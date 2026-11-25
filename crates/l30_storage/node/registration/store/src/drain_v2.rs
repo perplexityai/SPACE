@@ -567,6 +567,44 @@ impl LockedV2Node {
     }
 }
 
+/// Whether `node_id`'s row is still the v2 drain a listing read: the v2
+/// engine in `phase` (`None`: a cancel pending) under `generation`, on the
+/// machine registration recorded then, `k8s_node_uid` and `instance_id` as
+/// listed (either may be absent). An undrain or another phase change moves
+/// the phase; a registration that takes the row for another machine changes
+/// the UID or the instance, or clears the drain. Takes no lock: the loop
+/// reads it just before an effect on the node, a Kubernetes patch or a
+/// `DrainNode` call, which no row lock may span.
+pub async fn v2_node_as_listed(
+    executor: impl Executor<'_>,
+    node_id: NodeId,
+    phase: Option<&str>,
+    generation: i64,
+    k8s_node_uid: Option<&str>,
+    instance_id: Option<&str>,
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM nodes n
+               LEFT JOIN node_k8s k ON k.node_id = n.id
+              WHERE n.id = $1
+                AND n.drain_engine = 'v2'
+                AND (n.drain_status->>'generation')::BIGINT = $2
+                AND k.k8s_node_uid IS NOT DISTINCT FROM $3::TEXT
+                AND k.instance_id IS NOT DISTINCT FROM $4::TEXT
+                AND n.drain_phase IS NOT DISTINCT FROM $5::TEXT
+         )"
+    ))
+    .bind(node_id)
+    .bind(generation)
+    .bind(k8s_node_uid)
+    .bind(instance_id)
+    .bind(phase)
+    .fetch_one(executor.into_sqlx())
+    .await?)
+}
+
 /// Record what holds the locked node from its terminate transaction's fence
 /// in `drain_last_error`. The caller must pass its open transaction.
 pub async fn record_terminate_held<C>(

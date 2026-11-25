@@ -857,7 +857,7 @@ pub async fn run_reconcilers(
                 // a node only through EC2
                 // ([`TerminatorBackend::v2_terminator`]).
                 handles.push(tokio::spawn(node_drain::v2::run(
-                    node_drain::SubstrateSink::v2(pool.clone(), kube.clone()),
+                    node_drain::V2Sink::new(pool.clone(), kube.clone()),
                     backend.v2_terminator(),
                     node_drain_config.tick,
                     // Each bound's test hook shrinks it in a test-hooks build;

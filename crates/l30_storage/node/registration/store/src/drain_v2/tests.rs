@@ -651,6 +651,127 @@ async fn terminated_is_recorded_once_on_the_asked_instance() -> TestDbResult<()>
     Ok(())
 }
 
+/// The re-read before each effect holds only while the row is the v2 drain
+/// as listed: in the listed phase, under the listed generation, on the
+/// listed Kubernetes UID and recorded instance. A registration for another
+/// machine, a corrected instance, a new drain, an undrain of a listed drain
+/// and a cleared drain each refuse it; a cancel listed as one holds while
+/// it still is; and a row listed with no UID or instance holds only while
+/// it still has none.
+#[tokio::test(flavor = "current_thread")]
+async fn the_row_reads_as_listed_only_on_its_generation_and_machine() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let undrain = "UPDATE nodes SET drain_phase = NULL WHERE id = $1";
+    for (case, listed, moved_on, holds) in [
+        ("as listed", Some("draining"), None, true),
+        (
+            "another uid",
+            Some("draining"),
+            Some("UPDATE node_k8s SET k8s_node_uid = 'uid-2' WHERE node_id = $1"),
+            false,
+        ),
+        (
+            "another instance",
+            Some("draining"),
+            Some("UPDATE node_k8s SET instance_id = 'i-0000000b' WHERE node_id = $1"),
+            false,
+        ),
+        (
+            "no instance any more",
+            Some("draining"),
+            Some("UPDATE node_k8s SET instance_id = NULL WHERE node_id = $1"),
+            false,
+        ),
+        (
+            "another generation",
+            Some("draining"),
+            Some(
+                "UPDATE nodes SET drain_status = drain_status
+                          || jsonb_build_object('generation', 1)
+                  WHERE id = $1",
+            ),
+            false,
+        ),
+        (
+            "drain cleared",
+            Some("draining"),
+            Some(
+                "UPDATE nodes SET drain_phase = NULL, drain_engine = NULL, drain_status = NULL
+                  WHERE id = $1",
+            ),
+            false,
+        ),
+        (
+            "listed draining, then undrained",
+            Some("draining"),
+            Some(undrain),
+            false,
+        ),
+        (
+            "listed as a cancel, still a cancel",
+            None,
+            Some(undrain),
+            true,
+        ),
+        (
+            "registration gone",
+            Some("draining"),
+            Some("DELETE FROM node_k8s WHERE node_id = $1"),
+            false,
+        ),
+    ] {
+        let node_id = node(pool, true).await?;
+        start(pool, node_id, 600).await?;
+        let generation = generation_of(pool, node_id).await?;
+        sqlx::query(sql!(
+            "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid, instance_id)
+             VALUES ($1, $2, 'uid-1', 'i-0000000a')"
+        ))
+        .bind(node_id)
+        .bind(format!("worker-{}", node_id.as_uuid().simple()))
+        .execute(pool)
+        .await?;
+        if let Some(moved_on) = moved_on {
+            sqlx::query(sqlx::AssertSqlSafe(moved_on))
+                .bind(node_id)
+                .execute(pool)
+                .await?;
+        }
+        assert_eq!(
+            v2_node_as_listed(
+                pool,
+                node_id,
+                listed,
+                generation,
+                Some("uid-1"),
+                Some("i-0000000a")
+            )
+            .await?,
+            holds,
+            "{case}"
+        );
+    }
+    // Listed with no registration: holds while there is still none.
+    let unregistered = node(pool, true).await?;
+    start(pool, unregistered, 600).await?;
+    let generation = generation_of(pool, unregistered).await?;
+    let draining = Some("draining");
+    assert!(v2_node_as_listed(pool, unregistered, draining, generation, None, None).await?);
+    assert!(
+        !v2_node_as_listed(
+            pool,
+            unregistered,
+            draining,
+            generation,
+            Some("uid-1"),
+            None
+        )
+        .await?
+    );
+    Ok(())
+}
+
 /// The listing reads the generation, the deadline and whether the drain
 /// evacuates by the database clock: a hold ahead holds, a hold of 0
 /// evacuates at once.

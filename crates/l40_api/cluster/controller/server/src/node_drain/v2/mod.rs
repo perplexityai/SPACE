@@ -7,7 +7,21 @@
 //! every resident durable elsewhere, holding running sandboxes until a call
 //! asks it to evacuate. Each call is level-triggered: it states the drain
 //! and gets the node's state back, so the loop asks again on every tick and
-//! keeps nothing of the node's between ticks. Per v2 node, each tick:
+//! keeps nothing of the node's between ticks.
+//!
+//! The tick lists each node once and may act on it later. Every effect on
+//! the node, a cordon, its lift and each `DrainNode` call, is bound to the
+//! node as listed: just before it, one statement re-reads that the row is
+//! still a v2 drain in the listed phase, under the listed generation, on
+//! the listed Kubernetes UID and recorded instance, and a row that moved on
+//! (an undrain or another phase change, a registration that took it for
+//! another machine, or a cleared drain) is skipped for the tick, with no
+//! effect and nothing recorded; the next listing decides. A
+//! cordon or its lift patches the Node under the name only while its UID is
+//! the listed one, and names that UID in the patch, which the API server
+//! refuses once the Node under the name is another one.
+//!
+//! Per v2 node, each tick:
 //!
 //! 1. **Let-go first.** A node whose machine is gone some other way is let
 //!    go: its heartbeat is stale, EC2 lists its instance `terminated` (now,
@@ -28,14 +42,20 @@
 //!    The node unseals and hands nothing back: a sandbox the drain suspended
 //!    stays suspended until a call wakes it. Then lift the cordon, which
 //!    `:undrain` leaves on a v2 node so nothing places on a node still
-//!    sealed, and clear the engine and status, both under the row's lock and
-//!    only while the row is still this generation's cancel. An `Aborted`
-//!    call, an error or no answer is unanswered (`node_drain.v2.unanswered`),
+//!    sealed, and once it is lifted clear the engine and status, only while
+//!    the row is still this generation's cancel. No row lock spans the
+//!    lift. While one controller runs ticks, the API refuses a `:drain`
+//!    until the clear lands, so no drain of the node starts and cordons in
+//!    between; a lift from an outgoing controller's last tick can still land
+//!    after a new drain's cordon, which that drain's next tick restores.
+//!    An `Aborted` call, an error or no answer is unanswered
+//!    (`node_drain.v2.unanswered`),
 //!    goes to `drain_last_error`, and is retried next tick, forever: giving
 //!    up would uncordon a sealed node or orphan its seal.
 //! 3. **Draining**: converge the cordon; a cordon refused because the Node
-//!    under the name is another one than the drain's (its UID moved) gets no
-//!    `DrainNode` call this tick. Call `DrainNode{generation, Drain{evacuate}}`,
+//!    under the name is another one than the drain's (its UID moved, or the
+//!    API server refused the patch naming it) gets no `DrainNode` call this
+//!    tick. Call `DrainNode{generation, Drain{evacuate}}`,
 //!    `evacuate` once the database clock has reached the deadline. An
 //!    `Aborted` call is another call in progress on the node: the tick skips
 //!    the node. An answer that isn't a drain report under the generation
@@ -483,6 +503,7 @@ impl EvacuationRecord {
 pub struct DrainCallError {
     text: String,
     aborted: bool,
+    moved: bool,
 }
 
 impl DrainCallError {
@@ -491,6 +512,7 @@ impl DrainCallError {
         Self {
             text: status.to_string(),
             aborted: status.code() == tonic::Code::Aborted,
+            moved: false,
         }
     }
 
@@ -499,7 +521,24 @@ impl DrainCallError {
         Self {
             text: text.into(),
             aborted: false,
+            moved: false,
         }
+    }
+
+    /// No call was made: the row is no longer the drain the tick listed
+    /// ([`DrainV2Sink::drain_node`]).
+    pub fn moved() -> Self {
+        Self {
+            text: "the node's row is no longer the drain the tick listed".to_owned(),
+            aborted: false,
+            moved: true,
+        }
+    }
+
+    /// The call wasn't made because the row moved on since the tick listed
+    /// it: the node is skipped this tick, with nothing recorded.
+    pub const fn is_moved(&self) -> bool {
+        self.moved
     }
 
     /// The node refused the call because another `DrainNode` call was in
@@ -519,9 +558,13 @@ impl std::fmt::Display for DrainCallError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CordonFailure {
     /// The Kubernetes Node under the drain's node name is another one than
-    /// the drain's: its UID isn't the one registration recorded. The node
-    /// isn't called this tick.
+    /// the drain's: its UID isn't the one the tick listed, or the API server
+    /// refused the patch that named that UID. The node isn't called this
+    /// tick.
     UidMismatch(String),
+    /// Nothing was patched: the row is no longer the drain the tick listed.
+    /// The node is skipped this tick, with nothing recorded.
+    Moved,
     /// Anything else.
     Other(String),
 }
@@ -530,6 +573,7 @@ impl std::fmt::Display for CordonFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UidMismatch(text) | Self::Other(text) => f.write_str(text),
+            Self::Moved => f.write_str("the node's row is no longer the drain the tick listed"),
         }
     }
 }
@@ -549,16 +593,23 @@ pub trait DrainV2Sink: Send + Sync + 'static {
     fn list_v2_nodes(
         &self,
     ) -> impl std::future::Future<Output = Result<Vec<V2Node>, String>> + Send;
-    /// Converge the node's cordon, as the v1 drain does.
+    /// Cordon `node`, the node as the tick listed it: first re-read that its
+    /// row is still that drain, in the listed phase, under the listed
+    /// generation, on the listed Kubernetes UID and recorded instance
+    /// ([`CordonFailure::Moved`] if not), then patch the Node under its name only while its UID is the
+    /// listed one ([`CordonFailure::UidMismatch`] if not). A Node that is
+    /// gone has no cordon to converge.
     fn ensure_cordon(
         &self,
-        node_id: NodeId,
+        node: &V2Node,
     ) -> impl std::future::Future<Output = Result<(), CordonFailure>> + Send;
-    /// Call the node's `DrainNode` with `request` ([`drain_request`],
-    /// [`cancel_request`]).
+    /// Call the `DrainNode` of `node`, the node as the tick listed it, with
+    /// `request` ([`drain_request`], [`cancel_request`]), once its row still
+    /// reads as listed, as [`Self::ensure_cordon`] re-reads it; else make no
+    /// call ([`DrainCallError::moved`]).
     fn drain_node(
         &self,
-        node_id: NodeId,
+        node: &V2Node,
         request: DrainNodeRequest,
     ) -> impl std::future::Future<Output = Result<DrainNodeResponse, DrainCallError>> + Send;
     fn record_evacuation(
@@ -593,16 +644,19 @@ pub trait DrainV2Sink: Send + Sync + 'static {
         generation: u64,
         refused: &str,
     ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
-    /// Lift the node's cordon and clear an undrained row's v2 columns once
-    /// its generation is cancelled on the node, both under the row's lock
-    /// and only while the row is still that generation's cancel, so a drain
-    /// of the node started meanwhile, which takes that lock, cordons after
-    /// it. False, with nothing done, when the row is no longer that
-    /// generation's cancel.
+    /// Once `node`'s listed generation is cancelled on the node, lift its
+    /// cordon, then clear the undrained row's v2 columns, with no row lock
+    /// across the Kubernetes calls: the lift only while the row still reads
+    /// as the tick listed it and the Node under the name has the listed
+    /// UID, the clear only after a lift that succeeded, and only while the
+    /// row is still that generation's cancel. While one controller runs
+    /// ticks, no drain of the node can start meanwhile: the API refuses a
+    /// `:drain` while the cancel is pending. False, with nothing cleared,
+    /// when the row is no longer that generation's cancel, or was listed
+    /// with no generation.
     fn finish_cancel(
         &self,
-        node_id: NodeId,
-        generation: u64,
+        node: &V2Node,
     ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
     /// For each v2 node, how many of the sandboxes its drain has seen
     /// running (`drain_status.observed_running`) are `suspended`, their

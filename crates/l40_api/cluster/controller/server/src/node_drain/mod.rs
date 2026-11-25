@@ -226,7 +226,7 @@ pub use noop::NoopInstanceTerminator;
 #[cfg(feature = "kubernetes")]
 pub use store::{
     CordonError, CordonOutcome, EvacuateError, PodLessRecovery, RestoreOutcome,
-    StoppedEvacuationOutcome, StoppedEvacuationStall, SubstrateSink,
+    StoppedEvacuationOutcome, StoppedEvacuationStall, SubstrateSink, V2Sink,
 };
 
 pub(crate) const PHASE_DRAINING: &str = "draining";

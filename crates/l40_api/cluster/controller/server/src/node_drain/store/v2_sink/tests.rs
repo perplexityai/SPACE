@@ -624,14 +624,16 @@ async fn the_report_and_the_drained_edge_need_the_rows_own_generation() -> TestR
     Ok(())
 }
 
-/// The cancel's finish, its uncordon and its clear, runs only on an
-/// undrained row of the cancel's generation (a v2 engine with no phase),
-/// under its row lock: the uncordon is asked for with the Node's name and
-/// recorded uid, before the clear, and one that fails clears nothing. A row
-/// re-drained since the tick listed it, still draining, or of another
-/// generation is neither uncordoned nor cleared.
+/// The cancel's finish lifts the cordon first, with no row lock held, and
+/// clears the v2 columns only after a lift that succeeded, while the row is
+/// still the listed generation's cancel. The lift is asked for with the
+/// Node's name and the uid the tick listed. A row that moved on since the
+/// listing (re-drained, or taken by a registration for another machine) is
+/// neither uncordoned nor cleared, nor is a listing that isn't a cancel. A
+/// failed lift clears nothing; a lift during which the row moved on, which a
+/// row lock would have blocked, clears nothing and reports false.
 #[tokio::test(flavor = "current_thread")]
-async fn the_cancel_clears_and_uncordons_only_an_undrained_row_of_its_generation() -> TestResult {
+async fn the_cancel_clears_only_after_its_lift_and_only_its_generations_cancel() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
@@ -650,41 +652,87 @@ async fn the_cancel_clears_and_uncordons_only_an_undrained_row_of_its_generation
                 .await?;
         TestResult::Ok(engine.is_none())
     };
+    // A cancel listed, then moved on by `moved_on` before the finish.
+    let cancel_status = &status;
+    let cancel_moved_on = |moved_on: &'static str| async move {
+        let node_id = v2_node(pool, None, cancel_status.clone()).await?;
+        identity(pool, node_id, Some(INSTANCE)).await?;
+        let node = listed(pool, node_id).await?;
+        sqlx::query(sqlx::AssertSqlSafe(moved_on))
+            .bind(node_id)
+            .execute(pool)
+            .await?;
+        TestResult::Ok(node)
+    };
+    for (case, moved_on) in [
+        (
+            "re-drained",
+            "UPDATE nodes SET drain_phase = 'draining',
+                              drain_status = '{\"generation\": 6, \"deadline_at\": 0}'::JSONB
+              WHERE id = $1",
+        ),
+        (
+            "replaced by a registration",
+            "UPDATE node_k8s SET k8s_node_uid = 'uid-replacement' WHERE node_id = $1",
+        ),
+    ] {
+        let node = cancel_moved_on(moved_on).await?;
+        assert!(
+            !finish_v2_cancel_after_lift(pool, &node, uncordon).await?,
+            "{case}"
+        );
+        assert!(!cleared(pool.clone(), node.id).await?, "{case}");
+    }
+    let still_draining = v2_node(pool, Some("draining"), status.clone()).await?;
+    identity(pool, still_draining, Some(INSTANCE)).await?;
+    let still_draining = listed(pool, still_draining).await?;
+    assert!(!finish_v2_cancel_after_lift(pool, &still_draining, uncordon).await?);
+    assert!(!cleared(pool.clone(), still_draining.id).await?);
+    assert!(uncordoned.lock().unwrap().is_empty());
 
     let undrained = v2_node(pool, None, status.clone()).await?;
     let name = identity(pool, undrained, Some(INSTANCE)).await?;
-    let still_draining = v2_node(pool, Some("draining"), status.clone()).await?;
-    // Re-drained after the tick listed it: a new generation, a phase.
-    let redrained = v2_node(
-        pool,
-        Some("draining"),
-        serde_json::json!({"generation": 6, "deadline_at": 0}),
-    )
-    .await?;
-    for (case, node, generation) in [
-        ("another generation", undrained, 4),
-        ("still draining", still_draining, 5),
-        ("re-drained", redrained, 5),
-    ] {
-        assert!(
-            !finish_v2_cancel_locked(pool, node, generation, uncordon).await?,
-            "{case}"
-        );
-        assert!(!cleared(pool.clone(), node).await?, "{case}");
-    }
-    assert!(uncordoned.lock().unwrap().is_empty());
-
+    let undrained = listed(pool, undrained).await?;
     let failing = |_: String, _: Option<String>| async { Err::<(), _>("refused".to_owned()) };
     assert_eq!(
-        finish_v2_cancel_locked(pool, undrained, 5, failing).await,
+        finish_v2_cancel_after_lift(pool, &undrained, failing).await,
         Err("refused".to_owned())
     );
-    assert!(
-        !cleared(pool.clone(), undrained).await?,
-        "a failed uncordon"
+    assert!(!cleared(pool.clone(), undrained.id).await?, "a failed lift");
+
+    // The row moves on while the lift runs, from another connection, which
+    // a row lock held across the lift would block past its lock timeout.
+    let racing = v2_node(pool, None, status.clone()).await?;
+    identity(pool, racing, Some(INSTANCE)).await?;
+    let racing = listed(pool, racing).await?;
+    let racing_id = racing.id;
+    let moves_on = |_: String, _: Option<String>| async move {
+        let mut conn = pool.acquire().await.map_err(|error| error.to_string())?;
+        sqlx::query(sql!("SET lock_timeout = '2s'"))
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| error.to_string())?;
+        sqlx::query(sql!(
+            "UPDATE nodes SET drain_status = drain_status || '{\"generation\": 6}'::JSONB
+              WHERE id = $1"
+        ))
+        .bind(racing_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok::<_, String>(())
+    };
+    assert_eq!(
+        finish_v2_cancel_after_lift(pool, &racing, moves_on).await,
+        Ok(false)
     );
-    assert!(finish_v2_cancel_locked(pool, undrained, 5, uncordon).await?);
-    assert!(cleared(pool.clone(), undrained).await?);
+    assert!(
+        !cleared(pool.clone(), racing_id).await?,
+        "moved on during the lift"
+    );
+
+    assert!(finish_v2_cancel_after_lift(pool, &undrained, uncordon).await?);
+    assert!(cleared(pool.clone(), undrained.id).await?);
     assert_eq!(
         *uncordoned.lock().unwrap(),
         [(name, Some("uid".to_owned()))]
@@ -1464,4 +1512,205 @@ async fn the_listing_reads_the_deadline_by_the_database_clock_and_the_report() -
     .await?;
     assert_eq!(listed(pool, unreadable).await?.report, None);
     Ok(())
+}
+
+/// A cordon or its lift patches the Node a GET found only while its UID is
+/// the one the tick listed, and names that UID in the patch, so the API
+/// server refuses the patch once the Node under the name is another one. A
+/// Node that is gone is left alone; a listing without a UID names the UID
+/// the GET read.
+#[test]
+fn a_cordon_patch_names_the_listed_nodes_uid() {
+    let node = |uid: &str| Node {
+        metadata: kube::api::ObjectMeta {
+            uid: Some(uid.to_owned()),
+            ..kube::api::ObjectMeta::default()
+        },
+        ..Node::default()
+    };
+    let patch = |uid: &str, unschedulable: bool| {
+        NodePatch::Patch(serde_json::json!({
+            "metadata": {"uid": uid},
+            "spec": {"unschedulable": unschedulable},
+        }))
+    };
+    for (case, listed, found, unschedulable, expected) in [
+        ("gone", Some("uid"), None, true, NodePatch::Gone),
+        (
+            "cordon",
+            Some("uid"),
+            Some(node("uid")),
+            true,
+            patch("uid", true),
+        ),
+        (
+            "lift",
+            Some("uid"),
+            Some(node("uid")),
+            false,
+            patch("uid", false),
+        ),
+        (
+            "another node, cordon",
+            Some("uid"),
+            Some(node("uid-replacement")),
+            true,
+            NodePatch::AnotherNode,
+        ),
+        (
+            "another node, lift",
+            Some("uid"),
+            Some(node("uid-replacement")),
+            false,
+            NodePatch::AnotherNode,
+        ),
+        (
+            "listed without a uid",
+            None,
+            Some(node("uid-found")),
+            true,
+            patch("uid-found", true),
+        ),
+    ] {
+        assert_eq!(
+            node_patch(listed, found.as_ref(), unschedulable),
+            expected,
+            "{case}"
+        );
+    }
+}
+
+/// Every effect of the production sink re-reads the row first: a row that
+/// moved on since the tick listed it (a registration that replaced the
+/// machine, a corrected instance, a new generation, an undrain of a listed
+/// drain, a cleared drain) gets no
+/// Kubernetes request, no `DrainNode` call and no lift, and nothing is
+/// cleared. A row that still reads as listed is looked up.
+#[tokio::test(flavor = "current_thread")]
+async fn the_sink_makes_no_call_for_a_row_that_moved_on() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let (substrate, requests) =
+        crate::lifecycle_writer_test_support::kubernetes_substrate_recording_requests(
+            pool,
+            Vec::new(),
+            crate::lifecycle_writer_test_support::CLOSED_PORT,
+        )?;
+    let sink = V2Sink::new(pool.clone(), Arc::new(substrate));
+    let status = serde_json::json!({"generation": 5, "deadline_at": 0});
+
+    let current = v2_node(pool, Some("draining"), status.clone()).await?;
+    let name = identity(pool, current, Some(INSTANCE)).await?;
+    // The double holds no Node, so the GET finds it gone: nothing to cordon.
+    assert_eq!(
+        sink.ensure_cordon(&listed(pool, current).await?).await,
+        Ok(())
+    );
+    assert_eq!(
+        std::mem::take(&mut *requests.lock().unwrap()),
+        [format!("GET /api/v1/nodes/{name}")]
+    );
+
+    for (case, phase, moved_on) in [
+        (
+            "replaced by a registration",
+            Some("draining"),
+            "UPDATE node_k8s SET k8s_node_uid = 'uid-replacement' WHERE node_id = $1",
+        ),
+        (
+            "instance corrected",
+            Some("draining"),
+            "UPDATE node_k8s SET instance_id = 'i-0000000000000f0f0' WHERE node_id = $1",
+        ),
+        (
+            "another generation",
+            Some("draining"),
+            "UPDATE nodes SET drain_status = drain_status || '{\"generation\": 6}'::JSONB
+              WHERE id = $1",
+        ),
+        (
+            "drain cleared",
+            Some("draining"),
+            "UPDATE nodes SET drain_phase = NULL, drain_engine = NULL, drain_status = NULL
+              WHERE id = $1",
+        ),
+        (
+            "listed draining, then undrained",
+            Some("draining"),
+            "UPDATE nodes SET drain_phase = NULL WHERE id = $1",
+        ),
+        (
+            "cancel, replaced by a registration",
+            None,
+            "UPDATE node_k8s SET k8s_node_uid = 'uid-replacement' WHERE node_id = $1",
+        ),
+    ] {
+        let node_id = v2_node(pool, phase, status.clone()).await?;
+        identity(pool, node_id, Some(INSTANCE)).await?;
+        let node = listed(pool, node_id).await?;
+        sqlx::query(sqlx::AssertSqlSafe(moved_on))
+            .bind(node_id)
+            .execute(pool)
+            .await?;
+        let before = columns(pool, node_id).await?;
+        assert_eq!(
+            sink.ensure_cordon(&node).await,
+            Err(CordonFailure::Moved),
+            "{case}"
+        );
+        let call = sink
+            .drain_node(&node, crate::node_drain::v2::drain_request(5, true))
+            .await;
+        assert!(
+            call.as_ref().is_err_and(DrainCallError::is_moved),
+            "{case}: {call:?}"
+        );
+        if phase.is_none() {
+            assert_eq!(sink.finish_cancel(&node).await, Ok(false), "{case}");
+        }
+        assert!(requests.lock().unwrap().is_empty(), "{case}");
+        assert_eq!(columns(pool, node_id).await?, before, "{case}");
+    }
+    Ok(())
+}
+
+/// A patch the API server refuses because the UID it names isn't the Node's
+/// is another Node under the name, as the Kubernetes API server answers it
+/// (a 422 with a cause on `metadata.uid`, or a precondition conflict); any
+/// other refusal is a plain failure.
+#[test]
+fn a_patch_refused_for_its_uid_is_another_node() {
+    // The API server's `Status` bodies, as it answers a refused patch.
+    let invalid_on = |field: &str| {
+        serde_json::json!({
+            "kind": "Status", "apiVersion": "v1", "status": "Failure",
+            "message": "Node \"worker\" is invalid", "reason": "Invalid", "code": 422,
+            "details": {"name": "worker", "kind": "Node", "causes": [{
+                "reason": "FieldValueInvalid", "message": "field is immutable", "field": field,
+            }]},
+        })
+    };
+    let refused = |reason: &str, code: u16| {
+        serde_json::json!({
+            "kind": "Status", "apiVersion": "v1", "status": "Failure",
+            "message": "refused", "reason": reason, "code": code,
+        })
+    };
+    for (case, body, another) in [
+        ("immutable uid", invalid_on("metadata.uid"), true),
+        ("uid precondition", refused("Conflict", 409), true),
+        ("another field", invalid_on("spec.taints"), false),
+        ("invalid without causes", refused("Invalid", 422), false),
+        ("not found", refused("NotFound", 404), false),
+        ("unavailable", refused("ServiceUnavailable", 503), false),
+    ] {
+        let status: kube::core::Status = serde_json::from_value(body).expect("a Status");
+        assert_eq!(
+            refused_for_another_uid(&kube::Error::Api(status.boxed())),
+            another,
+            "{case}"
+        );
+    }
 }

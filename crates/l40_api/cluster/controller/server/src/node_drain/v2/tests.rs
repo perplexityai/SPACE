@@ -52,9 +52,29 @@ struct FakeSink {
     /// The bound of each count of sandboxes left suspended, in seconds, in
     /// order; kept out of `calls`, since every tick makes one.
     counted: Mutex<Vec<u64>>,
+    /// When set, a registration replaces every node's machine right after
+    /// the listing, under this Kubernetes UID: the row no longer reads as
+    /// the tick listed it.
+    replaced_after_listing: Option<String>,
+    /// When set, a registration replaces a node's machine right after its
+    /// cordon converged, under this Kubernetes UID: the cordon went through,
+    /// and the row no longer reads as listed for the effects after it.
+    replaced_after_cordon: Option<String>,
+    /// The UID each node's row carries now, once a registration replaced it.
+    registered_uid: Mutex<HashMap<NodeId, String>>,
 }
 
 impl FakeSink {
+    /// Whether `node`'s row still reads as the tick listed it: no
+    /// registration replaced its machine since.
+    fn still_listed(&self, node: &V2Node) -> bool {
+        self.registered_uid
+            .lock()
+            .unwrap()
+            .get(&node.id)
+            .is_none_or(|uid| node.k8s_node_uid.as_ref() == Some(uid))
+    }
+
     fn log(&self, entry: String) {
         self.calls.lock().unwrap().push(entry);
     }
@@ -84,19 +104,38 @@ impl FakeSink {
 
 impl DrainV2Sink for FakeSink {
     async fn list_v2_nodes(&self) -> Result<Vec<V2Node>, String> {
+        if let Some(uid) = &self.replaced_after_listing {
+            self.registered_uid
+                .lock()
+                .unwrap()
+                .extend(self.nodes.iter().map(|node| (node.id, uid.clone())));
+        }
         Ok(self.nodes.clone())
     }
 
-    async fn ensure_cordon(&self, node_id: NodeId) -> Result<(), CordonFailure> {
-        self.log(format!("cordon {node_id}"));
+    async fn ensure_cordon(&self, node: &V2Node) -> Result<(), CordonFailure> {
+        if !self.still_listed(node) {
+            return Err(CordonFailure::Moved);
+        }
+        self.log(format!("cordon {}", node.id));
+        if let Some(uid) = &self.replaced_after_cordon {
+            self.registered_uid
+                .lock()
+                .unwrap()
+                .insert(node.id, uid.clone());
+        }
         self.cordon_error.clone().map_or(Ok(()), Err)
     }
 
     async fn drain_node(
         &self,
-        node_id: NodeId,
+        node: &V2Node,
         request: DrainNodeRequest,
     ) -> Result<DrainNodeResponse, DrainCallError> {
+        if !self.still_listed(node) {
+            return Err(DrainCallError::moved());
+        }
+        let node_id = node.id;
         self.requests.lock().unwrap().push(request);
         let cancel = matches!(request.op, Some(drain_node_request::Op::Cancel(_)));
         self.log(format!(
@@ -165,8 +204,12 @@ impl DrainV2Sink for FakeSink {
         Ok(true)
     }
 
-    async fn finish_cancel(&self, node_id: NodeId, generation: u64) -> Result<bool, String> {
-        self.log(format!("finish_cancel {node_id} {generation}"));
+    async fn finish_cancel(&self, node: &V2Node) -> Result<bool, String> {
+        if !self.still_listed(node) {
+            return Ok(false);
+        }
+        let generation = node.generation.expect("a listed cancel has a generation");
+        self.log(format!("finish_cancel {} {generation}", node.id));
         self.finish_cancel.clone().unwrap_or(Ok(true))
     }
 
@@ -1919,8 +1962,8 @@ async fn an_answer_not_under_the_drains_generation_records_nothing() {
 }
 
 /// A cancel pending (a v2 row with no phase) sends `Cancel` under its
-/// generation, and only a cancel's answer finishes it: the cordon's lift
-/// and the clear of the columns, under the row's lock and only while the
+/// generation, and only a cancel's answer finishes it: the cordon's lift,
+/// then the clear of the columns once the lift succeeded, only while the
 /// row is still this generation's cancel. A drain-shaped answer, a call
 /// that fails, and an `Aborted` one are unanswered: the error is recorded,
 /// and the next tick asks again; so is a finish that
@@ -2403,4 +2446,91 @@ fn the_loop_config_reads_its_test_hooks() {
         config(&[(DISPATCH_BACKOFF_BASE_TEST_ENV, "600")]).dispatch_backoff_base,
         DISPATCH_BACKOFF_CAP
     );
+}
+
+/// A registration that replaces a node's machine after the tick listed it,
+/// before its step, leaves the step with nothing to act on: in every phase
+/// that cordons or calls the node, nothing is cordoned, no `DrainNode` call
+/// or lift is made, a drained node's evacuations aren't counted, no error
+/// is recorded and no terminate is refused. The next listing decides.
+#[tokio::test]
+async fn a_registration_replaced_after_the_listing_gets_no_effect() {
+    for (case, phase) in [
+        ("draining", Some("draining")),
+        ("drained", Some("drained")),
+        ("terminating", Some("terminating")),
+        ("cancel", None),
+    ] {
+        let target = node(phase, Some(5));
+        let sink = FakeSink {
+            nodes: vec![target.clone()],
+            responses: HashMap::from([
+                ((target.id, false), Ok(response(5, &[]))),
+                ((target.id, true), Ok(cancelled(5))),
+            ]),
+            replaced_after_listing: Some("uid-replacement".to_owned()),
+            ..FakeSink::default()
+        };
+        let report = run_tick(&sink, &FakeAuthority::ok()).await;
+        assert_eq!(report, V2TickReport::default(), "{case}");
+        assert!(sink.requests().is_empty(), "{case}");
+        let calls = sink.calls();
+        for effect in [
+            "cordon",
+            "drain_node",
+            "finish_cancel",
+            "count_drained",
+            "error",
+            "return",
+            "fence",
+        ] {
+            assert!(
+                !called(&sink, effect, &target),
+                "{case}: {effect}: {calls:?}"
+            );
+        }
+    }
+}
+
+/// A registration that keeps the drain (the same instance, say) but lands
+/// between a node's cordon and the call after it leaves the step with
+/// nothing more to act on: the cordon went through, and no `DrainNode` call
+/// is made, no lift, report or error recorded, and no terminate refused or
+/// fenced. The next listing decides.
+#[tokio::test]
+async fn a_registration_replaced_after_the_cordon_gets_no_further_effect() {
+    for (case, phase) in [
+        ("draining", Some("draining")),
+        ("terminating", Some("terminating")),
+        ("cancel", None),
+    ] {
+        let target = node(phase, Some(5));
+        let sink = FakeSink {
+            nodes: vec![target.clone()],
+            responses: HashMap::from([
+                ((target.id, false), Ok(response(5, &[]))),
+                ((target.id, true), Ok(cancelled(5))),
+            ]),
+            replaced_after_cordon: Some("uid-replacement".to_owned()),
+            ..FakeSink::default()
+        };
+        let report = run_tick(&sink, &FakeAuthority::ok()).await;
+        assert_eq!(report, V2TickReport::default(), "{case}");
+        assert!(sink.requests().is_empty(), "{case}");
+        let calls = sink.calls();
+        assert!(called(&sink, "cordon", &target), "{case}: {calls:?}");
+        for effect in [
+            "drain_node",
+            "finish_cancel",
+            "error",
+            "report",
+            "return",
+            "fence",
+        ] {
+            assert!(
+                !called(&sink, effect, &target),
+                "{case}: {effect}: {calls:?}"
+            );
+        }
+    }
 }
