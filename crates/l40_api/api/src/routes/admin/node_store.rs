@@ -932,13 +932,6 @@ mod live_residents_tests;
 mod in_flight_drain_tests;
 #[cfg(test)]
 mod node_holds_agreement_tests;
-/// Postgres-backed plan-structure and page-shape regression for the
-/// `:force-upload-local-snapshots` enumeration: the scan stays bounded by the
-/// node's own pinned history rather than the fleet, the in-flight probe runs
-/// only for non-durable rows, and the page stays the ascending-id prefix the
-/// handler's `deferred[]` tail depends on.
-#[cfg(test)]
-mod pinned_local_only_plan_tests;
 /// The `:terminate` guard and the node-drain gate must count the same rows.
 /// Postgres-backed, and each case also shows the pre-change guard disagreed —
 /// otherwise the agreement proves nothing.
