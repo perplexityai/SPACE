@@ -27,7 +27,7 @@ FILL_MIB = 256
     substrates=("kubernetes",),
     timeout_minutes=40,
     tier="manual",
-    manual_reason="drain v2 is off by default outside Kind, so its scenarios run by name, not in the per-merge set",
+    manual_reason="twelve resident VMs filled with memory, too heavy for the per-merge set",
 )
 def v2_undrain_mid_suspend(test: smoke.CommandSandboxFixture) -> None:
     """A v2 `:drain`, due now, of a worker holding twelve started residents,

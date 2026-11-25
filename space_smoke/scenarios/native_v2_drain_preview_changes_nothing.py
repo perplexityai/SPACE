@@ -30,7 +30,7 @@ from space_smoke.drain_v2 import PENDING_RUNNING_FIELD, WAIT_HOLD
     substrates=("kubernetes",),
     timeout_minutes=30,
     tier="manual",
-    manual_reason="drain v2 is off by default outside Kind, so its scenarios run by name, not in the per-merge set",
+    manual_reason="runs by name until the drain v2 scenarios have a record of consecutive clean runs on Kind",
 )
 def v2_drain_preview_changes_nothing(test: smoke.CommandSandboxFixture) -> None:
     """With no v2 drain of it recorded, a worker holds a started and a

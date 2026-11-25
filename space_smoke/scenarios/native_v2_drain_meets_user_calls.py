@@ -33,7 +33,7 @@ BLOCK_MARGIN_SECONDS = 30
     substrates=("kubernetes",),
     timeout_minutes=45,
     tier="manual",
-    manual_reason="drain v2 is off by default outside Kind, so its scenarios run by name, not in the per-merge set",
+    manual_reason="timing-sensitive on Kind: its calls past the deadline race the controller's first evacuating tick",
 )
 def v2_drain_meets_user_calls(test: smoke.CommandSandboxFixture) -> None:
     """Of three residents of a worker v2-drained with a five-minute hold, one

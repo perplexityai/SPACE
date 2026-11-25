@@ -42,7 +42,7 @@ SHORT_AHEAD_SECONDS = 30
     # KVM bench.
     timeout_minutes=45,
     tier="manual",
-    manual_reason="drain v2 is off by default outside Kind, so its scenarios run by name, not in the per-merge set",
+    manual_reason="timing-sensitive on Kind: an idle suspend must be reported before the bench's short eviction floor drops its local rows",
 )
 def v2_drain_holds_running_until_its_deadline(test: smoke.CommandSandboxFixture) -> None:
     """A v2 `:drain` with an hour's hold of a worker holding two running

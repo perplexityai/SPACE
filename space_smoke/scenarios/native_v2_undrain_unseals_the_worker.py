@@ -24,7 +24,7 @@ HOLD_SECONDS = 60 * 60
     substrates=("kubernetes",),
     timeout_minutes=30,
     tier="manual",
-    manual_reason="drain v2 is off by default outside Kind, so its scenarios run by name, not in the per-merge set",
+    manual_reason="cuts a worker's node-api for a minute and a half, too slow for the per-merge set",
 )
 def v2_undrain_unseals_the_worker(test: smoke.CommandSandboxFixture) -> None:
     """A v2 `:drain` with a hold seals the worker, and the controller stores
