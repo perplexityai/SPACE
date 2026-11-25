@@ -572,7 +572,11 @@ class HarnessOps(unittest.TestCase):
                 return _Resp({"token": "tok"})
             return _Resp(next(payloads))
 
-        with mock.patch("space_smoke.adapters.urlopen", fake_urlopen), mock.patch("space_smoke.adapters.time.sleep", lambda s: None):
+        with (
+            mock.patch("space_smoke.adapters.urlopen", fake_urlopen),
+            mock.patch("space_smoke.adapters._URL_OPEN", fake_urlopen),
+            mock.patch("space_smoke.adapters.time.sleep", lambda s: None),
+        ):
             sandbox_id = harness.native_create_sandbox(template="seed", metadata={"space_smoke_run": "r"})
         self.assertEqual(sandbox_id, NATIVE)
         self.assertTrue(any(s.startswith("POST") and s.endswith("/v1/sandboxes") for s in seen))
