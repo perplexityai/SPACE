@@ -727,7 +727,7 @@ impl SandboxStatus {
 
     /// The cleanup as sandbox events carry it in
     /// `from_cleanup_state`/`to_cleanup_state`.
-    pub fn event_cleanup_state(self) -> &'static str {
+    pub(crate) fn event_cleanup_state(self) -> &'static str {
         self.cleanup().map_or("none", CleanupState::as_str)
     }
 

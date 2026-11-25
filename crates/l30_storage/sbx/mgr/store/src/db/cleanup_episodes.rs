@@ -1884,8 +1884,8 @@ pub fn mark_cleanup_failed(
     Ok(changed != 0)
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub fn clear_cleanup_intent(conn: &Connection, id: &str) -> Result<()> {
+#[cfg(test)]
+pub(crate) fn clear_cleanup_intent(conn: &Connection, id: &str) -> Result<()> {
     conn.execute(
         "UPDATE sandboxes
          SET cleanup_completion = NULL,

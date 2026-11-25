@@ -92,7 +92,7 @@ impl FromStr for AutoLifecycleDeleteAdmissionReason {
 /// `insert_quarantined_sandbox`, `startup_resident_recovery`,
 /// `complete_cleanup_episode`, `complete_row_intent_cleanup`,
 /// `quarantine_cleanup_episode`).
-pub fn quarantine_entered(reason: SandboxQuarantineReasonCode, operation: &'static str) {
+pub(crate) fn quarantine_entered(reason: SandboxQuarantineReasonCode, operation: &'static str) {
     counter(
         "sandbox.worker.quarantine.entered",
         1,

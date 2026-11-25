@@ -76,7 +76,7 @@ impl RuntimeUpgradePhase {
     }
 
     /// Whether a row in this phase refuses other activations of its sandbox.
-    pub fn fences_activation(self) -> bool {
+    pub(crate) fn fences_activation(self) -> bool {
         FENCING_PHASES.contains(&self)
     }
 
