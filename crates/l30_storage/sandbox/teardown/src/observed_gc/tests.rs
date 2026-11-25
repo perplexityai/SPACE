@@ -313,21 +313,38 @@ async fn delete_stale_suspended_stops_at_its_limit() -> TestResult {
     let pool = &db.pool;
     let node = insert_node(pool).await?;
     let ids = [SandboxId::new(), SandboxId::new(), SandboxId::new()];
-    for sandbox_id in ids {
-        insert_sandbox(pool, sandbox_id, "suspended", 120).await?;
+    let young = SandboxId::new();
+    let started = SandboxId::new();
+    for (sandbox_id, lifecycle, age_minutes) in [
+        (ids[0], "suspended", 120),
+        (ids[1], "suspended", 120),
+        (ids[2], "suspended", 120),
+        (young, "suspended", 5),
+        (started, "started", 120),
+    ] {
+        insert_sandbox(pool, sandbox_id, lifecycle, age_minutes).await?;
         insert_observed(pool, node, sandbox_id, 120).await?;
     }
 
+    // Rows that lose take none of the limit, and the next call reaches the
+    // rest.
     let (from, to) = (Uuid::nil(), Uuid::max());
-    assert_eq!(
-        delete_stale_suspended(pool, HOUR_SECS, 2, HOUR_SECS, from, to).await?,
-        (2, 0, 0)
-    );
-    let mut left = 0;
-    for sandbox_id in ids {
-        left += i32::from(observed_exists(pool, sandbox_id).await?);
+    for (expected, left_after) in [((2, 0, 0), 1), ((1, 0, 0), 0)] {
+        assert_eq!(
+            delete_stale_suspended(pool, HOUR_SECS, 2, HOUR_SECS, from, to).await?,
+            expected
+        );
+        let mut left = 0;
+        for sandbox_id in ids {
+            left += i32::from(observed_exists(pool, sandbox_id).await?);
+        }
+        assert_eq!(left, left_after);
+        assert!(
+            observed_exists(pool, young).await?,
+            "suspended too recently"
+        );
+        assert!(observed_exists(pool, started).await?, "not suspended");
     }
-    assert_eq!(left, 1);
     Ok(())
 }
 
@@ -399,6 +416,10 @@ async fn delete_orphaned_counts_and_keeps_the_losing_rows() -> TestResult {
     assert!(
         observed_exists(pool, fresh_recovery).await?,
         "a fresh quarantine_recovery observation keeps the row"
+    );
+    assert_eq!(
+        sandbox_facets_left(pool, node, fresh_recovery).await?,
+        (1, 1)
     );
     assert!(observed_exists(pool, above).await?, "after the window");
     assert_eq!(

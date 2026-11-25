@@ -1,10 +1,19 @@
 //! The `*_reads` modules decode what their callers decoded before the
 //! statements moved here: the port-exposure list both of its callers share,
 //! the execution reads that alias or trim columns, and the ownership probe
-//! two public routes share.
+//! two public routes share. With them, the other reads that moved here with
+//! callers in other crates: the Kubernetes node attribution's target,
+//! fork-copy and latest-execution legs and its UID filter, and the quarantine
+//! and tombstone counts.
+
+use pplx_space_db_test_fixtures::insert_ready_worker_node;
+use pplx_space_snapshot_model::SnapshotId;
 
 use super::*;
-use crate::{debug_reads, k8s_executions, port_exposures, row_reads};
+use crate::{
+    active_quarantines, debug_reads, deleted_rows, k8s_executions, k8s_node_attribution,
+    port_exposures, row_reads,
+};
 
 async fn insert_port_exposure(
     pool: &PgPool,
@@ -194,5 +203,244 @@ async fn org_owns_requires_the_row_and_its_organization() -> TestResult {
     assert!(row_reads::org_owns(&db.pool, id, OrgId::from_uuid(SEED_ORG)).await?);
     assert!(!row_reads::org_owns(&db.pool, id, OrgId::from_uuid(Uuid::now_v7())).await?);
     assert!(!row_reads::org_owns(&db.pool, SandboxId::new(), OrgId::from_uuid(SEED_ORG)).await?);
+    Ok(())
+}
+
+/// A Kubernetes worker registered with UID `uid`.
+async fn insert_k8s_node(pool: &PgPool, uid: &str) -> TestResult<NodeId> {
+    let node_id = NodeId::new();
+    insert_ready_worker_node(pool, node_id).await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid)
+         VALUES ($1, $2, $3)"
+    ))
+    .bind(node_id)
+    .bind(format!("ip-{node_id}.ec2.internal"))
+    .bind(uid)
+    .execute(pool)
+    .await?;
+    Ok(node_id)
+}
+
+/// The UIDs of the nodes attributed to `sandbox_id` and `snapshot_id`,
+/// sorted.
+async fn attributed_uids(
+    pool: &PgPool,
+    sandbox_id: Uuid,
+    snapshot_id: SnapshotId,
+) -> TestResult<Vec<String>> {
+    let mut uids = k8s_node_attribution::attributed_k8s_nodes(
+        pool,
+        SandboxId::from_uuid(sandbox_id),
+        snapshot_id,
+    )
+    .await?
+    .into_iter()
+    .map(|node| node.k8s_node_uid.as_str().to_owned())
+    .collect::<Vec<_>>();
+    uids.sort();
+    Ok(uids)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn attributed_k8s_nodes_include_the_target_placement() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let target = insert_k8s_node(pool, "uid-target").await?;
+    // No active node, execution or snapshot: only the target leg can
+    // attribute a node.
+    let id = insert_sandbox(pool, None, "started").await?;
+    let snapshot_id = SnapshotId::new();
+    assert_eq!(
+        attributed_uids(pool, id, snapshot_id).await?,
+        Vec::<String>::new()
+    );
+
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET target_node_id = $2 WHERE id = $1"
+    ))
+    .bind(id)
+    .bind(target)
+    .execute(pool)
+    .await?;
+    assert_eq!(
+        attributed_uids(pool, id, snapshot_id).await?,
+        ["uid-target"]
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn attributed_k8s_nodes_include_a_same_org_fork_copys_source_node() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let source_node = insert_k8s_node(pool, "uid-source").await?;
+    let subject = insert_sandbox(pool, None, "started").await?;
+    let same_org_owner = insert_sandbox(pool, None, "started").await?;
+    let other_org = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO organizations (id, name, slug) VALUES ($1, 'Other Org', $2)"
+    ))
+    .bind(other_org)
+    .bind(format!("other-org-{other_org}"))
+    .execute(pool)
+    .await?;
+    let other_org_owner = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (id, user_id, org_id, managed_by, lifecycle, network_policy_generation)
+         VALUES ($1, $2, $3, 'k8s', 'started', 1)"
+    ))
+    .bind(other_org_owner)
+    .bind(SEED_USER)
+    .bind(other_org)
+    .execute(pool)
+    .await?;
+
+    // Each snapshot belongs to another sandbox, so only the fork-copy leg
+    // can attribute its source node to `subject`.
+    for (owner, org_id, origin, expected, why) in [
+        (
+            same_org_owner,
+            SEED_ORG,
+            "fork",
+            &["uid-source"][..],
+            "a same-org fork copy",
+        ),
+        (
+            same_org_owner,
+            SEED_ORG,
+            "suspend",
+            &[],
+            "another sandbox's own snapshot",
+        ),
+        (
+            other_org_owner,
+            other_org,
+            "fork",
+            &[],
+            "another org's fork copy",
+        ),
+    ] {
+        let snapshot_id = SnapshotId::new();
+        sqlx::query(sql!(
+            "INSERT INTO snapshots (
+                 id, sandbox_id, type, state, source_node_id, org_id,
+                 local_artifact_id, artifact_kind, artifact_origin
+             )
+             VALUES ($1, $2, 'full', 'ready', $3, $4, $5, 'full', $6)"
+        ))
+        .bind(snapshot_id)
+        .bind(owner)
+        .bind(source_node)
+        .bind(org_id)
+        .bind(Uuid::now_v7())
+        .bind(origin)
+        .execute(pool)
+        .await?;
+        assert_eq!(
+            attributed_uids(pool, subject, snapshot_id).await?,
+            expected,
+            "{why}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn attributed_k8s_nodes_take_only_the_latest_execution_and_need_a_uid() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let older = insert_k8s_node(pool, "uid-older").await?;
+    let newer = insert_k8s_node(pool, "uid-newer").await?;
+    let without_uid = insert_k8s_node(pool, "uid-cleared").await?;
+    sqlx::query(sql!(
+        "UPDATE node_k8s SET k8s_node_uid = NULL WHERE node_id = $1"
+    ))
+    .bind(without_uid)
+    .execute(pool)
+    .await?;
+    // The active node has no UID, so it is skipped.
+    let id = insert_sandbox(pool, None, "started").await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET active_node_id = $2 WHERE id = $1"
+    ))
+    .bind(id)
+    .bind(without_uid)
+    .execute(pool)
+    .await?;
+    // Two executions on different nodes: only the newer one's node counts.
+    let older_name = format!("ip-{older}.ec2.internal");
+    let newer_name = format!("ip-{newer}.ec2.internal");
+    insert_execution(
+        pool,
+        id,
+        1,
+        "pod-uid-1",
+        Some(&older_name),
+        "forgotten",
+        false,
+    )
+    .await?;
+    insert_execution(pool, id, 2, "pod-uid-2", Some(&newer_name), "running", true).await?;
+
+    assert_eq!(
+        attributed_uids(pool, id, SnapshotId::new()).await?,
+        ["uid-newer"]
+    );
+    Ok(())
+}
+
+async fn insert_quarantine_episode(pool: &PgPool, sandbox_id: Uuid) -> TestResult {
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_quarantine_state
+             (sandbox_id, quarantine_id, entered_from_lifecycle, source, reason_code,
+              reason_message, next_action)
+         VALUES ($1, $2, 'paused', 'sbx_manager', 'pause_failed', 'pause timed out',
+                 'requires_operator_attention')"
+    ))
+    .bind(sandbox_id)
+    .bind(Uuid::now_v7())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn active_quarantines_count_only_rows_still_quarantined() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let before = active_quarantines::count(pool).await?;
+    let quarantined = insert_sandbox(pool, None, "quarantined").await?;
+    let moved_on = insert_sandbox(pool, None, "suspended").await?;
+    for id in [quarantined, moved_on] {
+        insert_quarantine_episode(pool, id).await?;
+    }
+    // Quarantined, but with no episode to count.
+    insert_sandbox(pool, None, "quarantined").await?;
+
+    assert_eq!(active_quarantines::count(pool).await?, before + 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn deleted_rows_count_each_tombstone_once() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let before = deleted_rows::count(pool).await?;
+    insert_sandbox(pool, None, "deleted").await?;
+    insert_sandbox(pool, None, "deleting").await?;
+    insert_sandbox(pool, None, "started").await?;
+
+    assert_eq!(deleted_rows::count(pool).await?, before + 1);
     Ok(())
 }

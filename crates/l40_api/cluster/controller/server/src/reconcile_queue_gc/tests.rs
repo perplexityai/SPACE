@@ -1,5 +1,4 @@
 use pplx_space_accounts::NodeId;
-use pplx_space_sandbox_model::SandboxId;
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -776,9 +775,7 @@ async fn disabled_loop_never_touches_the_sink() {
 mod postgres {
 
     use pplx_space_accounts::NodeId;
-    use pplx_space_db_test_fixtures::{
-        SEED_ORG_ID as SEEDED_ORG_ID, SEED_USER_ID as SEEDED_USER_ID, try_pg_test_db,
-    };
+    use pplx_space_db_test_fixtures::try_pg_test_db;
     use sqlx::PgPool;
 
     use super::*;
@@ -858,23 +855,40 @@ mod postgres {
         Ok(())
     }
 
-    async fn claim_queue_ref(
+    /// Which of a node's rows [`claim`] claims.
+    #[derive(Clone, Copy)]
+    enum Claimed {
+        Refs,
+        Trigger,
+    }
+
+    /// Claims every ref, or the trigger, on `node_id` as node-ctl,
+    /// `claimed_ago` ago.
+    async fn claim(
         pool: &PgPool,
+        claimed: Claimed,
         node_id: NodeId,
-        element: &str,
         claimed_ago: Duration,
     ) -> TestResult {
-        sqlx::query(
-            "UPDATE node_reconcile_queue
-                SET claim_token = 'node-ctl',
-                    claimed_at = NOW() - ($3 * INTERVAL '1 second')
-              WHERE node_id = $1 AND element = $2",
-        )
-        .bind(node_id)
-        .bind(element)
-        .bind(i64::try_from(claimed_ago.as_secs()).unwrap_or(i64::MAX))
-        .execute(pool)
-        .await?;
+        let statement = match claimed {
+            Claimed::Refs => {
+                "UPDATE node_reconcile_queue
+                    SET claim_token = 'node-ctl',
+                        claimed_at = NOW() - ($2 * INTERVAL '1 second')
+                  WHERE node_id = $1"
+            }
+            Claimed::Trigger => {
+                "UPDATE node_reconcile_triggers
+                    SET claim_token = 'node-ctl',
+                        claimed_at = NOW() - ($2 * INTERVAL '1 second')
+                  WHERE node_id = $1"
+            }
+        };
+        sqlx::query(statement)
+            .bind(node_id)
+            .bind(i64::try_from(claimed_ago.as_secs())?)
+            .execute(pool)
+            .await?;
         Ok(())
     }
 
@@ -886,186 +900,6 @@ mod postgres {
         .bind(node_id)
         .fetch_one(pool)
         .await?)
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn dead_prune_honors_retention_and_combined_limit() -> TestResult {
-        let Some(db) = try_pg_test_db().await? else {
-            return Ok(());
-        };
-        let node = insert_node(&db.pool, "ready", "uid-dead").await?;
-        insert_queue(&db.pool, node, "old-a", Duration::from_secs(120), true).await?;
-        insert_queue(&db.pool, node, "old-b", Duration::from_secs(120), true).await?;
-        insert_queue(&db.pool, node, "recent", Duration::from_secs(10), true).await?;
-        insert_trigger(&db.pool, node, Duration::from_secs(120), true).await?;
-        let store = QueueDbStore::new(db.pool.clone());
-
-        let first = store.prune_dead(Duration::from_secs(60), 2).await?;
-        assert_eq!(first.total(), 2);
-        let second = store.prune_dead(Duration::from_secs(60), 10).await?;
-        assert_eq!(second.total(), 1);
-        let remaining: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::BIGINT FROM node_reconcile_queue WHERE node_id = $1",
-        )
-        .bind(node)
-        .fetch_one(&db.pool)
-        .await?;
-        assert_eq!(remaining, 1, "recent dead ref must be retained");
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn candidate_scan_excludes_ready_draining_and_fresh() -> TestResult {
-        let Some(db) = try_pg_test_db().await? else {
-            return Ok(());
-        };
-        let offline = insert_node(&db.pool, "offline", "uid-offline").await?;
-        let registered = insert_node(&db.pool, "registered", "uid-registered").await?;
-        let ready = insert_node(&db.pool, "ready", "uid-ready").await?;
-        let draining = insert_node(&db.pool, "offline", "uid-draining").await?;
-        let fresh = insert_node(&db.pool, "offline", "uid-fresh").await?;
-        sqlx::query("UPDATE nodes SET drain_phase = 'draining' WHERE id = $1")
-            .bind(draining)
-            .execute(&db.pool)
-            .await?;
-        insert_queue(&db.pool, offline, "a", Duration::from_secs(120), false).await?;
-        insert_queue(&db.pool, registered, "a", Duration::from_secs(120), false).await?;
-        insert_queue(&db.pool, ready, "a", Duration::from_secs(120), false).await?;
-        insert_queue(&db.pool, draining, "a", Duration::from_secs(120), false).await?;
-        insert_queue(&db.pool, fresh, "a", Duration::from_secs(10), false).await?;
-        let store = QueueDbStore::new(db.pool.clone());
-
-        let mut ids: Vec<NodeId> = store
-            .list_gone_candidates(Duration::from_secs(60), 100, None)
-            .await?
-            .into_iter()
-            .map(|candidate| candidate.node_id)
-            .collect();
-        ids.sort();
-        let mut expected = vec![offline, registered];
-        expected.sort();
-        assert_eq!(ids, expected, "ready + draining + fresh excluded");
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn gone_prune_rechecks_uid_state_and_drain_without_touching_desired_state() -> TestResult
-    {
-        let Some(db) = try_pg_test_db().await? else {
-            return Ok(());
-        };
-        let node = insert_node(&db.pool, "offline", "uid-old").await?;
-        insert_queue(&db.pool, node, "old", Duration::from_secs(120), false).await?;
-        insert_trigger(&db.pool, node, Duration::from_secs(120), false).await?;
-        insert_queue(&db.pool, node, "recent", Duration::from_secs(10), false).await?;
-        let sandbox_id = SandboxId::new();
-        sqlx::query(
-            "INSERT INTO sandboxes (
-                 id, user_id, org_id, lifecycle, active_node_id,
-                 network_policy_generation
-             ) VALUES ($1, $2::UUID, $3::UUID, 'started', $4, 1)",
-        )
-        .bind(sandbox_id)
-        .bind(SEEDED_USER_ID)
-        .bind(SEEDED_ORG_ID)
-        .bind(node)
-        .execute(&db.pool)
-        .await?;
-        let store = QueueDbStore::new(db.pool.clone());
-        let grace = Duration::from_secs(60);
-
-        // UID drift preserves refs.
-        sqlx::query("UPDATE node_k8s SET k8s_node_uid = 'uid-new' WHERE node_id = $1")
-            .bind(node)
-            .execute(&db.pool)
-            .await?;
-        let drifted = store
-            .evaluate_gone_node(
-                node,
-                Some("uid-old".to_string()),
-                Duration::from_secs(60),
-                grace,
-                10,
-                QueueGcMode::Live,
-            )
-            .await?;
-        assert_eq!(
-            drifted,
-            GoneNodeEvaluation::default(),
-            "UID drift must preserve refs"
-        );
-        sqlx::query("UPDATE node_k8s SET k8s_node_uid = 'uid-old' WHERE node_id = $1")
-            .bind(node)
-            .execute(&db.pool)
-            .await?;
-
-        // A `ready` node is preserved (state re-checked under the lock).
-        sqlx::query("UPDATE nodes SET state = 'ready' WHERE id = $1")
-            .bind(node)
-            .execute(&db.pool)
-            .await?;
-        let ready = store
-            .evaluate_gone_node(
-                node,
-                Some("uid-old".to_string()),
-                Duration::from_secs(60),
-                grace,
-                10,
-                QueueGcMode::Live,
-            )
-            .await?;
-        assert_eq!(
-            ready,
-            GoneNodeEvaluation::default(),
-            "ready node must be preserved"
-        );
-        sqlx::query("UPDATE nodes SET state = 'offline' WHERE id = $1")
-            .bind(node)
-            .execute(&db.pool)
-            .await?;
-
-        let evaluation = store
-            .evaluate_gone_node(
-                node,
-                Some("uid-old".to_string()),
-                Duration::from_secs(60),
-                grace,
-                10,
-                QueueGcMode::Live,
-            )
-            .await?;
-        assert_eq!(
-            evaluation,
-            GoneNodeEvaluation {
-                eligible: PruneCounts {
-                    queue: 1,
-                    triggers: 1
-                },
-                deleted: PruneCounts {
-                    queue: 1,
-                    triggers: 1
-                },
-            }
-        );
-
-        let desired: (String, Option<NodeId>) =
-            sqlx::query_as("SELECT lifecycle, active_node_id FROM sandboxes WHERE id = $1")
-                .bind(sandbox_id)
-                .fetch_one(&db.pool)
-                .await?;
-        assert_eq!(desired, ("started".to_string(), Some(node)));
-        assert_eq!(
-            live_queue_count(&db.pool, node).await?,
-            1,
-            "fresh ref retained"
-        );
-        let node_still_exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM nodes WHERE id = $1)")
-                .bind(node)
-                .fetch_one(&db.pool)
-                .await?;
-        assert!(node_still_exists);
-        Ok(())
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1123,95 +957,130 @@ mod postgres {
         Ok(())
     }
 
+    /// Retention, in the same tests as the claim grace below. Every fixture
+    /// age falls between the two, or past the grace, so binding one in place
+    /// of the other, or as milliseconds, changes an outcome.
+    const RETENTION: Duration = Duration::from_secs(60);
+    const CLAIM_GRACE: Duration = Duration::from_secs(600);
+    /// Older than `RETENTION`, younger than `CLAIM_GRACE`.
+    const BETWEEN: Duration = Duration::from_secs(300);
+    /// Older than both.
+    const PAST_GRACE: Duration = Duration::from_secs(1200);
+
+    /// `prune_dead` and `list_gone_candidates` reach the store with the
+    /// retention in seconds and the caller's limit.
     #[tokio::test(flavor = "current_thread")]
-    async fn active_queue_claim_preserves_all_node_refs() -> TestResult {
+    async fn queue_db_store_prunes_dead_and_lists_candidates_by_retention_and_limit() -> TestResult
+    {
         let Some(db) = try_pg_test_db().await? else {
             return Ok(());
         };
-        let node = insert_node(&db.pool, "offline", "uid-node").await?;
-        insert_queue(
-            &db.pool,
-            node,
-            "fresh-claim",
-            Duration::from_secs(300),
-            false,
-        )
-        .await?;
-        insert_queue(
-            &db.pool,
-            node,
-            "stale-claim",
-            Duration::from_secs(300),
-            false,
-        )
-        .await?;
-        insert_queue(&db.pool, node, "unclaimed", Duration::from_secs(300), false).await?;
-        claim_queue_ref(&db.pool, node, "fresh-claim", Duration::from_secs(5)).await?;
-        claim_queue_ref(&db.pool, node, "stale-claim", Duration::from_secs(600)).await?;
         let store = QueueDbStore::new(db.pool.clone());
 
-        for mode in [QueueGcMode::DryRun, QueueGcMode::Live] {
-            let evaluation = store
-                .evaluate_gone_node(
-                    node,
-                    Some("uid-node".to_string()),
-                    Duration::from_secs(60),
-                    Duration::from_secs(60),
-                    10,
-                    mode,
-                )
-                .await?;
-            assert_eq!(
-                evaluation,
-                GoneNodeEvaluation::default(),
-                "a fresh node-ctl queue claim vetoes pruning for the entire node in {mode}"
-            );
+        let ready = insert_node(&db.pool, "ready", "uid-dead").await?;
+        insert_queue(&db.pool, ready, "old-a", BETWEEN, true).await?;
+        insert_queue(&db.pool, ready, "old-b", BETWEEN, true).await?;
+        insert_queue(&db.pool, ready, "recent", RETENTION / 2, true).await?;
+        insert_trigger(&db.pool, ready, BETWEEN, true).await?;
+        assert_eq!(store.prune_dead(RETENTION, 2).await?.total(), 2);
+        assert_eq!(store.prune_dead(RETENTION, 10).await?.total(), 1);
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::BIGINT FROM node_reconcile_queue WHERE node_id = $1",
+        )
+        .bind(ready)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(remaining, 1, "the dead ref within retention is kept");
+
+        let mut listed = Vec::new();
+        for (state, uid) in [("offline", "uid-offline"), ("registered", "uid-registered")] {
+            let node = insert_node(&db.pool, state, uid).await?;
+            insert_queue(&db.pool, node, "stale", BETWEEN, false).await?;
+            listed.push(candidate(node, &format!("ip-{node}.ec2.internal"), uid));
         }
-        assert_eq!(live_queue_count(&db.pool, node).await?, 3);
+        let fresh = insert_node(&db.pool, "offline", "uid-fresh").await?;
+        insert_queue(&db.pool, fresh, "fresh", RETENTION / 2, false).await?;
+        listed.sort_by_key(|candidate| candidate.node_id);
+
+        let page = store.list_gone_candidates(RETENTION, 1, None).await?;
+        assert_eq!(page, listed[..1]);
+        let rest = store
+            .list_gone_candidates(RETENTION, 10, Some(page[0].node_id))
+            .await?;
+        assert_eq!(rest, listed[1..], "the fresh node is not a candidate");
         Ok(())
     }
 
-    /// The candidate scan and the gone-node evaluation both bind the
-    /// Kubernetes substrate: a direct node with the same stale refs is neither
-    /// listed nor evaluated eligible, and keeps its refs.
+    /// `evaluate_gone_node` binds the retention to the request age and the
+    /// claim grace to the claim age, each in seconds, with the caller's limit.
     #[tokio::test(flavor = "current_thread")]
-    async fn direct_nodes_are_neither_listed_nor_pruned() -> TestResult {
+    async fn queue_db_store_binds_retention_and_claim_grace_to_their_own_checks() -> TestResult {
         let Some(db) = try_pg_test_db().await? else {
             return Ok(());
         };
-        let k8s = insert_node(&db.pool, "offline", "uid-k8s").await?;
-        let direct = insert_node(&db.pool, "offline", "uid-direct").await?;
-        sqlx::query("UPDATE nodes SET managed_by = 'space' WHERE id = $1")
-            .bind(direct)
-            .execute(&db.pool)
-            .await?;
-        for node in [k8s, direct] {
-            insert_queue(&db.pool, node, "old", Duration::from_secs(120), false).await?;
-        }
         let store = QueueDbStore::new(db.pool.clone());
+        let evaluate = |node: NodeId, uid: &'static str, limit: u32| {
+            store.evaluate_gone_node(
+                node,
+                Some(uid.to_owned()),
+                RETENTION,
+                CLAIM_GRACE,
+                limit,
+                QueueGcMode::Live,
+            )
+        };
+        let counts = |queue, triggers| PruneCounts { queue, triggers };
 
-        let ids: Vec<NodeId> = store
-            .list_gone_candidates(Duration::from_secs(60), 100, None)
-            .await?
-            .into_iter()
-            .map(|candidate| candidate.node_id)
-            .collect();
-        assert_eq!(ids, vec![k8s]);
+        // Requested past retention, within the grace: both are pruned, one per
+        // call under a limit of one.
+        let requested = insert_node(&db.pool, "offline", "uid-requested").await?;
+        insert_queue(&db.pool, requested, "ref", BETWEEN, false).await?;
+        insert_trigger(&db.pool, requested, BETWEEN, false).await?;
+        let first = evaluate(requested, "uid-requested", 1).await?;
+        assert_eq!(first.deleted.total(), 1);
+        assert_eq!(first.deleted, first.eligible);
+        let second = evaluate(requested, "uid-requested", 1).await?;
+        assert_eq!(second.deleted.total(), 1);
+        assert_eq!(
+            counts(
+                first.deleted.queue + second.deleted.queue,
+                first.deleted.triggers + second.deleted.triggers
+            ),
+            counts(1, 1)
+        );
 
-        for (node, uid, expected) in [(k8s, "uid-k8s", 1), (direct, "uid-direct", 0)] {
-            let evaluation = store
-                .evaluate_gone_node(
-                    node,
-                    Some(uid.to_string()),
-                    Duration::from_secs(60),
-                    Duration::from_secs(60),
-                    10,
-                    QueueGcMode::Live,
-                )
-                .await?;
-            assert_eq!(evaluation.deleted.queue, expected);
-            assert_eq!(live_queue_count(&db.pool, node).await?, 1 - expected as i64);
-        }
+        // A ref claimed within the grace, but past retention, vetoes the node.
+        let claimed = insert_node(&db.pool, "offline", "uid-claimed").await?;
+        insert_queue(&db.pool, claimed, "ref", PAST_GRACE, false).await?;
+        claim(&db.pool, Claimed::Refs, claimed, BETWEEN).await?;
+        assert_eq!(
+            evaluate(claimed, "uid-claimed", 10).await?,
+            GoneNodeEvaluation::default()
+        );
+        assert_eq!(live_queue_count(&db.pool, claimed).await?, 1);
+
+        // A ref claimed past the grace is pruned and vetoes nothing; the
+        // trigger's own claim, within the grace, keeps only the trigger.
+        let stale = insert_node(&db.pool, "offline", "uid-stale-claim").await?;
+        insert_queue(&db.pool, stale, "ref", PAST_GRACE, false).await?;
+        insert_trigger(&db.pool, stale, PAST_GRACE, false).await?;
+        claim(&db.pool, Claimed::Refs, stale, PAST_GRACE).await?;
+        claim(&db.pool, Claimed::Trigger, stale, BETWEEN).await?;
+        assert_eq!(
+            evaluate(stale, "uid-stale-claim", 10).await?,
+            GoneNodeEvaluation {
+                eligible: counts(1, 0),
+                deleted: counts(1, 0),
+            }
+        );
+        assert_eq!(live_queue_count(&db.pool, stale).await?, 0);
+        let triggers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::BIGINT FROM node_reconcile_triggers WHERE node_id = $1",
+        )
+        .bind(stale)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(triggers, 1);
         Ok(())
     }
 }

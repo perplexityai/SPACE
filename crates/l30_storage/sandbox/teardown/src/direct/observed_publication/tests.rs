@@ -1,6 +1,8 @@
 //! The observed-state publication writes against Postgres, with a Direct
 //! route identity seeded: each accepts a sandbox placed on the publishing
-//! node through its route identity, or one with no row, and skips the rest.
+//! node through its route identity, or one with no row, and skips the rest,
+//! including one whose active node is the publisher but whose route identity
+//! moved it elsewhere.
 
 use std::collections::BTreeSet;
 
@@ -25,6 +27,9 @@ struct Placement {
     routed: SandboxId,
     /// Placed on another node.
     elsewhere: SandboxId,
+    /// Active on `publisher`, but placed on another node by its route
+    /// identity.
+    routed_away: SandboxId,
 }
 
 async fn placement(pool: &PgPool) -> TestDbResult<Placement> {
@@ -39,7 +44,7 @@ async fn placement(pool: &PgPool) -> TestDbResult<Placement> {
     .execute(pool)
     .await?;
     let mut placed = Vec::new();
-    for _ in 0..2 {
+    for active_node in [other, other, publisher] {
         let sandbox_id = insert_suspended_sandbox(
             pool,
             OrgId::from_uuid(SEED_ORG_ID),
@@ -52,27 +57,30 @@ async fn placement(pool: &PgPool) -> TestDbResult<Placement> {
               WHERE id = $1"
         ))
         .bind(sandbox_id)
-        .bind(other)
+        .bind(active_node)
         .execute(pool)
         .await?;
         placed.push(sandbox_id);
     }
-    sqlx::query(sql!(
-        "INSERT INTO sandbox_direct_route_identities (
-             sandbox_id, route_generation, current_node_id, substrate_kind,
-             execution_generation, activation_attempt_id
-         )
-         VALUES ($1, 1, $2, 'space', 1, $3)"
-    ))
-    .bind(placed[0])
-    .bind(publisher)
-    .bind(Uuid::now_v7())
-    .execute(pool)
-    .await?;
+    for (sandbox_id, current_node) in [(placed[0], publisher), (placed[2], other)] {
+        sqlx::query(sql!(
+            "INSERT INTO sandbox_direct_route_identities (
+                 sandbox_id, route_generation, current_node_id, substrate_kind,
+                 execution_generation, activation_attempt_id
+             )
+             VALUES ($1, 1, $2, 'space', 1, $3)"
+        ))
+        .bind(sandbox_id)
+        .bind(current_node)
+        .bind(Uuid::now_v7())
+        .execute(pool)
+        .await?;
+    }
     Ok(Placement {
         publisher,
         routed: placed[0],
         elsewhere: placed[1],
+        routed_away: placed[2],
     })
 }
 
@@ -111,6 +119,7 @@ async fn degraded_observations_are_fenced_on_placement() -> TestDbResult<()> {
         &[
             degraded(placement.routed, Some("started")),
             degraded(placement.elsewhere, Some("started")),
+            degraded(placement.routed_away, Some("started")),
             degraded(rowless, None),
         ],
     )
@@ -128,6 +137,7 @@ async fn degraded_observations_are_fenced_on_placement() -> TestDbResult<()> {
         Some((placement.publisher, None, false))
     );
     assert_eq!(stored(pool, placement.elsewhere).await?, None);
+    assert_eq!(stored(pool, placement.routed_away).await?, None);
 
     // A NULL status keeps the stored one.
     write_degraded_observed_states(
@@ -216,6 +226,7 @@ async fn published_observations_write_only_what_changed_on_the_placed_node() -> 
     let first = [
         published(placement.routed, "started"),
         published(placement.elsewhere, "started"),
+        published(placement.routed_away, "started"),
         published(rowless, "started"),
     ];
     assert_eq!(
@@ -224,9 +235,10 @@ async fn published_observations_write_only_what_changed_on_the_placed_node() -> 
             (placement.routed, true, true, false, true, true),
             (rowless, false, true, false, true, true),
         ]),
-        "the sandbox placed elsewhere is not accepted"
+        "the sandboxes placed elsewhere are not accepted"
     );
     assert_eq!(stored(pool, placement.elsewhere).await?, None);
+    assert_eq!(stored(pool, placement.routed_away).await?, None);
     let network_bytes: (Option<i64>, Option<i64>) = sqlx::query_as(sql!(
         "SELECT network_tx_bytes, network_rx_bytes
            FROM sandbox_observed_states

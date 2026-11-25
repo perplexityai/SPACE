@@ -1816,8 +1816,9 @@ async fn a_release_is_published_once_a_storage_location_is_registered() -> TestR
 /// Widening an org-specific template whose content is wrapped under its
 /// owner's key to `generic` would make it launchable-but-undecryptable for
 /// every other org — the RFC forbids it and defers re-keying. The guard
-/// must report the per-template encryption sidecar so the handler refuses
-/// the widen; a template without a sidecar is safe to widen.
+/// must report the per-template encryption sidecar, or one on a storage
+/// location of any of its releases, so the handler refuses the widen; a
+/// template without either is safe to widen, plaintext locations included.
 #[tokio::test(flavor = "current_thread")]
 async fn widen_guard_detects_owner_encryption() -> TestResult {
     // Seeded by the baseline migration's fixture data.
@@ -1826,7 +1827,12 @@ async fn widen_guard_detects_owner_encryption() -> TestResult {
         return Ok(());
     };
     let pool = &db.pool;
-    for name in ["plain-owned", "encrypted-owned"] {
+    for name in [
+        "plain-owned",
+        "encrypted-owned",
+        "plain-location-owned",
+        "encrypted-location-owned",
+    ] {
         sqlx::query(
             "INSERT INTO templates (id, name, org_id, visibility)
              VALUES ($1, $2, $3, 'org_specific')",
@@ -1856,10 +1862,53 @@ async fn widen_guard_detects_owner_encryption() -> TestResult {
     .bind(key_id)
     .execute(pool)
     .await?;
+    for name in ["plain-location-owned", "encrypted-location-owned"] {
+        let release: Uuid = sqlx::query_scalar(
+            "INSERT INTO template_releases (template_name, type, hash, org_id)
+             VALUES ($1, 'fc', $2, $3)
+             RETURNING id",
+        )
+        .bind(name)
+        .bind(HASH)
+        .bind(ORG_A)
+        .fetch_one(pool)
+        .await?;
+        let location_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO template_release_storage_locations
+                 (template_release_id, storage_connection_string, org_id)
+             VALUES ($1, '', $2)
+             RETURNING id",
+        )
+        .bind(release)
+        .bind(ORG_A)
+        .fetch_one(pool)
+        .await?;
+        if name == "encrypted-location-owned" {
+            sqlx::query(
+                "INSERT INTO template_release_storage_location_encrypted_fields
+                     (template_release_storage_location_id, org_id, master_key_id, wrapped_dek,
+                      storage_connection_string)
+                 VALUES ($1, $2, $3, '\\x00', '\\x00')",
+            )
+            .bind(location_id)
+            .bind(ORG_A)
+            .bind(key_id)
+            .execute(pool)
+            .await?;
+        }
+    }
 
     assert!(
         !template_has_owner_encryption(pool, "plain-owned").await?,
         "a template with no encryption sidecar is safe to widen"
+    );
+    assert!(
+        !template_has_owner_encryption(pool, "plain-location-owned").await?,
+        "a plaintext storage location is safe to widen"
+    );
+    assert!(
+        template_has_owner_encryption(pool, "encrypted-location-owned").await?,
+        "an encrypted storage location must block the widen"
     );
     assert!(
         template_has_owner_encryption(pool, "encrypted-owned").await?,
