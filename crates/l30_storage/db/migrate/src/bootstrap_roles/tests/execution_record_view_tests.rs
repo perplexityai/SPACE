@@ -282,6 +282,26 @@ async fn upsert_node_identity(
         .rows_affected())
 }
 
+/// Whether the server refuses an `ON CONFLICT DO UPDATE` through a view at a
+/// conflicting row the view hides, as the fix for CVE-2026-16237 (14.25,
+/// 15.20, 16.16, 17.12, 18.7 and later) does. Older servers update the hidden
+/// row instead.
+async fn refuses_hidden_conflicts(conn: &mut PgConnection) -> TestResult<bool> {
+    let version: i32 =
+        sqlx::query_scalar(sql!("SELECT current_setting('server_version_num')::int"))
+            .fetch_one(&mut *conn)
+            .await?;
+    Ok(match version / 10_000 {
+        major if major < 14 => false,
+        14 => version >= 140_025,
+        15 => version >= 150_020,
+        16 => version >= 160_016,
+        17 => version >= 170_012,
+        18 => version >= 180_007,
+        _ => true,
+    })
+}
+
 fn assert_sqlstate<T: std::fmt::Debug>(result: sqlx::Result<T>, expected: &str) {
     let error = result.expect_err("the statement must fail");
     assert_eq!(
@@ -537,11 +557,17 @@ async fn views_hide_other_substrates_rows_but_their_unique_indexes_still_arbitra
     // another claim had won, though the view shows no active execution for the
     // sandbox...
     assert_eq!(claim_execution(&mut conn, &sandbox_id, 2).await?, None);
-    // ...and the inventory's DO UPDATE reaches the hidden row, whose updated
-    // version the check option refuses.
+    // ...and the inventory's DO UPDATE fails on the hidden row. A server with
+    // the fix refuses the conflict itself (55000); an older one updates the
+    // hidden row, and the check option refuses its new version (44000).
+    let expected = if refuses_hidden_conflicts(&mut conn).await? {
+        "55000"
+    } else {
+        "44000"
+    };
     assert_sqlstate(
         upsert_node_identity(&mut conn, &node_id, "node-a", "uid-1").await,
-        "44000",
+        expected,
     );
 
     // A retired hidden row at generation 1 on a sandbox with no Kubernetes
