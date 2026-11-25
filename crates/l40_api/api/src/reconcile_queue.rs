@@ -12,9 +12,6 @@ use pplx_space_sandbox_store::fork_source_lifecycle::{
 };
 use pplx_space_sandbox_store::orphan::lock_orphan_observation;
 
-pub use pplx_space_sandbox_teardown::{
-    delete_reconcile_state_for_elements, sandbox_reconcile_cleanup_refs,
-};
 pub use pplx_space_state_reconciliation::{
     NetworkPolicyTarget, ReconcileElementRef, ReconcileFacet, ReconcileReason, ReconcileRef,
 };

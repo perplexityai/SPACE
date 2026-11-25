@@ -363,7 +363,7 @@ pub struct TemplateWarmPoolUsage {
     /// sandboxes created from the pool. Each stays until its sandbox's pod
     /// is retired, whatever its config's state.
     pub sandbox_held_slots: i64,
-    /// Up to [`TEMPLATE_USAGE_SANDBOX_ID_LIMIT`] of the sandboxes holding
+    /// Up to `TEMPLATE_USAGE_SANDBOX_ID_LIMIT` of the sandboxes holding
     /// those slots, oldest claim first, then by id.
     pub sandbox_ids: Vec<SandboxId>,
     /// Enabled policies for the template name, by shape.
@@ -371,7 +371,7 @@ pub struct TemplateWarmPoolUsage {
 }
 
 /// How many sandbox ids [`TemplateWarmPoolUsage::sandbox_ids`] names.
-pub const TEMPLATE_USAGE_SANDBOX_ID_LIMIT: usize = 5;
+pub(crate) const TEMPLATE_USAGE_SANDBOX_ID_LIMIT: usize = 5;
 
 impl TemplateWarmPoolUsage {
     pub fn is_empty(&self) -> bool {
