@@ -5,9 +5,7 @@ use rusqlite::params;
 async fn send_source_census_keeps_all_unfinished_jobs_including_cancellation() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("volume-manager.sqlite");
-    pplx_space_volmgr_store::database::migrate(&path)
-        .await
-        .unwrap();
+    crate::database::migrate(&path).await.unwrap();
     let mut conn = rusqlite::Connection::open(&path).unwrap();
     let mut expected = Vec::new();
     // One transaction for the seed: committing each row would pay a sync per
@@ -41,7 +39,7 @@ async fn send_source_census_keeps_all_unfinished_jobs_including_cancellation() {
     )
     .unwrap();
     seed.commit().unwrap();
-    let conn = Connection::from_raw(conn);
+    let conn = Connection(conn);
     let mut actual = active_btrfs_upload_payloads(&conn).unwrap();
     actual.sort();
     expected.sort();
@@ -52,10 +50,8 @@ async fn send_source_census_keeps_all_unfinished_jobs_including_cancellation() {
 async fn historical_attachment_keys_remain_addressable_without_merging_aliases() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("volume-manager.sqlite");
-    pplx_space_volmgr_store::database::migrate(&path)
-        .await
-        .unwrap();
-    let conn = Connection::from_raw(rusqlite::Connection::open(&path).unwrap());
+    crate::database::migrate(&path).await.unwrap();
+    let conn = Connection(rusqlite::Connection::open(&path).unwrap());
     let spellings = [
         "019d84bd-280d-7331-99c6-b63377f3a3a2",
         "019D84BD-280D-7331-99C6-B63377F3A3A2",
@@ -66,7 +62,7 @@ async fn historical_attachment_keys_remain_addressable_without_merging_aliases()
     // The old writer stored spelling verbatim. Alias rows may disagree, so
     // normalizing the key would either hide a row or merge distinct attachments.
     for (index, raw) in spellings.iter().enumerate() {
-        conn.raw()
+        conn.0
             .execute(
                 "INSERT INTO volume_attachments (sandbox_id, name, s3_bucket, s3_region)
              VALUES (?1, 'data', ?2, 'us-east-1')",
@@ -75,17 +71,15 @@ async fn historical_attachment_keys_remain_addressable_without_merging_aliases()
             .unwrap();
     }
     for (index, raw) in spellings.iter().enumerate() {
-        let attachments = list_attachments(&conn, &raw.parse().unwrap()).unwrap();
+        let mut attachments = list_attachments(&conn, &raw.parse().unwrap()).unwrap();
         assert_eq!(attachments.len(), 1, "{raw}");
         assert_eq!(attachments[0].s3_bucket, format!("bucket-{index}"), "{raw}");
-        let mut attachment = get_attachment(&conn, &raw.parse().unwrap(), "data")
-            .unwrap()
-            .unwrap();
+        let mut attachment = attachments.remove(0);
         attachment.s3_bucket = format!("updated-{index}");
         upsert_attachment(&conn, &raw.parse().unwrap(), &attachment).unwrap();
         // Old binaries must see the same update after a rollback.
         let bucket: String = conn
-            .raw()
+            .0
             .query_row(
                 "SELECT s3_bucket FROM volume_attachments WHERE sandbox_id = ?1 AND name = 'data'",
                 [raw],
@@ -100,7 +94,7 @@ async fn historical_attachment_keys_remain_addressable_without_merging_aliases()
                 .is_empty()
         );
         let remaining: i64 = conn
-            .raw()
+            .0
             .query_row("SELECT count(*) FROM volume_attachments", [], |row| {
                 row.get(0)
             })
@@ -109,7 +103,7 @@ async fn historical_attachment_keys_remain_addressable_without_merging_aliases()
         // A newly inserted key also remains readable by an old binary.
         upsert_attachment(&conn, &raw.parse().unwrap(), &attachment).unwrap();
         let stored: String = conn
-            .raw()
+            .0
             .query_row(
                 "SELECT s3_bucket FROM volume_attachments WHERE sandbox_id = ?1 AND name = 'data'",
                 [raw],

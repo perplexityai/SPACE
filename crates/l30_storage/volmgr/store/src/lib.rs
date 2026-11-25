@@ -129,30 +129,6 @@ pub fn list_attachments(
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-pub fn get_attachment(
-    conn: &Connection,
-    sandbox_id: &AttachmentSandboxKey,
-    volume_name: &str,
-) -> Result<Option<VolumeAttachment>> {
-    let mut stmt = conn.0.prepare(sql!(
-        "SELECT name, s3_bucket, s3_prefix, s3_region, read_only, byok_key_id
-         FROM volume_attachments
-         WHERE sandbox_id = ?1 AND name = ?2
-         LIMIT 1"
-    ))?;
-    let mut rows = stmt.query_map(params![sandbox_id.0.as_ref(), volume_name], |row| {
-        Ok(VolumeAttachment {
-            name: row.get(0)?,
-            s3_bucket: row.get(1)?,
-            s3_prefix: row.get(2)?,
-            s3_region: row.get(3)?,
-            read_only: row.get::<_, i32>(4)? != 0,
-            byok_key_id: row.get(5)?,
-        })
-    })?;
-    Ok(rows.next().transpose()?)
-}
-
 // ---------------------------------------------------------------------------
 // Job censuses
 // ---------------------------------------------------------------------------
@@ -229,3 +205,6 @@ pub fn pending_or_running_job_payloads(
     rows.map(|row| row.map_err(|error| JobPayloadsError::Row(error.into())))
         .collect()
 }
+
+#[cfg(test)]
+mod tests;
