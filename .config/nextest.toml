@@ -40,6 +40,7 @@ filter = '''
  and not package(pplx-space-db-migrate))
 or test(postgres_collision_repair_tests)
 or test(postgres_lock_retry_tests)
+or test(postgres_invalid_index_tests)
 or (package(pplx-space-db-migrate) and test(user_password::))
 or (package(pplx-space-db-migrate) and test(postgres_baseline_tests::))
 '''
