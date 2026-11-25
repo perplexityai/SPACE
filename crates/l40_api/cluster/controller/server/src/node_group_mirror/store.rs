@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use pplx_space_node_model::NodeGroupId;
 use pplx_space_node_registration_store::node_group;
-use pplx_space_sql_locator::sql;
+use pplx_space_postgres_pool::TxSettings as _;
 use sqlx::{Connection, PgConnection, PgExecutor, Postgres, Transaction};
 
 /// `node_groups` as `name -> id`.
@@ -29,8 +29,8 @@ pub(super) async fn group_ids_by_name<'e>(
 /// `idle_in_transaction_session_timeout` set for that transaction only and the
 /// UPDATE prepared.
 ///
-/// `is_local = true`: the bounds end with the transaction, so the connection
-/// goes back to the pool with the role's own settings. Preparing here makes
+/// The bounds end with the transaction, so the connection goes back to the
+/// pool with the role's own settings. Preparing here makes
 /// [`mirror_worker_groups`] on the transaction a statement-cache hit, one round
 /// trip, and puts any cache eviction in this setup rather than in the write.
 pub(super) async fn begin_mirror_write(
@@ -39,14 +39,9 @@ pub(super) async fn begin_mirror_write(
     idle_timeout: Duration,
 ) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
     let mut tx = conn.begin().await?;
-    sqlx::query(sql!(
-        "SELECT set_config('statement_timeout', $1, true),
-                set_config('idle_in_transaction_session_timeout', $2, true)"
-    ))
-    .bind(format!("{}ms", statement_timeout.as_millis()))
-    .bind(format!("{}ms", idle_timeout.as_millis()))
-    .execute(&mut *tx)
-    .await?;
+    tx.set_local_statement_timeout(statement_timeout).await?;
+    tx.set_local_idle_in_transaction_timeout(idle_timeout)
+        .await?;
     node_group::prepare_mirror_worker_node_groups(&mut *tx).await?;
     Ok(tx)
 }

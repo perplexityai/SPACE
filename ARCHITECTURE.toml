@@ -515,6 +515,7 @@ pplx-space-postgres-pool = [
   "pplx-space-internal-api-server",
   "pplx-space-node-registration-store",
   "pplx-space-node-template-inventory-store",
+  "pplx-space-runtime-environment-catalog-store",
 ]
 pplx-space-public-operation-store = ["pplx-space-api"]
 pplx-space-runtime-environment-catalog-store = [

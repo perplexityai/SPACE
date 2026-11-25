@@ -1,10 +1,12 @@
 //! Recovery of an abandoned publication after its only execution disappeared.
 
+use std::time::Duration;
+
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::TxSettings as _;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_store::k8s_executions::quarantine_recovery;
 use pplx_space_sandbox_store::{quarantine_recovery_candidates, row_locks};
-use pplx_space_sql_locator::sql;
 use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
@@ -27,9 +29,7 @@ pub(super) async fn candidates<'e>(
 /// activity timestamp, or user operation invalidates the absence proof.
 pub(super) async fn recover(pool: &PgPool, expected: &Candidate) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query(sql!("SET LOCAL lock_timeout = '2s'"))
-        .execute(&mut *tx)
-        .await?;
+    tx.set_local_lock_timeout(Duration::from_secs(2)).await?;
     row_locks::lock_id(&mut tx, expected.sandbox_id).await?;
     pplx_space_sandbox_quarantine_store::locks::lock_quarantine_state(&mut tx, expected.sandbox_id)
         .await?;

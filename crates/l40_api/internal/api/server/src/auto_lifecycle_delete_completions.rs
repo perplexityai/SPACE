@@ -11,6 +11,7 @@ use pplx_space_auto_lifecycle_receipt::{
     AUTO_LIFECYCLE_DELETE_COMPLETION_REQUEST_LIMIT, AutoLifecyclePolicyFingerprint,
     AutoLifecyclePolicyFingerprintParseError,
 };
+use pplx_space_postgres_pool::TxSettings as _;
 use pplx_space_postgres_pool::contention::{self, is_lock_not_available};
 use pplx_space_sandbox_metrics::publication::{
     AutoLifecycleDeleteCompletionDisposition, AutoLifecycleDeleteCompletionReason,
@@ -25,7 +26,6 @@ use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use pplx_space_sandbox_store::auto_lifecycle_delete_completion;
 use pplx_space_sandbox_store::delete::delete_with_dependents;
 use pplx_space_sandbox_store::k8s_executions::auto_lifecycle_delete;
-use pplx_space_sql_locator::sql;
 use sqlx::{Acquire as _, Postgres, Transaction};
 use tonic::Status;
 
@@ -345,12 +345,7 @@ pub(super) async fn consume_auto_lifecycle_delete_completions(
     // holds the batch's sandbox row locks. Bound them for the remainder of the
     // publication transaction; receipt consumption is its last work, and the
     // expiry raises 55P03, which the contention paths already classify.
-    sqlx::query(sql!("SELECT set_config('lock_timeout', $1, TRUE)"))
-        .bind(format!(
-            "{}ms",
-            AUTO_LIFECYCLE_DELETE_COMPLETION_LOCK_TIMEOUT.as_millis()
-        ))
-        .execute(&mut **tx)
+    tx.set_local_lock_timeout(AUTO_LIFECYCLE_DELETE_COMPLETION_LOCK_TIMEOUT)
         .await
         .map_err(|error| {
             Status::internal(format!(
