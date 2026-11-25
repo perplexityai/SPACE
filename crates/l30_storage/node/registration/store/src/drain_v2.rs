@@ -557,14 +557,6 @@ impl LockedV2Node {
             && self.drain_phase.as_deref() == Some(phase)
             && self.generation == Some(generation)
     }
-
-    /// The undrained v2 row of `generation`'s drain, its cancel not yet
-    /// finished: a v2 engine with no phase, under that generation.
-    pub fn is_v2_cancel(&self, generation: i64) -> bool {
-        self.drain_engine.as_deref() == NodeDrainEngine::V2.column()
-            && self.drain_phase.is_none()
-            && self.generation == Some(generation)
-    }
 }
 
 /// Whether `node_id`'s row is still the v2 drain a listing read: the v2
