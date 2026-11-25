@@ -1,6 +1,6 @@
 use pplx_space_sandbox_model::SandboxId;
 
-use pplx_space_sandbox_store::observed_states::{self, ObservedStateWithNode};
+use pplx_space_sandbox_teardown::observed_states::{self, ObservedStateWithNode};
 use sqlx::PgPool;
 
 use crate::routes::debug::{response::ObservedResources, sources::begin_read_only};

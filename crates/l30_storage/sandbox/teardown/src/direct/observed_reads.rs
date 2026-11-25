@@ -10,7 +10,7 @@ use pplx_space_sql_locator::sql;
 use sqlx::PgExecutor;
 use sqlx::types::Json;
 
-use crate::ObservedSpacedVersion;
+use crate::observed_states::ObservedSpacedVersion;
 
 #[cfg(test)]
 mod tests;

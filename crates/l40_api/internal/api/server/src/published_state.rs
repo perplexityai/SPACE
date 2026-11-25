@@ -44,11 +44,11 @@ use pplx_space_state_reconciliation::{
 use pplx_space_template_mgr_client::proto::SnapshotInfo;
 
 use crate::proto::{PublishedSandboxState, PublishedTemplateState};
-use pplx_space_sandbox_store::direct::observed_publication::AcceptedSandboxPublishRow;
 use pplx_space_sandbox_store::ingest::SuspendedFinalizationCandidate;
 use pplx_space_sandbox_store::published_quarantine_candidates::{
     self, PublishedQuarantineCandidate,
 };
+use pplx_space_sandbox_teardown::direct::observed_publication::AcceptedSandboxPublishRow;
 use pplx_space_sandbox_teardown::{conditions, direct, observed_status};
 
 use super::{optional_trimmed, parse_sandbox_id, proto_network_policy_to_common, trimmed_required};
@@ -1516,7 +1516,7 @@ pub(super) async fn publish_sandbox_states_with_census(
 
     let mut accepted = 0_u64;
     if !absent_ids.is_empty() {
-        let deleted = pplx_space_sandbox_store::observed_states::delete_absent_on_node(
+        let deleted = pplx_space_sandbox_teardown::observed_states::delete_absent_on_node(
             &mut *conn,
             node_id,
             &absent_ids,
@@ -1585,7 +1585,7 @@ pub(super) async fn publish_sandbox_states_with_census(
 
     if !state_only.is_empty() {
         let result =
-            pplx_space_sandbox_store::direct::observed_publication::write_degraded_observed_states(
+            pplx_space_sandbox_teardown::direct::observed_publication::write_degraded_observed_states(
                 &mut *conn,
                 node_id,
                 serde_json::Value::Array(state_only.values().cloned().collect()),
@@ -1875,7 +1875,7 @@ pub(super) async fn publish_sandbox_states_with_census(
     .await?;
 
     if publishes_network_policy {
-        pplx_space_sandbox_store::observed_states::record_network_policy_authority(
+        pplx_space_sandbox_teardown::observed_states::record_network_policy_authority(
             &mut *conn,
             node_id,
             &rows_json.0,
@@ -2243,7 +2243,7 @@ async fn write_observed_states(
         .map(PublishedSandboxRow::observed_state)
         .collect::<Vec<_>>();
     let accepted_rows =
-        pplx_space_sandbox_store::direct::observed_publication::write_published_observed_states(
+        pplx_space_sandbox_teardown::direct::observed_publication::write_published_observed_states(
             &mut *conn, node_id, &published,
         )
         .await

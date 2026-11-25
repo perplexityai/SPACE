@@ -1,5 +1,7 @@
 //! `sandbox_snapshot_inventory`: the snapshots each sandbox's node last
-//! published for it, one row per `(sandbox, snapshot)`.
+//! published for it, one row per `(sandbox, snapshot)`. Its rows reference
+//! `sandbox_observed_states` (`pplx-space-sandbox-teardown`'s) with `ON DELETE
+//! CASCADE`: deleting a sandbox's observed row deletes its inventory rows.
 //!
 //! The census prune of rows for sandboxes no longer reported is part of
 //! [`crate::ingest`]. [`prune_unpublished`] and [`upsert_published`] are the

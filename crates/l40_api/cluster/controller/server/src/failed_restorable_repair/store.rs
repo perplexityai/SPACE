@@ -64,7 +64,7 @@ impl RepairDbStore {
         // unassigned sandboxes are unpublishable. The shape is re-pinned so
         // a projection that turned live since the guard ran survives (the
         // CAS would have refused the flip in that case anyway).
-        pplx_space_sandbox_store::observed_states::clear_failed_observation(
+        pplx_space_sandbox_teardown::observed_states::clear_failed_observation(
             &mut tx,
             candidate.sandbox_id,
         )

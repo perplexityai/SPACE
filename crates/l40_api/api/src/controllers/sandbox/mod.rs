@@ -15,7 +15,7 @@ use pplx_space_node_mgr_client::proto::{AllowPortRequest, ExposePortRequest, Net
 use pplx_space_node_model::NodePoolName;
 use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
-use pplx_space_sandbox_store::ObservedSpacedVersion;
+use pplx_space_sandbox_teardown::observed_states::ObservedSpacedVersion;
 use pplx_space_sbx_mgr_client::operations as spaced_ops;
 use pplx_space_sbx_mgr_client::proto::{
     AutoLifecycleTouchResult, CreateSnapshotRequest, KillRequest, ListSnapshotsRequest,
@@ -97,10 +97,10 @@ struct SandboxObservedState {
     network_policy_conditions: sqlx::types::Json<Vec<NetworkPolicyCondition>>,
 }
 
-impl From<pplx_space_sandbox_store::direct::observed_reads::ObservedStateRow>
+impl From<pplx_space_sandbox_teardown::direct::observed_reads::ObservedStateRow>
     for SandboxObservedState
 {
-    fn from(row: pplx_space_sandbox_store::direct::observed_reads::ObservedStateRow) -> Self {
+    fn from(row: pplx_space_sandbox_teardown::direct::observed_reads::ObservedStateRow) -> Self {
         Self {
             sandbox_id: row.sandbox_id,
             node_id: row.node_id,

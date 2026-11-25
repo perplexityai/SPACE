@@ -2,12 +2,16 @@
 //! puts the previous lifecycle back when the delete fails, and the hard
 //! delete of the row with the dependents it clears in the same transaction
 //! (observed state, reconcile state and claimed warm-pool slots are deleted,
-//! and snapshot storage locations are detached).
+//! and snapshot storage locations are detached). The observed state and the
+//! reconcile state's observed-status and condition rows are
+//! `pplx-space-sandbox-teardown`'s, and its queued refs
+//! `pplx-space-cluster-trigger-queue`'s; teardown's verbs delete all of them in
+//! the same transaction.
 
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 
 use pplx_space_sandbox_teardown::{
-    delete_reconcile_state_for_elements, sandbox_reconcile_cleanup_refs,
+    delete_reconcile_state_for_elements, observed_states, sandbox_reconcile_cleanup_refs,
 };
 use pplx_space_sql_locator::sql;
 use sqlx::{Postgres, Transaction};
@@ -103,12 +107,7 @@ pub async fn delete_with_dependents(
     sandbox_id: SandboxId,
 ) -> Result<(), sqlx::Error> {
     let cleanup_refs = sandbox_reconcile_cleanup_refs(sandbox_id);
-    sqlx::query(sql!(
-        "DELETE FROM sandbox_observed_states WHERE sandbox_id = $1"
-    ))
-    .bind(sandbox_id.as_uuid())
-    .execute(&mut **tx)
-    .await?;
+    observed_states::delete(&mut **tx, sandbox_id).await?;
     delete_reconcile_state_for_elements(tx, &cleanup_refs).await?;
     sqlx::query(sql!(
         "UPDATE snapshot_storage_locations

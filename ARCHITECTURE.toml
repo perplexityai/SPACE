@@ -866,6 +866,11 @@ node_facet_observed_status = ["pplx-space-sandbox-store"]
 # Teardown deletes an element's queued refs in the caller's transaction.
 # Temporary: the delete moves into cluster-trigger-queue and teardown calls it.
 node_reconcile_queue = ["pplx-space-sandbox-teardown"]
+# Pause-failed recovery and the census prune write sandboxes in the same
+# statement as the observed rows.
+# Temporary: it goes once neither statement writes the table, after a
+# pause-failed recovery coordinator and the census prune's own split.
+sandbox_observed_states = ["pplx-space-sandbox-store"]
 # Pause-failed recovery retires the quarantine in its sandboxes update.
 # Temporary: the recovery calls sandbox-quarantine-store for the quarantine.
 sandbox_quarantine_history = ["pplx-space-sandbox-store"]

@@ -19,7 +19,11 @@
 //! tables (`sandbox_k8s_executions`, `sandbox_port_exposures`,
 //! `sandbox_observed_states`, the quarantine and node-facet tables,
 //! `sandbox_snapshot_inventory`, `snapshot_storage_locations`): splitting one
-//! would change what it does. The caller owns the transaction, the other
+//! would change what it does. `sandbox_observed_states` and the node-facet
+//! tables are `pplx-space-sandbox-teardown`'s, and the quarantine tables
+//! `pplx-space-sandbox-quarantine-store`'s: the pause-failed recovery and the
+//! census prune write them under temporary co-writer grants in
+//! `ARCHITECTURE.toml`. The caller owns the transaction, the other
 //! tables' own statements and the events it emits, and takes the locking
 //! reads that select candidates, some of them through
 //! [`crate::quarantine_publication`].

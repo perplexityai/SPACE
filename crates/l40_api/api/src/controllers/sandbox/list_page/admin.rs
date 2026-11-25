@@ -335,7 +335,7 @@ impl SandboxController {
         // org-scoped count has no such rows. A row that appears between the
         // two reads counts as observed-local until the next count.
         let pool_reserved = if org_id.is_none() {
-            let rowless = pplx_space_sandbox_store::observed_states::rowless_sandbox_ids(pool)
+            let rowless = pplx_space_sandbox_teardown::observed_states::rowless_sandbox_ids(pool)
                 .await
                 .map_err(|err| db_contention_error("list the rowless observed sandboxes", &err))?;
             WarmPoolStore::new(pool.clone())

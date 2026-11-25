@@ -636,7 +636,7 @@ async fn recover_pod_less_sandbox_locked(
     // The observed guard tolerated a `failed`, pid-less record. Left behind,
     // it would keep a reverted row reading `failed` through the observed-state
     // overlay, and once the node is gone nothing would publish over it.
-    pplx_space_sandbox_store::observed_states::clear_failed_observation(
+    pplx_space_sandbox_teardown::observed_states::clear_failed_observation(
         &mut tx,
         candidate.sandbox_id,
     )

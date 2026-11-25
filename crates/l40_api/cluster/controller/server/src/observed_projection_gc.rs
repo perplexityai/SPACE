@@ -13,11 +13,11 @@
 
 use pplx_space_accounts::NodeId;
 
-use pplx_space_sql_locator::sql;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pplx_space_durations::PositiveDuration;
+use pplx_space_sandbox_teardown::observed_gc;
 use pplx_space_sandbox_teardown::observed_status::{self, ObservedStatusKey};
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
@@ -207,7 +207,7 @@ impl ObservedProjectionDbStore {
     /// The newest observed-row id, used as a lap's high-water bound. `None`
     /// means the table is empty and there is nothing to sweep.
     async fn newest_observed_sandbox_id(&self) -> Result<Option<Uuid>, sqlx::Error> {
-        Ok(pplx_space_sandbox_store::observed_states::newest(&self.pool).await?)
+        pplx_space_sandbox_teardown::observed_states::newest(&self.pool).await
     }
 
     /// Measure the next sweep window over `sandbox_observed_states`: the id
@@ -222,7 +222,7 @@ impl ObservedProjectionDbStore {
         through: Uuid,
         window: i64,
     ) -> Result<Option<WindowRange<Uuid>>, sqlx::Error> {
-        let ids = pplx_space_sandbox_store::observed_states::window(
+        let ids = pplx_space_sandbox_teardown::observed_states::window(
             &self.pool,
             cursor,
             through,
@@ -403,14 +403,16 @@ impl ProjectionGcSink for ObservedProjectionDbStore {
 }
 
 /// One windowed sweep of stale-suspended observed rows over the primary-key
-/// range `(from, to]`. Candidate selection is deliberately unordered and
-/// window-bounded: eligibility is a per-row probe (a `sandboxes` PK join plus
-/// a facet existence check), so an unwindowed pass paid one probe per
-/// candidate row per tick even when it found nothing new; the previous
-/// ORDER BY + MATERIALIZED candidate CTE additionally forced the full
-/// eligible set to be evaluated and sorted before LIMIT applied. Pick order
-/// cannot matter for a GC: each window deletes what it selects, and the lap
-/// cursor guarantees every row is revisited within one lap.
+/// range `(from, to]`, with their sandboxes' facet rows, through
+/// [`observed_gc::delete_stale_suspended`]. Candidate selection is
+/// deliberately unordered and window-bounded: eligibility is a per-row probe
+/// (a `sandboxes` PK join plus a facet existence check), so an unwindowed
+/// pass paid one probe per candidate row per tick even when it found nothing
+/// new; the previous ORDER BY + MATERIALIZED candidate CTE additionally
+/// forced the full eligible set to be evaluated and sorted before LIMIT
+/// applied. Pick order cannot matter for a GC: each window deletes what it
+/// selects, and the lap cursor guarantees every row is revisited within one
+/// lap.
 async fn delete_stale_suspended_observed(
     pool: &PgPool,
     request: PruneRequest,
@@ -418,85 +420,20 @@ async fn delete_stale_suspended_observed(
     from: Uuid,
     to: Uuid,
 ) -> Result<DeleteReportRow, sqlx::Error> {
-    sqlx::query_as(sql!(
-        // `stale` keeps MATERIALIZED for its multiple downstream references;
-        // its own LIMIT still evaluates lazily.
-        "WITH stale AS MATERIALIZED (
-             SELECT sos.sandbox_id, sos.node_id
-             FROM sandbox_observed_states sos
-             JOIN sandboxes s ON s.id = sos.sandbox_id
-             WHERE sos.sandbox_id > $4
-               AND sos.sandbox_id <= $5
-               AND s.lifecycle = 'suspended'
-               AND s.updated_at < NOW() - make_interval(secs => $1::BIGINT)
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM node_facet_observed_status nfos
-                   WHERE nfos.node_id = sos.node_id
-                     AND nfos.facet = 'sandbox-desired-state'
-                     AND nfos.element = sos.sandbox_id::TEXT
-                     AND nfos.observed_payload ? 'quarantine_recovery'
-                     AND nfos.observed_at
-                         >= NOW() - make_interval(secs => $3::BIGINT)
-               )
-             LIMIT $2
-         ),
-         stale_refs AS MATERIALIZED (
-             SELECT
-                 stale.node_id,
-                 'network-policy'::TEXT AS facet,
-                 'sandbox:' || stale.sandbox_id::TEXT AS element
-             FROM stale
-             UNION ALL
-             SELECT
-                 stale.node_id,
-                 sandbox_facets.facet,
-                 stale.sandbox_id::TEXT AS element
-             FROM stale
-             CROSS JOIN (
-                 VALUES
-                     ('sandbox-inventory'::TEXT),
-                     ('sandbox-desired-state'::TEXT)
-             ) AS sandbox_facets(facet)
-         ),
-         deleted_conditions AS (
-             DELETE FROM node_facet_conditions nfc
-             USING stale_refs
-             WHERE nfc.node_id = stale_refs.node_id
-               AND nfc.facet = stale_refs.facet
-               AND nfc.element = stale_refs.element
-             RETURNING 1
-         ),
-         deleted_status AS (
-             DELETE FROM node_facet_observed_status nfos
-             USING stale_refs
-             WHERE nfos.node_id = stale_refs.node_id
-               AND nfos.facet = stale_refs.facet
-               AND nfos.element = stale_refs.element
-             RETURNING 1
-         ),
-         deleted_observed AS (
-             DELETE FROM sandbox_observed_states sos
-             USING stale
-             WHERE sos.sandbox_id = stale.sandbox_id
-             RETURNING 1
-         )
-         SELECT
-             (SELECT COUNT(*)::BIGINT FROM deleted_observed),
-             (SELECT COUNT(*)::BIGINT FROM deleted_status),
-             (SELECT COUNT(*)::BIGINT FROM deleted_conditions)"
-    ))
-    .bind(secs_i64(request.stale_suspended_age))
-    .bind(limit)
-    .bind(secs_i64(request.orphan_age))
-    .bind(from)
-    .bind(to)
-    .fetch_one(pool)
+    observed_gc::delete_stale_suspended(
+        pool,
+        secs_i64(request.stale_suspended_age),
+        limit,
+        secs_i64(request.orphan_age),
+        from,
+        to,
+    )
     .await
 }
 
 /// One windowed sweep of orphaned observed rows (source-of-truth sandbox row
-/// gone) over the primary-key range `(from, to]`. Windowed and unordered for
+/// gone) over the primary-key range `(from, to]`, with their sandboxes' facet
+/// rows, through [`observed_gc::delete_orphaned`]. Windowed and unordered for
 /// the reasons on [`delete_stale_suspended_observed`]; shares that sweep's
 /// lap windows since both scan `sandbox_observed_states`.
 async fn delete_orphaned_observed(
@@ -506,78 +443,7 @@ async fn delete_orphaned_observed(
     from: Uuid,
     to: Uuid,
 ) -> Result<DeleteReportRow, sqlx::Error> {
-    sqlx::query_as(sql!(
-        "WITH stale AS MATERIALIZED (
-             SELECT sos.sandbox_id, sos.node_id
-             FROM sandbox_observed_states sos
-             LEFT JOIN sandboxes s ON s.id = sos.sandbox_id
-             WHERE sos.sandbox_id > $3
-               AND sos.sandbox_id <= $4
-               AND s.id IS NULL
-               AND sos.updated_at < NOW() - make_interval(secs => $1::BIGINT)
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM node_facet_observed_status nfos
-                   WHERE nfos.node_id = sos.node_id
-                     AND nfos.facet = 'sandbox-desired-state'
-                     AND nfos.element = sos.sandbox_id::TEXT
-                     AND nfos.observed_payload ? 'quarantine_recovery'
-                     AND nfos.observed_at
-                         >= NOW() - make_interval(secs => $1::BIGINT)
-               )
-             LIMIT $2
-         ),
-         stale_refs AS MATERIALIZED (
-             SELECT
-                 stale.node_id,
-                 'network-policy'::TEXT AS facet,
-                 'sandbox:' || stale.sandbox_id::TEXT AS element
-             FROM stale
-             UNION ALL
-             SELECT
-                 stale.node_id,
-                 sandbox_facets.facet,
-                 stale.sandbox_id::TEXT AS element
-             FROM stale
-             CROSS JOIN (
-                 VALUES
-                     ('sandbox-inventory'::TEXT),
-                     ('sandbox-desired-state'::TEXT)
-             ) AS sandbox_facets(facet)
-         ),
-         deleted_conditions AS (
-             DELETE FROM node_facet_conditions nfc
-             USING stale_refs
-             WHERE nfc.node_id = stale_refs.node_id
-               AND nfc.facet = stale_refs.facet
-               AND nfc.element = stale_refs.element
-             RETURNING 1
-         ),
-         deleted_status AS (
-             DELETE FROM node_facet_observed_status nfos
-             USING stale_refs
-             WHERE nfos.node_id = stale_refs.node_id
-               AND nfos.facet = stale_refs.facet
-               AND nfos.element = stale_refs.element
-             RETURNING 1
-         ),
-         deleted_observed AS (
-             DELETE FROM sandbox_observed_states sos
-             USING stale
-             WHERE sos.sandbox_id = stale.sandbox_id
-             RETURNING 1
-         )
-         SELECT
-             (SELECT COUNT(*)::BIGINT FROM deleted_observed),
-             (SELECT COUNT(*)::BIGINT FROM deleted_status),
-             (SELECT COUNT(*)::BIGINT FROM deleted_conditions)"
-    ))
-    .bind(secs_i64(request.orphan_age))
-    .bind(limit)
-    .bind(from)
-    .bind(to)
-    .fetch_one(pool)
-    .await
+    observed_gc::delete_orphaned(pool, secs_i64(request.orphan_age), limit, from, to).await
 }
 
 /// One windowed sweep of orphaned facet rows over the composite-primary-key

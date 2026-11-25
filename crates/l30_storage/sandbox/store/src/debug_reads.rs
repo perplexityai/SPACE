@@ -4,7 +4,7 @@
 //! executions, observed state, snapshots, snapshot inventory and port
 //! exposures. The debug view's port exposures are
 //! [`crate::port_exposures::list`], and its observed state is
-//! [`crate::observed_states::get_with_node`].
+//! `pplx_space_sandbox_teardown::observed_states::get_with_node`.
 //!
 //! Plain reads, run on the executor the caller passes (the debug view reads
 //! inside a read-only transaction).

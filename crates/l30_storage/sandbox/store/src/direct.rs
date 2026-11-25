@@ -44,8 +44,6 @@ use uuid::Uuid;
 
 pub mod adoption;
 pub mod node_endpoints;
-pub mod observed_publication;
-pub mod observed_reads;
 pub mod restore_candidates;
 pub mod route_reads;
 pub mod sandbox_listing;
