@@ -178,16 +178,17 @@ one claim and one terminal event.
 
 ## Leader-election coverage
 
-The implicit suite runs both `local.leader_election_brownout_keeps_one_leader`
-and `local.leader_election_refusal_does_not_restart` against the same controller
-image on separate Kind shards. The outage scenario qualifies the shortened
-liveness budget by requiring a real budget exit, then checks recovery. The
-refusal scenario checks that a forbidden Lease call does not restart a
-contender through that full budget. Alongside this observation, a second
-contender using the same controller image must exhaust its budget against an
-unreachable pod-local API endpoint and exit non-zero. Thus a standalone
-refusal run independently qualifies the shortened budget without a second
-serial budget wait.
+`local.leader_election_brownout_keeps_one_leader` runs every leader-election
+fault in one scenario, so their budget waits overlap. Both healthy replicas
+are cut off from the apiserver in their own network namespaces while the
+control plane stays up for every other client: the holder stops before its
+Lease can be taken over, and the pair recovers to one holder and one runner.
+Alongside, a contender whose Lease calls are refused by real RBAC must stay
+NotReady and unrestarted past the liveness budget it reports, and a second
+contender of the same image must spend its reported budget against an
+unreachable pod-local API endpoint and exit non-zero, which qualifies the
+shortened budget. The outage ends well inside a healthy replica's budget, so
+the control's is the scenario's budget exit.
 
 ## Cross-node restore coverage
 
@@ -460,8 +461,7 @@ uv run --frozen --python 3.11 -m space_smoke.inventory --check
 | [local.garbage_collectors_reclaim_independent_resources](local_garbage_collectors_reclaim_independent_resources.py) | routine | `kind_ecw`; kind; kubernetes | Evict a cold sandbox, reap a fork snapshot, and reclaim an unpinned template. |
 | [local.gentle_drain_leaves_sandbox_resident](local_gentle_drain_leaves_sandbox_resident.py) | routine | `kind_ecw`; kind; kubernetes | A `:drain` with no body parks the resident's worker in `draining` with `drain_mode = gentle` and cordons it; through a twenty-second observation the sandbox keeps its lifecycle, pod, pod UID and node pin, gains no snapshot, and the user API keeps serving it; once the sandbox suspends the node reaches `drained` on its own with the guarded Kubernetes node still present; `:undrain` returns it to schedulable with no drain phase. |
 | [local.interrupted_suspend_keeps_only_copy_until_discard](local_interrupted_suspend_keeps_only_copy_until_discard.py) | routine | `kind_ecw`; kind; kubernetes | A suspend that fails with its runtime gone and no capture kept leaves the sandbox quarantined as its only copy: the public delete doesn't complete, the node's ordinary delete fails, and the operator's discard refuses while the suspend attempt could still finish. Once that window has passed, the discard erases the sandbox and its filesystem, and the public delete then completes and the sandbox's pod is released. |
-| [local.leader_election_brownout_keeps_one_leader](local_leader_election_brownout_keeps_one_leader.py) | routine | `kind_admin`; kind; kubernetes | Two Ready replicas share one Lease holder and one reconciler runner. With the apiserver unavailable, readiness clears, the holder stops before its lease can be taken over, and a replica exits non-zero within its liveness budget. After recovery, recorded exits and telemetry establish why each stopped, and two Ready replicas share one fresh holder and runner. |
-| [local.leader_election_refusal_does_not_restart](local_leader_election_refusal_does_not_restart.py) | routine | `kind_admin`; kind; kubernetes | A third controller whose Lease calls are refused remains NotReady and unrestarted past its full liveness budget and restart visibility margin. Two healthy replicas stay Ready without restarting, keep the same Lease holder, and only that holder runs reconcilers throughout the observation. An independently unreachable contender must spend the shortened budget and exit non-zero, proving this run observed the full effective window. |
+| [local.leader_election_brownout_keeps_one_leader](local_leader_election_brownout_keeps_one_leader.py) | routine | `kind_admin`; kind; kubernetes | Two Ready replicas share one Lease holder and one reconciler runner. Cut off from the apiserver, readiness clears and the holder stops before its lease can be taken over; once reconnected, two Ready replicas share one fresh holder and runner. Throughout, a contender whose Lease calls are refused stays NotReady and unrestarted past its liveness budget, and one that cannot reach the apiserver spends that budget and exits non-zero. |
 | [local.node_ctl_fence_refuses_and_reconciles](local_node_ctl_fence_refuses_and_reconciles.py) | routine | `kind_ecw`; kind; kubernetes | With the token kubelet projects into the node-ctl pod on this sandbox's worker, every forbidden Node write (taints, cordon, finalizers, the node-group boundary and cred-authority labels, foreign or inflated status resources, forged conditions, a template-write pull request, and anything on another node) is refused by the fence policy and by the named rule, leaves no residue, and the boundary label is otherwise writable; every write shape node-ctl has (SSD placement apply, host-CPU label apply, template-presence apply and prune, template-write clear, capacity apply) is admitted; and the running node-ctl writes back a stripped owned label and the stripped slot capacity through its own credential. |
 | [local.node_group_boundary_schedules](local_node_group_boundary_schedules.py) | routine | `kind_ecw`; kind; kubernetes | With the placement gate off a created pod carries no node-group affinity term; a dedicated group is refused with a 409 while the cluster has no generic group; and with the labeler and the gate on, a generic create renders `node-restriction.kubernetes.io/space-node-group In (<default group>)` and its pod reaches Running on a labelled worker. |
 | [local.node_selector_extras_render_and_enforce](local_node_selector_extras_render_and_enforce.py) | main | `kind_ecw`; kind; kubernetes | With two satisfiable extras configured on both renderers, an ECW create's pod (rendered by space-api) and a native create's pod (rendered by the cluster controller's dispatcher) each carry `spec.nodeSelector` equal to the discriminator plus every extra and run on a node carrying all of them; with one extra no node carries added, the fleet still satisfies the old set, nothing satisfies the new one, and an ECW create is refused before any pod with `429 Server capacity limit: no eligible sandbox activation nodes …` and a Retry-After; the renderers' env is restored to what was captured. |
