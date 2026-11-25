@@ -1454,8 +1454,8 @@ pub(super) enum RuntimeAnswer {
     /// The worker reports the target's generation and Pod UID, and `pod_ip`
     /// whenever it reports an address.
     Serves,
-    /// The worker does not report the sandbox, reports a different
-    /// generation or Pod UID, or reports it unidentified at another address.
+    /// The worker does not report the sandbox, or reports a different
+    /// generation or Pod UID.
     Elsewhere,
     /// The worker reports the sandbox without its generation or Pod UID (an
     /// older node, or a sandbox manager that has restarted), or reports the
@@ -1490,10 +1490,12 @@ pub(super) fn runtime_answer(
         .is_some_and(|reported| PodIp::parse(reported).ok() != Some(pod_ip));
     let identified =
         info.execution_generation.is_some() && info.pod_uid.is_some() && target.pod_uid.is_some();
-    match (identity_differs, identified, address_differs) {
-        (true, _, _) | (false, false, true) => RuntimeAnswer::Elsewhere,
-        (false, true, false) => RuntimeAnswer::Serves,
-        (false, true, true) | (false, false, false) => RuntimeAnswer::Unconfirmed,
+    if identity_differs {
+        RuntimeAnswer::Elsewhere
+    } else if identified && !address_differs {
+        RuntimeAnswer::Serves
+    } else {
+        RuntimeAnswer::Unconfirmed
     }
 }
 
@@ -1631,11 +1633,16 @@ mod node_reported_address_tests {
         // The target's execution at another address is still a runtime to
         // clean up, so the teardown waits for an address it can confirm.
         let moved = info(sandbox_id, 1, "pod-a", "10.0.0.4");
+        let unidentified_moved = SandboxInfo {
+            pod_uid: None,
+            ..info(sandbox_id, 1, "pod-a", "10.0.0.4")
+        };
         let degraded = SandboxInfo {
             sandbox_id: sandbox_id.to_string(),
             ..Default::default()
         };
-        assert_eq!(answer(moved), RuntimeAnswer::Unconfirmed);
-        assert_eq!(answer(degraded), RuntimeAnswer::Unconfirmed);
+        for unconfirmed in [moved, unidentified_moved, degraded] {
+            assert_eq!(answer(unconfirmed), RuntimeAnswer::Unconfirmed);
+        }
     }
 }
