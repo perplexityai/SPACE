@@ -4,6 +4,7 @@ from typing import cast
 
 import space_smoke as smoke
 from space_smoke.capabilities import ResidentLifecycleSandbox
+from space_smoke.drain_v2 import UPLOAD_RETRY_SECONDS, WAKE_SECONDS
 
 # How soon after the controller is back its cancel must land: a few loop
 # ticks, with nothing to hand back first.
@@ -46,7 +47,7 @@ def v2_undrain_with_the_controller_down(test: smoke.CommandSandboxFixture) -> No
             with drain.controller_down():
                 uploads.release()
                 for sandbox_id in lifecycles:
-                    drain.expect_durable(sandbox_id, timeout=600)
+                    drain.expect_durable(sandbox_id, timeout=UPLOAD_RETRY_SECONDS)
                 drain.undrain()
 
         with test.phase("the controller back: the drain is cancelled at once"):
@@ -62,6 +63,6 @@ def v2_undrain_with_the_controller_down(test: smoke.CommandSandboxFixture) -> No
         with test.phase("a wake starts each, its memory intact"):
             for sandbox_id, sandbox in sandboxes.items():
                 cast(ResidentLifecycleSandbox, sandbox).wake()
-                drain.expect_lifecycle_back(sandbox_id, "started", timeout=600)
+                drain.expect_lifecycle_back(sandbox_id, "started", timeout=WAKE_SECONDS)
                 drain.expect_memory(sandbox, digests[sandbox_id])
             test.sandbox.wake()

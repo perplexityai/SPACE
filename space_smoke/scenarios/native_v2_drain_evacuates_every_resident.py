@@ -4,7 +4,7 @@ from typing import cast
 
 import space_smoke as smoke
 from space_smoke.capabilities import ResidentLifecycleSandbox
-from space_smoke.drain_v2 import ACCESS_WAKE_POLICY
+from space_smoke.drain_v2 import ACCESS_WAKE_POLICY, in_parallel
 
 PATH = "/tmp/space-smoke-v2-drain.txt"
 
@@ -52,13 +52,15 @@ def v2_drain_evacuates_every_resident(test: smoke.CommandSandboxFixture) -> None
             # worker is left alone.
             drain.pin_to_resident_worker(away_from_fixture=True)
             drain.give_fake_instance()
-            residents = {
-                "started": drain.create_resident(),
-                "started, woken on access": drain.create_resident(auto_lifecycle=ACCESS_WAKE_POLICY),
-                "paused": drain.create_resident(),
-            }
-            for sandbox in residents.values():
-                drain.write_file(sandbox, PATH)
+            created = in_parallel(
+                [
+                    drain.create_resident,
+                    lambda: drain.create_resident(auto_lifecycle=ACCESS_WAKE_POLICY),
+                    drain.create_resident,
+                ]
+            )
+            residents = dict(zip(("started", "started, woken on access", "paused"), created, strict=True))
+            in_parallel([lambda sandbox=sandbox: drain.write_file(sandbox, PATH) for sandbox in created])
             cast(ResidentLifecycleSandbox, residents["paused"]).pause()
             test.sandbox.suspend()
             drain.release_other_worker()
@@ -88,8 +90,7 @@ def v2_drain_evacuates_every_resident(test: smoke.CommandSandboxFixture) -> None
             drain.wake_elsewhere(residents["paused"])
 
         with test.phase("each sandbox's file survived"):
-            for sandbox in residents.values():
-                drain.expect_file(sandbox, PATH)
+            in_parallel([lambda sandbox=sandbox: drain.expect_file(sandbox, PATH) for sandbox in created])
             test.sandbox.wake()
 
         with test.phase("undrain: the drain is cancelled on the node"):

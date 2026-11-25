@@ -7,6 +7,7 @@ import space_smoke as smoke
 from space_smoke.capabilities import ResidentLifecycleSandbox
 from space_smoke.drain_v2 import (
     DRAIN_HOLD_FIELD,
+    in_parallel,
     LENGTHENED_DEADLINE_STATUS,
     MODE_WITH_V2_STATUS,
 )
@@ -82,11 +83,14 @@ def v2_drain_holds_running_until_its_deadline(test: smoke.CommandSandboxFixture)
         with test.phase("pin two running sandboxes, one with an idle policy, and a paused one to one worker"):
             drain.pin_to_resident_worker(away_from_fixture=True)
             drain.give_fake_instance()
-            idle = drain.create_resident(idle_timeout=IDLE_TIMEOUT)
-            busy = drain.create_resident()
-            paused = drain.create_resident()
-            for sandbox in (idle, busy, paused):
-                drain.write_file(sandbox, PATH)
+            idle, busy, paused = in_parallel(
+                [
+                    lambda: drain.create_resident(idle_timeout=IDLE_TIMEOUT),
+                    drain.create_resident,
+                    drain.create_resident,
+                ]
+            )
+            in_parallel([lambda sandbox=sandbox: drain.write_file(sandbox, PATH) for sandbox in (idle, busy, paused)])
             cast(ResidentLifecycleSandbox, paused).pause()
             test.sandbox.suspend()
             drain.release_other_worker()

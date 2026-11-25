@@ -1,13 +1,23 @@
 """A v2 drain survives the cluster-controller restarting, and its running residents stay held while the controller is down past the deadline."""
 
 import space_smoke as smoke
+from space_smoke.drain_v2 import UPLOAD_RETRY_SECONDS
 
-# The drain's hold: long enough for a controller restart, the blocked
-# uploads' retries and the scale to zero to land before it on a slow bench.
+# The drain's first hold: long enough for a controller restart and the
+# blocked uploads' retries to land before it on any bench. Once they have,
+# the run brings the deadline in (`LEAD_SECONDS`) rather than wait out the
+# rest of a hold sized for the slowest bench.
 HOLD_SECONDS = 900
 # The latest the controller may go down before the deadline for the run to
 # show the node holding across it.
-DOWN_MARGIN_SECONDS = 60
+DOWN_MARGIN_SECONDS = 20
+# How far ahead the deadline lands once brought in, with the controller up so
+# the node answers a call under it before the controller goes down (a node
+# that kept the deadline it last heard would then suspend at it, inside the
+# watch past it): the report under the new deadline (a 5 s tick, a call
+# within its 45 s budget, a 2 s poll and 10 s), the scale to zero (the
+# controller's 30 s grace and a 5 s poll) and the margin above.
+LEAD_SECONDS = 62 + 35 + DOWN_MARGIN_SECONDS + 3
 # How long past the deadline the run watches the running residents held with
 # the controller down.
 HELD_PAST_DEADLINE_SECONDS = 90
@@ -37,7 +47,8 @@ def v2_drain_survives_controller_restarts(test: smoke.CommandSandboxFixture) -> 
     resident outlives a controller restart after the seal, with uploads
     blocked and nothing evacuated: the restarted controller stores the
     node's report under the same generation and the deadline is unchanged.
-    Once uploads are let through the paused resident is made durable. With
+    Once uploads are let through the paused resident is made durable, and a
+    repeat `:drain` brings the deadline in, which the node hears. With
     the controller scaled to zero across the deadline, the started residents
     keep running on the worker past it: the node keeps no deadline of its
     own. Once the controller is back the node suspends them and reaches
@@ -87,9 +98,12 @@ def v2_drain_survives_controller_restarts(test: smoke.CommandSandboxFixture) -> 
             uploads.release()
             for sandbox_id, lifecycle in lifecycles.items():
                 if lifecycle == "paused":
-                    drain.expect_durable(sandbox_id, timeout=600)
+                    drain.expect_durable(sandbox_id, timeout=UPLOAD_RETRY_SECONDS)
             for sandbox_id in started:
                 drain.expect_held(sandbox_id)
+
+        with test.phase("bring the deadline in; the node answers a call under it"):
+            drain.bring_deadline_to(LEAD_SECONDS)
 
         with test.phase("the controller down across the deadline: the node holds the running ones"):
             with drain.controller_down():

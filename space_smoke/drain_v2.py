@@ -86,7 +86,7 @@ import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from space_smoke.capabilities import (
     CallAnswer,
@@ -100,7 +100,14 @@ from space_smoke.capabilities import (
     SandboxRowState,
     SnapshotRecord,
 )
-from space_smoke.runtime import Compensation, ResourceScope
+from space_smoke.runtime import (
+    Compensation,
+    InvariantViolation,
+    ResourceScope,
+    run_concurrently,
+)
+
+T = TypeVar("T")
 
 # The node-drain terminator: `aws` gives the v2 drain its terminate, and
 # EC2's answer for the instance, through Kind's fake EC2.
@@ -169,6 +176,88 @@ _FAKE_INSTANCE = re.compile(r"i-[0-9a-f]{17}")
 _FAKE_PROVIDER = re.compile(r"aws:///kind-a/(i-[0-9a-f]{17})")
 
 
+# --- How long each wait may take ------------------------------------------
+#
+# A wait's timeout is the fixed timers it waits out, about four times the
+# real work it waits for as measured on a Kind bench (the PR's validation
+# records the runs), and a margin: a step that hangs fails within a minute or
+# two of when it should have ended, not ten minutes later. None is shorter
+# than the longest wait it can contain, such as one `DrainNode` call's own
+# budget after a controller tick, or the upload worker's longest retry
+# backoff. Windows a check watches to see that something does *not* happen
+# are not these: each scenario keeps its own.
+
+# The controller's node-drain tick (`node_drain::DEFAULT_TICK`).
+TICK_SECONDS = 5
+# One `DrainNode` call's own budget on the node (`DRAIN_CALL_TIMEOUT`).
+CALL_BUDGET_SECONDS = 45
+# The next report the controller stores: a tick, a call within its budget,
+# a 2 s poll and 10 s.
+REPORT_SECONDS = TICK_SECONDS + CALL_BUDGET_SECONDS + 2 + 10
+# A drain of a few small residents to `drained`, due now: the next report,
+# and their suspends and uploads (8 s for three, 22 s for ten, measured),
+# four times over, with a 30 s margin.
+DRAINED_SECONDS = REPORT_SECONDS + 4 * 10 + 30
+# A resident's state once the drain is `drained`, or once the node says it
+# is suspended: polls of rows already written (under 5 s measured).
+SETTLED_SECONDS = 60
+# A wake to `started` elsewhere, a restore from a durable snapshot (2-10 s
+# measured), four times over, with a 30 s margin.
+WAKE_SECONDS = 4 * 10 + 30
+# The node's own suspend past the deadline: the next report and the suspend
+# and upload (about 10 s measured), four times over, with a 30 s margin.
+NODE_SUSPEND_SECONDS = REPORT_SECONDS + 4 * 10 + 30
+# An upload the node retried while its path was cut, once the path is back:
+# the upload worker's longest retry backoff (300 s,
+# `crates/l10_foundation/common/jobs/src/worker.rs`), an attempt, a report
+# and a minute's margin.
+UPLOAD_RETRY_SECONDS = 300 + 30 + REPORT_SECONDS + 60
+# The undrain's cancel and uncordon: the next report and the cancel call
+# (3-5 s measured), with a 20 s margin.
+CANCEL_SECONDS = REPORT_SECONDS + 20
+# A worker re-registered under a new providerID, its node services Ready and
+# its row recording the instance (35-40 s measured), four times over.
+REGISTER_SECONDS = 4 * 40
+# A Kind worker started again as a same-name replacement (77 s measured),
+# four times over.
+COME_BACK_SECONDS = 4 * 80
+# A gated activation, retried by the client until the drain made the
+# sandbox durable and the wake restored it (13-49 s measured), four times
+# over, with a minute's margin.
+ACTIVATION_SECONDS = 4 * 50 + 60
+# A stop or kill refused for the dispatcher's whole retry budget: 16 attempts
+# after the gate's Retry-After (`public_operation_driver.rs`), about 150 s
+# measured, with a two-minute margin.
+REFUSED_STOP_SECONDS = 150 + 120
+# A command on a sandbox whose data plane is coming up, or a memory fill of
+# up to 256 MiB (seconds measured), with a minute's margin.
+COMMAND_SECONDS = 90
+
+
+# How many independent per-resident calls (creates, fills, wakes, deletes) a
+# run makes at once: enough to overlap their round trips, few enough that a
+# worker's admission and the shared upload lane don't refuse or queue them.
+PARALLEL_WIDTH = 4
+
+
+def in_parallel(calls: Sequence[Callable[[], T]], *, width: int = PARALLEL_WIDTH) -> list[T]:
+    """Run independent calls `width` at a time; their results in order. Once
+    a batch ends with a failure, the first verdict it raised (else the first
+    error) is raised and no later batch starts."""
+
+    results: list[T] = []
+    for start in range(0, len(calls), width):
+        outcomes = run_concurrently(calls[start : start + width])
+        failures = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
+        if failures:
+            raise next(
+                (failure for failure in failures if isinstance(failure, InvariantViolation)),
+                failures[0],
+            )
+        results.extend(cast(list[T], outcomes))
+    return results
+
+
 def validate_fake_instance_id(instance_id: str) -> None:
     if _FAKE_INSTANCE.fullmatch(instance_id) is None:
         raise ValueError(f"refusing instance id {instance_id!r}")
@@ -206,7 +295,7 @@ def await_recorded_instance(
 
 def register_fake_instance(
     fixture: ScenarioFixture, control: KindWorkerControl, node_name: str, node_id: str,
-    *, timeout: float = 300,
+    *, timeout: float = REGISTER_SECONDS,
 ) -> str:
     """Re-register the worker under a new fake AWS providerID and wait until
     its row records the instance; returns it. Re-registering deletes the
@@ -708,7 +797,7 @@ class DrainV2Assertions:
         self._fixture.record("drained_worker", pinned)
         return pinned
 
-    def give_fake_instance(self, *, timeout: float = 300) -> str:
+    def give_fake_instance(self, *, timeout: float = REGISTER_SECONDS) -> str:
         """The pinned worker's fake AWS instance: re-register it under a fake
         AWS providerID unless it has one, and wait until its node row records
         the instance. Run before any resident lands on it: re-registering
@@ -814,6 +903,44 @@ class DrainV2Assertions:
         )
         return sandbox
 
+    def create_residents(
+        self,
+        count: int,
+        *,
+        idle_timeout: str | None = None,
+        auto_lifecycle: Mapping[str, object] | None = None,
+    ) -> list[DurableLifecycleSandbox]:
+        """`count` residents (`create_resident`), created a few at a time."""
+
+        return in_parallel(
+            [
+                lambda: self.create_resident(idle_timeout=idle_timeout, auto_lifecycle=auto_lifecycle)
+                for _ in range(count)
+            ]
+        )
+
+    def fill_memories(
+        self, sandboxes: Sequence[DurableLifecycleSandbox], *, mib: int
+    ) -> dict[str, str]:
+        """`fill_memory` of each sandbox, a few at a time; each digest by sandbox id."""
+
+        digests = in_parallel(
+            [lambda sandbox=sandbox: self.fill_memory(sandbox, mib=mib) for sandbox in sandboxes]
+        )
+        return {sandbox.sandbox_id: digest for sandbox, digest in zip(sandboxes, digests)}
+
+    def pause_all(self, sandboxes: Iterable[DurableLifecycleSandbox]) -> None:
+        """Pause each sandbox, a few at a time."""
+
+        in_parallel(
+            [lambda sandbox=sandbox: cast(ResidentLifecycleSandbox, sandbox).pause() for sandbox in sandboxes]
+        )
+
+    def delete_all(self, sandboxes: Iterable[CommandSandbox]) -> None:
+        """Delete each run-owned sandbox, a few at a time."""
+
+        in_parallel([lambda sandbox=sandbox: self._fixture.delete_sandbox(sandbox) for sandbox in sandboxes])
+
     def pin_residents(
         self, counts: dict[str, int], *, mib: int = 64
     ) -> tuple[dict[str, DurableLifecycleSandbox], dict[str, str], dict[str, str]]:
@@ -830,19 +957,14 @@ class DrainV2Assertions:
             raise ValueError(f"refusing resident lifecycles {unknown}: a v2 drain pins started and paused ones")
         self.pin_to_resident_worker(away_from_fixture=True)
         self.give_fake_instance()
-        sandboxes: dict[str, DurableLifecycleSandbox] = {}
-        lifecycles: dict[str, str] = {}
-        for lifecycle, count in counts.items():
-            for _ in range(count):
-                sandbox = self.create_resident()
-                sandboxes[sandbox.sandbox_id] = sandbox
-                lifecycles[sandbox.sandbox_id] = lifecycle
-        digests = {
-            sandbox_id: self.fill_memory(sandbox, mib=mib) for sandbox_id, sandbox in sandboxes.items()
-        }
-        for sandbox_id, sandbox in sandboxes.items():
-            if lifecycles[sandbox_id] == "paused":
-                cast(ResidentLifecycleSandbox, sandbox).pause()
+        created = self.create_residents(sum(counts.values()))
+        sandboxes = {sandbox.sandbox_id: sandbox for sandbox in created}
+        wanted = [lifecycle for lifecycle, count in counts.items() for _ in range(count)]
+        lifecycles = {sandbox.sandbox_id: lifecycle for sandbox, lifecycle in zip(created, wanted)}
+        digests = self.fill_memories(created, mib=mib)
+        self.pause_all(
+            sandbox for sandbox_id, sandbox in sandboxes.items() if lifecycles[sandbox_id] == "paused"
+        )
         self._fixture.record(
             "residents",
             {self.bare_id(sandbox_id): lifecycle for sandbox_id, lifecycle in lifecycles.items()},
@@ -852,7 +974,7 @@ class DrainV2Assertions:
         self.expect_lifecycles(lifecycles)
         return sandboxes, lifecycles, digests
 
-    def run_on(self, sandbox: DurableLifecycleSandbox, command: str, *, timeout: float = 180) -> Any:
+    def run_on(self, sandbox: DurableLifecycleSandbox, command: str, *, timeout: float = COMMAND_SECONDS) -> Any:
         """Run `command` in a run-owned sandbox, retrying while its data plane comes up."""
 
         deadline = time.monotonic() + timeout
@@ -908,7 +1030,7 @@ class DrainV2Assertions:
         filled = self.run_on(
             sandbox,
             f"dd if=/dev/urandom of={BALLAST} bs=1M count={int(mib)} 2>/dev/null && {BALLAST_DIGEST}",
-            timeout=300,
+            timeout=COMMAND_SECONDS,
         )
         digest = filled.stdout.strip()
         self._fixture.verify(
@@ -983,15 +1105,36 @@ class DrainV2Assertions:
 
     # --- where the drain leaves each resident -----------------------------------
 
-    def expect_all_evacuated(self, residents: Iterable[str], *, timeout: float = 420) -> None:
+    def expect_all_evacuated(self, residents: Iterable[str], *, timeout: float = SETTLED_SECONDS) -> None:
         """Each resident (sandbox ids), `started` or `paused` before the
         drain, ends where the drain leaves it: `suspended` and unplaced, with
         a durable snapshot and no VM on either worker."""
 
-        for sandbox_id in residents:
-            self.expect_suspended_unplaced(sandbox_id, timeout=timeout)
+        ids = list(residents)
+        deadline = time.monotonic() + timeout
+        while True:
+            left = [sandbox_id for sandbox_id in ids if not self._suspended_unplaced(sandbox_id)]
+            if not left:
+                break
+            self._fixture.verify(
+                time.monotonic() < deadline,
+                "a resident was never left suspended and unplaced with a durable snapshot",
+                residents_left={
+                    self.bare_id(sandbox_id): self.residency(sandbox_id) for sandbox_id in left
+                },
+            )
+            self._fixture.wait(3)
+        for sandbox_id in ids:
+            self.expect_single_vm(sandbox_id, "suspended")
 
-    def expect_suspended_unplaced(self, sandbox_id: str, *, timeout: float = 300) -> None:
+    def _suspended_unplaced(self, sandbox_id: str) -> bool:
+        residency = self._control.sandbox_residency(self.bare_id(sandbox_id))
+        if residency.lifecycle != "suspended" or residency.active_node_id is not None:
+            return False
+        snapshots = self.ready_snapshots(sandbox_id)
+        return bool(snapshots) and snapshots[-1].storage_location_count > 0
+
+    def expect_suspended_unplaced(self, sandbox_id: str, *, timeout: float = SETTLED_SECONDS) -> None:
         """The drain left the sandbox `suspended` and unplaced, its snapshot
         durable, with no VM on either worker: nothing restores it, and its
         next user call wakes it wherever the scheduler places it."""
@@ -1019,7 +1162,7 @@ class DrainV2Assertions:
             self._fixture.wait(3)
         self.expect_single_vm(sandbox_id, "suspended")
 
-    def expect_back_at_home(self, sandbox_id: str, lifecycle: str, *, timeout: float = 300) -> None:
+    def expect_back_at_home(self, sandbox_id: str, lifecycle: str, *, timeout: float = WAKE_SECONDS) -> None:
         """The sandbox is `lifecycle` again on the worker the drain was on."""
 
         bare = self.bare_id(sandbox_id)
@@ -1038,7 +1181,7 @@ class DrainV2Assertions:
             )
             self._fixture.wait(3)
 
-    def wake_elsewhere(self, sandbox: DurableLifecycleSandbox, *, timeout: float = 300) -> None:
+    def wake_elsewhere(self, sandbox: DurableLifecycleSandbox, *, timeout: float = WAKE_SECONDS) -> None:
         """Wake a sandbox the drain left `suspended`: it is restored `started`
         off the drained worker."""
 
@@ -1054,10 +1197,17 @@ class DrainV2Assertions:
         off the drained worker, with its memory intact when `digests` holds
         it."""
 
-        for sandbox_id, sandbox in sandboxes.items():
+        def wake(sandbox_id: str, sandbox: DurableLifecycleSandbox) -> None:
             self.wake_elsewhere(sandbox)
             if digests is not None:
                 self.expect_memory(sandbox, digests[sandbox_id])
+
+        in_parallel(
+            [
+                lambda sandbox_id=sandbox_id, sandbox=sandbox: wake(sandbox_id, sandbox)
+                for sandbox_id, sandbox in sandboxes.items()
+            ]
+        )
 
     def expect_call_refused_while_suspended(self, sandbox: DurableLifecycleSandbox) -> CallAnswer:
         """A command to a suspended sandbox whose policy has no implicit wake
@@ -1286,6 +1436,46 @@ class DrainV2Assertions:
         )
         return answer
 
+    def bring_deadline_to(self, lead: int, *, await_report: bool = True) -> dict[str, Any]:
+        """A repeat `:drain` with a shorter hold, counted from
+        `drain_started_at`, moves the deadline to `lead` seconds from now.
+        With `await_report`, returns the first report the controller stored
+        after it, which shows that deadline: the node answered a call made
+        under it; else the admin view as it reads at once."""
+
+        before = self.deadline
+        asked = time.time()
+        answer = self.repeat_drain(int(asked - self.started_at()) + lead)
+        self._fixture.verify(
+            answer.status in (200, 202) and self.deadline < before,
+            "a repeat :drain with a shorter hold did not move the deadline earlier",
+            status=answer.status,
+            body=answer.body,
+            deadline=self.deadline,
+            before=before,
+        )
+        if not await_report:
+            return self.report()
+
+        def under_it(report: dict[str, Any]) -> bool:
+            shown = self.view_deadline(report)
+            reported = timestamp_seconds(report.get(VIEW_REPORTED_FIELD))
+            return (
+                self.reported(report)
+                and shown is not None
+                and abs(shown - self.deadline) <= 1
+                and reported is not None
+                and reported > asked
+            )
+
+        # A 5 s tick, a call within its 45 s budget and a 2 s poll, with a
+        # 10 s margin.
+        return self.wait_for_report(
+            under_it,
+            "the controller never stored a report under the earlier deadline",
+            timeout=5 + 45 + 2 + 10,
+        )
+
     def expect_stored_deadline(self, hold: int) -> int:
         """The row's deadline is `drain_started_at` plus `hold`; returns it."""
 
@@ -1429,7 +1619,7 @@ class DrainV2Assertions:
 
         return self._control.ready_full_snapshots(self.bare_id(sandbox_id))
 
-    def expect_lifecycle(self, sandbox_id: str, lifecycle: str, *, timeout: float = 300) -> None:
+    def expect_lifecycle(self, sandbox_id: str, lifecycle: str, *, timeout: float = WAKE_SECONDS) -> None:
         """The sandbox reaches `lifecycle` on some node."""
 
         deadline = time.monotonic() + timeout
@@ -1627,7 +1817,7 @@ class DrainV2Assertions:
         assert shown is not None
         return shown
 
-    def wait_for_reported(self, *, timeout: float = 120) -> dict[str, Any]:
+    def wait_for_reported(self, *, timeout: float = 2 * REPORT_SECONDS) -> dict[str, Any]:
         """The view once the controller stored the node's report under the
         drain's generation, showing the stored deadline."""
 
@@ -1640,7 +1830,7 @@ class DrainV2Assertions:
         return report
 
     def expect_drained(
-        self, *, timeout: float = 420, first_reported: dict[str, float] | None = None
+        self, *, timeout: float = DRAINED_SECONDS, first_reported: dict[str, float] | None = None
     ) -> dict[str, Any]:
         """The node's report under the drain's generation lists nothing
         pending or blocked, and the row reaches `drained`.
@@ -1718,7 +1908,7 @@ class DrainV2Assertions:
 
     # --- the deadline -----------------------------------------------------------
 
-    def expect_held(self, sandbox_id: str, *, timeout: float = 120) -> dict[str, Any]:
+    def expect_held(self, sandbox_id: str, *, timeout: float = 2 * REPORT_SECONDS) -> dict[str, Any]:
         """Before the deadline, the report holds the running sandbox, and it is
         still started on the drained worker."""
 
@@ -1792,7 +1982,7 @@ class DrainV2Assertions:
 
         return self.node_state(sandbox_id) == "started"
 
-    def expect_left_started(self, sandbox_id: str, *, timeout: float = 180) -> str:
+    def expect_left_started(self, sandbox_id: str, *, timeout: float = NODE_SUSPEND_SECONDS) -> str:
         """Past the deadline, the node takes the running sandbox down: its row
         on the drained worker leaves `started` for a suspend, durable or not;
         the state it left for. The control-plane row reads `suspended` only
@@ -1818,7 +2008,7 @@ class DrainV2Assertions:
         )
         return str(state)
 
-    def expect_suspended_by_the_node(self, sandbox_id: str, *, timeout: float = 300) -> None:
+    def expect_suspended_by_the_node(self, sandbox_id: str, *, timeout: float = NODE_SUSPEND_SECONDS) -> None:
         """Past the deadline, the node suspends the running sandbox itself:
         its row leaves started for `suspended`, with a durable snapshot."""
 
@@ -1845,7 +2035,7 @@ class DrainV2Assertions:
     # --- the gate -----------------------------------------------------------------
 
     def request_activation(
-        self, sandbox: DurableLifecycleSandbox, verb: str = "wake", *, timeout: float = 600
+        self, sandbox: DurableLifecycleSandbox, verb: str = "wake", *, timeout: float = ACTIVATION_SECONDS
     ) -> dict[str, Any]:
         """Ask for `verb` and follow it until it ends or `timeout` passes:
         each refusal of the request itself, retried after its `Retry-After`
@@ -2022,7 +2212,7 @@ class DrainV2Assertions:
     # --- stops and stopped sandboxes ---------------------------------------------
 
     def request_stop(
-        self, sandbox: DurableLifecycleSandbox, verb: str, *, timeout: float = 600
+        self, sandbox: DurableLifecycleSandbox, verb: str, *, timeout: float = REFUSED_STOP_SECONDS
     ) -> dict[str, Any]:
         """Ask once for `verb` (`STOP_VERBS`: the user's `stop` or `kill`
         through the public API, an operator's `force-stop` or `force-kill`
@@ -2065,7 +2255,7 @@ class DrainV2Assertions:
             self._fixture.wait(5)
 
     def expect_stop_refused(
-        self, sandbox: DurableLifecycleSandbox, verb: str, *, timeout: float = 600
+        self, sandbox: DurableLifecycleSandbox, verb: str, *, timeout: float = REFUSED_STOP_SECONDS
     ) -> dict[str, Any]:
         """A `verb` of a running sandbox on the v2-drained worker is refused
         with the drain's retryable 503 (`stop_refused_by_the_drain`), and the
@@ -2176,7 +2366,7 @@ class DrainV2Assertions:
 
     # --- settling -------------------------------------------------------------------
 
-    def expect_back_elsewhere(self, sandbox_id: str, lifecycle: str, *, timeout: float = 300) -> None:
+    def expect_back_elsewhere(self, sandbox_id: str, lifecycle: str, *, timeout: float = WAKE_SECONDS) -> None:
         """The sandbox is `lifecycle` again, no longer on the drained worker."""
 
         bare = self.bare_id(sandbox_id)
@@ -2541,16 +2731,21 @@ class DrainV2Assertions:
         new instance, and verify through the admin preview that it answers
         unsealed."""
 
+        started = time.monotonic()
         restart.release()
+        steps = {"worker_registered": round(time.monotonic() - started, 1)}
         self._instance = replacement
         await_recorded_instance(
             self._fixture, self._control, self.node_name, self.node_id, replacement, timeout=timeout
         )
+        steps["instance_recorded"] = round(time.monotonic() - started, 1)
         self.expect_preview_succeeds(
             "the same-name replacement never answered a drain preview: it came back sealed, "
             "or its drain is still recorded",
             timeout=timeout,
         )
+        steps["preview_answered"] = round(time.monotonic() - started, 1)
+        self._fixture.record("come_back_seconds", steps)
 
     def terminate(self, *, timeout: float = 600) -> None:
         """`:terminate` reaches the worker's instance through the `aws`
@@ -2563,9 +2758,14 @@ class DrainV2Assertions:
         Runs inside `v2_controller` after `give_fake_instance`.
         """
 
+        started = time.monotonic()
         labels, provider_id, replacement = self._terminate_and_dispatch()
+        steps = {"dispatched": round(time.monotonic() - started, 1)}
         restart = self._stop_then_arm_replacement(labels, provider_id)
+        steps["worker_stopped"] = round(time.monotonic() - started, 1)
         self._expect_row_deleted_without_tombstone(timeout=timeout)
+        steps["row_deleted"] = round(time.monotonic() - started, 1)
+        self._fixture.record("terminate_seconds", steps)
         self._come_back(restart, replacement, timeout=timeout)
         self._fixture.record(
             "after_terminate",
@@ -2691,7 +2891,7 @@ class DrainV2Assertions:
         self._come_back(restart, replacement, timeout=timeout)
         self._fixture.record("after_lingering_node", {"replacement_instance": replacement})
 
-    def give_stale_instance(self, *, timeout: float = 300) -> str:
+    def give_stale_instance(self, *, timeout: float = REGISTER_SECONDS) -> str:
         """The pinned worker under Kind's own providerID, which names no EC2
         instance, with a fake instance written into its node row: the stale
         instance an older registration writer leaves across a Node UID
@@ -2806,7 +3006,7 @@ class DrainV2Assertions:
             drain_phase=phase,
         )
 
-    def come_back_after_death(self, restart: Compensation, *, timeout: float = 600) -> None:
+    def come_back_after_death(self, restart: Compensation, *, timeout: float = COME_BACK_SECONDS) -> None:
         """Start the dead worker again as a same-name replacement and open it again."""
 
         if self._replacement is None:
@@ -2822,14 +3022,14 @@ class DrainV2Assertions:
             compensation, self._undrain = self._undrain, None
             compensation.release()
 
-    def undrain_and_expect_cancelled(self, *, timeout: float = 300) -> None:
+    def undrain_and_expect_cancelled(self, *, timeout: float = CANCEL_SECONDS) -> None:
         """`:undrain` returns the node to no phase; the controller cancels the
         drain on the node, and uncordons it once it answers."""
 
         self.undrain()
         self.expect_cancelled(timeout=timeout)
 
-    def expect_cancelled(self, *, timeout: float = 300) -> None:
+    def expect_cancelled(self, *, timeout: float = CANCEL_SECONDS) -> None:
         """The controller clears the undrained node's v2 columns and, unless
         this run cordons the worker itself, uncordons it."""
 

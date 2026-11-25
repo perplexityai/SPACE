@@ -3,7 +3,7 @@
 import time
 
 import space_smoke as smoke
-from space_smoke.drain_v2 import PENDING_SINCE_FIELD, timestamp_seconds
+from space_smoke.drain_v2 import PENDING_SINCE_FIELD, UPLOAD_RETRY_SECONDS, timestamp_seconds
 
 
 # A failed action staying pending and tried again, and the stall rule, are
@@ -86,7 +86,7 @@ def v2_drain_waits_out_blocked_uploads(test: smoke.CommandSandboxFixture) -> Non
 
         with test.phase("the path back: the same drain finishes"):
             uploads.release()
-            report = drain.expect_drained()
+            report = drain.expect_drained(timeout=UPLOAD_RETRY_SECONDS)
             drain.expect_evacuated(report, lifecycles)
             drain.expect_all_evacuated(lifecycles)
             drain.wake_all_elsewhere(sandboxes, digests)
