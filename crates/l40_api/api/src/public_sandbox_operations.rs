@@ -16,6 +16,9 @@ use pplx_space_public_api::{
     UpdateSandboxRequest as PublicUpdateSandboxRequest,
 };
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle, SandboxLifecycleParseError};
+use pplx_space_sandbox_store::{
+    SandboxMetadata, SandboxMetadataValue as ControllerSandboxMetadataValue,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::Instrument;
@@ -31,8 +34,7 @@ use crate::controllers::sandbox::{SandboxController, fetch_sandbox};
 use crate::controllers::substrate::ExecutionActivityKind;
 use crate::controllers::{ControllerError, SnapshotUploadCheck, SnapshotUploadInFlight};
 use crate::models::{
-    CreateSandboxRequest as ControllerCreateSandboxRequest, SandboxMetadata,
-    SandboxMetadataValue as ControllerSandboxMetadataValue,
+    CreateSandboxRequest as ControllerCreateSandboxRequest,
     SandboxNetworkPolicyPatch as ControllerSandboxNetworkPolicyPatch,
     UpdateSandboxRequest as ControllerUpdateSandboxRequest, User,
 };

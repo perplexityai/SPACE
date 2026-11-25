@@ -537,7 +537,7 @@ pub struct ForkTargetConfig {
     pub source_template_id: Option<String>,
     pub runtime: Option<String>,
     pub env: BTreeMap<String, String>,
-    pub metadata: crate::models::SandboxMetadata,
+    pub metadata: pplx_space_sandbox_store::SandboxMetadata,
     pub vcpu: Option<u32>,
     pub memory_mib: Option<u32>,
     pub disk_mib: Option<u32>,

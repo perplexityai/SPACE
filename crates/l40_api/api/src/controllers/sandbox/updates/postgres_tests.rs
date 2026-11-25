@@ -12,9 +12,10 @@
 
 use pplx_space_accounts::{OrgId, UserId};
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sandbox_store::{SandboxMetadata, SandboxMetadataValue};
 
 use super::*;
-use crate::models::{SandboxMetadata, SandboxMetadataValue, User};
+use crate::models::User;
 use pplx_space_db_test_fixtures::pg_test_db;
 use pplx_space_feature_flags::{FeatureFlagClient, SPACE_API_TIMEOUT_LOCK_BYPASS_FLAG};
 use pplx_space_sql_locator::sql;

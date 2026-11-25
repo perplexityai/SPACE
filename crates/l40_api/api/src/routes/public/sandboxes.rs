@@ -30,6 +30,9 @@ use pplx_space_public_api::{
 };
 use pplx_space_sandbox_model::SandboxLifecycle;
 use pplx_space_sandbox_store::direct::sandbox_listing::{self, PageWalk, public::PublicSandboxRow};
+use pplx_space_sandbox_store::{
+    SandboxMetadata as ControllerSandboxMetadata, SandboxMetadataValue,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -47,7 +50,7 @@ use crate::{
     },
     inline_operations::{InlineLifecycle, InlineRefusal},
     middleware::auth::{AuthFederatedOwner, AuthOrg, AuthUser},
-    models::{Sandbox, SandboxMetadata as ControllerSandboxMetadata, SandboxMetadataValue},
+    models::Sandbox,
     public_operations::{
         ApiProduct, CreateInlinePublicOperationResult, CreatePublicOperation,
         CreatePublicOperationIdempotency, CreatePublicOperationResult, HttpOperationMethod,
