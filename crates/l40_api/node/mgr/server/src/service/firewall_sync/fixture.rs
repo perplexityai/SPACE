@@ -18,6 +18,13 @@
 //! else is resubmitted, so a stale slot waits for the next generation to list
 //! it again.
 //!
+//! An `All` binding also gates each runtime launch (`start`). A start waits for
+//! the pass to settle, then applies the accepted assignment to its own slot
+//! and reads that result by the same rule: one that ends the binding ends it,
+//! and a changed target refuses only that start. Only a match launches. A
+//! start dropped before its apply is read, or a launch whose outcome is
+//! unknown, ends the binding.
+//!
 //! A production binding is expected to build on this worker. First it must
 //! revisit the node-wide end rule, re-listing on retry, and per-slot reporting,
 //! and it must ship behind a default-off switch. Under `All`, nothing signals a
@@ -29,12 +36,13 @@
 //! so same-generation redeliveries never list again. The node-wide reply is the
 //! same in all of these cases.
 
-use std::path::PathBuf;
+use std::os::unix::fs::MetadataExt as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use pplx_space_accounts::NodeId;
-use tokio::sync::watch;
+use tokio::sync::{RwLock, watch};
 use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
@@ -46,13 +54,15 @@ use crate::firewall::assignment::{
 };
 use crate::firewall::rules::Nft;
 use crate::firewall::rules::verify::Verification;
+use crate::net::SlotInfo;
 use crate::proto::{
     FirewallAssignmentAcceptance, FirewallSlotDispatch, FirewallSlotDispatchOutcome as Outcome,
     SyncFirewallRulesRequest, SyncFirewallRulesResponse,
 };
 use crate::slot_pool::firewall_rules::SlotHost;
 use crate::slot_pool::{
-    NetworkPool, NotRun, NotRunnable, SlotFirewallReport, SlotFirewallRequest, SlotTarget, Stale,
+    NamespaceIdentity, NetworkPool, NotRun, NotRunnable, SlotFirewallReport, SlotFirewallRequest,
+    SlotTarget, Stale,
 };
 
 mod rounds;
@@ -67,8 +77,9 @@ pub(crate) struct FirewallSyncFixture {
     /// `NetworkPool::apply_firewall_rules_with`'s namespace and nft seams.
     pub host: Arc<dyn SlotHost>,
     pub nft: Arc<Nft<'static>>,
-    /// How long a `One` delivery waits for its dispatch. No effect under `All`,
-    /// whose reply carries none.
+    /// How long a `One` delivery waits for its dispatch, and a gated `All`
+    /// start for the pass to settle. No `All` delivery waits, as its reply
+    /// carries no dispatch.
     pub wait: Duration,
 }
 
@@ -116,12 +127,16 @@ pub(crate) struct FirewallSync {
     fixture: FirewallSyncFixture,
     assignments: Arc<FirewallAssignments>,
     wanted: watch::Sender<Option<Wanted>>,
-    /// Cancelled once the worker ends, which ends the binding.
+    /// Cancelled once the binding ends: the worker ends, or a start's apply or
+    /// launch leaves an uncertain result.
     ended: CancellationToken,
     /// Recent verification rounds, for replay.
     rounds: std::sync::Mutex<rounds::Rounds>,
     /// Held by each round's sweep, so sweeps read one at a time.
     sweeps: tokio::sync::Mutex<()>,
+    /// A gated start reads and an acceptance writes, so none lands between a
+    /// start's readback and its launch's outcome.
+    order: Arc<RwLock<()>>,
 }
 
 /// The latest generation armed, and how far its pass got.
@@ -189,6 +204,7 @@ impl NodeManagerService {
             ended: CancellationToken::new(),
             rounds: std::sync::Mutex::default(),
             sweeps: tokio::sync::Mutex::new(()),
+            order: Arc::default(),
         });
         self.device_op_tasks
             .spawn(sync.clone().work(self.pool.clone()));
@@ -203,8 +219,9 @@ impl FirewallSync {
         service: &NodeManagerService,
         request: SyncFirewallRulesRequest,
     ) -> Result<SyncFirewallRulesResponse, Status> {
-        // A delivery that races the end can still commit and arm, then replies NOT_RUN
-        // "the binding ended" for one slot or no dispatch for all; nothing reaches nft.
+        // A delivery that races the worker's end can still commit and arm, then replies
+        // NOT_RUN "the binding ended" for one slot or no dispatch for all; nothing reaches
+        // nft. One that races a start's end is refused under the order.
         if self.ended.is_cancelled() {
             return Err(Status::failed_precondition(
                 "the firewall rule sync binding ended",
@@ -217,8 +234,16 @@ impl FirewallSync {
         let revision_id = canonical_uuid("revision_id", &assignment.revision_id)?;
         let generation = assignment.generation;
         let sync = self.clone();
+        let order = self.order.clone().write_owned().await;
         let acceptance = service
             .off_runtime("accept firewall assignment", move || {
+                let _order = order;
+                // A start whose outcome is unknown ended the binding meanwhile.
+                if sync.ended.is_cancelled() {
+                    return Err(Status::failed_precondition(
+                        "the firewall rule sync binding ended",
+                    ));
+                }
                 let incoming = IncomingAssignment {
                     node_id,
                     generation,
@@ -248,6 +273,102 @@ impl FirewallSync {
                 BoundSlots::All => None,
             },
         })
+    }
+
+    /// Under a node-wide binding, runs `launch` only after the accepted
+    /// assignment is applied to the lease's slot and read back in the
+    /// namespace the launcher opens; every refusal comes before dispatch. An
+    /// apply result that ends a pass's binding ends this one too, as does a start
+    /// dropped before it has one. A launch that fails or is dropped may have
+    /// started its guest, so it ends the binding.
+    pub(in crate::service) async fn start<T>(
+        &self,
+        pool: &Arc<NetworkPool>,
+        lease: &SlotInfo,
+        namespace: &Path,
+        launch: impl Future<Output = Result<T, Status>>,
+    ) -> Result<T, Status> {
+        if !matches!(self.fixture.slots, BoundSlots::All) {
+            return launch.await;
+        }
+        let _order = self.order.read().await;
+        let refused = |why: String| Status::failed_precondition(format!("firewall check: {why}"));
+        if self.ended.is_cancelled() {
+            return Err(refused("the binding ended".into()));
+        }
+        // Only an acceptance arms a pass, so once this one settles the worker
+        // stays off the slot until `_order` drops.
+        let mut wanted = self.wanted.subscribe();
+        let idle = wanted.wait_for(|wanted| {
+            wanted
+                .as_ref()
+                .is_none_or(|wanted| wanted.claimed && wanted.settled())
+        });
+        tokio::select! {
+            idle = tokio::time::timeout(self.fixture.wait, idle) => {
+                if idle.is_err() {
+                    return Err(refused("the node-wide pass is still running".into()));
+                }
+            }
+            () = self.ended.cancelled() => return Err(refused("the binding ended".into())),
+        }
+        let accepted = match self.assignments.current() {
+            Ok(Some(accepted)) => accepted,
+            Ok(None) => return Err(refused("no accepted assignment".into())),
+            Err(error) => return Err(refused(error.to_string())),
+        };
+        let request = SlotFirewallRequest {
+            node_id: self.fixture.node_id,
+            generation: accepted.generation,
+            slot_id: lease.slot,
+            expected: Some(SlotTarget {
+                slot_generation: lease.generation,
+                sandbox_id: Some(lease.sandbox_id.clone()),
+                namespace: None,
+            }),
+        };
+        let (host, nft) = (self.fixture.host.clone(), self.fixture.nft.clone());
+        // A dropped start detaches its nft job, whose result is lost. Dropped
+        // before `_order`, so no acceptance follows an apply of unknown outcome.
+        let applying = self.ended.clone().drop_guard();
+        let report = pool
+            .apply_firewall_rules_with(&self.assignments, request, host, nft)
+            .await;
+        let (done, ends) = dispatch(&report);
+        if ends.binding(self.fixture.slots) {
+            tracing::warn!(
+                generation = accepted.generation,
+                slot_id = lease.slot,
+                outcome = ?done.outcome(),
+                "fixture firewall sync binding ended"
+            );
+            // Under `_order`, so no acceptance follows.
+            self.ended.cancel();
+        }
+        applying.disarm();
+        let attempt = match report {
+            Ok(SlotFirewallReport::Attempted(attempt)) if attempt.verified() => attempt,
+            report => return Err(refused(format!("{report:?}"))),
+        };
+        // The launcher opens the namespace by this path.
+        let entry = std::fs::metadata(namespace).map(|entry| NamespaceIdentity {
+            device: entry.dev(),
+            inode: entry.ino(),
+        });
+        if entry.ok() != Some(attempt.namespace) {
+            return Err(refused("the launch names another namespace".into()));
+        }
+        // Another start ended the binding during this one's apply.
+        if self.ended.is_cancelled() {
+            return Err(refused("the binding ended".into()));
+        }
+        // Dropped before `_order`, so no acceptance follows an unknown outcome.
+        // Any launch error, even a supervisor refusal before boot, ends the
+        // binding; a production gate should revisit that.
+        let unknown = self.ended.clone().drop_guard();
+        let launched = launch.await?;
+        unknown.disarm();
+        Ok(launched)
     }
 
     /// The one slot's dispatch for `generation` once settled, or as of the end
