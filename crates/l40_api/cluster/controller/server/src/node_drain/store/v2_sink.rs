@@ -4,7 +4,6 @@
 use std::str::FromStr;
 
 use pplx_space_api::controllers::substrate::connect_internal_node_api_client_for_target;
-use pplx_space_sandbox_store::drain_evacuation::{self, V2EvacuationRow};
 use pplx_space_sbx_mgr_client::proto::{DrainEvacuated, DrainNodeRequest, DrainNodeResponse};
 use uuid::Uuid;
 
@@ -309,11 +308,6 @@ where
 pub(crate) const DISK_NOT_RECORDED: &str =
     "a stopped sandbox's disk: drain v2 doesn't move stopped sandboxes";
 
-/// Why a reported evacuation of a sandbox whose row reads `stopped` and is
-/// still homed on the draining node isn't recorded: the node keeps it.
-pub(crate) const STOPPED_NOT_RECORDED: &str =
-    "a stopped sandbox: drain v2 doesn't move stopped sandboxes";
-
 /// Record one evacuation the node on `node_id` reported, `evacuated`: a
 /// full snapshot through [`record_v2_evacuation`]. A v2 drain doesn't move a
 /// stopped sandbox, so a stopped sandbox's disk is never recorded
@@ -349,129 +343,31 @@ pub(crate) async fn record_v2_evacuated(
     record_v2_evacuation(pool, node_id, sandbox_id, artifact).await
 }
 
-/// Record one full-snapshot evacuation the node on `node_id` reported.
-///
-/// Write nothing. The evacuation is recorded once the row reads `suspended`
-/// on the reported artifact and the catalog holds a ready, stored full
-/// snapshot of it, or once the row has moved on from it: it is homed on
-/// another node, or it pins another artifact with a ready, stored full
-/// snapshot. A node keeps a suspended sandbox's cache after the sandbox was
-/// restored elsewhere, so it can report an artifact the row no longer pins.
-/// A row that still pins the reported artifact waits for it, so a sandbox
-/// whose only copy is the node's is never recorded before its upload. A
-/// node-initiated suspend can leave the row `suspended` on the node with no
-/// pin at all; it is recorded once the catalog holds the reported artifact
-/// ready and stored, and the restore selector's
-/// [`fresh_ready_snapshot_exists`] holds for the row, so its next restore
-/// has a source. A row still `started`, `paused` or `suspending` on the node
-/// isn't projected yet; one that runs on another node, with an active
-/// execution there, has moved on. A `stopped` row still homed on the node is
-/// never recorded ([`STOPPED_NOT_RECORDED`]): a v2 drain doesn't move it, so
-/// the drain stays unfinished with that reason rather than reaching
-/// `drained` and being held at the fence. Durable means a ready, stored
-/// backup of the artifact as a full snapshot (`artifact_backup_ready`, the
-/// verb a node's release of its local copy asks).
-///
-/// A row that no longer needs anything is [`EvacuationRecord::Recorded`].
-///
-/// [`fresh_ready_snapshot_exists`]: pplx_space_sandbox_portability::fresh_ready_snapshot_exists
+/// Record one full-snapshot evacuation the node on `node_id` reported:
+/// recorded once the sandbox no longer needs the node, by the sandbox
+/// store's one default-deny answer
+/// ([`pplx_space_sandbox_store::drain_terminate::evacuation_verdict`]), and
+/// not yet, with why, while it may. Writes nothing. A `stopped` row still
+/// homed on the node is never recorded
+/// ([`pplx_space_sandbox_store::drain_terminate::evacuation_verdict::STOPPED_HELD`]): a v2
+/// drain doesn't move it, so the drain stays unfinished with that reason
+/// rather than reaching `drained` and being held at the fence.
 pub(crate) async fn record_v2_evacuation(
     pool: &PgPool,
     node_id: NodeId,
     sandbox_id: SandboxId,
     artifact: Uuid,
 ) -> Result<EvacuationRecord, String> {
-    let sql_error = |error: pplx_space_postgres_pool::DbError| sqlx::Error::from(error).to_string();
-    let row = drain_evacuation::v2_evacuation_row(pool, sandbox_id, node_id)
-        .await
-        .map_err(sql_error)?;
-    let Some(V2EvacuationRow {
-        lifecycle,
-        active_node_id,
-        target_node_id,
-        current_local_artifact_id: pin,
-        executes_elsewhere,
-    }) = row
-    else {
-        return Ok(EvacuationRecord::Recorded);
+    use pplx_space_sandbox_store::drain_terminate::evacuation_verdict::{
+        EvacuationVerdict, evacuation_verdict,
     };
-    let home = target_node_id.or(active_node_id);
-    match lifecycle.as_str() {
-        "suspended" => {}
-        "started" | "paused" | "suspending" if active_node_id == Some(node_id) => {
-            return Ok(EvacuationRecord::NotYet(
-                "the node's suspend isn't projected onto the row yet".to_owned(),
-            ));
-        }
-        // Running again, on an execution elsewhere: a user's call moved it.
-        "started" | "paused" | "suspending" if executes_elsewhere => {
-            return Ok(EvacuationRecord::Recorded);
-        }
-        "started" | "paused" | "suspending" => {
-            return Ok(EvacuationRecord::NotYet(
-                "the row runs nowhere the control plane knows of yet".to_owned(),
-            ));
-        }
-        "stopped" if home == Some(node_id) => {
-            return Ok(EvacuationRecord::NotYet(STOPPED_NOT_RECORDED.to_owned()));
-        }
-        _ => return Ok(EvacuationRecord::Recorded),
-    }
-    let ready = |artifact: Uuid| async move {
-        pplx_space_snapshot_store::artifact_backup_ready(
-            pool,
-            sandbox_id,
-            pplx_space_snapshot_model::LocalArtifactId::from_uuid(artifact),
-            pplx_space_snapshot_model::ArtifactKind::Full,
-        )
+    match evacuation_verdict(pool, node_id, sandbox_id, artifact)
         .await
-        .map_err(|error| error.to_string())
-    };
-    if pin == Some(artifact) {
-        return Ok(if ready(artifact).await? {
-            EvacuationRecord::Recorded
-        } else {
-            EvacuationRecord::NotYet(
-                "the catalog doesn't hold the artifact as ready yet".to_owned(),
-            )
-        });
-    }
-    // Moved on from the reported artifact: homed on another node, or
-    // pinning another artifact that is durable.
-    if home.is_some_and(|home| home != node_id) {
-        return Ok(EvacuationRecord::Recorded);
-    }
-    // A markerless row's restore takes a fresh ready full snapshot through
-    // the selector's legacy branch, so both halves must hold: the reported
-    // snapshot is durable, and that branch finds a source. A row the fence
-    // already unplaced, homed nowhere, is read the same way.
-    if pin.is_none() && home.is_none_or(|home| home == node_id) {
-        if !ready(artifact).await? {
-            return Ok(EvacuationRecord::NotYet(
-                "the row pins no artifact and the catalog doesn't hold the reported one as ready yet"
-                    .to_owned(),
-            ));
-        }
-        let fresh = drain_evacuation::fresh_ready_full_snapshot(pool, sandbox_id)
-            .await
-            .map_err(sql_error)?;
-        return Ok(if fresh {
-            EvacuationRecord::Recorded
-        } else {
-            EvacuationRecord::NotYet(
-                "the row pins no artifact and has no ready full snapshot since its placement changed"
-                    .to_owned(),
-            )
-        });
-    }
-    if let Some(pin) = pin
-        && ready(pin).await?
+        .map_err(|error| sqlx::Error::from(error).to_string())?
     {
-        return Ok(EvacuationRecord::Recorded);
+        EvacuationVerdict::Released(_) => Ok(EvacuationRecord::Recorded),
+        EvacuationVerdict::Holds(reason) => Ok(EvacuationRecord::NotYet(reason)),
     }
-    Ok(EvacuationRecord::NotYet(
-        "the row pins another artifact than the one the node reported, not yet durable".to_owned(),
-    ))
 }
 
 fn generation_i64(generation: u64) -> Result<i64, String> {

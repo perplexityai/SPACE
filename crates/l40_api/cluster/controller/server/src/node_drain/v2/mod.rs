@@ -39,7 +39,11 @@
 //!    goes to `drain_last_error` and the loop records nothing from it.
 //!    Otherwise record each evacuation the node reports: a suspended one
 //!    once the row reads `suspended` and the catalog holds its snapshot
-//!    ready, writing nothing (its next call restores it elsewhere). A v2
+//!    ready, writing nothing (its next call restores it elsewhere). One
+//!    default-deny answer decides it
+//!    (`pplx_space_sandbox_store::drain_terminate::evacuation_verdict`): a
+//!    row it doesn't release by name, one in a lifecycle that isn't settled,
+//!    not homed on another node, among them, isn't recorded. A v2
 //!    drain doesn't move a stopped sandbox: the node reports one pending,
 //!    and a stopped disk reported evacuated is never recorded, so the drain
 //!    isn't finished. The loop writes no sandbox row while it drains. The
@@ -52,7 +56,7 @@
 //!    changes nothing else. Once the report has nothing pending or blocked
 //!    and every evacuation is recorded, the node moves to `drained`.
 //! 4. **Drained**: no sandbox-row write, and the node isn't called. Every
-//!    suspended row still homed on the node that the terminate would
+//!    suspended row still naming the node that the terminate would
 //!    release (its snapshot durable, no restore or activation of it in
 //!    flight) is added to `evacuated_total` (a v2 drain never moves a
 //!    stopped sandbox, so none is counted), a `drain_status` write only,

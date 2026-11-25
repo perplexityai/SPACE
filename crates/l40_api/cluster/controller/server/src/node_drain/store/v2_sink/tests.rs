@@ -293,10 +293,11 @@ async fn a_row_that_moved_on_from_the_reported_artifact_is_recorded() -> TestRes
 
 /// A node-initiated suspend projects the row `suspended` on the node without
 /// pinning its artifact. That evacuation is recorded once the catalog holds
-/// the reported artifact ready and stored and the row has a ready full
-/// snapshot since its placement changed, which a markerless restore takes;
-/// without either it waits, and says which is missing. So is one the fence
-/// already unplaced.
+/// the reported artifact ready and stored and the terminate's source-release
+/// test holds for the row (for an unmarked row, a ready full snapshot since
+/// its placement changed, which a markerless restore takes); without either
+/// it waits, and says which is missing. So is one the fence already
+/// unplaced.
 #[tokio::test(flavor = "current_thread")]
 async fn a_markerless_suspended_row_is_recorded_once_its_artifact_and_a_fresh_snapshot_are_ready()
 -> TestResult {
@@ -345,7 +346,37 @@ async fn a_markerless_suspended_row_is_recorded_once_its_artifact_and_a_fresh_sn
     let EvacuationRecord::NotYet(reason) = record(stale).await? else {
         panic!("the ready artifact predates the placement");
     };
-    assert!(reason.contains("since its placement changed"), "{reason}");
+    assert!(reason.contains("durable enough to release"), "{reason}");
+
+    // A row marked for an evacuation restore waits for its newest full
+    // snapshot, which that restore takes, though the reported one is ready
+    // and newer than its placement.
+    let marked = sandbox(pool, "suspended", Some(node)).await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET evacuation_restore_target = 'started',
+                placement_changed_at = NOW() - INTERVAL '1 hour'
+          WHERE id = $1"
+    ))
+    .bind(marked)
+    .execute(pool)
+    .await?;
+    let reported = catalog(pool, marked, artifact, "full", "ready").await?;
+    let newer = catalog(pool, marked, Uuid::now_v7(), "full", "creating").await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots
+            SET timestamp = NOW() - CASE WHEN id = $1 THEN INTERVAL '10 minutes'
+                                         ELSE INTERVAL '1 minute' END
+          WHERE id IN ($1, $2)"
+    ))
+    .bind(reported)
+    .bind(newer)
+    .execute(pool)
+    .await?;
+    let EvacuationRecord::NotYet(reason) = record(marked).await? else {
+        panic!("the newest full snapshot is uploading");
+    };
+    assert!(reason.contains("durable enough to release"), "{reason}");
 
     // A row the fence already unplaced, homed nowhere, is read the same way:
     // it waits for the reported artifact, then is recorded.
@@ -417,7 +448,9 @@ async fn a_stopped_disk_evacuation_is_never_recorded() -> TestResult {
     // A stopped row reported with a full snapshot stays on the node.
     assert_eq!(
         record_v2_evacuated(pool, node, &entry(ArtifactKind::Full)).await?,
-        EvacuationRecord::NotYet(STOPPED_NOT_RECORDED.to_owned())
+        EvacuationRecord::NotYet(
+            pplx_space_sandbox_store::drain_terminate::evacuation_verdict::STOPPED_HELD.to_owned()
+        )
     );
     let elsewhere = v2_node(
         pool,
@@ -456,8 +489,10 @@ async fn a_stopped_disk_evacuation_is_never_recorded() -> TestResult {
 
 /// An evacuation waits while the catalog doesn't hold its artifact ready, or
 /// while the node's suspend isn't projected onto a row still on the node, or
-/// while a running row has no execution elsewhere; a sandbox a user woke on
-/// another node, or deleted, has moved on.
+/// while a running row has no execution bound to another node (one bound to
+/// no node yet runs nowhere known), or while a row in a transient lifecycle
+/// is homed on no other node; a sandbox a user woke on another node, or
+/// deleted, has moved on.
 #[tokio::test(flavor = "current_thread")]
 async fn an_evacuation_waits_for_its_catalog_and_projection_and_skips_what_moved_on() -> TestResult
 {
@@ -471,6 +506,7 @@ async fn an_evacuation_waits_for_its_catalog_and_projection_and_skips_what_moved
         serde_json::json!({"generation": 5, "deadline_at": 0}),
     )
     .await?;
+    identity(pool, node, Some(INSTANCE)).await?;
     let elsewhere = NodeId::new();
     let artifact = Uuid::now_v7();
 
@@ -492,6 +528,19 @@ async fn an_evacuation_waits_for_its_catalog_and_projection_and_skips_what_moved
     .await?;
     let stale = sandbox(pool, "started", Some(elsewhere)).await?;
     catalog(pool, stale, artifact, "full", "ready").await?;
+    let unbound = sandbox(pool, "started", None).await?;
+    catalog(pool, unbound, artifact, "full", "ready").await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions
+             (sandbox_id, generation, pod_name, pod_namespace, state, k8s_node_name)
+         VALUES ($1, 1, $2, 'space', 'creating', NULL)"
+    ))
+    .bind(unbound)
+    .bind(format!("pod-{unbound}"))
+    .execute(pool)
+    .await?;
+    let restoring = sandbox(pool, "restoring", None).await?;
+    catalog(pool, restoring, artifact, "full", "ready").await?;
     let control = sandbox(pool, "suspended", None).await?;
     pin_full(pool, control, artifact).await?;
     catalog(pool, control, artifact, "full", "ready").await?;
@@ -500,6 +549,12 @@ async fn an_evacuation_waits_for_its_catalog_and_projection_and_skips_what_moved
         ("unprojected", unprojected, "not yet"),
         ("woken elsewhere", woken, "recorded"),
         ("placed elsewhere, running nowhere", stale, "not yet"),
+        (
+            "running on an execution bound to no node",
+            unbound,
+            "not yet",
+        ),
+        ("restoring, placed nowhere", restoring, "not yet"),
         ("deleted", SandboxId::new(), "recorded"),
         ("control", control, "recorded"),
     ] {

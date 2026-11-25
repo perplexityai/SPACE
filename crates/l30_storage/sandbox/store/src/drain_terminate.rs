@@ -18,7 +18,12 @@
 //! never evacuates, are among them. A released suspended row keeps its
 //! lifecycle, is placed nowhere, and its next wake restores it on any node.
 //! A v2 drain never moves a stopped sandbox: nothing here writes a stopped
-//! row, and one that still names the node holds it.
+//! row, and one that still names the node holds it. The drained tick counts
+//! as evacuated exactly the rows the release would take
+//! ([`releasable_suspended_rows_naming`]).
+//!
+//! Earlier, while the node drains, [`evacuation_verdict`] answers whether a
+//! sandbox the node reported evacuated still needs it.
 
 use std::sync::LazyLock;
 
@@ -28,6 +33,8 @@ use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::snapshot_durable_for_source_release;
 use pplx_space_sql_locator::sql;
 use uuid::Uuid;
+
+pub mod evacuation_verdict;
 
 /// What still names a node, as [`node_references`] reads it: each list holds
 /// up to the read's limit of sandbox ids, by id.
