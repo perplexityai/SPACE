@@ -26,10 +26,25 @@ use pplx_space_node_model::{NodeAddress, NodeManagedBy, NodeRole};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_snapshot_model::LocalArtifactId;
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 use sqlx::types::{Json, JsonValue};
+use sqlx::{PgExecutor, Postgres, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+/// Lock existing observations before taking the sandbox row. This covers
+/// concurrent writers that do not take the per-sandbox advisory lock.
+pub async fn lock_for_delete_nowait(
+    tx: &mut Transaction<'_, Postgres>,
+    sandbox_id: SandboxId,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "SELECT 1 FROM sandbox_observed_states WHERE sandbox_id = $1 FOR UPDATE NOWAIT"
+    ))
+    .bind(sandbox_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
 
 /// The nullable `spaced_version` column shared by sandbox observation queries.
 #[derive(Clone, Debug, sqlx::FromRow)]
