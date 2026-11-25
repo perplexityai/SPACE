@@ -36,9 +36,8 @@ pub struct PendingRound {
     pub round: u64,
     pub issued_at: Timestamp,
     /// The assignment generation the round asks about, read from the round
-    /// rather than the assignment. `None` for a round that names none, which
-    /// can't be answered.
-    pub assignment_generation: Option<u64>,
+    /// rather than the assignment.
+    pub assignment_generation: u64,
 }
 
 /// Read `node`'s assignment and pending round.
@@ -77,38 +76,36 @@ pub async fn fetch_instructions(
         }),
         _ => None,
     };
-    // The schema sets the round and its issue time together.
-    let pending_round = match (round, issued_at) {
-        (Some(round), Some(issued_at)) => Some(pending_round(
-            round,
-            issued_at,
-            round_generation.map(non_negative).transpose()?,
-        )?),
-        _ => None,
-    };
+    let pending_round = pending_round(round, issued_at, round_generation)?;
     Ok(NodeInstructions {
         assignment,
         pending_round,
     })
 }
 
-/// A pending round as stored, with the generation it asks about, decoded
-/// alike for Fetch and the round opener.
+/// A pending round as stored, decoded alike for Fetch and the round opener.
+/// The schema sets all three columns or none, so a partial set is an error.
 pub(crate) fn pending_round(
-    round: i64,
-    issued_at: OffsetDateTime,
-    assignment_generation: Option<u64>,
-) -> Result<PendingRound, sqlx::Error> {
-    Ok(PendingRound {
-        round: non_negative(round)?,
-        issued_at: Timestamp::from_nanosecond(issued_at.unix_timestamp_nanos())
-            .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
-        assignment_generation,
-    })
+    round: Option<i64>,
+    issued_at: Option<OffsetDateTime>,
+    assignment_generation: Option<i64>,
+) -> Result<Option<PendingRound>, sqlx::Error> {
+    match (round, issued_at, assignment_generation) {
+        (None, None, None) => Ok(None),
+        (Some(round), Some(issued_at), Some(generation)) => Ok(Some(PendingRound {
+            round: non_negative(round)?,
+            issued_at: Timestamp::from_nanosecond(issued_at.unix_timestamp_nanos())
+                .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
+            assignment_generation: non_negative(generation)?,
+        })),
+        _ => Err(sqlx::Error::Decode(
+            "pending round columns are partly set".into(),
+        )),
+    }
 }
 
 /// The schema keeps every counter non-negative; report a violation rather
 /// than guess.
-pub(crate) fn non_negative(value: i64) -> Result<u64, sqlx::Error> {
+fn non_negative(value: i64) -> Result<u64, sqlx::Error> {
     u64::try_from(value).map_err(|error| sqlx::Error::Decode(Box::new(error)))
 }

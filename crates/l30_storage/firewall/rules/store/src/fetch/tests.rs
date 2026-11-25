@@ -120,7 +120,7 @@ async fn fetch_returns_exactly_the_nodes_own_parts() -> TestResult {
             pending_round: pending.map(|(round, generation)| PendingRound {
                 round: round.try_into().unwrap(),
                 issued_at: Timestamp::from_nanosecond(issued_at().unix_timestamp_nanos()).unwrap(),
-                assignment_generation: Some(generation.try_into().unwrap()),
+                assignment_generation: generation.try_into().unwrap(),
             }),
         };
         let fetched = fetch_instructions(&mut *pool.acquire().await?, node).await?;
@@ -149,4 +149,24 @@ async fn an_undecodable_revision_is_an_error() -> TestResult {
         "{error}"
     );
     Ok(())
+}
+
+/// The schema sets the three columns together; any other mix is an error.
+#[test]
+fn a_partly_stored_or_negative_round_is_an_error() {
+    let at = issued_at();
+    assert_eq!(pending_round(None, None, None).unwrap(), None);
+    assert!(pending_round(Some(1), Some(at), Some(2)).unwrap().is_some());
+    for (case, round, issued, generation) in [
+        ("round only", Some(1), None, None),
+        ("issued_at only", None, Some(at), None),
+        ("generation only", None, None, Some(2)),
+        ("no generation", Some(1), Some(at), None),
+        ("no round", None, Some(at), Some(2)),
+        ("no issued_at", Some(1), None, Some(2)),
+        ("negative round", Some(-1), Some(at), Some(2)),
+        ("negative generation", Some(1), Some(at), Some(-2)),
+    ] {
+        assert!(pending_round(round, issued, generation).is_err(), "{case}");
+    }
 }

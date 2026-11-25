@@ -104,10 +104,7 @@ async fn racing_and_repeated_opens_converge_on_one_round_and_one_wakeup() -> Tes
         _ => panic!("racing opens didn't converge: {outcomes:?}"),
     };
     assert_eq!(question.round, 1);
-    assert_eq!(
-        question.assignment_generation,
-        Some(stamp.assignment_generation)
-    );
+    assert_eq!(question.assignment_generation, stamp.assignment_generation);
     assert!((start..=end).contains(&question.issued_at), "{question:?}");
 
     let open = effects(&db.pool, rollout, node).await?;
@@ -381,11 +378,9 @@ async fn any_failure_rolls_back_the_whole_opening() -> TestResult {
 /// Catches a round numbered from only the pending or only the accepted round,
 /// which reissues a number a delayed answer may still carry; an accepted
 /// report a new round overwrites; a round returned as already open for
-/// another generation; a round for this generation that no report can answer
-/// any more returned, or replaced while it still can be, which the opener and
-/// acceptance must judge by one limit; and an unbound round, left from before
-/// rounds named their generation, that's returned or refused rather than
-/// replaced.
+/// another generation; and a round for this generation that no report can
+/// answer any more returned, or replaced while it still can be, which the
+/// opener and acceptance must judge by one limit.
 #[tokio::test(flavor = "current_thread")]
 async fn each_new_question_takes_a_new_round() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -396,10 +391,7 @@ async fn each_new_question_takes_a_new_round() -> TestResult {
     let generation = stamp.assignment_generation;
     let asked = |q: PendingRound| (q.round, q.assignment_generation);
 
-    assert_eq!(
-        asked(opened(&db.pool, &target).await?),
-        (1, Some(generation))
-    );
+    assert_eq!(asked(opened(&db.pool, &target).await?), (1, generation));
     accept(&db.pool, node).await?;
     let accepted = |effects: Effects| {
         effects.observation.map(|o| {
@@ -411,10 +403,7 @@ async fn each_new_question_takes_a_new_round() -> TestResult {
         })
     };
     let evidence = accepted(effects(&db.pool, first, node).await?);
-    assert_eq!(
-        asked(opened(&db.pool, &target).await?),
-        (2, Some(generation))
-    );
+    assert_eq!(asked(opened(&db.pool, &target).await?), (2, generation));
 
     // Round 2 aged to just inside the report age limit, then to it, on the
     // database clock. Once expired it's replaced, with a wakeup.
@@ -443,7 +432,7 @@ async fn each_new_question_takes_a_new_round() -> TestResult {
     age(REPORT_MAX_AGE).await?;
     let start = clock(&db.pool).await?;
     let reopened = opened(&db.pool, &target).await?;
-    assert_eq!(asked(reopened), (3, Some(generation)));
+    assert_eq!(asked(reopened), (3, generation));
     assert!(reopened.issued_at >= start, "{reopened:?}");
     let trigger = |effects: Effects| effects.trigger.map(|t| t.1);
     assert_eq!(
@@ -458,31 +447,7 @@ async fn each_new_question_takes_a_new_round() -> TestResult {
     save_targets(&db.pool, next, &[node]).await?;
     let target = lease(&db.pool, next, 1).await?.remove(0);
     let generation = issued(&db.pool, &target).await?.assignment_generation;
-    assert_eq!(
-        asked(opened(&db.pool, &target).await?),
-        (4, Some(generation))
-    );
-
-    // Round 4 unbound, as 20261123200458's down and up leave a round. The
-    // migration that then requires a generation won't apply over one, so its
-    // check is dropped first where the schema has it.
-    sqlx::query(sql!(
-        "ALTER TABLE firewall_rules_node_observations
-         DROP CONSTRAINT IF EXISTS firewall_rules_node_observations_pending_bound_check"
-    ))
-    .execute(&db.pool)
-    .await?;
-    sqlx::query(sql!(
-        "UPDATE firewall_rules_node_observations
-         SET pending_assignment_generation = NULL WHERE node_id = $1"
-    ))
-    .bind(node)
-    .execute(&db.pool)
-    .await?;
-    assert_eq!(
-        asked(opened(&db.pool, &target).await?),
-        (5, Some(generation))
-    );
+    assert_eq!(asked(opened(&db.pool, &target).await?), (4, generation));
 
     assert_eq!(accepted(effects(&db.pool, next, node).await?), evidence);
     Ok(())
