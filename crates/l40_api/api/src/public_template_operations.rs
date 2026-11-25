@@ -3,6 +3,7 @@ use pplx_space_accounts::NodeId;
 use std::time::Duration;
 
 use pplx_space_cluster_pool::{TemplateWarmPoolUsage, WarmPoolStore};
+use pplx_space_cluster_trigger_queue::enqueue_triggers;
 use pplx_space_node_model::SubstrateKind;
 use pplx_space_public_api::{
     OperationState, PublicErrorCode, PublicErrorDetail, PublicOperationResult,
@@ -21,7 +22,6 @@ use crate::{
         NetworkPolicyTarget, ReconcileElementRef, ReconcileRef,
         enqueue_node_reconcile_refs_for_nodes,
     },
-    reconcile_trigger::enqueue_triggers,
 };
 
 const TEMPLATE_DELETE_RETRY_AFTER: Duration = Duration::from_secs(5);

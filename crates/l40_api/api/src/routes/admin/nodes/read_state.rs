@@ -8,12 +8,12 @@ use pplx_space_accounts::NodeId;
 use pplx_space_admin_protocol::{
     AdminNodeReconcileTrigger, AdminNodeResponse, AdminNodeRuntimeInstallation,
 };
+use pplx_space_cluster_trigger_queue::QueuedTrigger;
 
 use pplx_space_node_execution_inventory_store::InstallationGuestRow;
 
 use super::super::node_store::AdminNodeStore;
 use super::super::support::{format_optional_time, format_time};
-use crate::reconcile_trigger::QueuedTrigger;
 use crate::routes::AppState;
 
 /// Fill in the node state the read routes add to [`super::admin_node_response`]:
@@ -70,7 +70,7 @@ async fn read_page_state(
     store: &AdminNodeStore,
     node_ids: &[NodeId],
 ) -> Result<PageState, sqlx::Error> {
-    let triggers = crate::reconcile_trigger::queued_triggers(&state.pool, node_ids)
+    let triggers = pplx_space_cluster_trigger_queue::queued_triggers(&state.pool, node_ids)
         .await?
         .into_iter()
         .map(|trigger| (trigger.node_id, admin_reconcile_trigger(trigger)))

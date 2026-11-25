@@ -2784,7 +2784,7 @@ async fn node_reads_report_cordon_group_trigger_and_runtimes() -> TestResult {
     .bind(busy)
     .execute(&db.pool)
     .await?;
-    crate::reconcile_trigger::enqueue_triggers(
+    pplx_space_cluster_trigger_queue::enqueue_triggers(
         &db.pool,
         [busy],
         pplx_space_state_reconciliation::ReconcileReason::ManualNodeReconcile,
@@ -2924,7 +2924,7 @@ async fn node_reads_survive_a_failed_read_state_read() -> TestResult {
     let actor =
         inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
     let node_id = insert_drain_test_node(&db.pool, NodeManagedBy::Space, None).await?;
-    crate::reconcile_trigger::enqueue_triggers(
+    pplx_space_cluster_trigger_queue::enqueue_triggers(
         &db.pool,
         [node_id],
         pplx_space_state_reconciliation::ReconcileReason::ManualNodeReconcile,

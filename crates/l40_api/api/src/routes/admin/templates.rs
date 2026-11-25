@@ -13,6 +13,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::StreamExt as _;
 use pplx_space_build_mgr_client::proto as build_proto;
 use pplx_space_cluster_pool::WarmPoolStore;
+use pplx_space_cluster_trigger_queue::enqueue_triggers_tx;
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_node_model::SubstrateKind;
 use pplx_space_node_registration_store::direct::registry as direct_registry;
@@ -61,7 +62,6 @@ use crate::{
         ReconcileRef, enqueue_node_reconcile_refs_for_nodes_tx,
         requeue_node_reconcile_refs_for_nodes_tx,
     },
-    reconcile_trigger::enqueue_triggers_tx,
     routes::{
         AppState,
         admin::{
@@ -374,8 +374,8 @@ async fn fetch_template(
 
 /// The node-discovery read this module's reconcile enqueues begin with.
 ///
-/// `reconcile_trigger` carries its own near-copy of the predicate for a
-/// different call shape; this is not the only place it appears.
+/// `pplx_space_cluster_trigger_queue::fetch_trigger_targets` carries its own near-copy
+/// of the predicate for a different call shape; this is not the only place it appears.
 ///
 /// Separate from the enqueue writes because the two do not classify the same
 /// way. It reads `nodes` and `node_direct` and writes nothing, so on a request
