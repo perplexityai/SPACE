@@ -40,9 +40,7 @@
 //! every statement in it reads one snapshot, and any write to a
 //! non-temporary table fails.
 //!
-//! Timeouts are set on the open transaction, never on the pool, and last
-//! until it commits or rolls back, as `SET LOCAL` does; the connection goes
-//! back to the pool with its session values:
+//! [`Tx`] sets timeouts for one transaction:
 //!
 //! - [`Tx::set_local_lock_timeout`], [`Tx::set_local_statement_timeout`] and
 //!   [`Tx::set_local_idle_in_transaction_timeout`] set `lock_timeout`,
@@ -52,6 +50,11 @@
 //!   [`Tx::restore_local_lock_timeout`] puts back the value it replaced, so a
 //!   tight bound can cover a few statements rather than the whole
 //!   transaction.
+//!
+//! These timeouts are set on the open transaction and last until it commits
+//! or rolls back, as `SET LOCAL` does; the connection then goes back to the
+//! pool with its session values. A pool-wide `statement_timeout` is
+//! [`DbOptions::statement_timeout`].
 //!
 //! The setters and the lowering take a [`Duration`] and send it in whole
 //! milliseconds, rounded down. Debug builds panic on a duration under 1 ms,
@@ -78,6 +81,7 @@
 //! ```
 
 use std::future::Future;
+use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -126,6 +130,39 @@ impl Db {
                 .await?,
         })
     }
+}
+
+/// What applies to every connection in a pool; what applies to one
+/// transaction belongs on [`Tx`]. The default is the shared pool
+/// configuration [`crate::connect_postgres_as`] documents.
+///
+/// Both settings exist for *sideline* pools, which take them as
+/// [`crate::SidelineOptions`]; see it for why a sideline needs each.
+///
+/// These settings do not decide the pool metrics reporter: a general pool's
+/// constructor starts it ([`crate::connect_space_user_pool_lazy`]), and a
+/// sideline's does not ([`crate::connect_space_user_sideline_pool_lazy`]).
+#[derive(Clone, Debug, Default)]
+pub struct DbOptions {
+    /// Connection ceiling. `None`: the `POSTGRES_POOL_MAX_CONNECTIONS` default
+    /// (`POSTGRES_CREDS_POOL_MAX_CONNECTIONS` for `space_creds`). When set,
+    /// `min_connections` is clamped to it so a large
+    /// `POSTGRES_POOL_MIN_CONNECTIONS` cannot exceed it. `NonZeroU32` for the
+    /// reason [`crate::SidelineOptions::max_connections`] gives.
+    pub max_connections: Option<NonZeroU32>,
+    /// Session `statement_timeout` for every connection, set once at connect.
+    /// `None`: the role's. Sent as the [`Tx`] setters send theirs: in whole
+    /// milliseconds, rounded down. Debug builds panic on a duration under
+    /// 1 ms, and release builds send it as `1ms`, since `0ms` would mean no
+    /// `statement_timeout` at all rather than the role's.
+    ///
+    /// That is the piece a connection cap cannot provide: the cap bounds how
+    /// much of the database's capacity a blocked sideline can hold, but each
+    /// blocked statement still runs to the *role's* `statement_timeout`, and
+    /// its caller waits that long. A pool-scoped setting cancels server-side —
+    /// no abandoned statement, no dropped future, and no effect on any other
+    /// pool using the same role.
+    pub statement_timeout: Option<Duration>,
 }
 
 /// An open transaction from [`Db::begin`] or [`Db::begin_snapshot`].
@@ -347,7 +384,7 @@ impl TxSettings for PgConnection {
 
 /// `d` as a setting value, in whole milliseconds and at least `1ms`: `0ms`
 /// would mean no bound.
-fn setting_millis(d: Duration) -> String {
+pub(crate) fn setting_millis(d: Duration) -> String {
     debug_assert!(
         d.as_millis() != 0,
         "a timeout under 1 ms would render as `0ms`, which Postgres reads as no bound: {d:?}"
