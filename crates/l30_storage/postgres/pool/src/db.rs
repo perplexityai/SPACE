@@ -134,7 +134,7 @@ impl Db {
 
 /// What applies to every connection in a pool; what applies to one
 /// transaction belongs on [`Tx`]. The default is the shared pool
-/// configuration [`crate::connect_postgres_as`] documents.
+/// configuration [`crate::connect_postgres_lazy_as`] documents.
 ///
 /// Both settings exist for *sideline* pools, which take them as
 /// [`crate::SidelineOptions`]; see it for why a sideline needs each.

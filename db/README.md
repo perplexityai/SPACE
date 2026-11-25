@@ -977,9 +977,9 @@ Two shapes need care when adding code:
 ### Application pools
 
 Long-running services connect only as the managed logins, with no selector
-and no fallback to the connecting admin. `pplx-space-postgres-pool`
-exposes three constructors: `connect_space_user_pool` (the service's
-general-purpose pool, as `space_user`), `CredentialsPool::connect` (the
+and no fallback to the connecting admin. They build their pools with three
+`pplx-space-postgres-pool` constructors: `connect_space_user_pool_lazy` (the service's
+general-purpose pool, as `space_user`), `CredentialsPool::connect_lazy` (the
 credential-fenced lane, as `space_creds`), and
 `connect_space_user_sideline_pool_lazy` (a *sideline* pool, also `space_user`,
 with an explicit connection cap). A sideline pool exists for one reason: a
