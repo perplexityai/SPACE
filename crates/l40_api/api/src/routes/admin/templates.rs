@@ -1980,7 +1980,9 @@ pub async fn list_template_builds(
         )
         .into_response();
     }
-    match super::template_store::template_exists(&state.pool, &template_name).await {
+    match pplx_space_template_store::templates::exists_not_deleted(&state.pool, &template_name)
+        .await
+    {
         Ok(true) => {}
         Ok(false) => return api_error(StatusCode::NOT_FOUND, "Template not found").into_response(),
         Err(error) => {

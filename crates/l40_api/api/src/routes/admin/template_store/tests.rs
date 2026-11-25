@@ -1,9 +1,8 @@
 use pplx_space_accounts::{NodeId, OrgId};
 
+use pplx_space_template_model::TemplateVisibility;
 use sqlx::PgPool;
 use uuid::Uuid;
-
-use super::*;
 
 use crate::routes::admin::test_fixtures::{TestResult, postgres_fixture};
 
@@ -71,10 +70,18 @@ async fn in_use_counts_live_and_restorable_only() -> TestResult {
 
     let mut tx = pool.begin().await?;
     assert_eq!(
-        template_sandboxes_in_use_in_tx(&mut tx, "flip-target").await?,
+        pplx_space_sandbox_store::template_usage::template_sandboxes_in_use(
+            &mut *tx,
+            "flip-target"
+        )
+        .await?,
         2
     );
-    assert_eq!(template_sandboxes_in_use_in_tx(&mut tx, "other").await?, 0);
+    assert_eq!(
+        pplx_space_sandbox_store::template_usage::template_sandboxes_in_use(&mut *tx, "other")
+            .await?,
+        0
+    );
     tx.commit().await?;
     Ok(())
 }
@@ -102,8 +109,16 @@ async fn cached_rootfs_counts_inventory_rows() -> TestResult {
         .await?;
 
     let mut tx = pool.begin().await?;
-    assert_eq!(template_cached_rootfs_in_tx(&mut tx, "cached").await?, 1);
-    assert_eq!(template_cached_rootfs_in_tx(&mut tx, "uncached").await?, 0);
+    assert_eq!(
+        pplx_space_node_template_inventory_store::template_inventory_rows(&mut *tx, "cached")
+            .await?,
+        1
+    );
+    assert_eq!(
+        pplx_space_node_template_inventory_store::template_inventory_rows(&mut *tx, "uncached")
+            .await?,
+        0
+    );
     tx.commit().await?;
     Ok(())
 }
@@ -121,8 +136,8 @@ async fn visibility_write_and_owner_check() -> TestResult {
 
     // Ownerless narrow without an owner in the same write → CHECK.
     let mut tx = pool.begin().await?;
-    let err = update_template_visibility_in_tx(
-        &mut tx,
+    let err = pplx_space_template_store::templates::update_visibility(
+        &mut *tx,
         "ownerless",
         TemplateVisibility::OrgSpecific,
         None,
@@ -139,14 +154,14 @@ async fn visibility_write_and_owner_check() -> TestResult {
     // Narrow with the owner supplied in the same write → row carries
     // both the new visibility and the owner.
     let mut tx = pool.begin().await?;
-    update_template_visibility_in_tx(
-        &mut tx,
+    pplx_space_template_store::templates::update_visibility(
+        &mut *tx,
         "ownerless",
         TemplateVisibility::OrgSpecific,
         Some(OrgId::from_uuid(ORG_A)),
     )
     .await?;
-    let row = lock_template_for_update(&mut tx, "ownerless")
+    let row = pplx_space_template_store::templates::lock_visibility(&mut tx, "ownerless")
         .await?
         .expect("row");
     tx.commit().await?;
@@ -156,9 +171,14 @@ async fn visibility_write_and_owner_check() -> TestResult {
     // Widening back leaves the owner in place (org_id is don't-care for
     // generic templates).
     let mut tx = pool.begin().await?;
-    update_template_visibility_in_tx(&mut tx, "ownerless", TemplateVisibility::Generic, None)
-        .await?;
-    let row = lock_template_for_update(&mut tx, "ownerless")
+    pplx_space_template_store::templates::update_visibility(
+        &mut *tx,
+        "ownerless",
+        TemplateVisibility::Generic,
+        None,
+    )
+    .await?;
+    let row = pplx_space_template_store::templates::lock_visibility(&mut tx, "ownerless")
         .await?
         .expect("row");
     tx.commit().await?;
@@ -199,7 +219,12 @@ async fn narrowing_prunes_cross_org_compat_rows() -> TestResult {
     .await?;
 
     let mut tx = pool.begin().await?;
-    let pruned = prune_cross_org_compat_in_tx(&mut tx, "narrowed", OrgId::from_uuid(ORG_A)).await?;
+    let pruned = pplx_space_node_group_store::prune_cross_org_template_compat(
+        &mut *tx,
+        "narrowed",
+        OrgId::from_uuid(ORG_A),
+    )
+    .await?;
     tx.commit().await?;
     assert_eq!(pruned, 1, "only the other org's row is pruned");
 
