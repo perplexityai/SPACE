@@ -330,7 +330,7 @@ mod postgres_backed {
         kubernetes_substrate, single_backend_pool, wait_until_blocked,
     };
     use pplx_space_api::controllers::substrate::Substrate;
-    use pplx_space_sandbox_store::sweeper::REPAIR_FAILED_ACTIVE_EXECUTION_SQL;
+    use pplx_space_sandbox_store::test_support::sweeper::REPAIR_FAILED_ACTIVE_EXECUTION_SQL;
     use std::sync::Arc;
 
     /// The activation-attempt columns of the active execution.
