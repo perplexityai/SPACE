@@ -17,6 +17,8 @@ from space_smoke.drain_v2 import CAP_REFUSAL_CODE_FIELD, V1_REFUSAL_CODE, V1_REF
     "native.v2_refuses_v1_drains",
     api_surfaces=("native",),
     substrates=("kubernetes",),
+    tier="manual",
+    manual_reason="drain v2 is off by default outside Kind, so its scenarios run by name, not in the per-merge set",
 )
 def v2_refuses_v1_drains(test: smoke.CommandSandboxFixture) -> None:
     """With drain v2 on, a `:drain` of the fixture's worker with an empty

@@ -41,6 +41,8 @@ SHORT_AHEAD_SECONDS = 30
     # the shortened hold, a suspend at the deadline and two wakes, on a slow
     # KVM bench.
     timeout_minutes=45,
+    tier="manual",
+    manual_reason="drain v2 is off by default outside Kind, so its scenarios run by name, not in the per-merge set",
 )
 def v2_drain_holds_running_until_its_deadline(test: smoke.CommandSandboxFixture) -> None:
     """A v2 `:drain` with an hour's hold of a worker holding two running

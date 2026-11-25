@@ -29,6 +29,8 @@ PATH = "/tmp/space-smoke-v2-drain.txt"
     # Three suspends, their uploads, three wakes and the drained edge on a
     # slow KVM bench.
     timeout_minutes=45,
+    tier="manual",
+    manual_reason="drain v2 is off by default outside Kind, so its scenarios run by name, not in the per-merge set",
 )
 def v2_drain_evacuates_every_resident(test: smoke.CommandSandboxFixture) -> None:
     """A v2 `:drain`, due now, of a worker holding two started sandboxes (one

@@ -29,6 +29,8 @@ HOLD_SECONDS = 60 * 60
     api_surfaces=("native",),
     substrates=("kubernetes",),
     timeout_minutes=45,
+    tier="manual",
+    manual_reason="drain v2 is off by default outside Kind, so its scenarios run by name, not in the per-merge set",
 )
 def v2_drain_refused_at_the_cap(test: smoke.CommandSandboxFixture) -> None:
     """With at most one v2 drain evacuating, a `:drain` of a worker while

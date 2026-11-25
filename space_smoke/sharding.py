@@ -130,10 +130,10 @@ _DURATION_SECONDS = {
         "native.network_policy_live_update": 7,
         "native.resident_pause": 5,
         "native.stopped_restart_preserves_rootfs": 68,
-        # The drain set, routine and manual alike, which runs by name and
-        # splits across benches with `space_smoke list --prefix native.v2_
-        # --shard I/N`: one local Kind run each (2026-11-20, a 32-core
-        # bench, Kind's drain v2 values); the median of two for the undrain.
+        # The drain set, which runs by name and splits across benches with
+        # `space_smoke list --prefix native.v2_ --shard I/N`: one local Kind
+        # run each (2026-11-20, a 32-core bench, Kind's drain v2 values); the
+        # median of two for the undrain.
         # The stopped-sandbox refusal is one local Kind run (2026-11-24, four
         # benches on a 32-core host): four refused stops' retry budgets and
         # a drain held for an hour that the scenario undrains. Replace with
