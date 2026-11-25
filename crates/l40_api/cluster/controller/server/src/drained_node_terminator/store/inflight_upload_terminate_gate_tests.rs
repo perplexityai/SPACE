@@ -10,9 +10,10 @@ use uuid::Uuid;
 
 use super::{
     DEAD_UPLOAD_SETTLE, DrainedNodeTerminatorSink, NodeDbStore, OrphanDeleteOutcome,
-    OrphanDeleteRefusal, PHASE_DRAINED, PHASE_TERMINATING, ResidencyEvidence,
-    delete_drained_node_if_orphan_query, mark_terminating_query,
+    OrphanDeleteRefusal, PHASE_DRAINED, ResidencyEvidence,
 };
+use crate::drained_node_terminator::PHASE_TERMINATING;
+use pplx_space_node_registration_store::drained_node;
 use pplx_space_sandbox_store::drain_gate_blockers;
 use pplx_space_sandbox_store::lost::{
     lock_unrecoverable_candidates, mark_unrecoverable_sandboxes_lost_query,
@@ -94,15 +95,8 @@ async fn inflight_upload_blocks_terminate_until_finalized() -> TestResult {
         "in-flight upload must count as a blocking snapshot"
     );
 
-    let flipped = sqlx::query(sqlx::AssertSqlSafe(sql!(mark_terminating_query(
-        ResidencyEvidence::default()
-    ))))
-    .bind(node)
-    .bind(PHASE_TERMINATING)
-    .bind(PHASE_DRAINED)
-    .execute(pool)
-    .await?
-    .rows_affected();
+    let flipped =
+        u64::from(drained_node::mark_terminating(pool, node, ResidencyEvidence::default()).await?);
     assert_eq!(flipped, 0, "must not terminate while upload is in flight");
     assert_eq!(
         drain_phase(pool, node).await?.as_deref(),
@@ -131,15 +125,8 @@ async fn inflight_upload_blocks_terminate_until_finalized() -> TestResult {
     .execute(pool)
     .await?;
 
-    let flipped = sqlx::query(sqlx::AssertSqlSafe(sql!(mark_terminating_query(
-        ResidencyEvidence::default()
-    ))))
-    .bind(node)
-    .bind(PHASE_TERMINATING)
-    .bind(PHASE_DRAINED)
-    .execute(pool)
-    .await?
-    .rows_affected();
+    let flipped =
+        u64::from(drained_node::mark_terminating(pool, node, ResidencyEvidence::default()).await?);
     assert_eq!(
         flipped, 1,
         "terminate proceeds once the snapshot is durable"
@@ -201,15 +188,9 @@ async fn evacuation_restoring_does_not_block_terminate() -> TestResult {
         count_a, 0,
         "an evacuation restore must not block termination"
     );
-    let flipped_a = sqlx::query(sqlx::AssertSqlSafe(sql!(mark_terminating_query(
-        ResidencyEvidence::default()
-    ))))
-    .bind(node_a)
-    .bind(PHASE_TERMINATING)
-    .bind(PHASE_DRAINED)
-    .execute(pool)
-    .await?
-    .rows_affected();
+    let flipped_a = u64::from(
+        drained_node::mark_terminating(pool, node_a, ResidencyEvidence::default()).await?,
+    );
     assert_eq!(
         flipped_a, 1,
         "terminate proceeds past an evacuation restore"
@@ -224,15 +205,9 @@ async fn evacuation_restoring_does_not_block_terminate() -> TestResult {
         count_b, 1,
         "a non-evacuation restore still blocks termination"
     );
-    let flipped_b = sqlx::query(sqlx::AssertSqlSafe(sql!(mark_terminating_query(
-        ResidencyEvidence::default()
-    ))))
-    .bind(node_b)
-    .bind(PHASE_TERMINATING)
-    .bind(PHASE_DRAINED)
-    .execute(pool)
-    .await?
-    .rows_affected();
+    let flipped_b = u64::from(
+        drained_node::mark_terminating(pool, node_b, ResidencyEvidence::default()).await?,
+    );
     assert_eq!(
         flipped_b, 0,
         "must not terminate past a non-evacuation restore"
@@ -309,15 +284,8 @@ async fn terminate_blocks_marked_sandbox_until_current_upload_ready() -> TestRes
 
     let count: i64 = drain_gate_blockers::count_on_node(pool, node).await?;
     assert_eq!(count, 1, "current upload in flight must block terminate");
-    let flipped = sqlx::query(sqlx::AssertSqlSafe(sql!(mark_terminating_query(
-        ResidencyEvidence::default()
-    ))))
-    .bind(node)
-    .bind(PHASE_TERMINATING)
-    .bind(PHASE_DRAINED)
-    .execute(pool)
-    .await?
-    .rows_affected();
+    let flipped =
+        u64::from(drained_node::mark_terminating(pool, node, ResidencyEvidence::default()).await?);
     assert_eq!(
         flipped, 0,
         "must not terminate while the current upload is creating"
@@ -335,15 +303,8 @@ async fn terminate_blocks_marked_sandbox_until_current_upload_ready() -> TestRes
     .bind(current)
     .execute(pool)
     .await?;
-    let flipped = sqlx::query(sqlx::AssertSqlSafe(sql!(mark_terminating_query(
-        ResidencyEvidence::default()
-    ))))
-    .bind(node)
-    .bind(PHASE_TERMINATING)
-    .bind(PHASE_DRAINED)
-    .execute(pool)
-    .await?
-    .rows_affected();
+    let flipped =
+        u64::from(drained_node::mark_terminating(pool, node, ResidencyEvidence::default()).await?);
     assert_eq!(
         flipped, 1,
         "terminate proceeds once the current upload is ready"
@@ -421,18 +382,19 @@ async fn delete_drained_orphan_guards() -> TestResult {
         return Ok(());
     };
     let pool = &db.pool;
-    let query = delete_drained_node_if_orphan_query(ResidencyEvidence::default());
 
     // Clean drained row, no sandbox references, matching uid → deleted.
     let clean = NodeId::new();
     insert_drained_node(pool, clean).await?;
-    let deleted = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(clean)
-        .bind(Some(node_uid(clean)))
-        .bind(SubstrateKind::Kubernetes)
-        .execute(pool)
-        .await?
-        .rows_affected();
+    let deleted = u64::from(
+        drained_node::delete_if_orphan(
+            pool,
+            clean,
+            Some(node_uid(clean)).as_deref(),
+            ResidencyEvidence::default(),
+        )
+        .await?,
+    );
     assert_eq!(deleted, 1, "a clean drained orphan must be reaped");
     assert_eq!(drain_phase(pool, clean).await?, None, "row must be gone");
 
@@ -441,13 +403,15 @@ async fn delete_drained_orphan_guards() -> TestResult {
     let pinned = NodeId::new();
     insert_drained_node(pool, pinned).await?;
     insert_active_sandbox(pool, pinned, "started").await?;
-    let deleted = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(pinned)
-        .bind(Some(node_uid(pinned)))
-        .bind(SubstrateKind::Kubernetes)
-        .execute(pool)
-        .await?
-        .rows_affected();
+    let deleted = u64::from(
+        drained_node::delete_if_orphan(
+            pool,
+            pinned,
+            Some(node_uid(pinned)).as_deref(),
+            ResidencyEvidence::default(),
+        )
+        .await?,
+    );
     assert_eq!(
         deleted, 0,
         "must not reap a node a resident active sandbox still references"
@@ -462,13 +426,15 @@ async fn delete_drained_orphan_guards() -> TestResult {
     let local_only = NodeId::new();
     insert_drained_node(pool, local_only).await?;
     insert_suspended_sandbox_with_creating_snapshot(pool, local_only).await?;
-    let deleted = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(local_only)
-        .bind(Some(node_uid(local_only)))
-        .bind(SubstrateKind::Kubernetes)
-        .execute(pool)
-        .await?
-        .rows_affected();
+    let deleted = u64::from(
+        drained_node::delete_if_orphan(
+            pool,
+            local_only,
+            Some(node_uid(local_only)).as_deref(),
+            ResidencyEvidence::default(),
+        )
+        .await?,
+    );
     assert_eq!(
         deleted, 0,
         "must not reap a node whose suspended snapshot is still local-only"
@@ -484,13 +450,15 @@ async fn delete_drained_orphan_guards() -> TestResult {
     let durable = NodeId::new();
     insert_drained_node(pool, durable).await?;
     insert_suspended_with_durable_snapshot(pool, durable).await?;
-    let deleted = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(durable)
-        .bind(Some(node_uid(durable)))
-        .bind(SubstrateKind::Kubernetes)
-        .execute(pool)
-        .await?
-        .rows_affected();
+    let deleted = u64::from(
+        drained_node::delete_if_orphan(
+            pool,
+            durable,
+            Some(node_uid(durable)).as_deref(),
+            ResidencyEvidence::default(),
+        )
+        .await?,
+    );
     assert_eq!(
         deleted, 1,
         "a durably-portable suspended sandbox must not block the reap"
@@ -501,13 +469,15 @@ async fn delete_drained_orphan_guards() -> TestResult {
     let terminal_ref = NodeId::new();
     insert_drained_node(pool, terminal_ref).await?;
     insert_active_sandbox(pool, terminal_ref, "deleted").await?;
-    let deleted = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(terminal_ref)
-        .bind(Some(node_uid(terminal_ref)))
-        .bind(SubstrateKind::Kubernetes)
-        .execute(pool)
-        .await?
-        .rows_affected();
+    let deleted = u64::from(
+        drained_node::delete_if_orphan(
+            pool,
+            terminal_ref,
+            Some(node_uid(terminal_ref)).as_deref(),
+            ResidencyEvidence::default(),
+        )
+        .await?,
+    );
     assert_eq!(
         deleted, 1,
         "a terminal sandbox reference must not block the reap"
@@ -518,13 +488,15 @@ async fn delete_drained_orphan_guards() -> TestResult {
     // reap must refuse (the row now belongs to the fresh node).
     let replaced = NodeId::new();
     insert_drained_node(pool, replaced).await?;
-    let deleted = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(replaced)
-        .bind(Some("stale-observed-uid".to_string()))
-        .bind(SubstrateKind::Kubernetes)
-        .execute(pool)
-        .await?
-        .rows_affected();
+    let deleted = u64::from(
+        drained_node::delete_if_orphan(
+            pool,
+            replaced,
+            Some("stale-observed-uid".to_string()).as_deref(),
+            ResidencyEvidence::default(),
+        )
+        .await?,
+    );
     assert_eq!(
         deleted, 0,
         "must not reap when the observed kube uid no longer matches node_k8s"
@@ -554,13 +526,15 @@ async fn delete_drained_orphan_guards() -> TestResult {
     .bind(node_uid(terminating))
     .execute(pool)
     .await?;
-    let deleted = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(terminating)
-        .bind(Some(node_uid(terminating)))
-        .bind(SubstrateKind::Kubernetes)
-        .execute(pool)
-        .await?
-        .rows_affected();
+    let deleted = u64::from(
+        drained_node::delete_if_orphan(
+            pool,
+            terminating,
+            Some(node_uid(terminating)).as_deref(),
+            ResidencyEvidence::default(),
+        )
+        .await?,
+    );
     assert_eq!(deleted, 0, "only `drained` rows are eligible for this reap");
     assert_eq!(
         drain_phase(pool, terminating).await?.as_deref(),

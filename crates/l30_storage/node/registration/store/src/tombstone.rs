@@ -1,9 +1,36 @@
-//! `node_k8s_tombstones` writes. A tombstone outlives the node's `nodes` and
-//! `node_k8s` rows, and registration refuses a tombstoned node id.
+//! `node_k8s_tombstones` writes, and the guarded delete of a terminating
+//! node that runs before one ([`delete_terminating_k8s_node`]). A tombstone
+//! outlives the node's `nodes` and `node_k8s` rows, and registration refuses
+//! a tombstoned node id.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_node_model::SubstrateKind;
 use pplx_space_sql_locator::sql;
 use sqlx::PgExecutor;
+
+/// Delete `node_id`'s Kubernetes row while it is in `drain_phase =
+/// 'terminating'` under a v1 drain (`drain_engine IS NULL`); its `node_k8s`
+/// row cascades. Returns whether the row was deleted. A v2 drain's node is
+/// never deleted here. Run it in the transaction that then records the
+/// node's tombstone ([`record_admin_terminate_tombstone`]), and record one
+/// only when this returns `true`.
+pub async fn delete_terminating_k8s_node(
+    executor: impl PgExecutor<'_>,
+    node_id: NodeId,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(sql!(
+        "DELETE FROM nodes
+         WHERE id = $1
+           AND drain_phase = 'terminating'
+           AND managed_by = $2
+           AND drain_engine IS NULL"
+    ))
+    .bind(node_id)
+    .bind(SubstrateKind::Kubernetes)
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
 
 /// Tombstone `node_id` with reason `admin-terminate`, now, or re-date and
 /// rewrite its existing tombstone. Run it in the transaction that deletes the
@@ -30,3 +57,6 @@ pub async fn record_admin_terminate_tombstone(
     .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

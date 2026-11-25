@@ -2,12 +2,15 @@
 //! the row: who owns it, whether it has prior state, whether it is started,
 //! how long its restore lease has left, and whose activation its runtime
 //! records. [`owner`] also
-//! reads whether the owning organization brings its own key.
+//! reads whether the owning organization brings its own key, and
+//! [`home_node_v2_drain`] whether the node the row names is under a v2
+//! drain, from `nodes`, which belongs to
+//! `pplx-space-node-registration-store`.
 //!
 //! Plain reads: none takes a lock, and each runs on the executor its caller
 //! passes.
 
-use pplx_space_accounts::{ClientId, OrgId, UserId};
+use pplx_space_accounts::{ClientId, NodeId, OrgId, UserId};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 
@@ -139,3 +142,25 @@ pub async fn owner(
     .fetch_optional(executor)
     .await
 }
+
+/// The node `sandbox_id`'s row names (its `active_node_id`, else its
+/// `target_node_id`), and whether a v2 drain of that node is recorded
+/// (`drain_engine = 'v2'`). `None` when the row is gone; `Some((None,
+/// false))` when it names no node, or one whose `nodes` row is gone.
+pub async fn home_node_v2_drain(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+) -> Result<Option<(Option<NodeId>, bool)>, sqlx::Error> {
+    sqlx::query_as(sql!(
+        "SELECT n.id, COALESCE(n.drain_engine = 'v2', FALSE)
+               FROM sandboxes s
+               LEFT JOIN nodes n ON n.id = COALESCE(s.active_node_id, s.target_node_id)
+              WHERE s.id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_optional(executor)
+    .await
+}
+
+#[cfg(test)]
+mod tests;

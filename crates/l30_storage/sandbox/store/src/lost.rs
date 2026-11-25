@@ -282,7 +282,7 @@ pub async fn write_off_lost_sandboxes(
 /// The `EXISTS` guards re-check the node's `drained` + Kubernetes-managed
 /// phase and the `node_k8s.k8s_node_uid` identity (`IS NOT DISTINCT FROM
 /// $2`) **inside the UPDATE**, mirroring the terminator's
-/// `delete_drained_node_if_orphan_query`: a same-name kube replacement or an
+/// `drained_node::delete_if_orphan`: a same-name kube replacement or an
 /// admin undrain that lands after the EC2
 /// cross-check makes this match nothing, so the terminal flip can never
 /// outlive the observation that justified it.

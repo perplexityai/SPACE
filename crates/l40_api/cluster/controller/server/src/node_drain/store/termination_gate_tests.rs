@@ -21,7 +21,6 @@ use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_residency::CENSUS_PLACEMENT_SETTLE;
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
 
-use crate::drained_node_terminator::store::mark_terminating_query;
 use crate::node_drain::PHASE_TERMINATING;
 
 use super::*;
@@ -292,14 +291,12 @@ async fn terminator_would_advance(
     node_id: NodeId,
     residency: ResidencyEvidence,
 ) -> TestResult<bool> {
-    let query = mark_terminating_query(residency);
-    let updated = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(node_id)
-        .bind(PHASE_TERMINATING)
-        .bind(PHASE_DRAINED)
-        .execute(pool)
-        .await?;
-    Ok(updated.rows_affected() == 1)
+    Ok(
+        pplx_space_node_registration_store::drained_node::mark_terminating(
+            pool, node_id, residency,
+        )
+        .await?,
+    )
 }
 
 /// The full lifecycle matrix against a live database, in one pass: for every

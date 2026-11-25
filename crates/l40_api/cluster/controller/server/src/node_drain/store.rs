@@ -225,8 +225,8 @@ pub(crate) fn is_lock_timeout(error: &sqlx::Error) -> bool {
 ///
 /// When `guard_residency` is set the UPDATE additionally re-checks the
 /// drained-node terminator's resident guard **inside the statement**, mirroring
-/// `drained_node_terminator::store::mark_terminating_query`, which re-checks its
-/// own guards for exactly the same reason.
+/// `pplx_space_node_registration_store::drained_node::mark_terminating`, which
+/// re-checks its own guards for exactly the same reason.
 ///
 /// Load-bearing, not belt-and-braces. `handle_draining_node` evaluates the
 /// gate's four terms as separate reads, so a sandbox that attaches to the node
@@ -2234,8 +2234,8 @@ impl SubstrateSink {
         //
         // **"Still force-drained" is one condition with several spellings.**
         // This statement and the stall gauge's spell it `drain_phase =
-        // 'draining' AND drain_mode = 'forced'`; the pod-less give-up's
-        // precheck binds `PHASE_DRAINING` and `NodeDrainMode::Forced`, and the
+        // 'draining' AND drain_mode = 'forced'`; the pod-less give-up's guards
+        // (`pplx_space_sandbox_store::pod_less_giveup::read_guards`) and the
         // evacuation claims in `pplx_space_sandbox_store::drain` bind
         // `NodeDrainPhase::Draining` and `NodeDrainMode::Forced`. All of them
         // render `'draining'` and `'forced'`. The mode is matched literally
@@ -2628,8 +2628,8 @@ impl NodeDrainSink for SubstrateSink {
     /// drained-node terminator's resident guard refuse this node.
     ///
     /// The predicate is `sandbox_residency::active_resident_predicate` itself — the
-    /// same string `mark_terminating_query` and the KubeNodeGone reap re-check
-    /// atomically — not a restatement of it. Its docs carry which lifecycles that
+    /// same string `drained_node::mark_terminating` and the KubeNodeGone reap
+    /// re-check atomically — not a restatement of it. Its docs carry which lifecycles that
     /// is and why it differs from the resident scan's include-list.
     ///
     /// Unordered on purpose: `GROUP BY` alone lets the planner hash-aggregate, while
@@ -4626,10 +4626,11 @@ impl NodeDrainSink for SubstrateSink {
             // not the same one restated.
             //
             // Both routes into `terminating` must guard residency:
-            // `mark_terminating_query` and the admin `POST :terminate` driven
-            // by `scripts/space-rollout-mng.py`. Each checks active residents
-            // and local snapshots with the same census policy, so a node
-            // gaining a resident in either window parks instead of terminating.
+            // `drained_node::mark_terminating` and the admin `POST :terminate`
+            // driven by `scripts/space-rollout-mng.py`. Each checks active
+            // residents and local snapshots with the same census policy, so a
+            // node gaining a resident in either window parks instead of
+            // terminating.
             //
             // **Scoped to that one writer, deliberately narrowly.** There is no
             // FK from `sandboxes.active_node_id` to `nodes(id)`, so attaching a
@@ -4917,18 +4918,7 @@ pub(crate) async fn delete_terminating_node_and_record_tombstone(
     else {
         return Ok(false);
     };
-    let result = sqlx::query(sql!(
-        "DELETE FROM nodes
-         WHERE id = $1
-           AND drain_phase = 'terminating'
-           AND managed_by = $2
-           AND drain_engine IS NULL"
-    ))
-    .bind(node_id)
-    .bind(SubstrateKind::Kubernetes)
-    .execute(&mut *tx)
-    .await?;
-    if result.rows_affected() == 0 {
+    if !tombstone::delete_terminating_k8s_node(&mut *tx, node_id).await? {
         return Ok(false);
     }
     tombstone::record_admin_terminate_tombstone(

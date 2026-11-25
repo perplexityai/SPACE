@@ -101,6 +101,9 @@
 //! **A resident with no execution row at all** recorded no pod name and no
 //! generation, so neither the pod read nor the node's answer is possible. It
 //! parks under reason `no_execution_row`.
+//!
+//! [`failed_repair_revert_eligibility`]: pplx_space_sandbox_portability::failed_repair_revert_eligibility
+//! [`newest_full_snapshot_unambiguous`]: pplx_space_sandbox_portability::newest_full_snapshot_unambiguous
 
 use std::future::Future;
 use std::pin::Pin;
@@ -115,22 +118,18 @@ use pplx_space_api::controllers::substrate::kubernetes::{
 };
 use pplx_space_cluster_pool::{PoolError, WarmPoolStore};
 use pplx_space_durations::PositiveDuration;
-use pplx_space_node_model::{NodeDrainMode, SubstrateKind};
+use pplx_space_node_model::{NodeDrainMode, NodeDrainPhase, SubstrateKind};
 use pplx_space_node_registration_store::locks;
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId, SandboxLifecycle};
-use pplx_space_sandbox_portability::{
-    failed_repair_revert_eligibility, newest_full_snapshot_unambiguous,
-    pod_less_drain_revert_loses_no_newer_bytes,
-};
 use pplx_space_sandbox_store::drain;
-use pplx_space_sandbox_store::k8s_executions::pod_less_giveup;
+use pplx_space_sandbox_store::k8s_executions::pod_less_giveup as giveup_executions;
+use pplx_space_sandbox_store::pod_less_giveup;
 use pplx_space_sandbox_store::row_locks;
 use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
 use crate::orphaned_sandboxes::{PodPresenceStatus, classify_pod_presence};
 
-use super::super::PHASE_DRAINING;
 use super::is_lock_timeout;
 
 /// What [`super::NodeDrainSink::recover_pod_less_sandbox`] did.
@@ -356,61 +355,36 @@ pub(crate) async fn pod_refs(
     Ok(pplx_space_sandbox_store::k8s_executions::newest_first(pool, sandbox_id).await?)
 }
 
-/// The row-state guards, read once before the pod reads and again under the
-/// row locks.
-#[derive(Debug, Clone, Copy, sqlx::FromRow)]
-struct Guards {
-    /// Still the resident the suspend failed on: the lifecycle the claim
-    /// reverted to, on this node, no evacuation marker, and the node still
-    /// force-draining (gentle mode doesn't touch residents).
-    row_matches: bool,
-    /// A node publishes the sandbox as anything but a `failed`, pid-less
-    /// record.
-    vm_observed: bool,
-    /// An active execution carries a pod UID, or any execution a pod IP.
-    pod_bound: bool,
-    /// An execution advanced `updated_at` within the staleness window.
-    recent_progress: bool,
-    /// A durable suspend snapshot passes [`failed_repair_revert_eligibility`].
-    restorable: bool,
-    /// Reverting now loses nothing newer and restores the snapshot the
-    /// eligibility proved current:
-    /// [`pod_less_drain_revert_loses_no_newer_bytes`] and
-    /// [`newest_full_snapshot_unambiguous`] hold.
-    revert_safe: bool,
-    max_generation: Option<ExecutionGeneration>,
-}
-
-impl Guards {
-    /// The newest generation, which the transaction must still see and the
-    /// node is asked about, when every guard passes; else the
-    /// hold.
-    fn generation(self) -> Result<ExecutionGeneration, PodLessHold> {
-        let Some(generation) = self.max_generation else {
-            return Err(if self.row_matches {
-                PodLessHold::NoExecutionRow
-            } else {
-                PodLessHold::RowDrifted
-            });
-        };
-        if !self.row_matches {
-            Err(PodLessHold::RowDrifted)
-        } else if self.vm_observed {
-            Err(PodLessHold::VmObserved)
-        } else if self.pod_bound {
-            Err(PodLessHold::PodBound)
-        } else if self.recent_progress {
-            Err(PodLessHold::RecentProgress)
-        } else if !self.restorable {
-            // Read here so a row the revert can't take never reaches the pod
-            // reads or the node; the revert re-checks both in its own
-            // statement.
-            Err(PodLessHold::NoRestoreSource)
-        } else if !self.revert_safe {
-            Err(PodLessHold::HeldForDataSafety)
+/// The newest generation, which the transaction must still see and the node
+/// is asked about, when every row-state guard passes; else the hold. The
+/// guards are read once before the pod reads and again under the row locks.
+fn guards_generation(
+    guards: pod_less_giveup::PodLessGuards,
+) -> Result<ExecutionGeneration, PodLessHold> {
+    let Some(generation) = guards.max_generation else {
+        return Err(if guards.row_matches {
+            PodLessHold::NoExecutionRow
         } else {
-            Ok(generation)
-        }
+            PodLessHold::RowDrifted
+        });
+    };
+    if !guards.row_matches {
+        Err(PodLessHold::RowDrifted)
+    } else if guards.vm_observed {
+        Err(PodLessHold::VmObserved)
+    } else if guards.pod_bound {
+        Err(PodLessHold::PodBound)
+    } else if guards.recent_progress {
+        Err(PodLessHold::RecentProgress)
+    } else if !guards.restorable {
+        // Read here so a row the revert can't take never reaches the pod
+        // reads or the node; the revert re-checks both in its own
+        // statement.
+        Err(PodLessHold::NoRestoreSource)
+    } else if !guards.revert_safe {
+        Err(PodLessHold::HeldForDataSafety)
+    } else {
+        Ok(generation)
     }
 }
 
@@ -429,72 +403,17 @@ impl PodLessCandidate {
     }
 }
 
-async fn read_guards<'e, E>(
-    executor: E,
-    candidate: PodLessCandidate,
-) -> Result<Option<Guards>, sqlx::Error>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    let query = format!(
-        "SELECT COALESCE((
-                    s.lifecycle = $3
-                    AND s.active_node_id = $2
-                    AND s.evacuation_restore_target IS NULL
-                    AND s.managed_by = $5
-                    AND EXISTS (
-                        SELECT 1
-                          FROM nodes n
-                         WHERE n.id = $2
-                           AND n.drain_phase = $6
-                           AND n.drain_mode = $7
-                           AND n.drain_engine IS NULL
-                    )
-                ), FALSE) AS row_matches,
-                EXISTS (
-                    SELECT 1
-                      FROM sandbox_observed_states o
-                     WHERE o.sandbox_id = s.id
-                       AND (o.status IS DISTINCT FROM 'failed' OR o.pid IS NOT NULL)
-                ) AS vm_observed,
-                EXISTS (
-                    SELECT 1
-                      FROM sandbox_k8s_executions e
-                     WHERE e.sandbox_id = s.id
-                       AND (
-                           e.pod_ip IS NOT NULL
-                           OR (e.active AND NULLIF(BTRIM(e.pod_uid), '') IS NOT NULL)
-                       )
-                ) AS pod_bound,
-                EXISTS (
-                    SELECT 1
-                      FROM sandbox_k8s_executions e
-                     WHERE e.sandbox_id = s.id
-                       AND e.updated_at > NOW() - make_interval(secs => $4::BIGINT)
-                ) AS recent_progress,
-                COALESCE({eligible}, FALSE) AS restorable,
-                COALESCE({loses_no_newer_bytes} AND {unambiguous}, FALSE) AS revert_safe,
-                (
-                    SELECT MAX(e.generation)
-                      FROM sandbox_k8s_executions e
-                     WHERE e.sandbox_id = s.id
-                ) AS max_generation
-           FROM sandboxes s
-          WHERE s.id = $1",
-        eligible = failed_repair_revert_eligibility("s").eligible,
-        loses_no_newer_bytes = pod_less_drain_revert_loses_no_newer_bytes("s"),
-        unambiguous = newest_full_snapshot_unambiguous("s"),
-    );
-    sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(candidate.sandbox_id)
-        .bind(candidate.source_node_id)
-        .bind(candidate.pre_lifecycle.as_str())
-        .bind(candidate.stale_secs())
-        .bind(SubstrateKind::Kubernetes)
-        .bind(PHASE_DRAINING)
-        .bind(NodeDrainMode::Forced)
-        .fetch_optional(executor)
-        .await
+/// What every guard read of `candidate` binds.
+fn guards_query(candidate: PodLessCandidate) -> pod_less_giveup::PodLessGuardsQuery {
+    pod_less_giveup::PodLessGuardsQuery {
+        sandbox_id: candidate.sandbox_id,
+        source_node_id: candidate.source_node_id,
+        pre_lifecycle: candidate.pre_lifecycle,
+        stale_secs: candidate.stale_secs(),
+        managed_by: SubstrateKind::Kubernetes,
+        drain_phase: NodeDrainPhase::Draining,
+        drain_mode: NodeDrainMode::Forced,
+    }
 }
 
 /// Every guard, evaluated once. Run lock-free before any pod read, and again
@@ -506,9 +425,11 @@ pub(crate) async fn precheck<'e, E>(
 where
     E: sqlx::PgExecutor<'e>,
 {
-    Ok(read_guards(executor, candidate)
-        .await?
-        .map_or(Err(PodLessHold::RowDrifted), Guards::generation))
+    Ok(
+        pod_less_giveup::read_guards(executor, guards_query(candidate))
+            .await?
+            .map_or(Err(PodLessHold::RowDrifted), guards_generation),
+    )
 }
 
 /// The source node's teardown record for one generation, behind a seam so the
@@ -604,7 +525,7 @@ async fn recover_pod_less_sandbox_locked(
     // it. The drained-node terminator's flip fences the same way.
     locks::share_lock_node(&mut tx, candidate.source_node_id).await?;
     row_locks::lock_exists(&mut tx, candidate.sandbox_id).await?;
-    pod_less_giveup::lock_executions_in_generation_order(&mut tx, candidate.sandbox_id).await?;
+    giveup_executions::lock_executions_in_generation_order(&mut tx, candidate.sandbox_id).await?;
 
     let eligible = precheck(&mut *tx, candidate).await?.and_then(|generation| {
         if generation == expected {
@@ -650,7 +571,7 @@ async fn retire_executions(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     sandbox_id: SandboxId,
 ) -> Result<(), sqlx::Error> {
-    pod_less_giveup::retire_active_executions(&mut **tx, sandbox_id).await?;
+    giveup_executions::retire_active_executions(&mut **tx, sandbox_id).await?;
     Ok(())
 }
 

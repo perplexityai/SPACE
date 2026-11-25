@@ -438,15 +438,8 @@ impl K8sStore {
         sandbox_id: SandboxId,
         node_said: &str,
     ) {
-        let row: Result<Option<(Option<NodeId>, bool)>, sqlx::Error> = sqlx::query_as(sql!(
-            "SELECT n.id, COALESCE(n.drain_engine = 'v2', FALSE)
-               FROM sandboxes s
-               LEFT JOIN nodes n ON n.id = COALESCE(s.active_node_id, s.target_node_id)
-              WHERE s.id = $1"
-        ))
-        .bind(sandbox_id)
-        .fetch_optional(&self.pool)
-        .await;
+        let row =
+            pplx_space_sandbox_store::row_reads::home_node_v2_drain(&self.pool, sandbox_id).await;
         match row {
             Ok(Some((Some(node_id), false))) => {
                 tracing::warn!(

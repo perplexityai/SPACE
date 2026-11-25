@@ -80,7 +80,8 @@ async fn ranked_fleet_occupancy_counts_only_unmarked_restores_as_drain_blockers(
 }
 
 /// The `:terminate` guard's `active` count applies the census discount, so it
-/// refuses exactly what node-drain's gate and `mark_terminating_query` refuse.
+/// refuses exactly what node-drain's gate and `drained_node::mark_terminating`
+/// refuse.
 ///
 /// This is the wedge the guard would otherwise be: `active` used to restate the
 /// exclusion list with no census term. A worker whose own census disproves its

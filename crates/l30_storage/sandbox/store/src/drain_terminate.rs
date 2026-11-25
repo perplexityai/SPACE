@@ -2,10 +2,12 @@
 //! and executions that still name its node.
 //!
 //! A node is terminated, and its row deleted, only once nothing names it
-//! ([`node_references`], [`node_unreferenced`]): no non-terminal row's
-//! `active_node_id` or `target_node_id`, and no active execution on its
-//! Kubernetes name. A refused check names what holds the node. A released
-//! row's execution on the node is retired ([`retire_source_execution`]).
+//! ([`node_references`],
+//! [`node_unreferenced`](pplx_space_sandbox_residency::node_unreferenced)): no
+//! non-terminal row's `active_node_id` or `target_node_id`, and no active
+//! execution on its Kubernetes name. A refused check names what holds the
+//! node. A released row's execution on the node is retired
+//! ([`retire_source_execution`]).
 //!
 //! Before that check, the terminate's fence transaction cleans up
 //! the references of rows that no longer need the sealed, drained node, the
@@ -76,36 +78,11 @@ impl std::fmt::Display for NodeReferences {
     }
 }
 
-/// Boolean SQL fragment: TRUE iff nothing names the node `node_param` (a
-/// node id) with Kubernetes name `name_param`: no row outside `failed` and
-/// `deleted` whose `active_node_id` or `target_node_id` is the node, and no
-/// active execution on the name. A NULL name matches no execution. Both are
-/// placeholders or expressions of the caller's statement. [`node_references`]
-/// reads the same three guards.
-pub fn node_unreferenced(node_param: &str, name_param: &str) -> String {
-    format!(
-        "NOT EXISTS (
-             SELECT 1 FROM sandboxes
-              WHERE active_node_id = {node_param}
-                AND lifecycle NOT IN ('failed', 'deleted')
-         )
-         AND NOT EXISTS (
-             SELECT 1 FROM sandboxes
-              WHERE target_node_id = {node_param}
-                AND lifecycle NOT IN ('failed', 'deleted')
-         )
-         AND NOT EXISTS (
-             SELECT 1 FROM sandbox_k8s_executions
-              WHERE active
-                AND k8s_node_name = {name_param}
-         )"
-    )
-}
-
 /// What still names `node_id` (Kubernetes name `k8s_node_name`), by the
-/// guards of [`node_unreferenced`]: up to `limit` sandbox ids of each, by id.
-/// A read: it takes no lock. Empty is what [`node_unreferenced`] reads as
-/// TRUE at the same snapshot.
+/// guards of
+/// [`node_unreferenced`](pplx_space_sandbox_residency::node_unreferenced):
+/// up to `limit` sandbox ids of each, by id. A read: it takes no lock. Empty
+/// is what that fragment reads as TRUE at the same snapshot.
 pub async fn node_references(
     executor: impl sqlx::PgExecutor<'_>,
     node_id: NodeId,
@@ -215,7 +192,9 @@ fn activation_in_flight() -> &'static str {
 /// placement are cleared and its execution on the node retired. Writes an
 /// **operation step** (the release), in the caller's transaction. Returns
 /// the released ids, by id. A row it skips keeps naming the node, so the
-/// terminate's reference check ([`node_unreferenced`]) refuses the node.
+/// terminate's reference check
+/// ([`node_unreferenced`](pplx_space_sandbox_residency::node_unreferenced))
+/// refuses the node.
 ///
 /// Only for a node sealed under its drain's generation that reported nothing
 /// pending or blocked: the seal refuses every activation on it, so nothing
