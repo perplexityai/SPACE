@@ -29,8 +29,12 @@
 //   - a Kubernetes API error is an EC2 error (Unavailable, HTTP 503).
 //
 // TerminateInstanceInAutoScalingGroup only marks the instance terminated: the harness stops the worker's container itself,
-// once it sees the termination the controller recorded. The marks live in
-// memory, so a restart of the fixture forgets them.
+// once it sees the termination the controller recorded. It takes only an
+// instance a Node names or one already marked; any other ID is refused with
+// ValidationError (HTTP 400), as Auto Scaling refuses an instance it doesn't
+// hold, and a Kubernetes API error is Unavailable (HTTP 503). The test
+// control's terminate marks any instance ID. The marks live in memory, so a
+// restart of the fixture forgets them.
 //
 // The test control listens on loopback only, in plain HTTP, so only a
 // process in the pod reaches it: `space-kind-fake-ec2 terminate <id>...`,
@@ -510,7 +514,15 @@ func (f *fakeEC2) serveAutoScaling(w http.ResponseWriter, form url.Values, reqID
 		fail(http.StatusBadRequest, "ValidationError", "ShouldDecrementDesiredCapacity must be true or false, not "+strconv.Quote(decrement))
 		return
 	}
-	before := f.terminate(id)
+	before, err := f.terminate(id)
+	switch {
+	case errors.Is(err, errNotInGroup):
+		fail(http.StatusBadRequest, "ValidationError", "Instance Id not found - No managed instance found for instance ID: "+id)
+		return
+	case err != nil:
+		fail(http.StatusServiceUnavailable, "Unavailable", "the Kubernetes API did not answer: "+err.Error())
+		return
+	}
 	resp := terminateInAutoScalingGroupResponse{Xmlns: asgNS, RequestID: reqID}
 	resp.Activity.ActivityID = reqID
 	resp.Activity.Description = "Terminating EC2 instance: " + id
@@ -625,14 +637,49 @@ func answerOf(matched []instance) string {
 	return strings.Join(answer, ",")
 }
 
-// terminate marks id terminated and returns its state before.
-func (f *fakeEC2) terminate(id string) instanceState {
+// errNotInGroup is Auto Scaling's refusal of an instance it doesn't hold.
+var errNotInGroup = errors.New("no managed instance has this ID")
+
+// terminate is Auto Scaling's terminate: it marks id as mark does when a
+// Node names it or it is already marked, and returns its state before. Any
+// other ID is refused with errNotInGroup, and a Node list that fails is
+// returned; either marks nothing.
+func (f *fakeEC2) terminate(id string) (instanceState, error) {
+	nodes, err := f.list()
+	if err != nil {
+		return instanceState{}, err
+	}
+	if _, marked := f.state.marked(id); !marked && !f.anyIs(nodes, id) {
+		return instanceState{}, errNotInGroup
+	}
+	return f.markFrom(id, nodes), nil
+}
+
+// anyIs is whether one of nodes is the instance id.
+func (f *fakeEC2) anyIs(nodes []node, id string) bool {
+	for i := range nodes {
+		if f.instanceOf(&nodes[i]).InstanceID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// mark marks id terminated and returns its state before, an ID no Node
+// names reading stopped, as does every ID when the Nodes can't be read.
+func (f *fakeEC2) mark(id string) instanceState {
+	nodes, _ := f.list()
+	return f.markFrom(id, nodes)
+}
+
+// markFrom marks id terminated and returns its state before: that of the
+// instance behind the one of nodes that names it, terminated when already
+// marked, and stopped otherwise.
+func (f *fakeEC2) markFrom(id string, nodes []node) instanceState {
 	before := "stopped"
-	if nodes, err := f.list(); err == nil {
-		for i := range nodes {
-			if inst := f.instanceOf(&nodes[i]); inst.InstanceID == id {
-				before = inst.InstanceState.Name
-			}
+	for i := range nodes {
+		if inst := f.instanceOf(&nodes[i]); inst.InstanceID == id {
+			before = inst.InstanceState.Name
 		}
 	}
 	switch f.state.terminate(id, before) {
@@ -646,7 +693,8 @@ func (f *fakeEC2) terminate(id string) instanceState {
 }
 
 // controlTerminate is the test control's terminate: the same mark, for a
-// harness that reaches the fixture through `kubectl exec`.
+// harness that reaches the fixture through `kubectl exec`, of any instance
+// ID, one no Node names included.
 func (f *fakeEC2) controlTerminate(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
 	id := r.FormValue("instance-id")
@@ -654,7 +702,7 @@ func (f *fakeEC2) controlTerminate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not an instance ID: "+id, http.StatusBadRequest)
 		return
 	}
-	before := f.terminate(id)
+	before := f.mark(id)
 	f.log.Info("terminated by test control", "instance_id", id, "previous_state", before.Name)
 	_, _ = fmt.Fprintf(w, "%s terminated\n", id)
 }
