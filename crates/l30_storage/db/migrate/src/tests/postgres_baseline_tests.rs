@@ -297,3 +297,235 @@ async fn campaign_generation_down_refuses_while_campaigns_exist() -> TestResult 
     assert_eq!(schema().await?, (true, true, true));
     Ok(())
 }
+
+/// The flag is the only record that the control plane, not a node, wrote a
+/// disk, as a memory drop does. So the down refuses while an unplaced sandbox
+/// is still pinned to one, leaving the column and the migration's history row
+/// in place, and runs once no pinned disk carries the flag. The fixture is
+/// the row a memory drop leaves: `suspended`, pinned to that disk.
+#[tokio::test]
+async fn written_off_node_down_refuses_while_a_sandbox_is_pinned_to_one() -> TestResult {
+    const VERSION: i64 = 20261124180000;
+    // One connection, as in `campaign_generation_down_refuses_while_campaigns_exist`:
+    // a refused undo keeps the migrator's advisory lock on its session.
+    let Some(fixture) = try_raw_pg_test_db_with_max_connections(1).await? else {
+        return Ok(());
+    };
+    let migrator = Migrator::with_migrations(
+        POSTGRES_MIGRATOR
+            .iter()
+            .filter(|migration| migration.version <= VERSION)
+            .cloned()
+            .collect(),
+    );
+    let previous = migrator
+        .iter()
+        .map(|migration| migration.version)
+        .filter(|version| *version < VERSION)
+        .max()
+        .expect("a migration precedes snapshot_written_off_node");
+    let schema = async || {
+        sqlx::query_as::<_, (bool, bool)>(sql!(
+            "SELECT
+                 EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_name = 'snapshots'
+                            AND column_name = 'written_off_node'),
+                 EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = $1)"
+        ))
+        .bind(VERSION)
+        .fetch_one(&fixture.pool)
+        .await
+    };
+
+    migrator.run(&fixture.pool).await?;
+    let artifact_id: String = sqlx::query_scalar(sql!("SELECT gen_random_uuid()::text"))
+        .fetch_one(&fixture.pool)
+        .await?;
+    let sandbox_id: String = sqlx::query_scalar(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, managed_by, lifecycle, placement,
+             network_policy_generation, current_local_artifact_id,
+             current_local_artifact_kind, current_local_artifact_origin
+         )
+         SELECT space_uuid_v7(), id, org_id, 'k8s', 'suspended', 'unplaced', 1,
+                $1::uuid, 'disk', 'stop'
+           FROM users
+          ORDER BY id
+          LIMIT 1
+         RETURNING id::text"
+    ))
+    .bind(&artifact_id)
+    .fetch_one(&fixture.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (
+             id, sandbox_id, org_id, type, state, local_artifact_id,
+             artifact_kind, artifact_origin, written_off_node
+         )
+         SELECT gen_random_uuid(), id, org_id, 'disk', 'ready',
+                current_local_artifact_id, 'disk', 'stop', true
+           FROM sandboxes
+          WHERE id = $1::uuid"
+    ))
+    .bind(&sandbox_id)
+    .execute(&fixture.pool)
+    .await?;
+
+    let refusal = migrator
+        .undo(&fixture.pool, previous)
+        .await
+        .expect_err("the down must refuse while a sandbox is pinned to an off-node disk");
+    assert!(
+        matches!(
+            &refusal,
+            MigrateError::ExecuteMigration(_, version) if *version == VERSION
+        ),
+        "unexpected error: {refusal:?}"
+    );
+    assert!(
+        refusal
+            .to_string()
+            .contains("pinned to a disk the off-node stop wrote"),
+        "unexpected error: {refusal}"
+    );
+    assert_eq!(schema().await?, (true, true));
+
+    // The same pin on a disk a node wrote guards nothing, so the down runs.
+    sqlx::query(sql!(
+        "UPDATE snapshots SET written_off_node = false WHERE sandbox_id = $1::uuid"
+    ))
+    .bind(&sandbox_id)
+    .execute(&fixture.pool)
+    .await?;
+    migrator.undo(&fixture.pool, previous).await?;
+    assert_eq!(schema().await?, (false, false));
+    migrator.run(&fixture.pool).await?;
+    assert_eq!(schema().await?, (true, true));
+    Ok(())
+}
+
+/// `sandboxes_keep_suspended_restore_lease` keeps a restore lease across a
+/// write that keeps a row `suspended`, which is how a memory drop seals the
+/// row for its copy. A write that moves the row anywhere else but
+/// `restoring` still clears it, and the restore-only preserve flag is reset
+/// either way. The down restores the old function, under which any write to a
+/// non-`restoring` row clears the lease.
+#[tokio::test]
+async fn keep_suspended_restore_lease_keeps_a_seal_only_while_suspended() -> TestResult {
+    const VERSION: i64 = 20261124184807;
+    let Some(fixture) = try_raw_pg_test_db_with_max_connections(1).await? else {
+        return Ok(());
+    };
+    let migrator = Migrator::with_migrations(
+        POSTGRES_MIGRATOR
+            .iter()
+            .filter(|migration| migration.version <= VERSION)
+            .cloned()
+            .collect(),
+    );
+    let previous = migrator
+        .iter()
+        .map(|migration| migration.version)
+        .filter(|version| *version < VERSION)
+        .max()
+        .expect("a migration precedes sandboxes_keep_suspended_restore_lease");
+    migrator.run(&fixture.pool).await?;
+    let sandbox_id: String = sqlx::query_scalar(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, managed_by, lifecycle, placement,
+             network_policy_generation
+         )
+         SELECT space_uuid_v7(), id, org_id, 'k8s', 'suspended', 'unplaced', 1
+           FROM users
+          ORDER BY id
+          LIMIT 1
+         RETURNING id::text"
+    ))
+    .fetch_one(&fixture.pool)
+    .await?;
+    let seal = async || {
+        sqlx::query(sql!(
+            "UPDATE sandboxes
+                SET lifecycle = 'suspended',
+                    restore_lease_token = gen_random_uuid(),
+                    restore_lease_expires_at = NOW() + INTERVAL '1 minute',
+                    preserve_local_artifact_on_restore_failure = true
+              WHERE id = $1::uuid"
+        ))
+        .bind(&sandbox_id)
+        .execute(&fixture.pool)
+        .await
+    };
+    let write = async |lifecycle: &str| {
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = $2 WHERE id = $1::uuid"
+        ))
+        .bind(&sandbox_id)
+        .bind(lifecycle)
+        .execute(&fixture.pool)
+        .await
+    };
+    // (lease token set, lease expiry set, preserve flag)
+    let lease = async || {
+        sqlx::query_as::<_, (bool, bool, bool)>(sql!(
+            "SELECT restore_lease_token IS NOT NULL,
+                    restore_lease_expires_at IS NOT NULL,
+                    preserve_local_artifact_on_restore_failure
+               FROM sandboxes WHERE id = $1::uuid"
+        ))
+        .bind(&sandbox_id)
+        .fetch_one(&fixture.pool)
+        .await
+    };
+
+    seal().await?;
+    assert_eq!(lease().await?, (true, true, false), "the seal's own write");
+    write("suspended").await?;
+    assert_eq!(
+        lease().await?,
+        (true, true, false),
+        "suspended to suspended"
+    );
+    write("started").await?;
+    assert_eq!(
+        lease().await?,
+        (false, false, false),
+        "suspended to started"
+    );
+
+    // A lease taken while `restoring` still clears once the row leaves it,
+    // including back to `suspended`.
+    write("restoring").await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET restore_lease_token = gen_random_uuid(),
+                restore_lease_expires_at = NOW() + INTERVAL '1 minute'
+          WHERE id = $1::uuid"
+    ))
+    .bind(&sandbox_id)
+    .execute(&fixture.pool)
+    .await?;
+    assert_eq!(
+        lease().await?,
+        (true, true, false),
+        "restoring keeps its lease"
+    );
+    write("suspended").await?;
+    assert_eq!(
+        lease().await?,
+        (false, false, false),
+        "restoring to suspended"
+    );
+
+    migrator.undo(&fixture.pool, previous).await?;
+    seal().await?;
+    assert_eq!(
+        lease().await?,
+        (false, false, false),
+        "the old function clears the lease on every non-restoring write"
+    );
+    migrator.run(&fixture.pool).await?;
+    seal().await?;
+    assert_eq!(lease().await?, (true, true, false));
+    Ok(())
+}

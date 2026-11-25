@@ -594,6 +594,7 @@ wire_enum_open_schema!(OperationKind, "operation kind", {
     EnableSandboxSnapshots => "enable_sandbox_snapshots",
     DisableSandboxSnapshots => "disable_sandbox_snapshots",
     RollbackSandbox => "rollback_sandbox",
+    DropSandboxMemory => "drop_sandbox_memory",
     DeleteTemplate => "delete_template",
     CreateSession => "create_session",
 });

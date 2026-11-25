@@ -1283,6 +1283,7 @@ mod reconnect_metrics_tests;
 mod ingress;
 pub(crate) mod lifecycle;
 pub(crate) mod list_page;
+pub mod memory_drop;
 mod org;
 mod ports;
 mod queries;

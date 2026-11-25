@@ -781,6 +781,17 @@ pub mod errors {
             .with_retry_after(crate::controllers::substrate::LOCK_CONTENTION_RETRY_AFTER)
         }
 
+        /// A memory drop holds the sandbox sealed. Retryable: the drop
+        /// commits or its seal lapses within a minute of the drop dying.
+        pub fn memory_drop_in_progress() -> Self {
+            Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "A memory drop of the sandbox is in progress; retry the request",
+            )
+            .with_classification(ResponseOrigin::Api, ResponseKind::RouteNotReady)
+            .with_retry_after(crate::controllers::substrate::GATEWAY_RETRY_AFTER)
+        }
+
         /// Status and response classification, for tests that assert how a
         /// translator attributes an error. Fields stay private.
         #[cfg(test)]

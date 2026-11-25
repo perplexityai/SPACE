@@ -47,6 +47,7 @@ use crate::routes::public::hidden_operations;
 use crate::routes::public::sandboxes::parse_rollback_body;
 use pplx_space_public_api::routes as native_routes;
 
+mod drop_memory;
 mod guest_access;
 pub use guest_access::{create_command, create_terminal_session, list_snapshots};
 
@@ -201,6 +202,7 @@ pub async fn create_sandbox(
                 operation_id: Some(response.operation_id),
                 success: true,
                 error: None,
+                reason: None,
             });
             (
                 StatusCode::ACCEPTED,
@@ -441,6 +443,9 @@ pub async fn dispatch_sandbox_action(
     if let Err(err) = require_managing_org_admin(&state.pool, &actor).await {
         return err.into_response();
     }
+    if let Some(sandbox_spec) = spec.strip_suffix(drop_memory::DROP_MEMORY_SUFFIX) {
+        return drop_memory::drop_memory(&state, &actor, &headers, sandbox_spec, &body).await;
+    }
     let (target, action) = match parse_spec(&spec) {
         Ok(value) => value,
         Err(err) => return err.into_response(),
@@ -515,6 +520,7 @@ pub async fn dispatch_sandbox_action(
                 operation_id: Some(response.operation_id),
                 success: true,
                 error: None,
+                reason: None,
             });
             (StatusCode::ACCEPTED, Json(response)).into_response()
         }
@@ -527,6 +533,7 @@ pub async fn dispatch_sandbox_action(
                 operation_id: err.operation_id,
                 success: false,
                 error: Some(err.message.as_str()),
+                reason: None,
             });
             err.into_response()
         }
@@ -617,6 +624,7 @@ pub async fn update_sandbox(
                 operation_id: Some(response.operation_id),
                 success: true,
                 error: None,
+                reason: None,
             });
             (StatusCode::ACCEPTED, Json(response)).into_response()
         }
@@ -629,6 +637,7 @@ pub async fn update_sandbox(
                 operation_id: err.operation_id,
                 success: false,
                 error: Some(err.message.as_str()),
+                reason: None,
             });
             err.into_response()
         }
@@ -737,6 +746,7 @@ fn audit_update_failure(
         operation_id,
         success: false,
         error: Some(error),
+        reason: None,
     });
 }
 
@@ -999,6 +1009,7 @@ fn audit_failure(
         operation_id,
         success: false,
         error: Some(error),
+        reason: None,
     });
 }
 

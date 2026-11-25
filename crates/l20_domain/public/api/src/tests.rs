@@ -179,6 +179,10 @@ fn public_wire_enums_use_canonical_strings() {
         OperationKind::ForkSandbox
     );
     assert_eq!(
+        "drop_sandbox_memory".parse::<OperationKind>().unwrap(),
+        OperationKind::DropSandboxMemory
+    );
+    assert_eq!(
         SandboxLifecycleAction::Checkpoint.operation_kind(),
         OperationKind::CheckpointSandbox
     );

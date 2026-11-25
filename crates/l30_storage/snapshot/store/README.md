@@ -1,8 +1,9 @@
 # Snapshot catalog store
 
 `pplx-space-snapshot-store` is the owning PostgreSQL storage layer for the
-durable snapshot catalog. It is not an object-storage backend and does not
-read or delete snapshot bytes.
+durable snapshot catalog. It is not an object-storage backend. Its catalog
+operations don't read or delete snapshot bytes; the `objects` module below is
+the one exception, and it never deletes.
 
 ## Owned aggregate
 
@@ -84,7 +85,7 @@ location, and leaves any row already registered under that id as it is. Delete
 removes the storage locations before the
 snapshot inside the caller's existing authorization-and-lock transaction. The
 store does not decide whether deletion or retry is safe and does not touch
-storage-backend bytes.
+storage-backend bytes through these catalog operations.
 
 The `lost` module holds the guarded write the lost-sandbox give-ups run in
 their flip's transaction: failing the gone node's quiet `creating` full
@@ -106,6 +107,17 @@ reads and copies), `environment` (the environment a snapshot was produced
 under), `listing` (every row of a sandbox, unparsed, for debug views),
 `public` (the snapshots the public API advertises), `storage_location` (one
 live location's connection string) and `upload` (uploads still in flight).
+
+The `orphan` module hands prefixes to the snapshot-storage sweeper without
+deleting bytes. `orphan_unowned_location` takes any executor and registers a
+prefix no snapshot row owns as an orphan. Given a pool, as the memory drop's
+lost commit does, the registration commits on its own, and no later rollback
+undoes it.
+
+The `objects` module is the one place this crate touches storage-backend
+bytes: it reads, copies and writes single files under a snapshot prefix in
+S3 for callers that project one artifact into another. It decides nothing
+about which rows those files belong to.
 
 Add further typed CRUD incrementally with each migrated caller. Add claim/prune
 with its live retention workflow, after the workflow has a complete protection

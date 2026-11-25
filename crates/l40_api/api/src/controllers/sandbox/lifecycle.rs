@@ -150,6 +150,12 @@ fn in_flight_suspend_upload_conflict(
     )
 }
 
+fn memory_drop_in_progress() -> ControllerError {
+    ControllerError::service_unavailable(
+        "a memory drop of the sandbox is in progress; retry the DELETE after it finishes",
+    )
+}
+
 fn fork_in_progress_conflict() -> ControllerError {
     ControllerError::conflict(
         "sandbox has a fork operation in progress; retry the DELETE after the fork completes",
@@ -198,6 +204,15 @@ async fn begin_delete_against_active_fork(
                 })
         })
         .transpose()?;
+    // Read under the row lock just taken, so a seal can't land in between. A
+    // drop's seal lapses within a minute if its drop dies, so the caller can
+    // retry rather than fail the delete.
+    if pplx_space_sandbox_store::memory_drop::sealed(&mut *guard, sandbox_id)
+        .await
+        .map_err(|error| db_contention_error("failed to read the memory drop seal", &error))?
+    {
+        return Err(memory_drop_in_progress());
+    }
     mark_deleting(&mut guard, sandbox_id)
         .await
         .map_err(|error| db_contention_error("failed to persist sandbox delete intent", &error))?;

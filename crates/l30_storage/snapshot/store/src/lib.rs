@@ -30,6 +30,8 @@ pub mod disk_artifact;
 pub mod environment;
 pub mod listing;
 pub mod lost;
+pub mod objects;
+pub mod orphan;
 mod placement;
 pub mod public;
 pub mod storage_location;
@@ -137,6 +139,9 @@ pub enum InsertSnapshotError {
 
     #[error("snapshot {snapshot_id} has no storage location after insert")]
     MissingStorageLocation { snapshot_id: SnapshotId },
+
+    #[error("snapshot {snapshot_id} has a timestamp Postgres can't store")]
+    UnrepresentableTimestamp { snapshot_id: SnapshotId },
 }
 
 /// Values required to insert one snapshot and its durable storage location.
@@ -160,6 +165,8 @@ pub struct NewSnapshot {
     artifact: Option<SnapshotArtifact>,
     execution_metadata: Option<SnapshotExecutionMetadata>,
     generation: Option<ExecutionGeneration>,
+    written_off_node: bool,
+    timestamp: Option<Timestamp>,
     storage_uri: ExactStorageUri,
 }
 
@@ -188,6 +195,8 @@ impl NewSnapshot {
             artifact: None,
             execution_metadata: None,
             generation: None,
+            written_off_node: false,
+            timestamp: None,
             storage_uri,
         }
     }
@@ -243,6 +252,23 @@ impl NewSnapshot {
         self.generation = generation;
         self
     }
+
+    /// Mark a disk artifact the control plane wrote after the sandbox's node
+    /// was gone (`snapshots.written_off_node`). Only the memory drop
+    /// (`pplx_space_sandbox_store::memory_drop`) sets it: no node holds a
+    /// local copy of such a disk, so a restore must fetch it from its URI.
+    pub fn written_off_node(mut self) -> Self {
+        self.written_off_node = true;
+        self
+    }
+
+    /// Stamp the row's `timestamp` with `timestamp` instead of the insert
+    /// time. Only the memory drop sets it: its disk takes the timestamp of
+    /// the full snapshot it was copied from, so the drop moves no clock.
+    pub fn with_timestamp(mut self, timestamp: Timestamp) -> Self {
+        self.timestamp = Some(timestamp);
+        self
+    }
 }
 
 /// The common read model for one durable `snapshots` row.
@@ -267,6 +293,7 @@ pub struct SnapshotRecord {
     artifact: Option<SnapshotArtifact>,
     execution_metadata: Option<SnapshotExecutionMetadata>,
     generation: Option<ExecutionGeneration>,
+    written_off_node: bool,
     storage_location: Option<SnapshotStorageLocationRecord>,
 }
 
@@ -293,6 +320,12 @@ impl SnapshotRecord {
 
     pub const fn source_node_id(&self) -> Option<NodeId> {
         self.source_node_id
+    }
+
+    /// Whether the memory drop wrote this snapshot after its node was gone
+    /// (`snapshots.written_off_node`).
+    pub const fn is_written_off_node(&self) -> bool {
+        self.written_off_node
     }
 
     pub fn label(&self) -> Option<&str> {
@@ -490,6 +523,7 @@ struct SnapshotRow {
     artifact_snapshot_name: Option<String>,
     execution_metadata: Option<Json<serde_json::Value>>,
     generation: Option<i64>,
+    written_off_node: bool,
     storage_location_id: Option<Uuid>,
     storage_location_snapshot_id: Option<SnapshotId>,
     storage_connection_string: Option<String>,
@@ -991,7 +1025,7 @@ pub async fn get(
                 sn.content_hash, sn.org_id, sn.failure_reason,
                 sn.last_attempt_at, sn.local_artifact_id, sn.artifact_kind,
                 sn.artifact_origin, sn.artifact_snapshot_name,
-                sn.execution_metadata, sn.generation,
+                sn.execution_metadata, sn.generation, sn.written_off_node,
                 ssl.id AS storage_location_id,
                 ssl.snapshot_id AS storage_location_snapshot_id,
                 ssl.storage_connection_string,
@@ -1093,6 +1127,7 @@ impl TryFrom<SnapshotRow> for SnapshotRecord {
             artifact,
             execution_metadata,
             generation,
+            written_off_node: row.written_off_node,
             storage_location,
         })
     }
@@ -1233,9 +1268,10 @@ pub async fn insert(
               local_artifact_id, artifact_kind, artifact_origin,
               artifact_snapshot_name, runtime, runtime_version, guest_os,
               guest_arch, state_format_name, state_format_version,
-              execution_metadata, generation)
+              execution_metadata, generation, written_off_node, timestamp)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                 $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+                 $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
+                 COALESCE($25, NOW()))
          ON CONFLICT DO NOTHING
          RETURNING id"
     ))
@@ -1270,6 +1306,19 @@ pub async fn insert(
     .bind(state_format.map(|identity| identity.version.as_str()))
     .bind(snapshot.execution_metadata.as_ref().map(Json))
     .bind(snapshot.generation.map(ExecutionGeneration::get))
+    .bind(snapshot.written_off_node)
+    .bind(
+        snapshot
+            .timestamp
+            .map(|timestamp| {
+                OffsetDateTime::from_unix_timestamp_nanos(timestamp.as_nanosecond()).map_err(|_| {
+                    InsertSnapshotError::UnrepresentableTimestamp {
+                        snapshot_id: snapshot.id,
+                    }
+                })
+            })
+            .transpose()?,
+    )
     .fetch_optional(&mut **tx)
     .await?;
 
@@ -1334,6 +1383,7 @@ fn same_snapshot_identity(persisted: &SnapshotRecord, expected: &NewSnapshot) ->
         && persisted.kind() == expected.kind
         && persisted.org_id() == Some(expected.org_id)
         && persisted.artifact() == expected.artifact.as_ref()
+        && persisted.is_written_off_node() == expected.written_off_node
         && match (
             persisted.execution_metadata(),
             expected.execution_metadata.as_ref(),

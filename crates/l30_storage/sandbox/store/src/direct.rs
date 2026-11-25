@@ -28,11 +28,14 @@
 //! guard; the caller decides what that means.
 //!
 //! Lease tokens need no lifecycle re-check of their own, because a row that
-//! holds a token is `restoring`. The `sandboxes_clear_restore_lease` BEFORE
-//! UPDATE trigger clears the token and its expiry on every update that leaves
-//! the row outside `restoring` (compared case- and whitespace-insensitively),
-//! and an insert that sets a token starts the row in `restoring`, as
-//! `insert_unplaced` does.
+//! holds a token this module wrote is `restoring`. The
+//! `sandboxes_clear_restore_lease` BEFORE UPDATE trigger clears the token and
+//! its expiry on every update that leaves the row outside `restoring`
+//! (compared case- and whitespace-insensitively), except one that keeps a
+//! `suspended` row `suspended`, and an insert that sets a token starts the row
+//! in `restoring`, as `insert_unplaced` does. The exception keeps a memory
+//! drop's seal (`crate::memory_drop`), which only a Kubernetes row carries,
+//! under a token no claim here wrote, so no guard here matches it.
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;

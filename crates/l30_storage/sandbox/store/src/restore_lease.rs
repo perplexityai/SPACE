@@ -13,7 +13,10 @@
 //! `restore_lease_token`. A user claim writes both; the evacuation claim is
 //! tokenless and is fenced by the `evacuation_restore_target` marker
 //! instead. Leaving `restoring` clears the pair through the
-//! `sandboxes_clear_restore_lease` trigger.
+//! `sandboxes_clear_restore_lease` trigger. The one lease on a row outside
+//! `restoring` is a memory drop's seal on a `suspended` row
+//! (`crate::memory_drop`), which the trigger keeps while the row stays
+//! `suspended` and both claims refuse while it's live.
 //!
 //! The Kubernetes store keeps everything around these statements: the
 //! transactions the locks last for, the execution retirement beside the
@@ -57,6 +60,9 @@ pub struct RestoreClaimRow {
 /// whatever its value, so a negative value still moves the row to
 /// `restoring` and returns `None`. Pass a non-negative value.
 ///
+/// Refuses a `suspended` row pinned to a disk, or one a memory drop holds
+/// sealed with a live restore lease, as [`claim_user_restore`] does.
+///
 /// `execution_ownership_ttl_secs` is bound as `$4`, which this statement
 /// doesn't read; it keeps the parameter list the statement has always been
 /// prepared with.
@@ -82,6 +88,14 @@ pub async fn claim_evacuation_restore(
                           )
                         )
                         AND evacuation_restore_target IS NOT NULL
+                        AND NOT (
+                          LOWER(TRIM(lifecycle)) = 'suspended'
+                          AND current_local_artifact_kind IS NOT DISTINCT FROM 'disk'
+                        )
+                        AND NOT (
+                          LOWER(TRIM(lifecycle)) = 'suspended'
+                          AND COALESCE(restore_lease_expires_at > NOW(), FALSE)
+                        )
                       FOR UPDATE
                  ),
                  updated AS (
@@ -130,6 +144,18 @@ pub async fn claim_evacuation_restore(
 /// episode (`sweeper::restoring_episode_overdue`) passes the lease and owner
 /// guards, so the sweeper may revert the row under a live lease.
 ///
+/// Refuses a `suspended` row pinned to a disk: a memory drop
+/// (`crate::memory_drop`) left it there, and no restore path turns a disk
+/// artifact into a running sandbox from `suspended` yet. Readers key the
+/// artifact kind on the lifecycle and the node refuses a non-full artifact
+/// after downloading it, so claiming would strand the row in `restoring`.
+/// The check reads only row columns, so a claim blocked on a concurrent
+/// drop's row lock re-evaluates it against the committed pin and loses.
+///
+/// While a memory drop copies the row's disk it holds the row sealed with a
+/// live restore lease on the `suspended` row (`crate::memory_drop::seal`),
+/// which the live-lease guard above refuses like any other.
+///
 /// `evacuation_target` is bound as `$5`, which this statement doesn't read;
 /// it keeps the parameter list the statement has always been prepared with.
 pub async fn claim_user_restore(
@@ -168,6 +194,10 @@ pub async fn claim_user_restore(
                              AND e.state IN ('creating', 'created', 'recovering', 'running')
                              AND e.updated_at >
                                  NOW() - make_interval(secs => $4)
+                        )
+                        AND NOT (
+                          LOWER(TRIM(lifecycle)) = 'suspended'
+                          AND current_local_artifact_kind IS NOT DISTINCT FROM 'disk'
                         )
                       FOR UPDATE
                  ),

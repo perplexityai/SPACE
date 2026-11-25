@@ -399,8 +399,9 @@ async fn update_desired_state_writes_an_empty_metadata_document() -> TestResult 
 /// Pins the hazard the verb documents: an all-`Unchanged` patch names no
 /// column, but it is still an `UPDATE`, so the row's guardless `BEFORE
 /// UPDATE` triggers fire. `sandboxes_clear_restore_lease` nulls the lease
-/// columns whenever `lifecycle <> 'restoring'` — with no check that the
-/// lifecycle changed, or that this statement touched them.
+/// columns whenever `lifecycle <> 'restoring'` — with no check that this
+/// statement touched them, and no check that the lifecycle changed except
+/// on a `suspended` row that stays `suspended`, where it keeps them.
 ///
 /// This is the `pids_max`-only request path: the runtime call carries the
 /// change and nothing here needs writing, yet the write still happens.

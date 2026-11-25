@@ -28,12 +28,14 @@ sqlx = { workspace = true, features = ["derive", "json", "postgres", "runtime-to
 thiserror = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }
+zstd = { workspace = true }
 
 # internal
 pplx-space-accounts = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-sandbox-model = { workspace = true, features = ["sqlx"] }
 pplx-space-content-digest = { workspace = true, features = ["serde"] }
 pplx-space-execution-spec = { workspace = true, features = ["serde"] }
+pplx-space-object-store = { workspace = true }
 pplx-space-sandbox-portability = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 
