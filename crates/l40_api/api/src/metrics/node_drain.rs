@@ -40,3 +40,15 @@ pub fn local_snapshot_promotion(node_id: &str, outcome: &str) {
         &[tag("node", node_id), tag("outcome", outcome)],
     );
 }
+
+/// Registration deferred a Node under a new UID that reports no EC2 instance
+/// yet, for a node with a v2 drain: the next sync decides once the Node
+/// reports its `providerID`, keeping the drain for the same instance or
+/// clearing it for another.
+pub fn v2_registration_deferred(node: &str) {
+    counter(
+        "node_drain.v2.registration_deferred",
+        1,
+        &[tag("node", node)],
+    );
+}
