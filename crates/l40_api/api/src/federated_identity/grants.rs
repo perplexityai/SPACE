@@ -10,7 +10,7 @@ pub use pplx_space_federated_identity::{
     DEFAULT_FEDERATED_GRANT_AUDIENCE, FEDERATED_OWNER_GRANT_PURPOSE,
 };
 
-pub async fn upsert_sandbox_federated_service_grant(
+pub(crate) async fn upsert_sandbox_federated_service_grant(
     pool: &PgPool,
     sandbox_id: SandboxId,
     owner: &FederatedOwner,
@@ -29,7 +29,7 @@ pub async fn upsert_sandbox_federated_service_grant(
     .await
 }
 
-pub async fn upsert_sandbox_federated_service_grant_tx(
+pub(crate) async fn upsert_sandbox_federated_service_grant_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     sandbox_id: SandboxId,
     owner: &FederatedOwner,

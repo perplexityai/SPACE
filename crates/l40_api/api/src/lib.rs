@@ -7,7 +7,7 @@
 //! deployment that needs private wiring can supply its own `main` against
 //! this library without copying any of the service.
 
-pub mod api_surface;
+pub(crate) mod api_surface;
 pub mod auth;
 pub mod client_classification;
 pub mod client_concurrency;
