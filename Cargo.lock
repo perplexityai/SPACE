@@ -4951,6 +4951,7 @@ dependencies = [
  "pplx-space-credmgr-client",
  "pplx-space-data-plane-session-store",
  "pplx-space-db-test-fixtures",
+ "pplx-space-direct-coordinator",
  "pplx-space-direct-store",
  "pplx-space-durations",
  "pplx-space-ecw-credential",
@@ -6078,15 +6079,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-direct-coordinator"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-accounts",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-direct-store",
+ "pplx-space-node-model",
+ "pplx-space-node-registration-store",
+ "pplx-space-postgres-pool",
+ "pplx-space-sql-locator",
+ "serde_json",
+ "sqlx",
+ "time",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "pplx-space-direct-store"
 version = "0.8.2"
 dependencies = [
  "pplx-space-accounts",
  "pplx-space-db-test-fixtures",
  "pplx-space-node-model",
+ "pplx-space-postgres-pool",
  "pplx-space-sandbox-model",
  "pplx-space-sql-locator",
+ "serde_json",
  "sqlx",
+ "time",
  "tokio",
  "uuid",
 ]
@@ -7348,6 +7370,7 @@ dependencies = [
  "pplx-space-k8s-node-id",
  "pplx-space-node-drain",
  "pplx-space-node-model",
+ "pplx-space-postgres-pool",
  "pplx-space-sandbox-portability",
  "pplx-space-sandbox-residency",
  "pplx-space-sql-locator",
