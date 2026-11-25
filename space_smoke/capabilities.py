@@ -2116,6 +2116,10 @@ class DrainV2Control(KindWorkerControl, Protocol):
         """`POST :drain` with `body`, answered as it came."""
         ...
 
+    def force_upload_answer(self, node_id: str) -> CallAnswer:
+        """`POST :force-upload-local-snapshots`, answered as it came."""
+        ...
+
     def admin_node_drain(self, node_id: str) -> dict[str, Any] | None:
         """The admin node response's `drain` view of a v2 drain; None when
         the node has no v2 drain."""
