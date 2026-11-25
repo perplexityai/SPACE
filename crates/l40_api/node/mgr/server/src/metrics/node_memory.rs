@@ -62,3 +62,69 @@ pub fn space_cgroup_read_success(success: bool) {
         &[],
     );
 }
+
+/// The parent's [`CgroupMemoryState::headroom_bytes`]. Skipped when the
+/// parent is unlimited or its unreclaimable memory is unknown.
+pub fn space_cgroup_headroom(state: &CgroupMemoryState) {
+    if let Some(headroom) = state.headroom_bytes() {
+        gauge(
+            "node_memory.space_cgroup.headroom_bytes",
+            headroom as f64,
+            &[],
+        );
+    }
+}
+
+/// The growth memory admission booked for the node's existing leases in its
+/// latest decision against `limit` (`host`): each VM's remaining room toward
+/// its booking level, as that check counted it.
+pub fn admission_booked_growth(limit: &'static str, booked_growth_mib: u64) {
+    gauge(
+        "node_memory.admission.booked_growth_bytes",
+        booked_growth_mib.saturating_mul(1024 * 1024) as f64,
+        &[tag("limit", limit)],
+    );
+}
+
+/// The outcome of memory admission for one new lease.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemoryAdmissionOutcome {
+    Accepted,
+    InsufficientCapacity,
+    RequirementOverflow,
+    NodeMemoryUnobservable,
+    ReservationsUnobservable,
+}
+
+impl MemoryAdmissionOutcome {
+    const fn decision(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::InsufficientCapacity | Self::RequirementOverflow => "refused",
+            Self::NodeMemoryUnobservable | Self::ReservationsUnobservable => "unavailable",
+        }
+    }
+
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::Accepted => "capacity_available",
+            Self::InsufficientCapacity => "insufficient_capacity",
+            Self::RequirementOverflow => "requirement_overflow",
+            Self::NodeMemoryUnobservable => "node_memory_unobservable",
+            Self::ReservationsUnobservable => "reservations_unobservable",
+        }
+    }
+}
+
+/// One memory-admission decision for a new lease, tagged `decision`
+/// (`accepted`, `refused` or `unavailable`) and `reason`.
+pub fn admission_decision(outcome: MemoryAdmissionOutcome) {
+    counter(
+        "node_memory.admission.decisions",
+        1,
+        &[
+            tag("decision", outcome.decision()),
+            tag("reason", outcome.reason()),
+        ],
+    );
+}

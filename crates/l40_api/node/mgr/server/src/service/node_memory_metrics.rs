@@ -83,6 +83,7 @@ impl Sampler {
             );
         }
         node_memory::space_cgroup(&state);
+        node_memory::space_cgroup_headroom(&state);
         if let Some(previous) = self.previous_events.replace(state.events) {
             for (event, count) in new_events(&previous, &state.events) {
                 node_memory::space_cgroup_events(event, count);
