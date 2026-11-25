@@ -13,7 +13,13 @@ Every table named here is in the control-plane Postgres store.
   `space-data-store-development` skill owns the store rules.
 - New `nodes.drain_phase` writes here compare-and-set the phase. Node-drain
   terminators delete a Kubernetes Node or its instance only after re-reading
-  the phase and the stored `node_k8s.k8s_node_uid`; a mismatch refuses.
+  the phase and the stored `node_k8s.k8s_node_uid`; a mismatch refuses. The
+  v2 loop (`node_drain::v2`) dispatches a termination only for the instance
+  its terminate transaction fenced (`drain_status.terminate_instance`), never
+  one it reads from a Node; registration protects the recorded identity. A
+  Node under a new UID keeps a v2 drain only if it reports the recorded
+  instance (`node_k8s.instance_id`), and one that reports no instance yet is
+  deferred until it reports one.
 - A new store that joins a credential-fenced `*_encrypted_fields` sidecar
   runs on the credentials pool, as the two snapshot sweepers do.
 - In dry-run, a loop classifies and reports through logs and dry-run-tagged

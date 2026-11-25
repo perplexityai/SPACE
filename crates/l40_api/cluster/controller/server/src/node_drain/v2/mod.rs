@@ -100,13 +100,15 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use pplx_space_accounts::NodeId;
+use pplx_space_k8s_node_id::Ec2InstanceId;
 use pplx_space_node_registration_store::drain_v2::StoredV2Report;
 use pplx_space_sbx_mgr_client::proto::{
     DrainEvacuated, DrainNodeRequest, DrainNodeResponse, drain_node_request,
 };
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
-use cleanup::{DispatchBackoff, fence, let_go, terminated_or_dispatch};
+use cleanup::{DispatchBackoff, REFUSED_TERMINATE, fence, let_go, terminated_or_dispatch};
 pub use cleanup::{Fence, TerminatedDelete};
 use step::step;
 #[cfg(test)]
@@ -179,6 +181,9 @@ impl V2LoopConfig {
     }
 }
 
+/// How long one EC2 or Auto Scaling call may take.
+const AWS_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// What EC2 answers for one instance, by its id.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InstanceEvidence {
@@ -194,6 +199,19 @@ pub enum InstanceEvidence {
     /// No answer: an EC2 error or timeout, no recorded instance, or no EC2
     /// to ask. Why.
     Unknown(String),
+}
+
+impl InstanceEvidence {
+    /// EC2's states for one instance id, as it listed them.
+    pub fn from_states(states: &[String]) -> Self {
+        match states {
+            [] => Self::NotListed,
+            [state] if state == "terminated" => Self::Terminated,
+            [state] if state == "shutting-down" => Self::ShuttingDown,
+            [state] => Self::Listed(state.clone()),
+            many => Self::Listed(format!("listed {} times", many.len())),
+        }
+    }
 }
 
 impl std::fmt::Display for InstanceEvidence {
@@ -226,6 +244,70 @@ pub trait V2InstanceAuthority: Send + Sync + 'static {
         instance_id: &str,
         decrement_capacity: bool,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+}
+
+/// The v2 loop's authority: EC2 and Auto Scaling, with the `aws`
+/// terminator, or none, which leaves a node `terminating` unfenced and reads
+/// every instance unknown.
+pub enum V2Terminator {
+    Ec2 {
+        ec2: pplx_space_aws_client::ec2::Client,
+        autoscaling: pplx_space_aws_client::autoscaling::Client,
+    },
+    Refuse,
+}
+
+impl V2InstanceAuthority for V2Terminator {
+    fn terminates(&self) -> bool {
+        matches!(self, Self::Ec2 { .. })
+    }
+
+    async fn describe_instance(&self, instance_id: &str) -> InstanceEvidence {
+        let Self::Ec2 { ec2, .. } = self else {
+            return InstanceEvidence::Unknown("the terminator is not aws".to_owned());
+        };
+        if Ec2InstanceId::parse(instance_id).is_none() {
+            return InstanceEvidence::Unknown(format!("{instance_id} is not an instance id"));
+        }
+        match tokio::time::timeout(
+            AWS_CALL_TIMEOUT,
+            ec2.describe_instances_by_ids(&[instance_id]),
+        )
+        .await
+        {
+            Ok(Ok(instances)) => {
+                let states: Vec<String> = instances
+                    .into_iter()
+                    .filter(|instance| instance.instance_id == instance_id)
+                    .map(|instance| instance.state)
+                    .collect();
+                InstanceEvidence::from_states(&states)
+            }
+            Ok(Err(error)) => InstanceEvidence::Unknown(error.to_string()),
+            Err(_) => InstanceEvidence::Unknown("the EC2 call timed out".to_owned()),
+        }
+    }
+
+    async fn terminate_instance(
+        &self,
+        instance_id: &str,
+        decrement_capacity: bool,
+    ) -> Result<(), String> {
+        let Self::Ec2 { autoscaling, .. } = self else {
+            return Err(REFUSED_TERMINATE.to_owned());
+        };
+        let instance = Ec2InstanceId::parse(instance_id)
+            .ok_or_else(|| format!("{instance_id} is not an instance id"))?;
+        match tokio::time::timeout(
+            AWS_CALL_TIMEOUT,
+            super::aws::terminate_fenced_instance(autoscaling, &instance, decrement_capacity),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(_) => Err("the Auto Scaling call timed out; its outcome is unknown".to_owned()),
+        }
+    }
 }
 
 /// A v2 drain's node, as the loop reads it.
@@ -720,6 +802,36 @@ async fn publish_still_suspended<S: DrainV2Sink>(sink: &S, listed: &[NodeId], af
             "node_drain v2: counting the sandboxes drains left suspended failed"
         ),
     }
+}
+
+/// Run the v2 loop every `tick_every` until `shutdown`, under `config`'s
+/// bounds.
+pub async fn run<S: DrainV2Sink, A: V2InstanceAuthority>(
+    sink: S,
+    authority: A,
+    tick_every: Duration,
+    config: V2LoopConfig,
+    shutdown: CancellationToken,
+) {
+    tracing::info!(
+        tick_secs = tick_every.as_secs(),
+        ?config,
+        "starting the node drain's v2 loop"
+    );
+    let state = V2LoopState::new(config);
+    let mut interval = tokio::time::interval(tick_every);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            _ = interval.tick() => {}
+        }
+        let report = tick(&sink, &authority, &state).await;
+        if report != V2TickReport::default() {
+            tracing::info!(?report, "node_drain v2: tick");
+        }
+    }
+    tracing::info!("node drain's v2 loop stopping");
 }
 
 #[cfg(test)]
