@@ -22,6 +22,8 @@ pub(crate) mod direct_seed;
 const NAME: &str = "space-test-instance-node";
 const INSTANCE_A: &str = "i-0000000a";
 const INSTANCE_B: &str = "i-0000000b";
+/// A `nodes.drain_engine` value this build doesn't know.
+const UNKNOWN_ENGINE: &str = "v9";
 
 fn instance(id: &str) -> Ec2InstanceId {
     Ec2InstanceId::parse(id).expect("a valid instance id")
@@ -476,5 +478,42 @@ async fn a_v2_drain_that_commits_while_a_registration_waits_defers_it() -> TestD
     assert!(registered(&db.pool, registration(plain, "uid-2", None)).await?);
     let k8s = node_k8s(&mut conn, plain).await?.unwrap();
     assert_eq!(k8s.k8s_node_uid.as_deref(), Some("uid-2"));
+    Ok(())
+}
+
+/// The phase counts are v1's: a node under no engine is counted in its
+/// phase, and one under v2 or an engine this build doesn't know isn't.
+#[tokio::test]
+async fn drain_phase_counts_count_only_v1_drains() -> TestDbResult<()> {
+    let db = db().await?;
+    for (phase, engine) in [
+        ("draining", None),
+        ("draining", None),
+        ("drained", None),
+        ("draining", Some("v2")),
+        ("drained", Some("v2")),
+        ("terminating", Some("v2")),
+        ("draining", Some(UNKNOWN_ENGINE)),
+        ("terminating", Some(UNKNOWN_ENGINE)),
+    ] {
+        sqlx::query(sql!(
+            "INSERT INTO nodes (id, address, role, managed_by, state, drain_phase, drain_engine)
+             VALUES ($1, '10.0.0.10', 'worker', 'k8s', 'registered', $2, $3)"
+        ))
+        .bind(NodeId::new())
+        .bind(phase)
+        .bind(engine)
+        .execute(&db.pool)
+        .await?;
+    }
+    let mut counts = drain_reads::drain_phase_counts(&db.pool).await?;
+    counts.sort_by(|a, b| a.drain_phase.cmp(&b.drain_phase));
+    assert_eq!(
+        counts,
+        [("drained", 1), ("draining", 2)].map(|(phase, count)| drain_reads::DrainPhaseCount {
+            drain_phase: Some(phase.to_owned()),
+            count,
+        })
+    );
     Ok(())
 }

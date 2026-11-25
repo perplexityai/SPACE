@@ -292,8 +292,10 @@ where
 /// scope — they keep blocking and stay parked for their own sweepers.
 ///
 /// The `EXISTS` guards re-check the node's `drained` + Kubernetes-managed
-/// phase and the `node_k8s.k8s_node_uid` identity (`IS NOT DISTINCT FROM
-/// $2`) **inside the UPDATE**, mirroring the terminator's
+/// phase under the v1 engine (`drain_engine IS NULL`: a v2 drain's node, or
+/// one under an engine this build doesn't know, is never v1's to give up)
+/// and the `node_k8s.k8s_node_uid` identity (`IS NOT DISTINCT FROM $2`)
+/// **inside the UPDATE**, mirroring the terminator's
 /// `drained_node::delete_if_orphan`: a same-name kube replacement or an
 /// admin undrain that lands after the EC2
 /// cross-check makes this match nothing, so the terminal flip can never
@@ -345,6 +347,7 @@ pub fn mark_unrecoverable_sandboxes_lost_query() -> String {
             AND EXISTS (
                 SELECT 1 FROM nodes
                 WHERE id = $1 AND drain_phase = 'drained' AND managed_by = $5
+                  AND drain_engine IS NULL
             )
             AND EXISTS (
                 SELECT 1 FROM node_k8s

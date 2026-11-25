@@ -1,9 +1,12 @@
-//! Every v1 writer keyed on drain phase skips a v2 drain's node: the node
-//! drain's draining, drained and terminating lists and its phase write, the
-//! drained-node terminator's list, its reap and its orphan delete, the
-//! terminating delete with its tombstone, the forced drain's suspend claim
-//! and the record of a stopped evacuation's artifact. Each writer runs
-//! against a v1 row and a v2 row in the same phase: the v1 row is the
+//! Every v1 writer keyed on drain phase skips a v2 drain's node, and a node
+//! under an engine this build doesn't know: the node drain's draining,
+//! drained and terminating lists and its phase write, the drained-node
+//! terminator's list, its reap and its orphan delete, the terminating delete
+//! with its tombstone, the forced drain's suspend claim, the record of a
+//! stopped evacuation's artifact, and the three sandbox give-ups keyed on
+//! the node's phase: the stale-resident sweep, the gone node's bulk fail and
+//! the drained gone node's mark-lost. Each writer runs against a v1 row and
+//! a row under each other engine in the same phase: the v1 row is the
 //! control the writer still takes.
 //!
 //! Two more writers carry the same `drain_engine IS NULL` guard and aren't
@@ -31,6 +34,8 @@ use crate::drained_node_terminator::store::NodeDbStore;
 use pplx_space_node_registration_store::drained_node;
 
 const UID: &str = "uid-1";
+/// A `nodes.drain_engine` value this build doesn't know.
+const UNKNOWN_ENGINE: &str = "v9";
 
 /// A sandbox in `lifecycle` active on `node_id`, with `marker` as its
 /// `evacuation_restore_target`.
@@ -107,10 +112,13 @@ enum Writer {
     Reap,
     OrphanDelete,
     TerminatingDelete,
+    AbandonStale,
+    GoneNodeFail,
+    UnrecoverableLost,
 }
 
 impl Writer {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 14] = [
         Self::DrainingList,
         Self::DrainingIds,
         Self::PhaseWrite,
@@ -122,6 +130,9 @@ impl Writer {
         Self::Reap,
         Self::OrphanDelete,
         Self::TerminatingDelete,
+        Self::AbandonStale,
+        Self::GoneNodeFail,
+        Self::UnrecoverableLost,
     ];
 
     /// The phase the writer reads its node in.
@@ -131,9 +142,15 @@ impl Writer {
             | Self::DrainingIds
             | Self::PhaseWrite
             | Self::SuspendClaim
-            | Self::StoppedArtifact => "draining",
+            | Self::StoppedArtifact
+            | Self::AbandonStale
+            | Self::GoneNodeFail => "draining",
             Self::TerminatingList | Self::TerminatingDelete => "terminating",
-            Self::DrainedIds | Self::DrainedList | Self::Reap | Self::OrphanDelete => "drained",
+            Self::DrainedIds
+            | Self::DrainedList
+            | Self::Reap
+            | Self::OrphanDelete
+            | Self::UnrecoverableLost => "drained",
         }
     }
 
@@ -227,24 +244,76 @@ impl Writer {
                 .await?;
                 deleted || tombstoned || phase(pool, node_id).await?.is_none()
             }
+            Self::AbandonStale => {
+                let id = sandbox_on(pool, node_id, "starting", None).await?;
+                sqlx::query(sql!(
+                    "UPDATE sandboxes SET lifecycle_changed_at = NOW() - INTERVAL '1 hour'
+                      WHERE id = $1"
+                ))
+                .bind(id)
+                .execute(pool)
+                .await?;
+                !pplx_space_sandbox_store::drain::abandon_stale_resident_sandboxes(
+                    pool,
+                    node_id,
+                    pplx_space_durations::PositiveDuration::new(std::time::Duration::from_secs(60))
+                        .expect("non-zero"),
+                    &["starting"],
+                )
+                .await?
+                .is_empty()
+            }
+            Self::GoneNodeFail => {
+                sandbox_on(pool, node_id, "started", None).await?;
+                !pplx_space_sandbox_store::drain::fail_resident_sandboxes_on_gone_node(
+                    pool,
+                    node_id,
+                    &["started"],
+                    Some(UID),
+                )
+                .await?
+                .is_empty()
+            }
+            Self::UnrecoverableLost => {
+                sqlx::query(sql!(
+                    "INSERT INTO sandboxes (
+                         id, user_id, org_id, lifecycle, placement, managed_by,
+                         target_node_id, network_policy_generation
+                     ) VALUES ($1, '00000000-0000-0000-0000-000000000010',
+                               '00000000-0000-0000-0000-000000000001', 'suspended',
+                               'unplaced', 'k8s', $2, 1)"
+                ))
+                .bind(pplx_space_sandbox_model::SandboxId::new())
+                .bind(node_id)
+                .execute(pool)
+                .await?;
+                !NodeDbStore::new(pool.clone(), ResidencyEvidence::default())
+                    .mark_unrecoverable_sandboxes_lost(node_id, Some(UID.to_owned()))
+                    .await?
+                    .is_empty()
+            }
         })
     }
 }
 
-/// Each v1 writer takes the v1 node and leaves the v2 node in the same phase:
-/// a v2 node's row stays, with no tombstone, for the v2 loop.
+/// Each v1 writer takes the v1 node and leaves the node under any other
+/// engine in the same phase: a v2 node's row stays, with no tombstone and no
+/// sandbox written off, for the v2 loop, and so does a row under an engine
+/// this build doesn't know.
 #[tokio::test(flavor = "current_thread")]
-async fn every_v1_writer_skips_a_v2_node() -> TestResult {
+async fn every_v1_writer_skips_a_node_under_another_engine() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
     for writer in Writer::ALL {
+        for engine in ["v2", UNKNOWN_ENGINE] {
+            let other = node(&db.pool, writer.phase(), Some(engine)).await?;
+            assert!(
+                !writer.takes(&db.pool, other).await?,
+                "{writer:?} took the {engine} node"
+            );
+        }
         let v1 = node(&db.pool, writer.phase(), None).await?;
-        let v2 = node(&db.pool, writer.phase(), Some("v2")).await?;
-        assert!(
-            !writer.takes(&db.pool, v2).await?,
-            "{writer:?} took the v2 node"
-        );
         assert!(
             writer.takes(&db.pool, v1).await?,
             "{writer:?} left the v1 control"

@@ -42,14 +42,15 @@ pub struct DrainPhaseCount {
     pub count: i64,
 }
 
-/// The node count of every drain phase that has nodes. Nodes without a
-/// phase are not counted.
+/// The node count of every v1 drain phase that has nodes. Nodes without a
+/// phase are not counted, nor is a node whose drain another engine owns
+/// (`drain_engine` set).
 pub async fn drain_phase_counts(
     executor: impl Executor<'_>,
 ) -> Result<Vec<DrainPhaseCount>, DbError> {
     Ok(sqlx::query_as::<_, DrainPhaseCount>(sql!(
         "SELECT drain_phase, COUNT(*) AS count FROM nodes
-             WHERE drain_phase IS NOT NULL
+             WHERE drain_phase IS NOT NULL AND drain_engine IS NULL
              GROUP BY drain_phase"
     ))
     .fetch_all(executor.into_sqlx())
