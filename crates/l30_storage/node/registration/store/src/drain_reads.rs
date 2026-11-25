@@ -57,8 +57,9 @@ pub async fn drain_phase_counts(
     .await?)
 }
 
-/// Every node of `managed_by` in v1 drain phase `phase`. A v2 drain's node
-/// (`drain_engine` set) is left to the node drain's v2 loop.
+/// Every node of `managed_by` in v1 drain phase `phase`. A node under an
+/// engine (`drain_engine` set: v2, or one this build doesn't know) is left to
+/// that engine.
 pub async fn nodes_in_drain_phase(
     executor: impl Executor<'_>,
     phase: NodeDrainPhase,
@@ -83,8 +84,8 @@ pub struct NodeInDrainPhase {
 }
 
 /// Every node of `managed_by` in v1 drain phase `phase`, with its drain
-/// mode. A v2 drain's node (`drain_engine` set) is left to the node drain's
-/// v2 loop.
+/// mode. A node under an engine (`drain_engine` set: v2, or one this build
+/// doesn't know) is left to that engine.
 pub async fn nodes_in_drain_phase_with_mode(
     executor: impl Executor<'_>,
     phase: NodeDrainPhase,
