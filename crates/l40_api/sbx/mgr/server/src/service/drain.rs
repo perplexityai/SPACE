@@ -538,6 +538,12 @@ fn try_acquire_state_writer(
         return Ok(None);
     }
     let independently_bounded_cleanup = matches!(method, "AsyncCleanup" | "CleanupAdmission");
+    // `DrainNode`'s lease covers one write of the seal row in this process's
+    // database, one call at a time, and nothing the dependency drain
+    // replaces, so neither the cap nor that drain's gate applies to it. A
+    // restart handoff still refuses it, and waits for it: it counts in
+    // `active`.
+    let seal_row_write = method == "DrainNode";
     let teardown = matches!(
         method,
         "/space.sandbox.manager.v1.SandboxManager/Delete"
@@ -560,15 +566,23 @@ fn try_acquire_state_writer(
             .active_by_method
             .get("CleanupAdmission")
             .copied()
+            .unwrap_or(0)
+        - state_writers
+            .active_by_method
+            .get("DrainNode")
+            .copied()
             .unwrap_or(0);
-    if !independently_bounded_cleanup && foreground >= capacity {
+    if !independently_bounded_cleanup && !seal_row_write && foreground >= capacity {
         return Err(StateWriterAdmissionError::CapacityExhausted);
     }
-    if let Some(dependency_drain) = &state_writers.dependency_drain {
+    if !seal_row_write && let Some(dependency_drain) = &state_writers.dependency_drain {
         let Some(admission) = dependency_drain.try_acquire_admission()? else {
             return Ok(None);
         };
-        if state_writers.active == 0 {
+        // The first writer to cross the admission gate takes the work gate,
+        // which writers share until none is left; a `DrainNode` active
+        // meanwhile holds neither.
+        if state_writers.dependency_work.is_none() {
             let Some(work) = dependency_drain.try_acquire_work(&admission)? else {
                 return Ok(None);
             };

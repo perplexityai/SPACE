@@ -2892,12 +2892,138 @@ async fn a_restart_handoff_starts_no_drain_action() {
                 vec![("NodeDrain", 1)]
             }
         );
-        release_held_suspend(&service, 7, wake).await;
+        if handing_off {
+            // The handoff refuses the cancel too; its successor takes it.
+            drop(wake);
+            service.drain_actions.wait_idle().await;
+        } else {
+            release_held_suspend(&service, 7, wake).await;
+        }
         assert_eq!(
             service.lookup_sandbox(&id).unwrap().state,
             SandboxStatus::from(SandboxState::Started)
         );
     }
+}
+
+/// A drain call's seal and a cancel each write the seal row under a
+/// state-writer lease. Once a restart handoff closes state-writer admission,
+/// either answers that it be retried on the successor and leaves the seal as
+/// it was, in memory and in its row alike: the successor reads that row at
+/// startup, so the predecessor can't answer a cancel done that leaves the
+/// successor sealed, nor seal behind a successor that read it unsealed. A
+/// refused cancel still stops this process evacuating, so the drain's
+/// suspend of a started sandbox, queued on its wake lock, leaves it running.
+#[tokio::test]
+async fn a_restart_handoff_refuses_a_seal_or_cancel_and_changes_nothing() {
+    for sealed_before in [false, true] {
+        let conn = crate::db::test_conn();
+        let id = started_sandbox(&conn);
+        let service = SandboxManagerService::for_test(conn);
+        let wake = service.auto_lifecycle.wake_lock(&id).lock_owned().await;
+        if sealed_before {
+            let first = service.begin_drain(7, EVACUATE).unwrap();
+            service.finish_drain(7, &first, DrainScans::default());
+            assert_eq!(
+                service.drain_actions.running().get(&id),
+                Some(&DrainAction::Suspend)
+            );
+        }
+        let seal = || {
+            (
+                service.activation_seal.status().sealed_generation,
+                crate::db::read::activation_seal(&service.db.lock().unwrap()).unwrap(),
+            )
+        };
+        let before = seal();
+        service.begin_draining_for_restart();
+        for request in [
+            drain_request(7, EVACUATE),
+            drain_request(8, HOLD),
+            cancel_request(7),
+        ] {
+            let refused = service.drain_node(request).await.unwrap_err();
+            assert!(
+                pplx_space_sbx_mgr_client::is_restart_retry_on_successor(&refused),
+                "sealed before: {sealed_before}: {refused:?}"
+            );
+            assert_eq!(seal(), before, "sealed before: {sealed_before}");
+        }
+        assert!(!service.drain_actions.evacuating(7));
+        drop(wake);
+        service.drain_actions.wait_idle().await;
+        assert_eq!(
+            service.lookup_sandbox(&id).unwrap().state,
+            SandboxStatus::from(SandboxState::Started),
+            "sealed before: {sealed_before}"
+        );
+        assert_eq!(service.active_state_transition_count(), 0);
+    }
+}
+
+/// `DrainNode`'s lease is admitted past a full state-writer capacity and a
+/// closed dependency drain, which bound and gate every other writer: it
+/// covers one write of the seal row in this process's database, one call at
+/// a time. It still counts while it writes, and a restart handoff still
+/// refuses it. A writer admitted while it counts takes the dependency
+/// drain's work gate, as the first writer does.
+#[tokio::test]
+async fn drain_node_is_admitted_past_the_writer_cap_and_the_dependency_drain() {
+    let locks = tempfile::tempdir().unwrap();
+    let [capability, admission, work] =
+        ["capability", "admission", "work"].map(|name| locks.path().join(name));
+    for path in [&capability, &admission, &work] {
+        std::fs::File::create(path).unwrap();
+    }
+    // A deployment's exclusive hold of a gate, if no writer shares it.
+    let exclusive = |path: &std::path::Path| {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            .ok()
+            .map(|()| file)
+    };
+    let service = SandboxManagerService::for_test(crate::db::test_conn());
+    service
+        .enable_dependency_restart_drain(&capability, &admission, &work)
+        .unwrap();
+
+    let seal_write = service.state_writer_lease("DrainNode").unwrap();
+    assert!(exclusive(&work).is_some(), "DrainNode holds no work gate");
+    let writer = service.state_writer_lease("Test").unwrap();
+    assert!(
+        exclusive(&work).is_none(),
+        "the writer shares the work gate"
+    );
+    drop((writer, seal_write));
+    assert!(exclusive(&work).is_some());
+
+    let writers: Vec<_> = (0..crate::service::drain::MAX_ACTIVE_STATE_WRITERS)
+        .map(|_| service.state_writer_lease("Test").unwrap())
+        .collect();
+    assert!(matches!(
+        service.state_writer_lease("Test"),
+        Err(full) if full.code() == tonic::Code::ResourceExhausted
+    ));
+    let closed = exclusive(&admission).expect("no writer holds the admission gate");
+    service.begin_drain(7, HOLD).unwrap();
+    assert_eq!(service.activation_seal.status().sealed_generation, Some(7));
+    assert_eq!(
+        service.active_state_transition_count(),
+        crate::service::drain::MAX_ACTIVE_STATE_WRITERS
+    );
+    drop((writers, closed));
+
+    service.begin_draining_for_restart();
+    let refused = service.cancel_drain(7).unwrap_err();
+    assert!(
+        pplx_space_sbx_mgr_client::is_restart_retry_on_successor(&refused),
+        "{refused:?}"
+    );
+    assert_eq!(service.activation_seal.status().sealed_generation, Some(7));
 }
 
 fn preview_request() -> Request<PreviewDrainNodeRequest> {
