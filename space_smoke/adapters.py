@@ -43,6 +43,7 @@ from space_smoke.capabilities import (
     TcpProbe,
     TcpTarget,
     AdminNodeGroupView,
+    DEDICATED_NODE_TAINT_KEY,
     DedicatedOrgToleration,
     SandboxPodBoundaryRender,
     CensusPublication,
@@ -739,7 +740,6 @@ FAST_ROLLOUT_STANDING_ANNOTATION = "space.pplx.net/smoke-fast-rollout-standing"
 FAST_ROLLOUT_MAX_SURGE = "100%"
 DRAIN_KEEP_ANNOTATION = "space.pplx.net/drain-keep"
 NODE_GROUP_BOUNDARY_LABEL = "node-restriction.kubernetes.io/space-node-group"
-DEDICATED_NODE_TAINT_KEY = "space.pplx.net/dedicated-org"
 NODE_GROUP_GATE_ENV = "SPACE_SANDBOX_NODE_GROUP_PLACEMENT"
 NODE_GROUP_LABELER_ENV = "SPACE_NODE_GROUP_LABELER_ENABLED"
 NODE_GROUP_MIRROR_ENV = "SPACE_NODE_GROUP_MIRROR_ENABLED"
@@ -4607,13 +4607,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             for taint in ((item.get("spec") or {}).get("taints") or []):
                 if isinstance(taint, dict) and taint.get("key") == DEDICATED_NODE_TAINT_KEY:
                     raw_value = taint.get("value")
-                    effect = taint.get("effect")
-                    if effect == "NoSchedule" and isinstance(raw_value, str) and raw_value:
-                        value = raw_value
-                    else:
-                        val_str = raw_value if isinstance(raw_value, str) else ""
-                        eff_str = effect if isinstance(effect, str) else ""
-                        value = f"{val_str}:{eff_str}"
+                    value = raw_value if isinstance(raw_value, str) else ""
                     break
             taints[name] = value
         return taints
@@ -4642,28 +4636,6 @@ ON CONFLICT (key_hash) DO NOTHING;
             f"set the dedicated-org taint on {node}",
         )
 
-    def restore_worker_dedicated_taints(self, snapshot: Mapping[str, str | None]) -> None:
-        self._require_isolated_kind("worker dedicated-org taint restore")
-        for node_name, value in snapshot.items():
-            node = _kube_node_name(node_name)
-            self.set_worker_dedicated_taint(node, None)
-            if value is None:
-                continue
-            raw_val, effect = value.rsplit(":", 1) if ":" in value else (value, "NoSchedule")
-            if effect not in {"NoSchedule", "PreferNoSchedule", "NoExecute"}:
-                raise ValueError(f"unsupported Kubernetes taint effect: {effect!r}")
-            if raw_val and not re.fullmatch(r"[A-Za-z0-9]([-._A-Za-z0-9]{0,61}[A-Za-z0-9])?", raw_val):
-                raise ValueError(f"refusing taint value {raw_val!r}")
-            spec = (
-                f"{DEDICATED_NODE_TAINT_KEY}={raw_val}:{effect}"
-                if raw_val
-                else f"{DEDICATED_NODE_TAINT_KEY}:{effect}"
-            )
-            _require_ok(
-                self.kubectl("taint", "node", node, spec, "--overwrite", timeout=30),
-                f"restore the dedicated-org taint on {node}",
-            )
-
     def _sandbox_pod_json(self, sandbox_id: str) -> dict[str, Any] | None:
         result = self.kubectl(
             "get", "pods", "-l", f"space.pplx.net/sandbox-id={_sql_uuid(sandbox_id)}", "-o", "json", timeout=15,
@@ -4675,26 +4647,6 @@ ON CONFLICT (key_hash) DO NOTHING;
     def sandbox_pod_boundary(self, sandbox_id: str) -> SandboxPodBoundaryRender | None:
         pod = self._sandbox_pod_json(sandbox_id)
         return None if pod is None else _parse_pod_boundary_render(pod)
-
-    def sandbox_pod_node_group_terms(self, sandbox_id: str) -> list[str]:
-        pod = self._sandbox_pod_json(sandbox_id)
-        if pod is None:
-            return []
-        required = (
-            ((pod.get("spec") or {}).get("affinity") or {}).get("nodeAffinity") or {}
-        ).get("requiredDuringSchedulingIgnoredDuringExecution") or {}
-        values: set[str] = set()
-        for term in required.get("nodeSelectorTerms") or []:
-            for expression in term.get("matchExpressions") or []:
-                if expression.get("key") == NODE_GROUP_BOUNDARY_LABEL:
-                    values.update(str(v) for v in expression.get("values") or [])
-        return sorted(values)
-
-    def sandbox_pod_phase_and_node(self, sandbox_id: str) -> tuple[str | None, str | None]:
-        pod = self._sandbox_pod_json(sandbox_id)
-        if pod is None:
-            return None, None
-        return (pod.get("status") or {}).get("phase"), (pod.get("spec") or {}).get("nodeName")
 
     def admin_org_id(self) -> str:
         """The managing org of the kind admin, read from the admin's own listing route."""

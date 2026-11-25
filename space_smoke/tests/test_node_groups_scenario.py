@@ -86,7 +86,6 @@ class _Control:
             AdminNodeView("n2", "worker-b", None, None, 0, node_group_id="g1"),
         ]
         if self.fail_on_write:
-            self.taints = {"worker-a": "019d0000-0000-7000-8000-000000000001", "worker-b": None}
             raise RuntimeError("write failed mid-rollout")
 
     def restore_node_group_env(self, standing):
@@ -122,10 +121,6 @@ class _Control:
     def worker_dedicated_taints(self):
         return dict(self.taints)
 
-    def restore_worker_dedicated_taints(self, snapshot):
-        self.taints = dict(snapshot)
-        self.calls.append(f"restore-taints:{sorted(snapshot.items())}")
-
     def sandbox_pod_boundary(self, sandbox_id):
         phase, node = self.phase
         parsed = _parse_pod_boundary_render(
@@ -147,12 +142,6 @@ class _Control:
             any_node_group_terms=any_terms,
             dedicated_org_tolerations=parsed.dedicated_org_tolerations,
         )
-
-    def sandbox_pod_node_group_terms(self, sandbox_id):
-        return list(self.terms)
-
-    def sandbox_pod_phase_and_node(self, sandbox_id):
-        return self.phase
 
     def ready_full_snapshots(self, sandbox_id):
         return []
@@ -297,6 +286,7 @@ class Sweep(unittest.TestCase):
 class Compensations(unittest.TestCase):
     def test_snapshot_and_restore_are_armed_before_the_write_and_unwind_env_first(self) -> None:
         control = _Control()
+        standing_before = control.node_group_env()
         control.fail_on_write = True
         _, groups, scope = _assertions(control)
         with self.assertRaisesRegex(RuntimeError, "write failed mid-rollout"):
@@ -309,18 +299,15 @@ class Compensations(unittest.TestCase):
         unwind = [
             c
             for c in control.calls
-            if c.startswith(("restore-taints", "restore-env", "restore-labels", "lease:release"))
+            if c.startswith(("restore-env", "restore-labels", "lease:release"))
         ]
+        self.assertEqual(unwind[0], "restore-env")
         self.assertTrue(
-            unwind[0].startswith("restore-taints:[('worker-a', None), ('worker-b', None)]")
+            unwind[1].startswith("restore-labels:[('worker-a', None), ('worker-b', None)]")
         )
-        self.assertEqual(unwind[1], "restore-env")
-        self.assertTrue(
-            unwind[2].startswith("restore-labels:[('worker-a', None), ('worker-b', None)]")
-        )
-        self.assertEqual(unwind[3], "lease:release")
+        self.assertEqual(unwind[2], "lease:release")
         self.assertEqual(control.labels, {"worker-a": None, "worker-b": None})
-        self.assertEqual(control.taints, {"worker-a": None, "worker-b": None})
+        self.assertEqual(control.env, standing_before)
         self.assertTrue(all(value is None for value in control.env.values()))
 
 

@@ -36,9 +36,9 @@ labeler seeds the `default` generic group, which the API refuses to delete by
 design; the membership mirror populates `nodes.node_group_id` with that default
 group's id, which stays populated once the mirror is rolled back off before the
 pre-run worker labels are restored; and the labeler writes every sandbox worker,
-so pre-run boundary labels and dedicated taints are snapshotted and restored
-after the dedicated group is deleted and the Deployment environment is rolled
-back.
+so pre-run boundary labels are snapshotted and restored (and the dedicated
+worker's taint is cleared) after the dedicated group is deleted and the
+Deployment environment is rolled back.
 """
 
 from __future__ import annotations
@@ -52,6 +52,7 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 from space_smoke.capabilities import (
+    DEDICATED_NODE_TAINT_KEY,
     AdminNodeGroupView,
     DedicatedOrgToleration,
     EcwSandboxDeleteRetryable,
@@ -64,8 +65,6 @@ from space_smoke.runtime import Compensation, ResourceScope
 
 if TYPE_CHECKING:
     from space_smoke.fixtures import KindEcw
-
-DEDICATED_TAINT_KEY = "space.pplx.net/dedicated-org"
 
 
 @dataclass
@@ -90,7 +89,6 @@ class NodeGroupAssertions:
         self._probe = probe
         self._scope = scope
         self._sweep_guard: Compensation | None = None
-        self._restore_taints: Compensation | None = None
         self._delete_dedicated: Compensation | None = None
         self._restore_env: Compensation | None = None
         self._restore_labels: Compensation | None = None
@@ -138,12 +136,6 @@ class NodeGroupAssertions:
             worker_taints=dict(taints),
         )
         sandbox_id = self._fixture.sandbox.sandbox_id
-        terms = self._control.sandbox_pod_node_group_terms(sandbox_id)
-        self._fixture.verify(
-            terms == [],
-            "the gate is off but the pod carries a node-group affinity term",
-            terms=terms,
-        )
         boundary = self._control.sandbox_pod_boundary(sandbox_id)
         self._fixture.verify(
             boundary is not None,
@@ -202,13 +194,6 @@ class NodeGroupAssertions:
         self._delete_dedicated = self._scope.defer(
             "delete the run-owned dedicated node group",
             self._cleanup_dedicated_group,
-            critical=True,
-        )
-        taints = self._control.worker_dedicated_taints()
-        self._fixture.record("worker_dedicated_taints_before", dict(taints))
-        self._restore_taints = self._scope.defer(
-            "restore the workers' dedicated-org taints",
-            lambda: self._control.restore_worker_dedicated_taints(taints),
             critical=True,
         )
         self._sweep_guard = self._scope.defer(
@@ -394,7 +379,12 @@ class NodeGroupAssertions:
             response_message=outcome.message,
         )
         assert outcome.sandbox_id is not None
-        terms = self._control.sandbox_pod_node_group_terms(outcome.sandbox_id)
+        boundary = self._control.sandbox_pod_boundary(outcome.sandbox_id)
+        terms = (
+            sorted({group for group_set in boundary.required_node_group_sets for group in group_set})
+            if boundary is not None
+            else []
+        )
         self._fixture.verify(
             default.name in terms,
             "the gate is on but the pod's node-group term does not name the default group",
@@ -407,24 +397,18 @@ class NodeGroupAssertions:
         # never runs.
         deadline = time.monotonic() + schedule_timeout
         while True:
-            phase, node = self._control.sandbox_pod_phase_and_node(outcome.sandbox_id)
-            if phase == "Running":
-                boundary = self._control.sandbox_pod_boundary(outcome.sandbox_id)
-                self._fixture.verify(
-                    boundary is not None,
-                    "generic create reached Running but has no live sandbox pod boundary to inspect",
-                    sandbox_id=outcome.sandbox_id,
-                )
-                assert boundary is not None
+            if boundary is not None and boundary.phase == "Running":
                 self._expect_pod_shared_boundary(
                     boundary,
                     expected_group=default.name,
                     context="generic create with gate on and no dedicated group",
                 )
-                self._fixture.record("scheduled_node", node)
+                self._fixture.record("scheduled_node", boundary.node_name)
                 if kill_after:
                     self._kill_admitted(active_probe, outcome.sandbox_id)
                 return outcome.sandbox_id
+            phase = None if boundary is None else boundary.phase
+            node = None if boundary is None else boundary.node_name
             self._fixture.verify(
                 phase != "Failed" and time.monotonic() < deadline,
                 "the pod carries the boundary term but never scheduled; the term and the labeler disagree",
@@ -433,6 +417,7 @@ class NodeGroupAssertions:
                 terms=terms,
             )
             self._fixture.wait(3)
+            boundary = self._control.sandbox_pod_boundary(outcome.sandbox_id)
 
     # --- Proof 5 (dedicated group + label + taint + pause/restore + foreign) --
 
@@ -461,9 +446,10 @@ class NodeGroupAssertions:
             default_group=default.name,
             worker_labels=labels_before,
         )
-        _, fixture_node = self._control.sandbox_pod_phase_and_node(
+        fixture_pod = self._control.sandbox_pod_boundary(
             self._fixture.sandbox.sandbox_id
         )
+        fixture_node = None if fixture_pod is None else fixture_pod.node_name
         # Prefer a worker that isn't already hosting the standing fixture pod so
         # the dedicated worker has full Firecracker capacity for create+restore.
         unoccupied = [node for node in sandbox_workers if node != fixture_node]
@@ -820,10 +806,15 @@ class NodeGroupAssertions:
 
     def _expect_pod_inert(self, pod: SandboxPodBoundaryRender, *, context: str) -> None:
         self._fixture.verify(
-            pod.any_node_group_terms == () and pod.dedicated_org_tolerations == (),
-            f"{context}: pod rendered node-group affinity or dedicated-org toleration while gate was off",
+            pod.any_node_group_terms == (),
+            f"{context}: the gate is off but the pod carries a node-group affinity term",
             pod_name=pod.pod_name,
             any_node_group_terms=list(pod.any_node_group_terms),
+        )
+        self._fixture.verify(
+            pod.dedicated_org_tolerations == (),
+            f"{context}: pod rendered dedicated-org toleration while gate was off",
+            pod_name=pod.pod_name,
             dedicated_org_tolerations=[asdict(t) for t in pod.dedicated_org_tolerations],
         )
 
@@ -881,7 +872,7 @@ class NodeGroupAssertions:
             and preferred_terms_ok
             and pod.dedicated_org_tolerations == (expected_toleration,)
             and pod.node_name == expected_worker,
-            f"{context}: dedicated pod didn't carry expected node-group terms + {DEDICATED_TAINT_KEY}={owner_org_id}:NoSchedule on {expected_worker}",
+            f"{context}: dedicated pod didn't carry expected node-group terms + {DEDICATED_NODE_TAINT_KEY}={owner_org_id}:NoSchedule on {expected_worker}",
             pod_name=pod.pod_name,
             node_name=pod.node_name,
             expected_worker=expected_worker,
@@ -958,7 +949,6 @@ class NodeGroupAssertions:
     def restore(self) -> None:
         for slot in (
             "_sweep_guard",
-            "_restore_taints",
             "_delete_dedicated",
             "_restore_env",
             "_restore_labels",

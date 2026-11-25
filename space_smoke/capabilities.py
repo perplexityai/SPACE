@@ -585,6 +585,9 @@ class RateLimiterControl(Protocol):
     def wait_redis_rollout(self, *, timeout: float) -> None: ...
 
 
+DEDICATED_NODE_TAINT_KEY = "space.pplx.net/dedicated-org"
+
+
 @dataclass(frozen=True)
 class DedicatedOrgToleration:
     """One `space.pplx.net/dedicated-org` toleration on a sandbox pod."""
@@ -626,7 +629,8 @@ class NodeGroupControl(Protocol):
     the membership mirror (`SPACE_NODE_GROUP_MIRROR_ENABLED`, cluster-controller)
     are literal Deployment env captured before they are written and restored to
     the captured values; the admin node-group routes are the product surface;
-    worker boundary labels and dedicated-org taints are snapshotted and restored.
+    worker boundary labels are snapshotted and restored, and any run-applied
+    dedicated-org worker taint is cleared on teardown.
     """
 
     def acquire_public_api_mutation(self) -> Callable[[], None]: ...
@@ -661,19 +665,11 @@ class NodeGroupControl(Protocol):
 
     def set_worker_dedicated_taint(self, node_name: str, org_id: str | None) -> None: ...
 
-    def restore_worker_dedicated_taints(self, snapshot: Mapping[str, str | None]) -> None: ...
-
     def live_sandbox_pods(self) -> tuple[str, ...]:
         """Non-pool, non-terminating sandbox pod identities (`name:uid`)."""
         ...
 
     def sandbox_pod_boundary(self, sandbox_id: str) -> SandboxPodBoundaryRender | None: ...
-
-    def sandbox_pod_node_group_terms(self, sandbox_id: str) -> list[str]:
-        """Every value of the boundary key across the pod's required nodeSelectorTerms."""
-        ...
-
-    def sandbox_pod_phase_and_node(self, sandbox_id: str) -> tuple[str | None, str | None]: ...
 
     def ready_full_snapshots(self, sandbox_id: str) -> list[SnapshotRecord]: ...
 
