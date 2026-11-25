@@ -2014,24 +2014,28 @@ func (s *spaceTaskService) Stats(ctx context.Context, r *taskAPI.StatsRequest) (
 	}
 	s.mu.Unlock()
 
-	// Always return a typed cgroup v2 Metrics so containerd's CRI can
-	// typeurl.UnmarshalAny it without erroring. Missing data leaves the
-	// corresponding fields zero — we'd rather report zeros than fail
-	// kubelet's /stats/summary for the entire node.
-	metrics := &cgroupsv2.Metrics{
-		CPU:    &cgroupsv2.CPUStat{},
-		Memory: &cgroupsv2.MemoryStat{},
-		Pids:   &cgroupsv2.PidsStat{},
-	}
+	// Always return a typed cgroup v2 Metrics, the payload containerd's CRI
+	// decodes. A figure sandbox-manager could not read leaves its section
+	// absent, which CRI reports as no sample, rather than zero, which reads as
+	// an idle sandbox and, for the cumulative CPU counter, as a reset.
+	metrics := &cgroupsv2.Metrics{}
 	if sandboxID != "" {
-		if resp, err := fetchSandboxStats(ctx, sandboxID); err == nil {
-			metrics.CPU.UsageUsec = resp.CpuUsageUsec
-			metrics.Memory.Usage = resp.MemoryCurrent
-			metrics.Memory.UsageLimit = resp.MemoryMax
-			metrics.Pids.Current = resp.PidsCurrent
-			metrics.Pids.Limit = resp.PidsMax
-		} else {
-			logShim("Stats: sbx-manager Stats(%s) failed: %v", sandboxID, err)
+		resp, err := s.fetchSandboxStats(ctx, sandboxID)
+		switch {
+		case err != nil:
+			statsFailures.report(time.Now(), "Stats: sbx-manager Stats(%s) failed: %v", sandboxID, err)
+		case resp.MemoryCurrent == 0:
+			// A running VM always charges memory to its cgroup. Zero means
+			// sandbox-manager answered without the cgroup figures.
+			statsFailures.report(time.Now(), "Stats: sbx-manager Stats(%s) answered without cgroup figures", sandboxID)
+		default:
+			metrics.Memory = &cgroupsv2.MemoryStat{Usage: resp.MemoryCurrent, UsageLimit: resp.MemoryMax}
+			metrics.Pids = &cgroupsv2.PidsStat{Current: resp.PidsCurrent, Limit: resp.PidsMax}
+			// A running VM has used CPU time. Zero means the cgroup's
+			// cpu.stat had no usage line, so CPU is reported as no sample.
+			if resp.CpuUsageUsec != 0 {
+				metrics.CPU = &cgroupsv2.CPUStat{UsageUsec: resp.CpuUsageUsec}
+			}
 		}
 	}
 
@@ -2047,13 +2051,44 @@ func (s *spaceTaskService) Stats(ctx context.Context, r *taskAPI.StatsRequest) (
 	}, nil
 }
 
-func fetchSandboxStats(ctx context.Context, sandboxID string) (*pb.StatsResponse, error) {
-	conn, err := dialSbxManager()
+func (s *spaceTaskService) fetchSandboxStats(ctx context.Context, sandboxID string) (*pb.StatsResponse, error) {
+	client, closer, err := s.sandboxManagerClient()
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-	return pb.NewSandboxManagerClient(conn).Stats(ctx, &pb.StatsRequest{SandboxId: sandboxID})
+	defer closer.Close()
+	return client.Stats(ctx, &pb.StatsRequest{SandboxId: sandboxID})
+}
+
+// statsFailureLogInterval bounds how often one shim logs failed stats
+// samples. kubelet polls container stats every few seconds, so an outage of
+// sandbox-manager would otherwise log on every poll in every shim.
+const statsFailureLogInterval = time.Minute
+
+var statsFailures failureLog
+
+// failureLog logs at most one line per statsFailureLogInterval and counts
+// the failures it held back in the next line.
+type failureLog struct {
+	mu         sync.Mutex
+	logged     time.Time
+	suppressed int
+}
+
+func (l *failureLog) report(now time.Time, format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.logged.IsZero() && now.Sub(l.logged) < statsFailureLogInterval {
+		l.suppressed++
+		return
+	}
+	if l.suppressed > 0 {
+		format += " (%d more failed samples since the last log)"
+		args = append(args, l.suppressed)
+	}
+	logShim(format, args...)
+	l.logged = now
+	l.suppressed = 0
 }
 
 func (s *spaceTaskService) Pids(ctx context.Context, r *taskAPI.PidsRequest) (*taskAPI.PidsResponse, error) {
