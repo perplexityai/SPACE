@@ -13,6 +13,7 @@ use pplx_space_auto_lifecycle::{
 };
 use pplx_space_content_digest::Digest;
 use pplx_space_execution_spec::ArtifactVersion;
+pub use pplx_space_net_common::NetworkPolicyCondition;
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyV1};
 use pplx_space_node_model::{NodeAddress, NodeManagedBy, NodePoolName, NodeRole};
 use pplx_space_semver::SemVer;
@@ -231,16 +232,6 @@ pub struct SandboxNodeSummary {
     pub role: Option<NodeRole>,
     pub address: Option<NodeAddress>,
     pub managed_by: Option<NodeManagedBy>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct NetworkPolicyCondition {
-    #[serde(rename = "type")]
-    pub condition_type: String,
-    pub status: String,
-    pub reason: Option<String>,
-    pub message: Option<String>,
-    pub last_transition_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

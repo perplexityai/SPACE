@@ -25,9 +25,9 @@ pub async fn lock_quarantine_state(
 
 /// Lock the sandbox's open episode `FOR UPDATE NOWAIT` and answer whether it
 /// was last observed on `node_id` (`last_observed_node_id`), opened by
-/// `source`, for one of `reason_codes`; `None` when it has no episode. Fails at once with `lock_not_available` when another
-/// transaction holds the episode. The lock lasts until the caller's
-/// transaction ends.
+/// `source`, for one of `reason_codes`; `None` when it has no episode. Fails
+/// at once with `lock_not_available` when another transaction holds the
+/// episode. The lock lasts until the caller's transaction ends.
 pub async fn lock_orphan_quarantine_match(
     conn: &mut PgConnection,
     sandbox_id: SandboxId,

@@ -75,8 +75,9 @@
 //!   restore's Wake dispatch and [`suspend::lock_committed_artifact`] for
 //!   the suspend's pod retirement). The caller keeps its transaction, its
 //!   lock settings and errors, and the re-checks it runs under the lock.
-//! * **The node-local SQLite `sandboxes` table** (`crates/l30_storage/sbx/mgr/store`) is a
-//!   different database on a different machine and is out of scope.
+//! * **The node-local SQLite `sandboxes` table**
+//!   (`crates/l30_storage/sbx/mgr/store`) is a different database on a
+//!   different machine and is out of scope.
 //!
 //! * **Composed predicates are in scope, on terms.** Most verbs here are row
 //!   CRUD, but [`any_undescribed_artifact_owner`] is a question rather than a
@@ -107,8 +108,9 @@
 //!   termination-blocking gate count against it.
 //! * **So are single-question reads.** A read of the `sandboxes` row that
 //!   callers made inline moves here whole, as a module named for the question
-//!   it answers, such as [`restore_pod_owners`], [`stale_suspended_executions`],
-//!   [`stopped_replacements`], [`placement_gate`] or [`template_usage`]
+//!   it answers, such as [`restore_pod_owners`],
+//!   [`stale_suspended_executions`], [`stopped_replacements`],
+//!   [`placement_gate`] or [`template_usage`]
 //!   (node drain's are [`evacuation_candidates`], [`evacuation_restores`],
 //!   [`pinned_local_only`] and [`stopped_evacuations`]), and so does one
 //!   that joins the row to what it references, as [`row_reads::owner`]
@@ -727,13 +729,14 @@ pub struct SandboxDesiredStatePatch<'a> {
 /// `updated_at` is deliberately not assigned here. The
 /// `sandboxes_set_updated_at` trigger stamps it, and only when a column
 /// outside `{updated_at, last_used_at, last_access_at, last_command_at,
-/// next_auto_event_at}` actually changed; writing it explicitly makes the trigger return early
-/// and defeats that no-op detection.
+/// next_auto_event_at}` actually changed; writing it explicitly makes the
+/// trigger return early and defeats that no-op detection.
 ///
 /// This row carries four further `BEFORE UPDATE` triggers, two of which
-/// (`sandboxes_clear_restore_lease`, `sandboxes_clear_evacuation_restore_target`)
-/// have no change guard. They fire on any update regardless of which columns
-/// this sets, so an all-`Unchanged` patch is still not a database no-op.
+/// (`sandboxes_clear_restore_lease` and
+/// `sandboxes_clear_evacuation_restore_target`) have no change guard. They
+/// fire on any update regardless of which columns this sets, so an
+/// all-`Unchanged` patch is still not a database no-op.
 pub async fn update_desired_state(
     executor: impl sqlx::PgExecutor<'_>,
     sandbox_id: SandboxId,

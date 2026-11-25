@@ -11,8 +11,8 @@
 
 use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_model::{
-    SandboxCleanupEpisodeId, SandboxId, SandboxLifecycle, SandboxQuarantineRecoveryPolicy,
-    SandboxQuarantineSource, SandboxTransitionReceiptKind,
+    SandboxCleanupEpisodeId, SandboxId, SandboxLifecycle, SandboxQuarantineReasonCode,
+    SandboxQuarantineRecoveryPolicy, SandboxQuarantineSource, SandboxTransitionReceiptKind,
 };
 
 use std::sync::LazyLock;
@@ -50,8 +50,8 @@ pub async fn lock_pause_failed_recovery_candidates(
     conn: &mut PgConnection,
     node_id: NodeId,
     rows_json: Json<JsonValue>,
-    quarantine_source: &str,
-    quarantine_reason: &str,
+    quarantine_source: SandboxQuarantineSource,
+    quarantine_reason: SandboxQuarantineReasonCode,
 ) -> Result<Vec<PauseFailedRecoveryCandidate>, sqlx::Error> {
     sqlx::query_as(sql!(
         "SELECT s.id, qs.quarantine_id, input.published_lifecycle, s.lifecycle
@@ -70,8 +70,8 @@ pub async fn lock_pause_failed_recovery_candidates(
     ))
     .bind(node_id)
     .bind(rows_json)
-    .bind(quarantine_source)
-    .bind(quarantine_reason)
+    .bind(quarantine_source.as_str())
+    .bind(quarantine_reason.as_str())
     .fetch_all(conn)
     .await
 }

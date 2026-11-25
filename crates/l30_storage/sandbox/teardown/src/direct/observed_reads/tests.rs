@@ -5,11 +5,12 @@ use pplx_space_accounts::{NodeId, OrgId, UserId};
 use pplx_space_db_test_fixtures::{
     SEED_ORG_ID, SEED_USER_ID, TestDbResult, insert_suspended_sandbox, pg_test_db,
 };
+use pplx_space_net_common::NetworkPolicyCondition;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
-use super::{ObservedNetworkPolicyCondition, observed_only, observed_states};
+use super::{observed_only, observed_states};
 
 const NETWORK_POLICY_FACET: &str = "network-policy";
 
@@ -125,11 +126,11 @@ async fn observed_states_name_the_direct_node_and_its_conditions() -> TestDbResu
     let conditions = &row.network_policy_conditions.0;
     assert_eq!(conditions.len(), 1);
     assert_eq!(
-        ObservedNetworkPolicyCondition {
+        NetworkPolicyCondition {
             last_transition_at: None,
             ..conditions[0].clone()
         },
-        ObservedNetworkPolicyCondition {
+        NetworkPolicyCondition {
             condition_type: "Applied".to_owned(),
             status: "True".to_owned(),
             reason: Some("ok".to_owned()),

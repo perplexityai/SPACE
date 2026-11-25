@@ -47,7 +47,9 @@ use pplx_space_sandbox_store::ingest::SuspendedFinalizationCandidate;
 use pplx_space_sandbox_store::published_quarantine_candidates::{
     self, PublishedQuarantineCandidate,
 };
-use pplx_space_sandbox_teardown::direct::observed_publication::AcceptedSandboxPublishRow;
+use pplx_space_sandbox_teardown::direct::observed_publication::{
+    AcceptedSandboxPublishRow, DegradedObservedState,
+};
 use pplx_space_sandbox_teardown::{conditions, direct, observed_status};
 
 use super::{optional_trimmed, parse_sandbox_id, proto_network_policy_to_common, trimmed_required};
@@ -1141,7 +1143,7 @@ pub(super) async fn publish_sandbox_states_with_census(
     // loses at most one status string, whereas the pending-backup report
     // rejects a duplicated sandbox outright because there collapsing would
     // silently drop one of two *artifacts*.
-    let mut state_only: BTreeMap<SandboxId, serde_json::Value> = BTreeMap::new();
+    let mut state_only: BTreeMap<SandboxId, DegradedObservedState> = BTreeMap::new();
     let mut failure_episode_rows = Vec::new();
     let mut snapshot_rows = Vec::new();
     let mut quarantine_inputs = Vec::new();
@@ -1162,10 +1164,10 @@ pub(super) async fn publish_sandbox_states_with_census(
             failure_episode_rows.push(failure_episode_input(sandbox_uuid, state, status, true));
             state_only.insert(
                 sandbox_uuid,
-                serde_json::json!({
-                    "sandbox_id": sandbox_uuid,
-                    "status": optional_trimmed(state.status.as_deref()),
-                }),
+                DegradedObservedState {
+                    sandbox_id: sandbox_uuid,
+                    status: optional_trimmed(state.status.as_deref()),
+                },
             );
             continue;
         }
@@ -1491,10 +1493,10 @@ pub(super) async fn publish_sandbox_states_with_census(
             );
             state_only.insert(
                 sandbox_uuid,
-                serde_json::json!({
-                    "sandbox_id": sandbox_uuid,
-                    "status": optional_trimmed(state.status.as_deref()),
-                }),
+                DegradedObservedState {
+                    sandbox_id: sandbox_uuid,
+                    status: optional_trimmed(state.status.as_deref()),
+                },
             );
         } else {
             failure_episode_rows.push(failure_episode_input(sandbox_uuid, state, status, false));
@@ -1587,7 +1589,7 @@ pub(super) async fn publish_sandbox_states_with_census(
             pplx_space_sandbox_teardown::direct::observed_publication::write_degraded_observed_states(
                 &mut *conn,
                 node_id,
-                serde_json::Value::Array(state_only.values().cloned().collect()),
+                &state_only.values().cloned().collect::<Vec<_>>(),
             )
             .await
             .map_err(|err| {

@@ -16,6 +16,8 @@ use std::sync::OnceLock;
 const DEFAULT_NETWORK_CREDENTIAL_PORT: u16 = 443;
 const MAX_NETWORK_CREDENTIAL_PATH_PREFIX_BYTES: usize = 2048;
 
+pub mod condition;
+pub use condition::NetworkPolicyCondition;
 pub mod tls_interception;
 pub use tls_interception::{TlsInterception, TlsInterceptionParseError};
 
