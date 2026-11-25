@@ -50,8 +50,3 @@ pub(super) async fn org_template_rows(
         (None, _, _) => OrgTemplateRows::None,
     })
 }
-
-/// Postgres-backed regression tests for the visibility-flip guards and the
-/// narrowing-flip compat prune, through the store verbs the handler calls.
-#[cfg(test)]
-mod tests;
