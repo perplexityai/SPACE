@@ -4,7 +4,7 @@ use sqlx::{PgPool, Postgres};
 
 use super::{FederatedOwner, FederatedServiceGrant};
 
-pub use pplx_space_federated_grant_store::FederatedGrantStoreError;
+pub(crate) use pplx_space_federated_grant_store::FederatedGrantStoreError;
 use pplx_space_federated_grant_store::{FederatedGrantOwnerRef, FederatedServiceGrantRef};
 pub use pplx_space_federated_identity::{
     DEFAULT_FEDERATED_GRANT_AUDIENCE, FEDERATED_OWNER_GRANT_PURPOSE,
