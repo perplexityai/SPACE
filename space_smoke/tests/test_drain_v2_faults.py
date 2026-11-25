@@ -176,9 +176,11 @@ class DrainV2Env(unittest.TestCase):
     def test_the_switch_the_restore_knobs_and_the_cap_are_off_the_controller_list(self) -> None:
         validate_drain_v2_overrides(drain_v2.AWS_TERMINATOR_ENV)
         validate_drain_v2_overrides(drain_v2.LEGACY_LOOPS_ENV)
+        validate_drain_v2_overrides({drain_v2.STALL_BOUND_HOOK: "30"})
         for overrides in (
             {DRAIN_V2_ENABLED_ENV: "true"},
-            {drain_v2.STALL_BOUND_HOOK: "60"},
+            {drain_v2.STALL_BOUND_HOOK: "5"},
+            {drain_v2.STALL_BOUND_HOOK: "1000"},
             {"SPACE_DRAIN_RESTORE_TEST_HOLD_SECS": "30"},
             {"SPACE_PUBLIC_OPERATION_DISPATCHER_DRAIN_RESTORE_SLOTS": "4"},
             {DRAIN_V2_MAX_EVACUATING_ENV: "1"},

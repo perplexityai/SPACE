@@ -4,7 +4,7 @@ import time
 from typing import cast
 
 import space_smoke as smoke
-from space_smoke.capabilities import ResidentLifecycleSandbox
+from space_smoke.capabilities import DurableLifecycleSandbox, ResidentLifecycleSandbox
 from space_smoke.drain_v2 import (
     DRAIN_HOLD_FIELD,
     in_parallel,
@@ -17,11 +17,13 @@ PATH = "/tmp/space-smoke-v2-held.txt"
 # drain (its last command is the file read there), and well under the bench's
 # 120 s eviction floor (`minIdleSecs` in space-sandbox-manager-local's
 # values.yaml), which counts from that same command: the idle suspend lands
-# at about 50 s, so its upload and the next report have more than a minute
+# at about 45 s, so its upload and the next report have more than a minute
 # before eviction may drop the node's rows, where an idle policy equal to the
-# floor left them one 15 s eviction interval.
-IDLE_TIMEOUT = "45s"
-IDLE_SECONDS = 45
+# floor left them one 15 s eviction interval. The drain finds it running: the
+# run's last command before the drain is 3-6 s before the held check,
+# measured.
+IDLE_TIMEOUT = "40s"
+IDLE_SECONDS = 40
 # The first hold: the drain must not reach it.
 LONG_HOLD_SECONDS = 60 * 60
 # How far ahead of the repeat the shortened deadline lands: a hold that only
@@ -185,10 +187,12 @@ def v2_drain_holds_running_until_its_deadline(test: smoke.CommandSandboxFixture)
             )
 
         with test.phase("a wake lands each held sandbox on the other worker, its file intact"):
-            for sandbox in (busy, idle):
+            def wake(sandbox: DurableLifecycleSandbox) -> None:
                 drain.expect_suspended_unplaced(sandbox.sandbox_id)
                 drain.wake_elsewhere(sandbox)
                 drain.expect_file(sandbox, PATH)
+
+            in_parallel([lambda sandbox=sandbox: wake(sandbox) for sandbox in (busy, idle)])
             test.sandbox.wake()
 
         with test.phase("undrain: the drain is cancelled on the node"):

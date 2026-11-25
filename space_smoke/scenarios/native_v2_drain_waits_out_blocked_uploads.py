@@ -5,6 +5,9 @@ import time
 import space_smoke as smoke
 from space_smoke.drain_v2 import PENDING_SINCE_FIELD, UPLOAD_RETRY_SECONDS, timestamp_seconds
 
+# The stall bound this run scopes to the controller, in whole seconds.
+STALL_BOUND_SECONDS = 30
+
 
 # A failed action staying pending and tried again, and the stall rule, are
 # crate tests (`service/drain_node/tests.rs`; `node_drain/v2/tests.rs`: past
@@ -12,8 +15,12 @@ from space_smoke.drain_v2 import PENDING_SINCE_FIELD, UPLOAD_RETRY_SECONDS, time
 # is stalled). This is the object store unreachable from the drained worker
 # alone: the node reports the resident still pending and no sandbox
 # blocked, the controller marks the drain stalled the stall bound past its
-# deadline (Kind's values shorten the bound; `require_drain_v2` reads it),
-# the drain holds, and once the path is back the same drain finishes. A
+# deadline, the drain holds, and once the path is back the same drain
+# finishes. The run scopes a 30 s bound to itself (`STALL_BOUND_SECONDS`): six
+# controller ticks with nothing evacuated, and short enough that the path is
+# back before the upload's 120 s retry, not after its 300 s one. Kind's
+# standing 180 s stays for the rest of the suite, whose "never stalled" checks
+# depend on it. A
 # pending entry's reason is display text, so the run doesn't read the
 # failure in it. The path is cut with a TCP reset, so each upload attempt
 # fails at once rather than at a timeout.
@@ -38,7 +45,7 @@ def v2_drain_waits_out_blocked_uploads(test: smoke.CommandSandboxFixture) -> Non
 
     drain = test.drain_v2
 
-    with drain.v2_controller():
+    with drain.v2_controller(stall_bound=STALL_BOUND_SECONDS):
         with test.phase("pin a started resident to one worker"):
             sandboxes, lifecycles, digests = drain.pin_residents({"started": 1})
             ids = {drain.bare_id(sandbox_id) for sandbox_id in lifecycles}
@@ -69,7 +76,7 @@ def v2_drain_waits_out_blocked_uploads(test: smoke.CommandSandboxFixture) -> Non
             )
 
         with test.phase("past the deadline with nothing evacuated for the stall bound: the drain is stalled"):
-            remaining = drain.deadline + drain.gate.stall_bound_seconds - time.time()
+            remaining = drain.deadline + drain.stall_bound_seconds - time.time()
             drain.wait_for_stall(timeout=max(remaining, 0) + 60)
             report = drain.report()
             test.record("stalled_report", report)

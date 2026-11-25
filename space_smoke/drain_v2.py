@@ -43,7 +43,9 @@ drain: each batch of runs checks the switches once (`require_drain_v2`). A
 run whose drain needs EC2's answers, a terminate or a let-go, scopes the
 `aws` terminator to itself (`v2_controller(aws=True)`), under the
 controller-mutation Lease, with the gone-node loops a let-go node is handed
-to when the run asks for them; Kind's other drains run `kube-delete`. The
+to when the run asks for them; Kind's other drains run `kube-delete`. A
+run that waits a stall out scopes a shorter stall bound to itself the same
+way (`v2_controller(stall_bound=...)`). The
 evacuation cap is the API's, read where `:drain` is served, so a run that
 needs it scopes it to the public API Deployment (`evacuation_cap`), under
 the public-API mutation Lease.
@@ -127,15 +129,6 @@ ORPHANED_NODES_ENABLED_ENV = "SPACE_ORPHANED_NODES_ENABLED"
 ORPHANED_SANDBOXES_ENABLED_ENV = "SPACE_ORPHANED_SANDBOX_RECONCILER_ENABLED"
 ORPHANED_SANDBOXES_DRY_RUN_ENV = "SPACE_API_RECONCILER_DRY_RUN"
 
-# The only controller env a drain v2 scenario may touch, and the closed
-# vocabulary its overrides come from.
-DRAIN_V2_ENV_KEYS: tuple[str, ...] = (
-    TERMINATOR_KIND_ENV,
-    LOST_STARTED_ENABLED_ENV,
-    ORPHANED_NODES_ENABLED_ENV,
-    ORPHANED_SANDBOXES_ENABLED_ENV,
-    ORPHANED_SANDBOXES_DRY_RUN_ENV,
-)
 # The only public API env a drain v2 scenario may touch: the API counts the
 # evacuating drains when it answers `:drain`.
 DRAIN_V2_API_ENV_KEYS: tuple[str, ...] = (DRAIN_V2_MAX_EVACUATING_ENV,)
@@ -150,6 +143,8 @@ LEGACY_LOOPS_ENV = {
 _TERMINATOR_VALUES = frozenset({"aws", "kube-delete"})
 _FLAG_VALUES = frozenset({"true", "false"})
 _COUNT_VALUE = re.compile(r"[1-9][0-9]{0,2}")
+# A scoped stall bound, in whole seconds: at least 10.
+_STALL_BOUND_VALUE = re.compile(r"[1-9][0-9]{1,2}")
 
 # The controller config a run whose drain needs EC2's answers scopes to
 # itself: the `aws` terminator, which alone gives the v2 loop EC2 and Auto
@@ -169,6 +164,17 @@ DRAIN_V2_HOOK_KEYS: tuple[str, ...] = (
     DISPATCH_BACKOFF_BASE_HOOK,
 )
 RELEASE_STALL_BOUND_SECONDS = 15 * 60
+# The only controller env a drain v2 scenario may touch, and the closed
+# vocabulary its overrides come from.
+DRAIN_V2_ENV_KEYS: tuple[str, ...] = (
+    TERMINATOR_KIND_ENV,
+    LOST_STARTED_ENABLED_ENV,
+    ORPHANED_NODES_ENABLED_ENV,
+    ORPHANED_SANDBOXES_ENABLED_ENV,
+    ORPHANED_SANDBOXES_DRY_RUN_ENV,
+    # A run that waits a stall out shortens it for itself (`v2_controller`).
+    STALL_BOUND_HOOK,
+)
 RELEASE_DISPATCH_BACKOFF_BASE_SECONDS = 10
 # The controller's cap on a fenced node's EC2 check backoff.
 DISPATCH_BACKOFF_CAP_SECONDS = 120
@@ -409,6 +415,8 @@ def validate_drain_v2_overrides(overrides: Mapping[str, str]) -> None:
     for key, value in overrides.items():
         if key == TERMINATOR_KIND_ENV:
             allowed = value in _TERMINATOR_VALUES
+        elif key == STALL_BOUND_HOOK:
+            allowed = _STALL_BOUND_VALUE.fullmatch(value) is not None
         else:
             allowed = value in _FLAG_VALUES
         if not allowed:
@@ -712,6 +720,8 @@ class DrainV2Assertions:
         self._controller_lease = False
         # Each resident a report this run read named evacuated, with its kind.
         self._reported_kinds: dict[str, str] = {}
+        # The stall bound `v2_controller` scoped to this run, if any.
+        self._stall_bound: int | None = None
 
     @staticmethod
     def bare_id(sandbox_id: str) -> str:
@@ -740,6 +750,13 @@ class DrainV2Assertions:
         """The batch's drain v2 gate (`require_drain_v2`)."""
 
         return require_drain_v2(self._fixture, self._control)
+
+    @property
+    def stall_bound_seconds(self) -> int:
+        """The controller's stall bound for this run: the one `v2_controller`
+        scoped to it, else the batch's."""
+
+        return self._stall_bound if self._stall_bound is not None else self.gate.stall_bound_seconds
 
     @property
     def deadline(self) -> int:
@@ -873,24 +890,35 @@ class DrainV2Assertions:
         return instance
 
     @contextmanager
-    def v2_controller(self, *, aws: bool = False, legacy_loops: bool = False) -> Iterator[None]:
+    def v2_controller(
+        self, *, aws: bool = False, legacy_loops: bool = False, stall_bound: int | None = None
+    ) -> Iterator[None]:
         """Run the body on a bench whose values switched drain v2 on, checked
         once per batch. With `aws`, the controller's `aws` terminator, against
         Kind's fake EC2, for a drain that terminates its node or lets it go;
         with `legacy_loops` too, the gone-node loops a let-go node is handed
-        to run and write. Only those change the controller, under its
+        to run and write. With `stall_bound`, the stall bound for this run, in
+        whole seconds, where Kind's values render the bound's test hook (a
+        release build reads none, and keeps its own); `stall_bound_seconds`
+        says which holds. Only those change the controller, under its
         mutation Lease; the standing config goes back when the body ends, and
         is checked to be back."""
 
         self._fixture.record("drain_v2_gate", self.gate.__dict__)
-        if not aws:
-            if legacy_loops:
-                raise ValueError("the gone-node loops take a let-go node: they need aws=True")
-            yield
-            return
-        env = dict(AWS_TERMINATOR_ENV)
+        if legacy_loops and not aws:
+            raise ValueError("the gone-node loops take a let-go node: they need aws=True")
+        env: dict[str, str] = {}
+        if aws:
+            env.update(AWS_TERMINATOR_ENV)
         if legacy_loops:
             env.update(LEGACY_LOOPS_ENV)
+        if stall_bound is not None and self.gate.stall_bound_seconds != RELEASE_STALL_BOUND_SECONDS:
+            env[STALL_BOUND_HOOK] = str(stall_bound)
+            self._stall_bound = stall_bound
+        self._fixture.record("stall_bound_seconds", self.stall_bound_seconds)
+        if not env:
+            yield
+            return
         if self._controller_lease:
             raise RuntimeError("the run already holds the controller-mutation lease")
         with scoped_drain_v2_env(self._fixture, self._control, self._scope) as set_env:
@@ -1622,7 +1650,7 @@ class DrainV2Assertions:
         measured from, the view's `evacuated_grew_at`. Returns the error, the
         stamp and the bound."""
 
-        bound = self.gate.stall_bound_seconds
+        bound = self.stall_bound_seconds
         deadline = time.monotonic() + timeout
         while True:
             error = self.last_error() or ""
