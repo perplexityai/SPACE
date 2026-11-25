@@ -247,6 +247,10 @@ newer copy, so the reconciler leaves the sandbox to that node in two ways.
 The listing's skip has no metric of its own: such a sandbox is one the node
 reports while the control plane has no pod for it.
 
+## A v2 node drain that waits
+
+**An orphaned seal.** A node can stay sealed with no v2 drain recorded, for instance after its row lost the drain while the node was unreachable. Nothing heals it on its own, and every activation on the node keeps being refused. With `SPACE_DRAIN_V2_ENABLED` on, `:drain {engine: v2, hold_seconds: ...}` then `:undrain` heals it: the drain takes a new, later generation and the undrain's cancel unseals the node. With it off, or instead, send the node `DrainNode{generation, Cancel}` through its node-api with the generation it is sealed under, which its refusals name.
+
 ## Timeouts mean different things
 
 A client deadline limits how long the client waits; it does not cancel a lifecycle operation or establish that a process stopped. Inspect the resource before retrying or issuing another command.

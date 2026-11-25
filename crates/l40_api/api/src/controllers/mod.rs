@@ -629,6 +629,16 @@ pub(crate) fn pool_store_error(
     substrate::pool_error(message, error).into()
 }
 
+/// The process switch that lets the admin API's `:drain` start a v2 node
+/// drain, which the cluster controller also checks at startup. The drain
+/// gates don't read it: they follow the drain a node records.
+pub struct DrainV2Switch;
+
+impl DrainV2Switch {
+    /// The environment variable that turns the switch on.
+    pub const ENV: &'static str = "SPACE_DRAIN_V2_ENABLED";
+}
+
 impl From<tonic::Status> for ControllerError {
     fn from(status: tonic::Status) -> Self {
         use pplx_space_native_files::FileCallFailure as _;
