@@ -4,10 +4,7 @@ use pplx_space_build_mgr::{SystemPublicationGrantId, TemplateOrg, TenantPublicat
 use pplx_space_build_mgr_client::proto::BuildState;
 use pplx_space_build_mgr_store::database::{self, ConnectionGuard, SharedConnection};
 use pplx_space_build_mgr_store::jobs::{Job, JobError};
-pub use pplx_space_build_mgr_store::{
-    BUILD_JOB_KIND, BuildJobResult, BuildTerminalState, ParseBuildTerminalStateError,
-    count_other_active_builds_for_subject, fail_expired_running_builds, get_build_result,
-};
+use pplx_space_build_mgr_store::{BUILD_JOB_KIND, BuildJobResult, BuildTerminalState};
 use serde::{Deserialize, Serialize};
 
 // The job kind remains stable for queue accounting and scheduling. Nest the
