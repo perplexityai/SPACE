@@ -62,7 +62,7 @@
 //!    and warm each release bound to it (a twin, or the release itself) in
 //!    that environment's cache partition. Its tag pins are written under that
 //!    partition, its release pins join the keep set, and its pulls join the
-//!    same drain under the same visibility gate. See [`environments`].
+//!    same drain under the same visibility gate. See `environments`.
 //!
 //! ## Why both passes
 //!
@@ -88,7 +88,7 @@
 //!   tuple of the template leaves the prune keep-set; the template's
 //!   release pins prune to empty), which makes any residue *eligible*
 //!   for LRU eviction. Note the weaker verb: unpinning does not
-//!   evict. [`crate::eviction`] is enabled by default (100 GiB budget) —
+//!   evict. `crate::eviction` is enabled by default (100 GiB budget) —
 //!   and being enabled, it only reclaims once the node is *over budget*,
 //!   and never within the grace period (1800 s default). So the residue
 //!   becomes evictable, on the GC's schedule rather than this tick's.
@@ -214,7 +214,7 @@
 //! `Generic` too whenever it beats the flip or hits a stale replica —
 //! which puts a private rootfs on a shared node, with only the
 //! (budget- and grace-gated) evictor to clean it up. Once
-//! [`dispatch_pull`] spawns, nothing recalls the task: the verdict has
+//! `dispatch_pull` spawns, nothing recalls the task: the verdict has
 //! to land while the pull is still a queued decision.
 //!
 //! ### No switch opens the gate

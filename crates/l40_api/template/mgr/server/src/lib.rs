@@ -5,7 +5,7 @@ pub mod btrfs_via_nodemgr;
 mod content_hash;
 mod file_reader;
 pub use content_hash::TemplateHashConfigError;
-pub mod db;
+pub(crate) mod db;
 pub(crate) mod eviction;
 pub mod metrics;
 mod node_environments;

@@ -70,7 +70,9 @@ pub struct BuildRow {
     pub arch: String,
     pub artifact_size_bytes: u64,
     pub state: String,
+    #[cfg(test)]
     pub owner_type: String,
+    #[cfg(test)]
     pub owner_id: String,
     pub execution_metadata_json: Option<String>,
 }
@@ -134,7 +136,9 @@ impl From<TemplateBuildRow> for BuildRow {
             arch: row.arch,
             artifact_size_bytes: row.artifact_size_bytes,
             state: row.state,
+            #[cfg(test)]
             owner_type: row.owner_type,
+            #[cfg(test)]
             owner_id: row.owner_id,
             execution_metadata_json: row.execution_metadata_json,
         }
