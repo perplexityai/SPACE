@@ -788,7 +788,7 @@ class PreviewContentionTests(unittest.TestCase):
         with (
             mock.patch.object(KindHarness, "_require_isolated_kind"),
             mock.patch.object(KindHarness, "_admin_token", return_value="token"),
-            mock.patch("space_smoke.adapters.urlopen", side_effect=list(answers)),
+            mock.patch("space_smoke.adapters._URL_OPEN", side_effect=list(answers)),
             mock.patch("space_smoke.adapters.time.sleep", side_effect=slept.append),
         ):
             return harness.drain_v2_preview(NODE_ID), slept

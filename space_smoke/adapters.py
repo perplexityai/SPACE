@@ -143,6 +143,7 @@ from space_smoke.execution_environment import (
     WORKER_ROLE,
 )
 from space_smoke.leader_election import RECONCILER_TICK_ENV
+from space_smoke.native import _URL_OPEN
 from space_smoke.reconcile_queue_gc import (
     GC_ENV_KEYS as RECONCILE_QUEUE_GC_ENV_KEYS,
     validate_marker,
@@ -5469,7 +5470,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             method="POST",
         )
         try:
-            with urlopen(request, timeout=15) as response:
+            with _URL_OPEN(request, timeout=15) as response:
                 token = json.load(response).get("token")
         except (HTTPError, URLError, OSError, ValueError):
             raise SmokeConfigurationError("kind admin login failed") from None
@@ -5477,13 +5478,27 @@ ON CONFLICT (key_hash) DO NOTHING;
             raise SmokeConfigurationError("kind admin login returned no token")
         return token
 
-    def _admin(
-        self, method: str, resource: str, *, expect: Collection[int], body: Any = None
-    ) -> Any:
-        self._require_isolated_kind("admin node operations")
+    def _admin_request(
+        self,
+        method: str,
+        resource: str,
+        *,
+        body: Any = None,
+        idempotency_key: str | None = None,
+        timeout: float = 20,
+    ) -> tuple[int, Any, bytes]:
+        """`method /admin/api/v1/<resource>` on the isolated Kind API: its
+        status, headers and body, whatever the status. The opener bypasses
+        proxies and refuses redirects, so the admin bearer goes only to the
+        loopback API; a redirect is answered as its 3xx. A failed transport
+        raises."""
+
+        self._require_isolated_kind("admin API calls")
         headers = {"Authorization": "Bearer " + self._admin_token()}
         if body is not None:
             headers["Content-Type"] = "application/json"
+        if idempotency_key is not None:
+            headers["Idempotency-Key"] = idempotency_key
         request = Request(
             self.config.api_url.rstrip("/") + "/admin/api/v1/" + resource,
             method=method,
@@ -5491,14 +5506,37 @@ ON CONFLICT (key_hash) DO NOTHING;
             data=None if body is None else json.dumps(body).encode(),
         )
         try:
-            with urlopen(request, timeout=20) as response:
-                if response.status not in expect:
-                    raise RuntimeError(f"admin {method} {resource} returned HTTP {response.status}")
-                raw = response.read()
+            with _URL_OPEN(request, timeout=timeout) as response:
+                return int(response.status), response.headers, response.read()
         except HTTPError as error:
-            raise RuntimeError(f"admin {method} {resource} returned HTTP {error.code}") from None
+            with error:
+                return int(error.code), error.headers, error.read()
         except (URLError, OSError):
             raise RuntimeError(f"admin {method} {resource} failed") from None
+
+    def _admin_answer(
+        self,
+        method: str,
+        resource: str,
+        *,
+        body: Any = None,
+        idempotency_key: str | None = None,
+        timeout: float = 20,
+    ) -> CallAnswer:
+        """An admin call answered as it came, for a caller that judges it."""
+
+        return _call_answer(
+            *self._admin_request(
+                method, resource, body=body, idempotency_key=idempotency_key, timeout=timeout
+            )
+        )
+
+    def _admin(
+        self, method: str, resource: str, *, expect: Collection[int], body: Any = None
+    ) -> Any:
+        status, _, raw = self._admin_request(method, resource, body=body)
+        if status not in expect:
+            raise RuntimeError(f"admin {method} {resource} returned HTTP {status}")
         return json.loads(raw) if raw else None
 
     def admin_nodes(self) -> list[AdminNodeView]:
@@ -5555,43 +5593,20 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
 
     def drain_node_answer(self, node_id: str, body: Mapping[str, object]) -> CallAnswer:
-        self._require_isolated_kind("admin node operations")
-        request = Request(
-            self.config.api_url.rstrip("/")
-            + f"/admin/api/v1/nodes/{quote(_sql_uuid(node_id), safe='')}:drain",
-            method="POST",
-            headers={
-                "Authorization": "Bearer " + self._admin_token(),
-                "Content-Type": "application/json",
-            },
-            data=json.dumps(dict(body)).encode(),
+        return self._admin_answer(
+            "POST", f"nodes/{quote(_sql_uuid(node_id), safe='')}:drain", body=dict(body)
         )
-        try:
-            with urlopen(request, timeout=20) as response:
-                return _call_answer(int(response.status), response.headers, response.read())
-        except HTTPError as error:
-            return _call_answer(int(error.code), error.headers, error.read())
 
     _ADMIN_SANDBOX_ACTIONS = frozenset({"stop", "kill"})
 
     def admin_sandbox_action_answer(self, sandbox_id: str, action: str) -> CallAnswer:
         if action not in self._ADMIN_SANDBOX_ACTIONS:
             raise ValueError(f"unsupported admin sandbox action {action!r}")
-        self._require_isolated_kind("admin sandbox actions")
-        request = Request(
-            self.config.api_url.rstrip("/")
-            + f"/admin/api/v1/sandboxes/sbx_{_sql_uuid(sandbox_id.removeprefix('sbx_'))}:force-{action}",
-            method="POST",
-            headers={
-                "Authorization": "Bearer " + self._admin_token(),
-                "Idempotency-Key": f"space-smoke-force-{action}-{secrets.token_hex(8)}",
-            },
+        return self._admin_answer(
+            "POST",
+            f"sandboxes/sbx_{_sql_uuid(sandbox_id.removeprefix('sbx_'))}:force-{action}",
+            idempotency_key=f"space-smoke-force-{action}-{secrets.token_hex(8)}",
         )
-        try:
-            with urlopen(request, timeout=20) as response:
-                return _call_answer(int(response.status), response.headers, response.read())
-        except HTTPError as error:
-            return _call_answer(int(error.code), error.headers, error.read())
 
     def admin_operation(self, operation_id: str) -> dict[str, Any]:
         payload = self._admin("GET", f"operations/{quote(operation_id, safe='')}", expect=(200,))
@@ -5629,49 +5644,33 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
 
     def terminate_node(self, node_id: str) -> int:
-        self._require_isolated_kind("admin node operations")
-        request = Request(
-            self.config.api_url.rstrip("/")
-            + f"/admin/api/v1/nodes/{quote(_sql_uuid(node_id), safe='')}:terminate",
-            method="POST",
-            headers={"Authorization": "Bearer " + self._admin_token()},
-        )
-        try:
-            with urlopen(request, timeout=20) as response:
-                return int(response.status)
-        except HTTPError as error:
-            return int(error.code)
+        return self._admin_answer(
+            "POST", f"nodes/{quote(_sql_uuid(node_id), safe='')}:terminate"
+        ).status
 
     def drain_v2_preview(self, node_id: str) -> dict[str, Any]:
-        self._require_isolated_kind("admin node operations")
-        request = Request(
-            self.config.api_url.rstrip("/")
-            + f"/admin/api/v1/nodes/{quote(_sql_uuid(node_id), safe='')}/drain-v2-preview",
-            method="GET",
-            headers={"Authorization": "Bearer " + self._admin_token()},
-        )
+        resource = f"nodes/{quote(_sql_uuid(node_id), safe='')}/drain-v2-preview"
         # The API bounds a preview at 60 s once it has authorized the caller,
         # its reads and the node call together; wait longer, so its own
         # answer arrives first. A node busy with another drain call is
         # contention, not an answer: ask again after its `Retry-After`.
         give_up_at = time.monotonic() + PREVIEW_BUSY_RETRY_SECONDS
         while True:
-            try:
-                with urlopen(request, timeout=75) as response:
-                    body = json.loads(response.read() or b"null")
-                break
-            except HTTPError as error:
-                detail = error.read()[:2000].decode(errors="replace")
-                retry_after = _preview_busy_retry_after(error.code, error.headers, detail)
-                if retry_after is not None and time.monotonic() + retry_after < give_up_at:
-                    time.sleep(retry_after)
-                    continue
-                raise RuntimeError(f"admin drain preview returned HTTP {error.code}: {detail}") from None
-            except (URLError, OSError):
-                raise RuntimeError("admin drain preview failed") from None
-        if not isinstance(body, dict):
-            raise RuntimeError("the admin drain preview was not an object")
-        return body
+            status, headers, raw = self._admin_request("GET", resource, timeout=75)
+            if status < 300:
+                try:
+                    body = json.loads(raw or b"null")
+                except ValueError:
+                    body = None
+                if not isinstance(body, dict):
+                    raise RuntimeError("the admin drain preview was not an object")
+                return body
+            detail = raw[:2000].decode(errors="replace")
+            retry_after = _preview_busy_retry_after(status, headers, detail)
+            if retry_after is not None and time.monotonic() + retry_after < give_up_at:
+                time.sleep(retry_after)
+                continue
+            raise RuntimeError(f"admin drain preview returned HTTP {status}: {detail}")
 
     def plant_orphan_cache_dir(self, node_name: str, sandbox_id: str) -> str:
         path = f"{SANDBOX_CACHE_ROOT}/{uuid.UUID(sandbox_id)}"
