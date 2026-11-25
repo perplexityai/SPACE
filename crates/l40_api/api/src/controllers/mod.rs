@@ -631,8 +631,10 @@ pub(crate) fn pool_store_error(
 }
 
 /// The process switch that lets the admin API's `:drain` start a v2 node
-/// drain, which the cluster controller also checks at startup. The drain
-/// gates don't read it: they follow the drain a node records.
+/// drain, which the cluster controller also reads at startup: with it on,
+/// the controller starts none of v1's drain writers (its node-drain loop and
+/// the drained-node terminator). The drain gates don't read it: they follow
+/// the drain a node records.
 pub struct DrainV2Switch;
 
 impl DrainV2Switch {

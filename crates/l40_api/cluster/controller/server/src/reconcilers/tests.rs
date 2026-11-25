@@ -1,6 +1,6 @@
 use super::{
-    ReconcilerRuntimeError, Supervision, TerminatorBackend, TerminatorKind, build_if_enabled,
-    ensure_drain_v2_has_its_loop, supervise_reconcilers,
+    DrainWriters, ReconcilerRuntimeError, Supervision, TerminatorBackend, TerminatorKind,
+    build_if_enabled, ensure_drain_v2_has_its_loop, supervise_reconcilers,
 };
 use std::future::Future;
 use tokio::task::JoinError;
@@ -153,6 +153,30 @@ fn the_drain_v2_runs_only_with_the_node_drain() {
                 "{case}"
             );
         }
+    }
+}
+
+/// The drain v2 switch picks the drain writers: v1's, its node-drain loop
+/// and the drained-node terminator, only with it off; on, the v2 loop alone.
+#[test]
+fn drain_writers_follow_the_drain_v2_switch() {
+    let mut env = pplx_space_test_env::TestEnv::default();
+    for (flag, runs_v1) in [
+        (None, true),
+        (Some("false"), true),
+        (Some("0"), true),
+        (Some("true"), false),
+        (Some("1"), false),
+    ] {
+        match flag {
+            Some(flag) => env.set(pplx_space_api::controllers::DrainV2Switch::ENV, flag),
+            None => env.remove(pplx_space_api::controllers::DrainV2Switch::ENV),
+        }
+        assert_eq!(
+            DrainWriters::from_environment(&env).runs_v1(),
+            runs_v1,
+            "{flag:?}"
+        );
     }
 }
 
