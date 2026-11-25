@@ -46,17 +46,16 @@ pub(in crate::service) fn drain_node_window_from_env() -> usize {
 }
 
 /// The window `raw`, [`DRAIN_NODE_WINDOW_ENV`]'s value, sets: a number
-/// above [`MAX_DRAIN_NODE_WINDOW`] is lowered to it.
+/// above [`MAX_DRAIN_NODE_WINDOW`], however large, is lowered to it.
 pub(super) fn drain_node_window(raw: Option<&str>) -> usize {
     let Some(raw) = raw else {
         return DEFAULT_DRAIN_NODE_WINDOW;
     };
-    match raw
-        .trim()
-        .parse::<usize>()
-        .ok()
-        .filter(|window| *window > 0)
-    {
+    let parsed = match raw.trim().parse::<usize>() {
+        Err(error) if *error.kind() == std::num::IntErrorKind::PosOverflow => Some(usize::MAX),
+        parsed => parsed.ok().filter(|window| *window > 0),
+    };
+    match parsed {
         Some(window) if window > MAX_DRAIN_NODE_WINDOW => {
             tracing::warn!(
                 var = DRAIN_NODE_WINDOW_ENV,

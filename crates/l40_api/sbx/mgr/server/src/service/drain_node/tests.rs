@@ -3384,6 +3384,7 @@ fn the_drain_window_reads_a_positive_number_or_the_default() {
         (Some(" 12 "), 12),
         (Some("13"), MAX_DRAIN_NODE_WINDOW),
         (Some("1000"), MAX_DRAIN_NODE_WINDOW),
+        (Some("99999999999999999999999"), MAX_DRAIN_NODE_WINDOW),
         (Some("0"), DEFAULT_DRAIN_NODE_WINDOW),
         (Some("-1"), DEFAULT_DRAIN_NODE_WINDOW),
         (Some("eight"), DEFAULT_DRAIN_NODE_WINDOW),
