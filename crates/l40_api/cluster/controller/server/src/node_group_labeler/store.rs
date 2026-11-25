@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use pplx_space_node_model::NodeGroupId;
 use pplx_space_node_model::NodeGroupName;
-use pplx_space_sql_locator::sql;
+use pplx_space_postgres_pool::TxSettings as _;
 use sqlx::PgPool;
 
 use super::{DefaultNodeGroup, EnsureDefaultGroupError, EnsuredDefaultGroup, NodeGroupSink};
@@ -165,15 +165,9 @@ impl NodeGroupSink for NodeGroupDbStore {
         // invisible to a plain SELECT, because ACCESS SHARE conflicts only with
         // ACCESS EXCLUSIVE — Postgres admits a lock request that doesn't
         // conflict with the wait queue's mask. The bound is for this tick alone.
-        //
-        // `set_config(..., is_local => true)` rather than `SET LOCAL` because
-        // `SET` takes no bind parameter. It is the same statement in function
-        // form: transaction-local scope, the same value, and a wait past it
-        // still fails with `55P03`.
-        sqlx::query(sql!("SELECT set_config('lock_timeout', $1, TRUE)"))
-            .bind(format!("{}ms", self.seed_lock_timeout.as_millis()))
-            .execute(&mut *tx)
-            .await?;
+        tx.set_local_lock_timeout(self.seed_lock_timeout)
+            .await
+            .map_err(sqlx::Error::from)?;
         pplx_space_node_group_store::locks::lock_node_groups_share_row_exclusive(&mut tx).await?;
 
         // Both facts are re-read under the lock: another replica may have

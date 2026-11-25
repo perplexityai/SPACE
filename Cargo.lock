@@ -7892,6 +7892,7 @@ dependencies = [
  "pplx-space-content-digest",
  "pplx-space-db-test-fixtures",
  "pplx-space-execution-spec",
+ "pplx-space-postgres-pool",
  "pplx-space-sql-locator",
  "pplx-space-test-env",
  "serde_json",

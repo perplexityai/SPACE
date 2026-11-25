@@ -19,6 +19,7 @@ use std::collections::BTreeSet;
 use pplx_space_accounts::NodeId;
 use pplx_space_content_digest::DigestParseError;
 use pplx_space_execution_spec::EnvironmentReference;
+use pplx_space_postgres_pool::{Db, Executor as _};
 use pplx_space_sql_locator::sql;
 
 mod certifications;
@@ -82,21 +83,19 @@ pub async fn list_unretired_for_node(
     pool: &sqlx::PgPool,
     node_id: NodeId,
 ) -> Result<Vec<EnvironmentReference>, ListUnretiredError> {
-    let mut tx = pool.begin().await?;
-    sqlx::query(sql!(
-        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
-    ))
-    .execute(&mut *tx)
-    .await?;
+    let mut tx = Db::from(pool.clone())
+        .begin_snapshot()
+        .await
+        .map_err(sqlx::Error::from)?;
     let known = sqlx::query_scalar::<_, Option<Vec<String>>>(sql!(
         "SELECT known_environment_refs FROM node_status_snapshots WHERE node_id = $1"
     ))
     .bind(node_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional((&mut tx).into_sqlx())
     .await?
     .flatten();
-    let recipe = list_unretired_within(&mut *tx, known.as_deref()).await?;
-    tx.commit().await?;
+    let recipe = list_unretired_within((&mut tx).into_sqlx(), known.as_deref()).await?;
+    tx.commit().await.map_err(sqlx::Error::from)?;
     Ok(recipe)
 }
 
