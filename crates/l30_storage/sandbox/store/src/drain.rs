@@ -839,13 +839,16 @@ pub async fn mark_sandbox_lost_on_gone_node(
 /// same row id) — its registration bumps `node_k8s.k8s_node_uid` and the
 /// inventory reflector resets `drain_phase`, and either change must refuse the
 /// give-up so the replacement's freshly suspended sandboxes (and its live
-/// in-flight uploads) can't be mutated under the dead node's verdict.
+/// in-flight uploads) can't be mutated under the dead node's verdict. The
+/// phase is v1's (`drain_engine IS NULL`): a v2 drain's node, or one under an
+/// engine this build doesn't know, is never v1's to give up on.
 pub fn gone_node_identity_guards(node_param: &str, uid_param: &str) -> String {
     format!(
         "AND EXISTS (
                 SELECT 1 FROM nodes
                  WHERE id = {node_param}
                    AND drain_phase = 'draining'
+                   AND drain_engine IS NULL
             )
             AND EXISTS (
                 SELECT 1 FROM node_k8s
