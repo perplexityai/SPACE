@@ -134,6 +134,73 @@ pub struct WarmPoolStore {
     pool: PgPool,
 }
 
+/// [`WarmPoolStore::retained_policy_release_rows`]'s statement. Binds `$1` and
+/// `$2` (the disk I/O defaults) and `$3` (the initial environment).
+pub(crate) static RETAINED_POLICY_RELEASES: LazyLock<String> = LazyLock::new(|| {
+    sql!(format!(
+        "SELECT
+         COALESCE(twin.id, retained.id) AS template_release_id,
+         p.template_name,
+         retained.hash AS content_hash,
+         p.vcpu,
+         p.memory_mib,
+         p.disk_mib,
+         COALESCE(p.disk_io_max_operations_per_sec, $1)
+             AS disk_io_max_operations_per_sec,
+         COALESCE(p.disk_io_max_bandwidth_mib_per_sec, $2)
+             AS disk_io_max_bandwidth_mib_per_sec,
+         p.min_ready_slots,
+         p.max_ready_slots,
+         p.refill_per_tick,
+         p.max_warming_slots,
+         p.retain_releases,
+         TRUE AS retained
+     FROM warm_pool_policies p
+     JOIN LATERAL (
+         SELECT release.id,
+              release.hash,
+              COALESCE(
+                  (
+                      SELECT MAX(published.modified_at)
+                      FROM template_release_tags published
+                      JOIN template_releases tagged
+                        ON tagged.id = published.template_release_id
+                      -- Tags on either spelling of the digest: one written
+                      -- before the shared rule can sit on the other spelling.
+                      WHERE tagged.template_name = release.template_name
+                        AND tagged.hash IN (replace(release.hash, 'sha256:', ''),
+                                            'sha256:' || replace(release.hash, 'sha256:', ''))
+                  ),
+                  release.created_at
+              ) AS published_at
+          FROM template_releases release
+          WHERE release.template_name = p.template_name
+            AND release.type = p.runtime
+            -- Digest originals only: a twin of a retained release,
+            -- bound to another environment, or the other spelling's
+            -- original of its digest would use up a retain slot and
+            -- warm slots no create claims.
+            AND {digest_original}
+          ORDER BY published_at DESC, release.id DESC
+          LIMIT p.retain_releases
+     ) retained ON TRUE
+     -- Creates of a retained release run the release its build
+     -- resolves to, so that release's pools are the ones claimed.
+     LEFT JOIN LATERAL (
+         SELECT CASE WHEN $3::TEXT IS NULL THEN NULL ELSE {resolved} END AS id
+     ) twin ON TRUE
+     WHERE p.enabled
+     ORDER BY p.template_name, p.vcpu, p.memory_mib,
+              retained.published_at DESC, retained.id DESC",
+        digest_original = digest_original("release"),
+        resolved = pplx_space_template_release_store::resolved_release_sql(
+            "p.template_name",
+            "retained.hash",
+            "$3",
+        ),
+    ))
+});
+
 impl WarmPoolStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -819,83 +886,21 @@ impl WarmPoolStore {
         &self,
         initial_environment: Option<&str>,
     ) -> Result<Vec<PoolPolicyReleaseRow>> {
-        static STATEMENT: LazyLock<String> = LazyLock::new(|| {
-            sql!(format!(
-                "SELECT
-                 COALESCE(twin.id, retained.id) AS template_release_id,
-                 p.template_name,
-                 retained.hash AS content_hash,
-                 p.vcpu,
-                 p.memory_mib,
-                 p.disk_mib,
-                 COALESCE(p.disk_io_max_operations_per_sec, $1)
-                     AS disk_io_max_operations_per_sec,
-                 COALESCE(p.disk_io_max_bandwidth_mib_per_sec, $2)
-                     AS disk_io_max_bandwidth_mib_per_sec,
-                 p.min_ready_slots,
-                 p.max_ready_slots,
-                 p.refill_per_tick,
-                 p.max_warming_slots,
-                 p.retain_releases,
-                 TRUE AS retained
-             FROM warm_pool_policies p
-             JOIN LATERAL (
-                 SELECT release.id,
-                      release.hash,
-                      COALESCE(
-                          (
-                              SELECT MAX(published.modified_at)
-                              FROM template_release_tags published
-                              JOIN template_releases tagged
-                                ON tagged.id = published.template_release_id
-                              -- Tags on either spelling of the digest: one written
-                              -- before the shared rule can sit on the other spelling.
-                              WHERE tagged.template_name = release.template_name
-                                AND replace(tagged.hash, 'sha256:', '')
-                                  = replace(release.hash, 'sha256:', '')
-                          ),
-                          release.created_at
-                      ) AS published_at
-                  FROM template_releases release
-                  WHERE release.template_name = p.template_name
-                    AND release.type = p.runtime
-                    -- Digest originals only: a twin of a retained release,
-                    -- bound to another environment, or the other spelling's
-                    -- original of its digest would use up a retain slot and
-                    -- warm slots no create claims.
-                    AND {digest_original}
-                  ORDER BY published_at DESC, release.id DESC
-                  LIMIT p.retain_releases
-             ) retained ON TRUE
-             -- Creates of a retained release run the release its build
-             -- resolves to, so that release's pools are the ones claimed.
-             LEFT JOIN LATERAL (
-                 SELECT CASE WHEN $3::TEXT IS NULL THEN NULL ELSE {resolved} END AS id
-             ) twin ON TRUE
-             WHERE p.enabled
-             ORDER BY p.template_name, p.vcpu, p.memory_mib,
-                      retained.published_at DESC, retained.id DESC",
-                digest_original = digest_original("release"),
-                resolved = pplx_space_template_release_store::resolved_release_sql(
-                    "p.template_name",
-                    "retained.hash",
-                    "$3",
-                ),
-            ))
-        });
         Ok(
-            sqlx::query_as::<_, PoolPolicyReleaseRow>(sqlx::AssertSqlSafe(STATEMENT.as_str()))
-                .bind(
-                    i64::try_from(DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC)
-                        .expect("disk I/O default fits in PostgreSQL BIGINT"),
-                )
-                .bind(
-                    i64::try_from(DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC)
-                        .expect("disk I/O default fits in PostgreSQL BIGINT"),
-                )
-                .bind(initial_environment)
-                .fetch_all(&self.pool)
-                .await?,
+            sqlx::query_as::<_, PoolPolicyReleaseRow>(sqlx::AssertSqlSafe(
+                RETAINED_POLICY_RELEASES.as_str(),
+            ))
+            .bind(
+                i64::try_from(DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC)
+                    .expect("disk I/O default fits in PostgreSQL BIGINT"),
+            )
+            .bind(
+                i64::try_from(DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC)
+                    .expect("disk I/O default fits in PostgreSQL BIGINT"),
+            )
+            .bind(initial_environment)
+            .fetch_all(&self.pool)
+            .await?,
         )
     }
 
@@ -934,8 +939,8 @@ impl WarmPoolStore {
                                 -- Tags on either spelling of the digest: one written
                                 -- before the shared rule can sit on the other spelling.
                                 WHERE tagged.template_name = release.template_name
-                                  AND replace(tagged.hash, 'sha256:', '')
-                                    = replace(release.hash, 'sha256:', '')
+                                  AND tagged.hash IN (replace(release.hash, 'sha256:', ''),
+                                                      'sha256:' || replace(release.hash, 'sha256:', ''))
                             ),
                             release.created_at
                         ) AS published_at

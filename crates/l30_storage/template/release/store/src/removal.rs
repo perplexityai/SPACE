@@ -84,8 +84,8 @@ pub async fn lock_releases_of_digest(
              FROM template_releases r
              JOIN template_releases digest
                ON digest.template_name = r.template_name
-              AND replace(digest.hash, 'sha256:', '')
-                = replace(r.hash, 'sha256:', '')
+              AND digest.hash IN (replace(r.hash, 'sha256:', ''),
+                                  'sha256:' || replace(r.hash, 'sha256:', ''))
              WHERE r.id = $1
              FOR UPDATE OF digest"
     ))
