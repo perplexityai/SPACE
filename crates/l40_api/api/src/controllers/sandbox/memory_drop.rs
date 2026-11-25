@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 use pplx_space_artifact_model::{ExactStorageUri, SnapshotArtifact as SnapshotFile, StorageUri};
+use pplx_space_content_digest::ContentHash;
 use pplx_space_execution_spec::SnapshotExecutionMetadata;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_store::fork_source_lifecycle::{
@@ -44,9 +45,11 @@ use pplx_space_sandbox_store::fork_source_lifecycle::{
 };
 use pplx_space_sandbox_store::memory_drop::{self, MemoryDropCandidate, MemoryDropRefusal};
 use pplx_space_snapshot_model::{
-    ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotId, SnapshotKind, SnapshotState,
+    ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotContentHash, SnapshotId, SnapshotKind,
+    SnapshotState,
 };
 use pplx_space_snapshot_store::{NewSnapshot, SnapshotArtifact};
+use pplx_space_template_model::TemplateArtifactDigest;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -272,7 +275,7 @@ impl MemoryDrop {
             // full artifact. Copying again would rewrite objects retention may
             // claim at any time; reusing them leaves nothing to race. The
             // commit refuses if retention claimed the disk in the meantime.
-            EarlierDisk::Ready { rootfs_size } => Copied::Size(rootfs_size),
+            EarlierDisk::Ready(written) => Copied::Written(written),
             // The bytes under the prefix are being deleted, so a copy written
             // there now could lose objects to that delete after it registers.
             // Once the delete finishes its row is gone, and a retry copies.
@@ -283,13 +286,13 @@ impl MemoryDrop {
                 ));
             }
         };
-        let rootfs_size = match copied {
-            Copied::Size(rootfs_size) => rootfs_size,
+        let written = match copied {
+            Copied::Written(written) => written,
             Copied::Outcome(outcome) => return Ok(outcome),
         };
 
         match self
-            .commit(pool, sandbox_id, token, &candidate, &plan, rootfs_size)
+            .commit(pool, sandbox_id, token, &candidate, &plan, written)
             .await?
         {
             CommitOutcome::Committed => {
@@ -357,11 +360,15 @@ impl MemoryDrop {
                     .storage_location()
                     .is_some_and(|location| location.orphaned_at().is_none());
             return Ok(if usable {
-                EarlierDisk::Ready {
+                EarlierDisk::Ready(WrittenDisk {
                     rootfs_size: registered
                         .size_bytes()
                         .and_then(|size| u64::try_from(size).ok()),
-                }
+                    content_hash: registered
+                        .content_hash()
+                        .and_then(SnapshotContentHash::artifact_digest)
+                        .map(|digest| digest.content_hash()),
+                })
             } else {
                 EarlierDisk::Retiring
             });
@@ -376,9 +383,9 @@ impl MemoryDrop {
         })
     }
 
-    /// Copy the disk under a renewing seal. Returns its rootfs size, or the
-    /// outcome when the copy can't go ahead; every path but the size lifts
-    /// or has lost the seal.
+    /// Copy the disk under a renewing seal. Returns its recorded summary, or
+    /// the outcome when the copy can't go ahead; every path but the summary
+    /// lifts or has lost the seal.
     async fn copy_disk(
         &self,
         pool: &PgPool,
@@ -396,7 +403,7 @@ impl MemoryDrop {
             )
             .await?;
         match written {
-            Some(Ok(Ok(rootfs_size))) => Ok(Copied::Size(Some(rootfs_size))),
+            Some(Ok(Ok(written))) => Ok(Copied::Written(written)),
             Some(Ok(Err(why))) => {
                 self.release(pool, sandbox_id, token).await;
                 Ok(Copied::Outcome(MemoryDropOutcome::NotEligible(
@@ -545,15 +552,15 @@ impl MemoryDrop {
     }
 
     /// Copy the rootfs into the disk prefix and write its `metadata.json`
-    /// last, as the publication marker. Returns the rootfs's logical size, or
-    /// `Ok(Err(why))` when the full artifact's metadata can't project to a
-    /// disk.
+    /// last, as the publication marker. Returns the projected disk's recorded
+    /// size and template digest, or `Ok(Err(why))` when the full artifact's
+    /// metadata can't project to a disk.
     async fn write_disk(
         &self,
         sandbox_id: SandboxId,
         candidate: &MemoryDropCandidate,
         plan: &CopyPlan,
-    ) -> Result<Result<u64, &'static str>, MemoryDropObjectsError> {
+    ) -> Result<Result<WrittenDisk, &'static str>, MemoryDropObjectsError> {
         let metadata = self
             .objects
             .read(plan.source.parsed(), SnapshotFile::Metadata)
@@ -595,11 +602,11 @@ impl MemoryDrop {
                 plan.dest.parsed(),
                 SnapshotFile::Metadata,
                 // Moved, not cloned: `projection` isn't used for its bytes
-                // again, only for the `Copy` size read after this.
+                // again, only for the `Copy` summary read after this.
                 projection.metadata,
             )
             .await?;
-        Ok(Ok(projection.rootfs_size))
+        Ok(Ok(projection.written))
     }
 
     /// Register the disk snapshot, re-pin the row to it and lift the seal, if
@@ -617,7 +624,7 @@ impl MemoryDrop {
         token: Uuid,
         candidate: &MemoryDropCandidate,
         plan: &CopyPlan,
-        rootfs_size: Option<u64>,
+        written: WrittenDisk,
     ) -> Result<CommitOutcome, ControllerError> {
         let mut tx = pool
             .begin()
@@ -647,6 +654,11 @@ impl MemoryDrop {
             None,
         )
         .map_err(|error| ControllerError::internal(format!("disk artifact identity: {error}")))?;
+        let content_hash = written
+            .content_hash
+            .map(TemplateArtifactDigest::from)
+            .map(SnapshotContentHash::from)
+            .or_else(|| full.content_hash().cloned());
         let mut snapshot = NewSnapshot::new(
             plan.disk_snapshot_id,
             sandbox_id,
@@ -656,8 +668,12 @@ impl MemoryDrop {
             plan.dest.clone(),
         )
         .with_resources(full.vcpu(), full.memory_mib())
-        .with_size_bytes(rootfs_size.and_then(|size| i64::try_from(size).ok()))
-        .with_template(full.template_id().cloned(), full.content_hash().cloned())
+        .with_size_bytes(
+            written
+                .rootfs_size
+                .and_then(|size| i64::try_from(size).ok()),
+        )
+        .with_template(full.template_id().cloned(), content_hash)
         .with_artifact(artifact)
         .with_generation(full.generation())
         // The bytes are the full snapshot's, so the row orders with it.
@@ -765,18 +781,17 @@ enum EarlierDisk {
     /// No row and no orphan: the drop copies.
     None,
     /// A `ready` disk with an attached location. Its bytes are complete, so
-    /// the drop re-pins to it without copying; `rootfs_size` is what that
-    /// drop recorded.
-    Ready { rootfs_size: Option<u64> },
+    /// the drop re-pins to it without copying; the summary is what that drop
+    /// recorded.
+    Ready(WrittenDisk),
     /// Retention or the storage sweeper is deleting the prefix.
     Retiring,
 }
 
 /// The result of [`MemoryDrop::copy_disk`].
 enum Copied {
-    /// The disk's bytes are in place, with the rootfs's logical size when
-    /// known.
-    Size(Option<u64>),
+    /// The disk's bytes are in place, with its recorded summary.
+    Written(WrittenDisk),
     /// The drop ends here with this outcome.
     Outcome(MemoryDropOutcome),
 }
@@ -840,18 +855,37 @@ fn derived_id(candidate: &MemoryDropCandidate, kind: &[u8]) -> Uuid {
     Uuid::new_v5(&candidate.pinned_artifact_id.as_uuid(), &name)
 }
 
+/// Summary of a written disk artifact passed from [`MemoryDrop::write_disk`] or
+/// [`MemoryDrop::earlier_disk`] to [`MemoryDrop::commit`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct WrittenDisk {
+    rootfs_size: Option<u64>,
+    content_hash: Option<ContentHash>,
+}
+
 /// The disk artifact's `metadata.json` and the rootfs object it describes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DiskProjection {
     metadata: Vec<u8>,
     rootfs: SnapshotFile,
-    rootfs_size: u64,
+    written: WrittenDisk,
 }
 
 /// Project the full artifact's `metadata.json` onto the disk artifact, the
 /// way a fork projects a disk: same rootfs and environment, `disk` `stop`
-/// identity, sizes of the rootfs alone, and nothing that names the full
-/// artifact's node-local bundle. Fields this doesn't know are kept.
+/// identity, sizes of the rootfs alone when recorded, and nothing that names
+/// the full artifact's node-local bundle. Fields this doesn't know are kept.
+///
+/// For an encrypted sandbox, the rootfs object is `cow.luks` rather than
+/// `rootfs` or `rootfs.btrfs-send`, `rootfs_encryption_source` must be absent
+/// (a memory drop keeps the sandbox's own key rather than re-encrypting a
+/// fork's COW), and `source.content_hash` must parse as a [`ContentHash`] and
+/// agree with any digest recorded on `sandboxes.content_hash` or
+/// `snapshots.content_hash` so a cold boot can reconstruct the read-only
+/// template origin beneath `cow.luks`. Encrypted snapshots require a positive
+/// `rootfs_size_bytes`, or, for snapshots captured before `rootfs_size_bytes`
+/// was recorded, a positive `size_bytes` upper bound in `metadata.json` with
+/// `snapshots.size_bytes` left unset.
 ///
 /// `Err` names why the artifact can't be projected; the drop then refuses.
 fn project_disk_metadata(
@@ -868,8 +902,17 @@ fn project_disk_metadata(
     if object.get("sandbox_id").and_then(Value::as_str) != Some(sandbox_id.to_string().as_str()) {
         return Err("metadata names another sandbox");
     }
-    if object.get("encrypted").and_then(Value::as_bool) == Some(true) {
-        return Err("encrypted artifact");
+    let encrypted = match object.get("encrypted") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => return Err("invalid encryption flag"),
+    };
+    if encrypted != candidate.volume_encryption {
+        return Err("encryption mismatch");
+    }
+    match object.get("rootfs_encryption_source") {
+        None | Some(Value::Null) => {}
+        Some(_) => return Err("foreign encryption source"),
     }
     if object.get("artifact_kind").and_then(Value::as_str) != Some(ArtifactKind::Full.as_str()) {
         return Err("not a full artifact");
@@ -881,16 +924,62 @@ fn project_disk_metadata(
     if pinned != Some(candidate.pinned_artifact_id.as_uuid()) {
         return Err("metadata names another local artifact");
     }
-    let rootfs_size = object
-        .get("rootfs_size_bytes")
-        .and_then(Value::as_u64)
-        .ok_or("rootfs size unknown")?;
-    let rootfs = match object.get("rootfs_diff_format") {
+    let diff_format = match object.get("rootfs_diff_format") {
         None | Some(Value::Null) => SnapshotFile::Rootfs,
         Some(Value::String(format)) if format == ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1 => {
             SnapshotFile::RootfsBtrfsSend
         }
         Some(_) => return Err("unknown rootfs format"),
+    };
+    let (rootfs, rootfs_size, content_hash) = if encrypted {
+        let raw_hash = object
+            .get("source")
+            .and_then(Value::as_object)
+            .and_then(|source| source.get("content_hash"))
+            .and_then(Value::as_str)
+            .ok_or("missing template content hash")?;
+        let content_hash = raw_hash
+            .parse::<ContentHash>()
+            .map_err(|_| "invalid template content hash")?;
+        let matches_digest = |stored: Option<&str>| {
+            stored.is_none_or(|raw| {
+                SnapshotContentHash::from_stored(raw)
+                    .artifact_digest()
+                    .is_some_and(|digest| digest.content_hash() == content_hash)
+            })
+        };
+        if !matches_digest(candidate.sandbox_content_hash.as_deref())
+            || !matches_digest(candidate.snapshot_content_hash.as_deref())
+        {
+            return Err("template content hash mismatch");
+        }
+        let rootfs_size = match object.get("rootfs_size_bytes") {
+            None | Some(Value::Null) => {
+                object
+                    .get("size_bytes")
+                    .and_then(Value::as_u64)
+                    .filter(|&size| size > 0)
+                    .ok_or("rootfs size unknown")?;
+                None
+            }
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .filter(|&size| size > 0)
+                    .ok_or("rootfs size unknown")?,
+            ),
+        };
+        (
+            SnapshotFile::EncryptedRootfsCow,
+            rootfs_size,
+            Some(content_hash),
+        )
+    } else {
+        let rootfs_size = object
+            .get("rootfs_size_bytes")
+            .and_then(Value::as_u64)
+            .ok_or("rootfs size unknown")?;
+        (diff_format, Some(rootfs_size), None)
     };
     let execution: SnapshotExecutionMetadata = object
         .get("execution")
@@ -902,7 +991,12 @@ fn project_disk_metadata(
         .map_err(|_| "invalid execution metadata")?;
 
     object.insert("execution".to_string(), execution);
-    object.insert("size_bytes".to_string(), rootfs_size.into());
+    if let Some(size) = rootfs_size {
+        object.insert("size_bytes".to_string(), size.into());
+        object.insert("rootfs_size_bytes".to_string(), size.into());
+    } else {
+        object.remove("rootfs_size_bytes");
+    }
     object.insert(
         "artifact_kind".to_string(),
         ArtifactKind::Disk.as_str().into(),
@@ -915,14 +1009,19 @@ fn project_disk_metadata(
         "local_artifact_id".to_string(),
         disk_artifact_id.to_string().into(),
     );
-    // The disk has the stream, never the full artifact's node-local bundle.
+    // The disk has the stream or COW, never a foreign key or the full
+    // artifact's node-local bundle.
+    object.remove("rootfs_encryption_source");
     object.remove("rootfs_send_source_id");
     object.remove("artifact_snapshot_name");
     let metadata = serde_json::to_vec_pretty(&metadata).map_err(|_| "unserializable")?;
     Ok(DiskProjection {
         metadata,
         rootfs,
-        rootfs_size,
+        written: WrittenDisk {
+            rootfs_size,
+            content_hash,
+        },
     })
 }
 

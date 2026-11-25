@@ -6,6 +6,7 @@ use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use pplx_space_accounts::NodeId;
 use pplx_space_artifact_model::{SnapshotArtifact as SnapshotFile, StorageUri};
+use pplx_space_content_digest::ContentHash;
 use pplx_space_cpu_arch::Arch;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
 use pplx_space_execution_spec::{ExecutionMetadata, HostCpu, SnapshotExecutionMetadata};
@@ -24,11 +25,14 @@ use uuid::Uuid;
 
 use super::{
     CommitOutcome, CopyPlan, MemoryDrop, MemoryDropIneligible, MemoryDropObjects,
-    MemoryDropObjectsError, MemoryDropOutcome, Sealed, object_key, project_disk_metadata,
+    MemoryDropObjectsError, MemoryDropOutcome, Sealed, WrittenDisk, object_key,
+    project_disk_metadata,
 };
 
 const BUCKET: &str = "test-bucket";
 const PARENT: &str = "suspend_snapshots/00";
+const TEMPLATE_DIGEST: &str =
+    "sha256:5e0f1d2c3b4a59687766554433221100ffeeddccbbaa99887766554433221100";
 
 fn candidate_at(storage_connection_string: String) -> MemoryDropCandidate {
     MemoryDropCandidate {
@@ -36,6 +40,9 @@ fn candidate_at(storage_connection_string: String) -> MemoryDropCandidate {
         pinned_artifact_id: LocalArtifactId::from_uuid(Uuid::now_v7()),
         full_snapshot_id: SnapshotId::from_uuid(Uuid::now_v7()),
         storage_connection_string,
+        volume_encryption: false,
+        sandbox_content_hash: None,
+        snapshot_content_hash: None,
     }
 }
 
@@ -158,18 +165,25 @@ fn full_metadata(sandbox_id: SandboxId, candidate: &MemoryDropCandidate) -> Valu
     })
 }
 
+fn encrypted_full_metadata(sandbox_id: SandboxId, candidate: &MemoryDropCandidate) -> Value {
+    let mut metadata = full_metadata(sandbox_id, candidate);
+    metadata["encrypted"] = json!(true);
+    metadata["source"]["content_hash"] = json!(TEMPLATE_DIGEST);
+    metadata
+}
+
 fn project(
     metadata: &Value,
     sandbox_id: SandboxId,
     candidate: &MemoryDropCandidate,
-) -> Result<(Value, SnapshotFile, u64), &'static str> {
+) -> Result<(Value, SnapshotFile, WrittenDisk), &'static str> {
     let disk = LocalArtifactId::from_uuid(Uuid::now_v7());
     let bytes = serde_json::to_vec(metadata).map_err(|_| "unserializable test metadata")?;
     let projection = project_disk_metadata(&bytes, sandbox_id, candidate, disk)?;
     let projected: Value = serde_json::from_slice(&projection.metadata)
         .map_err(|_| "projected metadata isn't JSON")?;
     assert_eq!(projected["local_artifact_id"], disk.to_string());
-    Ok((projected, projection.rootfs, projection.rootfs_size))
+    Ok((projected, projection.rootfs, projection.written))
 }
 
 #[test]
@@ -178,10 +192,17 @@ fn a_full_artifact_projects_to_a_stop_disk() {
     let candidate = candidate_under(sandbox_id, PARENT);
     let metadata = full_metadata(sandbox_id, &candidate);
 
-    let (projected, rootfs, size) = project(&metadata, sandbox_id, &candidate).expect("projects");
+    let (projected, rootfs, written) =
+        project(&metadata, sandbox_id, &candidate).expect("projects");
 
     assert_eq!(rootfs, SnapshotFile::RootfsBtrfsSend);
-    assert_eq!(size, 4);
+    assert_eq!(
+        written,
+        WrittenDisk {
+            rootfs_size: Some(4),
+            content_hash: None,
+        }
+    );
     assert_eq!(projected["artifact_kind"], "disk");
     assert_eq!(projected["artifact_origin"], "stop");
     assert_eq!(projected["size_bytes"], 4);
@@ -194,6 +215,57 @@ fn a_full_artifact_projects_to_a_stop_disk() {
     let execution: SnapshotExecutionMetadata =
         serde_json::from_value(projected["execution"].clone()).expect("execution");
     assert_eq!(execution, self::execution());
+}
+
+#[test]
+fn an_encrypted_full_artifact_projects_to_cow_luks() {
+    let sandbox_id = SandboxId::new();
+    let mut candidate = candidate_under(sandbox_id, PARENT);
+    candidate.volume_encryption = true;
+    let digest: ContentHash = TEMPLATE_DIGEST.parse().expect("digest");
+
+    let metadata = encrypted_full_metadata(sandbox_id, &candidate);
+    let (projected, rootfs, written) =
+        project(&metadata, sandbox_id, &candidate).expect("projects");
+    assert_eq!(rootfs, SnapshotFile::EncryptedRootfsCow);
+    assert_eq!(
+        written,
+        WrittenDisk {
+            rootfs_size: Some(4),
+            content_hash: Some(digest),
+        }
+    );
+    assert_eq!(projected["artifact_kind"], "disk");
+    assert_eq!(projected["artifact_origin"], "stop");
+    assert_eq!(projected["encrypted"], true);
+    assert_eq!(projected["size_bytes"], 4);
+    assert_eq!(projected["rootfs_size_bytes"], 4);
+    assert!(projected.get("rootfs_encryption_source").is_none());
+    assert!(projected.get("rootfs_send_source_id").is_none());
+    assert!(projected.get("artifact_snapshot_name").is_none());
+    let execution: SnapshotExecutionMetadata =
+        serde_json::from_value(projected["execution"].clone()).expect("execution");
+    assert_eq!(execution, self::execution());
+
+    // Encrypted snapshots that predate `rootfs_size_bytes` preserve `size_bytes`
+    // in `metadata.json` as the staging upper bound and leave the database
+    // disk size unset.
+    let mut legacy = metadata;
+    legacy
+        .as_object_mut()
+        .expect("object")
+        .remove("rootfs_size_bytes");
+    let (projected, rootfs, written) = project(&legacy, sandbox_id, &candidate).expect("projects");
+    assert_eq!(rootfs, SnapshotFile::EncryptedRootfsCow);
+    assert_eq!(
+        written,
+        WrittenDisk {
+            rootfs_size: None,
+            content_hash: Some(digest),
+        }
+    );
+    assert_eq!(projected["size_bytes"], 9000);
+    assert!(projected.get("rootfs_size_bytes").is_none());
 }
 
 #[test]
@@ -231,6 +303,70 @@ fn an_artifact_the_projection_cant_vouch_for_is_refused() {
         assert!(
             project(&metadata, sandbox_id, &candidate).is_err(),
             "{field} should refuse"
+        );
+    }
+
+    let mut encrypted = candidate.clone();
+    encrypted.volume_encryption = true;
+    for (label, mutate) in [
+        (
+            "non-boolean encrypted flag",
+            (|m: &mut Value| m["encrypted"] = json!("yes")) as fn(&mut Value),
+        ),
+        ("plaintext metadata on encrypted sandbox", |m| {
+            m["encrypted"] = json!(false);
+        }),
+        ("missing encrypted flag on encrypted sandbox", |m| {
+            m.as_object_mut().unwrap().remove("encrypted");
+        }),
+        ("foreign encryption source", |m| {
+            m["rootfs_encryption_source"] = json!(SandboxId::new().to_string());
+        }),
+        ("missing template content hash", |m| {
+            m["source"].as_object_mut().unwrap().remove("content_hash");
+        }),
+        ("invalid template content hash", |m| {
+            m["source"]["content_hash"] = json!("not-a-digest");
+        }),
+        ("invalid rootfs_size_bytes", |m| {
+            m["rootfs_size_bytes"] = json!("four");
+        }),
+        ("zero rootfs_size_bytes", |m| {
+            m["rootfs_size_bytes"] = json!(0);
+        }),
+        ("legacy encrypted without size_bytes", |m| {
+            let obj = m.as_object_mut().unwrap();
+            obj.remove("rootfs_size_bytes");
+            obj.remove("size_bytes");
+        }),
+        ("legacy encrypted with zero size_bytes", |m| {
+            m.as_object_mut().unwrap().remove("rootfs_size_bytes");
+            m["size_bytes"] = json!(0);
+        }),
+    ] {
+        let mut metadata = encrypted_full_metadata(sandbox_id, &encrypted);
+        mutate(&mut metadata);
+        assert!(
+            project(&metadata, sandbox_id, &encrypted).is_err(),
+            "{label} should refuse"
+        );
+    }
+
+    let other_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    for (label, sandbox_hash, snapshot_hash) in [
+        ("mismatched sandbox digest", Some(other_digest), None),
+        ("non-digest sandbox hash", Some("not-a-digest"), None),
+        ("mismatched snapshot digest", None, Some(other_digest)),
+        ("non-digest snapshot hash", None, Some("not-a-digest")),
+    ] {
+        let mut bad = encrypted.clone();
+        bad.sandbox_content_hash = sandbox_hash.map(str::to_owned);
+        bad.snapshot_content_hash = snapshot_hash.map(str::to_owned);
+        let metadata = encrypted_full_metadata(sandbox_id, &bad);
+        assert_eq!(
+            project(&metadata, sandbox_id, &bad),
+            Err("template content hash mismatch"),
+            "{label} should refuse"
         );
     }
     project_disk_metadata(b"not json", sandbox_id, &candidate, LocalArtifactId::new())
@@ -379,6 +515,9 @@ impl Fixture {
             pinned_artifact_id: artifact_id,
             full_snapshot_id: snapshot_id,
             storage_connection_string: String::new(),
+            volume_encryption: false,
+            sandbox_content_hash: None,
+            snapshot_content_hash: None,
         };
         let metadata = full_metadata(sandbox_id, &candidate);
         objects.put(
@@ -584,6 +723,172 @@ async fn a_suspended_sandbox_off_a_gone_node_keeps_its_disk_and_retains_its_full
         metadata["execution"].is_object(),
         "the producer stays recorded"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropping_an_encrypted_sandbox_copies_cow_luks_and_retains_snapshot_luks() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    async fn insert_encrypted(
+        pool: &PgPool,
+        sandbox_hash: Option<&str>,
+        snapshot_hash: Option<&str>,
+        mutate: impl FnOnce(&mut Value),
+    ) -> TestResult<(Arc<MapObjects>, Fixture)> {
+        let objects = Arc::new(MapObjects::default());
+        let fixture = Fixture::insert(pool, &objects).await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET volume_encryption = TRUE, content_hash = $2 WHERE id = $1"
+        ))
+        .bind(fixture.sandbox_id)
+        .bind(sandbox_hash)
+        .execute(pool)
+        .await?;
+        if let Some(hash) = snapshot_hash {
+            sqlx::query(sql!("UPDATE snapshots SET content_hash = $2 WHERE id = $1"))
+                .bind(fixture.snapshot_id)
+                .bind(hash)
+                .execute(pool)
+                .await?;
+        }
+        objects.objects.lock().expect("objects").clear();
+        let mut candidate = candidate_at(String::new());
+        candidate.pinned_artifact_id = fixture.artifact_id;
+        candidate.full_snapshot_id = fixture.snapshot_id;
+        candidate.volume_encryption = true;
+        let mut metadata = encrypted_full_metadata(fixture.sandbox_id, &candidate);
+        mutate(&mut metadata);
+        let source = fixture.source();
+        objects.put(
+            &source,
+            SnapshotFile::Metadata,
+            serde_json::to_vec(&metadata)?,
+        );
+        objects.put(
+            &source,
+            SnapshotFile::EncryptedRootfsCow,
+            b"sealed".to_vec(),
+        );
+        objects.put(
+            &source,
+            SnapshotFile::EncryptedSnapshotVolume,
+            b"vmstate+mem".to_vec(),
+        );
+        Ok((objects, fixture))
+    }
+
+    for has_rootfs_size in [true, false] {
+        let bare_hex = TEMPLATE_DIGEST.strip_prefix("sha256:").expect("sha256");
+        let (objects, fixture) = insert_encrypted(
+            &db.pool,
+            (!has_rootfs_size).then_some(TEMPLATE_DIGEST),
+            (!has_rootfs_size).then_some(bare_hex),
+            |metadata| {
+                if has_rootfs_size {
+                    metadata["rootfs_size_bytes"] = json!(6);
+                } else {
+                    metadata
+                        .as_object_mut()
+                        .expect("object")
+                        .remove("rootfs_size_bytes");
+                }
+            },
+        )
+        .await?;
+        let source = fixture.source();
+        let before = fixture.lifecycle_changed_at(&db.pool).await?;
+        assert_eq!(
+            MemoryDrop::eligibility(&db.pool, fixture.sandbox_id).await?,
+            None
+        );
+
+        let outcome = MemoryDrop::new(objects.clone())
+            .drop_memory(&db.pool, fixture.sandbox_id)
+            .await?;
+
+        let MemoryDropOutcome::Dropped(dropped) = outcome else {
+            panic!("expected a drop, got {outcome:?}");
+        };
+        let (lifecycle, pin, kind) = fixture.lifecycle(&db.pool).await?;
+        assert_eq!(
+            (lifecycle.as_str(), pin, kind.as_str()),
+            ("suspended", dropped.disk_artifact_id, "disk")
+        );
+        assert_eq!(fixture.lifecycle_changed_at(&db.pool).await?, before);
+        let encrypted: bool = sqlx::query_scalar(sql!(
+            "SELECT volume_encryption FROM sandboxes WHERE id = $1"
+        ))
+        .bind(fixture.sandbox_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert!(encrypted);
+
+        let (size, content_hash): (Option<i64>, Option<String>) = sqlx::query_as(sql!(
+            "SELECT size_bytes, content_hash FROM snapshots WHERE id = $1"
+        ))
+        .bind(dropped.disk_snapshot_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(size, has_rootfs_size.then_some(6));
+        assert_eq!(content_hash.as_deref(), Some(TEMPLATE_DIGEST));
+
+        let dest = StorageUri::parse(&storage_uri(fixture.sandbox_id, dropped.disk_snapshot_id))?;
+        assert_eq!(
+            objects.get(&dest, SnapshotFile::EncryptedRootfsCow),
+            Some(b"sealed".to_vec())
+        );
+        assert_eq!(
+            objects.get(&dest, SnapshotFile::EncryptedSnapshotVolume),
+            None
+        );
+        assert_eq!(
+            objects.get(&source, SnapshotFile::EncryptedSnapshotVolume),
+            Some(b"vmstate+mem".to_vec())
+        );
+        let disk_metadata: Value = serde_json::from_slice(
+            &objects
+                .get(&dest, SnapshotFile::Metadata)
+                .expect("disk metadata"),
+        )?;
+        assert_eq!(disk_metadata["encrypted"], true);
+        assert_eq!(
+            disk_metadata["size_bytes"],
+            if has_rootfs_size { 6 } else { 9000 }
+        );
+        assert_eq!(
+            disk_metadata.get("rootfs_size_bytes"),
+            has_rootfs_size.then_some(&json!(6))
+        );
+
+        repoint_to_full(&db.pool, &fixture).await?;
+        let copies = objects.copies.load(Ordering::SeqCst);
+        assert_eq!(
+            MemoryDrop::new(objects.clone())
+                .drop_memory(&db.pool, fixture.sandbox_id)
+                .await?,
+            MemoryDropOutcome::Dropped(dropped)
+        );
+        assert_eq!(objects.copies.load(Ordering::SeqCst), copies);
+    }
+
+    let (objects, fixture) = insert_encrypted(
+        &db.pool,
+        Some("sha256:0000000000000000000000000000000000000000000000000000000000000000"),
+        None,
+        |_| {},
+    )
+    .await?;
+    assert_eq!(
+        MemoryDrop::new(objects.clone())
+            .drop_memory(&db.pool, fixture.sandbox_id)
+            .await?,
+        MemoryDropOutcome::NotEligible(MemoryDropIneligible::Metadata(
+            "template content hash mismatch"
+        ))
+    );
+    assert_eq!(objects.objects.lock().expect("objects").len(), 3);
     Ok(())
 }
 
@@ -864,8 +1169,15 @@ async fn the_commit_refuses_a_disk_retention_claimed_after_the_drop_read_it() ->
     .await?;
 
     assert_eq!(
-        drop.commit(&db.pool, fixture.sandbox_id, token, &candidate, &plan, None)
-            .await?,
+        drop.commit(
+            &db.pool,
+            fixture.sandbox_id,
+            token,
+            &candidate,
+            &plan,
+            WrittenDisk::default()
+        )
+        .await?,
         CommitOutcome::DiskRetiring
     );
     assert_eq!(

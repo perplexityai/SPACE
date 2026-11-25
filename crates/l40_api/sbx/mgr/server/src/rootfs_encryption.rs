@@ -31,12 +31,15 @@
 /// A cold start passes no `restore_cow_source`. If the sandbox then has no
 /// `instance/cow.luks` but its checkpoint has one, node-mgr would format a
 /// fresh COW and the guest would boot without its writes, so that start is
-/// refused ([`EncryptedRootfsPrepareError::CheckpointCowNotLaid`]). With
-/// [`PinnedCheckpoint::lay_checkpoint_cow`], a suspended sandbox's start
-/// lays the COW of the encrypted suspend checkpoint the row pins, written
-/// over the template the row names, as a restore does, and refuses any
-/// other checkpoint, and a pinned one whose COW is empty or not a regular
-/// file with one link ([`EncryptedRootfsPrepareError::CheckpointCowUnusable`]).
+/// refused ([`EncryptedRootfsPrepareError::CheckpointCowNotLaid`]). A
+/// suspended sandbox pinned to its own `stop`-origin encrypted disk artifact
+/// always lays `snapshot/cow.luks` (there's no memory volume to restore), and
+/// with [`PinnedCheckpoint::lay_checkpoint_cow`], a suspended sandbox pinned
+/// to its own encrypted suspend checkpoint lays its COW too. Both paths check
+/// that the sidecar names the template the row clones the origin from and
+/// refuse any other sidecar; a pinned COW that's empty or not a regular file
+/// with one link — or absent, for a `stop` disk — is refused
+/// ([`EncryptedRootfsPrepareError::CheckpointCowUnusable`]).
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum EncryptedRootfsPrepareError {
     #[error("read encrypted disk restore metadata: {0}")]
@@ -46,12 +49,12 @@ pub(crate) enum EncryptedRootfsPrepareError {
     #[error("encrypted disk restore metadata does not match the target sandbox")]
     MetadataIdentity,
     #[error(
-        "the sandbox's instance has no cow.luks and its checkpoint holds one that isn't its own \
-         encrypted suspend checkpoint's; refusing to format a fresh COW in its place"
+        "the sandbox's staged encrypted checkpoint cannot be laid over its instance COW, \
+         or its instance has no cow.luks; refusing to boot or format a fresh COW in its place"
     )]
     CheckpointCowNotLaid,
     #[error(
-        "the sandbox's pinned suspend checkpoint holds a cow.luks that isn't a non-empty, \
+        "the sandbox's pinned encrypted checkpoint holds a cow.luks that isn't a non-empty, \
          single-link regular file; refusing to lay it over the instance's"
     )]
     CheckpointCowUnusable,
@@ -79,13 +82,17 @@ impl EncryptedRootfsPrepareError {
     }
 }
 
-/// The suspend checkpoint a sandbox's row pins, if it still pins one (a stop
+/// The local artifact a sandbox's row pins, if it still pins one (a stop
 /// after a suspend drops the pin and keeps the checkpoint), and the template
 /// its disk was written over.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PinnedCheckpoint<'a> {
     pub(crate) template_hash: Option<&'a str>,
     pub(crate) local_artifact_id: Option<pplx_space_snapshot_model::LocalArtifactId>,
+    /// The row pins a `stop`-origin `disk` artifact (an evacuated stopped
+    /// sandbox, a locally stopped sandbox, or a memory-dropped suspended
+    /// sandbox), rather than a `suspend`-origin `full` checkpoint or no pin.
+    pub(crate) stop_disk: bool,
     /// The row is suspended, so its checkpoint, not the instance, is its
     /// disk, as a restore treats it by laying the checkpoint's COW whenever
     /// the checkpoint holds one.
@@ -102,6 +109,11 @@ impl<'a> PinnedCheckpoint<'a> {
             lay_checkpoint_cow,
             template_hash: sandbox.template_hash.as_deref(),
             local_artifact_id: sandbox.current_local_artifact_id,
+            stop_disk: sandbox.current_local_artifact_id.is_some()
+                && crate::service::is_stop_origin_disk(
+                    sandbox.current_local_artifact_kind,
+                    sandbox.current_local_artifact_origin,
+                ),
             suspended: sandbox
                 .state
                 .is_unowned(crate::state::SandboxState::Suspended),
@@ -130,15 +142,32 @@ pub(crate) async fn prepare_encrypted_rootfs(
     restore_cow_source: Option<&str>,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
 ) -> Result<String, EncryptedRootfsPrepareError> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum StagedCheckpointKind {
+        Other,
+        OwnSuspendCheckpoint,
+        OwnStopDisk,
+        MismatchedStopDisk,
+    }
+
     let mut fork_source = None;
     let mut cow_source = restore_cow_source.map(str::to_owned);
     let sandbox_dir = cache_root.join(sandbox_id);
-    let mut own_suspend_checkpoint = false;
+    let mut staged_kind = StagedCheckpointKind::Other;
     if cow_source.is_none() {
         let snapshot_dir = sandbox_dir.join("snapshot");
         match tokio::fs::read(snapshot_dir.join("snapshot.json")).await {
             Ok(bytes) => {
                 let meta: crate::snapshot_upload::SnapshotMeta = serde_json::from_slice(&bytes)?;
+                let matches_pinned_template = |meta: &crate::snapshot_upload::SnapshotMeta| {
+                    pinned
+                        .local_artifact_id
+                        .is_some_and(|pin| meta.local_artifact_id == Some(pin))
+                        && same_template_digest(
+                            meta.source.content_hash.as_deref(),
+                            pinned.template_hash,
+                        )
+                };
                 if meta.encrypted
                     && crate::snapshot_upload::artifact_kind_from_meta(&meta)
                         == pplx_space_snapshot_model::ArtifactKind::Disk
@@ -146,38 +175,50 @@ pub(crate) async fn prepare_encrypted_rootfs(
                     if meta.sandbox_id != sandbox_id {
                         return Err(EncryptedRootfsPrepareError::MetadataIdentity);
                     }
-                    let source = meta
-                        .rootfs_encryption_source
-                        .ok_or(EncryptedRootfsPrepareError::MetadataIdentity)?;
-                    if source.to_string() == sandbox_id {
-                        return Err(EncryptedRootfsPrepareError::MetadataIdentity);
+                    if meta.artifact_origin == Some(pplx_space_snapshot_model::ArtifactOrigin::Stop)
+                    {
+                        if meta.rootfs_encryption_source.is_some() {
+                            return Err(EncryptedRootfsPrepareError::MetadataIdentity);
+                        }
+                        staged_kind = if pinned.stop_disk && matches_pinned_template(&meta) {
+                            StagedCheckpointKind::OwnStopDisk
+                        } else {
+                            StagedCheckpointKind::MismatchedStopDisk
+                        };
+                    } else {
+                        let source = meta
+                            .rootfs_encryption_source
+                            .ok_or(EncryptedRootfsPrepareError::MetadataIdentity)?;
+                        if source.to_string() == sandbox_id {
+                            return Err(EncryptedRootfsPrepareError::MetadataIdentity);
+                        }
+                        if !pinned.suspended && !pinned.stop_disk {
+                            cow_source =
+                                Some(snapshot_dir.join("cow.luks").to_string_lossy().into_owned());
+                            fork_source = Some(
+                                pplx_space_node_mgr_client::proto::EncryptedRootfsForkSource {
+                                    sandbox_id: source.to_string(),
+                                },
+                            );
+                        }
                     }
-                    cow_source = Some(snapshot_dir.join("cow.luks").to_string_lossy().into_owned());
-                    fork_source = Some(
-                        pplx_space_node_mgr_client::proto::EncryptedRootfsForkSource {
-                            sandbox_id: source.to_string(),
-                        },
-                    );
-                } else {
+                } else if meta.encrypted
+                    && meta.sandbox_id == sandbox_id
+                    && meta.rootfs_encryption_source.is_none()
+                    // Named Full, as staging requires
+                    // (`validate_suspend_snapshot_metadata`): a sidecar
+                    // that names no kind isn't counted as one.
+                    && meta.artifact_kind == Some(pplx_space_snapshot_model::ArtifactKind::Full)
+                    && meta.artifact_origin
+                        == Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend)
+                    && !pinned.stop_disk
+                    && matches_pinned_template(&meta)
+                {
                     // The checkpoint the row pins, written over the template
                     // the start clones the origin from. A row that pins
                     // none, stopped since its suspend, has no checkpoint
                     // that's known to be its disk.
-                    own_suspend_checkpoint = meta.encrypted
-                        && meta.sandbox_id == sandbox_id
-                        // Named Full, as staging requires
-                        // (`validate_suspend_snapshot_metadata`): a sidecar
-                        // that names no kind isn't counted as one.
-                        && meta.artifact_kind == Some(pplx_space_snapshot_model::ArtifactKind::Full)
-                        && meta.artifact_origin
-                            == Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend)
-                        && pinned
-                            .local_artifact_id
-                            .is_some_and(|pin| meta.local_artifact_id == Some(pin))
-                        && same_template_digest(
-                            meta.source.content_hash.as_deref(),
-                            pinned.template_hash,
-                        );
+                    staged_kind = StagedCheckpointKind::OwnSuspendCheckpoint;
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -185,32 +226,63 @@ pub(crate) async fn prepare_encrypted_rootfs(
         }
     }
     let staged = sandbox_dir.join("snapshot").join(ROOTFS_COW_FILE);
-    if cow_source.is_none()
-        && pinned.lay_checkpoint_cow
-        && pinned.suspended
-        && path_present(&staged).map_err(EncryptedRootfsPrepareError::MetadataIo)?
-    {
-        // A suspended sandbox's disk is its pinned checkpoint's COW, laid on
-        // every activation as a restore lays it, whatever an earlier attempt
-        // left in the instance. A checkpoint that isn't the pinned one isn't
-        // that disk, and the instance may not be either, so neither boots.
-        if !own_suspend_checkpoint {
-            return Err(EncryptedRootfsPrepareError::CheckpointCowNotLaid);
-        }
-        // node-manager replaces the instance's COW with it before it opens
-        // either, so one that can't be the disk would clobber the instance's.
-        if disk_file(&staged).map_err(EncryptedRootfsPrepareError::MetadataIo)?
-            != pplx_space_sandbox_model::sandbox_storage::DiskFile::Present
+    if cow_source.is_none() {
+        if pinned.stop_disk
+            || matches!(
+                staged_kind,
+                StagedCheckpointKind::OwnStopDisk | StagedCheckpointKind::MismatchedStopDisk
+            )
         {
-            return Err(EncryptedRootfsPrepareError::CheckpointCowUnusable);
+            // A stop-origin disk artifact has no memory volume to restore, so
+            // a suspended sandbox pinned to one always cold-boots by laying
+            // `snapshot/cow.luks` — and refuses if `snapshot/snapshot.json` is
+            // absent or doesn't match the pin, rather than opening a stale
+            // `instance/cow.luks` or formatting a fresh COW. Once woken or
+            // stopped locally, `instance/cow.luks` holds the disk and must
+            // already exist.
+            if pinned.suspended {
+                if staged_kind != StagedCheckpointKind::OwnStopDisk {
+                    return Err(EncryptedRootfsPrepareError::CheckpointCowNotLaid);
+                }
+                if disk_file(&staged).map_err(EncryptedRootfsPrepareError::MetadataIo)?
+                    != pplx_space_sandbox_model::sandbox_storage::DiskFile::Present
+                {
+                    return Err(EncryptedRootfsPrepareError::CheckpointCowUnusable);
+                }
+                cow_source = Some(staged.to_string_lossy().into_owned());
+            } else if !path_present(&sandbox_dir.join("instance").join(ROOTFS_COW_FILE))
+                .map_err(EncryptedRootfsPrepareError::MetadataIo)?
+            {
+                return Err(EncryptedRootfsPrepareError::CheckpointCowNotLaid);
+            }
+        } else {
+            if pinned.lay_checkpoint_cow
+                && pinned.suspended
+                && path_present(&staged).map_err(EncryptedRootfsPrepareError::MetadataIo)?
+            {
+                // A suspended sandbox's disk is its pinned checkpoint's COW, laid on
+                // every activation as a restore lays it, whatever an earlier attempt
+                // left in the instance. A checkpoint that isn't the pinned one isn't
+                // that disk, and the instance may not be either, so neither boots.
+                if staged_kind != StagedCheckpointKind::OwnSuspendCheckpoint {
+                    return Err(EncryptedRootfsPrepareError::CheckpointCowNotLaid);
+                }
+                // node-manager replaces the instance's COW with it before it opens
+                // either, so one that can't be the disk would clobber the instance's.
+                if disk_file(&staged).map_err(EncryptedRootfsPrepareError::MetadataIo)?
+                    != pplx_space_sandbox_model::sandbox_storage::DiskFile::Present
+                {
+                    return Err(EncryptedRootfsPrepareError::CheckpointCowUnusable);
+                }
+                cow_source = Some(staged.to_string_lossy().into_owned());
+            }
+            if cow_source.is_none() && checkpoint_cow_unlaid(&sandbox_dir)? {
+                // node-manager would format a fresh COW over a disk whose writes may
+                // be only in the checkpoint. Laying it is the case above; anything
+                // else, the switch off included, is refused.
+                return Err(EncryptedRootfsPrepareError::CheckpointCowNotLaid);
+            }
         }
-        cow_source = Some(staged.to_string_lossy().into_owned());
-    }
-    if cow_source.is_none() && checkpoint_cow_unlaid(&sandbox_dir)? {
-        // node-manager would format a fresh COW over a disk whose writes may
-        // be only in the checkpoint. Laying it is the case above; anything
-        // else, the switch off included, is refused.
-        return Err(EncryptedRootfsPrepareError::CheckpointCowNotLaid);
     }
     let mut node = node_manager.connect().await?;
     let prepared = node

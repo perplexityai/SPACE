@@ -303,3 +303,99 @@ async fn a_pinned_checkpoint_cow_is_what_a_cold_start_lays() {
     );
     shut_down(fixture).await;
 }
+
+/// `PinnedCheckpoint::of` reads the row's `(disk, stop)` pin onto `stop_disk`:
+/// a cold start refuses when `snapshot/snapshot.json` is missing rather than
+/// opening `instance/cow.luks`, and lays `snapshot/cow.luks` once staged even
+/// when `staged_checkpoint_disk` is off. Sidecar variants are covered in
+/// `rootfs_encryption::tests`.
+#[tokio::test]
+async fn a_pinned_stop_disk_cow_is_laid_even_with_staged_checkpoint_disk_off() {
+    let pin_as_stop_disk = |fixture: &mut Fixture| -> LocalArtifactId {
+        fixture.service.staged_checkpoint_disk = false;
+        let conn = fixture.service.db.lock().unwrap();
+        let pin = crate::db::get_sandbox(&conn, &fixture.id)
+            .unwrap()
+            .unwrap()
+            .current_local_artifact_id
+            .expect("pinned artifact");
+        conn.execute(
+            "UPDATE local_artifacts
+             SET artifact_kind = 'disk',
+                 artifact_origin = 'stop'
+             WHERE local_artifact_id = ?1",
+            [pin.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sandboxes
+             SET current_local_artifact_kind = 'disk',
+                 current_local_artifact_origin = 'stop'
+             WHERE id = ?1",
+            [&fixture.id],
+        )
+        .unwrap();
+        pin
+    };
+
+    let mut missing = fixture(b"sealed");
+    let _ = pin_as_stop_disk(&mut missing);
+    std::fs::remove_file(missing.sandbox_dir.join("snapshot/snapshot.json")).unwrap();
+    std::fs::remove_file(missing.sandbox_dir.join("snapshot/cow.luks")).unwrap();
+    let error = cold_start(&missing).await;
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert!(
+        error
+            .message()
+            .contains("encrypted rootfs preparation failed"),
+        "{error}"
+    );
+    assert!(
+        missing.sent.lock().unwrap().is_empty(),
+        "node-manager must not open stale instance/cow.luks when the pinned stop disk sidecar is missing"
+    );
+    assert_eq!(
+        std::fs::read(missing.sandbox_dir.join("instance/cow.luks")).unwrap(),
+        INSTANCE_COW,
+    );
+    let _ = settled(&missing).await;
+    shut_down(missing).await;
+
+    let mut staged = fixture(b"sealed");
+    let pin = pin_as_stop_disk(&mut staged);
+    std::fs::write(
+        staged.sandbox_dir.join("snapshot/snapshot.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "sandbox_id": staged.id,
+            "size_bytes": 1,
+            "created_at": "2026-11-09T00:00:00Z",
+            "source": {"runtime": "fc", "template_id": "seed", "content_hash": DIGEST},
+            "encrypted": true,
+            "local_artifact_id": pin.to_string(),
+            "artifact_kind": "disk",
+            "artifact_origin": "stop",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let error = cold_start(&staged).await;
+    assert!(
+        error
+            .message()
+            .contains("encrypted prepare refused by the test"),
+        "{error}"
+    );
+    assert_eq!(
+        *staged.sent.lock().unwrap(),
+        vec![Some(
+            staged
+                .sandbox_dir
+                .join("snapshot/cow.luks")
+                .to_string_lossy()
+                .into_owned()
+        )]
+    );
+    let _ = settled(&staged).await;
+    shut_down(staged).await;
+}
