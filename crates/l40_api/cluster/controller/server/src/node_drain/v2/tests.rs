@@ -68,6 +68,12 @@ struct FakeSink {
     node_lookup_takes: Option<Duration>,
     /// When set, the drained count fails with this.
     count_error: Option<String>,
+    /// When set, each `DrainNode` call reports its arrival on the sender,
+    /// then waits for a permit of the semaphore.
+    call_gate: Option<(
+        tokio::sync::mpsc::UnboundedSender<NodeId>,
+        std::sync::Arc<tokio::sync::Semaphore>,
+    )>,
 }
 
 impl FakeSink {
@@ -142,6 +148,14 @@ impl DrainV2Sink for FakeSink {
             return Err(DrainCallError::moved());
         }
         let node_id = node.id;
+        if let Some((arrived, permits)) = &self.call_gate {
+            let _ = arrived.send(node_id);
+            permits
+                .acquire()
+                .await
+                .expect("the gate stays open")
+                .forget();
+        }
         self.requests.lock().unwrap().push(request);
         let cancel = matches!(request.op, Some(drain_node_request::Op::Cancel(_)));
         self.log(format!(
@@ -3104,4 +3118,67 @@ async fn an_aborted_terminate_call_keeps_the_node_terminating() {
         };
         assert_eq!(status_writes(&sink, &listed), expected, "{last_error:?}");
     }
+}
+
+/// A tick that starts once shutdown is requested does nothing: EC2 isn't
+/// asked about a node whose heartbeat is stale, and no node is cordoned or
+/// called.
+#[tokio::test]
+async fn a_tick_after_shutdown_takes_no_node() {
+    let target = V2Node {
+        heartbeat_fresh: false,
+        ..node(Some("draining"), Some(5))
+    };
+    let sink = FakeSink {
+        nodes: vec![target.clone()],
+        responses: HashMap::from([((target.id, false), Ok(response(5, &[])))]),
+        ..FakeSink::default()
+    };
+    let authority = FakeAuthority::ok();
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    let state = V2LoopState::with_shutdown(V2LoopConfig::default(), shutdown);
+    let report = tick(&sink, &authority, &state).await;
+    assert_eq!(report, V2TickReport::default());
+    assert!(
+        authority.described().is_empty(),
+        "{:?}",
+        authority.described()
+    );
+    assert!(sink.calls().is_empty(), "{:?}", sink.calls());
+    assert!(sink.requests().is_empty());
+}
+
+/// Once shutdown is requested, a tick over more nodes than it calls at once
+/// takes no new node, and the calls already in flight finish: each of those
+/// nodes' reports is stored.
+#[tokio::test(flavor = "current_thread")]
+async fn a_tick_takes_no_new_node_after_shutdown() {
+    let nodes: Vec<V2Node> = (0..NODE_CONCURRENCY + 4)
+        .map(|_| node(Some("draining"), Some(5)))
+        .collect();
+    let (arrived, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let sink = FakeSink {
+        responses: nodes
+            .iter()
+            .map(|node| ((node.id, false), Ok(response(5, &[]))))
+            .collect(),
+        nodes,
+        call_gate: Some((arrived, std::sync::Arc::clone(&permits))),
+        ..FakeSink::default()
+    };
+    let shutdown = CancellationToken::new();
+    let state = V2LoopState::with_shutdown(V2LoopConfig::default(), shutdown.clone());
+    let authority = FakeAuthority::ok();
+    let (report, ()) = tokio::join!(tick(&sink, &authority, &state), async {
+        for _ in 0..NODE_CONCURRENCY {
+            arrivals.recv().await.expect("a call");
+        }
+        shutdown.cancel();
+        permits.add_permits(sink.nodes.len());
+    });
+    assert_eq!(sink.requests().len(), NODE_CONCURRENCY);
+    assert_eq!(sink.reports.lock().unwrap().len(), NODE_CONCURRENCY);
+    assert_eq!(report.drained.len(), NODE_CONCURRENCY);
 }

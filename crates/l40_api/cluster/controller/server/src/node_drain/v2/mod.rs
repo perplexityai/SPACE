@@ -152,7 +152,12 @@
 //! timer and [`V2LoopState`]: the dispatch backoff, where a lost backoff
 //! only retries sooner, the nodes it listed, so a node that leaves its
 //! listing, however its row lost the drain, has its v2 gauges zeroed, and
-//! the pacer of its warnings about a node's node-wide problems.
+//! the pacer of its warnings about a node's node-wide problems. Once
+//! shutdown is requested, no tick starts and a tick takes no new node. The
+//! steps already running go on until the controller's shutdown grace
+//! (`SHUTDOWN_DRAIN_TIMEOUT`, 10 s) ends; the process then exits and drops
+//! any still running, so a dispatch in flight then has an unknown outcome,
+//! as a timed-out one does.
 
 mod cleanup;
 mod step;
@@ -528,13 +533,14 @@ pub fn cancel_request(generation: u64) -> DrainNodeRequest {
 
 /// What the loop keeps between ticks: its [`V2LoopConfig`], the
 /// [`DispatchBackoff`], the nodes its last listing returned, and its warning
-/// pacer. In memory only: a controller that restarts starts with no
-/// listing.
+/// pacer; and the shutdown token its ticks watch. In memory only: a
+/// controller that restarts starts with no listing.
 pub struct V2LoopState {
     config: V2LoopConfig,
     backoff: DispatchBackoff,
     listed: Mutex<HashSet<NodeId>>,
     warn_pacer: PerNodeWarnPacer,
+    shutdown: CancellationToken,
 }
 
 impl std::fmt::Debug for V2LoopState {
@@ -560,11 +566,17 @@ impl Default for V2LoopState {
 
 impl V2LoopState {
     pub fn new(config: V2LoopConfig) -> Self {
+        Self::with_shutdown(config, CancellationToken::new())
+    }
+
+    /// A state whose ticks take no new node once `shutdown` is cancelled.
+    pub fn with_shutdown(config: V2LoopConfig, shutdown: CancellationToken) -> Self {
         Self {
             config,
             backoff: DispatchBackoff::new(config.dispatch_backoff_base),
             listed: Mutex::default(),
             warn_pacer: PerNodeWarnPacer::new(BLOCKED_WARN_INTERVAL),
+            shutdown,
         }
     }
 
@@ -1066,8 +1078,11 @@ async fn apply<S: DrainV2Sink>(
 /// asked first, in one call about every instance the tick asks about: each
 /// fenced node's that the backoff lets ask and each other node's whose
 /// heartbeat is stale; each node's step reads its answer, and its outcome
-/// is applied ([`apply`]). Then the sandboxes each listed node's drain left
-/// suspended longer than the config's bound are counted.
+/// is applied ([`apply`]). Once the state's shutdown token is cancelled, a
+/// tick doesn't start, and one under way takes no new node; the steps
+/// already running go on until the controller's shutdown grace ends, which
+/// drops any still running. Then the sandboxes each listed node's drain
+/// left suspended longer than the config's bound are counted.
 pub async fn tick<S: DrainV2Sink, A: V2InstanceAuthority>(
     sink: &S,
     authority: &A,
@@ -1076,6 +1091,9 @@ pub async fn tick<S: DrainV2Sink, A: V2InstanceAuthority>(
     use futures_util::StreamExt as _;
 
     let mut report = V2TickReport::default();
+    if state.shutdown.is_cancelled() {
+        return report;
+    }
     let nodes = match sink.list_v2_nodes().await {
         Ok(nodes) => nodes,
         Err(error) => {
@@ -1091,6 +1109,7 @@ pub async fn tick<S: DrainV2Sink, A: V2InstanceAuthority>(
     let backoff = &state.backoff;
     let config = &state.config;
     let warn_pacer = &state.warn_pacer;
+    let shutdown = &state.shutdown;
     backoff.retain(
         &nodes
             .iter()
@@ -1135,6 +1154,7 @@ pub async fn tick<S: DrainV2Sink, A: V2InstanceAuthority>(
         let evidence = evidence.get(&node.id).cloned();
         (node, evidence)
     }))
+    .take_while(|_| std::future::ready(!shutdown.is_cancelled()))
     .map(|(node, evidence)| async move {
         let outcome = step(
             sink,
@@ -1163,7 +1183,9 @@ pub async fn tick<S: DrainV2Sink, A: V2InstanceAuthority>(
             None => {}
         }
     }
-    publish_still_suspended(sink, &listed, config.still_suspended_after).await;
+    if !shutdown.is_cancelled() {
+        publish_still_suspended(sink, &listed, config.still_suspended_after).await;
+    }
     report
 }
 
@@ -1207,11 +1229,14 @@ pub async fn run<S: DrainV2Sink, A: V2InstanceAuthority>(
         ?config,
         "starting the node drain's v2 loop"
     );
-    let state = V2LoopState::new(config);
+    let state = V2LoopState::with_shutdown(config, shutdown.clone());
     let mut interval = tokio::time::interval(tick_every);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            // Shutdown first: a tick longer than `tick_every` leaves the
+            // interval ready.
+            biased;
             () = shutdown.cancelled() => break,
             _ = interval.tick() => {}
         }
