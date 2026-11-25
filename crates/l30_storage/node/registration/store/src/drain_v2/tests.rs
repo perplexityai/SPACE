@@ -117,8 +117,8 @@ async fn a_start_records_its_generation_and_deadline() -> TestDbResult<()> {
 }
 
 /// `drain_status` carries exactly the frozen keys, and reads back the
-/// same: the scalars, the two id lists, the fence, its two stamps and the
-/// report's six keys.
+/// same: the scalars, the two id lists, the fence, its two stamps, the
+/// instance the terminated stamp is about, and the report's six keys.
 #[test]
 fn the_stored_status_carries_the_frozen_keys() {
     let status = StoredV2Status {
@@ -129,6 +129,7 @@ fn the_stored_status_carries_the_frozen_keys() {
         terminate_instance: Some("i-0123456789abcdef0".to_owned()),
         dispatched_at: Some(200),
         terminated_observed_at: Some(300),
+        terminated_observed_instance: Some("i-0123456789abcdef0".to_owned()),
         report: Some(StoredV2Report {
             reported_at: 150,
             evacuated_grew_at: 140,
@@ -177,6 +178,7 @@ fn the_stored_status_carries_the_frozen_keys() {
             "report",
             "terminate_instance",
             "terminated_observed_at",
+            "terminated_observed_instance",
         ]
     );
     assert_eq!(
@@ -541,10 +543,13 @@ async fn a_report_grows_the_observed_and_evacuated_sets() -> TestDbResult<()> {
     Ok(())
 }
 
-/// EC2's `terminated` is recorded once, with the first time, for the
-/// instance the drain asks about under its generation: the recorded one
-/// until the fence is written, then the fenced one; and for any phase, a
-/// cancel included.
+/// EC2's `terminated` is recorded once, with the first time and the
+/// instance, for the instance the drain asks about under its generation:
+/// the recorded one until the fence is written, then the fenced one; and
+/// for any phase, a cancel included. A record about another instance than
+/// the one asked about now doesn't count, in the listing or for a new
+/// record, which replaces it; one written without an instance, before the
+/// key existed, counts for whichever instance is asked about.
 #[tokio::test(flavor = "current_thread")]
 async fn terminated_is_recorded_once_on_the_asked_instance() -> TestDbResult<()> {
     let db = pg_test_db().await?;
@@ -559,26 +564,48 @@ async fn terminated_is_recorded_once_on_the_asked_instance() -> TestDbResult<()>
     .bind(node_id)
     .execute(pool)
     .await?;
+    let listed_stamp = || async {
+        let listed = list_v2_node_rows(pool).await?;
+        TestDbResult::Ok(
+            listed
+                .iter()
+                .find(|row| row.id == node_id)
+                .expect("the v2 node")
+                .terminated_observed_at,
+        )
+    };
+    let backdate = || async {
+        sqlx::query(sql!(
+            "UPDATE nodes SET drain_status = drain_status
+                     || jsonb_build_object('terminated_observed_at', 1)
+              WHERE id = $1"
+        ))
+        .bind(node_id)
+        .execute(pool)
+        .await?;
+        TestDbResult::Ok(())
+    };
     set(pool, node_id, None, serde_json::json!({})).await?;
     assert!(!record_v2_terminated_observed(pool, node_id, generation, "i-0000000b").await?);
     assert!(!record_v2_terminated_observed(pool, node_id, generation + 1, "i-0000000a").await?);
     assert!(record_v2_terminated_observed(pool, node_id, generation, "i-0000000a").await?);
-    let first = status_of(pool, node_id).await?.terminated_observed_at;
-    assert!(first.is_some());
-    sqlx::query(sql!(
-        "UPDATE nodes SET drain_status = drain_status
-                 || jsonb_build_object('terminated_observed_at', 1)
-          WHERE id = $1"
-    ))
-    .bind(node_id)
-    .execute(pool)
-    .await?;
+    let first = status_of(pool, node_id).await?;
+    assert!(first.terminated_observed_at.is_some());
+    assert_eq!(
+        first.terminated_observed_instance.as_deref(),
+        Some("i-0000000a")
+    );
+    backdate().await?;
     assert!(record_v2_terminated_observed(pool, node_id, generation, "i-0000000a").await?);
     assert_eq!(
         status_of(pool, node_id).await?.terminated_observed_at,
         Some(1)
     );
-    // Once fenced on another instance, the fence is the one asked about.
+    assert_eq!(listed_stamp().await?, Some(1));
+
+    // Once fenced on another instance, the fence is the one asked about: the
+    // record about the recorded instance no longer counts, and a record
+    // about the fence replaces it.
     set(
         pool,
         node_id,
@@ -586,15 +613,41 @@ async fn terminated_is_recorded_once_on_the_asked_instance() -> TestDbResult<()>
         serde_json::json!({"terminate_instance": "i-0000000c"}),
     )
     .await?;
+    assert_eq!(
+        listed_stamp().await?,
+        None,
+        "a record about another instance"
+    );
     assert!(!record_v2_terminated_observed(pool, node_id, generation, "i-0000000a").await?);
     assert!(record_v2_terminated_observed(pool, node_id, generation, "i-0000000c").await?);
-    let listed = list_v2_node_rows(pool).await?;
-    let row = listed
-        .iter()
-        .find(|row| row.id == node_id)
-        .expect("the v2 node");
-    assert_eq!(row.terminated_observed_at, Some(1));
-    assert_eq!(row.fence.as_deref(), Some("i-0000000c"));
+    let replaced = status_of(pool, node_id).await?;
+    assert!(replaced.terminated_observed_at.is_some_and(|at| at > 1));
+    assert_eq!(
+        replaced.terminated_observed_instance.as_deref(),
+        Some("i-0000000c")
+    );
+    assert!(listed_stamp().await?.is_some());
+
+    // A record without an instance, written before the key existed, counts
+    // as it always did, and a new record keeps its time.
+    sqlx::query(sql!(
+        "UPDATE nodes SET drain_status = (drain_status - 'terminated_observed_instance')
+                 || jsonb_build_object('terminated_observed_at', 1)
+          WHERE id = $1"
+    ))
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    assert_eq!(
+        listed_stamp().await?,
+        Some(1),
+        "a record without an instance"
+    );
+    assert!(record_v2_terminated_observed(pool, node_id, generation, "i-0000000c").await?);
+    assert_eq!(
+        status_of(pool, node_id).await?.terminated_observed_at,
+        Some(1)
+    );
     Ok(())
 }
 

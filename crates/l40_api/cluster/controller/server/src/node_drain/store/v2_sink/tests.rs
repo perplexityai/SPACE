@@ -1135,7 +1135,9 @@ async fn the_first_terminated_is_recorded_on_the_asked_instance() -> TestResult 
 }
 
 /// The delete of a terminated node's row needs the row to still carry the
-/// fence with a dispatch, the identity the tick read, a stale heartbeat and
+/// fence with a dispatch, the record that EC2 listed the fenced instance
+/// terminated (one about another instance doesn't count; one without an
+/// instance does), the identity the tick read, a stale heartbeat and
 /// nothing naming the node; it leaves no tombstone. A row a registration
 /// took has no fence left; a fresh heartbeat or a moved identity waits; a
 /// row that names the node lets it go instead, with the trace, writing no
@@ -1161,6 +1163,8 @@ async fn the_terminated_delete_holds_its_guards_and_lets_go_on_a_reference() -> 
         "unfenced",
         "not dispatched",
         "terminated not recorded",
+        "terminated recorded for another instance",
+        "terminated recorded for the fence",
         "heartbeat fresh",
         "uid moved",
         "instance moved",
@@ -1176,6 +1180,22 @@ async fn the_terminated_delete_holds_its_guards_and_lets_go_on_a_reference() -> 
                 7,
                 serde_json::json!({"terminate_instance": INSTANCE, "dispatched_at": 1}),
             ),
+            "terminated recorded for another instance" | "terminated recorded for the fence" => {
+                let about = if case.ends_with("the fence") {
+                    INSTANCE
+                } else {
+                    "i-0000000000000e0e0"
+                };
+                done(
+                    7,
+                    serde_json::json!({
+                        "terminate_instance": INSTANCE,
+                        "dispatched_at": 1,
+                        "terminated_observed_at": 2,
+                        "terminated_observed_instance": about,
+                    }),
+                )
+            }
             _ => dispatched(),
         };
         let node_id = v2_node(pool, Some("terminating"), status.clone()).await?;
@@ -1204,7 +1224,7 @@ async fn the_terminated_delete_holds_its_guards_and_lets_go_on_a_reference() -> 
                 .fetch_one(pool)
                 .await?;
         match case {
-            "deleted" => {
+            "deleted" | "terminated recorded for the fence" => {
                 assert_eq!(outcome, TerminatedDelete::Deleted, "{case}");
                 assert!(!exists, "{case}");
                 let tombstoned: bool = sqlx::query_scalar(sql!(

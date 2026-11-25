@@ -13,7 +13,10 @@
 //!    go: its heartbeat is stale, EC2 lists its instance `terminated` (now,
 //!    or not at all once the drain recorded it `terminated`,
 //!    `drain_status.terminated_observed_at`, which the loop records for
-//!    every v2 row the first time EC2 says so), and its Kubernetes Node is
+//!    every v2 row the first time EC2 says so, with the instance it is
+//!    about, `drain_status.terminated_observed_instance`: a record about
+//!    another instance doesn't count, and one without an instance counts
+//!    for whichever instance the drain asks about), and its Kubernetes Node is
 //!    gone or its `providerID` names that instance. EC2 not listing an
 //!    instance it was never seen to list `terminated` isn't death. The loop
 //!    clears the v2 columns and the phase under the node's lock and records
@@ -643,10 +646,12 @@ pub trait DrainV2Sink: Send + Sync + 'static {
         instance_id: &str,
     ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
     /// Record that EC2 listed `instance_id`, the instance the drain asks
-    /// about (its fence, else its recorded instance), `terminated`
-    /// (`drain_status.terminated_observed_at`), keeping the first time it
-    /// did; false when the row is no longer that generation's v2 drain
-    /// asking about that instance.
+    /// about (its fence, else its recorded instance), `terminated`, with the
+    /// instance (`drain_status.terminated_observed_at`,
+    /// `drain_status.terminated_observed_instance`): keeps the first time of
+    /// a record about that instance, or of one that names none, and replaces
+    /// one about another instance; false when the row is no longer that
+    /// generation's v2 drain asking about that instance.
     fn record_terminated_observed(
         &self,
         node_id: NodeId,
