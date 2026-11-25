@@ -1677,9 +1677,9 @@ async fn the_sink_makes_no_call_for_a_row_that_moved_on() -> TestResult {
 }
 
 /// A patch the API server refuses because the UID it names isn't the Node's
-/// is another Node under the name, as the Kubernetes API server answers it
-/// (a 422 with a cause on `metadata.uid`, or a precondition conflict); any
-/// other refusal is a plain failure.
+/// is another Node under the name, as the Kubernetes API server answers it:
+/// a 422 with a cause on `metadata.uid`. Any other refusal, a conflict
+/// included, is a plain failure.
 #[test]
 fn a_patch_refused_for_its_uid_is_another_node() {
     // The API server's `Status` bodies, as it answers a refused patch.
@@ -1700,7 +1700,7 @@ fn a_patch_refused_for_its_uid_is_another_node() {
     };
     for (case, body, another) in [
         ("immutable uid", invalid_on("metadata.uid"), true),
-        ("uid precondition", refused("Conflict", 409), true),
+        ("conflict", refused("Conflict", 409), false),
         ("another field", invalid_on("spec.taints"), false),
         ("invalid without causes", refused("Invalid", 422), false),
         ("not found", refused("NotFound", 404), false),

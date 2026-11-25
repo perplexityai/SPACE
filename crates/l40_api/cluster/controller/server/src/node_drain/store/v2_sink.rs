@@ -115,20 +115,21 @@ fn node_patch(listed_uid: Option<&str>, node: Option<&Node>, unschedulable: bool
 
 /// Whether the API server refused a patch because the UID it names isn't
 /// the UID of the Node under the name. It answers such a merge patch as an
-/// invalid change of the immutable `metadata.uid` (422, a cause on that
-/// field); a UID precondition conflict (409) means the same.
+/// invalid change of the immutable `metadata.uid`: a 422 `Invalid` with a
+/// cause on that field. Any other refusal, a conflict included, is an
+/// ordinary failure, reported and retried next tick, whose GET and UID
+/// compare then find a replaced Node.
 fn refused_for_another_uid(error: &kube::Error) -> bool {
     let kube::Error::Api(status) = error else {
         return false;
     };
-    status.is_conflict()
-        || (status.is_invalid()
-            && status.details.as_ref().is_some_and(|details| {
-                details
-                    .causes
-                    .iter()
-                    .any(|cause| cause.field == "metadata.uid")
-            }))
+    status.is_invalid()
+        && status.details.as_ref().is_some_and(|details| {
+            details
+                .causes
+                .iter()
+                .any(|cause| cause.field == "metadata.uid")
+        })
 }
 
 /// Why a cordon or its lift didn't converge.
