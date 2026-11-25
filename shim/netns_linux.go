@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	goruntime "runtime"
+	"sort"
 
 	"golang.org/x/sys/unix"
 )
@@ -68,6 +69,7 @@ func podIPFromCurrentNetns() string {
 	if err != nil {
 		return ""
 	}
+	sort.Slice(interfaces, func(i, j int) bool { return interfaces[i].Index < interfaces[j].Index })
 
 	for _, iface := range interfaces {
 		if iface.Flags&net.FlagLoopback != 0 {

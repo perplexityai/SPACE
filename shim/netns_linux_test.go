@@ -10,8 +10,9 @@ import (
 	"testing"
 )
 
-// The redirect address is the first eligible address in interface order, even
-// when the default route uses another interface. The node manager's
+// The redirect address is the first eligible address in interface index order,
+// even when the default route uses another interface or a higher-index link is
+// created first. The node manager's
 // `external_address_is_the_shim_redirect_address` pins the same fixture.
 func TestPodIPFromNetnsMatchesNodeManager(t *testing.T) {
 	ns := fmt.Sprintf("space-test-shim-addr-%d", os.Getpid())
@@ -26,6 +27,9 @@ func TestPodIPFromNetnsMatchesNodeManager(t *testing.T) {
 			t.Fatalf("ip %s: %v: %s", args, err, output)
 		}
 	}
+	ip("-n NS link add high0 index 256 type dummy")
+	ip("-n NS addr add 198.51.100.4/24 dev high0")
+	ip("-n NS link set high0 up")
 	for _, link := range [][2]string{{"other0", "192.0.2.9/24"}, {"eth0", "10.244.3.7/24"}} {
 		ip("-n NS link add " + link[0] + " type dummy")
 		ip("-n NS addr add " + link[1] + " dev " + link[0])
