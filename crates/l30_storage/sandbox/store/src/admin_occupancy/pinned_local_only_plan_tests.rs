@@ -1,11 +1,12 @@
 //! Plan-structure and page-shape regression for
 //! [`admin_occupancy::pinned_local_only_sandboxes`]'s statement.
 //!
-//! The behavioural tests in `inflight_upload_occupancy_tests` cover *which*
-//! rows the `:force-upload-local-snapshots` enumeration returns, over fixtures
-//! of two or three sandboxes. They cannot see the defect this module guards,
-//! because that defect is not about which rows come back — the correct answer
-//! can be zero — but about how many rows Postgres reads to decide that.
+//! The api's behavioural tests in `inflight_upload_occupancy_tests` cover
+//! *which* rows the `:force-upload-local-snapshots` enumeration returns, over
+//! fixtures of two or three sandboxes. They cannot see the defect this module
+//! guards, because that defect is not about which rows come back — the
+//! correct answer can be zero — but about how many rows Postgres reads to
+//! decide that.
 //!
 //! `target_node_id` is a placement diagnostic that suspend never clears, so a
 //! long-lived node accumulates every sandbox ever suspended from it. The
@@ -73,7 +74,7 @@ use sqlx::PgPool;
 use std::num::NonZeroUsize;
 use uuid::Uuid;
 
-use pplx_space_sandbox_store::admin_occupancy;
+use crate::admin_occupancy;
 
 use pplx_space_test_env::TestResult;
 

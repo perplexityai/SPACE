@@ -120,7 +120,7 @@ pub enum NodeHoldReason {
 }
 
 impl NodeHoldReason {
-    pub const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::CensusAbsent,
         Self::Evacuating,
         Self::UploadInFlight,

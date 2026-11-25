@@ -25,10 +25,9 @@ default = []
 # Exposes `test_support` to other crates' test suites as a dev-dependency
 # feature: `StoredSandboxLifecycle::all`, every value Postgres
 # `sandboxes.lifecycle` can hold, and the reader for writer × stored-lifecycle
-# expectation tables; and
-# `admin_occupancy::pinned_local_only_sandboxes_statement_with_limit`, the
-# force-upload enumeration at a page other than production's, for the api's
-# plan tests. This crate's unit tests get it under `cfg(test)`.
+# expectation tables; and `attribute_runtime::activating_client`, the read of
+# a sandbox's activating-client record, for the api's attribution tests. This
+# crate's unit tests get it under `cfg(test)`.
 test-support = []
 
 [dependencies]
