@@ -1,3 +1,5 @@
+mod plan;
+
 use pplx_space_accounts::{OrgId, UserId};
 
 use std::time::Duration;

@@ -231,8 +231,8 @@ pub async fn pool_target_release(
                            AND tagged.template_name = t.template_name
                           WHERE t.template_name = r.template_name
                             AND t.tag = 'latest'
-                            AND replace(tagged.hash, 'sha256:', '')
-                              = replace(r.hash, 'sha256:', '')) DESC,
+                            AND tagged.hash IN (replace(r.hash, 'sha256:', ''),
+                                                'sha256:' || replace(r.hash, 'sha256:', ''))) DESC,
                       r.created_at DESC
              LIMIT 1",
             digest_original = digest_original("r"),
@@ -581,8 +581,8 @@ pub async fn release_serves_a_tag(
                      FROM template_releases r
                      JOIN template_releases tagged
                        ON tagged.template_name = r.template_name
-                      AND replace(tagged.hash, 'sha256:', '')
-                        = replace(r.hash, 'sha256:', '')
+                      AND tagged.hash IN (replace(r.hash, 'sha256:', ''),
+                                          'sha256:' || replace(r.hash, 'sha256:', ''))
                      JOIN template_release_tags t
                        ON t.template_release_id = tagged.id
                      WHERE r.id = $1
