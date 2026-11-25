@@ -59,18 +59,6 @@ impl KubernetesSubstrate {
             .ok()
     }
 
-    pub(in crate::controllers::substrate::kubernetes) async fn pod_proxy_accepts_tcp(
-        pod_ip: PodIp,
-        port: u16,
-        connect_timeout: Duration,
-    ) -> bool {
-        let addr = pod_ip.socket_addr(port);
-        matches!(
-            timeout(connect_timeout, TcpStream::connect(addr)).await,
-            Ok(Ok(_stream))
-        )
-    }
-
     pub(in crate::controllers::substrate::kubernetes) async fn pod_worker_internal_client(
         pod_ip: PodIp,
         port: u16,

@@ -66,6 +66,45 @@ impl K8sStore {
         Ok(Some(resulting_state))
     }
 
+    /// Record the address the pod's node reported for `pod_uid`, once the
+    /// node confirmed it serves the execution there, for use before kubelet
+    /// publishes `status.podIP`. Only a `created` row of `generation` that
+    /// records `pod_uid` and no address takes it, and becomes `running`; a
+    /// `running` row that already records it is kept. Every other row,
+    /// including one a suspend or retire has moved on, is left as it is.
+    /// Returns whether the row records the address.
+    pub(in crate::controllers::substrate::kubernetes) async fn record_confirmed_pod_ip(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+        pod_uid: &str,
+        pod_ip: PodIp,
+    ) -> Result<bool, SubstrateError> {
+        let recorded = sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions
+             SET pod_ip = $1::INET,
+                 state = 'running',
+                 updated_at = CASE WHEN state = 'created' THEN NOW() ELSE updated_at END
+             WHERE sandbox_id = $2
+               AND generation = $3
+               AND active
+               AND NULLIF(BTRIM(pod_uid), '') = $4
+               AND (
+                   (state = 'created' AND pod_ip IS NULL)
+                   OR (state = 'running' AND pod_ip = $1::INET)
+               )
+             RETURNING 1"
+        ))
+        .bind(pod_ip.to_string())
+        .bind(sandbox_id)
+        .bind(generation)
+        .bind(pod_uid)
+        .fetch_optional(&self.pool)
+        .await
+        .db_context("failed to record the confirmed pod IP")?;
+        Ok(recorded.is_some())
+    }
+
     /// [`Self::persist_pod_metadata`]'s path for a write that also changes the
     /// sandbox's record: `sandboxes` is locked first, then the execution row,
     /// and both are re-read before writing.
@@ -124,6 +163,12 @@ impl K8sStore {
         pod_ip: Option<&str>,
         pod_client: Option<&ClientId>,
     ) -> Result<ActiveExecutionState, SubstrateError> {
+        let pod_ip = super::super::support::pod_ip_or_recorded(
+            pod_ip,
+            pod_uid,
+            tracked.pod_uid.as_deref(),
+            tracked.pod_ip.as_deref(),
+        );
         self.update_active_execution_pod_metadata(tx, sandbox_id, generation, pod_uid, pod_ip)
             .await?;
         if let Some(record) = self.record_after(tracked, pod_uid, pod_client) {

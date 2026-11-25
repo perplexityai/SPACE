@@ -175,7 +175,7 @@ impl KubernetesSubstrate {
     /// readiness finalizer. Requiring a live proxy means a preserved create can
     /// actually be reached by the client's data-plane retry; anything else
     /// falls through to teardown, exactly as before this change.
-    pub(super) async fn preservable_create_node(
+    pub(in crate::controllers::substrate::kubernetes) async fn preservable_create_node(
         &self,
         sandbox_uuid: SandboxId,
         pod_name: &str,
@@ -190,13 +190,11 @@ impl KubernetesSubstrate {
             return None;
         }
         let pod = match self.lookup_sandbox_pod(pod_name) {
-            // Trust the cached pod only when it shows BOTH a node assignment
-            // and a pod IP. The reflector can observe the scheduling update
-            // (`nodeName`) before the later `podIP` assignment; an IP-lagged
-            // cached pod would make `assigned_pod_ip` below return `None` and
-            // wrongly drop a reachable slow-create to teardown even though the
-            // per-pod watch already persisted the IP (`row.pod_ip`, checked
-            // above). Fall through to the authoritative GET in that window.
+            // Trust the cached pod only when it shows a node assignment and a
+            // published IP. The reflector can observe the scheduling update
+            // (`nodeName`) before the later `podIP`, and a published IP the
+            // cache has not seen supersedes the row's node-reported one; fall
+            // through to the authoritative GET in that window.
             Some(pod)
                 if assigned_pod_node_name(&pod).is_some()
                     && assigned_pod_ip(&pod).ok().flatten().is_some() =>
@@ -213,15 +211,27 @@ impl KubernetesSubstrate {
             return None;
         }
         // Live evidence the runtime is reachable — not merely that an IP was
-        // assigned. Same probe + timeout the create proxy-reachable loop uses.
-        let pod_ip = assigned_pod_ip(&pod).ok().flatten()?;
-        if !Self::pod_proxy_accepts_tcp(
-            pod_ip,
-            self.k8s.sandbox_proxy_port,
-            START_WAIT_CONNECT_TIMEOUT,
-        )
-        .await
-        {
+        // assigned. The same identity probe the create proxy-reachable loop
+        // uses: the node behind the address must report this execution.
+        let (pod_ip, source) =
+            current_pod_ip_with_source(&pod, row.pod_uid.as_ref(), row.pod_ip.as_deref())
+                .ok()
+                .flatten()?;
+        let target = PodProxyWaitTarget {
+            pod_name,
+            pod_uid: row.pod_uid.as_ref().map(PodUid::as_str),
+            generation: row.generation,
+        };
+        let reachable = self
+            .probe_pod_proxy(
+                sandbox_uuid,
+                pod_ip,
+                source,
+                &target,
+                Instant::now() + START_WAIT_CONNECT_TIMEOUT,
+            )
+            .await;
+        if !reachable {
             return None;
         }
         self.remember_pod_node_placement(

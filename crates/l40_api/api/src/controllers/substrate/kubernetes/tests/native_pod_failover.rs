@@ -51,6 +51,7 @@ async fn silent_listener(
 fn stale_instance() -> ResolvedPodInstance {
     ResolvedPodInstance {
         ip: PodIp::parse("127.0.0.2").unwrap(),
+        source: super::super::support::PodIpSource::Published,
         pod_uid: Some(PodUid::parse("space-sbx-old-uid").unwrap()),
         generation: 1,
         sandbox_restoring: false,

@@ -8,15 +8,15 @@ use sqlx::PgExecutor;
 /// Record `pod_uid` and `pod_ip` on `sandbox_id`'s active execution at
 /// `generation`, moving it to `running` once it has an IP or to `created`
 /// once it has a UID. A `recovering` execution keeps its state and
-/// `updated_at`.
+/// `updated_at`, and a `suspended` one is not written.
 ///
 /// Stamps `pod_materialized_at` when the row records a pod UID, or held one
 /// before this write replaces or clears it, and never clears a stamp. An
 /// otherwise unchanged row is still written when it carries a UID and no
 /// stamp; that write leaves `state` and `updated_at` as they were.
 ///
-/// `false` when nothing was written: no active execution at `generation`, or
-/// one already current. The two read alike, so a caller that must tell them
+/// `false` when nothing was written: no active execution at `generation`, a
+/// suspended one, or one already current. The two read alike, so a caller that must tell them
 /// apart holds the execution's row lock before this write, in the same
 /// transaction.
 pub async fn record_pod_metadata(
@@ -71,6 +71,7 @@ pub async fn record_pod_metadata(
                      ELSE NOW()
                  END
              WHERE sandbox_id = $3 AND generation = $4 AND active
+               AND state <> 'suspended'
                AND (
                  pod_uid IS DISTINCT FROM $1::TEXT
                  OR pod_ip IS DISTINCT FROM $2::INET

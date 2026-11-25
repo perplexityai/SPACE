@@ -45,10 +45,7 @@ use pplx_space_sandbox_pod::{
 };
 use pplx_space_sbx_mgr_client::proto::SpacedWaitReadyRequest;
 use sqlx::PgPool;
-use tokio::{
-    net::TcpStream,
-    time::{Instant, sleep, timeout, timeout_at},
-};
+use tokio::time::{Instant, sleep, timeout, timeout_at};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tonic::{Code, transport::Channel};
 use tracing::Instrument;
@@ -391,6 +388,7 @@ impl PodIp {
 #[derive(Clone, Debug)]
 struct ResolvedPodInstance {
     ip: PodIp,
+    source: support::PodIpSource,
     pod_uid: Option<PodUid>,
     generation: i64,
     /// The sandbox row read with the execution was `restoring`. A path that

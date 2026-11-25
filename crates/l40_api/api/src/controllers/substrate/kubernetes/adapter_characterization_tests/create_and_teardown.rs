@@ -3,7 +3,7 @@
 use axum::http::{Method, StatusCode};
 
 use super::super::scripted_test_doubles::{
-    KubeLog, ScriptedReply, ScriptedWorkerConfig, kube_status, pod_path, pod_reply,
+    KubeLog, KubeReply, ScriptedReply, ScriptedWorkerConfig, kube_status, pod_path, pod_reply,
     requests_matching, scripted_kube_client, start_scripted_worker,
 };
 use super::super::tests::{
@@ -570,68 +570,89 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
 /// still answers: a runtime crash, or a quarantined sandbox an operator then
 /// discarded. A delete whose pod worker is unreachable reaches the same
 /// sbx-mgr through the node-api of the execution's node, so the delete is
-/// admitted and the teardown finishes instead of retrying it unadmitted.
+/// admitted and the teardown finishes instead of retrying it unadmitted. A
+/// node-reported address kubelet has not published is confirmed the same way.
 #[tokio::test(flavor = "current_thread")]
 async fn a_delete_reaches_the_node_api_when_its_pod_worker_is_gone() -> TestResult {
     if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
         return Ok(());
     }
-    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
-    let sandbox_id = SandboxId::new();
-    let pod_name = "space-sbx-teardown-node-route-g1";
-    insert_test_sandbox_row(&db.pool, sandbox_id, "started").await?;
-    // The execution names its node, and its pod sits at an address nothing
-    // answers on.
-    insert_execution(
-        &db.pool,
-        sandbox_id,
-        ExecutionSeed::running(pod_name, "teardown-node-route-uid"),
-    )
-    .await?;
-    let worker = start_scripted_worker(ScriptedWorkerConfig::new(std::iter::empty())).await?;
-    worker
-        .sim
-        .ensure_default_running(&sandbox_id.to_string())
+    for published in [true, false] {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let sandbox_id = SandboxId::new();
+        let pod_name = "space-sbx-teardown-node-route-g1";
+        let pod_uid = "teardown-node-route-uid";
+        insert_test_sandbox_row(&db.pool, sandbox_id, "started").await?;
+        // The execution names its node, and its pod sits at an address
+        // nothing answers on.
+        insert_execution(
+            &db.pool,
+            sandbox_id,
+            ExecutionSeed::running(pod_name, pod_uid),
+        )
         .await?;
-    let (client, log) = teardown_kube_client();
-    let mut substrate = substrate_with_store_client_proxy_port_and_pods(
-        db.pool.clone(),
-        client,
-        DEFAULT_SANDBOX_PROXY_PORT,
-        vec![
-            sandbox_pod(
-                pod_name,
-                "teardown-node-route-uid",
-                sandbox_id,
-                1,
-                "Running",
-                Some(UNDIALED_POD_IP),
-            ),
-            super::hydration_and_suspend::node_api_pod(worker.port),
-        ],
-    );
-    // Only the node-api pod's advertised port reaches the worker.
-    substrate.k8s.node_api_port = 1;
-    substrate.budgets.teardown_worker_connect = Duration::from_millis(300);
-    substrate.budgets.teardown_node_delete_wait = Duration::from_millis(300);
+        let worker = start_scripted_worker(ScriptedWorkerConfig::new(std::iter::empty())).await?;
+        if published {
+            worker
+                .sim
+                .ensure_default_running(&sandbox_id.to_string())
+                .await?;
+        } else {
+            let mut record = pplx_space_node_api_sim::SandboxRecord::new_creating(
+                sandbox_id.to_string(),
+                "seed".into(),
+                "fc".into(),
+                "root".into(),
+                None,
+                false,
+            )
+            .with_allocation(1, pod_uid, UNDIALED_POD_IP);
+            record.status = "running".into();
+            worker.sim.insert_new(record).await?;
+        }
+        let pod = sandbox_pod(
+            pod_name,
+            pod_uid,
+            sandbox_id,
+            1,
+            "Running",
+            published.then_some(UNDIALED_POD_IP),
+        );
+        let pod_json = serde_json::to_value(&pod)?;
+        let (client, log) = scripted_kube_client(move |request| match request.method {
+            Method::DELETE => kube_status(StatusCode::OK, "Success"),
+            Method::GET => KubeReply::Json(StatusCode::OK, pod_json.clone()),
+            _ => kube_status(StatusCode::NOT_FOUND, "NotFound"),
+        });
+        let mut substrate = substrate_with_store_client_proxy_port_and_pods(
+            db.pool.clone(),
+            client,
+            DEFAULT_SANDBOX_PROXY_PORT,
+            vec![pod, super::hydration_and_suspend::node_api_pod(worker.port)],
+        );
+        // Only the node-api pod's advertised port reaches the worker.
+        substrate.k8s.node_api_port = 1;
+        substrate.budgets.teardown_worker_connect = Duration::from_millis(300);
+        substrate.budgets.teardown_node_delete_wait = Duration::from_millis(300);
 
-    substrate.delete_execution(sandbox_id).await?;
+        substrate.delete_execution(sandbox_id).await?;
 
-    assert_eq!(
-        worker.received("WorkerApi/DeleteSandbox").len(),
-        1,
-        "the delete reached sbx-mgr through the node-api"
-    );
-    assert_eq!(
-        requests_matching(&log, &Method::DELETE).len(),
-        1,
-        "the admitted delete removes the pod"
-    );
-    assert_eq!(
-        active_execution_count(&db.pool, sandbox_id).await?,
-        0,
-        "the admitted delete releases the execution"
-    );
+        assert_eq!(
+            worker.received("WorkerApi/DeleteSandbox").len(),
+            1,
+            "published={published}: the delete reached sbx-mgr through the node-api"
+        );
+        assert_eq!(
+            requests_matching(&log, &Method::DELETE).len(),
+            1,
+            "published={published}: the admitted delete removes the pod"
+        );
+        assert_eq!(
+            active_execution_count(&db.pool, sandbox_id).await?,
+            0,
+            "published={published}: the admitted delete releases the execution"
+        );
+    }
     Ok(())
 }
 
