@@ -913,3 +913,23 @@ async fn cleanup_proceeds_once_the_claim_holder_releases_it() {
         node.stop().await;
     }
 }
+
+#[test]
+fn inspect_reads_the_jailer_cgroup_before_the_sidecar_cgroup() {
+    let parent = tempfile::tempdir().unwrap();
+    let id = SandboxId::new().to_string();
+    let read = || {
+        sandbox_cgroup_dir(parent.path(), &id).map(|dir| read_cgroup_file(&dir, "memory.current"))
+    };
+    assert_eq!(read(), None);
+
+    let sidecar = parent.path().join(format!("sbx-{id}"));
+    std::fs::create_dir(&sidecar).unwrap();
+    std::fs::write(sidecar.join("memory.current"), "4096\n").unwrap();
+    assert_eq!(read().as_deref(), Some("4096"));
+
+    let jailer = parent.path().join(&id);
+    std::fs::create_dir(&jailer).unwrap();
+    std::fs::write(jailer.join("memory.current"), "536870912\n").unwrap();
+    assert_eq!(read().as_deref(), Some("536870912"));
+}

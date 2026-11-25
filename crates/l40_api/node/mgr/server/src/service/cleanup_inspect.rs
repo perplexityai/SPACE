@@ -795,22 +795,16 @@ impl NodeManagerService {
         let vpeer = format!("vpeer-{uuid8}");
         let ns_up = net::ns_exists(&ns);
 
-        // Cgroup (check both sbx- prefix and direct jailer name)
-        let cgroup_path = format!("/sys/fs/cgroup/space/sbx-{sandbox_id}");
-        let jailer_cgroup = format!("/sys/fs/cgroup/space/{sandbox_id}");
-        let cgroup_exists = std::path::Path::new(&cgroup_path).exists()
-            || std::path::Path::new(&jailer_cgroup).exists();
-        let cg_base = if std::path::Path::new(&cgroup_path).exists() {
-            &cgroup_path
-        } else {
-            &jailer_cgroup
-        };
-
+        let cg_base = sandbox_cgroup_dir(
+            std::path::Path::new(pplx_space_node_runtime_core::cgroup_paths::CGROUP_BASE),
+            sandbox_id,
+        );
+        let cgroup_exists = cg_base.is_some();
         let read_cgroup = |file: &str| -> String {
-            std::fs::read_to_string(format!("{cg_base}/{file}"))
+            cg_base
+                .as_deref()
+                .map(|dir| read_cgroup_file(dir, file))
                 .unwrap_or_default()
-                .trim()
-                .to_string()
         };
 
         let run_dir = format!("{RUN_DIR}/{sandbox_id}");
@@ -962,6 +956,26 @@ impl NodeManagerService {
             .page(request.into_inner(), &records)
             .map(Response::new)
     }
+}
+
+/// The cgroup under `parent` whose figures `InspectSandbox` reports: the
+/// jailer cgroup `{id}`, which holds the VM and carries its limits and usage,
+/// or the sidecar cgroup `sbx-{id}` when the jailer cgroup is absent.
+fn sandbox_cgroup_dir(parent: &std::path::Path, sandbox_id: &str) -> Option<std::path::PathBuf> {
+    [
+        pplx_space_node_runtime_core::cgroup_paths::jailer_cgroup_path_in(parent, sandbox_id),
+        parent.join(format!("sbx-{sandbox_id}")),
+    ]
+    .into_iter()
+    .find(|dir| dir.exists())
+}
+
+/// One cgroup interface file, trimmed; an absent file reads as empty.
+fn read_cgroup_file(dir: &std::path::Path, file: &str) -> String {
+    std::fs::read_to_string(dir.join(file))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 fn parse_cleanup_request(
