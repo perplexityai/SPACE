@@ -386,29 +386,42 @@ def _run_all(
         for part in os.environ.get("SPACE_SMOKE_INCLUDE_SCENARIOS", "").split(",")
         if part.strip()
     )
+    named = _run_scenarios()
     try:
-        if "manual" in selected_tiers:
-            raise ValueError("manual scenarios run only by name, not through --all or --category")
-        eligible = REGISTRY.select(
-            category=category, template=template, tiers=selected_tiers,
-            include_scenarios=included,
-        )
+        if named:
+            if category is not None:
+                raise ValueError(f"{RUN_SCENARIOS_ENV} selects for --all, not --category")
+            # Exactly these, in this order and as often as listed, manual
+            # ones included: a named run replaces the tier selection.
+            eligible = tuple(REGISTRY.get(scenario_id) for scenario_id in named)
+        else:
+            if "manual" in selected_tiers:
+                raise ValueError(
+                    "manual scenarios run only by name, not through --all or --category"
+                )
+            eligible = REGISTRY.select(
+                category=category, template=template, tiers=selected_tiers,
+                include_scenarios=included,
+            )
     except (ValueError, KeyError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
-    print(f"TIERS: {', '.join(selected_tiers)}")
-    if included:
-        print(f"ADDITIONAL MAIN SCENARIOS: {', '.join(included)}")
-    # Withheld cases are visible holes in coverage, never passes.
-    for held in REGISTRY.select(
-        category=category, template=template, include_quarantined=True, tiers=TIERS,
-    ):
-        if held.quarantined is not None:
-            print(f"QUARANTINED {held.id}: {held.quarantined}")
-        elif held.tier == "manual":
-            print(f"MANUAL {held.id}: {held.manual_reason}")
-        elif held.tier not in selected_tiers and held.id not in included:
-            print(f"SKIPPED {held.id}: tier {held.tier} is not selected")
+    if named:
+        print(f"NAMED SCENARIOS: {', '.join(named)}")
+    else:
+        print(f"TIERS: {', '.join(selected_tiers)}")
+        if included:
+            print(f"ADDITIONAL MAIN SCENARIOS: {', '.join(included)}")
+        # Withheld cases are visible holes in coverage, never passes.
+        for held in REGISTRY.select(
+            category=category, template=template, include_quarantined=True, tiers=TIERS,
+        ):
+            if held.quarantined is not None:
+                print(f"QUARANTINED {held.id}: {held.quarantined}")
+            elif held.tier == "manual":
+                print(f"MANUAL {held.id}: {held.manual_reason}")
+            elif held.tier not in selected_tiers and held.id not in included:
+                print(f"SKIPPED {held.id}: tier {held.tier} is not selected")
     api_surface = os.environ.get("SPACE_SMOKE_API_SURFACE", "ecw")
     if category is None:
         eligible = tuple(
@@ -473,6 +486,7 @@ def _run_all(
                 include_scenarios=included,
                 backend=backend,
                 browser_selection=browser_selection,
+                run_scenarios=named,
             )
         inventory = scenarios
         scenarios = select_shard(
@@ -482,7 +496,16 @@ def _run_all(
             api_surface=api_surface,
             inventories=inventories,
         )
+        if named:
+            # A named run's share keeps the order the run named its
+            # scenarios in, so a caller can put last one that disturbs the
+            # bench; repeats of one scenario run back to back.
+            scenarios = tuple(sorted(scenarios, key=lambda scenario: named.index(scenario.id)))
         print(f"SHARD {index}/{count}: {len(scenarios)} scenarios ({api_surface})")
+        # Fewer named runs than shards leave some shards nothing, which is
+        # their whole share.
+        if not scenarios and named:
+            return 0
         # The joint partition need not give a shard work on every surface: a
         # long scenario can fill one shard's load by itself. That pass has
         # nothing to run while the shard's other pass covers its share. A
@@ -814,6 +837,16 @@ def _apply_drain_v1(
 
 
 BROWSER_SCENARIOS_ENV = "SPACE_SMOKE_BROWSER_SCENARIOS"
+# The scenarios an `--all` pass runs instead of its tier selection, comma
+# separated, in order and as often as listed, manual ones included
+# (scripts/tests/smoke-kind-parallel.sh --scenario and --repeat).
+RUN_SCENARIOS_ENV = "SPACE_SMOKE_RUN_SCENARIOS"
+
+
+def _run_scenarios() -> tuple[str, ...]:
+    return tuple(
+        part.strip() for part in os.environ.get(RUN_SCENARIOS_ENV, "").split(",") if part.strip()
+    )
 BROWSER_SELECTIONS = ("run", "require", "withhold")
 
 

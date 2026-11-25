@@ -27,13 +27,19 @@
 #
 # Usage:
 #   scripts/tests/smoke-kind-parallel.sh [run] [--benches N] [--keep] [--out DIR]
+#                                        [--scenario ID]... [--repeat N]
 #   scripts/tests/smoke-kind-parallel.sh teardown
 #
-#   --benches N  benches to run (default: from the host's CPUs, available
-#                memory, free disk and a write probe of the bench volume, printed)
-#   --keep       leave the benches up afterwards; `teardown` removes them
-#   --out DIR    where logs, timings and the summary go
-#                (default: ~/.space-devbox/kind-parallel/<run id>)
+#   --benches N    benches to run (default: from the host's CPUs, available
+#                  memory, free disk and a write probe of the bench volume, printed)
+#   --keep         leave the benches up afterwards; `teardown` removes them
+#   --out DIR      where logs, timings and the summary go
+#                  (default: ~/.space-devbox/kind-parallel/<run id>)
+#   --scenario ID  run this scenario instead of the tier selection, whatever
+#                  its tier, manual included; repeat the flag for more, which
+#                  run in the order named on each bench
+#   --repeat N     run each named scenario N times (default 1), spread across
+#                  the benches by the same duration-balanced partition
 #
 # Exit status: as the typed suite ranks a suite: 1 a scenario failed that
 # SPACE_SMOKE_KNOWN_FAILURES did not excuse; else 2
@@ -45,6 +51,7 @@
 #
 # Env: SPACE_KIND_SUBSTRATE, SPACE_KIND_STORAGE_CREDENTIALS, SPACE_KIND_RUST_BUILD,
 # SPACE_SMOKE_TIERS (default routine), SPACE_SMOKE_INCLUDE_SCENARIOS,
+# SPACE_SMOKE_RUN_SCENARIOS (what --scenario and --repeat set),
 # SPACE_SMOKE_SUBSTRATE, SPACE_SMOKE_KNOWN_FAILURES, SPACE_KIND_TELEMETRY_MODE
 # (default otel) and SPACE_CI_IMAGE_MIRROR pass through to every bench. SPACE_KIND_BENCH_ROOT
 # (default ~/.space-benches) holds the benches' Docker data. SPACE_KIND_REGISTRY_MIRROR
@@ -71,6 +78,8 @@ COMMAND=run
 BENCHES=""
 KEEP=0
 OUT=""
+NAMED=()
+REPEAT=""
 if [[ "${1:-}" == run || "${1:-}" == teardown ]]; then
   COMMAND="$1"
   shift
@@ -82,6 +91,10 @@ while (( $# > 0 )); do
     --keep) KEEP=1; shift ;;
     --out) OUT="${2:?--out needs a directory}"; shift 2 ;;
     --out=*) OUT="${1#*=}"; [[ -n "$OUT" ]] || die "--out needs a directory"; shift ;;
+    --scenario) NAMED+=("${2:?--scenario needs a scenario ID}"); shift 2 ;;
+    --scenario=*) NAMED+=("${1#*=}"); [[ -n "${NAMED[-1]}" ]] || die "--scenario needs a scenario ID"; shift ;;
+    --repeat) REPEAT="${2:?--repeat needs a count}"; shift 2 ;;
+    --repeat=*) REPEAT="${1#*=}"; [[ -n "$REPEAT" ]] || die "--repeat needs a count"; shift ;;
     -h|--help) sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -90,6 +103,27 @@ done
 # --keep run left.
 if [[ -n "$BENCHES" ]] && { ! [[ "$BENCHES" =~ ^[1-9][0-9]*$ ]] || (( BENCHES > KIND_BENCH_MAX )); }; then
   die "--benches must be 1..$KIND_BENCH_MAX (got $BENCHES)"
+fi
+if [[ -n "$REPEAT" ]] && { ! [[ "$REPEAT" =~ ^[1-9][0-9]*$ ]] || (( REPEAT > 100 )); }; then
+  die "--repeat must be 1..100 (got $REPEAT)"
+fi
+if [[ -n "$REPEAT" ]] && (( ${#NAMED[@]} == 0 )); then
+  die "--repeat repeats the --scenario runs; name at least one"
+fi
+# A named run: every bench's typed pass runs its share of this list, each
+# scenario as often as it is listed (space_smoke/__main__.py,
+# SPACE_SMOKE_RUN_SCENARIOS), in place of the tier selection.
+if (( ${#NAMED[@]} > 0 )); then
+  for id in "${NAMED[@]}"; do
+    [[ "$id" =~ ^[A-Za-z0-9_.]+$ ]] || die "refusing scenario ID '$id'"
+  done
+  runs=()
+  for id in "${NAMED[@]}"; do
+    for _ in $(seq 1 "${REPEAT:-1}"); do runs+=("$id"); done
+  done
+  SPACE_SMOKE_RUN_SCENARIOS="$(IFS=,; printf '%s' "${runs[*]}")"
+  export SPACE_SMOKE_RUN_SCENARIOS
+  unset runs id
 fi
 
 # Two registries on the host's own Docker, kept across runs:
@@ -425,7 +459,7 @@ printf '%s\n' "$BENCHES" >"$OUT/bench-count"
 # until the run has copied and built it: check_source compares each bench's
 # copy, and the checkout after each host step, with this record.
 SPACE_KIND_SUBSTRATE="${SPACE_KIND_SUBSTRATE:-}" SPACE_KIND_RUST_BUILD="${SPACE_KIND_RUST_BUILD:-}" \
-  SPACE_SMOKE_TIERS="${SPACE_SMOKE_TIERS:-}" \
+  SPACE_SMOKE_TIERS="${SPACE_SMOKE_TIERS:-}" SPACE_SMOKE_RUN_SCENARIOS="${SPACE_SMOKE_RUN_SCENARIOS:-}" \
   python3 "$SCRIPT_DIR/lib/kind_parallel_report.py" source "$REPO_ROOT" "$OUT/source.json" \
   || die "could not record the checkout's state"
 log "run $RUN_ID: output in $OUT"
@@ -780,6 +814,8 @@ smoke_selection_env() {
   printf 'SPACE_SMOKE_TIERS=%s\n' "${SPACE_SMOKE_TIERS:-routine}"
   [[ -z "${SPACE_SMOKE_INCLUDE_SCENARIOS:-}" ]] \
     || printf 'SPACE_SMOKE_INCLUDE_SCENARIOS=%s\n' "$SPACE_SMOKE_INCLUDE_SCENARIOS"
+  [[ -z "${SPACE_SMOKE_RUN_SCENARIOS:-}" ]] \
+    || printf 'SPACE_SMOKE_RUN_SCENARIOS=%s\n' "$SPACE_SMOKE_RUN_SCENARIOS"
 }
 
 # The full inventory, for the coverage check: the typed runner's own

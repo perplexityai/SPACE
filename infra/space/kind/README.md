@@ -353,6 +353,18 @@ scripts/tests/smoke-kind-parallel.sh --benches 4 --keep     # leave the benches 
 scripts/tests/smoke-kind-parallel.sh teardown               # remove what a run left
 ```
 
+To run chosen scenarios instead of the tier selection, manual ones
+included, name them with `--scenario` (repeat the flag for more) and give
+`--repeat N` to run each N times. The runs are spread across the benches by
+the same duration-balanced partition, each bench runs its share in the order
+the scenarios were named, and the coverage check expects each scenario as
+often as it was named. Nothing outside the tier selection runs unless named:
+
+```bash
+scripts/tests/smoke-kind-parallel.sh --benches 4 \
+  --scenario native.v2_drain_holds_running_until_its_deadline --repeat 3
+```
+
 Bench `i` of `N` is one CI shard runner: it runs the baseline
 (`smoke-kind-e2e.sh`) and then `smoke-kind-typed.sh all i/N`, so the benches
 together run both API surfaces' inventory once each. The summary

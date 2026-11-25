@@ -16,7 +16,8 @@ summary.md, summary.json and timeline.txt there, and exits as the typed suite
 ranks a suite (space_smoke/suite.py, suite_exit_code): 1 when any scenario
 failed; else 2 when a bench did not come up, a scenario was inconclusive or did
 not finish, a pass exited 2 outside any scenario, the benches did not cover
-the inventory exactly once, the checkout changed during the run, or the run's
+the inventory exactly once (a named run: each scenario as often as named),
+the checkout changed during the run, or the run's
 teardown left benches; else 42
 when a scenario warned; else 0. A failure the known-failures list excused
 (`KNOWN FAILURE <id>` in its pass) is listed and does not count as one, and a
@@ -60,6 +61,11 @@ def inventory(benches: int) -> int:
         ),
         backend=os.environ.get("SPACE_SMOKE_BACKEND", "kind"),
         browser_selection=os.environ.get("SPACE_SMOKE_BROWSER_SCENARIOS") or "run",
+        run_scenarios=tuple(
+            part.strip()
+            for part in os.environ.get("SPACE_SMOKE_RUN_SCENARIOS", "").split(",")
+            if part.strip()
+        ),
     )
     shares = {
         str(index): {
@@ -374,18 +380,24 @@ def summarize(out: Path) -> int:
         incomplete = True
     else:
         for surface in SURFACES:
-            expected = set(inventory_data["surfaces"][surface])
+            # A named run lists a scenario once per repetition, so each pair
+            # is expected as many times as it is listed; an implicit
+            # selection lists each once.
+            expected = Counter(inventory_data["surfaces"][surface])
             ran = seen.get(surface, Counter())
             mode_skipped = skipped.get(surface, Counter())
-            # Each pair once across the benches, run or skipped by a mode.
+            # Each pair as often as expected across the benches, run or
+            # skipped by a mode.
             occurrences = ran + mode_skipped
             entry = {
-                "expected": len(expected),
+                "expected": sum(expected.values()),
                 "ran": sum(ran.values()),
                 "skipped_by_mode": sorted(mode_skipped),
-                "missing": sorted(expected - set(occurrences)),
-                "unexpected": sorted(set(occurrences) - expected),
-                "duplicated": sorted(s for s, n in occurrences.items() if n > 1),
+                "missing": sorted(expected - occurrences),
+                "unexpected": sorted(set(occurrences) - set(expected)),
+                "duplicated": sorted(
+                    s for s, n in occurrences.items() if s in expected and n > expected[s]
+                ),
             }
             entry["exactly_once"] = not (entry["missing"] or entry["unexpected"] or entry["duplicated"])
             coverage["surfaces"][surface] = entry
@@ -459,7 +471,11 @@ def summarize(out: Path) -> int:
             else " (clean)"
         ),
         f"- lane: substrate {source.get('substrate')}, Rust build {source.get('rust_build')},"
-        f" tiers {source.get('tiers')}",
+        + (
+            f" named scenarios {source['named']}"
+            if source.get("named")
+            else f" tiers {source.get('tiers')}"
+        ),
         f"- Rust image: {source['rust_image'].get('image_id')} built from"
         f" {source['rust_image'].get('built_from')} ({rust_image_origin(source['rust_image'])})",
     ]
@@ -588,6 +604,7 @@ def source(repo: Path, destination: Path) -> int:
         "substrate": os.environ.get("SPACE_KIND_SUBSTRATE") or "kubernetes",
         "rust_build": os.environ.get("SPACE_KIND_RUST_BUILD") or "test-hooks",
         "tiers": os.environ.get("SPACE_SMOKE_TIERS") or "routine",
+        "named": os.environ.get("SPACE_SMOKE_RUN_SCENARIOS") or "",
     }
     destination.write_text(json.dumps(record, indent=2) + "\n")
     return 0

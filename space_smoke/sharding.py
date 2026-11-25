@@ -205,17 +205,24 @@ def joint_inventories(
     include_scenarios: tuple[str, ...],
     backend: str,
     browser_selection: str,
+    run_scenarios: tuple[str, ...] = (),
 ) -> dict[str, tuple[Scenario[Any], ...]]:
     """Each joint surface's eligible inventory, as a sharded `--all` pass filters it.
 
-    The tiers and extra scenarios, the surface, the backend, then browser
-    withholding; mode-dependent skips come after the partition. Every pass of
-    a sharded run partitions these, and so does anything that checks the
-    run's coverage (scripts/tests/lib/kind_parallel_report.py).
+    The tiers and extra scenarios, or with `run_scenarios` exactly those, in
+    that order and as often as listed, whatever their tier; then the surface,
+    the backend and browser withholding; mode-dependent skips come after the
+    partition. Every pass of a sharded run partitions these, and so does
+    anything that checks the run's coverage
+    (scripts/tests/lib/kind_parallel_report.py).
     """
 
-    selected = registry.select(
-        category=None, template=template, tiers=tiers, include_scenarios=include_scenarios,
+    selected = (
+        tuple(registry.get(scenario_id) for scenario_id in run_scenarios)
+        if run_scenarios
+        else registry.select(
+            category=None, template=template, tiers=tiers, include_scenarios=include_scenarios,
+        )
     )
     return {
         surface: tuple(

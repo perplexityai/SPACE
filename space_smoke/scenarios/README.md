@@ -53,6 +53,11 @@ scenario after another. For the drain v2 set on four benches:
 uv run --frozen --python 3.11 -m space_smoke list --prefix native.v2_ --tier manual --shard 1/4
 ```
 
+`scripts/tests/smoke-kind-parallel.sh --scenario ID --repeat N` brings the
+benches up and runs named scenarios, repeated, across them in one command.
+It sets `SPACE_SMOKE_RUN_SCENARIOS`, a comma-separated list an `--all` pass
+runs instead of its tier selection, in order and as often as listed.
+
 `SPACE_SMOKE_TIERS=routine,main` selects the same tiers for suite wrappers.
 `SPACE_SMOKE_INCLUDE_SCENARIOS` adds named main-tier cases to a routine run
 before sharding; it does not bypass environment requirements or quarantine.
