@@ -16,15 +16,6 @@ impl GrantStorageError {
     }
 }
 
-/// Whether this build's grant is fresh and names its publication target.
-pub(super) async fn covers(
-    executor: impl PgExecutor<'_>,
-    template: &TemplateName,
-    grant: SystemPublicationGrantId,
-) -> Result<bool, GrantStorageError> {
-    Ok(publication_grants::system_grant_covers(executor, template, grant).await?)
-}
-
 /// Consume only this build's grant in the publication transaction. Rollback
 /// restores it; concurrent uses of the same grant can commit at most once.
 pub(super) async fn consume(

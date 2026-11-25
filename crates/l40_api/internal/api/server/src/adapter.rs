@@ -236,16 +236,16 @@ impl ClusterApi for ClusterApiService {
 
         // Registration leaves the grant for the release that follows it.
         if let Some(grant) = system_grant
-            && !template_system_publication_grants::covers(&mut *tx, &name, grant)
-                .await
-                .map_err(|err| {
-                    template_publication::storage_status("check system publication", err.as_sql())
-                })?
+            && !pplx_space_template_store::publication_grants::system_grant_covers(
+                &mut *tx, &name, grant,
+            )
+            .await
+            .map_err(|err| template_publication::storage_status("check system publication", &err))?
         {
             return Err(template_publication::missing_system_publication_grant());
         }
         if let (Some(grant), TemplateOrg::Owned { org_id }) = (tenant_grant, template_org)
-            && !template_tenant_publication_grants::covers(
+            && !pplx_space_template_store::publication_grants::tenant_grant_covers(
                 &mut *tx,
                 &template_tenant_publication_grants::TenantPublication {
                     grant,
@@ -255,9 +255,7 @@ impl ClusterApi for ClusterApiService {
                 },
             )
             .await
-            .map_err(|err| {
-                template_publication::storage_status("check tenant publication", err.as_sql())
-            })?
+            .map_err(|err| template_publication::storage_status("check tenant publication", &err))?
         {
             return Err(template_publication::missing_tenant_publication_grant());
         }

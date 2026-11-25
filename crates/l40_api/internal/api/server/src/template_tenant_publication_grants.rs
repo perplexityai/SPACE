@@ -24,18 +24,9 @@ impl GrantStorageError {
 /// publishes, and the publisher’s authenticated registered nodes.
 pub(super) use pplx_space_template_store::publication_grants::TenantPublication;
 
-/// Whether this build's grant is fresh, names this target and owner, and
-/// is bound to the authenticated builder.
-pub(super) async fn covers(
-    executor: impl PgExecutor<'_>,
-    publication: &TenantPublication<'_>,
-) -> Result<bool, GrantStorageError> {
-    Ok(publication_grants::tenant_grant_covers(executor, publication).await?)
-}
-
 /// Consume only this build's grant in the publication transaction, under the
-/// same conditions as [`covers`]. Rollback restores it; concurrent uses of
-/// the same grant can commit at most once.
+/// same conditions as [`publication_grants::tenant_grant_covers`]. Rollback
+/// restores it; concurrent uses of the same grant can commit at most once.
 pub(super) async fn consume(
     executor: impl PgExecutor<'_>,
     publication: &TenantPublication<'_>,
