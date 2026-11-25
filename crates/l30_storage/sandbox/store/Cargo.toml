@@ -26,10 +26,13 @@ default = []
 # feature: `StoredSandboxLifecycle::all`, every value Postgres
 # `sandboxes.lifecycle` can hold, and the reader for writer × stored-lifecycle
 # expectation tables; `attribute_runtime::activating_client`, the read of a
-# sandbox's activating-client record, for the api's attribution tests; and
+# sandbox's activating-client record, for the api's attribution tests;
 # `test_support::sweeper`, the transient-lifecycle sweeper's statements, for
-# the cluster controller's sweeper tests. This crate's unit tests get it under
-# `cfg(test)`.
+# the cluster controller's sweeper tests; `test_support::admin_occupancy`, the
+# node and fleet occupancy statements, for the api's plan tests; and
+# `direct::sandbox_listing::admin::AdminIdSearch::id_prefix`, the ID-prefix
+# range a search binds, for the api's admin-search tests. This crate's unit
+# tests get them under `cfg(test)`.
 test-support = []
 
 [dependencies]

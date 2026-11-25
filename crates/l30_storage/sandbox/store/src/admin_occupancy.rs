@@ -640,7 +640,7 @@ static GROUP_OCCUPANCY: LazyLock<String> = LazyLock::new(|| {
 
 /// The statement [`node_occupancy`] runs for `ranked` and `residency`, for a
 /// caller that inspects its plan.
-pub fn node_occupancy_statement(ranked: bool, residency: ResidencyEvidence) -> &'static str {
+pub(crate) fn node_occupancy_statement(ranked: bool, residency: ResidencyEvidence) -> &'static str {
     match (ranked, residency) {
         (false, _) => &NODE_OCCUPANCY,
         (true, ResidencyEvidence::LifecycleOnly) => &RANKED_NODE_OCCUPANCY,
@@ -650,7 +650,10 @@ pub fn node_occupancy_statement(ranked: bool, residency: ResidencyEvidence) -> &
 
 /// The statement [`fleet_occupancy`] runs for `ranked` and `residency`, for a
 /// caller that inspects its plan.
-pub fn fleet_occupancy_statement(ranked: bool, residency: ResidencyEvidence) -> &'static str {
+pub(crate) fn fleet_occupancy_statement(
+    ranked: bool,
+    residency: ResidencyEvidence,
+) -> &'static str {
     match (ranked, residency) {
         (false, _) => &FLEET_OCCUPANCY,
         (true, ResidencyEvidence::LifecycleOnly) => &RANKED_FLEET_OCCUPANCY,

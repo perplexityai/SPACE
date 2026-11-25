@@ -210,7 +210,8 @@ impl WarmPoolStore {
         &self.pool
     }
 
-    pub async fn enabled_configs(&self) -> Result<PoolConfigRead> {
+    #[cfg(test)]
+    pub(crate) async fn enabled_configs(&self) -> Result<PoolConfigRead> {
         let rows = sqlx::query_as::<_, PoolConfigRow>(sql!(
             "SELECT c.id, c.template_release_id, r.template_name, r.hash AS content_hash,
                     c.vcpu, c.memory_mib, c.disk_mib, c.disk_io_max_operations_per_sec,
