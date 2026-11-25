@@ -32,4 +32,4 @@ pplx-space-state-reconciliation = { workspace = true, features = ["sqlx"] }
 [dev-dependencies]
 pplx-space-db-test-fixtures = { workspace = true }
 pplx-space-observability = { workspace = true, features = ["otel", "test-capture"] }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

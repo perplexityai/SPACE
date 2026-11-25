@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use pplx_space_accounts::NodeId;
 
 use super::*;
-use pplx_space_db_test_fixtures::pg_test_db;
+use pplx_space_db_test_fixtures::{pg_test_db, pg_test_db_with_max_connections};
 use sqlx::PgPool;
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -146,6 +147,110 @@ async fn enqueue_rejects_cluster_role_nodes() -> TestResult {
             .await?;
     assert_eq!(count, 0);
     Ok(())
+}
+
+/// Two enqueues over the same nodes lock their trigger rows in node-id order,
+/// whichever plan each runs the upsert with. The settings force each plan mode;
+/// on the fixture's Postgres, `nodes` never analyzed, the custom plan without
+/// hash aggregation walks the sorted ids, the generic one scans `nodes`, stored
+/// in descending id order. A third enqueue holds the middle row, so without the
+/// ORDER BY each would hold one end and wait on the middle, then on the other:
+/// a deadlock (40P01).
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_enqueues_on_different_plans_do_not_deadlock() -> TestResult {
+    // The holder, the two enqueues, and the lock probe.
+    let db = pg_test_db_with_max_connections(4).await?;
+    let mut node_ids = [NodeId::new(), NodeId::new(), NodeId::new()];
+    node_ids.sort();
+    for &node_id in node_ids.iter().rev() {
+        insert_node(
+            &db.pool,
+            node_id,
+            SpaceNodeRole::Worker.as_str(),
+            "k8s",
+            None,
+        )
+        .await?;
+    }
+    let reason = ReconcileReason::TemplateDesiredStateUpdated;
+
+    let mut holder = db.pool.begin().await?;
+    enqueue_triggers_tx(&mut holder, [node_ids[1]], reason).await?;
+    let (custom_pid, custom) = spawn_enqueue(
+        &db.pool,
+        &[
+            ("plan_cache_mode", "force_custom_plan"),
+            ("enable_hashagg", "off"),
+        ],
+        node_ids,
+        reason,
+    )
+    .await?;
+    wait_until_waiting(&db.pool, custom_pid).await?;
+    let (generic_pid, generic) = spawn_enqueue(
+        &db.pool,
+        &[("plan_cache_mode", "force_generic_plan")],
+        node_ids,
+        reason,
+    )
+    .await?;
+    wait_until_waiting(&db.pool, generic_pid).await?;
+    holder.commit().await?;
+
+    let custom = tokio::time::timeout(Duration::from_secs(10), custom).await??;
+    let generic = tokio::time::timeout(Duration::from_secs(10), generic).await??;
+    assert!(
+        matches!((&custom, &generic), (Ok(3), Ok(3))),
+        "custom plan: {custom:?}, generic plan: {generic:?}"
+    );
+    Ok(())
+}
+
+/// Start an enqueue of `node_ids`, in its own transaction, on a connection
+/// with `settings` applied, and return that connection's backend pid.
+async fn spawn_enqueue(
+    pool: &PgPool,
+    settings: &[(&str, &str)],
+    node_ids: [NodeId; 3],
+    reason: ReconcileReason,
+) -> TestResult<(i32, tokio::task::JoinHandle<Result<u64, sqlx::Error>>)> {
+    let mut conn = pool.acquire().await?;
+    for (name, value) in settings {
+        sqlx::query(sql!("SELECT set_config($1, $2, false)"))
+            .bind(name)
+            .bind(value)
+            .execute(&mut *conn)
+            .await?;
+    }
+    let pid: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+        .fetch_one(&mut *conn)
+        .await?;
+    let enqueue = tokio::spawn(async move {
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+        let queued = enqueue_triggers_tx(&mut tx, node_ids, reason).await?;
+        tx.commit().await?;
+        Ok(queued)
+    });
+    Ok((pid, enqueue))
+}
+
+/// Return once backend `pid` waits on a lock another backend holds.
+async fn wait_until_waiting(pool: &PgPool, pid: i32) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let waiting: bool =
+            sqlx::query_scalar(sql!("SELECT cardinality(pg_blocking_pids($1)) > 0"))
+                .bind(pid)
+                .fetch_one(pool)
+                .await?;
+        if waiting {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("backend {pid} never waited on a lock").into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

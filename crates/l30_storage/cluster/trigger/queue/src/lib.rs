@@ -141,6 +141,14 @@ where
              FROM eligible
              CROSS JOIN counts
              WHERE counts.requested = counts.eligible
+             -- Each row is inserted, or its existing trigger row locked and
+             -- updated, in this SELECT's output order. Without ORDER BY that
+             -- order is the plan's: a generic plan of this prepared statement
+             -- can scan `nodes` where a custom plan walks `input`, and a hash
+             -- DISTINCT or the join can reorder the sorted ids bound as $1.
+             -- Two enqueues over overlapping nodes could then lock them in
+             -- opposite orders and deadlock.
+             ORDER BY eligible.node_id
              ON CONFLICT (node_id) DO UPDATE
              SET generation = node_reconcile_triggers.generation + 1,
                  reasons = CASE
