@@ -2872,10 +2872,13 @@ mod postgres_backed {
     use pplx_space_sandbox_model::SandboxId;
     use pplx_space_sandbox_model::SandboxLifecycle;
     use pplx_space_sandbox_store::sweeper::{
-        AgedTransientRow, HEAL_COMMAND_READY_PENDING_SQL, LIST_COMMAND_READY_PENDING_SQL,
+        AgedTransientRow, fail_unrestorable_restoring_query, list_aged_transient_query,
+        list_unrestorable_restoring_query,
+    };
+    use pplx_space_sandbox_store::test_support::sweeper::{
+        HEAL_COMMAND_READY_PENDING_SQL, LIST_COMMAND_READY_PENDING_SQL,
         REAP_COMMAND_READY_PENDING_SQL, REPAIR_FAILED_ACTIVE_EXECUTION_SQL,
-        converge_restoring_query, fail_candidate_query, fail_unrestorable_restoring_query,
-        list_aged_transient_query, list_unrestorable_restoring_query, revert_to_suspended_query,
+        converge_restoring_query, fail_candidate_query, revert_to_suspended_query,
         undo_revert_to_suspended_query,
     };
     use pplx_space_snapshot_model::SnapshotId;

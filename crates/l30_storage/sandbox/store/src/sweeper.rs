@@ -28,15 +28,15 @@
 //! ([`fail_unrestorable_restoring`]). The others, `evacuation_guards`
 //! among them, are interpolated only here too.
 //!
-//! [`LIST_COMMAND_READY_PENDING_SQL`], [`HEAL_COMMAND_READY_PENDING_SQL`],
-//! [`REAP_COMMAND_READY_PENDING_SQL`], [`REPAIR_FAILED_ACTIVE_EXECUTION_SQL`]
-//! and the [`list_aged_transient_query`],
-//! [`list_unrestorable_restoring_query`], [`fail_candidate_query`],
-//! [`converge_restoring_query`], [`revert_to_suspended_query`],
-//! [`undo_revert_to_suspended_query`] and
-//! [`fail_unrestorable_restoring_query`] builders are public only because
-//! the sweeper's Postgres tests run them directly. Production code calls the
-//! function here that binds each one.
+//! The [`list_aged_transient_query`], [`list_unrestorable_restoring_query`]
+//! and [`fail_unrestorable_restoring_query`] builders are public only because
+//! the sweeper's Postgres tests run them directly. Those tests reach
+//! `LIST_COMMAND_READY_PENDING_SQL`, `HEAL_COMMAND_READY_PENDING_SQL`,
+//! `REAP_COMMAND_READY_PENDING_SQL`, `REPAIR_FAILED_ACTIVE_EXECUTION_SQL` and
+//! the `fail_candidate_query`, `converge_restoring_query`,
+//! `revert_to_suspended_query` and `undo_revert_to_suspended_query` builders
+//! through `test_support::sweeper`, under the `test-support` feature.
+//! Production code calls the function here that binds each one.
 
 use pplx_space_durations::PositiveDuration;
 use pplx_space_node_model::SubstrateKind;
@@ -269,7 +269,7 @@ pub const fn is_activation_owned(lifecycle: SandboxLifecycle) -> bool {
 
 /// Shared evacuation-aware guards layered on top of the plain age predicate.
 /// Used identically by [`list_aged_transient_query`] (the probe-first
-/// select) and [`fail_candidate_query`] (the per-row fail CAS), so
+/// select) and `fail_candidate_query` (the per-row fail CAS), so
 /// a row can never be failed under a guard the select did not apply:
 ///
 /// 1. `(evacuation_restore_target IS NULL OR lifecycle = 'suspending')` exempts
@@ -582,7 +582,7 @@ pub async fn list_aged_transient(
 /// set, and no fixed front-of-queue can monopolize the batch. The matching set
 /// (aged, never-retried preserved creates) is small, so the random sort is
 /// cheap.
-pub const LIST_COMMAND_READY_PENDING_SQL: &str = sql!(
+pub(crate) const LIST_COMMAND_READY_PENDING_SQL: &str = sql!(
     "SELECT
          s.id,
          EXTRACT(EPOCH FROM (NOW() - s.lifecycle_changed_at))::BIGINT AS age_secs,
@@ -602,7 +602,7 @@ pub const LIST_COMMAND_READY_PENDING_SQL: &str = sql!(
      LIMIT $3"
 );
 
-/// One row of [`LIST_COMMAND_READY_PENDING_SQL`]: a `started` row whose
+/// One row of `LIST_COMMAND_READY_PENDING_SQL`: a `started` row whose
 /// `command_ready_pending` marker outlived the age, with its active
 /// execution's pod identity when it has one.
 #[derive(sqlx::FromRow)]
@@ -618,7 +618,7 @@ pub struct CommandReadyPendingRow {
 
 /// List up to `limit` `started` rows of the `managed_by` substrate whose
 /// `command_ready_pending` marker is older than `age` on the database clock
-/// ([`LIST_COMMAND_READY_PENDING_SQL`]), changing nothing.
+/// (`LIST_COMMAND_READY_PENDING_SQL`), changing nothing.
 pub async fn list_command_ready_pending(
     executor: impl sqlx::PgExecutor<'_>,
     managed_by: &str,
@@ -660,7 +660,7 @@ pub async fn lock_placement_changed_at(
 
 /// Heal query: clear the marker on a probe-confirmed-ready row. Bind order:
 /// `$1` = sandbox id, `$2` = `managed_by`. Lifecycle is left untouched.
-pub const HEAL_COMMAND_READY_PENDING_SQL: &str = sql!(
+pub(crate) const HEAL_COMMAND_READY_PENDING_SQL: &str = sql!(
     "UPDATE sandboxes
      SET command_ready_pending = false
      WHERE id = $1
@@ -669,7 +669,7 @@ pub const HEAL_COMMAND_READY_PENDING_SQL: &str = sql!(
 );
 
 /// Clear `command_ready_pending` on a `started` row the sweeper's guest probe
-/// found command-ready ([`HEAL_COMMAND_READY_PENDING_SQL`]).
+/// found command-ready (`HEAL_COMMAND_READY_PENDING_SQL`).
 ///
 /// Writes an **observed projection**: the probe's answer. No lifecycle
 /// predicate of its own; it re-checks only that the marker is still set.
@@ -694,7 +694,7 @@ pub async fn heal_command_ready_pending(
 /// of the predicate. The `sandboxes_lifecycle_changed_at` and
 /// `sandboxes_clear_command_ready_pending` triggers fire on the resulting
 /// `started` -> `failed` change, so no follow-up write is needed.
-pub const REAP_COMMAND_READY_PENDING_SQL: &str = sql!(
+pub(crate) const REAP_COMMAND_READY_PENDING_SQL: &str = sql!(
     "UPDATE sandboxes
      SET lifecycle = 'failed'
      WHERE id = $1
@@ -706,7 +706,7 @@ pub const REAP_COMMAND_READY_PENDING_SQL: &str = sql!(
 
 /// Fail a `started` row whose `command_ready_pending` marker outlived the
 /// reaper's age and whose guest probe found it wedged
-/// ([`REAP_COMMAND_READY_PENDING_SQL`]). Returns the reap's write token
+/// (`REAP_COMMAND_READY_PENDING_SQL`). Returns the reap's write token
 /// (`LIFECYCLE_WRITE_TOKEN`), or `None` when a heal or another transition
 /// got there first.
 ///
@@ -801,7 +801,7 @@ pub enum FailGuard {
 /// execution isn't both routable (`running` with a pod IP) and holding an
 /// activation attempt, the state in which a completion receipt can still move
 /// it to `started`.
-pub fn fail_candidate_query(lifecycle: SandboxLifecycle, guard: FailGuard) -> String {
+pub(crate) fn fail_candidate_query(lifecycle: SandboxLifecycle, guard: FailGuard) -> String {
     let guards = evacuation_guards(lifecycle, None);
     let routable_guard = match guard {
         FailGuard::Aged => String::new(),
@@ -828,7 +828,7 @@ pub fn fail_candidate_query(lifecycle: SandboxLifecycle, guard: FailGuard) -> St
 }
 
 /// Fail an aged `lifecycle` row the sweeper's decision gave up on
-/// ([`fail_candidate_query`]). Returns the fail's write token
+/// (`fail_candidate_query`). Returns the fail's write token
 /// (`LIFECYCLE_WRITE_TOKEN`), or `None` when the row left the predicate
 /// between the select and this CAS.
 ///
@@ -933,7 +933,7 @@ pub async fn undo_fail_aged_candidate(
 /// clause above lets a row whose restore lease was cleared through, and the
 /// attempt is still the wake's. Converging under a live wake would make its
 /// own `restoring -> started` CAS lose.
-pub fn converge_restoring_query() -> String {
+pub(crate) fn converge_restoring_query() -> String {
     let routable_execution = routable_execution_or_non_k8s("sandboxes", "$5");
     let owner_guard = activation_owner_guard("$2");
     format!(
@@ -951,7 +951,7 @@ pub fn converge_restoring_query() -> String {
 }
 
 /// Converge an aged `restoring` row whose restore the sweeper's probe found
-/// alive to its wake `target` ([`converge_restoring_query`]). Returns whether
+/// alive to its wake `target` (`converge_restoring_query`). Returns whether
 /// the row converged.
 ///
 /// Writes an **inference**: the sweeper concluding that an abandoned restore
@@ -1011,7 +1011,7 @@ pub async fn converge_restoring(
 /// (`restoring_episode_overdue`) waives the lease and owner guards, as in the
 /// select; the converge CAS never does, since only a restore that reached a
 /// pod IP can converge.
-pub fn revert_to_suspended_query() -> String {
+pub(crate) fn revert_to_suspended_query() -> String {
     let ready_snapshot = restore_retry_suspended_revert_snapshot_exists("sandboxes");
     let ownership_guards = restoring_ownership_guards("$3", Some(REVERT_EPISODE_DEADLINE));
     format!(
@@ -1049,7 +1049,7 @@ fn revert_to_suspended_lifecycle_only_query() -> String {
 }
 
 /// Revert an abandoned `restoring` row to `suspended` and clear its
-/// `placement_changed_at` ([`revert_to_suspended_query`]), the form used when
+/// `placement_changed_at` (`revert_to_suspended_query`), the form used when
 /// the caller retires the restore's execution in the same transaction.
 /// Returns the revert's write token (`LIFECYCLE_WRITE_TOKEN`), or `None`
 /// when the row no longer qualifies.
@@ -1148,7 +1148,7 @@ pub async fn unplace_reverted_restore(
 /// contract could discard the local artifact it was supposed to keep. The
 /// lease itself is deliberately *not* restored — another actor may hold one by
 /// now.
-pub fn undo_revert_to_suspended_query() -> String {
+pub(crate) fn undo_revert_to_suspended_query() -> String {
     format!(
         "UPDATE sandboxes
             SET lifecycle = $3,
@@ -1164,7 +1164,7 @@ pub fn undo_revert_to_suspended_query() -> String {
 
 /// Undo either revert form when the cleanup it was meant to enable was
 /// refused, bound to the revert's `write_token`
-/// ([`undo_revert_to_suspended_query`]). Returns whether the row went back to
+/// (`undo_revert_to_suspended_query`). Returns whether the row went back to
 /// `lifecycle`.
 ///
 /// Writes an **operation step**: the revert's compensation.
@@ -1382,7 +1382,7 @@ pub async fn fail_unrestorable_restoring(
 ///
 /// Bind order: `$1` = sandbox id, `$2` = [`SubstrateKind::Kubernetes`] (see
 /// the sweeper's `failed_active_execution_scope`).
-pub const REPAIR_FAILED_ACTIVE_EXECUTION_SQL: &str = sql!(
+pub(crate) const REPAIR_FAILED_ACTIVE_EXECUTION_SQL: &str = sql!(
     "UPDATE sandboxes s
      SET lifecycle = 'started',
          current_local_artifact_id = CASE
@@ -1416,7 +1416,7 @@ pub const REPAIR_FAILED_ACTIVE_EXECUTION_SQL: &str = sql!(
 );
 
 /// Put a `failed` row whose active execution is still running back to
-/// `started` ([`REPAIR_FAILED_ACTIVE_EXECUTION_SQL`]). Returns whether the row
+/// `started` (`REPAIR_FAILED_ACTIVE_EXECUTION_SQL`). Returns whether the row
 /// was repaired.
 ///
 /// Writes an **inference**: the sweeper's repair of a stale `failed`
