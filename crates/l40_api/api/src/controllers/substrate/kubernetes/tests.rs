@@ -8512,11 +8512,11 @@ mod kubernetes_tests {
         Ok(())
     }
 
-    /// Before kubelet publishes a pod's IP, the one its node reported serves
-    /// from the cached pod, without a pod GET: a create that outlives its
-    /// budget is preserved on its node while that node affirms the execution
-    /// at the address, and a request resolves the pod. A proxy that merely
-    /// accepts, or a node serving another pod there, does not preserve it.
+    /// Before kubelet publishes a pod's IP, the one its node reported serves:
+    /// a create that outlives its budget is preserved on its node while that
+    /// node affirms the execution at the address, and a request resolves the
+    /// pod from the cache, without a pod GET. A proxy that merely accepts, or
+    /// a node serving another pod there, does not preserve it.
     #[tokio::test(flavor = "current_thread")]
     async fn node_reported_pod_ip_serves_from_the_cache_before_kubelet_publishes()
     -> Result<(), BoxError> {
@@ -8587,6 +8587,7 @@ mod kubernetes_tests {
                 serves,
                 "{served_pod_uid:?}"
             );
+            kube_requests.lock().unwrap().clear();
             if serves {
                 assert_eq!(
                     substrate.resolve_reachable_pod_ip(sandbox_id).await?,
@@ -15683,6 +15684,68 @@ mod kubernetes_tests {
                 1
             );
         }
+        Ok(())
+    }
+
+    /// A node-reported address whose node does not answer is no evidence the
+    /// runtime is gone: the retire fails before the pod delete, keeping the
+    /// execution tracked for retry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fenced_retire_waits_for_an_unanswering_node_reported_address() -> Result<(), BoxError>
+    {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        let pod_name = format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple());
+        insert_test_sandbox_row(&pool, sandbox_id, "failed").await?;
+        insert_k8s_execution(
+            &pool,
+            sandbox_id,
+            1,
+            &pod_name,
+            "uid-observed",
+            Some("127.0.0.1"),
+            true,
+        )
+        .await?;
+        let fenced_pod = Pod {
+            metadata: kube::api::ObjectMeta {
+                name: Some(pod_name.clone()),
+                namespace: Some("space".to_string()),
+                uid: Some("uid-observed".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")?
+            .local_addr()?
+            .port();
+        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            delete_capturing_kubernetes_client(
+                Arc::clone(&captured_deletes),
+                Some(fenced_pod.clone()),
+            ),
+            closed_port,
+            Some(fenced_pod),
+        );
+
+        let retired = substrate
+            .retire_execution(RetireExecutionRequest::fenced(
+                sandbox_id,
+                PodIdentityFence::new(PodName::parse(&pod_name)?)
+                    .with_pod_uid(PodUid::parse("uid-observed")?),
+            ))
+            .await;
+
+        assert!(retired.is_err(), "{retired:?}");
+        assert!(
+            captured_deletes
+                .lock()
+                .expect("capture mutex poisoned")
+                .is_empty()
+        );
         Ok(())
     }
 

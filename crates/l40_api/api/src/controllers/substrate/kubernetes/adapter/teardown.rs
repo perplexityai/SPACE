@@ -349,22 +349,24 @@ impl KubernetesSubstrate {
             identity: current_execution_identity(&active, live_pod.as_deref()),
             runtime_pod_ip: self
                 .fenced_runtime_address(sandbox_id, &active, live_pod.as_deref())
-                .await,
+                .await?,
             node_name: active.k8s_node_name,
         })))
     }
 
     /// The address the fenced teardown stops and deletes the runtime at. A
     /// node-reported address is used only while its node still affirms the
-    /// active execution there; otherwise the teardown proceeds to the pod
-    /// delete without talking to a VM.
+    /// active execution there; when its node answers otherwise, the teardown
+    /// proceeds to the pod delete without talking to a VM.
     async fn fenced_runtime_address(
         &self,
         sandbox_id: SandboxId,
         active: &ActiveExecutionStatusRow,
         live_pod: Option<&SandboxPodView>,
-    ) -> Option<PodIp> {
-        let address = fenced_runtime_pod_ip(active, live_pod)?;
+    ) -> Result<Option<PodIp>, SubstrateError> {
+        let Some(address) = fenced_runtime_pod_ip(active, live_pod) else {
+            return Ok(None);
+        };
         let target = PodProxyWaitTarget {
             pod_name: &active.pod_name,
             pod_uid: active.pod_uid.as_ref().map(PodUid::as_str),

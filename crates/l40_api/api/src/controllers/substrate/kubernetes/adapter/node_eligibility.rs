@@ -190,17 +190,14 @@ impl KubernetesSubstrate {
             return None;
         }
         let pod = match self.lookup_sandbox_pod(pod_name) {
-            // Trust the cached pod only when it shows a node assignment and
-            // its IP, published or recorded on the row for the same pod UID.
-            // The reflector can observe the scheduling update (`nodeName`)
-            // before a pod it does not know the IP of; fall through to the
-            // authoritative GET in that window.
+            // Trust the cached pod only when it shows a node assignment and a
+            // published IP. The reflector can observe the scheduling update
+            // (`nodeName`) before the later `podIP`, and a published IP the
+            // cache has not seen supersedes the row's node-reported one; fall
+            // through to the authoritative GET in that window.
             Some(pod)
                 if assigned_pod_node_name(&pod).is_some()
-                    && current_pod_ip(&pod, row.pod_uid.as_ref(), row.pod_ip.as_deref())
-                        .ok()
-                        .flatten()
-                        .is_some() =>
+                    && assigned_pod_ip(&pod).ok().flatten().is_some() =>
             {
                 pod
             }
@@ -235,9 +232,11 @@ impl KubernetesSubstrate {
                     pod_uid: row.pod_uid.as_ref().map(PodUid::as_str),
                     generation: row.generation,
                 };
-                self.verified_runtime_pod_ip(sandbox_uuid, address, &target)
-                    .await
-                    .is_some()
+                matches!(
+                    self.verified_runtime_pod_ip(sandbox_uuid, address, &target)
+                        .await,
+                    Ok(Some(_))
+                )
             }
         };
         if !reachable {

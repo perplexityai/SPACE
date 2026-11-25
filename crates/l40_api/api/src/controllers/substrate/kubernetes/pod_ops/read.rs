@@ -349,9 +349,8 @@ impl KubernetesSubstrate {
             pod_uid: pod.pod_uid.as_ref().map(PodUid::as_str),
             generation: pod.generation,
         };
-        Ok(self
-            .verified_runtime_pod_ip(sandbox_id, (pod.ip, pod.source), &target)
-            .await)
+        self.verified_runtime_pod_ip(sandbox_id, (pod.ip, pod.source), &target)
+            .await
     }
 
     /// [`Self::resolve_pod_ip`], with the identity of the pod the address

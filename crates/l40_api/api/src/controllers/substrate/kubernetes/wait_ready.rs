@@ -661,9 +661,12 @@ impl KubernetesSubstrate {
                     attempt = connect_attempts,
                 ))
                 .await
-                && self
-                    .record_confirmed(sandbox_id, pod_ip, source, &target)
-                    .await?;
+                && timeout_at(
+                    deadline,
+                    self.record_confirmed(sandbox_id, pod_ip, source, &target),
+                )
+                .await
+                .unwrap_or(Ok(false))?;
             if serves {
                 record_pod_proxy_wait_ready(
                     metric_identity,
@@ -730,15 +733,27 @@ impl KubernetesSubstrate {
         target: &PodProxyWaitTarget<'_>,
         deadline: Instant,
     ) -> bool {
-        let Some(mut client) = Self::pod_worker_client(
+        self.node_answer_at(sandbox_id, pod_ip, source, target, deadline)
+            .await
+            .unwrap_or(false)
+    }
+
+    /// [`Self::probe_pod_proxy`]'s answer, or `None` when no node answered
+    /// at `pod_ip` before `deadline`.
+    async fn node_answer_at(
+        &self,
+        sandbox_id: SandboxId,
+        pod_ip: PodIp,
+        source: PodIpSource,
+        target: &PodProxyWaitTarget<'_>,
+        deadline: Instant,
+    ) -> Option<bool> {
+        let mut client = Self::pod_worker_client(
             pod_ip,
             self.k8s.sandbox_proxy_port,
             START_WAIT_CONNECT_TIMEOUT.min(remaining_ready_window(deadline)),
         )
-        .await
-        else {
-            return false;
-        };
+        .await?;
         let state = timeout(
             START_WAIT_CONNECT_TIMEOUT.min(remaining_ready_window(deadline)),
             client.sandbox_state(pplx_space_sbx_mgr_client::proto::StateRequest {
@@ -747,38 +762,42 @@ impl KubernetesSubstrate {
         )
         .await;
         match state {
-            Ok(Ok(response)) => serves_target(
+            Ok(Ok(response)) => Some(serves_target(
                 response.into_inner().sandboxes,
                 sandbox_id,
                 target,
                 pod_ip,
                 source,
-            ),
-            _ => false,
+            )),
+            _ => None,
         }
     }
 
     /// `pod_ip` when it is safe to act on as `target`'s runtime address: a
     /// kubelet-published address as it is, a node-reported one only once its
-    /// node affirms the execution there (see [`serves_target`]).
+    /// node affirms the execution there (see [`serves_target`]). A node that
+    /// does not answer is an error, so a teardown keeps the execution tracked
+    /// for retry as it does when a published address does not answer.
     pub(super) async fn verified_runtime_pod_ip(
         &self,
         sandbox_id: SandboxId,
         (pod_ip, source): (PodIp, PodIpSource),
         target: &PodProxyWaitTarget<'_>,
-    ) -> Option<PodIp> {
-        match source {
-            PodIpSource::Published => Some(pod_ip),
-            PodIpSource::NodeReported => self
-                .probe_pod_proxy(
-                    sandbox_id,
-                    pod_ip,
-                    source,
-                    target,
-                    Instant::now() + START_WAIT_CONNECT_TIMEOUT,
-                )
-                .await
-                .then_some(pod_ip),
+    ) -> Result<Option<PodIp>, SubstrateError> {
+        if source == PodIpSource::Published {
+            return Ok(Some(pod_ip));
+        }
+        let deadline = Instant::now() + START_WAIT_CONNECT_TIMEOUT;
+        match self
+            .node_answer_at(sandbox_id, pod_ip, source, target, deadline)
+            .await
+        {
+            Some(serves) => Ok(serves.then_some(pod_ip)),
+            None => Err(SubstrateError::Failed {
+                message: format!(
+                    "no node answered at the node-reported address {pod_ip} of sandbox {sandbox_id}"
+                ),
+            }),
         }
     }
 
