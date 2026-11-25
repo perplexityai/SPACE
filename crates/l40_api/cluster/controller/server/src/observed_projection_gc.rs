@@ -204,12 +204,6 @@ impl ObservedProjectionDbStore {
         self.laps.lock().expect("gc lap mutex poisoned").facet = lap;
     }
 
-    /// The newest observed-row id, used as a lap's high-water bound. `None`
-    /// means the table is empty and there is nothing to sweep.
-    async fn newest_observed_sandbox_id(&self) -> Result<Option<Uuid>, sqlx::Error> {
-        pplx_space_sandbox_teardown::observed_states::newest(&self.pool).await
-    }
-
     /// Measure the next sweep window over `sandbox_observed_states`: the id
     /// closing the half-open range `(cursor, last]` containing at most
     /// `window` rows inside `(cursor, through]`, from a primary-key range
@@ -237,10 +231,6 @@ impl ObservedProjectionDbStore {
             last,
             exhausted: (ids.len() as i64) < window,
         }))
-    }
-
-    async fn newest_facet_key(&self) -> Result<Option<FacetKey>, sqlx::Error> {
-        observed_status::greatest_key(&self.pool).await
     }
 
     /// Facet-table counterpart of [`Self::observed_window_range`], row-wise
@@ -291,17 +281,19 @@ impl ProjectionGcSink for ObservedProjectionDbStore {
             }
             let lap = match self.observed_lap() {
                 Some(lap) => lap,
-                None => match self.newest_observed_sandbox_id().await? {
-                    Some(high_water) => {
-                        let lap = ObservedLap {
-                            cursor: Uuid::nil(),
-                            high_water,
-                        };
-                        self.store_observed_lap(Some(lap));
-                        lap
+                None => {
+                    match pplx_space_sandbox_teardown::observed_states::newest(&self.pool).await? {
+                        Some(high_water) => {
+                            let lap = ObservedLap {
+                                cursor: Uuid::nil(),
+                                high_water,
+                            };
+                            self.store_observed_lap(Some(lap));
+                            lap
+                        }
+                        None => break,
                     }
-                    None => break,
-                },
+                }
             };
             let Some(range) = self
                 .observed_window_range(lap.cursor, lap.high_water, request.scan_window)
@@ -356,7 +348,7 @@ impl ProjectionGcSink for ObservedProjectionDbStore {
             }
             let lap = match self.facet_lap() {
                 Some(lap) => lap,
-                None => match self.newest_facet_key().await? {
+                None => match observed_status::greatest_key(&self.pool).await? {
                     Some(high_water) => {
                         let lap = FacetLap {
                             cursor: facet_key_origin(),
