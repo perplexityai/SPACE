@@ -118,17 +118,12 @@ impl K8sStore {
         sandbox_id: SandboxId,
         generation: i64,
     ) -> Result<Option<TrackedPod>, SubstrateError> {
-        let Some(pod_uid) = sqlx::query_scalar::<_, Option<String>>(sql!(
-            "SELECT NULLIF(BTRIM(pod_uid), '')
-               FROM sandbox_k8s_executions
-              WHERE sandbox_id = $1 AND generation = $2 AND active
-              FOR UPDATE"
-        ))
-        .bind(sandbox_id)
-        .bind(generation)
-        .fetch_optional(&mut *conn)
-        .await
-        .db_context("failed to lock the tracked Kubernetes pod")?
+        let Some(pod_uid) =
+            pplx_space_sandbox_store::k8s_executions::runtime_attribution::lock_tracked_pod_uid(
+                &mut *conn, sandbox_id, generation,
+            )
+            .await
+            .db_context("failed to lock the tracked Kubernetes pod")?
         else {
             return Ok(None);
         };

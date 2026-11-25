@@ -36,9 +36,13 @@ pub mod materialize;
 #[cfg(test)]
 pub(crate) mod ownership_test_fixture;
 pub mod pod_less_giveup;
+pub mod pod_placement;
+pub mod pod_tracking;
+pub mod pool_claim;
 pub mod quarantine_recovery;
 pub mod quarantine_rollback;
 pub mod retire;
+pub mod runtime_attribution;
 pub mod started_recovery;
 pub mod suspend;
 pub mod suspended_reaper;
