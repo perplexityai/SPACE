@@ -102,6 +102,7 @@ from space_smoke.capabilities import (
 )
 from space_smoke.runtime import (
     Compensation,
+    InconclusiveSmoke,
     InvariantViolation,
     ResourceScope,
     run_concurrently,
@@ -229,6 +230,9 @@ ACTIVATION_SECONDS = 4 * 50 + 60
 # after the gate's Retry-After (`public_operation_driver.rs`), about 150 s
 # measured, with a two-minute margin.
 REFUSED_STOP_SECONDS = 150 + 120
+# How long a run waits, as it pins its workers, for sandboxes an earlier
+# run deleted to leave them: a delete lands in seconds; two minutes.
+LEFTOVER_SECONDS = 120
 # A command on a sandbox whose data plane is coming up, or a memory fill of
 # up to 256 MiB (seconds measured), with a minute's margin.
 COMMAND_SECONDS = 90
@@ -775,6 +779,7 @@ class DrainV2Assertions:
             workers=workers,
             resident_node=placement.node_name,
         )
+        self._expect_no_leftovers(workers, self.bare_id(self._fixture.sandbox.sandbox_id))
         release = self._control.acquire_worker_cordon_mutation()
         self._scope.defer("release the worker cordon lease", release)
         other = others[0]
@@ -796,6 +801,55 @@ class DrainV2Assertions:
         self._node_id = node.id
         self._fixture.record("drained_worker", pinned)
         return pinned
+
+    def _expect_no_leftovers(self, workers: Sequence[str], fixture_id: str) -> None:
+        """Neither worker holds a sandbox a drain would wait on but the
+        fixture's: each one's preview lists nothing else pending. A sandbox an
+        earlier run left, such as one whose cleanup failed, would be counted
+        in this run's reports and fail it for something it didn't do; so,
+        once the deletes still landing have had `LEFTOVER_SECONDS`, the run
+        ends inconclusive, naming what is left, and the earlier run's own
+        cleanup failure stays its own."""
+
+        nodes = {n.k8s_node_name: n.id for n in self._control.admin_nodes() if n.k8s_node_name in workers}
+        deadline = time.monotonic() + LEFTOVER_SECONDS
+        while True:
+            leftovers: dict[str, list[str]] = {}
+            unread: dict[str, str] = {}
+            for name, node_id in nodes.items():
+                try:
+                    pending = self._control.drain_v2_preview(node_id).get("pending") or []
+                except Exception as error:  # noqa: BLE001 - a worker still coming up is read again
+                    unread[name] = repr(error)[:300]
+                    continue
+                left = [
+                    str(entry.get("sandbox_id"))
+                    for entry in pending
+                    if isinstance(entry, Mapping) and str(entry.get("sandbox_id")) != fixture_id
+                ]
+                if left:
+                    leftovers[name] = left
+            if not leftovers and not unread:
+                return
+            if time.monotonic() >= deadline:
+                left_ids = [sandbox_id for ids in leftovers.values() for sandbox_id in ids]
+                self._fixture.record(
+                    "leftover_sandboxes",
+                    {
+                        "by_worker": leftovers,
+                        "unread_previews": unread,
+                        "rows": {
+                            sandbox_id: list(placement)
+                            for sandbox_id, placement in self._control.sandbox_placements(left_ids).items()
+                        },
+                    },
+                )
+                raise InconclusiveSmoke(
+                    "the bench is not clean: a worker holds sandboxes an earlier run left, "
+                    "such as one whose cleanup failed, which this run's drain would count "
+                    "(leftover_sandboxes); delete them, or bring the bench up again, and rerun"
+                )
+            self._fixture.wait(5)
 
     def give_fake_instance(self, *, timeout: float = REGISTER_SECONDS) -> str:
         """The pinned worker's fake AWS instance: re-register it under a fake
