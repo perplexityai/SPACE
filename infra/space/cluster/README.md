@@ -123,14 +123,31 @@ holds bench-only settings that are not test hooks, such as a 45 s
 `SPACE_CREATE_DATA_PLANE_READY_TIMEOUT_SECS` and drain v2 on the API
 (`drainV2.enabled`, `SPACE_DRAIN_V2_ENABLED`); `space-cluster-controller-local`'s
 turns drain v2 on for the controller the same way. `templates/validate.yaml`
-refuses either switch here until drain v2 is ready to enable. This chart reads
-neither file, so those settings keep their binary defaults here. Kind's data
+refuses either switch here until drain v2 is ready to enable. The bring-up
+passes `space-sandbox-manager-local`'s `values-kind.yaml` too, which turns on
+cold-sandbox eviction at a two-minute idle and shortens the cluster-deleted
+eviction quiescence to 10 s. This chart reads none of these files, so those
+settings keep their binary defaults here: eviction off, and 600 s. Kind's data
 plane serves Native files, so `space-api-local`'s file and `space-sandbox-network-policy`'s
 `values-kind.yaml` admit it to the activation listener and to sandbox pods'
 TCP 9800. This chart sets `space-data-plane-local.nativeFiles.enabled`,
 `space-sandbox-network-policy.allowDataPlane` and
 `space-api-local.ingressActivation.allowedServiceAccounts` so it admits the
 data plane to neither.
+
+With cold-sandbox eviction off, nothing reclaims a suspended sandbox's local
+copy for being idle: the copy stays in the node's cache until another path
+removes it, such as a delete, a runtime upgrade or a node drain, so idle
+suspended sandboxes accumulate on the node's disk. To reclaim them, set
+`space-sandbox-manager-local.sandboxEviction` in your values file: `enabled`,
+`engageFraction`, `targetFraction`, `minIdleSecs`, `intervalSecs` and
+`reuploadMaxPerTick`. The chart's `templates/daemonset.yaml` renders them as the
+`SPACE_SBX_EVICT_*` variables. `EvictionConfig` in
+`crates/l40_api/sbx/mgr/server/src/sandbox_eviction.rs` documents each one and
+its default, and the comments in the chart's `values-kind.yaml` explain the
+bench's choices. `install.sh` passes your file to the `space-builder` release
+after `chart/values-builder.yaml`, so your `sandboxEviction` replaces that
+file's null and turns eviction on in the builder release's sandbox-manager too.
 
 Telemetry follows `global.observability` through the space-kind-telemetry
 helper. A chart's `telemetry.traceExporter: "off"` still vetoes its traces,

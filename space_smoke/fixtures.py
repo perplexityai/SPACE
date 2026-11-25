@@ -5470,7 +5470,7 @@ class ColdEvictionAssertions:
             raise SmokeConfigurationError(
                 f"the sandbox-manager on {node_name} does not enable SPACE_SBX_EVICT_ENABLED; "
                 "cold-sandbox eviction is off on this worker (see sandboxEviction "
-                "in the kind chart)"
+                "in the kind chart's values-kind.yaml)"
             )
         if (
             config.engage_fraction > 0.0

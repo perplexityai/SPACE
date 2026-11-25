@@ -62,6 +62,8 @@ def _rendered_env(manifests: list[dict]) -> set[str]:
 def _node_service_env(release: str, role: str, service: str) -> set[str]:
     chart = KIND_DIR / f"charts/space-{service}-local"
     extra = ["--set", f"node.role={role}"]
+    if (chart / "values-kind.yaml").exists():
+        extra += ["-f", str(chart / "values-kind.yaml")]
     if role == "builder" and (chart / "values-builder.yaml").exists():
         extra += ["-f", str(chart / "values-builder.yaml")]
     return _rendered_env(render(chart, release, *extra))
