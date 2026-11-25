@@ -37,8 +37,18 @@ use crate::middleware::auth::AuthUser;
 use crate::models::User;
 use crate::routes::AppState;
 
+#[cfg(test)]
+mod drain_preview;
+#[cfg(test)]
+mod drain_v2;
 mod holds;
 mod read_state;
+#[cfg(test)]
+pub use drain_preview::DrainPreviewError;
+#[cfg(test)]
+use drain_v2::drain_v2_node_refusals;
+#[cfg(test)]
+pub use drain_v2::{NodeApiV2DrainProbe, V2DrainPreview, V2DrainProbe};
 pub(super) use holds::list_node_holds;
 use read_state::attach_node_read_state;
 
