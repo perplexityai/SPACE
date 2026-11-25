@@ -315,8 +315,10 @@ pub async fn run(
     let visibility_pool = pplx_space_postgres_pool::connect_space_user_sideline_pool_lazy(
         &database_url,
         VISIBILITY_POOL_APPLICATION_NAME,
-        VISIBILITY_POOL_MAX_CONNECTIONS,
-        Some(VISIBILITY_POOL_STATEMENT_TIMEOUT),
+        pplx_space_postgres_pool::SidelineOptions {
+            max_connections: VISIBILITY_POOL_MAX_CONNECTIONS,
+            statement_timeout: Some(VISIBILITY_POOL_STATEMENT_TIMEOUT),
+        },
     )
     .map_err(RunInternalApiError::VisibilityPool)?;
     tracing::info!(
@@ -361,8 +363,10 @@ pub async fn run(
         let runtime_catalog_pool = pplx_space_postgres_pool::connect_space_user_sideline_pool_lazy(
             &database_url,
             RUNTIME_CATALOG_POOL_APPLICATION_NAME,
-            RUNTIME_CATALOG_POOL_MAX_CONNECTIONS,
-            Some(RUNTIME_CATALOG_POOL_STATEMENT_TIMEOUT),
+            pplx_space_postgres_pool::SidelineOptions {
+                max_connections: RUNTIME_CATALOG_POOL_MAX_CONNECTIONS,
+                statement_timeout: Some(RUNTIME_CATALOG_POOL_STATEMENT_TIMEOUT),
+            },
         )
         .map_err(RunInternalApiError::RuntimeCatalogPool)?;
         tracing::info!(
