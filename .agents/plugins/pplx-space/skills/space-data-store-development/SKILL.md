@@ -305,3 +305,16 @@ isolated clones; direct `cargo test` can use a process-local testcontainer.
 Unavailable Postgres or Redis fails the test unless the run opts out with
 `SPACE_TEST_DEPS_OPTIONAL=1`. Opted-out skips are diagnostic only, not
 acceptable final validation when Docker can be started.
+
+A statement on a hot path that matches rows of a table growing per template,
+node or org, such as releases, against other rows of it needs a plan-cost
+test: seed one owner with a few hundred rows among other owners' rows, so the
+tables are too large to rescan cheaply, and bound the per-row work its plan
+does under both plan modes, through `pplx_space_db_test_fixtures::plan`
+(its docs say why both), on the statement text the store runs. Bound how much
+more the plan touches at a fixture several times larger too, which catches an
+index walked per row. Show the bounds catch the regression by mutating the
+statement, such as wrapping the probed column, and say so in the pull
+request; a check that drops an index breaks once another index serves the
+probe. `crates/l30_storage/template/release/store/src/plan_tests.rs` is an
+example.

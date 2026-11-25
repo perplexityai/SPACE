@@ -26,6 +26,8 @@
 //! E1 twins until each build's E2 twin exists, rather than sending them back
 //! to the E0 originals.
 
+use std::sync::LazyLock;
+
 use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_sql_locator::sql;
 use sqlx::PgExecutor;
@@ -150,6 +152,17 @@ fn sha256_spellings(expr: &str) -> String {
     )
 }
 
+/// The statement [`resolved_release`] runs, built once; the plan tests
+/// explain it.
+pub(crate) static RESOLVED_RELEASE: LazyLock<String> = LazyLock::new(|| {
+    sql!(format!(
+        "SELECT r.id, r.execution_metadata->>'environment'
+         FROM template_releases r
+         WHERE r.id = {resolved}",
+        resolved = resolved_release_sql("$1", "$2", "$3"),
+    ))
+});
+
 /// The release a create of `template_name` at `hash` resolves to
 /// ([`resolved_release_sql`]), with the environment it records, unparsed;
 /// `None` when no release qualifies. `initial_environment` is the initial
@@ -160,15 +173,7 @@ pub async fn resolved_release(
     hash: &str,
     initial_environment: EnvironmentReference,
 ) -> Result<Option<(Uuid, Option<String>)>, sqlx::Error> {
-    static STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        sql!(format!(
-            "SELECT r.id, r.execution_metadata->>'environment'
-             FROM template_releases r
-             WHERE r.id = {resolved}",
-            resolved = resolved_release_sql("$1", "$2", "$3"),
-        ))
-    });
-    sqlx::query_as::<_, (Uuid, Option<String>)>(sqlx::AssertSqlSafe(STATEMENT.as_str()))
+    sqlx::query_as::<_, (Uuid, Option<String>)>(sqlx::AssertSqlSafe(RESOLVED_RELEASE.as_str()))
         .bind(template_name)
         .bind(hash)
         .bind(initial_environment.to_string())

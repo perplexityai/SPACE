@@ -111,3 +111,9 @@ pplx-space-common-proto-build = "crates/l10_foundation/common/proto/build"
 pplx-space-execution-common = "crates/l20_domain/execution/common"
 pplx-space-net-common = "crates/l20_domain/net/common"
 pplx-space-node-runtime-core = "crates/l40_api/node/runtime/core"
+
+[pattern_ratchet.sql_wrapped_column_predicate]
+# Major-version match on a state format, a residual filter after the
+# primary-key lookup by node and runtime.
+"crates/l30_storage/node/registration/store/src/direct/placement_candidates.rs" = 2
+"crates/l30_storage/sandbox/store/src/direct/restore_candidates.rs" = 4

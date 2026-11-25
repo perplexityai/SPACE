@@ -92,6 +92,67 @@ fn node_manager_commands_reject_direct_spawns_without_restricting_other_services
         && finding.code() == "pattern_ratchet.node_manager_commands.listed_no_growth"));
 }
 
+/// `sql_wrapped_column_predicate` counts a string function around a probed
+/// column in a predicate, on the line that compares it or ends before the
+/// comparison, and not the same call where nothing compares it.
+#[test]
+fn sql_wrapped_column_predicate_flags_wrapped_probes_not_projections() {
+    use pplx_space_archcheck::context::ProductionFile;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let mut ctx = Context::load(&root).unwrap();
+    ctx.config
+        .rules
+        .pattern_ratchet
+        .retain(|name, _| name.as_str() == "sql_wrapped_column_predicate");
+    assert_eq!(ctx.config.rules.pattern_ratchet.len(), 1);
+    ctx.config.rules.layers = None;
+    // Only the case's own file: the instance's patterns over every production
+    // file, once per case, would take seconds. Its baselined files then read
+    // as stale, which the check below doesn't look at.
+    ctx.files.clear();
+    let path = "crates/l30_storage/template/release/store/src/probe_regression.rs";
+    let cases = [
+        // The comparison on the next line, as a statement spells a join.
+        (
+            "\"SELECT 1 FROM t o JOIN r ON o.k = r.k\n AND replace(o.hash, 'sha256:', '')\n = replace(r.hash, 'sha256:', '')\"",
+            true,
+        ),
+        ("\"SELECT 1 FROM t o WHERE lower(o.name) = $1\"", true),
+        (
+            "\"SELECT 1 FROM t o WHERE o.a = 1 OR replace(o.hash, $1, $2) = $3\"",
+            true,
+        ),
+        (
+            "\"SELECT 1 FROM t o WHERE o.a = 1 AND\n    replace(o.hash, $1, $2) IN ($3, $4)\"",
+            true,
+        ),
+        (
+            "\"SELECT DISTINCT ON (lower(t.name)) t.name FROM templates t ORDER BY lower(t.name)\"",
+            false,
+        ),
+        (
+            "\"SELECT 1 FROM t o WHERE o.hash IN (replace($1, 'sha256:', ''), 'sha256:' || replace($1, 'sha256:', ''))\"",
+            false,
+        ),
+        (
+            "\"SELECT CASE WHEN starts_with(op.id, $1)\n AND substr(op.id, length($1) + 1) LIKE $2 THEN 1 END FROM op\"",
+            false,
+        ),
+    ];
+    for (text, rejected) in cases {
+        ctx.files.push(ProductionFile {
+            path: path.to_owned(),
+            text: text.to_owned(),
+        });
+        let found = check(&ctx).iter().any(|finding| {
+            finding.path == path
+                && finding.code() == "pattern_ratchet.sql_wrapped_column_predicate.no_crossing"
+        });
+        assert_eq!(found, rejected, "{text}");
+        ctx.files.pop();
+    }
+}
+
 /// The database migrator's sources, outside `sbxmgr_sqlite_schema`'s `allow`.
 const MIGRATOR_SRC: &str = "crates/l30_storage/db/migrate/src";
 
