@@ -21,9 +21,10 @@
 //! [`AdminIdSearch::from_id_digits`] builds, as the api's searches do, so a
 //! change to how they are built is explained here too.
 
+use pplx_space_db_test_fixtures::plan::{PLAN_CACHE_MODES, PlanNode, explain_prepared};
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
 use pplx_space_test_env::TestResult;
-use sqlx::{Connection as _, PgPool};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::*;
@@ -47,9 +48,6 @@ const CREATED_EVERY_MS: i64 = 10_000;
 /// which these copy.
 const MAX_PAGE_BYTES: i64 = 8 * 1024 * 1024;
 const ROW_OVERHEAD_BYTES: i64 = 2 * 1024;
-
-/// Both forced plan modes, custom first.
-const PLAN_CACHE_MODES: [&str; 2] = ["force_custom_plan", "force_generic_plan"];
 
 /// The fixture's sandboxes: [`SANDBOXES`] with UUIDv7-shaped IDs, and one
 /// more with a known ID.
@@ -89,7 +87,7 @@ async fn a_search_reads_only_the_rows_it_matches() -> TestResult {
                 assert!(
                     handled <= MAX_ROWS_HANDLED,
                     "{statement_label}, {search_label} ({plan_cache_mode}): handled {handled} \
-                     rows, over {MAX_ROWS_HANDLED}. Rows handled by node:{}",
+                     rows, over {MAX_ROWS_HANDLED}. Rows each node handled per loop:{}",
                     plan.outline()
                 );
             }
@@ -105,7 +103,7 @@ async fn a_search_reads_only_the_rows_it_matches() -> TestResult {
         assert!(
             handled > MAX_ROWS_HANDLED,
             "{statement_label} without the ID-end index: handled {handled} rows, within the \
-             bound the index is to buy. Rows handled by node:{}",
+             bound the index is to buy. Rows each node handled per loop:{}",
             plan.outline()
         );
     }
@@ -208,120 +206,4 @@ async fn seed(pool: &PgPool) -> TestResult<Fixture> {
         label: compact.chars().skip(24).collect(),
         id_start: middle.chars().take(8).collect(),
     })
-}
-
-/// One `EXPLAIN (ANALYZE, FORMAT JSON)` statement's result.
-#[derive(Debug, serde::Deserialize)]
-struct Explained {
-    #[serde(rename = "Plan")]
-    plan: PlanNode,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct PlanNode {
-    #[serde(rename = "Node Type")]
-    node_type: String,
-    #[serde(rename = "Join Type", default)]
-    join_type: Option<String>,
-    #[serde(rename = "Relation Name", default)]
-    relation: Option<String>,
-    #[serde(rename = "Index Name", default)]
-    index: Option<String>,
-    #[serde(rename = "Actual Rows", default)]
-    rows: f64,
-    #[serde(rename = "Rows Removed by Filter", default)]
-    removed_by_filter: f64,
-    #[serde(rename = "Rows Removed by Join Filter", default)]
-    removed_by_join_filter: f64,
-    #[serde(rename = "Rows Removed by Index Recheck", default)]
-    removed_by_recheck: f64,
-    #[serde(rename = "Actual Loops", default)]
-    loops: f64,
-    #[serde(rename = "Plans", default)]
-    children: Vec<PlanNode>,
-}
-
-impl PlanNode {
-    /// The rows every node in the plan emitted or discarded, times its
-    /// loops: `EXPLAIN` reports both per loop. A join that compares every
-    /// pair of its inputs discards the unmatched pairs by its join filter,
-    /// so they count here too.
-    fn rows_handled(&self) -> f64 {
-        let own = (self.rows
-            + self.removed_by_filter
-            + self.removed_by_join_filter
-            + self.removed_by_recheck)
-            * self.loops.max(1.0);
-        own + self
-            .children
-            .iter()
-            .map(PlanNode::rows_handled)
-            .sum::<f64>()
-    }
-
-    /// One line per node, indented by depth: its type and join type, the
-    /// table and index it reads, and the rows it and its children handled,
-    /// so a failure names the node that broke the bound.
-    fn outline(&self) -> String {
-        let mut out = String::new();
-        self.outline_into(1, &mut out);
-        out
-    }
-
-    fn outline_into(&self, depth: usize, out: &mut String) {
-        use std::fmt::Write as _;
-
-        let _ = write!(
-            out,
-            "\n{:indent$}{}",
-            "",
-            self.node_type,
-            indent = depth * 2
-        );
-        if let Some(join_type) = &self.join_type {
-            let _ = write!(out, " {join_type}");
-        }
-        if let Some(relation) = &self.relation {
-            let _ = write!(out, " on {relation}");
-        }
-        if let Some(index) = &self.index {
-            let _ = write!(out, " using {index}");
-        }
-        let _ = write!(out, ": {} rows", self.rows_handled());
-        for child in &self.children {
-            child.outline_into(depth + 1, out);
-        }
-    }
-}
-
-/// `EXPLAIN (ANALYZE, FORMAT JSON)` `execute` under a forced
-/// `plan_cache_mode`, after `prepare` names the statement it runs.
-///
-/// A generic plan exists only for a prepared statement, so this prepares the
-/// statement on a connection of its own, forces the mode there, and explains
-/// its `EXECUTE`. `EXECUTE` takes no bind parameters of its own, so `execute`
-/// spells its arguments as literals.
-async fn explain_prepared(
-    pool: &PgPool,
-    prepare: &str,
-    execute: &str,
-    plan_cache_mode: &str,
-) -> TestResult<PlanNode> {
-    // Detached, so the prepared statement and the forced mode leave with this
-    // connection instead of going back to the pool, however this returns.
-    let mut conn = pool.acquire().await?.detach();
-    sqlx::query(sqlx::AssertSqlSafe(sql!(prepare)))
-        .execute(&mut conn)
-        .await?;
-    let set_mode = format!("SET plan_cache_mode = {plan_cache_mode}");
-    sqlx::query(sqlx::AssertSqlSafe(sql!(set_mode.as_str())))
-        .execute(&mut conn)
-        .await?;
-    let statement = format!("EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON) {execute}");
-    let raw: serde_json::Value = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(statement.as_str())))
-        .fetch_one(&mut conn)
-        .await?;
-    conn.close().await?;
-    let mut explained: Vec<Explained> = serde_json::from_value(raw)?;
-    Ok(explained.pop().ok_or("EXPLAIN returned no plan")?.plan)
 }

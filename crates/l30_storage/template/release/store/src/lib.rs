@@ -97,6 +97,8 @@ pub use resolution::{resolved_release, resolved_release_sql};
 pub use twin::{InsertTwin, insert_twin};
 
 #[cfg(test)]
+mod plan_tests;
+#[cfg(test)]
 mod tests;
 
 #[cfg(any(test, feature = "test-support"))]

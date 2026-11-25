@@ -176,6 +176,66 @@ mode = "required"
 [rules.pattern_ratchet.substrate_literals.stale_entries]     # entries with fewer matches, none, or gone
 mode = "required"
 
+# A string function wrapped around a table's column in a predicate, such as
+# `AND replace(o.hash, 'sha256:', '') = replace(r.hash, 'sha256:', '')`, can't
+# use the column's index. On the probed side of a join or a correlated subquery
+# that means every outer row rescans the inner table's candidates, a cost that
+# grows with the square of their count and that tests on small tables never
+# show. Compare the bare column with each spelling instead,
+# `o.hash IN (replace(r.hash, 'sha256:', ''), 'sha256:' || replace(r.hash,
+# 'sha256:', ''))`: the function wraps only the outer value, and the index
+# serves the lookup. Don't fold the spellings into an `OR` with the exact match
+# either (`o.hash = r.hash OR replace(o.hash, ...) = ...`): only a custom plan
+# can drop the second branch, and a cached statement runs its generic plan. A
+# line matcher counts a function from the list below applied to an
+# alias-qualified column, with no parentheses among its arguments, when it is
+# compared (by =, <>, !=, IN) and either
+# - follows AND, OR, WHERE or ON, optionally with NOT and then opening
+#   parentheses between; the comparison may start the next line, so a call
+#   that ends its line counts there too; or
+# - starts its line, the form of a predicate whose AND ends the line before.
+# A call that neither ends its line nor is compared isn't in a predicate
+# (`DISTINCT ON (lower(t.x))`, an ORDER BY or select-list expression), and
+# doesn't count.
+# Not caught: an unqualified column, a call split across lines before its
+# column, a schema-qualified or nested call (`pg_catalog.lower(o.x)`,
+# `lower(trim(o.name))`), a call with a parenthesized argument
+# (`substr(o.x, length($1))`), a call followed by a closing parenthesis or an
+# operator before its comparison (`(lower(o.x)) = $1`, `lower(o.x) || 'a' =`),
+# a call that starts its line after a quote or ends it before a `\` or `",`,
+# a predicate after WHEN, NOT after a parenthesis
+# or with no space before one (`NOT(lower(o.x) = $1)`), a keyword with no space
+# after it (`AND(lower(o.x)`), a call that starts its line with NOT, a call
+# compared other than by =, <>, != or IN or cast first (`LIKE`, `::int =`),
+# COALESCE (mostly over unindexed state columns, and too common to count), a
+# wrapped column on the right of the comparison, and SQL outside production
+# `.rs` files, such as the `.sql` fragments that
+# pplx-space-template-release-original reads with `include_str!`.
+# False positives: a wrapped column that is a residual filter after an index
+# lookup, or that belongs to the outer row; such lines are baselined. The
+# plan-cost tests of `pplx_space_db_test_fixtures::plan` catch what this misses.
+[rules.pattern_ratchet.sql_wrapped_column_predicate]
+patterns = [
+  '''(?i)\b(?:AND|OR|WHERE|ON)\s+(?:NOT\s+)?\(*\s*(?:replace|regexp_replace|translate|lower|upper|initcap|substring|substr|left|right|trim|btrim|ltrim|rtrim|split_part|concat|md5)\s*\(\s*"?[a-z_][a-z0-9_]*"?\s*\.\s*"?[a-z_][a-z0-9_]*[^()]*\)\s*(?:=|<>|!=|\bIN\b|"?\s*$)''',
+  '''(?i)^\s*\(*\s*(?:replace|regexp_replace|translate|lower|upper|initcap|substring|substr|left|right|trim|btrim|ltrim|rtrim|split_part|concat|md5)\s*\(\s*"?[a-z_][a-z0-9_]*"?\s*\.\s*"?[a-z_][a-z0-9_]*[^()]*\)\s*(?:=|<>|!=|\bIN\b)''',
+]
+allow = []
+
+[rules.pattern_ratchet.sql_wrapped_column_predicate.no_crossing]
+mode = "required"
+
+[rules.pattern_ratchet.sql_wrapped_column_predicate.no_new_entries]
+mode = "required"
+
+[rules.pattern_ratchet.sql_wrapped_column_predicate.no_raised_caps]
+mode = "required"
+
+[rules.pattern_ratchet.sql_wrapped_column_predicate.listed_no_growth]
+mode = "required"
+
+[rules.pattern_ratchet.sql_wrapped_column_predicate.stale_entries]
+mode = "required"
+
 # Writes of the control-plane Postgres `public.sandboxes` row move into its
 # store, `pplx-space-sandbox-store`; this ratchet only shrinks. It counts each
 # production line that opens a statement writing the row (`UPDATE`,

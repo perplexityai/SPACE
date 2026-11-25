@@ -134,6 +134,54 @@ pub struct WarmPoolStore {
     pool: PgPool,
 }
 
+/// [`WarmPoolStore::demanded_policy_release_rows`]'s statement. Binds `$1`
+/// (the demanded release ids) and `$2` and `$3` (the disk I/O defaults).
+pub(crate) const DEMANDED_POLICY_RELEASES: &str = sql!(
+    "SELECT
+             demanded.id AS template_release_id,
+             p.template_name,
+             demanded.hash AS content_hash,
+             p.vcpu,
+             p.memory_mib,
+             p.disk_mib,
+             COALESCE(p.disk_io_max_operations_per_sec, $2)
+                 AS disk_io_max_operations_per_sec,
+             COALESCE(p.disk_io_max_bandwidth_mib_per_sec, $3)
+                 AS disk_io_max_bandwidth_mib_per_sec,
+             p.min_ready_slots,
+             p.max_ready_slots,
+             p.refill_per_tick,
+             p.max_warming_slots,
+             p.retain_releases,
+             FALSE AS retained
+         FROM warm_pool_policies p
+         JOIN LATERAL (
+             SELECT release.id,
+                    release.hash,
+                    COALESCE(
+                        (
+                            SELECT MAX(published.modified_at)
+                            FROM template_release_tags published
+                            JOIN template_releases tagged
+                              ON tagged.id = published.template_release_id
+                            -- Tags on either spelling of the digest: one written
+                            -- before the shared rule can sit on the other spelling.
+                            WHERE tagged.template_name = release.template_name
+                              AND tagged.hash IN (replace(release.hash, 'sha256:', ''),
+                                                  'sha256:' || replace(release.hash, 'sha256:', ''))
+                        ),
+                        release.created_at
+                    ) AS published_at
+             FROM template_releases release
+             WHERE release.template_name = p.template_name
+               AND release.type = p.runtime
+               AND release.id = ANY($1::UUID[])
+         ) demanded ON TRUE
+         WHERE p.enabled
+         ORDER BY p.template_name, p.vcpu, p.memory_mib,
+                  demanded.published_at DESC, demanded.id DESC"
+);
+
 /// [`WarmPoolStore::retained_policy_release_rows`]'s statement. Binds `$1` and
 /// `$2` (the disk I/O defaults) and `$3` (the initial environment).
 pub(crate) static RETAINED_POLICY_RELEASES: LazyLock<String> = LazyLock::new(|| {
@@ -908,62 +956,20 @@ impl WarmPoolStore {
         &self,
         demanded_release_ids: &[Uuid],
     ) -> Result<Vec<PoolPolicyReleaseRow>> {
-        Ok(sqlx::query_as::<_, PoolPolicyReleaseRow>(sql!(
-            "SELECT
-                 demanded.id AS template_release_id,
-                 p.template_name,
-                 demanded.hash AS content_hash,
-                 p.vcpu,
-                 p.memory_mib,
-                 p.disk_mib,
-                 COALESCE(p.disk_io_max_operations_per_sec, $2)
-                     AS disk_io_max_operations_per_sec,
-                 COALESCE(p.disk_io_max_bandwidth_mib_per_sec, $3)
-                     AS disk_io_max_bandwidth_mib_per_sec,
-                 p.min_ready_slots,
-                 p.max_ready_slots,
-                 p.refill_per_tick,
-                 p.max_warming_slots,
-                 p.retain_releases,
-                 FALSE AS retained
-             FROM warm_pool_policies p
-             JOIN LATERAL (
-                 SELECT release.id,
-                        release.hash,
-                        COALESCE(
-                            (
-                                SELECT MAX(published.modified_at)
-                                FROM template_release_tags published
-                                JOIN template_releases tagged
-                                  ON tagged.id = published.template_release_id
-                                -- Tags on either spelling of the digest: one written
-                                -- before the shared rule can sit on the other spelling.
-                                WHERE tagged.template_name = release.template_name
-                                  AND tagged.hash IN (replace(release.hash, 'sha256:', ''),
-                                                      'sha256:' || replace(release.hash, 'sha256:', ''))
-                            ),
-                            release.created_at
-                        ) AS published_at
-                 FROM template_releases release
-                 WHERE release.template_name = p.template_name
-                   AND release.type = p.runtime
-                   AND release.id = ANY($1::UUID[])
-             ) demanded ON TRUE
-             WHERE p.enabled
-             ORDER BY p.template_name, p.vcpu, p.memory_mib,
-                      demanded.published_at DESC, demanded.id DESC"
-        ))
-        .bind(demanded_release_ids)
-        .bind(
-            i64::try_from(DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC)
-                .expect("disk I/O default fits in PostgreSQL BIGINT"),
+        Ok(
+            sqlx::query_as::<_, PoolPolicyReleaseRow>(DEMANDED_POLICY_RELEASES)
+                .bind(demanded_release_ids)
+                .bind(
+                    i64::try_from(DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC)
+                        .expect("disk I/O default fits in PostgreSQL BIGINT"),
+                )
+                .bind(
+                    i64::try_from(DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC)
+                        .expect("disk I/O default fits in PostgreSQL BIGINT"),
+                )
+                .fetch_all(&self.pool)
+                .await?,
         )
-        .bind(
-            i64::try_from(DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC)
-                .expect("disk I/O default fits in PostgreSQL BIGINT"),
-        )
-        .fetch_all(&self.pool)
-        .await?)
     }
 
     /// Recent creates by release and shape. A create's release is the one
