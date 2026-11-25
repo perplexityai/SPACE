@@ -21,10 +21,12 @@ pub mod contention;
 pub mod db;
 mod error;
 pub mod identity;
+mod listener;
 pub mod metrics;
 
 pub use db::{Db, Executor, SavedLockTimeout, Tx, TxSettings};
 pub use error::{DbError, DbErrorKind};
+pub use listener::set_listener_keepalives;
 
 const POOL_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 
