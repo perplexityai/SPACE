@@ -12,11 +12,14 @@ use pplx_space_metrics_emit::{counter, elapsed_ms, gauge, tag, timing_ms};
 /// counted once: node-wide problems that keep the drain from ending
 /// (`blocked`, which is what to page on), the residents with work still
 /// under way (`pending`, evacuations not yet recorded included), and the
-/// running sandboxes the drain holds until its deadline with nothing
-/// started for them (`held`). `stalled` is 1 while the loop finds the drain
-/// stalled (see `node_drain::v2::step::stalled`). `unanswered` is 1 while
-/// the node didn't answer, which keeps the drain from ending just as
-/// `blocked` does.
+/// running sandboxes the drain leaves running until its deadline, whose
+/// pinned artifact's upload may be under way (`held`). `stalled` is 1 while
+/// the loop finds the drain stalled (see `node_drain::v2::step::stalled`).
+/// `unanswered` is 1 while the node didn't answer the loop's last drain or
+/// cancel call, which keeps the drain from ending just as `blocked` does. A
+/// node a refused terminate returned to `drained` keeps the refused report's
+/// `blocked`, `pending` and `held`, with `stalled` and `unanswered` 0; a
+/// terminate's fresh call that fails changes none of them.
 pub fn v2_report(node_id: &str, blocked: u64, pending: u64, held: u64, stalled: bool) {
     gauge("node_drain.v2.unanswered", 0.0, &[tag("node", node_id)]);
     gauge(

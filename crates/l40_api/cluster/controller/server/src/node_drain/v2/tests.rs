@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use pplx_space_node_registration_store::drain_v2::{StoredV2ArtifactKind, StoredV2Wait};
+use pplx_space_node_registration_store::drain_v2::{
+    StoredV2ArtifactKind, StoredV2Evacuated, StoredV2Wait,
+};
 use pplx_space_sbx_mgr_client::proto::{
     CancelResult, DrainBlocked, DrainEvacuated, DrainPending, DrainReport, DrainWait,
     drain_node_response,
@@ -64,6 +66,8 @@ struct FakeSink {
     registered_uid: Mutex<HashMap<NodeId, String>>,
     /// When set, each Node GET takes this long.
     node_lookup_takes: Option<Duration>,
+    /// When set, the drained count fails with this.
+    count_error: Option<String>,
 }
 
 impl FakeSink {
@@ -223,8 +227,17 @@ impl DrainV2Sink for FakeSink {
         Ok(self.still_suspended.clone())
     }
 
-    async fn record_error(&self, node_id: NodeId, message: &str) {
-        self.log(format!("error {node_id} {message}"));
+    async fn write_status(
+        &self,
+        node_id: NodeId,
+        generation: u64,
+        status: Option<&str>,
+    ) -> Result<bool, String> {
+        self.log(match status {
+            Some(status) => format!("error {node_id} {status}"),
+            None => format!("clear {node_id} {generation}"),
+        });
+        Ok(true)
     }
 
     async fn count_drained_evacuations(
@@ -233,7 +246,7 @@ impl DrainV2Sink for FakeSink {
         generation: u64,
     ) -> Result<Vec<SandboxId>, String> {
         self.log(format!("count_drained {node_id} {generation}"));
-        Ok(Vec::new())
+        self.count_error.clone().map_or(Ok(Vec::new()), Err)
     }
 
     async fn fence(&self, node_id: NodeId, generation: u64) -> Result<Fence, String> {
@@ -418,6 +431,7 @@ fn node(phase: Option<&str>, generation: Option<u64>) -> V2Node {
         dispatched_at: None,
         terminated_observed_at: None,
         decrement_capacity: false,
+        last_error: None,
         db_now: DB_NOW,
     }
 }
@@ -739,7 +753,7 @@ async fn the_loop_owns_persisted_drains_without_terminating() {
     assert!(report.fenced.is_empty());
     let calls = sink.calls();
     assert!(
-        calls.contains(&format!("error {} {REFUSED_TERMINATE}", terminating.id)),
+        calls.contains(&format!("error {} {NOT_AWS_TERMINATOR}", terminating.id)),
         "{calls:?}"
     );
     assert!(
@@ -976,7 +990,7 @@ async fn a_terminating_node_fences_only_on_a_fresh_empty_report() {
             refusal(tonic::Status::aborted("in progress")),
             None,
             false,
-            Some("terminate refused: DrainNode failed: another DrainNode call is in progress"),
+            None,
             None,
         ),
         (
@@ -1041,6 +1055,20 @@ async fn a_terminating_node_fences_only_on_a_fresh_empty_report() {
                     "{case}: {calls:?}"
                 );
                 assert!(!calls.contains(&fenced_call), "{case}: {calls:?}");
+            }
+            // Another call held the node's slot and changed nothing: the
+            // node stays terminating, its status saying so, and the next
+            // tick checks again.
+            None if case == "aborted" => {
+                assert!(!calls.contains(&fenced_call), "{case}: {calls:?}");
+                assert!(!called(&sink, "return", &terminating), "{case}: {calls:?}");
+                assert!(
+                    calls.contains(&format!(
+                        "error {} {TERMINATE_WAITS_FOR_A_CALL}",
+                        terminating.id
+                    )),
+                    "{case}: {calls:?}"
+                );
             }
             None => {
                 assert!(calls.contains(&fenced_call), "{case}: {calls:?}");
@@ -1125,7 +1153,7 @@ async fn a_terminating_node_waits_without_a_terminating_authority() {
         [format!(
             "error {} {}",
             terminating.id,
-            super::cleanup::REFUSED_TERMINATE
+            super::cleanup::NOT_AWS_TERMINATOR
         )]
     );
 }
@@ -1330,7 +1358,8 @@ async fn an_unlisted_instance_after_a_recorded_terminated_reads_terminated() {
 /// Once `dispatched_at` is recorded the loop never dispatches again,
 /// whatever EC2 answers; past the bound it says the termination was
 /// accepted and the instance still runs. No answer from EC2 is said on
-/// every check, with the dispatch's age.
+/// every check. Neither names the dispatch's age, so the status changes
+/// only with the situation.
 #[tokio::test]
 async fn a_dispatched_node_is_never_dispatched_again() {
     let bound = V2LoopConfig::default().terminate_bound;
@@ -1343,19 +1372,19 @@ async fn a_dispatched_node_is_never_dispatched_again() {
             "past the bound",
             past_bound,
             running(),
-            Some("EC2 still answers running after 16 minutes"),
+            Some("EC2 still answers running past the terminate bound"),
         ),
         (
             "just dispatched, no answer",
             DB_NOW,
             unknown(),
-            Some("was dispatched 0 minutes ago; EC2 answers unknown (the EC2 call timed out)"),
+            Some("was dispatched; EC2 answers unknown (the EC2 call timed out)"),
         ),
         (
             "past the bound, no answer",
             past_bound,
             unknown(),
-            Some("was dispatched 16 minutes ago; EC2 answers unknown"),
+            Some("was dispatched; EC2 answers unknown"),
         ),
     ] {
         let node = V2Node {
@@ -1597,8 +1626,9 @@ async fn a_dispatched_node_is_deleted_once_terminated_with_its_node_gone() {
 /// with a trace naming it, recorded first (`terminated_observed_at`), and
 /// the node is called for nothing; so does an unlisted instance once the
 /// drain recorded it `terminated`. An unlisted one never seen `terminated`
-/// isn't death, and any other answer only records what EC2 said, after
-/// which the state's own step runs. A fresh heartbeat asks EC2 nothing.
+/// isn't death, and with any other answer the state's own step runs; what
+/// EC2 said is the node's status when that step has nothing else to report.
+/// A fresh heartbeat asks EC2 nothing.
 #[tokio::test]
 async fn every_unfenced_v2_state_lets_go_once_ec2_says_terminated() {
     type Build = fn() -> V2Node;
@@ -1694,7 +1724,10 @@ async fn every_unfenced_v2_state_lets_go_once_ec2_says_terminated() {
             );
             assert_eq!(
                 sink.calls().iter().any(|call| call.contains("EC2 answers")),
-                evidence.is_some() && !lets_go,
+                // The drained step alone has nothing else to report here:
+                // the others' calls are unscripted, and the terminate
+                // returns the node with its own reason.
+                evidence.is_some() && !lets_go && state == "drained",
                 "{case}: {:?}",
                 sink.calls()
             );
@@ -2190,7 +2223,8 @@ async fn a_tick_with_no_v2_node_counts_nothing() {
 }
 
 /// The gauges count each row once: a row the node reports twice pending is
-/// one pending row, a held row with work started for it is pending, and an
+/// one pending row, a held row with another artifact's upload started for it
+/// is pending, and an
 /// unrecorded evacuation is pending. `blocked` counts the node-wide
 /// problems.
 #[test]
@@ -2490,7 +2524,11 @@ async fn a_registration_replaced_after_the_listing_gets_no_effect() {
         ("terminating", Some("terminating")),
         ("cancel", None),
     ] {
-        let target = node(phase, Some(5));
+        // An earlier status, which a tick that acted on nothing keeps.
+        let target = V2Node {
+            last_error: Some("an earlier status".to_owned()),
+            ..node(phase, Some(5))
+        };
         let sink = FakeSink {
             nodes: vec![target.clone()],
             responses: HashMap::from([
@@ -2510,6 +2548,7 @@ async fn a_registration_replaced_after_the_listing_gets_no_effect() {
             "finish_cancel",
             "count_drained",
             "error",
+            "clear",
             "return",
             "fence",
         ] {
@@ -2533,7 +2572,11 @@ async fn a_registration_replaced_after_the_cordon_gets_no_further_effect() {
         ("terminating", Some("terminating")),
         ("cancel", None),
     ] {
-        let target = node(phase, Some(5));
+        // An earlier status, which a tick that acted on nothing keeps.
+        let target = V2Node {
+            last_error: Some("an earlier status".to_owned()),
+            ..node(phase, Some(5))
+        };
         let sink = FakeSink {
             nodes: vec![target.clone()],
             responses: HashMap::from([
@@ -2552,6 +2595,7 @@ async fn a_registration_replaced_after_the_cordon_gets_no_further_effect() {
             "drain_node",
             "finish_cancel",
             "error",
+            "clear",
             "report",
             "return",
             "fence",
@@ -2704,4 +2748,360 @@ async fn a_backoff_counts_from_after_the_calls_it_waited_on() {
     tokio::time::advance(config.dispatch_backoff_base).await;
     tick(&sink, &authority, &state).await;
     assert_eq!(authority.described().len(), 2, "the backoff ran out");
+}
+
+/// The status writes of `node` this tick, in order: `Some(text)` for a
+/// status, `None` for a clear.
+fn status_writes(sink: &FakeSink, node: &V2Node) -> Vec<Option<String>> {
+    sink.calls()
+        .iter()
+        .filter_map(|call| {
+            if let Some(text) = call.strip_prefix(&format!("error {} ", node.id)) {
+                Some(Some(text.to_owned()))
+            } else {
+                call.starts_with(&format!("clear {} ", node.id))
+                    .then_some(None)
+            }
+        })
+        .collect()
+}
+
+/// The tick writes a node's status at most once, from its outcome: nothing
+/// when it reads what the row holds already, once when it changes (the
+/// stall wins over a cordon error, with no clear between them), a clear
+/// when the tick has nothing to report, and nothing over a status a guarded
+/// transition wrote with its move this tick.
+#[tokio::test]
+async fn a_tick_writes_a_nodes_status_once_and_only_when_it_changes() {
+    const UNANSWERED: &str = "DrainNode failed: unscripted";
+    let stalled_report = || {
+        Ok(answer(
+            5,
+            DrainReport {
+                pending: vec![pending("c", DrainWait::Moving)],
+                ..DrainReport::default()
+            },
+        ))
+    };
+    let stale_report = |since: i64| StoredV2Report {
+        reported_at: since,
+        evacuated_grew_at: since,
+        ..StoredV2Report::default()
+    };
+    // (case, node, the answer to its drain call, its cordon's failure, the
+    // writes expected)
+    type Case = (
+        &'static str,
+        V2Node,
+        Option<Result<DrainNodeResponse, String>>,
+        Option<CordonFailure>,
+        Vec<Option<String>>,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "unchanged",
+            V2Node {
+                last_error: Some(UNANSWERED.to_owned()),
+                ..node(Some("draining"), Some(5))
+            },
+            None,
+            None,
+            vec![],
+        ),
+        (
+            "changed",
+            V2Node {
+                last_error: Some("an older status".to_owned()),
+                ..node(Some("draining"), Some(5))
+            },
+            None,
+            None,
+            vec![Some(UNANSWERED.to_owned())],
+        ),
+        (
+            "stalled, with a cordon error",
+            V2Node {
+                deadline_at: Some(DB_NOW - HOUR),
+                report: Some(stale_report(DB_NOW - HOUR)),
+                ..node(Some("draining"), Some(5))
+            },
+            Some(stalled_report()),
+            Some(CordonFailure::Other("the API server timed out".to_owned())),
+            vec![Some(
+                "the drain is stalled: no sandbox evacuated for over 15 minutes past its \
+                 deadline (1 pending, 0 blocked)"
+                    .to_owned(),
+            )],
+        ),
+        (
+            "nothing to report",
+            V2Node {
+                last_error: Some(UNANSWERED.to_owned()),
+                ..node(Some("draining"), Some(5))
+            },
+            Some(Ok(response(5, &[]))),
+            None,
+            vec![None],
+        ),
+        (
+            "a terminate's refusal, written with its move",
+            V2Node {
+                last_error: Some("an older status".to_owned()),
+                ..node(Some("terminating"), Some(5))
+            },
+            Some(stalled_report()),
+            None,
+            vec![],
+        ),
+    ];
+    for (case, target, answer, cordon_error, writes) in cases {
+        let sink = FakeSink {
+            nodes: vec![target.clone()],
+            responses: answer
+                .map(|answer| HashMap::from([((target.id, false), answer)]))
+                .unwrap_or_default(),
+            cordon_error,
+            ..FakeSink::default()
+        };
+        run_tick(&sink, &FakeAuthority::ok()).await;
+        assert_eq!(
+            status_writes(&sink, &target),
+            writes,
+            "{case}: {:?}",
+            sink.calls()
+        );
+    }
+}
+
+/// A drained node shows a failed count, and the next tick whose count
+/// succeeds clears it. Why a terminate returned it to drained stays: a
+/// tick whose count fails doesn't replace it, and the next good tick keeps
+/// it.
+#[tokio::test]
+async fn a_drained_nodes_error_clears_once_its_tick_succeeds() {
+    const FAILED: &str = "counting the drained node's durable rows evacuated failed: timeout";
+    let drained = node(Some("drained"), Some(5));
+    let failing = FakeSink {
+        nodes: vec![drained.clone()],
+        count_error: Some("timeout".to_owned()),
+        ..FakeSink::default()
+    };
+    run_tick(&failing, &FakeAuthority::ok()).await;
+    assert_eq!(status_writes(&failing, &drained), [Some(FAILED.to_owned())]);
+
+    let showing = V2Node {
+        last_error: Some(FAILED.to_owned()),
+        ..drained.clone()
+    };
+    let succeeding = FakeSink {
+        nodes: vec![showing.clone()],
+        ..FakeSink::default()
+    };
+    run_tick(&succeeding, &FakeAuthority::ok()).await;
+    assert_eq!(status_writes(&succeeding, &showing), [None]);
+
+    let returned = V2Node {
+        last_error: Some(NO_INSTANCE_TO_TERMINATE.to_owned()),
+        ..drained
+    };
+    let refused_and_failing = FakeSink {
+        nodes: vec![returned.clone()],
+        count_error: Some("timeout".to_owned()),
+        ..FakeSink::default()
+    };
+    run_tick(&refused_and_failing, &FakeAuthority::ok()).await;
+    assert!(
+        status_writes(&refused_and_failing, &returned).is_empty(),
+        "{:?}",
+        refused_and_failing.calls()
+    );
+    let keeping = FakeSink {
+        nodes: vec![returned.clone()],
+        ..FakeSink::default()
+    };
+    run_tick(&keeping, &FakeAuthority::ok()).await;
+    assert!(
+        status_writes(&keeping, &returned).is_empty(),
+        "{:?}",
+        keeping.calls()
+    );
+}
+
+/// A terminating node that records no instance to terminate returns to
+/// drained with that reason, without a call, once: the next tick finds it
+/// drained, keeps the reason and doesn't return it again. A terminate
+/// transaction that finds no instance returns it the same way.
+#[tokio::test]
+async fn a_terminate_with_no_instance_returns_to_drained_once() {
+    let terminating = V2Node {
+        instance_id: None,
+        ..node(Some("terminating"), Some(5))
+    };
+    let sink = FakeSink {
+        nodes: vec![terminating.clone()],
+        ..FakeSink::default()
+    };
+    let report = run_tick(&sink, &FakeAuthority::ok()).await;
+    assert_eq!(report.returned, [terminating.id]);
+    assert_eq!(
+        sink.calls(),
+        [format!(
+            "return {} 5 {NO_INSTANCE_TO_TERMINATE}",
+            terminating.id
+        )]
+    );
+
+    let returned = V2Node {
+        phase: Some("drained".to_owned()),
+        last_error: Some(NO_INSTANCE_TO_TERMINATE.to_owned()),
+        ..terminating
+    };
+    let next = FakeSink {
+        nodes: vec![returned.clone()],
+        ..FakeSink::default()
+    };
+    let report = run_tick(&next, &FakeAuthority::ok()).await;
+    assert_eq!(report, V2TickReport::default());
+    assert!(!called(&next, "return", &returned), "{:?}", next.calls());
+    assert!(
+        status_writes(&next, &returned).is_empty(),
+        "{:?}",
+        next.calls()
+    );
+
+    let found_none = node(Some("terminating"), Some(5));
+    let sink = FakeSink {
+        nodes: vec![found_none.clone()],
+        responses: HashMap::from([((found_none.id, false), Ok(response(5, &[])))]),
+        fence: Some(Fence::NoInstance),
+        ..FakeSink::default()
+    };
+    let report = run_tick(&sink, &FakeAuthority::ok()).await;
+    assert_eq!(report.returned, [found_none.id]);
+    assert!(
+        sink.calls().contains(&format!(
+            "return {} 5 {NO_INSTANCE_TO_TERMINATE}",
+            found_none.id
+        )),
+        "{:?}",
+        sink.calls()
+    );
+}
+
+/// A terminate's fresh report that refuses the terminate publishes the same
+/// rows as a draining tick's for that report, with the stall off, since the
+/// node goes back to `drained`, though the draining path reads the same
+/// report stalled. A fresh call the node doesn't answer counts as
+/// unanswered on the draining path and changes no gauge on the terminating
+/// one: nothing calls a drained node.
+#[tokio::test]
+async fn a_refused_terminate_publishes_its_reports_rows_unstalled() {
+    let config = V2LoopConfig::default();
+    let backoff = DispatchBackoff::new(config.dispatch_backoff_base);
+    let report = || {
+        Ok(answer(
+            5,
+            DrainReport {
+                evacuated: vec![evacuated("a")],
+                pending: vec![
+                    pending("b", DrainWait::Hold),
+                    pending("c", DrainWait::Moving),
+                ],
+                blocked: vec![blocked("scan failed")],
+            },
+        ))
+    };
+    for (case, answer) in [("a report", Some(report())), ("no answer", None)] {
+        let mut gauges = Vec::new();
+        for phase in ["draining", "terminating"] {
+            // The node reported `a` evacuated an hour ago and nothing since,
+            // so the draining path reads the report stalled.
+            let target = V2Node {
+                report: Some(StoredV2Report {
+                    evacuated_grew_at: DB_NOW - HOUR,
+                    evacuated: vec![StoredV2Evacuated {
+                        sandbox_id: "a".to_owned(),
+                        artifact_kind: StoredV2ArtifactKind::Full,
+                        artifact_id: "artifact".to_owned(),
+                    }],
+                    ..StoredV2Report::default()
+                }),
+                deadline_at: Some(DB_NOW - HOUR),
+                ..node(Some(phase), Some(5))
+            };
+            let sink = FakeSink {
+                nodes: vec![target.clone()],
+                responses: answer
+                    .clone()
+                    .map(|answer| HashMap::from([((target.id, false), answer)]))
+                    .unwrap_or_default(),
+                records: HashMap::from([(
+                    "a".to_owned(),
+                    EvacuationRecord::NotYet("uploading".into()),
+                )]),
+                ..FakeSink::default()
+            };
+            let outcome = step(
+                &sink,
+                &FakeAuthority::ok(),
+                &target,
+                None,
+                &backoff,
+                &config,
+                &PerNodeWarnPacer::new(Duration::from_secs(60)),
+            )
+            .await;
+            gauges.push(outcome.gauges);
+        }
+        let (draining, terminating) = (gauges[0], gauges[1]);
+        match draining {
+            Gauges::Report { rows, stalled } => {
+                assert!(stalled, "{case}: the draining path reads it stalled");
+                assert_eq!(
+                    terminating,
+                    Gauges::Report {
+                        rows,
+                        stalled: false
+                    },
+                    "{case}"
+                );
+            }
+            Gauges::Unanswered => assert_eq!(terminating, Gauges::Kept, "{case}"),
+            Gauges::Kept => panic!("{case}: the draining path publishes"),
+        }
+    }
+}
+
+/// A terminating node whose fresh call finds another call in progress on
+/// the node stays terminating and fences nothing, across ticks; its status
+/// says so, written once.
+#[tokio::test]
+async fn an_aborted_terminate_call_keeps_the_node_terminating() {
+    let terminating = node(Some("terminating"), Some(5));
+    for last_error in [None, Some(TERMINATE_WAITS_FOR_A_CALL.to_owned())] {
+        let listed = V2Node {
+            last_error: last_error.clone(),
+            ..terminating.clone()
+        };
+        let sink = FakeSink {
+            nodes: vec![listed.clone()],
+            refusal: Some(tonic::Status::aborted("in progress")),
+            ..FakeSink::default()
+        };
+        let report = run_tick(&sink, &FakeAuthority::ok()).await;
+        assert_eq!(report, V2TickReport::default(), "{last_error:?}");
+        for moved in ["fence", "return"] {
+            assert!(
+                !called(&sink, moved, &listed),
+                "{moved}: {:?}",
+                sink.calls()
+            );
+        }
+        let expected = if last_error.is_some() {
+            vec![]
+        } else {
+            vec![Some(TERMINATE_WAITS_FOR_A_CALL.to_owned())]
+        };
+        assert_eq!(status_writes(&sink, &listed), expected, "{last_error:?}");
+    }
 }

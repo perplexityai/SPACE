@@ -14,8 +14,8 @@ use uuid::Uuid;
 use pplx_space_node_registration_store::drain_v2::{
     LockedV2Node, StoredV2Report, add_v2_evacuated, advance_v2_drained, evacuated_still_suspended,
     finish_v2_cancel, let_go_v2_node, list_v2_node_rows, read_locked_v2_node,
-    record_terminate_held, record_v2_dispatched, record_v2_error, record_v2_report,
-    record_v2_terminated_observed, return_v2_drained, v2_node_as_listed, write_fence,
+    record_terminate_held, record_v2_dispatched, record_v2_report, record_v2_terminated_observed,
+    return_v2_drained, v2_node_as_listed, write_fence, write_v2_status,
 };
 
 use super::*;
@@ -211,6 +211,7 @@ pub(crate) async fn list_v2_nodes(pool: &PgPool) -> Result<Vec<V2Node>, sqlx::Er
             dispatched_at: row.dispatched_at,
             terminated_observed_at: row.terminated_observed_at,
             decrement_capacity: row.decrement_capacity,
+            last_error: row.last_error,
             db_now: row.db_now,
         })
         .collect())
@@ -667,11 +668,15 @@ impl DrainV2Sink for V2Sink {
             .collect())
     }
 
-    async fn record_error(&self, node_id: NodeId, message: &str) {
-        if let Err(error) = record_v2_error(&self.pool, node_id, message).await {
-            tracing::warn!(node_id = %node_id, %error, "node_drain v2: recording an error failed");
-        }
-        tracing::warn!(node_id = %node_id, error = message, "node_drain v2");
+    async fn write_status(
+        &self,
+        node_id: NodeId,
+        generation: u64,
+        status: Option<&str>,
+    ) -> Result<bool, String> {
+        write_v2_status(&self.pool, node_id, generation_i64(generation)?, status)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn count_drained_evacuations(

@@ -852,11 +852,105 @@ async fn the_phase_moves_check_the_stored_state() -> TestDbResult<()> {
         "fenced"
     );
     set(pool, node_id, None, serde_json::json!({})).await?;
+    let last_error = || async {
+        let error: Option<String> =
+            sqlx::query_scalar(sql!("SELECT drain_last_error FROM nodes WHERE id = $1"))
+                .bind(node_id)
+                .fetch_one(pool)
+                .await?;
+        TestDbResult::Ok(error)
+    };
     assert!(!finish_v2_cancel(pool, node_id, generation + 1).await?);
+    assert_eq!(
+        last_error().await?.as_deref(),
+        Some("terminate refused: x"),
+        "another generation's finish clears nothing"
+    );
     assert!(finish_v2_cancel(pool, node_id, generation).await?);
     assert_eq!(
         drain_v2_columns(pool, node_id).await?.map(|c| c.status),
         Some(None)
     );
+    assert_eq!(last_error().await?, None, "the finished cancel's status");
+    Ok(())
+}
+
+/// The loop's status write lands only on the row of the generation it names,
+/// and only when the row doesn't read that status already; `None` clears
+/// it. Storing a report leaves it as it is, and the listing reads it.
+#[tokio::test(flavor = "current_thread")]
+async fn the_status_is_written_once_under_its_generation() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let node_id = node(pool, true).await?;
+    start(pool, node_id, 600).await?;
+    let generation = generation_of(pool, node_id).await?;
+    let last_error = || async {
+        let error: Option<String> =
+            sqlx::query_scalar(sql!("SELECT drain_last_error FROM nodes WHERE id = $1"))
+                .bind(node_id)
+                .fetch_one(pool)
+                .await?;
+        TestDbResult::Ok(error)
+    };
+    assert!(write_v2_status(pool, node_id, generation, Some("waiting")).await?);
+    assert!(!write_v2_status(pool, node_id, generation, Some("waiting")).await?);
+    assert!(!write_v2_status(pool, node_id, generation + 1, Some("another")).await?);
+    assert_eq!(last_error().await?.as_deref(), Some("waiting"));
+
+    assert!(record_v2_report(pool, node_id, generation, &report_pending(&["a"]), &[], &[]).await?);
+    assert_eq!(last_error().await?.as_deref(), Some("waiting"));
+    let listed = list_v2_node_rows(pool).await?;
+    let row = listed
+        .iter()
+        .find(|row| row.id == node_id)
+        .expect("the v2 node");
+    assert_eq!(row.last_error.as_deref(), Some("waiting"));
+
+    assert!(write_v2_status(pool, node_id, generation, None).await?);
+    assert!(!write_v2_status(pool, node_id, generation, None).await?);
+    assert_eq!(last_error().await?, None);
+
+    // A row whose drain is gone takes no status.
+    sqlx::query(sql!(
+        "UPDATE nodes SET drain_phase = NULL, drain_engine = NULL, drain_status = NULL
+          WHERE id = $1"
+    ))
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    assert!(!write_v2_status(pool, node_id, generation, Some("late")).await?);
+    assert_eq!(last_error().await?, None);
+    Ok(())
+}
+
+/// What holds the terminate transaction's fence is written only when the
+/// row doesn't read it already: the same reason on a later tick leaves the
+/// row untouched (its `xmin` unchanged), another one replaces it.
+#[tokio::test(flavor = "current_thread")]
+async fn the_held_reason_is_written_only_when_it_changes() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let node_id = node(pool, true).await?;
+    start(pool, node_id, 600).await?;
+    let row = || async {
+        let row: (Option<String>, String) = sqlx::query_as(sql!(
+            "SELECT drain_last_error, xmin::TEXT FROM nodes WHERE id = $1"
+        ))
+        .bind(node_id)
+        .fetch_one(pool)
+        .await?;
+        TestDbResult::Ok(row)
+    };
+    let mut conn = pool.acquire().await?;
+    record_terminate_held(&mut *conn, node_id, "terminate held: a").await?;
+    let (held, written) = row().await?;
+    assert_eq!(held.as_deref(), Some("terminate held: a"));
+    record_terminate_held(&mut *conn, node_id, "terminate held: a").await?;
+    assert_eq!(row().await?, (held, written.clone()), "the same reason");
+    record_terminate_held(&mut *conn, node_id, "terminate held: b").await?;
+    let (held, rewritten) = row().await?;
+    assert_eq!(held.as_deref(), Some("terminate held: b"));
+    assert_ne!(rewritten, written, "another reason");
     Ok(())
 }

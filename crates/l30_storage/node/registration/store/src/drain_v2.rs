@@ -397,6 +397,8 @@ pub struct V2NodeRow {
     pub fence: Option<String>,
     /// `drain_status.dispatched_at`.
     pub dispatched_at: Option<i64>,
+    /// `drain_last_error`, as the listing read it.
+    pub last_error: Option<String>,
     /// `drain_status.terminated_observed_at`, while it counts for the
     /// instance the drain asks about (its fence, else its recorded
     /// instance): `None` once `drain_status.terminated_observed_instance`
@@ -445,6 +447,7 @@ static LIST_V2_NODES: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| 
                     THEN (n.drain_status->>'terminated_observed_at')::BIGINT
                 END AS terminated_observed_at,
                 n.terminate_decrement_capacity AS decrement_capacity,
+                n.drain_last_error AS last_error,
                 FLOOR(EXTRACT(EPOCH FROM NOW()))::BIGINT AS db_now
            FROM nodes n
            LEFT JOIN node_k8s k ON k.node_id = n.id
@@ -598,7 +601,8 @@ pub async fn v2_node_as_listed(
 }
 
 /// Record what holds the locked node from its terminate transaction's fence
-/// in `drain_last_error`. The caller must pass its open transaction.
+/// in `drain_last_error`, only when the row doesn't read it already. The
+/// caller must pass its open transaction.
 pub async fn record_terminate_held<C>(
     tx: &mut C,
     node_id: NodeId,
@@ -607,11 +611,16 @@ pub async fn record_terminate_held<C>(
 where
     for<'a> &'a mut C: Executor<'a>,
 {
-    sqlx::query(sql!("UPDATE nodes SET drain_last_error = $2 WHERE id = $1"))
-        .bind(node_id)
-        .bind(held)
-        .execute(tx.into_sqlx())
-        .await?;
+    sqlx::query(sql!(
+        "UPDATE nodes
+            SET drain_last_error = $2
+          WHERE id = $1
+            AND drain_last_error IS DISTINCT FROM $2::TEXT"
+    ))
+    .bind(node_id)
+    .bind(held)
+    .execute(tx.into_sqlx())
+    .await?;
     Ok(())
 }
 
@@ -791,8 +800,7 @@ static RECORD_V2_REPORT_STATEMENT: std::sync::LazyLock<String> = std::sync::Lazy
                     'report', $3::JSONB,
                     'observed_running', {observed_running},
                     'evacuated_total', {evacuated_total}
-                ),
-                drain_last_error = NULL
+                )
           WHERE id = $1
             AND drain_engine = 'v2'
             AND {GENERATION} = $2"
@@ -803,8 +811,9 @@ static RECORD_V2_REPORT_STATEMENT: std::sync::LazyLock<String> = std::sync::Lazy
 /// sandboxes it lists running, to the drain's observed set
 /// (`drain_status.observed_running`), and `evacuated`, the evacuations the
 /// controller recorded, to `drain_status.evacuated_total`; both sets only
-/// grow. Clears the last error. Returns false when the row is no longer
-/// that generation's v2 drain.
+/// grow. Leaves `drain_last_error` to the loop's status write
+/// ([`write_v2_status`]). Returns false when the row is no longer that
+/// generation's v2 drain.
 pub async fn record_v2_report(
     executor: impl Executor<'_>,
     node_id: NodeId,
@@ -953,7 +962,8 @@ static FINISH_V2_CANCEL_STATEMENT: std::sync::LazyLock<String> = std::sync::Lazy
     sql!(format!(
         "UPDATE nodes
             SET drain_engine = NULL,
-                drain_status = NULL
+                drain_status = NULL,
+                drain_last_error = NULL
           WHERE id = $1
             AND drain_engine = 'v2'
             AND drain_phase IS NULL
@@ -962,7 +972,9 @@ static FINISH_V2_CANCEL_STATEMENT: std::sync::LazyLock<String> = std::sync::Lazy
 });
 
 /// Clear an undrained v2 row's columns once its generation `generation` is
-/// cancelled on the node; false for a row that is no longer that
+/// cancelled on the node, its status (`drain_last_error`) included: the
+/// cancel's move writes the row's status with it, and a finished cancel
+/// leaves nothing to report. False for a row that is no longer that
 /// generation's cancel (a v2 engine with no phase).
 pub async fn finish_v2_cancel(
     executor: impl Executor<'_>,
@@ -980,19 +992,31 @@ pub async fn finish_v2_cancel(
     )
 }
 
-pub async fn record_v2_error(
+/// Make `drain_last_error` of the v2 drain under `generation` read
+/// `status` (`None` clears it), the status the loop's tick decided on. Writes
+/// only a row that is still that generation's v2 drain and doesn't read
+/// `status` already. Returns whether it wrote.
+pub async fn write_v2_status(
     executor: impl Executor<'_>,
     node_id: NodeId,
-    message: &str,
-) -> Result<(), DbError> {
-    sqlx::query(sql!(
-        "UPDATE nodes SET drain_last_error = $2 WHERE id = $1 AND drain_engine = 'v2'"
+    generation: i64,
+    status: Option<&str>,
+) -> Result<bool, DbError> {
+    Ok(sqlx::query(sql!(
+        "UPDATE nodes
+            SET drain_last_error = $3
+          WHERE id = $1
+            AND drain_engine = 'v2'
+            AND (drain_status->>'generation')::BIGINT = $2
+            AND drain_last_error IS DISTINCT FROM $3::TEXT"
     ))
     .bind(node_id)
-    .bind(message)
+    .bind(generation)
+    .bind(status)
     .execute(executor.into_sqlx())
-    .await?;
-    Ok(())
+    .await?
+    .rows_affected()
+        == 1)
 }
 
 #[cfg(test)]
