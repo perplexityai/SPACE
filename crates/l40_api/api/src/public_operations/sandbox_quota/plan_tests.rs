@@ -33,7 +33,7 @@ use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
-use pplx_space_public_operation_store::quota::SANDBOXES_HELD;
+use pplx_space_public_operation_store::test_support::SANDBOXES_HELD;
 
 /// How many plan nodes may handle each input row. The count's linear plans
 /// handle an org row in its scan (the bitmap index entry and the heap row),

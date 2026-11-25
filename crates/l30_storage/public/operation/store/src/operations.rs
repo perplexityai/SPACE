@@ -1100,7 +1100,7 @@ pub async fn hand_over_queued_system_operation(
 /// `idx_public_operations_tenant_created`. A constant rather than a literal at
 /// its query site so the API's plan-cost test can `EXPLAIN` the text this
 /// runs.
-pub const INLINE_ORG_AT_LIMIT: &str = sql!(
+pub(crate) const INLINE_ORG_AT_LIMIT: &str = sql!(
     "SELECT COUNT(*) >= $2
        FROM public_operations
       WHERE state = $3
@@ -1113,7 +1113,7 @@ pub const INLINE_ORG_AT_LIMIT: &str = sql!(
 /// Whether `org_id` has at least `limit` running operations, of no kind in
 /// `excluded_kinds`, whose claim token starts with `claim_token_prefix` and
 /// was renewed within `claim_stale_after_secs` of now by the database clock.
-/// See [`INLINE_ORG_AT_LIMIT`] for what it reads.
+/// See `INLINE_ORG_AT_LIMIT` for what it reads.
 pub async fn inline_org_at_limit(
     executor: impl PgExecutor<'_>,
     org_id: OrgId,

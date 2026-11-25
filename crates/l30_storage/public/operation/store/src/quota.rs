@@ -52,7 +52,7 @@ pub struct SandboxesHeld {
 /// read; and each of the org's in-flight creates joined to its row by id.
 /// A constant rather than a literal at its query site so the API's plan-cost
 /// test can `EXPLAIN` the text this runs.
-pub const SANDBOXES_HELD: &str = sql!(
+pub(crate) const SANDBOXES_HELD: &str = sql!(
     "SELECT COUNT(*), COUNT(*) FILTER (WHERE held.user_id = $2)
        FROM (
             SELECT s.user_id
@@ -119,7 +119,7 @@ pub async fn lock_quota_exclusive(
     Ok(())
 }
 
-/// Count with [`SANDBOXES_HELD`], for in-flight creates of `api_product`;
+/// Count with `SANDBOXES_HELD`, for in-flight creates of `api_product`;
 /// see there for what is counted.
 pub async fn sandboxes_held(
     executor: impl PgExecutor<'_>,

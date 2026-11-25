@@ -49,6 +49,7 @@ pub struct ExecutionSupersessionRow {
     pub materialized: bool,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl ExecutionSupersessionRow {
     pub const fn new(generation: i64, active: bool, replaced: bool, materialized: bool) -> Self {
         Self {

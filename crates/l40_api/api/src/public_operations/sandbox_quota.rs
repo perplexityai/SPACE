@@ -363,7 +363,7 @@ async fn lock_tx(
     }
 }
 
-/// Count with [`SANDBOXES_HELD`](pplx_space_public_operation_store::quota::SANDBOXES_HELD);
+/// Count with `pplx_space_public_operation_store::quota::SANDBOXES_HELD`;
 /// see there for what is counted.
 async fn sandboxes_held_tx(
     tx: &mut Transaction<'_, Postgres>,

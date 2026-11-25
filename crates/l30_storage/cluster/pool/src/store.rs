@@ -533,31 +533,23 @@ impl WarmPoolStore {
     }
 
     /// Give `twin` a copy of each operator-managed plaintext pool config of
-    /// `original`: same shape, namespace, targets, disk settings and
+    /// `originals`: same shape, namespace, targets, disk settings and
     /// `enabled`. A create that resolves to a twin claims only the twin's
-    /// slots, so a twin without these would have no pool. The original's
+    /// slots, so a twin without these would have no pool. The originals'
     /// configs are left as they are.
+    ///
+    /// `originals` may name several releases at once, such as one build's
+    /// releases under both hash spellings, which all resolve to the one twin.
+    /// It is in precedence order: a shape more than one of them configures
+    /// gets the first one's settings.
     ///
     /// Autoscaler-owned configs aren't copied: the autoscaler re-derives them
     /// for the twin from demand ([`Self::autoscale_configs`]). A manual config
     /// the twin already has for a shape is kept, so a retry copies nothing
-    /// twice; an autoscaler-owned one for the shape takes the original's
-    /// manual settings. Returns how many configs were copied or taken over.
+    /// twice; an autoscaler-owned one for the shape takes the copied manual
+    /// settings. Returns how many configs were copied or taken over.
     /// Runs on the caller's connection, so the copy commits with the twin's
     /// insert and a twin never wins resolution without its manual pools.
-    pub async fn copy_manual_configs_to_release(
-        conn: &mut PgConnection,
-        original: Uuid,
-        twin: Uuid,
-    ) -> std::result::Result<u64, sqlx::Error> {
-        Self::copy_manual_configs_from_releases(conn, &[original], twin).await
-    }
-
-    /// [`Self::copy_manual_configs_to_release`] from several originals at
-    /// once, such as one build's releases under both hash spellings, which
-    /// all resolve to the one twin. `originals` is in precedence order: a
-    /// shape more than one of them configures gets the first one's settings.
-    /// Everything else is as for the single-original copy.
     pub async fn copy_manual_configs_from_releases(
         conn: &mut PgConnection,
         originals: &[Uuid],

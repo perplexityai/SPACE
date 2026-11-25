@@ -2198,11 +2198,13 @@ pub fn portable_for_restore_affinity(sandbox_alias: &str) -> String {
 /// — `pplx_space_sandbox_residency`'s docs point here for it — and it is the
 /// oracle the executed forms are differentially tested against in
 /// `drain_gate_differential_tests`. Neither of those needs `pub`, since that
-/// test is in this crate; what does is `pplx-space-api`'s
-/// `live_residents_tests`, which uses it cross-crate as the same oracle. So it
-/// stays the definition of the question; it is just not how the question gets
-/// asked. Reach for [`drain_gate_blockers_for_node`] instead, always: this
-/// form's access path does not survive a production-sized `sandboxes`.
+/// test is in this crate; it is exposed under the `test-support` feature for
+/// `pplx-space-api`'s `live_residents_tests`, which uses it cross-crate as the
+/// same oracle. So it stays the definition of the question; it is just not how
+/// the question gets asked. Reach for [`drain_gate_blockers_for_node`]
+/// instead, always: this form's access path does not survive a
+/// production-sized `sandboxes`.
+#[cfg(any(test, feature = "test-support"))]
 pub fn drain_gate_blocks_source_release(sandbox_alias: &str, node_expr: &str) -> String {
     let target_pinned = drain_gate_target_pinned_blocks(sandbox_alias, node_expr);
     let durable = snapshot_durable_for_source_release(sandbox_alias);
@@ -2215,7 +2217,7 @@ pub fn drain_gate_blocks_source_release(sandbox_alias: &str, node_expr: &str) ->
     )
 }
 
-/// The `target_node_id`-attributed half of [`drain_gate_blocks_source_release`]:
+/// The `target_node_id`-attributed half of `drain_gate_blocks_source_release`:
 /// the mid-flight and not-yet-portable lifecycles pinned to the node, without
 /// the in-flight-upload disjunct.
 ///
@@ -2240,7 +2242,7 @@ fn drain_gate_target_pinned_blocks(sandbox_alias: &str, node_expr: &str) -> Stri
     )
 }
 
-/// Batched counterpart of [`drain_gate_blocks_source_release`]: a complete
+/// Batched counterpart of `drain_gate_blocks_source_release`: a complete
 /// `SELECT` yielding one `(node_id, sandbox_id)` pair per sandbox that blocks a
 /// node's drain gate, for an entire set of nodes in one pass.
 ///
@@ -2307,7 +2309,7 @@ pub fn drain_gate_blocker_pairs(node_ids_param: &str) -> String {
 
 /// Complete `SELECT` of the sandbox ids blocking **one** node's drain gate.
 ///
-/// Same rows as [`drain_gate_blocks_source_release`] evaluated for that node,
+/// Same rows as `drain_gate_blocks_source_release` evaluated for that node,
 /// but reached through [`drain_gate_blocker_pairs`] so each of the gate's two
 /// attributions drives off its own indexable column. Use this anywhere a
 /// statement needs one node's blockers — as a `COUNT(*)` source, or inside a

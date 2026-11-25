@@ -17,6 +17,13 @@ postgres = [
 [lints]
 workspace = true
 
+[features]
+default = []
+# Exposes `test_support`, the statement texts of `operations::inline_org_at_limit`
+# and `quota::sandboxes_held`, to the api's plan-cost tests as a
+# dev-dependency feature. This crate's unit tests get it under `cfg(test)`.
+test-support = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
