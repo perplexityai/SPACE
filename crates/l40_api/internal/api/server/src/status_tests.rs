@@ -56,7 +56,7 @@ async fn insert_placed_sandbox(
 /// One variant rather than a `(kind, origin)` plus `(state, location)` pair of
 /// tuples: those are two same-shaped tuples whose slots mean different things,
 /// so a case can be misassembled at the call site without failing to compile.
-/// Mirrors `sandbox_portability_tests`' `SnapshotSetup`.
+/// Mirrors `SnapshotSetup` in sandbox-portability's `portable_predicate_tests`.
 #[derive(Debug, Clone, Copy)]
 enum ArtifactPin {
     /// No `current_local_artifact_*` marker and no catalog row.

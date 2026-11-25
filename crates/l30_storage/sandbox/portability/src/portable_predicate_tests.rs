@@ -1,24 +1,21 @@
 //! Postgres-backed truth-table tests for the shared portability predicate
-//! defined in `pplx_space_sandbox_portability`.
+//! defined in this crate.
 //!
 //! Each test inserts a sandbox row with a controlled (lifecycle,
 //! `placement_changed_at`) tuple plus zero or one `snapshots` /
 //! `snapshot_storage_locations` rows, then evaluates the predicate via a
 //! direct `SELECT ...` against the live Postgres so the SQL fragment is
 //! actually parsed and executed by the same database engine that runs in
-//! production. The end-to-end callsite tests (`drain_guard_postgres_tests`
-//! in `lifecycle.rs`) cover the predicate's wiring through
-//! `fetch_active_node_drain_state`; these tests pin the predicate itself.
-
-#![cfg(test)]
+//! production. The end-to-end callsite tests in `pplx-space-api`
+//! (`drain_guard_postgres_tests` in `lifecycle.rs`) cover the predicate's
+//! wiring through `fetch_active_node_drain_state`; these tests pin the
+//! predicate itself.
 
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_snapshot_model::SnapshotId;
 
+use crate::{fresh_ready_snapshot_exists, portable_for_restore_affinity};
 use pplx_space_db_test_fixtures::pg_test_db;
-use pplx_space_sandbox_portability::{
-    fresh_ready_snapshot_exists, portable_for_drain_completion, portable_for_restore_affinity,
-};
 use sqlx::PgPool;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use uuid::Uuid;
@@ -89,19 +86,6 @@ async fn insert_snapshot_with_location(
     Ok(snapshot_id)
 }
 
-async fn eval_portable_for_drain_completion(
-    pool: &PgPool,
-    sandbox_id: SandboxId,
-) -> TestResult<bool> {
-    let predicate = portable_for_drain_completion("s");
-    let query = format!("SELECT {predicate} FROM sandboxes s WHERE s.id = $1");
-    let result: Option<bool> = sqlx::query_scalar(sqlx::AssertSqlSafe(query.as_str()))
-        .bind(sandbox_id)
-        .fetch_optional(pool)
-        .await?;
-    Ok(result.unwrap_or(false))
-}
-
 async fn eval_portable_for_restore_affinity(
     pool: &PgPool,
     sandbox_id: SandboxId,
@@ -130,8 +114,8 @@ async fn eval_fresh_ready_snapshot_exists(
 
 /// Drives the full `lifecycle × snapshot-state × freshness ×
 /// placement_changed_at IS NULL` truth table on a single fixture. Each row
-/// is checked against both portability predicates plus the inner freshness
-/// fragment so a regression in any one of them surfaces here.
+/// is checked against the restore-affinity predicate plus the inner freshness
+/// fragment so a regression in either of them surfaces here.
 #[tokio::test(flavor = "current_thread")]
 async fn portability_predicates_truth_table() -> TestResult {
     let db = pg_test_db().await?;
@@ -158,48 +142,28 @@ async fn portability_predicates_truth_table() -> TestResult {
         lifecycle: &'static str,
         placement_changed_at: Option<OffsetDateTime>,
         snapshot: SnapshotSetup,
-        expect_drain: bool,
         expect_restore: bool,
         expect_fresh: bool,
     }
 
-    let case =
-        |lifecycle, placement_changed_at, snapshot, expect_drain, expect_restore, expect_fresh| {
-            Case {
-                lifecycle,
-                placement_changed_at,
-                snapshot,
-                expect_drain,
-                expect_restore,
-                expect_fresh,
-            }
-        };
+    let case = |lifecycle, placement_changed_at, snapshot, expect_restore, expect_fresh| Case {
+        lifecycle,
+        placement_changed_at,
+        snapshot,
+        expect_restore,
+        expect_fresh,
+    };
 
     let cases = &[
         // === lifecycle = 'suspended', placement_changed_at IS NULL ===
         // Legacy rows: any ready full snapshot counts as fresh.
-        case("suspended", None, SnapshotSetup::None, false, false, false),
-        case(
-            "suspended",
-            None,
-            SnapshotSetup::FullReadyFresh,
-            true,
-            true,
-            true,
-        ),
-        case(
-            "suspended",
-            None,
-            SnapshotSetup::FullReadyStale,
-            true,
-            true,
-            true,
-        ),
+        case("suspended", None, SnapshotSetup::None, false, false),
+        case("suspended", None, SnapshotSetup::FullReadyFresh, true, true),
+        case("suspended", None, SnapshotSetup::FullReadyStale, true, true),
         case(
             "suspended",
             None,
             SnapshotSetup::FullCreatingFresh,
-            false,
             false,
             false,
         ),
@@ -207,7 +171,6 @@ async fn portability_predicates_truth_table() -> TestResult {
             "suspended",
             None,
             SnapshotSetup::DiskReadyFresh,
-            false,
             false,
             false,
         ),
@@ -219,7 +182,6 @@ async fn portability_predicates_truth_table() -> TestResult {
             SnapshotSetup::None,
             false,
             false,
-            false,
         ),
         case(
             "suspended",
@@ -227,13 +189,11 @@ async fn portability_predicates_truth_table() -> TestResult {
             SnapshotSetup::FullReadyFresh,
             true,
             true,
-            true,
         ),
         case(
             "suspended",
             Some(placement_changed),
             SnapshotSetup::FullReadyStale,
-            false,
             false,
             false,
         ),
@@ -243,7 +203,6 @@ async fn portability_predicates_truth_table() -> TestResult {
             SnapshotSetup::FullCreatingFresh,
             false,
             false,
-            false,
         ),
         case(
             "suspended",
@@ -251,15 +210,13 @@ async fn portability_predicates_truth_table() -> TestResult {
             SnapshotSetup::DiskReadyFresh,
             false,
             false,
-            false,
         ),
         // === lifecycle = 'restoring' ===
-        // Restore-affinity widens to include 'restoring'; drain-completion stays strict.
+        // Restore-affinity widens to include 'restoring'.
         case(
             "restoring",
             Some(placement_changed),
             SnapshotSetup::FullReadyFresh,
-            false,
             true,
             true,
         ),
@@ -269,13 +226,11 @@ async fn portability_predicates_truth_table() -> TestResult {
             SnapshotSetup::FullReadyStale,
             false,
             false,
-            false,
         ),
         case(
             "restoring",
             Some(placement_changed),
             SnapshotSetup::None,
-            false,
             false,
             false,
         ),
@@ -285,7 +240,6 @@ async fn portability_predicates_truth_table() -> TestResult {
             Some(placement_changed),
             SnapshotSetup::FullReadyFresh,
             false,
-            false,
             true,
         ),
         case(
@@ -294,14 +248,12 @@ async fn portability_predicates_truth_table() -> TestResult {
             SnapshotSetup::None,
             false,
             false,
-            false,
         ),
         // === lifecycle = 'paused' (same reasoning as 'started') ===
         case(
             "paused",
             Some(placement_changed),
             SnapshotSetup::FullReadyFresh,
-            false,
             false,
             true,
         ),
@@ -312,18 +264,16 @@ async fn portability_predicates_truth_table() -> TestResult {
             SnapshotSetup::None,
             false,
             false,
-            false,
         ),
         case(
             "suspending",
             Some(placement_changed),
             SnapshotSetup::FullReadyFresh,
             false,
-            false,
             true,
         ),
         // === lifecycle = 'creating' (no snapshot path applies) ===
-        case("creating", None, SnapshotSetup::None, false, false, false),
+        case("creating", None, SnapshotSetup::None, false, false),
     ];
 
     for (index, case) in cases.iter().enumerate() {
@@ -347,11 +297,10 @@ async fn portability_predicates_truth_table() -> TestResult {
         }
 
         let fresh = eval_fresh_ready_snapshot_exists(pool, sandbox_id).await?;
-        let drain = eval_portable_for_drain_completion(pool, sandbox_id).await?;
         let restore = eval_portable_for_restore_affinity(pool, sandbox_id).await?;
         assert_eq!(
-            (fresh, drain, restore),
-            (case.expect_fresh, case.expect_drain, case.expect_restore),
+            (fresh, restore),
+            (case.expect_fresh, case.expect_restore),
             "case[{index}] {case:?}"
         );
     }
@@ -387,7 +336,6 @@ async fn portability_passes_when_any_snapshot_is_fresh_even_if_others_are_stale(
     )
     .await?;
 
-    assert!(eval_portable_for_drain_completion(pool, sandbox_id).await?);
     assert!(eval_portable_for_restore_affinity(pool, sandbox_id).await?);
     Ok(())
 }
@@ -405,7 +353,6 @@ async fn portability_treats_equal_timestamps_as_fresh() -> TestResult {
     insert_sandbox(pool, sandbox_id, "suspended", Some(placement_changed)).await?;
     insert_snapshot_with_location(pool, sandbox_id, "full", "ready", placement_changed).await?;
 
-    assert!(eval_portable_for_drain_completion(pool, sandbox_id).await?);
     assert!(eval_portable_for_restore_affinity(pool, sandbox_id).await?);
     Ok(())
 }
@@ -433,7 +380,6 @@ async fn portability_requires_snapshot_storage_location_row() -> TestResult {
     .await?;
     // Deliberately omit the snapshot_storage_locations insert.
 
-    assert!(!eval_portable_for_drain_completion(pool, sandbox_id).await?);
     assert!(!eval_portable_for_restore_affinity(pool, sandbox_id).await?);
     assert!(!eval_fresh_ready_snapshot_exists(pool, sandbox_id).await?);
     Ok(())
@@ -502,6 +448,5 @@ async fn portability_requires_backup_for_the_current_local_artifact() -> TestRes
     .await?;
 
     assert!(eval_fresh_ready_snapshot_exists(pool, sandbox_id).await?);
-    assert!(eval_portable_for_drain_completion(pool, sandbox_id).await?);
     Ok(())
 }
