@@ -831,6 +831,8 @@ message SandboxInfo {
   // fields are carried with node state publication so the control plane can
   // fence a terminal suspend projection to the pod that produced the bytes.
   optional int64 execution_generation = 49;
+  // TODO: rename to an opaque `instance_id` that the sandbox manager compares
+  // and never interprets.
   optional string pod_uid = 50;
   // Highest current or retained node-local route generations. These remain
   // available after the active runtime identity is cleared.
@@ -868,6 +870,11 @@ message SandboxInfo {
   // The row's recorded node-local cleanup. Absent when none is recorded, or
   // from an older node that never set it.
   optional SandboxCleanup cleanup = 59;
+  // The address the node manager read from the externally created network
+  // namespace of the execution this row's current `execution_generation` and
+  // `pod_uid` name. Absent without such a namespace, once the sandbox stops,
+  // and after a sandbox-manager restart; callers fall back to their own source.
+  optional string external_address = 60;
 }
 
 // A node-local cleanup recorded on a sandbox row. An activation records one,
