@@ -56,9 +56,10 @@ pub async fn get_template(
         .map_err(|error| PublicApiError::bad_request(format!("invalid template name: {error}")))?
         .as_str()
         .to_string();
-    let Some(row) = fetch_template_row(&state.pool, org.id, &template_name)
-        .await
-        .map_err(database_error)?
+    let Some(row) =
+        pplx_space_template_store::templates::get_visible(&state.pool, org.id, &template_name)
+            .await
+            .map_err(database_error)?
     else {
         return Err(PublicApiError::not_found("template not found"));
     };
@@ -104,14 +105,6 @@ async fn fetch_template_rows(
 ) -> Result<Vec<TemplateRow>, sqlx::Error> {
     pplx_space_template_store::templates::list_visible(pool, org_id, cursor, i64::from(limit) + 1)
         .await
-}
-
-async fn fetch_template_row(
-    pool: &PgPool,
-    org_id: OrgId,
-    template_name: &str,
-) -> Result<Option<TemplateRow>, sqlx::Error> {
-    pplx_space_template_store::templates::get_visible(pool, org_id, template_name).await
 }
 
 async fn fetch_template_variants(

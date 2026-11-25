@@ -134,7 +134,7 @@ async fn template_rows_include_observed_base_snapshot_inventory() -> TestResult 
     .execute(&db.pool)
     .await?;
 
-    let templates = fetch_template_rows(&db.pool, None).await?;
+    let templates = pplx_space_template_store::templates::list_admin(&db.pool, None).await?;
     let response = templates
         .into_iter()
         .map(template_response)
