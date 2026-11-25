@@ -18,16 +18,20 @@ metric_vocabulary! {
         Allowed => "allowed",
         /// A resident sandbox was counted, with or without drain blockers.
         RefusedActive => "refused_active",
-        /// Only drain-gate blockers were counted.
+        /// The guard refused without counting a resident sandbox: only
+        /// drain-gate blockers were counted.
         RefusedDrainBlockers => "refused_drain_blockers",
     }
 }
 
 /// One v1 `:terminate` that reached the occupancy guard. `allowed` means the
-/// guard let the call through, not that the phase write then committed. A
-/// node refused on every call stays `drained`, and an allowed one is
-/// terminated with whatever the count missed. "Admin node terminate guard" in
-/// `docs/observability.md` describes each outcome; keep it current.
+/// guard let the call through to the `terminating` phase write, not that the
+/// write committed or the instance was terminated: the terminating tick
+/// recounts the blocking residents first and returns the node to `drained` if
+/// one attached after the write. The cluster controller's
+/// `drained_node_terminator` also moves drained nodes to `terminating`, and
+/// never counts here. "Admin node terminate guard" in `docs/observability.md`
+/// describes each outcome; keep it current.
 pub fn node_terminate_guard(node_id: &str, outcome: NodeTerminateGuardOutcome) {
     counter(
         "admin.node_terminate.guard",

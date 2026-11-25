@@ -1464,13 +1464,30 @@ the guard and counts nothing.
 | `refused_active` | A resident sandbox was counted, whatever the drain blockers; the call answered 409 |
 | `refused_drain_blockers` | Only drain-gate blockers were counted; the call answered 409 |
 
-A refusal's `admin_audit` log entry (target `space.admin.audit`) carries the
-counts in `outcome_counts`, as `active=N drain_blockers=M`.
+The 409 body carries the same counts in `sandboxes_active` and
+`sandboxes_drain_blockers`, and a refusal's `admin_audit` log entry (target
+`space.admin.audit`) carries them in `outcome_counts`, as
+`active=N drain_blockers=M`.
 
-Automation calls `:terminate` on drained nodes, so a node refused on every
-call stays `drained`, and only its audit entries say why. Alert on a `refused_*` outcome that
-persists for one `node_id` across repeated calls. `allowed` comes from the same
-counts, so it cannot show a blocker the count missed.
+`allowed` means the call reached the `terminating` phase write, not that the
+instance was terminated. `node_drain` recounts the blocking residents just
+before the provider terminate call, and returns the node to `drained` with a
+warning if one attached after the write.
+
+The counter covers only the admin `:terminate` path. Where the cluster
+controller's `drained_node_terminator` is enabled
+(`SPACE_DRAINED_NODE_TERMINATOR_ENABLED`), it also moves drained nodes to
+`terminating`, through its own local-snapshot hold and guarded phase update.
+It counts the move in `node_drain.transitions` with `from:drained` and
+`to:terminating`, without a node tag, and logs a warning when its
+local-snapshot hold keeps a node. On such a deployment a node this guard
+refused may still leave `drained`, and a node with no `allowed` count may still
+have been terminated.
+
+Automation calls `:terminate` on drained nodes. Where nothing else moves them,
+a node refused on every call stays `drained`. Alert on a `refused_*` outcome
+that persists for one `node_id` across repeated calls. `allowed` comes from
+the same counts as the decision, so it cannot show a blocker the count missed.
 
 ## Sandboxes in a transient lifecycle
 

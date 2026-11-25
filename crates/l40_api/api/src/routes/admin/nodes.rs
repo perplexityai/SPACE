@@ -1240,18 +1240,18 @@ pub(super) fn terminate_blocked_by_occupancy(occupancy: &node_store::TerminateOc
     occupancy.active > 0 || occupancy.drain_blockers > 0
 }
 
-/// The `outcome` the `:terminate` occupancy guard is counted under. It
-/// refuses exactly when [`terminate_blocked_by_occupancy`] does; a node with
-/// residents counts as `refused_active` whatever its drain blockers.
+/// The `outcome` the `:terminate` occupancy guard is counted under. Whether it
+/// refused comes from [`terminate_blocked_by_occupancy`] itself; a refused node
+/// with residents counts as `refused_active` whatever its drain blockers.
 pub(super) fn terminate_guard_outcome(
     occupancy: &node_store::TerminateOccupancy,
 ) -> NodeTerminateGuardOutcome {
-    if occupancy.active > 0 {
-        NodeTerminateGuardOutcome::RefusedActive
-    } else if occupancy.drain_blockers > 0 {
-        NodeTerminateGuardOutcome::RefusedDrainBlockers
-    } else {
+    if !terminate_blocked_by_occupancy(occupancy) {
         NodeTerminateGuardOutcome::Allowed
+    } else if occupancy.active > 0 {
+        NodeTerminateGuardOutcome::RefusedActive
+    } else {
+        NodeTerminateGuardOutcome::RefusedDrainBlockers
     }
 }
 
