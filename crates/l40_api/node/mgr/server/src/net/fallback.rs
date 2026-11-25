@@ -245,20 +245,25 @@ pub fn default_iface(ns: Option<&str>) -> Result<String, DefaultIfaceError> {
         })
 }
 
-pub fn default_iface_ipv4(ns: &str) -> Result<std::net::Ipv4Addr, DefaultIfaceError> {
-    let iface = default_iface(Some(ns))?;
+pub fn external_ipv4(ns: &str) -> Result<std::net::Ipv4Addr, DefaultIfaceError> {
     let output = Command::new("ip")
-        .args([
-            "netns", "exec", ns, "ip", "-4", "-o", "addr", "show", "dev", &iface,
-        ])
+        .args(["-n", ns, "-4", "-o", "addr", "show"])
         .output()
         .map_err(|e| DefaultIfaceError::Other(format!("cannot run ip addr: {e}")))?;
     String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .skip_while(|word| *word != "inet")
-        .nth(1)
-        .and_then(|cidr| cidr.split('/').next()?.parse().ok())
-        .ok_or_else(|| DefaultIfaceError::Other(format!("{iface} has no IPv4 address")))
+        .lines()
+        .filter(|line| line.split_whitespace().nth(1) != Some("lo"))
+        .filter_map(|line| {
+            let mut words = line.split_whitespace().skip_while(|word| *word != "inet");
+            words
+                .nth(1)?
+                .split('/')
+                .next()?
+                .parse::<std::net::Ipv4Addr>()
+                .ok()
+        })
+        .find(|ip| !ip.is_loopback() && !ip.is_link_local())
+        .ok_or_else(|| DefaultIfaceError::Other("no external IPv4 address".to_string()))
 }
 
 pub fn ns_exists(name: &str) -> bool {

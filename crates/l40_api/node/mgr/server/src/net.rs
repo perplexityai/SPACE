@@ -832,9 +832,12 @@ fn get_default_iface_in_ns(ns: &str) -> Result<String, DefaultIfaceError> {
     native::default_iface(Some(ns))
 }
 
-/// The IPv4 address of `ns`'s default-route interface.
-pub fn default_route_ipv4(ns: &str) -> Result<std::net::Ipv4Addr, DefaultIfaceError> {
-    native::default_iface_ipv4(ns)
+/// The address the containerd shim redirects to the node-api proxy in the
+/// external namespace `ns`: the first IPv4 address, in interface index order,
+/// that is neither loopback nor link-local, on a non-loopback interface. It
+/// must match the shim's `podIPFromCurrentNetns`.
+pub fn external_ipv4(ns: &str) -> Result<std::net::Ipv4Addr, DefaultIfaceError> {
+    native::external_ipv4(ns)
 }
 
 /// Return the ingress interface to bind host-port DNAT rules to.

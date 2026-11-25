@@ -253,11 +253,13 @@ fn firewall_setup_classifier_preserves_transient_and_permanent_sources() {
     );
 }
 
-/// The external address is the one on the default route's interface, not
-/// the first address in the namespace.
+/// The external address is the one the shim redirects: the first eligible
+/// address in interface order, even when the default route uses another
+/// interface. `TestPodIPFromNetnsMatchesNodeManager` in the shim pins the same
+/// fixture.
 #[cfg(target_os = "linux")]
 #[test]
-fn external_address_is_the_default_route_interface_address() {
+fn external_address_is_the_shim_redirect_address() {
     if !pplx_space_test_env::root_or_skip("create a network namespace") {
         return;
     }
@@ -286,7 +288,7 @@ fn external_address_is_the_default_route_interface_address() {
     ip("-n NS route add default via 10.244.3.1 dev eth0");
 
     assert_eq!(
-        super::default_route_ipv4(&ns.0).unwrap(),
-        "10.244.3.7".parse::<std::net::Ipv4Addr>().unwrap()
+        super::external_ipv4(&ns.0).unwrap(),
+        "192.0.2.9".parse::<std::net::Ipv4Addr>().unwrap()
     );
 }

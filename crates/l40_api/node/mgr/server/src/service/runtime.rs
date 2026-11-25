@@ -1268,7 +1268,7 @@ pub(super) mod tests;
 
 /// Best effort: a caller without the address falls back to its own source.
 async fn read_external_address(sandbox_id: &str, netns: String) -> Option<String> {
-    match tokio::task::spawn_blocking(move || net::default_route_ipv4(&netns)).await {
+    match tokio::task::spawn_blocking(move || net::external_ipv4(&netns)).await {
         Ok(Ok(ip)) => Some(ip.to_string()),
         Ok(Err(error)) => {
             tracing::warn!(sandbox_id, %error, "failed to read external netns address");
