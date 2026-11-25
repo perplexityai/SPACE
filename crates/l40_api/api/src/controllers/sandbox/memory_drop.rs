@@ -262,51 +262,30 @@ impl MemoryDrop {
                 MemoryDropIneligible::UnsupportedLocation,
             ));
         };
-        let written = self
-            .renewing_seal(
-                pool,
-                sandbox_id,
-                token,
-                self.write_disk(sandbox_id, &candidate, &plan),
-            )
-            .await?;
-        let rootfs_size = match written {
-            Some(Ok(Ok(rootfs_size))) => rootfs_size,
-            Some(Ok(Err(why))) => {
-                self.release(pool, sandbox_id, token).await;
-                return Ok(MemoryDropOutcome::NotEligible(
-                    MemoryDropIneligible::Metadata(why),
-                ));
+        let copied = match self.earlier_disk(pool, &plan).await? {
+            EarlierDisk::None => {
+                self.copy_disk(pool, sandbox_id, token, &candidate, &plan)
+                    .await?
             }
-            Some(Err(error)) => {
-                // The row stays on its full pin, so a retry derives the same
-                // disk prefix and rewrites it. Nothing registers the copied
-                // bytes for the sweeper while another attempt may still own
-                // them: the sweeper doesn't check whether a live snapshot row
-                // shares a prefix before deleting it, so an orphan registered
-                // now could delete a concurrent winner's disk. If the pin
-                // moves some other way, such as a wake, nothing reuses the
-                // prefix and it leaks: at most one per pinned artifact.
-                tracing::warn!(
-                    %sandbox_id,
-                    snapshot_id = %candidate.full_snapshot_id,
-                    %error,
-                    "memory drop failed: writing the disk artifact failed"
-                );
+            // An earlier drop of this pin copied and registered these exact
+            // bytes, and an operator has since pointed the row back at its
+            // full artifact. Copying again would rewrite objects retention may
+            // claim at any time; reusing them leaves nothing to race. The
+            // commit refuses if retention claimed the disk in the meantime.
+            EarlierDisk::Ready { rootfs_size } => Copied::Size(rootfs_size),
+            // The bytes under the prefix are being deleted, so a copy written
+            // there now could lose objects to that delete after it registers.
+            // Once the delete finishes its row is gone, and a retry copies.
+            EarlierDisk::Retiring => {
                 self.release(pool, sandbox_id, token).await;
-                return Err(ControllerError::service_unavailable(format!(
-                    "writing the disk artifact failed; retry: {error}"
-                )));
-            }
-            // The seal was lost mid-copy: it expired and something took the
-            // row, or a write moved its lifecycle.
-            None => {
-                self.release_lost_prefix(pool, sandbox_id, &candidate, &plan)
-                    .await?;
                 return Err(ControllerError::service_unavailable(
-                    "the memory drop lost its seal while its disk was being written; retry",
+                    "an earlier drop's disk for this snapshot is still being deleted; retry the memory drop",
                 ));
             }
+        };
+        let rootfs_size = match copied {
+            Copied::Size(rootfs_size) => rootfs_size,
+            Copied::Outcome(outcome) => return Ok(outcome),
         };
 
         match self
@@ -349,6 +328,111 @@ impl MemoryDrop {
         Err(ControllerError::service_unavailable(
             "the sandbox changed while its disk was being written; retry the memory drop",
         ))
+    }
+
+    /// What an earlier drop of the same pin left under the disk ids, read
+    /// after the seal so no other drop of this row is copying.
+    ///
+    /// Retention claims a disk (`ready` to `deleting`), deletes its prefix,
+    /// and only then deletes its rows; the storage sweeper deletes an
+    /// orphaned prefix before its row. So no row and no pending orphan means
+    /// nothing is deleting the prefix, and nothing can start to: retention
+    /// claims only a registered row, and only a drop of this pin, which the
+    /// seal excludes, orphans this prefix.
+    async fn earlier_disk(
+        &self,
+        pool: &PgPool,
+        plan: &CopyPlan,
+    ) -> Result<EarlierDisk, ControllerError> {
+        let registered = pplx_space_snapshot_store::get(pool, plan.disk_snapshot_id)
+            .await
+            .map_err(|error| {
+                ControllerError::internal(format!(
+                    "failed to load an earlier drop's disk snapshot: {error}"
+                ))
+            })?;
+        if let Some(registered) = registered {
+            let usable = registered.state().is_ready()
+                && registered
+                    .storage_location()
+                    .is_some_and(|location| location.orphaned_at().is_none());
+            return Ok(if usable {
+                EarlierDisk::Ready {
+                    rootfs_size: registered
+                        .size_bytes()
+                        .and_then(|size| u64::try_from(size).ok()),
+                }
+            } else {
+                EarlierDisk::Retiring
+            });
+        }
+        let pending = pplx_space_snapshot_store::orphan::orphan_pending(pool, &plan.dest)
+            .await
+            .map_err(|error| db_error("check for an unswept disk prefix", &error))?;
+        Ok(if pending {
+            EarlierDisk::Retiring
+        } else {
+            EarlierDisk::None
+        })
+    }
+
+    /// Copy the disk under a renewing seal. Returns its rootfs size, or the
+    /// outcome when the copy can't go ahead; every path but the size lifts
+    /// or has lost the seal.
+    async fn copy_disk(
+        &self,
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+        token: Uuid,
+        candidate: &MemoryDropCandidate,
+        plan: &CopyPlan,
+    ) -> Result<Copied, ControllerError> {
+        let written = self
+            .renewing_seal(
+                pool,
+                sandbox_id,
+                token,
+                self.write_disk(sandbox_id, candidate, plan),
+            )
+            .await?;
+        match written {
+            Some(Ok(Ok(rootfs_size))) => Ok(Copied::Size(Some(rootfs_size))),
+            Some(Ok(Err(why))) => {
+                self.release(pool, sandbox_id, token).await;
+                Ok(Copied::Outcome(MemoryDropOutcome::NotEligible(
+                    MemoryDropIneligible::Metadata(why),
+                )))
+            }
+            Some(Err(error)) => {
+                // The row stays on its full pin, so a retry derives the same
+                // disk prefix and rewrites it. Nothing registers the copied
+                // bytes for the sweeper while another attempt may still own
+                // them: the sweeper doesn't check whether a live snapshot row
+                // shares a prefix before deleting it, so an orphan registered
+                // now could delete a concurrent winner's disk. If the pin
+                // moves some other way, such as a wake, nothing reuses the
+                // prefix and it leaks: at most one per pinned artifact.
+                tracing::warn!(
+                    %sandbox_id,
+                    snapshot_id = %candidate.full_snapshot_id,
+                    %error,
+                    "memory drop failed: writing the disk artifact failed"
+                );
+                self.release(pool, sandbox_id, token).await;
+                Err(ControllerError::service_unavailable(format!(
+                    "writing the disk artifact failed; retry: {error}"
+                )))
+            }
+            // The seal was lost mid-copy: it expired and something took the
+            // row, or a write moved its lifecycle.
+            None => {
+                self.release_lost_prefix(pool, sandbox_id, candidate, plan)
+                    .await?;
+                Err(ControllerError::service_unavailable(
+                    "the memory drop lost its seal while its disk was being written; retry",
+                ))
+            }
+        }
     }
 
     /// Seal the row with `token`, under the fork-source lock and the row
@@ -533,7 +617,7 @@ impl MemoryDrop {
         token: Uuid,
         candidate: &MemoryDropCandidate,
         plan: &CopyPlan,
-        rootfs_size: u64,
+        rootfs_size: Option<u64>,
     ) -> Result<CommitOutcome, ControllerError> {
         let mut tx = pool
             .begin()
@@ -572,7 +656,7 @@ impl MemoryDrop {
             plan.dest.clone(),
         )
         .with_resources(full.vcpu(), full.memory_mib())
-        .with_size_bytes(i64::try_from(rootfs_size).ok())
+        .with_size_bytes(rootfs_size.and_then(|size| i64::try_from(size).ok()))
         .with_template(full.template_id().cloned(), full.content_hash().cloned())
         .with_artifact(artifact)
         .with_generation(full.generation())
@@ -673,6 +757,28 @@ enum CommitOutcome {
     /// An earlier drop of the same pin registered this disk, and it's no
     /// longer `ready` or its location was given to the sweeper.
     DiskRetiring,
+}
+
+/// What an earlier drop of the same pin left under the disk ids
+/// ([`MemoryDrop::earlier_disk`]).
+enum EarlierDisk {
+    /// No row and no orphan: the drop copies.
+    None,
+    /// A `ready` disk with an attached location. Its bytes are complete, so
+    /// the drop re-pins to it without copying; `rootfs_size` is what that
+    /// drop recorded.
+    Ready { rootfs_size: Option<u64> },
+    /// Retention or the storage sweeper is deleting the prefix.
+    Retiring,
+}
+
+/// The result of [`MemoryDrop::copy_disk`].
+enum Copied {
+    /// The disk's bytes are in place, with the rootfs's logical size when
+    /// known.
+    Size(Option<u64>),
+    /// The drop ends here with this outcome.
+    Outcome(MemoryDropOutcome),
 }
 
 /// Where the copy reads and writes, and the ids it registers.

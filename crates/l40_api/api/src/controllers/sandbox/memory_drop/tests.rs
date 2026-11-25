@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_util::FutureExt;
@@ -22,8 +23,8 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{
-    CopyPlan, MemoryDrop, MemoryDropIneligible, MemoryDropObjects, MemoryDropObjectsError,
-    MemoryDropOutcome, object_key, project_disk_metadata,
+    CommitOutcome, CopyPlan, MemoryDrop, MemoryDropIneligible, MemoryDropObjects,
+    MemoryDropObjectsError, MemoryDropOutcome, Sealed, object_key, project_disk_metadata,
 };
 
 const BUCKET: &str = "test-bucket";
@@ -242,6 +243,8 @@ fn an_artifact_the_projection_cant_vouch_for_is_refused() {
 #[derive(Default)]
 struct MapObjects {
     objects: Mutex<HashMap<String, Vec<u8>>>,
+    /// How many object copies the drops made.
+    copies: AtomicUsize,
     on_write: Option<Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>>,
 }
 
@@ -299,6 +302,7 @@ impl MemoryDropObjects for MapObjects {
                 .get(source, file)
                 .ok_or_else(|| MemoryDropObjectsError(format!("no {file}")))?;
             assert_eq!(body.len() as u64, size);
+            self.copies.fetch_add(1, Ordering::SeqCst);
             self.put(dest, file, body);
             Ok(())
         }
@@ -646,10 +650,17 @@ async fn a_redrop_onto_a_disk_retention_is_deleting_is_retryable() -> TestResult
     .execute(&db.pool)
     .await?;
 
+    let copies = objects.copies.load(Ordering::SeqCst);
+
     let error = drop
         .drop_memory(&db.pool, fixture.sandbox_id)
         .await
         .expect_err("a disk being deleted isn't re-pinned");
+    assert_eq!(
+        objects.copies.load(Ordering::SeqCst),
+        copies,
+        "nothing is copied into a prefix retention is deleting"
+    );
     assert_eq!(
         error.status(),
         axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -669,6 +680,201 @@ async fn a_redrop_onto_a_disk_retention_is_deleting_is_retryable() -> TestResult
     assert!(
         !pplx_space_sandbox_store::memory_drop::sealed(&db.pool, fixture.sandbox_id).await?,
         "the refused drop lifts its seal"
+    );
+    Ok(())
+}
+
+/// Point a dropped row back at its retained full artifact, as an operator
+/// does before a rollback.
+async fn repoint_to_full(pool: &PgPool, fixture: &Fixture) -> TestResult {
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+         SET current_local_artifact_id = $2,
+             current_local_artifact_kind = 'full',
+             current_local_artifact_origin = 'suspend'
+         WHERE id = $1"
+    ))
+    .bind(fixture.sandbox_id)
+    .bind(fixture.artifact_id.as_uuid())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The sandbox's `(lifecycle, pin, pin kind)`.
+async fn pin_of(pool: &PgPool, fixture: &Fixture) -> TestResult<(String, Uuid, String)> {
+    Ok(sqlx::query_as(sql!(
+        "SELECT lifecycle, current_local_artifact_id, current_local_artifact_kind
+         FROM sandboxes WHERE id = $1"
+    ))
+    .bind(fixture.sandbox_id)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// After a repoint, the first drop's disk is unpinned and retention may claim
+/// it at any time: it carries the full snapshot's timestamp, so the age gate
+/// doesn't hold it. A re-drop that copied into the same prefix could have
+/// objects deleted under it. The second drop re-pins to the registered disk
+/// and copies nothing.
+#[tokio::test]
+async fn a_redrop_onto_a_ready_earlier_disk_reuses_it_without_copying() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let objects = Arc::new(MapObjects::default());
+    let fixture = Fixture::insert(&db.pool, &objects).await?;
+    let drop = MemoryDrop::new(objects.clone());
+    let MemoryDropOutcome::Dropped(first) = drop.drop_memory(&db.pool, fixture.sandbox_id).await?
+    else {
+        panic!("the first drop commits");
+    };
+    repoint_to_full(&db.pool, &fixture).await?;
+    let copies = objects.copies.load(Ordering::SeqCst);
+
+    let MemoryDropOutcome::Dropped(second) = drop.drop_memory(&db.pool, fixture.sandbox_id).await?
+    else {
+        panic!("the re-drop commits");
+    };
+    assert_eq!(second, first);
+    assert_eq!(objects.copies.load(Ordering::SeqCst), copies);
+    assert_eq!(
+        pin_of(&db.pool, &fixture).await?,
+        (
+            "suspended".to_string(),
+            first.disk_artifact_id.as_uuid(),
+            "disk".to_string()
+        )
+    );
+    assert!(!memory_drop::sealed(&db.pool, fixture.sandbox_id).await?);
+    Ok(())
+}
+
+/// Once retention has deleted the first drop's disk, its rows are gone too
+/// (it deletes the prefix before the rows), so the prefix is free and the
+/// re-drop copies again.
+#[tokio::test]
+async fn a_redrop_after_retention_deleted_the_earlier_disk_copies_again() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let objects = Arc::new(MapObjects::default());
+    let fixture = Fixture::insert(&db.pool, &objects).await?;
+    let drop = MemoryDrop::new(objects.clone());
+    let MemoryDropOutcome::Dropped(first) = drop.drop_memory(&db.pool, fixture.sandbox_id).await?
+    else {
+        panic!("the first drop commits");
+    };
+    repoint_to_full(&db.pool, &fixture).await?;
+    sqlx::query(sql!(
+        "DELETE FROM snapshot_storage_locations WHERE snapshot_id = $1"
+    ))
+    .bind(first.disk_snapshot_id.as_uuid())
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!("DELETE FROM snapshots WHERE id = $1"))
+        .bind(first.disk_snapshot_id.as_uuid())
+        .execute(&db.pool)
+        .await?;
+    let copies = objects.copies.load(Ordering::SeqCst);
+
+    let MemoryDropOutcome::Dropped(second) = drop.drop_memory(&db.pool, fixture.sandbox_id).await?
+    else {
+        panic!("the re-drop commits");
+    };
+    assert_eq!(second, first);
+    assert_eq!(objects.copies.load(Ordering::SeqCst), copies + 1);
+    Ok(())
+}
+
+/// A drop that lost after its pin moved handed the prefix to the storage
+/// sweeper. If the row is pointed back at that artifact, a re-drop derives
+/// the same prefix, so it waits for the sweeper rather than copy into bytes
+/// being deleted.
+#[tokio::test]
+async fn a_redrop_onto_an_unswept_orphan_prefix_is_retryable() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let objects = Arc::new(MapObjects::default());
+    let fixture = Fixture::insert(&db.pool, &objects).await?;
+    let drop = MemoryDrop::new(objects.clone());
+    let candidate = memory_drop::candidate(&db.pool, fixture.sandbox_id, CandidateRead::Plain)
+        .await?
+        .expect("eligible");
+    let plan = CopyPlan::new(fixture.sandbox_id, &candidate).expect("plan");
+    assert!(
+        pplx_space_snapshot_store::orphan::orphan_unowned_location(
+            &db.pool,
+            plan.disk_snapshot_id,
+            &plan.dest,
+            candidate.org_id,
+        )
+        .await?
+    );
+
+    let error = drop
+        .drop_memory(&db.pool, fixture.sandbox_id)
+        .await
+        .expect_err("an unswept prefix isn't copied into");
+    assert_eq!(
+        error.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "{error}"
+    );
+    assert_eq!(objects.copies.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        pin_of(&db.pool, &fixture).await?,
+        (
+            "suspended".to_string(),
+            fixture.artifact_id.as_uuid(),
+            "full".to_string()
+        )
+    );
+    assert!(!memory_drop::sealed(&db.pool, fixture.sandbox_id).await?);
+    Ok(())
+}
+
+/// The commit re-checks the earlier disk under the fork-source lock, which
+/// retention's claim also takes: a claim that lands after the drop decided to
+/// reuse the disk, and before it commits, still stops the re-pin.
+#[tokio::test]
+async fn the_commit_refuses_a_disk_retention_claimed_after_the_drop_read_it() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let objects = Arc::new(MapObjects::default());
+    let fixture = Fixture::insert(&db.pool, &objects).await?;
+    let drop = MemoryDrop::new(objects.clone());
+    let MemoryDropOutcome::Dropped(first) = drop.drop_memory(&db.pool, fixture.sandbox_id).await?
+    else {
+        panic!("the first drop commits");
+    };
+    repoint_to_full(&db.pool, &fixture).await?;
+    let token = Uuid::now_v7();
+    let Sealed::Candidate(candidate) = drop.seal(&db.pool, fixture.sandbox_id, token).await? else {
+        panic!("the repointed row seals");
+    };
+    let plan = CopyPlan::new(fixture.sandbox_id, &candidate).expect("plan");
+    sqlx::query(sql!(
+        "UPDATE snapshots SET state = 'deleting' WHERE id = $1"
+    ))
+    .bind(first.disk_snapshot_id.as_uuid())
+    .execute(&db.pool)
+    .await?;
+
+    assert_eq!(
+        drop.commit(&db.pool, fixture.sandbox_id, token, &candidate, &plan, None)
+            .await?,
+        CommitOutcome::DiskRetiring
+    );
+    assert_eq!(
+        pin_of(&db.pool, &fixture).await?,
+        (
+            "suspended".to_string(),
+            fixture.artifact_id.as_uuid(),
+            "full".to_string()
+        )
     );
     Ok(())
 }
@@ -729,6 +935,7 @@ async fn lose_the_commit(
     let race = Arc::new(race);
     let objects = Arc::new(MapObjects {
         objects: Mutex::default(),
+        copies: AtomicUsize::new(0),
         on_write: Some(Box::new(move || {
             let (sandbox_id, artifact_id) = hook_slot.lock().expect("slot").expect("filled");
             race(hook_pool.clone(), sandbox_id, artifact_id)
@@ -835,6 +1042,7 @@ async fn a_newer_backup_of_the_pin_during_the_copy_doesnt_stop_the_commit() -> T
     let hook_pool = db.pool.clone();
     let objects = Arc::new(MapObjects {
         objects: Mutex::default(),
+        copies: AtomicUsize::new(0),
         on_write: Some(Box::new(move || {
             let (sandbox_id, artifact_id) = hook_slot.lock().expect("slot").expect("filled");
             let pool = hook_pool.clone();
@@ -873,6 +1081,7 @@ fn slow_objects(
     let during = Arc::new(during);
     Arc::new(MapObjects {
         objects: Mutex::default(),
+        copies: AtomicUsize::new(0),
         on_write: Some(Box::new(move || {
             let sandbox_id = slot.lock().expect("slot").expect("filled");
             let pool = pool.clone();
@@ -1047,6 +1256,7 @@ async fn a_fork_queued_during_the_copy_keeps_the_suspend_artifact() -> TestResul
     let hook_pool = db.pool.clone();
     let objects = Arc::new(MapObjects {
         objects: Mutex::default(),
+        copies: AtomicUsize::new(0),
         on_write: Some(Box::new(move || {
             let sandbox_id = hook_slot.lock().expect("slot").expect("filled");
             let pool = hook_pool.clone();

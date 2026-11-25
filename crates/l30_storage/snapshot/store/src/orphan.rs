@@ -37,5 +37,29 @@ pub async fn orphan_unowned_location(
     Ok(result.rows_affected() == 1)
 }
 
+/// Whether the sweeper still has `storage_uri` to delete: an orphan row
+/// names it and the sweeper hasn't removed that row yet.
+///
+/// A writer that derives a prefix from a stable identity asks this before
+/// writing into it again. The sweeper deletes the bytes before the row, so
+/// while the row exists it may delete whatever the writer copies there.
+pub async fn orphan_pending(
+    executor: impl sqlx::PgExecutor<'_>,
+    storage_uri: &ExactStorageUri,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM snapshot_storage_locations
+              WHERE snapshot_id IS NULL
+                AND orphaned_at IS NOT NULL
+                AND storage_connection_string = $1
+         )"
+    ))
+    .bind(storage_uri.as_wire())
+    .fetch_one(executor)
+    .await
+}
+
 #[cfg(test)]
 mod tests;

@@ -7,7 +7,7 @@ use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
-use super::orphan_unowned_location;
+use super::{orphan_pending, orphan_unowned_location};
 
 async fn insert_sandbox(pool: &PgPool) -> TestResult<SandboxId> {
     let sandbox_id = SandboxId::new();
@@ -114,5 +114,36 @@ async fn an_unowned_prefix_goes_to_the_sweeper_and_an_owned_one_doesnt() -> Test
         attached_uri(&db.pool, owned).await?,
         Some(uri_of(sandbox_id, owned))
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_prefix_is_pending_only_while_its_orphan_row_exists() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let sandbox_id = insert_sandbox(&db.pool).await?;
+    let org_id = OrgId::from_uuid(SEED_ORG_ID);
+    let orphaned = SnapshotId::new();
+    let uri = ExactStorageUri::parse(&uri_of(sandbox_id, orphaned))?;
+    assert!(!orphan_pending(&db.pool, &uri).await?);
+
+    assert!(orphan_unowned_location(&db.pool, orphaned, &uri, org_id).await?);
+    assert!(orphan_pending(&db.pool, &uri).await?);
+
+    // A location still attached to a snapshot isn't the sweeper's.
+    let owned = insert_snapshot(&db.pool, sandbox_id, LocalArtifactId::new(), "disk").await?;
+    let owned_uri = ExactStorageUri::parse(&uri_of(sandbox_id, owned))?;
+    assert!(!orphan_pending(&db.pool, &owned_uri).await?);
+
+    // The sweeper removes the row once it has deleted the bytes.
+    sqlx::query(sql!(
+        "DELETE FROM snapshot_storage_locations
+          WHERE snapshot_id IS NULL AND storage_connection_string = $1"
+    ))
+    .bind(uri.as_wire())
+    .execute(&db.pool)
+    .await?;
+    assert!(!orphan_pending(&db.pool, &uri).await?);
     Ok(())
 }
