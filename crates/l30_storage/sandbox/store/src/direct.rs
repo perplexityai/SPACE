@@ -5,27 +5,27 @@
 //! are the lease owner's row lock ([`lock_restore_lease_owner`]) and the two
 //! unlocked reads of the lease's remaining time by the database clock that a
 //! restore takes before and after its claim ([`unexpired_restore_lease`],
-//! [`floored_restore_lease`]). Reads of the row that join the Direct-only
-//! tables go in child modules under `direct/`, each named for the question
-//! it answers; `pattern_ratchet.direct_tables` lets this module and its
-//! children name those tables.
+//! [`floored_restore_lease`]). Its child modules hold this crate's other
+//! statements that join the Direct-only tables, each named for the question
+//! it answers, whatever their caller; `pattern_ratchet.direct_tables` lets
+//! this module and its children name those tables.
 //!
 //! The adoption's guard also reads the Direct-only route-identity and
-//! provenance tables, which `pattern_ratchet.direct_tables` confines to the
-//! Direct substrate and its store. The substrate evaluates that part and
-//! passes what it decided; [`adopt_live_execution`] guards on the row's own
-//! columns.
+//! provenance tables. The substrate takes the row lock and reads them with
+//! [`adoption::lock_live_adoption_candidate`], one statement, first in the
+//! adoption's transaction, decides from what it read and passes that;
+//! [`adopt_live_execution`] guards on the row's own columns.
 //!
-//! The substrate keeps everything around them: the adoption's row lock
-//! (`FOR NO KEY UPDATE`), the route-identity writes beside the receipt
-//! placement and the reads the adoption decides from, the transactions, and
-//! the lease's duration. Each function runs on the executor its caller
-//! passes, so it composes into the caller's transaction when there is one;
-//! the lock verb takes the caller's connection, so its lock lasts until the
-//! caller's transaction ends. The two reads run on the pool, so `NOW()` is
-//! each read's own instant. A guarded write that matches no row returns
-//! `false` (or `None`), whether another writer won or the row never met the
-//! guard; the caller decides what that means.
+//! The substrate keeps everything around them: the route-identity writes
+//! beside the receipt placement, the adoption's decision from the generations
+//! it read, the transactions, and the lease's duration. Each function runs on
+//! the executor its caller passes, so it composes into the caller's
+//! transaction when there is one; the lock verbs take the caller's
+//! transaction or connection, so their locks last until the caller's
+//! transaction ends. The two reads run on the pool, so `NOW()` is each read's
+//! own instant. A guarded write that matches no row returns `false` (or
+//! `None`), whether another writer won or the row never met the guard; the
+//! caller decides what that means.
 //!
 //! Lease tokens need no lifecycle re-check of their own, because a row that
 //! holds a token is `restoring`. The `sandboxes_clear_restore_lease` BEFORE
@@ -41,6 +41,13 @@ use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sql_locator::sql;
 use sqlx::PgExecutor;
 use uuid::Uuid;
+
+pub mod adoption;
+pub mod node_endpoints;
+pub mod restore_candidates;
+pub mod route_reads;
+pub mod sandbox_listing;
+pub mod service_route_reset;
 
 /// The restore lease [`claim_restore_lease`] took.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

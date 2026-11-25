@@ -17,9 +17,10 @@
 //!   ([`insert_unplaced`], [`insert_pooled`], [`update_desired_state`],
 //!   [`set_auto_lifecycle_policy`]) touch `sandboxes` only and re-check
 //!   nothing in their `WHERE` beyond the row's id. A write whose caller
-//!   answers with a row shape this crate does not own, such as the api's
-//!   joined response row, still moves here: the caller reads its shape after
-//!   the verb in the same transaction, as the pooled create does after
+//!   answers with a joined row, such as the api's response row
+//!   ([`direct::sandbox_listing::Sandbox`]), still moves here as its own
+//!   verb: the caller reads that row after the verb in the same transaction,
+//!   as the pooled create does with [`direct::sandbox_listing::by_id`] after
 //!   [`action_stamp::stamp_pooled_post_wake`].
 //! * **Column writes respect the row's triggers.** `sandboxes` carries five
 //!   `BEFORE UPDATE` triggers. `updated_at` is trigger-maintained, so verbs
@@ -43,16 +44,20 @@
 //!   some rows that do not cascade from it (observed state, reconcile state,
 //!   claimed warm-pool slots) have to be deleted, and snapshot storage
 //!   locations detached, in the same transaction. It calls
-//!   `pplx-space-sandbox-teardown` for the reconcile-state rows and
-//!   `pplx-space-cluster-pool` for the slots; the observed-state delete and
-//!   the snapshot-storage detach are written inline, although
+//!   `pplx-space-sandbox-teardown` for the observed-state and
+//!   reconcile-state rows and `pplx-space-cluster-pool` for the slots; the
+//!   snapshot-storage detach is written inline, although
 //!   `snapshot_storage_locations` belongs to `pplx-space-snapshot-store`.
 //!   [`lost::write_off_lost_sandboxes`] reaches past the row too: it deletes
 //!   the gone node's backup-queue rows and retires the active execution of
 //!   the sandboxes it unplaces.
 //!   A transition that is one statement whose CTEs also write a sibling
 //!   table, as several in [`ingest`] do, stays one statement: splitting it
-//!   would change what it does.
+//!   would change what it does. Two of them also write
+//!   `pplx-space-sandbox-teardown`'s tables under temporary co-writer grants:
+//!   [`ingest::recover_published_pause_failed`] clears the observed row's
+//!   failure reason, and [`ingest::prune_census_absent_sandboxes`] deletes
+//!   the observed rows and their network-policy facet rows.
 //! * **Locking reads are not gets.** `SELECT ... FOR UPDATE` acquires a row
 //!   lock inside a caller's transaction; converting one to [`get`] would drop
 //!   the lock. One moves here only as a lock verb: the statement verbatim, on
@@ -97,14 +102,17 @@
 //!   it, for scoping the storage credentials a node may receive.
 //!   [`spaced_version_counts`] groups the rows and the observed states nodes
 //!   publish by the template, `spaced` version and status the admin list
-//!   shows.
+//!   shows. [`drain_gate_blockers`] counts the rows that block one node's
+//!   release, and [`node_residents`] the rows node drain's resident scan and
+//!   termination-blocking gate count against it.
 //! * **So are single-question reads.** A read of the `sandboxes` row that
 //!   callers made inline moves here whole, as a module named for the question
 //!   it answers, such as [`restore_pod_owners`], [`stale_suspended_executions`],
-//!   [`stopped_replacements`], [`placement_gate`] or [`template_usage`], and so
-//!   does one that joins the row to what it references, as
-//!   [`row_reads::owner`] (its organization) and [`debug_reads::record`]
-//!   (its nodes) do.
+//!   [`stopped_replacements`], [`placement_gate`] or [`template_usage`]
+//!   (node drain's are [`evacuation_candidates`], [`evacuation_restores`],
+//!   [`pinned_local_only`] and [`stopped_evacuations`]), and so does one
+//!   that joins the row to what it references, as [`row_reads::owner`]
+//!   (its organization) and [`debug_reads::record`] (its nodes) do.
 //!   The two restore-lease reads the Direct restore takes before and after
 //!   its claim stay beside that claim in [`direct`].
 //!   Some such modules also read tables another store owns. For example,
@@ -115,27 +123,61 @@
 //!   [`quarantine_publication::lock_pause_failed_recovery_candidates`] also
 //!   locks the joined episode rows (`FOR UPDATE OF s, qs`).
 //!   [`debug_reads::record`] joins `nodes` and `node_k8s`, which belong to
-//!   `pplx-space-node-registration-store`.
+//!   `pplx-space-node-registration-store`; [`stopped_evacuations`] reads
+//!   `nodes` too, and `snapshots`, which belongs to
+//!   `pplx-space-snapshot-store`.
 //!   [`org_storage`] joins the owning organization's row in `organizations`,
 //!   which no store owns yet, for its configured snapshot storage.
+//! * **The api's response row and list pages live in
+//!   [`direct::sandbox_listing`].** They read a sandbox's node from its
+//!   Direct route, and the admin list filters on the node the response
+//!   reports, so they moved there whole; the module shares only its
+//!   projection and join constants, private to it and its children, and
+//!   writes everything else, the page walk included, whole in each
+//!   statement. They also read
+//!   tables this crate does not declare: `users`, `organizations`,
+//!   `templates`, `template_releases`, `template_release_tags`, `nodes`,
+//!   `node_k8s`, `node_direct`, `sandbox_direct_route_identities` and
+//!   `node_facet_observed_status`.
 //! * **Sibling tables get a module each.** The unlocked reads and the
 //!   unguarded steps that callers ran on the sandbox-scoped tables this
 //!   crate declares, mostly inside a larger transaction, move into modules
-//!   named for the table: [`port_exposures`], [`observed_states`],
+//!   named for the table: [`port_exposures`],
 //!   [`snapshot_inventory`], [`node_local_backup_pending`],
 //!   [`ecw_credential_epochs`] and [`k8s_executions`]. [`k8s_executions`]
-//!   holds unlocked reads only: the table's writes, the generation
-//!   allocation and its `FOR UPDATE` reads stay with the execution-ownership
-//!   paths that issue them. A step that is part of a transition statement
-//!   stays in that transition's module. The other sibling-table modules
-//!   also hold the guarded writes confined to their table, each a statement
-//!   of its own with its guard whole, such as
+//!   holds the table's unlocked reads; its submodules, named for the
+//!   transition or the path that issues them, hold the execution-ownership
+//!   transitions and lock verbs, such as [`k8s_executions::activation_fence`],
+//!   and the callers keep their transactions, lock order and outcome
+//!   decisions (see the [`k8s_executions`] module docs). A step that is part
+//!   of a transition statement stays in that transition's module. The other
+//!   sibling-table modules also hold the guarded writes confined to their
+//!   table, each a statement of its own with its guard whole, such as
 //!   [`port_exposures::record_apply_states`],
 //!   [`port_exposures::mark_applied`] and [`port_exposures::mark_failed`],
 //!   and a step that more than one transition runs, such as
-//!   [`observed_states::clear_failed_observation`]. A read of the
+//!   [`port_exposures::invalidate_open_observations`]. The node-observation
+//!   cache, `sandbox_observed_states` and its facet rows, is
+//!   `pplx-space-sandbox-teardown`'s. [`snapshot_inventory`]'s rows, which
+//!   cascade from the observed rows, stay here. A read of the
 //!   `sandboxes` row alone, such as [`runtime_access`], gets a module named
 //!   for the question it answers.
+//! * **Statements that join a Direct table live under [`direct`].** A
+//!   statement whose main table this crate declares, but which also joins
+//!   one of the Direct substrate's tables (the ones archcheck's
+//!   `pattern_ratchet.direct_tables` names), moves whole into a module
+//!   under [`direct`] named for the question it answers, not into the
+//!   table's module above: that rule lets a storage crate name those
+//!   tables only in its `direct` module. Their callers aren't only the
+//!   Direct substrate: [`direct::route_reads`] serves the api's sandbox
+//!   responses and internal-api-server's data-plane sessions, and
+//!   [`direct::service_route_reset`] internal-api-server's service routes.
+//!   A statement whose main table is `sandbox_observed_states` lives in
+//!   `pplx-space-sandbox-teardown`'s `direct` module instead, as the api's
+//!   observed-state reads and internal-api-server's node publication do.
+//!   [`any_undescribed_artifact_owner`] and
+//!   [`auto_lifecycle_execution`], in this file, are the rule's baselined
+//!   exceptions.
 //!
 //! # Fact kinds
 //!
@@ -187,8 +229,12 @@ pub mod delete;
 pub mod deleted_rows;
 pub mod direct;
 pub mod drain;
+pub mod drain_admission;
+pub mod drain_gate_blockers;
 pub mod drain_terminate;
 pub mod ecw_credential_epochs;
+pub mod evacuation_candidates;
+pub mod evacuation_restores;
 pub mod fork_source_lifecycle;
 pub mod ingest;
 pub mod intent;
@@ -200,9 +246,10 @@ pub mod node_desired_state;
 pub mod node_holds;
 pub mod node_local_backup_pending;
 pub mod node_placements;
-pub mod observed_states;
+pub mod node_residents;
 pub mod org_storage;
 pub mod orphan;
+pub mod pinned_local_only;
 pub mod placement_gate;
 pub mod pod_tracking;
 pub mod port_exposures;
@@ -229,6 +276,7 @@ pub mod snapshot_retention_finalize;
 pub mod spaced_version_counts;
 pub mod stale_suspended_executions;
 pub mod started_recovery_source;
+pub mod stopped_evacuations;
 pub mod stopped_replacement_claim;
 pub mod stopped_replacements;
 pub mod stuck;
@@ -243,12 +291,6 @@ pub mod wake;
 
 pub use create::{SandboxCreate, insert_pooled, insert_unplaced};
 pub use lifecycle::StoredSandboxLifecycle;
-
-/// The nullable `spaced_version` column shared by sandbox observation queries.
-#[derive(Clone, Debug, sqlx::FromRow)]
-pub struct ObservedSpacedVersion {
-    pub spaced_version: Option<pplx_space_semver::SemVer>,
-}
 
 /// The `sandboxes.metadata` document: caller-supplied labels, untyped by
 /// design. Distinct from the validated `SandboxMetadata` newtype in

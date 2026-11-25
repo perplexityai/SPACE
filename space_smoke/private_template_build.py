@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import re
 import secrets
 import time
@@ -23,6 +24,19 @@ from space_smoke.runtime import (
     SmokeConfigurationError,
     run_concurrently,
 )
+
+# The template delete route's answers to a lost lock race, by envelope code:
+# `contention_disposition` in `crates/l40_api/api/src/routes/admin/support.rs`,
+# rendered with `retryable: true` by the templates module's
+# `contention_envelope`. The run's sibling deletes run concurrently and can
+# lose such a race to each other.
+DELETE_CONTENTION_MESSAGES = {
+    "conflict": "operation conflicted with a concurrent admin write; retry the request",
+    "service_unavailable": "operation conflicted with a concurrent change; retry the request",
+}
+# The error envelope's retry contract: at most five attempts, backing off from
+# one second with jitter, a mutation replayed with the same Idempotency-Key.
+DELETE_ATTEMPTS = 5
 
 
 class PrivateTemplateBuildAssertions:
@@ -254,7 +268,33 @@ class PrivateTemplateBuildAssertions:
 
     def _delete_template(self, name: str) -> None:
         admin = self.kind.admin_request
-        response = admin("DELETE", f"templates/{name}", expected=(202, 404))
+        # One key for every attempt, so a replay adopts the delete operation
+        # an attempt committed before it lost the race instead of adding one.
+        key = str(uuid.uuid4())
+        for attempt in range(1, DELETE_ATTEMPTS + 1):
+            response = admin(
+                "DELETE",
+                f"templates/{name}",
+                expected=(202, 404, 409, 503),
+                idempotency_key=key,
+            )
+            code = (response or {}).get("code")
+            if code not in DELETE_CONTENTION_MESSAGES:
+                break
+            status = 409 if code == "conflict" else 503
+            refusal = f"HTTP {status}: {response.get('message')}"
+            if (
+                response.get("retryable") is not True
+                or response.get("message") != DELETE_CONTENTION_MESSAGES[code]
+            ):
+                raise SmokeConfigurationError(f"Kind admin DELETE templates/{name}: {refusal}")
+            self.context.record(name + "_delete_contention_refusals", attempt)
+            self.context.verify(
+                attempt < DELETE_ATTEMPTS,
+                f"template {name} delete lost a lock race on all "
+                f"{DELETE_ATTEMPTS} attempts: {refusal}",
+            )
+            self.context.wait(2 ** (attempt - 1) * random.uniform(1, 1.5))
         if response and "operation_id" in response:
             deadline = time.monotonic() + 90
             while time.monotonic() < deadline:

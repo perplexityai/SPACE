@@ -229,7 +229,7 @@ impl ClusterApiService {
         let release_org_id = self
             .lock_template_for_publication(&mut tx, &template_name, template_org)
             .await?;
-        let release = ensure_template_release(
+        let EnsuredRelease { release, twin_of } = ensure_template_release(
             &mut tx,
             template_name.as_str(),
             runtime,
@@ -265,6 +265,22 @@ impl ClusterApiService {
         tx.commit()
             .await
             .map_err(|err| template_publication::storage_status("commit tx", &err))?;
+        // Logged once committed, so a refused registration's twin isn't.
+        // Template campaigns log the twins they insert with a message that
+        // contains this one.
+        // A twin keeps the `(template_name, hash)` index from being rebuilt,
+        // and binaries that read releases by template and hash alone can't
+        // tell it from its original. An unbound twin has no `environment`.
+        if let Some(original_release_id) = twin_of {
+            tracing::info!(
+                template_name = %release.template_name,
+                hash = %release.hash,
+                environment = release.environment.as_deref(),
+                release_id = %release.id,
+                %original_release_id,
+                "inserted template release twin"
+            );
+        }
 
         Ok(Response::new(RegisterTemplateReleaseResponse {
             release: Some(template_release_proto(release)),
@@ -370,16 +386,16 @@ impl ClusterApi for ClusterApiService {
 
         // Registration leaves the grant for the release that follows it.
         if let Some(grant) = system_grant
-            && !template_system_publication_grants::covers(&mut *tx, &name, grant)
-                .await
-                .map_err(|err| {
-                    template_publication::storage_status("check system publication", err.as_sql())
-                })?
+            && !pplx_space_template_store::publication_grants::system_grant_covers(
+                &mut *tx, &name, grant,
+            )
+            .await
+            .map_err(|err| template_publication::storage_status("check system publication", &err))?
         {
             return Err(template_publication::missing_system_publication_grant());
         }
         if let (Some(grant), TemplateOrg::Owned { org_id }) = (tenant_grant, template_org)
-            && !template_tenant_publication_grants::covers(
+            && !pplx_space_template_store::publication_grants::tenant_grant_covers(
                 &mut *tx,
                 &template_tenant_publication_grants::TenantPublication {
                     grant,
@@ -389,9 +405,7 @@ impl ClusterApi for ClusterApiService {
                 },
             )
             .await
-            .map_err(|err| {
-                template_publication::storage_status("check tenant publication", err.as_sql())
-            })?
+            .map_err(|err| template_publication::storage_status("check tenant publication", &err))?
         {
             return Err(template_publication::missing_tenant_publication_grant());
         }

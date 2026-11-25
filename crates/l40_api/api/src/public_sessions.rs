@@ -544,7 +544,7 @@ async fn insert_completed_session_operation_tx(
     let result_json = serde_json::to_value(&result).expect("public session result serializes");
 
     // The operation is new, so its completion is its first event: sequence 1
-    // is what `append_operation_event_tx` would compute.
+    // is what `operation_store::events::append` would compute.
     pplx_space_public_operation_store::operations::insert_completed_session_create(
         &mut **tx,
         pplx_space_public_operation_store::operations::CompletedSessionCreate {

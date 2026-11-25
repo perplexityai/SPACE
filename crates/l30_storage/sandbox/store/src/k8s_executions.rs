@@ -1,12 +1,22 @@
-//! Reads of `sandbox_k8s_executions`, the per-generation execution records of
-//! Kubernetes-managed sandboxes, for callers that read them without locking
-//! them.
+//! `sandbox_k8s_executions`, the per-generation execution records of
+//! Kubernetes-managed sandboxes.
 //!
-//! Writes of the table stay with the execution-ownership paths that issue
-//! them, as do the generation allocation and every `FOR UPDATE` read: they
-//! are correct only under the caller's locks. Each read here runs on the
-//! executor its caller passes, so one issued inside a transaction stays in
-//! it, and keeps its comparisons with the database clock in the SQL.
+//! This module holds the table's unlocked reads. Each runs on the executor
+//! its caller passes, so one issued inside a transaction stays in it, and
+//! keeps its comparisons with the database clock in the SQL.
+//!
+//! Its submodules, each named for the transition or the path that issues
+//! them, hold the execution-ownership transitions and their lock verbs, as
+//! [`activation_fence`] does for the activation attempt's fence and route
+//! publication. Each guarded write there keeps its guard whole, bound to the
+//! caller's values, and returns its outcome; each `FOR UPDATE` read is a
+//! `lock_…` verb on the caller's transaction, its lock clause verbatim (see
+//! "Guarded state transitions" and "Locks the caller relies on after the
+//! statement" in the `space-data-store-development` skill). Some are correct
+//! only under locks their caller holds, as [`activation_fence`]'s claims are
+//! after [`activation_fence::lock_attempt_owner`], so the callers keep their
+//! transactions, their lock order (the sandbox row before its executions),
+//! their re-checks between statements and the decision on each outcome.
 
 use pplx_space_accounts::{ClientId, NodeId};
 use pplx_space_k8s_ids::PodUid;
@@ -17,6 +27,27 @@ use sqlx::PgExecutor;
 use uuid::Uuid;
 
 use crate::SandboxStoreError;
+
+pub mod activation_fence;
+pub mod auto_lifecycle_delete;
+pub mod backup_generation_fence;
+pub mod claim;
+pub mod materialize;
+#[cfg(test)]
+pub(crate) mod ownership_test_fixture;
+pub mod pod_less_giveup;
+pub mod pod_placement;
+pub mod pod_tracking;
+pub mod pool_claim;
+pub mod quarantine_recovery;
+pub mod quarantine_rollback;
+pub mod retire;
+pub mod runtime_attribution;
+pub mod started_recovery;
+pub mod suspend;
+pub mod suspended_reaper;
+pub mod transient_sweeper;
+pub mod transition;
 
 /// The sandbox's active execution, as [`active_execution`] reads it.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -427,8 +458,8 @@ pub async fn predates_current_stop(
 /// active execution exists and a claim would reuse it. Taken without a lock,
 /// it is a hint: a concurrent claim can take that generation first.
 ///
-/// Mirrors the claim's generation allocation in `execution_rows.rs`
-/// (`ensure_active_execution_claim_in`); change them together.
+/// Mirrors the claim's generation allocation, [`claim::mint_generation`];
+/// change them together.
 pub async fn unclaimed_generation(
     executor: impl sqlx::PgExecutor<'_>,
     sandbox_id: SandboxId,

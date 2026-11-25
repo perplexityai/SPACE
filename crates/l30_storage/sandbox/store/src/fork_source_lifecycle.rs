@@ -7,7 +7,7 @@ use pplx_space_sql_locator::sql;
 use sqlx::{Postgres, Transaction};
 
 /// Stable namespace for the per-source advisory transaction lock.
-pub const FORK_SOURCE_LIFECYCLE_LOCK_SEED: i64 = 734_927_411;
+const FORK_SOURCE_LIFECYCLE_LOCK_SEED: i64 = 734_927_411;
 
 /// Serialize fork admission, source deletion, and snapshot-retention claims for
 /// one sandbox. Every participant must acquire this lock before the sandbox

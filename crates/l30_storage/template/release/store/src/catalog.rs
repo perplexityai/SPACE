@@ -435,6 +435,152 @@ pub async fn find_by_hash(
         .await
 }
 
+/// The statement [`list_latest`] runs for a node-scoped caller, built once:
+/// every input is a literal or a bind placeholder. The plan tests explain it.
+pub(crate) static LIST_LATEST_NODE_SCOPED: LazyLock<String> = LazyLock::new(|| {
+    sql!(format!(
+        "SELECT r.id,
+                r.template_name,
+                r.type AS runtime,
+                r.hash,
+                r.created_at,
+                r.environment,
+                COALESCE(
+                    json_agg(
+                        json_build_object(
+                            'id', s.id::text,
+                            'connection_string', s.storage_connection_string,
+                            'created_at', to_char(
+                                s.created_at AT TIME ZONE 'UTC',
+                                'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'
+                            )
+                        )
+                        ORDER BY s.created_at ASC
+                    ) FILTER (WHERE s.id IS NOT NULL),
+                    '[]'::json
+                ) AS storage_locations
+         FROM (
+             SELECT * FROM (
+             SELECT DISTINCT ON (CASE WHEN $5::TEXT IS NULL THEN rel.id::TEXT
+                                ELSE 'sha256:' || replace(rel.hash, 'sha256:', '') END)
+                    rel.id, rel.template_name, rel.type, rel.hash, rel.created_at,
+                    rel.execution_metadata->>'environment' AS environment,
+                    (SELECT MIN(o.created_at) FROM template_releases o
+                     WHERE o.template_name = rel.template_name
+                       AND o.hash IN (replace(rel.hash, 'sha256:', ''),
+                                      'sha256:' || replace(rel.hash, 'sha256:', ''))) AS version_created_at
+             FROM template_releases rel
+             JOIN templates tpl ON tpl.name = rel.template_name
+             WHERE rel.template_name = $1
+               AND rel.type = $2
+               AND (($5::TEXT IS NULL AND {digest_original})
+                    OR rel.execution_metadata->>'environment' = $5
+                OR ($6 AND rel.execution_metadata->>'environment' IS NULL))
+               AND ((tpl.visibility = 'generic' AND tpl.desired_state = 'present')
+                    OR EXISTS (
+                        SELECT 1
+                        FROM sandboxes sb
+                        WHERE sb.template_id = tpl.name
+                          AND (sb.active_node_id = ANY($4) OR sb.target_node_id = ANY($4)))
+                    OR EXISTS (
+                        SELECT 1
+                        FROM kubernetes_pool_configs pc
+                        JOIN template_releases pr ON pr.id = pc.template_release_id
+                        JOIN nodes wn ON wn.id = ANY($4)
+                        WHERE pc.enabled
+                          AND pr.template_name = tpl.name
+                          AND wn.role = 'worker')
+                    OR EXISTS (
+                        SELECT 1
+                        FROM template_build_base_grants g
+                        JOIN nodes bn ON bn.id = ANY($4)
+                        WHERE g.base_template_name = tpl.name
+                          AND g.org_id = tpl.org_id
+                          AND bn.role = 'builder'
+                          AND ((g.builder_node_id IS NULL
+                                AND g.granted_at > NOW() - INTERVAL '1 hour')
+                               OR (g.builder_node_id = bn.id
+                                   AND g.granted_at > NOW() - INTERVAL '7 days'))))
+             ORDER BY CASE WHEN $5::TEXT IS NULL THEN rel.id::TEXT
+                                ELSE 'sha256:' || replace(rel.hash, 'sha256:', '') END,
+                      EXISTS (
+                          SELECT 1 FROM template_release_storage_locations l
+                          WHERE l.template_release_id = rel.id) DESC,
+                      rel.created_at ASC,
+                      rel.id ASC
+             ) rel
+             ORDER BY rel.version_created_at DESC, rel.created_at DESC, rel.id DESC
+             LIMIT $3
+         ) r
+         LEFT JOIN template_release_storage_locations s
+           ON s.template_release_id = r.id
+         GROUP BY r.id, r.template_name, r.type, r.hash, r.created_at, r.environment,
+                  r.version_created_at
+         ORDER BY r.version_created_at DESC, r.created_at DESC, r.id DESC",
+        digest_original = digest_original("rel"),
+    ))
+});
+
+/// The statement [`list_latest`] runs for an unscoped caller, built once:
+/// every input is a literal or a bind placeholder. The plan tests explain it.
+pub(crate) static LIST_LATEST_UNSCOPED: LazyLock<String> = LazyLock::new(|| {
+    sql!(format!(
+        "SELECT r.id,
+                r.template_name,
+                r.type AS runtime,
+                r.hash,
+                r.created_at,
+                r.environment,
+                COALESCE(
+                    json_agg(
+                        json_build_object(
+                            'id', s.id::text,
+                            'connection_string', s.storage_connection_string,
+                            'created_at', to_char(
+                                s.created_at AT TIME ZONE 'UTC',
+                                'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'
+                            )
+                        )
+                        ORDER BY s.created_at ASC
+                    ) FILTER (WHERE s.id IS NOT NULL),
+                    '[]'::json
+                ) AS storage_locations
+         FROM (
+             SELECT * FROM (
+             SELECT DISTINCT ON (CASE WHEN $4::TEXT IS NULL THEN rel.id::TEXT
+                                ELSE 'sha256:' || replace(rel.hash, 'sha256:', '') END)
+                    rel.id, rel.template_name, rel.type, rel.hash, rel.created_at,
+                    rel.execution_metadata->>'environment' AS environment,
+                    (SELECT MIN(o.created_at) FROM template_releases o
+                     WHERE o.template_name = rel.template_name
+                       AND o.hash IN (replace(rel.hash, 'sha256:', ''),
+                                      'sha256:' || replace(rel.hash, 'sha256:', ''))) AS version_created_at
+             FROM template_releases rel
+             WHERE rel.template_name = $1
+               AND rel.type = $2
+               AND (($4::TEXT IS NULL AND {digest_original})
+                    OR rel.execution_metadata->>'environment' = $4
+                OR ($5 AND rel.execution_metadata->>'environment' IS NULL))
+             ORDER BY CASE WHEN $4::TEXT IS NULL THEN rel.id::TEXT
+                                ELSE 'sha256:' || replace(rel.hash, 'sha256:', '') END,
+                      EXISTS (
+                          SELECT 1 FROM template_release_storage_locations l
+                          WHERE l.template_release_id = rel.id) DESC,
+                      rel.created_at ASC,
+                      rel.id ASC
+             ) rel
+             ORDER BY rel.version_created_at DESC, rel.created_at DESC, rel.id DESC
+             LIMIT $3
+         ) r
+         LEFT JOIN template_release_storage_locations s
+           ON s.template_release_id = r.id
+         GROUP BY r.id, r.template_name, r.type, r.hash, r.created_at, r.environment,
+                  r.version_created_at
+         ORDER BY r.version_created_at DESC, r.created_at DESC, r.id DESC",
+        digest_original = digest_original("rel"),
+    ))
+});
+
 /// The latest `limit` releases for `(template_name, runtime)`: those the
 /// selector selects, or with none, each digest's original release
 /// (`pplx_space_template_release_original::digest_original`, one per digest
@@ -484,91 +630,7 @@ pub async fn list_latest(
     // is the caller's node ids); the unscoped statement stays off
     // that table for the same schema-skew reason.
     let rows = if let Some(node_ids) = node_ids {
-        /// Built once: every input is a literal or a bind placeholder.
-        static NODE_SCOPED: LazyLock<String> = LazyLock::new(|| {
-            sql!(format!(
-                "SELECT r.id,
-                        r.template_name,
-                        r.type AS runtime,
-                        r.hash,
-                        r.created_at,
-                        r.environment,
-                        COALESCE(
-                            json_agg(
-                                json_build_object(
-                                    'id', s.id::text,
-                                    'connection_string', s.storage_connection_string,
-                                    'created_at', to_char(
-                                        s.created_at AT TIME ZONE 'UTC',
-                                        'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'
-                                    )
-                                )
-                                ORDER BY s.created_at ASC
-                            ) FILTER (WHERE s.id IS NOT NULL),
-                            '[]'::json
-                        ) AS storage_locations
-                 FROM (
-                     SELECT * FROM (
-                     SELECT DISTINCT ON (CASE WHEN $5::TEXT IS NULL THEN rel.id::TEXT
-                                        ELSE 'sha256:' || replace(rel.hash, 'sha256:', '') END)
-                            rel.id, rel.template_name, rel.type, rel.hash, rel.created_at,
-                            rel.execution_metadata->>'environment' AS environment,
-                            (SELECT MIN(o.created_at) FROM template_releases o
-                             WHERE o.template_name = rel.template_name
-                               AND o.hash IN (replace(rel.hash, 'sha256:', ''),
-                                              'sha256:' || replace(rel.hash, 'sha256:', ''))) AS version_created_at
-                     FROM template_releases rel
-                     JOIN templates tpl ON tpl.name = rel.template_name
-                     WHERE rel.template_name = $1
-                       AND rel.type = $2
-                       AND (($5::TEXT IS NULL AND {digest_original})
-                            OR rel.execution_metadata->>'environment' = $5
-                        OR ($6 AND rel.execution_metadata->>'environment' IS NULL))
-                       AND ((tpl.visibility = 'generic' AND tpl.desired_state = 'present')
-                            OR EXISTS (
-                                SELECT 1
-                                FROM sandboxes sb
-                                WHERE sb.template_id = tpl.name
-                                  AND (sb.active_node_id = ANY($4) OR sb.target_node_id = ANY($4)))
-                            OR EXISTS (
-                                SELECT 1
-                                FROM kubernetes_pool_configs pc
-                                JOIN template_releases pr ON pr.id = pc.template_release_id
-                                JOIN nodes wn ON wn.id = ANY($4)
-                                WHERE pc.enabled
-                                  AND pr.template_name = tpl.name
-                                  AND wn.role = 'worker')
-                            OR EXISTS (
-                                SELECT 1
-                                FROM template_build_base_grants g
-                                JOIN nodes bn ON bn.id = ANY($4)
-                                WHERE g.base_template_name = tpl.name
-                                  AND g.org_id = tpl.org_id
-                                  AND bn.role = 'builder'
-                                  AND ((g.builder_node_id IS NULL
-                                        AND g.granted_at > NOW() - INTERVAL '1 hour')
-                                       OR (g.builder_node_id = bn.id
-                                           AND g.granted_at > NOW() - INTERVAL '7 days'))))
-                     ORDER BY CASE WHEN $5::TEXT IS NULL THEN rel.id::TEXT
-                                        ELSE 'sha256:' || replace(rel.hash, 'sha256:', '') END,
-                              EXISTS (
-                                  SELECT 1 FROM template_release_storage_locations l
-                                  WHERE l.template_release_id = rel.id) DESC,
-                              rel.created_at ASC,
-                              rel.id ASC
-                     ) rel
-                     ORDER BY rel.version_created_at DESC, rel.created_at DESC, rel.id DESC
-                     LIMIT $3
-                 ) r
-                 LEFT JOIN template_release_storage_locations s
-                   ON s.template_release_id = r.id
-                 GROUP BY r.id, r.template_name, r.type, r.hash, r.created_at, r.environment,
-                          r.version_created_at
-                 ORDER BY r.version_created_at DESC, r.created_at DESC, r.id DESC",
-                digest_original = digest_original("rel"),
-            ))
-        });
-        sqlx::query_as::<_, LatestReleaseRow>(sqlx::AssertSqlSafe(NODE_SCOPED.as_str()))
+        sqlx::query_as::<_, LatestReleaseRow>(sqlx::AssertSqlSafe(LIST_LATEST_NODE_SCOPED.as_str()))
             .bind(template_name)
             .bind(runtime)
             .bind(limit)
@@ -578,65 +640,7 @@ pub async fn list_latest(
             .fetch_all(executor)
             .await?
     } else {
-        /// Built once: every input is a literal or a bind placeholder.
-        static UNSCOPED: LazyLock<String> = LazyLock::new(|| {
-            sql!(format!(
-                "SELECT r.id,
-                        r.template_name,
-                        r.type AS runtime,
-                        r.hash,
-                        r.created_at,
-                        r.environment,
-                        COALESCE(
-                            json_agg(
-                                json_build_object(
-                                    'id', s.id::text,
-                                    'connection_string', s.storage_connection_string,
-                                    'created_at', to_char(
-                                        s.created_at AT TIME ZONE 'UTC',
-                                        'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'
-                                    )
-                                )
-                                ORDER BY s.created_at ASC
-                            ) FILTER (WHERE s.id IS NOT NULL),
-                            '[]'::json
-                        ) AS storage_locations
-                 FROM (
-                     SELECT * FROM (
-                     SELECT DISTINCT ON (CASE WHEN $4::TEXT IS NULL THEN rel.id::TEXT
-                                        ELSE 'sha256:' || replace(rel.hash, 'sha256:', '') END)
-                            rel.id, rel.template_name, rel.type, rel.hash, rel.created_at,
-                            rel.execution_metadata->>'environment' AS environment,
-                            (SELECT MIN(o.created_at) FROM template_releases o
-                             WHERE o.template_name = rel.template_name
-                               AND o.hash IN (replace(rel.hash, 'sha256:', ''),
-                                              'sha256:' || replace(rel.hash, 'sha256:', ''))) AS version_created_at
-                     FROM template_releases rel
-                     WHERE rel.template_name = $1
-                       AND rel.type = $2
-                       AND (($4::TEXT IS NULL AND {digest_original})
-                            OR rel.execution_metadata->>'environment' = $4
-                        OR ($5 AND rel.execution_metadata->>'environment' IS NULL))
-                     ORDER BY CASE WHEN $4::TEXT IS NULL THEN rel.id::TEXT
-                                        ELSE 'sha256:' || replace(rel.hash, 'sha256:', '') END,
-                              EXISTS (
-                                  SELECT 1 FROM template_release_storage_locations l
-                                  WHERE l.template_release_id = rel.id) DESC,
-                              rel.created_at ASC,
-                              rel.id ASC
-                     ) rel
-                     ORDER BY rel.version_created_at DESC, rel.created_at DESC, rel.id DESC
-                     LIMIT $3
-                 ) r
-                 LEFT JOIN template_release_storage_locations s
-                   ON s.template_release_id = r.id
-                 GROUP BY r.id, r.template_name, r.type, r.hash, r.created_at, r.environment,
-                          r.version_created_at
-                 ORDER BY r.version_created_at DESC, r.created_at DESC, r.id DESC",
-                digest_original = digest_original("rel"),
-            ))
-        });
-        sqlx::query_as::<_, LatestReleaseRow>(sqlx::AssertSqlSafe(UNSCOPED.as_str()))
+        sqlx::query_as::<_, LatestReleaseRow>(sqlx::AssertSqlSafe(LIST_LATEST_UNSCOPED.as_str()))
             .bind(template_name)
             .bind(runtime)
             .bind(limit)

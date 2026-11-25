@@ -18,15 +18,13 @@
 //!
 //! `pplx-space-template-mgr-store` owns both tables, and its [`pins`]
 //! module holds their statements. [`PinnedDigestsStore`] mirrors
-//! [`WarmPoolStore`] in `pplx-space-cluster-pool`: per-domain struct
+//! `WarmPoolStore` in `pplx-space-cluster-pool`: per-domain struct
 //! holding a connection handle, methods that lock it and call the
 //! store, no trait abstraction. Methods are synchronous
 //! because the on-node SQLite database is wrapped in a
 //! [`SharedConnection`] and must be locked under a
 //! `tokio::task::spawn_blocking` boundary anyway — async wrappers here
 //! would add a layer without removing the boundary.
-//!
-//! [`WarmPoolStore`]: pplx_space_cluster_pool::WarmPoolStore
 
 use pplx_space_template_mgr_store::pins;
 

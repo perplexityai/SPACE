@@ -32,6 +32,7 @@ tracing = { workspace = true }
 
 # internal
 pplx-space-accounts = { workspace = true }
+pplx-space-accounts-store = { workspace = true }
 pplx-space-host-layout = { workspace = true }
 pplx-space-migration-checksums = { workspace = true }
 pplx-space-node-runtime-manager-store = { workspace = true }

@@ -87,6 +87,7 @@ x509-parser = { workspace = true, features = ["verify-aws"] }
 zeroize = { workspace = true }
 
 # internal
+pplx-space-accounts-store = { workspace = true }
 pplx-space-byok-store = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-credential-injection = { workspace = true }
@@ -112,7 +113,6 @@ pplx-space-sandbox-store = { workspace = true }
 pplx-space-service-lifecycle = { workspace = true }
 pplx-space-service-mutex = { workspace = true }
 pplx-space-snapshot-store = { workspace = true }
-pplx-space-sql-locator = { workspace = true }
 pplx-space-storage-vend-store = { workspace = true }
 pplx-space-template-release-store = { workspace = true }
 pplx-space-template-store = { workspace = true }
@@ -133,6 +133,7 @@ pplx-space-common-grpc = { workspace = true, features = ["test-support"] }
 nix = { workspace = true, features = ["user", "fs"] }
 pplx-space-db-test-fixtures = { workspace = true }
 pplx-space-metrics-emit = { workspace = true, features = ["test-capture"] }
+pplx-space-sql-locator = { workspace = true }
 pplx-space-test-env = { workspace = true }
 pplx-space-test-hooks = { workspace = true, features = ["test-hooks"] }
 prost-types = { workspace = true }

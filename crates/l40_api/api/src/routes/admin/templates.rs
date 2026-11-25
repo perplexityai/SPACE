@@ -1,6 +1,5 @@
 use pplx_space_accounts::{NodeId, OrgId};
 
-use pplx_space_sql_locator::sql;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -14,8 +13,10 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::StreamExt as _;
 use pplx_space_build_mgr_client::proto as build_proto;
 use pplx_space_cluster_pool::WarmPoolStore;
+use pplx_space_cluster_trigger_queue::enqueue_triggers_tx;
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_node_registration_store::direct::registry as direct_registry;
 use pplx_space_public_api::{
     OperationKind, OperationTargetType, PublicErrorCode, PublicErrorDetail, PublicErrorEnvelope,
     RequestFingerprint,
@@ -61,7 +62,6 @@ use crate::{
         ReconcileRef, enqueue_node_reconcile_refs_for_nodes_tx,
         requeue_node_reconcile_refs_for_nodes_tx,
     },
-    reconcile_trigger::enqueue_triggers_tx,
     routes::{
         AppState,
         admin::{
@@ -364,23 +364,18 @@ async fn fetch_template(
     pool: &sqlx::PgPool,
     template_name: &TemplateName,
 ) -> Result<Option<TemplateRow>, sqlx::Error> {
-    Ok(fetch_template_rows(pool, Some(template_name))
-        .await?
-        .into_iter()
-        .next())
-}
-
-async fn fetch_template_rows(
-    pool: &sqlx::PgPool,
-    template_name: Option<&TemplateName>,
-) -> Result<Vec<TemplateRow>, sqlx::Error> {
-    pplx_space_template_store::templates::list_admin(pool, template_name).await
+    Ok(
+        pplx_space_template_store::templates::list_admin(pool, Some(template_name))
+            .await?
+            .into_iter()
+            .next(),
+    )
 }
 
 /// The node-discovery read this module's reconcile enqueues begin with.
 ///
-/// `reconcile_trigger` carries its own near-copy of the predicate for a
-/// different call shape; this is not the only place it appears.
+/// `pplx_space_cluster_trigger_queue::fetch_trigger_targets` carries its own near-copy
+/// of the predicate for a different call shape; this is not the only place it appears.
 ///
 /// Separate from the enqueue writes because the two do not classify the same
 /// way. It reads `nodes` and `node_direct` and writes nothing, so on a request
@@ -396,19 +391,7 @@ async fn fetch_template_rows(
 async fn reconcile_target_node_ids(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<Vec<NodeId>, sqlx::Error> {
-    sqlx::query_scalar::<_, NodeId>(sql!(
-        "SELECT DISTINCT n.id
-         FROM nodes n
-         LEFT JOIN node_direct nd ON nd.node_id = n.id
-         WHERE n.role IN ('worker', 'builder')
-           AND (
-             n.managed_by != $1
-             OR (nd.node_id IS NOT NULL AND nd.deleted_at IS NULL)
-           )"
-    ))
-    .bind(SubstrateKind::Space)
-    .fetch_all(&mut **tx)
-    .await
+    direct_registry::live_worker_and_builder_ids(&mut **tx, SubstrateKind::Space).await
 }
 
 /// The enqueue writes, for a caller that already holds the node ids.
@@ -489,7 +472,7 @@ pub async fn list_templates(
     if let Err(error) = require_template_admin(&state.pool, &actor).await {
         return error.into_response();
     }
-    match fetch_template_rows(&state.pool, None).await {
+    match pplx_space_template_store::templates::list_admin(&state.pool, None).await {
         Ok(rows) => {
             Json(rows.into_iter().map(template_response).collect::<Vec<_>>()).into_response()
         }
@@ -803,15 +786,6 @@ fn template_delete_fingerprint(
     })
 }
 
-/// Whether a public operation can still run: it exists and is queued or
-/// running.
-async fn delete_operation_is_active(
-    pool: &sqlx::PgPool,
-    operation_id: pplx_space_public_api::OperationId,
-) -> Result<bool, sqlx::Error> {
-    pplx_space_public_operation_store::operations::is_active(pool, operation_id).await
-}
-
 pub async fn delete_template(
     State(state): State<AppState>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
@@ -972,7 +946,12 @@ pub async fn delete_template(
             // current delete: it would never run, and installing it could
             // displace an active replacement. The caller retries with a new
             // key.
-            match delete_operation_is_active(&state.pool, operation_id).await {
+            match pplx_space_public_operation_store::operations::is_active(
+                &state.pool,
+                operation_id,
+            )
+            .await
+            {
                 Ok(true) => operation_id,
                 Ok(false) => {
                     return (
@@ -2001,7 +1980,9 @@ pub async fn list_template_builds(
         )
         .into_response();
     }
-    match super::template_store::template_exists(&state.pool, &template_name).await {
+    match pplx_space_template_store::templates::exists_not_deleted(&state.pool, &template_name)
+        .await
+    {
         Ok(true) => {}
         Ok(false) => return api_error(StatusCode::NOT_FOUND, "Template not found").into_response(),
         Err(error) => {
@@ -2291,8 +2272,12 @@ pub async fn tag_template_release(
         // lock is what makes the precondition and the move one step. A tag
         // created between this read and the insert below has committed by the
         // time `DO NOTHING` reports it, so one more read finds and locks it.
-        let mut previous =
-            current_tag_release_for_update(&mut tx, &row.template_name, tag.as_str()).await?;
+        let mut previous = pplx_space_template_store::release_tags::current_release_locked(
+            &mut tx,
+            &row.template_name,
+            tag.as_str(),
+        )
+        .await?;
         for _ in 0..2 {
             if let Some(expected) = expected
                 && expected != previous
@@ -2334,8 +2319,12 @@ pub async fn tag_template_release(
                 tx.commit().await?;
                 return Ok(TagMove::Moved { row, previous });
             }
-            previous =
-                current_tag_release_for_update(&mut tx, &row.template_name, tag.as_str()).await?;
+            previous = pplx_space_template_store::release_tags::current_release_locked(
+                &mut tx,
+                &row.template_name,
+                tag.as_str(),
+            )
+            .await?;
         }
         Ok(TagMove::Raced)
     }
@@ -2450,16 +2439,6 @@ async fn original_release_of(
         &release.content_hash,
     )
     .await
-}
-
-/// The release a tag points at, locking its row for the rest of the
-/// transaction, or `None` when the tag does not exist.
-async fn current_tag_release_for_update(
-    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
-    template_name: &str,
-    tag: &str,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    pplx_space_template_store::release_tags::current_release_locked(tx, template_name, tag).await
 }
 
 pub async fn delete_template_release_tag(

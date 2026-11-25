@@ -1,14 +1,15 @@
 use pplx_space_accounts::OrgId;
 
-use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
-use crate::{models::User, user_role::UserRole};
+use crate::{
+    models::User,
+    user_role::{UserRole, UserRolePolicy},
+};
+use pplx_space_accounts_store::{clusters, organizations};
 
 pub(crate) async fn cluster_managing_org_id(pool: &PgPool) -> Result<OrgId, sqlx::Error> {
-    sqlx::query_scalar::<_, OrgId>(sql!("SELECT managing_org_id FROM clusters WHERE singleton"))
-        .fetch_one(pool)
-        .await
+    clusters::cluster_managing_org_id(pool).await
 }
 
 pub(crate) async fn is_managing_org_admin(pool: &PgPool, user: &User) -> Result<bool, sqlx::Error> {
@@ -19,48 +20,13 @@ pub(crate) async fn is_managing_org_admin(pool: &PgPool, user: &User) -> Result<
     Ok(user.org_id == cluster_managing_org_id(pool).await?)
 }
 
-async fn org_subtree_ids(pool: &PgPool, org_id: OrgId) -> Result<Vec<OrgId>, sqlx::Error> {
-    sqlx::query_scalar::<_, OrgId>(sql!(
-        "WITH RECURSIVE org_tree AS (
-            SELECT id FROM organizations WHERE id = $1
-            UNION ALL
-            SELECT o.id FROM organizations o JOIN org_tree t ON o.parent_id = t.id
-        )
-        SELECT id FROM org_tree"
-    ))
-    .bind(org_id)
-    .fetch_all(pool)
-    .await
-}
-
-async fn org_subtree_contains(
-    pool: &PgPool,
-    root_org_id: OrgId,
-    target_org_id: OrgId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
-        "WITH RECURSIVE org_tree AS (
-            SELECT id FROM organizations WHERE id = $1
-            UNION ALL
-            SELECT o.id FROM organizations o JOIN org_tree t ON o.parent_id = t.id
-        )
-        SELECT EXISTS(SELECT 1 FROM org_tree WHERE id = $2)"
-    ))
-    .bind(root_org_id)
-    .bind(target_org_id)
-    .fetch_one(pool)
-    .await
-}
-
 pub(crate) async fn visible_org_ids(pool: &PgPool, user: &User) -> Result<Vec<OrgId>, sqlx::Error> {
     match user.role {
         UserRole::OrganizationAdmin => {
             if is_managing_org_admin(pool, user).await? {
-                sqlx::query_scalar::<_, OrgId>(sql!("SELECT id FROM organizations"))
-                    .fetch_all(pool)
-                    .await
+                organizations::organization_ids(pool).await
             } else {
-                org_subtree_ids(pool, user.org_id).await
+                organizations::organization_subtree_ids(pool, user.org_id).await
             }
         }
         UserRole::Member => Ok(vec![user.org_id]),
@@ -77,7 +43,7 @@ pub(crate) async fn user_can_access_org(
             if is_managing_org_admin(pool, user).await? {
                 Ok(true)
             } else {
-                org_subtree_contains(pool, user.org_id, org_id).await
+                organizations::organization_subtree_contains(pool, user.org_id, org_id).await
             }
         }
         UserRole::Member => Ok(user.org_id == org_id),

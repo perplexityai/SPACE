@@ -48,6 +48,7 @@ members = [
     "crates/test_support/test/env",
     "crates/l10_foundation/bearer/token",
     "crates/l10_foundation/tokio/runtime",
+    "crates/l30_storage/accounts/store",
     "crates/l30_storage/sandbox/store",
     "crates/l30_storage/sandbox/quarantine/store",
     "crates/l30_storage/sandbox/teardown",
@@ -151,6 +152,7 @@ members = [
     "crates/l10_foundation/feature/flags",
     "crates/l20_domain/events",
     "crates/l30_storage/data/plane/session/store",
+    "crates/l30_storage/direct/coordinator",
     "crates/l30_storage/direct/store",
     "crates/l30_storage/admin/audit/store",
     "crates/l30_storage/federated/grant/store",
@@ -433,6 +435,7 @@ pplx-space-cpu-arch = { path = "crates/l10_foundation/cpu/arch" }
 pplx-space-data-plane-server = { path = "crates/l40_api/data/plane/server" }
 pplx-space-db-migrate = { path = "crates/l30_storage/db/migrate" }
 pplx-space-db-test-fixtures = { path = "crates/test_support/db/test/fixtures" }
+pplx-space-direct-coordinator = { path = "crates/l30_storage/direct/coordinator" }
 pplx-space-direct-store = { path = "crates/l30_storage/direct/store" }
 pplx-space-dependency-drain = { path = "crates/l10_foundation/dependency/drain" }
 pplx-space-ecw-credential = { path = "crates/l20_domain/ecw/credential" }
@@ -448,6 +451,7 @@ pplx-space-node-status-store = { path = "crates/l30_storage/node/status/store" }
 pplx-space-node-execution-inventory-store = { path = "crates/l30_storage/node/execution/inventory/store" }
 pplx-space-feature-flags = { path = "crates/l10_foundation/feature/flags" }
 pplx-space-events = { path = "crates/l20_domain/events" }
+pplx-space-accounts-store = { path = "crates/l30_storage/accounts/store" }
 pplx-space-data-plane-session-store = { path = "crates/l30_storage/data/plane/session/store" }
 pplx-space-admin-audit-store = { path = "crates/l30_storage/admin/audit/store" }
 pplx-space-federated-grant-store = { path = "crates/l30_storage/federated/grant/store" }

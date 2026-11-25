@@ -8,7 +8,6 @@ use pplx_space_execution_spec::VcpuCount;
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_node_registration_store::lookup as node_lookup;
 use pplx_space_sandbox_model::SandboxId;
-use pplx_space_sql_locator::sql;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
@@ -700,24 +699,12 @@ pub(super) async fn persist_pooled_execution_claim(
             ControllerError::internal("claimed pool slot missing during execution bind")
         })?;
 
-    sqlx::query(sql!(
-        "INSERT INTO sandbox_k8s_executions (
-             sandbox_id, generation, pod_name, pod_namespace, pod_uid, pod_ip,
-             k8s_node_name, state, active, route_activation_id, pod_materialized_at
-         )
-         VALUES (
-             $1, 1, $2, $3, $4, $5::inet, $6, 'running', TRUE, $7,
-             CASE WHEN NULLIF(BTRIM($4::TEXT), '') IS NOT NULL THEN NOW() END
-         )"
-    ))
-    .bind(claim.sandbox_id)
-    .bind(&source.pod_name)
-    .bind(&source.pod_namespace)
-    .bind(source.pod_uid.as_deref())
-    .bind(source.pod_ip.as_deref())
-    .bind(source.k8s_node_name.as_deref())
-    .bind(route_activation_id)
-    .execute(&mut **tx)
+    pplx_space_sandbox_store::k8s_executions::pool_claim::insert_first_generation(
+        tx,
+        claim.sandbox_id,
+        &source,
+        route_activation_id,
+    )
     .await
     .map_err(|err| db_contention_error("failed to bind pool execution", &err))?;
 

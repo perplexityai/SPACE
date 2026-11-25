@@ -19,24 +19,24 @@
 //! statement.
 //!
 //! A sweep write that returns a write token (`RETURNING`
-//! [`LIFECYCLE_WRITE_TOKEN`]) is undone only by the compensation bound to that
+//! `LIFECYCLE_WRITE_TOKEN`) is undone only by the compensation bound to that
 //! token, so an undo never reaches past its own transition.
 //!
 //! One guard fragment, `unrestorable_restoring_guards`, is interpolated by
 //! two statements: the unrestorable-`restoring` candidate select
 //! ([`list_unrestorable_restoring`]) and the fail CAS that re-checks it
-//! ([`fail_unrestorable_restoring`]). The others, [`evacuation_guards`]
+//! ([`fail_unrestorable_restoring`]). The others, `evacuation_guards`
 //! among them, are interpolated only here too.
 //!
-//! [`LIST_COMMAND_READY_PENDING_SQL`], [`HEAL_COMMAND_READY_PENDING_SQL`],
-//! [`REAP_COMMAND_READY_PENDING_SQL`], [`REPAIR_FAILED_ACTIVE_EXECUTION_SQL`]
-//! and the [`list_aged_transient_query`],
-//! [`list_unrestorable_restoring_query`], [`fail_candidate_query`],
-//! [`converge_restoring_query`], [`revert_to_suspended_query`],
-//! [`undo_revert_to_suspended_query`] and
-//! [`fail_unrestorable_restoring_query`] builders are public only because
-//! the sweeper's Postgres tests run them directly. Production code calls the
-//! function here that binds each one.
+//! The [`list_aged_transient_query`], [`list_unrestorable_restoring_query`]
+//! and [`fail_unrestorable_restoring_query`] builders are public only because
+//! the sweeper's Postgres tests run them directly. Those tests reach
+//! `LIST_COMMAND_READY_PENDING_SQL`, `HEAL_COMMAND_READY_PENDING_SQL`,
+//! `REAP_COMMAND_READY_PENDING_SQL`, `REPAIR_FAILED_ACTIVE_EXECUTION_SQL` and
+//! the `fail_candidate_query`, `converge_restoring_query`,
+//! `revert_to_suspended_query` and `undo_revert_to_suspended_query` builders
+//! through `test_support::sweeper`, under the `test-support` feature.
+//! Production code calls the function here that binds each one.
 
 use pplx_space_durations::PositiveDuration;
 use pplx_space_node_model::SubstrateKind;
@@ -67,7 +67,7 @@ use time::OffsetDateTime;
 /// reverting a later, legitimate one that happens to have landed on the same
 /// lifecycle. Formatted as text, at the microsecond precision the column
 /// holds, so callers carry it as an opaque token.
-pub const LIFECYCLE_WRITE_TOKEN: &str = "to_char(lifecycle_changed_at, 'YYYY-MM-DD HH24:MI:SS.US')";
+const LIFECYCLE_WRITE_TOKEN: &str = "to_char(lifecycle_changed_at, 'YYYY-MM-DD HH24:MI:SS.US')";
 
 /// Saturating seconds-as-`i64` for SQL binds; any value above `i64::MAX`
 /// is "never" in human terms.
@@ -77,7 +77,7 @@ fn secs_bind(age: PositiveDuration) -> i64 {
 
 /// The binds [`restoring_episode_overdue`] reads.
 #[derive(Debug, Clone, Copy)]
-pub struct EpisodeDeadlineBinds {
+struct EpisodeDeadlineBinds {
     /// A nullable `BIGINT` bind of the deadline in seconds; NULL turns the
     /// deadline off.
     pub deadline: &'static str,
@@ -135,7 +135,7 @@ const REVERT_EPISODE_DEADLINE: EpisodeDeadlineBinds = EpisodeDeadlineBinds {
 ///
 /// It renders one parenthesized condition on the row named `sandboxes`, so
 /// the calling statement must not alias that table.
-pub fn restoring_episode_overdue(binds: EpisodeDeadlineBinds) -> String {
+fn restoring_episode_overdue(binds: EpisodeDeadlineBinds) -> String {
     let EpisodeDeadlineBinds {
         deadline,
         kubernetes,
@@ -175,7 +175,7 @@ pub fn restoring_episode_overdue(binds: EpisodeDeadlineBinds) -> String {
 ///
 /// It renders a conjunct that starts with a newline and `AND`, on the row
 /// named `sandboxes`, so the calling statement must not alias that table.
-pub fn restoring_ownership_guards(
+fn restoring_ownership_guards(
     age_param: &str,
     episode_deadline: Option<EpisodeDeadlineBinds>,
 ) -> String {
@@ -195,7 +195,7 @@ pub fn restoring_ownership_guards(
 /// It renders an unparenthesized conjunction (the lease clause `AND` the
 /// owner guard): parenthesize it before applying `NOT` or `OR`. It reads the
 /// row named `sandboxes`, so the calling statement must not alias that table.
-pub fn restoring_unowned(age_param: &str) -> String {
+fn restoring_unowned(age_param: &str) -> String {
     let owner_guard = activation_owner_guard(age_param);
     format!(
         "(sandboxes.restore_lease_expires_at IS NULL
@@ -233,7 +233,7 @@ pub fn restoring_unowned(age_param: &str) -> String {
 ///
 /// It renders a conjunct that starts with a newline and `AND`, on the row
 /// named `sandboxes`, so the calling statement must not alias that table.
-pub fn activation_owner_guard(age_param: &str) -> String {
+fn activation_owner_guard(age_param: &str) -> String {
     format!(
         "
                 AND NOT EXISTS (
@@ -269,14 +269,14 @@ pub const fn is_activation_owned(lifecycle: SandboxLifecycle) -> bool {
 
 /// Shared evacuation-aware guards layered on top of the plain age predicate.
 /// Used identically by [`list_aged_transient_query`] (the probe-first
-/// select) and [`fail_candidate_query`] (the per-row fail CAS), so
+/// select) and `fail_candidate_query` (the per-row fail CAS), so
 /// a row can never be failed under a guard the select did not apply:
 ///
 /// 1. `(evacuation_restore_target IS NULL OR lifecycle = 'suspending')` exempts
 ///    node-drain's in-flight evacuation **restore** — a marked `restoring` row
 ///    legitimately polls the rebuilt pod for up to the evacuate-timeout (the
 ///    same order of magnitude as this sweep's default age) and has its own
-///    re-drive path (`restore_pending_evacuations_query` + `restore_in_flight`),
+///    re-drive path ([`crate::evacuation_restores::pending`] + `restore_in_flight`),
 ///    so the backstop must not race it. The clear-trigger only keeps the marker
 ///    on `suspending`/`suspended`/`restoring`, and `suspended` isn't sweepable,
 ///    so `restoring` is the only lifecycle this exemption actually spares. A
@@ -303,7 +303,7 @@ pub const fn is_activation_owned(lifecycle: SandboxLifecycle) -> bool {
 /// It renders a conjunct that starts with `AND`, on the row named
 /// `sandboxes`, so the calling statement must not alias that table, and it
 /// reads the age threshold from `$3`.
-pub fn evacuation_guards(
+fn evacuation_guards(
     lifecycle: SandboxLifecycle,
     episode_deadline: Option<EpisodeDeadlineBinds>,
 ) -> String {
@@ -342,7 +342,7 @@ pub enum EvacuationRestoreTarget {
 
 impl EvacuationRestoreTarget {
     /// The stored string, which [`FromStr`] accepts back.
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Started => "started",
             Self::Paused => "paused",
@@ -426,7 +426,7 @@ fn ready_snapshot_predicate(lifecycle: SandboxLifecycle) -> String {
 /// `SubstrateKind::Kubernetes` (the routability fragment's substrate), `$6` =
 /// the restoring-episode deadline in seconds (`BIGINT`, NULL when off).
 ///
-/// A `restoring` row whose episode is overdue ([`restoring_episode_overdue`])
+/// A `restoring` row whose episode is overdue (`restoring_episode_overdue`)
 /// is listed whatever its restore lease and activation attempt say. It
 /// reports `episode_overdue` when those would have spared it.
 ///
@@ -582,7 +582,7 @@ pub async fn list_aged_transient(
 /// set, and no fixed front-of-queue can monopolize the batch. The matching set
 /// (aged, never-retried preserved creates) is small, so the random sort is
 /// cheap.
-pub const LIST_COMMAND_READY_PENDING_SQL: &str = sql!(
+pub(crate) const LIST_COMMAND_READY_PENDING_SQL: &str = sql!(
     "SELECT
          s.id,
          EXTRACT(EPOCH FROM (NOW() - s.lifecycle_changed_at))::BIGINT AS age_secs,
@@ -602,7 +602,7 @@ pub const LIST_COMMAND_READY_PENDING_SQL: &str = sql!(
      LIMIT $3"
 );
 
-/// One row of [`LIST_COMMAND_READY_PENDING_SQL`]: a `started` row whose
+/// One row of `LIST_COMMAND_READY_PENDING_SQL`: a `started` row whose
 /// `command_ready_pending` marker outlived the age, with its active
 /// execution's pod identity when it has one.
 #[derive(sqlx::FromRow)]
@@ -618,7 +618,7 @@ pub struct CommandReadyPendingRow {
 
 /// List up to `limit` `started` rows of the `managed_by` substrate whose
 /// `command_ready_pending` marker is older than `age` on the database clock
-/// ([`LIST_COMMAND_READY_PENDING_SQL`]), changing nothing.
+/// (`LIST_COMMAND_READY_PENDING_SQL`), changing nothing.
 pub async fn list_command_ready_pending(
     executor: impl sqlx::PgExecutor<'_>,
     managed_by: &str,
@@ -660,7 +660,7 @@ pub async fn lock_placement_changed_at(
 
 /// Heal query: clear the marker on a probe-confirmed-ready row. Bind order:
 /// `$1` = sandbox id, `$2` = `managed_by`. Lifecycle is left untouched.
-pub const HEAL_COMMAND_READY_PENDING_SQL: &str = sql!(
+pub(crate) const HEAL_COMMAND_READY_PENDING_SQL: &str = sql!(
     "UPDATE sandboxes
      SET command_ready_pending = false
      WHERE id = $1
@@ -669,7 +669,7 @@ pub const HEAL_COMMAND_READY_PENDING_SQL: &str = sql!(
 );
 
 /// Clear `command_ready_pending` on a `started` row the sweeper's guest probe
-/// found command-ready ([`HEAL_COMMAND_READY_PENDING_SQL`]).
+/// found command-ready (`HEAL_COMMAND_READY_PENDING_SQL`).
 ///
 /// Writes an **observed projection**: the probe's answer. No lifecycle
 /// predicate of its own; it re-checks only that the marker is still set.
@@ -688,13 +688,13 @@ pub async fn heal_command_ready_pending(
 
 /// Reap CAS: flip a wedged `started` + marker row to `failed`. Bind order:
 /// `$1` = sandbox id, `$2` = `managed_by`. It returns the reap's write token:
-/// the [`LIFECYCLE_WRITE_TOKEN`] expression, spelled out because a `sql!`
+/// the `LIFECYCLE_WRITE_TOKEN` expression, spelled out because a `sql!`
 /// literal cannot interpolate it. Keep the two identical, or the reap's undo
 /// never matches. No row means a concurrent heal or transition dropped it out
 /// of the predicate. The `sandboxes_lifecycle_changed_at` and
 /// `sandboxes_clear_command_ready_pending` triggers fire on the resulting
 /// `started` -> `failed` change, so no follow-up write is needed.
-pub const REAP_COMMAND_READY_PENDING_SQL: &str = sql!(
+pub(crate) const REAP_COMMAND_READY_PENDING_SQL: &str = sql!(
     "UPDATE sandboxes
      SET lifecycle = 'failed'
      WHERE id = $1
@@ -706,8 +706,8 @@ pub const REAP_COMMAND_READY_PENDING_SQL: &str = sql!(
 
 /// Fail a `started` row whose `command_ready_pending` marker outlived the
 /// reaper's age and whose guest probe found it wedged
-/// ([`REAP_COMMAND_READY_PENDING_SQL`]). Returns the reap's write token
-/// ([`LIFECYCLE_WRITE_TOKEN`]), or `None` when a heal or another transition
+/// (`REAP_COMMAND_READY_PENDING_SQL`). Returns the reap's write token
+/// (`LIFECYCLE_WRITE_TOKEN`), or `None` when a heal or another transition
 /// got there first.
 ///
 /// Writes an **inference**: the sweeper concluding the preserved create will
@@ -788,9 +788,9 @@ pub enum FailGuard {
 /// Build the per-row fail CAS for `lifecycle`. Bind order: `$1` =
 /// `managed_by`, `$2` = lifecycle string, `$3` = age threshold seconds
 /// (`BIGINT`), `$4` = sandbox id. The returned write token
-/// ([`LIFECYCLE_WRITE_TOKEN`]) reports whether this call claimed the row; the
+/// (`LIFECYCLE_WRITE_TOKEN`) reports whether this call claimed the row; the
 /// predicate repeats every guard the candidate select applied (see
-/// [`evacuation_guards`]) plus the age window, so a row that exited the
+/// `evacuation_guards`) plus the age window, so a row that exited the
 /// transient lifecycle between select and act is left alone.
 ///
 /// The shared guards require a full age window after the last restore lease
@@ -801,7 +801,7 @@ pub enum FailGuard {
 /// execution isn't both routable (`running` with a pod IP) and holding an
 /// activation attempt, the state in which a completion receipt can still move
 /// it to `started`.
-pub fn fail_candidate_query(lifecycle: SandboxLifecycle, guard: FailGuard) -> String {
+pub(crate) fn fail_candidate_query(lifecycle: SandboxLifecycle, guard: FailGuard) -> String {
     let guards = evacuation_guards(lifecycle, None);
     let routable_guard = match guard {
         FailGuard::Aged => String::new(),
@@ -828,8 +828,8 @@ pub fn fail_candidate_query(lifecycle: SandboxLifecycle, guard: FailGuard) -> St
 }
 
 /// Fail an aged `lifecycle` row the sweeper's decision gave up on
-/// ([`fail_candidate_query`]). Returns the fail's write token
-/// ([`LIFECYCLE_WRITE_TOKEN`]), or `None` when the row left the predicate
+/// (`fail_candidate_query`). Returns the fail's write token
+/// (`LIFECYCLE_WRITE_TOKEN`), or `None` when the row left the predicate
 /// between the select and this CAS.
 ///
 /// Writes an **inference**: the sweeper's age limit concluding that the
@@ -927,13 +927,13 @@ pub async fn undo_fail_aged_candidate(
 /// *at flip time*; if the execution changed underneath, the CAS claims
 /// nothing and the in-flight wake keeps ownership of the row.
 ///
-/// It also repeats the select's [`activation_owner_guard`]. Materialization
+/// It also repeats the select's `activation_owner_guard`. Materialization
 /// sets the restore lease and the wake's activation attempt to the same
 /// ownership window, so the two usually end together, but the restore-lease
 /// clause above lets a row whose restore lease was cleared through, and the
 /// attempt is still the wake's. Converging under a live wake would make its
 /// own `restoring -> started` CAS lose.
-pub fn converge_restoring_query() -> String {
+pub(crate) fn converge_restoring_query() -> String {
     let routable_execution = routable_execution_or_non_k8s("sandboxes", "$5");
     let owner_guard = activation_owner_guard("$2");
     format!(
@@ -951,7 +951,7 @@ pub fn converge_restoring_query() -> String {
 }
 
 /// Converge an aged `restoring` row whose restore the sweeper's probe found
-/// alive to its wake `target` ([`converge_restoring_query`]). Returns whether
+/// alive to its wake `target` (`converge_restoring_query`). Returns whether
 /// the row converged.
 ///
 /// Writes an **inference**: the sweeper concluding that an abandoned restore
@@ -1005,13 +1005,13 @@ pub async fn converge_restoring(
 ///
 /// It also clears `placement_changed_at` (see the sweeper's
 /// `SweepSink::revert_to_suspended`), and repeats the select's
-/// [`activation_owner_guard`], for the same reason as
+/// `activation_owner_guard`, for the same reason as
 /// [`converge_restoring_query`]: a row whose restore lease was cleared may
 /// still have a live wake's activation attempt. An overdue episode
-/// ([`restoring_episode_overdue`]) waives the lease and owner guards, as in the
+/// (`restoring_episode_overdue`) waives the lease and owner guards, as in the
 /// select; the converge CAS never does, since only a restore that reached a
 /// pod IP can converge.
-pub fn revert_to_suspended_query() -> String {
+pub(crate) fn revert_to_suspended_query() -> String {
     let ready_snapshot = restore_retry_suspended_revert_snapshot_exists("sandboxes");
     let ownership_guards = restoring_ownership_guards("$3", Some(REVERT_EPISODE_DEADLINE));
     format!(
@@ -1049,15 +1049,15 @@ fn revert_to_suspended_lifecycle_only_query() -> String {
 }
 
 /// Revert an abandoned `restoring` row to `suspended` and clear its
-/// `placement_changed_at` ([`revert_to_suspended_query`]), the form used when
+/// `placement_changed_at` (`revert_to_suspended_query`), the form used when
 /// the caller retires the restore's execution in the same transaction.
-/// Returns the revert's write token ([`LIFECYCLE_WRITE_TOKEN`]), or `None`
+/// Returns the revert's write token (`LIFECYCLE_WRITE_TOKEN`), or `None`
 /// when the row no longer qualifies.
 ///
 /// Writes an **inference**: the sweeper concluding the restore is abandoned
 /// and its pre-restore snapshot is what the row should rest on.
 /// `restoring_episode_deadline` (`None` turns it off) lets an overdue episode
-/// through the lease and owner guards ([`restoring_episode_overdue`]).
+/// through the lease and owner guards (`restoring_episode_overdue`).
 ///
 /// The caller holds the sandbox row lock, and the active execution's lock
 /// when there is one, before this runs. In the same transaction it then
@@ -1148,7 +1148,7 @@ pub async fn unplace_reverted_restore(
 /// contract could discard the local artifact it was supposed to keep. The
 /// lease itself is deliberately *not* restored — another actor may hold one by
 /// now.
-pub fn undo_revert_to_suspended_query() -> String {
+pub(crate) fn undo_revert_to_suspended_query() -> String {
     format!(
         "UPDATE sandboxes
             SET lifecycle = $3,
@@ -1164,7 +1164,7 @@ pub fn undo_revert_to_suspended_query() -> String {
 
 /// Undo either revert form when the cleanup it was meant to enable was
 /// refused, bound to the revert's `write_token`
-/// ([`undo_revert_to_suspended_query`]). Returns whether the row went back to
+/// (`undo_revert_to_suspended_query`). Returns whether the row went back to
 /// `lifecycle`.
 ///
 /// Writes an **operation step**: the revert's compensation.
@@ -1382,7 +1382,7 @@ pub async fn fail_unrestorable_restoring(
 ///
 /// Bind order: `$1` = sandbox id, `$2` = [`SubstrateKind::Kubernetes`] (see
 /// the sweeper's `failed_active_execution_scope`).
-pub const REPAIR_FAILED_ACTIVE_EXECUTION_SQL: &str = sql!(
+pub(crate) const REPAIR_FAILED_ACTIVE_EXECUTION_SQL: &str = sql!(
     "UPDATE sandboxes s
      SET lifecycle = 'started',
          current_local_artifact_id = CASE
@@ -1416,7 +1416,7 @@ pub const REPAIR_FAILED_ACTIVE_EXECUTION_SQL: &str = sql!(
 );
 
 /// Put a `failed` row whose active execution is still running back to
-/// `started` ([`REPAIR_FAILED_ACTIVE_EXECUTION_SQL`]). Returns whether the row
+/// `started` (`REPAIR_FAILED_ACTIVE_EXECUTION_SQL`). Returns whether the row
 /// was repaired.
 ///
 /// Writes an **inference**: the sweeper's repair of a stale `failed`

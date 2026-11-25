@@ -19,7 +19,7 @@ const TEMPLATE: &str = "seed";
 const HASH: &str = "sha256:abababababababababababababababababababababababababababababababab";
 const LOCATION: &str = "s3://templates-bucket/space/templates/seed/sha256:abababababababababababababababababababababababababababababababab?region=us-east-1";
 
-fn environment(byte: u8) -> EnvironmentReference {
+pub(crate) fn environment(byte: u8) -> EnvironmentReference {
     EnvironmentReference::new(Digest::sha256([byte; 32]))
 }
 
@@ -35,7 +35,7 @@ fn bound(environment: EnvironmentReference) -> PartitionSelector {
     }
 }
 
-fn metadata(environment: EnvironmentReference) -> serde_json::Value {
+pub(crate) fn metadata(environment: EnvironmentReference) -> serde_json::Value {
     serde_json::json!({ "environment": environment.to_string() })
 }
 
@@ -53,7 +53,7 @@ async fn twin_ready_db() -> TestResult<Option<pplx_space_db_test_fixtures::TestD
     Ok(Some(db))
 }
 
-async fn insert_template(pool: &PgPool, name: &str) -> TestResult {
+pub(crate) async fn insert_template(pool: &PgPool, name: &str) -> TestResult {
     sqlx::query("INSERT INTO templates (id, name) VALUES ($1, $2)")
         .bind(Uuid::now_v7())
         .bind(name)
@@ -116,7 +116,7 @@ async fn set_state(pool: &PgPool, environment: EnvironmentReference, state: &str
 
 /// Make `environment` the cluster default, as the policy store's
 /// `set_default` leaves the rows: allowed, and the policy's default.
-async fn set_default(pool: &PgPool, environment: EnvironmentReference) -> TestResult {
+pub(crate) async fn set_default(pool: &PgPool, environment: EnvironmentReference) -> TestResult {
     set_state(pool, environment, "allowed").await?;
     sqlx::query(
         "UPDATE runtime_environment_policy
@@ -130,7 +130,11 @@ async fn set_default(pool: &PgPool, environment: EnvironmentReference) -> TestRe
 }
 
 /// Catalog `environment` with the runtime version sort key `version`.
-async fn catalog(pool: &PgPool, environment: EnvironmentReference, version: &[i32]) -> TestResult {
+pub(crate) async fn catalog(
+    pool: &PgPool,
+    environment: EnvironmentReference,
+    version: &[i32],
+) -> TestResult {
     sqlx::query(
         "INSERT INTO runtime_environments (
              environment_ref, runtime, runtime_version, version_sort_key, kernel_version,

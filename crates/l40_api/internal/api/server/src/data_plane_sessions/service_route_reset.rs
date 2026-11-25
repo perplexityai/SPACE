@@ -4,11 +4,6 @@ use super::*;
 
 pub(super) const RESET_ROUTE_DIAGNOSTIC_MAX_CHARS: usize = 512;
 
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct UnstableResetSandboxServiceRouteRow {
-    pub(super) active_node_id: NodeId,
-}
-
 pub(crate) async fn reset_sandbox_service_route(
     pool: &sqlx::PgPool,
     request: UnstableResetSandboxServiceRouteRequest,
@@ -39,48 +34,17 @@ pub(crate) async fn reset_sandbox_service_route(
     // The caller's generation is the one the service-route resolver handed
     // out, so it is resolved as the shared route readers resolve it: a Direct
     // sandbox has no execution row, and its generation is its route identity's.
-    let reset = sqlx::query_as::<_, UnstableResetSandboxServiceRouteRow>(sql!(
-        "WITH current_route AS (
-             SELECT s.id AS sandbox_id, s.active_node_id
-             FROM sandboxes s
-             LEFT JOIN sandbox_k8s_executions e
-               ON e.sandbox_id = s.id
-              AND e.active
-             LEFT JOIN sandbox_direct_route_identities direct_route
-               ON direct_route.sandbox_id = s.id
-             WHERE s.id = $1
-               AND s.active_node_id IS NOT NULL
-               AND COALESCE(e.generation, direct_route.execution_generation) = $3
-         ),
-         updated AS (
-             UPDATE sandbox_port_exposures spe
-             SET apply_state = 'pending',
-                 last_applied_node_id = NULL,
-                 last_error = $4,
-                 last_bridge_status = NULL,
-                 last_applied_bridge_generation = NULL,
-                 last_observed_at = NULL,
-                 updated_at = NOW()
-             FROM current_route
-             WHERE spe.sandbox_id = current_route.sandbox_id
-               AND spe.protocol = 'tcp'
-               AND spe.guest_port = $2
-               AND spe.desired_state = 'open'
-               AND spe.apply_state = 'applied'
-               AND spe.last_applied_node_id = current_route.active_node_id
-             RETURNING current_route.active_node_id
-         )
-         SELECT active_node_id FROM updated"
-    ))
-    .bind(sandbox_id.as_uuid())
-    .bind(port_i32)
-    .bind(route_generation)
-    .bind(diagnostic)
-    .fetch_optional(&mut *tx)
+    let reset = sandbox_store::direct::service_route_reset::reset_applied_service_port(
+        &mut *tx,
+        sandbox_id,
+        port_i32,
+        route_generation,
+        &diagnostic,
+    )
     .await
     .map_err(|error| Status::internal(format!("reset sandbox service route: {error}")))?;
 
-    let Some(reset) = reset else {
+    let Some(active_node_id) = reset else {
         tx.commit().await.map_err(|error| {
             Status::internal(format!("commit reset sandbox service route no-op: {error}"))
         })?;
@@ -90,7 +54,7 @@ pub(crate) async fn reset_sandbox_service_route(
         });
     };
 
-    enqueue_sandbox_desired_state_reconcile_tx(&mut tx, sandbox_id, reset.active_node_id).await?;
+    enqueue_sandbox_desired_state_reconcile_tx(&mut tx, sandbox_id, active_node_id).await?;
     tx.commit().await.map_err(|error| {
         Status::internal(format!("commit reset sandbox service route: {error}"))
     })?;

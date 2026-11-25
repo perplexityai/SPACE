@@ -4,7 +4,14 @@
 //! locked for an administrative transition; and the two hard deletes of a
 //! Direct node, by id ([`delete_direct_node`]) and of its expired tombstones
 //! ([`prune_expired_direct_node_tombstones`]), whose `node_direct` rows go by
-//! the schema's `ON DELETE CASCADE`.
+//! the schema's `ON DELETE CASCADE`. [`registry`] holds the admin Direct node
+//! registry's statements on `nodes`, and the reads of Direct nodes' registry
+//! rows. The other submodules hold the other reads of `nodes` joined to
+//! `node_direct`: [`endpoints`] and [`placement_candidates`].
+
+pub mod endpoints;
+pub mod placement_candidates;
+pub mod registry;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::{NodeAddress, NodeGroupId, NodeManagedBy, NodeRole};
@@ -47,6 +54,8 @@ pub struct AdminNodeRow<S, C> {
     pub drain_mode: Option<String>,
     pub drain_started_at: Option<OffsetDateTime>,
     pub drain_last_error: Option<String>,
+    pub drain_engine: Option<String>,
+    pub drain_status: Option<sqlx::types::Json<serde_json::Value>>,
     pub terminate_decrement_capacity: bool,
     pub node_group_id: Option<NodeGroupId>,
     pub metadata: Option<sqlx::types::Json<serde_json::Value>>,
@@ -101,6 +110,8 @@ where
        n.drain_mode,
        n.drain_started_at,
        n.drain_last_error,
+       n.drain_engine,
+       n.drain_status,
        n.terminate_decrement_capacity,
        n.node_group_id,
        nd.metadata,
@@ -169,6 +180,8 @@ where
        n.drain_mode,
        n.drain_started_at,
        n.drain_last_error,
+       n.drain_engine,
+       n.drain_status,
        n.terminate_decrement_capacity,
        n.node_group_id,
        nd.metadata,
@@ -244,6 +257,8 @@ where
        n.drain_mode,
        n.drain_started_at,
        n.drain_last_error,
+       n.drain_engine,
+       n.drain_status,
        n.terminate_decrement_capacity,
        n.node_group_id,
        nd.metadata,

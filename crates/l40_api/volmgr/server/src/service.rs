@@ -23,12 +23,14 @@ use pplx_space_volmgr_store::jobs::{
     PriorityBand, WorkerConfig,
 };
 use pplx_space_volmgr_store::{
-    ConnectionGuard, JobPayloadRow, JobPayloadsError, SharedConnection, count_active_jobs,
-    pending_or_running_job_payloads, transfer_scope_job_ids,
+    AttachmentSandboxKey, ConnectionGuard, JobPayloadRow, JobPayloadsError, SharedConnection,
+    VolumeAttachment, count_active_jobs, delete_attachment, list_attachments,
+    pending_or_running_job_payloads, transfer_scope_job_ids, upsert_attachment,
 };
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
+use crate::db;
 use crate::executor::{
     ArtifactEntryPayload, ArtifactPayload, FileMode, PullExistingPolicy,
     ShadowComparisonController, TransferDedupOptions, TransferEncryption, TransferExecutor,
@@ -36,7 +38,6 @@ use crate::executor::{
     snapshot_artifact_from_entry_role, snapshot_artifact_from_local_path,
 };
 use crate::staging::{StagingDir, StagingError};
-use crate::{VolumeAttachment, db};
 use pplx_space_volmgr_client::proto::cancel_transfer_request::Selector as CancelTransferSelector;
 use pplx_space_volmgr_client::proto::{
     AttachVolumeRequest, AttachVolumeResponse, BatchDecryptionConfig, BatchEncryptionConfig,
@@ -1107,10 +1108,10 @@ impl VolumeManager for VolumeManagerService {
         record_sandbox_id(&tracing::Span::current(), &req.sandbox_id);
         let sandbox_id = req
             .sandbox_id
-            .parse::<db::AttachmentSandboxKey>()
+            .parse::<AttachmentSandboxKey>()
             .map_err(|error| Status::invalid_argument(format!("invalid sandbox_id: {error}")))?;
         let conn = self.lock_db()?;
-        db::upsert_attachment(&conn, &sandbox_id, &attachment).map_err(db_err)?;
+        upsert_attachment(&conn, &sandbox_id, &attachment).map_err(db_err)?;
         tracing::info!(
             sandbox_id = %req.sandbox_id,
             volume_name = %attachment.name,
@@ -1131,10 +1132,10 @@ impl VolumeManager for VolumeManagerService {
         record_sandbox_id(&tracing::Span::current(), &req.sandbox_id);
         let sandbox_id = req
             .sandbox_id
-            .parse::<db::AttachmentSandboxKey>()
+            .parse::<AttachmentSandboxKey>()
             .map_err(|error| Status::invalid_argument(format!("invalid sandbox_id: {error}")))?;
         let conn = self.lock_db()?;
-        db::delete_attachment(&conn, &sandbox_id, &req.volume_name).map_err(db_err)?;
+        delete_attachment(&conn, &sandbox_id, &req.volume_name).map_err(db_err)?;
         tracing::info!(
             sandbox_id = %req.sandbox_id,
             volume_name = %req.volume_name,
@@ -1153,10 +1154,10 @@ impl VolumeManager for VolumeManagerService {
         record_sandbox_id(&tracing::Span::current(), &req.sandbox_id);
         let sandbox_id = req
             .sandbox_id
-            .parse::<db::AttachmentSandboxKey>()
+            .parse::<AttachmentSandboxKey>()
             .map_err(|error| Status::invalid_argument(format!("invalid sandbox_id: {error}")))?;
         let conn = self.lock_db()?;
-        let attachments = db::list_attachments(&conn, &sandbox_id).map_err(db_err)?;
+        let attachments = list_attachments(&conn, &sandbox_id).map_err(db_err)?;
         Ok(Response::new(ListVolumesResponse {
             volumes: attachments.into_iter().map(attachment_to_proto).collect(),
         }))

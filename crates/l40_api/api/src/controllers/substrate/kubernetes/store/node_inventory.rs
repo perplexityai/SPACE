@@ -92,13 +92,14 @@ impl K8sStore {
                 manage_state,
                 instance_id,
             },
-            || {
+            |abandoned_v2| {
                 tracing::warn!(
                     node_id = %node_id,
                     node_name = %node_name,
                     new_k8s_node_uid = %node_uid,
-                    "k8s Node UID changed for existing node row; cleared drain_phase/drain_mode/drain_started_at/drain_last_error — \
-                     any in-progress drain was abandoned"
+                    abandoned_v2,
+                    "k8s Node UID changed for existing node row; cleared drain_phase/drain_mode/drain_started_at/drain_last_error/\
+                     drain_engine/drain_status — any in-progress drain was abandoned (abandoned_v2 says whether it was a v2 drain)"
                 );
             },
         )
@@ -118,6 +119,25 @@ impl K8sStore {
                     ),
                 }
             }
+            // The same per-node skip as a tombstone: the next sync retries.
+            K8sNodeRegistrationError::AwaitingInstance => {
+                tracing::warn!(
+                    %node_id,
+                    node_name,
+                    %node_uid,
+                    "a Node under a new uid that reports no EC2 instance yet would take a v2 \
+                     drain's node; deferring its registration until the Node reports its \
+                     providerID"
+                );
+                crate::metrics::node_drain::v2_registration_deferred(&node_id.to_string());
+                SubstrateError::NodeTombstoned {
+                    message: format!(
+                        "kube node {node_name} role {role} has a new uid {node_uid} and no \
+                         instance yet, and the node has a v2 drain; deferring its registration \
+                         until the Node reports its providerID"
+                    ),
+                }
+            }
             K8sNodeRegistrationError::NotKubernetes => SubstrateError::Failed {
                 message: format!(
                     "Kubernetes node uid {node_uid} role {role} for {node_name} conflicts with a non-Kubernetes node"
@@ -131,6 +151,9 @@ impl K8sStore {
                     }
                     K8sNodeRegistrationStep::RecheckOwnership => {
                         "failed to re-check Kubernetes node ownership"
+                    }
+                    K8sNodeRegistrationStep::CheckUidChange => {
+                        "failed to check the v2 drain's Node UID"
                     }
                     K8sNodeRegistrationStep::ClearDrain => {
                         "failed to clear drain state on UID change"

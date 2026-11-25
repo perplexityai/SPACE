@@ -552,7 +552,7 @@ async fn prune_skipped_while_sibling_same_template_job_active() -> TestResult {
         conn.raw().execute(
             "INSERT INTO jobs (job_id, kind, payload, subject_id, status)
              VALUES ('sibling-job', ?1, '{}', 'seed', 'pending')",
-            params![jobs::BUILD_JOB_KIND],
+            params![BUILD_JOB_KIND],
         )?;
     }
 
@@ -999,7 +999,7 @@ async fn expired_running_job_lease_is_marked_failed() -> TestResult {
              )
              VALUES (?1, ?2, 'running', ?3, ?4, ?4, 1, 'dead-worker',
                      datetime('now', '-1 second'))",
-            params![job_id, jobs::BUILD_JOB_KIND, payload, "seed"],
+            params![job_id, BUILD_JOB_KIND, payload, "seed"],
         )?;
     }
 

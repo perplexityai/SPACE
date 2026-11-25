@@ -5980,6 +5980,34 @@ fn layers_coordinators() {
             &format!("{C}:2"),
         )],
     );
+    // The same leaf rule would accept `c/coordinator/server` for
+    // `pplx-space-c-coordinator`, so `coordinators` reports a coordinator
+    // below `<area>/coordinator`, and not one at it.
+    let ws = Layered {
+        extra: &[
+            (
+                "crates/l30_storage/c/coordinator/server",
+                "pplx-space-c-coordinator",
+            ),
+            COORDINATORS[1],
+        ],
+        ..Layered::default()
+    }
+    .build();
+    assert_layer_findings(
+        "a coordinator in a leaf directory, beside one at its path",
+        &layer_findings(&load(ws.path(), None)),
+        &[(
+            "layers.coordinators",
+            "crates/l30_storage/c/coordinator/server/Cargo.toml: pplx-space-c-coordinator is a \
+             coordinator (an l30_storage crate named *-coordinator) at \
+             crates/l30_storage/c/coordinator/server, but a coordinator takes no leaf \
+             directory: it sits exactly at crates/l30_storage/c/coordinator, its package name \
+             without `pplx-space-`, split on `-`. Move it there. See \
+             crates/tools/archcheck/README.md#layers.",
+            "crates/l30_storage/c/coordinator/server/Cargo.toml:2",
+        )],
+    );
 }
 
 /// With the state checks, `state.declarations` asks no coordinator for a

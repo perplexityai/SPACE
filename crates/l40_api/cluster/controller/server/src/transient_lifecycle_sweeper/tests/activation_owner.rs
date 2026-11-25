@@ -17,7 +17,7 @@ use pplx_space_k8s_ids::PodUid;
 use pplx_space_node_model::SubstrateKind;
 use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_store::row_locks;
-use pplx_space_sandbox_store::sweeper::REPAIR_FAILED_ACTIVE_EXECUTION_SQL;
+use pplx_space_sandbox_store::test_support::sweeper::REPAIR_FAILED_ACTIVE_EXECUTION_SQL;
 use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;

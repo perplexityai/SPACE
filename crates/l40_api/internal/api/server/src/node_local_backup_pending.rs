@@ -641,11 +641,11 @@ async fn delete_durable_absent(
 /// The artifact identity a finalize just made durable.
 ///
 /// All four parts are required, which is why the `snapshots` row that produces
-/// it — `FinalizedSnapshotRow`, beside the statement that selects it — can
-/// only offer an `Option`: a delete that dropped `source_node_id` or
-/// `artifact_id` from its `WHERE` would key on `(node, sandbox)` alone, and
-/// that is exactly what lets finalizing an *old* artifact remove a *newer*
-/// artifact's row.
+/// it — the snapshot store's `upload::FinalizedAttempt`, read through
+/// `finalized_artifact` — can only offer an `Option`: a delete that dropped
+/// `source_node_id` or `artifact_id` from its `WHERE` would key on
+/// `(node, sandbox)` alone, and that is exactly what lets finalizing an *old*
+/// artifact remove a *newer* artifact's row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct FinalizedArtifact {
     pub(super) source_node_id: NodeId,

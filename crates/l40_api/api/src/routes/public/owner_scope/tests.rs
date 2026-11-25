@@ -760,7 +760,7 @@ async fn statements_during(
 fn sandbox_row_loads(statements: &[String]) -> usize {
     statements
         .iter()
-        .filter(|locator| locator.starts_with("pplx_space_api::controllers::sandbox::responses:"))
+        .filter(|locator| locator.starts_with("pplx_space_sandbox_store::direct::sandbox_listing:"))
         .count()
 }
 
@@ -789,11 +789,13 @@ async fn sandbox_scoped_requests_load_owner_and_row_once() -> TestDbResult<()> {
     // session, operation with its event, idempotency record, and commit.
     assert_eq!(statements.len(), 10, "{statements:#?}");
     assert_eq!(sandbox_row_loads(&statements), 1, "{statements:#?}");
-    // An already-materialized owner resolves in one read.
+    // An already-materialized owner resolves in one read: the request's only
+    // statement from the accounts store's `organizations` module, where
+    // materializing the owner would add its upsert.
     assert_eq!(
         statements
             .iter()
-            .filter(|locator| locator.starts_with("pplx_space_api::federated_identity::store:"))
+            .filter(|locator| locator.starts_with("pplx_space_accounts_store::organizations:"))
             .count(),
         1,
         "{statements:#?}"

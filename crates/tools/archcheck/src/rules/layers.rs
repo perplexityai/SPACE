@@ -21,10 +21,10 @@
 //! - `store_edges`: an API or Storage crate depends on a store only if the
 //!   store lists it as a user.
 //! - `coordinators` and `coordinator_edges`: a coordinator, a Storage crate
-//!   named `*-coordinator` that runs one transaction across stores, declares
-//!   no state and depends on no other coordinator; an API crate depends on
-//!   one only if it lists it as a user, and a store never does
-//!   ([`coordinator`]).
+//!   named `*-coordinator` that runs one transaction across stores, sits at
+//!   `<area>/coordinator` without a leaf, declares no state and depends on
+//!   no other coordinator; an API crate depends on one only if it lists it
+//!   as a user, and a store never does ([`coordinator`]).
 //! - `driver_reexports`: no Storage crate's library root re-exports a driver
 //!   ([`coordinator`]).
 //! - `storage_access` and `codec_features`: only stores and storage helpers
@@ -289,6 +289,7 @@ impl Rule for Layers {
         }
         findings.extend(coordinator::declared_state(config, &graph));
         findings.extend(coordinator::misnamed(config, &graph));
+        findings.extend(coordinator::misplaced(config, &graph));
         findings.extend(coordinator::driver_reexports(ctx, config, &graph));
         if let (Some(state), Some(unowned)) = (&config.state, &config.unowned) {
             findings.extend(state::check(ctx, config, state, unowned, &graph));

@@ -80,15 +80,14 @@ pub(crate) async fn reject_deleting_current_local_artifact(
     sandbox_id: SandboxId,
     artifact: PublishedLocalArtifact,
 ) -> Result<(), SubstrateError> {
-    let deleting_snapshot = deleting_snapshot_matches_artifact("$1", "$2", "$3");
-    let query = format!("SELECT {deleting_snapshot}");
-    let deleting = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(sandbox_id.as_uuid())
-        .bind(artifact.id.as_uuid())
-        .bind(artifact.kind.as_str())
-        .fetch_one(&mut **tx)
-        .await
-        .db_context("failed to check current artifact retention claim")?;
+    let deleting = pplx_space_snapshot_store::claimed::deleting_without_ready_copy(
+        tx,
+        sandbox_id,
+        artifact.id,
+        artifact.kind,
+    )
+    .await
+    .db_context("failed to check current artifact retention claim")?;
     if deleting {
         return Err(SubstrateError::Unavailable {
             message: format!(

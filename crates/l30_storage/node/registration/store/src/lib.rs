@@ -10,11 +10,19 @@
 //! without writing them, [`drain_write`] writes them checking only the node
 //! id, [`tombstone`] records terminated nodes, [`inventory`] lists the
 //! Kubernetes nodes, [`demotion`] demotes ready ones missing from the
-//! cluster, and [`node_group`] mirrors their node-group labels.
-//! [`direct`] reads the admin node row, which joins the node's Direct
-//! registration, and hard-deletes Direct nodes and their expired tombstones.
+//! cluster, [`node_group`] mirrors their node-group labels, and
+//! [`orphan_reap_refusal`] says why the drained-node terminator's reap of a
+//! gone node's row refused. [`direct`] holds the statements that join or test
+//! a node's Direct registration in `node_direct` (`pplx-space-direct-store`'s):
+//! the admin node row and the hard deletes of Direct nodes and their expired
+//! tombstones, and in its submodules a Direct node's endpoint, the Direct
+//! substrate's placement candidates, and the admin node registry's reads and
+//! the writes of a Direct node's `nodes` row ([`direct::registry`]).
 //! [`stale_reconcile_work`] finds the Kubernetes nodes the reconcile queue GC
 //! may treat as gone.
+//! [`orphan_reap_refusal`] also counts `sandboxes` rows, which belong to
+//! `pplx-space-sandbox-store`, through the residency and portability
+//! fragments the reap's guards use.
 //!
 //! Every verb runs on the caller's executor, so it composes into the
 //! caller's transaction. The row locks in [`locks`] and
@@ -36,6 +44,7 @@ pub mod inventory;
 pub mod locks;
 pub mod lookup;
 pub mod node_group;
+pub mod orphan_reap_refusal;
 mod register;
 pub mod stale_reconcile_work;
 pub mod tombstone;

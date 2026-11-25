@@ -4,10 +4,13 @@
 //! bytes are reaped, so a restarted reconciler finishes the claims it finds
 //! here instead of waiting for fresh discovery to revisit them.
 
+use std::sync::LazyLock;
+
 use pplx_space_sandbox_model::SandboxId;
-use pplx_space_snapshot_model::SnapshotId;
+use pplx_space_sandbox_portability::deleting_snapshot_matches_artifact;
+use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId, SnapshotId};
 use pplx_space_sql_locator::sql;
-use sqlx::FromRow;
+use sqlx::{FromRow, Postgres, Transaction};
 use uuid::Uuid;
 
 /// Upper bound of the durable claims present when a recovery epoch starts.
@@ -106,6 +109,32 @@ pub async fn list(
         .bind(after)
         .bind(through)
         .fetch_all(executor)
+        .await
+}
+
+/// Whether a claim has parked a snapshot of `sandbox_id`'s local artifact
+/// `artifact_id` of kind `artifact_kind` in `deleting` while no ready copy of
+/// that artifact keeps a live location.
+///
+/// Run it after locking the sandbox row in the same transaction. Retention
+/// takes that lock before it claims a snapshot, so this read sees the
+/// committed claim and a caller can refuse to pin an artifact whose bytes may
+/// be going.
+pub async fn deleting_without_ready_copy(
+    tx: &mut Transaction<'_, Postgres>,
+    sandbox_id: SandboxId,
+    artifact_id: LocalArtifactId,
+    artifact_kind: ArtifactKind,
+) -> Result<bool, sqlx::Error> {
+    static DELETING_WITHOUT_READY_COPY: LazyLock<String> = LazyLock::new(|| {
+        let deleting_snapshot = deleting_snapshot_matches_artifact("$1", "$2", "$3");
+        sql!(format!("SELECT {deleting_snapshot}"))
+    });
+    sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(DELETING_WITHOUT_READY_COPY.as_str()))
+        .bind(sandbox_id.as_uuid())
+        .bind(artifact_id.as_uuid())
+        .bind(artifact_kind.as_str())
+        .fetch_one(&mut **tx)
         .await
 }
 

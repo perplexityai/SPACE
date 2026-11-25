@@ -11,6 +11,7 @@
 
 mod create_and_teardown;
 mod create_readiness;
+mod drain_recovery_gate;
 mod durable_snapshot;
 mod hydration_and_suspend;
 mod pooled_adoption;

@@ -1243,3 +1243,6 @@ pub async fn node_desired_states(
     .fetch_all(executor)
     .await
 }
+
+#[cfg(test)]
+mod visibility_tests;

@@ -1,12 +1,10 @@
 //! Characterization of the sibling-table verbs at the store layer: the
 //! port-exposure upserts, apply outcomes, invalidations and node apply
-//! reports, the ECW credential epoch advance, the runtime-access read, the
-//! published snapshot upsert and the failed observed-state purge.
+//! reports, the ECW credential epoch advance, the runtime-access read and the
+//! published snapshot upsert.
 
 use super::*;
-use crate::{
-    ecw_credential_epochs, observed_states, port_exposures, runtime_access, snapshot_inventory,
-};
+use crate::{ecw_credential_epochs, port_exposures, runtime_access, snapshot_inventory};
 
 async fn insert_node(pool: &PgPool) -> TestResult<NodeId> {
     let node_id = NodeId::new();
@@ -552,62 +550,6 @@ async fn apply_state_reports_update_only_sandboxes_active_on_the_reporting_node(
         read_observation(&db.pool, elsewhere, 8080).await?,
         ("pending".to_string(), None, None, None, false),
         "the other node's exposure is left as it was"
-    );
-    Ok(())
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn clear_failed_observation_keeps_a_live_record() -> TestResult {
-    let Some(db) = try_pg_test_db().await? else {
-        return Ok(());
-    };
-    let node_id = insert_node(&db.pool).await?;
-    let observed = |status: &'static str, pid: Option<i32>| {
-        let pool = db.pool.clone();
-        async move {
-            let sandbox_id = SandboxId::new();
-            sqlx::query(sql!(
-                "INSERT INTO sandbox_observed_states (sandbox_id, node_id, status, pid)
-                 VALUES ($1, $2, $3, $4)"
-            ))
-            .bind(sandbox_id)
-            .bind(node_id)
-            .bind(status)
-            .bind(pid)
-            .execute(&pool)
-            .await?;
-            TestResult::<SandboxId>::Ok(sandbox_id)
-        }
-    };
-    let exists = |sandbox_id: SandboxId| {
-        let pool = db.pool.clone();
-        async move {
-            sqlx::query_scalar::<_, bool>(sql!(
-                "SELECT EXISTS (SELECT 1 FROM sandbox_observed_states WHERE sandbox_id = $1)"
-            ))
-            .bind(sandbox_id)
-            .fetch_one(&pool)
-            .await
-        }
-    };
-    let fossil = observed("failed", None).await?;
-    let running = observed("running", None).await?;
-    let failed_with_pid = observed("failed", Some(42)).await?;
-
-    let mut conn = db.pool.acquire().await?;
-    for sandbox_id in [fossil, running, failed_with_pid] {
-        observed_states::clear_failed_observation(&mut conn, sandbox_id).await?;
-    }
-    drop(conn);
-
-    assert!(
-        !exists(fossil).await?,
-        "a failed, pid-less record is purged"
-    );
-    assert!(exists(running).await?, "a non-failed record survives");
-    assert!(
-        exists(failed_with_pid).await?,
-        "a record with a pid survives"
     );
     Ok(())
 }

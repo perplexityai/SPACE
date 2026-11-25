@@ -44,6 +44,17 @@ pub async fn insert_campaign(
     executor: impl sqlx::PgExecutor<'_>,
     seed: CampaignSeed,
 ) -> Result<CampaignId, sqlx::Error> {
+    let kind = seed.kind.as_str();
+    insert_campaign_with_kind(executor, seed, kind).await
+}
+
+/// Insert `seed` with `kind` stored verbatim, so a test can seed a kind from a
+/// newer build that [`CampaignKind`] doesn't name.
+pub async fn insert_campaign_with_kind(
+    executor: impl sqlx::PgExecutor<'_>,
+    seed: CampaignSeed,
+    kind: &str,
+) -> Result<CampaignId, sqlx::Error> {
     let id = sqlx::query_scalar::<_, uuid::Uuid>(sql!(
         "INSERT INTO runtime_upgrade_campaigns (
              from_environment_ref, to_environment_ref, kind, phase,
@@ -56,7 +67,7 @@ pub async fn insert_campaign(
     ))
     .bind(seed.from.to_string())
     .bind(seed.to.to_string())
-    .bind(seed.kind.as_str())
+    .bind(kind)
     .bind(seed.phase.as_str())
     .bind(seed.per_node)
     .bind(seed.per_cluster)

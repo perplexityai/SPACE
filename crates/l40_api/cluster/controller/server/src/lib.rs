@@ -90,6 +90,10 @@ pub enum RunClusterControllerError {
     CredentialsPool(#[source] pplx_space_postgres_pool::DatabaseConnectOptionsError),
     #[error("substrate init failed: {0}")]
     Substrate(#[source] pplx_space_api::controllers::substrate::SubstrateError),
+    /// `SPACE_DRAIN_V2_ENABLED` is on where the node drain, which runs the v2
+    /// loop, is off.
+    #[error("invalid drain v2 configuration: {0}")]
+    DrainV2Config(#[source] reconcilers::ReconcilerRuntimeError),
     #[error("failed to build the leadership lease client: {0}")]
     LeaseClient(#[source] kube::Error),
     /// The leadership lease could not be reached for longer than the liveness
@@ -136,6 +140,18 @@ pub async fn run(
     let substrate = Substrate::from_env(&pool)
         .await
         .map_err(RunClusterControllerError::Substrate)?;
+    // A drain v2 switch the node drain can't serve fails here too, in every
+    // replica before leader election can mark it Ready, so a rollout that
+    // sets it stalls with the working pods intact. Admission is the API's;
+    // here the flag is only checked against what a v2 drain needs, on a
+    // substrate whose nodes a drain runs on.
+    if substrate.capabilities().supports_node_drain {
+        reconcilers::ensure_drain_v2_has_its_loop(
+            &pplx_space_env_vars::ProcessEnvironment,
+            node_drain::ReconcilerConfig::from_env().enabled,
+        )
+        .map_err(RunClusterControllerError::DrainV2Config)?;
+    }
 
     // Contend for cluster-controller leadership when the process runs in a
     // Kubernetes pod, where an apiserver hosts the `Lease` and a Deployment may

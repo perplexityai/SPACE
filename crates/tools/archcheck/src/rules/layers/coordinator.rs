@@ -10,8 +10,10 @@
 //! - `coordinators`: a coordinator with a `[package.metadata.space.state]`
 //!   ([`declared_state`]); a Storage crate in a coordinator's directory whose
 //!   name doesn't end in `-coordinator` ([`misnamed`]), which `layout`'s
-//!   leaf rule would accept for `pplx-space-<area>`; and, from
-//!   [`super::graph`], a coordinator's edge to another coordinator.
+//!   leaf rule would accept for `pplx-space-<area>`; a coordinator in a
+//!   leaf directory below `<area>/coordinator` ([`misplaced`]), which that
+//!   rule would accept too; and, from [`super::graph`], a coordinator's edge
+//!   to another coordinator.
 //! - `driver_reexports`: a `pub use` or `pub extern crate` of a driver in a
 //!   Storage crate's library root, at its top level or in a `pub mod` block
 //!   there ([`driver_reexports`]), which would hand the crate's users the
@@ -26,7 +28,12 @@ use std::collections::BTreeMap;
 
 use syn::{Attribute, Item, Meta, Token, UseTree, Visibility, punctuated::Punctuated};
 
-use super::{GUIDE, RULE, graph::Graph, storage::production};
+use super::{
+    GUIDE, RULE,
+    graph::{Graph, PACKAGE_PREFIX, name_segments},
+    leaf,
+    storage::production,
+};
 use crate::{
     config::{Layer, LayersConfig},
     context::Context,
@@ -94,6 +101,43 @@ pub(super) fn misnamed(config: &LayersConfig, graph: &Graph<'_>) -> Vec<Finding>
                      See {GUIDE}.",
                     member.name(),
                     member.krate.member,
+                ),
+                mode: config.coordinators.mode,
+                location: Location {
+                    path: manifest,
+                    line: member.krate.name_line,
+                },
+            }
+        })
+        .collect()
+}
+
+/// `coordinators` findings for each coordinator in a leaf directory below
+/// its name's path, shown on its `name =` line: a coordinator sits exactly at
+/// `<area>/coordinator`, where [`misnamed`] pairs path and name. `layout`
+/// reports any other path that isn't its name's.
+pub(super) fn misplaced(config: &LayersConfig, graph: &Graph<'_>) -> Vec<Finding> {
+    graph
+        .members
+        .values()
+        .filter(|member| member.is_coordinator() && leaf(member).is_some())
+        .map(|member| {
+            let manifest = member.krate.manifest();
+            Finding {
+                rule: RULE,
+                instance: None,
+                behaviour: "coordinators",
+                path: manifest.clone(),
+                detail: format!(
+                    ": {} is a coordinator (an l30_storage crate named *-coordinator) at {}, but \
+                     a coordinator takes no leaf directory: it sits exactly at \
+                     crates/{}/{}, its package name without `{}`, split on `-`. Move it \
+                     there. See {GUIDE}.",
+                    member.name(),
+                    member.krate.member,
+                    Layer::Storage,
+                    name_segments(member.name()).join("/"),
+                    PACKAGE_PREFIX,
                 ),
                 mode: config.coordinators.mode,
                 location: Location {

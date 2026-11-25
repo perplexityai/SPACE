@@ -7,7 +7,8 @@
 //! Plain reads: none takes a lock. Each runs on the executor its caller
 //! passes, so the ones the suspend flow makes after its row locks run in
 //! that transaction. The suspend's `sandboxes` writes are
-//! [`crate::suspend`]'s; its execution writes stay with the Kubernetes store.
+//! [`crate::suspend`]'s. Its commit's execution writes and the pod
+//! retirement's execution lock are [`crate::k8s_executions::suspend`]'s.
 
 use std::sync::LazyLock;
 

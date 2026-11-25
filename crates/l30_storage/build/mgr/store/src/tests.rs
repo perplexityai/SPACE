@@ -244,3 +244,69 @@ fn expired_running_build_reaper_is_idempotent() {
     );
     assert_eq!(job_row(&conn, JOB), after_first);
 }
+
+#[test]
+fn count_other_active_builds_excludes_self_and_terminal_rows() {
+    let conn = test_db();
+    insert_build_job(
+        &conn,
+        "019d84bd-280d-7331-99c6-000000000002",
+        "tpl-a",
+        "running",
+    );
+    insert_build_job(
+        &conn,
+        "019d84bd-280d-7331-99c6-000000000003",
+        "tpl-a",
+        "pending",
+    );
+    insert_build_job(
+        &conn,
+        "019d84bd-280d-7331-99c6-000000000004",
+        "tpl-a",
+        "completed",
+    );
+    insert_build_job(
+        &conn,
+        "019d84bd-280d-7331-99c6-000000000005",
+        "tpl-a",
+        "failed",
+    );
+    insert_build_job(
+        &conn,
+        "019d84bd-280d-7331-99c6-000000000006",
+        "tpl-b",
+        "running",
+    );
+
+    // From 019d84bd-280d-7331-99c6-000000000002's perspective only the pending sibling counts:
+    // terminal rows and other templates never gate the prune.
+    assert_eq!(
+        count_other_active_builds_for_subject(
+            &conn,
+            "tpl-a",
+            &"019d84bd-280d-7331-99c6-000000000002".parse().unwrap()
+        )
+        .unwrap(),
+        1
+    );
+    // From the pending sibling's perspective, the running job counts.
+    assert_eq!(
+        count_other_active_builds_for_subject(
+            &conn,
+            "tpl-a",
+            &"019d84bd-280d-7331-99c6-000000000003".parse().unwrap()
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        count_other_active_builds_for_subject(
+            &conn,
+            "tpl-b",
+            &"019d84bd-280d-7331-99c6-000000000006".parse().unwrap()
+        )
+        .unwrap(),
+        0
+    );
+}

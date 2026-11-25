@@ -10,17 +10,8 @@
 [pattern_ratchet.direct_tables]
 "crates/l30_storage/cluster/trigger/queue/src/lib.rs" = 1
 "crates/l30_storage/sandbox/store/src/lib.rs" = 2
-"crates/l40_api/api/src/controllers/sandbox/responses.rs" = 4
-"crates/l40_api/api/src/controllers/sandbox/spaced.rs" = 1
-"crates/l40_api/api/src/public_template_operations.rs" = 1
-"crates/l40_api/api/src/routes/admin/node_maintenance.rs" = 6
-"crates/l40_api/api/src/routes/admin/templates.rs" = 1
-"crates/l40_api/api/src/routes/public/sandboxes.rs" = 1
-"crates/l40_api/cluster/controller/server/src/tombstone_retention.rs" = 1
-"crates/l40_api/internal/api/server/src/data_plane_sessions/route_rows.rs" = 3
-"crates/l40_api/internal/api/server/src/data_plane_sessions/service_route_reset.rs" = 1
-"crates/l40_api/internal/api/server/src/lib.rs" = 1
-"crates/l40_api/internal/api/server/src/published_state.rs" = 2
+"crates/l40_api/api/src/routes/admin/node_maintenance.rs" = 4
+"crates/l40_api/internal/api/server/src/data_plane_sessions/route_rows.rs" = 1
 
 [pattern_ratchet.kubernetes_access]
 # Spawns the Kubernetes-only reconcilers from the bound `KubernetesSubstrate`.
@@ -100,18 +91,13 @@ pplx-space-volmgr = [
 
 [layers.unowned]
 postgres = [
-  "api_keys",
-  "clusters",
   "data_plane_session_output_events",
   "org_credentials",
-  "organizations",
   "sandbox_archives",
   "sandbox_encrypted_fields",
-  "sessions",
   "template_encrypted_fields",
   "template_release_storage_location_encrypted_fields",
   "user_credentials",
-  "users",
 ]
 
 # [crate_names] maps each workspace package with a catch-all name (a part such
@@ -125,3 +111,9 @@ pplx-space-common-proto-build = "crates/l10_foundation/common/proto/build"
 pplx-space-execution-common = "crates/l20_domain/execution/common"
 pplx-space-net-common = "crates/l20_domain/net/common"
 pplx-space-node-runtime-core = "crates/l40_api/node/runtime/core"
+
+[pattern_ratchet.sql_wrapped_column_predicate]
+# Major-version match on a state format, a residual filter after the
+# primary-key lookup by node and runtime.
+"crates/l30_storage/node/registration/store/src/direct/placement_candidates.rs" = 2
+"crates/l30_storage/sandbox/store/src/direct/restore_candidates.rs" = 4

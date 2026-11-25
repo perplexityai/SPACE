@@ -30,8 +30,10 @@ struct RecordedExecutionRow {
     state_format_version: Option<String>,
 }
 
-impl From<pplx_space_sandbox_store::observed_states::PublishedExecution> for RecordedExecutionRow {
-    fn from(row: pplx_space_sandbox_store::observed_states::PublishedExecution) -> Self {
+impl From<pplx_space_sandbox_teardown::observed_states::PublishedExecution>
+    for RecordedExecutionRow
+{
+    fn from(row: pplx_space_sandbox_teardown::observed_states::PublishedExecution) -> Self {
         Self {
             subject: row.subject,
             local_artifact_id: row.local_artifact_id,
@@ -130,7 +132,7 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<RecordedActivation>, SubstrateError> {
-        let row = pplx_space_sandbox_store::observed_states::last_published_execution(
+        let row = pplx_space_sandbox_teardown::observed_states::last_published_execution(
             &self.pool, sandbox_id,
         )
         .await

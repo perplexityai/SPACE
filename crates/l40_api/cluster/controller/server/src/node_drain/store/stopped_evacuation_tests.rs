@@ -12,6 +12,9 @@
 //! be: each near-miss is a *possible* yes turned into a no by exactly one field,
 //! seeded alongside a real yes so no assertion holds vacuously.
 
+use pplx_space_sandbox_portability::current_disk_artifact_backup_ready;
+use pplx_space_snapshot_model::SnapshotId;
+
 use super::*;
 
 pub(super) type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -159,12 +162,11 @@ async fn disk_backup_ready(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<b
 }
 
 async fn restore_pending(pool: &PgPool) -> TestResult<Vec<(SandboxId, String)>> {
-    let query = restore_pending_evacuations_query(true);
-    Ok(
-        sqlx::query_as::<_, (SandboxId, String)>(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .fetch_all(pool)
-            .await?,
-    )
+    Ok(sandbox_store::evacuation_restores::pending(pool, true)
+        .await?
+        .into_iter()
+        .map(|row| (row.id, row.evacuation_restore_target))
+        .collect())
 }
 
 /// Claim with new evacuations enabled — what a cluster that has opted in does.

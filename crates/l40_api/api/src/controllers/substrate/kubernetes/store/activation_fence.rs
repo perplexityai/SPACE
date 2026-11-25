@@ -2,6 +2,7 @@
 //! activation attempts, route identity publication, and fence reconciliation.
 
 use super::*;
+use pplx_space_sandbox_store::k8s_executions::activation_fence;
 
 impl K8sStore {
     pub(in crate::controllers::substrate::kubernetes) async fn begin_activation_execution_row(
@@ -98,23 +99,13 @@ impl K8sStore {
         activation_attempt_id: SandboxActivationAttemptId,
         expected_pod_uid: &str,
     ) -> Result<(), SubstrateError> {
-        let published = sqlx::query_scalar::<_, Uuid>(sql!(
-            "UPDATE sandbox_k8s_executions
-                SET route_activation_id = $3,
-                    updated_at = NOW()
-              WHERE sandbox_id = $1
-                AND generation = $2
-                AND active
-                AND activation_attempt_id = $3
-                AND route_activation_id IS NULL
-                AND pod_uid = $4
-              RETURNING route_activation_id"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(generation)
-        .bind(activation_attempt_id)
-        .bind(expected_pod_uid)
-        .fetch_optional(&self.pool)
+        let published = activation_fence::publish_acknowledged_legacy_route(
+            &self.pool,
+            sandbox_id,
+            generation,
+            activation_attempt_id,
+            expected_pod_uid,
+        )
         .await
         .map_err(|error| SubstrateError::Failed {
             message: format!("failed to publish acknowledged legacy route identity: {error}"),
@@ -162,27 +153,15 @@ impl K8sStore {
         generation: i64,
         activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
     ) -> Result<bool, SubstrateError> {
-        let changed = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions execution
-                SET activation_attempt_id = NULL,
-                    activation_attempt_expires_at = NULL,
-                    activation_attempt_target_state = NULL
-               FROM sandboxes sandbox
-              WHERE sandbox.id = execution.sandbox_id
-                AND execution.sandbox_id = $1
-                AND execution.generation = $2
-                AND execution.active
-                AND execution.activation_attempt_id = $3
-                AND execution.route_activation_id IS NOT NULL
-                AND LOWER(TRIM(sandbox.lifecycle)) = execution.activation_attempt_target_state"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(generation)
-        .bind(activation_attempt_id)
-        .execute(&self.pool)
+        let changed = activation_fence::complete_attempt(
+            &self.pool,
+            sandbox_id,
+            generation,
+            activation_attempt_id,
+        )
         .await
         .db_context("failed to complete activation attempt")?;
-        Ok(changed.rows_affected() == 1)
+        Ok(changed == 1)
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn release_activation_attempt_best_effort(
@@ -218,18 +197,12 @@ impl K8sStore {
         generation: i64,
         activation_attempt_id: SandboxActivationAttemptId,
     ) {
-        if let Err(error) = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-                SET activation_attempt_id = NULL,
-                    activation_attempt_expires_at = NULL,
-                    activation_attempt_target_state = NULL
-              WHERE sandbox_id = $1 AND generation = $2 AND active
-                AND activation_attempt_id = $3"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(generation)
-        .bind(activation_attempt_id)
-        .execute(&self.pool)
+        if let Err(error) = activation_fence::release_finished_attempt(
+            &self.pool,
+            sandbox_id,
+            generation,
+            activation_attempt_id,
+        )
         .await
         {
             tracing::warn!(
@@ -263,18 +236,12 @@ impl K8sStore {
         generation: i64,
         activation_attempt_id: SandboxActivationAttemptId,
     ) {
-        if let Err(error) = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-                SET activation_attempt_id = NULL,
-                    activation_attempt_expires_at = LEAST(activation_attempt_expires_at, NOW()),
-                    activation_attempt_target_state = NULL
-              WHERE sandbox_id = $1 AND generation = $2 AND active
-                AND activation_attempt_id = $3"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(generation)
-        .bind(activation_attempt_id)
-        .execute(&self.pool)
+        if let Err(error) = activation_fence::give_up_attempt(
+            &self.pool,
+            sandbox_id,
+            generation,
+            activation_attempt_id,
+        )
         .await
         {
             tracing::warn!(
@@ -293,26 +260,15 @@ impl K8sStore {
         generation: i64,
         activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
     ) -> Result<bool, SubstrateError> {
-        let changed = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions execution
-                SET activation_attempt_id = NULL,
-                    activation_attempt_expires_at = NULL,
-                    activation_attempt_target_state = NULL
-               FROM sandboxes sandbox
-              WHERE sandbox.id = execution.sandbox_id
-                AND execution.sandbox_id = $1
-                AND execution.generation = $2
-                AND execution.active
-                AND execution.activation_attempt_id = $3
-                AND LOWER(TRIM(sandbox.lifecycle)) IN ('suspended', 'restoring')"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(generation)
-        .bind(activation_attempt_id)
-        .execute(&self.pool)
+        let changed = activation_fence::abandon_attempt_superseded_by_suspend(
+            &self.pool,
+            sandbox_id,
+            generation,
+            activation_attempt_id,
+        )
         .await
         .db_context("failed to abandon suspend-superseded activation attempt")?;
-        Ok(changed.rows_affected() == 1)
+        Ok(changed == 1)
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn abandon_activation_attempt_superseded_by_suspend_best_effort(
@@ -347,26 +303,15 @@ impl K8sStore {
         target_state: SandboxTransitionTargetState,
         route_publication: ActivationRoutePublication,
     ) -> Result<pplx_space_sandbox_model::SandboxActivationAttemptId, SubstrateError> {
-        let current_attempt =
-            sqlx::query_as::<_, (Option<Uuid>, Option<String>, f64, Option<Uuid>)>(sql!(
-                "SELECT activation_attempt_id,
-                    activation_attempt_target_state,
-                    GREATEST(
-                        EXTRACT(EPOCH FROM (activation_attempt_expires_at - NOW())),
-                        0.0
-                    )::float8,
-                    route_activation_id
-               FROM sandbox_k8s_executions
-              WHERE sandbox_id = $1 AND generation = $2 AND active
-              FOR UPDATE"
-            ))
-            .bind(sandbox_id.as_uuid())
-            .bind(generation)
-            .fetch_optional(&mut *conn)
+        let current_attempt = activation_fence::lock_attempt_owner(conn, sandbox_id, generation)
             .await
             .db_context("failed to inspect activation attempt owner")?;
-        let Some((current_attempt_id, current_target, lease_remaining_secs, route_owner)) =
-            current_attempt
+        let Some(activation_fence::AttemptOwner {
+            activation_attempt_id: current_attempt_id,
+            activation_attempt_target_state: current_target,
+            lease_remaining_secs,
+            route_activation_id: route_owner,
+        }) = current_attempt
         else {
             return Err(SubstrateError::Conflict {
                 message: "execution changed before activation attempt assignment".to_string(),
@@ -419,73 +364,36 @@ impl K8sStore {
         };
         let assigned = match route_publication {
             ActivationRoutePublication::PreserveExisting => {
-                sqlx::query_scalar::<_, Uuid>(sql!(
-                    "UPDATE sandbox_k8s_executions
-                        SET activation_attempt_id = $3,
-                            activation_attempt_expires_at =
-                                NOW() + make_interval(secs => $5),
-                            activation_attempt_target_state = $4,
-                            updated_at = NOW()
-                      WHERE sandbox_id = $1
-                        AND generation = $2
-                        AND active
-                        AND route_activation_id IS NOT NULL
-                      RETURNING activation_attempt_id"
-                ))
-                .bind(sandbox_id.as_uuid())
-                .bind(generation)
-                .bind(activation_attempt_id)
-                .bind(target_state.as_str())
-                .bind(super::super::ACTIVATION_ATTEMPT_LEASE_TTL_SECS)
-                .fetch_optional(&mut *conn)
+                activation_fence::claim_attempt_with_published_route(
+                    &mut *conn,
+                    sandbox_id,
+                    generation,
+                    activation_attempt_id,
+                    target_state.as_str(),
+                    super::super::ACTIVATION_ATTEMPT_LEASE_TTL_SECS,
+                )
                 .await
             }
             ActivationRoutePublication::InitializeFirst => {
-                sqlx::query_scalar::<_, Uuid>(sql!(
-                    "UPDATE sandbox_k8s_executions
-                        SET activation_attempt_id = $3,
-                            route_activation_id = $3,
-                            activation_attempt_expires_at =
-                                NOW() + make_interval(secs => $5),
-                            activation_attempt_target_state = $4,
-                            updated_at = NOW()
-                      WHERE sandbox_id = $1
-                        AND generation = $2
-                        AND active
-                        AND state IN ('creating', 'recovering')
-                        AND NULLIF(BTRIM(pod_uid), '') IS NULL
-                        AND route_activation_id IS NULL
-                      RETURNING activation_attempt_id"
-                ))
-                .bind(sandbox_id.as_uuid())
-                .bind(generation)
-                .bind(activation_attempt_id)
-                .bind(target_state.as_str())
-                .bind(super::super::ACTIVATION_ATTEMPT_LEASE_TTL_SECS)
-                .fetch_optional(&mut *conn)
+                activation_fence::claim_attempt_initializing_route(
+                    &mut *conn,
+                    sandbox_id,
+                    generation,
+                    activation_attempt_id,
+                    target_state.as_str(),
+                    super::super::ACTIVATION_ATTEMPT_LEASE_TTL_SECS,
+                )
                 .await
             }
             ActivationRoutePublication::AdoptLegacyResident => {
-                sqlx::query_scalar::<_, Uuid>(sql!(
-                    "UPDATE sandbox_k8s_executions
-                        SET activation_attempt_id = $3,
-                            activation_attempt_expires_at =
-                                NOW() + make_interval(secs => $5),
-                            activation_attempt_target_state = $4,
-                            updated_at = NOW()
-                      WHERE sandbox_id = $1
-                        AND generation = $2
-                        AND active
-                        AND route_activation_id IS NULL
-                        AND NULLIF(BTRIM(pod_uid), '') IS NOT NULL
-                      RETURNING activation_attempt_id"
-                ))
-                .bind(sandbox_id.as_uuid())
-                .bind(generation)
-                .bind(activation_attempt_id)
-                .bind(target_state.as_str())
-                .bind(super::super::ACTIVATION_ATTEMPT_LEASE_TTL_SECS)
-                .fetch_optional(&mut *conn)
+                activation_fence::claim_attempt_adopting_legacy_route(
+                    &mut *conn,
+                    sandbox_id,
+                    generation,
+                    activation_attempt_id,
+                    target_state.as_str(),
+                    super::super::ACTIVATION_ATTEMPT_LEASE_TTL_SECS,
+                )
                 .await
             }
         }

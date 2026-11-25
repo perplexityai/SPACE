@@ -7,7 +7,14 @@
 //! caller keeps the transaction, any `lock_timeout` it sets, and the
 //! re-checks it runs under the lock. A lock that carries a guard, or that
 //! only one path takes, lives in a module named for that path.
+//!
+//! Each verb's doc names its lock mode. `FOR NO KEY UPDATE` still blocks
+//! other transactions' updates and deletes of the row, but not the
+//! `FOR KEY SHARE` lock that a child-row insert's foreign-key check takes,
+//! so a node publication's insert of a row that references the sandbox does
+//! not wait on a path that holds it.
 
+use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_model::SandboxId;
 
 use pplx_space_sql_locator::sql;
@@ -22,6 +29,31 @@ pub async fn lock_lifecycle(
 ) -> Result<Option<String>, sqlx::Error> {
     sqlx::query_scalar(sql!(
         "SELECT lifecycle FROM sandboxes WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(sandbox_id)
+    .fetch_optional(conn)
+    .await
+}
+
+/// What [`lock_lifecycle_with_active_node_drain`] reads, unparsed: the
+/// sandbox's stored lifecycle, then the `drain_engine`, `drain_phase` and
+/// `drain_mode` of the node it is active on (all NULL when it has none).
+pub type LifecycleWithActiveNodeDrain = (String, Option<String>, Option<String>, Option<String>);
+
+/// [`lock_lifecycle`] for a claim that also reads the drain columns of the
+/// node the sandbox is active on, in the same statement. It locks only the
+/// sandbox's row, `FOR UPDATE OF s`; `None` when the row is absent. The lock
+/// lasts until the caller's transaction ends.
+pub async fn lock_lifecycle_with_active_node_drain(
+    conn: &mut PgConnection,
+    sandbox_id: SandboxId,
+) -> Result<Option<LifecycleWithActiveNodeDrain>, sqlx::Error> {
+    sqlx::query_as(sql!(
+        "SELECT s.lifecycle, n.drain_engine, n.drain_phase, n.drain_mode
+           FROM sandboxes s
+           LEFT JOIN nodes n ON n.id = s.active_node_id
+          WHERE s.id = $1
+            FOR UPDATE OF s"
     ))
     .bind(sandbox_id)
     .fetch_optional(conn)
@@ -53,4 +85,37 @@ pub async fn lock_exists(
             .await?
             .is_some(),
     )
+}
+
+/// Lock the sandbox's row `FOR NO KEY UPDATE`; `None` when the row is absent.
+/// The lock lasts until the caller's transaction ends. Unlike `FOR UPDATE`,
+/// it lets a child-row insert's foreign-key check (`FOR KEY SHARE`) on the
+/// row through.
+pub async fn lock_id_no_key_update(
+    conn: &mut PgConnection,
+    sandbox_id: SandboxId,
+) -> Result<Option<SandboxId>, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT id FROM sandboxes WHERE id = $1 FOR NO KEY UPDATE"
+    ))
+    .bind(sandbox_id)
+    .fetch_optional(conn)
+    .await
+}
+
+/// Lock the sandbox's row `FOR NO KEY UPDATE` and return its active node:
+/// `None` when the row is absent, `Some(None)` when it has no active node.
+/// The lock lasts until the caller's transaction ends. Unlike `FOR UPDATE`,
+/// it lets a child-row insert's foreign-key check (`FOR KEY SHARE`) on the
+/// row through.
+pub async fn lock_active_node_id_no_key_update(
+    conn: &mut PgConnection,
+    sandbox_id: SandboxId,
+) -> Result<Option<Option<NodeId>>, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT active_node_id FROM sandboxes WHERE id = $1 FOR NO KEY UPDATE"
+    ))
+    .bind(sandbox_id)
+    .fetch_optional(conn)
+    .await
 }

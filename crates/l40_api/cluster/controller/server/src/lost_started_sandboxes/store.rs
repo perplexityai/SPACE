@@ -9,8 +9,9 @@ use pplx_space_sandbox_store::lost::{
     DEAD_UPLOAD_SETTLE, mark_started_lost, started_lost_candidates, write_off_lost_sandboxes,
 };
 use pplx_space_sandbox_store::row_locks;
-use pplx_space_snapshot_store::lost::fail_quiet_full_uploads_from_node;
-use pplx_space_sql_locator::sql;
+use pplx_space_snapshot_store::lost::{
+    fail_quiet_full_uploads_from_node, lock_creating_full_uploads,
+};
 use sqlx::PgPool;
 
 use super::{LostCandidate, LostStartedSink, SourceNode};
@@ -103,17 +104,8 @@ impl LostStartedSink for LostStartedDbStore {
         // the gone node isn't retried, so the flip lands and the uploaded
         // bytes are left for the storage sweeper: the residual the drained-node
         // give-up accepts for the same race.
-        let _locked_uploads: Vec<SnapshotId> = sqlx::query_scalar(sql!(
-            "SELECT id FROM snapshots
-              WHERE sandbox_id = $1
-                AND type = 'full'
-                AND state = 'creating'
-              ORDER BY id
-              FOR UPDATE"
-        ))
-        .bind(candidate.sandbox_id)
-        .fetch_all(&mut *tx)
-        .await?;
+        let _locked_uploads: Vec<SnapshotId> =
+            lock_creating_full_uploads(&mut tx, candidate.sandbox_id).await?;
 
         if !mark_started_lost(
             &mut tx,

@@ -35,7 +35,7 @@ impl FromStr for RuntimeUpgradeOperationId {
     }
 }
 
-/// Where an upgrade is. Only the forward edges in [`Self::can_advance_to`]
+/// Where an upgrade is. Only the forward edges in `Self::can_advance_to`
 /// and the rollback edge from a fencing phase exist.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeUpgradePhase {
@@ -76,7 +76,7 @@ impl RuntimeUpgradePhase {
     }
 
     /// Whether a row in this phase refuses other activations of its sandbox.
-    pub fn fences_activation(self) -> bool {
+    pub(crate) fn fences_activation(self) -> bool {
         FENCING_PHASES.contains(&self)
     }
 
@@ -370,7 +370,7 @@ db_private_outside_tests! {
 
 db_private_outside_tests! {
     /// The upgrade that fences `sandbox_id`'s activations, if any: one in a
-    /// phase of [`FENCING_PHASES`].
+    /// phase of `FENCING_PHASES`.
     fn fencing_runtime_upgrade(
         conn: &Connection,
         sandbox_id: &str,
@@ -823,14 +823,14 @@ pub fn bind_runtime_upgrade_consumer(
 /// `rolled_back`, releasing the fence. The caller restores the disk first.
 /// With `attempt_finality`, the same transaction records the rollback as the
 /// final outcome of the attempt the row runs as (see
-/// [`runtime_upgrade_attempt_outcome`]), so it's final for that attempt from
-/// the moment the operation's report names it, whether or not the preserved
-/// disk is ever discarded. An attempt that already has a final outcome keeps
-/// it. Without `attempt_finality`, or for a row written before attempts were
-/// recorded, no attempt's outcome is recorded. False, changing nothing, when
-/// the operation's row is now another sandbox's than `sandbox_id`: an
-/// operation id reused after the row was deleted, which only that sandbox's
-/// driver may settle.
+/// [`read::runtime_upgrade_attempt_outcome`]), so it's final for that attempt
+/// from the moment the operation's report names it, whether or not the
+/// preserved disk is ever discarded. An attempt that already has a final
+/// outcome keeps it. Without `attempt_finality`, or for a row written before
+/// attempts were recorded, no attempt's outcome is recorded. False, changing
+/// nothing, when the operation's row is now another sandbox's than
+/// `sandbox_id`: an operation id reused after the row was deleted, which only
+/// that sandbox's driver may settle.
 pub fn roll_back_runtime_upgrade_for_sandbox(
     conn: &Connection,
     operation_id: RuntimeUpgradeOperationId,
@@ -939,10 +939,10 @@ pub(super) fn verify_booting_runtime_upgrade(conn: &Connection, sandbox_id: &str
 /// [`RecordedRuntimeUpgradeOutcome::RolledBack`] outcome, at the time the
 /// rollback was recorded. The attempt's own final outcome, when attempt
 /// finality recorded one, was written with the rollback
-/// ([`roll_back_runtime_upgrade`]) and stays. An attempt whose final outcome
-/// is another one keeps it, and the operation's outcome is left as it
-/// stands, so the two never disagree about that attempt; the row is deleted
-/// either way.
+/// ([`roll_back_runtime_upgrade_for_sandbox`]) and stays. An attempt whose
+/// final outcome is another one keeps it, and the operation's outcome is left
+/// as it stands, so the two never disagree about that attempt; the row is
+/// deleted either way.
 /// False, changing nothing, when the operation's row is now another
 /// sandbox's than `sandbox_id`.
 pub fn finish_runtime_upgrade_rollback_for_sandbox(
@@ -1172,7 +1172,7 @@ pub enum AlreadyOnTargetRecord {
     /// What [`record_runtime_upgrade_already_on_target`] answers false for.
     NotRecorded,
     /// The sandbox is gone, no longer as `observed` saw it, or a cleanup owns
-    /// it ([`cleanup_owns`]): the target it was found on may be a copy the
+    /// it (`cleanup_owns`): the target it was found on may be a copy the
     /// cleanup is removing, so nothing is recorded and a retry decides again.
     SandboxMoved,
 }
@@ -1273,7 +1273,7 @@ fn cleanup_owns(conn: &Connection, sandbox: &SandboxRow) -> Result<bool> {
 /// `attempt_id` before it fenced anything, with `failure` as the reason, so the
 /// refusal is final for that attempt as a rollback is: it becomes the
 /// operation's outcome and the attempt's own (see
-/// [`runtime_upgrade_attempt_outcome`]). The caller records only a refusal a
+/// [`read::runtime_upgrade_attempt_outcome`]). The caller records only a refusal a
 /// retry can't change. False, recording nothing, when the attempt already has
 /// a final outcome of its own, the sandbox is gone from the node, a live
 /// upgrade row exists for the operation, its recorded outcome or a final
@@ -1286,7 +1286,7 @@ fn cleanup_owns(conn: &Connection, sandbox: &SandboxRow) -> Result<bool> {
 /// last activation: what
 /// the refusal said of the sandbox may no longer hold, and a retry decides it
 /// again. `None` for a refusal that doesn't depend on the sandbox's row.
-/// False too while a cleanup owns the sandbox ([`cleanup_owns`]), including
+/// False too while a cleanup owns the sandbox (`cleanup_owns`), including
 /// one admitted while the refusal was decided. The checks and the write are
 /// one transaction.
 pub fn record_runtime_upgrade_refusal(
@@ -1415,10 +1415,10 @@ fn already_on_target_for(
 }
 
 /// The final outcome the operation recorded for the attempt `attempt_id`:
-/// its rollback ([`roll_back_runtime_upgrade`]), its refusal before the
-/// fence ([`record_runtime_upgrade_refusal`]), or its refusal after the
-/// operation reached its target ([`record_runtime_upgrade_refused_attempt`]).
-/// An attempt has at most one.
+/// its rollback ([`roll_back_runtime_upgrade_for_sandbox`]), its refusal
+/// before the fence ([`record_runtime_upgrade_refusal`]), or its refusal
+/// after the operation reached its target
+/// ([`record_runtime_upgrade_refused_attempt`]). An attempt has at most one.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeUpgradeAttemptOutcome {
     pub outcome: RecordedAttemptOutcome,
@@ -1601,7 +1601,7 @@ db_private_outside_tests! {
 /// then, and when a final attempt outcome records the operation for another
 /// request. False too, keeping the recorded one, when the attempt already has
 /// a final outcome: a final row is never rewritten, so `recorded_seq` order
-/// is recording order (see [`latest_refused_attempt`]). The attempt's outcome
+/// is recording order (see `latest_refused_attempt`). The attempt's outcome
 /// keeps the request of the record that reached the target. False too when the
 /// sandbox's row isn't `decided_on`, the row the caller decided the refusal
 /// was final from (`None` when it found none): another start, stop or suspend
@@ -1610,7 +1610,7 @@ db_private_outside_tests! {
 /// reads: its runtime label, state, execution, route identity and pinned
 /// artifact, which a start or backup can pin without the upgrade's lock, so a
 /// checkpoint refusal can't outlive the pin it was decided from. False too
-/// while a cleanup owns the sandbox ([`cleanup_owns`]). The checks and the
+/// while a cleanup owns the sandbox (`cleanup_owns`). The checks and the
 /// write are one transaction.
 pub fn record_runtime_upgrade_refused_attempt(
     conn: &Connection,
@@ -1818,7 +1818,7 @@ pub struct RuntimeUpgradeReport {
     /// The attempt the reported outcome ran as, as its live row or recorded
     /// outcome names it; `None` for a row written before the node recorded
     /// attempts, or for a recorded outcome a store without attempts rewrote
-    /// since (see [`recorded_outcome_attempt`]).
+    /// since (see `recorded_outcome_attempt`).
     pub attempt_id: Option<String>,
     /// The latest attempt the operation refused after it reached its target,
     /// so the sandbox doesn't run for that attempt; see

@@ -19,7 +19,11 @@
 //! tables (`sandbox_k8s_executions`, `sandbox_port_exposures`,
 //! `sandbox_observed_states`, the quarantine and node-facet tables,
 //! `sandbox_snapshot_inventory`, `snapshot_storage_locations`): splitting one
-//! would change what it does. The caller owns the transaction, the other
+//! would change what it does. `sandbox_observed_states` and the node-facet
+//! tables are `pplx-space-sandbox-teardown`'s, and the quarantine tables
+//! `pplx-space-sandbox-quarantine-store`'s: the pause-failed recovery and the
+//! census prune write them under temporary co-writer grants in
+//! `ARCHITECTURE.toml`. The caller owns the transaction, the other
 //! tables' own statements and the events it emits, and takes the locking
 //! reads that select candidates, some of them through
 //! [`crate::quarantine_publication`].
@@ -50,9 +54,11 @@ use uuid::Uuid;
 /// The `jsonb_to_recordset` column list of one published sandbox row with
 /// its transition receipt, as the publish path serializes it.
 /// [`lock_suspended_projection_candidates`](crate::quarantine_publication::lock_suspended_projection_candidates)
-/// and a statement still in the internal API splice it as well, and its names
-/// must match the fields that path serializes: `jsonb_to_recordset` reads a
-/// missing field as NULL.
+/// splices it as well, and
+/// [`lock_activation_rollback_candidates`](crate::k8s_executions::quarantine_rollback::lock_activation_rollback_candidates)
+/// spells the same list out: change them together. Its names must match the
+/// fields that path serializes: `jsonb_to_recordset` reads a missing field
+/// as NULL.
 pub const TRANSITION_RECEIPT_RECORD_COLUMNS: &str = "
     sandbox_id UUID,
     published_lifecycle TEXT,

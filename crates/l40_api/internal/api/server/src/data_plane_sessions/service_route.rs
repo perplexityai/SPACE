@@ -3,6 +3,8 @@
 
 use super::*;
 
+pub(super) use sandbox_store::direct::route_reads::SandboxServiceRouteRow;
+
 pub(super) const SANDBOX_SERVICE_ROUTE_COMMAND_READY_RPC_TIMEOUT: Duration =
     Duration::from_secs(10);
 
@@ -11,24 +13,6 @@ pub(super) const SANDBOX_SERVICE_ROUTE_COMMAND_READY_WAIT_TIMEOUT: prost_types::
         seconds: 8,
         nanos: 0,
     };
-
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct SandboxServiceRouteRow {
-    pub(super) sandbox_id: SandboxId,
-    pub(super) org_id: OrgId,
-    pub(super) template_id: Option<String>,
-    pub(super) lifecycle: String,
-    pub(super) active_node_id: Option<NodeId>,
-    pub(super) node_address: Option<String>,
-    pub(super) node_managed_by: Option<NodeManagedBy>,
-    pub(super) k8s_node_name: Option<String>,
-    pub(super) direct_node_api_endpoint: Option<String>,
-    pub(super) sandbox_pod_uid: Option<PodUid>,
-    pub(super) execution_generation: Option<ExecutionGeneration>,
-    pub(super) activation_attempt_id: Option<SandboxActivationAttemptId>,
-    pub(super) ecw_credential_epoch: EcwCredentialEpoch,
-    pub(super) command_ready_pending: bool,
-}
 
 pub(crate) async fn unstable_resolve_sandbox_service_route(
     budget: Duration,

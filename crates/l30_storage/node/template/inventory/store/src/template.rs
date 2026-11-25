@@ -229,3 +229,6 @@ where
     .fetch_all(executor)
     .await
 }
+
+#[cfg(test)]
+mod inventory_rows_tests;

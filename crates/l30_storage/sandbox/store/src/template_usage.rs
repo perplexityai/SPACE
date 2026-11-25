@@ -36,3 +36,6 @@ pub async fn template_sandboxes_in_use(
         .fetch_one(executor)
         .await
 }
+
+#[cfg(test)]
+mod in_use_tests;

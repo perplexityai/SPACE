@@ -2,6 +2,7 @@
 //! active execution of a sandbox, plus abandoning unmaterialized create claims.
 
 use super::*;
+use pplx_space_node_model::NodeDrain;
 
 impl K8sStore {
     pub(super) fn execution_pod_name(sandbox_id: SandboxId, generation: i64) -> String {
@@ -28,21 +29,12 @@ impl K8sStore {
         sandbox_id: SandboxId,
     ) -> Result<(), SubstrateError> {
         let pod_name = Self::execution_pod_name(sandbox_id, 1);
-        sqlx::query(sql!(
-            "INSERT INTO sandbox_k8s_executions (
-                 sandbox_id, generation, pod_name, pod_namespace, state, active,
-                 terminated_at
-             )
-             SELECT $1, 1, $2, $3, 'replaced', FALSE, NOW()
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM sandbox_k8s_executions WHERE sandbox_id = $1
-             )
-             ON CONFLICT DO NOTHING"
-        ))
-        .bind(sandbox_id)
-        .bind(&pod_name)
-        .bind(&self.namespace)
-        .execute(&self.pool)
+        pplx_space_sandbox_store::k8s_executions::claim::retire_pool_reserved_generation(
+            &self.pool,
+            sandbox_id,
+            &pod_name,
+            &self.namespace,
+        )
         .await
         .db_context("failed to retire the pool-reserved execution generation")?;
         Ok(())
@@ -69,35 +61,26 @@ impl K8sStore {
         sandbox_id: SandboxId,
     ) -> Result<SandboxExecutionClaim, SubstrateError> {
         let sandbox_uuid = sandbox_id;
-        // `pplx_space_sandbox_store::k8s_executions::unclaimed_generation`
-        // mirrors this allocation as a lock-free hint; change them together.
-        let generation = sqlx::query_scalar::<_, i64>(sql!(
-            "SELECT COALESCE(MAX(generation), 0) + 1
-             FROM sandbox_k8s_executions
-             WHERE sandbox_id = $1"
-        ))
-        .bind(sandbox_uuid)
-        .fetch_one(&mut *conn)
+        // The minted generation is correct only under the caller's sandbox
+        // row lock with the insert below run next in this transaction; see
+        // `pplx_space_sandbox_store::k8s_executions::claim::mint_generation`.
+        let generation = pplx_space_sandbox_store::k8s_executions::claim::mint_generation(
+            &mut *conn,
+            sandbox_uuid,
+        )
         .await
         .db_context("failed to allocate Kubernetes execution generation")?;
         let pod_name = Self::execution_pod_name(sandbox_uuid, generation);
 
-        let row = sqlx::query_as::<_, SandboxExecutionRow>(sql!(
-            "INSERT INTO sandbox_k8s_executions (
-                 sandbox_id, generation, pod_name, pod_namespace, state, active
-             )
-             VALUES ($1, $2, $3, $4, 'creating', TRUE)
-             ON CONFLICT DO NOTHING
-             RETURNING generation, pod_name, FALSE AS pod_materialized, state,
-                       FALSE AS create_age_expired, activation_attempt_id,
-                       route_activation_id"
-        ))
-        .bind(sandbox_uuid)
-        .bind(generation)
-        .bind(&pod_name)
-        .bind(&self.namespace)
-        .fetch_optional(&mut *conn)
+        let row = pplx_space_sandbox_store::k8s_executions::claim::insert_creating_claim(
+            &mut *conn,
+            sandbox_uuid,
+            generation,
+            &pod_name,
+            &self.namespace,
+        )
         .await
+        .and_then(|record| record.map(SandboxExecutionRow::try_from).transpose())
         .db_context("failed to insert Kubernetes execution row")?;
 
         let created = row.is_some();
@@ -120,7 +103,7 @@ impl K8sStore {
 
     /// Apply the pod metadata update to the (caller-locked) active execution
     /// row. Callers must have taken the row lock first
-    /// (`lock_active_execution_state_in`) — the guarded UPDATE alone cannot
+    /// (`lock_tracked_pod_in`) — the guarded UPDATE alone cannot
     /// distinguish "row already current" from "row retired underneath".
     ///
     /// Stamps `pod_materialized_at` when the row records a pod UID, or held
@@ -137,75 +120,9 @@ impl K8sStore {
         pod_uid: Option<&str>,
         pod_ip: Option<&str>,
     ) -> Result<(), SubstrateError> {
-        sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-             SET pod_uid = $1::TEXT,
-                 pod_ip = $2::INET,
-                 pod_materialized_at = COALESCE(
-                     pod_materialized_at,
-                     CASE
-                         WHEN NULLIF(BTRIM(pod_uid), '') IS NOT NULL
-                           OR NULLIF(BTRIM($1::TEXT), '') IS NOT NULL
-                         THEN NOW()
-                     END
-                 ),
-                 state = CASE
-                     WHEN state = 'recovering' THEN state
-                     WHEN NOT (
-                         pod_uid IS DISTINCT FROM $1::TEXT
-                         OR pod_ip IS DISTINCT FROM $2::INET
-                         OR (
-                             state NOT IN ('running', 'recovering')
-                             AND (
-                                 $2::TEXT IS NOT NULL
-                                 OR ($1::TEXT IS NOT NULL AND state <> 'created')
-                             )
-                         )
-                     ) THEN state
-                     WHEN $2::TEXT IS NOT NULL THEN 'running'
-                     WHEN $1::TEXT IS NOT NULL THEN 'created'
-                     ELSE state
-                 END,
-                 updated_at = CASE
-                     WHEN state = 'recovering' THEN updated_at
-                     WHEN NOT (
-                         pod_uid IS DISTINCT FROM $1::TEXT
-                         OR pod_ip IS DISTINCT FROM $2::INET
-                         OR (
-                             state NOT IN ('running', 'recovering')
-                             AND (
-                                 $2::TEXT IS NOT NULL
-                                 OR ($1::TEXT IS NOT NULL AND state <> 'created')
-                             )
-                         )
-                     ) THEN updated_at
-                     ELSE NOW()
-                 END
-             WHERE sandbox_id = $3 AND generation = $4 AND active
-               AND (
-                 pod_uid IS DISTINCT FROM $1::TEXT
-                 OR pod_ip IS DISTINCT FROM $2::INET
-                 OR (
-                     state NOT IN ('running', 'recovering')
-                     AND (
-                         $2::TEXT IS NOT NULL
-                         OR ($1::TEXT IS NOT NULL AND state <> 'created')
-                     )
-                 )
-                 OR (
-                     pod_materialized_at IS NULL
-                     AND (
-                         NULLIF(BTRIM(pod_uid), '') IS NOT NULL
-                         OR NULLIF(BTRIM($1::TEXT), '') IS NOT NULL
-                     )
-                 )
-               )"
-        ))
-        .bind(pod_uid)
-        .bind(pod_ip)
-        .bind(sandbox_id)
-        .bind(generation)
-        .execute(conn)
+        pplx_space_sandbox_store::k8s_executions::materialize::record_pod_metadata(
+            conn, sandbox_id, generation, pod_uid, pod_ip,
+        )
         .await
         .db_context("failed to persist pod metadata")?;
         Ok(())
@@ -222,15 +139,9 @@ impl K8sStore {
         sandbox_id: SandboxId,
         generation: i64,
     ) -> Result<Option<ActiveExecutionState>, SubstrateError> {
-        let state: Option<String> = sqlx::query_scalar(sql!(
-            "SELECT state
-             FROM sandbox_k8s_executions
-             WHERE sandbox_id = $1 AND generation = $2 AND active
-             FOR UPDATE"
-        ))
-        .bind(sandbox_id)
-        .bind(generation)
-        .fetch_optional(&mut *conn)
+        let state = pplx_space_sandbox_store::k8s_executions::transition::lock_active_state(
+            &mut *conn, sandbox_id, generation,
+        )
         .await
         .db_context("failed to lock active Kubernetes execution row")?;
         state
@@ -250,24 +161,9 @@ impl K8sStore {
         sandbox_id: SandboxId,
         node_name: &str,
     ) -> Result<bool, SubstrateError> {
-        sqlx::query_scalar::<_, bool>(sql!(
-            "WITH updated AS (
-                UPDATE sandbox_k8s_executions
-                SET k8s_node_name = $1::TEXT,
-                    updated_at = CASE WHEN state = 'recovering' THEN updated_at ELSE NOW() END
-                WHERE sandbox_id = $2 AND active
-                  AND k8s_node_name IS DISTINCT FROM $1::TEXT
-                RETURNING 1
-             )
-             SELECT EXISTS (
-                SELECT 1
-                FROM sandbox_k8s_executions
-                WHERE sandbox_id = $2 AND active
-             )"
-        ))
-        .bind(node_name)
-        .bind(sandbox_id)
-        .fetch_one(conn)
+        pplx_space_sandbox_store::k8s_executions::materialize::record_node_name(
+            conn, sandbox_id, node_name,
+        )
         .await
         .db_context("failed to persist sandbox pod node name")
     }
@@ -278,18 +174,9 @@ impl K8sStore {
         sandbox_id: SandboxId,
         state: &str,
     ) -> Result<(), SubstrateError> {
-        sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-             SET active = FALSE,
-                 state = $1,
-                 pod_ip = NULL,
-                 terminated_at = COALESCE(terminated_at, NOW()),
-                 updated_at = NOW()
-             WHERE sandbox_id = $2 AND active"
-        ))
-        .bind(state)
-        .bind(sandbox_id)
-        .execute(&mut **tx)
+        pplx_space_sandbox_store::k8s_executions::retire::finish_active(
+            &mut **tx, sandbox_id, state,
+        )
         .await
         .db_context("failed to finish active Kubernetes execution")?;
         self.invalidate_open_port_exposure_observations_in(tx, sandbox_id)
@@ -346,31 +233,19 @@ impl K8sStore {
     ) -> Result<bool, SubstrateError> {
         let (generation, activation_attempt_id, pod_uid, route_activation_id) =
             Self::identity_binds(identity);
-        let finished = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-             SET active = FALSE,
-                 state = $1,
-                 pod_ip = NULL,
-                 terminated_at = COALESCE(terminated_at, NOW()),
-                 updated_at = NOW()
-             WHERE sandbox_id = $2
-               AND active
-               AND generation IS NOT DISTINCT FROM $3
-               AND activation_attempt_id IS NOT DISTINCT FROM $4
-               AND NULLIF(BTRIM(pod_uid), '') IS NOT DISTINCT FROM $5::TEXT
-               AND route_activation_id IS NOT DISTINCT FROM $6"
-        ))
-        .bind(state)
-        .bind(sandbox_id)
-        .bind(generation)
-        .bind(activation_attempt_id)
-        .bind(pod_uid)
-        .bind(route_activation_id)
-        .execute(&mut **tx)
+        let finished = pplx_space_sandbox_store::k8s_executions::retire::finish_fenced(
+            &mut **tx,
+            sandbox_id,
+            pplx_space_sandbox_store::k8s_executions::retire::ExecutionFence {
+                generation,
+                activation_attempt_id,
+                pod_uid: pod_uid.as_deref(),
+                route_activation_id,
+            },
+            state,
+        )
         .await
-        .db_context("failed to finish fenced Kubernetes execution")?
-        .rows_affected()
-            > 0;
+        .db_context("failed to finish fenced Kubernetes execution")?;
         if finished {
             self.invalidate_open_port_exposure_observations_in(tx, sandbox_id)
                 .await?;
@@ -385,23 +260,11 @@ impl K8sStore {
         generation: i64,
         state: &str,
     ) -> Result<bool, SubstrateError> {
-        let finished = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-             SET active = FALSE,
-                 state = $1,
-                 pod_ip = NULL,
-                 terminated_at = COALESCE(terminated_at, NOW()),
-                 updated_at = NOW()
-             WHERE sandbox_id = $2 AND active AND generation = $3"
-        ))
-        .bind(state)
-        .bind(sandbox_id)
-        .bind(generation)
-        .execute(&mut **tx)
+        let finished = pplx_space_sandbox_store::k8s_executions::retire::finish_generation(
+            &mut **tx, sandbox_id, generation, state,
+        )
         .await
-        .db_context("failed to finish active Kubernetes execution")?
-        .rows_affected()
-            > 0;
+        .db_context("failed to finish active Kubernetes execution")?;
         if finished {
             self.invalidate_open_port_exposure_observations_in(tx, sandbox_id)
                 .await?;
@@ -417,27 +280,15 @@ impl K8sStore {
         activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
         state: &str,
     ) -> Result<bool, SubstrateError> {
-        let finished = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-             SET active = FALSE,
-                 state = $1,
-                 pod_ip = NULL,
-                 terminated_at = COALESCE(terminated_at, NOW()),
-                 updated_at = NOW()
-             WHERE sandbox_id = $2
-               AND active
-               AND generation = $3
-               AND activation_attempt_id = $4"
-        ))
-        .bind(state)
-        .bind(sandbox_id)
-        .bind(generation)
-        .bind(activation_attempt_id)
-        .execute(&mut **tx)
+        let finished = pplx_space_sandbox_store::k8s_executions::retire::finish_generation_attempt(
+            &mut **tx,
+            sandbox_id,
+            generation,
+            activation_attempt_id,
+            state,
+        )
         .await
-        .db_context("failed to finish activation-fenced Kubernetes execution")?
-        .rows_affected()
-            > 0;
+        .db_context("failed to finish activation-fenced Kubernetes execution")?;
         if finished {
             self.invalidate_open_port_exposure_observations_in(tx, sandbox_id)
                 .await?;
@@ -573,6 +424,76 @@ impl K8sStore {
             .transpose()
     }
 
+    /// The orphaned-seal detector: after a node refused an activation of
+    /// `sandbox_id` as sealed, check that Postgres records a v2 drain of the
+    /// node the sandbox is active on (or targeted at). When it records none,
+    /// the node's seal is orphaned, which nothing heals on its own: warn and
+    /// count it (`node_drain.v2.orphaned_seal_refusals`). Only a sealed
+    /// refusal runs this statement, and a failure to read is logged.
+    pub(in crate::controllers::substrate::kubernetes) async fn note_sealed_refusal(
+        &self,
+        sandbox_id: SandboxId,
+        node_said: &str,
+    ) {
+        let row: Result<Option<(Option<NodeId>, bool)>, sqlx::Error> = sqlx::query_as(sql!(
+            "SELECT n.id, COALESCE(n.drain_engine = 'v2', FALSE)
+               FROM sandboxes s
+               LEFT JOIN nodes n ON n.id = COALESCE(s.active_node_id, s.target_node_id)
+              WHERE s.id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_optional(&self.pool)
+        .await;
+        match row {
+            Ok(Some((Some(node_id), false))) => {
+                tracing::warn!(
+                    %node_id,
+                    %sandbox_id,
+                    node_said,
+                    "a node refused an activation as sealed, but no v2 drain of it is recorded: \
+                     an orphaned seal; with drain v2 on, a :drain {{engine: v2}} then :undrain \
+                     heals it, and otherwise the node-api's DrainNode {{generation, Cancel}} \
+                     under the seal's generation"
+                );
+                crate::metrics::node_drain::v2_orphaned_seal_refusal(&node_id.to_string());
+            }
+            Ok(_) => {}
+            Err(error) => tracing::debug!(
+                %sandbox_id,
+                %error,
+                "reading the drain of a node that refused an activation as sealed failed"
+            ),
+        }
+    }
+
+    /// [`Self::lock_sandbox_execution_lifecycle_in`] for a claim that may
+    /// boot the sandbox's VM somewhere: the same one statement, which also
+    /// reads the drain of the node the sandbox is active on, from its shared
+    /// columns ([`NodeDrain::from_columns`]). It locks only the sandbox row.
+    pub(super) async fn lock_sandbox_for_claim_in(
+        conn: &mut PgConnection,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<(SandboxLifecycle, Option<NodeDrain>)>, SubstrateError> {
+        let row = pplx_space_sandbox_store::row_locks::lock_lifecycle_with_active_node_drain(
+            conn, sandbox_id,
+        )
+        .await
+        .db_context("failed to lock sandbox for execution materialization")?;
+        row.map(|(lifecycle, engine, phase, mode)| {
+            let lifecycle =
+                lifecycle
+                    .parse::<SandboxLifecycle>()
+                    .map_err(|err| SubstrateError::Failed {
+                        message: format!("failed to parse sandbox execution lifecycle: {err}"),
+                    })?;
+            Ok((
+                lifecycle,
+                NodeDrain::from_columns(engine.as_deref(), phase.as_deref(), mode.as_deref()),
+            ))
+        })
+        .transpose()
+    }
+
     pub(super) async fn lock_sandbox_for_execution_lifecycle_in(
         conn: &mut PgConnection,
         sandbox_id: SandboxId,
@@ -658,8 +579,23 @@ impl K8sStore {
             .await
             .db_context("failed to start Kubernetes materialization transaction")?;
 
-        Self::lock_sandbox_for_execution_lifecycle_in(&mut tx, sandbox_id, expected_lifecycle)
-            .await?;
+        let Some((lifecycle, drain)) = Self::lock_sandbox_for_claim_in(&mut tx, sandbox_id).await?
+        else {
+            return Err(SubstrateError::NotFound {
+                message: format!("sandbox not found: {sandbox_id}"),
+            });
+        };
+        if lifecycle == SandboxLifecycle::Suspending {
+            return Err(SubstrateError::suspend_in_flight(sandbox_id));
+        }
+        if lifecycle != expected_lifecycle {
+            return Err(SubstrateError::Conflict {
+                message: format!(
+                    "sandbox cannot materialize a {expected_lifecycle} execution while lifecycle is {lifecycle}"
+                ),
+            });
+        }
+        refuse_started_recovery_under_v2_drain(sandbox_id, lifecycle, drain)?;
         if let Some(restore_lease_token) = restore_lease_token {
             let renewed = pplx_space_sandbox_store::wake::renew_restore_lease_for_execution_claim(
                 &mut *tx,
@@ -790,19 +726,16 @@ impl K8sStore {
             .ensure_active_execution_claim_in(&mut tx, sandbox_id, activation_attempt)
             .await?;
         if recovery_in_flight {
-            let marked = sqlx::query(sql!(
-                "UPDATE sandbox_k8s_executions
-                 SET state = $3, updated_at = NOW()
-                 WHERE sandbox_id = $1 AND generation = $2 AND active AND state = $4"
-            ))
-            .bind(sandbox_uuid)
-            .bind(claim.row.generation)
-            .bind(ActiveExecutionState::Recovering.as_str())
-            .bind(ActiveExecutionState::Creating.as_str())
-            .execute(&mut *tx)
-            .await
-            .db_context("failed to preserve recovery on replacement execution")?
-            .rows_affected();
+            let marked =
+                pplx_space_sandbox_store::k8s_executions::transition::compare_and_set_active_state(
+                    &mut *tx,
+                    sandbox_uuid,
+                    claim.row.generation,
+                    ActiveExecutionState::Recovering.as_str(),
+                    ActiveExecutionState::Creating.as_str(),
+                )
+                .await
+                .db_context("failed to preserve recovery on replacement execution")?;
             if marked != 1 {
                 return Err(SubstrateError::Failed {
                     message: "failed to preserve recovery on replacement execution".to_string(),
@@ -926,28 +859,15 @@ impl K8sStore {
                 .db_context("failed to commit Kubernetes create claim transaction")?;
             return Ok(false);
         }
-        let abandoned = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-             SET active = FALSE,
-                 state = 'replaced',
-                 terminated_at = COALESCE(terminated_at, NOW()),
-                 updated_at = NOW()
-             WHERE sandbox_id = $1
-               AND active
-               AND generation = $2
-               AND activation_attempt_id IS NOT DISTINCT FROM $3
-               AND state = 'creating'
-               AND pod_uid IS NULL
-               AND pod_ip IS NULL"
-        ))
-        .bind(sandbox_id)
-        .bind(generation)
-        .bind(activation_attempt_id)
-        .execute(&mut *tx)
-        .await
-        .db_context("failed to abandon Kubernetes create claim")?
-        .rows_affected()
-            > 0;
+        let abandoned =
+            pplx_space_sandbox_store::k8s_executions::retire::abandon_unmaterialized_create_claim(
+                &mut *tx,
+                sandbox_id,
+                generation,
+                activation_attempt_id,
+            )
+            .await
+            .db_context("failed to abandon Kubernetes create claim")?;
         if abandoned {
             self.invalidate_open_port_exposure_observations_in(&mut tx, sandbox_id)
                 .await?;
@@ -1019,31 +939,14 @@ impl K8sStore {
         }
         // Clearing the pod UID stamps `pod_materialized_at` first if the row
         // held one, so the record that a pod ran outlives the UID.
-        let reset = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-             SET pod_uid = NULL,
-                 pod_ip = NULL,
-                 pod_materialized_at = COALESCE(
-                     pod_materialized_at,
-                     CASE WHEN NULLIF(BTRIM(pod_uid), '') IS NOT NULL THEN NOW() END
-                 ),
-                 state = 'creating',
-                 updated_at = NOW()
-             WHERE sandbox_id = $1
-               AND active
-               AND generation = $2
-               AND activation_attempt_id IS NOT DISTINCT FROM $3
-               AND pod_ip IS NULL
-               AND state IN ('creating', 'created')"
-        ))
-        .bind(sandbox_id)
-        .bind(generation)
-        .bind(activation_attempt_id)
-        .execute(&mut *tx)
+        let reset = pplx_space_sandbox_store::k8s_executions::claim::reset_to_creating(
+            &mut *tx,
+            sandbox_id,
+            generation,
+            activation_attempt_id,
+        )
         .await
-        .db_context("failed to reset create claim to creating")?
-        .rows_affected()
-            > 0;
+        .db_context("failed to reset create claim to creating")?;
         tx.commit()
             .await
             .db_context("failed to commit create claim reset transaction")?;
@@ -1074,5 +977,35 @@ impl K8sStore {
         .await
         .and_then(|status| status.map(ActiveExecutionStatusRow::try_from).transpose())
         .db_context("failed to query pod metadata")
+    }
+}
+
+/// The recovery gate: a claim that would materialize a `started` sandbox's
+/// execution anew, its VM cold-booted wherever the pod lands, is refused
+/// while the node the row is active on is under a v2 drain, in any phase,
+/// its cancel included, or a drain this build doesn't know. While that node
+/// suspends the sandbox the row still reads `started`, and a call in that
+/// window must never boot it elsewhere: the refusal is the drain's
+/// retryable 503 ([`SubstrateError::NodeSealed`]), and the retried call
+/// finds the sandbox suspended and restores it from its snapshot. A v1
+/// drain's claim is not refused here; its own gates decide, as they did.
+pub(super) fn refuse_started_recovery_under_v2_drain(
+    sandbox_id: SandboxId,
+    lifecycle: SandboxLifecycle,
+    drain: Option<NodeDrain>,
+) -> Result<(), SubstrateError> {
+    match drain {
+        Some(drain @ (NodeDrain::V2 { .. } | NodeDrain::Unknown))
+            if lifecycle == SandboxLifecycle::Started =>
+        {
+            Err(SubstrateError::NodeSealed {
+                message: format!(
+                    "sandbox {sandbox_id} is started on a node that is {drain} in a v2 drain, \
+                     which may be suspending it; its runtime is not recovered elsewhere \
+                     meanwhile; retry shortly"
+                ),
+            })
+        }
+        _ => Ok(()),
     }
 }

@@ -1,7 +1,7 @@
 //! The sandbox row locks at the store layer: what each returns, that a
-//! matched lock lasts until the caller's transaction ends, and that a
-//! guarded lock takes no lock on a row whose guard already fails when the
-//! statement reads it.
+//! matched lock lasts until the caller's transaction ends in the mode its
+//! verb names, and that a guarded lock takes no lock on a row whose guard
+//! already fails when the statement reads it.
 use super::*;
 use crate::{restore_dispatch_fence, restore_lease, row_locks, suspend};
 use pplx_space_snapshot_model::ArtifactKind;
@@ -29,6 +29,21 @@ async fn key_share_blocked(pool: &PgPool, id: Uuid) -> TestResult<bool> {
     let mut probe = pool.begin().await?;
     let result = sqlx::query(sql!(
         "SELECT 1 FROM sandboxes WHERE id = $1 FOR KEY SHARE NOWAIT"
+    ))
+    .bind(id)
+    .fetch_optional(&mut *probe)
+    .await;
+    probe.rollback().await?;
+    lock_not_available(result)
+}
+
+/// Whether another transaction's `FOR SHARE NOWAIT` on the row fails with
+/// `lock_not_available`. `FOR NO KEY UPDATE` and `FOR UPDATE` refuse it, so
+/// with [`key_share_blocked`] it pins a `FOR NO KEY UPDATE` lock exactly.
+async fn share_blocked(pool: &PgPool, id: Uuid) -> TestResult<bool> {
+    let mut probe = pool.begin().await?;
+    let result = sqlx::query(sql!(
+        "SELECT 1 FROM sandboxes WHERE id = $1 FOR SHARE NOWAIT"
     ))
     .bind(id)
     .fetch_optional(&mut *probe)
@@ -89,6 +104,78 @@ async fn id_only_row_locks_report_the_row_and_hold_until_the_transaction_ends() 
     assert!(row_locks::lock_exists(&mut tx, sandbox).await?);
     assert!(row_locked(&db.pool, id).await?);
     assert!(key_share_blocked(&db.pool, id).await?);
+    tx.rollback().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn no_key_update_row_locks_report_the_row_and_let_key_share_through_until_the_transaction_ends()
+-> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let node_id = NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '10.0.0.10', 'worker', 'k8s', 'ready')"
+    ))
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    let placed = insert_sandbox(pool, None, "started").await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET active_node_id = $2 WHERE id = $1"
+    ))
+    .bind(placed)
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    let placed_id = SandboxId::from_uuid(placed);
+    let unplaced = insert_sandbox(pool, None, "started").await?;
+    let unplaced_id = SandboxId::from_uuid(unplaced);
+    let missing = SandboxId::new();
+
+    // A `FOR SHARE` probe is refused and a `FOR KEY SHARE` one, the lock a
+    // child-row insert's foreign-key check takes, is not: exactly
+    // `FOR NO KEY UPDATE`.
+    let mut tx = pool.begin().await?;
+    assert_eq!(
+        row_locks::lock_id_no_key_update(&mut tx, placed_id).await?,
+        Some(placed_id)
+    );
+    assert!(share_blocked(pool, placed).await?);
+    assert!(!key_share_blocked(pool, placed).await?);
+    assert_eq!(
+        row_locks::lock_id_no_key_update(&mut tx, missing).await?,
+        None
+    );
+    assert!(share_blocked(pool, placed).await?);
+    tx.commit().await?;
+    assert!(!share_blocked(pool, placed).await?);
+    assert!(!key_share_blocked(pool, placed).await?);
+
+    // A row with no active node is locked too, and reads `Some(None)`.
+    for (sandbox, id, active_node) in [
+        (placed_id, placed, Some(node_id)),
+        (unplaced_id, unplaced, None),
+    ] {
+        let mut tx = pool.begin().await?;
+        assert_eq!(
+            row_locks::lock_active_node_id_no_key_update(&mut tx, sandbox).await?,
+            Some(active_node)
+        );
+        assert!(share_blocked(pool, id).await?);
+        assert!(!key_share_blocked(pool, id).await?);
+        tx.rollback().await?;
+        assert!(!share_blocked(pool, id).await?);
+        assert!(!key_share_blocked(pool, id).await?);
+    }
+    let mut tx = pool.begin().await?;
+    assert_eq!(
+        row_locks::lock_active_node_id_no_key_update(&mut tx, missing).await?,
+        None
+    );
     tx.rollback().await?;
     Ok(())
 }

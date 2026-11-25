@@ -5,6 +5,7 @@ use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 use super::*;
 use crate::fork_operations::{ForkRequest, ForkTargetConfig};
 use pplx_space_db_test_fixtures::try_pg_test_db;
+use pplx_space_sql_locator::sql;
 use sqlx::types::Json;
 
 #[test]

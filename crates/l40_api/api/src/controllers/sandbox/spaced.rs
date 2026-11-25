@@ -5,13 +5,12 @@ use pplx_space_api_route::{
     ed25519::insert_space_api_route_ed25519_token,
 };
 use pplx_space_guest_process::{GuestUserName, ProcessId};
-use pplx_space_k8s_ids::PodUid;
 use pplx_space_node_api_client::NodeApiOperationBudget;
-use pplx_space_node_model::{NodeManagedBy, SubstrateKind};
+use pplx_space_node_model::SubstrateKind;
 use pplx_space_sandbox_model::{
-    ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId,
-    SandboxRouteIdentity,
+    ExecutionGeneration, RouteGeneration, SandboxId, SandboxRouteIdentity,
 };
+use pplx_space_sandbox_store as sandbox_store;
 use std::future::Future;
 use tonic::Code;
 
@@ -139,6 +138,17 @@ impl SandboxController {
         })
     }
 
+    /// A spaced client for a runtime already reachable: it neither recovers
+    /// nor wakes the sandbox, and answers 503 when nothing is reachable.
+    ///
+    /// The drain gate still sees it as a `spaced` call, so under a v2 drain
+    /// that refuses activations (the gate reads no deadline) it is refused
+    /// on a sandbox that isn't `started`
+    /// although this connect activates nothing. That is on purpose: the
+    /// refusal names the caller's action as every other spaced call's does,
+    /// where another action's name would mislabel a forced drain's 409, and
+    /// the call it serves needs a running sandbox anyway. Its mid-stream
+    /// reconnect can recover a lost pod and passes the gate again.
     pub(super) async fn reachable_spaced_client(
         &self,
         pool: &PgPool,
@@ -757,52 +767,17 @@ fn complete_space_api_route_identity(
     .map_err(|error| ControllerError::internal(error.to_string()))
 }
 
-#[derive(sqlx::FromRow)]
-struct AuthoritativeRouteIdentityRow {
-    active_node_id: Option<NodeId>,
-    active_node_managed_by: Option<NodeManagedBy>,
-    active_execution_generation: Option<i64>,
-    active_pod_uid: Option<PodUid>,
-    active_activation_attempt_id: Option<SandboxActivationAttemptId>,
-}
-
 async fn fetch_authoritative_route_sandbox(
     pool: &PgPool,
     sandbox: &Sandbox,
 ) -> Result<Sandbox, ControllerError> {
-    let route_identity = sqlx::query_as::<_, AuthoritativeRouteIdentityRow>(sql!(
-        "SELECT COALESCE(direct_route.current_node_id, s.active_node_id) AS active_node_id,
-                COALESCE(direct_route.substrate_kind, active_node.managed_by)
-                    AS active_node_managed_by,
-                COALESCE(active_execution.generation, direct_route.execution_generation)
-                    AS active_execution_generation,
-                COALESCE(active_execution.pod_uid, direct_route.pod_uid) AS active_pod_uid,
-                COALESCE(
-                    active_execution.route_activation_id,
-                    direct_route.activation_attempt_id
-                ) AS active_activation_attempt_id
-         FROM sandboxes s
-         LEFT JOIN sandbox_direct_route_identities direct_route
-             ON direct_route.sandbox_id = s.id
-         LEFT JOIN nodes active_node
-             ON active_node.id = COALESCE(direct_route.current_node_id, s.active_node_id)
-         LEFT JOIN LATERAL (
-             SELECT e.generation,
-                    NULLIF(BTRIM(e.pod_uid), '') AS pod_uid,
-                    e.route_activation_id
-             FROM sandbox_k8s_executions e
-             WHERE e.sandbox_id = s.id
-               AND e.active
-             ORDER BY e.generation DESC
-             LIMIT 1
-         ) active_execution ON TRUE
-         WHERE s.id = $1"
-    ))
-    .bind(sandbox.id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|error| db_contention_error("reload authoritative sandbox route identity", &error))?
-    .ok_or_else(|| ControllerError::not_found("sandbox no longer exists"))?;
+    let route_identity =
+        sandbox_store::direct::route_reads::authoritative_route_identity(pool, sandbox.id)
+            .await
+            .map_err(|error| {
+                db_contention_error("reload authoritative sandbox route identity", &error)
+            })?
+            .ok_or_else(|| ControllerError::not_found("sandbox no longer exists"))?;
 
     let mut authoritative = sandbox.clone();
     authoritative.active_node_id = route_identity.active_node_id;

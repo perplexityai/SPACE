@@ -68,7 +68,7 @@ impl TwinMetadataTarget {
     /// `template_name` and `hash`.
     ///
     /// A location outside the release's build directory still parses, so its
-    /// shared metadata can be read, but [`Self::twin_metadata_key`] refuses
+    /// shared metadata can be read, but the twin-metadata key is refused for
     /// it.
     ///
     /// An endpoint override must be an `http://` or `https://` URL with a
@@ -131,14 +131,14 @@ impl TwinMetadataTarget {
     }
 
     /// The key of the build's `manifest.json`.
-    pub fn manifest_key(&self) -> String {
+    pub(crate) fn manifest_key(&self) -> String {
         self.join(TemplateArtifact::Manifest.file_name())
     }
 
     /// The key of the `metadata.json` of the build's twin bound to
     /// `environment`. Refused with [`ObjectAccessError::NotReleaseDirectory`]
     /// unless the location is the release's own build directory.
-    pub fn twin_metadata_key(
+    pub(crate) fn twin_metadata_key(
         &self,
         environment: EnvironmentReference,
     ) -> Result<String, ObjectAccessError> {

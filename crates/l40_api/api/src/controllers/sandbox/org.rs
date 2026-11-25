@@ -2,13 +2,11 @@ use pplx_space_accounts::OrgId;
 use pplx_space_sandbox_model::SandboxId;
 
 use pplx_space_accounts::SandboxOwnerSource;
-use pplx_space_sql_locator::sql;
-
-use std::sync::LazyLock;
+use pplx_space_sandbox_store::direct::sandbox_listing::{self, FederatedSubject, PageWalk};
 
 use crate::federated_identity::FederatedOwner;
 
-use super::list_page::{ListPage, PageWalkParams, SANDBOX_LIST_ROW_OVERHEAD_BYTES, page_rows_cte};
+use super::list_page::{ListPage, SANDBOX_LIST_ROW_OVERHEAD_BYTES};
 
 use super::*;
 
@@ -35,108 +33,6 @@ pub enum SandboxAccessScope {
         /// The API key's local org whose legacy local-owned rows stay reachable.
         legacy_org_id: OrgId,
     },
-}
-
-/// A sandbox on an ECW or admin list page and whether another sandbox
-/// follows it.
-#[derive(sqlx::FromRow)]
-pub(super) struct ScopedPageRow {
-    #[sqlx(flatten)]
-    pub(super) sandbox: Sandbox,
-    pub(super) has_next: bool,
-}
-
-/// The local org's sandboxes ($1) after the cursor, matching the metadata
-/// filter $5. ECW reads a `deleted` tombstone as not found, so tombstones are
-/// left out before the page and its lookahead, as the native list leaves them
-/// out.
-const LOCAL_ORG_CANDIDATE_ROWS: &str = "SELECT s.id, s.created_at
-    FROM sandboxes s
-    JOIN users owner_user ON owner_user.id = s.user_id
-    WHERE owner_user.owner_source = 'local'
-      AND s.org_id = $1
-      AND s.lifecycle NOT IN ('deleted')
-      AND {after_cursor}
-      AND ($5::jsonb IS NULL OR s.metadata @> $5::jsonb)
-    ORDER BY s.created_at DESC, s.id DESC
-    LIMIT {max_rows}";
-
-static LOCAL_ORG_PAGE_SQL: LazyLock<String> = LazyLock::new(|| {
-    scoped_page_sql(
-        LOCAL_ORG_CANDIDATE_ROWS,
-        &PageWalkParams {
-            cursor_created_at: "$2",
-            cursor_id: "$3",
-            max_rows: "$4",
-            max_bytes: "$6",
-            row_overhead_bytes: "$7",
-            lists_env: true,
-        },
-    )
-});
-
-/// The federated subject's sandboxes ($1-$3) and the key org's legacy local
-/// sandboxes ($8) after the cursor, matching the metadata filter $7. Each
-/// arm keeps its own index-backed `ORDER BY` / `LIMIT`; the outer sort merges
-/// the two candidate lists. Both arms leave out the delete tombstones, as
-/// `LOCAL_ORG_CANDIDATE_ROWS` does.
-const FEDERATED_SUBJECT_CANDIDATE_ROWS: &str = "SELECT candidate.id, candidate.created_at
-    FROM (
-        (SELECT s.id, s.created_at
-         FROM sandboxes s
-         JOIN users owner_user ON owner_user.id = s.user_id
-         JOIN organizations owner_org ON owner_org.id = s.org_id
-         WHERE owner_user.owner_source = 'federated_identity'
-           AND owner_user.upstream_issuer = $1
-           AND owner_org.upstream_issuer = $1
-           AND owner_org.upstream_org_id = $2
-           AND owner_user.upstream_subject_id = $3
-           AND s.lifecycle NOT IN ('deleted')
-           AND {after_cursor}
-           AND ($7::jsonb IS NULL OR s.metadata @> $7::jsonb)
-         ORDER BY s.created_at DESC, s.id DESC
-         LIMIT {max_rows})
-        UNION ALL
-        (SELECT s.id, s.created_at
-         FROM sandboxes s
-         JOIN users owner_user ON owner_user.id = s.user_id
-         WHERE owner_user.owner_source = 'local'
-           AND s.org_id = $8
-           AND s.lifecycle NOT IN ('deleted')
-           AND {after_cursor}
-           AND ($7::jsonb IS NULL OR s.metadata @> $7::jsonb)
-         ORDER BY s.created_at DESC, s.id DESC
-         LIMIT {max_rows})
-    ) candidate
-    ORDER BY candidate.created_at DESC, candidate.id DESC
-    LIMIT {max_rows}";
-
-static FEDERATED_SUBJECT_PAGE_SQL: LazyLock<String> = LazyLock::new(|| {
-    scoped_page_sql(
-        FEDERATED_SUBJECT_CANDIDATE_ROWS,
-        &PageWalkParams {
-            cursor_created_at: "$4",
-            cursor_id: "$5",
-            max_rows: "$6",
-            max_bytes: "$9",
-            row_overhead_bytes: "$10",
-            lists_env: true,
-        },
-    )
-});
-
-/// A list page statement, ECW or admin: the page walk over `candidate_rows`,
-/// then the full sandbox row of each page row.
-pub(super) fn scoped_page_sql(candidate_rows: &str, params: &PageWalkParams) -> String {
-    let page_rows = page_rows_cte(candidate_rows, params);
-    sandbox_query(&format!(
-        "{page_rows}
-         SELECT {{sandbox_columns}}, page.has_next
-         FROM page_rows page
-         JOIN sandboxes s ON s.id = page.id
-         {{sandbox_join_tail}}
-         ORDER BY page.position"
-    ))
 }
 
 fn sandbox_in_scope(sandbox: &Sandbox, scope: &SandboxAccessScope) -> bool {
@@ -207,42 +103,31 @@ impl SandboxController {
         limit: u32,
         metadata_filter: Option<serde_json::Value>,
     ) -> Result<ListPage<Sandbox>, ControllerError> {
-        let max_rows = i64::from(limit.saturating_add(1));
-        let cursor_created_at = cursor.map(|cursor| cursor.created_at);
-        let cursor_id = cursor.map(|cursor| cursor.id);
+        let walk = PageWalk {
+            after: cursor.map(|cursor| (cursor.created_at, cursor.id)),
+            max_rows: i64::from(limit.saturating_add(1)),
+            max_bytes: self.list_page_max_bytes,
+            row_overhead_bytes: SANDBOX_LIST_ROW_OVERHEAD_BYTES,
+        };
         let rows = match scope {
             SandboxAccessScope::LocalOrg { org_id } => {
-                sqlx::query_as::<_, ScopedPageRow>(sqlx::AssertSqlSafe(sql!(
-                    LOCAL_ORG_PAGE_SQL.as_str()
-                )))
-                .bind(*org_id)
-                .bind(cursor_created_at)
-                .bind(cursor_id)
-                .bind(max_rows)
-                .bind(metadata_filter)
-                .bind(self.list_page_max_bytes)
-                .bind(SANDBOX_LIST_ROW_OVERHEAD_BYTES)
-                .fetch_all(pool)
-                .await
+                sandbox_listing::local_org_page(pool, *org_id, metadata_filter, &walk).await
             }
             SandboxAccessScope::FederatedSubject {
                 owner,
                 legacy_org_id,
             } => {
-                sqlx::query_as::<_, ScopedPageRow>(sqlx::AssertSqlSafe(sql!(
-                    FEDERATED_SUBJECT_PAGE_SQL.as_str()
-                )))
-                .bind(owner.issuer.as_str())
-                .bind(owner.org_id.as_str())
-                .bind(owner.subject_id.as_str())
-                .bind(cursor_created_at)
-                .bind(cursor_id)
-                .bind(max_rows)
-                .bind(metadata_filter)
-                .bind(*legacy_org_id)
-                .bind(self.list_page_max_bytes)
-                .bind(SANDBOX_LIST_ROW_OVERHEAD_BYTES)
-                .fetch_all(pool)
+                sandbox_listing::federated_subject_page(
+                    pool,
+                    FederatedSubject {
+                        issuer: &owner.issuer,
+                        upstream_org_id: &owner.org_id,
+                        subject_id: &owner.subject_id,
+                    },
+                    *legacy_org_id,
+                    metadata_filter,
+                    &walk,
+                )
                 .await
             }
         }

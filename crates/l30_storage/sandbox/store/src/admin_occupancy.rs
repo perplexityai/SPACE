@@ -614,7 +614,7 @@ static GROUP_OCCUPANCY: LazyLock<String> = LazyLock::new(|| {
                     -- node via target_node_id while active_node_id is still
                     -- NULL (begin_restore_lifecycle clears active_node_id but
                     -- leaves target_node_id on the source). Mirror the
-                    -- node-drain blocker (drain_blocking_sandboxes_query):
+                    -- node-drain blocker (drain_gate_blockers::count_on_node):
                     -- `suspending` always occupies; `restoring` occupies for
                     -- non-evacuation restores.
                     OR (
@@ -640,7 +640,7 @@ static GROUP_OCCUPANCY: LazyLock<String> = LazyLock::new(|| {
 
 /// The statement [`node_occupancy`] runs for `ranked` and `residency`, for a
 /// caller that inspects its plan.
-pub fn node_occupancy_statement(ranked: bool, residency: ResidencyEvidence) -> &'static str {
+pub(crate) fn node_occupancy_statement(ranked: bool, residency: ResidencyEvidence) -> &'static str {
     match (ranked, residency) {
         (false, _) => &NODE_OCCUPANCY,
         (true, ResidencyEvidence::LifecycleOnly) => &RANKED_NODE_OCCUPANCY,
@@ -650,7 +650,10 @@ pub fn node_occupancy_statement(ranked: bool, residency: ResidencyEvidence) -> &
 
 /// The statement [`fleet_occupancy`] runs for `ranked` and `residency`, for a
 /// caller that inspects its plan.
-pub fn fleet_occupancy_statement(ranked: bool, residency: ResidencyEvidence) -> &'static str {
+pub(crate) fn fleet_occupancy_statement(
+    ranked: bool,
+    residency: ResidencyEvidence,
+) -> &'static str {
     match (ranked, residency) {
         (false, _) => &FLEET_OCCUPANCY,
         (true, ResidencyEvidence::LifecycleOnly) => &RANKED_FLEET_OCCUPANCY,
@@ -839,15 +842,16 @@ static PINNED_LOCAL_ONLY_SANDBOXES: LazyLock<String> =
 
 /// The statement [`pinned_local_only_sandboxes`] runs, for a caller that
 /// inspects its plan.
-pub fn pinned_local_only_sandboxes_statement() -> &'static str {
+#[cfg(test)]
+fn pinned_local_only_sandboxes_statement() -> &'static str {
     &PINNED_LOCAL_ONLY_SANDBOXES
 }
 
 /// The statement [`pinned_local_only_sandboxes`] runs, with `limit` in place
 /// of [`FORCE_UPLOAD_PAGE`], for tests that need a page smaller or larger than
 /// production's. It has no locator comment.
-#[cfg(any(test, feature = "test-support"))]
-pub fn pinned_local_only_sandboxes_statement_with_limit(limit: NonZeroUsize) -> String {
+#[cfg(test)]
+fn pinned_local_only_sandboxes_statement_with_limit(limit: NonZeroUsize) -> String {
     pinned_local_only_sandboxes_for(limit)
 }
 
@@ -857,8 +861,8 @@ pub fn pinned_local_only_sandboxes_statement_with_limit(limit: NonZeroUsize) -> 
 /// handler to enumerate the sandboxes that still need a durable upload before
 /// the source node can terminate.
 ///
-/// [`pinned_local_only_sandboxes_statement`] returns the statement this runs,
-/// so the api's plan-structure regression (`pinned_local_only_plan_tests`)
+/// `pinned_local_only_sandboxes_statement` returns the statement this runs,
+/// so the plan-structure regression (`pinned_local_only_plan_tests`)
 /// can `EXPLAIN` it; the `sql!` locator comment it starts with changes no
 /// plan.
 ///
@@ -1014,7 +1018,7 @@ pub fn pinned_local_only_sandboxes_statement_with_limit(limit: NonZeroUsize) -> 
 ///
 /// Excludes sandboxes whose durable upload is already in flight from any node
 /// (`NOT inflight_suspend_upload_exists`), mirroring the node-drain reupload
-/// queue (`node_drain::store::pinned_local_only_sandboxes_query`):
+/// queue (`pinned_local_only::page`):
 /// force-reuploading a sandbox
 /// whose original upload is still `creating` is redundant and racy, and a
 /// resulting newer `failed` snapshot would make `latest_full_snapshot_ready`
@@ -1029,5 +1033,12 @@ pub async fn pinned_local_only_sandboxes(
         .await
 }
 
+/// Postgres-backed plan-structure and page-shape regression for the
+/// `:force-upload-local-snapshots` enumeration: the scan stays bounded by the
+/// node's own pinned history rather than the fleet, the in-flight probe runs
+/// only for non-durable rows, and the page stays the ascending-id prefix the
+/// handler's `deferred[]` tail depends on.
+#[cfg(test)]
+mod pinned_local_only_plan_tests;
 #[cfg(test)]
 mod tests;

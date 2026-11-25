@@ -16,6 +16,7 @@ use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_cluster_pool::PoolConfigOwner;
 use pplx_space_db_test_fixtures::pg_test_db;
 use pplx_space_net_common::NetworkPolicyV1;
+use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
 use pplx_space_test_env::TestResult;

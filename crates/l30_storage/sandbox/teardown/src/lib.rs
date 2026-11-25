@@ -1,3 +1,19 @@
+//! The node-observation cache: what each node last reported about the
+//! sandboxes and facet elements it holds. This store owns
+//! `sandbox_observed_states` (the last state a node published for each
+//! sandbox), `node_facet_observed_status` (what a node last reported applying
+//! for a facet/element pair) and `node_facet_conditions` (the conditions it
+//! reported for one). They are one store because they describe the same
+//! observations and are written and swept together: a publication writes a
+//! sandbox's observed row and its facet rows, and the cache's deletes (the
+//! census prune, the observed-projection GC, a sandbox's teardown) remove
+//! them together, some in one statement. None of it is the durable record of
+//! a sandbox; that is `sandboxes` and its snapshots.
+//! `sandbox_snapshot_inventory`, the snapshots a node last published for each
+//! sandbox, stays `pplx-space-sandbox-store`'s. Its rows reference
+//! `sandbox_observed_states` with `ON DELETE CASCADE`, so every delete of an
+//! observed row here also deletes that sandbox's inventory rows.
+//!
 //! Reconcile-state cleanup: deletes the queue refs, observed status and
 //! condition rows for the given facet/element pairs inside the caller's
 //! transaction. Those rows are keyed by facet and element, not foreign-keyed
@@ -7,17 +23,23 @@
 //! rollback, a template delete) and when no node owns it any more (a sandbox
 //! recovered to suspended, quarantined, or recovered from quarantine).
 //!
-//! The same rows' other verbs live alongside: [`observed_status`] for
+//! The same rows' other verbs live alongside: [`observed_states`] for
+//! `sandbox_observed_states`, [`observed_status`] for
 //! `node_facet_observed_status`, [`conditions`] for
-//! `node_facet_conditions`, and [`direct`] for the
-//! `node_facet_observed_status` writes that resolve a sandbox's node through
-//! the Direct route table. [`observed_status`]'s orphaned-facet sweep also
-//! deletes the swept rows' `node_facet_conditions` rows. Some verbs in
-//! [`observed_status`] and [`conditions`] read, without locking and in the
-//! same statement, tables other stores own: `sandboxes`,
-//! `sandbox_k8s_executions`, `sandbox_observed_states` and
-//! `node_template_inventory`. [`direct`]'s verbs read `sandboxes` and the
-//! Direct route table the same way.
+//! `node_facet_conditions`, and [`direct`] for the statements on these
+//! tables that join a Direct-only table: the `node_facet_observed_status`
+//! writes that resolve a sandbox's node through the Direct route table, a
+//! node's sandbox state publication and the api's observed-state reads.
+//! [`observed_status`]'s orphaned-facet sweep also
+//! deletes the swept rows' `node_facet_conditions` rows, and
+//! [`observed_gc`]'s sweeps delete cold `sandbox_observed_states` rows with
+//! their sandboxes' facet rows, each in one statement. Some verbs in
+//! [`observed_states`], [`observed_status`], [`conditions`] and
+//! [`observed_gc`] read, without locking and in the same statement, tables
+//! other stores own: `sandboxes`, `sandbox_k8s_executions`, `nodes`,
+//! `node_k8s` and `node_template_inventory`. [`direct`]'s verbs read
+//! `sandboxes`, `nodes`, `node_k8s`, `node_template_inventory`, the template
+//! release tables and the Direct-only tables the same way.
 
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
@@ -26,6 +48,8 @@ use pplx_space_state_reconciliation::{NetworkPolicyTarget, ReconcileElementRef};
 
 pub mod conditions;
 pub mod direct;
+pub mod observed_gc;
+pub mod observed_states;
 pub mod observed_status;
 
 pub fn sandbox_reconcile_cleanup_refs(sandbox_id: SandboxId) -> Vec<ReconcileElementRef> {

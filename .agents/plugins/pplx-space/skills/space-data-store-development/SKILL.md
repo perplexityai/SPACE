@@ -136,9 +136,7 @@ move must keep.
   with each outcome. A guarded statement that writes two owners' tables
   splits into one such verb per store, which a coordinator runs, in the
   caller's open transaction when the statement was one step of it (see
-  Coordinators). Two kinds stay with the paths that issue them: the
-  execution-ownership writes of `sandbox_k8s_executions`, as
-  `pplx-space-sandbox-store`'s `k8s_executions` docs say, and node drain's
+  Coordinators). One kind stays with the path that issues it: node drain's
   phase compare-and-sets, as `pplx-space-node-registration-store`'s docs say.
   Other store docs that say a guarded write stays at its call site do not
   override this item; the change that moves the write updates them. The
@@ -167,10 +165,11 @@ move must keep.
   still move as a store verb, under these conditions:
   - the statement moves verbatim, lock clause included (`OF …`, `NOWAIT`,
     `SKIP LOCKED`), along with any setting written in the same statement;
-  - the verb takes the caller's `&mut sqlx::Transaction<'_, Postgres>`, or
+  - the verb takes the caller's open transaction: `&mut Tx` from
+    `pplx-space-postgres-pool`, `&mut sqlx::Transaction<'_, Postgres>`, or
     `&mut sqlx::PgConnection` when every caller passes its open transaction
-    (`&mut *tx`). It never takes `impl PgExecutor`, which also accepts a
-    pool;
+    (`&mut *tx`). It never takes `impl PgExecutor` or postgres-pool's
+    `impl Executor`, which also accept a pool;
   - its name says it locks (`lock_…`, `share_lock_…`, `…_locked`), and its
     doc says the lock lasts until the caller's transaction ends, as
     `pplx-space-runtime-environment-policy-store`'s `lock_generation` and
@@ -210,8 +209,19 @@ rows change together and in what order they are locked. When the split
 statement is one step of a transaction a service already owns, such as
 internal-api's node-state publish, the coordinator's verb takes that open
 transaction, and its docs say which locks the caller must already hold;
-otherwise the coordinator opens and commits the transaction itself. The
-caller decides what to write and when, passes that in, and gets each guarded
+otherwise the coordinator opens and commits the transaction itself. It
+reaches Postgres through `pplx-space-postgres-pool` alone: it takes the
+caller's open transaction as `&mut pplx_space_postgres_pool::Tx`, or opens
+its own with `Db::begin` and ends it with `Tx::commit`. It passes the
+transaction to each store verb (`&mut tx` for one it opened, `&mut *tx` for
+one it was given), which takes `impl Executor<'_>`, except a verb whose lock
+the caller relies on after the statement: that one takes the open transaction
+(see "Locks the caller relies on after the statement" above). So neither the
+coordinator nor its callers name a driver type. While its caller still opens
+the transaction with the driver and passes `&mut *tx`, the verb takes any
+`&mut C` where `&mut C: Executor`, documents that the caller must pass an open
+transaction, and narrows to `Tx` once the caller moves. The caller decides what
+to write and when, passes that in, and gets each guarded
 verb's outcome back to act on. Make one only when one of
 these holds:
 
@@ -295,3 +305,16 @@ isolated clones; direct `cargo test` can use a process-local testcontainer.
 Unavailable Postgres or Redis fails the test unless the run opts out with
 `SPACE_TEST_DEPS_OPTIONAL=1`. Opted-out skips are diagnostic only, not
 acceptable final validation when Docker can be started.
+
+A statement on a hot path that matches rows of a table growing per template,
+node or org, such as releases, against other rows of it needs a plan-cost
+test: seed one owner with a few hundred rows among other owners' rows, so the
+tables are too large to rescan cheaply, and bound the per-row work its plan
+does under both plan modes, through `pplx_space_db_test_fixtures::plan`
+(its docs say why both), on the statement text the store runs. Bound how much
+more the plan touches at a fixture several times larger too, which catches an
+index walked per row. Show the bounds catch the regression by mutating the
+statement, such as wrapping the probed column, and say so in the pull
+request; a check that drops an index breaks once another index serves the
+probe. `crates/l30_storage/template/release/store/src/plan_tests.rs` is an
+example.

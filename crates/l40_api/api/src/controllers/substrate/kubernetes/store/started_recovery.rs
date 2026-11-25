@@ -72,15 +72,18 @@ impl K8sStore {
             .begin()
             .await
             .db_context("failed to start Kubernetes recovery transaction")?;
-        let Some(lifecycle) =
-            Self::lock_sandbox_execution_lifecycle_in(&mut tx, sandbox_id).await?
+        let Some((lifecycle, drain)) = Self::lock_sandbox_for_claim_in(&mut tx, sandbox_id).await?
         else {
             return Err(SubstrateError::NotFound {
                 message: format!("sandbox not found: {sandbox_id}"),
             });
         };
         match lifecycle {
-            SandboxLifecycle::Started => {}
+            SandboxLifecycle::Started => {
+                super::execution_rows::refuse_started_recovery_under_v2_drain(
+                    sandbox_id, lifecycle, drain,
+                )?;
+            }
             SandboxLifecycle::Suspending => {
                 return Err(SubstrateError::suspend_in_flight(sandbox_id));
             }
@@ -97,30 +100,13 @@ impl K8sStore {
         let claim = self
             .ensure_active_execution_claim_in(&mut tx, sandbox_id, None)
             .await?;
-        let generation = sqlx::query_scalar::<_, i64>(sql!(
-            "UPDATE sandbox_k8s_executions
-             SET state = 'recovering', updated_at = NOW()
-             WHERE sandbox_id = $1 AND generation = $2 AND active
-               AND (
-                 ($3 AND state = 'creating')
-                 OR (
-                   NOT $3
-                   AND (
-                     state IN ('created', 'running', 'recovery_failed')
-                     OR (
-                       state IN ('creating', 'recovering')
-                       AND updated_at <= NOW() - make_interval(secs => $4)
-                     )
-                   )
-                 )
-               )
-             RETURNING generation"
-        ))
-        .bind(sandbox_uuid)
-        .bind(claim.row.generation)
-        .bind(claim.created)
-        .bind(recovery_lease_ttl_secs())
-        .fetch_optional(&mut *tx)
+        let generation = pplx_space_sandbox_store::k8s_executions::started_recovery::claim(
+            &mut *tx,
+            sandbox_uuid,
+            claim.row.generation,
+            claim.created,
+            recovery_lease_ttl_secs(),
+        )
         .await
         .db_context("failed to claim started sandbox recovery")?;
 
@@ -234,30 +220,23 @@ impl K8sStore {
             });
         }
 
-        let previous_attempt = sqlx::query_as::<_, (Option<Uuid>, Option<String>)>(sql!(
-            "SELECT e.activation_attempt_id, e.activation_attempt_target_state
-               FROM sandboxes s
-               JOIN sandbox_k8s_executions e
-                 ON e.sandbox_id = s.id
-                AND e.generation = $2
-                AND e.active
-                AND e.state = 'recovering'
-              WHERE s.id = $1
-                AND s.lifecycle = 'started'
-              FOR UPDATE OF e"
-        ))
-        .bind(sandbox_uuid)
-        .bind(generation.get())
-        .fetch_optional(&mut *tx)
-        .await
-        .db_context("failed to lock started recovery execution")?;
-        let Some((activation_attempt_id, activation_target)) = previous_attempt else {
+        let previous_attempt =
+            pplx_space_sandbox_store::k8s_executions::started_recovery::lock_recovering_execution(
+                &mut tx,
+                sandbox_uuid,
+                generation.get(),
+            )
+            .await
+            .db_context("failed to lock started recovery execution")?;
+        let Some(previous_attempt) = previous_attempt else {
             tx.commit()
                 .await
                 .db_context("failed to commit lost started recovery handoff")?;
             return Ok(StartedRecoveryReplacement::OwnershipLost);
         };
-        let activation_target = activation_target
+        let activation_attempt_id = previous_attempt.activation_attempt_id;
+        let activation_target = previous_attempt
+            .activation_attempt_target_state
             .map(|target| target.parse::<SandboxTransitionTargetState>())
             .transpose()
             .map_err(|err| SubstrateError::Failed {
@@ -315,31 +294,17 @@ impl K8sStore {
                 message: "failed to allocate started recovery successor execution".to_string(),
             });
         }
-        let updated = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-                SET state = 'recovering',
-                    activation_attempt_id = $3,
-                    route_activation_id = $3,
-                    activation_attempt_expires_at = CASE
-                        WHEN $3::UUID IS NULL THEN NULL
-                        ELSE NOW() + make_interval(secs => $5)
-                    END,
-                    activation_attempt_target_state = $4,
-                    updated_at = NOW()
-              WHERE sandbox_id = $1
-                AND generation = $2
-                AND active
-                AND state = 'creating'"
-        ))
-        .bind(sandbox_uuid)
-        .bind(claim.row.generation)
-        .bind(activation_attempt_id)
-        .bind(activation_target.map(SandboxTransitionTargetState::as_str))
-        .bind(super::super::ACTIVATION_ATTEMPT_LEASE_TTL_SECS)
-        .execute(&mut *tx)
-        .await
-        .db_context("failed to preserve started recovery ownership")?
-        .rows_affected();
+        let updated =
+            pplx_space_sandbox_store::k8s_executions::started_recovery::hand_off_to_successor(
+                &mut *tx,
+                sandbox_uuid,
+                claim.row.generation,
+                activation_attempt_id,
+                activation_target.map(SandboxTransitionTargetState::as_str),
+                super::super::ACTIVATION_ATTEMPT_LEASE_TTL_SECS,
+            )
+            .await
+            .db_context("failed to preserve started recovery ownership")?;
         if updated != 1 {
             return Err(SubstrateError::Failed {
                 message: "failed to preserve started recovery ownership".to_string(),
@@ -383,16 +348,13 @@ impl K8sStore {
                 .await;
         }
 
-        sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-             SET state = $3, updated_at = NOW()
-             WHERE sandbox_id = $1 AND generation >= $2 AND active AND state = $4"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(generation)
-        .bind(completion.as_str())
-        .bind(ActiveExecutionState::Recovering.as_str())
-        .execute(&self.pool)
+        pplx_space_sandbox_store::k8s_executions::started_recovery::complete(
+            &self.pool,
+            sandbox_id,
+            generation,
+            completion.as_str(),
+            ActiveExecutionState::Recovering.as_str(),
+        )
         .await
         .db_context_with(|| {
             format!("failed to complete started sandbox recovery as {completion}")
@@ -416,36 +378,14 @@ impl K8sStore {
             return Ok(());
         }
 
-        let failed_generation = sqlx::query_scalar::<_, i64>(sql!(
-            "UPDATE sandbox_k8s_executions
-             SET state = $3,
-                 activation_attempt_id = NULL,
-                 activation_attempt_expires_at = NULL,
-                 activation_attempt_target_state = NULL,
-                 updated_at = NOW()
-             WHERE sandbox_id = $1
-               AND active
-               AND state = $4
-               AND (
-                 (
-                   $5::UUID IS NULL
-                   AND activation_attempt_id IS NULL
-                   AND generation = $2
-                 )
-                 OR (
-                   $5::UUID IS NOT NULL
-                   AND activation_attempt_id = $5
-                   AND generation >= $2
-                 )
-               )
-             RETURNING generation"
-        ))
-        .bind(sandbox_uuid)
-        .bind(generation.get())
-        .bind(StartedRecoveryCompletion::Failed.as_str())
-        .bind(ActiveExecutionState::Recovering.as_str())
-        .bind(activation_attempt_id)
-        .fetch_optional(&mut *tx)
+        let failed_generation = pplx_space_sandbox_store::k8s_executions::started_recovery::fail(
+            &mut *tx,
+            sandbox_uuid,
+            generation.get(),
+            StartedRecoveryCompletion::Failed.as_str(),
+            ActiveExecutionState::Recovering.as_str(),
+            activation_attempt_id,
+        )
         .await
         .db_context("failed to complete started sandbox recovery as failed")?;
         let generation = failed_generation

@@ -9,10 +9,19 @@
 //! `pattern_ratchet.direct_tables` confines to the Direct substrate and the
 //! stores' `direct` modules, so these statements live here rather than in
 //! [`crate::observed_status`].
+//!
+//! The child modules hold this crate's `sandbox_observed_states` statements
+//! that join the Direct-only tables, each named for the question it answers:
+//! [`observed_publication`], a node's sandbox state publication, fenced on
+//! the sandbox's Direct route identity, and [`observed_reads`], the api's
+//! observed-state reads, which read a Direct node's `node_direct` row.
 
 use pplx_space_accounts::NodeId;
 use pplx_space_sql_locator::sql;
 use sqlx::types::Json;
+
+pub mod observed_publication;
+pub mod observed_reads;
 
 /// The payload keys a failure episode is recorded under: the episode's own
 /// member of the observed payload, and its members for the execution

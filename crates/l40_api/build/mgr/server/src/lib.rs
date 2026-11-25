@@ -30,7 +30,9 @@ use pplx_space_build_mgr_store::jobs::{
     drain_outstanding,
 };
 use pplx_space_build_mgr_store::{
-    count_active_build_jobs, count_running_build_jobs_by_lease_owner,
+    BUILD_JOB_KIND, BuildJobResult, BuildTerminalState, count_active_build_jobs,
+    count_other_active_builds_for_subject, count_running_build_jobs_by_lease_owner,
+    fail_expired_running_builds, get_build_result,
 };
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
@@ -38,7 +40,7 @@ use tracing::Instrument as _;
 
 pub mod jobs;
 pub mod run;
-use jobs::{BuildJobPayload, BuildJobResult, BuildTerminalState};
+use jobs::BuildJobPayload;
 pub use run::{
     BuildMgrRunConfig, DEFAULT_DRAIN_TIMEOUT_SECONDS, DEFAULT_LISTEN, RunBuildMgrError,
     SERVICE_NAME, run,
@@ -175,12 +177,10 @@ impl BuildManagerDaemonService {
     pub fn mark_expired_build_leases_failed(&self) -> usize {
         let expired = {
             let conn = self.db.lock().expect("build-manager db mutex poisoned");
-            jobs::fail_expired_running_builds(&conn, INTERRUPTED_BUILD_ERROR).unwrap_or_else(
-                |error| {
-                    tracing::error!(%error, "failed to mark expired build leases failed");
-                    Vec::new()
-                },
-            )
+            fail_expired_running_builds(&conn, INTERRUPTED_BUILD_ERROR).unwrap_or_else(|error| {
+                tracing::error!(%error, "failed to mark expired build leases failed");
+                Vec::new()
+            })
         };
         if !expired.is_empty() {
             tracing::warn!(
@@ -662,9 +662,7 @@ impl JobExecutor for BuildExecutor {
     /// successful job.
     fn completed_result(&self, job: &Job) -> JobCompletedResult {
         let stored = match self.db.lock() {
-            Ok(conn) => {
-                jobs::get_build_result(&conn, &job.job_id).map_err(|error| error.to_string())
-            }
+            Ok(conn) => get_build_result(&conn, &job.job_id).map_err(|error| error.to_string()),
             Err(error) => Err(error.to_string()),
         };
         match stored {
@@ -717,7 +715,7 @@ impl BuildExecutor {
         };
         let active_siblings = {
             let conn = self.db.lock().expect("build-manager db mutex poisoned");
-            match jobs::count_other_active_builds_for_subject(&conn, &result.template_id, job_id) {
+            match count_other_active_builds_for_subject(&conn, &result.template_id, job_id) {
                 Ok(count) => count,
                 Err(error) => {
                     tracing::warn!(
@@ -879,7 +877,7 @@ impl BuildManager for BuildManagerDaemonService {
         // Every submission gets its own job; staging is isolated by job ID.
         let job_id = if let Some(environment) = environment {
             self.worker.submit_json(
-                jobs::BUILD_JOB_KIND,
+                BUILD_JOB_KIND,
                 &jobs::VersionedBuildJobPayload::Environment {
                     environment,
                     build: payload,
@@ -889,7 +887,7 @@ impl BuildManager for BuildManagerDaemonService {
             )?
         } else {
             self.worker
-                .submit_json(jobs::BUILD_JOB_KIND, &payload, Some(&template_id), None)?
+                .submit_json(BUILD_JOB_KIND, &payload, Some(&template_id), None)?
         };
         tracing::info!(
             job_id = %job_id,
@@ -926,7 +924,7 @@ impl BuildManager for BuildManagerDaemonService {
         })?;
         let result = {
             let conn = self.db.lock().expect("build-manager db mutex poisoned");
-            jobs::get_build_result(&conn, &job_id)
+            get_build_result(&conn, &job_id)
                 .map_err(|error| Status::internal(format!("read build result: {error}")))?
         };
 

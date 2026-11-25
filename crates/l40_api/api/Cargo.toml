@@ -55,6 +55,7 @@ pplx-space-admin-protocol = { workspace = true, features = ["serde"] }
 pplx-space-artifact-model = { workspace = true }
 pplx-space-byok-model = { workspace = true, features = ["serde"] }
 pplx-space-node-model = { workspace = true }
+pplx-space-node-drain = { workspace = true, features = ["serde"] }
 pplx-space-snapshot-model = { workspace = true, features = ["serde"] }
 pplx-space-template-model = { workspace = true }
 rand = { workspace = true }
@@ -105,6 +106,7 @@ pplx-space-credential-injection-store = { workspace = true }
 pplx-space-ecw-credential = { workspace = true }
 pplx-space-execution-spec = { workspace = true, features = ["serde"] }
 pplx-space-feature-flags = { workspace = true }
+pplx-space-accounts-store = { workspace = true }
 pplx-space-federated-grant-store = { workspace = true }
 pplx-space-federated-identity = { workspace = true }
 pplx-space-firewall-rules-model = { workspace = true }
@@ -124,6 +126,7 @@ pplx-space-node-mgr-client = { workspace = true }
 pplx-space-node-registration-store = { workspace = true }
 pplx-space-cluster-trigger-queue = { workspace = true }
 pplx-space-data-plane-session-store = { workspace = true }
+pplx-space-direct-coordinator = { workspace = true }
 pplx-space-direct-store = { workspace = true }
 pplx-space-events = { workspace = true }
 pplx-space-grpc-metrics = { workspace = true }
