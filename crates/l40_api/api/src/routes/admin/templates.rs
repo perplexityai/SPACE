@@ -364,17 +364,12 @@ async fn fetch_template(
     pool: &sqlx::PgPool,
     template_name: &TemplateName,
 ) -> Result<Option<TemplateRow>, sqlx::Error> {
-    Ok(fetch_template_rows(pool, Some(template_name))
-        .await?
-        .into_iter()
-        .next())
-}
-
-async fn fetch_template_rows(
-    pool: &sqlx::PgPool,
-    template_name: Option<&TemplateName>,
-) -> Result<Vec<TemplateRow>, sqlx::Error> {
-    pplx_space_template_store::templates::list_admin(pool, template_name).await
+    Ok(
+        pplx_space_template_store::templates::list_admin(pool, Some(template_name))
+            .await?
+            .into_iter()
+            .next(),
+    )
 }
 
 /// The node-discovery read this module's reconcile enqueues begin with.
@@ -477,7 +472,7 @@ pub async fn list_templates(
     if let Err(error) = require_template_admin(&state.pool, &actor).await {
         return error.into_response();
     }
-    match fetch_template_rows(&state.pool, None).await {
+    match pplx_space_template_store::templates::list_admin(&state.pool, None).await {
         Ok(rows) => {
             Json(rows.into_iter().map(template_response).collect::<Vec<_>>()).into_response()
         }
@@ -791,15 +786,6 @@ fn template_delete_fingerprint(
     })
 }
 
-/// Whether a public operation can still run: it exists and is queued or
-/// running.
-async fn delete_operation_is_active(
-    pool: &sqlx::PgPool,
-    operation_id: pplx_space_public_api::OperationId,
-) -> Result<bool, sqlx::Error> {
-    pplx_space_public_operation_store::operations::is_active(pool, operation_id).await
-}
-
 pub async fn delete_template(
     State(state): State<AppState>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
@@ -960,7 +946,12 @@ pub async fn delete_template(
             // current delete: it would never run, and installing it could
             // displace an active replacement. The caller retries with a new
             // key.
-            match delete_operation_is_active(&state.pool, operation_id).await {
+            match pplx_space_public_operation_store::operations::is_active(
+                &state.pool,
+                operation_id,
+            )
+            .await
+            {
                 Ok(true) => operation_id,
                 Ok(false) => {
                     return (
@@ -2279,8 +2270,12 @@ pub async fn tag_template_release(
         // lock is what makes the precondition and the move one step. A tag
         // created between this read and the insert below has committed by the
         // time `DO NOTHING` reports it, so one more read finds and locks it.
-        let mut previous =
-            current_tag_release_for_update(&mut tx, &row.template_name, tag.as_str()).await?;
+        let mut previous = pplx_space_template_store::release_tags::current_release_locked(
+            &mut tx,
+            &row.template_name,
+            tag.as_str(),
+        )
+        .await?;
         for _ in 0..2 {
             if let Some(expected) = expected
                 && expected != previous
@@ -2322,8 +2317,12 @@ pub async fn tag_template_release(
                 tx.commit().await?;
                 return Ok(TagMove::Moved { row, previous });
             }
-            previous =
-                current_tag_release_for_update(&mut tx, &row.template_name, tag.as_str()).await?;
+            previous = pplx_space_template_store::release_tags::current_release_locked(
+                &mut tx,
+                &row.template_name,
+                tag.as_str(),
+            )
+            .await?;
         }
         Ok(TagMove::Raced)
     }
@@ -2438,16 +2437,6 @@ async fn original_release_of(
         &release.content_hash,
     )
     .await
-}
-
-/// The release a tag points at, locking its row for the rest of the
-/// transaction, or `None` when the tag does not exist.
-async fn current_tag_release_for_update(
-    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
-    template_name: &str,
-    tag: &str,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    pplx_space_template_store::release_tags::current_release_locked(tx, template_name, tag).await
 }
 
 pub async fn delete_template_release_tag(
