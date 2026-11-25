@@ -470,6 +470,10 @@ impl NodeManagerService {
         let ns_name = info.ns_name();
 
         let ns_path = info.ns_path();
+        let external_address = match pod_netns {
+            Some(netns) => read_external_address(sandbox_id, netns).await,
+            None => None,
+        };
 
         Ok(Response::new(AllocateResponse {
             slot: info.slot,
@@ -482,6 +486,7 @@ impl NodeManagerService {
             slot_generation: info.generation,
             slot_label: info.slot_label(),
             sandbox_uid: info.sandbox_uid,
+            external_address,
         }))
     }
 
@@ -1300,3 +1305,18 @@ impl NodeManagerService {
 #[cfg(test)]
 #[cfg(target_os = "linux")]
 pub(super) mod tests;
+
+/// Best effort: a caller without the address falls back to its own source.
+async fn read_external_address(sandbox_id: &str, netns: String) -> Option<String> {
+    match tokio::task::spawn_blocking(move || net::external_ipv4(&netns)).await {
+        Ok(Ok(ip)) => Some(ip.to_string()),
+        Ok(Err(error)) => {
+            tracing::warn!(sandbox_id, %error, "failed to read external netns address");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(sandbox_id, %error, "external netns address read task failed");
+            None
+        }
+    }
+}

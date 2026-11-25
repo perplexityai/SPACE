@@ -252,3 +252,50 @@ fn firewall_setup_classifier_preserves_transient_and_permanent_sources() {
         .is_transient()
     );
 }
+
+/// The external address is the one the shim redirects: the first eligible
+/// address in interface index order, skipping the sandbox veth, even when the
+/// default route uses another interface or a higher-index link is created
+/// first. `TestPodIPFromNetnsMatchesNodeManager` in the shim pins the same
+/// fixture.
+#[cfg(target_os = "linux")]
+#[test]
+fn external_address_is_the_shim_redirect_address() {
+    if !pplx_space_test_env::root_or_skip("create a network namespace") {
+        return;
+    }
+    struct Namespace(String);
+    impl Drop for Namespace {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("ip")
+                .args(["netns", "delete", &self.0])
+                .status();
+        }
+    }
+    let ns = Namespace(format!("space-test-ext-addr-{}", std::process::id()));
+    let ip = |args: &str| {
+        let status = std::process::Command::new("ip")
+            .args(args.replace("NS", &ns.0).split_whitespace())
+            .status()
+            .unwrap();
+        assert!(status.success(), "ip {args}");
+    };
+    ip("netns add NS");
+    ip("-n NS link add sveth-test index 2 type dummy");
+    ip("-n NS addr add 10.12.0.5/32 dev sveth-test");
+    ip("-n NS link set sveth-test up");
+    ip("-n NS link add high0 index 256 type dummy");
+    ip("-n NS addr add 198.51.100.4/24 dev high0");
+    ip("-n NS link set high0 up");
+    for (link, cidr) in [("other0", "192.0.2.9/24"), ("eth0", "10.244.3.7/24")] {
+        ip(&format!("-n NS link add {link} type dummy"));
+        ip(&format!("-n NS addr add {cidr} dev {link}"));
+        ip(&format!("-n NS link set {link} up"));
+    }
+    ip("-n NS route add default via 10.244.3.1 dev eth0");
+
+    assert_eq!(
+        super::external_ipv4(&ns.0).unwrap(),
+        "192.0.2.9".parse::<std::net::Ipv4Addr>().unwrap()
+    );
+}

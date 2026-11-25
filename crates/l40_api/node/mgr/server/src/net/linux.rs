@@ -13,7 +13,8 @@ use futures_util::stream::TryStreamExt;
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, setns, unshare};
 use rtnetlink::packet_route::AddressFamily;
-use rtnetlink::packet_route::link::LinkAttribute;
+use rtnetlink::packet_route::address::AddressAttribute;
+use rtnetlink::packet_route::link::{LinkAttribute, LinkFlags};
 use rtnetlink::packet_route::neighbour::NeighbourState;
 use rtnetlink::packet_route::route::{
     RouteAddress, RouteAttribute, RouteMessage, RouteScope, RouteType,
@@ -512,6 +513,59 @@ pub fn default_iface(ns: Option<&str>) -> Result<String, DefaultIfaceError> {
     } else {
         read().map_err(DefaultIfaceError::Other)
     }
+}
+
+pub fn external_ipv4(ns: &str) -> Result<Ipv4Addr, DefaultIfaceError> {
+    run_in_netns(ns, || {
+        block_on_netlink(async move {
+            with_handle(|handle| async move {
+                let mut links = Vec::new();
+                let mut dump = handle.link().get().execute();
+                while let Some(link) = dump
+                    .try_next()
+                    .await
+                    .map_err(|e| format!("failed to dump links: {e}"))?
+                {
+                    let sandbox_link = link.attributes.iter().any(|attr| {
+                        matches!(attr, LinkAttribute::IfName(name) if name.starts_with(super::SANDBOX_LINK_PREFIX))
+                    });
+                    if !link.header.flags.contains(LinkFlags::Loopback) && !sandbox_link {
+                        links.push(link.header.index);
+                    }
+                }
+                links.sort_unstable();
+                for index in links {
+                    let mut addresses = handle
+                        .address()
+                        .get()
+                        .set_link_index_filter(index)
+                        .execute();
+                    while let Some(address) = addresses
+                        .try_next()
+                        .await
+                        .map_err(|e| format!("failed to dump addresses of link {index}: {e}"))?
+                    {
+                        let local = address.attributes.iter().find_map(|attr| match attr {
+                            AddressAttribute::Local(IpAddr::V4(ip)) => Some(*ip),
+                            _ => None,
+                        });
+                        let ip = local.or_else(|| {
+                            address.attributes.iter().find_map(|attr| match attr {
+                                AddressAttribute::Address(IpAddr::V4(ip)) => Some(*ip),
+                                _ => None,
+                            })
+                        });
+                        if let Some(ip) = ip.filter(|ip| !ip.is_loopback() && !ip.is_link_local()) {
+                            return Ok(ip);
+                        }
+                    }
+                }
+                Err("no external IPv4 address".to_string())
+            })
+            .await
+        })
+        .map_err(DefaultIfaceError::Other)
+    })
 }
 
 pub fn ns_exists(name: &str) -> bool {
