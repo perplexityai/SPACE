@@ -324,7 +324,6 @@ impl SharedConnection {
     }
 
     /// [`Mutex::try_lock`].
-    #[cfg(any(test, feature = "test-support"))]
     pub fn try_lock(&self) -> std::sync::TryLockResult<ConnectionGuard<'_>> {
         use std::sync::TryLockError;
         match self.0.try_lock() {

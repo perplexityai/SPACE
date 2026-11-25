@@ -746,6 +746,62 @@ async fn stats_answers_without_cgroup_figures_when_node_manager_stalls() {
     );
 }
 
+/// Stats takes no state-writer slot, so it bounds itself: with every Stats
+/// slot held by a call stalled on node-manager, the next poll is rejected at
+/// once rather than queued, and the stalled calls still answer.
+#[tokio::test(start_paused = true)]
+async fn stats_rejects_polls_beyond_its_cap_without_queueing() {
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &sandbox_id, SandboxState::Started);
+    conn.execute(
+        "UPDATE sandboxes SET uid = 10000, slot = 7 WHERE id = ?1",
+        crate::db::fixture::params![sandbox_id],
+    )
+    .unwrap();
+    let node_manager = StalledNodeManager::bind();
+    let service = service_with_node_manager(conn, node_manager.connector());
+    let stalled = (0..super::super::grpc_spaced_files::STATS_CONCURRENCY_CAP)
+        .map(|_| {
+            let service = service.clone();
+            let sandbox_id = sandbox_id.clone();
+            tokio::spawn(async move {
+                service
+                    .stats(internal_request(StatsRequest { sandbox_id }))
+                    .await
+            })
+        })
+        .collect::<Vec<_>>();
+    // Each spawned call takes its permit on its first poll; a bounded number
+    // of yields lets them all run that far.
+    for _ in 0..1_000 {
+        if service.stats_admission.available_permits() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        service.stats_admission.available_permits(),
+        0,
+        "the stalled Stats calls did not hold every slot"
+    );
+
+    let started = tokio::time::Instant::now();
+    let error = service
+        .stats(internal_request(StatsRequest {
+            sandbox_id: sandbox_id.clone(),
+        }))
+        .await
+        .expect_err("a poll beyond the cap must be rejected");
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted, "{error}");
+    assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    for call in stalled {
+        call.await
+            .unwrap()
+            .expect("a stalled Stats call still answers");
+    }
+}
+
 #[tokio::test]
 async fn both_seal_entry_points_reject_a_live_runtime_and_ignore_other_attempts() {
     for case in ["gone", "live", "unknown", "contradiction", "failed"] {

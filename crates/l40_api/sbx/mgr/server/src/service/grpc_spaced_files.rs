@@ -180,12 +180,25 @@ fn required_operation<T: Clone>(operation: &Option<T>) -> Result<T, Status> {
         .ok_or_else(|| Status::invalid_argument("spaced operation payload is required"))
 }
 
+/// Concurrent Stats calls one sandbox-manager serves. Container stats polls
+/// beyond it are rejected, not queued: each poll repeats on the next period.
+pub(super) const STATS_CONCURRENCY_CAP: usize = 16;
+
 impl SandboxManagerService {
     pub(super) async fn stats(
         &self,
         request: Request<StatsRequest>,
     ) -> Result<Response<StatsResponse>, Status> {
         self.authorize_peer(&request, "Stats", ALLOW_SANDBOX_OBSERVER)?;
+        let _admitted = self
+            .stats_admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                Status::resource_exhausted(
+                    "sandbox-manager stats capacity exhausted; retry on the next poll",
+                )
+            })?;
         let sandbox = self.lookup_sandbox(&request.get_ref().sandbox_id)?;
         let id = &sandbox.id;
         let uid = sandbox

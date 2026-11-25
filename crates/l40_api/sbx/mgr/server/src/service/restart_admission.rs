@@ -252,7 +252,10 @@ restart_rpcs! {
     SandboxListSnapshots => ("/space.sandbox.manager.v1.SandboxManager/ListSnapshots", ReadOnly),
     SandboxDeleteSnapshots => ("/space.sandbox.manager.v1.SandboxManager/DeleteSnapshots", StateWriter),
     SandboxRollback => ("/space.sandbox.manager.v1.SandboxManager/Rollback", StateWriter),
-    SandboxStats => ("/space.sandbox.manager.v1.SandboxManager/Stats", StateWriter),
+    // Container stats polls read cgroup and gateway counters. The only write
+    // raises the persisted network counters monotonically, so polls neither
+    // take nor wait for a lifecycle state-writer slot.
+    SandboxStats => ("/space.sandbox.manager.v1.SandboxManager/Stats", ReadOnlyWithNarrowStateWrites),
     SandboxUpdate => ("/space.sandbox.manager.v1.SandboxManager/Update", StateWriter),
     SandboxSetAutoLifecyclePolicy => ("/space.sandbox.manager.v1.SandboxManager/SetAutoLifecyclePolicy", StateWriter),
     SandboxTouchAutoLifecycle => ("/space.sandbox.manager.v1.SandboxManager/TouchAutoLifecycle", StateWriter),

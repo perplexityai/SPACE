@@ -790,8 +790,9 @@ async fn grpc_writer_during_pre_handoff_drain_returns_retry_on_successor() {
     service.begin_draining_for_restart();
 
     let result = client
-        .stats(crate::proto::StatsRequest {
+        .update(crate::proto::UpdateRequest {
             sandbox_id: "sandbox".to_string(),
+            ..Default::default()
         })
         .await;
     shutdown_token.cancel();
@@ -841,8 +842,9 @@ async fn grpc_in_flight_request_interrupted_at_handoff_is_not_marked_replayable(
     let mut client = crate::proto::sandbox_manager_client::SandboxManagerClient::new(channel);
     let request = tokio::spawn(async move {
         client
-            .stats(crate::proto::StatsRequest {
+            .update(crate::proto::UpdateRequest {
                 sandbox_id: "sandbox".to_string(),
+                ..Default::default()
             })
             .await
     });

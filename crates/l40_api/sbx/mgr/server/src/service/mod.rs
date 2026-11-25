@@ -411,6 +411,9 @@ pub struct SandboxManagerService {
     /// Guest maintenance leaves excess intent durable instead of queueing
     /// unbounded transfer/activation tasks alongside customer work.
     guest_update_sem: Arc<tokio::sync::Semaphore>,
+    /// Concurrent Stats calls. Stats takes no state-writer slot; excess polls
+    /// are rejected rather than queued, and the next poll retries.
+    stats_admission: Arc<tokio::sync::Semaphore>,
     guest_auto_updates: Arc<guest_update::automatic::Automatic>,
     automatic_guest_updates: bool,
     /// Shared blocking cleanup I/O budget, acquired before task allocation.
@@ -1894,6 +1897,9 @@ impl SandboxManagerService {
             ),
             cleanup_sem: Arc::new(tokio::sync::Semaphore::new(DEFAULT_CLEANUP_CONCURRENCY_CAP)),
             guest_update_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            stats_admission: Arc::new(tokio::sync::Semaphore::new(
+                grpc_spaced_files::STATS_CONCURRENCY_CAP,
+            )),
             guest_auto_updates: Arc::default(),
             automatic_guest_updates: options.automatic_guest_updates,
             cleanup_io: Arc::new(tokio::sync::Semaphore::new(CLEANUP_IO_CONCURRENCY_CAP)),
