@@ -9,6 +9,7 @@ use axum::{
 use futures_util::{StreamExt, stream};
 use pplx_space_accounts::NodeId;
 use pplx_space_bearer_token::SpaceBearerToken;
+use pplx_space_cluster_trigger_queue::enqueue_triggers;
 use pplx_space_direct_coordinator::{DirectNode, DirectNodeRegistration, DirectNodeUpdate};
 use pplx_space_node_api_client::proto::{
     GetNodeInfoRequest, NodeRole as ProtoNodeRole, NodeSource, PullTemplateRequest, TransferSource,
@@ -34,7 +35,6 @@ use crate::{
         ReconcileRef, enqueue_node_reconcile_refs_and_trigger,
         enqueue_node_reconcile_refs_for_nodes,
     },
-    reconcile_trigger::enqueue_triggers,
     routes::{AppState, admin::support::require_managing_org_admin},
 };
 

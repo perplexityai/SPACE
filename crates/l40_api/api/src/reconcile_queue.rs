@@ -16,9 +16,9 @@ pub use pplx_space_state_reconciliation::{
     NetworkPolicyTarget, ReconcileElementRef, ReconcileFacet, ReconcileReason, ReconcileRef,
 };
 
-use crate::reconcile_trigger::{enqueue_triggers, enqueue_triggers_tx};
 use pplx_space_cluster_trigger_queue::{
-    QueuedReconcileRefs, QueuedRefConflict, queue_node_reconcile_refs,
+    QueuedReconcileRefs, QueuedRefConflict, enqueue_triggers, enqueue_triggers_tx,
+    queue_node_reconcile_refs,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
