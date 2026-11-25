@@ -23,13 +23,13 @@
 //!    write directly into the digest dir — vol-mgr's per-file
 //!    `.partial → rename` provides per-file atomicity.
 //! 4. Materializing local `rootfs.ext4` in expanded runtime shape via
-//!    [`crate::rootfs_zstd::decompress_rootfs`] (process-unique tmp
+//!    `crate::rootfs_zstd::decompress_rootfs` (process-unique tmp
 //!    filename + atomic rename, so two overlapping decompresses from a
 //!    cancellation race can't corrupt each other) and verifying its
 //!    digest against the resolved release `hash`. Mismatch is the only
 //!    hard failure on this path.
 //! 5. Atomically rewriting `manifest.json` with normalized fields (via
-//!    [`write_file_atomic`]) and inserting a `ready` build row in
+//!    `write_file_atomic`) and inserting a `ready` build row in
 //!    SQLite.
 //!
 //! There is no staging dir. A process-local flight map coalesces
@@ -348,7 +348,7 @@ pub enum PullOutcome {
 ///
 /// The map is also the digest claim: registration, imports, background rootfs
 /// compression, `DeleteTemplateBuild`, startup recovery's per-dir pass and the
-/// GC tick's rowless check hold a [`DigestClaim`] in it while they write or
+/// GC tick's rowless check hold a `DigestClaim` in it while they write or
 /// remove the digest's dirs and rows, and `DeleteTemplate` holds one for the
 /// whole template, so no two of them, and no pull, hold the same digest at
 /// once. Eviction coordinates through the eviction gate and the row's

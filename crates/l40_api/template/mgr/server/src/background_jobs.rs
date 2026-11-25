@@ -20,7 +20,7 @@
 //!
 //! ## Stamp job
 //!
-//! See [`stamp::execute`] for the per-attempt logic. The classifier
+//! See `stamp::execute` for the per-attempt logic. The classifier
 //! is:
 //!
 //! - `FailedPrecondition` from nodemgr → [`JobError::Permanent`].

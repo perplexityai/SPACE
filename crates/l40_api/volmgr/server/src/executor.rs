@@ -176,7 +176,7 @@ impl<'de> serde::Deserialize<'de> for FileMode {
 /// execute does not lose the typed identity. The `#[serde(alias = "sandbox_id")]`
 /// keeps deserialization of pre-rename payloads sitting in the SQLite job
 /// queue working — those store a bare sandbox UUID in this slot, which is
-/// re-typed via [`parse_subject_id_with_legacy_fallback`] at execute time.
+/// re-typed via `parse_subject_id_with_legacy_fallback` at execute time.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct TransferPayload {
     #[serde(alias = "sandbox_id")]
@@ -261,7 +261,7 @@ pub struct TransferPayload {
 /// worker's `from_json` step rather than reaching credmgr. `wrapped_dek`
 /// is the opaque ciphertext we persist; the AADs (artifact-level wrap +
 /// per-entry chunk) are derived at execute time from the payload's
-/// subject, `artifact_id`, and entry `role` via [`derive_artifact_aads`],
+/// subject, `artifact_id`, and entry `role` via `derive_artifact_aads`,
 /// so no AAD bytes round-trip through the request or the SQLite row.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TransferEncryption {
@@ -1060,7 +1060,7 @@ pub struct TransferExecutorConfig {
     /// Deployment upload policy with one shared streaming-buffer budget.
     pub snapshot_upload_mode: SnapshotUploadMode,
     /// Maximum concurrent CPU-bound zstd passes (compress or decompress).
-    /// `0` auto-sizes to the CPU quota. See [`resolved_codec_concurrency`].
+    /// `0` auto-sizes to the CPU quota. See `resolved_codec_concurrency`.
     pub codec_concurrency: usize,
     /// Decode zstd pulls inline with the ranged download (one pass) instead
     /// of a separate read-back decompress step. Kill switch for rollout;

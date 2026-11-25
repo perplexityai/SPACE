@@ -5,7 +5,7 @@ mod btrfs_push;
 mod codec_admission;
 pub mod credentials;
 pub mod crypto;
-pub mod db;
+pub(crate) mod db;
 pub mod executor;
 mod materialization;
 pub mod metrics;

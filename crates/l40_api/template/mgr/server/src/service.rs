@@ -1960,13 +1960,13 @@ impl TemplateManagerService {
 
     /// Spawn the LRU eviction loop. Budgeted by
     /// `SPACE_TEMPLATE_CACHE_BUDGET_BYTES` (default 100 GiB): when it is
-    /// explicitly zero, [`crate::eviction::run_loop`] evicts nothing and
+    /// explicitly zero, `crate::eviction::run_loop` evicts nothing and
     /// only checks build dirs without a row on each tick.
     ///
     /// The loop owns:
     /// - The `SharedConnection` (same instance as the
     ///   prefetcher and the volume puller).
-    /// - A clone of [`TemplateArtifactStore`] for disk deletes.
+    /// - A clone of `TemplateArtifactStore` for disk deletes.
     /// - A closure that lazily connects to sbx-mgr per tick. A
     ///   failed `List` short-circuits the tick — without an active
     ///   set we cannot safely evict; grace-period age is the backstop
