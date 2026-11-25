@@ -1451,6 +1451,27 @@ them with `disposition` and `reason`. On OTLP the cluster is the `cluster_id`
 point attribute or resource `space.cluster.id`, and the release is resource
 `service.version`.
 
+## Admin node terminate guard
+
+A v1 `:terminate` (`POST /admin/api/v1/nodes/{node_id}:terminate`) counts the
+occupancy guard's decision in `admin.node_terminate.guard`, tagged `node_id` and
+`outcome`, before it writes the phase. A v2 node's `:terminate` doesn't reach
+the guard and counts nothing.
+
+| `outcome` | Meaning |
+| --- | --- |
+| `allowed` | No resident sandbox and no drain-gate blocker was counted, so the call went on to move the node to `terminating` |
+| `refused_active` | A resident sandbox was counted, whatever the drain blockers; the call answered 409 |
+| `refused_drain_blockers` | Only drain-gate blockers were counted; the call answered 409 |
+
+A refusal's `admin_audit` log entry (target `space.admin.audit`) carries the
+counts in `outcome_counts`, as `active=N drain_blockers=M`.
+
+Automation calls `:terminate` on drained nodes, so a node refused on every
+call stays `drained`, and only its audit entries say why. Alert on a `refused_*` outcome that
+persists for one `node_id` across repeated calls. `allowed` comes from the same
+counts, so it cannot show a blocker the count missed.
+
 ## Sandboxes in a transient lifecycle
 
 The cluster controller's elected leader counts the `sandboxes` rows in each
