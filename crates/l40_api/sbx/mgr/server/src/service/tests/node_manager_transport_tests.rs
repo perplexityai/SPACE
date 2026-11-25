@@ -617,6 +617,65 @@ async fn stats_answers_without_cgroup_figures_while_node_manager_is_down() {
     );
 }
 
+/// `Stats` asks node-manager for the cgroup files alone and reports them.
+#[tokio::test]
+async fn stats_reads_cgroup_figures_through_a_cgroup_only_inspect() {
+    use pplx_space_node_mgr_client::proto::{InspectSandboxRequest, InspectSandboxResponse};
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &sandbox_id, SandboxState::Started);
+    conn.execute(
+        "UPDATE sandboxes SET uid = 10000, slot = 7 WHERE id = ?1",
+        crate::db::fixture::params![sandbox_id],
+    )
+    .unwrap();
+    let node_manager = FakeNodeManager::default()
+        .unary("InspectSandbox", |request: InspectSandboxRequest| {
+            if !request.cgroup_only {
+                return Err(Status::failed_precondition("Stats needs only the cgroup"));
+            }
+            // An older node-manager answers the full inspection from this identity.
+            if request.uuid8.is_empty()
+                || request.uid != Some(10_000)
+                || request.slot != Some(7)
+                || request.template.is_none()
+            {
+                return Err(Status::invalid_argument("Stats sends the sandbox identity"));
+            }
+            Ok(InspectSandboxResponse {
+                sandbox_id: request.sandbox_id,
+                cgroup_exists: true,
+                cgroup_cpu_max: "200000 100000".to_string(),
+                cgroup_memory_max: "1073741824".to_string(),
+                cgroup_memory_current: "524288".to_string(),
+                cgroup_pids_max: "max".to_string(),
+                cgroup_pids_current: "3".to_string(),
+                cgroup_cpu_stat: "usage_usec 4200\nuser_usec 4000\n".to_string(),
+                ..Default::default()
+            })
+        })
+        .serve();
+    let service = service_with_node_manager(conn, node_manager.connector());
+
+    let stats = service
+        .stats(internal_request(StatsRequest {
+            sandbox_id: sandbox_id.clone(),
+        }))
+        .await
+        .expect("Stats answers from the cgroup inspect")
+        .into_inner();
+    assert_eq!(
+        (
+            stats.cpu_max.as_str(),
+            stats.memory_max,
+            stats.memory_current,
+            stats.pids_current,
+            stats.cpu_usage_usec,
+        ),
+        ("200000 100000", 1_073_741_824, 524_288, 3, 4200)
+    );
+}
+
 /// The read's budget bounds the whole read, not only its retries. The kept
 /// channel dials inside an attempt, so with no caller deadline a node-manager
 /// that accepts but never answers would hold the read until the server's own
