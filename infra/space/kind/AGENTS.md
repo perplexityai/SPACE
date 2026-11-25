@@ -36,7 +36,9 @@ Direct state manipulation is limited to faults or state with no public setup
 path: the run-scoped ECW API key, stale node tombstones contradicted by
 Kubernetes, stranded lifecycle rows created by the sweeper smoke, the
 backdated reconcile-queue rows of the reconcile-queue GC smoke's synthetic
-nodes, and Kubernetes Node patches exercised by the node-ctl admission smoke. Keep these exceptions inside their existing helpers
+nodes, the stale `node_k8s.instance_id` the drain v2 stale-instance smoke
+writes (only an older registration writer leaves one), and Kubernetes Node
+patches exercised by the node-ctl admission smoke. Keep these exceptions inside their existing helpers
 or suites.
 
 ## Harness invariants

@@ -82,6 +82,7 @@ class Scenario(Generic[Fixture]):
     telemetry_mode: str | None
     storage_credentials: str | None
     test_hooks: str | None
+    drain_v1: bool
     browser: str | None
     verify: Callable[[Fixture], None]
     source_module: str
@@ -129,6 +130,7 @@ def scenario(
     cleanup_timeout_seconds: float | None = None,
     storage_credentials: str | None = None,
     test_hooks: str | None = None,
+    drain_v1: bool = False,
     substrates: Iterable[str] | None = None,
     browser: str | None = None,
 ) -> Callable[[Callable[[Fixture], None]], Scenario[Fixture]]:
@@ -149,6 +151,11 @@ def scenario(
     the scenario cannot pass without; implicit selection skips it, visibly, on
     a bench of release binaries (SPACE_KIND_RUST_BUILD=release), which read
     none.
+    `drain_v1` marks a scenario that drives v1 node drains, which the admin
+    API refuses while drain v2 is on (`SPACE_DRAIN_V2_ENABLED`: v1 and v2
+    drains never run together); a suite run skips it, visibly, on a bench
+    whose public API runs drain v2, as Kind's values do. Run it on a bench
+    with drain v2 off.
     `timeout_minutes` raises the fixture's wall-clock budget for a scenario
     whose own waits outlast it; it never lowers it.
     `browser` names the browser the scenario drives a web UI through
@@ -311,6 +318,7 @@ def scenario(
             telemetry_mode=telemetry_mode,
             storage_credentials=storage_credentials,
             test_hooks=test_hooks,
+            drain_v1=drain_v1,
             browser=browser,
             verify=verify,
             source_module=verify.__module__,

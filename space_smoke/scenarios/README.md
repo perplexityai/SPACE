@@ -27,7 +27,11 @@ Placement-related pull requests also select the main-tier node-selector
 scenario. The tier controls when a scenario runs, not what it proves.
 Template, API surface, backend, substrate, test-hook and browser requirements
 still apply. Quarantine is separate from tier and withholds a known defect
-from implicit selection.
+from implicit selection. A scenario that declares `drain_v1` drives v1 node
+drains, which the admin API refuses while drain v2 is on
+(`SPACE_DRAIN_V2_ENABLED`); a suite run skips it, visibly, on a bench whose
+public API runs drain v2, as Kind's values do, so run those on a bench with
+drain v2 off.
 
 Manual scenarios run only by name and must declare a nonempty `manual_reason`.
 Use manual for an explicit operational prerequisite or a contract whose

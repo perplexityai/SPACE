@@ -59,6 +59,7 @@ def test_shards_run_every_eligible_scenario_once_and_propagate_failures(count):
                     "return_value.browser_unavailable.return_value": None,
                     "return_value.storage_credentials.return_value": "exchange",
                     "return_value.substrate.return_value": "kubernetes",
+                    "return_value.drain_v2_enabled.return_value": False,
                 },
             ) as bootstrap,
             mock.patch("space_smoke.__main__.run_scenarios", side_effect=execute),
