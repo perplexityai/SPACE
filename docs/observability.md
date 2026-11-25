@@ -1341,6 +1341,66 @@ Metric backends with explicit tag-retention allowlists must retain
 `cleanup_state`, `runtime` and `runtime_version` alongside `state` to support
 the cleanup and version breakdowns.
 
+## Auto-lifecycle delete completions
+
+A node reports the sandboxes its idle policy deleted as delete receipts in
+`PublishNodeState`. internal-api decides each receipt in the publication
+transaction and, once that commits, counts each `disposition` and `reason`
+pair in `sandbox.auto_lifecycle.delete_completion`. A publication whose
+transaction rolls back counts nothing.
+
+| `disposition` | Meaning |
+| --- | --- |
+| `applied` | The receipt deleted the sandbox row |
+| `acknowledged_noop` | Settled without deleting; the node may prune the receipt |
+| `deferred` | Not decided; the node sends the receipt again in a later publication |
+| `unacknowledgeable` | The receipt id does not parse, so it cannot be acknowledged |
+
+`reason` names the check that decided the receipt. Its values are
+`AutoLifecycleDeleteCompletionReason` in
+`crates/l40_api/sandbox/metrics/src/publication.rs`:
+
+| `reason` | `disposition` | Meaning |
+| --- | --- | --- |
+| `applied` | `applied` | Every check passed and the delete committed |
+| `lock_contended` | `deferred` | Another transaction held a row that a `NOWAIT` lock on the sandbox, its latest execution or its quarantine evidence needed |
+| `finalize_contended` | `deferred` | The delete hit a lock timeout, deadlock or serialization failure |
+| `transient_lifecycle` | `deferred` | The sandbox is in a transient lifecycle |
+| `awaiting_ownership_evidence` | `deferred` | A `started` or `paused` sandbox has no active node, within the ownership grace period |
+| `creating_snapshot` | `deferred` | One of the sandbox's snapshots is still `creating` |
+| `policy_unreadable` | `deferred` | The stored auto-lifecycle policy does not parse |
+| `unsupported_fingerprint_version` | `deferred` | The receipt's policy fingerprint version is newer than this build reads |
+| `duplicate_sandbox_receipt` | `deferred` | A second receipt for a sandbox already selected in this publication |
+| `batch_limit` | `deferred` | A parsed receipt past the per-publication batch of `AUTO_LIFECYCLE_DELETE_COMPLETION_BATCH_SIZE` sandboxes |
+| `request_limit` | `deferred` | An entry past the request's `AUTO_LIFECYCLE_DELETE_COMPLETION_REQUEST_LIMIT` cap, never parsed |
+| `sandbox_absent` | `acknowledged_noop` | The sandbox row is gone, as on a retry of an applied receipt |
+| `deleted_tombstone` | `acknowledged_noop` | The sandbox row is already `deleted` |
+| `unknown_lifecycle` | `acknowledged_noop` | The stored lifecycle is not one this build knows |
+| `missing_lineage` | `acknowledged_noop` | The sandbox has no execution row |
+| `stale_generation` | `acknowledged_noop` | A newer execution generation exists |
+| `ahead_of_lineage` | `acknowledged_noop` | The receipt's generation is newer than the latest execution's |
+| `missing_route_identity` | `acknowledged_noop` | The latest execution has no route activation id |
+| `route_incarnation_mismatch` | `acknowledged_noop` | The route activation id differs from the receipt's |
+| `different_execution_node` | `acknowledged_noop` | Another node owns the latest execution |
+| `policy_mismatch` | `acknowledged_noop` | The stored policy's fingerprint differs from the receipt's |
+| `policy_does_not_authorize_delete` | `acknowledged_noop` | The stored policy has no delete action |
+| `quarantine_hold` | `acknowledged_noop` | The sandbox is quarantined, and not by a matching orphan quarantine for this node |
+| `different_active_node` | `acknowledged_noop` | The sandbox is active on another node |
+| `ownership_evidence_expired` | `acknowledged_noop` | A `started` or `paused` sandbox has had no active node past the grace period |
+| `ownership_absent` | `acknowledged_noop` | The sandbox has no active node and no placement left to prove |
+| `malformed_receipt` | `acknowledged_noop` or `unacknowledgeable` | A field does not parse; `unacknowledgeable` when it is the receipt id |
+
+Every `acknowledged_noop` other than `sandbox_absent` also logs a warning.
+
+Contended receipts can only be told apart from applied ones by `disposition`
+and `reason`, and clusters and releases only by the constant identity tags. On
+the DogStatsD path those are `cluster_id` and `version`, and a per-metric tag
+configuration (see
+[Restricted tag configurations](#restricted-tag-configurations)) must list
+them with `disposition` and `reason`. On OTLP the cluster is the `cluster_id`
+point attribute or resource `space.cluster.id`, and the release is resource
+`service.version`.
+
 ## Sandboxes in a transient lifecycle
 
 The cluster controller's elected leader counts the `sandboxes` rows in each

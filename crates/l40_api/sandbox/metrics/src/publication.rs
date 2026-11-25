@@ -219,6 +219,10 @@ impl fmt::Display for AutoLifecycleDeleteCompletionReason {
     }
 }
 
+/// Count internal-api's decisions on a committed publication's auto-lifecycle
+/// delete receipts. "Auto-lifecycle delete completions" in
+/// `docs/observability.md` explains each reason; keep it in step with
+/// [`AutoLifecycleDeleteCompletionReason`].
 pub fn auto_lifecycle_delete_completion(
     disposition: AutoLifecycleDeleteCompletionDisposition,
     reason: AutoLifecycleDeleteCompletionReason,
