@@ -315,7 +315,7 @@ impl Installer {
         let pins = parts.pins.clone();
         tokio::task::spawn_blocking(move || pins.catalog()).await??;
         let db = store::open(state_dir).await?;
-        let orphaned = store::delete_orphaned_job_results(&db)?;
+        let orphaned = store::delete_orphaned_job_results(&db).map_err(StoreError::from)?;
         if orphaned > 0 {
             tracing::info!(orphaned, "dropped results of pruned kernel jobs");
         }
