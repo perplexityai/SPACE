@@ -15,7 +15,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgConnection, PgPool, Postgres, SqlSafeStr as _, Transaction};
 
 use super::super::*;
-use super::PROBE_VERSION;
+use super::{PROBE_VERSION, fast_policy, probe_migrator};
 use crate::pg_test_support::TestResult;
 
 /// Per-attempt bound every probe migration imposes, standing in for the `1s`
@@ -26,28 +26,6 @@ const PROBE_LOCK_TIMEOUT: &str = "250ms";
 /// whose margins don't rest on the wait's length: the blocker never releases,
 /// so each attempt fails at its bound however short.
 const SHORT_PROBE_LOCK_TIMEOUT: &str = "50ms";
-
-/// Millisecond-scale schedule so a test spans the same number of attempts a
-/// real deploy would, in a fraction of the wall clock. The window is left
-/// wide so the attempt budget is always what binds here.
-fn fast_policy(attempts: u32) -> LockRetryPolicy {
-    LockRetryPolicy {
-        attempts: NonZeroU32::new(attempts).expect("test attempt budget is non-zero"),
-        initial_backoff: Duration::from_millis(100),
-        max_backoff: Duration::from_millis(200),
-        max_total_wait: Duration::from_secs(60),
-    }
-}
-
-fn probe_migrator(sql: String, no_tx: bool) -> Migrator {
-    Migrator::with_migrations(vec![Migration::new(
-        PROBE_VERSION,
-        Cow::Borrowed("probe"),
-        MigrationType::Simple,
-        sqlx::AssertSqlSafe(sql).into_sql_str(),
-        no_tx,
-    )])
-}
 
 /// A pass that applies one slow migration successfully before the bounded
 /// `ALTER` loses its race, so the two clocks — since run start, and since the

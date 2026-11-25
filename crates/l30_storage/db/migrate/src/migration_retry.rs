@@ -209,6 +209,8 @@ pub(crate) async fn run_up(
         source: MigrateError::Execute(error),
     })?;
 
+    warn_invalid_indexes_before_run(&mut *conn).await;
+
     let mut attempt = 1;
     let mut backoff = policy.initial_backoff;
     // Set at the first failure so the window bounds retrying rather than the
@@ -343,6 +345,55 @@ pub(crate) async fn run_up(
     }
 }
 
+/// An index whose `pg_index.indisvalid` is false.
+#[derive(Debug, sqlx::FromRow)]
+struct InvalidIndex {
+    index: String,
+    table: String,
+    /// Whether writes still maintain it, which for a unique index decides
+    /// whether it still refuses writes that violate it.
+    ready: bool,
+    /// Whether another session holds `SHARE UPDATE EXCLUSIVE` on the table,
+    /// as a `CONCURRENTLY` build or drop does until it ends, so the index may
+    /// still be in progress rather than abandoned. A build keeps running on
+    /// the server after its client is killed. `VACUUM`, `ANALYZE` and work on
+    /// another index of the table take the same lock, so true means "maybe";
+    /// false means no build or drop holds the table now (one still waiting
+    /// for the lock shows false).
+    in_progress: bool,
+}
+
+/// Every index in the database that Postgres holds as INVALID.
+async fn invalid_indexes<'c>(
+    executor: impl PgExecutor<'c>,
+) -> Result<Vec<InvalidIndex>, sqlx::Error> {
+    sqlx::query_as(sql!(
+        r#"
+        SELECT
+            i.indexrelid::regclass::text AS index,
+            i.indrelid::regclass::text AS "table",
+            i.indisready AS ready,
+            EXISTS (
+                SELECT 1
+                FROM pg_locks AS l
+                WHERE l.locktype = 'relation'
+                    AND l.database = (
+                        SELECT oid FROM pg_database WHERE datname = current_database()
+                    )
+                    AND l.relation = i.indrelid
+                    AND l.mode = 'ShareUpdateExclusiveLock'
+                    AND l.granted
+                    AND l.pid <> pg_backend_pid()
+            ) AS in_progress
+        FROM pg_index AS i
+        WHERE NOT i.indisvalid
+        ORDER BY i.indexrelid::regclass::text
+        "#
+    ))
+    .fetch_all(executor)
+    .await
+}
+
 /// Log each index Postgres holds as INVALID after the statement of the
 /// `-- no-transaction` up or down migration at `failed_version` failed.
 ///
@@ -351,28 +402,25 @@ pub(crate) async fn run_up(
 /// not show: a failed up records no history row, and a failed down keeps the
 /// row of the up it was undoing. The query covers the whole database, so a
 /// listed index may also come from an earlier failure or another session's
-/// build; the line says only that it was INVALID when this migration failed.
-/// `ready` says whether writes still maintain it, which for a unique index
-/// decides whether it still refuses writes that violate it.
+/// build; the line says only that it was INVALID when this migration failed,
+/// and `in_progress` whether another session may still be building or
+/// dropping it.
 pub(crate) async fn report_invalid_indexes<'c>(executor: impl PgExecutor<'c>, failed_version: i64) {
-    let indexes: Result<Vec<(String, String, bool)>, sqlx::Error> = sqlx::query_as(sql!(
-        r"
-        SELECT indexrelid::regclass::text, indrelid::regclass::text, indisready
-        FROM pg_index
-        WHERE NOT indisvalid
-        ORDER BY indexrelid::regclass::text
-        "
-    ))
-    .fetch_all(executor)
-    .await;
-    match indexes {
+    match invalid_indexes(executor).await {
         Ok(indexes) => {
-            for (index, table, ready) in indexes {
+            for InvalidIndex {
+                index,
+                table,
+                ready,
+                in_progress,
+            } in indexes
+            {
                 error!(
                     failed_version,
                     index = %index,
                     table = %table,
                     ready,
+                    in_progress,
                     "INVALID index present when a `-- no-transaction` migration failed; \
                      `_sqlx_migrations` does not show it, and the index may be the failed \
                      file's partial state or left by an earlier failure or another session"
@@ -383,6 +431,44 @@ pub(crate) async fn report_invalid_indexes<'c>(executor: impl PgExecutor<'c>, fa
             failed_version,
             error = %error,
             "failed to list INVALID indexes after a `-- no-transaction` migration failed"
+        ),
+    }
+}
+
+/// Log each index Postgres holds as INVALID before a run applies anything.
+///
+/// [`report_invalid_indexes`] only sees a `-- no-transaction` statement that
+/// fails while the migrator is still running. A migrator killed partway
+/// through a `CONCURRENTLY` build or drop logs nothing: the statement keeps
+/// running on the server, and leaves an INVALID index if it later fails or is
+/// terminated. The next run is the first that can log it, and `in_progress`
+/// tells a statement still running from one that stopped. The read only logs:
+/// an INVALID index does not stop the run.
+async fn warn_invalid_indexes_before_run<'c>(executor: impl PgExecutor<'c>) {
+    match invalid_indexes(executor).await {
+        Ok(indexes) => {
+            for InvalidIndex {
+                index,
+                table,
+                ready,
+                in_progress,
+            } in indexes
+            {
+                warn!(
+                    index = %index,
+                    table = %table,
+                    ready,
+                    in_progress,
+                    "INVALID index present before applying migrations; \
+                     `_sqlx_migrations` does not show it, and the index may be partial \
+                     state from an earlier `-- no-transaction` migration, or a build or \
+                     drop still running when `in_progress` is true"
+                );
+            }
+        }
+        Err(error) => warn!(
+            error = %error,
+            "failed to list INVALID indexes before applying migrations"
         ),
     }
 }

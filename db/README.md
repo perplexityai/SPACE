@@ -634,9 +634,22 @@ A failed `DROP INDEX CONCURRENTLY` can leave one too, and so can a
 statement of a `-- no-transaction` file fails under `control-plane up`,
 `reset` or `down`, the migrator logs one error per INVALID index in the
 database before it exits, with the `failed_version`, the `index`, its `table`,
-and `ready` (whether writes still maintain it). The list is not capped or
-filtered to the failed file, so it can name an index from an earlier failure
-or another session's build; check which file names it before recovering.
+`ready` (whether writes still maintain it) and `in_progress`. The list is not
+capped or filtered to the failed file, so it can name an index from an earlier
+failure or another session's build; check which file names it before
+recovering.
+A Job killed partway through such a file logs none of this, and its statement
+keeps running on the server: the index it leaves is INVALID while the build or
+drop runs, and stays INVALID only if that statement later fails or is
+terminated. So `control-plane up`, and `reset` after it drops the schema, also
+run the same query before they apply anything, and log a warning per INVALID
+index with the same fields but no `failed_version`; the run goes on either way.
+`in_progress` is true when another session holds `SHARE UPDATE EXCLUSIVE` on
+the table, as a running `CONCURRENTLY` build or drop does. `VACUUM`, `ANALYZE`
+and a build or drop of another index on that table hold it too, so true means
+it may be running. Do not drop an index while it is true: wait for the
+statement to end, then check again. When it is false, no build or drop holds
+the table now; one still waiting for the lock also shows false.
 
 [The migration lint guard](../scripts/check-postgres-migrations-squawk.sh)
 checks changed `db/postgres/*.up.sql` files with Squawk. Squawk catches generic
