@@ -103,7 +103,8 @@
 //!    nothing: the node returns to `drained`, with why in
 //!    `drain_last_error`, and the operator retries.
 //!    Only the `aws` terminator fences. After the fence, the loop asks EC2
-//!    about that instance on its dispatch backoff and, while EC2 lists it in
+//!    about that instance on its dispatch backoff (one EC2 call per tick
+//!    asks about every instance the tick asks about) and, while EC2 lists it in
 //!    a state other than `shutting-down` or `terminated` and no dispatch has
 //!    succeeded, asks Auto Scaling to terminate exactly it, recording
 //!    `dispatched_at` on success; it never dispatches after that, and an
@@ -270,11 +271,13 @@ pub trait V2InstanceAuthority: Send + Sync + 'static {
     /// One that doesn't never fences a node.
     fn terminates(&self) -> bool;
 
-    /// EC2's answer for `instance_id`.
-    fn describe_instance(
+    /// EC2's answer for each of `instance_ids`, in one call: every id asked
+    /// has an answer, and an error or a timeout is
+    /// [`InstanceEvidence::Unknown`] for every one.
+    fn describe_instances(
         &self,
-        instance_id: &str,
-    ) -> impl std::future::Future<Output = InstanceEvidence> + Send;
+        instance_ids: &[String],
+    ) -> impl std::future::Future<Output = HashMap<String, InstanceEvidence>> + Send;
 
     /// Ask Auto Scaling to terminate exactly `instance_id`.
     fn terminate_instance(
@@ -282,6 +285,43 @@ pub trait V2InstanceAuthority: Send + Sync + 'static {
         instance_id: &str,
         decrement_capacity: bool,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+}
+
+/// EC2's answer for each of `asked`, from the instances one call listed: an
+/// id listed under none of them is [`InstanceEvidence::NotListed`].
+pub fn evidence_by_id(
+    asked: &[&str],
+    listed: Vec<pplx_space_aws_client::ec2::Instance>,
+) -> HashMap<String, InstanceEvidence> {
+    let mut states: HashMap<String, Vec<String>> = asked
+        .iter()
+        .map(|instance_id| ((*instance_id).to_owned(), Vec::new()))
+        .collect();
+    for instance in listed {
+        if let Some(listed) = states.get_mut(&instance.instance_id) {
+            listed.push(instance.state);
+        }
+    }
+    states
+        .into_iter()
+        .map(|(instance_id, states)| (instance_id, InstanceEvidence::from_states(&states)))
+        .collect()
+}
+
+/// [`InstanceEvidence::Unknown`] for each of `instance_ids`, with `why`.
+fn unknown_for<'a>(
+    instance_ids: impl IntoIterator<Item = &'a str>,
+    why: &str,
+) -> HashMap<String, InstanceEvidence> {
+    instance_ids
+        .into_iter()
+        .map(|instance_id| {
+            (
+                instance_id.to_owned(),
+                InstanceEvidence::Unknown(why.to_owned()),
+            )
+        })
+        .collect()
 }
 
 /// The v2 loop's authority: EC2 and Auto Scaling, with the `aws`
@@ -300,30 +340,44 @@ impl V2InstanceAuthority for V2Terminator {
         matches!(self, Self::Ec2 { .. })
     }
 
-    async fn describe_instance(&self, instance_id: &str) -> InstanceEvidence {
+    async fn describe_instances(
+        &self,
+        instance_ids: &[String],
+    ) -> HashMap<String, InstanceEvidence> {
         let Self::Ec2 { ec2, .. } = self else {
-            return InstanceEvidence::Unknown("the terminator is not aws".to_owned());
+            return unknown_for(
+                instance_ids.iter().map(String::as_str),
+                "the terminator is not aws",
+            );
         };
-        if Ec2InstanceId::parse(instance_id).is_none() {
-            return InstanceEvidence::Unknown(format!("{instance_id} is not an instance id"));
+        let (asked, malformed): (Vec<&str>, Vec<&str>) = instance_ids
+            .iter()
+            .map(String::as_str)
+            .partition(|instance_id| Ec2InstanceId::parse(instance_id).is_some());
+        let mut answers: HashMap<String, InstanceEvidence> = malformed
+            .into_iter()
+            .map(|instance_id| {
+                (
+                    instance_id.to_owned(),
+                    InstanceEvidence::Unknown(format!("{instance_id} is not an instance id")),
+                )
+            })
+            .collect();
+        if asked.is_empty() {
+            return answers;
         }
-        match tokio::time::timeout(
-            AWS_CALL_TIMEOUT,
-            ec2.describe_instances_by_ids(&[instance_id]),
-        )
-        .await
-        {
-            Ok(Ok(instances)) => {
-                let states: Vec<String> = instances
-                    .into_iter()
-                    .filter(|instance| instance.instance_id == instance_id)
-                    .map(|instance| instance.state)
-                    .collect();
-                InstanceEvidence::from_states(&states)
-            }
-            Ok(Err(error)) => InstanceEvidence::Unknown(error.to_string()),
-            Err(_) => InstanceEvidence::Unknown("the EC2 call timed out".to_owned()),
-        }
+        // The client asks with an `instance-id` filter, so an id EC2 doesn't
+        // know is left out of the answer rather than failing the call.
+        answers.extend(
+            match tokio::time::timeout(AWS_CALL_TIMEOUT, ec2.describe_instances_by_ids(&asked))
+                .await
+            {
+                Ok(Ok(instances)) => evidence_by_id(&asked, instances),
+                Ok(Err(error)) => unknown_for(asked, &error.to_string()),
+                Err(_) => unknown_for(asked, "the EC2 call timed out"),
+            },
+        );
+        answers
     }
 
     async fn terminate_instance(
@@ -781,8 +835,9 @@ enum NodeStep {
 
 /// One pass over every v2 node, [`NODE_CONCURRENCY`] at a time. A node the
 /// last tick listed and this one doesn't has its v2 gauges zeroed. EC2 is
-/// asked first, about each fenced node that the backoff lets ask and each
-/// other node whose heartbeat is stale; each node's step reads its answer.
+/// asked first, in one call about every instance the tick asks about: each
+/// fenced node's that the backoff lets ask and each other node's whose
+/// heartbeat is stale; each node's step reads its answer.
 /// Then the sandboxes each listed node's drain left suspended longer than
 /// the config's bound are counted.
 pub async fn tick<S: DrainV2Sink, A: V2InstanceAuthority>(
@@ -823,17 +878,29 @@ pub async fn tick<S: DrainV2Sink, A: V2InstanceAuthority>(
         })
         .map(|node| (node.id, node.asked_instance().map(str::to_owned)))
         .collect();
-    let evidence: HashMap<NodeId, InstanceEvidence> = futures_util::stream::iter(asked)
-        .map(|(node_id, instance_id)| async move {
+    let instance_ids: Vec<String> = asked
+        .iter()
+        .filter_map(|(_, instance_id)| instance_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let answers = if instance_ids.is_empty() {
+        HashMap::new()
+    } else {
+        authority.describe_instances(&instance_ids).await
+    };
+    let evidence: HashMap<NodeId, InstanceEvidence> = asked
+        .into_iter()
+        .map(|(node_id, instance_id)| {
             let answer = match instance_id {
-                Some(instance_id) => authority.describe_instance(&instance_id).await,
+                Some(instance_id) => answers.get(&instance_id).cloned().unwrap_or_else(|| {
+                    InstanceEvidence::Unknown("EC2 gave no answer for it".to_owned())
+                }),
                 None => InstanceEvidence::Unknown("the node records no EC2 instance".to_owned()),
             };
             (node_id, answer)
         })
-        .buffer_unordered(NODE_CONCURRENCY)
-        .collect()
-        .await;
+        .collect();
     let steps: Vec<_> = futures_util::stream::iter(nodes.into_iter().map(|node| {
         let evidence = evidence.get(&node.id).cloned();
         (node, evidence)

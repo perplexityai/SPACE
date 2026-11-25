@@ -302,7 +302,10 @@ struct FakeAuthority {
     terminates: bool,
     answers: HashMap<String, InstanceEvidence>,
     terminate: Result<(), String>,
+    /// Every instance asked about, in order, across calls.
     described: Mutex<Vec<String>>,
+    /// How many `describe_instances` calls were made.
+    describe_calls: Mutex<usize>,
     terminated: Mutex<Vec<(String, bool)>>,
 }
 
@@ -313,6 +316,7 @@ impl FakeAuthority {
             answers: HashMap::new(),
             terminate: Ok(()),
             described: Mutex::default(),
+            describe_calls: Mutex::default(),
             terminated: Mutex::default(),
         }
     }
@@ -338,12 +342,26 @@ impl V2InstanceAuthority for FakeAuthority {
         self.terminates
     }
 
-    async fn describe_instance(&self, instance_id: &str) -> InstanceEvidence {
-        self.described.lock().unwrap().push(instance_id.to_owned());
-        self.answers
-            .get(instance_id)
-            .cloned()
-            .unwrap_or_else(|| InstanceEvidence::Listed("running".to_owned()))
+    async fn describe_instances(
+        &self,
+        instance_ids: &[String],
+    ) -> HashMap<String, InstanceEvidence> {
+        *self.describe_calls.lock().unwrap() += 1;
+        self.described
+            .lock()
+            .unwrap()
+            .extend(instance_ids.iter().cloned());
+        instance_ids
+            .iter()
+            .map(|instance_id| {
+                let answer = self
+                    .answers
+                    .get(instance_id)
+                    .cloned()
+                    .unwrap_or_else(|| InstanceEvidence::Listed("running".to_owned()));
+                (instance_id.clone(), answer)
+            })
+            .collect()
     }
 
     async fn terminate_instance(
@@ -2533,4 +2551,92 @@ async fn a_registration_replaced_after_the_cordon_gets_no_further_effect() {
             );
         }
     }
+}
+
+/// A tick asks EC2 once, about every instance it asks about, however many
+/// nodes ask: each stale unfenced node and each fenced one. Each node reads
+/// the answer for its own instance: one EC2 doesn't list doesn't hide
+/// another's `terminated`.
+#[tokio::test]
+async fn a_tick_asks_ec2_once_for_every_node() {
+    const TERMINATED: &str = "i-000000000000a0a0a";
+    const UNKNOWN: &str = "i-000000000000b0b0b";
+    let stale = |instance: &str| V2Node {
+        instance_id: Some(instance.to_owned()),
+        heartbeat_fresh: false,
+        ..node(Some("drained"), Some(5))
+    };
+    let terminated = stale(TERMINATED);
+    let unknown = stale(UNKNOWN);
+    let running = stale(INSTANCE);
+    let fenced = V2Node {
+        fence: Some("i-000000000000c0c0c".to_owned()),
+        ..fenced(true)
+    };
+    let sink = FakeSink {
+        nodes: vec![
+            terminated.clone(),
+            unknown.clone(),
+            running.clone(),
+            fenced.clone(),
+        ],
+        ..FakeSink::default()
+    };
+    let authority = FakeAuthority {
+        answers: HashMap::from([
+            (TERMINATED.to_owned(), InstanceEvidence::Terminated),
+            (UNKNOWN.to_owned(), InstanceEvidence::NotListed),
+        ]),
+        ..FakeAuthority::ok()
+    };
+    let report = run_tick(&sink, &authority).await;
+    assert_eq!(*authority.describe_calls.lock().unwrap(), 1);
+    let mut described = authority.described();
+    described.sort();
+    assert_eq!(
+        described,
+        [
+            INSTANCE,
+            "i-000000000000a0a0a",
+            "i-000000000000b0b0b",
+            "i-000000000000c0c0c",
+        ]
+    );
+    assert_eq!(report.let_go, [terminated.id]);
+    for kept in [&unknown, &running] {
+        assert!(!called(&sink, "let_go", kept), "{:?}", sink.calls());
+    }
+}
+
+/// EC2's answer for each instance one call asked about, from what it listed:
+/// an instance it doesn't list is not listed, beside the others' answers,
+/// and one listed twice may still run.
+#[test]
+fn one_ec2_answer_reads_per_instance() {
+    let listed = |instance_id: &str, state: &str| pplx_space_aws_client::ec2::Instance {
+        instance_id: instance_id.to_owned(),
+        state: state.to_owned(),
+    };
+    let answers = evidence_by_id(
+        &["i-a", "i-b", "i-c", "i-d"],
+        vec![
+            listed("i-b", "terminated"),
+            listed("i-c", "running"),
+            listed("i-c", "running"),
+            listed("i-d", "shutting-down"),
+            listed("i-z", "terminated"),
+        ],
+    );
+    assert_eq!(
+        answers,
+        HashMap::from([
+            ("i-a".to_owned(), InstanceEvidence::NotListed),
+            ("i-b".to_owned(), InstanceEvidence::Terminated),
+            (
+                "i-c".to_owned(),
+                InstanceEvidence::Listed("listed 2 times".to_owned())
+            ),
+            ("i-d".to_owned(), InstanceEvidence::ShuttingDown),
+        ])
+    );
 }
