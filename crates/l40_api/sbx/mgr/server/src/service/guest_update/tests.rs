@@ -598,7 +598,7 @@ fn installed_authority_must_match_the_current_promotion_and_authorization() {
 struct ObservedCaptures {
     service: SandboxManagerService,
     id: String,
-    captures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    captures: tokio::sync::watch::Sender<usize>,
     observer: tokio::task::JoinHandle<()>,
 }
 
@@ -619,12 +619,12 @@ impl ObservedCaptures {
             .unwrap()
             .node_execution_id
             .unwrap();
-        let captures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (captures, _) = tokio::sync::watch::channel(0);
         let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
             .unary("CaptureSandboxEndpointProof", {
-                let captures = std::sync::Arc::clone(&captures);
+                let captures = captures.clone();
                 move |_: CaptureSandboxEndpointProofRequest| {
-                    captures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    captures.send_modify(|count| *count += 1);
                     Err::<SandboxEndpointProof, _>(refusal())
                 }
             })
@@ -651,7 +651,16 @@ impl ObservedCaptures {
 
     async fn after(&self, wait: Duration) -> usize {
         tokio::time::sleep(wait).await;
-        self.captures.load(std::sync::atomic::Ordering::SeqCst)
+        *self.captures.borrow()
+    }
+
+    /// Returns once the observer has requested `count` endpoint proofs.
+    async fn until(&self, count: usize) {
+        self.captures
+            .subscribe()
+            .wait_for(|captures| *captures >= count)
+            .await
+            .expect("ObservedCaptures holds a sender");
     }
 }
 
@@ -697,8 +706,7 @@ async fn refused_endpoint_attestation_waits_for_a_spaced_host_relaunch() {
 #[tokio::test]
 async fn unavailable_endpoint_proof_keeps_reconnecting() {
     let observed = ObservedCaptures::start(|| Status::unavailable("node-manager restarting"));
-    assert!(
-        observed.after(Duration::from_secs(3)).await >= 4,
-        "transient failures retry within a second"
-    );
+    tokio::time::timeout(Duration::from_secs(3), observed.until(4))
+        .await
+        .expect("transient failures retry within a second");
 }
