@@ -13,6 +13,15 @@ postgres = []
 [lints]
 workspace = true
 
+[features]
+default = []
+# Exposes `ExecutionSupersessionRow::new` and `drain_gate_blocks_source_release`
+# to other crates' test suites as a dev-dependency feature: the constructor for
+# the cluster controller's orphaned-restore-pod GC tests, and the drain gate's
+# reference predicate for the api's `live_residents_tests`. This crate's unit
+# tests get them under `cfg(test)`.
+test-support = []
+
 [dependencies]
 pplx-space-sandbox-model = { workspace = true }
 pplx-space-snapshot-model = { workspace = true }

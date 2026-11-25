@@ -1234,9 +1234,7 @@ pub struct InlineOrgLimit {
 /// one. Each such admission holds an inline permit in its process, so the
 /// overshoot is bounded by the permits free across the API processes.
 ///
-/// Counted with
-/// [`INLINE_ORG_AT_LIMIT`](operation_store::operations::INLINE_ORG_AT_LIMIT);
-/// see there for what it reads.
+/// Counted with `operation_store::operations::INLINE_ORG_AT_LIMIT`; see there for what it reads.
 async fn inline_org_at_limit_tx(
     tx: &mut Transaction<'_, Postgres>,
     org_id: OrgId,

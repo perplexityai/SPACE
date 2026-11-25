@@ -37,6 +37,8 @@ pub mod events;
 pub mod idempotency;
 pub mod operations;
 pub mod quota;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 #[cfg(test)]
 mod tests;

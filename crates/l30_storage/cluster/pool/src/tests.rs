@@ -5179,18 +5179,18 @@ async fn a_twin_gets_copies_of_its_originals_manual_configs() -> TestResult {
     .await?;
 
     assert_eq!(
-        WarmPoolStore::copy_manual_configs_to_release(
+        WarmPoolStore::copy_manual_configs_from_releases(
             &mut *fixture.pool.acquire().await?,
-            original,
+            &[original],
             twin
         )
         .await?,
         1
     );
     assert_eq!(
-        WarmPoolStore::copy_manual_configs_to_release(
+        WarmPoolStore::copy_manual_configs_from_releases(
             &mut *fixture.pool.acquire().await?,
-            original,
+            &[original],
             twin
         )
         .await?,
@@ -5305,9 +5305,9 @@ async fn a_twin_copy_takes_over_the_autoscalers_config_of_a_manual_shape() -> Te
     .execute(&fixture.pool)
     .await?;
 
-    WarmPoolStore::copy_manual_configs_to_release(
+    WarmPoolStore::copy_manual_configs_from_releases(
         &mut *fixture.pool.acquire().await?,
-        original,
+        &[original],
         twin,
     )
     .await?;

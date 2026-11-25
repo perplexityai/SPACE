@@ -187,6 +187,8 @@ pplx-space-node-api-sim = { workspace = true }
 pplx-space-rustls-provider = { workspace = true }
 pplx-space-node-status-store = { workspace = true, features = ["test-support"] }
 pplx-space-runtime-upgrade-campaign-store = { workspace = true, features = ["test-support"] }
+pplx-space-public-operation-store = { workspace = true, features = ["test-support"] }
+pplx-space-sandbox-portability = { workspace = true, features = ["test-support"] }
 pplx-space-test-env = { workspace = true }
 pplx-space-test-hooks = { workspace = true, features = ["test-hooks"] }
 rcgen = { workspace = true, features = ["aws_lc_rs", "pem"] }
