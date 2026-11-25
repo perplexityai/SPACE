@@ -79,15 +79,12 @@ test('a draining v2 drain ends its hold instead of switching mode, typed, and no
   assert.equal(shorten.body, undefined, 'the hold the operator picks makes the body');
   assert.ok(shorten.dangerous && shorten.typed);
   assert.ok(shorten.confirm.includes(V2_SHORTEN_HOLD));
-  assert.deepEqual(labels(v2('draining')), ['Shorten hold', 'End hold now', 'Undrain', 'Upload local snapshots']);
+  assert.deepEqual(labels(v2('draining')), ['Shorten hold', 'End hold now', 'Undrain']);
   for (const mode of [null, 'gentle', 'forced']) {
     assert.ok(!forcesDrain(v2('draining', mode)), `a v2 drain is never sent a mode (${mode})`);
-    // The API keys the upload on the drain refusing activations, which a
-    // v2 drain's sealed node does in every phase.
-    assert.ok(names(v2('draining', mode)).includes('force-upload-local-snapshots'), `upload while a v2 drain runs (${mode})`);
   }
-  assert.deepEqual(labels(v2('drained')), ['Undrain', 'Terminate', 'Upload local snapshots']);
-  assert.deepEqual(names(v2('terminating')), ['undrain', 'force-upload-local-snapshots'], 'unfenced');
+  assert.deepEqual(labels(v2('drained')), ['Undrain', 'Terminate']);
+  assert.deepEqual(names(v2('terminating')), ['undrain'], 'unfenced');
   assert.equal(nodeActions(v2('draining'), 'space').find((a) => a.label === 'End hold now'), undefined, 'not on Direct');
   // A v1 drain still switches to forced.
   assert.ok(forced(node('draining', 'gentle')));
@@ -115,7 +112,7 @@ test('a v2 drain starts on an idle worker with a hold the operator picks, typed,
 
 test('while a v2 cancel is pending, no drain starts and Uncordon is hidden: the API refuses both until it finishes', () => {
   const cancelling = { ...node(), drain_engine: 'v2' };
-  assert.deepEqual(labels(cancelling), ['Cordon', 'Upload local snapshots']);
+  assert.deepEqual(labels(cancelling), ['Cordon']);
   assert.equal(forcesDrain(cancelling), false);
   assert.deepEqual(labels(node()), ['Cordon', 'Uncordon', 'Drain', 'Forced drain', 'v2 drain'], 'an idle worker keeps every choice');
 });
@@ -127,7 +124,6 @@ test('a v2 node in terminating can be undrained until its instance is fenced, an
   const drained = { ...node('drained'), drain_engine: 'v2' };
   const terminate = nodeActions(drained, 'k8s').find((a) => a.action === 'terminate');
   assert.ok(terminate.confirm.includes('returns the node to drained'));
-  assert.ok(names({ ...node('draining'), drain_engine: 'v2' }).includes('force-upload-local-snapshots'), 'a sealed v2 node refuses wakes');
 });
 
 test('undrain stays available while draining or drained, and no other action needs typing', () => {
@@ -147,6 +143,20 @@ test('upload is offered only where the API accepts it', () => {
   assert.ok(names(node('drained', 'gentle')).includes('force-upload-local-snapshots'));
   assert.ok(names(node('terminating', 'gentle')).includes('force-upload-local-snapshots'));
   assert.deepEqual(names(node('terminating', 'gentle')), ['force-upload-local-snapshots']);
+});
+
+// The API refuses it under a v2 drain in every phase and while its cancel is
+// pending: the sealed node itself uploads each local snapshot of a suspended
+// resident that it has not recorded as backed up.
+test('upload is never offered on a v2 drain\'s node', () => {
+  for (const phase of [null, 'draining', 'drained', 'terminating']) {
+    for (const mode of [null, 'gentle', 'forced']) {
+      for (const fenced of [false, true]) {
+        const v2 = { ...node(phase, mode), drain_engine: 'v2', drain: { fenced } };
+        assert.ok(!names(v2).includes('force-upload-local-snapshots'), `phase ${phase}, mode ${mode}, fenced ${fenced}`);
+      }
+    }
+  }
 });
 
 test('the direct substrate keeps only undrain, and other roles get nothing', () => {

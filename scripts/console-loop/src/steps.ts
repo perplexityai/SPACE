@@ -1585,7 +1585,10 @@ step('node-holds-panel', ['nodes'], async (c) => {
   if (counted) c.rec.check(/Holding the node .*what holds it/.test(summary), 'the Drain section summarizes the groups and links to the panel');
   const needsUpload = holds.holds.some((h) => h.reason === 'local_only_snapshot');
   const uploadOffered = await card.getByRole('button', { name: 'Upload local snapshots' }).count();
-  const uploadOpen = node.drain_phase === 'drained' || node.drain_phase === 'terminating' || (node.drain_phase === 'draining' && node.drain_mode === 'forced');
+  // A v1 drain whose gate refuses wakes; never a v2 drain, whose sealed node
+  // itself uploads each local snapshot of a suspended resident that it has
+  // not recorded as backed up.
+  const uploadOpen = node.drain_engine !== 'v2' && (node.drain_phase === 'drained' || node.drain_phase === 'terminating' || (node.drain_phase === 'draining' && node.drain_mode === 'forced'));
   c.rec.check(uploadOffered === Number(needsUpload && uploadOpen), `Upload local snapshots sits by the local-only rows exactly when the API accepts it (${uploadOffered})`);
   await card.screenshot({ path: `${c.rec.outDir}/${c.rec.stepName()}-panel.png` }).catch(() => {});
   // The href, not a click: a held row need not have a sandbox the public API
@@ -2487,11 +2490,16 @@ step('node-v2-drain-now', V2_TAGS, async (c) => {
     c.rec.check(JSON.stringify(answer?.request().postDataJSON()) === '{"engine":"v2","hold_seconds":0,"require_undrained":true}', `the request asks for engine v2 with hold 0, start-only, and no mode (${answer?.request().postData()})`);
     c.rec.check(await waitForSection(c, /Engine\s+v2/, 15_000), 'the Drain section shows engine v2');
     c.rec.check(await waitForPanel(c, /Drain progress/, 15_000), 'the Drain progress panel appears');
+    // The API refuses Upload local snapshots under a v2 drain: the sealed node
+    // itself uploads each local snapshot of a suspended resident that it has
+    // not recorded as backed up.
+    c.rec.check(await exactButton(c.page, 'Upload local snapshots').count() === 0, 'a draining v2 node does not offer Upload local snapshots');
     await panelShot(c, '03-draining');
     c.rec.check(!!(await waitForNode(c, node.id, (n) => n.drain_phase === 'drained', 300_000)), 'the empty worker reaches drained');
     c.rec.check(await waitForSection(c, /Phase\s+drained/, 20_000), "the page's poll shows drained without a reload");
     c.rec.check(await waitForPanel(c, /Finished: everything on the node is durable elsewhere/, 20_000), 'the panel says the drain is finished');
     c.rec.check(await exactButton(c.page, 'Terminate').count() === 1, 'a drained v2 node offers Terminate');
+    c.rec.check(await exactButton(c.page, 'Upload local snapshots').count() === 0, 'a drained v2 node does not offer Upload local snapshots');
     await panelShot(c, '04-drained');
 
     // Terminate's refusal: `:terminate` refuses a v2 node only on its phase.
@@ -2767,6 +2775,10 @@ step('node-v2-hold-shorten-undrain', V2_TAGS, async (c) => {
       // The API refuses every drain until the cancel finishes ("undrain still
       // finishing"), so the page offers none.
       c.rec.check(offered.drain === 0 && offered.forced === 0 && offered.v2 === 0, `while the cancel is pending no drain is offered (${JSON.stringify(offered)})`);
+      // The node may already be unsealed, and its snapshots can change under
+      // an upload: the API refuses Upload local snapshots, and the page
+      // doesn't offer it.
+      c.rec.check(await exactButton(c.page, 'Upload local snapshots').count() === 0, 'while the cancel is pending Upload local snapshots is not offered');
       await progressCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
       await panelShot(c, '14-cancelling');
       await visit(c, '/dashboard/nodes', 3000);
