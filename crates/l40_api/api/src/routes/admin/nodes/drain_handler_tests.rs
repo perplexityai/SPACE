@@ -2434,3 +2434,113 @@ async fn a_v2_drain_follows_the_nodes_preview_not_a_stale_stopped_row() -> TestR
     }
     Ok(())
 }
+
+/// `:force-upload-local-snapshots` against `node_id`, as the handler answers.
+async fn post_force_upload(
+    state: &AppState,
+    actor: &User,
+    node_id: NodeId,
+) -> TestResult<(StatusCode, serde_json::Value)> {
+    let response = super::apply_force_upload_local_snapshots(
+        State(state.clone()),
+        Extension(AuthUser(actor.clone())),
+        node_id,
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024).await?;
+    Ok((status, serde_json::from_slice(&bytes)?))
+}
+
+/// A suspended sandbox pinned to `node_id` with no snapshot in the catalog:
+/// one `:force-upload-local-snapshots` lists and asks the node to upload.
+async fn insert_pinned_local_only(
+    pool: &PgPool,
+    node_id: NodeId,
+) -> TestResult<pplx_space_sandbox_model::SandboxId> {
+    let sandbox_id = pplx_space_sandbox_model::SandboxId::new();
+    crate::controllers::substrate::kubernetes::tests::insert_test_sandbox_row(
+        pool,
+        sandbox_id,
+        "suspended",
+    )
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET target_node_id = $2 WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    Ok(sandbox_id)
+}
+
+/// `:force-upload-local-snapshots` on a node whose drain is v2, in every
+/// phase and while its cancel is pending, is a 409 with its own code. A v1
+/// `drained` node and a v1 forced `draining` node still admit the call and
+/// attempt the pinned sandbox's upload (listed in `reuploaded` or `failed`);
+/// a gentle v1 drain and a node with no drain are still refused, without the
+/// code.
+#[tokio::test(flavor = "current_thread")]
+async fn force_upload_is_refused_under_a_v2_drain_and_runs_under_v1() -> TestResult {
+    if !enter_direct_test_process() {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let state = kubernetes_state(&db.pool).await?;
+    let actor = managing_org_admin(&db.pool).await?;
+    let v2_status = || Some(serde_json::json!({"generation": 42, "deadline_at": 0}));
+
+    for (case, phase) in [
+        ("v2 draining", Some("draining")),
+        ("v2 drained", Some("drained")),
+        ("v2 terminating", Some("terminating")),
+        ("v2 cancel pending", None),
+    ] {
+        let node_id = insert_k8s_node(&db.pool, phase, Some("v2"), v2_status()).await?;
+        insert_pinned_local_only(&db.pool, node_id).await?;
+        let (status, body) = post_force_upload(&state, &actor, node_id).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{case}: {body}");
+        assert_eq!(
+            body["code"], "drain_v2_uploads_local_snapshots",
+            "{case}: {body}"
+        );
+    }
+
+    // A v1 row without a `node_k8s` row: an upload it admits fails at once,
+    // for want of the node's name, and is listed in `failed`.
+    for (case, phase, mode, runs) in [
+        ("v1 drained", Some("drained"), Some("gentle"), true),
+        ("v1 forced draining", Some("draining"), Some("forced"), true),
+        (
+            "v1 gentle draining",
+            Some("draining"),
+            Some("gentle"),
+            false,
+        ),
+        ("no drain", None, None, false),
+    ] {
+        let node_id = insert_node(&db.pool, phase, mode, false).await?;
+        let sandbox_id = insert_pinned_local_only(&db.pool, node_id).await?;
+        let (status, body) = post_force_upload(&state, &actor, node_id).await?;
+        if runs {
+            assert_eq!(status, StatusCode::OK, "{case}: {body}");
+            let answer: pplx_space_admin_protocol::ForceUploadLocalSnapshotsResponse =
+                serde_json::from_value(body.clone())?;
+            let attempted: Vec<_> = answer
+                .reuploaded
+                .iter()
+                .copied()
+                .chain(answer.failed.iter().map(|failure| failure.sandbox_id))
+                .collect();
+            assert_eq!(attempted, [sandbox_id], "{case}: {body}");
+        } else {
+            assert_eq!(status, StatusCode::CONFLICT, "{case}: {body}");
+            assert!(body.get("code").is_none(), "{case}: {body}");
+        }
+    }
+    Ok(())
+}
