@@ -348,26 +348,6 @@ impl KubernetesSubstrate {
             .map(|pod| (pod.ip, pod.source)))
     }
 
-    /// [`Self::resolve_pod_ip`] for a path that stops or deletes the runtime
-    /// at the address: a node-reported one only while its node affirms the
-    /// execution there (see [`Self::verified_runtime_pod_ip`]).
-    pub(in crate::controllers::substrate::kubernetes) async fn resolve_runtime_pod_ip(
-        &self,
-        sandbox_id: SandboxId,
-    ) -> Result<Option<PodIp>, SubstrateError> {
-        let Some(pod) = self.resolve_pod_instance(sandbox_id).await? else {
-            return Ok(None);
-        };
-        let pod_name = K8sStore::execution_pod_name(sandbox_id, pod.generation);
-        let target = PodProxyWaitTarget {
-            pod_name: &pod_name,
-            pod_uid: pod.pod_uid.as_ref().map(PodUid::as_str),
-            generation: pod.generation,
-        };
-        self.verified_runtime_pod_ip(sandbox_id, (pod.ip, pod.source), &target)
-            .await
-    }
-
     /// [`Self::resolve_pod_ip`], with the identity of the pod the address
     /// belongs to.
     pub(in crate::controllers::substrate::kubernetes) async fn resolve_pod_instance(

@@ -1454,11 +1454,12 @@ pub(super) enum RuntimeAnswer {
     /// The worker reports the target's generation and Pod UID, and `pod_ip`
     /// whenever it reports an address.
     Serves,
-    /// The worker does not report the sandbox, or reports a different
-    /// generation, Pod UID or address.
+    /// The worker does not report the sandbox, reports a different
+    /// generation or Pod UID, or reports it unidentified at another address.
     Elsewhere,
     /// The worker reports the sandbox without its generation or Pod UID (an
-    /// older node, or a sandbox manager that has restarted).
+    /// older node, or a sandbox manager that has restarted), or reports the
+    /// target's execution at another address.
     Unconfirmed,
 }
 
@@ -1475,27 +1476,24 @@ pub(super) fn runtime_answer(
     let Some(info) = sandboxes.iter().find(|info| info.sandbox_id == sandbox_id) else {
         return RuntimeAnswer::Elsewhere;
     };
-    let differs = info
+    let identity_differs = info
         .execution_generation
         .is_some_and(|generation| generation != target.generation)
         || info
             .pod_uid
             .as_deref()
             .zip(target.pod_uid)
-            .is_some_and(|(reported, expected)| reported != expected)
-        || info
-            .external_address
-            .as_deref()
-            .is_some_and(|reported| PodIp::parse(reported).ok() != Some(pod_ip));
-    if differs {
-        RuntimeAnswer::Elsewhere
-    } else if info.execution_generation.is_some()
-        && info.pod_uid.is_some()
-        && target.pod_uid.is_some()
-    {
-        RuntimeAnswer::Serves
-    } else {
-        RuntimeAnswer::Unconfirmed
+            .is_some_and(|(reported, expected)| reported != expected);
+    let address_differs = info
+        .external_address
+        .as_deref()
+        .is_some_and(|reported| PodIp::parse(reported).ok() != Some(pod_ip));
+    let identified =
+        info.execution_generation.is_some() && info.pod_uid.is_some() && target.pod_uid.is_some();
+    match (identity_differs, identified, address_differs) {
+        (true, _, _) | (false, false, true) => RuntimeAnswer::Elsewhere,
+        (false, true, false) => RuntimeAnswer::Serves,
+        (false, true, true) | (false, false, false) => RuntimeAnswer::Unconfirmed,
     }
 }
 
@@ -1601,7 +1599,8 @@ mod node_reported_address_tests {
     }
 
     /// A teardown acts on a runtime its worker names by identity, skips it
-    /// only on a contrary answer, and does not read missing fields as either.
+    /// only when the worker reports another execution, and does not read
+    /// missing fields or a moved address as either.
     #[test]
     fn a_runtime_answer_skips_only_a_worker_that_reports_another_runtime() {
         let sandbox_id = SandboxId::new();
@@ -1625,15 +1624,18 @@ mod node_reported_address_tests {
         for elsewhere in [
             info(sandbox_id, 1, "pod-b", "10.0.0.3"),
             info(sandbox_id, 2, "pod-a", "10.0.0.3"),
-            info(sandbox_id, 1, "pod-a", "10.0.0.4"),
             info(SandboxId::new(), 1, "pod-a", "10.0.0.3"),
         ] {
             assert_eq!(answer(elsewhere), RuntimeAnswer::Elsewhere);
         }
+        // The target's execution at another address is still a runtime to
+        // clean up, so the teardown waits for an address it can confirm.
+        let moved = info(sandbox_id, 1, "pod-a", "10.0.0.4");
         let degraded = SandboxInfo {
             sandbox_id: sandbox_id.to_string(),
             ..Default::default()
         };
+        assert_eq!(answer(moved), RuntimeAnswer::Unconfirmed);
         assert_eq!(answer(degraded), RuntimeAnswer::Unconfirmed);
     }
 }
