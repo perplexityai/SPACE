@@ -11,8 +11,8 @@ pub fn audit_persist_failed(method: &str, mode: &str) {
 }
 
 metric_vocabulary! {
-    /// What the v1 `:terminate` occupancy guard decided, on the counts
-    /// `admin_occupancy::terminate_occupancy` returned.
+    /// What the `:terminate` occupancy guard decided under the v1 drain engine,
+    /// on the counts `admin_occupancy::terminate_occupancy` returned.
     NodeTerminateGuardOutcome {
         /// Both counts were zero, so the call went on to the phase write.
         Allowed => "allowed",
@@ -24,11 +24,11 @@ metric_vocabulary! {
     }
 }
 
-/// One v1 `:terminate` that reached the occupancy guard. `allowed` means the
-/// guard let the call through to the `terminating` phase write, not that the
-/// write committed or the instance was terminated: the terminating tick
-/// recounts the blocking residents first and returns the node to `drained` if
-/// one attached after the write. The cluster controller's
+/// One `:terminate` under the v1 drain engine that reached the occupancy guard.
+/// `allowed` means the guard let the call through to the `terminating` phase
+/// write, not that the write committed or the instance was terminated: the
+/// terminating tick recounts the blocking residents first and returns the node
+/// to `drained` if one attached after the write. The cluster controller's
 /// `drained_node_terminator` also moves drained nodes to `terminating`, and
 /// never counts here. "Admin node terminate guard" in `docs/observability.md`
 /// describes each outcome; keep it current.
@@ -36,6 +36,6 @@ pub fn node_terminate_guard(node_id: &str, outcome: NodeTerminateGuardOutcome) {
     counter(
         "admin.node_terminate.guard",
         1,
-        &[tag("node_id", node_id), tag("outcome", outcome)],
+        &[tag("node", node_id), tag("outcome", outcome)],
     );
 }
