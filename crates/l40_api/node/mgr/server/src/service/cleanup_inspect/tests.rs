@@ -993,3 +993,35 @@ async fn cgroup_only_inspect_answers_without_host_probes() {
         }
     );
 }
+
+#[test]
+fn cgroup_only_inspect_reports_each_jailer_cgroup_file_in_its_own_field() {
+    let root = tempfile::tempdir().unwrap();
+    let id = SandboxId::new().to_string();
+    let dir = jailer_cgroup_path_in(root.path(), &id);
+    std::fs::create_dir(&dir).unwrap();
+    for (file, value) in [
+        ("cpu.max", "200000 100000"),
+        ("memory.max", "1073741824"),
+        ("memory.current", "524288"),
+        ("pids.max", "512"),
+        ("pids.current", "3"),
+        ("cpu.stat", "usage_usec 4200"),
+    ] {
+        std::fs::write(dir.join(file), format!("{value}\n")).unwrap();
+    }
+    assert_eq!(
+        inspect_sandbox_cgroup(root.path(), id.clone()),
+        InspectSandboxResponse {
+            sandbox_id: id,
+            cgroup_exists: true,
+            cgroup_cpu_max: "200000 100000".to_string(),
+            cgroup_memory_max: "1073741824".to_string(),
+            cgroup_memory_current: "524288".to_string(),
+            cgroup_pids_max: "512".to_string(),
+            cgroup_pids_current: "3".to_string(),
+            cgroup_cpu_stat: "usage_usec 4200".to_string(),
+            ..Default::default()
+        }
+    );
+}

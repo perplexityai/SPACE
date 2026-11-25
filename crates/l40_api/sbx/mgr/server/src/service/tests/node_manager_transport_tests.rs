@@ -634,6 +634,14 @@ async fn stats_reads_cgroup_figures_through_a_cgroup_only_inspect() {
             if !request.cgroup_only {
                 return Err(Status::failed_precondition("Stats needs only the cgroup"));
             }
+            // An older node-manager answers the full inspection from this identity.
+            if request.uuid8.is_empty()
+                || request.uid != Some(10_000)
+                || request.slot != Some(7)
+                || request.template.is_none()
+            {
+                return Err(Status::invalid_argument("Stats sends the sandbox identity"));
+            }
             Ok(InspectSandboxResponse {
                 sandbox_id: request.sandbox_id,
                 cgroup_exists: true,

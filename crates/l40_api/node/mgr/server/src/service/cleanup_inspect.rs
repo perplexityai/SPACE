@@ -748,9 +748,10 @@ impl NodeManagerService {
             let sandbox_id = request.into_inner().sandbox_id;
             return self
                 .off_runtime("inspect sandbox cgroup", move || {
-                    let cgroup =
-                        SandboxCgroup::read(std::path::Path::new(SANDBOX_CGROUP_ROOT), &sandbox_id);
-                    Ok(Response::new(cgroup.into_response(sandbox_id)))
+                    Ok(Response::new(inspect_sandbox_cgroup(
+                        std::path::Path::new(SANDBOX_CGROUP_ROOT),
+                        sandbox_id,
+                    )))
                 })
                 .await;
         }
@@ -808,7 +809,15 @@ impl NodeManagerService {
         let vpeer = format!("vpeer-{uuid8}");
         let ns_up = net::ns_exists(&ns);
 
-        let cgroup = SandboxCgroup::read(std::path::Path::new(SANDBOX_CGROUP_ROOT), sandbox_id);
+        let SandboxCgroup {
+            exists: cgroup_exists,
+            cpu_max: cgroup_cpu_max,
+            memory_max: cgroup_memory_max,
+            memory_current: cgroup_memory_current,
+            pids_max: cgroup_pids_max,
+            pids_current: cgroup_pids_current,
+            cpu_stat: cgroup_cpu_stat,
+        } = SandboxCgroup::read(std::path::Path::new(SANDBOX_CGROUP_ROOT), sandbox_id);
 
         let run_dir = format!("{RUN_DIR}/{sandbox_id}");
         // Inspection reports filesystem presence, not execution authority.
@@ -902,7 +911,13 @@ impl NodeManagerService {
             nft_ns_forward_drop_exists: ns_up && crate::firewall::ns_has_forward_drop(&ns),
             slot_allocated,
             template,
-            ..cgroup.into_response(sandbox_id.to_string())
+            cgroup_exists,
+            cgroup_cpu_max,
+            cgroup_memory_max,
+            cgroup_memory_current,
+            cgroup_pids_max,
+            cgroup_pids_current,
+            cgroup_cpu_stat,
         }))
     }
 
@@ -992,19 +1007,21 @@ impl SandboxCgroup {
             cpu_stat: read("cpu.stat"),
         }
     }
+}
 
-    fn into_response(self, sandbox_id: String) -> InspectSandboxResponse {
-        InspectSandboxResponse {
-            sandbox_id,
-            cgroup_exists: self.exists,
-            cgroup_cpu_max: self.cpu_max,
-            cgroup_memory_max: self.memory_max,
-            cgroup_memory_current: self.memory_current,
-            cgroup_pids_max: self.pids_max,
-            cgroup_pids_current: self.pids_current,
-            cgroup_cpu_stat: self.cpu_stat,
-            ..Default::default()
-        }
+/// Answers a `cgroup_only` inspect from the sandbox cgroup under `root`.
+fn inspect_sandbox_cgroup(root: &std::path::Path, sandbox_id: String) -> InspectSandboxResponse {
+    let cgroup = SandboxCgroup::read(root, &sandbox_id);
+    InspectSandboxResponse {
+        sandbox_id,
+        cgroup_exists: cgroup.exists,
+        cgroup_cpu_max: cgroup.cpu_max,
+        cgroup_memory_max: cgroup.memory_max,
+        cgroup_memory_current: cgroup.memory_current,
+        cgroup_pids_max: cgroup.pids_max,
+        cgroup_pids_current: cgroup.pids_current,
+        cgroup_cpu_stat: cgroup.cpu_stat,
+        ..Default::default()
     }
 }
 
