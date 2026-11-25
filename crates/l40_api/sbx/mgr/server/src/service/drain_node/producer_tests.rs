@@ -3,7 +3,8 @@
 //! paused sandbox is admitted and keeps the drain pending until it ends. A
 //! rollback that doesn't restart is a producer too: admitted for a running
 //! sandbox, it holds its token until it returns, and the stopped sandbox it
-//! leaves keeps the drain pending, since a v2 drain doesn't move one.
+//! leaves keeps the drain pending, since a v2 drain doesn't move one. So is
+//! an idle auto-stop, which holds its token until its state write commits.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -699,5 +700,98 @@ async fn an_unreadable_seal_admits_a_producer_the_next_call_reports() {
             .any(|(sandbox, wait, _)| *sandbox == id && *wait == WireWait::Moving),
         "{after:?}"
     );
+    service.drain_actions.wait_idle().await;
+}
+
+/// The durable full snapshot a suspended sandbox pins.
+const DURABLE_SNAPSHOT: &str = "01939e3e-9001-7000-8000-000000000001";
+
+/// An idle auto-stop of a suspended sandbox holds its producer token until
+/// its state write commits. It takes only the wake lock, so a drain can seal
+/// the node between the stop's admission and its write, and read the row
+/// still suspended on its durable snapshot: on its own, evacuated, and the
+/// node finished. The stop in flight keeps the sandbox pending instead. Once
+/// the write commits the token is released and the row is stopped, which a
+/// v2 drain doesn't move, so the sandbox is still pending, now as stopped,
+/// and nothing is evacuated.
+#[tokio::test]
+async fn an_idle_stop_holds_its_producer_token_until_its_write_commits() {
+    let node_manager = gated_node_manager(&Arc::new(Semaphore::new(0)));
+    let service = service_on(crate::db::test_conn(), &node_manager);
+    let id = SandboxId::new().to_string();
+    crate::service::reconcile::tests::insert_due_sandbox(
+        &service,
+        &id,
+        SandboxState::Suspended,
+        AutoLifecycleIdleAction::Stop,
+        10,
+    );
+    {
+        let db = service.db.lock().unwrap();
+        db.execute(
+            "UPDATE sandboxes
+                SET current_local_artifact_id = ?1,
+                    current_local_artifact_kind = 'full',
+                    current_local_artifact_origin = 'suspend'
+              WHERE id = ?2",
+            crate::db::fixture::params![DURABLE_SNAPSHOT, id],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO local_artifacts (
+                 local_artifact_id, sandbox_id, artifact_kind, artifact_origin,
+                 snapshot_name, local_path, created_at, backup_completed_at
+             ) VALUES (?1, ?2, 'full', 'suspend', NULL, '/tmp/a', '0', '1')",
+            crate::db::fixture::params![DURABLE_SNAPSHOT, id],
+        )
+        .unwrap();
+    }
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    *service
+        .auto_lifecycle
+        .suspended_stop_barrier
+        .lock()
+        .unwrap() = Some(Arc::clone(&barrier));
+    let stop = tokio::spawn({
+        let service = service.clone();
+        let id = id.clone();
+        async move { service.run_due_auto_lifecycle(&id).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), barrier.wait())
+        .await
+        .expect("the idle stop is admitted and reaches its write");
+    assert_eq!(
+        service.activation_seal.status().producers_in_flight,
+        std::slice::from_ref(&id)
+    );
+
+    // The seal lands between the stop's admission and its write: the drain
+    // reports the stop pending, though the row reads evacuated.
+    service.begin_drain(7, HOLD).unwrap();
+    let first = service.activation_seal.status();
+    let report = service.finish_drain(7, &first, DrainScans::default());
+    assert!(!finished(&report), "{report:?}");
+    assert_eq!(kinds(&report), [snapshot_entry(&id, false)]);
+    assert_eq!(report.pending[0].reason, SNAPSHOT_REASON);
+
+    tokio::time::timeout(Duration::from_secs(5), barrier.wait())
+        .await
+        .expect("the idle stop writes");
+    tokio::time::timeout(Duration::from_secs(5), stop)
+        .await
+        .expect("the idle stop finishes")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        service.lookup_sandbox(&id).unwrap().state,
+        SandboxStatus::from(SandboxState::Stopped)
+    );
+    service.activation_seal.assert_quiesced();
+    let first = service.activation_seal.status();
+    let report = service.finish_drain(7, &first, DrainScans::default());
+    assert!(!finished(&report), "{report:?}");
+    assert_eq!(kinds(&report), [(id.clone(), WireWait::External, false)]);
+    assert_eq!(report.pending[0].reason, STOPPED_REASON);
+    assert!(report.evacuated.is_empty(), "{report:?}");
     service.drain_actions.wait_idle().await;
 }
