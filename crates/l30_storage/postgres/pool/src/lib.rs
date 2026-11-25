@@ -35,12 +35,12 @@ const DEFAULT_MAX_LIFETIME_SECS: u64 = 30 * 60;
 const DEFAULT_MAX_LIFETIME_JITTER_FRACTION: f64 = 1.0 / 6.0;
 
 /// Password projections for managed application database identities.
-pub const SPACE_DB_USER_PASSWORD_ENV: &str = "SPACE_DB_USER_PASSWORD";
-pub const SPACE_DB_CREDS_PASSWORD_ENV: &str = "SPACE_DB_CREDS_PASSWORD";
+pub(crate) const SPACE_DB_USER_PASSWORD_ENV: &str = "SPACE_DB_USER_PASSWORD";
+pub(crate) const SPACE_DB_CREDS_PASSWORD_ENV: &str = "SPACE_DB_CREDS_PASSWORD";
 
 pub use identity::{
     CredentialsPool, SidelineOptions, connect_space_user_pool, connect_space_user_pool_lazy,
-    connect_space_user_sideline_pool_lazy, managed_database_password,
+    connect_space_user_sideline_pool_lazy,
 };
 
 /// Building connection options for a managed database identity failed.
@@ -69,7 +69,7 @@ pub enum DatabaseConnectOptionsError {
 /// `application_name` (the caller's service name) is stamped on every
 /// connection so `pg_stat_activity` and server logs attribute connections to
 /// the owning service when debugging pool or server-side saturation.
-pub fn database_connect_options(
+pub(crate) fn database_connect_options(
     database_url: &str,
     application_name: &str,
     identity: DatabaseIdentity,
@@ -113,22 +113,13 @@ fn service_connect_options(
     )
 }
 
-/// Connect a managed Postgres identity with the shared pool configuration.
-///
-/// One generic pool knob per setting, set per-Deployment in Helm (env is
-/// per-container, so per-service env names add nothing):
-/// `POSTGRES_POOL_MAX_CONNECTIONS` (default 25),
-/// `POSTGRES_CREDS_POOL_MAX_CONNECTIONS` (the `space_creds` pool's cap;
-/// unset uses `POSTGRES_POOL_MAX_CONNECTIONS`),
-/// `POSTGRES_POOL_MIN_CONNECTIONS` (default 1),
-/// `POSTGRES_POOL_ACQUIRE_TIMEOUT_SECS` (default 5),
-/// `POSTGRES_POOL_IDLE_TIMEOUT_SECS` (default 300),
-/// `POSTGRES_POOL_MAX_LIFETIME_SECS` (default 1800), and
-/// `POSTGRES_POOL_MAX_LIFETIME_JITTER_FRACTION` (default 1/6).
+/// Connect a managed Postgres identity with the shared pool configuration
+/// [`connect_postgres_lazy_as`] documents, opening a connection before it
+/// returns.
 ///
 /// Every statement emits a query-completion event; see
 /// [`QUERY_EVENT_LEVEL`].
-pub async fn connect_postgres_as(
+pub(crate) async fn connect_postgres_as(
     database_url: &str,
     application_name: &str,
     identity: DatabaseIdentity,
@@ -152,10 +143,19 @@ pub enum ConnectPostgresAsError {
 
 /// Prepare a managed Postgres identity pool without waiting for a connection.
 ///
-/// Same options and pool knobs as [`connect_postgres_as`], except where
-/// `options` sets one (see [`DbOptions`]). The minimum pool floor is
-/// established in the background, while configuration errors still fail
-/// eagerly.
+/// One generic pool knob per setting, set per-Deployment in Helm (env is
+/// per-container, so per-service env names add nothing):
+/// `POSTGRES_POOL_MAX_CONNECTIONS` (default 25),
+/// `POSTGRES_CREDS_POOL_MAX_CONNECTIONS` (the `space_creds` pool's cap;
+/// unset uses `POSTGRES_POOL_MAX_CONNECTIONS`),
+/// `POSTGRES_POOL_MIN_CONNECTIONS` (default 1),
+/// `POSTGRES_POOL_ACQUIRE_TIMEOUT_SECS` (default 5),
+/// `POSTGRES_POOL_IDLE_TIMEOUT_SECS` (default 300),
+/// `POSTGRES_POOL_MAX_LIFETIME_SECS` (default 1800), and
+/// `POSTGRES_POOL_MAX_LIFETIME_JITTER_FRACTION` (default 1/6),
+/// except where `options` sets one (see [`DbOptions`]). The minimum pool
+/// floor is established in the background, while configuration errors
+/// still fail eagerly.
 pub fn connect_postgres_lazy_as(
     database_url: &str,
     application_name: &str,
@@ -368,7 +368,10 @@ fn parse_positive_env_u64(var: &str, default: u64) -> u64 {
 ///
 /// Successful real-acquire timing comes from SQLx's `sqlx::pool::acquire`
 /// events; this reporter reads state only and never consumes pool capacity.
-pub fn spawn_postgres_pool_metrics_reporter_for_identity(pool: PgPool, identity: DatabaseIdentity) {
+pub(crate) fn spawn_postgres_pool_metrics_reporter_for_identity(
+    pool: PgPool,
+    identity: DatabaseIdentity,
+) {
     let max = pool.options().get_max_connections();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(POOL_METRICS_INTERVAL);

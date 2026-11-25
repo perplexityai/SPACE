@@ -19,7 +19,7 @@ use super::{
 };
 
 /// Read the projected password for a managed identity, failing when absent.
-pub fn managed_database_password(
+pub(crate) fn managed_database_password(
     identity: DatabaseIdentity,
 ) -> Result<String, DatabaseConnectOptionsError> {
     let env_var = password_env_for_identity(identity);
@@ -182,21 +182,6 @@ pub struct CredentialsPool {
 }
 
 impl CredentialsPool {
-    /// Connect the fenced lane as `space_creds`.
-    ///
-    /// Reads `SPACE_DB_CREDS_PASSWORD`, verifies the connection eagerly, and
-    /// spawns the identity-tagged pool metrics reporter.
-    pub async fn connect(
-        database_url: &str,
-        application_name: &str,
-    ) -> Result<Self, ConnectPostgresAsError> {
-        let identity = DatabaseIdentity::SpaceCreds;
-        let password = managed_database_password(identity)?;
-        let pool = connect_postgres_as(database_url, application_name, identity, &password).await?;
-        spawn_postgres_pool_metrics_reporter_for_identity(pool.clone(), identity);
-        Ok(Self { pool })
-    }
-
     /// Prepare the fenced lane as `space_creds` without connecting; the
     /// first acquire opens the connection.
     ///
@@ -223,7 +208,7 @@ impl CredentialsPool {
     /// credential-table grants.
     ///
     /// For single-pool callers, especially tests running against a local
-    /// Postgres superuser; production startup uses [`Self::connect`].
+    /// Postgres superuser; production startup uses [`Self::connect_lazy`].
     #[must_use]
     pub const fn shared(pool: PgPool) -> Self {
         Self { pool }
