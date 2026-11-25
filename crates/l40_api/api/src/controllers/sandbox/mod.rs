@@ -1349,8 +1349,6 @@ mod ports;
 mod queries;
 mod requested_size_metrics;
 mod responses;
-#[cfg(test)]
-mod sandbox_portability_tests;
 pub(crate) mod spaced;
 pub(crate) use ingress::ingress_activation;
 mod wake_completion;

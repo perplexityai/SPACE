@@ -2133,20 +2133,6 @@ pub fn started_restore_source_absent(sandbox_alias: &str, settle_param: &str) ->
 }
 
 /// SQL fragment evaluating to TRUE iff the sandbox aliased as `sandbox_alias`
-/// is **portable for drain-completion**:
-///
-/// `{alias}.lifecycle = 'suspended' AND <fresh ready snapshot exists>`.
-///
-/// Use this at decision points that gate the source node's drain on the
-/// absence of local-only snapshots. `suspending` / `restoring` rows are
-/// deliberately excluded — their state isn't yet uploadable so they always
-/// block drain regardless of any prior snapshot.
-pub fn portable_for_drain_completion(sandbox_alias: &str) -> String {
-    let snapshot_exists = fresh_ready_snapshot_exists(sandbox_alias);
-    format!("{sandbox_alias}.lifecycle = 'suspended' AND {snapshot_exists}")
-}
-
-/// SQL fragment evaluating to TRUE iff the sandbox aliased as `sandbox_alias`
 /// is **portable for restore-affinity drop**:
 ///
 /// `{alias}.lifecycle IN ('suspended', 'restoring') AND <fresh ready snapshot exists>`.
@@ -2357,5 +2343,7 @@ pub mod execution_supersession;
 mod drain_gate_differential_tests;
 #[cfg(test)]
 mod inflight_upload_shape_differential_tests;
+#[cfg(test)]
+mod portable_predicate_tests;
 #[cfg(test)]
 mod queued_artifact_recoverable_tests;
