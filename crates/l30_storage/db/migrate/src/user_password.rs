@@ -30,7 +30,7 @@ pub enum SetUserPasswordError {
     Database(#[from] sqlx::Error),
 }
 
-pub async fn run(args: SetUserPasswordArgs) -> Result<(), SetUserPasswordError> {
+pub(crate) async fn run(args: SetUserPasswordArgs) -> Result<(), SetUserPasswordError> {
     let password =
         std::env::var("SPACE_USER_PASSWORD").map_err(|_| SetUserPasswordError::InvalidPassword)?;
     let hash = hash_password(password).await?;
