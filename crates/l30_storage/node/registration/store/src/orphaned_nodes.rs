@@ -6,10 +6,11 @@
 //!
 //! - `managed_by` is the Kubernetes substrate: Direct rows are owned by a
 //!   different lifecycle.
-//! - `drain_phase IS NULL` and no v2 drain (`drain_engine = 'v2'`, whose
-//!   cancel pending has no phase): a row in a drain phase belongs to node
-//!   drain and the drained-node terminator, and a v2 drain's row to the v2
-//!   loop.
+//! - `drain_phase IS NULL` and no engine (`drain_engine IS NULL`): a row in
+//!   a drain phase belongs to node drain and the drained-node terminator,
+//!   and a v2 drain's row (whose cancel pending has no phase) to the v2
+//!   loop. A row under an engine this build doesn't know is someone's drain
+//!   too, so it is never a candidate.
 //! - No sandbox outside `failed` and `deleted` names the node through
 //!   `active_node_id` or `target_node_id`: a suspended sandbox pinned to a
 //!   gone node still has its only snapshot there. `quarantined` is not
@@ -56,7 +57,7 @@ pub async fn candidates(
              JOIN node_k8s k ON k.node_id = n.id
              WHERE n.managed_by = $3
                AND n.drain_phase IS NULL
-               AND n.drain_engine IS DISTINCT FROM 'v2'
+               AND n.drain_engine IS NULL
                AND k.k8s_node_name IS NOT NULL
                AND ($1::UUID IS NULL OR n.id > $1)
                AND NOT EXISTS (
@@ -106,7 +107,7 @@ pub async fn delete_if_orphan(
              WHERE n.id = $1
                AND n.managed_by = $3
                AND n.drain_phase IS NULL
-               AND n.drain_engine IS DISTINCT FROM 'v2'
+               AND n.drain_engine IS NULL
                AND COALESCE(
                    (SELECT k8s_node_uid FROM node_k8s WHERE node_id = $1),
                    ''

@@ -89,21 +89,27 @@ async fn listed(pool: &PgPool) -> TestDbResult<Vec<NodeId>> {
         .collect())
 }
 
-/// A v2 drain's row is never an orphan candidate, its cancel pending
-/// (a v2 engine with no phase) included, and its DELETE refuses it; a
-/// row with no drain is both.
+/// A row under an engine is never an orphan candidate and its DELETE
+/// refuses it, with no phase: a v2 drain's cancel pending, or a drain under
+/// an engine this build doesn't know. A row with no drain is both.
 #[tokio::test]
-async fn a_v2_drains_row_is_never_an_orphan() -> TestDbResult<()> {
+async fn a_row_under_an_engine_is_never_an_orphan() -> TestDbResult<()> {
     let db = pg_test_db().await?;
-    let v2 = node(&db.pool, Some("v2")).await?;
-    let plain = node(&db.pool, None).await?;
-    let candidates = listed(&db.pool).await?;
-    assert!(candidates.contains(&plain), "{candidates:?}");
-    assert!(!candidates.contains(&v2), "{candidates:?}");
-    assert!(!delete_if_orphan(&db.pool, v2, Some("uid")).await?);
-    assert!(exists(&db.pool, v2).await?);
-    assert!(delete_if_orphan(&db.pool, plain, Some("uid")).await?);
-    assert!(!exists(&db.pool, plain).await?);
+    for (engine, orphan) in [(None, true), (Some("v2"), false), (Some("v9"), false)] {
+        let node_id = node(&db.pool, engine).await?;
+        let candidates = listed(&db.pool).await?;
+        assert_eq!(
+            candidates.contains(&node_id),
+            orphan,
+            "{engine:?}: {candidates:?}"
+        );
+        assert_eq!(
+            delete_if_orphan(&db.pool, node_id, Some("uid")).await?,
+            orphan,
+            "{engine:?}"
+        );
+        assert_eq!(exists(&db.pool, node_id).await?, !orphan, "{engine:?}");
+    }
     Ok(())
 }
 
