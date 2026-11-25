@@ -74,8 +74,14 @@ impl RestartingClusterApi {
     }
 
     /// Stop the replica, wait until its connections are closed and its
-    /// address refuses, and serve there again after `down_for`.
-    async fn restart(&mut self, down_for: Duration) {
+    /// address refuses, then run `during` while the address stays refused for
+    /// `down_for` and the next replica comes back there.
+    ///
+    /// The next replica is brought back on the test's own task, alongside
+    /// `during`, not in a spawned one: a replica that cannot listen fails the
+    /// test when `down_for` ends, instead of leaving `during` to retry against
+    /// a refused address until its retry window ends.
+    async fn restart<T>(&mut self, down_for: Duration, during: impl Future<Output = T>) -> T {
         self.stop.cancel();
         (&mut self.server).await.unwrap();
         let refused = tokio::net::TcpStream::connect(self.addr).await;
@@ -86,16 +92,21 @@ impl RestartingClusterApi {
         );
         let next = shared_port_socket();
         next.bind(self.addr).unwrap();
-        let resolves = self.resolves.clone();
-        let answer = self.answer;
-        let stop = CancellationToken::new();
-        self.stop = stop.clone();
-        self.server = tokio::spawn(async move {
+        self.stop = CancellationToken::new();
+        let come_back = async {
             tokio::time::sleep(down_for).await;
-            serve(next.listen(1024).unwrap(), resolves, answer, stop)
-                .await
-                .unwrap();
-        });
+            let listener = next
+                .listen(1024)
+                .expect("the next replica listens on the stopped replica's address");
+            self.server = serve(
+                listener,
+                self.resolves.clone(),
+                self.answer,
+                self.stop.clone(),
+            );
+        };
+        let (result, ()) = tokio::join!(during, come_back);
+        result
     }
 }
 
@@ -194,15 +205,19 @@ async fn ecw_route_resolve_rides_out_a_cluster_api_restart() {
     }
     let mut cluster_api = RestartingClusterApi::start(ecw_route_answer).await;
     let state = state_for(&cluster_api).await;
-    cluster_api.restart(Duration::from_millis(300)).await;
+    let target = envd_target();
 
-    let route = resolve_ecw_route(
-        &state,
-        &envd_target(),
-        &HeaderMap::new(),
-        EcwRouteTransport::Direct,
-    )
-    .await;
+    let route = cluster_api
+        .restart(
+            Duration::from_millis(300),
+            resolve_ecw_route(
+                &state,
+                &target,
+                &HeaderMap::new(),
+                EcwRouteTransport::Direct,
+            ),
+        )
+        .await;
 
     assert!(route.is_ok(), "{:?}", route.err());
     assert_eq!(cluster_api.resolves.load(Ordering::SeqCst), 1);
@@ -216,11 +231,15 @@ async fn session_route_resolve_rides_out_a_cluster_api_restart() {
     }
     let mut cluster_api = RestartingClusterApi::start(session_route_answer).await;
     let state = state_for(&cluster_api).await;
-    cluster_api.restart(Duration::from_millis(300)).await;
 
     let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
     let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "a".repeat(64));
-    let route = resolve_session_route(&state, session_id, &token).await;
+    let route = cluster_api
+        .restart(
+            Duration::from_millis(300),
+            resolve_session_route(&state, session_id, &token),
+        )
+        .await;
 
     assert!(route.is_ok(), "{:?}", route.err());
     assert_eq!(cluster_api.resolves.load(Ordering::SeqCst), 1);
