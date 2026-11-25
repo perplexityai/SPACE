@@ -39,6 +39,8 @@ pub mod pod_less_giveup;
 pub mod quarantine_recovery;
 pub mod quarantine_rollback;
 pub mod retire;
+pub mod started_recovery;
+pub mod suspend;
 pub mod suspended_reaper;
 pub mod transient_sweeper;
 pub mod transition;
