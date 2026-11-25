@@ -10773,8 +10773,11 @@ pub(crate) mod service_tests {
         let current_generation = ExecutionGeneration::new(2).unwrap();
 
         {
-            let mut conn = crate::db::Connection::open_at(&db_path).unwrap();
-            crate::db::create_test_schema(&mut conn);
+            crate::db::create_test_schema_on_disk(&db_path);
+            let conn = crate::db::Connection::open_at(&db_path).unwrap();
+            // The test models a process restart, not a host crash, so no
+            // commit needs an fsync.
+            conn.pragma_update(None, "synchronous", "OFF").unwrap();
             insert_test_sandbox(&conn, &sandbox_id.to_string(), SandboxState::Paused);
             let service = service_for_teardown_test(conn);
             service
@@ -12907,8 +12910,11 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         let deleted_generation = ExecutionGeneration::new(2).unwrap();
         {
-            let mut conn = crate::db::Connection::open_at(&db_path).unwrap();
-            crate::db::create_test_schema(&mut conn);
+            crate::db::create_test_schema_on_disk(&db_path);
+            let conn = crate::db::Connection::open_at(&db_path).unwrap();
+            // The test models a process restart, not a host crash, so no
+            // commit needs an fsync.
+            conn.pragma_update(None, "synchronous", "OFF").unwrap();
             delete_sandbox_with_generation_receipt(&conn, &sandbox_id, deleted_generation);
         }
         let service = service_for_teardown_test(crate::db::Connection::open_at(&db_path).unwrap());
