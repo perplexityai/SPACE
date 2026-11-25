@@ -9464,7 +9464,9 @@ dependencies = [
  "ref-cast",
  "rusqlite",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.20",
+ "tokio",
  "tokio-util",
  "tonic",
 ]

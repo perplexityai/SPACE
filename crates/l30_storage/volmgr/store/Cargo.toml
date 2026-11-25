@@ -34,3 +34,7 @@ pplx-space-sandbox-model = { workspace = true }
 pplx-space-snapshot-model = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 pplx-space-sqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
