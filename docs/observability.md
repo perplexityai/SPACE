@@ -1363,13 +1363,13 @@ transaction rolls back counts nothing.
 | `reason` | `disposition` | Meaning |
 | --- | --- | --- |
 | `applied` | `applied` | Every check passed and the delete committed |
-| `lock_contended` | `deferred` | Another transaction held a row that a `NOWAIT` lock on the sandbox, its latest execution or its quarantine evidence needed |
+| `lock_contended` | `deferred` | An evidence read on the sandbox, its latest execution or its quarantine state hit a `NOWAIT` row-lock conflict or `lock_timeout` |
 | `finalize_contended` | `deferred` | The delete hit a lock timeout, deadlock or serialization failure |
 | `transient_lifecycle` | `deferred` | The sandbox is in a transient lifecycle |
 | `awaiting_ownership_evidence` | `deferred` | A `started` or `paused` sandbox has no active node, within the ownership grace period |
 | `creating_snapshot` | `deferred` | One of the sandbox's snapshots is still `creating` |
 | `policy_unreadable` | `deferred` | The stored auto-lifecycle policy does not parse |
-| `unsupported_fingerprint_version` | `deferred` | The receipt's policy fingerprint version is newer than this build reads |
+| `unsupported_fingerprint_version` | `deferred` | The receipt's policy fingerprint names a version this build does not read (for example, a newer format) |
 | `duplicate_sandbox_receipt` | `deferred` | A second receipt for a sandbox already selected in this publication |
 | `batch_limit` | `deferred` | A parsed receipt past the per-publication batch of `AUTO_LIFECYCLE_DELETE_COMPLETION_BATCH_SIZE` sandboxes |
 | `request_limit` | `deferred` | An entry past the request's `AUTO_LIFECYCLE_DELETE_COMPLETION_REQUEST_LIMIT` cap, never parsed |
