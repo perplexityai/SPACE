@@ -17,7 +17,11 @@ HOLD_SECONDS = 60 * 60
 # with node-api cut across the undrain as in
 # `native.v2_drain_waits_for_an_unreachable_node`. The API shows no seal: a
 # preview that succeeds once the cancel has cleared is what proves the node
-# unsealed, since a sealed node refuses one.
+# unsealed, since a sealed node refuses one. The admin API refuses
+# `:force-upload-local-snapshots` under a v2 drain in every phase, which is
+# the route's test (`nodes/drain_handler_tests.rs`); here it is checked while
+# draining and while the cancel is pending, the state where an upload could
+# read a snapshot a wake changes.
 @smoke.scenario(
     "native.v2_undrain_unseals_the_worker",
     api_surfaces=("native",),
@@ -30,7 +34,9 @@ def v2_undrain_unseals_the_worker(test: smoke.CommandSandboxFixture) -> None:
     """A v2 `:drain` with a hold seals the worker, and the controller stores
     the node's report under the drain's generation; its node-api then stops
     answering and the worker is `:undrain`ed. While the node can't answer,
-    its Node stays unschedulable and the cancel stays pending. Once node-api
+    its Node stays unschedulable and the cancel stays pending. While it
+    drains, and while the cancel is pending, `:force-upload-local-snapshots`
+    is refused with the v2 drain's code. Once node-api
     answers, the controller cancels the drain on the node, clears the v2
     columns and uncordons the worker; a preview of it then succeeds, which a
     sealed node refuses, and it admits an activation again: with the other
@@ -52,11 +58,13 @@ def v2_undrain_unseals_the_worker(test: smoke.CommandSandboxFixture) -> None:
             drain.drain(hold=HOLD_SECONDS)
             drain.wait_for_reported()
             drain.expect_held(resident.sandbox_id)
+            drain.expect_force_upload_refused("draining")
 
-        with test.phase("node-api stops answering; undrain: the worker stays cordoned"):
+        with test.phase("node-api stops answering; undrain: the worker stays cordoned, uploads refused"):
             node_api = drain.block("node-api")
             drain.undrain()
             drain.expect_kept_cordoned(watch_seconds=UNANSWERED_SECONDS)
+            drain.expect_force_upload_refused("cancel_pending")
 
         with test.phase("node-api back: the drain is cancelled, the worker uncordoned; a preview succeeds"):
             node_api.release()

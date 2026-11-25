@@ -499,6 +499,13 @@ STOPPED_REFUSAL_STATUS = 409
 STOPPED_REFUSAL_CODE = "drain_v2_stopped_sandboxes"
 STOPPED_REFUSAL_COUNT_FIELD = "stopped"
 STOPPED_REFUSAL_IDS_FIELD = "stopped_sandbox_ids"
+# `:force-upload-local-snapshots` of a node under a v2 drain, in any phase,
+# its cancel pending included: a 409 with this stable code under the cap's
+# key. The sealed node itself uploads each local snapshot of a suspended
+# resident that it has not recorded as backed up, and a cancel can unseal it
+# before its row says so.
+FORCE_UPLOAD_REFUSAL_STATUS = 409
+FORCE_UPLOAD_REFUSAL_CODE = "drain_v2_uploads_local_snapshots"
 # `nodes.drain_status` keys (Unix seconds by the database's clock where a
 # time): the drain's `generation` (`drain_started_at` in microseconds), its
 # deadline (`deadline_at`, `drain_started_at` plus the hold), every sandbox
@@ -1724,6 +1731,24 @@ class DrainV2Assertions:
             {"body": dict(body), "status": answer.status, "retry_after": answer.retry_after},
         )
         return answer
+
+    def expect_force_upload_refused(self, when: str) -> None:
+        """`:force-upload-local-snapshots` of the node is the v2 drain's 409,
+        with its stable code; `when` names the drain's state in the
+        evidence."""
+
+        answer = self._control.force_upload_answer(self.node_id)
+        self._fixture.record(
+            f"force_upload_answer_{when}", {"status": answer.status, "body": answer.body}
+        )
+        self._fixture.verify(
+            answer.status == FORCE_UPLOAD_REFUSAL_STATUS
+            and answer.body.get(CAP_REFUSAL_CODE_FIELD) == FORCE_UPLOAD_REFUSAL_CODE,
+            "a v2 drain's node was not refused :force-upload-local-snapshots with its code",
+            when=when,
+            status=answer.status,
+            body=answer.body,
+        )
 
     def repeat_drain(self, hold: int) -> CallAnswer:
         """A repeat `:drain` of the drain in flight with a hold of `hold`
