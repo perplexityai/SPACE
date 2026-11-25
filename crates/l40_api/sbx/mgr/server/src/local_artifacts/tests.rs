@@ -53,8 +53,8 @@ fn artifact_id(s: &str) -> LocalArtifactId {
 fn gc_checkout_serializes_eligibility_with_a_concurrent_restore_release() {
     let root = tempfile::TempDir::new().unwrap();
     let path = root.path().join("artifacts.db");
+    crate::db::create_test_schema_on_disk(&path);
     let mut conn = Connection::open_at(&path).unwrap();
-    crate::db::create_test_schema(&mut conn);
     conn.pragma_update(None, "journal_mode", "WAL").unwrap();
     let id = "01939e3e-1111-7000-8000-000000000001";
     insert_row(&conn, id, "sbx", "/artifact");

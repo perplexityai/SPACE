@@ -732,8 +732,8 @@ fn a_type_mismatched_column_makes_one_row_malformed_not_the_whole_scan() {
 fn quarantine_recovery_candidate_scan_propagates_statement_failures() {
     let directory = tempfile::tempdir().unwrap();
     let database_path = directory.path().join("sandbox-manager.db");
-    let mut conn = Connection::open_at(&database_path).unwrap();
-    create_test_schema(&mut conn);
+    create_test_schema_on_disk(&database_path);
+    let conn = Connection::open_at(&database_path).unwrap();
     setup_quarantine_recovery_episode(
         &conn,
         SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
@@ -6852,8 +6852,8 @@ fn start_arms_access_idle_only_after_guest_readiness() {
 fn legacy_equal_route_and_operation_receipt_survives_restart_without_split_field() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("manager.sqlite");
-    let mut conn = Connection::open_at(&path).unwrap();
-    create_test_schema(&mut conn);
+    create_test_schema_on_disk(&path);
+    let conn = Connection::open_at(&path).unwrap();
     let sandbox_id = SandboxId::new().to_string();
     insert_test_sandbox(
         &conn,
