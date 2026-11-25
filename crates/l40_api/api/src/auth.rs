@@ -1,7 +1,6 @@
 use pplx_space_accounts::OrgId;
 
 use crate::api_surface::ApiSurface;
-use pplx_space_sql_locator::sql;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use sqlx::types::time::OffsetDateTime;
@@ -113,14 +112,7 @@ pub async fn get_session_user(
 ) -> Result<Option<(User, Organization)>, sqlx::Error> {
     let token_hash = hash_token(raw_token);
 
-    let row = sqlx::query_as::<_, User>(sql!(
-        "SELECT u.* FROM users u
-         JOIN sessions s ON s.user_id = u.id
-         WHERE s.token_hash = $1 AND s.expires_at > NOW()"
-    ))
-    .bind(&token_hash)
-    .fetch_optional(pool)
-    .await?;
+    let row = users::user_by_session_token_hash(pool, &token_hash).await?;
 
     let Some(user) = row else {
         return Ok(None);
@@ -218,23 +210,9 @@ async fn record_api_key_use(pool: &PgPool, api_key: &ApiKey) {
     if fresh {
         return;
     }
-    let result = sqlx::query(sql!(
-        "UPDATE api_keys
-            SET last_used_at = NOW()
-          WHERE id = (
-              SELECT id
-              FROM api_keys
-              WHERE id = $1
-                AND revoked_at IS NULL
-                AND (last_used_at IS NULL
-                     OR last_used_at < NOW() - make_interval(secs => $2))
-              FOR UPDATE SKIP LOCKED
-          )"
-    ))
-    .bind(api_key.id)
-    .bind(API_KEY_LAST_USED_GRANULARITY.as_secs_f64())
-    .execute(pool)
-    .await;
+    let result =
+        api_keys::advance_api_key_last_used_at(pool, api_key.id, API_KEY_LAST_USED_GRANULARITY)
+            .await;
     if let Err(error) = result {
         tracing::warn!(%error, api_key_id = %api_key.id, "failed to record api key use");
     }

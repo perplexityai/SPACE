@@ -5799,6 +5799,7 @@ dependencies = [
  "lru 0.18.4",
  "nix 0.31.3",
  "pplx-space-accounts",
+ "pplx-space-accounts-store",
  "pplx-space-artifact-model",
  "pplx-space-byok-model",
  "pplx-space-byok-store",

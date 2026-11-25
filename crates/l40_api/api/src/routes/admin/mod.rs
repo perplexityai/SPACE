@@ -34,7 +34,6 @@ use crate::{
 };
 pub use runtime_upgrade_campaigns::RUNTIME_UPGRADE_DRIVEN_KINDS;
 
-mod api_key_store;
 mod api_keys;
 pub mod audit;
 mod docs;

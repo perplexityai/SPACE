@@ -5,12 +5,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use pplx_space_accounts::{ApiKeyId, OrgId, UserId};
-use pplx_space_accounts_store::{ApiKeyRow, CreateApiKey, api_keys, organizations, users};
+use pplx_space_accounts_store::{
+    ApiKeyRevocation, ApiKeyRow, CreateApiKey, api_keys, organizations, users,
+};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use super::{
-    api_key_store::{self, RevokeOutcome},
     audit::AdminAuditTarget,
     support::{self, ContentionScope, api_error},
 };
@@ -270,13 +271,13 @@ pub(super) async fn delete_api_key(
     State(state): State<AppState>,
     Path((org_id, api_key_id)): Path<(OrgId, ApiKeyId)>,
 ) -> Response {
-    match api_key_store::revoke(&state.pool, org_id, api_key_id).await {
-        Ok(RevokeOutcome::Revoked | RevokeOutcome::AlreadyRevoked) => (
+    match api_keys::revoke_organization_api_key(&state.pool, org_id, api_key_id).await {
+        Ok(ApiKeyRevocation::Revoked | ApiKeyRevocation::AlreadyRevoked) => (
             StatusCode::NO_CONTENT,
             Extension(AdminAuditTarget::api_key(org_id, Some(api_key_id), None)),
         )
             .into_response(),
-        Ok(RevokeOutcome::NotFound) => {
+        Ok(ApiKeyRevocation::NotFound) => {
             api_error(StatusCode::NOT_FOUND, "API key not found").into_response()
         }
         Err(error) => support::db_error(error).into_response(),

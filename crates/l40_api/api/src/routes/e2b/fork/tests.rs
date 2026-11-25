@@ -187,20 +187,14 @@ async fn invalid_federated_grant_does_not_materialize_owner_namespace() -> TestR
     .expect_err("a federated fork without a service grant is unauthorized");
     assert_eq!(error.status, StatusCode::UNAUTHORIZED);
 
-    let owner_org_exists: bool = sqlx::query_scalar(pplx_space_sql_locator::sql!(
-        "SELECT EXISTS (
-             SELECT 1 FROM organizations
-             WHERE owner_source = 'federated_identity'
-               AND upstream_issuer = $1
-               AND upstream_org_id = $2
-         )"
-    ))
-    .bind(owner.issuer.as_str())
-    .bind(owner.org_id.as_str())
-    .fetch_one(&db.pool)
+    let owner_org = pplx_space_accounts_store::organizations::federated_organization_id(
+        &db.pool,
+        owner.issuer.as_str(),
+        owner.org_id.as_str(),
+    )
     .await?;
     assert!(
-        !owner_org_exists,
+        owner_org.is_none(),
         "unauthorized fork persisted its owner org"
     );
     Ok(())

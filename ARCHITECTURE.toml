@@ -371,7 +371,12 @@ mode = "advisory"
 # Each store's users: the l40_api and l30_storage crates that own its state
 # and use the store today, and the coordinators that call it.
 [rules.layers.store_users]
-pplx-space-accounts-store = ["pplx-space-api", "pplx-space-db-migrate", "pplx-space-internal-api-server"]
+pplx-space-accounts-store = [
+  "pplx-space-api",
+  "pplx-space-credmgr",
+  "pplx-space-db-migrate",
+  "pplx-space-internal-api-server",
+]
 pplx-space-admin-audit-store = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",

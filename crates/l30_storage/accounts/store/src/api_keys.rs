@@ -1,5 +1,5 @@
-//! `api_keys` rows: the authentication lookups by key hash, and an
-//! organization's key listing and creates.
+//! `api_keys` rows: the authentication lookups by key hash, recording a key's
+//! use, and an organization's key listing, creates and revocation.
 
 use pplx_space_accounts::{ApiKeyId, OrgId, SandboxOwnerSource, UserId};
 use pplx_space_sql_locator::sql;
@@ -193,6 +193,91 @@ impl ApiKeyAuthRow {
             actor,
         }
     }
+}
+
+/// Set the key's `last_used_at` to the database's `NOW()` when it is unset or
+/// older than `stale_after`, unless the key is revoked or another transaction
+/// holds a lock on its row. `false` when it wrote nothing: the key is missing,
+/// revoked, recently used or locked by another transaction.
+///
+/// The row lock (`FOR UPDATE SKIP LOCKED`) serves only this statement, so
+/// concurrent uses of one key neither wait on each other nor write twice. The
+/// staleness check compares with `NOW()`, the start of the transaction the
+/// statement runs in.
+pub async fn advance_api_key_last_used_at(
+    executor: impl PgExecutor<'_>,
+    api_key_id: Uuid,
+    stale_after: std::time::Duration,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(sql!(
+        "UPDATE api_keys
+            SET last_used_at = NOW()
+          WHERE id = (
+              SELECT id
+              FROM api_keys
+              WHERE id = $1
+                AND revoked_at IS NULL
+                AND (last_used_at IS NULL
+                     OR last_used_at < NOW() - make_interval(secs => $2))
+              FOR UPDATE SKIP LOCKED
+          )"
+    ))
+    .bind(api_key_id)
+    .bind(stale_after.as_secs_f64())
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// What [`revoke_organization_api_key`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApiKeyRevocation {
+    Revoked,
+    AlreadyRevoked,
+    NotFound,
+}
+
+/// Revoke an organization's key, keeping its row so it lists as revoked. A
+/// key of another organization is [`ApiKeyRevocation::NotFound`] and stays as
+/// it is.
+///
+/// Revocation replaces `key_hash` with `revoked:<id>`, which no SHA-256 hex
+/// digest equals, rather than relying on readers to filter on `revoked_at`:
+/// every lookup by `key_hash`, including those of releases that predate the
+/// column, stops matching the key in the same statement. `revoked_at` is kept
+/// from the first revocation.
+///
+/// Its `EXISTS` reads the snapshot from before the `UPDATE`, which revokes
+/// without removing the row, so a key this statement revokes still counts as
+/// found.
+pub async fn revoke_organization_api_key(
+    executor: impl PgExecutor<'_>,
+    org_id: OrgId,
+    api_key_id: ApiKeyId,
+) -> Result<ApiKeyRevocation, sqlx::Error> {
+    let (revoked, found) = sqlx::query_as::<_, (bool, bool)>(sql!(
+        "WITH revoked AS (
+             UPDATE api_keys
+                SET revoked_at = NOW(),
+                    updated_at = NOW(),
+                    key_hash = 'revoked:' || id::text
+              WHERE id = $1
+                AND org_id = $2
+                AND revoked_at IS NULL
+          RETURNING id
+         )
+         SELECT EXISTS(SELECT 1 FROM revoked),
+                EXISTS(SELECT 1 FROM api_keys WHERE id = $1 AND org_id = $2)"
+    ))
+    .bind(api_key_id)
+    .bind(org_id)
+    .fetch_one(executor)
+    .await?;
+    Ok(match (revoked, found) {
+        (true, _) => ApiKeyRevocation::Revoked,
+        (false, true) => ApiKeyRevocation::AlreadyRevoked,
+        (false, false) => ApiKeyRevocation::NotFound,
+    })
 }
 
 /// Whether a key with this hash belongs to `org_id` and is scoped to the ECW

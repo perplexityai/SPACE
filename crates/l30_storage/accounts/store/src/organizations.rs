@@ -1,12 +1,14 @@
-//! `organizations` rows: lookups, the organization tree, and the local and
-//! federated creates.
+//! `organizations` rows: lookups, the organization tree, the locked branding
+//! read, the federated owner reads, and the local and federated creates.
 
 use pplx_space_accounts::OrgId;
 use pplx_space_sql_locator::sql;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgExecutor};
+use sqlx::{FromRow, PgConnection, PgExecutor};
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+use crate::users::{UserOrganizationRow, UserWithOrganization};
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Organization {
@@ -141,6 +143,52 @@ pub async fn organization_byok_enabled(
         .await
 }
 
+/// Who owns an organization: `owner_source` as stored, and the upstream
+/// organization a federated one was created for.
+#[derive(Debug, Clone, FromRow)]
+pub struct OrganizationOwner {
+    pub owner_source: String,
+    pub upstream_org_id: Option<String>,
+}
+
+/// The organization's owner, or `None` when the organization is missing.
+pub async fn organization_owner(
+    executor: impl PgExecutor<'_>,
+    org_id: OrgId,
+) -> Result<Option<OrganizationOwner>, sqlx::Error> {
+    sqlx::query_as::<_, OrganizationOwner>(sql!(
+        "SELECT owner_source, upstream_org_id FROM organizations WHERE id = $1"
+    ))
+    .bind(org_id)
+    .fetch_optional(executor)
+    .await
+}
+
+/// An organization's branding columns.
+#[derive(Debug, Clone, FromRow)]
+pub struct OrganizationBranding {
+    pub theme_primary: Option<String>,
+    pub theme_secondary: Option<String>,
+    pub logo_url: Option<String>,
+}
+
+/// The organization's branding, with its row locked `FOR UPDATE` until the
+/// caller's transaction ends; `None` when the organization is missing.
+pub async fn lock_organization_branding(
+    conn: &mut PgConnection,
+    org_id: OrgId,
+) -> Result<Option<OrganizationBranding>, sqlx::Error> {
+    sqlx::query_as::<_, OrganizationBranding>(sql!(
+        "SELECT theme_primary, theme_secondary, logo_url
+         FROM organizations
+         WHERE id = $1
+         FOR UPDATE"
+    ))
+    .bind(org_id)
+    .fetch_optional(conn)
+    .await
+}
+
 /// A local organization to create.
 pub struct NewOrganization {
     pub id: OrgId,
@@ -256,6 +304,47 @@ pub async fn federated_organization_id(
     .bind(upstream_org_id)
     .fetch_optional(executor)
     .await
+}
+
+/// The statement [`federated_organization_user`] runs. Its select list is the
+/// one [`UserOrganizationRow`] decodes.
+pub(crate) const FEDERATED_ORGANIZATION_USER_SQL: &str = sql!(
+    "SELECT u.id AS user_id, u.email AS user_email, u.password_hash AS user_password_hash,
+            u.display_name AS user_display_name, u.role AS user_role,
+            u.owner_source AS user_owner_source, u.created_at AS user_created_at,
+            u.updated_at AS user_updated_at,
+            o.id AS org_id, o.name AS org_name, o.slug AS org_slug, o.parent_id AS org_parent_id,
+            o.theme_primary AS org_theme_primary, o.theme_secondary AS org_theme_secondary,
+            o.logo_url AS org_logo_url, o.byok_enabled AS org_byok_enabled,
+            o.snapshot_base_object_storage_uri AS org_snapshot_base_object_storage_uri,
+            o.created_at AS org_created_at, o.updated_at AS org_updated_at
+     FROM organizations o
+     JOIN users u
+       ON u.org_id = o.id
+      AND u.owner_source = 'federated_identity'
+      AND u.upstream_issuer = $1
+      AND u.upstream_subject_id = $3
+     WHERE o.owner_source = 'federated_identity'
+       AND o.upstream_issuer = $1
+       AND o.upstream_org_id = $2"
+);
+
+/// The user an upstream subject maps to, with the organization its upstream
+/// organization maps to; `None` when either is missing or the user is not in
+/// that organization.
+pub async fn federated_organization_user(
+    executor: impl PgExecutor<'_>,
+    upstream_issuer: &str,
+    upstream_org_id: &str,
+    upstream_subject_id: &str,
+) -> Result<Option<UserWithOrganization>, sqlx::Error> {
+    sqlx::query_as::<_, UserOrganizationRow>(FEDERATED_ORGANIZATION_USER_SQL)
+        .bind(upstream_issuer)
+        .bind(upstream_org_id)
+        .bind(upstream_subject_id)
+        .fetch_optional(executor)
+        .await
+        .map(|row| row.map(UserOrganizationRow::into_user_with_organization))
 }
 
 /// The organization a federated owner's upstream organization maps to.
