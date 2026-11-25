@@ -196,7 +196,7 @@ async fn observe_candidate_pods(
 /// activation attempt claimed while it waited for the row.
 ///
 /// The fail, converge and revert CASes check the owner with a subquery on the
-/// execution ([`activation_owner_guard`](sweeper::activation_owner_guard)), and every activation-attempt
+/// execution (`activation_owner_guard`), and every activation-attempt
 /// assignment (`assign_activation_attempt_in`'s callers) locks the sandbox row
 /// without changing it before it writes a new lease there. An `UPDATE` that
 /// waits on that lock goes ahead on its original snapshot once the lock is

@@ -181,7 +181,7 @@ pub async fn mark_started_lost(
 ///
 /// Guarded only by `lifecycle = 'failed'`: the caller flips the rows in the
 /// same transaction and holds their locks.
-pub async fn release_lost_placement(
+async fn release_lost_placement(
     tx: &mut Transaction<'_, Postgres>,
     ids: &[SandboxId],
 ) -> Result<(), sqlx::Error> {
@@ -212,7 +212,7 @@ pub async fn release_lost_placement(
 ///   that can only deadlock against a census from the gone node itself.
 /// - **Executions.** The active execution is written off as `forgotten`, the
 ///   pod-tracking write-off state: its pod, if one ran, died with the node.
-/// - **Placement.** Released through [`release_lost_placement`], so the row
+/// - **Placement.** Released through `release_lost_placement`, so the row
 ///   stops pinning the gone node.
 ///
 /// Port exposures are left alone: re-queueing them for a terminal sandbox
