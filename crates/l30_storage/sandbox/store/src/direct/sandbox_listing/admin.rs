@@ -24,7 +24,8 @@
 //! second is then FALSE rather than NULL, so the predicate is too. The
 //! assigned predicate ($11) is TRUE iff the response reports the row on some
 //! node, FALSE otherwise, never NULL, so `= $11` with FALSE keeps exactly the
-//! rows on no node (`tests`).
+//! rows on no node (`tests`). The api's admin list tests also run each node
+//! filter through all four statements, with and without a search.
 //!
 //! The route table does not shrink to the routes in flight: writing off a
 //! sandbox from a gone node, reverting a restore and rolling back an

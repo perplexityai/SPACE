@@ -123,6 +123,7 @@ pub struct SimState {
     failing_wakes: Arc<Mutex<HashSet<String>>>,
     refused_artifact_backups: Arc<Mutex<HashMap<String, tonic::Code>>>,
     refused_resource_updates: Arc<Mutex<HashMap<String, tonic::Code>>>,
+    refused_create: Arc<Mutex<Option<tonic::Code>>>,
     snapshot_dir: PathBuf,
     node_id: String,
     fs: crate::fs::SandboxFs,
@@ -168,6 +169,7 @@ impl SimState {
             failing_wakes: Default::default(),
             refused_artifact_backups: Default::default(),
             refused_resource_updates: Default::default(),
+            refused_create: Default::default(),
             snapshot_dir,
             node_id,
             fs: crate::fs::SandboxFs::new(sandbox_fs_dir),
@@ -341,6 +343,16 @@ impl SimState {
             .lock()
             .await
             .remove(sandbox_id)
+    }
+
+    /// Refuse the next create, whatever its sandbox, with `code`, as
+    /// sandbox-manager refuses one when the node is full or failing.
+    pub async fn refuse_next_create(&self, code: tonic::Code) {
+        *self.refused_create.lock().await = Some(code);
+    }
+
+    pub(crate) async fn take_create_refusal(&self) -> Option<tonic::Code> {
+        self.refused_create.lock().await.take()
     }
 
     pub async fn state_of(&self, ids: &[String]) -> (Vec<SandboxRecord>, Vec<String>) {
