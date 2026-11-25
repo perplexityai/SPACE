@@ -24,9 +24,7 @@ use std::sync::Arc;
 use sqlx::PgPool;
 
 pub(super) use crate::template_build_jobs_store::{BuildJob, BuildSpec};
-use crate::template_build_jobs_store::{
-    TemplateBuildJobsStore, TemplateBuildJobsStoreError, template_build_owner_matches,
-};
+use crate::template_build_jobs_store::{TemplateBuildJobsStore, TemplateBuildJobsStoreError};
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum RecordBlobError {
@@ -67,7 +65,13 @@ impl TemplateBuildState {
         files_hash: &str,
         blob_sha256: &str,
     ) -> Result<(), RecordBlobError> {
-        if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
+        if !pplx_space_template_store::templates::not_owned_by_another_org(
+            &self.pool,
+            template_name,
+            org_id,
+        )
+        .await?
+        {
             return Err(RecordBlobError::Conflict);
         }
         let recorded = pplx_space_template_store::build_blobs::record(
@@ -90,7 +94,13 @@ impl TemplateBuildState {
         template_name: &TemplateName,
         files_hash: &str,
     ) -> Result<Option<String>, sqlx::Error> {
-        if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
+        if !pplx_space_template_store::templates::not_owned_by_another_org(
+            &self.pool,
+            template_name,
+            org_id,
+        )
+        .await?
+        {
             return Ok(None);
         }
         pplx_space_template_store::build_blobs::blob_sha256(

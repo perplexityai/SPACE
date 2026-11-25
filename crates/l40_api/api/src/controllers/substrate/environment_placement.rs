@@ -417,7 +417,11 @@ async fn build_binding(
                 pplx_space_execution_catalog::catalog::initial_environment_reference(),
             )
             .await?;
-            crate::template_inventory_store::agreed_build_environment(
+            // Holders that disagree give no binding: one hash can be cached
+            // bound to several environments. Both digest spellings match
+            // because a tag on a legacy unprefixed release reports that
+            // spelling while the digest's holders record the `sha256:` one.
+            pplx_space_node_template_inventory_store::agreed_build_environment(
                 pool,
                 template,
                 content_hash,

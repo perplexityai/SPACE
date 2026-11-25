@@ -386,13 +386,6 @@ pub(crate) async fn org_byok_enabled(
     Ok(enabled.unwrap_or(false))
 }
 
-/// The owner org's encryption flag, or `None` when the org row is missing.
-/// For decisions that must fail closed on an unknown org, unlike
-/// [`org_byok_enabled`].
-async fn org_encryption_flag(pool: &PgPool, org_id: OrgId) -> Result<Option<bool>, sqlx::Error> {
-    pplx_space_accounts_store::organizations::organization_byok_enabled(pool, org_id).await
-}
-
 /// Cluster-wide opt-in for stamping `volume_encryption` on new sandboxes.
 /// `organizations.byok_enabled` is an advisory flag shared with the
 /// credential-encryption feature, so volume encryption additionally requires
@@ -1103,7 +1096,10 @@ impl SandboxController {
         let Ok(boot_mode) = CreateBootMode::from_api(req.boot_mode.as_deref(), false) else {
             return AdmissionPoolPlan::Ineligible;
         };
-        match org_encryption_flag(pool, org_id).await {
+        // Fails closed on an unknown org, unlike `org_byok_enabled`.
+        match pplx_space_accounts_store::organizations::organization_byok_enabled(pool, org_id)
+            .await
+        {
             Ok(Some(false)) => {}
             Ok(Some(true) | None) => return AdmissionPoolPlan::Ineligible,
             Err(error) => {

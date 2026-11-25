@@ -982,8 +982,8 @@ async fn claim_created_operation_tx(
     let row =
         operation_store::operations::claim_created(&mut **tx, operation_id, &claim_token).await?;
     let operation = ClaimedPublicOperation::try_from(row)?;
-    append_operation_event_tx(
-        tx,
+    operation_store::events::append(
+        &mut **tx,
         operation.id,
         PublicOperationEventType::Claimed,
         serde_json::json!({
@@ -2018,8 +2018,8 @@ pub async fn create_operation_tx(
     )
     .await?;
 
-    append_operation_event_tx(
-        tx,
+    operation_store::events::append(
+        &mut **tx,
         operation_id,
         PublicOperationEventType::Created,
         serde_json::json!({
@@ -2109,8 +2109,8 @@ async fn cancel_superseded_create_tx(
         error.clone(),
     )
     .await?;
-    append_operation_event_tx(
-        tx,
+    operation_store::events::append(
+        &mut **tx,
         create_id,
         PublicOperationEventType::Canceled,
         serde_json::json!({
@@ -2390,8 +2390,8 @@ async fn claim_operations(
         let operation = ClaimedPublicOperation::try_from(row.operation)?;
         // A stale reclaim was already running, so its wait is not queue time.
         queue_waits.push((!row.reclaimed).then_some(row.queue_wait_ms));
-        append_operation_event_tx(
-            &mut tx,
+        operation_store::events::append(
+            &mut *tx,
             operation.id,
             PublicOperationEventType::Claimed,
             serde_json::json!({
@@ -2441,8 +2441,8 @@ async fn complete_claimed_operation(
     .await?;
 
     if updated {
-        append_operation_event_tx(
-            &mut tx,
+        operation_store::events::append(
+            &mut *tx,
             input.operation_id,
             PublicOperationEventType::Completed,
             serde_json::json!({
@@ -2474,8 +2474,8 @@ async fn fail_claimed_operation(
     .await?;
 
     if updated {
-        append_operation_event_tx(
-            &mut tx,
+        operation_store::events::append(
+            &mut *tx,
             input.operation_id,
             PublicOperationEventType::Failed,
             serde_json::json!({
@@ -2509,8 +2509,8 @@ async fn expire_claimed_operation(
     .await?;
 
     if updated {
-        append_operation_event_tx(
-            &mut tx,
+        operation_store::events::append(
+            &mut *tx,
             input.operation_id,
             PublicOperationEventType::Expired,
             expired_event(&input),
@@ -2642,8 +2642,8 @@ async fn release_claimed_operation(
     .await?;
 
     if updated {
-        append_operation_event_tx(
-            &mut tx,
+        operation_store::events::append(
+            &mut *tx,
             input.operation_id,
             PublicOperationEventType::Requeued,
             serde_json::json!({
@@ -2812,15 +2812,6 @@ fn idempotency_lock_key(
             .expect("sha256 digest should contain at least eight bytes"),
     );
     i64::from_be_bytes(key)
-}
-
-pub async fn append_operation_event_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    operation_id: OperationId,
-    event_type: PublicOperationEventType,
-    event_json: serde_json::Value,
-) -> Result<i64, sqlx::Error> {
-    operation_store::events::append(&mut **tx, operation_id, event_type, event_json).await
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
