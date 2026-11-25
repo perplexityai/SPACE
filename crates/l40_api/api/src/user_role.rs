@@ -1,7 +1,7 @@
 //! The `users.role` column type, owned by the accounts store, and the rules
 //! for which roles a role may grant or act on.
 
-pub use pplx_space_accounts_store::{UserRole, UserRoleParseError};
+pub(crate) use pplx_space_accounts_store::UserRole;
 
 /// Which roles a user's role may assign or act on.
 pub trait UserRolePolicy {

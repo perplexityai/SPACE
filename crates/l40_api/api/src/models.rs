@@ -20,16 +20,12 @@ use pplx_space_template_model::TemplateReference;
 
 use crate::user_role::UserRole;
 use pplx_space_cluster_pool::PoolConfigOwner;
+use pplx_space_sandbox_store::SandboxMetadata;
 
-/// The `sandboxes.metadata` document shape, owned by the sandbox store
-/// (it is the shape of a column on that table) and re-exported here so the
-/// api's existing `crate::models::SandboxMetadata` paths keep resolving.
-pub use pplx_space_sandbox_store::{SandboxMetadata, SandboxMetadataValue};
-
-/// The account rows, owned by the accounts store and re-exported here so the
-/// api's existing `crate::models::{Organization, User, ApiKey, Cluster}` paths
-/// keep resolving.
-pub use pplx_space_accounts_store::{ApiKey, Cluster, Organization, User};
+/// The account rows, owned by the accounts store; this crate-internal alias
+/// keeps the api's `crate::models::{Organization, User, ApiKey, Cluster}`
+/// paths resolving.
+pub(crate) use pplx_space_accounts_store::{ApiKey, Cluster, Organization, User};
 
 /// Which users may sign in to the console: the api's rules over the
 /// accounts store's `User` row.
@@ -100,9 +96,9 @@ pub struct Session {
 }
 
 /// A sandbox's response row, owned by the sandbox store with the
-/// statements that read it and re-exported here so the api's existing
-/// `crate::models::Sandbox` paths keep resolving.
-pub use pplx_space_sandbox_store::direct::sandbox_listing::Sandbox;
+/// statements that read it; this crate-internal alias keeps the api's
+/// `crate::models::Sandbox` paths resolving.
+pub(crate) use pplx_space_sandbox_store::direct::sandbox_listing::Sandbox;
 
 /// Per-organization Key Encryption Key. Populated by tenant
 /// onboarding; consumed by the credmgr at wrap/unwrap time.
