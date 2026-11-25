@@ -13,7 +13,9 @@ use pplx_space_node_mgr_client::proto::{CreateBtrfsSnapshotRequest, CreateBtrfsS
 use pplx_space_sandbox_model::SandboxId;
 use tokio::sync::Semaphore;
 
-use super::planner::{DrainScans, PlannedAction, SNAPSHOT_REASON, STOPPED_REASON};
+use super::planner::DrainScans;
+use super::planner::{PlannedAction, SNAPSHOT_REASON, STOPPED_REASON};
+use super::tests::work_of;
 use crate::activation_seal::ACTIVATIONS_SEALED_MARKER;
 use crate::node_manager_transport::fake::{FakeNodeManager, ServedNodeManager};
 use crate::proto::{CreateSnapshotRequest, DrainReport, DrainWait as WireWait, SnapshotType};
@@ -225,7 +227,7 @@ async fn a_snapshot_in_flight_on_a_sealed_node_keeps_the_drain_pending() {
         producer_in_flight(&service, &id).await;
 
         let first = service.activation_seal.status();
-        let report = service.finish_drain(7, &first, DrainScans::default());
+        let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
         assert!(!finished(&report), "{state}: {report:?}");
         let pending: Vec<_> = kinds(&report)
             .into_iter()
@@ -275,7 +277,7 @@ async fn a_snapshot_in_flight_on_a_sealed_node_keeps_the_drain_pending() {
         drop(wake);
         service.drain_actions.wait_idle().await;
         let first = service.activation_seal.status();
-        let report = service.finish_drain(7, &first, DrainScans::default());
+        let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
         assert!(!finished(&report), "{state}: {report:?}");
         assert_eq!(
             report
@@ -293,7 +295,7 @@ async fn a_snapshot_in_flight_on_a_sealed_node_keeps_the_drain_pending() {
             .mark_backup_completed(published.local_artifact_id.parse().unwrap())
             .unwrap();
         let first = service.activation_seal.status();
-        let report = service.finish_drain(7, &first, DrainScans::default());
+        let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
         assert!(finished(&report), "{state}: {report:?}");
         service.drain_actions.wait_idle().await;
         service.activation_seal.assert_quiesced();
@@ -389,7 +391,7 @@ async fn a_producer_ending_after_a_cancel_clears_its_entry() {
     snapshot.await.unwrap().unwrap();
     service.activation_seal.assert_quiesced();
     let first = service.begin_drain(8, HOLD).unwrap();
-    let report = service.finish_drain(8, &first, DrainScans::default());
+    let report = service.finish_drain(8, &first, DrainScans::default(), work_of(&service));
     assert!(
         report
             .pending
@@ -520,7 +522,7 @@ async fn a_rollback_of_a_running_sandbox_leaves_the_drain_pending() {
     );
     for _ in 0..2 {
         let first = service.activation_seal.status();
-        let report = service.finish_drain(7, &first, DrainScans::default());
+        let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
         assert!(!finished(&report), "{report:?}");
         assert_eq!(kinds(&report), [(id.clone(), WireWait::External, false)]);
         assert_eq!(report.pending[0].reason, STOPPED_REASON);
@@ -568,7 +570,7 @@ async fn a_rollback_holds_its_producer_token_until_it_returns() {
     // The seal lands mid-rollback: the drain reports the rollback pending.
     service.begin_drain(7, HOLD).unwrap();
     let first = service.activation_seal.status();
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     assert!(!finished(&report), "{report:?}");
     assert!(
         report.pending.iter().any(|entry| entry.sandbox_id == id
@@ -584,7 +586,7 @@ async fn a_rollback_holds_its_producer_token_until_it_returns() {
     assert!(ended.message().contains("rootfs.ext4"), "{ended:?}");
     service.activation_seal.assert_quiesced();
     let first = service.activation_seal.status();
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     assert!(
         !report
             .pending
@@ -769,7 +771,7 @@ async fn an_idle_stop_holds_its_producer_token_until_its_write_commits() {
     // reports the stop pending, though the row reads evacuated.
     service.begin_drain(7, HOLD).unwrap();
     let first = service.activation_seal.status();
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     assert!(!finished(&report), "{report:?}");
     assert_eq!(kinds(&report), [snapshot_entry(&id, false)]);
     assert_eq!(report.pending[0].reason, SNAPSHOT_REASON);
@@ -788,7 +790,7 @@ async fn an_idle_stop_holds_its_producer_token_until_its_write_commits() {
     );
     service.activation_seal.assert_quiesced();
     let first = service.activation_seal.status();
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     assert!(!finished(&report), "{report:?}");
     assert_eq!(kinds(&report), [(id.clone(), WireWait::External, false)]);
     assert_eq!(report.pending[0].reason, STOPPED_REASON);

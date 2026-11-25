@@ -21,8 +21,12 @@
 //! A call that doesn't say to evacuate holds: a started sandbox the node can
 //! make durable is reported `pending` ([`planner::Wait::Hold`]) and nothing
 //! is suspended for it, so it keeps running until the drain evacuates, or
-//! until its idle auto-lifecycle or its user moves it on. A started sandbox
-//! whose drain suspend is already running is waited for. A suspend planned
+//! until its idle auto-lifecycle or its user moves it on, and is reported
+//! held whatever its pin's upload does, that upload finished meanwhile and
+//! the held entry's reason saying when it holds a window slot and how its
+//! last attempt failed, if it did. A
+//! started sandbox whose drain suspend is already running is waited for. A
+//! suspend planned
 //! while holding suspends a VM only from `paused`, checked again under the
 //! wake lock, so a resume that was already in flight at the seal and
 //! finished `started` is held, not suspended. A call that says to evacuate
@@ -40,19 +44,34 @@
 //! moved by the drain, or waiting on work the drain doesn't drive), whether
 //! its row was a started VM at the planning read (`running`), the detail in
 //! its reason, and when its row entered its state (`since`); the drain
-//! reports no sandbox `blocked`, and one it can't move is pending with why.
+//! reports no sandbox `blocked`, and one it can't move is pending with why,
+//! a VM whose suspend the node refuses waiting on what the drain doesn't
+//! drive. Such a VM's pin, holding or evacuating, still has its upload
+//! finished: no suspend of the drain's will replace it, as none replaces a
+//! held VM's. Its entry's reason says when that upload holds a window
+//! slot.
 //! `blocked` holds node-wide problems only. A cancel unseals, keeps its
 //! generation as the tombstone, and answers at once: nothing is started,
 //! stopped or handed back.
 //!
 //! A call never waits for that work. It plans from the rows as they are,
-//! starts what is not already running, and answers. It paces what it
-//! starts: at most a window of suspends and publications is in flight at
-//! once, uploads they leave pending included, and a suspend starts only
-//! while the cache disk covers its snapshot; the rest wait, `pending`, for a
-//! later call. An upload whose job is still queued or running is left to
-//! it. [`planner::DrainPlan`] is that decision, a pure function of what the
-//! pass read. Beside it, the report blocks unless every scan that can reveal
+//! starts what is not already running, and answers. Each sandbox has one
+//! stage in a pass ([`planner::Stage`]), a pure function of its row, the
+//! drain's action running for it, its pin's upload and the hold, and the
+//! pass's window, disk reservation, action and reported wait all come from
+//! it. It paces what it starts: a sandbox holds one of a window of slots
+//! from its suspend or publication's start until the upload of the pin it
+//! leaves ends, a pin upload's retry needs a slot too, after the VMs' work,
+//! paused VMs then started ones, beside the publications, and a suspend starts
+//! only while the cache disk covers its snapshot beside what the running
+//! suspends reserve, the bytes sized when each started; the rest wait,
+//! `pending`, for a later call. It starts at most one action per sandbox:
+//! its suspend or publication, then its pin's upload, then the upload of
+//! another of its artifacts, which takes no slot. An upload whose job is
+//! still queued or running is left to it. The call reads the drain's own
+//! work first, then the cache disk, then the rows, so work that ends
+//! between those reads is counted twice, never not at all.
+//! [`planner::DrainPlan`] is the pass's decision. Beside it, the report blocks unless every scan that can reveal
 //! a resident or an artifact succeeded and the seal held, under the call's
 //! generation, from before the walk to its end, and lists the activations
 //! and the artifact producers in flight at its first read as pending.

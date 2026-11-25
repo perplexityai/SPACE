@@ -32,19 +32,66 @@ fn pending(id: &str, artifact: &str) -> BTreeMap<String, BTreeSet<String>> {
     BTreeMap::from([(id.to_owned(), BTreeSet::from([artifact.to_owned()]))])
 }
 
+/// An artifact no row here pins, which a running upload uploads unless a
+/// test names another.
+const UNPINNED_ARTIFACT: &str = "01939e3e-9005-7000-8000-000000000001";
+
+/// `kind` as it runs: a suspend reserving nothing, an upload of
+/// [`UNPINNED_ARTIFACT`].
+fn runs(kind: DrainAction) -> RunningAction {
+    match kind {
+        DrainAction::Suspend => RunningAction::Suspend { reserved_bytes: 0 },
+        DrainAction::PublishSnapshot => RunningAction::PublishSnapshot,
+        DrainAction::Upload => RunningAction::Upload {
+            artifact_id: UNPINNED_ARTIFACT.to_owned(),
+        },
+    }
+}
+
+/// The drain's work running for each sandbox, as [`runs`] gives it.
+fn running(pairs: &[(&str, DrainAction)]) -> BTreeMap<String, RunningAction> {
+    pairs
+        .iter()
+        .map(|(id, action)| ((*id).to_owned(), runs(*action)))
+        .collect()
+}
+
+/// The kind of each action `service`'s drain has running.
+fn running_kinds(service: &SandboxManagerService) -> BTreeMap<String, DrainAction> {
+    service
+        .drain_actions
+        .running()
+        .into_iter()
+        .map(|(id, action)| (id, action.kind()))
+        .collect()
+}
+
+/// `service`'s drain work in flight, beside an unmeasured disk.
+pub(super) fn work_of(service: &SandboxManagerService) -> DrainWork {
+    DrainWork {
+        running: service.drain_actions.running(),
+        disk_headroom: None,
+    }
+}
+
+/// A failure of the drain's work that uploaded no artifact, with `reason`.
+fn failed(reason: &str) -> DrainFailure {
+    DrainFailure {
+        reason: reason.to_owned(),
+        artifact: None,
+    }
+}
+
 fn plan_one(
     row: DrainRow,
     pending_backups: &BTreeMap<String, BTreeSet<String>>,
-    running: &[(&str, DrainAction)],
+    running_now: &[(&str, DrainAction)],
 ) -> DrainPlan {
     plan(
         &[row],
         &PlanInputs {
             pending_backups: pending_backups.clone(),
-            running: running
-                .iter()
-                .map(|(id, action)| ((*id).to_owned(), *action))
-                .collect(),
+            running: running(running_now),
             ..PlanInputs::default()
         },
     )
@@ -81,6 +128,7 @@ fn suspend(id: &str) -> PlannedAction {
     PlannedAction::Suspend {
         sandbox_id: id.into(),
         from: SuspendFrom::StartedOrPaused,
+        snapshot_bytes: 0,
     }
 }
 
@@ -90,6 +138,7 @@ fn held_suspend(id: &str) -> PlannedAction {
     PlannedAction::Suspend {
         sandbox_id: id.into(),
         from: SuspendFrom::Paused,
+        snapshot_bytes: 0,
     }
 }
 
@@ -206,7 +255,8 @@ fn every_lifecycle_plans_as_the_drain_table_says() {
 }
 
 /// A row with drain work in flight waits for it rather than starting it
-/// again; a VM the node can't make durable is pending with the reason.
+/// again; a VM the node can't make durable is pending with the reason,
+/// waiting on what the drain doesn't drive.
 #[test]
 fn a_vm_waits_for_its_suspend_or_says_why_it_cant() {
     let running = plan_one(
@@ -220,9 +270,13 @@ fn a_vm_waits_for_its_suspend_or_says_why_it_cant() {
     let mut refused = row("a", SandboxState::Started);
     refused.suspend_refusal = Some("can't be made durable: no memory snapshots".into());
     let waiting = plan_one(refused, &BTreeMap::new(), &[]);
-    assert_eq!(waits(&waiting), expect(&[("a", "suspend")]));
+    assert_eq!(waits(&waiting), expect(&[("a", "refused")]));
     assert_eq!(
-        reason_of(&waiting, "a", "suspend").as_deref(),
+        waiting.pending[0].wait.kind(),
+        crate::proto::DrainWait::External
+    );
+    assert_eq!(
+        reason_of(&waiting, "a", "refused").as_deref(),
         Some("can't be made durable: no memory snapshots")
     );
     assert!(waiting.actions.is_empty() && waiting.blocked.is_empty());
@@ -355,21 +409,20 @@ fn an_unpinned_suspended_sandbox_is_published_before_the_drain_is_done() {
     assert_eq!(waits(&first), expect(&[("a", "publish_snapshot")]));
     assert!(first.evacuated.is_empty() && first.blocked.is_empty());
 
-    let running = plan_one(
+    let publishing = plan_one(
         unpinned.clone(),
         &BTreeMap::new(),
         &[("a", DrainAction::PublishSnapshot)],
     );
-    assert!(running.actions.is_empty(), "{running:?}");
-    assert_eq!(waits(&running), expect(&[("a", "publish_snapshot")]));
+    assert!(publishing.actions.is_empty(), "{publishing:?}");
+    assert_eq!(waits(&publishing), expect(&[("a", "publish_snapshot")]));
     let rows = [unpinned.clone()];
     let inputs = PlanInputs {
-        running: BTreeMap::from([("a".to_owned(), DrainAction::PublishSnapshot)]),
+        running: running(&[("a", DrainAction::PublishSnapshot)]),
         ..PlanInputs::default()
     };
-    assert_eq!(
-        inputs.window_in_flight(&rows),
-        1,
+    assert!(
+        inputs.stage(&rows[0]).holds_slot(),
         "a publication takes a slot"
     );
 
@@ -388,7 +441,7 @@ fn an_unpinned_suspended_sandbox_is_published_before_the_drain_is_done() {
         &PlanInputs {
             failures: BTreeMap::from([(
                 ("a".to_owned(), DrainAction::PublishSnapshot),
-                "no snapshot".to_owned(),
+                failed("no snapshot"),
             )]),
             ..PlanInputs::default()
         },
@@ -474,9 +527,9 @@ fn a_running_action_is_reported_once_per_sandbox() {
                             (SUPERSEDED.to_owned(), ArtifactKind::Full),
                         ],
                     )]),
-                    running: BTreeMap::from([("a".to_owned(), DrainAction::Suspend)]),
+                    running: running(&[("a", DrainAction::Suspend)]),
                     failures: failure
-                        .map(|failure| (("a".to_owned(), DrainAction::Suspend), failure.to_owned()))
+                        .map(|failure| (("a".to_owned(), DrainAction::Suspend), failed(failure)))
                         .into_iter()
                         .collect(),
                     hold_running,
@@ -502,18 +555,15 @@ fn a_running_action_is_reported_once_per_sandbox() {
 /// reason of the sandbox's upload.
 #[test]
 fn a_failure_is_the_reason_of_its_work_which_is_retried() {
-    let plan_with = |running: &[(&str, DrainAction)]| {
+    let plan_with = |running_now: &[(&str, DrainAction)]| {
         plan(
             &[row("a", SandboxState::Paused)],
             &PlanInputs {
                 failures: BTreeMap::from([(
                     ("a".to_owned(), DrainAction::Suspend),
-                    "no space".to_owned(),
+                    failed("no space"),
                 )]),
-                running: running
-                    .iter()
-                    .map(|(id, action)| ((*id).to_owned(), *action))
-                    .collect(),
+                running: running(running_now),
                 ..PlanInputs::default()
             },
         )
@@ -572,11 +622,8 @@ fn the_window_starts_paused_then_started_and_queues_the_rest() {
         window,
         pending_backups: pending("u", FULL_ARTIFACT),
         active_uploads: BTreeSet::from([FULL_ARTIFACT.to_owned()]),
-        running: BTreeMap::from([("r".to_owned(), DrainAction::Suspend)]),
-        failures: BTreeMap::from([(
-            ("s2".to_owned(), DrainAction::Suspend),
-            "no space".to_owned(),
-        )]),
+        running: running(&[("r", DrainAction::Suspend)]),
+        failures: BTreeMap::from([(("s2".to_owned(), DrainAction::Suspend), failed("no space"))]),
         ..PlanInputs::default()
     };
     // The running suspend and the active upload take two of five.
@@ -614,13 +661,14 @@ fn the_window_starts_paused_then_started_and_queues_the_rest() {
     );
 }
 
-/// A pinned artifact still without a durable copy takes a window slot only
-/// while its upload job is queued or running. One whose job failed, or that
-/// no job uploads yet, takes none, a VM's or a suspended snapshot's alike, so a
-/// failed upload frees its slot. The paused rows here can't be suspended,
-/// so their own suspends take no slot either.
+/// A pinned artifact still without a durable copy holds its sandbox's window
+/// slot while its upload job is queued or running, a VM's whose suspend is
+/// refused or a suspended snapshot's alike. Once the job has ended, failed or
+/// never enqueued, the slot is free, and the drain's retry of that upload
+/// needs one like any other windowed work, after the VMs' suspends: a pin
+/// whose upload keeps failing never holds a VM back.
 #[test]
-fn a_pin_takes_a_window_slot_only_while_its_upload_job_is_active() {
+fn a_pin_holds_a_window_slot_while_its_upload_job_is_active_and_its_retry_needs_one() {
     let pinned: Vec<DrainRow> = (1..=8)
         .map(|n| {
             let mut pinned = if n % 2 == 0 {
@@ -650,34 +698,98 @@ fn a_pin_takes_a_window_slot_only_while_its_upload_job_is_active() {
             (row.sandbox_id.clone(), BTreeSet::from([artifact]))
         })
         .collect();
-    let inputs = |active_uploads: BTreeSet<String>| PlanInputs {
-        window: 8,
+    let inputs = |window: usize, active_uploads: BTreeSet<String>| PlanInputs {
+        window,
         pending_backups: BTreeMap::clone(&pending_backups),
         active_uploads,
         ..PlanInputs::default()
     };
+    let uploads = |plan: &DrainPlan| {
+        plan.actions
+            .iter()
+            .filter(|action| matches!(action, PlannedAction::Upload { .. }))
+            .count()
+    };
 
-    let failed = plan(&rows, &inputs(BTreeSet::new()));
-    assert!(
-        failed.actions.contains(&suspend("s")),
-        "{:?}",
-        failed.actions
-    );
-
-    let uploading = plan(&rows, &inputs(artifacts));
-    assert!(
-        !uploading.actions.contains(&suspend("s")),
-        "{:?}",
-        uploading.actions
-    );
+    let uploading = plan(&rows, &inputs(8, artifacts));
+    assert!(uploading.actions.is_empty(), "{:?}", uploading.actions);
     assert!(waits(&uploading).contains(&("s".into(), "queued".into())));
+
+    // The started VM first, then the retries the window has room for, in
+    // sandbox order; the last waits.
+    let ended = plan(&rows, &inputs(8, BTreeSet::new()));
+    assert_eq!(ended.actions.first(), Some(&suspend("s")), "{ended:?}");
+    assert_eq!(uploads(&ended), 7, "{:?}", ended.actions);
+    // `p8`, a refused VM, is reported refused whatever its upload waits for.
+    assert!(
+        !ended.actions.iter().any(|action| action.target().0 == "p8"),
+        "{:?}",
+        ended.actions
+    );
+
+    let roomier = plan(&rows, &inputs(9, BTreeSet::new()));
+    assert_eq!(uploads(&roomier), 8, "{:?}", roomier.actions);
+    assert!(
+        roomier.actions.contains(&suspend("s")),
+        "{:?}",
+        roomier.actions
+    );
+}
+
+/// A VM whose pin is still uploading holds its slot already, and its suspend
+/// takes no second one; but it starts only while the window has room, so no
+/// more VMs are ever being suspended than the window allows, however many
+/// pins were uploading when the drain began.
+#[test]
+fn a_vm_whose_pin_holds_a_slot_starts_its_suspend_only_with_room() {
+    let pinned_paused = |n: usize| DrainRow {
+        pin: Some((format!("{FULL_ARTIFACT}-{n}"), ArtifactKind::Full)),
+        ..row(&format!("p{n}"), SandboxState::Paused)
+    };
+    let rows: Vec<DrainRow> = (1..=3).map(pinned_paused).collect();
+    let artifacts = rows.iter().map(|row| row.pin.clone().unwrap().0);
+    let inputs = |window: usize| PlanInputs {
+        window,
+        pending_backups: rows
+            .iter()
+            .map(|row| {
+                let artifact = row.pin.clone().unwrap().0;
+                (row.sandbox_id.clone(), BTreeSet::from([artifact]))
+            })
+            .collect(),
+        active_uploads: artifacts.clone().collect(),
+        ..PlanInputs::default()
+    };
+
+    // Three pins hold three slots of a window of two: none starts.
+    let full = plan(&rows, &inputs(2));
+    assert!(full.actions.is_empty(), "{full:?}");
+    assert_eq!(
+        waits(&full),
+        expect(&[("p1", "queued"), ("p2", "queued"), ("p3", "queued")])
+    );
+
+    // With room for one more, every VM whose pin holds a slot starts in it.
+    let room = plan(&rows, &inputs(4));
+    assert_eq!(room.actions, [suspend("p1"), suspend("p2"), suspend("p3")]);
+}
+
+/// The drain's suspend of `id` while it evacuates, sized `mib` MiB.
+fn sized_suspend(id: &str, mib: u64) -> PlannedAction {
+    PlannedAction::Suspend {
+        sandbox_id: id.into(),
+        from: SuspendFrom::StartedOrPaused,
+        snapshot_bytes: mib * MIB,
+    }
 }
 
 /// A suspend starts only while the cache disk's headroom covers its snapshot
-/// beside the snapshots of the suspends already running; otherwise it is
+/// beside what the suspends already running reserve; otherwise it is
 /// pending `disk`, with the snapshot's size, however long it waits. A
 /// smaller snapshot behind it still starts, and a node that doesn't measure
-/// its disk starts every one.
+/// its disk starts every one. A running suspend reserves what the plan sized
+/// when it started it, whatever its row reads since: here `suspending`, a
+/// row the read no longer sizes.
 #[test]
 fn a_suspend_waits_for_disk_room_for_its_snapshot() {
     let sized = |id: &str, mib: u64| {
@@ -689,26 +801,41 @@ fn a_suspend_waits_for_disk_room_for_its_snapshot() {
         sized("a", 600),
         sized("b", 600),
         sized("c", 100),
-        sized("r", 300),
+        row("r", SandboxState::Suspending),
     ];
     let inputs = |disk_headroom: Option<u64>| PlanInputs {
         disk_headroom,
-        running: BTreeMap::from([("r".to_owned(), DrainAction::Suspend)]),
+        running: BTreeMap::from([(
+            "r".to_owned(),
+            RunningAction::Suspend {
+                reserved_bytes: 300 * MIB,
+            },
+        )]),
         ..PlanInputs::default()
     };
 
-    let tight = plan(&rows, &inputs(Some(1024 * MIB)));
-    assert_eq!(tight.actions, [suspend("a"), suspend("c")]);
+    // 300 reserved and 600 for `a` leave no room for `b`'s 600, but for `c`'s
+    // 100.
+    let tight = plan(&rows, &inputs(Some(1250 * MIB)));
+    assert_eq!(
+        tight.actions,
+        [sized_suspend("a", 600), sized_suspend("c", 100)]
+    );
     assert_eq!(
         reason_of(&tight, "b", "disk").as_deref(),
         Some("the cache disk has no room yet for a 600 MiB snapshot")
     );
+    assert_eq!(reason_of(&tight, "r", "suspend"), None);
     assert!(tight.blocked.is_empty());
 
     let unmeasured = plan(&rows, &inputs(None));
     assert_eq!(
         unmeasured.actions,
-        [suspend("a"), suspend("b"), suspend("c")]
+        [
+            sized_suspend("a", 600),
+            sized_suspend("b", 600),
+            sized_suspend("c", 100)
+        ]
     );
     assert!(
         !waits(&unmeasured)
@@ -750,6 +877,525 @@ fn an_upload_with_an_active_job_is_not_enqueued_again() {
             kind: ArtifactKind::Full,
         }]
     );
+}
+
+/// The upload of `id`'s pin, [`FULL_ARTIFACT`].
+fn pin_upload(id: &str) -> PlannedAction {
+    PlannedAction::Upload {
+        sandbox_id: id.into(),
+        artifact_id: FULL_ARTIFACT.into(),
+        kind: ArtifactKind::Full,
+    }
+}
+
+/// Every stage a sandbox the drain drives can be in, one row alone in a
+/// roomy window: a started, paused, suspended or failed row, whose pin is
+/// durable, without a durable copy or absent, with nothing of the drain's
+/// running for it or each of its actions (an upload of its pin or of
+/// another artifact), its pin's upload job active or not, holding or
+/// evacuating, a VM's suspend refused or not, and an earlier upload of the
+/// drain's failed or not. Each gets one stage, and from it whether it holds
+/// a window slot, the one action the pass starts and the kind of its one
+/// entry.
+///
+/// A running suspend or publication comes first; then a refused suspend,
+/// `EXTERNAL`; then the hold, `HOLD`, whose reason names its pin upload's
+/// last failure; a held or refused VM still has its pin uploaded. A VM the drain suspends doesn't upload its pin, which the
+/// suspend supersedes. A sandbox holds a slot from its suspend or
+/// publication's start until its pin's upload ends.
+#[test]
+fn each_sandbox_has_one_stage_its_slot_action_and_wait_come_from() {
+    use crate::proto::DrainWait as Kind;
+    use SandboxState as S;
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Pin {
+        Durable,
+        Pending,
+        Unpinned,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Runs {
+        Nothing,
+        Suspend,
+        Publish,
+        PinUpload,
+        OtherUpload,
+    }
+    let step_name = |step: &Step| match step {
+        Step::Finished => "finished",
+        Step::Evacuated(_) => "evacuated",
+        Step::Held => "held",
+        Step::Suspend { .. } => "suspend",
+        Step::Publish => "publish",
+        Step::Suspending => "suspending",
+        Step::Publishing => "publishing",
+        Step::Uploading => "uploading",
+        Step::Refused(_) => "refused",
+        Step::External(..) => "external",
+    };
+    for state in [S::Started, S::Paused, S::Suspended, S::Failed] {
+        let vm = matches!(state, S::Started | S::Paused);
+        for pin in [Pin::Durable, Pin::Pending, Pin::Unpinned] {
+            for runs in [
+                Runs::Nothing,
+                Runs::Suspend,
+                Runs::Publish,
+                Runs::PinUpload,
+                Runs::OtherUpload,
+            ] {
+                for job_active in [false, true] {
+                    for hold_running in [false, true] {
+                        for (refused, upload_failed) in
+                            [(false, false), (false, true), (true, false), (true, true)]
+                        {
+                            if (job_active && pin != Pin::Pending) || (refused && !vm) {
+                                continue;
+                            }
+                            let mut subject = row("a", state);
+                            subject.pin = (pin != Pin::Unpinned)
+                                .then(|| (FULL_ARTIFACT.to_owned(), ArtifactKind::Full));
+                            subject.suspend_refusal =
+                                refused.then(|| "can't be made durable".to_owned());
+                            subject.snapshot_bytes = if vm { MIB } else { 0 };
+                            let running_action = match runs {
+                                Runs::Nothing => None,
+                                Runs::Suspend => Some(RunningAction::Suspend {
+                                    reserved_bytes: MIB,
+                                }),
+                                Runs::Publish => Some(RunningAction::PublishSnapshot),
+                                Runs::PinUpload => Some(RunningAction::Upload {
+                                    artifact_id: FULL_ARTIFACT.to_owned(),
+                                }),
+                                Runs::OtherUpload => Some(runs_upload_of(UNPINNED_ARTIFACT)),
+                            };
+                            let inputs = PlanInputs {
+                                pending_backups: if pin == Pin::Pending {
+                                    pending("a", FULL_ARTIFACT)
+                                } else {
+                                    BTreeMap::new()
+                                },
+                                active_uploads: job_active
+                                    .then(|| FULL_ARTIFACT.to_owned())
+                                    .into_iter()
+                                    .collect(),
+                                running: running_action
+                                    .clone()
+                                    .map(|action| ("a".to_owned(), action))
+                                    .into_iter()
+                                    .collect(),
+                                // The last upload that failed was the pin's,
+                                // or, while another artifact's runs, that
+                                // artifact's.
+                                failures: upload_failed
+                                    .then(|| {
+                                        (
+                                            ("a".to_owned(), DrainAction::Upload),
+                                            DrainFailure {
+                                                reason: "connection reset".to_owned(),
+                                                artifact: Some(
+                                                    if runs == Runs::OtherUpload {
+                                                        UNPINNED_ARTIFACT
+                                                    } else {
+                                                        FULL_ARTIFACT
+                                                    }
+                                                    .to_owned(),
+                                                ),
+                                            },
+                                        )
+                                    })
+                                    .into_iter()
+                                    .collect(),
+                                hold_running,
+                                ..PlanInputs::default()
+                            };
+                            let stage = inputs.stage(&subject);
+                            let planned = plan(std::slice::from_ref(&subject), &inputs);
+
+                            let pin_uploading =
+                                pin == Pin::Pending && (job_active || runs == Runs::PinUpload);
+                            let retry =
+                                (pin == Pin::Pending && !pin_uploading && runs == Runs::Nothing)
+                                    .then(|| pin_upload("a"));
+                            let held = hold_running && state == S::Started;
+                            let (step, action, kind) = match runs {
+                                Runs::Suspend => ("suspending", None, Some(Kind::Moving)),
+                                Runs::Publish => ("publishing", None, Some(Kind::Moving)),
+                                _ if vm && refused => ("refused", retry, Some(Kind::External)),
+                                _ if held => ("held", retry, Some(Kind::Hold)),
+                                Runs::Nothing if vm => (
+                                    "suspend",
+                                    Some(PlannedAction::Suspend {
+                                        sandbox_id: "a".into(),
+                                        from: if hold_running {
+                                            SuspendFrom::Paused
+                                        } else {
+                                            SuspendFrom::StartedOrPaused
+                                        },
+                                        snapshot_bytes: MIB,
+                                    }),
+                                    Some(Kind::Moving),
+                                ),
+                                _ if vm => ("uploading", None, Some(Kind::Moving)),
+                                _ if pin == Pin::Pending => {
+                                    ("uploading", retry, Some(Kind::Moving))
+                                }
+                                _ if state == S::Suspended && pin == Pin::Durable => {
+                                    ("evacuated", None, None)
+                                }
+                                Runs::Nothing if state == S::Suspended => (
+                                    "publish",
+                                    Some(PlannedAction::PublishSnapshot {
+                                        sandbox_id: "a".into(),
+                                    }),
+                                    Some(Kind::Moving),
+                                ),
+                                _ if state == S::Suspended => {
+                                    ("uploading", None, Some(Kind::Moving))
+                                }
+                                _ => ("finished", None, None),
+                            };
+                            let case = format!(
+                                "{state:?} pin={pin:?} runs={runs:?} job_active={job_active} \
+                                 hold_running={hold_running} refused={refused} \
+                                 upload_failed={upload_failed}"
+                            );
+                            assert_eq!(step_name(&stage.step), step, "{case}: {stage:?}");
+                            assert_eq!(
+                                stage.holds_slot(),
+                                matches!(runs, Runs::Suspend | Runs::Publish) || pin_uploading,
+                                "{case}: holds a slot"
+                            );
+                            assert_eq!(
+                                stage.reserved_bytes(),
+                                if runs == Runs::Suspend { MIB } else { 0 },
+                                "{case}: reserved"
+                            );
+                            assert_eq!(
+                                planned.actions,
+                                action.into_iter().collect::<Vec<_>>(),
+                                "{case}: actions"
+                            );
+                            assert_eq!(
+                                planned
+                                    .pending
+                                    .iter()
+                                    .map(|wait| wait.wait.kind())
+                                    .collect::<Vec<_>>(),
+                                kind.into_iter().collect::<Vec<_>>(),
+                                "{case}: {:?}",
+                                planned.pending
+                            );
+                            assert_eq!(
+                                !planned.evacuated.is_empty(),
+                                step == "evacuated",
+                                "{case}: evacuated"
+                            );
+                            // A held or refused entry says when its pin's
+                            // upload holds a window slot, and a held one how
+                            // the pin's last upload failed, never another
+                            // artifact's.
+                            let slot = pin_uploading.then_some(PIN_SLOT_NOTE);
+                            if step == "refused" {
+                                assert_eq!(
+                                    planned.pending[0].reason,
+                                    Some(
+                                        ["can't be made durable"]
+                                            .into_iter()
+                                            .chain(slot)
+                                            .collect::<Vec<_>>()
+                                            .join("; ")
+                                    ),
+                                    "{case}: the refusal is the reason"
+                                );
+                            }
+                            if step == "held" {
+                                let failure = (pin == Pin::Pending
+                                    && upload_failed
+                                    && runs != Runs::OtherUpload)
+                                    .then_some("the last upload failed: connection reset");
+                                let notes: Vec<_> = slot.into_iter().chain(failure).collect();
+                                assert_eq!(
+                                    planned.pending[0].reason,
+                                    (!notes.is_empty()).then(|| notes.join("; ")),
+                                    "{case}: a held entry's reason"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// An upload of `artifact_id` as it runs.
+fn runs_upload_of(artifact_id: &str) -> RunningAction {
+    RunningAction::Upload {
+        artifact_id: artifact_id.to_owned(),
+    }
+}
+
+/// A suspended row pinning [`FULL_ARTIFACT`].
+fn pinned_suspended(id: &str) -> DrainRow {
+    DrainRow {
+        pin: Some((FULL_ARTIFACT.into(), ArtifactKind::Full)),
+        ..row(id, SandboxState::Suspended)
+    }
+}
+
+/// A sandbox whose pin the drain's own upload action is uploading holds its
+/// window slot as one whose upload job is active does: a full window starts
+/// no other sandbox's suspend beside it.
+#[test]
+fn a_running_pin_upload_holds_its_window_slot() {
+    let rows = [pinned_suspended("u"), row("s", SandboxState::Started)];
+    let planned = plan(
+        &rows,
+        &PlanInputs {
+            window: 1,
+            pending_backups: pending("u", FULL_ARTIFACT),
+            running: BTreeMap::from([("u".to_owned(), runs_upload_of(FULL_ARTIFACT))]),
+            ..PlanInputs::default()
+        },
+    );
+    assert!(planned.actions.is_empty(), "{planned:?}");
+    assert_eq!(waits(&planned), expect(&[("u", "upload"), ("s", "queued")]));
+}
+
+/// The retry of a pin's upload, once its job has ended, needs a window slot
+/// like any other windowed work: it waits, queued, while the window is
+/// full, and starts once it has room.
+#[test]
+fn a_pin_upload_retry_waits_for_a_window_slot() {
+    let rows = [pinned_suspended("u"), row("r", SandboxState::Started)];
+    let inputs = |window: usize| PlanInputs {
+        window,
+        pending_backups: pending("u", FULL_ARTIFACT),
+        running: running(&[("r", DrainAction::Suspend)]),
+        ..PlanInputs::default()
+    };
+    let full = plan(&rows, &inputs(1));
+    assert!(full.actions.is_empty(), "{full:?}");
+    assert_eq!(waits(&full), expect(&[("r", "suspend"), ("u", "queued")]));
+    assert_eq!(
+        full.pending[1].reason(),
+        "the drain's upload, waiting for a window slot"
+    );
+
+    let roomy = plan(&rows, &inputs(2));
+    assert_eq!(roomy.actions, [pin_upload("u")]);
+    assert_eq!(waits(&roomy), expect(&[("r", "suspend"), ("u", "upload")]));
+}
+
+/// The pass starts one action per sandbox, its VM's suspend or its
+/// snapshot's publication ahead of the upload of another of its artifacts
+/// (a named snapshot here), so the suspend the window admits starts and an
+/// upload that keeps failing can't hold it back. The other upload is still
+/// pending, and starts once nothing ahead of it is admitted: here, behind a
+/// window the running suspend fills, which those uploads don't wait for.
+#[test]
+fn a_sandboxs_admitted_suspend_or_publication_starts_before_its_other_uploads() {
+    const NAMED_TOO: &str = "01939e3e-9006-7000-8000-000000000001";
+    let rows = [
+        row("p", SandboxState::Paused),
+        row("d", SandboxState::Suspended),
+        row("r", SandboxState::Started),
+    ];
+    let named = |id: &str, artifact: &str| {
+        (
+            id.to_owned(),
+            vec![(artifact.to_owned(), ArtifactKind::Full)],
+        )
+    };
+    let upload = |id: &str, artifact: &str| PlannedAction::Upload {
+        sandbox_id: id.into(),
+        artifact_id: artifact.into(),
+        kind: ArtifactKind::Full,
+    };
+    let inputs = |window: usize| PlanInputs {
+        window,
+        local_only: LocalOnlyArtifacts::from([named("p", NAMED_ARTIFACT), named("d", NAMED_TOO)]),
+        failures: BTreeMap::from([(
+            ("p".to_owned(), DrainAction::Upload),
+            failed("the control plane refused it"),
+        )]),
+        running: running(&[("r", DrainAction::Suspend)]),
+        ..PlanInputs::default()
+    };
+
+    let roomy = plan(&rows, &inputs(3));
+    assert_eq!(
+        roomy.actions,
+        [
+            suspend("p"),
+            PlannedAction::PublishSnapshot {
+                sandbox_id: "d".into()
+            }
+        ]
+    );
+    let mut entries = waits(&roomy);
+    entries.sort();
+    assert_eq!(
+        entries,
+        expect(&[
+            ("d", "publish_snapshot"),
+            ("d", "upload"),
+            ("p", "suspend"),
+            ("p", "upload"),
+            ("r", "suspend"),
+        ])
+    );
+
+    let full = plan(&rows, &inputs(1));
+    assert_eq!(
+        full.actions,
+        [upload("p", NAMED_ARTIFACT), upload("d", NAMED_TOO)]
+    );
+    assert!(waits(&full).contains(&("p".into(), "queued".into())));
+    assert!(waits(&full).contains(&("d".into(), "queued".into())));
+}
+
+/// A started VM whose suspend the node refuses waits on what the drain
+/// doesn't drive, `EXTERNAL` with the refusal as the reason, held or not, and
+/// its pin without a durable copy is uploaded meanwhile: no suspend of the
+/// drain's will replace it.
+#[test]
+fn a_refused_vm_is_external_and_still_has_its_pin_uploaded() {
+    let mut refused = row("a", SandboxState::Started);
+    refused.pin = Some((FULL_ARTIFACT.into(), ArtifactKind::Full));
+    refused.suspend_refusal = Some("can't be made durable: no memory snapshots".into());
+    for hold_running in [false, true] {
+        let planned = plan(
+            std::slice::from_ref(&refused),
+            &PlanInputs {
+                pending_backups: pending("a", FULL_ARTIFACT),
+                hold_running,
+                ..PlanInputs::default()
+            },
+        );
+        let case = format!("hold_running={hold_running}");
+        assert_eq!(planned.actions, [pin_upload("a")], "{case}");
+        assert_eq!(waits(&planned), expect(&[("a", "refused")]), "{case}");
+        assert_eq!(
+            planned.pending[0].wait.kind(),
+            crate::proto::DrainWait::External,
+            "{case}"
+        );
+        assert_eq!(
+            planned.pending[0].reason(),
+            "the node refuses its suspend: can't be made durable: no memory snapshots",
+            "{case}"
+        );
+    }
+}
+
+/// While holding, a paused VM whose suspend waits for cache disk room has its
+/// pin's upload started meanwhile: the suspend, from `paused` only, may never
+/// come. That upload holds no VM, so it waits its turn after every VM's
+/// suspend: a smaller paused VM the disk has room for is suspended first,
+/// however often the pin's upload has failed, and the upload starts only in
+/// a slot left over. Evacuating, the suspend supersedes the pin, and nothing
+/// starts for it until the disk has room.
+#[test]
+fn while_holding_a_suspend_waiting_for_disk_has_its_pin_uploaded_after_the_vms() {
+    let mut paused = row("a", SandboxState::Paused);
+    paused.pin = Some((FULL_ARTIFACT.into(), ArtifactKind::Full));
+    paused.snapshot_bytes = 600 * MIB;
+    let inputs = PlanInputs {
+        pending_backups: pending("a", FULL_ARTIFACT),
+        disk_headroom: Some(100 * MIB),
+        ..PlanInputs::default()
+    };
+    let held = plan(std::slice::from_ref(&paused), &holding(inputs.clone()));
+    assert_eq!(held.actions, [pin_upload("a")], "{held:?}");
+    assert_eq!(waits(&held), expect(&[("a", "disk")]));
+
+    let mut smaller = row("b", SandboxState::Paused);
+    smaller.snapshot_bytes = 100 * MIB;
+    let rows = [paused.clone(), smaller];
+    let failing = |window: usize| {
+        holding(PlanInputs {
+            window,
+            failures: BTreeMap::from([(
+                ("a".to_owned(), DrainAction::Upload),
+                DrainFailure {
+                    reason: "the control plane refused it".to_owned(),
+                    artifact: Some(FULL_ARTIFACT.to_owned()),
+                },
+            )]),
+            ..inputs.clone()
+        })
+    };
+    let b_suspend = PlannedAction::Suspend {
+        sandbox_id: "b".into(),
+        from: SuspendFrom::Paused,
+        snapshot_bytes: 100 * MIB,
+    };
+    let one_slot = plan(&rows, &failing(1));
+    assert_eq!(
+        one_slot.actions,
+        std::slice::from_ref(&b_suspend),
+        "{one_slot:?}"
+    );
+    assert_eq!(waits(&one_slot), expect(&[("a", "disk"), ("b", "suspend")]));
+    let two_slots = plan(&rows, &failing(2));
+    assert_eq!(
+        two_slots.actions,
+        [b_suspend, pin_upload("a")],
+        "{two_slots:?}"
+    );
+
+    let evacuating = plan(&[paused], &inputs);
+    assert!(evacuating.actions.is_empty(), "{evacuating:?}");
+    assert_eq!(waits(&evacuating), expect(&[("a", "disk")]));
+}
+
+/// A sandbox is reported with the same entries on every pass, whether the
+/// upload of one of its other artifacts (a named snapshot here) runs or not:
+/// a held sandbox `HOLD`, a refused VM `EXTERNAL`, and one in a transition
+/// the drain doesn't drive `EXTERNAL`, each beside the artifact's upload,
+/// `MOVING`.
+#[test]
+fn a_sandboxs_entries_dont_change_while_another_artifacts_upload_runs() {
+    let mut refused = row("a", SandboxState::Started);
+    refused.suspend_refusal = Some("can't be made durable".into());
+    for (case, subject, hold_running, own) in [
+        ("held", row("a", SandboxState::Started), true, "hold"),
+        ("refused", refused, false, "refused"),
+        (
+            "resuming",
+            row("a", SandboxState::Resuming),
+            false,
+            "settle:resuming",
+        ),
+    ] {
+        let planned = |running_now: BTreeMap<String, RunningAction>| {
+            plan(
+                std::slice::from_ref(&subject),
+                &PlanInputs {
+                    local_only: LocalOnlyArtifacts::from([(
+                        "a".to_owned(),
+                        vec![(NAMED_ARTIFACT.to_owned(), ArtifactKind::Full)],
+                    )]),
+                    running: running_now,
+                    hold_running,
+                    ..PlanInputs::default()
+                },
+            )
+        };
+        let idle = planned(BTreeMap::new());
+        let uploading = planned(BTreeMap::from([(
+            "a".to_owned(),
+            runs_upload_of(NAMED_ARTIFACT),
+        )]));
+        assert_eq!(
+            waits(&idle),
+            expect(&[("a", own), ("a", "upload")]),
+            "{case}: {idle:?}"
+        );
+        assert_eq!(waits(&uploading), waits(&idle), "{case}: {uploading:?}");
+        assert!(uploading.actions.is_empty(), "{case}: {uploading:?}");
+    }
 }
 
 /// The disk's headroom is what is available above the floor disk admission
@@ -799,7 +1445,7 @@ fn while_holding_the_drain_keeps_a_started_sandbox_running_and_plans_the_rest() 
         refused,
     ];
     let inputs = PlanInputs {
-        running: BTreeMap::from([("suspending".to_owned(), DrainAction::Suspend)]),
+        running: running(&[("suspending", DrainAction::Suspend)]),
         ..PlanInputs::default()
     };
     let planned = plan(&rows, &holding(inputs.clone()));
@@ -813,7 +1459,7 @@ fn while_holding_the_drain_keeps_a_started_sandbox_running_and_plans_the_rest() 
             ("resuming".to_owned(), "settle:resuming".to_owned()),
             ("suspending".to_owned(), "suspend".to_owned()),
             ("member".to_owned(), "warm_pool_eviction".to_owned()),
-            ("refused".to_owned(), "suspend".to_owned()),
+            ("refused".to_owned(), "refused".to_owned()),
         ]),
         "{planned:?}"
     );
@@ -833,7 +1479,7 @@ fn while_holding_the_drain_keeps_a_started_sandbox_running_and_plans_the_rest() 
         "a started VM at the read is running, a paused one isn't"
     );
     assert_eq!(
-        reason_of(&planned, "refused", "suspend").as_deref(),
+        reason_of(&planned, "refused", "refused").as_deref(),
         Some("can't be made durable: no memory snapshots")
     );
     assert_eq!(planned.actions, [held_suspend("paused")]);
@@ -860,11 +1506,6 @@ fn while_holding_the_drain_keeps_a_started_sandbox_running_and_plans_the_rest() 
     );
 }
 
-/// A started sandbox the drain holds still has its pinned artifact's upload
-/// finished: a pin without a durable copy is uploaded, and retried after a
-/// failed attempt, its failure the upload's reason, while the row stays
-/// held; an upload whose job is still active is left to it. The hold is
-/// reported throughout. Evacuating, the row is suspended instead.
 /// A report's kind follows the planner's wait: a held sandbox is `HOLD`,
 /// the drain's own work and its waits for a window slot or disk room are
 /// `MOVING`, and what the drain doesn't drive is `EXTERNAL`. Each reason
@@ -879,6 +1520,7 @@ fn each_wait_reports_its_kind_and_says_what_it_waits_for() {
         (Wait::Work(DrainAction::Upload), Kind::Moving),
         (Wait::Queued(DrainAction::Suspend), Kind::Moving),
         (Wait::Disk, Kind::Moving),
+        (Wait::Refused, Kind::External),
         (Wait::WarmPoolEviction, Kind::External),
         (Wait::Settle(SandboxState::Resuming.into()), Kind::External),
         (Wait::Stopped, Kind::External),
@@ -899,6 +1541,12 @@ fn each_wait_reports_its_kind_and_says_what_it_waits_for() {
     }
 }
 
+/// A started sandbox the drain holds still has its pinned artifact's upload
+/// finished: a pin without a durable copy is uploaded, and retried after a
+/// failed attempt; an upload whose job is still active, or that the drain
+/// runs, is left to it. The row is reported held throughout, one `HOLD`
+/// entry whatever its upload does. Evacuating, the row is suspended
+/// instead.
 #[test]
 fn a_held_started_sandbox_still_has_its_pending_pin_uploaded() {
     let mut held = row("held", SandboxState::Started);
@@ -912,35 +1560,69 @@ fn a_held_started_sandbox_still_has_its_pending_pin_uploaded() {
         pending_backups: pending("held", FULL_ARTIFACT),
         failures: BTreeMap::from([(
             ("held".to_owned(), DrainAction::Upload),
-            "connection reset".to_owned(),
+            DrainFailure {
+                reason: "connection reset".to_owned(),
+                artifact: Some(FULL_ARTIFACT.to_owned()),
+            },
         )]),
         ..PlanInputs::default()
     };
-    let planned = plan(&[held.clone()], &holding(inputs.clone()));
+    let planned = plan(std::slice::from_ref(&held), &holding(inputs.clone()));
     assert_eq!(planned.actions, [upload], "{planned:?}");
+    assert_eq!(waits(&planned), expect(&[("held", "hold")]));
     assert_eq!(
-        waits(&planned),
-        expect(&[("held", "upload"), ("held", "hold")])
+        planned.pending[0].wait.kind(),
+        crate::proto::DrainWait::Hold
     );
     assert_eq!(
-        reason_of(&planned, "held", "upload").as_deref(),
-        Some("the last upload failed: connection reset")
+        planned.pending[0].reason(),
+        format!("{HOLD_REASON}: the last upload failed: connection reset")
     );
     assert!(planned.blocked.is_empty(), "{planned:?}");
 
-    let active = plan(
-        &[held.clone()],
+    for (case, inputs) in [
+        (
+            "its job active",
+            PlanInputs {
+                active_uploads: BTreeSet::from([FULL_ARTIFACT.to_owned()]),
+                ..inputs.clone()
+            },
+        ),
+        (
+            "the drain's upload of it running",
+            PlanInputs {
+                running: BTreeMap::from([(
+                    "held".to_owned(),
+                    RunningAction::Upload {
+                        artifact_id: FULL_ARTIFACT.to_owned(),
+                    },
+                )]),
+                ..inputs.clone()
+            },
+        ),
+        ("durable", PlanInputs::default()),
+    ] {
+        let planned = plan(std::slice::from_ref(&held), &holding(inputs));
+        assert!(planned.actions.is_empty(), "{case}: {planned:?}");
+        assert_eq!(waits(&planned), expect(&[("held", "hold")]), "{case}");
+    }
+
+    // The last upload that failed was a named snapshot's, not the pin's: the
+    // held entry doesn't name it.
+    let named_failed = plan(
+        std::slice::from_ref(&held),
         &holding(PlanInputs {
-            active_uploads: BTreeSet::from([FULL_ARTIFACT.to_owned()]),
+            failures: BTreeMap::from([(
+                ("held".to_owned(), DrainAction::Upload),
+                DrainFailure {
+                    reason: "connection reset".to_owned(),
+                    artifact: Some(NAMED_ARTIFACT.to_owned()),
+                },
+            )]),
             ..inputs.clone()
         }),
     );
-    assert!(active.actions.is_empty(), "{active:?}");
-    assert!(waits(&active).contains(&("held".to_owned(), "hold".to_owned())));
-
-    let durable = plan(&[held.clone()], &holding(PlanInputs::default()));
-    assert!(durable.actions.is_empty(), "{durable:?}");
-    assert_eq!(waits(&durable), expect(&[("held", "hold")]));
+    assert_eq!(named_failed.pending[0].reason(), HOLD_REASON);
 
     let evacuating = plan(&[held], &inputs);
     assert_eq!(evacuating.actions, [suspend("held")], "{evacuating:?}");
@@ -1058,7 +1740,7 @@ async fn a_pending_entry_says_whether_it_is_a_warm_pool_member() {
     let service = SandboxManagerService::for_test(conn);
     let first = service.begin_drain(7, HOLD).unwrap();
 
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     let mut entries: Vec<_> = report
         .pending
         .iter()
@@ -1075,7 +1757,7 @@ async fn a_pending_entry_says_whether_it_is_a_warm_pool_member() {
 #[tokio::test]
 async fn an_empty_sealed_node_is_finished_unless_a_scan_failed() {
     let (service, first) = sealed_service(7);
-    let done = service.finish_drain(7, &first, DrainScans::default());
+    let done = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     assert!(finished(&done), "{done:?}");
     assert_eq!(service.activation_seal.status().sealed_generation, Some(7));
 
@@ -1086,6 +1768,7 @@ async fn an_empty_sealed_node_is_finished_unless_a_scan_failed() {
             blocked: vec!["can't scan the cache".into()],
             ..DrainScans::default()
         },
+        work_of(&service),
     );
     assert!(!finished(&blocked));
     assert_eq!(
@@ -1105,7 +1788,7 @@ async fn an_activation_in_flight_before_the_seal_is_pending() {
     let token = service.activation_seal.admit("restore", "sbx-a").unwrap();
     service.begin_drain(7, EVACUATE).unwrap();
     let first = service.activation_seal.status();
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     assert!(!finished(&report));
     assert_eq!(
         kinds(&report.pending),
@@ -1117,7 +1800,8 @@ async fn an_activation_in_flight_before_the_seal_is_pending() {
     assert!(finished(&service.finish_drain(
         7,
         &first,
-        DrainScans::default()
+        DrainScans::default(),
+        work_of(&service)
     )));
 }
 
@@ -1129,14 +1813,15 @@ async fn an_activation_in_flight_before_the_seal_is_pending() {
 async fn a_seal_that_did_not_hold_for_the_whole_call_blocks() {
     let (service, first) = sealed_service(7);
     service.activation_seal.unseal(&service.db, 7).unwrap();
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     assert!(!finished(&report), "{report:?}");
     assert_eq!(report.blocked.len(), 1, "{report:?}");
     let first = service.activation_seal.status();
     assert!(!finished(&service.finish_drain(
         7,
         &first,
-        DrainScans::default()
+        DrainScans::default(),
+        work_of(&service)
     )));
 }
 
@@ -1150,8 +1835,9 @@ async fn the_report_has_an_entry_for_every_reason_the_node_isnt_finished() {
     let conn = crate::db::test_conn();
     let started = started_sandbox(&conn);
     let (service, sealed) = sealed_service_with(conn, 7);
-    let report =
-        |first: &ActivationSealStatus, scans: DrainScans| service.finish_drain(7, first, scans);
+    let report = |first: &ActivationSealStatus, scans: DrainScans| {
+        service.finish_drain(7, first, scans, work_of(&service))
+    };
     // A started VM, held: pending, and running.
     service.drain_actions.stop_evacuating();
     let held = report(&sealed, DrainScans::default());
@@ -1256,7 +1942,7 @@ async fn a_suspended_sandbox_is_reported_from_its_row_across_a_restart() {
     .unwrap();
 
     let (service, first) = sealed_service_with(conn, 7);
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     let expected = [DrainEvacuated {
         sandbox_id: "sbx-a".into(),
         artifact_kind: crate::proto::ArtifactKind::Full as i32,
@@ -1281,6 +1967,7 @@ async fn a_suspended_sandbox_is_reported_from_its_row_across_a_restart() {
             ],
             ..DrainScans::default()
         },
+        work_of(&service),
     );
     assert!(!finished(&report));
     assert_eq!(
@@ -1298,7 +1985,7 @@ async fn a_suspended_sandbox_is_reported_from_its_row_across_a_restart() {
         Some(7),
         "the seal survives the restart"
     );
-    let report = restarted.finish_drain(7, &first, DrainScans::default());
+    let report = restarted.finish_drain(7, &first, DrainScans::default(), work_of(&restarted));
     assert_eq!(report.evacuated, expected);
 }
 
@@ -1340,7 +2027,7 @@ async fn a_stopped_sandbox_is_pending_from_its_row_whatever_it_pins() {
         }
     }
     let (service, first) = sealed_service_with(conn, 7);
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     assert!(report.evacuated.is_empty(), "{report:?}");
     assert!(report.blocked.is_empty(), "{report:?}");
     let mut pending: Vec<_> = report
@@ -1422,13 +2109,13 @@ async fn a_writer_holding_a_rows_artifact_lock_keeps_the_row_pending() {
     }];
     assert_eq!(
         service
-            .finish_drain(7, &first, DrainScans::default())
+            .finish_drain(7, &first, DrainScans::default(), work_of(&service))
             .evacuated,
         evacuated
     );
     for id in ["sbx-a", "sbx-f"] {
         let writer = service.auto_lifecycle.artifact_lock(id).lock_owned().await;
-        let report = service.finish_drain(7, &first, DrainScans::default());
+        let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
         assert_eq!(
             kinds(&report.pending),
             [kind(id, WireWait::External, false)],
@@ -1445,7 +2132,7 @@ async fn a_writer_holding_a_rows_artifact_lock_keeps_the_row_pending() {
         }
         drop(writer);
     }
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     assert!(finished(&report), "{report:?}");
     assert_eq!(report.evacuated, evacuated);
 }
@@ -1459,10 +2146,10 @@ async fn a_row_changed_between_the_read_and_its_lock_is_demoted() {
     let conn = crate::db::test_conn();
     insert_finished_rows(&conn);
     let service = SandboxManagerService::for_test(conn);
-    let read = |service: &SandboxManagerService| service.read_plan_reads(None).unwrap();
+    let read = |service: &SandboxManagerService| service.read_plan_reads().unwrap();
     let unchanged = read(&service);
     let mut kept = plan(&unchanged.rows, &unchanged.inputs);
-    service.confirm_finished_rows(&mut kept, &unchanged.rows, &unchanged.inputs, None);
+    service.confirm_finished_rows(&mut kept, &unchanged.rows, &unchanged.inputs);
     assert!(kept.pending.is_empty(), "{kept:?}");
     assert_eq!(kept.evacuated.len(), 1, "{kept:?}");
 
@@ -1484,7 +2171,7 @@ async fn a_row_changed_between_the_read_and_its_lock_is_demoted() {
         )
         .unwrap();
     }
-    service.confirm_finished_rows(&mut demoted, &stale.rows, &stale.inputs, None);
+    service.confirm_finished_rows(&mut demoted, &stale.rows, &stale.inputs);
     let mut pending: Vec<_> = demoted
         .pending
         .iter()
@@ -1562,7 +2249,7 @@ async fn a_local_only_named_snapshot_is_pending_until_it_is_durable() {
     );
     let (service, first) = sealed_service_with(conn, 7);
 
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     assert!(!finished(&report), "{report:?}");
     assert_eq!(
         kinds(&report.pending),
@@ -1580,7 +2267,7 @@ async fn a_local_only_named_snapshot_is_pending_until_it_is_durable() {
         )
         .unwrap();
     service.drain_actions.wait_idle().await;
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     assert!(finished(&report), "{report:?}");
 }
 
@@ -1591,13 +2278,19 @@ async fn a_local_only_named_snapshot_is_pending_until_it_is_durable() {
 fn a_new_generation_forgets_the_old_failures() {
     let actions = DrainActions::default();
     assert!(actions.failures(7).is_empty());
-    assert!(actions.start("a", DrainAction::Upload));
+    assert!(actions.start("a", runs(DrainAction::Upload)));
     actions.finish(7, "a", Some("no space".into()));
     assert_eq!(
         actions.failures(7),
-        BTreeMap::from([(("a".to_owned(), DrainAction::Upload), "no space".to_owned())])
+        BTreeMap::from([(
+            ("a".to_owned(), DrainAction::Upload),
+            DrainFailure {
+                reason: "no space".to_owned(),
+                artifact: Some(UNPINNED_ARTIFACT.to_owned()),
+            }
+        )])
     );
-    assert!(actions.start("a", DrainAction::Upload));
+    assert!(actions.start("a", runs(DrainAction::Upload)));
     assert!(
         actions.failures(8).is_empty(),
         "a new generation forgets the old failures"
@@ -2007,7 +2700,7 @@ async fn a_call_that_runs_out_its_timeout_frees_the_node() {
 fn a_failed_upload_is_named_the_last_uploads_failure_once() {
     let actions = DrainActions::default();
     assert!(actions.failures(7).is_empty());
-    assert!(actions.start("a", DrainAction::Upload));
+    assert!(actions.start("a", runs(DrainAction::Upload)));
     let answered = upload_gave_up("the store refused it".to_owned());
     actions.finish(7, "a", Some(answered.message().to_owned()));
     let mut suspended = row("a", SandboxState::Suspended);
@@ -2077,9 +2770,9 @@ async fn a_hold_keeps_a_running_sandbox_running_while_a_paused_one_is_suspended(
     let (service, started, paused) = holding_node();
     let wake = service.auto_lifecycle.wake_lock(&paused).lock_owned().await;
     let first = service.begin_drain(7, HOLD).unwrap();
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     assert_eq!(
-        service.drain_actions.running(),
+        running_kinds(&service),
         BTreeMap::from([(paused.clone(), DrainAction::Suspend)]),
         "{report:?}"
     );
@@ -2140,9 +2833,9 @@ async fn an_evacuating_call_suspends_running_sandboxes_in_that_call() {
         .lock_owned()
         .await;
     let first = service.begin_drain(7, EVACUATE).unwrap();
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     assert_eq!(
-        service.drain_actions.running().get(&started),
+        running_kinds(&service).get(&started),
         Some(&DrainAction::Suspend),
         "{report:?}"
     );
@@ -2187,9 +2880,9 @@ async fn an_evacuating_drain_stays_evacuating_whatever_a_later_call_under_its_ge
     service.begin_drain(7, EVACUATE).unwrap();
     let first = service.begin_drain(7, HOLD).unwrap();
     assert!(service.drain_actions.evacuating(7));
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     assert_eq!(
-        service.drain_actions.running().get(&started),
+        running_kinds(&service).get(&started),
         Some(&DrainAction::Suspend),
         "{report:?}"
     );
@@ -2226,7 +2919,7 @@ async fn a_restart_while_evacuating_holds_until_the_next_call() {
         "the seal survives the restart"
     );
     assert!(!after.drain_actions.evacuating(7), "its evacuating doesn't");
-    let report = after.finish_drain(7, &first, DrainScans::default());
+    let report = after.finish_drain(7, &first, DrainScans::default(), work_of(&after));
     assert!(after.drain_actions.running().is_empty(), "{report:?}");
     assert_eq!(
         kinds(&report.pending),
@@ -2235,9 +2928,9 @@ async fn a_restart_while_evacuating_holds_until_the_next_call() {
 
     let wake = after.auto_lifecycle.wake_lock(&started).lock_owned().await;
     let first = after.begin_drain(7, EVACUATE).unwrap();
-    after.finish_drain(7, &first, DrainScans::default());
+    after.finish_drain(7, &first, DrainScans::default(), work_of(&after));
     assert_eq!(
-        after.drain_actions.running().get(&started),
+        running_kinds(&after).get(&started),
         Some(&DrainAction::Suspend)
     );
     release_held_suspend(&after, 7, wake).await;
@@ -2262,7 +2955,7 @@ async fn a_cancel_ends_the_evacuating_and_a_later_generation_holds() {
         .wake_lock(&started)
         .lock_owned()
         .await;
-    let report = service.finish_drain(9, &first, DrainScans::default());
+    let report = service.finish_drain(9, &first, DrainScans::default(), work_of(&service));
     assert!(
         !service.drain_actions.running().contains_key(&started),
         "{report:?}"
@@ -2326,7 +3019,7 @@ async fn a_drain_action_runs_as_a_state_writer() {
     // The suspend waits on the wake lock this test holds.
     let wake_lock = service.auto_lifecycle.wake_lock(&id);
     let held = wake_lock.lock_owned().await;
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     assert_eq!(report.pending.len(), 1, "{report:?}");
     assert!(
         service
@@ -2357,7 +3050,7 @@ async fn a_suspend_while_holding_still_suspends_a_paused_row() {
         crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Paused);
         let service = service_with_node_manager(conn, &node_manager);
         let first = service.begin_drain(7, evacuate).unwrap();
-        let report = service.finish_drain(7, &first, DrainScans::default());
+        let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
         assert_eq!(
             kinds(&report.pending),
             [kind(&id, WireWait::Moving, false)],
@@ -2393,9 +3086,9 @@ async fn a_queued_suspend_while_holding_leaves_a_sandbox_a_resume_started() {
         // The resume in flight holds the wake lock while the drain plans.
         let wake_lock = service.auto_lifecycle.wake_lock(&id);
         let resume = wake_lock.lock_owned().await;
-        let report = service.finish_drain(7, &first, DrainScans::default());
+        let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
         assert_eq!(
-            service.drain_actions.running().get(&id),
+            running_kinds(&service).get(&id),
             Some(&DrainAction::Suspend),
             "holding: {holding}: {report:?}"
         );
@@ -2425,7 +3118,7 @@ async fn a_queued_suspend_while_holding_leaves_a_sandbox_a_resume_started() {
                 service.lookup_sandbox(&id).unwrap().state,
                 SandboxStatus::from(SandboxState::Started)
             );
-            let next = service.finish_drain(7, &first, DrainScans::default());
+            let next = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
             assert_eq!(kinds(&next.pending), [kind(&id, WireWait::Hold, true)]);
             assert!(service.drain_actions.running().is_empty());
         } else {
@@ -2477,7 +3170,7 @@ async fn a_drain_suspend_acts_only_on_its_own_resident_under_its_own_seal() {
         SandboxStatus::from(SandboxState::Started)
     );
     let first = service.activation_seal.status();
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     assert_eq!(kinds(&report.pending), [kind(&id, WireWait::Moving, true)]);
 }
 
@@ -2576,7 +3269,7 @@ async fn a_pending_upload_becomes_an_evacuation() {
     insert_artifact(&conn, FULL_ARTIFACT, ("suspend", None), false, "ready");
     let (service, first) = sealed_service_with(conn, 7);
 
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     assert!(!finished(&report));
     assert!(report.evacuated.is_empty());
     assert_eq!(
@@ -2589,7 +3282,7 @@ async fn a_pending_upload_becomes_an_evacuation() {
         .local_artifacts()
         .mark_backup_completed(FULL_ARTIFACT.parse().unwrap())
         .unwrap();
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     assert_eq!(
         report.evacuated,
         [DrainEvacuated {
@@ -2627,12 +3320,12 @@ async fn an_unpinned_suspended_sandbox_keeps_the_drain_from_done() {
     crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Suspended);
     let (service, first) = sealed_service_with(conn, 7);
 
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     assert!(!finished(&report), "{report:?}");
     assert_eq!(kinds(&report.pending), [kind(&id, WireWait::Moving, false)]);
     service.drain_actions.wait_idle().await;
 
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     assert!(!finished(&report), "{report:?}");
     assert!(report.evacuated.is_empty() && report.blocked.is_empty());
     assert_eq!(report.pending.len(), 1, "{report:?}");
@@ -2640,6 +3333,7 @@ async fn an_unpinned_suspended_sandbox_keeps_the_drain_from_done() {
     let reason = failures
         .get(&(id.clone(), DrainAction::PublishSnapshot))
         .unwrap_or_else(|| panic!("the publication failed: {report:?}"));
+    let reason = &reason.reason;
     assert!(
         !reason.contains(
             pplx_space_rpc_contracts::artifact_backup_signals::CURRENT_INSTANCE_BACKUP_PUBLISHES_FULL_MARKER
@@ -2867,9 +3561,9 @@ async fn a_restart_handoff_starts_no_drain_action() {
         if handing_off {
             service.begin_draining_for_restart();
         }
-        let report = service.finish_drain(7, &first, DrainScans::default());
+        let report = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
         assert_eq!(
-            service.drain_actions.running().get(&id),
+            running_kinds(&service).get(&id),
             (!handing_off).then_some(&DrainAction::Suspend),
             "handing off: {handing_off}: {report:?}"
         );
@@ -2887,6 +3581,48 @@ async fn a_restart_handoff_starts_no_drain_action() {
             SandboxStatus::from(SandboxState::Started)
         );
     }
+}
+
+/// A pass plans from the drain's own work as it was read before the rows: a
+/// suspend running at that read and over by the time the rows are read
+/// still holds its window slot for the pass, though its row, read in a
+/// state that holds none on its own, shows no work. The window starts
+/// nothing beside it, and nothing new for it.
+#[tokio::test]
+async fn work_that_ends_between_its_read_and_the_rows_still_holds_its_slot() {
+    let conn = crate::db::test_conn();
+    let suspending = insert_in_status(&conn, SandboxState::Suspending.into());
+    let started = started_sandbox(&conn);
+    let mut service = SandboxManagerService::for_test(conn);
+    service.drain_actions = std::sync::Arc::new(DrainActions::with_window(1));
+    let first = service.begin_drain(7, EVACUATE).unwrap();
+    assert!(service.drain_actions.start(
+        &suspending,
+        RunningAction::Suspend {
+            reserved_bytes: MIB
+        }
+    ));
+    let work = work_of(&service);
+    service.drain_actions.finish(7, &suspending, None);
+
+    let report = service.finish_drain(7, &first, DrainScans::default(), work);
+    assert!(service.drain_actions.running().is_empty(), "{report:?}");
+    let reasons: BTreeMap<_, _> = report
+        .pending
+        .iter()
+        .map(|entry| (entry.sandbox_id.clone(), entry.reason.clone()))
+        .collect();
+    assert_eq!(
+        reasons,
+        BTreeMap::from([
+            (suspending, "the drain's suspend".to_owned()),
+            (
+                started,
+                "the drain's suspend, waiting for a window slot".to_owned()
+            ),
+        ]),
+        "{report:?}"
+    );
 }
 
 fn preview_request() -> Request<PreviewDrainNodeRequest> {
@@ -3000,7 +3736,7 @@ async fn a_preview_on_a_sealed_node_is_refused() {
     );
     assert_eq!(
         service
-            .finish_preview(DrainScans::default())
+            .finish_preview(DrainScans::default(), work_of(&service))
             .unwrap_err()
             .code(),
         tonic::Code::FailedPrecondition
@@ -3088,7 +3824,9 @@ async fn a_preview_seals_nothing_starts_nothing_and_writes_nothing() {
     // A suspend started now would wait here, in flight, for this lock.
     let wake_lock = service.auto_lifecycle.wake_lock(&id);
     let held = wake_lock.lock_owned().await;
-    let report = service.finish_preview(DrainScans::default()).unwrap();
+    let report = service
+        .finish_preview(DrainScans::default(), work_of(&service))
+        .unwrap();
     assert_eq!(kinds(&report.pending), [kind(&id, WireWait::Moving, true)]);
     assert!(service.drain_actions.running().is_empty());
     assert!(
@@ -3145,20 +3883,27 @@ async fn a_preview_opens_no_orphan_inventory_scan() {
 async fn a_preview_finds_a_drain_finished_only_with_nothing_pending_or_blocked() {
     let conn = crate::db::test_conn();
     let service = SandboxManagerService::for_test(conn);
-    let empty = service.finish_preview(DrainScans::default()).unwrap();
+    let empty = service
+        .finish_preview(DrainScans::default(), work_of(&service))
+        .unwrap();
     assert!(finished(&empty), "{empty:?}");
     let scan_failed = service
-        .finish_preview(DrainScans {
-            blocked: vec!["orphan inventory scan failed: CacheDirs: denied".into()],
-            ..DrainScans::default()
-        })
+        .finish_preview(
+            DrainScans {
+                blocked: vec!["orphan inventory scan failed: CacheDirs: denied".into()],
+                ..DrainScans::default()
+            },
+            work_of(&service),
+        )
         .unwrap();
     assert!(
         !finished(&scan_failed) && scan_failed.pending.is_empty(),
         "{scan_failed:?}"
     );
     let stopped = insert_in_status(&service.db.lock().unwrap(), SandboxState::Stopped.into());
-    let waiting = service.finish_preview(DrainScans::default()).unwrap();
+    let waiting = service
+        .finish_preview(DrainScans::default(), work_of(&service))
+        .unwrap();
     assert!(!finished(&waiting));
     assert_eq!(
         (kinds(&waiting.pending), waiting.blocked),
@@ -3223,10 +3968,12 @@ fn items(blocked: &[DrainBlocked], pending: &[DrainPending]) -> Vec<Item> {
 /// started runs; answer the preview's items once they are the drain call's,
 /// sorted. The pending entries' reasons and stamps must match too.
 async fn preview_then_drain(service: &SandboxManagerService, scans: DrainScans) -> Vec<Item> {
-    let preview = service.finish_preview(scans.clone()).unwrap();
+    let preview = service
+        .finish_preview(scans.clone(), work_of(service))
+        .unwrap();
     service.begin_drain(7, EVACUATE).unwrap();
     let first = service.activation_seal.status();
-    let drain = service.finish_drain(7, &first, scans);
+    let drain = service.finish_drain(7, &first, scans, work_of(service));
     // The work the call started runs only once this test yields, and finds
     // the drain over.
     service.cancel_drain(7).unwrap();
@@ -3316,7 +4063,6 @@ async fn a_preview_reports_every_arm_as_a_drain_call_does() {
     let scans = DrainScans {
         blocked: vec![scan_failure.into()],
         orphan_dirs: vec![(orphan.clone(), format!("orphan cache directory {orphan}"))],
-        disk_headroom: None,
     };
     expected.sort();
     let service = SandboxManagerService::for_test(conn);
@@ -3335,9 +4081,11 @@ async fn a_preview_reports_every_arm_as_a_drain_call_does() {
     );
     assert_eq!(
         preview_then_drain(&service, DrainScans::default()).await,
-        [pending(&refused, WireWait::Moving, true)]
+        [pending(&refused, WireWait::External, true)]
     );
-    let report = service.finish_preview(DrainScans::default()).unwrap();
+    let report = service
+        .finish_preview(DrainScans::default(), work_of(&service))
+        .unwrap();
     assert!(
         report.pending[0].reason.ends_with(
             "can't be made durable: snapshot restore requires file-backed memory; set \
@@ -3404,13 +4152,15 @@ async fn a_preview_reports_when_each_row_entered_its_state() {
         pending
     };
 
-    let preview = service.finish_preview(DrainScans::default()).unwrap();
+    let preview = service
+        .finish_preview(DrainScans::default(), work_of(&service))
+        .unwrap();
     assert!(preview.blocked.is_empty(), "{preview:?}");
     assert_eq!(stamped(preview.pending), expected);
 
     service.begin_drain(7, EVACUATE).unwrap();
     let first = service.activation_seal.status();
-    let drain = service.finish_drain(7, &first, DrainScans::default());
+    let drain = service.finish_drain(7, &first, DrainScans::default(), work_of(&service));
     assert!(drain.blocked.is_empty(), "{drain:?}");
     assert_eq!(stamped(drain.pending), expected);
 }
