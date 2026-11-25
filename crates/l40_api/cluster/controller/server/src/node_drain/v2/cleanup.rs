@@ -163,7 +163,8 @@ pub(super) async fn fence<S: DrainV2Sink>(
 /// termination was confirmed and the Node is gone, or let the node go if it
 /// wasn't, the node's heartbeat is stale and the machine EC2 answered about
 /// is the registered one ([`unregistered_machine`]). Every path that waits
-/// defers the next check.
+/// defers the next check from the clock after the calls it waited on; the
+/// status it then records isn't counted.
 #[expect(
     clippy::too_many_arguments,
     reason = "the node, its fence and EC2's answer, and the loop's backoff and bounds"
@@ -178,7 +179,6 @@ pub(super) async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthorit
     backoff: &DispatchBackoff,
     config: &V2LoopConfig,
 ) -> Option<NodeStep> {
-    let now = Instant::now();
     if *evidence == InstanceEvidence::Terminated && node.terminated_observed_at.is_none() {
         match sink
             .record_terminated_observed(node.id, generation, fence)
@@ -187,7 +187,7 @@ pub(super) async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthorit
             Ok(true) => {}
             Ok(false) => return None,
             Err(error) => {
-                backoff.defer(node.id, now);
+                backoff.defer(node.id, Instant::now());
                 sink.record_error(
                     node.id,
                     &format!("recording that {fence} is terminated failed: {error}"),
@@ -205,7 +205,7 @@ pub(super) async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthorit
     if !node.dispatched() {
         if terminated {
             if node.heartbeat_fresh {
-                backoff.defer(node.id, now);
+                backoff.defer(node.id, Instant::now());
                 sink.record_error(
                     node.id,
                     &format!(
@@ -217,7 +217,7 @@ pub(super) async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthorit
                 return None;
             }
             if let Some(why) = unregistered_machine(sink, node, fence).await {
-                backoff.defer(node.id, now);
+                backoff.defer(node.id, Instant::now());
                 sink.record_error(
                     node.id,
                     &format!("fenced instance {fence} is terminated, but {why}; not letting it go"),
@@ -230,12 +230,12 @@ pub(super) async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthorit
             );
             let gone = let_go(sink, node, generation, &trace).await;
             if !gone {
-                backoff.defer(node.id, now);
+                backoff.defer(node.id, Instant::now());
             }
             return gone.then_some(NodeStep::LetGo);
         }
         let InstanceEvidence::Listed(_) = evidence else {
-            backoff.defer(node.id, now);
+            backoff.defer(node.id, Instant::now());
             let why = if *evidence == InstanceEvidence::NotListed {
                 format!(
                     "EC2 does not list fenced instance {fence}, and was never seen to list it \
@@ -250,11 +250,11 @@ pub(super) async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthorit
             sink.record_error(node.id, &why).await;
             return None;
         };
-        backoff.defer(node.id, now);
-        return match authority
+        let dispatched = authority
             .terminate_instance(fence, node.decrement_capacity)
-            .await
-        {
+            .await;
+        backoff.defer(node.id, Instant::now());
+        return match dispatched {
             Ok(()) => match sink.record_dispatched(node.id, generation, fence).await {
                 Ok(recorded) => {
                     if recorded {
@@ -287,7 +287,7 @@ pub(super) async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthorit
         };
     }
     if !terminated {
-        backoff.defer(node.id, now);
+        backoff.defer(node.id, Instant::now());
         // By the database clock the dispatch was recorded on.
         let elapsed = node
             .dispatched_at
@@ -331,7 +331,7 @@ pub(super) async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthorit
         return None;
     }
     let Some(node_name) = node.k8s_node_name.as_deref() else {
-        backoff.defer(node.id, now);
+        backoff.defer(node.id, Instant::now());
         sink.record_error(node.id, "the node has no Kubernetes name to look up")
             .await;
         return None;
@@ -339,7 +339,7 @@ pub(super) async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthorit
     match sink.node_exists(node_name).await {
         Ok(false) => {}
         Ok(true) => {
-            backoff.defer(node.id, now);
+            backoff.defer(node.id, Instant::now());
             sink.record_error(
                 node.id,
                 &format!(
@@ -351,7 +351,7 @@ pub(super) async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthorit
             return None;
         }
         Err(error) => {
-            backoff.defer(node.id, now);
+            backoff.defer(node.id, Instant::now());
             sink.record_error(
                 node.id,
                 &format!("looking up the Kubernetes Node {node_name} failed: {error}"),
@@ -379,7 +379,7 @@ pub(super) async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthorit
         }
         Ok(TerminatedDelete::Unfenced) => None,
         Ok(TerminatedDelete::Wait(why)) => {
-            backoff.defer(node.id, now);
+            backoff.defer(node.id, Instant::now());
             sink.record_error(
                 node.id,
                 &format!("fenced instance {fence} is terminated; not deleting the row yet: {why}"),
@@ -388,7 +388,7 @@ pub(super) async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthorit
             None
         }
         Err(error) => {
-            backoff.defer(node.id, now);
+            backoff.defer(node.id, Instant::now());
             sink.record_error(
                 node.id,
                 &format!("deleting the terminated node's row failed: {error}"),

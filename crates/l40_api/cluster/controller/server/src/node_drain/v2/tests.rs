@@ -62,6 +62,8 @@ struct FakeSink {
     replaced_after_cordon: Option<String>,
     /// The UID each node's row carries now, once a registration replaced it.
     registered_uid: Mutex<HashMap<NodeId, String>>,
+    /// When set, each Node GET takes this long.
+    node_lookup_takes: Option<Duration>,
 }
 
 impl FakeSink {
@@ -264,6 +266,9 @@ impl DrainV2Sink for FakeSink {
 
     async fn node_exists(&self, k8s_node_name: &str) -> Result<bool, String> {
         self.log(format!("node_exists {k8s_node_name}"));
+        if let Some(takes) = self.node_lookup_takes {
+            tokio::time::sleep(takes).await;
+        }
         Ok(self.nodes_present.iter().any(|name| name == k8s_node_name))
     }
 
@@ -307,6 +312,8 @@ struct FakeAuthority {
     /// How many `describe_instances` calls were made.
     describe_calls: Mutex<usize>,
     terminated: Mutex<Vec<(String, bool)>>,
+    /// How long each `terminate_instance` call takes.
+    terminate_takes: Option<Duration>,
 }
 
 impl FakeAuthority {
@@ -318,6 +325,7 @@ impl FakeAuthority {
             described: Mutex::default(),
             describe_calls: Mutex::default(),
             terminated: Mutex::default(),
+            terminate_takes: None,
         }
     }
 
@@ -373,6 +381,9 @@ impl V2InstanceAuthority for FakeAuthority {
             .lock()
             .unwrap()
             .push((instance_id.to_owned(), decrement_capacity));
+        if let Some(takes) = self.terminate_takes {
+            tokio::time::sleep(takes).await;
+        }
         self.terminate.clone()
     }
 }
@@ -2639,4 +2650,58 @@ fn one_ec2_answer_reads_per_instance() {
             ("i-d".to_owned(), InstanceEvidence::ShuttingDown),
         ])
     );
+}
+
+/// A fenced node's next check waits out the backoff from when its step
+/// finished waiting on its calls, not from when the step started: a Node
+/// lookup, or an Auto Scaling call, that takes longer than the backoff
+/// doesn't let the next tick ask again at once.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_backoff_counts_from_after_the_calls_it_waited_on() {
+    let config = V2LoopConfig {
+        dispatch_backoff_base: Duration::from_secs(3),
+        ..V2LoopConfig::default()
+    };
+
+    let undispatched = fenced(false);
+    let sink = FakeSink {
+        nodes: vec![undispatched],
+        ..FakeSink::default()
+    };
+    let authority = FakeAuthority {
+        terminate_takes: Some(Duration::from_secs(10)),
+        ..FakeAuthority::answering(InstanceEvidence::Listed("running".to_owned()))
+    };
+    let state = V2LoopState::new(config);
+    tick(&sink, &authority, &state).await;
+    assert_eq!(
+        authority.terminated().len(),
+        1,
+        "the termination is dispatched"
+    );
+    tick(&sink, &authority, &state).await;
+    assert_eq!(
+        authority.described().len(),
+        1,
+        "the backoff holds the ask after the Auto Scaling call"
+    );
+    tokio::time::advance(config.dispatch_backoff_base).await;
+    tick(&sink, &authority, &state).await;
+    assert_eq!(authority.described().len(), 2, "the backoff ran out");
+
+    let node = fenced(true);
+    let sink = FakeSink {
+        nodes: vec![node.clone()],
+        nodes_present: vec![node.k8s_node_name.clone().expect("a name")],
+        node_lookup_takes: Some(Duration::from_secs(10)),
+        ..FakeSink::default()
+    };
+    let authority = FakeAuthority::answering(InstanceEvidence::Terminated);
+    let state = V2LoopState::new(config);
+    tick(&sink, &authority, &state).await;
+    tick(&sink, &authority, &state).await;
+    assert_eq!(authority.described().len(), 1, "the backoff holds the ask");
+    tokio::time::advance(config.dispatch_backoff_base).await;
+    tick(&sink, &authority, &state).await;
+    assert_eq!(authority.described().len(), 2, "the backoff ran out");
 }
