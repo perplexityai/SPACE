@@ -86,7 +86,7 @@ _DURATION_SECONDS = {
         "local.interrupted_suspend_keeps_only_copy_until_discard": 79,
         "local.leader_election_brownout_keeps_one_leader": 133,
         "local.node_ctl_fence_refuses_and_reconciles": 10,
-        "local.node_group_boundary_schedules": 34,
+        "local.node_group_boundary_schedules": 150,
         "local.node_selector_extras_render_and_enforce": 63,
         "local.orphaned_restore_pod_gc_reaps_only_superseded": 118,
         "local.pending_backup_census_reports_blocked_upload": 22,

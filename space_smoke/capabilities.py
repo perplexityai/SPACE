@@ -586,6 +586,28 @@ class RateLimiterControl(Protocol):
 
 
 @dataclass(frozen=True)
+class DedicatedOrgToleration:
+    """One `space.pplx.net/dedicated-org` toleration on a sandbox pod."""
+
+    operator: str | None
+    value: str | None
+    effect: str | None
+
+
+@dataclass(frozen=True)
+class SandboxPodBoundaryRender:
+    """Boundary affinity, dedicated-org tolerations, and schedule state of a sandbox's live pod."""
+
+    pod_name: str
+    phase: str | None
+    node_name: str | None
+    required_node_group_sets: tuple[tuple[str, ...], ...]
+    any_node_group_terms: tuple[str, ...]
+    dedicated_org_tolerations: tuple[DedicatedOrgToleration, ...]
+    has_restore_storage_uri: bool = False
+
+
+@dataclass(frozen=True)
 class AdminNodeGroupView:
     """One node group as `GET /admin/api/v1/node-groups` lists it."""
 
@@ -599,19 +621,19 @@ class AdminNodeGroupView:
 class NodeGroupControl(Protocol):
     """Kind-only operations for the node-group placement scenario.
 
-    The gate (`SPACE_SANDBOX_NODE_GROUP_PLACEMENT`, api + cluster-controller)
-    and the labeler (`SPACE_NODE_GROUP_LABELER_ENABLED`, cluster-controller)
-    are literal Deployment env captured before they are written and restored
-    to the captured values; the admin node-group routes are the product
-    surface; the worker boundary labels are snapshotted and restored because
-    the labeler writes the whole fleet.
+    The gate (`SPACE_SANDBOX_NODE_GROUP_PLACEMENT`, api + cluster-controller),
+    the labeler (`SPACE_NODE_GROUP_LABELER_ENABLED`, cluster-controller), and
+    the membership mirror (`SPACE_NODE_GROUP_MIRROR_ENABLED`, cluster-controller)
+    are literal Deployment env captured before they are written and restored to
+    the captured values; the admin node-group routes are the product surface;
+    worker boundary labels and dedicated-org taints are snapshotted and restored.
     """
 
     def acquire_public_api_mutation(self) -> Callable[[], None]: ...
 
     def node_group_env(self) -> dict[str, str | None]: ...
 
-    def set_node_group_env(self, *, gate: bool, labeler: bool) -> None: ...
+    def set_node_group_env(self, *, gate: bool, labeler: bool, mirror: bool) -> None: ...
 
     def restore_node_group_env(self, standing: Mapping[str, str | None]) -> None: ...
 
@@ -619,19 +641,41 @@ class NodeGroupControl(Protocol):
 
     def node_groups(self) -> list[AdminNodeGroupView]: ...
 
+    def admin_nodes(self) -> list[AdminNodeView]: ...
+
     def try_create_node_group(self, *, name: str, org_id: str | None) -> tuple[int, str]:
         """`POST /admin/api/v1/node-groups`; returns (status, body) so a refusal is judged, not raised."""
         ...
 
+    def try_delete_node_group(self, node_group_id: str) -> tuple[int, str]:
+        """`DELETE /admin/api/v1/node-groups/{id}`; returns (status, body) so 409 mirror lag can be retried."""
+        ...
+
     def worker_boundary_labels(self) -> dict[str, str | None]: ...
 
+    def set_worker_boundary_label(self, node_name: str, group_name: str | None) -> None: ...
+
     def restore_worker_boundary_labels(self, snapshot: Mapping[str, str | None]) -> None: ...
+
+    def worker_dedicated_taints(self) -> dict[str, str | None]: ...
+
+    def set_worker_dedicated_taint(self, node_name: str, org_id: str | None) -> None: ...
+
+    def restore_worker_dedicated_taints(self, snapshot: Mapping[str, str | None]) -> None: ...
+
+    def live_sandbox_pods(self) -> tuple[str, ...]:
+        """Non-pool, non-terminating sandbox pod identities (`name:uid`)."""
+        ...
+
+    def sandbox_pod_boundary(self, sandbox_id: str) -> SandboxPodBoundaryRender | None: ...
 
     def sandbox_pod_node_group_terms(self, sandbox_id: str) -> list[str]:
         """Every value of the boundary key across the pod's required nodeSelectorTerms."""
         ...
 
     def sandbox_pod_phase_and_node(self, sandbox_id: str) -> tuple[str | None, str | None]: ...
+
+    def ready_full_snapshots(self, sandbox_id: str) -> list[SnapshotRecord]: ...
 
     def admin_org_id(self) -> str:
         """The kind admin's org id, for admin routes that scope a resource to an org."""
@@ -1707,6 +1751,7 @@ class AdminNodeView:
     drain_last_error: str | None = None
     # `v2` while a v2 drain, or its undrain's cancel, is recorded.
     drain_engine: str | None = None
+    node_group_id: str | None = None
 
 
 @dataclass(frozen=True)

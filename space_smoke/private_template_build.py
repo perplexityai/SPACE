@@ -17,6 +17,7 @@ from space_smoke.adapters import (
     KindHarness,
     _ecw_control_plane_json,
 )
+from space_smoke.capabilities import RateLimitProbe
 from space_smoke.fixtures import retry_sandbox_delete
 from space_smoke.runtime import (
     ResourceScope,
@@ -56,8 +57,18 @@ class PrivateTemplateBuildAssertions:
         )
         self.owner: EcwConfig | None = None
         self.foreign: EcwConfig | None = None
+        self.owner_org_id = ""
+        self.foreign_org_id = ""
         self.digest = ""
         self.templates: list[str] = []
+
+    def owner_probe(self) -> RateLimitProbe:
+        assert self.owner is not None
+        return EcwSdk(self.owner)
+
+    def foreign_probe(self) -> RateLimitProbe:
+        assert self.foreign is not None
+        return EcwSdk(self.foreign)
 
     def _key(self, org_id: str, user_id: str) -> EcwConfig:
         key = secrets.token_hex(32)
@@ -85,6 +96,8 @@ class PrivateTemplateBuildAssertions:
         self.context.verify(owner_id != foreign_org, "build keys share an organization")
         self.owner = self._key(owner_id, owner_users[0]["id"])
         self.foreign = self._key(foreign_org, foreign_users[0]["id"])
+        self.owner_org_id = owner_id
+        self.foreign_org_id = foreign_org
         self.context.record("build_owner_org", owner_id)
         self.context.record("build_foreign_org", foreign_org)
         self._own_template(self.base)
