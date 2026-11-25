@@ -5,7 +5,10 @@ use super::*;
 use pplx_space_node_model::NodeDrain;
 
 impl K8sStore {
-    pub(super) fn execution_pod_name(sandbox_id: SandboxId, generation: i64) -> String {
+    pub(in crate::controllers::substrate::kubernetes) fn execution_pod_name(
+        sandbox_id: SandboxId,
+        generation: i64,
+    ) -> String {
         format!(
             "space-sbx-{}-g{}",
             sandbox_id.as_uuid().simple(),

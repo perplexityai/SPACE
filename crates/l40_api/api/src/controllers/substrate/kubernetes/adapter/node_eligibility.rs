@@ -215,16 +215,32 @@ impl KubernetesSubstrate {
         }
         // Live evidence the runtime is reachable — not merely that an IP was
         // assigned. Same probe + timeout the create proxy-reachable loop uses.
-        let pod_ip = current_pod_ip(&pod, row.pod_uid.as_ref(), row.pod_ip.as_deref())
+        // A kubelet-published address needs only its proxy to accept; a
+        // node-reported one only while its node affirms this execution there.
+        let address = current_pod_ip_with_source(&pod, row.pod_uid.as_ref(), row.pod_ip.as_deref())
             .ok()
             .flatten()?;
-        if !Self::pod_proxy_accepts_tcp(
-            pod_ip,
-            self.k8s.sandbox_proxy_port,
-            START_WAIT_CONNECT_TIMEOUT,
-        )
-        .await
-        {
+        let reachable = match address {
+            (pod_ip, PodIpSource::Published) => {
+                Self::pod_proxy_accepts_tcp(
+                    pod_ip,
+                    self.k8s.sandbox_proxy_port,
+                    START_WAIT_CONNECT_TIMEOUT,
+                )
+                .await
+            }
+            (_, PodIpSource::NodeReported) => {
+                let target = PodProxyWaitTarget {
+                    pod_name,
+                    pod_uid: row.pod_uid.as_ref().map(PodUid::as_str),
+                    generation: row.generation,
+                };
+                self.verified_runtime_pod_ip(sandbox_uuid, address, &target)
+                    .await
+                    .is_some()
+            }
+        };
+        if !reachable {
             return None;
         }
         self.remember_pod_node_placement(

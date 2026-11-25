@@ -401,11 +401,29 @@ async fn writers_from_before_the_record_keep_existing_stamps() -> TestResult {
     Ok(())
 }
 
-/// A node report is written only while the row records the reported pod: a
-/// report for the pod a re-materialization cleared is dropped, and the
-/// replacement's report is accepted once its UID is recorded.
+async fn execution_state(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    generation: i64,
+) -> TestResult<(String, Option<String>)> {
+    Ok(sqlx::query_as(sql!(
+        "SELECT state, HOST(pod_ip)::TEXT
+           FROM sandbox_k8s_executions
+          WHERE sandbox_id = $1 AND generation = $2"
+    ))
+    .bind(sandbox_id)
+    .bind(generation)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// A confirmed node address is recorded only on the `created` row that
+/// records the pod it was confirmed for. A re-materialized row or a replaced
+/// pod does not take it, and a writer that keeps no node address (an older
+/// API replica) returns the row to `created` without one, to be confirmed
+/// again.
 #[tokio::test]
-async fn node_reports_follow_the_recorded_pod_across_rematerialization() -> TestResult {
+async fn confirmed_node_addresses_follow_the_recorded_pod() -> TestResult {
     let fixture = postgres_store().await?;
     let sandbox_id = SandboxId::new();
     insert_sandbox(&fixture.pool, sandbox_id, "started").await?;
@@ -425,17 +443,34 @@ async fn node_reports_follow_the_recorded_pod_across_rematerialization() -> Test
             None,
         )
     };
-    let report = |pod_uid, pod_ip| {
+    let record = |pod_uid, pod_ip: &str| {
+        let pod_ip = PodIp::parse(pod_ip).unwrap();
         fixture
             .store
-            .persist_node_reported_pod_ip(sandbox_id, generation, pod_uid, pod_ip, None)
+            .record_confirmed_pod_ip(sandbox_id, generation, pod_uid, pod_ip)
     };
+    let row = || execution_state(&fixture.pool, sandbox_id, generation);
 
     materialize("first-pod").await?;
-    assert_eq!(
-        report("first-pod", "10.0.0.1").await?.as_deref(),
-        Some("10.0.0.1")
-    );
+    assert!(record("first-pod", "10.0.0.1").await?);
+    assert!(record("first-pod", "10.0.0.1").await?);
+    assert!(!record("first-pod", "10.0.0.9").await?);
+    assert_eq!(row().await?, ("running".into(), Some("10.0.0.1".into())));
+
+    let mut conn = fixture.pool.acquire().await?;
+    fixture
+        .store
+        .update_active_execution_pod_metadata(
+            &mut conn,
+            sandbox_id,
+            generation,
+            Some("first-pod"),
+            None,
+        )
+        .await?;
+    drop(conn);
+    assert_eq!(row().await?, ("created".into(), None));
+    assert!(record("first-pod", "10.0.0.1").await?);
 
     assert!(
         fixture
@@ -447,14 +482,78 @@ async fn node_reports_follow_the_recorded_pod_across_rematerialization() -> Test
             )
             .await?
     );
-    assert_eq!(report("first-pod", "10.0.0.1").await?, None);
-    assert_eq!(report("second-pod", "10.0.0.2").await?, None);
+    assert!(!record("first-pod", "10.0.0.1").await?);
+    assert!(!record("second-pod", "10.0.0.2").await?);
 
     materialize("second-pod").await?;
-    assert_eq!(report("first-pod", "10.0.0.1").await?, None);
-    assert_eq!(
-        report("second-pod", "10.0.0.2").await?.as_deref(),
-        Some("10.0.0.2")
+    assert!(!record("first-pod", "10.0.0.1").await?);
+    assert!(record("second-pod", "10.0.0.2").await?);
+    Ok(())
+}
+
+/// A confirmation arriving after a suspend commits leaves the suspended
+/// execution as it is, and its retirement still completes.
+#[tokio::test]
+async fn a_late_confirmation_does_not_undo_a_committed_suspend() -> TestResult {
+    let fixture = postgres_store().await?;
+    let sandbox_id = SandboxId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, "started").await?;
+    let generation = fixture
+        .store
+        .ensure_active_execution_claim(sandbox_id)
+        .await?
+        .row
+        .generation;
+    fixture
+        .store
+        .persist_materialized_pod_metadata(
+            sandbox_id,
+            generation,
+            SandboxLifecycle::Started,
+            Some("suspending-pod"),
+            None,
+            None,
+        )
+        .await?;
+    let pod_ip = PodIp::parse("10.0.0.5")?;
+    assert!(
+        fixture
+            .store
+            .record_confirmed_pod_ip(sandbox_id, generation, "suspending-pod", pod_ip)
+            .await?
     );
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'suspending' WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&fixture.pool)
+    .await?;
+    let execution_generation = ExecutionGeneration::new(generation)?;
+    let pod_uid = PodUid::parse("suspending-pod")?;
+    let artifact = super::super::super::super::PublishedLocalArtifact {
+        id: LocalArtifactId::new(),
+        kind: ArtifactKind::Full,
+    };
+    fixture
+        .store
+        .persist_or_accept_suspend_commit(sandbox_id, execution_generation, &pod_uid, artifact)
+        .await?;
+
+    assert!(
+        !fixture
+            .store
+            .record_confirmed_pod_ip(sandbox_id, generation, "suspending-pod", pod_ip)
+            .await?
+    );
+    assert_eq!(
+        execution_state(&fixture.pool, sandbox_id, generation)
+            .await?
+            .0,
+        "suspended"
+    );
+    fixture
+        .store
+        .finish_suspended_execution(sandbox_id, execution_generation, &pod_uid, artifact)
+        .await?;
     Ok(())
 }

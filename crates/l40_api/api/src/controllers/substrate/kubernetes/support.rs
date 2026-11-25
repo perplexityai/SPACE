@@ -1509,8 +1509,9 @@ pub(super) fn assigned_pod_ip(pod: &SandboxPodView) -> Result<Option<PodIp>, Sub
 }
 
 /// The pod's IP: the one kubelet published in `status.podIP`, else the one
-/// recorded for the same pod UID. The node reports a pod's IP before kubelet
-/// publishes it, and a pod keeps one IP for its lifetime.
+/// recorded for the same pod UID. A readiness wait records the address the
+/// pod's node reports once the node confirms it serves the execution there,
+/// which is usually before kubelet publishes it.
 pub(super) fn pod_ip_or_recorded<'a>(
     published_ip: Option<&'a str>,
     pod_uid: Option<&str>,
@@ -1520,6 +1521,17 @@ pub(super) fn pod_ip_or_recorded<'a>(
     published_ip.or_else(|| recorded_ip.filter(|_| pod_uid.is_some() && pod_uid == recorded_uid))
 }
 
+/// Where a pod address comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PodIpSource {
+    /// Kubelet published it in the pod's `status.podIP`.
+    Published,
+    /// The pod's node reported it, before kubelet published one. A node can
+    /// keep reporting an address its pod no longer has, so only a node that
+    /// affirms the execution at that address confirms it.
+    NodeReported,
+}
+
 /// [`assigned_pod_ip`], falling back to the IP recorded for the same pod UID
 /// (see [`pod_ip_or_recorded`]).
 pub(super) fn current_pod_ip(
@@ -1527,13 +1539,25 @@ pub(super) fn current_pod_ip(
     recorded_uid: Option<&PodUid>,
     recorded_ip: Option<&str>,
 ) -> Result<Option<PodIp>, SubstrateError> {
+    Ok(current_pod_ip_with_source(pod, recorded_uid, recorded_ip)?.map(|(ip, _)| ip))
+}
+
+/// [`current_pod_ip`], with where the address comes from.
+pub(super) fn current_pod_ip_with_source(
+    pod: &SandboxPodView,
+    recorded_uid: Option<&PodUid>,
+    recorded_ip: Option<&str>,
+) -> Result<Option<(PodIp, PodIpSource)>, SubstrateError> {
+    if let Some(ip) = assigned_pod_ip(pod)? {
+        return Ok(Some((ip, PodIpSource::Published)));
+    }
     pod_ip_or_recorded(
-        pod.pod_ip(),
+        None,
         pod.uid(),
         recorded_uid.map(PodUid::as_str),
         recorded_ip,
     )
-    .map(PodIp::parse)
+    .map(|ip| Ok((PodIp::parse(ip)?, PodIpSource::NodeReported)))
     .transpose()
 }
 

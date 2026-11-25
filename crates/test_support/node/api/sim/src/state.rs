@@ -50,6 +50,12 @@ pub struct SandboxRecord {
     /// change.
     #[serde(default)]
     pub activation_attempt_id: Option<String>,
+    /// The pod UID and external address the node reports for the sandbox's
+    /// current network allocation.
+    #[serde(default)]
+    pub pod_uid: Option<String>,
+    #[serde(default)]
+    pub external_address: Option<String>,
 }
 
 impl SandboxRecord {
@@ -79,11 +85,27 @@ impl SandboxRecord {
             auto_lifecycle_authority: Default::default(),
             route_substrate_kind: None,
             activation_attempt_id: None,
+            pod_uid: None,
+            external_address: None,
         }
     }
 
     pub fn with_pool_template(mut self, pool_template: Option<String>) -> Self {
         self.pool_template = pool_template;
+        self
+    }
+
+    /// Report `execution_generation`'s network allocation for `pod_uid` at
+    /// `external_address`.
+    pub fn with_allocation(
+        mut self,
+        execution_generation: i64,
+        pod_uid: &str,
+        external_address: &str,
+    ) -> Self {
+        self.execution_generation = Some(execution_generation);
+        self.pod_uid = Some(pod_uid.to_owned());
+        self.external_address = Some(external_address.to_owned());
         self
     }
 
@@ -285,6 +307,8 @@ impl SimState {
             auto_lifecycle_authority: Default::default(),
             route_substrate_kind: None,
             activation_attempt_id: None,
+            pod_uid: None,
+            external_address: None,
         };
         // insert_new races are tolerable: another concurrent call already
         // created the record, so fall through to a fresh get().

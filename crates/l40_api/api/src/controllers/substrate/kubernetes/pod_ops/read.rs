@@ -313,13 +313,14 @@ impl KubernetesSubstrate {
     /// Bound direct pod GETs without putting the store mutations in the
     /// resolver under the shorter GET timeout. A timed-out read leaves the
     /// IP unresolved so readiness can keep observing the reflector or watch.
-    /// Only an address for the execution and pod `target` names is returned.
+    /// Only an address for the execution and pod `target` names is returned,
+    /// with where it comes from.
     pub(in crate::controllers::substrate::kubernetes) async fn resolve_pod_ip_for_readiness(
         &self,
         sandbox_id: SandboxId,
         target: &PodProxyWaitTarget<'_>,
         deadline: Instant,
-    ) -> Result<Option<PodIp>, SubstrateError> {
+    ) -> Result<Option<(PodIp, PodIpSource)>, SubstrateError> {
         Ok(self
             .resolve_pod_instance_inner(sandbox_id, Some(deadline))
             .await?
@@ -329,7 +330,28 @@ impl KubernetesSubstrate {
                         .pod_uid
                         .is_none_or(|uid| pod.pod_uid.as_ref().map(PodUid::as_str) == Some(uid))
             })
-            .map(|pod| pod.ip))
+            .map(|pod| (pod.ip, pod.source)))
+    }
+
+    /// [`Self::resolve_pod_ip`] for a path that stops or deletes the runtime
+    /// at the address: a node-reported one only while its node affirms the
+    /// execution there (see [`Self::verified_runtime_pod_ip`]).
+    pub(in crate::controllers::substrate::kubernetes) async fn resolve_runtime_pod_ip(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<PodIp>, SubstrateError> {
+        let Some(pod) = self.resolve_pod_instance(sandbox_id).await? else {
+            return Ok(None);
+        };
+        let pod_name = K8sStore::execution_pod_name(sandbox_id, pod.generation);
+        let target = PodProxyWaitTarget {
+            pod_name: &pod_name,
+            pod_uid: pod.pod_uid.as_ref().map(PodUid::as_str),
+            generation: pod.generation,
+        };
+        Ok(self
+            .verified_runtime_pod_ip(sandbox_id, (pod.ip, pod.source), &target)
+            .await)
     }
 
     /// [`Self::resolve_pod_ip`], with the identity of the pod the address
@@ -559,7 +581,9 @@ impl KubernetesSubstrate {
         }
 
         let pod_uid = pod.uid().map(str::to_owned);
-        let pod_ip = current_pod_ip(&pod, row.pod_uid.as_ref(), row.pod_ip.as_deref())?;
+        let resolved =
+            current_pod_ip_with_source(&pod, row.pod_uid.as_ref(), row.pod_ip.as_deref())?;
+        let pod_ip = resolved.map(|(ip, _)| ip);
         let pod_ip_string = pod_ip.map(|ip| ip.to_string());
         let pod_client = pod.client_id();
         if row.pod_uid.as_ref().map(PodUid::as_str) != pod_uid.as_deref()
@@ -622,8 +646,9 @@ impl KubernetesSubstrate {
             }
         }
 
-        Ok(pod_ip.map(|ip| ResolvedPodInstance {
+        Ok(resolved.map(|(ip, source)| ResolvedPodInstance {
             ip,
+            source,
             pod_uid: pod_uid.as_deref().and_then(|uid| PodUid::parse(uid).ok()),
             generation: row.generation,
             sandbox_restoring: is_restoring_lifecycle(&row.lifecycle),

@@ -391,6 +391,7 @@ impl PodIp {
 #[derive(Clone, Debug)]
 struct ResolvedPodInstance {
     ip: PodIp,
+    source: support::PodIpSource,
     pod_uid: Option<PodUid>,
     generation: i64,
     /// The sandbox row read with the execution was `restoring`. A path that

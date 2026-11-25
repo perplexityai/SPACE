@@ -405,8 +405,8 @@ impl KubernetesSubstrate {
     /// it allocates the sandbox's network, so the node knows it before
     /// kubelet's status sync publishes the same address. Only an address
     /// reported for this execution generation and the observed pod's UID is
-    /// taken, and only once it is persisted; otherwise the wait is left to
-    /// the watch. With `expected_pod_uid`, only that pod is looked up.
+    /// taken, as a candidate the readiness probe must confirm before anything
+    /// records it. Only a wait that knows its pod's UID can confirm one.
     async fn node_reported_pod_ip(
         &self,
         sandbox_id: SandboxId,
@@ -414,12 +414,11 @@ impl KubernetesSubstrate {
         expected_pod_uid: Option<&str>,
         mut observed: tokio::sync::watch::Receiver<Option<SandboxPodView>>,
     ) -> Option<PodIp> {
+        let expected_pod_uid = expected_pod_uid?;
         let pod = observed
             .wait_for(|pod| {
                 pod.as_ref().is_some_and(|pod| {
-                    pod.uid()
-                        .is_some_and(|uid| expected_pod_uid.is_none_or(|e| e == uid))
-                        && assigned_pod_node_name(pod).is_some()
+                    pod.uid() == Some(expected_pod_uid) && assigned_pod_node_name(pod).is_some()
                 })
             })
             .await
@@ -457,25 +456,7 @@ impl KubernetesSubstrate {
                             generation,
                             pod_uid,
                         ) {
-                            let persisted = self
-                                .store
-                                .persist_node_reported_pod_ip(
-                                    sandbox_id,
-                                    generation,
-                                    pod_uid,
-                                    &pod_ip.to_string(),
-                                    pod.client_id().as_ref(),
-                                )
-                                .await;
-                            match persisted {
-                                Ok(Some(recorded)) => return PodIp::parse(&recorded).ok(),
-                                Ok(None) => return None,
-                                Err(error) => tracing::warn!(
-                                    sandbox_id = %sandbox_id,
-                                    error = %error,
-                                    "failed to persist node-reported pod IP; retrying"
-                                ),
-                            }
+                            return Some(pod_ip);
                         }
                     }
                     Ok(Err(_)) | Err(_) => worker = None,
@@ -490,14 +471,14 @@ impl KubernetesSubstrate {
         sandbox_id: SandboxId,
         target: &PodProxyWaitTarget<'_>,
         deadline: Instant,
-    ) -> Result<Option<PodIp>, SubstrateError> {
+    ) -> Result<Option<(PodIp, PodIpSource)>, SubstrateError> {
         let started_at = Instant::now();
         while Instant::now() < deadline {
-            if let Some(pod_ip) = self
+            if let Some(resolved) = self
                 .resolve_pod_ip_for_readiness(sandbox_id, target, deadline)
                 .await?
             {
-                return Ok(Some(pod_ip));
+                return Ok(Some(resolved));
             }
             tokio::time::sleep_until(
                 deadline.min(Instant::now() + start_wait_poll_interval(started_at)),
@@ -514,19 +495,19 @@ impl KubernetesSubstrate {
         target: &PodProxyWaitTarget<'_>,
         deadline: Instant,
         phase: &'static str,
-    ) -> Result<Option<PodIp>, SubstrateError> {
+    ) -> Result<Option<(PodIp, PodIpSource)>, SubstrateError> {
         let PodProxyWaitTarget {
             pod_name,
             pod_uid,
             generation,
         } = *target;
         let started_at = Instant::now();
-        if let Some(pod_ip) = self
+        if let Some(resolved) = self
             .resolve_pod_ip_for_readiness(sandbox_id, target, deadline)
             .await?
         {
             record_pod_ip_ready(metric_identity, sandbox_id, started_at, "cached");
-            return Ok(Some(pod_ip));
+            return Ok(Some(resolved));
         }
         if Instant::now() >= deadline {
             return Ok(None);
@@ -555,7 +536,7 @@ impl KubernetesSubstrate {
         // Kubernetes' answer: the watch, then polling if the watch ends or fails.
         let kubernetes = Box::pin(async {
             match watched.await {
-                Ok(Some(pod_ip)) => Ok(Some((pod_ip, "watch"))),
+                Ok(Some(pod_ip)) => Ok(Some(((pod_ip, PodIpSource::Published), "watch"))),
                 Ok(None) => {
                     let pod_ip = self
                         .poll_until_pod_ip_assigned(sandbox_id, target, deadline)
@@ -600,13 +581,15 @@ impl KubernetesSubstrate {
         let raced = async {
             tokio::select! {
                 kubernetes = kubernetes => kubernetes,
-                Some(pod_ip) = node_reported => Ok(Some((pod_ip, "node"))),
+                Some(pod_ip) = node_reported => {
+                    Ok(Some(((pod_ip, PodIpSource::NodeReported), "node")))
+                }
             }
         };
         match timeout_at(deadline, raced).await {
-            Ok(Ok(Some((pod_ip, source)))) => {
-                record_pod_ip_ready(metric_identity, sandbox_id, started_at, source);
-                Ok(Some(pod_ip))
+            Ok(Ok(Some((resolved, label)))) => {
+                record_pod_ip_ready(metric_identity, sandbox_id, started_at, label);
+                Ok(Some(resolved))
             }
             Ok(Ok(None)) | Err(_) => Ok(None),
             Ok(Err(err)) => Err(err),
@@ -649,7 +632,7 @@ impl KubernetesSubstrate {
             },
             None => pod_ip_assignment.await?,
         };
-        let Some(mut pod_ip) = pod_ip else {
+        let Some((mut pod_ip, mut source)) = pod_ip else {
             record_pod_proxy_wait_timeout(metric_identity, sandbox_id, started_at);
             // Pod never reached scheduled / IP-assigned in the window. No
             // node-mgr probe ran on this path, so the message names only
@@ -669,7 +652,7 @@ impl KubernetesSubstrate {
             connect_attempts += 1;
             let connect_started_at = Instant::now();
             let serves = self
-                .probe_pod_proxy(sandbox_id, pod_ip, &target, deadline)
+                .probe_pod_proxy(sandbox_id, pod_ip, source, &target, deadline)
                 .instrument(tracing::info_span!(
                     "substrate.k8s.connect_pod_proxy",
                     sandbox_id = %sandbox_id,
@@ -677,7 +660,10 @@ impl KubernetesSubstrate {
                     port = self.k8s.sandbox_proxy_port,
                     attempt = connect_attempts,
                 ))
-                .await;
+                .await
+                && self
+                    .record_confirmed(sandbox_id, pod_ip, source, &target)
+                    .await?;
             if serves {
                 record_pod_proxy_wait_ready(
                     metric_identity,
@@ -721,25 +707,26 @@ impl KubernetesSubstrate {
             // publishes another, so after a runtime sandbox is recreated under
             // the same UID the wait binds its new address at kubelet's pace,
             // as without a node report.
-            if !serves
-                && let Some(current) = self
-                    .resolve_pod_ip_for_readiness(sandbox_id, &target, deadline)
-                    .await?
+            if let Some(current) = self
+                .resolve_pod_ip_for_readiness(sandbox_id, &target, deadline)
+                .await?
             {
-                pod_ip = current;
+                (pod_ip, source) = current;
             }
             sleep(start_wait_poll_interval(started_at)).await;
         }
     }
 
     /// Whether the node behind `pod_ip` answers that it serves `target`'s
-    /// execution at that address. The address forwards to its node's node-api, so a stale
-    /// or reused address reaches a node that does not, or that reports
-    /// another address for the execution's current network allocation.
-    async fn probe_pod_proxy(
+    /// execution at that address, as [`serves_target`] compares it for
+    /// `source`. The address forwards to its node's node-api, so a stale or
+    /// reused address reaches a node that does not, or that reports another
+    /// address for the execution's current network allocation.
+    pub(super) async fn probe_pod_proxy(
         &self,
         sandbox_id: SandboxId,
         pod_ip: PodIp,
+        source: PodIpSource,
         target: &PodProxyWaitTarget<'_>,
         deadline: Instant,
     ) -> bool {
@@ -760,10 +747,59 @@ impl KubernetesSubstrate {
         )
         .await;
         match state {
-            Ok(Ok(response)) => {
-                serves_target(response.into_inner().sandboxes, sandbox_id, target, pod_ip)
-            }
+            Ok(Ok(response)) => serves_target(
+                response.into_inner().sandboxes,
+                sandbox_id,
+                target,
+                pod_ip,
+                source,
+            ),
             _ => false,
+        }
+    }
+
+    /// `pod_ip` when it is safe to act on as `target`'s runtime address: a
+    /// kubelet-published address as it is, a node-reported one only once its
+    /// node affirms the execution there (see [`serves_target`]).
+    pub(super) async fn verified_runtime_pod_ip(
+        &self,
+        sandbox_id: SandboxId,
+        (pod_ip, source): (PodIp, PodIpSource),
+        target: &PodProxyWaitTarget<'_>,
+    ) -> Option<PodIp> {
+        match source {
+            PodIpSource::Published => Some(pod_ip),
+            PodIpSource::NodeReported => self
+                .probe_pod_proxy(
+                    sandbox_id,
+                    pod_ip,
+                    source,
+                    target,
+                    Instant::now() + START_WAIT_CONNECT_TIMEOUT,
+                )
+                .await
+                .then_some(pod_ip),
+        }
+    }
+
+    /// Whether the execution row records `pod_ip` for `target`, recording a
+    /// node-reported address its node has just confirmed. A row a suspend,
+    /// retire or newer pod has moved on does not take it.
+    async fn record_confirmed(
+        &self,
+        sandbox_id: SandboxId,
+        pod_ip: PodIp,
+        source: PodIpSource,
+        target: &PodProxyWaitTarget<'_>,
+    ) -> Result<bool, SubstrateError> {
+        match (source, target.pod_uid) {
+            (PodIpSource::Published, _) => Ok(true),
+            (PodIpSource::NodeReported, Some(pod_uid)) => {
+                self.store
+                    .record_confirmed_pod_ip(sandbox_id, target.generation, pod_uid, pod_ip)
+                    .await
+            }
+            (PodIpSource::NodeReported, None) => Ok(false),
         }
     }
 
@@ -1346,31 +1382,36 @@ pub(super) struct PodProxyWaitTarget<'a> {
     pub generation: i64,
 }
 
-/// Whether `sandboxes` show `target`'s execution served at `pod_ip`. A field
-/// the node does not report (an older node, or a sandbox manager that has
-/// restarted since the allocation) is not compared. Without a reported pod IP,
-/// a runtime sandbox recreated under the same Pod UID matches at its previous
-/// address.
+/// Whether `sandboxes` show `target`'s execution served at `pod_ip`. For a
+/// kubelet-published address, a field the node does not report (an older
+/// node, or a sandbox manager that has restarted since the allocation) is not
+/// compared. A node-reported address is confirmed only by a node that reports
+/// the target's generation, Pod UID and that address.
 fn serves_target(
     sandboxes: Vec<pplx_space_sbx_mgr_client::proto::SandboxInfo>,
     sandbox_id: SandboxId,
     target: &PodProxyWaitTarget<'_>,
     pod_ip: PodIp,
+    source: PodIpSource,
 ) -> bool {
+    let strict = source == PodIpSource::NodeReported;
+    let matches = |compared: Option<bool>| compared.unwrap_or(!strict);
     let sandbox_id = sandbox_id.to_string();
     sandboxes.iter().any(|info| {
         info.sandbox_id == sandbox_id
-            && info
-                .execution_generation
-                .is_none_or(|generation| generation == target.generation)
-            && target
-                .pod_uid
-                .zip(info.pod_uid.as_deref())
-                .is_none_or(|(expected, reported)| expected == reported)
-            && info
-                .external_address
-                .as_deref()
-                .is_none_or(|reported| PodIp::parse(reported).ok() == Some(pod_ip))
+            && matches(
+                info.execution_generation
+                    .map(|generation| generation == target.generation),
+            )
+            && match (target.pod_uid, info.pod_uid.as_deref()) {
+                (Some(expected), Some(reported)) => expected == reported,
+                _ => !strict,
+            }
+            && matches(
+                info.external_address
+                    .as_deref()
+                    .map(|reported| PodIp::parse(reported).ok() == Some(pod_ip)),
+            )
     })
 }
 
@@ -1440,7 +1481,8 @@ mod node_reported_address_tests {
         );
     }
     /// The readiness probe accepts only a node serving the target execution
-    /// at the probed address; fields an older node omits are not compared.
+    /// at the probed address. For a kubelet-published address, fields an older
+    /// node omits are not compared; a node-reported one needs them all.
     #[test]
     fn a_probe_accepts_only_the_target_served_at_its_address() {
         let sandbox_id = SandboxId::new();
@@ -1450,18 +1492,27 @@ mod node_reported_address_tests {
             pod_uid: Some("pod-a"),
             generation: 1,
         };
-        let serves = |info: SandboxInfo| serves_target(vec![info], sandbox_id, &target, probed);
-
-        assert!(serves(info(sandbox_id, 1, "pod-a", "10.0.0.3")));
-        // A recreated runtime sandbox's node reports its new allocation.
-        assert!(!serves(info(sandbox_id, 1, "pod-a", "10.0.0.4")));
-        assert!(!serves(info(sandbox_id, 1, "pod-b", "10.0.0.3")));
-        assert!(!serves(info(sandbox_id, 2, "pod-a", "10.0.0.3")));
-        assert!(!serves(info(SandboxId::new(), 1, "pod-a", "10.0.0.3")));
-        assert!(!serves_target(Vec::new(), sandbox_id, &target, probed));
-        assert!(serves(SandboxInfo {
+        let degraded = SandboxInfo {
             sandbox_id: sandbox_id.to_string(),
             ..Default::default()
-        }));
+        };
+        for source in [PodIpSource::Published, PodIpSource::NodeReported] {
+            let serves =
+                |info: SandboxInfo| serves_target(vec![info], sandbox_id, &target, probed, source);
+            assert!(serves(info(sandbox_id, 1, "pod-a", "10.0.0.3")));
+            // A recreated runtime sandbox's node reports its new allocation.
+            assert!(!serves(info(sandbox_id, 1, "pod-a", "10.0.0.4")));
+            assert!(!serves(info(sandbox_id, 1, "pod-b", "10.0.0.3")));
+            assert!(!serves(info(sandbox_id, 2, "pod-a", "10.0.0.3")));
+            assert!(!serves(info(SandboxId::new(), 1, "pod-a", "10.0.0.3")));
+            assert!(!serves_target(
+                Vec::new(),
+                sandbox_id,
+                &target,
+                probed,
+                source
+            ));
+            assert_eq!(serves(degraded.clone()), source == PodIpSource::Published);
+        }
     }
 }
