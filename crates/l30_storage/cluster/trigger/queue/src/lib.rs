@@ -13,7 +13,7 @@ use time::OffsetDateTime;
 
 mod depth;
 mod lag;
-pub mod metrics;
+mod metrics;
 pub mod queue_gc;
 mod reconcile_refs;
 pub mod ref_claims;
@@ -575,7 +575,7 @@ pub async fn queued_triggers(
         .collect())
 }
 
-pub fn normalize_trigger_reason(reason: &str) -> String {
+fn normalize_trigger_reason(reason: &str) -> String {
     normalize_shared_reconcile_reason(reason)
 }
 
