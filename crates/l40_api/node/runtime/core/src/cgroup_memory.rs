@@ -73,6 +73,44 @@ pub struct CgroupMemoryPressure {
     pub full_total_us: u64,
 }
 
+/// A best-effort sample of the memory charged to one cgroup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CgroupMemoryUsage {
+    pub current_bytes: u64,
+    pub anon_bytes: Option<u64>,
+    pub limit: CgroupMemoryLimit,
+}
+
+/// `memory.max`, distinguishing an unlimited cgroup from an unreadable limit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CgroupMemoryLimit {
+    Limited(u64),
+    Unlimited,
+    Unknown,
+}
+
+/// Reads only usage and limit files, without reading event counters or PSI.
+/// An invalid `memory.current` is an error; missing or malformed limit and
+/// anonymous memory readings do not hide an otherwise valid usage sample.
+pub fn read_cgroup_memory_usage(cgroup: &Path) -> io::Result<CgroupMemoryUsage> {
+    let read = |file| std::fs::read_to_string(cgroup.join(file));
+    let current_bytes = parse_u64(cgroup, "memory.current", read("memory.current")?.trim())?;
+    let anon_bytes = read("memory.stat")
+        .and_then(|stat| parse_keyed_u64(cgroup, "memory.stat", &stat, "anon"))
+        .ok()
+        .flatten();
+    let limit = match read("memory.max").and_then(|max| parse_memory_max(cgroup, &max)) {
+        Ok(Some(bytes)) => CgroupMemoryLimit::Limited(bytes),
+        Ok(None) => CgroupMemoryLimit::Unlimited,
+        Err(_) => CgroupMemoryLimit::Unknown,
+    };
+    Ok(CgroupMemoryUsage {
+        current_bytes,
+        anon_bytes,
+        limit,
+    })
+}
+
 /// Reads the memory files of the cgroup at `cgroup`. Fails when `memory.max`,
 /// `memory.current`, `memory.stat` or `memory.events` is unreadable, or when
 /// one of their values read here is malformed; an unreadable
@@ -83,18 +121,11 @@ pub fn read_cgroup_memory_state(cgroup: &Path) -> io::Result<CgroupMemoryState> 
     let current = read("memory.current")?;
     let stat = read("memory.stat")?;
     let events = read("memory.events")?;
-    let keyed = |file: &str, content: &str, key: &str| {
-        keyed_u64(content, key)
-            .map(|value| parse_u64(cgroup, &format!("{file} {key}"), value))
-            .transpose()
-    };
+    let keyed = |file: &str, content: &str, key: &str| parse_keyed_u64(cgroup, file, content, key);
     // A counter the running kernel does not report has never fired.
     let event = |key: &str| Ok::<_, io::Error>(keyed("memory.events", &events, key)?.unwrap_or(0));
     Ok(CgroupMemoryState {
-        max_bytes: match max.trim() {
-            "max" => None,
-            value => Some(parse_u64(cgroup, "memory.max", value)?),
-        },
+        max_bytes: parse_memory_max(cgroup, &max)?,
         current_bytes: parse_u64(cgroup, "memory.current", current.trim())?,
         stat: CgroupMemoryStat {
             anon: keyed("memory.stat", &stat, "anon")?,
@@ -116,6 +147,19 @@ pub fn read_cgroup_memory_state(cgroup: &Path) -> io::Result<CgroupMemoryState> 
             .ok()
             .and_then(|content| parse_pressure(&content)),
     })
+}
+
+fn parse_memory_max(cgroup: &Path, contents: &str) -> io::Result<Option<u64>> {
+    match contents.trim() {
+        "max" => Ok(None),
+        value => parse_u64(cgroup, "memory.max", value).map(Some),
+    }
+}
+
+fn parse_keyed_u64(cgroup: &Path, file: &str, content: &str, key: &str) -> io::Result<Option<u64>> {
+    keyed_u64(content, key)
+        .map(|value| parse_u64(cgroup, &format!("{file} {key}"), value))
+        .transpose()
 }
 
 fn parse_u64(cgroup: &Path, file: &str, value: &str) -> io::Result<u64> {

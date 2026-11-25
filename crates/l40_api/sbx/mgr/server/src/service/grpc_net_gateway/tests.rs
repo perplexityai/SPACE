@@ -92,6 +92,7 @@ async fn a_handover_that_is_not_taken_stops_and_relaunches_the_gateway() {
                 guest_image: Default::default(),
                 node_execution_id: sandbox.node_execution_id,
                 sandbox_id: id.clone(),
+                created_at: None,
                 uid: Some(uid),
                 runtime_pid: None,
                 spaced_host_pid: sandbox.spaced_host_pid,

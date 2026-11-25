@@ -769,6 +769,31 @@ resume notice, and since a restore that ends paused sends none, sandbox-manager
 also drops the first drain after every restore. A guest that predates the
 field sends none.
 
+## VM host memory
+
+Sandbox-manager samples populated VM jailer cgroups every 30 seconds, including
+paused VMs. These are host charges, not guest memory readings. The jailer
+cgroup excludes sidecars. Missing or unreadable usage is not reported as zero.
+
+| Metric | Type | Source |
+| --- | --- | --- |
+| `sandbox.cgroup.memory.current_bytes` | distribution | `memory.current`, total bytes charged to the VM cgroup |
+| `sandbox.cgroup.memory.anon_bytes` | distribution | the `anon` field of `memory.stat`, when available |
+| `sandbox.cgroup.memory.sweep_truncated` | counter | one increment when the sampling sweep hits its deadline before visiting every candidate |
+
+Both distributions have only two sandbox-specific dimensions:
+
+- `cgroup_limit_bucket` describes the configured host cgroup limit
+  (`memory.max`), not requested guest RAM. The upper-inclusive thresholds
+  are 1, 2, 4, 8, and 16 GiB plus the standard jailer memory headroom. For
+  example, a 2 GiB VM with standard headroom has `1_to_2gib_plus_headroom`.
+  Limits above the last threshold are `gt_16gib_plus_headroom`; uncapped
+  and unreadable limits are `unlimited` and `unknown`, respectively.
+- `age_bucket` is time since the sandbox row was created on the node, not
+  time since the last VM start. The upper-exclusive buckets are `lt_1m`,
+  `1_to_5m`, `5_to_15m`, and `15_to_60m`, followed by `ge_60m`.
+  Unavailable ages use `unknown`.
+
 ## Sandbox identity
 
 Telemetry names a sandbox by one canonical value, its bare lowercase UUID
