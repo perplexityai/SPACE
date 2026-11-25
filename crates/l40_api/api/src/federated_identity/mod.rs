@@ -1,5 +1,5 @@
 pub mod config;
-pub mod grants;
+mod grants;
 mod identity;
 pub mod ingress;
 mod store;
