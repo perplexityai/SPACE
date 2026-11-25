@@ -3,9 +3,10 @@
 //! drained and terminating lists and its phase write, the drained-node
 //! terminator's list, its reap and its orphan delete, the terminating delete
 //! with its tombstone, the forced drain's suspend claim, the record of a
-//! stopped evacuation's artifact, and the three sandbox give-ups keyed on
-//! the node's phase: the stale-resident sweep, the gone node's bulk fail and
-//! the drained gone node's mark-lost. Each writer runs against a v1 row and
+//! stopped evacuation's artifact, and the give-ups keyed on the node's
+//! phase: the stale-resident sweep, the gone node's bulk fail, mark-lost,
+//! remote-snapshot adoption and in-flight upload fail, and the drained gone
+//! node's mark-lost. Each writer runs against a v1 row and
 //! a row under each other engine in the same phase: the v1 row is the
 //! control the writer still takes.
 //!
@@ -88,6 +89,59 @@ async fn node(pool: &PgPool, phase: &str, engine: Option<&str>) -> TestResult<No
     Ok(node_id)
 }
 
+/// A `suspended` sandbox pinned to `node_id` with no snapshot.
+async fn suspended_on(
+    pool: &PgPool,
+    node_id: NodeId,
+) -> TestResult<pplx_space_sandbox_model::SandboxId> {
+    let id = pplx_space_sandbox_model::SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, lifecycle, placement, managed_by,
+             target_node_id, network_policy_generation
+         ) VALUES ($1, '00000000-0000-0000-0000-000000000010',
+                   '00000000-0000-0000-0000-000000000001', 'suspended',
+                   'unplaced', 'k8s', $2, 1)"
+    ))
+    .bind(id)
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// A full snapshot of `sandbox_id` from `node_id` in `state`, taken now; a
+/// ready one with its storage location.
+async fn snapshot_of(
+    pool: &PgPool,
+    sandbox_id: pplx_space_sandbox_model::SandboxId,
+    node_id: NodeId,
+    state: &str,
+) -> TestResult {
+    let snapshot_id = uuid::Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (id, sandbox_id, type, state, source_node_id, timestamp)
+         VALUES ($1, $2, 'full', $3, $4, NOW())"
+    ))
+    .bind(snapshot_id)
+    .bind(sandbox_id)
+    .bind(state)
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    if state == "ready" {
+        sqlx::query(sql!(
+            "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string)
+             VALUES ($1, $2)"
+        ))
+        .bind(snapshot_id)
+        .bind(format!("s3://synthetic-bucket/{snapshot_id}"))
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
 async fn phase(pool: &PgPool, node_id: NodeId) -> TestResult<Option<String>> {
     Ok(
         sqlx::query_scalar(sql!("SELECT drain_phase FROM nodes WHERE id = $1"))
@@ -114,11 +168,14 @@ enum Writer {
     TerminatingDelete,
     AbandonStale,
     GoneNodeFail,
+    GoneNodeLost,
+    GoneNodeAdopt,
+    GoneNodeUploads,
     UnrecoverableLost,
 }
 
 impl Writer {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 17] = [
         Self::DrainingList,
         Self::DrainingIds,
         Self::PhaseWrite,
@@ -132,6 +189,9 @@ impl Writer {
         Self::TerminatingDelete,
         Self::AbandonStale,
         Self::GoneNodeFail,
+        Self::GoneNodeLost,
+        Self::GoneNodeAdopt,
+        Self::GoneNodeUploads,
         Self::UnrecoverableLost,
     ];
 
@@ -144,7 +204,10 @@ impl Writer {
             | Self::SuspendClaim
             | Self::StoppedArtifact
             | Self::AbandonStale
-            | Self::GoneNodeFail => "draining",
+            | Self::GoneNodeFail
+            | Self::GoneNodeLost
+            | Self::GoneNodeAdopt
+            | Self::GoneNodeUploads => "draining",
             Self::TerminatingList | Self::TerminatingDelete => "terminating",
             Self::DrainedIds
             | Self::DrainedList
@@ -274,19 +337,53 @@ impl Writer {
                 .await?
                 .is_empty()
             }
-            Self::UnrecoverableLost => {
+            Self::GoneNodeLost => {
+                let id = suspended_on(pool, node_id).await?;
+                pplx_space_sandbox_store::drain::mark_sandbox_lost_on_gone_node(
+                    pool,
+                    id,
+                    node_id,
+                    Some(UID),
+                )
+                .await?
+                    > 0
+            }
+            Self::GoneNodeAdopt => {
+                let id = suspended_on(pool, node_id).await?;
+                // Suspended an hour ago, with a ready snapshot of this cycle.
                 sqlx::query(sql!(
-                    "INSERT INTO sandboxes (
-                         id, user_id, org_id, lifecycle, placement, managed_by,
-                         target_node_id, network_policy_generation
-                     ) VALUES ($1, '00000000-0000-0000-0000-000000000010',
-                               '00000000-0000-0000-0000-000000000001', 'suspended',
-                               'unplaced', 'k8s', $2, 1)"
+                    "UPDATE sandboxes SET lifecycle_changed_at = NOW() - INTERVAL '1 hour'
+                      WHERE id = $1"
                 ))
-                .bind(pplx_space_sandbox_model::SandboxId::new())
-                .bind(node_id)
+                .bind(id)
                 .execute(pool)
                 .await?;
+                snapshot_of(pool, id, node_id, "ready").await?;
+                pplx_space_sandbox_store::drain::adopt_remote_snapshot_on_gone_node(
+                    pool,
+                    id,
+                    node_id,
+                    pplx_space_durations::PositiveDuration::new(std::time::Duration::from_secs(60))
+                        .expect("non-zero"),
+                    Some(UID),
+                )
+                .await?
+                    > 0
+            }
+            Self::GoneNodeUploads => {
+                let id = suspended_on(pool, node_id).await?;
+                snapshot_of(pool, id, node_id, "creating").await?;
+                !pplx_space_snapshot_store::lost::fail_inflight_uploads_from_gone_node(
+                    pool,
+                    node_id,
+                    Some(UID),
+                    "the node is gone",
+                )
+                .await?
+                .is_empty()
+            }
+            Self::UnrecoverableLost => {
+                suspended_on(pool, node_id).await?;
                 !NodeDbStore::new(pool.clone(), ResidencyEvidence::default())
                     .mark_unrecoverable_sandboxes_lost(node_id, Some(UID.to_owned()))
                     .await?
