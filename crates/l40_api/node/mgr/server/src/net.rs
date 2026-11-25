@@ -404,7 +404,7 @@ impl NetId {
         format!("/var/run/netns/sns-{}", self.label)
     }
     pub fn sveth(&self) -> String {
-        format!("sveth-{}", self.label)
+        format!("{SANDBOX_LINK_PREFIX}{}", self.label)
     }
     pub fn vpeer(&self) -> String {
         format!("vpeer-{}", self.label)
@@ -452,6 +452,9 @@ pub fn slot_label(slot: u32) -> String {
         .unwrap_or_else(|_| format!("{slot:06}"))
 }
 
+/// Prefix of the sandbox-side veth node-mgr adds to the pod namespace. The
+/// shim's redirect address selection skips the same prefix.
+pub(crate) const SANDBOX_LINK_PREFIX: &str = "sveth-";
 const SANDBOX_IPV4_BASE: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 12, 0, 0);
 const VPEER_IPV4_BASE_OFFSET: u32 = 32_768;
 pub const MAX_IPV4_NETWORK_SLOTS: u32 = 16_383;

@@ -8,6 +8,7 @@ import (
 	"os"
 	goruntime "runtime"
 	"sort"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
@@ -72,7 +73,9 @@ func podIPFromCurrentNetns() string {
 	sort.Slice(interfaces, func(i, j int) bool { return interfaces[i].Index < interfaces[j].Index })
 
 	for _, iface := range interfaces {
-		if iface.Flags&net.FlagLoopback != 0 {
+		// node-mgr adds a sandbox-side veth to the pod namespace; its
+		// external_ipv4 skips the same prefix.
+		if iface.Flags&net.FlagLoopback != 0 || strings.HasPrefix(iface.Name, "sveth-") {
 			continue
 		}
 

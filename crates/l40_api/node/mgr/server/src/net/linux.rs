@@ -526,7 +526,10 @@ pub fn external_ipv4(ns: &str) -> Result<Ipv4Addr, DefaultIfaceError> {
                     .await
                     .map_err(|e| format!("failed to dump links: {e}"))?
                 {
-                    if !link.header.flags.contains(LinkFlags::Loopback) {
+                    let sandbox_link = link.attributes.iter().any(|attr| {
+                        matches!(attr, LinkAttribute::IfName(name) if name.starts_with(super::SANDBOX_LINK_PREFIX))
+                    });
+                    if !link.header.flags.contains(LinkFlags::Loopback) && !sandbox_link {
                         links.push(link.header.index);
                     }
                 }

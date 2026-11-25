@@ -254,8 +254,9 @@ fn firewall_setup_classifier_preserves_transient_and_permanent_sources() {
 }
 
 /// The external address is the one the shim redirects: the first eligible
-/// address in interface index order, even when the default route uses another
-/// interface or a higher-index link is created first. `TestPodIPFromNetnsMatchesNodeManager` in the shim pins the same
+/// address in interface index order, skipping the sandbox veth, even when the
+/// default route uses another interface or a higher-index link is created
+/// first. `TestPodIPFromNetnsMatchesNodeManager` in the shim pins the same
 /// fixture.
 #[cfg(target_os = "linux")]
 #[test]
@@ -280,6 +281,9 @@ fn external_address_is_the_shim_redirect_address() {
         assert!(status.success(), "ip {args}");
     };
     ip("netns add NS");
+    ip("-n NS link add sveth-test index 2 type dummy");
+    ip("-n NS addr add 10.12.0.5/32 dev sveth-test");
+    ip("-n NS link set sveth-test up");
     ip("-n NS link add high0 index 256 type dummy");
     ip("-n NS addr add 198.51.100.4/24 dev high0");
     ip("-n NS link set high0 up");
