@@ -132,31 +132,32 @@ _DURATION_SECONDS = {
         "native.resident_pause": 5,
         "native.stopped_restart_preserves_rootfs": 68,
         # The drain set, which runs by name and splits across benches with
-        # `space_smoke list --prefix native.v2_ --shard I/N`: one local Kind
-        # run each (2026-11-25, four benches on a 32-core host, Kind's drain
-        # v2 values), setup and cleanup included. Replace with CI medians
-        # once CI runs them.
-        "native.v2_drain_evacuates_every_resident": 46,
-        "native.v2_drain_holds_running_until_its_deadline": 124,
-        "native.v2_drain_keeps_a_live_node_with_a_stale_instance": 338,
-        "native.v2_drain_meets_user_calls": 123,
-        "native.v2_drain_moves_ten_residents": 84,
-        "native.v2_drain_outlived_by_a_dead_worker": 525,
-        "native.v2_drain_paces_a_full_worker": 246,
-        "native.v2_drain_preview_changes_nothing": 74,
-        "native.v2_drain_refused_at_the_cap": 91,
-        "native.v2_drain_refuses_stopped_sandboxes": 178,
-        "native.v2_drain_replaced_while_shutting_down": 153,
-        "native.v2_drain_survives_controller_restarts": 259,
-        "native.v2_drain_survives_sandbox_manager_restarts": 205,
-        "native.v2_drain_terminates_its_worker": 235,
-        "native.v2_drain_waits_for_a_lingering_node": 262,
-        "native.v2_drain_waits_for_an_unreachable_node": 210,
-        "native.v2_drain_waits_out_blocked_uploads": 493,
-        "native.v2_refuses_v1_drains": 7,
-        "native.v2_undrain_mid_suspend": 76,
-        "native.v2_undrain_unseals_the_worker": 111,
-        "native.v2_undrain_with_the_controller_down": 50,
+        # `space_smoke list --prefix native.v2_ --shard I/N`: the median of
+        # three local Kind runs each (2026-11-25, `smoke-kind-parallel.sh
+        # --repeat 3` on four benches of a 32-core host, Kind's drain v2
+        # values), setup and cleanup included. Replace with CI medians once
+        # CI runs them.
+        "native.v2_drain_evacuates_every_resident": 75,
+        "native.v2_drain_holds_running_until_its_deadline": 122,
+        "native.v2_drain_keeps_a_live_node_with_a_stale_instance": 289,
+        "native.v2_drain_meets_user_calls": 145,
+        "native.v2_drain_moves_ten_residents": 110,
+        "native.v2_drain_outlived_by_a_dead_worker": 469,
+        "native.v2_drain_paces_a_full_worker": 290,
+        "native.v2_drain_preview_changes_nothing": 42,
+        "native.v2_drain_refused_at_the_cap": 70,
+        "native.v2_drain_refuses_stopped_sandboxes": 175,
+        "native.v2_drain_replaced_while_shutting_down": 169,
+        "native.v2_drain_survives_controller_restarts": 266,
+        "native.v2_drain_survives_sandbox_manager_restarts": 199,
+        "native.v2_drain_terminates_its_worker": 282,
+        "native.v2_drain_waits_for_a_lingering_node": 267,
+        "native.v2_drain_waits_for_an_unreachable_node": 205,
+        "native.v2_drain_waits_out_blocked_uploads": 95,
+        "native.v2_refuses_v1_drains": 6,
+        "native.v2_undrain_mid_suspend": 79,
+        "native.v2_undrain_unseals_the_worker": 114,
+        "native.v2_undrain_with_the_controller_down": 47,
         "native_concurrency.command_idempotency": 4,
         "native_concurrency.create_idempotency": 4,
         "native_concurrency.independent_commands": 4,
