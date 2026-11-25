@@ -1,11 +1,9 @@
 //! Postgres-side queries that back the admin node endpoints.
 //!
 //! Handlers in [`super::nodes`] stay focused on HTTP, auth, the drain
-//! state-machine, and audit logging; the SQL strings, row structs, and
-//! transaction-bound helpers live here.
+//! state-machine, and audit logging; the row structs and transaction-bound
+//! helpers live here, and the SQL they run lives in the stores they call.
 
-#[cfg(test)]
-use pplx_space_sql_locator::sql;
 use std::collections::HashMap;
 
 use pplx_space_accounts::NodeId;
@@ -18,16 +16,7 @@ use pplx_space_node_registration_store::direct;
 use pplx_space_node_registration_store::drain_reads::{self, NodeDrainColumns};
 use pplx_space_node_registration_store::drain_write::{self, DrainColumnsUpdate};
 use pplx_space_sandbox_model::SandboxId;
-#[cfg(test)]
-use pplx_space_sandbox_portability::drain_gate_blocker_pairs;
-#[cfg(test)]
-use pplx_space_sandbox_portability::snapshot_durable_for_source_release;
 use pplx_space_sandbox_residency::ResidencyEvidence;
-#[cfg(test)]
-use pplx_space_sandbox_residency::{
-    node_heartbeat_fresh, non_resident_lifecycle_exclusion, occupies_node_predicate,
-    resident_lifecycle,
-};
 use pplx_space_sandbox_store::{admin_occupancy, node_placements};
 use serde::Serialize;
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
@@ -99,45 +88,6 @@ pub(super) struct SandboxOccupancy {
 
 pub(super) use pplx_space_sandbox_store::admin_occupancy::TerminateOccupancy;
 
-/// The lifecycle scope of the `active` occupancy count: everything that has
-/// neither terminated (`failed` / `deleted`) nor migrated off the node
-/// (`suspended`).
-///
-/// `deleted` is not a value `SandboxLifecycle` produces: it is the tombstone
-/// raw SQL writes into the TEXT column.
-///
-/// Shared by the batched listing count and this module's in-transaction
-/// `:terminate` guard, so the *lifecycle scope* an operator reads and the one
-/// that refuses an operator-driven termination cannot drift.
-///
-/// The two are no longer equal counts, and deliberately so. The
-/// guard additionally applies the census discount, so it matches the listing's
-/// `terminate_blockers` — not its `active`, which stays raw precisely so an
-/// operator can see the phantom rows the discount drops. The figure that
-/// refuses is therefore a figure the listing publishes; that equality is pinned
-/// by `the_guard_refuses_exactly_what_the_listing_calls_terminate_blockers`.
-///
-/// The list itself now lives next to `RESIDENT_LIFECYCLES` in the shared
-/// residency module as [`NON_RESIDENT_LIFECYCLES`], rendered by
-/// [`non_resident_lifecycle_exclusion`] — the hoist this comment used to
-/// prescribe. So `terminate_blockers` no longer merely *predicts* the
-/// cluster-controller's drained-node terminator; it and that reconciler read the
-/// same definition, and node-drain's `draining → drained` gate consults it too
-/// before releasing a node. What remains local to this helper is only the
-/// alias-shaped rendering.
-///
-/// This is deliberately *not* the scope of the live-resident drainability
-/// count, which narrows to `RESIDENT_LIFECYCLES`: occupancy blocks
-/// `:terminate`, while the ranking predicts what a drain waits on, and a
-/// `stopped` sandbox does the first without doing the second.
-///
-/// `alias` is the SQL alias for the `sandboxes` row in the calling query — pass
-/// the bare table name (`"sandboxes"`) when no alias is set.
-#[cfg(test)]
-fn active_occupancy_lifecycles(alias: &str) -> String {
-    format!("({})", non_resident_lifecycle_exclusion(alias))
-}
-
 /// Ceiling on the long-runner age, applied before the value reaches
 /// `make_interval`. Any threshold this large already selects nothing, so
 /// clamping costs no expressiveness and keeps a hostile query parameter from
@@ -171,8 +121,8 @@ pub(super) struct NodeLiveResidents {
 
 /// One row of [`AdminNodeStore::occupancy_for_nodes`]'s result, named rather
 /// than positional: the five `i64` counters are adjacent and interchangeable by
-/// type, so a tuple would couple their order to a `SELECT` list dozens of lines
-/// away in a `format!` string, with a silent miscount as the failure mode.
+/// type, so a tuple would couple their order to a `SELECT` list in another
+/// crate, with a silent miscount as the failure mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromRow)]
 struct OccupancyRow {
     node_id: NodeId,
@@ -225,41 +175,6 @@ pub(super) struct NodeOccupancy {
     /// which is also what [`Default`] yields.
     pub(super) heartbeat_fresh: bool,
     pub(super) live: Option<NodeLiveResidents>,
-}
-
-/// Whether the per-row occupancy CTE should be `MATERIALIZED`, as the SQL
-/// keyword to splice in.
-///
-/// Materializing is load-bearing only when the row flags actually carry the
-/// census absence proof. The aggregates over that CTE reference the projected
-/// booleans three times, and an inlined CTE lets Postgres expand those aliases
-/// and re-evaluate whatever they stand for per aggregate — restoring the per-row
-/// SubPlan over the census relation and pushing the plan back over
-/// `jit_above_cost`.
-///
-/// The node-drain reconciler avoids the same duplication the other way: its
-/// resident-count query stays flat and keeps the absence proof under a single
-/// `FILTER`, so no second reference to it exists for the planner to expand.
-/// That shape is not available here — the ranking needs three counts that all
-/// narrow the same proof, so the proof is referenced more than once by
-/// construction and the fence is what stops the re-expansion.
-///
-/// In every other mode nothing on the row is worth fencing: the census flag is
-/// the literal TRUE, and the two flags that remain — an `IN` test over a column
-/// already on the row, and one `make_interval` comparison against a bound
-/// parameter — are each referenced once by the aggregates, so there is no
-/// repeated evaluation to prevent. Materializing would still cost: it would spool every active sandbox row in the listed set into a
-/// tuplestore, which on a fleet listing is millions of rows and can spill to
-/// temporary storage. The ordinary listing path — which asks for no drainability
-/// counters at all — must therefore keep the streaming shape it had before the
-/// ranking existed.
-#[cfg(test)]
-fn row_cte_materialization(ranking_requested: bool, residency: ResidencyEvidence) -> &'static str {
-    if ranking_requested && residency.discounts_absent_rows() {
-        " MATERIALIZED"
-    } else {
-        ""
-    }
 }
 
 /// The age the statement actually applied, i.e. after the clamp. Reported back
@@ -453,264 +368,14 @@ impl AdminNodeStore {
         long_runner_age: Option<Duration>,
         residency: ResidencyEvidence,
     ) -> Result<Vec<OccupancyRow>, sqlx::Error> {
-        // `local_snapshot` counts strand-risk sandboxes for a node: a
-        // suspended sandbox pinned to it whose snapshot is **not** yet
-        // durably in S3 (attributed to `target_node_id`), plus any sandbox
-        // whose suspend-snapshot upload is still in flight *from* it
-        // (`snapshots.state='creating'`, attributed to `source_node_id`).
-        // UNION deduplicates the suspended and in-flight branches per
-        // (node, sandbox), matching the `:terminate` guard's per-sandbox count.
-        // When the upload source differs from the target, both nodes count.
-        // The shared marker-aware `snapshot_durable_for_source_release`
-        // predicate is the single source of truth for "durably restorable from
-        // S3": an evacuation-marked sandbox counts as strand risk until its
-        // *newest* full snapshot is `ready` (matching the node-drain
-        // source-release guards), while a plain user-suspended sandbox uses
-        // placement-freshness.
-        // Quarantined sandboxes are counted as active occupancy because
-        // quarantine preserves the hot-node association for later inspection.
-        //
-        // Deliberately **not** census-aware, unlike the `:terminate` guard in
-        // `admin_occupancy::terminate_occupancy`. This scan is multi-node
-        // (`ANY($1::UUID[])`), so the discount's node expression would have to be
-        // the per-row `active_node_id` column rather than a bound parameter —
-        // the shape `sandbox_residency::node_heartbeat_fresh` documents as
-        // costing 30–120 ms per call by forcing a hashed SubPlan over
-        // `node_status_snapshots`. This listing refuses nothing, so over-counting
-        // shows an operator a high number rather than blocking an operation. The
-        // guard, which does refuse, pays for accuracy instead.
-        let snapshot_exists = snapshot_durable_for_source_release("s");
-        // Durability check for the in-flight UNION branch (which joins
-        // `sandboxes s2`): a sandbox already durably restorable must not count
-        // as strand risk just because an earlier `creating` row lingers. Uses
-        // the same marker-aware predicate as the suspended branch and the
-        // in-tx guard so all three agree. (Its inner `EXISTS` reuses the alias
-        // `sn`, shadowing the outer `snapshots sn` within the subquery — the
-        // subquery is self-contained, correlating only via `s2.id`.)
-        let portable_for_snapshot = snapshot_durable_for_source_release("s2");
-        let active_lifecycles = active_occupancy_lifecycles("sandboxes");
-        // Per-row drainability flags, carried on the `active` branch only —
-        // `live_residents` is by definition a subset of `active`, so deriving
-        // both from the same scan is what makes the subset relation hold by
-        // construction instead of by two queries agreeing. The census predicate
-        // is read only in its TRUE direction, per that module's contract: `NOT
-        // proven_absent` means "not proven absent", never "proven present".
-        //
-        // `present` is the census-aware "the node has not proven this row
-        // absent" test, projected once per row. The three counts below narrow it
-        // by ANDing the projected booleans rather than re-stating the predicate,
-        // so the absence proof is written into the statement once and evaluated
-        // once per row. Each narrowing answers a different gate's question:
-        //
-        // - `active` — no narrowing. The occupancy figure the `:terminate` guard
-        //   enforces, phantoms included.
-        // - `present` — what the drained-node terminator blocks on. It discounts
-        //   phantom rows exactly as the terminator does, but keeps `stopped` /
-        //   `created` / `deleting` / `quarantined`, which the census reports and
-        //   the terminator therefore still refuses to advance past. Ranking on
-        //   the raw occupancy count instead would prefer a node holding one
-        //   reported `stopped` row over one holding fifty phantoms — backwards.
-        //   Under `LifecycleOnly` the discount is a no-op: `present` is the
-        //   literal TRUE and this count equals `active` exactly, so the phantom
-        //   argument only bites on a cluster that has opted in.
-        // - `present AND resident` — what a drain waits on. `RESIDENT_LIFECYCLES`
-        //   drops `stopped` / `created` / `deleting` / `quarantined` because
-        //   there is no VM the pipeline can evacuate. So
-        //   `active` minus this is phantom rows *plus* those non-evacuable
-        //   lifecycles: "not blocking a drain" is broader than "not really
-        //   there".
-        //
-        // `residency` is the caller's, read from the same switch the drain
-        // reconciler reads, so the counts describe whichever policy the
-        // cluster's gates run under rather than a second opinion about it.
-        //
-        // Without a threshold every flag is the literal FALSE, so Postgres plans
-        // no census probe at all and the default listing keeps its old cost.
-        let (present_flag, resident_flag, aged_flag) = match long_runner_age {
-            Some(_) => {
-                // The reconciler's own policy branch, not a second copy of it:
-                // under the default `LifecycleOnly` this is the literal `TRUE`,
-                // so no census probe is planned at all and every occupying row
-                // counts — which is what the drain and terminator gates do in
-                // that mode. Reading the same switch is the only way the ranking
-                // predicts what those gates will actually do.
-                (
-                    occupies_node_predicate("sandboxes", "sandboxes.active_node_id", residency),
-                    resident_lifecycle("sandboxes"),
-                    "sandboxes.lifecycle_changed_at < NOW() - make_interval(secs => $2::BIGINT)"
-                        .to_string(),
-                )
-            }
-            None => (
-                "FALSE".to_string(),
-                "FALSE".to_string(),
-                "FALSE".to_string(),
-            ),
-        };
-        let row_cte_materialization = row_cte_materialization(long_runner_age.is_some(), residency);
-        // Per-node heartbeat freshness, evaluated once per listed node in the
-        // `scope` CTE rather than derived later from the separate `list()`
-        // read. It is the ranking's first term, so reading it from a different
-        // statement than the counts it orders lets a node that flipped
-        // reachable between the two sort by one snapshot's visibility and
-        // another's occupancy.
-        // The ranking's visibility term and the rows' discount term are the same
-        // definition, evaluated here against the unnested node id.
-        let heartbeat_fresh = node_heartbeat_fresh("scope_input.node_id");
-        // The reconciler's own `draining -> drained` gate: two of the states it
-        // counts pin through `target_node_id` while `active_node_id` is NULL, so
-        // the occupancy branches cannot see them and a node whose drain is held
-        // open would otherwise report zero everywhere.
-        //
-        // Counted from the batched pair form, grouped once for the whole node
-        // set. The single-node predicate is not reusable per node here: its two
-        // disjuncts attribute to different columns, so a correlated evaluation
-        // leaves the planner no indexable driver on `sandboxes` and degrades to a
-        // full scan of that table per listed node when sorting by drainability.
-        //
-        // Gated on the same opt-in as the census probes, and the count travels
-        // inside the `Option` alongside the live counters, so a caller cannot
-        // read a skipped computation as "no blockers".
-        let blockers_cte = match long_runner_age {
-            Some(_) => format!(
-                "SELECT node_id, COUNT(*)::BIGINT AS drain_blockers\n\
-                   FROM (\n{}\n) gate_blockers\n\
-                  GROUP BY node_id",
-                drain_gate_blocker_pairs("$1::UUID[]")
-            ),
-            // Shape-compatible and empty, so the join below yields no row and
-            // the COALESCE reports zero without the scan.
-            None => "SELECT NULL::UUID AS node_id, 0::BIGINT AS drain_blockers\n\
-                      WHERE FALSE"
-                .to_string(),
-        };
-        let query = format!(
-            "WITH scope AS (
-                 SELECT scope_input.node_id AS node_id,
-                        {heartbeat_fresh} AS heartbeat_fresh
-                   FROM UNNEST($1::UUID[]) AS scope_input(node_id)
-             ),
-             blockers AS (
-             {blockers_cte}
-             ),
-             occupancy_rows AS{row_cte_materialization} (
-                   -- `sandbox_id` here feeds no aggregate; it is what makes
-                   -- this arm's arity match the deduped local-snapshot arm below
-                   -- across the `UNION ALL`. Dropping it as unused breaks the
-                   -- statement at runtime, not at compile time.
-                   SELECT active_node_id AS node_id, id AS sandbox_id,
-                          'active' AS kind,
-                          ({present_flag}) AS present,
-                          ({resident_flag}) AS resident,
-                          ({aged_flag}) AS aged
-                     FROM sandboxes
-                    WHERE active_node_id = ANY($1::UUID[])
-                      AND {active_lifecycles}
-                   UNION ALL
-                   -- One row per (node, sandbox), deduped *here* rather than by a
-                   -- DISTINCT aggregate below. `local_snapshots` counts
-                   -- sandboxes, and two of these branches can describe one
-                   -- sandbox on one node. UNION collapses that pair without
-                   -- a correlated in-flight-upload exclusion for every suspended
-                   -- row. Keep both nodes when the target differs from the source.
-                   --
-                   -- Deduping here and keeping a plain `COUNT(*) FILTER` below is
-                   -- deliberate: a `COUNT(DISTINCT …)` in the aggregate disables
-                   -- hashed aggregation for the whole `GROUP BY`. Measured at
-                   -- 200k active rows, that planned a `GroupAggregate` over a
-                   -- Sort of *every* occupancy row — active rows included —
-                   -- where the plain count plans a `HashAggregate` over the
-                   -- `Append` (whose active arm still gathers in parallel). The
-                   -- sort here is not removed so much as bounded: this `UNION`
-                   -- plans as Sort → Unique over the strand-risk rows alone,
-                   -- which is the trade. Paying the unbounded version on the
-                   -- default listing, which asks for none of this, would be a
-                   -- regression.
-                   SELECT node_id, sandbox_id, 'local_snapshot' AS kind,
-                          FALSE AS present, FALSE AS resident, FALSE AS aged
-                     FROM (
-                         SELECT target_node_id AS node_id, s.id AS sandbox_id
-                           FROM sandboxes s
-                          WHERE target_node_id = ANY($1::UUID[])
-                            AND lifecycle = 'suspended'
-                            AND NOT {snapshot_exists}
-                         UNION
-                         -- A sandbox with several `creating` rows from the same
-                         -- source counts once, matching the in-tx guard's
-                         -- per-sandbox EXISTS. Freshness-gated and
-                         -- fresh-ready-excluded so stale prior-cycle remnants and
-                         -- already-portable sandboxes don't count.
-                         --
-                         -- The gate here is the *legacy* one, while the in-tx
-                         -- guard's in-flight term goes through the artifact-aware
-                         -- fragment, so the two still disagree per node in one
-                         -- case: a `creating` row naming an artifact other than
-                         -- the sandbox's current one, sourced from a node that is
-                         -- not also its target. This arm counts that source node;
-                         -- the guard does not. The listing therefore
-                         -- **over**-reports — an operator who expects
-                         -- `:terminate` to refuse on the strength of it will find
-                         -- the termination allowed. Closing that means routing
-                         -- this arm through the shared fragment, which is what
-                         -- the batched blocker form does and is a change to
-                         -- pre-existing strand-risk counting, so it is tracked
-                         -- rather than folded in here.
-                         SELECT sn.source_node_id AS node_id, sn.sandbox_id
-                           FROM snapshots sn
-                           JOIN sandboxes s2 ON s2.id = sn.sandbox_id
-                          WHERE sn.source_node_id = ANY($1::UUID[])
-                            AND sn.type = 'full'
-                            AND sn.state = 'creating'
-                            AND (
-                                s2.placement_changed_at IS NULL
-                                OR sn.timestamp >= s2.placement_changed_at
-                            )
-                            AND NOT {portable_for_snapshot}
-                     ) local_snapshot_dedup
-             ),
-             occupancy AS (
-             SELECT node_id,
-                    COUNT(*) FILTER (WHERE kind = 'active')::BIGINT AS active,
-                    -- Safe as a row count because the branch above already
-                    -- deduped per (node, sandbox); see the note there for why
-                    -- the dedup is not a `COUNT(DISTINCT …)` here.
-                    COUNT(*) FILTER (
-                        WHERE kind = 'local_snapshot'
-                    )::BIGINT AS local_snapshots,
-                    COUNT(*) FILTER (
-                        WHERE kind = 'active' AND present
-                    )::BIGINT AS terminate_blockers,
-                    COUNT(*) FILTER (
-                        WHERE kind = 'active' AND present AND resident
-                    )::BIGINT AS live_residents,
-                    COUNT(*) FILTER (
-                        WHERE kind = 'active' AND present AND resident AND aged
-                    )::BIGINT AS live_long_runners
-               FROM occupancy_rows
-              WHERE node_id IS NOT NULL
-              GROUP BY node_id
-             )
-             SELECT scope.node_id,
-                    COALESCE(occupancy.active, 0)::BIGINT AS active,
-                    COALESCE(occupancy.local_snapshots, 0)::BIGINT AS local_snapshots,
-                    COALESCE(occupancy.terminate_blockers, 0)::BIGINT AS terminate_blockers,
-                    COALESCE(occupancy.live_residents, 0)::BIGINT AS live_residents,
-                    COALESCE(occupancy.live_long_runners, 0)::BIGINT AS live_long_runners,
-                    COALESCE(blockers.drain_blockers, 0)::BIGINT AS drain_blockers,
-                    scope.heartbeat_fresh
-               FROM scope
-               LEFT JOIN occupancy ON occupancy.node_id = scope.node_id
-               LEFT JOIN blockers ON blockers.node_id = scope.node_id"
-        );
-        let mut statement =
-            sqlx::query_as::<_, OccupancyRow>(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                .bind(node_ids);
-        // Bound only when the threshold is in play, because `$2` appears in the
-        // statement only then — sqlx rejects a bind the SQL never references.
-        if let Some(age) = long_runner_age {
-            statement = statement.bind(long_runner_age_secs(age));
-        }
-        statement.fetch_all(&self.pool).await
+        let rows = pplx_space_sandbox_store::test_support::admin_occupancy::batched_occupancy(
+            &self.pool,
+            node_ids,
+            long_runner_age.map(long_runner_age_secs),
+            residency,
+        )
+        .await?;
+        Ok(rows.into_iter().map(OccupancyRow::from).collect())
     }
 
     /// Best-effort: persists `message` into `nodes.drain_last_error` for the

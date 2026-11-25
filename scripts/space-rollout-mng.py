@@ -1218,8 +1218,8 @@ def pick_terminate_candidates(
     `sandboxes_local_snapshots` disagrees with the guard both ways. It misses
     a `suspending` or non-evacuation `restoring` row pinned to the node, which
     the guard refuses on. And its in-flight arm still uses the legacy freshness
-    gate (`legacy_upload` in `admin/node_store/single_node_occupancy.rs`, and
-    the note in `admin/node_store.rs::batched_occupancy_rows`), so it counts a
+    gate (`legacy_upload` in the node and fleet statements of sandbox-store's
+    `admin_occupancy.rs`, and the note in its `batched_occupancy`), so it counts a
     `creating` row naming a non-current artifact, on a source node that isn't
     the sandbox's target, that the guard doesn't count. Screening on it would
     hold a node with only that row out of the wave on every tick without ever
