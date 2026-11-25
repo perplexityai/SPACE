@@ -8440,9 +8440,10 @@ mod kubernetes_tests {
             let expected = Some(PodIp::parse(expected_ip)?);
 
             assert_eq!(substrate.resolve_pod_ip(sandbox_id).await?, expected);
+            // No worker answers at the node-reported address to confirm it.
             assert_eq!(
                 substrate.resolve_reachable_pod_ip(sandbox_id).await?,
-                expected
+                published_ip.and(expected)
             );
             // A hydration write that observed no published IP keeps the bound one.
             substrate
@@ -8469,10 +8470,7 @@ mod kubernetes_tests {
                         .await?
                 );
             }
-            assert_eq!(
-                substrate.resolve_reachable_pod_ip(sandbox_id).await?,
-                expected
-            );
+            assert_eq!(substrate.resolve_pod_ip(sandbox_id).await?, expected);
             // An older API replica's hydration keeps no node address: the row
             // returns to `created` without it, and the pod resolves only once
             // kubelet publishes, or a readiness wait confirms it again.
@@ -8503,10 +8501,7 @@ mod kubernetes_tests {
                         )
                         .await?
                 );
-                assert_eq!(
-                    substrate.resolve_reachable_pod_ip(sandbox_id).await?,
-                    expected
-                );
+                assert_eq!(substrate.resolve_pod_ip(sandbox_id).await?, expected);
             }
         }
         Ok(())
@@ -8588,12 +8583,10 @@ mod kubernetes_tests {
                 "{served_pod_uid:?}"
             );
             kube_requests.lock().unwrap().clear();
-            if serves {
-                assert_eq!(
-                    substrate.resolve_reachable_pod_ip(sandbox_id).await?,
-                    Some(PodIp::parse("127.0.0.1")?)
-                );
-            }
+            assert_eq!(
+                substrate.resolve_reachable_pod_ip(sandbox_id).await?,
+                serves.then(|| PodIp::parse("127.0.0.1")).transpose()?
+            );
             assert_eq!(*kube_requests.lock().unwrap(), Vec::new());
         }
         Ok(())
@@ -15604,16 +15597,21 @@ mod kubernetes_tests {
     }
 
     /// Before kubelet publishes `status.podIP`, the row's node-reported IP for
-    /// the same pod UID is the fenced pod's runtime only while its node
-    /// affirms the execution there: the retire stops that runtime, and leaves
-    /// a worker now reached at the address, serving another pod, untouched.
+    /// the same pod UID is the fenced pod's runtime while its node reports the
+    /// execution there, with or without the address (a restarted sandbox
+    /// manager): the retire stops that runtime, and leaves a worker now
+    /// reached at the address, serving another pod, untouched.
     #[tokio::test(flavor = "current_thread")]
     async fn fenced_retire_stops_the_runtime_recorded_for_an_unpublished_pod()
     -> Result<(), BoxError> {
         if !crate::test_support::enter_sim_worker_process() {
             return Ok(());
         }
-        for (served_pod_uid, stopped) in [("uid-observed", true), ("uid-other", false)] {
+        for (served_pod_uid, reports_address, stopped) in [
+            ("uid-observed", true, true),
+            ("uid-observed", false, true),
+            ("uid-other", true, false),
+        ] {
             let db = pplx_space_db_test_fixtures::pg_test_db().await?;
             let pool = db.pool.clone();
             let sandbox_id = SandboxId::new();
@@ -15649,6 +15647,9 @@ mod kubernetes_tests {
                 false,
             )
             .with_allocation(1, served_pod_uid, "127.0.0.1");
+            if !reports_address {
+                record.external_address = None;
+            }
             record.status = "running".into();
             sim_worker.state().insert_new(record).await?;
             let captured_deletes = Arc::new(Mutex::new(Vec::new()));
@@ -15687,65 +15688,119 @@ mod kubernetes_tests {
         Ok(())
     }
 
-    /// A node-reported address whose node does not answer is no evidence the
-    /// runtime is gone: the retire fails before the pod delete, keeping the
-    /// execution tracked for retry.
+    /// A node-reported address whose pod proxy does not answer is no evidence
+    /// the runtime is gone. The execution route keeps the execution tracked
+    /// for retry without deleting the pod; the node route confirms and stops
+    /// the runtime through the node's node-api.
     #[tokio::test(flavor = "current_thread")]
-    async fn fenced_retire_waits_for_an_unanswering_node_reported_address() -> Result<(), BoxError>
-    {
-        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
-        let pool = db.pool.clone();
-        let sandbox_id = SandboxId::new();
-        let pod_name = format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple());
-        insert_test_sandbox_row(&pool, sandbox_id, "failed").await?;
-        insert_k8s_execution(
-            &pool,
-            sandbox_id,
-            1,
-            &pod_name,
-            "uid-observed",
-            Some("127.0.0.1"),
-            true,
-        )
-        .await?;
-        let fenced_pod = Pod {
-            metadata: kube::api::ObjectMeta {
-                name: Some(pod_name.clone()),
-                namespace: Some("space".to_string()),
-                uid: Some("uid-observed".to_string()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")?
-            .local_addr()?
-            .port();
-        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
-        let substrate = substrate_with_store_client_proxy_port_and_pod(
-            pool.clone(),
-            delete_capturing_kubernetes_client(
-                Arc::clone(&captured_deletes),
-                Some(fenced_pod.clone()),
-            ),
-            closed_port,
-            Some(fenced_pod),
-        );
-
-        let retired = substrate
-            .retire_execution(RetireExecutionRequest::fenced(
+    async fn fenced_retire_confirms_an_unanswered_node_address_through_its_route()
+    -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process() {
+            return Ok(());
+        }
+        for stop_route in [RetireStopRoute::Execution, RetireStopRoute::Node] {
+            let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+            let pool = db.pool.clone();
+            let sandbox_id = SandboxId::new();
+            let (pod_name, node_name) = (
+                format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple()),
+                "node-a",
+            );
+            insert_test_sandbox_row(&pool, sandbox_id, "failed").await?;
+            insert_k8s_execution(
+                &pool,
                 sandbox_id,
-                PodIdentityFence::new(PodName::parse(&pod_name)?)
-                    .with_pod_uid(PodUid::parse("uid-observed")?),
+                1,
+                &pod_name,
+                "uid-observed",
+                Some("127.0.0.1"),
+                true,
+            )
+            .await?;
+            sqlx::query(sql!(
+                "UPDATE sandbox_k8s_executions SET k8s_node_name = $2 WHERE sandbox_id = $1"
             ))
-            .await;
+            .bind(sandbox_id)
+            .bind(node_name)
+            .execute(&pool)
+            .await?;
+            let fenced_pod = Pod {
+                metadata: kube::api::ObjectMeta {
+                    name: Some(pod_name.clone()),
+                    namespace: Some("space".to_string()),
+                    uid: Some("uid-observed".to_string()),
+                    ..Default::default()
+                },
+                spec: Some(K8sPodSpec {
+                    node_name: Some(node_name.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let sim_worker = start_sim_worker().await?;
+            let mut record = pplx_space_node_api_sim::SandboxRecord::new_creating(
+                sandbox_id.to_string(),
+                "seed".into(),
+                "fc".into(),
+                "test".into(),
+                None,
+                false,
+            )
+            .with_allocation(1, "uid-observed", "127.0.0.1");
+            record.status = "running".into();
+            sim_worker.state().insert_new(record).await?;
+            let mut node_api = node_api_pod_on_node("space-worker-node-a", node_name);
+            node_api.metadata.annotations = Some(BTreeMap::from([(
+                "space.pplx.net/node-api-port".to_string(),
+                sim_worker.port().to_string(),
+            )]));
+            node_api
+                .status
+                .as_mut()
+                .expect("node-api pod has status")
+                .pod_ip = Some("127.0.0.1".to_string());
+            let closed_pod_port = std::net::TcpListener::bind("127.0.0.1:0")?
+                .local_addr()?
+                .port();
+            let captured_deletes = Arc::new(Mutex::new(Vec::new()));
+            let substrate = substrate_with_store_client_proxy_port_and_pods(
+                pool.clone(),
+                delete_capturing_kubernetes_client(
+                    Arc::clone(&captured_deletes),
+                    Some(fenced_pod.clone()),
+                ),
+                closed_pod_port,
+                vec![fenced_pod, node_api],
+            );
 
-        assert!(retired.is_err(), "{retired:?}");
-        assert!(
-            captured_deletes
+            let retired = substrate
+                .retire_execution(RetireExecutionRequest {
+                    sandbox_id,
+                    fence: RetireFence::Pod(
+                        PodIdentityFence::new(PodName::parse(&pod_name)?)
+                            .with_pod_uid(PodUid::parse("uid-observed")?),
+                    ),
+                    stop_route,
+                })
+                .await;
+
+            let status = sim_worker
+                .state()
+                .get(&sandbox_id.to_string())
+                .await?
+                .status;
+            let deletes = captured_deletes
                 .lock()
                 .expect("capture mutex poisoned")
-                .is_empty()
-        );
+                .len();
+            if stop_route == RetireStopRoute::Node {
+                assert!(retired.is_ok(), "{retired:?}");
+                assert_eq!((status.as_str(), deletes), ("stopped", 1));
+            } else {
+                assert!(retired.is_err(), "{retired:?}");
+                assert_eq!((status.as_str(), deletes), ("running", 0));
+            }
+        }
         Ok(())
     }
 

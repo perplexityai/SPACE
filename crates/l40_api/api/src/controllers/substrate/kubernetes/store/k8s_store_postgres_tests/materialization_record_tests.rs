@@ -491,8 +491,8 @@ async fn confirmed_node_addresses_follow_the_recorded_pod() -> TestResult {
     Ok(())
 }
 
-/// A confirmation arriving after a suspend commits leaves the suspended
-/// execution as it is, and its retirement still completes.
+/// A confirmation or pod metadata arriving after a suspend commits leaves the
+/// suspended execution as it is, and its retirement still completes.
 #[tokio::test]
 async fn a_late_confirmation_does_not_undo_a_committed_suspend() -> TestResult {
     let fixture = postgres_store().await?;
@@ -545,6 +545,27 @@ async fn a_late_confirmation_does_not_undo_a_committed_suspend() -> TestResult {
             .record_confirmed_pod_ip(sandbox_id, generation, "suspending-pod", pod_ip)
             .await?
     );
+    fixture
+        .store
+        .persist_pod_metadata(
+            sandbox_id,
+            generation,
+            Some("suspending-pod"),
+            Some("10.0.0.5"),
+            None,
+        )
+        .await?;
+    fixture
+        .store
+        .persist_materialized_pod_metadata(
+            sandbox_id,
+            generation,
+            SandboxLifecycle::Suspending,
+            Some("suspending-pod"),
+            None,
+            None,
+        )
+        .await?;
     assert_eq!(
         execution_state(&fixture.pool, sandbox_id, generation)
             .await?

@@ -733,51 +733,20 @@ impl KubernetesSubstrate {
         target: &PodProxyWaitTarget<'_>,
         deadline: Instant,
     ) -> bool {
-        self.node_answer_at(sandbox_id, pod_ip, source, target, deadline)
+        let timeout = START_WAIT_CONNECT_TIMEOUT.min(remaining_ready_window(deadline));
+        let Some(mut client) =
+            Self::pod_worker_client(pod_ip, self.k8s.sandbox_proxy_port, timeout).await
+        else {
+            return false;
+        };
+        node_sandboxes(&mut client, sandbox_id, timeout)
             .await
-            .unwrap_or(false)
-    }
-
-    /// [`Self::probe_pod_proxy`]'s answer, or `None` when no node answered
-    /// at `pod_ip` before `deadline`.
-    async fn node_answer_at(
-        &self,
-        sandbox_id: SandboxId,
-        pod_ip: PodIp,
-        source: PodIpSource,
-        target: &PodProxyWaitTarget<'_>,
-        deadline: Instant,
-    ) -> Option<bool> {
-        let mut client = Self::pod_worker_client(
-            pod_ip,
-            self.k8s.sandbox_proxy_port,
-            START_WAIT_CONNECT_TIMEOUT.min(remaining_ready_window(deadline)),
-        )
-        .await?;
-        let state = timeout(
-            START_WAIT_CONNECT_TIMEOUT.min(remaining_ready_window(deadline)),
-            client.sandbox_state(pplx_space_sbx_mgr_client::proto::StateRequest {
-                sandbox_ids: vec![sandbox_id.to_string()],
-            }),
-        )
-        .await;
-        match state {
-            Ok(Ok(response)) => Some(serves_target(
-                response.into_inner().sandboxes,
-                sandbox_id,
-                target,
-                pod_ip,
-                source,
-            )),
-            _ => None,
-        }
+            .is_some_and(|sandboxes| serves_target(sandboxes, sandbox_id, target, pod_ip, source))
     }
 
     /// `pod_ip` when it is safe to act on as `target`'s runtime address: a
-    /// kubelet-published address as it is, a node-reported one only once its
-    /// node affirms the execution there (see [`serves_target`]). A node that
-    /// does not answer is an error, so a teardown keeps the execution tracked
-    /// for retry as it does when a published address does not answer.
+    /// kubelet-published address as it is, a node-reported one only once the
+    /// node behind it affirms the execution (see [`Self::runtime_at`]).
     pub(super) async fn verified_runtime_pod_ip(
         &self,
         sandbox_id: SandboxId,
@@ -787,15 +756,40 @@ impl KubernetesSubstrate {
         if source == PodIpSource::Published {
             return Ok(Some(pod_ip));
         }
-        let deadline = Instant::now() + START_WAIT_CONNECT_TIMEOUT;
-        match self
-            .node_answer_at(sandbox_id, pod_ip, source, target, deadline)
+        let mut client = Self::pod_worker_client(
+            pod_ip,
+            self.k8s.sandbox_proxy_port,
+            START_WAIT_CONNECT_TIMEOUT,
+        )
+        .await
+        .ok_or_else(|| SubstrateError::Failed {
+            message: format!(
+                "no node answered at the node-reported address {pod_ip} of sandbox {sandbox_id}"
+            ),
+        })?;
+        Self::runtime_at(&mut client, sandbox_id, pod_ip, target).await
+    }
+
+    /// `pod_ip` when the worker behind `client` reports `target`'s execution,
+    /// `None` when it reports the sandbox elsewhere or not at all (see
+    /// [`runtime_answer`]). A worker that does not answer, or does not report
+    /// enough to tell, is an error, so a teardown keeps the execution tracked
+    /// for retry.
+    pub(super) async fn runtime_at(
+        client: &mut crate::controllers::substrate::RuntimeClient,
+        sandbox_id: SandboxId,
+        pod_ip: PodIp,
+        target: &PodProxyWaitTarget<'_>,
+    ) -> Result<Option<PodIp>, SubstrateError> {
+        let answer = node_sandboxes(client, sandbox_id, START_WAIT_CONNECT_TIMEOUT)
             .await
-        {
-            Some(serves) => Ok(serves.then_some(pod_ip)),
-            None => Err(SubstrateError::Failed {
+            .map(|sandboxes| runtime_answer(sandboxes, sandbox_id, target, pod_ip));
+        match answer {
+            Some(RuntimeAnswer::Serves) => Ok(Some(pod_ip)),
+            Some(RuntimeAnswer::Elsewhere) => Ok(None),
+            Some(RuntimeAnswer::Unconfirmed) | None => Err(SubstrateError::Failed {
                 message: format!(
-                    "no node answered at the node-reported address {pod_ip} of sandbox {sandbox_id}"
+                    "the worker at {pod_ip} did not confirm sandbox {sandbox_id}'s runtime"
                 ),
             }),
         }
@@ -1434,6 +1428,77 @@ fn serves_target(
     })
 }
 
+/// `sandbox_id`'s entries as the worker behind `client` reports them, or
+/// `None` when it does not answer within `wait`.
+async fn node_sandboxes(
+    client: &mut crate::controllers::substrate::RuntimeClient,
+    sandbox_id: SandboxId,
+    wait: Duration,
+) -> Option<Vec<pplx_space_sbx_mgr_client::proto::SandboxInfo>> {
+    let state = timeout(
+        wait,
+        client.sandbox_state(pplx_space_sbx_mgr_client::proto::StateRequest {
+            sandbox_ids: vec![sandbox_id.to_string()],
+        }),
+    )
+    .await;
+    match state {
+        Ok(Ok(response)) => Some(response.into_inner().sandboxes),
+        _ => None,
+    }
+}
+
+/// What a worker's report says about `target`'s runtime there.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum RuntimeAnswer {
+    /// The worker reports the target's generation and Pod UID, and `pod_ip`
+    /// whenever it reports an address.
+    Serves,
+    /// The worker does not report the sandbox, or reports a different
+    /// generation, Pod UID or address.
+    Elsewhere,
+    /// The worker reports the sandbox without its generation or Pod UID (an
+    /// older node, or a sandbox manager that has restarted).
+    Unconfirmed,
+}
+
+/// [`RuntimeAnswer`] for `sandboxes`. Unlike readiness ([`serves_target`]),
+/// acting on a runtime that is there does not need its address reported: the
+/// identity fields name the execution.
+pub(super) fn runtime_answer(
+    sandboxes: Vec<pplx_space_sbx_mgr_client::proto::SandboxInfo>,
+    sandbox_id: SandboxId,
+    target: &PodProxyWaitTarget<'_>,
+    pod_ip: PodIp,
+) -> RuntimeAnswer {
+    let sandbox_id = sandbox_id.to_string();
+    let Some(info) = sandboxes.iter().find(|info| info.sandbox_id == sandbox_id) else {
+        return RuntimeAnswer::Elsewhere;
+    };
+    let differs = info
+        .execution_generation
+        .is_some_and(|generation| generation != target.generation)
+        || info
+            .pod_uid
+            .as_deref()
+            .zip(target.pod_uid)
+            .is_some_and(|(reported, expected)| reported != expected)
+        || info
+            .external_address
+            .as_deref()
+            .is_some_and(|reported| PodIp::parse(reported).ok() != Some(pod_ip));
+    if differs {
+        RuntimeAnswer::Elsewhere
+    } else if info.execution_generation.is_some()
+        && info.pod_uid.is_some()
+        && target.pod_uid.is_some()
+    {
+        RuntimeAnswer::Serves
+    } else {
+        RuntimeAnswer::Unconfirmed
+    }
+}
+
 impl PodProxyWaitTarget<'_> {
     /// Whether `pod` is the pod this wait binds: with a target UID, only the
     /// pod that has it.
@@ -1533,5 +1598,42 @@ mod node_reported_address_tests {
             ));
             assert_eq!(serves(degraded.clone()), source == PodIpSource::Published);
         }
+    }
+
+    /// A teardown acts on a runtime its worker names by identity, skips it
+    /// only on a contrary answer, and does not read missing fields as either.
+    #[test]
+    fn a_runtime_answer_skips_only_a_worker_that_reports_another_runtime() {
+        let sandbox_id = SandboxId::new();
+        let probed = PodIp::parse("10.0.0.3").unwrap();
+        let target = PodProxyWaitTarget {
+            pod_name: "pod",
+            pod_uid: Some("pod-a"),
+            generation: 1,
+        };
+        let answer = |info: SandboxInfo| runtime_answer(vec![info], sandbox_id, &target, probed);
+        assert_eq!(
+            answer(info(sandbox_id, 1, "pod-a", "10.0.0.3")),
+            RuntimeAnswer::Serves
+        );
+        // A restarted sandbox manager no longer reports the address.
+        let restarted = SandboxInfo {
+            external_address: None,
+            ..info(sandbox_id, 1, "pod-a", "10.0.0.3")
+        };
+        assert_eq!(answer(restarted), RuntimeAnswer::Serves);
+        for elsewhere in [
+            info(sandbox_id, 1, "pod-b", "10.0.0.3"),
+            info(sandbox_id, 2, "pod-a", "10.0.0.3"),
+            info(sandbox_id, 1, "pod-a", "10.0.0.4"),
+            info(SandboxId::new(), 1, "pod-a", "10.0.0.3"),
+        ] {
+            assert_eq!(answer(elsewhere), RuntimeAnswer::Elsewhere);
+        }
+        let degraded = SandboxInfo {
+            sandbox_id: sandbox_id.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(answer(degraded), RuntimeAnswer::Unconfirmed);
     }
 }

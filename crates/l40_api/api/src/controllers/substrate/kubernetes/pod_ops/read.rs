@@ -289,15 +289,30 @@ impl KubernetesSubstrate {
         {
             return Ok(None);
         }
-        let pod_ip = current_pod_ip(&pod, row.pod_uid.as_ref(), row.pod_ip.as_deref())?;
+        let address =
+            current_pod_ip_with_source(&pod, row.pod_uid.as_ref(), row.pod_ip.as_deref())?;
         // Let the owned path publish changed routing evidence before returning
         // a client; otherwise ingress would repeatedly resolve stale metadata.
-        if row.pod_ip != pod_ip.map(|ip| ip.to_string())
+        if row.pod_ip != address.map(|(ip, _)| ip.to_string())
             || row.k8s_node_name.as_deref() != assigned_pod_node_name(&pod)
         {
             return Ok(None);
         }
-        Ok(pod_ip)
+        let Some(address) = address else {
+            return Ok(None);
+        };
+        // An address kubelet has not published is reachable only while the
+        // worker behind it reports this execution.
+        let target = PodProxyWaitTarget {
+            pod_name: row.pod_name.as_str(),
+            pod_uid: row.pod_uid.as_ref().map(PodUid::as_str),
+            generation: row.generation,
+        };
+        Ok(self
+            .verified_runtime_pod_ip(sandbox_id, address, &target)
+            .await
+            .ok()
+            .flatten())
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn resolve_pod_ip(

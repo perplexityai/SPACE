@@ -126,10 +126,17 @@ pub(super) struct FencedTeardown {
     /// cleanup is most needed.
     identity: ExecutionIdentity,
     /// The address the in-VM stop may use, derived from the pod the fence
-    /// verified rather than from whatever is active at stop time. `None` means
-    /// there is no runtime to stop and the teardown goes straight to the pod
-    /// delete.
-    runtime_pod_ip: Option<PodIp>,
+    /// verified rather than from whatever is active at stop time, with where it
+    /// comes from. A node-reported one is confirmed through the teardown's
+    /// worker before use (see [`KubernetesSubstrate::confirmed_fenced_runtime`]).
+    /// `None` means there is no runtime to stop and the teardown goes straight
+    /// to the pod delete.
+    runtime_address: Option<(PodIp, PodIpSource)>,
+    /// The pod name, UID and generation of the execution the fence matched,
+    /// which a node-reported address is confirmed against.
+    pod_name: String,
+    pod_uid: Option<PodUid>,
+    generation: i64,
     /// The node the execution row places it on, which
     /// [`RetireStopRoute::Node`] stops through.
     node_name: Option<String>,
@@ -347,33 +354,55 @@ impl KubernetesSubstrate {
                 ObservedPod::Absent | ObservedPod::Unobserved => None,
             },
             identity: current_execution_identity(&active, live_pod.as_deref()),
-            runtime_pod_ip: self
-                .fenced_runtime_address(sandbox_id, &active, live_pod.as_deref())
-                .await?,
+            runtime_address: fenced_runtime_pod_ip(&active, live_pod.as_deref()),
+            pod_name: active.pod_name.as_str().to_owned(),
+            pod_uid: active.pod_uid.clone(),
+            generation: active.generation,
             node_name: active.k8s_node_name,
         })))
     }
 
-    /// The address the fenced teardown stops and deletes the runtime at. A
-    /// node-reported address is used only while its node still affirms the
-    /// active execution there; when its node answers otherwise, the teardown
-    /// proceeds to the pod delete without talking to a VM.
-    async fn fenced_runtime_address(
+    /// The address the fenced teardown stops and deletes the runtime at: a
+    /// published one as it is, a node-reported one only once the worker the
+    /// teardown will use confirms the execution there (see
+    /// [`Self::runtime_at`]). That is the node's node-api on the node route,
+    /// and on the execution route the address itself, or the node's node-api
+    /// when a delete cannot reach it.
+    async fn confirmed_fenced_runtime(
         &self,
         sandbox_id: SandboxId,
-        active: &ActiveExecutionStatusRow,
-        live_pod: Option<&SandboxPodView>,
+        fenced: &FencedTeardown,
+        mode: ExecutionTeardown,
+        stop_route: RetireStopRoute,
     ) -> Result<Option<PodIp>, SubstrateError> {
-        let Some(address) = fenced_runtime_pod_ip(active, live_pod) else {
+        let Some((pod_ip, source)) = fenced.runtime_address else {
             return Ok(None);
         };
+        if source == PodIpSource::Published {
+            return Ok(Some(pod_ip));
+        }
+        let node_name = fenced.node_name.as_deref();
+        let mut worker = self.teardown_worker(pod_ip, stop_route, node_name).await;
+        if worker.is_err()
+            && mode.sends_sandbox_delete()
+            && stop_route == RetireStopRoute::Execution
+        {
+            worker = self
+                .teardown_worker(pod_ip, RetireStopRoute::Node, node_name)
+                .await;
+        }
+        let (_, mut client) = worker.map_err(|cause| SubstrateError::Failed {
+            message: format!(
+                "{cause} confirming the node-reported address {pod_ip} of sandbox {sandbox_id}; \
+                 keeping execution tracked for retry"
+            ),
+        })?;
         let target = PodProxyWaitTarget {
-            pod_name: &active.pod_name,
-            pod_uid: active.pod_uid.as_ref().map(PodUid::as_str),
-            generation: active.generation,
+            pod_name: &fenced.pod_name,
+            pod_uid: fenced.pod_uid.as_ref().map(PodUid::as_str),
+            generation: fenced.generation,
         };
-        self.verified_runtime_pod_ip(sandbox_id, address, &target)
-            .await
+        Self::runtime_at(&mut client, sandbox_id, pod_ip, &target).await
     }
 
     /// The pod object the fence decision is made against.
@@ -520,7 +549,10 @@ impl KubernetesSubstrate {
         // runtime" and fall through to the pod-delete loop instead of
         // short-circuiting. Genuine infra faults still propagate.
         let pod_ip = match &fenced {
-            Some(fenced) => fenced.runtime_pod_ip,
+            Some(fenced) => {
+                self.confirmed_fenced_runtime(sandbox_id, fenced, mode, stop_route)
+                    .await?
+            }
             None => match self.resolve_runtime_pod_ip(sandbox_uuid).await {
                 Ok(pod_ip) => pod_ip,
                 Err(err) if delete_can_skip_runtime_cleanup(&err) => {
