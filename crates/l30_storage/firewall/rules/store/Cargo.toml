@@ -26,12 +26,14 @@ test-support = ["dep:tokio"]
 
 [dependencies]
 jiff = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 sqlx = { workspace = true, features = ["derive", "postgres", "runtime-tokio", "time", "tls-rustls-aws-lc-rs", "uuid"] }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["time"], optional = true }
 tracing = { workspace = true }
-uuid = { workspace = true, features = ["v7"] }
+uuid = { workspace = true, features = ["serde", "v7"] }
 
 # internal
 pplx-space-accounts = { workspace = true, features = ["sqlx"] }

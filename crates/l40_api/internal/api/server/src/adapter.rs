@@ -1637,6 +1637,13 @@ impl ClusterApi for ClusterApiService {
     ) -> Result<Response<crate::proto::FetchFirewallRulesResponse>, Status> {
         ClusterApiService::fetch_firewall_rules(self, request).await
     }
+
+    async fn report_firewall_rules(
+        &self,
+        request: Request<crate::proto::ReportFirewallRulesRequest>,
+    ) -> Result<Response<crate::proto::ReportFirewallRulesResponse>, Status> {
+        ClusterApiService::report_firewall_rules(self, request).await
+    }
 }
 
 /// The node cache partition a release's stored binding puts its build in:

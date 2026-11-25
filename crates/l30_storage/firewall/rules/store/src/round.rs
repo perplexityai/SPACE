@@ -5,10 +5,11 @@
 //! Locks, in order: the rollout row (shared, so a pause or abort waits), the
 //! lease handoff lock (shared), the item row, the node's assignment row
 //! (shared), its observation row, and the wakeup's rows; a writer that takes
-//! any of them takes them in this order. The first three are issuance's.
-//! Rounds are numbered one past the node's larger pending or accepted round,
-//! so none is reused while only acceptance or a larger round replaces a
-//! pending one.
+//! any of them takes them in this order, as
+//! [`accept_report`](crate::accept_report) does with the assignment and
+//! observation rows. The first three are issuance's. Rounds are numbered one
+//! past the node's larger pending or accepted round, so none is reused while
+//! only acceptance or a larger round replaces a pending one.
 //!
 //! `open_round` is not the authority for the node-manager epoch: it stamps
 //! whatever epoch its first caller passes, and a later mismatch is refused with
@@ -23,7 +24,7 @@ use time::OffsetDateTime;
 use crate::fetch::{PendingRound, non_negative, pending_round};
 use crate::issue::wake_one;
 use crate::leased_item::{HeaderLock, lock_leased_item};
-use crate::{LeasedTarget, Wakeup, Work, roll_back};
+use crate::{LeasedTarget, REPORT_MAX_AGE, Wakeup, Work, roll_back};
 
 /// What [`open_round`] did. A round is returned as Fetch reads it: bound to
 /// the generation the target's item issued, which an answer must be about,
@@ -32,7 +33,8 @@ use crate::{LeasedTarget, Wakeup, Work, roll_back};
 pub enum Opening {
     /// This call opened the round and queued the wakeup, and committed.
     Opened(PendingRound),
-    /// The round was already open for this generation; nothing changed.
+    /// The round was already open for this generation and wasn't expired at
+    /// the opener's clock reading; nothing changed.
     AlreadyOpen(PendingRound),
     /// Nothing changed.
     Refused(OpenRefusal),
@@ -71,8 +73,10 @@ pub enum OpenRefusal {
 /// the generation and revision it issued. `manager_epoch` must match the
 /// node's observations, if it has any. A round already open for that
 /// generation is returned as it is, without rechecking the lease after the
-/// observation lock, since it changes nothing. One for a later generation is
-/// refused; any other pending round is replaced by a new one. The lease is
+/// observation lock, since it changes nothing, unless it was issued
+/// [`REPORT_MAX_AGE`] or longer ago by the database clock and so can no longer
+/// be answered. One for a later generation is refused; any other pending
+/// round, an expired one included, is replaced by a new one. The lease is
 /// rechecked at the clock reading that times the round, after the wakeup,
 /// which can wait on a lock.
 pub async fn open_round(
@@ -149,22 +153,28 @@ async fn open(
     .bind(manager_epoch)
     .execute(&mut **tx)
     .await?;
-    let (epoch, round, round_issued_at, bound) =
-        sqlx::query_as::<_, (i64, Option<i64>, Option<OffsetDateTime>, Option<i64>)>(sql!(
+    // Expired as acceptance judges it: on the clock, from the original issue.
+    let (epoch, round, round_issued_at, bound, expired) =
+        sqlx::query_as::<_, (i64, Option<i64>, Option<OffsetDateTime>, Option<i64>, bool)>(sql!(
             "SELECT manager_epoch, pending_round, pending_round_issued_at,
-                    pending_assignment_generation
+                    pending_assignment_generation,
+                    coalesce(clock_timestamp()
+                             >= pending_round_issued_at + make_interval(secs => $2), false)
              FROM firewall_rules_node_observations
              WHERE node_id = $1
              FOR UPDATE"
         ))
         .bind(target.node_id)
+        .bind(REPORT_MAX_AGE.as_secs_f64())
         .fetch_one(&mut **tx)
         .await?;
     if epoch != manager_epoch {
         return Ok(Opening::Refused(OpenRefusal::EpochMismatch));
     }
     match (round, round_issued_at, bound.map(non_negative).transpose()?) {
-        (Some(round), Some(issued_at), Some(bound)) if bound == assignment_generation => {
+        (Some(round), Some(issued_at), Some(bound))
+            if bound == assignment_generation && !expired =>
+        {
             return Ok(Opening::AlreadyOpen(pending_round(
                 round,
                 issued_at,
@@ -174,8 +184,9 @@ async fn open(
         (_, _, Some(bound)) if bound > assignment_generation => {
             return Ok(Opening::Refused(OpenRefusal::LaterGeneration));
         }
-        // Replaced: no round, one for an earlier generation, or an unbound
-        // one, left from before rounds named their generation.
+        // Replaced: no round, an expired one for this generation, one for an
+        // earlier generation, or an unbound one, left from before rounds
+        // named their generation.
         _ => {}
     }
     wake_one(tx, wakeup, target.node_id).await?;

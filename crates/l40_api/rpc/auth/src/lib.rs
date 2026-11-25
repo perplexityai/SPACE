@@ -228,6 +228,18 @@ impl NodeApiAuthConfig {
         self
     }
 
+    /// Grant `service_account` the firewall-rules report authority that
+    /// production grants no one; panics without Kubernetes auth.
+    #[cfg(all(feature = "k8s", any(test, feature = "test-support")))]
+    #[must_use]
+    pub fn grant_firewall_rules_report_for_test(mut self, service_account: &str) -> Self {
+        self.k8s
+            .as_mut()
+            .expect("firewall-rules report grant needs Kubernetes auth")
+            .grant_firewall_rules_report(service_account);
+        self
+    }
+
     fn from_environment_impl(
         env: &dyn pplx_space_env_vars::Environment,
         role: NodeRole,
@@ -314,6 +326,7 @@ pub struct NodeApiAuthenticatedCaller {
     template_release_read_authority: TemplateReleaseReadAuthority,
     template_transfer_authority: template_transfer::TemplateTransferAuthority,
     firewall_rules_fetch_authority: FirewallRulesFetchAuthority,
+    firewall_rules_report_authority: FirewallRulesReportAuthority,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -383,6 +396,16 @@ pub enum FirewallRulesFetchAuthority {
     Granted,
 }
 
+/// Whether the caller may record its node's firewall observation as node-ctl
+/// (`ReportFirewallRules`). Separate from fetching: reading instructions never
+/// permits writing evidence. No production caller is granted it; tests grant
+/// it to a named service account.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirewallRulesReportAuthority {
+    Denied,
+    Granted,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum KubernetesAuthenticationMode {
     Disabled,
@@ -435,6 +458,7 @@ impl NodeApiAuthenticatedCaller {
                 }
             },
             firewall_rules_fetch_authority: FirewallRulesFetchAuthority::Denied,
+            firewall_rules_report_authority: FirewallRulesReportAuthority::Denied,
         }
     }
 
@@ -452,6 +476,7 @@ impl NodeApiAuthenticatedCaller {
             template_release_read_authority: TemplateReleaseReadAuthority::NodeScoped,
             template_transfer_authority: template_transfer::TemplateTransferAuthority::Denied,
             firewall_rules_fetch_authority: FirewallRulesFetchAuthority::Denied,
+            firewall_rules_report_authority: FirewallRulesReportAuthority::Denied,
         }
     }
 
@@ -467,6 +492,7 @@ impl NodeApiAuthenticatedCaller {
             template_release_read_authority: TemplateReleaseReadAuthority::NodeScoped,
             template_transfer_authority: template_transfer::TemplateTransferAuthority::Denied,
             firewall_rules_fetch_authority: FirewallRulesFetchAuthority::Denied,
+            firewall_rules_report_authority: FirewallRulesReportAuthority::Denied,
         }
     }
 
@@ -481,6 +507,7 @@ impl NodeApiAuthenticatedCaller {
             template_release_read_authority: TemplateReleaseReadAuthority::NodeScoped,
             template_transfer_authority: template_transfer::TemplateTransferAuthority::Denied,
             firewall_rules_fetch_authority: FirewallRulesFetchAuthority::Denied,
+            firewall_rules_report_authority: FirewallRulesReportAuthority::Denied,
         }
     }
 
@@ -512,6 +539,10 @@ impl NodeApiAuthenticatedCaller {
 
     pub const fn firewall_rules_fetch_authority(&self) -> FirewallRulesFetchAuthority {
         self.firewall_rules_fetch_authority
+    }
+
+    pub const fn firewall_rules_report_authority(&self) -> FirewallRulesReportAuthority {
+        self.firewall_rules_report_authority
     }
 }
 

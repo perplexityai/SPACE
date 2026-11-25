@@ -37,6 +37,7 @@ fn test_k8s_config() -> K8sTokenAuthConfig {
             "system:serviceaccount:space:space-cluster-controller".to_string(),
         ]),
         firewall_rules_fetch_usernames: BTreeSet::new(),
+        firewall_rules_report_usernames: BTreeSet::new(),
         cache_ttl: Duration::from_secs(30),
         negative_cache_ttl: Duration::from_secs(2),
         cache_max_entries: 2,

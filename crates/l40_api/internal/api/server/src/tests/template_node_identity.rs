@@ -57,7 +57,7 @@ async fn pod_template_reads_follow_reviewed_node_identity() -> TestResult {
     let reviewed_tokens = tokens.clone();
     let reviews = Arc::new(AtomicUsize::new(0));
     let review_count = reviews.clone();
-    let mut harness = serve_reviewed(fixture.service, "workers", None, move |spec| {
+    let mut harness = serve_reviewed(fixture.service, "workers", None, None, move |spec| {
         review_count.fetch_add(1, Ordering::SeqCst);
         let index = reviewed_tokens
             .iter()

@@ -354,7 +354,8 @@ pub struct ClusterApiService {
     /// its execution as `replaced`. Off unless `from_env_with_security_state`
     /// reads it on, for the same reason.
     abandoned_restore_retirement: pplx_space_sandbox_model::AbandonedRestoreRetirement,
-    /// Which workers `FetchFirewallRules` serves: none outside tests.
+    /// Which workers `FetchFirewallRules` and `ReportFirewallRules` serve:
+    /// none outside tests.
     firewall_enrollment: firewall_rules::Enrollment,
 }
 
