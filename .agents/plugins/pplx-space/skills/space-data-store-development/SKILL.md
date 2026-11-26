@@ -23,13 +23,45 @@ Exemplar: `crates/l30_storage/sandbox/store` (`pplx-space-sandbox-store`, the
   and limits is the default. No query builder and no `SELECT`-shaped
   arguments — callers pick an API, never pass columns, predicates, or sort
   orders.
-- Executor-generic free functions (`impl PgExecutor`) so an operation composes
-  into the caller's open transaction. A pool-owning store forces callers to
-  choose between committing early and bypassing the store.
-- `sql!` locators on every statement; small operation-specific `thiserror`
-  enums. A guarded write that matches zero rows is an outcome
-  (`Option`/`bool`), not an error — "another writer won" is a normal race
-  result.
+- Free functions on `pplx-space-postgres-pool`'s handles so an operation
+  composes into the caller's open transaction. A pool-owning store forces
+  callers to choose between committing early and bypassing the store. A verb
+  that runs one statement on whatever the caller passes, the pool or its
+  transaction, takes `impl Executor<'_>` and runs it on
+  `executor.into_sqlx()`, which consumes the executor. A verb that runs
+  several statements takes `impl Executor<'_> + Copy`, which only a pool
+  satisfies, when each statement may run on whichever connection the pool
+  hands out, as `pplx-space-firewall-rules-store`'s `read_adopted` does.
+  When its statements must run in the caller's transaction, for example to
+  read one snapshot of a `db.begin_snapshot()` transaction or to see the
+  caller's uncommitted writes, it takes the caller's transaction in the form
+  the next item gives and runs each statement on `(&mut *tx).into_sqlx()`, as
+  that store's `fetch_instructions` does.
+- A verb whose lock the caller relies on after the statement, that runs under
+  a lock the caller took, or that must commit together with another of the
+  caller's statements takes the caller's transaction: `tx: &mut C` where
+  `for<'a> &'a mut C: Executor<'a>`, which accepts a `Tx` or a
+  `PgConnection` and refuses a pool. The bound cannot prove a transaction is
+  open, so the verb's doc says the caller must pass its open transaction. Take
+  `&mut Tx` instead where every caller already holds one. A verb that opens
+  its own transaction takes `&Db` and calls `db.begin()` (or
+  `db.begin_snapshot()`).
+- No sqlx type in a store's public signatures, public fields or public type
+  aliases; sqlx stays the store's own dependency. A Storage crate depends on
+  `pplx-space-postgres-pool` without a `[rules.layers.store_users]` entry
+  (archcheck's `[rules.layers] storage_handles`). A JSON column or argument
+  crosses the API as its Rust type (the typed document or
+  `serde_json::Value`): the store decodes it through `sqlx::types::Json` in a
+  private row struct, and wraps an argument in `Json(..)` where it binds it.
+- `sql!` locators on every statement. Verbs return `DbError`, or a small
+  operation-specific `thiserror` enum with a variant that wraps `DbError`
+  (usually `#[from] DbError`); callers classify a failure with
+  `DbError::kind()`, `constraint()` and `is_lock_contention()`, never by
+  matching the driver's error. A failure a caller must tell apart that
+  `kind()` reports as `Other`, such as an I/O, decode or closed-pool error,
+  first gets its own `DbErrorKind` in `pplx-space-postgres-pool`. A guarded
+  write that matches zero rows is an outcome (`Option`/`bool`), not an error
+  — "another writer won" is a normal race result.
 - Verbs and record columns are added with their first migrated caller, never
   speculatively, and `SELECT` lists stay explicit.
 - Keep every SQL statement syntactically whole and reviewable at its query
@@ -165,11 +197,11 @@ move must keep.
   still move as a store verb, under these conditions:
   - the statement moves verbatim, lock clause included (`OF …`, `NOWAIT`,
     `SKIP LOCKED`), along with any setting written in the same statement;
-  - the verb takes the caller's open transaction: `&mut Tx` from
-    `pplx-space-postgres-pool`, `&mut sqlx::Transaction<'_, Postgres>`, or
-    `&mut sqlx::PgConnection` when every caller passes its open transaction
-    (`&mut *tx`). It never takes `impl PgExecutor` or postgres-pool's
-    `impl Executor`, which also accept a pool;
+  - the verb takes the caller's open transaction, as `tx: &mut C` where
+    `for<'a> &'a mut C: Executor<'a>`, or `&mut Tx` where every caller
+    already holds one, and its doc says the caller must pass its open
+    transaction. It never takes `impl Executor<'_>`, which also accepts a
+    pool;
   - its name says it locks (`lock_…`, `share_lock_…`, `…_locked`), and its
     doc says the lock lasts until the caller's transaction ends, as
     `pplx-space-runtime-environment-policy-store`'s `lock_generation` and
@@ -181,8 +213,8 @@ move must keep.
   with the caller that owns the transaction. A lock that serves only its own
   statement, such as a `FOR UPDATE` CTE or subquery that feeds the same
   statement's `UPDATE` or `DELETE`, needs no caller transaction, and its
-  verb may be executor-generic, as `pplx-space-sandbox-store`'s
-  `ingest::mark_published_failed` is. A session-level advisory lock
+  verb may take `impl Executor<'_>`, as `pplx-space-sandbox-store`'s
+  `restore_lease::claim_user_restore` does. A session-level advisory lock
   (`pg_advisory_lock`) outlives the transaction; leave it with the code that
   unlocks it.
 - **Database-clock predicates.** A `NOW()`-relative freshness check decides
@@ -214,12 +246,14 @@ reaches Postgres through `pplx-space-postgres-pool` alone: it takes the
 caller's open transaction as `&mut pplx_space_postgres_pool::Tx`, or opens
 its own with `Db::begin` and ends it with `Tx::commit`. It passes the
 transaction to each store verb (`&mut tx` for one it opened, `&mut *tx` for
-one it was given), which takes `impl Executor<'_>`, except a verb whose lock
-the caller relies on after the statement: that one takes the open transaction
-(see "Locks the caller relies on after the statement" above). So neither the
-coordinator nor its callers name a driver type. While its caller still opens
-the transaction with the driver and passes `&mut *tx`, the verb takes any
-`&mut C` where `&mut C: Executor`, documents that the caller must pass an open
+one it was given). A verb that runs under a lock an earlier step took, that
+must commit together with the other steps, or whose lock the caller relies on
+after the statement takes the caller's transaction (see the store shape and
+"Locks the caller relies on after the statement" above); any other takes
+`impl Executor<'_>`. So neither the coordinator nor its callers name a driver
+type. While its caller still opens the transaction with the driver and passes
+`&mut *tx`, the verb takes any `&mut C` where
+`for<'a> &'a mut C: Executor<'a>`, documents that the caller must pass an open
 transaction, and narrows to `Tx` once the caller moves. The caller decides what
 to write and when, passes that in, and gets each guarded
 verb's outcome back to act on. Make one only when one of
