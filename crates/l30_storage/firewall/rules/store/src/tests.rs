@@ -5,6 +5,7 @@ use pplx_space_db_test_fixtures::{
     TestDb, insert_ready_worker_node, try_pg_test_db, try_pg_test_db_with_max_connections,
 };
 use pplx_space_node_status_store::test_support::{SnapshotSeed, upsert_snapshot};
+use pplx_space_postgres_pool::{Db, DbError, Executor};
 use pplx_space_rollout_queue::LEASE_EXPIRED;
 use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
@@ -142,7 +143,7 @@ async fn row(pool: &PgPool, rollout: RolloutId, node: NodeId) -> TestResult<Stri
 /// Two claims of `rollout` that both reach the header lock before either
 /// takes it, all they lease together.
 async fn race(db: &TestDb, rollout: RolloutId, active_limit: u64) -> TestResult<Vec<LeasedTarget>> {
-    let holder = hold_header(&db.pool, rollout).await?;
+    let holder = hold_header(&Db::from(db.pool.clone()), rollout).await?;
     let claims: Vec<_> = (0..2)
         .map(|_| {
             let pool = db.pool.clone();

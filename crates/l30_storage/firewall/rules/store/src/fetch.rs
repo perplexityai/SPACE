@@ -6,8 +6,8 @@
 use jiff::Timestamp;
 use pplx_space_accounts::NodeId;
 use pplx_space_firewall_rules_model::FirewallRuleRevision;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::PgConnection;
 use time::OffsetDateTime;
 
 use crate::RevisionId;
@@ -41,11 +41,16 @@ pub struct PendingRound {
     pub assignment_generation: Option<u64>,
 }
 
-/// Read `node`'s assignment and pending round.
-pub async fn fetch_instructions(
-    conn: &mut PgConnection,
+/// Read `node`'s assignment and pending round. It takes a `Tx` or a
+/// connection and refuses the pool, so both statements run on one
+/// connection; it can't tell whether that connection has a transaction open.
+pub async fn fetch_instructions<C>(
+    conn: &mut C,
     node: NodeId,
-) -> Result<NodeInstructions, StoredStateError> {
+) -> Result<NodeInstructions, StoredStateError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     // Anchored on the node, so a round without an assignment still returns.
     let (generation, revision_id, round, issued_at, round_generation) = sqlx::query_as::<
         _,
@@ -67,23 +72,30 @@ pub async fn fetch_instructions(
          LEFT JOIN firewall_rules_node_observations o ON o.node_id = n.node_id"
     ))
     .bind(node)
-    .fetch_one(&mut *conn)
-    .await?;
+    .fetch_one((&mut *conn).into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     let assignment = match (generation, revision_id) {
         (Some(generation), Some(id)) => Some(Assignment {
-            generation: non_negative(generation)?,
+            generation: non_negative(generation).map_err(DbError::from)?,
             revision_id: id,
-            revision: read_revision(&mut *conn, id).await?,
+            revision: read_revision((&mut *conn).into_sqlx(), id).await?,
         }),
         _ => None,
     };
     // The schema sets the round and its issue time together.
     let pending_round = match (round, issued_at) {
-        (Some(round), Some(issued_at)) => Some(pending_round(
-            round,
-            issued_at,
-            round_generation.map(non_negative).transpose()?,
-        )?),
+        (Some(round), Some(issued_at)) => Some(
+            pending_round(
+                round,
+                issued_at,
+                round_generation
+                    .map(non_negative)
+                    .transpose()
+                    .map_err(DbError::from)?,
+            )
+            .map_err(DbError::from)?,
+        ),
         _ => None,
     };
     Ok(NodeInstructions {

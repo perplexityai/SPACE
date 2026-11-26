@@ -15,7 +15,9 @@ async fn issue_canary(
     mut queue: Queue,
 ) -> Result<Issuance, sqlx::Error> {
     let mut conn = pool.acquire().await?;
-    issue_canary_and_release(&mut conn, target, FIRST_CHECK_IN, &mut queue).await
+    issue_canary_and_release(&mut conn, target, FIRST_CHECK_IN, &mut queue)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 /// `node`'s item's phase, lease token, lease expiry and attempts.
@@ -63,11 +65,11 @@ async fn only_a_canary_is_claimed_and_issued() -> TestResult {
 
     let rollout = rollout(&db.pool, "canary").await?;
     save_targets(&db.pool, rollout, &nodes).await?;
-    let mut rolling = hold_header(&db.pool, rollout).await?;
+    let mut rolling = hold_header(&Db::from(db.pool.clone()), rollout).await?;
     let pool = db.pool.clone();
     let claiming = tokio::spawn(async move { claim(&pool).await });
     wait_for_lock_waiters(&db.pool, 1).await?;
-    set_phase(&mut *rolling, rollout, "rolling").await?;
+    set_phase(&mut rolling, rollout, "rolling").await?;
     rolling.commit().await?;
     let raced = tokio::time::timeout(Duration::from_secs(10), claiming).await;
     assert_eq!(raced???, None);
@@ -118,11 +120,11 @@ async fn only_an_unissued_lapsed_claim_is_taken_back() -> TestResult {
         .await
     };
     let lapsed = row().await?;
-    let mut pausing = hold_header(&db.pool, rollout).await?;
+    let mut pausing = hold_header(&Db::from(db.pool.clone()), rollout).await?;
     let pool = db.pool.clone();
     let claiming = tokio::spawn(async move { claim(&pool).await });
     wait_for_lock_waiters(&db.pool, 1).await?;
-    set_phase(&mut *pausing, rollout, "paused").await?;
+    set_phase(&mut pausing, rollout, "paused").await?;
     pausing.commit().await?;
     let raced = tokio::time::timeout(Duration::from_secs(10), claiming).await;
     assert_eq!(raced???, None);

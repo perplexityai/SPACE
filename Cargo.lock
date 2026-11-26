@@ -6299,6 +6299,7 @@ dependencies = [
  "pplx-space-firewall-rules-model",
  "pplx-space-firewall-rules-protocol",
  "pplx-space-node-status-store",
+ "pplx-space-postgres-pool",
  "pplx-space-rollout-queue",
  "pplx-space-sql-locator",
  "pplx-space-state-reconciliation",

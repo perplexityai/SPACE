@@ -27,6 +27,7 @@
 
 use std::fmt;
 
+use pplx_space_postgres_pool::DbError;
 use pplx_space_rollout_queue::HeaderPhase;
 
 mod fetch;
@@ -122,13 +123,13 @@ enum Scope {
 
 /// Commit on `Ok`, roll back otherwise, so a verb's locks end with it rather
 /// than when the connection is next used.
-async fn end_transaction<T, E: From<sqlx::Error>>(
+async fn end_transaction<T, E: From<DbError>>(
     tx: sqlx::Transaction<'_, sqlx::Postgres>,
     result: Result<T, E>,
 ) -> Result<T, E> {
     match result {
         Ok(value) => {
-            tx.commit().await?;
+            tx.commit().await.map_err(DbError::from)?;
             Ok(value)
         }
         Err(error) => {

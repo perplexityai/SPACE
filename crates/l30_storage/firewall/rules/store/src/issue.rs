@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use sqlx::{Connection, PgConnection};
 use time::OffsetDateTime;
@@ -26,12 +27,15 @@ use crate::{LeasedTarget, Requeue, Scope, Work, requeue, roll_back};
 /// The wakeup issuance or a round's opening queues for its node, on its
 /// transaction.
 pub trait Wakeup {
-    /// Queue `node`'s wakeup on `tx`, returning how many nodes it queued.
-    fn wake(
+    /// Queue `node`'s wakeup on `tx`, the verb's open transaction, returning
+    /// how many nodes it queued.
+    fn wake<C>(
         &mut self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tx: &mut C,
         node: NodeId,
-    ) -> impl Future<Output = Result<u64, sqlx::Error>> + Send;
+    ) -> impl Future<Output = Result<u64, DbError>> + Send
+    where
+        for<'a> &'a mut C: Executor<'a>;
 }
 
 /// Queue `node`'s wakeup through `wakeup` on `tx`; queuing any other number
@@ -41,7 +45,7 @@ pub(crate) async fn wake_one(
     wakeup: &mut impl Wakeup,
     node: NodeId,
 ) -> Result<(), sqlx::Error> {
-    let queued = wakeup.wake(tx, node).await?;
+    let queued = wakeup.wake(&mut **tx, node).await?;
     if queued != 1 {
         return Err(sqlx::Error::Protocol(format!(
             "firewall rules wakeup for node {node} queued {queued} nodes, not 1"
@@ -106,8 +110,8 @@ pub async fn issue_first_assignment(
     target: &LeasedTarget,
     first_check_in: Duration,
     wakeup: &mut impl Wakeup,
-) -> Result<Issuance, sqlx::Error> {
-    issue_and_commit(conn, target, first_check_in, Scope::Any, wakeup).await
+) -> Result<Issuance, DbError> {
+    Ok(issue_and_commit(conn, target, first_check_in, Scope::Any, wakeup).await?)
 }
 
 /// [`issue_first_assignment`], only while the rollout is in canary, ending
@@ -120,8 +124,8 @@ pub async fn issue_canary_and_release(
     target: &LeasedTarget,
     first_check_in: Duration,
     wakeup: &mut impl Wakeup,
-) -> Result<Issuance, sqlx::Error> {
-    issue_and_commit(conn, target, first_check_in, Scope::FirstCanary, wakeup).await
+) -> Result<Issuance, DbError> {
+    Ok(issue_and_commit(conn, target, first_check_in, Scope::FirstCanary, wakeup).await?)
 }
 
 async fn issue_and_commit(

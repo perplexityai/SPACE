@@ -197,7 +197,7 @@ fn stored_state_error(
     db: impl FnOnce(sqlx::Error) -> Response,
 ) -> Response {
     match error {
-        StoredStateError::Database(err) => db(err),
+        StoredStateError::Database(err) => db(sqlx::Error::from(err)),
         error => internal(&error),
     }
 }
