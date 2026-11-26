@@ -831,12 +831,16 @@ class DrainV2Assertions:
 
     def _expect_no_leftovers(self, workers: Sequence[str], fixture_id: str) -> None:
         """Neither worker holds a sandbox a drain would wait on but the
-        fixture's: each one's preview lists nothing else pending. A sandbox an
-        earlier run left, such as one whose cleanup failed, would be counted
-        in this run's reports and fail it for something it didn't do; so,
-        once the deletes still landing have had `LEFTOVER_SECONDS`, the run
-        ends inconclusive, naming what is left, and the earlier run's own
-        cleanup failure stays its own."""
+        fixture's: each one's preview lists nothing else pending. A sandbox
+        left there would be counted in this run's reports and fail it for
+        something it didn't do; so, once the deletes still landing have had
+        `LEFTOVER_SECONDS`, the run ends inconclusive with what it saw in
+        `leftover_sandboxes`, as it does when a preview can't be read for as
+        long. Each leftover is classed by its control-plane row: one still
+        live is the bench's (an earlier run's, such as one whose cleanup
+        failed, which stays that run's failure); one the control plane has
+        deleted or is deleting, which the node still holds, may be the
+        product's own orphan, and the verdict says so."""
 
         nodes = {n.k8s_node_name: n.id for n in self._control.admin_nodes() if n.k8s_node_name in workers}
         deadline = time.monotonic() + LEFTOVER_SECONDS
@@ -859,24 +863,43 @@ class DrainV2Assertions:
             if not leftovers and not unread:
                 return
             if time.monotonic() >= deadline:
-                left_ids = [sandbox_id for ids in leftovers.values() for sandbox_id in ids]
-                self._fixture.record(
-                    "leftover_sandboxes",
-                    {
-                        "by_worker": leftovers,
-                        "unread_previews": unread,
-                        "rows": {
-                            sandbox_id: list(placement)
-                            for sandbox_id, placement in self._control.sandbox_placements(left_ids).items()
-                        },
-                    },
-                )
-                raise InconclusiveSmoke(
-                    "the bench is not clean: a worker holds sandboxes an earlier run left, "
-                    "such as one whose cleanup failed, which this run's drain would count "
-                    "(leftover_sandboxes); delete them, or bring the bench up again, and rerun"
-                )
+                break
             self._fixture.wait(5)
+        left_ids = [sandbox_id for ids in leftovers.values() for sandbox_id in ids]
+        rows = self._control.sandbox_placements(left_ids) if left_ids else {}
+        live = sorted(i for i in left_ids if i in rows and rows[i][0] not in ("deleting", "deleted"))
+        deleted = sorted(i for i in left_ids if i not in live)
+        self._fixture.record(
+            "leftover_sandboxes",
+            {
+                "by_worker": leftovers,
+                "unread_previews": unread,
+                "rows": {sandbox_id: list(placement) for sandbox_id, placement in rows.items()},
+                "live": live,
+                "deleted_but_held": deleted,
+                "waited_seconds": LEFTOVER_SECONDS,
+            },
+        )
+        found = []
+        if live:
+            found.append(
+                f"{len(live)} live sandbox(es) an earlier run left, such as one whose cleanup "
+                "failed: bench hygiene, delete them or bring the bench up again"
+            )
+        if deleted:
+            found.append(
+                f"{len(deleted)} sandbox(es) the control plane deleted or is deleting that a "
+                "worker still holds: possibly a product orphan, report it before cleaning the bench"
+            )
+        if unread:
+            found.append(
+                f"no drain preview could be read from {sorted(unread)}, so the bench's state is unknown"
+            )
+        raise InconclusiveSmoke(
+            f"the bench is not known to be clean after {LEFTOVER_SECONDS} s: "
+            + "; ".join(found)
+            + " (leftover_sandboxes); this run's drain would count them, so it did not start"
+        )
 
     def give_fake_instance(self, *, timeout: float = REGISTER_SECONDS) -> str:
         """The pinned worker's fake AWS instance: re-register it under a fake
