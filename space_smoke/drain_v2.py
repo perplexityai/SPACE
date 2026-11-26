@@ -105,8 +105,8 @@ from space_smoke.capabilities import (
 from space_smoke.runtime import (
     Compensation,
     InconclusiveSmoke,
-    InvariantViolation,
     ResourceScope,
+    primary_failure,
     run_concurrently,
 )
 
@@ -253,17 +253,17 @@ PARALLEL_WIDTH = 4
 def in_parallel(calls: Sequence[Callable[[], T]], *, width: int = PARALLEL_WIDTH) -> list[T]:
     """Run independent calls `width` at a time; their results in order. Once
     a batch ends with a failure, the first verdict it raised (else the first
-    error) is raised and no later batch starts."""
+    error) is raised, with the evidence that call recorded, and no later
+    batch starts. An interrupted batch ends its calls before the interrupt
+    goes on to cleanup (`run_concurrently`), and a resident a create hands
+    out is owned by the run's cleanup from the moment the API accepts it."""
 
     results: list[T] = []
     for start in range(0, len(calls), width):
         outcomes = run_concurrently(calls[start : start + width])
-        failures = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
-        if failures:
-            raise next(
-                (failure for failure in failures if isinstance(failure, InvariantViolation)),
-                failures[0],
-            )
+        failure = primary_failure(outcomes)
+        if failure is not None:
+            raise failure
         results.extend(cast(list[T], outcomes))
     return results
 

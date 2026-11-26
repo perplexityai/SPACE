@@ -1327,7 +1327,9 @@ class RateLimiterAssertions:
                 raise
 
         try:
-            raw = run_concurrently([call for _ in range(count)])
+            # This class settles interrupted workers itself (`sweep_admitted`,
+            # late reaps), so an interrupt leaves them running, uncancelled.
+            raw = run_concurrently([call for _ in range(count)], on_interrupt="detach")
         except BaseException:
             with self._probe_lock:
                 cancelled.set()
@@ -1484,7 +1486,7 @@ class RateLimiterAssertions:
         # deadline interrupts the main thread at once rather than waiting out
         # in-flight HTTP timeouts inside `ThreadPoolExecutor.__exit__`.
         try:
-            raw = run_concurrently([call for _, call in calls])
+            raw = run_concurrently([call for _, call in calls], on_interrupt="detach")
         except BaseException:
             if not tripped.is_set():
                 barrier.abort()

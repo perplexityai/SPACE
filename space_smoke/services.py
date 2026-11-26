@@ -552,22 +552,26 @@ class SmokeServices:
             idle_timeout: str | None = None,
             auto_lifecycle: Mapping[str, object] | None = None,
         ) -> DurableLifecycleSandbox:
-            # Native create deletes a sandbox whose create failed; the delete
-            # of one that started is armed before it is handed out.
-            created = cast(
+            # Its delete is armed as soon as the API accepts the create, before
+            # the wait for it to run, so a create interrupted on a
+            # `run_concurrently` worker still leaves its sandbox to cleanup.
+            # Native create also deletes a sandbox whose wait failed.
+            def own(created: DurableLifecycleSandbox) -> None:
+                context.scope.defer(
+                    f"delete Native sandbox {created.sandbox_id}",
+                    partial(native.delete, created),
+                    critical=True,
+                )
+
+            return cast(
                 DurableLifecycleSandbox,
                 native.create(
                     {**run_metadata, "space_smoke_instance": uuid.uuid4().hex},
                     idle_timeout=idle_timeout,
                     auto_lifecycle=auto_lifecycle,
+                    accepted=own,
                 ),
             )
-            context.scope.defer(
-                f"delete Native sandbox {created.sandbox_id}",
-                partial(native.delete, created),
-                critical=True,
-            )
-            return created
 
         return CommandSandboxFixture(
             context,

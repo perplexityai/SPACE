@@ -42,6 +42,7 @@ from space_smoke.runtime import (
     ScenarioTimedOut,
     SmokeConfigurationError,
     _scenario_deadline,
+    pause,
 )
 
 
@@ -71,6 +72,16 @@ class _Fixture:
     def verify(self, condition: bool, message: str, **evidence: object) -> None:
         if not condition:
             raise InvariantViolation(f"{message} {evidence}" if evidence else message)
+
+
+class _PausingFixture(_Fixture):
+    """A `_Fixture` whose `wait` goes through `pause`, as `ScenarioContext.wait`
+    does, for a moment rather than the seconds asked: on a worker of an
+    interrupted `run_concurrently` that cancelled its calls, it raises
+    `CallsCancelled`."""
+
+    def wait(self, seconds: float, *, reason: str | None = None) -> None:
+        pause(0.001)
 
 
 class _Probe:
@@ -737,8 +748,11 @@ class ScopedLimiterCleanup(unittest.TestCase):
             fail_first={"sbx_straggler", "<metadata>"},
             reaped={"sbx_straggler": straggler_reaped},
         )
+        # The straggler's late reap retries its failed first delete after a
+        # `wait`, on the worker the interrupt left running, so the wait must
+        # be one an interrupt that cancels the workers would end.
         fanout_assertions = RateLimiterAssertions(
-            cast(Any, _Fixture()), cast(Any, admin), cast(Any, _SlowProbe()), ResourceScope()
+            cast(Any, _PausingFixture()), cast(Any, admin), cast(Any, _SlowProbe()), ResourceScope()
         )
         # Barrier actions deliver `SIGALRM` deterministically once all workers
         # reach the stall point; patching `setitimer` avoids racing an OS timer
