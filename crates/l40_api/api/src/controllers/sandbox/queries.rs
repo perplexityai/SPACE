@@ -71,6 +71,7 @@ async fn finalize_created_sandbox(
         restore_operation_id.map(|operation_id| operation_id.as_uuid()),
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 struct PooledCreateInput<'a> {
@@ -2899,8 +2900,9 @@ impl SandboxController {
             .begin()
             .await
             .map_err(PooledCreateRollbackError::BeginCleanup)?;
-        delete_with_dependents(&mut tx, sandbox_id)
+        delete_with_dependents(&mut *tx, sandbox_id)
             .await
+            .map_err(sqlx::Error::from)
             .map_err(PooledCreateRollbackError::Cleanup)?;
         tx.commit()
             .await

@@ -3026,7 +3026,7 @@ mod postgres {
 
         let mut fork_guard = pool.begin().await?;
         pplx_space_sandbox_store::fork_source_lifecycle::lock_fork_source_lifecycle(
-            &mut fork_guard,
+            &mut *fork_guard,
             sandbox,
         )
         .await?;

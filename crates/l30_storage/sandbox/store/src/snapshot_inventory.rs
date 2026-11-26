@@ -8,9 +8,9 @@
 //! publish path's prune and upsert, run on the executor (usually the publish
 //! transaction) its caller passes.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 use sqlx::types::{Json, JsonValue};
 
 /// Delete the inventory rows of the sandboxes in `sandbox_ids` whose snapshot
@@ -18,10 +18,10 @@ use sqlx::types::{Json, JsonValue};
 /// objects with the keys `sandbox_id` and `snapshot_id`: the snapshots a
 /// node's publication no longer lists. Rows of other sandboxes are kept.
 pub async fn prune_unpublished(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_ids: &[SandboxId],
     published: JsonValue,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "WITH scope AS (
              SELECT UNNEST($1::UUID[]) AS sandbox_id
@@ -45,7 +45,7 @@ pub async fn prune_unpublished(
     ))
     .bind(sandbox_ids)
     .bind(Json(published))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -58,10 +58,10 @@ pub async fn prune_unpublished(
 /// and a row whose published columns are unchanged is not rewritten, so its
 /// `observed_at` and `updated_at` keep their values.
 pub async fn upsert_published(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_ids: &[SandboxId],
     snapshots: JsonValue,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "WITH scope AS (
              SELECT UNNEST($1::UUID[]) AS sandbox_id
@@ -154,7 +154,7 @@ pub async fn upsert_published(
     ))
     .bind(sandbox_ids)
     .bind(Json(snapshots))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }

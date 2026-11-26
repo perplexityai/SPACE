@@ -128,6 +128,7 @@
 //! `suspending` bullets).
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sql_locator::sql;
 
@@ -228,10 +229,10 @@ impl ActionStamp {
 /// lifecycles (`ActionStamp::admits`). Returns whether the row was
 /// written; `false` means the row is gone or another writer owns it.
 pub async fn stamp_action_lifecycle(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     id: SandboxId,
     stamp: ActionStamp,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "UPDATE sandboxes
             SET lifecycle = $1
@@ -241,7 +242,7 @@ pub async fn stamp_action_lifecycle(
     .bind(stamp.lifecycle().as_str())
     .bind(id)
     .bind(stamp.admitted_values())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -253,10 +254,10 @@ pub async fn stamp_action_lifecycle(
 /// The api's `maybe_mark_started_after_start` documents why the `disk` pin
 /// goes.
 pub async fn stamp_started_after_start(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     id: SandboxId,
     substrate: StartSubstrate,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "UPDATE sandboxes
             SET lifecycle = 'started',
@@ -278,7 +279,7 @@ pub async fn stamp_started_after_start(
     ))
     .bind(id)
     .bind(ActionStamp::Start(substrate).admitted_values())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -303,10 +304,10 @@ pub async fn stamp_started_after_start(
 /// transient-lifecycle sweeper converge it), and any value outside the
 /// stored vocabulary. The module docs say who finishes each.
 pub async fn stamp_pooled_post_wake(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     id: SandboxId,
     active_node_id: Option<NodeId>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "UPDATE sandboxes
             SET lifecycle = 'started',
@@ -319,7 +320,7 @@ pub async fn stamp_pooled_post_wake(
     .bind(active_node_id)
     .bind(id)
     .bind(ActionStamp::Resume.admitted_values())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() > 0)
 }

@@ -244,13 +244,13 @@ impl RetentionSink for SnapshotRetentionDbStore {
         // advisory lock before the sandbox row lock. Once held, no queued or
         // running fork can freeze or consume this source while its snapshot
         // set is being changed.
-        lock_fork_source_lifecycle(&mut tx, candidate.sandbox_id).await?;
+        lock_fork_source_lifecycle(&mut *tx, candidate.sandbox_id).await?;
 
         // Serialize marker/restore writers and sibling claims. Revalidate in
         // a later statement so READ COMMITTED observes a writer that committed
         // while this transaction waited for the sandbox lock.
         let locked = snapshot_retention_claim::lock_snapshot_owner(
-            &mut tx,
+            &mut *tx,
             candidate.snapshot_id,
             candidate.sandbox_id,
         )
@@ -262,7 +262,7 @@ impl RetentionSink for SnapshotRetentionDbStore {
             ));
         }
 
-        if active_fork_source_operation_exists(&mut tx, candidate.sandbox_id).await? {
+        if active_fork_source_operation_exists(&mut *tx, candidate.sandbox_id).await? {
             tx.rollback().await?;
             return Ok(ClaimOutcome::Refused(ClaimRefusalReason::ActiveForkSource));
         }
@@ -402,7 +402,7 @@ impl RetentionSink for SnapshotRetentionDbStore {
         // `unwrap_or(false)` further down would read as "unknown means not
         // pinned", which is the wrong default for a data-loss signal even
         // when the branch is provably dead.
-        let Some(is_pinned) = lock_owner_marks_snapshot(&mut tx, snapshot_id).await? else {
+        let Some(is_pinned) = lock_owner_marks_snapshot(&mut *tx, snapshot_id).await? else {
             tx.rollback().await?;
             return Ok(PruneFinalize::AlreadyGone);
         };

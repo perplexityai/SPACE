@@ -18,7 +18,7 @@ impl K8sStore {
             .db_context("failed to start suspended pod transaction")?;
 
         let lifecycle = pplx_space_sandbox_store::suspend::lock_committed_artifact(
-            &mut tx,
+            &mut *tx,
             sandbox_id,
             published_artifact.id,
             published_artifact.kind,
@@ -285,6 +285,7 @@ impl K8sStore {
             expected_pod_uid,
         )
         .await
+        .map_err(sqlx::Error::from)
         .and_then(|marker| {
             marker
                 .map(CommittedSuspendArtifactRow::try_from)

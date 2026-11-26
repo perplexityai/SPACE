@@ -18,6 +18,7 @@ use pplx_space_k8s_ids::PodUid;
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId, SandboxLifecycle};
 use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 
 /// Lock the sandbox row `FOR UPDATE` until the caller's transaction ends,
@@ -27,14 +28,17 @@ use pplx_space_sql_locator::sql;
 /// that already fails the guard when the statement reads it is not locked;
 /// under READ COMMITTED, one that a concurrent writer moves off the guard
 /// while the statement waits for its lock can stay locked until the
-/// transaction ends.
-pub async fn lock_committed_artifact(
-    conn: &mut sqlx::PgConnection,
+/// transaction ends. The caller must pass its open transaction.
+pub async fn lock_committed_artifact<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     artifact_id: LocalArtifactId,
     artifact_kind: ArtifactKind,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>(sql!(
+) -> Result<Option<String>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar::<_, String>(sql!(
         "SELECT lifecycle
               FROM sandboxes
               WHERE id = $1
@@ -48,8 +52,8 @@ pub async fn lock_committed_artifact(
     .bind(artifact_id.as_uuid())
     .bind(artifact_kind.as_str())
     .bind(ArtifactOrigin::Suspend.as_str())
-    .fetch_optional(conn)
-    .await
+    .fetch_optional(tx.into_sqlx())
+    .await?)
 }
 
 /// **Operation step.** Claim the suspend of the execution at `generation`
@@ -61,12 +65,12 @@ pub async fn lock_committed_artifact(
 /// `paused`) in turn; a zero-row match means another writer won or the
 /// execution moved on.
 pub async fn claim(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: ExecutionGeneration,
     pod_uid: &PodUid,
     previous: SandboxLifecycle,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let claimed = sqlx::query(sql!(
         "UPDATE sandboxes s
                     SET lifecycle = 'suspending'
@@ -83,7 +87,7 @@ pub async fn claim(
     .bind(generation.get())
     .bind(pod_uid.as_str())
     .bind(previous.as_str())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(claimed.rows_affected() == 1)
 }
@@ -96,11 +100,11 @@ pub async fn claim(
 /// re-assigns. The caller locks the row first and, in the same transaction,
 /// fences a `deleting` artifact and marks the execution suspend-committed.
 pub async fn record_committed_artifact(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     artifact_id: LocalArtifactId,
     artifact_kind: ArtifactKind,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let updated = sqlx::query(sql!(
         "UPDATE sandboxes
                 SET lifecycle = 'suspending',
@@ -113,7 +117,7 @@ pub async fn record_committed_artifact(
     .bind(sandbox_id.as_uuid())
     .bind(artifact_id.as_uuid())
     .bind(artifact_kind.as_str())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(updated.rows_affected() == 1)
 }
@@ -128,11 +132,11 @@ pub async fn record_committed_artifact(
 /// caller's sandbox and execution row locks and the re-checks it made under
 /// them in the same transaction.
 pub async fn finalize_with_committed_artifact(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     artifact_id: LocalArtifactId,
     artifact_kind: ArtifactKind,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "WITH candidate AS MATERIALIZED (
                  SELECT id
@@ -180,7 +184,7 @@ pub async fn finalize_with_committed_artifact(
     .bind(artifact_id.as_uuid())
     .bind(artifact_kind.as_str())
     .bind(ArtifactOrigin::Suspend.as_str())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -194,10 +198,10 @@ pub async fn finalize_with_committed_artifact(
 /// relies on the caller's sandbox row lock, its eligibility select and its
 /// retirement of the active execution, all in the same transaction.
 pub async fn finalize_missing_pod_from_current_snapshot(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     clear_marker: bool,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE sandboxes s SET lifecycle = 'suspended',
                     placement = 'unplaced',
@@ -209,7 +213,7 @@ pub async fn finalize_missing_pod_from_current_snapshot(
     ))
         .bind(sandbox_id)
         .bind(clear_marker)
-        .execute(executor)
+        .execute(executor.into_sqlx())
         .await?;
     Ok(())
 }

@@ -113,7 +113,7 @@ pub async fn finalize_sandbox_db_delete_user_initiated(
 ) -> Result<(), FinalizeSandboxDbDeleteError> {
     let mut tx = pool.begin().await?;
     lock_orphan_observation(&mut tx, sandbox_id).await?;
-    lock_fork_source_lifecycle(&mut tx, sandbox_id).await?;
+    lock_fork_source_lifecycle(&mut *tx, sandbox_id).await?;
     // Lock the parent sandbox row to serialize against any
     // concurrent BeginArtifactBackup INSERT (which acquires the
     // implicit FK FOR KEY SHARE on this row). Result is discarded —
@@ -133,10 +133,10 @@ pub async fn finalize_sandbox_db_delete_user_initiated(
         // ROLLBACK explicitly — sqlx will roll back on drop.
         return Err(FinalizeSandboxDbDeleteError::InFlightSuspendUpload { idle_for });
     }
-    if active_fork_source_operation_exists(&mut tx, sandbox_id).await? {
+    if active_fork_source_operation_exists(&mut *tx, sandbox_id).await? {
         return Err(FinalizeSandboxDbDeleteError::ForkInProgress);
     }
-    delete_with_dependents(&mut tx, sandbox_id).await?;
+    delete_with_dependents(&mut *tx, sandbox_id).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -146,7 +146,7 @@ pub async fn finalize_sandbox_db_delete(
     sandbox_id: SandboxId,
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    delete_with_dependents(&mut tx, sandbox_id).await?;
+    delete_with_dependents(&mut *tx, sandbox_id).await?;
     tx.commit().await
 }
 

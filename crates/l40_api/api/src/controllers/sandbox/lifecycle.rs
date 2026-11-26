@@ -174,13 +174,21 @@ async fn begin_delete_against_active_fork(
         }
         mapped
     })?;
-    lock_fork_source_lifecycle(&mut guard, sandbox_id)
-        .await
-        .map_err(|error| db_contention_error("failed to lock sandbox delete lifecycle", &error))?;
-    let active_fork = active_fork_source_operation_exists(&mut guard, sandbox_id)
+    lock_fork_source_lifecycle(&mut *guard, sandbox_id)
         .await
         .map_err(|error| {
-            db_contention_error("fork precheck failed before sandbox DELETE", &error)
+            db_contention_error(
+                "failed to lock sandbox delete lifecycle",
+                &sqlx::Error::from(error),
+            )
+        })?;
+    let active_fork = active_fork_source_operation_exists(&mut *guard, sandbox_id)
+        .await
+        .map_err(|error| {
+            db_contention_error(
+                "fork precheck failed before sandbox DELETE",
+                &sqlx::Error::from(error),
+            )
         })?;
     if active_fork {
         return Err(fork_in_progress_conflict());
@@ -199,9 +207,14 @@ async fn begin_delete_against_active_fork(
                 })
         })
         .transpose()?;
-    mark_deleting(&mut guard, sandbox_id)
+    mark_deleting(&mut *guard, sandbox_id)
         .await
-        .map_err(|error| db_contention_error("failed to persist sandbox delete intent", &error))?;
+        .map_err(|error| {
+            db_contention_error(
+                "failed to persist sandbox delete intent",
+                &sqlx::Error::from(error),
+            )
+        })?;
     guard
         .commit()
         .await
@@ -224,7 +237,10 @@ async fn restore_lifecycle_after_failed_delete(
         // so the caller is at least told to retry; the residual is that a failed
         // restore still leaves the row pinned until that retry lands.
         .map_err(|error| {
-            db_contention_error("failed to restore sandbox after deferred deletion", &error)
+            db_contention_error(
+                "failed to restore sandbox after deferred deletion",
+                &sqlx::Error::from(error),
+            )
         })?;
     if restored {
         Ok(())
@@ -255,7 +271,7 @@ async fn restore_lifecycle_after_failed_finalize_delete(
         .map_err(|error| {
             db_contention_error(
                 "failed to restore sandbox after deletion finalization",
-                &error,
+                &sqlx::Error::from(error),
             )
         })?;
     if restored {

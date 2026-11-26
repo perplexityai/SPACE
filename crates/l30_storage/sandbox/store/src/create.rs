@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use pplx_space_accounts::{ClientId, NodeId, OrgId, UserId};
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_execution_spec::DiskIoLimits;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use sqlx::types::JsonValue;
@@ -38,7 +39,7 @@ pub struct SandboxCreate<'a> {
 /// Insert an unplaced sandbox. A restore token starts it in `restoring` and
 /// sets the lease against the database clock; otherwise it starts in `creating`.
 pub async fn insert_unplaced(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     input: &SandboxCreate<'_>,
     volume_encryption: bool,
     restore_lease_token: Option<Uuid>,
@@ -88,7 +89,7 @@ pub async fn insert_unplaced(
     .bind(restore_lease_seconds)
     .bind(input.egress_profiles)
     .bind(input.activating_client_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -97,7 +98,7 @@ pub async fn insert_unplaced(
 /// Substrates without a database node row pass no active node id.
 /// The caller owns the transaction that also records the pool claim.
 pub async fn insert_pooled(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     input: &SandboxCreate<'_>,
     active_node_id: Option<NodeId>,
 ) -> Result<(), SandboxStoreError> {
@@ -136,7 +137,7 @@ pub async fn insert_pooled(
     .bind(input.network_policy_override_json)
     .bind(input.egress_profiles)
     .bind(input.activating_client_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -166,14 +167,14 @@ pub async fn insert_pooled(
 /// write moves the row to a lifecycle other than `started`). The `WHERE`
 /// alone guards the write: it needs no row lock from its caller.
 pub async fn finalize_created(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     lifecycle: &str,
     placement: &str,
     active_node_id: Option<NodeId>,
     command_ready: bool,
     restore_operation_id: Option<Uuid>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "UPDATE sandboxes
          SET lifecycle = CASE
@@ -242,7 +243,7 @@ pub async fn finalize_created(
     .bind(sandbox_id.as_uuid())
     .bind(!command_ready)
     .bind(restore_operation_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
 
     Ok(result.rows_affected() == 1)
@@ -256,10 +257,10 @@ pub async fn finalize_created(
 /// relies on running between a create's substrate call and
 /// [`finalize_created`], on the row that create inserted.
 pub async fn record_created_placement(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     active_node_id: NodeId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE sandboxes
                  SET active_node_id = $1,
@@ -268,7 +269,7 @@ pub async fn record_created_placement(
     ))
     .bind(active_node_id)
     .bind(sandbox_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -283,12 +284,12 @@ pub async fn record_created_placement(
 /// to the caller. The statement carries no `sql!` locator,
 /// as at the call sites it moved from.
 pub async fn delete_failed_create(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query("DELETE FROM sandboxes WHERE id = $1")
         .bind(sandbox_id.as_uuid())
-        .execute(executor)
+        .execute(executor.into_sqlx())
         .await?;
     Ok(())
 }

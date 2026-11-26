@@ -13,6 +13,7 @@
 use std::sync::LazyLock;
 
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_sandbox_portability::missing_suspending_pod_revert_eligibility;
 use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
@@ -23,27 +24,27 @@ use uuid::Uuid;
 /// Whether `sandbox_id` is `suspending` (compared trimmed and
 /// case-insensitively); `None` when the row is gone.
 pub async fn lifecycle_is_suspending(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<bool>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Option<bool>, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT LOWER(TRIM(lifecycle)) = 'suspending' FROM sandboxes WHERE id = $1"
     ))
     .bind(sandbox_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether `sandbox_id` is `suspending` with an active execution at
 /// `generation` tracking `pod_uid` that is `running` or `suspended`: a
 /// suspend claim already held by that execution.
 pub async fn claim_held(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: ExecutionGeneration,
     pod_uid: &PodUid,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT EXISTS (
                  SELECT 1
                    FROM sandboxes s
@@ -59,8 +60,8 @@ pub async fn claim_held(
     .bind(sandbox_id)
     .bind(generation.get())
     .bind(pod_uid.as_str())
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// The finalized suspend a projection must already have written: the
@@ -81,11 +82,11 @@ pub struct ProjectedSuspend<'a> {
 /// marker, and its execution at that generation and pod is retired in
 /// `projected.execution_state` with no successor.
 pub async fn projection_matches(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     projected: ProjectedSuspend<'_>,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
         "SELECT EXISTS (
                      SELECT 1
                        FROM sandboxes s
@@ -115,8 +116,8 @@ pub async fn projection_matches(
     .bind(projected.artifact_kind.as_str())
     .bind(projected.artifact_origin.as_str())
     .bind(projected.execution_state)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// The execution state and the sandbox's artifact marker behind a committed
@@ -134,12 +135,12 @@ pub struct CommittedSuspendMarker {
 /// active, or once it is `suspended` and that execution is retired
 /// `suspended` with no successor. `None` otherwise.
 pub async fn committed_marker(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: ExecutionGeneration,
     pod_uid: &PodUid,
-) -> Result<Option<CommittedSuspendMarker>, sqlx::Error> {
-    sqlx::query_as::<_, CommittedSuspendMarker>(sql!(
+) -> Result<Option<CommittedSuspendMarker>, DbError> {
+    Ok(sqlx::query_as::<_, CommittedSuspendMarker>(sql!(
         "SELECT e.state AS execution_state,
                     s.current_local_artifact_id AS artifact_id,
                     s.current_local_artifact_kind AS artifact_kind,
@@ -168,8 +169,8 @@ pub async fn committed_marker(
     .bind(sandbox_id)
     .bind(generation.get())
     .bind(pod_uid.as_str())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The artifact of a durable suspend snapshot, its kind undecoded.
@@ -185,12 +186,12 @@ pub struct DurableSuspendArtifact {
 /// storage location, and with no newer full or in-flight snapshot. `None`
 /// when there is none.
 pub async fn durable_suspend_artifact(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: ExecutionGeneration,
     pod_uid: &PodUid,
-) -> Result<Option<DurableSuspendArtifact>, sqlx::Error> {
-    sqlx::query_as::<_, DurableSuspendArtifact>(sql!(
+) -> Result<Option<DurableSuspendArtifact>, DbError> {
+    Ok(sqlx::query_as::<_, DurableSuspendArtifact>(sql!(
         "SELECT sn.local_artifact_id, sn.artifact_kind
                FROM sandboxes s
                JOIN sandbox_k8s_executions e
@@ -227,8 +228,8 @@ pub async fn durable_suspend_artifact(
     .bind(sandbox_id)
     .bind(generation.get())
     .bind(pod_uid.as_str())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether `sandbox_id` is `started` with an active, `recovering` Kubernetes
@@ -237,12 +238,12 @@ pub async fn durable_suspend_artifact(
 /// suspend upload from that node, taken no earlier than the sandbox's last
 /// command or access.
 pub async fn local_backup_pending(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: ExecutionGeneration,
     pod_uid: &PodUid,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT EXISTS (
                  SELECT 1
                    FROM sandboxes s
@@ -277,8 +278,8 @@ pub async fn local_backup_pending(
     .bind(pod_uid.as_str())
     .bind(FACET_SANDBOX_DESIRED_STATE)
     .bind(SANDBOX_LOCAL_SUSPEND_KEY)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether the `suspending` `sandbox_id`, still placed, whose active execution
@@ -291,11 +292,11 @@ pub async fn local_backup_pending(
 /// transaction, and feeds the answer to
 /// [`crate::suspend::finalize_missing_pod_from_current_snapshot`].
 pub async fn missing_suspending_pod_clear_marker(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     pod_uid: &str,
-) -> Result<Option<bool>, sqlx::Error> {
+) -> Result<Option<bool>, DbError> {
     static QUERY: LazyLock<String> = LazyLock::new(|| {
         let eligibility = missing_suspending_pod_revert_eligibility("s");
         let clear_marker = eligibility.clear_marker;
@@ -324,10 +325,12 @@ pub async fn missing_suspending_pod_clear_marker(
                 AND {eligible}",
         ))
     });
-    sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(QUERY.as_str()))
-        .bind(sandbox_id)
-        .bind(generation)
-        .bind(pod_uid)
-        .fetch_optional(executor)
-        .await
+    Ok(
+        sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(QUERY.as_str()))
+            .bind(sandbox_id)
+            .bind(generation)
+            .bind(pod_uid)
+            .fetch_optional(executor.into_sqlx())
+            .await?,
+    )
 }
