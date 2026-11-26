@@ -3001,11 +3001,13 @@ class KindAdmin(ScenarioFixture):
             )
         if self._template_default_lifecycle is None:
             creator = self._ecw_creator
+            template = self.sandbox_template_name()
             self._template_default_lifecycle = TemplateDefaultLifecycle(
                 self,
                 self._template_default_lifecycle_control,
                 self._context.scope,
-                self.sandbox_template_name(),
+                template,
+                selector=self._template_selector or template,
                 kill_sandbox=creator.kill_sandbox,
                 kill_matching=creator.kill_matching,
             )

@@ -616,14 +616,6 @@ def _sql_identifier_ish(value: str) -> str:
     return value
 
 
-def _sql_template_name(value: str) -> str:
-    """Refuse anything but a bare template name before it reaches SQL or a path."""
-
-    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", value):
-        raise ValueError(f"unexpected template name: {value!r}")
-    return value
-
-
 # The desired default `PATCH /admin/api/v1/templates/{name}` writes; the admin
 # read would also fall back to a builder's published copy.
 TEMPLATE_DEFAULT_AUTO_LIFECYCLE_SQL = """\
@@ -8261,7 +8253,7 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def template_default_auto_lifecycle(self, template: str) -> Mapping[str, object] | None:
         out = self._psql(
-            TEMPLATE_DEFAULT_AUTO_LIFECYCLE_SQL.format(template=_sql_template_name(template)),
+            TEMPLATE_DEFAULT_AUTO_LIFECYCLE_SQL.format(template=_template_name(template)),
             action="read the template's default auto-lifecycle policy",
         )
         return json.loads(out) if out else None
@@ -8271,21 +8263,21 @@ ON CONFLICT (key_hash) DO NOTHING;
     ) -> None:
         self._admin(
             "PATCH",
-            f"templates/{quote(_sql_template_name(template), safe='')}",
+            f"templates/{quote(_template_name(template), safe='')}",
             expect=(200,),
             body={"default_auto_lifecycle": dict(policy)},
         )
 
     def template_default_auto_lifecycle_published(self, template: str) -> bool:
         out = self._psql(
-            TEMPLATE_DEFAULT_AUTO_LIFECYCLE_PUBLISHED_SQL.format(template=_sql_template_name(template)),
+            TEMPLATE_DEFAULT_AUTO_LIFECYCLE_PUBLISHED_SQL.format(template=_template_name(template)),
             action="compare published template default auto-lifecycle policies",
         )
         return out == "t"
 
     def delete_template_default_auto_lifecycle(self, template: str) -> None:
         self._psql(
-            DELETE_TEMPLATE_DEFAULT_AUTO_LIFECYCLE_SQL.format(template=_sql_template_name(template)),
+            DELETE_TEMPLATE_DEFAULT_AUTO_LIFECYCLE_SQL.format(template=_template_name(template)),
             action="delete the template's default auto-lifecycle policy",
         )
 

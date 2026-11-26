@@ -83,7 +83,11 @@ class TemplateDefaultLifecycleControl(Protocol):
 
 
 class TemplateDefaultLifecycle:
-    """Native creates of one template, and its default set for the scenario."""
+    """Native creates of one template, and its default set for the scenario.
+
+    Creates name `selector`, which keeps a tag or digest; the policy is keyed
+    by the bare `template` name.
+    """
 
     def __init__(
         self,
@@ -92,6 +96,7 @@ class TemplateDefaultLifecycle:
         scope: ResourceScope,
         template: str,
         *,
+        selector: str,
         kill_sandbox: Callable[[str], None],
         kill_matching: Callable[[Mapping[str, str]], None],
     ) -> None:
@@ -99,6 +104,7 @@ class TemplateDefaultLifecycle:
         self._control = control
         self._scope = scope
         self._template = template
+        self._selector = selector
         self._kill_sandbox = kill_sandbox
         self._kill_matching = kill_matching
         self._compensation: Compensation | None = None
@@ -145,14 +151,14 @@ class TemplateDefaultLifecycle:
         self._compensation.release()
 
     def create(self, auto_lifecycle: Mapping[str, object] | None = None) -> str:
-        """A native create of the template; the bare sandbox id. Cleanup kills it."""
+        """A native create of the selected build; the bare sandbox id. Cleanup kills it."""
 
         metadata = {"space_smoke_template_default_lifecycle": uuid.uuid4().hex}
         by_metadata = self._scope.defer(
             "kill the native sandbox", lambda: self._kill_matching(metadata), critical=True
         )
         sandbox_id = self._control.native_create_sandbox(
-            template=self._template, metadata=metadata, auto_lifecycle=auto_lifecycle
+            template=self._selector, metadata=metadata, auto_lifecycle=auto_lifecycle
         )
         self._scope.defer(
             f"kill native sandbox {sandbox_id}",
