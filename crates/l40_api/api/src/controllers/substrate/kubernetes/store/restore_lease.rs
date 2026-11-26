@@ -211,7 +211,7 @@ impl K8sStore {
         // transaction then reads the snapshots and executions as of after the
         // lock, so a writer that committed while this waited is seen.
         let locked = pplx_space_sandbox_store::restore_lease::lock_restore_claim(
-            &mut tx,
+            &mut *tx,
             sandbox_id,
             restore_lease_token,
         )
@@ -233,7 +233,7 @@ impl K8sStore {
             any_active_execution: any_active,
             source_proven,
         } = pplx_space_sandbox_store::restore_lease::restore_revert_evidence(
-            &mut tx,
+            &mut *tx,
             sandbox_id,
             restore_lease_token,
             activation_attempt,
@@ -268,7 +268,7 @@ impl K8sStore {
                 // pre-restore source, and both the suspended selector and
                 // `durably_restorable` take a markerless snapshot only when
                 // it is newer than the last placement.
-                restore_lease::revert_restore_claim_retiring_placement(&mut tx, sandbox_id)
+                restore_lease::revert_restore_claim_retiring_placement(&mut *tx, sandbox_id)
                     .await
                     .db_context("failed to revert sandbox lifecycle to suspended")?;
                 RestoreClaimRevert::ExecutionRetired { pod_name }
@@ -278,13 +278,13 @@ impl K8sStore {
                 // clear as above. An execution the claim reused rather than
                 // created keeps the clock, since nothing proves its pod
                 // holds no state of its own.
-                restore_lease::revert_restore_claim_clearing_placement_clock(&mut tx, sandbox_id)
+                restore_lease::revert_restore_claim_clearing_placement_clock(&mut *tx, sandbox_id)
                     .await
                     .db_context("failed to revert sandbox lifecycle to suspended")?;
                 RestoreClaimRevert::LifecycleOnly
             }
             (claimed, _) => {
-                restore_lease::revert_restore_claim_lifecycle(&mut tx, sandbox_id)
+                restore_lease::revert_restore_claim_lifecycle(&mut *tx, sandbox_id)
                     .await
                     .db_context("failed to revert sandbox lifecycle to suspended")?;
                 if claimed.is_some() || any_active {

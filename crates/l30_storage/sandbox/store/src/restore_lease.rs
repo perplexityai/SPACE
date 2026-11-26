@@ -24,12 +24,12 @@
 use std::sync::LazyLock;
 
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId, SandboxLifecycle};
 
 use pplx_space_sandbox_portability::restore_retry_suspended_revert_snapshot_exists;
 use pplx_space_sandbox_routability::routable_execution_or_non_k8s;
 use pplx_space_sql_locator::sql;
-use sqlx::{PgExecutor, Postgres, Transaction};
 use uuid::Uuid;
 
 /// What a restore claim returns: the lifecycle the row had before the claim,
@@ -61,13 +61,13 @@ pub struct RestoreClaimRow {
 /// doesn't read; it keeps the parameter list the statement has always been
 /// prepared with.
 pub async fn claim_evacuation_restore(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     lease_ttl_secs: i64,
     execution_ownership_ttl_secs: i64,
     evacuation_target: Option<SandboxLifecycle>,
-) -> Result<Option<RestoreClaimRow>, sqlx::Error> {
-    sqlx::query_as::<_, RestoreClaimRow>(sql!(
+) -> Result<Option<RestoreClaimRow>, DbError> {
+    Ok(sqlx::query_as::<_, RestoreClaimRow>(sql!(
         "WITH candidate AS (
                      SELECT id, lifecycle
                        FROM sandboxes
@@ -103,8 +103,8 @@ pub async fn claim_evacuation_restore(
     .bind(None::<Uuid>)
     .bind(execution_ownership_ttl_secs)
     .bind(evacuation_target.map(SandboxLifecycle::as_str))
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The user restore claim: flip a `suspended` row, or a markerless
@@ -133,14 +133,14 @@ pub async fn claim_evacuation_restore(
 /// `evacuation_target` is bound as `$5`, which this statement doesn't read;
 /// it keeps the parameter list the statement has always been prepared with.
 pub async fn claim_user_restore(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     lease_ttl_secs: i64,
     restore_lease_token: Uuid,
     execution_ownership_ttl_secs: i64,
     evacuation_target: Option<SandboxLifecycle>,
-) -> Result<Option<RestoreClaimRow>, sqlx::Error> {
-    sqlx::query_as::<_, RestoreClaimRow>(sql!(
+) -> Result<Option<RestoreClaimRow>, DbError> {
+    Ok(sqlx::query_as::<_, RestoreClaimRow>(sql!(
         "WITH candidate AS (
                      SELECT id, lifecycle
                        FROM sandboxes
@@ -188,8 +188,8 @@ pub async fn claim_user_restore(
     .bind(Some(restore_lease_token))
     .bind(execution_ownership_ttl_secs)
     .bind(evacuation_target.map(SandboxLifecycle::as_str))
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Take the restore lease of a markerless `restoring` row without moving its
@@ -198,13 +198,13 @@ pub async fn claim_user_restore(
 /// markerless `restoring` row, its lease is still live, or an active
 /// execution did work within `execution_ownership_ttl_secs`.
 pub async fn claim_markerless_restoring_lease(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     lease_ttl_secs: i64,
     restore_lease_token: Uuid,
     execution_ownership_ttl_secs: i64,
-) -> Result<Option<RestoreClaimRow>, sqlx::Error> {
-    sqlx::query_as::<_, RestoreClaimRow>(sql!(
+) -> Result<Option<RestoreClaimRow>, DbError> {
+    Ok(sqlx::query_as::<_, RestoreClaimRow>(sql!(
         "WITH candidate AS (
                  SELECT id, lifecycle
                    FROM sandboxes
@@ -239,8 +239,8 @@ pub async fn claim_markerless_restoring_lease(
     .bind(lease_ttl_secs)
     .bind(restore_lease_token)
     .bind(execution_ownership_ttl_secs)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Commit `restoring -> started` (and `on_node`) for the restore whose lease
@@ -253,10 +253,10 @@ pub async fn claim_markerless_restoring_lease(
 /// A row a rollback, the sweeper, a suspend or a delete has moved on matches
 /// nothing.
 pub async fn complete_owned_user_restore(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     restore_lease_token: Uuid,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let routable = routable_execution_or_non_k8s("sandboxes", "$3");
     let query = format!(
         "UPDATE sandboxes
@@ -270,7 +270,7 @@ pub async fn complete_owned_user_restore(
         .bind(sandbox_id)
         .bind(restore_lease_token)
         .bind(SubstrateKind::Kubernetes)
-        .execute(executor)
+        .execute(executor.into_sqlx())
         .await?
         .rows_affected();
     Ok(completed == 1)
@@ -283,10 +283,10 @@ pub async fn complete_owned_user_restore(
 /// Guarded by the token alone, with no lifecycle predicate: a lease a newer
 /// claim replaced, or one the lease-clear trigger dropped, matches nothing.
 pub async fn release_user_restore_lease(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     restore_lease_token: Uuid,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE sandboxes
                 SET restore_lease_expires_at = NOW()
@@ -295,7 +295,7 @@ pub async fn release_user_restore_lease(
     ))
     .bind(sandbox_id)
     .bind(restore_lease_token)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -308,10 +308,14 @@ pub async fn release_user_restore_lease(
 /// No lifecycle or lease predicate of its own; it relies on the caller's row
 /// lock, taken on `restoring` (and, when the claim wrote a lease token, on
 /// that token), and on the caller's proof that the pre-restore source is still restorable.
-pub async fn revert_restore_claim_retiring_placement(
-    tx: &mut Transaction<'_, Postgres>,
+/// The caller must pass its open transaction.
+pub async fn revert_restore_claim_retiring_placement<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "UPDATE sandboxes
                         SET lifecycle = 'suspended',
@@ -321,7 +325,7 @@ pub async fn revert_restore_claim_retiring_placement(
                       WHERE id = $1"
     ))
     .bind(sandbox_id)
-    .execute(&mut **tx)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -332,11 +336,14 @@ pub async fn revert_restore_claim_retiring_placement(
 ///
 /// No lifecycle or lease predicate of its own; it relies on the caller's row
 /// lock and on the caller's proof that the pre-restore source is still
-/// restorable.
-pub async fn revert_restore_claim_clearing_placement_clock(
-    tx: &mut Transaction<'_, Postgres>,
+/// restorable. The caller must pass its open transaction.
+pub async fn revert_restore_claim_clearing_placement_clock<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "UPDATE sandboxes
                         SET lifecycle = 'suspended',
@@ -344,7 +351,7 @@ pub async fn revert_restore_claim_clearing_placement_clock(
                       WHERE id = $1"
     ))
     .bind(sandbox_id)
-    .execute(&mut **tx)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -354,16 +361,19 @@ pub async fn revert_restore_claim_clearing_placement_clock(
 /// Writes an **operation step** (the claim's compensation).
 ///
 /// No lifecycle or lease predicate of its own; it relies on the caller's row
-/// lock.
-pub async fn revert_restore_claim_lifecycle(
-    tx: &mut Transaction<'_, Postgres>,
+/// lock. The caller must pass its open transaction.
+pub async fn revert_restore_claim_lifecycle<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "UPDATE sandboxes SET lifecycle = 'suspended' WHERE id = $1"
     ))
     .bind(sandbox_id)
-    .execute(&mut **tx)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -377,12 +387,16 @@ pub async fn revert_restore_claim_lifecycle(
 /// statement waits for its lock can stay locked until the transaction ends.
 ///
 /// The revert takes it in its own statement first, so its later statements
-/// read the snapshots and executions as of after the lock.
-pub async fn lock_restore_claim(
-    conn: &mut sqlx::PgConnection,
+/// read the snapshots and executions as of after the lock. The caller must
+/// pass its open transaction.
+pub async fn lock_restore_claim<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     restore_lease_token: Option<Uuid>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let locked: Option<bool> = sqlx::query_scalar(sql!(
         "SELECT TRUE
                FROM sandboxes
@@ -393,7 +407,7 @@ pub async fn lock_restore_claim(
     ))
     .bind(sandbox_id)
     .bind(restore_lease_token)
-    .fetch_optional(conn)
+    .fetch_optional(tx.into_sqlx())
     .await?;
     Ok(locked.is_some())
 }
@@ -404,17 +418,20 @@ pub async fn lock_restore_claim(
 ///
 /// The caller compares the token under the lock, so a cleanup by a lapsed
 /// lease owner serializes against the lease takeover, which locks the row
-/// before it writes a new token.
-pub async fn lock_restore_lease_token(
-    conn: &mut sqlx::PgConnection,
+/// before it writes a new token. The caller must pass its open transaction.
+pub async fn lock_restore_lease_token<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
-) -> Result<Option<Option<Uuid>>, sqlx::Error> {
-    sqlx::query_scalar::<_, Option<Uuid>>(sql!(
+) -> Result<Option<Option<Uuid>>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar::<_, Option<Uuid>>(sql!(
         "SELECT restore_lease_token FROM sandboxes WHERE id = $1 FOR UPDATE"
     ))
     .bind(sandbox_id)
-    .fetch_optional(conn)
-    .await
+    .fetch_optional(tx.into_sqlx())
+    .await?)
 }
 
 /// What [`restore_revert_evidence`] reads of one row: the active execution
@@ -431,7 +448,8 @@ pub struct RestoreRevertEvidence {
 
 /// Read the evidence a restore revert decides on, after
 /// [`lock_restore_claim`] in the caller's transaction. A plain read: it takes
-/// no lock, and a missing row is an error ([`sqlx::Error::RowNotFound`]).
+/// no lock, and a missing row is an error
+/// ([`DbErrorKind::NotFound`](pplx_space_postgres_pool::DbErrorKind::NotFound)).
 ///
 /// The claimed execution is an active one created at or after the row's
 /// `lifecycle_changed_at` that carries `activation_attempt` (its attempt id
@@ -441,12 +459,16 @@ pub struct RestoreRevertEvidence {
 /// claim's `restoring` transition, so that execution is the one this claim
 /// created. The source proof is
 /// `pplx_space_sandbox_portability::restore_retry_suspended_revert_snapshot_exists`.
-pub async fn restore_revert_evidence(
-    conn: &mut sqlx::PgConnection,
+/// The caller must pass its open transaction.
+pub async fn restore_revert_evidence<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     restore_lease_token: Option<Uuid>,
     activation_attempt: Option<(SandboxActivationAttemptId, i64)>,
-) -> Result<RestoreRevertEvidence, sqlx::Error> {
+) -> Result<RestoreRevertEvidence, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     /// Built once: every input is a literal or a bind placeholder.
     static QUERY: LazyLock<String> = LazyLock::new(|| {
         let proof = restore_retry_suspended_revert_snapshot_exists("s");
@@ -487,7 +509,7 @@ pub async fn restore_revert_evidence(
         .bind(restore_lease_token)
         .bind(activation_attempt.map(|(attempt, _)| attempt))
         .bind(activation_attempt.map(|(_, generation)| generation))
-        .fetch_one(conn)
+        .fetch_one(tx.into_sqlx())
         .await?;
     Ok(RestoreRevertEvidence {
         claimed_generation,
@@ -516,10 +538,10 @@ pub struct RestoreOwnershipSnapshot {
 /// `execution_ownership_ttl_secs` past its `updated_at`. A plain read: it
 /// takes no lock, and both remainders are against the database's `NOW()`.
 pub async fn restore_ownership_snapshot(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     execution_ownership_ttl_secs: i64,
-) -> Result<Option<RestoreOwnershipSnapshot>, sqlx::Error> {
+) -> Result<Option<RestoreOwnershipSnapshot>, DbError> {
     let row: Option<(String, Option<String>, f64, f64)> = sqlx::query_as(sql!(
         "SELECT lifecycle,
                     evacuation_restore_target,
@@ -544,7 +566,7 @@ pub async fn restore_ownership_snapshot(
     ))
     .bind(sandbox_id.as_uuid())
     .bind(execution_ownership_ttl_secs)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(row.map(
         |(lifecycle, evacuation_restore_target, lease_remaining_secs, execution_remaining_secs)| {
@@ -582,10 +604,10 @@ pub struct UserRestoreObservationRow {
 /// The remainders are as [`restore_ownership_snapshot`] computes them. A
 /// plain read: it takes no lock.
 pub async fn observe_user_restores(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_ids: &[SandboxId],
     execution_ownership_ttl_secs: i64,
-) -> Result<Vec<UserRestoreObservationRow>, sqlx::Error> {
+) -> Result<Vec<UserRestoreObservationRow>, DbError> {
     type Row = (
         Uuid,
         String,
@@ -628,7 +650,7 @@ pub async fn observe_user_restores(
             .collect::<Vec<_>>(),
     )
     .bind(execution_ownership_ttl_secs)
-    .fetch_all(executor)
+    .fetch_all(executor.into_sqlx())
     .await?;
     Ok(rows
         .into_iter()

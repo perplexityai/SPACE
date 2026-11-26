@@ -11,6 +11,7 @@
 //! caller passes.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_snapshot_model::LocalArtifactId;
 
@@ -21,7 +22,6 @@ use pplx_space_sandbox_portability::{
     snapshot_is_current_local_artifact,
 };
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 
 /// What [`restore_source_plan`] reads of one row: the two node-name
 /// candidates, kept apart rather than `COALESCE`d, the placement's node id,
@@ -64,9 +64,9 @@ pub struct RestoreSourcePlanRow {
 /// re-placement with a target chosen and nothing active yet still has no local
 /// copy anywhere.
 pub async fn restore_source_plan(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<RestoreSourcePlanRow>, sqlx::Error> {
+) -> Result<Option<RestoreSourcePlanRow>, DbError> {
     type Row = (Option<String>, Option<String>, Option<NodeId>, bool);
     let row: Option<Row> = sqlx::query_as(sql!(
         "SELECT (
@@ -96,7 +96,7 @@ pub async fn restore_source_plan(
              WHERE s.id = $1"
     ))
     .bind(sandbox_id)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(row.map(
         |(mapped_name, execution_name, placement_node_id, stopped_evacuation_unplaced)| {
@@ -140,9 +140,9 @@ pub struct StoppedEvacuationRestoreSourceRow {
 /// `local_artifact_id`, so the pin can match several rows, and the latest
 /// registered location is the one to load.
 pub async fn stopped_evacuation_restore_source(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<StoppedEvacuationRestoreSourceRow>, sqlx::Error> {
+) -> Result<Option<StoppedEvacuationRestoreSourceRow>, DbError> {
     let pinned = snapshot_is_current_local_artifact("s", "sn");
     let query = sql!(format!(
         "SELECT ssl.storage_connection_string, s.current_local_artifact_id
@@ -161,7 +161,7 @@ pub async fn stopped_evacuation_restore_source(
     ));
     let row: Option<(String, LocalArtifactId)> = sqlx::query_as(sqlx::AssertSqlSafe(query))
         .bind(sandbox_id)
-        .fetch_optional(executor)
+        .fetch_optional(executor.into_sqlx())
         .await?;
     Ok(
         row.map(|(storage_connection_string, current_local_artifact_id)| {
@@ -200,10 +200,10 @@ pub enum SuspendRestoreSnapshot {
 /// the fragment the retention sweeper's never-prune-the-current-artifact
 /// guard is built from, so the sweep cannot delete what those branches select.
 pub async fn suspend_restore_storage_uri(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     snapshot: SuspendRestoreSnapshot,
-) -> Result<Option<String>, sqlx::Error> {
+) -> Result<Option<String>, DbError> {
     static RESTORE_RETRY_SOURCE: LazyLock<String> = LazyLock::new(|| {
         let retry_source = restore_retry_source_snapshot_is_current("s", "sn");
         sql!(format!(
@@ -268,10 +268,10 @@ pub async fn suspend_restore_storage_uri(
         SuspendRestoreSnapshot::NewestRemote => &NEWEST_REMOTE,
         SuspendRestoreSnapshot::PlacementFresh => &PLACEMENT_FRESH,
     };
-    sqlx::query_scalar(sqlx::AssertSqlSafe(query.as_str()))
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(query.as_str()))
         .bind(sandbox_id)
-        .fetch_optional(executor)
-        .await
+        .fetch_optional(executor.into_sqlx())
+        .await?)
 }
 
 /// The storage connection string of the newest ready disk snapshot of a
@@ -284,9 +284,9 @@ pub async fn suspend_restore_storage_uri(
 /// tiebreak, because a retried backup of one artifact mints a fresh
 /// `snapshots` row per attempt while keeping the same `local_artifact_id`.
 pub async fn stopped_restore_storage_uri(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<String>, sqlx::Error> {
+) -> Result<Option<String>, DbError> {
     static QUERY: LazyLock<String> = LazyLock::new(|| {
         let pinned = snapshot_is_current_local_artifact("s", "sn");
         sql!(format!(
@@ -304,8 +304,8 @@ pub async fn stopped_restore_storage_uri(
               LIMIT 1"
         ))
     });
-    sqlx::query_scalar(sqlx::AssertSqlSafe(QUERY.as_str()))
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(QUERY.as_str()))
         .bind(sandbox_id)
-        .fetch_optional(executor)
-        .await
+        .fetch_optional(executor.into_sqlx())
+        .await?)
 }
