@@ -5,9 +5,9 @@
 
 use pplx_space_accounts::NodeId;
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyCondition};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 use sqlx::types::Json;
 
 use crate::observed_states::ObservedSpacedVersion;
@@ -53,12 +53,12 @@ pub struct ObservedStateRow {
 /// The observed states of `ids`, in no particular order. The
 /// network-policy columns come from the node facet named
 /// `network_policy_facet`.
-pub async fn observed_states<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn observed_states(
+    executor: impl Executor<'_>,
     ids: &[SandboxId],
     network_policy_facet: &str,
-) -> Result<Vec<ObservedStateRow>, sqlx::Error> {
-    sqlx::query_as::<_, ObservedStateRow>(
+) -> Result<Vec<ObservedStateRow>, DbError> {
+    Ok(sqlx::query_as::<_, ObservedStateRow>(
         sql!("SELECT sos.sandbox_id,
                 sos.node_id,
                 COALESCE(observed_direct.name, observed_k8s.k8s_node_name) AS node_name,
@@ -136,19 +136,19 @@ pub async fn observed_states<'e>(
     )
     .bind(ids)
     .bind(network_policy_facet)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The observed states whose sandbox has no `sandboxes` row and is not
 /// among `known_ids`, newest observation first. The network-policy columns
 /// come from the node facet named `network_policy_facet`.
-pub async fn observed_only<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn observed_only(
+    executor: impl Executor<'_>,
     known_ids: &[SandboxId],
     network_policy_facet: &str,
-) -> Result<Vec<ObservedStateRow>, sqlx::Error> {
-    sqlx::query_as::<_, ObservedStateRow>(
+) -> Result<Vec<ObservedStateRow>, DbError> {
+    Ok(sqlx::query_as::<_, ObservedStateRow>(
         sql!("SELECT sos.sandbox_id,
                 sos.node_id,
                 COALESCE(observed_direct.name, observed_k8s.k8s_node_name) AS node_name,
@@ -228,6 +228,6 @@ pub async fn observed_only<'e>(
     )
     .bind(known_ids)
     .bind(network_policy_facet)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }

@@ -108,7 +108,7 @@ pub async fn delete_with_dependents(
 ) -> Result<(), sqlx::Error> {
     let cleanup_refs = sandbox_reconcile_cleanup_refs(sandbox_id);
     observed_states::delete(&mut **tx, sandbox_id).await?;
-    delete_reconcile_state_for_elements(tx, &cleanup_refs).await?;
+    delete_reconcile_state_for_elements(&mut **tx, &cleanup_refs).await?;
     sqlx::query(sql!(
         "UPDATE snapshot_storage_locations
          SET snapshot_id = NULL, orphaned_at = NOW()

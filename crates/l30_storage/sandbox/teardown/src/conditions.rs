@@ -2,6 +2,7 @@
 //! reported for a facet/element pair.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use sqlx::types::Json;
 
@@ -11,12 +12,12 @@ use sqlx::types::Json;
 /// status changes. The ref's observed-status row must exist
 /// ([`crate::observed_status::touch`]).
 pub async fn record_apply_failed(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     facet: &str,
     element: Option<&str>,
     message: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "INSERT INTO node_facet_conditions (
              node_id, facet, element, condition_type, condition_status,
@@ -41,7 +42,7 @@ pub async fn record_apply_failed(
     .bind(facet)
     .bind(element)
     .bind(message)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -49,11 +50,11 @@ pub async fn record_apply_failed(
 /// Clear `node_id`'s `ApplyFailed` condition for the `(facet, element)` ref
 /// (`None`, the whole-facet ref).
 pub async fn clear_apply_failed(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     facet: &str,
     element: Option<&str>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "DELETE FROM node_facet_conditions
          WHERE node_id = $1
@@ -64,7 +65,7 @@ pub async fn clear_apply_failed(
     .bind(node_id)
     .bind(facet)
     .bind(element)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -75,11 +76,11 @@ pub async fn clear_apply_failed(
 /// carries a generation and names a template the node's
 /// `node_template_inventory` lists.
 pub async fn clear_template_apply_failed(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     rows: &serde_json::Value,
     facet: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "WITH input AS (
              SELECT *
@@ -103,7 +104,7 @@ pub async fn clear_template_apply_failed(
     .bind(node_id)
     .bind(Json(rows))
     .bind(facet)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -113,11 +114,11 @@ pub async fn clear_template_apply_failed(
 /// with `sandbox_id` and `observed_network_policy_generation`) that carries a
 /// generation and whose sandbox is gone or still active on `node_id`.
 pub async fn clear_sandbox_apply_failed(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     rows: &serde_json::Value,
     facet: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "WITH input AS (
              SELECT *
@@ -143,7 +144,7 @@ pub async fn clear_sandbox_apply_failed(
     .bind(node_id)
     .bind(Json(rows))
     .bind(facet)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }

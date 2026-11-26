@@ -379,7 +379,7 @@ pub(super) async fn fetch_sandbox_observed_states(
         ReconcileFacet::NetworkPolicy.as_str(),
     )
     .await
-    .map_err(|err| db_contention_error("query sandbox observed state", &err))?;
+    .map_err(|err| db_contention_error("query sandbox observed state", &sqlx::Error::from(err)))?;
     Ok(rows
         .into_iter()
         .map(|row| (row.sandbox_id, SandboxObservedState::from(row)))
@@ -397,7 +397,7 @@ pub(super) async fn fetch_observed_only_sandboxes(
     )
     .await
     .map(|rows| rows.into_iter().map(SandboxObservedState::from).collect())
-    .map_err(|err| db_contention_error("query observed-only sandboxes", &err))
+    .map_err(|err| db_contention_error("query observed-only sandboxes", &sqlx::Error::from(err)))
 }
 
 pub(super) fn sandbox_to_cached_response(

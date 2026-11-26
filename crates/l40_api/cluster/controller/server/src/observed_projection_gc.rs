@@ -421,6 +421,7 @@ async fn delete_stale_suspended_observed(
         to,
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 /// One windowed sweep of orphaned observed rows (source-of-truth sandbox row
@@ -435,7 +436,9 @@ async fn delete_orphaned_observed(
     from: Uuid,
     to: Uuid,
 ) -> Result<DeleteReportRow, sqlx::Error> {
-    observed_gc::delete_orphaned(pool, secs_i64(request.orphan_age), limit, from, to).await
+    observed_gc::delete_orphaned(pool, secs_i64(request.orphan_age), limit, from, to)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 /// One windowed sweep of orphaned facet rows over the composite-primary-key
@@ -452,6 +455,7 @@ async fn delete_orphaned_facets(
 ) -> Result<DeleteReportRow, sqlx::Error> {
     observed_status::delete_orphaned_in_window(pool, secs_i64(request.orphan_age), limit, from, to)
         .await
+        .map_err(sqlx::Error::from)
 }
 
 pub struct Reconciler<S: ProjectionGcSink> {
