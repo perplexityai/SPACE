@@ -18,6 +18,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
 };
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::{
     ConditionStatus, CreateSandboxRequest, OperationId, OperationKind, OperationState,
@@ -625,13 +626,13 @@ async fn with_native_create_defaults(
     mut request: CreateSandboxRequest,
 ) -> Result<CreateSandboxRequest, PublicApiError> {
     if request.auto_lifecycle.is_none() {
-        let template_default =
-            crate::controllers::sandbox::template_desired_default_auto_lifecycle(
-                pool,
-                request.template.name().as_str(),
-            )
-            .await
-            .map_err(database_error)?;
+        let template_default = pplx_space_template_store::default_auto_lifecycle_policies::desired(
+            pool,
+            request.template.name(),
+        )
+        .await
+        .map_err(sqlx::Error::from)
+        .map_err(database_error)?;
         request.auto_lifecycle =
             Some(template_default.unwrap_or_else(native_server_default_auto_lifecycle));
     }

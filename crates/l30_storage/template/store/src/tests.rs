@@ -577,9 +577,18 @@ async fn the_default_auto_lifecycle_upsert_replaces_the_policy() -> TestResult {
         "fc",
     )
     .await?;
-    assert_eq!(for_create.map(|policy| policy.0), Some(second));
+    assert_eq!(for_create.map(|policy| policy.0), Some(second.clone()));
     assert!(
         super::default_auto_lifecycle_policies::for_create(&db.pool, "other", "sha256:any", "fc")
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        super::default_auto_lifecycle_policies::desired(&db.pool, &template).await?,
+        Some(second)
+    );
+    assert!(
+        super::default_auto_lifecycle_policies::desired(&db.pool, &name("other"))
             .await?
             .is_none()
     );

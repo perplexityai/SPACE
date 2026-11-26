@@ -543,27 +543,6 @@ async fn load_create_template_defaults(
     })
 }
 
-/// The operator-set default auto-lifecycle policy for `template_name`, if any.
-///
-/// This is the desired-state authority that `PUT /admin/templates/{name}`
-/// writes and builder inventory echoes back.
-pub(crate) async fn template_desired_default_auto_lifecycle(
-    pool: &PgPool,
-    template_name: &str,
-) -> Result<Option<AutoLifecyclePolicy>, sqlx::Error> {
-    Ok(
-        sqlx::query_scalar::<_, sqlx::types::Json<AutoLifecyclePolicy>>(sql!(
-            "SELECT default_auto_lifecycle_json
-             FROM template_default_auto_lifecycle_policies
-             WHERE template = $1"
-        ))
-        .bind(template_name)
-        .fetch_optional(pool)
-        .await?
-        .map(|sqlx::types::Json(policy)| policy),
-    )
-}
-
 fn create_auto_lifecycle_policy(
     policy: Option<AutoLifecyclePolicy>,
 ) -> Result<AutoLifecyclePolicy, ControllerError> {
