@@ -21,6 +21,7 @@ uuid = { workspace = true }
 # internal
 pplx-space-accounts = { workspace = true, features = ["sqlx"] }
 pplx-space-node-model = { workspace = true, features = ["sqlx"] }
+pplx-space-postgres-pool = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 pplx-space-template-model = { workspace = true, features = ["sqlx"] }
 

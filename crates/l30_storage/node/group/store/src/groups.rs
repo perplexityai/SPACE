@@ -3,8 +3,9 @@
 
 use pplx_space_accounts::OrgId;
 use pplx_space_node_model::{NodeGroupId, NodeGroupName, NodeGroupTemplatePolicy};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::{FromRow, PgExecutor, Postgres, Transaction};
+use sqlx::FromRow;
 use time::OffsetDateTime;
 
 #[derive(Debug, Clone, FromRow)]
@@ -30,10 +31,10 @@ pub struct NodeGroupRow {
 
 /// `node_group_id`'s row, if the group exists.
 pub async fn node_group(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_group_id: NodeGroupId,
-) -> Result<Option<NodeGroupRow>, sqlx::Error> {
-    sqlx::query_as::<_, NodeGroupRow>(sql!(
+) -> Result<Option<NodeGroupRow>, DbError> {
+    Ok(sqlx::query_as::<_, NodeGroupRow>(sql!(
         "SELECT g.id,
        g.name,
        g.org_id,
@@ -48,13 +49,13 @@ FROM node_groups g
 WHERE g.id = $1"
     ))
     .bind(node_group_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Every group's row, ordered by name.
-pub async fn node_groups(executor: impl PgExecutor<'_>) -> Result<Vec<NodeGroupRow>, sqlx::Error> {
-    sqlx::query_as::<_, NodeGroupRow>(sql!(
+pub async fn node_groups(executor: impl Executor<'_>) -> Result<Vec<NodeGroupRow>, DbError> {
+    Ok(sqlx::query_as::<_, NodeGroupRow>(sql!(
         "SELECT g.id,
        g.name,
        g.org_id,
@@ -68,18 +69,22 @@ pub async fn node_groups(executor: impl PgExecutor<'_>) -> Result<Vec<NodeGroupR
 FROM node_groups g
 ORDER BY g.name ASC"
     ))
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// [`node_group`] with the group's row locked `FOR UPDATE`; the counted
 /// `nodes` rows are not locked. The lock lasts until the caller's
-/// transaction ends, so a guarded write validates and writes under it.
-pub async fn lock_node_group(
-    tx: &mut Transaction<'_, Postgres>,
+/// transaction ends, so a guarded write validates and writes under it. The
+/// caller must pass its open transaction.
+pub async fn lock_node_group<C>(
+    tx: &mut C,
     node_group_id: NodeGroupId,
-) -> Result<Option<NodeGroupRow>, sqlx::Error> {
-    sqlx::query_as::<_, NodeGroupRow>(sql!(
+) -> Result<Option<NodeGroupRow>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_as::<_, NodeGroupRow>(sql!(
         "SELECT g.id,
        g.name,
        g.org_id,
@@ -95,8 +100,8 @@ WHERE g.id = $1
 FOR UPDATE OF g"
     ))
     .bind(node_group_id)
-    .fetch_optional(&mut **tx)
-    .await
+    .fetch_optional(tx.into_sqlx())
+    .await?)
 }
 
 #[cfg(test)]

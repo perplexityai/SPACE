@@ -51,11 +51,15 @@ impl AdminNodeGroupStore {
         &self,
         node_group_id: NodeGroupId,
     ) -> Result<Option<NodeGroupRow>, sqlx::Error> {
-        pplx_space_node_group_store::groups::node_group(&self.pool, node_group_id).await
+        pplx_space_node_group_store::groups::node_group(&self.pool, node_group_id)
+            .await
+            .map_err(sqlx::Error::from)
     }
 
     pub(super) async fn list(&self) -> Result<Vec<NodeGroupRow>, sqlx::Error> {
-        pplx_space_node_group_store::groups::node_groups(&self.pool).await
+        pplx_space_node_group_store::groups::node_groups(&self.pool)
+            .await
+            .map_err(sqlx::Error::from)
     }
 
     /// Allowlist template names per group in one round trip. Groups with no
@@ -172,6 +176,7 @@ pub(super) async fn update_group_org_in_tx(
         reset_policy,
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 /// Move the singleton default flag onto `node_group_id`. The caller has
@@ -183,7 +188,9 @@ pub(super) async fn move_default_in_tx(
     node_group_id: NodeGroupId,
 ) -> Result<(), sqlx::Error> {
     pplx_space_node_group_store::clear_default_node_group(&mut **tx).await?;
-    pplx_space_node_group_store::set_default_node_group(&mut **tx, node_group_id).await
+    pplx_space_node_group_store::set_default_node_group(&mut **tx, node_group_id)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 /// Set the template policy. Moving to `default` clears the allowlist in the
@@ -199,6 +206,7 @@ pub(super) async fn set_template_policy_in_tx(
     }
     pplx_space_node_group_store::set_node_group_template_policy(&mut **tx, node_group_id, policy)
         .await
+        .map_err(sqlx::Error::from)
 }
 
 /// Replace the group's allowlist with `names` (full-set PUT semantics).
@@ -211,7 +219,9 @@ pub(super) async fn replace_compat_in_tx(
     if names.is_empty() {
         return Ok(());
     }
-    pplx_space_node_group_store::insert_template_compat(&mut **tx, node_group_id, names).await
+    pplx_space_node_group_store::insert_template_compat(&mut **tx, node_group_id, names)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 /// Postgres-backed regression tests for the node-group store: the schema

@@ -15,11 +15,11 @@ use std::time::Duration;
 use pplx_space_node_model::NodeGroupId;
 use pplx_space_node_registration_store::node_group;
 use pplx_space_postgres_pool::TxSettings as _;
-use sqlx::{Connection, PgConnection, PgExecutor, Postgres, Transaction};
+use sqlx::{Connection, PgConnection, Postgres, Transaction};
 
 /// `node_groups` as `name -> id`.
-pub(super) async fn group_ids_by_name<'e>(
-    executor: impl PgExecutor<'e>,
+pub(super) async fn group_ids_by_name(
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
 ) -> Result<HashMap<String, NodeGroupId>, sqlx::Error> {
     let rows = pplx_space_node_group_store::node_group_names(executor).await?;
     Ok(rows.into_iter().map(|row| (row.name, row.id)).collect())
