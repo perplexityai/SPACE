@@ -155,6 +155,7 @@ async fn insert(
         },
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 async fn expire(pool: &sqlx::PgPool, session_id: &str) -> Result<(), sqlx::Error> {
@@ -264,7 +265,7 @@ async fn revoke_clears_the_token_and_advances_the_epoch_only_when_asked() -> Tes
 
     let mut tx = db.pool.begin().await?;
     assert_eq!(
-        lock_live_revocation_status(&mut tx, org_id, sandbox_id, "dps_revoked")
+        lock_live_revocation_status(&mut *tx, org_id, sandbox_id, "dps_revoked")
             .await?
             .as_deref(),
         Some("active")
@@ -312,7 +313,7 @@ async fn revoke_leaves_an_expired_session_alone() -> TestResult {
 
     let mut tx = db.pool.begin().await?;
     assert_eq!(
-        lock_live_revocation_status(&mut tx, org_id, sandbox_id, "dps_expired").await?,
+        lock_live_revocation_status(&mut *tx, org_id, sandbox_id, "dps_expired").await?,
         None
     );
     tx.commit().await?;

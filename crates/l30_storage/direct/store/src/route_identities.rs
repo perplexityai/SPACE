@@ -7,9 +7,10 @@
 //! `sandboxes` row's lifecycle and placement stay with
 //! `pplx-space-sandbox-store`.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{SandboxId, SandboxRouteIdentity};
 use pplx_space_sql_locator::sql;
-use sqlx::{FromRow, PgExecutor};
+use sqlx::FromRow;
 use uuid::Uuid;
 
 /// A sandbox's stored route identity, as its columns hold it. The caller
@@ -25,11 +26,11 @@ pub struct RouteIdentityRow {
 }
 
 /// The sandbox's route identity, or `None` when it has none.
-pub async fn get<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn get(
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<RouteIdentityRow>, sqlx::Error> {
-    sqlx::query_as::<_, RouteIdentityRow>(sql!(
+) -> Result<Option<RouteIdentityRow>, DbError> {
+    Ok(sqlx::query_as::<_, RouteIdentityRow>(sql!(
         "SELECT route_generation,
                     current_node_id,
                     substrate_kind,
@@ -40,8 +41,8 @@ pub async fn get<'e>(
               WHERE sandbox_id = $1"
     ))
     .bind(sandbox_id.as_uuid())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Guarded write: stores `identity` as the sandbox's route unless the stored
@@ -51,10 +52,10 @@ pub async fn get<'e>(
 /// The guard compares generations only. Whatever else the write needs, such
 /// as the restore lease it is made under, the caller checks first in the same
 /// transaction.
-pub async fn store_unless_newer<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn store_unless_newer(
+    executor: impl Executor<'_>,
     identity: &SandboxRouteIdentity,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let persisted = sqlx::query_scalar::<_, i64>(sql!(
         "INSERT INTO sandbox_direct_route_identities (
              sandbox_id, route_generation, current_node_id, substrate_kind,
@@ -80,7 +81,7 @@ pub async fn store_unless_newer<'e>(
     .bind(identity.execution_generation())
     .bind(identity.activation_attempt_id().as_uuid())
     .bind(identity.pod_uid().map(ToString::to_string))
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(persisted.is_some())
 }
@@ -97,10 +98,10 @@ pub async fn store_unless_newer<'e>(
 /// A sandbox with no stored route always accepts. The guard reads the
 /// `sandboxes` row; a caller that changes it first, in the same transaction,
 /// holds its row lock across this write.
-pub async fn accept_receipt<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn accept_receipt(
+    executor: impl Executor<'_>,
     identity: &SandboxRouteIdentity,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let persisted = sqlx::query_scalar::<_, i64>(sql!(
         "INSERT INTO sandbox_direct_route_identities (
              sandbox_id,
@@ -154,22 +155,19 @@ pub async fn accept_receipt<'e>(
     .bind(identity.execution_generation())
     .bind(identity.activation_attempt_id().as_uuid())
     .bind(identity.pod_uid().map(ToString::to_string))
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(persisted.is_some())
 }
 
 /// Deletes the sandbox's route identity, if it has one. Its provenance stays.
-pub async fn delete<'e>(
-    executor: impl PgExecutor<'e>,
-    sandbox_id: SandboxId,
-) -> Result<(), sqlx::Error> {
+pub async fn delete(executor: impl Executor<'_>, sandbox_id: SandboxId) -> Result<(), DbError> {
     sqlx::query(sql!(
         "DELETE FROM sandbox_direct_route_identities
          WHERE sandbox_id = $1"
     ))
     .bind(sandbox_id.as_uuid())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }

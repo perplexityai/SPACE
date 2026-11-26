@@ -11,8 +11,8 @@
 //! retention loop deletes ended sessions with [`delete_ended_sessions`].
 //!
 //! Every verb except [`lock_live_revocation_status`] takes an executor, so a
-//! caller can run it in its own transaction. That one takes the caller's
-//! connection, and its row lock lasts until the caller's transaction ends.
+//! caller can run it in its own transaction. That one takes the caller's open
+//! transaction, and its row lock lasts until the caller's transaction ends.
 //! Statements that compare with the database clock (`NOW()`) keep the
 //! comparison in their SQL: the caller's executor decides which transaction's
 //! start time they compare against. Guarded transitions
@@ -28,6 +28,7 @@
 pub mod direct;
 
 use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use sqlx::{FromRow, types::Json};
@@ -138,10 +139,10 @@ pub struct OrgRevocationEpoch {
 
 /// Insert a session and return it as stored.
 pub async fn insert_session(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     session: &NewSession<'_>,
-) -> Result<Session, sqlx::Error> {
-    sqlx::query_as::<_, Session>(sql!(
+) -> Result<Session, DbError> {
+    Ok(sqlx::query_as::<_, Session>(sql!(
         "INSERT INTO data_plane_sessions (
              session_id,
              org_id,
@@ -192,19 +193,19 @@ pub async fn insert_session(
     .bind(session.target_path)
     .bind(Json(session.adapter_state))
     .bind(session.expires_at)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// The guest process id the data plane bound `session_id` to; `None` when the
 /// session is gone or has bound none. Expired and revoked sessions are read
 /// too.
 pub async fn bound_process_id(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     sandbox_id: SandboxId,
     session_id: &str,
-) -> Result<Option<String>, sqlx::Error> {
+) -> Result<Option<String>, DbError> {
     let process_id = sqlx::query_scalar::<_, Option<String>>(sql!(
         "SELECT backend_process_id
          FROM data_plane_sessions
@@ -215,7 +216,7 @@ pub async fn bound_process_id(
     .bind(org_id)
     .bind(sandbox_id)
     .bind(session_id)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(process_id.flatten())
 }
@@ -223,12 +224,12 @@ pub async fn bound_process_id(
 /// The sessions of `sandbox_id` the data plane bound to any of
 /// `process_ids`. Expired and revoked sessions are read too.
 pub async fn sessions_bound_to_processes(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     sandbox_id: SandboxId,
     process_ids: &[String],
-) -> Result<Vec<SessionProcessBinding>, sqlx::Error> {
-    sqlx::query_as::<_, SessionProcessBinding>(sql!(
+) -> Result<Vec<SessionProcessBinding>, DbError> {
+    Ok(sqlx::query_as::<_, SessionProcessBinding>(sql!(
         "SELECT session_id,
                 backend_process_id
          FROM data_plane_sessions
@@ -239,15 +240,15 @@ pub async fn sessions_bound_to_processes(
     .bind(org_id)
     .bind(sandbox_id)
     .bind(process_ids)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Advance the org's revocation epoch by one, starting it at 1.
 pub async fn advance_org_revocation_epoch(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "INSERT INTO data_plane_org_revocation_epochs (org_id, epoch, updated_at)
          VALUES ($1, 1, NOW())
@@ -256,7 +257,7 @@ pub async fn advance_org_revocation_epoch(
                  updated_at = EXCLUDED.updated_at"
     ))
     .bind(org_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -264,28 +265,28 @@ pub async fn advance_org_revocation_epoch(
 /// The org's revocation epoch; `None` when no session in the org has been
 /// revoked.
 pub async fn org_revocation_epoch(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
-) -> Result<Option<OrgRevocationEpoch>, sqlx::Error> {
-    sqlx::query_as::<_, OrgRevocationEpoch>(sql!(
+) -> Result<Option<OrgRevocationEpoch>, DbError> {
+    Ok(sqlx::query_as::<_, OrgRevocationEpoch>(sql!(
         "SELECT epoch, updated_at
          FROM data_plane_org_revocation_epochs
          WHERE org_id = $1"
     ))
     .bind(org_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The session `session_id` of `sandbox_id`, unless it is gone or has
 /// expired by the database clock.
 pub async fn live_session(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     sandbox_id: SandboxId,
     session_id: &str,
-) -> Result<Option<Session>, sqlx::Error> {
-    sqlx::query_as::<_, Session>(sql!(
+) -> Result<Option<Session>, DbError> {
+    Ok(sqlx::query_as::<_, Session>(sql!(
         "SELECT session_id,
        sandbox_id,
        kind,
@@ -308,22 +309,22 @@ WHERE org_id = $1
     .bind(org_id)
     .bind(sandbox_id)
     .bind(session_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Up to `limit` of the sessions of `sandbox_id` that have not expired by
 /// the database clock, newest first, of `kind` when one is given, and
 /// starting after `cursor` when one is given.
 pub async fn list_live_sessions(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     sandbox_id: SandboxId,
     kind: Option<&str>,
     cursor: Option<SessionCursor<'_>>,
     limit: i64,
-) -> Result<Vec<Session>, sqlx::Error> {
-    sqlx::query_as::<_, Session>(sql!(
+) -> Result<Vec<Session>, DbError> {
+    Ok(sqlx::query_as::<_, Session>(sql!(
         "SELECT session_id,
                     sandbox_id,
                     kind,
@@ -355,21 +356,27 @@ pub async fn list_live_sessions(
     .bind(cursor.map(|cursor| cursor.created_at))
     .bind(cursor.map(|cursor| cursor.session_id))
     .bind(limit)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Lock the session `session_id` of `sandbox_id` and read its revocation
 /// status, unless it is gone or has expired by the database clock.
 ///
 /// The row lock (`FOR UPDATE`) lasts until the caller's transaction ends.
-pub async fn lock_live_revocation_status(
-    conn: &mut sqlx::PgConnection,
+/// It takes a `Tx` or a `PgConnection` and refuses a pool, but cannot tell
+/// whether a `PgConnection` has a transaction open: the caller must pass its
+/// open transaction.
+pub async fn lock_live_revocation_status<C>(
+    tx: &mut C,
     org_id: OrgId,
     sandbox_id: SandboxId,
     session_id: &str,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>(sql!(
+) -> Result<Option<String>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar::<_, String>(sql!(
         "SELECT revocation_status
              FROM data_plane_sessions
              WHERE org_id = $1
@@ -381,8 +388,8 @@ pub async fn lock_live_revocation_status(
     .bind(org_id)
     .bind(sandbox_id)
     .bind(session_id)
-    .fetch_optional(conn)
-    .await
+    .fetch_optional(tx.into_sqlx())
+    .await?)
 }
 
 /// Revoke the session `session_id` of `sandbox_id` and return it as revoked;
@@ -392,14 +399,14 @@ pub async fn lock_live_revocation_status(
 /// epoch advances only when `advance_epoch`, which the caller decides from
 /// the status it read under [`lock_live_revocation_status`].
 pub async fn revoke_live_session(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     sandbox_id: SandboxId,
     session_id: &str,
     reason: &str,
     advance_epoch: bool,
-) -> Result<Option<Session>, sqlx::Error> {
-    sqlx::query_as::<_, Session>(sql!(
+) -> Result<Option<Session>, DbError> {
+    Ok(sqlx::query_as::<_, Session>(sql!(
         "UPDATE data_plane_sessions
              SET revocation_epoch = CASE WHEN $5::BOOL THEN revocation_epoch + 1 ELSE revocation_epoch END,
                  revocation_status = 'revoked',
@@ -433,20 +440,20 @@ pub async fn revoke_live_session(
     .bind(session_id)
     .bind(reason)
     .bind(advance_epoch)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Give the session `session_id` a new attach token, and report whether it
 /// did: `false` when its revocation has started (its `revocation_status` is
 /// no longer `active`), it has expired by the database clock, or it is gone.
 pub async fn refresh_live_attach_token(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     session_id: &str,
     token_hash: &str,
     token_expires_at: OffsetDateTime,
     attach_deadline_at: OffsetDateTime,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let refreshed = sqlx::query(sql!(
         "UPDATE data_plane_sessions
          SET token_hash = $2,
@@ -461,7 +468,7 @@ pub async fn refresh_live_attach_token(
     .bind(token_hash)
     .bind(token_expires_at)
     .bind(attach_deadline_at)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(refreshed.rows_affected() > 0)
 }
@@ -478,13 +485,13 @@ pub async fn refresh_live_attach_token(
 /// takes any executor. Like the `UPDATE`'s own row lock, it is held until the
 /// transaction the statement runs in ends; on a pool, that is the statement.
 pub async fn bind_session_process(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     session_id: &str,
     protocol_session_id: Option<&str>,
     process_id: &str,
     records_exit: bool,
-) -> Result<Option<BoundSessionProcess>, sqlx::Error> {
-    sqlx::query_as::<_, BoundSessionProcess>(sql!(
+) -> Result<Option<BoundSessionProcess>, DbError> {
+    Ok(sqlx::query_as::<_, BoundSessionProcess>(sql!(
         "WITH target AS (
              SELECT session_id,
                     protocol_session_id,
@@ -529,8 +536,8 @@ pub async fn bind_session_process(
     .bind(protocol_session_id)
     .bind(process_id)
     .bind(records_exit)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The guest process id the terminal or process session `session_id` is
@@ -538,10 +545,10 @@ pub async fn bind_session_process(
 /// of another kind, carries another protocol session id than
 /// `protocol_session_id` (when one is given), or has bound none.
 pub async fn live_process_session_bound_process_id(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     session_id: &str,
     protocol_session_id: Option<&str>,
-) -> Result<Option<String>, sqlx::Error> {
+) -> Result<Option<String>, DbError> {
     let process_id = sqlx::query_scalar::<_, Option<String>>(sql!(
         "SELECT backend_process_id
          FROM data_plane_sessions
@@ -552,7 +559,7 @@ pub async fn live_process_session_bound_process_id(
     ))
     .bind(session_id)
     .bind(protocol_session_id)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(process_id.flatten())
 }
@@ -563,11 +570,11 @@ pub async fn live_process_session_bound_process_id(
 /// database clock closes, and one that carries another protocol session id
 /// than `protocol_session_id` (when one is given) does not.
 pub async fn close_exited_process_session(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     session_id: &str,
     protocol_session_id: Option<&str>,
     process_id: &str,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let closed = sqlx::query(sql!(
         "UPDATE data_plane_sessions
          SET state = 'closed',
@@ -582,7 +589,7 @@ pub async fn close_exited_process_session(
     .bind(session_id)
     .bind(protocol_session_id)
     .bind(process_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(closed.rows_affected() > 0)
 }
@@ -592,12 +599,12 @@ pub async fn close_exited_process_session(
 /// or carries another protocol session id than `protocol_session_id` (when
 /// one is given).
 pub async fn record_reconnect(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     session_id: &str,
     protocol_session_id: Option<&str>,
     reason: &str,
-) -> Result<Option<SessionReconnect>, sqlx::Error> {
-    sqlx::query_as::<_, SessionReconnect>(sql!(
+) -> Result<Option<SessionReconnect>, DbError> {
+    Ok(sqlx::query_as::<_, SessionReconnect>(sql!(
         "UPDATE data_plane_sessions
          SET reconnect_count = reconnect_count + 1,
              last_reconnect_reason = $3,
@@ -613,8 +620,8 @@ pub async fn record_reconnect(
     .bind(session_id)
     .bind(protocol_session_id)
     .bind(reason)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The revocation state of the session `session_id` and its org's epoch;
@@ -622,11 +629,11 @@ pub async fn record_reconnect(
 /// another protocol session id than `protocol_session_id` (when one is
 /// given).
 pub async fn live_session_revocation(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     session_id: &str,
     protocol_session_id: Option<&str>,
-) -> Result<Option<SessionRevocation>, sqlx::Error> {
-    sqlx::query_as::<_, SessionRevocation>(sql!(
+) -> Result<Option<SessionRevocation>, DbError> {
+    Ok(sqlx::query_as::<_, SessionRevocation>(sql!(
         "SELECT d.session_id,
                 d.protocol_session_id,
                 d.org_id,
@@ -643,8 +650,8 @@ pub async fn live_session_revocation(
     ))
     .bind(session_id)
     .bind(protocol_session_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Delete up to `limit` ended sessions, least recently updated first, and
@@ -662,10 +669,10 @@ pub async fn live_session_revocation(
 /// one does, so that reading it, replaying its create and reattaching to read
 /// the exit keep working for the session's lifetime.
 pub async fn delete_ended_sessions(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     grace_secs: i64,
     limit: i64,
-) -> Result<usize, sqlx::Error> {
+) -> Result<usize, DbError> {
     Ok(sqlx::query_scalar::<_, String>(sql!(
         "WITH candidates AS (
                  SELECT session_id
@@ -694,7 +701,7 @@ pub async fn delete_ended_sessions(
     ))
     .bind(grace_secs)
     .bind(limit)
-    .fetch_all(executor)
+    .fetch_all(executor.into_sqlx())
     .await?
     .len())
 }

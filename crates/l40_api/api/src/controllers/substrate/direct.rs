@@ -1253,6 +1253,7 @@ impl DirectSubstrate {
             .await?;
         let persisted = route_identities::accept_receipt(&mut *transaction, &identity)
             .await
+            .map_err(sqlx::Error::from)
             .db_context("failed to persist direct route identity")?;
         if !persisted {
             return Err(SubstrateError::Failed {
@@ -1268,6 +1269,7 @@ impl DirectSubstrate {
             identity.execution_generation(),
         )
         .await
+        .map_err(sqlx::Error::from)
         .db_context("failed to retain direct route provenance")?;
         transaction
             .commit()
@@ -1385,6 +1387,7 @@ impl DirectSubstrate {
     ) -> Result<Option<SandboxRouteIdentity>, SubstrateError> {
         let row = route_identities::get(&self.pool, sandbox_id)
             .await
+            .map_err(sqlx::Error::from)
             .db_context_with(|| {
                 format!("failed to load current Direct route identity for sandbox {sandbox_id}")
             })?;
@@ -1556,6 +1559,7 @@ impl DirectSubstrate {
     ) -> Result<Option<(i64, i64)>, SubstrateError> {
         let reserved = route_provenance::advance_generations(&self.pool, sandbox_id)
             .await
+            .map_err(sqlx::Error::from)
             .map_err(direct_route_generation_reservation_error)?;
         Ok(reserved.map(|reserved| {
             (
@@ -1602,6 +1606,7 @@ impl DirectSubstrate {
                 execution_generation,
             )
             .await
+            .map_err(sqlx::Error::from)
             .db_context_with(|| {
                 format!("failed to recover direct route provenance for sandbox {sandbox_id}")
             })?;
@@ -1614,6 +1619,7 @@ impl DirectSubstrate {
         // sandboxes table from a startup migration.
         route_provenance::initialize(&self.pool, sandbox_id)
             .await
+            .map_err(sqlx::Error::from)
             .map_err(direct_route_generation_reservation_error)?;
         Ok(())
     }
@@ -1708,6 +1714,7 @@ impl DirectSubstrate {
     ) -> Result<pplx_space_sbx_mgr_client::proto::SpaceApiRouteIdentity, SubstrateError> {
         let inserted = route_provenance::initialize(&self.pool, sandbox_id)
             .await
+            .map_err(sqlx::Error::from)
             .map_err(direct_route_generation_reservation_error)?;
         if !inserted {
             return Err(SubstrateError::Failed {
@@ -1791,6 +1798,7 @@ impl DirectSubstrate {
     ) -> Result<bool, SubstrateError> {
         route_provenance::retain_route_identity_generations(&mut **transaction, sandbox_id)
             .await
+            .map_err(sqlx::Error::from)
             .db_context_with(|| {
                 format!("failed to retain active direct route provenance for sandbox {sandbox_id}")
             })
@@ -1809,6 +1817,7 @@ impl DirectSubstrate {
             .await?;
         route_identities::delete(&mut *transaction, sandbox_id)
             .await
+            .map_err(sqlx::Error::from)
             .db_context("failed to clear direct route identity")?;
         transaction
             .commit()
