@@ -1,5 +1,6 @@
 //! Whether a stopped evacuation's re-placement has been claimed.
 
+use pplx_space_postgres_pool::Executor;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 
@@ -12,7 +13,7 @@ use crate::SandboxStoreError;
 ///
 /// A plain read that takes no lock.
 pub async fn claimed(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
 ) -> Result<bool, SandboxStoreError> {
     let claimed = sqlx::query_scalar::<_, bool>(sql!(
@@ -24,7 +25,7 @@ pub async fn claimed(
               WHERE id = $1"
     ))
     .bind(sandbox_id)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(claimed.unwrap_or(false))
 }

@@ -10,10 +10,10 @@
 
 use std::sync::LazyLock;
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_sandbox_portability::no_newer_full_snapshot;
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 
 /// What [`started_recovery_restore_candidate`] selects, undecoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,10 +34,10 @@ pub struct StartedRecoveryRestoreCandidate {
 /// last access, and have no newer full snapshot ([`no_newer_full_snapshot`]).
 /// `None` when nothing matches.
 pub async fn started_recovery_restore_candidate(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: ExecutionGeneration,
-) -> Result<Option<StartedRecoveryRestoreCandidate>, sqlx::Error> {
+) -> Result<Option<StartedRecoveryRestoreCandidate>, DbError> {
     static QUERY: LazyLock<String> = LazyLock::new(|| {
         let no_newer = no_newer_full_snapshot("s", "sn");
         sql!(format!(
@@ -83,7 +83,7 @@ pub async fn started_recovery_restore_candidate(
         sqlx::query_as(sqlx::AssertSqlSafe(QUERY.as_str()))
             .bind(sandbox_id.as_uuid())
             .bind(generation.get())
-            .fetch_optional(executor)
+            .fetch_optional(executor.into_sqlx())
             .await?;
     Ok(row.map(
         |(state, source_node_name, storage_uri)| StartedRecoveryRestoreCandidate {

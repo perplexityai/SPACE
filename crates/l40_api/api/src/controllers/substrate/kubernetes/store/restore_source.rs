@@ -171,7 +171,7 @@ impl K8sStore {
     /// and a value the catalog holds but `StorageUri` rejects is a stored-data
     /// fault worth failing on rather than handing to a node.
     fn checked_restore_storage_uri(
-        storage_uri: Result<Option<String>, sqlx::Error>,
+        storage_uri: Result<Option<String>, pplx_space_postgres_pool::DbError>,
         label: &str,
     ) -> Result<Option<String>, SubstrateError> {
         let storage_uri = storage_uri

@@ -9,10 +9,10 @@
 use std::sync::LazyLock;
 
 use pplx_space_node_model::NodeDrainPhase;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::portable_for_restore_affinity;
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 
 /// What [`placement_gate`] reads of the sandbox row and its primary node.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -43,9 +43,9 @@ pub struct PlacementGateRow {
 /// and whether it is stopped. The primary node is `COALESCE(target_node_id,
 /// active_node_id)`. `None` when the sandbox row is missing.
 pub async fn placement_gate(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<PlacementGateRow>, sqlx::Error> {
+) -> Result<Option<PlacementGateRow>, DbError> {
     static QUERY: LazyLock<String> = LazyLock::new(|| {
         let portable_predicate = portable_for_restore_affinity("s");
         sql!(format!(
@@ -66,8 +66,10 @@ pub async fn placement_gate(
           WHERE s.id = $1"
         ))
     });
-    sqlx::query_as::<_, PlacementGateRow>(sqlx::AssertSqlSafe(QUERY.as_str()))
-        .bind(sandbox_id)
-        .fetch_optional(executor)
-        .await
+    Ok(
+        sqlx::query_as::<_, PlacementGateRow>(sqlx::AssertSqlSafe(QUERY.as_str()))
+            .bind(sandbox_id)
+            .fetch_optional(executor.into_sqlx())
+            .await?,
+    )
 }

@@ -25,9 +25,9 @@
 //! transactions those locks last for and the decision of when to fence;
 //! these functions are the statements.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
-use sqlx::{PgExecutor, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::restore_lease::RestoreClaimRow;
@@ -40,11 +40,11 @@ use crate::restore_lease::RestoreClaimRow;
 /// renewed its restore lease in the same transaction. A fence another owner
 /// wrote is replaced; it is bound to a token the row no longer carries.
 pub async fn fence_unsent_user_restore(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     restore_lease_token: Uuid,
     fence_ttl_secs: i64,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let fenced = sqlx::query_scalar::<_, bool>(sql!(
         "UPDATE sandbox_k8s_executions
             SET restore_dispatch_fence_token = $2,
@@ -56,7 +56,7 @@ pub async fn fence_unsent_user_restore(
     .bind(sandbox_id)
     .bind(restore_lease_token)
     .bind(fence_ttl_secs as f64)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(fenced.is_some())
 }
@@ -67,11 +67,11 @@ pub async fn fence_unsent_user_restore(
 /// under that token: the owner cleared it to send its Wake, or a takeover
 /// cleared it.
 pub async fn renew_unsent_user_restore_fence(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     restore_lease_token: Uuid,
     fence_ttl_secs: i64,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let renewed = sqlx::query_scalar::<_, bool>(sql!(
         "UPDATE sandbox_k8s_executions
             SET restore_dispatch_fence_expires_at = NOW() + make_interval(secs => $3)
@@ -83,7 +83,7 @@ pub async fn renew_unsent_user_restore_fence(
     .bind(sandbox_id)
     .bind(restore_lease_token)
     .bind(fence_ttl_secs as f64)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(renewed.is_some())
 }
@@ -94,12 +94,12 @@ pub async fn renew_unsent_user_restore_fence(
 /// from an owner that died before sending its Wake, maybe before creating the
 /// pod.
 pub async fn holds_fence(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     restore_lease_token: Uuid,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
         "SELECT EXISTS (
              SELECT 1
                FROM sandbox_k8s_executions
@@ -112,8 +112,8 @@ pub async fn holds_fence(
     .bind(sandbox_id)
     .bind(generation)
     .bind(restore_lease_token)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Lock the sandbox row `FOR UPDATE` until the caller's transaction ends and
@@ -122,13 +122,17 @@ pub async fn holds_fence(
 /// answer.
 ///
 /// The owner takes it before [`clear_for_dispatch`]; the takeover holds the
-/// same row lock, so the two serialize.
-pub async fn lock_dispatch_ownership(
-    conn: &mut sqlx::PgConnection,
+/// same row lock, so the two serialize. The caller must pass its open
+/// transaction.
+pub async fn lock_dispatch_ownership<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     restore_lease_token: Uuid,
-) -> Result<Option<bool>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Option<bool>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar(sql!(
         "SELECT LOWER(TRIM(lifecycle)) = 'restoring'
                     AND restore_lease_token IS NOT DISTINCT FROM $2
                FROM sandboxes
@@ -137,8 +141,8 @@ pub async fn lock_dispatch_ownership(
     ))
     .bind(sandbox_id)
     .bind(restore_lease_token)
-    .fetch_optional(conn)
-    .await
+    .fetch_optional(tx.into_sqlx())
+    .await?)
 }
 
 /// Clear the fence on the sandbox's active execution as its owner sends the
@@ -149,9 +153,9 @@ pub async fn lock_dispatch_ownership(
 /// No guard of its own: the caller holds the sandbox row lock and has checked,
 /// under it, that the row is still `restoring` with its restore lease token.
 pub async fn clear_for_dispatch(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
             SET restore_dispatch_fence_token = NULL,
@@ -161,7 +165,7 @@ pub async fn clear_for_dispatch(
             AND active"
     ))
     .bind(sandbox_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -177,13 +181,16 @@ pub async fn clear_for_dispatch(
 /// The caller holds the sandbox row lock in `tx`, which the owner's
 /// [`clear_for_dispatch`] path also takes, so an owner that clears its fence
 /// first leaves nothing to take over, and one that comes second finds the
-/// token changed.
-pub async fn take_over_unsent_user_restore(
-    tx: &mut Transaction<'_, Postgres>,
+/// token changed. The caller must pass its open transaction.
+pub async fn take_over_unsent_user_restore<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     lease_ttl_secs: i64,
     restore_lease_token: Uuid,
-) -> Result<Option<RestoreClaimRow>, sqlx::Error> {
+) -> Result<Option<RestoreClaimRow>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let fenced = sqlx::query_scalar::<_, i64>(sql!(
         "UPDATE sandbox_k8s_executions e
             SET restore_dispatch_fence_token = NULL,
@@ -203,12 +210,12 @@ pub async fn take_over_unsent_user_restore(
          RETURNING e.generation"
     ))
     .bind(sandbox_id)
-    .fetch_optional(&mut **tx)
+    .fetch_optional((&mut *tx).into_sqlx())
     .await?;
     if fenced.is_none() {
         return Ok(None);
     }
-    sqlx::query_as::<_, RestoreClaimRow>(sql!(
+    Ok(sqlx::query_as::<_, RestoreClaimRow>(sql!(
         "UPDATE sandboxes
             SET restore_lease_expires_at = NOW() + ($2::bigint * INTERVAL '1 second'),
                 restore_lease_token = $3
@@ -219,6 +226,6 @@ pub async fn take_over_unsent_user_restore(
     .bind(sandbox_id)
     .bind(lease_ttl_secs)
     .bind(restore_lease_token)
-    .fetch_optional(&mut **tx)
-    .await
+    .fetch_optional(tx.into_sqlx())
+    .await?)
 }

@@ -204,11 +204,11 @@ async fn guarded_row_locks_leave_a_row_that_already_fails_their_guard_unlocked()
     .await?;
 
     let mut tx = pool.begin().await?;
-    assert!(!restore_lease::lock_restore_claim(&mut tx, restoring_id, Some(other_token)).await?);
+    assert!(!restore_lease::lock_restore_claim(&mut *tx, restoring_id, Some(other_token)).await?);
     assert!(!row_locked(pool, restoring).await?);
     assert!(!key_share_blocked(pool, restoring).await?);
     assert_eq!(
-        restore_lease::lock_restore_lease_token(&mut tx, restoring_id).await?,
+        restore_lease::lock_restore_lease_token(&mut *tx, restoring_id).await?,
         Some(Some(token))
     );
     assert!(row_locked(pool, restoring).await?);
@@ -217,7 +217,7 @@ async fn guarded_row_locks_leave_a_row_that_already_fails_their_guard_unlocked()
 
     for claim_token in [Some(token), None] {
         let mut tx = pool.begin().await?;
-        assert!(restore_lease::lock_restore_claim(&mut tx, restoring_id, claim_token).await?);
+        assert!(restore_lease::lock_restore_claim(&mut *tx, restoring_id, claim_token).await?);
         assert!(row_locked(pool, restoring).await?);
         assert!(key_share_blocked(pool, restoring).await?);
         tx.rollback().await?;
@@ -228,7 +228,7 @@ async fn guarded_row_locks_leave_a_row_that_already_fails_their_guard_unlocked()
     for (owner_token, owned) in [(token, true), (other_token, false)] {
         let mut tx = pool.begin().await?;
         assert_eq!(
-            restore_dispatch_fence::lock_dispatch_ownership(&mut tx, restoring_id, owner_token)
+            restore_dispatch_fence::lock_dispatch_ownership(&mut *tx, restoring_id, owner_token)
                 .await?,
             Some(owned)
         );
@@ -241,15 +241,15 @@ async fn guarded_row_locks_leave_a_row_that_already_fails_their_guard_unlocked()
     let suspended = insert_sandbox(pool, None, "suspended").await?;
     let suspended_id = SandboxId::from_uuid(suspended);
     let mut tx = pool.begin().await?;
-    assert!(!restore_lease::lock_restore_claim(&mut tx, suspended_id, None).await?);
+    assert!(!restore_lease::lock_restore_claim(&mut *tx, suspended_id, None).await?);
     assert!(!row_locked(pool, suspended).await?);
     assert!(!key_share_blocked(pool, suspended).await?);
     assert_eq!(
-        restore_lease::lock_restore_lease_token(&mut tx, SandboxId::new()).await?,
+        restore_lease::lock_restore_lease_token(&mut *tx, SandboxId::new()).await?,
         None
     );
     assert_eq!(
-        restore_dispatch_fence::lock_dispatch_ownership(&mut tx, SandboxId::new(), token).await?,
+        restore_dispatch_fence::lock_dispatch_ownership(&mut *tx, SandboxId::new(), token).await?,
         None
     );
     tx.rollback().await?;

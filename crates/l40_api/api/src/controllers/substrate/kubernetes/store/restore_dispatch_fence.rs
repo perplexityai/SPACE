@@ -115,7 +115,7 @@ impl K8sStore {
             .await
             .db_context("failed to start restore dispatch transaction")?;
         let owned = restore_dispatch_fence::lock_dispatch_ownership(
-            &mut tx,
+            &mut *tx,
             sandbox_id,
             restore_lease_token,
         )
@@ -152,7 +152,7 @@ impl K8sStore {
             return Ok(None);
         }
         let claim = restore_dispatch_fence::take_over_unsent_user_restore(
-            &mut tx,
+            &mut *tx,
             sandbox_id,
             recovery_lease_ttl_secs(),
             Uuid::now_v7(),
