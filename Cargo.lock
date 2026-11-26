@@ -5093,6 +5093,7 @@ version = "0.8.2"
 dependencies = [
  "globset",
  "regex",
+ "rstest",
  "serde",
  "serde_json",
  "syn 2.0.119",
