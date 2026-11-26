@@ -1840,6 +1840,27 @@ impl Substrate {
         self.capabilities().boots_required_environment && self.environment_placement().refuses()
     }
 
+    /// Whether this substrate enforces runtime-environment memory retirement on
+    /// restore (`KubernetesSubstrate::decide_activation_runtime`). Substrates
+    /// without restore-time memory retirement return
+    /// [`SubstrateError::Unsupported`].
+    pub fn check_environment_memory_retirement(&self) -> Result<(), SubstrateError> {
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.check_environment_memory_retirement(),
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(_) => Ok(()),
+        }
+    }
+
+    /// Clear any cached runtime environment policy after a local admin write.
+    pub async fn invalidate_runtime_policy_cache(&self) {
+        match &self.inner {
+            Inner::Direct(_) => {}
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => substrate.invalidate_runtime_policy_cache().await,
+        }
+    }
+
     /// Run on the Direct substrate.
     pub fn from_direct(substrate: direct::DirectSubstrate) -> Self {
         Self {

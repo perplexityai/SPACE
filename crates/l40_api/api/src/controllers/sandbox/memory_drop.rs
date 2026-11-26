@@ -29,7 +29,12 @@
 //! was copied from rather than with the drop.
 //!
 //! The cluster controller runs it as the `drop_sandbox_memory` operation an
-//! admin route enqueues; it's the only process with the object store.
+//! admin route enqueues; the API server also runs [`MemoryDrop::drop_for_restore`]
+//! inline when a restore arrives for an environment whose checkpoint memory was
+//! retired before a campaign reached the row.
+
+mod objects;
+mod restore;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -183,6 +188,28 @@ impl MemoryDropIneligible {
             Self::ForkActive => "fork_active".to_string(),
             Self::UnsupportedLocation => "unsupported_location".to_string(),
             Self::Metadata(why) => format!("metadata: {why}"),
+        }
+    }
+
+    /// Whether retrying later without changing the sandbox or its snapshot can
+    /// clear this refusal (an in-flight fork, seal or lifecycle transition).
+    pub const fn is_retryable(self) -> bool {
+        match self {
+            Self::ForkActive
+            | Self::Row(MemoryDropRefusal::Sealed | MemoryDropRefusal::NotSuspended) => true,
+            Self::UnsupportedLocation
+            | Self::Metadata(_)
+            | Self::Row(
+                MemoryDropRefusal::NotFound
+                | MemoryDropRefusal::NotKubernetes
+                | MemoryDropRefusal::AlreadyDropped
+                | MemoryDropRefusal::Placed
+                | MemoryDropRefusal::Encrypted
+                | MemoryDropRefusal::NotFullSuspendPin
+                | MemoryDropRefusal::NoDurableCopy
+                | MemoryDropRefusal::NewerFullSnapshot
+                | MemoryDropRefusal::NodeNotGone,
+            ) => false,
         }
     }
 }
@@ -498,14 +525,39 @@ impl MemoryDrop {
         Ok(Sealed::Candidate(candidate))
     }
 
-    /// Run `work` while renewing the seal every `renew_every`. Returns its
-    /// output, or `None` when a renewal finds the seal gone; `work` is then
+    /// Run `work` while renewing its lease every `renew_every`. Returns its
+    /// output, or `None` when a renewal finds the lease gone; `work` is then
     /// dropped, which cancels whatever object-store call it was awaiting.
     ///
     /// `tokio::pin!` is needed because `select!` polls `work` through a
     /// `&mut` on every iteration: polling a future requires it to stay at one
     /// address (`Pin`), and pinning it on the stack here promises that
     /// without a heap allocation.
+    pub(super) async fn renewing<T, R, Fut>(
+        &self,
+        work: impl Future<Output = T>,
+        mut renew: R,
+    ) -> Result<Option<T>, ControllerError>
+    where
+        R: FnMut(Duration) -> Fut,
+        Fut: Future<Output = Result<bool, ControllerError>>,
+    {
+        tokio::pin!(work);
+        let mut renewals = tokio::time::interval(self.seal.renew_every);
+        // The first tick completes at once; the lease was just taken.
+        renewals.tick().await;
+        loop {
+            tokio::select! {
+                output = &mut work => return Ok(Some(output)),
+                _ = renewals.tick() => {
+                    if !renew(self.seal.ttl).await? {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+
     async fn renewing_seal<T>(
         &self,
         pool: &PgPool,
@@ -513,23 +565,12 @@ impl MemoryDrop {
         token: Uuid,
         work: impl Future<Output = T>,
     ) -> Result<Option<T>, ControllerError> {
-        tokio::pin!(work);
-        let mut renewals = tokio::time::interval(self.seal.renew_every);
-        // The first tick completes at once; the seal was just taken.
-        renewals.tick().await;
-        loop {
-            tokio::select! {
-                output = &mut work => return Ok(Some(output)),
-                _ = renewals.tick() => {
-                    let renewed = memory_drop::renew(pool, sandbox_id, token, self.seal.ttl)
-                        .await
-                        .map_err(|error| db_error("renew the memory drop seal", &error))?;
-                    if !renewed {
-                        return Ok(None);
-                    }
-                }
-            }
-        }
+        self.renewing(work, |ttl| async move {
+            memory_drop::renew(pool, sandbox_id, token, ttl)
+                .await
+                .map_err(|error| db_error("renew the memory drop seal", &error))
+        })
+        .await
     }
 
     /// Lift the seal after a refusal or a failed copy. Best effort: a seal
@@ -632,58 +673,7 @@ impl MemoryDrop {
         {
             return Ok(CommitOutcome::ForkActive);
         }
-        let full = pplx_space_snapshot_store::get(&mut *tx, candidate.full_snapshot_id)
-            .await
-            .map_err(|error| {
-                ControllerError::internal(format!("failed to load the suspend snapshot: {error}"))
-            })?
-            .ok_or_else(|| {
-                ControllerError::internal("the pinned suspend snapshot disappeared".to_string())
-            })?;
-        let artifact = SnapshotArtifact::new(
-            Some(plan.disk_artifact_id),
-            ArtifactKind::Disk,
-            ArtifactOrigin::Stop,
-            None,
-        )
-        .map_err(|error| ControllerError::internal(format!("disk artifact identity: {error}")))?;
-        let mut snapshot = NewSnapshot::new(
-            plan.disk_snapshot_id,
-            sandbox_id,
-            SnapshotKind::Disk,
-            SnapshotState::Ready,
-            candidate.org_id,
-            plan.dest.clone(),
-        )
-        .with_resources(full.vcpu(), full.memory_mib())
-        .with_size_bytes(rootfs_size.and_then(|size| i64::try_from(size).ok()))
-        .with_template(full.template_id().cloned(), full.content_hash().cloned())
-        .with_artifact(artifact)
-        .with_generation(full.generation())
-        // The bytes are the full snapshot's, so the row orders with it.
-        .with_timestamp(full.timestamp())
-        // The control plane wrote this disk, not a node: no node holds a local
-        // copy of it.
-        .written_off_node();
-        if let Some(execution) = full.execution_metadata() {
-            // A disk carries no vCPU state, so no capture CPU constrains where
-            // it boots.
-            snapshot = snapshot.with_execution_metadata(execution.clone().with_host_cpu(None));
-        }
-        let (registered, _) = pplx_space_snapshot_store::insert(&mut tx, &snapshot)
-            .await
-            .map_err(|error| {
-                ControllerError::internal(format!("failed to register the disk snapshot: {error}"))
-            })?;
-        // The ids are derived from the pin, so an earlier drop of this pin
-        // registered the same row. If the row was repointed back to the full
-        // since, retention may already be deleting that disk: re-pinning to it
-        // would leave the row on bytes being deleted.
-        if !registered.state().is_ready()
-            || registered
-                .storage_location()
-                .is_none_or(|location| location.orphaned_at().is_some())
-        {
+        if !insert_disk_snapshot(&mut tx, sandbox_id, candidate, plan, rootfs_size).await? {
             return Ok(CommitOutcome::DiskRetiring);
         }
         if !memory_drop::commit(
@@ -944,9 +934,72 @@ async fn fork_active(pool: &PgPool, sandbox_id: SandboxId) -> Result<bool, Contr
         .map_err(|error| db_error("check for an active fork", &error))
 }
 
+async fn insert_disk_snapshot(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    sandbox_id: SandboxId,
+    candidate: &MemoryDropCandidate,
+    plan: &CopyPlan,
+    rootfs_size: Option<u64>,
+) -> Result<bool, ControllerError> {
+    let full = pplx_space_snapshot_store::get(&mut **tx, candidate.full_snapshot_id)
+        .await
+        .map_err(|error| {
+            ControllerError::internal(format!("failed to load the suspend snapshot: {error}"))
+        })?
+        .ok_or_else(|| {
+            ControllerError::internal("the pinned suspend snapshot disappeared".to_string())
+        })?;
+    let artifact = SnapshotArtifact::new(
+        Some(plan.disk_artifact_id),
+        ArtifactKind::Disk,
+        ArtifactOrigin::Stop,
+        None,
+    )
+    .map_err(|error| ControllerError::internal(format!("disk artifact identity: {error}")))?;
+    let mut snapshot = NewSnapshot::new(
+        plan.disk_snapshot_id,
+        sandbox_id,
+        SnapshotKind::Disk,
+        SnapshotState::Ready,
+        candidate.org_id,
+        plan.dest.clone(),
+    )
+    .with_resources(full.vcpu(), full.memory_mib())
+    .with_size_bytes(rootfs_size.and_then(|size| i64::try_from(size).ok()))
+    .with_template(full.template_id().cloned(), full.content_hash().cloned())
+    .with_artifact(artifact)
+    .with_generation(full.generation())
+    // The bytes are the full snapshot's, so the row orders with it.
+    .with_timestamp(full.timestamp())
+    // The control plane wrote this disk, not a node: no node holds a local
+    // copy of it.
+    .written_off_node();
+    if let Some(execution) = full.execution_metadata() {
+        // A disk carries no vCPU state, so no capture CPU constrains where
+        // it boots.
+        snapshot = snapshot.with_execution_metadata(execution.clone().with_host_cpu(None));
+    }
+    let (registered, _) = pplx_space_snapshot_store::insert(tx, &snapshot)
+        .await
+        .map_err(|error| {
+            ControllerError::internal(format!("failed to register the disk snapshot: {error}"))
+        })?;
+    // The ids are derived from the pin, so an earlier drop of this pin
+    // registered the same row. If the row was repointed back to the full
+    // since, retention may already be deleting that disk: re-pinning to it
+    // would leave the row on bytes being deleted.
+    Ok(registered.state().is_ready()
+        && registered
+            .storage_location()
+            .is_some_and(|location| location.orphaned_at().is_none()))
+}
+
 fn db_error(what: &str, error: &sqlx::Error) -> ControllerError {
     crate::controllers::db_contention_error(&format!("failed to {what}"), error)
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "kubernetes"))]
+pub(crate) use tests::MapObjects;

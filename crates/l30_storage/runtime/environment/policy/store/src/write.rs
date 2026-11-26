@@ -79,6 +79,8 @@ pub enum SetDefaultError {
     PolicyRowMissing,
     #[error("environment {0} is blocked and can't become the default")]
     Blocked(EnvironmentReference),
+    #[error("environment {0}'s memory is retired and it can't become the default")]
+    MemoryRetired(EnvironmentReference),
     #[error("environment {environment} has an unknown stored state")]
     UnknownState {
         environment: EnvironmentReference,
@@ -102,6 +104,43 @@ pub enum SetEnvironmentStateError {
     },
     #[error("blocking environment {0} requires a cluster default")]
     BlockRequiresDefault(EnvironmentReference),
+    #[error("environment {0}'s memory is retired and it can't become allowed")]
+    MemoryRetired(EnvironmentReference),
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SetEnvironmentMemoryError {
+    #[error("the runtime environment policy row is missing")]
+    PolicyRowMissing,
+    #[error("retiring environment {0}'s memory requires a cluster default")]
+    RetireRequiresDefault(EnvironmentReference),
+    #[error(
+        "{} environment {environment}'s memory requires state 'deprecated', got {}",
+        if *.memory_retired { "retiring" } else { "unretiring" },
+        match .current {
+            Some(state) => format!("'{state}'"),
+            None => "no recorded state".to_owned(),
+        }
+    )]
+    RequiresDeprecated {
+        environment: EnvironmentReference,
+        current: Option<RuntimeEnvironmentState>,
+        memory_retired: bool,
+    },
+    #[error(
+        "environment {0} is blocked; unretiring its memory is allowed only while it is deprecated"
+    )]
+    BlockedCannotUnretire(EnvironmentReference),
+    #[error("environment {environment} has an unknown stored state")]
+    UnknownState {
+        environment: EnvironmentReference,
+        #[source]
+        source: UnknownRuntimeEnvironmentState,
+    },
+    #[error("the runtime_environment_states memory-retirement migration has not been applied yet")]
+    SchemaNotMigrated,
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 }
@@ -148,24 +187,34 @@ pub async fn set_default(
         return Err(SetDefaultError::PolicyRowMissing);
     }
     let environment_ref = environment.to_string();
-    let current = sqlx::query_as::<_, (String,)>(sql!(
-        "SELECT state FROM runtime_environment_states WHERE environment_ref = $1"
+    let current = sqlx::query_as::<_, (String, bool)>(sql!(
+        "SELECT s.state, COALESCE((to_jsonb(s) ->> 'memory_retired')::boolean, FALSE)
+         FROM runtime_environment_states s
+         WHERE s.environment_ref = $1"
     ))
     .bind(&environment_ref)
     .fetch_optional(&mut **tx)
     .await?;
-    let current = current
-        .map(|(state,)| state.parse::<RuntimeEnvironmentState>())
-        .transpose()
-        .map_err(|source| SetDefaultError::UnknownState {
-            environment,
-            source,
-        })?;
+    let (current, memory_retired) = match current {
+        Some((state, memory_retired)) => (
+            Some(state.parse::<RuntimeEnvironmentState>().map_err(|source| {
+                SetDefaultError::UnknownState {
+                    environment,
+                    source,
+                }
+            })?),
+            memory_retired,
+        ),
+        None => (None, false),
+    };
     match current {
-        Some(RuntimeEnvironmentState::Allowed) => {}
         Some(RuntimeEnvironmentState::Blocked) => {
             return Err(SetDefaultError::Blocked(environment));
         }
+        _ if memory_retired => {
+            return Err(SetDefaultError::MemoryRetired(environment));
+        }
+        Some(RuntimeEnvironmentState::Allowed) => {}
         None | Some(RuntimeEnvironmentState::Deprecated) => {
             upsert_state(
                 tx,
@@ -218,7 +267,97 @@ pub async fn set_environment_state(
         }
         _ => {}
     }
+    if state == RuntimeEnvironmentState::Allowed {
+        // Read only `memory_retired`, never `state`, so an unknown stored
+        // `state` string can still be repaired by this write. `to_jsonb(s)`
+        // defaults to `FALSE` before the memory-retirement migration runs.
+        let memory_retired = sqlx::query_scalar::<_, bool>(sql!(
+            "SELECT COALESCE((to_jsonb(s) ->> 'memory_retired')::boolean, FALSE)
+             FROM runtime_environment_states s
+             WHERE s.environment_ref = $1"
+        ))
+        .bind(&environment_ref)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if memory_retired == Some(true) {
+            return Err(SetEnvironmentStateError::MemoryRetired(environment));
+        }
+    }
     upsert_state(tx, &environment_ref, state, change).await?;
+    Ok(bump_generation(tx, change).await?)
+}
+
+/// Retire (`true`) or unretire (`false`) `environment`'s checkpoint memory.
+/// Retiring requires a cluster default and `deprecated` state; unretiring is
+/// allowed while `deprecated`, and refused once `blocked`. Returns the new
+/// generation.
+pub async fn set_environment_memory_retired(
+    tx: &mut Transaction<'_, Postgres>,
+    environment: EnvironmentReference,
+    memory_retired: bool,
+    change: &PolicyChange,
+) -> Result<u64, SetEnvironmentMemoryError> {
+    let Some(locked) = lock_policy(tx).await? else {
+        return Err(SetEnvironmentMemoryError::PolicyRowMissing);
+    };
+    if memory_retired && locked.default_environment_ref.is_none() {
+        return Err(SetEnvironmentMemoryError::RetireRequiresDefault(
+            environment,
+        ));
+    }
+    let environment_ref = environment.to_string();
+    let current = sqlx::query_scalar::<_, String>(sql!(
+        "SELECT state FROM runtime_environment_states WHERE environment_ref = $1"
+    ))
+    .bind(&environment_ref)
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(|state| state.parse::<RuntimeEnvironmentState>())
+    .transpose()
+    .map_err(|source| SetEnvironmentMemoryError::UnknownState {
+        environment,
+        source,
+    })?;
+    match current {
+        Some(RuntimeEnvironmentState::Deprecated) => {}
+        Some(RuntimeEnvironmentState::Blocked) if !memory_retired => {
+            return Err(SetEnvironmentMemoryError::BlockedCannotUnretire(
+                environment,
+            ));
+        }
+        other => {
+            return Err(SetEnvironmentMemoryError::RequiresDeprecated {
+                environment,
+                current: other,
+                memory_retired,
+            });
+        }
+    }
+    if let Err(error) = sqlx::query(sql!(
+        "UPDATE runtime_environment_states
+         SET memory_retired = $2,
+             memory_updated_at = NOW(),
+             memory_updated_by_user_id = $3,
+             memory_reason = $4
+         WHERE environment_ref = $1"
+    ))
+    .bind(&environment_ref)
+    .bind(memory_retired)
+    .bind(change.actor)
+    .bind(change.reason.as_str())
+    .execute(&mut **tx)
+    .await
+    {
+        if error
+            .as_database_error()
+            .and_then(|db_err| db_err.code())
+            .as_deref()
+            == Some("42703")
+        {
+            return Err(SetEnvironmentMemoryError::SchemaNotMigrated);
+        }
+        return Err(SetEnvironmentMemoryError::Database(error));
+    }
     Ok(bump_generation(tx, change).await?)
 }
 

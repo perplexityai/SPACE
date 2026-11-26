@@ -2,11 +2,13 @@
 //! (`runtime_environment_policy` and `runtime_environment_states`).
 //!
 //! The policy is one seeded row naming the cluster default, the legacy
-//! permission and a generation, plus a state per environment. [`get`] reads
+//! permission and a generation, plus a state and memory-retirement flag per
+//! environment. [`get`] reads
 //! all of it in one statement ([`get_record`] adds who changed each row and
 //! why), so a reader never sees a default from one
 //! policy and states from another. The write verbs ([`set_default`],
-//! [`set_environment_state`], [`set_legacy_unbound_allowed`]) take the
+//! [`set_environment_state`], [`set_environment_memory_retired`],
+//! [`set_legacy_unbound_allowed`]) take the
 //! caller's open transaction, lock the policy row first, and increment the
 //! generation in the same transaction as the change. They don't tell nodes
 //! about the change: the admin API's write handlers queue the node
@@ -20,27 +22,35 @@
 //!   enforce this: direct SQL can still clear the column, as the migration's
 //!   rollback procedure requires.
 //! * **The default stays `allowed`.** Setting a default records the
-//!   environment as `allowed`, refuses one that is `blocked`, and no state
-//!   write may move the default off `allowed`. The composite foreign key on
-//!   the policy row backs this up: it refuses a non-null default whose state
-//!   isn't `allowed`.
-//! * **Blocking requires a cluster default.** Without one, state rows narrow
-//!   nothing on a node, so a block would sit inert and then take effect
+//!   environment as `allowed`, refuses one that is `blocked` or memory-retired,
+//!   and no state write may move the default off `allowed`. The composite
+//!   foreign key on the policy row backs this up: it refuses a non-null default
+//!   whose state isn't `allowed`.
+//! * **Blocking or retiring memory requires a cluster default.** Without one,
+//!   state rows narrow nothing on a node and activation upgrades don't move
+//!   sandboxes, so either write would sit inert and then take effect
 //!   unannounced when a later write first sets a default.
+//! * **Memory retirement applies only while `deprecated`, and unretiring is
+//!   allowed until `blocked`.** Promoting a memory-retired environment back to
+//!   `allowed` or making it the default is refused until its memory is
+//!   unretired, and once an environment is `blocked` its memory can't be
+//!   unretired.
 //! * **The singleton row must exist.** Nothing in the schema protects it from
 //!   a `DELETE`, so a missing row is an error for readers and writers alike,
 //!   never the bootstrap policy.
 //!
 //! # What the columns don't mean
 //!
-//! `updated_at` on either table is trigger-maintained and also changes when a
-//! user is deleted (the `ON DELETE SET NULL` cascade fires the trigger), so it
-//! isn't policy history. The generation restarts at 0 if the schema is rolled
-//! back and reapplied, so it orders and identifies versions only within one
-//! schema lifetime: across a rollback, equal generations can name different
-//! policies.
+//! `updated_at` on the policy row and on `runtime_environment_states` is
+//! trigger-maintained on state writes (`state`, `updated_by_user_id`, `reason`)
+//! and also changes when that actor is deleted (the `ON DELETE SET NULL`
+//! cascade fires the trigger), so it isn't policy history. Memory writes stamp
+//! `memory_updated_at` directly without moving `updated_at`. The generation
+//! restarts at 0 if the schema is rolled back and reapplied, so it orders and
+//! identifies versions only within one schema lifetime: across a rollback,
+//! equal generations can name different policies.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -53,8 +63,8 @@ mod write;
 
 pub use write::{
     PolicyChange, PolicyChangeReason, PolicyChangeReasonError, SetDefaultError,
-    SetEnvironmentStateError, SetLegacyUnboundAllowedError, set_default, set_environment_state,
-    set_legacy_unbound_allowed,
+    SetEnvironmentMemoryError, SetEnvironmentStateError, SetLegacyUnboundAllowedError, set_default,
+    set_environment_memory_retired, set_environment_state, set_legacy_unbound_allowed,
 };
 
 /// The cluster's state for one execution environment.
@@ -129,6 +139,9 @@ pub struct RuntimeEnvironmentPolicy {
     pub legacy_unbound_allowed: Option<bool>,
     /// Every environment with a state, the default included.
     pub environments: BTreeMap<EnvironmentReference, RuntimeEnvironmentState>,
+    /// Environments in [`Self::environments`] whose checkpoints' memory has
+    /// been retired (`memory_retired = TRUE`).
+    pub memory_retired_environments: BTreeSet<EnvironmentReference>,
 }
 
 impl RuntimeEnvironmentPolicy {
@@ -139,6 +152,11 @@ impl RuntimeEnvironmentPolicy {
             .iter()
             .filter(|(_, state)| state.executes())
             .map(|(environment, _)| *environment)
+    }
+
+    /// Whether `environment`'s checkpoints have their memory retired.
+    pub fn is_memory_retired(&self, environment: EnvironmentReference) -> bool {
+        self.memory_retired_environments.contains(&environment)
     }
 }
 
@@ -186,6 +204,9 @@ pub struct RuntimeEnvironmentPolicyRecord {
     /// The last change of each environment's state, keyed like
     /// [`RuntimeEnvironmentPolicy::environments`].
     pub environment_changes: BTreeMap<EnvironmentReference, RecordedChange>,
+    /// The last memory-retirement change of each environment whose memory has
+    /// been retired or unretired (`None` until first retired).
+    pub environment_memory_changes: BTreeMap<EnvironmentReference, RecordedChange>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -201,6 +222,10 @@ struct PolicyStateRow {
     state_updated_at: Option<time::OffsetDateTime>,
     state_updated_by_user_id: Option<UserId>,
     state_reason: Option<String>,
+    memory_retired: Option<bool>,
+    memory_updated_at: Option<time::OffsetDateTime>,
+    memory_updated_by_user_id: Option<UserId>,
+    memory_reason: Option<String>,
 }
 
 /// Read the whole policy. Accepts a pool or a transaction connection; takes
@@ -211,6 +236,32 @@ pub async fn get(
     Ok(get_record(executor).await?.policy)
 }
 
+/// Read the policy after acquiring `FOR KEY SHARE` on the singleton policy
+/// row, so a restore that already committed its `restoring` lease waits for any
+/// in-flight policy write (`FOR UPDATE` on `runtime_environment_policy`) and
+/// then reads the committed `runtime_environment_states` snapshot in the next
+/// `READ COMMITTED` statement. `FOR KEY SHARE` is shared across concurrent
+/// restores.
+pub async fn get_serialized(
+    pool: &sqlx::PgPool,
+) -> Result<RuntimeEnvironmentPolicy, GetPolicyError> {
+    let mut tx = pool.begin().await?;
+    let locked: Option<(bool,)> = sqlx::query_as(sql!(
+        "SELECT singleton
+         FROM runtime_environment_policy
+         WHERE singleton
+         FOR KEY SHARE"
+    ))
+    .fetch_optional(&mut *tx)
+    .await?;
+    if locked.is_none() {
+        return Err(GetPolicyError::PolicyRowMissing);
+    }
+    let policy = get(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(policy)
+}
+
 /// Read the whole policy with who changed each row, when and why. Same
 /// snapshot and failure rules as [`get`], which reads through it.
 pub async fn get_record(
@@ -219,6 +270,9 @@ pub async fn get_record(
     // One statement, so the policy row and the states come from one snapshot
     // even under READ COMMITTED. The LEFT JOIN keeps the policy row when no
     // environment has a state, and yields no rows when the policy row is gone.
+    // `to_jsonb(s)` reads the memory-retirement columns when their migration
+    // has run and yields `NULL` before it has (or after its down migration),
+    // so policy reads stay available across mixed schema rollouts.
     let rows = sqlx::query_as::<_, PolicyStateRow>(sql!(
         "SELECT p.generation, p.default_environment_ref, p.legacy_unbound_allowed,
                 p.updated_at AS policy_updated_at,
@@ -227,7 +281,11 @@ pub async fn get_record(
                 s.environment_ref, s.state,
                 s.updated_at AS state_updated_at,
                 s.updated_by_user_id AS state_updated_by_user_id,
-                s.reason AS state_reason
+                s.reason AS state_reason,
+                (to_jsonb(s) ->> 'memory_retired')::boolean AS memory_retired,
+                (to_jsonb(s) ->> 'memory_updated_at')::timestamptz AS memory_updated_at,
+                (to_jsonb(s) ->> 'memory_updated_by_user_id')::uuid AS memory_updated_by_user_id,
+                to_jsonb(s) ->> 'memory_reason' AS memory_reason
          FROM runtime_environment_policy p
          LEFT JOIN runtime_environment_states s ON TRUE"
     ))
@@ -254,10 +312,12 @@ pub async fn get_record(
     });
 
     let mut environments = BTreeMap::new();
+    let mut memory_retired_environments = BTreeSet::new();
     let mut environment_changes = BTreeMap::new();
+    let mut environment_memory_changes = BTreeMap::new();
     for row in rows {
-        // The state table's columns are NOT NULL; they're optional here only
-        // because of the LEFT JOIN, which fills all of them or none.
+        // The state table's non-memory columns are NOT NULL; they're optional
+        // here only because of the LEFT JOIN, which fills all of them or none.
         let (Some(environment), Some(state), Some(updated_at), Some(reason)) = (
             row.environment_ref,
             row.state,
@@ -274,6 +334,9 @@ pub async fn get_record(
                 source,
             })?;
         environments.insert(environment, state);
+        if row.memory_retired == Some(true) {
+            memory_retired_environments.insert(environment);
+        }
         environment_changes.insert(
             environment,
             RecordedChange {
@@ -282,6 +345,18 @@ pub async fn get_record(
                 reason,
             },
         );
+        if let (Some(memory_updated_at), Some(memory_reason)) =
+            (row.memory_updated_at, row.memory_reason)
+        {
+            environment_memory_changes.insert(
+                environment,
+                RecordedChange {
+                    updated_at: memory_updated_at,
+                    updated_by: row.memory_updated_by_user_id,
+                    reason: memory_reason,
+                },
+            );
+        }
     }
 
     Ok(RuntimeEnvironmentPolicyRecord {
@@ -290,9 +365,11 @@ pub async fn get_record(
             default_environment,
             legacy_unbound_allowed,
             environments,
+            memory_retired_environments,
         },
         last_change,
         environment_changes,
+        environment_memory_changes,
     })
 }
 
@@ -366,6 +443,46 @@ pub async fn lock_generation(
     u64::try_from(generation).map_err(|_| GetPolicyError::InvalidGeneration(generation))
 }
 
+/// Read the `deprecated` environments whose checkpoint memory is currently
+/// retired (`memory_retired = true`). Like [`get_default`], an unreadable state
+/// row on another environment doesn't fail it, and `to_jsonb(s)` yields `false`
+/// before the memory-retirement migration has run.
+pub async fn deprecated_memory_retired_environments(
+    executor: impl sqlx::PgExecutor<'_>,
+) -> Result<BTreeSet<EnvironmentReference>, GetPolicyError> {
+    let rows = sqlx::query_as::<_, (String,)>(sql!(
+        "SELECT s.environment_ref
+           FROM runtime_environment_states s
+          WHERE s.state = 'deprecated'
+            AND COALESCE((to_jsonb(s) ->> 'memory_retired')::boolean, FALSE)"
+    ))
+    .fetch_all(executor)
+    .await?;
+    rows.into_iter()
+        .map(|(reference,)| parse_environment(&reference))
+        .collect()
+}
+
+/// Whether `runtime_environment_states.memory_retired` exists in the current
+/// schema, so callers can defer pre-transaction checks to the write's own
+/// [`SetEnvironmentMemoryError::SchemaNotMigrated`] refusal before the
+/// migration has run.
+pub async fn memory_retirement_schema_migrated(
+    executor: impl sqlx::PgExecutor<'_>,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM pg_attribute
+              WHERE attrelid = 'runtime_environment_states'::regclass
+                AND attname = 'memory_retired'
+                AND NOT attisdropped
+         )"
+    ))
+    .fetch_one(executor)
+    .await
+}
+
 fn parse_environment(value: &str) -> Result<EnvironmentReference, GetPolicyError> {
     value
         .parse()
@@ -374,6 +491,9 @@ fn parse_environment(value: &str) -> Result<EnvironmentReference, GetPolicyError
             source,
         })
 }
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 #[cfg(test)]
 mod tests;

@@ -1091,7 +1091,7 @@ fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
                 "summary": "Get the cluster execution environment policy",
                 "description": "The generation, the default environment, the legacy unbound permission, and every environment with a state, each with who last changed it and why. A null default or legacy permission means nodes keep their configured one. updated_at is trigger-maintained and isn't policy history.",
                 "responses": {
-                    "200": { "description": "Object with generation, default_environment_ref, legacy_unbound_allowed, last_change and environments (environment_ref, state, executes, is_default, last_change)" },
+                    "200": { "description": "Object with generation, default_environment_ref, legacy_unbound_allowed, last_change and environments (environment_ref, state, executes, is_default, memory_retired, memory_last_change, last_change)" },
                     "403": { "description": "Managing organization administrator required" },
                     "500": { "description": "A stored policy value this server can't read; the error names it" }
                 }
@@ -1104,7 +1104,7 @@ fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
             "put": {
                 "summary": "Set the cluster default execution environment",
                 "parameters": [if_match.clone()],
-                "description": "Records the environment as allowed if it isn't already and increments the generation in the same transaction. The previous default stays allowed. The default can be replaced but never cleared. The first default starts narrowing nodes to the environments that execute, so it needs strand: true while sandboxes, or template releases in use (tagged or pinned by an enabled pool config), are bound to an environment with no state or one that doesn't execute, or while any sandbox's environment can't be told; mark the environments to keep allowed first. It also needs strand: true while an unfinished template runtime upgrade campaign moves an environment it stops. Later defaults stop nothing. No check yet that every node can run the new default: a node that applies the policy is to refuse a default it hasn't installed and verified.",
+                "description": "Records the environment as allowed if it isn't already and increments the generation in the same transaction. The previous default stays allowed, and an environment with memory_retired true must be unretired first. The default can be replaced but never cleared. The first default starts narrowing nodes to the environments that execute, so it needs strand: true while sandboxes, or template releases in use (tagged or pinned by an enabled pool config), are bound to an environment with no state or one that doesn't execute, or while any sandbox's environment can't be told; mark the environments to keep allowed first. It also needs strand: true while an unfinished template runtime upgrade campaign moves an environment it stops. Replacing the default needs strand: true when any deprecated environment with memory_retired true lacks a certified upgrade_edges entry to the new default. No check yet that every node can run the new default: a node that applies the policy is to refuse a default it hasn't installed and verified.",
                 "requestBody": {
                     "required": true,
                     "content": {
@@ -1119,7 +1119,7 @@ fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
                                     "strand": {
                                         "type": "boolean",
                                         "default": false,
-                                        "description": "Set the first default even though work may depend on an environment it stops, or an unfinished template runtime upgrade campaign moves one."
+                                        "description": "Set the first default even though work may depend on an environment it stops or an unfinished template runtime upgrade campaign moves one, or replace the default even though a deprecated memory-retired environment lacks a certified upgrade edge to the new default."
                                     }
                                 }
                             }
@@ -1130,7 +1130,7 @@ fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
                     "200": { "description": "Object with the new generation and default_environment_ref" },
                     "400": { "description": "Invalid body, environment reference or reason" },
                     "403": { "description": "Managing organization administrator required" },
-                    "409": { "description": "The environment is blocked or has a stored state this server doesn't recognize, the first default would stop work (at_risk carries the environments and counts), or an unfinished template runtime upgrade campaign moves an environment it stops (with at_risk when it would stop work too, since strand: true waives both)" },
+                    "409": { "description": "The environment is blocked, has memory_retired true, or has a stored state this server doesn't recognize, a deprecated memory-retired environment lacks a certified upgrade edge to the new default, the first default would stop work (at_risk carries the environments and counts), or an unfinished template runtime upgrade campaign moves an environment it stops (with at_risk when it would stop work too, since strand: true waives both)" },
                     "412": { "description": "If-Match named a generation other than the policy's current one; nothing changed" }
                 }
             }
@@ -1141,10 +1141,10 @@ fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
         json!({
             "put": {
                 "summary": "Set an execution environment's state",
-                "description": "allowed and deprecated execute; blocked never executes. Increments the generation in the same transaction. The default must stay allowed, and blocking requires a cluster default. Blocking an environment that still has sandboxes, or template releases in use (a tag points to it or an enabled pool config pins it), bound to it, or while any sandbox has no environment binding, an unreadable one, or no binding record, needs strand: true: unbound legacy work executes as the environment it matches, which the server can't resolve, and a sandbox with no observation from its node may be bound to this one. In-use releases with no or an unreadable binding gate too, since new creates from them may run on the environment that stops. Other template releases, and sandboxes that can't run again (deleting, or failed with no live evidence and nothing the repair loop could revert to), are reported in at_risk but don't require strand. Blocking an environment that already doesn't execute (blocked, or with no state under a default) normally needs no strand; if another policy write lands while the block waits, the check runs in full. The counts are read just before the write and sandboxes keep changing, so strand is an acknowledgement, not a guarantee. Blocking also needs strand: true while an unfinished template runtime upgrade campaign moves the environment's releases, since a block mid-campaign stops the releases the campaign hasn't given a twin on its target yet; as for bound work, not when the environment already doesn't execute.",
+                "description": "allowed and deprecated execute; blocked never executes. Increments the generation in the same transaction. The default must stay allowed, promoting a memory-retired environment back to allowed requires unretiring its memory first, and blocking requires a cluster default. Blocking an environment that still has sandboxes, or template releases in use (a tag points to it or an enabled pool config pins it), bound to it, or while any sandbox has no environment binding, an unreadable one, or no binding record, needs strand: true: unbound legacy work executes as the environment it matches, which the server can't resolve, and a sandbox with no observation from its node may be bound to this one. In-use releases with no or an unreadable binding gate too, since new creates from them may run on the environment that stops. Other template releases, and sandboxes that can't run again (deleting, or failed with no live evidence and nothing the repair loop could revert to), are reported in at_risk but don't require strand. Blocking an environment that already doesn't execute (blocked, or with no state under a default) normally needs no strand; if another policy write lands while the block waits, the check runs in full. The counts are read just before the write and sandboxes keep changing, so strand is an acknowledgement, not a guarantee. Blocking also needs strand: true while an unfinished template runtime upgrade campaign moves the environment's releases, since a block mid-campaign stops the releases the campaign hasn't given a twin on its target yet; as for bound work, not when the environment already doesn't execute.",
                 "parameters": [
-                    { "name": "environment_ref", "in": "path", "required": true, "schema": environment_ref },
-                    if_match
+                    { "name": "environment_ref", "in": "path", "required": true, "schema": environment_ref.clone() },
+                    if_match.clone()
                 ],
                 "requestBody": {
                     "required": true,
@@ -1156,7 +1156,7 @@ fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
                                 "required": ["state", "reason"],
                                 "properties": {
                                     "state": { "type": "string", "enum": ["allowed", "deprecated", "blocked"] },
-                                    "reason": reason,
+                                    "reason": reason.clone(),
                                     "strand": {
                                         "type": "boolean",
                                         "default": false,
@@ -1171,8 +1171,47 @@ fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
                     "200": { "description": "Object with the new generation, environment_ref and state" },
                     "400": { "description": "Invalid body, environment reference, state or reason, or strand without blocked" },
                     "403": { "description": "Managing organization administrator required" },
-                    "409": { "description": "The environment is the default, blocking needs a default first, work may still be bound to it (at_risk carries the environments and counts), or an unfinished template runtime upgrade campaign still moves it (with at_risk when work is bound to it too, since strand: true waives both)" },
+                    "409": { "description": "The environment is the default, promoting to allowed requires unretiring checkpoint memory first, blocking needs a default first, work may still be bound to it (at_risk carries the environments and counts), or an unfinished template runtime upgrade campaign still moves it (with at_risk when work is bound to it too, since strand: true waives both)" },
                     "412": { "description": "If-Match named a generation other than the policy's current one; nothing changed" }
+                }
+            }
+        }),
+    );
+    paths.insert(
+        "/runtime-environments/{environment_ref}/memory".to_string(),
+        json!({
+            "put": {
+                "summary": "Retire or unretire an execution environment's checkpoint memory",
+                "description": "Retiring checkpoint memory requires Kubernetes substrate enforcement, SPACE_MEMORY_DROP_ENABLED, a cluster default with a certified upgrade_edges entry from this environment, deprecated state, zero in-use template releases bound to the environment, and full restore-time memory-drop coverage over every runnable sandbox attributed to the environment (plus zero unattributed runnable sandboxes or unattributed in-use template releases unless strand is true). Once retired, any subsequent restore of the environment drops its checkpoint memory inline in object storage and Postgres before any pod exists and cold-boots on the default environment. Unretiring is allowed while the environment stays deprecated (even when SPACE_MEMORY_DROP_ENABLED is off or on Direct) and refused once blocked. Promoting a memory-retired environment back to allowed or default requires unretiring its memory first.",
+                "parameters": [
+                    { "name": "environment_ref", "in": "path", "required": true, "schema": environment_ref },
+                    if_match
+                ],
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["action", "reason"],
+                                "properties": {
+                                    "action": { "type": "string", "enum": ["retire", "unretire"] },
+                                    "reason": reason,
+                                    "strand": { "type": "boolean", "default": false, "description": "Retire even though unattributed runnable sandboxes or unattributed in-use template releases exist (action=retire only). Never waives sandboxes or in-use template releases attributed to the retiring environment." }
+                                }
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "200": { "description": "Object with the new generation, environment_ref and memory_retired" },
+                    "400": { "description": "Invalid body, environment reference, action, reason or strand with action=unretire" },
+                    "403": { "description": "Managing organization administrator required" },
+                    "409": { "description": "No cluster default is set, no certified upgrade edge to the default exists, the environment isn't deprecated (or is already blocked on unretire), in-use template releases may still boot on the environment (template_releases_in_use carries bound and unattributed counts), or runnable sandboxes lack restore-time memory-drop coverage (uncovered carries not_kubernetes, encrypted, node_held, unpinned_or_not_ready and unattributed counts)" },
+                    "412": { "description": "If-Match named a generation other than the policy's current one; nothing changed" },
+                    "501": { "description": "Not available on the active substrate (action=retire)" },
+                    "503": { "description": "SPACE_MEMORY_DROP_ENABLED is off when action is retire, or the memory-retirement schema migration has not been applied yet" }
                 }
             }
         }),

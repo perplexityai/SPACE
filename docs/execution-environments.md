@@ -1283,10 +1283,37 @@ and refuses a block while the cluster has no default.
 
 Operators change the policy through the admin API under
 `/admin/api/v1/runtime-environments`, or `space-admin-cli runtime env`: `PUT
-.../default` sets the default and `PUT .../{environment}/state` sets a state,
-each with a required reason recorded with the caller. Both write through the
-store, so a write it refuses, such as blocking the default, comes back as a 409
-that names the rule. The API adds one check of its own, for a write that stops
+.../default` sets the default, `PUT .../{environment}/state` sets a state, and
+`PUT .../{environment}/memory` (`space-admin-cli runtime env memory <env>
+retire|unretire [--strand]`) retires or unretires a `deprecated` environment's
+checkpoint memory, each with a required reason recorded with the caller. All
+three write through the store, so a write it refuses, such as blocking the
+default or promoting a memory-retired environment back to `allowed` or default
+without unretiring its memory first, comes back as a 409 that names the rule.
+Retiring an environment's checkpoint memory requires the Kubernetes substrate
+(501 on Direct; `unretire` still clears an existing flag on Direct),
+`SPACE_MEMORY_DROP_ENABLED` (503 when off, or before the `memory_retired`
+schema migration runs; `unretire` works even when the switch is off so rollback
+never deadlocks), a cluster default, `deprecated` state, a certified
+`upgrade_edges` entry from the retiring environment to the
+cluster default in `runtime_environments` (409 when missing, never waived by
+`strand`; `PUT .../default` also refuses moving the default onto an environment
+that an already-retired `deprecated` environment has no certified upgrade edge to
+unless `strand: true` waives it), zero in-use template releases bound to the
+retiring environment (`template_releases_in_use`, counting tags after twin
+resolution and enabled warm-pool configs), and full restore-time memory-drop
+coverage over every runnable sandbox attributed to the environment plus zero
+unattributed runnable sandboxes or unattributed in-use template releases unless
+`strand: true` (`--strand`) waives unattributed work (409 with `uncovered`
+counts across `not_kubernetes`, `encrypted`, `node_held` including live,
+un-upgraded `stopped`, and active `restoring` leases, `unpinned_or_not_ready`
+and `unattributed`; `strand` never waives sandboxes or in-use template releases
+attributed to the retiring environment). Each policy write invalidates the receiving API replica's runtime
+policy cache immediately, every Kubernetes restore refreshes that cache from
+Postgres under `FOR KEY SHARE` on `runtime_environment_policy` after claiming
+its restore lease so concurrent `retire` calls serialize cleanly, and memory history (`memory_retired` and
+`memory_last_change` on `GET /runtime-environments`) stays separate from the
+environment's state-change columns. The API also checks a write that stops
 an environment executing: blocking stops the blocked environment, and the first
 default stops every environment with no state, along with any whose state
 doesn't execute (a block only direct SQL can leave without a default). Such a
@@ -2401,9 +2428,11 @@ is stranded.
    plan's storage URI, or, for a restore from the node's local copy, the
    snapshot of the sandbox's current local artifact. A start reads the
    execution the sandbox last published, from `sandbox_observed_states`; a
-   publish that carried no execution is no evidence, and so is a checkpoint
-   without a local artifact identity, since the node couldn't tell its copy
-   is that checkpoint. A record that names its environment is that
+   publish that carried no execution is no evidence, and so is a same-node
+   local restore with no `current_local_artifact_id` (a remote-storage restore
+   still attributes from its `snapshots` row; node-side `UpgradeRuntime` still
+   requires `local_artifact_id`, whereas control-plane restore-time memory drop
+   requires a durable `current_local_artifact_id` pin). A record that names its environment is that
    environment. An unbound one is attributed as narrowly as the control
    plane can approach node-manager, which applies an environment's
    eligibility to unbound work only when the work matches that environment's
@@ -2417,11 +2446,36 @@ is stranded.
    metadata counts as E0 (Firecracker 1.15.1 with format 9.0.0, the
    `INITIAL_FIRECRACKER_*` identity) only when the cluster disables legacy
    unbound work, and a kernel it names must match. A bound record on an
-   `allowed` environment needs no catalog. Anything else activates as
-   recorded, and the node's execution policy decides whether it may run.
-2. **Decision.** With no cluster default, or on the default or an `allowed`
-   environment, nothing moves. A suspended sandbox on a `deprecated`
-   environment restores where it is, memory included. Otherwise the target is
+   `allowed` environment needs no catalog. When any `deprecated` environment
+   currently has `memory_retired = true`, an unattributed restore (including a
+   markerless same-node restore) is refused with 412 and parked back in
+   `suspended` before any pod is created, because a `deprecated` environment
+   still executes on worker nodes (`PUT /admin/api/v1/runtime-environments/{env}/memory`
+   with `action: "unretire"` lifts that check). Otherwise anything unattributed
+   activates as recorded, and the node's execution policy decides whether it may
+   run.
+2. **Decision.** Every Kubernetes restore refreshes the runtime policy cache
+   from Postgres under `FOR KEY SHARE` on `runtime_environment_policy` after
+   claiming its restore lease, so neither a newly retired environment nor an
+   operator `unretire` waits out another replica's 5-second cache TTL or races
+   an in-flight `retire` transaction. With no
+   cluster default, or on the default or an `allowed` environment, nothing
+   moves. A suspended sandbox on a `deprecated` environment whose checkpoint
+   memory isn't retired restores where it is, memory included. When an operator
+   has retired an environment's checkpoint memory (`memory_retired = true`,
+   whether still `deprecated` or later `blocked`), `decide_activation_runtime`
+   runs on `Restore` even when `SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED` is
+   off and plans `DropMemoryAndColdBoot` (`plan = "drop_memory_and_cold_boot"`,
+   `cause = "memory_retired"` on `runtime_upgrade.activation.decision`) once an
+   upgrade edge exists regardless of any `memory_edges` entry (stranding with
+   412 naming `/memory` `unretire` when no upgrade edge exists): on Kubernetes, before any pod is created, the API copies the
+   pinned full suspend artifact's rootfs into a disk-only artifact in object
+   storage and re-pins the row under the restore lease (and while a background
+   campaign drop seals the row, `claim_user_restore` waits on the seal rather
+   than failing fast). Permanent structural ineligibility answers 412; until
+   disk-only cold boot lands, a completed inline drop parks the row back in
+   `suspended` pinned to that disk artifact and answers a retryable 503.
+   Otherwise the target is
    the default, along the edges `runtime_environments` records for the
    sandbox's environment:
    - a resume with a memory edge restores as usual, and the node's

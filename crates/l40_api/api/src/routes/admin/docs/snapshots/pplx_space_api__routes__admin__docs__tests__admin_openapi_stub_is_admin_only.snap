@@ -114,6 +114,9 @@ expression: paths_by_method
   "/runtime-environments/population": [
     "get"
   ],
+  "/runtime-environments/{environment_ref}/memory": [
+    "put"
+  ],
   "/runtime-environments/{environment_ref}/state": [
     "put"
   ],

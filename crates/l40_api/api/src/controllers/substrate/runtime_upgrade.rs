@@ -11,21 +11,24 @@
 //! * a memory edge reaches the cluster default, so a suspended sandbox
 //!   restores normally and the node's restore-consumer selection loads the
 //!   checkpoint under the default;
-//! * an upgrade edge reaches the default, so the node runs its runtime upgrade
-//!   (`UpgradeRuntime`) instead: a fenced cold boot of the disk under the
-//!   default that keeps files, loses memory and records the default as the
-//!   sandbox's consumer without rewriting the checkpoint's producer. A
-//!   suspended sandbox's memory is discarded only when an operator blocked its
-//!   environment;
+//! * an upgrade edge reaches the default: for a stopped sandbox, or a
+//!   suspended sandbox whose environment an operator blocked, the node runs its
+//!   runtime upgrade (`UpgradeRuntime`), a fenced cold boot of the disk under
+//!   the default that keeps files, loses memory and records the default as the
+//!   sandbox's consumer without rewriting the checkpoint's producer; for a
+//!   suspended sandbox whose `deprecated` environment has its memory retired,
+//!   the control plane drops the sandbox's memory to a disk artifact under the
+//!   restore lease and cold-boots that disk under the default;
 //! * nothing reaches the default, or only an upgrade edge reaches it from an
-//!   environment no operator blocked for a suspended sandbox, so the sandbox
-//!   is stranded and the activation is refused until an operator acts.
+//!   environment whose memory hasn't been retired or blocked for a suspended
+//!   sandbox, so the sandbox is stranded and the activation is refused until an
+//!   operator acts.
 //!
 //! A stopped sandbox on a `deprecated` environment is upgraded as well when an
 //! edge allows it: a cold start loses nothing a plain start would keep. A
-//! suspended one on a `deprecated` environment restores as recorded. With no
-//! cluster default the policy narrows nothing, and every activation proceeds
-//! as recorded.
+//! suspended one on a `deprecated` environment restores as recorded until an
+//! operator retires that environment's memory. With no cluster default the
+//! policy narrows nothing, and every activation proceeds as recorded.
 //!
 //! Shipped disabled behind [`RuntimeUpgradeAtActivation`]. The decision only
 //! chooses what to ask the node for; the node re-checks the edge against its
@@ -225,6 +228,10 @@ pub enum UpgradeCause {
     Unlisted,
     /// The environment is `deprecated`; only stopped sandboxes move.
     Deprecated,
+    /// The environment is `deprecated` and an operator retired its memory, so
+    /// suspended sandboxes drop their memory at restore time instead of
+    /// resuming on it.
+    MemoryRetired,
 }
 
 impl UpgradeCause {
@@ -233,6 +240,7 @@ impl UpgradeCause {
             Self::Blocked => "blocked",
             Self::Unlisted => "unlisted",
             Self::Deprecated => "deprecated",
+            Self::MemoryRetired => "memory_retired",
         }
     }
 }
@@ -259,6 +267,9 @@ pub enum RuntimePlan {
     /// Restore as usual; a memory edge lets the node load the checkpoint
     /// under the default.
     RestoreOnDefault(EnvironmentMove),
+    /// Drop the suspended sandbox's memory in the control plane under the
+    /// restore lease, then cold-boot the resulting disk under the default.
+    DropMemoryAndColdBoot(EnvironmentMove),
     /// Cold-boot the disk under the default by the node's runtime upgrade.
     ColdBootUpgrade(EnvironmentMove),
     /// No certified edge reaches the default from an environment that may not
@@ -271,6 +282,7 @@ impl RuntimePlan {
         match self {
             Self::AsRecorded => "as_recorded",
             Self::RestoreOnDefault(_) => "restore_on_default",
+            Self::DropMemoryAndColdBoot(_) => "drop_memory_and_cold_boot",
             Self::ColdBootUpgrade(_) => "cold_boot_upgrade",
             Self::Stranded(_) => "stranded",
         }
@@ -295,9 +307,13 @@ pub fn decide(
     let cause = match policy.environments.get(&from) {
         Some(RuntimeEnvironmentState::Allowed) => return RuntimePlan::AsRecorded,
         // A deprecated environment still executes: a suspended sandbox
-        // restores on it, keeping its memory.
+        // restores on it, keeping its memory, until an operator retires that
+        // environment's memory.
         Some(RuntimeEnvironmentState::Deprecated) if activation == UpgradeActivation::Restore => {
-            return RuntimePlan::AsRecorded;
+            if !policy.memory_retired_environments.contains(&from) {
+                return RuntimePlan::AsRecorded;
+            }
+            UpgradeCause::MemoryRetired
         }
         Some(RuntimeEnvironmentState::Deprecated) => UpgradeCause::Deprecated,
         Some(RuntimeEnvironmentState::Blocked) => UpgradeCause::Blocked,
@@ -308,8 +324,16 @@ pub fn decide(
         from_catalog.is_some_and(|environment| environment.memory_edges.contains(&to));
     let upgrade_edge =
         from_catalog.is_some_and(|environment| environment.upgrade_edges.contains(&to));
-    if activation == UpgradeActivation::Restore && memory_edge {
+    // Retiring an environment's memory explicitly sheds its VM checkpoint
+    // memory, and a `deprecated` environment remains in `executing()` on worker
+    // nodes (so `RestoreOnDefault` with `runtime_upgrade = None` would select
+    // `from` itself rather than moving to `default`). Only a non-memory-retired
+    // environment can restore its checkpoint memory onto `default` via a
+    // `memory_edge`.
+    if activation == UpgradeActivation::Restore && !policy.is_memory_retired(from) && memory_edge {
         RuntimePlan::RestoreOnDefault(to_default)
+    } else if upgrade_edge && cause == UpgradeCause::MemoryRetired {
+        RuntimePlan::DropMemoryAndColdBoot(to_default)
     } else if upgrade_edge
         // A cold boot discards a suspended sandbox's memory, which only an
         // operator's block of the environment consents to. Without one, the
@@ -343,17 +367,23 @@ impl EnvironmentMove {
         &self,
         activation: UpgradeActivation,
     ) -> pplx_space_sbx_mgr_client::proto::RuntimeUpgradeAuthorization {
+        let state = match self.cause {
+            UpgradeCause::MemoryRetired => "deprecated with its memory retired",
+            _ => self.cause.as_str(),
+        };
         pplx_space_sbx_mgr_client::proto::RuntimeUpgradeAuthorization {
             authorization_id: format!("runtime-environment-{}:{}", self.cause, self.from),
             reason: format!(
-                "environment {} is {}; {} moves to the cluster default {}",
+                "environment {} is {state}; {} moves to the cluster default {}",
                 self.from,
-                self.cause,
                 activation.as_str(),
                 self.to
             ),
             memory_loss: activation == UpgradeActivation::Restore
-                && self.cause == UpgradeCause::Blocked,
+                && matches!(
+                    self.cause,
+                    UpgradeCause::Blocked | UpgradeCause::MemoryRetired
+                ),
         }
     }
 
@@ -402,16 +432,76 @@ impl EnvironmentMove {
     }
 }
 
-/// The refusal for a stranded sandbox. Not retryable: it holds until an
-/// operator allows the environment, certifies an edge or changes the
-/// default.
-pub fn stranded_error(sandbox_id: SandboxId, stranded: EnvironmentMove) -> super::SubstrateError {
+/// Whether `policy` has any executing (`deprecated`) environment whose
+/// checkpoint memory is retired. Worker nodes enforce `blocked` on their own,
+/// whereas `deprecated` environments remain in `executing()` so only the
+/// control plane prevents their retired checkpoints from booting.
+pub fn has_executing_memory_retired_environment(policy: &RuntimeEnvironmentPolicy) -> bool {
+    policy
+        .memory_retired_environments
+        .iter()
+        .any(|environment| {
+            policy
+                .environments
+                .get(environment)
+                .is_some_and(|state| state.executes())
+        })
+}
+
+/// The refusal for a restore whose checkpoint cannot be attributed to a catalog
+/// environment while an executing (`deprecated`) environment has retired its
+/// checkpoint memory. Worker nodes still allow `deprecated` environments, so
+/// activating an unattributed checkpoint could boot retired VM memory.
+pub fn unattributed_memory_retired_error(
+    sandbox_id: SandboxId,
+    policy: &RuntimeEnvironmentPolicy,
+) -> super::SubstrateError {
+    let retired = policy
+        .memory_retired_environments
+        .iter()
+        .filter(|environment| {
+            policy
+                .environments
+                .get(environment)
+                .is_some_and(|state| state.executes())
+        })
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
     super::SubstrateError::FailedPrecondition {
         message: format!(
-            "sandbox {sandbox_id} last ran under execution environment {}, which is {} and has \
-             no certified upgrade edge to the cluster default {}; an operator must allow the \
-             environment or certify an edge",
-            stranded.from, stranded.cause, stranded.to
+            "sandbox {sandbox_id} cannot restore because its checkpoint cannot be attributed to a \
+             catalog environment while deprecated environment(s) [{retired}] have retired \
+             checkpoint memory; unretire with PUT /admin/api/v1/runtime-environments/{{env}}/memory \
+             (action: \"unretire\") or block the retired environment first"
+        ),
+    }
+}
+
+/// The refusal for a stranded sandbox. Not retryable: it holds until an
+/// operator allows or unretires the environment, certifies an edge or changes
+/// the default.
+pub fn stranded_error(sandbox_id: SandboxId, stranded: EnvironmentMove) -> super::SubstrateError {
+    let (state, remedy) = match stranded.cause {
+        UpgradeCause::MemoryRetired => (
+            "deprecated with its memory retired",
+            format!(
+                "an operator must unretire its memory with \
+                 PUT /admin/api/v1/runtime-environments/{}/memory (action: \"unretire\"), \
+                 allow the environment or certify an edge",
+                stranded.from
+            ),
+        ),
+        _ => (
+            stranded.cause.as_str(),
+            "an operator must allow the environment or certify an edge".to_owned(),
+        ),
+    };
+    super::SubstrateError::FailedPrecondition {
+        message: format!(
+            "sandbox {sandbox_id} last ran under execution environment {}, which is {state} and has \
+             no certified upgrade edge to the cluster default {}; {remedy}",
+            stranded.from, stranded.to
         ),
     }
 }
@@ -450,5 +540,29 @@ impl RuntimePolicyCache {
         let policy = Arc::new(read().await?);
         *cached = Some((tokio::time::Instant::now(), Arc::clone(&policy)));
         Ok(policy)
+    }
+
+    /// Read a fresh policy through `read` without holding the cache mutex
+    /// across database I/O, then store it unless a newer generation was cached
+    /// concurrently. A failed read leaves any existing entry untouched.
+    pub async fn refresh<F, Fut, E>(&self, read: F) -> Result<Arc<RuntimeEnvironmentPolicy>, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<RuntimeEnvironmentPolicy, E>>,
+    {
+        let policy = Arc::new(read().await?);
+        let mut cached = self.cached.lock().await;
+        if cached
+            .as_ref()
+            .is_none_or(|(_, existing)| policy.generation >= existing.generation)
+        {
+            *cached = Some((tokio::time::Instant::now(), Arc::clone(&policy)));
+        }
+        Ok(policy)
+    }
+
+    /// Clear the cached policy so the next activation reads the store directly.
+    pub async fn invalidate(&self) {
+        *self.cached.lock().await = None;
     }
 }

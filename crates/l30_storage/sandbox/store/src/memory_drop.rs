@@ -1,5 +1,6 @@
-//! The memory drop: a suspended Kubernetes sandbox whose node is gone keeps
-//! its disk and loses its memory, done in Postgres and object storage alone.
+//! The memory drop: a suspended or restoring Kubernetes sandbox whose node is
+//! gone keeps its disk and loses its memory, done in Postgres and object
+//! storage alone.
 //!
 //! A suspended Kubernetes sandbox is unplaced, and its only copy is the
 //! durable full suspend artifact its pin names. Its memory and VM state are
@@ -14,12 +15,18 @@
 //! The seal is the row's restore lease (`restore_lease_token`,
 //! `restore_lease_expires_at`), taken without moving the lifecycle ([`seal`]),
 //! renewed while the copy runs ([`renew`]) and cleared by [`commit`] or
-//! [`release`]. The user restore claim already refuses a live lease, and the
-//! `sandboxes_clear_restore_lease` trigger keeps a lease across writes that
-//! keep the row `suspended`, so the seal holds until the drop lifts it, it
-//! expires, or a write moves the row's lifecycle, which clears it. A sealed row
-//! is one that's `suspended` with a live lease ([`sealed`]); fork admission,
-//! the delete and the restore claims refuse it with a retryable error.
+//! [`release`]. The user restore claim refuses a live lease while the seal is
+//! held and joins the wait, and the `sandboxes_clear_restore_lease` trigger
+//! keeps a lease across writes that keep the row `suspended`, so the seal holds
+//! until the drop lifts it, it expires, or a write moves the row's lifecycle,
+//! which clears it. A sealed row is one that's `suspended` with a live lease
+//! ([`sealed`]); fork admission, delete and evacuation claims refuse it with a
+//! retryable error.
+//!
+//! A restore that arrives after an environment's memory was retired before a
+//! campaign reached the row drops the memory inline under the restore lease it
+//! already claimed ([`restore`]). Coverage over a cluster's sandbox population
+//! lives in [`coverage`].
 //!
 //! The full artifact's snapshot rows and storage locations aren't touched:
 //! they stay `ready` and attached, so retention keeps them and an operator
@@ -29,9 +36,12 @@
 //! that [`dropped`] reports, and no restore claim takes such a row
 //! (`restore_lease`), so no newer full snapshot appears while it's dropped.
 //!
-//! This module owns the reads and the guarded write on `sandboxes`. The
-//! api's sandbox controller drives the copy between them and owns the
-//! transaction; the snapshot rows belong to `pplx-space-snapshot-store`.
+//! This module owns the reads and the guarded writes on `sandboxes`. The api's
+//! sandbox controller drives the copy between them and owns the transaction;
+//! the snapshot rows belong to `pplx-space-snapshot-store`.
+
+pub mod coverage;
+pub mod restore;
 
 use std::time::Duration;
 
@@ -65,12 +75,12 @@ pub struct MemoryDropCandidate {
 pub enum CandidateRead {
     /// A plain read, for deciding whether to start copying.
     Plain,
-    /// `FOR UPDATE OF s`, inside the transaction that seals the row. Every
-    /// activation claims the row with a `suspended` → `restoring` CAS, so
-    /// holding the lock fences them until the seal is decided. A fork reads
-    /// the full artifact without claiming the row; the caller fences forks
-    /// with the fork-source lock (`crate::fork_source_lifecycle`) before this
-    /// one.
+    /// `FOR UPDATE OF s`, inside the transaction that seals the row or checks a
+    /// restore-owned row. Every activation claims the row with a `suspended` →
+    /// `restoring` CAS, so holding the lock fences them until the seal is
+    /// decided. A fork reads the full artifact without claiming the row; the
+    /// caller fences forks with the fork-source lock
+    /// (`crate::fork_source_lifecycle`) before this one.
     Locked,
 }
 
@@ -127,51 +137,30 @@ impl MemoryDropRefusal {
     }
 }
 
-/// The conditions on `s`, the `sandboxes` row, that don't involve the pinned
-/// artifact's snapshot rows. [`candidate`] and [`refusal`] both read them, so
-/// the two can't drift.
-fn row_conditions() -> [(&'static str, String); 7] {
-    [
-        ("kubernetes", "s.managed_by = $2".to_string()),
-        (
-            "dropped",
-            "s.lifecycle = 'suspended' AND s.current_local_artifact_kind = 'disk'".to_string(),
-        ),
-        ("suspended", "s.lifecycle = 'suspended'".to_string()),
-        // An expired seal is a drop that died mid-copy; a retry takes it over.
-        ("unsealed", LEASE_EXPIRED.to_string()),
-        (
-            "unplaced",
-            "s.active_node_id IS NULL
+/// Unplaced and without an active Kubernetes execution on `s`.
+pub(super) const UNPLACED: &str = "s.active_node_id IS NULL
             AND s.evacuation_restore_target IS NULL
             AND NOT EXISTS (
                 SELECT 1
                   FROM sandbox_k8s_executions ske
                  WHERE ske.sandbox_id = s.id
                    AND ske.active
-            )"
-            .to_string(),
-        ),
-        (
-            "unencrypted",
-            "NOT COALESCE(s.volume_encryption, FALSE)".to_string(),
-        ),
-        (
-            "full_suspend_pin",
-            "s.current_local_artifact_kind = 'full'
-            AND s.current_local_artifact_origin = 'suspend'"
-                .to_string(),
-        ),
-    ]
-}
+            )";
+
+/// Not volume-encrypted on `s`.
+pub(super) const UNENCRYPTED: &str = "NOT COALESCE(s.volume_encryption, FALSE)";
+
+/// Pinned to a `full` `suspend` artifact on `s`.
+pub(super) const FULL_SUSPEND_PIN: &str = "s.current_local_artifact_kind = 'full'
+            AND s.current_local_artifact_origin = 'suspend'";
 
 /// No live restore lease on `s`: none, or one past its expiry.
-const LEASE_EXPIRED: &str =
+pub(super) const LEASE_EXPIRED: &str =
     "(s.restore_lease_expires_at IS NULL OR s.restore_lease_expires_at <= NOW())";
 
 /// The node checks: neither the placement's node nor the newest execution's
 /// node has a `node_k8s` mapping, and an execution names a node.
-const NODE_GONE: &str = "NOT EXISTS (
+pub(super) const NODE_GONE: &str = "NOT EXISTS (
                 SELECT 1 FROM node_k8s nk WHERE nk.node_id = s.target_node_id
             )
             AND EXISTS (
@@ -195,7 +184,7 @@ const NODE_GONE: &str = "NOT EXISTS (
 
 /// The conditions on `sn` and `ssl`, a snapshot row of the pinned artifact
 /// and its location: durable, and the newest full snapshot.
-fn durable_copy() -> String {
+pub(super) fn durable_copy() -> String {
     let pinned = snapshot_is_current_local_artifact("s", "sn");
     format!(
         "{pinned}
@@ -203,6 +192,111 @@ fn durable_copy() -> String {
             AND sn.state = 'ready'
             AND ssl.orphaned_at IS NULL"
     )
+}
+
+/// Build the `SELECT ... FROM sandboxes s JOIN snapshots sn ...` query for a
+/// memory-drop candidate given `lifecycle_guard` (`s` predicates on lifecycle
+/// and lease ownership).
+pub(super) fn candidate_sql(lifecycle_guard: &str, read: CandidateRead) -> String {
+    let durable = durable_copy();
+    let newest = no_newer_full_snapshot_ignoring_failed_retry("s", "sn");
+    let lock = match read {
+        CandidateRead::Plain => "",
+        CandidateRead::Locked => "FOR UPDATE OF s",
+    };
+    sql!(format!(
+        "SELECT s.org_id, s.current_local_artifact_id, sn.id, ssl.storage_connection_string
+           FROM sandboxes s
+           JOIN snapshots sn ON sn.sandbox_id = s.id
+           JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
+          WHERE s.id = $1
+            AND s.managed_by = $2
+            AND {lifecycle_guard}
+            AND {UNPLACED}
+            AND {UNENCRYPTED}
+            AND {FULL_SUSPEND_PIN}
+            AND {durable}
+            AND {newest}
+            AND {NODE_GONE}
+          ORDER BY sn.timestamp DESC, sn.id DESC, ssl.created_at DESC, ssl.id DESC
+          LIMIT 1
+          {lock}"
+    ))
+}
+
+pub(super) fn candidate_from_row(
+    (org_id, pinned_artifact_id, full_snapshot_id, storage_connection_string): (
+        OrgId,
+        LocalArtifactId,
+        SnapshotId,
+        String,
+    ),
+) -> MemoryDropCandidate {
+    MemoryDropCandidate {
+        org_id,
+        pinned_artifact_id,
+        full_snapshot_id,
+        storage_connection_string,
+    }
+}
+
+/// Shared row-eligibility tail columns (`unplaced`, `unencrypted`,
+/// `full_suspend_pin`, `durable`, `newest`, `node_gone`) for diagnostic refusal
+/// queries.
+pub(super) fn refusal_tail_columns() -> String {
+    refusal_tail_columns_with("TRUE")
+}
+
+/// [`refusal_tail_columns`] with an extra predicate `snapshot_guard` on `sn`
+/// (and outer `s`) inside the `durable` and `newest` subqueries.
+pub(super) fn refusal_tail_columns_with(snapshot_guard: &str) -> String {
+    let durable = durable_copy();
+    let newest = no_newer_full_snapshot_ignoring_failed_retry("s", "sn");
+    format!(
+        "COALESCE(({UNPLACED}), FALSE) AS unplaced,
+                COALESCE(({UNENCRYPTED}), FALSE) AS unencrypted,
+                COALESCE(({FULL_SUSPEND_PIN}), FALSE) AS full_suspend_pin,
+                EXISTS (
+                    SELECT 1
+                      FROM snapshots sn
+                      JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
+                     WHERE sn.sandbox_id = s.id
+                       AND {durable}
+                       AND {snapshot_guard}
+                ) AS durable,
+                EXISTS (
+                    SELECT 1
+                      FROM snapshots sn
+                      JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
+                     WHERE sn.sandbox_id = s.id
+                       AND {durable}
+                       AND {snapshot_guard}
+                       AND {newest}
+                ) AS newest,
+                COALESCE(({NODE_GONE}), FALSE) AS node_gone"
+    )
+}
+
+pub(super) fn refusal_from_tail(
+    (unplaced, unencrypted, full_suspend_pin, durable, newest, node_gone): (
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+    ),
+) -> Option<MemoryDropRefusal> {
+    [
+        (unplaced, MemoryDropRefusal::Placed),
+        (unencrypted, MemoryDropRefusal::Encrypted),
+        (full_suspend_pin, MemoryDropRefusal::NotFullSuspendPin),
+        (durable, MemoryDropRefusal::NoDurableCopy),
+        (newest, MemoryDropRefusal::NewerFullSnapshot),
+        (node_gone, MemoryDropRefusal::NodeNotGone),
+    ]
+    .into_iter()
+    .find_map(|(holds, refusal)| (!holds).then_some(refusal))
 }
 
 /// Read the memory-drop candidate of one sandbox. `None` when the row isn't
@@ -237,33 +331,10 @@ pub async fn candidate(
     sandbox_id: SandboxId,
     read: CandidateRead,
 ) -> Result<Option<MemoryDropCandidate>, sqlx::Error> {
-    let rows = row_conditions()
-        .into_iter()
-        .filter(|(name, _)| *name != "dropped")
-        .map(|(_, condition)| condition)
-        .collect::<Vec<_>>()
-        .join("\n            AND ");
-    let durable = durable_copy();
-    let newest = no_newer_full_snapshot_ignoring_failed_retry("s", "sn");
-    // Only the trailing lock clause differs between the two reads.
-    let lock = match read {
-        CandidateRead::Plain => "",
-        CandidateRead::Locked => "FOR UPDATE OF s",
-    };
-    let query = sql!(format!(
-        "SELECT s.org_id, s.current_local_artifact_id, sn.id, ssl.storage_connection_string
-           FROM sandboxes s
-           JOIN snapshots sn ON sn.sandbox_id = s.id
-           JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
-          WHERE s.id = $1
-            AND {rows}
-            AND {durable}
-            AND {newest}
-            AND {NODE_GONE}
-          ORDER BY sn.timestamp DESC, sn.id DESC
-          LIMIT 1
-          {lock}"
-    ));
+    let query = candidate_sql(
+        &format!("s.lifecycle = 'suspended' AND {LEASE_EXPIRED}"),
+        read,
+    );
     type Row = (OrgId, LocalArtifactId, SnapshotId, String);
     let row: Option<Row> = sqlx::query_as(sqlx::AssertSqlSafe(query))
         .bind(sandbox_id)
@@ -272,16 +343,7 @@ pub async fn candidate(
         .bind(SubstrateKind::Kubernetes)
         .fetch_optional(executor)
         .await?;
-    Ok(row.map(
-        |(org_id, pinned_artifact_id, full_snapshot_id, storage_connection_string)| {
-            MemoryDropCandidate {
-                org_id,
-                pinned_artifact_id,
-                full_snapshot_id,
-                storage_connection_string,
-            }
-        },
-    ))
+    Ok(row.map(candidate_from_row))
 }
 
 /// Why the row isn't a [`candidate`], or `None` when it is one. A plain read:
@@ -291,31 +353,13 @@ pub async fn refusal(
     executor: impl PgExecutor<'_>,
     sandbox_id: SandboxId,
 ) -> Result<Option<MemoryDropRefusal>, sqlx::Error> {
-    let columns = row_conditions()
-        .into_iter()
-        .map(|(name, condition)| format!("COALESCE(({condition}), FALSE) AS {name}"))
-        .collect::<Vec<_>>()
-        .join(",\n                ");
-    let durable = durable_copy();
-    let newest = no_newer_full_snapshot_ignoring_failed_retry("s", "sn");
+    let tail = refusal_tail_columns();
     let query = sql!(format!(
-        "SELECT {columns},
-                EXISTS (
-                    SELECT 1
-                      FROM snapshots sn
-                      JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
-                     WHERE sn.sandbox_id = s.id
-                       AND {durable}
-                ) AS durable,
-                EXISTS (
-                    SELECT 1
-                      FROM snapshots sn
-                      JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
-                     WHERE sn.sandbox_id = s.id
-                       AND {durable}
-                       AND {newest}
-                ) AS newest,
-                COALESCE(({NODE_GONE}), FALSE) AS node_gone
+        "SELECT COALESCE((s.managed_by = $2), FALSE) AS kubernetes,
+                COALESCE((s.lifecycle = 'suspended' AND s.current_local_artifact_kind = 'disk'), FALSE) AS dropped,
+                COALESCE((s.lifecycle = 'suspended'), FALSE) AS suspended,
+                COALESCE(({LEASE_EXPIRED}), FALSE) AS unsealed,
+                {tail}
            FROM sandboxes s
           WHERE s.id = $1"
     ));
@@ -340,22 +384,26 @@ pub async fn refusal(
     else {
         return Ok(Some(MemoryDropRefusal::NotFound));
     };
-    // The first failing condition, most fundamental first.
-    let checks = [
+    let head = [
         (kubernetes, MemoryDropRefusal::NotKubernetes),
         (!dropped, MemoryDropRefusal::AlreadyDropped),
         (suspended, MemoryDropRefusal::NotSuspended),
         (unsealed, MemoryDropRefusal::Sealed),
-        (unplaced, MemoryDropRefusal::Placed),
-        (unencrypted, MemoryDropRefusal::Encrypted),
-        (full_suspend_pin, MemoryDropRefusal::NotFullSuspendPin),
-        (durable, MemoryDropRefusal::NoDurableCopy),
-        (newest, MemoryDropRefusal::NewerFullSnapshot),
-        (node_gone, MemoryDropRefusal::NodeNotGone),
     ];
-    Ok(checks
+    if let Some(refusal) = head
         .into_iter()
-        .find_map(|(holds, refusal)| (!holds).then_some(refusal)))
+        .find_map(|(holds, refusal)| (!holds).then_some(refusal))
+    {
+        return Ok(Some(refusal));
+    }
+    Ok(refusal_from_tail((
+        unplaced,
+        unencrypted,
+        full_suspend_pin,
+        durable,
+        newest,
+        node_gone,
+    )))
 }
 
 /// **Guarded transition.** Seal the row for a memory drop: read its
@@ -493,8 +541,9 @@ pub async fn commit(
 /// Whether a memory drop holds the row's seal: it's `suspended` with a live
 /// restore lease. Only [`seal`] writes a lease on a `suspended` row.
 ///
-/// Fork admission, the delete and the restore claims ask this to refuse such
-/// a row with a retryable error rather than a final one.
+/// Fork admission, delete and evacuation claims ask this to refuse such a row
+/// with a retryable error rather than a final one; user restores join the wait
+/// on the row's restore lease instead.
 pub async fn sealed(
     executor: impl PgExecutor<'_>,
     sandbox_id: SandboxId,
@@ -536,6 +585,29 @@ pub async fn dropped(
     .await
 }
 
+/// Whether a `suspended` or `restoring` row is pinned to a disk artifact.
+///
+/// Used as a defense-in-depth guard before resolving a full suspend snapshot
+/// for a VM restore pod: even if a row entered `restoring` before or across a
+/// pin change, a disk pin must never boot the retained full checkpoint.
+pub async fn pinned_to_disk(
+    executor: impl PgExecutor<'_>,
+    sandbox_id: SandboxId,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM sandboxes
+              WHERE id = $1
+                AND lifecycle IN ('suspended', 'restoring')
+                AND current_local_artifact_kind = 'disk'
+         )"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(executor)
+    .await
+}
+
 /// Whether the row is still pinned to `candidate`'s artifact.
 ///
 /// A caller that lost [`commit`] asks this before giving the disk prefix it
@@ -564,7 +636,7 @@ pub async fn pin_held(
 }
 
 /// `duration` in whole milliseconds for a SQL bind, saturating.
-fn millis(duration: Duration) -> i64 {
+pub(super) fn millis(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 

@@ -11,7 +11,10 @@ use uuid::Uuid;
 
 use crate::{
     admin_client::{ADMIN_API_PREFIX, AdminClient, CliError},
-    cli::{RuntimeCommands, RuntimeEnvCommands, RuntimeEnvironmentStateArg},
+    cli::{
+        RuntimeCommands, RuntimeEnvCommands, RuntimeEnvironmentMemoryActionArg,
+        RuntimeEnvironmentStateArg,
+    },
 };
 
 #[derive(Debug, Deserialize)]
@@ -26,6 +29,10 @@ struct EnvironmentState {
     environment_ref: String,
     state: String,
     is_default: bool,
+    #[serde(default)]
+    memory_retired: bool,
+    #[serde(default)]
+    memory_last_change: Option<RecordedChange>,
     last_change: Option<RecordedChange>,
 }
 
@@ -49,6 +56,13 @@ struct SetStateResponse {
     generation: u64,
     environment_ref: String,
     state: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetMemoryResponse {
+    generation: u64,
+    environment_ref: String,
+    memory_retired: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,6 +257,47 @@ impl AdminClient {
                     response.environment_ref, response.state, response.generation
                 ))
             }
+            RuntimeEnvCommands::Memory {
+                environment,
+                action,
+                reason,
+                strand,
+                if_generation,
+                json,
+            } => {
+                if strand && action != RuntimeEnvironmentMemoryActionArg::Retire {
+                    return Err(CliError::Argument(
+                        "--strand applies only to retire".to_string(),
+                    ));
+                }
+                let request = self
+                    .http
+                    .put(runtime_environments_url(
+                        &self.base_url,
+                        &format!("/{environment}/memory"),
+                    ))
+                    .json(&serde_json::json!({
+                        "action": action.as_str(),
+                        "reason": reason,
+                        "strand": strand,
+                    }));
+                let body = self
+                    .send_write(request, if_generation, POLICY_CHECK)
+                    .await?;
+                if json {
+                    return Ok(body);
+                }
+                let response: SetMemoryResponse = decode(&body, "set memory")?;
+                let state_desc = if response.memory_retired {
+                    "retired"
+                } else {
+                    "active"
+                };
+                Ok(format!(
+                    "{} checkpoint memory is now {state_desc} (policy generation {}).",
+                    response.environment_ref, response.generation
+                ))
+            }
             RuntimeEnvCommands::Nodes { after, all, json } => {
                 self.runtime_nodes(after, all, json).await
             }
@@ -392,6 +447,7 @@ fn render_policy(policy: &Policy) -> String {
     table.set_header(vec![
         "ENVIRONMENT",
         "STATE",
+        "MEMORY",
         "DEFAULT",
         "CHANGED",
         "BY",
@@ -399,9 +455,18 @@ fn render_policy(policy: &Policy) -> String {
     ]);
     for environment in &policy.environments {
         let (changed, by, reason) = describe_change(environment.last_change.as_ref());
+        let memory = match (
+            environment.memory_retired,
+            environment.memory_last_change.as_ref(),
+        ) {
+            (true, Some(change)) => format!("retired ({})", change.reason),
+            (true, None) => "retired".to_string(),
+            (false, _) => String::new(),
+        };
         table.add_row(vec![
             environment.environment_ref.clone(),
             environment.state.clone(),
+            memory,
             if environment.is_default { "*" } else { "" }.to_string(),
             changed,
             by,

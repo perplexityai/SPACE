@@ -341,3 +341,11 @@ inlineOperations:
 # `scripts/tests/test_node_drain_activation_parity.py` is what holds them
 # equal.
 nodeCensusResidency: "true"
+
+# Optional static object-store credentials + signing region for
+# `MemoryDrop::from_env` (`SPACE_MEMORY_DROP_ENABLED=true`). Empty defaults
+# render nothing so an install using workload identity resolves credentials
+# from the pod's ambient AWS environment; Kind sets its versitygw Secret in
+# `values-kind.yaml`.
+snapshotRegion: ""
+snapshotCredentialsSecretName: ""

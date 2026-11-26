@@ -172,6 +172,7 @@ pub(super) fn assemble_substrate(
         node_group_placement: NodeGroupPlacementResolver::new(pool, false),
         recovery_join_backoff: RecoveryJoinBackoffPolicy::default(),
         runtime_policy: RuntimePolicyCache::default(),
+        memory_drop: None,
         budgets: SubstrateBudgets {
             reflector_wait: TEST_REFLECTOR_WAIT,
             ..SubstrateBudgets::DEFAULT

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pplx_space_accounts::UserId;
 use pplx_space_content_digest::Digest;
@@ -57,6 +57,20 @@ async fn set_state_committed(
     Ok(generation)
 }
 
+async fn set_memory_committed(
+    pool: &PgPool,
+    environment: EnvironmentReference,
+    memory_retired: bool,
+    reason: &str,
+) -> Result<u64, SetEnvironmentMemoryError> {
+    let mut tx = pool.begin().await?;
+    let generation =
+        set_environment_memory_retired(&mut tx, environment, memory_retired, &change(reason))
+            .await?;
+    tx.commit().await?;
+    Ok(generation)
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn bootstrap_policy_overrides_nothing() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -70,6 +84,7 @@ async fn bootstrap_policy_overrides_nothing() -> TestResult {
             default_environment: None,
             legacy_unbound_allowed: None,
             environments: BTreeMap::new(),
+            memory_retired_environments: BTreeSet::new(),
         }
     );
     Ok(())
@@ -517,12 +532,183 @@ async fn an_unknown_stored_state_fails_closed() -> TestResult {
     );
     tx.rollback().await?;
 
-    // Assigning a known state over it is the repair.
-    set_state_committed(&db.pool, e0, RuntimeEnvironmentState::Deprecated).await?;
+    // Assigning a known state over it is the repair, including `allowed` when
+    // its memory isn't retired.
+    set_state_committed(&db.pool, e0, RuntimeEnvironmentState::Allowed).await?;
     assert_eq!(
         get(&db.pool).await?.environments[&e0],
-        RuntimeEnvironmentState::Deprecated
+        RuntimeEnvironmentState::Allowed
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reads_and_state_writes_work_before_memory_retirement_columns_exist() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    crate::test_support::apply_memory_retirement_schema(&db.pool).await?;
+    crate::test_support::revert_memory_retirement_schema(&db.pool).await?;
+    let (e0, e1) = (environment(0), environment(1));
+
+    set_default_committed(&db.pool, e1).await?;
+    set_state_committed(&db.pool, e0, RuntimeEnvironmentState::Deprecated).await?;
+    let record = get_record(&db.pool).await?;
+    assert!(record.policy.memory_retired_environments.is_empty());
+    assert!(record.environment_memory_changes.is_empty());
+
+    // Promoting back to `allowed` and rotating the default also work before the
+    // memory-retirement columns exist, while `set_environment_memory_retired`
+    // reports `SchemaNotMigrated`.
+    let not_migrated = set_memory_committed(&db.pool, e0, true, "before migration").await;
+    assert!(
+        matches!(
+            not_migrated,
+            Err(SetEnvironmentMemoryError::SchemaNotMigrated)
+        ),
+        "{not_migrated:?}"
+    );
+    set_state_committed(&db.pool, e0, RuntimeEnvironmentState::Allowed).await?;
+    set_default_committed(&db.pool, e0).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn memory_retirement_lifecycle_and_state_transition_guards() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    crate::test_support::apply_memory_retirement_schema(&db.pool).await?;
+    let (e0, e1, e2) = (environment(0), environment(1), environment(2));
+
+    // Retiring memory requires a cluster default first.
+    set_state_committed(&db.pool, e0, RuntimeEnvironmentState::Deprecated).await?;
+    let no_default = set_memory_committed(&db.pool, e0, true, "retire without default").await;
+    assert!(
+        matches!(no_default, Err(SetEnvironmentMemoryError::RetireRequiresDefault(env)) if env == e0),
+        "{no_default:?}"
+    );
+
+    set_default_committed(&db.pool, e1).await?;
+
+    // Missing state and `allowed` state both refuse retire and unretire.
+    for (target, expected_state) in [(e2, None), (e1, Some(RuntimeEnvironmentState::Allowed))] {
+        for retire in [true, false] {
+            let refused = set_memory_committed(&db.pool, target, retire, "wrong state").await;
+            assert!(
+                matches!(
+                    refused,
+                    Err(SetEnvironmentMemoryError::RequiresDeprecated {
+                        environment,
+                        current,
+                        memory_retired,
+                    }) if environment == target && current == expected_state && memory_retired == retire
+                ),
+                "{refused:?}"
+            );
+        }
+    }
+
+    let before_retire = get_record(&db.pool).await?;
+    let state_change_before = before_retire.environment_changes[&e0].clone();
+    assert!(!before_retire.policy.is_memory_retired(e0));
+    assert!(!before_retire.environment_memory_changes.contains_key(&e0));
+
+    // Retiring while `deprecated` records the memory change without moving the
+    // state change timestamp or reason, and increments the generation.
+    let gen_retired = set_memory_committed(&db.pool, e0, true, "campaigns drained").await?;
+    assert_eq!(gen_retired, before_retire.policy.generation + 1);
+    let retired_record = get_record(&db.pool).await?;
+    assert!(retired_record.policy.is_memory_retired(e0));
+    assert!(!retired_record.policy.is_memory_retired(e1));
+    assert_eq!(retired_record.environment_changes[&e0], state_change_before);
+    assert_eq!(
+        retired_record.environment_memory_changes[&e0].reason,
+        "campaigns drained"
+    );
+
+    // While memory-retired, promoting back to `allowed` or making it the
+    // default is refused until its memory is unretired.
+    let allow_refused = set_state_committed(&db.pool, e0, RuntimeEnvironmentState::Allowed).await;
+    assert!(
+        matches!(allow_refused, Err(SetEnvironmentStateError::MemoryRetired(env)) if env == e0),
+        "{allow_refused:?}"
+    );
+    let default_refused = set_default_committed_result(&db.pool, e0).await;
+    assert!(
+        matches!(default_refused, Err(SetDefaultError::MemoryRetired(env)) if env == e0),
+        "{default_refused:?}"
+    );
+
+    // Unretiring while `deprecated` restores promotion eligibility and records
+    // the unretire reason.
+    set_memory_committed(&db.pool, e0, false, "keep checkpoints loadable").await?;
+    let unretired_record = get_record(&db.pool).await?;
+    assert!(!unretired_record.policy.is_memory_retired(e0));
+    assert_eq!(
+        unretired_record.environment_memory_changes[&e0].reason,
+        "keep checkpoints loadable"
+    );
+    set_state_committed(&db.pool, e0, RuntimeEnvironmentState::Allowed).await?;
+    set_state_committed(&db.pool, e0, RuntimeEnvironmentState::Deprecated).await?;
+
+    // Once `blocked`, unretiring is refused ("unretiring is allowed until the block").
+    set_memory_committed(&db.pool, e0, true, "retire again").await?;
+    set_state_committed(&db.pool, e0, RuntimeEnvironmentState::Blocked).await?;
+    let unretire_blocked = set_memory_committed(&db.pool, e0, false, "too late").await;
+    assert!(
+        matches!(unretire_blocked, Err(SetEnvironmentMemoryError::BlockedCannotUnretire(env)) if env == e0),
+        "{unretire_blocked:?}"
+    );
+    let retire_blocked = set_memory_committed(&db.pool, e0, true, "already blocked").await;
+    assert!(
+        matches!(
+            retire_blocked,
+            Err(SetEnvironmentMemoryError::RequiresDeprecated {
+                environment,
+                current: Some(RuntimeEnvironmentState::Blocked),
+                memory_retired: true,
+            }) if environment == e0
+        ),
+        "{retire_blocked:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_serialized_waits_for_in_flight_retirement_and_reads_committed_policy() -> TestResult {
+    let Some(db) = try_pg_test_db_with_max_connections(4).await? else {
+        return Ok(());
+    };
+    crate::test_support::apply_memory_retirement_schema(&db.pool).await?;
+    let (e0, e1) = (environment(0), environment(1));
+    set_default_committed(&db.pool, e1).await?;
+    set_state_committed(&db.pool, e0, RuntimeEnvironmentState::Deprecated).await?;
+
+    let mut tx = db.pool.begin().await?;
+    let retired_generation =
+        set_environment_memory_retired(&mut tx, e0, true, &change("retire e0")).await?;
+
+    // An unlocked snapshot read still sees the pre-commit policy, while
+    // `get_serialized` blocks on `runtime_environment_policy` (`FOR KEY SHARE`
+    // vs the uncommitted `UPDATE`) and reads `memory_retired = true` once
+    // `tx` commits.
+    assert!(!get(&db.pool).await?.is_memory_retired(e0));
+
+    let pool_clone = db.pool.clone();
+    let mut serialized_read = tokio::spawn(async move { get_serialized(&pool_clone).await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(75), &mut serialized_read)
+            .await
+            .is_err(),
+        "get_serialized must block while the policy write holds the singleton row lock"
+    );
+
+    tx.commit().await?;
+    let policy = serialized_read.await??;
+    assert_eq!(policy.generation, retired_generation);
+    assert!(policy.is_memory_retired(e0));
     Ok(())
 }
 

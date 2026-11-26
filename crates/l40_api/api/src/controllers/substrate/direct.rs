@@ -98,6 +98,7 @@
 //! | Per-client live cap | `DirectSubstrate::live_sandboxes_for_client` answers `Unknown(Unsupported)`: Direct keeps no per-client inventory, so the cap admits every activation (reason `unsupported` while attribution is on). Direct also has no point that reserves for a `ReserveAtClaim` charge or checks a `Check` one, so a restore of a suspended sandbox, and a start or restore that reserved nothing at entry, go uncapped either way | the-gigi-pplx | A per-client count of Direct's live executions from its node records, plus reserving for `ReserveAtClaim` at Direct's restore entry and checking `Check` where Direct launches an execution, with `RecoveryCharge`'s live-cap methods built without the `kubernetes` feature |
 //! | Kubernetes-only state loops (drain, orphan, failed-row repair, node sync and others, listed in the cluster controller's `reconcilers.rs` module doc) | Not started on Direct (below) | ac-pplx | Those loops running for both substrates through the adapter |
 //! | Booting a create's required environment | [`SubstrateCapabilities::boots_required_environment`] is false: a Direct create names no environment, so its worker boots the legacy partition's build, so creates, placement and pools keep the release a tag or digest names rather than a twin | the-gigi-pplx | A Direct create that carries the required environment (`CreateRequest.required_environment`), with direct pools preferring the resolved release's partition |
+//! | Runtime-environment memory retirement (`memory_retired` / activation runtime upgrade) | [`SubstrateError::Unsupported`] from `DirectSubstrate::check_environment_memory_retirement`: `DirectSubstrate` does not run `decide_activation_runtime` or restore-time memory drop, so `PUT /runtime-environments/{environment_ref}/memory` (`action: "retire"`) answers 501; `unretire` still clears an existing flag | the-gigi-pplx | Activation runtime-upgrade planning and restore-time memory drop in the core for both substrates |
 //! | Network-slot headroom (`Substrate::network_slot_headroom`) | Reads `Unknown(Unsupported)`, so the activation limiter's slot check (`SPACE_CLUSTER_ACTIVATION_ADMISSION_SLOT_CHECK_ENABLED`) admits every Direct cold create | ac-pplx | Slot capacity of registered nodes, read by an admission check that runs for both substrates |
 //!
 //! # Kubernetes-only reconcilers
@@ -1042,6 +1043,16 @@ impl DirectSubstrate {
 
     pub(super) fn environment_placement(&self) -> EnvironmentPlacementGate {
         self.environment_placement
+    }
+
+    /// Direct's answer to `PUT /runtime-environments/{environment_ref}/memory`
+    /// (`action: "retire"`); see this module doc's `# Gaps` table.
+    pub(super) fn check_environment_memory_retirement(&self) -> Result<(), SubstrateError> {
+        Err(SubstrateError::Unsupported {
+            message:
+                "runtime-environment memory retirement is not implemented on the Direct substrate"
+                    .to_string(),
+        })
     }
 
     /// Place bound work under `gate`.

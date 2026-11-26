@@ -1084,6 +1084,16 @@ impl SandboxController {
         self.substrate.boots_template_twins()
     }
 
+    /// [`super::substrate::Substrate::check_environment_memory_retirement`].
+    pub fn check_environment_memory_retirement(&self) -> Result<(), SubstrateError> {
+        self.substrate.check_environment_memory_retirement()
+    }
+
+    /// Clear any cached runtime environment policy after a local admin write.
+    pub async fn invalidate_runtime_policy_cache(&self) {
+        self.substrate.invalidate_runtime_policy_cache().await;
+    }
+
     /// Whether the substrate accepts a create pinned to a node pool (see
     /// [`SubstrateAdapter::check_node_pool_placement`]).
     pub fn check_node_pool_placement(

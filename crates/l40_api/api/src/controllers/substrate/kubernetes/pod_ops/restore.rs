@@ -224,6 +224,9 @@ impl KubernetesSubstrate {
         sandbox: &Sandbox,
         snapshot: RestoreSnapshotChoice,
     ) -> Result<SuspendRestorePlan, SubstrateError> {
+        if self.store.is_memory_dropped_disk_pin(sandbox.id).await? {
+            return Err(super::store::memory_dropped_restore_pending());
+        }
         let existing = self
             .existing_suspend_restore_annotations(sandbox.id)
             .await?;

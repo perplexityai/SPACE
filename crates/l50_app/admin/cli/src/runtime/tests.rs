@@ -203,6 +203,117 @@ async fn default_and_state_send_the_reason_and_report_the_generation() {
 }
 
 #[tokio::test]
+async fn memory_retire_and_unretire_send_action_and_list_renders_retired_memory() {
+    let (sender, mut requests) = mpsc::channel(4);
+    let app = Router::new()
+        .route(
+            "/admin/api/v1/runtime-environments",
+            get(|| async {
+                Json(json!({
+                    "generation": 6,
+                    "default_environment_ref": E1,
+                    "legacy_unbound_allowed": false,
+                    "last_change": {
+                        "updated_at": "2026-10-27T00:00:00Z",
+                        "updated_by_user_id": null,
+                        "reason": "retire e0 memory",
+                    },
+                    "environments": [
+                        {
+                            "environment_ref": E0,
+                            "state": "deprecated",
+                            "executes": true,
+                            "is_default": false,
+                            "memory_retired": true,
+                            "memory_last_change": {
+                                "updated_at": "2026-10-27T00:00:00Z",
+                                "updated_by_user_id": null,
+                                "reason": "retire e0 memory",
+                            },
+                            "last_change": {
+                                "updated_at": "2026-10-25T09:00:00Z",
+                                "updated_by_user_id": null,
+                                "reason": "superseded",
+                            },
+                        }
+                    ]
+                }))
+            }),
+        )
+        .route(
+            "/admin/api/v1/runtime-environments/{environment}/memory",
+            put(
+                |State(sender): State<mpsc::Sender<(String, Value, Option<String>)>>,
+                 axum::extract::Path(environment): axum::extract::Path<String>,
+                 headers: HeaderMap,
+                 Json(body): Json<Value>| async move {
+                    let retired = body["action"] == "retire";
+                    sender
+                        .send((environment.clone(), body, if_match(&headers)))
+                        .await
+                        .unwrap();
+                    Json(json!({
+                        "generation": if retired { 6 } else { 7 },
+                        "environment_ref": environment,
+                        "memory_retired": retired,
+                    }))
+                },
+            ),
+        )
+        .with_state(sender);
+    with_server(app, |client| async move {
+        let rendered = client
+            .runtime_command(env(&[
+                "memory",
+                E0,
+                "retire",
+                "--reason",
+                "retire e0 memory",
+                "--if-generation",
+                "5",
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(
+            rendered,
+            format!("{E0} checkpoint memory is now retired (policy generation 6).")
+        );
+        assert_eq!(
+            requests.try_recv().unwrap(),
+            (
+                E0.into(),
+                json!({"action": "retire", "reason": "retire e0 memory", "strand": false}),
+                Some("5".into())
+            )
+        );
+
+        let list = client.runtime_command(env(&["list"])).await.unwrap();
+        assert!(
+            list.contains("MEMORY") && list.contains("retired (retire e0 memory)"),
+            "{list}"
+        );
+
+        let unretired = client
+            .runtime_command(env(&["memory", E0, "unretire", "--reason", "roll back"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            unretired,
+            format!("{E0} checkpoint memory is now active (policy generation 7).")
+        );
+        assert_eq!(
+            requests.try_recv().unwrap(),
+            (
+                E0.into(),
+                json!({"action": "unretire", "reason": "roll back", "strand": false}),
+                None
+            )
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_refusal_comes_back_with_the_servers_status_and_body() {
     let app = Router::new().route(
         "/admin/api/v1/runtime-environments/{environment}/state",
@@ -419,6 +530,13 @@ async fn strand_without_a_block_is_refused_before_sending() {
     let client = AdminClient::new("http://127.0.0.1:1", "synthetic-token").unwrap();
     let error = client
         .runtime_command(env(&["state", E1, "allowed", "--reason", "r", "--strand"]))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, CliError::Argument(_)), "{error:?}");
+    let error = client
+        .runtime_command(env(&[
+            "memory", E1, "unretire", "--reason", "r", "--strand",
+        ]))
         .await
         .unwrap_err();
     assert!(matches!(error, CliError::Argument(_)), "{error:?}");

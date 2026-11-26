@@ -14,7 +14,7 @@ use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_store::memory_drop::{
     self, CandidateRead, MemoryDropCandidate, MemoryDropRefusal,
 };
-use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
+use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId, SnapshotKind, SnapshotState};
 use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use serde_json::{Value, json};
@@ -241,7 +241,7 @@ fn an_artifact_the_projection_cant_vouch_for_is_refused() {
 /// metadata write lands, standing in for whatever happens to the row while
 /// the copy runs.
 #[derive(Default)]
-struct MapObjects {
+pub(crate) struct MapObjects {
     objects: Mutex<HashMap<String, Vec<u8>>>,
     /// How many object copies the drops made.
     copies: AtomicUsize,
@@ -253,7 +253,7 @@ impl MapObjects {
         format!("{}/{}", prefix.bucket, object_key(prefix, file))
     }
 
-    fn put(&self, prefix: &StorageUri, file: SnapshotFile, body: Vec<u8>) {
+    pub(crate) fn put(&self, prefix: &StorageUri, file: SnapshotFile, body: Vec<u8>) {
         self.objects
             .lock()
             .expect("objects")
@@ -1375,13 +1375,16 @@ async fn a_wake_of_a_dropped_sandbox_is_a_retryable_503_without_a_pod() -> TestR
     Ok(())
 }
 
-/// A wake of a row a memory drop holds sealed answers a retryable 503 before
-/// any pod exists, and leaves the seal for the drop to commit.
+/// A wake of a row a memory drop holds sealed waits up to the caller's budget,
+/// then answers a retryable 503 (`RestoreInFlight`) before any pod exists and
+/// leaves the seal for the drop to commit.
 #[cfg(feature = "kubernetes")]
 #[tokio::test(flavor = "current_thread")]
 async fn a_wake_of_a_sealed_sandbox_is_a_retryable_503_without_a_pod() -> TestResult {
+    use crate::controllers::ControllerRetryAfterCause;
     use crate::controllers::sandbox::SandboxController;
     use crate::controllers::sandbox::lifecycle::SandboxAction;
+    use crate::controllers::substrate::SubstrateAdapter;
     use crate::controllers::substrate::kubernetes::tests::{
         mock_kubernetes_client, substrate_with_store_and_client,
     };
@@ -1404,6 +1407,121 @@ async fn a_wake_of_a_sealed_sandbox_is_a_retryable_503_without_a_pod() -> TestRe
     .expect("eligible");
     tx.commit().await?;
     let pod_creates = Arc::new(Mutex::new(Vec::new()));
+    let substrate =
+        crate::controllers::substrate::Substrate::from_kubernetes(substrate_with_store_and_client(
+            db.pool.clone(),
+            mock_kubernetes_client(pod_creates.clone()),
+        ));
+    let controller = SandboxController::new(substrate.clone());
+
+    let sandbox = crate::controllers::sandbox::fetch_sandbox(&db.pool, fixture.sandbox_id)
+        .await?
+        .expect("sandbox row exists");
+    let restore_error = controller
+        .action(
+            &db.pool,
+            fixture.sandbox_id,
+            Some(&sandbox),
+            SandboxApiMetricIdentity::native("restore"),
+            SandboxAction::Restore,
+            Some(crate::models::SandboxActivationRequest {
+                blocking: Some(true),
+                ready_timeout_secs: Some(1),
+            }),
+            crate::controllers::substrate::ActivationClient::Native,
+        )
+        .await
+        .expect_err("a sealed row can't restore while sealed");
+    assert_eq!(
+        restore_error.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "Restore: {restore_error:?}"
+    );
+    assert_eq!(
+        restore_error.retry_after_cause(),
+        Some(ControllerRetryAfterCause::RestoreInFlight),
+        "Restore: {restore_error:?}"
+    );
+    assert_eq!(fixture.lifecycle(&db.pool).await?.0, "suspended");
+
+    // `SandboxAction::Wake` uses `DEFAULT_BLOCKING_WAIT_TIMEOUT` (60s); test
+    // `wake_execution` directly with a bounded readiness budget so the test
+    // exercises the wake path without waiting 60 real wall-clock seconds.
+    let wake_error = crate::controllers::ControllerError::from(
+        substrate
+            .wake_execution(
+                SandboxApiMetricIdentity::native("wake"),
+                &sandbox,
+                std::time::Duration::from_millis(200),
+                None,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
+            )
+            .await
+            .expect_err("a sealed row can't wake while sealed"),
+    );
+    assert_eq!(
+        wake_error.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "Wake: {wake_error:?}"
+    );
+    assert_eq!(
+        wake_error.retry_after_cause(),
+        Some(ControllerRetryAfterCause::RestoreInFlight),
+        "Wake: {wake_error:?}"
+    );
+    assert_eq!(fixture.lifecycle(&db.pool).await?.0, "suspended");
+    assert!(pod_creates.lock().expect("pod creates").is_empty());
+    assert!(memory_drop::sealed(&db.pool, fixture.sandbox_id).await?);
+    Ok(())
+}
+
+/// When a campaign holds a seal on a suspended row and commits within the
+/// wake's budget, the wake waits out the seal through `RestoreInFlight` and
+/// re-reads the committed disk pin on the next lap instead of failing as soon
+/// as it sees the seal.
+#[cfg(feature = "kubernetes")]
+#[tokio::test(flavor = "current_thread")]
+async fn a_wake_waits_for_a_campaign_seal_to_commit_within_budget() -> TestResult {
+    use crate::controllers::ControllerRetryAfterCause;
+    use crate::controllers::sandbox::SandboxController;
+    use crate::controllers::sandbox::lifecycle::SandboxAction;
+    use crate::controllers::substrate::kubernetes::tests::{
+        mock_kubernetes_client, substrate_with_store_and_client,
+    };
+    use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
+
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let objects = Arc::new(MapObjects::default());
+    let fixture = Fixture::insert(&db.pool, &objects).await?;
+    let token = Uuid::now_v7();
+    let mut tx = db.pool.begin().await?;
+    let candidate = memory_drop::seal(
+        &mut tx,
+        fixture.sandbox_id,
+        token,
+        std::time::Duration::from_secs(60),
+    )
+    .await?
+    .expect("eligible");
+    tx.commit().await?;
+
+    let pool_for_commit = db.pool.clone();
+    let sandbox_id = fixture.sandbox_id;
+    let commit_task = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        memory_drop::commit(
+            &pool_for_commit,
+            sandbox_id,
+            token,
+            &candidate,
+            LocalArtifactId::from_uuid(Uuid::now_v7()),
+        )
+        .await
+    });
+
+    let pod_creates = Arc::new(Mutex::new(Vec::new()));
     let substrate = substrate_with_store_and_client(
         db.pool.clone(),
         mock_kubernetes_client(pod_creates.clone()),
@@ -1411,31 +1529,214 @@ async fn a_wake_of_a_sealed_sandbox_is_a_retryable_503_without_a_pod() -> TestRe
     let controller = SandboxController::new(
         crate::controllers::substrate::Substrate::from_kubernetes(substrate),
     );
+    let sandbox = crate::controllers::sandbox::fetch_sandbox(&db.pool, fixture.sandbox_id)
+        .await?
+        .expect("sandbox row exists");
+    let error = controller
+        .action(
+            &db.pool,
+            fixture.sandbox_id,
+            Some(&sandbox),
+            SandboxApiMetricIdentity::native("restore"),
+            SandboxAction::Restore,
+            Some(crate::models::SandboxActivationRequest {
+                blocking: Some(true),
+                ready_timeout_secs: Some(5),
+            }),
+            crate::controllers::substrate::ActivationClient::Native,
+        )
+        .await
+        .expect_err("disk-pinned row awaits disk cold-boot wiring");
 
-    for action in [SandboxAction::Restore, SandboxAction::Wake] {
-        let sandbox = crate::controllers::sandbox::fetch_sandbox(&db.pool, fixture.sandbox_id)
-            .await?
-            .expect("sandbox row exists");
-        let error = controller
-            .action(
-                &db.pool,
-                fixture.sandbox_id,
-                Some(&sandbox),
-                SandboxApiMetricIdentity::native(action.as_str()),
-                action,
-                None,
-                crate::controllers::substrate::ActivationClient::Native,
-            )
-            .await
-            .expect_err("a sealed row can't restore yet");
-        assert_eq!(
-            error.status(),
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "{action:?}: {error:?}"
-        );
-        assert_eq!(fixture.lifecycle(&db.pool).await?.0, "suspended");
-    }
+    assert!(commit_task.await??);
+    assert_eq!(error.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_ne!(
+        error.retry_after_cause(),
+        Some(ControllerRetryAfterCause::RestoreInFlight),
+        "wake must wait past the seal and observe the committed disk pin: {error:?}"
+    );
     assert!(pod_creates.lock().expect("pod creates").is_empty());
-    assert!(memory_drop::sealed(&db.pool, fixture.sandbox_id).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn drop_for_restore_rewrites_disk_and_parks_suspended_under_restore_lease() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let objects = Arc::new(MapObjects::default());
+    let fixture = Fixture::insert(&db.pool, &objects).await?;
+    let token = Uuid::now_v7();
+    pplx_space_sandbox_store::restore_lease::claim_user_restore(
+        &db.pool,
+        fixture.sandbox_id,
+        300,
+        token,
+        60,
+        None,
+    )
+    .await?
+    .expect("claim user restore");
+
+    let drop = MemoryDrop::new(objects.clone());
+    let outcome = drop
+        .drop_for_restore(&db.pool, fixture.sandbox_id, token)
+        .await?;
+    let MemoryDropOutcome::Dropped(dropped) = outcome else {
+        panic!("expected Dropped, got {outcome:?}");
+    };
+    assert_eq!(dropped.retained_snapshot_id, fixture.snapshot_id);
+    assert_eq!(dropped.retained_artifact_id, fixture.artifact_id);
+
+    let (lifecycle, _artifact_id, kind) = fixture.lifecycle(&db.pool).await?;
+    assert_eq!((lifecycle.as_str(), kind.as_str()), ("suspended", "disk"));
+    assert!(memory_drop::dropped(&db.pool, fixture.sandbox_id).await?);
+    assert!(!memory_drop::sealed(&db.pool, fixture.sandbox_id).await?);
+
+    let disk_snapshot = pplx_space_snapshot_store::get(&db.pool, dropped.disk_snapshot_id)
+        .await?
+        .expect("disk snapshot registered");
+    assert_eq!(disk_snapshot.kind(), SnapshotKind::Disk);
+    assert_eq!(disk_snapshot.state(), SnapshotState::Ready);
+    assert_eq!(
+        disk_snapshot
+            .execution_metadata()
+            .and_then(|meta| meta.host_cpu()),
+        None
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn drop_for_restore_reuses_ready_earlier_disk_and_waits_for_deleting_or_orphaned_prefix()
+-> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let objects = Arc::new(MapObjects::default());
+    let fixture = Fixture::insert(&db.pool, &objects).await?;
+    let drop = MemoryDrop::new(objects.clone());
+
+    let MemoryDropOutcome::Dropped(first) = drop.drop_memory(&db.pool, fixture.sandbox_id).await?
+    else {
+        panic!("the first drop commits");
+    };
+
+    // 1. Re-pointing back to the retained full artifact and running
+    // `drop_for_restore` reuses the registered `Ready` disk without copying.
+    repoint_to_full(&db.pool, &fixture).await?;
+    let copies = objects.copies.load(Ordering::SeqCst);
+    let token = Uuid::now_v7();
+    pplx_space_sandbox_store::restore_lease::claim_user_restore(
+        &db.pool,
+        fixture.sandbox_id,
+        300,
+        token,
+        60,
+        None,
+    )
+    .await?
+    .expect("claim user restore");
+
+    let MemoryDropOutcome::Dropped(second) = drop
+        .drop_for_restore(&db.pool, fixture.sandbox_id, token)
+        .await?
+    else {
+        panic!("restore re-drop commits");
+    };
+    assert_eq!(second, first);
+    assert_eq!(objects.copies.load(Ordering::SeqCst), copies);
+    assert_eq!(
+        pin_of(&db.pool, &fixture).await?,
+        (
+            "suspended".to_string(),
+            first.disk_artifact_id.as_uuid(),
+            "disk".to_string()
+        )
+    );
+
+    // 2. While retention is deleting the earlier disk (`state = 'deleting'`),
+    // `drop_for_restore` returns 503 without copying into the deleting prefix.
+    repoint_to_full(&db.pool, &fixture).await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots SET state = 'deleting' WHERE id = $1"
+    ))
+    .bind(first.disk_snapshot_id.as_uuid())
+    .execute(&db.pool)
+    .await?;
+    let token_deleting = Uuid::now_v7();
+    pplx_space_sandbox_store::restore_lease::claim_user_restore(
+        &db.pool,
+        fixture.sandbox_id,
+        300,
+        token_deleting,
+        60,
+        None,
+    )
+    .await?
+    .expect("claim user restore while disk deleting");
+    let err_deleting = drop
+        .drop_for_restore(&db.pool, fixture.sandbox_id, token_deleting)
+        .await
+        .expect_err("deleting disk must refuse retryably without copying");
+    assert_eq!(
+        err_deleting.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(objects.copies.load(Ordering::SeqCst), copies);
+    assert!(
+        pplx_space_sandbox_store::memory_drop::restore::park_unplaced_restore_as_suspended(
+            &db.pool,
+            fixture.sandbox_id,
+            token_deleting,
+        )
+        .await?
+    );
+
+    // 3. Once retention finishes deleting the disk row, an unswept orphan row
+    // for the same prefix also refuses retryably without copying.
+    sqlx::query(sql!(
+        "DELETE FROM snapshot_storage_locations WHERE snapshot_id = $1"
+    ))
+    .bind(first.disk_snapshot_id.as_uuid())
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!("DELETE FROM snapshots WHERE id = $1"))
+        .bind(first.disk_snapshot_id.as_uuid())
+        .execute(&db.pool)
+        .await?;
+    let candidate = memory_drop::candidate(&db.pool, fixture.sandbox_id, CandidateRead::Plain)
+        .await?
+        .expect("eligible");
+    let plan = CopyPlan::new(fixture.sandbox_id, &candidate).expect("plan");
+    assert!(
+        pplx_space_snapshot_store::orphan::orphan_unowned_location(
+            &db.pool,
+            plan.disk_snapshot_id,
+            &plan.dest,
+            candidate.org_id,
+        )
+        .await?
+    );
+    let token_orphan = Uuid::now_v7();
+    pplx_space_sandbox_store::restore_lease::claim_user_restore(
+        &db.pool,
+        fixture.sandbox_id,
+        300,
+        token_orphan,
+        60,
+        None,
+    )
+    .await?
+    .expect("claim user restore with pending orphan");
+    let err_orphan = drop
+        .drop_for_restore(&db.pool, fixture.sandbox_id, token_orphan)
+        .await
+        .expect_err("unswept orphan prefix must refuse retryably without copying");
+    assert_eq!(
+        err_orphan.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(objects.copies.load(Ordering::SeqCst), copies);
     Ok(())
 }

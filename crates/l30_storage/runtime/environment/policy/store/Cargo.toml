@@ -13,6 +13,10 @@ postgres = ["runtime_environment_policy", "runtime_environment_states"]
 [lints]
 workspace = true
 
+[features]
+# Exposes `test_support` to other crates' test suites as a dev-dependency.
+test-support = []
+
 [dependencies]
 sqlx = { workspace = true, features = ["derive", "postgres", "runtime-tokio", "time", "tls-rustls-aws-lc-rs", "uuid"] }
 thiserror = { workspace = true }

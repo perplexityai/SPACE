@@ -174,19 +174,37 @@ impl K8sStore {
         &self,
     ) -> Result<pplx_space_runtime_environment_policy_store::RuntimeEnvironmentPolicy, SubstrateError>
     {
-        use pplx_space_runtime_environment_policy_store::GetPolicyError;
-        pplx_space_runtime_environment_policy_store::get(&self.pool)
-            .await
-            .map_err(|error| match error {
-                GetPolicyError::Database(error) => {
-                    crate::controllers::substrate::substrate_db_error(
-                        "failed to read the runtime environment policy",
-                        &error,
-                    )
-                }
-                error => SubstrateError::Failed {
-                    message: format!("failed to read the runtime environment policy: {error}"),
-                },
-            })
+        map_policy_error(pplx_space_runtime_environment_policy_store::get(&self.pool).await)
     }
+
+    /// The cluster's runtime environment policy, serialized behind any
+    /// in-flight policy write (`FOR KEY SHARE` on `runtime_environment_policy`)
+    /// so a restore that just committed its `restoring` lease sees any
+    /// concurrent `retire` that scanned coverage before that lease committed.
+    pub(in crate::controllers::substrate::kubernetes) async fn runtime_environment_policy_serialized(
+        &self,
+    ) -> Result<pplx_space_runtime_environment_policy_store::RuntimeEnvironmentPolicy, SubstrateError>
+    {
+        map_policy_error(
+            pplx_space_runtime_environment_policy_store::get_serialized(&self.pool).await,
+        )
+    }
+}
+
+fn map_policy_error(
+    result: Result<
+        pplx_space_runtime_environment_policy_store::RuntimeEnvironmentPolicy,
+        pplx_space_runtime_environment_policy_store::GetPolicyError,
+    >,
+) -> Result<pplx_space_runtime_environment_policy_store::RuntimeEnvironmentPolicy, SubstrateError> {
+    use pplx_space_runtime_environment_policy_store::GetPolicyError;
+    result.map_err(|error| match error {
+        GetPolicyError::Database(error) => crate::controllers::substrate::substrate_db_error(
+            "failed to read the runtime environment policy",
+            &error,
+        ),
+        error => SubstrateError::Failed {
+            message: format!("failed to read the runtime environment policy: {error}"),
+        },
+    })
 }

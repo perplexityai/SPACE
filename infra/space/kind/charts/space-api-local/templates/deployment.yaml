@@ -284,6 +284,24 @@ spec:
             {{- end }}
             - name: SPACE_INTERNAL_SECRET_NAME
               value: {{ .Values.internal.secretName | quote }}
+            {{- if .Values.snapshotRegion }}
+            - name: AWS_REGION
+              value: {{ .Values.snapshotRegion | quote }}
+            - name: AWS_DEFAULT_REGION
+              value: {{ .Values.snapshotRegion | quote }}
+            {{- end }}
+            {{- if .Values.snapshotCredentialsSecretName }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.snapshotCredentialsSecretName }}
+                  key: SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.snapshotCredentialsSecretName }}
+                  key: SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY
+            {{- end }}
             {{- if $shared }}
             # The ingress activation listener's Cluster bearer surface
             # (ingress_activation::server; docs/internal-rpc-tls.md, "Ingress

@@ -60,11 +60,20 @@ fn policy(
     default: Option<EnvironmentReference>,
     states: &[(EnvironmentReference, RuntimeEnvironmentState)],
 ) -> RuntimeEnvironmentPolicy {
+    policy_with_retired(default, states, &[])
+}
+
+fn policy_with_retired(
+    default: Option<EnvironmentReference>,
+    states: &[(EnvironmentReference, RuntimeEnvironmentState)],
+    memory_retired: &[EnvironmentReference],
+) -> RuntimeEnvironmentPolicy {
     RuntimeEnvironmentPolicy {
         generation: 7,
         default_environment: default,
         legacy_unbound_allowed: None,
         environments: states.iter().copied().collect::<BTreeMap<_, _>>(),
+        memory_retired_environments: memory_retired.iter().copied().collect::<BTreeSet<_>>(),
     }
 }
 
@@ -353,7 +362,58 @@ fn discarding_memory_needs_an_operator_block_naming_the_environment() {
 }
 
 #[test]
-fn only_a_suspended_sandbox_moved_off_a_blocked_environment_loses_memory() {
+fn retiring_a_deprecated_environments_memory_drops_memory_along_upgrade_edges_even_with_memory_edge()
+ {
+    use RuntimeEnvironmentState::{Allowed, Deprecated};
+    let policy = policy_with_retired(Some(e1()), &[(e0(), Deprecated), (e1(), Allowed)], &[e0()]);
+    let start_move = EnvironmentMove {
+        from: e0(),
+        to: e1(),
+        cause: UpgradeCause::Deprecated,
+    };
+    let restore_move = EnvironmentMove {
+        from: e0(),
+        to: e1(),
+        cause: UpgradeCause::MemoryRetired,
+    };
+
+    // Even when `memory_edges` also includes the default, `memory_retired`
+    // must drop checkpoint memory rather than returning `RestoreOnDefault`
+    // (`NoWakeUpgrade`), because `Deprecated` stays in `executing()` on nodes
+    // and would boot the retired memory on `E0` itself.
+    for edges in [
+        with_edges(catalog().remove(0), &[e1()], &[e1()]),
+        with_edges(catalog().remove(0), &[e1()], &[]),
+    ] {
+        assert_eq!(
+            plans(&policy, e0(), Some(&edges)),
+            (
+                RuntimePlan::ColdBootUpgrade(start_move),
+                RuntimePlan::DropMemoryAndColdBoot(restore_move),
+            )
+        );
+    }
+
+    // A hypothetical memory-only edge without an `upgrade_edge`, or edges
+    // pointing elsewhere, cannot cold-boot onto `E1` and therefore strand the
+    // restore while stopped starts on `Deprecated` still execute on `E0`.
+    let memory_only = with_edges(catalog().remove(0), &[], &[e1()]);
+    let elsewhere = with_edges(catalog().remove(0), &[e2()], &[e2()]);
+    for from_catalog in [
+        Some(&memory_only),
+        Some(&elsewhere),
+        Some(&catalog()[0]),
+        None,
+    ] {
+        assert_eq!(
+            plans(&policy, e0(), from_catalog),
+            (RuntimePlan::AsRecorded, RuntimePlan::Stranded(restore_move),)
+        );
+    }
+}
+
+#[test]
+fn only_a_suspended_sandbox_moved_off_a_blocked_or_memory_retired_environment_loses_memory() {
     let to = |cause| EnvironmentMove {
         from: e0(),
         to: e1(),
@@ -361,9 +421,15 @@ fn only_a_suspended_sandbox_moved_off_a_blocked_environment_loses_memory() {
     };
     for (cause, activation, memory_loss) in [
         (UpgradeCause::Blocked, UpgradeActivation::Restore, true),
+        (
+            UpgradeCause::MemoryRetired,
+            UpgradeActivation::Restore,
+            true,
+        ),
         // Never decided, but never consent either: no operator wrote it.
         (UpgradeCause::Unlisted, UpgradeActivation::Restore, false),
         (UpgradeCause::Blocked, UpgradeActivation::Start, false),
+        (UpgradeCause::MemoryRetired, UpgradeActivation::Start, false),
         (UpgradeCause::Unlisted, UpgradeActivation::Start, false),
         (UpgradeCause::Deprecated, UpgradeActivation::Start, false),
         // Never decided, but never consent either.
@@ -495,4 +561,34 @@ async fn the_policy_is_reused_until_it_ages_and_a_failed_read_is_not_cached() {
         .await
         .unwrap_err();
     assert_eq!(cache.get(|| read(4)).await.unwrap().generation, 4);
+
+    // Refresh replaces a live entry immediately; a failed refresh preserves it;
+    // invalidate forces the next `get` to read again.
+    assert_eq!(cache.refresh(|| read(5)).await.unwrap().generation, 5);
+    assert_eq!(cache.get(|| read(99)).await.unwrap().generation, 5);
+    cache
+        .refresh(|| async { Err::<RuntimeEnvironmentPolicy, _>("down") })
+        .await
+        .unwrap_err();
+    assert_eq!(cache.get(|| read(99)).await.unwrap().generation, 5);
+    cache.invalidate().await;
+    assert_eq!(cache.get(|| read(6)).await.unwrap().generation, 6);
+}
+
+#[test]
+fn a_memory_retired_stranded_refusal_names_unretiring_as_a_remedy() {
+    let sandbox = SandboxId::new();
+    let error = stranded_error(
+        sandbox,
+        EnvironmentMove {
+            from: e0(),
+            to: e1(),
+            cause: UpgradeCause::MemoryRetired,
+        },
+    );
+    let super::super::SubstrateError::FailedPrecondition { message } = &error else {
+        panic!("{error:?}");
+    };
+    assert!(message.contains("memory retired"), "{message}");
+    assert!(message.contains("unretire"), "{message}");
 }
