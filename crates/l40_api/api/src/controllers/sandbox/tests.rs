@@ -1234,7 +1234,7 @@ mod template_release_resolution_postgres_tests {
             async move {
                 let mut tx = pool.begin().await?;
                 set_default(
-                    &mut tx,
+                    &mut *tx,
                     environment,
                     &PolicyChange {
                         actor: None,

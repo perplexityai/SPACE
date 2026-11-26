@@ -3,6 +3,7 @@
 
 use std::sync::LazyLock;
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 
 /// How many of the substrate's workers [`workers_not_reading_twins`] counted,
@@ -47,9 +48,9 @@ impl TwinReaders {
 /// node with no `nodes` row yet isn't seen, and a deleted one's row isn't
 /// counted. Takes no lock.
 pub async fn workers_not_reading_twins(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     managed_by: &str,
-) -> Result<TwinReaders, sqlx::Error> {
+) -> Result<TwinReaders, DbError> {
     /// Built once: the node status predicates are the only interpolation.
     static COUNT: LazyLock<String> = LazyLock::new(|| {
         let holding = format!(
@@ -74,7 +75,7 @@ pub async fn workers_not_reading_twins(
     let (workers, holding, sample) =
         sqlx::query_as::<_, (i64, i64, Vec<uuid::Uuid>)>(sqlx::AssertSqlSafe(COUNT.as_str()))
             .bind(managed_by)
-            .fetch_one(executor)
+            .fetch_one(executor.into_sqlx())
             .await?;
     Ok(TwinReaders {
         workers: u64::try_from(workers).unwrap_or_default(),

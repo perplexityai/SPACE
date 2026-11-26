@@ -9,6 +9,7 @@
 //! [`pplx_space_rollout_queue::pause_if_over_budget`] and
 //! [`pplx_space_rollout_queue::complete_if_drained`] on these tables.
 
+use pplx_space_postgres_pool::DbError;
 use pplx_space_rollout_queue::{Drain, FailedItems, Leasing, PhaseStore};
 use pplx_space_sql_locator::sql;
 use sqlx::{Acquire, PgConnection, Postgres};
@@ -27,7 +28,7 @@ use crate::{CampaignId, CampaignPhase, ItemPhase, end_transaction};
 pub async fn pause_if_over_budget(
     conn: impl Acquire<'_, Database = Postgres>,
     campaign_id: CampaignId,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let mut tx = conn.begin().await?;
     let mut reconciling = Reconciling {
         tx: &mut tx,
@@ -67,7 +68,7 @@ pub async fn pause_if_over_budget(
 pub async fn complete_if_drained(
     conn: impl Acquire<'_, Database = Postgres>,
     campaign_id: CampaignId,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let mut tx = conn.begin().await?;
     let mut reconciling = Reconciling {
         tx: &mut tx,
@@ -81,7 +82,7 @@ pub async fn complete_if_drained(
 pub(crate) async fn count_failed(
     tx: &mut PgConnection,
     campaign_id: CampaignId,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let failed = sqlx::query_scalar::<_, i64>(sql!(
         "SELECT count(*)
          FROM runtime_upgrade_items
@@ -103,15 +104,15 @@ struct Reconciling<'c> {
 }
 
 impl FailedItems for Reconciling<'_> {
-    type Error = sqlx::Error;
+    type Error = DbError;
 
-    async fn failed(&mut self) -> Result<u64, sqlx::Error> {
+    async fn failed(&mut self) -> Result<u64, DbError> {
         count_failed(self.tx, self.campaign_id).await
     }
 }
 
 impl PhaseStore for Reconciling<'_> {
-    async fn lock_leasing(&mut self) -> Result<Option<Leasing>, sqlx::Error> {
+    async fn lock_leasing(&mut self) -> Result<Option<Leasing>, DbError> {
         let leasing: Vec<&str> = CampaignPhase::ALL
             .iter()
             .filter(|phase| phase.leases())
@@ -136,7 +137,7 @@ impl PhaseStore for Reconciling<'_> {
         }))
     }
 
-    async fn drain(&mut self) -> Result<Drain, sqlx::Error> {
+    async fn drain(&mut self) -> Result<Drain, DbError> {
         let open: Vec<&str> = [ItemPhase::Pending, ItemPhase::InFlight]
             .iter()
             .map(|phase| phase.as_str())
@@ -173,7 +174,7 @@ impl PhaseStore for Reconciling<'_> {
         })
     }
 
-    async fn write_paused(&mut self) -> Result<(), sqlx::Error> {
+    async fn write_paused(&mut self) -> Result<(), DbError> {
         sqlx::query(sql!(
             "UPDATE runtime_upgrade_campaigns
              SET phase = $2,
@@ -188,7 +189,7 @@ impl PhaseStore for Reconciling<'_> {
     }
 
     /// A drained campaign needs no further evidence to complete.
-    async fn write_completed(&mut self) -> Result<bool, sqlx::Error> {
+    async fn write_completed(&mut self) -> Result<bool, DbError> {
         sqlx::query(sql!(
             "UPDATE runtime_upgrade_campaigns
              SET phase = $2,

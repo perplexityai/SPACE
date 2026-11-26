@@ -549,7 +549,7 @@ impl TemplateDriver {
         // commits for a target that isn't the default at commit time. Taken
         // first, before the template row: nothing that holds a template row
         // waits on the policy row.
-        let default = pplx_space_runtime_environment_policy_store::share_lock_default(&mut tx)
+        let default = pplx_space_runtime_environment_policy_store::share_lock_default(&mut *tx)
             .await
             .map_err(|error| MoveError::database("reading the cluster default", error))?;
         if default != Some(campaign.to) {

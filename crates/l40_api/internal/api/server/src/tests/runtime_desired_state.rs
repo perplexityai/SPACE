@@ -124,22 +124,22 @@ async fn insert_unreadable_catalog(pool: &sqlx::PgPool) -> TestResult {
 /// Default e0, deprecated e1, blocked e2, legacy off.
 async fn write_policy(pool: &sqlx::PgPool) -> TestResult {
     let mut tx = pool.begin().await?;
-    policy_store::set_default(&mut tx, environment(0), &change()).await?;
+    policy_store::set_default(&mut *tx, environment(0), &change()).await?;
     policy_store::set_environment_state(
-        &mut tx,
+        &mut *tx,
         environment(1),
         RuntimeEnvironmentState::Deprecated,
         &change(),
     )
     .await?;
     policy_store::set_environment_state(
-        &mut tx,
+        &mut *tx,
         environment(2),
         RuntimeEnvironmentState::Blocked,
         &change(),
     )
     .await?;
-    policy_store::set_legacy_unbound_allowed(&mut tx, false, &change()).await?;
+    policy_store::set_legacy_unbound_allowed(&mut *tx, false, &change()).await?;
     tx.commit().await?;
     Ok(())
 }

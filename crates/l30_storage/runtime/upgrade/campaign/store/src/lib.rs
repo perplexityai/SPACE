@@ -84,6 +84,7 @@ use std::str::FromStr;
 use pplx_space_accounts::UserId;
 use pplx_space_content_digest::DigestParseError;
 use pplx_space_execution_spec::EnvironmentReference;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_rollout_queue::HeaderPhase;
 use pplx_space_sql_locator::sql;
 use time::OffsetDateTime;
@@ -119,13 +120,13 @@ pub mod test_support;
 /// otherwise. A read-only `Ok` commits too, which releases its row locks just
 /// as a rollback would. A failed rollback is logged and left to the
 /// connection's own cleanup; the verb's error is the one the caller needs.
-pub(crate) async fn end_transaction<T, E: From<sqlx::Error>>(
+pub(crate) async fn end_transaction<T, E: From<DbError>>(
     tx: sqlx::Transaction<'_, sqlx::Postgres>,
     result: Result<T, E>,
 ) -> Result<T, E> {
     match result {
         Ok(value) => {
-            tx.commit().await?;
+            tx.commit().await.map_err(DbError::from)?;
             Ok(value)
         }
         Err(error) => {
@@ -352,7 +353,7 @@ pub enum ReadCampaignError {
         column: &'static str,
     },
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 }
 
 #[derive(sqlx::FromRow)]
@@ -453,7 +454,7 @@ impl CampaignRecordRow {
 /// and skipped; an unreadable column on a known kind fails the whole read.
 /// Takes no lock.
 pub async fn list_unfinished(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
 ) -> Result<Vec<Campaign>, ReadCampaignError> {
     let rows = sqlx::query_as::<_, CampaignRow>(sql!(
         "SELECT id, from_environment_ref, to_environment_ref, kind, phase,
@@ -463,8 +464,9 @@ pub async fn list_unfinished(
          WHERE finished_at IS NULL
          ORDER BY created_at, id"
     ))
-    .fetch_all(executor)
-    .await?;
+    .fetch_all(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     rows.into_iter()
         .filter_map(|row| row.decode().transpose())
         .collect()
@@ -474,7 +476,7 @@ pub async fn list_unfinished(
 /// or its kind is one this build doesn't know (logged and skipped). An
 /// unreadable column on a known kind fails the read. Takes no lock.
 pub async fn get_record(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     campaign_id: CampaignId,
 ) -> Result<Option<CampaignRecord>, ReadCampaignError> {
     let row = sqlx::query_as::<_, CampaignRecordRow>(sql!(
@@ -486,8 +488,9 @@ pub async fn get_record(
          WHERE id = $1"
     ))
     .bind(campaign_id)
-    .fetch_optional(executor)
-    .await?;
+    .fetch_optional(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     let Some(row) = row else {
         return Ok(None);
     };
@@ -501,7 +504,7 @@ pub async fn get_record(
 /// know are logged and skipped without shrinking the page; an unreadable column
 /// on a known kind fails the whole read. Takes no lock.
 pub async fn list_records(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     unfinished_only: bool,
     after: Option<CampaignId>,
     limit: u32,
@@ -539,8 +542,9 @@ pub async fn list_records(
     .bind(i64::from(limit - 1))
     .bind(&known_kinds)
     .bind(uuid::Uuid::max())
-    .fetch_all(executor)
-    .await?;
+    .fetch_all(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     rows.into_iter()
         .filter_map(|row| row.decode().transpose())
         .collect()
@@ -556,19 +560,22 @@ pub async fn list_records(
 /// The caller's transaction must run at `READ COMMITTED`, Postgres's
 /// default. Under `REPEATABLE READ` or `SERIALIZABLE` its snapshot can
 /// predate the lock, so the read would miss a campaign a create committed
-/// while this waited.
-pub async fn unfinished_from_locked(
-    conn: &mut sqlx::PgConnection,
+/// while this waited. The caller must pass its open transaction.
+pub async fn unfinished_from_locked<C>(
+    tx: &mut C,
     kind: CampaignKind,
     source: EnvironmentReference,
-) -> Result<Option<CampaignId>, sqlx::Error> {
+) -> Result<Option<CampaignId>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
     ))
     .bind(format!("runtime_upgrade_campaigns/{kind}/{source}"))
-    .execute(&mut *conn)
+    .execute((&mut *tx).into_sqlx())
     .await?;
-    unfinished_from(&mut *conn, kind, source).await
+    unfinished_from(tx, kind, source).await
 }
 
 /// Whether an unfinished campaign of `kind` moves `source`: the one
@@ -576,11 +583,11 @@ pub async fn unfinished_from_locked(
 /// read for a caller's check, not a guarantee; [`unfinished_from_locked`]
 /// is the guarded form.
 pub(crate) async fn unfinished_from(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     kind: CampaignKind,
     source: EnvironmentReference,
-) -> Result<Option<CampaignId>, sqlx::Error> {
-    sqlx::query_scalar::<_, CampaignId>(sql!(
+) -> Result<Option<CampaignId>, DbError> {
+    Ok(sqlx::query_scalar::<_, CampaignId>(sql!(
         "SELECT id
          FROM runtime_upgrade_campaigns
          WHERE from_environment_ref = $1
@@ -591,8 +598,8 @@ pub(crate) async fn unfinished_from(
     ))
     .bind(source.to_string())
     .bind(kind.as_str())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// A campaign's items, counted by phase.
@@ -632,12 +639,12 @@ pub enum ItemCountsError {
     #[error(transparent)]
     UnknownValue(#[from] UnknownValue),
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 }
 
 /// `campaign_id`'s items counted by phase. Takes no lock.
 pub async fn item_counts(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     campaign_id: CampaignId,
 ) -> Result<ItemCounts, ItemCountsError> {
     let rows = sqlx::query_as::<_, (String, i64)>(sql!(
@@ -647,8 +654,9 @@ pub async fn item_counts(
          GROUP BY phase"
     ))
     .bind(campaign_id)
-    .fetch_all(executor)
-    .await?;
+    .fetch_all(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     let mut counts = ItemCounts::default();
     for (phase, count) in rows {
         // count(*) is never negative.
@@ -661,7 +669,7 @@ pub async fn item_counts(
 /// The items of each of `campaign_ids` counted by phase, in one read; a
 /// campaign with no items gets zero counts. Takes no lock.
 pub async fn item_counts_of(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     campaign_ids: &[CampaignId],
 ) -> Result<std::collections::HashMap<CampaignId, ItemCounts>, ItemCountsError> {
     let rows = sqlx::query_as::<_, (CampaignId, String, i64)>(sql!(
@@ -671,8 +679,9 @@ pub async fn item_counts_of(
          GROUP BY campaign_id, phase"
     ))
     .bind(campaign_ids)
-    .fetch_all(executor)
-    .await?;
+    .fetch_all(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     let mut counts: std::collections::HashMap<CampaignId, ItemCounts> = campaign_ids
         .iter()
         .map(|campaign_id| (*campaign_id, ItemCounts::default()))

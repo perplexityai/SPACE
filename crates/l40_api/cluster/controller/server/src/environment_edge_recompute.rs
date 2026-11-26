@@ -37,7 +37,9 @@ pub struct CatalogEdgeStore {
 
 impl EdgeRecomputeSink for CatalogEdgeStore {
     async fn recompute_all_edges(&self) -> Result<RecomputeOutcome, sqlx::Error> {
-        catalog_store::recompute_all_edges(&self.pool).await
+        catalog_store::recompute_all_edges(&pplx_space_postgres_pool::Db::from(self.pool.clone()))
+            .await
+            .map_err(sqlx::Error::from)
     }
 }
 

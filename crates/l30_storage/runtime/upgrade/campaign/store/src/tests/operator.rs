@@ -1044,7 +1044,7 @@ async fn a_locked_read_of_a_source_holds_off_a_create_until_its_transaction_ends
     let campaign = new_campaign(53, CampaignKind::Templates);
     let mut reader = db.pool.begin().await?;
     assert_eq!(
-        unfinished_from_locked(&mut reader, CampaignKind::Templates, campaign.from).await?,
+        unfinished_from_locked(&mut *reader, CampaignKind::Templates, campaign.from).await?,
         None
     );
     let create = create_campaign(&db.pool, &campaign);

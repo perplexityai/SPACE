@@ -166,13 +166,13 @@ async fn workers_hold_templates<'a>(
     store::workers_not_reading_twins(&state.pool, state.sandbox_controller.managed_by())
         .await
         .map(|readers| readers.holds())
-        .map_err(|error| Box::new(super::support::read_db_error(error)))
+        .map_err(|error| Box::new(super::support::read_db_error(sqlx::Error::from(error))))
 }
 
 /// Why a read failed, as a response.
 pub(super) fn campaign_read_error(error: ReadCampaignError) -> Response {
     match error {
-        ReadCampaignError::Database(err) => read_db_error(err),
+        ReadCampaignError::Database(err) => read_db_error(sqlx::Error::from(err)),
         error => {
             tracing::error!(%error, "read runtime upgrade campaign");
             api_error(
@@ -187,7 +187,7 @@ pub(super) fn campaign_read_error(error: ReadCampaignError) -> Response {
 /// Why counting items failed, as a response.
 fn item_counts_error(error: store::ItemCountsError) -> Response {
     match error {
-        store::ItemCountsError::Database(err) => read_db_error(err),
+        store::ItemCountsError::Database(err) => read_db_error(sqlx::Error::from(err)),
         error => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("a campaign's items can't be read: {error}"),
@@ -223,7 +223,7 @@ async fn edges_certified(
     let mut answers =
         pplx_space_runtime_environment_catalog_store::upgrade_edges_certified(pool, &to_read)
             .await
-            .map_err(|err| Box::new(read_db_error(err)))?
+            .map_err(|err| Box::new(read_db_error(sqlx::Error::from(err))))?
             .into_iter();
     Ok(edges
         .iter()
@@ -613,9 +613,10 @@ pub(super) async fn start_campaign(
                 campaign.kind, campaign.from
             ),
         ),
-        Err(CreateCampaignError::Database(err)) => {
-            audit.fail("the write failed", db_error(err).into_response())
-        }
+        Err(CreateCampaignError::Database(err)) => audit.fail(
+            "the write failed",
+            db_error(sqlx::Error::from(err)).into_response(),
+        ),
     }
 }
 
@@ -729,9 +730,10 @@ fn change_error(
             tracing::error!(%error, %campaign_id, "change runtime upgrade campaign phase");
             audit.refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
         }
-        ChangePhaseError::Database(err) => {
-            audit.fail("the write failed", db_error(err).into_response())
-        }
+        ChangePhaseError::Database(err) => audit.fail(
+            "the write failed",
+            db_error(sqlx::Error::from(err)).into_response(),
+        ),
     }
 }
 

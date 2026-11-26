@@ -126,7 +126,7 @@ impl Fixture {
     async fn set_default(&self, environment: EnvironmentReference) -> TestResult {
         let mut tx = self.pool().begin().await?;
         set_default(
-            &mut tx,
+            &mut *tx,
             environment,
             &PolicyChange {
                 actor: None,
@@ -349,7 +349,7 @@ impl ReleaseObjects for HookedObjects {
             OnWrite::MoveDefaultAndFail(to) => {
                 let mut tx = self.pool.begin().await.expect("begin");
                 set_default(
-                    &mut tx,
+                    &mut *tx,
                     to,
                     &PolicyChange {
                         actor: None,

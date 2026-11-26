@@ -13,6 +13,7 @@
 
 use pplx_space_accounts::UserId;
 use pplx_space_execution_spec::EnvironmentReference;
+use pplx_space_postgres_pool::DbError;
 use pplx_space_sql_locator::sql;
 use sqlx::{Acquire, PgConnection, Postgres};
 
@@ -56,7 +57,7 @@ pub enum CreateCampaignError {
     #[error("invalid campaign: {0}")]
     Invalid(&'static str),
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 }
 
 /// The most characters a reason may hold, matching the schema's `CHECK`.
@@ -107,7 +108,7 @@ pub async fn create_campaign(
     campaign: &NewCampaign,
 ) -> Result<CampaignId, CreateCampaignError> {
     validate(campaign).map_err(CreateCampaignError::Invalid)?;
-    let mut tx = conn.begin().await?;
+    let mut tx = conn.begin().await.map_err(DbError::from)?;
     let created = create_in(&mut tx, campaign).await;
     end_transaction(tx, created).await
 }
@@ -143,5 +144,6 @@ async fn create_in(
     .bind(&campaign.reason)
     .bind(campaign.created_by)
     .fetch_one(&mut *tx)
-    .await?)
+    .await
+    .map_err(DbError::from)?)
 }
