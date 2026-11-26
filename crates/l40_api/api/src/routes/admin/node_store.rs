@@ -225,7 +225,9 @@ impl AdminNodeStore {
 
     /// The node's admin row: [`direct::admin_node`].
     pub(super) async fn fetch(&self, node_id: NodeId) -> Result<Option<AdminNodeRow>, sqlx::Error> {
-        direct::admin_node(&self.pool, node_id).await
+        direct::admin_node(&self.pool, node_id)
+            .await
+            .map_err(sqlx::Error::from)
     }
 
     /// The admin rows matching `filters`: [`direct::list_admin_nodes`].
@@ -246,6 +248,7 @@ impl AdminNodeStore {
             phase_param,
         )
         .await
+        .map_err(sqlx::Error::from)
     }
 
     /// The runtime installations each of `node_ids` last reported, one row

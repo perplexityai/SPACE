@@ -20,8 +20,9 @@ use std::sync::LazyLock;
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
 use pplx_space_node_status_store::environment_refusal;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::{FromRow, PgExecutor};
+use sqlx::FromRow;
 
 /// A worker a create may be placed on, with what the environment gate would
 /// refuse it for (an `EnvironmentRefusal` wire value); NULL when there's
@@ -69,10 +70,10 @@ pub struct CreateCandidateBinds<'a> {
 /// The cached-ready create candidates: workers whose fresh, `ready`
 /// snapshot and inventory show they hold the build and can run it, in
 /// random order.
-pub async fn cached_ready_worker_create_candidates<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn cached_ready_worker_create_candidates(
+    executor: impl Executor<'_>,
     binds: CreateCandidateBinds<'_>,
-) -> Result<Vec<GatedCandidateRow>, sqlx::Error> {
+) -> Result<Vec<GatedCandidateRow>, DbError> {
     static CACHED_READY_WORKER_CREATE_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
         format!(
             "SELECT n.id, nd.node_api_endpoint, environment_gate.refusal AS environment_refusal
@@ -175,18 +176,20 @@ pub async fn cached_ready_worker_create_candidates<'e>(
             refusal = environment_refusal("nss", "COALESCE(nti.execution_metadata->>'environment', $7::TEXT)"),
         )
     });
-    sqlx::query_as::<_, GatedCandidateRow>(sqlx::AssertSqlSafe(sql!(
-        CACHED_READY_WORKER_CREATE_CANDIDATES.as_str()
-    )))
-    .bind(binds.template)
-    .bind(binds.content_hash)
-    .bind(binds.runtime)
-    .bind(binds.require_base_snapshot)
-    .bind(binds.managed_by)
-    .bind(binds.refuse)
-    .bind(binds.release_environment)
-    .fetch_all(executor)
-    .await
+    Ok(
+        sqlx::query_as::<_, GatedCandidateRow>(sqlx::AssertSqlSafe(sql!(
+            CACHED_READY_WORKER_CREATE_CANDIDATES.as_str()
+        )))
+        .bind(binds.template)
+        .bind(binds.content_hash)
+        .bind(binds.runtime)
+        .bind(binds.require_base_snapshot)
+        .bind(binds.managed_by)
+        .bind(binds.refuse)
+        .bind(binds.release_environment)
+        .fetch_all(executor.into_sqlx())
+        .await?,
+    )
 }
 
 /// The last-known create candidates, one row per worker, in node id order:
@@ -198,10 +201,10 @@ pub async fn cached_ready_worker_create_candidates<'e>(
 /// environment gate refuses and the work is bound to an environment (the
 /// row's binding, else the release's). Each worker's row is its most recently
 /// observed matching inventory row.
-pub async fn last_known_worker_create_candidates<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn last_known_worker_create_candidates(
+    executor: impl Executor<'_>,
     binds: CreateCandidateBinds<'_>,
-) -> Result<Vec<GatedCandidateRow>, sqlx::Error> {
+) -> Result<Vec<GatedCandidateRow>, DbError> {
     static LAST_KNOWN_WORKER_CREATE_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
         format!(
             "SELECT DISTINCT ON (n.id) n.id, nd.node_api_endpoint,
@@ -304,18 +307,20 @@ pub async fn last_known_worker_create_candidates<'e>(
             refusal = environment_refusal("nss", "COALESCE(nti.execution_metadata->>'environment', $7::TEXT)"),
         )
     });
-    sqlx::query_as::<_, GatedCandidateRow>(sqlx::AssertSqlSafe(sql!(
-        LAST_KNOWN_WORKER_CREATE_CANDIDATES.as_str()
-    )))
-    .bind(binds.template)
-    .bind(binds.content_hash)
-    .bind(binds.runtime)
-    .bind(binds.require_base_snapshot)
-    .bind(binds.managed_by)
-    .bind(binds.refuse)
-    .bind(binds.release_environment)
-    .fetch_all(executor)
-    .await
+    Ok(
+        sqlx::query_as::<_, GatedCandidateRow>(sqlx::AssertSqlSafe(sql!(
+            LAST_KNOWN_WORKER_CREATE_CANDIDATES.as_str()
+        )))
+        .bind(binds.template)
+        .bind(binds.content_hash)
+        .bind(binds.runtime)
+        .bind(binds.require_base_snapshot)
+        .bind(binds.managed_by)
+        .bind(binds.refuse)
+        .bind(binds.release_environment)
+        .fetch_all(executor.into_sqlx())
+        .await?,
+    )
 }
 
 /// What [`pull_on_create_worker_candidates`] binds.
@@ -340,10 +345,10 @@ pub struct PullOnCreateBinds<'a> {
 /// The workers with a fresh, `ready` snapshot that can pull the build and
 /// create from it, holders included, in random order. With the gate
 /// refusing, only those it doesn't refuse.
-pub async fn pull_on_create_worker_candidates<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn pull_on_create_worker_candidates(
+    executor: impl Executor<'_>,
     binds: PullOnCreateBinds<'_>,
-) -> Result<Vec<GatedCandidateRow>, sqlx::Error> {
+) -> Result<Vec<GatedCandidateRow>, DbError> {
     static PULL_ON_CREATE_WORKER_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
         format!(
             "SELECT n.id, nd.node_api_endpoint, environment_gate.refusal AS environment_refusal
@@ -410,18 +415,20 @@ pub async fn pull_on_create_worker_candidates<'e>(
             refusal = environment_refusal("nss", "CASE WHEN held.holds THEN held.environment ELSE $3::TEXT END"),
         )
     });
-    sqlx::query_as::<_, GatedCandidateRow>(sqlx::AssertSqlSafe(sql!(
-        PULL_ON_CREATE_WORKER_CANDIDATES.as_str()
-    )))
-    .bind(binds.runtime)
-    .bind(binds.managed_by)
-    .bind(binds.build_environment)
-    .bind(binds.refuse)
-    .bind(binds.template)
-    .bind(binds.content_hash)
-    .bind(binds.release_environment)
-    .fetch_all(executor)
-    .await
+    Ok(
+        sqlx::query_as::<_, GatedCandidateRow>(sqlx::AssertSqlSafe(sql!(
+            PULL_ON_CREATE_WORKER_CANDIDATES.as_str()
+        )))
+        .bind(binds.runtime)
+        .bind(binds.managed_by)
+        .bind(binds.build_environment)
+        .bind(binds.refuse)
+        .bind(binds.template)
+        .bind(binds.content_hash)
+        .bind(binds.release_environment)
+        .fetch_all(executor.into_sqlx())
+        .await?,
+    )
 }
 
 /// What [`pooled_worker_candidates`] binds.
@@ -444,10 +451,10 @@ pub struct PooledCandidateBinds<'a> {
 /// The workers with a fresh, `ready` snapshot whose warm pool of the build
 /// has a current member, fullest pool first. With the gate refusing, only
 /// those it doesn't refuse.
-pub async fn pooled_worker_candidates<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn pooled_worker_candidates(
+    executor: impl Executor<'_>,
     binds: PooledCandidateBinds<'_>,
-) -> Result<Vec<PooledCandidateRow>, sqlx::Error> {
+) -> Result<Vec<PooledCandidateRow>, DbError> {
     static POOLED_WORKER_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
         format!(
             "SELECT n.id, nd.node_api_endpoint, nti.content_hash, nti.vcpu, nti.memory_mib,
@@ -532,27 +539,29 @@ pub async fn pooled_worker_candidates<'e>(
             refusal = environment_refusal("nss", "COALESCE(nti.execution_metadata->>'environment', $6::TEXT)"),
         )
     });
-    sqlx::query_as::<_, PooledCandidateRow>(sqlx::AssertSqlSafe(sql!(
-        POOLED_WORKER_CANDIDATES.as_str()
-    )))
-    .bind(binds.template)
-    .bind(binds.content_hash)
-    .bind(binds.runtime)
-    .bind(binds.managed_by)
-    .bind(binds.refuse)
-    .bind(binds.release_environment)
-    .fetch_all(executor)
-    .await
+    Ok(
+        sqlx::query_as::<_, PooledCandidateRow>(sqlx::AssertSqlSafe(sql!(
+            POOLED_WORKER_CANDIDATES.as_str()
+        )))
+        .bind(binds.template)
+        .bind(binds.content_hash)
+        .bind(binds.runtime)
+        .bind(binds.managed_by)
+        .bind(binds.refuse)
+        .bind(binds.release_environment)
+        .fetch_all(executor.into_sqlx())
+        .await?,
+    )
 }
 
 /// How many live, registered Direct workers under `managed_by` a start could
 /// place on: those with no snapshot, or one that is reachable and not
 /// `full`, `draining` or `unavailable`, however stale.
-pub async fn count_start_eligible_workers<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn count_start_eligible_workers(
+    executor: impl Executor<'_>,
     managed_by: SubstrateKind,
-) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>(
+) -> Result<i64, DbError> {
+    Ok(sqlx::query_scalar::<_, i64>(
         sql!("SELECT COUNT(*)
              FROM nodes n
              JOIN node_direct nd ON nd.node_id = n.id
@@ -565,6 +574,6 @@ pub async fn count_start_eligible_workers<'e>(
                AND COALESCE(nss.scheduling_status, 'ready') NOT IN ('full', 'draining', 'unavailable')"),
     )
     .bind(managed_by)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }

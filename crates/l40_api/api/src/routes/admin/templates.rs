@@ -391,7 +391,9 @@ async fn fetch_template(
 async fn reconcile_target_node_ids(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<Vec<NodeId>, sqlx::Error> {
-    direct_registry::live_worker_and_builder_ids(&mut **tx, SubstrateKind::Space).await
+    direct_registry::live_worker_and_builder_ids(&mut **tx, SubstrateKind::Space)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 /// The enqueue writes, for a caller that already holds the node ids.

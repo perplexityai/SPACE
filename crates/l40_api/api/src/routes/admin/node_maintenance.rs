@@ -530,7 +530,7 @@ pub async fn delete_node(
     match result {
         Ok(count) if count > 0 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => api_error(StatusCode::NOT_FOUND, "Node not found").into_response(),
-        Err(err) => db_error(err).into_response(),
+        Err(err) => db_error(sqlx::Error::from(err)).into_response(),
     }
 }
 

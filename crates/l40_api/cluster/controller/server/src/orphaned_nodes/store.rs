@@ -58,6 +58,8 @@ impl OrphanedNodesSink for NodeDbStore {
         node_id: NodeId,
         expected_uid: Option<String>,
     ) -> Result<bool, sqlx::Error> {
-        orphaned_nodes::delete_if_orphan(&self.pool, node_id, expected_uid.as_deref()).await
+        orphaned_nodes::delete_if_orphan(&self.pool, node_id, expected_uid.as_deref())
+            .await
+            .map_err(sqlx::Error::from)
     }
 }

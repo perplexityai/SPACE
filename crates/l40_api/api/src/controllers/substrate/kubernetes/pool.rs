@@ -832,7 +832,9 @@ async fn resolve_pool_slot_node_id(
     let Some(node_name) = node_name else {
         return Ok(None);
     };
-    node_lookup::worker_for_k8s_node_name(&mut **tx, node_name).await
+    node_lookup::worker_for_k8s_node_name(&mut **tx, node_name)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 async fn fetch_pool_config(

@@ -79,8 +79,8 @@ async fn share_lock_node_holds_off_writers_until_the_transaction_ends() -> TestD
     let node_id = node(&db.pool).await?;
 
     let mut tx = db.pool.begin().await?;
-    assert!(!share_lock_node(&mut tx, NodeId::new()).await?);
-    assert!(share_lock_node(&mut tx, node_id).await?);
+    assert!(!share_lock_node(&mut *tx, NodeId::new()).await?);
+    assert!(share_lock_node(&mut *tx, node_id).await?);
     assert!(acquirable(&db.pool, Probe::NodeShare, node_id).await?);
     assert!(!acquirable(&db.pool, Probe::NodeUpdate, node_id).await?);
     assert!(!acquirable(&db.pool, Probe::NodeNoKeyUpdate, node_id).await?);
@@ -100,8 +100,8 @@ async fn lock_node_for_update_holds_until_the_transaction_ends() -> TestDbResult
     let node_id = node(&db.pool).await?;
 
     let mut tx = db.pool.begin().await?;
-    assert!(!lock_node_for_update(&mut tx, NodeId::new()).await?);
-    assert!(lock_node_for_update(&mut tx, node_id).await?);
+    assert!(!lock_node_for_update(&mut *tx, NodeId::new()).await?);
+    assert!(lock_node_for_update(&mut *tx, node_id).await?);
     assert!(!acquirable(&db.pool, Probe::NodeKeyShare, node_id).await?);
     tx.rollback().await?;
 
@@ -118,8 +118,8 @@ async fn lock_node_for_no_key_update_admits_key_share_locks() -> TestDbResult<()
     let node_id = node(&db.pool).await?;
 
     let mut tx = db.pool.begin().await?;
-    assert!(!lock_node_for_no_key_update(&mut tx, NodeId::new()).await?);
-    assert!(lock_node_for_no_key_update(&mut tx, node_id).await?);
+    assert!(!lock_node_for_no_key_update(&mut *tx, NodeId::new()).await?);
+    assert!(lock_node_for_no_key_update(&mut *tx, node_id).await?);
     assert!(acquirable(&db.pool, Probe::NodeKeyShare, node_id).await?);
     assert!(!acquirable(&db.pool, Probe::NodeShare, node_id).await?);
     tx.commit().await?;
@@ -157,7 +157,7 @@ async fn share_lock_k8s_node_in_drain_phase_matches_the_phase_and_substrate() ->
         let case = format!("{node_id} {phase:?}");
         let mut tx = db.pool.begin().await?;
         assert_eq!(
-            share_lock_k8s_node_in_drain_phase(&mut tx, node_id, phase).await?,
+            share_lock_k8s_node_in_drain_phase(&mut *tx, node_id, phase).await?,
             expected,
             "{case}"
         );
@@ -206,7 +206,7 @@ async fn share_lock_k8s_registration_with_uid_matches_the_uid() -> TestDbResult<
         let case = format!("{node_id} {uid:?}");
         let mut tx = db.pool.begin().await?;
         assert_eq!(
-            share_lock_k8s_registration_with_uid(&mut tx, node_id, uid).await?,
+            share_lock_k8s_registration_with_uid(&mut *tx, node_id, uid).await?,
             expected,
             "{case}"
         );
@@ -246,9 +246,9 @@ async fn share_lock_k8s_identity_reads_and_holds_the_registration() -> TestDbRes
     let unregistered = node(&db.pool).await?;
 
     let mut tx = db.pool.begin().await?;
-    assert_eq!(share_lock_k8s_identity(&mut tx, unregistered).await?, None);
+    assert_eq!(share_lock_k8s_identity(&mut *tx, unregistered).await?, None);
     assert_eq!(
-        share_lock_k8s_identity(&mut tx, registered).await?,
+        share_lock_k8s_identity(&mut *tx, registered).await?,
         Some((
             Some("uid-1".to_owned()),
             Some("i-0000000000000a0a0".to_owned())

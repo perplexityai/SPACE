@@ -69,10 +69,12 @@ async fn lock_v2_node(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     node_id: NodeId,
 ) -> Result<Option<LockedV2Node>, sqlx::Error> {
-    if !guarded_delete::lock_node(tx, node_id).await? {
+    if !guarded_delete::lock_node(&mut **tx, node_id).await? {
         return Ok(None);
     }
-    read_locked_v2_node(tx, node_id).await
+    read_locked_v2_node(&mut **tx, node_id)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 /// Add every durable row still homed on the `drained` v2 node under
@@ -156,11 +158,11 @@ pub(crate) async fn fence_v2_node(
     .await?;
     if !references.is_empty() {
         let held = format!("terminate held: {references}");
-        record_terminate_held(&mut tx, node_id, &held).await?;
+        record_terminate_held(&mut *tx, node_id, &held).await?;
         tx.commit().await?;
         return Ok(Fence::Held(held));
     }
-    write_fence(&mut tx, node_id, &instance_id).await?;
+    write_fence(&mut *tx, node_id, &instance_id).await?;
     tx.commit().await?;
     Ok(Fence::Fenced(instance_id))
 }
@@ -176,7 +178,7 @@ pub(crate) async fn let_go_v2(
     trace: &str,
 ) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    if !guarded_delete::lock_node(&mut tx, node_id).await? {
+    if !guarded_delete::lock_node(&mut *tx, node_id).await? {
         return Ok(false);
     }
     let cleared = let_go_v2_node(&mut *tx, node_id, generation, phase, fence, trace).await?;
@@ -293,6 +295,7 @@ where
     uncordon(node_name, node.k8s_node_uid).await?;
     let cleared = finish_v2_cancel(&mut *tx, node_id, generation)
         .await
+        .map_err(sqlx::Error::from)
         .map_err(sql_error)?;
     tx.commit().await.map_err(sql_error)?;
     Ok(cleared)

@@ -2633,6 +2633,7 @@ impl NodeDrainSink for SubstrateSink {
             DRAIN_RECONCILER_SUBSTRATE,
         )
         .await
+        .map_err(sqlx::Error::from)
     }
 
     /// `(occupying, total)` for one draining node
@@ -4743,7 +4744,7 @@ impl NodeDrainSink for SubstrateSink {
                 .bind(DRAIN_COMPLETION_LOCK_TIMEOUT.as_millis().to_string())
                 .execute(&mut *tx)
                 .await?;
-            locks::lock_node_for_update(&mut tx, node_id).await?;
+            locks::lock_node_for_update(&mut *tx, node_id).await?;
             let result = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
                 .bind(node_id)
                 .bind(new_phase)

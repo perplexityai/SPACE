@@ -1,8 +1,9 @@
 //! Mirroring Kubernetes node-group labels into `nodes.node_group_id`.
 
 use pplx_space_node_model::{NODE_ROLE_WORKER, NodeGroupId, SubstrateKind};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::{PgExecutor, Postgres, SqlSafeStr};
+use sqlx::{Postgres, SqlSafeStr};
 
 /// The bulk UPDATE, prepared by [`prepare_mirror_worker_node_groups`] and
 /// executed by [`mirror_worker_node_groups`], which must send the same text
@@ -20,9 +21,7 @@ const MIRROR_UPDATE: &str = sql!(
 
 /// Prepare [`mirror_worker_node_groups`]'s statement on `executor`'s
 /// connection, so the write on that connection is a statement-cache hit.
-pub async fn prepare_mirror_worker_node_groups<'e>(
-    executor: impl PgExecutor<'e>,
-) -> Result<(), sqlx::Error> {
+pub async fn prepare_mirror_worker_node_groups(executor: impl Executor<'_>) -> Result<(), DbError> {
     // The parameter types `mirror_worker_node_groups` binds, so the prepared
     // statement is the one its execute would have prepared itself.
     let parameters = [
@@ -31,9 +30,12 @@ pub async fn prepare_mirror_worker_node_groups<'e>(
         <&str as sqlx::Type<Postgres>>::type_info(),
         <SubstrateKind as sqlx::Type<Postgres>>::type_info(),
     ];
-    executor
-        .prepare_with(MIRROR_UPDATE.into_sql_str(), &parameters)
-        .await?;
+    sqlx::Executor::prepare_with(
+        executor.into_sqlx(),
+        MIRROR_UPDATE.into_sql_str(),
+        &parameters,
+    )
+    .await?;
     Ok(())
 }
 
@@ -46,16 +48,16 @@ pub async fn prepare_mirror_worker_node_groups<'e>(
 /// Worker rows only: node ids are role-scoped, so one Kubernetes Node may back
 /// several `nodes` rows (worker and builder) sharing a Kubernetes node name.
 pub async fn mirror_worker_node_groups(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_names: &[String],
     group_ids: &[Option<NodeGroupId>],
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let result = sqlx::query(MIRROR_UPDATE)
         .bind(node_names)
         .bind(group_ids)
         .bind(NODE_ROLE_WORKER)
         .bind(SubstrateKind::Kubernetes)
-        .execute(executor)
+        .execute(executor.into_sqlx())
         .await?;
     Ok(result.rows_affected())
 }

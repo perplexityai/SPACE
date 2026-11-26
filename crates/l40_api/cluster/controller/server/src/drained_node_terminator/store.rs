@@ -86,6 +86,7 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
             SubstrateKind::Kubernetes,
         )
         .await
+        .map_err(sqlx::Error::from)
     }
 
     async fn count_local_snapshots(&self, node_id: NodeId) -> Result<i64, sqlx::Error> {
@@ -127,7 +128,9 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
         //
         // `drain_last_error` is explicitly cleared so a stale error from
         // a prior phase doesn't carry into the new state.
-        drained_node::mark_terminating(&self.pool, node_id, self.residency_evidence).await
+        drained_node::mark_terminating(&self.pool, node_id, self.residency_evidence)
+            .await
+            .map_err(sqlx::Error::from)
     }
 
     async fn delete_drained_node_if_orphan(

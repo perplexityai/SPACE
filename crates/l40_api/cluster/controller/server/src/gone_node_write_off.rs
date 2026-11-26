@@ -31,10 +31,12 @@ pub(crate) async fn node_identity_holds(
     drain_phase: Option<&str>,
     expected_uid: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
-    if !locks::share_lock_k8s_node_in_drain_phase(tx, node_id, drain_phase).await? {
+    if !locks::share_lock_k8s_node_in_drain_phase(&mut **tx, node_id, drain_phase).await? {
         return Ok(false);
     }
-    locks::share_lock_k8s_registration_with_uid(tx, node_id, expected_uid).await
+    locks::share_lock_k8s_registration_with_uid(&mut **tx, node_id, expected_uid)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 /// Emit the `sandbox_lost` and `sandbox_failed` pair for a committed flip. The

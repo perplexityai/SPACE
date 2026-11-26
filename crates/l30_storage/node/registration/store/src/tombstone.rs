@@ -5,8 +5,8 @@
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 
 /// Delete `node_id`'s Kubernetes row while it is in `drain_phase =
 /// 'terminating'` under a v1 drain (`drain_engine IS NULL`); its `node_k8s`
@@ -15,9 +15,9 @@ use sqlx::PgExecutor;
 /// node's tombstone ([`record_admin_terminate_tombstone`]), and record one
 /// only when this returns `true`.
 pub async fn delete_terminating_k8s_node(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "DELETE FROM nodes
          WHERE id = $1
@@ -27,7 +27,7 @@ pub async fn delete_terminating_k8s_node(
     ))
     .bind(node_id)
     .bind(SubstrateKind::Kubernetes)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -36,11 +36,11 @@ pub async fn delete_terminating_k8s_node(
 /// rewrite its existing tombstone. Run it in the transaction that deletes the
 /// node, so the node is never gone without its tombstone.
 pub async fn record_admin_terminate_tombstone(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     k8s_node_name: &str,
     role: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "INSERT INTO node_k8s_tombstones (node_id, k8s_node_name, role, reason)
          VALUES ($1, $2, $3, 'admin-terminate')
@@ -53,7 +53,7 @@ pub async fn record_admin_terminate_tombstone(
     .bind(node_id)
     .bind(k8s_node_name)
     .bind(role)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }

@@ -2085,7 +2085,12 @@ impl DirectSubstrate {
             },
         )
         .await
-        .map_err(|err| db_contention_error("failed to select direct pool candidates", &err))?
+        .map_err(|err| {
+            db_contention_error(
+                "failed to select direct pool candidates",
+                &sqlx::Error::from(err),
+            )
+        })?
         .into_iter()
         .map(DirectPoolCandidate::from)
         .collect();
@@ -4643,7 +4648,10 @@ impl SubstrateAdapter for DirectSubstrate {
         let node = direct_endpoints::live_builder(&self.pool, node_id, SubstrateKind::Space)
             .await
             .map_err(|error| {
-                db_contention_error(&format!("failed to load builder node {node_id}"), &error)
+                db_contention_error(
+                    &format!("failed to load builder node {node_id}"),
+                    &sqlx::Error::from(error),
+                )
             })?
             .ok_or_else(|| {
                 ControllerError::service_unavailable(format!(

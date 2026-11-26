@@ -90,9 +90,9 @@ async fn exists(pool: &PgPool, node_id: NodeId) -> TestDbResult<bool> {
 async fn delete(pool: &PgPool, node_id: NodeId) -> TestDbResult<bool> {
     let name = name_of(node_id);
     let mut tx = pool.begin().await?;
-    assert!(crate::locks::lock_node_for_update(&mut tx, node_id).await?);
+    assert!(crate::locks::lock_node_for_update(&mut *tx, node_id).await?);
     let deleted =
-        delete_unreferenced_stale_node(&mut tx, node_id, SubstrateKind::Kubernetes, Some(&name))
+        delete_unreferenced_stale_node(&mut *tx, node_id, SubstrateKind::Kubernetes, Some(&name))
             .await?;
     tx.commit().await?;
     Ok(deleted)
@@ -106,9 +106,9 @@ async fn heartbeat_fresh_reads_the_nodes_heartbeat() -> TestDbResult<()> {
     let beating = node(&db.pool).await?;
     heartbeat(&db.pool, beating).await?;
     let mut tx = db.pool.begin().await?;
-    assert!(!heartbeat_fresh(&mut tx, silent).await?);
-    assert!(heartbeat_fresh(&mut tx, beating).await?);
-    assert!(!heartbeat_fresh(&mut tx, NodeId::new()).await?);
+    assert!(!heartbeat_fresh(&mut *tx, silent).await?);
+    assert!(heartbeat_fresh(&mut *tx, beating).await?);
+    assert!(!heartbeat_fresh(&mut *tx, NodeId::new()).await?);
     tx.rollback().await?;
     Ok(())
 }
@@ -143,7 +143,7 @@ async fn the_delete_statement_holds_its_guards_by_itself() -> TestDbResult<()> {
     let mut tx = pool.begin().await?;
     assert!(
         !delete_unreferenced_stale_node(
-            &mut tx,
+            &mut *tx,
             direct,
             SubstrateKind::Space,
             Some(&name_of(direct))

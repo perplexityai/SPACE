@@ -8,8 +8,8 @@
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::{NodeDrainPhase, SubstrateKind};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 
 /// A node's drain columns, all undecoded: a phase or an engine this build
 /// does not know still reads, and each caller decides what it means. The
@@ -24,15 +24,15 @@ pub struct NodeDrainColumns {
 
 /// The drain columns of `node_id`; `None` when the `nodes` row is gone.
 pub async fn drain_columns(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
-) -> Result<Option<NodeDrainColumns>, sqlx::Error> {
-    sqlx::query_as::<_, NodeDrainColumns>(sql!(
+) -> Result<Option<NodeDrainColumns>, DbError> {
+    Ok(sqlx::query_as::<_, NodeDrainColumns>(sql!(
         "SELECT drain_phase, drain_mode, drain_engine FROM nodes WHERE id = $1"
     ))
     .bind(node_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// How many nodes are in one drain phase.
@@ -45,32 +45,32 @@ pub struct DrainPhaseCount {
 /// The node count of every drain phase that has nodes. Nodes without a
 /// phase are not counted.
 pub async fn drain_phase_counts(
-    executor: impl PgExecutor<'_>,
-) -> Result<Vec<DrainPhaseCount>, sqlx::Error> {
-    sqlx::query_as::<_, DrainPhaseCount>(sql!(
+    executor: impl Executor<'_>,
+) -> Result<Vec<DrainPhaseCount>, DbError> {
+    Ok(sqlx::query_as::<_, DrainPhaseCount>(sql!(
         "SELECT drain_phase, COUNT(*) AS count FROM nodes
              WHERE drain_phase IS NOT NULL
              GROUP BY drain_phase"
     ))
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Every node of `managed_by` in v1 drain phase `phase`. A v2 drain's node
 /// (`drain_engine` set) is left to the node drain's v2 loop.
 pub async fn nodes_in_drain_phase(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     phase: NodeDrainPhase,
     managed_by: SubstrateKind,
-) -> Result<Vec<NodeId>, sqlx::Error> {
-    sqlx::query_scalar::<_, NodeId>(sql!(
+) -> Result<Vec<NodeId>, DbError> {
+    Ok(sqlx::query_scalar::<_, NodeId>(sql!(
         "SELECT id FROM nodes
           WHERE drain_phase = $1 AND managed_by = $2 AND drain_engine IS NULL"
     ))
     .bind(phase.as_str())
     .bind(managed_by)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// A node in a drain phase and the raw `drain_mode` column, undecoded so a
@@ -85,18 +85,18 @@ pub struct NodeInDrainPhase {
 /// mode. A v2 drain's node (`drain_engine` set) is left to the node drain's
 /// v2 loop.
 pub async fn nodes_in_drain_phase_with_mode(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     phase: NodeDrainPhase,
     managed_by: SubstrateKind,
-) -> Result<Vec<NodeInDrainPhase>, sqlx::Error> {
-    sqlx::query_as::<_, NodeInDrainPhase>(sql!(
+) -> Result<Vec<NodeInDrainPhase>, DbError> {
+    Ok(sqlx::query_as::<_, NodeInDrainPhase>(sql!(
         "SELECT id, drain_mode FROM nodes
           WHERE drain_phase = $1 AND managed_by = $2 AND drain_engine IS NULL"
     ))
     .bind(phase.as_str())
     .bind(managed_by)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// What a terminator re-reads before it touches the node's infrastructure:
@@ -114,10 +114,10 @@ pub struct TerminateTarget {
 /// [`TerminateTarget`] of `node_id`, in one statement; `None` when the
 /// `nodes` row is gone.
 pub async fn terminate_target(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
-) -> Result<Option<TerminateTarget>, sqlx::Error> {
-    sqlx::query_as::<_, TerminateTarget>(sql!(
+) -> Result<Option<TerminateTarget>, DbError> {
+    Ok(sqlx::query_as::<_, TerminateTarget>(sql!(
         "SELECT n.drain_phase AS phase,
                     k.k8s_node_name AS node_name,
                     k.k8s_node_uid  AS stored_uid,
@@ -127,8 +127,8 @@ pub async fn terminate_target(
              WHERE n.id = $1"
     ))
     .bind(node_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The drain columns of a node that is draining. The engine is undecoded:
@@ -149,10 +149,10 @@ pub struct DrainingSibling {
 /// can differ in both phase and mode; there is no `LIMIT`, and the caller
 /// picks among them.
 pub async fn draining_nodes_for_k8s_node_name(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     k8s_node_name: &str,
-) -> Result<Vec<DrainingSibling>, sqlx::Error> {
-    sqlx::query_as::<_, DrainingSibling>(sql!(
+) -> Result<Vec<DrainingSibling>, DbError> {
+    Ok(sqlx::query_as::<_, DrainingSibling>(sql!(
         "SELECT n.drain_engine, n.drain_phase, n.drain_mode
            FROM node_k8s nk
            JOIN nodes n ON n.id = nk.node_id
@@ -160,8 +160,8 @@ pub async fn draining_nodes_for_k8s_node_name(
             AND (n.drain_phase IS NOT NULL OR n.drain_engine IS NOT NULL)"
     ))
     .bind(k8s_node_name)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// A Kubernetes node in `drain_phase = 'terminating'`: its role, undecoded,
@@ -176,10 +176,10 @@ pub struct TerminatingK8sNode {
 /// isn't Kubernetes-managed, or isn't `terminating`. A read only: the delete
 /// that follows re-checks the phase itself.
 pub async fn terminating_k8s_node(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
-) -> Result<Option<TerminatingK8sNode>, sqlx::Error> {
-    sqlx::query_as::<_, TerminatingK8sNode>(sql!(
+) -> Result<Option<TerminatingK8sNode>, DbError> {
+    Ok(sqlx::query_as::<_, TerminatingK8sNode>(sql!(
         "SELECT n.role, nk.k8s_node_name
          FROM nodes n
          LEFT JOIN node_k8s nk ON nk.node_id = n.id
@@ -189,6 +189,6 @@ pub async fn terminating_k8s_node(
     ))
     .bind(node_id)
     .bind(SubstrateKind::Kubernetes)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }

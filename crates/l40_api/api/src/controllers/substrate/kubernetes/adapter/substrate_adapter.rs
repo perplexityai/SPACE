@@ -1566,7 +1566,10 @@ impl SubstrateAdapter for KubernetesSubstrate {
         let node_name = node_lookup::builder_k8s_node_name(self.store.pool(), node_id)
             .await
             .map_err(|error| {
-                db_contention_error(&format!("failed to load builder node {node_id}"), &error)
+                db_contention_error(
+                    &format!("failed to load builder node {node_id}"),
+                    &sqlx::Error::from(error),
+                )
             })?
             .ok_or_else(|| {
                 ControllerError::service_unavailable(format!(

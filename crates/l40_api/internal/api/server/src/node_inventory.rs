@@ -4,10 +4,9 @@ use super::NodeRow;
 use pplx_space_node_api_client::DEFAULT_PORT;
 use pplx_space_node_model::NodeRole;
 use pplx_space_node_registration_store::inventory::{self, KubernetesInventoryRow};
-use sqlx::PgExecutor;
 
 pub(super) async fn list_kubernetes(
-    executor: impl PgExecutor<'_>,
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
     role: Option<NodeRole>,
     include_deleted: bool,
 ) -> Result<Vec<NodeRow>, sqlx::Error> {

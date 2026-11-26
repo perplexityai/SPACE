@@ -2,8 +2,8 @@
 //! no longer lists back to `registered`.
 
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 
 /// Demote up to `max_per_tick` `ready` Kubernetes nodes outside any drain
 /// whose Kubernetes node name is not in `live_node_names`, and whose
@@ -17,12 +17,12 @@ use sqlx::PgExecutor;
 /// of `ready`, into a drain or to another heartbeat in between is left as it
 /// is and not returned. Node and sandbox placement rows are never deleted.
 pub async fn demote_unobserved_ready_nodes(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     live_node_names: &[String],
     missing_grace_secs: i64,
     max_per_tick: i64,
-) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>(sql!(
+) -> Result<Vec<String>, DbError> {
+    Ok(sqlx::query_scalar::<_, String>(sql!(
         "WITH candidates AS MATERIALIZED (
              SELECT candidate.id,
                     candidate.last_heartbeat,
@@ -61,8 +61,8 @@ pub async fn demote_unobserved_ready_nodes(
     .bind(missing_grace_secs)
     .bind(max_per_tick)
     .bind(SubstrateKind::Kubernetes)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 #[cfg(test)]

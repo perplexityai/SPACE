@@ -13,6 +13,7 @@ use std::sync::LazyLock;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_portability::drain_gate_blockers_for_node;
 use pplx_space_sandbox_residency::{ResidencyEvidence, active_resident_predicate};
 use pplx_space_sql_locator::sql;
@@ -65,20 +66,20 @@ static DIAGNOSE_NODE_CENSUS_AWARE: LazyLock<String> =
 /// `residency`) hold it. A read; it takes no lock, and in the census-aware
 /// mode it compares against the executor's `NOW()`.
 pub async fn diagnose(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     expected_uid: Option<&str>,
     managed_by: SubstrateKind,
     residency: ResidencyEvidence,
-) -> Result<OrphanReapRefusal, sqlx::Error> {
+) -> Result<OrphanReapRefusal, DbError> {
     let statement = match residency {
         ResidencyEvidence::LifecycleOnly => DIAGNOSE_LIFECYCLE_ONLY.as_str(),
         ResidencyEvidence::NodeCensusAware => DIAGNOSE_NODE_CENSUS_AWARE.as_str(),
     };
-    sqlx::query_as(sqlx::AssertSqlSafe(statement))
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(statement))
         .bind(node_id)
         .bind(expected_uid)
         .bind(managed_by)
-        .fetch_one(executor)
-        .await
+        .fetch_one(executor.into_sqlx())
+        .await?)
 }

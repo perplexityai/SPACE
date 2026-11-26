@@ -165,7 +165,7 @@ impl K8sStore {
                         "failed to re-check node tombstone"
                     }
                 };
-                crate::controllers::substrate::substrate_db_error(what, &source)
+                crate::controllers::substrate::substrate_db_error(what, &sqlx::Error::from(source))
             }
         })
     }

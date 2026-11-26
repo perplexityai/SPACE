@@ -54,6 +54,7 @@
 use pplx_space_accounts::NodeId;
 use pplx_space_k8s_ids::{K8sNodeName, K8sNodeUid};
 use pplx_space_node_model::{NodeRole, SubstrateKind};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 
 pub mod demotion;
@@ -79,12 +80,12 @@ pub use register::{
 #[derive(Debug, thiserror::Error)]
 pub enum NodeRegistrationError {
     #[error("node registration lookup failed: {0}")]
-    Query(#[from] sqlx::Error),
+    Query(#[from] DbError),
 }
 
 /// Require both name and UID; a registration without a UID cannot match.
 pub async fn registered_node(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     name: &K8sNodeName,
     uid: &K8sNodeUid,
 ) -> Result<Option<NodeId>, NodeRegistrationError> {
@@ -94,19 +95,20 @@ pub async fn registered_node(
     ))
     .bind(name.as_str())
     .bind(uid.as_str())
-    .fetch_optional(executor)
-    .await?)
+    .fetch_optional(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?)
 }
 
 /// Live registrations of the reviewed node name in `roles`, each with
 /// whether its inventory UID matches (`None` when it has none).
 pub async fn nodes_for_identity(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     name: &K8sNodeName,
     uid: &K8sNodeUid,
     roles: &[NodeRole],
-) -> Result<Vec<(NodeId, Option<bool>)>, sqlx::Error> {
-    sqlx::query_as(sql!(
+) -> Result<Vec<(NodeId, Option<bool>)>, DbError> {
+    Ok(sqlx::query_as(sql!(
         "SELECT n.id, k.k8s_node_uid = $2
          FROM nodes n JOIN node_k8s k ON k.node_id = n.id
          WHERE k.k8s_node_name = $1
@@ -117,8 +119,8 @@ pub async fn nodes_for_identity(
     .bind(uid.as_str())
     .bind(SubstrateKind::Kubernetes)
     .bind(roles.iter().map(|role| role.as_str()).collect::<Vec<_>>())
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 #[cfg(test)]

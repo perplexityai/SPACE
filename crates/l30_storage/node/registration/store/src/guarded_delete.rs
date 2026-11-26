@@ -15,9 +15,9 @@ use std::sync::LazyLock;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_residency::{node_heartbeat_fresh, node_unreferenced};
 use pplx_space_sql_locator::sql;
-use sqlx::{Postgres, Transaction};
 
 /// `$1` = node id.
 static HEARTBEAT_FRESH: LazyLock<String> = LazyLock::new(|| {
@@ -27,15 +27,18 @@ static HEARTBEAT_FRESH: LazyLock<String> = LazyLock::new(|| {
 
 /// Whether `node_id`'s heartbeat is fresh
 /// ([`pplx_space_sandbox_residency::node_heartbeat_fresh`]), on the database
-/// clock of the caller's transaction.
-pub async fn heartbeat_fresh(
-    tx: &mut Transaction<'_, Postgres>,
-    node_id: NodeId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sqlx::AssertSqlSafe(HEARTBEAT_FRESH.as_str()))
-        .bind(node_id)
-        .fetch_one(&mut **tx)
-        .await
+/// clock of the caller's transaction. The caller must pass its open
+/// transaction.
+pub async fn heartbeat_fresh<C>(tx: &mut C, node_id: NodeId) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(HEARTBEAT_FRESH.as_str()))
+            .bind(node_id)
+            .fetch_one(tx.into_sqlx())
+            .await?,
+    )
 }
 
 /// `$1` = node id, `$2` = substrate, `$3` = the node's Kubernetes name.
@@ -58,18 +61,21 @@ static DELETE_UNREFERENCED_STALE_NODE: LazyLock<String> = LazyLock::new(|| {
 /// nothing names it under `k8s_node_name` (`None` matches no execution).
 /// Returns whether the row was deleted; its `node_k8s` row cascades. The
 /// caller holds the row lock and has checked the node's identity; a
-/// refusal writes nothing.
-pub async fn delete_unreferenced_stale_node(
-    tx: &mut Transaction<'_, Postgres>,
+/// refusal writes nothing. The caller must pass its open transaction.
+pub async fn delete_unreferenced_stale_node<C>(
+    tx: &mut C,
     node_id: NodeId,
     managed_by: SubstrateKind,
     k8s_node_name: Option<&str>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let deleted = sqlx::query(sqlx::AssertSqlSafe(DELETE_UNREFERENCED_STALE_NODE.as_str()))
         .bind(node_id)
         .bind(managed_by)
         .bind(k8s_node_name)
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?
         .rows_affected();
     Ok(deleted == 1)
