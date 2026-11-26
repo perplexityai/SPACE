@@ -538,9 +538,9 @@ pub async fn run_reconcilers(
         }
         // Joins the credential-fenced encrypted-fields sidecar; same lane
         // rule as the storage sweeper above.
-        let sink = snapshot_retention_sweeper::SnapshotRetentionDbStore::new(
+        let sink = snapshot_retention_sweeper::SnapshotRetentionDbStore::new(Db::from(
             credentials_pool.pool().clone(),
-        );
+        ));
         handles.push(tokio::spawn(snapshot_retention_sweeper::run(
             retention_config,
             sink,

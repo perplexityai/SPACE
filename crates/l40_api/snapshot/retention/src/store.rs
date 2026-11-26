@@ -3,9 +3,9 @@
 
 use pplx_space_sandbox_model::SandboxId;
 
-use pplx_space_sql_locator::sql;
 use std::time::Duration;
 
+use pplx_space_postgres_pool::Db;
 use pplx_space_sandbox_store::fork_source_lifecycle::{
     active_fork_source_operation_exists, lock_fork_source_lifecycle,
 };
@@ -14,13 +14,14 @@ use pplx_space_sandbox_store::snapshot_retention_finalize::lock_owner_marks_snap
 use pplx_space_snapshot_model::SnapshotId;
 use pplx_space_snapshot_store::claimed::{self, ClaimedSnapshot};
 use pplx_space_snapshot_store::retention;
-use pplx_space_snapshot_store::{delete_snapshot_catalog, snapshot_ids_after};
-use sqlx::PgPool;
+use pplx_space_snapshot_store::{
+    DeleteSnapshotCatalogError, delete_snapshot_catalog, snapshot_ids_after,
+};
 use uuid::Uuid;
 
 use super::{
     CandidatePage, ClaimOutcome, ClaimRefusalReason, ClaimedScanEpoch, PruneCandidate,
-    PruneFinalize, RetentionSink, SnapshotStorageLocation,
+    PruneFinalize, RetentionSink, RetentionStoreError, SnapshotStorageLocation,
 };
 
 type PruneCandidateRow = (
@@ -54,16 +55,12 @@ fn claimed_row(row: ClaimedSnapshot) -> PruneCandidateRow {
     )
 }
 
-fn prune_candidate_from_row(row: PruneCandidateRow) -> Result<PruneCandidate, sqlx::Error> {
+fn prune_candidate_from_row(row: PruneCandidateRow) -> Result<PruneCandidate, RetentionStoreError> {
     let (snapshot_id, sandbox_id, location_id, route, encrypted, age_secs) = row;
     let storage_location = match (location_id, route) {
         (None, None) => None,
         (Some(id), Some(route)) => Some(SnapshotStorageLocation::new(id, route, encrypted)),
-        _ => {
-            return Err(sqlx::Error::Protocol(
-                "snapshot retention location projection had mismatched identity and route".into(),
-            ));
-        }
+        _ => return Err(RetentionStoreError::MismatchedLocation),
     };
     Ok(PruneCandidate {
         snapshot_id,
@@ -77,15 +74,15 @@ fn prune_candidate_from_row(row: PruneCandidateRow) -> Result<PruneCandidate, sq
 const RAW_PAGE_SIZE: usize = 10_000;
 
 pub struct SnapshotRetentionDbStore {
-    pool: PgPool,
+    db: Db,
     /// [`RAW_PAGE_SIZE`] outside tests.
     raw_page_size: usize,
 }
 
 impl SnapshotRetentionDbStore {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(db: Db) -> Self {
         Self {
-            pool,
+            db,
             raw_page_size: RAW_PAGE_SIZE,
         }
     }
@@ -93,11 +90,8 @@ impl SnapshotRetentionDbStore {
     /// A store whose discovery reads `raw_page_size` ids a page, so a test can
     /// cross page boundaries without seeding tens of thousands of rows.
     #[cfg(test)]
-    pub fn with_raw_page_size(pool: PgPool, raw_page_size: usize) -> Self {
-        Self {
-            pool,
-            raw_page_size,
-        }
+    pub fn with_raw_page_size(db: Db, raw_page_size: usize) -> Self {
+        Self { db, raw_page_size }
     }
 
     #[cfg(test)]
@@ -105,7 +99,10 @@ impl SnapshotRetentionDbStore {
         &self,
         snapshot_id: SnapshotId,
         keep_n: i64,
-    ) -> Result<ClaimOutcome, sqlx::Error> {
+    ) -> Result<ClaimOutcome, RetentionStoreError> {
+        use pplx_space_postgres_pool::{DbError, Executor as _};
+        use pplx_space_sql_locator::sql;
+
         let (sandbox_id, age_secs): (SandboxId, i64) = sqlx::query_as(sql!(
             "SELECT sandbox_id,
                     EXTRACT(EPOCH FROM (NOW() - timestamp))::BIGINT AS age_secs
@@ -113,8 +110,9 @@ impl SnapshotRetentionDbStore {
               WHERE id = $1"
         ))
         .bind(snapshot_id)
-        .fetch_one(&self.pool)
-        .await?;
+        .fetch_one((&self.db).into_sqlx())
+        .await
+        .map_err(DbError::from)?;
         let storage_location: Option<(Uuid, String, bool)> = sqlx::query_as(sql!(
             "SELECT ssl.id,
                     ssl.storage_connection_string,
@@ -127,8 +125,9 @@ impl SnapshotRetentionDbStore {
               WHERE ssl.snapshot_id = $1"
         ))
         .bind(snapshot_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        .fetch_optional((&self.db).into_sqlx())
+        .await
+        .map_err(DbError::from)?;
         let storage_location = storage_location
             .map(|(id, route, encrypted)| SnapshotStorageLocation::new(id, route, encrypted));
         let candidate = PruneCandidate {
@@ -148,8 +147,8 @@ impl RetentionSink for SnapshotRetentionDbStore {
         limit: i64,
         after: Option<SnapshotId>,
         min_age: Option<Duration>,
-    ) -> Result<CandidatePage, sqlx::Error> {
-        let ids = snapshot_ids_after(&self.pool, after, self.raw_page_size as i64).await?;
+    ) -> Result<CandidatePage, RetentionStoreError> {
+        let ids = snapshot_ids_after(&self.db, after, self.raw_page_size as i64).await?;
         let mut page = CandidatePage {
             scanned_through: ids.last().copied(),
             exhausted: ids.len() < self.raw_page_size,
@@ -201,7 +200,7 @@ impl RetentionSink for SnapshotRetentionDbStore {
         // prevents fleet-wide decorrelated joins for the keyed safety probes.
         // Sibling work still depends on keep-N and usable history within a sandbox.
         // A failed bulk read returns no page, so callers cannot advance its cursor.
-        let rows = retention::candidates(&self.pool, &ids, keep_n, limit, min_age).await?;
+        let rows = retention::candidates(&self.db, &ids, keep_n, limit, min_age).await?;
         page.candidates = rows
             .into_iter()
             .map(|row| prune_candidate_from_row(candidate_row(row)))
@@ -214,8 +213,8 @@ impl RetentionSink for SnapshotRetentionDbStore {
         Ok(page)
     }
 
-    async fn claimed_scan_epoch(&self) -> Result<Option<ClaimedScanEpoch>, sqlx::Error> {
-        let through = claimed::scan_epoch(&self.pool).await?;
+    async fn claimed_scan_epoch(&self) -> Result<Option<ClaimedScanEpoch>, RetentionStoreError> {
+        let through = claimed::scan_epoch(&self.db).await?;
         Ok(through.map(|through| ClaimedScanEpoch { through }))
     }
 
@@ -224,9 +223,9 @@ impl RetentionSink for SnapshotRetentionDbStore {
         limit: i64,
         after: Option<SnapshotId>,
         through: SnapshotId,
-    ) -> Result<Vec<PruneCandidate>, sqlx::Error> {
+    ) -> Result<Vec<PruneCandidate>, RetentionStoreError> {
         // Claims are already de-advertised; page them separately to finish forward.
-        let rows = claimed::list(&self.pool, limit, after, through).await?;
+        let rows = claimed::list(&self.db, limit, after, through).await?;
         rows.into_iter()
             .map(|row| prune_candidate_from_row(claimed_row(row)))
             .collect()
@@ -237,20 +236,20 @@ impl RetentionSink for SnapshotRetentionDbStore {
         candidate: PruneCandidate,
         keep_n: i64,
         min_age: Option<Duration>,
-    ) -> Result<ClaimOutcome, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+    ) -> Result<ClaimOutcome, RetentionStoreError> {
+        let mut tx = self.db.begin().await?;
 
         // Fork admission, source deletion, and retention all acquire this
         // advisory lock before the sandbox row lock. Once held, no queued or
         // running fork can freeze or consume this source while its snapshot
         // set is being changed.
-        lock_fork_source_lifecycle(&mut *tx, candidate.sandbox_id).await?;
+        lock_fork_source_lifecycle(&mut tx, candidate.sandbox_id).await?;
 
         // Serialize marker/restore writers and sibling claims. Revalidate in
         // a later statement so READ COMMITTED observes a writer that committed
         // while this transaction waited for the sandbox lock.
         let locked = snapshot_retention_claim::lock_snapshot_owner(
-            &mut *tx,
+            &mut tx,
             candidate.snapshot_id,
             candidate.sandbox_id,
         )
@@ -262,7 +261,7 @@ impl RetentionSink for SnapshotRetentionDbStore {
             ));
         }
 
-        if active_fork_source_operation_exists(&mut *tx, candidate.sandbox_id).await? {
+        if active_fork_source_operation_exists(&mut tx, candidate.sandbox_id).await? {
             tx.rollback().await?;
             return Ok(ClaimOutcome::Refused(ClaimRefusalReason::ActiveForkSource));
         }
@@ -271,7 +270,7 @@ impl RetentionSink for SnapshotRetentionDbStore {
         // makes a concurrent insert take a conflicting parent key lock, so the
         // optional location below cannot change through commit.
         let state: Option<String> = retention::lock_sandbox_snapshot_state(
-            &mut *tx,
+            &mut tx,
             candidate.snapshot_id,
             candidate.sandbox_id,
         )
@@ -287,7 +286,7 @@ impl RetentionSink for SnapshotRetentionDbStore {
         }
 
         let storage_location =
-            retention::lock_usable_storage_location(&mut *tx, candidate.snapshot_id).await?;
+            retention::lock_usable_storage_location(&mut tx, candidate.snapshot_id).await?;
         let storage_location = storage_location.map(|location| {
             SnapshotStorageLocation::new(
                 location.id,
@@ -313,7 +312,7 @@ impl RetentionSink for SnapshotRetentionDbStore {
 
         // `floor_ok` is also what keeps unswept rows unclaimed: a `disk` row of
         // any origin but `stop` fails it and is refused as `KeepNFloor`.
-        let safe = retention::claim_safety(&mut *tx, candidate.snapshot_id, keep_n, min_age)
+        let safe = retention::claim_safety(&mut tx, candidate.snapshot_id, keep_n, min_age)
             .await?
             .map(|safe| (safe.floor_ok, safe.restore_source_ok, safe.age_ok));
         // Report the first failing predicate, without another read or changing
@@ -330,15 +329,7 @@ impl RetentionSink for SnapshotRetentionDbStore {
             return Ok(ClaimOutcome::Refused(reason));
         }
 
-        let claimed = sqlx::query(sql!(
-            "UPDATE snapshots SET state = 'deleting' WHERE id = $1 AND state = 'ready'"
-        ))
-        .bind(candidate.snapshot_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-            == 1;
-        if !claimed {
+        if !retention::claim(&mut tx, candidate.snapshot_id).await? {
             tx.rollback().await?;
             return Ok(ClaimOutcome::Refused(ClaimRefusalReason::ConditionalUpdate));
         }
@@ -351,8 +342,8 @@ impl RetentionSink for SnapshotRetentionDbStore {
         &self,
         snapshot_id: SnapshotId,
         keep_n: i64,
-    ) -> Result<PruneFinalize, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+    ) -> Result<PruneFinalize, RetentionStoreError> {
+        let mut tx = self.db.begin().await?;
 
         // Lock the owning sandbox row *first*, before the snapshot row.
         //
@@ -402,7 +393,7 @@ impl RetentionSink for SnapshotRetentionDbStore {
         // `unwrap_or(false)` further down would read as "unknown means not
         // pinned", which is the wrong default for a data-loss signal even
         // when the branch is provably dead.
-        let Some(is_pinned) = lock_owner_marks_snapshot(&mut *tx, snapshot_id).await? else {
+        let Some(is_pinned) = lock_owner_marks_snapshot(&mut tx, snapshot_id).await? else {
             tx.rollback().await?;
             return Ok(PruneFinalize::AlreadyGone);
         };
@@ -412,7 +403,7 @@ impl RetentionSink for SnapshotRetentionDbStore {
         // `claim_prune`, but the store enforces that protocol boundary too:
         // deleting an advertised `ready` row here would make PostgreSQL
         // promise bytes the reaper may already have removed.
-        let locked: Option<String> = retention::lock_snapshot_state(&mut *tx, snapshot_id).await?;
+        let locked: Option<String> = retention::lock_snapshot_state(&mut tx, snapshot_id).await?;
         let Some(state) = locked else {
             tx.rollback().await?;
             return Ok(PruneFinalize::AlreadyGone);
@@ -427,14 +418,16 @@ impl RetentionSink for SnapshotRetentionDbStore {
         // at the configured floor while the hot sandbox lock is held.
         // It is not a gate: bytes are already gone, so drift is reported and
         // the unrestorable row still finishes forward.
-        let floor_ok = retention::floor_holds(&mut *tx, snapshot_id, keep_n).await?;
+        let floor_ok = retention::floor_holds(&mut tx, snapshot_id, keep_n).await?;
 
         // Delete storage locations first (the FK on snapshot_id is
         // RESTRICT, so the snapshot delete would fail otherwise), then
         // the snapshot row. Unconditional: we hold the row lock and have
         // already reaped its blobs.
 
-        delete_snapshot_catalog(&mut *tx, snapshot_id).await?;
+        delete_snapshot_catalog(&mut tx, snapshot_id)
+            .await
+            .map_err(|DeleteSnapshotCatalogError::Database(source)| source)?;
 
         tx.commit().await?;
         Ok(PruneFinalize::Pruned {

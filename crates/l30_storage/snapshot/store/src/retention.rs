@@ -1,11 +1,11 @@
-//! Retention's discovery read, and the locks and re-checks its claim and
-//! finalize take on a snapshot.
+//! Retention's discovery read, the locks and re-checks its claim and
+//! finalize take on a snapshot, and the claim's `ready -> deleting` update.
 //!
 //! A usable storage location is one with `orphaned_at IS NULL`; every
-//! statement here that reads a location spells that out. The claim's
-//! `ready -> deleting` update stays with the retention workflow (see the
-//! crate docs); finalize deletes the snapshot and its optional location
-//! through [`crate::delete_snapshot_catalog`].
+//! statement here that reads a location spells that out. The retention
+//! workflow keeps the claim's transaction, its locks and re-checks, and what
+//! each outcome means (see the crate docs); finalize deletes the snapshot and
+//! its optional location through [`crate::delete_snapshot_catalog`].
 
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -317,3 +317,29 @@ pub async fn floor_holds(
     .fetch_one(executor.into_sqlx())
     .await?)
 }
+
+/// Claim `ready` snapshot `snapshot_id` for deletion: `ready -> deleting`.
+/// Returns whether it was claimed; `false` when it is no longer `ready`, or
+/// gone.
+///
+/// The last step of the claim, after its locks and [`claim_safety`]: those
+/// decide whether the snapshot may be claimed, and this guard only refuses a
+/// row that left `ready` anyway.
+///
+/// The caller must pass its open transaction.
+pub async fn claim<C>(tx: &mut C, snapshot_id: SnapshotId) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query(sql!(
+        "UPDATE snapshots SET state = 'deleting' WHERE id = $1 AND state = 'ready'"
+    ))
+    .bind(snapshot_id)
+    .execute(tx.into_sqlx())
+    .await?
+    .rows_affected()
+        == 1)
+}
+
+#[cfg(test)]
+mod tests;
