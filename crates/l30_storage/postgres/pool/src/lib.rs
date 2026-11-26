@@ -41,7 +41,7 @@ pub(crate) const SPACE_DB_USER_PASSWORD_ENV: &str = "SPACE_DB_USER_PASSWORD";
 pub(crate) const SPACE_DB_CREDS_PASSWORD_ENV: &str = "SPACE_DB_CREDS_PASSWORD";
 
 pub use identity::{
-    CredentialsPool, SidelineOptions, connect_space_user_pool, connect_space_user_pool_lazy,
+    CredentialsPool, SidelineOptions, connect_space_user_pool_lazy,
     connect_space_user_sideline_pool_lazy,
 };
 
@@ -113,34 +113,6 @@ fn service_connect_options(
         database_connect_options(database_url, application_name, identity, password)?
             .log_statements(QUERY_EVENT_LEVEL),
     )
-}
-
-/// Connect a managed Postgres identity with the shared pool configuration
-/// [`connect_postgres_lazy_as`] documents, opening a connection before it
-/// returns.
-///
-/// Every statement emits a query-completion event; see
-/// [`QUERY_EVENT_LEVEL`].
-pub(crate) async fn connect_postgres_as(
-    database_url: &str,
-    application_name: &str,
-    identity: DatabaseIdentity,
-    password: &str,
-) -> Result<PgPool, ConnectPostgresAsError> {
-    let options = service_connect_options(database_url, application_name, identity, password)?;
-    postgres_pool_options(identity)
-        .connect_with(options)
-        .await
-        .map_err(ConnectPostgresAsError::Connect)
-}
-
-/// Connecting a managed Postgres identity failed.
-#[derive(Debug, thiserror::Error)]
-pub enum ConnectPostgresAsError {
-    #[error(transparent)]
-    Options(#[from] DatabaseConnectOptionsError),
-    #[error("failed to connect Postgres pool")]
-    Connect(#[source] sqlx::Error),
 }
 
 /// Prepare a managed Postgres identity pool without waiting for a connection.
