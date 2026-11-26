@@ -96,6 +96,12 @@ impl From<sqlx::Error> for IdentityAdminError {
     }
 }
 
+impl From<pplx_space_postgres_pool::DbError> for IdentityAdminError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 impl IdentityAdminError {
     const fn status(&self) -> StatusCode {
         match self {

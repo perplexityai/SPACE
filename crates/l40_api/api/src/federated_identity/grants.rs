@@ -19,7 +19,7 @@ pub(crate) async fn upsert_sandbox_federated_service_grant(
     grant_purpose: &str,
 ) -> Result<(), FederatedGrantStoreError> {
     pplx_space_federated_grant_store::upsert_sandbox_federated_service_grant(
-        pool,
+        &pplx_space_postgres_pool::Db::from(pool.clone()),
         sandbox_id,
         owner_ref(owner),
         grant_ref(grant),
@@ -38,7 +38,7 @@ pub(crate) async fn upsert_sandbox_federated_service_grant_tx(
     grant_purpose: &str,
 ) -> Result<(), FederatedGrantStoreError> {
     pplx_space_federated_grant_store::upsert_sandbox_federated_service_grant_tx(
-        tx,
+        &mut **tx,
         sandbox_id,
         owner_ref(owner),
         grant_ref(grant),

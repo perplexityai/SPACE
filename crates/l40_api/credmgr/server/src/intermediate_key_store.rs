@@ -30,6 +30,6 @@ impl WrappedIntermediateKeyStore for PgWrappedIntermediateKeyStore {
         // both rows to the asserted org so a cross-org claim reads as absent.
         pplx_space_byok_store::branching_key(&self.pool, org, key_id)
             .await
-            .map_err(WrappedKeyStoreError::Lookup)
+            .map_err(|error| WrappedKeyStoreError::Lookup(sqlx::Error::from(error)))
     }
 }

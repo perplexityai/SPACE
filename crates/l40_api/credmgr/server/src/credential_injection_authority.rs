@@ -268,7 +268,7 @@ pub(crate) enum BundleResolutionError {
 impl From<ResolutionStateError> for BundleResolutionError {
     fn from(error: ResolutionStateError) -> Self {
         match error {
-            ResolutionStateError::Query(error) => Self::StateUnavailable(error),
+            ResolutionStateError::Query(error) => Self::StateUnavailable(sqlx::Error::from(error)),
             ResolutionStateError::InvalidData(message) => Self::InvalidState(message),
         }
     }

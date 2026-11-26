@@ -37,6 +37,12 @@ pub enum VolumeWrapStoreError {
     Query(#[from] sqlx::Error),
 }
 
+impl From<pplx_space_postgres_pool::DbError> for VolumeWrapStoreError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 /// Read and first-writer-wins persistence of per-sandbox volume DEK wraps. A
 /// trait so the service handler can be exercised without a live Postgres.
 #[tonic::async_trait]

@@ -5395,6 +5395,7 @@ dependencies = [
  "pplx-space-accounts",
  "pplx-space-byok-model",
  "pplx-space-db-test-fixtures",
+ "pplx-space-postgres-pool",
  "pplx-space-sandbox-model",
  "pplx-space-sql-locator",
  "sqlx",
@@ -5733,6 +5734,7 @@ dependencies = [
  "pplx-space-db-test-fixtures",
  "pplx-space-k8s-ids",
  "pplx-space-net-common",
+ "pplx-space-postgres-pool",
  "pplx-space-sandbox-model",
  "pplx-space-sql-locator",
  "serde",
@@ -6234,6 +6236,7 @@ name = "pplx-space-federated-grant-store"
 version = "0.8.2"
 dependencies = [
  "pplx-space-accounts",
+ "pplx-space-postgres-pool",
  "pplx-space-sandbox-model",
  "pplx-space-sql-locator",
  "sqlx",
@@ -8960,6 +8963,7 @@ name = "pplx-space-storage-vend-store"
 version = "0.8.2"
 dependencies = [
  "pplx-space-accounts",
+ "pplx-space-postgres-pool",
  "pplx-space-sql-locator",
  "sqlx",
 ]
