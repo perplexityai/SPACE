@@ -14,12 +14,13 @@
 //! become a single point of failure on the create path.
 
 use std::future::Future;
+use std::num::NonZeroU64;
 use std::time::Duration;
 
 use pplx_space_env_vars::{env_flag_var, parse_positive_f64_env, valid_positive_f64};
 use pplx_space_feature_flags::{Attributes, FeatureFlagClient, SPACE_CLUSTER_RATE_LIMITER_FLAG};
 use pplx_space_sandbox_metrics::admission::{
-    AdmissionDecision, AdmissionOperationClass, AdmissionRejectReason,
+    AdmissionDecision, AdmissionOperationClass, AdmissionRejectReason, ClusterUnscheduledPodBacklog,
 };
 use rand::RngExt as _;
 use tokio_util::sync::CancellationToken;
@@ -28,7 +29,7 @@ use crate::client_live_cap::{ClientLiveCap, ClientLiveCapConfig, LiveCapRefusal}
 use crate::controllers::substrate::{
     ActivationAdmission, ActivationAdmissionClass, ActivationAdmissionFuture,
     ActivationAdmissionRejection, ActivationRejectionKind, GATEWAY_RETRY_AFTER, LiveCapFuture,
-    NetworkSlotHeadroom, Substrate,
+    NetworkSlotHeadroom, Substrate, UnscheduledPodBacklog, UnscheduledPodBacklogUnknown,
 };
 use pplx_space_accounts::ClientId;
 use pplx_space_sandbox_model::SandboxId;
@@ -48,6 +49,10 @@ const DEFAULT_ENABLED: bool = true;
 const ENABLED_ENV: &str = "SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED";
 const DEFAULT_SLOT_CHECK_ENABLED: bool = false;
 const SLOT_CHECK_ENABLED_ENV: &str = "SPACE_CLUSTER_ACTIVATION_ADMISSION_SLOT_CHECK_ENABLED";
+const MAX_UNSCHEDULED_PODS_ENV: &str = "SPACE_CLUSTER_ACTIVATION_ADMISSION_MAX_UNSCHEDULED_PODS";
+const DEFAULT_UNSCHEDULED_POD_MAX_STALE: Duration = Duration::from_secs(30);
+const UNSCHEDULED_POD_MAX_STALE_SECS_ENV: &str =
+    "SPACE_CLUSTER_ACTIVATION_ADMISSION_UNSCHEDULED_POD_MAX_STALE_SECS";
 /// Test-only: smoke runs shrink the bucket so a short probe can drain it.
 const BURST_ENV: &str = "SPACE_CLUSTER_ACTIVATION_ADMISSION_BURST";
 const REFILL_RPS_ENV: &str = "SPACE_CLUSTER_ACTIVATION_ADMISSION_REFILL_RPS";
@@ -181,6 +186,16 @@ pub struct ClusterSandboxAdmissionConfig {
     /// network slot. Off by default, and independent of `enabled`: it runs
     /// with the limiter off too.
     pub slot_check_enabled: bool,
+    /// Refuse a cold create with a 503 when unscheduled sandbox pods waiting on
+    /// `kube-scheduler` reach or exceed this ceiling. `None` (default; unset or
+    /// `0`) disables the gate. Independent of `enabled`, like
+    /// `slot_check_enabled`.
+    pub max_unscheduled_pods: Option<NonZeroU64>,
+    /// How long a stale reflector snapshot at or above `max_unscheduled_pods`
+    /// keeps rejecting cold creates across a watch error or re-list before
+    /// failing open. `None` (`0` in env) disables the stale hold so any stale
+    /// watch fails open immediately.
+    pub unscheduled_pod_max_stale: Option<Duration>,
 }
 
 impl Default for ClusterSandboxAdmissionConfig {
@@ -191,6 +206,8 @@ impl Default for ClusterSandboxAdmissionConfig {
             burst: DEFAULT_BURST,
             redis_url: None,
             slot_check_enabled: DEFAULT_SLOT_CHECK_ENABLED,
+            max_unscheduled_pods: None,
+            unscheduled_pod_max_stale: Some(DEFAULT_UNSCHEDULED_POD_MAX_STALE),
         }
     }
 }
@@ -210,6 +227,64 @@ impl ClusterSandboxAdmissionConfig {
                 .map(|url| url.trim().to_string())
                 .filter(|url| !url.is_empty()),
             slot_check_enabled: env_flag_var(SLOT_CHECK_ENABLED_ENV, defaults.slot_check_enabled),
+            max_unscheduled_pods: parse_optional_nonzero_u64_env(MAX_UNSCHEDULED_PODS_ENV),
+            unscheduled_pod_max_stale: parse_optional_duration_secs_env(
+                UNSCHEDULED_POD_MAX_STALE_SECS_ENV,
+                defaults.unscheduled_pod_max_stale,
+            ),
+        }
+    }
+}
+
+fn parse_optional_nonzero_u64_env(name: &str) -> Option<NonZeroU64> {
+    let raw = std::env::var(name).ok()?;
+    parse_optional_nonzero_u64(name, &raw)
+}
+
+fn parse_optional_nonzero_u64(name: &str, raw: &str) -> Option<NonZeroU64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.parse::<u64>() {
+        Ok(value) => NonZeroU64::new(value),
+        Err(error) => {
+            tracing::warn!(
+                var = name,
+                %error,
+                "invalid cluster admission cap; leaving it unset"
+            );
+            None
+        }
+    }
+}
+
+fn parse_optional_duration_secs_env(name: &str, default: Option<Duration>) -> Option<Duration> {
+    let Some(raw) = std::env::var(name).ok() else {
+        return default;
+    };
+    parse_optional_duration_secs(name, &raw, default)
+}
+
+fn parse_optional_duration_secs(
+    name: &str,
+    raw: &str,
+    default: Option<Duration>,
+) -> Option<Duration> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return default;
+    }
+    match trimmed.parse::<u64>() {
+        Ok(0) => None,
+        Ok(secs) => Some(Duration::from_secs(secs)),
+        Err(error) => {
+            tracing::warn!(
+                var = name,
+                %error,
+                "invalid cluster admission duration; using default"
+            );
+            default
         }
     }
 }
@@ -398,7 +473,9 @@ impl ClusterSandboxAdmission {
     /// disk is on, and a `created` one may already have a pod, so neither
     /// comes here. With the slot check on, it also rejects as
     /// [`ActivationRejectionKind::NoFreeSlot`] when no start-eligible node has a
-    /// free network slot.
+    /// free network slot; with `max_unscheduled_pods` set, it rejects as
+    /// [`ActivationRejectionKind::UnscheduledPodBacklog`] when unscheduled
+    /// sandbox pods reach that ceiling.
     pub async fn admit_cold_create(&self) -> Result<(), ClusterAdmissionError> {
         self.admit_with_slot_check(ClusterActivationClass::Cold, true)
             .await
@@ -407,7 +484,7 @@ impl ClusterSandboxAdmission {
     async fn admit_with_slot_check(
         &self,
         class: ClusterActivationClass,
-        slot_check: bool,
+        cold_create: bool,
     ) -> Result<(), ClusterAdmissionError> {
         // `false` means admission is disabled or a capacity probe failed —
         // already metered inside `prepare_activation_admission`, which admits
@@ -417,7 +494,7 @@ impl ClusterSandboxAdmission {
             &self.config,
             self.admission_enabled(),
             class,
-            slot_check && self.config.slot_check_enabled,
+            cold_create,
         )
         .await?
         {
@@ -569,19 +646,22 @@ fn build_bucket(url: Option<&str>) -> Option<RedisTokenBucket> {
 /// bucket, and `Ok(false)` when the activation is admitted open without the
 /// bucket (limiter disabled, or a fail-open capacity-probe error) — the
 /// fail-open decision metric is already emitted here in that case. Returns
-/// an `EmptyCluster` rejection only on a confident empty cluster, and a
-/// `NoFreeSlot` one only on a confident full one.
+/// an `EmptyCluster` rejection only on a confident empty cluster, a
+/// `NoFreeSlot` one only on a confident full one, and an
+/// `UnscheduledPodBacklog` one only when unscheduled pods reach the configured
+/// ceiling (or remain within the bounded stale-hold window of an active trip).
 ///
 /// The limiter's own gates, the empty-cluster guard (which reads its refill
-/// rate) and the bucket, run only while it's `enabled`. The slot check runs on
-/// its own switch, so it still applies with the limiter off or after a failed
-/// node-count probe; those fail open only the limiter's gates.
+/// rate) and the bucket, run only while it's `enabled`. The cold-create
+/// capacity checks (`slot_check_enabled` and `max_unscheduled_pods`) run on
+/// their own switches, so they still apply with the limiter off or after a
+/// failed node-count probe; those fail open only the limiter's gates.
 async fn prepare_activation_admission(
     substrate: &Substrate,
     config: &ClusterSandboxAdmissionConfig,
     enabled: bool,
     class: ClusterActivationClass,
-    slot_check: bool,
+    cold_create: bool,
 ) -> Result<bool, ClusterAdmissionError> {
     let fail_open = if enabled {
         limiter_gates(substrate, config, class).await?
@@ -589,12 +669,21 @@ async fn prepare_activation_admission(
         Some(AdmissionRejectReason::Disabled)
     };
 
-    if slot_check {
+    if cold_create && config.slot_check_enabled {
         check_network_slot_headroom(substrate, class)?;
     }
 
-    // Metered after the slot check, so a refusal there isn't also counted as
-    // an admission.
+    if cold_create && let Some(max_unscheduled_pods) = config.max_unscheduled_pods {
+        check_unscheduled_pod_backlog(
+            substrate,
+            class,
+            max_unscheduled_pods,
+            config.unscheduled_pod_max_stale,
+        )?;
+    }
+
+    // Metered after the cold-create capacity checks, so a refusal there isn't
+    // also counted as an admission.
     if let Some(reason) = fail_open {
         emit_decision(class, AdmissionDecision::Accepted, reason, None);
         return Ok(false);
@@ -719,6 +808,81 @@ fn check_network_slot_headroom(
             .to_string(),
         // No duration signal here either: slots free as sandboxes stop, which
         // the server can't predict. Same window as the empty-cluster guard.
+        retry_after: capacity_retry_after(),
+    })
+}
+
+/// The unscheduled-pod backlog circuit breaker: refuse cold creates with
+/// `UnscheduledPodBacklog` (`503` + `Retry-After`) once unscheduled sandbox
+/// pods waiting on `kube-scheduler` reach `max_unscheduled_pods`.
+///
+/// Runs after the empty-cluster and slot-headroom checks and before the shared
+/// token bucket, so a refusal spends no token that warm-pool claims or restores
+/// could use.
+///
+/// Reflector staleness prices both failure modes explicitly:
+///
+/// * If the last complete snapshot was already at or above the ceiling and the
+///   watch has been stalled for at most `max_stale`, keep rejecting
+///   (`OverLimitStale`) so a transient apiserver `LIST`/`WATCH` brownout during
+///   an active scheduling backlog doesn't drop the breaker and flood `POST
+///   pods` back into the overloaded apiserver.
+/// * If the last snapshot was healthy (`< limit`), or `stale_for` exceeds
+///   `max_stale` (or `max_stale` is `None`), fail open (`PodCacheStale`) so a
+///   routine watch reconnect never rejects healthy traffic and a broken watch
+///   after cluster recovery can't wedge cold creates permanently.
+fn check_unscheduled_pod_backlog(
+    substrate: &Substrate,
+    class: ClusterActivationClass,
+    max_unscheduled_pods: NonZeroU64,
+    max_stale: Option<Duration>,
+) -> Result<(), ClusterAdmissionError> {
+    let backlog = substrate.unscheduled_pod_backlog();
+    let limit = max_unscheduled_pods.get();
+    let (metric, reject) = match backlog {
+        UnscheduledPodBacklog::Fresh(count) => {
+            pplx_space_sandbox_metrics::admission::cluster_unscheduled_pods(count);
+            if count >= limit {
+                (ClusterUnscheduledPodBacklog::OverLimit, true)
+            } else {
+                (ClusterUnscheduledPodBacklog::WithinLimit, false)
+            }
+        }
+        UnscheduledPodBacklog::Stale {
+            last_count,
+            stale_for,
+        } => {
+            if last_count >= limit && max_stale.is_some_and(|window| stale_for <= window) {
+                (ClusterUnscheduledPodBacklog::OverLimitStale, true)
+            } else {
+                (ClusterUnscheduledPodBacklog::PodCacheStale, false)
+            }
+        }
+        UnscheduledPodBacklog::Unknown(UnscheduledPodBacklogUnknown::Unsupported) => {
+            (ClusterUnscheduledPodBacklog::Unsupported, false)
+        }
+        UnscheduledPodBacklog::Unknown(UnscheduledPodBacklogUnknown::PodCacheCold) => {
+            (ClusterUnscheduledPodBacklog::PodCacheCold, false)
+        }
+    };
+    pplx_space_sandbox_metrics::admission::cluster_unscheduled_pod_backlog(
+        class.metric_class(),
+        metric,
+    );
+    if !reject {
+        return Ok(());
+    }
+    emit_decision(
+        class,
+        AdmissionDecision::Rejected,
+        AdmissionRejectReason::UnscheduledPodBacklog,
+        None,
+    );
+    Err(ClusterAdmissionError {
+        kind: ActivationRejectionKind::UnscheduledPodBacklog,
+        message: "Server capacity limit: too many sandbox pods are waiting to be \
+                  scheduled. Not specific to your client — retry with backoff."
+            .to_string(),
         retry_after: capacity_retry_after(),
     })
 }
@@ -886,5 +1050,9 @@ fn sanitize_config(config: ClusterSandboxAdmissionConfig) -> ClusterSandboxAdmis
             .unwrap_or(defaults.burst),
         redis_url: config.redis_url,
         slot_check_enabled: config.slot_check_enabled,
+        max_unscheduled_pods: config.max_unscheduled_pods,
+        unscheduled_pod_max_stale: config
+            .unscheduled_pod_max_stale
+            .filter(|duration| !duration.is_zero()),
     }
 }

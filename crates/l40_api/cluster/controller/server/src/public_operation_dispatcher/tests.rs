@@ -61,6 +61,7 @@ fn direct_native_executor(
                 burst: 60.0,
                 redis_url: None,
                 slot_check_enabled: false,
+                ..Default::default()
             },
             FeatureFlagClient::disabled(),
         ),

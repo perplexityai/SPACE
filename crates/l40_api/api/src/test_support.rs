@@ -110,6 +110,9 @@ pub(crate) fn enabled_config() -> ClusterSandboxAdmissionConfig {
         burst: 60.0,
         redis_url: None,
         slot_check_enabled: false,
+        max_unscheduled_pods: None,
+        unscheduled_pod_max_stale: ClusterSandboxAdmissionConfig::default()
+            .unscheduled_pod_max_stale,
     }
 }
 

@@ -174,6 +174,11 @@ fn admission_refusals_keep_their_dispatcher_retry_causes() {
             None,
         ),
         (
+            ActivationRejectionKind::UnscheduledPodBacklog,
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
+        ),
+        (
             ActivationRejectionKind::LiveCap,
             StatusCode::TOO_MANY_REQUESTS,
             None,

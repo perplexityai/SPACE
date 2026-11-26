@@ -275,6 +275,44 @@ async fn actions_and_implicit_wakes_are_not_slot_checked() -> TestResult {
             .await
             .unwrap_or_else(|error| panic!("implicit wake from {lifecycle}: {error:?}"));
     }
+
+    let backlog_admission =
+        std::sync::Arc::new(crate::test_support::kubernetes::unscheduled_backlog_admission(&pool));
+    assert_eq!(
+        backlog_admission
+            .admit_cold_create()
+            .await
+            .expect_err("the fixture's unscheduled-pod backlog is at the ceiling")
+            .kind(),
+        crate::controllers::substrate::ActivationRejectionKind::UnscheduledPodBacklog,
+    );
+    let backlog_controller = SandboxController::with_cluster_admission(
+        kubernetes(
+            crate::controllers::substrate::kubernetes::tests::substrate_with_store(pool.clone()),
+        ),
+        crate::test_support::kubernetes::unscheduled_backlog_admission(&pool),
+    );
+    for action in [SandboxAction::Start, SandboxAction::Wake] {
+        for lifecycle in [
+            None,
+            Some(SandboxLifecycle::Created),
+            Some(SandboxLifecycle::Stopped),
+            Some(SandboxLifecycle::Suspended),
+        ] {
+            backlog_controller
+                .admit_action_cluster_activation(action, lifecycle, SandboxId::new(), &attribution)
+                .await
+                .unwrap_or_else(|error| panic!("backlog {action:?} from {lifecycle:?}: {error:?}"));
+        }
+    }
+    for lifecycle in ["created", "stopped", "suspended"] {
+        let sandbox = crate::controllers::substrate::kubernetes::tests::test_sandbox_with_lifecycle(
+            lifecycle,
+        );
+        super::charge_implicit_activation(Some(&backlog_admission), &sandbox)
+            .await
+            .unwrap_or_else(|error| panic!("backlog implicit wake from {lifecycle}: {error:?}"));
+    }
     Ok(())
 }
 

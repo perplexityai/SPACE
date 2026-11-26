@@ -718,8 +718,8 @@ fn reconnect_error_outcome(
 /// Classify a wake that activation admission refused. The only caller, the
 /// `Wake` / `ImplicitWake` admission check in `SandboxController::action`,
 /// passes what `admit_action_cluster_activation` returns: a live-cap refusal,
-/// or a cluster-activation 429. That check never runs the slot check, so a
-/// `NoFreeSlot` 503 doesn't arrive here.
+/// or a cluster-activation 429. That check never runs the cold-create capacity
+/// gates, so `NoFreeSlot` and `UnscheduledPodBacklog` 503s don't arrive here.
 fn reconnect_admission_refusal_outcome(
     err: &ControllerError,
 ) -> (ReconnectOutcome, ReconnectTerminalPhase, ReconnectReason) {

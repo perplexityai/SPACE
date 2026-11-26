@@ -95,6 +95,7 @@ mod recovery_charge;
 pub mod runtime_upgrade;
 mod sandbox_state_probe;
 mod slot_headroom;
+mod unscheduled_backlog;
 
 pub use execution_fence::*;
 pub use live_count::*;
@@ -104,6 +105,7 @@ pub use pool_claims::*;
 pub use recovery_charge::*;
 pub use sandbox_state_probe::*;
 pub use slot_headroom::*;
+pub use unscheduled_backlog::*;
 
 /// Outcome of a non-recovering guest command-readiness probe.
 ///
@@ -2200,6 +2202,20 @@ impl Substrate {
             }
             #[cfg(feature = "kubernetes")]
             Inner::Kubernetes(substrate) => substrate.network_slot_headroom(),
+        }
+    }
+
+    /// Unscheduled sandbox pods (`spec.nodeName` unset, neither deleting nor
+    /// terminal, and not already marked `PodScheduled=False,
+    /// reason=Unschedulable`) waiting on `kube-scheduler` in the sandbox
+    /// namespace. A cache read: it makes no apiserver or database call.
+    pub fn unscheduled_pod_backlog(&self) -> UnscheduledPodBacklog {
+        match &self.inner {
+            Inner::Direct(_) => {
+                UnscheduledPodBacklog::Unknown(UnscheduledPodBacklogUnknown::Unsupported)
+            }
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => substrate.unscheduled_pod_backlog(),
         }
     }
 

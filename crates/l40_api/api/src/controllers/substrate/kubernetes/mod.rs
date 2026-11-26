@@ -61,6 +61,7 @@ mod restore_dispatch_fence;
 mod restore_waiters;
 mod sandbox_pod_view;
 mod store;
+mod unscheduled_pods;
 
 use budgets::SubstrateBudgets;
 pub use pod_reflector::ReflectorReady;
@@ -891,6 +892,10 @@ pub struct KubernetesSubstrate {
     /// Per-client live sandbox-pod index and reflector freshness, written
     /// from the same reflector events as `pod_store`. Read by the live cap.
     pod_client_index: client_live_pods::ClientLivePods,
+    /// Unscheduled sandbox pods (`spec.nodeName` unset, neither deleting nor
+    /// terminal) fed by the same reflector watch, read in O(1) by cold-create
+    /// cluster admission.
+    pod_unscheduled_index: unscheduled_pods::UnscheduledPods,
     /// Per-pod-name event signaller fed by the same reflector watch. Lets
     /// `read_sandbox_pod` wait briefly for the next reflector update before
     /// falling through to a direct `GET` during the brief window between pod
@@ -990,6 +995,7 @@ impl KubernetesSubstrate {
                     pod_store,
                     pod_network_slots: pod_indexes.network_slots,
                     pod_client_index: pod_indexes.client_pods,
+                    pod_unscheduled_index: pod_indexes.unscheduled_pods,
                     pod_events,
                     pod_reflector_ready,
                     k8s,
@@ -1026,10 +1032,20 @@ impl KubernetesSubstrate {
     }
 
     /// Mark the sandbox-pod watch as failed, as a watch error does, so tests
-    /// can drive the live cap's stale path.
+    /// can drive the live cap's and unscheduled-pod backlog's stale paths.
     #[cfg(test)]
     pub(crate) fn mark_pod_watch_error_for_test(&self) {
         self.pod_client_index.mark_watch_error();
+        self.pod_unscheduled_index.mark_watch_error();
+    }
+
+    /// Backdate a sandbox-pod watch failure to `since` so tests can verify
+    /// both sides of the unscheduled-pod backlog stale-hold window without
+    /// sleeping.
+    #[cfg(test)]
+    pub(crate) fn mark_pod_watch_error_at_for_test(&self, since: std::time::Instant) {
+        self.pod_client_index.mark_watch_error();
+        self.pod_unscheduled_index.mark_watch_error_at(since);
     }
 
     /// Count `ids`'s live sandboxes from the sandbox-pod reflector. See
@@ -1128,6 +1144,13 @@ impl KubernetesSubstrate {
             return NetworkSlotHeadroom::Unknown(NetworkSlotHeadroomUnknown::PodCacheCold);
         }
         adapter::network_slot_headroom(&nodes, &self.pod_network_slots)
+    }
+
+    /// Unscheduled sandbox pods waiting on `kube-scheduler` in the sandbox
+    /// namespace, from the sandbox-pod reflector index.
+    pub fn unscheduled_pod_backlog(&self) -> super::UnscheduledPodBacklog {
+        self.pod_unscheduled_index
+            .count(self.pod_reflector_ready.is_ready())
     }
 
     /// Source-aware restore shortlist: the source node first, then up to

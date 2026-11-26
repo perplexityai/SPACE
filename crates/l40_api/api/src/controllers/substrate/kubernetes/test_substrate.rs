@@ -162,6 +162,7 @@ pub(super) fn assemble_substrate(
         pod_store,
         pod_network_slots: pod_indexes.network_slots,
         pod_client_index: pod_indexes.client_pods,
+        pod_unscheduled_index: pod_indexes.unscheduled_pods,
         pod_events: pod_reflector::PodEvents::for_test(),
         pod_reflector_ready: ReflectorReady::always_ready(),
         cancel_tracker: Arc::new(CancelRateTracker::with_budget(64)),
