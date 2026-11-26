@@ -926,7 +926,8 @@ node_facet_conditions = ["pplx-space-sandbox-store"]
 # Pruning a node's absent sandboxes deletes their facet rows in one statement.
 # Temporary: the prune calls sandbox-teardown for those rows.
 # node-template-inventory-store: the absent-template prune deletes the
-# network-policy rows of the templates whose builds it deletes, in the same
+# network-policy rows of the templates whose builds it deletes and which the
+# publication doesn't list with a network-policy generation, in the same
 # statement as their inventory rows. Temporary: it goes when the statement
 # splits into one verb per store, once a split is proven equivalent or a
 # per-node publication lock orders the prune against node-ctl's concurrent

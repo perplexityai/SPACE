@@ -6,7 +6,8 @@
 //! its components and deletes the templates a node reports absent here. A
 //! complete publication's prune ([`prune_absent_templates`]) also deletes, in
 //! the same statement, the node's `network-policy` rows in
-//! `node_facet_observed_status` for the templates whose builds it deletes, a
+//! `node_facet_observed_status` for the templates whose builds it deletes and
+//! which the publication doesn't list with a network-policy generation, a
 //! table this store writes under a temporary co-writer grant. The admin
 //! node-template routes delete one node's cached copies and list them;
 //! template admin and public routes, and the release lookups, read what

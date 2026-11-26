@@ -368,9 +368,12 @@ pub async fn upsert_published_template_components(
 /// is not among `present_keys`, the builds a complete publication lists
 /// (every row of the node when it is empty), and in the same statement the
 /// node's `network-policy` rows in `node_facet_observed_status` whose
-/// element is `template:<name>` for a template that lost a row. Their
-/// `node_template_components` and `node_facet_conditions` rows go with
-/// them (`ON DELETE CASCADE`).
+/// element is `template:<name>` for a template that lost a row and is not
+/// among `policy_templates`, the templates the publication lists with a
+/// network-policy generation. A template listed with one keeps its row,
+/// which the publication's own upsert writes for every template it accepts. Their
+/// `node_template_components` and `node_facet_conditions` rows go with them
+/// (`ON DELETE CASCADE`).
 ///
 /// `node_facet_observed_status` is sandbox-teardown's table, which this
 /// statement writes under a temporary co-writer grant: the two deletes stay
@@ -379,6 +382,7 @@ pub async fn prune_absent_templates(
     executor: impl Executor<'_>,
     node_id: NodeId,
     present_keys: &[(String, String)],
+    policy_templates: &[String],
 ) -> Result<(), DbError> {
     let templates = present_keys
         .iter()
@@ -404,9 +408,18 @@ pub async fn prune_absent_templates(
                )
              RETURNING nti.template_name
          ),
+         with_policy AS (
+             SELECT *
+             FROM UNNEST($5::TEXT[]) AS with_policy(template_name)
+         ),
          removed_elements AS (
-             SELECT DISTINCT 'template:' || template_name AS element
+             SELECT DISTINCT 'template:' || removed.template_name AS element
              FROM removed
+             WHERE NOT EXISTS (
+                 SELECT 1
+                 FROM with_policy
+                 WHERE with_policy.template_name = removed.template_name
+             )
          )
          DELETE FROM node_facet_observed_status nfos
          USING removed_elements
@@ -418,6 +431,7 @@ pub async fn prune_absent_templates(
     .bind(templates)
     .bind(content_hashes)
     .bind(FACET_NETWORK_POLICY)
+    .bind(policy_templates)
     .execute(executor.into_sqlx())
     .await?;
     Ok(())
