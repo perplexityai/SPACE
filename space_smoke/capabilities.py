@@ -532,6 +532,34 @@ class LimiterProbeOutcome:
     finished_at: float
 
 
+@dataclass(frozen=True)
+class SandboxNodeSlots:
+    """One sandbox-pool node's advertised network slots and bound sandbox pods.
+
+    `capacity` reads `status.capacity["space.pplx.net/network-slots"]` and
+    `allocatable` reads `status.allocatable["space.pplx.net/network-slots"]`
+    without falling back to `capacity`. `used` counts non-terminating sandbox
+    pods bound to the node; `terminating` counts deleting ones whose slot
+    request kube-scheduler still charges until the pod is gone.
+    """
+
+    capacity: int
+    allocatable: int
+    used: int
+    terminating: int
+
+
+@dataclass(frozen=True)
+class OccupiedNetworkSlot:
+    """One worker `network_slots` row that would block shrinking `max_slots` below it."""
+
+    slot_id: int
+    state: str
+    health: str
+    sandbox_id: str | None
+    owned: bool
+
+
 class RateLimitProbe(Protocol):
     """Raw ECW control-plane requests for one client id, plus their cleanup.
 
@@ -553,10 +581,17 @@ class RateLimitProbe(Protocol):
     ) -> LimiterProbeOutcome: ...
 
     def kill_matching(
-        self, metadata: Mapping[str, str], *, scan_whole_window: bool = False
+        self,
+        metadata: Mapping[str, str],
+        *,
+        scan_whole_window: bool = False,
+        deadline: float | None = None,
     ) -> None:
         """Kill the run's matching sandboxes; `scan_whole_window` keeps polling
-        after a match, for several creates of unknown outcome."""
+        after a match, for several creates of unknown outcome. `deadline` (a
+        `time.monotonic()` value) bounds every list and DELETE by the time
+        left and stops at the first match, so it can't be combined with
+        `scan_whole_window`."""
         ...
 
     def kill_sandbox(self, sandbox_id: str) -> None:
@@ -627,6 +662,53 @@ class RateLimiterControl(Protocol):
 
     def live_client_sandboxes(self, client_id: str) -> list[str]:
         """The client's live sandboxes, counted the way the live cap counts them."""
+        ...
+
+    def sandbox_node_slots(self) -> dict[str, SandboxNodeSlots]:
+        """Per sandbox-pool node: advertised and allocatable network slots and bound sandbox pods."""
+        ...
+
+    def acquire_worker_network_slots_mutation(self) -> Callable[[], None]: ...
+
+    def worker_network_pool_max_slots_env(self) -> str | None:
+        """The standing `SPACE_NODEMGR_NETWORK_POOL_MAX_SLOTS` literal on worker `node-manager`."""
+        ...
+
+    def set_worker_network_pool_max_slots_env(
+        self,
+        value: str | None,
+        *,
+        record: tuple[str | None, Mapping[str, int]] | None = None,
+        rollout_timeout: float = 300,
+        shared_deadline: bool = False,
+    ) -> None:
+        """Set or unset worker `SPACE_NODEMGR_NETWORK_POOL_MAX_SLOTS` under the held Leases."""
+        ...
+
+    def restore_worker_network_pool_max_slots_env(
+        self,
+        standing_env: str | None,
+        standing_capacities: Mapping[str, int],
+        *,
+        rollout_timeout: float = 300,
+        settle_timeout: float = 120,
+        shared_deadline: bool = False,
+    ) -> None:
+        """Restore `SPACE_NODEMGR_NETWORK_POOL_MAX_SLOTS`, await standing node capacities, and clear record."""
+        ...
+
+    def publish_node_ctl_facet(self, node_name: str, facet: str) -> str | None:
+        """Have node-ctl on `node_name` publish an outbound facet now; None on success."""
+        ...
+
+    def occupied_worker_network_slots_at_or_above(
+        self, min_slot_id: int
+    ) -> dict[str, tuple[OccupiedNetworkSlot, ...]]:
+        """Per sandbox worker node: `network_slots` rows at or above `min_slot_id` that block a shrink."""
+        ...
+
+    def unbound_sandbox_pods(self) -> list[str]:
+        """User sandbox pods no node has been bound to yet."""
         ...
 
     def redis_replicas(self) -> int:
@@ -1494,6 +1576,7 @@ class EcwSandboxes(Protocol):
         attempts: int = 10,
         interval_seconds: float = 1.0,
         scan_whole_window: bool = False,
+        deadline: float | None = None,
     ) -> None: ...
 
     def list_pages(

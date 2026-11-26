@@ -164,7 +164,10 @@ class _Probe:
         if self._kill_sandbox_error is not None:
             raise self._kill_sandbox_error
 
-    def kill_matching(self, metadata, *, scan_whole_window: bool = False) -> None:
+    def kill_matching(
+        self, metadata, *, scan_whole_window: bool = False, deadline: float | None = None
+    ) -> None:
+        del deadline
         self.kills += 1
         self.whole_window_scans.append(scan_whole_window)
         raise self._kill_error or EcwSandboxReconcileUnmatched(
