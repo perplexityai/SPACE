@@ -16,6 +16,7 @@
 //! in each statement, so it compares against that executor's clock.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use sqlx::FromRow;
 use time::OffsetDateTime;
@@ -38,13 +39,13 @@ pub struct ClaimedReconcileRef {
 /// with it, and inside a caller's transaction they last until that
 /// transaction ends.
 pub async fn claim_node_refs(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     limit: i64,
     stale_secs: i64,
     claim_token: &str,
-) -> Result<Vec<ClaimedReconcileRef>, sqlx::Error> {
-    sqlx::query_as::<_, ClaimedReconcileRef>(sql!(
+) -> Result<Vec<ClaimedReconcileRef>, DbError> {
+    Ok(sqlx::query_as::<_, ClaimedReconcileRef>(sql!(
         "WITH picked AS (
              SELECT node_id, facet, element, requested_at
              FROM node_reconcile_queue
@@ -77,20 +78,20 @@ pub async fn claim_node_refs(
     .bind(limit)
     .bind(stale_secs)
     .bind(claim_token)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Guarded transition: delete `node_id`'s `(facet, element)` ref (`None`,
 /// the whole-facet ref) once applied, while `claim_token` holds it and no
 /// enqueue has refreshed it since the claim. Returns the rows deleted.
 pub async fn complete_claimed_ref(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     facet: &str,
     element: Option<&str>,
     claim_token: &str,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let result = sqlx::query(sql!(
         "DELETE FROM node_reconcile_queue
          WHERE node_id = $1
@@ -103,7 +104,7 @@ pub async fn complete_claimed_ref(
     .bind(facet)
     .bind(element)
     .bind(claim_token)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected())
 }
@@ -113,12 +114,12 @@ pub async fn complete_claimed_ref(
 /// completing transition it matches only a ref refreshed since the claim.
 /// Returns the rows released.
 pub async fn release_claimed_ref(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     facet: &str,
     element: Option<&str>,
     claim_token: &str,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let result = sqlx::query(sql!(
         "UPDATE node_reconcile_queue
          SET claim_token = '',
@@ -135,7 +136,7 @@ pub async fn release_claimed_ref(
     .bind(facet)
     .bind(element)
     .bind(claim_token)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected())
 }
@@ -145,13 +146,13 @@ pub async fn release_claimed_ref(
 /// `claim_token` holds it and no enqueue has refreshed it since the claim.
 /// Returns the rows dead-lettered.
 pub async fn dead_letter_claimed_ref(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     facet: &str,
     element: Option<&str>,
     claim_token: &str,
     error: &str,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let result = sqlx::query(sql!(
         "UPDATE node_reconcile_queue
          SET attempts = attempts + 1,
@@ -173,7 +174,7 @@ pub async fn dead_letter_claimed_ref(
     .bind(element)
     .bind(claim_token)
     .bind(error)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected())
 }
@@ -183,14 +184,14 @@ pub async fn dead_letter_claimed_ref(
 /// `delay_secs` from now, while `claim_token` holds it and no enqueue has
 /// refreshed it since the claim. Returns the rows scheduled for retry.
 pub async fn retry_claimed_ref(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     facet: &str,
     element: Option<&str>,
     claim_token: &str,
     error: &str,
     delay_secs: i64,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let result = sqlx::query(sql!(
         "UPDATE node_reconcile_queue
          SET attempts = attempts + 1,
@@ -212,7 +213,7 @@ pub async fn retry_claimed_ref(
     .bind(claim_token)
     .bind(error)
     .bind(delay_secs)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected())
 }

@@ -8,7 +8,7 @@ use pplx_space_state_reconciliation::{
     RECONCILE_REASON_MAX_CHARS, ReconcileReason,
     normalize_reconcile_reason as normalize_shared_reconcile_reason,
 };
-use sqlx::{FromRow, PgPool};
+use sqlx::FromRow;
 use time::OffsetDateTime;
 
 mod depth;
@@ -68,39 +68,43 @@ pub struct TriggerTargets {
 }
 
 pub async fn enqueue_triggers(
-    pool: &PgPool,
+    executor: impl Executor<'_>,
     node_ids: impl IntoIterator<Item = NodeId>,
     reason: ReconcileReason,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let node_ids = normalized_node_ids(node_ids);
     if node_ids.is_empty() {
         return Ok(0);
     }
-    enqueue_triggers_on(pool, &node_ids, reason).await
+    enqueue_triggers_on(executor, &node_ids, reason).await
 }
 
-pub async fn enqueue_triggers_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+/// The caller must pass its open transaction.
+pub async fn enqueue_triggers_tx<C>(
+    tx: &mut C,
     node_ids: impl IntoIterator<Item = NodeId>,
     reason: ReconcileReason,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let node_ids = normalized_node_ids(node_ids);
     if node_ids.is_empty() {
         return Ok(0);
     }
-    enqueue_triggers_on(&mut **tx, &node_ids, reason).await
+    enqueue_triggers_on(tx, &node_ids, reason).await
 }
 
 pub async fn enqueue_triggers_conn(
-    conn: &mut sqlx::PgConnection,
+    executor: impl Executor<'_>,
     node_ids: impl IntoIterator<Item = NodeId>,
     reason: ReconcileReason,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let node_ids = normalized_node_ids(node_ids);
     if node_ids.is_empty() {
         return Ok(0);
     }
-    enqueue_triggers_on(&mut *conn, &node_ids, reason).await
+    enqueue_triggers_on(executor, &node_ids, reason).await
 }
 
 fn normalized_node_ids(node_ids: impl IntoIterator<Item = NodeId>) -> Vec<NodeId> {
@@ -108,14 +112,11 @@ fn normalized_node_ids(node_ids: impl IntoIterator<Item = NodeId>) -> Vec<NodeId
     node_ids.into_iter().collect::<Vec<_>>()
 }
 
-async fn enqueue_triggers_on<'e, E>(
-    executor: E,
+async fn enqueue_triggers_on(
+    executor: impl Executor<'_>,
     node_ids: &[NodeId],
     reason: ReconcileReason,
-) -> Result<u64, sqlx::Error>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
+) -> Result<u64, DbError> {
     let diagnostic_reason = reason.as_str();
     let (queued, rejected) = sqlx::query_as::<_, (i64, i64)>(sql!(
         "WITH input AS (
@@ -193,12 +194,12 @@ where
     .bind(RECONCILE_REASON_MAX_CHARS as i32)
     .bind(SpaceNodeRole::Worker)
     .bind(SpaceNodeRole::Builder)
-    .fetch_one(executor)
+    .fetch_one(executor.into_sqlx())
     .await?;
     if rejected > 0 {
-        return Err(sqlx::Error::Protocol(format!(
+        return Err(DbError::from(sqlx::Error::Protocol(format!(
             "state reconciliation triggers can only target worker or builder nodes; rejected {rejected} node(s)"
-        )));
+        ))));
     }
     Ok(queued.cast_unsigned())
 }
@@ -536,9 +537,9 @@ struct QueuedTriggerRow {
 /// The queued triggers of `node_ids`, at most one per node. A node with
 /// nothing queued has no entry.
 pub async fn queued_triggers(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_ids: &[NodeId],
-) -> Result<Vec<QueuedTrigger>, sqlx::Error> {
+) -> Result<Vec<QueuedTrigger>, DbError> {
     let rows = sqlx::query_as::<_, QueuedTriggerRow>(sql!(
         "SELECT node_id,
                 reasons::TEXT[] AS reasons,
@@ -555,7 +556,7 @@ pub async fn queued_triggers(
          ORDER BY node_id"
     ))
     .bind(node_ids)
-    .fetch_all(executor)
+    .fetch_all(executor.into_sqlx())
     .await?;
     Ok(rows
         .into_iter()

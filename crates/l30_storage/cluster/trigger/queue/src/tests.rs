@@ -175,7 +175,7 @@ async fn concurrent_enqueues_on_different_plans_do_not_deadlock() -> TestResult 
     let reason = ReconcileReason::TemplateDesiredStateUpdated;
 
     let mut holder = db.pool.begin().await?;
-    enqueue_triggers_tx(&mut holder, [node_ids[1]], reason).await?;
+    enqueue_triggers_tx(&mut *holder, [node_ids[1]], reason).await?;
     let (custom_pid, custom) = spawn_enqueue(
         &db.pool,
         &[
@@ -227,7 +227,7 @@ async fn spawn_enqueue(
         .await?;
     let enqueue = tokio::spawn(async move {
         let mut tx = sqlx::Connection::begin(&mut *conn).await?;
-        let queued = enqueue_triggers_tx(&mut tx, node_ids, reason).await?;
+        let queued = enqueue_triggers_tx(&mut *tx, node_ids, reason).await?;
         tx.commit().await?;
         Ok(queued)
     });

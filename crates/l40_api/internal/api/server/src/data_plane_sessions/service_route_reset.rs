@@ -84,7 +84,7 @@ pub(super) async fn enqueue_sandbox_desired_state_reconcile_tx(
     .map_err(|error| Status::internal(format!("enqueue sandbox route reconcile: {error}")))?;
 
     enqueue_triggers_tx(
-        tx,
+        &mut **tx,
         [active_node_id],
         ReconcileReason::SandboxPortExposureUpdated,
     )

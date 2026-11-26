@@ -41,7 +41,8 @@ impl Wakeup for Queue {
         if let Self::Fails = self {
             return Err(sqlx::Error::Protocol("injected wakeup failure".into()));
         }
-        let queued = enqueue_triggers_tx(tx, [node], ReconcileReason::FirewallRulesChanged).await?;
+        let queued =
+            enqueue_triggers_tx(&mut **tx, [node], ReconcileReason::FirewallRulesChanged).await?;
         match *self {
             Self::Reports(count) => Ok(count),
             Self::ThenLapses => {
