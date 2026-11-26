@@ -560,32 +560,38 @@ class SmokeServices:
             auto_lifecycle: Mapping[str, object] | None = None,
         ) -> DurableLifecycleSandbox:
             # Cleanup owns the create until the create call returns, or until
-            # cleanup's own deadline: its delete is armed before the request,
-            # and waits for the call to return (it may be a `run_concurrently`
-            # worker that outlived its interrupt), within the time cleanup has
-            # left less `CREATE_LOOKUP_SECONDS`. It then deletes by the id the
-            # API answered with, or else looks the create's label up once. A
-            # call that never returned and whose label finds nothing fails
-            # cleanup by name, and the next run's leftover check reports what
-            # it may still store. Native create also deletes a sandbox whose
-            # wait failed.
+            # cleanup's own deadline: its delete is armed before the request.
+            # In cleanup it waits until the API has answered with the id or
+            # the call has returned (it may be a `run_concurrently` worker that
+            # outlived its interrupt), within the time cleanup has left less
+            # `CREATE_LOOKUP_SECONDS`, so a create blocked after its answer
+            # (in its readiness wait, say) holds nobody's budget. It reads
+            # whether the call had returned, then deletes by the answered id,
+            # else looks the create's label up once and reads the id again,
+            # since the answer may land during the lookup. Only when nothing
+            # was found and the call had not returned does cleanup fail, by
+            # name; the next run's leftover check reports what it may still
+            # store. Native create also deletes a sandbox whose wait failed.
             instance = uuid.uuid4().hex
             accepted: list[DurableLifecycleSandbox] = []
             returned = Event()
+            known = Event()
+
+            def on_accepted(sandbox: DurableLifecycleSandbox) -> None:
+                accepted.append(sandbox)
+                known.set()
 
             def delete_created() -> None:
                 left = cleanup_seconds_left()
-                returned.wait(
+                known.wait(
                     CREATE_RETURN_WAIT_SECONDS if left is None else max(0.0, left - CREATE_LOOKUP_SECONDS)
                 )
-                found = accepted[:1] or [
-                    sandbox
-                    for sandbox in [native.sandbox_labelled("space_smoke_instance", instance)]
-                    if sandbox is not None
-                ]
-                for sandbox in found:
+                done = returned.is_set()
+                found = None if accepted else native.sandbox_labelled("space_smoke_instance", instance)
+                targets = accepted[:1] or ([found] if found is not None else [])
+                for sandbox in targets:
                     native.delete(sandbox)
-                if not found and not returned.is_set():
+                if not targets and not done:
                     raise RuntimeError(
                         f"create space_smoke_instance={instance} still in flight when cleanup ended; "
                         "left for the leftover check"
@@ -603,11 +609,12 @@ class SmokeServices:
                         {**run_metadata, "space_smoke_instance": instance},
                         idle_timeout=idle_timeout,
                         auto_lifecycle=auto_lifecycle,
-                        accepted=accepted.append,
+                        accepted=on_accepted,
                     ),
                 )
             finally:
                 returned.set()
+                known.set()
 
         return CommandSandboxFixture(
             context,
