@@ -2,7 +2,7 @@
 //! campaign's pacing, and recording outcomes under the lease. Every verb
 //! takes or reads the subject kind, so one set of verbs serves every
 //! campaign kind; only the lease's node pacing differs by kind
-//! ([`SubjectKind::has_node`]). Leasing and renewal run the steps of
+//! ([`CampaignKind::paces_per_node`]). Leasing and renewal run the steps of
 //! [`pplx_space_rollout_queue::claim`] and [`pplx_space_rollout_queue::renew`]
 //! on these tables.
 
@@ -155,9 +155,9 @@ pub struct LeasedItem {
     pub lease_token: uuid::Uuid,
     /// Leases taken on this item so far, this one included.
     pub attempts: u64,
-    /// For a kind whose subjects have a node, the node that last published
-    /// the subject, if it still has a published state. Always `None` for
-    /// other kinds.
+    /// For a kind that paces per node ([`CampaignKind::paces_per_node`]), the
+    /// node that last published the sandbox, if it still has a published
+    /// state. Always `None` for other kinds.
     pub node_id: Option<NodeId>,
 }
 
@@ -170,7 +170,7 @@ pub struct LeasedItem {
 ///   canary then waits for an operator to resume the campaign;
 /// * at most `max_in_flight_per_cluster` items in flight in all, counting
 ///   those already leased;
-/// * for a kind whose subjects have a node ([`SubjectKind::has_node`]), at
+/// * for a kind that paces per node ([`CampaignKind::paces_per_node`]), at
 ///   most `max_in_flight_per_node` in flight on any node, by the node that
 ///   last published each sandbox, and only on a node that's reachable and
 ///   whose status is evidence of its environments
@@ -179,8 +179,9 @@ pub struct LeasedItem {
 ///   qualifies again. An item with no published node counts toward the
 ///   cluster cap only and is leased: the driver finds it on neither end of
 ///   the campaign and skips it, where pending it would hold the campaign open
-///   for good. Items of other kinds have no node and are paced by the cluster
-///   cap only.
+///   for good. Kinds without per-node pacing (`templates` and
+///   `sandbox_memory_drops`) run without calling a node, ignore
+///   `max_in_flight_per_node`, and pace by the cluster cap only.
 ///
 /// * never a subject another campaign holds in flight under a live lease
 ///   (an aborted campaign's, while its worker may still be on it); the item
@@ -250,6 +251,7 @@ struct Claiming<'c> {
 /// after.
 struct LeaseHeader {
     subject_kind: SubjectKind,
+    paces_per_node: bool,
     per_node: u64,
 }
 
@@ -291,10 +293,11 @@ impl ClaimStore for Claiming<'_> {
         else {
             return Ok(None);
         };
-        let subject_kind = kind.parse::<CampaignKind>()?.subject_kind();
+        let kind = kind.parse::<CampaignKind>()?;
         Ok(Some((
             LeaseHeader {
-                subject_kind,
+                subject_kind: kind.subject_kind(),
+                paces_per_node: kind.paces_per_node(),
                 per_node: u64::try_from(per_node).unwrap_or(0),
             },
             Pacing {
@@ -337,7 +340,7 @@ impl ClaimStore for Claiming<'_> {
         scan_limit: u32,
     ) -> Result<Candidates<uuid::Uuid, Option<NodeId>>, LeaseError> {
         let subject_kind = header.subject_kind;
-        let (in_flight, pending) = if subject_kind.has_node() {
+        let (in_flight, pending) = if header.paces_per_node {
             node_bound_candidates(self.tx, self.campaign_id, subject_kind, scan_limit).await?
         } else {
             nodeless_candidates(self.tx, self.campaign_id, subject_kind, scan_limit).await?
@@ -791,6 +794,159 @@ pub async fn finish_item(
     .await?
     .rows_affected();
     Ok(finished == 1)
+}
+
+/// An `in_flight` item whose lease has lapsed at or past `max_attempts`,
+/// before [`redrive_expired_checked`] decides whether to fail it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpiredFinalLease {
+    pub campaign_id: CampaignId,
+    pub subject_kind: SubjectKind,
+    pub subject_id: uuid::Uuid,
+    pub lease_token: uuid::Uuid,
+    pub attempts: u64,
+}
+
+/// Read `campaign_id`'s `in_flight` items whose leases have lapsed at or past
+/// `max_attempts`, so a driver with durable completion state can salvage
+/// already-committed work via [`finish_expired_done`] before
+/// [`redrive_expired_checked`] marks uncommitted items `failed`.
+pub async fn expired_final_leases(
+    executor: impl sqlx::PgExecutor<'_>,
+    campaign_id: CampaignId,
+    max_attempts: u64,
+) -> Result<Vec<ExpiredFinalLease>, LeaseError> {
+    let rows: Vec<(String, uuid::Uuid, uuid::Uuid, i64)> = sqlx::query_as(sql!(
+        "SELECT subject_kind, subject_id, lease_token, attempts
+         FROM runtime_upgrade_items
+         WHERE campaign_id = $1
+           AND phase = $2
+           AND lease_expires_at <= clock_timestamp()
+           AND attempts >= $3
+           AND lease_token IS NOT NULL
+         ORDER BY subject_id"
+    ))
+    .bind(campaign_id)
+    .bind(ItemPhase::InFlight.as_str())
+    .bind(i64::try_from(max_attempts).unwrap_or(i64::MAX))
+    .fetch_all(executor)
+    .await?;
+    rows.into_iter()
+        .map(|(subject_kind, subject_id, lease_token, attempts)| {
+            Ok(ExpiredFinalLease {
+                campaign_id,
+                subject_kind: subject_kind.parse()?,
+                subject_id,
+                lease_token,
+                attempts: u64::try_from(attempts).unwrap_or(0),
+            })
+        })
+        .collect()
+}
+
+/// Salvage an [`ExpiredFinalLease`] whose driver confirmed the upgrade already
+/// committed, recording `done` without spending `failure_budget`. Returns
+/// `false` if another caller already moved the row off `lease_token`.
+pub async fn finish_expired_done(
+    executor: impl sqlx::PgExecutor<'_>,
+    lease: &ExpiredFinalLease,
+) -> Result<bool, sqlx::Error> {
+    let finished = sqlx::query(sql!(
+        "UPDATE runtime_upgrade_items
+         SET phase = $5,
+             last_error = NULL,
+             lease_token = NULL,
+             lease_expires_at = NULL
+         WHERE campaign_id = $1
+           AND subject_kind = $2
+           AND subject_id = $3
+           AND phase = $6
+           AND lease_token = $4
+           AND lease_expires_at <= clock_timestamp()"
+    ))
+    .bind(lease.campaign_id)
+    .bind(lease.subject_kind.as_str())
+    .bind(lease.subject_id)
+    .bind(lease.lease_token)
+    .bind(ItemPhase::Done.as_str())
+    .bind(ItemPhase::InFlight.as_str())
+    .execute(executor)
+    .await?
+    .rows_affected();
+    Ok(finished == 1)
+}
+
+/// Record one failed completion-check attempt on an [`ExpiredFinalLease`] while
+/// keeping it `in_flight` for the next tick's redrive check, so transient
+/// completion-store read failures stay bounded.
+pub async fn bump_expired_final_attempt(
+    executor: impl sqlx::PgExecutor<'_>,
+    lease: &ExpiredFinalLease,
+) -> Result<u64, sqlx::Error> {
+    let attempts = sqlx::query_scalar::<_, i64>(sql!(
+        "UPDATE runtime_upgrade_items
+         SET attempts = attempts + 1
+         WHERE campaign_id = $1
+           AND subject_kind = $2
+           AND subject_id = $3
+           AND phase = $5
+           AND lease_token = $4
+           AND lease_expires_at <= clock_timestamp()
+         RETURNING attempts"
+    ))
+    .bind(lease.campaign_id)
+    .bind(lease.subject_kind.as_str())
+    .bind(lease.subject_id)
+    .bind(lease.lease_token)
+    .bind(ItemPhase::InFlight.as_str())
+    .fetch_optional(executor)
+    .await?;
+    Ok(attempts
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or(lease.attempts))
+}
+
+/// Re-drive `campaign_id`'s items stuck `in_flight` past their lease: items
+/// below `max_attempts` return to `pending`, while items at or past
+/// `max_attempts` become `failed` only when their `lease_token` is listed in
+/// `fail_lease_tokens` (already verified uncommitted by the caller). Any final
+/// lease that expired after [`expired_final_leases`] ran or whose completion
+/// check failed transiently stays `in_flight` for the next tick.
+pub async fn redrive_expired_checked(
+    executor: impl sqlx::PgExecutor<'_>,
+    campaign_id: CampaignId,
+    max_attempts: u64,
+    fail_lease_tokens: &[uuid::Uuid],
+) -> Result<RedriveReport, sqlx::Error> {
+    let phases = sqlx::query_scalar::<_, String>(sql!(
+        "UPDATE runtime_upgrade_items
+         SET phase = CASE WHEN attempts >= $2 THEN $3 ELSE $4 END,
+             last_error = $5,
+             lease_token = NULL,
+             lease_expires_at = NULL
+         WHERE campaign_id = $1
+           AND phase = $6
+           AND lease_expires_at <= clock_timestamp()
+           AND (attempts < $2 OR lease_token = ANY($7))
+         RETURNING phase"
+    ))
+    .bind(campaign_id)
+    .bind(i64::try_from(max_attempts).unwrap_or(i64::MAX))
+    .bind(ItemPhase::Failed.as_str())
+    .bind(ItemPhase::Pending.as_str())
+    .bind(LEASE_EXPIRED)
+    .bind(ItemPhase::InFlight.as_str())
+    .bind(fail_lease_tokens)
+    .fetch_all(executor)
+    .await?;
+    let failed = phases
+        .iter()
+        .filter(|phase| phase.as_str() == ItemPhase::Failed.as_str())
+        .count() as u64;
+    Ok(RedriveReport {
+        requeued: phases.len() as u64 - failed,
+        failed,
+    })
 }
 
 /// Re-drive `campaign_id`'s items stuck `in_flight` past their lease: back to

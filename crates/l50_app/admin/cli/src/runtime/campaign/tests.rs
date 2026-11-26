@@ -200,6 +200,37 @@ async fn start_sends_the_settings_and_leaves_unset_defaults_to_the_server() {
                 "reason": "retire memory",
             })
         );
+
+        client
+            .runtime_command(campaign(&[
+                "start",
+                "--kind",
+                "sandbox_memory_drops",
+                "--from",
+                E0,
+                "--to",
+                E1,
+                "--wave-size",
+                "6",
+                "--failure-budget",
+                "2",
+                "--reason",
+                "drop suspended memory",
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(
+            requests.try_recv().unwrap().1,
+            json!({
+                "kind": "sandbox_memory_drops",
+                "from_environment_ref": E0,
+                "to_environment_ref": E1,
+                "max_in_flight_per_cluster": 6,
+                "failure_budget": 2,
+                "include_running": false,
+                "reason": "drop suspended memory",
+            })
+        );
     })
     .await;
 }

@@ -259,6 +259,7 @@ pub mod stopped_replacements;
 pub mod stuck;
 pub mod suspend;
 pub mod suspend_reads;
+pub mod suspended_environment_pins;
 pub mod sweeper;
 pub mod template_usage;
 #[cfg(any(test, feature = "test-support"))]

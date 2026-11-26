@@ -2604,9 +2604,9 @@ decision is counted by `runtime_upgrade.activation.decision`.
 ### Runtime upgrade campaigns
 
 A campaign moves one kind of subject, template releases (`templates`) or
-sandboxes (`sandboxes` and `sandbox_force_restarts`), off one execution
-environment and onto another, at a pace an operator sets. Campaigns live in
-`runtime_upgrade_campaigns`, with one row per subject in
+sandboxes (`sandboxes`, `sandbox_force_restarts`, `sandbox_memory_drops`), off
+one execution environment and onto another, at a pace an operator sets.
+Campaigns live in `runtime_upgrade_campaigns`, with one row per subject in
 `runtime_upgrade_items`. The cluster controller's `runtime_upgrade` loop drives
 them, and the admin API starts and steers them. Both read
 `runtime_upgrade_campaigns.generation`, so the migration that adds it
@@ -2619,12 +2619,23 @@ The loop is off unless `SPACE_RUNTIME_UPGRADE_RECONCILER_ENABLED` turns it on
 table. What a kind's subjects are, and how one is upgraded, belong to that
 kind's driver. Only template campaigns have one the controller runs
 ([Template runtime upgrade campaigns](#template-runtime-upgrade-campaigns)), so
-the admin API refuses to start a valid sandbox campaign (409), and the loop
-only reports one it finds; a campaign row of a kind from a newer build is
-logged and skipped. Both sandbox drivers (`sandboxes` and
-`sandbox_force_restarts`) are built but not registered: they move sandboxes
-through a sandbox upgrade dispatcher that doesn't exist yet.
-Each tick the
+the admin API refuses to start a valid sandbox campaign of any kind (409), and
+the loop only reports one it finds; a campaign row of a kind from a newer build
+is logged and skipped. The three sandbox drivers (`sandboxes`,
+`sandbox_force_restarts`, and `sandbox_memory_drops`) are built but not
+registered until their production dispatchers and memory-retirement source are
+wired; `sandbox_memory_drops` holds while its target isn't the cluster default
+(`target_not_default`), its source is `allowed` (`source_allowed`), or its
+source's memory isn't retired (`memory_not_retired`), and otherwise drops
+`suspended` source-attributed `full` checkpoints offline to `disk` projections
+without placing a pod or calling a node (on Kubernetes, re-pinning to `disk`
+drops the row from `suspended` `sandbox_population`, whereas Direct's
+`sandbox_population` selector still reads the newest `full` snapshot until
+updated to consult `current_local_artifact_*` before Direct is registered;
+checkpoints ineligible for offline projection are recorded `skipped`, with
+restore-time memory drop cold-booting any that later wake onto the target and
+`sandbox_population` still counting any that remain `suspended` on the
+source). Each tick the
 loop also returns a finished campaign's in-flight items whose leases lapsed to
 pending (see abort below), and for every unfinished campaign whose kind has a
 driver, it:
@@ -2651,16 +2662,18 @@ driver, it:
 Steps 2 to 6 run only for a canary or rolling campaign. A paused campaign
 gets step 1 alone, so it records no new items while it waits.
 
-Pacing is `max_in_flight_per_cluster`, the wave size. A sandbox item also
-counts against `max_in_flight_per_node` on the node that last published its
-sandbox, and is leased only while that node is reachable with fresh
-environment evidence; until then it stays pending. A sandbox item whose
-sandbox no node has published counts against the cluster cap only and is
-leased, so the driver can skip it instead of holding the campaign open. A
-template release has no node, so only the cluster
-cap applies to it. A campaign that starts as a canary leases one item at a
-time until one is done, then waits for a resume; one whose items all fail or
-are skipped, under the budget, completes instead (step 5).
+Pacing is `max_in_flight_per_cluster`, the wave size. Items of `sandboxes` and
+`sandbox_force_restarts` campaigns also count against `max_in_flight_per_node`
+on the node that last published each sandbox, and are leased only while that
+node is reachable with fresh environment evidence; until then they stay
+pending. A sandbox item whose sandbox no node has published counts against the
+cluster cap only and is leased, so the driver can skip it instead of holding
+the campaign open. Items of `templates` and `sandbox_memory_drops` campaigns
+run without calling a node, ignore `max_in_flight_per_node` (which still stays
+between 1 and `max_in_flight_per_cluster`), and count against the cluster cap
+only. A campaign that starts as a canary leases one item at a time until one is
+done, then waits for a resume; one whose items all fail or are skipped, under
+the budget, completes instead (step 5).
 
 Every change to a campaign row raises its `generation` by one: an operator's
 pause, resume or abort, and the loop's pause at the failure budget or its
@@ -2679,9 +2692,8 @@ managing-organization admin. `space-admin-cli runtime campaign` wraps them
   is one subject, so nothing else is accepted),
   `max_in_flight_per_cluster`, `max_in_flight_per_node` (default 1),
   `failure_budget`, `include_running` (`sandboxes` campaigns only: also take
-  running and paused sandboxes, as the sandbox driver defines it; refused on
-  `templates` and `sandbox_force_restarts`, whose subjects are already running
-  and paused sandboxes) and a
+  running and paused sandboxes, as the `sandboxes` driver defines it; every
+  other kind refuses it) and a
   required `reason`. An invalid request is refused (400) first. A valid one is
   refused (409) for a kind with no driver, and while an unfinished campaign of
   the same kind moves the same source.
@@ -2693,7 +2705,9 @@ managing-organization admin. `space-admin-cli runtime campaign` wraps them
 * `GET /runtime-upgrade-campaigns` and `GET /runtime-upgrade-campaigns/{id}`
   report each campaign's phase, generation, items by phase and stranded
   count; a campaign of a kind this build doesn't know is skipped (`GET
-  .../{id}` answers 404). For a sandbox campaign, `stranded` is its pending items while the
+  .../{id}` answers 404). For a sandbox campaign (`sandboxes`,
+  `sandbox_force_restarts`, or `sandbox_memory_drops`), `stranded` is its
+  pending items while the
   catalog certifies no upgrade edge from its source to its target, and 0
   once the campaign is finished. It's `null` for template campaigns.
 

@@ -30,9 +30,15 @@
 //!   ([`SandboxUpgradeDispatcher::stop`]) and then takes the same path. One
 //!   mid-transition is released for a later lease; anything else is skipped.
 //!
-//! Nothing registers this driver in [`super::cluster_drivers`] yet: it runs
-//! once a production dispatcher exists.
+//! Nothing registers these sandbox drivers in [`super::cluster_drivers`] yet:
+//! they run once production dispatchers exist.
+//!
+//! [`force_restarts::SandboxForceRestartDriver`] and
+//! [`memory_drops::SandboxMemoryDropDriver`] drive the two retired-memory
+//! sandbox campaign kinds (`sandbox_force_restarts` and
+//! `sandbox_memory_drops`).
 
+use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -55,16 +61,39 @@ use super::{CampaignDriver, MAX_ATTEMPTS, Plan, ScanPlan, SubjectPage, SubjectSc
 
 mod dispatcher;
 mod force_restarts;
+mod memory_drops;
 
 #[cfg(test)]
 mod tests;
 
 pub use dispatcher::{
-    DispatchError, ForceRestartProgress, GuardedStop, SandboxUpgradeDispatcher, StoppedUpgrade,
-    TargetStart,
+    DispatchError, ForceRestartProgress, GuardedStop, SandboxMemoryDrop,
+    SandboxMemoryDropDispatcher, SandboxUpgradeDispatcher, StoppedUpgrade, TargetStart,
 };
 use dispatcher::{Step, step};
-pub use force_restarts::{MemoryRetirement, MemoryRetirementSource, SandboxForceRestartDriver};
+pub use force_restarts::SandboxForceRestartDriver;
+pub use memory_drops::SandboxMemoryDropDriver;
+
+/// Snapshot of whether an environment's memory is retired and the monotonic
+/// generation that stamped it, so a sub-tick unretire/re-retire cycle changes
+/// [`ScanPlan`] and restarts any open subject-scan pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryRetirement {
+    pub retired: bool,
+    pub generation: u64,
+}
+
+/// Reads whether a runtime environment's memory is retired in the cluster
+/// policy, authorizing memory-discarding restores, force-restarts, and offline
+/// memory drops off a deprecated environment before it's blocked.
+pub trait MemoryRetirementSource: Send + Sync + 'static {
+    /// `environment`'s current memory-retirement state and monotonic
+    /// generation. Every retirement change must advance `generation`.
+    fn memory_retirement(
+        &self,
+        environment: EnvironmentReference,
+    ) -> impl Future<Output = Result<MemoryRetirement, String>> + Send;
+}
 
 pub(super) const NO_LONGER_ON_SOURCE: &str = "the sandbox is no longer on the campaign's source";
 pub(super) const ON_NEITHER_END: &str =
@@ -151,6 +180,61 @@ fn sandbox_plan(
     }
 }
 
+/// Why reading a retired-memory campaign's scan plan didn't produce a scan.
+pub(super) enum PlanChange {
+    Hold(&'static str),
+    ReadError(String),
+}
+
+/// What a leasing retired-memory sandbox campaign (`sandbox_force_restarts` or
+/// `sandbox_memory_drops`) does under the current policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RetiredMemoryPlan {
+    /// Nothing calls for the move; the reason is the hold metric's tag.
+    Hold(&'static str),
+    /// Find the source's subjects. `moves` says whether a cold-boot start edge
+    /// to the target is certified or leaves them stranded.
+    Scan { moves: bool },
+}
+
+pub(super) fn retired_memory_edge_plan(
+    policy: &RuntimeEnvironmentPolicy,
+    from_catalog: Option<&CatalogEnvironment>,
+    memory_retired: bool,
+    from: EnvironmentReference,
+    to: EnvironmentReference,
+) -> RetiredMemoryPlan {
+    if policy.default_environment != Some(to) {
+        return RetiredMemoryPlan::Hold("target_not_default");
+    }
+    if policy.environments.get(&from) == Some(&RuntimeEnvironmentState::Allowed) {
+        return RetiredMemoryPlan::Hold("source_allowed");
+    }
+    if !memory_retired {
+        return RetiredMemoryPlan::Hold("memory_not_retired");
+    }
+    let moves = matches!(
+        decide(policy, UpgradeActivation::Start, from, from_catalog),
+        RuntimePlan::ColdBootUpgrade(EnvironmentMove { to: target, .. }) if target == to
+    );
+    RetiredMemoryPlan::Scan { moves }
+}
+
+pub(super) fn retired_memory_plan(
+    policy: &RuntimeEnvironmentPolicy,
+    from_catalog: Option<&CatalogEnvironment>,
+    memory_retired: bool,
+    campaign: &Campaign,
+) -> RetiredMemoryPlan {
+    retired_memory_edge_plan(
+        policy,
+        from_catalog,
+        memory_retired,
+        campaign.from,
+        campaign.to,
+    )
+}
+
 /// The lifecycles a pass scans: stopped, and running and paused too when the
 /// campaign takes them.
 const fn scanned_lifecycles(takes_running: bool) -> &'static [SandboxLifecycle] {
@@ -184,6 +268,35 @@ impl Inputs {
             .collect::<Result<_, _>>()
             .map_err(|error| format!("reading the catalog failed: {error}"))?;
         Ok(Self { policy, catalog })
+    }
+
+    pub(super) async fn read_retired_memory_plan<M: MemoryRetirementSource>(
+        pool: &PgPool,
+        memory_retirement: &M,
+        campaign: &Campaign,
+    ) -> Result<(Self, ScanPlan), PlanChange> {
+        let retirement = memory_retirement
+            .memory_retirement(campaign.from)
+            .await
+            .map_err(|error| {
+                PlanChange::ReadError(format!("reading memory retirement failed: {error}"))
+            })?;
+        let inputs = Self::read(pool).await.map_err(PlanChange::ReadError)?;
+        match retired_memory_plan(
+            &inputs.policy,
+            inputs.catalog_entry(campaign.from),
+            retirement.retired,
+            campaign,
+        ) {
+            RetiredMemoryPlan::Hold(reason) => Err(PlanChange::Hold(reason)),
+            RetiredMemoryPlan::Scan { moves } => {
+                let plan = ScanPlan {
+                    moves,
+                    inputs: inputs.fingerprint(retirement.generation),
+                };
+                Ok((inputs, plan))
+            }
+        }
     }
 
     pub(super) fn catalog_entry(
@@ -267,6 +380,26 @@ impl Inputs {
     /// Whether `execution` puts its sandbox on `campaign`'s source.
     pub(super) fn on_source(&self, execution: &SandboxCandidate, campaign: &Campaign) -> bool {
         self.attributed(execution) == Some(campaign.from)
+    }
+
+    /// The environment `checkpoint` was captured under, as a restore attributes
+    /// it. Unlike [`Self::attributed`] on `sandbox_observed_states` (where an
+    /// all-`None` row is an empty heartbeat publish), a `ready` row in
+    /// `snapshots` with `execution_metadata = None` and no recorded runtime or
+    /// format version is a pre-metadata checkpoint that `attribute` attributes
+    /// to stock `E0` when `legacy_unbound_allowed == Some(false)`.
+    pub(super) fn attributed_checkpoint(
+        &self,
+        checkpoint: &pplx_space_sandbox_store::suspended_environment_pins::PinnedCheckpointExecution,
+    ) -> Option<EnvironmentReference> {
+        let recorded = RecordedExecution::from_record(
+            checkpoint.execution_metadata.as_deref(),
+            checkpoint.runtime.clone(),
+            checkpoint.runtime_version.clone(),
+            checkpoint.state_format_name.clone(),
+            checkpoint.state_format_version.clone(),
+        );
+        attribute(&recorded, &self.catalog, self.policy.legacy_unbound_allowed)
     }
 
     /// Read one page of `lifecycles` candidates for `campaign` and split them

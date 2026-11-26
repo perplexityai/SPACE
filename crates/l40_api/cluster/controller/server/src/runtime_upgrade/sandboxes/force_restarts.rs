@@ -34,17 +34,9 @@
 //!   a skip, and a sandbox mid-transition is released without spending an
 //!   attempt.
 
-use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use pplx_space_api::controllers::substrate::runtime_upgrade::{
-    CatalogEnvironment, RuntimePlan, UpgradeActivation, decide,
-};
-use pplx_space_execution_spec::EnvironmentReference;
-use pplx_space_runtime_environment_policy_store::{
-    RuntimeEnvironmentPolicy, RuntimeEnvironmentState,
-};
 use pplx_space_runtime_upgrade_campaign_store::{
     self as store, Campaign, CampaignId, CampaignKind, ItemError, ItemOutcome, LeasedItem,
 };
@@ -56,8 +48,11 @@ use super::dispatcher::{
     ForceRestartProgress, GuardedStop, SandboxUpgradeDispatcher, TargetStart, is_mid_transition,
 };
 use super::{
-    CampaignDriver, Inputs, NO_LONGER_ON_SOURCE, ON_NEITHER_END, Plan, ScanPlan, SubjectScan,
-    error_outcome,
+    CampaignDriver, Inputs, MemoryRetirementSource, NO_LONGER_ON_SOURCE, ON_NEITHER_END, Plan,
+    PlanChange, ScanPlan, SubjectScan, error_outcome,
+};
+pub(super) use super::{
+    RetiredMemoryPlan as ForceRestartPlan, retired_memory_plan as force_restart_plan,
 };
 
 pub(super) const POLICY_STOPPED_FORCE_RESTARTING: &str =
@@ -65,27 +60,6 @@ pub(super) const POLICY_STOPPED_FORCE_RESTARTING: &str =
 
 const RESIDENT_LIFECYCLES: &[SandboxLifecycle] =
     &[SandboxLifecycle::Started, SandboxLifecycle::Paused];
-
-/// Snapshot of whether an environment's memory is retired and the monotonic
-/// generation that stamped it, so a sub-tick unretire/re-retire cycle changes
-/// [`ScanPlan`] and restarts any open subject-scan pass.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MemoryRetirement {
-    pub retired: bool,
-    pub generation: u64,
-}
-
-/// Reads whether a runtime environment's memory is retired in the cluster
-/// policy, authorizing memory-discarding restores and force-restarts off a
-/// deprecated environment before it's blocked.
-pub trait MemoryRetirementSource: Send + Sync + 'static {
-    /// `environment`'s current memory-retirement state and monotonic
-    /// generation. Every retirement change must advance `generation`.
-    fn memory_retirement(
-        &self,
-        environment: EnvironmentReference,
-    ) -> impl Future<Output = Result<MemoryRetirement, String>> + Send;
-}
 
 /// Drives `sandbox_force_restarts` campaigns of one substrate's running and
 /// paused sandboxes.
@@ -141,79 +115,12 @@ impl<D: SandboxUpgradeDispatcher, M: MemoryRetirementSource> SandboxForceRestart
     }
 
     async fn read_plan(&self, campaign: &Campaign) -> Result<(Inputs, ScanPlan), PlanChange> {
-        let inputs = Inputs::read(&self.pool)
-            .await
-            .map_err(PlanChange::ReadError)?;
-        let retirement = self
-            .memory_retirement
-            .memory_retirement(campaign.from)
-            .await
-            .map_err(|error| {
-                PlanChange::ReadError(format!("reading memory retirement failed: {error}"))
-            })?;
-        match force_restart_plan(
-            &inputs.policy,
-            inputs.catalog_entry(campaign.from),
-            retirement.retired,
-            campaign,
-        ) {
-            ForceRestartPlan::Hold(reason) => Err(PlanChange::Hold(reason)),
-            ForceRestartPlan::Scan { moves } => {
-                let plan = ScanPlan {
-                    moves,
-                    inputs: inputs.fingerprint(retirement.generation),
-                };
-                Ok((inputs, plan))
-            }
-        }
+        Inputs::read_retired_memory_plan(&self.pool, &*self.memory_retirement, campaign).await
     }
 }
 
 fn sandbox_timestamp(value: time::OffsetDateTime) -> Option<jiff::Timestamp> {
     jiff::Timestamp::from_nanosecond(value.unix_timestamp_nanos()).ok()
-}
-
-enum PlanChange {
-    Hold(&'static str),
-    ReadError(String),
-}
-
-/// What a leasing `sandbox_force_restarts` campaign does under the current
-/// policy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ForceRestartPlan {
-    /// Nothing calls for the move; the reason is the hold metric's tag.
-    Hold(&'static str),
-    /// Find the source's running and paused sandboxes. `moves` says whether
-    /// a start cold-boots them onto the target or leaves them stranded.
-    Scan { moves: bool },
-}
-
-pub(super) fn force_restart_plan(
-    policy: &RuntimeEnvironmentPolicy,
-    from_catalog: Option<&CatalogEnvironment>,
-    memory_retired: bool,
-    campaign: &Campaign,
-) -> ForceRestartPlan {
-    if policy.default_environment != Some(campaign.to) {
-        return ForceRestartPlan::Hold("target_not_default");
-    }
-    if policy.environments.get(&campaign.from) == Some(&RuntimeEnvironmentState::Allowed) {
-        return ForceRestartPlan::Hold("source_allowed");
-    }
-    if !memory_retired {
-        return ForceRestartPlan::Hold("memory_not_retired");
-    }
-    let moves = matches!(
-        decide(
-            policy,
-            UpgradeActivation::Start,
-            campaign.from,
-            from_catalog
-        ),
-        RuntimePlan::ColdBootUpgrade(_)
-    );
-    ForceRestartPlan::Scan { moves }
 }
 
 /// What to do with a leased sandbox in `lifecycle`.

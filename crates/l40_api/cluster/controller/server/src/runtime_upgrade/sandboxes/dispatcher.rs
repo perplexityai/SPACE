@@ -6,6 +6,7 @@ use std::future::Future;
 use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_runtime_upgrade_campaign_store::CampaignId;
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+use pplx_space_snapshot_model::LocalArtifactId;
 
 /// How the node-side upgrade of a stopped sandbox ended.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,17 +73,46 @@ pub enum ForceRestartProgress {
     StartedOnTarget,
 }
 
+/// How an offline memory drop of a `suspended` sandbox ended.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SandboxMemoryDrop {
+    /// Projected `expected_artifact_id` to a `disk` checkpoint and re-pinned
+    /// the `suspended` row to it under the sandbox's seal.
+    Dropped,
+    /// Already projected to a `disk` checkpoint by an earlier attempt or a
+    /// concurrent caller; nothing else was written.
+    AlreadyDropped,
+    /// Temporarily blocked by an in-flight `suspend` sealing its checkpoint;
+    /// release the item without spending an attempt so a later tick retries it.
+    Sealed(String),
+    /// Temporarily declined because policy, memory retirement, or upgrade-edge
+    /// preconditions stopped moving the sandbox at commit time; release the
+    /// item without spending an attempt.
+    Held(String),
+    /// The sandbox's lifecycle or current local artifact pin moved away from
+    /// `expected_artifact_id` since the driver inspected it (for example, a
+    /// wake restored it onto the default environment, a user stopped or
+    /// deleted it, or a new suspend rotated the pin).
+    Moved(String),
+    /// The sandbox's checkpoint isn't eligible for an offline memory drop (for
+    /// example, node-liveness fencing while restore awaits explicit
+    /// pinned-artifact selection, a newer `full` snapshot row, an unsupported
+    /// storage URI, or unreadable checkpoint `metadata.json`); skip without
+    /// spending the campaign's failure budget.
+    Ineligible(String),
+}
+
 /// A dispatch that didn't finish.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum DispatchError {
-    /// Worth another lease: the sandbox is busy, the node is unavailable, or
-    /// a deadline of the dispatcher's own passed. The sandbox is left as it
-    /// was. The worker's item deadline isn't one of these: past it, the item
-    /// fails.
+    /// Worth another lease: the sandbox is busy, the node or object store is
+    /// unavailable, or a deadline of the dispatcher's own passed. The sandbox
+    /// is left as it was. The worker's item deadline isn't one of these: past
+    /// it, the item fails.
     #[error("{0}")]
     Retryable(String),
-    /// The upgrade ran and failed; counts against the failure budget. The
-    /// sandbox is left stopped on its old environment.
+    /// The operation ran and failed; counts against the failure budget. The
+    /// sandbox is left on its old environment or checkpoint.
     #[error("{0}")]
     Failed(String),
 }
@@ -180,6 +210,71 @@ pub trait SandboxUpgradeDispatcher: Send + Sync + 'static {
     /// Drop any cached force-restart progress for campaigns no longer in
     /// `unfinished`.
     fn retain_force_restart_campaigns(&self, _unfinished: &[CampaignId]) {}
+}
+
+/// Offline control-plane memory drop for one `suspended` sandbox in a
+/// `sandbox_memory_drops` campaign. Acts in Postgres and object storage with
+/// no node placement or node RPC, and is idempotent across retries and lapsed
+/// leases.
+///
+/// The loop drops a call's future when the item's lease is lost, `:abort`
+/// refuses renewal, or its deadline passes
+/// ([`super::super::CampaignDriver::upgrade`]). The final Postgres re-pin is
+/// fenced where it lands: under the `sandboxes` row lock, verifying the row is
+/// still `suspended`, unsealed by an in-flight `suspend`, pinned to
+/// `expected_artifact_id`, and still attributed to `source` (returning
+/// [`SandboxMemoryDrop::Moved`] otherwise), while enforcing store-level memory
+/// retirement and policy preconditions for `source -> target` alongside that
+/// seal at commit (returning [`SandboxMemoryDrop::Held`] if policy or memory
+/// retirement no longer authorizes dropping `source` memory for `target`).
+///
+/// Committing the `disk` re-pin for `(campaign_id, sandbox_id)` atomically
+/// records durable per-campaign completion in the same transaction so
+/// [`Self::memory_drop_completed`] reports `true` on retries and redriven
+/// leases — even if the reply was lost and the sandbox subsequently woke,
+/// deleted, or suspended a new `full` checkpoint on `source` — preserving the
+/// per-campaign rule that each subject's memory is dropped at most once.
+pub trait SandboxMemoryDropDispatcher: Send + Sync + 'static {
+    /// Project `sandbox_id`'s `expected_artifact_id` `full` checkpoint to a
+    /// `disk` checkpoint for `campaign_id` (`source` -> `target`) and re-pin
+    /// the `suspended` row to it under the sandbox's seal.
+    ///
+    /// At the final re-pin transaction:
+    /// * Under the `sandboxes` `FOR UPDATE` row lock, if a completion record
+    ///   for `(campaign_id, sandbox_id)` already exists, leave the row
+    ///   untouched and return [`SandboxMemoryDrop::AlreadyDropped`].
+    /// * If the row's lifecycle or `current_local_artifact_id` rotated away
+    ///   from `expected_artifact_id`, or the sealed checkpoint no longer
+    ///   attributes to `source`, leave the row untouched and return
+    ///   [`SandboxMemoryDrop::Moved`].
+    /// * If policy, catalog, or memory retirement no longer authorizes dropping
+    ///   `source` memory for a campaign targeting `target` (for example, the
+    ///   cluster default moved from `target` to another certified target),
+    ///   leave the row untouched and return [`SandboxMemoryDrop::Held`].
+    /// * Record `(campaign_id, sandbox_id)` completion in the same transaction
+    ///   that commits the `disk` re-pin so [`Self::memory_drop_completed`]
+    ///   reports `true` if the reply is lost or the lease lapses before
+    ///   `finish_item`.
+    fn drop_memory(
+        &self,
+        campaign_id: CampaignId,
+        sandbox_id: SandboxId,
+        expected_artifact_id: LocalArtifactId,
+        source: EnvironmentReference,
+        target: EnvironmentReference,
+    ) -> impl Future<Output = Result<SandboxMemoryDrop, DispatchError>> + Send;
+
+    /// Whether `campaign_id` has already durably committed a memory drop for
+    /// `sandbox_id`.
+    fn memory_drop_completed(
+        &self,
+        campaign_id: CampaignId,
+        sandbox_id: SandboxId,
+    ) -> impl Future<Output = Result<bool, DispatchError>> + Send;
+
+    /// Drop any cached memory-drop completion state for campaigns no longer in
+    /// `unfinished`.
+    fn retain_memory_drop_campaigns(&self, _unfinished: &[CampaignId]) {}
 }
 
 /// Whether `lifecycle` is an active transition rather than a settled state.

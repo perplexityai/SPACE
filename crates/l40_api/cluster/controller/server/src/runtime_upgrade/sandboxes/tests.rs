@@ -30,6 +30,8 @@ use super::*;
 
 mod force_restart_recovery;
 mod force_restarts;
+mod memory_drop_recovery;
+mod memory_drops;
 mod moves;
 mod passes;
 
@@ -761,6 +763,8 @@ impl SandboxUpgradeDispatcher for FakeDispatcher {
 struct FakeMemoryRetirementState {
     retired: HashSet<EnvironmentReference>,
     generation: u64,
+    reads: usize,
+    on_read_legacy_unbound: HashMap<usize, (PgPool, bool)>,
     script: VecDeque<Result<bool, String>>,
 }
 
@@ -793,6 +797,14 @@ impl FakeMemoryRetirement {
     fn script_reads(&self, reads: impl IntoIterator<Item = Result<bool, String>>) {
         self.state.lock().unwrap().script.extend(reads);
     }
+
+    fn set_legacy_unbound_on_read(&self, read_number: usize, pool: PgPool, allowed: bool) {
+        self.state
+            .lock()
+            .unwrap()
+            .on_read_legacy_unbound
+            .insert(read_number, (pool, allowed));
+    }
 }
 
 impl MemoryRetirementSource for FakeMemoryRetirement {
@@ -800,12 +812,29 @@ impl MemoryRetirementSource for FakeMemoryRetirement {
         &self,
         environment: EnvironmentReference,
     ) -> Result<MemoryRetirement, String> {
-        let mut state = self.state.lock().unwrap();
-        let generation = state.generation;
-        let retired = match state.script.pop_front() {
-            Some(scripted) => scripted?,
-            None => state.retired.contains(&environment),
+        let (generation, retired, side_effect) = {
+            let mut state = self.state.lock().unwrap();
+            state.reads += 1;
+            let read_number = state.reads;
+            let side_effect = state.on_read_legacy_unbound.remove(&read_number);
+            let generation = state.generation;
+            let retired = match state.script.pop_front() {
+                Some(scripted) => scripted?,
+                None => state.retired.contains(&environment),
+            };
+            (generation, retired, side_effect)
         };
+        if let Some((pool, allowed)) = side_effect {
+            let mut tx = pool.begin().await.expect("begin policy tx");
+            pplx_space_runtime_environment_policy_store::set_legacy_unbound_allowed(
+                &mut tx,
+                allowed,
+                &change(),
+            )
+            .await
+            .expect("setting legacy_unbound_allowed during memory_retirement read");
+            tx.commit().await.expect("commit policy tx");
+        }
         Ok(MemoryRetirement {
             retired,
             generation,
