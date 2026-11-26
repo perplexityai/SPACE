@@ -345,6 +345,27 @@ pub(crate) enum RuntimeEnvCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Retire or unretire a deprecated environment's checkpoint memory.
+    Memory {
+        environment: EnvironmentReference,
+        action: RuntimeEnvironmentMemoryActionArg,
+        /// Why, recorded with you on the policy.
+        #[arg(long)]
+        reason: String,
+        /// Retire (`retire` only) even though runnable sandboxes exist whose
+        /// environment can't be determined (`uncovered.unattributed`). Never
+        /// waives sandboxes attributed to the retiring environment.
+        #[arg(long)]
+        strand: bool,
+        /// Apply only if the policy is still at this generation (the one
+        /// `runtime env list` showed), so a write from a stale read is
+        /// refused instead of undoing someone else's change.
+        #[arg(long, value_name = "GENERATION")]
+        if_generation: Option<u64>,
+        /// Emit the raw JSON response.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show each node's enforced policy and whether it matches the cluster's.
     Nodes {
         /// Start after this node id (the previous page's next_after).
@@ -381,6 +402,22 @@ impl RuntimeEnvironmentStateArg {
             Self::Allowed => "allowed",
             Self::Deprecated => "deprecated",
             Self::Blocked => "blocked",
+        }
+    }
+}
+
+/// The actions `PUT .../{environment}/memory` accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum RuntimeEnvironmentMemoryActionArg {
+    Retire,
+    Unretire,
+}
+
+impl RuntimeEnvironmentMemoryActionArg {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Retire => "retire",
+            Self::Unretire => "unretire",
         }
     }
 }

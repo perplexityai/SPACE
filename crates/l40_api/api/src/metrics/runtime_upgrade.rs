@@ -2,10 +2,11 @@
 //!
 //! * `runtime_upgrade.activation.decision` (counter): one per resume or start
 //!   the decision ran for. Tags: `activation` (`start` or `restore`), `plan`
-//!   (`as_recorded`, `restore_on_default`, `cold_boot_upgrade`, `stranded`, or
-//!   `unattributed` when no recorded execution names an environment the
-//!   catalog knows), and `cause` (`blocked`, `unlisted`, `deprecated`, or
-//!   `none` when the environment still executes).
+//!   (`as_recorded`, `restore_on_default`, `drop_memory_and_cold_boot`,
+//!   `cold_boot_upgrade`, `stranded`, or `unattributed` when no recorded
+//!   execution names an environment the catalog knows), and `cause` (`blocked`,
+//!   `unlisted`, `deprecated`, `memory_retired`, or `none` when the environment
+//!   still executes).
 
 use pplx_space_metrics_emit::{counter, tag};
 

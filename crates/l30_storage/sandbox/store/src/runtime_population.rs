@@ -191,7 +191,9 @@ static SANDBOX_POPULATION_QUERY: LazyLock<String> = LazyLock::new(|| {
 /// more often.
 ///
 /// A suspended or restoring sandbox with no such snapshot has no restore
-/// source and counts as unrecorded.
+/// source and counts as unrecorded; that includes rows whose checkpoint memory
+/// was dropped (`current_local_artifact_kind = 'disk'`) until disk-pin restore
+/// readers land.
 /// Every other sandbox's binding comes from the execution metadata its node
 /// last published. Unbound records (legacy work) aren't attributed to an
 /// environment here: that needs the legacy-equivalence rule, which only a

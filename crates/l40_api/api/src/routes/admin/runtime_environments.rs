@@ -31,31 +31,36 @@
 //! target), and which nodes can't enforce a block (node status reports each
 //! node's applied generation; refusing on it is a later change).
 
+mod memory;
+mod nodes;
+
+pub(super) use memory::set_runtime_environment_memory;
+pub(super) use nodes::list_runtime_environment_nodes;
+
+#[cfg(test)]
+use nodes::*;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use axum::{
     Extension, Json,
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use pplx_space_accounts::{NodeId, UserId};
-use pplx_space_admin_protocol::ListAdminNodesFilters;
-use pplx_space_execution_spec::{EnvironmentReference, ExecutionPolicyObservation};
-use pplx_space_node_model::NodeRole;
+use pplx_space_accounts::UserId;
+use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_runtime_environment_policy_store::{
     self as policy_store, GetPolicyError, PolicyChange, PolicyChangeReason, RecordedChange,
     RuntimeEnvironmentPolicy, RuntimeEnvironmentPolicyRecord, RuntimeEnvironmentState,
     SetDefaultError, SetEnvironmentStateError,
 };
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 
 use pplx_space_runtime_upgrade_campaign_store::{self as campaign_store, CampaignId, CampaignKind};
 
 use super::audit::{self, AdminRuntimeEnvironmentAuditEntry};
-use super::node_store::{self, AdminNodeRow, AdminNodeStore};
 use super::runtime_environment_store as store;
 use super::runtime_upgrade_campaigns::campaign_read_error;
 use super::support::{
@@ -67,10 +72,6 @@ use crate::middleware::auth::AuthUser;
 use crate::models::User;
 use crate::reconcile_queue::{ReconcileFacet, ReconcileReason, ReconcileRef};
 use crate::routes::AppState;
-
-/// Rows per `GET /runtime-environments/nodes` page, matching
-/// `GET /nodes/{node_id}/sandboxes`.
-const NODE_PAGE_SIZE: usize = 100;
 
 #[derive(Debug, Serialize)]
 struct RecordedChangeResponse {
@@ -95,6 +96,8 @@ struct EnvironmentStateResponse {
     state: &'static str,
     executes: bool,
     is_default: bool,
+    memory_retired: bool,
+    memory_last_change: Option<RecordedChangeResponse>,
     last_change: Option<RecordedChangeResponse>,
 }
 
@@ -129,6 +132,11 @@ fn policy_response(record: &RuntimeEnvironmentPolicyRecord) -> PolicyResponse {
                 state: state.as_str(),
                 executes: state.executes(),
                 is_default: policy.default_environment == Some(*environment),
+                memory_retired: policy.is_memory_retired(*environment),
+                memory_last_change: record
+                    .environment_memory_changes
+                    .get(environment)
+                    .map(RecordedChangeResponse::from),
                 last_change: record
                     .environment_changes
                     .get(environment)
@@ -179,8 +187,10 @@ struct SetDefaultRequest {
     environment_ref: String,
     reason: String,
     /// Set the first default even though work may depend on an environment
-    /// it stops (see [`AtRisk::of_first_default`]), or an unfinished template
-    /// campaign moves one.
+    /// it stops (see [`AtRisk::of_first_default`]) or an unfinished template
+    /// campaign moves one, or replace the default even though a `deprecated`
+    /// environment with `memory_retired: true` lacks a certified `upgrade_edges`
+    /// entry to the new default.
     #[serde(default)]
     strand: bool,
 }
@@ -649,6 +659,16 @@ pub(super) async fn set_default_runtime_environment(
                 ),
             );
         }
+        Err(SetDefaultError::MemoryRetired(environment)) => {
+            return audit.refuse(
+                StatusCode::CONFLICT,
+                format!(
+                    "environment {environment} has retired its checkpoint memory and can't \
+                     become the default; unretire its memory with \
+                     PUT /runtime-environments/{environment}/memory first"
+                ),
+            );
+        }
         Err(SetDefaultError::UnknownState { environment, .. }) => {
             return audit.refuse(
                 StatusCode::CONFLICT,
@@ -714,6 +734,30 @@ pub(super) async fn set_default_runtime_environment(
         drop(tx);
         return audit.refuse_strand(at_risk);
     }
+    if !request.strand {
+        match memory::deprecated_retired_missing_edge_to_default(&mut tx, environment).await {
+            Ok(None) => {}
+            Ok(Some(retired)) => {
+                drop(tx);
+                return audit.refuse(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "deprecated environment {retired} has memory_retired = true and no \
+                         certified upgrade edge to the new default {environment} in \
+                         runtime_environments; certify an upgrade edge, unretire {retired}'s \
+                         memory, or pass strand: true to move the default anyway"
+                    ),
+                );
+            }
+            Err(response) => {
+                drop(tx);
+                return audit.fail(
+                    "couldn't check certified edges for memory-retired environments",
+                    *response,
+                );
+            }
+        }
+    }
     // A refusal drops the transaction, which discards anything queued in it,
     // and so does a failed enqueue, rolling the write back with it. The
     // enqueue goes last so a refused write doesn't do it at all, and the
@@ -727,6 +771,10 @@ pub(super) async fn set_default_runtime_environment(
             db_error(err).into_response(),
         );
     }
+    state
+        .sandbox_controller
+        .invalidate_runtime_policy_cache()
+        .await;
     audit.record(Some(generation), None);
     Json(SetDefaultResponse {
         generation,
@@ -872,6 +920,16 @@ pub(super) async fn set_runtime_environment_state(
                     ),
                 );
             }
+            Err(SetEnvironmentStateError::MemoryRetired(environment)) => {
+                return audit.refuse(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "environment {environment} has retired its checkpoint memory and can't \
+                         become allowed; unretire its memory with \
+                         PUT /runtime-environments/{environment}/memory first"
+                    ),
+                );
+            }
             Err(error @ SetEnvironmentStateError::PolicyRowMissing) => {
                 tracing::error!(%error, "set runtime environment state");
                 return audit.refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
@@ -959,210 +1017,15 @@ pub(super) async fn set_runtime_environment_state(
             db_error(err).into_response(),
         );
     }
+    state
+        .sandbox_controller
+        .invalidate_runtime_policy_cache()
+        .await;
     audit.record(Some(generation), None);
     Json(SetStateResponse {
         generation,
         environment_ref: environment,
         state: requested.as_str(),
-    })
-    .into_response()
-}
-
-/// How a node's published execution policy compares with the cluster
-/// policy. This compares content, not generations: a node that conforms
-/// enforces what the current policy asks for, whichever write it applied, and
-/// a node on its startup policy, which publishes no generation, is judged the
-/// same way.
-#[derive(Debug, Eq, PartialEq, Serialize)]
-#[serde(tag = "conformance", rename_all = "snake_case")]
-enum NodePolicyConformance {
-    /// The node hasn't published a readable policy, or reports it couldn't
-    /// read the cluster policy it persisted (and so refuses everything).
-    Unknown,
-    Conforms,
-    Diverges {
-        /// The node resolves unbound work to a different default.
-        default_differs: bool,
-        /// The node executes environments the cluster policy doesn't, for
-        /// example one that was blocked.
-        executes_outside_policy: Vec<EnvironmentReference>,
-        /// The node allows unbound legacy work the cluster revoked.
-        allows_revoked_legacy_unbound: bool,
-    },
-}
-
-/// A node narrows to the cluster's executing set, never widens past what its
-/// build certifies, so its allowlist may be a strict subset. Until a default
-/// is set the cluster asks for nothing, and every published policy conforms
-/// on the default and allowlist. The rules nodes apply are in
-/// `docs/execution-environments.md`, "Cluster desired policy".
-fn conformance(
-    policy: &RuntimeEnvironmentPolicy,
-    observed: Option<&ExecutionPolicyObservation>,
-) -> NodePolicyConformance {
-    // A node that couldn't read the cluster policy it persisted refuses
-    // everything; that's no evidence of which policy it would enforce.
-    let Some(observed) = observed.filter(|observed| !observed.cluster_policy_unreadable()) else {
-        return NodePolicyConformance::Unknown;
-    };
-    let (default_differs, executes_outside_policy) = match policy.default_environment {
-        None => (false, Vec::new()),
-        Some(default) => {
-            let executing: BTreeSet<_> = policy.executing().collect();
-            (
-                observed.default_environment_reference() != Some(default),
-                observed
-                    .allowed_environment_references()
-                    .iter()
-                    .copied()
-                    .filter(|environment| !executing.contains(environment))
-                    .collect(),
-            )
-        }
-    };
-    // The cluster can revoke the legacy permission, never grant it, so a
-    // node that refuses legacy work the cluster permits is only stricter.
-    let allows_revoked_legacy_unbound =
-        policy.legacy_unbound_allowed == Some(false) && observed.legacy_unbound_allowed();
-    if !default_differs && executes_outside_policy.is_empty() && !allows_revoked_legacy_unbound {
-        return NodePolicyConformance::Conforms;
-    }
-    NodePolicyConformance::Diverges {
-        default_differs,
-        executes_outside_policy,
-        allows_revoked_legacy_unbound,
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct NodeRuntimePolicyStatus {
-    node_id: NodeId,
-    name: Option<String>,
-    role: NodeRole,
-    substrate_node_id: Option<String>,
-    /// Whether the node's status snapshot is within its `stale_after`.
-    /// `null` when the node has never reported status. A stale node's
-    /// conformance describes what it last published, not what it runs now.
-    status_fresh: Option<bool>,
-    /// Control-plane receipt time of the published policy.
-    policy_received_at: Option<String>,
-    /// The policy the node reports enforcing.
-    enforced: Option<ExecutionPolicyObservation>,
-    /// The cluster policy generation the node reports applying. `null` for a
-    /// node enforcing its startup policy only (an older build, or the cluster
-    /// serving no policy), or one that couldn't read the policy it persisted.
-    applied_generation: Option<u64>,
-    /// Whether `applied_generation` is the generation compared with. A node
-    /// behind can still conform, when nothing it would change has changed.
-    applied_current: Option<bool>,
-    #[serde(flatten)]
-    conformance: NodePolicyConformance,
-}
-
-#[derive(Debug, Serialize)]
-struct NodeRuntimePolicyPage {
-    /// The cluster policy each node was compared with.
-    generation: u64,
-    default_environment_ref: Option<EnvironmentReference>,
-    nodes: Vec<NodeRuntimePolicyStatus>,
-    /// Pass as `after` for the next page; `null` on the last page.
-    next_after: Option<NodeId>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(super) struct NodeRuntimePolicyQuery {
-    after: Option<NodeId>,
-}
-
-/// A snapshot is stale from `stale_after` on, as the node listing's `stale`
-/// flag counts it.
-fn status_fresh(stale_after: OffsetDateTime, now: OffsetDateTime) -> bool {
-    stale_after > now
-}
-
-fn node_status(
-    policy: &RuntimeEnvironmentPolicy,
-    row: AdminNodeRow,
-    now: OffsetDateTime,
-) -> NodeRuntimePolicyStatus {
-    let enforced = node_store::execution_policy(&row);
-    let applied_generation = enforced
-        .as_ref()
-        .and_then(|(policy, _)| policy.applied_generation());
-    NodeRuntimePolicyStatus {
-        node_id: row.id,
-        name: row.name,
-        role: row.role,
-        substrate_node_id: row.substrate_node_id,
-        status_fresh: row
-            .status_stale_after
-            .map(|stale_after| status_fresh(stale_after, now)),
-        policy_received_at: enforced
-            .as_ref()
-            .and_then(|(_, received_at)| *received_at)
-            .map(format_time),
-        conformance: conformance(policy, enforced.as_ref().map(|(policy, _)| policy)),
-        enforced: enforced.map(|(policy, _)| policy),
-        applied_generation,
-        applied_current: applied_generation.map(|applied| applied == policy.generation),
-    }
-}
-
-/// The page of `rows` after `after`, in node id order, and the cursor for
-/// the next page when one follows.
-fn node_page(
-    mut rows: Vec<AdminNodeRow>,
-    after: Option<NodeId>,
-) -> (Vec<AdminNodeRow>, Option<NodeId>) {
-    rows.sort_unstable_by_key(|row| row.id);
-    rows.retain(|row| after.is_none_or(|after| row.id > after));
-    let next_after = if rows.len() > NODE_PAGE_SIZE {
-        rows.truncate(NODE_PAGE_SIZE);
-        rows.last().map(|row| row.id)
-    } else {
-        None
-    };
-    (rows, next_after)
-}
-
-/// `GET /runtime-environments/nodes`: each node's published execution
-/// policy and how it compares with the cluster policy, a page at a time in
-/// node id order.
-///
-/// Reads the admin node listing, which already joins the Direct-only node
-/// table for names and soft deletion, and pages it here: shared code reads
-/// that table only through an existing query (`controllers/substrate/AGENTS.md`).
-/// That costs one full node listing per page, the same read `list-nodes`
-/// makes without occupancy counts.
-pub(super) async fn list_runtime_environment_nodes(
-    State(state): State<AppState>,
-    Extension(AuthUser(actor)): Extension<AuthUser>,
-    Query(query): Query<NodeRuntimePolicyQuery>,
-) -> Response {
-    if let Err(err) = require_managing_org_admin(&state.pool, &actor).await {
-        return err.into_response();
-    }
-    let policy = match policy_store::get(&state.pool).await {
-        Ok(policy) => policy,
-        Err(error) => return policy_read_error(error),
-    };
-    let rows = match AdminNodeStore::new(state.pool.clone())
-        .list(&ListAdminNodesFilters::default())
-        .await
-    {
-        Ok(rows) => rows,
-        Err(err) => return read_db_error(err),
-    };
-    let (rows, next_after) = node_page(rows, query.after);
-    let now = OffsetDateTime::now_utc();
-    Json(NodeRuntimePolicyPage {
-        generation: policy.generation,
-        default_environment_ref: policy.default_environment,
-        nodes: rows
-            .into_iter()
-            .map(|row| node_status(&policy, row, now))
-            .collect(),
-        next_after,
     })
     .into_response()
 }

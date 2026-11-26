@@ -22,3 +22,9 @@ ingressActivation:
   allowedServiceAccounts:
     - space-internal-api
     - space-data-plane
+
+# Static object-store credentials + signing region so `MemoryDrop::from_env`
+# (`SPACE_MEMORY_DROP_ENABLED=true`) reaches Kind's versitygw gateway on
+# inline/ECW/ingress restores and admin offline memory drops.
+snapshotRegion: us-east-1
+snapshotCredentialsSecretName: space-object-store

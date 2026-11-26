@@ -810,3 +810,639 @@ async fn no_restore_claim_takes_a_sealed_row_until_the_seal_expires() -> TestRes
     assert!(!dropped(&db.pool, fixture.sandbox_id).await?);
     Ok(())
 }
+
+#[tokio::test]
+async fn restore_drop_commits_only_under_live_restore_lease_and_parks_suspended() -> TestResult {
+    use super::restore::{
+        RestoreDropRefusal, candidate_for_restore, commit_for_restore, refusal_for_restore,
+        renew_for_restore,
+    };
+
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let fixture = Fixture::insert(&db.pool).await?;
+    let token = Uuid::now_v7();
+    let other_token = Uuid::now_v7();
+
+    assert_eq!(
+        refusal_for_restore(&db.pool, fixture.sandbox_id, token).await?,
+        Some(RestoreDropRefusal::LostLease)
+    );
+
+    crate::restore_lease::claim_user_restore(&db.pool, fixture.sandbox_id, 300, token, 60, None)
+        .await?
+        .expect("claim user restore");
+
+    let candidate =
+        candidate_for_restore(&db.pool, fixture.sandbox_id, token, CandidateRead::Plain)
+            .await?
+            .expect("eligible restoring candidate");
+    assert_eq!(candidate.pinned_artifact_id, fixture.artifact_id);
+    assert_eq!(
+        refusal_for_restore(&db.pool, fixture.sandbox_id, token).await?,
+        None
+    );
+    assert_eq!(
+        refusal_for_restore(&db.pool, fixture.sandbox_id, other_token).await?,
+        Some(RestoreDropRefusal::LostLease)
+    );
+
+    // A short renewal never shortens a longer user-restore lease, while a longer
+    // renewal extends it.
+    let before: OffsetDateTime = sqlx::query_scalar(sql!(
+        "SELECT restore_lease_expires_at FROM sandboxes WHERE id = $1"
+    ))
+    .bind(fixture.sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(renew_for_restore(&db.pool, fixture.sandbox_id, token, Duration::from_secs(60)).await?);
+    let after_short: OffsetDateTime = sqlx::query_scalar(sql!(
+        "SELECT restore_lease_expires_at FROM sandboxes WHERE id = $1"
+    ))
+    .bind(fixture.sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(after_short, before);
+    assert!(
+        renew_for_restore(
+            &db.pool,
+            fixture.sandbox_id,
+            token,
+            Duration::from_secs(600),
+        )
+        .await?
+    );
+    let after_long: OffsetDateTime = sqlx::query_scalar(sql!(
+        "SELECT restore_lease_expires_at FROM sandboxes WHERE id = $1"
+    ))
+    .bind(fixture.sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(after_long > before);
+
+    let disk = LocalArtifactId::from_uuid(Uuid::now_v7());
+    assert!(
+        !commit_for_restore(&db.pool, fixture.sandbox_id, other_token, &candidate, disk).await?
+    );
+    assert!(commit_for_restore(&db.pool, fixture.sandbox_id, token, &candidate, disk).await?);
+    assert!(dropped(&db.pool, fixture.sandbox_id).await?);
+    assert_eq!(
+        refusal_for_restore(&db.pool, fixture.sandbox_id, token).await?,
+        Some(RestoreDropRefusal::AlreadyDropped)
+    );
+    let (lifecycle, lease_token): (String, Option<Uuid>) = sqlx::query_as(sql!(
+        "SELECT lifecycle, restore_lease_token FROM sandboxes WHERE id = $1"
+    ))
+    .bind(fixture.sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(lifecycle, "suspended");
+    assert_eq!(lease_token, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn park_unplaced_restore_as_suspended_reverts_cleanly_under_matching_token() -> TestResult {
+    use super::restore::park_unplaced_restore_as_suspended;
+
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let fixture = Fixture::insert(&db.pool).await?;
+    let token = Uuid::now_v7();
+    crate::restore_lease::claim_user_restore(&db.pool, fixture.sandbox_id, 300, token, 60, None)
+        .await?
+        .expect("claim user restore");
+
+    assert!(
+        !park_unplaced_restore_as_suspended(&db.pool, fixture.sandbox_id, Uuid::now_v7()).await?
+    );
+    assert!(park_unplaced_restore_as_suspended(&db.pool, fixture.sandbox_id, token).await?);
+
+    let (lifecycle, lease_token, lease_expires): (String, Option<Uuid>, Option<OffsetDateTime>) =
+        sqlx::query_as(sql!(
+            "SELECT lifecycle, restore_lease_token, restore_lease_expires_at
+               FROM sandboxes
+              WHERE id = $1"
+        ))
+        .bind(fixture.sandbox_id)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(lifecycle, "suspended");
+    assert_eq!(lease_token, None);
+    assert_eq!(lease_expires, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn coverage_groups_distinguish_gone_node_node_held_encrypted_and_dropped_rows() -> TestResult
+{
+    use super::coverage::coverage_groups;
+
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let e0_meta = serde_json::json!({ "environment": "env:v1:fc-15" });
+    let e1_meta = serde_json::json!({ "environment": "env:v1:fc-17" });
+
+    // Covered E0 row (gone node, unencrypted, ready durable full suspend pin).
+    let covered = Fixture::insert(&db.pool).await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots SET execution_metadata = $2 WHERE id = $1"
+    ))
+    .bind(covered.snapshot_id)
+    .bind(&e0_meta)
+    .execute(&db.pool)
+    .await?;
+
+    // Node-held E0 row (registered node).
+    let node_held = Fixture::insert(&db.pool).await?;
+    insert_node(&db.pool, node_held.target_node_id, "worker-live-e0").await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots SET execution_metadata = $2 WHERE id = $1"
+    ))
+    .bind(node_held.snapshot_id)
+    .bind(&e0_meta)
+    .execute(&db.pool)
+    .await?;
+
+    // Encrypted E0 row on a gone node.
+    let encrypted = Fixture::insert(&db.pool).await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET volume_encryption = TRUE WHERE id = $1"
+    ))
+    .bind(encrypted.sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots SET execution_metadata = $2 WHERE id = $1"
+    ))
+    .bind(encrypted.snapshot_id)
+    .bind(&e0_meta)
+    .execute(&db.pool)
+    .await?;
+
+    // Already-dropped E0 row is excluded; a `stopped` sandbox upgraded to an E1
+    // disk artifact binds to E1 even if `sandbox_observed_states` still carries E0,
+    // while an un-upgraded `stopped` E0 sandbox stays in E0 (`!needs_droppable_pin`).
+    let already_dropped = Fixture::insert(&db.pool).await?;
+    let drop_token = Uuid::now_v7();
+    let drop_read = seal_row(&db.pool, already_dropped.sandbox_id, drop_token, TTL)
+        .await?
+        .expect("eligible");
+    assert!(
+        commit(
+            &db.pool,
+            already_dropped.sandbox_id,
+            drop_token,
+            &drop_read,
+            LocalArtifactId::from_uuid(Uuid::now_v7()),
+        )
+        .await?
+    );
+    let stopped_upgraded = Fixture::insert(&db.pool).await?;
+    let upgraded_disk_artifact = LocalArtifactId::from_uuid(Uuid::now_v7());
+    let live_stop_node = NodeId::new();
+    insert_node(&db.pool, live_stop_node, "worker-stop-obs").await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_observed_states
+             (sandbox_id, node_id, status, execution_metadata)
+         VALUES ($1, $2, 'stopped', $3)"
+    ))
+    .bind(stopped_upgraded.sandbox_id)
+    .bind(live_stop_node)
+    .bind(&e0_meta)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshots
+             (id, sandbox_id, type, state, timestamp, local_artifact_id,
+              artifact_kind, artifact_origin, execution_metadata, org_id)
+         VALUES ($1, $2, 'disk', 'ready', NOW(), $3, 'disk', 'stop', $4, $5::UUID)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(stopped_upgraded.sandbox_id)
+    .bind(upgraded_disk_artifact)
+    .bind(&e1_meta)
+    .bind(SEED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET lifecycle = 'stopped',
+                current_local_artifact_id = $2,
+                current_local_artifact_kind = 'disk',
+                current_local_artifact_origin = 'stop'
+          WHERE id = $1"
+    ))
+    .bind(stopped_upgraded.sandbox_id)
+    .bind(upgraded_disk_artifact)
+    .execute(&db.pool)
+    .await?;
+
+    let stopped_e0 = Fixture::insert(&db.pool).await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_observed_states
+             (sandbox_id, node_id, status, execution_metadata)
+         VALUES ($1, $2, 'stopped', $3)"
+    ))
+    .bind(stopped_e0.sandbox_id)
+    .bind(live_stop_node)
+    .bind(&e0_meta)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET lifecycle = 'stopped',
+                current_local_artifact_id = NULL,
+                current_local_artifact_kind = NULL,
+                current_local_artifact_origin = NULL
+          WHERE id = $1"
+    ))
+    .bind(stopped_e0.sandbox_id)
+    .execute(&db.pool)
+    .await?;
+
+    // Markerless E0 row with a newer failed E1 snapshot stays attributed to E0,
+    // never hidden behind the failed E1 attempt.
+    let shadowed_by_failed = Fixture::insert(&db.pool).await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET current_local_artifact_id = NULL,
+                current_local_artifact_kind = NULL,
+                current_local_artifact_origin = NULL,
+                placement_changed_at = NULL
+          WHERE id = $1"
+    ))
+    .bind(shadowed_by_failed.sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots SET execution_metadata = $2 WHERE id = $1"
+    ))
+    .bind(shadowed_by_failed.snapshot_id)
+    .bind(&e0_meta)
+    .execute(&db.pool)
+    .await?;
+    let failed_e1_snap = insert_snapshot_in(
+        &db.pool,
+        shadowed_by_failed.sandbox_id,
+        LocalArtifactId::from_uuid(Uuid::now_v7()),
+        "1 second",
+        "failed",
+    )
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots SET execution_metadata = $2 WHERE id = $1"
+    ))
+    .bind(failed_e1_snap)
+    .bind(&e1_meta)
+    .execute(&db.pool)
+    .await?;
+
+    // Repairable `failed` E0 row on a gone node with an intact full suspend pin
+    // is covered (`unplaced_on_gone_node = true`, `droppable_pin = true`), not
+    // misclassified as `node_held`.
+    let failed_repairable = Fixture::insert(&db.pool).await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'failed' WHERE id = $1"
+    ))
+    .bind(failed_repairable.sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots
+            SET execution_metadata = $2,
+                artifact_origin = 'suspend'
+          WHERE id = $1"
+    ))
+    .bind(failed_repairable.snapshot_id)
+    .bind(&e0_meta)
+    .execute(&db.pool)
+    .await?;
+
+    // Repairable `failed` E0 row on a gone node whose stale marker repair will
+    // clear lands in `unplaced_on_gone_node && !droppable_pin` (`unpinned_or_not_ready`),
+    // not `node_held` and not falsely covered.
+    let failed_stale_marker = Fixture::insert(&db.pool).await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET lifecycle = 'failed',
+                current_local_artifact_id = $2
+          WHERE id = $1"
+    ))
+    .bind(failed_stale_marker.sandbox_id)
+    .bind(Uuid::now_v7())
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots
+            SET execution_metadata = $2,
+                artifact_origin = 'suspend'
+          WHERE id = $1"
+    ))
+    .bind(failed_stale_marker.snapshot_id)
+    .bind(&e0_meta)
+    .execute(&db.pool)
+    .await?;
+
+    // Live-node encrypted E1 row stays grouped under E1, not E0.
+    let e1_row = Fixture::insert(&db.pool).await?;
+    insert_node(&db.pool, e1_row.target_node_id, "worker-live-e1").await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET volume_encryption = TRUE WHERE id = $1"
+    ))
+    .bind(e1_row.sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots SET execution_metadata = $2 WHERE id = $1"
+    ))
+    .bind(e1_row.snapshot_id)
+    .bind(&e1_meta)
+    .execute(&db.pool)
+    .await?;
+
+    let groups = coverage_groups(&db.pool).await?;
+    let e0_groups: Vec<_> = groups
+        .iter()
+        .filter(|group| group.execution_metadata.as_ref() == Some(&e0_meta))
+        .collect();
+    assert_eq!(
+        e0_groups.iter().map(|group| group.sandboxes).sum::<u64>(),
+        7
+    );
+    assert!(e0_groups.iter().any(|group| {
+        group.kubernetes
+            && !group.encrypted
+            && group.unplaced_on_gone_node
+            && group.needs_droppable_pin
+            && group.droppable_pin
+            && group.sandboxes == 2
+    }));
+    assert!(e0_groups.iter().any(|group| {
+        group.kubernetes
+            && !group.encrypted
+            && group.unplaced_on_gone_node
+            && group.needs_droppable_pin
+            && !group.droppable_pin
+            && group.sandboxes == 2
+    }));
+    assert!(e0_groups.iter().any(|group| {
+        group.kubernetes
+            && !group.encrypted
+            && !group.unplaced_on_gone_node
+            && group.needs_droppable_pin
+            && group.sandboxes == 1
+    }));
+    assert!(e0_groups.iter().any(|group| {
+        group.kubernetes
+            && !group.encrypted
+            && !group.unplaced_on_gone_node
+            && !group.needs_droppable_pin
+            && group.sandboxes == 1
+    }));
+    assert!(e0_groups.iter().any(|group| {
+        group.kubernetes && group.encrypted && group.unplaced_on_gone_node && group.sandboxes == 1
+    }));
+    let e1_total: u64 = groups
+        .iter()
+        .filter(|group| group.execution_metadata.as_ref() == Some(&e1_meta))
+        .map(|group| group.sandboxes)
+        .sum();
+    assert_eq!(e1_total, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn coverage_groups_flags_active_restoring_lease_as_node_held_and_accepts_expired_lease()
+-> TestResult {
+    use super::coverage::coverage_groups;
+
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let active_meta = serde_json::json!({ "environment": "env:v1:fc-active-lease" });
+    let expired_meta = serde_json::json!({ "environment": "env:v1:fc-expired-lease" });
+
+    let active_restore = Fixture::insert(&db.pool).await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots SET execution_metadata = $2 WHERE id = $1"
+    ))
+    .bind(active_restore.snapshot_id)
+    .bind(&active_meta)
+    .execute(&db.pool)
+    .await?;
+    crate::restore_lease::claim_user_restore(
+        &db.pool,
+        active_restore.sandbox_id,
+        300,
+        Uuid::now_v7(),
+        60,
+        None,
+    )
+    .await?
+    .expect("claim user restore");
+
+    let expired_restore = Fixture::insert(&db.pool).await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots SET execution_metadata = $2 WHERE id = $1"
+    ))
+    .bind(expired_restore.snapshot_id)
+    .bind(&expired_meta)
+    .execute(&db.pool)
+    .await?;
+    crate::restore_lease::claim_user_restore(
+        &db.pool,
+        expired_restore.sandbox_id,
+        300,
+        Uuid::now_v7(),
+        60,
+        None,
+    )
+    .await?
+    .expect("claim user restore");
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET restore_lease_expires_at = NOW() - INTERVAL '1 second'
+          WHERE id = $1"
+    ))
+    .bind(expired_restore.sandbox_id)
+    .execute(&db.pool)
+    .await?;
+
+    let groups = coverage_groups(&db.pool).await?;
+    let active_group = groups
+        .iter()
+        .find(|group| group.execution_metadata.as_ref() == Some(&active_meta))
+        .expect("active restoring group");
+    assert!(!active_group.unplaced_on_gone_node);
+    assert_eq!(active_group.sandboxes, 1);
+
+    let expired_group = groups
+        .iter()
+        .find(|group| group.execution_metadata.as_ref() == Some(&expired_meta))
+        .expect("expired restoring group");
+    assert!(expired_group.unplaced_on_gone_node);
+    assert!(expired_group.droppable_pin);
+    assert_eq!(expired_group.sandboxes, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn restore_drop_refuses_and_flags_overwritten_post_claim_restoring_pin() -> TestResult {
+    use super::coverage::coverage_groups;
+    use super::restore::{
+        RestoreDropRefusal, candidate_for_restore, commit_for_restore, refusal_for_restore,
+    };
+
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pre_claim_meta = serde_json::json!({ "environment": "env:v1:fc-pre-claim" });
+    let post_claim_meta = serde_json::json!({ "environment": "env:v1:fc-post-claim" });
+
+    let f = Fixture::insert(&db.pool).await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots SET execution_metadata = $2 WHERE id = $1"
+    ))
+    .bind(f.snapshot_id)
+    .bind(&pre_claim_meta)
+    .execute(&db.pool)
+    .await?;
+
+    let token = Uuid::now_v7();
+    crate::restore_lease::claim_user_restore(&db.pool, f.sandbox_id, 300, token, 60, None)
+        .await?
+        .expect("claim user restore");
+
+    // Simulate a failed restore branch that minted a post-claim snapshot and
+    // overwrote `current_local_artifact_id` before the lease expired and got
+    // redriven.
+    let overwritten_artifact = LocalArtifactId::from_uuid(Uuid::now_v7());
+    let overwritten_snap = SnapshotId::from_uuid(Uuid::now_v7());
+    sqlx::query(sql!(
+        "INSERT INTO snapshots
+            (id, sandbox_id, type, state, timestamp, local_artifact_id,
+             artifact_kind, artifact_origin, execution_metadata, org_id)
+         VALUES ($1, $2, 'full', 'ready', NOW() + INTERVAL '5 seconds', $3,
+                 'full', 'suspend', $4, $5::UUID)"
+    ))
+    .bind(overwritten_snap)
+    .bind(f.sandbox_id)
+    .bind(overwritten_artifact)
+    .bind(&post_claim_meta)
+    .bind(SEED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshot_storage_locations
+            (snapshot_id, storage_connection_string, org_id)
+         VALUES ($1, $2, $3::UUID)"
+    ))
+    .bind(overwritten_snap)
+    .bind(storage_uri(f.sandbox_id, overwritten_snap))
+    .bind(SEED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET current_local_artifact_id = $2,
+                current_local_artifact_kind = 'full',
+                current_local_artifact_origin = 'suspend'
+          WHERE id = $1"
+    ))
+    .bind(f.sandbox_id)
+    .bind(overwritten_artifact)
+    .execute(&db.pool)
+    .await?;
+
+    assert_eq!(
+        candidate_for_restore(&db.pool, f.sandbox_id, token, CandidateRead::Plain).await?,
+        None
+    );
+    assert_eq!(
+        refusal_for_restore(&db.pool, f.sandbox_id, token).await?,
+        Some(RestoreDropRefusal::Refused(
+            MemoryDropRefusal::NoDurableCopy
+        ))
+    );
+    let synthetic = MemoryDropCandidate {
+        org_id: pplx_space_accounts::OrgId::from_uuid(SEED_ORG_ID),
+        pinned_artifact_id: overwritten_artifact,
+        full_snapshot_id: overwritten_snap,
+        storage_connection_string: storage_uri(f.sandbox_id, overwritten_snap),
+    };
+    assert!(
+        !commit_for_restore(
+            &db.pool,
+            f.sandbox_id,
+            token,
+            &synthetic,
+            LocalArtifactId::from_uuid(Uuid::now_v7()),
+        )
+        .await?
+    );
+
+    // Expire the lease so the row isn't held by an active lease; coverage must
+    // still attribute it to the pre-restore checkpoint and mark `droppable_pin = false`.
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET restore_lease_expires_at = NOW() - INTERVAL '1 second'
+          WHERE id = $1"
+    ))
+    .bind(f.sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    let groups = coverage_groups(&db.pool).await?;
+    let pre_group = groups
+        .iter()
+        .find(|group| group.execution_metadata.as_ref() == Some(&pre_claim_meta))
+        .expect("pre-claim group");
+    assert!(pre_group.unplaced_on_gone_node);
+    assert!(pre_group.needs_droppable_pin);
+    assert!(!pre_group.droppable_pin);
+    assert!(
+        groups
+            .iter()
+            .all(|group| group.execution_metadata.as_ref() != Some(&post_claim_meta))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn coverage_groups_rejects_non_per_attempt_storage_uri_as_undroppable() -> TestResult {
+    use super::coverage::coverage_groups;
+
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let bad_uri_meta = serde_json::json!({ "environment": "env:v1:fc-bad-uri" });
+    let f = Fixture::insert(&db.pool).await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots SET execution_metadata = $2 WHERE id = $1"
+    ))
+    .bind(f.snapshot_id)
+    .bind(&bad_uri_meta)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE snapshot_storage_locations
+            SET storage_connection_string = 's3://test-bucket/legacy-prefix?region=us-east-1'
+          WHERE snapshot_id = $1"
+    ))
+    .bind(f.snapshot_id)
+    .execute(&db.pool)
+    .await?;
+
+    let groups = coverage_groups(&db.pool).await?;
+    let group = groups
+        .iter()
+        .find(|group| group.execution_metadata.as_ref() == Some(&bad_uri_meta))
+        .expect("bad-uri group");
+    assert!(group.unplaced_on_gone_node);
+    assert!(group.needs_droppable_pin);
+    assert!(!group.droppable_pin);
+    Ok(())
+}

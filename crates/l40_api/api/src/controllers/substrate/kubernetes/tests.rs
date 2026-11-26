@@ -29,6 +29,7 @@ pub(super) mod environment_placement;
 mod native_pod_failover;
 mod node_instance;
 mod runtime_upgrade_dispatch;
+mod runtime_upgrade_memory_drop;
 mod slot_headroom;
 mod substrate_scope;
 

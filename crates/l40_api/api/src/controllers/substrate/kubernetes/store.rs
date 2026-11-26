@@ -54,6 +54,7 @@ mod runtime_upgrade;
 mod started_recovery;
 mod suspend;
 
+pub(super) use restore_lease::memory_dropped_restore_pending;
 pub(super) use restore_source::RestoreSnapshotChoice;
 
 #[derive(Clone)]

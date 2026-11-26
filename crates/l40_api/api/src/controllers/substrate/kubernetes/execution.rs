@@ -256,6 +256,7 @@ struct PreparedWakeDrive {
     intent: RestoreIntent,
     cleanup_on_failure: bool,
     join_deadline: Instant,
+    pod_step_entered: Arc<AtomicBool>,
 }
 
 impl RestoreClaimHandling {
@@ -1729,7 +1730,7 @@ impl KubernetesSubstrate {
                         .fetch_restore_ownership_snapshot(sandbox_id)
                         .await
                         .ok()
-                        .map(|(_, _, remaining_secs)| remaining_secs)
+                        .map(|(_, _, remaining_secs, _)| remaining_secs)
                         .filter(|remaining_secs| *remaining_secs > 0.0)
                         .map(Duration::from_secs_f64);
                     return Err(SubstrateError::RestoreInFlight {
@@ -1929,6 +1930,8 @@ impl KubernetesSubstrate {
         }
         let shutdown_token = self.shutdown_token.clone();
         let sandbox_id = prepared.sandbox.id;
+        let pod_step_entered = Arc::new(AtomicBool::new(false));
+        let drive_pod_step_entered = Arc::clone(&pod_step_entered);
         let leader_span = tracing::info_span!("substrate.wake.leader", sandbox_id = %sandbox_id);
         let wake_trace = crate::wake_trace::current();
         let leader = self.task_tracker.spawn(
@@ -1942,6 +1945,7 @@ impl KubernetesSubstrate {
                     intent,
                     cleanup_on_failure,
                     join_deadline,
+                    pod_step_entered: drive_pod_step_entered,
                 }));
                 // The reservation rides with the detached leader, so a
                 // disconnected caller doesn't uncount a restore still running.
@@ -1964,10 +1968,16 @@ impl KubernetesSubstrate {
                         result
                     }
                 };
-                // As in the inline restore: a failed drive may have left its
-                // pod, so the count lapses after one TTL either way.
-                if let Some(live) = live {
-                    live.keep();
+                // A drive that succeeded or entered pod materialization may
+                // have left a pod, so the count lapses after one TTL; a failure
+                // before `ensure_pod_exists` created no pod and releases its
+                // slot immediately.
+                if let Some(mut live) = live {
+                    if result.is_err() && !pod_step_entered.load(Ordering::Acquire) {
+                        live.no_pod_yet();
+                    } else {
+                        live.keep();
+                    }
                 }
                 result
             })
@@ -1989,6 +1999,7 @@ impl KubernetesSubstrate {
             intent,
             cleanup_on_failure,
             join_deadline,
+            pod_step_entered,
         } = drive;
         let target_state = intent.target.state();
         let wake_activity = intent.target.activity();
@@ -2070,6 +2081,7 @@ impl KubernetesSubstrate {
         // the lifecycle cleanup decision without being reduced to a plain
         // `SubstrateError`.
         let wake_was_dispatched = AtomicBool::new(false);
+        let memory_drop_entered = AtomicBool::new(false);
         // With the dispatch fence on, a user restore proves on its execution
         // that it hasn't sent its Wake and renews that proof while this future
         // lives; the Wake goes out only after ownership is confirmed under the
@@ -2094,20 +2106,43 @@ impl KubernetesSubstrate {
                 None
             };
             // Decided before the pod exists, so a stranded sandbox is refused
-            // before anything is placed. Every restore here lands in the
-            // started lifecycle except a drain's evacuation, which keeps the
-            // sandbox's lifecycle and its environment.
+            // and a retired-memory checkpoint drops its memory before anything
+            // is placed. Every restore here lands in the started lifecycle
+            // except a drain's evacuation, which keeps the sandbox's lifecycle
+            // and its environment.
             let runtime_upgrade = match &restore_plan {
                 Some(plan) if intent.allows_runtime_upgrade => {
-                    self.activation_runtime_upgrade(
-                        sandbox_id,
-                        UpgradeActivation::Restore,
-                        plan.storage_uri.as_deref(),
-                    )
-                    .await?
+                    match self
+                        .decide_activation_runtime(
+                            sandbox_id,
+                            UpgradeActivation::Restore,
+                            plan.storage_uri.as_deref(),
+                        )
+                        .await?
+                    {
+                        super::runtime_upgrade::ActivationRuntimePlan::NoWakeUpgrade => None,
+                        super::runtime_upgrade::ActivationRuntimePlan::WakeUpgrade(upgrade) => {
+                            Some(upgrade)
+                        }
+                        super::runtime_upgrade::ActivationRuntimePlan::DropMemoryAndColdBoot(
+                            to_default,
+                        ) => {
+                            memory_drop_entered.store(true, Ordering::Release);
+                            match self
+                                .drop_memory_for_restore(
+                                    sandbox_id,
+                                    prepared
+                                        .restore_claim
+                                        .and_then(RestoreClaim::restore_lease_token),
+                                    to_default,
+                                )
+                                .await? {}
+                        }
+                    }
                 }
                 _ => None,
             };
+            pod_step_entered.store(true, Ordering::Release);
             // Boxed: `ensure_pod_exists` is a large future; inlining it here
             // overflows the test thread's stack.
             let (activation_attempt_id, joined_attempt_id) = match Box::pin(
@@ -2494,41 +2529,83 @@ impl KubernetesSubstrate {
         )
         .await;
 
-        if cleanup_on_failure
-            && restore_failure_should_revert_to_suspended(
+        if cleanup_on_failure && result.is_err() {
+            if memory_drop_entered.load(Ordering::Acquire) {
+                // `drop_memory_for_restore` runs before `ensure_pod_exists`. When
+                // `commit_for_restore` succeeded, the row is already `suspended`
+                // with its lease cleared; on any failure or outer `wait_budget`
+                // cancellation, park an unplaced restore back in `suspended` (or
+                // release the lease if an earlier attempt already placed one)
+                // rather than leaving `Timeout` wedged in `restoring`.
+                if let Some(restore_lease_token) = prepared
+                    .restore_claim
+                    .and_then(RestoreClaim::restore_lease_token)
+                {
+                    match self
+                        .store
+                        .park_unplaced_restore_as_suspended(sandbox_id, restore_lease_token)
+                        .await
+                    {
+                        Ok(true) => {
+                            if matches!(
+                                prepared.restore_claim,
+                                Some(RestoreClaim::FreshFromSuspended { .. })
+                            ) {
+                                crate::metrics::sandbox::restore::claim_reverted(
+                                    RestoreClaimRevert::LifecycleOnly.metric_outcome(),
+                                );
+                            }
+                        }
+                        Ok(false) => {
+                            if let Err(release_err) = self
+                                .store
+                                .release_user_restore_lease(sandbox_id, restore_lease_token)
+                                .await
+                            {
+                                tracing::warn!(
+                                    sandbox_id = %sandbox_id,
+                                    error = %release_err,
+                                    "failed to release restore lease after restore-time memory drop failure"
+                                );
+                            }
+                        }
+                        Err(update_err) => {
+                            tracing::warn!(
+                                sandbox_id = %sandbox_id,
+                                error = %update_err,
+                                "failed to park unplaced restore as suspended after restore-time memory drop failure"
+                            );
+                        }
+                    }
+                }
+            } else if restore_failure_should_revert_to_suspended(
                 prepared.restore_claim,
                 result.as_ref().err(),
                 wake_dispatch,
-            )
-            && let Some(restore_claim) = prepared.restore_claim
-        {
-            self.revert_failed_restore_claim(
-                sandbox_id,
-                restore_claim,
-                activation_assignment.assigned(),
-            )
-            .await;
-        }
-        if cleanup_on_failure
-            && !restore_failure_should_revert_to_suspended(
-                prepared.restore_claim,
-                result.as_ref().err(),
-                wake_dispatch,
-            )
-            && wake_failure_should_revert_to_suspended(result.as_ref().err(), wake_dispatch)
-            && let Some(restore_lease_token) = prepared
-                .restore_claim
-                .and_then(RestoreClaim::restore_lease_token)
-            && let Err(update_err) = self
-                .store
-                .release_user_restore_lease(sandbox_id, restore_lease_token)
-                .await
-        {
-            tracing::warn!(
-                sandbox_id = %sandbox_id,
-                error = %update_err,
-                "failed to release restore lease after Kubernetes wake failure"
-            );
+            ) {
+                if let Some(restore_claim) = prepared.restore_claim {
+                    self.revert_failed_restore_claim(
+                        sandbox_id,
+                        restore_claim,
+                        activation_assignment.assigned(),
+                    )
+                    .await;
+                }
+            } else if wake_failure_should_revert_to_suspended(result.as_ref().err(), wake_dispatch)
+                && let Some(restore_lease_token) = prepared
+                    .restore_claim
+                    .and_then(RestoreClaim::restore_lease_token)
+                && let Err(update_err) = self
+                    .store
+                    .release_user_restore_lease(sandbox_id, restore_lease_token)
+                    .await
+            {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %update_err,
+                    "failed to release restore lease after Kubernetes wake failure"
+                );
+            }
         }
 
         if let Ok((_, Some((activation_attempt_id, generation)))) = &result {

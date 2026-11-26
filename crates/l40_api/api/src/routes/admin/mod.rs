@@ -186,6 +186,10 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
             get(runtime_environments::get_runtime_environment_population),
         )
         .route(
+            "/runtime-environments/{environment_ref}/memory",
+            put(runtime_environments::set_runtime_environment_memory),
+        )
+        .route(
             "/runtime-environments/{environment_ref}/state",
             put(runtime_environments::set_runtime_environment_state),
         )

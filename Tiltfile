@@ -726,7 +726,7 @@ k8s_resource(
 # reaches them (they would admit it open, not fail it).
 SPACE_API_DEPS = ["space-postgres", "label-kind-workers", "label-kind-infra",
                   "install-space-shim", "internal-rpc-tls", "space-sandbox-network-policy",
-                  "space-db-migrate", "space-redis"]
+                  "space-db-migrate", "space-redis", "space-object-store"]
 # No port_forward: localhost:8080 is the cluster's host port mapping onto the
 # space-api-entry NodePort (kind-cluster.yaml.tmpl), which spreads connections
 # across the autoscaled replicas as a deployment's load balancer does.

@@ -935,6 +935,9 @@ pub struct KubernetesSubstrate {
     /// The runtime environment policy the resume- and start-time upgrade
     /// decision reads, shared by clones.
     runtime_policy: super::runtime_upgrade::RuntimePolicyCache,
+    /// Object-store memory drop (`SPACE_MEMORY_DROP_ENABLED`), used inline when
+    /// a restore arrives for an environment whose checkpoint memory was retired.
+    memory_drop: Option<crate::controllers::sandbox::memory_drop::MemoryDrop>,
     /// Readiness, preserve-decision, suspend and connect budgets. Production
     /// takes the default, which is the constants each one names.
     budgets: SubstrateBudgets,
@@ -954,6 +957,19 @@ impl KubernetesSubstrate {
     /// ([`super::Substrate::boots_template_twins`]).
     pub(crate) fn boots_template_twins(&self) -> bool {
         self.capabilities().boots_required_environment && self.k8s.environment_placement.refuses()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_memory_drop(
+        mut self,
+        memory_drop: crate::controllers::sandbox::memory_drop::MemoryDrop,
+    ) -> Self {
+        self.memory_drop = Some(memory_drop);
+        self
+    }
+
+    pub(crate) async fn invalidate_runtime_policy_cache(&self) {
+        self.runtime_policy.invalidate().await;
     }
 
     pub async fn try_from_env(
@@ -999,6 +1015,7 @@ impl KubernetesSubstrate {
                     cancel_tracker: CancelRateTracker::with_default_budget(),
                     recovery_join_backoff: execution::RecoveryJoinBackoffPolicy::default(),
                     runtime_policy: super::runtime_upgrade::RuntimePolicyCache::default(),
+                    memory_drop: crate::controllers::sandbox::memory_drop::MemoryDrop::from_env(),
                     budgets: SubstrateBudgets::default(),
                     shutdown_token,
                     task_tracker,

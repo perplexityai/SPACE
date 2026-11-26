@@ -1,13 +1,18 @@
+use std::collections::BTreeMap;
+
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request};
-use pplx_space_accounts::OrgId;
+use pplx_space_accounts::{NodeId, OrgId};
 use pplx_space_content_digest::Digest;
-use pplx_space_node_model::SubstrateKind;
+use pplx_space_execution_spec::ExecutionPolicyObservation;
+use pplx_space_node_model::{NodeRole, SubstrateKind};
+use pplx_space_runtime_environment_policy_store::RuntimeEnvironmentPolicy;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use time::OffsetDateTime;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -61,6 +66,7 @@ fn policy(
         default_environment: default,
         legacy_unbound_allowed,
         environments: states.iter().copied().collect(),
+        memory_retired_environments: Default::default(),
     }
 }
 
@@ -554,6 +560,67 @@ async fn harness_on(db: Fixture) -> TestResult<Option<Harness>> {
     harness_with_state(db, state).await
 }
 
+async fn harness_with_memory_drop_direct() -> TestResult<Option<Harness>> {
+    let Some(db) = postgres_fixture().await? else {
+        return Ok(None);
+    };
+    pplx_space_runtime_environment_policy_store::test_support::apply_memory_retirement_schema(
+        &db.pool,
+    )
+    .await?;
+    let mut state = AppState::from_pool(db.pool.clone()).await?;
+    state.memory_drop_enabled = true;
+    harness_with_state(db, state).await
+}
+
+#[cfg(feature = "kubernetes")]
+async fn state_with_kubernetes_substrate(pool: PgPool) -> TestResult<AppState> {
+    use crate::controllers::substrate::kubernetes::tests::{
+        mock_kubernetes_client, substrate_with_store_and_client,
+    };
+    let kubernetes = substrate_with_store_and_client(
+        pool.clone(),
+        mock_kubernetes_client(std::sync::Arc::default()),
+    );
+    let substrate = crate::controllers::substrate::Substrate::from_kubernetes(kubernetes);
+    substrate.check_environment_memory_retirement()?;
+    let mut state = AppState::from_pool(pool).await?;
+    state.sandbox_controller = crate::controllers::sandbox::SandboxController::new(substrate);
+    Ok(state)
+}
+
+#[cfg(feature = "kubernetes")]
+async fn harness_with_memory_drop_unmigrated() -> TestResult<Option<Harness>> {
+    let Some(db) = postgres_fixture().await? else {
+        return Ok(None);
+    };
+    pplx_space_runtime_environment_policy_store::test_support::apply_memory_retirement_schema(
+        &db.pool,
+    )
+    .await?;
+    pplx_space_runtime_environment_policy_store::test_support::revert_memory_retirement_schema(
+        &db.pool,
+    )
+    .await?;
+    let mut state = state_with_kubernetes_substrate(db.pool.clone()).await?;
+    state.memory_drop_enabled = true;
+    harness_with_state(db, state).await
+}
+
+#[cfg(feature = "kubernetes")]
+async fn harness_with_memory_drop() -> TestResult<Option<Harness>> {
+    let Some(db) = postgres_fixture().await? else {
+        return Ok(None);
+    };
+    pplx_space_runtime_environment_policy_store::test_support::apply_memory_retirement_schema(
+        &db.pool,
+    )
+    .await?;
+    let mut state = state_with_kubernetes_substrate(db.pool.clone()).await?;
+    state.memory_drop_enabled = true;
+    harness_with_state(db, state).await
+}
+
 /// A harness on a deployment whose creates boot the twin they resolve to: a
 /// Kubernetes substrate with the environment placement gate `on`.
 #[cfg(feature = "kubernetes")]
@@ -574,6 +641,32 @@ async fn harness_booting_twins() -> TestResult<Option<Harness>> {
     assert!(substrate.boots_template_twins());
     let mut state = AppState::from_pool(db.pool.clone()).await?;
     state.sandbox_controller = crate::controllers::sandbox::SandboxController::new(substrate);
+    harness_with_state(db, state).await
+}
+
+#[cfg(feature = "kubernetes")]
+async fn harness_booting_twins_with_memory_drop() -> TestResult<Option<Harness>> {
+    use crate::controllers::substrate::kubernetes::tests::{
+        mock_kubernetes_client, substrate_with_store_and_client,
+    };
+    let Some(db) = postgres_fixture().await? else {
+        return Ok(None);
+    };
+    pplx_space_runtime_environment_policy_store::test_support::apply_memory_retirement_schema(
+        &db.pool,
+    )
+    .await?;
+    let mut kubernetes = substrate_with_store_and_client(
+        db.pool.clone(),
+        mock_kubernetes_client(std::sync::Arc::default()),
+    );
+    kubernetes.k8s.environment_placement =
+        crate::controllers::substrate::environment_placement::EnvironmentPlacementGate::On;
+    let substrate = crate::controllers::substrate::Substrate::from_kubernetes(kubernetes);
+    assert!(substrate.boots_template_twins());
+    let mut state = AppState::from_pool(db.pool.clone()).await?;
+    state.sandbox_controller = crate::controllers::sandbox::SandboxController::new(substrate);
+    state.memory_drop_enabled = true;
     harness_with_state(db, state).await
 }
 
@@ -617,6 +710,14 @@ impl Harness {
         self.put(&state_path(environment), body).await
     }
 
+    async fn set_memory(
+        &self,
+        environment: EnvironmentReference,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        self.put(&memory_path(environment), body).await
+    }
+
     async fn put_if_match(&self, path: &str, body: Value, if_match: &str) -> (StatusCode, Value) {
         call_with_if_match(
             &self.app,
@@ -636,6 +737,10 @@ impl Harness {
 
 fn state_path(environment: EnvironmentReference) -> String {
     format!("/admin/api/v1{}", state_path_suffix(environment))
+}
+
+fn memory_path(environment: EnvironmentReference) -> String {
+    format!("/admin/api/v1{}", memory_path_suffix(environment))
 }
 
 async fn call(
@@ -685,6 +790,10 @@ async fn call_with_if_match(
 
 fn state_path_suffix(environment: EnvironmentReference) -> String {
     format!("/runtime-environments/{environment}/state")
+}
+
+fn memory_path_suffix(environment: EnvironmentReference) -> String {
+    format!("/runtime-environments/{environment}/memory")
 }
 
 /// Realistic execution metadata, bound to `environment` when given.
@@ -792,9 +901,12 @@ async fn insert_snapshot(
     if located {
         sqlx::query(sql!(
             "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string)
-             VALUES ($1, 's3://synthetic-bucket/snapshot')"
+             VALUES ($1, $2)"
         ))
         .bind(snapshot_id)
+        .bind(format!(
+            "s3://synthetic-bucket/snapshots/{sandbox_id}/{snapshot_id}?region=us-east-1"
+        ))
         .execute(pool)
         .await?;
     }
@@ -905,6 +1017,7 @@ fn published(observation: &ExecutionPolicyObservation) -> Value {
     serde_json::to_value(observation).unwrap()
 }
 
+mod memory;
 mod nodes;
 mod population;
 mod reconcile;

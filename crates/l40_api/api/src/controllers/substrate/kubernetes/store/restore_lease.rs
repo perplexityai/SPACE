@@ -36,7 +36,7 @@ impl K8sStore {
     pub(in crate::controllers::substrate::kubernetes) async fn fetch_restore_ownership_snapshot(
         &self,
         sandbox_id: SandboxId,
-    ) -> Result<(SandboxLifecycle, Option<String>, f64), SubstrateError> {
+    ) -> Result<(SandboxLifecycle, Option<String>, f64, f64), SubstrateError> {
         let restore_lease::RestoreOwnershipSnapshot {
             lifecycle,
             evacuation_restore_target: marker,
@@ -63,7 +63,12 @@ impl K8sStore {
         } else {
             lease_remaining_secs
         };
-        Ok((lifecycle, marker, ownership_remaining_secs))
+        Ok((
+            lifecycle,
+            marker,
+            ownership_remaining_secs,
+            execution_remaining_secs,
+        ))
     }
 
     pub(super) fn restore_ownership_collision(
@@ -416,24 +421,25 @@ impl K8sStore {
         };
 
         let Some(restore_claim) = restore_claim else {
-            // Both claims refuse a row whose memory was dropped, or one a
-            // memory drop holds sealed. Checked first: their other answers (a
-            // lost drain claim the drain drops, an ownership collision, a
-            // lifecycle conflict) would hide why, and a sealed row is
-            // retryable.
+            // Both claims refuse a row whose memory was dropped. Evacuation
+            // claims also refuse a sealed row directly so the drain doesn't
+            // misread it as `EvacuationClaimLost`; user restores fall through to
+            // `RestoreInFlight` below so `wait_for_user_restore` joins the seal
+            // instead of failing immediately.
             if pplx_space_sandbox_store::memory_drop::dropped(&self.pool, sandbox_id)
                 .await
                 .db_context("failed to read whether the sandbox's memory was dropped")?
             {
                 return Err(memory_dropped_restore_pending());
             }
-            if pplx_space_sandbox_store::memory_drop::sealed(&self.pool, sandbox_id)
-                .await
-                .db_context("failed to read the memory drop seal")?
+            if require_evacuation_marker
+                && pplx_space_sandbox_store::memory_drop::sealed(&self.pool, sandbox_id)
+                    .await
+                    .db_context("failed to read the memory drop seal")?
             {
                 return Err(memory_drop_in_progress());
             }
-            let (lifecycle, marker, ownership_remaining_secs) =
+            let (lifecycle, marker, ownership_remaining_secs, execution_remaining_secs) =
                 self.fetch_restore_ownership_snapshot(sandbox_id).await?;
             // When the marker was required and the row is still in the
             // suspend/restore window, the CAS lost to a concurrent user
@@ -488,6 +494,24 @@ impl K8sStore {
                     ownership_remaining_secs,
                 ));
             }
+            // Only a `suspended` row with no live execution fence (`execution_remaining_secs <= 0.0`)
+            // missed `claim_user_restore` on a memory-drop seal that cleared between the CAS and
+            // `fetch_restore_ownership_snapshot`; an active execution fence must stay `Conflict`
+            // so `wake_execution_uncoalesced` runs `ConflictRedrive` and honors `retry_deferral`.
+            if !require_evacuation_marker
+                && lifecycle == SandboxLifecycle::Suspended
+                && execution_remaining_secs <= 0.0
+            {
+                if pplx_space_sandbox_store::memory_drop::dropped(&self.pool, sandbox_id)
+                    .await
+                    .db_context("failed to re-read whether the sandbox's memory was dropped")?
+                {
+                    return Err(memory_dropped_restore_pending());
+                }
+                return Err(SubstrateError::restore_in_flight(format!(
+                    "sandbox {sandbox_id} became claimable while checking its restore lease"
+                )));
+            }
             return Err(SubstrateError::Conflict {
                 message: format!("sandbox cannot be restored while lifecycle is {lifecycle}"),
             });
@@ -538,7 +562,7 @@ impl K8sStore {
             };
         }
 
-        let (lifecycle, marker, ownership_remaining_secs) =
+        let (lifecycle, marker, ownership_remaining_secs, _) =
             self.fetch_restore_ownership_snapshot(sandbox_id).await?;
 
         if lifecycle == SandboxLifecycle::Restoring
@@ -588,6 +612,29 @@ impl K8sStore {
         restore_lease::complete_owned_user_restore(&self.pool, sandbox_id, restore_lease_token)
             .await
             .db_context("failed to complete owned sandbox restore")
+    }
+
+    pub(in crate::controllers::substrate::kubernetes) async fn is_memory_dropped_disk_pin(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<bool, SubstrateError> {
+        pplx_space_sandbox_store::memory_drop::pinned_to_disk(&self.pool, sandbox_id)
+            .await
+            .db_context("failed to check whether sandbox restore source is pinned to a disk")
+    }
+
+    pub(in crate::controllers::substrate::kubernetes) async fn park_unplaced_restore_as_suspended(
+        &self,
+        sandbox_id: SandboxId,
+        restore_lease_token: Uuid,
+    ) -> Result<bool, SubstrateError> {
+        pplx_space_sandbox_store::memory_drop::restore::park_unplaced_restore_as_suspended(
+            &self.pool,
+            sandbox_id,
+            restore_lease_token,
+        )
+        .await
+        .db_context("failed to park unplaced restore as suspended")
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn release_user_restore_lease(
@@ -678,7 +725,7 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<(), SubstrateError> {
-        let (_, marker, _) = self.fetch_restore_ownership_snapshot(sandbox_id).await?;
+        let (_, marker, _, _) = self.fetch_restore_ownership_snapshot(sandbox_id).await?;
         if marker.as_deref() == Some("stopped") {
             return Err(super::stopped_evacuation_pending());
         }
