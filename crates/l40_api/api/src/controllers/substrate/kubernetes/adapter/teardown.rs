@@ -2,6 +2,7 @@
 //! including retirement when no active execution remains.
 
 use super::*;
+use pplx_space_accounts::NodeId;
 
 /// The address a fenced teardown may send its in-VM stop to, derived from the
 /// execution row and the pod the fence check already verified.
@@ -181,18 +182,36 @@ impl KubernetesSubstrate {
     ///
     /// This takes the [`RetireFence::NoExecution`] path in delete mode: only
     /// inactive executions' pods are deleted, no in-VM request is sent, and the
-    /// placement clear re-proves the absence inside the lock execution creation
-    /// also takes. Delete mode keeps the placement clock bump that
-    /// `delete_execution` makes.
+    /// tracking clear re-proves the absence inside the lock execution creation
+    /// also takes. That clear leaves a `stopped` row placed, as every pod
+    /// teardown does, so the node is then released on its own, by
+    /// [`K8sStore::release_stopped_evacuation_placement`]: only for a row
+    /// still `stopped` with the drain's evacuation marker, a durable pinned
+    /// disk artifact and no active execution, still placed on
+    /// `source_node_id`, the node the caller confirmed holds the artifact's
+    /// rootfs. The first release bumps the placement clock, as
+    /// `delete_execution` does; a retry that finds the row already released
+    /// leaves it.
     ///
-    /// `Ok(true)` when the sandbox was torn down (or had nothing left to tear
-    /// down), `Ok(false)` when an active execution appeared and this call
-    /// changed nothing. Reached through
-    /// [`Self::delete_execution_retired_by_current_stop`], `Ok(false)` can
-    /// follow that wrapper's committed retirement of the pre-stop execution.
+    /// `Ok(true)` when the sandbox was torn down and its node released, or a
+    /// retry found both already done. `Ok(false)` leaves the row on its node,
+    /// in two cases:
+    ///
+    /// * An active execution appeared before the teardown, which then deleted
+    ///   nothing.
+    /// * The release refused after the teardown deleted the inactive
+    ///   executions' pods and cleared the tracking: the row no longer
+    ///   qualifies (its marker or its durable disk artifact is gone, an
+    ///   execution appeared, it moved to another node, or it was deleted).
+    ///   The node keeps the rootfs, so nothing is lost.
+    ///
+    /// Reached through [`Self::delete_execution_retired_by_current_stop`],
+    /// `Ok(false)` can also follow that wrapper's committed retirement of the
+    /// pre-stop execution.
     pub async fn delete_execution_with_no_active_execution(
         &self,
         sandbox_id: SandboxId,
+        source_node_id: NodeId,
     ) -> Result<bool, SubstrateError> {
         let outcome = self
             .teardown_execution(
@@ -201,7 +220,12 @@ impl KubernetesSubstrate {
                 &RetireFence::NoExecution,
             )
             .await?;
-        Ok(matches!(outcome, RetireExecutionOutcome::Retired))
+        if !matches!(outcome, RetireExecutionOutcome::Retired) {
+            return Ok(false);
+        }
+        self.store
+            .release_stopped_evacuation_placement(sandbox_id, source_node_id)
+            .await
     }
 
     /// [`Self::delete_execution_with_no_active_execution`] for a `stopped`
@@ -213,13 +237,14 @@ impl KubernetesSubstrate {
     /// holds a live activation attempt on it
     /// ([`K8sStore::retire_executions_predating_current_stop`]). The no-execution
     /// teardown then runs as before: the now-inactive pods are deleted, no
-    /// in-VM request is sent, and the placement clear re-proves the absence. So
-    /// a `start` that lands at any point still keeps its pod, its rootfs and its
-    /// placement; the most it can lose is the pre-stop execution it would have
-    /// replaced anyway.
+    /// in-VM request is sent, and both the tracking clear and the node release
+    /// re-prove the absence. So a `start` that lands at any point still keeps
+    /// its pod, its rootfs and its placement; the most it can lose is the
+    /// pre-stop execution it would have replaced anyway.
     pub async fn delete_execution_retired_by_current_stop(
         &self,
         sandbox_id: SandboxId,
+        source_node_id: NodeId,
     ) -> Result<bool, SubstrateError> {
         if !self
             .store
@@ -228,7 +253,7 @@ impl KubernetesSubstrate {
         {
             return Ok(false);
         }
-        self.delete_execution_with_no_active_execution(sandbox_id)
+        self.delete_execution_with_no_active_execution(sandbox_id, source_node_id)
             .await
     }
 

@@ -1164,6 +1164,10 @@ struct TestStoppedPath {
     /// pinned to exactly the artifact the cluster row records.
     teardown_node_artifact: Option<NodeReportedArtifact>,
     teardowns: std::sync::Mutex<Vec<SandboxId>>,
+    /// A statement another writer commits between the teardown's pod delete
+    /// and its node release, bound to the sandbox id as `$1`. `None` models
+    /// no such writer.
+    before_release: Option<&'static str>,
 }
 
 type SuspendExecutionResult = Result<Option<PublishedLocalArtifact>, SubstrateError>;
@@ -1532,6 +1536,7 @@ impl SubstrateSink {
                 node_artifact: Self::stopped_pinless_node(),
                 teardown_node_artifact: None,
                 teardowns: std::sync::Mutex::new(Vec::new()),
+                before_release: None,
             })),
             promotion_node_api_clients: tokio::sync::Mutex::new(HashMap::new()),
             restore_listener: tokio::sync::Mutex::new(None),
@@ -1586,6 +1591,28 @@ impl SubstrateSink {
             node_artifact,
             teardown_node_artifact,
             teardowns: std::sync::Mutex::new(Vec::new()),
+            before_release: None,
+        }));
+        sink
+    }
+
+    /// Same as [`Self::with_stopped_path`], but with another writer committing
+    /// `before_release` (bound to the sandbox id as `$1`) between the
+    /// teardown's pod delete and its node release.
+    #[cfg(test)]
+    fn with_stopped_path_before_release(
+        pool: PgPool,
+        artifact: EnqueuedArtifactBackup,
+        before_release: &'static str,
+    ) -> Self {
+        let mut sink = Self::with_stopped_path(pool, artifact);
+        sink.substrate = SubstrateSinkBackend::StoppedPath(Arc::new(TestStoppedPath {
+            publish: Box::new(move |_| Ok(artifact)),
+            publish_calls: std::sync::Mutex::new(0),
+            node_artifact: Self::stopped_pinless_node(),
+            teardown_node_artifact: None,
+            teardowns: std::sync::Mutex::new(Vec::new()),
+            before_release: Some(before_release),
         }));
         sink
     }
@@ -1961,8 +1988,16 @@ impl SubstrateSink {
 
     /// The teardown's one irreversible call, behind a seam so a test can
     /// observe whether it happened at all. Production has exactly one arm.
-    /// `Ok(false)` when an active execution newer than the stop exists, in
-    /// which case nothing was torn down.
+    /// `Ok(true)` when the sandbox's pods are gone and `source_node_id` is
+    /// released. `Ok(false)` leaves the row on `source_node_id`, in two cases:
+    ///
+    /// * An active execution newer than the stop exists, or a `start` holds a
+    ///   live activation attempt on the pre-stop one. Nothing was torn down.
+    /// * The release refused after the pre-stop execution was retired and its
+    ///   pods deleted: the row lost its evacuation marker or its durable disk
+    ///   artifact, gained an active execution, left `source_node_id`, or was
+    ///   deleted. The node still holds the rootfs, so nothing is lost, and the
+    ///   next tick re-reads the claim.
     ///
     /// Fenced rather than unfenced, and on "no execution newer than the stop"
     /// rather than "no active execution". On Kubernetes a stop leaves its
@@ -1975,31 +2010,43 @@ impl SubstrateSink {
     async fn delete_execution_for_teardown(
         &self,
         sandbox_id: SandboxId,
+        source_node_id: NodeId,
     ) -> Result<bool, SubstrateError> {
         #[cfg(test)]
         if let SubstrateSinkBackend::StoppedPath(fake) = &self.substrate {
-            // The real retirement, fence and transaction included, against the
-            // same database: a test reaches the refusal by seeding an execution
-            // rather than by a knob. What's faked is the Kubernetes half that
-            // follows it in production (the pod delete, and the placement clear
-            // that re-checks for an active execution).
-            if !pplx_space_api::controllers::substrate::kubernetes::retire_executions_predating_current_stop(
-                self.pool.clone(),
-                sandbox_id,
-            )
-            .await?
-            {
+            // The real retirement and the real node release, fences,
+            // statements and transactions included, against the same
+            // database: a test reaches either refusal by seeding rows rather
+            // than by a knob. What's faked is the Kubernetes half between them
+            // in production: the pod delete, and the tracking clear, which
+            // leaves a `stopped` row placed.
+            use pplx_space_api::controllers::substrate::kubernetes::{
+                release_stopped_evacuation_placement, retire_executions_predating_current_stop,
+            };
+            if !retire_executions_predating_current_stop(self.pool.clone(), sandbox_id).await? {
                 return Ok(false);
             }
             fake.teardowns
                 .lock()
                 .expect("stopped-path teardown recorder poisoned")
                 .push(sandbox_id);
-            return Ok(true);
+            if let Some(statement) = fake.before_release {
+                sqlx::query(sqlx::AssertSqlSafe(statement))
+                    .bind(sandbox_id)
+                    .execute(&self.pool)
+                    .await
+                    .expect("the concurrent writer's statement must apply");
+            }
+            return release_stopped_evacuation_placement(
+                self.pool.clone(),
+                sandbox_id,
+                source_node_id,
+            )
+            .await;
         }
         self.substrate
             .kubernetes()
-            .delete_execution_retired_by_current_stop(sandbox_id)
+            .delete_execution_retired_by_current_stop(sandbox_id, source_node_id)
             .await
     }
 
@@ -2126,7 +2173,10 @@ impl SubstrateSink {
                 .with_from_state(SandboxLifecycle::Stopped.as_str())
                 .source_node_id(node_label.to_string()),
         );
-        let torn_down = match self.delete_execution_for_teardown(sandbox_id).await {
+        let torn_down = match self
+            .delete_execution_for_teardown(sandbox_id, source_node_id)
+            .await
+        {
             Ok(torn_down) => torn_down,
             Err(err) => {
                 emit_node_drain_event(
@@ -2139,17 +2189,17 @@ impl SubstrateSink {
                 );
                 // Retryable, and safe to retry: the bytes are already durable,
                 // the claim is still held, and a partially-applied teardown
-                // converges because the delete clears placement even when it
-                // finds no pod left to remove.
+                // converges because the release runs again even when the
+                // delete finds no execution left to retire or pod to remove.
                 return Err(EvacuateError::LocalTeardown(err.to_string()));
             }
         };
         if !torn_down {
             return Ok(StoppedEvacuationOutcome::Deferred {
                 reason: format!(
-                    "sandbox {sandbox_id} is being started, was started or lost its evacuation \
-                     marker after the teardown was authorized; its copy on the node was \
-                     left alone"
+                    "sandbox {sandbox_id} is being started, was started, was deleted, left its \
+                     node, or lost its evacuation marker or its durable disk artifact after the \
+                     teardown was authorized; its node keeps it"
                 ),
             });
         }
@@ -4349,13 +4399,12 @@ impl NodeDrainSink for SubstrateSink {
         // its owner's `start` is a hard 503 until the sweep reaches it.
         //
         // `placement_changed_at` is the stopped arm's equivalent: the teardown's
-        // placement clear (`forget_pod_tracking_if_no_active_execution`, in delete
-        // mode) runs under `PlacementClock::Bump` (only `Retire` preserves), so it
-        // is stamped at exactly the moment the row became
-        // unplaced — the same "became the sweep's responsibility" instant the
-        // suspend arm gets from its own column. The `CASE` costs an in-memory sort
-        // the sweep was already doing over a set bounded by the marker's partial
-        // index.
+        // node release (`release_published_stopped_evacuation`) sets it to `NOW()`
+        // in the write that unplaces the row, so it is stamped at exactly the
+        // moment the row became unplaced — the same "became the sweep's
+        // responsibility" instant the suspend arm gets from its own column. The
+        // `CASE` costs an in-memory sort the sweep was already doing over a set
+        // bounded by the marker's partial index.
         let rows =
             sandbox_store::evacuation_restores::pending(&self.pool, honor_backoff_windows).await?;
         let mut out = Vec::with_capacity(rows.len());

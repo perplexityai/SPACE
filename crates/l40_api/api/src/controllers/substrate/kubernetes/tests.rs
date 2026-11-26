@@ -11,7 +11,7 @@ use super::*;
 use k8s_openapi::api::core::v1::PodStatus;
 
 pub(crate) use kubernetes_tests::{
-    SequencedWakeWorker, deleted_pod_kubernetes_client,
+    SequencedWakeWorker, conflict_then_created_kubernetes_client, deleted_pod_kubernetes_client,
     existing_then_created_running_pod_kubernetes_client, inert_kubernetes_client,
     insert_k8s_execution, insert_ready_full_snapshot_relative_to_lifecycle,
     insert_test_sandbox_row, mock_kubernetes_client, node_api_pod_on_node, node_with_network_slots,
@@ -30,6 +30,7 @@ mod native_pod_failover;
 mod node_instance;
 mod runtime_upgrade_dispatch;
 mod slot_headroom;
+mod stopped_start_stale_pod;
 mod substrate_scope;
 
 mod kubernetes_tests {
@@ -1418,7 +1419,7 @@ mod kubernetes_tests {
         );
     }
 
-    fn conflict_then_created_kubernetes_client(
+    pub(crate) fn conflict_then_created_kubernetes_client(
         captured_pod_creates: Arc<Mutex<Vec<serde_json::Value>>>,
     ) -> Client {
         let create_attempts = Arc::new(Mutex::new(0usize));
@@ -16191,6 +16192,15 @@ mod kubernetes_tests {
         .expect("placement must be queryable")
     }
 
+    /// The row's `placement_changed_at`, exactly.
+    async fn placement_changed_at(pool: &PgPool, sandbox_id: SandboxId) -> OffsetDateTime {
+        sqlx::query_scalar("SELECT placement_changed_at FROM sandboxes WHERE id = $1")
+            .bind(sandbox_id)
+            .fetch_one(pool)
+            .await
+            .expect("placement clock must be queryable")
+    }
+
     /// A drain tearing down an evacuated `stopped` sandbox must not touch one
     /// its owner has started since the teardown was authorized. The start's
     /// execution is the only trace of it the teardown can see, and the
@@ -16215,7 +16225,7 @@ mod kubernetes_tests {
         );
 
         let torn_down = substrate
-            .delete_execution_with_no_active_execution(sandbox_id)
+            .delete_execution_with_no_active_execution(sandbox_id, node_id)
             .await?;
 
         assert!(!torn_down, "the teardown must report that it did nothing");
@@ -16242,7 +16252,9 @@ mod kubernetes_tests {
     /// The other half: with no active execution, the same call releases the
     /// node the way `delete_execution` does — the stopped sandbox's retired
     /// pods deleted, its placement cleared, and the placement clock bumped,
-    /// which the restore sweep's stopped arm orders on.
+    /// which the restore sweep's stopped arm orders on. As in production, the
+    /// drain has marked the row and published its disk first: the unplace
+    /// keeps a `stopped` row on its node otherwise.
     #[tokio::test(flavor = "current_thread")]
     async fn a_stopped_teardown_releases_the_node_when_nothing_is_running() -> Result<(), BoxError>
     {
@@ -16252,6 +16264,8 @@ mod kubernetes_tests {
         let pod_name = format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple());
         insert_test_sandbox_row(&pool, sandbox_id, "stopped").await?;
         let node_id = place_on_fresh_node(&pool, sandbox_id).await?;
+        mark_stopped_evacuation(&pool, sandbox_id).await?;
+        publish_durable_disk(&pool, sandbox_id).await?;
         insert_k8s_execution(&pool, sandbox_id, 1, &pod_name, "uid-retired", None, false).await?;
         assert_eq!(
             placement_of(&pool, sandbox_id).await,
@@ -16267,7 +16281,7 @@ mod kubernetes_tests {
         );
 
         let torn_down = substrate
-            .delete_execution_with_no_active_execution(sandbox_id)
+            .delete_execution_with_no_active_execution(sandbox_id, node_id)
             .await?;
 
         assert!(torn_down, "with nothing running the teardown must proceed");
@@ -16283,6 +16297,20 @@ mod kubernetes_tests {
                 .iter()
                 .any(|(path, _)| path.ends_with(&pod_name)),
             "the retired execution's pod must be deleted"
+        );
+        let released_at = placement_changed_at(&pool, sandbox_id).await;
+        assert!(
+            substrate
+                .delete_execution_with_no_active_execution(sandbox_id, node_id)
+                .await?,
+            "a retry after the release must converge, not defer the drain"
+        );
+        assert_eq!(placement_of(&pool, sandbox_id).await.0, None);
+        assert_eq!(
+            placement_changed_at(&pool, sandbox_id).await,
+            released_at,
+            "the retry must keep the first release's placement clock, which the restore \
+             sweep's stopped arm orders on"
         );
         Ok(())
     }
@@ -16304,14 +16332,15 @@ mod kubernetes_tests {
         let stopped = SandboxId::new();
         let stopped_pod = format!("space-sbx-{}-g1", stopped.as_uuid().simple());
         insert_test_sandbox_row(&pool, stopped, "started").await?;
-        place_on_fresh_node(&pool, stopped).await?;
+        let stopped_node = place_on_fresh_node(&pool, stopped).await?;
         insert_k8s_execution(&pool, stopped, 1, &stopped_pod, "uid-pre-stop", None, true).await?;
         sqlx::query("UPDATE sandboxes SET lifecycle = 'stopped' WHERE id = $1")
             .bind(stopped)
             .execute(&pool)
             .await?;
-        // The drain's claim on it.
+        // The drain's claim on it, and the disk it published.
         mark_stopped_evacuation(&pool, stopped).await?;
+        publish_durable_disk(&pool, stopped).await?;
 
         // A whole start→stop cycle since the drain's claim: the execution
         // predates the new stop, but the start cleared the marker.
@@ -16354,13 +16383,13 @@ mod kubernetes_tests {
 
         assert!(
             !substrate
-                .delete_execution_with_no_active_execution(stopped)
+                .delete_execution_with_no_active_execution(stopped, stopped_node)
                 .await?,
             "precondition: the plain no-execution teardown refuses the shape a stop leaves"
         );
         assert!(
             substrate
-                .delete_execution_retired_by_current_stop(stopped)
+                .delete_execution_retired_by_current_stop(stopped, stopped_node)
                 .await?,
             "the execution the stop left active must not block the teardown"
         );
@@ -16381,7 +16410,7 @@ mod kubernetes_tests {
 
         assert!(
             !substrate
-                .delete_execution_retired_by_current_stop(starting)
+                .delete_execution_retired_by_current_stop(starting, starting_node)
                 .await?,
             "an execution newer than the stop must refuse the teardown"
         );
@@ -16401,7 +16430,7 @@ mod kubernetes_tests {
 
         assert!(
             !substrate
-                .delete_execution_retired_by_current_stop(cycled)
+                .delete_execution_retired_by_current_stop(cycled, cycled_node)
                 .await?,
             "a start→stop cycle since the claim must refuse the teardown"
         );
@@ -16447,6 +16476,7 @@ mod kubernetes_tests {
                 .execute(&pool)
                 .await?;
             mark_stopped_evacuation(&pool, sandbox_id).await?;
+            publish_durable_disk(&pool, sandbox_id).await?;
             sqlx::query(
                 "UPDATE sandbox_k8s_executions
                     SET activation_attempt_id = $2,
@@ -16461,7 +16491,7 @@ mod kubernetes_tests {
             .await?;
             rows.push((sandbox_id, node));
         }
-        let [(starting, starting_node), (abandoned, _)] = rows[..] else {
+        let [(starting, starting_node), (abandoned, abandoned_node)] = rows[..] else {
             unreachable!("two rows were seeded");
         };
 
@@ -16474,7 +16504,7 @@ mod kubernetes_tests {
 
         assert!(
             !substrate
-                .delete_execution_retired_by_current_stop(starting)
+                .delete_execution_retired_by_current_stop(starting, starting_node)
                 .await?,
             "a start holding a live attempt on the pre-stop execution must refuse the teardown"
         );
@@ -16486,7 +16516,7 @@ mod kubernetes_tests {
 
         assert!(
             substrate
-                .delete_execution_retired_by_current_stop(abandoned)
+                .delete_execution_retired_by_current_stop(abandoned, abandoned_node)
                 .await?,
             "an expired attempt must not hold the node"
         );
@@ -16515,10 +16545,23 @@ mod kubernetes_tests {
 
         assert!(
             !substrate
-                .delete_execution_retired_by_current_stop(SandboxId::new())
+                .delete_execution_retired_by_current_stop(SandboxId::new(), NodeId::new())
                 .await?,
             "a teardown with no sandbox row must refuse"
         );
+        Ok(())
+    }
+
+    /// The durable disk artifact a drain publishes before it releases a
+    /// stopped sandbox's node.
+    async fn publish_durable_disk(pool: &PgPool, sandbox_id: SandboxId) -> Result<(), BoxError> {
+        pplx_space_db_test_fixtures::publish_ready_disk_artifact(
+            pool,
+            sandbox_id,
+            LocalArtifactId::new(),
+            "s3://space-test/stopped-teardown-disk?region=us-east-1",
+        )
+        .await?;
         Ok(())
     }
 
