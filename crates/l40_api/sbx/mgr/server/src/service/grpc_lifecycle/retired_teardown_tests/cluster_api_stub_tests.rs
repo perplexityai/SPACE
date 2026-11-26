@@ -453,3 +453,43 @@ where
         )
         .await
 }
+
+/// A gRPC handler answering one request type once its future resolves, for
+/// [`answer_later`].
+struct AnswerLater<F, Resp>(std::sync::Arc<F>, std::marker::PhantomData<fn() -> Resp>);
+
+impl<Req, Resp, F, Fut> tonic::server::UnaryService<Req> for AnswerLater<F, Resp>
+where
+    F: Fn(Req) -> Fut,
+    Fut: std::future::Future<Output = Result<Resp, tonic::Status>> + Send + 'static,
+{
+    type Response = Resp;
+    type Future =
+        futures_util::future::BoxFuture<'static, Result<tonic::Response<Resp>, tonic::Status>>;
+
+    fn call(&mut self, request: tonic::Request<Req>) -> Self::Future {
+        let answer = (self.0)(request.into_inner());
+        Box::pin(async move { answer.await.map(tonic::Response::new) })
+    }
+}
+
+/// Answer one gRPC `request` with the future `handler` returns, for a stub
+/// that holds a request until something else happened.
+pub(in crate::service::grpc_lifecycle) async fn answer_later<B, Req, Resp, Fut>(
+    request: http::Request<B>,
+    handler: impl Fn(Req) -> Fut,
+) -> http::Response<tonic::body::Body>
+where
+    B: http_body::Body + Send + 'static,
+    B::Error: Into<tonic::codegen::StdError> + Send + 'static,
+    Req: prost::Message + Default + Send + 'static,
+    Resp: prost::Message + Send + 'static,
+    Fut: std::future::Future<Output = Result<Resp, tonic::Status>> + Send + 'static,
+{
+    tonic::server::Grpc::new(tonic_prost::ProstCodec::<Resp, Req>::default())
+        .unary(
+            AnswerLater(std::sync::Arc::new(handler), std::marker::PhantomData),
+            request,
+        )
+        .await
+}

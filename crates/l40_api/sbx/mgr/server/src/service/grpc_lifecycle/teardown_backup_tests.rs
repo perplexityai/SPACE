@@ -337,17 +337,88 @@ const UNAVAILABLE_SANDBOX: uuid::Uuid =
 /// register once.
 const UNAVAILABLE_BEGINS: usize = 2;
 
+/// The sandbox whose first [`UNAVAILABLE_BEGINS`] registrations the control
+/// plane is unavailable to, as [`UNAVAILABLE_SANDBOX`]'s, and which then
+/// registers an attempt only once the node has finalized it, as a handoff's
+/// registration lands after the finalize of a worker that ended the upload.
+const LATE_REGISTERING_SANDBOX: uuid::Uuid =
+    uuid::Uuid::from_u128(0x019f_8000_0000_7000_8000_0000_0000_0b10);
+
 /// A control plane that admits every artifact backup but [`REFUSED_SANDBOX`]'s
-/// and the first ones of [`RECOVERING_SANDBOX`] and [`UNAVAILABLE_SANDBOX`],
-/// finalizes every attempt it registered, answering a finalize of any other
-/// `NotFound`, as the control plane does, and has no ready backup of any
-/// artifact. It records every registration it is asked for and every finalize.
+/// and the first ones of [`RECOVERING_SANDBOX`], [`UNAVAILABLE_SANDBOX`] and
+/// [`LATE_REGISTERING_SANDBOX`], finalizes every attempt it registered,
+/// answering a finalize of any other `NotFound`, as the control plane does,
+/// and has no ready backup of any artifact. It records every registration it
+/// is asked for and every finalize.
 #[derive(Clone, Default)]
 struct BackupControlPlane {
     recovering_begins: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     unavailable_begins: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    late_registering_begins: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// The backup attempts it registered.
     registered: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// The backup attempts the node finalized, registered or not.
+    finalized: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl BackupControlPlane {
+    async fn begin_artifact_backup(
+        self,
+        request: pplx_space_node_api_client::proto::BeginArtifactBackupRequest,
+    ) -> Result<pplx_space_node_api_client::proto::BeginArtifactBackupResponse, Status> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if !request.fence_verdict_only {
+            super::retired_teardown_tests::record_begun_attempt(&request.backup_attempt_id);
+        }
+        let sandbox_id = request.sandbox_id.parse::<uuid::Uuid>().ok();
+        if sandbox_id == Some(UNAVAILABLE_SANDBOX)
+            && self.unavailable_begins.fetch_add(1, SeqCst) < UNAVAILABLE_BEGINS
+        {
+            return Err(Status::unavailable("cluster-api is restarting"));
+        }
+        if sandbox_id == Some(REFUSED_SANDBOX) {
+            return Err(Status::invalid_argument(
+                "the artifact's metadata contradicts its identity",
+            ));
+        }
+        if sandbox_id == Some(RECOVERING_SANDBOX)
+            && self.recovering_begins.fetch_add(1, SeqCst) < UNREGISTERED_NODE_BEGINS
+        {
+            return Err(Status::not_found("source node is not registered"));
+        }
+        if sandbox_id == Some(LATE_REGISTERING_SANDBOX) && !request.fence_verdict_only {
+            if self.late_registering_begins.fetch_add(1, SeqCst) < UNAVAILABLE_BEGINS {
+                return Err(Status::unavailable("cluster-api is restarting"));
+            }
+            let finalized = || {
+                self.finalized
+                    .lock()
+                    .unwrap()
+                    .contains(&request.backup_attempt_id)
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !finalized() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .map_err(|_| Status::deadline_exceeded("the node never finalized the attempt"))?;
+        }
+        if !request.fence_verdict_only {
+            self.registered
+                .lock()
+                .unwrap()
+                .insert(request.backup_attempt_id.clone());
+        }
+        Ok(
+            pplx_space_node_api_client::proto::BeginArtifactBackupResponse {
+                local_artifact_id: request.local_artifact_id,
+                backup_attempt_id: request.backup_attempt_id,
+                fence_verdict_only: request.fence_verdict_only,
+                generation_fence_admitted: false,
+            },
+        )
+    }
 }
 
 impl tonic::server::NamedService for BackupControlPlane {
@@ -379,55 +450,29 @@ where
             .next()
             .unwrap_or_default()
             .to_owned();
-        let recovering_begins = std::sync::Arc::clone(&self.recovering_begins);
-        let unavailable_begins = std::sync::Arc::clone(&self.unavailable_begins);
-        let registered = std::sync::Arc::clone(&self.registered);
+        let plane = self.clone();
         Box::pin(async move {
             Ok(match method.as_str() {
                 "BeginArtifactBackup" => {
-                    answer(request, move |request: api::BeginArtifactBackupRequest| {
-                        if !request.fence_verdict_only {
-                            super::retired_teardown_tests::record_begun_attempt(
-                                &request.backup_attempt_id,
-                            );
-                        }
-                        if request.sandbox_id == UNAVAILABLE_SANDBOX.to_string()
-                            && unavailable_begins.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                                < UNAVAILABLE_BEGINS
-                        {
-                            return Err(Status::unavailable("cluster-api is restarting"));
-                        }
-                        if request.sandbox_id == REFUSED_SANDBOX.to_string() {
-                            return Err(Status::invalid_argument(
-                                "the artifact's metadata contradicts its identity",
-                            ));
-                        }
-                        if request.sandbox_id == RECOVERING_SANDBOX.to_string()
-                            && recovering_begins.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                                < UNREGISTERED_NODE_BEGINS
-                        {
-                            return Err(Status::not_found("source node is not registered"));
-                        }
-                        if !request.fence_verdict_only {
-                            registered
-                                .lock()
-                                .unwrap()
-                                .insert(request.backup_attempt_id.clone());
-                        }
-                        Ok(api::BeginArtifactBackupResponse {
-                            local_artifact_id: request.local_artifact_id,
-                            backup_attempt_id: request.backup_attempt_id,
-                            fence_verdict_only: request.fence_verdict_only,
-                            generation_fence_admitted: false,
-                        })
-                    })
+                    super::retired_teardown_tests::answer_later(
+                        request,
+                        move |request: api::BeginArtifactBackupRequest| {
+                            plane.clone().begin_artifact_backup(request)
+                        },
+                    )
                     .await
                 }
                 "FinalizeArtifactBackup" => {
                     answer(
                         request,
                         move |request: api::FinalizeArtifactBackupRequest| {
-                            let known = registered
+                            plane
+                                .finalized
+                                .lock()
+                                .unwrap()
+                                .insert(request.backup_attempt_id.clone());
+                            let known = plane
+                                .registered
                                 .lock()
                                 .unwrap()
                                 .contains(&request.backup_attempt_id);
@@ -499,11 +544,13 @@ struct HeldPush {
 }
 
 /// A vol-mgr on a test-owned socket that accepts every push and reports every
-/// transfer as `Transfers` says, counting the pushes it accepted.
+/// transfer as `Transfers` says, recording the transfer each push it accepted
+/// started and each transfer it was asked about.
 struct FakeVolumeManager {
     socket: std::path::PathBuf,
     transfers: std::sync::Arc<std::sync::Mutex<Transfers>>,
-    accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    accepted: std::sync::Arc<std::sync::Mutex<Vec<JobId>>>,
+    polled: std::sync::Arc<std::sync::Mutex<Vec<JobId>>>,
     on_next_push: std::sync::Arc<std::sync::Mutex<Option<OnPush>>>,
     held_push: std::sync::Arc<std::sync::Mutex<Option<HeldPush>>>,
     stop: tokio_util::sync::CancellationToken,
@@ -518,8 +565,10 @@ impl FakeVolumeManager {
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let transfers = std::sync::Arc::new(std::sync::Mutex::new(transfers));
         let observed = std::sync::Arc::clone(&transfers);
-        let accepted = std::sync::Arc::<std::sync::atomic::AtomicUsize>::default();
-        let counted = std::sync::Arc::clone(&accepted);
+        let accepted = std::sync::Arc::<std::sync::Mutex<Vec<JobId>>>::default();
+        let recorded = std::sync::Arc::clone(&accepted);
+        let polled = std::sync::Arc::<std::sync::Mutex<Vec<JobId>>>::default();
+        let probed = std::sync::Arc::clone(&polled);
         let on_next_push = std::sync::Arc::<std::sync::Mutex<Option<OnPush>>>::default();
         let hooked = std::sync::Arc::clone(&on_next_push);
         let held_push = std::sync::Arc::<std::sync::Mutex<Option<HeldPush>>>::default();
@@ -533,7 +582,8 @@ impl FakeVolumeManager {
                 .unwrap_or_default()
                 .to_owned();
             let transfers = *observed.lock().unwrap();
-            let counted = std::sync::Arc::clone(&counted);
+            let recorded = std::sync::Arc::clone(&recorded);
+            let probed = std::sync::Arc::clone(&probed);
             let hooked = std::sync::Arc::clone(&hooked);
             let held = match method.as_str() {
                 "SubmitPushFile" => holding.lock().unwrap().take(),
@@ -553,15 +603,17 @@ impl FakeVolumeManager {
                             if let Some(hook) = hooked.lock().unwrap().take() {
                                 hook();
                             }
-                            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let job_id = JobId::new();
+                            recorded.lock().unwrap().push(job_id);
                             Ok(vol::SubmitTransferResponse {
-                                job_id: JobId::new().to_string(),
+                                job_id: job_id.to_string(),
                             })
                         })
                         .await
                     }
                     "GetTransferJob" => {
                         answer(request, move |request: vol::GetTransferJobRequest| {
+                            probed.lock().unwrap().push(request.job_id.parse().unwrap());
                             if transfers == Transfers::Unreadable {
                                 return Err(Status::internal("transfer record unreadable"));
                             }
@@ -603,6 +655,7 @@ impl FakeVolumeManager {
             socket,
             transfers,
             accepted,
+            polled,
             on_next_push,
             held_push,
             stop,
@@ -632,7 +685,17 @@ impl FakeVolumeManager {
     }
 
     fn accepted_pushes(&self) -> usize {
-        self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+        self.accepted.lock().unwrap().len()
+    }
+
+    /// The transfers the pushes it accepted started.
+    fn started_transfers(&self) -> std::collections::HashSet<JobId> {
+        self.accepted.lock().unwrap().iter().copied().collect()
+    }
+
+    /// The transfers it was asked about.
+    fn polled_transfers(&self) -> std::collections::HashSet<JobId> {
+        self.polled.lock().unwrap().iter().copied().collect()
     }
 
     /// Run `hook` as the next push is accepted, before it is answered.
@@ -1399,6 +1462,10 @@ enum Publication {
     /// Before the upload registered: the control plane was unavailable to the
     /// handoff's registration and the upload's first attempt's.
     BeforeRegistering,
+    /// As [`Self::BeforeRegistering`], and another handoff of the upload reads
+    /// it before the upload's next attempt ends it, and registers it after
+    /// that attempt's finalize found no row.
+    BeforeALateHandoffRegisters,
     /// Before the upload submitted anything: vol-mgr refused the handoff's
     /// pushes and the upload's first attempt.
     BeforePushes,
@@ -1416,8 +1483,10 @@ enum Publication {
 /// anything, it submits nothing more to a vol-mgr that would take every
 /// push, and one the publication meets mid-submit doesn't register its
 /// pushes, which carry another capture's files. One that never registered
-/// doesn't register now, and its finalize finds no row. One whose transfers
-/// were already staged keeps their bytes and completes on its next attempt.
+/// doesn't register now, and its finalize finds no row; a handoff that
+/// registers it after that finalize still fails, and finalizes the row it
+/// registered failed as the attempt would have. One whose transfers were
+/// already staged keeps their bytes and completes on its next attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were_staged() {
     use super::retired_teardown_tests::{
@@ -1430,6 +1499,7 @@ async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were
         let case = async |publication: Publication| {
             let volume_manager = FakeVolumeManager::serve(match publication {
                 Publication::BeforeRegistering
+                | Publication::BeforeALateHandoffRegisters
                 | Publication::BeforePushes
                 | Publication::AtFirstPush => Transfers::Refused,
                 Publication::AfterStaging => Transfers::Running,
@@ -1437,6 +1507,9 @@ async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were
             let scratch = tempfile::tempdir().unwrap();
             let sandbox_id = match publication {
                 Publication::BeforeRegistering => SandboxId::from_uuid(UNAVAILABLE_SANDBOX),
+                Publication::BeforeALateHandoffRegisters => {
+                    SandboxId::from_uuid(LATE_REGISTERING_SANDBOX)
+                }
                 _ => SandboxId::new(),
             };
             let id = sandbox_id.to_string();
@@ -1454,7 +1527,7 @@ async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were
             )
             .await;
             match publication {
-                Publication::BeforeRegistering => {
+                Publication::BeforeRegistering | Publication::BeforeALateHandoffRegisters => {
                     handoff.expect_err("the control plane is unavailable to the registration");
                 }
                 Publication::BeforePushes | Publication::AtFirstPush => {
@@ -1479,13 +1552,45 @@ async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were
                         .on_next_push(Box::new(move || publish_newer_capture(&snapshot_dir, &id)));
                 }
                 Publication::BeforeRegistering
+                | Publication::BeforeALateHandoffRegisters
                 | Publication::BeforePushes
                 | Publication::AfterStaging => {
                     publish_newer_capture(&snapshot_dir, &id);
                 }
             }
             volume_manager.report(Transfers::Completed);
-            release_retry(&service, &upload);
+            let attempt = backup_attempt(&only_upload(&service, &id));
+            let begun = || {
+                begun_attempts()
+                    .iter()
+                    .filter(|begun| **begun == attempt)
+                    .count()
+            };
+            match publication {
+                Publication::BeforeALateHandoffRegisters => {
+                    let (late_handoff, ()) = futures_util::future::join(
+                        service.establish_restore_visible_artifact_backup(&upload),
+                        async {
+                            // The handoff asks to register once it has read
+                            // the job, which the attempt then ends.
+                            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                                while begun() == UNAVAILABLE_BEGINS {
+                                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                }
+                            })
+                            .await
+                            .expect("the handoff asks to register");
+                            release_retry(&service, &upload);
+                        },
+                    )
+                    .await;
+                    late_handoff.expect_err("the handoff can't stage a superseded upload");
+                }
+                Publication::BeforeRegistering
+                | Publication::BeforePushes
+                | Publication::AtFirstPush
+                | Publication::AfterStaging => release_retry(&service, &upload),
+            }
             let ended = service
                 .snapshot_upload_worker
                 .wait_for_job(&upload, std::time::Duration::from_secs(10))
@@ -1495,6 +1600,7 @@ async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were
             assert_eq!(ended.attempts, 2, "{publication:?}: {ended:?}");
             match publication {
                 Publication::BeforeRegistering
+                | Publication::BeforeALateHandoffRegisters
                 | Publication::BeforePushes
                 | Publication::AtFirstPush => {
                     assert_eq!(
@@ -1517,38 +1623,50 @@ async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were
             }
             if matches!(
                 publication,
-                Publication::BeforeRegistering | Publication::BeforePushes
+                Publication::BeforeRegistering
+                    | Publication::BeforeALateHandoffRegisters
+                    | Publication::BeforePushes
             ) {
                 assert_eq!(volume_manager.accepted_pushes(), pushed);
             }
-            if matches!(publication, Publication::BeforeRegistering) {
-                let attempt = backup_attempt(&ended);
-                assert_eq!(
-                    begun_attempts()
-                        .iter()
-                        .filter(|begun| **begun == attempt)
-                        .count(),
+            match publication {
+                Publication::BeforeRegistering => assert_eq!(
+                    begun(),
                     UNAVAILABLE_BEGINS,
                     "the superseded upload's retry registers nothing"
-                );
+                ),
+                Publication::BeforeALateHandoffRegisters => assert_eq!(
+                    begun(),
+                    UNAVAILABLE_BEGINS + 1,
+                    "only the late handoff registers"
+                ),
+                Publication::BeforePushes
+                | Publication::AtFirstPush
+                | Publication::AfterStaging => {}
             }
             super::retired_teardown_tests::drain(&service).await;
             (publication, backup_attempt(&ended))
         };
-        let ends = futures_util::future::join4(
+        let ends = futures_util::future::join5(
             Box::pin(case(Publication::BeforeRegistering)),
+            Box::pin(case(Publication::BeforeALateHandoffRegisters)),
             Box::pin(case(Publication::BeforePushes)),
             Box::pin(case(Publication::AtFirstPush)),
             Box::pin(case(Publication::AfterStaging)),
         )
         .await;
 
+        let by_attempt = |a: &FinalizedBackup, b: &FinalizedBackup| {
+            (&a.backup_attempt_id, a.registered).cmp(&(&b.backup_attempt_id, b.registered))
+        };
         let mut finalized = finalized_backups();
-        finalized.sort_by(|a, b| a.backup_attempt_id.cmp(&b.backup_attempt_id));
-        let mut expected =
-            [ends.0, ends.1, ends.2, ends.3].map(|(publication, backup_attempt_id)| {
+        finalized.sort_by(by_attempt);
+        let mut expected = [ends.0, ends.1, ends.2, ends.3, ends.4]
+            .into_iter()
+            .flat_map(|(publication, backup_attempt_id)| {
                 let (target_state, failure_reason) = match publication {
                     Publication::BeforeRegistering
+                    | Publication::BeforeALateHandoffRegisters
                     | Publication::BeforePushes
                     | Publication::AtFirstPush => (
                         SuspendSnapshotTerminalState::Failed,
@@ -1559,16 +1677,28 @@ async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were
                     ),
                     Publication::AfterStaging => (SuspendSnapshotTerminalState::Ready, None),
                 };
-                FinalizedBackup {
-                    backup_attempt_id,
+                let finalized = |registered| FinalizedBackup {
+                    backup_attempt_id: backup_attempt_id.clone(),
                     target_state: target_state as i32,
-                    failure_reason,
+                    failure_reason: failure_reason.clone(),
                     // The ready backup is of a suspend that rolled back to `paused`.
                     suspend_uncommitted: matches!(publication, Publication::AfterStaging),
-                    registered: !matches!(publication, Publication::BeforeRegistering),
+                    registered,
+                };
+                match publication {
+                    Publication::BeforeRegistering => vec![finalized(false)],
+                    // The attempt's finalize finds no row; the handoff's
+                    // finalizes the one it registered, as the attempt's would.
+                    Publication::BeforeALateHandoffRegisters => {
+                        vec![finalized(false), finalized(true)]
+                    }
+                    Publication::BeforePushes
+                    | Publication::AtFirstPush
+                    | Publication::AfterStaging => vec![finalized(true)],
                 }
-            });
-        expected.sort_by(|a, b| a.backup_attempt_id.cmp(&b.backup_attempt_id));
+            })
+            .collect::<Vec<_>>();
+        expected.sort_by(by_attempt);
         assert_eq!(finalized, expected);
     })
     .await;
@@ -1693,6 +1823,22 @@ async fn an_upload_polls_the_transfers_a_concurrent_handoff_staged_before_a_publ
                 staged.job_ids,
                 "{concurrent:?}: the upload keeps the handoff's transfers"
             );
+            let staged_transfers: std::collections::HashSet<_> =
+                staged.job_ids.iter().copied().collect();
+            assert_eq!(
+                volume_manager.polled_transfers(),
+                staged_transfers,
+                "{concurrent:?}: the attempt polls the handoff's transfers, and only those"
+            );
+            // The attempt's own pushes, which it discards.
+            let discarded = volume_manager
+                .started_transfers()
+                .difference(&staged_transfers)
+                .count();
+            match concurrent {
+                ConcurrentHandoff::WhileTheAttemptPushes => assert!(discarded > 0),
+                ConcurrentHandoff::BeforeTheAttemptRegisters => assert_eq!(discarded, 0),
+            }
             super::retired_teardown_tests::drain(&service).await;
             backup_attempt(&ended)
         };

@@ -886,7 +886,9 @@ impl SnapshotUploadExecutor {
     /// doesn't retry it, so a row the control plane doesn't hear about stays
     /// `creating`, refusing the sandbox's delete, until an enabled
     /// stuck-snapshot reaper or an operator fails it. An upload that never
-    /// registered has no row to mark.
+    /// registered has no row to mark; a handoff that registers it after this
+    /// mark found no row marks the row itself
+    /// ([`finalize_superseded_upload_failed`]).
     async fn end_superseded_upload(
         &self,
         job_id: &JobId,
@@ -942,6 +944,15 @@ impl SnapshotUploadExecutor {
             UnsubmittedUploadEnd::Kept(None) => Err(error),
         }
     }
+}
+
+/// Mark failed the row of an upload the worker ended as superseded, with the
+/// failure reason the worker's own finalize sends, for a caller that
+/// registered the row after that finalize found none. The worker already
+/// emitted the attempt's `artifact_backup_failed` event and removed its
+/// metadata staging.
+pub(crate) async fn finalize_superseded_upload_failed(payload: &SnapshotUploadJobs) {
+    finalize_with_cluster_api_failed(&payload.snapshot_id, SUPERSEDED_UPLOAD_ERROR).await;
 }
 
 async fn converge_failed_upload(payload: &SnapshotUploadJobs, reason: &'static str, error: &str) {

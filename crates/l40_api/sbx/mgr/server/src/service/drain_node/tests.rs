@@ -2707,11 +2707,14 @@ enum LaterSuspend {
 }
 
 /// A failed drain suspend rolls the VM back to `paused`, keeping the capture
-/// it published pinned and its upload live. The next suspend publishes over
-/// the sandbox's snapshot directory, retiring that capture, whether it fails
-/// the same way or succeeds. From then on the drain plans nothing for the
-/// retired capture: it isn't one of the sandbox's artifacts without a durable
-/// copy, and its live upload is no upload the drain waits on.
+/// it published pinned and its upload live, which the drain counts. The next
+/// suspend publishes over the sandbox's snapshot directory, retiring that
+/// capture, whether it fails the same way, leaving the VM `paused` for the
+/// drain to suspend, or succeeds, leaving it `suspended`. From then on the
+/// drain plans nothing for the retired capture: it isn't one of the sandbox's
+/// artifacts without a durable copy, and its upload, still live, is no upload
+/// the drain waits on. A suspended sandbox waits for the newer capture's
+/// upload, which the drain doesn't enqueue again.
 #[tokio::test]
 async fn the_drain_keeps_nothing_of_a_capture_a_later_publication_retired() {
     use pplx_space_snapshot_model::LocalArtifactId;
@@ -2754,7 +2757,16 @@ async fn the_drain_keeps_nothing_of_a_capture_a_later_publication_retired() {
             );
         };
         suspend_then_roll_back(retired);
-        upload(retired);
+        let retired_upload = upload(retired);
+        assert!(
+            service
+                .read_plan_reads(None)
+                .unwrap()
+                .inputs
+                .active_uploads
+                .contains(&retired.to_string()),
+            "{later:?}: the drain counts the pinned capture's upload"
+        );
         match later {
             LaterSuspend::Fails => suspend_then_roll_back(newer),
             LaterSuspend::Succeeds => {
@@ -2773,15 +2785,36 @@ async fn the_drain_keeps_nothing_of_a_capture_a_later_publication_retired() {
             }
         }
         upload(newer);
+        let retired_job = service
+            .snapshot_upload_worker
+            .get_job(&retired_upload)
+            .unwrap()
+            .unwrap();
+        assert!(!retired_job.is_terminal(), "{later:?}: {retired_job:?}");
 
         let reads = service.read_plan_reads(None).unwrap();
+        let row = reads.rows.iter().find(|row| row.sandbox_id == id).unwrap();
+        assert_eq!(
+            row.lifecycle,
+            SandboxStatus::Unowned(match later {
+                LaterSuspend::Fails => SandboxState::Paused,
+                LaterSuspend::Succeeds => SandboxState::Suspended,
+            }),
+            "{later:?}"
+        );
+        assert_eq!(
+            row.pin,
+            Some((newer.to_string(), ArtifactKind::Full)),
+            "{later:?}"
+        );
         assert_eq!(
             reads.inputs.local_only.get(&id),
             Some(&vec![(newer.to_string(), ArtifactKind::Full)]),
             "{later:?}"
         );
-        assert!(
-            !reads.inputs.active_uploads.contains(&retired.to_string()),
+        assert_eq!(
+            reads.inputs.active_uploads,
+            BTreeSet::from([newer.to_string()]),
             "{later:?}"
         );
         let plan = plan(&reads.rows, &reads.inputs);
@@ -2792,6 +2825,24 @@ async fn the_drain_keeps_nothing_of_a_capture_a_later_publication_retired() {
             )),
             "{later:?}: {plan:?}"
         );
+        match later {
+            LaterSuspend::Fails => assert_eq!(
+                plan.actions,
+                [PlannedAction::Suspend {
+                    sandbox_id: id.clone(),
+                    from: SuspendFrom::StartedOrPaused,
+                }],
+                "{plan:?}"
+            ),
+            LaterSuspend::Succeeds => {
+                assert_eq!(plan.actions, [], "{plan:?}");
+                assert!(
+                    plan.pending.iter().any(|wait| wait.sandbox_id == id
+                        && wait.wait == Wait::Work(DrainAction::Upload)),
+                    "{plan:?}"
+                );
+            }
+        }
     }
 }
 

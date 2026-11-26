@@ -24,7 +24,7 @@ use crate::state::SandboxState;
 pub(crate) use cluster_api_stub_tests::answer;
 pub(in crate::service) use cluster_api_stub_tests::with_cluster_api;
 pub(super) use cluster_api_stub_tests::{
-    FinalizedBackup, begun_attempts, finalized_backups, record_begun_attempt,
+    FinalizedBackup, answer_later, begun_attempts, finalized_backups, record_begun_attempt,
     record_finalized_backup,
 };
 use cluster_api_stub_tests::{
