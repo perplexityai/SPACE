@@ -431,11 +431,12 @@ async fn apply_receipt(
     completion: &ParsedCompletion,
 ) -> Result<ReceiptOutcome, Status> {
     let row = auto_lifecycle_delete_completion::lock_completion_authority(
-        tx,
+        &mut **tx,
         completion.sandbox_id,
         AUTO_LIFECYCLE_DELETE_COMPLETION_OWNERSHIP_GRACE.as_secs_f64(),
     )
-    .await;
+    .await
+    .map_err(sqlx::Error::from);
     let row = match row {
         Ok(row) => row,
         Err(error) if is_lock_not_available(&error) => {

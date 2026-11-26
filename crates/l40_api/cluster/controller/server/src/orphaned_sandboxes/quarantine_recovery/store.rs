@@ -7,21 +7,22 @@ use pplx_space_postgres_pool::TxSettings as _;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_store::k8s_executions::quarantine_recovery;
 use pplx_space_sandbox_store::{quarantine_recovery_candidates, row_locks};
-use sqlx::{PgExecutor, PgPool};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 pub(super) use pplx_space_sandbox_store::quarantine_recovery_candidates::Candidate;
 
 /// The recovery candidates after `after`, or `only` alone, up to `limit`
 /// ([`quarantine_recovery_candidates::list`]).
-pub(super) async fn candidates<'e>(
-    executor: impl PgExecutor<'e>,
+pub(super) async fn candidates(
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
     after: Option<SandboxId>,
     only: Option<SandboxId>,
     limit: i64,
 ) -> Result<Vec<Candidate>, sqlx::Error> {
     quarantine_recovery_candidates::list(executor, after, only, limit, SubstrateKind::Kubernetes)
         .await
+        .map_err(sqlx::Error::from)
 }
 
 /// Recheck on fresh statement snapshots after locking the owners. No external

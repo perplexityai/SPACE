@@ -3,6 +3,7 @@
 //! execution and its local-artifact marker.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::Executor;
 use pplx_space_sandbox_model::{SandboxId, SandboxQuarantineSource};
 use pplx_space_snapshot_model::LocalArtifactId;
 use pplx_space_sql_locator::sql;
@@ -30,7 +31,7 @@ pub struct QuarantineRecoveryAuthority {
 /// to a node: the caller tells a missing quarantine, a missing active node
 /// and another node's sandbox apart.
 pub async fn get(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     source: SandboxQuarantineSource,
 ) -> Result<Option<QuarantineRecoveryAuthority>, SandboxStoreError> {
@@ -55,6 +56,6 @@ pub async fn get(
     ))
     .bind(sandbox_id.as_uuid())
     .bind(source.as_str())
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?)
 }

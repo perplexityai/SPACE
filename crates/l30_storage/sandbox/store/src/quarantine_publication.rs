@@ -17,13 +17,13 @@ use pplx_space_sandbox_model::{
 
 use std::sync::LazyLock;
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_portability::{
     current_suspend_origin_marker_snapshot_ready, exact_marker_snapshot_backup_current,
     node_published_suspend_evidence, pre_quarantine_suspend_snapshot_current,
     started_suspend_revert_eligibility, suspended_projection_lifecycle_eligible_with_node_evidence,
 };
 use pplx_space_sql_locator::sql;
-use sqlx::PgConnection;
 use sqlx::types::{Json, JsonValue};
 use uuid::Uuid;
 
@@ -45,15 +45,19 @@ pub struct PauseFailedRecoveryCandidate {
 /// `started` or `paused` while it sits `quarantined` (compared trimmed and
 /// lower-cased) under an episode of `quarantine_source` and
 /// `quarantine_reason`, together with that episode's row. The locks last
-/// until the caller's transaction ends.
-pub async fn lock_pause_failed_recovery_candidates(
-    conn: &mut PgConnection,
+/// until the caller's transaction ends. The caller must pass its open
+/// transaction.
+pub async fn lock_pause_failed_recovery_candidates<C>(
+    tx: &mut C,
     node_id: NodeId,
     rows_json: Json<JsonValue>,
     quarantine_source: SandboxQuarantineSource,
     quarantine_reason: SandboxQuarantineReasonCode,
-) -> Result<Vec<PauseFailedRecoveryCandidate>, sqlx::Error> {
-    sqlx::query_as(sql!(
+) -> Result<Vec<PauseFailedRecoveryCandidate>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_as(sql!(
         "SELECT s.id, qs.quarantine_id, input.published_lifecycle, s.lifecycle
            FROM sandboxes s
            JOIN jsonb_to_recordset($2::jsonb) AS input(
@@ -72,8 +76,8 @@ pub async fn lock_pause_failed_recovery_candidates(
     .bind(rows_json)
     .bind(quarantine_source.as_str())
     .bind(quarantine_reason.as_str())
-    .fetch_all(conn)
-    .await
+    .fetch_all(tx.into_sqlx())
+    .await?)
 }
 
 /// The decoded row of [`lock_suspended_projection_candidates`], in `SELECT`
@@ -255,22 +259,26 @@ fn suspended_projection_candidates_query() -> String {
 /// [`TRANSITION_RECEIPT_RECORD_COLUMNS`]) as `suspended`, when the row may
 /// take the suspended projection or the published quarantine-recovery
 /// receipt is fenced to its episode and active execution generation. The
-/// locks last until the caller's transaction ends.
-pub async fn lock_suspended_projection_candidates(
-    conn: &mut PgConnection,
+/// locks last until the caller's transaction ends. The caller must pass its
+/// open transaction.
+pub async fn lock_suspended_projection_candidates<C>(
+    tx: &mut C,
     node_id: NodeId,
     rows_json: Json<JsonValue>,
     binds: SuspendedProjectionBinds,
-) -> Result<Vec<SuspendedProjectionCandidateRow>, sqlx::Error> {
+) -> Result<Vec<SuspendedProjectionCandidateRow>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     static QUERY: LazyLock<String> =
         LazyLock::new(|| sql!(suspended_projection_candidates_query().as_str()));
-    sqlx::query_as(sqlx::AssertSqlSafe(QUERY.as_str()))
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(QUERY.as_str()))
         .bind(node_id)
         .bind(rows_json)
         .bind(binds.recovery_receipt_kind.as_str())
         .bind(binds.quarantine_source.as_str())
         .bind(binds.exact_policy.as_str())
         .bind(binds.exact_or_pre_quarantine_policy.as_str())
-        .fetch_all(conn)
-        .await
+        .fetch_all(tx.into_sqlx())
+        .await?)
 }

@@ -14,6 +14,7 @@
 use std::sync::LazyLock;
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::{
     artifact_has_durable_copy, inflight_suspend_upload_exists,
@@ -21,7 +22,6 @@ use pplx_space_sandbox_portability::{
 };
 use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId};
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 
 use crate::SandboxStoreError;
 
@@ -34,12 +34,12 @@ use crate::SandboxStoreError;
 /// Returns the rows written, unchanged ones included, so the shortfall from
 /// the report is the skipped entries.
 pub async fn upsert_reported(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     sandbox_ids: &[SandboxId],
     artifact_ids: &[LocalArtifactId],
     artifact_kinds: &[ArtifactKind],
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let artifact_kinds: Vec<&'static str> =
         artifact_kinds.iter().map(|kind| kind.as_str()).collect();
     let result = sqlx::query(sql!(
@@ -58,7 +58,7 @@ pub async fn upsert_reported(
     .bind(sandbox_ids)
     .bind(artifact_ids)
     .bind(&artifact_kinds)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected())
 }
@@ -75,7 +75,7 @@ pub struct PendingBackupDepth {
 /// Count `node_id`'s pending-local-backup rows, and those of them for a
 /// sandbox outside `reported_sandbox_ids`.
 pub async fn depth(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     reported_sandbox_ids: &[SandboxId],
 ) -> Result<PendingBackupDepth, SandboxStoreError> {
@@ -87,7 +87,7 @@ pub async fn depth(
     ))
     .bind(node_id.as_uuid())
     .bind(reported_sandbox_ids)
-    .fetch_one(executor)
+    .fetch_one(executor.into_sqlx())
     .await?;
     Ok(PendingBackupDepth {
         depth,
@@ -130,15 +130,15 @@ static DELETE_DURABLE_ABSENT: LazyLock<String> = LazyLock::new(|| {
 /// without that node's disk (an observed projection). A row that is absent
 /// and not provably recoverable stays. Returns the rows deleted.
 pub async fn delete_durable_absent(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     reported_sandbox_ids: &[SandboxId],
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     Ok(
         sqlx::query(sqlx::AssertSqlSafe(DELETE_DURABLE_ABSENT.as_str()))
             .bind(node_id.as_uuid())
             .bind(reported_sandbox_ids)
-            .execute(executor)
+            .execute(executor.into_sqlx())
             .await?
             .rows_affected(),
     )
@@ -150,12 +150,12 @@ pub async fn delete_durable_absent(
 /// alone would let finalizing an old artifact remove a newer artifact's row.
 /// Returns whether a row was removed.
 pub async fn delete_finalized(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     sandbox_id: SandboxId,
     artifact_id: LocalArtifactId,
     artifact_kind: ArtifactKind,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     /// Built once: every input is a bind placeholder, so the composed text is
     /// identical on every finalize. Same shape as `DELETE_DURABLE_ABSENT`.
     static DELETE_FINALIZED: LazyLock<String> = LazyLock::new(|| {
@@ -177,7 +177,7 @@ pub async fn delete_finalized(
         .bind(sandbox_id.as_uuid())
         .bind(artifact_id.as_uuid())
         .bind(artifact_kind.as_str())
-        .execute(executor)
+        .execute(executor.into_sqlx())
         .await?
         .rows_affected()
         > 0;
@@ -251,19 +251,19 @@ static QUEUED_CANDIDATES_EXCLUDING_LEGACY_ROWS: LazyLock<String> = LazyLock::new
 /// `exclude_legacy_rows`, only rows whose sandbox names its current local
 /// artifact. A read; it takes no lock.
 pub async fn queued_candidates(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     exclude_legacy_rows: bool,
-) -> Result<Vec<QueuedBackupCandidate>, sqlx::Error> {
+) -> Result<Vec<QueuedBackupCandidate>, DbError> {
     let statement = if exclude_legacy_rows {
         QUEUED_CANDIDATES_EXCLUDING_LEGACY_ROWS.as_str()
     } else {
         QUEUED_CANDIDATES.as_str()
     };
-    sqlx::query_as(sqlx::AssertSqlSafe(statement))
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(statement))
         .bind(node_id)
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }
 
 #[cfg(test)]
