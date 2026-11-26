@@ -20,9 +20,11 @@
 //!    skip this step. An upload whose artifact directory a later publication
 //!    replaced before it registered, or before or while it submitted, fails
 //!    permanently: no attempt can upload bytes the directory no longer holds.
-//!    Its row is marked failed, best effort. Once submitted, an upload's
-//!    transfers read vol-mgr's staged copies and node-manager's leased source,
-//!    so a later publication leaves its retries their bytes.
+//!    Its row is marked failed, best effort. A handoff that submitted the
+//!    same upload concurrently and persisted its transfers first staged the
+//!    artifact's bytes, so the attempt polls those instead. Once submitted,
+//!    an upload's transfers read vol-mgr's staged copies and node-manager's
+//!    leased source, so a later publication leaves its retries their bytes.
 //! 2. Concurrently polls all vol-mgr jobs — every VM artifact and the
 //!    `snapshot.json` metadata document — to a terminal
 //!    state. Any permanent vol-mgr failure → [`JobError::Permanent`]; any
@@ -186,7 +188,9 @@ impl JobExecutor for SnapshotUploadExecutor {
             && let Err(superseded) =
                 crate::snapshot_upload::check_prepared_artifact_identity(&payload)
         {
-            return Err(end_superseded_upload(&payload, &superseded).await);
+            payload = self
+                .end_superseded_upload(&job.job_id, &payload, &superseded)
+                .await?;
         }
         if prepared_upload_requires_begin(&payload)
             && let Err(refusal) = begin_prepared_upload_naming_supersession(&payload).await
@@ -224,9 +228,13 @@ impl JobExecutor for SnapshotUploadExecutor {
             )
             .await
             {
-                Ok(submitted) => submitted,
+                Ok(submitted) => {
+                    persist_submitted_transfer_ids(&self.db, &job.job_id, &submitted)?;
+                    submitted
+                }
                 Err(SubmitPreparedSnapshotError::Superseded(superseded)) => {
-                    return Err(end_superseded_upload(&payload, &superseded).await);
+                    self.end_superseded_upload(&job.job_id, &payload, &superseded)
+                        .await?
                 }
                 Err(SubmitPreparedSnapshotError::Failed(error)) => {
                     return Err(JobError::retriable(format!(
@@ -234,7 +242,6 @@ impl JobExecutor for SnapshotUploadExecutor {
                     )));
                 }
             };
-            persist_submitted_transfer_ids(&self.db, &job.job_id, &payload)?;
         }
 
         // Heartbeat the cluster row at the start of every attempt (including
@@ -856,26 +863,83 @@ fn classify_begin_error(error: BeginArtifactBackupError) -> JobError {
     }
 }
 
-/// End an upload whose artifact a later publication superseded: fail the job
-/// for good, since no attempt can upload bytes its directory no longer holds,
-/// and mark failed the row it registered, as an exhausted upload's is
-/// ([`converge_failed_upload`]). The job's end is durable; marking the row is
-/// best effort, so a row the control plane doesn't hear about stays
-/// `creating`, refusing the sandbox's delete until the stuck-attempt reaper
-/// fails it. An upload that never registered has no row to mark.
-async fn end_superseded_upload(
-    payload: &SnapshotUploadJobs,
-    superseded: &crate::snapshot_upload::SupersededArtifact,
-) -> JobError {
-    converge_failed_upload(
-        payload,
-        "superseded",
-        "a later suspend superseded the artifact before its upload finished",
-    )
-    .await;
-    JobError::permanent(format!(
-        "a later suspend superseded the artifact before its upload finished: {superseded}"
-    ))
+const SUPERSEDED_UPLOAD_ERROR: &str =
+    "a later suspend superseded the artifact before its upload finished";
+
+impl SnapshotUploadExecutor {
+    /// End an upload whose artifact a later publication superseded, unless a
+    /// handoff staged it meanwhile. This attempt read `payload` as it started,
+    /// and the restore-visible handoff registers and submits the same job
+    /// concurrently: once it persisted transfer IDs, they hold the capture's
+    /// staged bytes, so the upload carries on with them, returned here.
+    /// Otherwise the job fails for good, since no attempt can upload bytes its
+    /// directory no longer holds, and the row it registered is marked failed,
+    /// as an exhausted upload's is ([`converge_failed_upload`]).
+    ///
+    /// The job ends in one statement that requires a payload without transfer
+    /// IDs ([`end_unsubmitted_upload_job`](crate::db::snapshot_upload_jobs::end_unsubmitted_upload_job)),
+    /// so a handoff persists its transfers either before it, and the attempt
+    /// polls them, or after it, and finds the job ended and fails. The worker's
+    /// own write of the failure then finds the job failed already. The job's
+    /// end is durable before the row is marked; marking the row is best
+    /// effort, so a row the control plane doesn't hear about stays
+    /// `creating`, refusing the sandbox's delete until the stuck-attempt
+    /// reaper fails it. An upload that never registered has no row to mark.
+    async fn end_superseded_upload(
+        &self,
+        job_id: &JobId,
+        payload: &SnapshotUploadJobs,
+        superseded: &crate::snapshot_upload::SupersededArtifact,
+    ) -> Result<SnapshotUploadJobs, JobError> {
+        use crate::db::snapshot_upload_jobs::UnsubmittedUploadEnd;
+
+        let error = JobError::permanent(format!("{SUPERSEDED_UPLOAD_ERROR}: {superseded}"));
+        let ended = {
+            let conn = self.db.lock().map_err(|_| {
+                JobError::permanent(format!(
+                    "snapshot-upload database mutex poisoned while ending superseded job {job_id}"
+                ))
+            })?;
+            crate::db::snapshot_upload_jobs::end_unsubmitted_upload_job(
+                &conn,
+                job_id,
+                error.message(),
+            )
+            .map_err(|error| {
+                JobError::retriable(format!(
+                    "end superseded snapshot-upload job {job_id}: {error}"
+                ))
+            })?
+        };
+        match ended {
+            UnsubmittedUploadEnd::Ended => {
+                converge_failed_upload(payload, "superseded", SUPERSEDED_UPLOAD_ERROR).await;
+                Err(error)
+            }
+            UnsubmittedUploadEnd::Kept(Some(persisted)) => {
+                let persisted: SnapshotUploadJobs =
+                    serde_json::from_str(&persisted).map_err(|decode| {
+                        JobError::permanent(format!(
+                            "decode snapshot-upload job {job_id} after its supersession: {decode}"
+                        ))
+                    })?;
+                if persisted.job_ids.is_empty() {
+                    // Not running: the worker settles a cancelled job, and
+                    // one that ended has no attempt left to stop.
+                    return Err(error);
+                }
+                tracing::info!(
+                    job_id = %job_id,
+                    sandbox_id = %payload.meta.sandbox_id,
+                    snapshot_id = %payload.snapshot_id,
+                    %superseded,
+                    "a handoff staged the superseded upload's transfers first; polling them"
+                );
+                Ok(persisted)
+            }
+            UnsubmittedUploadEnd::Kept(None) => Err(error),
+        }
+    }
 }
 
 async fn converge_failed_upload(payload: &SnapshotUploadJobs, reason: &'static str, error: &str) {

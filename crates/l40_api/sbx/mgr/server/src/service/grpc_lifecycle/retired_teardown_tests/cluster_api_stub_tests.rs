@@ -63,6 +63,22 @@ static ADMITTED_REGISTRATIONS: CrossProcessLog =
 static FINALIZED_BACKUPS: CrossProcessLog =
     CrossProcessLog::new("SPACE_TEST_FINALIZED_ARTIFACT_BACKUPS");
 
+/// The backup attempt of each registration a stub was asked for, a probe
+/// that registers nothing aside, admitted or not.
+static BEGUN_ATTEMPTS: CrossProcessLog = CrossProcessLog::new("SPACE_TEST_BEGUN_ARTIFACT_BACKUPS");
+
+/// The backup attempts of every registration a stub recorded with
+/// [`record_begun_attempt`], once per request, in arrival order.
+pub(in crate::service::grpc_lifecycle) fn begun_attempts() -> Vec<String> {
+    BEGUN_ATTEMPTS.lines()
+}
+
+/// Record a registration of `backup_attempt_id` for the child's
+/// [`begun_attempts`].
+pub(in crate::service::grpc_lifecycle) fn record_begun_attempt(backup_attempt_id: &str) {
+    BEGUN_ATTEMPTS.append(backup_attempt_id);
+}
+
 /// The local artifact ids of every registration the stub admitted, a probe
 /// that registers nothing aside. Admitting one is what lets a backup proceed.
 pub(super) fn admitted_registrations() -> Vec<String> {
@@ -81,6 +97,9 @@ pub(in crate::service::grpc_lifecycle) struct FinalizedBackup {
     pub(in crate::service::grpc_lifecycle) target_state: i32,
     pub(in crate::service::grpc_lifecycle) failure_reason: Option<String>,
     pub(in crate::service::grpc_lifecycle) suspend_uncommitted: bool,
+    /// Whether the stub had registered the attempt. It answers a finalize of
+    /// one it hadn't `NotFound`, as the control plane does.
+    pub(in crate::service::grpc_lifecycle) registered: bool,
 }
 
 /// Every `FinalizeArtifactBackup` a stub recorded with
@@ -93,9 +112,11 @@ pub(in crate::service::grpc_lifecycle) fn finalized_backups() -> Vec<FinalizedBa
         .collect()
 }
 
-/// Record `request` for the child's [`finalized_backups`].
+/// Record `request`, of an attempt the stub had `registered` or not, for the
+/// child's [`finalized_backups`].
 pub(in crate::service::grpc_lifecycle) fn record_finalized_backup(
     request: &pplx_space_node_api_client::proto::FinalizeArtifactBackupRequest,
+    registered: bool,
 ) {
     FINALIZED_BACKUPS.append(
         &serde_json::to_string(&FinalizedBackup {
@@ -103,6 +124,7 @@ pub(in crate::service::grpc_lifecycle) fn record_finalized_backup(
             target_state: request.target_state,
             failure_reason: request.failure_reason.clone(),
             suspend_uncommitted: request.suspend_uncommitted,
+            registered,
         })
         .unwrap(),
     );
@@ -345,9 +367,11 @@ where
     std::fs::write(token.path(), "synthetic-backup-test-token").unwrap();
     let admitted = tempfile::NamedTempFile::new().unwrap();
     let finalized = tempfile::NamedTempFile::new().unwrap();
+    let begun = tempfile::NamedTempFile::new().unwrap();
     let child = pplx_space_test_env::enter_test_process(&[
         ADMITTED_REGISTRATIONS.serve_into(&admitted),
         FINALIZED_BACKUPS.serve_into(&finalized),
+        BEGUN_ATTEMPTS.serve_into(&begun),
         ("SPACE_INTERNAL_RPC_INSECURE_DEV", Some(OsStr::new("1"))),
         (
             pplx_space_node_api_client::cluster::CLUSTER_API_ENDPOINT_ENV,

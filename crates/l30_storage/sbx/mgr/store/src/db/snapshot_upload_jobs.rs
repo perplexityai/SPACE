@@ -1,7 +1,7 @@
 //! `jobs` rows of the snapshot-upload pipeline, and the backup markers its
 //! completed jobs prove.
 
-use crate::db::{Connection, Result};
+use crate::db::{Connection, OptionalExtension as _, Result};
 use pplx_space_accounts::JobId;
 use pplx_space_snapshot_model::LocalArtifactId;
 use rusqlite::params;
@@ -52,6 +52,56 @@ pub fn set_upload_failure_scope(conn: &Connection, job_id: &JobId, scope: &str) 
          WHERE job_id = ?2 AND kind = ?3 AND status IN ('pending', 'running')",
         params![scope, job_id, SNAPSHOT_UPLOAD_JOB_KIND],
     )
+}
+
+/// What [`end_unsubmitted_upload_job`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnsubmittedUploadEnd {
+    /// It failed the job permanently.
+    Ended,
+    /// It left the job alone, since the job wasn't running or its payload
+    /// named transfers. Carries the payload as it stands, `None` for a job
+    /// that is gone.
+    Kept(Option<String>),
+}
+
+/// Fail a running snapshot-upload job permanently with `error`, as the worker
+/// records a permanent failure, but only while its payload names no transfer.
+/// One statement, so a handoff that persists transfer IDs into the payload,
+/// which requires a pending or running job, either did so first and keeps the
+/// job, or finds it ended. A payload that isn't JSON is left alone; `CASE`
+/// keeps `json_array_length` off it, as SQLite needn't short-circuit `AND`.
+/// A job this leaves alone is read back under the same connection.
+pub fn end_unsubmitted_upload_job(
+    conn: &Connection,
+    job_id: &JobId,
+    error: &str,
+) -> Result<UnsubmittedUploadEnd> {
+    let changed = conn.execute(
+        "UPDATE jobs
+         SET status = 'failed', error_kind = ?3, error = ?4, failure_reason = NULL,
+             completed_at = datetime('now')
+         WHERE job_id = ?1 AND kind = ?2 AND status = 'running'
+           AND CASE WHEN json_valid(payload)
+                    THEN json_array_length(payload, '$.job_ids') END IS 0",
+        params![
+            job_id,
+            SNAPSHOT_UPLOAD_JOB_KIND,
+            pplx_space_common_jobs::JobFailureKind::Permanent.as_str(),
+            error
+        ],
+    )?;
+    if changed == 1 {
+        return Ok(UnsubmittedUploadEnd::Ended);
+    }
+    let payload = conn
+        .query_row(
+            "SELECT payload FROM jobs WHERE job_id = ?1 AND kind = ?2",
+            params![job_id, SNAPSHOT_UPLOAD_JOB_KIND],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(UnsubmittedUploadEnd::Kept(payload))
 }
 
 /// How many snapshot-upload jobs under `dedup_key` failed permanently with a

@@ -25,6 +25,26 @@ pub(crate) fn job_fixture(kind: &str, payload: String) -> Job {
     }
 }
 
+/// The executor a service's worker runs over `db`, for a test that runs an
+/// attempt itself, as the worker would with a job it read earlier. Its
+/// retained sources are absent.
+pub(crate) fn executor_for_test(
+    db: crate::db::SharedConnection,
+    drain_state: std::sync::Arc<crate::service::drain::DrainState>,
+    node_manager: crate::node_manager_transport::NodeManagerConnector,
+    volume_manager_socket: std::path::PathBuf,
+) -> SnapshotUploadExecutor {
+    SnapshotUploadExecutor {
+        db,
+        drain_state,
+        retained_source_inspector: std::sync::Arc::new(crate::retained_source::FakeInspector::new(
+            crate::retained_source::RetainedSourceCheck::Absent,
+        )),
+        node_manager,
+        volume_manager_socket,
+    }
+}
+
 #[tokio::test]
 async fn upload_executor_converges_unstaged_metadata_failure() {
     let staging = tempfile::tempdir().unwrap();

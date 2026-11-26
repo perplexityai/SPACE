@@ -671,7 +671,9 @@ impl SandboxManagerService {
                             // The durable worker may have persisted the same
                             // deterministic transfers or completed between our
                             // read and write. Join its payload instead of
-                            // failing a valid handoff.
+                            // failing a valid handoff. A worker that found the
+                            // artifact superseded and ended the job first left
+                            // it no transfer IDs, so the handoff fails.
                             payload = self
                                 .persisted_submitted_artifact_backup(job_id)
                                 .map_err(|reload_error| {
