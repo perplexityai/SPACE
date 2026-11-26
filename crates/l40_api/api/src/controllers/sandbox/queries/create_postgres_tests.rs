@@ -1089,7 +1089,7 @@ impl SubstrateAdapter for RetryingPoolSubstrate {
             ))
         })?;
         let marked = pplx_space_cluster_pool::WarmPoolStore::mark_claimed_slot_cleanup_pending(
-            &mut tx,
+            &mut *tx,
             claim.claim_id,
             claim.sandbox_id,
         )

@@ -1564,7 +1564,7 @@ async fn a_disable_racing_a_twin_insert_reaches_the_twins_copy() -> TestResult {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         let copied =
-            WarmPoolStore::copy_manual_configs_from_releases(&mut campaign, &[original], twin)
+            WarmPoolStore::copy_manual_configs_from_releases(&mut *campaign, &[original], twin)
                 .await?;
         campaign.commit().await?;
         TestResult::Ok(copied)
@@ -1750,7 +1750,7 @@ async fn an_upsert_racing_a_twin_insert_reaches_the_twins_copy() -> TestResult {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         let copied =
-            WarmPoolStore::copy_manual_configs_from_releases(&mut campaign, &[original], twin)
+            WarmPoolStore::copy_manual_configs_from_releases(&mut *campaign, &[original], twin)
                 .await?;
         campaign.commit().await?;
         TestResult::Ok(copied)

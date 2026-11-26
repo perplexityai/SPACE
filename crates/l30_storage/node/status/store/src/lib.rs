@@ -14,7 +14,9 @@ use std::str::FromStr;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_execution_spec::ExecutionPolicyObservation;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
+use serde::de::DeserializeOwned;
 use sqlx::types::Json;
 use time::OffsetDateTime;
 
@@ -92,9 +94,9 @@ pub struct NodeStatusPublication<'a> {
 /// environment arrays are the statement's clock (`clock_timestamp()`), the
 /// rest the transaction's.
 pub async fn upsert_from_publish(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     publication: &NodeStatusPublication<'_>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     let (usable_environment_refs, known_environment_refs) = match publication.environment_refs {
         EnvironmentRefsWrite::Record { usable, known } => (Some(usable), Some(known)),
         EnvironmentRefsWrite::Preserve | EnvironmentRefsWrite::Clear => (None, None),
@@ -307,7 +309,7 @@ pub async fn upsert_from_publish(
         publication.environment_refs,
         EnvironmentRefsWrite::Preserve
     ))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -329,13 +331,14 @@ pub struct NodeStatusSummary<S, C> {
 /// The snapshots of those of `node_ids` that have one, in no particular
 /// order. Takes no lock.
 pub async fn status_summaries<S, C>(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_ids: &[NodeId],
-) -> Result<Vec<NodeStatusSummary<S, C>>, sqlx::Error>
+) -> Result<Vec<NodeStatusSummary<S, C>>, DbError>
 where
-    NodeStatusSummary<S, C>: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin,
+    S: DeserializeOwned + Send + Unpin + 'static,
+    C: DeserializeOwned + Send + Unpin + 'static,
 {
-    sqlx::query_as::<_, NodeStatusSummary<S, C>>(sql!(
+    Ok(sqlx::query_as::<_, NodeStatusSummary<S, C>>(sql!(
         "SELECT node_id,
                 stale_after,
                 reachable,
@@ -347,8 +350,8 @@ where
          WHERE node_id = ANY($1)"
     ))
     .bind(node_ids)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// A boolean SQL predicate, TRUE iff the node status snapshot aliased as

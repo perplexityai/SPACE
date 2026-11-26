@@ -1,6 +1,7 @@
 //! The admin surface over `warm_pool_policies`, the per-template warm-pool
 //! shapes.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use sqlx::FromRow;
 use time::OffsetDateTime;
@@ -28,9 +29,9 @@ pub struct WarmPoolPolicyRecord {
 
 /// Every Firecracker policy, ordered by template, runtime and shape.
 pub async fn fc_warm_pool_policies(
-    executor: impl sqlx::PgExecutor<'_>,
-) -> Result<Vec<WarmPoolPolicyRecord>, sqlx::Error> {
-    sqlx::query_as::<_, WarmPoolPolicyRecord>(sql!(
+    executor: impl Executor<'_>,
+) -> Result<Vec<WarmPoolPolicyRecord>, DbError> {
+    Ok(sqlx::query_as::<_, WarmPoolPolicyRecord>(sql!(
         "SELECT template_name, runtime, vcpu, memory_mib, disk_mib, min_ready_slots,
                 max_ready_slots, refill_per_tick, max_warming_slots,
                 retain_releases, disk_io_max_operations_per_sec,
@@ -39,8 +40,8 @@ pub async fn fc_warm_pool_policies(
          WHERE runtime = 'fc'
          ORDER BY template_name, runtime, vcpu, memory_mib"
     ))
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// A Firecracker policy to write with [`upsert_fc_warm_pool_policy`].
@@ -70,10 +71,10 @@ pub struct WarmPoolPolicyUpsert<'a> {
 /// Insert the policy for its template and shape, or update the one there,
 /// returning the row as written.
 pub async fn upsert_fc_warm_pool_policy(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     policy: &WarmPoolPolicyUpsert<'_>,
-) -> Result<WarmPoolPolicyRecord, sqlx::Error> {
-    sqlx::query_as::<_, WarmPoolPolicyRecord>(sql!(
+) -> Result<WarmPoolPolicyRecord, DbError> {
+    Ok(sqlx::query_as::<_, WarmPoolPolicyRecord>(sql!(
         "INSERT INTO warm_pool_policies (
              template_name, runtime, vcpu, memory_mib, disk_mib, min_ready_slots,
              max_ready_slots, refill_per_tick, max_warming_slots,
@@ -121,6 +122,6 @@ pub async fn upsert_fc_warm_pool_policy(
     .bind(policy.enabled)
     .bind(policy.reset_disk_to_template_default)
     .bind(policy.reset_disk_io_to_default)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }

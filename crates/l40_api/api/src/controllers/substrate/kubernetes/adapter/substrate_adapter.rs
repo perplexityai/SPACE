@@ -854,7 +854,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             .await
             .db_context("failed to start pool slot delete transaction")?;
         let slot = match WarmPoolStore::lock_open_slot_for_delete_by_reserved_sandbox_id(
-            &mut tx,
+            &mut *tx,
             sandbox_uuid,
         )
         .await
@@ -897,7 +897,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
         // are already classified, so leaving this one statement out is the hole
         // that reports an abort here as permanent while its neighbours in the
         // same transaction report it as retryable.
-        let deleted = WarmPoolStore::delete_locked_open_slot(&mut tx, slot.id)
+        let deleted = WarmPoolStore::delete_locked_open_slot(&mut *tx, slot.id)
             .await
             .db_context("failed to delete observed pool slot row")?;
         if !deleted {

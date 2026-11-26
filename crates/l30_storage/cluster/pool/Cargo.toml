@@ -23,6 +23,7 @@ kubernetes = [
     "dep:pplx-space-byte-size",
     "dep:pplx-space-content-digest",
     "dep:pplx-space-execution-spec",
+    "dep:pplx-space-postgres-pool",
     "dep:pplx-space-sandbox-model",
     "dep:pplx-space-sql-locator",
     "dep:pplx-space-template-model",
@@ -40,6 +41,7 @@ pplx-space-byte-size = { workspace = true, features = ["serde"], optional = true
 pplx-space-sandbox-model = { workspace = true, features = ["sqlx"], optional = true }
 pplx-space-content-digest = { workspace = true, features = ["serde"], optional = true }
 pplx-space-execution-spec = { workspace = true, features = ["serde"], optional = true }
+pplx-space-postgres-pool = { workspace = true, optional = true }
 pplx-space-sql-locator = { workspace = true, optional = true }
 pplx-space-template-model = { workspace = true, optional = true }
 pplx-space-template-release-store = { workspace = true, optional = true }

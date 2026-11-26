@@ -136,7 +136,7 @@ pub(super) async fn upsert_pool_config(
         }
         err => pool_store_error("failed to upsert cluster pool config", &err),
     };
-    let id = WarmPoolStore::upsert_manual_config(&mut tx, release.id, &spec)
+    let id = WarmPoolStore::upsert_manual_config(&mut *tx, release.id, &spec)
         .await
         .map_err(upsert_error)?;
     // Creates of the release may resolve to one of its twins
@@ -169,7 +169,7 @@ pub(super) async fn upsert_pool_config(
         // takes the original's disk I/O limits too: a config this upsert
         // makes would get the platform defaults, and once it's
         // operator-managed the autoscaler no longer sets them from policy.
-        let disk_mib = WarmPoolStore::config_disk_mib(&mut tx, id)
+        let disk_mib = WarmPoolStore::config_disk_mib(&mut *tx, id)
             .await
             .map_err(|err| pool_store_error("failed to read cluster pool config", &err))?;
         let twin_spec = ManualPoolConfigSpec {
@@ -177,10 +177,10 @@ pub(super) async fn upsert_pool_config(
             reset_disk_to_template_default: disk_mib.is_none(),
             ..spec
         };
-        let twin_config = WarmPoolStore::upsert_manual_config(&mut tx, twin, &twin_spec)
+        let twin_config = WarmPoolStore::upsert_manual_config(&mut *tx, twin, &twin_spec)
             .await
             .map_err(upsert_error)?;
-        WarmPoolStore::copy_config_disk_io_limits(&mut tx, id, twin_config)
+        WarmPoolStore::copy_config_disk_io_limits(&mut *tx, id, twin_config)
             .await
             .map_err(|err| pool_store_error("failed to copy cluster pool config", &err))?;
     }
@@ -223,7 +223,7 @@ pub(super) async fn disable_pool_config(
             .lock_template_against_twin_inserts(&mut tx, &template_name)
             .await?;
     }
-    let disabled = WarmPoolStore::disable_config(&mut tx, id)
+    let disabled = WarmPoolStore::disable_config(&mut *tx, id)
         .await
         .map_err(disable_error)?
         .ok_or_else(|| ControllerError::not_found("cluster pool config not found"))?;
@@ -251,7 +251,7 @@ pub(super) async fn disable_pool_config(
         .await
         .map_err(|err| db_contention_error("failed to read the release's twins", &err))?;
         for twin in twins {
-            WarmPoolStore::disable_shape_config(&mut tx, twin, &disabled)
+            WarmPoolStore::disable_shape_config(&mut *tx, twin, &disabled)
                 .await
                 .map_err(disable_error)?;
         }
@@ -451,7 +451,7 @@ pub(super) async fn lookup_admitted_pooled_execution(
     let mut tx = pool.begin().await.map_err(|err| {
         db_contention_error("failed to start admitted pool claim transaction", &err)
     })?;
-    let reserved = WarmPoolStore::lock_reserved_slot(&mut tx, sandbox_id)
+    let reserved = WarmPoolStore::lock_reserved_slot(&mut *tx, sandbox_id)
         .await
         .map_err(|err| pool_store_error("failed to read admitted pool slot", &err))?;
     let (lookup, result) = match reserved {
@@ -481,7 +481,7 @@ pub(super) async fn lookup_admitted_pooled_execution(
                     "claimed",
                 )
             } else {
-                WarmPoolStore::invalidate_claimed_slot_in(&mut tx, admitted.claim_id, sandbox_id)
+                WarmPoolStore::invalidate_claimed_slot_in(&mut *tx, admitted.claim_id, sandbox_id)
                     .await
                     .map_err(|err| {
                         pool_store_error("failed to invalidate admitted pool slot", &err)
@@ -490,7 +490,7 @@ pub(super) async fn lookup_admitted_pooled_execution(
             }
         }
         Some(reserved) if reserved.state == PoolSlotState::Ready => {
-            WarmPoolStore::fence_ready_slot(&mut tx, reserved.slot.id)
+            WarmPoolStore::fence_ready_slot(&mut *tx, reserved.slot.id)
                 .await
                 .map_err(|err| pool_store_error("failed to fence admitted pool slot", &err))?;
             (AdmittedPoolClaimLookup::ReleasePending, "slot_ready")
@@ -555,7 +555,7 @@ pub(super) async fn claim_admission_pool_slot(
 ) -> Result<Option<AdmissionPoolClaim>, ControllerError> {
     let claim_id = Uuid::now_v7();
     let slot = WarmPoolStore::claim_ready_slot_for_release(
-        tx,
+        &mut **tx,
         template_release_id,
         namespace,
         claim_id,
@@ -613,7 +613,7 @@ async fn claim_ready_pool_slot(
                 ))
             })?;
             let shape = WarmPoolStore::preferred_enabled_shape_for_release(
-                tx,
+                &mut **tx,
                 template_release_id,
                 namespace,
                 Some((pool_vcpu, pool_memory)),
@@ -626,7 +626,7 @@ async fn claim_ready_pool_slot(
             };
             (
                 WarmPoolStore::claim_ready_slot(
-                    tx,
+                    &mut **tx,
                     template_release_id,
                     pool_vcpu,
                     pool_memory,
@@ -640,7 +640,7 @@ async fn claim_ready_pool_slot(
         }
         (None, None) => {
             let slot = WarmPoolStore::claim_ready_slot_for_release(
-                tx,
+                &mut **tx,
                 template_release_id,
                 namespace,
                 claim_id,
@@ -652,7 +652,7 @@ async fn claim_ready_pool_slot(
                 return Ok((slot, None));
             };
             let miss_shape = WarmPoolStore::preferred_enabled_shape_for_release(
-                tx,
+                &mut **tx,
                 template_release_id,
                 namespace,
                 None,
@@ -683,7 +683,7 @@ pub(super) async fn persist_pooled_execution_claim(
     // Stamp the slot bound first: it row-locks the slot for the rest of the
     // transaction and is the marker the stale-claimed sweep uses to tell a
     // committed handoff from one that died between claim and bind.
-    let bound = WarmPoolStore::bind_claimed_slot(tx, claim.claim_id, claim.sandbox_id)
+    let bound = WarmPoolStore::bind_claimed_slot(&mut **tx, claim.claim_id, claim.sandbox_id)
         .await
         .map_err(|err| pool_store_error("failed to stamp pool slot bound", &err))?;
     if !bound {
@@ -692,7 +692,7 @@ pub(super) async fn persist_pooled_execution_claim(
         ));
     }
 
-    let source = WarmPoolStore::bind_source(tx, claim.claim_id, claim.sandbox_id)
+    let source = WarmPoolStore::bind_source(&mut **tx, claim.claim_id, claim.sandbox_id)
         .await
         .map_err(|err| pool_store_error("failed to read pool slot bind source", &err))?
         .ok_or_else(|| {
@@ -733,12 +733,13 @@ pub(super) async fn mark_claimed_pool_slot_cleanup_pending(
             &err,
         )
     })?;
-    let marked =
-        WarmPoolStore::mark_claimed_slot_cleanup_pending(&mut tx, claim.claim_id, claim.sandbox_id)
-            .await
-            .map_err(|err| {
-                pool_store_error("failed to mark claimed pool slot cleanup_pending", &err)
-            })?;
+    let marked = WarmPoolStore::mark_claimed_slot_cleanup_pending(
+        &mut *tx,
+        claim.claim_id,
+        claim.sandbox_id,
+    )
+    .await
+    .map_err(|err| pool_store_error("failed to mark claimed pool slot cleanup_pending", &err))?;
     if !marked {
         return Err(ControllerError::internal(
             "claimed pool slot missing during cleanup-pending mark",

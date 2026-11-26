@@ -116,7 +116,7 @@ impl RetentionSink for TombstoneRetentionStore {
             .map(|id| SandboxId::from_uuid(*id))
             .collect::<Vec<_>>();
         pplx_space_cluster_pool::WarmPoolStore::delete_claimed_slots_for_retired_executions(
-            &mut tx,
+            &mut *tx,
             &deleted_reservations,
         )
         .await?;

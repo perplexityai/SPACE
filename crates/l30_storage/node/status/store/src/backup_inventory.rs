@@ -4,6 +4,7 @@
 use std::sync::LazyLock;
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_residency::node_backup_inventory_fresh;
 use pplx_space_sql_locator::sql;
 
@@ -20,14 +21,11 @@ static FRESH: LazyLock<String> =
 /// reported one, or reported it too long ago. TRUE licenses reading an empty
 /// pending-backup set as "nothing pending" rather than "never reported". A
 /// read; it compares against the executor's `NOW()`.
-pub async fn fresh(
-    executor: impl sqlx::PgExecutor<'_>,
-    node_id: NodeId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sqlx::AssertSqlSafe(FRESH.as_str()))
+pub async fn fresh(executor: impl Executor<'_>, node_id: NodeId) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(FRESH.as_str()))
         .bind(node_id)
-        .fetch_one(executor)
-        .await
+        .fetch_one(executor.into_sqlx())
+        .await?)
 }
 
 #[cfg(test)]

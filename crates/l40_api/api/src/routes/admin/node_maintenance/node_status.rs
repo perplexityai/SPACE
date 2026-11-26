@@ -154,7 +154,9 @@ pub(super) async fn fetch_node_status_map(
     if node_ids.is_empty() {
         return Ok(Vec::new());
     }
-    pplx_space_node_status_store::status_summaries(pool, node_ids).await
+    pplx_space_node_status_store::status_summaries(pool, node_ids)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 pub(super) async fn node_status_refresh_needed(

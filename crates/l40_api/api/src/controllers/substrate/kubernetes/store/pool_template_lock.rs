@@ -43,6 +43,7 @@ impl K8sStore {
     ) -> Result<Option<String>, SubstrateError> {
         pplx_space_cluster_pool::pool_config_template_name(&mut *conn, config_id)
             .await
+            .map_err(sqlx::Error::from)
             .db_context("failed to read the pool config's template")
     }
 }
