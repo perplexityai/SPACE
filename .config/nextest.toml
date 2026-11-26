@@ -103,13 +103,15 @@ max-threads = 2
 filter = 'package(pplx-space-api) and test(/^routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::/)'
 test-group = "state-render"
 
-# Plan tests that seed production-scale fixtures, tens of thousands of rows,
-# on the run's shared Postgres server. nextest starts a binary's tests
-# together, so each binary's bulk inserts arrived at once: single inserts then
-# took 1 to 9 s, and every other test on the server slowed with them. At most
-# two run at once, and they start first, so that waiting for the group does
-# not lengthen the run's tail. Each still has its own exception in
-# ci/test-duration-budget.toml; delete it once its test stays under the limit.
+# Tests that seed large fixtures on the run's shared Postgres server: plan
+# tests over production-scale tables, and the fleet occupancy comparisons.
+# nextest starts a binary's tests together, so each binary's bulk inserts
+# arrived at once: single inserts then took 1 to 9 s, and every other test on
+# the server slowed with them. At most two run at once. Their priority starts
+# them ahead of other tests whenever a slot frees, so the group's queue drains
+# early in the run, though a test waiting for the group can still start late.
+# Each still has its own exception in ci/test-duration-budget.toml; delete it
+# once its test stays under the limit.
 [test-groups.postgres-bulk-fixtures]
 max-threads = 2
 
