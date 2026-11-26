@@ -144,8 +144,12 @@ enum PodSource {
     /// The reflector reports the pod bound to its node, whose sandbox
     /// manager reports the pod's address before kubelet publishes it.
     NodeReportsFirst,
-    /// The reflector never reports the pod; a read of it finds it running.
+    /// The reflector keeps delivering other pods' updates but never this
+    /// pod's; a read of it finds it running.
     ReflectorLagsBehindReads,
+    /// The reflector delivers nothing at all, as a stalled watch does; a read
+    /// of the pod finds it running.
+    ReflectorStalls,
     /// The reflector never reports the pod and a read of it finds no IP.
     NeverAssigned,
     /// The reflector never reports the pod and a read of it never answers.
@@ -160,6 +164,10 @@ enum PodSource {
 /// backstop reads in [`create_learns_its_pod_ip_without_a_watch_or_poll_of_its_own`].
 const TEST_BACKSTOP: Duration = Duration::from_millis(400);
 
+/// How long the reflector may deliver nothing before the waits of the
+/// reflector cases read their pods directly.
+const TEST_QUIET_REFLECTOR: Duration = Duration::from_millis(150);
+
 /// The IP phase's deadline in that test: long enough to see more than one
 /// backstop interval, short enough that the cases that run it out stay quick.
 const TEST_DATA_PLANE_READY: Duration = Duration::from_millis(1_500);
@@ -168,13 +176,15 @@ const TEST_DATA_PLANE_READY: Duration = Duration::from_millis(1_500);
 /// reflector and no watch or poll of its own. A reflector update binds the
 /// pod without any read of it; while the reflector does not show it settled,
 /// the pod is read about once a backstop interval and once more just before
-/// the deadline. The pod's node can report the address first, once the
+/// the deadline, or about once a quiet interval while the reflector delivers
+/// nothing at all. The pod's node can report the address first, once the
 /// reflector shows the pod placed. An unschedulable or deleted pod ends the
 /// wait as it did with a per-pod watch.
 #[rstest::rstest]
 #[case::a_reflector_update_binds_the_pod(PodSource::ReflectorEvent)]
 #[case::the_node_reported_address_binds_the_pod(PodSource::NodeReportsFirst)]
 #[case::a_lagging_reflector_is_covered_by_a_backstop_read(PodSource::ReflectorLagsBehindReads)]
+#[case::a_stalled_reflector_is_covered_by_a_prompt_read(PodSource::ReflectorStalls)]
 #[case::a_pod_without_an_ip_is_read_once_at_the_deadline(PodSource::NeverAssigned)]
 #[case::the_phase_deadline_preempts_a_stalled_read(PodSource::ReadsStall)]
 #[case::an_unschedulable_pod_fails_the_create(PodSource::Unschedulable)]
@@ -207,7 +217,7 @@ async fn create_learns_its_pod_ip_without_a_watch_or_poll_of_its_own(
             Method::GET if request.path == pod_path(&pod_name) => {
                 reply_pod_reads.lock().unwrap().push(Instant::now());
                 match source {
-                    PodSource::ReflectorLagsBehindReads => {
+                    PodSource::ReflectorLagsBehindReads | PodSource::ReflectorStalls => {
                         pod_reply(&running_pod(&pod_name, sandbox_id, Some(WORKER_NODE)))
                     }
                     PodSource::NeverAssigned => {
@@ -257,7 +267,18 @@ async fn create_learns_its_pod_ip_without_a_watch_or_poll_of_its_own(
     } else {
         Duration::from_millis(100)
     };
-    substrate.budgets.readiness_backstop = TEST_BACKSTOP;
+    substrate.budgets.readiness_backstop = if source == PodSource::ReflectorStalls {
+        // Out of reach, so only the stalled reflector can prompt the read.
+        Duration::from_secs(10)
+    } else {
+        TEST_BACKSTOP
+    };
+    if matches!(
+        source,
+        PodSource::ReflectorLagsBehindReads | PodSource::ReflectorStalls
+    ) {
+        substrate.budgets.readiness_quiet_reflector = TEST_QUIET_REFLECTOR;
+    }
     let data_plane_ready = TEST_DATA_PLANE_READY;
     substrate.k8s.create_data_plane_ready_timeout = data_plane_ready;
     let inputs = CreateInputs::new();
@@ -318,9 +339,15 @@ async fn create_learns_its_pod_ip_without_a_watch_or_poll_of_its_own(
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 feed.delete(pending);
             }
-            PodSource::ReflectorLagsBehindReads
-            | PodSource::NeverAssigned
-            | PodSource::ReadsStall => {}
+            PodSource::ReflectorLagsBehindReads => {
+                // Other pods keep changing, so the reflector is not quiet.
+                let other = starting_pod("space-sbx-other-g1", SandboxId::new(), Some(WORKER_NODE));
+                for _ in 0..30 {
+                    feed.apply(other.clone());
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+            PodSource::ReflectorStalls | PodSource::NeverAssigned | PodSource::ReadsStall => {}
         }
     };
     let (outcome, ()) = tokio::time::timeout(
@@ -377,6 +404,16 @@ async fn create_learns_its_pod_ip_without_a_watch_or_poll_of_its_own(
                 recorded.as_deref(),
                 Some("127.0.0.1"),
                 "the confirmed node address is recorded"
+            );
+        }
+        PodSource::ReflectorStalls => {
+            let outcome = outcome?;
+            assert!(outcome.binding.is_some(), "the prompt read binds the pod");
+            let first = *reads.first().ok_or("the wait reads the pod")?;
+            assert!(
+                first >= TEST_QUIET_REFLECTOR - Duration::from_millis(50)
+                    && first < TEST_QUIET_REFLECTOR + Duration::from_millis(400),
+                "a silent reflector prompts a read about one quiet interval in: {reads:?}"
             );
         }
         PodSource::ReflectorLagsBehindReads => {

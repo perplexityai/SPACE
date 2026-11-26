@@ -83,7 +83,7 @@ async fn reflect_sandbox_pods_updates_store_and_slots_then_broadcasts_touched_na
         .into_iter()
         .map(|event| Ok::<_, watcher::Error>(sandbox_pod_view::sandbox_pod_view_event(event))),
     );
-    reflect_sandbox_pods(raw.boxed(), writer, tx, TEST_NS).await;
+    reflect_sandbox_pods(raw.boxed(), writer, tx, _events.delivery_clock(), TEST_NS).await;
 
     let seen: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
     assert_eq!(seen, ["pod-listed", "pod-applied", "pod-listed"]);

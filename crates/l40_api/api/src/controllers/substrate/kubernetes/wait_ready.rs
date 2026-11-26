@@ -14,12 +14,18 @@ const READINESS_BACKSTOP_JITTER: f64 = 0.2;
 /// reflector does not show the pod settled: about every
 /// [`SubstrateBudgets::readiness_backstop`], jittered, and once more just
 /// before the deadline, early enough for that read to finish within it.
-/// Reflector lag or a broken watch costs a wait at most one interval, and the
-/// apiserver at most one read per waiting create per interval.
+/// While the reflector has delivered nothing at all for
+/// [`SubstrateBudgets::readiness_quiet_reflector`] (a stalled watch), also
+/// at most once per that interval. Reflector lag costs a wait at most one
+/// backstop interval, a stalled watch about one quiet interval past its
+/// recovery, and the apiserver at most one read per waiting create per
+/// backstop interval while the reflector is delivering.
 pub(super) struct ReadinessBackstop {
     next: Instant,
     last: Instant,
     interval: Duration,
+    quiet: Duration,
+    last_read: Instant,
     exhausted: bool,
 }
 
@@ -35,22 +41,30 @@ impl ReadinessBackstop {
             next: (now + jittered_backstop(interval)).min(last),
             last,
             interval,
+            quiet: budgets.readiness_quiet_reflector,
+            last_read: now,
             exhausted: false,
         }
     }
 
-    /// When the next read is due, or `None` once the last one has run.
-    fn next_read(&self) -> Option<Instant> {
-        (!self.exhausted).then_some(self.next)
+    /// When a read may next be due, given when the reflector last delivered
+    /// anything, or `None` once the last read has run.
+    fn next_read(&self, last_delivery: Instant) -> Option<Instant> {
+        let quiet_read = last_delivery.max(self.last_read) + self.quiet;
+        (!self.exhausted).then_some(self.next.min(quiet_read))
     }
 
-    fn due(&self, now: Instant) -> bool {
-        self.next_read().is_some_and(|next| now >= next)
+    fn due(&self, now: Instant, last_delivery: Instant) -> bool {
+        let reflector_quiet = now.saturating_duration_since(last_delivery) >= self.quiet
+            && now.saturating_duration_since(self.last_read) >= self.quiet;
+        !self.exhausted && (now >= self.next || (now < self.last && reflector_quiet))
     }
 
-    /// Count a read, due or not, starting the next interval.
+    /// Count a read, starting the next interval; the one at or after the last
+    /// read's time is the last.
     fn read(&mut self, now: Instant) {
-        if self.next >= self.last {
+        self.last_read = now;
+        if now >= self.last {
             self.exhausted = true;
             return;
         }
@@ -280,8 +294,9 @@ impl KubernetesSubstrate {
     /// store shows the pod settled (an IP, a terminal phase or
     /// unschedulable), the address is resolved and validated as every
     /// readiness resolution is. While it does not, `backstop` paces the
-    /// apiserver reads that cover reflector lag. A reflector that has not
-    /// finished its first list is waited for, within the same reads.
+    /// apiserver reads that cover reflector lag and a stalled watch. A
+    /// reflector that has not finished its first list is waited for, within
+    /// the same reads.
     async fn reflected_pod_ip(
         &self,
         sandbox_id: SandboxId,
@@ -346,7 +361,7 @@ impl KubernetesSubstrate {
                     observed.send_replace(Some(SandboxPodView::clone(&pod)));
                 }
             }
-            if !settled && backstop.due(Instant::now()) {
+            if !settled && backstop.due(Instant::now(), self.pod_events.last_delivery()) {
                 backstop.read(Instant::now());
                 if let Some(resolved) = self
                     .resolve_pod_ip_for_readiness(sandbox_id, target, deadline)
@@ -356,7 +371,14 @@ impl KubernetesSubstrate {
                 }
             }
             learned = PodIpLearned::Reflector;
-            let wake_at = [backstop.next_read(), recheck_at]
+            // Reads are only for a pod the store does not show settled; a
+            // settled one is asked again at `recheck_at`.
+            let next_read = if settled {
+                None
+            } else {
+                backstop.next_read(self.pod_events.last_delivery())
+            };
+            let wake_at = [next_read, recheck_at]
                 .into_iter()
                 .flatten()
                 .fold(deadline, Instant::min);
@@ -644,7 +666,7 @@ impl KubernetesSubstrate {
             let settled = self
                 .lookup_sandbox_pod(target.pod_name)
                 .is_some_and(|pod| target.names(&pod) && pod_status_is_settled(&pod));
-            if settled || backstop.due(Instant::now()) {
+            if settled || backstop.due(Instant::now(), self.pod_events.last_delivery()) {
                 if !settled {
                     backstop.read(Instant::now());
                 }

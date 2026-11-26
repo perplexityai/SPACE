@@ -56,6 +56,10 @@ pub(super) struct SubstrateBudgets {
     /// readiness wait reads its pod from the apiserver while the reflector
     /// does not show it settled.
     pub(super) readiness_backstop: Duration,
+    /// [`super::READINESS_QUIET_REFLECTOR`]: how long the sandbox-pod
+    /// reflector may deliver nothing before IP readiness waits read their
+    /// pods directly, and how often each does while it stays silent.
+    pub(super) readiness_quiet_reflector: Duration,
     /// [`super::execution::RETRY_DEFERRAL_GRACE`]: how long a caller under
     /// the dispatcher's retry deferral keeps retrying a fenced restore claim
     /// in place before it hands the wait back.
@@ -78,6 +82,7 @@ impl SubstrateBudgets {
         // displace the reflector, which can observe readiness independently.
         readiness_pod_get: Duration::from_secs(5),
         readiness_backstop: super::READINESS_BACKSTOP_INTERVAL,
+        readiness_quiet_reflector: super::READINESS_QUIET_REFLECTOR,
         retry_deferral_grace: super::execution::RETRY_DEFERRAL_GRACE,
     };
 

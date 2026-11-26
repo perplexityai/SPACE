@@ -189,6 +189,7 @@ pub(super) fn assemble_substrate(
 pub(super) struct PodCacheFeed {
     writer: sandbox_pod_view::SandboxPodWriter,
     events: tokio::sync::broadcast::Sender<String>,
+    delivered: pod_reflector::DeliveryClock,
 }
 
 #[cfg(test)]
@@ -209,6 +210,7 @@ impl PodCacheFeed {
         };
         let name = pod.name().to_owned();
         self.writer.apply_watcher_event(&event);
+        self.delivered.stamp();
         // No receiver is a wait that has not subscribed yet; the store holds
         // the update for it.
         if self.events.send(name).is_err() {
@@ -227,8 +229,16 @@ impl KubernetesSubstrate {
         self.pod_store = pod_store;
         self.pod_network_slots = indexes.network_slots;
         self.pod_client_index = indexes.client_pods;
+        let delivered = pod_events.delivery_clock();
         self.pod_events = pod_events;
-        (self, PodCacheFeed { writer, events })
+        (
+            self,
+            PodCacheFeed {
+                writer,
+                events,
+                delivered,
+            },
+        )
     }
 
     /// This substrate with the process's watch of sandbox refusals running

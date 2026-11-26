@@ -206,6 +206,14 @@ const K8S_BLOCKING_DELETE_FALLBACK_GET_TIMEOUT: Duration = Duration::from_secs(2
 /// a broken watch can hold a create, at one read per waiting create per
 /// interval however many creates wait.
 const READINESS_BACKSTOP_INTERVAL: Duration = Duration::from_secs(30);
+/// How long the sandbox-pod reflector may deliver nothing at all before IP
+/// readiness waits stop trusting it and read their pods directly, each at
+/// most this often while the silence lasts. A watch whose connection has
+/// stalled delivers nothing, yet reports no error until it resumes, which
+/// can take the apiserver's retransmission backoff, tens of seconds. While
+/// creates are starting pods, the reflector normally delivers several updates
+/// a second, so this costs nothing in steady state.
+const READINESS_QUIET_REFLECTOR: Duration = Duration::from_secs(5);
 /// Wall-clock budget for `read_sandbox_pod` to wait on a reflector event for
 /// the target pod before falling through to a direct `GET /pods/{name}`.
 /// A short wait can avoid an apiserver GET when the reflector is catching up,
