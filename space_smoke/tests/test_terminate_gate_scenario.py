@@ -493,7 +493,7 @@ class TheRefusalIsDataNotAnException(unittest.TestCase):
         with (
             mock.patch.object(KindHarness, "_assert_lease_owned", return_value=None),
             mock.patch(
-                "space_smoke.adapters.urlopen",
+                "space_smoke.adapters._URL_OPEN",
                 side_effect=_http_error(409, b'{"sandboxes_drain_blockers":1}'),
             ),
         ):
@@ -506,7 +506,7 @@ class TheRefusalIsDataNotAnException(unittest.TestCase):
         with (
             mock.patch.object(KindHarness, "_assert_lease_owned", return_value=None),
             mock.patch(
-                "space_smoke.adapters.urlopen",
+                "space_smoke.adapters._URL_OPEN",
                 side_effect=_http_error(502, b"<html>bad gateway</html>"),
             ),
             self.assertRaisesRegex(SmokeConfigurationError, "not JSON"),
