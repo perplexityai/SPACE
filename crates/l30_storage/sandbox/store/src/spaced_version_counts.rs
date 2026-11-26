@@ -3,9 +3,9 @@
 //! the list projects them.
 
 use pplx_space_accounts::OrgId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 
 use pplx_space_sandbox_teardown::observed_states::ObservedSpacedVersion;
 
@@ -35,11 +35,11 @@ pub struct SpacedVersionCountRecord {
 /// observed states with no sandbox row too. `pool_reserved` lists the
 /// rowless sandboxes the caller found a warm-pool slot reserving.
 pub async fn count_by_spaced_version(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: Option<OrgId>,
     pool_reserved: &[SandboxId],
-) -> Result<Vec<SpacedVersionCountRecord>, sqlx::Error> {
-    sqlx::query_as::<_, SpacedVersionCountRecord>(sql!(
+) -> Result<Vec<SpacedVersionCountRecord>, DbError> {
+    Ok(sqlx::query_as::<_, SpacedVersionCountRecord>(sql!(
         "SELECT counted.template,
                 counted.spaced_version,
                 counted.status,
@@ -75,6 +75,6 @@ pub async fn count_by_spaced_version(
     .bind(org_id)
     .bind(DELETED_LIFECYCLE)
     .bind(pool_reserved)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }

@@ -422,7 +422,7 @@ async fn a_new_owner_that_claims_first_keeps_the_row(
         let owner_pid: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
             .fetch_one(&mut *owner)
             .await?;
-        row_locks::lock_id(&mut owner, id).await?;
+        row_locks::lock_id(&mut *owner, id).await?;
 
         let (sweep_pool, sweep_pid) = single_backend_pool(&db).await?;
         // The revert that only moves the lifecycle: the one that also

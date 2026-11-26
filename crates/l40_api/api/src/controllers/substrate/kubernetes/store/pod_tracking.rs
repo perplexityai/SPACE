@@ -121,7 +121,7 @@ impl K8sStore {
         if !Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await? {
             return Ok(false);
         }
-        let refuse = pod_tracking::stopped_execution_retirement_refused(&mut tx, sandbox_id)
+        let refuse = pod_tracking::stopped_execution_retirement_refused(&mut *tx, sandbox_id)
             .await
             .db_context("failed to check for an execution newer than the stop")?;
         if refuse {
@@ -155,10 +155,13 @@ impl K8sStore {
         if !Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await? {
             return Ok(false);
         }
-        let released =
-            pod_tracking::release_published_stopped_evacuation(&mut tx, sandbox_id, source_node_id)
-                .await
-                .db_context("failed to release stopped evacuation placement")?;
+        let released = pod_tracking::release_published_stopped_evacuation(
+            &mut *tx,
+            sandbox_id,
+            source_node_id,
+        )
+        .await
+        .db_context("failed to release stopped evacuation placement")?;
         tx.commit()
             .await
             .db_context("failed to commit stopped evacuation release")?;
@@ -562,10 +565,14 @@ impl K8sStore {
         // gate doesn't strand a markerless row's ready snapshot. See
         // [`PlacementClock`].
         let unplaced = match placement_clock {
-            PlacementClock::Bump => pod_tracking::unplace_after_pod_teardown(tx, sandbox_id).await,
+            PlacementClock::Bump => {
+                pod_tracking::unplace_after_pod_teardown(&mut **tx, sandbox_id).await
+            }
             PlacementClock::Preserve => {
-                pod_tracking::unplace_after_pod_teardown_preserving_placement_clock(tx, sandbox_id)
-                    .await
+                pod_tracking::unplace_after_pod_teardown_preserving_placement_clock(
+                    &mut **tx, sandbox_id,
+                )
+                .await
             }
         }
         .db_context("failed to mark sandbox unplaced")?;
@@ -591,7 +598,7 @@ impl K8sStore {
         // Callers hold the sandbox row lock and retire the authoritative
         // execution earlier in this transaction. Execution creation takes the
         // same lock, so a successor cannot appear between this proof and commit.
-        pod_tracking::recover_markerless_restoring_after_execution_cleanup(tx, sandbox_id)
+        pod_tracking::recover_markerless_restoring_after_execution_cleanup(&mut **tx, sandbox_id)
             .await
             .db_context("failed to recover markerless restoring sandbox after execution cleanup")
     }
@@ -601,7 +608,7 @@ impl K8sStore {
         tx: &mut Transaction<'_, Postgres>,
         sandbox_id: SandboxId,
     ) -> Result<bool, SubstrateError> {
-        pod_tracking::recover_started_after_execution_retired(tx, sandbox_id)
+        pod_tracking::recover_started_after_execution_retired(&mut **tx, sandbox_id)
             .await
             .db_context("failed to recover started sandbox with current suspend snapshot")
     }
@@ -612,7 +619,7 @@ impl K8sStore {
         sandbox_id: SandboxId,
         generation: ExecutionGeneration,
     ) -> Result<bool, SubstrateError> {
-        pod_tracking::recover_started_after_failed_recovery(tx, sandbox_id, generation)
+        pod_tracking::recover_started_after_failed_recovery(&mut **tx, sandbox_id, generation)
             .await
             .db_context("failed to recover started sandbox with current suspend snapshot")
     }

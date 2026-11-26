@@ -8,9 +8,9 @@
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sql_locator::sql;
-use sqlx::{PgExecutor, Postgres, Transaction};
 
 #[cfg(test)]
 mod tests;
@@ -20,13 +20,13 @@ mod tests;
 /// restore-lease token, has a route identity on `node_id` older than
 /// `record_generation`, a generation its provenance has already reserved.
 /// Takes no lock.
-pub async fn route_identity_trails_record<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn route_identity_trails_record(
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     node_id: NodeId,
     record_generation: i64,
     read_lifecycle: SandboxLifecycle,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     Ok(sqlx::query_scalar::<_, bool>(sql!(
         "SELECT TRUE
                FROM sandboxes s
@@ -47,7 +47,7 @@ pub async fn route_identity_trails_record<'e>(
     .bind(record_generation)
     .bind(SubstrateKind::Space)
     .bind(read_lifecycle.as_str())
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?
     .is_some())
 }
@@ -82,15 +82,19 @@ pub struct LiveAdoptionGenerations {
 /// an insert into the route tables, which a route writer can reach while
 /// holding its route row. The route rows take no lock: locking them would
 /// order the adoption against writers that take the route identity and the
-/// provenance in different orders.
-pub async fn lock_live_adoption_candidate(
-    transaction: &mut Transaction<'_, Postgres>,
+/// provenance in different orders. The caller must pass its open
+/// transaction.
+pub async fn lock_live_adoption_candidate<C>(
+    transaction: &mut C,
     sandbox_id: SandboxId,
     read_lifecycle: SandboxLifecycle,
     node_id: NodeId,
     execution_generation: i64,
-) -> Result<Option<LiveAdoptionGenerations>, sqlx::Error> {
-    sqlx::query_as::<_, LiveAdoptionGenerations>(sql!(
+) -> Result<Option<LiveAdoptionGenerations>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_as::<_, LiveAdoptionGenerations>(sql!(
         "SELECT route.execution_generation,
                     provenance.last_execution_generation
                FROM sandboxes s
@@ -116,6 +120,6 @@ pub async fn lock_live_adoption_candidate(
     .bind(read_lifecycle.as_str())
     .bind(node_id)
     .bind(execution_generation)
-    .fetch_optional(&mut **transaction)
-    .await
+    .fetch_optional(transaction.into_sqlx())
+    .await?)
 }

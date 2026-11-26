@@ -1319,7 +1319,7 @@ impl DirectSubstrate {
             .await
             .db_context("failed to begin owned direct restore transaction")?;
         let owns_restore =
-            sandbox_direct::lock_restore_lease_owner(&mut transaction, sandbox_id, lease.token)
+            sandbox_direct::lock_restore_lease_owner(&mut *transaction, sandbox_id, lease.token)
                 .await
                 .db_context("failed to validate direct restore ownership")?;
         if !owns_restore {
@@ -3090,7 +3090,7 @@ impl DirectSubstrate {
         // The candidate's row lock is the transaction's first statement; see
         // the verb for what it locks and why.
         let route = sandbox_direct::adoption::lock_live_adoption_candidate(
-            &mut transaction,
+            &mut *transaction,
             sandbox_id,
             read_lifecycle,
             node.id,

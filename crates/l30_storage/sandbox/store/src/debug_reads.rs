@@ -12,6 +12,7 @@
 use pplx_space_accounts::{NodeId, OrgId, UserId};
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_node_model::{NodeAddress, NodeManagedBy, NodeRole};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use sqlx::types::{Json, JsonValue};
@@ -67,10 +68,10 @@ pub struct SandboxDebugRecord {
 
 /// The sandbox's [`SandboxDebugRecord`]. `None` when no such sandbox exists.
 pub async fn record(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<SandboxDebugRecord>, sqlx::Error> {
-    sqlx::query_as::<_, SandboxDebugRecord>(sql!(
+) -> Result<Option<SandboxDebugRecord>, DbError> {
+    Ok(sqlx::query_as::<_, SandboxDebugRecord>(sql!(
         "SELECT s.id,
                 s.name,
                 s.user_id,
@@ -113,8 +114,8 @@ pub async fn record(
           WHERE s.id = $1"
     ))
     .bind(sandbox_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// One `sandbox_k8s_executions` row as the debug view shows it.
@@ -139,10 +140,10 @@ pub struct ExecutionRow {
 
 /// Every execution of `sandbox_id`, newest first.
 pub async fn executions(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Vec<ExecutionRow>, sqlx::Error> {
-    sqlx::query_as::<_, ExecutionRow>(sql!(
+) -> Result<Vec<ExecutionRow>, DbError> {
+    Ok(sqlx::query_as::<_, ExecutionRow>(sql!(
         "SELECT id,
                 sandbox_id,
                 generation,
@@ -161,8 +162,8 @@ pub async fn executions(
           ORDER BY created_at DESC, generation DESC"
     ))
     .bind(sandbox_id)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// One `sandbox_snapshot_inventory` row: a snapshot a node reports holding.
@@ -189,10 +190,10 @@ pub struct SnapshotInventoryRow {
 /// The snapshot inventory nodes report for `sandbox_id`, newest observation
 /// first.
 pub async fn snapshot_inventory(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Vec<SnapshotInventoryRow>, sqlx::Error> {
-    sqlx::query_as::<_, SnapshotInventoryRow>(sql!(
+) -> Result<Vec<SnapshotInventoryRow>, DbError> {
+    Ok(sqlx::query_as::<_, SnapshotInventoryRow>(sql!(
         "SELECT sandbox_id,
                 snapshot_id,
                 type,
@@ -214,8 +215,8 @@ pub async fn snapshot_inventory(
           ORDER BY observed_at DESC, snapshot_id DESC"
     ))
     .bind(sandbox_id)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// One timeline entry: when, what kind of change, and a JSON summary of it.
@@ -232,10 +233,10 @@ pub struct TimelineEvent {
 /// owns; it stays in this one statement because splitting it would change
 /// which 200 entries the limit keeps.
 pub async fn timeline(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Vec<TimelineEvent>, sqlx::Error> {
-    sqlx::query_as::<_, TimelineEvent>(sql!(
+) -> Result<Vec<TimelineEvent>, DbError> {
+    Ok(sqlx::query_as::<_, TimelineEvent>(sql!(
         "SELECT at, kind, detail
            FROM (
                  SELECT s.created_at AS at,
@@ -355,6 +356,6 @@ pub async fn timeline(
           LIMIT 200"
     ))
     .bind(sandbox_id)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }

@@ -39,7 +39,7 @@ pub(super) struct SandboxPopulationRow {
 /// and lifecycle, as [`pplx_space_sandbox_store::runtime_population::sandbox_population`]
 /// reads them.
 pub(super) async fn sandbox_population(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
 ) -> Result<Vec<SandboxPopulationRow>, sqlx::Error> {
     Ok(
         pplx_space_sandbox_store::runtime_population::sandbox_population(executor)

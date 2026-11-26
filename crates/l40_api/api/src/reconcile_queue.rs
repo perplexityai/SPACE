@@ -120,7 +120,7 @@ pub async fn finalize_sandbox_db_delete_user_initiated(
     // if the sandbox doesn't exist (already deleted), the
     // subsequent delete_with_dependents deletes no `sandboxes` row
     // and only clears any dependent rows left for this id.
-    pplx_space_sandbox_store::row_locks::lock_exists(&mut tx, sandbox_id).await?;
+    pplx_space_sandbox_store::row_locks::lock_exists(&mut *tx, sandbox_id).await?;
     // Under the parent-row lock above, no new `creating` row can
     // appear between this SELECT and the orphan UPDATE inside
     // `delete_with_dependents`. A plain SELECT (no row lock)
@@ -342,9 +342,11 @@ pub async fn enqueue_sandbox_reconcile_tx(
     // Keep placement stable through enqueue without blocking foreign-key
     // checks in a node publication that already holds its reconcile trigger.
     let node_id: Option<NodeId> =
-        pplx_space_sandbox_store::row_locks::lock_active_node_id_no_key_update(tx, sandbox_id)
-            .await?
-            .flatten();
+        pplx_space_sandbox_store::row_locks::lock_active_node_id_no_key_update(
+            &mut **tx, sandbox_id,
+        )
+        .await?
+        .flatten();
     let Some(node_id) = node_id else {
         return Ok(None);
     };

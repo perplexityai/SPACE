@@ -11,6 +11,7 @@
 //! nothing.
 
 use pplx_space_k8s_ids::{K8sNodeName, K8sNodeUid};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_snapshot_model::SnapshotId;
 use pplx_space_sql_locator::sql;
@@ -29,11 +30,11 @@ pub struct AttributedK8sNode {
 /// particular order; a node attributed more than once is listed once. An
 /// unknown sandbox has none.
 pub async fn attributed_k8s_nodes(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     snapshot_id: SnapshotId,
-) -> Result<Vec<AttributedK8sNode>, sqlx::Error> {
-    sqlx::query_as::<_, AttributedK8sNode>(sql!(
+) -> Result<Vec<AttributedK8sNode>, DbError> {
+    Ok(sqlx::query_as::<_, AttributedK8sNode>(sql!(
         "WITH latest_execution AS (
              SELECT k8s_node_name
              FROM sandbox_k8s_executions
@@ -69,6 +70,6 @@ pub async fn attributed_k8s_nodes(
     ))
     .bind(sandbox_id)
     .bind(snapshot_id)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }

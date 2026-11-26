@@ -11,17 +11,18 @@
 //! passes.
 
 use pplx_space_accounts::{ClientId, NodeId, OrgId, UserId};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 
 /// Whether `sandbox_id` exists and belongs to `org_id`. A deleted row kept
 /// for retention still counts.
 pub async fn org_owns(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     org_id: OrgId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
         "SELECT EXISTS(
              SELECT 1
              FROM sandboxes
@@ -30,17 +31,17 @@ pub async fn org_owns(
     ))
     .bind(sandbox_id)
     .bind(org_id)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether `sandbox_id` has prior state: a current local
 /// artifact, or a full snapshot that is `creating` or `ready`.
 pub async fn prior_state_exists(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT EXISTS (
                  SELECT 1
                    FROM sandboxes s
@@ -58,8 +59,8 @@ pub async fn prior_state_exists(
              )"
     ))
     .bind(sandbox_id)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// A sandbox's lifecycle and its runtime's activation record
@@ -72,40 +73,40 @@ pub struct ActivationRecord {
 
 /// Whether `sandbox_id` is `started`; `false` when the row is gone.
 pub async fn is_started(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT COALESCE((SELECT lifecycle = 'started' FROM sandboxes WHERE id = $1), FALSE)"
     ))
     .bind(sandbox_id)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// [`ActivationRecord`] of `sandbox_id`; `None` when the row is gone. See
 /// [`crate::attribute_runtime`] for who writes the record.
 pub async fn activation_record(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<ActivationRecord>, sqlx::Error> {
-    sqlx::query_as::<_, ActivationRecord>(sql!(
+) -> Result<Option<ActivationRecord>, DbError> {
+    Ok(sqlx::query_as::<_, ActivationRecord>(sql!(
         "SELECT lifecycle, activating_client_id FROM sandboxes WHERE id = $1"
     ))
     .bind(sandbox_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Seconds left on `sandbox_id`'s restore lease by the database clock:
 /// `0.0` once it has expired or when the row holds no lease expiry
-/// (`GREATEST` skips the NULL). Fails with `RowNotFound` when the row is
-/// gone.
+/// (`GREATEST` skips the NULL). Fails with a [`DbError`] of kind `NotFound`
+/// (the driver's `RowNotFound`) when the row is gone.
 pub async fn restore_lease_remaining_secs(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<f64, sqlx::Error> {
-    sqlx::query_scalar::<_, f64>(sql!(
+) -> Result<f64, DbError> {
+    Ok(sqlx::query_scalar::<_, f64>(sql!(
         "SELECT GREATEST(
                                 EXTRACT(EPOCH FROM (restore_lease_expires_at - NOW())),
                                 0.0
@@ -114,8 +115,8 @@ pub async fn restore_lease_remaining_secs(
                       WHERE id = $1"
     ))
     .bind(sandbox_id)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// A sandbox's owning user and organization, and whether that organization
@@ -130,17 +131,17 @@ pub struct OwnerRecord {
 
 /// The sandbox's [`OwnerRecord`]. `None` when no such sandbox exists.
 pub async fn owner(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<OwnerRecord>, sqlx::Error> {
-    sqlx::query_as::<_, OwnerRecord>(sql!(
+) -> Result<Option<OwnerRecord>, DbError> {
+    Ok(sqlx::query_as::<_, OwnerRecord>(sql!(
         "SELECT s.user_id, s.org_id, o.byok_enabled \
          FROM sandboxes s JOIN organizations o ON o.id = s.org_id \
          WHERE s.id = $1"
     ))
     .bind(sandbox_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The node `sandbox_id`'s row names (its `active_node_id`, else its
@@ -148,18 +149,18 @@ pub async fn owner(
 /// (`drain_engine = 'v2'`). `None` when the row is gone; `Some((None,
 /// false))` when it names no node, or one whose `nodes` row is gone.
 pub async fn home_node_v2_drain(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<(Option<NodeId>, bool)>, sqlx::Error> {
-    sqlx::query_as(sql!(
+) -> Result<Option<(Option<NodeId>, bool)>, DbError> {
+    Ok(sqlx::query_as(sql!(
         "SELECT n.id, COALESCE(n.drain_engine = 'v2', FALSE)
                FROM sandboxes s
                LEFT JOIN nodes n ON n.id = COALESCE(s.active_node_id, s.target_node_id)
               WHERE s.id = $1"
     ))
     .bind(sandbox_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 #[cfg(test)]

@@ -7,11 +7,11 @@
 use pplx_space_accounts::{NodeId, OrgId};
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_node_model::NodeManagedBy;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{
     EcwCredentialEpoch, ExecutionGeneration, SandboxActivationAttemptId, SandboxId,
 };
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 
 #[cfg(test)]
 mod tests;
@@ -30,11 +30,11 @@ pub struct AuthoritativeRouteIdentityRow {
 /// and substrate, else the row's active node, and the active Kubernetes
 /// execution's generation, pod and activation, else the Direct route
 /// identity's. `None` when the row is gone.
-pub async fn authoritative_route_identity<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn authoritative_route_identity(
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<AuthoritativeRouteIdentityRow>, sqlx::Error> {
-    sqlx::query_as::<_, AuthoritativeRouteIdentityRow>(sql!(
+) -> Result<Option<AuthoritativeRouteIdentityRow>, DbError> {
+    Ok(sqlx::query_as::<_, AuthoritativeRouteIdentityRow>(sql!(
         "SELECT COALESCE(direct_route.current_node_id, s.active_node_id) AS active_node_id,
                 COALESCE(direct_route.substrate_kind, active_node.managed_by)
                     AS active_node_managed_by,
@@ -63,8 +63,8 @@ pub async fn authoritative_route_identity<'e>(
          WHERE s.id = $1"
     ))
     .bind(sandbox_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The row [`service_route_row`] reads.
@@ -94,11 +94,11 @@ pub struct SandboxServiceRouteRow {
 /// as internal-api-server's other route reads join it: a worker's own
 /// suspend clears `active_node_id` but leaves the identity naming that
 /// worker, where the sandbox no longer runs.
-pub async fn service_route_row<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn service_route_row(
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<SandboxServiceRouteRow>, sqlx::Error> {
-    sqlx::query_as::<_, SandboxServiceRouteRow>(sql!(
+) -> Result<Option<SandboxServiceRouteRow>, DbError> {
+    Ok(sqlx::query_as::<_, SandboxServiceRouteRow>(sql!(
         "SELECT s.id AS sandbox_id,
                 s.org_id,
                 s.template_id,
@@ -133,6 +133,6 @@ pub async fn service_route_row<'e>(
          WHERE s.id = $1"
     ))
     .bind(sandbox_id.as_uuid())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }

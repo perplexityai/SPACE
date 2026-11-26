@@ -101,7 +101,7 @@ impl RetireSink for ExecutionDbStore {
     ) -> Result<RetireOutcome, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
-        let lifecycle = row_locks::lock_lifecycle(&mut tx, candidate.sandbox_id).await?;
+        let lifecycle = row_locks::lock_lifecycle(&mut *tx, candidate.sandbox_id).await?;
         if lifecycle.as_deref() != Some("suspended") {
             tx.rollback().await?;
             return Ok(RetireOutcome::SkippedRaced);

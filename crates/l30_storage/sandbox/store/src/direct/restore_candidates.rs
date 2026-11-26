@@ -22,12 +22,12 @@ use std::sync::LazyLock;
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
 use pplx_space_node_status_store::environment_refusal;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::{
     no_newer_full_snapshot, restore_retry_source_snapshot_is_current,
 };
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 
 #[cfg(test)]
 mod tests;
@@ -543,23 +543,25 @@ static REMOTE_RETRY: LazyLock<String> = LazyLock::new(|| {
 /// observed state there. `restore_retry` picks the retry's source snapshot;
 /// `environment_refuses` drops a candidate the environment gate refuses, and,
 /// for a snapshot that names an environment, replaces the runtime check.
-pub async fn source_candidates<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn source_candidates(
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     restore_retry: bool,
     environment_refuses: bool,
-) -> Result<Vec<RestoreCandidateRow>, sqlx::Error> {
+) -> Result<Vec<RestoreCandidateRow>, DbError> {
     let statement = if restore_retry {
         &SOURCE_RETRY
     } else {
         &SOURCE_FRESH
     };
-    sqlx::query_as::<_, RestoreCandidateRow>(sqlx::AssertSqlSafe(statement.as_str()))
-        .bind(sandbox_id.as_uuid())
-        .bind(SubstrateKind::Space)
-        .bind(environment_refuses)
-        .fetch_all(executor)
-        .await
+    Ok(
+        sqlx::query_as::<_, RestoreCandidateRow>(sqlx::AssertSqlSafe(statement.as_str()))
+            .bind(sandbox_id.as_uuid())
+            .bind(SubstrateKind::Space)
+            .bind(environment_refuses)
+            .fetch_all(executor.into_sqlx())
+            .await?,
+    )
 }
 
 /// Up to `limit` workers other than the snapshot's source node that can
@@ -567,23 +569,25 @@ pub async fn source_candidates<'e>(
 /// `restore_retry` picks the retry's source snapshot; `environment_refuses`
 /// drops a candidate the environment gate refuses, and, for a snapshot that
 /// names an environment, replaces the runtime check.
-pub async fn remote_candidates<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn remote_candidates(
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     restore_retry: bool,
     limit: i64,
     environment_refuses: bool,
-) -> Result<Vec<RestoreCandidateRow>, sqlx::Error> {
+) -> Result<Vec<RestoreCandidateRow>, DbError> {
     let statement = if restore_retry {
         &REMOTE_RETRY
     } else {
         &REMOTE_FRESH
     };
-    sqlx::query_as::<_, RestoreCandidateRow>(sqlx::AssertSqlSafe(statement.as_str()))
-        .bind(sandbox_id.as_uuid())
-        .bind(limit)
-        .bind(SubstrateKind::Space)
-        .bind(environment_refuses)
-        .fetch_all(executor)
-        .await
+    Ok(
+        sqlx::query_as::<_, RestoreCandidateRow>(sqlx::AssertSqlSafe(statement.as_str()))
+            .bind(sandbox_id.as_uuid())
+            .bind(limit)
+            .bind(SubstrateKind::Space)
+            .bind(environment_refuses)
+            .fetch_all(executor.into_sqlx())
+            .await?,
+    )
 }

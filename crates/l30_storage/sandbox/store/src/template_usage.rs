@@ -7,18 +7,18 @@
 
 use std::sync::LazyLock;
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_portability::failed_repair_revert_eligibility;
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 
 /// How many sandboxes whose `template_id` is `template_name` are not gone:
 /// any lifecycle but `failed` and `deleted`, plus the `failed` rows the
 /// failed-restorable repair loop could still revert to `suspended`
 /// ([`failed_repair_revert_eligibility`]'s `eligible`).
 pub async fn template_sandboxes_in_use(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &str,
-) -> Result<i64, sqlx::Error> {
+) -> Result<i64, DbError> {
     static QUERY: LazyLock<String> = LazyLock::new(|| {
         let eligible = failed_repair_revert_eligibility("s").eligible;
         sql!(format!(
@@ -31,10 +31,12 @@ pub async fn template_sandboxes_in_use(
             )"
         ))
     });
-    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(QUERY.as_str()))
-        .bind(template_name)
-        .fetch_one(executor)
-        .await
+    Ok(
+        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(QUERY.as_str()))
+            .bind(template_name)
+            .fetch_one(executor.into_sqlx())
+            .await?,
+    )
 }
 
 #[cfg(test)]

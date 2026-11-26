@@ -46,7 +46,7 @@ async fn lock_restore_lease_owner_locks_the_row_for_update_only_for_the_holder()
     );
 
     let mut owner = db.pool.begin().await?;
-    assert!(direct::lock_restore_lease_owner(&mut owner, id, token).await?);
+    assert!(direct::lock_restore_lease_owner(&mut *owner, id, token).await?);
     assert!(
         !key_share_is_free(&db.pool, id).await?,
         "the holder's lock is FOR UPDATE"
@@ -58,7 +58,7 @@ async fn lock_restore_lease_owner_locks_the_row_for_update_only_for_the_holder()
     );
 
     let mut owner = db.pool.begin().await?;
-    assert!(direct::lock_restore_lease_owner(&mut owner, id, token).await?);
+    assert!(direct::lock_restore_lease_owner(&mut *owner, id, token).await?);
     assert!(!key_share_is_free(&db.pool, id).await?);
     owner.commit().await?;
     assert!(
@@ -67,13 +67,13 @@ async fn lock_restore_lease_owner_locks_the_row_for_update_only_for_the_holder()
     );
 
     let mut other = db.pool.begin().await?;
-    assert!(!direct::lock_restore_lease_owner(&mut other, id, Uuid::now_v7()).await?);
+    assert!(!direct::lock_restore_lease_owner(&mut *other, id, Uuid::now_v7()).await?);
     assert!(
         key_share_is_free(&db.pool, id).await?,
         "another token takes no lock"
     );
     assert!(
-        !direct::lock_restore_lease_owner(&mut other, SandboxId::new(), token).await?,
+        !direct::lock_restore_lease_owner(&mut *other, SandboxId::new(), token).await?,
         "a missing row is not held"
     );
     other.rollback().await?;

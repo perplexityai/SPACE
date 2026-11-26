@@ -361,7 +361,9 @@ impl SandboxController {
             &pool_reserved,
         )
         .await
-        .map_err(|err| db_contention_error("count sandboxes by spaced version", &err))?;
+        .map_err(|err| {
+            db_contention_error("count sandboxes by spaced version", &sqlx::Error::from(err))
+        })?;
         Ok(rows
             .into_iter()
             .map(|row| SpacedVersionCount {

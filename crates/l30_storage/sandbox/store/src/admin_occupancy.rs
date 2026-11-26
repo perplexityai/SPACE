@@ -21,6 +21,7 @@ use std::sync::LazyLock;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::NodeGroupId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 #[cfg(any(test, feature = "test-support"))]
 use pplx_space_sandbox_portability::drain_gate_blocker_pairs;
@@ -671,36 +672,40 @@ pub(crate) fn fleet_occupancy_statement(
 /// `node_id`'s occupancy. With `ranked`, also its drainability counters
 /// under `residency`, with long runners older than `long_runner_age_secs`.
 pub async fn node_occupancy(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     long_runner_age_secs: i64,
     ranked: bool,
     residency: ResidencyEvidence,
-) -> Result<NodeOccupancyCounts, sqlx::Error> {
-    sqlx::query_as::<_, NodeOccupancyCounts>(sqlx::AssertSqlSafe(node_occupancy_statement(
-        ranked, residency,
-    )))
-    .bind(node_id)
-    .bind(long_runner_age_secs)
-    .fetch_one(executor)
-    .await
+) -> Result<NodeOccupancyCounts, DbError> {
+    Ok(
+        sqlx::query_as::<_, NodeOccupancyCounts>(sqlx::AssertSqlSafe(node_occupancy_statement(
+            ranked, residency,
+        )))
+        .bind(node_id)
+        .bind(long_runner_age_secs)
+        .fetch_one(executor.into_sqlx())
+        .await?,
+    )
 }
 
 /// [`node_occupancy`] for every node in `node_ids`, one row each.
 pub async fn fleet_occupancy(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_ids: &[NodeId],
     long_runner_age_secs: i64,
     ranked: bool,
     residency: ResidencyEvidence,
-) -> Result<Vec<NodeOccupancyCounts>, sqlx::Error> {
-    sqlx::query_as::<_, NodeOccupancyCounts>(sqlx::AssertSqlSafe(fleet_occupancy_statement(
-        ranked, residency,
-    )))
-    .bind(node_ids)
-    .bind(long_runner_age_secs)
-    .fetch_all(executor)
-    .await
+) -> Result<Vec<NodeOccupancyCounts>, DbError> {
+    Ok(
+        sqlx::query_as::<_, NodeOccupancyCounts>(sqlx::AssertSqlSafe(fleet_occupancy_statement(
+            ranked, residency,
+        )))
+        .bind(node_ids)
+        .bind(long_runner_age_secs)
+        .fetch_all(executor.into_sqlx())
+        .await?,
+    )
 }
 
 /// The lifecycle scope of the `active` occupancy count: everything that has
@@ -788,11 +793,11 @@ fn row_cte_materialization(ranking_requested: bool, residency: ResidencyEvidence
 /// decides which instant it reads.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn batched_occupancy(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_ids: &[NodeId],
     long_runner_age_secs: Option<i64>,
     residency: ResidencyEvidence,
-) -> Result<Vec<NodeOccupancyCounts>, sqlx::Error> {
+) -> Result<Vec<NodeOccupancyCounts>, DbError> {
     // `local_snapshot` counts strand-risk sandboxes for a node: a
     // suspended sandbox pinned to it whose snapshot is **not** yet
     // durably in S3 (attributed to `target_node_id`), plus any sandbox
@@ -1051,7 +1056,7 @@ pub(crate) async fn batched_occupancy(
     if let Some(age_secs) = long_runner_age_secs {
         statement = statement.bind(age_secs);
     }
-    statement.fetch_all(executor).await
+    Ok(statement.fetch_all(executor.into_sqlx()).await?)
 }
 
 /// The occupancy of every node in `node_group_id`: live placements, plus
@@ -1059,13 +1064,13 @@ pub(crate) async fn batched_occupancy(
 /// suspended sandboxes or in-flight uploads whose only snapshot is on a group
 /// node's disk.
 pub async fn group_occupancy(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_group_id: NodeGroupId,
-) -> Result<GroupOccupancyCounts, sqlx::Error> {
+) -> Result<GroupOccupancyCounts, DbError> {
     let (active, local_snapshots): (i64, i64) =
         sqlx::query_as(sqlx::AssertSqlSafe(GROUP_OCCUPANCY.as_str()))
             .bind(node_group_id)
-            .fetch_one(executor)
+            .fetch_one(executor.into_sqlx())
             .await?;
     Ok(GroupOccupancyCounts {
         active,
@@ -1154,17 +1159,17 @@ static TERMINATE_OCCUPANCY_CENSUS_AWARE: LazyLock<String> =
 /// Run it on the caller's transaction: that is what keeps the count under
 /// the caller's lock.
 pub async fn terminate_occupancy(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     residency: ResidencyEvidence,
-) -> Result<TerminateOccupancy, sqlx::Error> {
+) -> Result<TerminateOccupancy, DbError> {
     let statement: &str = match residency {
         ResidencyEvidence::LifecycleOnly => &TERMINATE_OCCUPANCY,
         ResidencyEvidence::NodeCensusAware => &TERMINATE_OCCUPANCY_CENSUS_AWARE,
     };
     let row: (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(statement))
         .bind(node_id)
-        .fetch_one(executor)
+        .fetch_one(executor.into_sqlx())
         .await?;
     Ok(TerminateOccupancy {
         active: row.0,
@@ -1382,13 +1387,15 @@ fn pinned_local_only_sandboxes_statement_with_limit(limit: NonZeroUsize) -> Stri
 /// resulting newer `failed` snapshot would make `latest_full_snapshot_ready`
 /// stop seeing the in-flight upload and could strand an evacuation restore.
 pub async fn pinned_local_only_sandboxes(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
-) -> Result<Vec<SandboxId>, sqlx::Error> {
-    sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(PINNED_LOCAL_ONLY_SANDBOXES.as_str()))
-        .bind(node_id)
-        .fetch_all(executor)
-        .await
+) -> Result<Vec<SandboxId>, DbError> {
+    Ok(sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(
+        PINNED_LOCAL_ONLY_SANDBOXES.as_str(),
+    ))
+    .bind(node_id)
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Postgres-backed plan-structure and page-shape regression for the

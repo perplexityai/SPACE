@@ -3,6 +3,7 @@
 
 use pplx_space_accounts::NodeId;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
+use pplx_space_postgres_pool::Executor;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use sqlx::types::Json;
@@ -29,7 +30,7 @@ pub struct SandboxDesiredStateRow {
 /// into assigned-here, exists-elsewhere or unplaced, and absent (no row at
 /// all).
 pub async fn partition(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_ids: &[SandboxId],
     node_id: NodeId,
 ) -> Result<Vec<SandboxDesiredStateRow>, SandboxStoreError> {
@@ -45,6 +46,6 @@ pub async fn partition(
     ))
     .bind(sandbox_ids)
     .bind(node_id)
-    .fetch_all(executor)
+    .fetch_all(executor.into_sqlx())
     .await?)
 }
