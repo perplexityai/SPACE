@@ -311,6 +311,42 @@ async fn an_unencrypted_checkpoint_staged_here_gets_its_disk_execution_recorded(
     assert_eq!(f.recorded_execution(), Some(f.source.clone()));
 }
 
+/// The producer's metadata decides the disk's record, so one that reads but
+/// doesn't parse is final for the attempt: every retry would read the same
+/// bytes. One that can't be read at all may be readable on a retry. Neither
+/// asks node-manager for anything or records an execution.
+#[tokio::test]
+async fn a_checkpoints_unparsable_runtime_metadata_is_final() {
+    let (f, _, _) = staged(false, NodeRelease::Current);
+    let runtime = f.checkpoint().join("runtime.json");
+    std::fs::write(&runtime, b"not runtime metadata").unwrap();
+    let refusal = f
+        .service
+        .complete_staged_upgrade_disk(&f.row())
+        .await
+        .unwrap_err();
+    let expected = matches!(refusal, super::super::Refusal::Final(_));
+    assert!(expected, "{}", refusal.into_status());
+
+    std::fs::remove_file(&runtime).unwrap();
+    std::fs::create_dir(&runtime).unwrap();
+    let refusal = f
+        .service
+        .complete_staged_upgrade_disk(&f.row())
+        .await
+        .unwrap_err();
+    let expected = matches!(refusal, super::super::Refusal::Retry(_));
+    assert!(expected, "{}", refusal.into_status());
+    assert!(
+        !calls(&f)
+            .iter()
+            .any(|call| call == "MaterializeStagedCheckpointDisk"),
+        "{:?}",
+        calls(&f)
+    );
+    assert_eq!(f.recorded_execution(), None);
+}
+
 /// A copy suspended on this node keeps its own record, but its instance COW
 /// isn't known to be the checkpoint's, so the pinned checkpoint's is laid
 /// over it, as a restore would, and the copy the upgrade preserves is that

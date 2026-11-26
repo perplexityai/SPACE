@@ -244,17 +244,25 @@ impl crate::service::SandboxManagerService {
 /// `metadata.json` from the checkpoint's producer, the execution that wrote
 /// the disk. The record names the disk's execution from now on, so it comes
 /// only from the checkpoint the upgrade was decided from, which the caller
-/// validated.
-fn staged_disk_metadata_json(sandbox: &SandboxRow, checkpoint: &Path) -> Result<String, Status> {
+/// validated. A producer's metadata that can't be read may be readable on a
+/// retry, but one that reads and doesn't parse or validate answers every
+/// retry the same way, so it's final for the attempt, as the inspection's is
+/// ([`super::node_effects::artifact_read_refusal`]).
+fn staged_disk_metadata_json(
+    sandbox: &SandboxRow,
+    checkpoint: &Path,
+) -> Result<String, super::Refusal> {
     let producer =
         crate::service::tail_support::checkpoint_execution_metadata(&checkpoint.to_string_lossy())
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            .map_err(super::node_effects::artifact_read_refusal)?;
     let (cpu_budget, guest_memory) = (producer.cpu_budget(), producer.guest_memory());
-    crate::service::tail_support::sandbox_artifact_metadata_json(
-        sandbox,
-        producer.into_execution(),
-        cpu_budget,
-        guest_memory,
+    Ok(
+        crate::service::tail_support::sandbox_artifact_metadata_json(
+            sandbox,
+            producer.into_execution(),
+            cpu_budget,
+            guest_memory,
+        )?,
     )
 }
 
