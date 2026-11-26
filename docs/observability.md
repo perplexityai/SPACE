@@ -1299,12 +1299,15 @@ total; it retains those events and is not additive with the breakdown.
 `node_memory.space_cgroup.events_cumulative`, tagged `event`, is that
 cumulative count on every reading. The per-process
 `node_memory.space_cgroup.events` counter misses events between the old
-process's last reading and the new one's first; a delta of the gauge counts
-them. Aggregate it with `max` to one series per node and `event`, dropping
-`version` and the pod or process identity that a restart changes, then take
-the delta. A sum across nodes before the delta counts a node's whole history
-when its series first appears. An event the kernel does not expose, such as
-`oom_group_kill` on older kernels, reads 0.
+process's last reading and the new one's first; a reset-aware delta of the
+gauge counts them. Aggregate it with `max` to one series per node and `event`,
+dropping `version` and the pod or process identity that a restart changes,
+then take a reset-aware delta (Datadog `monotonic_diff()` or Prometheus
+`increase()` over a `max by` subquery) so a node reboot or cgroup recreation
+resetting the count to 0 does not produce a negative delta. A sum across nodes
+before the delta counts a node's whole history when its series first appears.
+An event the kernel does not expose, such as `oom_group_kill` on older
+kernels, reads 0.
 
 The counters describe where the killed processes were, not which memory
 limit triggered the kill. Use the host kernel's `oom-kill:` log for an
