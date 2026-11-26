@@ -731,6 +731,10 @@ class DrainV2Assertions:
         self._node_id: str | None = None
         self._other: str | None = None
         self._uncordon_other: Compensation | None = None
+        # The one cleanup uncordon of each worker this run cordons or drains,
+        # by Kubernetes Node name, shared with `companion()`s
+        # (`_own_uncordon`).
+        self._uncordons: dict[str, Compensation] = {}
         self._undrain: Compensation | None = None
         self._generation: int | None = None
         self._hold: int | None = None
@@ -829,9 +833,7 @@ class DrainV2Assertions:
         else:
             pinned = placement.node_name
         self._other = other
-        self._uncordon_other = self._scope.defer(
-            f"uncordon {other}", lambda: self._control.uncordon_kube_node(other), critical=True
-        )
+        self._uncordon_other = self._own_uncordon(other)
         self._control.cordon_kube_node(other)
         node = next(
             (n for n in self._control.admin_nodes() if n.k8s_node_name == pinned), None
@@ -1370,15 +1372,14 @@ class DrainV2Assertions:
         other._node_name = self._other
         other._node_id = node.id
         other._other = self.node_name
+        other._uncordons = self._uncordons
         return other
 
     def cordon(self) -> None:
         """Cordon this worker, uncordoned again when the run ends."""
 
         node_name = self.node_name
-        self._scope.defer(
-            f"uncordon {node_name}", lambda: self._control.uncordon_kube_node(node_name), critical=True
-        )
+        self._own_uncordon(node_name, self.node_id)
         self._control.cordon_kube_node(node_name)
         self._cordoned_by_run = True
 
@@ -1412,10 +1413,8 @@ class DrainV2Assertions:
         other = self._other
         if other is None:
             raise RuntimeError("pin_to_resident_worker() must run first")
-        if self._uncordon_other is None:
-            self._uncordon_other = self._scope.defer(
-                f"uncordon {other}", lambda: self._control.uncordon_kube_node(other), critical=True
-            )
+        if self._uncordon_other is None or not self._uncordon_other.armed:
+            self._uncordon_other = self._own_uncordon(other)
         self._control.cordon_kube_node(other)
 
     # --- the preview ----------------------------------------------------------
@@ -1510,14 +1509,29 @@ class DrainV2Assertions:
         if self._undrain is not None:
             return
         node_name, node_id = self.node_name, self.node_id
-        self._scope.defer(
+        # Before the undrain, so cleanup runs the undrain first.
+        self._own_uncordon(node_name, node_id)
+        self._undrain = self._scope.defer(
+            f"undrain {node_name}", lambda: self._undrain_if_draining(node_id), critical=True
+        )
+
+    def _own_uncordon(self, node_name: str, node_id: str | None = None) -> Compensation:
+        """The one cleanup uncordon of `node_name`, whoever cordoned it (the
+        pin, `cordon`, a drain): through the cancel gate
+        (`_uncordon_once_cancelled`), so no path uncordons a worker that may
+        still be sealed. Registered once while armed; `node_id` is the
+        worker's SPACE node, else read by name when cleanup runs."""
+
+        held = self._uncordons.get(node_name)
+        if held is not None and held.armed:
+            return held
+        compensation = self._scope.defer(
             f"uncordon {node_name}",
             lambda: self._uncordon_once_cancelled(node_name, node_id),
             critical=True,
         )
-        self._undrain = self._scope.defer(
-            f"undrain {node_name}", lambda: self._undrain_if_draining(node_id), critical=True
-        )
+        self._uncordons[node_name] = compensation
+        return compensation
 
     def _drain_cleared(self, node_id: str) -> bool:
         """The controller cleared the node's v2 engine and status, which it
@@ -1527,7 +1541,7 @@ class DrainV2Assertions:
         status = self._control.drain_v2_status(node_id)
         return status is None or (status.engine is None and status.status is None)
 
-    def _uncordon_once_cancelled(self, node_name: str, node_id: str) -> None:
+    def _uncordon_once_cancelled(self, node_name: str, node_id: str | None) -> None:
         """Cleanup's uncordon of the drained worker, after the undrain: only
         once the drain is cancelled on the node (`_drain_cleared`), waited
         for as long as a cancel may take (`CANCEL_SECONDS`). A worker whose
@@ -1535,8 +1549,13 @@ class DrainV2Assertions:
         the raise makes cleanup report it, so nothing the next scenario
         creates lands on a sealed worker."""
 
+        node_ids = (
+            [node_id]
+            if node_id is not None
+            else [node.id for node in self._control.admin_nodes() if node.k8s_node_name == node_name]
+        )
         deadline = time.monotonic() + CANCEL_SECONDS
-        while not self._drain_cleared(node_id):
+        while not all(self._drain_cleared(each) for each in node_ids):
             if time.monotonic() >= deadline:
                 raise RuntimeError(
                     f"left {node_name} cordoned: its drain's cancel was not confirmed within "
