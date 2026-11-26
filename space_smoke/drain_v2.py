@@ -186,8 +186,7 @@ _FAKE_PROVIDER = re.compile(r"aws:///kind-a/(i-[0-9a-f]{17})")
 # --- How long each wait may take ------------------------------------------
 #
 # A wait's timeout is the fixed timers it waits out, about four times the
-# real work it waits for as measured on a Kind bench (the PR's validation
-# records the runs), and a margin: a step that hangs fails within a minute or
+# real work it waits for as measured on a local Kind bench, and a margin: a step that hangs fails within a minute or
 # two of when it should have ended, not ten minutes later. None is shorter
 # than the longest wait it can contain, such as one `DrainNode` call's own
 # budget after a controller tick, or the upload worker's longest retry
@@ -198,12 +197,15 @@ _FAKE_PROVIDER = re.compile(r"aws:///kind-a/(i-[0-9a-f]{17})")
 TICK_SECONDS = 5
 # One `DrainNode` call's own budget on the node (`DRAIN_CALL_TIMEOUT`).
 CALL_BUDGET_SECONDS = 45
+# How often a run reads the admin view while it waits for a report.
+REPORT_POLL_SECONDS = 2
 # The next report the controller stores: a tick, a call within its budget,
-# a 2 s poll and 10 s.
-REPORT_SECONDS = TICK_SECONDS + CALL_BUDGET_SECONDS + 2 + 10
-# A drain of a few small residents to `drained`, due now: the next report,
-# and their suspends and uploads (8 s for three, 22 s for ten, measured),
-# four times over, with a 30 s margin.
+# a poll and 10 s.
+REPORT_SECONDS = TICK_SECONDS + CALL_BUDGET_SECONDS + REPORT_POLL_SECONDS + 10
+# A drain of up to three small residents to `drained`, due now: the next
+# report, and their suspends and uploads (8 s for three measured, so 10 s),
+# four times over, with a 30 s margin. A run that drains more sizes its own
+# from this rule.
 DRAINED_SECONDS = REPORT_SECONDS + 4 * 10 + 30
 # A resident's state once the drain is `drained`, or once the node says it
 # is suspended: polls of rows already written (under 5 s measured).
@@ -1197,60 +1199,50 @@ class DrainV2Assertions:
 
     def expect_all_evacuated(self, residents: Iterable[str], *, timeout: float = SETTLED_SECONDS) -> None:
         """Each resident (sandbox ids), `started` or `paused` before the
-        drain, ends where the drain leaves it: `suspended` and unplaced, with
-        a durable snapshot and no VM on either worker."""
+        drain, ends where the drain leaves it (`expect_suspended_unplaced`)."""
 
         ids = list(residents)
         deadline = time.monotonic() + timeout
         while True:
-            left = [sandbox_id for sandbox_id in ids if not self._suspended_unplaced(sandbox_id)]
+            left = {
+                self.bare_id(sandbox_id): residency
+                for sandbox_id in ids
+                if (residency := self._unless_suspended_unplaced(sandbox_id)) is not None
+            }
             if not left:
                 break
             self._fixture.verify(
                 time.monotonic() < deadline,
                 "a resident was never left suspended and unplaced with a durable snapshot",
-                residents_left={
-                    self.bare_id(sandbox_id): self.residency(sandbox_id) for sandbox_id in left
-                },
+                **({"sandbox_id": next(iter(left))} if len(ids) == 1 else {}),
+                residents_left=left,
             )
             self._fixture.wait(3)
         for sandbox_id in ids:
             self.expect_single_vm(sandbox_id, "suspended")
 
-    def _suspended_unplaced(self, sandbox_id: str) -> bool:
+    def _unless_suspended_unplaced(self, sandbox_id: str) -> dict[str, Any] | None:
+        """None once the sandbox is `suspended` and unplaced with a durable
+        snapshot; else what it is."""
+
         residency = self._control.sandbox_residency(self.bare_id(sandbox_id))
-        if residency.lifecycle != "suspended" or residency.active_node_id is not None:
-            return False
         snapshots = self.ready_snapshots(sandbox_id)
-        return bool(snapshots) and snapshots[-1].storage_location_count > 0
+        durable = bool(snapshots) and snapshots[-1].storage_location_count > 0
+        if residency.lifecycle == "suspended" and residency.active_node_id is None and durable:
+            return None
+        return {
+            "lifecycle": residency.lifecycle,
+            "active_node_id": residency.active_node_id,
+            "ready_snapshots": len(snapshots),
+            "durable": durable,
+        }
 
     def expect_suspended_unplaced(self, sandbox_id: str, *, timeout: float = SETTLED_SECONDS) -> None:
         """The drain left the sandbox `suspended` and unplaced, its snapshot
         durable, with no VM on either worker: nothing restores it, and its
         next user call wakes it wherever the scheduler places it."""
 
-        bare = self.bare_id(sandbox_id)
-        deadline = time.monotonic() + timeout
-        while True:
-            residency = self._control.sandbox_residency(bare)
-            snapshots = self.ready_snapshots(sandbox_id)
-            durable = bool(snapshots) and snapshots[-1].storage_location_count > 0
-            if (
-                residency.lifecycle == "suspended"
-                and residency.active_node_id is None
-                and durable
-            ):
-                break
-            self._fixture.verify(
-                time.monotonic() < deadline,
-                "the resident was never left suspended and unplaced with a durable snapshot",
-                sandbox_id=bare,
-                lifecycle=residency.lifecycle,
-                active_node_id=residency.active_node_id,
-                ready_snapshots=len(snapshots),
-            )
-            self._fixture.wait(3)
-        self.expect_single_vm(sandbox_id, "suspended")
+        self.expect_all_evacuated([sandbox_id], timeout=timeout)
 
     def expect_back_at_home(self, sandbox_id: str, lifecycle: str, *, timeout: float = WAKE_SECONDS) -> None:
         """The sandbox is `lifecycle` again on the worker the drain was on."""
@@ -1794,7 +1786,7 @@ class DrainV2Assertions:
             if report and accept(report):
                 return report
             self._fixture.verify(time.monotonic() < deadline, failure, report=report)
-            self._fixture.wait(2)
+            self._fixture.wait(REPORT_POLL_SECONDS)
 
     def reported(self, report: dict[str, Any]) -> bool:
         """The view holds a report the controller stored under this run's

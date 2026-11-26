@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 
 import space_smoke as smoke
 from space_smoke.capabilities import DurableLifecycleSandbox
-from space_smoke.drain_v2 import DRAINED_SECONDS
+from space_smoke.drain_v2 import REPORT_SECONDS
 
 # Seven started and three paused: more suspends than one node's drain runs at
 # once is `native.v2_drain_paces_a_full_worker`; here the point is each
@@ -13,6 +13,10 @@ from space_smoke.drain_v2 import DRAINED_SECONDS
 RESIDENTS = (("started", 7), ("paused", 3))
 # Guest memory each VM holds.
 BALLAST_MIB = 128
+# The drain to `drained`, due now, by the waits' sizing rule
+# (`space_smoke/drain_v2.py`): the next report, and the ten suspends and
+# uploads (22 s measured) four times over, with a 30 s margin.
+TEN_DRAINED_SECONDS = REPORT_SECONDS + 4 * 22 + 30
 
 
 # `native.v2_drain_evacuates_every_resident` is each lifecycle once. This is
@@ -65,7 +69,7 @@ def v2_drain_moves_ten_residents(test: smoke.CommandSandboxFixture) -> None:
 
         with test.phase("every resident is reported evacuated with its snapshot; the node drains"):
             first_reported: dict[str, float] = {}
-            report = drain.expect_drained(timeout=DRAINED_SECONDS, first_reported=first_reported)
+            report = drain.expect_drained(timeout=TEN_DRAINED_SECONDS, first_reported=first_reported)
             test.record(
                 "first_reported_evacuated",
                 {

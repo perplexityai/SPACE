@@ -7,9 +7,10 @@ import space_smoke as smoke
 from space_smoke.capabilities import DurableLifecycleSandbox, ResidentLifecycleSandbox
 from space_smoke.drain_v2 import (
     DRAIN_HOLD_FIELD,
-    in_parallel,
     LENGTHENED_DEADLINE_STATUS,
     MODE_WITH_V2_STATUS,
+    REPORT_SECONDS,
+    in_parallel,
 )
 
 PATH = "/tmp/space-smoke-v2-held.txt"
@@ -22,26 +23,21 @@ PATH = "/tmp/space-smoke-v2-held.txt"
 # floor left them one 15 s eviction interval. The drain finds it running: the
 # run's last command before the drain is 3-6 s before the held check,
 # measured.
-IDLE_TIMEOUT = "40s"
 IDLE_SECONDS = 40
+IDLE_TIMEOUT = f"{IDLE_SECONDS}s"
 # The first hold: the drain must not reach it.
 LONG_HOLD_SECONDS = 60 * 60
 # How far ahead of the repeat the shortened deadline lands: a hold that only
 # has to pass, with the admin view showing it within a couple of the
 # controller's 5 s ticks and the held sandbox answering once before it.
 SHORT_AHEAD_SECONDS = 30
-# The paused resident's suspend and upload, from the seal: a report (62 s,
-# as below) and the work, under 5 s measured, four times over, with a 30 s
-# margin.
-DURABLE_SECONDS = 62 + 4 * 5 + 30
+# The paused resident's suspend and upload, from the seal: the next report
+# and the work, under 5 s measured, four times over, with a 30 s margin.
+DURABLE_SECONDS = REPORT_SECONDS + 4 * 5 + 30
 # The idle suspend, from its last command: the idle policy, the node's 5 s
 # auto-lifecycle sweep, the suspend and upload (under 30 s measured) and a
 # 3 s poll, with a 30 s margin.
 IDLE_SUSPENDED_SECONDS = IDLE_SECONDS + 5 + 30 + 3 + 30
-# The next report after the row reads suspended: a 5 s controller tick, a
-# call within its 45 s budget, and a 2 s poll, with a 10 s margin. Inside
-# the minute eviction leaves it.
-REPORTED_SECONDS = 5 + 45 + 2 + 10
 
 
 # The hold's parts are crate tests: the planner's hold of a started row
@@ -125,7 +121,9 @@ def v2_drain_holds_running_until_its_deadline(test: smoke.CommandSandboxFixture)
                 lambda report: drain.bare_id(idle.sandbox_id)
                 in drain.evacuated_residents(report, [idle.sandbox_id]) | drain.evacuated_total(report),
                 "the node never reported the self-suspended sandbox evacuated",
-                timeout=REPORTED_SECONDS,
+                # The next report after the row reads suspended, inside the
+                # minute eviction leaves it.
+                timeout=REPORT_SECONDS,
             )
             drain.expect_held(busy.sandbox_id)
 

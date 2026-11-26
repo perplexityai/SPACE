@@ -8,7 +8,7 @@ from space_smoke.drain_v2 import UPLOAD_RETRY_SECONDS, WAKE_SECONDS
 
 # How soon after the controller is back its cancel must land: a few loop
 # ticks, with nothing to hand back first.
-CANCEL_SECONDS = 120
+CANCELLED_ONCE_BACK_SECONDS = 120
 
 
 # `native.v2_undrain_mid_suspend` undrains while the suspends run. Here the
@@ -51,7 +51,7 @@ def v2_undrain_with_the_controller_down(test: smoke.CommandSandboxFixture) -> No
                 drain.undrain()
 
         with test.phase("the controller back: the drain is cancelled at once"):
-            drain.expect_cancelled(timeout=CANCEL_SECONDS)
+            drain.expect_cancelled(timeout=CANCELLED_ONCE_BACK_SECONDS)
             outcome = drain.settled_lifecycles(lifecycles, timeout=300)
             test.record("lifecycles_after_undrain", outcome)
             test.verify(

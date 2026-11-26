@@ -20,7 +20,7 @@ SAMPLE_SECONDS = 3
 # Thirty residents' suspends and uploads, a window at a time, to `drained`:
 # about 80 s measured from the drain, four times over, with a minute's
 # margin.
-DRAINED_SECONDS = 4 * 80 + 60
+FULL_WORKER_DRAINED_SECONDS = 4 * 80 + 60
 # One pass over thirty residents' rows and snapshots takes about a minute
 # of reads; two passes and a margin.
 EVACUATED_SECONDS = 180
@@ -121,7 +121,7 @@ def v2_drain_paces_a_full_worker(test: smoke.CommandSandboxFixture) -> None:
             drain.expect_back_elsewhere(by_id[queued].sandbox_id, "started")
 
         with test.phase("sample the drain until drained"):
-            deadline = started + DRAINED_SECONDS
+            deadline = started + FULL_WORKER_DRAINED_SECONDS
             while drain.drain_phase() != "drained":
                 sample(started)
                 test.verify(time.monotonic() < deadline, "the v2 drain never reached drained")

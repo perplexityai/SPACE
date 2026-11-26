@@ -5,6 +5,7 @@ from typing import Any, cast
 
 import space_smoke as smoke
 from space_smoke.capabilities import DurableLifecycleSandbox, SandboxRowState
+from space_smoke.drain_v2 import DISPATCH_BACKOFF_CAP_SECONDS, REPORT_SECONDS
 
 # How long Kind's fake EC2 keeps the dead worker's instance `shutting-down`:
 # long enough for failed wakes of the queued residents and many drain ticks
@@ -26,9 +27,9 @@ LOOP_SECONDS = 420
 STARTED = 10
 WINDOW = 8
 # The let-go once EC2 says terminated: the drain's next EC2 check, backed off
-# to its 120 s cap by then (`DISPATCH_BACKOFF_CAP`), the margin the window
-# left, a report, and a minute (28 s measured).
-LET_GO_SECONDS = 120 + SHUTDOWN_MARGIN_SECONDS + 62 + 60
+# to its cap by then, the margin the window left, the next report, and a
+# minute (28 s measured).
+LET_GO_SECONDS = DISPATCH_BACKOFF_CAP_SECONDS + SHUTDOWN_MARGIN_SECONDS + REPORT_SECONDS + 60
 # A parked row's delete landing (seconds measured), with a minute's margin.
 DELETED_SECONDS = 120
 
