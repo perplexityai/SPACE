@@ -298,9 +298,11 @@ pub struct AdminAuditEntry<'a> {
     /// `:force-upload-local-snapshots`, an operator investigating
     /// "why is this node still stuck?" needs to know from the audit
     /// trail whether the prior call drained the work queue or just
-    /// chipped at it (non-empty `deferred` / `truncated: true`). The
-    /// `Drain` / `Terminate` / `Undrain` actions don't have per-call
-    /// numeric outcomes, so they leave this `None`.
+    /// chipped at it (non-empty `deferred` / `truncated: true`). A
+    /// `:terminate` the occupancy guard refuses puts the counts it refused
+    /// on here (`active=N drain_blockers=M`). Every other `Drain` /
+    /// `Terminate` / `Undrain` entry has no per-call numeric outcome, so it
+    /// leaves this `None`.
     pub outcome_counts: Option<&'a str>,
 }
 

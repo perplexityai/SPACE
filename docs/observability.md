@@ -1451,6 +1451,52 @@ them with `disposition` and `reason`. On OTLP the cluster is the `cluster_id`
 point attribute or resource `space.cluster.id`, and the release is resource
 `service.version`.
 
+## Admin node terminate guard
+
+A `:terminate` call (`POST /admin/api/v1/nodes/{node_id}:terminate`) under the
+v1 drain engine counts the occupancy guard's decision in
+`admin.node_terminate.guard`, tagged `node` and `outcome`, before
+`update_drain_phase` and `tx.commit()`. A v2 drain-engine node's `:terminate`
+doesn't reach the guard and counts nothing.
+
+| `outcome` | Meaning |
+| --- | --- |
+| `allowed` | No resident sandbox and no drain-gate blocker was counted, so the call went on to `update_drain_phase` (counted before the write and `tx.commit()`) |
+| `refused_active` | A resident sandbox was counted, whatever the drain blockers; the call answered 409 |
+| `refused_drain_blockers` | Only drain-gate blockers were counted; the call answered 409 |
+
+The 409 body carries the same counts in `sandboxes_active` and
+`sandboxes_drain_blockers`, and a refusal's `admin_audit` log entry (target
+`space.admin.audit`) carries them in `outcome_counts`, as
+`active=N drain_blockers=M`.
+
+`allowed` is counted before `update_drain_phase` and `tx.commit()`: it means the
+call passed the occupancy guard, not that the phase write committed or that the
+instance was terminated. `node_drain` recounts the blocking residents just
+before the provider terminate call, and returns the node to `drained` with a
+warning if one attached after the write.
+
+The counter covers only the admin `:terminate` path. Where the cluster
+controller's `drained_node_terminator` is enabled
+(`SPACE_DRAINED_NODE_TERMINATOR_ENABLED`), it also moves drained nodes to
+`terminating`, through its own local-snapshot hold and guarded phase update.
+It counts the move in `node_drain.transitions` with `from:drained` and
+`to:terminating`, without a node tag, and logs a warning when its
+local-snapshot hold keeps a node. On such a deployment a node this guard
+refused may still leave `drained`, and a node with no `allowed` count may still
+have been terminated.
+
+Automation calls `:terminate` on drained nodes. Where nothing else moves them,
+a node refused on every call stays `drained`. Alert on a `refused_*` outcome
+that persists for one `node` across repeated calls. `allowed` comes from
+the same counts as the decision, so it cannot show a blocker the count missed.
+
+OTLP caps each instrument at 2,000 attribute sets. Under the default delta OTLP
+export, stale per-node series evict between intervals; under cumulative OTLP
+export, retired node IDs persist until restart and overflow into
+`otel.metric.overflow=true` with tags stripped. Use `space.admin.audit` for
+per-node alerting on cumulative OTLP deployments.
+
 ## Sandboxes in a transient lifecycle
 
 The cluster controller's elected leader counts the `sandboxes` rows in each

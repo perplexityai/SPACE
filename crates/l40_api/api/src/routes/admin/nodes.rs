@@ -37,6 +37,7 @@ use super::support::{
     require_managing_org_admin,
 };
 use crate::controllers::substrate::{NodeApiTarget, NodeSchedulability, NodeSchedulabilityRequest};
+use crate::metrics::admin::NodeTerminateGuardOutcome;
 use crate::middleware::auth::AuthUser;
 use crate::models::User;
 use crate::routes::AppState;
@@ -1239,6 +1240,21 @@ pub(super) fn terminate_blocked_by_occupancy(occupancy: &node_store::TerminateOc
     occupancy.active > 0 || occupancy.drain_blockers > 0
 }
 
+/// The `outcome` the `:terminate` occupancy guard is counted under. Whether it
+/// refused comes from [`terminate_blocked_by_occupancy`] itself; a refused node
+/// with residents counts as `refused_active` whatever its drain blockers.
+pub(super) fn terminate_guard_outcome(
+    occupancy: &node_store::TerminateOccupancy,
+) -> NodeTerminateGuardOutcome {
+    if !terminate_blocked_by_occupancy(occupancy) {
+        NodeTerminateGuardOutcome::Allowed
+    } else if occupancy.active > 0 {
+        NodeTerminateGuardOutcome::RefusedActive
+    } else {
+        NodeTerminateGuardOutcome::RefusedDrainBlockers
+    }
+}
+
 /// The 501 for an action [`DrainAction::runs_without_node_drain`] excludes,
 /// on a substrate without [`SubstrateCapabilities::supports_node_drain`];
 /// `None` when the action may run.
@@ -2114,7 +2130,15 @@ async fn apply_drain_action(
             Ok(value) => value,
             Err(err) => return db_error(err).into_response(),
         };
+        crate::metrics::admin::node_terminate_guard(
+            &node_id.to_string(),
+            terminate_guard_outcome(&occupancy),
+        );
         if terminate_blocked_by_occupancy(&occupancy) {
+            let outcome_counts = format!(
+                "active={} drain_blockers={}",
+                occupancy.active, occupancy.drain_blockers
+            );
             audit::record(AdminAuditEntry {
                 actor: &actor,
                 action: action.label(),
@@ -2127,7 +2151,7 @@ async fn apply_drain_action(
                 drain_mode: requested_mode,
                 success: false,
                 error: Some("conflict: node still holds sandboxes"),
-                outcome_counts: None,
+                outcome_counts: Some(outcome_counts.as_str()),
             });
             return (
                 StatusCode::CONFLICT,
