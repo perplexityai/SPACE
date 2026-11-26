@@ -8096,6 +8096,7 @@ dependencies = [
  "pplx-space-net-common",
  "pplx-space-node-model",
  "pplx-space-node-status-store",
+ "pplx-space-postgres-pool",
  "pplx-space-sandbox-model",
  "pplx-space-sandbox-portability",
  "pplx-space-sandbox-residency",

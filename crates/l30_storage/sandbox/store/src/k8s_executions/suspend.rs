@@ -7,22 +7,25 @@
 //! Each write is a guarded transition, its generation, pod UID, `active` and
 //! state guard whole and bound to the values the caller decided on.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
-use sqlx::{PgConnection, PgExecutor};
 
 /// Lock `sandbox_id`'s execution at `generation` tracking `pod_uid` while it
 /// is in `suspended_state`, `FOR UPDATE`, and return whether it is still
 /// active. `None`: there is no such execution. The lock lasts until the
-/// caller's transaction ends.
-pub async fn lock_suspended_execution(
-    conn: &mut PgConnection,
+/// caller's transaction ends. The caller must pass its open transaction.
+pub async fn lock_suspended_execution<C>(
+    conn: &mut C,
     sandbox_id: SandboxId,
     generation: i64,
     pod_uid: &str,
     suspended_state: &str,
-) -> Result<Option<bool>, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
+) -> Result<Option<bool>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
         "SELECT active
                FROM sandbox_k8s_executions
               WHERE sandbox_id = $1
@@ -35,8 +38,8 @@ pub async fn lock_suspended_execution(
     .bind(generation)
     .bind(pod_uid)
     .bind(suspended_state)
-    .fetch_optional(conn)
-    .await
+    .fetch_optional(conn.into_sqlx())
+    .await?)
 }
 
 /// Mark the suspend of `sandbox_id`'s active execution at `generation`
@@ -44,13 +47,13 @@ pub async fn lock_suspended_execution(
 /// `suspended_state`, or touch it when it is already there. Returns the
 /// number of rows written: `0` when no such execution is in either state.
 pub async fn mark_committed(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     pod_uid: &str,
     suspended_state: &str,
     running_state: &str,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
                 SET state = $4,
@@ -66,7 +69,7 @@ pub async fn mark_committed(
     .bind(pod_uid)
     .bind(suspended_state)
     .bind(running_state)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected())
 }
@@ -77,12 +80,12 @@ pub async fn mark_committed(
 /// no newer execution exists. Returns the number of rows written: `0` when
 /// the execution, the sandbox or a successor rules it out.
 pub async fn mark_forgotten_committed(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     pod_uid: &str,
     suspended_state: &str,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions e
                     SET state = $4,
@@ -106,7 +109,7 @@ pub async fn mark_forgotten_committed(
     .bind(generation)
     .bind(pod_uid)
     .bind(suspended_state)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected())
 }

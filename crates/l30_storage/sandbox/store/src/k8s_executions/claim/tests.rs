@@ -146,7 +146,7 @@ async fn mint_generation_takes_one_past_the_highest_recorded() -> TestResult {
     let sandbox = insert_sandbox(pool).await?;
 
     let mut conn = pool.acquire().await?;
-    assert_eq!(mint_generation(&mut conn, sandbox).await?, 1);
+    assert_eq!(mint_generation(&mut *conn, sandbox).await?, 1);
     for generation in [1, 3] {
         insert_execution(
             pool,
@@ -158,7 +158,7 @@ async fn mint_generation_takes_one_past_the_highest_recorded() -> TestResult {
         )
         .await?;
     }
-    assert_eq!(mint_generation(&mut conn, sandbox).await?, 4);
+    assert_eq!(mint_generation(&mut *conn, sandbox).await?, 4);
     Ok(())
 }
 
@@ -226,7 +226,7 @@ async fn claim_under_sandbox_lock(
 ) -> TestResult<(i64, Option<i64>)> {
     let mut tx = pool.begin().await?;
     assert_eq!(row_locks::lock_id(&mut tx, sandbox).await?, Some(sandbox));
-    let generation = mint_generation(&mut tx, sandbox).await?;
+    let generation = mint_generation(&mut *tx, sandbox).await?;
     let claimed = insert_creating_claim(
         &mut *tx,
         sandbox,
@@ -256,7 +256,7 @@ async fn two_claims_under_one_sandbox_lock_cannot_both_go_live() -> TestResult {
         row_locks::lock_id(&mut first, sandbox).await?,
         Some(sandbox)
     );
-    let generation = mint_generation(&mut first, sandbox).await?;
+    let generation = mint_generation(&mut *first, sandbox).await?;
     assert_eq!(generation, 1);
 
     // The second claim queues on the sandbox lock before it mints.

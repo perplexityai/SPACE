@@ -8,6 +8,7 @@
 //! is the other generation-1 insert.
 
 use pplx_space_cluster_pool::ClaimedSlotBindSource;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use uuid::Uuid;
@@ -17,16 +18,19 @@ use uuid::Uuid;
 /// activation. A pod UID stamps `pod_materialized_at`.
 ///
 /// Runs in the caller's transaction, after it bound the slot to the sandbox.
-/// It takes a connection rather than any executor because the write is
-/// correct only inside that transaction. The sandbox is new, so no other
-/// execution exists: an existing generation `1` or active execution fails
-/// the insert on the table's unique indexes instead.
-pub async fn insert_first_generation(
-    conn: &mut sqlx::PgConnection,
+/// It refuses a pool because the write is correct only inside that
+/// transaction, and the caller must pass its open transaction. The sandbox
+/// is new, so no other execution exists: an existing generation `1` or
+/// active execution fails the insert on the table's unique indexes instead.
+pub async fn insert_first_generation<C>(
+    conn: &mut C,
     sandbox_id: SandboxId,
     source: &ClaimedSlotBindSource,
     route_activation_id: Uuid,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "INSERT INTO sandbox_k8s_executions (
              sandbox_id, generation, pod_name, pod_namespace, pod_uid, pod_ip,
@@ -44,7 +48,7 @@ pub async fn insert_first_generation(
     .bind(source.pod_ip.as_deref())
     .bind(source.k8s_node_name.as_deref())
     .bind(route_activation_id)
-    .execute(&mut *conn)
+    .execute(conn.into_sqlx())
     .await?;
     Ok(())
 }

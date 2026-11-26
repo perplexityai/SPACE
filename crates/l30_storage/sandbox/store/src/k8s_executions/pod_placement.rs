@@ -10,9 +10,9 @@
 //! and [`k8s_executions::claim::reset_to_creating`](super::claim::reset_to_creating)
 //! write the same pod columns.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId};
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 
 /// Record `pod_ip` on the active execution of `sandbox_id` at `generation`,
 /// only while the complete selected route still owns it: the row names
@@ -23,14 +23,14 @@ use sqlx::PgExecutor;
 ///
 /// `false` when the route no longer owns the row, and nothing changes.
 pub async fn refresh_selected_route_pod_ip(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     pod_name: &str,
     route_activation_id: SandboxActivationAttemptId,
     pod_uid: &str,
     pod_ip: &str,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
              SET pod_ip = $1::INET,
@@ -53,7 +53,7 @@ pub async fn refresh_selected_route_pod_ip(
     .bind(pod_name)
     .bind(route_activation_id.as_uuid())
     .bind(pod_uid)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(result.is_some())
 }
@@ -65,15 +65,18 @@ pub async fn refresh_selected_route_pod_ip(
 /// that a pod ran outlives the UID.
 ///
 /// Runs in the caller's transaction, under the `sandboxes` row lock it took
-/// for the lifecycle it expects. It takes a connection rather than any
-/// executor because the write is correct only inside that transaction.
-/// `false` when that generation is no longer the active execution, and
-/// nothing changes.
-pub async fn claim_pod_materialization(
-    conn: &mut sqlx::PgConnection,
+/// for the lifecycle it expects. It refuses a pool because the write is
+/// correct only inside that transaction, and the caller must pass its open
+/// transaction. `false` when that generation is no longer the active
+/// execution, and nothing changes.
+pub async fn claim_pod_materialization<C>(
+    conn: &mut C,
     sandbox_id: SandboxId,
     generation: i64,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
              SET state = CASE WHEN state = 'recovering' THEN state ELSE 'creating' END,
@@ -89,7 +92,7 @@ pub async fn claim_pod_materialization(
     ))
     .bind(sandbox_id)
     .bind(generation)
-    .fetch_optional(&mut *conn)
+    .fetch_optional(conn.into_sqlx())
     .await?
     .is_some())
 }

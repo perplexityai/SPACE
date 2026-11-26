@@ -105,7 +105,7 @@ async fn active_state_lock_holds_for_update_until_the_transaction_ends() -> Test
 
     let mut tx = pool.begin().await?;
     assert_eq!(
-        lock_active_state(&mut tx, sandbox, 2).await?.as_deref(),
+        lock_active_state(&mut *tx, sandbox, 2).await?.as_deref(),
         Some("running")
     );
     assert!(key_share_blocked(pool, sandbox, 2).await?);
@@ -113,7 +113,7 @@ async fn active_state_lock_holds_for_update_until_the_transaction_ends() -> Test
     assert!(!key_share_blocked(pool, sandbox, 2).await?);
 
     let mut tx = pool.begin().await?;
-    assert!(lock_active_state(&mut tx, sandbox, 2).await?.is_some());
+    assert!(lock_active_state(&mut *tx, sandbox, 2).await?.is_some());
     assert!(key_share_blocked(pool, sandbox, 2).await?);
     tx.rollback().await?;
     assert!(!key_share_blocked(pool, sandbox, 2).await?);
@@ -121,8 +121,8 @@ async fn active_state_lock_holds_for_update_until_the_transaction_ends() -> Test
     // A retired generation, or one the sandbox never had, reads as `None`
     // and locks nothing.
     let mut tx = pool.begin().await?;
-    assert_eq!(lock_active_state(&mut tx, sandbox, 1).await?, None);
-    assert_eq!(lock_active_state(&mut tx, sandbox, 3).await?, None);
+    assert_eq!(lock_active_state(&mut *tx, sandbox, 1).await?, None);
+    assert_eq!(lock_active_state(&mut *tx, sandbox, 3).await?, None);
     assert!(!key_share_blocked(pool, sandbox, 1).await?);
     assert!(!key_share_blocked(pool, sandbox, 2).await?);
     tx.rollback().await?;
@@ -148,7 +148,7 @@ async fn active_state_lock_that_waits_on_a_retirement_reads_none() -> TestResult
     let waiter_pool = pool.clone();
     let waiter = tokio::spawn(async move {
         let mut tx = waiter_pool.begin().await?;
-        let state = lock_active_state(&mut tx, sandbox, 2).await?;
+        let state = lock_active_state(&mut *tx, sandbox, 2).await?;
         tx.rollback().await?;
         Ok::<_, sqlx::Error>(state)
     });

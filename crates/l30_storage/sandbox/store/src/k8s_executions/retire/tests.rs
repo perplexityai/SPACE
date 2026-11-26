@@ -360,7 +360,7 @@ async fn a_replacement_claim_goes_live_only_after_the_retire_before_it() -> Test
     // `(sandbox_id) WHERE active` unique index refuses the claim after it.
     let mut tx = pool.begin().await?;
     assert!(!finish_generation(&mut *tx, sandbox, 7, "replaced").await?);
-    let generation = claim::mint_generation(&mut tx, sandbox).await?;
+    let generation = claim::mint_generation(&mut *tx, sandbox).await?;
     assert_eq!(
         claim::insert_creating_claim(&mut *tx, sandbox, generation, "pod-g2", "space-sandboxes")
             .await?,
@@ -370,7 +370,7 @@ async fn a_replacement_claim_goes_live_only_after_the_retire_before_it() -> Test
 
     let mut tx = pool.begin().await?;
     assert!(finish_generation(&mut *tx, sandbox, 1, "replaced").await?);
-    let generation = claim::mint_generation(&mut tx, sandbox).await?;
+    let generation = claim::mint_generation(&mut *tx, sandbox).await?;
     let claimed =
         claim::insert_creating_claim(&mut *tx, sandbox, generation, "pod-g2", "space-sandboxes")
             .await?;

@@ -7,22 +7,23 @@
 //! re-read of its candidate under those locks that decides whether the
 //! retire runs.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
-use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 /// Lock every execution row of the sandbox, active or not, `FOR UPDATE`.
-/// The lock lasts until the caller's transaction ends.
-pub async fn lock_executions(
-    tx: &mut Transaction<'_, Postgres>,
-    sandbox_id: SandboxId,
-) -> Result<(), sqlx::Error> {
+/// The lock lasts until the caller's transaction ends. The caller must pass
+/// its open transaction.
+pub async fn lock_executions<C>(tx: &mut C, sandbox_id: SandboxId) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "SELECT id FROM sandbox_k8s_executions WHERE sandbox_id = $1 FOR UPDATE"
     ))
     .bind(sandbox_id)
-    .execute(&mut **tx)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -32,16 +33,16 @@ pub async fn lock_executions(
 /// ([`lock_executions`] among them) and its re-read of the candidate guard
 /// it. `false` when there is no such execution, and nothing changes.
 pub async fn retire_recovered_execution(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     execution_id: Uuid,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions SET active = FALSE, state = 'suspended', pod_ip = NULL,
              terminated_at = COALESCE(terminated_at, NOW()), updated_at = NOW()
           WHERE id = $1"
     ))
     .bind(execution_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected()
         > 0)

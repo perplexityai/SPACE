@@ -461,11 +461,12 @@ async fn apply_receipt(
     // Keep this as a second statement: PostgreSQL need not acquire a row
     // lock before evaluating subqueries in the locking SELECT itself.
     let evidence = auto_lifecycle_delete::lock_latest_execution_evidence(
-        tx,
+        &mut **tx,
         completion.sandbox_id,
         origin_node_id,
     )
-    .await;
+    .await
+    .map_err(sqlx::Error::from);
     let evidence = match evidence {
         Ok(evidence) => evidence,
         Err(error) if is_lock_not_available(&error) => {

@@ -222,7 +222,7 @@ impl K8sStore {
 
         let previous_attempt =
             pplx_space_sandbox_store::k8s_executions::started_recovery::lock_recovering_execution(
-                &mut tx,
+                &mut *tx,
                 sandbox_uuid,
                 generation.get(),
             )

@@ -703,13 +703,13 @@ pub(super) async fn persist_pooled_execution_claim(
         })?;
 
     pplx_space_sandbox_store::k8s_executions::pool_claim::insert_first_generation(
-        tx,
+        &mut **tx,
         claim.sandbox_id,
         &source,
         route_activation_id,
     )
     .await
-    .map_err(|err| db_contention_error("failed to bind pool execution", &err))?;
+    .map_err(|err| db_contention_error("failed to bind pool execution", &sqlx::Error::from(err)))?;
 
     Ok(())
 }

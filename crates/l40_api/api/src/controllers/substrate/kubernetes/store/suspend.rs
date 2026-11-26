@@ -33,7 +33,7 @@ impl K8sStore {
 
         let execution_active =
             pplx_space_sandbox_store::k8s_executions::suspend::lock_suspended_execution(
-                &mut tx,
+                &mut *tx,
                 sandbox_id,
                 expected_generation.get(),
                 expected_pod_uid.as_str(),

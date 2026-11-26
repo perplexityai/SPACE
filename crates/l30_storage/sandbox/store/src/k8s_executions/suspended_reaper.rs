@@ -5,6 +5,7 @@
 //! ([`crate::row_locks::lock_lifecycle`]), its re-check of the lifecycle under
 //! that lock, and the decision of what to do when the retire matches nothing.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 
@@ -15,12 +16,12 @@ use pplx_space_sql_locator::sql;
 /// behind. `false` when the active execution is no longer that one, as when
 /// a wake replaced it, and nothing changes.
 pub async fn retire_stale_execution(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     pod_name: &str,
     pod_uid: Option<&str>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
             SET active = FALSE,
@@ -38,7 +39,7 @@ pub async fn retire_stale_execution(
     .bind(generation)
     .bind(pod_name)
     .bind(pod_uid)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected()
         > 0)

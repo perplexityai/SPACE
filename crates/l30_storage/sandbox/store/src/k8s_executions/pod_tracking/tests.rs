@@ -122,7 +122,7 @@ async fn backfill_missing_pod_uid_fills_only_an_unset_uid_under_the_observed_ide
         (Some(1), Some(attempt), None),
     ] {
         assert!(
-            !backfill_missing_pod_uid(&mut tx, sandbox, generation, attempt_id, "uid-a", route_id)
+            !backfill_missing_pod_uid(&mut *tx, sandbox, generation, attempt_id, "uid-a", route_id)
                 .await?
         );
     }
@@ -133,7 +133,7 @@ async fn backfill_missing_pod_uid_fills_only_an_unset_uid_under_the_observed_ide
     let mut tx = pool.begin().await?;
     assert!(
         backfill_missing_pod_uid(
-            &mut tx,
+            &mut *tx,
             sandbox,
             Some(1),
             Some(attempt),
@@ -155,7 +155,7 @@ async fn backfill_missing_pod_uid_fills_only_an_unset_uid_under_the_observed_ide
     let mut tx = pool.begin().await?;
     assert!(
         !backfill_missing_pod_uid(
-            &mut tx,
+            &mut *tx,
             sandbox,
             Some(1),
             Some(attempt),
@@ -171,7 +171,7 @@ async fn backfill_missing_pod_uid_fills_only_an_unset_uid_under_the_observed_ide
     let unclaimed = insert_sandbox(pool).await?;
     insert_execution(pool, unclaimed, "creating", None, None, None).await?;
     let mut tx = pool.begin().await?;
-    assert!(backfill_missing_pod_uid(&mut tx, unclaimed, Some(1), None, "uid-c", None).await?);
+    assert!(backfill_missing_pod_uid(&mut *tx, unclaimed, Some(1), None, "uid-c", None).await?);
     tx.commit().await?;
     assert_eq!(
         read_execution(pool, unclaimed).await?.0.as_deref(),
@@ -186,7 +186,7 @@ async fn backfill_missing_pod_uid_fills_only_an_unset_uid_under_the_observed_ide
     let mut tx = pool.begin().await?;
     assert!(
         !backfill_missing_pod_uid(
-            &mut tx,
+            &mut *tx,
             retired,
             Some(1),
             Some(attempt),
@@ -274,7 +274,7 @@ async fn clear_absent_recovery_pod_clears_only_the_pod_the_caller_found_absent()
         ),
     ] {
         assert!(
-            !clear_absent_recovery_pod(&mut tx, sandbox, generation, state, uid, ip, node).await?
+            !clear_absent_recovery_pod(&mut *tx, sandbox, generation, state, uid, ip, node).await?
         );
     }
     tx.commit().await?;
@@ -283,7 +283,7 @@ async fn clear_absent_recovery_pod_clears_only_the_pod_the_caller_found_absent()
     let mut tx = pool.begin().await?;
     assert!(
         clear_absent_recovery_pod(
-            &mut tx,
+            &mut *tx,
             sandbox,
             generation,
             "recovery_failed",
@@ -304,7 +304,7 @@ async fn clear_absent_recovery_pod_clears_only_the_pod_the_caller_found_absent()
     let mut tx = pool.begin().await?;
     assert!(
         !clear_absent_recovery_pod(
-            &mut tx,
+            &mut *tx,
             sandbox,
             generation,
             "recovery_failed",
@@ -325,7 +325,7 @@ async fn clear_absent_recovery_pod_clears_only_the_pod_the_caller_found_absent()
     let mut tx = pool.begin().await?;
     assert!(
         !clear_absent_recovery_pod(
-            &mut tx,
+            &mut *tx,
             retired,
             generation,
             "recovery_failed",

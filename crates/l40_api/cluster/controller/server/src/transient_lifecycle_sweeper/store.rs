@@ -643,7 +643,9 @@ impl SweepSink for SubstrateSweepSink {
         // CAS's "no pod IP" check reads a committed IP rather than racing one.
         // If an execution-only writer holds that lock, defer to the next tick
         // rather than waiting while holding the sandbox lock.
-        let execution_locked = transient_sweeper::lock_active_nowait(&mut tx, sandbox_id).await;
+        let execution_locked = transient_sweeper::lock_active_nowait(&mut *tx, sandbox_id)
+            .await
+            .map_err(sqlx::Error::from);
         match execution_locked {
             Ok(_) => {}
             Err(error) if crate::node_drain::store::is_lock_timeout(&error) => {

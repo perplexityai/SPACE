@@ -9,9 +9,9 @@
 //! verb reports whether it retired a row; the caller decides what follows,
 //! such as invalidating the sandbox's open port-exposure observations.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId};
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 
 /// The identity of the execution a [`finish_fenced`] retire may end, as the
 /// caller observed it. `None` is a value the caller observed, not an absence
@@ -31,10 +31,10 @@ pub struct ExecutionFence<'a> {
 /// clearing its pod IP and keeping any `terminated_at` it already has.
 /// `false` when the sandbox has no active execution.
 pub async fn finish_active(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     state: &str,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
              SET active = FALSE,
@@ -46,7 +46,7 @@ pub async fn finish_active(
     ))
     .bind(state)
     .bind(sandbox_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected()
         > 0)
@@ -56,11 +56,11 @@ pub async fn finish_active(
 /// field of `fence`. `false` when it doesn't, or there is none: a successor
 /// that took the generation over is left as it is.
 pub async fn finish_fenced(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     fence: ExecutionFence<'_>,
     state: &str,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let ExecutionFence {
         generation,
         activation_attempt_id,
@@ -87,7 +87,7 @@ pub async fn finish_fenced(
     .bind(activation_attempt_id)
     .bind(pod_uid)
     .bind(route_activation_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected()
         > 0)
@@ -96,11 +96,11 @@ pub async fn finish_fenced(
 /// [`finish_active`], only while the active execution is the one at
 /// `generation`. `false` when it isn't, or there is none.
 pub async fn finish_generation(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     state: &str,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
              SET active = FALSE,
@@ -113,7 +113,7 @@ pub async fn finish_generation(
     .bind(state)
     .bind(sandbox_id)
     .bind(generation)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected()
         > 0)
@@ -122,12 +122,12 @@ pub async fn finish_generation(
 /// [`finish_generation`], only while that execution is still held by
 /// `activation_attempt_id`. `false` when it isn't.
 pub async fn finish_generation_attempt(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     activation_attempt_id: SandboxActivationAttemptId,
     state: &str,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
              SET active = FALSE,
@@ -144,7 +144,7 @@ pub async fn finish_generation_attempt(
     .bind(sandbox_id)
     .bind(generation)
     .bind(activation_attempt_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected()
         > 0)
@@ -156,11 +156,11 @@ pub async fn finish_generation_attempt(
 /// none). Its pod IP is already `NULL`, so it is left as it is. `false` when
 /// no execution matches, such as one a concurrent attempt materialized.
 pub async fn abandon_unmaterialized_create_claim(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     activation_attempt_id: Option<SandboxActivationAttemptId>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
              SET active = FALSE,
@@ -178,7 +178,7 @@ pub async fn abandon_unmaterialized_create_claim(
     .bind(sandbox_id)
     .bind(generation)
     .bind(activation_attempt_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected()
         > 0)

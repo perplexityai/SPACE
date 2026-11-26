@@ -9,9 +9,9 @@
 //! `lock_not_available`), and every decision it makes from the evidence.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxActivationAttemptId, SandboxId};
 use pplx_space_sql_locator::sql;
-use sqlx::PgConnection;
 
 /// The latest execution's fencing evidence, as
 /// [`lock_latest_execution_evidence`] reads it.
@@ -30,18 +30,22 @@ pub struct CompletionEvidenceRow {
 /// execution NOWAIT`, and read its fencing evidence against
 /// `publisher_node_id`; `None` when the sandbox has no execution. Fails at
 /// once with `lock_not_available` when another transaction holds the row.
-/// The lock lasts until the caller's transaction ends.
+/// The lock lasts until the caller's transaction ends. The caller must pass
+/// its open transaction.
 ///
 /// Run it after the sandbox row lock, as its own statement: that lock
 /// serializes this read against execution and snapshot inserts through their
 /// `sandboxes` foreign key, and PostgreSQL need not take a row lock before it
 /// evaluates the subqueries of the locking `SELECT` itself.
-pub async fn lock_latest_execution_evidence(
-    conn: &mut PgConnection,
+pub async fn lock_latest_execution_evidence<C>(
+    conn: &mut C,
     sandbox_id: SandboxId,
     publisher_node_id: NodeId,
-) -> Result<Option<CompletionEvidenceRow>, sqlx::Error> {
-    sqlx::query_as::<_, CompletionEvidenceRow>(sql!(
+) -> Result<Option<CompletionEvidenceRow>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_as::<_, CompletionEvidenceRow>(sql!(
         "SELECT execution.generation AS latest_execution_generation,
                 execution.route_activation_id,
                 EXISTS (
@@ -64,8 +68,8 @@ pub async fn lock_latest_execution_evidence(
     ))
     .bind(sandbox_id)
     .bind(publisher_node_id)
-    .fetch_optional(conn)
-    .await
+    .fetch_optional(conn.into_sqlx())
+    .await?)
 }
 
 #[cfg(test)]

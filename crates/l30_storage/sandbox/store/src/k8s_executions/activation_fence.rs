@@ -21,9 +21,9 @@
 //! that calls these decides what that means. It keeps the transactions, the
 //! sandbox row lock taken before the execution's, and the choice of claim.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId};
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 use uuid::Uuid;
 
 /// Publish `activation_attempt_id` as the route of the active execution at
@@ -33,13 +33,13 @@ use uuid::Uuid;
 /// moved on: it is no longer active, another attempt owns it, it already
 /// carries a route, or it tracks another pod.
 pub async fn publish_acknowledged_legacy_route(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     activation_attempt_id: SandboxActivationAttemptId,
     expected_pod_uid: &str,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar::<_, Uuid>(sql!(
+) -> Result<Option<Uuid>, DbError> {
+    Ok(sqlx::query_scalar::<_, Uuid>(sql!(
         "UPDATE sandbox_k8s_executions
                 SET route_activation_id = $3,
                     updated_at = NOW()
@@ -55,8 +55,8 @@ pub async fn publish_acknowledged_legacy_route(
     .bind(generation)
     .bind(activation_attempt_id)
     .bind(expected_pod_uid)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Clear the fence `activation_attempt_id` holds on the active execution at
@@ -66,11 +66,11 @@ pub async fn publish_acknowledged_legacy_route(
 /// attempt no longer holds the fence, the route is unpublished, or the
 /// sandbox is not in the attempt's target lifecycle.
 pub async fn complete_attempt(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     activation_attempt_id: SandboxActivationAttemptId,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let changed = sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions execution
                 SET activation_attempt_id = NULL,
@@ -88,7 +88,7 @@ pub async fn complete_attempt(
     .bind(sandbox_id)
     .bind(generation)
     .bind(activation_attempt_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(changed.rows_affected())
 }
@@ -99,11 +99,11 @@ pub async fn complete_attempt(
 /// Returns the number of rows changed: `0` when the attempt no longer holds
 /// the fence.
 pub async fn release_finished_attempt(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     activation_attempt_id: SandboxActivationAttemptId,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let changed = sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
                 SET activation_attempt_id = NULL,
@@ -115,7 +115,7 @@ pub async fn release_finished_attempt(
     .bind(sandbox_id)
     .bind(generation)
     .bind(activation_attempt_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(changed.rows_affected())
 }
@@ -127,11 +127,11 @@ pub async fn release_finished_attempt(
 /// (the attempt's give-up). Returns the number of rows changed: `0` when the
 /// attempt no longer holds the fence.
 pub async fn give_up_attempt(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     activation_attempt_id: SandboxActivationAttemptId,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let changed = sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
                 SET activation_attempt_id = NULL,
@@ -143,7 +143,7 @@ pub async fn give_up_attempt(
     .bind(sandbox_id)
     .bind(generation)
     .bind(activation_attempt_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(changed.rows_affected())
 }
@@ -154,11 +154,11 @@ pub async fn give_up_attempt(
 /// abandonment). Returns the number of rows changed: `0` when the attempt no
 /// longer holds the fence or the sandbox is in any other lifecycle.
 pub async fn abandon_attempt_superseded_by_suspend(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     activation_attempt_id: SandboxActivationAttemptId,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let changed = sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions execution
                 SET activation_attempt_id = NULL,
@@ -175,7 +175,7 @@ pub async fn abandon_attempt_superseded_by_suspend(
     .bind(sandbox_id)
     .bind(generation)
     .bind(activation_attempt_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(changed.rows_affected())
 }
@@ -194,15 +194,19 @@ pub struct AttemptOwner {
 
 /// Lock the active execution of `sandbox_id` at `generation` `FOR UPDATE`
 /// and read its fence. `None` when that generation isn't the active
-/// execution. The lock lasts until the caller's transaction ends.
+/// execution. The lock lasts until the caller's transaction ends. The
+/// caller must pass its open transaction.
 ///
 /// The caller holds its sandbox's row lock first, then claims the fence
 /// with one of the `claim_attempt_…` writes in the same transaction.
-pub async fn lock_attempt_owner(
-    conn: &mut sqlx::PgConnection,
+pub async fn lock_attempt_owner<C>(
+    conn: &mut C,
     sandbox_id: SandboxId,
     generation: i64,
-) -> Result<Option<AttemptOwner>, sqlx::Error> {
+) -> Result<Option<AttemptOwner>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let row = sqlx::query_as::<_, (Option<Uuid>, Option<String>, f64, Option<Uuid>)>(sql!(
         "SELECT activation_attempt_id,
                     activation_attempt_target_state,
@@ -217,7 +221,7 @@ pub async fn lock_attempt_owner(
     ))
     .bind(sandbox_id)
     .bind(generation)
-    .fetch_optional(conn)
+    .fetch_optional(conn.into_sqlx())
     .await?;
     Ok(row.map(
         |(
@@ -242,16 +246,20 @@ pub async fn lock_attempt_owner(
 ///
 /// It checks no current owner and replaces whichever attempt holds the
 /// fence, so the caller runs it only after [`lock_attempt_owner`], in the
-/// same transaction, found no live owner.
-pub async fn claim_attempt_with_published_route(
-    conn: &mut sqlx::PgConnection,
+/// same transaction, found no live owner. The caller must pass its open
+/// transaction.
+pub async fn claim_attempt_with_published_route<C>(
+    conn: &mut C,
     sandbox_id: SandboxId,
     generation: i64,
     activation_attempt_id: SandboxActivationAttemptId,
     target_state: &str,
     lease_ttl_secs: i64,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar::<_, Uuid>(sql!(
+) -> Result<Option<Uuid>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar::<_, Uuid>(sql!(
         "UPDATE sandbox_k8s_executions
                         SET activation_attempt_id = $3,
                             activation_attempt_expires_at =
@@ -269,8 +277,8 @@ pub async fn claim_attempt_with_published_route(
     .bind(activation_attempt_id)
     .bind(target_state)
     .bind(lease_ttl_secs)
-    .fetch_optional(conn)
-    .await
+    .fetch_optional(conn.into_sqlx())
+    .await?)
 }
 
 /// Claim the fence of the active execution at `generation` for
@@ -283,16 +291,20 @@ pub async fn claim_attempt_with_published_route(
 ///
 /// It checks no current owner and replaces whichever attempt holds the
 /// fence, so the caller runs it only after [`lock_attempt_owner`], in the
-/// same transaction, found no live owner.
-pub async fn claim_attempt_initializing_route(
-    conn: &mut sqlx::PgConnection,
+/// same transaction, found no live owner. The caller must pass its open
+/// transaction.
+pub async fn claim_attempt_initializing_route<C>(
+    conn: &mut C,
     sandbox_id: SandboxId,
     generation: i64,
     activation_attempt_id: SandboxActivationAttemptId,
     target_state: &str,
     lease_ttl_secs: i64,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar::<_, Uuid>(sql!(
+) -> Result<Option<Uuid>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar::<_, Uuid>(sql!(
         "UPDATE sandbox_k8s_executions
                         SET activation_attempt_id = $3,
                             route_activation_id = $3,
@@ -313,8 +325,8 @@ pub async fn claim_attempt_initializing_route(
     .bind(activation_attempt_id)
     .bind(target_state)
     .bind(lease_ttl_secs)
-    .fetch_optional(conn)
-    .await
+    .fetch_optional(conn.into_sqlx())
+    .await?)
 }
 
 /// Claim the fence of a legacy resident, the active execution at
@@ -326,16 +338,20 @@ pub async fn claim_attempt_initializing_route(
 ///
 /// It checks no current owner and replaces whichever attempt holds the
 /// fence, so the caller runs it only after [`lock_attempt_owner`], in the
-/// same transaction, found no live owner.
-pub async fn claim_attempt_adopting_legacy_route(
-    conn: &mut sqlx::PgConnection,
+/// same transaction, found no live owner. The caller must pass its open
+/// transaction.
+pub async fn claim_attempt_adopting_legacy_route<C>(
+    conn: &mut C,
     sandbox_id: SandboxId,
     generation: i64,
     activation_attempt_id: SandboxActivationAttemptId,
     target_state: &str,
     lease_ttl_secs: i64,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar::<_, Uuid>(sql!(
+) -> Result<Option<Uuid>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar::<_, Uuid>(sql!(
         "UPDATE sandbox_k8s_executions
                         SET activation_attempt_id = $3,
                             activation_attempt_expires_at =
@@ -354,8 +370,8 @@ pub async fn claim_attempt_adopting_legacy_route(
     .bind(activation_attempt_id)
     .bind(target_state)
     .bind(lease_ttl_secs)
-    .fetch_optional(conn)
-    .await
+    .fetch_optional(conn.into_sqlx())
+    .await?)
 }
 
 #[cfg(test)]

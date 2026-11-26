@@ -21,9 +21,9 @@
 use pplx_space_accounts::{ClientId, NodeId};
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxActivationAttemptId, SandboxId};
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 use uuid::Uuid;
 
 use crate::SandboxStoreError;
@@ -68,11 +68,11 @@ pub struct ActiveExecutionRecord {
 /// The sandbox's active execution, if it has one, with whether it was last
 /// updated at least `create_age_limit_secs` ago.
 pub async fn active_execution(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     create_age_limit_secs: i64,
-) -> Result<Option<ActiveExecutionRecord>, sqlx::Error> {
-    sqlx::query_as::<_, ActiveExecutionRecord>(sql!(
+) -> Result<Option<ActiveExecutionRecord>, DbError> {
+    Ok(sqlx::query_as::<_, ActiveExecutionRecord>(sql!(
         "SELECT generation, pod_name,
                 NULLIF(BTRIM(pod_uid), '') IS NOT NULL AS pod_materialized,
                 state,
@@ -83,8 +83,8 @@ pub async fn active_execution(
     ))
     .bind(sandbox_id)
     .bind(create_age_limit_secs)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether the sandbox's execution `generation` is its active one, when
@@ -92,12 +92,12 @@ pub async fn active_execution(
 /// is registered as one of them). `None` when there is no such execution, or
 /// it ran elsewhere.
 pub async fn generation_active_on_nodes(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: ExecutionGeneration,
     node_ids: &[NodeId],
-) -> Result<Option<bool>, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
+) -> Result<Option<bool>, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
         "SELECT e.active
            FROM sandbox_k8s_executions e
            JOIN node_k8s nk ON nk.k8s_node_name = e.k8s_node_name
@@ -108,20 +108,20 @@ pub async fn generation_active_on_nodes(
     .bind(sandbox_id)
     .bind(generation.get())
     .bind(node_ids)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Milliseconds left, by the database clock and never negative, until the
 /// newest active execution at or past `generation` is `lease_ttl_secs` past
 /// its last update. `None` when there is no such execution.
 pub async fn started_recovery_lease_remaining_millis(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     lease_ttl_secs: i64,
-) -> Result<Option<i64>, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>(sql!(
+) -> Result<Option<i64>, DbError> {
+    Ok(sqlx::query_scalar::<_, i64>(sql!(
         "SELECT GREATEST(
                     CEIL(EXTRACT(EPOCH FROM (
                         updated_at + make_interval(secs => $3) - NOW()
@@ -136,8 +136,8 @@ pub async fn started_recovery_lease_remaining_millis(
     .bind(sandbox_id)
     .bind(generation)
     .bind(lease_ttl_secs)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// A started recovery still inside its lease, as [`fresh_started_recovery`]
@@ -153,11 +153,11 @@ pub struct FreshStartedRecovery {
 /// updated less than `lease_ttl_secs` ago by the database clock, with the
 /// time its lease has left. `None` when there is no such execution.
 pub async fn fresh_started_recovery(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     recovering_state: &str,
     lease_ttl_secs: i64,
-) -> Result<Option<FreshStartedRecovery>, sqlx::Error> {
+) -> Result<Option<FreshStartedRecovery>, DbError> {
     let row = sqlx::query_as::<_, (i64, i64)>(sql!(
         "SELECT generation,
                     GREATEST(
@@ -173,7 +173,7 @@ pub async fn fresh_started_recovery(
     .bind(sandbox_id.as_uuid())
     .bind(recovering_state)
     .bind(lease_ttl_secs)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(row.map(
         |(generation, lease_remaining_millis)| FreshStartedRecovery {
@@ -246,11 +246,11 @@ pub struct FailedActiveExecutionRecord {
 /// attempt is left for a completion receipt to finish it), but if its retire
 /// doesn't complete, the sweeper's repair can put it back to `started`.
 pub async fn list_failed_active_executions(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     managed_by: SubstrateKind,
     limit: i64,
-) -> Result<Vec<FailedActiveExecutionRecord>, sqlx::Error> {
-    sqlx::query_as::<_, FailedActiveExecutionRecord>(sql!(
+) -> Result<Vec<FailedActiveExecutionRecord>, DbError> {
+    Ok(sqlx::query_as::<_, FailedActiveExecutionRecord>(sql!(
         "SELECT s.id, e.k8s_node_name, e.pod_name, e.activation_attempt_id, e.generation,
                 NULLIF(BTRIM(e.pod_uid), '') AS pod_uid, e.route_activation_id,
                 COALESCE(
@@ -276,8 +276,8 @@ pub async fn list_failed_active_executions(
     ))
     .bind(managed_by)
     .bind(limit)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Re-read one failed-cleanup candidate's first activation just before an
@@ -287,11 +287,11 @@ pub async fn list_failed_active_executions(
 /// sandbox is no longer a `failed` row managed by `managed_by` with an active
 /// execution.
 pub async fn first_activation(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     managed_by: SubstrateKind,
-) -> Result<Option<FirstActivationRecord>, sqlx::Error> {
-    sqlx::query_as::<_, FirstActivationRecord>(sql!(
+) -> Result<Option<FirstActivationRecord>, DbError> {
+    Ok(sqlx::query_as::<_, FirstActivationRecord>(sql!(
         "SELECT COALESCE(
                     e.state IN ('creating', 'created')
                         AND (e.activation_attempt_id IS NOT NULL
@@ -314,14 +314,14 @@ pub async fn first_activation(
     ))
     .bind(sandbox_id)
     .bind(managed_by)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether `sandbox_id` has an active execution row. A plain read: run it in
 /// the caller's transaction to see that transaction's writes.
 pub async fn exists(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
 ) -> Result<bool, SandboxStoreError> {
     Ok(sqlx::query_scalar::<_, bool>(sql!(
@@ -333,7 +333,7 @@ pub async fn exists(
                  )"
     ))
     .bind(sandbox_id)
-    .fetch_one(executor)
+    .fetch_one(executor.into_sqlx())
     .await?)
 }
 
@@ -351,7 +351,7 @@ pub struct ExecutionPodRef {
 /// Every pod name `sandbox_id`'s execution rows recorded, newest generation
 /// first: a live pod is likeliest under the newest name.
 pub async fn newest_first(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
 ) -> Result<Vec<ExecutionPodRef>, SandboxStoreError> {
     Ok(sqlx::query_as::<_, ExecutionPodRef>(sql!(
@@ -361,7 +361,7 @@ pub async fn newest_first(
           ORDER BY generation DESC"
     ))
     .bind(sandbox_id)
-    .fetch_all(executor)
+    .fetch_all(executor.into_sqlx())
     .await?)
 }
 
@@ -369,10 +369,10 @@ pub async fn newest_first(
 /// ran on; `None` when none did. The unique index on
 /// `(sandbox_id, generation)` makes the pick deterministic.
 pub async fn latest_k8s_node_name(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>(sql!(
+) -> Result<Option<String>, DbError> {
+    Ok(sqlx::query_scalar::<_, String>(sql!(
         "SELECT ske.k8s_node_name
            FROM sandbox_k8s_executions ske
           WHERE ske.sandbox_id = $1
@@ -381,17 +381,17 @@ pub async fn latest_k8s_node_name(
           LIMIT 1"
     ))
     .bind(sandbox_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The trimmed, distinct Kubernetes node names the inactive executions of
 /// `sandbox_id` recorded, sorted; blank names are skipped.
 pub async fn inactive_k8s_node_names(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Vec<String>, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT DISTINCT BTRIM(k8s_node_name)
                FROM sandbox_k8s_executions
               WHERE sandbox_id = $1
@@ -400,19 +400,19 @@ pub async fn inactive_k8s_node_names(
               ORDER BY 1"
     ))
     .bind(sandbox_id)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The route activation the active execution of `sandbox_id` at
 /// `generation` tracking `pod_uid` has published; `None` when there is no
 /// such execution or it has published none.
 pub async fn active_route_activation_id(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     pod_uid: &str,
-) -> Result<Option<Uuid>, sqlx::Error> {
+) -> Result<Option<Uuid>, DbError> {
     let route_activation_id = sqlx::query_scalar::<_, Option<Uuid>>(sql!(
         "SELECT route_activation_id
                FROM sandbox_k8s_executions
@@ -424,7 +424,7 @@ pub async fn active_route_activation_id(
     .bind(sandbox_id)
     .bind(generation)
     .bind(pod_uid)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(route_activation_id.flatten())
 }
@@ -434,11 +434,11 @@ pub async fn active_route_activation_id(
 /// `stopped`: the execution its stop retired rather than one booted after.
 /// Both timestamps come from the database clock.
 pub async fn predates_current_stop(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT EXISTS (
                 SELECT 1 FROM sandbox_k8s_executions execution
                 JOIN sandboxes sandbox ON sandbox.id = execution.sandbox_id
@@ -449,8 +449,8 @@ pub async fn predates_current_stop(
     ))
     .bind(sandbox_id)
     .bind(generation)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// The generation a new execution claim for `sandbox_id` would take now,
@@ -461,10 +461,10 @@ pub async fn predates_current_stop(
 /// Mirrors the claim's generation allocation, [`claim::mint_generation`];
 /// change them together.
 pub async fn unclaimed_generation(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<i64>, sqlx::Error> {
-    sqlx::query_scalar::<_, Option<i64>>(sql!(
+) -> Result<Option<i64>, DbError> {
+    Ok(sqlx::query_scalar::<_, Option<i64>>(sql!(
         "SELECT CASE
                         WHEN BOOL_OR(active) THEN NULL
                         ELSE COALESCE(MAX(generation), 0) + 1
@@ -473,17 +473,17 @@ pub async fn unclaimed_generation(
              WHERE sandbox_id = $1"
     ))
     .bind(sandbox_id)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether `sandbox_id`'s active execution is the one at `generation`.
 pub async fn active_is_generation(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT EXISTS(
                  SELECT 1
                    FROM sandbox_k8s_executions
@@ -494,19 +494,19 @@ pub async fn active_is_generation(
     ))
     .bind(sandbox_id)
     .bind(generation)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether the active execution of `sandbox_id` at `generation` is in
 /// `state`; `None` when that generation isn't the active execution.
 pub async fn active_in_state(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     state: &str,
-) -> Result<Option<bool>, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
+) -> Result<Option<bool>, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
         "SELECT state = $3
              FROM sandbox_k8s_executions
              WHERE sandbox_id = $1 AND generation = $2 AND active"
@@ -514,18 +514,18 @@ pub async fn active_in_state(
     .bind(sandbox_id)
     .bind(generation)
     .bind(state)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether `sandbox_id` has an execution newer than `generation`, in any
 /// state.
 pub async fn successor_exists(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
         "SELECT EXISTS (
                      SELECT 1
                        FROM sandbox_k8s_executions
@@ -535,20 +535,20 @@ pub async fn successor_exists(
     ))
     .bind(sandbox_id)
     .bind(generation)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether the execution of `sandbox_id` at `generation` that names
 /// `pod_name` is retired (`active = FALSE`); `false` when there is no such
 /// execution.
 pub async fn generation_retired(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     pod_name: &str,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
         "SELECT EXISTS (
                  SELECT 1
                    FROM sandbox_k8s_executions
@@ -561,30 +561,30 @@ pub async fn generation_retired(
     .bind(sandbox_id)
     .bind(generation)
     .bind(pod_name)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// The pod name of every execution `sandbox_id` has recorded.
 pub async fn pod_names(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>(sql!(
+) -> Result<Vec<String>, DbError> {
+    Ok(sqlx::query_scalar::<_, String>(sql!(
         "SELECT pod_name FROM sandbox_k8s_executions WHERE sandbox_id = $1"
     ))
     .bind(sandbox_id)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The pod names of the executions of `sandbox_id` older than `generation`.
 pub async fn pod_names_before_generation(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
-) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>(sql!(
+) -> Result<Vec<String>, DbError> {
+    Ok(sqlx::query_scalar::<_, String>(sql!(
         "SELECT pod_name
                FROM sandbox_k8s_executions
               WHERE sandbox_id = $1
@@ -592,24 +592,24 @@ pub async fn pod_names_before_generation(
     ))
     .bind(sandbox_id)
     .bind(generation)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The pod names of the inactive executions of `sandbox_id`.
 pub async fn inactive_pod_names(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>(sql!(
+) -> Result<Vec<String>, DbError> {
+    Ok(sqlx::query_scalar::<_, String>(sql!(
         "SELECT pod_name
                FROM sandbox_k8s_executions
               WHERE sandbox_id = $1
                 AND NOT active"
     ))
     .bind(sandbox_id)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The active execution a started-recovery follower waits on, with its
@@ -628,13 +628,13 @@ pub struct RecoveringExecution {
 /// is one of `live_states`, the states the caller counts as a recovery still
 /// in progress or done; `None` when there is none.
 pub async fn recovering_execution(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     live_states: [&str; 3],
-) -> Result<Option<RecoveringExecution>, sqlx::Error> {
+) -> Result<Option<RecoveringExecution>, DbError> {
     let [first, second, third] = live_states;
-    sqlx::query_as::<_, RecoveringExecution>(sql!(
+    Ok(sqlx::query_as::<_, RecoveringExecution>(sql!(
         "SELECT e.generation, e.state, e.pod_name, host(e.pod_ip) AS pod_ip, s.lifecycle
              FROM sandbox_k8s_executions e
              JOIN sandboxes s ON s.id = e.sandbox_id
@@ -646,8 +646,8 @@ pub async fn recovering_execution(
     .bind(first)
     .bind(second)
     .bind(third)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The active execution of a sandbox with the parts of its row the
@@ -677,11 +677,11 @@ pub struct ActiveExecutionStatus {
 /// [`ActiveExecutionStatus`] of `sandbox_id`'s active execution; `None` when
 /// it has none.
 pub async fn active_execution_status(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     create_ttl_secs: i64,
-) -> Result<Option<ActiveExecutionStatus>, sqlx::Error> {
-    sqlx::query_as::<_, ActiveExecutionStatus>(sql!(
+) -> Result<Option<ActiveExecutionStatus>, DbError> {
+    Ok(sqlx::query_as::<_, ActiveExecutionStatus>(sql!(
         "SELECT e.generation, e.pod_name, NULLIF(BTRIM(e.pod_uid), '') AS pod_uid,
                     host(e.pod_ip) AS pod_ip, s.active_node_id AS current_node_id,
                     e.k8s_node_name, e.state, s.lifecycle,
@@ -694,6 +694,6 @@ pub async fn active_execution_status(
     ))
     .bind(sandbox_id)
     .bind(create_ttl_secs)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }

@@ -19,7 +19,7 @@ async fn lock_latest_execution_evidence_locks_only_the_latest_execution() -> Tes
     let latest = insert_execution(pool, sandbox_id, 2, "suspended", false, None).await?;
 
     let mut tx = pool.begin().await?;
-    let evidence = lock_latest_execution_evidence(&mut tx, sandbox_id, NodeId::new())
+    let evidence = lock_latest_execution_evidence(&mut *tx, sandbox_id, NodeId::new())
         .await?
         .expect("the sandbox has executions");
     assert_eq!(evidence.latest_execution_generation.get(), 2);
@@ -37,9 +37,11 @@ async fn lock_latest_execution_evidence_locks_only_the_latest_execution() -> Tes
     // `lock_not_available`.
     let holder = hold_execution(pool, latest.id).await?;
     let mut tx = pool.begin().await?;
-    let error = lock_latest_execution_evidence(&mut tx, sandbox_id, NodeId::new())
-        .await
-        .expect_err("a held execution fails the lock");
+    let error = sqlx::Error::from(
+        lock_latest_execution_evidence(&mut *tx, sandbox_id, NodeId::new())
+            .await
+            .expect_err("a held execution fails the lock"),
+    );
     assert!(is_lock_not_available(&error), "{error}");
     tx.rollback().await?;
     holder.rollback().await?;
@@ -47,7 +49,7 @@ async fn lock_latest_execution_evidence_locks_only_the_latest_execution() -> Tes
     let bare = insert_sandbox(pool, "suspended").await?;
     let mut tx = pool.begin().await?;
     assert!(
-        lock_latest_execution_evidence(&mut tx, bare, NodeId::new())
+        lock_latest_execution_evidence(&mut *tx, bare, NodeId::new())
             .await?
             .is_none()
     );

@@ -54,6 +54,7 @@ impl K8sStore {
             super::super::RESTORE_EXECUTION_OWNERSHIP_TTL_SECS,
         )
         .await
+        .map_err(sqlx::Error::from)
         .and_then(|record| record.map(SandboxExecutionRow::try_from).transpose())
         .db_context("failed to query active Kubernetes execution row")
     }
@@ -83,6 +84,7 @@ impl K8sStore {
             &self.namespace,
         )
         .await
+        .map_err(sqlx::Error::from)
         .and_then(|record| record.map(SandboxExecutionRow::try_from).transpose())
         .db_context("failed to insert Kubernetes execution row")?;
 
@@ -971,6 +973,7 @@ impl K8sStore {
             super::super::RESTORE_EXECUTION_OWNERSHIP_TTL_SECS,
         )
         .await
+        .map_err(sqlx::Error::from)
         .and_then(|status| status.map(ActiveExecutionStatusRow::try_from).transpose())
         .db_context("failed to query pod metadata")
     }
