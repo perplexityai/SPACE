@@ -157,16 +157,17 @@ pub async fn delete(executor: impl Executor<'_>, sandbox_id: SandboxId) -> Resul
 /// out of the lifecycle that record describes.
 /// When the record is purged, the sandbox's `sandbox_snapshot_inventory`
 /// rows go with it, through that table's foreign-key cascade.
-pub async fn clear_failed_observation(
-    executor: impl Executor<'_>,
-    sandbox_id: SandboxId,
-) -> Result<(), DbError> {
+/// The caller must pass its open transaction.
+pub async fn clear_failed_observation<C>(tx: &mut C, sandbox_id: SandboxId) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "DELETE FROM sandbox_observed_states
           WHERE sandbox_id = $1 AND status = 'failed' AND pid IS NULL"
     ))
     .bind(sandbox_id)
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
