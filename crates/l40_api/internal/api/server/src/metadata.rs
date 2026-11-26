@@ -1386,6 +1386,7 @@ async fn find_template_release_storage_location_row(
     )
     .await
     .map(|location| location.map(TemplateReleaseStorageLocationRow::from))
+    .map_err(sqlx::Error::from)
     .map_err(|err| {
         crate::template_publication::storage_status("query storage_connection_string", &err)
     })
@@ -1405,6 +1406,7 @@ async fn insert_template_release_storage_location_row(
     )
     .await
     .map(|location| location.map(TemplateReleaseStorageLocationRow::from))
+    .map_err(sqlx::Error::from)
     .map_err(|err| {
         crate::template_publication::storage_status("insert storage_connection_string", &err)
     })
@@ -1419,6 +1421,7 @@ async fn adopt_template_release_storage_location_org_id(
         location_id,
     )
     .await
+    .map_err(sqlx::Error::from)
     .map_err(|err| {
         crate::template_publication::storage_status(
             "adopt template_release_storage_location org_id",

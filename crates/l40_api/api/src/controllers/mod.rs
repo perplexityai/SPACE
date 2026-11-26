@@ -589,7 +589,7 @@ pub(crate) fn db_contention_error(message: &str, error: &sqlx::Error) -> Control
 /// the build qualifies, so the caller keeps the release its tag or digest
 /// names.
 pub(crate) async fn resolved_create_release(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
     template: &str,
     content_hash: &str,
     boots_template_twins: bool,
@@ -604,6 +604,7 @@ pub(crate) async fn resolved_create_release(
         pplx_space_execution_catalog::catalog::initial_environment_reference(),
     )
     .await
+    .map_err(sqlx::Error::from)
     .map_err(|err| db_contention_error("failed to resolve the release a create runs", &err))?;
     Ok(resolved.map(|(release, _)| release))
 }

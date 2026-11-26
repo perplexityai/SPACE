@@ -250,7 +250,7 @@ pub async fn set_template_visibility(
             .await
             {
                 Ok(has) => has,
-                Err(err) => return db_error(err).into_response(),
+                Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
             };
         if owner_encrypted {
             audit_failure("conflict: owner-encrypted template cannot widen");

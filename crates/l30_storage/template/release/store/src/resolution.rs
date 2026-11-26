@@ -29,8 +29,8 @@
 use std::sync::LazyLock;
 
 use pplx_space_execution_spec::EnvironmentReference;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 use uuid::Uuid;
 
 /// A scalar subquery evaluating to the id of the release a create of
@@ -168,15 +168,17 @@ pub(crate) static RESOLVED_RELEASE: LazyLock<String> = LazyLock::new(|| {
 /// `None` when no release qualifies. `initial_environment` is the initial
 /// environment, which unbound releases count as. Takes no lock.
 pub async fn resolved_release(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &str,
     hash: &str,
     initial_environment: EnvironmentReference,
-) -> Result<Option<(Uuid, Option<String>)>, sqlx::Error> {
-    sqlx::query_as::<_, (Uuid, Option<String>)>(sqlx::AssertSqlSafe(RESOLVED_RELEASE.as_str()))
-        .bind(template_name)
-        .bind(hash)
-        .bind(initial_environment.to_string())
-        .fetch_optional(executor)
-        .await
+) -> Result<Option<(Uuid, Option<String>)>, DbError> {
+    Ok(
+        sqlx::query_as::<_, (Uuid, Option<String>)>(sqlx::AssertSqlSafe(RESOLVED_RELEASE.as_str()))
+            .bind(template_name)
+            .bind(hash)
+            .bind(initial_environment.to_string())
+            .fetch_optional(executor.into_sqlx())
+            .await?,
+    )
 }

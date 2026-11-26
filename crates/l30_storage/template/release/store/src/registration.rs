@@ -5,9 +5,9 @@
 //! caller's transaction ends.
 
 use pplx_space_accounts::OrgId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use pplx_space_template_release_original::digest_original;
-use sqlx::PgExecutor;
 use std::sync::LazyLock;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -41,11 +41,11 @@ pub struct RegisteredStorageLocation {
 /// The first registered release of `template_name` stored under exactly
 /// `hash`: that spelling's original.
 pub async fn first_registered_release_id(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &str,
     hash: &str,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Option<Uuid>, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT id FROM template_releases
          WHERE template_name = $1 AND hash = $2
          ORDER BY created_at ASC, id ASC
@@ -53,8 +53,8 @@ pub async fn first_registered_release_id(
     ))
     .bind(template_name)
     .bind(hash)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The release of `template_name` stored under exactly `hash` that `selector`
@@ -66,13 +66,13 @@ pub async fn first_registered_release_id(
 /// Unlike [`crate::release_of_hash_in_partition`], it matches only `hash`'s
 /// exact spelling and doesn't skip releases without a storage location.
 pub async fn partition_release(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &str,
     hash: &str,
     selector: PartitionSelector,
     include_unrecorded: bool,
-) -> Result<Option<RegisteredRelease>, sqlx::Error> {
-    sqlx::query_as::<_, RegisteredRelease>(sql!(
+) -> Result<Option<RegisteredRelease>, DbError> {
+    Ok(sqlx::query_as::<_, RegisteredRelease>(sql!(
         "SELECT r.id, r.template_name, r.type, r.hash, r.org_id, r.created_at,
                 r.execution_metadata->>'environment' AS environment
          FROM template_releases r
@@ -96,8 +96,8 @@ pub async fn partition_release(
     .bind(selector.includes_unbound)
     .bind(selector.environment.to_string())
     .bind(include_unrecorded)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Insert the release, or nothing (`None`) when it conflicts with one already
@@ -119,14 +119,14 @@ pub async fn partition_release(
 /// `created_at`) is the one inserted first even when a twin's transaction
 /// began earlier.
 pub async fn insert_release(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &str,
     runtime: &str,
     hash: &str,
     org_id: Option<OrgId>,
     execution_metadata: Option<&serde_json::Value>,
-) -> Result<Option<RegisteredRelease>, sqlx::Error> {
-    sqlx::query_as::<_, RegisteredRelease>(sql!(
+) -> Result<Option<RegisteredRelease>, DbError> {
+    Ok(sqlx::query_as::<_, RegisteredRelease>(sql!(
         "INSERT INTO template_releases
              (template_name, type, hash, org_id, execution_metadata, created_at)
          SELECT $1, $2, $3, COALESCE($4, org_id), $5, clock_timestamp()
@@ -141,18 +141,18 @@ pub async fn insert_release(
     .bind(hash)
     .bind(org_id)
     .bind(execution_metadata)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The storage location of release `release_id` at exactly
 /// `connection_string`, or `None`.
 pub async fn storage_location(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     release_id: Uuid,
     connection_string: &str,
-) -> Result<Option<RegisteredStorageLocation>, sqlx::Error> {
-    sqlx::query_as::<_, RegisteredStorageLocation>(sql!(
+) -> Result<Option<RegisteredStorageLocation>, DbError> {
+    Ok(sqlx::query_as::<_, RegisteredStorageLocation>(sql!(
         "SELECT id, storage_connection_string, created_at
          FROM template_release_storage_locations
          WHERE template_release_id = $1
@@ -160,8 +160,8 @@ pub async fn storage_location(
     ))
     .bind(release_id)
     .bind(connection_string)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Insert the storage location `connection_string` of release `release_id`,
@@ -170,12 +170,12 @@ pub async fn storage_location(
 /// one when it has none, and the location comes back all the same. `None`
 /// when there is no release `release_id`.
 pub async fn insert_storage_location(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     release_id: Uuid,
     org_id: Option<OrgId>,
     connection_string: &str,
-) -> Result<Option<RegisteredStorageLocation>, sqlx::Error> {
-    sqlx::query_as::<_, RegisteredStorageLocation>(sql!(
+) -> Result<Option<RegisteredStorageLocation>, DbError> {
+    Ok(sqlx::query_as::<_, RegisteredStorageLocation>(sql!(
         "INSERT INTO template_release_storage_locations
              (template_release_id, storage_connection_string, org_id)
          SELECT $1, $3, COALESCE($2, org_id)
@@ -191,8 +191,8 @@ pub async fn insert_storage_location(
     .bind(release_id)
     .bind(org_id)
     .bind(connection_string)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Record `execution` as release `release_id`'s execution metadata when it
@@ -201,17 +201,17 @@ pub async fn insert_storage_location(
 /// holds fails with the partition index's unique violation. The caller holds
 /// the release's row lock while it compares or fills the metadata.
 pub async fn fill_execution_metadata(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     release_id: Uuid,
     execution: &serde_json::Value,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "UPDATE template_releases SET execution_metadata = $2
          WHERE id = $1 AND execution_metadata IS NULL"
     ))
     .bind(release_id)
     .bind(execution)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() == 1)
 }
@@ -221,9 +221,9 @@ pub async fn fill_execution_metadata(
 /// release has none either, which leaves the location ownerless. `false`
 /// when it already has an owner, or there is no such location.
 pub async fn adopt_storage_location_owner(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     location_id: Uuid,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "UPDATE template_release_storage_locations location
          SET org_id = release.org_id
@@ -233,7 +233,7 @@ pub async fn adopt_storage_location_owner(
            AND location.org_id IS NULL"
     ))
     .bind(location_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() == 1)
 }
@@ -242,17 +242,25 @@ pub async fn adopt_storage_location_owner(
 /// locking the release's row `FOR UPDATE` until the caller's transaction
 /// ends, so a check and fill of the metadata
 /// ([`fill_execution_metadata`]) is one step against other writers. Fails
-/// with [`sqlx::Error::RowNotFound`] when there is no release `release_id`.
-pub async fn lock_execution_metadata(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+/// with a [`DbError`] whose `kind()` is [`DbErrorKind::NotFound`] (the
+/// driver's `RowNotFound`, which callers still see after converting) when
+/// there is no release `release_id`. The caller must pass its open
+/// transaction.
+///
+/// [`DbErrorKind::NotFound`]: pplx_space_postgres_pool::DbErrorKind::NotFound
+pub async fn lock_execution_metadata<C>(
+    tx: &mut C,
     release_id: Uuid,
-) -> Result<Option<serde_json::Value>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Option<serde_json::Value>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar(sql!(
         "SELECT execution_metadata FROM template_releases WHERE id = $1 FOR UPDATE"
     ))
     .bind(release_id)
-    .fetch_one(&mut **tx)
-    .await
+    .fetch_one(tx.into_sqlx())
+    .await?)
 }
 
 /// The original release of `template_name` stored as `canonical_hash` or
@@ -261,11 +269,11 @@ pub async fn lock_execution_metadata(
 /// lookup with no environment resolves, never a twin. `None` when no
 /// release has the digest.
 pub async fn original_release(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &str,
     canonical_hash: &str,
     bare_hash: &str,
-) -> Result<Option<RegisteredRelease>, sqlx::Error> {
+) -> Result<Option<RegisteredRelease>, DbError> {
     /// Built once: every input is a literal or a bind placeholder.
     static QUERY: LazyLock<String> = LazyLock::new(|| {
         sql!(format!(
@@ -278,10 +286,12 @@ pub async fn original_release(
             digest_original = digest_original("r"),
         ))
     });
-    sqlx::query_as::<_, RegisteredRelease>(sqlx::AssertSqlSafe(QUERY.as_str()))
-        .bind(template_name)
-        .bind(canonical_hash)
-        .bind(bare_hash)
-        .fetch_optional(executor)
-        .await
+    Ok(
+        sqlx::query_as::<_, RegisteredRelease>(sqlx::AssertSqlSafe(QUERY.as_str()))
+            .bind(template_name)
+            .bind(canonical_hash)
+            .bind(bare_hash)
+            .fetch_optional(executor.into_sqlx())
+            .await?,
+    )
 }

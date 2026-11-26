@@ -74,6 +74,12 @@ pub enum StorageVendStoreError {
     UnsupportedProvider,
 }
 
+impl From<pplx_space_postgres_pool::DbError> for StorageVendStoreError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 #[tonic::async_trait]
 pub trait StorageVendStore: Send + Sync + 'static {
     async fn sandbox_context(

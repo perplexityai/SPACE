@@ -405,6 +405,7 @@ async fn resolve_original_release(
             caller_org,
         )
         .await
+        .map_err(sqlx::Error::from)
         .map_err(|err| db_contention_error("failed to resolve template release by hash", &err))?;
 
         return match resolved {
@@ -469,6 +470,7 @@ async fn classify_release_miss(
         caller_org,
     )
     .await
+    .map_err(sqlx::Error::from)
     .map_err(|err| db_contention_error("failed to check template releases", &err))?;
     Ok(not_found.with_template_release_miss(if has_release {
         TemplateReleaseMiss::NoMatchingRelease
@@ -492,6 +494,7 @@ pub(crate) async fn resolve_template_release_by_tag(
         caller_org,
     )
     .await
+    .map_err(sqlx::Error::from)
     .map_err(|err| db_contention_error("failed to resolve template release by tag", &err))
 }
 

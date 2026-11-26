@@ -1,11 +1,11 @@
 use pplx_space_accounts::OrgId;
 use pplx_space_content_digest::{ContentHash, HashAlg};
 use pplx_space_execution_spec::RuntimeKind;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_template_model::{
     TemplateArtifactDigest, TemplateArtifactDigestPrefix, TemplateName, TemplateReference,
     TemplateSelector,
 };
-use sqlx::PgExecutor;
 
 /// The digests of the template's `runtime` releases the caller may resolve
 /// that start with `prefix`, each once in canonical `<algorithm>:<hex>` form. Same
@@ -14,7 +14,7 @@ use sqlx::PgExecutor;
 /// hex is a SHA-256 digest, as in
 /// [`pplx_space_template_release_store::lookup::resolve_by_digest`].
 pub(crate) async fn template_release_digests_with_prefix(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &TemplateName,
     prefix: &TemplateArtifactDigestPrefix,
     runtime: RuntimeKind,
@@ -55,8 +55,14 @@ pub(crate) enum ResolveBaseError {
     Digest(#[from] pplx_space_content_digest::DigestParseError),
 }
 
+impl From<DbError> for ResolveBaseError {
+    fn from(error: DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 pub(crate) async fn resolve_base(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     reference: &TemplateReference,
     caller_org: OrgId,
 ) -> Result<ContentHash, ResolveBaseError> {

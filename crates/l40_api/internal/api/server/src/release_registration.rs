@@ -121,6 +121,7 @@ pub(super) async fn ensure_template_release(
         execution.map(|execution| &execution.json),
     )
     .await
+    .map_err(sqlx::Error::from)
     .map_err(|error| {
         crate::template_publication::storage_status("insert template release", &error)
     })? {
@@ -255,6 +256,7 @@ async fn first_registered_release_id(
         hash,
     )
     .await
+    .map_err(sqlx::Error::from)
     .map_err(|err| crate::template_publication::storage_status("query template_release", &err))
 }
 
@@ -376,6 +378,7 @@ async fn find_original_release_row(
     )
     .await
     .map(|release| release.map(TemplateReleaseRow::from))
+    .map_err(sqlx::Error::from)
     .map_err(|err| crate::template_publication::storage_status("query template_release", &err))
 }
 
@@ -414,6 +417,7 @@ async fn find_partition_release_row(
     )
     .await
     .map(|release| release.map(TemplateReleaseRow::from))
+    .map_err(sqlx::Error::from)
     .map_err(|err| crate::template_publication::storage_status("query template_release", &err))
 }
 
@@ -432,15 +436,14 @@ async fn check_template_release_execution_metadata(
 ) -> Result<MetadataCheck, Status> {
     // Fence the check and backfill against node publication and other writers,
     // including those that do not take the parent-template publication lock.
-    let existing =
-        pplx_space_template_release_store::registration::lock_execution_metadata(tx, release_id)
-            .await
-            .map_err(|error| {
-                crate::template_publication::storage_status(
-                    "lock release execution metadata",
-                    &error,
-                )
-            })?;
+    let existing = pplx_space_template_release_store::registration::lock_execution_metadata(
+        &mut **tx, release_id,
+    )
+    .await
+    .map_err(sqlx::Error::from)
+    .map_err(|error| {
+        crate::template_publication::storage_status("lock release execution metadata", &error)
+    })?;
     match existing {
         Some(existing) if &existing != execution => Err(Status::already_exists(
             "template release already has different execution metadata",
@@ -467,6 +470,7 @@ async fn fill_release_execution_metadata(
         execution,
     )
     .await
+    .map_err(sqlx::Error::from)
     {
         Ok(_) => {
             savepoint.commit().await.map_err(|error| storage(&error))?;
