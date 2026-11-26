@@ -208,7 +208,10 @@ impl ClusterApiService {
             )
             .await
             .map_err(|err| {
-                template_publication::storage_status("consume system publication", &err)
+                template_publication::storage_status(
+                    "consume system publication",
+                    &sqlx::Error::from(err),
+                )
             })?
         {
             return Err(template_publication::missing_system_publication_grant());
@@ -225,7 +228,10 @@ impl ClusterApiService {
             )
             .await
             .map_err(|err| {
-                template_publication::storage_status("consume tenant publication", &err)
+                template_publication::storage_status(
+                    "consume tenant publication",
+                    &sqlx::Error::from(err),
+                )
             })?
         {
             return Err(template_publication::missing_tenant_publication_grant());
@@ -394,7 +400,12 @@ impl ClusterApi for ClusterApiService {
                 &mut *tx, &name, grant,
             )
             .await
-            .map_err(|err| template_publication::storage_status("check system publication", &err))?
+            .map_err(|err| {
+                template_publication::storage_status(
+                    "check system publication",
+                    &sqlx::Error::from(err),
+                )
+            })?
         {
             return Err(template_publication::missing_system_publication_grant());
         }
@@ -409,7 +420,12 @@ impl ClusterApi for ClusterApiService {
                 },
             )
             .await
-            .map_err(|err| template_publication::storage_status("check tenant publication", &err))?
+            .map_err(|err| {
+                template_publication::storage_status(
+                    "check tenant publication",
+                    &sqlx::Error::from(err),
+                )
+            })?
         {
             return Err(template_publication::missing_tenant_publication_grant());
         }

@@ -3,7 +3,7 @@ use std::str::FromStr;
 use pplx_space_accounts::{NodeId, OrgId, SystemPublicationGrantId, TenantPublicationGrantId};
 use pplx_space_template_model::{BuildRunId, BuildRunIdParseError, TemplateName};
 use pplx_space_template_store::{build_base_grants, build_jobs, publication_grants, templates};
-use sqlx::{PgExecutor, PgPool};
+use sqlx::PgPool;
 use time::OffsetDateTime;
 
 #[derive(Clone)]
@@ -66,6 +66,12 @@ pub enum TemplateBuildJobsStoreError {
     BuilderIdentityRequired,
 }
 
+impl From<pplx_space_postgres_pool::DbError> for TemplateBuildJobsStoreError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 impl TemplateBuildJobsStoreError {
     /// The wrapped `sqlx::Error`, when this is a storage failure rather than a
     /// malformed stored row.
@@ -96,7 +102,9 @@ impl TemplateBuildJobsStore {
         template_name: &TemplateName,
         org_id: OrgId,
     ) -> Result<bool, sqlx::Error> {
-        templates::not_owned_by_another_org(&self.pool, template_name, org_id).await
+        templates::not_owned_by_another_org(&self.pool, template_name, org_id)
+            .await
+            .map_err(sqlx::Error::from)
     }
 
     pub(crate) async fn record_accepted_build(
@@ -241,11 +249,13 @@ impl TemplateBuildJobsStore {
     /// job can still be running, so a build that waits behind long jobs keeps
     /// its base authorization. Other submissions' grants are untouched.
     async fn pin_base_grant(
-        executor: impl PgExecutor<'_>,
+        executor: impl pplx_space_postgres_pool::Executor<'_>,
         base_grant: BuildBaseGrantId,
         builder_node_id: NodeId,
     ) -> Result<(), sqlx::Error> {
-        build_base_grants::pin_to_builder(executor, base_grant.as_uuid(), builder_node_id).await
+        build_base_grants::pin_to_builder(executor, base_grant.as_uuid(), builder_node_id)
+            .await
+            .map_err(sqlx::Error::from)
     }
 
     pub(crate) async fn lookup_build(

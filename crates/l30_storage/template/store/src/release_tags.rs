@@ -8,9 +8,10 @@
 //! confirms with [`share_lock_tags_of_digest`]. Each locking verb takes the
 //! caller's transaction, and its lock lasts until that transaction ends.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use pplx_space_template_model::{TemplateName, TemplateTag};
-use sqlx::{FromRow, PgExecutor, Postgres, Transaction};
+use sqlx::FromRow;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -23,28 +24,28 @@ pub struct ReleaseTag {
 
 /// The tags of `release_ids`, by release, then tag.
 pub async fn list_for_releases(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     release_ids: &[Uuid],
-) -> Result<Vec<ReleaseTag>, sqlx::Error> {
-    sqlx::query_as::<_, ReleaseTag>(sql!(
+) -> Result<Vec<ReleaseTag>, DbError> {
+    Ok(sqlx::query_as::<_, ReleaseTag>(sql!(
         "SELECT template_release_id, tag
          FROM template_release_tags
          WHERE template_release_id = ANY($1)
          ORDER BY template_release_id, tag"
     ))
     .bind(release_ids)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Point `tag` of `template_name` at `release_id`. `false` when the template
 /// has no such tag.
 pub async fn retarget(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     release_id: Uuid,
     template_name: &str,
     tag: &TemplateTag,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "UPDATE template_release_tags
                      SET template_release_id = $1,
@@ -54,7 +55,7 @@ pub async fn retarget(
     .bind(release_id)
     .bind(template_name)
     .bind(tag.as_str())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() == 1)
 }
@@ -63,11 +64,11 @@ pub async fn retarget(
 /// the template already has a tag of that name, which may have committed
 /// after the caller found it absent.
 pub async fn insert_if_absent(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     release_id: Uuid,
     template_name: &str,
     tag: &TemplateTag,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "INSERT INTO template_release_tags (template_release_id, template_name, tag)
                      VALUES ($1, $2, $3)
@@ -76,7 +77,7 @@ pub async fn insert_if_absent(
     .bind(release_id)
     .bind(template_name)
     .bind(tag.as_str())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() == 1)
 }
@@ -92,12 +93,12 @@ pub struct RegisteredTag {
 /// Point `tag` of `template_name` at `release_id`, creating the tag if the
 /// template has none of that name.
 pub async fn upsert(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     release_id: Uuid,
     template_name: &str,
     tag: &str,
-) -> Result<RegisteredTag, sqlx::Error> {
-    sqlx::query_as::<_, RegisteredTag>(sql!(
+) -> Result<RegisteredTag, DbError> {
+    Ok(sqlx::query_as::<_, RegisteredTag>(sql!(
         "INSERT INTO template_release_tags (template_release_id, template_name, tag)
          VALUES ($1, $2, $3)
          ON CONFLICT (template_name, tag) DO UPDATE
@@ -108,64 +109,67 @@ pub async fn upsert(
     .bind(release_id)
     .bind(template_name)
     .bind(tag)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Delete `tag` from `release_id`, if it names that release.
 pub async fn delete(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     release_id: Uuid,
     tag: &TemplateTag,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "DELETE FROM template_release_tags
          WHERE template_release_id = $1 AND tag = $2"
     ))
     .bind(release_id)
     .bind(tag.as_str())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
 
 /// Delete every tag of `release_id`.
 pub async fn delete_for_release(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     release_id: Uuid,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "DELETE FROM template_release_tags WHERE template_release_id = $1"
     ))
     .bind(release_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
 
 /// Delete every tag of every release of `template`.
 pub async fn delete_for_template(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &TemplateName,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "DELETE FROM template_release_tags WHERE template_name = $1"
     ))
     .bind(template.as_str())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
 
 /// The release `tag` of `template_name` points at, or `None` when the
 /// template has no such tag, locking the tag's row `FOR UPDATE` until the
-/// caller's transaction ends.
-pub async fn current_release_locked(
-    tx: &mut Transaction<'_, Postgres>,
+/// caller's transaction ends. The caller must pass its open transaction.
+pub async fn current_release_locked<C>(
+    tx: &mut C,
     template_name: &str,
     tag: &str,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Option<Uuid>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar(sql!(
         "SELECT template_release_id
          FROM template_release_tags
          WHERE template_name = $1 AND tag = $2
@@ -173,22 +177,25 @@ pub async fn current_release_locked(
     ))
     .bind(template_name)
     .bind(tag)
-    .fetch_optional(&mut **tx)
-    .await
+    .fetch_optional(tx.into_sqlx())
+    .await?)
 }
 
 /// The tags among `tags` of `template_name` that name a release of the
 /// digest stored as `hash` (bare `bare_hash`), under either spelling, by
 /// tag, share-locking each tag's row `FOR SHARE` until the caller's
-/// transaction ends.
-pub async fn share_lock_tags_of_digest(
-    tx: &mut Transaction<'_, Postgres>,
+/// transaction ends. The caller must pass its open transaction.
+pub async fn share_lock_tags_of_digest<C>(
+    tx: &mut C,
     template_name: &str,
     tags: &[String],
     hash: &str,
     bare_hash: &str,
-) -> Result<Vec<RegisteredTag>, sqlx::Error> {
-    sqlx::query_as::<_, RegisteredTag>(sql!(
+) -> Result<Vec<RegisteredTag>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_as::<_, RegisteredTag>(sql!(
         "SELECT t.id, t.tag, t.created_at
          FROM template_release_tags t
          JOIN template_releases r ON r.id = t.template_release_id
@@ -202,6 +209,6 @@ pub async fn share_lock_tags_of_digest(
     .bind(tags)
     .bind(hash)
     .bind(bare_hash)
-    .fetch_all(&mut **tx)
-    .await
+    .fetch_all(tx.into_sqlx())
+    .await?)
 }

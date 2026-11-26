@@ -111,7 +111,9 @@ async fn registration_inserts_once_and_fills_only_a_missing_description() -> Tes
     let kept = templates::fill_description(&db.pool, "registered", Some("second")).await?;
     assert_eq!(kept.description.as_deref(), Some("first"));
     assert!(matches!(
-        templates::fill_description(&db.pool, "missing", Some("x")).await,
+        templates::fill_description(&db.pool, "missing", Some("x"))
+            .await
+            .map_err(sqlx::Error::from),
         Err(sqlx::Error::RowNotFound)
     ));
     Ok(())
@@ -1335,7 +1337,7 @@ async fn template_row_locks_last_until_the_callers_transaction_ends() -> TestRes
     set_desired_state(&db.pool, "retiring", "deleting").await?;
 
     let mut tx = db.pool.begin().await?;
-    let row = templates::lock_visibility(&mut tx, "locked")
+    let row = templates::lock_visibility(&mut *tx, "locked")
         .await?
         .expect("the row");
     assert_eq!(
@@ -1348,7 +1350,7 @@ async fn template_row_locks_last_until_the_callers_transaction_ends() -> TestRes
 
     let mut tx = db.pool.begin().await?;
     let rows =
-        templates::share_lock_visibilities(&mut tx, &["locked".to_owned(), "missing".to_owned()])
+        templates::share_lock_visibilities(&mut *tx, &["locked".to_owned(), "missing".to_owned()])
             .await?;
     assert_eq!(rows.len(), 1);
     assert!(!row_lock_free(&db.pool, "locked", "NO KEY UPDATE").await?);
@@ -1356,22 +1358,22 @@ async fn template_row_locks_last_until_the_callers_transaction_ends() -> TestRes
     tx.rollback().await?;
 
     let mut tx = db.pool.begin().await?;
-    templates::lock_no_key_update(&mut tx, &name("locked")).await?;
+    templates::lock_no_key_update(&mut *tx, &name("locked")).await?;
     assert!(!row_lock_free(&db.pool, "locked", "SHARE").await?);
     assert!(row_lock_free(&db.pool, "locked", "KEY SHARE").await?);
     tx.rollback().await?;
 
     let release = insert_release(&db.pool, "locked").await?;
     let mut tx = db.pool.begin().await?;
-    templates::lock_no_key_update_of_release(&mut tx, release).await?;
+    templates::lock_no_key_update_of_release(&mut *tx, release).await?;
     assert!(!row_lock_free(&db.pool, "locked", "SHARE").await?);
     assert!(row_lock_free(&db.pool, "locked", "KEY SHARE").await?);
     assert!(release_row_lock_free(&db.pool, release, "UPDATE").await?);
     tx.rollback().await?;
 
     let mut tx = db.pool.begin().await?;
-    templates::share_lock_if_present(&mut tx, "locked").await?;
-    templates::share_lock_if_present(&mut tx, "retiring").await?;
+    templates::share_lock_if_present(&mut *tx, "locked").await?;
+    templates::share_lock_if_present(&mut *tx, "retiring").await?;
     assert!(!row_lock_free(&db.pool, "locked", "NO KEY UPDATE").await?);
     assert!(row_lock_free(&db.pool, "locked", "SHARE").await?);
     assert!(
@@ -1381,7 +1383,7 @@ async fn template_row_locks_last_until_the_callers_transaction_ends() -> TestRes
     tx.rollback().await?;
 
     let mut tx = db.pool.begin().await?;
-    let owner = templates::lock_publication_owner(&mut tx, &name("locked"))
+    let owner = templates::lock_publication_owner(&mut *tx, &name("locked"))
         .await?
         .expect("the row");
     assert_eq!(
@@ -1390,7 +1392,7 @@ async fn template_row_locks_last_until_the_callers_transaction_ends() -> TestRes
     );
     assert!(!row_lock_free(&db.pool, "locked", "KEY SHARE").await?);
     assert!(
-        templates::lock_publication_owner(&mut tx, &name("missing"))
+        templates::lock_publication_owner(&mut *tx, &name("missing"))
             .await?
             .is_none()
     );
@@ -1428,11 +1430,11 @@ async fn tag_locks_last_until_the_callers_transaction_ends() -> TestResult {
 
     let mut tx = db.pool.begin().await?;
     assert_eq!(
-        release_tags::current_release_locked(&mut tx, "tagged", "stable").await?,
+        release_tags::current_release_locked(&mut *tx, "tagged", "stable").await?,
         Some(release)
     );
     assert_eq!(
-        release_tags::current_release_locked(&mut tx, "tagged", "missing").await?,
+        release_tags::current_release_locked(&mut *tx, "tagged", "missing").await?,
         None
     );
     assert!(!tag_lock_free(&db.pool, "KEY SHARE").await?);
@@ -1442,7 +1444,7 @@ async fn tag_locks_last_until_the_callers_transaction_ends() -> TestResult {
     let bare = hash.trim_start_matches("sha256:").to_owned();
     let mut tx = db.pool.begin().await?;
     let tags = release_tags::share_lock_tags_of_digest(
-        &mut tx,
+        &mut *tx,
         "tagged",
         &["stable".to_owned(), "missing".to_owned()],
         &bare,

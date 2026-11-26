@@ -933,6 +933,7 @@ pub(super) async fn template_visibility(
             visibility_absent()
         }
         Err(error) => {
+            let error = sqlx::Error::from(error);
             let code = error.as_database_error().and_then(|error| error.code());
             let reason = degradation_for_sqlstate(code.as_deref());
             // `reason` below drives only the log line and the `degraded` tag; it
@@ -1339,7 +1340,9 @@ pub(super) async fn ensure_template_release_tag(
         tag: row.tag,
         created_at: row.created_at,
     })
-    .map_err(|err| crate::template_publication::storage_status("insert tag", &err))
+    .map_err(|err| {
+        crate::template_publication::storage_status("insert tag", &sqlx::Error::from(err))
+    })
 }
 
 pub(super) async fn ensure_template_release_storage_location(

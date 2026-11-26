@@ -466,7 +466,7 @@ async fn compat_replace_and_policy_switch_clear() -> TestResult {
 
     let mut tx = pool.begin().await?;
     let known = pplx_space_template_store::templates::share_lock_visibilities(
-        &mut tx,
+        &mut *tx,
         &["a-secret".to_string(), "base-generic".to_string()],
     )
     .await?;
@@ -536,7 +536,7 @@ async fn compat_validation_serializes_against_concurrent_narrowing() -> TestResu
         .await?
         .expect("group row");
     let known = pplx_space_template_store::templates::share_lock_visibilities(
-        &mut compat_tx,
+        &mut *compat_tx,
         &["victim".to_string()],
     )
     .await?;
@@ -556,7 +556,7 @@ async fn compat_validation_serializes_against_concurrent_narrowing() -> TestResu
     let flip_pool = pool.clone();
     let flip = tokio::spawn(async move {
         let mut tx = flip_pool.begin().await?;
-        pplx_space_template_store::templates::lock_visibility(&mut tx, "victim").await?;
+        pplx_space_template_store::templates::lock_visibility(&mut *tx, "victim").await?;
         pplx_space_template_store::templates::update_visibility(
             &mut *tx,
             "victim",

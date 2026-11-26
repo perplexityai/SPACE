@@ -34,6 +34,12 @@ pub(super) enum RecordBlobError {
     Conflict,
 }
 
+impl From<pplx_space_postgres_pool::DbError> for RecordBlobError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 pub struct TemplateBuildState {
     pool: PgPool,
     jobs: TemplateBuildJobsStore,
@@ -110,6 +116,7 @@ impl TemplateBuildState {
             org_id,
         )
         .await
+        .map_err(sqlx::Error::from)
     }
 
     pub(super) async fn record_build_spec(

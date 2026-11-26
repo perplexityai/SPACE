@@ -101,9 +101,9 @@ impl ClusterApiService {
             org_id: owner,
             desired_state,
             managing_org_id: managing_org,
-        } = pplx_space_template_store::templates::lock_publication_owner(tx, name)
+        } = pplx_space_template_store::templates::lock_publication_owner(&mut **tx, name)
             .await
-            .map_err(|err| storage_status("lock publication owner", &err))?
+            .map_err(|err| storage_status("lock publication owner", &sqlx::Error::from(err)))?
             .ok_or_else(|| Status::not_found("template does not exist"))?;
         let allowed = match publisher {
             TemplateOrg::Owned { org_id } => owner == Some(org_id),

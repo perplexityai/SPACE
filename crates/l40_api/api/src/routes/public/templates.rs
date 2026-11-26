@@ -59,6 +59,7 @@ pub async fn get_template(
     let Some(row) =
         pplx_space_template_store::templates::get_visible(&state.pool, org.id, &template_name)
             .await
+            .map_err(sqlx::Error::from)
             .map_err(database_error)?
     else {
         return Err(PublicApiError::not_found("template not found"));
@@ -105,6 +106,7 @@ async fn fetch_template_rows(
 ) -> Result<Vec<TemplateRow>, sqlx::Error> {
     pplx_space_template_store::templates::list_visible(pool, org_id, cursor, i64::from(limit) + 1)
         .await
+        .map_err(sqlx::Error::from)
 }
 
 async fn fetch_template_variants(

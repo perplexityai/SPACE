@@ -1,9 +1,10 @@
 //! Whether a template keeps a base snapshot, and at what size
 //! (`template_base_snapshot_policies`).
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use pplx_space_template_model::{TemplateDesiredState, TemplateName};
-use sqlx::{FromRow, PgExecutor};
+use sqlx::FromRow;
 use time::OffsetDateTime;
 
 /// A template's configured base snapshot policy.
@@ -19,10 +20,10 @@ pub struct BaseSnapshotPolicy {
 /// `template`'s policy, or `None` when it has none or the template is not
 /// present.
 pub async fn get_present(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &TemplateName,
-) -> Result<Option<BaseSnapshotPolicy>, sqlx::Error> {
-    sqlx::query_as::<_, BaseSnapshotPolicy>(
+) -> Result<Option<BaseSnapshotPolicy>, DbError> {
+    Ok(sqlx::query_as::<_, BaseSnapshotPolicy>(
         sql!("SELECT p.template, p.ensure_base_snapshot, p.snapshot_vcpu, p.snapshot_memory_mib, p.updated_at
          FROM template_base_snapshot_policies p
          JOIN templates t ON t.name = p.template
@@ -31,20 +32,17 @@ pub async fn get_present(
     )
     .bind(template.as_str())
     .bind(TemplateDesiredState::Present.as_str())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Delete `template`'s policy, if it has one.
-pub async fn delete(
-    executor: impl PgExecutor<'_>,
-    template: &TemplateName,
-) -> Result<(), sqlx::Error> {
+pub async fn delete(executor: impl Executor<'_>, template: &TemplateName) -> Result<(), DbError> {
     sqlx::query(sql!(
         "DELETE FROM template_base_snapshot_policies WHERE template = $1"
     ))
     .bind(template.as_str())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -52,13 +50,13 @@ pub async fn delete(
 /// Set a present `template`'s policy, and read it back. `None` when the
 /// template isn't present, which writes nothing.
 pub async fn upsert_if_present(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &TemplateName,
     ensure_base_snapshot: bool,
     snapshot_vcpu: i32,
     snapshot_memory_mib: i32,
-) -> Result<Option<BaseSnapshotPolicy>, sqlx::Error> {
-    sqlx::query_as::<_, BaseSnapshotPolicy>(
+) -> Result<Option<BaseSnapshotPolicy>, DbError> {
+    Ok(sqlx::query_as::<_, BaseSnapshotPolicy>(
         sql!("INSERT INTO template_base_snapshot_policies
                  (template, ensure_base_snapshot, snapshot_vcpu, snapshot_memory_mib, updated_at)
              SELECT name, $2, $3, $4, NOW()
@@ -77,6 +75,6 @@ pub async fn upsert_if_present(
     .bind(snapshot_vcpu)
     .bind(snapshot_memory_mib)
     .bind(TemplateDesiredState::Present.as_str())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }

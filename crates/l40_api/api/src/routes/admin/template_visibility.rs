@@ -111,7 +111,7 @@ pub async fn set_template_visibility(
     // `FOR UPDATE`: the visibility write and its guards share one lock window
     // on the template row, so two operators cannot race the in-use guards.
     let template = match pplx_space_template_store::templates::lock_visibility(
-        &mut tx,
+        &mut *tx,
         template_name.as_str(),
     )
     .await
@@ -120,7 +120,7 @@ pub async fn set_template_visibility(
         Ok(None) => {
             return api_error(StatusCode::NOT_FOUND, "Template not found").into_response();
         }
-        Err(err) => return db_error(err).into_response(),
+        Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
     };
     let from_state = visibility_state_summary(template.visibility, template.org_id);
     let audit_failure = |error: &str| {
@@ -304,7 +304,7 @@ pub async fn set_template_visibility(
     )
     .await
     {
-        return db_error(err).into_response();
+        return db_error(sqlx::Error::from(err)).into_response();
     }
     let pruned_compat_rows = if narrowing {
         // `effective_org` is Some here: org-specific without an owner was

@@ -48,6 +48,7 @@ async fn visibility_write_and_owner_check() -> TestResult {
     let mut tx = pool.begin().await?;
     let err = update_visibility(&mut *tx, "ownerless", TemplateVisibility::OrgSpecific, None)
         .await
+        .map_err(sqlx::Error::from)
         .unwrap_err();
     drop(tx);
     let constraint = match &err {
@@ -66,7 +67,7 @@ async fn visibility_write_and_owner_check() -> TestResult {
         Some(OrgId::from_uuid(ORG_A)),
     )
     .await?;
-    let row = lock_visibility(&mut tx, "ownerless").await?.expect("row");
+    let row = lock_visibility(&mut *tx, "ownerless").await?.expect("row");
     tx.commit().await?;
     assert_eq!(row.visibility, TemplateVisibility::OrgSpecific);
     assert_eq!(row.org_id, Some(OrgId::from_uuid(ORG_A)));
@@ -75,7 +76,7 @@ async fn visibility_write_and_owner_check() -> TestResult {
     // generic templates).
     let mut tx = pool.begin().await?;
     update_visibility(&mut *tx, "ownerless", TemplateVisibility::Generic, None).await?;
-    let row = lock_visibility(&mut tx, "ownerless").await?.expect("row");
+    let row = lock_visibility(&mut *tx, "ownerless").await?.expect("row");
     tx.commit().await?;
     assert_eq!(row.visibility, TemplateVisibility::Generic);
     assert_eq!(row.org_id, Some(OrgId::from_uuid(ORG_A)));

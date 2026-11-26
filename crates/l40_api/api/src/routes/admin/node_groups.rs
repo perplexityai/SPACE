@@ -908,12 +908,12 @@ pub async fn set_compat(
     // database constraint to catch it. With it, either this transaction sees
     // the post-flip row and rejects, or the flip waits and its cross-org prune
     // removes the freshly inserted row.
-    let known = match pplx_space_template_store::templates::share_lock_visibilities(&mut tx, &names)
-        .await
-    {
-        Ok(rows) => rows,
-        Err(err) => return db_error(err).into_response(),
-    };
+    let known =
+        match pplx_space_template_store::templates::share_lock_visibilities(&mut *tx, &names).await
+        {
+            Ok(rows) => rows,
+            Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
+        };
     let missing: Vec<&str> = {
         let known_names: std::collections::HashSet<&str> =
             known.iter().map(|row| row.name.as_str()).collect();
