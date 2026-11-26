@@ -23,10 +23,10 @@
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::{NodeAddress, NodeManagedBy, NodeRole};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_snapshot_model::LocalArtifactId;
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 use sqlx::types::{Json, JsonValue};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -75,10 +75,10 @@ pub struct ObservedStateWithNode {
 /// The sandbox's observed state with its publishing node's registration.
 /// `None` when no node has published one.
 pub async fn get_with_node(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<ObservedStateWithNode>, sqlx::Error> {
-    sqlx::query_as::<_, ObservedStateWithNode>(sql!(
+) -> Result<Option<ObservedStateWithNode>, DbError> {
+    Ok(sqlx::query_as::<_, ObservedStateWithNode>(sql!(
         "SELECT sos.sandbox_id,
                 sos.node_id,
                 host(n.address) AS node_address,
@@ -110,8 +110,8 @@ pub async fn get_with_node(
           WHERE sos.sandbox_id = $1"
     ))
     .bind(sandbox_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Drop the observed states `node_id` published for those of `sandbox_ids`
@@ -120,10 +120,10 @@ pub async fn get_with_node(
 /// deleted. The deleted rows' `sandbox_snapshot_inventory` rows go with them,
 /// through that table's foreign-key cascade.
 pub async fn delete_absent_on_node(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     sandbox_ids: &[SandboxId],
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let result = sqlx::query(sql!(
         "DELETE FROM sandbox_observed_states sos
          WHERE sos.node_id = $1
@@ -131,7 +131,7 @@ pub async fn delete_absent_on_node(
     ))
     .bind(node_id)
     .bind(sandbox_ids)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected())
 }
@@ -141,15 +141,12 @@ pub async fn delete_absent_on_node(
 /// leave a node's stale report overlaying it.
 /// The sandbox's `sandbox_snapshot_inventory` rows go with it, through that
 /// table's foreign-key cascade.
-pub async fn delete(
-    executor: impl PgExecutor<'_>,
-    sandbox_id: SandboxId,
-) -> Result<(), sqlx::Error> {
+pub async fn delete(executor: impl Executor<'_>, sandbox_id: SandboxId) -> Result<(), DbError> {
     sqlx::query(sql!(
         "DELETE FROM sandbox_observed_states WHERE sandbox_id = $1"
     ))
     .bind(sandbox_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -161,15 +158,15 @@ pub async fn delete(
 /// When the record is purged, the sandbox's `sandbox_snapshot_inventory`
 /// rows go with it, through that table's foreign-key cascade.
 pub async fn clear_failed_observation(
-    conn: &mut sqlx::PgConnection,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "DELETE FROM sandbox_observed_states
           WHERE sandbox_id = $1 AND status = 'failed' AND pid IS NULL"
     ))
     .bind(sandbox_id)
-    .execute(conn)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -181,10 +178,10 @@ pub async fn clear_failed_observation(
 /// a sandbox with no `sandboxes` row or one active on `node_id`. A row
 /// already holding that authority is left as it is.
 pub async fn record_network_policy_authority(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     rows: &JsonValue,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(
         sql!("WITH input AS (
                  SELECT *
@@ -210,33 +207,33 @@ pub async fn record_network_policy_authority(
     )
     .bind(node_id)
     .bind(Json(rows))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
 
 /// The newest observed-row id; `None` when the table is empty.
-pub async fn newest(executor: impl sqlx::PgExecutor<'_>) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+pub async fn newest(executor: impl Executor<'_>) -> Result<Option<Uuid>, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT sandbox_id
              FROM sandbox_observed_states
              ORDER BY sandbox_id DESC
              LIMIT 1"
     ))
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Up to `limit` observed-row ids in `(after, through]`, ascending, from a
 /// primary-key range scan. The ordering is a resume position, not a fairness
 /// policy.
 pub async fn window(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     after: Uuid,
     through: Uuid,
     limit: i64,
-) -> Result<Vec<Uuid>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Vec<Uuid>, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT sandbox_id
              FROM sandbox_observed_states
              WHERE sandbox_id > $1
@@ -247,21 +244,19 @@ pub async fn window(
     .bind(after)
     .bind(through)
     .bind(limit)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The sandboxes nodes report that have no `sandboxes` row.
-pub async fn rowless_sandbox_ids(
-    executor: impl sqlx::PgExecutor<'_>,
-) -> Result<Vec<SandboxId>, sqlx::Error> {
-    sqlx::query_scalar::<_, SandboxId>(sql!(
+pub async fn rowless_sandbox_ids(executor: impl Executor<'_>) -> Result<Vec<SandboxId>, DbError> {
+    Ok(sqlx::query_scalar::<_, SandboxId>(sql!(
         "SELECT sos.sandbox_id
                  FROM sandbox_observed_states sos
                  WHERE NOT EXISTS (SELECT 1 FROM sandboxes s WHERE s.id = sos.sandbox_id)"
     ))
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The execution a sandbox's node last published, as evidence of what it
@@ -282,10 +277,10 @@ pub struct PublishedExecution {
 /// The execution `sandbox_id`'s node last published; `None` when nothing is
 /// published or the publish carried no execution.
 pub async fn last_published_execution(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<PublishedExecution>, sqlx::Error> {
-    sqlx::query_as::<_, PublishedExecution>(sql!(
+) -> Result<Option<PublishedExecution>, DbError> {
+    Ok(sqlx::query_as::<_, PublishedExecution>(sql!(
         "SELECT md5(concat_ws('/', s.lifecycle_changed_at::text, o.execution_metadata::text,
                                   o.runtime, o.runtime_version, o.state_format_name,
                                   o.state_format_version)) AS subject,
@@ -301,8 +296,8 @@ pub async fn last_published_execution(
                      OR o.state_format_version IS NOT NULL)"
     ))
     .bind(sandbox_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 #[cfg(test)]

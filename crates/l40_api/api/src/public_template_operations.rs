@@ -398,6 +398,7 @@ async fn nodes_with_template_inventory(
         SubstrateKind::Space,
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 async fn enqueue_template_delete_reconcile(

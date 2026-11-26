@@ -12,8 +12,8 @@ use pplx_space_accounts::NodeId;
 use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::FACET_NETWORK_POLICY;
+use sqlx::FromRow;
 use sqlx::types::Json;
-use sqlx::{FromRow, PgExecutor};
 
 /// One published template build the inventory accepted: its template has a
 /// `templates` row.
@@ -33,11 +33,11 @@ pub struct AcceptedTemplateBuild {
 /// templates and leaving unchanged rows unwritten, and report each accepted
 /// build.
 pub async fn upsert_published_templates(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     rows: &serde_json::Value,
-) -> Result<Vec<AcceptedTemplateBuild>, sqlx::Error> {
-    sqlx::query_as::<_, AcceptedTemplateBuild>(sql!(
+) -> Result<Vec<AcceptedTemplateBuild>, DbError> {
+    Ok(sqlx::query_as::<_, AcceptedTemplateBuild>(sql!(
         "WITH input AS (
              SELECT *
              FROM jsonb_to_recordset($2::jsonb) AS input(
@@ -246,17 +246,17 @@ pub async fn upsert_published_templates(
     ))
     .bind(node_id)
     .bind(Json(rows))
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Delete the components of the published builds that the publication no
 /// longer lists for them.
 pub async fn delete_unpublished_template_components(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     rows: &serde_json::Value,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "WITH scope AS (
              SELECT DISTINCT input.template_name, COALESCE(input.content_hash, '') AS content_hash
@@ -304,7 +304,7 @@ pub async fn delete_unpublished_template_components(
     ))
     .bind(node_id)
     .bind(Json(rows))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -312,10 +312,10 @@ pub async fn delete_unpublished_template_components(
 /// Upsert the components the publication lists for builds the node has an
 /// inventory row for, leaving unchanged rows unwritten.
 pub async fn upsert_published_template_components(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     rows: &serde_json::Value,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!("WITH input AS (
              SELECT *
              FROM jsonb_to_recordset($2::jsonb) AS input(
@@ -359,7 +359,7 @@ pub async fn upsert_published_template_components(
          )"))
     .bind(node_id)
     .bind(Json(rows))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }

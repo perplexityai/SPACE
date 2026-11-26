@@ -5,19 +5,19 @@
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use pplx_space_template_model::TemplateName;
-use sqlx::PgExecutor;
 
 /// The nodes whose inventory lists `template`, each once: those of every
 /// substrate other than `direct`, and `direct`'s whose `node_direct` row is
 /// live.
-pub async fn template_holder_ids<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn template_holder_ids(
+    executor: impl Executor<'_>,
     template: &TemplateName,
     direct: SubstrateKind,
-) -> Result<Vec<NodeId>, sqlx::Error> {
-    sqlx::query_scalar::<_, NodeId>(sql!(
+) -> Result<Vec<NodeId>, DbError> {
+    Ok(sqlx::query_scalar::<_, NodeId>(sql!(
         "SELECT DISTINCT nti.node_id
          FROM node_template_inventory nti
          JOIN nodes n ON n.id = nti.node_id
@@ -30,8 +30,8 @@ pub async fn template_holder_ids<'e>(
     ))
     .bind(template.as_str())
     .bind(direct)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 #[cfg(test)]

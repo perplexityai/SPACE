@@ -117,7 +117,9 @@ async fn fetch_template_variants(
         return Ok(Vec::new());
     }
 
-    pplx_space_node_template_inventory_store::template_variants(pool, template_names).await
+    pplx_space_node_template_inventory_store::template_variants(pool, template_names)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 fn public_templates(

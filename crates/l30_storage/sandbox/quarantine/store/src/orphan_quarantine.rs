@@ -7,6 +7,7 @@
 //! sandbox to `quarantined`, state first and history second.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{
     SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
     SandboxQuarantineReasonCode, SandboxQuarantineSource,
@@ -33,11 +34,11 @@ pub struct OrphanQuarantine<'a> {
 /// running it. A sandbox that already has an episode has it replaced: the
 /// schedule, attempt count, claim and last error start over.
 pub async fn upsert_state(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     quarantine: &OrphanQuarantine<'_>,
     from_lifecycle: SandboxLifecycle,
     last_observed_node_id: Option<NodeId>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "INSERT INTO sandbox_quarantine_state (sandbox_id,
              quarantine_id,
@@ -77,7 +78,7 @@ pub async fn upsert_state(
     .bind(Json(quarantine.evidence))
     .bind(quarantine.next_action.as_str())
     .bind(last_observed_node_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -85,11 +86,11 @@ pub async fn upsert_state(
 /// Record history event `history_id`, `action`, at now in episode
 /// `quarantine.quarantine_id`.
 pub async fn insert_history(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     quarantine: &OrphanQuarantine<'_>,
     history_id: Uuid,
     action: SandboxQuarantineHistoryAction,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "INSERT INTO sandbox_quarantine_history (id,
              quarantine_id,
@@ -112,7 +113,7 @@ pub async fn insert_history(
     .bind(quarantine.reason_message)
     .bind(quarantine.next_action.as_str())
     .bind(Json(quarantine.evidence))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }

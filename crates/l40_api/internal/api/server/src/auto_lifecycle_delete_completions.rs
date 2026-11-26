@@ -576,7 +576,7 @@ async fn apply_receipt(
 
     if from_lifecycle == SandboxLifecycle::Quarantined {
         let matching_orphan_quarantine = lock_orphan_quarantine_match(
-            tx,
+            &mut **tx,
             completion.sandbox_id,
             origin_node_id,
             SandboxQuarantineSource::ClusterController,
@@ -585,7 +585,8 @@ async fn apply_receipt(
                 SandboxQuarantineReasonCode::OrphanedExecutionLegacyDeletingState,
             ],
         )
-        .await;
+        .await
+        .map_err(sqlx::Error::from);
         let matching_orphan_quarantine = match matching_orphan_quarantine {
             Ok(matching) => matching.unwrap_or(false),
             Err(error) if is_lock_not_available(&error) => {
