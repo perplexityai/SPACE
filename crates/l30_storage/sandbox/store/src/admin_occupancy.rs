@@ -1099,8 +1099,8 @@ pub struct TerminateOccupancy {
 fn terminate_occupancy_for(residency: ResidencyEvidence) -> String {
     // `active` is `active_resident_predicate` for the node, census term
     // included, so this guard counts exactly the rows node-drain's
-    // `draining → drained` gate and `mark_terminating_query` count. The census
-    // term matters because this endpoint refuses on `active` and
+    // `draining → drained` gate and `drained_node::mark_terminating` count.
+    // The census term matters because this endpoint refuses on `active` and
     // `space-rollout-mng.py` drives it automatically: without it, a worker
     // whose own census disproves its phantom `active_node_id` rows would clear
     // the census-aware drain gate, reach `drained`, and then be refused here

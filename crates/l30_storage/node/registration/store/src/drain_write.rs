@@ -1,7 +1,7 @@
 //! Writes of a node's drain columns that check only its id. The caller decides
 //! what to write and holds whatever lock makes that decision current, such as
-//! the admin handlers' `FOR UPDATE` of the node's row; the phase
-//! compare-and-sets stay with their callers.
+//! the admin handlers' `FOR UPDATE` of the node's row; node drain's phase
+//! compare-and-sets (`set_drain_phase`) stay with their caller.
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::NodeDrainMode;

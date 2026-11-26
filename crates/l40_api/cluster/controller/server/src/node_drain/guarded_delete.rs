@@ -5,23 +5,25 @@
 //! ownership: a drain phase and fence, or none). [`delete_locked_node`] then
 //! deletes the row only while its Kubernetes identity is the one the caller
 //! read, its heartbeat is stale, and nothing names it
-//! ([`pplx_space_sandbox_store::drain_terminate::node_unreferenced`]). The
+//! ([`pplx_space_sandbox_residency::node_unreferenced`]). The
 //! exclusive lock holds a registration of a replacement off until the
 //! caller commits, or waits for one in flight and then reads what it
 //! committed; a moved uid or instance refuses.
 //!
-//! The statements are written here because no store owns `nodes`.
-
-use std::sync::LazyLock;
+//! The statements are `pplx_space_node_registration_store`'s: the locks in
+//! `locks`, and the heartbeat read and the delete in `guarded_delete`; the
+//! reference read is `pplx_space_sandbox_store::drain_terminate::node_references`. The
+//! order of the checks and what each outcome means are decided here.
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
-use pplx_space_sandbox_residency::node_heartbeat_fresh;
-use pplx_space_sandbox_store::drain_terminate::{
-    NodeReferences, node_references, node_unreferenced,
-};
-use pplx_space_sql_locator::sql;
+use pplx_space_node_registration_store::{guarded_delete, locks};
+use pplx_space_sandbox_store::drain_terminate::{NodeReferences, node_references};
 use sqlx::{Postgres, Transaction};
+
+/// Lock the node row `FOR UPDATE`. Returns whether it exists. The lock lasts
+/// until the caller's transaction ends.
+pub(crate) use locks::lock_node_for_update as lock_node;
 
 /// How many sandbox ids of each guard a refused delete names.
 pub(crate) const REFERENCE_SAMPLE: u32 = 10;
@@ -53,43 +55,6 @@ pub(crate) enum GuardedDelete {
     Referenced(NodeReferences),
 }
 
-/// `$1` = node id, `$2` = substrate, `$3` = the node's Kubernetes name. The
-/// delete, re-checking the stale heartbeat and that nothing names the node in
-/// the statement that deletes it.
-static DELETE_NODE: LazyLock<String> = LazyLock::new(|| {
-    let fresh = node_heartbeat_fresh("$1");
-    let unreferenced = node_unreferenced("$1", "$3");
-    sql!(
-        format!(
-            "DELETE FROM nodes n
-              WHERE n.id = $1
-                AND n.managed_by = $2
-                AND NOT {fresh}
-                AND {unreferenced}"
-        )
-        .as_str()
-    )
-});
-
-/// `$1` = node id. Whether the node's heartbeat is fresh.
-static HEARTBEAT_FRESH: LazyLock<String> = LazyLock::new(|| {
-    let fresh = node_heartbeat_fresh("$1");
-    sql!(format!("SELECT {fresh}").as_str())
-});
-
-/// Lock the node row `FOR UPDATE`. Returns whether it exists.
-pub(crate) async fn lock_node(
-    tx: &mut Transaction<'_, Postgres>,
-    node_id: NodeId,
-) -> Result<bool, sqlx::Error> {
-    let locked: Option<i32> =
-        sqlx::query_scalar(sql!("SELECT 1 FROM nodes WHERE id = $1 FOR UPDATE"))
-            .bind(node_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-    Ok(locked.is_some())
-}
-
 /// Delete the node row the caller locked with [`lock_node`], guarded as the
 /// module says. The caller commits on [`GuardedDelete::Deleted`]; nothing
 /// else wrote anything.
@@ -97,21 +62,12 @@ pub(crate) async fn delete_locked_node(
     tx: &mut Transaction<'_, Postgres>,
     node: &NodeIdentity<'_>,
 ) -> Result<GuardedDelete, sqlx::Error> {
-    let identity: Option<(Option<String>, Option<String>)> = sqlx::query_as(sql!(
-        "SELECT k8s_node_uid, instance_id FROM node_k8s WHERE node_id = $1 FOR SHARE"
-    ))
-    .bind(node.node_id)
-    .fetch_optional(&mut **tx)
-    .await?;
+    let identity = locks::share_lock_k8s_identity(tx, node.node_id).await?;
     let (uid, instance_id) = identity.unwrap_or_default();
     if uid.as_deref() != node.k8s_node_uid || instance_id.as_deref() != node.instance_id {
         return Ok(GuardedDelete::IdentityMoved);
     }
-    let fresh: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(HEARTBEAT_FRESH.as_str()))
-        .bind(node.node_id)
-        .fetch_one(&mut **tx)
-        .await?;
-    if fresh {
+    if guarded_delete::heartbeat_fresh(tx, node.node_id).await? {
         return Ok(GuardedDelete::HeartbeatFresh);
     }
     let references = node_references(
@@ -124,14 +80,14 @@ pub(crate) async fn delete_locked_node(
     if !references.is_empty() {
         return Ok(GuardedDelete::Referenced(references));
     }
-    let deleted = sqlx::query(sqlx::AssertSqlSafe(DELETE_NODE.as_str()))
-        .bind(node.node_id)
-        .bind(node.managed_by)
-        .bind(node.k8s_node_name)
-        .execute(&mut **tx)
-        .await?
-        .rows_affected();
-    if deleted == 1 {
+    if guarded_delete::delete_unreferenced_stale_node(
+        tx,
+        node.node_id,
+        node.managed_by,
+        node.k8s_node_name,
+    )
+    .await?
+    {
         return Ok(GuardedDelete::Deleted);
     }
     // The statement's own snapshot saw a reference, or the row went: read

@@ -111,8 +111,9 @@
 //!   it answers, such as [`restore_pod_owners`],
 //!   [`stale_suspended_executions`], [`stopped_replacements`],
 //!   [`placement_gate`] or [`template_usage`]
-//!   (node drain's are [`evacuation_candidates`], [`evacuation_restores`],
-//!   [`pinned_local_only`] and [`stopped_evacuations`]), and so does one
+//!   (node drain's are [`drain_evacuation`], [`evacuation_candidates`],
+//!   [`evacuation_restores`], [`pinned_local_only`], [`pod_less_giveup`] and
+//!   [`stopped_evacuations`]), and so does one
 //!   that joins the row to what it references, as [`row_reads::owner`]
 //!   (its organization) and [`debug_reads::record`] (its nodes) do.
 //!   The two restore-lease reads the Direct restore takes before and after
@@ -127,7 +128,12 @@
 //!   [`debug_reads::record`] joins `nodes` and `node_k8s`, which belong to
 //!   `pplx-space-node-registration-store`; [`stopped_evacuations`] reads
 //!   `nodes` too, and `snapshots`, which belongs to
-//!   `pplx-space-snapshot-store`.
+//!   `pplx-space-snapshot-store`. [`pod_less_giveup`], the give-up's
+//!   guards, reads `nodes`' drain columns, and `sandbox_observed_states`,
+//!   which belongs to `pplx-space-sandbox-teardown`; [`drain_evacuation`],
+//!   a v2 drain's evacuation record, reads `node_k8s` for the node's
+//!   Kubernetes name. Both read the snapshot tables through
+//!   `pplx-space-sandbox-portability`'s fragments.
 //!   [`org_storage`] joins the owning organization's row in `organizations`,
 //!   which no store owns yet, for its configured snapshot storage.
 //! * **The api's response row and list pages live in
@@ -232,6 +238,7 @@ pub mod deleted_rows;
 pub mod direct;
 pub mod drain;
 pub mod drain_admission;
+pub mod drain_evacuation;
 pub mod drain_gate_blockers;
 pub mod drain_terminate;
 pub mod ecw_credential_epochs;
@@ -253,6 +260,7 @@ pub mod org_storage;
 pub mod orphan;
 pub mod pinned_local_only;
 pub mod placement_gate;
+pub mod pod_less_giveup;
 pub mod pod_tracking;
 pub mod port_exposures;
 pub mod published_quarantine_candidates;

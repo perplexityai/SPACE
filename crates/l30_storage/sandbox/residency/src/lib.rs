@@ -73,6 +73,13 @@
 //! its recovery to `suspended` do use [`node_observes_sandbox`], to defer to a
 //! node whose report lands after that candidate listing; otherwise this
 //! module is the definition for node-release decisions.
+//!
+//! # What still names a node
+//!
+//! [`node_unreferenced`] is the stricter question node drain's guarded delete
+//! (`pplx_space_node_registration_store::guarded_delete::delete_unreferenced_stale_node`)
+//! asks before a v2 drain's terminate deletes the node's row: any row outside `failed` and `deleted` that names the node, and any active
+//! execution on its Kubernetes name, holds it, with no census discount.
 
 use pplx_space_sandbox_model::SandboxLifecycle;
 use std::time::Duration;
@@ -385,7 +392,7 @@ pub fn non_resident_lifecycle_exclusion(sandbox_alias: &str) -> String {
 /// destructive: the drained-node terminator's `drained → terminating` flip, the
 /// admin `POST :terminate` 409, and node-drain's pre-terminate recheck all
 /// refuse on a match, and the terminator's KubeNodeGone reap **deletes** the
-/// `nodes` row behind the same `resident_blocking_clause`. Two ungated readers
+/// `nodes` row behind the same resident guard. Two ungated readers
 /// refuse nothing at all — node-drain's per-lifecycle gauge and the terminator's
 /// refusal diagnosis (`pplx_space_node_registration_store::orphan_reap_refusal::diagnose`), which exist so an environment can measure
 /// this population before it holds anything on it. So neither "it refuses" nor
@@ -729,6 +736,37 @@ pub fn node_proves_sandbox_absent(sandbox_alias: &str, node_expr: &str) -> Strin
              AND {census_fresh}\n\
              AND {settled}\n\
              AND NOT {observed}\n\
+         )"
+    )
+}
+
+/// Boolean SQL fragment: TRUE iff nothing names the node `node_param` (a
+/// node id) with Kubernetes name `name_param`: no row outside `failed` and
+/// `deleted` whose `active_node_id` or `target_node_id` is the node, and no
+/// active execution on the name. A NULL name matches no execution. Both are
+/// placeholders or expressions of the caller's statement.
+/// `pplx_space_sandbox_store::drain_terminate::node_references` reads the
+/// same three guards.
+///
+/// Unlike the residency fragments above, it reads no census: it is a v2
+/// drain's require-empty check before the node's row goes, and any row that
+/// still names the node refuses it.
+pub fn node_unreferenced(node_param: &str, name_param: &str) -> String {
+    format!(
+        "NOT EXISTS (
+             SELECT 1 FROM sandboxes
+              WHERE active_node_id = {node_param}
+                AND lifecycle NOT IN ('failed', 'deleted')
+         )
+         AND NOT EXISTS (
+             SELECT 1 FROM sandboxes
+              WHERE target_node_id = {node_param}
+                AND lifecycle NOT IN ('failed', 'deleted')
+         )
+         AND NOT EXISTS (
+             SELECT 1 FROM sandbox_k8s_executions
+              WHERE active
+                AND k8s_node_name = {name_param}
          )"
     )
 }

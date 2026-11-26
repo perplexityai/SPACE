@@ -4,7 +4,7 @@
 use std::str::FromStr;
 
 use pplx_space_api::controllers::substrate::connect_internal_node_api_client_for_target;
-use pplx_space_sandbox_portability::fresh_ready_snapshot_exists;
+use pplx_space_sandbox_store::drain_evacuation::{self, V2EvacuationRow};
 use pplx_space_sbx_mgr_client::proto::{DrainEvacuated, DrainNodeRequest, DrainNodeResponse};
 use uuid::Uuid;
 
@@ -366,6 +366,8 @@ pub(crate) async fn record_v2_evacuated(
 /// verb a node's release of its local copy asks).
 ///
 /// A row that no longer needs anything is [`EvacuationRecord::Recorded`].
+///
+/// [`fresh_ready_snapshot_exists`]: pplx_space_sandbox_portability::fresh_ready_snapshot_exists
 pub(crate) async fn record_v2_evacuation(
     pool: &PgPool,
     node_id: NodeId,
@@ -373,25 +375,17 @@ pub(crate) async fn record_v2_evacuation(
     artifact: Uuid,
 ) -> Result<EvacuationRecord, String> {
     let sql_error = |error: sqlx::Error| error.to_string();
-    type Row = (String, Option<NodeId>, Option<NodeId>, Option<Uuid>, bool);
-    let row: Option<Row> = sqlx::query_as(sql!(
-        "SELECT s.lifecycle, s.active_node_id, s.target_node_id, s.current_local_artifact_id,
-                EXISTS (
-                  SELECT 1 FROM sandbox_k8s_executions e
-                   WHERE e.sandbox_id = s.id
-                     AND e.active
-                     AND e.k8s_node_name IS DISTINCT FROM
-                         (SELECT k8s_node_name FROM node_k8s WHERE node_id = $2)
-                )
-           FROM sandboxes s
-          WHERE s.id = $1"
-    ))
-    .bind(sandbox_id)
-    .bind(node_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(sql_error)?;
-    let Some((lifecycle, active_node_id, target_node_id, pin, executes_elsewhere)) = row else {
+    let row = drain_evacuation::v2_evacuation_row(pool, sandbox_id, node_id)
+        .await
+        .map_err(sql_error)?;
+    let Some(V2EvacuationRow {
+        lifecycle,
+        active_node_id,
+        target_node_id,
+        current_local_artifact_id: pin,
+        executes_elsewhere,
+    }) = row
+    else {
         return Ok(EvacuationRecord::Recorded);
     };
     let home = target_node_id.or(active_node_id);
@@ -451,13 +445,7 @@ pub(crate) async fn record_v2_evacuation(
                     .to_owned(),
             ));
         }
-        let fresh = format!(
-            "SELECT {} FROM sandboxes s WHERE s.id = $1",
-            fresh_ready_snapshot_exists("s")
-        );
-        let fresh: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(fresh.as_str())))
-            .bind(sandbox_id)
-            .fetch_one(pool)
+        let fresh = drain_evacuation::fresh_ready_full_snapshot(pool, sandbox_id)
             .await
             .map_err(sql_error)?;
         return Ok(if fresh {

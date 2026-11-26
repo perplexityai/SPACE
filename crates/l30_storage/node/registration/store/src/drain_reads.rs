@@ -2,7 +2,8 @@
 //! per-phase work lists and counts, the terminate re-read, the draining rows
 //! behind a Kubernetes node name, and the read before a terminating node's
 //! delete.
-//! The drain-phase compare-and-sets stay with their callers;
+//! Node drain's phase compare-and-sets (`set_drain_phase`) stay with their
+//! caller;
 //! [`crate::drain_write`] holds the writes that check only the node id.
 
 use pplx_space_accounts::NodeId;

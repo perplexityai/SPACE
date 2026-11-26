@@ -10,12 +10,12 @@
 //! driven here: the stopped evacuation's claim
 //! (`pplx_space_sandbox_store::drain::claim_stopped_evacuation`), whose
 //! claim also needs the sandbox's current disk backed up, and the pod-less
-//! give-up's row check (`pod_less_giveup::read_guards`), private to its
-//! module.
+//! give-up's row check (`pplx_space_sandbox_store::pod_less_giveup::read_guards`),
+//! a read whose `row_matches` carries the guard.
 
 use pplx_space_accounts::NodeId;
 use pplx_space_db_test_fixtures::try_pg_test_db;
-use pplx_space_node_model::{NodeDrainPhase, SubstrateKind};
+use pplx_space_node_model::NodeDrainPhase;
 use pplx_space_node_registration_store::drain_reads;
 use pplx_space_sandbox_residency::ResidencyEvidence;
 use pplx_space_sql_locator::sql;
@@ -27,9 +27,8 @@ use super::{
     set_drain_phase_query,
 };
 use crate::drained_node_terminator::DrainedNodeTerminatorSink as _;
-use crate::drained_node_terminator::store::{
-    NodeDbStore, delete_drained_node_if_orphan_query, mark_terminating_query,
-};
+use crate::drained_node_terminator::store::NodeDbStore;
+use pplx_space_node_registration_store::drained_node;
 
 const UID: &str = "uid-1";
 
@@ -205,24 +204,16 @@ impl Writer {
                 .await?
                 .contains(&node_id),
             Self::Reap => {
-                sqlx::query(sqlx::AssertSqlSafe(sql!(mark_terminating_query(
-                    ResidencyEvidence::default()
-                ))))
-                .bind(node_id)
-                .bind("terminating")
-                .bind("drained")
-                .execute(pool)
-                .await?;
+                drained_node::mark_terminating(pool, node_id, ResidencyEvidence::default()).await?;
                 phase(pool, node_id).await?.as_deref() == Some("terminating")
             }
             Self::OrphanDelete => {
-                sqlx::query(sqlx::AssertSqlSafe(sql!(
-                    delete_drained_node_if_orphan_query(ResidencyEvidence::default())
-                )))
-                .bind(node_id)
-                .bind(UID)
-                .bind(SubstrateKind::Kubernetes)
-                .execute(pool)
+                drained_node::delete_if_orphan(
+                    pool,
+                    node_id,
+                    Some(UID),
+                    ResidencyEvidence::default(),
+                )
                 .await?;
                 phase(pool, node_id).await?.is_none()
             }

@@ -4,8 +4,9 @@
 //!
 //! The give-up keeps its transaction and `lock_timeout`, its lock order (the
 //! node row shared, the sandbox row, then the executions in generation
-//! order), its guard re-reads under those locks, and the revert of the
-//! sandbox row that decides whether the retire runs.
+//! order), its guard re-reads under those locks
+//! ([`crate::pod_less_giveup::read_guards`], which reads the give-up's guards),
+//! and the revert of the sandbox row that decides whether the retire runs.
 
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;

@@ -16,6 +16,7 @@ enum Probe {
     NodeKeyShare,
     RegistrationUpdate,
     RegistrationNoKeyUpdate,
+    RegistrationShare,
 }
 
 /// Whether another transaction can take `probe` on `node_id`'s row now.
@@ -33,6 +34,9 @@ async fn acquirable(pool: &PgPool, probe: Probe, node_id: NodeId) -> TestDbResul
         }
         Probe::RegistrationNoKeyUpdate => {
             sql!("SELECT 1 FROM node_k8s WHERE node_id = $1 FOR NO KEY UPDATE NOWAIT")
+        }
+        Probe::RegistrationShare => {
+            sql!("SELECT 1 FROM node_k8s WHERE node_id = $1 FOR SHARE NOWAIT")
         }
     };
     let result = sqlx::query(statement)
@@ -87,16 +91,17 @@ async fn share_lock_node_holds_off_writers_until_the_transaction_ends() -> TestD
     Ok(())
 }
 
-/// The update lock holds off even a key-share lock until the transaction
-/// ends, and on a missing row succeeds having locked nothing.
+/// The update lock reports whether the row exists and holds off even a
+/// key-share lock until the transaction ends; on a missing row it locks
+/// nothing.
 #[tokio::test]
 async fn lock_node_for_update_holds_until_the_transaction_ends() -> TestDbResult<()> {
     let db = pg_test_db().await?;
     let node_id = node(&db.pool).await?;
 
     let mut tx = db.pool.begin().await?;
-    lock_node_for_update(&mut tx, NodeId::new()).await?;
-    lock_node_for_update(&mut tx, node_id).await?;
+    assert!(!lock_node_for_update(&mut tx, NodeId::new()).await?);
+    assert!(lock_node_for_update(&mut tx, node_id).await?);
     assert!(!acquirable(&db.pool, Probe::NodeKeyShare, node_id).await?);
     tx.rollback().await?;
 
@@ -221,5 +226,41 @@ async fn share_lock_k8s_registration_with_uid_matches_the_uid() -> TestDbResult<
             "{case}"
         );
     }
+    Ok(())
+}
+
+/// The identity lock reads the registration's uid and instance (`None`
+/// without a registration), admits other shared locks, and holds off the
+/// locks a registration's update takes until the transaction ends.
+#[tokio::test]
+async fn share_lock_k8s_identity_reads_and_holds_the_registration() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let registered = node(&db.pool).await?;
+    register(&db.pool, registered, Some("uid-1")).await?;
+    sqlx::query(sql!(
+        "UPDATE node_k8s SET instance_id = 'i-0000000000000a0a0' WHERE node_id = $1"
+    ))
+    .bind(registered)
+    .execute(&db.pool)
+    .await?;
+    let unregistered = node(&db.pool).await?;
+
+    let mut tx = db.pool.begin().await?;
+    assert_eq!(share_lock_k8s_identity(&mut tx, unregistered).await?, None);
+    assert_eq!(
+        share_lock_k8s_identity(&mut tx, registered).await?,
+        Some((
+            Some("uid-1".to_owned()),
+            Some("i-0000000000000a0a0".to_owned())
+        ))
+    );
+    assert!(acquirable(&db.pool, Probe::RegistrationShare, registered).await?);
+    assert!(!acquirable(&db.pool, Probe::RegistrationUpdate, registered).await?);
+    assert!(!acquirable(&db.pool, Probe::RegistrationNoKeyUpdate, registered).await?);
+    assert!(acquirable(&db.pool, Probe::NodeUpdate, registered).await?);
+    tx.commit().await?;
+
+    assert!(acquirable(&db.pool, Probe::RegistrationUpdate, registered).await?);
+    assert!(acquirable(&db.pool, Probe::RegistrationNoKeyUpdate, registered).await?);
     Ok(())
 }

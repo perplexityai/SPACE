@@ -1,5 +1,5 @@
 //! Postgres-backed coverage for the census term on the resident guard shared
-//! by `mark_terminating_query` and `delete_drained_node_if_orphan_query`.
+//! by `drained_node::mark_terminating` and `drained_node::delete_if_orphan`.
 //!
 //! The pairing with node-drain is the point. Node-drain's `draining → drained`
 //! gate discounts rows a node's own census proves absent; if this guard did not
@@ -20,9 +20,9 @@ use pplx_space_sandbox_residency::{CENSUS_INVENTORY_MAX_AGE, CENSUS_PLACEMENT_SE
 use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
-use pplx_space_node_registration_store::orphan_reap_refusal;
+use pplx_space_node_registration_store::{drained_node, orphan_reap_refusal};
 
-use super::{PHASE_DRAINED, PHASE_TERMINATING, ResidencyEvidence, mark_terminating_query};
+use super::ResidencyEvidence;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -147,14 +147,9 @@ async fn try_mark_terminating(
     node_id: NodeId,
     residency: ResidencyEvidence,
 ) -> TestResult<u64> {
-    let query = mark_terminating_query(residency);
-    Ok(sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(node_id)
-        .bind(PHASE_TERMINATING)
-        .bind(PHASE_DRAINED)
-        .execute(pool)
-        .await?
-        .rows_affected())
+    Ok(u64::from(
+        drained_node::mark_terminating(pool, node_id, residency).await?,
+    ))
 }
 
 /// A phantom `started` row on a node whose census does not list it must not

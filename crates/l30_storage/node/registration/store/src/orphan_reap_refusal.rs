@@ -1,8 +1,12 @@
 //! Why the drained-node terminator's guarded reap of a gone node's row
 //! matched nothing: each of its guards re-evaluated on its own.
 //!
-//! The reap itself, a guarded `DELETE` of `nodes`, stays with the terminator.
-//! This read runs after it refused, so it can race concurrent writes; it feeds
+//! The reap itself is [`crate::drained_node::delete_if_orphan`], a guarded
+//! `DELETE` of a `drained` v1 row. Its guards differ from the orphaned-nodes
+//! sweep's [`crate::orphaned_nodes::delete_if_orphan`], which deletes a row in
+//! no drain phase that no non-terminal sandbox names, and has neither the
+//! snapshot guard nor the resident guard counted here.
+//! This read runs after the reap refused, so it can race concurrent writes; it feeds
 //! logging, metrics and the give-up's pre-check, never a state change.
 
 use std::sync::LazyLock;

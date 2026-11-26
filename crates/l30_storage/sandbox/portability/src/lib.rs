@@ -337,8 +337,8 @@ pub fn snapshot_has_durable_copy(snapshot_alias: &str) -> String {
 /// rather than NULL, so a caller may safely negate it.
 ///
 /// **Only safe as a filter on an already-joined row.** `orphaned_nodes`
-/// deliberately does *not* use this shape: its comment
-/// (`orphaned_nodes/store.rs`) explains that driving a scan from
+/// deliberately does *not* use this shape: the docs of
+/// `pplx_space_node_registration_store::orphaned_nodes::candidates` explain that driving a scan from
 /// `(active_node_id = n.id OR target_node_id = n.id)` can make the planner
 /// BitmapOr both partial indexes and materialize every sandbox pinned to the
 /// node, so it splits the question into two `NOT EXISTS` probes. Use this

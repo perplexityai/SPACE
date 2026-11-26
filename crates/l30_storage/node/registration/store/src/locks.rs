@@ -48,6 +48,22 @@ pub async fn share_lock_k8s_registration_with_uid(
     Ok(uid.is_some())
 }
 
+/// Share-lock `node_id`'s `node_k8s` row and read its Kubernetes identity:
+/// `(k8s_node_uid, instance_id)`, `None` without a row. The lock lasts until
+/// the caller's transaction ends, holding off a registration that would
+/// move either.
+pub async fn share_lock_k8s_identity(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: NodeId,
+) -> Result<Option<(Option<String>, Option<String>)>, sqlx::Error> {
+    sqlx::query_as(sql!(
+        "SELECT k8s_node_uid, instance_id FROM node_k8s WHERE node_id = $1 FOR SHARE"
+    ))
+    .bind(node_id)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
 /// Share-lock `node_id`'s `nodes` row, and report whether it exists. The
 /// lock lasts until the caller's transaction ends; a missing row locks
 /// nothing, so a row inserted afterwards isn't fenced.
@@ -62,17 +78,18 @@ pub async fn share_lock_node(
     Ok(row.is_some())
 }
 
-/// Lock `node_id`'s `nodes` row `FOR UPDATE`, if it exists. The lock lasts
-/// until the caller's transaction ends.
+/// Lock `node_id`'s `nodes` row `FOR UPDATE`, and report whether it exists.
+/// The lock lasts until the caller's transaction ends; a missing row locks
+/// nothing.
 pub async fn lock_node_for_update(
     tx: &mut Transaction<'_, Postgres>,
     node_id: NodeId,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!("SELECT 1 FROM nodes WHERE id = $1 FOR UPDATE"))
+) -> Result<bool, sqlx::Error> {
+    let row: Option<i32> = sqlx::query_scalar(sql!("SELECT 1 FROM nodes WHERE id = $1 FOR UPDATE"))
         .bind(node_id)
-        .execute(&mut **tx)
+        .fetch_optional(&mut **tx)
         .await?;
-    Ok(())
+    Ok(row.is_some())
 }
 
 /// Lock `node_id`'s `nodes` row `FOR NO KEY UPDATE`, and report whether it
