@@ -930,23 +930,36 @@ class _MutatingControl(_Control):
         *,
         terminate_status: int = 200,
         scale_fails: bool = False,
-        drain_statuses: list[DrainV2Status | None] | None = None,
+        draining: bool = False,
+        cancel_answered: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.terminate_status = terminate_status
         self.scale_fails = scale_fails
-        self.drain_statuses = drain_statuses
+        # With `draining`, the node is mid-drain until it gets `:undrain`;
+        # the controller then clears its v2 columns once the node answers
+        # the cancel, which with `cancel_answered=False` it never does.
+        self.draining = draining
+        self.cancel_answered = cancel_answered
         self.calls: list[tuple[Any, ...]] = []
 
+    def _undrained(self) -> bool:
+        return ("undrain_node", NODE_ID) in self.calls
+
     def drain_v2_status(self, node_id: str) -> DrainV2Status | None:
-        if self.drain_statuses is None:
+        if not self.draining:
             return super().drain_v2_status(node_id)
-        answers = self.drain_statuses
-        return answers.pop(0) if len(answers) > 1 else answers[0]
+        if self._undrained() and self.cancel_answered:
+            return DrainV2Status(engine=None, status=None)
+        return DrainV2Status(engine="v2", status={"generation": 7})
 
     def admin_nodes(self) -> list[Any]:
-        return [type("Node", (), {"id": NODE_ID, "k8s_node_name": NODE, "drain_phase": None, "drain_last_error": None})()]
+        phase = "draining" if self.draining and not self._undrained() else None
+        return [type("Node", (), {"id": NODE_ID, "k8s_node_name": NODE, "drain_phase": phase, "drain_last_error": None})()]
+
+    def undrain_node(self, node_id: str) -> None:
+        self.calls.append(("undrain_node", node_id))
 
     def cordon_kube_node(self, node: str) -> None:
         self.calls.append(("cordon_kube_node", node))
@@ -1029,41 +1042,38 @@ class Compensations(unittest.TestCase):
 
 
 class UncordonGate(unittest.TestCase):
-    DRAINING = DrainV2Status(engine="v2", status={"generation": 7})
-    CLEARED = DrainV2Status(engine=None, status=None)
+    UNCORDON = ("uncordon_kube_node", NODE)
+    UNDRAIN = ("undrain_node", NODE_ID)
 
-    def _uncordons(self, control: _MutatingControl) -> int:
-        return control.calls.count(("uncordon_kube_node", NODE))
+    def _cleanup(self, control: _MutatingControl, *, cordon: bool = False) -> tuple[Any, ...]:
+        drain, scope = _scoped(control)
+        if cordon:
+            drain.cordon()
+        drain.drain_answer({"engine": "v2", "hold_seconds": 0})
+        with mock.patch.object(drain_v2, "CANCEL_SECONDS", 0.2):
+            return scope.close()
 
     def test_cleanup_uncordons_a_drained_worker_once_its_cancel_is_confirmed(self) -> None:
-        control = _MutatingControl(drain_statuses=[self.DRAINING, self.DRAINING, self.CLEARED])
-        drain, scope = _scoped(control)
-        drain.drain_answer({"engine": "v2", "hold_seconds": 0})
-        self.assertEqual(scope.close(), ())
-        self.assertEqual(self._uncordons(control), 1)
+        # The node is mid-drain; its columns clear only after the undrain.
+        control = _MutatingControl(draining=True)
+        self.assertEqual(self._cleanup(control), ())
+        self.assertEqual(control.calls.count(self.UNCORDON), 1)
+        self.assertLess(control.calls.index(self.UNDRAIN), control.calls.index(self.UNCORDON))
 
     def test_a_cancel_never_confirmed_leaves_the_worker_cordoned_and_named(self) -> None:
-        control = _MutatingControl(drain_statuses=[self.DRAINING])
-        drain, scope = _scoped(control)
-        drain.drain_answer({"engine": "v2", "hold_seconds": 0})
-        with mock.patch.object(drain_v2, "CANCEL_SECONDS", 0):
-            failures = scope.close()
+        control = _MutatingControl(draining=True, cancel_answered=False)
+        failures = self._cleanup(control)
         self.assertEqual([failure.name for failure in failures], [f"uncordon {NODE}"])
         self.assertIn(f"left {NODE} cordoned", failures[0].detail)
-        self.assertEqual(self._uncordons(control), 0)
+        self.assertIn(self.UNDRAIN, control.calls)
+        self.assertNotIn(self.UNCORDON, control.calls)
 
     def test_a_worker_the_run_cordoned_itself_is_uncordoned_only_through_the_gate(self) -> None:
-        for statuses, uncordons in (([self.DRAINING], 0), ([self.DRAINING, self.CLEARED], 1)):
-            with self.subTest(uncordons=uncordons):
-                control = _MutatingControl(drain_statuses=list(statuses))
-                drain, scope = _scoped(control)
-                drain.cordon()
-                drain.drain_answer({"engine": "v2", "hold_seconds": 0})
-                names = [compensation.name for compensation in scope._compensations]
-                self.assertEqual(names.count(f"uncordon {NODE}"), 1)
-                with mock.patch.object(drain_v2, "CANCEL_SECONDS", 0 if not uncordons else 60):
-                    scope.close()
-                self.assertEqual(self._uncordons(control), uncordons)
+        for answered, uncordons in ((False, 0), (True, 1)):
+            with self.subTest(cancel_answered=answered):
+                control = _MutatingControl(draining=True, cancel_answered=answered)
+                self._cleanup(control, cordon=True)
+                self.assertEqual(control.calls.count(self.UNCORDON), uncordons)
 
 
 class CleanFleet(unittest.TestCase):
