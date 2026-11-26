@@ -28,7 +28,7 @@ pub(super) enum OrgTemplateRows {
 /// [`pplx_space_sandbox_store::DELETED_SANDBOX_RETENTION`] for every tombstone
 /// kind.
 pub(super) async fn org_template_rows(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
     org_id: OrgId,
 ) -> Result<OrgTemplateRows, sqlx::Error> {
     let pplx_space_template_store::templates::OrgTemplates {

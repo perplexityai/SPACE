@@ -28,7 +28,7 @@ impl K8sStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         template_name: &str,
     ) -> Result<(), SubstrateError> {
-        pplx_space_template_store::templates::share_lock_if_present(tx, template_name)
+        pplx_space_template_store::templates::share_lock_if_present(&mut **tx, template_name)
             .await
             .db_context("failed to lock the template against twin inserts")?;
         Ok(())

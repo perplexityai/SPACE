@@ -472,7 +472,10 @@ pub async fn list_templates(
     if let Err(error) = require_template_admin(&state.pool, &actor).await {
         return error.into_response();
     }
-    match pplx_space_template_store::templates::list_admin(&state.pool, None).await {
+    match pplx_space_template_store::templates::list_admin(&state.pool, None)
+        .await
+        .map_err(sqlx::Error::from)
+    {
         Ok(rows) => {
             Json(rows.into_iter().map(template_response).collect::<Vec<_>>()).into_response()
         }
@@ -640,7 +643,7 @@ pub async fn update_template(
         let desired_state =
             pplx_space_template_store::templates::desired_state(&mut *tx, &template_name)
                 .await
-                .map_err(|error| (scope, error))?;
+                .map_err(|error| (scope, sqlx::Error::from(error)))?;
         let Some(desired_state) = desired_state else {
             return Ok(false);
         };
@@ -655,7 +658,7 @@ pub async fn update_template(
                 policy,
             )
             .await
-            .map_err(|error| (ContentionScope::Writing, error))?;
+            .map_err(|error| (ContentionScope::Writing, sqlx::Error::from(error)))?;
             scope = ContentionScope::Writing;
         }
 
@@ -667,7 +670,7 @@ pub async fn update_template(
                 expected_generation.map(|generation| generation as i64),
             )
             .await
-            .map_err(|error| (ContentionScope::Writing, error))?;
+            .map_err(|error| (ContentionScope::Writing, sqlx::Error::from(error)))?;
             scope = ContentionScope::Writing;
             if updated.is_none() {
                 return Ok(false);
@@ -681,7 +684,7 @@ pub async fn update_template(
                 description,
             )
             .await
-            .map_err(|error| (ContentionScope::Writing, error))?;
+            .map_err(|error| (ContentionScope::Writing, sqlx::Error::from(error)))?;
             scope = ContentionScope::Writing;
         }
 
@@ -818,6 +821,7 @@ pub async fn delete_template(
         &template_name,
     )
     .await
+    .map_err(sqlx::Error::from)
     {
         Ok(value) => value.map(|row| {
             (
@@ -1297,6 +1301,7 @@ async fn reject_deleted_template_build(
 ) -> Result<(), ApiErrorResponse> {
     let state = pplx_space_template_store::templates::desired_state(pool, template_name)
         .await
+        .map_err(sqlx::Error::from)
         .map_err(|error| {
             contention_response(ContentionScope::ReadOnly, &error).unwrap_or_else(|| {
                 tracing::error!(%error, template = template_name.as_str(), "failed to load template build state");
@@ -1982,6 +1987,7 @@ pub async fn list_template_builds(
     }
     match pplx_space_template_store::templates::exists_not_deleted(&state.pool, &template_name)
         .await
+        .map_err(sqlx::Error::from)
     {
         Ok(true) => {}
         Ok(false) => return api_error(StatusCode::NOT_FOUND, "Template not found").into_response(),
@@ -2248,7 +2254,7 @@ pub async fn tag_template_release(
         // The template row first, then the release, as `delete_template_release`
         // takes them, so a tag and a delete of one release queue rather than
         // deadlock.
-        pplx_space_template_store::templates::lock_no_key_update_of_release(&mut tx, release_id)
+        pplx_space_template_store::templates::lock_no_key_update_of_release(&mut *tx, release_id)
             .await?;
         let row = pplx_space_template_release_store::lookup::lock_release_of_present_template(
             &mut *tx, release_id,
@@ -2273,7 +2279,7 @@ pub async fn tag_template_release(
         // created between this read and the insert below has committed by the
         // time `DO NOTHING` reports it, so one more read finds and locks it.
         let mut previous = pplx_space_template_store::release_tags::current_release_locked(
-            &mut tx,
+            &mut *tx,
             &row.template_name,
             tag.as_str(),
         )
@@ -2320,7 +2326,7 @@ pub async fn tag_template_release(
                 return Ok(TagMove::Moved { row, previous });
             }
             previous = pplx_space_template_store::release_tags::current_release_locked(
-                &mut tx,
+                &mut *tx,
                 &row.template_name,
                 tag.as_str(),
             )
@@ -2463,7 +2469,10 @@ pub async fn delete_template_release_tag(
     if tag == TemplateTag::latest() {
         return api_error(StatusCode::BAD_REQUEST, "latest tag cannot be deleted").into_response();
     }
-    match pplx_space_template_store::release_tags::delete(&state.pool, release_id, &tag).await {
+    match pplx_space_template_store::release_tags::delete(&state.pool, release_id, &tag)
+        .await
+        .map_err(sqlx::Error::from)
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => contention_response(ContentionScope::Writing, &error)
             .unwrap_or_else(|| {
@@ -2499,7 +2508,7 @@ pub async fn delete_template_release(
         // that adds the release's first twin. `NO KEY UPDATE` still conflicts
         // with that lock, but not with the key-share locks node publications'
         // foreign-key checks take on the template row.
-        pplx_space_template_store::templates::lock_no_key_update_of_release(&mut tx, release_id)
+        pplx_space_template_store::templates::lock_no_key_update_of_release(&mut *tx, release_id)
             .await?;
         // A writer that predates the shared rule can tag the other
         // spelling's release without the template lock; its insert only
@@ -2627,6 +2636,7 @@ pub async fn get_base_snapshot_policy(
         &template_name,
     )
     .await
+    .map_err(sqlx::Error::from)
     {
         Ok(Some(row)) => Json(base_snapshot_policy_response(
             row.template,
@@ -2967,6 +2977,7 @@ pub async fn template_pool_status(
     }
     let policy = match pplx_space_template_store::pool_policies::get(&state.pool, &template_name)
         .await
+        .map_err(sqlx::Error::from)
     {
         Ok(policy) => policy,
         Err(error) => {

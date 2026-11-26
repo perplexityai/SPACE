@@ -10,39 +10,39 @@
 //! transaction compare against one instant.
 
 use pplx_space_accounts::{NodeId, OrgId, SystemPublicationGrantId, TenantPublicationGrantId};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use pplx_space_template_model::TemplateName;
-use sqlx::PgExecutor;
 use uuid::Uuid;
 
 /// Record `grant`, authorizing one build to publish `template` as a system
 /// template.
 pub async fn insert_system(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     grant: SystemPublicationGrantId,
     template: &TemplateName,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "INSERT INTO template_system_publication_grants (id, template_name)
              VALUES ($1, $2)"
     ))
     .bind(grant.as_uuid())
     .bind(template.as_str())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
 
 /// Withdraw `grant`, if it is still recorded.
 pub async fn delete_system(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     grant: SystemPublicationGrantId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "DELETE FROM template_system_publication_grants WHERE id = $1"
     ))
     .bind(grant.as_uuid())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -50,11 +50,11 @@ pub async fn delete_system(
 /// Record `grant`, authorizing one build to publish `template` for
 /// `org_id`.
 pub async fn insert_tenant(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     grant: TenantPublicationGrantId,
     template: &TemplateName,
     org_id: OrgId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "INSERT INTO template_tenant_publication_grants (id, template_name, org_id)
              VALUES ($1, $2, $3)"
@@ -62,21 +62,21 @@ pub async fn insert_tenant(
     .bind(grant.as_uuid())
     .bind(template.as_str())
     .bind(org_id.as_uuid())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
 
 /// Withdraw `grant`, if it is still recorded.
 pub async fn delete_tenant(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     grant: TenantPublicationGrantId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "DELETE FROM template_tenant_publication_grants WHERE id = $1"
     ))
     .bind(grant.as_uuid())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -84,10 +84,10 @@ pub async fn delete_tenant(
 /// Bind `grant` to the builder that accepted its build, the only builder
 /// that may use it from then on.
 pub async fn pin_tenant_to_builder(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     grant: TenantPublicationGrantId,
     builder_node_id: NodeId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE template_tenant_publication_grants
              SET builder_node_id = $2
@@ -95,19 +95,19 @@ pub async fn pin_tenant_to_builder(
     ))
     .bind(grant.as_uuid())
     .bind(builder_node_id.as_uuid())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
 
 /// Delete every system grant recorded more than seven days before the
 /// database's `NOW()`, after which none is fresh.
-pub async fn delete_expired_system(executor: impl PgExecutor<'_>) -> Result<(), sqlx::Error> {
+pub async fn delete_expired_system(executor: impl Executor<'_>) -> Result<(), DbError> {
     sqlx::query(sql!(
         "DELETE FROM template_system_publication_grants
              WHERE granted_at < NOW() - INTERVAL '7 days'"
     ))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -116,13 +116,13 @@ pub async fn delete_expired_system(executor: impl PgExecutor<'_>) -> Result<(), 
 /// its SQL text, kept as its own verb so the operator grant issue runs its
 /// statement unchanged apart from the `sql!` locator. Change the two together.
 pub async fn delete_expired_system_before_issue(
-    executor: impl PgExecutor<'_>,
-) -> Result<(), sqlx::Error> {
+    executor: impl Executor<'_>,
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "DELETE FROM template_system_publication_grants
         WHERE granted_at < NOW() - INTERVAL '7 days'"
     ))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -130,11 +130,11 @@ pub async fn delete_expired_system_before_issue(
 /// Whether `grant` names `template` and was recorded less than seven days
 /// before the database's `NOW()`.
 pub async fn system_grant_covers(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &TemplateName,
     grant: SystemPublicationGrantId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT EXISTS (
              SELECT 1 FROM template_system_publication_grants
              WHERE id = $1 AND template_name = $2
@@ -142,8 +142,8 @@ pub async fn system_grant_covers(
     ))
     .bind(grant)
     .bind(template.as_str())
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Consume `grant` under the conditions [`system_grant_covers`] checks.
@@ -151,10 +151,10 @@ pub async fn system_grant_covers(
 /// or is gone), which leaves every grant in place. Concurrent consumers of
 /// one grant commit at most once.
 pub async fn consume_system(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &TemplateName,
     grant: SystemPublicationGrantId,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let consumed = sqlx::query_scalar::<_, Uuid>(sql!(
         "DELETE FROM template_system_publication_grants
          WHERE id = $1 AND template_name = $2
@@ -163,19 +163,19 @@ pub async fn consume_system(
     ))
     .bind(grant)
     .bind(template.as_str())
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(consumed.is_some())
 }
 
 /// Delete every tenant grant recorded more than seven days before the
 /// database's `NOW()`, the longest validity any reader honours.
-pub async fn delete_expired_tenant(executor: impl PgExecutor<'_>) -> Result<(), sqlx::Error> {
+pub async fn delete_expired_tenant(executor: impl Executor<'_>) -> Result<(), DbError> {
     sqlx::query(sql!(
         "DELETE FROM template_tenant_publication_grants
              WHERE granted_at < NOW() - INTERVAL '7 days'"
     ))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -196,10 +196,10 @@ pub struct TenantPublication<'a> {
 /// `NOW()`: the pinned builder for seven days, or, while none is pinned,
 /// any builder for one hour.
 pub async fn tenant_grant_covers(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     publication: &TenantPublication<'_>,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT EXISTS (
              SELECT 1
              FROM template_tenant_publication_grants g
@@ -215,8 +215,8 @@ pub async fn tenant_grant_covers(
     .bind(publication.template.as_str())
     .bind(publication.org_id.as_uuid())
     .bind(publication.caller_nodes)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Consume `publication`'s grant under the conditions
@@ -224,9 +224,9 @@ pub async fn tenant_grant_covers(
 /// it, which leaves every grant in place. Concurrent consumers of one grant
 /// commit at most once.
 pub async fn consume_tenant(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     publication: &TenantPublication<'_>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let consumed = sqlx::query_scalar::<_, Uuid>(sql!(
         "DELETE FROM template_tenant_publication_grants g
          WHERE g.id = $1 AND g.template_name = $2 AND g.org_id = $3
@@ -244,7 +244,7 @@ pub async fn consume_tenant(
     .bind(publication.template.as_str())
     .bind(publication.org_id.as_uuid())
     .bind(publication.caller_nodes)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(consumed.is_some())
 }

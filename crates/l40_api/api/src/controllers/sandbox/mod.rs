@@ -263,7 +263,12 @@ pub(crate) async fn gate_template_access(
         desired_state,
     }) = pplx_space_template_store::templates::access(pool, template_name)
         .await
-        .map_err(|err| db_contention_error("failed to load template for authorization", &err))?
+        .map_err(|err| {
+            db_contention_error(
+                "failed to load template for authorization",
+                &sqlx::Error::from(err),
+            )
+        })?
     else {
         return Ok(TemplateAccess::Absent);
     };
@@ -507,7 +512,12 @@ async fn load_create_template_defaults(
     let (network_policy, network_policy_generation) =
         pplx_space_template_store::templates::present_network_policy(pool, template_name)
             .await
-            .map_err(|err| db_contention_error("failed to load template network policy", &err))?
+            .map_err(|err| {
+                db_contention_error(
+                    "failed to load template network policy",
+                    &sqlx::Error::from(err),
+                )
+            })?
             .map(|row| (row.network_policy_json, row.network_policy_generation))
             .unwrap_or_else(|| (sqlx::types::Json(NetworkPolicyV1::deny_all()), 0));
 
@@ -519,7 +529,12 @@ async fn load_create_template_defaults(
             runtime,
         )
         .await
-        .map_err(|err| db_contention_error("failed to load template auto lifecycle", &err))?;
+        .map_err(|err| {
+            db_contention_error(
+                "failed to load template auto lifecycle",
+                &sqlx::Error::from(err),
+            )
+        })?;
 
     Ok(CreateTemplateDefaults {
         network_policy,

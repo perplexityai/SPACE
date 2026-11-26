@@ -385,6 +385,7 @@ async fn mark_template_deleting(
         operation.id.as_uuid(),
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 async fn nodes_with_template_inventory(
@@ -432,7 +433,7 @@ pub(crate) async fn mark_template_deleted(
     // storage location this transaction deleted, while this one waits on
     // that delete's tag row. `NO KEY UPDATE` is the lock the final update
     // takes anyway, and doesn't conflict with foreign-key checks.
-    pplx_space_template_store::templates::lock_no_key_update(&mut tx, template).await?;
+    pplx_space_template_store::templates::lock_no_key_update(&mut *tx, template).await?;
     if let Some(in_use) = TemplateInUse::check(&mut tx, template).await? {
         return Ok(MarkTemplateDeleted::InUse(in_use));
     }

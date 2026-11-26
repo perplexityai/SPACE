@@ -535,14 +535,16 @@ pub(super) async fn twin_tags(
         .strip_prefix("sha256:")
         .unwrap_or(&original.hash);
     let rows = pplx_space_template_store::release_tags::share_lock_tags_of_digest(
-        tx,
+        &mut **tx,
         &original.template_name,
         tags,
         &original.hash,
         bare_hash,
     )
     .await
-    .map_err(|err| crate::template_publication::storage_status("check twin tags", &err))?;
+    .map_err(|err| {
+        crate::template_publication::storage_status("check twin tags", &sqlx::Error::from(err))
+    })?;
     match tags
         .iter()
         .find(|tag| !rows.iter().any(|row| &row.tag == *tag))
