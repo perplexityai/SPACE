@@ -890,7 +890,12 @@ async fn load_tcp_sandbox_port_exposure(
     pplx_space_sandbox_store::port_exposures::get_tcp(pool, sandbox_id, port as i32)
         .await
         .map(|exposure| exposure.map(SandboxPortExposure::from))
-        .map_err(|err| db_contention_error("failed to load sandbox port exposure", &err))
+        .map_err(|err| {
+            db_contention_error(
+                "failed to load sandbox port exposure",
+                &sqlx::Error::from(err),
+            )
+        })
 }
 
 async fn mark_sandbox_port_exposure_applied(
@@ -908,7 +913,12 @@ async fn mark_sandbox_port_exposure_applied(
         observation.as_bridge_observation(),
     )
     .await
-    .map_err(|err| db_contention_error("failed to mark sandbox port exposure applied", &err))?
+    .map_err(|err| {
+        db_contention_error(
+            "failed to mark sandbox port exposure applied",
+            &sqlx::Error::from(err),
+        )
+    })?
     .map(SandboxPortExposure::from)
     .ok_or_else(|| ControllerError::conflict("sandbox port exposure is no longer open"))
 }

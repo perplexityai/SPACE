@@ -2,6 +2,7 @@
 //! quarantine projection may still move.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::Executor;
 use pplx_space_sql_locator::sql;
 use sqlx::types::{Json, JsonValue};
 use uuid::Uuid;
@@ -30,7 +31,7 @@ pub struct PublishedQuarantineCandidate {
 /// [`crate::ingest::mark_published_quarantined`], re-checks the row, and the
 /// caller keeps only the ids it moved.
 pub async fn list(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     inputs: Json<JsonValue>,
 ) -> Result<Vec<PublishedQuarantineCandidate>, SandboxStoreError> {
@@ -57,6 +58,6 @@ pub async fn list(
     ))
     .bind(node_id)
     .bind(inputs)
-    .fetch_all(executor)
+    .fetch_all(executor.into_sqlx())
     .await?)
 }

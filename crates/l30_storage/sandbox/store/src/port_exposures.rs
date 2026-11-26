@@ -23,9 +23,9 @@
 //! that tells the node what to apply.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 use time::OffsetDateTime;
 
 /// One `sandbox_port_exposures` row, as the open and close upserts return it.
@@ -51,14 +51,14 @@ pub struct PortExposureRecord {
 /// `source` (an intent), queueing it for the node to apply. An existing row
 /// keeps its last-applied observation; only its error is cleared.
 pub async fn upsert_open(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     protocol: &str,
     guest_port: i32,
     visibility: &str,
     source: &str,
-) -> Result<PortExposureRecord, sqlx::Error> {
-    sqlx::query_as::<_, PortExposureRecord>(sql!(
+) -> Result<PortExposureRecord, DbError> {
+    Ok(sqlx::query_as::<_, PortExposureRecord>(sql!(
         "INSERT INTO sandbox_port_exposures (
              sandbox_id,
              protocol,
@@ -98,20 +98,20 @@ pub async fn upsert_open(
     .bind(guest_port)
     .bind(visibility)
     .bind(source)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Record that `protocol`/`guest_port` should be closed (an intent), queueing
 /// it for the node to apply. A port never opened gets a `private`, `api` row
 /// so the close is still applied.
 pub async fn upsert_closed(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     protocol: &str,
     guest_port: i32,
-) -> Result<PortExposureRecord, sqlx::Error> {
-    sqlx::query_as::<_, PortExposureRecord>(sql!(
+) -> Result<PortExposureRecord, DbError> {
+    Ok(sqlx::query_as::<_, PortExposureRecord>(sql!(
         "INSERT INTO sandbox_port_exposures (
              sandbox_id,
              protocol,
@@ -147,8 +147,8 @@ pub async fn upsert_closed(
     .bind(sandbox_id)
     .bind(protocol)
     .bind(guest_port)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// What a node reported about an exposure's in-guest bridge when it applied
@@ -168,13 +168,13 @@ pub struct BridgeObservation<'a> {
 /// Guarded by `desired_state = 'open'`: a close that landed while the node
 /// was applying the open wins.
 pub async fn mark_applied(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     guest_port: i32,
     node_id: NodeId,
     observation: BridgeObservation<'_>,
-) -> Result<Option<PortExposureRecord>, sqlx::Error> {
-    sqlx::query_as::<_, PortExposureRecord>(sql!(
+) -> Result<Option<PortExposureRecord>, DbError> {
+    Ok(sqlx::query_as::<_, PortExposureRecord>(sql!(
         "UPDATE sandbox_port_exposures
          SET apply_state = 'applied',
              last_applied_node_id = $3,
@@ -207,8 +207,8 @@ pub async fn mark_applied(
     .bind(node_id)
     .bind(observation.bridge_status)
     .bind(observation.service_generation)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Observed projection: records that applying the open TCP exposure of
@@ -222,14 +222,14 @@ pub async fn mark_applied(
 /// `loopback_forwarded`) observed at most `freshness_secs` ago: a fresh
 /// success there wins over this failure.
 pub async fn mark_failed(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     guest_port: i32,
     node_id: NodeId,
     error: &str,
     observation: Option<BridgeObservation<'_>>,
     freshness_secs: i64,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "UPDATE sandbox_port_exposures
          SET apply_state = 'failed',
@@ -258,7 +258,7 @@ pub async fn mark_failed(
     .bind(observation.map(|observation| observation.bridge_status))
     .bind(observation.and_then(|observation| observation.service_generation))
     .bind(freshness_secs)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -267,11 +267,11 @@ pub async fn mark_failed(
 /// proxy failed to reach it, recording `reason` as its error and queueing it
 /// to be applied again. Returns whether an open exposure matched.
 pub async fn invalidate_open_tcp_exposure_after_proxy_failure(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     guest_port: i32,
     reason: &str,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "UPDATE sandbox_port_exposures
          SET apply_state = 'pending',
@@ -289,7 +289,7 @@ pub async fn invalidate_open_tcp_exposure_after_proxy_failure(
     .bind(sandbox_id)
     .bind(guest_port)
     .bind(reason)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -305,9 +305,9 @@ pub async fn invalidate_open_tcp_exposure_after_proxy_failure(
 /// of their own, so change them together.
 /// [`crate::lost::write_off_lost_sandboxes`] leaves exposures alone.
 pub async fn invalidate_open_observations(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE sandbox_port_exposures
          SET apply_state = 'pending',
@@ -321,17 +321,17 @@ pub async fn invalidate_open_observations(
            AND desired_state = 'open'"
     ))
     .bind(sandbox_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
 
 /// Every port exposure of `sandbox_id`, by guest port then protocol.
 pub async fn list(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Vec<PortExposureRecord>, sqlx::Error> {
-    sqlx::query_as::<_, PortExposureRecord>(sql!(
+) -> Result<Vec<PortExposureRecord>, DbError> {
+    Ok(sqlx::query_as::<_, PortExposureRecord>(sql!(
         "SELECT sandbox_id,
                     protocol,
                     guest_port,
@@ -351,17 +351,17 @@ pub async fn list(
              ORDER BY guest_port ASC, protocol ASC"
     ))
     .bind(sandbox_id)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The exposures of `sandbox_id` whose desired state is `open`, by guest port
 /// then protocol.
 pub async fn list_open(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Vec<PortExposureRecord>, sqlx::Error> {
-    sqlx::query_as::<_, PortExposureRecord>(sql!(
+) -> Result<Vec<PortExposureRecord>, DbError> {
+    Ok(sqlx::query_as::<_, PortExposureRecord>(sql!(
         "SELECT sandbox_id,
                     protocol,
                     guest_port,
@@ -382,18 +382,18 @@ pub async fn list_open(
              ORDER BY guest_port ASC, protocol ASC"
     ))
     .bind(sandbox_id)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The TCP exposure of `guest_port` on `sandbox_id`, in any desired state;
 /// `None` when there is none.
 pub async fn get_tcp(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     guest_port: i32,
-) -> Result<Option<PortExposureRecord>, sqlx::Error> {
-    sqlx::query_as::<_, PortExposureRecord>(sql!(
+) -> Result<Option<PortExposureRecord>, DbError> {
+    Ok(sqlx::query_as::<_, PortExposureRecord>(sql!(
         "SELECT sandbox_id,
                     protocol,
                     guest_port,
@@ -415,34 +415,31 @@ pub async fn get_tcp(
     ))
     .bind(sandbox_id)
     .bind(guest_port)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether any exposure of `sandbox_id` wants to be open.
-pub async fn any_open(
-    executor: impl sqlx::PgExecutor<'_>,
-    sandbox_id: SandboxId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
+pub async fn any_open(executor: impl Executor<'_>, sandbox_id: SandboxId) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
         "SELECT EXISTS (
              SELECT 1 FROM sandbox_port_exposures
              WHERE sandbox_id = $1 AND desired_state = 'open'
          )"
     ))
     .bind(sandbox_id)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether `sandbox_id` already wants `protocol`/`guest_port` open.
 pub async fn open_exists(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     protocol: &str,
     guest_port: i32,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
         "SELECT EXISTS (
                  SELECT 1 FROM sandbox_port_exposures
                  WHERE sandbox_id = $1
@@ -454,20 +451,20 @@ pub async fn open_exists(
     .bind(sandbox_id)
     .bind(protocol)
     .bind(guest_port)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// How many exposures of `sandbox_id` other than `protocol`/`guest_port` want
 /// to be open: the slots the capacity check counts against an open of that
 /// port.
 pub async fn count_other_open(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     protocol: &str,
     guest_port: i32,
-) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>(sql!(
+) -> Result<i64, DbError> {
+    Ok(sqlx::query_scalar::<_, i64>(sql!(
         "SELECT COUNT(*)
              FROM sandbox_port_exposures
              WHERE sandbox_id = $1
@@ -477,8 +474,8 @@ pub async fn count_other_open(
     .bind(sandbox_id)
     .bind(protocol)
     .bind(guest_port)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// One exposure a node is asked to apply: its port and desired state.
@@ -496,11 +493,11 @@ pub struct PortExposureToApply {
 /// node's last observation of it is missing, unhealthy, more than 60 seconds
 /// old on the database clock, or from another node.
 pub async fn to_apply_on_node(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_ids: &[SandboxId],
     node_id: NodeId,
-) -> Result<Vec<PortExposureToApply>, sqlx::Error> {
-    sqlx::query_as::<_, PortExposureToApply>(sql!(
+) -> Result<Vec<PortExposureToApply>, DbError> {
+    Ok(sqlx::query_as::<_, PortExposureToApply>(sql!(
         "SELECT spe.sandbox_id,
                     spe.protocol,
                     spe.guest_port,
@@ -529,8 +526,8 @@ pub async fn to_apply_on_node(
     ))
     .bind(sandbox_ids)
     .bind(node_id)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// What a node reports it applied for one exposure.
@@ -564,10 +561,10 @@ pub struct MissedApplyState {
 /// keeps the stored one. Returns the reports that matched no such exposure,
 /// the ones naming a sandbox placed elsewhere included; none is an error.
 pub async fn record_apply_states(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     reports: &[ApplyStateReport<'_>],
-) -> Result<Vec<MissedApplyState>, sqlx::Error> {
+) -> Result<Vec<MissedApplyState>, DbError> {
     let sandbox_ids = reports
         .iter()
         .map(|report| report.sandbox_id.as_uuid())
@@ -596,7 +593,7 @@ pub async fn record_apply_states(
         .iter()
         .map(|report| report.service_generation)
         .collect::<Vec<_>>();
-    sqlx::query_as::<_, MissedApplyState>(sql!(
+    Ok(sqlx::query_as::<_, MissedApplyState>(sql!(
         "WITH input AS (
                  SELECT *
                  FROM UNNEST(
@@ -654,6 +651,6 @@ pub async fn record_apply_states(
     .bind(node_id)
     .bind(bridge_statuses)
     .bind(service_generations)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }

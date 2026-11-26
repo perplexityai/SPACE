@@ -14,6 +14,7 @@ use pplx_space_node_model::SubstrateKind;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use uuid::Uuid;
 
@@ -42,14 +43,14 @@ pub struct Candidate {
 ///
 /// Pages after `after`, or reads only `only`, in id order, up to `limit`
 /// rows of the `managed_by` substrate.
-pub async fn list<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
+pub async fn list(
+    executor: impl Executor<'_>,
     after: Option<SandboxId>,
     only: Option<SandboxId>,
     limit: i64,
     managed_by: SubstrateKind,
-) -> Result<Vec<Candidate>, sqlx::Error> {
-    sqlx::query_as(sql!(
+) -> Result<Vec<Candidate>, DbError> {
+    Ok(sqlx::query_as(sql!(
         "SELECT s.id AS sandbox_id, q.quarantine_id, s.active_node_id AS node_id,
                 n.k8s_node_name AS node_name, e.id AS execution_id, e.generation,
                 e.pod_name, e.pod_namespace, e.pod_uid,
@@ -100,6 +101,6 @@ pub async fn list<'e>(
     .bind(only)
     .bind(limit)
     .bind(managed_by)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }

@@ -37,7 +37,7 @@ pub async fn advance_sandbox_ecw_credential_epoch(
             Json(serde_json::json!({"error": "Sandbox not found"})),
         )
             .into_response(),
-        Err(error) => db_error(&error, sandbox_id),
+        Err(error) => db_error(&sqlx::Error::from(error), sandbox_id),
     }
 }
 

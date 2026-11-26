@@ -8,8 +8,8 @@
 use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_model::SandboxId;
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::PgConnection;
 use sqlx::types::{Json, JsonValue};
 
 /// The receipt's authority columns of the locked row.
@@ -26,13 +26,17 @@ pub struct CompletionAuthorityRow {
 /// Lock the sandbox's row `FOR UPDATE OF s NOWAIT` and read the receipt's
 /// authority columns; `None` when the row is absent. Fails at once with
 /// `lock_not_available` when another transaction holds the row. The lock
-/// lasts until the caller's transaction ends.
-pub async fn lock_completion_authority(
-    conn: &mut PgConnection,
+/// lasts until the caller's transaction ends. The caller must pass its open
+/// transaction.
+pub async fn lock_completion_authority<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     ownership_grace_secs: f64,
-) -> Result<Option<CompletionAuthorityRow>, sqlx::Error> {
-    sqlx::query_as::<_, CompletionAuthorityRow>(sql!(
+) -> Result<Option<CompletionAuthorityRow>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_as::<_, CompletionAuthorityRow>(sql!(
         "SELECT s.lifecycle,
                 s.auto_lifecycle_json,
                 s.active_node_id,
@@ -44,6 +48,6 @@ pub async fn lock_completion_authority(
     ))
     .bind(sandbox_id)
     .bind(ownership_grace_secs)
-    .fetch_optional(conn)
-    .await
+    .fetch_optional(tx.into_sqlx())
+    .await?)
 }
