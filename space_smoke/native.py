@@ -164,6 +164,33 @@ class NativeSandboxFactory:
             raise
         return sandbox
 
+    def sandboxes_labelled(
+        self, key: str, value: str, *, limit: int = 100, max_pages: int = 50
+    ) -> list[DurableLifecycleSandbox]:
+        """The caller's sandboxes whose metadata sets `key` to `value`, read
+        from the list: how cleanup finds a sandbox it labelled before its
+        create answered, or that it never heard of."""
+
+        found: list[DurableLifecycleSandbox] = []
+        cursor: str | None = None
+        for _ in range(max_pages):
+            query = {"limit": str(limit)}
+            if cursor is not None:
+                query["cursor"] = cursor
+            response = self._json_request("GET", f"/v1/sandboxes?{urlencode(query)}", expected_status=200)
+            data = response.get("data")
+            if not isinstance(data, list):
+                raise TypeError("Native sandbox page field 'data' was not an array")
+            for index, item in enumerate(data):
+                entry = _page_item(item, index)
+                metadata = entry.get("metadata")
+                if isinstance(metadata, Mapping) and metadata.get(key) == value:
+                    found.append(_NativeSandbox(self, _required_string(entry, "id")))
+            cursor = _optional_string(response, "next_cursor")
+            if cursor is None:
+                return found
+        raise RuntimeError(f"more than {max_pages} pages of sandboxes to search for {key}={value}")
+
     def delete(self, sandbox: CommandSandbox) -> None:
         deadline = time.monotonic() + self._config.ready_timeout_seconds
         while True:

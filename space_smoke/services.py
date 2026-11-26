@@ -552,26 +552,35 @@ class SmokeServices:
             idle_timeout: str | None = None,
             auto_lifecycle: Mapping[str, object] | None = None,
         ) -> DurableLifecycleSandbox:
-            # Its delete is armed as soon as the API accepts the create, before
-            # the wait for it to run, so a create interrupted on a
-            # `run_concurrently` worker still leaves its sandbox to cleanup.
-            # Native create also deletes a sandbox whose wait failed.
-            def own(created: DurableLifecycleSandbox) -> None:
-                context.scope.defer(
-                    f"delete Native sandbox {created.sandbox_id}",
-                    partial(native.delete, created),
-                    critical=True,
-                )
+            # Its delete is armed before the request, keyed on the label the
+            # create carries, so cleanup owns it however the create ends: by
+            # the id once the API accepts it, else by finding the label. A
+            # create interrupted on a `run_concurrently` worker, even one whose
+            # answer arrives only after cleanup has run this, is found as long
+            # as the API stored it first. Native create also deletes a sandbox
+            # whose wait failed.
+            instance = uuid.uuid4().hex
+            accepted: list[DurableLifecycleSandbox] = []
 
-            return cast(
+            def delete_created() -> None:
+                for sandbox in accepted or native.sandboxes_labelled("space_smoke_instance", instance):
+                    native.delete(sandbox)
+
+            context.scope.defer(
+                f"delete the Native sandbox labelled space_smoke_instance={instance}",
+                delete_created,
+                critical=True,
+            )
+            created = cast(
                 DurableLifecycleSandbox,
                 native.create(
-                    {**run_metadata, "space_smoke_instance": uuid.uuid4().hex},
+                    {**run_metadata, "space_smoke_instance": instance},
                     idle_timeout=idle_timeout,
                     auto_lifecycle=auto_lifecycle,
-                    accepted=own,
+                    accepted=accepted.append,
                 ),
             )
+            return created
 
         return CommandSandboxFixture(
             context,

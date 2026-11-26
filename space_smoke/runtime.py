@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -316,10 +316,10 @@ _EVIDENCE_SINK: contextvars.ContextVar[dict[str, object] | None] = contextvars.C
 )
 
 # How long an interrupted `run_concurrently` waits for its calls to end
-# before cleanup starts. A cancelled call ends at its next request or wait;
-# one already in a request ends within that request's timeout (Native's is
-# 15 s, `NativeConfig.request_timeout_seconds`), so a create whose POST was
-# in flight still hands its sandbox to cleanup before cleanup starts.
+# before cleanup starts. A cancelled call ends at its next request or wait,
+# and most already in a request end within its timeout (Native's is 15 s,
+# `NativeConfig.request_timeout_seconds`, per socket operation). One that
+# takes longer, such as a response still arriving, is not waited for.
 CANCEL_JOIN_SECONDS = 20.0
 
 
@@ -404,9 +404,14 @@ def run_concurrently(
     SIGTERM, cancels the calls: every subprocess they started through
     `SubprocessExecutor` is killed and reaped, each call ends at its next
     `cancellation_point` or `pause`, and the wait for that is bounded
-    (`CANCEL_JOIN_SECONDS`). Only then is the exception raised, so cleanup
-    starts after every call that could still hand it something has. A call
-    still running after the bound is named on stderr.
+    (`CANCEL_JOIN_SECONDS`) before the exception is raised and cleanup
+    starts. A call still running after the bound, such as one whose
+    response is still arriving, is named on stderr and not waited for: a
+    compensation it registers before cleanup ends still runs
+    (`ResourceScope.close`); one registered later does not. A caller that
+    creates something registers its cleanup before the request, keyed on
+    something it chose, so cleanup finds it either way (Native creates do:
+    `space_smoke.services`).
 
     `on_interrupt="detach"` neither cancels the calls nor waits for them:
     once the subprocesses they started are killed and reaped (and new ones
@@ -472,7 +477,14 @@ def run_concurrently(
 
 
 class ResourceScope:
-    """Run cleanup in reverse registration order and report every failure."""
+    """Run cleanup in reverse registration order and report every failure.
+
+    A compensation registered while cleanup runs, such as by a concurrent
+    call that outlived its interrupt (`run_concurrently`), runs too: once
+    the ones registered before it are done, newer ones go in reverse, until
+    none is left. Each runs once, within its own cap if it has one, and all
+    within the one cleanup deadline.
+    """
 
     def __init__(self) -> None:
         self._compensations: list[Compensation] = []
@@ -517,10 +529,22 @@ class ResourceScope:
         deadline = (
             time.monotonic() + timeout_seconds if timeout_seconds is not None else None
         )
-        for compensation in reversed(self._compensations):
-            if id(compensation) in seen:
-                continue
-            seen.add(id(compensation))
+        while True:
+            batch: list[Compensation] = []
+            for compensation in reversed(self._compensations):
+                if id(compensation) not in seen:
+                    seen.add(id(compensation))
+                    batch.append(compensation)
+            if not batch:
+                return tuple(failures)
+            failures.extend(self._release(batch, deadline))
+
+    @staticmethod
+    def _release(
+        compensations: Iterable[Compensation], deadline: float | None
+    ) -> list[CleanupFailure]:
+        failures: list[CleanupFailure] = []
+        for compensation in compensations:
             if not compensation.armed:
                 continue
             remaining = None if deadline is None else deadline - time.monotonic()
@@ -545,7 +569,7 @@ class ResourceScope:
                         compensation.critical,
                     )
                 )
-        return tuple(failures)
+        return failures
 
 
 def _compensation_deadline_seconds(
