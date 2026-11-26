@@ -837,10 +837,13 @@ pub(crate) fn substrate_db_error(what: &str, error: &sqlx::Error) -> SubstrateEr
 /// An extension trait rather than an inherent method because `Result` is
 /// foreign: the orphan rule permits `impl LocalTrait for ForeignType` in the
 /// crate that owns the trait, which is what makes `.db_context(..)` available
-/// on a `sqlx` result here. Implemented for exactly two error types —
-/// `sqlx::Error` and the warm-pool store's `PoolError`, which wraps one — so
-/// reaching for it on a `kube` or `tonic` result does not compile. The type
-/// checker, not review, is what keeps the classification on database errors.
+/// on a database result here. It is implemented only for `sqlx::Error`, the
+/// warm-pool store's `PoolError` (which wraps one) and postgres-pool's
+/// `DbError` (which converted store verbs return), so reaching for it on a
+/// `kube` or `tonic` result does not compile. The type checker, not review, is
+/// what keeps the classification on database errors. During the store
+/// conversions, the `DbError` impl unwraps the `sqlx::Error` inside and
+/// classifies that, so a converted verb's error classifies as before.
 pub(crate) trait DbContext<T> {
     /// Classify, prefixing `what` onto the message. Phrase `what` as the
     /// existing messages are — `"failed to load the sandbox row"` — since the
@@ -859,6 +862,16 @@ impl<T> DbContext<T> for Result<T, sqlx::Error> {
 
     fn db_context_with<F: FnOnce() -> String>(self, what: F) -> Result<T, SubstrateError> {
         self.map_err(|error| substrate_db_error(&what(), &error))
+    }
+}
+
+impl<T> DbContext<T> for Result<T, pplx_space_postgres_pool::DbError> {
+    fn db_context(self, what: &'static str) -> Result<T, SubstrateError> {
+        self.map_err(|error| substrate_db_error(what, &sqlx::Error::from(error)))
+    }
+
+    fn db_context_with<F: FnOnce() -> String>(self, what: F) -> Result<T, SubstrateError> {
+        self.map_err(|error| substrate_db_error(&what(), &sqlx::Error::from(error)))
     }
 }
 

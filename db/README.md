@@ -945,13 +945,14 @@ the caller, not of the statement:
 Inside the substrate the classification is reached through an extension trait,
 `DbContext::db_context`, rather than a bare `map_err` at each site. That is
 partly ergonomics — one line per call site instead of a five-line closure — but
-mostly a type check: the trait is implemented only for `Result<_, sqlx::Error>`
-and for the warm-pool store's error, so reaching for it on a `kube` or `tonic`
-result does not compile, and the compiler rather than review is what keeps the
-classification on database errors. A `SubstrateError::Failed` built directly
-from a `sqlx::Error` is the regression to look for. `direct.rs` keeps one
-hand-written mapper on top of it, because its route reservation classifies
-`Io`/`PoolTimedOut`/`57014` as retryable-but-not-contention.
+mostly a type check: the trait is implemented only for `Result<_, sqlx::Error>`,
+for the warm-pool store's error and for postgres-pool's `DbError`, so reaching
+for it on a `kube` or `tonic` result does not compile, and the compiler rather
+than review is what keeps the classification on database errors. A
+`SubstrateError::Failed` built directly from a `sqlx::Error` or a `DbError` is
+the regression to look for. `direct.rs` keeps one hand-written mapper on top of
+it, because its route reservation classifies `Io`/`PoolTimedOut`/`57014` as
+retryable-but-not-contention.
 
 Finding a gap like this is a matter of reading the error mapping, not the SQL:
 the statement looks ordinary and the disposition lives at the boundary, often
