@@ -463,8 +463,37 @@ fn committed_suspend_response_downgrades_unusable_artifact_identity() {
     );
 }
 
+/// A `DbError` classifies as the `sqlx::Error` it wraps, through both
+/// methods. That the conversion back is lossless is postgres-pool's
+/// `display_and_the_conversion_back_are_the_drivers`.
+async fn assert_db_error_classifies_alike(
+    db: &pplx_space_db_test_fixtures::TestDb,
+    sqlstate: &str,
+    expected: &SubstrateError,
+) {
+    let what = "failed to lock the sandbox row";
+    let raise = || pplx_space_db_test_fixtures::raise_sqlstate(&db.pool, sqlstate);
+    let through = Err::<(), _>(pplx_space_postgres_pool::DbError::from(raise().await))
+        .db_context(what)
+        .expect_err("the statement failed");
+    assert_eq!(
+        format!("{through:?}"),
+        format!("{expected:?}"),
+        "{sqlstate}"
+    );
+    let through = Err::<(), _>(pplx_space_postgres_pool::DbError::from(raise().await))
+        .db_context_with(|| what.to_string())
+        .expect_err("the statement failed");
+    assert_eq!(
+        format!("{through:?}"),
+        format!("{expected:?}"),
+        "{sqlstate}"
+    );
+}
+
 /// The producer half of the substrate's contention classification: what
-/// `db_context` turns each SQLSTATE into.
+/// `db_context` turns each SQLSTATE into, raised as a `sqlx::Error` and as a
+/// `DbError` wrapping one.
 ///
 /// Every `sqlx` statement in the substrate reaches this one function, so its
 /// two dispositions are asserted here rather than at each call site. The
@@ -489,6 +518,7 @@ async fn db_context_separates_a_lost_lock_race_from_a_real_failure()
             matches!(error, SubstrateError::LockContention { .. }),
             "{sqlstate} must classify as contention, got {error:?}"
         );
+        assert_db_error_classifies_alike(&db, sqlstate, &error).await;
     }
 
     // `57014` is a statement timeout, not a lock race: the statement was too
@@ -503,6 +533,7 @@ async fn db_context_separates_a_lost_lock_race_from_a_real_failure()
             matches!(error, SubstrateError::Failed { .. }),
             "{sqlstate} must stay a failure, got {error:?}"
         );
+        assert_db_error_classifies_alike(&db, sqlstate, &error).await;
         // The failure keeps its context so the log names the statement.
         assert!(error.to_string().contains("failed to lock the sandbox row"));
     }
