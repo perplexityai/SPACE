@@ -42,7 +42,7 @@ RESTART_MARGIN_SECONDS = 30
 def v2_drain_survives_sandbox_manager_restarts(test: smoke.CommandSandboxFixture) -> None:
     """With uploads blocked on the drained worker, a v2 drain with a
     hold of two started and a paused resident seals it. Its sandbox-manager restarts before the deadline: the node reports
-    under the same generation again, the deadline is unchanged, and the
+    under the same generation again, the stored deadline is unchanged, and the
     started residents keep running until it, once brought in by a repeat
     `:drain`. Past it the node suspends them,
     and it restarts again while every upload waits: it reports under the
@@ -82,9 +82,11 @@ def v2_drain_survives_sandbox_manager_restarts(test: smoke.CommandSandboxFixture
             )
             test.record("report_after_first_restart", after_first)
             shown = drain.expect_view_deadline(after_first)
+            # The node keeps no deadline: the view shows the stored one, which
+            # only a `:drain` may move.
             test.verify(
                 shown == persisted,
-                "the drain's deadline moved across the restart",
+                "the stored deadline moved across the restart",
                 persisted=persisted,
                 shown=shown,
             )
@@ -120,11 +122,14 @@ def v2_drain_survives_sandbox_manager_restarts(test: smoke.CommandSandboxFixture
             }
             test.record("after_second_restart", {"report": after_second, "node_states": node_states})
             test.verify(
-                shown == persisted
-                and all(state == "suspended" for state in node_states.values()),
-                "the node restarted past the deadline lost its seal's deadline, or ran a suspended resident again",
+                shown == persisted,
+                "the stored deadline moved across the second restart",
                 persisted=persisted,
                 shown=shown,
+            )
+            test.verify(
+                all(state == "suspended" for state in node_states.values()),
+                "the node restarted past the deadline ran a suspended resident again",
                 node_states=node_states,
             )
 
