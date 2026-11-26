@@ -91,7 +91,15 @@ fn workspace(files: &[(&str, String)]) -> TempDir {
         ("ARCHITECTURE.toml", CRATE_NAMES.to_owned()),
         ("architecture-baseline.toml", tables(&[])),
     ];
-    for (path, contents) in defaults.iter().chain(files) {
+    // Each path is written once, with its last contents: ext4 starts writing
+    // out a file that was truncated and rewritten when it is closed, and on a
+    // busy disk that close waits behind the writes queued ahead of it.
+    let files: BTreeMap<&str, &String> = defaults
+        .iter()
+        .chain(files)
+        .map(|(path, contents)| (*path, contents))
+        .collect();
+    for (path, contents) in files {
         let path = dir.path().join(path);
         fs::create_dir_all(path.parent().expect("a parent directory")).expect("create it");
         fs::write(&path, contents).expect("write a workspace file");
@@ -8248,6 +8256,10 @@ const FACADE_TABLES: &str = "[rules.layers.storage]\n\
                              rusqlite = [\"types::ToSql\"]\n\
                              sqlx = [\"Type\", \"postgres::PgTypeInfo\"]\n";
 
+/// The shards [`layers_codec_facades`] deals its cases into, each about
+/// eight; its `#[values]` lists one more, for the checks after the table.
+const CODEC_FACADE_SHARDS: usize = 4;
+
 /// The codec facade's manifest in [`layers_codec_facades`], with `extra`
 /// after its dependencies: its library is `src/lib.rs`.
 fn facade_manifest(extra: &str) -> String {
@@ -8281,8 +8293,13 @@ const FACADE_LIB: &str = "//! Codec items.\n\n\
 /// on one are `storage_access` findings. A facade may have optional normal
 /// dependencies on drivers, nothing else, and its source may re-export only
 /// its listed exports, with no baseline entry to tolerate anything more.
-#[test]
-fn layers_codec_facades() {
+///
+/// Each case loads its own workspace, which runs `cargo metadata`, so the
+/// cases are dealt by position into [`CODEC_FACADE_SHARDS`] shards, each its
+/// own test, and every case, a new one included, lands in exactly one of
+/// them. The last shard runs the checks after the table instead.
+#[rstest::rstest]
+fn layers_codec_facades(#[values(0, 1, 2, 3, 4)] shard: usize) {
     const D: &str = "crates/l20_domain/d/Cargo.toml";
     const G: &str = "crates/l10_foundation/g/Cargo.toml";
     const A: &str = "crates/l40_api/a/server/Cargo.toml";
@@ -8775,18 +8792,22 @@ fn layers_codec_facades() {
         }
         .build()
     };
-    for (name, files, expected) in cases {
-        let ws = build(&files, FACADE_TABLES, None);
-        let found = storage_findings(&load(ws.path(), None));
-        assert_eq!(found.len(), expected.len(), "{name}: {found:#?}");
-        for ((code, message, at), (want_code, want, path)) in found.iter().zip(&expected) {
-            assert_eq!(code, want_code, "{name}: {message}");
-            assert!(
-                want.split(" … ").all(|part| message.contains(part)),
-                "{name}: {message}"
-            );
-            assert!(at.starts_with(&format!("{path}:")), "{name}: {at}");
+    if shard < CODEC_FACADE_SHARDS {
+        let cases = cases.into_iter().skip(shard).step_by(CODEC_FACADE_SHARDS);
+        for (name, files, expected) in cases {
+            let ws = build(&files, FACADE_TABLES, None);
+            let found = storage_findings(&load(ws.path(), None));
+            assert_eq!(found.len(), expected.len(), "{name}: {found:#?}");
+            for ((code, message, at), (want_code, want, path)) in found.iter().zip(&expected) {
+                assert_eq!(code, want_code, "{name}: {message}");
+                assert!(
+                    want.split(" … ").all(|part| message.contains(part)),
+                    "{name}: {message}"
+                );
+                assert!(at.starts_with(&format!("{path}:")), "{name}: {at}");
+            }
         }
+        return;
     }
 
     // A source finding takes no baseline entry: one for the facade, as for
