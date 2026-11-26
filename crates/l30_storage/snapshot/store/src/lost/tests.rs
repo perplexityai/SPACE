@@ -165,7 +165,7 @@ async fn fail_quiet_full_uploads_from_node_fails_only_the_nodes_dead_uploads() -
     .await?;
 
     let mut tx = pool.begin().await?;
-    fail_quiet_full_uploads_from_node(&mut tx, gone, &[lost], SETTLE).await?;
+    fail_quiet_full_uploads_from_node(&mut *tx, gone, &[lost], SETTLE).await?;
     tx.commit().await?;
 
     for (id, kind, state, expected) in sweep {

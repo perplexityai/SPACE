@@ -69,6 +69,12 @@ pub enum FinalizeSandboxDbDeleteError {
     Db(#[from] sqlx::Error),
 }
 
+impl From<pplx_space_postgres_pool::DbError> for FinalizeSandboxDbDeleteError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 /// Variant of [`finalize_sandbox_db_delete`] safe for user-facing
 /// DELETEs: refuses to orphan storage-location rows while any
 /// `snapshots` row for the sandbox is in `state='creating'`. See

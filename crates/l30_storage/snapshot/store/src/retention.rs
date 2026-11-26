@@ -10,11 +10,12 @@
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::snapshot_is_live_restore_source;
 use pplx_space_snapshot_model::SnapshotId;
 use pplx_space_sql_locator::sql;
-use sqlx::{FromRow, Postgres, Transaction};
+use sqlx::FromRow;
 use uuid::Uuid;
 
 /// A `ready` snapshot discovery found prunable, with its optional usable
@@ -39,12 +40,12 @@ pub struct Candidate {
 /// The `OFFSET 0` fences keep each keyed probe on its own index rather than a
 /// fleet-wide join.
 pub async fn candidates(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     ids: &[SnapshotId],
     keep_n: i64,
     limit: i64,
     min_age: Option<Duration>,
-) -> Result<Vec<Candidate>, sqlx::Error> {
+) -> Result<Vec<Candidate>, DbError> {
     static CANDIDATES: LazyLock<String> = LazyLock::new(|| {
         let restore_source = snapshot_is_live_restore_source("sb", "s");
         sql!(format!(
@@ -108,15 +109,15 @@ pub async fn candidates(
         ))
     });
     let min_age_secs = min_age.map(|d| d.as_secs().cast_signed());
-    sqlx::query_as(sqlx::AssertSqlSafe(CANDIDATES.as_str()))
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(CANDIDATES.as_str()))
         .bind(keep_n)
         .bind(limit)
         .bind(ids)
         .bind(min_age_secs)
         .bind(ids.first().copied())
         .bind(ids.last().copied())
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }
 
 /// Lock snapshot `snapshot_id` of `sandbox_id` `FOR UPDATE` and return its
@@ -130,12 +131,17 @@ pub async fn candidates(
 /// such as `orphaned_at` or `snapshot_id`: the claim takes that lock
 /// separately with [`lock_usable_storage_location`], and a caller needs both
 /// rather than the snapshot lock alone.
-pub async fn lock_sandbox_snapshot_state(
-    tx: &mut Transaction<'_, Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn lock_sandbox_snapshot_state<C>(
+    tx: &mut C,
     snapshot_id: SnapshotId,
     sandbox_id: SandboxId,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Option<String>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar(sql!(
         "SELECT state
                FROM snapshots
               WHERE id = $1
@@ -144,26 +150,31 @@ pub async fn lock_sandbox_snapshot_state(
     ))
     .bind(snapshot_id)
     .bind(sandbox_id)
-    .fetch_optional(&mut **tx)
-    .await
+    .fetch_optional(tx.into_sqlx())
+    .await?)
 }
 
 /// Lock snapshot `snapshot_id` `FOR UPDATE` and return its stored state,
 /// unparsed; `None` when there's no such row. The lock lasts until the
 /// caller's transaction ends.
-pub async fn lock_snapshot_state(
-    tx: &mut Transaction<'_, Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn lock_snapshot_state<C>(
+    tx: &mut C,
     snapshot_id: SnapshotId,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Option<String>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar(sql!(
         "SELECT state
                FROM snapshots
               WHERE id = $1
               FOR UPDATE"
     ))
     .bind(snapshot_id)
-    .fetch_optional(&mut **tx)
-    .await
+    .fetch_optional(tx.into_sqlx())
+    .await?)
 }
 
 /// A snapshot's usable storage location, as the claim locked it.
@@ -177,11 +188,16 @@ pub struct LockedStorageLocation {
 /// Lock `FOR UPDATE` the usable storage location of snapshot `snapshot_id`
 /// and return it; `None` when it has none. The lock lasts until the caller's
 /// transaction ends.
-pub async fn lock_usable_storage_location(
-    tx: &mut Transaction<'_, Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn lock_usable_storage_location<C>(
+    tx: &mut C,
     snapshot_id: SnapshotId,
-) -> Result<Option<LockedStorageLocation>, sqlx::Error> {
-    sqlx::query_as(sql!(
+) -> Result<Option<LockedStorageLocation>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_as(sql!(
         "SELECT ssl.id,
                     ssl.storage_connection_string,
                     EXISTS (
@@ -195,8 +211,8 @@ pub async fn lock_usable_storage_location(
               FOR UPDATE OF ssl"
     ))
     .bind(snapshot_id)
-    .fetch_optional(&mut **tx)
-    .await
+    .fetch_optional(tx.into_sqlx())
+    .await?)
 }
 
 /// The claim's re-check of `ready` snapshot `snapshot_id`, one flag per
@@ -218,11 +234,11 @@ pub struct ClaimSafety {
 /// longer `ready` or its sandbox is gone. Run it in the claim's transaction,
 /// after its locks, so it sees writers that committed while it waited.
 pub async fn claim_safety(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     snapshot_id: SnapshotId,
     keep_n: i64,
     min_age: Option<Duration>,
-) -> Result<Option<ClaimSafety>, sqlx::Error> {
+) -> Result<Option<ClaimSafety>, DbError> {
     static CLAIM_SAFETY: LazyLock<String> = LazyLock::new(|| {
         let restore_source = snapshot_is_live_restore_source("sb", "cur");
         sql!(format!(
@@ -254,23 +270,23 @@ pub async fn claim_safety(
         ))
     });
     let min_age_secs = min_age.map(|duration| duration.as_secs().cast_signed());
-    sqlx::query_as(sqlx::AssertSqlSafe(CLAIM_SAFETY.as_str()))
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(CLAIM_SAFETY.as_str()))
         .bind(snapshot_id)
         .bind(keep_n)
         .bind(min_age_secs)
-        .fetch_optional(executor)
-        .await
+        .fetch_optional(executor.into_sqlx())
+        .await?)
 }
 
 /// Whether snapshot `snapshot_id` still meets the keep-N floor: it's a `stop`
 /// disk row, or at least `keep_n` newer ready full siblings with a usable
 /// location exist.
 pub async fn floor_holds(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     snapshot_id: SnapshotId,
     keep_n: i64,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT EXISTS (
                  SELECT 1
                    FROM snapshots cur
@@ -298,6 +314,6 @@ pub async fn floor_holds(
     ))
     .bind(snapshot_id)
     .bind(keep_n)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }

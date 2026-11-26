@@ -105,7 +105,7 @@ impl LostStartedSink for LostStartedDbStore {
         // bytes are left for the storage sweeper: the residual the drained-node
         // give-up accepts for the same race.
         let _locked_uploads: Vec<SnapshotId> =
-            lock_creating_full_uploads(&mut tx, candidate.sandbox_id).await?;
+            lock_creating_full_uploads(&mut *tx, candidate.sandbox_id).await?;
 
         if !mark_started_lost(
             &mut tx,
@@ -120,7 +120,7 @@ impl LostStartedSink for LostStartedDbStore {
             return Ok(false);
         }
         fail_quiet_full_uploads_from_node(
-            &mut tx,
+            &mut *tx,
             node_id,
             &[candidate.sandbox_id],
             DEAD_UPLOAD_SETTLE,

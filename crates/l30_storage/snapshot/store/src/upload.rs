@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId, SnapshotState};
 use pplx_space_sql_locator::sql;
@@ -25,9 +26,9 @@ use sqlx::FromRow;
 /// insert's foreign-key check takes on the row, so no snapshot can be
 /// registered between the read and the delete.
 pub async fn in_flight_idle_for(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<Duration>, sqlx::Error> {
+) -> Result<Option<Duration>, DbError> {
     let idle_secs: Option<f64> = sqlx::query_scalar(sql!(
         "SELECT EXTRACT(EPOCH FROM NOW() - MIN(COALESCE(last_attempt_at, \"timestamp\")))
                     ::DOUBLE PRECISION
@@ -37,7 +38,7 @@ pub async fn in_flight_idle_for(
            AND artifact_origin IS DISTINCT FROM 'fork'"
     ))
     .bind(sandbox_id)
-    .fetch_one(executor)
+    .fetch_one(executor.into_sqlx())
     .await?;
     Ok(idle_secs.map(|secs| Duration::from_secs_f64(secs.max(0.0))))
 }
@@ -62,13 +63,13 @@ pub struct FinalizedAttempt {
 /// `None` when no row matches: there's no such snapshot, or it's in another
 /// state.
 pub async fn finalize_attempt(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     snapshot_id: SnapshotId,
     target_state: SnapshotState,
     size_bytes: Option<i64>,
     failure_reason: Option<&str>,
-) -> Result<Option<FinalizedAttempt>, sqlx::Error> {
-    sqlx::query_as(sql!(
+) -> Result<Option<FinalizedAttempt>, DbError> {
+    Ok(sqlx::query_as(sql!(
         "UPDATE snapshots
                 SET state = $2,
                     size_bytes = COALESCE($3, size_bytes),
@@ -84,17 +85,17 @@ pub async fn finalize_attempt(
     .bind(target_state.as_str())
     .bind(size_bytes)
     .bind(failure_reason)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Stamp upload attempt `snapshot_id`'s `last_attempt_at` with the database
 /// clock, while it is still `creating`. `false` when there's no such row or
 /// it is no longer `creating`.
 pub async fn touch_attempt(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     snapshot_id: SnapshotId,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let updated = sqlx::query(sql!(
         "UPDATE snapshots
                 SET last_attempt_at = NOW()
@@ -102,7 +103,7 @@ pub async fn touch_attempt(
                 AND state = 'creating'"
     ))
     .bind(snapshot_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected();
     Ok(updated == 1)
@@ -125,12 +126,12 @@ pub struct StuckFullUpload {
 /// A `min_age` past `i64::MAX` seconds is bound as `i64::MAX`. A row that left
 /// `creating` before the statement ran is not matched.
 pub async fn fail_stuck_full_uploads(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     min_age: Duration,
     failure_reason: &str,
-) -> Result<Vec<StuckFullUpload>, sqlx::Error> {
+) -> Result<Vec<StuckFullUpload>, DbError> {
     let min_age_secs = i64::try_from(min_age.as_secs()).unwrap_or(i64::MAX);
-    sqlx::query_as(sql!(
+    Ok(sqlx::query_as(sql!(
         "UPDATE snapshots
                 SET state = 'failed',
                     failure_reason = COALESCE(failure_reason, $2)
@@ -141,8 +142,8 @@ pub async fn fail_stuck_full_uploads(
     ))
     .bind(min_age_secs)
     .bind(failure_reason)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 #[cfg(test)]

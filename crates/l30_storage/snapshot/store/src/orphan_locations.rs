@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use sqlx::FromRow;
 use uuid::Uuid;
@@ -27,13 +28,13 @@ pub struct OrphanLocation {
 /// Up to `limit` orphan locations with ids above `after`, in id order. With
 /// `min_age`, only those orphaned longer ago than that by the database clock.
 pub async fn page(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     after: Option<Uuid>,
     limit: i64,
     min_age: Option<Duration>,
-) -> Result<Vec<OrphanLocation>, sqlx::Error> {
+) -> Result<Vec<OrphanLocation>, DbError> {
     let min_age_secs = min_age.map(|d| d.as_secs().cast_signed());
-    sqlx::query_as(sql!(
+    Ok(sqlx::query_as(sql!(
         "SELECT
                  ssl.id,
                  ssl.storage_connection_string,
@@ -54,16 +55,13 @@ pub async fn page(
     .bind(after)
     .bind(limit)
     .bind(min_age_secs)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Delete location `id` if it is still an orphan; its encrypted-fields row,
 /// if any, cascades. `false` when the row is gone or no longer an orphan.
-pub async fn delete_if_orphan(
-    executor: impl sqlx::PgExecutor<'_>,
-    id: Uuid,
-) -> Result<bool, sqlx::Error> {
+pub async fn delete_if_orphan(executor: impl Executor<'_>, id: Uuid) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "DELETE FROM snapshot_storage_locations
              WHERE id = $1
@@ -71,7 +69,7 @@ pub async fn delete_if_orphan(
                AND snapshot_id IS NULL"
     ))
     .bind(id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() > 0)
 }

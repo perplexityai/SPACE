@@ -5053,7 +5053,7 @@ async fn seed_suspend_snapshot_with_identity(
         .begin()
         .await
         .map_err(|e| tonic::Status::internal(format!("begin tx: {e}")))?;
-    snapshot_store::insert(&mut tx, &snapshot)
+    snapshot_store::insert(&mut *tx, &snapshot)
         .await
         .map_err(snapshot_insert_status)?;
     tx.commit()
@@ -5580,7 +5580,7 @@ async fn begin_replay_racing_retention_cannot_register_a_row_for_another_node() 
 
     // Retention's delete is in flight.
     let mut retention = pool.begin().await?;
-    assert!(snapshot_store::delete_snapshot_catalog(&mut retention, backup_attempt_id).await?);
+    assert!(snapshot_store::delete_snapshot_catalog(&mut *retention, backup_attempt_id).await?);
 
     let replay = begin_artifact_backup_from_node(
         &fixture.service,

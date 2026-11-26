@@ -118,6 +118,7 @@ async fn fetch_snapshot_rows(
         i64::from(limit) + 1,
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 async fn fetch_snapshot_row(
@@ -126,7 +127,9 @@ async fn fetch_snapshot_row(
     sandbox_id: PublicSandboxId,
     snapshot_id: SnapshotId,
 ) -> Result<Option<SnapshotRow>, sqlx::Error> {
-    pplx_space_snapshot_store::public::get(pool, org_id, sandbox_id.into(), snapshot_id).await
+    pplx_space_snapshot_store::public::get(pool, org_id, sandbox_id.into(), snapshot_id)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 fn public_snapshot_from_row(row: SnapshotRow) -> Result<PublicSnapshot, PublicApiError> {

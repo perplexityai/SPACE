@@ -81,7 +81,7 @@ pub(crate) async fn reject_deleting_current_local_artifact(
     artifact: PublishedLocalArtifact,
 ) -> Result<(), SubstrateError> {
     let deleting = pplx_space_snapshot_store::claimed::deleting_without_ready_copy(
-        tx,
+        &mut **tx,
         sandbox_id,
         artifact.id,
         artifact.kind,

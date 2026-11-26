@@ -2,6 +2,7 @@
 //! the guarded transitions of a fork copy's catalog rows.
 
 use pplx_space_accounts::OrgId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 use pplx_space_sql_locator::sql;
@@ -30,10 +31,10 @@ impl From<(SnapshotId, Uuid, String)> for ReadyDiskArtifact {
 /// The ready disk backup of `sandbox_id`'s local artifact
 /// `local_artifact_id` whose live storage location was created last.
 pub async fn ready_for_local_id(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     local_artifact_id: LocalArtifactId,
-) -> Result<Option<ReadyDiskArtifact>, sqlx::Error> {
+) -> Result<Option<ReadyDiskArtifact>, DbError> {
     let row = sqlx::query_as::<_, (SnapshotId, Uuid, String)>(sql!(
         "SELECT sn.id, ssl.id, ssl.storage_connection_string
              FROM snapshots sn
@@ -49,7 +50,7 @@ pub async fn ready_for_local_id(
     ))
     .bind(sandbox_id.as_uuid())
     .bind(local_artifact_id.as_uuid())
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(row.map(ReadyDiskArtifact::from))
 }
@@ -57,10 +58,10 @@ pub async fn ready_for_local_id(
 /// Snapshot `snapshot_id` at storage location `storage_location_id`, when
 /// it is still a ready disk snapshot or fork copy and the location is live.
 pub async fn ready_at_location(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     snapshot_id: SnapshotId,
     storage_location_id: Uuid,
-) -> Result<Option<ReadyDiskArtifact>, sqlx::Error> {
+) -> Result<Option<ReadyDiskArtifact>, DbError> {
     let row = sqlx::query_as::<_, (SnapshotId, Uuid, String)>(sql!(
         "SELECT sn.id, ssl.id, ssl.storage_connection_string
              FROM snapshots sn
@@ -75,7 +76,7 @@ pub async fn ready_at_location(
     ))
     .bind(snapshot_id)
     .bind(storage_location_id)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(row.map(ReadyDiskArtifact::from))
 }
@@ -84,11 +85,11 @@ pub async fn ready_at_location(
 /// by `owner_sandbox_id`. A row already registered under that id is left as
 /// it is, so a retried copy reuses it.
 pub async fn insert_creating_fork_copy(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     snapshot_id: SnapshotId,
     owner_sandbox_id: SandboxId,
     org_id: OrgId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "INSERT INTO snapshots (
                  id, sandbox_id, type, state, timestamp, artifact_kind, artifact_origin, org_id
@@ -99,7 +100,7 @@ pub async fn insert_creating_fork_copy(
     .bind(snapshot_id)
     .bind(owner_sandbox_id.as_uuid())
     .bind(org_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -112,12 +113,12 @@ pub async fn insert_creating_fork_copy(
 /// was new or an orphan was re-adopted; `false` when a location with that id
 /// exists and isn't an orphan, which is left as it is.
 pub async fn attach_fork_copy_location(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     storage_location_id: Uuid,
     snapshot_id: SnapshotId,
     storage_connection_string: &str,
     org_id: OrgId,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let attached = sqlx::query(sql!(
         "INSERT INTO snapshot_storage_locations (
                  id, snapshot_id, storage_connection_string, org_id
@@ -134,7 +135,7 @@ pub async fn attach_fork_copy_location(
     .bind(snapshot_id)
     .bind(storage_connection_string)
     .bind(org_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected();
     Ok(attached == 1)
@@ -145,11 +146,11 @@ pub async fn attach_fork_copy_location(
 /// completion succeeds. `false` when no `creating` or `ready` fork copy with
 /// that id and owner exists.
 pub async fn mark_fork_copy_ready(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     snapshot_id: SnapshotId,
     owner_sandbox_id: SandboxId,
     size_bytes: i64,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let updated = sqlx::query(sql!(
         "UPDATE snapshots
              SET state = 'ready', size_bytes = $2
@@ -163,7 +164,7 @@ pub async fn mark_fork_copy_ready(
     .bind(snapshot_id)
     .bind(size_bytes)
     .bind(owner_sandbox_id.as_uuid())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected();
     Ok(updated == 1)
@@ -174,11 +175,11 @@ pub async fn mark_fork_copy_ready(
 /// again, so a retried handoff succeeds. `false` when no ready fork copy with
 /// that id belongs to either sandbox.
 pub async fn rebind_fork_copy_owner(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     snapshot_id: SnapshotId,
     source_sandbox_id: SandboxId,
     target_sandbox_id: SandboxId,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let updated = sqlx::query(sql!(
         "UPDATE snapshots
              SET sandbox_id = $3
@@ -192,7 +193,7 @@ pub async fn rebind_fork_copy_owner(
     .bind(snapshot_id)
     .bind(source_sandbox_id.as_uuid())
     .bind(target_sandbox_id.as_uuid())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected();
     Ok(updated == 1)
@@ -203,10 +204,10 @@ pub async fn rebind_fork_copy_owner(
 /// bytes to the storage sweeper. `false` when the location no longer belongs
 /// to that snapshot or is already orphaned.
 pub async fn orphan_fork_copy_location(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     snapshot_id: SnapshotId,
     storage_location_id: Uuid,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let updated = sqlx::query(sql!(
         "UPDATE snapshot_storage_locations
              SET snapshot_id = NULL, orphaned_at = NOW()
@@ -214,7 +215,7 @@ pub async fn orphan_fork_copy_location(
     ))
     .bind(storage_location_id)
     .bind(snapshot_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected();
     Ok(updated == 1)
@@ -224,9 +225,9 @@ pub async fn orphan_fork_copy_location(
 /// `false` when there's no such fork copy or a live location still points at
 /// it.
 pub async fn delete_unlocated_fork_copy(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     snapshot_id: SnapshotId,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let deleted = sqlx::query(sql!(
         "DELETE FROM snapshots s
              WHERE s.id = $1
@@ -237,7 +238,7 @@ pub async fn delete_unlocated_fork_copy(
                )"
     ))
     .bind(snapshot_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected();
     Ok(deleted == 1)
