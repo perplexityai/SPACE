@@ -222,6 +222,8 @@ pub enum AgedTransientOutcome {
     GaveUpNothingRecoverable,
     Deferred,
     CasLost,
+    /// The converge, revert or give-up write failed; `reason` names which.
+    Error,
 }
 
 impl AgedTransientOutcome {
@@ -233,6 +235,7 @@ impl AgedTransientOutcome {
             Self::GaveUpNothingRecoverable => "gave_up_nothing_recoverable",
             Self::Deferred => OUTCOME_DEFERRED,
             Self::CasLost => OUTCOME_CAS_LOST,
+            Self::Error => OUTCOME_ERROR,
         }
     }
 
@@ -242,7 +245,7 @@ impl AgedTransientOutcome {
             | Self::ConvergedAfterHydratingExecution(wake) => Some(wake.as_str()),
             Self::RevertedToDurableSnapshot => Some(LIFECYCLE_SUSPENDED),
             Self::GaveUpNothingRecoverable => Some(LIFECYCLE_FAILED),
-            Self::Deferred | Self::CasLost => None,
+            Self::Deferred | Self::CasLost | Self::Error => None,
         }
     }
 }
@@ -289,8 +292,17 @@ pub enum FailedCleanupOutcome {
     /// `reason:probe_verdict_forbids_retire`).
     Deferred,
     CasLost,
+    /// The repair write failed (`reason:repair_write_failed`), the rotation
+    /// that precedes the probe gate did (`reason:rotate_write_failed`;
+    /// [`VERDICT_NOT_PROBED`] when the candidate was waiting out a retry), or
+    /// the re-read before retiring a live abandoned create did
+    /// (`reason:first_activation_read_failed`).
     Error,
 }
+
+/// `verdict` for a failed-cleanup candidate the sweep did not probe because
+/// it was waiting out a failed retire.
+pub const VERDICT_NOT_PROBED: &str = "not_probed";
 
 impl FailedCleanupOutcome {
     pub fn as_str(self) -> &'static str {
@@ -323,6 +335,10 @@ pub enum CleanupOutcome {
     /// [`Self::Error`] — no work failed, and the retry belongs to whoever owns
     /// the sandbox now.
     PodIdentityChanged,
+    /// The teardown failed (no `reason`), or, after a
+    /// [`Self::PodIdentityChanged`] refusal, so did the write undoing the
+    /// transition that preceded it (`reason:undo_revert_write_failed`,
+    /// `undo_give_up_write_failed` or `undo_reap_write_failed`).
     Error,
 }
 
@@ -352,6 +368,9 @@ pub enum CommandReadyOutcome {
     GaveUpGuestUnreachable,
     /// Unreachable but not yet terminal-aged (`reason:probe_unreachable`).
     Deferred,
+    /// The heal write (`reason:heal_write_failed`) or the reap write
+    /// (`reason:reap_write_failed`) failed.
+    Error,
 }
 
 impl CommandReadyOutcome {
@@ -361,13 +380,14 @@ impl CommandReadyOutcome {
             Self::GaveUpGuestWedged => "gave_up_guest_wedged",
             Self::GaveUpGuestUnreachable => "gave_up_guest_unreachable",
             Self::Deferred => OUTCOME_DEFERRED,
+            Self::Error => OUTCOME_ERROR,
         }
     }
 
     fn to_lifecycle(self) -> Option<&'static str> {
         match self {
             Self::GaveUpGuestWedged | Self::GaveUpGuestUnreachable => Some(LIFECYCLE_FAILED),
-            Self::ClearedStaleReadyMarker | Self::Deferred => None,
+            Self::ClearedStaleReadyMarker | Self::Deferred | Self::Error => None,
         }
     }
 }
@@ -380,6 +400,8 @@ pub enum UnrestorableOutcome {
     /// (`reason:restore_source_unavailable`).
     GaveUpNoRestoreSource,
     CasLost,
+    /// The fail write failed (`reason:fail_write_failed`).
+    Error,
 }
 
 impl UnrestorableOutcome {
@@ -387,13 +409,14 @@ impl UnrestorableOutcome {
         match self {
             Self::GaveUpNoRestoreSource => "gave_up_no_restore_source",
             Self::CasLost => OUTCOME_CAS_LOST,
+            Self::Error => OUTCOME_ERROR,
         }
     }
 
     fn to_lifecycle(self) -> Option<&'static str> {
         match self {
             Self::GaveUpNoRestoreSource => Some(LIFECYCLE_FAILED),
-            Self::CasLost => None,
+            Self::CasLost | Self::Error => None,
         }
     }
 }
@@ -750,6 +773,7 @@ enum LogLevel {
     Debug,
     Info,
     Warn,
+    Error,
 }
 
 /// One reconciler outcome: an increment of `cluster_reconciler.outcome` plus
@@ -757,8 +781,8 @@ enum LogLevel {
 /// log fields; identifier fields (`sandbox_id`, `pod_name`, ...) become log
 /// fields only. Construct via the per-sweep constructors, attach identifiers
 /// with the builder setters, then finish with [`Self::info`], [`Self::warn`],
-/// or [`Self::debug`].
-#[must_use = "call .info()/.warn()/.debug() to emit the metric and log"]
+/// [`Self::error_level`], or [`Self::debug`].
+#[must_use = "call .info()/.warn()/.error_level()/.debug() to emit the metric and log"]
 #[derive(Debug)]
 pub struct OutcomeEvent {
     loop_: Loop,
@@ -1005,6 +1029,12 @@ impl OutcomeEvent {
         self.emit(LogLevel::Warn);
     }
 
+    /// Emit at `error`: failures that leave a row where no reconciler
+    /// revisits it.
+    pub fn error_level(self) {
+        self.emit(LogLevel::Error);
+    }
+
     /// Emit at `debug`: no-op outcomes (CAS losses, routine skips/defers).
     /// The metric still increments; the log needs `cluster_reconciler=debug`.
     pub fn debug(self) {
@@ -1076,6 +1106,7 @@ impl OutcomeEvent {
             LogLevel::Debug => log_at!(debug),
             LogLevel::Info => log_at!(info),
             LogLevel::Warn => log_at!(warn),
+            LogLevel::Error => log_at!(error),
         }
     }
 }

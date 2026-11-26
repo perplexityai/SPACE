@@ -800,6 +800,14 @@ impl<P: PodPresence, S: OrphanActionSink> Reconciler<P, S> {
                         error = %err,
                         "reconciler disposition planning failed; will retry when the sweep reaches it again"
                     );
+                    reconciler_metrics::rows_failed(
+                        reconciler_metrics::FailedStep::Plan,
+                        if self.config.dry_run {
+                            reconciler_metrics::Mode::DryRun
+                        } else {
+                            reconciler_metrics::Mode::Live
+                        },
+                    );
                     continue;
                 }
             };
@@ -986,6 +994,10 @@ impl<P: PodPresence, S: OrphanActionSink> Reconciler<P, S> {
                         pod_name = %candidate.pod_name,
                         error = %err,
                         "reconciler classify_orphan failed; will retry when the sweep reaches it again"
+                    );
+                    reconciler_metrics::rows_failed(
+                        reconciler_metrics::FailedStep::Classify,
+                        reconciler_metrics::Mode::Live,
                     );
                 }
             }
