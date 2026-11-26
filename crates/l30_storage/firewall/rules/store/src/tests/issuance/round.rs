@@ -15,7 +15,9 @@ async fn open_with(
     mut queue: Queue,
 ) -> Result<Opening, sqlx::Error> {
     let mut conn = pool.acquire().await?;
-    open_round(&mut conn, target, EPOCH, &mut queue).await
+    open_round(&mut conn, target, EPOCH, &mut queue)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 async fn opened(pool: &PgPool, target: &LeasedTarget) -> TestResult<PendingRound> {
@@ -84,7 +86,7 @@ async fn racing_and_repeated_opens_converge_on_one_round_and_one_wakeup() -> Tes
     .await?;
     let before = effects(&db.pool, rollout, node).await?;
 
-    let holder = hold_header(&db.pool, rollout).await?;
+    let holder = hold_header(&Db::from(db.pool.clone()), rollout).await?;
     let racing = [spawn_open(&db.pool, &target), spawn_open(&db.pool, &target)];
     wait_for_lock_waiters(&db.pool, 2).await?;
     let start = clock(&db.pool).await?;
@@ -299,10 +301,10 @@ async fn the_first_to_lock_wins_a_change_of_intent_or_lease_against_opening() ->
     let node = target.node_id;
     let before = effects(&db.pool, rollout, node).await?;
 
-    let mut pausing = hold_header(&db.pool, rollout).await?;
+    let mut pausing = hold_header(&Db::from(db.pool.clone()), rollout).await?;
     let opening = spawn_open(&db.pool, &target);
     wait_for_lock_waiters(&db.pool, 1).await?;
-    set_phase(&mut *pausing, rollout, "paused").await?;
+    set_phase(&mut pausing, rollout, "paused").await?;
     pausing.commit().await?;
     assert_eq!(
         tokio::time::timeout(WAIT, opening).await???,

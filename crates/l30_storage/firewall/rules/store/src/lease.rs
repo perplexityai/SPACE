@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_rollout_queue::{
     Candidates, ClaimStore, FailedItems, HeaderPhase, LEASE_EXPIRED, Pacing, RedriveReport,
     RenewStore,
@@ -96,7 +97,7 @@ pub async fn lease_targets(
     active_limit: u64,
     lease: Duration,
     scan_limit: u32,
-) -> Result<Vec<LeasedTarget>, sqlx::Error> {
+) -> Result<Vec<LeasedTarget>, DbError> {
     // Its own transaction, never a savepoint: a caller's snapshot or locks
     // would break the shared claim's lock order.
     let mut tx = conn
@@ -110,7 +111,7 @@ pub async fn lease_targets(
         scope: Scope::Any,
     };
     let leased = pplx_space_rollout_queue::claim(&mut claiming, lease, scan_limit).await;
-    end_transaction(tx, leased).await
+    end_transaction(tx, leased.map_err(DbError::from)).await
 }
 
 /// Lease one first assignment of the database's unfinished rollout for
@@ -126,7 +127,7 @@ pub async fn lease_first_canary(
     conn: &mut PgConnection,
     lease: Duration,
     scan_limit: u32,
-) -> Result<Option<LeasedTarget>, sqlx::Error> {
+) -> Result<Option<LeasedTarget>, DbError> {
     let Some(rollout_id) = sqlx::query_scalar::<_, RolloutId>(sql!(
         "SELECT id
          FROM firewall_rules_rollouts
@@ -151,7 +152,9 @@ pub async fn lease_first_canary(
     };
     let leased = pplx_space_rollout_queue::claim(&mut claiming, lease, scan_limit).await;
     // A canary leases one target at a time.
-    Ok(end_transaction(tx, leased).await?.pop())
+    Ok(end_transaction(tx, leased.map_err(DbError::from))
+        .await?
+        .pop())
 }
 
 struct Claiming<'c> {
@@ -469,7 +472,7 @@ pub async fn renew_lease(
     conn: &mut PgConnection,
     target: &LeasedTarget,
     lease: Duration,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let mut tx = conn
         .begin_with(sql!("BEGIN ISOLATION LEVEL READ COMMITTED"))
         .await?;
@@ -478,7 +481,7 @@ pub async fn renew_lease(
         target,
     };
     let renewed = pplx_space_rollout_queue::renew(&mut renewing, lease).await;
-    end_transaction(tx, renewed).await
+    end_transaction(tx, renewed.map_err(DbError::from)).await
 }
 
 struct Renewing<'c, 't> {
@@ -555,10 +558,10 @@ pub enum Requeue {
 /// item. Bookkeeping only; it permits no assignment. Issuance is left as it
 /// is.
 pub async fn requeue(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     target: &LeasedTarget,
     requeue: &Requeue,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let (refund, next_check_in, error): (i64, _, _) = match requeue {
         Requeue::Release { error } => (1, None, error),
         Requeue::Retry {
@@ -596,7 +599,7 @@ pub async fn requeue(
     .bind(refund)
     .bind(next_check_in)
     .bind(error)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected();
     Ok(requeued == 1)
@@ -606,11 +609,11 @@ pub async fn requeue(
 /// pending, or fail those leased `max_attempts` times. Their old tokens no
 /// longer hold them. Issuance and scheduling are left as they are.
 pub async fn redrive_expired(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     rollout_id: RolloutId,
     max_attempts: u64,
-) -> Result<RedriveReport, sqlx::Error> {
-    redrive(executor, rollout_id, max_attempts, Scope::Any).await
+) -> Result<RedriveReport, DbError> {
+    Ok(redrive(executor.into_sqlx(), rollout_id, max_attempts, Scope::Any).await?)
 }
 
 /// [`redrive_expired`]; [`Scope::FirstCanary`] redrives only unissued items.

@@ -16,6 +16,7 @@
 //! identity owns the observation row and its epoch; it should then refuse a
 //! missing row or a different epoch rather than create one.
 
+use pplx_space_postgres_pool::DbError;
 use pplx_space_sql_locator::sql;
 use sqlx::{Connection, PgConnection};
 use time::OffsetDateTime;
@@ -80,7 +81,7 @@ pub async fn open_round(
     target: &LeasedTarget,
     manager_epoch: u64,
     wakeup: &mut impl Wakeup,
-) -> Result<Opening, sqlx::Error> {
+) -> Result<Opening, DbError> {
     let manager_epoch = i64::try_from(manager_epoch).map_err(|_| {
         sqlx::Error::Protocol(format!("manager epoch {manager_epoch} is too large"))
     })?;
@@ -94,7 +95,7 @@ pub async fn open_round(
         }
         other => {
             roll_back(tx).await;
-            other
+            Ok(other?)
         }
     }
 }

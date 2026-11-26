@@ -18,6 +18,7 @@ use pplx_space_cluster_trigger_queue::enqueue_triggers_tx;
 use pplx_space_firewall_rules_store::{
     Issuance, LeasedTarget, Wakeup, issue_canary_and_release, lease_first_canary,
 };
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_state_reconciliation::ReconcileReason;
 use sqlx::{PgConnection, PgPool};
 use tokio_util::sync::CancellationToken;
@@ -35,14 +36,11 @@ const LEASE_SCAN: u32 = 16;
 pub struct FirewallWakeup;
 
 impl Wakeup for FirewallWakeup {
-    async fn wake(
-        &mut self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        node: NodeId,
-    ) -> Result<u64, sqlx::Error> {
-        enqueue_triggers_tx(&mut **tx, [node], ReconcileReason::FirewallRulesChanged)
-            .await
-            .map_err(sqlx::Error::from)
+    async fn wake<C>(&mut self, tx: &mut C, node: NodeId) -> Result<u64, DbError>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
+        enqueue_triggers_tx(tx, [node], ReconcileReason::FirewallRulesChanged).await
     }
 }
 
@@ -61,6 +59,7 @@ pub async fn issue_first_assignment(
         &mut FirewallWakeup,
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 /// What [`run`] runs with; only tests have one.
@@ -90,6 +89,7 @@ pub(crate) async fn tick(pool: &PgPool, config: &Config) -> Result<Option<Issuan
     )
     .await
     .map(Some)
+    .map_err(sqlx::Error::from)
 }
 
 /// Tick under `config` until `shutdown`. With no config, wait for shutdown

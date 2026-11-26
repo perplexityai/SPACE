@@ -20,6 +20,7 @@ use std::fmt;
 use pplx_space_accounts::{NodeId, UserId};
 use pplx_space_firewall_rules_model::{FirewallRuleRevision, RuleRevisionDiff, diff};
 use pplx_space_firewall_rules_protocol::{DecodeError, decode_revision, encode_revision};
+use pplx_space_postgres_pool::DbError;
 use pplx_space_rollout_queue::HeaderPhase;
 use pplx_space_sql_locator::sql;
 use sqlx::{Connection, PgConnection};
@@ -119,8 +120,8 @@ pub enum StartError {
     Stored(#[from] StoredStateError),
 }
 
-impl From<sqlx::Error> for StartError {
-    fn from(error: sqlx::Error) -> Self {
+impl From<DbError> for StartError {
+    fn from(error: DbError) -> Self {
         Self::Stored(error.into())
     }
 }
@@ -134,7 +135,7 @@ impl StartError {
         {
             return Self::SlotTaken;
         }
-        error.into()
+        DbError::from(error).into()
     }
 }
 
@@ -194,7 +195,8 @@ async fn start_with(
     // lock sees what the lock's previous holder committed.
     let mut tx = conn
         .begin_with(sql!("BEGIN ISOLATION LEVEL READ COMMITTED"))
-        .await?;
+        .await
+        .map_err(DbError::from)?;
     let started = start_in(&mut tx, start, &candidate, &document, targets).await;
     end_transaction(tx, started).await
 }
@@ -207,7 +209,8 @@ async fn start_in(
     targets: &mut impl Targets,
 ) -> Result<StartedRollout, StartError> {
     let adopted = lock_control(&mut *tx)
-        .await?
+        .await
+        .map_err(DbError::from)?
         .ok_or(StoredStateError::MissingControlRow)?;
     let adopted = AdoptedRevision::from(adopted);
     if adopted != start.expected_adopted {
@@ -218,7 +221,8 @@ async fn start_in(
         "SELECT id FROM firewall_rules_rollouts WHERE unfinished_slot IS NOT NULL"
     ))
     .fetch_optional(&mut *tx)
-    .await?
+    .await
+    .map_err(DbError::from)?
     {
         return Err(StartError::RolloutInProgress(in_progress));
     }
@@ -241,7 +245,8 @@ async fn start_in(
     .bind(revision_id)
     .bind(document)
     .execute(&mut *tx)
-    .await?;
+    .await
+    .map_err(DbError::from)?;
     let rollout_id = RolloutId(uuid::Uuid::now_v7());
     let generation = sqlx::query_scalar::<_, i64>(sql!(
         "INSERT INTO firewall_rules_rollouts (
@@ -268,12 +273,13 @@ async fn start_in(
     .bind(nodes.iter().map(|node| node.as_uuid()).collect::<Vec<_>>())
     .bind(ItemPhase::Pending.as_str())
     .execute(&mut *tx)
-    .await?;
+    .await
+    .map_err(DbError::from)?;
     // The schema keeps it non-negative; report a violation rather than guess.
     let generation = u64::try_from(generation).map_err(|_| {
-        sqlx::Error::Decode(
+        DbError::from(sqlx::Error::Decode(
             format!("firewall rules rollout {rollout_id} has a negative generation").into(),
-        )
+        ))
     })?;
     Ok(StartedRollout {
         revision_id,

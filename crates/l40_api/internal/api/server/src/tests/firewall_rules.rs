@@ -14,6 +14,7 @@ use pplx_space_firewall_rules_store::{
     lease_targets, open_round, requeue,
 };
 use pplx_space_node_status_store::test_support::{SnapshotSeed, upsert_snapshot};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_rpc_auth::test_support::{
     TokenReviewStatus, pod_bound_service_account_status, projected_token, service_account_status,
 };
@@ -357,14 +358,11 @@ async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
 struct Wake;
 
 impl Wakeup for Wake {
-    async fn wake(
-        &mut self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        node: NodeId,
-    ) -> Result<u64, sqlx::Error> {
-        enqueue_triggers_tx(&mut **tx, [node], ReconcileReason::FirewallRulesChanged)
-            .await
-            .map_err(sqlx::Error::from)
+    async fn wake<C>(&mut self, tx: &mut C, node: NodeId) -> Result<u64, DbError>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
+        enqueue_triggers_tx(tx, [node], ReconcileReason::FirewallRulesChanged).await
     }
 }
 
