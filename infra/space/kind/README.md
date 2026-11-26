@@ -359,8 +359,10 @@ included, name them with `--scenario` (repeat the flag for more) and give
 is built: an ID that doesn't exist, or one the run would withhold (its
 templates, backend or browser), fails it at once. The runs are spread across
 the benches by the same duration-balanced partition, and each bench runs its
-share in the order the scenarios were named, each occurrence apart (`A, B, A`
-runs in that order). The coverage check expects each named occurrence as
+share in the order the scenarios were named within each API surface, each
+occurrence apart (`A, B, A` runs in that order). The bench's ECW pass runs
+before its native one, so a native scenario named before an ECW one still
+runs after it. The coverage check expects each named occurrence as
 often as it was named, and run: one a bench's mode skipped did not run, so
 the run is incomplete (exit 2). Each bench still runs the baseline first: it
 is the bench's bring-up and a health check, and the typed pass assumes the

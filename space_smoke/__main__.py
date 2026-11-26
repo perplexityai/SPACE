@@ -539,7 +539,9 @@ def _run_all(
         if named:
             # A named run's share keeps each occurrence apart, in the order the
             # run named them, so a caller can put last one that disturbs the
-            # bench, and `A, B, A` runs in that order.
+            # bench, and `A, B, A` runs in that order. That holds within this
+            # pass's surface: smoke-kind-typed.sh `all` runs the ECW pass,
+            # then the native one.
             scenarios = tuple(
                 inventory[position]
                 for position in shard_positions(
@@ -925,7 +927,8 @@ def _drain_v1_skipped(scenario: Scenario[Any], services: SmokeServices) -> bool:
 
 BROWSER_SCENARIOS_ENV = "SPACE_SMOKE_BROWSER_SCENARIOS"
 # The scenarios an `--all` pass runs instead of its tier selection, comma
-# separated, in order and as often as listed, manual ones included
+# separated, as often as listed and, within each API surface's pass, in the
+# order listed, manual ones included
 # (scripts/tests/smoke-kind-parallel.sh --scenario and --repeat).
 RUN_SCENARIOS_ENV = "SPACE_SMOKE_RUN_SCENARIOS"
 

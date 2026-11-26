@@ -37,7 +37,8 @@
 #                  (default: ~/.space-devbox/kind-parallel/<run id>)
 #   --scenario ID  run this scenario instead of the tier selection, whatever
 #                  its tier, manual included; repeat the flag for more. Each
-#                  bench runs its share in the order named. An ID that doesn't
+#                  bench runs its share in the order named within each API
+#                  surface (its ECW pass, then its native one). An ID that doesn't
 #                  exist or can't run here fails before any bench comes up
 #   --repeat N     run each named scenario N times (default 1), spread across
 #                  the benches by the same duration-balanced partition; the
