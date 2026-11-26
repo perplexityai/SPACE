@@ -141,7 +141,7 @@ pub(crate) async fn fence_v2_node(
         return Ok(Fence::NoInstance);
     };
     pplx_space_sandbox_store::drain_terminate::release_durable_suspended(
-        &mut tx,
+        &mut *tx,
         node_id,
         node.k8s_node_name.as_deref(),
         execution_ownership_ttl_secs(),
@@ -374,7 +374,7 @@ pub(crate) async fn record_v2_evacuation(
     sandbox_id: SandboxId,
     artifact: Uuid,
 ) -> Result<EvacuationRecord, String> {
-    let sql_error = |error: sqlx::Error| error.to_string();
+    let sql_error = |error: pplx_space_postgres_pool::DbError| sqlx::Error::from(error).to_string();
     let row = drain_evacuation::v2_evacuation_row(pool, sandbox_id, node_id)
         .await
         .map_err(sql_error)?;

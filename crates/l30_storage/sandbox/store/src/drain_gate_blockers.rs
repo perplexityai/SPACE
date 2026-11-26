@@ -5,6 +5,7 @@
 use std::sync::LazyLock;
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_portability::drain_gate_blockers_for_node;
 use pplx_space_sql_locator::sql;
 
@@ -31,12 +32,11 @@ static COUNT_ON_NODE: LazyLock<String> = LazyLock::new(|| {
 /// `node_id`: the mid-flight and not-yet-portable suspended rows pinned to it,
 /// plus any sandbox whose full snapshot upload is still in flight from it.
 /// A read; it takes no lock.
-pub async fn count_on_node(
-    executor: impl sqlx::PgExecutor<'_>,
-    node_id: NodeId,
-) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(COUNT_ON_NODE.as_str()))
-        .bind(node_id)
-        .fetch_one(executor)
-        .await
+pub async fn count_on_node(executor: impl Executor<'_>, node_id: NodeId) -> Result<i64, DbError> {
+    Ok(
+        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(COUNT_ON_NODE.as_str()))
+            .bind(node_id)
+            .fetch_one(executor.into_sqlx())
+            .await?,
+    )
 }

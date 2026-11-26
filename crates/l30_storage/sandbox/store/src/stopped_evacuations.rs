@@ -4,6 +4,7 @@
 use std::sync::LazyLock;
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::{
     current_disk_artifact_backup_ready, snapshot_is_current_local_artifact,
@@ -68,15 +69,15 @@ static STATE: LazyLock<String> = LazyLock::new(|| {
 /// `None` when the row is gone. A read; it takes no lock and has no freshness
 /// term (the claim guarantees what it can see was minted by this evacuation).
 pub async fn state(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     source_node_id: NodeId,
-) -> Result<Option<StoppedEvacuationRow>, sqlx::Error> {
-    sqlx::query_as(sqlx::AssertSqlSafe(STATE.as_str()))
+) -> Result<Option<StoppedEvacuationRow>, DbError> {
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(STATE.as_str()))
         .bind(sandbox_id)
         .bind(source_node_id)
-        .fetch_optional(executor)
-        .await
+        .fetch_optional(executor.into_sqlx())
+        .await?)
 }
 
 /// The claimed stopped evacuation that has waited longest for its bytes.
@@ -126,10 +127,8 @@ static LONGEST_STALL: LazyLock<String> = LazyLock::new(|| {
 /// The claimed stopped evacuation on a force-draining node that has waited
 /// longest for its bytes, or `None` when none is waiting. A read; it takes no
 /// lock, and its age is measured against the executor's `NOW()`.
-pub async fn longest_stall(
-    executor: impl sqlx::PgExecutor<'_>,
-) -> Result<Option<LongestStall>, sqlx::Error> {
-    sqlx::query_as(sqlx::AssertSqlSafe(LONGEST_STALL.as_str()))
-        .fetch_optional(executor)
-        .await
+pub async fn longest_stall(executor: impl Executor<'_>) -> Result<Option<LongestStall>, DbError> {
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(LONGEST_STALL.as_str()))
+        .fetch_optional(executor.into_sqlx())
+        .await?)
 }

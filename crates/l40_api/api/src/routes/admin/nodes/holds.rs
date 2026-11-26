@@ -141,6 +141,6 @@ pub(in crate::routes::admin) async fn list_node_holds(
     let residency = cluster_residency_evidence();
     match node_holds::list(&state.pool, node_id, residency, NODE_HOLDS_LIMIT).await {
         Ok(holds) => Json(holds_response(node_id, residency, holds)).into_response(),
-        Err(err) => read_db_error(err),
+        Err(err) => read_db_error(sqlx::Error::from(err)),
     }
 }

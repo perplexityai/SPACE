@@ -112,7 +112,9 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
         // NULL`) is excluded — it reads from the durable S3 snapshot, so the
         // source can terminate without losing it. See
         // `pplx_space_sandbox_portability::drain_gate_blockers_for_node`.
-        drain_gate_blockers::count_on_node(&self.pool, node_id).await
+        drain_gate_blockers::count_on_node(&self.pool, node_id)
+            .await
+            .map_err(sqlx::Error::from)
     }
 
     async fn mark_terminating(&self, node_id: NodeId) -> Result<bool, sqlx::Error> {

@@ -348,7 +348,7 @@ pub(super) async fn v2_start_stopped_refusal(
         match pplx_space_sandbox_store::drain_admission::stopped_among(&state.pool, &pending).await
         {
             Ok(stopped) => stopped,
-            Err(error) => return StoppedCheck::ReadFailed(error),
+            Err(error) => return StoppedCheck::ReadFailed(sqlx::Error::from(error)),
         };
     if stopped.is_empty() {
         return StoppedCheck::Ran;

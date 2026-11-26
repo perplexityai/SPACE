@@ -7,10 +7,10 @@
 use std::sync::LazyLock;
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::fresh_ready_snapshot_exists;
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 use uuid::Uuid;
 
 /// A sandbox row as the v2 evacuation record reads it.
@@ -32,10 +32,10 @@ pub struct V2EvacuationRow {
 /// reads it. A plain read; `node_id` only supplies the name
 /// `executes_elsewhere` compares with. `None` when the row is gone.
 pub async fn v2_evacuation_row(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     node_id: NodeId,
-) -> Result<Option<V2EvacuationRow>, sqlx::Error> {
+) -> Result<Option<V2EvacuationRow>, DbError> {
     type Row = (String, Option<NodeId>, Option<NodeId>, Option<Uuid>, bool);
     let row: Option<Row> = sqlx::query_as(sql!(
         "SELECT s.lifecycle, s.active_node_id, s.target_node_id, s.current_local_artifact_id,
@@ -51,7 +51,7 @@ pub async fn v2_evacuation_row(
     ))
     .bind(sandbox_id)
     .bind(node_id)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(row.map(
         |(
@@ -85,14 +85,17 @@ static FRESH_READY_FULL_SNAPSHOT: LazyLock<String> = LazyLock::new(|| {
 /// pins an artifact, that is a ready, stored full snapshot of that artifact.
 /// For one that pins none, the case the v2 evacuation record asks, it is a
 /// ready, stored full snapshot taken at or after `placement_changed_at`, or
-/// any such snapshot while that is NULL. Fails with `RowNotFound` when the row
-/// is gone.
+/// any such snapshot while that is NULL. Fails with a [`DbError`] of kind
+/// [`DbErrorKind::NotFound`](pplx_space_postgres_pool::DbErrorKind::NotFound)
+/// when the row is gone.
 pub async fn fresh_ready_full_snapshot(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sqlx::AssertSqlSafe(FRESH_READY_FULL_SNAPSHOT.as_str()))
-        .bind(sandbox_id)
-        .fetch_one(executor)
-        .await
+) -> Result<bool, DbError> {
+    Ok(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(FRESH_READY_FULL_SNAPSHOT.as_str()))
+            .bind(sandbox_id)
+            .fetch_one(executor.into_sqlx())
+            .await?,
+    )
 }
