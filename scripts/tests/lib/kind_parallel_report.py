@@ -16,12 +16,14 @@ summary.md, summary.json and timeline.txt there, and exits as the typed suite
 ranks a suite (space_smoke/suite.py, suite_exit_code): 1 when any scenario
 failed; else 2 when a bench did not come up, a scenario was inconclusive or did
 not finish, a pass exited 2 outside any scenario, the benches did not cover
-the inventory exactly once (a named run: each scenario as often as named),
-the checkout changed during the run, or the run's
-teardown left benches; else 42
-when a scenario warned; else 0. A failure the known-failures list excused
-(`KNOWN FAILURE <id>` in its pass) is listed and does not count as one, and a
-scenario a bench's mode skipped after the partition counts as covered. It
+the inventory exactly once (a named run: each named occurrence as often as
+named, every one of them run), the checkout changed during the run, or the
+run's teardown left benches; else 42 when a scenario warned; else 0. A
+failure the known-failures list excused (`KNOWN FAILURE <id>` in its pass,
+`KNOWN FAILURE <id> (run N)` for the Nth attempt of one the pass ran more
+than once) is listed and does not count as one; each line excuses one
+attempt. A scenario a bench's mode skipped after the partition counts as
+covered, except in a named run, where it did not run what was named. It
 needs only the standard library.
 """
 
@@ -43,29 +45,43 @@ SURFACES = ("ecw", "native")
 def inventory(benches: int) -> int:
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     from space_smoke.scenarios import REGISTRY
-    from space_smoke.sharding import joint_inventories, select_shard
+    from space_smoke.sharding import joint_inventories, named_withheld, select_shard
 
     # The variables a bench's `--all` pass reads (space_smoke/__main__.py,
     # _run_all); smoke-kind-parallel.sh runs this with a bench's environment.
     tiers = tuple(
         part.strip() for part in os.environ.get("SPACE_SMOKE_TIERS", "routine").split(",")
     )
+    named = tuple(
+        part.strip()
+        for part in os.environ.get("SPACE_SMOKE_RUN_SCENARIOS", "").split(",")
+        if part.strip()
+    )
+    selection = {
+        "template": os.environ.get("E2B_TEMPLATE") or None,
+        "backend": os.environ.get("SPACE_SMOKE_BACKEND", "kind"),
+        "browser_selection": os.environ.get("SPACE_SMOKE_BROWSER_SCENARIOS") or "run",
+    }
+    # A named run that cannot run every occurrence it names is refused here,
+    # before any bench comes up (smoke-kind-parallel.sh runs this first).
+    withheld = named_withheld(REGISTRY, named, **selection)
+    if withheld:
+        print(
+            "ERROR: these named scenarios cannot run: "
+            + "; ".join(f"{scenario_id} ({reason})" for scenario_id, reason in withheld),
+            file=sys.stderr,
+        )
+        return 2
     inventories = joint_inventories(
         REGISTRY,
-        template=os.environ.get("E2B_TEMPLATE") or None,
         tiers=tiers,
         include_scenarios=tuple(
             part.strip()
             for part in os.environ.get("SPACE_SMOKE_INCLUDE_SCENARIOS", "").split(",")
             if part.strip()
         ),
-        backend=os.environ.get("SPACE_SMOKE_BACKEND", "kind"),
-        browser_selection=os.environ.get("SPACE_SMOKE_BROWSER_SCENARIOS") or "run",
-        run_scenarios=tuple(
-            part.strip()
-            for part in os.environ.get("SPACE_SMOKE_RUN_SCENARIOS", "").split(",")
-            if part.strip()
-        ),
+        run_scenarios=named,
+        **selection,
     )
     shares = {
         str(index): {
@@ -86,6 +102,7 @@ def inventory(benches: int) -> int:
     json.dump(
         {
             "tiers": list(tiers),
+            "named": list(named),
             "surfaces": {
                 surface: [scenario.id for scenario in inventories[surface]]
                 for surface in SURFACES
@@ -107,8 +124,9 @@ SURFACE = re.compile(r"^--- typed smoke on the (\S+) API surface$")
 SUITE = re.compile(r"^SUITE: (\d+) passed, (\d+) warned, (\d+) failed, (\d+) inconclusive")
 SHARD = re.compile(r"^SHARD \d+/\d+: ")
 SKIPPED = re.compile(r"^SKIPPED (\S+): (.*)$")
-# The runner's report of a failure SPACE_SMOKE_KNOWN_FAILURES excused.
-KNOWN_FAILURE = re.compile(r"^  KNOWN FAILURE (\S+): ")
+# The runner's report of a failure SPACE_SMOKE_KNOWN_FAILURES excused: one
+# attempt, the Nth when the pass ran the scenario more than once.
+KNOWN_FAILURE = re.compile(r"^  KNOWN FAILURE (\S+)(?: \(run (\d+)\))?: ")
 # smoke-kind-typed.sh `all` repeats both passes' SUITE lines after this; read
 # as part of the last pass they would replace its counts with the first's.
 SUMMARY = "=== typed smoke summary"
@@ -120,7 +138,9 @@ VERDICT = {0: "pass", 42: "warn", 1: "fail"}
 
 
 def parse_typed(log: Path) -> dict:
-    """Per surface: each attempt as [scenario, exit or None], post-partition skips, SUITE."""
+    """Per surface: each attempt as [scenario, exit or None], post-partition
+    skips, the attempts the known-failures list excused as (scenario, Nth run
+    of it in the pass), SUITE."""
 
     surfaces: dict[str, dict] = {}
     current = None
@@ -158,7 +178,8 @@ def parse_typed(log: Path) -> dict:
                     attempt[1] = int(match[2])
                     break
         elif match := KNOWN_FAILURE.match(line):
-            current["known"].add(match[1])
+            # A line without a run number is a scenario the pass ran once.
+            current["known"].add((match[1], int(match[2] or 1)))
         elif (match := SKIPPED.match(line)) and partitioned:
             # One entry per line, as runs are: a pair skipped twice is covered twice.
             current["skipped"].append(match[1])
@@ -337,11 +358,13 @@ def summarize(out: Path) -> int:
             pass_failed = False
             seen.setdefault(surface, Counter()).update(scenario for scenario, _ in data["run"])
             skipped.setdefault(surface, Counter()).update(data["skipped"])
+            attempts: Counter = Counter()
             for scenario, code in data["run"]:
+                attempts[scenario] += 1
                 if code != 0:
                     if code is None:
                         verdict = "unfinished"
-                    elif code == 1 and scenario in data["known"]:
+                    elif code == 1 and (scenario, attempts[scenario]) in data["known"]:
                         verdict = "known failure"
                     else:
                         verdict = VERDICT.get(code, "inconclusive")
@@ -356,6 +379,7 @@ def summarize(out: Path) -> int:
                             "bench": bench,
                             "surface": surface,
                             "scenario": scenario,
+                            "attempt": attempts[scenario],
                             "verdict": verdict,
                             "exit": code,
                             "log": str(directory / "typed.log"),
@@ -375,20 +399,22 @@ def summarize(out: Path) -> int:
         if None in statuses or result != f"typed_exit_{statuses[0] or statuses[1]}":
             incomplete = True
 
-    coverage = {"checked": inventory_data is not None, "surfaces": {}}
+    named = bool(inventory_data and inventory_data.get("named"))
+    coverage = {"checked": inventory_data is not None, "named": named, "surfaces": {}}
     if inventory_data is None:
         incomplete = True
     else:
         for surface in SURFACES:
-            # A named run lists a scenario once per repetition, so each pair
+            # A named run lists a scenario once per occurrence, so each pair
             # is expected as many times as it is listed; an implicit
             # selection lists each once.
             expected = Counter(inventory_data["surfaces"][surface])
             ran = seen.get(surface, Counter())
             mode_skipped = skipped.get(surface, Counter())
-            # Each pair as often as expected across the benches, run or
-            # skipped by a mode.
-            occurrences = ran + mode_skipped
+            # Each pair as often as expected across the benches: run, or
+            # skipped by a mode, which covers an implicit selection's pair but
+            # not a named run's, which asked for it to run.
+            occurrences = ran if named else ran + mode_skipped
             entry = {
                 "expected": sum(expected.values()),
                 "ran": sum(ran.values()),
@@ -523,7 +549,9 @@ def summarize(out: Path) -> int:
     if not_passed:
         md += ["| bench | surface | scenario | verdict | log |", "|---|---|---|---|---|"]
         md += [
-            f"| {r['bench']} | {r['surface']} | {r['scenario']} | {r['verdict']} | {r['log']} |"
+            f"| {r['bench']} | {r['surface']} | {r['scenario']}"
+            + (f" (run {r['attempt']})" if r["attempt"] > 1 else "")
+            + f" | {r['verdict']} | {r['log']} |"
             for r in not_passed
         ]
     else:
@@ -535,7 +563,8 @@ def summarize(out: Path) -> int:
         md.append(
             f"- {surface}: expected {entry['expected']}, ran {entry['ran']}, "
             f"skipped by mode {len(entry['skipped_by_mode'])}, "
-            f"exactly once: {'yes' if entry['exactly_once'] else 'NO'}"
+            + ("each as often as named, all run" if named else "exactly once")
+            + f": {'yes' if entry['exactly_once'] else 'NO'}"
             + (f"; missing ({len(entry['missing'])}) {entry['missing'][:10]}" if entry["missing"] else "")
             + (f"; unexpected {entry['unexpected']}" if entry["unexpected"] else "")
             + (f"; duplicated {entry['duplicated']}" if entry["duplicated"] else "")

@@ -355,10 +355,16 @@ scripts/tests/smoke-kind-parallel.sh teardown               # remove what a run 
 
 To run chosen scenarios instead of the tier selection, manual ones
 included, name them with `--scenario` (repeat the flag for more) and give
-`--repeat N` to run each N times. The runs are spread across the benches by
-the same duration-balanced partition, each bench runs its share in the order
-the scenarios were named, and the coverage check expects each scenario as
-often as it was named. Nothing outside the tier selection runs unless named:
+`--repeat N` to run each N times. The run checks the names before anything
+is built: an ID that doesn't exist, or one the run would withhold (its
+templates, backend or browser), fails it at once. The runs are spread across
+the benches by the same duration-balanced partition, and each bench runs its
+share in the order the scenarios were named, each occurrence apart (`A, B, A`
+runs in that order). The coverage check expects each named occurrence as
+often as it was named, and run: one a bench's mode skipped did not run, so
+the run is incomplete (exit 2). Each bench still runs the baseline first: it
+is the bench's bring-up and a health check, and the typed pass assumes the
+stack it leaves. Nothing outside the tier selection runs unless named:
 
 ```bash
 scripts/tests/smoke-kind-parallel.sh --benches 4 \
@@ -372,7 +378,8 @@ together run both API surfaces' inventory once each. The summary
 printed at the end) lists each bench's phase times and SUITE counts, every
 scenario that did not pass with its log, and checks that the benches cover the
 inventory exactly once: each (surface, scenario) pair has one `=== RUN`, or was
-skipped by a bench's mode after the partition, which counts as covered. The
+skipped by a bench's mode after the partition, which counts as covered (a
+named run instead expects each occurrence as often as named, and run). The
 script exits as the typed suite ranks a suite: 1 when a scenario failed that
 the known-failures list (`SPACE_SMOKE_KNOWN_FAILURES`) did not excuse; else 2
 when a bench did not come up, a scenario was inconclusive or did not finish, a

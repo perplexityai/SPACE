@@ -36,10 +36,12 @@
 #   --out DIR      where logs, timings and the summary go
 #                  (default: ~/.space-devbox/kind-parallel/<run id>)
 #   --scenario ID  run this scenario instead of the tier selection, whatever
-#                  its tier, manual included; repeat the flag for more, which
-#                  run in the order named on each bench
+#                  its tier, manual included; repeat the flag for more. Each
+#                  bench runs its share in the order named. An ID that doesn't
+#                  exist or can't run here fails before any bench comes up
 #   --repeat N     run each named scenario N times (default 1), spread across
-#                  the benches by the same duration-balanced partition
+#                  the benches by the same duration-balanced partition; the
+#                  run fails unless every occurrence ran
 #
 # Exit status: as the typed suite ranks a suite: 1 a scenario failed that
 # SPACE_SMOKE_KNOWN_FAILURES did not excuse; else 2
@@ -973,11 +975,22 @@ phase run host_prep prepare_host >"$HOST/prepare.log" 2>&1 \
 phase run registries start_registries >"$HOST/registries.log" 2>&1 \
   || { tail -n 30 "$HOST/registries.log" >&2; die "the host registries did not start; see $HOST/registries.log"; }
 
+# A named run's names are checked before anything is built or brought up:
+# the inventory refuses an ID that doesn't exist, or one this run's
+# selection would withhold (its template, backend or browser), rather than
+# the coverage check finding it missing once every bench has run.
+if [[ -n "${SPACE_SMOKE_RUN_SCENARIOS:-}" ]]; then
+  phase host inventory inventory >"$HOST/inventory.log" 2>&1 \
+    || { tail -n 30 "$HOST/inventory.log" >&2; die "the named scenarios cannot run as named; see $HOST/inventory.log"; }
+  check_source "the checkout after host step inventory"
+  mark inventory ok
+fi
+
 host_step rust rust_image
 host_step shared-images shared_images
 host_step build-cache build_cache
 host_step seed seed
-host_step inventory inventory
+[[ -n "${SPACE_SMOKE_RUN_SCENARIOS:-}" ]] || host_step inventory inventory
 
 declare -A BENCH_PIDS=()
 for i in $(seq 1 "$BENCHES"); do

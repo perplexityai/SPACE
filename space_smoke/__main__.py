@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +20,13 @@ from space_smoke.services import (
     SmokeServices,
     repair_orphaned_kind_faults,
 )
-from space_smoke.sharding import JOINT_SURFACES, joint_inventories, select_shard
+from space_smoke.sharding import (
+    JOINT_SURFACES,
+    joint_inventories,
+    named_withheld,
+    select_shard,
+    shard_positions,
+)
 from space_smoke.suite import (
     KNOWN_FAILURES_ENV,
     RESULT_PREFIX,
@@ -307,6 +314,15 @@ def _print_known_failures(
     ran = tuple(result for result in results if result.scenario_id in known_failures)
     excused = tuple(result for result in ran if is_known_failure(result, known_failures))
     passed = tuple(result for result in ran if result.exit_code == 0)
+    # A scenario the pass ran more than once names which run each line
+    # excuses, so a reader of the log (kind_parallel_report.py) excuses that
+    # attempt alone.
+    runs = Counter(result.scenario_id for result in results)
+    attempt: dict[int, int] = {}
+    seen: Counter[str] = Counter()
+    for result in results:
+        seen[result.scenario_id] += 1
+        attempt[id(result)] = seen[result.scenario_id]
     print(
         f"KNOWN FAILURES ({path}): {len(excused)} failed as listed, "
         f"{len(ran) - len(excused) - len(passed)} failed otherwise, "
@@ -314,7 +330,8 @@ def _print_known_failures(
     )
     for result in excused:
         reason = known_failures[result.scenario_id].reason
-        print(f"  KNOWN FAILURE {result.scenario_id}: {reason}")
+        which = f" (run {attempt[id(result)]})" if runs[result.scenario_id] > 1 else ""
+        print(f"  KNOWN FAILURE {result.scenario_id}{which}: {reason}")
     for result in passed:
         reason = known_failures[result.scenario_id].reason
         print(
@@ -388,40 +405,31 @@ def _run_all(
     )
     named = _run_scenarios()
     try:
+        if "manual" in selected_tiers and not named:
+            raise ValueError("manual scenarios run only by name, not through --all or --category")
+        eligible = REGISTRY.select(
+            category=category, template=template, tiers=selected_tiers,
+            include_scenarios=included,
+        )
         if named:
-            if category is not None:
-                raise ValueError(f"{RUN_SCENARIOS_ENV} selects for --all, not --category")
-            # Exactly these, in this order and as often as listed, manual
-            # ones included: a named run replaces the tier selection.
-            eligible = tuple(REGISTRY.get(scenario_id) for scenario_id in named)
-        else:
-            if "manual" in selected_tiers:
-                raise ValueError(
-                    "manual scenarios run only by name, not through --all or --category"
-                )
-            eligible = REGISTRY.select(
-                category=category, template=template, tiers=selected_tiers,
-                include_scenarios=included,
-            )
+            eligible = _named_selection(named, category=category, template=template)
     except (ValueError, KeyError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
-    if named:
-        print(f"NAMED SCENARIOS: {', '.join(named)}")
-    else:
-        print(f"TIERS: {', '.join(selected_tiers)}")
-        if included:
-            print(f"ADDITIONAL MAIN SCENARIOS: {', '.join(included)}")
-        # Withheld cases are visible holes in coverage, never passes.
-        for held in REGISTRY.select(
-            category=category, template=template, include_quarantined=True, tiers=TIERS,
-        ):
-            if held.quarantined is not None:
-                print(f"QUARANTINED {held.id}: {held.quarantined}")
-            elif held.tier == "manual":
-                print(f"MANUAL {held.id}: {held.manual_reason}")
-            elif held.tier not in selected_tiers and held.id not in included:
-                print(f"SKIPPED {held.id}: tier {held.tier} is not selected")
+    print(f"NAMED SCENARIOS: {', '.join(named)}" if named else f"TIERS: {', '.join(selected_tiers)}")
+    if included and not named:
+        print(f"ADDITIONAL MAIN SCENARIOS: {', '.join(included)}")
+    # Withheld cases are visible holes in coverage, never passes. A named run
+    # withholds nothing it names (below), and lists nothing else.
+    for held in () if named else REGISTRY.select(
+        category=category, template=template, include_quarantined=True, tiers=TIERS,
+    ):
+        if held.quarantined is not None:
+            print(f"QUARANTINED {held.id}: {held.quarantined}")
+        elif held.tier == "manual":
+            print(f"MANUAL {held.id}: {held.manual_reason}")
+        elif held.tier not in selected_tiers and held.id not in included:
+            print(f"SKIPPED {held.id}: tier {held.tier} is not selected")
     api_surface = os.environ.get("SPACE_SMOKE_API_SURFACE", "ecw")
     if category is None:
         eligible = tuple(
@@ -460,6 +468,18 @@ def _run_all(
             if withheld.browser is not None:
                 print(f"SKIPPED {withheld.id}: withheld from this run ({BROWSER_SCENARIOS_ENV}=withhold)")
         scenarios = tuple(scenario for scenario in scenarios if scenario.browser is None)
+    # A named run runs every occurrence it names: one withheld here, by its
+    # template, backend or browser, fails the pass before anything runs.
+    withheld = named_withheld(
+        REGISTRY, named, template=template, backend=backend, browser_selection=browser_selection
+    )
+    if withheld:
+        print(
+            f"ERROR: {RUN_SCENARIOS_ENV} names scenarios this run cannot run: "
+            + "; ".join(f"{scenario_id} ({reason})" for scenario_id, reason in withheld),
+            file=sys.stderr,
+        )
+        return 2
     # A misspelt substrate is refused before the bootstrap; on Kind the bench's
     # own substrate is read once it has run (_apply_substrate).
     for variable, substrate in _substrate_requests(backend).items():
@@ -497,10 +517,16 @@ def _run_all(
             inventories=inventories,
         )
         if named:
-            # A named run's share keeps the order the run named its
-            # scenarios in, so a caller can put last one that disturbs the
-            # bench; repeats of one scenario run back to back.
-            scenarios = tuple(sorted(scenarios, key=lambda scenario: named.index(scenario.id)))
+            # A named run's share keeps each occurrence apart, in the order the
+            # run named them, so a caller can put last one that disturbs the
+            # bench, and `A, B, A` runs in that order.
+            scenarios = tuple(
+                inventory[position]
+                for position in shard_positions(
+                    inventory, index=index, count=count, api_surface=api_surface,
+                    inventories=inventories,
+                )
+            )
         print(f"SHARD {index}/{count}: {len(scenarios)} scenarios ({api_surface})")
         # Fewer named runs than shards leave some shards nothing, which is
         # their whole share.
@@ -563,6 +589,7 @@ def _run_all(
         print(f"ERROR: {type(error).__name__}: {error}", file=sys.stderr)
         return 2
 
+    share = scenarios
     scenarios, substrate_error = _apply_substrate(scenarios, services, backend)
     if substrate_error is not None:
         print(f"ERROR: {substrate_error}", file=sys.stderr)
@@ -587,6 +614,15 @@ def _run_all(
     telemetry_error = telemetry_error or browser_error
     if not scenarios:
         return _mode_emptied(selection, "browser state", shard, telemetry_error)
+
+    # A named occurrence a bench mode skipped did not run: the pass runs the
+    # rest and ends incomplete.
+    not_run = Counter(scenario.id for scenario in share) - Counter(scenario.id for scenario in scenarios)
+    if named and not_run:
+        telemetry_error = telemetry_error or (
+            f"{RUN_SCENARIOS_ENV} names scenarios this bench's modes skipped: "
+            + ", ".join(f"{scenario_id} x{count}" for scenario_id, count in sorted(not_run.items()))
+        )
 
     environment = dict(os.environ)
     if environment.get("SPACE_SMOKE_BACKEND", "kind") == "kind":
@@ -660,6 +696,14 @@ def _mode_emptied(
 
     if error is not None:
         print(f"ERROR: {error}", file=sys.stderr)
+        return 2
+    # A named run's share holds only what it named, so a shard left empty
+    # skipped named occurrences: they did not run.
+    if _run_scenarios():
+        print(
+            f"ERROR: this bench's {mode} skipped every scenario {RUN_SCENARIOS_ENV} gave {selection}",
+            file=sys.stderr,
+        )
         return 2
     if shard is None or shard[1] == 1:
         print(
@@ -846,6 +890,21 @@ RUN_SCENARIOS_ENV = "SPACE_SMOKE_RUN_SCENARIOS"
 def _run_scenarios() -> tuple[str, ...]:
     return tuple(
         part.strip() for part in os.environ.get(RUN_SCENARIOS_ENV, "").split(",") if part.strip()
+    )
+
+
+def _named_selection(
+    named: tuple[str, ...], *, category: str | None, template: str | None
+) -> tuple[Scenario[Any], ...]:
+    """A named run's selection, in place of the tier selection: exactly
+    these, in this order and as often as listed, manual ones included, but
+    each only where its templates allow, as naming one scenario (`_run`)
+    keeps them. An unknown ID is a `KeyError`."""
+
+    if category is not None:
+        raise ValueError(f"{RUN_SCENARIOS_ENV} selects for --all, not --category")
+    return tuple(
+        scenario for scenario in map(REGISTRY.get, named) if scenario.applies_to(template)
     )
 BROWSER_SELECTIONS = ("run", "require", "withhold")
 

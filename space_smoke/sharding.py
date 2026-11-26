@@ -211,15 +211,19 @@ def joint_inventories(
     """Each joint surface's eligible inventory, as a sharded `--all` pass filters it.
 
     The tiers and extra scenarios, or with `run_scenarios` exactly those, in
-    that order and as often as listed, whatever their tier; then the surface,
-    the backend and browser withholding; mode-dependent skips come after the
+    that order and as often as listed, whatever their tier but not whatever
+    their templates; then the surface, the backend and browser withholding; mode-dependent skips come after the
     partition. Every pass of a sharded run partitions these, and so does
     anything that checks the run's coverage
     (scripts/tests/lib/kind_parallel_report.py).
     """
 
     selected = (
-        tuple(registry.get(scenario_id) for scenario_id in run_scenarios)
+        tuple(
+            scenario
+            for scenario in map(registry.get, run_scenarios)
+            if scenario.applies_to(template)
+        )
         if run_scenarios
         else registry.select(
             category=None, template=template, tiers=tiers, include_scenarios=include_scenarios,
@@ -235,6 +239,41 @@ def joint_inventories(
         )
         for surface in JOINT_SURFACES
     }
+
+
+def named_withheld(
+    registry: ScenarioRegistry,
+    run_scenarios: tuple[str, ...],
+    *,
+    template: str | None,
+    backend: str,
+    browser_selection: str,
+) -> list[tuple[str, str]]:
+    """Each occurrence in `run_scenarios` that no joint surface's inventory
+    holds (`joint_inventories`), with why: an unknown ID, a template it
+    doesn't apply to, another backend, a surface no sharded run covers, or
+    browser withholding. A named run that withholds any did not run what it
+    named. Mode-dependent skips are a bench's, known only once it is up."""
+
+    withheld: list[tuple[str, str]] = []
+    for scenario_id in run_scenarios:
+        try:
+            scenario = registry.get(scenario_id)
+        except KeyError:
+            withheld.append((scenario_id, "no such scenario"))
+            continue
+        if not scenario.applies_to(template):
+            reason = f"applies to template(s) {', '.join(sorted(scenario.templates or ()))}, not {template}"
+        elif backend not in scenario.backends:
+            reason = f"runs only on backend(s) {', '.join(sorted(scenario.backends))}"
+        elif not set(scenario.api_surfaces) & set(JOINT_SURFACES):
+            reason = f"runs only on API surface(s) {', '.join(sorted(scenario.api_surfaces))}"
+        elif browser_selection == "withhold" and scenario.browser is not None:
+            reason = "needs a browser, which this run withholds"
+        else:
+            continue
+        withheld.append((scenario_id, reason))
+    return withheld
 
 
 def select_shard(
@@ -254,21 +293,45 @@ def select_shard(
     pair still runs on exactly one shard.
     """
 
+    chosen = shard_positions(
+        scenarios, index=index, count=count, api_surface=api_surface, inventories=inventories
+    )
+    return tuple(sorted((scenarios[position] for position in chosen), key=lambda scenario: scenario.id))
+
+
+def shard_positions(
+    scenarios: tuple[Scenario[Any], ...],
+    *,
+    index: int,
+    count: int,
+    api_surface: str,
+    inventories: Mapping[str, tuple[Scenario[Any], ...]] | None = None,
+) -> tuple[int, ...]:
+    """`select_shard`'s share as positions in `scenarios`, in position order.
+
+    A named run lists a scenario once per occurrence, so its share keeps each
+    occurrence apart and in the order named. Occurrences of one scenario
+    have equal hints, IDs and surfaces; their positions break that tie, which
+    changes which occurrence lands where but not how many land on each shard.
+    """
+
     pools = dict(inventories or {})
     pools[api_surface] = scenarios
     items = [
-        (surface, scenario, _DURATION_SECONDS.get(surface, {}).get(scenario.id, 30))
+        (surface, position, scenario, _DURATION_SECONDS.get(surface, {}).get(scenario.id, 30))
         for surface in sorted(pools)
-        for scenario in pools[surface]
+        for position, scenario in enumerate(pools[surface])
     ]
     loads = [0] * count
-    chosen: list[Scenario[Any]] = []
+    chosen: list[int] = []
     # Equal hints order by surface and ID, and equal loads choose the lower
     # shard index: neither discovery order nor process-local hash
     # randomization may change the assignment.
-    for surface, scenario, seconds in sorted(items, key=lambda item: (-item[2], item[0], item[1].id)):
+    for surface, position, scenario, seconds in sorted(
+        items, key=lambda item: (-item[3], item[0], item[2].id, item[1])
+    ):
         target = min(range(count), key=loads.__getitem__)
         loads[target] += seconds
         if target == index - 1 and surface == api_surface:
-            chosen.append(scenario)
-    return tuple(sorted(chosen, key=lambda scenario: scenario.id))
+            chosen.append(position)
+    return tuple(sorted(chosen))
