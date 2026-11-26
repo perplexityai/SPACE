@@ -84,6 +84,9 @@ impl Sampler {
         }
         node_memory::space_cgroup(&state);
         node_memory::space_cgroup_headroom(&state);
+        for (event, total) in event_counts(&state.events) {
+            node_memory::space_cgroup_events_cumulative(event, total);
+        }
         if let Some(previous) = self.previous_events.replace(state.events) {
             for (event, count) in new_events(&previous, &state.events) {
                 node_memory::space_cgroup_events(event, count);
@@ -100,22 +103,24 @@ fn new_events(
     previous: &CgroupMemoryEvents,
     current: &CgroupMemoryEvents,
 ) -> Vec<(&'static str, u64)> {
-    let pairs = |events: &CgroupMemoryEvents| {
-        [
-            ("low", events.low),
-            ("high", events.high),
-            ("max", events.max),
-            ("oom", events.oom),
-            ("oom_kill", events.oom_kill),
-            ("oom_group_kill", events.oom_group_kill),
-        ]
-    };
-    pairs(previous)
+    event_counts(previous)
         .into_iter()
-        .zip(pairs(current))
+        .zip(event_counts(current))
         .filter(|((_, before), (_, after))| after > before)
         .map(|((event, before), (_, after))| (event, after - before))
         .collect()
+}
+
+/// Each `memory.events` count, keyed by its `event` tag value.
+fn event_counts(events: &CgroupMemoryEvents) -> [(&'static str, u64); 6] {
+    [
+        ("low", events.low),
+        ("high", events.high),
+        ("max", events.max),
+        ("oom", events.oom),
+        ("oom_kill", events.oom_kill),
+        ("oom_group_kill", events.oom_group_kill),
+    ]
 }
 
 #[cfg(test)]
