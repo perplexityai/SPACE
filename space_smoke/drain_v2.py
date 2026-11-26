@@ -350,6 +350,10 @@ class DrainV2Gate:
 
     stall_bound_seconds: int
     dispatch_backoff_base_seconds: int
+    # Whether the controller renders the v2 bounds' test hooks at all, which
+    # only a test-hooks build's chart does, whatever values they hold: a
+    # release build renders none and reads none.
+    test_hooks: bool = False
 
 
 # The gate a batch passed, once: every run in one process shares it.
@@ -393,6 +397,7 @@ def require_drain_v2(fixture: ScenarioFixture, control: DrainV2Control) -> Drain
             ),
             DISPATCH_BACKOFF_CAP_SECONDS,
         ),
+        test_hooks=any(hooks.get(key) is not None for key in DRAIN_V2_HOOK_KEYS),
     )
     return _GATE
 
@@ -961,7 +966,7 @@ class DrainV2Assertions:
             env.update(AWS_TERMINATOR_ENV)
         if legacy_loops:
             env.update(LEGACY_LOOPS_ENV)
-        if stall_bound is not None and self.gate.stall_bound_seconds != RELEASE_STALL_BOUND_SECONDS:
+        if stall_bound is not None and self.gate.test_hooks:
             env[STALL_BOUND_HOOK] = str(stall_bound)
             self._stall_bound = stall_bound
         self._fixture.record("stall_bound_seconds", self.stall_bound_seconds)
