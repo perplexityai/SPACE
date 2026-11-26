@@ -442,6 +442,49 @@ class GateAnswers(unittest.TestCase):
             drain.expect_calls_pass_until_suspended(caller)  # type: ignore[arg-type]
 
 
+class _ReadClock(_Control):
+    """Each node-row read takes `cost` seconds off the time to the deadline."""
+
+    def __init__(self, seconds_to_deadline: float, cost: float, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.clock = seconds_to_deadline
+        self.cost = cost
+
+    def node_sandbox_state(self, node: str, sandbox_id: str) -> str:
+        self.clock -= self.cost
+        return super().node_sandbox_state(node, sandbox_id)
+
+
+class HeldWatch(unittest.TestCase):
+    SANDBOX = "00000000-0000-4000-8000-000000000031"
+
+    def _watch(self, seconds_to_deadline: float, node_states: list[str]) -> _Fixture:
+        control = _ReadClock(
+            seconds_to_deadline,
+            6,
+            residencies={self.SANDBOX: [SandboxResidency(lifecycle="started", active_node_id=NODE_ID)]},
+            node_states={self.SANDBOX: list(node_states)},
+        )
+        drain, fixture = _assertions(control)
+        drain.seconds_to_deadline = lambda: control.clock  # type: ignore[method-assign]
+        drain.expect_started_until_deadline([self.SANDBOX], margin=10)
+        return fixture
+
+    def test_only_reads_that_finish_before_the_margin_are_judged(self) -> None:
+        # The second read finishes 8 s out, inside the 10 s margin: its
+        # suspend is the evacuation's, not judged.
+        fixture = self._watch(20, ["started", "suspending"])
+        self.assertEqual(fixture.evidence["held_reads"]["judged"], {self.SANDBOX: 1})
+        self.assertEqual(fixture.evidence["held_reads"]["past_the_window"], {self.SANDBOX: 1})
+        # A window whose every read finishes inside the margin proves nothing.
+        with self.assertRaises(InconclusiveSmoke):
+            self._watch(12, ["started"])
+        # A running VM's checkpoint is held; a suspend inside the window is not.
+        self._watch(30, ["checkpointing", "started", "checkpointing"])
+        with self.assertRaises(InvariantViolation):
+            self._watch(30, ["started", "suspending"])
+
+
 class StoppedSandboxes(unittest.TestCase):
     STOPPED = "00000000-0000-4000-8000-000000000020"
 
@@ -848,11 +891,31 @@ class _MutatingControl(_Control):
     """A control whose mutations are recorded, for the compensations a
     scenario arms around them."""
 
-    def __init__(self, *, terminate_status: int = 200, scale_fails: bool = False, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        terminate_status: int = 200,
+        scale_fails: bool = False,
+        drain_statuses: list[DrainV2Status | None] | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         self.terminate_status = terminate_status
         self.scale_fails = scale_fails
+        self.drain_statuses = drain_statuses
         self.calls: list[tuple[Any, ...]] = []
+
+    def drain_v2_status(self, node_id: str) -> DrainV2Status | None:
+        if self.drain_statuses is None:
+            return super().drain_v2_status(node_id)
+        answers = self.drain_statuses
+        return answers.pop(0) if len(answers) > 1 else answers[0]
+
+    def admin_nodes(self) -> list[Any]:
+        return [type("Node", (), {"id": NODE_ID, "k8s_node_name": NODE, "drain_phase": None, "drain_last_error": None})()]
+
+    def cordon_kube_node(self, node: str) -> None:
+        self.calls.append(("cordon_kube_node", node))
 
     def kind_node_labels(self, _node: str) -> dict[str, str]:
         return {"space.pplx.net/pool": "sandboxes"}
@@ -929,6 +992,44 @@ class Compensations(unittest.TestCase):
         names = [compensation.name for compensation in scope._compensations]
         self.assertIn(f"undrain {NODE}", names)
         self.assertIn(f"uncordon {NODE}", names)
+
+
+class UncordonGate(unittest.TestCase):
+    DRAINING = DrainV2Status(engine="v2", status={"generation": 7})
+    CLEARED = DrainV2Status(engine=None, status=None)
+
+    def _uncordons(self, control: _MutatingControl) -> int:
+        return control.calls.count(("uncordon_kube_node", NODE))
+
+    def test_cleanup_uncordons_a_drained_worker_once_its_cancel_is_confirmed(self) -> None:
+        control = _MutatingControl(drain_statuses=[self.DRAINING, self.DRAINING, self.CLEARED])
+        drain, scope = _scoped(control)
+        drain.drain_answer({"engine": "v2", "hold_seconds": 0})
+        self.assertEqual(scope.close(), ())
+        self.assertEqual(self._uncordons(control), 1)
+
+    def test_a_cancel_never_confirmed_leaves_the_worker_cordoned_and_named(self) -> None:
+        control = _MutatingControl(drain_statuses=[self.DRAINING])
+        drain, scope = _scoped(control)
+        drain.drain_answer({"engine": "v2", "hold_seconds": 0})
+        with mock.patch.object(drain_v2, "CANCEL_SECONDS", 0):
+            failures = scope.close()
+        self.assertEqual([failure.name for failure in failures], [f"uncordon {NODE}"])
+        self.assertIn(f"left {NODE} cordoned", failures[0].detail)
+        self.assertEqual(self._uncordons(control), 0)
+
+    def test_a_worker_the_run_cordoned_itself_is_uncordoned_only_through_the_gate(self) -> None:
+        for statuses, uncordons in (([self.DRAINING], 0), ([self.DRAINING, self.CLEARED], 1)):
+            with self.subTest(uncordons=uncordons):
+                control = _MutatingControl(drain_statuses=list(statuses))
+                drain, scope = _scoped(control)
+                drain.cordon()
+                drain.drain_answer({"engine": "v2", "hold_seconds": 0})
+                names = [compensation.name for compensation in scope._compensations]
+                self.assertEqual(names.count(f"uncordon {NODE}"), 1)
+                with mock.patch.object(drain_v2, "CANCEL_SECONDS", 0 if not uncordons else 60):
+                    scope.close()
+                self.assertEqual(self._uncordons(control), uncordons)
 
 
 class CleanFleet(unittest.TestCase):
