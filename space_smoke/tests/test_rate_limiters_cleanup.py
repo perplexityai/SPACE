@@ -1191,6 +1191,51 @@ class KindLateProbeReap(unittest.TestCase):
         self.assertEqual(run(False), ["sbx_a"])
         self.assertEqual(run(True), ["sbx_a", "sbx_b"])
 
+    def test_a_page_read_timeout_rescans_so_later_pages_are_still_checked(self) -> None:
+        # The first listing's second page times out at the HTTPX transport
+        # (the pinned SDK lets `httpx.ReadTimeout` escape). A match on page one
+        # doesn't end the call: the next attempt lists again and reaches B.
+        import httpx
+
+        from space_smoke.adapters import EcwConfig, EcwSdk
+
+        listings = [[["sbx_a"], httpx.ReadTimeout("page read timed out")], [["sbx_a"], ["sbx_b"]]]
+        killed: list[str] = []
+
+        class _Paginator:
+            def __init__(self, pages: list[object]) -> None:
+                self._pages = pages
+
+            @property
+            def has_next(self) -> bool:
+                return bool(self._pages)
+
+            def next_items(self) -> list[SimpleNamespace]:
+                page = self._pages.pop(0)
+                if isinstance(page, Exception):
+                    raise page
+                return [SimpleNamespace(sandbox_id=i) for i in cast(list[str], page)]
+
+        fake_e2b = SimpleNamespace(
+            Sandbox=SimpleNamespace(list=lambda **_kw: _Paginator(listings.pop(0)), kill=None),
+            SandboxQuery=lambda **kw: kw,
+        )
+        # The `import_module` patch goes last: it is process-wide, and
+        # `mock.patch` resolves the other targets through it.
+        with (
+            mock.patch(
+                "space_smoke.adapters._kill_with_sdk",
+                side_effect=lambda _kill, sandbox_id, **_kw: killed.append(sandbox_id),
+            ),
+            mock.patch("space_smoke.adapters.time.sleep"),
+            mock.patch("space_smoke.adapters.importlib.import_module", return_value=fake_e2b),
+        ):
+            EcwSdk(EcwConfig(api_key="key")).kill_matching(
+                {"space_smoke_run": "abc"}, attempts=3, interval_seconds=0
+            )
+        self.assertEqual(killed, ["sbx_a", "sbx_a", "sbx_b"])
+        self.assertEqual(listings, [])
+
     def test_matches_from_pages_read_before_a_failing_page_are_still_deleted(self) -> None:
         run = {"space_smoke_run": "abc"}
         found = "11111111-1111-1111-1111-111111111111"

@@ -245,18 +245,28 @@ def limiter_tightenings(env: Mapping[str, str | None]) -> list[str]:
     return tightened
 
 
-def _create_uncertain(outcome: LimiterProbeOutcome) -> bool:
+def is_slot_shortage(outcome: LimiterProbeOutcome) -> bool:
+    """True for the pre-admission slot-shortage 503 (`ResourceExhausted`)."""
+
+    return (
+        outcome.status == 503
+        and CAPACITY_LIMIT_MESSAGE in outcome.message
+        and NO_FREE_SLOT_MESSAGE in outcome.message
+    )
+
+
+def create_uncertain(outcome: LimiterProbeOutcome) -> bool:
     """A create whose answer can't say whether it left a sandbox behind.
 
-    No answer at all, a 5xx (for example a gateway error or a post-start fetch
-    failure), or a success that carried no id: any of them may have committed,
-    so the sweep has to reconcile by metadata. None counts as admission
-    evidence, which takes an id.
+    No answer at all, a 5xx other than the pre-admission slot-shortage 503 (for
+    example a gateway error or a post-start fetch failure), or a success that
+    carried no id: any of them may have committed, so the sweep has to reconcile
+    by metadata. None counts as admission evidence, which takes an id.
     """
 
     return not outcome.sandbox_id and (
         outcome.status == 0
-        or outcome.status >= 500
+        or (outcome.status >= 500 and not is_slot_shortage(outcome))
         or 200 <= outcome.status < 300
     )
 
@@ -1046,7 +1056,7 @@ class RateLimiterAssertions:
     def _finish_create_outcome(
         self, inflight: _InflightCreate, outcome: LimiterProbeOutcome
     ) -> None:
-        uncertain = _create_uncertain(outcome)
+        uncertain = create_uncertain(outcome)
         with self._probe_lock:
             if inflight.settled:
                 return

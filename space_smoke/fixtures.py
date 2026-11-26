@@ -135,6 +135,7 @@ from space_smoke.execution_environment import (
 )
 from space_smoke.runtime_upgrade_campaign import CampaignControl, TemplateCampaignAssertions
 from space_smoke.drain_gate import DrainGateAssertions
+from space_smoke.no_free_slot import NoFreeSlotAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
 from space_smoke.sandbox_network_isolation import SandboxNetworkIsolationAssertions
 from space_smoke.storage_exchange import StorageExchangeScopingAssertions
@@ -3000,9 +3001,14 @@ class KindAdmin(ScenarioFixture):
     def sandbox_template_name(self) -> str:
         """The bare template name (no tag or digest) selected for this scenario."""
 
+        return self.sandbox_template_selector().split("@", 1)[0].split(":", 1)[0]
+
+    def sandbox_template_selector(self) -> str:
+        """The full template selector (including any `:tag` or `@digest`) for this scenario."""
+
         if not self._template_selector:
             raise SmokeConfigurationError("the fixture template is unknown")
-        return self._template_selector.split("@", 1)[0].split(":", 1)[0]
+        return self._template_selector
 
 
 class KindNetworkEcw(Ecw):
@@ -3432,6 +3438,22 @@ class KindEcw(Ecw, KindAdmin):
         """The sandbox's running VM reports `environment`'s Firecracker."""
 
         expect_runtime(self, self._environment_control(), environment, sandbox_id, step=step)
+
+    _no_free_slot_assertions: NoFreeSlotAssertions | None = None
+
+    @property
+    def no_free_slot(self) -> NoFreeSlotAssertions:
+        """Privileged assertions for the activation limiter's network-slot check."""
+
+        if self._rate_limiter_control is None or self._rate_limit_probe is None:
+            raise SmokeConfigurationError(
+                "slot-check control is only available on the kind backend"
+            )
+        if self._no_free_slot_assertions is None:
+            self._no_free_slot_assertions = NoFreeSlotAssertions(
+                self, self._rate_limiter_control, self._rate_limit_probe, self._context.scope
+            )
+        return self._no_free_slot_assertions
 
     _cross_node_control: CrossNodeRestoreControl | None = None
     _cross_node_assertions: CrossNodeRestoreAssertions | None = None
