@@ -244,6 +244,10 @@ LEFTOVER_SECONDS = 120
 # A command on a sandbox whose data plane is coming up, or a memory fill of
 # up to 256 MiB (seconds measured), with a minute's margin.
 COMMAND_SECONDS = 90
+# The node-row states of a running sandbox a drain holds: `started`, or a
+# checkpoint it passes through on the way back to `started` (sandbox-manager's
+# state machine has no checkpoint-to-suspend edge).
+HELD_NODE_STATES = frozenset({"started", "checkpointing"})
 # One probe of a running sandbox around its deadline: the node's own state,
 # a command, and the node's state again. About 0.4 s measured on Kind
 # (26-30 probes in the 12 s before a deadline); 4 s allows for a bench ten
@@ -2052,23 +2056,42 @@ class DrainV2Assertions:
         seconds before the deadline; with a negative `margin`, until that
         long past it. Read from both rows: the control-plane row, and the
         node's own, which a suspend changes at once even while its upload is
-        cut and the control-plane row still reads `started`."""
+        cut and the control-plane row still reads `started`. The node's row
+        may read `checkpointing`, which a running VM passes through and
+        returns from to `started`, never to a suspend. Only a read that
+        finished while the deadline was still more than `margin` away is
+        judged, and each sandbox needs at least one: a window too short to
+        read in ends the run inconclusive rather than passing."""
 
+        bare = {sandbox_id: self.bare_id(sandbox_id) for sandbox_id in sandbox_ids}
+        judged: dict[str, int] = dict.fromkeys(bare.values(), 0)
+        late: dict[str, int] = dict.fromkeys(bare.values(), 0)
         while self.seconds_to_deadline() > margin:
-            residencies = {
-                self.bare_id(sandbox_id): (*self.residency(sandbox_id), self.node_state(sandbox_id))
-                for sandbox_id in sandbox_ids
-            }
+            residencies: dict[str, tuple[str, str | None, str | None]] = {}
+            for sandbox_id, short in bare.items():
+                read = (*self.residency(sandbox_id), self.node_state(sandbox_id))
+                if self.seconds_to_deadline() > margin:
+                    residencies[short] = read
+                    judged[short] += 1
+                else:
+                    late[short] += 1
             self._fixture.verify(
                 all(
-                    lifecycle == "started" and node == self.node_id and node_state == "started"
+                    lifecycle == "started" and node == self.node_id and node_state in HELD_NODE_STATES
                     for lifecycle, node, node_state in residencies.values()
                 ),
                 "a held sandbox left started before the run stopped watching",
                 residency=residencies,
                 seconds_to_deadline=round(self.seconds_to_deadline()),
             )
-            self._fixture.wait(min(5, max(1, self.seconds_to_deadline() - margin)))
+            if self.seconds_to_deadline() > margin:
+                self._fixture.wait(min(5, max(1, self.seconds_to_deadline() - margin)))
+        self._fixture.record("held_reads", {"judged": judged, "past_the_window": late, "margin": margin})
+        if not all(judged.values()):
+            raise InconclusiveSmoke(
+                "the watch of the held sandboxes judged no read of one of them before the "
+                "deadline came within its margin, so it proved nothing (held_reads); rerun"
+            )
 
     def wait_past_deadline(self) -> None:
         """Return once the deadline has passed."""
