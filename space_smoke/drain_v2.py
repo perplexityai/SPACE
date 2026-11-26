@@ -276,9 +276,11 @@ def in_parallel(calls: Sequence[Callable[[], T]], *, width: int = PARALLEL_WIDTH
     """Run independent calls `width` at a time; their results in order. Once
     a batch ends with a failure, the first verdict it raised (else the first
     error) is raised, with the evidence that call recorded, and no later
-    batch starts. An interrupted batch ends its calls before the interrupt
-    goes on to cleanup (`run_concurrently`), and a resident a create hands
-    out is owned by the run's cleanup from the moment the API accepts it."""
+    batch starts. An interrupted batch's calls are cancelled and waited for
+    up to `run_concurrently`'s bound before cleanup starts; one still running
+    then is named on stderr. A resident a create makes is owned by the run's
+    cleanup from before the create call starts until it returns, or until
+    cleanup's deadline (`space_smoke.services`)."""
 
     results: list[T] = []
     for start in range(0, len(calls), width):

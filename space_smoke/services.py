@@ -11,7 +11,7 @@ import uuid
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from functools import partial
-from threading import Lock
+from threading import Event, Lock
 from typing import Any, Protocol, TypeVar, cast
 
 from space_smoke.adapters import (
@@ -69,6 +69,7 @@ from space_smoke.runtime import (
     ScenarioContext,
     SmokeConfigurationError,
     SubprocessExecutor,
+    cleanup_seconds_left,
 )
 from space_smoke.execution_environment import ExecutionEnvironmentAdmission
 from space_smoke.template_build import build_dedicated_template
@@ -97,6 +98,12 @@ class ScenarioDefinition(Protocol):
 
 Fixture = TypeVar("Fixture")
 SANDBOX_CREATE_ATTEMPTS = 3
+# What a run-owned Native create's delete keeps of cleanup's time for its
+# own label lookup once it stops waiting for the create call to return: a
+# list request or two within Native's 15 s request timeout.
+CREATE_LOOKUP_SECONDS = 20.0
+# How long that delete waits for the call when cleanup has no deadline.
+CREATE_RETURN_WAIT_SECONDS = 120.0
 SANDBOX_CREATE_RETRY_SECONDS = 1.0
 KIND_BACKEND = "kind"
 DEPLOYED_BACKEND = "deployed"
@@ -552,35 +559,55 @@ class SmokeServices:
             idle_timeout: str | None = None,
             auto_lifecycle: Mapping[str, object] | None = None,
         ) -> DurableLifecycleSandbox:
-            # Its delete is armed before the request, keyed on the label the
-            # create carries, so cleanup owns it however the create ends: by
-            # the id once the API accepts it, else by finding the label. A
-            # create interrupted on a `run_concurrently` worker, even one whose
-            # answer arrives only after cleanup has run this, is found as long
-            # as the API stored it first. Native create also deletes a sandbox
-            # whose wait failed.
+            # Cleanup owns the create until the create call returns, or until
+            # cleanup's own deadline: its delete is armed before the request,
+            # and waits for the call to return (it may be a `run_concurrently`
+            # worker that outlived its interrupt), within the time cleanup has
+            # left less `CREATE_LOOKUP_SECONDS`. It then deletes by the id the
+            # API answered with, or else looks the create's label up once. A
+            # call that never returned and whose label finds nothing fails
+            # cleanup by name, and the next run's leftover check reports what
+            # it may still store. Native create also deletes a sandbox whose
+            # wait failed.
             instance = uuid.uuid4().hex
             accepted: list[DurableLifecycleSandbox] = []
+            returned = Event()
 
             def delete_created() -> None:
-                for sandbox in accepted or native.sandboxes_labelled("space_smoke_instance", instance):
+                left = cleanup_seconds_left()
+                returned.wait(
+                    CREATE_RETURN_WAIT_SECONDS if left is None else max(0.0, left - CREATE_LOOKUP_SECONDS)
+                )
+                found = accepted[:1] or [
+                    sandbox
+                    for sandbox in [native.sandbox_labelled("space_smoke_instance", instance)]
+                    if sandbox is not None
+                ]
+                for sandbox in found:
                     native.delete(sandbox)
+                if not found and not returned.is_set():
+                    raise RuntimeError(
+                        f"create space_smoke_instance={instance} still in flight when cleanup ended; "
+                        "left for the leftover check"
+                    )
 
             context.scope.defer(
                 f"delete the Native sandbox labelled space_smoke_instance={instance}",
                 delete_created,
                 critical=True,
             )
-            created = cast(
-                DurableLifecycleSandbox,
-                native.create(
-                    {**run_metadata, "space_smoke_instance": instance},
-                    idle_timeout=idle_timeout,
-                    auto_lifecycle=auto_lifecycle,
-                    accepted=accepted.append,
-                ),
-            )
-            return created
+            try:
+                return cast(
+                    DurableLifecycleSandbox,
+                    native.create(
+                        {**run_metadata, "space_smoke_instance": instance},
+                        idle_timeout=idle_timeout,
+                        auto_lifecycle=auto_lifecycle,
+                        accepted=accepted.append,
+                    ),
+                )
+            finally:
+                returned.set()
 
         return CommandSandboxFixture(
             context,

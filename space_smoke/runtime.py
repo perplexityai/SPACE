@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -406,12 +406,10 @@ def run_concurrently(
     `cancellation_point` or `pause`, and the wait for that is bounded
     (`CANCEL_JOIN_SECONDS`) before the exception is raised and cleanup
     starts. A call still running after the bound, such as one whose
-    response is still arriving, is named on stderr and not waited for: a
-    compensation it registers before cleanup ends still runs
-    (`ResourceScope.close`); one registered later does not. A caller that
-    creates something registers its cleanup before the request, keyed on
-    something it chose, so cleanup finds it either way (Native creates do:
-    `space_smoke.services`).
+    response is still arriving, is named on stderr and not waited for. A
+    call that creates something owns its cleanup itself, registered before
+    the call starts: Native creates do (`space_smoke.services`), and their
+    cleanup waits for the create call to return, within cleanup's deadline.
 
     `on_interrupt="detach"` neither cancels the calls nor waits for them:
     once the subprocesses they started are killed and reaped (and new ones
@@ -479,11 +477,9 @@ def run_concurrently(
 class ResourceScope:
     """Run cleanup in reverse registration order and report every failure.
 
-    A compensation registered while cleanup runs, such as by a concurrent
-    call that outlived its interrupt (`run_concurrently`), runs too: once
-    the ones registered before it are done, newer ones go in reverse, until
-    none is left. Each runs once, within its own cap if it has one, and all
-    within the one cleanup deadline.
+    A compensation can read how long its step has left, until the cleanup's
+    deadline or its own cap (`cleanup_seconds_left`), to bound a wait of its
+    own inside it.
     """
 
     def __init__(self) -> None:
@@ -529,22 +525,10 @@ class ResourceScope:
         deadline = (
             time.monotonic() + timeout_seconds if timeout_seconds is not None else None
         )
-        while True:
-            batch: list[Compensation] = []
-            for compensation in reversed(self._compensations):
-                if id(compensation) not in seen:
-                    seen.add(id(compensation))
-                    batch.append(compensation)
-            if not batch:
-                return tuple(failures)
-            failures.extend(self._release(batch, deadline))
-
-    @staticmethod
-    def _release(
-        compensations: Iterable[Compensation], deadline: float | None
-    ) -> list[CleanupFailure]:
-        failures: list[CleanupFailure] = []
-        for compensation in compensations:
+        for compensation in reversed(self._compensations):
+            if id(compensation) in seen:
+                continue
+            seen.add(id(compensation))
             if not compensation.armed:
                 continue
             remaining = None if deadline is None else deadline - time.monotonic()
@@ -558,6 +542,9 @@ class ResourceScope:
                 )
                 continue
             step_timeout = _compensation_deadline_seconds(remaining, compensation.timeout_seconds)
+            token = _CLEANUP_DEADLINE.set(
+                None if step_timeout is None else time.monotonic() + step_timeout
+            )
             try:
                 with _scenario_deadline(step_timeout, label="cleanup"):
                     compensation.release()
@@ -569,7 +556,26 @@ class ResourceScope:
                         compensation.critical,
                     )
                 )
-        return failures
+            finally:
+                _CLEANUP_DEADLINE.reset(token)
+        return tuple(failures)
+
+
+# The deadline (monotonic) of the compensation `ResourceScope.close` is
+# running: the step's own, the cleanup's or a shorter cap of its own, the one
+# its alarm enforces; None if the step has none.
+_CLEANUP_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "space_smoke_cleanup_deadline", default=None
+)
+
+
+def cleanup_seconds_left() -> float | None:
+    """How long the compensation now running in cleanup has left: until the
+    cleanup's deadline, or its own cap (`timeout_seconds`) if that ends
+    sooner. None outside cleanup, or for a step without a deadline."""
+
+    deadline = _CLEANUP_DEADLINE.get()
+    return None if deadline is None else max(0.0, deadline - time.monotonic())
 
 
 def _compensation_deadline_seconds(

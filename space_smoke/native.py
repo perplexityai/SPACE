@@ -164,14 +164,16 @@ class NativeSandboxFactory:
             raise
         return sandbox
 
-    def sandboxes_labelled(
+    def sandbox_labelled(
         self, key: str, value: str, *, limit: int = 100, max_pages: int = 50
-    ) -> list[DurableLifecycleSandbox]:
-        """The caller's sandboxes whose metadata sets `key` to `value`, read
-        from the list: how cleanup finds a sandbox it labelled before its
-        create answered, or that it never heard of."""
+    ) -> DurableLifecycleSandbox | None:
+        """The caller's sandbox whose metadata sets `key` to `value`, read
+        from the list, or None: how cleanup finds a sandbox it labelled
+        before its create answered. The label is unique per create, so the
+        search ends at the first match, and a later page's error or the page
+        bound can't lose it; only a search that found nothing reads to the
+        end, and one past `max_pages` raises."""
 
-        found: list[DurableLifecycleSandbox] = []
         cursor: str | None = None
         for _ in range(max_pages):
             query = {"limit": str(limit)}
@@ -185,10 +187,10 @@ class NativeSandboxFactory:
                 entry = _page_item(item, index)
                 metadata = entry.get("metadata")
                 if isinstance(metadata, Mapping) and metadata.get(key) == value:
-                    found.append(_NativeSandbox(self, _required_string(entry, "id")))
+                    return _NativeSandbox(self, _required_string(entry, "id"))
             cursor = _optional_string(response, "next_cursor")
             if cursor is None:
-                return found
+                return None
         raise RuntimeError(f"more than {max_pages} pages of sandboxes to search for {key}={value}")
 
     def delete(self, sandbox: CommandSandbox) -> None:

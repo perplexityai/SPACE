@@ -26,6 +26,7 @@ from space_smoke.runtime import (
     ResourceScope,
     SmokeConfigurationError,
     SubprocessExecutor,
+    cleanup_seconds_left,
     execute_scenario,
 )
 from space_smoke.scenarios import REGISTRY
@@ -596,6 +597,33 @@ def partner_round_trip(_test: smoke.Ecw) -> None:
         self.assertEqual(len(failures), 1)
         self.assertEqual(failures[0].name, "never returns")
         self.assertIn("cleanup timed out", failures[0].detail)
+
+    def test_a_compensation_reads_the_deadline_its_own_step_has(self) -> None:
+        # A capped step's alarm fires at its cap, so a wait it bounds by
+        # `cleanup_seconds_left` must end inside the cap, not the cleanup's.
+        read: dict[str, float | None] = {}
+
+        def reads(name: str) -> None:
+            read[name] = cleanup_seconds_left()
+
+        for timeout in (30.0, None):
+            with self.subTest(cleanup_timeout=timeout):
+                read.clear()
+                scope = ResourceScope()
+                scope.defer("uncapped", lambda: reads("uncapped"))
+                scope.defer("capped", lambda: reads("capped"), timeout_seconds=2.0)
+                self.assertEqual(scope.close(timeout_seconds=timeout), ())
+                capped = read["capped"]
+                self.assertIsNotNone(capped)
+                assert capped is not None
+                self.assertTrue(0.0 < capped <= 2.0, capped)
+                if timeout is None:
+                    self.assertIsNone(read["uncapped"])
+                else:
+                    uncapped = read["uncapped"]
+                    assert uncapped is not None
+                    self.assertTrue(2.0 < uncapped <= timeout, uncapped)
+        self.assertIsNone(cleanup_seconds_left())
 
 
 class BackgroundWorkJoinIsAVerdict(unittest.TestCase):
