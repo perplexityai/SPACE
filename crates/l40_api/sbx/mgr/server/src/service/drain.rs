@@ -266,8 +266,8 @@ impl SandboxManagerService {
 
     /// Enables the cross-process dependency replacement protocol before the
     /// production socket begins serving. The active process holds the
-    /// capability for its lifetime; state writers share the work gate while
-    /// any transition is active.
+    /// capability for its lifetime; every state writer but `DrainNode`'s
+    /// seal-row write shares the work gate while any of them is active.
     pub fn enable_dependency_restart_drain(
         &self,
         capability_path: impl AsRef<Path>,
@@ -580,8 +580,8 @@ fn try_acquire_state_writer(
             return Ok(None);
         };
         // The first writer to cross the admission gate takes the work gate,
-        // which writers share until none is left; a `DrainNode` active
-        // meanwhile holds neither.
+        // which the writers it admits share until none of them is left; a
+        // `DrainNode` seal-row write holds neither.
         if state_writers.dependency_work.is_none() {
             let Some(work) = dependency_drain.try_acquire_work(&admission)? else {
                 return Ok(None);
@@ -625,7 +625,16 @@ fn release_state_writer(drain_state: &DrainState, method: &'static str) {
     if *active_for_method == 0 {
         state_writers.active_by_method.remove(method);
     }
-    if remaining == 0 {
+    // The work gate goes once no writer the dependency drain admitted is
+    // left: a `DrainNode` seal-row write still counts for a restart handoff,
+    // but holds no gate.
+    let gated = remaining
+        - state_writers
+            .active_by_method
+            .get("DrainNode")
+            .copied()
+            .unwrap_or(0);
+    if gated == 0 {
         state_writers.dependency_work = None;
     }
     drop(state_writers);

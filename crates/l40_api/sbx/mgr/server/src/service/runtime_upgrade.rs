@@ -901,7 +901,7 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
         // VM and isn't stopped, so the refusal is left unrecorded for the
         // attempt. A seal landing between the stage's admission and this
         // fence can leave the staged restore behind, which the drain then
-        // waits on as pending upload until its backup is confirmed.
+        // handles as any other suspended sandbox.
         let disk_mutations = self
             .effects
             .exclude_disk_mutations(&request.sandbox_id)

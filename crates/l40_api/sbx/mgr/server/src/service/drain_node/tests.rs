@@ -2964,9 +2964,10 @@ async fn a_restart_handoff_refuses_a_seal_or_cancel_and_changes_nothing() {
 /// `DrainNode`'s lease is admitted past a full state-writer capacity and a
 /// closed dependency drain, which bound and gate every other writer: it
 /// covers one write of the seal row in this process's database, one call at
-/// a time. It still counts while it writes, and a restart handoff still
-/// refuses it. A writer admitted while it counts takes the dependency
-/// drain's work gate, as the first writer does.
+/// a time. It never holds the dependency drain's work gate: a writer admitted
+/// while it counts takes the gate as the first writer does, and the gate
+/// goes when the last such writer ends, the seal-row write still counting.
+/// A restart handoff refuses a new one and waits for one that counts.
 #[tokio::test]
 async fn drain_node_is_admitted_past_the_writer_cap_and_the_dependency_drain() {
     let locks = tempfile::tempdir().unwrap();
@@ -3001,6 +3002,24 @@ async fn drain_node_is_admitted_past_the_writer_cap_and_the_dependency_drain() {
     drop((writer, seal_write));
     assert!(exclusive(&work).is_some());
 
+    let writer = service.state_writer_lease("Test").unwrap();
+    let seal_write = service.state_writer_lease("DrainNode").unwrap();
+    assert!(
+        exclusive(&work).is_none(),
+        "the writer shares the work gate"
+    );
+    drop(writer);
+    assert!(
+        exclusive(&work).is_some(),
+        "the work gate goes with the last writer that shares it"
+    );
+    let writer = service.state_writer_lease("Test").unwrap();
+    assert!(
+        exclusive(&work).is_none(),
+        "a writer admitted beside the seal-row write takes the work gate"
+    );
+    drop((writer, seal_write));
+
     let writers: Vec<_> = (0..crate::service::drain::MAX_ACTIVE_STATE_WRITERS)
         .map(|_| service.state_writer_lease("Test").unwrap())
         .collect();
@@ -3017,7 +3036,24 @@ async fn drain_node_is_admitted_past_the_writer_cap_and_the_dependency_drain() {
     );
     drop((writers, closed));
 
+    let seal_write = service.state_writer_lease("DrainNode").unwrap();
     service.begin_draining_for_restart();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            service.wait_for_state_transitions_drained()
+        )
+        .await
+        .is_err(),
+        "a restart handoff waits for the seal-row write"
+    );
+    drop(seal_write);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        service.wait_for_state_transitions_drained(),
+    )
+    .await
+    .expect("the handoff drains once the seal-row write ends");
     let refused = service.cancel_drain(7).unwrap_err();
     assert!(
         pplx_space_sbx_mgr_client::is_restart_retry_on_successor(&refused),

@@ -34,12 +34,15 @@
 //! node, which has no row until it adopts one. Each counts as an artifact
 //! producer in flight until it ends, which keeps a drain pending.
 //!
-//! Each class's rule is the one its call site applied before the gate. A
-//! node whose seal is unknown admits every writer, as a node never sealed
-//! does; only a VM activation is refused then. A class that is always
-//! admitted reads neither the seal nor the database, and a rule that needs
-//! the sandbox's row reads it only on a node known sealed, so a node never
-//! sealed admits as it did before the gate.
+//! Each class's rule is the one its call site applied before the gate, but a
+//! runtime upgrade's: the seal refused neither its stage
+//! ([`NodeWriter::UpgradeStage`]) nor its fence ([`NodeWriter::RuntimeUpgrade`])
+//! before, and now refuses each on a node known sealed. A node whose seal is
+//! unknown admits every writer, as a node never sealed does; only a VM
+//! activation is refused then. A class that is always admitted reads neither
+//! the seal nor the database, and a rule that needs the sandbox's row reads
+//! it only on a node known sealed, so a node never sealed admits as it did
+//! before the gate.
 
 use std::sync::Arc;
 
