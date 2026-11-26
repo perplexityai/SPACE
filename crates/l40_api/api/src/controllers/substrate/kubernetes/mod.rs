@@ -1415,4 +1415,7 @@ use pod_ops::ExecutionHydrationOutcome;
 use pod_ops::{ActivationAttemptAssignment, PodMaterializationOwnership, StartedRecoveryOwnership};
 use restore_intent::{RestoreClaimMode, RestoreIntent, RestorePodPlacement};
 #[cfg(any(test, feature = "test-hooks"))]
-pub use test_substrate::{TEST_SANDBOX_NAMESPACE, retire_executions_predating_current_stop};
+pub use test_substrate::{
+    TEST_SANDBOX_NAMESPACE, release_stopped_evacuation_placement,
+    retire_executions_predating_current_stop,
+};
