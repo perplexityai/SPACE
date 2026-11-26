@@ -19,6 +19,7 @@
 //! `pplx-space-sandbox-store`'s `quarantine_publication` module.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_snapshot_model::SnapshotId;
 use pplx_space_sql_locator::sql;
@@ -71,10 +72,10 @@ pub struct QuarantineHistoryEntry {
 
 /// The sandbox's open quarantine episode; `None` when it is not quarantined.
 pub async fn active_quarantine(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<ActiveQuarantine>, sqlx::Error> {
-    sqlx::query_as::<_, ActiveQuarantine>(sql!(
+) -> Result<Option<ActiveQuarantine>, DbError> {
+    Ok(sqlx::query_as::<_, ActiveQuarantine>(sql!(
         "SELECT quarantine_id,
                 entered_at,
                 updated_at,
@@ -91,18 +92,18 @@ pub async fn active_quarantine(
          WHERE sandbox_id = $1"
     ))
     .bind(sandbox_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The sandbox's newest `limit` quarantine events across all its episodes,
 /// newest first. A sandbox never quarantined has none.
 pub async fn quarantine_history(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     limit: u32,
-) -> Result<Vec<QuarantineHistoryEntry>, sqlx::Error> {
-    sqlx::query_as::<_, QuarantineHistoryEntry>(sql!(
+) -> Result<Vec<QuarantineHistoryEntry>, DbError> {
+    Ok(sqlx::query_as::<_, QuarantineHistoryEntry>(sql!(
         "SELECT id,
                 quarantine_id,
                 occurred_at,
@@ -119,8 +120,8 @@ pub async fn quarantine_history(
     ))
     .bind(sandbox_id)
     .bind(i64::from(limit))
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Append a `recovered_to_suspended` history event, `history_id`, to the
@@ -130,11 +131,11 @@ pub async fn quarantine_history(
 /// the sandbox isn't quarantined. The caller holds the sandbox's and the
 /// episode's row locks and has rechecked the recovery.
 pub async fn record_recovered_to_suspended(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     history_id: Uuid,
     snapshot_id: SnapshotId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "INSERT INTO sandbox_quarantine_history
             (id, quarantine_id, sandbox_id, source, action, reason_code, message, attempt_count, evidence)
@@ -146,7 +147,7 @@ pub async fn record_recovered_to_suspended(
     .bind(sandbox_id)
     .bind(history_id)
     .bind(snapshot_id.to_string())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -154,14 +155,14 @@ pub async fn record_recovered_to_suspended(
 /// Close the sandbox's open episode, whichever it is. `false` when it had
 /// none.
 pub async fn delete_quarantine_state(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "DELETE FROM sandbox_quarantine_state WHERE sandbox_id = $1"
     ))
     .bind(sandbox_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() > 0)
 }

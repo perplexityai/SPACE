@@ -4,7 +4,6 @@
 use pplx_space_byte_size::MemorySize;
 use pplx_space_execution_spec::{RuntimeKind, VcpuCount};
 use pplx_space_template_model::TemplateName;
-use sqlx::PgExecutor;
 
 /// The VM shape a template release was built for, from its `metadata.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,7 +27,7 @@ impl TemplateBuildShape {
 /// metadata; the builder's row is preferred, as for the lifecycle default,
 /// but the shape survives the builder evicting the release.
 pub(crate) async fn release_build_shape(
-    executor: impl PgExecutor<'_>,
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
     template: &TemplateName,
     content_hash: &str,
     runtime: RuntimeKind,

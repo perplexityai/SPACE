@@ -428,6 +428,7 @@ async fn build_binding(
                 &twins,
             )
             .await
+            .map_err(sqlx::Error::from)
         }
     }
 }

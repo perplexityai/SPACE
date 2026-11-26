@@ -59,7 +59,7 @@ async fn clear_failed_observation_keeps_a_live_record() -> TestResult {
 
     let mut conn = db.pool.acquire().await?;
     for sandbox_id in [fossil, running, failed_with_pid] {
-        clear_failed_observation(&mut conn, sandbox_id).await?;
+        clear_failed_observation(&mut *conn, sandbox_id).await?;
     }
     drop(conn);
 

@@ -31,8 +31,11 @@ pub(super) async fn recover(pool: &PgPool, expected: &Candidate) -> Result<bool,
     let mut tx = pool.begin().await?;
     tx.set_local_lock_timeout(Duration::from_secs(2)).await?;
     row_locks::lock_id(&mut tx, expected.sandbox_id).await?;
-    pplx_space_sandbox_quarantine_store::locks::lock_quarantine_state(&mut tx, expected.sandbox_id)
-        .await?;
+    pplx_space_sandbox_quarantine_store::locks::lock_quarantine_state(
+        &mut *tx,
+        expected.sandbox_id,
+    )
+    .await?;
     quarantine_recovery::lock_executions(&mut tx, expected.sandbox_id).await?;
     pplx_space_snapshot_store::quarantine_recovery::share_lock_snapshot(
         &mut tx,

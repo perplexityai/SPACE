@@ -65,7 +65,7 @@ impl RepairDbStore {
         // a projection that turned live since the guard ran survives (the
         // CAS would have refused the flip in that case anyway).
         pplx_space_sandbox_teardown::observed_states::clear_failed_observation(
-            &mut tx,
+            &mut *tx,
             candidate.sandbox_id,
         )
         .await?;

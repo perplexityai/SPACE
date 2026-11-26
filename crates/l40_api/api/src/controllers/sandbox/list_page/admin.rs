@@ -337,7 +337,12 @@ impl SandboxController {
         let pool_reserved = if org_id.is_none() {
             let rowless = pplx_space_sandbox_teardown::observed_states::rowless_sandbox_ids(pool)
                 .await
-                .map_err(|err| db_contention_error("list the rowless observed sandboxes", &err))?;
+                .map_err(|err| {
+                    db_contention_error(
+                        "list the rowless observed sandboxes",
+                        &sqlx::Error::from(err),
+                    )
+                })?;
             WarmPoolStore::new(pool.clone())
                 .pool_reservations(&rowless)
                 .await

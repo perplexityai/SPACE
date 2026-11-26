@@ -3001,6 +3001,7 @@ pub async fn template_pool_status(
     {
         Ok(observed) => observed,
         Err(error) => {
+            let error = sqlx::Error::from(error);
             if let Some(response) = contention_response(ContentionScope::ReadOnly, &error) {
                 return response.into_response();
             }

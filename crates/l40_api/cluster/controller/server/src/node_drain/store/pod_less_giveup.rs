@@ -558,7 +558,7 @@ async fn recover_pod_less_sandbox_locked(
     // it would keep a reverted row reading `failed` through the observed-state
     // overlay, and once the node is gone nothing would publish over it.
     pplx_space_sandbox_teardown::observed_states::clear_failed_observation(
-        &mut tx,
+        &mut *tx,
         candidate.sandbox_id,
     )
     .await?;

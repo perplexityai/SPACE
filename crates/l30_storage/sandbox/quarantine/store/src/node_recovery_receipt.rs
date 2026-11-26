@@ -9,12 +9,12 @@
 //! publication transaction and decides what a count other than `1` means.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{
     SandboxId, SandboxQuarantineHistoryAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
 };
 
 use pplx_space_sql_locator::sql;
-use sqlx::PgConnection;
 use uuid::Uuid;
 
 /// The episode a node recovery retires and the event it records.
@@ -40,9 +40,9 @@ pub struct NodeRecovery {
 /// `quarantine_id`, opened by `quarantined_by` for `reason_code`. Returns the
 /// rows inserted: `0` when the episode is gone or isn't that one.
 pub async fn record_node_recovery(
-    conn: &mut PgConnection,
+    executor: impl Executor<'_>,
     recovery: &NodeRecovery,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let result = sqlx::query(sql!(
         "INSERT INTO sandbox_quarantine_history (
                  id, quarantine_id, sandbox_id, occurred_at, source, action,
@@ -67,7 +67,7 @@ pub async fn record_node_recovery(
     .bind(recovery.quarantine_id)
     .bind(recovery.reason_code.as_str())
     .bind(recovery.quarantined_by.as_str())
-    .execute(conn)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected())
 }
@@ -75,17 +75,17 @@ pub async fn record_node_recovery(
 /// Close the sandbox's open episode when it is still `quarantine_id`.
 /// Returns the rows deleted: `0` when the episode is gone or was replaced.
 pub async fn retire_node_recovered_episode(
-    conn: &mut PgConnection,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     quarantine_id: Uuid,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let result = sqlx::query(sql!(
         "DELETE FROM sandbox_quarantine_state
               WHERE sandbox_id = $1 AND quarantine_id = $2"
     ))
     .bind(sandbox_id)
     .bind(quarantine_id)
-    .execute(conn)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected())
 }

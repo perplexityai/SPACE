@@ -1823,9 +1823,9 @@ pub(super) async fn publish_sandbox_states_with_census(
                     .iter()
                     .map(ClaimedQuarantineProjection::sql_projection)
                     .collect::<Vec<_>>();
-                let updated_json = Json(serde_json::to_value(&updated_sql).map_err(|err| {
+                let updated_json = serde_json::to_value(&updated_sql).map_err(|err| {
                     Status::internal(format!("serialize updated quarantine input: {err}"))
-                })?);
+                })?;
                 pplx_space_sandbox_quarantine_store::published_quarantine::upsert_states(
                     &mut *conn,
                     node_id,

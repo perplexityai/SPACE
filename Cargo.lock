@@ -8060,6 +8060,7 @@ version = "0.8.2"
 dependencies = [
  "pplx-space-accounts",
  "pplx-space-db-test-fixtures",
+ "pplx-space-postgres-pool",
  "pplx-space-sandbox-model",
  "pplx-space-snapshot-model",
  "pplx-space-sql-locator",

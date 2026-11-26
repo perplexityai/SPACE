@@ -502,7 +502,7 @@ async fn apply_assign_org(
     .await
     {
         Ok(count) => count,
-        Err(err) => return db_error(err).into_response(),
+        Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
     };
     if stranded > 0 {
         audit_failure("conflict: cached org-specific rootfs would be stranded");

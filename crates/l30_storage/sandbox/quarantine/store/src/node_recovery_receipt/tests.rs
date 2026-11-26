@@ -83,7 +83,7 @@ async fn record_inserts_nothing_unless_the_episode_source_and_reason_all_match()
         ("other reason", other_reason),
     ] {
         assert_eq!(
-            record_node_recovery(&mut conn, &losing).await?,
+            record_node_recovery(&mut *conn, &losing).await?,
             0,
             "{label}"
         );
@@ -91,7 +91,7 @@ async fn record_inserts_nothing_unless_the_episode_source_and_reason_all_match()
     }
 
     let winning = recovery(sandbox_id, quarantine_id);
-    assert_eq!(record_node_recovery(&mut conn, &winning).await?, 1);
+    assert_eq!(record_node_recovery(&mut *conn, &winning).await?, 1);
     let (id, recorded_episode, source, action, reason_code, node): (
         Uuid,
         Uuid,
@@ -141,7 +141,7 @@ async fn retire_deletes_nothing_for_a_stale_quarantine_id() -> TestResult {
     let mut conn = db.pool.acquire().await?;
 
     assert_eq!(
-        retire_node_recovered_episode(&mut conn, sandbox_id, Uuid::now_v7()).await?,
+        retire_node_recovered_episode(&mut *conn, sandbox_id, Uuid::now_v7()).await?,
         0
     );
     assert_eq!(
@@ -150,7 +150,7 @@ async fn retire_deletes_nothing_for_a_stale_quarantine_id() -> TestResult {
     );
 
     assert_eq!(
-        retire_node_recovered_episode(&mut conn, sandbox_id, quarantine_id).await?,
+        retire_node_recovered_episode(&mut *conn, sandbox_id, quarantine_id).await?,
         1
     );
     assert_eq!(open_episode(&db.pool, sandbox_id).await?, None);
