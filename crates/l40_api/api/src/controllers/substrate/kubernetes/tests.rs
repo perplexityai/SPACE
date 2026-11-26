@@ -6406,6 +6406,13 @@ mod kubernetes_tests {
         }
     }
 
+    /// The member TTL the disconnected-reservation tests give their cap.
+    /// Redis's clock decides expiry, so they wait out real time: half a TTL
+    /// past it, only the detached task's renewals keep the member live. A
+    /// renewal is due every third of a TTL, so one a loaded runner delays by
+    /// up to 400 ms still lands in time.
+    const DISCONNECTED_RESERVATION_TTL: Duration = Duration::from_millis(600);
+
     /// A restore's live-cap reservation moves into its detached leader, so a
     /// caller that disconnects while the pod is still being created doesn't
     /// stop its renewal: past the member's TTL the restore still counts.
@@ -6438,7 +6445,7 @@ mod kubernetes_tests {
             ),
         );
         let leader_tasks = substrate.task_tracker.clone();
-        let ttl = Duration::from_secs(1);
+        let ttl = DISCONNECTED_RESERVATION_TTL;
         let cap = crate::client_live_cap::ClientLiveCap::for_tests(
             Substrate::from_kubernetes(KubernetesSubstrate::with_seeded_caches(
                 pool.clone(),
@@ -6489,7 +6496,7 @@ mod kubernetes_tests {
                 .expect_err("handler must be cancelled")
                 .is_cancelled()
         );
-        tokio::time::sleep(ttl + Duration::from_millis(500)).await;
+        tokio::time::sleep(ttl + ttl / 2).await;
         cap.precheck(&alpha, SandboxId::new())
             .await
             .expect_err("the detached restore still holds its slot past the TTL");
@@ -6546,7 +6553,7 @@ mod kubernetes_tests {
             ),
         );
         let leader_tasks = substrate.task_tracker.clone();
-        let ttl = Duration::from_secs(1);
+        let ttl = DISCONNECTED_RESERVATION_TTL;
         let cap = crate::client_live_cap::ClientLiveCap::for_tests(
             Substrate::from_kubernetes(KubernetesSubstrate::with_seeded_caches(
                 pool.clone(),
@@ -6603,7 +6610,7 @@ mod kubernetes_tests {
                 .expect_err("handler must be cancelled")
                 .is_cancelled()
         );
-        tokio::time::sleep(ttl + Duration::from_millis(500)).await;
+        tokio::time::sleep(ttl + ttl / 2).await;
         cap.precheck(&alpha, SandboxId::new())
             .await
             .expect_err("the detached wake still holds its slot past the TTL");
