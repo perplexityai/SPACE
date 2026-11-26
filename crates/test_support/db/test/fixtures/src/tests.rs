@@ -1,10 +1,13 @@
 use std::sync::{Arc, Barrier};
+use std::time::Duration;
 
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestEnv;
+use sqlx::{Connection, PgConnection, PgPool};
 
 use super::{
-    SchemaVariant, TestDepsPolicy, append_skip_record, report_dependency_skip_to,
-    unavailable_dependency_outcome,
+    SchemaVariant, TestDbResult, TestDepsPolicy, append_skip_record, end_connections, pg_test_db,
+    report_dependency_skip_to, unavailable_dependency_outcome,
 };
 
 #[test]
@@ -260,4 +263,58 @@ fn schema_variant_values_that_are_not_utf8_fail() {
         error.to_string().contains(super::SCHEMA_VARIANT_ENV),
         "the error names the variable: {error}"
     );
+}
+
+/// A test database's cleanup ends its connections, including ones the test
+/// still has checked out, refuses new ones, and drops the database.
+#[tokio::test]
+async fn cleanup_ends_held_connections_refuses_new_ones_and_drops_the_database() -> TestDbResult<()>
+{
+    let db = pg_test_db().await?;
+    let name = db._cleanup.database_name.clone();
+    let admin = PgPool::connect(&db._cleanup.admin_database_url).await?;
+    let mut held = db.pool.acquire().await?;
+    let _also_held = db.pool.acquire().await?;
+
+    // A generous timeout: this checks what the cleanup waits for, not how
+    // long it takes.
+    assert!(end_connections(&admin, &name, Duration::from_secs(30)).await?);
+    let remaining: i64 = sqlx::query_scalar(sql!(
+        "SELECT count(*) FROM pg_stat_get_activity(NULL)
+         WHERE datid = (SELECT oid FROM pg_database WHERE datname = $1)"
+    ))
+    .bind(&name)
+    .fetch_one(&admin)
+    .await?;
+    assert_eq!(remaining, 0);
+    let refused = PgConnection::connect(&db.database_url)
+        .await
+        .expect_err("the database must refuse new connections");
+    // object_not_in_prerequisite_state: "not currently accepting connections".
+    assert_eq!(
+        refused
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55000"),
+        "{refused}"
+    );
+    sqlx::query(sql!("SELECT 1"))
+        .execute(&mut *held)
+        .await
+        .expect_err("an ended connection must not answer");
+
+    // Dropped while the test still holds both connections.
+    drop(db);
+    let exists: bool = sqlx::query_scalar(sql!(
+        "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)"
+    ))
+    .bind(&name)
+    .fetch_one(&admin)
+    .await?;
+    assert!(!exists, "{name} survived its TestDb");
+    // A database that is already gone has nothing to end.
+    assert!(end_connections(&admin, &name, Duration::from_secs(30)).await?);
+    admin.close().await;
+    Ok(())
 }

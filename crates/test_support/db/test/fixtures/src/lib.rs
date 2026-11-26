@@ -9,9 +9,10 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Weak};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
 use testcontainers_modules::postgres::Postgres as PostgresImage;
 use tokio::sync::{Mutex, OnceCell};
@@ -192,10 +193,25 @@ impl Drop for DatabaseCleanup {
                 })?;
 
             runtime.block_on(async move {
+                // No warnings: ending a connection that has just exited on
+                // its own warns that it is not a backend.
+                let admin_options = admin_database_url
+                    .parse::<PgConnectOptions>()?
+                    .options([("client_min_messages", "error")]);
                 let admin_pool = PgPoolOptions::new()
                     .max_connections(1)
-                    .connect(&admin_database_url)
+                    .connect_with(admin_options)
                     .await?;
+                // Only for speed: the drop below ends whatever this leaves,
+                // so it runs whatever this returns.
+                if let Err(error) =
+                    end_connections(&admin_pool, &database_name, CONNECTION_EXIT_TIMEOUT).await
+                {
+                    eprintln!(
+                        "failed to end the connections to postgres test database \
+                         {database_name} before dropping it: {error}"
+                    );
+                }
                 let drop_database = format!(
                     "DROP DATABASE IF EXISTS {} WITH (FORCE)",
                     quote_ident(&database_name)
@@ -214,6 +230,65 @@ impl Drop for DatabaseCleanup {
             Err(_) => {
                 eprintln!("failed to clean up postgres test database: cleanup thread panicked")
             }
+        }
+    }
+}
+
+/// How long a test database's cleanup waits for its connections to exit
+/// before dropping it. They take a millisecond or two. One still there is
+/// left to the drop, which waits for it as it always has, so no drop takes
+/// longer than before by more than this: one of the drop's own polls.
+const CONNECTION_EXIT_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// End every connection to `database_name` and wait up to `timeout` for them
+/// to exit, so the `DROP DATABASE ... WITH (FORCE)` that follows finds none.
+/// The drop ends them itself, but then checks for them only every 100 ms, and
+/// the test's own pool is often still connected when it runs. Returns whether
+/// none was left.
+async fn end_connections(
+    admin_pool: &PgPool,
+    database_name: &str,
+    timeout: Duration,
+) -> TestDbResult<bool> {
+    // First refuse new connections, so a pool the test still holds cannot
+    // reconnect between the ones ended here and the drop.
+    let refuse_connections = format!(
+        "ALTER DATABASE {} WITH ALLOW_CONNECTIONS false",
+        quote_ident(database_name)
+    );
+    match sqlx::query(sqlx::AssertSqlSafe(refuse_connections.as_str()))
+        .execute(admin_pool)
+        .await
+    {
+        Ok(_) => {}
+        // Already gone: `DROP DATABASE IF EXISTS` skips it, as it always has.
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("3D000") => {
+            return Ok(true);
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        // Ends any connection still there, again for those already ended,
+        // and counts them. Each check's round trip is long enough for most
+        // of them to exit; a sleep, which tokio rounds up to whole
+        // milliseconds, made the cleanup slower. The activity function rather
+        // than the pg_stat_activity view, which a new connection takes about
+        // a millisecond longer to plan.
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_get_activity(NULL)
+             WHERE datid = (SELECT oid FROM pg_database WHERE datname = $1)
+               AND pid <> pg_backend_pid()",
+        )
+        .bind(database_name)
+        .fetch_one(admin_pool)
+        .await?;
+        if remaining == 0 {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
         }
     }
 }
