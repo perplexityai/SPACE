@@ -588,6 +588,9 @@ fn delete_sandbox_child_rows(tx: &Connection, id: &str) -> Result<()> {
     // `sandbox_runtime_upgrade_attempt_outcomes` is kept, with no foreign
     // key: a delayed retry of an attempt whose outcome is final can arrive
     // after the sandbox was staged again, and must still be refused.
+    // `sandbox_runtime_upgrade_abandoned` is kept for the same reason: a late
+    // call for an abandoned operation can stage the sandbox again, and must
+    // still be refused.
     Ok(())
 }
 

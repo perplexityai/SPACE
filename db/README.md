@@ -506,6 +506,23 @@ is nonzero, roll the binary back only to a release that honors recorded
 finality (see "Upgrading a sandbox's runtime" in
 `docs/execution-environments.md`).
 
+`20261120230000_sandbox_runtime_upgrade_abandoned` adds
+`sandbox_runtime_upgrade_abandoned`, which records each operation the control
+plane abandoned. It has no foreign key to `sandboxes`, so a record outlives its
+sandbox's row and can precede it. Its down refuses, before it changes the
+schema, while the table holds any row: a release without it doesn't know an
+operation was abandoned, so a late call for one could change a disk the
+control plane has already captured. This read-only query counts the rows that
+hold it back:
+
+```sql
+SELECT COUNT(*) FROM sandbox_runtime_upgrade_abandoned;
+```
+
+An image-only rollback runs no down, so once that count is nonzero, roll the
+binary back only to a release that enforces abandonment, or keep every caller
+of the abandoned operations quiet first.
+
 ## Console password provisioning
 
 The password hash marker `!` locks console password login and rejects existing

@@ -80,6 +80,23 @@ impl RuntimeUpgradePhase {
         FENCING_PHASES.contains(&self)
     }
 
+    /// Whether the operation is done with the sandbox, for any target state,
+    /// so [`abandon_runtime_upgrade`] records it abandoned without settling
+    /// it first, and the abandon RPC doesn't settle it either. A rolled-back
+    /// row already restored the sandbox's disk and released its fence; what
+    /// it still owes is deleting the preserved copy, which never touches the
+    /// sandbox, so recovery's [`crate::db::scan::unsettled_runtime_upgrades`]
+    /// still lists it and finishes that after an abandon as it would before. A
+    /// fencing phase may still change the disk, and a verified one still owes
+    /// the retirement and, for a stopped target, the stop. Spelled out with no
+    /// wildcard, so a new phase has to choose.
+    pub const fn is_done_with_the_sandbox(self) -> bool {
+        match self {
+            Self::RolledBack | Self::Retired => true,
+            Self::Fenced | Self::Preserved | Self::Booting | Self::Verified => false,
+        }
+    }
+
     const fn can_advance_to(self, next: Self) -> bool {
         matches!(
             (self, next),
@@ -284,6 +301,9 @@ pub enum BeginRuntimeUpgrade {
     MemoryLossUnauthorized,
     /// The sandbox changed since the caller inspected it.
     SandboxChanged,
+    /// The control plane abandoned this operation; see
+    /// [`abandon_runtime_upgrade`].
+    Abandoned,
 }
 
 fn conversion_error(
@@ -630,6 +650,9 @@ pub fn begin_runtime_upgrade(
     if runtime_upgrade(&tx, new.operation_id)?.is_some() {
         return Ok(BeginRuntimeUpgrade::OperationExists);
     }
+    if runtime_upgrade_abandoned(&tx, new.operation_id)? {
+        return Ok(BeginRuntimeUpgrade::Abandoned);
+    }
     // An operation id names one upgrade of one sandbox, across both tables,
     // and asks for what its final attempt outcomes recorded, which outlive
     // the sandbox's row.
@@ -704,6 +727,110 @@ pub fn begin_runtime_upgrade(
     let record = runtime_upgrade(&tx, new.operation_id)?.ok_or_else(Error::no_rows)?;
     tx.commit()?;
     Ok(BeginRuntimeUpgrade::Fenced(Box::new(record)))
+}
+
+/// What [`abandon_runtime_upgrade`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbandonRuntimeUpgrade {
+    /// The operation is recorded abandoned, now or by an earlier call: no
+    /// later call for it fences or boots.
+    Abandoned,
+    /// The operation hasn't settled: it fences the sandbox, so its boot may
+    /// still change the disk, or its boot was verified and still owes the
+    /// retirement, and for a stopped target the stop, a retry of it finishes.
+    Unsettled,
+    /// The node recorded this operation id for another sandbox.
+    OperationNamesAnother,
+}
+
+/// Record `operation_id` abandoned for `sandbox_id`, so no later call for it
+/// fences or boots, from any pod; see [`AbandonRuntimeUpgrade`]. An operation
+/// the node never saw is recorded too, as is one for a sandbox the node
+/// doesn't hold: its call may still be on its way, and one carrying
+/// `stage_from` would stage the sandbox. The record outlives the sandbox's
+/// row.
+pub fn abandon_runtime_upgrade(
+    conn: &Connection,
+    sandbox_id: &str,
+    operation_id: RuntimeUpgradeOperationId,
+) -> Result<AbandonRuntimeUpgrade> {
+    let tx = immediate_transaction(conn)?;
+    let live = runtime_upgrade(&tx, operation_id)?;
+    let outcome = if live
+        .as_ref()
+        .is_some_and(|record| record.sandbox_id != sandbox_id)
+        || recorded_runtime_upgrade_request(&tx, operation_id)?
+            .is_some_and(|recorded| recorded.sandbox_id != sandbox_id)
+        || abandoned_runtime_upgrade_sandbox(&tx, operation_id)?
+            .is_some_and(|abandoned| abandoned != sandbox_id)
+        || attempt_outcome_names_another_sandbox(&tx, operation_id, sandbox_id)?
+    {
+        AbandonRuntimeUpgrade::OperationNamesAnother
+    } else if live
+        .as_ref()
+        .is_some_and(|record| !record.phase.is_done_with_the_sandbox())
+    {
+        AbandonRuntimeUpgrade::Unsettled
+    } else {
+        tx.execute(
+            "INSERT OR IGNORE INTO sandbox_runtime_upgrade_abandoned
+                 (operation_id, sandbox_id, recorded_at)
+             VALUES (?1, ?2, ?3)",
+            params![operation_id.to_string(), sandbox_id, now()?],
+        )?;
+        AbandonRuntimeUpgrade::Abandoned
+    };
+    tx.commit()?;
+    Ok(outcome)
+}
+
+/// Whether an attempt's final outcome records `operation_id` for another
+/// sandbox than `sandbox_id`. Attempt outcomes outlive the sandbox's row, and
+/// with it the operation's own outcome, so they still name the operation's
+/// sandbox after that row is gone. A row without the request, which a build
+/// from before the request columns writes, is final for no attempt, and
+/// [`begin_runtime_upgrade`] doesn't hold an operation to it either: counting
+/// it here would refuse to abandon an operation that same check let fence.
+fn attempt_outcome_names_another_sandbox(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+    sandbox_id: &str,
+) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM sandbox_runtime_upgrade_attempt_outcomes
+              WHERE operation_id = ?1
+                AND sandbox_id != ?2
+                AND target_environment IS NOT NULL
+         )",
+        params![operation_id.to_string(), sandbox_id],
+        |row| row.get(0),
+    )
+}
+
+db_private_outside_tests! {
+    /// Whether the control plane abandoned `operation_id` on this node.
+    fn runtime_upgrade_abandoned(
+        conn: &Connection,
+        operation_id: RuntimeUpgradeOperationId,
+    ) -> Result<bool> {
+        Ok(abandoned_runtime_upgrade_sandbox(conn, operation_id)?.is_some())
+    }
+}
+
+/// The sandbox `operation_id` was abandoned for, if the control plane
+/// abandoned it on this node.
+pub(in crate::db) fn abandoned_runtime_upgrade_sandbox(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT sandbox_id FROM sandbox_runtime_upgrade_abandoned WHERE operation_id = ?1",
+        params![operation_id.to_string()],
+        |row| row.get(0),
+    )
+    .optional()
 }
 
 /// Move `sandbox_id`'s upgrade `operation_id` one forward edge. A false
@@ -1148,7 +1275,8 @@ struct MissingRetainedAuthorization;
 /// leaves it. False, recording nothing, when the attempt already
 /// has a final outcome of its own, or the node already recorded the
 /// operation, as an outcome or a live upgrade, for another sandbox, or as an
-/// outcome or a final attempt outcome for another request.
+/// outcome or a final attempt outcome for another request, or the control
+/// plane abandoned it here (see [`abandon_runtime_upgrade`]).
 /// The checks and the write are one transaction, and `begin_runtime_upgrade`
 /// checks this table in its transaction, so two requests reusing one
 /// operation id can't both succeed.
@@ -1228,6 +1356,11 @@ fn insert_already_on_target(
           )
             AND NOT EXISTS (
                 SELECT 1
+                  FROM sandbox_runtime_upgrade_abandoned
+                 WHERE operation_id = ?1
+          )
+            AND NOT EXISTS (
+                SELECT 1
                   FROM sandbox_runtime_upgrade_attempt_outcomes
                  WHERE operation_id = ?1
                    AND attempt_id = ?8
@@ -1276,14 +1409,14 @@ fn cleanup_owns(conn: &Connection, sandbox: &SandboxRow) -> Result<bool> {
 /// [`read::runtime_upgrade_attempt_outcome`]). The caller records only a refusal a
 /// retry can't change. False, recording nothing, when the attempt already has
 /// a final outcome of its own, the sandbox is gone from the node, a live
-/// upgrade row exists for the operation, its recorded outcome or a final
-/// attempt outcome names another request. An already-on-target outcome isn't
-/// replaced: it keeps the operation from ever booting, and its activation
-/// claim with it, so beside one only the attempt's own outcome records the
-/// refusal, and that attempt's report and retries answer with it. False too when the refusal was
-/// decided from the sandbox as `decided_on` saw it and the sandbox's row no
-/// longer matches it on its state, local artifact, execution metadata and
-/// last activation: what
+/// upgrade row exists for the operation, the control plane abandoned it here,
+/// or its recorded outcome or a final attempt outcome names another request.
+/// An already-on-target outcome isn't replaced: it keeps the operation from
+/// ever booting, and its activation claim with it, so beside one only the
+/// attempt's own outcome records the refusal, and that attempt's report and
+/// retries answer with it. False too when the refusal was decided from the
+/// sandbox as `decided_on` saw it and the sandbox's row no longer matches it
+/// on its state, local artifact, execution metadata and last activation: what
 /// the refusal said of the sandbox may no longer hold, and a retry decides it
 /// again. `None` for a refusal that doesn't depend on the sandbox's row.
 /// False too while a cleanup owns the sandbox (`cleanup_owns`), including
@@ -1323,6 +1456,11 @@ pub fn record_runtime_upgrade_refusal(
             AND NOT EXISTS (
                 SELECT 1
                   FROM sandbox_runtime_upgrades
+                 WHERE operation_id = ?1
+          )
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM sandbox_runtime_upgrade_abandoned
                  WHERE operation_id = ?1
           )
             AND NOT EXISTS (
@@ -1376,9 +1514,9 @@ pub fn record_runtime_upgrade_refusal(
 
 /// Whether the operation `request` names recorded an already-on-target
 /// outcome for the same request under another attempt than `attempt_id`,
-/// with no live upgrade row and its sandbox still on the node: an earlier
-/// attempt found the target, so a later attempt's refusal is that attempt's
-/// alone. The attempt that found the target keeps that answer.
+/// with no live upgrade row, its sandbox still on the node and the operation
+/// not abandoned here: an earlier attempt found the target, so a later
+/// attempt's refusal is that attempt's alone. The attempt that found the target keeps that answer.
 fn already_on_target_for(
     tx: &Connection,
     request: &RuntimeUpgradeRequestIdentity,
@@ -1398,6 +1536,9 @@ fn already_on_target_for(
                 AND EXISTS (SELECT 1 FROM sandboxes WHERE id = ?2)
                 AND NOT EXISTS (
                     SELECT 1 FROM sandbox_runtime_upgrades WHERE operation_id = ?1
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM sandbox_runtime_upgrade_abandoned WHERE operation_id = ?1
                 )",
             params![
                 request.operation_id.to_string(),

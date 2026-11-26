@@ -131,7 +131,7 @@ fn required_file(path: &Path, what: &str) -> Result<(), Refusal> {
 
 /// Runtime metadata that can't be read may be readable on a retry; metadata
 /// that reads but doesn't parse or validate answers every retry the same way.
-fn artifact_read_refusal(error: RuntimeArtifactReadError) -> Refusal {
+pub(super) fn artifact_read_refusal(error: RuntimeArtifactReadError) -> Refusal {
     let status = Status::failed_precondition(error.to_string());
     match error {
         RuntimeArtifactReadError::Read { .. } => Refusal::Retry(status),
