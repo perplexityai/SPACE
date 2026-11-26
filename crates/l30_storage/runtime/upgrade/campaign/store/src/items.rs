@@ -11,6 +11,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 pub(crate) use pplx_space_rollout_queue::LEASE_EXPIRED;
 pub use pplx_space_rollout_queue::RedriveReport;
 use pplx_space_rollout_queue::{Candidates, ClaimStore, FailedItems, Pacing, RenewStore};
@@ -33,11 +34,11 @@ pub const RETIRED_ATTEMPTS: u64 = i64::MAX as u64;
 /// [`insert_pending`] never makes a retired item pending again, whatever
 /// `max_attempts` it's given.
 pub async fn retire_skipped(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     campaign_id: CampaignId,
     subject_kind: SubjectKind,
     subject_ids: &[uuid::Uuid],
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     if subject_ids.is_empty() {
         return Ok(0);
     }
@@ -55,7 +56,7 @@ pub async fn retire_skipped(
     .bind(subject_ids)
     .bind(RETIRED_ATTEMPTS as i64)
     .bind(ItemPhase::Skipped.as_str())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected())
 }
@@ -79,7 +80,7 @@ pub async fn insert_pending(
     subject_kind: SubjectKind,
     subject_ids: &[uuid::Uuid],
     max_attempts: u64,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     if subject_ids.is_empty() {
         return Ok(0);
     }
@@ -101,7 +102,7 @@ async fn insert_pending_in(
     subject_kind: SubjectKind,
     subject_ids: &[uuid::Uuid],
     max_attempts: u64,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let kinds: Vec<&str> = CampaignKind::ALL
         .iter()
         .filter(|kind| kind.subject_kind() == subject_kind)
@@ -218,7 +219,7 @@ pub async fn lease_items(
     lease: Duration,
     scan_limit: u32,
 ) -> Result<Vec<LeasedItem>, LeaseError> {
-    let mut tx = conn.begin().await?;
+    let mut tx = conn.begin().await.map_err(DbError::from)?;
     let mut claiming = Claiming {
         tx: &mut tx,
         campaign_id,
@@ -233,7 +234,7 @@ pub enum LeaseError {
     #[error(transparent)]
     UnknownValue(#[from] crate::UnknownValue),
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 }
 
 /// [`lease_items`]'s steps. The shared claim paces by the cluster cap; the
@@ -287,7 +288,8 @@ impl ClaimStore for Claiming<'_> {
             .bind(CampaignPhase::Canary.as_str())
             .bind(&leasing)
             .fetch_optional(&mut *self.tx)
-            .await?
+            .await
+            .map_err(DbError::from)?
         else {
             return Ok(None);
         };
@@ -316,7 +318,8 @@ impl ClaimStore for Claiming<'_> {
         .bind(ItemPhase::Done.as_str())
         .bind(ItemPhase::InFlight.as_str())
         .fetch_one(&mut *self.tx)
-        .await?;
+        .await
+        .map_err(DbError::from)?;
         Ok((canary_done, u64::try_from(canary_in_flight).unwrap_or(0)))
     }
 
@@ -393,7 +396,8 @@ impl ClaimStore for Claiming<'_> {
         .bind(lease.as_secs_f64())
         .bind(ItemPhase::Pending.as_str())
         .fetch_optional(&mut *self.tx)
-        .await?;
+        .await
+        .map_err(DbError::from)?;
         let Some(attempts) = attempts else {
             return Ok(None);
         };
@@ -425,7 +429,7 @@ async fn held_by_other_campaigns(
     tx: &mut PgConnection,
     campaign_id: CampaignId,
     subject_kind: SubjectKind,
-) -> Result<HashSet<uuid::Uuid>, sqlx::Error> {
+) -> Result<HashSet<uuid::Uuid>, DbError> {
     // Campaigns first, so each one's in-flight items come from the
     // (campaign_id, phase, subject_id) index. A completed campaign has none:
     // completion needs no item in flight, under the lock leasers take.
@@ -469,7 +473,7 @@ async fn lock_lease_handoff(
     tx: &mut PgConnection,
     subject_kind: SubjectKind,
     handoff: Handoff,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     let statement = match handoff {
         Handoff::Lease => sql!("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"),
         Handoff::Renewal => {
@@ -497,7 +501,7 @@ async fn node_bound_candidates(
     campaign_id: CampaignId,
     subject_kind: SubjectKind,
     scan_limit: u32,
-) -> Result<NodeCandidates, sqlx::Error> {
+) -> Result<NodeCandidates, DbError> {
     debug_assert_eq!(subject_kind, SubjectKind::Sandbox);
     // One statement, so one snapshot: the in-flight counts and the pending
     // items see each sandbox on the same node. Read in two, a sandbox
@@ -568,7 +572,7 @@ async fn nodeless_candidates(
     campaign_id: CampaignId,
     subject_kind: SubjectKind,
     scan_limit: u32,
-) -> Result<NodeCandidates, sqlx::Error> {
+) -> Result<NodeCandidates, DbError> {
     // One statement, so one snapshot: an item that leaves flight in between
     // would otherwise count both in flight and pending.
     let (in_flight, pending) = sqlx::query_as::<_, (i64, Vec<uuid::Uuid>)>(sql!(
@@ -629,7 +633,7 @@ pub async fn renew_lease(
     conn: impl Acquire<'_, Database = Postgres>,
     item: &LeasedItem,
     lease: Duration,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let mut tx = conn.begin().await?;
     let mut renewing = Renewing { tx: &mut tx, item };
     let renewed = pplx_space_rollout_queue::renew(&mut renewing, lease).await;
@@ -643,9 +647,9 @@ struct Renewing<'c, 'i> {
 }
 
 impl RenewStore for Renewing<'_, '_> {
-    type Error = sqlx::Error;
+    type Error = DbError;
 
-    async fn lock_unfinished(&mut self) -> Result<bool, sqlx::Error> {
+    async fn lock_unfinished(&mut self) -> Result<bool, DbError> {
         // Shared, so renewals of one campaign don't wait on each other here.
         let unfinished = sqlx::query_scalar::<_, i32>(sql!(
             "SELECT 1
@@ -660,11 +664,11 @@ impl RenewStore for Renewing<'_, '_> {
         Ok(unfinished.is_some())
     }
 
-    async fn lock_handoff(&mut self) -> Result<(), sqlx::Error> {
+    async fn lock_handoff(&mut self) -> Result<(), DbError> {
         lock_lease_handoff(self.tx, self.item.subject_kind, Handoff::Renewal).await
     }
 
-    async fn lock_item(&mut self) -> Result<(), sqlx::Error> {
+    async fn lock_item(&mut self) -> Result<(), DbError> {
         // insert_pending's conflict check, say, locks a row without
         // updating it.
         sqlx::query(sql!(
@@ -683,7 +687,7 @@ impl RenewStore for Renewing<'_, '_> {
         Ok(())
     }
 
-    async fn extend(&mut self, lease: Duration) -> Result<bool, sqlx::Error> {
+    async fn extend(&mut self, lease: Duration) -> Result<bool, DbError> {
         let renewed = sqlx::query(sql!(
             "UPDATE runtime_upgrade_items
              SET lease_expires_at = clock_timestamp() + make_interval(secs => $5)
@@ -762,10 +766,10 @@ impl ItemOutcome {
 /// item, and refusing the outcome of finished work would only make a later
 /// lease redo it.
 pub async fn finish_item(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     item: &LeasedItem,
     outcome: &ItemOutcome,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let finished = sqlx::query(sql!(
         "UPDATE runtime_upgrade_items
          SET phase = $5,
@@ -787,7 +791,7 @@ pub async fn finish_item(
     .bind(outcome.error())
     .bind(ItemPhase::InFlight.as_str())
     .bind(outcome.refunded_attempts())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected();
     Ok(finished == 1)
@@ -798,10 +802,10 @@ pub async fn finish_item(
 /// upgrade is idempotent, so a later lease redoes it safely, and the lapsed
 /// worker can no longer record an outcome.
 pub async fn redrive_expired(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     campaign_id: CampaignId,
     max_attempts: u64,
-) -> Result<RedriveReport, sqlx::Error> {
+) -> Result<RedriveReport, DbError> {
     let phases = sqlx::query_scalar::<_, String>(sql!(
         "UPDATE runtime_upgrade_items
          SET phase = CASE WHEN attempts >= $2 THEN $3 ELSE $4 END,
@@ -819,7 +823,7 @@ pub async fn redrive_expired(
     .bind(ItemPhase::Pending.as_str())
     .bind(LEASE_EXPIRED)
     .bind(ItemPhase::InFlight.as_str())
-    .fetch_all(executor)
+    .fetch_all(executor.into_sqlx())
     .await?;
     let failed = phases
         .iter()
@@ -837,9 +841,7 @@ pub async fn redrive_expired(
 /// campaign keeps an item in flight until its worker's lease lapses, so no
 /// other campaign leases the subject while that worker may still be on it
 /// ([`lease_items`]); this tidies up after. Returns how many it released.
-pub async fn release_lapsed_in_finished(
-    executor: impl sqlx::PgExecutor<'_>,
-) -> Result<u64, sqlx::Error> {
+pub async fn release_lapsed_in_finished(executor: impl Executor<'_>) -> Result<u64, DbError> {
     Ok(sqlx::query(sql!(
         "UPDATE runtime_upgrade_items
          SET phase = $2,
@@ -857,7 +859,7 @@ pub async fn release_lapsed_in_finished(
     .bind(ItemPhase::Pending.as_str())
     .bind(LEASE_EXPIRED)
     .bind(CampaignPhase::Aborted.as_str())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected())
 }

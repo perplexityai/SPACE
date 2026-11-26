@@ -30,7 +30,7 @@ async fn set_default_committed(
     environment: EnvironmentReference,
 ) -> TestResult<u64> {
     let mut tx = pool.begin().await?;
-    let generation = set_default(&mut tx, environment, &change("set default")).await?;
+    let generation = set_default(&mut *tx, environment, &change("set default")).await?;
     tx.commit().await?;
     Ok(generation)
 }
@@ -39,9 +39,9 @@ async fn set_default_committed_result(
     pool: &PgPool,
     environment: EnvironmentReference,
 ) -> Result<u64, SetDefaultError> {
-    let mut tx = pool.begin().await?;
-    let generation = set_default(&mut tx, environment, &change("set default")).await?;
-    tx.commit().await?;
+    let mut tx = pool.begin().await.map_err(DbError::from)?;
+    let generation = set_default(&mut *tx, environment, &change("set default")).await?;
+    tx.commit().await.map_err(DbError::from)?;
     Ok(generation)
 }
 
@@ -50,10 +50,10 @@ async fn set_state_committed(
     environment: EnvironmentReference,
     state: RuntimeEnvironmentState,
 ) -> Result<u64, SetEnvironmentStateError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin().await.map_err(DbError::from)?;
     let generation =
-        set_environment_state(&mut tx, environment, state, &change("set state")).await?;
-    tx.commit().await?;
+        set_environment_state(&mut *tx, environment, state, &change("set state")).await?;
+    tx.commit().await.map_err(DbError::from)?;
     Ok(generation)
 }
 
@@ -161,7 +161,7 @@ async fn a_blocked_environment_cannot_become_the_default() -> TestResult {
     set_state_committed(&db.pool, e1, RuntimeEnvironmentState::Blocked).await?;
 
     let mut tx = db.pool.begin().await?;
-    let refused = set_default(&mut tx, e1, &change("promote blocked")).await;
+    let refused = set_default(&mut *tx, e1, &change("promote blocked")).await;
     assert!(
         matches!(refused, Err(SetDefaultError::Blocked(env)) if env == e1),
         "{refused:?}"
@@ -182,7 +182,7 @@ async fn a_block_waits_for_a_concurrent_default_change_and_sees_it() -> TestResu
     set_default_committed(&db.pool, e0).await?;
 
     let mut first = db.pool.begin().await?;
-    set_default(&mut first, e1, &change("move default")).await?;
+    set_default(&mut *first, e1, &change("move default")).await?;
 
     let pool = db.pool.clone();
     let blocker = tokio::spawn(async move {
@@ -241,7 +241,7 @@ async fn a_default_change_waits_for_a_concurrent_block_and_sees_it() -> TestResu
 
     let mut first = db.pool.begin().await?;
     set_environment_state(
-        &mut first,
+        &mut *first,
         e1,
         RuntimeEnvironmentState::Blocked,
         &change("block"),
@@ -310,7 +310,7 @@ async fn legacy_permission_is_written_and_bumps_the_generation() -> TestResult {
     };
     let mut tx = db.pool.begin().await?;
     assert_eq!(
-        set_legacy_unbound_allowed(&mut tx, false, &change("disable legacy")).await?,
+        set_legacy_unbound_allowed(&mut *tx, false, &change("disable legacy")).await?,
         1
     );
     tx.commit().await?;
@@ -328,8 +328,8 @@ async fn a_write_composes_into_the_callers_transaction() -> TestResult {
     };
     let e0 = environment(0);
     let mut tx = db.pool.begin().await?;
-    set_default(&mut tx, e0, &change("set default")).await?;
-    set_legacy_unbound_allowed(&mut tx, true, &change("allow legacy")).await?;
+    set_default(&mut *tx, e0, &change("set default")).await?;
+    set_legacy_unbound_allowed(&mut *tx, true, &change("allow legacy")).await?;
     assert_eq!(get(&mut *tx).await?.generation, 2);
     tx.rollback().await?;
 
@@ -391,7 +391,7 @@ async fn the_record_reads_back_each_rows_actor_and_reason() -> TestResult {
         reason: PolicyChangeReason::new("deprecate e1")?,
     };
     set_environment_state(
-        &mut tx,
+        &mut *tx,
         e1,
         RuntimeEnvironmentState::Deprecated,
         &unattributed,
@@ -433,12 +433,12 @@ async fn a_missing_policy_row_is_an_error_not_the_bootstrap_policy() -> TestResu
     ));
     let mut tx = db.pool.begin().await?;
     assert!(matches!(
-        set_default(&mut tx, environment(0), &change("set default")).await,
+        set_default(&mut *tx, environment(0), &change("set default")).await,
         Err(SetDefaultError::PolicyRowMissing)
     ));
     assert!(matches!(
         set_environment_state(
-            &mut tx,
+            &mut *tx,
             environment(1),
             RuntimeEnvironmentState::Allowed,
             &change("allow")
@@ -447,7 +447,7 @@ async fn a_missing_policy_row_is_an_error_not_the_bootstrap_policy() -> TestResu
         Err(SetEnvironmentStateError::PolicyRowMissing)
     ));
     assert!(matches!(
-        set_legacy_unbound_allowed(&mut tx, true, &change("allow legacy")).await,
+        set_legacy_unbound_allowed(&mut *tx, true, &change("allow legacy")).await,
         Err(SetLegacyUnboundAllowedError::PolicyRowMissing)
     ));
     tx.rollback().await?;
@@ -510,7 +510,7 @@ async fn an_unknown_stored_state_fails_closed() -> TestResult {
         "{read:?}"
     );
     let mut tx = db.pool.begin().await?;
-    let refused = set_default(&mut tx, e0, &change("set default")).await;
+    let refused = set_default(&mut *tx, e0, &change("set default")).await;
     assert!(
         matches!(refused, Err(SetDefaultError::UnknownState { environment, .. }) if environment == e0),
         "{refused:?}"

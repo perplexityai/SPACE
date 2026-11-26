@@ -47,6 +47,7 @@
 //! on these tables.
 
 use pplx_space_accounts::UserId;
+use pplx_space_postgres_pool::DbError;
 use pplx_space_rollout_queue::{HeaderPhase, Locked, OperatorStore, Refusal};
 use pplx_space_sql_locator::sql;
 use sqlx::{Acquire, PgConnection, Postgres};
@@ -98,7 +99,7 @@ pub enum ChangePhaseError {
     #[error(transparent)]
     UnknownValue(#[from] UnknownValue),
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 }
 
 /// [`Operating`]'s error: a [`ChangePhaseError`] that the shared verbs'
@@ -137,7 +138,7 @@ impl From<Refusal> for OperatorError {
 
 impl From<sqlx::Error> for OperatorError {
     fn from(error: sqlx::Error) -> Self {
-        Self(error.into())
+        Self(DbError::from(error).into())
     }
 }
 
@@ -260,7 +261,7 @@ pub async fn pause_campaign(
     campaign_id: CampaignId,
     change: &PhaseChange,
 ) -> Result<PhaseChanged, ChangePhaseError> {
-    let mut tx = conn.begin().await?;
+    let mut tx = conn.begin().await.map_err(DbError::from)?;
     let mut operating = Operating {
         tx: &mut tx,
         campaign_id,
@@ -294,7 +295,7 @@ pub async fn resume_campaign(
     change: &PhaseChange,
     retry_failed: bool,
 ) -> Result<PhaseChanged, ChangePhaseError> {
-    let mut tx = conn.begin().await?;
+    let mut tx = conn.begin().await.map_err(DbError::from)?;
     let mut operating = Operating {
         tx: &mut tx,
         campaign_id,
@@ -325,7 +326,7 @@ pub async fn abort_campaign(
     campaign_id: CampaignId,
     change: &PhaseChange,
 ) -> Result<PhaseChanged, ChangePhaseError> {
-    let mut tx = conn.begin().await?;
+    let mut tx = conn.begin().await.map_err(DbError::from)?;
     let mut operating = Operating {
         tx: &mut tx,
         campaign_id,

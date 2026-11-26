@@ -183,7 +183,7 @@ impl K8sStore {
                 GetPolicyError::Database(error) => {
                     crate::controllers::substrate::substrate_db_error(
                         "failed to read the runtime environment policy",
-                        &error,
+                        &sqlx::Error::from(error),
                     )
                 }
                 error => SubstrateError::Failed {

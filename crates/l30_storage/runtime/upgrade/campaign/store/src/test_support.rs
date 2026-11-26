@@ -4,6 +4,7 @@
 
 use pplx_space_content_digest::Digest;
 use pplx_space_execution_spec::EnvironmentReference;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 
 use crate::{CampaignId, CampaignKind, CampaignPhase};
@@ -41,9 +42,9 @@ impl Default for CampaignSeed {
 /// Insert `seed`, with `finished_at` set exactly when its phase is terminal,
 /// as the schema requires.
 pub async fn insert_campaign(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     seed: CampaignSeed,
-) -> Result<CampaignId, sqlx::Error> {
+) -> Result<CampaignId, DbError> {
     let kind = seed.kind.as_str();
     insert_campaign_with_kind(executor, seed, kind).await
 }
@@ -51,10 +52,10 @@ pub async fn insert_campaign(
 /// Insert `seed` with `kind` stored verbatim, so a test can seed a kind from a
 /// newer build that [`CampaignKind`] doesn't name.
 pub async fn insert_campaign_with_kind(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     seed: CampaignSeed,
     kind: &str,
-) -> Result<CampaignId, sqlx::Error> {
+) -> Result<CampaignId, DbError> {
     let id = sqlx::query_scalar::<_, uuid::Uuid>(sql!(
         "INSERT INTO runtime_upgrade_campaigns (
              from_environment_ref, to_environment_ref, kind, phase,
@@ -75,7 +76,7 @@ pub async fn insert_campaign_with_kind(
     .bind(seed.include_running)
     .bind(CampaignPhase::Completed.as_str())
     .bind(CampaignPhase::Aborted.as_str())
-    .fetch_one(executor)
+    .fetch_one(executor.into_sqlx())
     .await?;
     Ok(CampaignId(id))
 }

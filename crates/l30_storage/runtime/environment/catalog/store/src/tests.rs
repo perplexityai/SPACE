@@ -90,9 +90,15 @@ async fn a_node_is_assigned_the_unretired_environments_it_knows() -> TestResult 
     // unretired catalog, as before nodes reported.
     let unreported = node(&db.pool).await?;
     let all = vec![environment(0), environment(2), environment(3)];
-    assert_eq!(list_unretired_for_node(&db.pool, unreported).await?, all);
+    assert_eq!(
+        list_unretired_for_node(&Db::from(db.pool.clone()), unreported).await?,
+        all
+    );
     insert_status(&db.pool, unreported, None).await?;
-    assert_eq!(list_unretired_for_node(&db.pool, unreported).await?, all);
+    assert_eq!(
+        list_unretired_for_node(&Db::from(db.pool.clone()), unreported).await?,
+        all
+    );
 
     // A known set narrows it, and a known retired environment stays out.
     let reporting = node(&db.pool).await?;
@@ -103,14 +109,18 @@ async fn a_node_is_assigned_the_unretired_environments_it_knows() -> TestResult 
     )
     .await?;
     assert_eq!(
-        list_unretired_for_node(&db.pool, reporting).await?,
+        list_unretired_for_node(&Db::from(db.pool.clone()), reporting).await?,
         vec![environment(2)]
     );
 
     // An empty known set is a build that certifies nothing.
     let empty = node(&db.pool).await?;
     insert_status(&db.pool, empty, Some(&[])).await?;
-    assert!(list_unretired_for_node(&db.pool, empty).await?.is_empty());
+    assert!(
+        list_unretired_for_node(&Db::from(db.pool.clone()), empty)
+            .await?
+            .is_empty()
+    );
 
     assert_eq!(list_unretired_within(&db.pool, None).await?, all);
     assert_eq!(
@@ -141,7 +151,7 @@ async fn an_unparseable_reference_fails_the_read() -> TestResult {
     insert(&db.pool, "sha256:not-a-digest", false).await?;
 
     let node_id = node(&db.pool).await?;
-    let error = list_unretired_for_node(&db.pool, node_id)
+    let error = list_unretired_for_node(&Db::from(db.pool.clone()), node_id)
         .await
         .expect_err("a malformed reference must fail the whole read");
     assert!(
@@ -185,7 +195,7 @@ async fn record(
     certified: &[CertifiedEnvironment],
 ) -> TestResult<CertificationOutcome> {
     let mut tx = pool.begin().await?;
-    let changed = record_node_certifications(&mut tx, node_id, certified).await?;
+    let changed = record_node_certifications(&mut *tx, node_id, certified).await?;
     tx.commit().await?;
     Ok(changed)
 }
@@ -345,7 +355,7 @@ async fn an_unchanged_report_writes_nothing_and_takes_no_lock() -> TestResult {
     // node's change still records rather than deferring.
     let mut unchanged = db.pool.begin().await?;
     assert_eq!(
-        record_node_certifications(&mut unchanged, node_id, &report).await?,
+        record_node_certifications(&mut *unchanged, node_id, &report).await?,
         CertificationOutcome::Unchanged
     );
     assert_eq!(
@@ -433,7 +443,7 @@ async fn a_change_while_another_holds_the_aggregate_waits_for_a_later_publicatio
     // A's build vetoes it too, uncommitted, holding the aggregate lock.
     let mut veto = db.pool.begin().await?;
     assert_eq!(
-        record_node_certifications(&mut veto, a, &vetoes).await?,
+        record_node_certifications(&mut *veto, a, &vetoes).await?,
         CertificationOutcome::Recorded
     );
     // B withdraws meanwhile. It doesn't wait: it writes nothing, so it can't
@@ -444,7 +454,7 @@ async fn a_change_while_another_holds_the_aggregate_waits_for_a_later_publicatio
         .execute(&mut *withdrawal)
         .await?;
     assert_eq!(
-        record_node_certifications(&mut withdrawal, b, &[]).await?,
+        record_node_certifications(&mut *withdrawal, b, &[]).await?,
         CertificationOutcome::Deferred
     );
     withdrawal.commit().await?;
@@ -523,12 +533,12 @@ async fn deleting_the_last_vetoing_node_brings_the_edge_back_on_recompute() -> T
 
     // The periodic recompute brings the edge back.
     assert_eq!(
-        recompute_all_edges(&db.pool).await?,
+        recompute_all_edges(&Db::from(db.pool.clone())).await?,
         RecomputeOutcome::Recomputed { changed: 1 }
     );
     assert_eq!(edges(&db.pool, a).await?, (set(&[b]), set(&[])));
     assert_eq!(
-        recompute_all_edges(&db.pool).await?,
+        recompute_all_edges(&Db::from(db.pool.clone())).await?,
         RecomputeOutcome::Recomputed { changed: 0 }
     );
     Ok(())
@@ -543,18 +553,18 @@ async fn a_recompute_while_a_publication_holds_the_aggregate_is_deferred() -> Te
     let node_id = node(&db.pool).await?;
     let mut held = db.pool.begin().await?;
     record_node_certifications(
-        &mut held,
+        &mut *held,
         node_id,
         &[certified(a, &[b], &[]), certified(b, &[], &[])],
     )
     .await?;
     assert_eq!(
-        recompute_all_edges(&db.pool).await?,
+        recompute_all_edges(&Db::from(db.pool.clone())).await?,
         RecomputeOutcome::Deferred
     );
     held.commit().await?;
     assert_eq!(
-        recompute_all_edges(&db.pool).await?,
+        recompute_all_edges(&Db::from(db.pool.clone())).await?,
         RecomputeOutcome::Recomputed { changed: 0 }
     );
     Ok(())

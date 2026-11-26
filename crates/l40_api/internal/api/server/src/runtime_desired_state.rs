@@ -104,16 +104,18 @@ impl ClusterApiService {
         {
             return None;
         }
-        let environments =
-            match catalog_store::list_unretired_for_node(&self.runtime_catalog_pool, origin.id)
-                .await
-            {
-                Ok(environments) => environments,
-                Err(error) => {
-                    log_store_read_failure(&error, "runtime environment catalog");
-                    return None;
-                }
-            };
+        let environments = match catalog_store::list_unretired_for_node(
+            &pplx_space_postgres_pool::Db::from(self.runtime_catalog_pool.clone()),
+            origin.id,
+        )
+        .await
+        {
+            Ok(environments) => environments,
+            Err(error) => {
+                log_store_read_failure(&error, "runtime environment catalog");
+                return None;
+            }
+        };
         if environments.len() > MAX_RECIPE_ENVIRONMENTS {
             // `required_environments` admits at most this many. Omitted rather
             // than trimmed, since trimming would pick which certified

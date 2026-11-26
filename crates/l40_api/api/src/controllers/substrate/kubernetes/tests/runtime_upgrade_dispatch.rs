@@ -29,9 +29,9 @@ async fn block_e0_for_e1(pool: &sqlx::PgPool, e0_upgrade_edges: &[&str]) -> Resu
         reason: PolicyChangeReason::new("test policy")?,
     };
     let mut tx = pool.begin().await?;
-    set_default(&mut tx, E1.parse()?, &change).await?;
+    set_default(&mut *tx, E1.parse()?, &change).await?;
     set_environment_state(
-        &mut tx,
+        &mut *tx,
         E0.parse()?,
         RuntimeEnvironmentState::Blocked,
         &change,
@@ -305,7 +305,7 @@ async fn a_stopped_start_off_a_blocked_environment_wakes_by_the_upgrade(
         };
         let mut tx = pool.begin().await?;
         set_environment_state(
-            &mut tx,
+            &mut *tx,
             E0.parse()?,
             RuntimeEnvironmentState::Deprecated,
             &PolicyChange {
@@ -427,7 +427,7 @@ async fn a_resume_discards_memory_only_under_the_current_policy() -> Result<(), 
         };
         let mut tx = db.pool.begin().await?;
         set_environment_state(
-            &mut tx,
+            &mut *tx,
             E0.parse()?,
             RuntimeEnvironmentState::Allowed,
             &PolicyChange {

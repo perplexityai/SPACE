@@ -500,7 +500,7 @@ async fn a_repeated_block_rechecks_after_a_concurrent_unblock() -> TestResult {
     // Another operator allows E0, holding the policy row lock until commit.
     let mut unblock = h.db.pool.begin().await?;
     policy_store::set_environment_state(
-        &mut unblock,
+        &mut *unblock,
         e0,
         RuntimeEnvironmentState::Allowed,
         &PolicyChange {
@@ -999,7 +999,7 @@ async fn a_recheck_counts_a_twin_the_block_would_stop() -> TestResult {
     );
 
     policy_store::set_environment_state(
-        &mut block,
+        &mut *block,
         e0,
         RuntimeEnvironmentState::Blocked,
         &PolicyChange {
@@ -1202,7 +1202,7 @@ async fn the_first_default_waits_for_a_template_campaign_starting_on_an_environm
     // held, the campaign written but not committed.
     let mut start = h.db.pool.begin().await?;
     assert_eq!(
-        campaign_store::unfinished_from_locked(&mut start, CampaignKind::Templates, e0).await?,
+        campaign_store::unfinished_from_locked(&mut *start, CampaignKind::Templates, e0).await?,
         None
     );
     let starting = insert_campaign(

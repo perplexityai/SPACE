@@ -505,7 +505,7 @@ async fn a_lease_that_waits_on_another_lease_of_its_campaign_counts_what_that_on
 
     let pool = db.pool.clone();
     let second = tokio::spawn(async move {
-        let mut conn = pool.acquire().await?;
+        let mut conn = pool.acquire().await.map_err(DbError::from)?;
         lease_items(&mut *conn, campaign, LEASE, SCAN).await
     });
     wait_for_lock_waiter(&db.pool).await?;
@@ -608,7 +608,7 @@ async fn a_lease_counts_a_sandbox_on_the_node_that_published_it_while_the_lease_
 
     let pool = db.pool.clone();
     let leasing = tokio::spawn(async move {
-        let mut conn = pool.acquire().await?;
+        let mut conn = pool.acquire().await.map_err(DbError::from)?;
         lease_items(&mut *conn, campaign, LEASE, SCAN).await
     });
     wait_for_lock_waiter(&db.pool).await?;
@@ -961,7 +961,7 @@ async fn a_lease_waits_for_a_renewal_in_an_open_transaction_and_then_skips_the_s
 
     let pool = db.pool.clone();
     let leasing = tokio::spawn(async move {
-        let mut conn = pool.acquire().await?;
+        let mut conn = pool.acquire().await.map_err(DbError::from)?;
         lease_items(&mut *conn, campaign, LEASE, SCAN).await
     });
     wait_for_lock_waiter(&db.pool).await?;
@@ -1182,7 +1182,7 @@ async fn a_failure_committed_while_a_lease_waits_counts_against_the_budget() -> 
 
     let pool = db.pool.clone();
     let leasing = tokio::spawn(async move {
-        let mut conn = pool.acquire().await?;
+        let mut conn = pool.acquire().await.map_err(DbError::from)?;
         lease_items(&mut *conn, campaign, LEASE, SCAN).await
     });
     wait_for_lock_waiter(&db.pool).await?;
@@ -1987,11 +1987,14 @@ async fn a_verb_that_fails_after_locking_the_campaign_releases_it() -> TestResul
         .await
         .expect_err("the trigger refuses the lease");
     // The trigger fires on the item update, after the campaign is locked.
+    let LeaseError::Database(refused) = refused else {
+        panic!("{refused:?}");
+    };
+    let refused = sqlx::Error::from(refused);
     assert!(
         matches!(
             &refused,
-            LeaseError::Database(sqlx::Error::Database(error))
-                if error.message() == "leases are down"
+            sqlx::Error::Database(error) if error.message() == "leases are down"
         ),
         "{refused:?}"
     );

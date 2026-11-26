@@ -47,6 +47,7 @@ use std::str::FromStr;
 use pplx_space_accounts::UserId;
 use pplx_space_content_digest::DigestParseError;
 use pplx_space_execution_spec::EnvironmentReference;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 
 mod write;
@@ -163,7 +164,7 @@ pub enum GetPolicyError {
         source: UnknownRuntimeEnvironmentState,
     },
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 }
 
 /// Who last changed a row, when and why, as the row records it. Not policy
@@ -205,16 +206,14 @@ struct PolicyStateRow {
 
 /// Read the whole policy. Accepts a pool or a transaction connection; takes
 /// no lock.
-pub async fn get(
-    executor: impl sqlx::PgExecutor<'_>,
-) -> Result<RuntimeEnvironmentPolicy, GetPolicyError> {
+pub async fn get(executor: impl Executor<'_>) -> Result<RuntimeEnvironmentPolicy, GetPolicyError> {
     Ok(get_record(executor).await?.policy)
 }
 
 /// Read the whole policy with who changed each row, when and why. Same
 /// snapshot and failure rules as [`get`], which reads through it.
 pub async fn get_record(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
 ) -> Result<RuntimeEnvironmentPolicyRecord, GetPolicyError> {
     // One statement, so the policy row and the states come from one snapshot
     // even under READ COMMITTED. The LEFT JOIN keeps the policy row when no
@@ -231,8 +230,9 @@ pub async fn get_record(
          FROM runtime_environment_policy p
          LEFT JOIN runtime_environment_states s ON TRUE"
     ))
-    .fetch_all(executor)
-    .await?;
+    .fetch_all(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
 
     let Some(first) = rows.first() else {
         return Err(GetPolicyError::PolicyRowMissing);
@@ -301,13 +301,14 @@ pub async fn get_record(
 /// caller that needs only the default can still act while that row awaits
 /// repair. Takes no lock.
 pub async fn get_default(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
 ) -> Result<Option<EnvironmentReference>, GetPolicyError> {
     let row = sqlx::query_as::<_, (Option<String>,)>(sql!(
         "SELECT default_environment_ref FROM runtime_environment_policy WHERE singleton"
     ))
-    .fetch_optional(executor)
-    .await?;
+    .fetch_optional(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     let Some((default,)) = row else {
         return Err(GetPolicyError::PolicyRowMissing);
     };
@@ -318,15 +319,19 @@ pub async fn get_default(
 /// caller's transaction ends. Every write here takes the row `FOR UPDATE`
 /// first, so no write changes the default between this read and the
 /// caller's commit; two callers holding the share lock don't block each
-/// other.
-pub async fn share_lock_default(
-    conn: &mut sqlx::PgConnection,
-) -> Result<Option<EnvironmentReference>, GetPolicyError> {
+/// other. The caller must pass its open transaction.
+pub async fn share_lock_default<C>(
+    tx: &mut C,
+) -> Result<Option<EnvironmentReference>, GetPolicyError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let row = sqlx::query_as::<_, (Option<String>,)>(sql!(
         "SELECT default_environment_ref FROM runtime_environment_policy WHERE singleton FOR SHARE"
     ))
-    .fetch_optional(&mut *conn)
-    .await?;
+    .fetch_optional(tx.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     let Some((default,)) = row else {
         return Err(GetPolicyError::PolicyRowMissing);
     };
@@ -336,12 +341,13 @@ pub async fn share_lock_default(
 /// Read only the policy generation, for a caller deciding whether a write
 /// conditional on one could still apply. Like [`get_default`], an unreadable
 /// state row doesn't fail it. Takes no lock.
-pub async fn get_generation(executor: impl sqlx::PgExecutor<'_>) -> Result<u64, GetPolicyError> {
+pub async fn get_generation(executor: impl Executor<'_>) -> Result<u64, GetPolicyError> {
     let row = sqlx::query_as::<_, (i64,)>(sql!(
         "SELECT generation FROM runtime_environment_policy WHERE singleton"
     ))
-    .fetch_optional(executor)
-    .await?;
+    .fetch_optional(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     let Some((generation,)) = row else {
         return Err(GetPolicyError::PolicyRowMissing);
     };
@@ -351,15 +357,17 @@ pub async fn get_generation(executor: impl sqlx::PgExecutor<'_>) -> Result<u64, 
 /// [`get_generation`] under the policy row lock, which every write here takes
 /// first and holds until `tx` ends. A caller that reads before writing in the
 /// same transaction takes it first, so no other policy write lands between
-/// its read and its write.
-pub async fn lock_generation(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-) -> Result<u64, GetPolicyError> {
+/// its read and its write. The caller must pass its open transaction.
+pub async fn lock_generation<C>(tx: &mut C) -> Result<u64, GetPolicyError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let row = sqlx::query_as::<_, (i64,)>(sql!(
         "SELECT generation FROM runtime_environment_policy WHERE singleton FOR UPDATE"
     ))
-    .fetch_optional(&mut **tx)
-    .await?;
+    .fetch_optional(tx.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     let Some((generation,)) = row else {
         return Err(GetPolicyError::PolicyRowMissing);
     };
