@@ -9,6 +9,7 @@ use pplx_space_snapshot_model::SnapshotId;
 
 use std::sync::LazyLock;
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_portability::{
     started_suspend_revert_eligibility, suspended_projection_lifecycle_eligible,
 };
@@ -38,11 +39,15 @@ pub struct ReadySuspendProjectionCandidate {
 ///
 /// `FOR UPDATE OF s`: the sandbox row lock lasts until the caller's
 /// transaction ends, so the caller's projection in the same transaction
-/// writes the row this read decided on.
-pub async fn lock_candidates(
-    conn: &mut sqlx::PgConnection,
+/// writes the row this read decided on. The caller must pass its open
+/// transaction.
+pub async fn lock_candidates<C>(
+    tx: &mut C,
     snapshot_id: SnapshotId,
-) -> Result<Vec<ReadySuspendProjectionCandidate>, sqlx::Error> {
+) -> Result<Vec<ReadySuspendProjectionCandidate>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     /// Built once: every input is a literal or a bind placeholder.
     static QUERY: LazyLock<String> = LazyLock::new(|| {
         let eligibility = started_suspend_revert_eligibility("s");
@@ -77,8 +82,8 @@ pub async fn lock_candidates(
             eligible = eligibility.eligible,
         ))
     });
-    sqlx::query_as(sqlx::AssertSqlSafe(QUERY.as_str()))
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(QUERY.as_str()))
         .bind(snapshot_id)
-        .fetch_all(&mut *conn)
-        .await
+        .fetch_all(tx.into_sqlx())
+        .await?)
 }

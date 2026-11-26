@@ -665,7 +665,10 @@ async fn apply_receipt(
         ));
     }
 
-    match delete_with_dependents(tx, completion.sandbox_id).await {
+    match delete_with_dependents(&mut **tx, completion.sandbox_id)
+        .await
+        .map_err(sqlx::Error::from)
+    {
         Ok(()) => Ok(ReceiptOutcome::Applied { from_lifecycle }),
         Err(error) if is_retryable_finalize_error(&error) => Ok(ReceiptOutcome::Deferred(
             AutoLifecycleDeleteCompletionReason::FinalizeContended,

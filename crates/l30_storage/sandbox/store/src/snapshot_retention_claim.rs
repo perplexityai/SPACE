@@ -8,19 +8,23 @@
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_snapshot_model::SnapshotId;
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::PgConnection;
 
 /// Lock the sandbox's row `FOR UPDATE OF sb` when `snapshot_id` is one of
 /// its snapshots, and return its id; `None` when the sandbox or that
 /// snapshot of it is absent. The snapshot row is joined, not locked. The lock
-/// lasts until the caller's transaction ends.
-pub async fn lock_snapshot_owner(
-    conn: &mut PgConnection,
+/// lasts until the caller's transaction ends. The caller must pass its open
+/// transaction.
+pub async fn lock_snapshot_owner<C>(
+    tx: &mut C,
     snapshot_id: SnapshotId,
     sandbox_id: SandboxId,
-) -> Result<Option<SandboxId>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Option<SandboxId>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar(sql!(
         "SELECT sb.id
            FROM sandboxes sb
            JOIN snapshots cur ON cur.sandbox_id = sb.id
@@ -30,6 +34,6 @@ pub async fn lock_snapshot_owner(
     ))
     .bind(snapshot_id)
     .bind(sandbox_id)
-    .fetch_optional(conn)
-    .await
+    .fetch_optional(tx.into_sqlx())
+    .await?)
 }

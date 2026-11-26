@@ -623,6 +623,7 @@ pub async fn update_and_fetch_post_wake_sandbox(
     let mut tx = pool.begin().await.map_err(failed)?;
     if !sandbox_store::action_stamp::stamp_pooled_post_wake(&mut *tx, id, active_node_id)
         .await
+        .map_err(sqlx::Error::from)
         .map_err(failed)?
     {
         return Err(lost_cas());

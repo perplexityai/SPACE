@@ -2241,8 +2241,10 @@ impl WarmPoolStore {
     /// commits on its own.
     ///
     /// Returns [`DbError`] rather than [`PoolError`] (this verb performs
-    /// exactly one statement), so a caller whose error type is `sqlx::Error`,
-    /// such as the shared sandbox-delete transaction, converts it with `?`.
+    /// exactly one statement), so `?` works in a caller whose error type is
+    /// `DbError`, such as the shared sandbox delete
+    /// (`pplx_space_sandbox_store::delete::delete_with_dependents`), and in one
+    /// whose error type is still `sqlx::Error`.
     pub async fn delete_claimed_slots_for_retired_executions(
         executor: impl Executor<'_>,
         reserved_sandbox_ids: &[SandboxId],

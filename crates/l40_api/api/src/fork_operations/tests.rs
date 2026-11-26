@@ -489,7 +489,7 @@ async fn fork_admission_waits_for_source_lifecycle_guard() -> TestResult {
 
     let mut delete_guard = db.pool.begin().await?;
     pplx_space_sandbox_store::fork_source_lifecycle::lock_fork_source_lifecycle(
-        &mut delete_guard,
+        &mut *delete_guard,
         source_sandbox_id,
     )
     .await?;

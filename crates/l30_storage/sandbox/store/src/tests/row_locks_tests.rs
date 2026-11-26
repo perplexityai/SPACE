@@ -271,14 +271,19 @@ async fn guarded_row_locks_leave_a_row_that_already_fails_their_guard_unlocked()
     let other_artifact = LocalArtifactId::from_uuid(Uuid::now_v7());
     let mut tx = pool.begin().await?;
     assert_eq!(
-        suspend::lock_committed_artifact(&mut tx, suspended_id, other_artifact, ArtifactKind::Full)
-            .await?,
+        suspend::lock_committed_artifact(
+            &mut *tx,
+            suspended_id,
+            other_artifact,
+            ArtifactKind::Full
+        )
+        .await?,
         None
     );
     assert!(!row_locked(pool, suspended).await?);
     assert!(!key_share_blocked(pool, suspended).await?);
     assert_eq!(
-        suspend::lock_committed_artifact(&mut tx, suspended_id, artifact, ArtifactKind::Full)
+        suspend::lock_committed_artifact(&mut *tx, suspended_id, artifact, ArtifactKind::Full)
             .await?
             .as_deref(),
         Some("suspending")

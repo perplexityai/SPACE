@@ -1336,7 +1336,7 @@ impl PublicOperationAdmission {
         &mut self,
         target_id: SandboxId,
     ) -> Result<bool, PublicOperationStoreError> {
-        lock_fork_source_lifecycle(&mut self.tx, target_id).await?;
+        lock_fork_source_lifecycle(&mut *self.tx, target_id).await?;
         let exists = sandbox_store::get(&mut *self.tx, target_id)
             .await
             .map_err(sqlx::Error::from)?

@@ -1279,7 +1279,7 @@ impl OrphanActionSink for SubstrateActionSink {
                 finalize_tx.rollback().await?;
                 return Ok(ClassifyOutcome::SkippedTerminal);
             };
-            delete_with_dependents(&mut finalize_tx, sandbox_id).await?;
+            delete_with_dependents(&mut *finalize_tx, sandbox_id).await?;
             finalize_tx.commit().await?;
             emit_orphan_reconcile_event(
                 sandbox_id,

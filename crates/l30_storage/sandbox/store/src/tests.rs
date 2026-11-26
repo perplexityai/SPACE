@@ -944,7 +944,7 @@ async fn an_active_fork_source_is_found_by_either_target_id_form() -> TestResult
         };
         let mut tx = db.pool.begin().await?;
         assert!(
-            !crate::fork_source_lifecycle::active_fork_source_operation_exists(&mut tx, source)
+            !crate::fork_source_lifecycle::active_fork_source_operation_exists(&mut *tx, source)
                 .await?
         );
         sqlx::query(sql!(
@@ -958,7 +958,7 @@ async fn an_active_fork_source_is_found_by_either_target_id_form() -> TestResult
         .execute(&mut *tx)
         .await?;
         assert!(
-            crate::fork_source_lifecycle::active_fork_source_operation_exists(&mut tx, source)
+            crate::fork_source_lifecycle::active_fork_source_operation_exists(&mut *tx, source)
                 .await?,
             "{target_id}"
         );

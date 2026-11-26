@@ -8,6 +8,7 @@
 use std::sync::LazyLock;
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::{
     inflight_suspend_upload_exists, snapshot_durable_for_source_release,
@@ -81,14 +82,16 @@ fn page_statement(exclude_legacy_rows: bool) -> &'static str {
 /// `exclude_legacy_rows`, only rows that name their current local artifact.
 /// A read; it takes no lock.
 pub async fn page(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     exclude_legacy_rows: bool,
-) -> Result<Vec<SandboxId>, sqlx::Error> {
-    sqlx::query_scalar(sqlx::AssertSqlSafe(page_statement(exclude_legacy_rows)))
-        .bind(node_id)
-        .fetch_all(executor)
-        .await
+) -> Result<Vec<SandboxId>, DbError> {
+    Ok(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(page_statement(exclude_legacy_rows)))
+            .bind(node_id)
+            .fetch_all(executor.into_sqlx())
+            .await?,
+    )
 }
 
 #[cfg(test)]

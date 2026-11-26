@@ -85,7 +85,7 @@ async fn unfenced_teardown_and_activation_completion_do_not_deadlock() -> TestRe
         // DELETE commits its intent before it can tear down the execution.
         // The publication's statement has already read the preceding state.
         let mut intent = pool.begin().await?;
-        pplx_space_sandbox_store::delete::mark_deleting(&mut intent, sandbox_id).await?;
+        pplx_space_sandbox_store::delete::mark_deleting(&mut *intent, sandbox_id).await?;
         intent.commit().await?;
         fixture
             .store

@@ -275,7 +275,7 @@ async fn finalize_sandbox_db_delete_removes_live_sandbox() -> TestResult {
     .await?;
 
     let mut tx = db.pool.begin().await?;
-    delete_with_dependents(&mut tx, sandbox_id).await?;
+    delete_with_dependents(&mut *tx, sandbox_id).await?;
     tx.commit().await?;
 
     let row = sqlx::query_scalar::<_, Uuid>(sql!(

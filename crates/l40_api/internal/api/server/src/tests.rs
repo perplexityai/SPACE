@@ -8187,7 +8187,7 @@ async fn restore_locations_keep_digests_during_catalog_deletion() -> TestResult 
                 }
                 tokio::task::yield_now().await;
             }
-            pplx_space_sandbox_store::delete::delete_with_dependents(&mut deletion, sandbox_id)
+            pplx_space_sandbox_store::delete::delete_with_dependents(&mut *deletion, sandbox_id)
                 .await?;
             deletion.commit().await
         };

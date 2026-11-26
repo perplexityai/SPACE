@@ -2148,7 +2148,7 @@ impl Reconciler {
         }
         self.timed_postgres(
             "cleanup-pending-finalize-sandbox-delete",
-            delete_with_dependents(&mut tx, slot.reserved_sandbox_id),
+            delete_with_dependents(&mut *tx, slot.reserved_sandbox_id),
         )
         .await?;
         self.timed_postgres(

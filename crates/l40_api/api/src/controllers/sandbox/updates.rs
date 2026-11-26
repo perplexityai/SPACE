@@ -527,7 +527,7 @@ impl SandboxController {
         .await
         .map_err(|err| {
             let error = "failed to update sandbox network policy";
-            let mapped = db_contention_error(error, &err);
+            let mapped = db_contention_error(error, &sqlx::Error::from(err));
             // Same rule as the enqueue arm below: the transaction has written
             // nothing on a lost race and the caller retries, so a
             // `NetworkPolicyUpdateFailed` event would record a transient
@@ -630,7 +630,12 @@ impl SandboxController {
         })?;
         sandbox_store::intent::set_snapshots_enabled_desired(&mut *tx, sandbox.id, enabled)
             .await
-            .map_err(|err| db_contention_error("failed to update sandbox snapshot intent", &err))?;
+            .map_err(|err| {
+                db_contention_error(
+                    "failed to update sandbox snapshot intent",
+                    &sqlx::Error::from(err),
+                )
+            })?;
 
         let refs = [ReconcileRef::sandbox_desired_state(sandbox.id)];
         let reconcile_queued = enqueue_sandbox_reconcile_and_trigger_tx(
