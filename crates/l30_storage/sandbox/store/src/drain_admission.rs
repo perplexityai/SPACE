@@ -7,24 +7,25 @@
 //! stopped row whose node id a replacement node reused, and which that node
 //! doesn't hold, refuses nothing.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 
 /// Of `sandbox_ids`, the ones whose row is `stopped`, by id. A read: it
 /// takes no lock and writes nothing.
 pub async fn stopped_among(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_ids: &[SandboxId],
-) -> Result<Vec<SandboxId>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Vec<SandboxId>, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT id FROM sandboxes
           WHERE id = ANY($1::UUID[])
             AND lifecycle = 'stopped'
           ORDER BY id"
     ))
     .bind(sandbox_ids)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 #[cfg(test)]

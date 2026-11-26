@@ -4,6 +4,7 @@
 use std::sync::LazyLock;
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_residency::{ResidencyEvidence, occupies_node_predicate};
 use pplx_space_sql_locator::sql;
@@ -72,18 +73,18 @@ static LIST_ON_NODE_NODE_CENSUS_AWARE: LazyLock<String> =
 /// under `residency`, in dispatch order. A read; it takes no lock, and in the
 /// census-aware mode it compares against the executor's `NOW()`.
 pub async fn list_on_node(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     evacuable_lifecycles: &[&str],
     residency: ResidencyEvidence,
-) -> Result<Vec<EvacuationCandidate>, sqlx::Error> {
+) -> Result<Vec<EvacuationCandidate>, DbError> {
     let statement = match residency {
         ResidencyEvidence::LifecycleOnly => LIST_ON_NODE_LIFECYCLE_ONLY.as_str(),
         ResidencyEvidence::NodeCensusAware => LIST_ON_NODE_NODE_CENSUS_AWARE.as_str(),
     };
-    sqlx::query_as(sqlx::AssertSqlSafe(statement))
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(statement))
         .bind(node_id)
         .bind(evacuable_lifecycles)
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }

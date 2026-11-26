@@ -1053,7 +1053,7 @@ pub(super) async fn list_node_sandboxes(
                         .into_iter()
                         .map(node_store::NodeSandboxRow::from)
                         .collect(),
-                    Err(err) => return db_error(err).into_response(),
+                    Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
                 };
             let next_after = if sandboxes.len() > NODE_SANDBOX_PAGE {
                 sandboxes.truncate(NODE_SANDBOX_PAGE);
@@ -1075,7 +1075,7 @@ pub(super) async fn list_node_sandboxes(
             .await
             {
                 Ok(rows) => rows,
-                Err(err) => return db_error(err).into_response(),
+                Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
             };
             let next_cursor = if rows.len() > NODE_SANDBOX_PAGE {
                 rows.truncate(NODE_SANDBOX_PAGE);

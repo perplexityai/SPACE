@@ -10,6 +10,7 @@
 
 use std::sync::LazyLock;
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_portability::{
     current_disk_artifact_backup_ready, latest_full_snapshot_ready,
@@ -120,17 +121,17 @@ static PENDING_IGNORING_BACKOFF: LazyLock<String> = LazyLock::new(|| {
 /// A read; it takes no lock, and the window compares against the executor's
 /// `NOW()`.
 pub async fn pending(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     honor_backoff_windows: bool,
-) -> Result<Vec<RestorePendingEvacuation>, sqlx::Error> {
+) -> Result<Vec<RestorePendingEvacuation>, DbError> {
     let statement = if honor_backoff_windows {
         PENDING_HONORING_BACKOFF.as_str()
     } else {
         PENDING_IGNORING_BACKOFF.as_str()
     };
-    sqlx::query_as(sqlx::AssertSqlSafe(statement))
-        .fetch_all(executor)
-        .await
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(statement))
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }
 
 /// `$1` = sandbox id. A suspend evacuation's eligibility: marked, with its
@@ -158,17 +159,19 @@ static ELIGIBLE_FROM_DISK_ARTIFACT: LazyLock<String> = LazyLock::new(|| {
 /// `stopped` target, the newest full snapshot otherwise. `None` when the row
 /// is gone. A read; it takes no lock.
 pub async fn restore_eligible(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     target_lifecycle: SandboxLifecycle,
-) -> Result<Option<bool>, sqlx::Error> {
+) -> Result<Option<bool>, DbError> {
     let statement = if target_lifecycle == SandboxLifecycle::Stopped {
         ELIGIBLE_FROM_DISK_ARTIFACT.as_str()
     } else {
         ELIGIBLE_FROM_SNAPSHOT.as_str()
     };
-    sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(statement))
-        .bind(sandbox_id)
-        .fetch_optional(executor)
-        .await
+    Ok(
+        sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(statement))
+            .bind(sandbox_id)
+            .fetch_optional(executor.into_sqlx())
+            .await?,
+    )
 }

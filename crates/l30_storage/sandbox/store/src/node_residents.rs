@@ -4,6 +4,7 @@
 use std::sync::LazyLock;
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_residency::{
     ResidencyEvidence, active_resident_predicate, occupies_node_predicate,
 };
@@ -45,20 +46,20 @@ static COUNTS_NODE_CENSUS_AWARE: LazyLock<String> =
 /// ([`occupies_node_predicate`]). Counts, not ids. A read; it takes no lock,
 /// and in the census-aware mode it compares against the executor's `NOW()`.
 pub async fn counts(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     resident_lifecycles: &[&str],
     residency: ResidencyEvidence,
-) -> Result<ResidentCounts, sqlx::Error> {
+) -> Result<ResidentCounts, DbError> {
     let statement = match residency {
         ResidencyEvidence::LifecycleOnly => COUNTS_LIFECYCLE_ONLY.as_str(),
         ResidencyEvidence::NodeCensusAware => COUNTS_NODE_CENSUS_AWARE.as_str(),
     };
-    sqlx::query_as(sqlx::AssertSqlSafe(statement))
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(statement))
         .bind(node_id)
         .bind(resident_lifecycles)
-        .fetch_one(executor)
-        .await
+        .fetch_one(executor.into_sqlx())
+        .await?)
 }
 
 /// `$1` = node id.
@@ -88,16 +89,16 @@ static TERMINATION_BLOCKING_NODE_CENSUS_AWARE: LazyLock<String> =
 /// it takes no lock, and in the census-aware mode it compares against the
 /// executor's `NOW()`.
 pub async fn termination_blocking_by_lifecycle(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     residency: ResidencyEvidence,
-) -> Result<Vec<(String, i64)>, sqlx::Error> {
+) -> Result<Vec<(String, i64)>, DbError> {
     let statement = match residency {
         ResidencyEvidence::LifecycleOnly => TERMINATION_BLOCKING_LIFECYCLE_ONLY.as_str(),
         ResidencyEvidence::NodeCensusAware => TERMINATION_BLOCKING_NODE_CENSUS_AWARE.as_str(),
     };
-    sqlx::query_as(sqlx::AssertSqlSafe(statement))
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(statement))
         .bind(node_id)
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }

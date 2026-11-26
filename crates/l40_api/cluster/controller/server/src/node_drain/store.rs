@@ -2816,7 +2816,9 @@ impl NodeDrainSink for SubstrateSink {
         &self,
         node_id: NodeId,
     ) -> Result<i64, sqlx::Error> {
-        sandbox_store::drain_gate_blockers::count_on_node(&self.pool, node_id).await
+        sandbox_store::drain_gate_blockers::count_on_node(&self.pool, node_id)
+            .await
+            .map_err(sqlx::Error::from)
     }
 
     /// Back up one local-only suspended sandbox from its source node.
@@ -4541,7 +4543,9 @@ impl NodeDrainSink for SubstrateSink {
         backoff_base: PositiveDuration,
         backoff_cap: PositiveDuration,
     ) -> Result<Option<i32>, sqlx::Error> {
-        drain::schedule_restore_retry(&self.pool, sandbox_id, backoff_base, backoff_cap).await
+        drain::schedule_restore_retry(&self.pool, sandbox_id, backoff_base, backoff_cap)
+            .await
+            .map_err(sqlx::Error::from)
     }
 
     async fn redrive_stranded_suspending_evacuations(&self) -> Result<Vec<SandboxId>, sqlx::Error> {

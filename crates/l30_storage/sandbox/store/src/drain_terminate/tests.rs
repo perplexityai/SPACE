@@ -136,7 +136,7 @@ async fn execution_active(pool: &PgPool, execution_id: Uuid) -> TestResult<bool>
 
 async fn release(pool: &PgPool, node: NodeId) -> TestResult<Vec<SandboxId>> {
     let mut tx = pool.begin().await?;
-    let released = release_durable_suspended(&mut tx, node, Some(NODE_NAME), TTL_SECS).await?;
+    let released = release_durable_suspended(&mut *tx, node, Some(NODE_NAME), TTL_SECS).await?;
     tx.commit().await?;
     Ok(released)
 }
@@ -351,9 +351,9 @@ async fn the_retire_takes_only_the_named_active_execution() -> TestResult {
     let id = insert_sandbox(pool, "suspended", Some(node), Some(node)).await?;
     let active = insert_execution(pool, id, "suspended", 0).await?;
     let mut tx = pool.begin().await?;
-    assert!(!retire_source_execution(&mut tx, id, Uuid::now_v7()).await?);
-    assert!(retire_source_execution(&mut tx, id, active).await?);
-    assert!(!retire_source_execution(&mut tx, id, active).await?);
+    assert!(!retire_source_execution(&mut *tx, id, Uuid::now_v7()).await?);
+    assert!(retire_source_execution(&mut *tx, id, active).await?);
+    assert!(!retire_source_execution(&mut *tx, id, active).await?);
     tx.commit().await?;
     assert!(!execution_active(pool, active).await?);
     Ok(())

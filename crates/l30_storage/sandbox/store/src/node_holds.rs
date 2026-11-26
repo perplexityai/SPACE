@@ -51,6 +51,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_portability::{
     drain_gate_blockers_for_node, inflight_suspend_upload_from_node_exists,
@@ -427,11 +428,11 @@ static HOLDS_NODE_CENSUS_AWARE: LazyLock<String> =
 /// A read: it takes no lock and writes nothing. One statement, so the rows
 /// and the counts are one snapshot.
 pub async fn list(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     residency: ResidencyEvidence,
     limit: NonZeroUsize,
-) -> Result<NodeHolds, sqlx::Error> {
+) -> Result<NodeHolds, DbError> {
     let statement = match residency {
         ResidencyEvidence::LifecycleOnly => HOLDS_LIFECYCLE_ONLY.as_str(),
         ResidencyEvidence::NodeCensusAware => HOLDS_NODE_CENSUS_AWARE.as_str(),
@@ -441,7 +442,7 @@ pub async fn list(
     let rows = sqlx::query_as::<_, NodeHoldRow>(sqlx::AssertSqlSafe(statement))
         .bind(node_id)
         .bind(stuck_after_secs)
-        .fetch_all(executor)
+        .fetch_all(executor.into_sqlx())
         .await?;
     Ok(collect(
         rows.into_iter().map(NodeHold::from).collect(),

@@ -7,6 +7,7 @@
 //! and targeted on the same node. They write nothing.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use time::OffsetDateTime;
@@ -140,12 +141,12 @@ pub struct NodePlacementChangeCursor {
 /// The node's placement rows narrowed by `filter`, by id ascending, strictly
 /// after `after`, at most `limit` of them.
 pub async fn list_by_id(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     filter: &NodePlacementFilter,
     after: Option<SandboxId>,
     limit: i64,
-) -> Result<Vec<NodePlacementRow>, sqlx::Error> {
+) -> Result<Vec<NodePlacementRow>, DbError> {
     let records: Vec<PlacementRecord> = sqlx::query_as(sql!(
         "SELECT id, lifecycle, active_node_id, target_node_id FROM (
             (SELECT id, lifecycle, active_node_id, target_node_id
@@ -168,7 +169,7 @@ pub async fn list_by_id(
     .bind(limit)
     .bind(filter.lifecycle_binds())
     .bind(filter.changed_since)
-    .fetch_all(executor)
+    .fetch_all(executor.into_sqlx())
     .await?;
     Ok(records.into_iter().map(Into::into).collect())
 }
@@ -178,12 +179,12 @@ pub async fn list_by_id(
 /// them. Each branch sorts one placement column's rows for the node, so the
 /// cost is the node's own history.
 pub async fn list_by_change(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     filter: &NodePlacementFilter,
     cursor: Option<NodePlacementChangeCursor>,
     limit: i64,
-) -> Result<Vec<NodePlacementChangeRow>, sqlx::Error> {
+) -> Result<Vec<NodePlacementChangeRow>, DbError> {
     let records: Vec<PlacementChangeRecord> = sqlx::query_as(sql!(
         "SELECT id, lifecycle, active_node_id, target_node_id, lifecycle_changed_at FROM (
             (SELECT id, lifecycle, active_node_id, target_node_id, lifecycle_changed_at
@@ -211,7 +212,7 @@ pub async fn list_by_change(
     .bind(limit)
     .bind(filter.lifecycle_binds())
     .bind(filter.changed_since)
-    .fetch_all(executor)
+    .fetch_all(executor.into_sqlx())
     .await?;
     Ok(records.into_iter().map(Into::into).collect())
 }

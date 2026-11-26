@@ -418,13 +418,10 @@ fn guards_query(candidate: PodLessCandidate) -> pod_less_giveup::PodLessGuardsQu
 
 /// Every guard, evaluated once. Run lock-free before any pod read, and again
 /// inside the transaction under the row locks, which must find the same shape.
-pub(crate) async fn precheck<'e, E>(
-    executor: E,
+pub(crate) async fn precheck(
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
     candidate: PodLessCandidate,
-) -> Result<Result<ExecutionGeneration, PodLessHold>, sqlx::Error>
-where
-    E: sqlx::PgExecutor<'e>,
-{
+) -> Result<Result<ExecutionGeneration, PodLessHold>, sqlx::Error> {
     Ok(
         pod_less_giveup::read_guards(executor, guards_query(candidate))
             .await?
@@ -539,7 +536,7 @@ async fn recover_pod_less_sandbox_locked(
         return Ok(PodLessRecovery::NotEligible(hold));
     }
 
-    if !drain::revert_pod_less_resident_to_suspended(&mut tx, candidate.sandbox_id).await? {
+    if !drain::revert_pod_less_resident_to_suspended(&mut *tx, candidate.sandbox_id).await? {
         // The guards just passed under the locks, so only a snapshot change
         // that the locks don't cover gets here.
         tx.rollback().await?;

@@ -9,13 +9,13 @@ use std::sync::LazyLock;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::{NodeDrainMode, NodeDrainPhase, SubstrateKind};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_portability::{
     failed_repair_revert_eligibility, newest_full_snapshot_unambiguous,
     pod_less_drain_revert_loses_no_newer_bytes,
 };
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 
 /// The row-state guards of one sandbox, as [`read_guards`] reads them.
 #[derive(Debug, Clone, Copy, sqlx::FromRow)]
@@ -125,10 +125,10 @@ static READ_GUARDS: LazyLock<String> = LazyLock::new(|| {
 /// `recent_progress` compares with
 /// the database clock of the executor it runs on.
 pub async fn read_guards(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     query: PodLessGuardsQuery,
-) -> Result<Option<PodLessGuards>, sqlx::Error> {
-    sqlx::query_as(sqlx::AssertSqlSafe(READ_GUARDS.as_str()))
+) -> Result<Option<PodLessGuards>, DbError> {
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(READ_GUARDS.as_str()))
         .bind(query.sandbox_id)
         .bind(query.source_node_id)
         .bind(query.pre_lifecycle.as_str())
@@ -136,6 +136,6 @@ pub async fn read_guards(
         .bind(query.managed_by)
         .bind(query.drain_phase.as_str())
         .bind(query.drain_mode)
-        .fetch_optional(executor)
-        .await
+        .fetch_optional(executor.into_sqlx())
+        .await?)
 }
