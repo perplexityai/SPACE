@@ -18,4 +18,5 @@ sqlx = { workspace = true, features = ["postgres", "uuid"] }
 
 # internal
 pplx-space-accounts = { workspace = true }
+pplx-space-postgres-pool = { workspace = true }
 pplx-space-sql-locator = { workspace = true }

@@ -32,6 +32,12 @@ pub enum ProvisionError {
     LostRaceWithoutWinner,
 }
 
+impl From<pplx_space_postgres_pool::DbError> for ProvisionError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 /// Provision an active KEK for an org that has none. A trait so the service
 /// handlers can be exercised without a live Postgres or provider.
 #[tonic::async_trait]

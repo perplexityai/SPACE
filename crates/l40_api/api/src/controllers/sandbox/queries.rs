@@ -845,9 +845,10 @@ fn federated_service_grant_store_error(
                 "grant renewal is older than the stored, already-expired grant; re-mint and retry",
             )
         }
-        crate::federated_identity::FederatedGrantStoreError::Upsert(err) => {
-            db_contention_error("failed to upsert sandbox federated service grant", &err)
-        }
+        crate::federated_identity::FederatedGrantStoreError::Upsert(err) => db_contention_error(
+            "failed to upsert sandbox federated service grant",
+            &sqlx::Error::from(err),
+        ),
     }
 }
 

@@ -5,6 +5,7 @@ use pplx_space_k8s_ids::K8sNodeUid;
 use pplx_space_net_common::{
     EffectiveNetworkPolicyRef, EffectiveNetworkPolicyRefScope, NetworkPolicyV1, network_policy_hash,
 };
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_sql_locator::sql;
 use sqlx::types::Json;
@@ -56,18 +57,18 @@ impl std::fmt::Debug for NetworkPolicyResolutionCandidate {
 #[derive(Debug, thiserror::Error)]
 pub enum ResolutionStateError {
     #[error("credential-injection state query failed: {0}")]
-    Query(#[source] sqlx::Error),
+    Query(#[source] DbError),
     #[error("credential-injection state contains invalid data: {0}")]
     InvalidData(&'static str),
 }
 
-impl From<sqlx::Error> for ResolutionStateError {
-    fn from(error: sqlx::Error) -> Self {
-        match error {
+impl From<DbError> for ResolutionStateError {
+    fn from(error: DbError) -> Self {
+        match sqlx::Error::from(error) {
             sqlx::Error::ColumnDecode { .. } | sqlx::Error::Decode(_) => {
                 Self::InvalidData("stored credential intent is malformed")
             }
-            error => Self::Query(error),
+            error => Self::Query(error.into()),
         }
     }
 }
@@ -117,7 +118,7 @@ struct NetworkPolicyCandidateRow {
 }
 
 pub async fn load_network_policy_candidate(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
 ) -> Result<Option<NetworkPolicyResolutionCandidate>, ResolutionStateError> {
     // Policy and referenced identities are one SQL statement so the candidate
@@ -174,8 +175,9 @@ pub async fn load_network_policy_candidate(
          ORDER BY requested.credential_reference_id"
     ))
     .bind(sandbox_id.as_uuid())
-    .fetch_all(executor)
-    .await?;
+    .fetch_all(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     let Some(first) = rows.first() else {
         return Ok(None);
     };

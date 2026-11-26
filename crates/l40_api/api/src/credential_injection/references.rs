@@ -19,6 +19,12 @@ pub(crate) enum ReferenceError {
     Database(#[from] sqlx::Error),
 }
 
+impl From<pplx_space_postgres_pool::DbError> for ReferenceError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 pub(crate) fn definition(
     request: &wire::RegisterCredentialReferenceRequest,
 ) -> Result<ValidatedCredentialReference, ReferenceError> {

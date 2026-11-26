@@ -34,6 +34,12 @@ pub enum KekStoreError {
     Query(#[from] sqlx::Error),
 }
 
+impl From<pplx_space_postgres_pool::DbError> for KekStoreError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 /// Lookup of a KEK row scoped to an organization. A trait so the service
 /// handlers can be exercised without a live Postgres.
 #[tonic::async_trait]
