@@ -111,6 +111,26 @@ def _run(scenario_id: str) -> int:
     except SmokeConfigurationError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
+    # Named on its own, a v1 drain scenario is skipped on a drain v2 bench as
+    # a suite run skips it, not run into the API's refusal: nothing runs, and
+    # the run ends incomplete (2) with the reason, never as a pass.
+    if _drain_v1_skipped(scenario, services):
+        print(f"SKIPPED {scenario_id}: {DRAIN_V1_SKIP_REASON}", flush=True)
+        print(
+            RESULT_PREFIX
+            + json.dumps(
+                {
+                    "scenario_id": scenario_id,
+                    "verdict": "skipped",
+                    "summary": f"skipped: {DRAIN_V1_SKIP_REASON}",
+                    "evidence": {},
+                    "cleanup_failures": [],
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return 2
     # Outside the scenario's budget: the repair may wait out two rollouts.
     try:
         if repair_orphaned_kind_faults(os.environ):
@@ -873,11 +893,34 @@ def _apply_drain_v1(
     if not drain_v2:
         return scenarios
     for skipped in declared:
-        print(
-            f"SKIPPED {skipped.id}: drives v1 drains, which the bench's API refuses while "
-            "drain v2 is on (SPACE_DRAIN_V2_ENABLED); run it on a bench with drain v2 off"
-        )
+        print(f"SKIPPED {skipped.id}: {DRAIN_V1_SKIP_REASON}")
     return tuple(scenario for scenario in scenarios if not scenario.drain_v1)
+
+
+# Why a v1 drain scenario does not run on a drain v2 bench, as a suite run
+# and a run of the one scenario both say it.
+DRAIN_V1_SKIP_REASON = (
+    "drives v1 drains, which this bench's API refuses: the bench runs drain v2 "
+    "(SPACE_DRAIN_V2_ENABLED=true on its public API); run it on a bench with drain v2 off"
+)
+
+
+def _drain_v1_skipped(scenario: Scenario[Any], services: SmokeServices) -> bool:
+    """Whether a run of `scenario` alone skips it as a suite run would
+    (`_apply_drain_v1`): it drives v1 drains and the Kind bench runs drain v2.
+    A bench the read cannot classify runs it, and its drain reports why."""
+
+    if not scenario.drain_v1 or os.environ.get("SPACE_SMOKE_BACKEND", "kind") != "kind":
+        return False
+    try:
+        return services.drain_v2_enabled()
+    except Exception as error:  # noqa: BLE001 - the scenario reports its own reads
+        print(
+            f"WARN: could not read whether the bench runs drain v2, so {scenario.id} will run: "
+            f"{type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+        return False
 
 
 BROWSER_SCENARIOS_ENV = "SPACE_SMOKE_BROWSER_SCENARIOS"
