@@ -1,6 +1,6 @@
 //! Runtime upgrade campaigns: moving an environment's template releases or
-//! sandboxes to another, paced per cluster and, where subjects have a node,
-//! per node.
+//! sandboxes to another, paced per cluster and, where the kind paces per node
+//! ([`CampaignKind::paces_per_node`]), per node.
 //!
 //! An operator starts a campaign (`runtime_upgrade_campaigns`, through the
 //! admin API) naming the kind, the environment to move off, the target, the
@@ -81,7 +81,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::env_config::EnvConfig;
 use crate::metrics::cluster_reconciler::{self as reconciler_metrics, Loop};
-use crate::metrics::runtime_upgrade::{self as metrics, RedriveResult};
+use crate::metrics::runtime_upgrade::{self as metrics, CampaignItemOutcome, RedriveResult};
 
 mod sandboxes;
 mod templates;
@@ -92,8 +92,8 @@ mod tests;
 
 pub use sandboxes::{
     DispatchError, ForceRestartProgress, GuardedStop, MemoryRetirement, MemoryRetirementSource,
-    SandboxDriver, SandboxForceRestartDriver, SandboxUpgradeDispatcher, StoppedUpgrade,
-    TargetStart,
+    SandboxDriver, SandboxForceRestartDriver, SandboxMemoryDrop, SandboxMemoryDropDispatcher,
+    SandboxMemoryDropDriver, SandboxUpgradeDispatcher, StoppedUpgrade, TargetStart,
 };
 
 /// The switch: `1`, `true`, `yes`, `on` or `enabled` turns the loop on;
@@ -269,6 +269,25 @@ pub trait CampaignDriver: Send + Sync + 'static {
     /// `unfinished`.
     fn retain_campaigns(&self, _unfinished: &[Campaign]) {}
 
+    /// Whether [`Reconciler::redrive`] should inspect expired final leases
+    /// (`attempts >= MAX_ATTEMPTS`) with [`Self::completed_before_redrive`]
+    /// before marking them `failed`.
+    fn salvages_expired_final_leases(&self) -> bool {
+        false
+    }
+
+    /// Whether an expired final lease's subject already committed its upgrade
+    /// before its worker lost the lease. Returning `Ok(true)` finishes the item
+    /// `done` without spending `failure_budget`; `Ok(false)` marks it `failed`;
+    /// `Err` defers the decision to the next tick (bounded by `2 * MAX_ATTEMPTS`).
+    async fn completed_before_redrive(
+        &self,
+        _campaign: &Campaign,
+        _subject_id: uuid::Uuid,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// Upgrade one leased item and say how it ended. Must be idempotent and
     /// safe to run again after any failure, including one that left the
     /// caller unsure whether it ran, and should decide afresh whether the
@@ -308,9 +327,10 @@ impl Drivers {
 }
 
 /// The drivers this build runs: templates ([`templates::TemplateDriver`]).
-/// The sandbox drivers ([`SandboxDriver`] and [`SandboxForceRestartDriver`])
-/// aren't among them until a production [`SandboxUpgradeDispatcher`] exists. A
-/// driver added here adds its kind to
+/// The sandbox drivers ([`SandboxDriver`], [`SandboxForceRestartDriver`], and
+/// [`SandboxMemoryDropDriver`]) aren't among them until their production
+/// dispatchers and memory-retirement source are wired. A driver added here adds
+/// its kind to
 /// `pplx_space_api::routes::admin::RUNTIME_UPGRADE_DRIVEN_KINDS` too, so the
 /// admin API starts campaigns of it; a test holds the two equal. Building
 /// them reads nothing: a disabled loop never asks them anything.
@@ -557,7 +577,7 @@ impl Reconciler {
         campaign: &Campaign,
         report: &mut TickReport,
     ) {
-        self.redrive(campaign, report).await;
+        self.redrive(driver, campaign, report).await;
         if !campaign.phase.leases() {
             // While a campaign is paused, subjects can enter its source behind
             // a half-scanned pass's cursor without `drive` observing a hold, so
@@ -598,11 +618,29 @@ impl Reconciler {
         // driver moves it or an operator aborts it. A pass that leased
         // anything, or began with work open, proves nothing either; the next
         // one finds any subject it left behind.
-        let completed = progress == (PassProgress::Ended { settled: true })
-            && plan.moves
-            && self.complete_if_done(campaign, report).await;
-        if !plan.moves || completed {
+        if !plan.moves {
             return;
+        }
+        if progress == (PassProgress::Ended { settled: true }) {
+            match driver.plan(campaign).await {
+                Ok(Plan::Scan(now)) if now == plan => {
+                    if self.complete_if_done(campaign, report).await {
+                        return;
+                    }
+                }
+                Ok(Plan::Scan(_)) | Ok(Plan::Hold(_)) => {
+                    self.lock_passes().remove(&campaign.id);
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        campaign_id = %campaign.id,
+                        %error,
+                        "runtime_upgrade: re-checking the campaign's plan before completion failed; retrying next tick"
+                    );
+                    return;
+                }
+            }
         }
         let leased_at = tokio::time::Instant::now();
         let leased = self.lease(campaign).await;
@@ -621,10 +659,99 @@ impl Reconciler {
         }
     }
 
-    async fn redrive(&self, campaign: &Campaign, report: &mut TickReport) {
-        match store::redrive_expired(&self.pool, campaign.id, MAX_ATTEMPTS).await {
+    async fn redrive(
+        &self,
+        driver: &Arc<dyn CampaignDriver>,
+        campaign: &Campaign,
+        report: &mut TickReport,
+    ) {
+        let kind = campaign.kind.as_str();
+        let redrive_result = if driver.salvages_expired_final_leases() {
+            match store::expired_final_leases(&self.pool, campaign.id, MAX_ATTEMPTS).await {
+                Ok(expired) => {
+                    let mut fail_tokens = Vec::with_capacity(expired.len());
+                    for lease in expired {
+                        match driver
+                            .completed_before_redrive(campaign, lease.subject_id)
+                            .await
+                        {
+                            Ok(true) => {
+                                match store::finish_expired_done(&self.pool, &lease).await {
+                                    Ok(true) => {
+                                        metrics::campaign_item_outcome(
+                                            kind,
+                                            CampaignItemOutcome::Done,
+                                        );
+                                        tracing::info!(
+                                            campaign_id = %campaign.id,
+                                            subject_id = %lease.subject_id,
+                                            attempts = lease.attempts,
+                                            "runtime_upgrade: salvaged committed item whose final lease lapsed"
+                                        );
+                                    }
+                                    Ok(false) => {}
+                                    Err(error) => tracing::warn!(
+                                        campaign_id = %campaign.id,
+                                        subject_id = %lease.subject_id,
+                                        %error,
+                                        "runtime_upgrade: salvaging lapsed final lease failed; retrying next tick"
+                                    ),
+                                }
+                            }
+                            Ok(false) => fail_tokens.push(lease.lease_token),
+                            Err(error) => {
+                                match store::bump_expired_final_attempt(&self.pool, &lease).await {
+                                    Ok(attempts) if attempts >= 2 * MAX_ATTEMPTS => {
+                                        tracing::warn!(
+                                            campaign_id = %campaign.id,
+                                            subject_id = %lease.subject_id,
+                                            attempts,
+                                            %error,
+                                            "runtime_upgrade: checking lapsed final lease failed repeatedly; failing item"
+                                        );
+                                        fail_tokens.push(lease.lease_token);
+                                    }
+                                    Ok(attempts) => tracing::warn!(
+                                        campaign_id = %campaign.id,
+                                        subject_id = %lease.subject_id,
+                                        attempts,
+                                        %error,
+                                        "runtime_upgrade: checking lapsed final lease failed; retrying next tick"
+                                    ),
+                                    Err(db_error) => tracing::warn!(
+                                        campaign_id = %campaign.id,
+                                        subject_id = %lease.subject_id,
+                                        %error,
+                                        %db_error,
+                                        "runtime_upgrade: recording lapsed final lease check retry failed; retrying next tick"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                    store::redrive_expired_checked(
+                        &self.pool,
+                        campaign.id,
+                        MAX_ATTEMPTS,
+                        &fail_tokens,
+                    )
+                    .await
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        campaign_id = %campaign.id,
+                        %error,
+                        "runtime_upgrade: reading lapsed final leases failed; retrying next tick"
+                    );
+                    return;
+                }
+            }
+        } else {
+            store::redrive_expired(&self.pool, campaign.id, MAX_ATTEMPTS).await
+        };
+
+        match redrive_result {
             Ok(redriven) => {
-                let kind = campaign.kind.as_str();
                 metrics::campaign_redriven(kind, RedriveResult::Requeued, redriven.requeued);
                 metrics::campaign_redriven(kind, RedriveResult::Failed, redriven.failed);
                 if redriven.requeued + redriven.failed > 0 {

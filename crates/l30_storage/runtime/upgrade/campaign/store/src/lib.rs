@@ -41,10 +41,12 @@
 //! * **Subject kind follows the campaign.** Items go only into unfinished
 //!   campaigns whose kind names their subject kind
 //!   ([`CampaignKind::subject_kind`]).
-//! * **Per-node pacing only where subjects have a node.** A sandbox item
-//!   counts against `max_in_flight_per_node` on the node that last published
-//!   its sandbox; a template release item has no node and counts against the
-//!   cluster cap only ([`SubjectKind::has_node`]).
+//! * **Per-node pacing only where the kind calls a node.** Items of `sandboxes`
+//!   and `sandbox_force_restarts` campaigns count against
+//!   `max_in_flight_per_node` on the node that last published each sandbox;
+//!   `templates` and `sandbox_memory_drops` run without calling a node, ignore
+//!   `max_in_flight_per_node`, and count against the cluster cap only
+//!   ([`CampaignKind::paces_per_node`]).
 //! * **Generation.** The schema owns `generation`: a `BEFORE UPDATE`
 //!   trigger raises it by exactly one whenever an update changes another
 //!   column (other than `updated_at` and the user columns), and overrides any
@@ -103,9 +105,10 @@ pub use create::{
     CreateCampaignError, NewCampaign, REASON_MAX_CHARS, check_reason, create_campaign, validate,
 };
 pub use items::{
-    ItemOutcome, LeaseError, LeasedItem, RETIRED_ATTEMPTS, RedriveReport, finish_item,
-    insert_pending, lease_items, redrive_expired, release_lapsed_in_finished, renew_lease,
-    retire_skipped,
+    ExpiredFinalLease, ItemOutcome, LeaseError, LeasedItem, RETIRED_ATTEMPTS, RedriveReport,
+    bump_expired_final_attempt, expired_final_leases, finish_expired_done, finish_item,
+    insert_pending, lease_items, redrive_expired, redrive_expired_checked,
+    release_lapsed_in_finished, renew_lease, retire_skipped,
 };
 pub use phase::{complete_if_drained, pause_if_over_budget};
 pub use pplx_space_rollout_queue::{MAX_LEASE, clamp_lease};
@@ -208,6 +211,7 @@ closed_vocabulary!(
         Templates => "templates",
         Sandboxes => "sandboxes",
         SandboxForceRestarts => "sandbox_force_restarts",
+        SandboxMemoryDrops => "sandbox_memory_drops",
     }
 );
 
@@ -277,24 +281,26 @@ closed_vocabulary!(
     }
 );
 
-impl SubjectKind {
-    /// Whether a subject of this kind lives on a node, so its items count
-    /// against a campaign's `max_in_flight_per_node`. A sandbox is on the node
-    /// that last published it; a template release is cluster-wide.
-    pub const fn has_node(self) -> bool {
-        match self {
-            Self::Sandbox => true,
-            Self::TemplateRelease => false,
-        }
-    }
-}
-
 impl CampaignKind {
     /// The kind of subject this campaign's items name.
     pub const fn subject_kind(self) -> SubjectKind {
         match self {
             Self::Templates => SubjectKind::TemplateRelease,
-            Self::Sandboxes | Self::SandboxForceRestarts => SubjectKind::Sandbox,
+            Self::Sandboxes | Self::SandboxForceRestarts | Self::SandboxMemoryDrops => {
+                SubjectKind::Sandbox
+            }
+        }
+    }
+
+    /// Whether leasing items of this kind paces by the node that last published
+    /// each sandbox (`max_in_flight_per_node`) and waits for that node to be
+    /// reachable with fresh environment evidence. `templates` and
+    /// `sandbox_memory_drops` run without calling a node and pace by
+    /// `max_in_flight_per_cluster` alone.
+    pub const fn paces_per_node(self) -> bool {
+        match self {
+            Self::Sandboxes | Self::SandboxForceRestarts => true,
+            Self::Templates | Self::SandboxMemoryDrops => false,
         }
     }
 }
@@ -308,7 +314,9 @@ pub struct Campaign {
     pub kind: CampaignKind,
     pub phase: CampaignPhase,
     /// At least 1, and at most [`Self::max_in_flight_per_cluster`]; the
-    /// schema enforces both. Applies only to kinds whose subjects have a node.
+    /// schema enforces both. Applies only to kinds with
+    /// [`CampaignKind::paces_per_node`]; `templates` and
+    /// `sandbox_memory_drops` ignore it.
     pub max_in_flight_per_node: u64,
     pub max_in_flight_per_cluster: u64,
     /// Failed items at which the campaign pauses itself; at least 1.

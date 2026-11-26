@@ -28,7 +28,7 @@ space-admin-cli runtime env default <environment> --reason TEXT [--strand] [--if
 space-admin-cli runtime env state <environment> <allowed|deprecated|blocked> --reason TEXT [--strand] [--if-generation N] [--json]
 space-admin-cli runtime env nodes [--after NODE_ID | --all] [--json]
 space-admin-cli runtime env population [--json]
-space-admin-cli runtime campaign start --kind <templates|sandboxes|sandbox_force_restarts> --from <environment> --to <environment> \
+space-admin-cli runtime campaign start --kind <templates|sandboxes|sandbox_force_restarts|sandbox_memory_drops> --from <environment> --to <environment> \
   --wave-size N --failure-budget N --reason TEXT [--canary-size 0|1] [--per-node N] [--include-running] [--json]
 space-admin-cli runtime campaign pause <campaign> --reason TEXT [--if-generation N] [--json]
 space-admin-cli runtime campaign resume <campaign> --reason TEXT [--retry-failed] [--if-generation N] [--json]
@@ -63,9 +63,9 @@ else's, such as re-allowing an environment another operator just blocked. See "C
 `/admin/api/v1/runtime-upgrade-campaigns`. A campaign moves one kind of subject,
 template releases or sandboxes, from the `--from` environment to the `--to`
 environment. `--wave-size` caps the items in flight across the cluster and
-`--per-node` caps them on any one node (default 1, at most the wave size). `--include-running` asks a
+`--per-node` caps them on any one node for `sandboxes` and `sandbox_force_restarts` (default 1, at most the wave size; `templates` and `sandbox_memory_drops` ignore it). `--include-running` asks a
 `sandboxes` campaign to take running and paused sandboxes too; the sandbox driver
-gives it its meaning, and `templates` and `sandbox_force_restarts` campaigns refuse it. A campaign starts in
+gives it its meaning, and every other kind refuses it. A campaign starts in
 `canary`: it upgrades one subject at a time until one is done, then waits until
 you resume it. A canary whose items all fail or are skipped, under the failure
 budget, doesn't wait: it completes once its plan moves and a pass begins and

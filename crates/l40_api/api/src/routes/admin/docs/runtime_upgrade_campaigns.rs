@@ -1,6 +1,6 @@
 //! Admin OpenAPI entries for `/runtime-upgrade-campaigns`.
 
-use pplx_space_runtime_upgrade_campaign_store::REASON_MAX_CHARS;
+use pplx_space_runtime_upgrade_campaign_store::{CampaignKind, REASON_MAX_CHARS};
 use serde_json::{Map, Value, json};
 
 pub(super) fn insert_runtime_upgrade_campaign_paths(paths: &mut Map<String, Value>) {
@@ -15,7 +15,7 @@ pub(super) fn insert_runtime_upgrade_campaign_paths(paths: &mut Map<String, Valu
         "The campaign generation the caller last read, optionally quoted. The change applies only at that generation, compared under the campaign row lock; absent, it's unconditional. The reconciler raises the generation too, when it pauses a campaign at its failure budget or completes it.",
     );
     let campaign_id = json!({ "name": "campaign_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } });
-    let campaign = "Object with id, kind, from_environment_ref, to_environment_ref, phase (canary, rolling, paused, completed or aborted), generation, max_in_flight_per_node, max_in_flight_per_cluster, failure_budget, include_running, reason, created_at, created_by_user_id, updated_at, updated_by_user_id (null when the reconciler made the last change), finished_at, items (pending, in_flight, done, failed, skipped), stranded and held. stranded counts the pending items of an unfinished sandbox campaign whose upgrade edge, from its source to its target, the catalog doesn't certify (0 for a finished campaign); a certified edge doesn't promise every node can make the move. It's null for template campaigns. held is {reason, detail} when this deployment can't move the unfinished campaign whatever its policy or catalog: twins_not_booted for a template campaign where creates don't boot a twin's environment (a Kubernetes substrate running with SPACE_ENVIRONMENT_PLACEMENT_GATE=on does, once the substrate accepts that mode), and otherwise nodes_dont_read_twins while a worker of the substrate doesn't report that its template-manager reads a twin's own metadata, its node status isn't current, or no worker is registered. It's null otherwise; the reconciler's holds that depend on the policy or the catalog (a target that isn't the default or isn't compiled) aren't reported here.";
+    let campaign = "Object with id, kind, from_environment_ref, to_environment_ref, phase (canary, rolling, paused, completed or aborted), generation, max_in_flight_per_node, max_in_flight_per_cluster, failure_budget, include_running, reason, created_at, created_by_user_id, updated_at, updated_by_user_id (null when the reconciler made the last change), finished_at, items (pending, in_flight, done, failed, skipped), stranded and held. stranded counts the pending items of an unfinished sandbox campaign (sandboxes, sandbox_force_restarts or sandbox_memory_drops) whose upgrade edge, from its source to its target, the catalog doesn't certify (0 for a finished campaign); a certified edge doesn't promise every node can make the move. It's null for template campaigns. held is {reason, detail} when this deployment can't move the unfinished campaign whatever its policy or catalog: twins_not_booted for a template campaign where creates don't boot a twin's environment (a Kubernetes substrate running with SPACE_ENVIRONMENT_PLACEMENT_GATE=on does, once the substrate accepts that mode), and otherwise nodes_dont_read_twins while a worker of the substrate doesn't report that its template-manager reads a twin's own metadata, its node status isn't current, or no worker is registered. It's null otherwise; the reconciler's holds that depend on the policy or the catalog (a target that isn't the default or isn't compiled) aren't reported here.";
     paths.insert(
         "/runtime-upgrade-campaigns".to_string(),
         json!({
@@ -34,7 +34,7 @@ pub(super) fn insert_runtime_upgrade_campaign_paths(paths: &mut Map<String, Valu
             },
             "post": {
                 "summary": "Start a runtime upgrade campaign",
-                "description": "Moves a kind's subjects (template releases or sandboxes) from one execution environment to another, driven by the cluster controller's runtime_upgrade loop. With canary_size 1, the default, the campaign upgrades one subject and then waits in canary for a resume; with 0 it starts rolling. At most max_in_flight_per_cluster items are in flight at once, and, for sandboxes, max_in_flight_per_node on any one node. The campaign pauses itself once failure_budget items have failed. Refused while an unfinished campaign of the same kind moves the same source, and for a kind no cluster-controller driver moves yet.",
+                "description": "Moves a kind's subjects (template releases or sandboxes) from one execution environment to another, driven by the cluster controller's runtime_upgrade loop. With canary_size 1, the default, the campaign upgrades one subject and then waits in canary for a resume; with 0 it starts rolling. At most max_in_flight_per_cluster items are in flight at once, and, for sandboxes and sandbox_force_restarts, max_in_flight_per_node on any one node. The campaign pauses itself once failure_budget items have failed. Refused while an unfinished campaign of the same kind moves the same source, and for a kind no cluster-controller driver moves yet.",
                 "requestBody": {
                     "required": true,
                     "content": {
@@ -44,14 +44,14 @@ pub(super) fn insert_runtime_upgrade_campaign_paths(paths: &mut Map<String, Valu
                                 "additionalProperties": false,
                                 "required": ["kind", "from_environment_ref", "to_environment_ref", "max_in_flight_per_cluster", "failure_budget", "reason"],
                                 "properties": {
-                                    "kind": { "type": "string", "enum": ["templates", "sandboxes", "sandbox_force_restarts"] },
+                                    "kind": { "type": "string", "enum": CampaignKind::ALL.iter().map(|kind| kind.as_str()).collect::<Vec<_>>() },
                                     "from_environment_ref": environment_ref.clone(),
                                     "to_environment_ref": environment_ref,
                                     "canary_size": { "type": "integer", "enum": [0, 1], "default": 1, "description": "Subjects upgraded before the campaign waits for a resume: 1, or 0 to start rolling. Only 0 and 1 are accepted, since a canary upgrades exactly one subject." },
                                     "max_in_flight_per_cluster": { "type": "integer", "minimum": 1, "maximum": i64::MAX, "description": "The wave size: items in flight at once across the cluster" },
-                                    "max_in_flight_per_node": { "type": "integer", "minimum": 1, "maximum": i64::MAX, "default": 1, "description": "Items in flight at once on any one node, at most max_in_flight_per_cluster. Only sandbox campaigns, whose subjects have a node, apply it, but it must stay in that range for every kind." },
+                                    "max_in_flight_per_node": { "type": "integer", "minimum": 1, "maximum": i64::MAX, "default": 1, "description": "Items in flight at once on any one node, at most max_in_flight_per_cluster. Only sandboxes and sandbox_force_restarts campaigns apply it; templates and sandbox_memory_drops ignore it, though it must stay in that range for every kind." },
                                     "failure_budget": { "type": "integer", "minimum": 1, "maximum": i64::MAX, "description": "Failed items at which the campaign pauses itself" },
-                                    "include_running": { "type": "boolean", "default": false, "description": "For a sandboxes campaign, also take running and paused sandboxes. Refused on templates and sandbox_force_restarts campaigns." },
+                                    "include_running": { "type": "boolean", "default": false, "description": "For a sandboxes campaign, also take running and paused sandboxes; every other kind refuses it" },
                                     "reason": reason.clone()
                                 }
                             }
@@ -60,7 +60,7 @@ pub(super) fn insert_runtime_upgrade_campaign_paths(paths: &mut Map<String, Valu
                 },
                 "responses": {
                     "201": { "description": "Object with the new campaign's id, phase and generation (0)" },
-                    "400": { "description": "Invalid body, kind, environment reference, canary size, pacing (max_in_flight_per_cluster 0, max_in_flight_per_node 0 or over max_in_flight_per_cluster, failure_budget 0, or a count over the maximum) or reason, the same source and target, or include_running on a templates or sandbox_force_restarts campaign" },
+                    "400": { "description": "Invalid body, kind, environment reference, canary size, pacing (max_in_flight_per_cluster 0, max_in_flight_per_node 0 or over max_in_flight_per_cluster, failure_budget 0, or a count over the maximum) or reason, the same source and target, or include_running on a kind other than sandboxes" },
                     "403": { "description": "Managing organization administrator required" },
                     "409": { "description": "No driver moves this kind yet, or an unfinished campaign of the kind already moves the source" }
                 }

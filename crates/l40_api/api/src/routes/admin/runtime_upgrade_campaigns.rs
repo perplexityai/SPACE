@@ -206,7 +206,9 @@ fn edge_to_check(
     let campaign = &record.campaign;
     (matches!(
         campaign.kind,
-        CampaignKind::Sandboxes | CampaignKind::SandboxForceRestarts
+        CampaignKind::Sandboxes
+            | CampaignKind::SandboxForceRestarts
+            | CampaignKind::SandboxMemoryDrops
     ) && counts.pending > 0
         && !campaign.phase.finished())
     .then_some((campaign.from, campaign.to))
@@ -259,11 +261,19 @@ fn campaign_response(
     };
     let stranded = match (campaign.kind, edge_certified) {
         (CampaignKind::Templates, _) => None,
-        (CampaignKind::Sandboxes | CampaignKind::SandboxForceRestarts, Some(false)) => {
-            Some(counts.pending)
-        }
+        (
+            CampaignKind::Sandboxes
+            | CampaignKind::SandboxForceRestarts
+            | CampaignKind::SandboxMemoryDrops,
+            Some(false),
+        ) => Some(counts.pending),
         // Certified, or nothing pending, or finished: nothing stranded.
-        (CampaignKind::Sandboxes | CampaignKind::SandboxForceRestarts, _) => Some(0),
+        (
+            CampaignKind::Sandboxes
+            | CampaignKind::SandboxForceRestarts
+            | CampaignKind::SandboxMemoryDrops,
+            _,
+        ) => Some(0),
     };
     CampaignResponse {
         id: campaign.id.0,
@@ -443,8 +453,8 @@ struct StartRequest {
     canary_size: u64,
     /// Items in flight at once across the cluster: the wave size.
     max_in_flight_per_cluster: u64,
-    /// Items in flight at once on any one node, for kinds whose subjects
-    /// have a node. Defaults to 1.
+    /// Items in flight at once on any one node, for kinds that pace per node
+    /// (`CampaignKind::paces_per_node`). Defaults to 1.
     #[serde(default = "one")]
     max_in_flight_per_node: u64,
     failure_budget: u64,

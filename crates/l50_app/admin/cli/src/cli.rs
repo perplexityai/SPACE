@@ -171,16 +171,17 @@ pub(crate) enum RuntimeCampaignCommands {
         /// Items in flight at once across the cluster: at least 1.
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
         wave_size: u64,
-        /// Items in flight at once on any one node, for kinds whose subjects
-        /// have a node: from 1 to the wave size (the server defaults to 1).
+        /// Items in flight at once on any one node, for `sandboxes` and
+        /// `sandbox_force_restarts`: from 1 to the wave size (the server
+        /// defaults to 1; `templates` and `sandbox_memory_drops` ignore it).
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
         per_node: Option<u64>,
         /// Failed items at which the campaign pauses itself: at least 1.
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
         failure_budget: u64,
         /// For a `sandboxes` campaign, also take running and paused sandboxes,
-        /// as the sandbox driver defines it. The server refuses it for
-        /// `templates` and `sandbox_force_restarts`.
+        /// as the sandbox driver defines it. The server refuses it for every
+        /// other kind.
         #[arg(long)]
         include_running: bool,
         /// Why, recorded with you on the campaign.
@@ -250,6 +251,8 @@ pub(crate) enum RuntimeCampaignKindArg {
     Sandboxes,
     #[value(name = "sandbox_force_restarts")]
     SandboxForceRestarts,
+    #[value(name = "sandbox_memory_drops")]
+    SandboxMemoryDrops,
 }
 
 impl RuntimeCampaignKindArg {
@@ -258,6 +261,7 @@ impl RuntimeCampaignKindArg {
             Self::Templates => "templates",
             Self::Sandboxes => "sandboxes",
             Self::SandboxForceRestarts => "sandbox_force_restarts",
+            Self::SandboxMemoryDrops => "sandbox_memory_drops",
         }
     }
 }

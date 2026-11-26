@@ -27,11 +27,14 @@ pub struct NewCampaign {
     /// Start as a canary, upgrading one subject and then waiting for an
     /// operator's resume; otherwise start rolling.
     pub canary: bool,
+    /// At least 1, and at most [`Self::max_in_flight_per_cluster`]. Ignored by
+    /// kinds without [`CampaignKind::paces_per_node`] (`templates` and
+    /// `sandbox_memory_drops`).
     pub max_in_flight_per_node: u64,
     pub max_in_flight_per_cluster: u64,
     pub failure_budget: u64,
     /// For a `sandboxes` campaign, also take running and paused sandboxes. The
-    /// `sandboxes` driver gives it its meaning; other kinds refuse it.
+    /// `sandboxes` driver gives it its meaning; every other kind refuses it.
     pub include_running: bool,
     /// Why the campaign runs: 1 to 1024 characters, no NUL.
     pub reason: String,

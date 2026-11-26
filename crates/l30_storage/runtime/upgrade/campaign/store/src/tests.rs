@@ -1937,6 +1937,14 @@ fn a_campaign_with_impossible_pacing_or_reason_is_refused_before_the_database() 
         ),
         (
             NewCampaign {
+                include_running: true,
+                ..new_campaign(10, CampaignKind::SandboxMemoryDrops)
+            },
+            "include_running on a memory-drop campaign",
+            "include_running applies only to sandboxes campaigns",
+        ),
+        (
+            NewCampaign {
                 reason: String::new(),
                 ..new_campaign(10, CampaignKind::Sandboxes)
             },
