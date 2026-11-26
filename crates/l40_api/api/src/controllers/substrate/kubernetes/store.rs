@@ -397,21 +397,20 @@ impl ReconciledActivationFence {
     }
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub(super) struct SandboxExecutionRow {
     pub(super) generation: i64,
     pub(super) pod_name: String,
     pub(super) pod_materialized: bool,
-    #[sqlx(try_from = "String")]
     pub(super) state: ActiveExecutionState,
     pub(super) create_age_expired: bool,
     pub(super) activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     pub(super) route_activation_id: Option<SandboxActivationAttemptId>,
 }
 
-/// Parses `state` as the derive's `try_from` does, failing with the same
-/// column-decode error, so a stored state this crate does not know fails the
-/// store read as it fails this row's own statements.
+/// Parses `state`, failing with a `state` column-decode error, so a stored
+/// state this crate does not know fails the store read as an undecodable
+/// column does.
 impl TryFrom<pplx_space_sandbox_store::k8s_executions::ActiveExecutionRecord>
     for SandboxExecutionRow
 {

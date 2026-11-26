@@ -10,23 +10,33 @@
 use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
+use serde::Serialize;
 use sqlx::PgExecutor;
 use sqlx::types::{Json, JsonValue};
 
 #[cfg(test)]
 mod tests;
 
+/// One sandbox whose publication was degraded to a status alone, as
+/// [`write_degraded_observed_states`] writes it. It is bound as one element
+/// of a JSON array, serialized `{"sandbox_id", "status"}` in field order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DegradedObservedState {
+    pub sandbox_id: SandboxId,
+    /// Serialized as JSON `null` when absent, which keeps a stored status.
+    pub status: Option<String>,
+}
+
 /// Observed projection: records the status of sandboxes whose publication
 /// was degraded to a status alone, and returns the ids it wrote.
 ///
-/// `states` is a JSON array of `{"sandbox_id", "status"}` objects. A
-/// sandbox not placed on `node_id` is skipped. A new row has snapshots off;
-/// an existing one keeps its other columns, and keeps its status when the
-/// published one is NULL.
+/// A sandbox not placed on `node_id` is skipped. A new row has snapshots
+/// off; an existing one keeps its other columns, and keeps its status when
+/// the published one is NULL.
 pub async fn write_degraded_observed_states<'e>(
     executor: impl PgExecutor<'e>,
     node_id: NodeId,
-    states: JsonValue,
+    states: &[DegradedObservedState],
 ) -> Result<Vec<SandboxId>, sqlx::Error> {
     sqlx::query_scalar::<_, SandboxId>(sql!(
         "WITH input AS (

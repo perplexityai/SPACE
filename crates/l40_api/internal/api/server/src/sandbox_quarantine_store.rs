@@ -449,16 +449,12 @@ pub(super) async fn recover_pause_failed_from_inventory(
     node_id: NodeId,
     rows_json: Json<serde_json::Value>,
 ) -> Result<Vec<PauseFailedQuarantineRecovery>, Status> {
-    let quarantine_source =
-        pplx_space_sandbox_store::ingest::PAUSE_FAILED_QUARANTINE_SOURCE.as_str();
-    let quarantine_reason =
-        pplx_space_sandbox_store::ingest::PAUSE_FAILED_QUARANTINE_REASON.as_str();
     let candidates = quarantine_publication::lock_pause_failed_recovery_candidates(
         &mut *conn,
         node_id,
         rows_json,
-        quarantine_source,
-        quarantine_reason,
+        pplx_space_sandbox_store::ingest::PAUSE_FAILED_QUARANTINE_SOURCE,
+        pplx_space_sandbox_store::ingest::PAUSE_FAILED_QUARANTINE_REASON,
     )
     .await
     .map_err(|error| {

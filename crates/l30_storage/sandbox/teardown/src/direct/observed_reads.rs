@@ -4,7 +4,7 @@
 //! endpoint.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_net_common::NetworkPolicy;
+use pplx_space_net_common::{NetworkPolicy, NetworkPolicyCondition};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use sqlx::PgExecutor;
@@ -46,19 +46,8 @@ pub struct ObservedStateRow {
     pub observed_network_policy_source: Option<String>,
     pub observed_network_policy_authority: Option<String>,
     pub observed_network_policy_at: Option<time::OffsetDateTime>,
-    pub network_policy_conditions: Json<Vec<ObservedNetworkPolicyCondition>>,
-}
-
-/// One element of [`ObservedStateRow::network_policy_conditions`], as the
-/// statement builds it from `node_facet_conditions`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
-pub struct ObservedNetworkPolicyCondition {
-    #[serde(rename = "type")]
-    pub condition_type: String,
-    pub status: String,
-    pub reason: Option<String>,
-    pub message: Option<String>,
-    pub last_transition_at: Option<String>,
+    /// Built by the statement from `node_facet_conditions`.
+    pub network_policy_conditions: Json<Vec<NetworkPolicyCondition>>,
 }
 
 /// The observed states of `ids`, in no particular order. The

@@ -14,7 +14,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{
-    PublishedObservedState, write_degraded_observed_states, write_published_observed_states,
+    DegradedObservedState, PublishedObservedState, write_degraded_observed_states,
+    write_published_observed_states,
 };
 
 struct Placement {
@@ -90,6 +91,13 @@ async fn stored(
     .await?)
 }
 
+fn degraded(sandbox_id: SandboxId, status: Option<&str>) -> DegradedObservedState {
+    DegradedObservedState {
+        sandbox_id,
+        status: status.map(str::to_owned),
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn degraded_observations_are_fenced_on_placement() -> TestDbResult<()> {
     let db = pg_test_db().await?;
@@ -100,11 +108,11 @@ async fn degraded_observations_are_fenced_on_placement() -> TestDbResult<()> {
     let written = write_degraded_observed_states(
         pool,
         placement.publisher,
-        serde_json::json!([
-            {"sandbox_id": placement.routed.as_uuid(), "status": "started"},
-            {"sandbox_id": placement.elsewhere.as_uuid(), "status": "started"},
-            {"sandbox_id": rowless.as_uuid(), "status": null},
-        ]),
+        &[
+            degraded(placement.routed, Some("started")),
+            degraded(placement.elsewhere, Some("started")),
+            degraded(rowless, None),
+        ],
     )
     .await?;
     assert_eq!(
@@ -125,7 +133,7 @@ async fn degraded_observations_are_fenced_on_placement() -> TestDbResult<()> {
     write_degraded_observed_states(
         pool,
         placement.publisher,
-        serde_json::json!([{"sandbox_id": placement.routed.as_uuid(), "status": null}]),
+        &[degraded(placement.routed, None)],
     )
     .await?;
     assert_eq!(

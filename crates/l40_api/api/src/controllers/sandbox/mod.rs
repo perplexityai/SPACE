@@ -131,19 +131,7 @@ impl From<pplx_space_sandbox_teardown::direct::observed_reads::ObservedStateRow>
             observed_network_policy_source: row.observed_network_policy_source,
             observed_network_policy_authority: row.observed_network_policy_authority,
             observed_network_policy_at: row.observed_network_policy_at,
-            network_policy_conditions: sqlx::types::Json(
-                row.network_policy_conditions
-                    .0
-                    .into_iter()
-                    .map(|condition| NetworkPolicyCondition {
-                        condition_type: condition.condition_type,
-                        status: condition.status,
-                        reason: condition.reason,
-                        message: condition.message,
-                        last_transition_at: condition.last_transition_at,
-                    })
-                    .collect(),
-            ),
+            network_policy_conditions: row.network_policy_conditions,
         }
     }
 }
