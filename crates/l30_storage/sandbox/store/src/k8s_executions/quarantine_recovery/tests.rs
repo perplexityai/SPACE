@@ -21,7 +21,7 @@ async fn lock_executions_locks_every_execution_of_the_sandbox_for_update() -> Te
     let other = insert_execution(pool, other_sandbox, 1, "running", true, None).await?;
 
     let mut tx = pool.begin().await?;
-    lock_executions(&mut tx, sandbox_id).await?;
+    lock_executions(&mut *tx, sandbox_id).await?;
     // `FOR UPDATE` on each, inactive included: even a key-share lock waits.
     assert!(execution_key_share_blocked(pool, retired.id).await?);
     assert!(execution_key_share_blocked(pool, active.id).await?);

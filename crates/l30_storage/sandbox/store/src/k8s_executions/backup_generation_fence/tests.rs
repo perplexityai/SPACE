@@ -27,7 +27,7 @@ async fn share_lock_from_generation_share_locks_the_executions_from_the_generati
 
     let mut tx = pool.begin().await?;
     let mut rows =
-        share_lock_from_generation(&mut tx, sandbox_id, ExecutionGeneration::new(2)?).await?;
+        share_lock_from_generation(&mut *tx, sandbox_id, ExecutionGeneration::new(2)?).await?;
     rows.sort_by_key(|row| row.generation);
     assert_eq!(
         rows,

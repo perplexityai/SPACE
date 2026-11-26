@@ -9,11 +9,11 @@
 //! ([`crate::quarantine::converge_activation_rollback`]).
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{
     SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId, SandboxTransitionReceiptKind,
 };
 use pplx_space_sql_locator::sql;
-use sqlx::PgConnection;
 use sqlx::types::{Json, JsonValue};
 
 /// One receipt [`lock_activation_rollback_candidates`] selected, with the
@@ -88,13 +88,16 @@ const LOCK_ACTIVATION_ROLLBACK_CANDIDATES: &str = sql!(
 /// `rows` is a JSON array of transition-receipt records, in the shape of
 /// [`crate::ingest::TRANSITION_RECEIPT_RECORD_COLUMNS`], which this
 /// statement spells out: change them together. The lock lasts until the
-/// caller's transaction ends.
-pub async fn lock_activation_rollback_candidates(
-    conn: &mut PgConnection,
+/// caller's transaction ends. The caller must pass its open transaction.
+pub async fn lock_activation_rollback_candidates<C>(
+    conn: &mut C,
     node_id: NodeId,
     rows: Json<JsonValue>,
     receipt_kind: SandboxTransitionReceiptKind,
-) -> Result<Vec<ActivationRollbackCandidateRow>, sqlx::Error> {
+) -> Result<Vec<ActivationRollbackCandidateRow>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     type CandidateRow = (
         SandboxId,
         SandboxCleanupEpisodeId,
@@ -109,7 +112,7 @@ pub async fn lock_activation_rollback_candidates(
         .bind(node_id)
         .bind(rows)
         .bind(receipt_kind.as_str())
-        .fetch_all(&mut *conn)
+        .fetch_all(conn.into_sqlx())
         .await?;
     Ok(rows
         .into_iter()
@@ -143,12 +146,12 @@ pub async fn lock_activation_rollback_candidates(
 /// `false` when the active execution is no longer that generation and
 /// attempt, and nothing changes.
 pub async fn retire_rolled_back_execution(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     execution_state: &str,
     activation_attempt_id: SandboxActivationAttemptId,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
                 SET active = FALSE,
@@ -165,7 +168,7 @@ pub async fn retire_rolled_back_execution(
     .bind(generation)
     .bind(execution_state)
     .bind(activation_attempt_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected()
         > 0)

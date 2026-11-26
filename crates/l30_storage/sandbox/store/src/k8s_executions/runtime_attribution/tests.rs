@@ -89,32 +89,32 @@ async fn lock_tracked_pod_reads_the_active_generations_uid() -> TestResult {
 
     let mut tx = pool.begin().await?;
     assert_eq!(
-        lock_tracked_pod(&mut tx, tracked, 2)
+        lock_tracked_pod(&mut *tx, tracked, 2)
             .await?
             .map(|pod| pod.pod_uid),
         Some(Some("uid-a".to_string()))
     );
     assert_eq!(
-        lock_tracked_pod(&mut tx, blank, 1)
+        lock_tracked_pod(&mut *tx, blank, 1)
             .await?
             .map(|pod| pod.pod_uid),
         Some(None)
     );
     // A retired generation, one never minted, and a missing sandbox.
     assert_eq!(
-        lock_tracked_pod(&mut tx, tracked, 1)
+        lock_tracked_pod(&mut *tx, tracked, 1)
             .await?
             .map(|pod| pod.pod_uid),
         None
     );
     assert_eq!(
-        lock_tracked_pod(&mut tx, tracked, 3)
+        lock_tracked_pod(&mut *tx, tracked, 3)
             .await?
             .map(|pod| pod.pod_uid),
         None
     );
     assert_eq!(
-        lock_tracked_pod(&mut tx, SandboxId::new(), 1)
+        lock_tracked_pod(&mut *tx, SandboxId::new(), 1)
             .await?
             .map(|pod| pod.pod_uid),
         None
@@ -137,7 +137,7 @@ async fn lock_tracked_pod_holds_for_update_until_the_transaction_ends() -> TestR
     // Held until commit.
     let mut tx = pool.begin().await?;
     assert!(
-        lock_tracked_pod(&mut tx, sandbox, 2)
+        lock_tracked_pod(&mut *tx, sandbox, 2)
             .await?
             .map(|pod| pod.pod_uid)
             .is_some()
@@ -149,7 +149,7 @@ async fn lock_tracked_pod_holds_for_update_until_the_transaction_ends() -> TestR
     // Held until rollback.
     let mut tx = pool.begin().await?;
     assert!(
-        lock_tracked_pod(&mut tx, sandbox, 2)
+        lock_tracked_pod(&mut *tx, sandbox, 2)
             .await?
             .map(|pod| pod.pod_uid)
             .is_some()
@@ -161,7 +161,7 @@ async fn lock_tracked_pod_holds_for_update_until_the_transaction_ends() -> TestR
     // A retired generation matches no row and locks nothing.
     let mut tx = pool.begin().await?;
     assert_eq!(
-        lock_tracked_pod(&mut tx, sandbox, 1)
+        lock_tracked_pod(&mut *tx, sandbox, 1)
             .await?
             .map(|pod| pod.pod_uid),
         None

@@ -7,6 +7,7 @@
 //! `sandboxes` row lock it takes first when it takes one, and what to do
 //! with each outcome.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxActivationAttemptId, SandboxId};
 use pplx_space_sql_locator::sql;
 
@@ -18,18 +19,21 @@ use pplx_space_sql_locator::sql;
 /// matches no row). The first UID stamps `pod_materialized_at` if it was
 /// unset.
 ///
-/// Runs in the caller's transaction. It takes a connection rather than any
-/// executor because the write is correct only inside that transaction.
-/// `false` when the row has moved on (another UID, attempt, route or
-/// generation, or none active), and nothing changes.
-pub async fn backfill_missing_pod_uid(
-    conn: &mut sqlx::PgConnection,
+/// Runs in the caller's transaction. It refuses a pool because the write is
+/// correct only inside that transaction, and the caller must pass its open
+/// transaction. `false` when the row has moved on (another UID, attempt,
+/// route or generation, or none active), and nothing changes.
+pub async fn backfill_missing_pod_uid<C>(
+    conn: &mut C,
     sandbox_id: SandboxId,
     generation: Option<i64>,
     activation_attempt_id: Option<SandboxActivationAttemptId>,
     pod_uid: &str,
     route_activation_id: Option<SandboxActivationAttemptId>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
                 SET pod_uid = $4,
@@ -50,7 +54,7 @@ pub async fn backfill_missing_pod_uid(
     .bind(activation_attempt_id)
     .bind(pod_uid)
     .bind(route_activation_id)
-    .execute(&mut *conn)
+    .execute(conn.into_sqlx())
     .await?
     .rows_affected()
         > 0)
@@ -64,18 +68,21 @@ pub async fn backfill_missing_pod_uid(
 /// the row held one, so the record that a pod ran outlives the UID.
 ///
 /// Runs in the caller's transaction, under its `sandboxes` row lock. It
-/// takes a connection rather than any executor because the write is correct
-/// only inside that transaction. `false` when the row no longer matches, and
-/// nothing changes.
-pub async fn clear_absent_recovery_pod(
-    conn: &mut sqlx::PgConnection,
+/// refuses a pool because the write is correct only inside that transaction,
+/// and the caller must pass its open transaction. `false` when the row no
+/// longer matches, and nothing changes.
+pub async fn clear_absent_recovery_pod<C>(
+    conn: &mut C,
     sandbox_id: SandboxId,
     generation: ExecutionGeneration,
     state: &str,
     expected_pod_uid: Option<&str>,
     expected_pod_ip: Option<&str>,
     expected_k8s_node_name: Option<&str>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
              SET pod_uid = NULL,
@@ -100,7 +107,7 @@ pub async fn clear_absent_recovery_pod(
     .bind(expected_pod_uid)
     .bind(expected_pod_ip)
     .bind(expected_k8s_node_name)
-    .execute(&mut *conn)
+    .execute(conn.into_sqlx())
     .await?
     .rows_affected()
         > 0)

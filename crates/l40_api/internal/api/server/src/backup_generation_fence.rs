@@ -49,9 +49,10 @@ pub(crate) async fn refuse_superseded_backup_execution(
     sandbox_id: SandboxId,
     generation: ExecutionGeneration,
 ) -> Result<(), Status> {
-    let rows = backup_generation_fence::share_lock_from_generation(tx, sandbox_id, generation)
-        .await
-        .map_err(|e| Status::internal(format!("backup execution lookup: {e}")))?;
+    let rows =
+        backup_generation_fence::share_lock_from_generation(&mut **tx, sandbox_id, generation)
+            .await
+            .map_err(|e| Status::internal(format!("backup execution lookup: {e}")))?;
     let executions: Vec<ExecutionSupersessionRow> = rows
         .into_iter()
         .map(|row| ExecutionSupersessionRow {

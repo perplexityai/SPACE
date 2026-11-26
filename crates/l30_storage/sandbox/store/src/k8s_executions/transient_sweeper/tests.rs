@@ -167,7 +167,7 @@ async fn lock_active_nowait_locks_the_active_execution_for_update_or_fails_fast(
     let active = insert_execution(pool, sandbox_id, 2, "running", true, None).await?;
 
     let mut tx = pool.begin().await?;
-    lock_active_nowait(&mut tx, sandbox_id).await?;
+    lock_active_nowait(&mut *tx, sandbox_id).await?;
     // `FOR UPDATE`: even a key-share lock waits, until the transaction ends.
     assert!(execution_key_share_blocked(pool, active.id).await?);
     assert!(!execution_key_share_blocked(pool, retired.id).await?);
@@ -177,9 +177,11 @@ async fn lock_active_nowait_locks_the_active_execution_for_update_or_fails_fast(
     // `NOWAIT`: a held row fails the read at once with `lock_not_available`.
     let holder = hold_execution(pool, active.id).await?;
     let mut tx = pool.begin().await?;
-    let error = lock_active_nowait(&mut tx, sandbox_id)
-        .await
-        .expect_err("a held execution fails the lock");
+    let error = sqlx::Error::from(
+        lock_active_nowait(&mut *tx, sandbox_id)
+            .await
+            .expect_err("a held execution fails the lock"),
+    );
     assert!(is_lock_not_available(&error), "{error}");
     tx.rollback().await?;
     holder.rollback().await?;
@@ -187,7 +189,7 @@ async fn lock_active_nowait_locks_the_active_execution_for_update_or_fails_fast(
     // No active execution: nothing to lock, and no error.
     let bare = insert_sandbox(pool, "restoring").await?;
     let mut tx = pool.begin().await?;
-    lock_active_nowait(&mut tx, bare).await?;
+    lock_active_nowait(&mut *tx, bare).await?;
     tx.rollback().await?;
     Ok(())
 }

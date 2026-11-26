@@ -20,7 +20,7 @@ async fn lock_executions_in_generation_order_locks_every_execution_for_update() 
     let other = insert_execution(pool, other_sandbox, 1, "creating", true, None).await?;
 
     let mut tx = pool.begin().await?;
-    lock_executions_in_generation_order(&mut tx, sandbox_id).await?;
+    lock_executions_in_generation_order(&mut *tx, sandbox_id).await?;
     // `FOR UPDATE` on each, inactive included: even a key-share lock waits.
     assert!(execution_key_share_blocked(pool, retired.id).await?);
     assert!(execution_key_share_blocked(pool, active.id).await?);

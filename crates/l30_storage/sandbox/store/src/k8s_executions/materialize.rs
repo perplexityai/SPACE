@@ -1,9 +1,9 @@
 //! What a sandbox's active execution records about its pod once the pod
 //! exists: its UID and IP, and the Kubernetes node it runs on.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 
 /// Record `pod_uid` and `pod_ip` on `sandbox_id`'s active execution at
 /// `generation`, moving it to `running` once it has an IP or to `created`
@@ -20,12 +20,12 @@ use sqlx::PgExecutor;
 /// apart holds the execution's row lock before this write, in the same
 /// transaction.
 pub async fn record_pod_metadata(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     pod_uid: Option<&str>,
     pod_ip: Option<&str>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
              SET pod_uid = $1::TEXT,
@@ -95,7 +95,7 @@ pub async fn record_pod_metadata(
     .bind(pod_ip)
     .bind(sandbox_id)
     .bind(generation)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected()
         > 0)
@@ -107,11 +107,11 @@ pub async fn record_pod_metadata(
 /// execution when the statement started, whether or not this wrote it;
 /// `false` means there was none to record the node on.
 pub async fn record_node_name(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     node_name: &str,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
         "WITH updated AS (
                 UPDATE sandbox_k8s_executions
                 SET k8s_node_name = $1::TEXT,
@@ -128,8 +128,8 @@ pub async fn record_node_name(
     ))
     .bind(node_name)
     .bind(sandbox_id)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 #[cfg(test)]

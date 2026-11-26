@@ -1,24 +1,28 @@
 //! State transitions of a sandbox's active execution: a `FOR UPDATE` read
 //! of its state, and the state compare-and-set.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
-use sqlx::{PgConnection, PgExecutor};
 
 /// Lock `sandbox_id`'s active execution at `generation` `FOR UPDATE` and
 /// return its stored state, unparsed; `None` when there is no such
-/// execution. The lock lasts until the caller's transaction ends.
+/// execution. The lock lasts until the caller's transaction ends. The
+/// caller must pass its open transaction.
 ///
 /// `FOR UPDATE` follows the update chain to the latest committed row version
 /// and re-evaluates the predicate, so a retirement that commits while this
 /// waits on the lock reads as `None`, unlike a plain read, whose
 /// statement-start snapshot could still show the active version.
-pub async fn lock_active_state(
-    conn: &mut PgConnection,
+pub async fn lock_active_state<C>(
+    conn: &mut C,
     sandbox_id: SandboxId,
     generation: i64,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Option<String>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar(sql!(
         "SELECT state
              FROM sandbox_k8s_executions
              WHERE sandbox_id = $1 AND generation = $2 AND active
@@ -26,8 +30,8 @@ pub async fn lock_active_state(
     ))
     .bind(sandbox_id)
     .bind(generation)
-    .fetch_optional(conn)
-    .await
+    .fetch_optional(conn.into_sqlx())
+    .await?)
 }
 
 /// Move `sandbox_id`'s active execution at `generation` to `state` while it
@@ -35,12 +39,12 @@ pub async fn lock_active_state(
 /// rows written: `0` when the execution isn't active at `generation` or has
 /// left `expected_state`, which it leaves as it is.
 pub async fn compare_and_set_active_state(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     state: &str,
     expected_state: &str,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
                  SET state = $3, updated_at = NOW()
@@ -50,7 +54,7 @@ pub async fn compare_and_set_active_state(
     .bind(generation)
     .bind(state)
     .bind(expected_state)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected())
 }

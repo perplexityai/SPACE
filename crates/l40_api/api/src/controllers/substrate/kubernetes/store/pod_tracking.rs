@@ -246,7 +246,7 @@ impl K8sStore {
             return Ok(false);
         }
         let filled = k8s_execution_pod_tracking::backfill_missing_pod_uid(
-            &mut tx,
+            &mut *tx,
             sandbox_id,
             generation,
             activation_attempt_id,
@@ -350,7 +350,7 @@ impl K8sStore {
         // Clearing the pod UID stamps `pod_materialized_at` first if the row
         // held one, so the record that a pod ran outlives the UID.
         let cleared = k8s_execution_pod_tracking::clear_absent_recovery_pod(
-            &mut tx,
+            &mut *tx,
             sandbox_id,
             generation,
             ActiveExecutionState::RecoveryFailed.as_str(),

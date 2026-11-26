@@ -8,16 +8,20 @@
 //! ([`crate::pod_less_giveup::read_guards`], which reads the give-up's guards),
 //! and the revert of the sandbox row that decides whether the retire runs.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
-use sqlx::{Postgres, Transaction};
 
 /// Lock every execution row of the sandbox, active or not, `FOR UPDATE`, in
 /// generation order. The lock lasts until the caller's transaction ends.
-pub async fn lock_executions_in_generation_order(
-    tx: &mut Transaction<'_, Postgres>,
+/// The caller must pass its open transaction.
+pub async fn lock_executions_in_generation_order<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "SELECT 1
            FROM sandbox_k8s_executions
@@ -26,7 +30,7 @@ pub async fn lock_executions_in_generation_order(
             FOR UPDATE"
     ))
     .bind(sandbox_id)
-    .execute(&mut **tx)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -38,9 +42,9 @@ pub async fn lock_executions_in_generation_order(
 /// guard it. Returns how many executions it retired: `0` when none was
 /// active, and nothing changes.
 pub async fn retire_active_executions(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions e
             SET active = FALSE,\n\
@@ -52,7 +56,7 @@ pub async fn retire_active_executions(
             AND e.active"
     ))
     .bind(sandbox_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected())
 }

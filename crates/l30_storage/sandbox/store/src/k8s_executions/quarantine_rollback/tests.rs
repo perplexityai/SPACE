@@ -166,7 +166,7 @@ async fn lock_activation_rollback_candidates_locks_the_sandbox_and_its_fenced_ex
 
     let mut tx = pool.begin().await?;
     let candidates = lock_activation_rollback_candidates(
-        &mut tx,
+        &mut *tx,
         node_id,
         Json(rows.clone()),
         SandboxTransitionReceiptKind::ActivationRollback,
@@ -214,7 +214,7 @@ async fn lock_activation_rollback_candidates_locks_the_sandbox_and_its_fenced_ex
         ),
     ] {
         let candidates =
-            lock_activation_rollback_candidates(&mut tx, node, Json(rows.clone()), kind).await?;
+            lock_activation_rollback_candidates(&mut *tx, node, Json(rows.clone()), kind).await?;
         assert!(candidates.is_empty());
     }
     tx.rollback().await?;

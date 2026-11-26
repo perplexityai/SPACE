@@ -81,7 +81,7 @@ async fn insert_first_generation_records_the_slots_pod_once() -> TestResult {
 
     let sandbox = insert_sandbox(pool).await?;
     let mut tx = pool.begin().await?;
-    insert_first_generation(&mut tx, sandbox, &source("pod-a", Some("uid-a")), slot_id).await?;
+    insert_first_generation(&mut *tx, sandbox, &source("pod-a", Some("uid-a")), slot_id).await?;
     tx.commit().await?;
     let inserted = read_executions(pool, sandbox).await?;
     assert_eq!(
@@ -103,9 +103,11 @@ async fn insert_first_generation_records_the_slots_pod_once() -> TestResult {
     // A second claim for the same sandbox fails on the unique indexes and
     // leaves the first.
     let mut tx = pool.begin().await?;
-    let error = insert_first_generation(&mut tx, sandbox, &source("pod-b", Some("uid-b")), slot_id)
-        .await
-        .expect_err("the sandbox already has generation 1");
+    let error = sqlx::Error::from(
+        insert_first_generation(&mut *tx, sandbox, &source("pod-b", Some("uid-b")), slot_id)
+            .await
+            .expect_err("the sandbox already has generation 1"),
+    );
     assert!(
         matches!(&error, sqlx::Error::Database(db_error) if db_error.code().as_deref() == Some("23505")),
         "{error}"
@@ -117,7 +119,7 @@ async fn insert_first_generation_records_the_slots_pod_once() -> TestResult {
     let unmaterialized = insert_sandbox(pool).await?;
     let mut tx = pool.begin().await?;
     insert_first_generation(
-        &mut tx,
+        &mut *tx,
         unmaterialized,
         &source("pod-c", Some(" ")),
         slot_id,

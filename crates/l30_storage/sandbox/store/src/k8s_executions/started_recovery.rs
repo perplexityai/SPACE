@@ -13,9 +13,9 @@
 //! database-clock comparisons and lease ends stay in the SQL, so each verb
 //! runs on the executor its caller passes.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId};
 use pplx_space_sql_locator::sql;
-use sqlx::{PgConnection, PgExecutor};
 use uuid::Uuid;
 
 /// Claim the recovery of `sandbox_id`'s active execution at `generation`,
@@ -26,13 +26,13 @@ use uuid::Uuid;
 /// updated at least `lease_ttl_secs` ago by the database clock. `None`: no
 /// such execution, which the caller reads as a recovery in flight.
 pub async fn claim(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     created: bool,
     lease_ttl_secs: i64,
-) -> Result<Option<i64>, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>(sql!(
+) -> Result<Option<i64>, DbError> {
+    Ok(sqlx::query_scalar::<_, i64>(sql!(
         "UPDATE sandbox_k8s_executions
              SET state = 'recovering', updated_at = NOW()
              WHERE sandbox_id = $1 AND generation = $2 AND active
@@ -55,8 +55,8 @@ pub async fn claim(
     .bind(generation)
     .bind(created)
     .bind(lease_ttl_secs)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The activation attempt a recovering execution holds, as
@@ -73,13 +73,17 @@ pub struct RecoveringActivationAttempt {
 /// attempt it holds. `None`: there is no such execution, or the sandbox is no
 /// longer `started`. The lock covers the execution row only (`OF e`), not the
 /// joined `sandboxes` row, which the caller has already locked, and lasts
-/// until the caller's transaction ends.
-pub async fn lock_recovering_execution(
-    conn: &mut PgConnection,
+/// until the caller's transaction ends. The caller must pass its open
+/// transaction.
+pub async fn lock_recovering_execution<C>(
+    conn: &mut C,
     sandbox_id: SandboxId,
     generation: i64,
-) -> Result<Option<RecoveringActivationAttempt>, sqlx::Error> {
-    sqlx::query_as::<_, RecoveringActivationAttempt>(sql!(
+) -> Result<Option<RecoveringActivationAttempt>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_as::<_, RecoveringActivationAttempt>(sql!(
         "SELECT e.activation_attempt_id, e.activation_attempt_target_state
                FROM sandboxes s
                JOIN sandbox_k8s_executions e
@@ -93,8 +97,8 @@ pub async fn lock_recovering_execution(
     ))
     .bind(sandbox_id)
     .bind(generation)
-    .fetch_optional(conn)
-    .await
+    .fetch_optional(conn.into_sqlx())
+    .await?)
 }
 
 /// Hand a started recovery to the successor execution at `generation`, which
@@ -105,13 +109,13 @@ pub async fn lock_recovering_execution(
 /// leaves none. Returns the number of rows written: `0` when the successor is
 /// no longer an active `creating` execution.
 pub async fn hand_off_to_successor(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     activation_attempt_id: Option<Uuid>,
     activation_target_state: Option<&str>,
     lease_ttl_secs: i64,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
                 SET state = 'recovering',
@@ -133,7 +137,7 @@ pub async fn hand_off_to_successor(
     .bind(activation_attempt_id)
     .bind(activation_target_state)
     .bind(lease_ttl_secs)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected())
 }
@@ -143,12 +147,12 @@ pub async fn hand_off_to_successor(
 /// `completion_state`. Returns the number of rows written: `0` when no such
 /// execution is still recovering.
 pub async fn complete(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     completion_state: &str,
     recovering_state: &str,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
              SET state = $3, updated_at = NOW()
@@ -158,7 +162,7 @@ pub async fn complete(
     .bind(generation)
     .bind(completion_state)
     .bind(recovering_state)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected())
 }
@@ -170,14 +174,14 @@ pub async fn complete(
 /// `generation` or newer that holds that attempt. Returns the failed
 /// execution's generation; `None` when no execution matches.
 pub async fn fail(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
     failed_state: &str,
     recovering_state: &str,
     activation_attempt_id: Option<SandboxActivationAttemptId>,
-) -> Result<Option<i64>, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>(sql!(
+) -> Result<Option<i64>, DbError> {
+    Ok(sqlx::query_scalar::<_, i64>(sql!(
         "UPDATE sandbox_k8s_executions
              SET state = $3,
                  activation_attempt_id = NULL,
@@ -206,8 +210,8 @@ pub async fn fail(
     .bind(failed_state)
     .bind(recovering_state)
     .bind(activation_attempt_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 #[cfg(test)]

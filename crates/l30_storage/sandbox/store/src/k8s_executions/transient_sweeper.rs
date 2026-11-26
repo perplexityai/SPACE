@@ -7,19 +7,19 @@
 //! `NOWAIT`, and what it does with each outcome.
 
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId};
 use pplx_space_sql_locator::sql;
-use sqlx::{Postgres, Transaction};
 
 /// Rotate a failed-cleanup candidate behind the others by bumping its active
 /// execution's `updated_at`, while its sandbox is still a `failed` row
 /// managed by `managed_by`. Returns how many rows it bumped: `0` when the
 /// sandbox no longer has that shape, and nothing changes.
 pub async fn note_failed_cleanup_attempt(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     managed_by: SubstrateKind,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions e
          SET updated_at = NOW()
@@ -32,7 +32,7 @@ pub async fn note_failed_cleanup_attempt(
     ))
     .bind(sandbox_id)
     .bind(managed_by)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected())
 }
@@ -44,14 +44,14 @@ pub async fn note_failed_cleanup_attempt(
 /// revert's transaction. `false` when the active execution is no longer that
 /// one, and nothing changes.
 pub async fn retire_reverted_restore_execution(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     pod_name: &str,
     generation: Option<i64>,
     activation_attempt_id: Option<SandboxActivationAttemptId>,
     pod_uid: Option<&str>,
     route_activation_id: Option<SandboxActivationAttemptId>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
             SET active = FALSE,
@@ -73,7 +73,7 @@ pub async fn retire_reverted_restore_execution(
     .bind(activation_attempt_id)
     .bind(pod_uid)
     .bind(route_activation_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected()
         == 1)
@@ -83,11 +83,12 @@ pub async fn retire_reverted_restore_execution(
 /// pod-IP writers take. The lock lasts until the caller's transaction ends.
 /// A sandbox with no active execution locks nothing and still succeeds.
 /// Fails at once with `lock_not_available` (`55P03`) when another
-/// transaction holds the row; the caller decides what that means.
-pub async fn lock_active_nowait(
-    tx: &mut Transaction<'_, Postgres>,
-    sandbox_id: SandboxId,
-) -> Result<(), sqlx::Error> {
+/// transaction holds the row; the caller decides what that means. The
+/// caller must pass its open transaction.
+pub async fn lock_active_nowait<C>(tx: &mut C, sandbox_id: SandboxId) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "SELECT id
                FROM sandbox_k8s_executions
@@ -96,7 +97,7 @@ pub async fn lock_active_nowait(
                 FOR UPDATE NOWAIT"
     ))
     .bind(sandbox_id)
-    .execute(&mut **tx)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }

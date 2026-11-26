@@ -216,7 +216,7 @@ async fn lock_recovering_execution_locks_only_the_execution_until_the_transactio
     for commit in [true, false] {
         let mut tx = pool.begin().await?;
         assert_eq!(
-            super::lock_recovering_execution(&mut tx, sandbox_id, 3).await?,
+            super::lock_recovering_execution(&mut *tx, sandbox_id, 3).await?,
             Some(RecoveringActivationAttempt {
                 activation_attempt_id: Some(attempt),
                 activation_attempt_target_state: Some("started".to_string()),
@@ -239,7 +239,7 @@ async fn lock_recovering_execution_locks_only_the_execution_until_the_transactio
     // sandbox that is no longer `started`, and an inactive execution.
     let mut tx = pool.begin().await?;
     assert_eq!(
-        super::lock_recovering_execution(&mut tx, sandbox_id, 2).await?,
+        super::lock_recovering_execution(&mut *tx, sandbox_id, 2).await?,
         None
     );
     tx.rollback().await?;
@@ -252,7 +252,7 @@ async fn lock_recovering_execution_locks_only_the_execution_until_the_transactio
     for other in [running, suspending, inactive] {
         let mut tx = pool.begin().await?;
         assert_eq!(
-            super::lock_recovering_execution(&mut tx, other, 1).await?,
+            super::lock_recovering_execution(&mut *tx, other, 1).await?,
             None
         );
         tx.rollback().await?;

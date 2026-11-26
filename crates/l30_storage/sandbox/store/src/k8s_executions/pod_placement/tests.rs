@@ -193,14 +193,14 @@ async fn claim_pod_materialization_claims_only_the_active_generation() -> TestRe
 
     // A retired generation, and one that was never minted.
     let mut tx = pool.begin().await?;
-    assert!(!claim_pod_materialization(&mut tx, sandbox, 1).await?);
-    assert!(!claim_pod_materialization(&mut tx, sandbox, 3).await?);
+    assert!(!claim_pod_materialization(&mut *tx, sandbox, 1).await?);
+    assert!(!claim_pod_materialization(&mut *tx, sandbox, 3).await?);
     tx.commit().await?;
     assert_eq!(read_execution(pool, sandbox, 1).await?, retired_before);
     assert_eq!(read_execution(pool, sandbox, 2).await?, before);
 
     let mut tx = pool.begin().await?;
-    assert!(claim_pod_materialization(&mut tx, sandbox, 2).await?);
+    assert!(claim_pod_materialization(&mut *tx, sandbox, 2).await?);
     tx.commit().await?;
     let (state, pod_uid, pod_ip, materialized, updated_at) =
         read_execution(pool, sandbox, 2).await?;
@@ -214,7 +214,7 @@ async fn claim_pod_materialization_claims_only_the_active_generation() -> TestRe
     let recovering = insert_sandbox(pool).await?;
     insert_execution(pool, recovering, 1, "recovering", true, None, None).await?;
     let mut tx = pool.begin().await?;
-    assert!(claim_pod_materialization(&mut tx, recovering, 1).await?);
+    assert!(claim_pod_materialization(&mut *tx, recovering, 1).await?);
     tx.commit().await?;
     let (state, _, _, materialized, _) = read_execution(pool, recovering, 1).await?;
     assert_eq!(state, "recovering");

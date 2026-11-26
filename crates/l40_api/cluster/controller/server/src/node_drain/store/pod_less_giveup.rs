@@ -522,7 +522,7 @@ async fn recover_pod_less_sandbox_locked(
     // it. The drained-node terminator's flip fences the same way.
     locks::share_lock_node(&mut tx, candidate.source_node_id).await?;
     row_locks::lock_exists(&mut tx, candidate.sandbox_id).await?;
-    giveup_executions::lock_executions_in_generation_order(&mut tx, candidate.sandbox_id).await?;
+    giveup_executions::lock_executions_in_generation_order(&mut *tx, candidate.sandbox_id).await?;
 
     let eligible = precheck(&mut *tx, candidate).await?.and_then(|generation| {
         if generation == expected {

@@ -117,7 +117,7 @@ async fn lock_suspended_execution_holds_the_execution_until_the_transaction_ends
     ] {
         let mut tx = pool.begin().await?;
         assert_eq!(
-            lock_suspended_execution(&mut tx, sandbox_id, 2, "uid-2", "suspended").await?,
+            lock_suspended_execution(&mut *tx, sandbox_id, 2, "uid-2", "suspended").await?,
             Some(still_active)
         );
         assert!(execution_key_share_blocked(pool, sandbox_id, 2).await?);
@@ -137,7 +137,7 @@ async fn lock_suspended_execution_holds_the_execution_until_the_transaction_ends
         (2, "uid-2", "running"),
     ] {
         assert_eq!(
-            lock_suspended_execution(&mut tx, active, generation, pod_uid, state).await?,
+            lock_suspended_execution(&mut *tx, active, generation, pod_uid, state).await?,
             None
         );
     }

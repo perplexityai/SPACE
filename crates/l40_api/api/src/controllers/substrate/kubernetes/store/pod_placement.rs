@@ -236,7 +236,7 @@ impl K8sStore {
         // held one, so the record that a pod ran outlives the UID.
         let claimed =
             pplx_space_sandbox_store::k8s_executions::pod_placement::claim_pod_materialization(
-                &mut tx, sandbox_id, generation,
+                &mut *tx, sandbox_id, generation,
             )
             .await
             .db_context("failed to claim pod materialization")?;

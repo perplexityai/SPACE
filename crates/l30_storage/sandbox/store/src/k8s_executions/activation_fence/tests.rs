@@ -407,39 +407,36 @@ async fn claims_lose_to_an_execution_their_route_publication_does_not_fit() -> T
         let mut conn = pool.acquire().await?;
         let conn = &mut *conn;
         match kind {
-            Claim::PublishedRoute => {
-                claim_attempt_with_published_route(
-                    conn,
-                    sandbox,
-                    1,
-                    attempt,
-                    "started",
-                    LEASE_TTL_SECS,
-                )
-                .await
-            }
-            Claim::InitializeRoute => {
-                claim_attempt_initializing_route(
-                    conn,
-                    sandbox,
-                    1,
-                    attempt,
-                    "started",
-                    LEASE_TTL_SECS,
-                )
-                .await
-            }
-            Claim::AdoptLegacy => {
-                claim_attempt_adopting_legacy_route(
-                    conn,
-                    sandbox,
-                    1,
-                    attempt,
-                    "started",
-                    LEASE_TTL_SECS,
-                )
-                .await
-            }
+            Claim::PublishedRoute => claim_attempt_with_published_route(
+                conn,
+                sandbox,
+                1,
+                attempt,
+                "started",
+                LEASE_TTL_SECS,
+            )
+            .await
+            .map_err(sqlx::Error::from),
+            Claim::InitializeRoute => claim_attempt_initializing_route(
+                conn,
+                sandbox,
+                1,
+                attempt,
+                "started",
+                LEASE_TTL_SECS,
+            )
+            .await
+            .map_err(sqlx::Error::from),
+            Claim::AdoptLegacy => claim_attempt_adopting_legacy_route(
+                conn,
+                sandbox,
+                1,
+                attempt,
+                "started",
+                LEASE_TTL_SECS,
+            )
+            .await
+            .map_err(sqlx::Error::from),
         }
     }
 
@@ -600,7 +597,7 @@ async fn locking_the_attempt_owner_holds_the_active_generation_until_the_transac
     for generation in [1, 3] {
         let mut tx = pool.begin().await?;
         assert_eq!(
-            lock_attempt_owner(&mut tx, sandbox, generation).await?,
+            lock_attempt_owner(&mut *tx, sandbox, generation).await?,
             None
         );
         assert!(!key_share_blocked(pool, sandbox, 1).await?);
@@ -611,7 +608,7 @@ async fn locking_the_attempt_owner_holds_the_active_generation_until_the_transac
 
     for commit in [true, false] {
         let mut tx = pool.begin().await?;
-        let locked = lock_attempt_owner(&mut tx, sandbox, 2)
+        let locked = lock_attempt_owner(&mut *tx, sandbox, 2)
             .await?
             .expect("the active generation");
         assert_eq!(locked.activation_attempt_id, Some(owner.as_uuid()));
@@ -646,7 +643,7 @@ async fn locking_the_attempt_owner_holds_the_active_generation_until_the_transac
     )
     .await?;
     let mut tx = pool.begin().await?;
-    let locked = lock_attempt_owner(&mut tx, expired, 1).await?;
+    let locked = lock_attempt_owner(&mut *tx, expired, 1).await?;
     tx.rollback().await?;
     assert_eq!(locked.map(|owner| owner.lease_remaining_secs), Some(0.0));
     Ok(())
