@@ -13,9 +13,12 @@ PATH = "/tmp/space-smoke-v2-calls.txt"
 # wait out the rest of a hold sized for the slowest bench.
 HOLD_SECONDS = 900
 # How far ahead the deadline lands once brought in, the uploads already
-# cut: an 18 s watch of the sandbox held, three of its 5 s reads, until the
-# calls start `CALLS_LEAD_SECONDS` before it. Nothing tells the node of the
-# new deadline (`bring_deadline_to`), so nothing here waits for that.
+# cut: at least an 18 s watch of the sandbox held, three of its 5 s reads,
+# until the calls start `CALLS_LEAD_SECONDS` before it; up to a tick more,
+# as the deadline is put just past one of the controller's ticks so the
+# calls have a few seconds past it before the node's suspend. Nothing tells
+# the node of the new deadline (`bring_deadline_to`), so nothing here waits
+# for that.
 LEAD_SECONDS = CALLS_LEAD_SECONDS + 18
 # The resident deleted as the drain began is long gone by the end: its
 # delete, the node's report of it and the finalize, measured in seconds,
@@ -99,7 +102,7 @@ def v2_drain_meets_user_calls(test: smoke.CommandSandboxFixture) -> None:
         with test.phase("cut the drained worker's uploads, then bring the deadline in"):
             uploads = drain.block("object-store")
             # Cut first, so the deadline is at least the lead after the cut.
-            drain.bring_deadline_to(LEAD_SECONDS)
+            drain.bring_deadline_to(LEAD_SECONDS, after_a_tick=True)
             drain.expect_started_until_deadline([serving.sandbox_id], margin=CALLS_LEAD_SECONDS)
 
         with test.phase("around the deadline: calls to the running one pass until the node suspends it"):

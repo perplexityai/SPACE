@@ -245,13 +245,21 @@ LEFTOVER_SECONDS = 120
 # up to 256 MiB (seconds measured), with a minute's margin.
 COMMAND_SECONDS = 90
 # One probe of a running sandbox around its deadline: the node's own state,
-# a command, and the node's state again (2-4 s measured, so 4 s).
+# a command, and the node's state again. About 0.4 s measured on Kind
+# (26-30 probes in the 12 s before a deadline); 4 s allows for a bench ten
+# times slower.
 PROBE_SECONDS = 4
 # How long before the deadline the probes start. The first one's call is
 # asked up to a probe after they start, so at least `2 * PROBE_SECONDS`
 # before the deadline: room for two calls to meet the VM held there even at
-# the slowest probe measured.
+# 4 s a probe.
 CALLS_LEAD_SECONDS = 3 * PROBE_SECONDS
+# How far past one of the controller's ticks `bring_deadline_to(...,
+# after_a_tick=True)` puts a deadline: the stored deadline may land a second
+# either side of the one asked for (`expect_stored_deadline`), and a tick's
+# stamp is its whole second, so 2 s keeps the deadline after that tick and
+# the next one, which evacuates, 2-5 s past the deadline.
+AFTER_A_TICK_SECONDS = 2
 
 
 # How many independent per-resident calls (creates, fills, wakes, deletes) a
@@ -1541,16 +1549,30 @@ class DrainV2Assertions:
         )
         return answer
 
-    def bring_deadline_to(self, lead: int) -> int:
+    def bring_deadline_to(self, lead: int, *, after_a_tick: bool = False) -> int:
         """A repeat `:drain` with a shorter hold, counted from
         `drain_started_at`, moves the stored deadline to `lead` seconds from
         now; returns it. Nothing tells the node: `DrainNode` carries no
         deadline, only whether to evacuate, which the controller decides each
         tick from the stored one. So the next tick past the new deadline
-        evacuates, whichever controller process runs it."""
+        evacuates, whichever controller process runs it.
+
+        With `after_a_tick`, the deadline instead lands up to a tick later,
+        `AFTER_A_TICK_SECONDS` past one of the controller's ticks: their
+        period is fixed, and the last report's `reported_at` is one tick's
+        own database clock. The next tick then comes 2-5 s past the deadline,
+        a window in which the node still holds a running sandbox. A tick that
+        ran long since shifts the phase, which only narrows that window; and
+        with no report to read, the deadline is `lead` from now."""
 
         before = self.deadline
-        answer = self.repeat_drain(int(time.time() - self.started_at()) + lead)
+        target = time.time() + lead
+        reported = timestamp_seconds(self.report().get(VIEW_REPORTED_FIELD)) if after_a_tick else None
+        if reported is not None:
+            ticks = -(-(target - AFTER_A_TICK_SECONDS - reported) // TICK_SECONDS)
+            target = reported + ticks * TICK_SECONDS + AFTER_A_TICK_SECONDS
+            self._fixture.record("deadline_after_tick", {"tick_reported_at": reported, "target": target})
+        answer = self.repeat_drain(round(target - self.started_at()))
         self._fixture.verify(
             answer.status in (200, 202) and self.deadline < before,
             "a repeat :drain with a shorter hold did not move the deadline earlier",
