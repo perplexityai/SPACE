@@ -51,6 +51,16 @@ crates/l40_api/internal/api/server/src/adapter.rs
 crates/l40_api/internal/api/server/src/metadata.rs
 crates/l40_api/internal/api/server/src/template_*.rs
 crates/l40_api/sbx/mgr/server/src/service/activation_support.rs
+# The node side of a v2 drain, which native.v2_drain_evacuates_every_resident
+# drives in the routine tier: sandbox-manager's DrainNode engine, the
+# activation seal it holds and the write gate on sealed rows. The seal's
+# storage is under crates/l30_storage/** above.
+crates/l40_api/sbx/mgr/server/src/service/drain_node.rs
+crates/l40_api/sbx/mgr/server/src/service/drain_node/**
+crates/l40_api/sbx/mgr/server/src/activation_seal.rs
+crates/l40_api/sbx/mgr/server/src/activation_seal/**
+crates/l40_api/sbx/mgr/server/src/service/write_gate.rs
+crates/l40_api/sbx/mgr/server/src/service/write_gate/**
 # Emit the template pull metrics that the Kind restore scenarios assert
 # on, and choose the selector and pull path behind them.
 crates/l40_api/template/mgr/server/src/volume.rs
