@@ -23,6 +23,7 @@ PAIRS: tuple[tuple[str, type], ...] = tuple(
         ("RateLimitProbe", adapters.EcwSdk),
         ("TemplateBuilder", adapters.EcwSdk),
         ("RateLimiterControl", adapters.KindHarness),
+        ("UnscheduledPodBacklogControl", adapters.KindHarness),
         ("NodeGroupControl", adapters.KindHarness),
         ("NodeDrainControl", adapters.KindHarness),
         ("PendingBackupControl", adapters.KindHarness),

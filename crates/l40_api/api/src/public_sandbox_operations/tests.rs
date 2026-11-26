@@ -842,6 +842,10 @@ fn activation_rejection_kinds_requeue_as_their_kind_says() {
             ActivationRejectionKind::NoFreeSlot,
             PublicOperationRequeueReason::TransientFailure,
         ),
+        (
+            ActivationRejectionKind::UnscheduledPodBacklog,
+            PublicOperationRequeueReason::TransientFailure,
+        ),
     ] {
         let result = controller_error_result(
             &op,

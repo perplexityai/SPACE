@@ -103,6 +103,7 @@ _DURATION_SECONDS = {
         "local.telemetry_reaches_local_backends": 75,
         "local.template_startup_recovery_decision_table": 18,
         "local.unanswered_template_deleted_after_wait": 104,
+        "local.unscheduled_pod_backlog_sheds_cold_creates": 45,
         "network_policy.v1_cidr_allow": 6,
         "network_policy.v1_cidr_deny": 6,
         "network_policy.v1_deny_precedes_allow": 7,

@@ -26,6 +26,10 @@ pub enum ActivationRejectionKind {
     /// No start-eligible node has a free network slot: a 503, since it isn't
     /// the client's doing, retried against the same bounded budget.
     NoFreeSlot,
+    /// Unscheduled sandbox pods waiting on `kube-scheduler` reached the
+    /// configured backlog ceiling: a 503 retried against the bounded budget, so
+    /// cold creates shed before `POST`ing another `Pending` pod.
+    UnscheduledPodBacklog,
     /// The client is at its live-sandbox cap: a 429 retried against the
     /// bounded budget, since the cap lifts when the client releases a
     /// sandbox, not with time.
@@ -45,7 +49,9 @@ impl ActivationRejectionKind {
             Self::RateLimited => ControllerError::rate_limited(message)
                 .with_retry_after_cause(ControllerRetryAfterCause::ClusterActivationAdmission),
             Self::EmptyCluster | Self::LiveCap => ControllerError::rate_limited(message),
-            Self::NoFreeSlot => ControllerError::service_unavailable(message),
+            Self::NoFreeSlot | Self::UnscheduledPodBacklog => {
+                ControllerError::service_unavailable(message)
+            }
         };
         if let Some(retry_after) = retry_after {
             error = error.with_retry_after_header(retry_after);

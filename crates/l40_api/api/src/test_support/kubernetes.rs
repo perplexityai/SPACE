@@ -68,6 +68,45 @@ pub(crate) fn full_cluster_slot_check_admission(
     )
 }
 
+/// Cluster admission with `max_unscheduled_pods = 1`, over one worker with
+/// free network slots and one unscheduled `Pending` pod (`spec.nodeName`
+/// unset), so slot headroom stays `Available` while every cold create is
+/// refused with `UnscheduledPodBacklog`.
+pub(crate) fn unscheduled_backlog_admission(
+    pool: &PgPool,
+) -> crate::cluster_admission::ClusterSandboxAdmission {
+    use crate::controllers::substrate::kubernetes::tests::{
+        node_with_network_slots, substrate_with_inventory_caches_and_pool,
+    };
+    use pplx_space_sandbox_pod::SandboxPodConfigValues;
+    let labels = SandboxPodConfigValues::default()
+        .base_node_selector()
+        .into_labels();
+    let node = node_with_network_slots("ready-node", labels, Some(8), None, true, false);
+    let pending: Pod = serde_json::from_value(serde_json::json!({
+        "metadata": {
+            "name": "pending-backlog-sbx",
+            "namespace": "space",
+        },
+        "spec": { "containers": [] },
+        "status": { "phase": "Pending" },
+    }))
+    .expect("valid pending pod");
+    crate::cluster_admission::ClusterSandboxAdmission::with_config(
+        kubernetes(substrate_with_inventory_caches_and_pool(
+            vec![pending],
+            vec![(*node).clone()],
+            pool.clone(),
+        )),
+        crate::cluster_admission::ClusterSandboxAdmissionConfig {
+            slot_check_enabled: true,
+            max_unscheduled_pods: std::num::NonZeroU64::new(1),
+            ..crate::test_support::enabled_config()
+        },
+        pplx_space_feature_flags::FeatureFlagClient::disabled(),
+    )
+}
+
 pub(crate) fn kubernetes(substrate: KubernetesSubstrate) -> Substrate {
     Substrate::from_kubernetes(substrate)
 }

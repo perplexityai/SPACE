@@ -369,6 +369,7 @@ fn the_control_fallback_passes_admission_refusals_through() {
         ActivationRejectionKind::RateLimited,
         ActivationRejectionKind::EmptyCluster,
         ActivationRejectionKind::NoFreeSlot,
+        ActivationRejectionKind::UnscheduledPodBacklog,
     ] {
         let refusal = kind.controller_error("refused".to_string(), None);
         assert_eq!(refusal.activation_rejection(), Some(kind));

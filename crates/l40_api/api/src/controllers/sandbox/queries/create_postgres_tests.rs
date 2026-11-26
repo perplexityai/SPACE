@@ -1678,6 +1678,49 @@ async fn postgres_cold_create_on_a_full_cluster_is_refused_before_its_row() -> T
     .fetch_one(&db.pool)
     .await?;
     assert_eq!(rows, 0);
+
+    let backlog_controller = SandboxController::with_cluster_admission(
+        crate::controllers::substrate::Substrate::from_direct(
+            crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
+        ),
+        crate::test_support::kubernetes::unscheduled_backlog_admission(&db.pool),
+    );
+    let mut backlog_req = pooled_create_request("backlog-cluster-cold", None);
+    backlog_req.boot_mode = Some("cold".to_string());
+    backlog_req.template = Some("seed:latest".parse()?);
+
+    let backlog_error = backlog_controller
+        .create(
+            &db.pool,
+            &actor,
+            &backlog_req,
+            SandboxApiMetricIdentity::native("create"),
+            FederatedSandboxCreateContext::new(None, None),
+            crate::controllers::substrate::ActivationClient::Native,
+        )
+        .await
+        .expect_err("an unscheduled-pod backlog at the ceiling refuses a cold create");
+
+    assert_eq!(
+        backlog_error.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{backlog_error}"
+    );
+    assert_eq!(
+        backlog_error.activation_rejection(),
+        Some(crate::controllers::substrate::ActivationRejectionKind::UnscheduledPodBacklog),
+        "{backlog_error}"
+    );
+    assert!(
+        backlog_error.retry_after_header().is_some(),
+        "{backlog_error}"
+    );
+    let (backlog_rows,): (i64,) = sqlx::query_as(sql!(
+        "SELECT COUNT(*) FROM sandboxes WHERE name = 'backlog-cluster-cold'"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(backlog_rows, 0);
     Ok(())
 }
 

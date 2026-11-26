@@ -99,6 +99,7 @@
 //! | Kubernetes-only state loops (drain, orphan, failed-row repair, node sync and others, listed in the cluster controller's `reconcilers.rs` module doc) | Not started on Direct (below) | ac-pplx | Those loops running for both substrates through the adapter |
 //! | Booting a create's required environment | [`SubstrateCapabilities::boots_required_environment`] is false: a Direct create names no environment, so its worker boots the legacy partition's build, so creates, placement and pools keep the release a tag or digest names rather than a twin | the-gigi-pplx | A Direct create that carries the required environment (`CreateRequest.required_environment`), with direct pools preferring the resolved release's partition |
 //! | Network-slot headroom (`Substrate::network_slot_headroom`) | Reads `Unknown(Unsupported)`, so the activation limiter's slot check (`SPACE_CLUSTER_ACTIVATION_ADMISSION_SLOT_CHECK_ENABLED`) admits every Direct cold create | ac-pplx | Slot capacity of registered nodes, read by an admission check that runs for both substrates |
+//! | Unscheduled-pod backlog (`Substrate::unscheduled_pod_backlog`) | Reads `Unknown(Unsupported)`: Direct launches VMs directly on registered nodes with no pod or `kube-scheduler` queue, so `SPACE_CLUSTER_ACTIVATION_ADMISSION_MAX_UNSCHEDULED_PODS` admits every Direct cold create (`backlog=unsupported`) | the-gigi-pplx | Core placement backlog accounting if Direct gains queued placement, or retiring the pod-queue check once pod-less hosting replaces per-sandbox pods |
 //!
 //! # Kubernetes-only reconcilers
 //!

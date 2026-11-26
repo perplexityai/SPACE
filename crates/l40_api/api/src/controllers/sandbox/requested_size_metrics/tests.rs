@@ -80,6 +80,7 @@ fn only_cluster_admission_refusals_are_rejected() {
         ActivationRejectionKind::RateLimited,
         ActivationRejectionKind::EmptyCluster,
         ActivationRejectionKind::NoFreeSlot,
+        ActivationRejectionKind::UnscheduledPodBacklog,
     ] {
         let error = kind.controller_error("refused".into(), None);
         assert_eq!(

@@ -346,6 +346,22 @@ def _recorded_limiter_env(recorded: str) -> dict[str, str | None]:
     return standing
 
 
+def _recorded_paused_scheduler_nodes(recorded: str) -> list[str]:
+    """The paused `kube-scheduler` node list a Lease recorded, deduplicated and DNS-validated."""
+
+    try:
+        parsed_nodes = json.loads(recorded)
+    except ValueError as error:
+        raise SmokeConfigurationError("the recorded paused scheduler node list is not JSON") from error
+    if not isinstance(parsed_nodes, list) or not all(
+        isinstance(item, str) and item for item in parsed_nodes
+    ):
+        raise SmokeConfigurationError(
+            "the recorded paused scheduler node list is not a list of node names"
+        )
+    return list(dict.fromkeys(_kube_node_name(item) for item in parsed_nodes))
+
+
 def _recorded_environment_placement_gate(recorded: str) -> dict[str, str | None]:
     """The standing gate literals a Lease recorded, refused unless every entry is restorable."""
 
@@ -728,6 +744,7 @@ ENVIRONMENT_PLACEMENT_GATE_ANNOTATION = "space.pplx.net/smoke-environment-placem
 # them, put back by the next holder's repair as the gate's are.
 TEMPLATE_CAMPAIGN_ENV_ANNOTATION = "space.pplx.net/smoke-template-campaign-env"
 REDIS_REPLICAS_ANNOTATION = "space.pplx.net/smoke-redis-replicas"
+PAUSED_SCHEDULER_ANNOTATION = "space.pplx.net/smoke-paused-scheduler-nodes"
 # A rollout a scenario starts only to apply or restore its env
 # (`KindHarness._fast_rollout`) runs with every replacement surged at once and
 # no `minReadySeconds`, and the Deployment carries the `minReadySeconds` and
@@ -757,6 +774,8 @@ SELECTOR_LABELS_ENV = "SPACE_SANDBOX_NODE_SELECTOR_LABELS"
 ADMISSION_ENABLED_ENV = "SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED"
 # Non-pool sandbox pods: `build_pool_pod` stamps `pool-role`, a user create does not.
 KIND_SANDBOX_POD_SELECTOR = "app.kubernetes.io/name=space-sandbox,!space.pplx.net/pool-role"
+# Every sandbox pod watched by `space-api`'s pod reflector (`pod_reflector::SANDBOX_POD_LABEL_SELECTOR`).
+KIND_MANAGED_SANDBOX_POD_SELECTOR = "space.pplx.net/managed-by=space-api"
 CONTROL_PLANE_LABEL = "node-role.kubernetes.io/control-plane"
 KIND_WORKER_NODE_SELECTOR = f"!{CONTROL_PLANE_LABEL}"
 SANDBOX_RESIDENCY_SQL = """\
@@ -4979,6 +4998,17 @@ ON CONFLICT (key_hash) DO NOTHING;
         # renews the Lease first, so a contender that lost the acquisition
         # never undoes the winner's fault.
         annotations = _lease_annotations(previous)
+        recorded_paused_schedulers = annotations.get(PAUSED_SCHEDULER_ANNOTATION)
+        if isinstance(recorded_paused_schedulers, str) and recorded_paused_schedulers:
+            validated_nodes = _recorded_paused_scheduler_nodes(recorded_paused_schedulers)
+            self._require_isolated_kind("orphaned paused kube-scheduler repairs")
+            self._renew_lease(ownership, "an orphaned paused kube-scheduler repair")
+            self._resume_kube_scheduler_processes(validated_nodes)
+            self._renew_lease(
+                ownership,
+                "clearing the paused kube-scheduler record",
+                {PAUSED_SCHEDULER_ANNOTATION: None},
+            )
         recorded_replicas = annotations.get(REDIS_REPLICAS_ANNOTATION)
         if isinstance(recorded_replicas, str) and recorded_replicas:
             if not recorded_replicas.isdigit():
@@ -5080,6 +5110,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         recorded_keys = (
             LIMITER_ENV_ANNOTATION,
             REDIS_REPLICAS_ANNOTATION,
+            PAUSED_SCHEDULER_ANNOTATION,
             ENVIRONMENT_PLACEMENT_GATE_ANNOTATION,
             TEMPLATE_CAMPAIGN_ENV_ANNOTATION,
         )
@@ -5345,6 +5376,248 @@ ON CONFLICT (key_hash) DO NOTHING;
             ),
             "await the Redis rollout",
         )
+
+    def control_plane_nodes(self) -> list[str]:
+        result = self.kubectl("get", "nodes", "-l", CONTROL_PLANE_LABEL, "-o", "name", timeout=15)
+        _require_ok(result, "list control-plane nodes")
+        return sorted(_kube_node_name(line.split("/", 1)[-1]) for line in result.stdout.split() if line)
+
+    def public_api_pod_names(self) -> list[str]:
+        name = self._public_api_deployment()
+        deployment = json.loads(
+            _require_ok(
+                self.kubectl("get", "deploy", name, "-o", "json", timeout=15),
+                f"read {name}",
+            )
+            or "{}"
+        )
+        match_labels = ((deployment.get("spec") or {}).get("selector") or {}).get("matchLabels") or {}
+        if not match_labels:
+            raise SmokeConfigurationError(f"{name} has no matchLabels selector to list its pods by")
+        selector = ",".join(f"{key}={value}" for key, value in sorted(match_labels.items()))
+        pods = json.loads(
+            _require_ok(
+                self.kubectl("get", "pods", "-l", selector, "-o", "json", timeout=15),
+                f"list {name} pods",
+            )
+            or "{}"
+        ).get("items", [])
+        names: list[str] = []
+        for pod in pods:
+            metadata = pod.get("metadata") or {}
+            if metadata.get("deletionTimestamp"):
+                continue
+            status = pod.get("status") or {}
+            if status.get("phase") != "Running":
+                continue
+            conditions = status.get("conditions") or []
+            if not any(
+                isinstance(condition, Mapping)
+                and condition.get("type") == "Ready"
+                and condition.get("status") == "True"
+                for condition in conditions
+            ):
+                continue
+            pod_name = metadata.get("name")
+            if isinstance(pod_name, str) and pod_name:
+                names.append(_kube_node_name(pod_name))
+        return sorted(names)
+
+    def open_public_api_pod_forward(self, pod_name: str) -> tuple[str, Callable[[], None]]:
+        self._require_isolated_kind("public API pod port-forward")
+        validated_pod = _kube_node_name(pod_name)
+        command = [
+            "kubectl",
+            "port-forward",
+            f"pod/{validated_pod}",
+            "0:8080",
+            "-n",
+            KIND_NAMESPACE,
+            "--context",
+            self.config.context,
+        ]
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        port_box: list[int | None] = [None]
+        output_lines: list[str] = []
+        ready = threading.Event()
+
+        def drain_output() -> None:
+            assert process.stdout is not None
+            for line in process.stdout:
+                if len(output_lines) < 20:
+                    output_lines.append(line.rstrip())
+                if port_box[0] is None:
+                    match = re.search(r"Forwarding from 127\.0\.0\.1:(\d+)\s*->", line)
+                    if match is not None:
+                        port_box[0] = int(match.group(1))
+                        ready.set()
+            ready.set()
+
+        reader = threading.Thread(
+            target=drain_output,
+            name=f"port-forward-{validated_pod}",
+            daemon=True,
+        )
+        reader.start()
+
+        closed = False
+        close_lock = threading.Lock()
+
+        def close() -> None:
+            nonlocal closed
+            with close_lock:
+                if closed:
+                    return
+                closed = True
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+
+        if not ready.wait(timeout=15) or port_box[0] is None:
+            close()
+            detail = "; ".join(output_lines) or "<no output>"
+            raise RuntimeError(
+                f"kubectl port-forward to {validated_pod} did not bind within 15s: {detail}"
+            )
+        return f"http://127.0.0.1:{port_box[0]}", close
+
+    def pause_kube_scheduler(self, nodes: Sequence[str]) -> None:
+        self._require_isolated_kind("kube-scheduler pause")
+        validated = list(dict.fromkeys(_kube_node_name(node) for node in nodes))
+        if not validated:
+            raise ValueError("refusing to pause kube-scheduler on an empty node list")
+        action = "pausing kube-scheduler"
+        ownership = self._held_public_api_lease(action)
+        existing_raw = self._lease_annotation(ownership, PAUSED_SCHEDULER_ANNOTATION)
+        existing = (
+            _recorded_paused_scheduler_nodes(existing_raw) if existing_raw is not None else []
+        )
+        merged = list(dict.fromkeys([*existing, *validated]))
+        record: dict[str, str | None] = {}
+        if merged != existing:
+            record[PAUSED_SCHEDULER_ANNOTATION] = json.dumps(merged)
+        self._renew_lease(ownership, action, record)
+        for node in validated:
+            _require_ok(
+                self._docker_exec(node, "pkill", "-STOP", "-x", "kube-scheduler", timeout=15),
+                f"pause kube-scheduler on {node}",
+            )
+
+    def resume_kube_scheduler(self, nodes: Sequence[str]) -> None:
+        self._require_isolated_kind("kube-scheduler resume")
+        validated = list(dict.fromkeys(_kube_node_name(node) for node in nodes))
+        action = "resuming kube-scheduler"
+        ownership = self._held_public_api_lease(action)
+        existing_raw = self._lease_annotation(ownership, PAUSED_SCHEDULER_ANNOTATION)
+        existing = (
+            _recorded_paused_scheduler_nodes(existing_raw) if existing_raw is not None else []
+        )
+        self._renew_lease(ownership, action)
+        self._resume_kube_scheduler_processes(validated)
+        resumed_set = set(validated)
+        remaining = [node for node in existing if node not in resumed_set]
+        updated_value = json.dumps(remaining) if remaining else None
+        if updated_value != existing_raw:
+            self._renew_lease(
+                ownership,
+                "updating the paused kube-scheduler record",
+                {PAUSED_SCHEDULER_ANNOTATION: updated_value},
+            )
+
+    def _resume_kube_scheduler_processes(self, nodes: Sequence[str]) -> None:
+        self._require_isolated_kind("kube-scheduler resume")
+        for node in nodes:
+            container = self._kind_node_container(node)
+            result = self._docker_exec(node, "pkill", "-CONT", "-x", "kube-scheduler", timeout=15)
+            if result.returncode == 0:
+                continue
+            if result.returncode != 1:
+                _require_ok(result, f"resume kube-scheduler on {node}")
+                continue
+            # `docker exec` also exits 1 on a paused/stopped container or daemon
+            # error, not only when `pkill` matched zero processes (kubelet
+            # restarting the static pod). Confirm the node container is running
+            # and unpaused, then check in-container process presence so a paused
+            # scheduler never clears `PAUSED_SCHEDULER_ANNOTATION`.
+            inspect = self.executor.run(
+                ["docker", "inspect", "-f", "{{.State.Running}} {{.State.Paused}}", container],
+                timeout=15,
+            )
+            state = _require_ok(inspect, f"inspect Kind node container {container}").strip()
+            if state != "true false":
+                raise RuntimeError(
+                    f"cannot confirm kube-scheduler resumed on {node}: container state is {state!r} "
+                    f"(pkill detail: {result.detail() or '<no output>'})"
+                )
+            probe = self._docker_exec(
+                node,
+                "sh",
+                "-c",
+                "if pgrep -x kube-scheduler >/dev/null; then printf present; else printf absent; fi",
+                timeout=15,
+            )
+            presence = _require_ok(
+                probe, f"check kube-scheduler process presence on {node}"
+            ).strip()
+            if presence == "absent":
+                continue
+            if presence == "present":
+                _require_ok(
+                    self._docker_exec(node, "pkill", "-CONT", "-x", "kube-scheduler", timeout=15),
+                    f"resume restarted kube-scheduler on {node}",
+                )
+                continue
+            raise RuntimeError(
+                f"unexpected kube-scheduler presence probe output {presence!r} on {node}"
+            )
+
+    def unscheduled_sandbox_pod_names(self) -> list[str]:
+        result = self.kubectl(
+            "get",
+            "pods",
+            "-l",
+            KIND_MANAGED_SANDBOX_POD_SELECTOR,
+            "-o",
+            "json",
+            timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        _require_ok(result, "list sandbox pods for unscheduled backlog")
+        items = json.loads(result.stdout or "{}").get("items", [])
+        names: list[str] = []
+        for item in items:
+            metadata = item.get("metadata") or {}
+            if metadata.get("deletionTimestamp"):
+                continue
+            spec = item.get("spec") or {}
+            if spec.get("nodeName"):
+                continue
+            status = item.get("status") or {}
+            if status.get("phase") in ("Succeeded", "Failed"):
+                continue
+            conditions = status.get("conditions") or []
+            if any(
+                isinstance(condition, Mapping)
+                and condition.get("type") == "PodScheduled"
+                and condition.get("status") == "False"
+                and condition.get("reason") == "Unschedulable"
+                for condition in conditions
+            ):
+                continue
+            name = metadata.get("name")
+            if isinstance(name, str) and name:
+                names.append(name)
+        return sorted(names)
 
     # --- admin console ---------------------------------------------------------
     #
@@ -10310,6 +10583,7 @@ class EcwSdk:
         client_id: str,
         timeout: float,
         gate: Callable[[], None] | None = None,
+        api_url: str | None = None,
     ) -> LimiterProbeOutcome:
         """One raw request for `client_id`, classified with its Retry-After and body."""
 
@@ -10320,7 +10594,12 @@ class EcwSdk:
             headers.pop("Content-Type", None)
         else:
             data = json.dumps(dict(body)).encode()
-        request = Request(self.config.api_endpoint(path), data=data, headers=headers, method=method)
+        endpoint = (
+            f"{api_url.rstrip('/')}/{path.lstrip('/')}"
+            if api_url is not None
+            else self.config.api_endpoint(path)
+        )
+        request = Request(endpoint, data=data, headers=headers, method=method)
         if gate is not None:
             gate()
         try:

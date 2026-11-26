@@ -454,6 +454,7 @@ class SmokeServices:
             fixture._cross_node_control = cast(Any, kind)
             fixture._concurrent_restore_control = cast(Any, kind)
             fixture._rate_limiter_control = cast(Any, kind)
+            fixture._unscheduled_pod_backlog_control = cast(Any, kind)
             fixture._node_group_control = cast(Any, kind)
             fixture._node_selector_extras_control = cast(Any, kind)
             fixture._node_fence_control = cast(Any, kind)

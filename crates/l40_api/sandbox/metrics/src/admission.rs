@@ -52,6 +52,10 @@ pub enum AdmissionRejectReason {
     /// The slot check found every start-eligible node with all its network
     /// slots held. Accompanies a `Rejected` decision answered with a 503.
     NoFreeSlot,
+    /// Unscheduled sandbox pods waiting on `kube-scheduler` reached the
+    /// configured backlog ceiling. Accompanies a `Rejected` decision answered
+    /// with a 503.
+    UnscheduledPodBacklog,
     /// The shared token-bucket store (Redis) was reachable but a runtime op
     /// (pool checkout / `EVALSHA`) failed. The cluster limiter fails open, so
     /// this accompanies an `Accepted` decision: admitted despite the store
@@ -78,6 +82,7 @@ impl AdmissionRejectReason {
             Self::Disabled => "disabled",
             Self::EmptyCluster => "empty_cluster",
             Self::NoFreeSlot => "no_free_slot",
+            Self::UnscheduledPodBacklog => "unscheduled_pod_backlog",
             Self::StoreUnavailable => "store_unavailable",
             Self::Misconfigured => "misconfigured",
             Self::CapacityUnavailable => "capacity_unavailable",
@@ -303,6 +308,57 @@ pub fn cluster_slot_headroom(
 pub fn cluster_eligible_nodes(value: u64) {
     gauge(
         "cluster.sandbox_admission.rate.eligible_nodes",
+        value as f64,
+        &[tag("bucket", "sandbox_activation")],
+    );
+}
+
+metric_vocabulary! {
+    /// What the unscheduled-pod backlog check observed for one cold create:
+    /// whether the backlog is under its ceiling, over it, held over it across a
+    /// bounded watch outage, or unreadable.
+    ClusterUnscheduledPodBacklog {
+        WithinLimit => "within_limit",
+        OverLimit => "over_limit",
+        /// The sandbox-pod watch errored or is mid-re-list within the bounded
+        /// stale-hold window after observing a backlog at or above the ceiling,
+        /// so cold creates remain shed across a transient apiserver brownout.
+        OverLimitStale => "over_limit_stale",
+        /// The substrate runs no Kubernetes pods (Direct).
+        Unsupported => "unsupported",
+        PodCacheCold => "pod_cache_cold",
+        /// The sandbox-pod watch errored or is mid-re-list and either the last
+        /// snapshot was below the ceiling or the bounded stale-hold window
+        /// expired, so admission fails open rather than wedging cold creates.
+        PodCacheStale => "pod_cache_stale",
+    }
+}
+
+/// Written once per cold create when the unscheduled-pod backlog ceiling is
+/// configured, after the empty-cluster and slot-headroom checks and before the
+/// shared token bucket. `OverLimit` and `OverLimitStale` also emit an
+/// `unscheduled_pod_backlog` rejection in [`cluster_decision`]; every other
+/// reading leaves the decision to the gates after it.
+pub fn cluster_unscheduled_pod_backlog(
+    operation_class: AdmissionOperationClass,
+    backlog: ClusterUnscheduledPodBacklog,
+) {
+    counter(
+        "cluster.sandbox_admission.unscheduled_pod_backlog",
+        1,
+        &[
+            tag("operation_class", operation_class.as_str()),
+            tag("backlog", backlog),
+        ],
+    );
+}
+
+/// Unscheduled sandbox pods waiting on `kube-scheduler`, emitted when the
+/// backlog check reads a fresh reflector snapshot. Omitted while the cache is
+/// cold or stale so a broken watch doesn't flatline at an outdated count.
+pub fn cluster_unscheduled_pods(value: u64) {
+    gauge(
+        "cluster.sandbox_admission.unscheduled_pods",
         value as f64,
         &[tag("bucket", "sandbox_activation")],
     );

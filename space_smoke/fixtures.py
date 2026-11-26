@@ -57,6 +57,7 @@ from space_smoke.capabilities import (
     SandboxNetworkIsolationControl,
     StorageExchangeControl,
     TelemetryBackendControl,
+    UnscheduledPodBacklogControl,
     LeaderElectionControl,
     RestoreFailure,
     RestorePodRead,
@@ -136,6 +137,7 @@ from space_smoke.execution_environment import (
 from space_smoke.runtime_upgrade_campaign import CampaignControl, TemplateCampaignAssertions
 from space_smoke.drain_gate import DrainGateAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
+from space_smoke.unscheduled_pod_backlog import UnscheduledPodBacklogAssertions
 from space_smoke.sandbox_network_isolation import SandboxNetworkIsolationAssertions
 from space_smoke.storage_exchange import StorageExchangeScopingAssertions
 from space_smoke.stopped_replacement import StoppedReplacementAssertions
@@ -3004,6 +3006,13 @@ class KindAdmin(ScenarioFixture):
             raise SmokeConfigurationError("the fixture template is unknown")
         return self._template_selector.split("@", 1)[0].split(":", 1)[0]
 
+    def sandbox_template_selector(self) -> str:
+        """The full template selector (preserving any tag or digest) selected for this scenario."""
+
+        if not self._template_selector:
+            raise SmokeConfigurationError("the fixture template is unknown")
+        return self._template_selector
+
 
 class KindNetworkEcw(Ecw):
     """ECW plus live gateway observation on either Kind substrate.
@@ -3383,6 +3392,26 @@ class KindEcw(Ecw, KindAdmin):
                 self, self._rate_limiter_control, self._rate_limit_probe, self._context.scope
             )
         return self._rate_limiter_assertions
+
+    _unscheduled_pod_backlog_control: UnscheduledPodBacklogControl | None = None
+    _unscheduled_pod_backlog_assertions: UnscheduledPodBacklogAssertions | None = None
+
+    @property
+    def unscheduled_pod_backlog(self) -> UnscheduledPodBacklogAssertions:
+        """Privileged assertions for the unscheduled-pod backlog circuit breaker."""
+
+        if self._unscheduled_pod_backlog_control is None or self._rate_limit_probe is None:
+            raise SmokeConfigurationError(
+                "unscheduled-pod backlog control is only available on the kind backend"
+            )
+        if self._unscheduled_pod_backlog_assertions is None:
+            self._unscheduled_pod_backlog_assertions = UnscheduledPodBacklogAssertions(
+                self,
+                self._unscheduled_pod_backlog_control,
+                self._rate_limit_probe,
+                self._context.scope,
+            )
+        return self._unscheduled_pod_backlog_assertions
 
     _execution_environment: ExecutionEnvironmentAdmission | None = None
 

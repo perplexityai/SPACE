@@ -31,6 +31,7 @@ mod node_instance;
 mod runtime_upgrade_dispatch;
 mod slot_headroom;
 mod substrate_scope;
+mod unscheduled_backlog;
 
 mod kubernetes_tests {
 

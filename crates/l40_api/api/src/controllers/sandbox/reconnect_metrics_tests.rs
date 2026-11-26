@@ -150,8 +150,8 @@ fn reconnect_tags_classify_deferred_restore_admission_rejection() {
     // direct-wake admission 429 (exhausted/wait_budget), not the generic
     // `rejected/unavailable`, so restore-path and direct-wake admission
     // rejections don't split across two outcome/reason series.
-    // The substrate's charges never run the slot check, so `NoFreeSlot`
-    // can't arrive this way.
+    // The substrate's charges never run the cold-create capacity gates, so
+    // `NoFreeSlot` and `UnscheduledPodBacklog` can't arrive this way.
     for kind in [
         ActivationRejectionKind::RateLimited,
         ActivationRejectionKind::EmptyCluster,

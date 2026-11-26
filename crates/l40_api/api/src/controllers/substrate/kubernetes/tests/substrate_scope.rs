@@ -224,6 +224,7 @@ async fn control_runtime_client_admits_the_fallback_wake_it_runs() -> TestResult
                 burst: 60.0,
                 redis_url: None,
                 slot_check_enabled: false,
+                ..Default::default()
             },
             pplx_space_feature_flags::FeatureFlagClient::disabled(),
         );

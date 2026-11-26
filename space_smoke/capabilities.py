@@ -545,6 +545,7 @@ class RateLimitProbe(Protocol):
         client_id: str,
         timeout: float,
         gate: Callable[[], None] | None = None,
+        api_url: str | None = None,
     ) -> LimiterProbeOutcome: ...
 
     def kill_matching(self, metadata: Mapping[str, str]) -> None: ...
@@ -552,6 +553,14 @@ class RateLimitProbe(Protocol):
     def kill_sandbox(self, sandbox_id: str) -> None:
         """ECW kill of one bare sandbox uuid, not-found counting as done."""
         ...
+
+    def list_pages(
+        self,
+        metadata: Mapping[str, str],
+        *,
+        limit: int,
+        max_pages: int,
+    ) -> EcwSandboxPages: ...
 
 
 class RateLimiterControl(Protocol):
@@ -583,6 +592,53 @@ class RateLimiterControl(Protocol):
     def wait_redis_unreachable(self, *, timeout: float) -> None: ...
 
     def wait_redis_rollout(self, *, timeout: float) -> None: ...
+
+
+class UnscheduledPodBacklogControl(Protocol):
+    """Kind-only operations for the unscheduled-pod backlog circuit-breaker scenario.
+
+    The public API's admission env and paused control-plane scheduler nodes
+    share the public-API mutation Lease so an interrupted run repairs both
+    before the next Kind scenario starts.
+    """
+
+    def acquire_public_api_mutation(self) -> Callable[[], None]: ...
+
+    def public_api_env(self, keys: Sequence[str]) -> dict[str, str | None]: ...
+
+    def set_public_api_env(self, overrides: Mapping[str, str]) -> None: ...
+
+    def restore_public_api_env(self, standing: Mapping[str, str | None]) -> None: ...
+
+    def wait_public_api_ready(self, *, timeout: float) -> None: ...
+
+    def control_plane_nodes(self) -> list[str]:
+        """Control-plane nodes hosting `kube-scheduler` (`node-role.kubernetes.io/control-plane`)."""
+        ...
+
+    def public_api_pod_names(self) -> list[str]:
+        """Ready, non-deleting `space-api` pod names serving the public API Deployment."""
+        ...
+
+    def open_public_api_pod_forward(
+        self, pod_name: str
+    ) -> tuple[str, Callable[[], None]]:
+        """Forward an ephemeral loopback port to `pod_name:8080`, returning `(api_url, close)`."""
+        ...
+
+    def pause_kube_scheduler(self, nodes: Sequence[str]) -> None:
+        """SIGSTOP `kube-scheduler` on `nodes` after recording all paused nodes on the Lease."""
+        ...
+
+    def resume_kube_scheduler(self, nodes: Sequence[str]) -> None:
+        """SIGCONT `kube-scheduler` on `nodes` and remove resumed nodes from the Lease record."""
+        ...
+
+    def unscheduled_sandbox_pod_names(self) -> list[str]:
+        """`space-api`-managed sandbox pods in `sandboxes` counted as unscheduled scheduler backlog."""
+        ...
+
+    def sandbox_pods(self, sandbox_id: str) -> list[SandboxPodView]: ...
 
 
 @dataclass(frozen=True)

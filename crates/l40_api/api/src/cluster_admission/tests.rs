@@ -906,3 +906,104 @@ async fn a_cluster_id_rule_switches_off_only_the_cluster_it_names() {
         }
     }
 }
+
+#[test]
+fn unscheduled_pod_backlog_config_parses_disable_sentinels_and_sanitizes_zero_duration() {
+    for off in ["", "  ", "0"] {
+        assert_eq!(
+            parse_optional_nonzero_u64("SPACE_TEST_MAX_UNSCHEDULED", off),
+            None,
+            "{off:?}"
+        );
+    }
+    assert_eq!(
+        parse_optional_nonzero_u64("SPACE_TEST_MAX_UNSCHEDULED", "250"),
+        std::num::NonZeroU64::new(250)
+    );
+    for invalid in ["-1", "abc", "1.5"] {
+        assert_eq!(
+            parse_optional_nonzero_u64("SPACE_TEST_MAX_UNSCHEDULED", invalid),
+            None,
+            "{invalid:?}"
+        );
+    }
+
+    let default_stale = Some(Duration::from_secs(30));
+    assert_eq!(
+        parse_optional_duration_secs("SPACE_TEST_MAX_STALE", "", default_stale),
+        default_stale
+    );
+    assert_eq!(
+        parse_optional_duration_secs("SPACE_TEST_MAX_STALE", "0", default_stale),
+        None
+    );
+    assert_eq!(
+        parse_optional_duration_secs("SPACE_TEST_MAX_STALE", "45", default_stale),
+        Some(Duration::from_secs(45))
+    );
+    assert_eq!(
+        parse_optional_duration_secs("SPACE_TEST_MAX_STALE", "bad", default_stale),
+        default_stale
+    );
+
+    let sanitized = sanitize_config(ClusterSandboxAdmissionConfig {
+        unscheduled_pod_max_stale: Some(Duration::ZERO),
+        ..ClusterSandboxAdmissionConfig::default()
+    });
+    assert_eq!(sanitized.unscheduled_pod_max_stale, None);
+}
+
+#[cfg(feature = "kubernetes")]
+#[tokio::test]
+async fn unscheduled_pod_backlog_refuses_before_spending_redis_bucket_token() -> TestResult {
+    let Some((_node, url)) = try_redis_url().await? else {
+        return Ok(());
+    };
+    // Isolate from the other tests that exercise the fixed SANDBOX_ACTIVATION_BUCKET
+    // key on logical DBs 0 and 1 of the shared test Redis server.
+    let url = format!("{}/2", url.trim_end_matches('/'));
+    let bucket = RedisTokenBucket::from_url(&url)?;
+    bucket.clear(super::SANDBOX_ACTIVATION_BUCKET).await?;
+    let pool = PgPool::connect_lazy("postgres://unused").expect("lazy pool");
+    let labels = pplx_space_sandbox_pod::SandboxPodConfigValues::default()
+        .base_node_selector()
+        .into_labels();
+    let ready_node = crate::controllers::substrate::kubernetes::tests::node_with_network_slots(
+        "ready-node",
+        labels,
+        Some(8),
+        None,
+        true,
+        false,
+    );
+    let pending: k8s_openapi::api::core::v1::Pod = serde_json::from_value(serde_json::json!({
+        "metadata": { "name": "pending-sbx", "namespace": "space" },
+        "spec": { "containers": [] },
+        "status": { "phase": "Pending" },
+    }))
+    .expect("valid pod");
+    let substrate = crate::test_support::kubernetes::kubernetes(
+        crate::controllers::substrate::kubernetes::tests::substrate_with_inventory_caches_and_pool(
+            vec![pending],
+            vec![(*ready_node).clone()],
+            pool,
+        ),
+    );
+    let config = ClusterSandboxAdmissionConfig {
+        refill_rps: 0.001,
+        burst: 1.0,
+        max_unscheduled_pods: std::num::NonZeroU64::new(1),
+        ..enabled_config()
+    };
+    let adm = admission(substrate, config, Some(bucket.clone()));
+
+    let error = adm
+        .admit_cold_create()
+        .await
+        .expect_err("backlog at ceiling must refuse before touching Redis");
+    assert_eq!(error.kind(), ActivationRejectionKind::UnscheduledPodBacklog);
+
+    // The single token in the bucket must still be available for a non-cold activation.
+    adm.admit_activation(ClusterActivationClass::Cold).await?;
+    Ok(())
+}
