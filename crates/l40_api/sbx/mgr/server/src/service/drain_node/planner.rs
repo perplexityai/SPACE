@@ -395,6 +395,21 @@ impl PlanInputs {
             .and(self.last_failure(sandbox_id, DrainAction::Upload))
     }
 
+    /// Whether `action`'s last attempt failed under this generation: for an
+    /// upload, whether the last upload that failed for its sandbox was of
+    /// its artifact.
+    fn last_attempt_failed(&self, action: &PlannedAction) -> bool {
+        let (sandbox_id, kind) = action.target();
+        self.failures
+            .get(&(sandbox_id.to_owned(), kind))
+            .is_some_and(|last| match action {
+                PlannedAction::Upload { artifact_id, .. } => {
+                    last.artifact.as_deref() == Some(artifact_id.as_str())
+                }
+                PlannedAction::Suspend { .. } | PlannedAction::PublishSnapshot { .. } => true,
+            })
+    }
+
     /// The row's pinned artifact, while it is still without a durable copy.
     fn pending_pin(&self, row: &DrainRow) -> Option<(String, ArtifactKind)> {
         row.pin.clone().filter(|(artifact, _)| {
@@ -863,7 +878,11 @@ struct Windowed {
 /// snapshot publication or a pin's upload retry. Within a pass every VM is
 /// admitted before any of them; one already started holds its slot until its
 /// upload job ends, failed attempts and backoff included, as any pin upload
-/// does.
+/// does. Within each tier, work whose last attempt failed under this
+/// generation comes after work with no recorded failure, then each by
+/// sandbox id. Work that fails fast (a suspend refused at once, an upload
+/// whose enqueue fails) holds no slot by the next pass, and would otherwise
+/// take the free one again on every pass ahead of the rest of its tier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(super) enum WindowOrder {
     PausedVm,
@@ -888,11 +907,13 @@ impl DrainPlan {
     }
 
     /// Start the windowed actions in `waiting` while the window has room,
-    /// in [`WindowOrder`], and a suspend only while the cache disk still
-    /// covers its snapshot beside what the running suspends reserve.
-    /// `in_flight` is how many sandboxes hold a slot and `committed` the
-    /// bytes reserved. The rest wait, queued for the window or for the disk; what starts
-    /// instead of a suspend waiting for disk waits for the no-VM tier.
+    /// in [`WindowOrder`] (within a tier, work whose last attempt failed
+    /// after the rest, then by sandbox id), and a suspend only while the
+    /// cache disk still covers its snapshot beside what the running suspends
+    /// reserve. `in_flight` is how many sandboxes hold a slot and `committed`
+    /// the bytes reserved. The rest wait, queued for the window or for the
+    /// disk; what starts instead of a suspend waiting for disk waits for the
+    /// no-VM tier.
     fn start_in_window(
         &mut self,
         inputs: &PlanInputs,
@@ -900,7 +921,13 @@ impl DrainPlan {
         mut in_flight: usize,
         mut committed: u64,
     ) {
-        let order = |windowed: &Windowed| (windowed.order, windowed.action.target().0.to_owned());
+        let order = |windowed: &Windowed| {
+            (
+                windowed.order,
+                inputs.last_attempt_failed(&windowed.action),
+                windowed.action.target().0.to_owned(),
+            )
+        };
         let (mut vms, mut no_vm): (Vec<_>, Vec<_>) = waiting
             .into_iter()
             .partition(|windowed| windowed.order != WindowOrder::Artifact);

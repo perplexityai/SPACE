@@ -1187,6 +1187,60 @@ fn a_pin_upload_retry_waits_for_a_window_slot() {
     assert_eq!(waits(&roomy), expect(&[("r", "suspend"), ("u", "upload")]));
 }
 
+/// Work whose last attempt failed fast, holding no slot by the next pass,
+/// waits behind its tier's work with no failure recorded rather than taking
+/// the one free slot again on every pass: a pin's upload whose enqueue fails
+/// behind a snapshot's publication, a paused VM whose suspend fails behind
+/// another paused VM. Ties among the failed go by sandbox id, and a failed
+/// VM still starts before the work that holds no VM.
+#[test]
+fn work_that_failed_fast_waits_behind_its_tier_for_the_last_slot() {
+    let publish = |id: &str| PlannedAction::PublishSnapshot {
+        sandbox_id: id.into(),
+    };
+    let cases = [
+        (
+            vec![pinned_suspended("a"), row("b", SandboxState::Suspended)],
+            pending("a", FULL_ARTIFACT),
+            vec![pin_upload("a"), publish("b")],
+        ),
+        (
+            vec![
+                row("p1", SandboxState::Paused),
+                row("p2", SandboxState::Paused),
+                row("c", SandboxState::Suspended),
+            ],
+            BTreeMap::new(),
+            vec![suspend("p1"), suspend("p2"), suspend("p1")],
+        ),
+    ];
+    for (rows, pending_backups, passes) in cases {
+        let generation = 7;
+        let actions = DrainActions::default();
+        for (pass, admitted) in passes.into_iter().enumerate() {
+            let planned = plan(
+                &rows,
+                &PlanInputs {
+                    window: 1,
+                    pending_backups: pending_backups.clone(),
+                    failures: actions.failures(generation),
+                    ..PlanInputs::default()
+                },
+            );
+            assert_eq!(
+                planned.actions,
+                std::slice::from_ref(&admitted),
+                "pass {pass}"
+            );
+            // It fails at once, leaving nothing that holds a slot by the
+            // next pass.
+            let id = admitted.target().0;
+            assert!(actions.start(id, admitted.running()));
+            actions.finish(generation, id, Some("refused at once".into()));
+        }
+    }
+}
+
 /// The pass starts one action per sandbox, its VM's suspend or its
 /// snapshot's publication ahead of the upload of another of its artifacts
 /// (a named snapshot here), so the suspend the window admits starts and an
@@ -3385,6 +3439,8 @@ fn the_drain_window_reads_a_positive_number_or_the_default() {
         (Some("13"), MAX_DRAIN_NODE_WINDOW),
         (Some("1000"), MAX_DRAIN_NODE_WINDOW),
         (Some("99999999999999999999999"), MAX_DRAIN_NODE_WINDOW),
+        (Some("+99999999999999999999999"), MAX_DRAIN_NODE_WINDOW),
+        (Some("99999999999999999999999ms"), DEFAULT_DRAIN_NODE_WINDOW),
         (Some("0"), DEFAULT_DRAIN_NODE_WINDOW),
         (Some("-1"), DEFAULT_DRAIN_NODE_WINDOW),
         (Some("eight"), DEFAULT_DRAIN_NODE_WINDOW),

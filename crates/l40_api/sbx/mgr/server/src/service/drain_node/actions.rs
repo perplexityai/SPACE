@@ -51,8 +51,18 @@ pub(super) fn drain_node_window(raw: Option<&str>) -> usize {
     let Some(raw) = raw else {
         return DEFAULT_DRAIN_NODE_WINDOW;
     };
-    let parsed = match raw.trim().parse::<usize>() {
-        Err(error) if *error.kind() == std::num::IntErrorKind::PosOverflow => Some(usize::MAX),
+    let trimmed = raw.trim();
+    // The parser reports an overflow as soon as the digits overflow, before
+    // it reaches a trailing non-digit, so only a value of digits alone is a
+    // number too large.
+    let digits = trimmed.strip_prefix('+').unwrap_or(trimmed);
+    let parsed = match trimmed.parse::<usize>() {
+        Err(error)
+            if *error.kind() == std::num::IntErrorKind::PosOverflow
+                && digits.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            Some(usize::MAX)
+        }
         parsed => parsed.ok().filter(|window| *window > 0),
     };
     match parsed {
