@@ -29,8 +29,11 @@ PATH = "/tmp/space-smoke-v2-drain.txt"
     # Three suspends, their uploads, three wakes and the drained edge on a
     # slow KVM bench.
     timeout_minutes=45,
-    tier="manual",
-    manual_reason="kept manual until it has several consecutive clean runs on Kind, after which it can return to the per-merge set",
+    # Routine, the one drain v2 scenario in the per-merge set: Kind runs drain
+    # v2, so the v1 drain scenarios skip there. A shard runs one scenario at
+    # a time against its own cluster, so nothing else runs beside the drain;
+    # it uncordons both workers and cancels its drain before it ends.
+    tier="routine",
 )
 def v2_drain_evacuates_every_resident(test: smoke.CommandSandboxFixture) -> None:
     """A v2 `:drain`, due now, of a worker holding two started sandboxes (one

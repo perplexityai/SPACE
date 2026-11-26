@@ -132,11 +132,12 @@ _DURATION_SECONDS = {
         "native.resident_pause": 5,
         "native.stopped_restart_preserves_rootfs": 68,
         # The drain set, which runs by name and splits across benches with
-        # `space_smoke list --prefix native.v2_ --shard I/N`: the median of
-        # three local Kind runs each (2026-11-25, `smoke-kind-parallel.sh
-        # --repeat 3` on four benches of a 32-core host, Kind's drain v2
-        # values), setup and cleanup included. Replace with CI medians once
-        # CI runs them.
+        # `space_smoke list --prefix native.v2_ --shard I/N`, but for
+        # native.v2_drain_evacuates_every_resident, which is routine too: the
+        # median of three local Kind runs each (2026-11-25,
+        # `smoke-kind-parallel.sh --repeat 3` on four benches of a 32-core
+        # host, Kind's drain v2 values), setup and cleanup included. Replace
+        # with CI medians once CI runs them.
         "native.v2_drain_evacuates_every_resident": 75,
         "native.v2_drain_holds_running_until_its_deadline": 122,
         "native.v2_drain_keeps_a_live_node_with_a_stale_instance": 289,
