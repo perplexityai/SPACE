@@ -93,7 +93,7 @@ async fn a_claim_write_under_a_lost_claim_changes_nothing() -> TestResult {
     assert!(!operations::renew_claim(pool, operation_id, &token, generation - 1).await?);
     let mut tx = pool.begin().await?;
     assert_eq!(
-        operations::claimed_kind_locked(&mut tx, operation_id, "other").await?,
+        operations::claimed_kind_locked(&mut *tx, operation_id, "other").await?,
         None
     );
     tx.rollback().await?;
@@ -116,7 +116,7 @@ async fn a_claim_write_under_a_lost_claim_changes_nothing() -> TestResult {
     );
     let mut tx = pool.begin().await?;
     assert_eq!(
-        operations::claimed_kind_locked(&mut tx, operation_id, &token)
+        operations::claimed_kind_locked(&mut *tx, operation_id, &token)
             .await?
             .as_deref(),
         Some(OperationKind::ResumeSandbox.as_str())
@@ -179,7 +179,7 @@ async fn a_finished_operation_takes_no_terminal_write_or_requeue() -> TestResult
     );
     let mut tx = pool.begin().await?;
     assert_eq!(
-        operations::claimed_kind_locked(&mut tx, finished, &token).await?,
+        operations::claimed_kind_locked(&mut *tx, finished, &token).await?,
         None
     );
     tx.rollback().await?;
@@ -221,13 +221,13 @@ async fn the_claim_does_not_take_over_a_live_claim() -> TestResult {
     let before = operation_row(pool, operation_id).await?;
 
     let mut tx = pool.begin().await?;
-    let live = claim_queue::claim_due(&mut tx, resume_claim(3_600)).await?;
+    let live = claim_queue::claim_due(&mut *tx, resume_claim(3_600)).await?;
     assert!(live.operations.is_empty());
     tx.commit().await?;
     assert_eq!(operation_row(pool, operation_id).await?, before);
 
     let mut tx = pool.begin().await?;
-    let stale = claim_queue::claim_due(&mut tx, resume_claim(0)).await?;
+    let stale = claim_queue::claim_due(&mut *tx, resume_claim(0)).await?;
     let taken = stale
         .operations
         .into_iter()

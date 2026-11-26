@@ -10,6 +10,12 @@ pub(crate) enum ResponseAdmissionError {
     Conflict,
 }
 
+impl From<pplx_space_postgres_pool::DbError> for ResponseAdmissionError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 pub(crate) struct PublicResponseAdmission {
     tx: Transaction<'static, Postgres>,
     org_id: OrgId,

@@ -6,6 +6,7 @@
 //! ([`try_lock_claims`]) is the caller's to take, in the transaction the
 //! claim runs in.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_public_api::{OperationKind, OperationState, OperationTargetType};
 use pplx_space_sql_locator::sql;
 use sqlx::{FromRow, Row};
@@ -17,12 +18,16 @@ use crate::operations::{ClaimedPublicOperationRow, kind_labels};
 /// keyed claims, without waiting, and turn off JIT for the rest of the
 /// transaction in the same round trip. `false` means another transaction
 /// holds the lock. A lock taken lasts until the caller's transaction ends.
-pub async fn try_lock_claims(conn: &mut sqlx::PgConnection, key: i64) -> Result<bool, sqlx::Error> {
+/// The caller must pass its open transaction.
+pub async fn try_lock_claims<C>(conn: &mut C, key: i64) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let (claim_lock_held, _jit) = sqlx::query_as::<_, (bool, String)>(sql!(
         "SELECT pg_try_advisory_xact_lock($1), set_config('jit', 'off', true)"
     ))
     .bind(key)
-    .fetch_one(&mut *conn)
+    .fetch_one(conn.into_sqlx())
     .await?;
     Ok(claim_lock_held)
 }
@@ -78,7 +83,7 @@ pub struct DueClaimRow {
 pub struct DueClaimed {
     /// The claimed operations, each row decoded into its own result, so
     /// the caller meets a row that fails to decode in its turn.
-    pub operations: Vec<Result<DueClaimRow, sqlx::Error>>,
+    pub operations: Vec<Result<DueClaimRow, DbError>>,
     /// With nothing claimed, whether other work was due and the
     /// organization limit held all of it back.
     pub org_limit_held_back: bool,
@@ -139,10 +144,11 @@ pub struct DueClaimed {
 /// for the next claim. When it claims nothing, the statement returns
 /// one row with no operation, whose `org_limit_held_back` says whether
 /// other work was due and the organization limit held all of it back.
-pub async fn claim_due(
-    conn: &mut sqlx::PgConnection,
-    claim: DueClaim<'_>,
-) -> Result<DueClaimed, sqlx::Error> {
+/// The caller must pass its open transaction.
+pub async fn claim_due<C>(conn: &mut C, claim: DueClaim<'_>) -> Result<DueClaimed, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let rows = sqlx::query(sql!(
         "WITH shared AS (
              SELECT org_id, target_id
@@ -403,7 +409,7 @@ pub async fn claim_due(
     .bind(claim.per_org_non_teardown)
     .bind(claim.per_org_headroom)
     .bind(claim.admission_claim_token_prefix)
-    .fetch_all(&mut *conn)
+    .fetch_all(conn.into_sqlx())
     .await?;
 
     let mut operations = Vec::with_capacity(rows.len());
@@ -413,8 +419,8 @@ pub async fn claim_due(
             // The row with no operation comes back only when nothing was
             // claimed, so it is the only row.
             Ok(None) => org_limit_held_back = row.try_get("org_limit_held_back")?,
-            Ok(Some(_)) => operations.push(DueClaimRow::from_row(&row)),
-            Err(error) => operations.push(Err(error)),
+            Ok(Some(_)) => operations.push(DueClaimRow::from_row(&row).map_err(DbError::from)),
+            Err(error) => operations.push(Err(DbError::from(error))),
         }
     }
     Ok(DueClaimed {

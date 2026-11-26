@@ -13,13 +13,14 @@
 use std::sync::LazyLock;
 
 use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_public_api::{
     OperationId, OperationKind, OperationState, OperationTargetType, PublicOperationEventType,
     PublicSandboxId,
 };
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
-use sqlx::{FromRow, PgExecutor, types::Json};
+use sqlx::{FromRow, types::Json};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -101,11 +102,11 @@ pub struct AdminPublicOperationRow {
 /// Whole seconds left before `hard_deadline_secs` after `operation_id` was
 /// created, by the database clock, and never below zero.
 pub async fn remaining_deadline_secs(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     operation_id: OperationId,
     hard_deadline_secs: i64,
-) -> Result<Option<i64>, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>(sql!(
+) -> Result<Option<i64>, DbError> {
+    Ok(sqlx::query_scalar::<_, i64>(sql!(
         "SELECT GREATEST(
              0,
              FLOOR(EXTRACT(EPOCH FROM (
@@ -117,33 +118,33 @@ pub async fn remaining_deadline_secs(
     ))
     .bind(operation_id.as_uuid())
     .bind(hard_deadline_secs)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Seconds since `operation_id` was first claimed, by the database clock.
 /// `None` when it does not exist or has never been claimed.
 pub async fn secs_since_first_claim(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     operation_id: OperationId,
-) -> Result<Option<f64>, sqlx::Error> {
+) -> Result<Option<f64>, DbError> {
     let seconds = sqlx::query_scalar::<_, Option<f64>>(sql!(
         "SELECT EXTRACT(EPOCH FROM NOW() - started_at)::DOUBLE PRECISION
          FROM public_operations
          WHERE operation_id = $1"
     ))
     .bind(operation_id.as_uuid())
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(seconds.flatten())
 }
 
 /// The operation `operation_id` of `org_id`.
 pub async fn fetch(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     operation_id: OperationId,
-) -> Result<Option<PublicOperationRow>, sqlx::Error> {
+) -> Result<Option<PublicOperationRow>, DbError> {
     static FETCH_OPERATION_SQL: LazyLock<String> = LazyLock::new(|| {
         sql!(public_operation_query(
             "SELECT {public_operation_columns}
@@ -151,23 +152,25 @@ pub async fn fetch(
              WHERE org_id = $1 AND operation_id = $2"
         ))
     });
-    sqlx::query_as::<_, PublicOperationRow>(sqlx::AssertSqlSafe(FETCH_OPERATION_SQL.as_str()))
-        .bind(org_id)
-        .bind(operation_id.as_uuid())
-        .fetch_optional(executor)
-        .await
+    Ok(
+        sqlx::query_as::<_, PublicOperationRow>(sqlx::AssertSqlSafe(FETCH_OPERATION_SQL.as_str()))
+            .bind(org_id)
+            .bind(operation_id.as_uuid())
+            .fetch_optional(executor.into_sqlx())
+            .await?,
+    )
 }
 
 /// Whether `operation_id` of `org_id` is in the owner scope of `subject_id`:
 /// a native operation that subject requested, or, with no subject, one with
 /// no actor or a local actor.
 pub async fn in_owner_scope(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     subject_id: Option<UserId>,
     operation_id: OperationId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT EXISTS(
              SELECT 1 FROM public_operations op
              LEFT JOIN users actor ON actor.id = op.actor_user_id
@@ -181,8 +184,8 @@ pub async fn in_owner_scope(
     .bind(org_id)
     .bind(operation_id.as_uuid())
     .bind(subject_id)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// What a fork operation's outcome is read from.
@@ -196,36 +199,36 @@ pub struct ForkOutcomeRow {
 
 /// The state, result and terminal error of the fork operation `operation_id`.
 pub async fn fork_outcome(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     operation_id: OperationId,
-) -> Result<Option<ForkOutcomeRow>, sqlx::Error> {
-    sqlx::query_as::<_, ForkOutcomeRow>(sql!(
+) -> Result<Option<ForkOutcomeRow>, DbError> {
+    Ok(sqlx::query_as::<_, ForkOutcomeRow>(sql!(
         "SELECT state, result_json, terminal_error_code, terminal_error_json
          FROM public_operations
          WHERE org_id = $1 AND operation_id = $2 AND kind = 'fork_sandbox'"
     ))
     .bind(org_id)
     .bind(operation_id.as_uuid())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The payload of the fork operation `operation_id`.
 pub async fn fork_payload(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     operation_id: OperationId,
-) -> Result<Option<Json<serde_json::Value>>, sqlx::Error> {
-    sqlx::query_scalar::<_, Json<serde_json::Value>>(sql!(
+) -> Result<Option<Json<serde_json::Value>>, DbError> {
+    Ok(sqlx::query_scalar::<_, Json<serde_json::Value>>(sql!(
         "SELECT payload_json
          FROM public_operations
          WHERE org_id = $1 AND operation_id = $2 AND kind = 'fork_sandbox'"
     ))
     .bind(org_id)
     .bind(operation_id.as_uuid())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The state and payload of a fork operation.
@@ -237,19 +240,19 @@ pub struct ForkStateRow {
 
 /// The state and payload of the fork operation `operation_id`.
 pub async fn fork_state(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     operation_id: OperationId,
-) -> Result<Option<ForkStateRow>, sqlx::Error> {
-    sqlx::query_as::<_, ForkStateRow>(sql!(
+) -> Result<Option<ForkStateRow>, DbError> {
+    Ok(sqlx::query_as::<_, ForkStateRow>(sql!(
         "SELECT state, payload_json
          FROM public_operations
          WHERE org_id = $1 AND operation_id = $2 AND kind = 'fork_sandbox'"
     ))
     .bind(org_id)
     .bind(operation_id.as_uuid())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// A queued or running fork of a source sandbox.
@@ -262,11 +265,11 @@ pub struct ActiveForkRow {
 /// The queued or running forks of `source_sandbox_id` in `org_id`, oldest
 /// first. Forks of one source name it by either id form.
 pub async fn active_forks_of_source(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     source_sandbox_id: SandboxId,
-) -> Result<Vec<ActiveForkRow>, sqlx::Error> {
-    sqlx::query_as::<_, ActiveForkRow>(sql!(
+) -> Result<Vec<ActiveForkRow>, DbError> {
+    Ok(sqlx::query_as::<_, ActiveForkRow>(sql!(
         "SELECT operation_id, payload_json
          FROM public_operations
          WHERE org_id = $1
@@ -280,8 +283,8 @@ pub async fn active_forks_of_source(
     .bind(OperationState::Queued.as_str())
     .bind(OperationState::Running.as_str())
     .bind(PublicSandboxId::from(source_sandbox_id).to_string())
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// [`fetch`] for an admin, in any org, as an [`AdminPublicOperationRow`].
@@ -290,10 +293,10 @@ pub async fn active_forks_of_source(
 /// [`PUBLIC_OPERATION_COLUMNS`], whose fragment may only be a statement's
 /// whole `SELECT` list.
 pub async fn fetch_admin(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     operation_id: OperationId,
-) -> Result<Option<AdminPublicOperationRow>, sqlx::Error> {
-    sqlx::query_as::<_, AdminPublicOperationRow>(sql!(
+) -> Result<Option<AdminPublicOperationRow>, DbError> {
+    Ok(sqlx::query_as::<_, AdminPublicOperationRow>(sql!(
         "SELECT op.operation_id,
                     op.org_id,
                     op.actor_user_id,
@@ -323,8 +326,8 @@ pub async fn fetch_admin(
     ))
     .bind(operation_id.as_uuid())
     .bind(OperationKind::CreateSandbox.as_str())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The filters of [`list_admin`]. `None` matches every value.
@@ -342,10 +345,10 @@ pub struct AdminOperationFilter<'a> {
 /// The newest operations matching `filter`, in any org, as
 /// [`AdminPublicOperationRow`]s.
 pub async fn list_admin(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     filter: AdminOperationFilter<'_>,
-) -> Result<Vec<AdminPublicOperationRow>, sqlx::Error> {
-    sqlx::query_as::<_, AdminPublicOperationRow>(sql!(
+) -> Result<Vec<AdminPublicOperationRow>, DbError> {
+    Ok(sqlx::query_as::<_, AdminPublicOperationRow>(sql!(
         "SELECT op.operation_id,
                     op.org_id,
                     op.actor_user_id,
@@ -386,17 +389,17 @@ pub async fn list_admin(
     .bind(filter.target_ids)
     .bind(filter.limit)
     .bind(OperationKind::CreateSandbox.as_str())
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether `operation_id` exists in `org_id`.
 pub async fn exists_in_org(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     operation_id: OperationId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
         "SELECT EXISTS(
              SELECT 1
              FROM public_operations
@@ -405,16 +408,16 @@ pub async fn exists_in_org(
     ))
     .bind(org_id)
     .bind(operation_id.as_uuid())
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether `operation_id` can still run: it exists and is queued or running.
 pub async fn is_active(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     operation_id: OperationId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
         "SELECT EXISTS (
              SELECT 1
              FROM public_operations
@@ -423,19 +426,19 @@ pub async fn is_active(
          )"
     ))
     .bind(operation_id.as_uuid())
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// The target of `operation_id` when it is a `kind` operation on a
 /// `target_type` target.
 pub async fn target_id(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     operation_id: Uuid,
     kind: OperationKind,
     target_type: OperationTargetType,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>(sql!(
+) -> Result<Option<String>, DbError> {
+    Ok(sqlx::query_scalar::<_, String>(sql!(
         "SELECT target_id
          FROM public_operations
          WHERE operation_id = $1
@@ -445,19 +448,19 @@ pub async fn target_id(
     .bind(operation_id)
     .bind(kind.as_str())
     .bind(target_type.as_str())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The earliest queued or running `kind` operation on the sandbox
 /// `target_id` of `org_id`.
 pub async fn earliest_active_on_sandbox(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     kind: OperationKind,
     target_id: &str,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar::<_, Uuid>(sql!(
+) -> Result<Option<Uuid>, DbError> {
+    Ok(sqlx::query_scalar::<_, Uuid>(sql!(
         "SELECT operation_id
            FROM public_operations
           WHERE org_id = $1
@@ -471,8 +474,8 @@ pub async fn earliest_active_on_sandbox(
     .bind(org_id)
     .bind(target_id)
     .bind(kind.as_str())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// `kinds` as the labels a statement binds.
@@ -484,13 +487,13 @@ pub(crate) fn kind_labels(kinds: &[OperationKind]) -> Vec<&'static str> {
 /// `operation_id`, and of no kind in `outside_queue_kinds`, is queued or
 /// running.
 pub async fn other_active_on_sandbox(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     target_id: &str,
     outside_queue_kinds: &[OperationKind],
     operation_id: OperationId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
         "SELECT EXISTS (
              SELECT 1
                FROM public_operations
@@ -509,18 +512,18 @@ pub async fn other_active_on_sandbox(
     .bind(OperationState::Queued.as_str())
     .bind(OperationState::Running.as_str())
     .bind(operation_id.as_uuid())
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// The creates of `target`, a sandbox of `org_id`, that are still queued or
 /// running.
 pub async fn sandbox_creates_in_flight(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     target: PublicSandboxId,
-) -> Result<Vec<Uuid>, sqlx::Error> {
-    sqlx::query_scalar::<_, Uuid>(sql!(
+) -> Result<Vec<Uuid>, DbError> {
+    Ok(sqlx::query_scalar::<_, Uuid>(sql!(
         "SELECT operation_id FROM public_operations
          WHERE org_id = $1
            AND target_type = $2
@@ -534,17 +537,17 @@ pub async fn sandbox_creates_in_flight(
     .bind(OperationKind::CreateSandbox.as_str())
     .bind(OperationState::Queued.as_str())
     .bind(OperationState::Running.as_str())
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The earliest delete of `create_id`'s sandbox requested after it that is
 /// still queued or running, if `create_id` is a sandbox create.
 pub async fn superseding_delete(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     create_id: OperationId,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar::<_, Uuid>(sql!(
+) -> Result<Option<Uuid>, DbError> {
+    Ok(sqlx::query_scalar::<_, Uuid>(sql!(
         "SELECT delete_op.operation_id
          FROM public_operations create_op
          JOIN public_operations delete_op
@@ -567,8 +570,8 @@ pub async fn superseding_delete(
     .bind(OperationKind::DeleteSandbox.as_str())
     .bind(OperationState::Queued.as_str())
     .bind(OperationState::Running.as_str())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// An active operation [`joinable_on_sandbox`] found.
@@ -585,13 +588,13 @@ pub struct JoinableOperation {
 /// behind. With `joiner`, only a native one that `joiner` requested, or the
 /// system's while it is still queued.
 pub async fn joinable_on_sandbox(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     kind: OperationKind,
     target_id: &str,
     joiner: Option<UserId>,
     outside_queue_kinds: &[OperationKind],
-) -> Result<Option<JoinableOperation>, sqlx::Error> {
+) -> Result<Option<JoinableOperation>, DbError> {
     let joinable = sqlx::query_as::<_, (Uuid, bool)>(sql!(
         "SELECT active.operation_id, active.actor_user_id IS NULL
            FROM public_operations active
@@ -624,7 +627,7 @@ pub async fn joinable_on_sandbox(
     .bind(kind.as_str())
     .bind(joiner)
     .bind(kind_labels(outside_queue_kinds))
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(joinable.map(|(operation_id, system)| JoinableOperation {
         operation_id,
@@ -634,17 +637,17 @@ pub async fn joinable_on_sandbox(
 
 /// Delete the operations `operation_ids`, returning the ids deleted.
 pub async fn delete_by_ids(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     operation_ids: &[Uuid],
-) -> Result<Vec<Uuid>, sqlx::Error> {
-    sqlx::query_scalar::<_, Uuid>(sql!(
+) -> Result<Vec<Uuid>, DbError> {
+    Ok(sqlx::query_scalar::<_, Uuid>(sql!(
         "DELETE FROM public_operations
          WHERE operation_id = ANY($1::UUID[])
          RETURNING operation_id"
     ))
     .bind(operation_ids)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// A new queued operation, as [`insert`] records it.
@@ -667,9 +670,9 @@ pub struct NewOperation<'a> {
 /// Record `operation`, queued, requested at the statement's clock time
 /// rather than the transaction's start.
 pub async fn insert(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     operation: NewOperation<'_>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "INSERT INTO public_operations (
              operation_id,
@@ -701,7 +704,7 @@ pub async fn insert(
     .bind(Json(operation.payload_json))
     .bind(operation.gc_after_days.to_string())
     .bind(operation.traceparent)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -724,9 +727,9 @@ pub struct CompletedSessionCreate<'a> {
 /// Record `create`; see [`CompletedSessionCreate`]. The event's foreign key
 /// is checked at the end of the statement, after the operation row.
 pub async fn insert_completed_session_create(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     create: CompletedSessionCreate<'_>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "WITH operation AS (
          INSERT INTO public_operations (
@@ -772,7 +775,7 @@ pub async fn insert_completed_session_create(
     .bind(Json(create.result_json))
     .bind(PublicOperationEventType::Completed.as_str())
     .bind(Json(create.event_json))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -801,11 +804,11 @@ pub struct ClaimedPublicOperationRow {
 /// holds: `running` under `claim_token`, one more attempt and generation,
 /// stamped at the statement's clock time.
 pub async fn claim_created(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     operation_id: OperationId,
     claim_token: &str,
-) -> Result<ClaimedPublicOperationRow, sqlx::Error> {
-    sqlx::query_as::<_, ClaimedPublicOperationRow>(sql!(
+) -> Result<ClaimedPublicOperationRow, DbError> {
+    Ok(sqlx::query_as::<_, ClaimedPublicOperationRow>(sql!(
         "UPDATE public_operations
          SET state = $3,
              attempts = attempts + 1,
@@ -833,20 +836,20 @@ pub async fn claim_created(
     .bind(operation_id.as_uuid())
     .bind(claim_token)
     .bind(OperationState::Running.as_str())
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Record `create_id`, whose row the caller's transaction holds, canceled
 /// with `progress_message` and the terminal error `code` and `error`,
 /// releasing any claim and dropping a federated create's service grant.
 pub async fn cancel_superseded_create(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     create_id: OperationId,
     progress_message: &str,
     code: &str,
     error: serde_json::Value,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE public_operations
          SET state = $2,
@@ -864,7 +867,7 @@ pub async fn cancel_superseded_create(
     .bind(progress_message)
     .bind(code)
     .bind(Json(error))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -883,9 +886,9 @@ pub struct Expiries<'a> {
 /// holds, expired with its message and terminal error, dropping a sandbox
 /// create's federated service grant.
 pub async fn expire_each(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     expiries: Expiries<'_>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE public_operations o
          SET state = $1,
@@ -906,7 +909,7 @@ pub async fn expire_each(
     .bind(expiries.progress_messages)
     .bind(expiries.terminal_error_codes)
     .bind(expiries.terminal_error_jsons)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -915,12 +918,12 @@ pub async fn expire_each(
 /// running under `claim_token` at `claim_generation`. `false` means the
 /// claim was lost, and nothing changed.
 pub async fn set_claimed_payload(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     operation_id: OperationId,
     claim_token: &str,
     claim_generation: i64,
     payload_json: serde_json::Value,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let changed = sqlx::query(sql!(
         "UPDATE public_operations
          SET payload_json = $4, updated_at = NOW()
@@ -933,7 +936,7 @@ pub async fn set_claimed_payload(
     .bind(claim_token)
     .bind(claim_generation)
     .bind(Json(payload_json))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected();
     Ok(changed == 1)
@@ -943,12 +946,12 @@ pub async fn set_claimed_payload(
 /// under `claim_token` at `claim_generation`. `false` means the claim was
 /// lost, and nothing changed.
 pub async fn scrub_claimed_payload_path(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     operation_id: OperationId,
     claim_token: &str,
     claim_generation: i64,
     json_path: &[&str],
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let updated = sqlx::query(sql!(
         "UPDATE public_operations
              SET payload_json = payload_json #- $4::text[],
@@ -962,7 +965,7 @@ pub async fn scrub_claimed_payload_path(
     .bind(claim_token)
     .bind(claim_generation)
     .bind(json_path)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected();
     Ok(updated == 1)
@@ -972,11 +975,11 @@ pub async fn scrub_claimed_payload_path(
 /// `claim_generation`, stamping it at the database clock. `false` means the
 /// claim was lost, and nothing changed.
 pub async fn renew_claim(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     operation_id: OperationId,
     claim_token: &str,
     claim_generation: i64,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let updated = sqlx::query(sql!(
         "UPDATE public_operations
              SET claimed_at = NOW(), updated_at = NOW()
@@ -989,7 +992,7 @@ pub async fn renew_claim(
     .bind(claim_token)
     .bind(claim_generation)
     .bind(OperationState::Running.as_str())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected();
     Ok(updated == 1)
@@ -1003,12 +1006,12 @@ pub async fn renew_claim(
 /// `operation_id` of `org_id` by `actor_user_id` exists, and nothing
 /// changed.
 pub async fn renew_queued_native_create_grant(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     actor_user_id: UserId,
     operation_id: OperationId,
     context: serde_json::Value,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let updated = sqlx::query(sql!(
         "UPDATE public_operations
              SET payload_json = jsonb_set(payload_json, '{federated_create}', $4),
@@ -1034,7 +1037,7 @@ pub async fn renew_queued_native_create_grant(
     .bind(actor_user_id)
     .bind(operation_id.as_uuid())
     .bind(Json(context))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected();
     Ok(updated == 1)
@@ -1044,11 +1047,11 @@ pub async fn renew_queued_native_create_grant(
 /// `payload_json` while it is queued or running. `false` means no queued or
 /// running fork `operation_id` of `org_id` exists, and nothing changed.
 pub async fn set_active_fork_payload(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     operation_id: OperationId,
     payload_json: serde_json::Value,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let updated = sqlx::query(sql!(
         "UPDATE public_operations
                  SET payload_json = $3, updated_at = NOW()
@@ -1060,7 +1063,7 @@ pub async fn set_active_fork_payload(
     .bind(org_id)
     .bind(operation_id.as_uuid())
     .bind(Json(payload_json))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected();
     Ok(updated == 1)
@@ -1070,10 +1073,10 @@ pub async fn set_active_fork_payload(
 /// while it is still queued with no actor. `false` means it had an actor or
 /// had left the queue, and nothing changed.
 pub async fn hand_over_queued_system_operation(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     operation_id: Uuid,
     actor_user_id: UserId,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let handed_over = sqlx::query_scalar::<_, Uuid>(sql!(
         "UPDATE public_operations
                     SET actor_user_id = $2, updated_at = NOW()
@@ -1084,7 +1087,7 @@ pub async fn hand_over_queued_system_operation(
     ))
     .bind(operation_id)
     .bind(actor_user_id)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(handed_over.is_some())
 }
@@ -1115,22 +1118,22 @@ pub(crate) const INLINE_ORG_AT_LIMIT: &str = sql!(
 /// was renewed within `claim_stale_after_secs` of now by the database clock.
 /// See `INLINE_ORG_AT_LIMIT` for what it reads.
 pub async fn inline_org_at_limit(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     limit: i64,
     claim_token_prefix: &str,
     claim_stale_after_secs: i64,
     excluded_kinds: &[OperationKind],
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(INLINE_ORG_AT_LIMIT)
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(INLINE_ORG_AT_LIMIT)
         .bind(org_id)
         .bind(limit)
         .bind(OperationState::Running.as_str())
         .bind(claim_token_prefix)
         .bind(claim_stale_after_secs)
         .bind(kind_labels(excluded_kinds))
-        .fetch_one(executor)
-        .await
+        .fetch_one(executor.into_sqlx())
+        .await?)
 }
 
 /// A queued or running sandbox create [`lock_active_creates_on_sandbox`]
@@ -1147,11 +1150,15 @@ pub struct ActiveCreate {
 /// requested no later than now by the database clock, in request order,
 /// each locked until the caller's transaction ends. Waits for a claim or a
 /// release that holds one.
-pub async fn lock_active_creates_on_sandbox(
-    conn: &mut sqlx::PgConnection,
+/// The caller must pass its open transaction.
+pub async fn lock_active_creates_on_sandbox<C>(
+    conn: &mut C,
     org_id: OrgId,
     target_id: &str,
-) -> Result<Vec<ActiveCreate>, sqlx::Error> {
+) -> Result<Vec<ActiveCreate>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let active = sqlx::query_as::<_, (Uuid, String, bool)>(sql!(
         "SELECT operation_id, api_product, state = $5 AND claim_token = ''
          FROM public_operations
@@ -1170,7 +1177,7 @@ pub async fn lock_active_creates_on_sandbox(
     .bind(OperationKind::CreateSandbox.as_str())
     .bind(OperationState::Queued.as_str())
     .bind(OperationState::Running.as_str())
-    .fetch_all(&mut *conn)
+    .fetch_all(conn.into_sqlx())
     .await?;
     Ok(active
         .into_iter()
@@ -1187,12 +1194,12 @@ pub async fn lock_active_creates_on_sandbox(
 /// sandbox create's federated service grant. `false` means the claim was
 /// lost, and nothing changed.
 pub async fn complete_claimed(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     operation_id: OperationId,
     claim_token: &str,
     progress_message: &str,
     result_json: serde_json::Value,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let updated = sqlx::query_scalar::<_, Uuid>(sql!(
         "UPDATE public_operations
          SET state = $3,
@@ -1215,7 +1222,7 @@ pub async fn complete_claimed(
     .bind(progress_message)
     .bind(Json(result_json))
     .bind(OperationState::Running.as_str())
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(updated.is_some())
 }
@@ -1232,11 +1239,11 @@ pub struct TerminalError<'a> {
 /// `terminal`, releasing the claim and dropping a sandbox create's federated
 /// service grant. `false` means the claim was lost, and nothing changed.
 pub async fn fail_claimed(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     operation_id: OperationId,
     claim_token: &str,
     terminal: TerminalError<'_>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let updated = sqlx::query_scalar::<_, Uuid>(sql!(
         "UPDATE public_operations
          SET state = $3,
@@ -1261,7 +1268,7 @@ pub async fn fail_claimed(
     .bind(terminal.code)
     .bind(Json(terminal.error))
     .bind(OperationState::Running.as_str())
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(updated.is_some())
 }
@@ -1271,11 +1278,11 @@ pub async fn fail_claimed(
 /// releasing the claim and dropping a sandbox create's federated service
 /// grant. `false` means the claim was lost, and nothing changed.
 pub async fn expire_claimed(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     operation_id: OperationId,
     claim_token: &str,
     terminal: TerminalError<'_>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let updated = sqlx::query_scalar::<_, Uuid>(sql!(
         "UPDATE public_operations
          SET state = $3,
@@ -1302,7 +1309,7 @@ pub async fn expire_claimed(
     .bind(terminal.code)
     .bind(Json(terminal.error))
     .bind(OperationState::Running.as_str())
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(updated.is_some())
 }
@@ -1320,14 +1327,18 @@ pub struct OverdueQueuedRow {
 /// `api_product` operations of `kinds` created more than `max_age_secs`
 /// before now by the database clock, each locked until the caller's
 /// transaction ends, skipping any another transaction holds.
-pub async fn lock_overdue_queued(
-    conn: &mut sqlx::PgConnection,
+/// The caller must pass its open transaction.
+pub async fn lock_overdue_queued<C>(
+    conn: &mut C,
     api_product: &str,
     kinds: &[OperationKind],
     max_age_secs: i64,
     limit: i64,
-) -> Result<Vec<OverdueQueuedRow>, sqlx::Error> {
-    sqlx::query_as::<_, OverdueQueuedRow>(sql!(
+) -> Result<Vec<OverdueQueuedRow>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_as::<_, OverdueQueuedRow>(sql!(
         "SELECT operation_id, kind, attempts, progress_message
          FROM public_operations
          WHERE state = $1
@@ -1345,19 +1356,23 @@ pub async fn lock_overdue_queued(
     .bind(kind_labels(kinds))
     .bind(max_age_secs)
     .bind(limit)
-    .fetch_all(&mut *conn)
-    .await
+    .fetch_all(conn.into_sqlx())
+    .await?)
 }
 
 /// The kind of `operation_id` while it is running under `claim_token`,
 /// locking its row until the caller's transaction ends. `None` means the
 /// claim was lost.
-pub async fn claimed_kind_locked(
-    conn: &mut sqlx::PgConnection,
+/// The caller must pass its open transaction.
+pub async fn claimed_kind_locked<C>(
+    conn: &mut C,
     operation_id: OperationId,
     claim_token: &str,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>(sql!(
+) -> Result<Option<String>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar::<_, String>(sql!(
         "SELECT kind
          FROM public_operations
          WHERE operation_id = $1
@@ -1368,8 +1383,8 @@ pub async fn claimed_kind_locked(
     .bind(operation_id.as_uuid())
     .bind(claim_token)
     .bind(OperationState::Running.as_str())
-    .fetch_optional(&mut *conn)
-    .await
+    .fetch_optional(conn.into_sqlx())
+    .await?)
 }
 
 /// A requeue for [`requeue_claimed`].
@@ -1388,11 +1403,11 @@ pub struct Requeue<'a> {
 /// `requeue` says, releasing the claim. `false` means the claim was lost,
 /// and nothing changed.
 pub async fn requeue_claimed(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     operation_id: OperationId,
     claim_token: &str,
     requeue: Requeue<'_>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let updated = sqlx::query_scalar::<_, Uuid>(sql!(
         "UPDATE public_operations
          SET state = $3,
@@ -1415,7 +1430,7 @@ pub async fn requeue_claimed(
     .bind(OperationState::Running.as_str())
     .bind(requeue.count_attempt)
     .bind(requeue.undo_first_start)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(updated.is_some())
 }
@@ -1424,11 +1439,11 @@ pub async fn requeue_claimed(
 /// operations that still carry it, least recently updated first, skipping
 /// any another transaction holds. Returns how many were scrubbed.
 pub async fn scrub_finished_payload_path(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     kind: OperationKind,
     json_path: &[&str],
     limit: i64,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let scrubbed = sqlx::query(sql!(
         "WITH terminal_operations AS (
              SELECT operation_id
@@ -1453,7 +1468,7 @@ pub async fn scrub_finished_payload_path(
     .bind(OperationState::Canceled.as_str())
     .bind(OperationState::Expired.as_str())
     .bind(json_path)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected();
     Ok(scrubbed)
@@ -1461,11 +1476,8 @@ pub async fn scrub_finished_payload_path(
 
 /// Up to `limit` finished operations past their `gc_after` by the database
 /// clock, earliest first.
-pub async fn due_for_gc(
-    executor: impl PgExecutor<'_>,
-    limit: i64,
-) -> Result<Vec<Uuid>, sqlx::Error> {
-    sqlx::query_scalar::<_, Uuid>(sql!(
+pub async fn due_for_gc(executor: impl Executor<'_>, limit: i64) -> Result<Vec<Uuid>, DbError> {
+    Ok(sqlx::query_scalar::<_, Uuid>(sql!(
         "SELECT operation_id
          FROM public_operations
          WHERE state IN ($2, $3, $4, $5)
@@ -1478,20 +1490,24 @@ pub async fn due_for_gc(
     .bind(OperationState::Failed.as_str())
     .bind(OperationState::Canceled.as_str())
     .bind(OperationState::Expired.as_str())
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Take the transaction-level advisory lock on `key`, hashed, waiting for
 /// it. Callers key it per sandbox: one key for inserts into its queue, and
 /// one for creating or joining each kind's active operation on it. The
 /// lock lasts until the caller's transaction ends.
-pub async fn lock_sandbox_key(conn: &mut sqlx::PgConnection, key: &str) -> Result<(), sqlx::Error> {
+/// The caller must pass its open transaction.
+pub async fn lock_sandbox_key<C>(conn: &mut C, key: &str) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
     ))
     .bind(key)
-    .execute(&mut *conn)
+    .execute(conn.into_sqlx())
     .await?;
     Ok(())
 }
@@ -1500,17 +1516,21 @@ pub async fn lock_sandbox_key(conn: &mut sqlx::PgConnection, key: &str) -> Resul
 /// capture leader among the forks of one source at one execution
 /// `generation`, keyed by `source_key` hashed with `generation` as the seed,
 /// waiting for it. The lock lasts until the caller's transaction ends.
-pub async fn lock_fork_capture_leader(
-    conn: &mut sqlx::PgConnection,
+/// The caller must pass its open transaction.
+pub async fn lock_fork_capture_leader<C>(
+    conn: &mut C,
     source_key: &str,
     generation: i64,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "SELECT pg_advisory_xact_lock(hashtextextended($1, $2))"
     ))
     .bind(source_key)
     .bind(generation)
-    .execute(&mut *conn)
+    .execute(conn.into_sqlx())
     .await?;
     Ok(())
 }

@@ -327,8 +327,12 @@ async fn lock_tx(
     mode: LockMode,
 ) -> Result<(), sqlx::Error> {
     match mode {
-        LockMode::Shared => quota::lock_quota_shared(tx, id, seed).await,
-        LockMode::Exclusive => quota::lock_quota_exclusive(tx, id, seed).await,
+        LockMode::Shared => quota::lock_quota_shared(&mut **tx, id, seed)
+            .await
+            .map_err(sqlx::Error::from),
+        LockMode::Exclusive => quota::lock_quota_exclusive(&mut **tx, id, seed)
+            .await
+            .map_err(sqlx::Error::from),
     }
 }
 
@@ -346,6 +350,7 @@ async fn sandboxes_held_tx(
         ApiProduct::Native.as_str(),
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 #[cfg(test)]

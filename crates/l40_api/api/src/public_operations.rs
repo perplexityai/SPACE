@@ -130,6 +130,12 @@ pub enum PublicOperationStoreError {
     Sql(#[from] sqlx::Error),
 }
 
+impl From<pplx_space_postgres_pool::DbError> for PublicOperationStoreError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 impl From<InvalidStoredEnum> for PublicOperationStoreError {
     fn from(error: InvalidStoredEnum) -> Self {
         Self::InvalidStoredEnum {
@@ -1249,6 +1255,7 @@ async fn inline_org_at_limit_tx(
         TEARDOWN_KINDS,
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 /// Why admission left an operation it created queued instead of claiming it
@@ -2058,7 +2065,7 @@ pub async fn create_operation_tx(
 /// running. A create can answer before its sandbox has a row, and one that
 /// succeeds commits its row before it leaves queued or running.
 async fn sandbox_creates_in_flight<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
+    executor: impl pplx_space_postgres_pool::Executor<'e>,
     org_id: OrgId,
     target: pplx_space_public_api::PublicSandboxId,
 ) -> Result<Vec<OperationId>, sqlx::Error> {
@@ -2139,7 +2146,8 @@ async fn cancel_creates_superseded_by_delete_tx(
     delete_id: OperationId,
 ) -> Result<SupersededCreates, PublicOperationStoreError> {
     let active =
-        operation_store::operations::lock_active_creates_on_sandbox(tx, org_id, target_id).await?;
+        operation_store::operations::lock_active_creates_on_sandbox(&mut **tx, org_id, target_id)
+            .await?;
     let creates = active
         .into_iter()
         .filter(|create| create.unclaimed)
@@ -2181,6 +2189,7 @@ async fn insert_idempotency_record_tx(
         DEFAULT_IDEMPOTENCY_TTL_HOURS,
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 /// Serialize creating or joining the active `kind` operation for one sandbox.
@@ -2196,7 +2205,9 @@ pub(crate) async fn lock_active_sandbox_operation(
     } else {
         format!("{org_id}:{target_id}:{}", kind.as_str())
     };
-    operation_store::operations::lock_sandbox_key(tx, &lock_key).await
+    operation_store::operations::lock_sandbox_key(&mut **tx, &lock_key)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 /// Kinds that name a sandbox as their target but are not in its queue. A
@@ -2259,7 +2270,9 @@ async fn lock_sandbox_queue(
     org_id: OrgId,
     target_id: &str,
 ) -> Result<(), sqlx::Error> {
-    operation_store::operations::lock_sandbox_key(tx, &format!("{org_id}:{target_id}:queue")).await
+    operation_store::operations::lock_sandbox_key(&mut **tx, &format!("{org_id}:{target_id}:queue"))
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 /// The queued or running `kind` operation on a sandbox that a new request
@@ -2290,6 +2303,7 @@ async fn joinable_active_sandbox_operation(
         OUTSIDE_SANDBOX_QUEUE_KINDS,
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 fn new_claim_token() -> String {
@@ -2336,9 +2350,11 @@ async fn claim_operations(
         // busy lock makes this tick claim nothing rather than wait. The same
         // round trip turns off JIT, which the keyed claim's cost estimate can
         // trigger and which costs more than the query.
-        let claim_lock_held =
-            operation_store::claim_queue::try_lock_claims(&mut tx, PUBLIC_OPERATION_CLAIM_LOCK_KEY)
-                .await?;
+        let claim_lock_held = operation_store::claim_queue::try_lock_claims(
+            &mut *tx,
+            PUBLIC_OPERATION_CLAIM_LOCK_KEY,
+        )
+        .await?;
         if !claim_lock_held {
             tx.rollback().await?;
             return Ok(PublicOperationClaim {
@@ -2351,7 +2367,7 @@ async fn claim_operations(
     // The claim's rules, and which rows it leaves locked, are
     // `claim_queue::claim_due`'s.
     let claimed = operation_store::claim_queue::claim_due(
-        &mut tx,
+        &mut *tx,
         operation_store::claim_queue::DueClaim {
             total: i64::from(input.limits.total),
             claim_stale_after_secs: duration_secs_i64(input.claim_stale_after),
@@ -2535,7 +2551,7 @@ async fn expire_overdue_queued_operations(
     let mut tx = pool.begin().await?;
     // Locked, so nothing claims them between this read and the write below.
     let rows = operation_store::operations::lock_overdue_queued(
-        &mut tx,
+        &mut *tx,
         input.api_product.as_str(),
         input.kinds,
         duration_secs_i64(input.max_age),
@@ -2608,7 +2624,7 @@ async fn release_claimed_operation(
     // either seen below or, waiting on this row, sees the requeued create
     // and cancels it itself.
     let kind = operation_store::operations::claimed_kind_locked(
-        &mut tx,
+        &mut *tx,
         input.operation_id,
         &input.claim_token,
     )
@@ -2714,7 +2730,7 @@ async fn find_idempotency_record(
     idempotency: &CreatePublicOperationIdempotency<'_>,
 ) -> Result<Option<PublicIdempotencyRecord>, PublicOperationStoreError> {
     let row = operation_store::idempotency::lock_live(
-        tx,
+        &mut **tx,
         api_product.as_str(),
         idempotency.store_key(org_id),
     )
@@ -2780,7 +2796,7 @@ async fn lock_idempotency_key(
     idempotency: &CreatePublicOperationIdempotency<'_>,
 ) -> Result<(), PublicOperationStoreError> {
     operation_store::idempotency::lock_key(
-        tx,
+        &mut **tx,
         idempotency_lock_key(org_id, api_product, idempotency),
     )
     .await?;

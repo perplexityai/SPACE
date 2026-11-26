@@ -7,9 +7,9 @@
 //! `lock_timeout` it sets around the locks and what a timed-out wait means.
 
 use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_public_api::{OperationKind, PUBLIC_SANDBOX_ID_PREFIX};
 use pplx_space_sql_locator::sql;
-use sqlx::{PgExecutor, Postgres, Transaction};
 use uuid::Uuid;
 
 /// What [`sandboxes_held`] counts: the org's, and the subject's share.
@@ -86,17 +86,17 @@ pub(crate) const SANDBOXES_HELD: &str = sql!(
 /// Take the shared advisory transaction lock on (`id`, `seed`). It lasts
 /// until the caller's transaction ends, and waits only for holders of
 /// [`lock_quota_exclusive`] on the same key.
-pub async fn lock_quota_shared(
-    tx: &mut Transaction<'_, Postgres>,
-    id: Uuid,
-    seed: i64,
-) -> Result<(), sqlx::Error> {
+/// The caller must pass its open transaction.
+pub async fn lock_quota_shared<C>(tx: &mut C, id: Uuid, seed: i64) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "SELECT pg_advisory_xact_lock_shared(hashtextextended($1::text, $2))"
     ))
     .bind(id)
     .bind(seed)
-    .execute(&mut **tx)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -104,17 +104,17 @@ pub async fn lock_quota_shared(
 /// Take the exclusive advisory transaction lock on (`id`, `seed`). It lasts
 /// until the caller's transaction ends, and waits for every holder of either
 /// mode on the same key.
-pub async fn lock_quota_exclusive(
-    tx: &mut Transaction<'_, Postgres>,
-    id: Uuid,
-    seed: i64,
-) -> Result<(), sqlx::Error> {
+/// The caller must pass its open transaction.
+pub async fn lock_quota_exclusive<C>(tx: &mut C, id: Uuid, seed: i64) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "SELECT pg_advisory_xact_lock(hashtextextended($1::text, $2))"
     ))
     .bind(id)
     .bind(seed)
-    .execute(&mut **tx)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -122,18 +122,18 @@ pub async fn lock_quota_exclusive(
 /// Count with `SANDBOXES_HELD`, for in-flight creates of `api_product`;
 /// see there for what is counted.
 pub async fn sandboxes_held(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     subject_id: Option<UserId>,
     api_product: &str,
-) -> Result<SandboxesHeld, sqlx::Error> {
+) -> Result<SandboxesHeld, DbError> {
     let (org, subject) = sqlx::query_as::<_, (i64, i64)>(SANDBOXES_HELD)
         .bind(org_id)
         .bind(subject_id)
         .bind(api_product)
         .bind(OperationKind::CreateSandbox.as_str())
         .bind(PUBLIC_SANDBOX_ID_PREFIX)
-        .fetch_one(executor)
+        .fetch_one(executor.into_sqlx())
         .await?;
     Ok(SandboxesHeld { org, subject })
 }

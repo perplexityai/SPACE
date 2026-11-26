@@ -20,7 +20,7 @@ pub(crate) const KEY_BINDING_TTL_MINUTES: i32 = 10;
 /// no row with the `id` it selected, so it cannot delete a binding renewed
 /// under it, whatever version of the sweep is running.
 pub(crate) async fn bind_idempotency_key(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
     org_id: OrgId,
     idempotency: &CreatePublicOperationIdempotency<'_>,
 ) -> Result<bool, sqlx::Error> {
@@ -32,4 +32,5 @@ pub(crate) async fn bind_idempotency_key(
         KEY_BINDING_TTL_MINUTES,
     )
     .await
+    .map_err(sqlx::Error::from)
 }
