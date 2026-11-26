@@ -71,6 +71,10 @@ pub(crate) async fn blocking<T: Send + 'static>(
         .map_err(error)
 }
 
+/// Loop block size for direct I/O. A backing must be a whole number of these
+/// blocks to attach with `LoopDevice::attach_direct`.
+pub(crate) const DIRECT_IO_BLOCK_BYTES: u64 = 4096;
+
 pub(crate) struct Backing {
     pub(crate) file: File,
     parent: File,
@@ -247,7 +251,34 @@ impl LoopDevice {
         }
     }
 
+    /// Attach with buffered I/O and 512-byte blocks.
     pub(crate) fn attach(backing: &Backing, readonly: bool) -> io::Result<Self> {
+        Self::attach_with(backing, readonly, LoopIo::Buffered)
+    }
+
+    /// Attach with direct I/O and 4 KiB blocks, for an encrypted volume's
+    /// backing file.
+    ///
+    /// A buffered loop device sends every read through the host page cache
+    /// of the backing file. That adds a second readahead under the upper
+    /// filesystem's own readahead, and a single loop worker serves the
+    /// request. On a fragmented, compressed snapshot volume, each guest page
+    /// fault then waits behind hundreds of small cache-missing reads.
+    /// Direct I/O hands those reads to the NVMe device in parallel instead.
+    ///
+    /// The kernel enables direct I/O only when the loop block size is at
+    /// least the logical block size of the disk under the backing file.
+    /// Otherwise it silently stays buffered. NVMe drives report 512 bytes or
+    /// 4 KiB, so 4 KiB works on both. dm-crypt keeps its LUKS sector size,
+    /// so an existing 512-byte-sector volume opens unchanged on a 4 KiB loop
+    /// device. The backing length must be a whole number of 4 KiB blocks:
+    /// cryptsetup refuses a device whose size is not a multiple of its
+    /// logical block size. Use `attach` for any other backing.
+    pub(crate) fn attach_direct(backing: &Backing, readonly: bool) -> io::Result<Self> {
+        Self::attach_with(backing, readonly, LoopIo::Direct)
+    }
+
+    fn attach_with(backing: &Backing, readonly: bool, io_mode: LoopIo) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
@@ -265,9 +296,9 @@ impl LoopDevice {
                 let device = File::options().read(true).write(true).open(&path)?;
                 let mut config = Config {
                     fd: backing.file.as_raw_fd().cast_unsigned(),
-                    block_size: 0,
+                    block_size: io_mode.block_size(),
                     info: Info {
-                        flags: 4 | u32::from(readonly),
+                        flags: LO_FLAGS_AUTOCLEAR | u32::from(readonly) | io_mode.flags(),
                         ..Info::default()
                     },
                     reserved: [0; 8],
@@ -291,8 +322,36 @@ impl LoopDevice {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (backing, readonly);
+            let _ = (backing, readonly, io_mode);
             Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+}
+
+/// `LO_FLAGS_AUTOCLEAR`: detach when the last opener closes.
+const LO_FLAGS_AUTOCLEAR: u32 = 4;
+/// `LO_FLAGS_DIRECT_IO`: bypass the backing file's page cache.
+const LO_FLAGS_DIRECT_IO: u32 = 16;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopIo {
+    Buffered,
+    Direct,
+}
+
+impl LoopIo {
+    /// `LOOP_CONFIGURE` block size; 0 keeps the kernel default of 512.
+    fn block_size(self) -> u32 {
+        match self {
+            Self::Buffered => 0,
+            Self::Direct => DIRECT_IO_BLOCK_BYTES as u32,
+        }
+    }
+
+    fn flags(self) -> u32 {
+        match self {
+            Self::Buffered => 0,
+            Self::Direct => LO_FLAGS_DIRECT_IO,
         }
     }
 }
