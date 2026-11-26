@@ -344,7 +344,9 @@ async fn registry_db() -> TestDbResult<TestDb> {
 /// table, as a fresh one seeded with them. An earlier run left only `nodes`
 /// rows and their `node_direct` rows, which the delete cascades to: neither
 /// table draws from a sequence or has a trigger that writes another table,
-/// and no run writes another table or ends with a transaction open.
+/// and no run writes another table or leaves a transaction that can still
+/// commit: each commits, or fails and is rolled back once dropped, and the
+/// delete waits for that rollback if it needs the rows.
 async fn reseed(pool: &PgPool, seeds: &[Seed]) -> TestDbResult<()> {
     sqlx::query(sql!("DELETE FROM nodes")).execute(pool).await?;
     // One statement writes every seed. Its reads see the tables as they were
