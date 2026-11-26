@@ -468,6 +468,38 @@ fn the_domain_policy_and_its_lines() {
     assert_eq!(modes, ["model_protocol.stale_entries"]);
 }
 
+/// `storage_handles` is read as a set of packages, and leniently for its
+/// lines, the key's too; a misspelt key is still rejected.
+#[test]
+fn storage_handles() {
+    let behaviours = behaviour_tables("");
+    let parse = |key: &str| {
+        toml::from_str::<LayersConfig>(&format!("{key} = [\"pplx-space-pool\"]\n{behaviours}"))
+    };
+    let config = parse("storage_handles").expect("it parses");
+    assert!(config.storage_handles.contains("pplx-space-pool"));
+    assert!(!config.storage_handles.contains("pplx-space-s"));
+    let found = parse("storage_handle")
+        .expect_err("an unknown key is rejected")
+        .to_string();
+    assert!(found.contains("unknown field `storage_handle`"), "{found}");
+
+    let policy = |text: &str| {
+        LayersPolicy::parse(text)
+            .expect("the table parses")
+            .expect("the text has the table")
+    };
+    let listed = policy("[rules.layers]\nstorage_handles = [\n  \"pplx-space-pool\",\n]\n");
+    assert_eq!(
+        listed.storage_handles,
+        BTreeMap::from([("pplx-space-pool".to_owned(), 3)])
+    );
+    assert_eq!(listed.storage_handles_line, Some(2));
+    let unlisted = policy("[rules.layers.placement]\nmode = \"required\"\n[rules.layers]\n");
+    assert!(unlisted.storage_handles.is_empty());
+    assert_eq!(unlisted.storage_handles_line, Some(3));
+}
+
 /// `domain_fences` is read as package to family, each package in one family.
 #[test]
 fn domain_fences() {

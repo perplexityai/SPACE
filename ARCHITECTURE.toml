@@ -429,7 +429,8 @@ mode = "advisory"
 # matrix and how to fix a finding: crates/tools/archcheck/README.md (Layers).
 
 # Each store's users: the l40_api and l30_storage crates that own its state
-# and use the store today, and the coordinators that call it.
+# and use the store today, and the coordinators that call it. An l30_storage
+# crate needs no entry for a crate in `[rules.layers] storage_handles`.
 [rules.layers.store_users]
 pplx-space-accounts-store = [
   "pplx-space-api",
@@ -508,14 +509,8 @@ pplx-space-postgres-pool = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
   "pplx-space-cluster-reconciler",
-  "pplx-space-cluster-trigger-queue",
   "pplx-space-credmgr",
-  "pplx-space-direct-coordinator",
-  "pplx-space-direct-store",
   "pplx-space-internal-api-server",
-  "pplx-space-node-registration-store",
-  "pplx-space-node-template-inventory-store",
-  "pplx-space-runtime-environment-catalog-store",
 ]
 pplx-space-public-operation-store = ["pplx-space-api"]
 pplx-space-runtime-environment-catalog-store = [
@@ -717,6 +712,12 @@ protocols = [
   "pplx-space-public-api",
   "pplx-space-rpc-contracts",
 ]
+
+# The l30_storage crates that provide the database handle types Postgres
+# stores use (Db, Tx, Executor, DbError). Any l30_storage crate, store or
+# coordinator, may depend on one without a store_users entry; an l40_api crate
+# still needs one, which says the service holds a database handle.
+storage_handles = ["pplx-space-postgres-pool"]
 
 # l20_domain crates do no I/O, so none depends on a package that does it:
 # normal and build dependencies, optional ones included. Each family is an

@@ -94,7 +94,7 @@ pub(super) enum Problem {
     /// and other clients.
     Clients,
     /// An API or Storage crate's normal or build edge to a store that does
-    /// not list it.
+    /// not list it, but for a Storage crate's to a storage handle crate.
     StoreEdges,
     /// A coordinator's normal or build edge to another coordinator.
     Coordinators,
@@ -263,10 +263,11 @@ pub(super) fn production_problem(
             (!listed).then_some(Problem::CoordinatorEdges)
         }
     } else if to == Layer::Storage && matches!(from, Layer::Api | Layer::Storage) {
-        let listed = config
-            .store_users
-            .get(edge.to.name())
-            .is_some_and(|users| users.contains(edge.from.name()));
+        let listed = (from == Layer::Storage && config.storage_handles.contains(edge.to.name()))
+            || config
+                .store_users
+                .get(edge.to.name())
+                .is_some_and(|users| users.contains(edge.from.name()));
         (!listed).then_some(Problem::StoreEdges)
     } else {
         (!may_depend(from, to)).then_some(Problem::Direction)
