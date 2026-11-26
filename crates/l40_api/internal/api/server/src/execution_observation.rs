@@ -97,7 +97,7 @@ pub(super) async fn prepare<'a>(
     // Keep artifact writes before the status upsert, as legacy readers do.
     // Locking the status row first would invert that order during rollout.
     // NO KEY UPDATE permits the foreign-key key-share locks of node reports.
-    let exists = locks::lock_node_for_no_key_update(tx, node_id)
+    let exists = locks::lock_node_for_no_key_update(&mut **tx, node_id)
         .await
         .map_err(|error| Status::internal(format!("lock node execution publication: {error}")))?;
     if !exists {

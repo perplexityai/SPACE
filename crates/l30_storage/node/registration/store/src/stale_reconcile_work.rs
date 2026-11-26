@@ -4,6 +4,7 @@
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 
 /// A node with stale live reconcile work, and its Kubernetes registration.
@@ -19,12 +20,12 @@ pub struct StaleReconcileWorkNode {
 /// `retention_secs` ago. `NOW()` stays in the statement, so the age is
 /// measured on the database clock.
 pub async fn unready_nodes_with_stale_reconcile_work(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     after: Option<NodeId>,
     retention_secs: i64,
     limit: i64,
-) -> Result<Vec<StaleReconcileWorkNode>, sqlx::Error> {
-    sqlx::query_as::<_, StaleReconcileWorkNode>(sql!(
+) -> Result<Vec<StaleReconcileWorkNode>, DbError> {
+    Ok(sqlx::query_as::<_, StaleReconcileWorkNode>(sql!(
         "SELECT n.id, k.k8s_node_name, k.k8s_node_uid
          FROM nodes n
          JOIN node_k8s k ON k.node_id = n.id
@@ -55,8 +56,8 @@ pub async fn unready_nodes_with_stale_reconcile_work(
     .bind(retention_secs)
     .bind(limit)
     .bind(SubstrateKind::Kubernetes)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 #[cfg(test)]

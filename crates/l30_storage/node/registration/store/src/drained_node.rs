@@ -36,10 +36,10 @@ use std::sync::LazyLock;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::{NodeDrainPhase, SubstrateKind};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_portability::drain_gate_blockers_for_node;
 use pplx_space_sandbox_residency::{ResidencyEvidence, active_resident_predicate};
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 
 /// The statement [`mark_terminating`] runs under `residency`. `$1` = node
 /// id, `$2` = the new phase (`terminating`), `$3` = the expected phase
@@ -90,10 +90,10 @@ static MARK_TERMINATING_CENSUS_AWARE: LazyLock<String> =
 /// `draining → drained` gate used, or a node that converged past that gate
 /// parks here.
 pub async fn mark_terminating(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     residency: ResidencyEvidence,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let statement: &str = match residency {
         ResidencyEvidence::LifecycleOnly => &MARK_TERMINATING,
         ResidencyEvidence::NodeCensusAware => &MARK_TERMINATING_CENSUS_AWARE,
@@ -102,7 +102,7 @@ pub async fn mark_terminating(
         .bind(node_id)
         .bind(NodeDrainPhase::Terminating.as_str())
         .bind(NodeDrainPhase::Drained.as_str())
-        .execute(executor)
+        .execute(executor.into_sqlx())
         .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -161,11 +161,11 @@ static DELETE_IF_ORPHAN_CENSUS_AWARE: LazyLock<String> =
 /// [`crate::orphan_reap_refusal::diagnose`] re-evaluates the phase and
 /// substrate, uid, snapshot and resident guards on their own.
 pub async fn delete_if_orphan(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     expected_uid: Option<&str>,
     residency: ResidencyEvidence,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let statement: &str = match residency {
         ResidencyEvidence::LifecycleOnly => &DELETE_IF_ORPHAN,
         ResidencyEvidence::NodeCensusAware => &DELETE_IF_ORPHAN_CENSUS_AWARE,
@@ -174,7 +174,7 @@ pub async fn delete_if_orphan(
         .bind(node_id)
         .bind(expected_uid)
         .bind(SubstrateKind::Kubernetes)
-        .execute(executor)
+        .execute(executor.into_sqlx())
         .await?;
     Ok(result.rows_affected() > 0)
 }

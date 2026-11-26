@@ -47,7 +47,7 @@ async fn start(pool: &PgPool, node_id: NodeId, hold_seconds: i64) -> TestDbResul
     .bind(node_id)
     .execute(&mut *tx)
     .await?;
-    start_v2_drain(&mut tx, node_id, hold_seconds).await?;
+    start_v2_drain(&mut *tx, node_id, hold_seconds).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -73,7 +73,7 @@ async fn set(
 
 async fn admission(pool: &PgPool, node_id: NodeId) -> TestDbResult<V2StartAdmission> {
     let mut tx = pool.begin().await?;
-    let admission = admit_v2_start(&mut tx, node_id).await?;
+    let admission = admit_v2_start(&mut *tx, node_id).await?;
     tx.commit().await?;
     Ok(admission)
 }
@@ -258,7 +258,7 @@ async fn a_repeat_only_shortens_the_deadline() -> TestDbResult<()> {
     ] {
         let mut tx = pool.begin().await?;
         assert_eq!(
-            shorten_v2_hold(&mut tx, node_id, hold).await?,
+            shorten_v2_hold(&mut *tx, node_id, hold).await?,
             change,
             "{hold}"
         );

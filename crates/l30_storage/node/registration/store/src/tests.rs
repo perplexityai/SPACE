@@ -50,7 +50,7 @@ async fn register(
     registration: K8sNodeRegistration<'_>,
 ) -> TestDbResult<Result<bool, K8sNodeRegistrationError>> {
     let mut tx = pool.begin().await?;
-    let result = register_k8s_node(&mut tx, registration, |_| {}).await;
+    let result = register_k8s_node(&mut *tx, registration, |_| {}).await;
     if result.is_ok() {
         tx.commit().await?;
     }
@@ -260,7 +260,7 @@ async fn an_instance_change_alone_keeps_drain_state() -> TestDbResult<()> {
 
         let mut cleared = None;
         let mut tx = db.pool.begin().await?;
-        register_k8s_node(&mut tx, registration(node_id, uid, instance_id), |v2| {
+        register_k8s_node(&mut *tx, registration(node_id, uid, instance_id), |v2| {
             cleared = Some(v2)
         })
         .await?;

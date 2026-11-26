@@ -62,12 +62,12 @@ pub(crate) async fn delete_locked_node(
     tx: &mut Transaction<'_, Postgres>,
     node: &NodeIdentity<'_>,
 ) -> Result<GuardedDelete, sqlx::Error> {
-    let identity = locks::share_lock_k8s_identity(tx, node.node_id).await?;
+    let identity = locks::share_lock_k8s_identity(&mut **tx, node.node_id).await?;
     let (uid, instance_id) = identity.unwrap_or_default();
     if uid.as_deref() != node.k8s_node_uid || instance_id.as_deref() != node.instance_id {
         return Ok(GuardedDelete::IdentityMoved);
     }
-    if guarded_delete::heartbeat_fresh(tx, node.node_id).await? {
+    if guarded_delete::heartbeat_fresh(&mut **tx, node.node_id).await? {
         return Ok(GuardedDelete::HeartbeatFresh);
     }
     let references = node_references(
@@ -81,7 +81,7 @@ pub(crate) async fn delete_locked_node(
         return Ok(GuardedDelete::Referenced(references));
     }
     if guarded_delete::delete_unreferenced_stale_node(
-        tx,
+        &mut **tx,
         node.node_id,
         node.managed_by,
         node.k8s_node_name,

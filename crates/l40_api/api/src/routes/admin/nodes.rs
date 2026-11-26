@@ -1728,12 +1728,12 @@ async fn apply_drain_action(
         Err(err) => return db_error(err).into_response(),
     };
 
-    let current: AdminNodeRow = match direct::lock_admin_node(&mut tx, node_id).await {
+    let current: AdminNodeRow = match direct::lock_admin_node(&mut *tx, node_id).await {
         Ok(Some(row)) => row,
         Ok(None) => {
             return api_error(StatusCode::NOT_FOUND, "Node not found").into_response();
         }
-        Err(err) => return db_error(err).into_response(),
+        Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
     };
 
     let current_mode = NodeDrainMode::from_column_str(current.drain_mode.as_deref());
@@ -1775,7 +1775,7 @@ async fn apply_drain_action(
         Ok(Some(columns)) => columns,
         // The row is locked above, so it can't be gone here.
         Ok(None) => return api_error(StatusCode::NOT_FOUND, "Node not found").into_response(),
-        Err(err) => return db_error(err).into_response(),
+        Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
     };
     // With drain v2 on, v1 and v2 drains never run together: refuse every
     // v1 `:drain`, before any check of a v1 drain's terms, so its answer
@@ -2058,9 +2058,9 @@ async fn apply_drain_action(
         return response;
     }
     if matches!(v2_write, DrainV2Write::Start { .. }) {
-        let admission = match node_drain_v2::admit_v2_start(&mut tx, node_id).await {
+        let admission = match node_drain_v2::admit_v2_start(&mut *tx, node_id).await {
             Ok(admission) => admission,
-            Err(err) => return db_error(err).into_response(),
+            Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
         };
         if let Some(refusal) = v2_start_refusal(admission, state.drain_v2_max_evacuating) {
             audit::record(AdminAuditEntry {
@@ -2214,12 +2214,12 @@ async fn apply_drain_action(
     let v2_written = match v2_write {
         DrainV2Write::None => Ok(None),
         DrainV2Write::Start { hold_seconds } => {
-            node_drain_v2::start_v2_drain(&mut tx, node_id, hold_seconds)
+            node_drain_v2::start_v2_drain(&mut *tx, node_id, hold_seconds)
                 .await
                 .map(|()| None)
         }
         DrainV2Write::Shorten { hold_seconds } => {
-            node_drain_v2::shorten_v2_hold(&mut tx, node_id, hold_seconds)
+            node_drain_v2::shorten_v2_hold(&mut *tx, node_id, hold_seconds)
                 .await
                 .map(Some)
         }
@@ -2255,7 +2255,7 @@ async fn apply_drain_action(
                 .into_response();
         }
         Ok(_) => {}
-        Err(err) => return db_error(err).into_response(),
+        Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
     }
     let new_phase = phase_after(&transition, current.drain_phase.as_deref());
 

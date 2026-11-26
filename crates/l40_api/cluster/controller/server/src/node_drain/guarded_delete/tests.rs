@@ -123,7 +123,7 @@ async fn delete(
 ) -> TestResult<GuardedDelete> {
     let name = name_of(node_id);
     let mut tx = pool.begin().await?;
-    assert!(lock_node(&mut tx, node_id).await?);
+    assert!(lock_node(&mut *tx, node_id).await?);
     let outcome = delete_locked_node(
         &mut tx,
         &NodeIdentity {

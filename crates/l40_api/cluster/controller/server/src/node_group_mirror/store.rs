@@ -69,5 +69,7 @@ pub(super) async fn mirror_worker_groups(
     node_names: &[String],
     group_ids: &[Option<NodeGroupId>],
 ) -> Result<u64, sqlx::Error> {
-    node_group::mirror_worker_node_groups(&mut **tx, node_names, group_ids).await
+    node_group::mirror_worker_node_groups(&mut **tx, node_names, group_ids)
+        .await
+        .map_err(sqlx::Error::from)
 }

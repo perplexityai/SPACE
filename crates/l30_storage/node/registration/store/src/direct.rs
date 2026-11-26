@@ -15,8 +15,9 @@ pub mod registry;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::{NodeAddress, NodeGroupId, NodeManagedBy, NodeRole};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::{PgExecutor, Postgres, Transaction};
+use serde::de::DeserializeOwned;
 use time::OffsetDateTime;
 
 /// One node as the admin API reads it: the `nodes` row, its `node_direct`
@@ -78,13 +79,14 @@ pub struct AdminNodeRow<S, C> {
 
 /// The admin row of `node_id`; `None` when the `nodes` row is gone.
 pub async fn admin_node<S, C>(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
-) -> Result<Option<AdminNodeRow<S, C>>, sqlx::Error>
+) -> Result<Option<AdminNodeRow<S, C>>, DbError>
 where
-    AdminNodeRow<S, C>: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin,
+    S: DeserializeOwned + Send + Unpin + 'static,
+    C: DeserializeOwned + Send + Unpin + 'static,
 {
-    sqlx::query_as::<_, AdminNodeRow<S, C>>(sql!(
+    Ok(sqlx::query_as::<_, AdminNodeRow<S, C>>(sql!(
         "SELECT n.id,
        nd.name,
        host(n.address) AS address,
@@ -135,8 +137,8 @@ LEFT JOIN node_status_snapshots nss ON nss.node_id = n.id
 WHERE n.id = $1"
     ))
     .bind(node_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Every admin row matching all three filters, ordered by role, then by
@@ -146,15 +148,16 @@ WHERE n.id = $1"
 /// `drain_phase` `None` matches every phase, `Some("")` only nodes with no
 /// phase.
 pub async fn list_admin_nodes<S, C>(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     role: Option<&str>,
     include_deleted: bool,
     drain_phase: Option<&str>,
-) -> Result<Vec<AdminNodeRow<S, C>>, sqlx::Error>
+) -> Result<Vec<AdminNodeRow<S, C>>, DbError>
 where
-    AdminNodeRow<S, C>: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin,
+    S: DeserializeOwned + Send + Unpin + 'static,
+    C: DeserializeOwned + Send + Unpin + 'static,
 {
-    sqlx::query_as::<_, AdminNodeRow<S, C>>(sql!(
+    Ok(sqlx::query_as::<_, AdminNodeRow<S, C>>(sql!(
         "SELECT n.id,
        nd.name,
        host(n.address) AS address,
@@ -216,22 +219,25 @@ ORDER BY n.role ASC,
     .bind(role)
     .bind(include_deleted)
     .bind(drain_phase)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The admin row of `node_id`, its `nodes` row locked `FOR UPDATE`; `None`
 /// when the row is gone. The lock lasts until the caller's transaction ends,
 /// so the caller can validate a transition against the row and write it
-/// before another transaction reads the row to do the same.
-pub async fn lock_admin_node<S, C>(
-    tx: &mut Transaction<'_, Postgres>,
+/// before another transaction reads the row to do the same. The caller must
+/// pass its open transaction.
+pub async fn lock_admin_node<S, C, T>(
+    tx: &mut T,
     node_id: NodeId,
-) -> Result<Option<AdminNodeRow<S, C>>, sqlx::Error>
+) -> Result<Option<AdminNodeRow<S, C>>, DbError>
 where
-    AdminNodeRow<S, C>: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin,
+    for<'a> &'a mut T: Executor<'a>,
+    S: DeserializeOwned + Send + Unpin + 'static,
+    C: DeserializeOwned + Send + Unpin + 'static,
 {
-    sqlx::query_as::<_, AdminNodeRow<S, C>>(sql!(
+    Ok(sqlx::query_as::<_, AdminNodeRow<S, C>>(sql!(
         "SELECT n.id,
        nd.name,
        host(n.address) AS address,
@@ -283,8 +289,8 @@ WHERE n.id = $1
 FOR UPDATE OF n"
     ))
     .bind(node_id)
-    .fetch_optional(&mut **tx)
-    .await
+    .fetch_optional(tx.into_sqlx())
+    .await?)
 }
 
 /// Hard-delete the `nodes` row of `node_id` when it is managed by
@@ -292,10 +298,10 @@ FOR UPDATE OF n"
 /// rows deleted: 0 when no such node exists. Rows whose foreign key to
 /// `nodes` cascades, `node_direct` among them, go with it.
 pub async fn delete_direct_node(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     managed_by: NodeManagedBy,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let result = sqlx::query(sql!(
         "DELETE FROM nodes n
          WHERE n.id = $1
@@ -308,7 +314,7 @@ pub async fn delete_direct_node(
     ))
     .bind(node_id)
     .bind(managed_by)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected())
 }
@@ -320,11 +326,11 @@ pub async fn delete_direct_node(
 /// non-terminal sandbox still names as its active or target node stays.
 /// `NOW()` is the start of the executor's transaction.
 pub async fn prune_expired_direct_node_tombstones(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     retention_secs: i64,
     max_records: i64,
     managed_by: NodeManagedBy,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     // Quarantined sandboxes are not terminal for tombstone retention:
     // they intentionally keep the node association until quarantine-aware
     // cleanup or operator release resolves the preserved state.
@@ -360,7 +366,7 @@ pub async fn prune_expired_direct_node_tombstones(
     .bind(retention_secs)
     .bind(max_records)
     .bind(managed_by)
-    .fetch_all(executor)
+    .fetch_all(executor.into_sqlx())
     .await?
     .len() as u64)
 }

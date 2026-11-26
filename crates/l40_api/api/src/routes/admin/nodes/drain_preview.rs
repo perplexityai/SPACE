@@ -314,7 +314,11 @@ async fn preview_within(
         "the node's drain columns",
         until,
         &ran_out,
-        pplx_space_node_registration_store::drain_v2::drain_v2_columns(&state.pool, node_id),
+        async {
+            pplx_space_node_registration_store::drain_v2::drain_v2_columns(&state.pool, node_id)
+                .await
+                .map_err(sqlx::Error::from)
+        },
     )
     .await
     {
@@ -349,10 +353,14 @@ async fn preview_within(
                 "the node's drain columns",
                 until,
                 &ran_out,
-                pplx_space_node_registration_store::drain_v2::drain_v2_columns(
-                    &state.pool,
-                    node_id,
-                ),
+                async {
+                    pplx_space_node_registration_store::drain_v2::drain_v2_columns(
+                        &state.pool,
+                        node_id,
+                    )
+                    .await
+                    .map_err(sqlx::Error::from)
+                },
             )
             .await
             {

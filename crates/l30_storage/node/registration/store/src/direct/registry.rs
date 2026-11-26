@@ -21,8 +21,8 @@ use pplx_space_accounts::NodeId;
 use pplx_space_node_model::{NodeManagedBy, NodeRole, SubstrateKind};
 use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
+use sqlx::FromRow;
 use sqlx::types::Json;
-use sqlx::{FromRow, PgExecutor};
 use time::OffsetDateTime;
 
 /// The `nodes` columns a registry write returns.
@@ -223,11 +223,11 @@ pub struct RegistryNodeRow {
 }
 
 /// Node `id` of any substrate, deleted Direct rows included.
-pub async fn registry_node<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn registry_node(
+    executor: impl Executor<'_>,
     id: NodeId,
-) -> Result<Option<RegistryNodeRow>, sqlx::Error> {
-    sqlx::query_as::<_, RegistryNodeRow>(sql!(
+) -> Result<Option<RegistryNodeRow>, DbError> {
+    Ok(sqlx::query_as::<_, RegistryNodeRow>(sql!(
         "SELECT n.id,
                 nd.name,
                 host(n.address) AS address,
@@ -247,19 +247,19 @@ pub async fn registry_node<'e>(
          WHERE n.id = $1"
     ))
     .bind(id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The nodes of any substrate, of `role` when given, by role, then name, then
 /// endpoint. A node whose `node_direct` row is deleted is listed only when
 /// `include_deleted`; a node with no such row always is.
-pub async fn registry_nodes<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn registry_nodes(
+    executor: impl Executor<'_>,
     role: Option<NodeRole>,
     include_deleted: bool,
-) -> Result<Vec<RegistryNodeRow>, sqlx::Error> {
-    sqlx::query_as::<_, RegistryNodeRow>(sql!(
+) -> Result<Vec<RegistryNodeRow>, DbError> {
+    Ok(sqlx::query_as::<_, RegistryNodeRow>(sql!(
         "SELECT n.id,
                 nd.name,
                 host(n.address) AS address,
@@ -284,8 +284,8 @@ pub async fn registry_nodes<'e>(
     ))
     .bind(role.map(NodeRole::as_str))
     .bind(include_deleted)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// A Direct node as internal-api lists it, with its id, role, substrate and
@@ -309,13 +309,13 @@ pub struct ListedNodeRow {
 /// The nodes under `managed_by` with a `node_direct` row, of `role` when
 /// given, by role, then name, then endpoint. Deleted rows are listed only
 /// when `include_deleted`.
-pub async fn listed_nodes<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn listed_nodes(
+    executor: impl Executor<'_>,
     role: Option<NodeRole>,
     include_deleted: bool,
     managed_by: SubstrateKind,
-) -> Result<Vec<ListedNodeRow>, sqlx::Error> {
-    sqlx::query_as::<_, ListedNodeRow>(sql!(
+) -> Result<Vec<ListedNodeRow>, DbError> {
+    Ok(sqlx::query_as::<_, ListedNodeRow>(sql!(
         "SELECT n.id::TEXT AS id,
                     nd.name,
                     host(n.address) AS address,
@@ -338,17 +338,17 @@ pub async fn listed_nodes<'e>(
     .bind(role.map(NodeRole::as_str))
     .bind(include_deleted)
     .bind(managed_by)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The worker and builder ids of every substrate other than `direct`, and
 /// `direct`'s whose `node_direct` row is live, each once.
-pub async fn live_worker_and_builder_ids<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn live_worker_and_builder_ids(
+    executor: impl Executor<'_>,
     direct: SubstrateKind,
-) -> Result<Vec<NodeId>, sqlx::Error> {
-    sqlx::query_scalar::<_, NodeId>(sql!(
+) -> Result<Vec<NodeId>, DbError> {
+    Ok(sqlx::query_scalar::<_, NodeId>(sql!(
         "SELECT DISTINCT n.id
          FROM nodes n
          LEFT JOIN node_direct nd ON nd.node_id = n.id
@@ -359,17 +359,17 @@ pub async fn live_worker_and_builder_ids<'e>(
            )"
     ))
     .bind(direct)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// How many nodes under `managed_by` are tombstones: `nodes.state` is
 /// `deleted` and the `node_direct` row has a `deleted_at`.
-pub async fn count_tombstones<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn count_tombstones(
+    executor: impl Executor<'_>,
     managed_by: SubstrateKind,
-) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>(sql!(
+) -> Result<i64, DbError> {
+    Ok(sqlx::query_scalar::<_, i64>(sql!(
         "SELECT COUNT(*)
                FROM nodes n
                JOIN node_direct nd ON nd.node_id = n.id
@@ -378,8 +378,8 @@ pub async fn count_tombstones<'e>(
                 AND nd.deleted_at IS NOT NULL"
     ))
     .bind(managed_by)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 #[cfg(test)]

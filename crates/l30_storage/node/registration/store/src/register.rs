@@ -4,8 +4,8 @@
 use pplx_space_accounts::NodeId;
 use pplx_space_k8s_node_id::Ec2InstanceId;
 use pplx_space_node_model::{NodeRole, SubstrateKind};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::PgConnection;
 
 /// A Kubernetes node to register under its deterministic SPACE node id.
 #[derive(Debug, Clone, Copy)]
@@ -91,7 +91,7 @@ pub enum K8sNodeRegistrationError {
     Query {
         step: K8sNodeRegistrationStep,
         #[source]
-        source: sqlx::Error,
+        source: DbError,
     },
 }
 
@@ -101,7 +101,10 @@ trait Step<T> {
 
 impl<T> Step<T> for Result<T, sqlx::Error> {
     fn step(self, step: K8sNodeRegistrationStep) -> Result<T, K8sNodeRegistrationError> {
-        self.map_err(|source| K8sNodeRegistrationError::Query { step, source })
+        self.map_err(|source| K8sNodeRegistrationError::Query {
+            step,
+            source: DbError::from(source),
+        })
     }
 }
 
@@ -119,11 +122,14 @@ impl<T> Step<T> for Result<T, sqlx::Error> {
 /// roll back the caller's transaction. `on_drain_cleared` runs as soon as
 /// the drain state is cleared, before the statements after it run, told
 /// whether the drain it abandoned was a v2 one.
-pub async fn register_k8s_node(
-    conn: &mut PgConnection,
+pub async fn register_k8s_node<C>(
+    conn: &mut C,
     registration: K8sNodeRegistration<'_>,
     on_drain_cleared: impl FnOnce(bool),
-) -> Result<bool, K8sNodeRegistrationError> {
+) -> Result<bool, K8sNodeRegistrationError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let K8sNodeRegistration {
         node_id,
         name: node_name,
@@ -140,7 +146,7 @@ pub async fn register_k8s_node(
     // this check they re-create the `nodes` row under the same deterministic
     // id after an admin terminate deleted it, so the ghost row returns. The
     // caller's whole transaction is rolled back.
-    if is_node_k8s_tombstoned(conn, node_id)
+    if is_node_k8s_tombstoned(&mut *conn, node_id)
         .await
         .step(K8sNodeRegistrationStep::CheckTombstone)?
     {
@@ -177,7 +183,7 @@ pub async fn register_k8s_node(
     .bind(state)
     .bind(manage_state)
     .bind(SubstrateKind::Kubernetes)
-    .fetch_optional(&mut *conn)
+    .fetch_optional((&mut *conn).into_sqlx())
     .await
     .step(K8sNodeRegistrationStep::UpsertNode)?;
 
@@ -200,7 +206,7 @@ pub async fn register_k8s_node(
             ))
             .bind(node_id)
             .bind(SubstrateKind::Kubernetes)
-            .fetch_optional(&mut *conn)
+            .fetch_optional((&mut *conn).into_sqlx())
             .await
             .step(K8sNodeRegistrationStep::RecheckOwnership)?
             .is_some();
@@ -241,7 +247,7 @@ pub async fn register_k8s_node(
         ))
         .bind(node_id)
         .bind(node_uid)
-        .fetch_one(&mut *conn)
+        .fetch_one((&mut *conn).into_sqlx())
         .await
         .step(K8sNodeRegistrationStep::CheckUidChange)?;
     if awaiting_instance {
@@ -298,7 +304,7 @@ pub async fn register_k8s_node(
     .bind(node_id)
     .bind(node_uid)
     .bind(instance_id.map(Ec2InstanceId::as_str))
-    .fetch_optional(&mut *conn)
+    .fetch_optional((&mut *conn).into_sqlx())
     .await
     .step(K8sNodeRegistrationStep::ClearDrain)?;
     if let Some(abandoned_v2) = drain_cleared {
@@ -337,7 +343,7 @@ pub async fn register_k8s_node(
     .bind(node_name)
     .bind(node_uid)
     .bind(instance_id.map(Ec2InstanceId::as_str))
-    .execute(&mut *conn)
+    .execute((&mut *conn).into_sqlx())
     .await
     .step(K8sNodeRegistrationStep::UpsertNodeK8s)?
     .rows_affected()
@@ -348,7 +354,7 @@ pub async fn register_k8s_node(
     // would not have been visible to the pre-check but is now
     // visible — returning Err here causes the caller's transaction
     // to roll back, undoing the resurrection insert.
-    if is_node_k8s_tombstoned(conn, node_id)
+    if is_node_k8s_tombstoned(&mut *conn, node_id)
         .await
         .step(K8sNodeRegistrationStep::RecheckTombstone)?
     {
@@ -358,13 +364,13 @@ pub async fn register_k8s_node(
 }
 
 async fn is_node_k8s_tombstoned(
-    conn: &mut PgConnection,
+    executor: impl Executor<'_>,
     node_id: NodeId,
 ) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(sql!(
         "SELECT EXISTS(SELECT 1 FROM node_k8s_tombstones WHERE node_id = $1)"
     ))
     .bind(node_id)
-    .fetch_one(conn)
+    .fetch_one(executor.into_sqlx())
     .await
 }

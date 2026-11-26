@@ -23,8 +23,8 @@
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 
 /// A Kubernetes node row eligible for the orphaned-nodes delete, with its
 /// registration as the scan read it.
@@ -46,10 +46,10 @@ pub struct OrphanCandidateRow {
 /// node, while each probe walks its own index and stops at the first
 /// non-terminal row. The two forms are equivalent.
 pub async fn candidates(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     after: Option<NodeId>,
     limit: i64,
-) -> Result<Vec<OrphanCandidateRow>, sqlx::Error> {
+) -> Result<Vec<OrphanCandidateRow>, DbError> {
     let rows: Vec<(NodeId, String, Option<String>)> = sqlx::query_as(sql!(
         "SELECT n.id, k.k8s_node_name, k.k8s_node_uid
              FROM nodes n
@@ -75,7 +75,7 @@ pub async fn candidates(
     .bind(after)
     .bind(limit)
     .bind(SubstrateKind::Kubernetes)
-    .fetch_all(executor)
+    .fetch_all(executor.into_sqlx())
     .await?;
     Ok(rows
         .into_iter()
@@ -97,10 +97,10 @@ pub async fn candidates(
 /// uid matches a `None` expected one; a uid that appeared or moved since
 /// the scan refuses.
 pub async fn delete_if_orphan(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     expected_uid: Option<&str>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "DELETE FROM nodes n
              WHERE n.id = $1
@@ -125,7 +125,7 @@ pub async fn delete_if_orphan(
     .bind(node_id)
     .bind(expected_uid)
     .bind(SubstrateKind::Kubernetes)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() > 0)
 }

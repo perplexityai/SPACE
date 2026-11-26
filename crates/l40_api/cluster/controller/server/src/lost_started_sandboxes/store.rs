@@ -70,7 +70,7 @@ impl LostStartedSink for LostStartedDbStore {
             // can't make the flip wrong. `nodes.id` is derived from the node
             // name and role, so the row is a new instance under the old name,
             // and the sandbox's runtime and local disk went with the old one.
-            SourceNode::RowDeleted => !locks::share_lock_node(&mut tx, node_id).await?,
+            SourceNode::RowDeleted => !locks::share_lock_node(&mut *tx, node_id).await?,
             // Reached only after the tick found the node absent from
             // Kubernetes with no live EC2 instance. The row must still be
             // outside any drain and carry the uid the scan observed, so a

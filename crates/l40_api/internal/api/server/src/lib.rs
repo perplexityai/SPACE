@@ -1482,7 +1482,7 @@ impl ClusterApiService {
     /// name a node. No source node fails closed. Returns the admitted node.
     async fn authorize_backup_source_node(
         &self,
-        executor: impl sqlx::PgExecutor<'_>,
+        executor: impl pplx_space_postgres_pool::Executor<'_>,
         source_node_id: Option<NodeId>,
         remote_addr: Option<std::net::SocketAddr>,
         subject: &str,
@@ -1501,7 +1501,7 @@ impl ClusterApiService {
 /// Look up a registered node by ID on `executor`, so a caller holding a
 /// transaction does not need a second pooled connection.
 async fn registered_origin_node(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
     display_id: &str,
     node_id: NodeId,
     role_hint: Option<SpaceNodeRole>,
