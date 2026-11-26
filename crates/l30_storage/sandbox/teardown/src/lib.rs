@@ -41,6 +41,7 @@
 //! `sandboxes`, `nodes`, `node_k8s`, `node_template_inventory`, the template
 //! release tables and the Direct-only tables the same way.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 
@@ -61,11 +62,14 @@ pub fn sandbox_reconcile_cleanup_refs(sandbox_id: SandboxId) -> Vec<ReconcileEle
 }
 
 /// Delete every node's queue ref, observed status, and condition rows for the
-/// given facet/element pairs.
-pub async fn delete_reconcile_state_for_elements(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+/// given facet/element pairs. The caller must pass its open transaction.
+pub async fn delete_reconcile_state_for_elements<C>(
+    tx: &mut C,
     refs: &[ReconcileElementRef],
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let facets = refs
         .iter()
         .map(|reference| reference.facet_str().to_string())
@@ -89,7 +93,7 @@ pub async fn delete_reconcile_state_for_elements(
     ))
     .bind(&facets)
     .bind(&elements)
-    .execute(&mut **tx)
+    .execute((&mut *tx).into_sqlx())
     .await?;
     sqlx::query(sql!(
         "WITH refs AS (
@@ -103,7 +107,7 @@ pub async fn delete_reconcile_state_for_elements(
     ))
     .bind(&facets)
     .bind(&elements)
-    .execute(&mut **tx)
+    .execute((&mut *tx).into_sqlx())
     .await?;
     sqlx::query(sql!(
         "WITH refs AS (
@@ -117,7 +121,7 @@ pub async fn delete_reconcile_state_for_elements(
     ))
     .bind(&facets)
     .bind(&elements)
-    .execute(&mut **tx)
+    .execute((&mut *tx).into_sqlx())
     .await?;
     Ok(())
 }

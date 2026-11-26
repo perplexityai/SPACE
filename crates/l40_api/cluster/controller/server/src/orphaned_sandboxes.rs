@@ -536,6 +536,12 @@ pub enum OrphanClassifyError {
     Database(#[from] sqlx::Error),
 }
 
+impl From<pplx_space_postgres_pool::DbError> for OrphanClassifyError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TickReport {
     pub scanned: u32,
@@ -1292,7 +1298,7 @@ impl OrphanActionSink for SubstrateActionSink {
             // refs). Drop the old node's queue ref/condition in the same
             // transaction — same rule as the quarantine branch below.
             delete_reconcile_state_for_elements(
-                &mut tx,
+                &mut *tx,
                 &[ReconcileElementRef::sandbox_desired_state(sandbox_id)],
             )
             .await?;
@@ -1336,7 +1342,7 @@ impl OrphanActionSink for SubstrateActionSink {
             // ref/condition in the same transaction so the old node stops
             // retrying a poison ref that can never converge.
             delete_reconcile_state_for_elements(
-                &mut tx,
+                &mut *tx,
                 &[ReconcileElementRef::sandbox_desired_state(sandbox_id)],
             )
             .await?;

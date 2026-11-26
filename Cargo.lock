@@ -8117,6 +8117,7 @@ dependencies = [
  "pplx-space-db-test-fixtures",
  "pplx-space-net-common",
  "pplx-space-node-model",
+ "pplx-space-postgres-pool",
  "pplx-space-sandbox-model",
  "pplx-space-semver",
  "pplx-space-snapshot-model",

@@ -3,6 +3,7 @@
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use sqlx::FromRow;
 use sqlx::types::Json;
@@ -17,27 +18,27 @@ pub struct ObservedStatusKey {
 
 /// The greatest key in the table; `None` when it is empty.
 pub async fn greatest_key(
-    executor: impl sqlx::PgExecutor<'_>,
-) -> Result<Option<ObservedStatusKey>, sqlx::Error> {
-    sqlx::query_as::<_, ObservedStatusKey>(sql!(
+    executor: impl Executor<'_>,
+) -> Result<Option<ObservedStatusKey>, DbError> {
+    Ok(sqlx::query_as::<_, ObservedStatusKey>(sql!(
         "SELECT node_id, facet, element
          FROM node_facet_observed_status
          ORDER BY node_id DESC, facet DESC, element DESC
          LIMIT 1"
     ))
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Up to `limit` keys in `(after, through]`, ascending: one window of a
 /// primary-key range scan.
 pub async fn keys_in_window(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     after: &ObservedStatusKey,
     through: &ObservedStatusKey,
     limit: i64,
-) -> Result<Vec<ObservedStatusKey>, sqlx::Error> {
-    sqlx::query_as::<_, ObservedStatusKey>(sql!(
+) -> Result<Vec<ObservedStatusKey>, DbError> {
+    Ok(sqlx::query_as::<_, ObservedStatusKey>(sql!(
         "SELECT node_id, facet, element
          FROM node_facet_observed_status
          WHERE (node_id, facet, element) > ROW($1, $2, $3)
@@ -52,8 +53,8 @@ pub async fn keys_in_window(
     .bind(&through.facet)
     .bind(&through.element)
     .bind(limit)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Delete up to `limit` rows in the key range `(from, to]` that have not been
@@ -65,13 +66,13 @@ pub async fn keys_in_window(
 /// with them. Candidates are picked unordered within the window. Returns
 /// `(0, statuses deleted, conditions deleted)`.
 pub async fn delete_orphaned_in_window(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     orphan_age_secs: i64,
     limit: i64,
     from: &ObservedStatusKey,
     to: &ObservedStatusKey,
-) -> Result<(i64, i64, i64), sqlx::Error> {
-    sqlx::query_as(sql!(
+) -> Result<(i64, i64, i64), DbError> {
+    Ok(sqlx::query_as(sql!(
         "WITH stale AS MATERIALIZED (
              SELECT nfos.node_id, nfos.facet, nfos.element
              FROM node_facet_observed_status nfos
@@ -153,19 +154,19 @@ pub async fn delete_orphaned_in_window(
     .bind(to.node_id)
     .bind(&to.facet)
     .bind(&to.element)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Ensure `node_id` has a row for the `(facet, element)` ref (`None`, the
 /// whole-facet ref), inserting an empty observation or touching
 /// `updated_at` on the one there.
 pub async fn touch(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     facet: &str,
     element: Option<&str>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "INSERT INTO node_facet_observed_status (
              node_id, facet, element, observed_at, updated_at
@@ -177,7 +178,7 @@ pub async fn touch(
     .bind(node_id)
     .bind(facet)
     .bind(element)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -185,11 +186,11 @@ pub async fn touch(
 /// Delete `node_id`'s row for `facet` and `element`. Returns the rows
 /// deleted.
 pub async fn delete_for_element(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     facet: &str,
     element: &str,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let result = sqlx::query(sql!(
         "DELETE FROM node_facet_observed_status
          WHERE node_id = $1
@@ -199,7 +200,7 @@ pub async fn delete_for_element(
     .bind(node_id)
     .bind(facet)
     .bind(element)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected())
 }
@@ -207,11 +208,11 @@ pub async fn delete_for_element(
 /// Delete `node_id`'s rows for `facet` and any of `elements`. Returns the
 /// rows deleted.
 pub async fn delete_for_elements(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     facet: &str,
     elements: &[String],
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let result = sqlx::query(sql!(
         "DELETE FROM node_facet_observed_status
          WHERE node_id = $1
@@ -221,7 +222,7 @@ pub async fn delete_for_elements(
     .bind(node_id)
     .bind(facet)
     .bind(elements)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected())
 }
@@ -233,11 +234,11 @@ pub async fn delete_for_elements(
 /// a generation and names a template the node's `node_template_inventory`
 /// lists. A row already holding the same observation is left as it is.
 pub async fn upsert_template_network_policies(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     rows: &serde_json::Value,
     facet: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "WITH input AS (
              SELECT *
@@ -290,7 +291,7 @@ pub async fn upsert_template_network_policies(
     .bind(node_id)
     .bind(Json(rows))
     .bind(facet)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -306,12 +307,12 @@ pub async fn upsert_template_network_policies(
 /// execution matches the reported generation and pod is written, and a row
 /// already holding the same handoff is left as it is.
 pub async fn record_local_suspend_handoffs(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     rows: &serde_json::Value,
     facet: &str,
     key: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "WITH input AS MATERIALIZED (
              SELECT input.sandbox_id, input.execution_generation, input.pod_uid,
@@ -371,7 +372,7 @@ pub async fn record_local_suspend_handoffs(
     .bind(facet)
     .bind(key)
     .bind(SubstrateKind::Kubernetes)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -382,11 +383,11 @@ pub async fn record_local_suspend_handoffs(
 /// a generation and names a sandbox with no `sandboxes` row or one active on
 /// `node_id`. A row already holding the same observation is left as it is.
 pub async fn upsert_sandbox_network_policies(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     rows: &serde_json::Value,
     facet: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "WITH input AS (
                  SELECT *
@@ -443,7 +444,7 @@ pub async fn upsert_sandbox_network_policies(
     .bind(node_id)
     .bind(Json(rows))
     .bind(facet)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -455,12 +456,12 @@ pub async fn upsert_sandbox_network_policies(
 /// isn't degraded. A row holding the same recovery is rewritten only once
 /// its observation is `heartbeat_secs` old on the database clock.
 pub async fn upsert_quarantine_recovery(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     rows: &serde_json::Value,
     facet: &str,
     heartbeat_secs: i64,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "WITH input AS (
              SELECT *
@@ -505,7 +506,7 @@ pub async fn upsert_quarantine_recovery(
     .bind(Json(rows))
     .bind(facet)
     .bind(heartbeat_secs)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -514,12 +515,12 @@ pub async fn upsert_quarantine_recovery(
 /// `node_id`'s rows for `facet` and any of `elements` that carry either,
 /// stamping them observed now.
 pub async fn clear_quarantine_recovery_and_key(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     facet: &str,
     elements: &[String],
     key: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE node_facet_observed_status
          SET observed_payload = COALESCE(observed_payload, '{}'::JSONB)
@@ -539,7 +540,7 @@ pub async fn clear_quarantine_recovery_and_key(
     .bind(facet)
     .bind(elements)
     .bind(key)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -550,11 +551,11 @@ pub async fn clear_quarantine_recovery_and_key(
 /// `quarantine_recovery_observation_degraded`) that reports no recovery and
 /// isn't degraded, where the payload carries one, stamping it observed now.
 pub async fn clear_quarantine_recovery(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     rows: &serde_json::Value,
     facet: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "WITH input AS (
              SELECT *
@@ -584,7 +585,7 @@ pub async fn clear_quarantine_recovery(
     .bind(node_id)
     .bind(Json(rows))
     .bind(facet)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }

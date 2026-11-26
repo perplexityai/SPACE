@@ -451,7 +451,7 @@ pub(crate) async fn mark_template_deleted(
         ReconcileElementRef::template_desired_state(template.clone()),
         ReconcileElementRef::template_base_snapshot_policy(template.clone()),
     ];
-    delete_reconcile_state_for_elements(&mut tx, &cleanup_refs).await?;
+    delete_reconcile_state_for_elements(&mut *tx, &cleanup_refs).await?;
     pplx_space_template_release_store::removal::delete_storage_locations_of_template(
         &mut *tx,
         template.as_str(),

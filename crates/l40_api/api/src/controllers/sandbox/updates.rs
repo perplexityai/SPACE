@@ -1188,7 +1188,7 @@ impl SandboxController {
         match pool.begin().await {
             Ok(mut tx) => {
                 let result = async {
-                    delete_reconcile_state_for_elements(&mut tx, &cleanup_refs).await?;
+                    delete_reconcile_state_for_elements(&mut *tx, &cleanup_refs).await?;
                     sandbox_store::create::delete_failed_create(&mut *tx, sandbox_id).await?;
                     tx.commit().await
                 }

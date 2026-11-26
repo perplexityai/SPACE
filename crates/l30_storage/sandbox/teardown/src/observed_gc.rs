@@ -16,6 +16,7 @@
 //! `sandbox_snapshot_inventory` rows go with them through that table's
 //! foreign-key cascade.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use uuid::Uuid;
 
@@ -29,14 +30,14 @@ pub type DeletedCounts = (i64, i64, i64);
 /// observed a `quarantine_recovery` for the sandbox within
 /// `orphan_age_secs`.
 pub async fn delete_stale_suspended(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     stale_suspended_age_secs: i64,
     limit: i64,
     orphan_age_secs: i64,
     from: Uuid,
     to: Uuid,
-) -> Result<DeletedCounts, sqlx::Error> {
-    sqlx::query_as(sql!(
+) -> Result<DeletedCounts, DbError> {
+    Ok(sqlx::query_as(sql!(
         // `stale` keeps MATERIALIZED for its multiple downstream references;
         // its own LIMIT still evaluates lazily.
         "WITH stale AS MATERIALIZED (
@@ -109,8 +110,8 @@ pub async fn delete_stale_suspended(
     .bind(orphan_age_secs)
     .bind(from)
     .bind(to)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Delete up to `limit` observed rows in `(from, to]` whose sandbox has no
@@ -118,13 +119,13 @@ pub async fn delete_stale_suspended(
 /// their sandbox facet rows, unless the row's node observed a
 /// `quarantine_recovery` for the sandbox within `orphan_age_secs`.
 pub async fn delete_orphaned(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     orphan_age_secs: i64,
     limit: i64,
     from: Uuid,
     to: Uuid,
-) -> Result<DeletedCounts, sqlx::Error> {
-    sqlx::query_as(sql!(
+) -> Result<DeletedCounts, DbError> {
+    Ok(sqlx::query_as(sql!(
         "WITH stale AS MATERIALIZED (
              SELECT sos.sandbox_id, sos.node_id
              FROM sandbox_observed_states sos
@@ -194,8 +195,8 @@ pub async fn delete_orphaned(
     .bind(limit)
     .bind(from)
     .bind(to)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 #[cfg(test)]

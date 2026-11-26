@@ -8,10 +8,10 @@
 //! publication transaction and keeps everything around them.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use serde::Serialize;
-use sqlx::PgExecutor;
 use sqlx::types::{Json, JsonValue};
 
 #[cfg(test)]
@@ -33,12 +33,12 @@ pub struct DegradedObservedState {
 /// A sandbox not placed on `node_id` is skipped. A new row has snapshots
 /// off; an existing one keeps its other columns, and keeps its status when
 /// the published one is NULL.
-pub async fn write_degraded_observed_states<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn write_degraded_observed_states(
+    executor: impl Executor<'_>,
     node_id: NodeId,
     states: &[DegradedObservedState],
-) -> Result<Vec<SandboxId>, sqlx::Error> {
-    sqlx::query_scalar::<_, SandboxId>(sql!(
+) -> Result<Vec<SandboxId>, DbError> {
+    Ok(sqlx::query_scalar::<_, SandboxId>(sql!(
         "WITH input AS (
                  SELECT *
                  FROM jsonb_to_recordset($2::jsonb) AS input(
@@ -71,8 +71,8 @@ pub async fn write_degraded_observed_states<'e>(
     ))
     .bind(node_id)
     .bind(Json(states))
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// One sandbox's published observation, as [`write_published_observed_states`]
@@ -128,13 +128,13 @@ pub struct AcceptedSandboxPublishRow {
 ///
 /// A published NULL disk usage keeps the stored value, and a write resets
 /// the missing-publish count.
-pub async fn write_published_observed_states<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn write_published_observed_states(
+    executor: impl Executor<'_>,
     node_id: NodeId,
     rows: &[PublishedObservedState<'_>],
-) -> Result<Vec<AcceptedSandboxPublishRow>, sqlx::Error> {
+) -> Result<Vec<AcceptedSandboxPublishRow>, DbError> {
     // Typed arrays avoid decoding the entire publication JSON for this hot write.
-    sqlx::query_as::<_, AcceptedSandboxPublishRow>(sql!(
+    Ok(sqlx::query_as::<_, AcceptedSandboxPublishRow>(sql!(
         "WITH input AS (
              SELECT input.sandbox_id,
                     input.status,
@@ -471,6 +471,6 @@ pub async fn write_published_observed_states<'e>(
     .bind(rows.iter().map(|row| row.network_rx_bytes).collect::<Vec<_>>())
     .bind(rows.iter().map(|row| row.disk_usage_bytes).collect::<Vec<_>>())
     .bind(rows.iter().map(|row| row.auto_lifecycle_authority).collect::<Vec<_>>())
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }

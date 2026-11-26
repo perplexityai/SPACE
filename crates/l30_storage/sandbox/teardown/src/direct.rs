@@ -17,6 +17,7 @@
 //! observed-state reads, which read a Direct node's `node_direct` row.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use sqlx::types::Json;
 
@@ -43,12 +44,12 @@ pub struct FailureEpisodeKeys<'a> {
 /// activation attempt under their `keys` members, nulls dropped. A row
 /// already holding the same episode is left as it is.
 pub async fn record_failure_episodes(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     rows: &serde_json::Value,
     facet: &str,
     keys: FailureEpisodeKeys<'_>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "INSERT INTO node_facet_observed_status (
              node_id, facet, element, observed_payload, observed_at, updated_at
@@ -100,7 +101,7 @@ pub async fn record_failure_episodes(
     .bind(keys.execution_generation)
     .bind(keys.pod_uid)
     .bind(keys.activation_attempt_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -111,12 +112,12 @@ pub async fn record_failure_episodes(
 /// undegraded without an execution generation, where the payload carries
 /// `episode_key`, stamping it observed now.
 pub async fn clear_failure_episodes(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     rows: &serde_json::Value,
     facet: &str,
     episode_key: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE node_facet_observed_status observed
          SET observed_payload = COALESCE(observed.observed_payload, '{}'::JSONB)
@@ -152,7 +153,7 @@ pub async fn clear_failure_episodes(
     .bind(Json(rows))
     .bind(facet)
     .bind(episode_key)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
