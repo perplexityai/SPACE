@@ -2251,7 +2251,7 @@ pub async fn tag_template_release(
         pplx_space_template_store::templates::lock_no_key_update_of_release(&mut tx, release_id)
             .await?;
         let row = pplx_space_template_release_store::lookup::lock_release_of_present_template(
-            &mut tx, release_id,
+            &mut *tx, release_id,
         )
         .await?
         .map(TemplateReleaseRow::from);
@@ -2439,6 +2439,7 @@ async fn original_release_of(
         &release.content_hash,
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 pub async fn delete_template_release_tag(
@@ -2507,7 +2508,7 @@ pub async fn delete_template_release(
         // release of the digest inserted after this lock can't make a tag
         // resolve to the deleted release: once the delete commits, the
         // digest original is one of the surviving releases.
-        pplx_space_template_release_store::removal::lock_releases_of_digest(&mut tx, release_id)
+        pplx_space_template_release_store::removal::lock_releases_of_digest(&mut *tx, release_id)
             .await?;
         // A tag resolves to the digest original of the release it names, and
         // a tag written before the shared rule can name the other spelling's

@@ -390,7 +390,8 @@ async fn a_twin_whose_metadata_binds_another_environment_is_refused() -> TestRes
             &execution_metadata,
             &prepared(),
         )
-        .await;
+        .await
+        .map_err(sqlx::Error::from);
         assert!(
             matches!(refused, Err(sqlx::Error::InvalidArgument(_))),
             "{execution_metadata}: {refused:?}"
@@ -412,7 +413,9 @@ async fn a_twin_with_none_of_its_originals_locations_is_rolled_back() -> TestRes
         vec![],
         vec!["s3://other-bucket/x?region=us-east-1".to_owned()],
     ] {
-        let refused = insert_twin(&db.pool, original, bound(e1), &metadata(e1), &locations).await;
+        let refused = insert_twin(&db.pool, original, bound(e1), &metadata(e1), &locations)
+            .await
+            .map_err(sqlx::Error::from);
         assert!(
             matches!(refused, Err(sqlx::Error::InvalidArgument(_))),
             "{locations:?}: {refused:?}"
@@ -1950,7 +1953,7 @@ async fn release_locks_last_until_the_callers_transaction_ends() -> TestResult {
 
     let mut tx = db.pool.begin().await?;
     assert_eq!(
-        registration::lock_execution_metadata(&mut tx, original).await?,
+        registration::lock_execution_metadata(&mut *tx, original).await?,
         Some(bound)
     );
     assert!(!release_lock_free(&db.pool, original, "KEY SHARE").await?);
@@ -1958,13 +1961,15 @@ async fn release_locks_last_until_the_callers_transaction_ends() -> TestResult {
     tx.rollback().await?;
     let mut tx = db.pool.begin().await?;
     assert!(matches!(
-        registration::lock_execution_metadata(&mut tx, Uuid::now_v7()).await,
+        registration::lock_execution_metadata(&mut *tx, Uuid::now_v7())
+            .await
+            .map_err(sqlx::Error::from),
         Err(sqlx::Error::RowNotFound)
     ));
     tx.rollback().await?;
 
     let mut tx = db.pool.begin().await?;
-    let release = lookup::lock_release_of_present_template(&mut tx, original)
+    let release = lookup::lock_release_of_present_template(&mut *tx, original)
         .await?
         .expect("a present template's release");
     assert_eq!(
@@ -1985,7 +1990,7 @@ async fn release_locks_last_until_the_callers_transaction_ends() -> TestResult {
         .await?;
     let mut tx = db.pool.begin().await?;
     assert!(
-        lookup::lock_release_of_present_template(&mut tx, original)
+        lookup::lock_release_of_present_template(&mut *tx, original)
             .await?
             .is_none()
     );
@@ -1993,7 +1998,7 @@ async fn release_locks_last_until_the_callers_transaction_ends() -> TestResult {
     tx.rollback().await?;
 
     let mut tx = db.pool.begin().await?;
-    removal::lock_releases_of_digest(&mut tx, other_spelling).await?;
+    removal::lock_releases_of_digest(&mut *tx, other_spelling).await?;
     assert!(!release_lock_free(&db.pool, original, "KEY SHARE").await?);
     assert!(!release_lock_free(&db.pool, other_spelling, "KEY SHARE").await?);
     tx.rollback().await?;

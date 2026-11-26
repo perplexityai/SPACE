@@ -160,6 +160,7 @@ pub(super) async fn upsert_pool_config(
         pplx_space_execution_catalog::catalog::initial_environment_reference(),
     )
     .await
+    .map_err(sqlx::Error::from)
     .map_err(|err| db_contention_error("failed to read the release's original", &err))?
     .is_some();
     if let Some(twin) = resolved.filter(|resolved| !release_is_twin && *resolved != release.id) {
@@ -241,6 +242,7 @@ pub(super) async fn disable_pool_config(
         initial_environment,
     )
     .await
+    .map_err(sqlx::Error::from)
     .map_err(|err| db_contention_error("failed to read the release's original", &err))?;
     if twin_of.is_none() {
         let twins = pplx_space_template_release_store::twin_releases(
@@ -249,6 +251,7 @@ pub(super) async fn disable_pool_config(
             initial_environment,
         )
         .await
+        .map_err(sqlx::Error::from)
         .map_err(|err| db_contention_error("failed to read the release's twins", &err))?;
         for twin in twins {
             WarmPoolStore::disable_shape_config(&mut tx, twin, &disabled)
@@ -791,6 +794,7 @@ async fn resolve_pool_template_release(
             content_hash: release.content_hash,
         })
     })
+    .map_err(sqlx::Error::from)
     .map_err(|err| db_contention_error("failed to resolve pool template release", &err))
 }
 
@@ -815,6 +819,7 @@ async fn named_pool_template_release(
             content_hash: release.content_hash,
         })
     })
+    .map_err(sqlx::Error::from)
     .map_err(|err| db_contention_error("failed to read the named pool template release", &err))
 }
 

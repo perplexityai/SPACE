@@ -183,6 +183,7 @@ impl TemplateReleasesStore {
             filter.catalog_filter(),
         )
         .await
+        .map_err(sqlx::Error::from)
     }
 
     /// The releases a lookup of `name` at `hash` (or its `bare_hash`)
@@ -205,6 +206,7 @@ impl TemplateReleasesStore {
             filter.catalog_filter(),
         )
         .await
+        .map_err(sqlx::Error::from)
     }
 
     /// The latest `limit` releases for `(template_name, runtime)`; see

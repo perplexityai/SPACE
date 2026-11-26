@@ -708,6 +708,7 @@ async fn original_pool_assignment(
         pplx_space_execution_catalog::catalog::initial_environment_reference(),
     )
     .await
+    .map_err(sqlx::Error::from)
     .map_err(|err| db_contention_error("failed to read the release's original", &err))?;
     match original {
         Some(original) => enabled_pool_assignment(pool, original).await,

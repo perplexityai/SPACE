@@ -462,7 +462,8 @@ pub(crate) async fn mark_template_deleted(
         &mut *tx,
         template.as_str(),
     )
-    .await;
+    .await
+    .map_err(sqlx::Error::from);
     if let Err(error) = releases {
         // A reference that committed after the check above. A new slot or
         // enabled config is reported, rather than retrying a delete that

@@ -8,13 +8,13 @@ use pplx_space_content_digest::HashAlg;
 use std::sync::LazyLock;
 
 use pplx_space_execution_spec::{EnvironmentReference, RuntimeKind};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use pplx_space_template_model::{
     TemplateArtifactDigest, TemplateArtifactDigestPrefix, TemplateDesiredState, TemplateName,
     TemplateTag, TemplateVisibility,
 };
 use pplx_space_template_release_original::{digest_original, spelling_original};
-use sqlx::PgExecutor;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -44,16 +44,16 @@ pub struct NamedRelease {
 /// `None` for an unbound release or no release. This reads that release's
 /// own row, which may be a twin, not the digest original's.
 pub async fn release_environment_by_id(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     release_id: Uuid,
-) -> Result<Option<String>, sqlx::Error> {
+) -> Result<Option<String>, DbError> {
     Ok(sqlx::query_scalar::<_, Option<String>>(sql!(
         "SELECT execution_metadata->>'environment'
          FROM template_releases
          WHERE id = $1"
     ))
     .bind(release_id)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?
     .flatten())
 }
@@ -69,12 +69,12 @@ pub async fn release_environment_by_id(
 /// legacy partition, so a holder bound to it holds the unbound release's
 /// build. Both can exist only under different spellings of the digest.
 pub async fn bound_release_environments(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &str,
     content_hash: &str,
     initial_environment: EnvironmentReference,
-) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>(sql!(
+) -> Result<Vec<String>, DbError> {
+    Ok(sqlx::query_scalar::<_, String>(sql!(
         "SELECT DISTINCT r.execution_metadata->>'environment'
          FROM template_releases r
          WHERE r.template_name = $1
@@ -85,8 +85,8 @@ pub async fn bound_release_environments(
     .bind(template_name)
     .bind(content_hash)
     .bind(initial_environment.to_string())
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The stored hashes of `template_name`'s `runtime` releases that start with
@@ -95,16 +95,16 @@ pub async fn bound_release_environments(
 /// a SHA-256 prefix's hex. The hashes come back as stored; the caller parses
 /// them.
 pub async fn visible_release_hashes_with_prefix(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &TemplateName,
     prefix: &TemplateArtifactDigestPrefix,
     runtime: RuntimeKind,
     caller_org: OrgId,
-) -> Result<Vec<String>, sqlx::Error> {
+) -> Result<Vec<String>, DbError> {
     let prefix = prefix.digest_prefix();
     let bare_sha256_prefix =
         (prefix.algorithm() == HashAlg::Sha256).then(|| prefix.hex_prefix().to_owned());
-    sqlx::query_scalar::<_, String>(sql!(
+    Ok(sqlx::query_scalar::<_, String>(sql!(
         "SELECT DISTINCT r.hash
          FROM template_releases r
          JOIN templates tpl ON tpl.name = r.template_name
@@ -124,18 +124,18 @@ pub async fn visible_release_hashes_with_prefix(
     .bind(caller_org.as_uuid())
     .bind(TemplateDesiredState::Present.as_str())
     .bind(bare_sha256_prefix)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether `template_name` has any release, whatever its runtime and tags, of
 /// a `present` template that is generic or owned by `caller_org`.
 pub async fn template_has_visible_release(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &TemplateName,
     caller_org: OrgId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
         "SELECT EXISTS (
              SELECT 1
              FROM template_releases r
@@ -149,8 +149,8 @@ pub async fn template_has_visible_release(
     .bind(TemplateVisibility::Generic.as_str())
     .bind(caller_org.as_uuid())
     .bind(TemplateDesiredState::Present.as_str())
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Every release of a `present` template that has no owning organization or
@@ -159,10 +159,10 @@ pub async fn template_has_visible_release(
 /// [`template_has_visible_release`]: a `generic` template owned by an
 /// organization outside `org_ids` is left out.
 pub async fn releases_unowned_or_owned_by(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_ids: &[OrgId],
-) -> Result<Vec<VisibleRelease>, sqlx::Error> {
-    sqlx::query_as::<_, VisibleRelease>(sql!(
+) -> Result<Vec<VisibleRelease>, DbError> {
+    Ok(sqlx::query_as::<_, VisibleRelease>(sql!(
         "SELECT r.id, r.template_name, r.type AS runtime, r.hash AS content_hash, r.created_at
          FROM template_releases r
          JOIN templates t ON t.name = r.template_name
@@ -172,19 +172,19 @@ pub async fn releases_unowned_or_owned_by(
     ))
     .bind(org_ids)
     .bind(TemplateDesiredState::Present.as_str())
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The release `release_id` names, when it's a release of `template_name`
 /// (and stored under exactly `content_hash`, when given).
 pub async fn named_release(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     release_id: Uuid,
     template_name: &str,
     content_hash: Option<&str>,
-) -> Result<Option<NamedRelease>, sqlx::Error> {
-    sqlx::query_as::<_, NamedRelease>(sql!(
+) -> Result<Option<NamedRelease>, DbError> {
+    Ok(sqlx::query_as::<_, NamedRelease>(sql!(
         "SELECT r.id, r.hash AS content_hash
          FROM template_releases r
          WHERE r.id = $1
@@ -194,8 +194,8 @@ pub async fn named_release(
     .bind(release_id)
     .bind(template_name)
     .bind(content_hash)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The release a Kubernetes pool claim or config upsert targets: the
@@ -209,10 +209,10 @@ pub async fn named_release(
 /// would otherwise be the newest, and the other spelling's original of a
 /// digest would hold slots no create claims. The hash comes back as stored.
 pub async fn pool_target_release(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &str,
     content_hash: Option<&str>,
-) -> Result<Option<NamedRelease>, sqlx::Error> {
+) -> Result<Option<NamedRelease>, DbError> {
     /// Built once: every input is a literal or a bind placeholder.
     static QUERY: LazyLock<String> = LazyLock::new(|| {
         sql!(format!(
@@ -238,11 +238,13 @@ pub async fn pool_target_release(
             digest_original = digest_original("r"),
         ))
     });
-    sqlx::query_as::<_, NamedRelease>(sqlx::AssertSqlSafe(QUERY.as_str()))
-        .bind(template_name)
-        .bind(content_hash)
-        .fetch_optional(executor)
-        .await
+    Ok(
+        sqlx::query_as::<_, NamedRelease>(sqlx::AssertSqlSafe(QUERY.as_str()))
+            .bind(template_name)
+            .bind(content_hash)
+            .fetch_optional(executor.into_sqlx())
+            .await?,
+    )
 }
 
 /// Every environment a release is bound to, an unbound release counting as
@@ -250,16 +252,16 @@ pub async fn pool_target_release(
 /// A binding that isn't a string comes back as its JSON text, which no
 /// environment reference parses as.
 pub async fn release_environments(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     initial_environment: EnvironmentReference,
-) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Vec<String>, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT DISTINCT COALESCE(execution_metadata ->> 'environment', $1)
          FROM template_releases"
     ))
     .bind(initial_environment.to_string())
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The release a create names by tag: the digest original
@@ -271,12 +273,12 @@ pub async fn release_environments(
 /// node inventory and lifecycle-default reads match it exactly, and a pool
 /// claim matches either spelling.
 pub async fn resolve_by_tag(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &TemplateName,
     tag: &TemplateTag,
     runtime: RuntimeKind,
     caller_org: OrgId,
-) -> Result<Option<(Uuid, String)>, sqlx::Error> {
+) -> Result<Option<(Uuid, String)>, DbError> {
     /// Built once: every input is a literal or a bind placeholder.
     static QUERY: LazyLock<String> = LazyLock::new(|| {
         sql!(format!(
@@ -300,15 +302,17 @@ pub async fn resolve_by_tag(
             digest_original = digest_original("r"),
         ))
     });
-    sqlx::query_as::<_, (Uuid, String)>(sqlx::AssertSqlSafe(QUERY.as_str()))
-        .bind(template_name.as_str())
-        .bind(tag.as_str())
-        .bind(runtime.alias())
-        .bind(TemplateVisibility::Generic.as_str())
-        .bind(caller_org.as_uuid())
-        .bind(TemplateDesiredState::Present.as_str())
-        .fetch_optional(executor)
-        .await
+    Ok(
+        sqlx::query_as::<_, (Uuid, String)>(sqlx::AssertSqlSafe(QUERY.as_str()))
+            .bind(template_name.as_str())
+            .bind(tag.as_str())
+            .bind(runtime.alias())
+            .bind(TemplateVisibility::Generic.as_str())
+            .bind(caller_org.as_uuid())
+            .bind(TemplateDesiredState::Present.as_str())
+            .fetch_optional(executor.into_sqlx())
+            .await?,
+    )
 }
 
 /// The release a create or base resolution names by digest: the digest's
@@ -317,12 +321,12 @@ pub async fn resolve_by_tag(
 /// internal API and the warm pool resolve it with), never a twin bound to
 /// another environment.
 pub async fn resolve_by_digest(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &TemplateName,
     digest: TemplateArtifactDigest,
     runtime: RuntimeKind,
     caller_org: OrgId,
-) -> Result<Option<(Uuid, String)>, sqlx::Error> {
+) -> Result<Option<(Uuid, String)>, DbError> {
     /// Built once: every input is a literal or a bind placeholder.
     static QUERY: LazyLock<String> = LazyLock::new(|| {
         sql!(format!(
@@ -346,7 +350,7 @@ pub async fn resolve_by_digest(
         .bind(TemplateVisibility::Generic.as_str())
         .bind(caller_org.as_uuid())
         .bind(TemplateDesiredState::Present.as_str())
-        .fetch_optional(executor)
+        .fetch_optional(executor.into_sqlx())
         .await?;
     // Legacy unprefixed rows matched the same digest; return its canonical form.
     Ok(release_id.map(|id| (id, hash)))
@@ -365,10 +369,10 @@ pub async fn resolve_by_digest(
 /// hold nothing, and of a Kubernetes pod's template work, through
 /// `environment_placement::work_environment`.
 pub async fn original_release_environment(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &str,
     content_hash: &str,
-) -> Result<Option<String>, sqlx::Error> {
+) -> Result<Option<String>, DbError> {
     /// Built once: every input is a literal or a bind placeholder.
     static QUERY: LazyLock<String> = LazyLock::new(|| {
         sql!(format!(
@@ -385,7 +389,7 @@ pub async fn original_release_environment(
         sqlx::query_scalar::<_, Option<String>>(sqlx::AssertSqlSafe(QUERY.as_str()))
             .bind(template_name)
             .bind(content_hash)
-            .fetch_optional(executor)
+            .fetch_optional(executor.into_sqlx())
             .await?
             .flatten(),
     )
@@ -416,10 +420,10 @@ pub struct ReleasePopulationRow {
 /// in use; see [`ReleasePopulationRow`]. Resolution counts an unbound release
 /// as `initial_environment`'s; the rows still report it as unbound.
 pub async fn release_population(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     boots_template_twins: bool,
     initial_environment: EnvironmentReference,
-) -> Result<Vec<ReleasePopulationRow>, sqlx::Error> {
+) -> Result<Vec<ReleasePopulationRow>, DbError> {
     static STATEMENT: LazyLock<String> = LazyLock::new(|| {
         sql!(format!(
             "SELECT tr.execution_metadata ->> 'environment' AS environment_ref,
@@ -471,11 +475,11 @@ pub async fn release_population(
             ),
         ))
     });
-    sqlx::query_as(sqlx::AssertSqlSafe(STATEMENT.as_str()))
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(STATEMENT.as_str()))
         .bind(boots_template_twins)
         .bind(initial_environment.to_string())
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }
 
 #[cfg(test)]
@@ -485,11 +489,15 @@ mod tests;
 /// locking the release's row `FOR UPDATE` until the caller's transaction
 /// ends. The admin tag move locks the template's row first
 /// (`pplx_space_template_store::templates::lock_no_key_update_of_release`).
-pub async fn lock_release_of_present_template(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+/// The caller must pass its open transaction.
+pub async fn lock_release_of_present_template<C>(
+    tx: &mut C,
     release_id: Uuid,
-) -> Result<Option<VisibleRelease>, sqlx::Error> {
-    sqlx::query_as::<_, VisibleRelease>(sql!(
+) -> Result<Option<VisibleRelease>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_as::<_, VisibleRelease>(sql!(
         "SELECT r.id, r.template_name, r.type AS runtime, r.hash AS content_hash, r.created_at
              FROM template_releases r
              JOIN templates t ON t.name = r.template_name
@@ -499,8 +507,8 @@ pub async fn lock_release_of_present_template(
     ))
     .bind(release_id)
     .bind(TemplateDesiredState::Present.as_str())
-    .fetch_optional(&mut **tx)
-    .await
+    .fetch_optional(tx.into_sqlx())
+    .await?)
 }
 
 /// The id of the original release of `template_name` at `content_hash`,
@@ -509,10 +517,10 @@ pub async fn lock_release_of_present_template(
 /// tags attach to, which [`original_release_environment`] reads the binding
 /// of. `None` when no release has the digest.
 pub async fn original_release_id(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &str,
     content_hash: &str,
-) -> Result<Option<Uuid>, sqlx::Error> {
+) -> Result<Option<Uuid>, DbError> {
     /// Built once: every input is a literal or a bind placeholder.
     static QUERY: LazyLock<String> = LazyLock::new(|| {
         sql!(format!(
@@ -524,11 +532,11 @@ pub async fn original_release_id(
             digest_original = digest_original("r"),
         ))
     });
-    sqlx::query_scalar(sqlx::AssertSqlSafe(QUERY.as_str()))
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(QUERY.as_str()))
         .bind(template_name)
         .bind(content_hash)
-        .fetch_optional(executor)
-        .await
+        .fetch_optional(executor.into_sqlx())
+        .await?)
 }
 
 /// Whether release `release_id` is its spelling's original
@@ -536,9 +544,9 @@ pub async fn original_release_id(
 /// twins: releases of the same template and exact hash registered after it.
 /// The admin release delete refuses to delete such an original.
 pub async fn release_has_twins(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     release_id: Uuid,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     /// Built once: every input is a literal or a bind placeholder.
     static HAS_TWINS: LazyLock<String> = LazyLock::new(|| {
         sql!(format!(
@@ -554,10 +562,10 @@ pub async fn release_has_twins(
             spelling_original = spelling_original("r"),
         ))
     });
-    sqlx::query_scalar(sqlx::AssertSqlSafe(HAS_TWINS.as_str()))
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(HAS_TWINS.as_str()))
         .bind(release_id)
-        .fetch_one(executor)
-        .await
+        .fetch_one(executor.into_sqlx())
+        .await?)
 }
 
 /// Whether release `release_id` is tagged `latest`, or is its digest's
@@ -565,9 +573,9 @@ pub async fn release_has_twins(
 /// tag names another release of the same digest, under either spelling. The
 /// admin release delete refuses to delete such a release.
 pub async fn release_serves_a_tag(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     release_id: Uuid,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     /// Built once: every input is a literal or a bind placeholder.
     static SERVES_A_TAG: LazyLock<String> = LazyLock::new(|| {
         sql!(format!(
@@ -591,8 +599,10 @@ pub async fn release_serves_a_tag(
             digest_original = digest_original("r"),
         ))
     });
-    sqlx::query_scalar(sqlx::AssertSqlSafe(SERVES_A_TAG.as_str()))
-        .bind(release_id)
-        .fetch_one(executor)
-        .await
+    Ok(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(SERVES_A_TAG.as_str()))
+            .bind(release_id)
+            .fetch_one(executor.into_sqlx())
+            .await?,
+    )
 }

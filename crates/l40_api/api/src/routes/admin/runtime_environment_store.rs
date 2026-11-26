@@ -106,7 +106,7 @@ pub(super) struct TemplateReleasePopulationRow {
 /// whether it's in use. Resolution counts an unbound release as the initial
 /// environment's; the rows still report it as unbound.
 pub(super) async fn template_release_population(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
     boots_template_twins: bool,
 ) -> Result<Vec<TemplateReleasePopulationRow>, sqlx::Error> {
     Ok(

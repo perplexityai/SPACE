@@ -1,5 +1,6 @@
 //! Inserting a release's twin.
 
+use pplx_space_postgres_pool::DbError;
 use pplx_space_sql_locator::sql;
 use sqlx::{Acquire, PgConnection, Postgres};
 use uuid::Uuid;
@@ -38,12 +39,13 @@ pub enum InsertTwin {
 /// one, so the caller checks [`crate::has_encrypted_storage_locations`] on the
 /// credentials pool first and never twins a release with encrypted locations.
 ///
-/// Fails with [`sqlx::Error::InvalidArgument`], writing nothing, when
-/// `execution_metadata` doesn't bind `target.environment`, or when it would
-/// insert the twin and none of `locations` is one of the original's: a twin
-/// with no location would hold the environment's release slot with nothing
-/// fetchable and turn a retry into [`InsertTwin::SlotTaken`]. `locations` isn't
-/// checked when nothing is inserted.
+/// Fails with the [`DbError`] of [`sqlx::Error::InvalidArgument`], writing
+/// nothing, when `execution_metadata` doesn't bind `target.environment`, or
+/// when it would insert the twin and none of `locations` is one of the
+/// original's: a twin with no location would hold the environment's release
+/// slot with nothing fetchable and turn a retry into
+/// [`InsertTwin::SlotTaken`]. `locations` isn't checked when nothing is
+/// inserted.
 ///
 /// The twin's `created_at` is never earlier than its original's, so the
 /// original stays first even if the database clock steps back. Each copied
@@ -78,7 +80,7 @@ pub async fn insert_twin(
     target: PartitionSelector,
     execution_metadata: &serde_json::Value,
     locations: &[String],
-) -> Result<InsertTwin, sqlx::Error> {
+) -> Result<InsertTwin, DbError> {
     let bound = execution_metadata
         .get("environment")
         .and_then(serde_json::Value::as_str);
@@ -86,7 +88,8 @@ pub async fn insert_twin(
         return Err(sqlx::Error::InvalidArgument(format!(
             "a twin bound to {} needs execution_metadata binding that environment, not {bound:?}",
             target.environment
-        )));
+        ))
+        .into());
     }
     let mut tx = conn.begin().await?;
     let inserted = insert_in(&mut tx, original, target, execution_metadata, locations).await;
@@ -99,7 +102,7 @@ async fn insert_in(
     target: PartitionSelector,
     execution_metadata: &serde_json::Value,
     locations: &[String],
-) -> Result<InsertTwin, sqlx::Error> {
+) -> Result<InsertTwin, DbError> {
     let Some((template_name, hash)) = sqlx::query_as::<_, (String, String)>(sql!(
         "SELECT r.template_name, r.hash
          FROM template_releases r
@@ -199,7 +202,8 @@ async fn insert_in(
         return Err(sqlx::Error::InvalidArgument(format!(
             "none of the {} named storage locations is one of release {original}'s",
             locations.len()
-        )));
+        ))
+        .into());
     }
     Ok(InsertTwin::Inserted(twin))
 }

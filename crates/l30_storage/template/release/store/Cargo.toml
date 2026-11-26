@@ -38,6 +38,7 @@ pplx-space-artifact-model = { workspace = true }
 pplx-space-content-digest = { workspace = true }
 pplx-space-execution-spec = { workspace = true }
 pplx-space-object-store = { workspace = true }
+pplx-space-postgres-pool = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 pplx-space-template-model = { workspace = true }
 pplx-space-template-release-original = { workspace = true }

@@ -538,7 +538,7 @@ async fn first_default_template_campaign(
             pplx_space_execution_catalog::catalog::initial_environment_reference(),
         )
         .await
-        .map_err(|err| Box::new(read_db_error(err)))?
+        .map_err(|err| Box::new(read_db_error(sqlx::Error::from(err))))?
         .iter()
         .filter_map(|environment| environment.parse().ok())
         .collect();

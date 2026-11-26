@@ -27,10 +27,10 @@
 use std::sync::LazyLock;
 
 use pplx_space_accounts::{NodeId, OrgId};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use pplx_space_template_release_original::{digest_original, spelling_original};
 use serde::Deserialize;
-use sqlx::PgExecutor;
 use sqlx::types::Json;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -149,13 +149,13 @@ fn selector_binds(selector: Option<PartitionSelector>) -> (Option<String>, bool)
 /// tagged release's digest, which a tag written before the shared rule
 /// may not point at.
 pub async fn find_by_tag(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &str,
     runtime: &str,
     tag: &str,
     node_ids: Option<&[NodeId]>,
     filter: CatalogFilter,
-) -> Result<Vec<CatalogReleaseRow>, sqlx::Error> {
+) -> Result<Vec<CatalogReleaseRow>, DbError> {
     let CatalogFilter {
         caller_org,
         generic_only,
@@ -202,14 +202,14 @@ pub async fn find_by_tag(
                 digest_original = digest_original("r"),
             ))
         });
-        return sqlx::query_as(sqlx::AssertSqlSafe(UNSCOPED.as_str()))
+        return Ok(sqlx::query_as(sqlx::AssertSqlSafe(UNSCOPED.as_str()))
             .bind(template_name)
             .bind(tag)
             .bind(runtime)
             .bind(environment)
             .bind(legacy_selector)
-            .fetch_all(executor)
-            .await;
+            .fetch_all(executor.into_sqlx())
+            .await?);
     }
     /// Built once: every input is a literal or a bind placeholder.
     static SCOPED: LazyLock<String> = LazyLock::new(|| {
@@ -282,7 +282,7 @@ pub async fn find_by_tag(
             digest_original = digest_original("r"),
         ))
     });
-    sqlx::query_as(sqlx::AssertSqlSafe(SCOPED.as_str()))
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(SCOPED.as_str()))
         .bind(template_name)
         .bind(tag)
         .bind(runtime)
@@ -291,8 +291,8 @@ pub async fn find_by_tag(
         .bind(generic_only)
         .bind(environment)
         .bind(legacy_selector)
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }
 
 /// The releases a catalog lookup of `template_name` at `hash` (canonical
@@ -307,13 +307,13 @@ pub async fn find_by_tag(
 /// unselected lookup answers with; the other spelling's original only
 /// contributes storage locations.
 pub async fn find_by_hash(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &str,
     hash: &str,
     bare_hash: &str,
     node_ids: Option<&[NodeId]>,
     filter: CatalogFilter,
-) -> Result<Vec<CatalogReleaseRow>, sqlx::Error> {
+) -> Result<Vec<CatalogReleaseRow>, DbError> {
     let CatalogFilter {
         caller_org,
         generic_only,
@@ -351,14 +351,14 @@ pub async fn find_by_hash(
                 digest_original = digest_original("r"),
             ))
         });
-        return sqlx::query_as(sqlx::AssertSqlSafe(UNSCOPED.as_str()))
+        return Ok(sqlx::query_as(sqlx::AssertSqlSafe(UNSCOPED.as_str()))
             .bind(template_name)
             .bind(hash)
             .bind(bare_hash)
             .bind(environment)
             .bind(legacy_selector)
-            .fetch_all(executor)
-            .await;
+            .fetch_all(executor.into_sqlx())
+            .await?);
     }
     /// Built once: every input is a literal or a bind placeholder.
     static SCOPED: LazyLock<String> = LazyLock::new(|| {
@@ -422,7 +422,7 @@ pub async fn find_by_hash(
             digest_original = digest_original("r"),
         ))
     });
-    sqlx::query_as(sqlx::AssertSqlSafe(SCOPED.as_str()))
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(SCOPED.as_str()))
         .bind(template_name)
         .bind(hash)
         .bind(bare_hash)
@@ -431,8 +431,8 @@ pub async fn find_by_hash(
         .bind(generic_only)
         .bind(environment)
         .bind(legacy_selector)
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }
 
 /// The statement [`list_latest`] runs for a node-scoped caller, built once:
@@ -596,13 +596,13 @@ pub(crate) static LIST_LATEST_UNSCOPED: LazyLock<String> = LazyLock::new(|| {
 /// and a negative one fails the statement (Postgres rejects a negative
 /// `LIMIT`), so a caller that wants to refuse either checks it first.
 pub async fn list_latest(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &str,
     runtime: &str,
     limit: i64,
     node_ids: Option<&[NodeId]>,
     selector: Option<PartitionSelector>,
-) -> Result<Vec<LatestRelease>, sqlx::Error> {
+) -> Result<Vec<LatestRelease>, DbError> {
     let (environment, legacy_selector) = selector_binds(selector);
     // Server-side aggregation: inner subquery picks the latest
     // `limit` releases (one release per digest, whichever spelling it's
@@ -637,7 +637,7 @@ pub async fn list_latest(
             .bind(node_ids)
             .bind(&environment)
             .bind(legacy_selector)
-            .fetch_all(executor)
+            .fetch_all(executor.into_sqlx())
             .await?
     } else {
         sqlx::query_as::<_, LatestReleaseRow>(sqlx::AssertSqlSafe(LIST_LATEST_UNSCOPED.as_str()))
@@ -646,7 +646,7 @@ pub async fn list_latest(
             .bind(limit)
             .bind(&environment)
             .bind(legacy_selector)
-            .fetch_all(executor)
+            .fetch_all(executor.into_sqlx())
             .await?
     };
 
