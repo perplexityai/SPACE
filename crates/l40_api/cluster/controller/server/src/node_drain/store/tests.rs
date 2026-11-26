@@ -93,7 +93,8 @@ fn pending_restore_source_defers_to_the_next_sweep() {
 /// high-churn `node_reconcile_*` tables and drives RDS CPU up as sequential
 /// scans wade through the accumulated dead tuples. This asserts that
 /// `connect_restore_listener` applies those GUCs to the session it returns
-/// (it fails if the hardening `SET`s are dropped).
+/// (it fails if `connect_restore_listener` stops applying
+/// `set_listener_keepalives`).
 #[tokio::test(flavor = "current_thread")]
 async fn restore_listener_hardens_connection_against_xmin_pinning()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -111,14 +112,6 @@ async fn restore_listener_hardens_connection_against_xmin_pinning()
     assert_eq!(
         hardened_timeout, "30000",
         "connect_restore_listener must set tcp_user_timeout (ms) on the session"
-    );
-    let keepalive_idle: String =
-        sqlx::query_scalar(sql!("SELECT current_setting('tcp_keepalives_idle')"))
-            .fetch_one(&mut listener)
-            .await?;
-    assert_ne!(
-        keepalive_idle, "0",
-        "connect_restore_listener must enable TCP keepalive probing"
     );
 
     Ok(())

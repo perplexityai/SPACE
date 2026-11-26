@@ -4868,39 +4868,18 @@ impl NodeDrainSink for SubstrateSink {
     }
 }
 
-/// TCP keepalive + `tcp_user_timeout` GUCs applied to the dedicated
-/// snapshot-ready `LISTEN` session so Postgres reaps a dead or unreachable
-/// cluster-controller promptly instead of letting its backend linger for hours.
-///
-/// This listener connection is detached from the pool and then parks in
-/// `recv()`, so it is exempt from the pool's idle-timeout recycling. If this
-/// process dies ungracefully (leaving a half-open TCP connection) or the
-/// backend wedges in `ClientWrite` because we stopped reading it, Postgres
-/// would otherwise keep that backend — and the snapshot it holds — alive until
-/// its own multi-hour TCP timeout. A backend held that long pins the cluster's
-/// xmin horizon, which starves autovacuum on the high-churn
-/// `node_reconcile_queue` / `node_reconcile_triggers` tables until they bloat
-/// enough that sequential scans over the dead tuples dominate RDS CPU.
-/// `tcp_user_timeout` bounds how long unacknowledged sends wait before the
-/// connection is dropped, and the keepalive probes detect a silently-gone peer,
-/// so the backend (and its xmin) is released within ~1 minute.
-const LISTENER_KEEPALIVE_SQL: &str = sql!(
-    "SET tcp_keepalives_idle = 30; \
-     SET tcp_keepalives_interval = 10; \
-     SET tcp_keepalives_count = 3; \
-     SET tcp_user_timeout = 30000"
-);
-
 /// Establish the dedicated `EVACUATION_RESTORE_READY_CHANNEL` listener, apply
-/// the keepalive hardening above, then start listening. Kept as a free function
-/// (rather than inlined in `wait_for_restore_signal`) so the connection
-/// hardening is unit-testable without constructing the full substrate.
+/// the keepalive hardening
+/// ([`pplx_space_postgres_pool::set_listener_keepalives`]), then start
+/// listening. Kept as a free function (rather than inlined in
+/// `wait_for_restore_signal`) so the connection hardening is unit-testable
+/// without constructing the full substrate.
 ///
 /// `eager_reconnect` is disabled deliberately: sqlx's transparent reconnect
-/// replays only the tracked `LISTEN` channels, not the ad-hoc session `SET`s
-/// above, so a silent reconnect would park the listener on a fresh *unhardened*
-/// backend and re-expose the xmin-pinning defect. With it off, a dropped
-/// connection surfaces to the caller as `try_recv() -> Ok(None)`;
+/// replays only the tracked `LISTEN` channels, not the hardening's ad-hoc
+/// session `SET`s, so a silent reconnect would park the listener on a fresh
+/// *unhardened* backend and re-expose the xmin-pinning defect. With it off, a
+/// dropped connection surfaces to the caller as `try_recv() -> Ok(None)`;
 /// `wait_for_restore_signal` then resets and reconnects through this function,
 /// re-applying the hardening on every reconnect.
 async fn connect_restore_listener(
@@ -4908,9 +4887,7 @@ async fn connect_restore_listener(
 ) -> Result<sqlx::postgres::PgListener, sqlx::Error> {
     let mut listener = sqlx::postgres::PgListener::connect_with(pool).await?;
     listener.eager_reconnect(false);
-    sqlx::raw_sql(LISTENER_KEEPALIVE_SQL)
-        .execute(&mut listener)
-        .await?;
+    pplx_space_postgres_pool::set_listener_keepalives(&mut listener).await?;
     listener.listen(EVACUATION_RESTORE_READY_CHANNEL).await?;
     Ok(listener)
 }
