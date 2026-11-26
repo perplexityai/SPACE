@@ -964,6 +964,7 @@ pub async fn delete_template(
                         .into_response();
                 }
                 Err(error) => {
+                    let error = sqlx::Error::from(error);
                     if let Some(response) = contention_response(ContentionScope::ReadOnly, &error) {
                         return response.into_response();
                     }

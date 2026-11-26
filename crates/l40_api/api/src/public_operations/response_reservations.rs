@@ -154,6 +154,7 @@ impl PublicOperationStore {
             &StoredReservation::Completed { response },
         )
         .await
+        .map_err(sqlx::Error::from)
     }
 
     /// Keep a reservation whose work may have happened pending for good,
@@ -173,6 +174,7 @@ impl PublicOperationStore {
             &StoredReservation::Pending { known: Some(known) },
         )
         .await
+        .map_err(sqlx::Error::from)
     }
 
     /// Withdraw a reservation whose work did not start, so the key can be
@@ -187,5 +189,6 @@ impl PublicOperationStore {
             &StoredReservation::RESERVED,
         )
         .await
+        .map_err(sqlx::Error::from)
     }
 }

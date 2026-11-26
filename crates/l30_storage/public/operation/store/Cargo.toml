@@ -33,6 +33,7 @@ uuid = { workspace = true }
 
 # internal
 pplx-space-accounts = { workspace = true, features = ["sqlx"] }
+pplx-space-postgres-pool = { workspace = true }
 pplx-space-public-api = { workspace = true }
 pplx-space-sandbox-model = { workspace = true }
 pplx-space-sql-locator = { workspace = true }

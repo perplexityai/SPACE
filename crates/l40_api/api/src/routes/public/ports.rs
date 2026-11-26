@@ -250,6 +250,7 @@ async fn find_idempotent_port_response(
         key.as_str(),
     )
     .await
+    .map_err(sqlx::Error::from)
     .map_err(database_error)?
     .map(|row| (row.request_fingerprint, row.response_json));
 
@@ -310,6 +311,7 @@ async fn record_idempotent_port_response(
             response_json,
         )
         .await
+        .map_err(sqlx::Error::from)
         .map_err(database_error)?;
 
     if inserted {

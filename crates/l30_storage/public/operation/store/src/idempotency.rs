@@ -10,9 +10,10 @@
 //! passes.
 
 use pplx_space_accounts::OrgId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use serde::Serialize;
-use sqlx::{FromRow, PgExecutor, types::Json};
+use sqlx::{FromRow, types::Json};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -34,13 +35,13 @@ pub struct RecordedReply<T> {
 
 /// The reply recorded under the native API's `key`, expired or not.
 pub async fn find_native_reply<T>(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     key: IdempotencyKeyRef<'_>,
-) -> Result<Option<RecordedReply<T>>, sqlx::Error>
+) -> Result<Option<RecordedReply<T>>, DbError>
 where
     T: serde::de::DeserializeOwned + Send + Unpin + 'static,
 {
-    sqlx::query_as(sql!(
+    Ok(sqlx::query_as(sql!(
         "SELECT request_fingerprint AS fingerprint, response_json AS response
          FROM public_idempotency_records
          WHERE org_id = $1 AND api_product = 'native' AND method = $4
@@ -50,20 +51,20 @@ where
     .bind(key.path_template)
     .bind(key.idempotency_key)
     .bind(key.method)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Record `response` under the native API's `key` as record `id`, never to
 /// expire, unless a record already holds the key. `false` means one did, and
 /// nothing was recorded.
 pub async fn insert_permanent_native_reply<T: Serialize + Sync>(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     id: Uuid,
     key: IdempotencyKeyRef<'_>,
     request_fingerprint: &str,
     response: &T,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "INSERT INTO public_idempotency_records (id, org_id, api_product, method, path_template, idempotency_key, request_fingerprint, response_json, expires_at)
          VALUES ($1, $2, 'native', $7, $3, $4, $5, $6, 'infinity')
@@ -76,7 +77,7 @@ pub async fn insert_permanent_native_reply<T: Serialize + Sync>(
     .bind(request_fingerprint)
     .bind(Json(response))
     .bind(key.method)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() == 1)
 }
@@ -85,13 +86,13 @@ pub async fn insert_permanent_native_reply<T: Serialize + Sync>(
 /// the default expiry. Fails on a record that already holds the key; the
 /// caller deletes an expired one first under the key's lock.
 pub async fn insert_reply<T: Serialize + Sync>(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     id: Uuid,
     api_product: &str,
     key: IdempotencyKeyRef<'_>,
     request_fingerprint: &str,
     response_json: &T,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "INSERT INTO public_idempotency_records
          (id, org_id, api_product, method, path_template, idempotency_key,
@@ -106,7 +107,7 @@ pub async fn insert_reply<T: Serialize + Sync>(
     .bind(key.idempotency_key)
     .bind(request_fingerprint)
     .bind(Json(response_json))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -115,14 +116,14 @@ pub async fn insert_reply<T: Serialize + Sync>(
 /// `path_template` as record `id`, with the default expiry, unless a record
 /// already holds the key. `false` means one did, and nothing was recorded.
 pub async fn insert_native_post_reply_if_absent(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     id: Uuid,
     org_id: OrgId,
     path_template: &str,
     idempotency_key: &str,
     request_fingerprint: &str,
     response_json: serde_json::Value,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let inserted = sqlx::query(sql!(
         "INSERT INTO public_idempotency_records (
              id,
@@ -143,7 +144,7 @@ pub async fn insert_native_post_reply_if_absent(
     .bind(idempotency_key)
     .bind(request_fingerprint)
     .bind(Json(response_json))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(inserted.rows_affected() == 1)
 }
@@ -151,14 +152,14 @@ pub async fn insert_native_post_reply_if_absent(
 /// Record that `operation_id` was created under `api_product`'s `key` as
 /// record `id`, expiring `ttl_hours` after now by the database clock.
 pub async fn insert_for_operation(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     id: Uuid,
     api_product: &str,
     key: IdempotencyKeyRef<'_>,
     request_fingerprint: &str,
     operation_id: Uuid,
     ttl_hours: i64,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "INSERT INTO public_idempotency_records (
              id,
@@ -185,7 +186,7 @@ pub async fn insert_for_operation(
     .bind(request_fingerprint)
     .bind(operation_id)
     .bind(ttl_hours.to_string())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -193,17 +194,17 @@ pub async fn insert_for_operation(
 /// Delete the records of the operations `operation_ids`, returning the ids
 /// of the records deleted.
 pub async fn delete_for_operations(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     operation_ids: &[Uuid],
-) -> Result<Vec<Uuid>, sqlx::Error> {
-    sqlx::query_scalar::<_, Uuid>(sql!(
+) -> Result<Vec<Uuid>, DbError> {
+    Ok(sqlx::query_scalar::<_, Uuid>(sql!(
         "DELETE FROM public_idempotency_records
          WHERE operation_id = ANY($1::UUID[])
          RETURNING id"
     ))
     .bind(operation_ids)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The operation a live record names, if any, and the fingerprint of the
@@ -217,11 +218,11 @@ pub struct OperationKeyRow {
 /// The live record under `api_product`'s `key`: one that has not expired by
 /// the database clock.
 pub async fn find_live(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     api_product: &str,
     key: IdempotencyKeyRef<'_>,
-) -> Result<Option<OperationKeyRow>, sqlx::Error> {
-    sqlx::query_as::<_, OperationKeyRow>(sql!(
+) -> Result<Option<OperationKeyRow>, DbError> {
+    Ok(sqlx::query_as::<_, OperationKeyRow>(sql!(
         "SELECT operation_id, request_fingerprint
              FROM public_idempotency_records
              WHERE org_id = $1
@@ -236,18 +237,22 @@ pub async fn find_live(
     .bind(key.method)
     .bind(key.path_template)
     .bind(key.idempotency_key)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// [`find_live`], locking the record it finds until the caller's
 /// transaction ends.
-pub async fn lock_live(
-    conn: &mut sqlx::PgConnection,
+/// The caller must pass its open transaction.
+pub async fn lock_live<C>(
+    conn: &mut C,
     api_product: &str,
     key: IdempotencyKeyRef<'_>,
-) -> Result<Option<OperationKeyRow>, sqlx::Error> {
-    sqlx::query_as::<_, OperationKeyRow>(sql!(
+) -> Result<Option<OperationKeyRow>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_as::<_, OperationKeyRow>(sql!(
         "SELECT operation_id, request_fingerprint
          FROM public_idempotency_records
          WHERE org_id = $1
@@ -263,8 +268,8 @@ pub async fn lock_live(
     .bind(key.method)
     .bind(key.path_template)
     .bind(key.idempotency_key)
-    .fetch_optional(&mut *conn)
-    .await
+    .fetch_optional(conn.into_sqlx())
+    .await?)
 }
 
 /// Delete the record under `api_product`'s `key` if it has expired by the
@@ -272,12 +277,16 @@ pub async fn lock_live(
 /// transaction ends. The key is unique, so the two never coexist: the
 /// delete happens only when no live record comes back. `NOW()` is the
 /// transaction's start, so the two predicates partition the record exactly.
-pub async fn delete_expired_and_lock_live(
-    conn: &mut sqlx::PgConnection,
+/// The caller must pass its open transaction.
+pub async fn delete_expired_and_lock_live<C>(
+    conn: &mut C,
     api_product: &str,
     key: IdempotencyKeyRef<'_>,
-) -> Result<Option<OperationKeyRow>, sqlx::Error> {
-    sqlx::query_as::<_, OperationKeyRow>(sql!(
+) -> Result<Option<OperationKeyRow>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_as::<_, OperationKeyRow>(sql!(
         "WITH expired AS (
              DELETE FROM public_idempotency_records
              WHERE org_id = $1
@@ -302,17 +311,17 @@ pub async fn delete_expired_and_lock_live(
     .bind(key.method)
     .bind(key.path_template)
     .bind(key.idempotency_key)
-    .fetch_optional(&mut *conn)
-    .await
+    .fetch_optional(conn.into_sqlx())
+    .await?)
 }
 
 /// Delete the record under `api_product`'s `key` if it has expired by the
 /// database clock.
 pub async fn delete_expired(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     api_product: &str,
     key: IdempotencyKeyRef<'_>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "DELETE FROM public_idempotency_records
          WHERE org_id = $1
@@ -327,7 +336,7 @@ pub async fn delete_expired(
     .bind(key.method)
     .bind(key.path_template)
     .bind(key.idempotency_key)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -341,10 +350,10 @@ pub async fn delete_expired(
 /// lock is free: a record renewed while this waits on it is rechecked as
 /// renewed and kept.
 pub async fn delete_expired_batch(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     limit: i64,
-) -> Result<Vec<Uuid>, sqlx::Error> {
-    sqlx::query_scalar::<_, Uuid>(sql!(
+) -> Result<Vec<Uuid>, DbError> {
+    Ok(sqlx::query_scalar::<_, Uuid>(sql!(
         "DELETE FROM public_idempotency_records
          WHERE id = ANY(ARRAY(
              SELECT id
@@ -357,8 +366,8 @@ pub async fn delete_expired_batch(
          RETURNING id"
     ))
     .bind(limit)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Bind the native API's `key` to `request_fingerprint` as record `id`
@@ -369,12 +378,12 @@ pub async fn delete_expired_batch(
 /// expiry. `false` means a live record holds another fingerprint, and
 /// nothing changed.
 pub async fn bind_native_key(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     id: Uuid,
     key: IdempotencyKeyRef<'_>,
     request_fingerprint: &str,
     ttl_minutes: i32,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let bound = sqlx::query_scalar::<_, Uuid>(sql!(
         "INSERT INTO public_idempotency_records (
              id, org_id, api_product, method, path_template, idempotency_key,
@@ -399,7 +408,7 @@ pub async fn bind_native_key(
     .bind(key.idempotency_key)
     .bind(request_fingerprint)
     .bind(ttl_minutes)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(bound.is_some())
 }
@@ -413,10 +422,10 @@ pub struct LiveReplyRow {
 
 /// The live record under the native API's `key`, by the database clock.
 pub async fn find_live_native_reply(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     key: IdempotencyKeyRef<'_>,
-) -> Result<Option<LiveReplyRow>, sqlx::Error> {
-    sqlx::query_as::<_, LiveReplyRow>(sql!(
+) -> Result<Option<LiveReplyRow>, DbError> {
+    Ok(sqlx::query_as::<_, LiveReplyRow>(sql!(
         "SELECT request_fingerprint, response_json FROM public_idempotency_records
              WHERE org_id = $1 AND api_product = 'native' AND method = $2
                AND path_template = $3 AND idempotency_key = $4 AND expires_at > NOW()"
@@ -425,19 +434,19 @@ pub async fn find_live_native_reply(
     .bind(key.method)
     .bind(key.path_template)
     .bind(key.idempotency_key)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The live record under the native API's `POST` key `idempotency_key` at
 /// `path_template` of `org_id`, by the database clock.
 pub async fn find_live_native_post_reply(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     path_template: &str,
     idempotency_key: &str,
-) -> Result<Option<LiveReplyRow>, sqlx::Error> {
-    sqlx::query_as::<_, LiveReplyRow>(sql!(
+) -> Result<Option<LiveReplyRow>, DbError> {
+    Ok(sqlx::query_as::<_, LiveReplyRow>(sql!(
         "SELECT request_fingerprint, response_json
          FROM public_idempotency_records
          WHERE org_id = $1
@@ -450,8 +459,8 @@ pub async fn find_live_native_post_reply(
     .bind(org_id)
     .bind(path_template)
     .bind(idempotency_key)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// A live record as a response reservation reads it.
@@ -468,12 +477,12 @@ pub struct ReservationRow {
 /// The live record under `api_product`'s `key`, by the database clock, and
 /// whether it was created more than `lifetime_secs` ago.
 pub async fn find_live_reservation(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     api_product: &str,
     key: IdempotencyKeyRef<'_>,
     lifetime_secs: f64,
-) -> Result<Option<ReservationRow>, sqlx::Error> {
-    sqlx::query_as::<_, ReservationRow>(sql!(
+) -> Result<Option<ReservationRow>, DbError> {
+    Ok(sqlx::query_as::<_, ReservationRow>(sql!(
         "SELECT request_fingerprint, response_json, created_at,
                     created_at + make_interval(secs => $6) <= NOW() AS reservation_expired
              FROM public_idempotency_records
@@ -486,18 +495,18 @@ pub async fn find_live_reservation(
     .bind(key.path_template)
     .bind(key.idempotency_key)
     .bind(lifetime_secs)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Replace record `id`'s response with `replacement` while it still holds
 /// `recorded`. `false` means it no longer did, and nothing changed.
 pub async fn replace_recorded_reply<R: Serialize + Sync, N: Serialize + Sync>(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     id: Uuid,
     recorded: &R,
     replacement: &N,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "UPDATE public_idempotency_records SET response_json = $2
              WHERE id = $1 AND response_json = $3"
@@ -505,7 +514,7 @@ pub async fn replace_recorded_reply<R: Serialize + Sync, N: Serialize + Sync>(
     .bind(id)
     .bind(Json(replacement))
     .bind(Json(recorded))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() == 1)
 }
@@ -513,16 +522,16 @@ pub async fn replace_recorded_reply<R: Serialize + Sync, N: Serialize + Sync>(
 /// Delete record `id` while it still holds `recorded`. `false` means it no
 /// longer did, and nothing changed.
 pub async fn delete_recorded_reply<R: Serialize + Sync>(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     id: Uuid,
     recorded: &R,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "DELETE FROM public_idempotency_records WHERE id = $1 AND response_json = $2"
     ))
     .bind(id)
     .bind(Json(recorded))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() == 1)
 }
@@ -530,10 +539,14 @@ pub async fn delete_recorded_reply<R: Serialize + Sync>(
 /// Take the transaction-level advisory lock `key`, which the caller derives
 /// from an idempotency key to serialize that key's writers, waiting for it.
 /// The lock lasts until the caller's transaction ends.
-pub async fn lock_key(conn: &mut sqlx::PgConnection, key: i64) -> Result<(), sqlx::Error> {
+/// The caller must pass its open transaction.
+pub async fn lock_key<C>(conn: &mut C, key: i64) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!("SELECT pg_advisory_xact_lock($1)"))
         .bind(key)
-        .execute(&mut *conn)
+        .execute(conn.into_sqlx())
         .await?;
     Ok(())
 }

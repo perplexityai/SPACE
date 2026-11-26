@@ -59,14 +59,16 @@ impl<'a> Scope<'a> {
 pub(super) use pplx_space_public_operation_store::idempotency::RecordedReply as Reply;
 
 pub(super) async fn get<T: DeserializeOwned + Send + Unpin + 'static>(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
     scope: &Scope<'_>,
 ) -> Result<Option<Reply<T>>, sqlx::Error> {
-    idempotency_store::find_native_reply(executor, scope.key()).await
+    idempotency_store::find_native_reply(executor, scope.key())
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 pub(super) async fn insert<T: Serialize + Sync>(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
     scope: &Scope<'_>,
     fingerprint: &RequestFingerprint,
     response: &T,
@@ -79,4 +81,5 @@ pub(super) async fn insert<T: Serialize + Sync>(
         response,
     )
     .await
+    .map_err(sqlx::Error::from)
 }

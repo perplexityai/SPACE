@@ -81,6 +81,12 @@ pub enum ForkOperationStoreError {
     InvalidLeaderState(String),
 }
 
+impl From<pplx_space_postgres_pool::DbError> for ForkOperationStoreError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 impl ForkOperationStore {
     pub fn new(pool: PgPool) -> Self {
         Self {
@@ -163,7 +169,7 @@ impl ForkOperationStore {
             .ok_or(ForkOperationStoreError::InvalidCaptureWorkflow)?;
         let mut tx = self.pool().begin().await?;
         operation_store::operations::lock_fork_capture_leader(
-            &mut tx,
+            &mut *tx,
             &payload.source_sandbox_id().to_string(),
             generation,
         )

@@ -436,7 +436,7 @@ async fn find_idempotency_record(
     // only when the lookup comes back empty. `NOW()` is the transaction's
     // start, so the two predicates partition the record exactly.
     let row = operation_store::idempotency::delete_expired_and_lock_live(
-        tx,
+        &mut **tx,
         API_PRODUCT_NATIVE.as_str(),
         operation_store::idempotency::IdempotencyKeyRef {
             org_id,
@@ -455,7 +455,8 @@ async fn lock_idempotency_key(
     org_id: OrgId,
     idempotency: CreatePublicSessionIdempotency<'_>,
 ) -> Result<(), PublicSessionStoreError> {
-    operation_store::idempotency::lock_key(tx, idempotency_lock_key(org_id, idempotency)).await?;
+    operation_store::idempotency::lock_key(&mut **tx, idempotency_lock_key(org_id, idempotency))
+        .await?;
     Ok(())
 }
 
@@ -569,6 +570,7 @@ async fn insert_completed_session_operation_tx(
         },
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 async fn insert_idempotency_record_tx(
@@ -593,6 +595,7 @@ async fn insert_idempotency_record_tx(
         IDEMPOTENCY_TTL_HOURS,
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 fn request_fingerprint(
