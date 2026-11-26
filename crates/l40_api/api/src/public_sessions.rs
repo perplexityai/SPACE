@@ -67,6 +67,12 @@ pub enum PublicSessionStoreError {
     Sql(#[from] sqlx::Error),
 }
 
+impl From<pplx_space_postgres_pool::DbError> for PublicSessionStoreError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 impl From<InvalidStoredEnum> for PublicSessionStoreError {
     fn from(error: InvalidStoredEnum) -> Self {
         Self::InvalidStoredEnum {
@@ -267,7 +273,7 @@ impl PublicSessionStore {
         let mut tx = self.pool.begin().await?;
         let session_id = input.session_id.to_string();
         let prior_status = data_plane_session_store::lock_live_revocation_status(
-            &mut tx,
+            &mut *tx,
             input.org_id,
             input.sandbox_id.into(),
             &session_id,
@@ -525,6 +531,7 @@ async fn fetch_session_tx(
     let session_id_string = session_id.to_string();
     data_plane_session_store::live_session(&mut **tx, org_id, sandbox_id.into(), &session_id_string)
         .await
+        .map_err(sqlx::Error::from)
 }
 
 async fn insert_completed_session_operation_tx(

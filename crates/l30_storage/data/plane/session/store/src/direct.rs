@@ -14,6 +14,7 @@
 
 use pplx_space_accounts::{NodeId, OrgId};
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{
     ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
 };
@@ -73,11 +74,11 @@ pub struct SessionRoute {
 /// expired by the database clock, or carries another protocol session id
 /// than `protocol_session_id` (when one is given).
 pub async fn live_session_route(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     session_id: &str,
     protocol_session_id: Option<&str>,
-) -> Result<Option<SessionRoute>, sqlx::Error> {
-    sqlx::query_as::<_, SessionRoute>(sql!(
+) -> Result<Option<SessionRoute>, DbError> {
+    Ok(sqlx::query_as::<_, SessionRoute>(sql!(
         "SELECT d.session_id,
                 d.protocol_session_id,
                 d.org_id,
@@ -130,8 +131,8 @@ pub async fn live_session_route(
     ))
     .bind(session_id)
     .bind(protocol_session_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Point the session `session_id`'s route at `current_node_id`,
@@ -143,13 +144,13 @@ pub async fn live_session_route(
 /// caller decides what to do with the sandbox it re-read, and rolls its
 /// transaction back to refuse it.
 pub async fn repoint_session_route(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     session_id: &str,
     current_node_id: NodeId,
     backend_endpoint: &str,
     backend_transport: &str,
-) -> Result<Option<SessionRoute>, sqlx::Error> {
-    sqlx::query_as::<_, SessionRoute>(sql!(
+) -> Result<Option<SessionRoute>, DbError> {
+    Ok(sqlx::query_as::<_, SessionRoute>(sql!(
         "UPDATE data_plane_sessions d
          SET current_node_id = $2,
              backend_endpoint = $3,
@@ -214,6 +215,6 @@ pub async fn repoint_session_route(
     .bind(current_node_id)
     .bind(backend_endpoint)
     .bind(backend_transport)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
