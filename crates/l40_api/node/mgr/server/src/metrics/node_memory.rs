@@ -53,6 +53,20 @@ pub fn space_cgroup_events(event: &'static str, count: u64) {
     );
 }
 
+/// The parent's cumulative `memory.events` count for `event`, as the kernel
+/// reports it, or 0 for an event the kernel does not expose. Unlike
+/// [`space_cgroup_events`], it needs no earlier reading in the same process,
+/// so a delta across node-manager restarts still counts the events that
+/// occurred between the old process's last reading and the new one's first.
+/// Not `events_total`: Prometheus already publishes the counter under that.
+pub fn space_cgroup_events_cumulative(event: &'static str, total: u64) {
+    gauge(
+        "node_memory.space_cgroup.events_cumulative",
+        total as f64,
+        &[tag("event", event)],
+    );
+}
+
 /// Whether the last parent cgroup read succeeded, so a stale byte gauge is
 /// distinguishable from a node that stopped reporting.
 pub fn space_cgroup_read_success(success: bool) {
