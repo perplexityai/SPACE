@@ -1,5 +1,7 @@
 """A v2 drain survives the cluster-controller restarting, and its running residents stay held while the controller is down past the deadline."""
 
+import time
+
 import space_smoke as smoke
 from space_smoke.drain_v2 import UPLOAD_RETRY_SECONDS
 
@@ -11,13 +13,13 @@ HOLD_SECONDS = 900
 # The latest the controller may go down before the deadline for the run to
 # show the node holding across it.
 DOWN_MARGIN_SECONDS = 20
-# How far ahead the deadline lands once brought in, with the controller up so
-# the node answers a call under it before the controller goes down (a node
-# that kept the deadline it last heard would then suspend at it, inside the
-# watch past it): the report under the new deadline (a 5 s tick, a call
-# within its 45 s budget, a 2 s poll and 10 s), the scale to zero (the
-# controller's 30 s grace and a 5 s poll) and the margin above.
-LEAD_SECONDS = 62 + 35 + DOWN_MARGIN_SECONDS + 3
+# The controller's scale to zero: its 30 s termination grace and a 5 s poll.
+SCALE_TO_ZERO_SECONDS = 30 + 5
+# How far ahead the deadline lands once brought in: the scale to zero, then
+# at least `DOWN_MARGIN_SECONDS` with the controller down before it, and 5 s.
+# The node is never told a deadline (`bring_deadline_to`), so nothing waits
+# for it to hear this one.
+LEAD_SECONDS = SCALE_TO_ZERO_SECONDS + DOWN_MARGIN_SECONDS + 5
 # How long past the deadline the run watches the running residents held with
 # the controller down.
 HELD_PAST_DEADLINE_SECONDS = 90
@@ -30,10 +32,13 @@ HELD_PAST_DEADLINE_SECONDS = 90
 # (`service/drain_node/tests.rs`). This is each seam on real workers.
 # Uploads blocked on the drained worker hold the drain after its seal with
 # nothing evacuated while the controller restarts, and the restarted
-# controller keeps the drain's generation and its stored deadline. The node
-# keeps no deadline of its own, so with the controller down across the
-# deadline it holds the running residents; once the controller is back, its
-# first call evacuates and the node suspends them.
+# controller keeps the drain's generation and its stored deadline. A repeat
+# `:drain` then brings the stored deadline in. `DrainNode` carries no
+# deadline, only whether to evacuate, so the node keeps none: with the
+# controller down across the deadline it holds the running residents. Once
+# the controller is back, the new process reads the shortened deadline from
+# the row, its first call evacuates and the node suspends them, long before
+# the first hold's deadline.
 @smoke.scenario(
     "native.v2_drain_survives_controller_restarts",
     api_surfaces=("native",),
@@ -48,11 +53,11 @@ def v2_drain_survives_controller_restarts(test: smoke.CommandSandboxFixture) -> 
     blocked and nothing evacuated: the restarted controller stores the
     node's report under the same generation and the deadline is unchanged.
     Once uploads are let through the paused resident is made durable, and a
-    repeat `:drain` brings the deadline in, which the node hears. With
-    the controller scaled to zero across the deadline, the started residents
-    keep running on the worker past it: the node keeps no deadline of its
-    own. Once the controller is back the node suspends them and reaches
-    `drained`; every resident is suspended and unplaced, a wake lands each
+    repeat `:drain` brings the stored deadline in. With the controller
+    scaled to zero across that deadline, the started residents keep running
+    on the worker past it: the node keeps no deadline of its own. Once the
+    controller is back it evacuates on the shortened deadline, well before
+    the first hold's, so the node suspends them and reaches `drained`; every resident is suspended and unplaced, a wake lands each
     on the other worker with its memory intact, and `:undrain` cancels the
     drain."""
 
@@ -102,7 +107,8 @@ def v2_drain_survives_controller_restarts(test: smoke.CommandSandboxFixture) -> 
             for sandbox_id in started:
                 drain.expect_held(sandbox_id)
 
-        with test.phase("bring the deadline in; the node answers a call under it"):
+        with test.phase("bring the stored deadline in"):
+            first_hold_deadline = drain.deadline
             drain.bring_deadline_to(LEAD_SECONDS)
 
         with test.phase("the controller down across the deadline: the node holds the running ones"):
@@ -115,9 +121,17 @@ def v2_drain_survives_controller_restarts(test: smoke.CommandSandboxFixture) -> 
                 )
                 drain.expect_started_until_deadline(started, margin=-HELD_PAST_DEADLINE_SECONDS)
 
-        with test.phase("the controller back: the node suspends them and the drain finishes"):
+        with test.phase("the controller back: it evacuates on the shortened deadline and the drain finishes"):
             for sandbox_id in started:
                 drain.expect_suspended_by_the_node(sandbox_id)
+            # Only the shortened deadline was past: the first hold's never
+            # was, so the restarted controller evacuated on the new one.
+            test.verify(
+                time.time() < first_hold_deadline,
+                "the node suspended the running residents only once the first hold's deadline passed",
+                first_hold_deadline=first_hold_deadline,
+                shortened_deadline=drain.deadline,
+            )
             report = drain.expect_drained()
             drain.expect_evacuated(report, lifecycles)
             drain.expect_all_evacuated(lifecycles)

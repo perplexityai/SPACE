@@ -47,7 +47,7 @@ from space_smoke.drain_v2 import (
     validate_drain_v2_api_overrides,
     validate_drain_v2_overrides,
 )
-from space_smoke.runtime import CommandResult, InvariantViolation, ResourceScope
+from space_smoke.runtime import CommandResult, InconclusiveSmoke, InvariantViolation, ResourceScope
 
 NODE = "space-local-worker"
 NODE_ID = "00000000-0000-4000-8000-000000000001"
@@ -406,14 +406,26 @@ class GateAnswers(unittest.TestCase):
         # The node's own state: its row stays `started` with the upload cut.
         states = ["started", "started", "started", "suspending"]
         drain, fixture = _assertions(_Control(node_states={sandbox: list(states)}))
-        # Inside the lead: the calls start at once, before the deadline.
+        # Inside the lead: the calls start at once, before the deadline, and
+        # the node suspends before any lands past it: no call there judged.
         drain._deadline = int(time.time()) + 3
         caller = _Sandbox(sandbox, [CALL_PASSED_STATUS, GATE_REFUSAL_STATUS])
-        self.assertEqual(
-            drain.expect_calls_pass_until_suspended(caller),  # type: ignore[arg-type]
-            {"before_deadline": [CALL_PASSED_STATUS], "past_deadline": []},
-        )
+        seen = drain.expect_calls_pass_until_suspended(caller)  # type: ignore[arg-type]
+        self.assertEqual(seen, {"before_deadline": [CALL_PASSED_STATUS], "past_deadline": []})
         self.assertEqual(caller.commands, 2)
+        with self.assertRaises(InconclusiveSmoke):
+            drain.expect_sampled_past_deadline(seen)
+        # One call before the deadline and one past it, both meeting the VM.
+        drain, fixture = _assertions(_Control(node_states={sandbox: ["started"] * 4 + ["suspending"]}))
+        drain._deadline = int(time.time()) + 3
+        with mock.patch.object(type(drain), "seconds_to_deadline", side_effect=[3, 2, -1]):
+            seen = drain.expect_calls_pass_until_suspended(
+                _Sandbox(sandbox, [CALL_PASSED_STATUS, CALL_PASSED_STATUS])  # type: ignore[arg-type]
+            )
+        self.assertEqual(
+            seen, {"before_deadline": [CALL_PASSED_STATUS], "past_deadline": [CALL_PASSED_STATUS]}
+        )
+        drain.expect_sampled_past_deadline(seen)
         for refused in (409, GATE_REFUSAL_STATUS):
             drain, fixture = _assertions(_Control(node_states={sandbox: list(states)}))
             drain._deadline = int(time.time()) + 3

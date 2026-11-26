@@ -4,7 +4,7 @@ from typing import cast
 
 import space_smoke as smoke
 from space_smoke.capabilities import RawCallSandbox, ResidentLifecycleSandbox
-from space_smoke.drain_v2 import UPLOAD_RETRY_SECONDS
+from space_smoke.drain_v2 import CALLS_LEAD_SECONDS, UPLOAD_RETRY_SECONDS
 
 PATH = "/tmp/space-smoke-v2-calls.txt"
 # The drain's first hold: the run's calls before the deadline (a delete, a
@@ -13,9 +13,10 @@ PATH = "/tmp/space-smoke-v2-calls.txt"
 # wait out the rest of a hold sized for the slowest bench.
 HOLD_SECONDS = 900
 # How far ahead the deadline lands once brought in, the uploads already
-# cut: the watch until the calls start 5 s before it. The node keeps no
-# deadline, so nothing here waits for it to hear the new one.
-LEAD_SECONDS = 30
+# cut: an 18 s watch of the sandbox held, three of its 5 s reads, until the
+# calls start `CALLS_LEAD_SECONDS` before it. Nothing tells the node of the
+# new deadline (`bring_deadline_to`), so nothing here waits for that.
+LEAD_SECONDS = CALLS_LEAD_SECONDS + 18
 # The resident deleted as the drain began is long gone by the end: its
 # delete, the node's report of it and the finalize, measured in seconds,
 # with a minute's margin.
@@ -52,7 +53,8 @@ def v2_drain_meets_user_calls(test: smoke.CommandSandboxFixture) -> None:
     409, and lands it on the other worker once the drain made it durable.
     The deadline is then brought in with a shorter hold; from just before
     it, each call that meets the running one passes until the node suspends
-    it. Once the node suspends it, with its upload cut, a wake and
+    it, and at least one meets it past the deadline, or the run ends
+    inconclusive. Once the node suspends it, with its upload cut, a wake and
     a command of it are recorded, and no second execution of it runs off
     the worker; once the upload goes through, a wake lands it on the other
     worker, its data intact. The node reaches `drained`."""
@@ -97,11 +99,11 @@ def v2_drain_meets_user_calls(test: smoke.CommandSandboxFixture) -> None:
         with test.phase("cut the drained worker's uploads, then bring the deadline in"):
             uploads = drain.block("object-store")
             # Cut first, so the deadline is at least the lead after the cut.
-            drain.bring_deadline_to(LEAD_SECONDS, await_report=False)
-            drain.expect_started_until_deadline([serving.sandbox_id], margin=5)
+            drain.bring_deadline_to(LEAD_SECONDS)
+            drain.expect_started_until_deadline([serving.sandbox_id], margin=CALLS_LEAD_SECONDS)
 
         with test.phase("around the deadline: calls to the running one pass until the node suspends it"):
-            drain.expect_calls_pass_until_suspended(serving)
+            calls = drain.expect_calls_pass_until_suspended(serving)
 
         # The node's suspend reaches the row only once its snapshot is
         # durable: with the upload cut the row still reads `started`, and the
@@ -134,3 +136,7 @@ def v2_drain_meets_user_calls(test: smoke.CommandSandboxFixture) -> None:
 
         with test.phase("undrain"):
             drain.undrain_and_expect_cancelled()
+
+        # Last, so every check above still decides a failure: a run with no
+        # call past the deadline judged none there, and passes nothing.
+        drain.expect_sampled_past_deadline(calls)

@@ -8,11 +8,14 @@ from space_smoke.drain_v2 import PENDING_RUNNING_FIELD, UPLOAD_RETRY_SECONDS, WA
 # the run brings the deadline in (`LEAD_SECONDS`) rather than wait out the
 # rest of a hold sized for the slowest bench.
 HOLD_SECONDS = 900
-# How far ahead the deadline lands once brought in: the report under it (a
-# 5 s tick, a call within its 45 s budget, a 2 s poll and 10 s), then a
-# watch of the restarted node holding the started residents, at least two
-# of its 10 s re-plans and four controller calls, until 5 s before it.
-LEAD_SECONDS = 62 + 25
+# How long before the deadline the watch of the started residents held ends.
+HELD_MARGIN_SECONDS = 5
+# How far ahead the deadline lands once brought in: a 25 s watch of the
+# restarted node holding the started residents, at least two of its 10 s
+# re-plans and four controller ticks, until `HELD_MARGIN_SECONDS` before it.
+# The node is never told a deadline (`bring_deadline_to`), so nothing waits
+# for it to hear this one.
+LEAD_SECONDS = 25 + HELD_MARGIN_SECONDS
 # The latest the first restart may end before the deadline.
 RESTART_MARGIN_SECONDS = 30
 
@@ -85,8 +88,9 @@ def v2_drain_survives_sandbox_manager_restarts(test: smoke.CommandSandboxFixture
                 persisted=persisted,
                 shown=shown,
             )
-            persisted = drain.expect_view_deadline(drain.bring_deadline_to(LEAD_SECONDS))
-            drain.expect_started_until_deadline(started, margin=5)
+            drain.bring_deadline_to(LEAD_SECONDS)
+            persisted = drain.expect_view_deadline(drain.report())
+            drain.expect_started_until_deadline(started, margin=HELD_MARGIN_SECONDS)
 
         with test.phase("past the deadline: restart sandbox-manager again while every upload waits"):
             drain.wait_past_deadline()

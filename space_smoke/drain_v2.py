@@ -242,6 +242,14 @@ LEFTOVER_SECONDS = 120
 # A command on a sandbox whose data plane is coming up, or a memory fill of
 # up to 256 MiB (seconds measured), with a minute's margin.
 COMMAND_SECONDS = 90
+# One probe of a running sandbox around its deadline: the node's own state,
+# a command, and the node's state again (2-4 s measured, so 4 s).
+PROBE_SECONDS = 4
+# How long before the deadline the probes start. The first one's call is
+# asked up to a probe after they start, so at least `2 * PROBE_SECONDS`
+# before the deadline: room for two calls to meet the VM held there even at
+# the slowest probe measured.
+CALLS_LEAD_SECONDS = 3 * PROBE_SECONDS
 
 
 # How many independent per-resident calls (creates, fills, wakes, deletes) a
@@ -1518,16 +1526,16 @@ class DrainV2Assertions:
         )
         return answer
 
-    def bring_deadline_to(self, lead: int, *, await_report: bool = True) -> dict[str, Any]:
+    def bring_deadline_to(self, lead: int) -> int:
         """A repeat `:drain` with a shorter hold, counted from
-        `drain_started_at`, moves the deadline to `lead` seconds from now.
-        With `await_report`, returns the first report the controller stored
-        after it, which shows that deadline: the node answered a call made
-        under it; else the admin view as it reads at once."""
+        `drain_started_at`, moves the stored deadline to `lead` seconds from
+        now; returns it. Nothing tells the node: `DrainNode` carries no
+        deadline, only whether to evacuate, which the controller decides each
+        tick from the stored one. So the next tick past the new deadline
+        evacuates, whichever controller process runs it."""
 
         before = self.deadline
-        asked = time.time()
-        answer = self.repeat_drain(int(asked - self.started_at()) + lead)
+        answer = self.repeat_drain(int(time.time() - self.started_at()) + lead)
         self._fixture.verify(
             answer.status in (200, 202) and self.deadline < before,
             "a repeat :drain with a shorter hold did not move the deadline earlier",
@@ -1536,27 +1544,8 @@ class DrainV2Assertions:
             deadline=self.deadline,
             before=before,
         )
-        if not await_report:
-            return self.report()
-
-        def under_it(report: dict[str, Any]) -> bool:
-            shown = self.view_deadline(report)
-            reported = timestamp_seconds(report.get(VIEW_REPORTED_FIELD))
-            return (
-                self.reported(report)
-                and shown is not None
-                and abs(shown - self.deadline) <= 1
-                and reported is not None
-                and reported > asked
-            )
-
-        # A 5 s tick, a call within its 45 s budget and a 2 s poll, with a
-        # 10 s margin.
-        return self.wait_for_report(
-            under_it,
-            "the controller never stored a report under the earlier deadline",
-            timeout=5 + 45 + 2 + 10,
-        )
+        self._fixture.record("brought_in_deadline", {"from": before, "to": self.deadline})
+        return self.deadline
 
     def expect_stored_deadline(self, hold: int) -> int:
         """The row's deadline is `drain_started_at` plus `hold`; returns it."""
@@ -1887,7 +1876,8 @@ class DrainV2Assertions:
 
     def expect_view_deadline(self, report: dict[str, Any]) -> float:
         """The admin view shows the stored deadline; returns it. The node
-        keeps none of its own: the controller sends it what remains."""
+        keeps none of its own: the controller decides from the stored one
+        when its calls ask the node to evacuate."""
 
         shown = self.view_deadline(report)
         self._fixture.verify(
@@ -2023,14 +2013,19 @@ class DrainV2Assertions:
     ) -> None:
         """Each sandbox stays started on the drained worker until `margin`
         seconds before the deadline; with a negative `margin`, until that
-        long past it."""
+        long past it. Read from both rows: the control-plane row, and the
+        node's own, which a suspend changes at once even while its upload is
+        cut and the control-plane row still reads `started`."""
 
         while self.seconds_to_deadline() > margin:
-            residencies = {self.bare_id(sandbox_id): self.residency(sandbox_id) for sandbox_id in sandbox_ids}
+            residencies = {
+                self.bare_id(sandbox_id): (*self.residency(sandbox_id), self.node_state(sandbox_id))
+                for sandbox_id in sandbox_ids
+            }
             self._fixture.verify(
                 all(
-                    lifecycle == "started" and node == self.node_id
-                    for lifecycle, node in residencies.values()
+                    lifecycle == "started" and node == self.node_id and node_state == "started"
+                    for lifecycle, node, node_state in residencies.values()
                 ),
                 "a held sandbox left started before the run stopped watching",
                 residency=residencies,
@@ -2241,18 +2236,17 @@ class DrainV2Assertions:
         )
 
     def expect_calls_pass_until_suspended(
-        self, sandbox: DurableLifecycleSandbox, *, lead: float = 5
+        self, sandbox: DurableLifecycleSandbox, *, lead: float = CALLS_LEAD_SECONDS
     ) -> dict[str, list[int]]:
         """From `lead` seconds before the deadline until the node suspends the
-        sandbox, a command a second: each that met its VM running on the
-        drained worker before and after the call passes, before the deadline
+        sandbox, one probe after another: each call that met its VM running
+        on the drained worker before and after it passes, before the deadline
         and past it, as a drain refuses no call to a running sandbox. At
-        least one such call lands before the deadline, when the node still
-        holds the VM. Past the deadline the node suspends at the controller's
-        first evacuating call, up to one 5 s tick after it, so some runs meet
-        the VM running there and some don't: the calls that did are judged,
-        and how many there were is recorded. The statuses before and past
-        the deadline."""
+        least one lands before the deadline, when the node must still hold
+        the VM. Past the deadline the node suspends at the controller's
+        first evacuating call, up to a tick after it, so a run may meet the
+        VM running there or not: `expect_sampled_past_deadline` judges that.
+        The statuses before and past the deadline."""
 
         subject = cast(RawCallSandbox, sandbox)
         bare = self.bare_id(sandbox.sandbox_id)
@@ -2260,9 +2254,11 @@ class DrainV2Assertions:
             self._fixture.wait(max(1, remaining - lead))
         before: list[int] = []
         past: list[int] = []
-        # The lead, a tick, a call within its 45 s budget and the node's
-        # suspend starting, with a 30 s margin.
-        deadline = time.monotonic() + lead + 5 + 45 + 30
+        # The lead, then the controller's first evacuating tick and its call,
+        # which starts the node's suspend, with a 30 s margin.
+        deadline = time.monotonic() + lead + TICK_SECONDS + CALL_BUDGET_SECONDS + 30
+        # No pause between probes: each takes seconds, and past the deadline
+        # the window before the suspend is about a tick long.
         while self.node_holds_vm_running(sandbox.sandbox_id):
             asked = self.seconds_to_deadline()
             answer = subject.command_answer("true")
@@ -2276,7 +2272,6 @@ class DrainV2Assertions:
                 before_deadline=before[-10:],
                 past_deadline=past[-10:],
             )
-            self._fixture.wait(1)
         seen = {"before_deadline": before, "past_deadline": past}
         self._fixture.record(f"calls_around_deadline_{bare}", seen)
         self._fixture.verify(
@@ -2290,6 +2285,20 @@ class DrainV2Assertions:
             **seen,
         )
         return seen
+
+    def expect_sampled_past_deadline(self, seen: Mapping[str, list[int]]) -> None:
+        """At least one call met the VM running past the deadline
+        (`expect_calls_pass_until_suspended`), so the run judged a call
+        there. A run whose calls all landed before it, or after the node's
+        suspend began, judged none: it ends inconclusive, not passed. A
+        scenario calls this last, so its other checks still decide a
+        failure."""
+
+        if not seen.get("past_deadline"):
+            raise InconclusiveSmoke(
+                "no call met the running sandbox past the deadline before the node "
+                "suspended it, so no call there was judged (calls_around_deadline_*); rerun"
+            )
 
     # --- stops and stopped sandboxes ---------------------------------------------
 
