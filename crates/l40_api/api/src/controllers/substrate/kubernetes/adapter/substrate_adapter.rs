@@ -153,7 +153,6 @@ impl SubstrateAdapter for KubernetesSubstrate {
                             pod_uid: execution.pod_uid.as_ref().map(PodUid::as_str),
                             generation: execution.generation,
                         },
-                        "create_join",
                         phase_deadline,
                     )
                     .await?;
@@ -492,7 +491,6 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         pod_uid: pod_uid.as_deref(),
                         generation: execution.generation,
                     },
-                    "create",
                     phase_deadline,
                 )
                 .instrument(tracing::info_span!(
@@ -687,16 +685,15 @@ impl SubstrateAdapter for KubernetesSubstrate {
             _ => "started",
         };
 
-        // The reflector watch and the per-pod watch used by
-        // `wait_for_pod_proxy_reachable` are independent streams, so the
-        // reflector cache may briefly lag the scheduler-binding MODIFIED
-        // event. We are at the post-readiness step, so the pod must have
-        // been bound to a node by now; if the cache still shows it as
+        // `wait_for_pod_proxy_reachable` can bind the pod from a backstop
+        // read while the reflector cache still lags the scheduler-binding
+        // MODIFIED event. We are at the post-readiness step, so the pod must
+        // have been bound to a node by now; if the cache still shows it as
         // unscheduled, that is definitive evidence of a stale cache and
         // we must fall back to an authoritative GET. Without this check,
         // a stale cache hit would leave `active_node_id` as `None` and the
         // caller's `UPDATE sandboxes SET active_node_id = $3` would clear
-        // the placement that the watch already persisted to the DB.
+        // the placement that the readiness wait already persisted to the DB.
         let post_create_pod = match self.lookup_sandbox_pod(&pod_name) {
             Some(pod) if assigned_pod_node_name(&pod).is_some() => Some(pod),
             _ => fetch_sandbox_pod_uncached(&self.k8s, &pod_name)

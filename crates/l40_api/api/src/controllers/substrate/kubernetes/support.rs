@@ -653,9 +653,9 @@ pub(super) fn terminal_pod_phase(pod: &SandboxPodView) -> Option<TerminalPodPhas
 /// True if the pod is in a status that callers of `read_sandbox_pod` branch
 /// on: it has been assigned an IP, or it has reached a terminal phase, or
 /// the scheduler has flagged it unschedulable. Anything else (notably
-/// pre-binding `Pending` with no IP) is treated as cache-stale so the
-/// reflector watch lag cannot stall callers that are already past the
-/// per-pod watch.
+/// pre-binding `Pending` with no IP) is treated as not yet decided: a read
+/// that needs an answer now confirms it with the apiserver, and an IP
+/// readiness wait keeps waiting on the reflector.
 pub(super) fn pod_status_is_settled(pod: &SandboxPodView) -> bool {
     assigned_pod_ip(pod).ok().flatten().is_some()
         || terminal_pod_phase(pod).is_some()

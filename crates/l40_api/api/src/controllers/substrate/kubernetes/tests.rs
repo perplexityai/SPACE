@@ -8660,7 +8660,6 @@ mod kubernetes_tests {
                         pod_uid: Some(pod_uid),
                         generation: 1,
                     },
-                    "create",
                     Instant::now() + Duration::from_millis(500),
                 )
                 .await
@@ -8747,7 +8746,6 @@ mod kubernetes_tests {
                         pod_uid: Some("unconfirmed-uid"),
                         generation: 1,
                     },
-                    "create",
                     Instant::now() + Duration::from_millis(500),
                 )
                 .await;

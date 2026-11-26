@@ -52,6 +52,10 @@ pub(super) struct SubstrateBudgets {
     /// Maximum duration of a direct pod GET during IP readiness, further
     /// clamped to the time left in that phase.
     pub(super) readiness_pod_get: Duration,
+    /// [`super::READINESS_BACKSTOP_INTERVAL`]: how often, at most, an IP
+    /// readiness wait reads its pod from the apiserver while the reflector
+    /// does not show it settled.
+    pub(super) readiness_backstop: Duration,
     /// [`super::execution::RETRY_DEFERRAL_GRACE`]: how long a caller under
     /// the dispatcher's retry deferral keeps retrying a fenced restore claim
     /// in place before it hands the wait back.
@@ -71,8 +75,9 @@ impl SubstrateBudgets {
         teardown_node_delete_wait: super::adapter::TEARDOWN_NODE_DELETE_WAIT_BUDGET,
         reflector_wait: super::REFLECTOR_WAIT_BUDGET,
         // Leave headroom for a slow single-object read without letting it
-        // displace the watch that can observe readiness independently.
+        // displace the reflector, which can observe readiness independently.
         readiness_pod_get: Duration::from_secs(5),
+        readiness_backstop: super::READINESS_BACKSTOP_INTERVAL,
         retry_deferral_grace: super::execution::RETRY_DEFERRAL_GRACE,
     };
 

@@ -130,6 +130,13 @@ impl PodEvents {
         Self::new().0
     }
 
+    /// Events and the sender a test feeds them from, as the reflector's
+    /// watch loop does.
+    #[cfg(test)]
+    pub(super) fn for_test_with_sender() -> (Self, broadcast::Sender<String>) {
+        Self::new()
+    }
+
     /// Subscribe to the raw per-name event stream. Used by waiters that must
     /// re-check their own store condition on *every* wakeup — including
     /// `Lagged` — rather than waiting for a specific pod name. An absence
@@ -137,7 +144,7 @@ impl PodEvents {
     /// and keeps blocking: if the target pod's delete signal was one of the
     /// dropped messages there may be no later event for it, stranding the wait
     /// even though the store already removed the pod.
-    fn subscribe(&self) -> broadcast::Receiver<String> {
+    pub(super) fn subscribe(&self) -> broadcast::Receiver<String> {
         self.tx.subscribe()
     }
 

@@ -1,112 +1,90 @@
 use super::store::PlacementRetryDisposition;
 use super::support::*;
 use super::*;
-use k8s_openapi::api::core::v1::Event;
 use pplx_space_api_route::wait_ready_lifecycle_request;
-use pplx_space_node_mgr_client::MEMORY_ADMISSION_REFUSAL_PREFIX;
+use tokio::sync::broadcast::error::RecvError;
+use tokio::time::sleep_until;
 
-/// The kubelet event reason for a pod sandbox the runtime failed to start.
-const FAILED_CREATE_POD_SANDBOX_REASON: &str = "FailedCreatePodSandBox";
+/// The subtractive jitter on [`SubstrateBudgets::readiness_backstop`], as a
+/// fraction of it, so the backstop reads of creates that started together
+/// spread out.
+const READINESS_BACKSTOP_JITTER: f64 = 0.2;
 
-/// The marker `annotateStatus` in `shim/space.go` writes for node-manager's
-/// `InvalidArgument`: the request fails identically on every node. sbx-mgr's
-/// `failure_status` decides which node-manager codes reach the shim intact.
-const INVALID_ARGUMENT_MARKER: &str = "[space-err=InvalidArgument]";
-const RESOURCE_EXHAUSTED_MARKER: &str = "[space-err=ResourceExhausted]";
-
-/// How long a create waiting for its pod's IP waits to watch that pod's
-/// events again after a watch ended or failed. A watch from `"0"` replays the
-/// events already recorded, so a refusal recorded in between is not missed.
-const POD_SANDBOX_REJECTION_REWATCH_DELAY: Duration = Duration::from_secs(1);
-
-/// Only explicit node-manager verdicts end the wait; other failures remain
-/// eligible for kubelet's retry of the same pod.
-fn pod_sandbox_rejection_error(
-    event_message: &str,
-    fail_fast_on_memory_refusal: bool,
-) -> Option<SubstrateError> {
-    if let Some((_, reason)) = event_message.split_once(INVALID_ARGUMENT_MARKER) {
-        return Some(SubstrateError::InvalidRequest {
-            message: format!(
-                "the node refused to start the sandbox: {}",
-                reason.trim_start_matches(':').trim()
-            ),
-        });
-    }
-    if !fail_fast_on_memory_refusal {
-        return None;
-    }
-    let (_, reason) = event_message.split_once(RESOURCE_EXHAUSTED_MARKER)?;
-    // ResourceExhausted also covers transient queue/slot pressure. The
-    // allocation path's explicit prefix distinguishes memory admission.
-    let (_, reason) = reason.split_once(MEMORY_ADMISSION_REFUSAL_PREFIX)?;
-    Some(SubstrateError::Unavailable {
-        message: format!("{MEMORY_ADMISSION_REFUSAL_PREFIX} {}", reason.trim()),
-    })
+/// When a readiness wait reads its pod from the apiserver while the shared
+/// reflector does not show the pod settled: about every
+/// [`SubstrateBudgets::readiness_backstop`], jittered, and once more just
+/// before the deadline, early enough for that read to finish within it.
+/// Reflector lag or a broken watch costs a wait at most one interval, and the
+/// apiserver at most one read per waiting create per interval.
+pub(super) struct ReadinessBackstop {
+    next: Instant,
+    last: Instant,
+    interval: Duration,
+    exhausted: bool,
 }
 
-/// Why a watch of a pod's sandbox refusals ended without one.
-struct RejectionWatchFailure {
-    /// The apiserver's HTTP status, when it answered with one.
-    code: Option<u16>,
-    message: String,
-}
-
-impl RejectionWatchFailure {
-    fn from_kube(error: kube::Error) -> Self {
-        let code = match &error {
-            kube::Error::Api(response) => Some(response.code),
-            _ => None,
-        };
+impl ReadinessBackstop {
+    fn new(budgets: &SubstrateBudgets, deadline: Instant) -> Self {
+        let now = Instant::now();
+        let last = deadline
+            .checked_sub(budgets.readiness_pod_get + budgets.reflector_wait)
+            .unwrap_or(now)
+            .max(now);
+        let interval = budgets.readiness_backstop;
         Self {
-            code,
-            message: error.to_string(),
+            next: (now + jittered_backstop(interval)).min(last),
+            last,
+            interval,
+            exhausted: false,
         }
     }
 
-    /// A client error that another watch would get again: anything in 4xx
-    /// but a request timeout, an expired resource version or throttling.
-    fn is_permanent(&self) -> bool {
-        self.code
-            .is_some_and(|code| (400..500).contains(&code) && !matches!(code, 408 | 410 | 429))
+    /// When the next read is due, or `None` once the last one has run.
+    fn next_read(&self) -> Option<Instant> {
+        (!self.exhausted).then_some(self.next)
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.next_read().is_some_and(|next| now >= next)
+    }
+
+    /// Count a read, due or not, starting the next interval.
+    fn read(&mut self, now: Instant) {
+        if self.next >= self.last {
+            self.exhausted = true;
+            return;
+        }
+        self.next = (now + jittered_backstop(self.interval)).min(self.last);
     }
 }
 
-/// Watch `params`' events from `"0"` until one carries a classified refusal,
-/// or the watch ends (`None`).
-async fn watch_pod_sandbox_rejection(
-    events: &Api<Event>,
-    params: &WatchParams,
-    fail_fast_on_memory_refusal: bool,
-) -> Result<Option<SubstrateError>, RejectionWatchFailure> {
-    let stream = events
-        .watch(params, "0")
-        .await
-        .map_err(RejectionWatchFailure::from_kube)?;
-    pin_mut!(stream);
-    while let Some(event) = stream
-        .try_next()
-        .await
-        .map_err(RejectionWatchFailure::from_kube)?
-    {
-        match event {
-            WatchEvent::Added(event) | WatchEvent::Modified(event) => {
-                if let Some(error) = event.message.as_deref().and_then(|message| {
-                    pod_sandbox_rejection_error(message, fail_fast_on_memory_refusal)
-                }) {
-                    return Ok(Some(error));
-                }
-            }
-            WatchEvent::Deleted(_) | WatchEvent::Bookmark(_) => {}
-            WatchEvent::Error(status) => {
-                return Err(RejectionWatchFailure {
-                    code: Some(status.code),
-                    message: status.message.clone(),
-                });
-            }
+fn jittered_backstop(interval: Duration) -> Duration {
+    interval.mul_f64(1.0 - rand::random::<f64>() * READINESS_BACKSTOP_JITTER)
+}
+
+/// How a readiness wait learned its pod's address, as the
+/// `network_address_assigned` step's `result` names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PodIpLearned {
+    /// The reflector already showed it when the wait began.
+    Cached,
+    /// A reflector update during the wait.
+    Reflector,
+    /// A backstop read from the apiserver.
+    Backstop,
+    /// The pod's node, before Kubernetes published it.
+    Node,
+}
+
+impl PodIpLearned {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cached => "cached",
+            Self::Reflector => "reflector",
+            Self::Backstop => "backstop",
+            Self::Node => "node",
         }
     }
-    Ok(None)
 }
 
 #[derive(Clone, Copy)]
@@ -292,111 +270,126 @@ impl KubernetesSubstrate {
         Ok(())
     }
 
-    /// Watch the pod until Kubernetes publishes its IP, sending each view of
-    /// it to `observed` once its placement is recorded. A pod other than the
-    /// one `target` names is ignored.
-    async fn watch_until_pod_ip_assigned(
+    /// The address of the pod `target` names, from the shared sandbox-pod
+    /// reflector, sending each view of the pod to `observed` once its
+    /// placement is recorded. A pod other than the one `target` names is
+    /// ignored.
+    ///
+    /// The wait opens no watch and polls nothing of its own: it reads the
+    /// reflector's store and wakes on [`pod_reflector::PodEvents`]. Once the
+    /// store shows the pod settled (an IP, a terminal phase or
+    /// unschedulable), the address is resolved and validated as every
+    /// readiness resolution is. While it does not, `backstop` paces the
+    /// apiserver reads that cover reflector lag. A reflector that has not
+    /// finished its first list is waited for, within the same reads.
+    async fn reflected_pod_ip(
         &self,
         sandbox_id: SandboxId,
         target: &PodProxyWaitTarget<'_>,
+        deadline: Instant,
+        backstop: &mut ReadinessBackstop,
         observed: &tokio::sync::watch::Sender<Option<SandboxPodView>>,
-    ) -> Result<Option<PodIp>, SubstrateError> {
-        let PodProxyWaitTarget {
-            pod_name,
-            generation,
-            ..
-        } = *target;
-        let sandbox_uuid = sandbox_id;
-        let pods: Api<Pod> = Api::namespaced(self.k8s.client.clone(), &self.k8s.sandbox_namespace);
-        let watch_params = WatchParams::default()
-            .fields(&format!("metadata.name={pod_name}"))
-            .timeout(POD_IP_WATCH_TIMEOUT_SECS);
-        let stream =
-            pods.watch(&watch_params, "0")
-                .await
-                .map_err(|err| SubstrateError::Failed {
-                    message: format!("failed to watch K8s pod: {err}"),
-                })?;
-        pin_mut!(stream);
-
+    ) -> Result<Option<((PodIp, PodIpSource), PodIpLearned)>, SubstrateError> {
+        // Subscribed before the first store read, so no update between that
+        // read and the wait is missed.
+        let mut updates = self.pod_events.subscribe();
+        let started_at = Instant::now();
+        let mut learned = PodIpLearned::Cached;
+        let mut last_view: Option<Arc<SandboxPodView>> = None;
+        let mut placed_on: Option<String> = None;
+        let mut recheck_at: Option<Instant> = None;
         loop {
-            let event = match stream.try_next().await {
-                Ok(Some(event)) => event,
-                Ok(None) => return Ok(None),
-                Err(err) => {
-                    return Err(SubstrateError::Failed {
-                        message: format!("failed to watch K8s pod event: {err}"),
-                    });
+            let now = Instant::now();
+            let view = self
+                .lookup_sandbox_pod(target.pod_name)
+                .filter(|pod| target.names(pod));
+            let settled = view.as_deref().is_some_and(pod_status_is_settled);
+            // The store replaces a pod's view on every update, so an
+            // unchanged `Arc` is a view this wait has already handled.
+            let fresh = view.as_ref().is_some_and(|pod| {
+                last_view
+                    .as_ref()
+                    .is_none_or(|seen| !Arc::ptr_eq(seen, pod))
+            });
+            let recheck = settled && recheck_at.is_some_and(|at| now >= at);
+            if let Some(pod) = view.filter(|_| fresh || recheck) {
+                last_view = Some(Arc::clone(&pod));
+                recheck_at = None;
+                if settled {
+                    if let Some(resolved) = self
+                        .resolve_pod_ip_for_readiness(sandbox_id, target, deadline)
+                        .await?
+                    {
+                        return Ok(Some((resolved, learned)));
+                    }
+                    // The execution row does not describe the settled pod
+                    // yet, as for a create joining one whose owner has not
+                    // recorded its pod. Ask again at the start-wait cadence:
+                    // a settled pod resolves from the store and Postgres
+                    // alone. A terminal pod is verified once per view.
+                    if terminal_pod_phase(&pod).is_none() {
+                        recheck_at = Some(now + start_wait_poll_interval(started_at));
+                    }
                 }
-            };
-
-            let pod = match event {
-                WatchEvent::Added(pod) | WatchEvent::Modified(pod) => SandboxPodView::from(pod),
-                WatchEvent::Deleted(_) => return Ok(None),
-                WatchEvent::Bookmark(_) => continue,
-                WatchEvent::Error(status) => {
-                    let message = if status.message.is_empty() {
-                        "unknown error".to_string()
-                    } else {
-                        status.message
-                    };
-                    return Err(SubstrateError::Failed {
-                        message: format!("K8s pod watch error: {message}"),
-                    });
+                if fresh {
+                    if let Some(node_name) = assigned_pod_node_name(&pod)
+                        && placed_on.as_deref() != Some(node_name)
+                    {
+                        self.remember_pod_node_placement(
+                            sandbox_id,
+                            &pod,
+                            PlacementRetryDisposition::RetryDuplicatesExecution,
+                        )
+                        .await?;
+                        placed_on = Some(node_name.to_owned());
+                    }
+                    observed.send_replace(Some(SandboxPodView::clone(&pod)));
                 }
-            };
-
-            if !target.names(&pod) {
+            }
+            if !settled && backstop.due(Instant::now()) {
+                backstop.read(Instant::now());
+                if let Some(resolved) = self
+                    .resolve_pod_ip_for_readiness(sandbox_id, target, deadline)
+                    .await?
+                {
+                    return Ok(Some((resolved, PodIpLearned::Backstop)));
+                }
+            }
+            learned = PodIpLearned::Reflector;
+            let wake_at = [backstop.next_read(), recheck_at]
+                .into_iter()
+                .flatten()
+                .fold(deadline, Instant::min);
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            if !self.pod_reflector_ready.is_ready() {
+                // An unready reflector's store is not yet readable; its
+                // first list's updates still arrive on `updates`.
+                tokio::select! {
+                    ready = self.pod_reflector_ready.wait_until_ready() => {
+                        if ready.is_err() {
+                            sleep_until(wake_at).await;
+                        }
+                    }
+                    () = sleep_until(wake_at) => {}
+                }
                 continue;
             }
-            if let Some(message) = pod.unschedulable_message() {
-                return Err(SubstrateError::Unschedulable {
-                    message: format!("sandbox pod is unschedulable: {message}"),
-                });
+            loop {
+                match timeout_at(wake_at, updates.recv()).await {
+                    Ok(Ok(pod_name)) if pod_name != target.pod_name => continue,
+                    // An update for the pod, or one this wait may have missed.
+                    Ok(Ok(_) | Err(RecvError::Lagged(_))) => break,
+                    // The reflector has stopped: only the backstop reads
+                    // remain.
+                    Ok(Err(RecvError::Closed)) => {
+                        sleep_until(wake_at).await;
+                        break;
+                    }
+                    Err(_) => break,
+                }
             }
-
-            let pod_uid = pod.uid().map(str::to_owned);
-            let pod_ip = assigned_pod_ip(&pod)?;
-            let _ = self
-                .remember_pod_node_placement(
-                    sandbox_uuid,
-                    &pod,
-                    PlacementRetryDisposition::RetryDuplicatesExecution,
-                )
-                .await?;
-            observed.send_replace(Some(pod.clone()));
-            if pod_ip.is_none() {
-                continue;
-            }
-
-            let pod_ip_string = pod_ip.map(|ip| ip.to_string());
-            match self
-                .store
-                .persist_pod_metadata(
-                    sandbox_uuid,
-                    generation,
-                    pod_uid.as_deref(),
-                    pod_ip_string.as_deref(),
-                    pod.client_id().as_ref(),
-                )
-                .await
-            {
-                Ok(Some(_)) => {}
-                Ok(None) => tracing::warn!(
-                    sandbox_id = %sandbox_id,
-                    generation,
-                    "pod metadata write no-oped after pod IP assignment: the execution \
-                     was retired or replaced mid-flight"
-                ),
-                Err(err) => tracing::warn!(
-                    sandbox_id = %sandbox_id,
-                    generation,
-                    error = %err,
-                    "failed to persist Kubernetes pod metadata after pod IP assignment"
-                ),
-            }
-
-            return Ok(pod_ip);
         }
     }
 
@@ -466,35 +459,13 @@ impl KubernetesSubstrate {
         }
     }
 
-    async fn poll_until_pod_ip_assigned(
-        &self,
-        sandbox_id: SandboxId,
-        target: &PodProxyWaitTarget<'_>,
-        deadline: Instant,
-    ) -> Result<Option<(PodIp, PodIpSource)>, SubstrateError> {
-        let started_at = Instant::now();
-        while Instant::now() < deadline {
-            if let Some(resolved) = self
-                .resolve_pod_ip_for_readiness(sandbox_id, target, deadline)
-                .await?
-            {
-                return Ok(Some(resolved));
-            }
-            tokio::time::sleep_until(
-                deadline.min(Instant::now() + start_wait_poll_interval(started_at)),
-            )
-            .await;
-        }
-        Ok(None)
-    }
-
     async fn wait_for_pod_ip_assignment(
         &self,
         metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         sandbox_id: SandboxId,
         target: &PodProxyWaitTarget<'_>,
         deadline: Instant,
-        phase: &'static str,
+        backstop: &mut ReadinessBackstop,
     ) -> Result<Option<(PodIp, PodIpSource)>, SubstrateError> {
         let PodProxyWaitTarget {
             pod_name,
@@ -502,25 +473,14 @@ impl KubernetesSubstrate {
             generation,
         } = *target;
         let started_at = Instant::now();
-        if let Some(resolved) = self
-            .resolve_pod_ip_for_readiness(sandbox_id, target, deadline)
-            .await?
-        {
-            record_pod_ip_ready(metric_identity, sandbox_id, started_at, "cached");
-            return Ok(Some(resolved));
-        }
-        if Instant::now() >= deadline {
-            return Ok(None);
-        }
-
         // The pod's node usually reports the address before Kubernetes does;
         // whichever answers first binds the execution.
         let (observed, observed_by_node) = tokio::sync::watch::channel(None);
         // Both waits are large futures; keep them off the caller's stack.
-        let watched = Box::pin(
-            self.watch_until_pod_ip_assigned(sandbox_id, target, &observed)
+        let reflected = Box::pin(
+            self.reflected_pod_ip(sandbox_id, target, deadline, backstop, &observed)
                 .instrument(tracing::info_span!(
-                    "substrate.k8s.watch_pod_ip",
+                    "substrate.k8s.reflected_pod_ip",
                     sandbox_id = %sandbox_id,
                     pod_name = %pod_name,
                     namespace = %self.k8s.sandbox_namespace,
@@ -533,62 +493,17 @@ impl KubernetesSubstrate {
                     sandbox_id = %sandbox_id,
                 )),
         );
-        // Kubernetes' answer: the watch, then polling if the watch ends or fails.
-        let kubernetes = Box::pin(async {
-            match watched.await {
-                Ok(Some(pod_ip)) => Ok(Some(((pod_ip, PodIpSource::Published), "watch"))),
-                Ok(None) => {
-                    let pod_ip = self
-                        .poll_until_pod_ip_assigned(sandbox_id, target, deadline)
-                        .instrument(tracing::info_span!(
-                            "substrate.k8s.poll_pod_ip",
-                            sandbox_id = %sandbox_id,
-                            pod_name = %pod_name,
-                            namespace = %self.k8s.sandbox_namespace,
-                        ))
-                        .await?;
-                    Ok(pod_ip.map(|pod_ip| (pod_ip, "poll")))
-                }
-                Err(err) => {
-                    crate::metrics::sandbox::api::create_step_error(
-                        sandbox_id,
-                        metric_identity,
-                        "fc",
-                        None,
-                        "execution_watch",
-                        "watch_error",
-                        Some(phase),
-                    );
-                    tracing::warn!(
-                        sandbox_id = %sandbox_id,
-                        error = %err,
-                        "pod IP watch failed; falling back to polling"
-                    );
-                    let pod_ip = self
-                        .poll_until_pod_ip_assigned(sandbox_id, target, deadline)
-                        .instrument(tracing::info_span!(
-                            "substrate.k8s.poll_pod_ip",
-                            sandbox_id = %sandbox_id,
-                            pod_name = %pod_name,
-                            namespace = %self.k8s.sandbox_namespace,
-                            fallback_reason = "watch_error",
-                        ))
-                        .await?;
-                    Ok(pod_ip.map(|pod_ip| (pod_ip, "poll_after_watch_error")))
-                }
-            }
-        });
         let raced = async {
             tokio::select! {
-                kubernetes = kubernetes => kubernetes,
+                reflected = reflected => reflected,
                 Some(pod_ip) = node_reported => {
-                    Ok(Some(((pod_ip, PodIpSource::NodeReported), "node")))
+                    Ok(Some(((pod_ip, PodIpSource::NodeReported), PodIpLearned::Node)))
                 }
             }
         };
         match timeout_at(deadline, raced).await {
-            Ok(Ok(Some((resolved, label)))) => {
-                record_pod_ip_ready(metric_identity, sandbox_id, started_at, label);
+            Ok(Ok(Some((resolved, learned)))) => {
+                record_pod_ip_ready(metric_identity, sandbox_id, started_at, learned.as_str());
                 Ok(Some(resolved))
             }
             Ok(Ok(None)) | Err(_) => Ok(None),
@@ -601,7 +516,6 @@ impl KubernetesSubstrate {
         metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         sandbox_id: SandboxId,
         target: PodProxyWaitTarget<'_>,
-        phase: &'static str,
         // Phase deadline of the enclosing budget-bounded wait (see
         // `ready_phase_deadline`). The configured data-plane timeout is
         // clamped to it so this wait's phase-tagged timeout fires before
@@ -613,9 +527,16 @@ impl KubernetesSubstrate {
         let deadline =
             (Instant::now() + self.k8s.create_data_plane_ready_timeout).min(phase_deadline);
         let sandbox_id_string = sandbox_id.to_string();
+        let mut backstop = ReadinessBackstop::new(&self.budgets, deadline);
 
         let pod_ip_assignment = self
-            .wait_for_pod_ip_assignment(metric_identity, sandbox_id, &target, deadline, phase)
+            .wait_for_pod_ip_assignment(
+                metric_identity,
+                sandbox_id,
+                &target,
+                deadline,
+                &mut backstop,
+            )
             .instrument(tracing::info_span!(
                 "substrate.k8s.wait_pod_ip",
                 sandbox_id = %sandbox_id,
@@ -626,10 +547,19 @@ impl KubernetesSubstrate {
         // retries it until the wait's deadline. Only a wait that knows its
         // pod's UID can tell that pod's refusal from an earlier pod's.
         let pod_ip = match target.pod_uid {
-            Some(pod_uid) => tokio::select! {
-                pod_ip = pod_ip_assignment => pod_ip?,
-                rejection = self.pod_sandbox_rejection(pod_uid) => return Err(rejection),
-            },
+            Some(pod_uid) => {
+                let refusal = self.pod_sandbox_rejections.register(pod_uid);
+                let fail_fast_on_memory_refusal = pplx_space_env_vars::env_flag_var(
+                    "SPACE_CREATE_FAIL_FAST_ON_NODE_REJECTION",
+                    false,
+                );
+                tokio::select! {
+                    pod_ip = pod_ip_assignment => pod_ip?,
+                    rejection = refusal.refused(fail_fast_on_memory_refusal) => {
+                        return Err(rejection);
+                    }
+                }
+            }
             None => pod_ip_assignment.await?,
         };
         let Some((mut pod_ip, mut source)) = pod_ip else {
@@ -709,12 +639,21 @@ impl KubernetesSubstrate {
             // recorded address for the target's UID is kept until kubelet
             // publishes another, so after a runtime sandbox is recreated under
             // the same UID the wait binds its new address at kubelet's pace,
-            // as without a node report.
-            if let Some(current) = self
-                .resolve_pod_ip_for_readiness(sandbox_id, &target, deadline)
-                .await?
-            {
-                (pod_ip, source) = current;
+            // as without a node report. Until the reflector shows the pod
+            // settled, only the backstop reads it from the apiserver.
+            let settled = self
+                .lookup_sandbox_pod(target.pod_name)
+                .is_some_and(|pod| target.names(&pod) && pod_status_is_settled(&pod));
+            if settled || backstop.due(Instant::now()) {
+                if !settled {
+                    backstop.read(Instant::now());
+                }
+                if let Some(current) = self
+                    .resolve_pod_ip_for_readiness(sandbox_id, &target, deadline)
+                    .await?
+                {
+                    (pod_ip, source) = current;
+                }
             }
             sleep(start_wait_poll_interval(started_at)).await;
         }
@@ -813,60 +752,6 @@ impl KubernetesSubstrate {
                     .await
             }
             (PodIpSource::NodeReported, None) => Ok(false),
-        }
-    }
-
-    /// Resolve once the node refuses `pod_uid`'s pod sandbox as invalid or,
-    /// when enabled, refuses memory admission; otherwise never. A memory
-    /// refusal fails this placement but lets the caller retry the create.
-    ///
-    /// A watch the apiserver refuses outright, with a client error other than
-    /// a timeout, throttling or an expired version (such as a missing `watch`
-    /// grant), leaves the wait to its deadline. Any other failure, and a watch
-    /// that ends, is watched again after
-    /// [`POD_SANDBOX_REJECTION_REWATCH_DELAY`].
-    async fn pod_sandbox_rejection(&self, pod_uid: &str) -> SubstrateError {
-        let events: Api<Event> =
-            Api::namespaced(self.k8s.client.clone(), &self.k8s.sandbox_namespace);
-        // A watch from "0", as `watch_until_pod_ip_assigned` does for the
-        // pod: the apiserver serves it from its watch cache, replays the
-        // refusals already recorded as `Added` and pushes later ones. A LIST
-        // would read the namespace's Events from etcd on every poll, since
-        // field selectors on Events are not indexed. It is bounded to one
-        // pod's UID and one reason, and runs only while a create waits for
-        // that pod's IP.
-        let params = WatchParams::default()
-            .fields(&format!(
-                "involvedObject.uid={pod_uid},reason={FAILED_CREATE_POD_SANDBOX_REASON}"
-            ))
-            .timeout(POD_IP_WATCH_TIMEOUT_SECS);
-        let fail_fast_on_memory_refusal =
-            pplx_space_env_vars::env_flag_var("SPACE_CREATE_FAIL_FAST_ON_NODE_REJECTION", false);
-        let mut warned = false;
-        loop {
-            match watch_pod_sandbox_rejection(&events, &params, fail_fast_on_memory_refusal).await {
-                Ok(Some(error)) => return error,
-                Ok(None) => {}
-                Err(failure) if failure.is_permanent() => {
-                    tracing::warn!(
-                        pod_uid,
-                        error = %failure.message,
-                        "sandbox pod events cannot be watched; waiting for the pod IP without them"
-                    );
-                    return std::future::pending().await;
-                }
-                Err(failure) => {
-                    if !warned {
-                        warned = true;
-                        tracing::warn!(
-                            pod_uid,
-                            error = %failure.message,
-                            "failed to watch sandbox pod events; watching them again"
-                        );
-                    }
-                }
-            }
-            sleep(POD_SANDBOX_REJECTION_REWATCH_DELAY).await;
         }
     }
 
@@ -1344,7 +1229,6 @@ impl KubernetesSubstrate {
                 pod_uid: None,
                 generation: execution.generation,
             },
-            "wake",
             phase_deadline,
         )
         .instrument(tracing::info_span!(
