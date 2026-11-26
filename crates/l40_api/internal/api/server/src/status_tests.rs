@@ -16,7 +16,7 @@ async fn prune_empty_census(conn: &mut sqlx::PgConnection, node_id: NodeId) -> T
     let mut tx = conn.begin().await?;
     let ids =
         pplx_space_sandbox_store::ingest::census_prune_candidates(&mut *tx, node_id, &[]).await?;
-    pplx_space_sandbox_store::orphan::lock_published_sandbox_observations(&mut tx, &ids).await?;
+    pplx_space_sandbox_store::orphan::lock_published_sandbox_observations(&mut *tx, &ids).await?;
     prune_absent_node_sandboxes(&mut tx, node_id, &ids).await?;
     tx.commit().await?;
     Ok(())
@@ -474,7 +474,7 @@ async fn complete_inventory_prunes_only_captured_missing_space_sandboxes() -> Te
     let ids =
         pplx_space_sandbox_store::ingest::census_prune_candidates(&mut *tx, node_id, &[]).await?;
     assert_eq!(ids, vec![sandbox_id]);
-    pplx_space_sandbox_store::orphan::lock_published_sandbox_observations(&mut tx, &ids).await?;
+    pplx_space_sandbox_store::orphan::lock_published_sandbox_observations(&mut *tx, &ids).await?;
 
     // A different connection commits a new placement and observation after
     // capture. It matches the prune predicates but was not captured or locked.

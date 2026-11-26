@@ -108,7 +108,7 @@ impl LostStartedSink for LostStartedDbStore {
             lock_creating_full_uploads(&mut *tx, candidate.sandbox_id).await?;
 
         if !mark_started_lost(
-            &mut tx,
+            &mut *tx,
             candidate.sandbox_id,
             node_id,
             candidate.generation,
@@ -126,7 +126,7 @@ impl LostStartedSink for LostStartedDbStore {
             DEAD_UPLOAD_SETTLE,
         )
         .await?;
-        write_off_lost_sandboxes(&mut tx, node_id, &[candidate.sandbox_id]).await?;
+        write_off_lost_sandboxes(&mut *tx, node_id, &[candidate.sandbox_id]).await?;
         tx.commit().await?;
 
         let details = SandboxEventDetails::default()

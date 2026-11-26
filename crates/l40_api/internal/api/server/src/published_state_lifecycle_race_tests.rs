@@ -512,7 +512,7 @@ async fn uncommitted_node_publish_and_orphan_revert_serialize() -> TestResult {
             create_age_threshold_secs: 600,
         };
         let recovered =
-            recover_orphan_to_suspended(&mut tx, sandbox_id, STOP_LIFECYCLES, &guard).await?;
+            recover_orphan_to_suspended(&mut *tx, sandbox_id, STOP_LIFECYCLES, &guard).await?;
         tx.commit().await?;
         assert!(
             recovered.is_some(),
@@ -548,7 +548,7 @@ async fn uncommitted_node_publish_and_orphan_revert_serialize() -> TestResult {
                 create_age_threshold_secs: 600,
             };
             let outcome =
-                recover_orphan_to_suspended(&mut recover_tx, sandbox_id, STOP_LIFECYCLES, &guard)
+                recover_orphan_to_suspended(&mut *recover_tx, sandbox_id, STOP_LIFECYCLES, &guard)
                     .await?;
             recover_tx.commit().await?;
             TestResult::Ok(outcome.is_some())
@@ -582,7 +582,7 @@ async fn uncommitted_node_publish_and_orphan_revert_serialize() -> TestResult {
             create_age_threshold_secs: 600,
         };
         let outcome =
-            recover_orphan_to_suspended(&mut recover_holder, sandbox_id, STOP_LIFECYCLES, &guard)
+            recover_orphan_to_suspended(&mut *recover_holder, sandbox_id, STOP_LIFECYCLES, &guard)
                 .await?;
         assert!(outcome.is_some());
 

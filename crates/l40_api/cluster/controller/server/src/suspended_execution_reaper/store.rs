@@ -127,7 +127,7 @@ impl RetireSink for ExecutionDbStore {
         .await?;
 
         let projected =
-            unplace_suspended_after_execution_retired(&mut tx, candidate.sandbox_id).await?;
+            unplace_suspended_after_execution_retired(&mut *tx, candidate.sandbox_id).await?;
         if !projected {
             tx.rollback().await?;
             return Ok(RetireOutcome::SkippedSnapshotNotCurrent);

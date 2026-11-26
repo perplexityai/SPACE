@@ -1,5 +1,6 @@
 //! Which sandbox rows and execution generations own a set of restore pods.
 
+use pplx_space_postgres_pool::Executor;
 use pplx_space_sql_locator::sql;
 use uuid::Uuid;
 
@@ -36,7 +37,7 @@ pub struct RestorePodOwnerRow {
 /// control plane retains until tombstone retention hard-deletes them, so a
 /// deleted sandbox's pod reads as having no owning row.
 pub async fn list(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_ids: &[Uuid],
     floor_generations: &[i64],
 ) -> Result<Vec<RestorePodOwnerRow>, SandboxStoreError> {
@@ -54,6 +55,6 @@ pub async fn list(
     ))
     .bind(sandbox_ids)
     .bind(floor_generations)
-    .fetch_all(executor)
+    .fetch_all(executor.into_sqlx())
     .await?)
 }

@@ -1298,7 +1298,7 @@ impl OrphanActionSink for SubstrateActionSink {
 
         if matches!(plan.disposition, OrphanDisposition::RecoverSuspended)
             && let Some(row) = orphan::recover_orphan_to_suspended(
-                &mut tx,
+                &mut *tx,
                 sandbox_id,
                 ORPHAN_RECONCILER_STOP_LIFECYCLES,
                 &guard.store_guard(),
@@ -1342,7 +1342,7 @@ impl OrphanActionSink for SubstrateActionSink {
 
         if matches!(plan.disposition, OrphanDisposition::QuarantineAmbiguous)
             && let Some(row) = orphan::quarantine_orphan(
-                &mut tx,
+                &mut *tx,
                 sandbox_id,
                 ORPHAN_RECONCILER_STOP_LIFECYCLES,
                 &guard.store_guard(),
@@ -1565,9 +1565,9 @@ async fn plan_orphan_in_tx(
 ) -> Result<Option<OrphanPlan>, sqlx::Error> {
     let store_guard = guard.store_guard();
     let row = if lock {
-        orphan::lock_orphan_observation(tx, sandbox_id).await?;
+        orphan::lock_orphan_observation(&mut **tx, sandbox_id).await?;
         orphan::plan::lock_plan(
-            tx,
+            &mut **tx,
             sandbox_id,
             ORPHAN_RECONCILER_STOP_LIFECYCLES,
             &store_guard,
@@ -1640,6 +1640,7 @@ async fn list_candidates_after(
         },
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 /// Run the orphaned-sandbox reconcile loop on the current task until the

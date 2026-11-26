@@ -242,7 +242,7 @@ async fn retire_reverted_restore_execution(
         // The retired execution no longer places the row. The cleanup that
         // follows unplaces it too, but it is best-effort, and a `suspended`
         // row left reading as placed is one nothing revisits.
-        sweeper::unplace_reverted_restore(tx, sandbox_id).await?;
+        sweeper::unplace_reverted_restore(&mut **tx, sandbox_id).await?;
         // The node state the open exposures described died with the runtime.
         pplx_space_sandbox_store::port_exposures::invalidate_open_observations(
             &mut **tx, sandbox_id,
@@ -619,6 +619,7 @@ impl SweepSink for SubstrateSweepSink {
             reverted.prior_placement_changed_at,
         )
         .await
+        .map_err(sqlx::Error::from)
     }
 
     async fn revert_to_suspended(
@@ -634,7 +635,7 @@ impl SweepSink for SubstrateSweepSink {
         // the execution check below can't race a new claim, and read the
         // placement clock the CAS clears while holding it.
         let prior_placement_changed_at: Option<Option<time::OffsetDateTime>> =
-            sweeper::lock_placement_changed_at(&mut tx, sandbox_id, managed_by).await?;
+            sweeper::lock_placement_changed_at(&mut *tx, sandbox_id, managed_by).await?;
         let Some(prior_placement_changed_at) = prior_placement_changed_at else {
             tx.rollback().await?;
             return Ok(None);
@@ -711,7 +712,8 @@ impl SweepSink for SubstrateSweepSink {
             return sweeper::fail_aged_candidate(
                 &self.pool, sandbox_id, managed_by, lifecycle, age, guard,
             )
-            .await;
+            .await
+            .map_err(sqlx::Error::from);
         }
         let mut tx = begin_locked(&self.pool, sandbox_id).await?;
         let token =
@@ -736,6 +738,7 @@ impl SweepSink for SubstrateSweepSink {
             write_token,
         )
         .await
+        .map_err(sqlx::Error::from)
     }
 
     async fn list_unrestorable_restoring(
@@ -767,6 +770,7 @@ impl SweepSink for SubstrateSweepSink {
         let managed_by = self.substrate.managed_by();
         sweeper::fail_unrestorable_restoring(&self.pool, sandbox_id, managed_by, min_placement_age)
             .await
+            .map_err(sqlx::Error::from)
     }
 
     async fn retire_fence_mismatch(
@@ -888,7 +892,9 @@ impl SweepSink for SubstrateSweepSink {
         let Some(managed_by) = failed_active_execution_scope(self.substrate.managed_by()) else {
             return Ok(false);
         };
-        sweeper::repair_failed_active_execution(&self.pool, sandbox_id, managed_by).await
+        sweeper::repair_failed_active_execution(&self.pool, sandbox_id, managed_by)
+            .await
+            .map_err(sqlx::Error::from)
     }
 
     /// List preserved `started` rows whose `command_ready_pending` marker has
@@ -948,7 +954,9 @@ impl SweepSink for SubstrateSweepSink {
 
     async fn heal_command_ready_pending(&self, sandbox_id: SandboxId) -> Result<(), sqlx::Error> {
         let managed_by = self.substrate.managed_by();
-        sweeper::heal_command_ready_pending(&self.pool, sandbox_id, managed_by).await
+        sweeper::heal_command_ready_pending(&self.pool, sandbox_id, managed_by)
+            .await
+            .map_err(sqlx::Error::from)
     }
 
     async fn reap_command_ready_pending(
@@ -956,7 +964,9 @@ impl SweepSink for SubstrateSweepSink {
         sandbox_id: SandboxId,
     ) -> Result<Option<String>, sqlx::Error> {
         let managed_by = self.substrate.managed_by();
-        sweeper::reap_command_ready_pending(&self.pool, sandbox_id, managed_by).await
+        sweeper::reap_command_ready_pending(&self.pool, sandbox_id, managed_by)
+            .await
+            .map_err(sqlx::Error::from)
     }
 
     async fn undo_reap_command_ready_pending(
@@ -967,5 +977,6 @@ impl SweepSink for SubstrateSweepSink {
         let managed_by = self.substrate.managed_by();
         sweeper::undo_reap_command_ready_pending(&self.pool, sandbox_id, managed_by, write_token)
             .await
+            .map_err(sqlx::Error::from)
     }
 }

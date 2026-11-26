@@ -22,11 +22,11 @@ use pplx_space_snapshot_model::LocalArtifactId;
 
 use std::sync::LazyLock;
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_portability::{
     failed_repair_revert_eligibility, newest_suspend_snapshot_current,
 };
 use pplx_space_sql_locator::sql;
-use sqlx::{Postgres, Transaction};
 
 /// `make_interval(secs => $n::BIGINT)` needs an i64 bind. Saturate rather
 /// than wrap: any value above i64::MAX means "never act" in human terms.
@@ -108,11 +108,11 @@ pub struct FailedRestorableCandidate {
 /// A plain read; its age and lease checks compare with `NOW()`, so it reads
 /// the clock of the executor's transaction.
 pub async fn failed_restorable_candidates(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     batch_size: u32,
     after_sandbox_id: Option<SandboxId>,
     min_age: PositiveDuration,
-) -> Result<Vec<FailedRestorableCandidate>, sqlx::Error> {
+) -> Result<Vec<FailedRestorableCandidate>, DbError> {
     /// Built once: every input is a literal or a bind placeholder.
     static QUERY: LazyLock<String> = LazyLock::new(|| {
         let eligibility = failed_repair_revert_eligibility("s");
@@ -142,13 +142,13 @@ pub async fn failed_restorable_candidates(
             eligible = eligibility.eligible,
         ))
     });
-    sqlx::query_as(sqlx::AssertSqlSafe(QUERY.as_str()))
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(QUERY.as_str()))
         .bind(duration_secs_i64(min_age))
         .bind(after_sandbox_id)
         .bind(i64::from(batch_size))
         .bind(SubstrateKind::Kubernetes)
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }
 
 /// **Inference.** Revert a `failed` Kubernetes sandbox with a restorable
@@ -170,11 +170,16 @@ pub async fn failed_restorable_candidates(
 /// This statement leaves it in place: the caller deletes it in the same
 /// transaction, after the flip, or the API keeps reporting the sandbox as
 /// failed.
-pub async fn revert_failed_to_suspended(
-    tx: &mut Transaction<'_, Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn revert_failed_to_suspended<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     min_age: PositiveDuration,
-) -> Result<Option<bool>, sqlx::Error> {
+) -> Result<Option<bool>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     /// Built once: every input is a literal or a bind placeholder.
     static QUERY: LazyLock<String> = LazyLock::new(|| {
         let eligibility = failed_repair_revert_eligibility("s");
@@ -206,12 +211,12 @@ pub async fn revert_failed_to_suspended(
             eligible = eligibility.eligible,
         ))
     });
-    sqlx::query_scalar(sqlx::AssertSqlSafe(QUERY.as_str()))
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(QUERY.as_str()))
         .bind(sandbox_id)
         .bind(duration_secs_i64(min_age))
         .bind(SubstrateKind::Kubernetes)
-        .fetch_optional(&mut **tx)
-        .await
+        .fetch_optional(tx.into_sqlx())
+        .await?)
 }
 
 /// **Inference.** Project a quarantined sandbox whose failed suspend
@@ -223,11 +228,16 @@ pub async fn revert_failed_to_suspended(
 /// caller having locked the sandbox, quarantine, execution and snapshot rows
 /// and re-run the candidate query under those locks in the same transaction.
 /// It also assigns `updated_at` itself, although a trigger maintains it.
-pub async fn recover_quarantined_publication_to_suspended(
-    tx: &mut Transaction<'_, Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn recover_quarantined_publication_to_suspended<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     artifact_id: LocalArtifactId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "UPDATE sandboxes SET lifecycle = 'suspended', placement = 'unplaced',
              active_node_id = NULL, target_node_id = NULL,
@@ -239,7 +249,7 @@ pub async fn recover_quarantined_publication_to_suspended(
     ))
     .bind(sandbox_id)
     .bind(artifact_id)
-    .execute(&mut **tx)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -255,10 +265,15 @@ pub async fn recover_quarantined_publication_to_suspended(
 /// this lifecycle cycle. There is no lifecycle predicate of its own: it
 /// relies on the caller's sandbox row lock and its `lifecycle = 'suspended'`
 /// re-check under that lock, in the same transaction.
-pub async fn unplace_suspended_after_execution_retired(
-    tx: &mut Transaction<'_, Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn unplace_suspended_after_execution_retired<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let markerless_snapshot_current = newest_suspend_snapshot_current("s");
     let query = format!(
         "UPDATE sandboxes s
@@ -273,7 +288,7 @@ pub async fn unplace_suspended_after_execution_retired(
     );
     let projected = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
         .bind(sandbox_id)
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?
         .rows_affected()
         > 0;

@@ -108,7 +108,7 @@ async fn lock_plan_locks_the_row_and_the_matched_execution_for_a_missing_pod() -
     ] {
         let mut tx = pool.begin().await?;
         assert!(
-            lock_plan(&mut tx, sandbox_id, STOP, &guard)
+            lock_plan(&mut *tx, sandbox_id, STOP, &guard)
                 .await?
                 .is_none()
         );
@@ -119,7 +119,7 @@ async fn lock_plan_locks_the_row_and_the_matched_execution_for_a_missing_pod() -
     let guard = pod_name_guard(&execution.pod_name, Some(&uid));
     let mut tx = pool.begin().await?;
     assert!(
-        lock_plan(&mut tx, sandbox_id, &["started"], &guard)
+        lock_plan(&mut *tx, sandbox_id, &["started"], &guard)
             .await?
             .is_none()
     );
@@ -128,7 +128,7 @@ async fn lock_plan_locks_the_row_and_the_matched_execution_for_a_missing_pod() -
     // `FOR UPDATE OF s, e`: both rows, so that even a key-share lock waits on
     // each, until the transaction ends.
     let mut tx = pool.begin().await?;
-    let plan = lock_plan(&mut tx, sandbox_id, STOP, &guard)
+    let plan = lock_plan(&mut *tx, sandbox_id, STOP, &guard)
         .await?
         .expect("the row matches the guard");
     assert_eq!(plan.from_lifecycle, SandboxLifecycle::Started);
@@ -171,12 +171,12 @@ async fn lock_plan_locks_only_the_row_for_a_forgotten_or_deleting_guard() -> Tes
     // and locks nothing.
     let mut tx = pool.begin().await?;
     assert!(
-        lock_plan(&mut tx, deleting, STOP, &forgotten_guard)
+        lock_plan(&mut *tx, deleting, STOP, &forgotten_guard)
             .await?
             .is_none()
     );
     assert!(
-        lock_plan(&mut tx, forgotten, STOP, &OrphanGuard::LegacyDeleting)
+        lock_plan(&mut *tx, forgotten, STOP, &OrphanGuard::LegacyDeleting)
             .await?
             .is_none()
     );
@@ -200,7 +200,7 @@ async fn lock_plan_locks_only_the_row_for_a_forgotten_or_deleting_guard() -> Tes
         ),
     ] {
         let mut tx = pool.begin().await?;
-        let plan = lock_plan(&mut tx, sandbox_id, STOP, &guard)
+        let plan = lock_plan(&mut *tx, sandbox_id, STOP, &guard)
             .await?
             .expect("the row matches the guard");
         assert_eq!(plan.from_lifecycle, lifecycle);

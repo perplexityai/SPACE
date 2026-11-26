@@ -112,7 +112,7 @@ pub async fn finalize_sandbox_db_delete_user_initiated(
     sandbox_id: SandboxId,
 ) -> Result<(), FinalizeSandboxDbDeleteError> {
     let mut tx = pool.begin().await?;
-    lock_orphan_observation(&mut tx, sandbox_id).await?;
+    lock_orphan_observation(&mut *tx, sandbox_id).await?;
     lock_fork_source_lifecycle(&mut *tx, sandbox_id).await?;
     // Lock the parent sandbox row to serialize against any
     // concurrent BeginArtifactBackup INSERT (which acquires the
