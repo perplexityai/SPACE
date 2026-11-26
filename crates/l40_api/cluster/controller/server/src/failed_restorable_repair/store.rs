@@ -51,7 +51,7 @@ impl RepairDbStore {
         // rows (CAS lost). See [`repair::revert_failed_to_suspended`].
         let mut tx = self.pool.begin().await?;
         let Some(cleared_marker) =
-            repair::revert_failed_to_suspended(&mut tx, candidate.sandbox_id, min_age).await?
+            repair::revert_failed_to_suspended(&mut *tx, candidate.sandbox_id, min_age).await?
         else {
             tx.rollback().await?;
             return Ok(ApplyOutcome::SkippedRaced);

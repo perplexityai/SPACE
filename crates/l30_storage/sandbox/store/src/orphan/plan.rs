@@ -14,11 +14,11 @@
 
 use std::sync::LazyLock;
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_portability::orphan_recovery_revert_eligibility;
 use pplx_space_sandbox_residency::node_observes_sandbox;
 use pplx_space_sql_locator::sql;
-use sqlx::{Postgres, Transaction};
 
 use super::OrphanGuard;
 
@@ -308,29 +308,34 @@ static LEGACY_DELETING_PLAN: LazyLock<String> = LazyLock::new(|| {
 /// caller's transaction ends, where the resolution write that follows
 /// re-checks the same guard. Run [`super::lock_orphan_observation`]
 /// first, in its own statement. Bind order as on [`OrphanGuard`].
-pub async fn lock_plan(
-    tx: &mut Transaction<'_, Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn lock_plan<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     stop_lifecycles: &[&str],
     guard: &OrphanGuard<'_>,
-) -> Result<Option<OrphanPlanRow>, sqlx::Error> {
+) -> Result<Option<OrphanPlanRow>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let query = match guard {
         OrphanGuard::PodName { .. } => &*LOCK_POD_NAME_PLAN,
         OrphanGuard::Forgotten { .. } => &*LOCK_FORGOTTEN_PLAN,
         OrphanGuard::LegacyDeleting => &*LOCK_LEGACY_DELETING_PLAN,
     };
-    fetch_plan(&mut **tx, query, sandbox_id, stop_lifecycles, guard).await
+    fetch_plan(tx, query, sandbox_id, stop_lifecycles, guard).await
 }
 
 /// Read the row's plan without locking it; `None` as for [`lock_plan`]. The
 /// guard compares execution ages with the database clock, so run it on the
 /// executor whose snapshot the caller acts on.
 pub async fn read_plan(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     stop_lifecycles: &[&str],
     guard: &OrphanGuard<'_>,
-) -> Result<Option<OrphanPlanRow>, sqlx::Error> {
+) -> Result<Option<OrphanPlanRow>, DbError> {
     let query = match guard {
         OrphanGuard::PodName { .. } => &*POD_NAME_PLAN,
         OrphanGuard::Forgotten { .. } => &*FORGOTTEN_PLAN,
@@ -340,16 +345,16 @@ pub async fn read_plan(
 }
 
 async fn fetch_plan(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     query: &str,
     sandbox_id: SandboxId,
     stop_lifecycles: &[&str],
     guard: &OrphanGuard<'_>,
-) -> Result<Option<OrphanPlanRow>, sqlx::Error> {
+) -> Result<Option<OrphanPlanRow>, DbError> {
     let query = sqlx::query_as::<_, OrphanPlanRow>(sqlx::AssertSqlSafe(query))
         .bind(sandbox_id)
         .bind(stop_lifecycles);
-    match *guard {
+    Ok(match *guard {
         OrphanGuard::PodName {
             name,
             uid,
@@ -363,19 +368,19 @@ async fn fetch_plan(
                 .bind(live_pod_required_lifecycles)
                 .bind(pending_pod_lifecycles)
                 .bind(create_age_threshold_secs)
-                .fetch_optional(executor)
-                .await
+                .fetch_optional(executor.into_sqlx())
+                .await?
         }
         OrphanGuard::Forgotten {
             active_execution_required_lifecycles,
         } => {
             query
                 .bind(active_execution_required_lifecycles)
-                .fetch_optional(executor)
-                .await
+                .fetch_optional(executor.into_sqlx())
+                .await?
         }
-        OrphanGuard::LegacyDeleting => query.fetch_optional(executor).await,
-    }
+        OrphanGuard::LegacyDeleting => query.fetch_optional(executor.into_sqlx()).await?,
+    })
 }
 
 #[cfg(test)]

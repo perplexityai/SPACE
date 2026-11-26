@@ -164,7 +164,7 @@ async fn write_off_lost_sandboxes_clears_only_the_gone_nodes_rows() -> TestResul
     let inactive_before = execution(pool, lost_inactive).await?;
 
     let mut tx = pool.begin().await?;
-    write_off_lost_sandboxes(&mut tx, gone, &[lost]).await?;
+    write_off_lost_sandboxes(&mut *tx, gone, &[lost]).await?;
     tx.commit().await?;
 
     assert_eq!(

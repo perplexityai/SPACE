@@ -47,6 +47,7 @@ use std::str::FromStr;
 use std::sync::LazyLock;
 
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxLifecycleParseError};
 use pplx_space_sandbox_portability::{
     fresh_ready_snapshot_exists, inflight_suspend_upload_exists,
@@ -550,23 +551,23 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for AgedTransientRow {
 /// ([`list_aged_transient_query`]), changing nothing. A
 /// `restoring_episode_deadline` of `None` turns the deadline off.
 pub async fn list_aged_transient(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     managed_by: &str,
     lifecycle: SandboxLifecycle,
     age: PositiveDuration,
     limit: i64,
     restoring_episode_deadline: Option<PositiveDuration>,
-) -> Result<Vec<AgedTransientRow>, sqlx::Error> {
+) -> Result<Vec<AgedTransientRow>, DbError> {
     let query = list_aged_transient_query(lifecycle);
-    sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
         .bind(managed_by)
         .bind(lifecycle.to_string())
         .bind(secs_bind(age))
         .bind(limit)
         .bind(SubstrateKind::Kubernetes)
         .bind(restoring_episode_deadline.map(secs_bind))
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }
 
 /// Candidate query for the command-ready-pending reaper. Bind order: `$1` =
@@ -620,17 +621,17 @@ pub struct CommandReadyPendingRow {
 /// `command_ready_pending` marker is older than `age` on the database clock
 /// (`LIST_COMMAND_READY_PENDING_SQL`), changing nothing.
 pub async fn list_command_ready_pending(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     managed_by: &str,
     age: PositiveDuration,
     limit: i64,
-) -> Result<Vec<CommandReadyPendingRow>, sqlx::Error> {
-    sqlx::query_as(LIST_COMMAND_READY_PENDING_SQL)
+) -> Result<Vec<CommandReadyPendingRow>, DbError> {
+    Ok(sqlx::query_as(LIST_COMMAND_READY_PENDING_SQL)
         .bind(managed_by)
         .bind(secs_bind(age))
         .bind(limit)
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }
 
 /// Lock the sandbox's row `FOR UPDATE` when it belongs to the `managed_by`
@@ -639,13 +640,17 @@ pub async fn list_command_ready_pending(
 ///
 /// The revert to `suspended` takes it before the active execution's lock, so
 /// its execution check can't race a new claim, and reads the placement clock
-/// the revert's CAS clears while holding it.
-pub async fn lock_placement_changed_at(
-    conn: &mut sqlx::PgConnection,
+/// the revert's CAS clears while holding it. The caller must pass its open
+/// transaction.
+pub async fn lock_placement_changed_at<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     managed_by: &str,
-) -> Result<Option<Option<OffsetDateTime>>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Option<Option<OffsetDateTime>>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar(sql!(
         "SELECT placement_changed_at
            FROM sandboxes
           WHERE id = $1
@@ -654,8 +659,8 @@ pub async fn lock_placement_changed_at(
     ))
     .bind(sandbox_id)
     .bind(managed_by)
-    .fetch_optional(conn)
-    .await
+    .fetch_optional(tx.into_sqlx())
+    .await?)
 }
 
 /// Heal query: clear the marker on a probe-confirmed-ready row. Bind order:
@@ -674,14 +679,14 @@ pub(crate) const HEAL_COMMAND_READY_PENDING_SQL: &str = sql!(
 /// Writes an **observed projection**: the probe's answer. No lifecycle
 /// predicate of its own; it re-checks only that the marker is still set.
 pub async fn heal_command_ready_pending(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     managed_by: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(HEAL_COMMAND_READY_PENDING_SQL)
         .bind(sandbox_id)
         .bind(managed_by)
-        .execute(executor)
+        .execute(executor.into_sqlx())
         .await?;
     Ok(())
 }
@@ -714,15 +719,17 @@ pub(crate) const REAP_COMMAND_READY_PENDING_SQL: &str = sql!(
 /// never become ready. The age the caller listed it under is not re-checked
 /// here; the `started` and marker predicates are the whole guard.
 pub async fn reap_command_ready_pending(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     managed_by: &str,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>(REAP_COMMAND_READY_PENDING_SQL)
-        .bind(sandbox_id)
-        .bind(managed_by)
-        .fetch_optional(executor)
-        .await
+) -> Result<Option<String>, DbError> {
+    Ok(
+        sqlx::query_scalar::<_, String>(REAP_COMMAND_READY_PENDING_SQL)
+            .bind(sandbox_id)
+            .bind(managed_by)
+            .fetch_optional(executor.into_sqlx())
+            .await?,
+    )
 }
 
 /// Put a reaped row back, bound to the reap's own write. Restores the marker
@@ -749,18 +756,18 @@ fn undo_reap_command_ready_pending_query() -> String {
 /// `failed`, or was failed again by another write, holds a different token
 /// and is left alone.
 pub async fn undo_reap_command_ready_pending(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     managed_by: &str,
     write_token: &str,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let restored = sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(sql!(
         undo_reap_command_ready_pending_query()
     )))
     .bind(sandbox_id)
     .bind(managed_by)
     .bind(write_token)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(restored.is_some())
 }
@@ -839,21 +846,23 @@ pub(crate) fn fail_candidate_query(lifecycle: SandboxLifecycle, guard: FailGuard
 /// holds the sandbox row lock, so the owner guard sees any attempt claimed
 /// while it waited; for the others it runs on the pool.
 pub async fn fail_aged_candidate(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     managed_by: &str,
     lifecycle: SandboxLifecycle,
     age: PositiveDuration,
     guard: FailGuard,
-) -> Result<Option<String>, sqlx::Error> {
+) -> Result<Option<String>, DbError> {
     let query = fail_candidate_query(lifecycle, guard);
-    sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(managed_by)
-        .bind(lifecycle.to_string())
-        .bind(secs_bind(age))
-        .bind(sandbox_id)
-        .fetch_optional(executor)
-        .await
+    Ok(
+        sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql!(query.as_str())))
+            .bind(managed_by)
+            .bind(lifecycle.to_string())
+            .bind(secs_bind(age))
+            .bind(sandbox_id)
+            .fetch_optional(executor.into_sqlx())
+            .await?,
+    )
 }
 
 /// Put an aged-out row back, bound to the fail CAS's own write.
@@ -884,12 +893,12 @@ fn undo_fail_aged_candidate_query() -> String {
 /// sweeper therefore never undoes a fail from either lifecycle (its
 /// `Reconciler::fail_candidate`) and leaves such a row `failed`.
 pub async fn undo_fail_aged_candidate(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     managed_by: &str,
     lifecycle: SandboxLifecycle,
     write_token: &str,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let restored = sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(sql!(
         undo_fail_aged_candidate_query()
     )))
@@ -897,7 +906,7 @@ pub async fn undo_fail_aged_candidate(
     .bind(managed_by)
     .bind(lifecycle.to_string())
     .bind(write_token)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(restored.is_some())
 }
@@ -959,12 +968,12 @@ pub(crate) fn converge_restoring_query() -> String {
 /// sandbox row lock, so the owner guard sees any attempt claimed while it
 /// waited.
 pub async fn converge_restoring(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     managed_by: &str,
     target: SandboxLifecycle,
     age: PositiveDuration,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let claimed =
         sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(sql!(converge_restoring_query())))
             .bind(managed_by)
@@ -972,7 +981,7 @@ pub async fn converge_restoring(
             .bind(sandbox_id)
             .bind(target.as_str())
             .bind(SubstrateKind::Kubernetes)
-            .fetch_optional(executor)
+            .fetch_optional(executor.into_sqlx())
             .await?;
     Ok(claimed.is_some())
 }
@@ -1067,22 +1076,24 @@ fn revert_to_suspended_lifecycle_only_query() -> String {
 /// when the execution is not the one its candidate observed, or when the
 /// candidate has no usable record of it.
 pub async fn revert_to_suspended(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     managed_by: &str,
     lifecycle: SandboxLifecycle,
     age: PositiveDuration,
     restoring_episode_deadline: Option<PositiveDuration>,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql!(revert_to_suspended_query())))
-        .bind(managed_by)
-        .bind(lifecycle.to_string())
-        .bind(secs_bind(age))
-        .bind(sandbox_id)
-        .bind(restoring_episode_deadline.map(secs_bind))
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_optional(executor)
-        .await
+) -> Result<Option<String>, DbError> {
+    Ok(
+        sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql!(revert_to_suspended_query())))
+            .bind(managed_by)
+            .bind(lifecycle.to_string())
+            .bind(secs_bind(age))
+            .bind(sandbox_id)
+            .bind(restoring_episode_deadline.map(secs_bind))
+            .bind(SubstrateKind::Kubernetes)
+            .fetch_optional(executor.into_sqlx())
+            .await?,
+    )
 }
 
 /// [`revert_to_suspended`] moving only the lifecycle
@@ -1093,14 +1104,14 @@ pub async fn revert_to_suspended(
 /// Writes an **inference**, as [`revert_to_suspended`] does. The caller takes
 /// the same locks first.
 pub async fn revert_to_suspended_lifecycle_only(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     managed_by: &str,
     lifecycle: SandboxLifecycle,
     age: PositiveDuration,
     restoring_episode_deadline: Option<PositiveDuration>,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql!(
+) -> Result<Option<String>, DbError> {
+    Ok(sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql!(
         revert_to_suspended_lifecycle_only_query()
     )))
     .bind(managed_by)
@@ -1109,8 +1120,8 @@ pub async fn revert_to_suspended_lifecycle_only(
     .bind(sandbox_id)
     .bind(restoring_episode_deadline.map(secs_bind))
     .bind(SubstrateKind::Kubernetes)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Unplace a row [`revert_to_suspended`] just reverted, once its caller has
@@ -1121,11 +1132,12 @@ pub async fn revert_to_suspended_lifecycle_only(
 /// Writes an **inference**, the revert's consequence for placement. It has no
 /// predicate beyond the id, no lifecycle guard of its own: it relies on the
 /// revert CAS and the execution retire before it in the caller's transaction,
-/// under the sandbox row lock the caller took first.
-pub async fn unplace_reverted_restore(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    sandbox_id: SandboxId,
-) -> Result<(), sqlx::Error> {
+/// under the sandbox row lock the caller took first. The caller must pass
+/// its open transaction.
+pub async fn unplace_reverted_restore<C>(tx: &mut C, sandbox_id: SandboxId) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "UPDATE sandboxes
                 SET placement = 'unplaced',
@@ -1133,7 +1145,7 @@ pub async fn unplace_reverted_restore(
               WHERE id = $1"
     ))
     .bind(sandbox_id)
-    .execute(&mut **tx)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -1172,14 +1184,14 @@ pub(crate) fn undo_revert_to_suspended_query() -> String {
 /// row held before the revert. A restore that started and genuinely suspended
 /// again in the meantime holds a different token, and is left alone.
 pub async fn undo_revert_to_suspended(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     managed_by: &str,
     lifecycle: SandboxLifecycle,
     write_token: &str,
     preserve_local_artifact: bool,
     prior_placement_changed_at: Option<OffsetDateTime>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let restored = sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(sql!(
         undo_revert_to_suspended_query()
     )))
@@ -1189,7 +1201,7 @@ pub async fn undo_revert_to_suspended(
     .bind(write_token)
     .bind(preserve_local_artifact)
     .bind(prior_placement_changed_at)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(restored.is_some())
 }
@@ -1305,18 +1317,18 @@ pub struct UnrestorableRestoringRow {
 /// `unrestorable_restoring_guards`, which [`fail_unrestorable_restoring`]
 /// re-checks whole.
 pub async fn list_unrestorable_restoring(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     managed_by: &str,
     min_placement_age: PositiveDuration,
     limit: i64,
-) -> Result<Vec<UnrestorableRestoringRow>, sqlx::Error> {
+) -> Result<Vec<UnrestorableRestoringRow>, DbError> {
     static QUERY: LazyLock<String> = LazyLock::new(|| sql!(list_unrestorable_restoring_query()));
-    sqlx::query_as(sqlx::AssertSqlSafe(QUERY.as_str()))
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(QUERY.as_str()))
         .bind(managed_by)
         .bind(secs_bind(min_placement_age))
         .bind(limit)
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }
 
 /// Per-row fail CAS for the unrestorable-`restoring` sweep. Bind order:
@@ -1344,18 +1356,18 @@ pub fn fail_unrestorable_restoring_query() -> String {
 /// restore source, that the row is unrestorable. It has no restore-lease
 /// guard, on purpose (`unrestorable_restoring_guards`).
 pub async fn fail_unrestorable_restoring(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     managed_by: &str,
     min_placement_age: PositiveDuration,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let claimed = sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(sql!(
         fail_unrestorable_restoring_query()
     )))
     .bind(managed_by)
     .bind(secs_bind(min_placement_age))
     .bind(sandbox_id)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(claimed.is_some())
 }
@@ -1425,14 +1437,14 @@ pub(crate) const REPAIR_FAILED_ACTIVE_EXECUTION_SQL: &str = sql!(
 /// `failed`, `on_node` and the unfinished-first-activation refusal, and takes
 /// no row lock first.
 pub async fn repair_failed_active_execution(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     managed_by: SubstrateKind,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let claimed = sqlx::query_scalar::<_, SandboxId>(REPAIR_FAILED_ACTIVE_EXECUTION_SQL)
         .bind(sandbox_id)
         .bind(managed_by)
-        .fetch_optional(executor)
+        .fetch_optional(executor.into_sqlx())
         .await?;
     Ok(claimed.is_some())
 }

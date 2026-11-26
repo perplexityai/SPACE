@@ -131,7 +131,7 @@ async fn the_claim_keeps_its_durability_check_fenced() -> TestResult {
     .await?;
 
     let mut tx = pool.begin().await?;
-    let claimed: Vec<Uuid> = lock_unrecoverable_candidates(&mut tx, NodeId::from_uuid(node))
+    let claimed: Vec<Uuid> = lock_unrecoverable_candidates(&mut *tx, NodeId::from_uuid(node))
         .await?
         .into_iter()
         .map(|id| id.as_uuid())

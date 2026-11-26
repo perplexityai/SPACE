@@ -20,10 +20,10 @@ use pplx_space_k8s_ids::PodUid;
 use pplx_space_node_model::SubstrateKind;
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_portability::orphan_recovery_revert_eligibility;
 use pplx_space_sandbox_residency::node_observes_sandbox;
 use pplx_space_sql_locator::sql;
-use sqlx::{PgConnection, Postgres, Transaction};
 
 pub mod plan;
 
@@ -44,10 +44,15 @@ pub const ORPHAN_OBSERVATION_LOCK_SEED: i64 = 847_291_653;
 /// mutations, while blocking [`lock_orphan_observation`] until the publication
 /// transaction finishes and making a concurrent publication wait for an
 /// in-flight orphan revert or delete to finish.
-pub async fn lock_published_sandbox_observations(
-    conn: &mut PgConnection,
+///
+/// The caller must pass its open transaction.
+pub async fn lock_published_sandbox_observations<C>(
+    tx: &mut C,
     sandbox_ids: &[SandboxId],
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     if sandbox_ids.is_empty() {
         return Ok(());
     }
@@ -61,7 +66,7 @@ pub async fn lock_published_sandbox_observations(
     ))
     .bind(&ordered)
     .bind(ORPHAN_OBSERVATION_LOCK_SEED)
-    .execute(&mut *conn)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -73,16 +78,18 @@ pub async fn lock_published_sandbox_observations(
 /// (`FOR UPDATE OF`), both to keep lock ordering acyclic and so the following
 /// `READ COMMITTED` statement snapshots `sandbox_observed_states` after any
 /// concurrent publication holding the shared lock has finished.
-pub async fn lock_orphan_observation(
-    tx: &mut Transaction<'_, Postgres>,
-    sandbox_id: SandboxId,
-) -> Result<(), sqlx::Error> {
+///
+/// The caller must pass its open transaction.
+pub async fn lock_orphan_observation<C>(tx: &mut C, sandbox_id: SandboxId) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "SELECT pg_advisory_xact_lock(hashtextextended($1::text, $2))"
     ))
     .bind(sandbox_id)
     .bind(ORPHAN_OBSERVATION_LOCK_SEED)
-    .execute(&mut **tx)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -153,12 +160,17 @@ impl OrphanResolution {
 /// already locked the same rows and decided the same predicates, so a re-check
 /// can change the outcome only for a caller without that read, or when one of
 /// those unlocked rows changed between the two statements.
-pub async fn recover_orphan_to_suspended(
-    tx: &mut Transaction<'_, Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn recover_orphan_to_suspended<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     stop_lifecycles: &[&str],
     guard: &OrphanGuard<'_>,
-) -> Result<Option<OrphanResolution>, sqlx::Error> {
+) -> Result<Option<OrphanResolution>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     lock_orphan_observation(tx, sandbox_id).await?;
     let eligibility = orphan_recovery_revert_eligibility("s");
     let clear_marker = eligibility.clear_marker;
@@ -246,12 +258,17 @@ pub async fn recover_orphan_to_suspended(
 /// eligibility check is `TRUE`, which the reconciler never reaches today: its
 /// plan finalizes such a row's delete, or defers it while a snapshot is being
 /// created.
-pub async fn quarantine_orphan(
-    tx: &mut Transaction<'_, Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn quarantine_orphan<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     stop_lifecycles: &[&str],
     guard: &OrphanGuard<'_>,
-) -> Result<Option<OrphanResolution>, sqlx::Error> {
+) -> Result<Option<OrphanResolution>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let eligibility = orphan_recovery_revert_eligibility("s");
     let eligible = eligibility.eligible;
     let artifact_predicate = if matches!(guard, OrphanGuard::LegacyDeleting) {
@@ -377,9 +394,9 @@ pub struct OrphanCandidateRow {
 /// `s.id <= $3` bounds the sweep against new sandboxes created after
 /// the high-water mark was captured; the next sweep picks them up.
 pub async fn list_candidates_after(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     scan: CandidateScan<'_>,
-) -> Result<Vec<OrphanCandidateRow>, sqlx::Error> {
+) -> Result<Vec<OrphanCandidateRow>, DbError> {
     let CandidateScan {
         stop_lifecycles,
         after,
@@ -391,7 +408,7 @@ pub async fn list_candidates_after(
         active_execution_required_lifecycles,
         managed_by,
     } = scan;
-    sqlx::query_as(sql!(
+    Ok(sqlx::query_as(sql!(
         r"
             SELECT s.id AS sandbox_id,
                    e.pod_name,
@@ -476,8 +493,8 @@ pub async fn list_candidates_after(
     .bind(create_age_threshold_secs)
     .bind(active_execution_required_lifecycles)
     .bind(managed_by)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The guard's lifecycle and execution predicate, on the row aliased `s` and,
@@ -543,17 +560,20 @@ fn classify_guard_lock_sql(guard: &OrphanGuard<'_>) -> &'static str {
     }
 }
 
-async fn fetch_guarded_resolution(
-    tx: &mut Transaction<'_, Postgres>,
+async fn fetch_guarded_resolution<C>(
+    tx: &mut C,
     query: String,
     sandbox_id: SandboxId,
     stop_lifecycles: &[&str],
     guard: &OrphanGuard<'_>,
-) -> Result<Option<OrphanResolution>, sqlx::Error> {
+) -> Result<Option<OrphanResolution>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let query = sqlx::query_as::<_, OrphanResolution>(sqlx::AssertSqlSafe(sql!(query.as_str())))
         .bind(sandbox_id)
         .bind(stop_lifecycles);
-    match *guard {
+    Ok(match *guard {
         OrphanGuard::PodName {
             name,
             uid,
@@ -567,17 +587,17 @@ async fn fetch_guarded_resolution(
                 .bind(live_pod_required_lifecycles)
                 .bind(pending_pod_lifecycles)
                 .bind(create_age_threshold_secs)
-                .fetch_optional(&mut **tx)
-                .await
+                .fetch_optional(tx.into_sqlx())
+                .await?
         }
         OrphanGuard::Forgotten {
             active_execution_required_lifecycles,
         } => {
             query
                 .bind(active_execution_required_lifecycles)
-                .fetch_optional(&mut **tx)
-                .await
+                .fetch_optional(tx.into_sqlx())
+                .await?
         }
-        OrphanGuard::LegacyDeleting => query.fetch_optional(&mut **tx).await,
-    }
+        OrphanGuard::LegacyDeleting => query.fetch_optional(tx.into_sqlx()).await?,
+    })
 }

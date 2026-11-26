@@ -1412,7 +1412,7 @@ async fn the_claim_locks_only_rows_without_a_durable_copy() -> TestResult {
                     .await?;
             }
             Claim::GiveUp => {
-                lock_unrecoverable_candidates(&mut claim_tx, node).await?;
+                lock_unrecoverable_candidates(&mut *claim_tx, node).await?;
             }
         }
         let mut probe_tx = pool.begin().await?;

@@ -60,7 +60,7 @@ pub(super) async fn recover(pool: &PgPool, expected: &Candidate) -> Result<bool,
     )
     .await?;
     pplx_space_sandbox_store::repair::recover_quarantined_publication_to_suspended(
-        &mut tx,
+        &mut *tx,
         expected.sandbox_id,
         expected.artifact_id,
     )

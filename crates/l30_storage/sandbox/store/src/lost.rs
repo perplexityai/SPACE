@@ -9,12 +9,12 @@ use pplx_space_sandbox_model::SandboxId;
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_portability::{
     inflight_suspend_upload_from_other_node_exists, snapshot_durable_for_source_release,
     started_restore_source_absent,
 };
 use pplx_space_sql_locator::sql;
-use sqlx::{Postgres, Transaction};
 
 /// Quiet period a same-node `creating` snapshot row must have sat without a
 /// worker heartbeat (`COALESCE(last_attempt_at, timestamp)`) before the
@@ -65,11 +65,11 @@ pub struct StartedLostCandidate {
 /// A plain read; the settle window compares with `NOW()`, so it reads the
 /// clock of the executor's transaction.
 pub async fn started_lost_candidates(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     after: Option<SandboxId>,
     limit: u32,
     dead_upload_settle: Duration,
-) -> Result<Vec<StartedLostCandidate>, sqlx::Error> {
+) -> Result<Vec<StartedLostCandidate>, DbError> {
     /// Built once: every input is a literal or a bind placeholder.
     static LIST_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
         let no_restore_source = started_restore_source_absent("s", "$4");
@@ -103,13 +103,15 @@ pub async fn started_lost_candidates(
             .as_str()
         )
     });
-    sqlx::query_as(sqlx::AssertSqlSafe(LIST_CANDIDATES.as_str()))
-        .bind(SubstrateKind::Kubernetes)
-        .bind(after)
-        .bind(i64::from(limit))
-        .bind(dead_upload_settle.as_secs().cast_signed())
-        .fetch_all(executor)
-        .await
+    Ok(
+        sqlx::query_as(sqlx::AssertSqlSafe(LIST_CANDIDATES.as_str()))
+            .bind(SubstrateKind::Kubernetes)
+            .bind(after)
+            .bind(i64::from(limit))
+            .bind(dead_upload_settle.as_secs().cast_signed())
+            .fetch_all(executor.into_sqlx())
+            .await?,
+    )
 }
 
 /// The guarded flip of `sandboxes` from `started` to `failed`. Returns
@@ -127,13 +129,18 @@ pub async fn started_lost_candidates(
 /// that the node is still gone, and, in the same transaction, the write-off:
 /// `pplx_space_snapshot_store::lost::fail_quiet_full_uploads_from_node`, then
 /// [`write_off_lost_sandboxes`].
-pub async fn mark_started_lost(
-    tx: &mut Transaction<'_, Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn mark_started_lost<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     source_node_id: NodeId,
     generation: i64,
     dead_upload_settle: Duration,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     /// Built once: every input is a literal or a bind placeholder.
     static MARK_STARTED_LOST: LazyLock<String> = LazyLock::new(|| {
         let no_restore_source = started_restore_source_absent("s", "$4");
@@ -167,7 +174,7 @@ pub async fn mark_started_lost(
         .bind(generation)
         .bind(dead_upload_settle.as_secs().cast_signed())
         .bind(SubstrateKind::Kubernetes)
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?
         .rows_affected();
     Ok(flipped == 1)
@@ -181,10 +188,10 @@ pub async fn mark_started_lost(
 ///
 /// Guarded only by `lifecycle = 'failed'`: the caller flips the rows in the
 /// same transaction and holds their locks.
-async fn release_lost_placement(
-    tx: &mut Transaction<'_, Postgres>,
-    ids: &[SandboxId],
-) -> Result<(), sqlx::Error> {
+async fn release_lost_placement<C>(tx: &mut C, ids: &[SandboxId]) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "UPDATE sandboxes
             SET placement = 'unplaced',
@@ -193,7 +200,7 @@ async fn release_lost_placement(
             AND lifecycle = 'failed'"
     ))
     .bind(ids)
-    .execute(&mut **tx)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -217,18 +224,23 @@ async fn release_lost_placement(
 ///
 /// Port exposures are left alone: re-queueing them for a terminal sandbox
 /// would only create work that can never apply.
-pub async fn write_off_lost_sandboxes(
-    tx: &mut Transaction<'_, Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn write_off_lost_sandboxes<C>(
+    tx: &mut C,
     node_id: NodeId,
     ids: &[SandboxId],
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "DELETE FROM node_local_backup_pending
           WHERE node_id = $1 AND sandbox_id = ANY($2)"
     ))
     .bind(node_id)
     .bind(ids)
-    .execute(&mut **tx)
+    .execute((&mut *tx).into_sqlx())
     .await?;
     sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
@@ -241,7 +253,7 @@ pub async fn write_off_lost_sandboxes(
             AND active"
     ))
     .bind(ids)
-    .execute(&mut **tx)
+    .execute((&mut *tx).into_sqlx())
     .await?;
     release_lost_placement(tx, ids).await
 }
@@ -381,14 +393,21 @@ static LOCK_UNRECOVERABLE_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
 /// conflict with the `KEY SHARE` foreign-key lock a concurrent artifact backup
 /// insert takes on the sandbox row, which the flip's own `NO KEY UPDATE` lock
 /// does not.
-pub async fn lock_unrecoverable_candidates(
-    tx: &mut Transaction<'_, Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn lock_unrecoverable_candidates<C>(
+    tx: &mut C,
     node_id: NodeId,
-) -> Result<Vec<SandboxId>, sqlx::Error> {
-    sqlx::query_scalar(sqlx::AssertSqlSafe(LOCK_UNRECOVERABLE_CANDIDATES.as_str()))
-        .bind(node_id)
-        .fetch_all(&mut **tx)
-        .await
+) -> Result<Vec<SandboxId>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(LOCK_UNRECOVERABLE_CANDIDATES.as_str()))
+            .bind(node_id)
+            .fetch_all(tx.into_sqlx())
+            .await?,
+    )
 }
 
 /// Fail the `claimed` `suspended` sandboxes pinned to a drained, gone node that
@@ -401,22 +420,29 @@ pub async fn lock_unrecoverable_candidates(
 /// verdict. Its node guards are snapshot reads, so it runs only in the
 /// transaction that claimed `claimed` ([`lock_unrecoverable_candidates`]) and
 /// locked the `nodes` and `node_k8s` rows.
-pub async fn mark_unrecoverable_sandboxes_lost(
-    tx: &mut Transaction<'_, Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn mark_unrecoverable_sandboxes_lost<C>(
+    tx: &mut C,
     node_id: NodeId,
     expected_uid: Option<&str>,
     claimed: &[SandboxId],
     dead_upload_settle: Duration,
-) -> Result<Vec<SandboxId>, sqlx::Error> {
+) -> Result<Vec<SandboxId>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let query = mark_unrecoverable_sandboxes_lost_query();
-    sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(node_id)
-        .bind(expected_uid)
-        .bind(claimed)
-        .bind(dead_upload_settle.as_secs().cast_signed())
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_all(&mut **tx)
-        .await
+    Ok(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
+            .bind(node_id)
+            .bind(expected_uid)
+            .bind(claimed)
+            .bind(dead_upload_settle.as_secs().cast_signed())
+            .bind(SubstrateKind::Kubernetes)
+            .fetch_all(tx.into_sqlx())
+            .await?,
+    )
 }
 
 #[cfg(test)]

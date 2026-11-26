@@ -1009,7 +1009,7 @@ async fn the_recovery_statement_refuses_while_the_node_reports_the_sandbox() -> 
 
         let mut tx = db.pool.begin().await?;
         let written = orphan::recover_orphan_to_suspended(
-            &mut tx,
+            &mut *tx,
             sandbox_id,
             ORPHAN_RECONCILER_STOP_LIFECYCLES,
             &guard.store_guard(),

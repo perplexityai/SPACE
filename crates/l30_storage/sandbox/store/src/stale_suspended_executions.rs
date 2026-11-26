@@ -11,6 +11,7 @@ use pplx_space_snapshot_model::LocalArtifactId;
 
 use std::sync::LazyLock;
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_portability::newest_suspend_snapshot_current;
 use pplx_space_sql_locator::sql;
 
@@ -40,12 +41,12 @@ pub struct StaleSuspendedExecution {
 /// A plain read; the ages compare with `NOW()`, so it reads the clock of the
 /// executor's transaction.
 pub async fn list(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     batch_size: u32,
     after_sandbox_id: Option<SandboxId>,
     upper_bound: SandboxId,
     min_age: PositiveDuration,
-) -> Result<Vec<StaleSuspendedExecution>, sqlx::Error> {
+) -> Result<Vec<StaleSuspendedExecution>, DbError> {
     /// Built once: every input is a literal or a bind placeholder.
     static QUERY: LazyLock<String> = LazyLock::new(|| {
         let markerless_snapshot_current = newest_suspend_snapshot_current("s");
@@ -65,12 +66,12 @@ pub async fn list(
               LIMIT $4"
         ))
     });
-    sqlx::query_as(sqlx::AssertSqlSafe(QUERY.as_str()))
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(QUERY.as_str()))
         .bind(crate::repair::duration_secs_i64(min_age))
         .bind(after_sandbox_id)
         .bind(upper_bound)
         .bind(i64::from(batch_size))
         .bind(SubstrateKind::Kubernetes)
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }

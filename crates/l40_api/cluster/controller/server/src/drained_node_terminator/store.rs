@@ -243,7 +243,7 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
         // claimed; see [`lost::lock_unrecoverable_candidates`] for why the flip
         // could act on no other row at that snapshot, and for the one-tick miss
         // on a row that loses durability after it.
-        let claimed = lost::lock_unrecoverable_candidates(&mut tx, node_id).await?;
+        let claimed = lost::lock_unrecoverable_candidates(&mut *tx, node_id).await?;
         if claimed.is_empty() {
             tx.rollback().await?;
             return Ok(Vec::new());
@@ -269,7 +269,7 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
         // candidate set after it must wait for the next tick's claim rather
         // than flip un-fenced.
         let ids = lost::mark_unrecoverable_sandboxes_lost(
-            &mut tx,
+            &mut *tx,
             node_id,
             expected_uid.as_deref(),
             &claimed,
@@ -278,7 +278,7 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
         .await?;
         if !ids.is_empty() {
             fail_quiet_full_uploads_from_node(&mut *tx, node_id, &ids, DEAD_UPLOAD_SETTLE).await?;
-            write_off_lost_sandboxes(&mut tx, node_id, &ids).await?;
+            write_off_lost_sandboxes(&mut *tx, node_id, &ids).await?;
         }
         tx.commit().await?;
         let node_label = node_id.to_string();
