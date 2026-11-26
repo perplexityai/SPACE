@@ -775,7 +775,10 @@ async fn fetch_authoritative_route_sandbox(
         sandbox_store::direct::route_reads::authoritative_route_identity(pool, sandbox.id)
             .await
             .map_err(|error| {
-                db_contention_error("reload authoritative sandbox route identity", &error)
+                db_contention_error(
+                    "reload authoritative sandbox route identity",
+                    &sqlx::Error::from(error),
+                )
             })?
             .ok_or_else(|| ControllerError::not_found("sandbox no longer exists"))?;
 

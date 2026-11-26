@@ -50,9 +50,9 @@
 use std::sync::LazyLock;
 
 use pplx_space_accounts::{NodeId, OrgId, UserId};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 use sqlx::postgres::PgArguments;
 use sqlx::query::QueryAs;
 use time::OffsetDateTime;
@@ -302,12 +302,12 @@ static PAGE_SQL: LazyLock<String> = LazyLock::new(|| {
 
 /// One admin list page matching `filter`, newest first by `(created_at,
 /// id)`, after `walk`'s cursor and within its byte budget.
-pub async fn page<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn page(
+    executor: impl Executor<'_>,
     filter: AdminListFilter<'_>,
     walk: &PageWalk,
-) -> Result<Vec<ScopedPageRow>, sqlx::Error> {
-    filter
+) -> Result<Vec<ScopedPageRow>, DbError> {
+    Ok(filter
         .bind(sqlx::query_as::<_, ScopedPageRow>(sqlx::AssertSqlSafe(
             PAGE_SQL.as_str(),
         )))
@@ -316,8 +316,8 @@ pub async fn page<'e>(
         .bind(walk.max_rows)
         .bind(walk.max_bytes)
         .bind(walk.row_overhead_bytes)
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }
 
 /// The legacy unpaged list: at most $12 sandboxes matching the filters
@@ -366,18 +366,18 @@ static LIST_SQL: LazyLock<String> = LazyLock::new(|| {
 
 /// At most `limit` sandboxes matching `filter`, newest first by
 /// `(created_at, id)`, with no byte budget and no cursor.
-pub async fn list<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn list(
+    executor: impl Executor<'_>,
     filter: AdminListFilter<'_>,
     limit: i64,
-) -> Result<Vec<Sandbox>, sqlx::Error> {
-    filter
+) -> Result<Vec<Sandbox>, DbError> {
+    Ok(filter
         .bind(sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(
             LIST_SQL.as_str(),
         )))
         .bind(limit)
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }
 
 /// [`PAGE_SQL`] with an ID search ($12-$15) required: the sandboxes whose ID
@@ -468,13 +468,13 @@ static SEARCH_PAGE_SQL: LazyLock<String> = LazyLock::new(|| {
 });
 
 /// [`page`] for the sandboxes `search` matches.
-pub async fn search_page<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn search_page(
+    executor: impl Executor<'_>,
     filter: AdminListFilter<'_>,
     search: &AdminIdSearch,
     walk: &PageWalk,
-) -> Result<Vec<ScopedPageRow>, sqlx::Error> {
-    search
+) -> Result<Vec<ScopedPageRow>, DbError> {
+    Ok(search
         .bind(
             filter.bind(sqlx::query_as::<_, ScopedPageRow>(sqlx::AssertSqlSafe(
                 SEARCH_PAGE_SQL.as_str(),
@@ -485,8 +485,8 @@ pub async fn search_page<'e>(
         .bind(walk.max_rows)
         .bind(walk.max_bytes)
         .bind(walk.row_overhead_bytes)
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }
 
 /// [`LIST_SQL`] with an ID search required, as [`SEARCH_PAGE_SQL`] matches
@@ -548,19 +548,19 @@ static SEARCH_LIST_SQL: LazyLock<String> = LazyLock::new(|| {
 });
 
 /// [`list`] for the sandboxes `search` matches.
-pub async fn search_list<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn search_list(
+    executor: impl Executor<'_>,
     filter: AdminListFilter<'_>,
     search: &AdminIdSearch,
     limit: i64,
-) -> Result<Vec<Sandbox>, sqlx::Error> {
-    search
+) -> Result<Vec<Sandbox>, DbError> {
+    Ok(search
         .bind(
             filter.bind(sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(
                 SEARCH_LIST_SQL.as_str(),
             ))),
         )
         .bind(limit)
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }

@@ -38,8 +38,8 @@ use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 use uuid::Uuid;
 
 pub mod adoption;
@@ -67,12 +67,12 @@ pub struct ClaimedRestoreLease {
 /// (compared case- and whitespace-insensitively) and hold no unexpired lease.
 /// The candidate row is locked by the statement's own `FOR UPDATE`, so the
 /// guard and the write see the same row version.
-pub async fn claim_restore_lease<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn claim_restore_lease(
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     lease_seconds: i64,
     token: Uuid,
-) -> Result<Option<ClaimedRestoreLease>, sqlx::Error> {
+) -> Result<Option<ClaimedRestoreLease>, DbError> {
     let claimed = sqlx::query_as::<_, (Uuid, bool)>(sql!(
         "WITH candidate AS (
                  SELECT id,
@@ -94,7 +94,7 @@ pub async fn claim_restore_lease<'e>(
     .bind(sandbox_id)
     .bind(lease_seconds)
     .bind(token)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(claimed.map(|(token, restore_retry)| ClaimedRestoreLease {
         token,
@@ -111,12 +111,12 @@ pub async fn claim_restore_lease<'e>(
 /// row was already `restoring` when the lease was claimed, and the lease
 /// expires on its own; the write still matches and still fires the row's
 /// update triggers.
-pub async fn release_restore_lease<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn release_restore_lease(
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     token: Uuid,
     restore_retry: bool,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let released = sqlx::query(sql!(
         "UPDATE sandboxes
                 SET lifecycle = CASE WHEN $3 THEN lifecycle ELSE 'suspended' END,
@@ -135,7 +135,7 @@ pub async fn release_restore_lease<'e>(
     .bind(sandbox_id)
     .bind(token)
     .bind(restore_retry)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(released.rows_affected() == 1)
 }
@@ -145,12 +145,12 @@ pub async fn release_restore_lease<'e>(
 ///
 /// Guarded by `token` alone; a row that holds a token is `restoring` (see the
 /// module docs).
-pub async fn renew_restore_lease<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn renew_restore_lease(
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     token: Uuid,
     lease_seconds: i64,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let renewed = sqlx::query(sql!(
         "UPDATE sandboxes
                 SET restore_lease_expires_at = NOW() + ($3::bigint * INTERVAL '1 second')
@@ -160,7 +160,7 @@ pub async fn renew_restore_lease<'e>(
     .bind(sandbox_id)
     .bind(token)
     .bind(lease_seconds)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(renewed.rows_affected() == 1)
 }
@@ -172,11 +172,11 @@ pub async fn renew_restore_lease<'e>(
 /// leaving `restoring` clears them through the `sandboxes_clear_restore_lease`
 /// trigger. It does not set the active node; the receipt placement
 /// ([`place_owned_restore_receipt`]) did that earlier under the same lease.
-pub async fn complete_restore_lease<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn complete_restore_lease(
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     token: Uuid,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let completed = sqlx::query(sql!(
         "UPDATE sandboxes
                 SET lifecycle = 'started',
@@ -186,7 +186,7 @@ pub async fn complete_restore_lease<'e>(
     ))
     .bind(sandbox_id)
     .bind(token)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(completed.rows_affected() == 1)
 }
@@ -198,12 +198,15 @@ pub async fn complete_restore_lease<'e>(
 ///
 /// The lease owner takes it before persisting a restore receipt's route
 /// identity and placement ([`place_owned_restore_receipt`]) in the same
-/// transaction.
-pub async fn lock_restore_lease_owner(
-    connection: &mut sqlx::PgConnection,
+/// transaction. The caller must pass its open transaction.
+pub async fn lock_restore_lease_owner<C>(
+    connection: &mut C,
     sandbox_id: SandboxId,
     token: Uuid,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let owns_restore = sqlx::query_scalar::<_, bool>(sql!(
         "SELECT TRUE
                FROM sandboxes
@@ -213,7 +216,7 @@ pub async fn lock_restore_lease_owner(
     ))
     .bind(sandbox_id.as_uuid())
     .bind(token)
-    .fetch_optional(connection)
+    .fetch_optional(connection.into_sqlx())
     .await?;
     Ok(owns_restore.is_some())
 }
@@ -225,12 +228,12 @@ pub async fn lock_restore_lease_owner(
 /// Guarded by `token` alone, with no lifecycle predicate: the caller holds
 /// the row lock [`lock_restore_lease_owner`] took while re-checking the same
 /// token, and persists the receipt's route identity in the same transaction.
-pub async fn place_owned_restore_receipt<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn place_owned_restore_receipt(
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     node_id: NodeId,
     token: Uuid,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let placed = sqlx::query(sql!(
         "UPDATE sandboxes
                 SET active_node_id = $2,
@@ -243,7 +246,7 @@ pub async fn place_owned_restore_receipt<'e>(
     .bind(sandbox_id)
     .bind(node_id)
     .bind(token)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(placed.rows_affected() == 1)
 }
@@ -264,14 +267,14 @@ pub async fn place_owned_restore_receipt<'e>(
 /// restore lease, and either no restore-lease token or `one_generation`. The
 /// row becomes `started` only when `started_now`; otherwise it keeps its
 /// lifecycle, and a row that stays `restoring` keeps its token.
-pub async fn adopt_live_execution<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn adopt_live_execution(
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     node_id: NodeId,
     read_lifecycle: SandboxLifecycle,
     one_generation: bool,
     started_now: bool,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let adopted = sqlx::query(sql!(
         "UPDATE sandboxes
                 SET active_node_id = $2,
@@ -292,7 +295,7 @@ pub async fn adopt_live_execution<'e>(
     .bind(one_generation)
     .bind(started_now)
     .bind(SubstrateKind::Space)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(adopted.rows_affected() == 1)
 }
@@ -323,10 +326,10 @@ pub struct FlooredRestoreLease {
 /// database clock while the lease is unexpired (`None` once it has expired
 /// or when the row holds no lease expiry). A plain read that takes no lock;
 /// `None` when no such sandbox exists.
-pub async fn unexpired_restore_lease<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn unexpired_restore_lease(
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<UnexpiredRestoreLease>, sqlx::Error> {
+) -> Result<Option<UnexpiredRestoreLease>, DbError> {
     let row = sqlx::query_as::<_, (String, Option<f64>)>(sql!(
         "SELECT lifecycle,
                     CASE
@@ -338,7 +341,7 @@ pub async fn unexpired_restore_lease<'e>(
               WHERE id = $1"
     ))
     .bind(sandbox_id.as_uuid())
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(
         row.map(|(lifecycle, remaining_seconds)| UnexpiredRestoreLease {
@@ -353,10 +356,10 @@ pub async fn unexpired_restore_lease<'e>(
 /// holds no lease expiry, as a caller reads them after
 /// [`claim_restore_lease`] claimed nothing. A plain read that takes no lock;
 /// `None` when no such sandbox exists.
-pub async fn floored_restore_lease<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn floored_restore_lease(
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<FlooredRestoreLease>, sqlx::Error> {
+) -> Result<Option<FlooredRestoreLease>, DbError> {
     let row = sqlx::query_as::<_, (String, Option<f64>)>(sql!(
         "SELECT lifecycle,
                     CASE
@@ -370,7 +373,7 @@ pub async fn floored_restore_lease<'e>(
               WHERE id = $1"
     ))
     .bind(sandbox_id.as_uuid())
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(
         row.map(|(lifecycle, remaining_seconds)| FlooredRestoreLease {

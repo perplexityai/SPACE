@@ -208,7 +208,7 @@ async fn begin_locked(
     sandbox_id: SandboxId,
 ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    row_locks::lock_id(&mut tx, sandbox_id).await?;
+    row_locks::lock_id(&mut *tx, sandbox_id).await?;
     Ok(tx)
 }
 

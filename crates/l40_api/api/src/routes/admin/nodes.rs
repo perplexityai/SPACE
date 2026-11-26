@@ -2128,7 +2128,7 @@ async fn apply_drain_action(
         .await
         {
             Ok(value) => value,
-            Err(err) => return db_error(err).into_response(),
+            Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
         };
         crate::metrics::admin::node_terminate_guard(
             &node_id.to_string(),
@@ -2618,7 +2618,7 @@ async fn apply_force_upload_local_snapshots(
     // filled the cap exactly, which is what flips `truncated` below.
     let pinned = match admin_occupancy::pinned_local_only_sandboxes(&state.pool, node_id).await {
         Ok(rows) => rows,
-        Err(err) => return db_error(err).into_response(),
+        Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
     };
 
     let mut response = ForceUploadLocalSnapshotsResponse {

@@ -3,6 +3,7 @@
 //! from.
 
 use pplx_space_accounts::OrgId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 
@@ -17,9 +18,9 @@ pub struct SandboxOrgStorage {
 /// `sandbox_id`'s [`SandboxOrgStorage`], or `None` when there's no such
 /// sandbox.
 pub async fn sandbox_org_storage(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<SandboxOrgStorage>, sqlx::Error> {
+) -> Result<Option<SandboxOrgStorage>, DbError> {
     let row: Option<(uuid::Uuid, Option<String>)> = sqlx::query_as(sql!(
         "SELECT s.org_id, o.snapshot_base_object_storage_uri
              FROM sandboxes s
@@ -27,7 +28,7 @@ pub async fn sandbox_org_storage(
              WHERE s.id = $1"
     ))
     .bind(sandbox_id.as_uuid())
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(row.map(
         |(organization_id, snapshot_base_object_storage_uri)| SandboxOrgStorage {

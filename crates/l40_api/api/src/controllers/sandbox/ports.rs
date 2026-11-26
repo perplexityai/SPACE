@@ -70,10 +70,13 @@ impl SandboxController {
         // rows remain idempotent and do not consume another slot.
         // Allow foreign-key checks while this transaction waits on reconciliation.
         let locked_sandbox =
-            pplx_space_sandbox_store::row_locks::lock_id_no_key_update(&mut tx, sandbox.id)
+            pplx_space_sandbox_store::row_locks::lock_id_no_key_update(&mut *tx, sandbox.id)
                 .await
                 .map_err(|err| {
-                    db_contention_error("failed to lock sandbox for port admission", &err)
+                    db_contention_error(
+                        "failed to lock sandbox for port admission",
+                        &sqlx::Error::from(err),
+                    )
                 })?;
         if locked_sandbox.is_none() {
             return Err(ControllerError::not_found("Sandbox"));
@@ -722,10 +725,13 @@ impl SandboxController {
         // reconcile enqueue below also locks this row, so updating the port
         // row first would permit an open/close deadlock.
         let locked_sandbox =
-            pplx_space_sandbox_store::row_locks::lock_id_no_key_update(&mut tx, sandbox.id)
+            pplx_space_sandbox_store::row_locks::lock_id_no_key_update(&mut *tx, sandbox.id)
                 .await
                 .map_err(|err| {
-                    db_contention_error("failed to lock sandbox for port close", &err)
+                    db_contention_error(
+                        "failed to lock sandbox for port close",
+                        &sqlx::Error::from(err),
+                    )
                 })?;
         if locked_sandbox.is_none() {
             return Err(ControllerError::not_found("Sandbox"));

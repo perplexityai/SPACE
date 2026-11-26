@@ -193,10 +193,13 @@ async fn begin_delete_against_active_fork(
     if active_fork {
         return Err(fork_in_progress_conflict());
     }
-    let previous_lifecycle = sandbox_store::row_locks::lock_lifecycle(&mut guard, sandbox_id)
+    let previous_lifecycle = sandbox_store::row_locks::lock_lifecycle(&mut *guard, sandbox_id)
         .await
         .map_err(|error| {
-            db_contention_error("failed to read sandbox lifecycle before delete", &error)
+            db_contention_error(
+                "failed to read sandbox lifecycle before delete",
+                &sqlx::Error::from(error),
+            )
         })?
         .map(|lifecycle| {
             lifecycle
@@ -284,8 +287,9 @@ async fn restore_lifecycle_after_failed_finalize_delete(
             // Reached only when the compensating UPDATE above matched no rows,
             // so it decides that path's outcome and can block on the same row
             // the UPDATE just contended for. `SandboxStoreError` wraps one
-            // transparent `sqlx::Error`, so the classification survives the
-            // store boundary — without this the statement one line above
+            // transparent `DbError`, which `sqlx::Error::from` turns back into
+            // the driver's error, so the classification survives the store
+            // boundary — without this the statement one line above
             // returns 503 and this one returns 500 for the same race.
             let error = sqlx::Error::from(error);
             db_contention_error(
@@ -1569,7 +1573,9 @@ const fn activates_no_vm(action: SandboxAction) -> bool {
 
 /// Whether the sandbox row is `started`.
 async fn sandbox_started(pool: &PgPool, sandbox_id: SandboxId) -> Result<bool, sqlx::Error> {
-    sandbox_store::row_reads::is_started(pool, sandbox_id).await
+    sandbox_store::row_reads::is_started(pool, sandbox_id)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 /// Access-path drain gate. Returns 409 when the sandbox's resolved node

@@ -214,6 +214,7 @@ use std::time::Duration;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::{
     artifact_has_durable_copy, latest_full_snapshot_ready, restore_retry_source_snapshot_exists,
@@ -318,11 +319,20 @@ pub enum SandboxMetadataValue {
 }
 
 /// A sandbox-store operation failed. A malformed stored row surfaces as a
-/// `sqlx::Error` decode failure, like every other typed column.
+/// [`DbError`] that wraps the driver's decode error, like every other typed
+/// column.
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxStoreError {
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
+}
+
+/// Lets a verb's `?` turn the driver's error into this one, losslessly,
+/// through [`DbError`]'s own conversion.
+impl From<sqlx::Error> for SandboxStoreError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(DbError::from(error))
+    }
 }
 
 /// Migration scaffolding: callers converted to the store one statement at a
@@ -333,7 +343,7 @@ pub enum SandboxStoreError {
 impl From<SandboxStoreError> for sqlx::Error {
     fn from(error: SandboxStoreError) -> Self {
         match error {
-            SandboxStoreError::Database(source) => source,
+            SandboxStoreError::Database(source) => sqlx::Error::from(source),
         }
     }
 }
@@ -370,7 +380,7 @@ pub struct SandboxRecord {
 /// inside a caller's transaction (without taking a lock — see the crate docs
 /// for why `FOR UPDATE` reads are not this verb).
 pub async fn get(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
 ) -> Result<Option<SandboxRecord>, SandboxStoreError> {
     let record = sqlx::query_as::<_, SandboxRecord>(sql!(
@@ -381,7 +391,7 @@ pub async fn get(
          WHERE id = $1"
     ))
     .bind(sandbox_id)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(record)
 }
@@ -405,7 +415,7 @@ pub enum UserSandboxRows {
 
 /// Classify `user_id`'s sandbox rows; see [`UserSandboxRows`].
 pub async fn user_sandbox_rows(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     user_id: UserId,
 ) -> Result<UserSandboxRows, SandboxStoreError> {
     let (live, retained_until) = sqlx::query_as::<_, (Option<bool>, Option<OffsetDateTime>)>(sql!(
@@ -416,7 +426,7 @@ pub async fn user_sandbox_rows(
     ))
     .bind(user_id)
     .bind(DELETED_SANDBOX_RETENTION.as_secs_f64())
-    .fetch_one(executor)
+    .fetch_one(executor.into_sqlx())
     .await?;
     Ok(match (live, retained_until) {
         (Some(true), _) => UserSandboxRows::Live,
@@ -428,14 +438,14 @@ pub async fn user_sandbox_rows(
 /// Whether `org_id` has any `sandboxes` row, deleted ones kept for retention
 /// included: the rows `sandboxes_org_id_fkey` holds the organization by.
 pub async fn org_has_sandbox_rows(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
 ) -> Result<bool, SandboxStoreError> {
     let exists = sqlx::query_scalar(sql!(
         "SELECT EXISTS (SELECT 1 FROM sandboxes WHERE org_id = $1)"
     ))
     .bind(org_id)
-    .fetch_one(executor)
+    .fetch_one(executor.into_sqlx())
     .await?;
     Ok(exists)
 }
@@ -464,7 +474,7 @@ pub struct SandboxNetworkPolicyInputs {
 /// that is not placed there is absent from the result, not an error: the
 /// caller is a node asking about its own set.
 pub async fn network_policy_inputs_placed_on(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     sandbox_ids: &[SandboxId],
 ) -> Result<Vec<SandboxNetworkPolicyInputs>, SandboxStoreError> {
@@ -484,7 +494,7 @@ pub async fn network_policy_inputs_placed_on(
     ))
     .bind(sandbox_ids)
     .bind(node_id)
-    .fetch_all(executor)
+    .fetch_all(executor.into_sqlx())
     .await?;
     Ok(rows)
 }
@@ -502,7 +512,7 @@ pub struct SandboxSnapshotStorage {
 /// migration or restore. A sandbox placed elsewhere is `None`, not an error:
 /// the caller is a node asking about its own set.
 pub async fn snapshot_storage_placed_on(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     node_ids: &[NodeId],
 ) -> Result<Option<SandboxSnapshotStorage>, SandboxStoreError> {
@@ -515,7 +525,7 @@ pub async fn snapshot_storage_placed_on(
     ))
     .bind(sandbox_id)
     .bind(node_ids)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(row)
 }
@@ -578,7 +588,7 @@ pub async fn snapshot_storage_placed_on(
 /// Being a composition rather than a column list is also why this is a
 /// predicate verb rather than a row `get`.
 pub async fn any_undescribed_artifact_owner(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     candidates: &[SandboxId],
 ) -> Result<Option<SandboxId>, SandboxStoreError> {
@@ -625,7 +635,7 @@ pub async fn any_undescribed_artifact_owner(
         sqlx::query_scalar(sqlx::AssertSqlSafe(ANY_UNDESCRIBED_ARTIFACT_OWNER.as_str()))
             .bind(candidates)
             .bind(node_id.as_uuid())
-            .fetch_optional(executor)
+            .fetch_optional(executor.into_sqlx())
             .await?;
     Ok(holding.map(SandboxId::from_uuid))
 }
@@ -644,7 +654,7 @@ pub async fn any_undescribed_artifact_owner(
 /// only holds a release. An older ready snapshot the restore wouldn't select
 /// doesn't count. `false` for a missing sandbox.
 pub async fn durably_restorable(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
 ) -> Result<bool, SandboxStoreError> {
     /// Built once: every input is a literal or a bind placeholder.
@@ -669,7 +679,7 @@ pub async fn durably_restorable(
     Ok(
         sqlx::query_scalar(sqlx::AssertSqlSafe(DURABLY_RESTORABLE.as_str()))
             .bind(sandbox_id)
-            .fetch_one(executor)
+            .fetch_one(executor.into_sqlx())
             .await?,
     )
 }
@@ -746,7 +756,7 @@ pub struct SandboxDesiredStatePatch<'a> {
 /// fire on any update regardless of which columns this sets, so an
 /// all-`Unchanged` patch is still not a database no-op.
 pub async fn update_desired_state(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     patch: SandboxDesiredStatePatch<'_>,
 ) -> Result<bool, SandboxStoreError> {
@@ -765,7 +775,7 @@ pub async fn update_desired_state(
     .bind(vcpu)
     .bind(write_memory_mib)
     .bind(memory_mib)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -775,14 +785,14 @@ mod tests;
 
 /// Observe restore ownership using the database clock; this never claims work.
 pub async fn restore_owner_active(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     id: SandboxId,
 ) -> Result<bool, SandboxStoreError> {
     Ok(sqlx::query_scalar::<_, bool>(sql!(
         "SELECT COALESCE(restore_lease_expires_at > NOW(), false) FROM sandboxes WHERE id = $1"
     ))
     .bind(id)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?
     .unwrap_or(false))
 }
@@ -806,7 +816,7 @@ pub struct SandboxActivationObservation {
 /// behind, never as an old lifecycle with no activation coming. `None` when
 /// the org has no such sandbox. Observation only: it never claims the work.
 pub async fn activation_observation(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     sandbox_id: SandboxId,
     target_id: &str,
@@ -830,13 +840,13 @@ pub async fn activation_observation(
     .bind(sandbox_id)
     .bind(org_id)
     .bind(target_id)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?)
 }
 
 /// Replace desired lifecycle policy and clear its stale published observation.
 pub async fn set_auto_lifecycle_policy(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     id: SandboxId,
     policy: &pplx_space_auto_lifecycle::AutoLifecyclePolicy,
 ) -> Result<bool, SandboxStoreError> {
@@ -846,7 +856,7 @@ pub async fn set_auto_lifecycle_policy(
     ))
     .bind(sqlx::types::Json(policy))
     .bind(id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected()
         == 1)
@@ -856,7 +866,7 @@ pub async fn set_auto_lifecycle_policy(
 /// Read after the claim, so a policy-only update accepted before that claim is
 /// included even when the caller's original sandbox snapshot predates it.
 pub async fn auto_lifecycle_policy(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     id: SandboxId,
 ) -> Result<Option<pplx_space_auto_lifecycle::AutoLifecyclePolicy>, SandboxStoreError> {
     let policy =
@@ -864,7 +874,7 @@ pub async fn auto_lifecycle_policy(
             sql!("SELECT auto_lifecycle_json FROM sandboxes WHERE id = $1"),
         )
         .bind(id)
-        .fetch_optional(executor)
+        .fetch_optional(executor.into_sqlx())
         .await?;
     Ok(policy.map(|policy| policy.0))
 }
@@ -906,7 +916,7 @@ impl AutoLifecycleExecution {
 }
 
 pub async fn auto_lifecycle_execution(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     id: SandboxId,
 ) -> Result<Option<AutoLifecycleExecution>, SandboxStoreError> {
     Ok(sqlx::query_as::<_, AutoLifecycleExecution>(sql!(
@@ -922,20 +932,20 @@ pub async fn auto_lifecycle_execution(
          WHERE s.id = $1"
     ))
     .bind(id)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?)
 }
 
 /// Immutable operator profile names selected at create.
 /// Tenant policy replacements never write this column.
 pub async fn egress_profiles(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
 ) -> Result<Option<Vec<String>>, SandboxStoreError> {
     Ok(
         sqlx::query_scalar(sql!("SELECT egress_profiles FROM sandboxes WHERE id = $1"))
             .bind(sandbox_id)
-            .fetch_optional(executor)
+            .fetch_optional(executor.into_sqlx())
             .await?,
     )
 }

@@ -107,7 +107,7 @@ impl K8sStore {
             .begin()
             .await
             .db_context("failed to start Kubernetes suspend commit transaction")?;
-        let sandbox_exists = pplx_space_sandbox_store::row_locks::lock_id(&mut tx, sandbox_id)
+        let sandbox_exists = pplx_space_sandbox_store::row_locks::lock_id(&mut *tx, sandbox_id)
             .await
             .db_context("failed to lock sandbox for Kubernetes suspend commit")?
             .is_some();

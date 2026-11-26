@@ -132,7 +132,10 @@ impl SandboxController {
             }
         }
         .map_err(|err| {
-            crate::controllers::db_contention_error("failed to fetch sandbox page", &err)
+            crate::controllers::db_contention_error(
+                "failed to fetch sandbox page",
+                &sqlx::Error::from(err),
+            )
         })?;
         let page = ListPage::from_rows(rows, limit as usize, |row| row.has_next);
         let page = ListPage {

@@ -3,9 +3,9 @@
 //! `pending`, so the node applies it again.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{RouteGeneration, SandboxId};
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 
 #[cfg(test)]
 mod tests;
@@ -27,14 +27,14 @@ mod tests;
 /// [`crate::port_exposures::invalidate_open_observations`] resets,
 /// recording `diagnostic` where that clears `last_error`, so change them
 /// together.
-pub async fn reset_applied_service_port<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn reset_applied_service_port(
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     guest_port: i32,
     route_generation: RouteGeneration,
     diagnostic: &str,
-) -> Result<Option<NodeId>, sqlx::Error> {
-    sqlx::query_scalar::<_, NodeId>(sql!(
+) -> Result<Option<NodeId>, DbError> {
+    Ok(sqlx::query_scalar::<_, NodeId>(sql!(
         "WITH current_route AS (
              SELECT s.id AS sandbox_id, s.active_node_id
              FROM sandboxes s
@@ -71,6 +71,6 @@ pub async fn reset_applied_service_port<'e>(
     .bind(guest_port)
     .bind(route_generation)
     .bind(diagnostic)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }

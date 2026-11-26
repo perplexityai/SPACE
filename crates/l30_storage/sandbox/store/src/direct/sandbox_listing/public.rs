@@ -14,6 +14,7 @@ use std::sync::LazyLock;
 use pplx_space_accounts::{NodeId, OrgId, UserId};
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::{
@@ -21,7 +22,6 @@ use pplx_space_state_reconciliation::{
     SANDBOX_FAILURE_EPISODE_KEY, SANDBOX_FAILURE_EXECUTION_GENERATION_KEY,
     SANDBOX_FAILURE_POD_UID_KEY,
 };
-use sqlx::PgExecutor;
 use sqlx::postgres::PgArguments;
 use sqlx::query::QueryAs;
 use sqlx::types::Json;
@@ -147,18 +147,20 @@ static BY_ID_SQL: LazyLock<String> = LazyLock::new(|| {
 
 /// The sandbox `sandbox_id` of `org_id`; `None` when there is none or it is
 /// a `deleted` tombstone.
-pub async fn by_id<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn by_id(
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     org_id: OrgId,
-) -> Result<Option<PublicSandboxRow>, sqlx::Error> {
-    bind_failure_terms(sqlx::query_as::<_, PublicSandboxRow>(sqlx::AssertSqlSafe(
-        BY_ID_SQL.as_str(),
-    )))
-    .bind(sandbox_id.as_uuid())
-    .bind(org_id)
-    .fetch_optional(executor)
-    .await
+) -> Result<Option<PublicSandboxRow>, DbError> {
+    Ok(
+        bind_failure_terms(sqlx::query_as::<_, PublicSandboxRow>(sqlx::AssertSqlSafe(
+            BY_ID_SQL.as_str(),
+        )))
+        .bind(sandbox_id.as_uuid())
+        .bind(org_id)
+        .fetch_optional(executor.into_sqlx())
+        .await?,
+    )
 }
 
 /// The org's ($8) live sandboxes, owned by subject $12 or, without one, by a
@@ -217,22 +219,24 @@ static PAGE_SQL: LazyLock<String> = LazyLock::new(|| {
 /// `(created_at, id)`: those `subject_id` owns, or without one those local
 /// users own, after `walk`'s cursor and within its byte budget. `deleted`
 /// tombstones are left out.
-pub async fn page<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn page(
+    executor: impl Executor<'_>,
     org_id: OrgId,
     subject_id: Option<UserId>,
     walk: &PageWalk,
-) -> Result<Vec<PublicSandboxRow>, sqlx::Error> {
-    bind_failure_terms(sqlx::query_as::<_, PublicSandboxRow>(sqlx::AssertSqlSafe(
-        PAGE_SQL.as_str(),
-    )))
-    .bind(org_id)
-    .bind(walk.cursor_created_at())
-    .bind(walk.cursor_id())
-    .bind(walk.max_rows)
-    .bind(subject_id)
-    .bind(walk.max_bytes)
-    .bind(walk.row_overhead_bytes)
-    .fetch_all(executor)
-    .await
+) -> Result<Vec<PublicSandboxRow>, DbError> {
+    Ok(
+        bind_failure_terms(sqlx::query_as::<_, PublicSandboxRow>(sqlx::AssertSqlSafe(
+            PAGE_SQL.as_str(),
+        )))
+        .bind(org_id)
+        .bind(walk.cursor_created_at())
+        .bind(walk.cursor_id())
+        .bind(walk.max_rows)
+        .bind(subject_id)
+        .bind(walk.max_bytes)
+        .bind(walk.row_overhead_bytes)
+        .fetch_all(executor.into_sqlx())
+        .await?,
+    )
 }

@@ -367,7 +367,8 @@ impl SandboxController {
             )
             .await
             .map_err(|err| {
-                // `SandboxStoreError` wraps one transparent `sqlx::Error`, so
+                // `SandboxStoreError` wraps one transparent `DbError`, which
+                // `sqlx::Error::from` turns back into the driver's error, so
                 // the classification survives the store boundary.
                 db_contention_error("failed to update sandbox metadata", &sqlx::Error::from(err))
             })?;
@@ -772,9 +773,11 @@ impl SandboxController {
                     .map_err(|error| db_contention_error("begin timeout intent", &error))?;
                 // Lock separately from the joined read: after waiting for an
                 // activation's row lock, READ COMMITTED must see its new claim.
-                let locked = sandbox_store::row_locks::lock_id(&mut tx, sandbox.id)
+                let locked = sandbox_store::row_locks::lock_id(&mut *tx, sandbox.id)
                     .await
-                    .map_err(|error| db_contention_error("lock timeout intent", &error))?;
+                    .map_err(|error| {
+                        db_contention_error("lock timeout intent", &sqlx::Error::from(error))
+                    })?;
                 if locked.is_none() {
                     return Err(ControllerError::not_found("sandbox no longer exists"));
                 }

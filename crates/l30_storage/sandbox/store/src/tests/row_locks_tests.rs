@@ -72,19 +72,19 @@ async fn id_only_row_locks_report_the_row_and_hold_until_the_transaction_ends() 
     let missing = SandboxId::new();
 
     let mut tx = db.pool.begin().await?;
-    assert_eq!(row_locks::lock_id(&mut tx, sandbox).await?, Some(sandbox));
+    assert_eq!(row_locks::lock_id(&mut *tx, sandbox).await?, Some(sandbox));
     assert!(row_locked(&db.pool, id).await?);
     assert!(key_share_blocked(&db.pool, id).await?);
     assert_eq!(
-        row_locks::lock_lifecycle(&mut tx, sandbox)
+        row_locks::lock_lifecycle(&mut *tx, sandbox)
             .await?
             .as_deref(),
         Some("started")
     );
-    assert!(row_locks::lock_exists(&mut tx, sandbox).await?);
-    assert_eq!(row_locks::lock_id(&mut tx, missing).await?, None);
-    assert_eq!(row_locks::lock_lifecycle(&mut tx, missing).await?, None);
-    assert!(!row_locks::lock_exists(&mut tx, missing).await?);
+    assert!(row_locks::lock_exists(&mut *tx, sandbox).await?);
+    assert_eq!(row_locks::lock_id(&mut *tx, missing).await?, None);
+    assert_eq!(row_locks::lock_lifecycle(&mut *tx, missing).await?, None);
+    assert!(!row_locks::lock_exists(&mut *tx, missing).await?);
     tx.commit().await?;
     assert!(!row_locked(&db.pool, id).await?);
     assert!(!key_share_blocked(&db.pool, id).await?);
@@ -92,7 +92,7 @@ async fn id_only_row_locks_report_the_row_and_hold_until_the_transaction_ends() 
     // Each verb takes the lock itself, not only under `lock_id`'s.
     let mut tx = db.pool.begin().await?;
     assert_eq!(
-        row_locks::lock_lifecycle(&mut tx, sandbox)
+        row_locks::lock_lifecycle(&mut *tx, sandbox)
             .await?
             .as_deref(),
         Some("started")
@@ -101,7 +101,7 @@ async fn id_only_row_locks_report_the_row_and_hold_until_the_transaction_ends() 
     assert!(key_share_blocked(&db.pool, id).await?);
     tx.rollback().await?;
     let mut tx = db.pool.begin().await?;
-    assert!(row_locks::lock_exists(&mut tx, sandbox).await?);
+    assert!(row_locks::lock_exists(&mut *tx, sandbox).await?);
     assert!(row_locked(&db.pool, id).await?);
     assert!(key_share_blocked(&db.pool, id).await?);
     tx.rollback().await?;
@@ -141,13 +141,13 @@ async fn no_key_update_row_locks_report_the_row_and_let_key_share_through_until_
     // `FOR NO KEY UPDATE`.
     let mut tx = pool.begin().await?;
     assert_eq!(
-        row_locks::lock_id_no_key_update(&mut tx, placed_id).await?,
+        row_locks::lock_id_no_key_update(&mut *tx, placed_id).await?,
         Some(placed_id)
     );
     assert!(share_blocked(pool, placed).await?);
     assert!(!key_share_blocked(pool, placed).await?);
     assert_eq!(
-        row_locks::lock_id_no_key_update(&mut tx, missing).await?,
+        row_locks::lock_id_no_key_update(&mut *tx, missing).await?,
         None
     );
     assert!(share_blocked(pool, placed).await?);
@@ -162,7 +162,7 @@ async fn no_key_update_row_locks_report_the_row_and_let_key_share_through_until_
     ] {
         let mut tx = pool.begin().await?;
         assert_eq!(
-            row_locks::lock_active_node_id_no_key_update(&mut tx, sandbox).await?,
+            row_locks::lock_active_node_id_no_key_update(&mut *tx, sandbox).await?,
             Some(active_node)
         );
         assert!(share_blocked(pool, id).await?);
@@ -173,7 +173,7 @@ async fn no_key_update_row_locks_report_the_row_and_let_key_share_through_until_
     }
     let mut tx = pool.begin().await?;
     assert_eq!(
-        row_locks::lock_active_node_id_no_key_update(&mut tx, missing).await?,
+        row_locks::lock_active_node_id_no_key_update(&mut *tx, missing).await?,
         None
     );
     tx.rollback().await?;

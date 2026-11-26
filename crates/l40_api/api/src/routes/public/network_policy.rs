@@ -154,7 +154,7 @@ async fn ensure_sandbox_owner(
         org_id,
     )
     .await
-    .map_err(database_error)?;
+    .map_err(|error| database_error(sqlx::Error::from(error)))?;
     if !found {
         return Err(PublicApiError::not_found("sandbox not found"));
     }

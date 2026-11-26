@@ -64,10 +64,10 @@ use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, AutoLifecycleRuntimeState};
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyV1};
 use pplx_space_node_model::{NodeAddress, NodeManagedBy, NodeRole};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{EcwCredentialEpoch, SandboxActivationAttemptId, SandboxId};
 use pplx_space_sql_locator::sql;
 use serde::{Deserialize, Serialize};
-use sqlx::PgExecutor;
 use sqlx::types::JsonValue;
 use time::OffsetDateTime;
 
@@ -279,14 +279,13 @@ static BY_ID_SQL: LazyLock<String> = LazyLock::new(|| {
 });
 
 /// One sandbox's response row, any lifecycle; `None` when there is no row.
-pub async fn by_id<'e>(
-    executor: impl PgExecutor<'e>,
-    id: SandboxId,
-) -> Result<Option<Sandbox>, sqlx::Error> {
-    sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(BY_ID_SQL.as_str()))
-        .bind(id)
-        .fetch_optional(executor)
-        .await
+pub async fn by_id(executor: impl Executor<'_>, id: SandboxId) -> Result<Option<Sandbox>, DbError> {
+    Ok(
+        sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(BY_ID_SQL.as_str()))
+            .bind(id)
+            .fetch_optional(executor.into_sqlx())
+            .await?,
+    )
 }
 
 /// The local org's sandboxes ($1) after the cursor ($2, $3), matching the
@@ -346,22 +345,24 @@ static LOCAL_ORG_PAGE_SQL: LazyLock<String> = LazyLock::new(|| {
 /// One ECW page of the sandboxes of `org_id` that local users own, newest
 /// first, matching `metadata_filter` (a JSON containment filter) when there
 /// is one. `deleted` tombstones are left out.
-pub async fn local_org_page<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn local_org_page(
+    executor: impl Executor<'_>,
     org_id: OrgId,
     metadata_filter: Option<JsonValue>,
     walk: &PageWalk,
-) -> Result<Vec<ScopedPageRow>, sqlx::Error> {
-    sqlx::query_as::<_, ScopedPageRow>(sqlx::AssertSqlSafe(LOCAL_ORG_PAGE_SQL.as_str()))
-        .bind(org_id)
-        .bind(walk.cursor_created_at())
-        .bind(walk.cursor_id())
-        .bind(walk.max_rows)
-        .bind(metadata_filter)
-        .bind(walk.max_bytes)
-        .bind(walk.row_overhead_bytes)
-        .fetch_all(executor)
-        .await
+) -> Result<Vec<ScopedPageRow>, DbError> {
+    Ok(
+        sqlx::query_as::<_, ScopedPageRow>(sqlx::AssertSqlSafe(LOCAL_ORG_PAGE_SQL.as_str()))
+            .bind(org_id)
+            .bind(walk.cursor_created_at())
+            .bind(walk.cursor_id())
+            .bind(walk.max_rows)
+            .bind(metadata_filter)
+            .bind(walk.max_bytes)
+            .bind(walk.row_overhead_bytes)
+            .fetch_all(executor.into_sqlx())
+            .await?,
+    )
 }
 
 /// The federated subject's sandboxes ($1-$3) and the key org's legacy local
@@ -451,14 +452,17 @@ pub struct FederatedSubject<'a> {
 /// One ECW page of the sandboxes `subject` owns and the local-owned sandboxes
 /// of `legacy_org_id`, newest first, matching `metadata_filter` when there is
 /// one. `deleted` tombstones are left out.
-pub async fn federated_subject_page<'e>(
-    executor: impl PgExecutor<'e>,
+pub async fn federated_subject_page(
+    executor: impl Executor<'_>,
     subject: FederatedSubject<'_>,
     legacy_org_id: OrgId,
     metadata_filter: Option<JsonValue>,
     walk: &PageWalk,
-) -> Result<Vec<ScopedPageRow>, sqlx::Error> {
-    sqlx::query_as::<_, ScopedPageRow>(sqlx::AssertSqlSafe(FEDERATED_SUBJECT_PAGE_SQL.as_str()))
+) -> Result<Vec<ScopedPageRow>, DbError> {
+    Ok(
+        sqlx::query_as::<_, ScopedPageRow>(sqlx::AssertSqlSafe(
+            FEDERATED_SUBJECT_PAGE_SQL.as_str(),
+        ))
         .bind(subject.issuer.as_str())
         .bind(subject.upstream_org_id.as_str())
         .bind(subject.subject_id.as_str())
@@ -469,6 +473,7 @@ pub async fn federated_subject_page<'e>(
         .bind(legacy_org_id)
         .bind(walk.max_bytes)
         .bind(walk.row_overhead_bytes)
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?,
+    )
 }

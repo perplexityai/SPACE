@@ -2,9 +2,12 @@
 //! own transaction before they re-check or write the row.
 //!
 //! Each verb runs on the caller's open transaction, and the lock it takes
-//! lasts until that transaction ends. The verbs take a `&mut PgConnection`,
-//! never a pool, on which the lock would end with its own statement. The
-//! caller keeps the transaction, any `lock_timeout` it sets, and the
+//! lasts until that transaction ends. The verbs take `&mut C` where
+//! `&mut C` is postgres-pool's `Executor`: that accepts a `Tx` or a
+//! `PgConnection` and refuses a pool, on which the lock would end with its
+//! own statement. It cannot tell whether a `PgConnection` has a transaction
+//! open, so the caller must pass its open transaction. The caller keeps the
+//! transaction, any `lock_timeout` it sets, and the
 //! re-checks it runs under the lock. A lock that carries a guard, or that
 //! only one path takes, lives in a module named for that path.
 //!
@@ -17,22 +20,26 @@
 use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_model::SandboxId;
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::PgConnection;
 
 /// Lock the sandbox's row `FOR UPDATE` and return its stored lifecycle,
 /// unparsed; `None` when the row is absent. The lock lasts until the caller's
 /// transaction ends.
-pub async fn lock_lifecycle(
-    conn: &mut PgConnection,
+/// The caller must pass its open transaction.
+pub async fn lock_lifecycle<C>(
+    conn: &mut C,
     sandbox_id: SandboxId,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Option<String>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar(sql!(
         "SELECT lifecycle FROM sandboxes WHERE id = $1 FOR UPDATE"
     ))
     .bind(sandbox_id)
-    .fetch_optional(conn)
-    .await
+    .fetch_optional(conn.into_sqlx())
+    .await?)
 }
 
 /// What [`lock_lifecycle_with_active_node_drain`] reads, unparsed: the
@@ -44,11 +51,15 @@ pub type LifecycleWithActiveNodeDrain = (String, Option<String>, Option<String>,
 /// node the sandbox is active on, in the same statement. It locks only the
 /// sandbox's row, `FOR UPDATE OF s`; `None` when the row is absent. The lock
 /// lasts until the caller's transaction ends.
-pub async fn lock_lifecycle_with_active_node_drain(
-    conn: &mut PgConnection,
+/// The caller must pass its open transaction.
+pub async fn lock_lifecycle_with_active_node_drain<C>(
+    conn: &mut C,
     sandbox_id: SandboxId,
-) -> Result<Option<LifecycleWithActiveNodeDrain>, sqlx::Error> {
-    sqlx::query_as(sql!(
+) -> Result<Option<LifecycleWithActiveNodeDrain>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_as(sql!(
         "SELECT s.lifecycle, n.drain_engine, n.drain_phase, n.drain_mode
            FROM sandboxes s
            LEFT JOIN nodes n ON n.id = s.active_node_id
@@ -56,32 +67,36 @@ pub async fn lock_lifecycle_with_active_node_drain(
             FOR UPDATE OF s"
     ))
     .bind(sandbox_id)
-    .fetch_optional(conn)
-    .await
+    .fetch_optional(conn.into_sqlx())
+    .await?)
 }
 
 /// Lock the sandbox's row `FOR UPDATE`; `None` when the row is absent. The
 /// lock lasts until the caller's transaction ends.
-pub async fn lock_id(
-    conn: &mut PgConnection,
-    sandbox_id: SandboxId,
-) -> Result<Option<SandboxId>, sqlx::Error> {
-    sqlx::query_scalar(sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"))
-        .bind(sandbox_id)
-        .fetch_optional(conn)
-        .await
+/// The caller must pass its open transaction.
+pub async fn lock_id<C>(conn: &mut C, sandbox_id: SandboxId) -> Result<Option<SandboxId>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(
+        sqlx::query_scalar(sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"))
+            .bind(sandbox_id)
+            .fetch_optional(conn.into_sqlx())
+            .await?,
+    )
 }
 
 /// Lock the sandbox's row `FOR UPDATE`; `false` when the row is absent. The
 /// lock lasts until the caller's transaction ends.
-pub async fn lock_exists(
-    conn: &mut PgConnection,
-    sandbox_id: SandboxId,
-) -> Result<bool, sqlx::Error> {
+/// The caller must pass its open transaction.
+pub async fn lock_exists<C>(conn: &mut C, sandbox_id: SandboxId) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     Ok(
         sqlx::query(sql!("SELECT 1 FROM sandboxes WHERE id = $1 FOR UPDATE"))
             .bind(sandbox_id)
-            .fetch_optional(conn)
+            .fetch_optional(conn.into_sqlx())
             .await?
             .is_some(),
     )
@@ -91,16 +106,20 @@ pub async fn lock_exists(
 /// The lock lasts until the caller's transaction ends. Unlike `FOR UPDATE`,
 /// it lets a child-row insert's foreign-key check (`FOR KEY SHARE`) on the
 /// row through.
-pub async fn lock_id_no_key_update(
-    conn: &mut PgConnection,
+/// The caller must pass its open transaction.
+pub async fn lock_id_no_key_update<C>(
+    conn: &mut C,
     sandbox_id: SandboxId,
-) -> Result<Option<SandboxId>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Option<SandboxId>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar(sql!(
         "SELECT id FROM sandboxes WHERE id = $1 FOR NO KEY UPDATE"
     ))
     .bind(sandbox_id)
-    .fetch_optional(conn)
-    .await
+    .fetch_optional(conn.into_sqlx())
+    .await?)
 }
 
 /// Lock the sandbox's row `FOR NO KEY UPDATE` and return its active node:
@@ -108,14 +127,18 @@ pub async fn lock_id_no_key_update(
 /// The lock lasts until the caller's transaction ends. Unlike `FOR UPDATE`,
 /// it lets a child-row insert's foreign-key check (`FOR KEY SHARE`) on the
 /// row through.
-pub async fn lock_active_node_id_no_key_update(
-    conn: &mut PgConnection,
+/// The caller must pass its open transaction.
+pub async fn lock_active_node_id_no_key_update<C>(
+    conn: &mut C,
     sandbox_id: SandboxId,
-) -> Result<Option<Option<NodeId>>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Option<Option<NodeId>>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar(sql!(
         "SELECT active_node_id FROM sandboxes WHERE id = $1 FOR NO KEY UPDATE"
     ))
     .bind(sandbox_id)
-    .fetch_optional(conn)
-    .await
+    .fetch_optional(conn.into_sqlx())
+    .await?)
 }

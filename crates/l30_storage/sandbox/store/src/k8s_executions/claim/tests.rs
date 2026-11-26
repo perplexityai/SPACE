@@ -225,7 +225,7 @@ async fn claim_under_sandbox_lock(
     sandbox: SandboxId,
 ) -> TestResult<(i64, Option<i64>)> {
     let mut tx = pool.begin().await?;
-    assert_eq!(row_locks::lock_id(&mut tx, sandbox).await?, Some(sandbox));
+    assert_eq!(row_locks::lock_id(&mut *tx, sandbox).await?, Some(sandbox));
     let generation = mint_generation(&mut *tx, sandbox).await?;
     let claimed = insert_creating_claim(
         &mut *tx,
@@ -253,7 +253,7 @@ async fn two_claims_under_one_sandbox_lock_cannot_both_go_live() -> TestResult {
         .fetch_one(&mut *first)
         .await?;
     assert_eq!(
-        row_locks::lock_id(&mut first, sandbox).await?,
+        row_locks::lock_id(&mut *first, sandbox).await?,
         Some(sandbox)
     );
     let generation = mint_generation(&mut *first, sandbox).await?;

@@ -132,7 +132,7 @@ async fn lock_live_adoption_candidate_locks_only_the_sandboxes_row() -> TestDbRe
 
     let mut transaction = pool.begin().await?;
     let generations = lock_live_adoption_candidate(
-        &mut transaction,
+        &mut *transaction,
         sandbox_id,
         SandboxLifecycle::Suspended,
         node_id,
@@ -241,7 +241,7 @@ async fn lock_live_adoption_candidate_refuses_without_waiting() -> TestDbResult<
         (behind, SandboxLifecycle::Started, "another lifecycle"),
     ] {
         assert_eq!(
-            lock_live_adoption_candidate(&mut transaction, sandbox_id, lifecycle, node_id, 3)
+            lock_live_adoption_candidate(&mut *transaction, sandbox_id, lifecycle, node_id, 3)
                 .await?,
             None,
             "{case}"

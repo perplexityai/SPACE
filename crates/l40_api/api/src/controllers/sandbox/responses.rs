@@ -583,10 +583,12 @@ pub fn sandbox_to_response(sandbox: &Sandbox, live: Option<&SandboxInfo>) -> San
 
 /// The sandbox's response row; `None` when there is no row.
 pub async fn fetch_sandbox(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
     id: SandboxId,
 ) -> Result<Option<Sandbox>, sqlx::Error> {
-    sandbox_store::direct::sandbox_listing::by_id(executor, id).await
+    sandbox_store::direct::sandbox_listing::by_id(executor, id)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 /// Marks a pooled sandbox as started/on-node after its wake completes and

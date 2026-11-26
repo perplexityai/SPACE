@@ -1778,6 +1778,7 @@ async fn inventory_reads_skip_locked_sandbox_accounting_but_diagnostics_do_not()
         ResidencyEvidence::LifecycleOnly,
     )
     .await
+    .map_err(sqlx::Error::from)
     .unwrap_err();
     assert_eq!(
         error.as_database_error().unwrap().code().as_deref(),

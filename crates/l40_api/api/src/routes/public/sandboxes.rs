@@ -1182,7 +1182,7 @@ async fn ensure_sandbox_owner(
     let found =
         pplx_space_sandbox_store::row_reads::org_owns(pool, SandboxId::from(sandbox_id), org_id)
             .await
-            .map_err(database_error)?;
+            .map_err(|error| database_error(sqlx::Error::from(error)))?;
     if !found {
         return Err(PublicApiError::not_found("sandbox not found"));
     }
@@ -1194,7 +1194,9 @@ async fn fetch_public_sandbox(
     org_id: OrgId,
     sandbox_id: PublicSandboxId,
 ) -> Result<Option<PublicSandboxRow>, sqlx::Error> {
-    sandbox_listing::public::by_id(pool, SandboxId::from(sandbox_id), org_id).await
+    sandbox_listing::public::by_id(pool, SandboxId::from(sandbox_id), org_id)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 async fn fetch_sandboxes_page(
@@ -1217,6 +1219,7 @@ async fn fetch_sandboxes_page(
         },
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 async fn sandbox_operation_response(

@@ -22,6 +22,12 @@ pub enum CredentialStoreError {
     Query(#[from] sqlx::Error),
 }
 
+impl From<pplx_space_postgres_pool::DbError> for CredentialStoreError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 /// Sandbox-owner lookup. A trait so the handlers can be exercised without a
 /// live Postgres.
 #[tonic::async_trait]

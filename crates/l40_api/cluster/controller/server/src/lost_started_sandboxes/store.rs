@@ -89,7 +89,7 @@ impl LostStartedSink for LostStartedDbStore {
         // the execution, so a wake either commits first (the flip's execution
         // check then refuses) or waits for this transaction, then finds the
         // row `failed` and claims nothing.
-        let locked = row_locks::lock_lifecycle(&mut tx, candidate.sandbox_id).await?;
+        let locked = row_locks::lock_lifecycle(&mut *tx, candidate.sandbox_id).await?;
         if locked.as_deref() != Some("started") {
             tx.rollback().await?;
             return Ok(false);
