@@ -1,8 +1,8 @@
 //! `[rules.layers]`: the layer of each workspace member that is not yet in its
 //! layer's directory, which crates may use each store and each coordinator,
-//! the declared
-//! exceptions to the layer order, and the mode of each of the layers rule's
-//! checks.
+//! the stores that provide the Postgres stores' database handles, the
+//! declared exceptions to the layer order, and the mode of each of the layers
+//! rule's checks.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -111,6 +111,11 @@ pub struct LayersConfig {
     /// Each store's package name to the packages that may depend on it.
     #[serde(default)]
     pub store_users: BTreeMap<String, PackageSet>,
+    /// The Storage crates that provide the database handle types
+    /// Postgres stores use: any Storage crate may depend on one without a
+    /// `store_users` entry; an API crate still needs one.
+    #[serde(default)]
+    pub storage_handles: PackageSet,
     /// Each coordinator's package name to the packages that may depend on
     /// it.
     #[serde(default)]
@@ -479,6 +484,11 @@ pub struct LayersPolicy {
     /// The line of the `protocols` key, or without one, of the
     /// `[rules.layers]` header, if there is one.
     pub protocols_line: Option<usize>,
+    /// `storage_handles`, each package with the line it is written on.
+    pub storage_handles: BTreeMap<String, usize>,
+    /// The line of the `storage_handles` key, or without one, of the
+    /// `[rules.layers]` header, if there is one.
+    pub storage_handles_line: Option<usize>,
     /// `[rules.layers.domain_fences]`: each package to its family and the
     /// line it is written on.
     pub domain_fences: Entries<String>,
@@ -545,6 +555,7 @@ struct PolicyTable {
     allowed_edges: Option<BTreeMap<Spanned<String>, Vec<Spanned<String>>>>,
     storage: Option<PolicyStorage>,
     protocols: Option<Spanned<Vec<Spanned<String>>>>,
+    storage_handles: Option<Spanned<Vec<Spanned<String>>>>,
     domain_fences: Option<BTreeMap<String, Vec<Spanned<String>>>>,
     placement: Option<PolicyBehaviour>,
     layout: Option<PolicyBehaviour>,
@@ -708,6 +719,11 @@ impl LayersPolicy {
             None => header_line(text, "[rules.layers]"),
         };
         let protocols = packages(table.protocols.map(Spanned::into_inner));
+        let storage_handles_line = match &table.storage_handles {
+            Some(handles) => Some(line(handles.span())),
+            None => header_line(text, "[rules.layers]"),
+        };
+        let storage_handles = packages(table.storage_handles.map(Spanned::into_inner));
         let (shared_catalogs, co_writers, state) = match table.state {
             Some(state) => (
                 lists("state.shared_catalogs", state.shared_catalogs),
@@ -782,6 +798,8 @@ impl LayersPolicy {
             storage,
             protocols,
             protocols_line,
+            storage_handles,
+            storage_handles_line,
             domain_fences,
             shared_catalogs,
             co_writers,

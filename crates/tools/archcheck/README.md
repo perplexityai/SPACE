@@ -290,7 +290,7 @@ each finding means and how to fix it.
 |---|---|
 | Foundation | Foundation |
 | Domain | Domain, Foundation |
-| Storage | Domain, Foundation, and another store that lists it as a user; never a coordinator |
+| Storage | Domain, Foundation, a `storage_handles` crate, and another store that lists it as a user; never a coordinator |
 | API | API, Domain, Foundation, and the stores and coordinators that list it as a user; a `*-client` only Domain, Foundation and other clients |
 | App | API, Domain, Foundation; never another app or an `l30_storage` crate |
 | test_support, tools | anything but tools |
@@ -317,6 +317,7 @@ sqlx = ["Type", "postgres::PgTypeInfo"]   # paths below each driver's root, each
 
 [rules.layers]
 protocols = ["pplx-space-events"]      # protocols without a *-protocol or *-proto name; see Domain
+storage_handles = ["pplx-space-postgres-pool"]  # Storage crates that provide the Postgres stores' database handles; API users stay listed
 
 [rules.layers.domain_fences]           # packages no Domain crate depends on, by family
 runtime = ["tokio"]
@@ -378,17 +379,23 @@ The checks, each with its own mode:
   `store_users` doesn't list it. The fix is the owner's API, or for a store,
   which can't depend on one, moving the read into the owning store; or, if
   the crate owns the state, listing it. A coordinator is listed as a user of
-  each store it has a normal or build dependency on,
-  `pplx-space-postgres-pool` included.
+  each store it has a normal or build dependency on. The exception is a
+  store in `[rules.layers] storage_handles`, which provides the database
+  handle types Postgres stores use (`pplx-space-postgres-pool`'s `Db`, `Tx`,
+  `Executor` and `DbError`): any Storage crate, store or coordinator, may
+  depend on it without an entry. An API crate still needs one, so its list
+  says which services hold a database handle.
 - `coordinators`, `coordinator_edges` and `driver_reexports`: see
   [Coordinators](#coordinators).
 - `stale_entries`: an `unmoved` entry for a crate that is gone or now in a
   layer directory; a `store_users` entry for something that isn't a store,
-  or listing a crate that is gone, a client, or one outside API and Storage,
-  which allows nothing, or a user that no longer uses the store: one with no
-  normal or build dependency on it, since the list says who uses the store
-  today; an `allowed_edges` entry whose normal or build dependency is gone,
-  that needs no exception, or that is for a `test_only` edge, which it can't
+  or listing a crate that is gone, a client, one outside API and Storage, or,
+  in a `storage_handles` crate's entry, a Storage crate, which allows
+  nothing, or a user that no longer uses the store: one with no normal or
+  build dependency on it, since the list says who uses the store today; a
+  `storage_handles` entry that is gone, outside `l30_storage` or a
+  coordinator; an `allowed_edges` entry whose normal or build dependency is
+  gone, that needs no exception, or that is for a `test_only` edge, which it can't
   exempt; a `[rules.layers.storage]` `helpers` entry that is gone or outside
   `l10_foundation`; a `codec_facades` entry that is gone, outside
   `l10_foundation` or also a helper, and one of its exports that no file of the
@@ -410,7 +417,7 @@ The checks, each with its own mode:
   branch's `ARCHITECTURE.toml`, given with `--base-architecture`: an
   `unmoved` entry added or moved to another layer, a store user or allowed
   edge added or removed, a coordinator user added or removed, a protocol
-  added or removed, a driver, helper or
+  or storage handle crate added or removed, a driver, helper or
   codec facade added to or removed from
   `[rules.layers.storage]`, a facade's export added or removed, a
   package added to, removed from or moved between
@@ -478,8 +485,9 @@ verb for that store's own rows, and documents the lock order. Every other
 `l30_storage` crate is a store. A coordinator owns no tables, holds no SQL
 and depends on no driver, storage helper or codec facade
 (`[rules.layers.storage]` in `ARCHITECTURE.toml`): only Domain crates, other
-Foundation crates and the stores that list it as a user,
-`pplx-space-postgres-pool` among them. The checks:
+Foundation crates, the stores that list it as a user, and the
+`storage_handles` crates, such as `pplx-space-postgres-pool`, which need no
+entry. The checks:
 
 - `coordinators`: a coordinator with a `[package.metadata.space.state]`,
   shown on the table's line, since it owns no tables; an `l30_storage` crate
@@ -970,7 +978,8 @@ so a new table is declared by its owner before its migration lands (see
   to the store's list in `[rules.layers.store_users]` with the dependency
   that uses it. `policy_changed` reports the change for review. A crate that
   only needs the data uses the owner's API instead, and one that stops using
-  the store leaves the list, which `stale_entries` asks for.
+  the store leaves the list, which `stale_entries` asks for. A Storage crate
+  needs no entry for a `storage_handles` crate; an API crate does.
 - **A coordinator user:** an API crate that runs a coordinator's
   transaction goes in its list in `[rules.layers.coordinator_users]` with
   the dependency that uses it, and the coordinator in the `store_users` list
@@ -1006,7 +1015,8 @@ also fail the check. Unknown keys, sections or modes, a missing file, bad TOML,
 an invalid regex, glob or instance name, an empty `patterns` or `include`
 list, a layer name that is not one of the seven, a package listed twice in
 `unmoved` or in one `store_users`, `coordinator_users` or `allowed_edges` list or in a
-`[rules.layers.storage]` list, a package listed twice in `protocols` or in two
+`[rules.layers.storage]` list, a package listed twice in `protocols` or
+`storage_handles` or in two
 `[rules.layers.domain_fences]` families, an empty `drivers`, a baseline table
 for an instance or layers check that is not configured, a state configuration
 or declaration that can't be read (see [State ownership](#state-ownership)),

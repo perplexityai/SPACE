@@ -5310,6 +5310,12 @@ fn layers_edge_checks() {
     // is stale.
     let a_users = "[rules.layers.store_users]\npplx-space-s-store = [\"pplx-space-a\"]\n";
     let s_users = "[rules.layers.store_users]\npplx-space-t-store = [\"pplx-space-s-store\"]\n";
+    let a_t = normal("pplx-space-a", "pplx-space-t-store");
+    // `t-store` provides every store's database handles, or `s-store` does.
+    let t_handles = "[rules.layers]\nstorage_handles = [\"pplx-space-t-store\"]\n";
+    let s_handles = "[rules.layers]\nstorage_handles = [\"pplx-space-s-store\"]\n";
+    let a_t_users =
+        format!("[rules.layers.store_users]\npplx-space-t-store = [\"pplx-space-a\"]\n{t_handles}");
     let dev_crossing = "crates/l30_storage/s/store/Cargo.toml: pplx-space-s-store (l30_storage) \
                         dev-depends on pplx-space-a (l40_api), a dev-dependency, but a \
                         dev-dependency may point only at the crate's own or a lower layer, or at \
@@ -5326,13 +5332,17 @@ fn layers_edge_checks() {
             if from == "pplx-space-a" { A } else { S }
         )
     };
-    let a_unlisted = format!(
-        "{} A store is private to the crates that own its state: reach the state through its \
-         owner's API (the crate root or its client), or, if pplx-space-a owns this state, add it \
-         to pplx-space-s-store's users, which layers.policy_changed reports. See \
-         crates/tools/archcheck/README.md#layers.",
-        store("pplx-space-a", "l40_api", "pplx-space-s-store")
-    );
+    let api_unlisted = |to: &str| {
+        format!(
+            "{} A store is private to the crates that own its state: reach the state through its \
+             owner's API (the crate root or its client), or, if pplx-space-a owns this state, add \
+             it to {to}'s users, which layers.policy_changed reports. See \
+             crates/tools/archcheck/README.md#layers.",
+            store("pplx-space-a", "l40_api", to)
+        )
+    };
+    let a_unlisted = api_unlisted("pplx-space-s-store");
+    let a_t_unlisted = api_unlisted("pplx-space-t-store");
     // A store can't go through an API crate.
     let s_unlisted = format!(
         "{} A store reads another only as one of its users: if pplx-space-s-store owns this \
@@ -5453,6 +5463,34 @@ fn layers_edge_checks() {
             &[("layers.store_edges", &s_unlisted, &s)],
         ),
         ("Storage to a store listing it", &s_store, s_users, &[], &[]),
+        (
+            "Storage to a storage handle crate",
+            &s_store,
+            t_handles,
+            &[],
+            &[],
+        ),
+        (
+            "API to an unlisted storage handle crate",
+            &a_t,
+            t_handles,
+            &[],
+            &[("layers.store_edges", &a_t_unlisted, &a)],
+        ),
+        (
+            "API to a storage handle crate listing it",
+            &a_t,
+            &a_t_users,
+            &[],
+            &[],
+        ),
+        (
+            "Storage to an unlisted store beside a storage handle crate",
+            &s_store,
+            s_handles,
+            &[],
+            &[("layers.store_edges", &s_unlisted, &s)],
+        ),
     ];
     // Each row runs `cargo metadata` over its own workspace, so the rows run
     // on threads of their own.
@@ -5485,11 +5523,11 @@ const COORDINATORS: [(&str, &str); 2] = [
 ];
 
 /// A coordinator, a Storage crate named `*-coordinator`, depends only on
-/// Domain, Foundation and the stores that list it, never on a driver or
-/// another coordinator, and declares no state; an API crate uses one only if
-/// it lists the crate in `coordinator_users`, and a store never does. No
-/// Storage crate's library root re-exports a driver. Entries of
-/// `coordinator_users` that allow nothing are stale.
+/// Domain, Foundation, the stores that list it and the `storage_handles`
+/// crates, never on a driver or another coordinator, and declares no state;
+/// an API crate uses one only if it lists the crate in `coordinator_users`,
+/// and a store never does. No Storage crate's library root re-exports a
+/// driver. Entries of `coordinator_users` that allow nothing are stale.
 #[test]
 fn layers_coordinators() {
     const C: &str = "crates/l30_storage/c/coordinator/Cargo.toml";
@@ -5585,6 +5623,13 @@ fn layers_coordinators() {
                 ),
                 at(C, 6),
             )],
+        ),
+        (
+            "a coordinator using a storage handle crate that doesn't list it",
+            vec![normal("pplx-space-c-coordinator", "pplx-space-s-store")],
+            "[rules.layers]\nstorage_handles = [\"pplx-space-s-store\"]\n".to_owned(),
+            vec![],
+            vec![],
         ),
         (
             "a coordinator using another coordinator",
@@ -6189,8 +6234,9 @@ fn layers_coordinators_and_the_state_checks() {
 
 /// `[rules.layers]` entries that no longer apply are stale, each shown on its
 /// line in `ARCHITECTURE.toml`: an `unmoved` crate that is gone or in a layer
-/// directory, a `store_users` store that is not a Storage member or a user
-/// that can't use a store by its list or doesn't use it, and an
+/// directory, a `storage_handles` crate that is not a Storage member, a
+/// `store_users` store that is not a Storage member or a user that can't use
+/// a store by its list, needs no entry or doesn't use it, and an
 /// `allowed_edges` edge that does not exist or needs no exception.
 #[test]
 fn layers_stale_config_entries() {
@@ -6208,6 +6254,10 @@ fn layers_stale_config_entries() {
     let p_a = [("pplx-space-p", "dependencies", "pplx-space-a")];
     let a_s = [("pplx-space-a", "dependencies", "pplx-space-s-store")];
     let a_dev_s = [("pplx-space-a", "dev-dependencies", "pplx-space-s-store")];
+    let a_s_t = [
+        ("pplx-space-a", "dependencies", "pplx-space-t-store"),
+        ("pplx-space-s-store", "dependencies", "pplx-space-t-store"),
+    ];
     let cases: &[Case] = &[
         (
             "an unmoved entry for no member",
@@ -6226,6 +6276,49 @@ fn layers_stale_config_entries() {
             &[],
             "pplx-space-f: is in [rules.layers] unmoved in ARCHITECTURE.toml, but the crate is \
              at crates/l10_foundation/f, whose directory gives its layer.",
+        ),
+        (
+            "a storage handle crate that is no member",
+            "storage_handles = ",
+            "[rules.layers]\nstorage_handles = [\"pplx-space-nobody\"]\n",
+            &[],
+            &[],
+            "pplx-space-nobody: is in [rules.layers] storage_handles in ARCHITECTURE.toml, but no \
+             workspace member has this name. Remove it.",
+        ),
+        (
+            "a storage handle crate that is not a Storage crate",
+            "storage_handles = ",
+            "[rules.layers]\nstorage_handles = [\"pplx-space-d\"]\n",
+            &[],
+            &[],
+            "pplx-space-d: is in [rules.layers] storage_handles in ARCHITECTURE.toml, but a \
+             storage handle crate is an l30_storage crate, and its layer is l20_domain. Remove it.",
+        ),
+        (
+            "a storage handle crate that is a coordinator",
+            "storage_handles = ",
+            "[rules.layers]\nstorage_handles = [\"pplx-space-c-coordinator\"]\n",
+            &[],
+            &[(
+                "crates/l30_storage/c/coordinator",
+                "pplx-space-c-coordinator",
+            )],
+            "pplx-space-c-coordinator: is in [rules.layers] storage_handles in ARCHITECTURE.toml, \
+             but a storage handle crate is a store; pplx-space-c-coordinator is a coordinator. \
+             Remove it.",
+        ),
+        (
+            "a Storage user of a storage handle crate",
+            "\"pplx-space-s-store\",",
+            "[rules.layers.store_users]\npplx-space-t-store = [\n  \"pplx-space-a\",\n  \
+             \"pplx-space-s-store\",\n]\n[rules.layers]\nstorage_handles = [\"pplx-space-t-store\"]\n",
+            &a_s_t,
+            &[],
+            "pplx-space-t-store: lists pplx-space-s-store in [rules.layers] store_users in \
+             ARCHITECTURE.toml, but pplx-space-t-store is in [rules.layers] storage_handles, \
+             which lets every l30_storage crate depend on it, so the entry allows nothing. \
+             Remove it from the list.",
         ),
         (
             "a store that is no member",
@@ -6381,7 +6474,8 @@ fn layers_stale_config_entries() {
     let tables = "[rules.layers.store_users]\npplx-space-old = [\"pplx-space-a\"]\n\
                   pplx-space-s-store = [\"pplx-space-old\"]\n\
                   [rules.layers.allowed_edges]\npplx-space-old = [\"pplx-space-d\"]\n\
-                  pplx-space-p = [\"pplx-space-old\"]\n";
+                  pplx-space-p = [\"pplx-space-old\"]\n\
+                  [rules.layers]\nstorage_handles = [\"pplx-space-old\"]\n";
     let ws = Layered {
         extra: &[("crates/libs/old", "pplx-space-old")],
         dependencies: &[
@@ -6429,6 +6523,11 @@ fn layers_policy_changed() {
     // After another `[rules.layers…]` header, as in the repository's copy.
     let protocols = |list: &str| {
         format!("[rules.layers.unmoved]\nl20_domain = []\n[rules.layers]\nprotocols = [{list}]\n")
+    };
+    let handles = |list: &str| {
+        format!(
+            "[rules.layers.unmoved]\nl20_domain = []\n[rules.layers]\nstorage_handles = [{list}]\n"
+        )
     };
     let fences = |runtime: &str, http: &str, kube: &str| {
         format!(
@@ -6602,6 +6701,36 @@ fn layers_policy_changed() {
             &[(
                 "[rules.layers]",
                 "ARCHITECTURE.toml: `pplx-space-old` was removed from [rules.layers] protocols.",
+            )],
+        ),
+        (
+            "storage_handles changed",
+            layers_config(&handles("\"pplx-space-s-store\""), "required"),
+            layers_config(&handles("\"pplx-space-t-store\""), "required"),
+            &[
+                (
+                    "storage_handles = ",
+                    "ARCHITECTURE.toml: `pplx-space-t-store` was added to [rules.layers] \
+                     storage_handles.",
+                ),
+                (
+                    "storage_handles = ",
+                    "ARCHITECTURE.toml: `pplx-space-s-store` was removed from [rules.layers] \
+                     storage_handles.",
+                ),
+            ],
+        ),
+        (
+            "storage_handles removed",
+            layers_config(&handles("\"pplx-space-s-store\""), "required"),
+            layers_config(
+                "[rules.layers.unmoved]\nl20_domain = []\n[rules.layers]\n",
+                "required",
+            ),
+            &[(
+                "[rules.layers]",
+                "ARCHITECTURE.toml: `pplx-space-s-store` was removed from [rules.layers] \
+                 storage_handles.",
             )],
         ),
         (
@@ -6890,6 +7019,15 @@ fn layers_configuration_errors() {
             "ARCHITECTURE.toml",
             tables("[rules.layers]\nprotocols = [\"pplx-space-d\", \"pplx-space-d\"]\n"),
             "\"pplx-space-d\" is listed twice",
+        ),
+        (
+            "a storage handle crate listed twice",
+            "ARCHITECTURE.toml",
+            tables(
+                "[rules.layers]\nstorage_handles = [\"pplx-space-s-store\", \
+                 \"pplx-space-s-store\"]\n",
+            ),
+            "\"pplx-space-s-store\" is listed twice",
         ),
         (
             "a store user listed twice",

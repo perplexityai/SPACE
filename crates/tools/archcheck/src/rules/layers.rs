@@ -19,7 +19,9 @@
 //! - `clients`: a client depends only on Domain, Foundation and other
 //!   clients.
 //! - `store_edges`: an API or Storage crate depends on a store only if the
-//!   store lists it as a user.
+//!   store lists it as a user; a Storage crate may also depend on a
+//!   `storage_handles` crate, which provides the Postgres stores' database
+//!   handles.
 //! - `coordinators` and `coordinator_edges`: a coordinator, a Storage crate
 //!   named `*-coordinator` that runs one transaction across stores, sits at
 //!   `<area>/coordinator` without a leaf, declares no state and depends on
