@@ -7,6 +7,7 @@ use pplx_space_db_test_fixtures::{
 };
 use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::Db;
 use pplx_space_sandbox_model::SandboxLifecycle;
 use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
@@ -1449,16 +1450,16 @@ async fn a_campaign_pauses_itself_when_failures_reach_its_budget() -> TestResult
         &ItemOutcome::Skipped(ItemError::new("gone")),
     )
     .await?;
-    assert!(!pause_if_over_budget(&db.pool, campaign).await?);
+    assert!(!pause_if_over_budget(&Db::from(db.pool.clone()), campaign).await?);
 
     finish_item(&db.pool, &leased[2], &failed).await?;
-    assert!(pause_if_over_budget(&db.pool, campaign).await?);
+    assert!(pause_if_over_budget(&Db::from(db.pool.clone()), campaign).await?);
     assert_eq!(
         campaign_phase(&db.pool, campaign).await?,
         ("paused".to_owned(), false)
     );
     // Already paused: nothing more to do.
-    assert!(!pause_if_over_budget(&db.pool, campaign).await?);
+    assert!(!pause_if_over_budget(&Db::from(db.pool.clone()), campaign).await?);
     Ok(())
 }
 
@@ -1490,7 +1491,7 @@ async fn an_operator_phase_isnt_overwritten_by_the_budget() -> TestResult {
     .execute(&db.pool)
     .await?;
 
-    assert!(!pause_if_over_budget(&db.pool, campaign).await?);
+    assert!(!pause_if_over_budget(&Db::from(db.pool.clone()), campaign).await?);
     assert_eq!(
         campaign_phase(&db.pool, campaign).await?,
         ("aborted".to_owned(), true)
@@ -1774,7 +1775,7 @@ async fn a_campaign_over_its_budget_doesnt_complete_or_lease() -> TestResult {
     .execute(&db.pool)
     .await?;
     assert!(!complete_if_drained(&db.pool, campaign).await?);
-    assert!(pause_if_over_budget(&db.pool, campaign).await?);
+    assert!(pause_if_over_budget(&Db::from(db.pool.clone()), campaign).await?);
     Ok(())
 }
 

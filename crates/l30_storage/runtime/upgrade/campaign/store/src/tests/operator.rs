@@ -46,7 +46,7 @@ async fn pause_and_resume_raise_the_generation_and_record_the_actor() -> TestRes
     let campaign = insert_campaign(&db.pool, CampaignSeed::default()).await?;
     assert_eq!(generation(&db.pool, campaign).await?, 0);
 
-    let paused = pause_campaign(&db.pool, campaign, &change(Some(0))).await?;
+    let paused = pause_campaign(&Db::from(db.pool.clone()), campaign, &change(Some(0))).await?;
     assert_eq!(
         paused,
         PhaseChanged {
@@ -69,7 +69,7 @@ async fn pause_and_resume_raise_the_generation_and_record_the_actor() -> TestRes
         actor: other,
         ..change(Some(1))
     };
-    let resumed = resume_campaign(&db.pool, campaign, &resume, false).await?;
+    let resumed = resume_campaign(&Db::from(db.pool.clone()), campaign, &resume, false).await?;
     assert_eq!(resumed.phase, CampaignPhase::Canary);
     assert_eq!(resumed.generation, 2);
     let record = get_record(&db.pool, campaign).await?.expect("exists");
@@ -87,10 +87,11 @@ async fn a_stale_generation_is_refused_and_changes_nothing() -> TestResult {
     // The reconciler's budget pause moved the campaign after an operator
     // read it at generation 0.
     fail_items(&db, campaign, 3).await?;
-    assert!(pause_if_over_budget(&db.pool, campaign).await?);
+    assert!(pause_if_over_budget(&Db::from(db.pool.clone()), campaign).await?);
     assert_eq!(generation(&db.pool, campaign).await?, 1);
 
-    let refused = resume_campaign(&db.pool, campaign, &change(Some(0)), true).await;
+    let refused =
+        resume_campaign(&Db::from(db.pool.clone()), campaign, &change(Some(0)), true).await;
     assert!(
         matches!(
             refused,
@@ -117,9 +118,9 @@ async fn a_resume_at_the_failure_budget_needs_the_failed_items_retried() -> Test
     };
     let campaign = insert_campaign(&db.pool, CampaignSeed::default()).await?;
     fail_items(&db, campaign, 3).await?;
-    assert!(pause_if_over_budget(&db.pool, campaign).await?);
+    assert!(pause_if_over_budget(&Db::from(db.pool.clone()), campaign).await?);
 
-    let refused = resume_campaign(&db.pool, campaign, &change(None), false).await;
+    let refused = resume_campaign(&Db::from(db.pool.clone()), campaign, &change(None), false).await;
     assert!(
         matches!(
             refused,
@@ -131,7 +132,8 @@ async fn a_resume_at_the_failure_budget_needs_the_failed_items_retried() -> Test
         "{refused:?}"
     );
 
-    let resumed = resume_campaign(&db.pool, campaign, &change(None), true).await?;
+    let resumed =
+        resume_campaign(&Db::from(db.pool.clone()), campaign, &change(None), true).await?;
     assert_eq!(resumed.retried, 3);
     assert_eq!(resumed.phase, CampaignPhase::Canary);
     let rows = sqlx::query_as::<_, (String, i64, Option<String>)>(sql!(
@@ -168,7 +170,7 @@ async fn a_resume_with_a_done_item_rolls() -> TestResult {
     .await?;
     pending_on(&db, canary, None, 2).await?;
 
-    let refused = resume_campaign(&db.pool, canary, &change(None), false).await;
+    let refused = resume_campaign(&Db::from(db.pool.clone()), canary, &change(None), false).await;
     assert!(
         matches!(
             refused,
@@ -178,12 +180,12 @@ async fn a_resume_with_a_done_item_rolls() -> TestResult {
     );
     let leased = lease(&db, canary).await?;
     finish_item(&db.pool, &leased[0], &ItemOutcome::Done).await?;
-    let resumed = resume_campaign(&db.pool, canary, &change(None), false).await?;
+    let resumed = resume_campaign(&Db::from(db.pool.clone()), canary, &change(None), false).await?;
     assert_eq!(resumed.phase, CampaignPhase::Rolling);
 
     // Paused and resumed again: an item is done, so it keeps rolling.
-    pause_campaign(&db.pool, canary, &change(None)).await?;
-    let resumed = resume_campaign(&db.pool, canary, &change(None), false).await?;
+    pause_campaign(&Db::from(db.pool.clone()), canary, &change(None)).await?;
+    let resumed = resume_campaign(&Db::from(db.pool.clone()), canary, &change(None), false).await?;
     assert_eq!(resumed.phase, CampaignPhase::Rolling);
     assert_eq!(resumed.generation, 3);
     Ok(())
@@ -241,8 +243,10 @@ async fn each_verb_is_allowed_or_refused_in_every_phase() -> TestResult {
         };
         let (pause, resume, abort) = (seed().await?, seed().await?, seed().await?);
         let got = (
-            outcome(pause_campaign(&db.pool, pause, &change(Some(0))).await),
-            outcome(resume_campaign(&db.pool, resume, &change(Some(0)), false).await),
+            outcome(pause_campaign(&Db::from(db.pool.clone()), pause, &change(Some(0))).await),
+            outcome(
+                resume_campaign(&Db::from(db.pool.clone()), resume, &change(Some(0)), false).await,
+            ),
             outcome(abort_campaign(&db.pool, abort, &change(Some(0))).await),
         );
         assert_eq!(got, expected, "{phase:?}");
@@ -272,11 +276,11 @@ async fn a_missing_campaign_is_not_found_and_a_refusal_wins_over_a_stale_generat
     };
     let missing = CampaignId(Uuid::now_v7());
     assert!(matches!(
-        pause_campaign(&db.pool, missing, &change(None)).await,
+        pause_campaign(&Db::from(db.pool.clone()), missing, &change(None)).await,
         Err(ChangePhaseError::NotFound)
     ));
     assert!(matches!(
-        resume_campaign(&db.pool, missing, &change(None), true).await,
+        resume_campaign(&Db::from(db.pool.clone()), missing, &change(None), true).await,
         Err(ChangePhaseError::NotFound)
     ));
     assert!(matches!(
@@ -295,7 +299,7 @@ async fn a_missing_campaign_is_not_found_and_a_refusal_wins_over_a_stale_generat
     )
     .await?;
     assert!(matches!(
-        pause_campaign(&db.pool, paused, &change(Some(9))).await,
+        pause_campaign(&Db::from(db.pool.clone()), paused, &change(Some(9))).await,
         Err(ChangePhaseError::AlreadyPaused)
     ));
     assert_eq!(generation(&db.pool, paused).await?, 0);
@@ -439,7 +443,7 @@ async fn item_progress_leaves_the_generation_alone() -> TestResult {
     );
     let counts = item_counts(&db.pool, campaign).await?;
     assert_eq!((counts.done, counts.pending), (1, 1), "{counts:?}");
-    assert!(!pause_if_over_budget(&db.pool, campaign).await?);
+    assert!(!pause_if_over_budget(&Db::from(db.pool.clone()), campaign).await?);
     assert_eq!(generation(&db.pool, campaign).await?, 0);
     Ok(())
 }
@@ -722,7 +726,7 @@ async fn completion_and_the_budget_pause_leave_an_aborted_campaign_alone() -> Te
     assert_eq!((counts.pending, counts.in_flight, counts.failed), (0, 0, 1));
     assert!(!complete_if_drained(&db.pool, drained).await?);
     assert_eq!(item_counts(&db.pool, at_budget).await?.failed, 3);
-    assert!(!pause_if_over_budget(&db.pool, at_budget).await?);
+    assert!(!pause_if_over_budget(&Db::from(db.pool.clone()), at_budget).await?);
     for campaign in [drained, at_budget] {
         let record = get_record(&db.pool, campaign).await?.expect("exists");
         assert_eq!(record.campaign.phase, CampaignPhase::Aborted);
@@ -924,7 +928,7 @@ async fn an_abort_at_a_stale_generation_changes_nothing() -> TestResult {
     let campaign = insert_campaign(&db.pool, CampaignSeed::default()).await?;
     pending_on(&db, campaign, None, 1).await?;
     let leased = lease(&db, campaign).await?;
-    pause_campaign(&db.pool, campaign, &change(None)).await?;
+    pause_campaign(&Db::from(db.pool.clone()), campaign, &change(None)).await?;
 
     let refused = abort_campaign(&db.pool, campaign, &change(Some(0))).await;
     assert!(
@@ -1097,7 +1101,8 @@ async fn a_budget_pause_waiting_on_a_retry_counts_the_failures_after_it() -> Tes
     .rows_affected();
     assert_eq!(retried, 3, "the retry returns every failure");
 
-    let pause = pause_if_over_budget(&db.pool, campaign);
+    let pool = Db::from(db.pool.clone());
+    let pause = pause_if_over_budget(&pool, campaign);
     tokio::pin!(pause);
     tokio::select! {
         paused = &mut pause => panic!("the pause didn't wait for the retry: {paused:?}"),
