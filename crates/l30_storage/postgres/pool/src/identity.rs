@@ -13,8 +13,7 @@ use pplx_space_db_identity::DatabaseIdentity;
 use sqlx::PgPool;
 
 use super::{
-    ConnectPostgresAsError, DatabaseConnectOptionsError, DbOptions, connect_postgres_as,
-    connect_postgres_lazy_as, password_env_for_identity,
+    DatabaseConnectOptionsError, DbOptions, connect_postgres_lazy_as, password_env_for_identity,
     spawn_postgres_pool_metrics_reporter_for_identity,
 };
 
@@ -38,22 +37,6 @@ fn managed_password(
             env_var: password_env_for_identity(identity),
         },
     )
-}
-
-/// Connect a service's general-purpose pool as `space_user`.
-///
-/// Reads `SPACE_DB_USER_PASSWORD`, verifies the connection eagerly so a
-/// misconfigured deployment fails at startup rather than on the first
-/// request, and spawns the identity-tagged pool metrics reporter.
-pub async fn connect_space_user_pool(
-    database_url: &str,
-    application_name: &str,
-) -> Result<PgPool, ConnectPostgresAsError> {
-    let identity = DatabaseIdentity::SpaceUser;
-    let password = managed_database_password(identity)?;
-    let pool = connect_postgres_as(database_url, application_name, identity, &password).await?;
-    spawn_postgres_pool_metrics_reporter_for_identity(pool.clone(), identity);
-    Ok(pool)
 }
 
 /// Prepare a service's general-purpose `space_user` pool without connecting;
