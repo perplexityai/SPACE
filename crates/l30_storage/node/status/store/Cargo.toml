@@ -18,6 +18,7 @@ workspace = true
 test-support = []
 
 [dependencies]
+serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true, features = ["derive", "json", "postgres", "runtime-tokio", "time", "tls-rustls-aws-lc-rs", "uuid"] }
 thiserror = { workspace = true }
@@ -26,6 +27,7 @@ time = { workspace = true }
 # internal
 pplx-space-accounts = { workspace = true, features = ["sqlx"] }
 pplx-space-execution-spec = { workspace = true, features = ["serde"] }
+pplx-space-postgres-pool = { workspace = true }
 pplx-space-sandbox-residency = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 

@@ -10,9 +10,10 @@ use pplx_space_byte_size::MemorySize;
 use pplx_space_execution_spec::{
     DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC, DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC, VcpuCount,
 };
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_template_model::TemplateName;
-use sqlx::{PgConnection, PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -400,28 +401,27 @@ impl WarmPoolStore {
 
     /// The disk size config `id` sets, `None` for the template default or
     /// when there's no such config. Read in `tx`, so it sees the caller's
-    /// own writes.
-    pub async fn config_disk_mib(
-        tx: &mut Transaction<'_, Postgres>,
-        id: Uuid,
-    ) -> Result<Option<i32>> {
+    /// own writes. The caller must pass its open transaction.
+    pub async fn config_disk_mib<C>(tx: &mut C, id: Uuid) -> Result<Option<i32>>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         Ok(sqlx::query_scalar::<_, Option<i32>>(sql!(
             "SELECT disk_mib FROM kubernetes_pool_configs WHERE id = $1"
         ))
         .bind(id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(tx.into_sqlx())
         .await?
         .flatten())
     }
 
     /// Set config `to`'s disk I/O limits to config `from`'s. Does nothing when
     /// either config is gone. Runs in `tx`, so it reads the caller's own
-    /// writes.
-    pub async fn copy_config_disk_io_limits(
-        tx: &mut Transaction<'_, Postgres>,
-        from: Uuid,
-        to: Uuid,
-    ) -> Result<()> {
+    /// writes. The caller must pass its open transaction.
+    pub async fn copy_config_disk_io_limits<C>(tx: &mut C, from: Uuid, to: Uuid) -> Result<()>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         sqlx::query(sql!(
             "UPDATE kubernetes_pool_configs t
              SET disk_io_max_operations_per_sec = f.disk_io_max_operations_per_sec,
@@ -432,7 +432,7 @@ impl WarmPoolStore {
         ))
         .bind(from)
         .bind(to)
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?;
         Ok(())
     }
@@ -441,12 +441,15 @@ impl WarmPoolStore {
     /// and shape, taking `managed_by` ownership away from the autoscaler.
     /// Runs inside the caller's transaction: the caller resolves the
     /// template release (template-domain logic that lives with the API) and
-    /// both commit atomically.
-    pub async fn upsert_manual_config(
-        tx: &mut Transaction<'_, Postgres>,
+    /// both commit atomically. The caller must pass its open transaction.
+    pub async fn upsert_manual_config<C>(
+        tx: &mut C,
         template_release_id: Uuid,
         spec: &ManualPoolConfigSpec<'_>,
-    ) -> Result<Uuid> {
+    ) -> Result<Uuid>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         // Fenced in the store, not just the API: any persisted encryptable
         // row aborts the autoscaler's partition-scoped ON CONFLICT while the
         // legacy 3-column index is live. Lifted with the index-drop stack.
@@ -467,7 +470,7 @@ impl WarmPoolStore {
         .bind(spec.vcpu)
         .bind(spec.memory_mib)
         .bind(spec.encryptable)
-        .fetch_optional(&mut **tx)
+        .fetch_optional((&mut *tx).into_sqlx())
         .await?;
 
         let id = if let Some(existing) = existing {
@@ -492,7 +495,7 @@ impl WarmPoolStore {
             .bind(spec.namespace)
             .bind(spec.enabled)
             .bind(PoolConfigOwner::Manual.as_str())
-            .execute(&mut **tx)
+            .execute((&mut *tx).into_sqlx())
             .await?;
             existing
         } else {
@@ -525,7 +528,7 @@ impl WarmPoolStore {
                 i64::try_from(DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC)
                     .expect("default disk bandwidth fits in PostgreSQL BIGINT"),
             )
-            .fetch_one(&mut **tx)
+            .fetch_one((&mut *tx).into_sqlx())
             .await?
         };
 
@@ -548,13 +551,15 @@ impl WarmPoolStore {
     /// the twin already has for a shape is kept, so a retry copies nothing
     /// twice; an autoscaler-owned one for the shape takes the copied manual
     /// settings. Returns how many configs were copied or taken over.
-    /// Runs on the caller's connection, so the copy commits with the twin's
-    /// insert and a twin never wins resolution without its manual pools.
+    /// Pass the transaction that inserts the twin, so the copy commits with
+    /// that insert and a twin never wins resolution without its manual pools.
+    /// On a pool, or on a connection with no transaction open, the copy
+    /// commits on its own.
     pub async fn copy_manual_configs_from_releases(
-        conn: &mut PgConnection,
+        executor: impl Executor<'_>,
         originals: &[Uuid],
         twin: Uuid,
-    ) -> std::result::Result<u64, sqlx::Error> {
+    ) -> std::result::Result<u64, DbError> {
         let copied = sqlx::query(sql!(
             "INSERT INTO kubernetes_pool_configs (
                  template_release_id, vcpu, memory_mib, disk_mib, encryptable,
@@ -602,7 +607,7 @@ impl WarmPoolStore {
         .bind(originals)
         .bind(twin)
         .bind(PoolConfigOwner::Manual.as_str())
-        .execute(conn)
+        .execute(executor.into_sqlx())
         .await?;
         Ok(copied.rows_affected())
     }
@@ -610,11 +615,14 @@ impl WarmPoolStore {
     /// Disable a pool config and zero its target so the reconciler drains
     /// its open slots. `managed_by` is deliberately untouched: a disabled
     /// autoscaler-owned config stays autoscaler-owned. Returns `None` when
-    /// no config has this id.
-    pub async fn disable_config(
-        tx: &mut Transaction<'_, Postgres>,
+    /// no config has this id. The caller must pass its open transaction.
+    pub async fn disable_config<C>(
+        tx: &mut C,
         id: Uuid,
-    ) -> Result<Option<crate::DisabledPoolConfig>> {
+    ) -> Result<Option<crate::DisabledPoolConfig>>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         Ok(sqlx::query_as::<_, (Uuid, i32, i32, bool)>(sql!(
             "UPDATE kubernetes_pool_configs
              SET enabled = FALSE,
@@ -624,7 +632,7 @@ impl WarmPoolStore {
              RETURNING template_release_id, vcpu, memory_mib, encryptable"
         ))
         .bind(id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(tx.into_sqlx())
         .await?
         .map(
             |(template_release_id, vcpu, memory_mib, encryptable)| crate::DisabledPoolConfig {
@@ -638,11 +646,15 @@ impl WarmPoolStore {
 
     /// Disable `template_release_id`'s config for `config`'s shape as
     /// [`Self::disable_config`] does. Returns `false` when it has none.
-    pub async fn disable_shape_config(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn disable_shape_config<C>(
+        tx: &mut C,
         template_release_id: Uuid,
         config: &crate::DisabledPoolConfig,
-    ) -> Result<bool> {
+    ) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let result = sqlx::query(sql!(
             "UPDATE kubernetes_pool_configs
              SET enabled = FALSE,
@@ -657,7 +669,7 @@ impl WarmPoolStore {
         .bind(config.vcpu)
         .bind(config.memory_mib)
         .bind(config.encryptable)
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?;
         Ok(result.rows_affected() > 0)
     }
@@ -666,10 +678,13 @@ impl WarmPoolStore {
     /// on any of its releases, and enabled policies for its name. Runs on the
     /// caller's connection so a template delete can re-check inside the
     /// transaction that deletes the releases.
-    pub async fn template_usage(
-        conn: &mut PgConnection,
+    pub async fn template_usage<C>(
+        conn: &mut C,
         template: &TemplateName,
-    ) -> std::result::Result<TemplateWarmPoolUsage, sqlx::Error> {
+    ) -> std::result::Result<TemplateWarmPoolUsage, DbError>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let enabled_configs = sqlx::query_as::<_, WarmPoolConfigRef>(sql!(
             "SELECT c.id, c.managed_by
              FROM kubernetes_pool_configs c
@@ -679,7 +694,7 @@ impl WarmPoolStore {
              ORDER BY c.created_at, c.id"
         ))
         .bind(template.as_str())
-        .fetch_all(&mut *conn)
+        .fetch_all((&mut *conn).into_sqlx())
         .await?;
         // Only `bound` slots belong to a sandbox; a `claimed` one has no
         // sandbox row until its bind commits. Any other state counts as open,
@@ -700,7 +715,7 @@ impl WarmPoolStore {
             .bind(template.as_str())
             .bind(PoolSlotState::Bound.as_str())
             .bind(i32::try_from(TEMPLATE_USAGE_SANDBOX_ID_LIMIT).unwrap_or(i32::MAX))
-            .fetch_one(&mut *conn)
+            .fetch_one((&mut *conn).into_sqlx())
             .await?;
         let enabled_policies = sqlx::query_as::<_, WarmPoolPolicyShape>(sql!(
             "SELECT vcpu, memory_mib
@@ -710,7 +725,7 @@ impl WarmPoolStore {
              ORDER BY vcpu, memory_mib"
         ))
         .bind(template.as_str())
-        .fetch_all(&mut *conn)
+        .fetch_all((&mut *conn).into_sqlx())
         .await?;
 
         Ok(TemplateWarmPoolUsage {
@@ -729,11 +744,14 @@ impl WarmPoolStore {
     /// template must not inherit the old name's policies. Enabled rows and
     /// configs that still have slots are left for [`Self::template_usage`] to
     /// report. Takes a transaction because the lock below must be held until
-    /// the delete that follows it.
-    pub async fn delete_disabled_for_template(
-        tx: &mut Transaction<'_, Postgres>,
+    /// the delete that follows it. The caller must pass its open transaction.
+    pub async fn delete_disabled_for_template<C>(
+        tx: &mut C,
         template: &TemplateName,
-    ) -> std::result::Result<DeletedDisabledWarmPools, sqlx::Error> {
+    ) -> std::result::Result<DeletedDisabledWarmPools, DbError>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         // Lock first and look for slots in a later statement. A slot insert
         // holds its config's key-share lock until it commits, so this waits
         // for it, and the delete's fresh snapshot then sees the slot. One
@@ -748,7 +766,7 @@ impl WarmPoolStore {
              FOR UPDATE OF c"
         ))
         .bind(template.as_str())
-        .fetch_all(&mut **tx)
+        .fetch_all((&mut *tx).into_sqlx())
         .await?;
         let configs = sqlx::query(sql!(
             "DELETE FROM kubernetes_pool_configs c
@@ -761,7 +779,7 @@ impl WarmPoolStore {
                )"
         ))
         .bind(&disabled)
-        .execute(&mut **tx)
+        .execute((&mut *tx).into_sqlx())
         .await?
         .rows_affected();
         let policies = sqlx::query(sql!(
@@ -770,7 +788,7 @@ impl WarmPoolStore {
                AND NOT enabled"
         ))
         .bind(template.as_str())
-        .execute(&mut **tx)
+        .execute((&mut *tx).into_sqlx())
         .await?
         .rows_affected();
 
@@ -1351,10 +1369,11 @@ impl WarmPoolStore {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn lock_open_slot_for_delete(
-        tx: &mut Transaction<'_, Postgres>,
-        slot_id: Uuid,
-    ) -> Result<bool> {
+    /// The caller must pass its open transaction.
+    pub async fn lock_open_slot_for_delete<C>(tx: &mut C, slot_id: Uuid) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let row = sqlx::query_scalar::<_, Uuid>(sql!(
             "SELECT id
              FROM kubernetes_pool_slots
@@ -1363,16 +1382,20 @@ impl WarmPoolStore {
              FOR UPDATE SKIP LOCKED"
         ))
         .bind(slot_id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(tx.into_sqlx())
         .await?;
 
         Ok(row.is_some())
     }
 
-    pub async fn lock_open_slot_for_delete_by_reserved_sandbox_id(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn lock_open_slot_for_delete_by_reserved_sandbox_id<C>(
+        tx: &mut C,
         reserved_sandbox_id: SandboxId,
-    ) -> Result<OpenPoolSlotDeleteLock> {
+    ) -> Result<OpenPoolSlotDeleteLock>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let row = sqlx::query_as::<_, PoolSlotRow>(sql!(
             "SELECT id, config_id, template_release_id, reserved_sandbox_id, template_name,
                     content_hash, vcpu, memory_mib, disk_mib, disk_io_max_operations_per_sec,
@@ -1385,7 +1408,7 @@ impl WarmPoolStore {
              FOR UPDATE SKIP LOCKED"
         ))
         .bind(reserved_sandbox_id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional((&mut *tx).into_sqlx())
         .await?;
 
         if let Some(row) = row {
@@ -1398,7 +1421,7 @@ impl WarmPoolStore {
              WHERE reserved_sandbox_id = $1"
         ))
         .bind(reserved_sandbox_id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional((&mut *tx).into_sqlx())
         .await?;
 
         match state {
@@ -1414,31 +1437,36 @@ impl WarmPoolStore {
         }
     }
 
-    pub async fn delete_locked_open_slot(
-        tx: &mut Transaction<'_, Postgres>,
-        slot_id: Uuid,
-    ) -> Result<bool> {
+    /// The caller must pass its open transaction.
+    pub async fn delete_locked_open_slot<C>(tx: &mut C, slot_id: Uuid) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let result = sqlx::query(sql!(
             "DELETE FROM kubernetes_pool_slots
              WHERE id = $1
                AND state IN ('warming', 'ready')"
         ))
         .bind(slot_id)
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?;
 
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn claim_ready_slot(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn claim_ready_slot<C>(
+        tx: &mut C,
         template_release_id: Uuid,
         vcpu: VcpuCount,
         memory: MemorySize,
         namespace: &str,
         claim_id: Uuid,
         encryptable: bool,
-    ) -> Result<Option<ClaimedPoolSlot>> {
+    ) -> Result<Option<ClaimedPoolSlot>>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let Some(slot) = sqlx::query_as::<_, ClaimedPoolSlotRow>(sql!(
             "SELECT s.id, s.reserved_sandbox_id, s.pod_name, s.pod_namespace, s.pod_uid,
                     host(s.pod_ip) AS pod_ip, s.k8s_node_name, s.vcpu, s.memory_mib, s.disk_mib,
@@ -1482,7 +1510,7 @@ impl WarmPoolStore {
         .bind(namespace)
         .bind(encryptable)
         .bind(MAX_ROOTFS_MIB)
-        .fetch_optional(&mut **tx)
+        .fetch_optional((&mut *tx).into_sqlx())
         .await?
         else {
             return Ok(None);
@@ -1498,13 +1526,17 @@ impl WarmPoolStore {
     /// behavior; callers report the returned slot's exact shape on a hit.
     /// Oversized historical slots remain visible to operators but cannot acquire
     /// a new owner. Filter before LIMIT so they cannot starve compatible siblings.
-    pub async fn claim_ready_slot_for_release(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn claim_ready_slot_for_release<C>(
+        tx: &mut C,
         template_release_id: Uuid,
         namespace: &str,
         claim_id: Uuid,
         encryptable: bool,
-    ) -> Result<Option<ClaimedPoolSlot>> {
+    ) -> Result<Option<ClaimedPoolSlot>>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let Some(slot) = sqlx::query_as::<_, ClaimedPoolSlotRow>(sql!(
             "SELECT s.id, s.reserved_sandbox_id, s.pod_name, s.pod_namespace, s.pod_uid,
                     host(s.pod_ip) AS pod_ip, s.k8s_node_name, s.vcpu, s.memory_mib, s.disk_mib,
@@ -1537,7 +1569,7 @@ impl WarmPoolStore {
         .bind(namespace)
         .bind(encryptable)
         .bind(MAX_ROOTFS_MIB)
-        .fetch_optional(&mut **tx)
+        .fetch_optional((&mut *tx).into_sqlx())
         .await?
         else {
             return Ok(None);
@@ -1552,13 +1584,17 @@ impl WarmPoolStore {
     /// explicit request resolves only its exact enabled config; a default
     /// request resolves the preferred configured pool after the any-shape
     /// ready-slot claim path has exhausted available warm capacity.
-    pub async fn preferred_enabled_shape_for_release(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn preferred_enabled_shape_for_release<C>(
+        tx: &mut C,
         template_release_id: Uuid,
         namespace: &str,
         requested_shape: Option<(VcpuCount, MemorySize)>,
         encryptable: bool,
-    ) -> Result<Option<crate::PoolAssignment>> {
+    ) -> Result<Option<crate::PoolAssignment>>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         if let Some((vcpu, memory)) = requested_shape {
             let row = sqlx::query_as::<_, (Option<i32>, i64, i64)>(sql!(
                 "SELECT disk_mib, disk_io_max_operations_per_sec,
@@ -1577,7 +1613,7 @@ impl WarmPoolStore {
             .bind(vcpu_to_i32(vcpu))
             .bind(memory_to_mib_i32(memory))
             .bind(encryptable)
-            .fetch_optional(&mut **tx)
+            .fetch_optional((&mut *tx).into_sqlx())
             .await?;
             return row
                 .map(|(disk_mib, operations, bandwidth)| {
@@ -1605,7 +1641,7 @@ impl WarmPoolStore {
         .bind(template_release_id)
         .bind(namespace)
         .bind(encryptable)
-        .fetch_optional(&mut **tx)
+        .fetch_optional((&mut *tx).into_sqlx())
         .await?;
 
         row.map(pool_assignment_from_shape_row).transpose()
@@ -1675,11 +1711,10 @@ impl WarmPoolStore {
         row.map(pool_assignment_from_shape_row).transpose()
     }
 
-    async fn mark_slot_claimed(
-        tx: &mut Transaction<'_, Postgres>,
-        slot_id: Uuid,
-        claim_id: Uuid,
-    ) -> Result<()> {
+    async fn mark_slot_claimed<C>(tx: &mut C, slot_id: Uuid, claim_id: Uuid) -> Result<()>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let claimed_state = PoolSlotState::Ready.claim()?;
         sqlx::query(sql!(
             "UPDATE kubernetes_pool_slots
@@ -1689,7 +1724,7 @@ impl WarmPoolStore {
         .bind(claimed_state.as_str())
         .bind(claim_id)
         .bind(slot_id)
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?;
 
         Ok(())
@@ -1702,11 +1737,15 @@ impl WarmPoolStore {
     /// as a dead handoff. The claim-id and state guards make this a CAS:
     /// `false` means the slot was already reaped, invalidated, or re-claimed,
     /// and the caller must abort the bind.
-    pub async fn bind_claimed_slot(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn bind_claimed_slot<C>(
+        tx: &mut C,
         claim_id: Uuid,
         reserved_sandbox_id: SandboxId,
-    ) -> Result<bool> {
+    ) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let bound_state = PoolSlotState::Claimed.bind()?;
         let result = sqlx::query(
             "UPDATE kubernetes_pool_slots
@@ -1720,7 +1759,7 @@ impl WarmPoolStore {
         .bind(claim_id)
         .bind(reserved_sandbox_id)
         .bind(PoolSlotState::Claimed.as_str())
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?;
 
         Ok(result.rows_affected() == 1)
@@ -1735,11 +1774,15 @@ impl WarmPoolStore {
     /// the caller must abort the bind. Runs after [`Self::bind_claimed_slot`],
     /// whose CAS already row-locks the slot; the `FOR UPDATE` here keeps the
     /// read self-sufficiently locked if callers ever reorder.
-    pub async fn bind_source(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn bind_source<C>(
+        tx: &mut C,
         claim_id: Uuid,
         reserved_sandbox_id: SandboxId,
-    ) -> Result<Option<ClaimedSlotBindSource>> {
+    ) -> Result<Option<ClaimedSlotBindSource>>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let source = sqlx::query_as::<_, ClaimedSlotBindSource>(sql!(
             "SELECT pod_name, pod_namespace, NULLIF(BTRIM(pod_uid), '') AS pod_uid,
                     host(pod_ip) AS pod_ip, k8s_node_name
@@ -1750,7 +1793,7 @@ impl WarmPoolStore {
         ))
         .bind(claim_id)
         .bind(reserved_sandbox_id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(tx.into_sqlx())
         .await?;
 
         Ok(source)
@@ -1765,10 +1808,14 @@ impl WarmPoolStore {
     /// this ID. `reserved_sandbox_id` is unique, so this is at most one row.
     /// The `FOR UPDATE` lock (no `SKIP LOCKED`) waits out a concurrent sweep
     /// or bind instead of misreading a locked row as absent.
-    pub async fn lock_reserved_slot(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn lock_reserved_slot<C>(
+        tx: &mut C,
         reserved_sandbox_id: SandboxId,
-    ) -> Result<Option<ReservedPoolSlot>> {
+    ) -> Result<Option<ReservedPoolSlot>>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let row = sqlx::query_as::<_, ReservedPoolSlotRow>(sql!(
             "SELECT id, reserved_sandbox_id, vcpu, memory_mib, disk_mib,
                     disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec,
@@ -1779,7 +1826,7 @@ impl WarmPoolStore {
              FOR UPDATE"
         ))
         .bind(reserved_sandbox_id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(tx.into_sqlx())
         .await?;
 
         row.map(TryInto::try_into).transpose()
@@ -1791,10 +1838,11 @@ impl WarmPoolStore {
     /// claim timeout passes. Used when a create owns the slot's reserved ID
     /// but will not adopt the slot, so no other create may bind that ID.
     /// `false` means the slot was not `ready`.
-    pub async fn fence_ready_slot(
-        tx: &mut Transaction<'_, Postgres>,
-        slot_id: Uuid,
-    ) -> Result<bool> {
+    /// The caller must pass its open transaction.
+    pub async fn fence_ready_slot<C>(tx: &mut C, slot_id: Uuid) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let claimed_state = PoolSlotState::Ready.claim()?;
         let result = sqlx::query(sql!(
             "UPDATE kubernetes_pool_slots
@@ -1805,7 +1853,7 @@ impl WarmPoolStore {
         .bind(claimed_state.as_str())
         .bind(slot_id)
         .bind(PoolSlotState::Ready.as_str())
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?;
 
         Ok(result.rows_affected() == 1)
@@ -1919,11 +1967,15 @@ impl WarmPoolStore {
 
     /// Transactional form of [`Self::invalidate_claimed_slot`], for a caller
     /// that already holds the slot's row lock.
-    pub async fn invalidate_claimed_slot_in(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn invalidate_claimed_slot_in<C>(
+        tx: &mut C,
         claim_id: Uuid,
         reserved_sandbox_id: SandboxId,
-    ) -> Result<bool> {
+    ) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let result = sqlx::query(sql!(
             "UPDATE kubernetes_pool_slots
              SET claim_id = NULL,
@@ -1935,7 +1987,7 @@ impl WarmPoolStore {
         .bind(claim_id)
         .bind(reserved_sandbox_id)
         .bind(PoolSlotState::Claimed.as_str())
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?;
 
         Ok(result.rows_affected() > 0)
@@ -1994,11 +2046,15 @@ impl WarmPoolStore {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
-    pub async fn mark_claimed_slot_cleanup_pending(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn mark_claimed_slot_cleanup_pending<C>(
+        tx: &mut C,
         claim_id: Uuid,
         reserved_sandbox_id: SandboxId,
-    ) -> Result<bool> {
+    ) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let cleanup_pending_state = PoolSlotState::Bound.cleanup_pending()?;
         let result = sqlx::query(sql!(
             "UPDATE kubernetes_pool_slots
@@ -2013,7 +2069,7 @@ impl WarmPoolStore {
         .bind(reserved_sandbox_id)
         .bind(PoolSlotState::Bound.as_str())
         .bind(PoolSlotState::Claimed.as_str())
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?;
 
         Ok(result.rows_affected() == 1)
@@ -2168,7 +2224,8 @@ impl WarmPoolStore {
         reserved_sandbox_id: SandboxId,
     ) -> Result<bool> {
         let deleted =
-            Self::delete_claimed_slots_for_retired_executions(tx, &[reserved_sandbox_id]).await?;
+            Self::delete_claimed_slots_for_retired_executions(&mut **tx, &[reserved_sandbox_id])
+                .await?;
 
         Ok(deleted > 0)
     }
@@ -2178,15 +2235,18 @@ impl WarmPoolStore {
     /// sandboxes) at once. `reserved_sandbox_id` is unique per slot and ids
     /// without a receipt row are no-ops, so callers pass every finalized
     /// sandbox id without checking whether the sandbox was pool-claimed.
-    /// Returns the number of receipts deleted.
+    /// Returns the number of receipts deleted. Pass the transaction that
+    /// retires those pods or deletes those sandboxes, so the receipts go with
+    /// it; on a pool, or on a connection with no transaction open, the delete
+    /// commits on its own.
     ///
-    /// Returns the raw [`sqlx::Error`] (this verb performs exactly one
-    /// statement) so `sqlx::Error`-boundary callers such as the shared
-    /// sandbox-delete transaction compose without an error-type detour.
+    /// Returns [`DbError`] rather than [`PoolError`] (this verb performs
+    /// exactly one statement), so a caller whose error type is `sqlx::Error`,
+    /// such as the shared sandbox-delete transaction, converts it with `?`.
     pub async fn delete_claimed_slots_for_retired_executions(
-        conn: &mut PgConnection,
+        executor: impl Executor<'_>,
         reserved_sandbox_ids: &[SandboxId],
-    ) -> std::result::Result<u64, sqlx::Error> {
+    ) -> std::result::Result<u64, DbError> {
         if reserved_sandbox_ids.is_empty() {
             return Ok(0);
         }
@@ -2202,7 +2262,7 @@ impl WarmPoolStore {
         .bind(ids)
         .bind(PoolSlotState::Bound.as_str())
         .bind(PoolSlotState::Claimed.as_str())
-        .execute(conn)
+        .execute(executor.into_sqlx())
         .await?;
 
         Ok(result.rows_affected())
@@ -2385,25 +2445,30 @@ impl WarmPoolStore {
         .await?)
     }
 
-    pub async fn lock_stale_unbound_claimed_slot_for_delete(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn lock_stale_unbound_claimed_slot_for_delete<C>(
+        tx: &mut C,
         slot_id: Uuid,
         older_than: Duration,
-    ) -> Result<bool> {
+    ) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let older_than_secs = i64::try_from(older_than.as_secs()).unwrap_or(i64::MAX);
         let row = sqlx::query_scalar::<_, Uuid>(STALE_UNBOUND_CLAIMED_SLOT_BY_ID_FOR_UPDATE_SQL)
             .bind(slot_id)
             .bind(older_than_secs)
-            .fetch_optional(&mut **tx)
+            .fetch_optional(tx.into_sqlx())
             .await?;
 
         Ok(row.is_some())
     }
 
-    pub async fn lock_cleanup_pending_slot_for_delete(
-        tx: &mut Transaction<'_, Postgres>,
-        slot_id: Uuid,
-    ) -> Result<bool> {
+    /// The caller must pass its open transaction.
+    pub async fn lock_cleanup_pending_slot_for_delete<C>(tx: &mut C, slot_id: Uuid) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let row = sqlx::query_scalar::<_, Uuid>(sql!(
             "SELECT id
              FROM kubernetes_pool_slots
@@ -2412,39 +2477,41 @@ impl WarmPoolStore {
              FOR UPDATE SKIP LOCKED"
         ))
         .bind(slot_id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(tx.into_sqlx())
         .await?;
 
         Ok(row.is_some())
     }
 
-    pub async fn delete_locked_claimed_slot(
-        tx: &mut Transaction<'_, Postgres>,
-        slot_id: Uuid,
-    ) -> Result<bool> {
+    /// The caller must pass its open transaction.
+    pub async fn delete_locked_claimed_slot<C>(tx: &mut C, slot_id: Uuid) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let result = sqlx::query(sql!(
             "DELETE FROM kubernetes_pool_slots
              WHERE id = $1
                AND state = 'claimed'"
         ))
         .bind(slot_id)
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?;
 
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn delete_locked_cleanup_pending_slot(
-        tx: &mut Transaction<'_, Postgres>,
-        slot_id: Uuid,
-    ) -> Result<bool> {
+    /// The caller must pass its open transaction.
+    pub async fn delete_locked_cleanup_pending_slot<C>(tx: &mut C, slot_id: Uuid) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let result = sqlx::query(sql!(
             "DELETE FROM kubernetes_pool_slots
              WHERE id = $1
                AND state = 'cleanup_pending'"
         ))
         .bind(slot_id)
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?;
 
         Ok(result.rows_affected() > 0)

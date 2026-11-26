@@ -436,7 +436,7 @@ pub(crate) async fn mark_template_deleted(
     if let Some(in_use) = TemplateInUse::check(&mut tx, template).await? {
         return Ok(MarkTemplateDeleted::InUse(in_use));
     }
-    let retired = WarmPoolStore::delete_disabled_for_template(&mut tx, template).await?;
+    let retired = WarmPoolStore::delete_disabled_for_template(&mut *tx, template).await?;
     if retired != Default::default() {
         tracing::info!(
             template = template.as_str(),

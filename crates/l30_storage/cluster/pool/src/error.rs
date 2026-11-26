@@ -39,4 +39,13 @@ pub enum PoolError {
     Sql(#[from] sqlx::Error),
 }
 
+/// Transition scaffolding: keeps a database error in `PoolError::Sql` while
+/// that variant holds the driver's error. Delete it when `Sql` holds a
+/// `DbError`.
+impl From<pplx_space_postgres_pool::DbError> for PoolError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 pub type Result<T> = std::result::Result<T, PoolError>;

@@ -3,6 +3,7 @@
 //! a short window passes.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 
 /// Insert or update `node_id`'s snapshot after a create on it failed: observed
@@ -16,13 +17,13 @@ use pplx_space_sql_locator::sql;
 /// and, after a reachable failure, no health. Writes nothing when the node
 /// isn't registered.
 pub async fn record_create_failure(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     reachable: bool,
     reason: &str,
     stale_after_secs: i64,
     scheduling_status: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "INSERT INTO node_status_snapshots (
              node_id,
@@ -74,7 +75,7 @@ pub async fn record_create_failure(
     .bind(reason)
     .bind(stale_after_secs)
     .bind(scheduling_status)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }

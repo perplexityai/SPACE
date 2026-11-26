@@ -90,7 +90,10 @@ pub async fn list_warm_pool_policies(
         return err.into_response();
     }
 
-    match pplx_space_cluster_pool::fc_warm_pool_policies(&state.pool).await {
+    match pplx_space_cluster_pool::fc_warm_pool_policies(&state.pool)
+        .await
+        .map_err(sqlx::Error::from)
+    {
         Ok(policies) => Json(
             policies
                 .into_iter()
@@ -199,6 +202,7 @@ async fn store_policy(
         },
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 fn validate_policy_request(

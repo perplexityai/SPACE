@@ -124,7 +124,7 @@ pub async fn delete_with_dependents(
     // the verb leaves open (`warming`/`ready`) and `cleanup_pending` slots
     // alone.
     pplx_space_cluster_pool::WarmPoolStore::delete_claimed_slots_for_retired_executions(
-        tx,
+        &mut **tx,
         &[sandbox_id],
     )
     .await?;

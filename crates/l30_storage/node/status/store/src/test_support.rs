@@ -1,8 +1,8 @@
 //! Seeding `node_status_snapshots` rows for tests.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::PgPool;
 
 /// A node status snapshot to seed, relative to the database clock. The
 /// default is reachable, fresh for another minute and observed now, with a
@@ -35,10 +35,10 @@ impl Default for SnapshotSeed {
 
 /// Insert or replace `node`'s snapshot as `seed` describes.
 pub async fn upsert_snapshot(
-    pool: &PgPool,
+    executor: impl Executor<'_>,
     node: NodeId,
     seed: SnapshotSeed,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "INSERT INTO node_status_snapshots (
              node_id, observed_at, stale_after, reachable, services, updated_at,
@@ -69,7 +69,7 @@ pub async fn upsert_snapshot(
     .bind(seed.reachable)
     .bind(seed.inventory)
     .bind(seed.environment_refs_secs_ago)
-    .execute(pool)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
