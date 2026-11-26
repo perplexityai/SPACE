@@ -103,6 +103,32 @@ max-threads = 2
 filter = 'package(pplx-space-api) and test(/^routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::/)'
 test-group = "state-render"
 
+# Plan tests that seed production-scale fixtures, tens of thousands of rows,
+# on the run's shared Postgres server. nextest starts a binary's tests
+# together, so each binary's bulk inserts arrived at once: single inserts then
+# took 1 to 9 s, and every other test on the server slowed with them. At most
+# two run at once, and they start first, so that waiting for the group does
+# not lengthen the run's tail. Each still has its own exception in
+# ci/test-duration-budget.toml; delete it once its test stays under the limit.
+[test-groups.postgres-bulk-fixtures]
+max-threads = 2
+
+[[profile.default.overrides]]
+filter = '''
+(package(pplx-space-api) and test(=public_operations::inline_org_limit_plan_tests::the_count_reads_only_the_orgs_running_operations))
+or (package(pplx-space-api) and test(=public_operations::sandbox_quota::plan_tests::the_count_reads_only_the_orgs_rows_and_in_flight_operations))
+or (package(pplx-space-api) and test(=routes::admin::node_store::single_node_occupancy::tests::fleet_matches_legacy_occupancy_and_blockers))
+or (package(pplx-space-api) and test(=routes::admin::node_store::single_node_occupancy::tests::postgres_fleet_occupancy_bounds_history_across_cached_plans))
+or (package(pplx-space-api) and test(=routes::admin::node_store::single_node_occupancy::tests::single_matches_batched_durability_upload_and_residency_semantics))
+or (package(pplx-space-sandbox-store) and test(/^admin_occupancy::pinned_local_only_plan_tests::/))
+or (package(pplx-space-sandbox-store) and test(=node_local_backup_pending::tests::the_delete_guard_resolves_through_indexes_not_a_history_scan))
+or (package(pplx-space-sandbox-store) and test(=stuck::tests::census_reads_a_lifecycle_index_not_the_table))
+or (package(pplx-space-snapshot-retention) and test(=tests::postgres::benchmark_postgres_reconciler_current_and_week_policy))
+or (package(pplx-space-snapshot-store) and test(=claimed::tests::claimed_recovery_reads_claims_not_the_table_under_stale_statistics))
+'''
+test-group = "postgres-bulk-fixtures"
+priority = 10
+
 [[profile.default.overrides]]
 # Shared btrfs tests receive a disposable filesystem from the privileged CI
 # wrapper. Other opt-in tests keep their separate activation requirements.
