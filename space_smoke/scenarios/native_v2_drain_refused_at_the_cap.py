@@ -30,7 +30,7 @@ HOLD_SECONDS = 60 * 60
     substrates=("kubernetes",),
     timeout_minutes=45,
     tier="manual",
-    manual_reason="two public API rollouts, two re-registered workers and a full drain, too slow for the per-merge set",
+    manual_reason="kept manual until it has several consecutive clean runs on Kind, after which it can return to the per-merge set",
 )
 def v2_drain_refused_at_the_cap(test: smoke.CommandSandboxFixture) -> None:
     """With at most one v2 drain evacuating, a `:drain` of a worker while

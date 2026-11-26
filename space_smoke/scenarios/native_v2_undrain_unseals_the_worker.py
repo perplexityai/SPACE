@@ -24,7 +24,7 @@ HOLD_SECONDS = 60 * 60
     substrates=("kubernetes",),
     timeout_minutes=30,
     tier="manual",
-    manual_reason="cuts a worker's node-api for a minute and a half, too slow for the per-merge set",
+    manual_reason="kept manual until it has several consecutive clean runs on Kind, after which it can return to the per-merge set",
 )
 def v2_undrain_unseals_the_worker(test: smoke.CommandSandboxFixture) -> None:
     """A v2 `:drain` with a hold seals the worker, and the controller stores

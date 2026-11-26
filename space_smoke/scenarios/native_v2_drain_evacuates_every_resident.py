@@ -30,7 +30,7 @@ PATH = "/tmp/space-smoke-v2-drain.txt"
     # slow KVM bench.
     timeout_minutes=45,
     tier="manual",
-    manual_reason="three suspends, uploads and wakes, minutes of work too slow for the per-merge set",
+    manual_reason="kept manual until it has several consecutive clean runs on Kind, after which it can return to the per-merge set",
 )
 def v2_drain_evacuates_every_resident(test: smoke.CommandSandboxFixture) -> None:
     """A v2 `:drain`, due now, of a worker holding two started sandboxes (one
