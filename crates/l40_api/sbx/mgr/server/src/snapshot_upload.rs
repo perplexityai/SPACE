@@ -532,6 +532,14 @@ pub struct SnapshotUploadJobs {
     /// [`UploadFailureScope::Attempt`].
     #[serde(default, skip_serializing_if = "UploadFailureScope::is_attempt")]
     pub failure_scope: UploadFailureScope,
+    /// The worker ended this upload because a later publication superseded
+    /// its artifact. Written only by the statement that ends the job
+    /// (`end_unsubmitted_upload_job` in the store), so it is durable with that
+    /// end, for a handoff that registers the attempt afterwards. A payload
+    /// persisted before this field existed, or of a job that ended any other
+    /// way, reads as `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub superseded: bool,
 }
 
 /// What a permanently failed upload failed: the attempt, or the artifact.
@@ -1093,6 +1101,7 @@ pub(crate) fn prepare_suspend_snapshot(
         execution_generation: None,
         execution_generation_names_capture: false,
         failure_scope: UploadFailureScope::Attempt,
+        superseded: false,
     })
 }
 

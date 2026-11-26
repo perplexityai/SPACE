@@ -826,6 +826,7 @@ fn new_payload_round_trips_metadata_job_flag() {
         execution_generation: None,
         execution_generation_names_capture: false,
         failure_scope: Default::default(),
+        superseded: false,
     };
     let round: SnapshotUploadJobs =
         serde_json::from_str(&serde_json::to_string(&jobs).unwrap()).unwrap();
@@ -851,6 +852,7 @@ fn payload_round_trips_execution_generation() {
         execution_generation: Some(generation),
         execution_generation_names_capture: false,
         failure_scope: Default::default(),
+        superseded: false,
     };
     let encoded = serde_json::to_value(&jobs).unwrap();
     let round: SnapshotUploadJobs = serde_json::from_value(encoded.clone()).unwrap();
@@ -887,6 +889,7 @@ fn cleanup_metadata_staging_dir_removes_only_owned_staging_dir() {
         execution_generation: None,
         execution_generation_names_capture: false,
         failure_scope: Default::default(),
+        superseded: false,
     };
 
     cleanup_metadata_staging_dir(&jobs);

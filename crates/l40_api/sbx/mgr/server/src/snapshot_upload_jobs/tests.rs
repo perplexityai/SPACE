@@ -891,6 +891,7 @@ pub(crate) fn reclaim_fixture_payload(
         execution_generation: None,
         execution_generation_names_capture: false,
         failure_scope: Default::default(),
+        superseded: false,
     }
 }
 

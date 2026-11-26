@@ -66,12 +66,15 @@ pub enum UnsubmittedUploadEnd {
 }
 
 /// Fail a running snapshot-upload job permanently with `error`, as the worker
-/// records a permanent failure, but only while its payload names no transfer.
-/// One statement, so a handoff that persists transfer IDs into the payload,
-/// which requires a pending or running job, either did so first and keeps the
-/// job, or finds it ended. A payload that isn't JSON is left alone; `CASE`
-/// keeps `json_array_length` off it, as SQLite needn't short-circuit `AND`.
-/// A job this leaves alone is read back under the same connection.
+/// records a permanent failure, but only while its payload names no transfer,
+/// and mark its payload `superseded`, which the worker ends a job this way
+/// for. One statement, so a handoff that persists transfer IDs into the
+/// payload, which requires a pending or running job, either did so first and
+/// keeps the job, or finds it ended, and one that registers the attempt
+/// afterwards finds the mark with the end. A payload that isn't JSON is left
+/// alone; `CASE` keeps `json_array_length` off it, as SQLite needn't
+/// short-circuit `AND`. A job this leaves alone is read back under the same
+/// connection.
 pub fn end_unsubmitted_upload_job(
     conn: &Connection,
     job_id: &JobId,
@@ -80,7 +83,8 @@ pub fn end_unsubmitted_upload_job(
     let changed = conn.execute(
         "UPDATE jobs
          SET status = 'failed', error_kind = ?3, error = ?4, failure_reason = NULL,
-             completed_at = datetime('now')
+             completed_at = datetime('now'),
+             payload = json_set(payload, '$.superseded', json('true'))
          WHERE job_id = ?1 AND kind = ?2 AND status = 'running'
            AND CASE WHEN json_valid(payload)
                     THEN json_array_length(payload, '$.job_ids') END IS 0",

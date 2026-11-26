@@ -751,15 +751,22 @@ impl SandboxManagerService {
                 return;
             }
         };
-        let ended_unsubmitted = job.failure.map(crate::db::jobs::JobFailure::kind)
-            == Some(crate::db::jobs::JobFailureKind::Permanent)
-            && job
-                .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
-                .is_ok_and(|persisted| persisted.job_ids.is_empty());
-        // A replaced artifact never comes back to its directory, so the
-        // directory still shows the supersession the worker ended it for.
-        if ended_unsubmitted
-            && crate::snapshot_upload::check_prepared_artifact_identity(payload).is_err()
+        let Ok(persisted) = job.payload_as::<crate::snapshot_upload::SnapshotUploadJobs>() else {
+            return;
+        };
+        if job.failure.map(crate::db::jobs::JobFailure::kind)
+            != Some(crate::db::jobs::JobFailureKind::Permanent)
+            || !persisted.job_ids.is_empty()
+        {
+            return;
+        }
+        // The worker's end marks the job superseded in the same statement.
+        // Only a job without the mark, one an older version ended, or one
+        // ended another way, falls back to the directory: a replaced artifact
+        // never comes back to it, but a sidecar gone or unreadable since
+        // proves nothing.
+        if persisted.superseded
+            || crate::snapshot_upload::check_prepared_artifact_identity(payload).is_err()
         {
             crate::snapshot_upload_jobs::finalize_superseded_upload_failed(payload).await;
         }

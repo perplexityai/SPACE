@@ -344,21 +344,32 @@ const UNAVAILABLE_BEGINS: usize = 2;
 const LATE_REGISTERING_SANDBOX: uuid::Uuid =
     uuid::Uuid::from_u128(0x019f_8000_0000_7000_8000_0000_0000_0b10);
 
+/// A sandbox registered as [`LATE_REGISTERING_SANDBOX`] is, except that a
+/// held registration also waits until the test has touched the attempt
+/// (`TouchArtifactBackup`), so the test can change the artifact's directory
+/// after the finalize and before the registration lands. Nothing else touches
+/// an attempt that never registered.
+const TOUCH_RELEASED_SANDBOX: uuid::Uuid =
+    uuid::Uuid::from_u128(0x019f_8000_0000_7000_8000_0000_0000_0b11);
+
 /// A control plane that admits every artifact backup but [`REFUSED_SANDBOX`]'s
-/// and the first ones of [`RECOVERING_SANDBOX`], [`UNAVAILABLE_SANDBOX`] and
-/// [`LATE_REGISTERING_SANDBOX`], finalizes every attempt it registered,
-/// answering a finalize of any other `NotFound`, as the control plane does,
-/// and has no ready backup of any artifact. It records every registration it
-/// is asked for and every finalize.
+/// and the first ones of [`RECOVERING_SANDBOX`], [`UNAVAILABLE_SANDBOX`],
+/// [`LATE_REGISTERING_SANDBOX`] and [`TOUCH_RELEASED_SANDBOX`], finalizes
+/// every attempt it registered, answering a finalize of any other `NotFound`,
+/// as the control plane does, and has no ready backup of any artifact. It
+/// records every registration it is asked for and every finalize.
 #[derive(Clone, Default)]
 struct BackupControlPlane {
     recovering_begins: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     unavailable_begins: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     late_registering_begins: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    touch_released_begins: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// The backup attempts it registered.
     registered: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// The backup attempts the node finalized, registered or not.
     finalized: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// The backup attempts the node touched.
+    touched: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl BackupControlPlane {
@@ -386,23 +397,31 @@ impl BackupControlPlane {
         {
             return Err(Status::not_found("source node is not registered"));
         }
-        if sandbox_id == Some(LATE_REGISTERING_SANDBOX) && !request.fence_verdict_only {
-            if self.late_registering_begins.fetch_add(1, SeqCst) < UNAVAILABLE_BEGINS {
+        let late = match sandbox_id {
+            Some(LATE_REGISTERING_SANDBOX) => Some((&self.late_registering_begins, false)),
+            Some(TOUCH_RELEASED_SANDBOX) => Some((&self.touch_released_begins, true)),
+            _ => None,
+        };
+        if let Some((begins, after_touch)) = late
+            && !request.fence_verdict_only
+        {
+            if begins.fetch_add(1, SeqCst) < UNAVAILABLE_BEGINS {
                 return Err(Status::unavailable("cluster-api is restarting"));
             }
-            let finalized = || {
-                self.finalized
+            let has = |attempts: &std::sync::Mutex<std::collections::HashSet<String>>| {
+                attempts
                     .lock()
                     .unwrap()
                     .contains(&request.backup_attempt_id)
             };
+            let released = || has(&self.finalized) && (!after_touch || has(&self.touched));
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                while !finalized() {
+                while !released() {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             })
             .await
-            .map_err(|_| Status::deadline_exceeded("the node never finalized the attempt"))?;
+            .map_err(|_| Status::deadline_exceeded("the attempt was never released"))?;
         }
         if !request.fence_verdict_only {
             self.registered
@@ -466,17 +485,19 @@ where
                     answer(
                         request,
                         move |request: api::FinalizeArtifactBackupRequest| {
-                            plane
-                                .finalized
-                                .lock()
-                                .unwrap()
-                                .insert(request.backup_attempt_id.clone());
                             let known = plane
                                 .registered
                                 .lock()
                                 .unwrap()
                                 .contains(&request.backup_attempt_id);
                             super::retired_teardown_tests::record_finalized_backup(&request, known);
+                            // Last: a registration held until this finalize
+                            // must not land before `known` is read.
+                            plane
+                                .finalized
+                                .lock()
+                                .unwrap()
+                                .insert(request.backup_attempt_id.clone());
                             if !known {
                                 return Err(Status::not_found(format!(
                                     "snapshot {} not found",
@@ -489,7 +510,12 @@ where
                     .await
                 }
                 "TouchArtifactBackup" => {
-                    answer(request, |_: api::TouchArtifactBackupRequest| {
+                    answer(request, move |request: api::TouchArtifactBackupRequest| {
+                        plane
+                            .touched
+                            .lock()
+                            .unwrap()
+                            .insert(request.backup_attempt_id);
                         Ok(api::TouchArtifactBackupResponse::default())
                     })
                     .await
@@ -1466,6 +1492,9 @@ enum Publication {
     /// it before the upload's next attempt ends it, and registers it after
     /// that attempt's finalize found no row.
     BeforeALateHandoffRegisters,
+    /// As [`Self::BeforeALateHandoffRegisters`], with the canonical sidecar
+    /// gone after that finalize and before the handoff registers.
+    BeforeALateHandoffRegistersOverAGoneSidecar,
     /// Before the upload submitted anything: vol-mgr refused the handoff's
     /// pushes and the upload's first attempt.
     BeforePushes,
@@ -1485,8 +1514,10 @@ enum Publication {
 /// pushes, which carry another capture's files. One that never registered
 /// doesn't register now, and its finalize finds no row; a handoff that
 /// registers it after that finalize still fails, and finalizes the row it
-/// registered failed as the attempt would have. One whose transfers were
-/// already staged keeps their bytes and completes on its next attempt.
+/// registered failed as the attempt would have, from the job's own record of
+/// its supersession, even once the directory's sidecar is gone. One whose
+/// transfers were already staged keeps their bytes and completes on its next
+/// attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were_staged() {
     use super::retired_teardown_tests::{
@@ -1500,6 +1531,7 @@ async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were
             let volume_manager = FakeVolumeManager::serve(match publication {
                 Publication::BeforeRegistering
                 | Publication::BeforeALateHandoffRegisters
+                | Publication::BeforeALateHandoffRegistersOverAGoneSidecar
                 | Publication::BeforePushes
                 | Publication::AtFirstPush => Transfers::Refused,
                 Publication::AfterStaging => Transfers::Running,
@@ -1509,6 +1541,9 @@ async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were
                 Publication::BeforeRegistering => SandboxId::from_uuid(UNAVAILABLE_SANDBOX),
                 Publication::BeforeALateHandoffRegisters => {
                     SandboxId::from_uuid(LATE_REGISTERING_SANDBOX)
+                }
+                Publication::BeforeALateHandoffRegistersOverAGoneSidecar => {
+                    SandboxId::from_uuid(TOUCH_RELEASED_SANDBOX)
                 }
                 _ => SandboxId::new(),
             };
@@ -1527,7 +1562,9 @@ async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were
             )
             .await;
             match publication {
-                Publication::BeforeRegistering | Publication::BeforeALateHandoffRegisters => {
+                Publication::BeforeRegistering
+                | Publication::BeforeALateHandoffRegisters
+                | Publication::BeforeALateHandoffRegistersOverAGoneSidecar => {
                     handoff.expect_err("the control plane is unavailable to the registration");
                 }
                 Publication::BeforePushes | Publication::AtFirstPush => {
@@ -1553,6 +1590,7 @@ async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were
                 }
                 Publication::BeforeRegistering
                 | Publication::BeforeALateHandoffRegisters
+                | Publication::BeforeALateHandoffRegistersOverAGoneSidecar
                 | Publication::BeforePushes
                 | Publication::AfterStaging => {
                     publish_newer_capture(&snapshot_dir, &id);
@@ -1567,7 +1605,8 @@ async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were
                     .count()
             };
             match publication {
-                Publication::BeforeALateHandoffRegisters => {
+                Publication::BeforeALateHandoffRegisters
+                | Publication::BeforeALateHandoffRegistersOverAGoneSidecar => {
                     let (late_handoff, ()) = futures_util::future::join(
                         service.establish_restore_visible_artifact_backup(&upload),
                         async {
@@ -1581,6 +1620,39 @@ async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were
                             .await
                             .expect("the handoff asks to register");
                             release_retry(&service, &upload);
+                            if matches!(
+                                publication,
+                                Publication::BeforeALateHandoffRegistersOverAGoneSidecar
+                            ) {
+                                // The attempt's finalize finds no row; then
+                                // the sidecar goes, and the registration lands.
+                                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                                    while !finalized_backups().iter().any(|finalized| {
+                                        finalized.backup_attempt_id == attempt
+                                            && !finalized.registered
+                                    }) {
+                                        tokio::time::sleep(std::time::Duration::from_millis(10))
+                                            .await;
+                                    }
+                                })
+                                .await
+                                .expect("the attempt finalizes its unregistered row");
+                                std::fs::remove_file(
+                                    snapshot_dir
+                                        .join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME),
+                                )
+                                .unwrap();
+                                pplx_space_node_api_client::cluster::connect_from_env()
+                                    .await
+                                    .unwrap()
+                                    .touch_artifact_backup(
+                                        pplx_space_node_api_client::proto::TouchArtifactBackupRequest {
+                                            backup_attempt_id: attempt.clone(),
+                                        },
+                                    )
+                                    .await
+                                    .unwrap();
+                            }
                         },
                     )
                     .await;
@@ -1598,11 +1670,17 @@ async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were
                 .unwrap();
 
             assert_eq!(ended.attempts, 2, "{publication:?}: {ended:?}");
+            let marked_superseded = ended
+                .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+                .unwrap()
+                .superseded;
             match publication {
                 Publication::BeforeRegistering
                 | Publication::BeforeALateHandoffRegisters
+                | Publication::BeforeALateHandoffRegistersOverAGoneSidecar
                 | Publication::BeforePushes
                 | Publication::AtFirstPush => {
+                    assert!(marked_superseded, "{publication:?}: {ended:?}");
                     assert_eq!(
                         ended.status,
                         JobStatus::Failed.as_str(),
@@ -1614,6 +1692,7 @@ async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were
                     );
                 }
                 Publication::AfterStaging => {
+                    assert!(!marked_superseded, "{publication:?}: {ended:?}");
                     assert_eq!(
                         ended.status,
                         JobStatus::Completed.as_str(),
@@ -1635,7 +1714,8 @@ async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were
                     UNAVAILABLE_BEGINS,
                     "the superseded upload's retry registers nothing"
                 ),
-                Publication::BeforeALateHandoffRegisters => assert_eq!(
+                Publication::BeforeALateHandoffRegisters
+                | Publication::BeforeALateHandoffRegistersOverAGoneSidecar => assert_eq!(
                     begun(),
                     UNAVAILABLE_BEGINS + 1,
                     "only the late handoff registers"
@@ -1647,12 +1727,16 @@ async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were
             super::retired_teardown_tests::drain(&service).await;
             (publication, backup_attempt(&ended))
         };
-        let ends = futures_util::future::join5(
-            Box::pin(case(Publication::BeforeRegistering)),
-            Box::pin(case(Publication::BeforeALateHandoffRegisters)),
-            Box::pin(case(Publication::BeforePushes)),
-            Box::pin(case(Publication::AtFirstPush)),
-            Box::pin(case(Publication::AfterStaging)),
+        let ends = futures_util::future::join_all(
+            [
+                Publication::BeforeRegistering,
+                Publication::BeforeALateHandoffRegisters,
+                Publication::BeforeALateHandoffRegistersOverAGoneSidecar,
+                Publication::BeforePushes,
+                Publication::AtFirstPush,
+                Publication::AfterStaging,
+            ]
+            .map(|publication| Box::pin(case(publication))),
         )
         .await;
 
@@ -1661,12 +1745,13 @@ async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were
         };
         let mut finalized = finalized_backups();
         finalized.sort_by(by_attempt);
-        let mut expected = [ends.0, ends.1, ends.2, ends.3, ends.4]
+        let mut expected = ends
             .into_iter()
             .flat_map(|(publication, backup_attempt_id)| {
                 let (target_state, failure_reason) = match publication {
                     Publication::BeforeRegistering
                     | Publication::BeforeALateHandoffRegisters
+                    | Publication::BeforeALateHandoffRegistersOverAGoneSidecar
                     | Publication::BeforePushes
                     | Publication::AtFirstPush => (
                         SuspendSnapshotTerminalState::Failed,
@@ -1689,7 +1774,8 @@ async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were
                     Publication::BeforeRegistering => vec![finalized(false)],
                     // The attempt's finalize finds no row; the handoff's
                     // finalizes the one it registered, as the attempt's would.
-                    Publication::BeforeALateHandoffRegisters => {
+                    Publication::BeforeALateHandoffRegisters
+                    | Publication::BeforeALateHandoffRegistersOverAGoneSidecar => {
                         vec![finalized(false), finalized(true)]
                     }
                     Publication::BeforePushes
