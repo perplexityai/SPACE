@@ -3,8 +3,9 @@
 
 use pplx_space_accounts::OrgId;
 use pplx_space_node_model::NodeGroupId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::{FromRow, PgExecutor};
+use sqlx::FromRow;
 
 /// One allowlist entry.
 #[derive(Debug, Clone, FromRow)]
@@ -15,47 +16,47 @@ pub struct NodeGroupCompatTemplate {
 
 /// The allowlist entries of `node_group_ids`, in template-name order.
 pub async fn compat_templates(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_group_ids: &[NodeGroupId],
-) -> Result<Vec<NodeGroupCompatTemplate>, sqlx::Error> {
-    sqlx::query_as::<_, NodeGroupCompatTemplate>(sql!(
+) -> Result<Vec<NodeGroupCompatTemplate>, DbError> {
+    Ok(sqlx::query_as::<_, NodeGroupCompatTemplate>(sql!(
         "SELECT node_group_id, template_name
            FROM node_group_template_compat
           WHERE node_group_id = ANY($1::UUID[])
           ORDER BY template_name ASC"
     ))
     .bind(node_group_ids)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Remove every allowlist entry of the group.
 pub async fn clear_template_compat(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_group_id: NodeGroupId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "DELETE FROM node_group_template_compat WHERE node_group_id = $1"
     ))
     .bind(node_group_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
 
 /// Add `names` to the group's allowlist.
 pub async fn insert_template_compat(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_group_id: NodeGroupId,
     names: &[String],
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "INSERT INTO node_group_template_compat (node_group_id, template_name)
          SELECT $1, name FROM UNNEST($2::TEXT[]) AS t(name)"
     ))
     .bind(node_group_id)
     .bind(names)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -63,10 +64,10 @@ pub async fn insert_template_compat(
 /// Remove the entries naming `template_name` from every group not owned by
 /// `owner_org_id`, and return how many went.
 pub async fn prune_cross_org_template_compat(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &str,
     owner_org_id: OrgId,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let result = sqlx::query(sql!(
         "DELETE FROM node_group_template_compat c
           USING node_groups g
@@ -76,7 +77,7 @@ pub async fn prune_cross_org_template_compat(
     ))
     .bind(template_name)
     .bind(owner_org_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected())
 }

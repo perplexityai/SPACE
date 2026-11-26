@@ -7188,6 +7188,7 @@ dependencies = [
  "pplx-space-accounts",
  "pplx-space-db-test-fixtures",
  "pplx-space-node-model",
+ "pplx-space-postgres-pool",
  "pplx-space-sql-locator",
  "pplx-space-template-model",
  "sqlx",

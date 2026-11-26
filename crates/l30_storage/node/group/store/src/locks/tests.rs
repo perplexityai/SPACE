@@ -50,7 +50,8 @@ async fn insert_acquirable(pool: &PgPool) -> TestDbResult<bool> {
             is_default: false,
         },
     )
-    .await;
+    .await
+    .map_err(sqlx::Error::from);
     other.rollback().await?;
     not_lock_unavailable(result)
 }
@@ -62,7 +63,9 @@ async fn table_lock_acquirable(pool: &PgPool) -> TestDbResult<bool> {
     sqlx::query(sql!("SELECT set_config('lock_timeout', '50ms', TRUE)"))
         .execute(&mut *other)
         .await?;
-    let result = lock_node_groups_share_row_exclusive(&mut other).await;
+    let result = lock_node_groups_share_row_exclusive(&mut *other)
+        .await
+        .map_err(sqlx::Error::from);
     other.rollback().await?;
     not_lock_unavailable(result)
 }
@@ -83,7 +86,7 @@ async fn the_default_row_lock_returns_the_default_and_holds_it() -> TestDbResult
     let pool = &db.pool;
 
     let mut tx = pool.begin().await?;
-    assert_eq!(lock_default_node_group(&mut tx).await?, None);
+    assert_eq!(lock_default_node_group(&mut *tx).await?, None);
     tx.commit().await?;
 
     let default = NodeGroupId::new();
@@ -96,7 +99,7 @@ async fn the_default_row_lock_returns_the_default_and_holds_it() -> TestDbResult
         .await?
     );
     let mut tx = pool.begin().await?;
-    assert_eq!(lock_default_node_group(&mut tx).await?, Some(default));
+    assert_eq!(lock_default_node_group(&mut *tx).await?, Some(default));
     assert!(!row_acquirable(pool, default).await?);
     tx.rollback().await?;
 
@@ -112,7 +115,7 @@ async fn the_table_lock_holds_off_writers_until_the_transaction_ends() -> TestDb
     let pool = &db.pool;
 
     let mut tx = pool.begin().await?;
-    lock_node_groups_share_row_exclusive(&mut tx).await?;
+    lock_node_groups_share_row_exclusive(&mut *tx).await?;
     assert!(!insert_acquirable(pool).await?);
     assert!(!table_lock_acquirable(pool).await?);
     assert_eq!(crate::non_default_node_group_count(pool).await?, 0);

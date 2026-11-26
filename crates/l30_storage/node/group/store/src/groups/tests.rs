@@ -143,11 +143,11 @@ async fn the_locked_read_returns_the_same_row_and_holds_it() -> TestDbResult<()>
 
     let mut tx = pool.begin().await?;
     assert!(
-        lock_node_group(&mut tx, NodeGroupId::new())
+        lock_node_group(&mut *tx, NodeGroupId::new())
             .await?
             .is_none()
     );
-    let locked = lock_node_group(&mut tx, shared)
+    let locked = lock_node_group(&mut *tx, shared)
         .await?
         .expect("the default group");
     assert_eq!(summary(&locked), summary(&unlocked));

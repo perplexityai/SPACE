@@ -142,7 +142,7 @@ async fn create_conflicts_and_default_move() -> TestResult {
     .await?;
     let mut tx = pool.begin().await?;
     assert_eq!(
-        pplx_space_node_group_store::locks::lock_default_node_group(&mut tx).await?,
+        pplx_space_node_group_store::locks::lock_default_node_group(&mut *tx).await?,
         Some(shared)
     );
     move_default_in_tx(&mut tx, other).await?;
@@ -314,7 +314,7 @@ async fn concurrent_set_default_loser_hits_identifiable_conflict() -> TestResult
     // unique index until tx1 commits — and loses with a violation.
     let mut tx1 = pool.begin().await?;
     assert_eq!(
-        pplx_space_node_group_store::locks::lock_default_node_group(&mut tx1).await?,
+        pplx_space_node_group_store::locks::lock_default_node_group(&mut *tx1).await?,
         None
     );
     move_default_in_tx(&mut tx1, group_a).await?;
@@ -323,7 +323,7 @@ async fn concurrent_set_default_loser_hits_identifiable_conflict() -> TestResult
     let loser = tokio::spawn(async move {
         let mut tx2 = loser_pool.begin().await?;
         assert_eq!(
-            pplx_space_node_group_store::locks::lock_default_node_group(&mut tx2).await?,
+            pplx_space_node_group_store::locks::lock_default_node_group(&mut *tx2).await?,
             None
         );
         move_default_in_tx(&mut tx2, group_b).await?;
@@ -532,7 +532,7 @@ async fn compat_validation_serializes_against_concurrent_narrowing() -> TestResu
     // Compat transaction: lock the group, validate the allowlist. At
     // validation time the template is still generic, so it passes.
     let mut compat_tx = pool.begin().await?;
-    pplx_space_node_group_store::groups::lock_node_group(&mut compat_tx, group)
+    pplx_space_node_group_store::groups::lock_node_group(&mut *compat_tx, group)
         .await?
         .expect("group row");
     let known = pplx_space_template_store::templates::share_lock_visibilities(
@@ -624,6 +624,7 @@ async fn delete_blocked_by_node_fk() -> TestResult {
     let mut tx = pool.begin().await?;
     let err = pplx_space_node_group_store::delete_node_group(&mut *tx, group)
         .await
+        .map_err(sqlx::Error::from)
         .unwrap_err();
     assert_eq!(
         violated_constraint(&err).as_deref(),

@@ -421,12 +421,12 @@ async fn apply_assign_org(
         Ok(tx) => tx,
         Err(err) => return db_error(err).into_response(),
     };
-    let group = match lock_node_group(&mut tx, node_group_id).await {
+    let group = match lock_node_group(&mut *tx, node_group_id).await {
         Ok(Some(row)) => row,
         Ok(None) => {
             return api_error(StatusCode::NOT_FOUND, "Node group not found").into_response();
         }
-        Err(err) => return db_error(err).into_response(),
+        Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
     };
     let from_state = row_state_summary(&group);
     let audit_failure = |error: &str| {
@@ -570,17 +570,17 @@ async fn apply_set_default(
         Ok(tx) => tx,
         Err(err) => return db_error(err).into_response(),
     };
-    let incumbent = match pplx_space_node_group_store::locks::lock_default_node_group(&mut tx).await
-    {
-        Ok(incumbent) => incumbent,
-        Err(err) => return db_error(err).into_response(),
-    };
-    let group = match lock_node_group(&mut tx, node_group_id).await {
+    let incumbent =
+        match pplx_space_node_group_store::locks::lock_default_node_group(&mut *tx).await {
+            Ok(incumbent) => incumbent,
+            Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
+        };
+    let group = match lock_node_group(&mut *tx, node_group_id).await {
         Ok(Some(row)) => row,
         Ok(None) => {
             return api_error(StatusCode::NOT_FOUND, "Node group not found").into_response();
         }
-        Err(err) => return db_error(err).into_response(),
+        Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
     };
     let from_state = row_state_summary(&group);
     if group.org_id.is_some() {
@@ -673,12 +673,12 @@ pub async fn delete_node_group(
         Ok(tx) => tx,
         Err(err) => return db_error(err).into_response(),
     };
-    let group = match lock_node_group(&mut tx, node_group_id).await {
+    let group = match lock_node_group(&mut *tx, node_group_id).await {
         Ok(Some(row)) => row,
         Ok(None) => {
             return api_error(StatusCode::NOT_FOUND, "Node group not found").into_response();
         }
-        Err(err) => return db_error(err).into_response(),
+        Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
     };
     let from_state = row_state_summary(&group);
     let audit_failure = |error: &str| {
@@ -715,6 +715,7 @@ pub async fn delete_node_group(
     }
     if let Err(err) = pplx_space_node_group_store::delete_node_group(&mut *tx, node_group_id).await
     {
+        let err = sqlx::Error::from(err);
         // The empty-group guard above can race a concurrent label mirror;
         // the nodes FK is the backstop.
         if violated_constraint(&err).as_deref() == Some("nodes_node_group_id_fkey") {
@@ -769,12 +770,12 @@ pub async fn set_template_policy(
         Ok(tx) => tx,
         Err(err) => return db_error(err).into_response(),
     };
-    let group = match lock_node_group(&mut tx, node_group_id).await {
+    let group = match lock_node_group(&mut *tx, node_group_id).await {
         Ok(Some(row)) => row,
         Ok(None) => {
             return api_error(StatusCode::NOT_FOUND, "Node group not found").into_response();
         }
-        Err(err) => return db_error(err).into_response(),
+        Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
     };
     let from_state = row_state_summary(&group);
     if group.org_id.is_none()
@@ -861,12 +862,12 @@ pub async fn set_compat(
         Ok(tx) => tx,
         Err(err) => return db_error(err).into_response(),
     };
-    let group = match lock_node_group(&mut tx, node_group_id).await {
+    let group = match lock_node_group(&mut *tx, node_group_id).await {
         Ok(Some(row)) => row,
         Ok(None) => {
             return api_error(StatusCode::NOT_FOUND, "Node group not found").into_response();
         }
-        Err(err) => return db_error(err).into_response(),
+        Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
     };
     let from_state = row_state_summary(&group);
     let audit_failure = |error: &str| {
