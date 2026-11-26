@@ -35,12 +35,12 @@ pub(super) async fn recover(pool: &PgPool, expected: &Candidate) -> Result<bool,
         .await?;
     quarantine_recovery::lock_executions(&mut tx, expected.sandbox_id).await?;
     pplx_space_snapshot_store::quarantine_recovery::share_lock_snapshot(
-        &mut tx,
+        &mut *tx,
         expected.snapshot_id,
     )
     .await?;
     pplx_space_snapshot_store::quarantine_recovery::share_lock_storage_location(
-        &mut tx,
+        &mut *tx,
         expected.snapshot_id,
     )
     .await?;

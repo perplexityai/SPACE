@@ -271,7 +271,7 @@ impl RetentionSink for SnapshotRetentionDbStore {
         // makes a concurrent insert take a conflicting parent key lock, so the
         // optional location below cannot change through commit.
         let state: Option<String> = retention::lock_sandbox_snapshot_state(
-            &mut tx,
+            &mut *tx,
             candidate.snapshot_id,
             candidate.sandbox_id,
         )
@@ -287,7 +287,7 @@ impl RetentionSink for SnapshotRetentionDbStore {
         }
 
         let storage_location =
-            retention::lock_usable_storage_location(&mut tx, candidate.snapshot_id).await?;
+            retention::lock_usable_storage_location(&mut *tx, candidate.snapshot_id).await?;
         let storage_location = storage_location.map(|location| {
             SnapshotStorageLocation::new(
                 location.id,
@@ -412,7 +412,7 @@ impl RetentionSink for SnapshotRetentionDbStore {
         // `claim_prune`, but the store enforces that protocol boundary too:
         // deleting an advertised `ready` row here would make PostgreSQL
         // promise bytes the reaper may already have removed.
-        let locked: Option<String> = retention::lock_snapshot_state(&mut tx, snapshot_id).await?;
+        let locked: Option<String> = retention::lock_snapshot_state(&mut *tx, snapshot_id).await?;
         let Some(state) = locked else {
             tx.rollback().await?;
             return Ok(PruneFinalize::AlreadyGone);
@@ -434,7 +434,7 @@ impl RetentionSink for SnapshotRetentionDbStore {
         // the snapshot row. Unconditional: we hold the row lock and have
         // already reaped its blobs.
 
-        delete_snapshot_catalog(&mut tx, snapshot_id).await?;
+        delete_snapshot_catalog(&mut *tx, snapshot_id).await?;
 
         tx.commit().await?;
         Ok(PruneFinalize::Pruned {

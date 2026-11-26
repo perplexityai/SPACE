@@ -1,6 +1,7 @@
 //! The execution a restore's checkpoint recorded it was produced under, for
 //! the runtime upgrade decision.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_snapshot_model::LocalArtifactId;
 use pplx_space_sql_locator::sql;
@@ -27,11 +28,11 @@ pub struct CheckpointExecution {
 /// a `storage_uri` that no location records never falls back to the current
 /// artifact.
 pub async fn restore_execution(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     storage_uri: Option<&str>,
-) -> Result<Option<CheckpointExecution>, sqlx::Error> {
-    sqlx::query_as(sql!(
+) -> Result<Option<CheckpointExecution>, DbError> {
+    Ok(sqlx::query_as(sql!(
         "SELECT sn.id::text AS subject, sn.local_artifact_id, sn.execution_metadata, sn.runtime,
                     sn.runtime_version, sn.state_format_name, sn.state_format_version
                FROM snapshots sn
@@ -51,6 +52,6 @@ pub async fn restore_execution(
     ))
     .bind(sandbox_id)
     .bind(storage_uri)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }

@@ -2,6 +2,7 @@
 
 use std::sync::LazyLock;
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::no_newer_full_snapshot;
 use pplx_space_snapshot_model::SnapshotId;
@@ -24,9 +25,9 @@ pub struct SuspendedSourceArtifact {
 /// marker the newest one taken since its last placement change, and no newer
 /// full snapshot may exist.
 pub async fn suspended_artifact(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     source_sandbox_id: SandboxId,
-) -> Result<Option<SuspendedSourceArtifact>, sqlx::Error> {
+) -> Result<Option<SuspendedSourceArtifact>, DbError> {
     static SUSPENDED_ARTIFACT: LazyLock<String> = LazyLock::new(|| {
         let no_newer = no_newer_full_snapshot("s", "sn");
         sql!(format!(
@@ -63,7 +64,7 @@ pub async fn suspended_artifact(
     let row =
         sqlx::query_as::<_, (SnapshotId, Uuid)>(sqlx::AssertSqlSafe(SUSPENDED_ARTIFACT.as_str()))
             .bind(source_sandbox_id.as_uuid())
-            .fetch_optional(executor)
+            .fetch_optional(executor.into_sqlx())
             .await?;
     Ok(row.map(
         |(snapshot_id, storage_location_id)| SuspendedSourceArtifact {

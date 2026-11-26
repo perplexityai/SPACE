@@ -4,13 +4,14 @@
 
 use std::sync::LazyLock;
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::{
     pre_quarantine_suspend_snapshot_current, quarantine_recovery_suspend_snapshot_current,
 };
 use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 use pplx_space_sql_locator::sql;
-use sqlx::{FromRow, Postgres, Transaction};
+use sqlx::FromRow;
 use time::OffsetDateTime;
 
 /// A recovery-policy-compatible suspend snapshot and its storage route.
@@ -28,10 +29,10 @@ pub struct RecoverySnapshot {
 /// snapshot that covers all recorded activity, with no newer full snapshot
 /// other than a failed retry of the same artifact. `None` when there's none.
 pub async fn exact_artifact_snapshot(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     local_artifact_id: LocalArtifactId,
-) -> Result<Option<RecoverySnapshot>, sqlx::Error> {
+) -> Result<Option<RecoverySnapshot>, DbError> {
     static EXACT_ARTIFACT_SNAPSHOT: LazyLock<String> = LazyLock::new(|| {
         let current = quarantine_recovery_suspend_snapshot_current("current_sandbox", "snapshot");
         sql!(format!(
@@ -50,21 +51,23 @@ pub async fn exact_artifact_snapshot(
           LIMIT 1"
         ))
     });
-    sqlx::query_as(sqlx::AssertSqlSafe(EXACT_ARTIFACT_SNAPSHOT.as_str()))
-        .bind(sandbox_id.as_uuid())
-        .bind(local_artifact_id)
-        .fetch_optional(executor)
-        .await
+    Ok(
+        sqlx::query_as(sqlx::AssertSqlSafe(EXACT_ARTIFACT_SNAPSHOT.as_str()))
+            .bind(sandbox_id.as_uuid())
+            .bind(local_artifact_id)
+            .fetch_optional(executor.into_sqlx())
+            .await?,
+    )
 }
 
 /// The newest snapshot of `sandbox_id` that is still current recovery
 /// evidence and was taken no later than `quarantine_entered_at`, when its
 /// quarantine episode began. `None` when there's none.
 pub async fn pre_quarantine_snapshot(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     quarantine_entered_at: OffsetDateTime,
-) -> Result<Option<RecoverySnapshot>, sqlx::Error> {
+) -> Result<Option<RecoverySnapshot>, DbError> {
     static PRE_QUARANTINE_SNAPSHOT: LazyLock<String> = LazyLock::new(|| {
         let current = pre_quarantine_suspend_snapshot_current("current_sandbox", "snapshot", "$2");
         sql!(format!(
@@ -83,23 +86,27 @@ pub async fn pre_quarantine_snapshot(
           LIMIT 1"
         ))
     });
-    sqlx::query_as(sqlx::AssertSqlSafe(PRE_QUARANTINE_SNAPSHOT.as_str()))
-        .bind(sandbox_id.as_uuid())
-        .bind(quarantine_entered_at)
-        .fetch_optional(executor)
-        .await
+    Ok(
+        sqlx::query_as(sqlx::AssertSqlSafe(PRE_QUARANTINE_SNAPSHOT.as_str()))
+            .bind(sandbox_id.as_uuid())
+            .bind(quarantine_entered_at)
+            .fetch_optional(executor.into_sqlx())
+            .await?,
+    )
 }
 
 /// Lock snapshot `snapshot_id` `FOR SHARE`, so it can't change or be deleted
 /// while recovery re-checks it. The lock lasts until the caller's transaction
 /// ends; a missing row locks nothing.
-pub async fn share_lock_snapshot(
-    tx: &mut Transaction<'_, Postgres>,
-    snapshot_id: SnapshotId,
-) -> Result<(), sqlx::Error> {
+///
+/// The caller must pass its open transaction.
+pub async fn share_lock_snapshot<C>(tx: &mut C, snapshot_id: SnapshotId) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!("SELECT id FROM snapshots WHERE id = $1 FOR SHARE"))
         .bind(snapshot_id)
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?;
     Ok(())
 }
@@ -107,15 +114,20 @@ pub async fn share_lock_snapshot(
 /// Lock `FOR SHARE` the storage location of snapshot `snapshot_id`, so it
 /// can't be orphaned or deleted while recovery re-checks it. The lock lasts
 /// until the caller's transaction ends; a missing row locks nothing.
-pub async fn share_lock_storage_location(
-    tx: &mut Transaction<'_, Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn share_lock_storage_location<C>(
+    tx: &mut C,
     snapshot_id: SnapshotId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "SELECT snapshot_id FROM snapshot_storage_locations WHERE snapshot_id = $1 FOR SHARE"
     ))
     .bind(snapshot_id)
-    .execute(&mut **tx)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }

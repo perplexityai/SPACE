@@ -91,6 +91,8 @@ impl SweeperSink for SnapshotStorageDbStore {
         // filter here means a row that drifted out of the orphan
         // state between scan and DELETE (any future admin tooling
         // that resets either column) is left alone.
-        pplx_space_snapshot_store::orphan_locations::delete_if_orphan(&self.pool, id).await
+        pplx_space_snapshot_store::orphan_locations::delete_if_orphan(&self.pool, id)
+            .await
+            .map_err(sqlx::Error::from)
     }
 }

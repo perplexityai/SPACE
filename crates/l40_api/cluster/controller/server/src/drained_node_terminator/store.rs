@@ -261,7 +261,7 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
         // tick after the instance was confirmed terminated) is accepted:
         // the bytes are preserved in S3 and the row is operator-revivable.
         let _locked_dead_uploads: Vec<SnapshotId> =
-            lock_creating_full_uploads_from_node(&mut tx, &claimed, node_id).await?;
+            lock_creating_full_uploads_from_node(&mut *tx, &claimed, node_id).await?;
         // The flip is restricted to the claimed ids: the claim only fences
         // rows that matched at its own snapshot, so a row entering the
         // candidate set after it must wait for the next tick's claim rather
@@ -275,7 +275,7 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
         )
         .await?;
         if !ids.is_empty() {
-            fail_quiet_full_uploads_from_node(&mut tx, node_id, &ids, DEAD_UPLOAD_SETTLE).await?;
+            fail_quiet_full_uploads_from_node(&mut *tx, node_id, &ids, DEAD_UPLOAD_SETTLE).await?;
             write_off_lost_sandboxes(&mut tx, node_id, &ids).await?;
         }
         tx.commit().await?;

@@ -8,8 +8,8 @@ use pplx_space_snapshot_model::SnapshotId;
 
 use std::time::Duration;
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::{PgExecutor, Postgres, Transaction};
 
 /// Lock, `FOR UPDATE` in id order, the `creating` full uploads `node_id`
 /// started for `ids`, and return their ids. The locks last until the caller's
@@ -20,12 +20,17 @@ use sqlx::{PgExecutor, Postgres, Transaction};
 /// it, or waits until the give-up's transaction ends. If that transaction
 /// failed the upload, because the flip took its sandbox, a `ready` finalize
 /// then matches no row; otherwise the upload is still `creating`.
-pub async fn lock_creating_full_uploads_from_node(
-    tx: &mut Transaction<'_, Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn lock_creating_full_uploads_from_node<C>(
+    tx: &mut C,
     ids: &[SandboxId],
     node_id: NodeId,
-) -> Result<Vec<SnapshotId>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Vec<SnapshotId>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar(sql!(
         "SELECT id FROM snapshots
               WHERE sandbox_id = ANY($1)
                 AND source_node_id = $2
@@ -36,8 +41,8 @@ pub async fn lock_creating_full_uploads_from_node(
     ))
     .bind(ids)
     .bind(node_id)
-    .fetch_all(&mut **tx)
-    .await
+    .fetch_all(tx.into_sqlx())
+    .await?)
 }
 
 /// Lock, `FOR UPDATE` in id order, every `creating` full upload of
@@ -47,11 +52,16 @@ pub async fn lock_creating_full_uploads_from_node(
 /// The lost-started give-up takes them before its flip evaluates the
 /// sandbox's restore source, so a finalize racing it either committed first,
 /// and the flip sees it, or conflicts with the give-up's locks.
-pub async fn lock_creating_full_uploads(
-    tx: &mut Transaction<'_, Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn lock_creating_full_uploads<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
-) -> Result<Vec<SnapshotId>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Vec<SnapshotId>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar(sql!(
         "SELECT id FROM snapshots
               WHERE sandbox_id = $1
                 AND type = 'full'
@@ -60,8 +70,8 @@ pub async fn lock_creating_full_uploads(
               FOR UPDATE"
     ))
     .bind(sandbox_id)
-    .fetch_all(&mut **tx)
-    .await
+    .fetch_all(tx.into_sqlx())
+    .await?)
 }
 
 /// Finalize `failed` the dead uploads `node_id` left for `ids`, which were
@@ -73,12 +83,17 @@ pub async fn lock_creating_full_uploads(
 /// `creating`, it reads as a live upload forever, and the drained-node
 /// snapshot guard would refuse the reap on it. It's finalized `failed`, as the
 /// worker's own failure path does.
-pub async fn fail_quiet_full_uploads_from_node(
-    tx: &mut Transaction<'_, Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn fail_quiet_full_uploads_from_node<C>(
+    tx: &mut C,
     node_id: NodeId,
     ids: &[SandboxId],
     dead_upload_settle: Duration,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "UPDATE snapshots
             SET state = 'failed'
@@ -92,7 +107,7 @@ pub async fn fail_quiet_full_uploads_from_node(
     .bind(ids)
     .bind(node_id)
     .bind(dead_upload_settle.as_secs().cast_signed())
-    .execute(&mut **tx)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -123,12 +138,12 @@ pub struct FailedUpload {
 /// renders for node drain's other gone-node writes; a change to one is a
 /// change to both.
 pub async fn fail_inflight_uploads_from_gone_node(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     expected_uid: Option<&str>,
     failure_reason: &str,
-) -> Result<Vec<FailedUpload>, sqlx::Error> {
-    sqlx::query_as(sql!(
+) -> Result<Vec<FailedUpload>, DbError> {
+    Ok(sqlx::query_as(sql!(
         "UPDATE snapshots
             SET state = 'failed',
                 failure_reason = COALESCE(failure_reason, $3)
@@ -150,8 +165,8 @@ pub async fn fail_inflight_uploads_from_gone_node(
     .bind(node_id)
     .bind(expected_uid)
     .bind(failure_reason)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 #[cfg(test)]

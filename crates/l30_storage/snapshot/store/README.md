@@ -29,7 +29,11 @@ their storage backend interfaces.
   Do not expose a query builder or caller-selected columns and predicates.
 - Ordinary reads and single-statement CRUD use explicit filters and limits and
   accept a generic PostgreSQL executor. Multi-statement aggregate operations
-  require the caller's transaction so partial mutation is not representable.
+  must run in the caller's open transaction, so their statements commit or
+  roll back together. Their parameter accepts a postgres-pool `Tx` or a
+  `PgConnection` and refuses a pool. It cannot tell whether a connection has
+  a transaction open, so each such operation's documentation says the caller
+  must pass its open transaction.
 - Add an operation and record fields with their first migrated caller; do not
   build a speculative complete CRUD surface.
 - Do not expose an unrestricted `update_snapshot` operation. A workflow's

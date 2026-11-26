@@ -823,7 +823,7 @@ impl ClusterApiService {
         let sandbox_id = finalized_snapshot.sandbox_id;
 
         if target_state.is_ready() {
-            snapshot_store::record_artifact_digests(&mut tx, snapshot_id, artifact_digests)
+            snapshot_store::record_artifact_digests(&mut *tx, snapshot_id, artifact_digests)
                 .await
                 .map_err(|error| match &error {
                     snapshot_store::RecordArtifactDigestsError::Conflict { .. } => {
@@ -1013,7 +1013,7 @@ impl ClusterApiService {
             .await
             .map_err(|e| Status::internal(format!("begin tx: {e}")))?;
 
-        let (persisted, outcome) = snapshot_store::insert(&mut tx, &snapshot)
+        let (persisted, outcome) = snapshot_store::insert(&mut *tx, &snapshot)
             .await
             .map_err(snapshot_insert_status)?;
         // Only a capture's first registration is fenced. Refusing a replay

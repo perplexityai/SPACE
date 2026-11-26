@@ -1703,8 +1703,9 @@ impl SandboxController {
         // self-healing (retry the DELETE once the upload finalizes).
         let phase_started = std::time::Instant::now();
         tracing::info!(sandbox_id = %id, phase = "snapshot_precheck", result = "started", "sandbox delete phase started");
-        let snapshot_precheck =
-            pplx_space_snapshot_store::upload::in_flight_idle_for(pool, id).await;
+        let snapshot_precheck = pplx_space_snapshot_store::upload::in_flight_idle_for(pool, id)
+            .await
+            .map_err(sqlx::Error::from);
         tracing::info!(
             sandbox_id = %id,
             phase = "snapshot_precheck",
