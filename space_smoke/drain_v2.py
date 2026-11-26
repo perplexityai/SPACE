@@ -1509,11 +1509,40 @@ class DrainV2Assertions:
             return
         node_name, node_id = self.node_name, self.node_id
         self._scope.defer(
-            f"uncordon {node_name}", lambda: self._control.uncordon_kube_node(node_name), critical=True
+            f"uncordon {node_name}",
+            lambda: self._uncordon_once_cancelled(node_name, node_id),
+            critical=True,
         )
         self._undrain = self._scope.defer(
             f"undrain {node_name}", lambda: self._undrain_if_draining(node_id), critical=True
         )
+
+    def _drain_cleared(self, node_id: str) -> bool:
+        """The controller cleared the node's v2 engine and status, which it
+        does only once the node answered the cancel and is unsealed; or the
+        node's row is gone, so no seal is left under it."""
+
+        status = self._control.drain_v2_status(node_id)
+        return status is None or (status.engine is None and status.status is None)
+
+    def _uncordon_once_cancelled(self, node_name: str, node_id: str) -> None:
+        """Cleanup's uncordon of the drained worker, after the undrain: only
+        once the drain is cancelled on the node (`_drain_cleared`), waited
+        for as long as a cancel may take (`CANCEL_SECONDS`). A worker whose
+        node never answered may still be sealed, so it is left cordoned, and
+        the raise makes cleanup report it, so nothing the next scenario
+        creates lands on a sealed worker."""
+
+        deadline = time.monotonic() + CANCEL_SECONDS
+        while not self._drain_cleared(node_id):
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"left {node_name} cordoned: its drain's cancel was not confirmed within "
+                    f"{CANCEL_SECONDS} s (the v2 engine or status is still set), so the worker may "
+                    "still be sealed; it is uncordoned once the node answers the controller's cancel"
+                )
+            self._fixture.wait(2)
+        self._control.uncordon_kube_node(node_name)
 
     def expect_drain_refused_for_stopped(self, stopped: Sequence[str], *, hold: int) -> CallAnswer:
         """A v2 `:drain` with a hold of `hold` seconds of the worker, with no
