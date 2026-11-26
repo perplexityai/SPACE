@@ -147,7 +147,7 @@ impl PgIntermediateKeyIdentityLookup {
             .map_err(|error| {
                 IdentityLookupError::unavailable(
                     org,
-                    IdentityLookupUnavailable::OrganizationQuery(error),
+                    IdentityLookupUnavailable::OrganizationQuery(sqlx::Error::from(error)),
                 )
             })?;
 

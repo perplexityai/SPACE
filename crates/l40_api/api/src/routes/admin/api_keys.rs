@@ -106,7 +106,7 @@ pub(super) async fn list_api_keys(
             return api_error(StatusCode::NOT_FOUND, "Organization not found").into_response();
         }
         Ok(true) => {}
-        Err(error) => return read_error(error),
+        Err(error) => return read_error(sqlx::Error::from(error)),
     }
     match api_keys::list_organization_api_keys(&state.pool, org_id, query.include_revoked).await {
         Ok(keys) => Json(
@@ -115,7 +115,7 @@ pub(super) async fn list_api_keys(
                 .collect::<Vec<_>>(),
         )
         .into_response(),
-        Err(error) => read_error(error),
+        Err(error) => read_error(sqlx::Error::from(error)),
     }
 }
 
@@ -144,7 +144,7 @@ pub(super) async fn create_api_key(
         Ok(false) => {
             return api_error(StatusCode::NOT_FOUND, "Organization not found").into_response();
         }
-        Err(error) => return read_error(error),
+        Err(error) => return read_error(sqlx::Error::from(error)),
     }
     let org_target = Extension(AdminAuditTarget::api_key(org_id, None, None));
     let name = match api_key_name(&request.name) {
@@ -191,7 +191,7 @@ pub(super) async fn create_api_key(
             .into_response(),
         Err(error) => (
             Extension(AdminAuditTarget::api_key(org_id, None, Some(user_id))),
-            create_error(error),
+            create_error(sqlx::Error::from(error)),
         )
             .into_response(),
     }
@@ -255,7 +255,7 @@ async fn key_user(
         Some(user_id) => match users::user_in_organization(&state.pool, org_id, user_id).await {
             Ok(true) => Ok(user_id),
             Ok(false) => Err(KeyUserRefusal::NotInOrganization),
-            Err(error) => Err(KeyUserRefusal::Read(error)),
+            Err(error) => Err(KeyUserRefusal::Read(sqlx::Error::from(error))),
         },
         None => Err(KeyUserRefusal::Required),
     }
@@ -280,7 +280,7 @@ pub(super) async fn delete_api_key(
         Ok(ApiKeyRevocation::NotFound) => {
             api_error(StatusCode::NOT_FOUND, "API key not found").into_response()
         }
-        Err(error) => support::db_error(error).into_response(),
+        Err(error) => support::db_error(sqlx::Error::from(error)).into_response(),
     }
 }
 

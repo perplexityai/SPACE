@@ -468,7 +468,7 @@ async fn apply_assign_org(
                 audit_failure("unknown org");
                 return api_error(StatusCode::BAD_REQUEST, "unknown org").into_response();
             }
-            Err(err) => return db_error(err).into_response(),
+            Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
         }
     }
 

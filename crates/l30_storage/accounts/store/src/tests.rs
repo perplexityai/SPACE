@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use pplx_space_accounts::{ApiKeyId, OrgId, SandboxOwnerSource, UserId};
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDbResult, pg_test_db};
+use pplx_space_postgres_pool::DbErrorKind;
 use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -484,12 +485,12 @@ async fn share_locked_user_decodes_every_column_and_holds_its_lock() -> TestDbRe
     let user = distinct_federated_user(&db.pool).await?;
 
     let mut tx = db.pool.begin().await?;
-    let read = users::share_lock_user_by_email(&mut tx, &user.email)
+    let read = users::share_lock_user_by_email(&mut *tx, &user.email)
         .await?
         .expect("the user is found by email");
     assert_same_user(&read, &user);
     assert!(
-        users::share_lock_user_by_email(&mut tx, "nobody@example.com")
+        users::share_lock_user_by_email(&mut *tx, "nobody@example.com")
             .await?
             .is_none()
     );
@@ -538,10 +539,10 @@ async fn joined_user_and_organization_reads_decode_both_rows() -> TestDbResult<(
     let found = users::user_with_organization(&db.pool, user.id).await?;
     assert_same_user(&found.user, &user);
     assert_same_organization(&found.org, &org);
-    assert!(matches!(
-        users::user_with_organization(&db.pool, UserId::new()).await,
-        Err(sqlx::Error::RowNotFound)
-    ));
+    let missing = users::user_with_organization(&db.pool, UserId::new())
+        .await
+        .expect_err("an unknown user has no row");
+    assert_eq!(missing.kind(), DbErrorKind::NotFound);
 
     let federated = organizations::federated_organization_user(
         &db.pool,
@@ -617,7 +618,7 @@ async fn organization_owner_and_branding_reads() -> TestDbResult<()> {
     )
     .await?;
     let mut tx = db.pool.begin().await?;
-    let branding = organizations::lock_organization_branding(&mut tx, branded.id)
+    let branding = organizations::lock_organization_branding(&mut *tx, branded.id)
         .await?
         .expect("the organization exists");
     assert_eq!(branding.theme_primary.as_deref(), Some("#111111"));
@@ -627,7 +628,7 @@ async fn organization_owner_and_branding_reads() -> TestDbResult<()> {
         Some("https://logo.example/branded.png")
     );
     assert!(
-        organizations::lock_organization_branding(&mut tx, OrgId::new())
+        organizations::lock_organization_branding(&mut *tx, OrgId::new())
             .await?
             .is_none()
     );

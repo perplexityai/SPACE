@@ -383,7 +383,9 @@ pub(crate) async fn org_byok_enabled(
 ) -> Result<bool, ControllerError> {
     let enabled = pplx_space_accounts_store::organizations::organization_byok_enabled(pool, org_id)
         .await
-        .map_err(|err| db_contention_error("failed to read org BYOK flag", &err))?;
+        .map_err(|err| {
+            db_contention_error("failed to read org BYOK flag", &sqlx::Error::from(err))
+        })?;
     Ok(enabled.unwrap_or(false))
 }
 

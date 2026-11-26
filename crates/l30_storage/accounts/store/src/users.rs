@@ -3,9 +3,10 @@
 //! local and federated creates.
 
 use pplx_space_accounts::{OrgId, SandboxOwnerSource, UserId};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgConnection, PgExecutor};
+use sqlx::FromRow;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -29,58 +30,59 @@ pub struct User {
 }
 
 pub async fn get_user(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     user_id: UserId,
-) -> Result<Option<User>, sqlx::Error> {
-    sqlx::query_as::<_, User>(sql!(
+) -> Result<Option<User>, DbError> {
+    Ok(sqlx::query_as::<_, User>(sql!(
         "SELECT id, email, password_hash, display_name, org_id, role, owner_source,
                 created_at, updated_at
          FROM users WHERE id = $1"
     ))
     .bind(user_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The user with exactly this email.
 pub async fn user_by_email(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     email: &str,
-) -> Result<Option<User>, sqlx::Error> {
-    sqlx::query_as::<_, User>(sql!(
+) -> Result<Option<User>, DbError> {
+    Ok(sqlx::query_as::<_, User>(sql!(
         "SELECT id, email, password_hash, display_name, org_id, role, owner_source,
                 created_at, updated_at
          FROM users WHERE email = $1"
     ))
     .bind(email)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The user with exactly this email, share-locked so its password hash and
-/// email cannot change until the caller's transaction ends.
-pub async fn share_lock_user_by_email(
-    conn: &mut PgConnection,
-    email: &str,
-) -> Result<Option<User>, sqlx::Error> {
-    sqlx::query_as::<_, User>(sql!(
+/// email cannot change until the caller's transaction ends. The caller must
+/// pass its open transaction.
+pub async fn share_lock_user_by_email<C>(tx: &mut C, email: &str) -> Result<Option<User>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_as::<_, User>(sql!(
         "SELECT id, email, password_hash, display_name, org_id, role, owner_source,
                 created_at, updated_at
          FROM users WHERE email = $1 FOR SHARE"
     ))
     .bind(email)
-    .fetch_optional(conn)
-    .await
+    .fetch_optional(tx.into_sqlx())
+    .await?)
 }
 
 /// The user of the console session with this token hash, while the session
 /// has not expired. Expiry is compared with the database's `NOW()`, the start
 /// of the transaction the statement runs in.
 pub async fn user_by_session_token_hash(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     token_hash: &str,
-) -> Result<Option<User>, sqlx::Error> {
-    sqlx::query_as::<_, User>(sql!(
+) -> Result<Option<User>, DbError> {
+    Ok(sqlx::query_as::<_, User>(sql!(
         "SELECT u.id, u.email, u.password_hash, u.display_name, u.org_id, u.role,
                 u.owner_source, u.created_at, u.updated_at
          FROM users u
@@ -88,8 +90,8 @@ pub async fn user_by_session_token_hash(
          WHERE s.token_hash = $1 AND s.expires_at > NOW()"
     ))
     .bind(token_hash)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// A user with its organization, read in one statement.
@@ -116,16 +118,21 @@ pub(crate) const USER_WITH_ORGANIZATION_SQL: &str = sql!(
      WHERE u.id = $1"
 );
 
-/// The user and its organization; `RowNotFound` when either is missing.
+/// The user and its organization. When either is missing, a [`DbError`] whose
+/// `kind()` is [`DbErrorKind::NotFound`]: the driver's `RowNotFound`, which
+/// callers still see after converting.
+///
+/// [`DbErrorKind::NotFound`]: pplx_space_postgres_pool::DbErrorKind::NotFound
 pub async fn user_with_organization(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     user_id: UserId,
-) -> Result<UserWithOrganization, sqlx::Error> {
+) -> Result<UserWithOrganization, DbError> {
     sqlx::query_as::<_, UserOrganizationRow>(USER_WITH_ORGANIZATION_SQL)
         .bind(user_id)
-        .fetch_one(executor)
+        .fetch_one(executor.into_sqlx())
         .await
         .map(UserOrganizationRow::into_user_with_organization)
+        .map_err(DbError::from)
 }
 
 /// One `users u JOIN organizations o` row, each column aliased so the two
@@ -194,11 +201,11 @@ impl UserOrganizationRow {
 
 /// The user, only when it belongs to `org_id`.
 pub async fn organization_user(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     user_id: UserId,
-) -> Result<Option<User>, sqlx::Error> {
-    sqlx::query_as::<_, User>(sql!(
+) -> Result<Option<User>, DbError> {
+    Ok(sqlx::query_as::<_, User>(sql!(
         "SELECT id, email, password_hash, display_name, org_id, role, owner_source,
                 created_at, updated_at
          FROM users
@@ -206,51 +213,51 @@ pub async fn organization_user(
     ))
     .bind(user_id)
     .bind(org_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether `user_id` is a user of `org_id`.
 pub async fn user_in_organization(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     user_id: UserId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
         "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND org_id = $2)"
     ))
     .bind(user_id)
     .bind(org_id)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// The organization's oldest user.
 pub async fn first_organization_user_id(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
-) -> Result<Option<UserId>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Option<UserId>, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT id FROM users WHERE org_id = $1 ORDER BY created_at, id LIMIT 1"
     ))
     .bind(org_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The organization's users, by email.
 pub async fn list_organization_users(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
-) -> Result<Vec<User>, sqlx::Error> {
-    sqlx::query_as::<_, User>(sql!(
+) -> Result<Vec<User>, DbError> {
+    Ok(sqlx::query_as::<_, User>(sql!(
         "SELECT id, email, password_hash, display_name, org_id, role, owner_source,
                 created_at, updated_at
          FROM users WHERE org_id = $1 ORDER BY email ASC, id ASC"
     ))
     .bind(org_id)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// A local user to create.
@@ -264,11 +271,8 @@ pub struct NewUser {
 }
 
 /// Create a local user. A taken email fails with the unique violation.
-pub async fn create_user(
-    executor: impl PgExecutor<'_>,
-    user: NewUser,
-) -> Result<User, sqlx::Error> {
-    sqlx::query_as::<_, User>(sql!(
+pub async fn create_user(executor: impl Executor<'_>, user: NewUser) -> Result<User, DbError> {
+    Ok(sqlx::query_as::<_, User>(sql!(
         "INSERT INTO users (id, email, password_hash, display_name, org_id, role)
          VALUES ($1, $2, $3, $4, $5, $6)
          RETURNING id, email, password_hash, display_name, org_id, role, owner_source,
@@ -280,8 +284,8 @@ pub async fn create_user(
     .bind(user.display_name)
     .bind(user.org_id)
     .bind(user.role)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Changes to a user's profile; `None` leaves a field as it is.
@@ -294,11 +298,11 @@ pub struct UserProfilePatch {
 /// Apply `patch` to the user; `None` when there is none. A taken email fails
 /// with the unique violation.
 pub async fn update_user_profile(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     user_id: UserId,
     patch: UserProfilePatch,
-) -> Result<Option<User>, sqlx::Error> {
-    sqlx::query_as::<_, User>(sql!(
+) -> Result<Option<User>, DbError> {
+    Ok(sqlx::query_as::<_, User>(sql!(
         "UPDATE users
          SET email = COALESCE($2, email),
              password_hash = COALESCE($3, password_hash),
@@ -312,39 +316,39 @@ pub async fn update_user_profile(
     .bind(patch.email)
     .bind(patch.password_hash)
     .bind(patch.display_name)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Give the user `role`; `None` when there is none.
 pub async fn set_user_role(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     user_id: UserId,
     role: UserRole,
-) -> Result<Option<User>, sqlx::Error> {
-    sqlx::query_as::<_, User>(sql!(
+) -> Result<Option<User>, DbError> {
+    Ok(sqlx::query_as::<_, User>(sql!(
         "UPDATE users SET role = $2, updated_at = NOW() WHERE id = $1
          RETURNING id, email, password_hash, display_name, org_id, role, owner_source,
                    created_at, updated_at"
     ))
     .bind(user_id)
     .bind(role)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Set the user's password hash.
 pub async fn set_user_password_hash(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     user_id: UserId,
     password_hash: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2"
     ))
     .bind(password_hash)
     .bind(user_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -353,13 +357,10 @@ pub async fn set_user_password_hash(
 /// through a foreign key without `ON DELETE CASCADE` or `ON DELETE SET NULL`
 /// fails the delete with that key's error; the others are deleted or cleared
 /// with it.
-pub async fn delete_user(
-    executor: impl PgExecutor<'_>,
-    user_id: UserId,
-) -> Result<bool, sqlx::Error> {
+pub async fn delete_user(executor: impl Executor<'_>, user_id: UserId) -> Result<bool, DbError> {
     let result = sqlx::query(sql!("DELETE FROM users WHERE id = $1"))
         .bind(user_id)
-        .execute(executor)
+        .execute(executor.into_sqlx())
         .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -388,10 +389,10 @@ pub struct FederatedUserRecord {
 /// one already created for it. Concurrent calls for one subject return the
 /// same user.
 pub async fn upsert_federated_user(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     user: FederatedUser<'_>,
-) -> Result<FederatedUserRecord, sqlx::Error> {
-    sqlx::query_as::<_, FederatedUserRecord>(sql!(
+) -> Result<FederatedUserRecord, DbError> {
+    Ok(sqlx::query_as::<_, FederatedUserRecord>(sql!(
         "INSERT INTO users (
              id, email, password_hash, display_name, org_id, role,
              owner_source, upstream_issuer, upstream_subject_id
@@ -411,6 +412,6 @@ pub async fn upsert_federated_user(
     .bind(user.org_id)
     .bind(user.upstream_issuer)
     .bind(user.upstream_subject_id)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }

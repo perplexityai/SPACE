@@ -2,8 +2,9 @@
 //! use, and an organization's key listing, creates and revocation.
 
 use pplx_space_accounts::{ApiKeyId, OrgId, SandboxOwnerSource, UserId};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::{FromRow, PgExecutor};
+use sqlx::FromRow;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -37,10 +38,10 @@ pub struct ApiKeyAuth {
 /// The key with this hash, when it is scoped to `surface`, with its
 /// organization and actor.
 pub async fn api_key_auth_by_hash(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     key_hash: &str,
     surface: ApiSurface,
-) -> Result<Option<ApiKeyAuth>, sqlx::Error> {
+) -> Result<Option<ApiKeyAuth>, DbError> {
     let row = sqlx::query_as::<_, ApiKeyAuthRow>(sql!(
         "SELECT
              k.id                AS api_key_id,
@@ -87,7 +88,7 @@ pub async fn api_key_auth_by_hash(
     ))
     .bind(key_hash)
     .bind(surface.as_str())
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(row.map(ApiKeyAuthRow::into_auth))
 }
@@ -205,10 +206,10 @@ impl ApiKeyAuthRow {
 /// staleness check compares with `NOW()`, the start of the transaction the
 /// statement runs in.
 pub async fn advance_api_key_last_used_at(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     api_key_id: Uuid,
     stale_after: std::time::Duration,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "UPDATE api_keys
             SET last_used_at = NOW()
@@ -224,7 +225,7 @@ pub async fn advance_api_key_last_used_at(
     ))
     .bind(api_key_id)
     .bind(stale_after.as_secs_f64())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -251,10 +252,10 @@ pub enum ApiKeyRevocation {
 /// without removing the row, so a key this statement revokes still counts as
 /// found.
 pub async fn revoke_organization_api_key(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     api_key_id: ApiKeyId,
-) -> Result<ApiKeyRevocation, sqlx::Error> {
+) -> Result<ApiKeyRevocation, DbError> {
     let (revoked, found) = sqlx::query_as::<_, (bool, bool)>(sql!(
         "WITH revoked AS (
              UPDATE api_keys
@@ -271,7 +272,7 @@ pub async fn revoke_organization_api_key(
     ))
     .bind(api_key_id)
     .bind(org_id)
-    .fetch_one(executor)
+    .fetch_one(executor.into_sqlx())
     .await?;
     Ok(match (revoked, found) {
         (true, _) => ApiKeyRevocation::Revoked,
@@ -283,11 +284,11 @@ pub async fn revoke_organization_api_key(
 /// Whether a key with this hash belongs to `org_id` and is scoped to the ECW
 /// surface.
 pub async fn ecw_api_key_authorizes_org(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     key_hash: &str,
     org_id: OrgId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT EXISTS (
              SELECT 1 FROM api_keys
              WHERE org_id = $1 AND key_hash = $2
@@ -296,8 +297,8 @@ pub async fn ecw_api_key_authorizes_org(
     ))
     .bind(org_id)
     .bind(key_hash)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// A key as an organization's key listing shows it, with its creator's email.
@@ -318,11 +319,11 @@ pub struct ApiKeyRow {
 /// An organization's keys, newest first; revoked ones only with
 /// `include_revoked`.
 pub async fn list_organization_api_keys(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     include_revoked: bool,
-) -> Result<Vec<ApiKeyRow>, sqlx::Error> {
-    sqlx::query_as::<_, ApiKeyRow>(sql!(
+) -> Result<Vec<ApiKeyRow>, DbError> {
+    Ok(sqlx::query_as::<_, ApiKeyRow>(sql!(
         "SELECT k.id,
                 k.org_id,
                 k.name,
@@ -341,8 +342,8 @@ pub async fn list_organization_api_keys(
     ))
     .bind(org_id)
     .bind(include_revoked)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 pub struct CreateApiKey<'a> {
@@ -355,14 +356,14 @@ pub struct CreateApiKey<'a> {
 }
 
 pub async fn create_api_key(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     input: CreateApiKey<'_>,
-) -> Result<ApiKeyRow, sqlx::Error> {
+) -> Result<ApiKeyRow, DbError> {
     // Return the creator label in the insert statement so a successful write
     // cannot be followed by a failed reload that loses the one-time secret
     // response. The CTE makes the inserted row available to that joined
     // projection without opening a second database round trip.
-    sqlx::query_as::<_, ApiKeyRow>(sql!(
+    Ok(sqlx::query_as::<_, ApiKeyRow>(sql!(
         "WITH inserted AS (
              INSERT INTO api_keys (
                  id, org_id, name, key_hash, created_by, allowed_surfaces,
@@ -391,6 +392,6 @@ pub async fn create_api_key(
     .bind(input.key_hash)
     .bind(input.created_by)
     .bind(input.allowed_surfaces)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }

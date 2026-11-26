@@ -2,9 +2,10 @@
 //! read, the federated owner reads, and the local and federated creates.
 
 use pplx_space_accounts::OrgId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgConnection, PgExecutor};
+use sqlx::FromRow;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -35,45 +36,45 @@ pub struct Organization {
 }
 
 pub async fn get_organization(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
-) -> Result<Option<Organization>, sqlx::Error> {
-    sqlx::query_as::<_, Organization>(sql!(
+) -> Result<Option<Organization>, DbError> {
+    Ok(sqlx::query_as::<_, Organization>(sql!(
         "SELECT id, name, slug, parent_id, theme_primary, theme_secondary, logo_url,
                 byok_enabled, snapshot_base_object_storage_uri, created_at, updated_at
          FROM organizations WHERE id = $1"
     ))
     .bind(org_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Every organization, by name.
-pub async fn list_organizations(
-    executor: impl PgExecutor<'_>,
-) -> Result<Vec<Organization>, sqlx::Error> {
-    sqlx::query_as::<_, Organization>(sql!(
+pub async fn list_organizations(executor: impl Executor<'_>) -> Result<Vec<Organization>, DbError> {
+    Ok(sqlx::query_as::<_, Organization>(sql!(
         "SELECT id, name, slug, parent_id, theme_primary, theme_secondary, logo_url,
                 byok_enabled, snapshot_base_object_storage_uri, created_at, updated_at
          FROM organizations ORDER BY name, id"
     ))
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The id of every organization.
-pub async fn organization_ids(executor: impl PgExecutor<'_>) -> Result<Vec<OrgId>, sqlx::Error> {
-    sqlx::query_scalar::<_, OrgId>(sql!("SELECT id FROM organizations"))
-        .fetch_all(executor)
-        .await
+pub async fn organization_ids(executor: impl Executor<'_>) -> Result<Vec<OrgId>, DbError> {
+    Ok(
+        sqlx::query_scalar::<_, OrgId>(sql!("SELECT id FROM organizations"))
+            .fetch_all(executor.into_sqlx())
+            .await?,
+    )
 }
 
 /// `org_id` and every organization below it through `parent_id`.
 pub async fn organization_subtree_ids(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
-) -> Result<Vec<OrgId>, sqlx::Error> {
-    sqlx::query_scalar::<_, OrgId>(sql!(
+) -> Result<Vec<OrgId>, DbError> {
+    Ok(sqlx::query_scalar::<_, OrgId>(sql!(
         "WITH RECURSIVE org_tree AS (
             SELECT id FROM organizations WHERE id = $1
             UNION ALL
@@ -82,17 +83,17 @@ pub async fn organization_subtree_ids(
         SELECT id FROM org_tree"
     ))
     .bind(org_id)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether `target_org_id` is `root_org_id` or below it through `parent_id`.
 pub async fn organization_subtree_contains(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     root_org_id: OrgId,
     target_org_id: OrgId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
         "WITH RECURSIVE org_tree AS (
             SELECT id FROM organizations WHERE id = $1
             UNION ALL
@@ -102,45 +103,47 @@ pub async fn organization_subtree_contains(
     ))
     .bind(root_org_id)
     .bind(target_org_id)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 pub async fn organization_exists(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
         "SELECT EXISTS(SELECT 1 FROM organizations WHERE id = $1)"
     ))
     .bind(org_id)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether the organization exists and is a local one, not materialized for
 /// a federated owner.
 pub async fn organization_has_local_owner(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT EXISTS(SELECT 1 FROM organizations WHERE id = $1 AND owner_source = 'local')"
     ))
     .bind(org_id)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// The organization's BYOK flag, or `None` when the organization is missing.
 pub async fn organization_byok_enabled(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
-) -> Result<Option<bool>, sqlx::Error> {
-    sqlx::query_scalar(sql!("SELECT byok_enabled FROM organizations WHERE id = $1"))
-        .bind(org_id)
-        .fetch_optional(executor)
-        .await
+) -> Result<Option<bool>, DbError> {
+    Ok(
+        sqlx::query_scalar(sql!("SELECT byok_enabled FROM organizations WHERE id = $1"))
+            .bind(org_id)
+            .fetch_optional(executor.into_sqlx())
+            .await?,
+    )
 }
 
 /// Who owns an organization: `owner_source` as stored, and the upstream
@@ -153,15 +156,15 @@ pub struct OrganizationOwner {
 
 /// The organization's owner, or `None` when the organization is missing.
 pub async fn organization_owner(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
-) -> Result<Option<OrganizationOwner>, sqlx::Error> {
-    sqlx::query_as::<_, OrganizationOwner>(sql!(
+) -> Result<Option<OrganizationOwner>, DbError> {
+    Ok(sqlx::query_as::<_, OrganizationOwner>(sql!(
         "SELECT owner_source, upstream_org_id FROM organizations WHERE id = $1"
     ))
     .bind(org_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// An organization's branding columns.
@@ -173,20 +176,24 @@ pub struct OrganizationBranding {
 }
 
 /// The organization's branding, with its row locked `FOR UPDATE` until the
-/// caller's transaction ends; `None` when the organization is missing.
-pub async fn lock_organization_branding(
-    conn: &mut PgConnection,
+/// caller's transaction ends; `None` when the organization is missing. The
+/// caller must pass its open transaction.
+pub async fn lock_organization_branding<C>(
+    tx: &mut C,
     org_id: OrgId,
-) -> Result<Option<OrganizationBranding>, sqlx::Error> {
-    sqlx::query_as::<_, OrganizationBranding>(sql!(
+) -> Result<Option<OrganizationBranding>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_as::<_, OrganizationBranding>(sql!(
         "SELECT theme_primary, theme_secondary, logo_url
          FROM organizations
          WHERE id = $1
          FOR UPDATE"
     ))
     .bind(org_id)
-    .fetch_optional(conn)
-    .await
+    .fetch_optional(tx.into_sqlx())
+    .await?)
 }
 
 /// A local organization to create.
@@ -201,10 +208,10 @@ pub struct NewOrganization {
 }
 
 pub async fn create_organization(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org: NewOrganization,
-) -> Result<Organization, sqlx::Error> {
-    sqlx::query_as::<_, Organization>(sql!(
+) -> Result<Organization, DbError> {
+    Ok(sqlx::query_as::<_, Organization>(sql!(
         "INSERT INTO organizations (
              id, name, slug, parent_id, theme_primary, theme_secondary, logo_url
          )
@@ -219,8 +226,8 @@ pub async fn create_organization(
     .bind(org.theme_primary)
     .bind(org.theme_secondary)
     .bind(org.logo_url)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Changes to an organization. `None` leaves a field as it is; for a
@@ -237,11 +244,11 @@ pub struct OrganizationPatch {
 
 /// Apply `patch` to the organization; `None` when there is none.
 pub async fn update_organization(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     patch: OrganizationPatch,
-) -> Result<Option<Organization>, sqlx::Error> {
-    sqlx::query_as::<_, Organization>(sql!(
+) -> Result<Option<Organization>, DbError> {
+    Ok(sqlx::query_as::<_, Organization>(sql!(
         "UPDATE organizations
          SET name = COALESCE($2, name),
              slug = COALESCE($3, slug),
@@ -268,8 +275,8 @@ pub async fn update_organization(
     .bind(patch.snapshot_base_object_storage_uri.is_some())
     .bind(patch.snapshot_base_object_storage_uri.flatten())
     .bind(patch.byok_enabled)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Delete the organization; `false` when there was none. A row that
@@ -277,23 +284,23 @@ pub async fn update_organization(
 /// `ON DELETE SET NULL` fails the delete with that key's error; the others
 /// are deleted or cleared with it.
 pub async fn delete_organization(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!("DELETE FROM organizations WHERE id = $1"))
         .bind(org_id)
-        .execute(executor)
+        .execute(executor.into_sqlx())
         .await?;
     Ok(result.rows_affected() > 0)
 }
 
 /// The organization created for an upstream organization, if there is one.
 pub async fn federated_organization_id(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     upstream_issuer: &str,
     upstream_org_id: &str,
-) -> Result<Option<OrgId>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Option<OrgId>, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT id
          FROM organizations
          WHERE owner_source = 'federated_identity'
@@ -302,8 +309,8 @@ pub async fn federated_organization_id(
     ))
     .bind(upstream_issuer)
     .bind(upstream_org_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The statement [`federated_organization_user`] runs. Its select list is the
@@ -333,18 +340,19 @@ pub(crate) const FEDERATED_ORGANIZATION_USER_SQL: &str = sql!(
 /// organization maps to; `None` when either is missing or the user is not in
 /// that organization.
 pub async fn federated_organization_user(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     upstream_issuer: &str,
     upstream_org_id: &str,
     upstream_subject_id: &str,
-) -> Result<Option<UserWithOrganization>, sqlx::Error> {
+) -> Result<Option<UserWithOrganization>, DbError> {
     sqlx::query_as::<_, UserOrganizationRow>(FEDERATED_ORGANIZATION_USER_SQL)
         .bind(upstream_issuer)
         .bind(upstream_org_id)
         .bind(upstream_subject_id)
-        .fetch_optional(executor)
+        .fetch_optional(executor.into_sqlx())
         .await
         .map(|row| row.map(UserOrganizationRow::into_user_with_organization))
+        .map_err(DbError::from)
 }
 
 /// The organization a federated owner's upstream organization maps to.
@@ -361,9 +369,9 @@ pub struct FederatedOrganization<'a> {
 /// already created for it, and return its id. Concurrent calls for one
 /// upstream organization return the same id.
 pub async fn upsert_federated_organization(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org: FederatedOrganization<'_>,
-) -> Result<OrgId, sqlx::Error> {
+) -> Result<OrgId, DbError> {
     let (org_id,): (OrgId,) = sqlx::query_as(sql!(
         "INSERT INTO organizations (
              id, name, slug, owner_source, upstream_issuer, upstream_org_id
@@ -379,7 +387,7 @@ pub async fn upsert_federated_organization(
     .bind(org.slug)
     .bind(org.upstream_issuer)
     .bind(org.upstream_org_id)
-    .fetch_one(executor)
+    .fetch_one(executor.into_sqlx())
     .await?;
     Ok(org_id)
 }
