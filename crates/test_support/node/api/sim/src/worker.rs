@@ -466,6 +466,9 @@ impl WorkerApi for SimWorkerApiService {
         &self,
         request: Request<sbx::CreateRequest>,
     ) -> Result<Response<sbx::CreateResponse>, Status> {
+        if let Some(code) = self.state.take_create_refusal().await {
+            return Err(Status::new(code, "create refused"));
+        }
         let req = request.into_inner();
         let sandbox_id = req
             .sandbox_id

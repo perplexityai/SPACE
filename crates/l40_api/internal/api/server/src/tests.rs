@@ -2,6 +2,7 @@ mod digest_original;
 mod prefetch_catalog;
 pub(crate) mod queued_ref;
 mod reconcile_claim_origins;
+mod reconcile_completion;
 mod release_twins;
 mod runtime_desired_state;
 mod substrate_scope;
