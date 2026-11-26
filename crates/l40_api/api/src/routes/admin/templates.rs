@@ -409,7 +409,7 @@ async fn enqueue_template_refs_for_nodes_tx(
         return Ok(());
     }
     enqueue_node_reconcile_refs_for_nodes_tx(tx, node_ids.clone(), refs).await?;
-    enqueue_triggers_tx(tx, node_ids, reason).await?;
+    enqueue_triggers_tx(&mut **tx, node_ids, reason).await?;
     Ok(())
 }
 
@@ -451,7 +451,7 @@ pub(super) async fn requeue_reconcile_targets_tx(
         return Ok(());
     }
     requeue_node_reconcile_refs_for_nodes_tx(tx, node_ids.clone(), refs).await?;
-    enqueue_triggers_tx(tx, node_ids, reason).await?;
+    enqueue_triggers_tx(&mut **tx, node_ids, reason).await?;
     Ok(())
 }
 

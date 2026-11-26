@@ -7,6 +7,7 @@
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 
 /// How many dead refs and dead triggers [`prune_dead`] deleted.
@@ -20,10 +21,10 @@ pub struct DeadPruneCounts {
 /// first, that were dead-lettered at least `retention_secs` ago and have not
 /// been requested (a ref) or touched (a trigger) since.
 pub async fn prune_dead(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     retention_secs: i64,
     limit: i64,
-) -> Result<DeadPruneCounts, sqlx::Error> {
+) -> Result<DeadPruneCounts, DbError> {
     let (queue, triggers): (i64, i64) = sqlx::query_as(sql!(
         "WITH doomed AS MATERIALIZED (
              SELECT 'queue'::TEXT AS record_kind,
@@ -75,7 +76,7 @@ pub async fn prune_dead(
     ))
     .bind(retention_secs)
     .bind(limit)
-    .fetch_one(executor)
+    .fetch_one(executor.into_sqlx())
     .await?;
     Ok(DeadPruneCounts { queue, triggers })
 }
@@ -106,14 +107,14 @@ pub struct GoneNodeDebt {
 /// row locks serve only this statement: on a pool they end with it, and
 /// inside a caller's transaction they last until that transaction ends.
 pub async fn prune_gone_node_debt(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     expected_uid: Option<&str>,
     retention_secs: i64,
     limit: i64,
     claim_grace_secs: i64,
     delete: bool,
-) -> Result<GoneNodeDebt, sqlx::Error> {
+) -> Result<GoneNodeDebt, DbError> {
     let (eligible_queue, eligible_triggers, deleted_queue, deleted_triggers): (i64, i64, i64, i64) =
         sqlx::query_as(sql!(
             "WITH candidate_node AS MATERIALIZED (
@@ -215,7 +216,7 @@ pub async fn prune_gone_node_debt(
         .bind(claim_grace_secs)
         .bind(delete)
         .bind(SubstrateKind::Kubernetes)
-        .fetch_one(executor)
+        .fetch_one(executor.into_sqlx())
         .await?;
     Ok(GoneNodeDebt {
         eligible_queue,

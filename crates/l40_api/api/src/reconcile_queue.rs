@@ -4,6 +4,7 @@ use pplx_space_sandbox_model::SandboxId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use pplx_space_postgres_pool::Executor;
 use sqlx::PgPool;
 
 use pplx_space_sandbox_store::delete::delete_with_dependents;
@@ -255,8 +256,8 @@ fn normalized_refs(refs: &[ReconcileRef]) -> Vec<(String, String)> {
         .collect()
 }
 
-async fn enqueue_node_reconcile_refs_for_nodes_on<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
+async fn enqueue_node_reconcile_refs_for_nodes_on(
+    executor: impl Executor<'_>,
     node_ids: &[NodeId],
     refs: &[(String, String)],
     conflict: QueuedRefConflict,
@@ -289,7 +290,7 @@ async fn enqueue_node_reconcile_refs_for_nodes_on<'e>(
                     crate::metrics::reconcile::queued(facet, "error");
                 }
             }
-            Err(error)
+            Err(sqlx::Error::from(error))
         }
     }
 }
@@ -312,7 +313,7 @@ pub async fn enqueue_node_reconcile_refs_and_trigger_tx(
     reason: ReconcileReason,
 ) -> Result<EnqueuedNodeReconcile, sqlx::Error> {
     let enqueued = enqueue_node_reconcile_refs_tx(tx, node_id, refs).await?;
-    enqueue_triggers_tx(tx, [enqueued.node_id], reason).await?;
+    enqueue_triggers_tx(&mut **tx, [enqueued.node_id], reason).await?;
     Ok(enqueued)
 }
 
@@ -367,7 +368,7 @@ pub async fn enqueue_sandbox_reconcile_and_trigger_tx(
 ) -> Result<Option<EnqueuedNodeReconcile>, sqlx::Error> {
     let enqueued = enqueue_sandbox_reconcile_tx(tx, sandbox_id, refs).await?;
     if let Some(enqueued) = enqueued {
-        enqueue_triggers_tx(tx, [enqueued.node_id], reason).await?;
+        enqueue_triggers_tx(&mut **tx, [enqueued.node_id], reason).await?;
         return Ok(Some(enqueued));
     }
     Ok(None)

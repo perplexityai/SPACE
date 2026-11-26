@@ -362,7 +362,9 @@ impl Wakeup for Wake {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         node: NodeId,
     ) -> Result<u64, sqlx::Error> {
-        enqueue_triggers_tx(tx, [node], ReconcileReason::FirewallRulesChanged).await
+        enqueue_triggers_tx(&mut **tx, [node], ReconcileReason::FirewallRulesChanged)
+            .await
+            .map_err(sqlx::Error::from)
     }
 }
 
