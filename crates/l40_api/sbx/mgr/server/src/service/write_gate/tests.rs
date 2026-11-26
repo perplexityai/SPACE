@@ -275,3 +275,62 @@ fn refused(refusal: SealRefusal) -> Answer {
     }
     Answer::Refused(status.code(), marker)
 }
+
+/// A writer is decided by the sandbox's row as it stands once the writer
+/// holds the artifact lock, not as it stood when it asked: on a node known
+/// sealed, a disk publication of a started sandbox that waits for the lock
+/// while the sandbox is suspended is refused once it gets the lock, as its
+/// class's contract says for a suspended sandbox, and isn't counted.
+#[tokio::test]
+async fn a_writer_waiting_for_the_lock_is_decided_by_the_row_it_finds_under_it() {
+    let (gate, rows) = node(Seal::Sealed, false);
+    let started = SandboxStatus::from(SandboxState::Started);
+    let id = rows
+        .iter()
+        .find(|(_, row)| matches!(row, Row::Reads(Some(status)) if *status == started))
+        .map(|(id, _)| id.clone())
+        .expect("a started sandbox");
+    let writer = LockedWriter::Producer(Producer::ScheduledDiskSnapshot);
+
+    let held = gate.lock_for_read(&id, Reader::Test).await;
+    let publication = tokio::spawn({
+        let gate = gate.clone();
+        let id = id.clone();
+        async move {
+            gate.lock_for_publication(&id, ArtifactKind::Disk, writer)
+                .await
+                .map(drop)
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while gate.artifact_lock_handles(&id) < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the publication waits for the lock");
+    gate.admission
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE sandboxes SET state = 'suspended' WHERE id = ?1",
+            [&id],
+        )
+        .unwrap();
+    drop(held);
+
+    let decided = tokio::time::timeout(std::time::Duration::from_secs(2), publication)
+        .await
+        .expect("the publication is decided once the lock is free")
+        .unwrap();
+    let Err(refusal) = decided else {
+        panic!("the publication was admitted on the row it found when it asked");
+    };
+    let suspended = Row::Reads(Some(SandboxStatus::from(SandboxState::Suspended)));
+    assert_eq!(
+        refused(refusal),
+        contract(Asked::Publication(writer), Seal::Sealed, suspended)
+    );
+    gate.seal().assert_quiesced();
+}
