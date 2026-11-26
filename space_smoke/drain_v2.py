@@ -2162,12 +2162,13 @@ class DrainV2Assertions:
 
     def node_holds_vm_running(self, sandbox_id: str) -> bool:
         """Whether the drained worker's sandbox-manager still holds the
-        sandbox `started`. The node's own state, not the row's: a suspend the
-        node made reaches the row only once its snapshot is durable, so with
-        its upload cut the row still reads `started` after the node took the
-        VM down."""
+        sandbox's VM running: its row reads `started`, or a checkpoint a
+        running VM passes through (`HELD_NODE_STATES`), not `suspending`. The
+        node's own state, not the row's: a suspend the node made reaches the
+        row only once its snapshot is durable, so with its upload cut the row
+        still reads `started` after the node took the VM down."""
 
-        return self.node_state(sandbox_id) == "started"
+        return self.node_state(sandbox_id) in HELD_NODE_STATES
 
     def expect_left_started(self, sandbox_id: str, *, timeout: float = NODE_SUSPEND_SECONDS) -> str:
         """Past the deadline, the node takes the running sandbox down: its row
@@ -2347,16 +2348,23 @@ class DrainV2Assertions:
 
     def expect_calls_pass_until_suspended(
         self, sandbox: DurableLifecycleSandbox, *, lead: float = CALLS_LEAD_SECONDS
-    ) -> dict[str, list[int]]:
+    ) -> dict[str, list[Any]]:
         """From `lead` seconds before the deadline until the node suspends the
-        sandbox, one probe after another: each call that met its VM running
-        on the drained worker before and after it passes, before the deadline
-        and past it, as a drain refuses no call to a running sandbox. At
-        least one lands before the deadline, when the node must still hold
-        the VM. Past the deadline the node suspends at the controller's
-        first evacuating call, up to a tick after it, so a run may meet the
-        VM running there or not: `expect_sampled_past_deadline` judges that.
-        The statuses before and past the deadline."""
+        sandbox, one probe after another, each call judged by the node's state
+        read just before it. A call made while the node held the VM running
+        must pass, before the deadline and past it, as a drain refuses no
+        call to a running sandbox. If the node read not running just after
+        it, the suspend began during the call: the call may still pass, and
+        the one refusal excused is the drain's documented retryable answer, a
+        `GATE_REFUSAL_STATUS` (503) with a `Retry-After`, recorded under
+        `overlapping_suspend`. Any other answer to a call made while the VM
+        ran fails the run; none is discarded. At least one call lands
+        before the deadline, when the node must still hold the VM. Past the
+        deadline the node suspends at the controller's first evacuating
+        call, up to a tick after it, so a run may or may not judge a call
+        there that the VM outlived: `expect_sampled_past_deadline` judges
+        that. The statuses before and past the deadline of the calls the VM
+        outlived, and the overlapping ones."""
 
         subject = cast(RawCallSandbox, sandbox)
         bare = self.bare_id(sandbox.sandbox_id)
@@ -2364,6 +2372,7 @@ class DrainV2Assertions:
             self._fixture.wait(max(1, remaining - lead))
         before: list[int] = []
         past: list[int] = []
+        overlapping: list[dict[str, Any]] = []
         # The lead, then the controller's first evacuating tick and its call,
         # which starts the node's suspend, with a 30 s margin.
         deadline = time.monotonic() + lead + TICK_SECONDS + CALL_BUDGET_SECONDS + 30
@@ -2372,9 +2381,17 @@ class DrainV2Assertions:
         while self.node_holds_vm_running(sandbox.sandbox_id):
             asked = self.seconds_to_deadline()
             answer = subject.command_answer("true")
-            if not self.node_holds_vm_running(sandbox.sandbox_id):
+            if self.node_holds_vm_running(sandbox.sandbox_id):
+                (before if asked > 0 else past).append(answer.status)
+            else:
+                overlapping.append(
+                    {
+                        "status": answer.status,
+                        "retry_after": answer.retry_after,
+                        "seconds_to_deadline": round(asked, 1),
+                    }
+                )
                 break
-            (before if asked > 0 else past).append(answer.status)
             self._fixture.verify(
                 time.monotonic() < deadline,
                 "the node never suspended the running sandbox past the deadline",
@@ -2382,7 +2399,11 @@ class DrainV2Assertions:
                 before_deadline=before[-10:],
                 past_deadline=past[-10:],
             )
-        seen = {"before_deadline": before, "past_deadline": past}
+        seen: dict[str, list[Any]] = {
+            "before_deadline": before,
+            "past_deadline": past,
+            "overlapping_suspend": overlapping,
+        }
         self._fixture.record(f"calls_around_deadline_{bare}", seen)
         self._fixture.verify(
             bool(before),
@@ -2394,9 +2415,19 @@ class DrainV2Assertions:
             "a call to a running sandbox around the deadline did not pass",
             **seen,
         )
+        self._fixture.verify(
+            all(
+                call["status"] == CALL_PASSED_STATUS
+                or (call["status"] == GATE_REFUSAL_STATUS and call["retry_after"] is not None)
+                for call in overlapping
+            ),
+            "a call made while the VM ran was refused, as its suspend began, with something "
+            "but the drain's retryable 503 with Retry-After",
+            **seen,
+        )
         return seen
 
-    def expect_sampled_past_deadline(self, seen: Mapping[str, list[int]]) -> None:
+    def expect_sampled_past_deadline(self, seen: Mapping[str, list[Any]]) -> None:
         """At least one call met the VM running past the deadline
         (`expect_calls_pass_until_suspended`), so the run judged a call
         there. A run whose calls all landed before it, or after the node's

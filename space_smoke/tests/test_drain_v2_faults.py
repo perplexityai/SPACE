@@ -155,14 +155,15 @@ class _Control:
 
 
 class _Sandbox:
-    def __init__(self, sandbox_id: str, statuses: list[int]) -> None:
+    def __init__(self, sandbox_id: str, statuses: list[int | CallAnswer]) -> None:
         self.sandbox_id = sandbox_id
         self.statuses = statuses
         self.commands = 0
 
     def command_answer(self, _command: str) -> CallAnswer:
         self.commands += 1
-        return CallAnswer(status=self.statuses.pop(0), retry_after=None, body={})
+        answer = self.statuses.pop(0)
+        return answer if isinstance(answer, CallAnswer) else CallAnswer(status=answer, retry_after=None, body={})
 
 
 def _assertions(control: _Control | None = None) -> tuple[DrainV2Assertions, _Fixture]:
@@ -409,9 +410,16 @@ class GateAnswers(unittest.TestCase):
         # Inside the lead: the calls start at once, before the deadline, and
         # the node suspends before any lands past it: no call there judged.
         drain._deadline = int(time.time()) + 3
-        caller = _Sandbox(sandbox, [CALL_PASSED_STATUS, GATE_REFUSAL_STATUS])
+        caller = _Sandbox(sandbox, [CALL_PASSED_STATUS, CALL_PASSED_STATUS])
         seen = drain.expect_calls_pass_until_suspended(caller)  # type: ignore[arg-type]
-        self.assertEqual(seen, {"before_deadline": [CALL_PASSED_STATUS], "past_deadline": []})
+        self.assertEqual(
+            seen,
+            {
+                "before_deadline": [CALL_PASSED_STATUS],
+                "past_deadline": [],
+                "overlapping_suspend": [{"status": CALL_PASSED_STATUS, "retry_after": None, "seconds_to_deadline": seen["overlapping_suspend"][0]["seconds_to_deadline"]}],
+            },
+        )
         self.assertEqual(caller.commands, 2)
         with self.assertRaises(InconclusiveSmoke):
             drain.expect_sampled_past_deadline(seen)
@@ -423,7 +431,7 @@ class GateAnswers(unittest.TestCase):
                 _Sandbox(sandbox, [CALL_PASSED_STATUS, CALL_PASSED_STATUS])  # type: ignore[arg-type]
             )
         self.assertEqual(
-            seen, {"before_deadline": [CALL_PASSED_STATUS], "past_deadline": [CALL_PASSED_STATUS]}
+            (seen["before_deadline"], seen["past_deadline"]), ([CALL_PASSED_STATUS], [CALL_PASSED_STATUS])
         )
         drain.expect_sampled_past_deadline(seen)
         for refused in (409, GATE_REFUSAL_STATUS):
@@ -432,6 +440,32 @@ class GateAnswers(unittest.TestCase):
             with self.subTest(refused=refused), self.assertRaises(InvariantViolation):
                 drain.expect_calls_pass_until_suspended(_Sandbox(sandbox, [refused, 201]))  # type: ignore[arg-type]
             self.assertIn(f"calls_around_deadline_{sandbox}", fixture.evidence)
+
+    def test_a_call_made_while_the_vm_ran_is_judged_even_as_its_suspend_begins(self) -> None:
+        sandbox = "00000000-0000-4000-8000-00000000000f"
+        # The node holds the VM before each call; the suspend begins during
+        # the second, which the node then reads `suspending` after.
+        states = ["started", "started", "started", "suspending"]
+        retryable = CallAnswer(status=GATE_REFUSAL_STATUS, retry_after=1, body={})
+        for second, judged in ((409, False), (CallAnswer(status=GATE_REFUSAL_STATUS, retry_after=None, body={}), False), (retryable, True)):
+            drain, fixture = _assertions(_Control(node_states={sandbox: list(states)}))
+            drain._deadline = int(time.time()) + 3
+            caller = _Sandbox(sandbox, [CALL_PASSED_STATUS, second])
+            with self.subTest(second=second):
+                if judged:
+                    seen = drain.expect_calls_pass_until_suspended(caller)  # type: ignore[arg-type]
+                    self.assertEqual([call["status"] for call in seen["overlapping_suspend"]], [GATE_REFUSAL_STATUS])
+                else:
+                    with self.assertRaisesRegex(InvariantViolation, "refused, as its suspend began"):
+                        drain.expect_calls_pass_until_suspended(caller)  # type: ignore[arg-type]
+                    self.assertEqual(len(fixture.evidence["overlapping_suspend"]), 1)
+        # A checkpoint between two reads keeps the probe going.
+        drain, _ = _assertions(_Control(node_states={sandbox: ["started", "checkpointing", "checkpointing", "started", "suspending"]}))
+        drain._deadline = int(time.time()) + 3
+        seen = drain.expect_calls_pass_until_suspended(
+            _Sandbox(sandbox, [CALL_PASSED_STATUS, CALL_PASSED_STATUS, CALL_PASSED_STATUS])  # type: ignore[arg-type]
+        )
+        self.assertEqual(seen["before_deadline"], [CALL_PASSED_STATUS, CALL_PASSED_STATUS])
 
     def test_before_the_deadline_a_call_must_meet_the_vm_running(self) -> None:
         sandbox = "00000000-0000-4000-8000-00000000000e"
