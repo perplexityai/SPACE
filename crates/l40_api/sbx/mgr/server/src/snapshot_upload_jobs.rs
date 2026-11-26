@@ -880,11 +880,13 @@ impl SnapshotUploadExecutor {
     /// IDs ([`end_unsubmitted_upload_job`](crate::db::snapshot_upload_jobs::end_unsubmitted_upload_job)),
     /// so a handoff persists its transfers either before it, and the attempt
     /// polls them, or after it, and finds the job ended and fails. The worker's
-    /// own write of the failure then finds the job failed already. The job's
-    /// end is durable before the row is marked; marking the row is best
-    /// effort, so a row the control plane doesn't hear about stays
-    /// `creating`, refusing the sandbox's delete until the stuck-attempt
-    /// reaper fails it. An upload that never registered has no row to mark.
+    /// own write of the failure then finds the job failed already, and logs at
+    /// WARN that it skipped the update. The job's end is durable before the
+    /// row is marked; marking the row is best effort, and restart recovery
+    /// doesn't retry it, so a row the control plane doesn't hear about stays
+    /// `creating`, refusing the sandbox's delete, until an enabled
+    /// stuck-snapshot reaper or an operator fails it. An upload that never
+    /// registered has no row to mark.
     async fn end_superseded_upload(
         &self,
         job_id: &JobId,
