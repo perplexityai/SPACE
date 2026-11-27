@@ -98,7 +98,7 @@ impl K8sStore {
         }
 
         let claim = self
-            .ensure_active_execution_claim_in(&mut tx, sandbox_id, None)
+            .ensure_active_execution_claim_in(&mut tx, sandbox_id, None, None, None)
             .await?;
         let generation = pplx_space_sandbox_store::k8s_executions::started_recovery::claim(
             &mut *tx,

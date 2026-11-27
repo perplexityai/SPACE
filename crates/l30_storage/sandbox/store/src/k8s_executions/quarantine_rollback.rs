@@ -31,6 +31,10 @@ pub struct ActivationRollbackCandidateRow {
     /// The stored `sandboxes.lifecycle`, trimmed and lower-cased.
     pub prior_lifecycle: String,
     pub failure_message: Option<String>,
+    /// The receipt's execution records a runtime upgrade and its claim
+    /// targets the `stay_stopped_target_state` the caller passed: a
+    /// stay-stopped runtime upgrade's execution.
+    pub stay_stopped_upgrade: bool,
 }
 
 /// [`lock_activation_rollback_candidates`]'s statement.
@@ -42,7 +46,12 @@ const LOCK_ACTIVATION_ROLLBACK_CANDIDATES: &str = sql!(
             input.transition_receipt_target_state,
             input.transition_receipt_reason_code,
             LOWER(TRIM(s.lifecycle)),
-            input.failure_reason
+            input.failure_reason,
+            COALESCE(
+                execution.runtime_upgrade_operation_id IS NOT NULL
+                    AND execution.activation_attempt_target_state = $4,
+                FALSE
+            )
        FROM sandboxes s
        JOIN jsonb_to_recordset($2::jsonb) AS input(
             sandbox_id UUID,
@@ -94,6 +103,7 @@ pub async fn lock_activation_rollback_candidates<C>(
     node_id: NodeId,
     rows: Json<JsonValue>,
     receipt_kind: SandboxTransitionReceiptKind,
+    stay_stopped_target_state: &str,
 ) -> Result<Vec<ActivationRollbackCandidateRow>, DbError>
 where
     for<'a> &'a mut C: Executor<'a>,
@@ -107,11 +117,13 @@ where
         String,
         String,
         Option<String>,
+        bool,
     );
     let rows: Vec<CandidateRow> = sqlx::query_as(LOCK_ACTIVATION_ROLLBACK_CANDIDATES)
         .bind(node_id)
         .bind(rows)
         .bind(receipt_kind.as_str())
+        .bind(stay_stopped_target_state)
         .fetch_all(conn.into_sqlx())
         .await?;
     Ok(rows
@@ -126,6 +138,7 @@ where
                 reason_code,
                 prior_lifecycle,
                 failure_message,
+                stay_stopped_upgrade,
             )| ActivationRollbackCandidateRow {
                 sandbox_id,
                 receipt_id,
@@ -135,6 +148,7 @@ where
                 reason_code,
                 prior_lifecycle,
                 failure_message,
+                stay_stopped_upgrade,
             },
         )
         .collect())

@@ -44,6 +44,7 @@ pub mod quarantine_rollback;
 pub mod retire;
 pub mod runtime_attribution;
 pub mod started_recovery;
+pub mod stopped_runtime_upgrade;
 pub mod suspend;
 pub mod suspended_reaper;
 pub mod transient_sweeper;

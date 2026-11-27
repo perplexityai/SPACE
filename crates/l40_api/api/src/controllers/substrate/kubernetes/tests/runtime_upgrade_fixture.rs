@@ -9,7 +9,7 @@ use pplx_space_accounts::NodeId;
 use pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternal;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_pod::{
-    RUNTIME_UPGRADE_CHECKPOINT, SANDBOX_CHECKPOINT_ANNOTATION,
+    RUNTIME_UPGRADE_CHECKPOINT, SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_NETWORK_SLOTS_RESOURCE,
     SANDBOX_RUNTIME_UPGRADE_OPERATION_ID_ANNOTATION,
     SANDBOX_RUNTIME_UPGRADE_TARGET_STATE_ANNOTATION,
 };
@@ -28,6 +28,8 @@ use crate::controllers::substrate::kubernetes::scripted_test_doubles::{
 
 pub(in crate::controllers::substrate::kubernetes) const GET_RUNTIME_UPGRADE: &str =
     "WorkerApiInternal/GetRuntimeUpgrade";
+pub(in crate::controllers::substrate::kubernetes) const WAKE: &str =
+    "WorkerApiInternal/WakeSandbox";
 pub(in crate::controllers::substrate::kubernetes) const ENQUEUE_BACKUP: &str =
     "WorkerApi/EnqueueSandboxArtifactBackup";
 
@@ -69,6 +71,10 @@ pub(in crate::controllers::substrate::kubernetes) enum Report {
     /// as for [`Self::RolledBack`].
     KeptPodRefused,
     InProgress,
+    /// The node-api can't answer.
+    Unreachable,
+    /// The node-api takes the call and never answers it.
+    Hangs,
 }
 
 /// The pod an earlier attempt's report names: never one the API created.
@@ -92,12 +98,44 @@ pub(in crate::controllers::substrate::kubernetes) struct Node {
     pub(in crate::controllers::substrate::kubernetes) asked_pod_uids: Mutex<Vec<Option<String>>>,
     publisher: (sqlx::PgPool, NodeId),
     pods: Arc<Pods>,
+    /// Every operation id an `AbandonRuntimeUpgrade` named, in order, and
+    /// whether the pod carrying the upgrade was gone when it arrived.
+    abandons: Mutex<Vec<(String, bool)>>,
+    /// What `AbandonRuntimeUpgrade` answers; `None` succeeds.
+    abandon_refusal: Mutex<Option<tonic::Code>>,
+    /// Operation ids the node records for another sandbox, which
+    /// `AbandonRuntimeUpgrade` refuses as sandbox-manager does
+    /// (`OperationNamesAnother`, `INVALID_ARGUMENT`).
+    operations_of_another_sandbox: Mutex<Vec<String>>,
 }
 
 impl Node {
     pub(in crate::controllers::substrate::kubernetes) fn report(&self, report: Report) {
         *self.report.lock().unwrap() = report;
         *self.report_pod_uid.lock().unwrap() = self.pods.current_uid();
+    }
+
+    /// Every operation id an `AbandonRuntimeUpgrade` named, with whether the
+    /// upgrade's pod was gone by then.
+    pub(in crate::controllers::substrate::kubernetes) fn abandons(&self) -> Vec<(String, bool)> {
+        self.abandons.lock().unwrap().clone()
+    }
+
+    /// Answer every later `AbandonRuntimeUpgrade` with `code`.
+    pub(in crate::controllers::substrate::kubernetes) fn refuse_abandons(&self, code: tonic::Code) {
+        *self.abandon_refusal.lock().unwrap() = Some(code);
+    }
+
+    /// Record `operation_id` for another sandbox, as a node would that ran
+    /// it for one, so an abandon naming this sandbox is refused.
+    pub(in crate::controllers::substrate::kubernetes) fn record_for_another_sandbox(
+        &self,
+        operation_id: &str,
+    ) {
+        self.operations_of_another_sandbox
+            .lock()
+            .unwrap()
+            .push(operation_id.to_owned());
     }
 
     /// The pod the reported rollback or refusal is the outcome of, pinned on
@@ -140,9 +178,30 @@ impl WorkerApiInternal for ScriptedNode {
 
     async fn abandon_runtime_upgrade(
         &self,
-        _request: tonic::Request<AbandonRuntimeUpgradeRequest>,
+        request: tonic::Request<AbandonRuntimeUpgradeRequest>,
     ) -> Result<tonic::Response<AbandonRuntimeUpgradeResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not used by this test"))
+        let pod_gone = !self.0.pods.exists();
+        self.0
+            .abandons
+            .lock()
+            .unwrap()
+            .push((request.get_ref().operation_id.clone(), pod_gone));
+        let operation_id = &request.get_ref().operation_id;
+        if self
+            .0
+            .operations_of_another_sandbox
+            .lock()
+            .unwrap()
+            .contains(operation_id)
+        {
+            return Err(tonic::Status::invalid_argument(format!(
+                "runtime upgrade {operation_id} names another sandbox"
+            )));
+        }
+        match *self.0.abandon_refusal.lock().unwrap() {
+            Some(code) => Err(tonic::Status::new(code, "scripted abandon refusal")),
+            None => Ok(tonic::Response::new(AbandonRuntimeUpgradeResponse {})),
+        }
     }
 
     async fn get_runtime_upgrade(
@@ -166,7 +225,26 @@ impl WorkerApiInternal for ScriptedNode {
                 ..Default::default()
             }));
         }
-        let report = *self.0.report.lock().unwrap();
+        // As a real node: an abandoned operation never fences again, so one
+        // it never saw stays absent, while a rollback or refusal it recorded
+        // stays as it was.
+        let abandoned = self
+            .0
+            .abandons
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(operation_id, _)| *operation_id == request.get_ref().operation_id);
+        let scripted = *self.0.report.lock().unwrap();
+        let report = match scripted {
+            Report::RolledBack
+            | Report::Refused
+            | Report::EarlierRollback
+            | Report::UnnamedRollback
+            | Report::Absent => scripted,
+            _ if abandoned => Report::Absent,
+            _ => scripted,
+        };
         let status = match report {
             Report::Upgraded { .. } | Report::AlreadyOnTarget => {
                 if matches!(
@@ -225,6 +303,8 @@ impl WorkerApiInternal for ScriptedNode {
                 RuntimeUpgradeStatus::Absent
             }
             Report::InProgress => RuntimeUpgradeStatus::InProgress,
+            Report::Unreachable => return Err(tonic::Status::unavailable("node-api is down")),
+            Report::Hangs => std::future::pending().await,
         };
         let pod_uid = match report {
             Report::EarlierRollback => Some(EARLIER_POD_UID.to_string()),
@@ -258,7 +338,7 @@ impl WorkerApiInternal for ScriptedNode {
             )
             .then(|| "the sandbox runs another pod's execution".to_string()),
             attempt_id: pod_uid,
-            abandoned: false,
+            abandoned,
             // A started target's `UpgradeRuntime` that found the sandbox on
             // the target claims its start.
             activation_claimed: matches!(
@@ -345,7 +425,8 @@ pub(in crate::controllers::substrate::kubernetes) struct Pods {
     pub(in crate::controllers::substrate::kubernetes) replace_before_deletes: AtomicBool,
     /// The worker's Node is gone from the API: its GET answers 404.
     pub(in crate::controllers::substrate::kubernetes) node_gone: AtomicBool,
-    /// The API takes a pod GET and never answers it.
+    /// The API holds every pod GET while this is set, and answers each one
+    /// it held once it's cleared. Left set, a GET is never answered.
     pub(in crate::controllers::substrate::kubernetes) pod_reads_hang: AtomicBool,
     /// Pod GETs the API answers before it drops the pod, as a forced delete
     /// takes a pod from the API with nothing confirmed on the node. Zero
@@ -353,6 +434,12 @@ pub(in crate::controllers::substrate::kubernetes) struct Pods {
     pub(in crate::controllers::substrate::kubernetes) pod_gone_after_reads: AtomicUsize,
     /// The API commits a pod create and answers it with a 500.
     pub(in crate::controllers::substrate::kubernetes) creates_fail_after_commit: AtomicBool,
+    /// A pod the API creates is already terminal, as a kubelet that failed
+    /// it before any read reports it.
+    pub(in crate::controllers::substrate::kubernetes) created_pods_fail: AtomicBool,
+    /// The pod has no address: kubelet posts it only once the shim's
+    /// pod-sandbox create returns, and a `stopped` upgrade settles inside it.
+    pub(in crate::controllers::substrate::kubernetes) addressless: AtomicBool,
     /// The API answers a pod create with a 500 before it commits, as the
     /// confirming read sees a create whose answer was lost while the API
     /// server was still processing it.
@@ -388,9 +475,44 @@ impl Pods {
     }
 
     /// The pod as the API serves it, for a reflector that has seen it.
-    fn current(&self) -> Option<Pod> {
+    pub(in crate::controllers::substrate::kubernetes) fn current(&self) -> Option<Pod> {
         let pod = self.pod.lock().unwrap().clone()?;
         Some(serde_json::from_value(self.rendered(&pod)).expect("the pod fixture parses"))
+    }
+
+    /// Set `annotations` on the pod, as the create that made it rendered them.
+    pub(in crate::controllers::substrate::kubernetes) fn annotate(
+        &self,
+        annotations: &[(&str, &str)],
+    ) {
+        if let Some(pod) = self.pod.lock().unwrap().as_mut() {
+            for (key, value) in annotations {
+                pod["metadata"]["annotations"][*key] = serde_json::json!(value);
+            }
+        }
+    }
+
+    /// The pod requests `slots` network slots, as every sandbox pod's
+    /// container does.
+    pub(in crate::controllers::substrate::kubernetes) fn request_network_slots(&self, slots: u64) {
+        if let Some(pod) = self.pod.lock().unwrap().as_mut() {
+            pod["spec"]["containers"] = serde_json::json!([{
+                "name": "sandbox",
+                "image": "sandbox",
+                "resources": {
+                    "requests": {
+                        SANDBOX_NETWORK_SLOTS_RESOURCE: slots.to_string(),
+                    },
+                },
+            }]);
+        }
+    }
+
+    /// The pod fails, as its kubelet reports a pod whose sandbox can't run.
+    pub(in crate::controllers::substrate::kubernetes) fn fail(&self) {
+        if let Some(pod) = self.pod.lock().unwrap().as_mut() {
+            pod["status"]["phase"] = serde_json::json!("Failed");
+        }
     }
 
     /// The pod's container ends, as for a pod that fails or whose container
@@ -502,6 +624,12 @@ impl Pods {
 
     fn rendered(&self, pod: &serde_json::Value) -> serde_json::Value {
         let mut pod = pod.clone();
+        if self.addressless.load(Ordering::SeqCst)
+            && let Some(status) = pod["status"].as_object_mut()
+        {
+            status.remove("podIP");
+            status.remove("podIPs");
+        }
         let state = if self.container_ended.load(Ordering::SeqCst) {
             serde_json::json!({ "terminated": { "exitCode": 128 } })
         } else if self.container_creating.load(Ordering::SeqCst) {
@@ -557,8 +685,8 @@ pub(in crate::controllers::substrate::kubernetes) fn pods_client(pods: Arc<Pods>
                     )
                 }
                 Method::GET if request.path.starts_with(pods_path) => {
-                    if pods.pod_reads_hang.load(Ordering::SeqCst) {
-                        std::future::pending::<()>().await;
+                    while pods.pod_reads_hang.load(Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                     }
                     let pod = {
                         let mut stored = pods.pod.lock().unwrap();
@@ -679,6 +807,10 @@ pub(in crate::controllers::substrate::kubernetes) fn pods_client(pods: Arc<Pods>
                             "podIPs": [{ "ip": "127.0.0.1" }]
                         }
                     });
+                    let mut created = created;
+                    if pods.created_pods_fail.load(Ordering::SeqCst) {
+                        created["status"]["phase"] = serde_json::json!("Failed");
+                    }
                     pods.created.lock().unwrap().push(requested);
                     pods.creates.fetch_add(1, Ordering::SeqCst);
                     *pods.pod.lock().unwrap() = Some(created.clone());
@@ -810,6 +942,9 @@ impl Cluster {
             asked_pod_uids: Mutex::default(),
             publisher: (pool.clone(), node_id),
             pods: Arc::clone(&pods),
+            abandons: Mutex::default(),
+            abandon_refusal: Mutex::default(),
+            operations_of_another_sandbox: Mutex::default(),
         });
         let worker = start_scripted_worker_serving(
             ScriptedWorkerConfig::new([(ENQUEUE_BACKUP, enqueue)]),
@@ -860,7 +995,7 @@ impl Cluster {
 
     /// A substrate over `pool` whose sandbox-pod reflector holds `sandbox_pods`
     /// and whose Node reflector holds `nodes`.
-    fn substrate_caching(
+    pub(in crate::controllers::substrate::kubernetes) fn substrate_caching(
         &self,
         pool: &sqlx::PgPool,
         sandbox_pods: Vec<Pod>,

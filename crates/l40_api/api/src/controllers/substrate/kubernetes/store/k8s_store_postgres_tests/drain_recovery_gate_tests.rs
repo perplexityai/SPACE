@@ -87,6 +87,8 @@ async fn the_recovery_claims_refuse_a_started_sandbox_under_a_v2_drain() -> Test
                         SandboxLifecycle::Started,
                         None,
                         None,
+                        None,
+                        None,
                     )
                     .await
                     .map(|_| ()),
@@ -136,6 +138,8 @@ async fn the_recovery_gate_leaves_a_sandbox_that_is_not_started_alone() -> TestR
         .ensure_active_execution_claim_for_lifecycle(
             sandbox_id,
             SandboxLifecycle::Suspended,
+            None,
+            None,
             None,
             None,
         )
@@ -218,6 +222,8 @@ async fn the_recovery_gate_adds_no_statement() -> TestResult {
                         .ensure_active_execution_claim_for_lifecycle(
                             sandbox_id,
                             SandboxLifecycle::Started,
+                            None,
+                            None,
                             None,
                             None,
                         )

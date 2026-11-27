@@ -190,6 +190,12 @@ pub struct AttemptOwner {
     /// negative: `0` once the lease expired, or when there is none.
     pub lease_remaining_secs: f64,
     pub route_activation_id: Option<Uuid>,
+    /// The upgrade a stopped sandbox's activation recorded on the execution
+    /// (`runtime_upgrade_operation_id`); see
+    /// [`super::stopped_runtime_upgrade`].
+    pub runtime_upgrade_operation_id: Option<Uuid>,
+    /// Raw `runtime_upgrade_target_environment_ref`, as stored.
+    pub runtime_upgrade_target_environment_ref: Option<String>,
 }
 
 /// Lock the active execution of `sandbox_id` at `generation` `FOR UPDATE`
@@ -207,14 +213,24 @@ pub async fn lock_attempt_owner<C>(
 where
     for<'a> &'a mut C: Executor<'a>,
 {
-    let row = sqlx::query_as::<_, (Option<Uuid>, Option<String>, f64, Option<Uuid>)>(sql!(
+    type OwnerRow = (
+        Option<Uuid>,
+        Option<String>,
+        f64,
+        Option<Uuid>,
+        Option<Uuid>,
+        Option<String>,
+    );
+    let row = sqlx::query_as::<_, OwnerRow>(sql!(
         "SELECT activation_attempt_id,
                     activation_attempt_target_state,
                     GREATEST(
                         EXTRACT(EPOCH FROM (activation_attempt_expires_at - NOW())),
                         0.0
                     )::float8,
-                    route_activation_id
+                    route_activation_id,
+                    runtime_upgrade_operation_id,
+                    runtime_upgrade_target_environment_ref
                FROM sandbox_k8s_executions
               WHERE sandbox_id = $1 AND generation = $2 AND active
               FOR UPDATE"
@@ -229,11 +245,15 @@ where
             activation_attempt_target_state,
             lease_remaining_secs,
             route_activation_id,
+            runtime_upgrade_operation_id,
+            runtime_upgrade_target_environment_ref,
         )| AttemptOwner {
             activation_attempt_id,
             activation_attempt_target_state,
             lease_remaining_secs,
             route_activation_id,
+            runtime_upgrade_operation_id,
+            runtime_upgrade_target_environment_ref,
         },
     ))
 }
