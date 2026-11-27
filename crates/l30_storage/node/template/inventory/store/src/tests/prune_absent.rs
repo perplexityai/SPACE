@@ -48,6 +48,9 @@ struct Case {
     inventory: &'static [(On, &'static str, &'static str)],
     facets: &'static [(On, &'static str, &'static str)],
     present: &'static [(&'static str, &'static str)],
+    /// The listed templates the publication reports a network-policy
+    /// generation for.
+    with_policy: &'static [&'static str],
     /// The inventory and observed-status rows left afterwards; their
     /// components and conditions are left with them.
     kept_inventory: &'static [(On, &'static str, &'static str)],
@@ -148,7 +151,13 @@ async fn check(case: Case) -> TestDbResult<()> {
         .map(|(template, hash)| (template.to_string(), hash.to_string()))
         .collect::<Vec<_>>();
 
-    prune_absent_templates(pool, nodes.node, &present).await?;
+    let with_policy = case
+        .with_policy
+        .iter()
+        .map(|template| template.to_string())
+        .collect::<Vec<_>>();
+
+    prune_absent_templates(pool, nodes.node, &present, &with_policy).await?;
 
     let builds = owned(case.kept_inventory);
     let facets = owned(case.kept_facets);
@@ -206,6 +215,7 @@ async fn some_templates_removed() -> TestDbResult<()> {
             (On::Node, NP, "template:gamma"),
         ],
         present: &[("alpha", "sha256:a1"), ("gamma", "sha256:c1")],
+        with_policy: &["alpha", "gamma"],
         kept_inventory: &[
             (On::Node, "alpha", "sha256:a1"),
             (On::Node, "gamma", "sha256:c1"),
@@ -235,6 +245,7 @@ async fn nothing_removed() -> TestDbResult<()> {
             ("beta", "sha256:b1"),
             ("unknown", "sha256:u1"),
         ],
+        with_policy: &["alpha", "beta", "unknown"],
         kept_inventory: &[
             (On::Node, "alpha", "sha256:a1"),
             (On::Node, "beta", "sha256:b1"),
@@ -263,6 +274,7 @@ async fn everything_removed_on_empty_input() -> TestDbResult<()> {
             (On::Other, NP, "template:alpha"),
         ],
         present: &[],
+        with_policy: &[],
         kept_inventory: &[(On::Other, "alpha", "sha256:a1")],
         kept_facets: &[(On::Other, NP, "template:alpha")],
     })
@@ -280,6 +292,7 @@ async fn removed_template_without_facet_row() -> TestDbResult<()> {
         ],
         facets: &[(On::Node, NP, "template:alpha")],
         present: &[("alpha", "sha256:a1")],
+        with_policy: &["alpha"],
         kept_inventory: &[(On::Node, "alpha", "sha256:a1")],
         kept_facets: &[(On::Node, NP, "template:alpha")],
     })
@@ -305,6 +318,7 @@ async fn other_facets_elements_and_nodes_survive() -> TestDbResult<()> {
             (On::Other, NP, "template:beta"),
         ],
         present: &[],
+        with_policy: &[],
         kept_inventory: &[(On::Other, "beta", "sha256:b1")],
         kept_facets: &[
             (On::Node, "template-desired-state", "beta"),
@@ -318,8 +332,8 @@ async fn other_facets_elements_and_nodes_survive() -> TestDbResult<()> {
 }
 
 /// Several builds of one template go together; listed keys may repeat; a
-/// template listed under another build loses the build it no longer lists,
-/// and its network-policy row with it.
+/// template listed under another build with a network-policy generation
+/// loses the build it no longer lists and keeps its network-policy row.
 #[tokio::test(flavor = "current_thread")]
 async fn duplicate_names() -> TestDbResult<()> {
     check(Case {
@@ -340,11 +354,46 @@ async fn duplicate_names() -> TestDbResult<()> {
             ("gamma", "sha256:c1"),
             ("gamma", "sha256:c1"),
         ],
+        with_policy: &["beta", "gamma"],
         kept_inventory: &[
             (On::Node, "beta", "sha256:b2"),
             (On::Node, "gamma", "sha256:c1"),
         ],
-        kept_facets: &[(On::Node, NP, "template:gamma")],
+        kept_facets: &[
+            (On::Node, NP, "template:beta"),
+            (On::Node, NP, "template:gamma"),
+        ],
+    })
+    .await
+}
+
+/// A rebuilt template listed with a network-policy generation, only under a
+/// build the node has no row for, loses its old build and keeps its
+/// network-policy row.
+#[tokio::test(flavor = "current_thread")]
+async fn rebuilt_template_keeps_network_policy_row() -> TestDbResult<()> {
+    check(Case {
+        inventory: &[(On::Node, "alpha", "sha256:a1")],
+        facets: &[(On::Node, NP, "template:alpha")],
+        present: &[("alpha", "sha256:a2")],
+        with_policy: &["alpha"],
+        kept_inventory: &[],
+        kept_facets: &[(On::Node, NP, "template:alpha")],
+    })
+    .await
+}
+
+/// A rebuilt template listed with no network-policy generation loses its old
+/// build and its network-policy row.
+#[tokio::test(flavor = "current_thread")]
+async fn rebuilt_template_without_policy_loses_network_policy_row() -> TestDbResult<()> {
+    check(Case {
+        inventory: &[(On::Node, "alpha", "sha256:a1")],
+        facets: &[(On::Node, NP, "template:alpha")],
+        present: &[("alpha", "sha256:a2")],
+        with_policy: &[],
+        kept_inventory: &[],
+        kept_facets: &[],
     })
     .await
 }

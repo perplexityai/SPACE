@@ -19,7 +19,7 @@ use pplx_space_internal_api_server::{
     ClusterApiService,
     proto::{
         GetQuarantineRecoveryPlanRequest, NodeRole as ProtoNodeRole, PublishNodeStateRequest,
-        PublishedSandboxState, cluster_api_server::ClusterApi,
+        PublishedSandboxState, PublishedTemplateState, cluster_api_server::ClusterApi,
     },
     publish_sandbox_states, publish_sandbox_states_with_retirement,
 };
@@ -4891,5 +4891,96 @@ async fn only_a_pruned_inventory_stamps_the_census_timestamp() -> TestResult {
         "a later accepted inventory must advance the timestamp: \
          {advanced} is not after {backdated}"
     );
+    Ok(())
+}
+
+/// A complete template inventory that lists a template under a new build
+/// drops the old build, and keeps the template's network-policy row when it
+/// lists the template with a network-policy generation; the row goes when
+/// it lists the template with none, and once the template leaves the node.
+#[tokio::test(flavor = "current_thread")]
+async fn complete_template_inventory_keeps_network_policy_row_across_a_rebuild() -> TestResult {
+    let db = pg_test_db().await?;
+    let node_id = NodeId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    sqlx::query(sql!(
+        "INSERT INTO templates (id, name, network_policy_generation)
+         VALUES (space_uuid_v7(), 'rebuilt', 7)"
+    ))
+    .execute(&db.pool)
+    .await?;
+
+    let service = ClusterApiService::new(db.pool.clone());
+    let build = |content_hash: &str, network_policy_generation: u64| PublishedTemplateState {
+        template: "rebuilt".to_string(),
+        present: true,
+        content_hash: Some(content_hash.to_string()),
+        network_policy_generation,
+        network_policy_authority: PolicyAuthority::Cluster.as_proto_i32(),
+        ..PublishedTemplateState::default()
+    };
+    let publish = async |templates: Vec<PublishedTemplateState>| {
+        let mut request = Request::new(PublishNodeStateRequest {
+            node_id: node_id.to_string(),
+            role: Some(ProtoNodeRole::Worker as i32),
+            template_inventory_complete: true,
+            templates,
+            ..PublishNodeStateRequest::default()
+        });
+        request
+            .extensions_mut()
+            .insert(tonic::transport::server::TcpConnectInfo {
+                local_addr: None,
+                remote_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 49000))),
+            });
+        service.publish_node_state(request).await
+    };
+    let builds = async || {
+        sqlx::query_scalar::<_, String>(sql!(
+            "SELECT content_hash FROM node_template_inventory
+             WHERE node_id = $1 AND template_name = 'rebuilt'
+             ORDER BY content_hash"
+        ))
+        .bind(node_id)
+        .fetch_all(&db.pool)
+        .await
+    };
+    let policy_generation = async || {
+        sqlx::query_scalar::<_, Option<i64>>(sql!(
+            "SELECT observed_generation FROM node_facet_observed_status
+             WHERE node_id = $1 AND facet = $2 AND element = 'template:rebuilt'"
+        ))
+        .bind(node_id)
+        .bind(FACET_NETWORK_POLICY)
+        .fetch_optional(&db.pool)
+        .await
+    };
+
+    publish(vec![build("sha256:h1", 7)]).await?;
+    assert_eq!(builds().await?, ["sha256:h1"]);
+    assert_eq!(policy_generation().await?, Some(Some(7)));
+
+    publish(vec![build("sha256:h2", 7)]).await?;
+    assert_eq!(builds().await?, ["sha256:h2"]);
+    assert_eq!(
+        policy_generation().await?,
+        Some(Some(7)),
+        "a rebuild must not drop the template's network-policy row"
+    );
+
+    publish(vec![build("sha256:h3", 0)]).await?;
+    assert_eq!(builds().await?, ["sha256:h3"]);
+    assert_eq!(
+        policy_generation().await?,
+        None,
+        "a rebuild reported with no generation must not keep the old one"
+    );
+
+    publish(vec![build("sha256:h3", 7)]).await?;
+    assert_eq!(policy_generation().await?, Some(Some(7)));
+
+    publish(Vec::new()).await?;
+    assert!(builds().await?.is_empty());
+    assert_eq!(policy_generation().await?, None);
     Ok(())
 }

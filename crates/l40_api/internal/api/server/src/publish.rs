@@ -90,6 +90,14 @@ impl ClusterApiService {
                 Some((name, content_hash))
             })
             .collect::<Vec<_>>();
+        // The templates listed with a network-policy generation, which
+        // `publish_template_states` records: the prune keeps their rows.
+        let policy_template_names = request
+            .templates
+            .iter()
+            .filter(|template| template.present && template.network_policy_generation != 0)
+            .filter_map(|template| optional_trimmed(Some(&template.template)))
+            .collect::<Vec<_>>();
 
         let mut tx = self
             .pool
@@ -145,6 +153,7 @@ impl ClusterApiService {
                 &mut *tx,
                 origin.id,
                 &present_template_keys,
+                &policy_template_names,
             )
             .await
             .map_err(|err| Status::internal(format!("prune absent published templates: {err}")))?;
