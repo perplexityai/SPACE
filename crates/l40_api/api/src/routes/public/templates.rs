@@ -178,7 +178,7 @@ fn public_template_variant(row: TemplateVariantRow) -> PublicTemplateVariant {
         artifact_size_bytes: non_negative_u64(row.artifact_size_bytes),
         has_base_snapshot: row.has_base_snapshot,
         base_snapshot_size_bytes: non_negative_u64(row.base_snapshot_size_bytes),
-        snapshots: row.snapshots.0,
+        snapshots: row.snapshots,
         resources: SandboxResources {
             vcpu: positive_u32(row.vcpu),
             memory_mib: positive_u32(row.memory_mib),

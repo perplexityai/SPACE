@@ -264,15 +264,40 @@ pub async fn rowless_sandbox_ids(executor: impl Executor<'_>) -> Result<Vec<Sand
 /// runs. `subject` digests the record and the sandbox's last lifecycle
 /// change, so one stopped period names one subject; `local_artifact_id` is
 /// always `None` here.
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug)]
 pub struct PublishedExecution {
     pub subject: String,
     pub local_artifact_id: Option<LocalArtifactId>,
-    pub execution_metadata: Option<Json<JsonValue>>,
+    pub execution_metadata: Option<JsonValue>,
     pub runtime: Option<String>,
     pub runtime_version: Option<String>,
     pub state_format_name: Option<String>,
     pub state_format_version: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct PublishedExecutionRow {
+    subject: String,
+    local_artifact_id: Option<LocalArtifactId>,
+    execution_metadata: Option<Json<JsonValue>>,
+    runtime: Option<String>,
+    runtime_version: Option<String>,
+    state_format_name: Option<String>,
+    state_format_version: Option<String>,
+}
+
+impl From<PublishedExecutionRow> for PublishedExecution {
+    fn from(row: PublishedExecutionRow) -> Self {
+        Self {
+            subject: row.subject,
+            local_artifact_id: row.local_artifact_id,
+            execution_metadata: row.execution_metadata.map(|json| json.0),
+            runtime: row.runtime,
+            runtime_version: row.runtime_version,
+            state_format_name: row.state_format_name,
+            state_format_version: row.state_format_version,
+        }
+    }
 }
 
 /// The execution `sandbox_id`'s node last published; `None` when nothing is
@@ -281,7 +306,7 @@ pub async fn last_published_execution(
     executor: impl Executor<'_>,
     sandbox_id: SandboxId,
 ) -> Result<Option<PublishedExecution>, DbError> {
-    Ok(sqlx::query_as::<_, PublishedExecution>(sql!(
+    let row = sqlx::query_as::<_, PublishedExecutionRow>(sql!(
         "SELECT md5(concat_ws('/', s.lifecycle_changed_at::text, o.execution_metadata::text,
                                   o.runtime, o.runtime_version, o.state_format_name,
                                   o.state_format_version)) AS subject,
@@ -298,7 +323,8 @@ pub async fn last_published_execution(
     ))
     .bind(sandbox_id)
     .fetch_optional(executor.into_sqlx())
-    .await?)
+    .await?;
+    Ok(row.map(PublishedExecution::from))
 }
 
 #[cfg(test)]

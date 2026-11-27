@@ -23,7 +23,7 @@ pub(in crate::controllers::substrate::kubernetes) struct RecordedActivation {
 struct RecordedExecutionRow {
     subject: String,
     local_artifact_id: Option<LocalArtifactId>,
-    execution_metadata: Option<sqlx::types::Json<serde_json::Value>>,
+    execution_metadata: Option<serde_json::Value>,
     runtime: Option<String>,
     runtime_version: Option<String>,
     state_format_name: Option<String>,
@@ -48,8 +48,7 @@ impl From<pplx_space_sandbox_teardown::observed_states::PublishedExecution>
 
 impl From<RecordedExecutionRow> for RecordedActivation {
     fn from(row: RecordedExecutionRow) -> Self {
-        let metadata = row.execution_metadata.map(|metadata| metadata.0);
-        let metadata = metadata.as_ref();
+        let metadata = row.execution_metadata.as_ref();
         // Read leniently: a record is evidence, and a field it lacks or holds
         // in another shape matches anything rather than failing the
         // activation.

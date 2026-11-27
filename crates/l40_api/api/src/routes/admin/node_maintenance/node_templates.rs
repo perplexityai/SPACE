@@ -452,7 +452,7 @@ pub(super) async fn list_templates_for_node(
                         .and_then(|value| u32::try_from(value).ok()),
                     runtime: build.runtime,
                     arch: build.arch,
-                    snapshots: build.snapshots.0,
+                    snapshots: build.snapshots,
                 })
                 .collect(),
         },

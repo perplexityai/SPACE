@@ -91,12 +91,12 @@ struct SandboxObservedState {
     observed_created_at: Option<String>,
     observed_at: time::OffsetDateTime,
     release_tags: Vec<String>,
-    observed_network_policy: Option<sqlx::types::Json<NetworkPolicy>>,
+    observed_network_policy: Option<NetworkPolicy>,
     observed_network_policy_generation: Option<i64>,
     observed_network_policy_source: Option<String>,
     observed_network_policy_authority: Option<String>,
     observed_network_policy_at: Option<time::OffsetDateTime>,
-    network_policy_conditions: sqlx::types::Json<Vec<NetworkPolicyCondition>>,
+    network_policy_conditions: Vec<NetworkPolicyCondition>,
 }
 
 impl From<pplx_space_sandbox_teardown::direct::observed_reads::ObservedStateRow>

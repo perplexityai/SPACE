@@ -2,6 +2,7 @@
 
 use pplx_space_db_test_fixtures::{TestDbResult, pg_test_db};
 use sqlx::PgPool;
+use sqlx::types::Json;
 use uuid::Uuid;
 
 use pplx_space_template_model::TemplateName;
@@ -246,11 +247,10 @@ async fn template_pool_observed_does_not_multiply_counts_by_sandbox_ids() -> Tes
     assert_eq!(observed.pool_target, Some(15));
     assert_eq!(observed.pool_current, 15);
     assert_eq!(observed.pool_pending, 0);
-    assert_eq!(observed.pool_sandbox_ids.0.len(), 15);
+    assert_eq!(observed.pool_sandbox_ids.len(), 15);
     assert!(
         !observed
             .pool_sandbox_ids
-            .0
             .iter()
             .any(|id| id == "stale-sandbox")
     );
@@ -289,12 +289,12 @@ async fn snapshot_generic_rows_decode_the_caller_payload() -> TestDbResult<()> {
     assert_eq!(builds.len(), 1);
     assert_eq!(builds[0].name, "alpha");
     assert_eq!(builds[0].content_hash.as_deref(), Some("sha256:a1"));
-    assert_eq!(builds[0].snapshots.0, expected);
+    assert_eq!(builds[0].snapshots, expected);
 
     let variants = template_variants::<Vec<TestSnapshot>>(pool, &["alpha".to_string()]).await?;
     assert_eq!(variants.len(), 1);
     assert_eq!(variants[0].template_name, "alpha");
     assert_eq!(variants[0].content_hash, "sha256:a1");
-    assert_eq!(variants[0].snapshots.0, expected);
+    assert_eq!(variants[0].snapshots, expected);
     Ok(())
 }

@@ -3025,7 +3025,7 @@ pub async fn template_pool_status(
             "pool_target": observed.pool_target,
             "pool_current": observed.pool_current,
             "pool_pending": observed.pool_pending,
-            "sandbox_ids": observed.pool_sandbox_ids.0,
+            "sandbox_ids": observed.pool_sandbox_ids,
         })),
     }))
     .into_response()
