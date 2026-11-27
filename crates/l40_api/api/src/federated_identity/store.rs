@@ -20,6 +20,7 @@ pub(super) async fn get_user_org(
     users::user_with_organization(pool, user_id)
         .await
         .map(|found| (found.user, found.org))
+        .map_err(sqlx::Error::from)
 }
 
 /// Read-only lookup of an already-materialized federated owner. A miss means
@@ -40,6 +41,7 @@ pub(super) async fn find_federated_user_org(
     )
     .await
     .map(|found| found.map(|found| (found.user, found.org)))
+    .map_err(sqlx::Error::from)
 }
 
 pub(super) async fn materialize_owner_in_tx(
@@ -62,6 +64,7 @@ pub(super) async fn materialize_owner_in_tx(
         },
     )
     .await
+    .map_err(sqlx::Error::from)
     .map_err(MaterializeOwnerError::Organization)?;
 
     let proposed_user_id = UserId::new();
@@ -82,6 +85,7 @@ pub(super) async fn materialize_owner_in_tx(
         },
     )
     .await
+    .map_err(sqlx::Error::from)
     .map_err(MaterializeOwnerError::User)?;
 
     Ok(FederatedOwnerRecord {

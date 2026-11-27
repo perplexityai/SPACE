@@ -625,7 +625,7 @@ async fn resolve_fork_replay_org_id(
         owner.org_id.as_str(),
     )
     .await
-    .map_err(|error| fork_sql_error("resolve fork replay owner", &error))
+    .map_err(|error| fork_sql_error("resolve fork replay owner", &sqlx::Error::from(error)))
 }
 
 async fn persisted_fork_wait_timeout(

@@ -1429,6 +1429,12 @@ enum CreateSandboxExecutionError {
     Controller(#[from] ControllerError),
 }
 
+impl From<pplx_space_postgres_pool::DbError> for CreateSandboxExecutionError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 impl CreateSandboxExecutionError {
     fn into_result(self, operation: &ClaimedPublicOperation) -> PublicOperationExecutionResult {
         match self {

@@ -4840,6 +4840,7 @@ version = "0.8.2"
 dependencies = [
  "pplx-space-accounts",
  "pplx-space-db-test-fixtures",
+ "pplx-space-postgres-pool",
  "pplx-space-sql-locator",
  "serde",
  "serde_json",

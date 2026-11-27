@@ -9,7 +9,9 @@ use crate::{
 use pplx_space_accounts_store::{clusters, organizations};
 
 pub(crate) async fn cluster_managing_org_id(pool: &PgPool) -> Result<OrgId, sqlx::Error> {
-    clusters::cluster_managing_org_id(pool).await
+    clusters::cluster_managing_org_id(pool)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 pub(crate) async fn is_managing_org_admin(pool: &PgPool, user: &User) -> Result<bool, sqlx::Error> {
@@ -24,9 +26,13 @@ pub(crate) async fn visible_org_ids(pool: &PgPool, user: &User) -> Result<Vec<Or
     match user.role {
         UserRole::OrganizationAdmin => {
             if is_managing_org_admin(pool, user).await? {
-                organizations::organization_ids(pool).await
+                organizations::organization_ids(pool)
+                    .await
+                    .map_err(sqlx::Error::from)
             } else {
-                organizations::organization_subtree_ids(pool, user.org_id).await
+                organizations::organization_subtree_ids(pool, user.org_id)
+                    .await
+                    .map_err(sqlx::Error::from)
             }
         }
         UserRole::Member => Ok(vec![user.org_id]),
@@ -43,7 +49,9 @@ pub(crate) async fn user_can_access_org(
             if is_managing_org_admin(pool, user).await? {
                 Ok(true)
             } else {
-                organizations::organization_subtree_contains(pool, user.org_id, org_id).await
+                organizations::organization_subtree_contains(pool, user.org_id, org_id)
+                    .await
+                    .map_err(sqlx::Error::from)
             }
         }
         UserRole::Member => Ok(user.org_id == org_id),

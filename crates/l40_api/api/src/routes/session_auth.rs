@@ -87,6 +87,12 @@ impl From<sqlx::Error> for AuthRouteError {
     }
 }
 
+impl From<pplx_space_postgres_pool::DbError> for AuthRouteError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 impl AuthRouteError {
     fn status(&self) -> StatusCode {
         match self {
@@ -229,7 +235,7 @@ async fn create_session_for_password(
     let mut tx = pool.begin().await?;
     // Hold the password read through session insertion so resets revoke every
     // session authenticated with the old password.
-    let Some(user) = users::share_lock_user_by_email(&mut tx, &request.email).await? else {
+    let Some(user) = users::share_lock_user_by_email(&mut *tx, &request.email).await? else {
         return Err(AuthRouteError::InvalidCredentials);
     };
 

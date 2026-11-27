@@ -70,8 +70,12 @@ async fn set_password_hash(
         return Ok(());
     }
     let user_id = pplx_space_accounts::UserId::from_uuid(user_id);
-    pplx_space_accounts_store::users::set_user_password_hash(&mut *tx, user_id, hash).await?;
-    pplx_space_accounts_store::sessions::delete_user_sessions(&mut *tx, user_id).await?;
+    pplx_space_accounts_store::users::set_user_password_hash(&mut *tx, user_id, hash)
+        .await
+        .map_err(sqlx::Error::from)?;
+    pplx_space_accounts_store::sessions::delete_user_sessions(&mut *tx, user_id)
+        .await
+        .map_err(sqlx::Error::from)?;
     tx.commit().await?;
     Ok(())
 }

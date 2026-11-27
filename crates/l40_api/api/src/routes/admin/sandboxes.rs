@@ -241,7 +241,7 @@ async fn admin_create_precheck(
 
     let org_exists = organizations::organization_exists(pool, org_id)
         .await
-        .map_err(|error| create_precheck_failure(org_id, &error))?;
+        .map_err(|error| create_precheck_failure(org_id, &sqlx::Error::from(error)))?;
     if !org_exists {
         return Err(AdminSandboxActionError::new(
             StatusCode::NOT_FOUND,
@@ -269,11 +269,11 @@ async fn create_sandbox_for_org(
     let owner_id: Option<UserId> = match request.user_id {
         Some(user_id) => users::user_in_organization(pool, org_id, user_id)
             .await
-            .map_err(|error| create_precheck_failure(org_id, &error))?
+            .map_err(|error| create_precheck_failure(org_id, &sqlx::Error::from(error)))?
             .then_some(user_id),
         None => users::first_organization_user_id(pool, org_id)
             .await
-            .map_err(|error| create_precheck_failure(org_id, &error))?,
+            .map_err(|error| create_precheck_failure(org_id, &sqlx::Error::from(error)))?,
     };
     let Some(owner_id) = owner_id else {
         return Err(AdminSandboxActionError::new(

@@ -646,6 +646,7 @@ pub(super) async fn delete_org(
     let deleted = match organizations::delete_organization(&state.pool, org_id).await {
         Ok(deleted) => deleted,
         Err(error) => {
+            let error = sqlx::Error::from(error);
             return Err(match OrgDeleteBlocker::from_delete_error(&error) {
                 Some(blocker) => {
                     IdentityAdminError::OrgNotEmpty(blocker.refine(&state, org_id).await?)
@@ -691,6 +692,7 @@ pub(super) async fn create_user_for_org(
         },
     )
     .await
+    .map_err(sqlx::Error::from)
     .map_err(IdentityAdminError::from_user_write)?;
 
     Ok((StatusCode::CREATED, Json(user.into())))
@@ -737,6 +739,7 @@ pub(super) async fn update_user(
         },
     )
     .await
+    .map_err(sqlx::Error::from)
     .map_err(IdentityAdminError::from_user_write)?
     .ok_or(IdentityAdminError::NotFound)?;
     if password_changed {
@@ -778,6 +781,7 @@ pub(super) async fn delete_user(
     let deleted = match users::delete_user(&state.pool, user_id).await {
         Ok(deleted) => deleted,
         Err(error) => {
+            let error = sqlx::Error::from(error);
             return Err(match UserDeleteBlocker::from_delete_error(&error) {
                 Some(blocker) => {
                     IdentityAdminError::StillOwns(blocker.refine(&state, user_id).await?)
