@@ -106,6 +106,7 @@ from space_smoke.runtime import (
     Compensation,
     InconclusiveSmoke,
     ResourceScope,
+    ScenarioTimedOut,
     primary_failure,
     run_concurrently,
 )
@@ -871,6 +872,8 @@ class DrainV2Assertions:
             for name, node_id in nodes.items():
                 try:
                     pending = self._control.drain_v2_preview(node_id).get("pending") or []
+                except ScenarioTimedOut:
+                    raise
                 except Exception as error:  # noqa: BLE001 - a worker still coming up is read again
                     unread[name] = repr(error)[:300]
                     continue
