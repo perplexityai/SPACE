@@ -345,7 +345,7 @@ def test_apply_moves_crates_and_rewrites_what_names_them(repo: Path) -> None:
     )
     assert (repo / "crates/l40_api/gadget/CLAUDE.md").read_text() == "# The gadget crates\n"
     assert os.readlink(repo / "docs/widget-lib.rs") == "../crates/l20_domain/widget/src/lib.rs"
-    assert "version: '0.1.5'" in (repo / ".agents/plugins/p/plugin.yaml").read_text()
+    assert "version: '0.1.4'" in (repo / ".agents/plugins/p/plugin.yaml").read_text()
 
     verify = tool(repo, "--verify", "--skip-arch")
 
