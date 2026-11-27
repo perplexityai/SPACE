@@ -217,12 +217,15 @@ async fn managing_org_id(
     pool: &sqlx::PgPool,
     log: &'static str,
 ) -> Result<OrgId, ApiErrorResponse> {
-    authz::cluster_managing_org_id(pool).await.map_err(|error| {
-        contention_response(ContentionScope::ReadOnly, &error).unwrap_or_else(|| {
-            tracing::error!(%error, log, "failed to load managing org for admin template action");
-            api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+    pplx_space_accounts_store::clusters::cluster_managing_org_id(pool)
+        .await
+        .map_err(sqlx::Error::from)
+        .map_err(|error| {
+            contention_response(ContentionScope::ReadOnly, &error).unwrap_or_else(|| {
+                tracing::error!(%error, log, "failed to load managing org for admin template action");
+                api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+            })
         })
-    })
 }
 
 /// `api_error`'s envelope with `retryable` forced on.

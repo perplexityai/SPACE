@@ -218,12 +218,6 @@ async fn record_api_key_use(pool: &PgPool, api_key: &ApiKey) {
     }
 }
 
-pub(crate) async fn org_has_local_owner(pool: &PgPool, org_id: OrgId) -> Result<bool, sqlx::Error> {
-    organizations::organization_has_local_owner(pool, org_id)
-        .await
-        .map_err(sqlx::Error::from)
-}
-
 pub async fn api_key_belongs_to_org(
     pool: &PgPool,
     raw_api_key: &str,

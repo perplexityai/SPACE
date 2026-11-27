@@ -1605,7 +1605,8 @@ async fn template_builds_list_reports_each_jobs_builder_status() -> TestResult {
     }
     let db = pg_test_db().await?;
     let state = AppState::from_pool(db.pool.clone()).await?;
-    let managing_org_id = crate::routes::authz::cluster_managing_org_id(&db.pool).await?;
+    let managing_org_id =
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?;
     let actor = User {
         id: UserId::new(),
         email: "builds-test@example.invalid".into(),

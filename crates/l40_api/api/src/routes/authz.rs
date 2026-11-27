@@ -8,18 +8,12 @@ use crate::{
 };
 use pplx_space_accounts_store::{clusters, organizations};
 
-pub(crate) async fn cluster_managing_org_id(pool: &PgPool) -> Result<OrgId, sqlx::Error> {
-    clusters::cluster_managing_org_id(pool)
-        .await
-        .map_err(sqlx::Error::from)
-}
-
 pub(crate) async fn is_managing_org_admin(pool: &PgPool, user: &User) -> Result<bool, sqlx::Error> {
     if user.role != UserRole::OrganizationAdmin {
         return Ok(false);
     }
 
-    Ok(user.org_id == cluster_managing_org_id(pool).await?)
+    Ok(user.org_id == clusters::cluster_managing_org_id(pool).await?)
 }
 
 pub(crate) async fn visible_org_ids(pool: &PgPool, user: &User) -> Result<Vec<OrgId>, sqlx::Error> {

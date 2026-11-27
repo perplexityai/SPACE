@@ -1619,8 +1619,9 @@ async fn fleet_http_inventory_preserves_legacy_counts_and_explicit_opt_out() -> 
     .bind(nodes[0])
     .execute(&db.pool)
     .await?;
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
     let app = axum::Router::new()
         .route("/admin/api/v1/nodes", axum::routing::get(list_admin_nodes))
         .layer(Extension(AuthUser(actor)))
@@ -1686,8 +1687,9 @@ async fn inventory_reads_skip_locked_sandbox_accounting_but_diagnostics_do_not()
         )
         .await?;
     let state = AppState::from_pool(pool).await?;
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
     let node_id = NodeId::new();
     sqlx::query(sql!(
         "INSERT INTO nodes (id, address, role) VALUES ($1, '127.0.0.1', 'worker'),
@@ -1830,8 +1832,9 @@ async fn node_sandbox_pages_are_scoped_deduplicated_and_complete() -> TestResult
         return Ok(());
     };
     let state = AppState::from_pool(db.pool.clone()).await?;
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
     let node_id = NodeId::new();
     let other_node = Uuid::now_v7();
     sqlx::query(sql!("INSERT INTO nodes (id, address, role) VALUES ($1, '127.0.0.1', 'worker'), ($2, '127.0.0.2', 'worker')"))
@@ -1952,8 +1955,9 @@ async fn node_sandbox_history_filters_orders_and_pages_by_change() -> TestResult
         return Ok(());
     };
     let state = AppState::from_pool(db.pool.clone()).await?;
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
     let node_id = NodeId::new();
     let other_node = NodeId::new();
     sqlx::query(sql!("INSERT INTO nodes (id, address, role) VALUES ($1, '127.0.0.3', 'worker'), ($2, '127.0.0.4', 'worker')"))
@@ -2373,8 +2377,9 @@ async fn direct_refuses_node_drain_and_cordon_before_writing() -> TestResult {
         return Ok(());
     };
     let state = AppState::from_pool(db.pool.clone()).await?;
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
     let refused = serde_json::json!({
         "error": "node drain and cordon are not supported on the Direct substrate"
     });
@@ -2438,8 +2443,9 @@ async fn direct_undrain_clears_a_phase_an_earlier_drain_left() -> TestResult {
         return Ok(());
     };
     let state = AppState::from_pool(db.pool.clone()).await?;
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
     let node_id =
         insert_drain_test_node(&db.pool, NodeManagedBy::Space, Some(PHASE_DRAINING)).await?;
 
@@ -2511,8 +2517,9 @@ async fn kubernetes_node_drain_and_cordon_converge_the_node() -> TestResult {
             ),
         ),
     );
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
 
     for (action, phase, unschedulable, phase_after) in [
         (DrainAction::Drain, None, Some(true), Some(PHASE_DRAINING)),
@@ -2601,8 +2608,9 @@ async fn node_inspection_reports_execution_receipt_independently_of_heartbeat() 
         return Ok(());
     };
     let state = AppState::from_pool(db.pool.clone()).await?;
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
     let node_id = NodeId::new();
     pplx_space_db_test_fixtures::insert_ready_worker_node(&db.pool, node_id).await?;
     for collection in [None, Some("complete"), Some("unavailable"), Some("legacy")] {
@@ -2823,8 +2831,9 @@ async fn node_reads_report_cordon_group_trigger_and_runtimes() -> TestResult {
             ],
         )),
     );
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
     for (state, busy_cordoned, idle_cordoned) in
         [(direct, None, None), (kubernetes, Some(true), Some(false))]
     {
@@ -2922,8 +2931,9 @@ async fn node_reads_survive_a_failed_read_state_read() -> TestResult {
         )
         .await?;
     let state = AppState::from_pool(pool).await?;
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
     let node_id = insert_drain_test_node(&db.pool, NodeManagedBy::Space, None).await?;
     pplx_space_cluster_trigger_queue::enqueue_triggers(
         &db.pool,
@@ -3006,8 +3016,9 @@ async fn node_holds_reports_each_row_with_its_gates_and_refuses_as_its_siblings(
         return Ok(());
     };
     let state = AppState::from_pool(db.pool.clone()).await?;
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
     let node_id = NodeId::new();
     sqlx::query(sql!(
         "INSERT INTO nodes (id, address, role) VALUES ($1, '127.0.0.6', 'worker')"
