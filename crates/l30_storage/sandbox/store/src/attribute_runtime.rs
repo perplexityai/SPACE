@@ -13,6 +13,7 @@
 //! is locked first either way.
 
 use pplx_space_accounts::ClientId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 #[cfg(test)]
 use pplx_space_sandbox_model::SandboxLifecycle;
@@ -65,10 +66,10 @@ pub(crate) const fn attributes_runtime(lifecycle: SandboxLifecycle) -> bool {
 /// already holds that value, or the sandbox is in one of the
 /// [`UNATTRIBUTED_LIFECYCLES`] or gone.
 pub async fn set_activating_client(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     client_id: Option<&ClientId>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let changed = sqlx::query(sql!(
         "UPDATE sandboxes
             SET activating_client_id = $2
@@ -79,7 +80,7 @@ pub async fn set_activating_client(
     .bind(sandbox_id)
     .bind(client_id)
     .bind(&UNATTRIBUTED_LIFECYCLES[..])
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected();
     Ok(changed == 1)
@@ -89,15 +90,16 @@ pub async fn set_activating_client(
 /// sandbox is gone, `Ok(Some(None))` when nothing is recorded.
 #[cfg(any(test, feature = "test-support"))]
 pub async fn activating_client(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Option<Option<ClientId>>, sqlx::Error> {
+) -> Result<Option<Option<ClientId>>, DbError> {
     sqlx::query_scalar::<_, Option<ClientId>>(sql!(
         "SELECT activating_client_id FROM sandboxes WHERE id = $1"
     ))
     .bind(sandbox_id)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await
+    .map_err(DbError::from)
 }
 
 #[cfg(test)]
