@@ -858,18 +858,24 @@ class DrainV2Assertions:
         something it didn't do; so, once the deletes still landing have had
         `LEFTOVER_SECONDS`, the run ends inconclusive with what it saw in
         `leftover_sandboxes`, as it does when a preview can't be read for as
-        long. Each leftover is classed by its control-plane row: one still
-        live is the bench's (an earlier run's, such as one whose cleanup
-        failed, which stays that run's failure); one the control plane has
-        deleted or is deleting, which the node still holds, may be the
-        product's own orphan, and the verdict says so."""
+        long. Every worker's preview must be read: one with no SPACE node row
+        yet counts as unread, and the rows are read again each round. Each
+        leftover is classed by its control-plane row: one still live is the
+        bench's (an earlier run's, such as one whose cleanup failed, which
+        stays that run's failure); one the control plane has deleted or is
+        deleting, which the node still holds, may be the product's own orphan,
+        and the verdict says so."""
 
-        nodes = {n.k8s_node_name: n.id for n in self._control.admin_nodes() if n.k8s_node_name in workers}
         deadline = time.monotonic() + LEFTOVER_SECONDS
         while True:
             leftovers: dict[str, list[str]] = {}
             unread: dict[str, str] = {}
-            for name, node_id in nodes.items():
+            nodes = {n.k8s_node_name: n.id for n in self._control.admin_nodes() if n.k8s_node_name in workers}
+            for name in workers:
+                node_id = nodes.get(name)
+                if node_id is None:
+                    unread[name] = "no SPACE node row"
+                    continue
                 try:
                     pending = self._control.drain_v2_preview(node_id).get("pending") or []
                 except ScenarioTimedOut:
