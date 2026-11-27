@@ -11,8 +11,9 @@ use crate::service::grpc_lifecycle::{BackupCaller, SuspendRequestContext};
 use crate::service::*;
 use pplx_space_events::SandboxEventTrigger;
 
-/// How many of the drain's suspends and publications may be in flight on the
-/// node at once, the uploads they leave pending included, unless
+/// How many sandboxes the drain's suspends and publications may hold on the
+/// node at once, from each one's start until the upload it leaves pending
+/// ends, unless
 /// [`DRAIN_NODE_WINDOW_ENV`] sets another positive number. Beside the idle
 /// auto-suspend scheduler's 8, at most 16 suspends from these two callers
 /// reach node-manager's Filesystem lane at once, below the 20 arrivals (4
@@ -21,8 +22,8 @@ use pplx_space_events::SandboxEventTrigger;
 /// suspend or snapshot, a snapshot rollback or restore, the rootfs sends and
 /// receives, a sandbox instance's creation and a guest sync arrive there
 /// too, so this keeps the drain and the scheduler from filling it, not every
-/// caller. It is also vol-mgr's push concurrency per kind, so a VM the drain
-/// has paused uploads rather than waiting behind the node's backlog.
+/// caller. The uploads themselves are narrower still: sandbox-manager's
+/// snapshot-upload worker runs 4 jobs of its kind at once.
 pub(super) const DEFAULT_DRAIN_NODE_WINDOW: usize = 8;
 
 /// The largest window [`DRAIN_NODE_WINDOW_ENV`] may set: with the idle
@@ -45,17 +46,26 @@ pub(in crate::service) fn drain_node_window_from_env() -> usize {
 }
 
 /// The window `raw`, [`DRAIN_NODE_WINDOW_ENV`]'s value, sets: a number
-/// above [`MAX_DRAIN_NODE_WINDOW`] is lowered to it.
+/// above [`MAX_DRAIN_NODE_WINDOW`], however large, is lowered to it.
 pub(super) fn drain_node_window(raw: Option<&str>) -> usize {
     let Some(raw) = raw else {
         return DEFAULT_DRAIN_NODE_WINDOW;
     };
-    match raw
-        .trim()
-        .parse::<usize>()
-        .ok()
-        .filter(|window| *window > 0)
-    {
+    let trimmed = raw.trim();
+    // The parser reports an overflow as soon as the digits overflow, before
+    // it reaches a trailing non-digit, so only a value of digits alone is a
+    // number too large.
+    let digits = trimmed.strip_prefix('+').unwrap_or(trimmed);
+    let parsed = match trimmed.parse::<usize>() {
+        Err(error)
+            if *error.kind() == std::num::IntErrorKind::PosOverflow
+                && digits.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            Some(usize::MAX)
+        }
+        parsed => parsed.ok().filter(|window| *window > 0),
+    };
+    match parsed {
         Some(window) if window > MAX_DRAIN_NODE_WINDOW => {
             tracing::warn!(
                 var = DRAIN_NODE_WINDOW_ENV,
@@ -82,7 +92,8 @@ pub(super) fn drain_node_window(raw: Option<&str>) -> usize {
 /// The drain's work in flight in this process, by sandbox, and what it
 /// remembers between calls.
 pub(in crate::service) struct DrainActions {
-    /// How many suspends and snapshot publications may be in flight at once.
+    /// How many sandboxes the drain's suspends and snapshot publications may
+    /// hold at once ([`DEFAULT_DRAIN_NODE_WINDOW`]).
     pub(super) window: usize,
     /// Taken for the whole of one `DrainNode` call, drain or cancel, so one
     /// runs at a time and each plans with the work earlier ones started,
@@ -98,7 +109,9 @@ pub(in crate::service) struct DrainActions {
     /// generation, whatever a later call under it says. In memory only, so
     /// after a restart the drain holds again until a call says to evacuate.
     evacuating: Mutex<Option<u64>>,
-    running: Mutex<BTreeMap<String, DrainAction>>,
+    /// The action running for each sandbox, with the disk its suspend
+    /// reserves.
+    running: Mutex<BTreeMap<String, RunningAction>>,
     /// The failures under the generation they happened under; a pass under
     /// another generation starts from none.
     failures: Mutex<(Option<u64>, DrainFailures)>,
@@ -202,13 +215,13 @@ impl DrainActions {
         superseded
     }
 
-    pub(super) fn running(&self) -> BTreeMap<String, DrainAction> {
+    pub(super) fn running(&self) -> BTreeMap<String, RunningAction> {
         lock(&self.running).clone()
     }
 
-    /// Mark `action` running for `sandbox_id`; false when something already
-    /// is.
-    pub(super) fn start(&self, sandbox_id: &str, action: DrainAction) -> bool {
+    /// Mark `action` running for `sandbox_id`, holding what it reserves
+    /// until it finishes; false when something already is.
+    pub(super) fn start(&self, sandbox_id: &str, action: RunningAction) -> bool {
         let mut running = lock(&self.running);
         if running.contains_key(sandbox_id) {
             return false;
@@ -218,14 +231,20 @@ impl DrainActions {
     }
 
     /// End `sandbox_id`'s running action, started under `generation`, keeping
-    /// `failure` as its last one if it failed and the failures are still that
-    /// generation's.
+    /// `failure` as its last one, with the artifact an upload uploaded, if it
+    /// failed and the failures are still that generation's.
     pub(super) fn finish(&self, generation: u64, sandbox_id: &str, failure: Option<String>) {
         let action = lock(&self.running).remove(sandbox_id);
         if let (Some(reason), Some(action)) = (failure, action) {
             let mut failures = lock(&self.failures);
             if failures.0 == Some(generation) {
-                failures.1.insert((sandbox_id.to_owned(), action), reason);
+                failures.1.insert(
+                    (sandbox_id.to_owned(), action.kind()),
+                    DrainFailure {
+                        reason,
+                        artifact: action.artifact().map(str::to_owned),
+                    },
+                );
             }
         }
     }
@@ -308,7 +327,7 @@ impl SandboxManagerService {
         for action in std::mem::take(&mut plan.actions) {
             let (sandbox_id, kind) = action.target();
             let sandbox_id = sandbox_id.to_owned();
-            if !self.drain_actions.start(&sandbox_id, kind) {
+            if !self.drain_actions.start(&sandbox_id, action.running()) {
                 continue;
             }
             let service = self.clone();
@@ -350,9 +369,9 @@ impl SandboxManagerService {
             return Ok(());
         }
         match action {
-            PlannedAction::Suspend { sandbox_id, from } => {
-                self.drain_suspend(generation, &sandbox_id, from).await
-            }
+            PlannedAction::Suspend {
+                sandbox_id, from, ..
+            } => self.drain_suspend(generation, &sandbox_id, from).await,
             PlannedAction::PublishSnapshot { sandbox_id } => {
                 self.publish_unpinned_snapshot(sandbox_id).await
             }

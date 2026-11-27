@@ -43,6 +43,29 @@ pub(super) struct PlanReads {
     pub(super) inputs: PlanInputs,
 }
 
+impl PlanReads {
+    /// The reads with the drain's `work`, read before them, to plan from.
+    pub(super) fn with_work(mut self, work: DrainWork) -> Self {
+        self.inputs.running = work.running;
+        self.inputs.disk_headroom = work.disk_headroom;
+        self
+    }
+}
+
+/// The drain's own work in flight and the cache disk's headroom, read before
+/// a pass reads the rows ([`SandboxManagerService::read_drain_work`]). It has
+/// no default, so a pass can't plan without it.
+#[derive(Clone, Debug)]
+pub(super) struct DrainWork {
+    /// The drain's work in flight in this process, with what each action
+    /// reserves.
+    pub(super) running: BTreeMap<String, RunningAction>,
+    /// The bytes of cache disk the drain may commit to new snapshots
+    /// ([`drain_disk_headroom`]); `None` when the node admits cache
+    /// allocations without measuring.
+    pub(super) disk_headroom: Option<u64>,
+}
+
 impl SandboxManagerService {
     /// One call at a time: a call that arrives while another is in progress
     /// fails at once with `Aborted` and changes nothing. A call ends within
@@ -64,10 +87,11 @@ impl SandboxManagerService {
                 Op::Drain(Drain { evacuate }) => {
                     let first = self.begin_drain(generation, evacuate)?;
                     let scans = self.read_drain_scans().await;
+                    let work = self.read_drain_work().await;
                     Ok(DrainNodeResponse {
                         generation,
                         result: Some(DrainResult::Drain(
-                            self.finish_drain(generation, &first, scans),
+                            self.finish_drain(generation, &first, scans, work),
                         )),
                     })
                 }
@@ -132,11 +156,8 @@ impl SandboxManagerService {
             // Not node-manager's orphan inventory: its scans are shared by
             // every caller on the node and few, so a preview's could evict a
             // drain call's or node-ctl's.
-            let scans = DrainScans {
-                disk_headroom: read_disk_headroom().instrument(span.clone()).await,
-                ..DrainScans::default()
-            };
-            span.in_scope(|| self.finish_preview(scans))
+            let work = self.read_drain_work().instrument(span.clone()).await;
+            span.in_scope(|| self.finish_preview(DrainScans::default(), work))
         })
         .await
         .map_err(|_| {
@@ -151,12 +172,25 @@ impl SandboxManagerService {
     }
 
     /// What a drain call scans outside the rows: node-manager's orphan
-    /// inventory and the cache disk's headroom. Both only read.
+    /// inventory. Only reads.
     async fn read_drain_scans(&self) -> DrainScans {
         let orphans = self.read_orphan_inventory().await;
         DrainScans {
             blocked: orphans.blocked,
             orphan_dirs: orphans.dirs,
+        }
+    }
+
+    /// The drain's own work in flight, with what each action reserves, then
+    /// the cache disk's headroom, in that order and before the pass reads
+    /// the rows: work that ends between the reads is counted twice, by its
+    /// action and by the snapshot it left on the disk or the upload it left
+    /// in the rows, and never not at all. The only builder of a
+    /// [`DrainWork`] outside tests, so no pass plans without it.
+    pub(super) async fn read_drain_work(&self) -> DrainWork {
+        let running = self.drain_actions.running();
+        DrainWork {
+            running,
             disk_headroom: read_disk_headroom().await,
         }
     }
@@ -171,6 +205,7 @@ impl SandboxManagerService {
         generation: u64,
         first: &ActivationSealStatus,
         scans: DrainScans,
+        work: DrainWork,
     ) -> DrainReport {
         let DrainPass {
             mut plan,
@@ -178,7 +213,7 @@ impl SandboxManagerService {
             entered,
             pool_members,
         } = self
-            .run_drain_pass(generation, scans.disk_headroom)
+            .run_drain_pass(generation, work)
             .unwrap_or_else(read_failed);
         fold_scans(&mut plan, &rows, scans, first);
         // A cancelled generation is never sealed again, so the same
@@ -208,7 +243,11 @@ impl SandboxManagerService {
     /// naming the generation, before its reads or after them, since a
     /// preview describes an unsealed node; one whose seal row is unreadable
     /// refuses it with `Internal`.
-    pub(super) fn finish_preview(&self, scans: DrainScans) -> Result<DrainReport, Status> {
+    pub(super) fn finish_preview(
+        &self,
+        scans: DrainScans,
+        work: DrainWork,
+    ) -> Result<DrainReport, Status> {
         self.refuse_preview_while_sealed()?;
         let seal = self.activation_seal.status();
         let DrainPass {
@@ -216,9 +255,7 @@ impl SandboxManagerService {
             rows,
             entered,
             pool_members,
-        } = self
-            .read_preview_plan(scans.disk_headroom)
-            .unwrap_or_else(read_failed);
+        } = self.read_preview_plan(work).unwrap_or_else(read_failed);
         fold_scans(&mut plan, &rows, scans, &seal);
         self.refuse_preview_while_sealed()?;
         Ok(report(plan, &entered, &pool_members))
@@ -245,12 +282,12 @@ impl SandboxManagerService {
     /// nothing. It plans as an evacuating drain would, so no started
     /// sandbox is held. An unsealed node has no drain to continue, and a
     /// drain call there would start with no failures, so the plan has none.
-    fn read_preview_plan(&self, disk_headroom: Option<u64>) -> Result<DrainPass, String> {
+    fn read_preview_plan(&self, work: DrainWork) -> Result<DrainPass, String> {
         let PlanReads {
             rows,
             entered,
             inputs,
-        } = self.read_plan_reads(disk_headroom)?;
+        } = self.read_plan_reads()?.with_work(work);
         Ok(DrainPass {
             plan: plan(&rows, &inputs),
             rows: row_ids(&rows),
@@ -259,30 +296,32 @@ impl SandboxManagerService {
         })
     }
 
-    /// One pass of the drain under a call's `generation`. One call runs at a
-    /// time, so a pass plans with the work earlier calls started. It reads
-    /// the seal and, while the seal is still under `generation`, reads every
-    /// row, plans (holding the started rows unless a call under
-    /// `generation` has said to evacuate), and starts what the plan asks for.
+    /// One pass of the drain under a call's `generation`, from the drain's
+    /// `work` in flight and the cache disk's headroom, both read before it
+    /// ([`Self::read_drain_work`]). One call runs at a time, so a pass
+    /// plans with the work earlier calls started. It reads the seal and,
+    /// while the seal is still under `generation`, reads every row, plans
+    /// (holding the started rows unless a call under `generation` has said
+    /// to evacuate), and starts what the plan asks for.
     /// A seal no longer under `generation` starts nothing and touches none
     /// of the drain's memory. An error is the scan that failed.
     pub(super) fn run_drain_pass(
         &self,
         generation: u64,
-        disk_headroom: Option<u64>,
+        work: DrainWork,
     ) -> Result<DrainPass, String> {
         let sealed = self.activation_seal.status().sealed_generation == Some(generation);
         let PlanReads {
             rows,
             entered,
             mut inputs,
-        } = self.read_plan_reads(disk_headroom)?;
+        } = self.read_plan_reads()?.with_work(work);
         inputs.hold_running = !(sealed && self.drain_actions.evacuating(generation));
         if sealed {
             inputs.failures = self.drain_actions.failures(generation);
         }
         let mut plan = plan(&rows, &inputs);
-        self.confirm_finished_rows(&mut plan, &rows, &inputs, disk_headroom);
+        self.confirm_finished_rows(&mut plan, &rows, &inputs);
         if sealed {
             // A failure counts while the drain still works on its sandbox,
             // starting it or waiting for it; one that succeeded, or moved
@@ -326,7 +365,6 @@ impl SandboxManagerService {
         plan: &mut DrainPlan,
         rows: &[DrainRow],
         inputs: &PlanInputs,
-        disk_headroom: Option<u64>,
     ) {
         let waiting: BTreeSet<String> = plan
             .pending
@@ -351,7 +389,7 @@ impl SandboxManagerService {
         if held.is_empty() {
             return;
         }
-        let again = match self.read_plan_reads(disk_headroom) {
+        let again = match self.read_plan_reads() {
             Ok(again) => again,
             Err(error) => {
                 for row in held {
@@ -425,11 +463,13 @@ impl SandboxManagerService {
         findings
     }
 
-    /// The reads every pass makes: every row, when each entered its status,
-    /// the artifacts without a durable copy and the drain's work in flight,
-    /// as the planner reads them, with none of the drain's memory of earlier
-    /// passes. Only reads. An error is the scan that failed.
-    pub(super) fn read_plan_reads(&self, disk_headroom: Option<u64>) -> Result<PlanReads, String> {
+    /// The reads every pass makes of the rows: every row, when each entered
+    /// its status, the artifacts without a durable copy and their upload
+    /// jobs, as the planner reads them, with none of the drain's memory of
+    /// earlier passes; a plan takes the drain's work too
+    /// ([`PlanReads::with_work`]). Only reads. An error is the scan that
+    /// failed.
+    pub(super) fn read_plan_reads(&self) -> Result<PlanReads, String> {
         let (sandboxes, entered, local_only_rows, pending_rows) = {
             let conn = self
                 .db_conn()
@@ -501,9 +541,7 @@ impl SandboxManagerService {
         let inputs = PlanInputs {
             pending_backups,
             local_only,
-            running: self.drain_actions.running(),
             window: self.drain_actions.window,
-            disk_headroom,
             active_uploads,
             ..PlanInputs::default()
         };
