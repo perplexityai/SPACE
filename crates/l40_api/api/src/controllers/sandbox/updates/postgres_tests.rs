@@ -530,7 +530,7 @@ async fn update_persists_metadata_and_reads_it_back() -> TestResult {
     let reread = fetch_sandbox(&db.pool, sandbox.id)
         .await?
         .expect("sandbox still present");
-    assert_eq!(reread.metadata.0, metadata);
+    assert_eq!(reread.metadata, metadata);
     // The patch names metadata only; the seeded resources must not move.
     assert_eq!(reread.vcpu, Some(2));
     assert_eq!(reread.memory_mib, Some(512));
@@ -551,7 +551,7 @@ async fn update_with_no_fields_leaves_the_row_alone() -> TestResult {
         .await?;
 
     let after = fetch_sandbox(&db.pool, sandbox.id).await?.expect("present");
-    assert_eq!(after.metadata.0, before.metadata.0);
+    assert_eq!(after.metadata, before.metadata);
     assert_eq!(after.vcpu, before.vcpu);
     assert_eq!(after.memory_mib, before.memory_mib);
     assert_eq!(
@@ -679,7 +679,7 @@ async fn update_metadata_replaces_the_whole_document() -> TestResult {
         .await?;
     let after = fetch_sandbox(&db.pool, sandbox.id).await?.expect("present");
     assert_eq!(
-        after.metadata.0, replacement,
+        after.metadata, replacement,
         "the patch replaces the document; `env` must be gone, not merged"
     );
 
@@ -693,6 +693,6 @@ async fn update_metadata_replaces_the_whole_document() -> TestResult {
         )
         .await?;
     let cleared = fetch_sandbox(&db.pool, sandbox.id).await?.expect("present");
-    assert!(cleared.metadata.0.is_empty());
+    assert!(cleared.metadata.is_empty());
     Ok(())
 }

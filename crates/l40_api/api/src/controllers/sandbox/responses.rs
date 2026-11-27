@@ -83,17 +83,11 @@ fn network_policy_source_name(source: i32) -> Option<String> {
 }
 
 fn sandbox_policy_override(sandbox: &Sandbox) -> Option<NetworkPolicy> {
-    sandbox
-        .network_policy
-        .as_ref()
-        .map(|policy| policy.0.clone())
+    sandbox.network_policy.clone()
 }
 
 fn sandbox_template_policy(sandbox: &Sandbox) -> Option<NetworkPolicyV1> {
-    sandbox
-        .template_network_policy
-        .as_ref()
-        .map(|policy| policy.0.clone())
+    sandbox.template_network_policy.clone()
 }
 
 fn sandbox_effective_desired_policy(sandbox: &Sandbox) -> Option<NetworkPolicy> {
@@ -533,15 +527,15 @@ pub fn sandbox_to_response(sandbox: &Sandbox, live: Option<&SandboxInfo>) -> San
         }),
         active_node_id: sandbox.active_node_id,
         active_node: active_node_summary(sandbox),
-        metadata: sandbox.metadata.0.clone(),
+        metadata: sandbox.metadata.clone(),
         created_at: Some(sandbox.created_at),
         updated_at: Some(sandbox.updated_at),
         last_used_at: sandbox.last_used_at,
         last_access_at: sandbox.last_access_at,
         last_command_at: sandbox.last_command_at,
-        auto_lifecycle: Some(live_policy.unwrap_or_else(|| sandbox.auto_lifecycle.0.clone())),
+        auto_lifecycle: Some(live_policy.unwrap_or_else(|| sandbox.auto_lifecycle.clone())),
         auto_lifecycle_status: Some(
-            live_status.unwrap_or_else(|| sandbox.auto_lifecycle_state.0.public_status()),
+            live_status.unwrap_or_else(|| sandbox.auto_lifecycle_state.public_status()),
         ),
         network_policy: sandbox_policy_override(sandbox),
         network_policy_override: sandbox_policy_override(sandbox),

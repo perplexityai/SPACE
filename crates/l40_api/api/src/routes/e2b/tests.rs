@@ -774,13 +774,11 @@ fn test_sandbox() -> Sandbox {
         disk_mib: None,
         disk_io_max_operations_per_sec: 1_000,
         disk_io_max_bandwidth_mib_per_sec: 100,
-        env: sqlx::types::Json(std::collections::BTreeMap::new()),
-        metadata: sqlx::types::Json(std::collections::BTreeMap::new()),
-        auto_lifecycle: sqlx::types::Json(AutoLifecyclePolicy::disabled()),
-        auto_lifecycle_state: sqlx::types::Json(AutoLifecycleRuntimeState::default()),
-        network_policy: Some(sqlx::types::Json(
-            pplx_space_net_common::NetworkPolicyV1::default(),
-        )),
+        env: std::collections::BTreeMap::new(),
+        metadata: std::collections::BTreeMap::new(),
+        auto_lifecycle: AutoLifecyclePolicy::disabled(),
+        auto_lifecycle_state: AutoLifecycleRuntimeState::default(),
+        network_policy: Some(pplx_space_net_common::NetworkPolicyV1::default()),
         network_policy_generation: 1,
         template_network_policy: None,
         template_network_policy_generation: None,
@@ -1686,7 +1684,7 @@ async fn egress_profile_header_applies_only_to_federated_creates(
         let sandbox = crate::controllers::sandbox::fetch_sandbox(&fixture.pool, sandbox_id)
             .await?
             .expect("created sandbox");
-        let policy = sandbox.network_policy.expect("resolved policy").0;
+        let policy = sandbox.network_policy.expect("resolved policy");
         assert_eq!(policy.allows_domain("sensor.example.test"), federated);
         assert!(!policy.allows_domain("unlisted.example.test"));
         assert_eq!(
@@ -5009,14 +5007,14 @@ async fn start_connect_route_sim_worker(node_id: NodeId) -> TestResult<SimWorker
 #[test]
 fn metadata_uses_sandbox_metadata() {
     let mut sandbox = test_sandbox();
-    sandbox.metadata = sqlx::types::Json(std::collections::BTreeMap::from([
+    sandbox.metadata = std::collections::BTreeMap::from([
         (
             "name".to_string(),
             SandboxMetadataValue::String("session-123".to_string()),
         ),
         ("priority".to_string(), SandboxMetadataValue::Number(3)),
         ("debug".to_string(), SandboxMetadataValue::Bool(true)),
-    ]));
+    ]);
     let response = SandboxResponse {
         name: sandbox.name.clone(),
         user_id: Some(sandbox.user_id),
@@ -5024,7 +5022,7 @@ fn metadata_uses_sandbox_metadata() {
         lifecycle: Some(sandbox.lifecycle.clone()),
         placement: Some(sandbox.placement.clone()),
         active_node_id: sandbox.active_node_id,
-        metadata: sandbox.metadata.0.clone(),
+        metadata: sandbox.metadata.clone(),
         status: Some("started".to_string()),
         ..native_sandbox_response(sandbox.id)
     };
@@ -5322,7 +5320,7 @@ fn detail_sandbox_uses_cached_runtime_spec() {
 #[test]
 fn detail_reports_authoritative_federated_ownership_not_metadata() {
     let mut sandbox = test_sandbox();
-    sandbox.metadata.0.insert(
+    sandbox.metadata.insert(
         "space.owner".into(),
         SandboxMetadataValue::String(
             r#"{"source":"federated_identity","orgID":"forged-org"}"#.into(),

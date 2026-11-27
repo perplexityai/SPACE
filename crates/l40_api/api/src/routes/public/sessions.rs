@@ -151,7 +151,7 @@ pub async fn create_process_session(
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
     let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, sandbox_id).await?;
     let lifecycle = sandbox_lifecycle(&sandbox)?;
-    let admission = command_admission(lifecycle, &sandbox.auto_lifecycle.0);
+    let admission = command_admission(lifecycle, &sandbox.auto_lifecycle);
     let request_json = serde_json::to_value(&request).map_err(|error| {
         tracing::error!(error = %error, "failed to serialize process session request");
         PublicApiError::internal()
@@ -214,7 +214,7 @@ pub async fn create_command(
         reject_streamed_pty(&request)?;
     }
     let lifecycle = sandbox_lifecycle(&sandbox)?;
-    let admission = command_admission(lifecycle, &sandbox.auto_lifecycle.0);
+    let admission = command_admission(lifecycle, &sandbox.auto_lifecycle);
     let command = create_command_session(
         &state.public_session_store(),
         org.id,
@@ -434,7 +434,7 @@ pub(crate) async fn queue_implicit_wake(
     let mut admission = activity_admission(
         activity,
         sandbox_lifecycle(sandbox)?,
-        &sandbox.auto_lifecycle.0,
+        &sandbox.auto_lifecycle,
     );
     if admission == CommandAdmission::Refuse {
         // Read the sandbox again before answering no, with its pending
@@ -464,7 +464,7 @@ pub(crate) async fn queue_implicit_wake(
         let Ok(lifecycle) = observed.lifecycle.parse::<SandboxLifecycle>() else {
             return Ok(false);
         };
-        admission = activity_admission(activity, lifecycle, &observed.auto_lifecycle.0);
+        admission = activity_admission(activity, lifecycle, &observed.auto_lifecycle);
     }
     match admission {
         CommandAdmission::Admit => Ok(true),

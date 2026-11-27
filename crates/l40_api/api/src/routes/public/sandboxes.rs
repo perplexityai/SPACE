@@ -1415,8 +1415,8 @@ fn public_sandbox_from_row(sandbox: PublicSandboxRow) -> Result<PublicSandbox, P
             tracing::error!(%error, "invalid stored sandbox idle deadline");
             PublicApiError::internal()
         })?;
-    let (idle_timeout, idle_action) = match sandbox.auto_lifecycle.0.stages.as_slice() {
-        [stage] => match crate::e2b::lifecycle_config_from_policy(&sandbox.auto_lifecycle.0) {
+    let (idle_timeout, idle_action) = match sandbox.auto_lifecycle.stages.as_slice() {
+        [stage] => match crate::e2b::lifecycle_config_from_policy(&sandbox.auto_lifecycle) {
             Some(config) => (
                 Some(format!("{}s", stage.at)),
                 Some(if config.auto_pause {
@@ -1444,7 +1444,7 @@ fn public_sandbox_from_row(sandbox: PublicSandboxRow) -> Result<PublicSandbox, P
                 .and_then(|value| u32::try_from(value).ok()),
             disk_mib: sandbox.disk_mib.and_then(|value| u32::try_from(value).ok()),
         },
-        metadata: public_metadata(sandbox.metadata.0),
+        metadata: public_metadata(sandbox.metadata),
         expires_at,
         idle_timeout,
         idle_action,

@@ -9,7 +9,7 @@ impl KubernetesSubstrate {
         sandbox: &Sandbox,
     ) -> Result<pplx_space_net_common::NetworkPolicy, SubstrateError> {
         if let Some(policy) = sandbox.network_policy.as_ref() {
-            return Ok(policy.0.clone());
+            return Ok(policy.clone());
         }
         let Some(template) = sandbox.template_id.as_deref() else {
             return Ok(pplx_space_net_common::NetworkPolicyV1::default());
@@ -369,7 +369,7 @@ impl KubernetesSubstrate {
             activation_attempt_id: execution.bootstrap_route_activation_id(),
             template: sandbox_template_name(sandbox),
             content_hash: sandbox.content_hash.as_deref(),
-            env: &sandbox.env.0,
+            env: &sandbox.env,
             traceparent: pplx_space_observability::trace_propagation::current_traceparent(),
             environment,
         };

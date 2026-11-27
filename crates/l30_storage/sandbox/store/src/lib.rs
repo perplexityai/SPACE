@@ -807,7 +807,8 @@ pub struct SandboxActivationObservation {
     /// restore or wake) is queued or running for it.
     pub activation_pending: bool,
     /// The sandbox's stored lifecycle policy, read with the lifecycle.
-    pub auto_lifecycle: sqlx::types::Json<pplx_space_auto_lifecycle::AutoLifecyclePolicy>,
+    #[sqlx(json)]
+    pub auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy,
 }
 
 /// Observe the org's sandbox's lifecycle, policy and pending activation, the
@@ -896,7 +897,8 @@ pub struct AutoLifecycleExecution {
     pub execution_generation: Option<i64>,
     pub has_direct_route: bool,
     pub has_activation_lease: bool,
-    pub policy: sqlx::types::Json<pplx_space_auto_lifecycle::AutoLifecyclePolicy>,
+    #[sqlx(json)]
+    pub policy: pplx_space_auto_lifecycle::AutoLifecyclePolicy,
 }
 
 impl AutoLifecycleExecution {

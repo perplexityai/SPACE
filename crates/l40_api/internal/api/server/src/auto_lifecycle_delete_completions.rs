@@ -542,7 +542,7 @@ async fn apply_receipt(
         StoredSandboxLifecycle::Live(lifecycle) => lifecycle,
     };
     let current_policy =
-        match serde_json::from_value::<AutoLifecyclePolicy>(row.auto_lifecycle_json.0) {
+        match serde_json::from_value::<AutoLifecyclePolicy>(row.auto_lifecycle_json) {
             Ok(policy) => policy,
             Err(error) => {
                 tracing::warn!(

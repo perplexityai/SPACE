@@ -854,7 +854,7 @@ pub(super) async fn charge_implicit_access_activation(
     sandbox: &Sandbox,
     activity: ExecutionActivityKind,
 ) -> Result<Option<LiveReservation>, ControllerError> {
-    if !activity.allows_implicit_wake(&sandbox.auto_lifecycle.0) {
+    if !activity.allows_implicit_wake(&sandbox.auto_lifecycle) {
         return Ok(None);
     }
     charge_implicit_activation(admission, sandbox).await

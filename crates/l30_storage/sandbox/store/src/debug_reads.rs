@@ -15,6 +15,7 @@ use pplx_space_node_model::{NodeAddress, NodeManagedBy, NodeRole};
 use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
+use sqlx::FromRow;
 use sqlx::types::{Json, JsonValue};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -26,7 +27,7 @@ use uuid::Uuid;
 /// `target_node_*` columns are `None` when that id is unset or names no
 /// `nodes` row; the address is also `None` when the node has no address,
 /// and the Kubernetes node name when the node has no `node_k8s` row.
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug)]
 pub struct SandboxDebugRecord {
     pub id: SandboxId,
     pub name: Option<String>,
@@ -51,14 +52,14 @@ pub struct SandboxDebugRecord {
     pub vcpu: Option<i32>,
     pub memory_mib: Option<i32>,
     pub disk_mib: Option<i32>,
-    pub env: Json<JsonValue>,
-    pub metadata: Json<JsonValue>,
+    pub env: JsonValue,
+    pub metadata: JsonValue,
     /// `auto_lifecycle_json`.
-    pub auto_lifecycle: Json<JsonValue>,
+    pub auto_lifecycle: JsonValue,
     /// `auto_lifecycle_state_json`.
-    pub auto_lifecycle_state: Json<JsonValue>,
+    pub auto_lifecycle_state: JsonValue,
     pub next_auto_event_at: Option<i64>,
-    pub network_policy_override_json: Option<Json<JsonValue>>,
+    pub network_policy_override_json: Option<JsonValue>,
     pub network_policy_generation: i64,
     pub snapshots_enabled_desired: bool,
     pub last_used_at: Option<OffsetDateTime>,
@@ -66,12 +67,93 @@ pub struct SandboxDebugRecord {
     pub updated_at: OffsetDateTime,
 }
 
+/// [`SandboxDebugRecord`] as Postgres returns it: the documents still
+/// wrapped for decoding.
+#[derive(FromRow)]
+struct SandboxDebugRecordRow {
+    id: SandboxId,
+    name: Option<String>,
+    user_id: Option<UserId>,
+    org_id: Option<OrgId>,
+    managed_by: String,
+    lifecycle: String,
+    placement: String,
+    active_node_id: Option<NodeId>,
+    active_node_address: Option<NodeAddress>,
+    active_node_role: Option<NodeRole>,
+    active_node_managed_by: Option<NodeManagedBy>,
+    active_k8s_node_name: Option<String>,
+    target_node_id: Option<NodeId>,
+    target_node_address: Option<NodeAddress>,
+    target_node_role: Option<NodeRole>,
+    target_node_managed_by: Option<NodeManagedBy>,
+    target_k8s_node_name: Option<String>,
+    placement_changed_at: Option<OffsetDateTime>,
+    template_id: Option<String>,
+    content_hash: Option<String>,
+    vcpu: Option<i32>,
+    memory_mib: Option<i32>,
+    disk_mib: Option<i32>,
+    env: Json<JsonValue>,
+    metadata: Json<JsonValue>,
+    auto_lifecycle: Json<JsonValue>,
+    auto_lifecycle_state: Json<JsonValue>,
+    next_auto_event_at: Option<i64>,
+    network_policy_override_json: Option<Json<JsonValue>>,
+    network_policy_generation: i64,
+    snapshots_enabled_desired: bool,
+    last_used_at: Option<OffsetDateTime>,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+}
+
+impl From<SandboxDebugRecordRow> for SandboxDebugRecord {
+    fn from(row: SandboxDebugRecordRow) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            user_id: row.user_id,
+            org_id: row.org_id,
+            managed_by: row.managed_by,
+            lifecycle: row.lifecycle,
+            placement: row.placement,
+            active_node_id: row.active_node_id,
+            active_node_address: row.active_node_address,
+            active_node_role: row.active_node_role,
+            active_node_managed_by: row.active_node_managed_by,
+            active_k8s_node_name: row.active_k8s_node_name,
+            target_node_id: row.target_node_id,
+            target_node_address: row.target_node_address,
+            target_node_role: row.target_node_role,
+            target_node_managed_by: row.target_node_managed_by,
+            target_k8s_node_name: row.target_k8s_node_name,
+            placement_changed_at: row.placement_changed_at,
+            template_id: row.template_id,
+            content_hash: row.content_hash,
+            vcpu: row.vcpu,
+            memory_mib: row.memory_mib,
+            disk_mib: row.disk_mib,
+            env: row.env.0,
+            metadata: row.metadata.0,
+            auto_lifecycle: row.auto_lifecycle.0,
+            auto_lifecycle_state: row.auto_lifecycle_state.0,
+            next_auto_event_at: row.next_auto_event_at,
+            network_policy_override_json: row.network_policy_override_json.map(|json| json.0),
+            network_policy_generation: row.network_policy_generation,
+            snapshots_enabled_desired: row.snapshots_enabled_desired,
+            last_used_at: row.last_used_at,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
 /// The sandbox's [`SandboxDebugRecord`]. `None` when no such sandbox exists.
 pub async fn record(
     executor: impl Executor<'_>,
     sandbox_id: SandboxId,
 ) -> Result<Option<SandboxDebugRecord>, DbError> {
-    Ok(sqlx::query_as::<_, SandboxDebugRecord>(sql!(
+    Ok(sqlx::query_as::<_, SandboxDebugRecordRow>(sql!(
         "SELECT s.id,
                 s.name,
                 s.user_id,
@@ -115,7 +197,8 @@ pub async fn record(
     ))
     .bind(sandbox_id)
     .fetch_optional(executor.into_sqlx())
-    .await?)
+    .await?
+    .map(SandboxDebugRecord::from))
 }
 
 /// One `sandbox_k8s_executions` row as the debug view shows it.
@@ -182,7 +265,8 @@ pub struct SnapshotInventoryRow {
     pub size_bytes: i64,
     pub template_id: Option<String>,
     pub content_hash: Option<String>,
-    pub locations: Json<JsonValue>,
+    #[sqlx(json)]
+    pub locations: JsonValue,
     pub observed_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }
@@ -224,7 +308,8 @@ pub async fn snapshot_inventory(
 pub struct TimelineEvent {
     pub at: OffsetDateTime,
     pub kind: String,
-    pub detail: Json<JsonValue>,
+    #[sqlx(json)]
+    pub detail: JsonValue,
 }
 
 /// The newest 200 changes to `sandbox_id` across its row, observed state,

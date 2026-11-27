@@ -896,7 +896,7 @@ impl SandboxLifecycleOperationExecutor {
         let (controller_action, activating_client) = if is_implicit_wake(operation, payload.action)
         {
             let activity = implicit_wake_activity(payload.wake_activity);
-            if !activity.allows_implicit_wake(&sandbox.auto_lifecycle.0) {
+            if !activity.allows_implicit_wake(&sandbox.auto_lifecycle) {
                 return Err(SandboxLifecycleExecutionError::ImplicitWakeNotAllowed);
             }
             (
