@@ -89,12 +89,6 @@ fn prune_request() -> PruneRequest {
     }
 }
 
-/// Full-table window bounds for tests that drive one windowed delete
-/// directly.
-fn full_range() -> (Uuid, Uuid) {
-    (Uuid::nil(), Uuid::max())
-}
-
 async fn insert_node(pool: &PgPool, node_id: NodeId) -> TestResult {
     sqlx::query(sql!(
         "INSERT INTO nodes (id, address, role, managed_by)
@@ -306,178 +300,56 @@ async fn observed_exists(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<boo
     Ok(exists)
 }
 
-/// Selection is unordered (the LIMIT short-circuits the candidate scan),
-/// so the per-tick contract is: exactly `max_per_tick` eligible rows go per
-/// tick, ineligible rows are untouched, and repeated ticks reach every
-/// eligible row — progress, not pick order, is the invariant.
+/// The tick passes `orphan_age`, not `stale_suspended_age`, as the stale
+/// sweep's quarantine-recovery grace: the two ages differ, and evidence
+/// between them decides the outcome.
 #[tokio::test]
-async fn stale_suspended_gc_bounds_each_tick_and_reaches_all_eligible() -> TestResult {
+async fn stale_suspended_gc_keeps_recovery_evidence_within_the_orphan_age() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
     let node_id = NodeId::new();
-    let eligible_ids = [SandboxId::new(), SandboxId::new(), SandboxId::new()];
-    let too_new_id = SandboxId::new();
-    let active_id = SandboxId::new();
+    let fresh = SandboxId::new();
+    let expired = SandboxId::new();
 
     insert_node(&db.pool, node_id).await?;
-    for (sandbox_id, lifecycle, age_minutes) in [
-        (eligible_ids[0], "suspended", 300),
-        (eligible_ids[1], "suspended", 240),
-        (eligible_ids[2], "suspended", 240),
-        (too_new_id, "suspended", 30),
-        (active_id, "started", 300),
-    ] {
-        insert_sandbox_with_state(&db.pool, sandbox_id, lifecycle, age_minutes).await?;
+    for (sandbox_id, evidence_age_minutes) in [(fresh, 30), (expired, 120)] {
+        insert_suspended_sandbox(&db.pool, sandbox_id).await?;
         insert_observed_sandbox(&db.pool, node_id, sandbox_id).await?;
+        insert_quarantine_recovery_facet(&db.pool, node_id, sandbox_id, evidence_age_minutes)
+            .await?;
     }
 
-    let request = PruneRequest {
-        stale_suspended_age: PositiveDuration::new_panic(Duration::from_secs(60 * 60)),
-        orphan_age: PositiveDuration::new_panic(Duration::from_secs(24 * 60 * 60)),
-        max_per_tick: 2,
-        scan_window: DEFAULT_SCAN_WINDOW,
-        windows_per_tick: DEFAULT_WINDOWS_PER_TICK,
-    };
-    let (from, to) = full_range();
-    let deleted = delete_stale_suspended_observed(&db.pool, request, 2, from, to).await?;
+    let report = ObservedProjectionDbStore::new(db.pool.clone())
+        .prune_observed_projections(PruneRequest {
+            stale_suspended_age: PositiveDuration::new_panic(Duration::from_secs(60)),
+            orphan_age: PositiveDuration::new_panic(Duration::from_secs(3600)),
+            ..prune_request()
+        })
+        .await?;
 
-    assert_eq!(
-        deleted,
-        (2, 0, 0),
-        "first tick deletes exactly max_per_tick"
-    );
-    let mut survivors = 0;
-    for id in eligible_ids {
-        if observed_exists(&db.pool, id).await? {
-            survivors += 1;
-        }
-    }
-    assert_eq!(
-        survivors, 1,
-        "exactly one eligible row awaits the next tick"
-    );
-    assert!(observed_exists(&db.pool, too_new_id).await?);
-    assert!(observed_exists(&db.pool, active_id).await?);
-
-    let deleted = delete_stale_suspended_observed(&db.pool, request, 2, from, to).await?;
-    assert_eq!(deleted, (1, 0, 0), "second tick drains the backlog");
-    for id in eligible_ids {
-        assert!(
-            !observed_exists(&db.pool, id).await?,
-            "every eligible row is reached across ticks"
+    assert_eq!(report.stale_suspended_observed, 1);
+    for (sandbox_id, kept) in [(fresh, true), (expired, false)] {
+        assert_eq!(observed_exists(&db.pool, sandbox_id).await?, kept);
+        assert_eq!(
+            facet_status_exists(
+                &db.pool,
+                node_id,
+                "sandbox-desired-state",
+                &sandbox_id.to_string()
+            )
+            .await?,
+            kept
         );
     }
-    assert!(observed_exists(&db.pool, too_new_id).await?);
-    assert!(observed_exists(&db.pool, active_id).await?);
-
     Ok(())
 }
 
+/// The tick runs the orphaned sweep and reports its observed and facet
+/// deletes. Which rows the sweep deletes is pinned by sandbox-teardown's
+/// `observed_gc` tests.
 #[tokio::test]
-async fn stale_suspended_gc_removes_bare_and_prefixed_sandbox_facets() -> TestResult {
-    let Some(db) = try_pg_test_db().await? else {
-        return Ok(());
-    };
-    let node_id = NodeId::new();
-    let sandbox_id = SandboxId::new();
-    let bare_element = sandbox_id.to_string();
-    let network_policy_element = format!("sandbox:{sandbox_id}");
-
-    insert_node(&db.pool, node_id).await?;
-    insert_suspended_sandbox(&db.pool, sandbox_id).await?;
-    insert_observed_sandbox(&db.pool, node_id, sandbox_id).await?;
-    insert_facet_status_and_condition(&db.pool, node_id, "sandbox-desired-state", &bare_element)
-        .await?;
-    insert_facet_status_and_condition(&db.pool, node_id, "sandbox-inventory", &bare_element)
-        .await?;
-    insert_facet_status_and_condition(&db.pool, node_id, "network-policy", &network_policy_element)
-        .await?;
-
-    let report = ObservedProjectionDbStore::new(db.pool.clone())
-        .prune_observed_projections(prune_request())
-        .await?;
-
-    assert_eq!(report.stale_suspended_observed, 1);
-    assert_eq!(report.orphaned_facet_status, 3);
-    assert_eq!(report.orphaned_facet_conditions, 3);
-    assert!(!facet_status_exists(&db.pool, node_id, "sandbox-desired-state", &bare_element).await?);
-    assert!(
-        !facet_condition_exists(&db.pool, node_id, "sandbox-desired-state", &bare_element).await?
-    );
-    assert!(!facet_status_exists(&db.pool, node_id, "sandbox-inventory", &bare_element).await?);
-    assert!(!facet_condition_exists(&db.pool, node_id, "sandbox-inventory", &bare_element).await?);
-    assert!(
-        !facet_status_exists(&db.pool, node_id, "network-policy", &network_policy_element).await?
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn stale_suspended_gc_preserves_fresh_quarantine_recovery_evidence() -> TestResult {
-    let Some(db) = try_pg_test_db().await? else {
-        return Ok(());
-    };
-    let node_id = NodeId::new();
-    let sandbox_id = SandboxId::new();
-
-    insert_node(&db.pool, node_id).await?;
-    insert_suspended_sandbox(&db.pool, sandbox_id).await?;
-    insert_observed_sandbox(&db.pool, node_id, sandbox_id).await?;
-    insert_quarantine_recovery_facet(&db.pool, node_id, sandbox_id, 0).await?;
-
-    let report = ObservedProjectionDbStore::new(db.pool.clone())
-        .prune_observed_projections(prune_request())
-        .await?;
-
-    assert_eq!(report.stale_suspended_observed, 0);
-    assert!(observed_exists(&db.pool, sandbox_id).await?);
-    assert!(
-        facet_status_exists(
-            &db.pool,
-            node_id,
-            "sandbox-desired-state",
-            &sandbox_id.to_string()
-        )
-        .await?
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn stale_suspended_gc_removes_expired_quarantine_recovery_evidence() -> TestResult {
-    let Some(db) = try_pg_test_db().await? else {
-        return Ok(());
-    };
-    let node_id = NodeId::new();
-    let sandbox_id = SandboxId::new();
-
-    insert_node(&db.pool, node_id).await?;
-    insert_suspended_sandbox(&db.pool, sandbox_id).await?;
-    insert_observed_sandbox(&db.pool, node_id, sandbox_id).await?;
-    insert_quarantine_recovery_facet(&db.pool, node_id, sandbox_id, 120).await?;
-
-    let report = ObservedProjectionDbStore::new(db.pool.clone())
-        .prune_observed_projections(prune_request())
-        .await?;
-
-    assert_eq!(report.stale_suspended_observed, 1);
-    assert!(!observed_exists(&db.pool, sandbox_id).await?);
-    assert!(
-        !facet_status_exists(
-            &db.pool,
-            node_id,
-            "sandbox-desired-state",
-            &sandbox_id.to_string()
-        )
-        .await?
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn orphaned_observed_gc_removes_bare_and_prefixed_sandbox_facets() -> TestResult {
+async fn orphaned_observed_sweep_reports_its_facet_deletes() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
@@ -500,41 +372,7 @@ async fn orphaned_observed_gc_removes_bare_and_prefixed_sandbox_facets() -> Test
     assert_eq!(report.orphaned_observed, 1);
     assert_eq!(report.orphaned_facet_status, 2);
     assert_eq!(report.orphaned_facet_conditions, 2);
-    assert!(!facet_status_exists(&db.pool, node_id, "sandbox-inventory", &bare_element).await?);
-    assert!(
-        !facet_status_exists(&db.pool, node_id, "network-policy", &network_policy_element).await?
-    );
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn orphaned_observed_gc_preserves_fresh_quarantine_recovery_evidence() -> TestResult {
-    let Some(db) = try_pg_test_db().await? else {
-        return Ok(());
-    };
-    let node_id = NodeId::new();
-    let sandbox_id = SandboxId::new();
-
-    insert_node(&db.pool, node_id).await?;
-    insert_observed_sandbox(&db.pool, node_id, sandbox_id).await?;
-    insert_quarantine_recovery_facet(&db.pool, node_id, sandbox_id, 0).await?;
-
-    let report = ObservedProjectionDbStore::new(db.pool.clone())
-        .prune_observed_projections(prune_request())
-        .await?;
-
-    assert_eq!(report.orphaned_observed, 0);
-    assert!(observed_exists(&db.pool, sandbox_id).await?);
-    assert!(
-        facet_status_exists(
-            &db.pool,
-            node_id,
-            "sandbox-desired-state",
-            &sandbox_id.to_string()
-        )
-        .await?
-    );
     Ok(())
 }
 
@@ -781,6 +619,10 @@ async fn facet_sweep_budget_survives_observed_churn() -> TestResult {
     assert_eq!(
         report.orphaned_facet_status, 3,
         "two churn side-deletes plus the orphaned facet row"
+    );
+    assert_eq!(
+        report.orphaned_facet_conditions, 3,
+        "the conditions of those three rows"
     );
 
     Ok(())

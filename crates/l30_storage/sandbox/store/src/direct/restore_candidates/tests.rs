@@ -4,7 +4,8 @@
 //! The sandbox entered `restoring` between two full snapshots: a ready one
 //! its nodes can load, from before the claim, and a newer failed one they
 //! can't, from after it. A fresh restore reads the newest; a retry reads the
-//! pre-claim source.
+//! pre-claim source, even once a post-claim snapshot its nodes can load is
+//! ready and stored.
 
 use pplx_space_accounts::{NodeId, OrgId, UserId};
 use pplx_space_db_test_fixtures::{
@@ -18,6 +19,7 @@ use uuid::Uuid;
 use super::{RestoreCandidateRow, remote_candidates, source_candidates};
 
 const STORAGE_URI: &str = "s3://bucket/snapshots/sandbox/source";
+const POST_CLAIM_STORAGE_URI: &str = "s3://bucket/snapshots/sandbox/post-claim";
 
 /// A registered, reachable, ready Direct worker that can load
 /// `firecracker-snapshot` 9.x on `fc` 1.15.1 for linux/aarch64.
@@ -226,5 +228,30 @@ async fn each_mode_reads_its_own_source_snapshot() -> TestDbResult<()> {
             "restore_retry = {restore_retry}"
         );
     }
+
+    // A post-claim attempt that is ready, loadable and stored: the claim's
+    // cutoff alone keeps the retry on the pre-claim copy. Only the remote leg
+    // names the snapshot it read, by its storage URI.
+    let post_claim = insert_full_snapshot(pool, id, seeded.source, "ready", "9.0.0", 1_000).await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string, org_id)
+         VALUES ($1, $2, $3)"
+    ))
+    .bind(post_claim)
+    .bind(POST_CLAIM_STORAGE_URI)
+    .bind(SEED_ORG_ID)
+    .execute(pool)
+    .await?;
+    assert_eq!(
+        remote_candidates(pool, id, false, 7, false).await?,
+        vec![RestoreCandidateRow {
+            storage_uri: Some(POST_CLAIM_STORAGE_URI.to_owned()),
+            ..remote_row.clone()
+        }]
+    );
+    assert_eq!(
+        remote_candidates(pool, id, true, 7, false).await?,
+        vec![remote_row]
+    );
     Ok(())
 }
