@@ -39,8 +39,8 @@ pub async fn for_create(
     template: &str,
     content_hash: &str,
     runtime: &str,
-) -> Result<Option<Json<AutoLifecyclePolicy>>, DbError> {
-    Ok(sqlx::query_scalar::<_, Json<AutoLifecyclePolicy>>(sql!(
+) -> Result<Option<AutoLifecyclePolicy>, DbError> {
+    let policy = sqlx::query_scalar::<_, Json<AutoLifecyclePolicy>>(sql!(
         "WITH desired AS (
              SELECT default_auto_lifecycle_json
              FROM template_default_auto_lifecycle_policies
@@ -68,7 +68,8 @@ pub async fn for_create(
     .bind(content_hash)
     .bind(runtime)
     .fetch_optional(executor.into_sqlx())
-    .await?)
+    .await?;
+    Ok(policy.map(|policy| policy.0))
 }
 
 /// Delete `template`'s default auto-lifecycle policy, if it has one.

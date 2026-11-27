@@ -833,7 +833,7 @@ impl ClusterApi for ClusterApiService {
                 };
                 Some(TemplateNetworkPolicyState {
                     template,
-                    policy: Some(common_network_policy_to_proto(&row.network_policy_json.0)),
+                    policy: Some(common_network_policy_to_proto(&row.network_policy_json)),
                     generation: db_generation_to_proto(row.network_policy_generation),
                 })
             })
@@ -1040,7 +1040,7 @@ impl ClusterApi for ClusterApiService {
                     .default_auto_lifecycle_json
                     .as_ref()
                     .filter(|_| present)
-                    .map(|policy| common_auto_lifecycle_to_proto(&policy.0)),
+                    .map(common_auto_lifecycle_to_proto),
                 pool,
                 present: Some(present),
             });

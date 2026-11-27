@@ -334,15 +334,12 @@ fn template_response(row: TemplateRow) -> TemplateResponse {
         base_snapshot_size_bytes: row
             .base_snapshot_size_bytes
             .and_then(|value| u64::try_from(value).ok()),
-        snapshots: row
-            .snapshots
-            .map(|snapshots| snapshots.0)
-            .unwrap_or_default(),
+        snapshots: row.snapshots.unwrap_or_default(),
         vcpu: row.vcpu.and_then(|value| u32::try_from(value).ok()),
         memory_mib: row.memory_mib.and_then(|value| u32::try_from(value).ok()),
         disk_size_mb: row.disk_size_mb.and_then(|value| u32::try_from(value).ok()),
-        default_auto_lifecycle: row.default_auto_lifecycle.map(|value| value.0),
-        network_policy: Some(row.network_policy.0),
+        default_auto_lifecycle: row.default_auto_lifecycle,
+        network_policy: Some(row.network_policy),
         network_policy_generation: u64::try_from(row.network_policy_generation).ok(),
         network_policy_status: row
             .observed_network_policy_generation
