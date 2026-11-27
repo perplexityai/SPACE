@@ -158,6 +158,11 @@ from space_smoke.runtime import (
     background,
 )
 
+from space_smoke.template_default_lifecycle import (
+    TemplateDefaultLifecycle,
+    TemplateDefaultLifecycleControl,
+)
+
 if TYPE_CHECKING:
     from space_smoke.private_template_build import PrivateTemplateBuildAssertions
 
@@ -2982,6 +2987,31 @@ class KindAdmin(ScenarioFixture):
         )
         by_metadata.disarm()
         return sandbox_id
+
+    _template_default_lifecycle_control: TemplateDefaultLifecycleControl | None = None
+    _template_default_lifecycle: TemplateDefaultLifecycle | None = None
+
+    @property
+    def template_default_lifecycle(self) -> TemplateDefaultLifecycle:
+        """Native creates of this scenario's template, and its default auto-lifecycle policy."""
+
+        if self._template_default_lifecycle_control is None or self._ecw_creator is None:
+            raise SmokeConfigurationError(
+                "template default lifecycle control needs the kind backend and the ECW SDK"
+            )
+        if self._template_default_lifecycle is None:
+            creator = self._ecw_creator
+            template = self.sandbox_template_name()
+            self._template_default_lifecycle = TemplateDefaultLifecycle(
+                self,
+                self._template_default_lifecycle_control,
+                self._context.scope,
+                template,
+                selector=self._template_selector or template,
+                kill_sandbox=creator.kill_sandbox,
+                kill_matching=creator.kill_matching,
+            )
+        return self._template_default_lifecycle
 
     _campaign_control: CampaignControl | None = None
     _campaign_assertions: TemplateCampaignAssertions | None = None

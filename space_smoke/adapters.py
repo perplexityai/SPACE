@@ -616,6 +616,28 @@ def _sql_identifier_ish(value: str) -> str:
     return value
 
 
+# The desired default `PATCH /admin/api/v1/templates/{name}` writes; the admin
+# read would also fall back to a builder's published copy.
+TEMPLATE_DEFAULT_AUTO_LIFECYCLE_SQL = """\
+SELECT default_auto_lifecycle_json::text FROM template_default_auto_lifecycle_policies
+WHERE template = '{template}';
+"""
+# True once no node publishes a default for the template other than the desired one.
+TEMPLATE_DEFAULT_AUTO_LIFECYCLE_PUBLISHED_SQL = """\
+SELECT NOT EXISTS (
+    SELECT 1 FROM node_template_inventory nti
+    JOIN template_default_auto_lifecycle_policies d ON d.template = nti.template_name
+    WHERE nti.template_name = '{template}'
+      AND nti.default_auto_lifecycle_json IS NOT NULL
+      AND nti.default_auto_lifecycle_json <> d.default_auto_lifecycle_json
+);
+"""
+# Restores a template to having no default: no public path removes one.
+DELETE_TEMPLATE_DEFAULT_AUTO_LIFECYCLE_SQL = """\
+DELETE FROM template_default_auto_lifecycle_policies WHERE template = '{template}';
+"""
+
+
 def _sql_uuid_list(values: Sequence[str]) -> str:
     if not values:
         raise ValueError("refusing an empty id list")
@@ -4733,11 +4755,20 @@ ON CONFLICT (key_hash) DO NOTHING;
         items = json.loads(result.stdout or "{}").get("items", [])
         return sum(1 for item in items if not (item.get("metadata") or {}).get("deletionTimestamp"))
 
-    def native_create_sandbox(self, *, template: str, metadata: Mapping[str, str]) -> str:
+    def native_create_sandbox(
+        self,
+        *,
+        template: str,
+        metadata: Mapping[str, str],
+        auto_lifecycle: Mapping[str, object] | None = None,
+    ) -> str:
         self._require_isolated_kind("native create")
-        body = json.dumps(
-            {"template": template, "runtime": "fc", "env": {}, "metadata": dict(metadata), "resources": None}
-        ).encode()
+        fields: dict[str, object] = {
+            "template": template, "runtime": "fc", "env": {}, "metadata": dict(metadata), "resources": None
+        }
+        if auto_lifecycle is not None:
+            fields["auto_lifecycle"] = dict(auto_lifecycle)
+        body = json.dumps(fields).encode()
         request = Request(
             self.config.api_url.rstrip("/") + "/v1/sandboxes",
             method="POST",
@@ -8207,6 +8238,48 @@ ON CONFLICT (key_hash) DO NOTHING;
         payload = self._admin_v1("GET", f"sandboxes/sbx_{quote(_sql_uuid(sandbox_id), safe='')}")
         state = payload.get("state") if isinstance(payload, dict) else None
         return str(state) if isinstance(state, str) else ""
+
+    def native_sandbox_idle(self, sandbox_id: str) -> tuple[str | None, str | None]:
+        """`idle_timeout` and `idle_action` from the native `/v1` read."""
+
+        payload = self._admin_v1("GET", f"sandboxes/sbx_{quote(_sql_uuid(sandbox_id), safe='')}")
+        if not isinstance(payload, dict):
+            raise RuntimeError("native sandbox read was not an object")
+        timeout, action = payload.get("idle_timeout"), payload.get("idle_action")
+        return (
+            timeout if isinstance(timeout, str) else None,
+            action if isinstance(action, str) else None,
+        )
+
+    def template_default_auto_lifecycle(self, template: str) -> Mapping[str, object] | None:
+        out = self._psql(
+            TEMPLATE_DEFAULT_AUTO_LIFECYCLE_SQL.format(template=_template_name(template)),
+            action="read the template's default auto-lifecycle policy",
+        )
+        return json.loads(out) if out else None
+
+    def set_template_default_auto_lifecycle(
+        self, template: str, policy: Mapping[str, object]
+    ) -> None:
+        self._admin(
+            "PATCH",
+            f"templates/{quote(_template_name(template), safe='')}",
+            expect=(200,),
+            body={"default_auto_lifecycle": dict(policy)},
+        )
+
+    def template_default_auto_lifecycle_published(self, template: str) -> bool:
+        out = self._psql(
+            TEMPLATE_DEFAULT_AUTO_LIFECYCLE_PUBLISHED_SQL.format(template=_template_name(template)),
+            action="compare published template default auto-lifecycle policies",
+        )
+        return out == "t"
+
+    def delete_template_default_auto_lifecycle(self, template: str) -> None:
+        self._psql(
+            DELETE_TEMPLATE_DEFAULT_AUTO_LIFECYCLE_SQL.format(template=_template_name(template)),
+            action="delete the template's default auto-lifecycle policy",
+        )
 
     def native_sandbox_present(self, sandbox_id: str) -> bool:
         """Whether the native `/v1` read still finds the sandbox (False on 404)."""

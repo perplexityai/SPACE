@@ -49,35 +49,107 @@ fn create_request_with_auto_lifecycle(
     }
 }
 
-#[test]
-fn native_create_defaults_to_suspending_after_six_hours_idle() {
-    let requests = [
-        serde_json::json!({ "template": "seed:latest" }),
-        serde_json::json!({ "template": "seed:latest", "auto_lifecycle": null }),
-    ];
+/// The policy a native create records in its operation payload.
+async fn admitted_auto_lifecycle(
+    pool: &PgPool,
+    key: &str,
+    request: serde_json::Value,
+) -> TestDbResult<AutoLifecyclePolicy> {
+    let response = create_native_sandbox_operation(
+        pool,
+        OrgId::from_uuid(SEED_ORG_ID),
+        UserId::from_uuid(SEED_USER_ID),
+        &IdempotencyKey::parse(key)?,
+        serde_json::from_value(request)?,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("native create should persist an operation");
+    let SqlJson(payload): SqlJson<CreateSandboxOperationPayload> = sqlx::query_scalar(sql!(
+        "SELECT payload_json FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(response.operation_id.as_uuid())
+    .fetch_one(pool)
+    .await?;
+    Ok(payload
+        .request
+        .auto_lifecycle
+        .expect("admission records a concrete policy"))
+}
 
-    for request in requests {
-        let request: CreateSandboxRequest = serde_json::from_value(request).unwrap();
-        let request = with_native_create_defaults(request);
-        let policy = request.auto_lifecycle.unwrap();
+/// An omitted policy inherits the template's default and falls back to
+/// suspending after six idle hours; any explicit choice, including the empty
+/// disabled policy and `idle_timeout`, wins over both.
+#[tokio::test]
+async fn native_create_lifecycle_precedence() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    for name in ["seed", "with-default"] {
+        sqlx::query("INSERT INTO templates (id, name, org_id) VALUES ($1, $2, $3)")
+            .bind(Uuid::now_v7())
+            .bind(name)
+            .bind(SEED_ORG_ID)
+            .execute(&db.pool)
+            .await?;
+    }
+    let template_default = crate::e2b::access_idle_policy(900, true, true);
+    sqlx::query(
+        "INSERT INTO template_default_auto_lifecycle_policies
+             (template, default_auto_lifecycle_json)
+         VALUES ('with-default', $1)",
+    )
+    .bind(SqlJson(&template_default))
+    .execute(&db.pool)
+    .await?;
+    let explicit = crate::e2b::access_idle_policy(60, false, false);
+    let explicit_json = serde_json::to_value(&explicit)?;
 
-        assert_eq!(policy.wake, Default::default());
+    for (key, request, expected) in [
+        (
+            "no-default-omitted",
+            serde_json::json!({ "template": "seed:latest" }),
+            native_server_default_auto_lifecycle(),
+        ),
+        (
+            "no-default-null",
+            serde_json::json!({ "template": "seed:latest", "auto_lifecycle": null }),
+            native_server_default_auto_lifecycle(),
+        ),
+        (
+            "missing-template",
+            serde_json::json!({ "template": "absent:latest" }),
+            native_server_default_auto_lifecycle(),
+        ),
+        (
+            "default-omitted",
+            serde_json::json!({ "template": "with-default:latest" }),
+            template_default.clone(),
+        ),
+        (
+            "default-explicit-disabled",
+            serde_json::json!({ "template": "with-default:latest", "auto_lifecycle": {} }),
+            AutoLifecyclePolicy::disabled(),
+        ),
+        (
+            "default-explicit-policy",
+            serde_json::json!({ "template": "with-default:latest", "auto_lifecycle": explicit_json }),
+            explicit.clone(),
+        ),
+        (
+            "default-idle-timeout",
+            serde_json::json!({ "template": "with-default:latest", "idle_timeout": "120s" }),
+            crate::e2b::access_idle_policy(120, true, true),
+        ),
+    ] {
         assert_eq!(
-            policy.condition_sets,
-            std::collections::BTreeMap::from([(
-                AutoLifecycleConditionSetId::AccessIdle,
-                AutoLifecycleConditionSet::access_idle(),
-            )])
-        );
-        assert_eq!(
-            policy.stages,
-            vec![AutoLifecycleStage {
-                condition_set: AutoLifecycleConditionSetId::AccessIdle,
-                at: DEFAULT_NATIVE_IDLE_TIMEOUT_SECS,
-                action: AutoLifecycleIdleAction::Suspend,
-            }]
+            admitted_auto_lifecycle(&db.pool, key, request).await?,
+            expected,
+            "{key}"
         );
     }
+    Ok(())
 }
 
 #[test]
@@ -694,9 +766,7 @@ fn only_a_resident_sandbox_reports_its_idle_deadline() {
 
 #[test]
 fn sandbox_idle_configuration_requires_one_access_idle_delete_or_suspend_stage() {
-    let default_policy = with_native_create_defaults(create_request_with_auto_lifecycle(None))
-        .auto_lifecycle
-        .unwrap();
+    let default_policy = native_server_default_auto_lifecycle();
     let mut cases = vec![
         (
             default_policy.clone(),
@@ -1038,9 +1108,7 @@ async fn sandbox_reads_exclude_deleted_tombstones_before_pagination() -> TestDbR
         let id = SandboxId::new();
         let created_at = OffsetDateTime::from_unix_timestamp(1_800_000_000 + offset as i64)?;
         let deadline = (offset % 2 == 0).then_some(1_800_021_600 + offset as i64);
-        let policy = with_native_create_defaults(create_request_with_auto_lifecycle(None))
-            .auto_lifecycle
-            .unwrap();
+        let policy = native_server_default_auto_lifecycle();
         sqlx::query(pplx_space_sql_locator::sql!(
             "INSERT INTO sandboxes (
                  id, user_id, org_id, lifecycle, created_at,

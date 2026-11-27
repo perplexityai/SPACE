@@ -71,6 +71,23 @@ pub async fn for_create(
     .await?)
 }
 
+/// `template`'s own default auto-lifecycle policy, or `None` when it has
+/// none. Unlike [`for_create`], a builder's report never stands in for it.
+pub async fn desired(
+    executor: impl Executor<'_>,
+    template: &TemplateName,
+) -> Result<Option<AutoLifecyclePolicy>, DbError> {
+    Ok(sqlx::query_scalar::<_, Json<AutoLifecyclePolicy>>(sql!(
+        "SELECT default_auto_lifecycle_json
+         FROM template_default_auto_lifecycle_policies
+         WHERE template = $1"
+    ))
+    .bind(template.as_str())
+    .fetch_optional(executor.into_sqlx())
+    .await?
+    .map(|Json(policy)| policy))
+}
+
 /// Delete `template`'s default auto-lifecycle policy, if it has one.
 pub async fn delete(executor: impl Executor<'_>, template: &TemplateName) -> Result<(), DbError> {
     sqlx::query(sql!(

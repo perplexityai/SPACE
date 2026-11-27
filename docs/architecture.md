@@ -197,7 +197,7 @@ it does not resize the guest or replace that stored shape. Pause/resume keeps
 the live quota. A new start or restore returns to the activation allocation,
 so a temporary reduction does not permanently prevent raising the quota again.
 
-By default, sandboxes created through the SPACE API suspend after six hours without access or command activity. This is an idle limit, not a maximum lifetime.
+A sandbox created through the SPACE API without `auto_lifecycle` or `idle_timeout` takes its template's default auto-lifecycle policy. When the template has none, it suspends after six hours without access or command activity. This is an idle limit, not a maximum lifetime. An explicit policy, including the empty disabled policy `{}`, replaces both defaults.
 
 A created or overwritten file that can replace its destination is published
 atomically when its writes complete, and persisted at lifecycle boundaries,

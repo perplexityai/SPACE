@@ -355,7 +355,7 @@ A client deadline limits how long the client waits; it does not cancel a lifecyc
 | Walkthrough event stream | 45 seconds | Stops reading the stream, not a reliable process-cancellation mechanism. |
 | Command `timeout` | `30s` in the example; none when omitted | Server-side execution deadline; expiry terminates the process group. |
 | Attachment token lifetime | 5 minutes | Separate from the command's execution timeout; observe the returned attachment expiry. |
-| Default sandbox idle policy | 6 hours without access or command activity | Suspends an idle sandbox rather than imposing a fixed lifetime. |
+| Default sandbox idle policy | The template's default policy; otherwise 6 hours without access or command activity | Suspends an idle sandbox rather than imposing a fixed lifetime. |
 
 The Python example uses Linux signals to bound whole requests and stream reads. Run it as an executable on the documented Linux host, not in a background Python thread.
 
