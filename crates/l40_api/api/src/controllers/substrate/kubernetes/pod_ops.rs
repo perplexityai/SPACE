@@ -48,6 +48,8 @@ use delete::{K8S_THROTTLE_RETRY_ATTEMPTS, lingering_sandbox_pod_names};
 #[cfg(test)]
 use ensure_pod::restore_placement_sample;
 #[cfg(test)]
+use ensure_pod::runtime_upgrade_stale_reason;
+#[cfg(test)]
 use read::{
     succeeded_pod_publication_grace_remaining, terminal_cleanup_phase_after_uncached_check,
 };
@@ -55,7 +57,7 @@ pub(super) use redrive::RedriveOutcome;
 #[cfg(test)]
 use redrive::{PreconditionReread, classify_precondition_reread};
 pub(super) use restore::ExecutionHydrationOutcome;
-use restore::pod_matches_execution_generation;
+pub(super) use restore::pod_matches_execution_generation;
 #[cfg(test)]
 use restore::restored_pod_routability;
 use started_recovery::started_recovery_replacement_event_details;
@@ -77,7 +79,7 @@ pub(super) fn is_transient_kube_read_error(err: &KubeError) -> bool {
     }
 }
 
-fn kube_error_for_substrate(operation: &str, err: KubeError) -> SubstrateError {
+pub(super) fn kube_error_for_substrate(operation: &str, err: KubeError) -> SubstrateError {
     // This helper does not retry by itself. Selection loops consume the
     // retryable timeout shape at their slow cadence and existing one-shot
     // callers return it to their retry owner, avoiding a tight retry loop
@@ -115,6 +117,10 @@ pub(super) enum RestoreContext<'a> {
         suspend_restore_source_node: Option<&'a str>,
         direct_node_name: Option<&'a str>,
         preferred_node_name: Option<&'a str>,
+        /// The runtime upgrade the pod boots the sandbox through; only a
+        /// user restore's pod, a start's or a resume's, carries one. See
+        /// [`super::pod_runtime_upgrade`].
+        runtime_upgrade: Option<&'a super::pod_runtime_upgrade::PodUpgrade>,
     },
     /// Cluster-controller-initiated evacuation. Drops the source-node pin so
     /// kube-scheduler can place the pod on the new cohort. `extra_tolerations`
@@ -162,7 +168,24 @@ pub(super) fn pod_client_id(
         .pod_label(sandbox.activating_client_id.as_ref())
 }
 
-impl PodCreateContext<'_> {
+impl<'a> PodCreateContext<'a> {
+    /// This context with `upgrade` rendered on a user restore's pod. Any
+    /// other pod would boot the environment the upgrade moves off, so it
+    /// carries none; the caller's wait for the upgrade then refuses a pod
+    /// that doesn't carry its operation.
+    pub(super) fn upgrading_runtime(
+        mut self,
+        upgrade: Option<&'a super::pod_runtime_upgrade::PodUpgrade>,
+    ) -> Self {
+        if let Self::Restore(RestoreContext::UserRestore {
+            runtime_upgrade, ..
+        }) = &mut self
+        {
+            *runtime_upgrade = upgrade;
+        }
+        self
+    }
+
     /// Which pod-build path this is, for the placement resolver's metrics.
     /// `OnDemand` here is the reconcile-side *materialization* of an on-demand
     /// sandbox, not a user create — the user create resolves in the adapter
@@ -221,7 +244,43 @@ pub(super) struct ActivationAttemptAssignment {
     target_state: SandboxTransitionTargetState,
     /// The client id this activation's new pods are labeled with.
     key: KeyResolution,
-    assigned: std::sync::Arc<std::sync::Mutex<Option<(SandboxActivationAttemptId, i64)>>>,
+    assigned: std::sync::Arc<std::sync::Mutex<Option<AssignedExecution>>>,
+}
+
+/// Whether a pod carrying a materialization's runtime upgrade may exist, as
+/// [`KubernetesSubstrate::ensure_pod_exists`] reports it with its error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum UpgradePod {
+    /// The materialization renders no upgrade, or it proved that no pod of
+    /// its own carries the upgrade: it ended before taking the execution
+    /// claim, or its create was refused or confirmed absent.
+    Absent,
+    /// A pod carrying the upgrade may exist, and its shim may be running it
+    /// whatever error the materialization ends with. The caller treats the
+    /// error as node work that may still run, not a clean failure.
+    MayRun,
+}
+
+/// A failed [`KubernetesSubstrate::ensure_pod_exists`]: the error, and
+/// whether a pod carrying the materialization's runtime upgrade may run.
+#[derive(Debug)]
+pub(super) struct MaterializeError {
+    pub(super) error: SubstrateError,
+    pub(super) upgrade_pod: UpgradePod,
+}
+
+impl MaterializeError {
+    pub(super) fn into_error(self) -> SubstrateError {
+        self.error
+    }
+}
+
+/// The execution an [`ActivationAttemptAssignment`] was assigned on.
+#[derive(Clone, Debug)]
+struct AssignedExecution {
+    attempt_id: SandboxActivationAttemptId,
+    generation: i64,
+    pod_name: String,
 }
 
 impl ActivationAttemptAssignment {
@@ -242,26 +301,42 @@ impl ActivationAttemptAssignment {
         (self.assigned_or_requested(), self.target_state)
     }
 
-    fn record_assigned(&self, assigned_id: SandboxActivationAttemptId, generation: i64) {
-        *self
-            .assigned
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((assigned_id, generation));
+    fn record_assigned(
+        &self,
+        assigned_id: SandboxActivationAttemptId,
+        generation: i64,
+        pod_name: &str,
+    ) {
+        *self.assigned_execution() = Some(AssignedExecution {
+            attempt_id: assigned_id,
+            generation,
+            pod_name: pod_name.to_string(),
+        });
     }
 
-    pub(super) fn assigned_id(&self) -> Option<SandboxActivationAttemptId> {
+    fn assigned_execution(&self) -> std::sync::MutexGuard<'_, Option<AssignedExecution>> {
         self.assigned
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(super) fn assigned_id(&self) -> Option<SandboxActivationAttemptId> {
+        self.assigned_execution()
             .as_ref()
-            .map(|(id, _)| *id)
+            .map(|assigned| assigned.attempt_id)
     }
 
     pub(super) fn assigned(&self) -> Option<(SandboxActivationAttemptId, i64)> {
-        *self
-            .assigned
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.assigned_execution()
+            .as_ref()
+            .map(|assigned| (assigned.attempt_id, assigned.generation))
+    }
+
+    /// The pod name of the execution the attempt was last assigned on.
+    pub(super) fn assigned_pod_name(&self) -> Option<String> {
+        self.assigned_execution()
+            .as_ref()
+            .map(|assigned| assigned.pod_name.clone())
     }
 
     pub(super) fn assigned_or_requested(&self) -> SandboxActivationAttemptId {
@@ -288,6 +363,16 @@ pub(super) struct PodMaterializationOwnership {
     /// to be created is checked when its cap policy says so. `None` checks
     /// nothing.
     charge: Option<RecoveryCharge>,
+    /// The runtime upgrade a user restore's pod boots the sandbox through,
+    /// when it creates one; see [`super::pod_runtime_upgrade`].
+    runtime_upgrade: Option<super::pod_runtime_upgrade::PodUpgrade>,
+    /// `runtime_upgrade` is the one a kept pod carries, not one this
+    /// activation decided: a resume taking over a restore whose own decision
+    /// refused goes on only to settle that pod. Such an upgrade never makes
+    /// its own pod stale, is never re-driven, and is never rendered on a new
+    /// pod, since the node takes a new pod as a new attempt and the decision
+    /// that would authorize one refused.
+    runtime_upgrade_kept: bool,
 }
 
 impl PodMaterializationOwnership {
@@ -302,7 +387,25 @@ impl PodMaterializationOwnership {
             activation_attempt,
             stopped_materialization_artifact_id: None,
             charge: None,
+            runtime_upgrade: None,
+            runtime_upgrade_kept: false,
         }
+    }
+
+    /// Make a pod this creates boot the sandbox through `upgrade`.
+    pub(super) fn upgrading_runtime(
+        mut self,
+        upgrade: Option<super::pod_runtime_upgrade::PodUpgrade>,
+    ) -> Self {
+        self.runtime_upgrade = upgrade;
+        self
+    }
+
+    /// Mark the runtime upgrade as a kept pod's rather than a decided one;
+    /// see the field.
+    pub(super) fn keeping_runtime_upgrade(mut self, kept: bool) -> Self {
+        self.runtime_upgrade_kept = kept;
+        self
     }
 
     /// Make the pod this materializes a stopped re-placement pod for
@@ -395,6 +498,7 @@ pub(super) fn parse_pod_create_context<'a>(
                 .is_some()
                 .then_some(source_node_name)
                 .flatten(),
+            runtime_upgrade: None,
         }));
     }
 

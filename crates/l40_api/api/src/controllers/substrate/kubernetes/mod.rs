@@ -851,6 +851,14 @@ fn is_not_found_error(err: &KubeError) -> bool {
     matches!(err, kube::Error::Api(resp) if resp.code == 404)
 }
 
+/// Whether the API server answered a create with a refusal, so the create
+/// can't commit later: a 4xx status (quota, admission, validation,
+/// throttling) other than 408, a request timeout whose create may still be
+/// processing. A transport error, a 5xx or a 408 leaves the outcome unknown.
+fn create_rejected_by_api_server(err: &KubeError) -> bool {
+    matches!(err, kube::Error::Api(resp) if (400..500).contains(&resp.code) && resp.code != 408)
+}
+
 fn parse_positive_seconds_timeout(value: Option<&str>, default: Duration) -> Duration {
     value
         .and_then(|v| v.parse::<u64>().ok())
@@ -1396,6 +1404,7 @@ mod execution;
 mod node_sync;
 mod per_sandbox_setup;
 mod pod_ops;
+mod pod_runtime_upgrade;
 mod pool;
 mod restore_intent;
 mod runtime_upgrade;

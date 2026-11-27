@@ -101,7 +101,8 @@ async fn a_rebuilt_pod_is_labeled_with_its_activating_client(
                 Some(assignment),
             ),
         )
-        .await?;
+        .await
+        .map_err(|error| error.into_error())?;
 
     let created_pods = captured_pod_creates
         .lock()
@@ -134,7 +135,7 @@ async fn a_rebuilt_pod_is_labeled_with_its_activating_client(
 /// Refuses every live-cap check and counts them. With `unconfigured` set it
 /// reports no cap configured, as a deployment without one does.
 #[derive(Default)]
-struct AtLiveCap(Mutex<usize>, bool);
+pub(in crate::controllers::substrate::kubernetes) struct AtLiveCap(Mutex<usize>, bool);
 
 impl crate::controllers::substrate::ActivationAdmission for AtLiveCap {
     fn admit(
@@ -262,7 +263,8 @@ async fn a_pod_create_is_checked_against_the_live_cap_by_its_cap_policy(
             )
             .with_charge(&charge),
         )
-        .await;
+        .await
+        .map_err(|error| error.into_error());
 
     let creates = captured_pod_creates
         .lock()
@@ -411,7 +413,8 @@ async fn attribution_off_leaves_the_pod_unlabeled_and_the_record_alone() -> Test
                 Some(assignment),
             ),
         )
-        .await?;
+        .await
+        .map_err(|error| error.into_error())?;
 
     let created_pods = captured_pod_creates
         .lock()

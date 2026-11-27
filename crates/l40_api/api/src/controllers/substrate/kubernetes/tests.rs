@@ -17,10 +17,11 @@ pub(crate) use kubernetes_tests::{
     insert_test_sandbox_row, mock_kubernetes_client, node_api_pod_on_node, node_with_network_slots,
     paused_restore_test_subject, running_pod_kubernetes_client,
     running_pod_kubernetes_client_with_create_barrier, sandbox_pod_on_node,
-    start_sequenced_wake_worker, substrate_with_inventory_caches_and_pool, substrate_with_store,
+    substrate_with_inventory_caches_and_pool, substrate_with_store,
     substrate_with_store_and_client, substrate_with_store_client_pods_and_nodes,
     substrate_with_store_client_proxy_port_and_pod,
-    substrate_with_store_client_proxy_port_and_pods, substrate_with_unreachable_store,
+    substrate_with_store_client_proxy_port_and_pods,
+    substrate_with_store_client_proxy_port_pods_and_nodes, substrate_with_unreachable_store,
     test_sandbox_with_lifecycle,
 };
 
@@ -29,6 +30,7 @@ pub(super) mod environment_placement;
 mod native_pod_failover;
 mod node_instance;
 mod runtime_upgrade_dispatch;
+mod runtime_upgrade_fixture;
 mod slot_headroom;
 mod stopped_start_stale_pod;
 mod substrate_scope;
@@ -1976,7 +1978,7 @@ mod kubernetes_tests {
         )
     }
 
-    fn substrate_with_store_client_proxy_port_pods_and_nodes(
+    pub(crate) fn substrate_with_store_client_proxy_port_pods_and_nodes(
         pool: PgPool,
         client: Client,
         sandbox_proxy_port: u16,
@@ -2030,9 +2032,6 @@ mod kubernetes_tests {
         pub(crate) wake_attempts: Arc<AtomicUsize>,
         pub(crate) succeed_after_attempt: Option<usize>,
         pub(crate) echo_route_identity: bool,
-        /// Every Wake received, in arrival order.
-        pub(crate) received:
-            Arc<std::sync::Mutex<Vec<pplx_space_sbx_mgr_client::proto::WakeRequest>>>,
         /// When set, every Wake is answered with this status instead.
         pub(crate) rejection: Arc<std::sync::Mutex<Option<tonic::Status>>>,
     }
@@ -2097,7 +2096,6 @@ mod kubernetes_tests {
         ) -> Result<tonic::Response<pplx_space_sbx_mgr_client::proto::WakeResponse>, tonic::Status>
         {
             let request = request.into_inner();
-            self.received.lock().unwrap().push(request.clone());
             let attempt = self.wake_attempts.fetch_add(1, Ordering::SeqCst) + 1;
             if let Some(rejection) = self.rejection.lock().unwrap().clone() {
                 return Err(rejection);
@@ -2138,8 +2136,6 @@ mod kubernetes_tests {
     // `SimWorkerHarness`.
     pub(crate) struct SequencedWakeWorkerHandle {
         pub(crate) port: u16,
-        pub(crate) received:
-            Arc<std::sync::Mutex<Vec<pplx_space_sbx_mgr_client::proto::WakeRequest>>>,
         pub(crate) rejection: Arc<std::sync::Mutex<Option<tonic::Status>>>,
         health_reporter: tonic_health::server::HealthReporter,
         shutdown: CancellationToken,
@@ -2185,13 +2181,11 @@ mod kubernetes_tests {
             "node-a".to_string(),
         );
         let worker_service = SimWorkerApiService::new(sim_state);
-        let received = Arc::default();
         let rejection = Arc::default();
         let service = SequencedWakeWorker {
             wake_attempts,
             succeed_after_attempt,
             echo_route_identity,
-            received: Arc::clone(&received),
             rejection: Arc::clone(&rejection),
         };
         let (health_reporter, health_service) = pplx_space_grpc_server::grpc_health_service();
@@ -2225,7 +2219,6 @@ mod kubernetes_tests {
         });
         Ok(SequencedWakeWorkerHandle {
             port,
-            received,
             rejection,
             health_reporter,
             shutdown,
@@ -4178,7 +4171,8 @@ mod kubernetes_tests {
             ),
         )
         .await
-        .expect("creating snapshot should restore locally without waiting")?;
+        .expect("creating snapshot should restore locally without waiting")
+        .map_err(|error| error.into_error())?;
 
         // Assert.
         assert_eq!(
@@ -4334,7 +4328,8 @@ mod kubernetes_tests {
                     )),
                 ),
             )
-            .await?;
+            .await
+            .map_err(|error| error.into_error())?;
 
         // Assert.
         assert_eq!(deleted_pods.load(Ordering::SeqCst), 1);
@@ -4486,6 +4481,7 @@ mod kubernetes_tests {
                     PodMaterializationOwnership::default(),
                 )
                 .await
+                .map_err(|error| error.into_error())
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
         let requests_while_owner_blocked = request_count.load(Ordering::SeqCst);
@@ -6165,6 +6161,7 @@ mod kubernetes_tests {
                 PodMaterializationOwnership::new(None, Some(old_token), None),
             )
             .await
+            .map_err(|error| error.into_error())
             .expect_err("a stale restore owner must lose before pod materialization");
         substrate
             .ensure_pod_exists(
@@ -6174,7 +6171,8 @@ mod kubernetes_tests {
                 None,
                 PodMaterializationOwnership::new(None, Some(new_token), None),
             )
-            .await?;
+            .await
+            .map_err(|error| error.into_error())?;
         let lease_remaining_secs: f64 = sqlx::query_scalar(
             "SELECT EXTRACT(EPOCH FROM (restore_lease_expires_at - NOW()))::float8
                FROM sandboxes
@@ -8169,6 +8167,7 @@ mod kubernetes_tests {
                 suspend_restore_source_node: Some("source-node"),
                 direct_node_name: Some("source-node"),
                 preferred_node_name: None,
+                runtime_upgrade: None,
             }),
             PodCreateContext::Restore(RestoreContext::Evacuation {
                 stopped_materialization: None,
@@ -8331,7 +8330,8 @@ mod kubernetes_tests {
                         )),
                     ),
                 )
-                .await?;
+                .await
+                .map_err(|error| error.into_error())?;
             {
                 let created = creates.lock().unwrap();
                 if predates_stop {
@@ -8977,7 +8977,8 @@ mod kubernetes_tests {
                     None,
                 ),
             )
-            .await?;
+            .await
+            .map_err(|error| error.into_error())?;
 
         // Assert.
         let created_pods = captured_pod_creates.lock().expect("capture mutex poisoned");
@@ -9048,6 +9049,7 @@ mod kubernetes_tests {
             let error = substrate
                 .ensure_pod_exists(&sandbox, None, None, None, ownership.clone())
                 .await
+                .map_err(|error| error.into_error())
                 .expect_err("unverified prior state must fail closed");
             assert!(matches!(
                 error,
@@ -9231,6 +9233,7 @@ mod kubernetes_tests {
                 ),
             )
             .await
+            .map_err(|error| error.into_error())
             .expect_err("an unavailable local source must defer recovery");
 
         // Assert.
@@ -9316,7 +9319,8 @@ mod kubernetes_tests {
                     Some(assignment.clone()),
                 ),
             )
-            .await?;
+            .await
+            .map_err(|error| error.into_error())?;
 
         // Assert.
         let current = substrate
@@ -9469,7 +9473,8 @@ mod kubernetes_tests {
                     )),
                 ),
             )
-            .await?;
+            .await
+            .map_err(|error| error.into_error())?;
 
         // Assert.
         {
@@ -9559,7 +9564,8 @@ mod kubernetes_tests {
                 None,
                 PodMaterializationOwnership::default(),
             )
-            .await?;
+            .await
+            .map_err(|error| error.into_error())?;
 
         {
             let created_pods = captured_pod_creates.lock().expect("capture mutex poisoned");
@@ -9667,7 +9673,8 @@ mod kubernetes_tests {
                 None,
                 PodMaterializationOwnership::default(),
             )
-            .await?;
+            .await
+            .map_err(|error| error.into_error())?;
 
         let created_pods = captured_pod_creates.lock().expect("capture mutex poisoned");
         assert_eq!(created_pods.len(), 1);
@@ -9733,6 +9740,7 @@ mod kubernetes_tests {
                 ),
             )
             .await
+            .map_err(|error| error.into_error())
             .expect_err("recovery materialization must lose to committed teardown");
 
         // Assert.
@@ -9784,6 +9792,7 @@ mod kubernetes_tests {
                 PodMaterializationOwnership::default(),
             )
             .await
+            .map_err(|error| error.into_error())
             .expect_err("wake materialization must join the in-flight suspend");
 
         // Assert: a retryable deferral is acceptable, but consuming generation
@@ -9868,6 +9877,7 @@ mod kubernetes_tests {
                 PodMaterializationOwnership::default(),
             )
             .await
+            .map_err(|error| error.into_error())
             .expect_err("ordinary restore materialization must lose to committed teardown");
 
         // Assert.
@@ -9922,6 +9932,7 @@ mod kubernetes_tests {
                 PodMaterializationOwnership::default(),
             )
             .await
+            .map_err(|error| error.into_error())
             .expect_err("a cold reflector must defer the restore create retryably");
 
         // Assert: retryable deferral, no pod POSTed, and no active claim, so
@@ -10011,6 +10022,7 @@ mod kubernetes_tests {
                     PodMaterializationOwnership::default(),
                 )
                 .await
+                .map_err(|error| error.into_error())
                 .expect_err("an unconfirmed prior-generation pod must defer the restore");
             assert!(matches!(error, SubstrateError::Unavailable { .. }));
         }
@@ -10070,6 +10082,7 @@ mod kubernetes_tests {
                     PodMaterializationOwnership::default(),
                 )
                 .await
+                .map_err(|error| error.into_error())
         });
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -10193,6 +10206,7 @@ mod kubernetes_tests {
                     PodMaterializationOwnership::default(),
                 )
                 .await
+                .map_err(|error| error.into_error())
         });
         tokio::time::timeout(Duration::from_secs(10), request_started.acquire())
             .await??
@@ -10316,6 +10330,7 @@ mod kubernetes_tests {
                 PodMaterializationOwnership::default(),
             )
             .await
+            .map_err(|error| error.into_error())
             .expect_err("injected metadata persistence failure must reach the caller");
 
         // Assert.
@@ -10594,6 +10609,7 @@ mod kubernetes_tests {
             suspend_restore_source_node: Some("source-node"),
             direct_node_name: Some("source-node"),
             preferred_node_name: None,
+            runtime_upgrade: None,
         });
 
         let error = substrate
@@ -11289,6 +11305,7 @@ mod kubernetes_tests {
                 PodMaterializationOwnership::default(),
             )
             .await
+            .map_err(|error| error.into_error())
             .expect_err("stateful generation create claim should return retryable timeout");
 
         assert!(matches!(
@@ -11395,7 +11412,8 @@ mod kubernetes_tests {
                 Some(storage_uri),
                 PodMaterializationOwnership::default(),
             )
-            .await?;
+            .await
+            .map_err(|error| error.into_error())?;
 
         // Assert.
         assert_eq!(deleted_pods.load(Ordering::SeqCst), 1);
@@ -11476,7 +11494,8 @@ mod kubernetes_tests {
                 Some(current_uri),
                 PodMaterializationOwnership::default(),
             )
-            .await?;
+            .await
+            .map_err(|error| error.into_error())?;
 
         {
             let created_pods = captured_pod_creates.lock().expect("capture mutex poisoned");
@@ -11590,7 +11609,8 @@ mod kubernetes_tests {
                 None,
                 PodMaterializationOwnership::default(),
             )
-            .await?;
+            .await
+            .map_err(|error| error.into_error())?;
 
         {
             let created_pods = captured_pod_creates.lock().expect("capture mutex poisoned");
@@ -11726,7 +11746,8 @@ mod kubernetes_tests {
                 restore_plan.storage_uri.as_deref(),
                 PodMaterializationOwnership::default(),
             )
-            .await?;
+            .await
+            .map_err(|error| error.into_error())?;
 
         // Assert.
         assert!(matches!(
@@ -11859,6 +11880,7 @@ mod kubernetes_tests {
                     suspend_restore_source_node: Some("source-node"),
                     direct_node_name: None,
                     preferred_node_name: Some("source-node"),
+                    runtime_upgrade: None,
                 }))
             ),
             "a durable disk artifact must downgrade the stopped restart's node pin to a \
@@ -11943,6 +11965,7 @@ mod kubernetes_tests {
                 suspend_restore_source_node: None,
                 direct_node_name: None,
                 preferred_node_name: None,
+                runtime_upgrade: None,
             }))
         ));
     }
@@ -14592,6 +14615,7 @@ mod kubernetes_tests {
                     ),
                 )
                 .await
+                .map_err(|error| error.into_error())
                 .expect_err("pre-finalization recovery must preserve generation one");
             assert!(matches!(error, SubstrateError::SuspendInFlight { .. }));
             let active_generation: i64 = sqlx::query_scalar(sql!(
@@ -18557,5 +18581,27 @@ mod kubernetes_tests {
             Some(FencedPodDeleteOutcome::PreconditionFailed)
         );
         assert_eq!(classify_fenced_pod_delete_error(&api_error(500)), None);
+    }
+
+    /// A pod create the API server answered with a 4xx can't commit later,
+    /// except a 408, whose create may still be processing. A 5xx leaves the
+    /// outcome unknown.
+    #[test]
+    fn create_refusals_are_the_4xx_answers_but_a_request_timeout() {
+        let api_error = |code: u16| {
+            kube::Error::Api(Box::new(kube::core::Status {
+                code,
+                message: "pod".to_string(),
+                reason: "Refused".to_string(),
+                ..Default::default()
+            }))
+        };
+
+        for code in [400, 403, 409, 422, 429] {
+            assert!(create_rejected_by_api_server(&api_error(code)), "{code}");
+        }
+        for code in [408, 500, 503, 504] {
+            assert!(!create_rejected_by_api_server(&api_error(code)), "{code}");
+        }
     }
 }
