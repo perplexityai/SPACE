@@ -33,6 +33,7 @@ use pplx_space_sandbox_pod::{
 use rand::RngExt;
 
 mod create_request;
+pub(super) use create_request::pinned_node_lacks_environment;
 mod delete;
 mod ensure_pod;
 mod read;

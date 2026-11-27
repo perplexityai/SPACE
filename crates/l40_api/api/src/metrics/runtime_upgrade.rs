@@ -2,10 +2,14 @@
 //!
 //! * `runtime_upgrade.activation.decision` (counter): one per resume or start
 //!   the decision ran for. Tags: `activation` (`start` or `restore`), `plan`
-//!   (`as_recorded`, `restore_on_default`, `cold_boot_upgrade`, `stranded`, or
-//!   `unattributed` when no recorded execution names an environment the
-//!   catalog knows), and `cause` (`blocked`, `unlisted`, `deprecated`, or
-//!   `none` when the environment still executes).
+//!   (`as_recorded`, `restore_on_default`, `cold_boot_upgrade`, `stranded`,
+//!   `restore_on_default_refused` for a memory-edge restore refused while the
+//!   environment placement gate evaluates, or `unattributed` when no recorded
+//!   execution names an environment the catalog knows), and `cause`
+//!   (`blocked`, `unlisted`, `deprecated`, or `none` when the environment
+//!   still executes). `as_recorded` with cause `deprecated` is a start that
+//!   stayed on its deprecated environment because the gate is `on` and its
+//!   disk node doesn't publish the default.
 
 use pplx_space_metrics_emit::{counter, tag};
 

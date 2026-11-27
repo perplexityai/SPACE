@@ -17,9 +17,9 @@ pub(crate) use kubernetes_tests::{
     insert_test_sandbox_row, mock_kubernetes_client, node_api_pod_on_node, node_with_network_slots,
     paused_restore_test_subject, running_pod_kubernetes_client,
     running_pod_kubernetes_client_with_create_barrier, sandbox_pod_on_node,
-    substrate_with_inventory_caches_and_pool, substrate_with_store,
-    substrate_with_store_and_client, substrate_with_store_client_pods_and_nodes,
-    substrate_with_store_client_proxy_port_and_pod,
+    substrate_with_inventory_caches_and_pool, substrate_with_node_cache_and_config,
+    substrate_with_store, substrate_with_store_and_client,
+    substrate_with_store_client_pods_and_nodes, substrate_with_store_client_proxy_port_and_pod,
     substrate_with_store_client_proxy_port_and_pods,
     substrate_with_store_client_proxy_port_pods_and_nodes, substrate_with_unreachable_store,
     test_sandbox_with_lifecycle,
@@ -10467,7 +10467,7 @@ mod kubernetes_tests {
         }
     }
 
-    fn substrate_with_node_cache_and_config(
+    pub(crate) fn substrate_with_node_cache_and_config(
         nodes: &[Arc<Node>],
         nodes_ready: bool,
         sandbox_pod_config: SandboxPodConfigValues,
@@ -10541,7 +10541,8 @@ mod kubernetes_tests {
         ];
         let substrate = substrate_with_node_cache_and_config(&nodes, true, config);
 
-        let shortlist = substrate.restore_node_shortlist(SandboxId::new(), "source-node", None);
+        let shortlist =
+            substrate.restore_node_shortlist(SandboxId::new(), "source-node", None, None);
 
         assert_eq!(shortlist[0], "source-node", "the source stays pinned first");
         assert!(
@@ -10565,7 +10566,8 @@ mod kubernetes_tests {
         )];
         let substrate = substrate_with_node_cache_and_config(&nodes, true, config);
 
-        let shortlist = substrate.restore_node_shortlist(SandboxId::new(), "source-node", None);
+        let shortlist =
+            substrate.restore_node_shortlist(SandboxId::new(), "source-node", None, None);
 
         assert!(shortlist.iter().any(|node| node == "fallback-rolling"));
     }
@@ -10714,8 +10716,12 @@ mod kubernetes_tests {
         )
         .expect("a generic group admits a generic template");
 
-        let shortlist =
-            substrate.restore_node_shortlist(SandboxId::new(), "source-node", Some(&placement));
+        let shortlist = substrate.restore_node_shortlist(
+            SandboxId::new(),
+            "source-node",
+            Some(&placement),
+            None,
+        );
 
         for name in ["in-set-a", "in-set-b", "in-set-c", "in-set-d"] {
             assert!(
@@ -10770,7 +10776,7 @@ mod kubernetes_tests {
 
         // Ungated, every fallback is a candidate — so the exclusions below are
         // this filter's doing and not some other narrowing in the chain.
-        let ungated = substrate.restore_node_shortlist(SandboxId::new(), "source-node", None);
+        let ungated = substrate.restore_node_shortlist(SandboxId::new(), "source-node", None, None);
         for name in [
             "fallback-in-set",
             "fallback-out-of-set",
@@ -10782,8 +10788,12 @@ mod kubernetes_tests {
             );
         }
 
-        let shortlist =
-            substrate.restore_node_shortlist(SandboxId::new(), "source-node", Some(&placement));
+        let shortlist = substrate.restore_node_shortlist(
+            SandboxId::new(),
+            "source-node",
+            Some(&placement),
+            None,
+        );
 
         assert_eq!(shortlist[0], "source-node", "the source stays pinned first");
         assert!(
@@ -10854,7 +10864,8 @@ mod kubernetes_tests {
         ];
         let substrate = substrate_with_node_cache_and_config(&nodes, true, config);
 
-        let shortlist = substrate.restore_node_shortlist(SandboxId::new(), "source-node", None);
+        let shortlist =
+            substrate.restore_node_shortlist(SandboxId::new(), "source-node", None, None);
 
         assert_eq!(
             shortlist.len(),

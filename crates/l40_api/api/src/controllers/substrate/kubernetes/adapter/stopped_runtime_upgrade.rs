@@ -14,7 +14,9 @@
 //! registered Kubernetes node or is outside the sandbox node selector. A disk node
 //! that can't take work now (not Ready, cordoned, placement-blocked or out of
 //! network slots), or a Node or pod reflector that hasn't synced, answers a
-//! retryable 503 instead ([`KubernetesSubstrate::local_source_node_refusal`]).
+//! retryable 503 instead ([`KubernetesSubstrate::local_source_node_refusal`]),
+//! as does one that doesn't publish the upgrade's target while the
+//! environment placement gate is on.
 //! A retry that will reuse the pod an earlier attempt left there needs no new
 //! network slot, so that pod's own is discounted.
 //!
@@ -370,7 +372,7 @@ impl KubernetesSubstrate {
         // A retry that will reuse the pod an earlier attempt left there, one
         // carrying the recorded operation, needs no new network slot: that
         // pod already holds its own, so it's discounted.
-        let held = retained_pod_name
+        let kept_pod = retained_pod_name
             .as_deref()
             .and_then(|name| self.lookup_sandbox_pod(name))
             .filter(|pod| {
@@ -378,7 +380,9 @@ impl KubernetesSubstrate {
                     && pod.node_name() == Some(source_node.as_str())
                     && !pod.is_deleting()
                     && !pod.is_terminal()
-            })
+            });
+        let held = kept_pod
+            .as_ref()
             .map_or(0, |pod| pod.network_slot_request());
         if let Some(refusal) = self.local_source_node_refusal(&source_node, held) {
             let message = format!(
@@ -392,6 +396,33 @@ impl KubernetesSubstrate {
                 SubstrateError::Unavailable {
                     message: format!("{message}; retry"),
                 }
+            });
+        }
+        // With the environment placement gate on, a new pod requires the
+        // upgrade's target's label, which kubelet would refuse it without.
+        // Refused here, before this attempt places a pod or claims anything
+        // new, rather than by the pod build, whose error the boot can't tell
+        // from one that left a pod. The check above found the node in a synced cache. A node
+        // publishes an environment once node-ctl observes it usable, so the
+        // refusal is retryable. The pod build checks the label again, so a
+        // label removed in between still keeps the pod off the node, as a
+        // 409. A retry that reuses the pod kept above creates none: that pod
+        // is already bound to the node, and kubelet decides its admission,
+        // so the node's labels now don't change what this attempt does.
+        if kept_pod.is_none()
+            && self.k8s.environment_placement.refuses()
+            && let Some(node) = self.k8s.caches.node_by_name(&source_node)
+            && !node.metadata.labels.as_ref().is_some_and(|labels| {
+                pplx_space_sandbox_pod::node_publishes_environment(labels, &upgrade.target)
+            })
+        {
+            return Err(SubstrateError::Unavailable {
+                message: format!(
+                    "stopped sandbox {sandbox_id}'s disk is on node {source_node}, which doesn't \
+                     publish the upgrade's target environment {} while the environment placement \
+                     gate is on, so its runtime can't be upgraded there; retry",
+                    upgrade.target
+                ),
             });
         }
 

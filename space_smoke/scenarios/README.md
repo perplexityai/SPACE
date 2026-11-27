@@ -263,14 +263,17 @@ seed can be built while no worker runs it, then on the workers. Beside it, it
 builds seed bound to E0 under no tag. With the gate on, the E0 create runs E0
 on a worker, and its pod requires E0's usable label. The other create is
 refused with 503 as unschedulable and leaves no sandbox. Once the workers run
-the environment, the same create runs it there. The gate's restore is armed
+the environment, the same create runs it there, and resuming a suspended E0
+sandbox with `SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED` on after E1 becomes
+the default and E0 is blocked records and requires E1's usable label on the
+activation pod and boots E1 with disk state intact before restoring the policy.
+The gate's restore is armed
 before the write that turns it on, and writes the API's literal before the
 controller's. The standing literals are recorded on the public API mutation
 Lease first, so a Kind scenario's preflight repairs a run killed with the
 gate on: the next one on the same host and user, or the first after the
-Lease's four hours elsewhere. It refuses while resume-time runtime upgrades are on, since the
-substrate refuses `on` beside them at startup, and it refuses a gate literal
-an earlier run left behind. It's manual
+Lease's four hours elsewhere. It refuses a gate literal an earlier run left
+behind. It's manual
 for the same reason as the scenario above, and it also rolls the API, the
 admin API and the cluster controller.
 
@@ -467,7 +470,7 @@ uv run --frozen --python 3.11 -m space_smoke.inventory --check
 | [local.encrypted_disk_fork](local_encrypted_disk_fork.py) | routine | `kind_ecw`; kind; kubernetes | Fork a sealed encrypted disk, replay it, and restore independently of its source. |
 | [local.encrypted_live_disk_fork](local_encrypted_live_disk_fork.py) | routine | `kind_ecw`; kind; kubernetes | Capture encrypted disk state without suspending or restarting its guest. |
 | [local.encrypted_resuspend_preserves_cow](local_encrypted_resuspend_preserves_cow.py) | routine | `kind_ecw`; kind; kubernetes | A BYOK sandbox survives suspend, restore, re-suspend, and a second restore with one stable sparse LUKS memory base and intact guest state. |
-| [local.environment_placement_gate_on_places_bound_pods](local_environment_placement_gate_on_places_bound_pods.py) | manual | `kind_ecw`; kind; kubernetes | With the gate on, a create bound to an environment no worker can run is refused as unschedulable and leaves no sandbox, a create bound to E0 runs E0 on a worker labelled for it, and once the workers run the other environment its create runs it there. Gate and allowlists are back to what they were at the end.<br>Manual: Rolls the API, admin API and cluster controller to turn the environment placement gate on, rolls every node-manager to admit Firecracker 1.17.0 / Linux 6.1.155, installs that runtime on every node from its upstream release, and builds two seeds: run it on a bench no other scenario shares while it runs. |
+| [local.environment_placement_gate_on_places_bound_pods](local_environment_placement_gate_on_places_bound_pods.py) | manual | `kind_ecw`; kind; kubernetes | With the gate on, a create bound to an environment no worker can run is refused as unschedulable and leaves no sandbox, a create bound to E0 runs E0 on a worker labelled for it, once the workers run the other environment its create runs it there, and resuming a suspended E0 sandbox after E1 becomes the default and E0 is blocked records and requires E1 on the activation pod and boots E1 with disk state intact. Gate, runtime policy and allowlists are back to what they were at the end.<br>Manual: Rolls the API, admin API and cluster controller to turn the environment placement gate on, rolls every node-manager to admit Firecracker 1.17.0 / Linux 6.1.155, installs that runtime on every node from its upstream release, and builds two seeds: run it on a bench no other scenario shares while it runs. |
 | [local.forced_drain_evacuates_sandbox](local_forced_drain_evacuates_sandbox.py) | routine | `kind_ecw`; kind; kubernetes | A `:drain` with `mode: forced` parks the resident's worker in `draining` in forced mode and cordons it; the drain reconciler suspends the sandbox and restores it onto the other worker, from object storage, as `started`, with its filesystem intact and its data plane executing; the emptied node then reaches `drained` on its own with the guarded Kubernetes node still present; `:undrain` returns it to schedulable with no drain phase. |
 | [local.fork_saturation_safety](local_fork_saturation_safety.py) | manual | `kind_ecw`; kind; kubernetes | Fork waves have distinct children with intact independent disks while a colocated, existing sandbox keeps answering commands and file reads. The source remains suspended, and each wave is deleted before the next one. This is a bounded load check, not a maximum-capacity or latency benchmark.<br>Manual: Explicit bounded fork-pressure run on a dedicated Kind bench |
 | [local.fork_suspended_cross_node](local_fork_suspended_cross_node.py) | routine | `kind_ecw`; kind; kubernetes | Off-source placement preserves disk data without resuming the suspended source. |
