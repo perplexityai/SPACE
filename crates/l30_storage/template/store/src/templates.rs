@@ -62,7 +62,8 @@ pub async fn access(
 /// A present template's network policy and its generation.
 #[derive(Debug, FromRow)]
 pub struct PresentNetworkPolicy {
-    pub network_policy_json: Json<NetworkPolicyV1>,
+    #[sqlx(json)]
+    pub network_policy_json: NetworkPolicyV1,
     pub network_policy_generation: i64,
 }
 
@@ -252,10 +253,11 @@ pub async fn org_templates(
 /// network policy generation nodes observe. `Snapshots` decodes the
 /// inventory's `snapshots` JSON.
 ///
-/// [`create_or_undelete`] also decodes its upsert's `RETURNING` row into
-/// this type, so a field added here needs a column in that `RETURNING` list
-/// too.
-#[derive(Debug, FromRow)]
+/// [`list_admin`] and [`create_or_undelete`] decode their rows into a
+/// private row type with the same field names and convert it, so a field
+/// added here also needs a field there, and a column in both
+/// `list_admin`'s select list and `create_or_undelete`'s `RETURNING` list.
+#[derive(Debug)]
 pub struct AdminTemplate<Snapshots> {
     pub name: String,
     pub description: Option<String>,
@@ -274,14 +276,75 @@ pub struct AdminTemplate<Snapshots> {
     pub artifact_size_bytes: Option<i64>,
     pub cache_size_bytes: Option<i64>,
     pub base_snapshot_size_bytes: Option<i64>,
-    pub snapshots: Option<Json<Snapshots>>,
+    pub snapshots: Option<Snapshots>,
     pub vcpu: Option<i32>,
     pub memory_mib: Option<i32>,
     pub disk_size_mb: Option<i32>,
-    pub default_auto_lifecycle: Option<Json<AutoLifecyclePolicy>>,
-    pub network_policy: Json<NetworkPolicyV1>,
+    pub default_auto_lifecycle: Option<AutoLifecyclePolicy>,
+    pub network_policy: NetworkPolicyV1,
     pub observed_network_policy_generation: Option<i64>,
     pub observed_network_policy_authority: Option<String>,
+}
+
+#[derive(FromRow)]
+struct AdminTemplateRow<Snapshots> {
+    name: String,
+    description: Option<String>,
+    org_id: Option<OrgId>,
+    desired_state: String,
+    network_policy_generation: i64,
+    created_at: OffsetDateTime,
+    built_at: Option<String>,
+    content_hash: Option<String>,
+    runtime: Option<String>,
+    runtime_version: Option<String>,
+    arch: Option<String>,
+    has_base_snapshot: Option<bool>,
+    pool_target: Option<i32>,
+    pool_current: Option<i32>,
+    artifact_size_bytes: Option<i64>,
+    cache_size_bytes: Option<i64>,
+    base_snapshot_size_bytes: Option<i64>,
+    snapshots: Option<Json<Snapshots>>,
+    vcpu: Option<i32>,
+    memory_mib: Option<i32>,
+    disk_size_mb: Option<i32>,
+    default_auto_lifecycle: Option<Json<AutoLifecyclePolicy>>,
+    network_policy: Json<NetworkPolicyV1>,
+    observed_network_policy_generation: Option<i64>,
+    observed_network_policy_authority: Option<String>,
+}
+
+impl<Snapshots> From<AdminTemplateRow<Snapshots>> for AdminTemplate<Snapshots> {
+    fn from(row: AdminTemplateRow<Snapshots>) -> Self {
+        Self {
+            name: row.name,
+            description: row.description,
+            org_id: row.org_id,
+            desired_state: row.desired_state,
+            network_policy_generation: row.network_policy_generation,
+            created_at: row.created_at,
+            built_at: row.built_at,
+            content_hash: row.content_hash,
+            runtime: row.runtime,
+            runtime_version: row.runtime_version,
+            arch: row.arch,
+            has_base_snapshot: row.has_base_snapshot,
+            pool_target: row.pool_target,
+            pool_current: row.pool_current,
+            artifact_size_bytes: row.artifact_size_bytes,
+            cache_size_bytes: row.cache_size_bytes,
+            base_snapshot_size_bytes: row.base_snapshot_size_bytes,
+            snapshots: row.snapshots.map(|json| json.0),
+            vcpu: row.vcpu,
+            memory_mib: row.memory_mib,
+            disk_size_mb: row.disk_size_mb,
+            default_auto_lifecycle: row.default_auto_lifecycle.map(|json| json.0),
+            network_policy: row.network_policy.0,
+            observed_network_policy_generation: row.observed_network_policy_generation,
+            observed_network_policy_authority: row.observed_network_policy_authority,
+        }
+    }
 }
 
 /// Every template that is not deleted, or only `template` when given, by
@@ -293,7 +356,7 @@ pub async fn list_admin<Snapshots>(
 where
     Snapshots: DeserializeOwned + Send + Unpin + 'static,
 {
-    Ok(sqlx::query_as::<_, AdminTemplate<Snapshots>>(
+    Ok(sqlx::query_as::<_, AdminTemplateRow<Snapshots>>(
          sql!("WITH template_names AS (
              SELECT name
              FROM templates
@@ -388,7 +451,10 @@ where
     .bind(template.map(TemplateName::as_str))
     .bind(TemplateDesiredState::Deleted.as_str())
     .fetch_all(executor.into_sqlx())
-    .await?)
+    .await?
+    .into_iter()
+    .map(AdminTemplate::from)
+    .collect())
 }
 
 /// The network policy stored for `template`, or `None` when no row names it.
@@ -504,7 +570,8 @@ pub struct RegisteredTemplate {
     pub name: String,
     pub description: Option<String>,
     pub created_at: OffsetDateTime,
-    pub network_policy_json: Json<NetworkPolicyV1>,
+    #[sqlx(json)]
+    pub network_policy_json: NetworkPolicyV1,
     pub network_policy_generation: i64,
 }
 
@@ -774,7 +841,7 @@ pub async fn create_or_undelete<Snapshots>(
 where
     Snapshots: DeserializeOwned + Send + Unpin + 'static,
 {
-    Ok(sqlx::query_as::<_, AdminTemplate<Snapshots>>(
+    Ok(sqlx::query_as::<_, AdminTemplateRow<Snapshots>>(
         sql!("INSERT INTO templates
                  (id, name, description, org_id, desired_state, network_policy_json, network_policy_generation)
              VALUES ($1, $2, $3, $4, $6, $5, 1)
@@ -832,7 +899,8 @@ where
     .bind(TemplateDesiredState::Present.as_str())
     .bind(TemplateDesiredState::Deleted.as_str())
     .fetch_optional(executor.into_sqlx())
-    .await?)
+    .await?
+    .map(AdminTemplate::from))
 }
 
 /// Replace a present `template`'s network policy with `policy`, advancing
@@ -972,7 +1040,8 @@ pub async fn prune_deleted(
 #[derive(Debug, Clone, FromRow)]
 pub struct NodeTemplateNetworkPolicy {
     pub template: String,
-    pub network_policy_json: Json<NetworkPolicyV1>,
+    #[sqlx(json)]
+    pub network_policy_json: NetworkPolicyV1,
     pub network_policy_generation: i64,
 }
 
@@ -1130,12 +1199,12 @@ pub async fn node_base_snapshot_policies(
 }
 
 /// A requested template's desired state as a node reads it.
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct NodeTemplateDesiredState {
     pub template: String,
     /// The stored desired state, unparsed.
     pub desired_state: String,
-    pub default_auto_lifecycle_json: Option<Json<AutoLifecyclePolicy>>,
+    pub default_auto_lifecycle_json: Option<AutoLifecyclePolicy>,
     pub pool_target: Option<i32>,
     pub pool_boot_mode: Option<String>,
     pub pool_vcpu: Option<i32>,
@@ -1144,6 +1213,35 @@ pub struct NodeTemplateDesiredState {
     pub admitted: bool,
     /// The node's published inventory lists the template.
     pub held_here: bool,
+}
+
+#[derive(FromRow)]
+struct NodeTemplateDesiredStateRow {
+    template: String,
+    desired_state: String,
+    default_auto_lifecycle_json: Option<Json<AutoLifecyclePolicy>>,
+    pool_target: Option<i32>,
+    pool_boot_mode: Option<String>,
+    pool_vcpu: Option<i32>,
+    pool_memory_mib: Option<i32>,
+    admitted: bool,
+    held_here: bool,
+}
+
+impl From<NodeTemplateDesiredStateRow> for NodeTemplateDesiredState {
+    fn from(row: NodeTemplateDesiredStateRow) -> Self {
+        Self {
+            template: row.template,
+            desired_state: row.desired_state,
+            default_auto_lifecycle_json: row.default_auto_lifecycle_json.map(|json| json.0),
+            pool_target: row.pool_target,
+            pool_boot_mode: row.pool_boot_mode,
+            pool_vcpu: row.pool_vcpu,
+            pool_memory_mib: row.pool_memory_mib,
+            admitted: row.admitted,
+            held_here: row.held_here,
+        }
+    }
 }
 
 /// The desired state of each of `templates` that has a row, for node
@@ -1156,7 +1254,7 @@ pub async fn node_desired_states(
     node_id: NodeId,
     role: NodeRole,
 ) -> Result<Vec<NodeTemplateDesiredState>, DbError> {
-    Ok(sqlx::query_as::<_, NodeTemplateDesiredState>(sql!("WITH requested AS (
+    Ok(sqlx::query_as::<_, NodeTemplateDesiredStateRow>(sql!("WITH requested AS (
                  SELECT DISTINCT UNNEST($1::TEXT[]) AS template
              ),
              private_requested AS (
@@ -1260,7 +1358,10 @@ pub async fn node_desired_states(
     .bind(role.as_str())
     .bind(node_id)
     .fetch_all(executor.into_sqlx())
-    .await?)
+    .await?
+    .into_iter()
+    .map(NodeTemplateDesiredState::from)
+    .collect())
 }
 
 #[cfg(test)]

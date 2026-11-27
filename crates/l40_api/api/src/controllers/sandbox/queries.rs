@@ -2937,10 +2937,9 @@ impl SandboxController {
             runtime_alias,
         )
         .await?;
-        let policy =
-            create_auto_lifecycle_policy(defaults.default_auto_lifecycle.map(|policy| policy.0))?;
+        let policy = create_auto_lifecycle_policy(defaults.default_auto_lifecycle)?;
 
-        let default_network_policy = defaults.network_policy.0;
+        let default_network_policy = defaults.network_policy;
 
         Ok(ResolvedCreateTemplate {
             template_release_id,

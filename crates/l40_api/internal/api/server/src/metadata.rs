@@ -21,7 +21,8 @@ pub(super) struct TemplateRow {
     pub(super) name: String,
     pub(super) description: Option<String>,
     pub(super) created_at: OffsetDateTime,
-    pub(super) network_policy_json: Json<NetworkPolicyV1>,
+    #[sqlx(json)]
+    pub(super) network_policy_json: NetworkPolicyV1,
     pub(super) network_policy_generation: i64,
 }
 
@@ -1439,7 +1440,7 @@ pub(super) fn template_proto(row: TemplateRow) -> Template {
         name: row.name,
         description: row.description,
         created_at: format_time(row.created_at),
-        network_policy: Some(common_network_policy_to_proto(&row.network_policy_json.0)),
+        network_policy: Some(common_network_policy_to_proto(&row.network_policy_json)),
         network_policy_generation: db_generation_to_proto(row.network_policy_generation),
     }
 }

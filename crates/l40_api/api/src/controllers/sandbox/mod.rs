@@ -181,9 +181,9 @@ struct ResolvedCreateTemplate {
 
 #[derive(Debug)]
 struct CreateTemplateDefaults {
-    network_policy: sqlx::types::Json<NetworkPolicy>,
+    network_policy: NetworkPolicy,
     network_policy_generation: i64,
-    default_auto_lifecycle: Option<sqlx::types::Json<AutoLifecyclePolicy>>,
+    default_auto_lifecycle: Option<AutoLifecyclePolicy>,
 }
 
 /// Builds the not-found error for an unresolvable template reference.
@@ -519,7 +519,7 @@ async fn load_create_template_defaults(
                 )
             })?
             .map(|row| (row.network_policy_json, row.network_policy_generation))
-            .unwrap_or_else(|| (sqlx::types::Json(NetworkPolicyV1::deny_all()), 0));
+            .unwrap_or_else(|| (NetworkPolicyV1::deny_all(), 0));
 
     let default_auto_lifecycle =
         pplx_space_template_store::default_auto_lifecycle_policies::for_create(

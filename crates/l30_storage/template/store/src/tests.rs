@@ -93,7 +93,7 @@ async fn registration_inserts_once_and_fills_only_a_missing_description() -> Tes
     assert_eq!(row.name, "registered");
     assert_eq!(row.description, None);
     assert_eq!(row.network_policy_generation, 1);
-    assert_eq!(row.network_policy_json.0, NetworkPolicyV1::deny_all());
+    assert_eq!(row.network_policy_json, NetworkPolicyV1::deny_all());
 
     let again = templates::NewTemplate {
         id: TemplateId::new(),
@@ -577,7 +577,7 @@ async fn the_default_auto_lifecycle_upsert_replaces_the_policy() -> TestResult {
         "fc",
     )
     .await?;
-    assert_eq!(for_create.map(|policy| policy.0), Some(second));
+    assert_eq!(for_create, Some(second));
     assert!(
         super::default_auto_lifecycle_policies::for_create(&db.pool, "other", "sha256:any", "fc")
             .await?
@@ -699,7 +699,7 @@ async fn create_reads_see_access_in_every_state_and_policy_only_when_present() -
     let policy = templates::present_network_policy(&db.pool, "owned")
         .await?
         .expect("a present template's policy");
-    assert_eq!(policy.network_policy_json.0, NetworkPolicyV1::deny_all());
+    assert_eq!(policy.network_policy_json, NetworkPolicyV1::deny_all());
     assert_eq!(policy.network_policy_generation, 1);
     Ok(())
 }
