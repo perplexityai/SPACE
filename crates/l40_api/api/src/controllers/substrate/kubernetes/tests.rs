@@ -8015,17 +8015,11 @@ mod kubernetes_tests {
             disk_mib: None,
             disk_io_max_operations_per_sec: 1_000,
             disk_io_max_bandwidth_mib_per_sec: 100,
-            env: sqlx::types::Json(BTreeMap::new()),
-            metadata: sqlx::types::Json(BTreeMap::new()),
-            auto_lifecycle: sqlx::types::Json(
-                pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
-            ),
-            auto_lifecycle_state: sqlx::types::Json(
-                pplx_space_auto_lifecycle::AutoLifecycleRuntimeState::default(),
-            ),
-            network_policy: Some(sqlx::types::Json(
-                pplx_space_net_common::NetworkPolicyV1::default(),
-            )),
+            env: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
+            auto_lifecycle_state: pplx_space_auto_lifecycle::AutoLifecycleRuntimeState::default(),
+            network_policy: Some(pplx_space_net_common::NetworkPolicyV1::default()),
             network_policy_generation: 1,
             template_network_policy: None,
             template_network_policy_generation: None,
@@ -8066,9 +8060,7 @@ mod kubernetes_tests {
         };
         let inherited_sandbox = Sandbox {
             network_policy: None,
-            template_network_policy: Some(sqlx::types::Json(
-                pplx_space_net_common::NetworkPolicyV1::allow_all(),
-            )),
+            template_network_policy: Some(pplx_space_net_common::NetworkPolicyV1::allow_all()),
             template_network_policy_generation: Some(3),
             ..override_sandbox.clone()
         };

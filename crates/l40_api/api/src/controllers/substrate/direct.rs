@@ -4607,7 +4607,7 @@ impl SubstrateAdapter for DirectSubstrate {
         if let Ok(lifecycle @ (SandboxLifecycle::Suspended | SandboxLifecycle::Restoring)) =
             sandbox.lifecycle.parse::<SandboxLifecycle>()
         {
-            if !activity.allows_implicit_wake(&sandbox.auto_lifecycle.0) {
+            if !activity.allows_implicit_wake(&sandbox.auto_lifecycle) {
                 return Err(ControllerError::sandbox_not_running(
                     crate::controllers::SandboxNotRunning {
                         sandbox_id: sandbox.id,

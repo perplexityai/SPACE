@@ -993,7 +993,7 @@ pub(super) async fn connect_sandbox_inner(
     let current_policy = native
         .auto_lifecycle
         .as_ref()
-        .unwrap_or(&sandbox.auto_lifecycle.0);
+        .unwrap_or(&sandbox.auto_lifecycle);
     let requested_timeout_secs = body.and_then(|crate::e2b::E2bJson(request)| request.timeout);
     let connect_should_touch =
         should_touch_on_connect(current_policy, requested_timeout_secs, &native);
@@ -1337,11 +1337,9 @@ async fn update_resuming_sandbox_policy(
     if sandbox.lifecycle.eq_ignore_ascii_case("failed") {
         return Err(E2bApiError::failed_to_place_sandbox());
     }
-    if let Some(policy) = e2b_policy_for_resume_update(
-        &sandbox.auto_lifecycle.0,
-        request.timeout,
-        request.auto_pause,
-    ) {
+    if let Some(policy) =
+        e2b_policy_for_resume_update(&sandbox.auto_lifecycle, request.timeout, request.auto_pause)
+    {
         state
             .sandbox_controller
             .set_auto_lifecycle_policy(&state.pool, &sandbox, policy)
@@ -1486,7 +1484,7 @@ pub(super) async fn refresh_sandbox(
     let current_policy = native
         .auto_lifecycle
         .as_ref()
-        .unwrap_or(&sandbox.auto_lifecycle.0);
+        .unwrap_or(&sandbox.auto_lifecycle);
     if e2b_policy_for_refresh(current_policy).is_none() {
         tracing::debug!(
             sandbox_id = %sandbox.id,

@@ -10,13 +10,14 @@ use pplx_space_sandbox_model::SandboxId;
 
 use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::types::{Json, JsonValue};
+use sqlx::types::JsonValue;
 
 /// The receipt's authority columns of the locked row.
 #[derive(Debug, sqlx::FromRow)]
 pub struct CompletionAuthorityRow {
     pub lifecycle: String,
-    pub auto_lifecycle_json: Json<JsonValue>,
+    #[sqlx(json)]
+    pub auto_lifecycle_json: JsonValue,
     pub active_node_id: Option<NodeId>,
     /// Whether the row's placement (or, when never placed, its creation) is
     /// at least `ownership_grace_secs` old on the database clock.

@@ -3,7 +3,6 @@ use pplx_space_sandbox_model::SandboxId;
 
 use serde::Serialize;
 use serde_json::{Map, Value};
-use sqlx::types::Json as SqlxJson;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -100,11 +99,11 @@ pub(super) struct ResourcesSection {
     pub disk_mib: Option<i32>,
     /// Variable names, each mapped to `null`; see [`env_names`].
     pub env: Map<String, Value>,
-    pub metadata: SqlxJson<Value>,
-    pub auto_lifecycle: SqlxJson<Value>,
-    pub auto_lifecycle_state: SqlxJson<Value>,
+    pub metadata: Value,
+    pub auto_lifecycle: Value,
+    pub auto_lifecycle_state: Value,
     pub next_auto_event_at: Option<i64>,
-    pub network_policy_override_json: Option<SqlxJson<Value>>,
+    pub network_policy_override_json: Option<Value>,
     pub network_policy_generation: i64,
     pub snapshots_enabled_desired: bool,
     pub observed: Option<ObservedResources>,
@@ -153,7 +152,7 @@ pub(super) fn sandbox_sections(
             vcpu: record.vcpu,
             memory_mib: record.memory_mib,
             disk_mib: record.disk_mib,
-            env: env_names(record.env.0),
+            env: env_names(record.env),
             metadata: record.metadata,
             auto_lifecycle: record.auto_lifecycle,
             auto_lifecycle_state: record.auto_lifecycle_state,
@@ -365,7 +364,7 @@ pub(super) struct SnapshotInventory {
     pub size_bytes: i64,
     pub template_id: Option<String>,
     pub content_hash: Option<String>,
-    pub locations: SqlxJson<Value>,
+    pub locations: Value,
     #[serde(with = "time::serde::rfc3339")]
     pub observed_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -443,5 +442,5 @@ pub(super) struct TimelineEvent {
     #[serde(with = "time::serde::rfc3339")]
     pub at: OffsetDateTime,
     pub kind: String,
-    pub detail: SqlxJson<Value>,
+    pub detail: Value,
 }

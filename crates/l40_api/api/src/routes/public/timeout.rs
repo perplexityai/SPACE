@@ -88,7 +88,7 @@ pub(super) async fn set_timeout(
             "sandbox must have a single access-idle delete or suspend rule",
         ));
     }
-    let current_policy = sandbox.auto_lifecycle.0.clone().normalized();
+    let current_policy = sandbox.auto_lifecycle.clone().normalized();
     let (Some(config), [stage]) = (
         crate::e2b::lifecycle_config_from_policy(&current_policy),
         current_policy.stages.as_slice(),

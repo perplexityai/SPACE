@@ -260,7 +260,7 @@ impl KubernetesSubstrate {
         activity: ExecutionActivityKind,
     ) -> Result<(), ControllerError> {
         if is_dormant_lifecycle(&sandbox.lifecycle)
-            && !activity.allows_implicit_wake(&sandbox.auto_lifecycle.0)
+            && !activity.allows_implicit_wake(&sandbox.auto_lifecycle)
         {
             return Err(
                 match sandbox

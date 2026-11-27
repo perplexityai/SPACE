@@ -138,7 +138,7 @@ impl TimeoutIntent {
         timeout_secs: u32,
         expected_policy: Option<&AutoLifecyclePolicy>,
     ) -> Self {
-        let current = execution.policy.0.clone().normalized();
+        let current = execution.policy.clone().normalized();
         let next = crate::e2b::policy_for_timeout_update(&current, timeout_secs).normalized();
         let expected_matches =
             expected_policy.is_none_or(|expected| expected.clone().normalized() == current);
@@ -466,20 +466,14 @@ impl SandboxController {
             "inherit_template_default"
         };
         let profiles = crate::egress_profiles::load(pool, sandbox.id).await?;
-        let policy_override = self.egress_profiles.resolve(&profiles)?.compose_override(
-            policy_override,
-            sandbox
-                .template_network_policy
-                .as_ref()
-                .map(|policy| &policy.0),
-        )?;
+        let policy_override = self
+            .egress_profiles
+            .resolve(&profiles)?
+            .compose_override(policy_override, sandbox.template_network_policy.as_ref())?;
         let policy_override = crate::tls_interception_exemptions::compose(
             self.tls_interception_exemptions.as_ref(),
             policy_override,
-            sandbox
-                .template_network_policy
-                .as_ref()
-                .map(|policy| &policy.0),
+            sandbox.template_network_policy.as_ref(),
         );
         let base_details = || {
             let mut details = SandboxEventDetails::default()

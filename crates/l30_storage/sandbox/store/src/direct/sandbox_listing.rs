@@ -68,7 +68,9 @@ use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{EcwCredentialEpoch, SandboxActivationAttemptId, SandboxId};
 use pplx_space_sql_locator::sql;
 use serde::{Deserialize, Serialize};
-use sqlx::types::JsonValue;
+use sqlx::FromRow;
+use sqlx::postgres::PgRow;
+use sqlx::types::{Json, JsonValue};
 use time::OffsetDateTime;
 
 use crate::SandboxMetadata;
@@ -76,7 +78,7 @@ use crate::SandboxMetadata;
 /// A sandbox's response row: its `sandboxes` row with its owner, its
 /// template's network policy, the node it runs on, its active execution, its
 /// ECW credential epoch and its release's tags.
-#[derive(Debug, Clone, sqlx::FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sandbox {
     pub id: SandboxId,
     pub name: Option<String>,
@@ -120,13 +122,13 @@ pub struct Sandbox {
     pub disk_mib: Option<i32>,
     pub disk_io_max_operations_per_sec: i64,
     pub disk_io_max_bandwidth_mib_per_sec: i64,
-    pub env: sqlx::types::Json<BTreeMap<String, String>>,
-    pub metadata: sqlx::types::Json<SandboxMetadata>,
-    pub auto_lifecycle: sqlx::types::Json<AutoLifecyclePolicy>,
-    pub auto_lifecycle_state: sqlx::types::Json<AutoLifecycleRuntimeState>,
-    pub network_policy: Option<sqlx::types::Json<NetworkPolicy>>,
+    pub env: BTreeMap<String, String>,
+    pub metadata: SandboxMetadata,
+    pub auto_lifecycle: AutoLifecyclePolicy,
+    pub auto_lifecycle_state: AutoLifecycleRuntimeState,
+    pub network_policy: Option<NetworkPolicy>,
     pub network_policy_generation: i64,
-    pub template_network_policy: Option<sqlx::types::Json<NetworkPolicyV1>>,
+    pub template_network_policy: Option<NetworkPolicyV1>,
     pub template_network_policy_generation: Option<i64>,
     pub next_auto_event_at: Option<i64>,
     pub snapshots_enabled_desired: bool,
@@ -148,6 +150,123 @@ pub struct Sandbox {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+}
+
+/// [`Sandbox`] as Postgres returns it: the documents still wrapped for
+/// decoding.
+#[derive(FromRow)]
+struct SandboxRow {
+    id: SandboxId,
+    name: Option<String>,
+    user_id: UserId,
+    user_email: Option<String>,
+    org_id: OrgId,
+    owner_source: SandboxOwnerSource,
+    upstream_issuer: Option<String>,
+    upstream_org_id: Option<String>,
+    upstream_subject_id: Option<String>,
+    managed_by: String,
+    lifecycle: String,
+    placement: String,
+    activating_client_id: Option<ClientId>,
+    active_node_id: Option<NodeId>,
+    active_node_name: Option<String>,
+    active_node_role: Option<NodeRole>,
+    active_node_address: Option<NodeAddress>,
+    active_node_managed_by: Option<NodeManagedBy>,
+    target_node_id: Option<NodeId>,
+    active_execution_generation: Option<i64>,
+    active_pod_uid: Option<PodUid>,
+    active_activation_attempt_id: Option<SandboxActivationAttemptId>,
+    ecw_credential_epoch: EcwCredentialEpoch,
+    placement_changed_at: Option<OffsetDateTime>,
+    template_id: Option<String>,
+    content_hash: Option<String>,
+    release_tags: Vec<String>,
+    vcpu: Option<i32>,
+    memory_mib: Option<i32>,
+    disk_mib: Option<i32>,
+    disk_io_max_operations_per_sec: i64,
+    disk_io_max_bandwidth_mib_per_sec: i64,
+    env: Json<BTreeMap<String, String>>,
+    metadata: Json<SandboxMetadata>,
+    auto_lifecycle: Json<AutoLifecyclePolicy>,
+    auto_lifecycle_state: Json<AutoLifecycleRuntimeState>,
+    network_policy: Option<Json<NetworkPolicy>>,
+    network_policy_generation: i64,
+    template_network_policy: Option<Json<NetworkPolicyV1>>,
+    template_network_policy_generation: Option<i64>,
+    next_auto_event_at: Option<i64>,
+    snapshots_enabled_desired: bool,
+    volume_encryption: bool,
+    command_ready_pending: bool,
+    last_used_at: Option<OffsetDateTime>,
+    last_access_at: Option<OffsetDateTime>,
+    last_command_at: Option<OffsetDateTime>,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+}
+
+impl From<SandboxRow> for Sandbox {
+    fn from(row: SandboxRow) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            user_id: row.user_id,
+            user_email: row.user_email,
+            org_id: row.org_id,
+            owner_source: row.owner_source,
+            upstream_issuer: row.upstream_issuer,
+            upstream_org_id: row.upstream_org_id,
+            upstream_subject_id: row.upstream_subject_id,
+            managed_by: row.managed_by,
+            lifecycle: row.lifecycle,
+            placement: row.placement,
+            activating_client_id: row.activating_client_id,
+            active_node_id: row.active_node_id,
+            active_node_name: row.active_node_name,
+            active_node_role: row.active_node_role,
+            active_node_address: row.active_node_address,
+            active_node_managed_by: row.active_node_managed_by,
+            target_node_id: row.target_node_id,
+            active_execution_generation: row.active_execution_generation,
+            active_pod_uid: row.active_pod_uid,
+            active_activation_attempt_id: row.active_activation_attempt_id,
+            ecw_credential_epoch: row.ecw_credential_epoch,
+            placement_changed_at: row.placement_changed_at,
+            template_id: row.template_id,
+            content_hash: row.content_hash,
+            release_tags: row.release_tags,
+            vcpu: row.vcpu,
+            memory_mib: row.memory_mib,
+            disk_mib: row.disk_mib,
+            disk_io_max_operations_per_sec: row.disk_io_max_operations_per_sec,
+            disk_io_max_bandwidth_mib_per_sec: row.disk_io_max_bandwidth_mib_per_sec,
+            env: row.env.0,
+            metadata: row.metadata.0,
+            auto_lifecycle: row.auto_lifecycle.0,
+            auto_lifecycle_state: row.auto_lifecycle_state.0,
+            network_policy: row.network_policy.map(|json| json.0),
+            network_policy_generation: row.network_policy_generation,
+            template_network_policy: row.template_network_policy.map(|json| json.0),
+            template_network_policy_generation: row.template_network_policy_generation,
+            next_auto_event_at: row.next_auto_event_at,
+            snapshots_enabled_desired: row.snapshots_enabled_desired,
+            volume_encryption: row.volume_encryption,
+            command_ready_pending: row.command_ready_pending,
+            last_used_at: row.last_used_at,
+            last_access_at: row.last_access_at,
+            last_command_at: row.last_command_at,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
+impl<'r> FromRow<'r, PgRow> for Sandbox {
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        SandboxRow::from_row(row).map(Self::from)
+    }
 }
 
 /// A sandbox on an ECW or admin list page and whether another sandbox

@@ -129,7 +129,7 @@ fn proves_no_execution_only_for_kubernetes_rows() {
             execution_generation: None,
             has_direct_route: false,
             has_activation_lease: false,
-            policy: sqlx::types::Json(Default::default()),
+            policy: Default::default(),
         };
         assert_eq!(execution.proves_no_execution(), proves, "{managed_by:?}");
     }

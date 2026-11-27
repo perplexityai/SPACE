@@ -151,7 +151,7 @@ impl AccessBackend for StoredAccess {
                 .parse::<SandboxLifecycle>()
                 .map_err(|error| Status::internal(error.to_string()))?,
             access_wake: ExecutionActivityKind::Access
-                .allows_implicit_wake(&sandbox.auto_lifecycle.0),
+                .allows_implicit_wake(&sandbox.auto_lifecycle),
             restore_owned: pplx_space_sandbox_store::restore_owner_active(&self.pool, id)
                 .await
                 .map_err(|error| Status::internal(error.to_string()))?,
@@ -195,7 +195,7 @@ impl AccessBackend for StoredAccess {
             .map_err(|error| Status::internal(error.to_string()))?;
         validate_access(
             lifecycle,
-            ExecutionActivityKind::Access.allows_implicit_wake(&sandbox.auto_lifecycle.0),
+            ExecutionActivityKind::Access.allows_implicit_wake(&sandbox.auto_lifecycle),
         )?;
         if lifecycle == SandboxLifecycle::Paused {
             // A resident worker is reachable while paused, but bridge setup

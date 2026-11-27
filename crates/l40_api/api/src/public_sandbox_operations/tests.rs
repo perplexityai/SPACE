@@ -279,7 +279,7 @@ async fn native_create_executor_preserves_operator_policy_across_replacements(
                 let updated = fetch_sandbox(&db.pool, sandbox_id)
                     .await?
                     .expect("updated sandbox");
-                let effective = updated.network_policy.expect("profile remains composed").0;
+                let effective = updated.network_policy.expect("profile remains composed");
                 assert!(effective.allows_domain("updated.example.test"));
                 assert!(!effective.allows_domain("sensor.example.test"));
                 assert!(!effective.allows_domain("retired.example.test"));

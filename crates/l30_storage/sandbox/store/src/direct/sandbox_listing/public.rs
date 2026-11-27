@@ -24,7 +24,6 @@ use pplx_space_state_reconciliation::{
 };
 use sqlx::postgres::PgArguments;
 use sqlx::query::QueryAs;
-use sqlx::types::Json;
 use time::OffsetDateTime;
 
 use super::PageWalk;
@@ -47,9 +46,11 @@ pub struct PublicSandboxRow {
     pub vcpu: Option<i32>,
     pub memory_mib: Option<i32>,
     pub disk_mib: Option<i32>,
-    pub metadata: Json<SandboxMetadata>,
+    #[sqlx(json)]
+    pub metadata: SandboxMetadata,
     pub next_auto_event_at: Option<i64>,
-    pub auto_lifecycle: Json<AutoLifecyclePolicy>,
+    #[sqlx(json)]
+    pub auto_lifecycle: AutoLifecyclePolicy,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
     /// A page row is followed by another sandbox in list order, whether or

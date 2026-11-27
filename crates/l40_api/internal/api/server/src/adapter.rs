@@ -1182,7 +1182,7 @@ impl ClusterApi for ClusterApiService {
                     auto_lifecycle: row
                         .auto_lifecycle_json
                         .as_ref()
-                        .map(|policy| common_auto_lifecycle_to_proto(&policy.0)),
+                        .map(common_auto_lifecycle_to_proto),
                 })
             })
             .collect::<Vec<_>>();

@@ -761,7 +761,7 @@ fn sandbox_idle_configuration_requires_one_access_idle_delete_or_suspend_stage()
 
     for (policy, expected_timeout, expected_action) in cases {
         let mut row = public_sandbox_row(OffsetDateTime::UNIX_EPOCH, SandboxId::new());
-        row.auto_lifecycle = SqlJson(policy.clone());
+        row.auto_lifecycle = policy.clone();
         let sandbox = public_sandbox_from_row(row).unwrap();
         assert_eq!(sandbox.idle_timeout, expected_timeout, "{policy:?}");
         assert_eq!(sandbox.idle_action, expected_action, "{policy:?}");
@@ -1806,9 +1806,9 @@ fn public_sandbox_row(created_at: OffsetDateTime, id: SandboxId) -> PublicSandbo
         vcpu: Some(2),
         memory_mib: Some(1024),
         disk_mib: Some(4096),
-        metadata: SqlJson(Default::default()),
+        metadata: Default::default(),
         next_auto_event_at: None,
-        auto_lifecycle: SqlJson(AutoLifecyclePolicy::disabled()),
+        auto_lifecycle: AutoLifecyclePolicy::disabled(),
         created_at,
         updated_at: created_at,
         has_next: false,
@@ -2456,7 +2456,7 @@ async fn sandbox_list_query_bounds_the_bytes_it_returns() -> TestDbResult<()> {
         .await?;
         let metadata_bytes = rows
             .iter()
-            .map(|row| serde_json::to_vec(&row.metadata.0).unwrap().len())
+            .map(|row| serde_json::to_vec(&row.metadata).unwrap().len())
             .sum::<usize>();
         if rows.len() > 1 {
             assert!(metadata_bytes <= BUDGET as usize, "{metadata_bytes}");
