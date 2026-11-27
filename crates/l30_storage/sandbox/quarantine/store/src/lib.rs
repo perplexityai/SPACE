@@ -129,13 +129,17 @@ pub async fn quarantine_history(
 /// cluster controller found the worker row and execution pod gone and a
 /// ready suspend snapshot matching the recorded activity. Writes nothing when
 /// the sandbox isn't quarantined. The caller holds the sandbox's and the
-/// episode's row locks and has rechecked the recovery.
-pub async fn record_recovered_to_suspended(
-    executor: impl Executor<'_>,
+/// episode's row locks and has rechecked the recovery. The caller must pass
+/// its open transaction.
+pub async fn record_recovered_to_suspended<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     history_id: Uuid,
     snapshot_id: SnapshotId,
-) -> Result<(), DbError> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "INSERT INTO sandbox_quarantine_history
             (id, quarantine_id, sandbox_id, source, action, reason_code, message, attempt_count, evidence)
@@ -147,22 +151,24 @@ pub async fn record_recovered_to_suspended(
     .bind(sandbox_id)
     .bind(history_id)
     .bind(snapshot_id.to_string())
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
 
-/// Close the sandbox's open episode, whichever it is. `false` when it had
-/// none.
-pub async fn delete_quarantine_state(
-    executor: impl Executor<'_>,
-    sandbox_id: SandboxId,
-) -> Result<bool, DbError> {
+/// Close the sandbox's open episode, whichever it is: the `WHERE` checks
+/// only the sandbox, so the caller holds the episode's row lock and has
+/// rechecked it. `false` when it had none. The caller must pass its open
+/// transaction.
+pub async fn delete_quarantine_state<C>(tx: &mut C, sandbox_id: SandboxId) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let result = sqlx::query(sql!(
         "DELETE FROM sandbox_quarantine_state WHERE sandbox_id = $1"
     ))
     .bind(sandbox_id)
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(result.rows_affected() > 0)
 }
