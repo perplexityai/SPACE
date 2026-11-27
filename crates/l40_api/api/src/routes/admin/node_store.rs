@@ -42,7 +42,7 @@ pub(super) fn execution_policy(
     Option<OffsetDateTime>,
 )> {
     let value = row.execution_policy.as_ref()?;
-    match serde_json::from_value(value.0.clone()) {
+    match serde_json::from_value(value.clone()) {
         Ok(policy) => Some((policy, row.execution_policy_received_at)),
         Err(error) => {
             tracing::warn!(node_id = %row.id, %error, "invalid stored execution policy; withholding policy evidence");

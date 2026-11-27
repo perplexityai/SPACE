@@ -315,17 +315,44 @@ pub async fn upsert_from_publish(
 }
 
 /// A node's reachability and health from its snapshot. `services` and
-/// `node_ctl` are JSON the caller decodes as `S` and `C`; a row that doesn't
-/// decode fails the read.
-#[derive(Debug, Clone, sqlx::FromRow)]
+/// `node_ctl` are the snapshot's JSON columns decoded as the caller's `S` and
+/// `C`; a row whose JSON doesn't decode as them fails the read.
+#[derive(Debug, Clone)]
 pub struct NodeStatusSummary<S, C> {
     pub node_id: NodeId,
     pub stale_after: OffsetDateTime,
     pub reachable: bool,
     pub error: Option<String>,
     pub health_healthy: Option<bool>,
-    pub services: Json<S>,
-    pub node_ctl: Option<Json<C>>,
+    pub services: S,
+    pub node_ctl: Option<C>,
+}
+
+/// [`NodeStatusSummary`] as [`status_summaries`] decodes it, its JSON
+/// columns through [`Json`].
+#[derive(sqlx::FromRow)]
+struct NodeStatusSummaryDecodeRow<S, C> {
+    node_id: NodeId,
+    stale_after: OffsetDateTime,
+    reachable: bool,
+    error: Option<String>,
+    health_healthy: Option<bool>,
+    services: Json<S>,
+    node_ctl: Option<Json<C>>,
+}
+
+impl<S, C> From<NodeStatusSummaryDecodeRow<S, C>> for NodeStatusSummary<S, C> {
+    fn from(row: NodeStatusSummaryDecodeRow<S, C>) -> Self {
+        Self {
+            node_id: row.node_id,
+            stale_after: row.stale_after,
+            reachable: row.reachable,
+            error: row.error,
+            health_healthy: row.health_healthy,
+            services: row.services.0,
+            node_ctl: row.node_ctl.map(|json| json.0),
+        }
+    }
 }
 
 /// The snapshots of those of `node_ids` that have one, in no particular
@@ -338,7 +365,7 @@ where
     S: DeserializeOwned + Send + Unpin + 'static,
     C: DeserializeOwned + Send + Unpin + 'static,
 {
-    Ok(sqlx::query_as::<_, NodeStatusSummary<S, C>>(sql!(
+    Ok(sqlx::query_as::<_, NodeStatusSummaryDecodeRow<S, C>>(sql!(
         "SELECT node_id,
                 stale_after,
                 reachable,
@@ -351,7 +378,10 @@ where
     ))
     .bind(node_ids)
     .fetch_all(executor.into_sqlx())
-    .await?)
+    .await?
+    .into_iter()
+    .map(NodeStatusSummary::from)
+    .collect())
 }
 
 /// A boolean SQL predicate, TRUE iff the node status snapshot aliased as

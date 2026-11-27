@@ -214,8 +214,8 @@ pub(super) async fn fetch_cached_node_health(
                 reachable: status.reachable,
                 healthy: status.health_healthy.unwrap_or(false),
                 error: status.error,
-                services: status.services.0,
-                node_ctl: status.node_ctl.map(|node_ctl| node_ctl.0),
+                services: status.services,
+                node_ctl: status.node_ctl,
             }
         }
         Err(err) => NodeHealthStatusResponse {

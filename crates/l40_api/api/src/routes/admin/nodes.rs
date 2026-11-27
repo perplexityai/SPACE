@@ -479,15 +479,8 @@ fn admin_node_status(row: &AdminNodeRow) -> Option<AdminNodeStatusSnapshot> {
             reachable: row.status_reachable.unwrap_or(false),
             healthy: row.status_health_healthy.unwrap_or(false),
             error: row.status_error.clone(),
-            services: row
-                .status_services
-                .as_ref()
-                .map(|services| services.0.clone())
-                .unwrap_or_default(),
-            node_ctl: row
-                .status_node_ctl
-                .as_ref()
-                .map(|node_ctl| node_ctl.0.clone()),
+            services: row.status_services.clone().unwrap_or_default(),
+            node_ctl: row.status_node_ctl.clone(),
         }),
     })
 }
@@ -536,16 +529,13 @@ fn admin_node_response(
             row.id,
             row.drain_engine.as_deref(),
             drain_phase.as_deref(),
-            row.drain_status.as_ref().map(|status| &status.0),
+            row.drain_status.as_ref(),
         ),
         drain_engine: row.drain_engine,
         terminate_decrement_capacity: row.terminate_decrement_capacity,
         node_group_id: row.node_group_id,
         k8s_node_name: row.substrate_node_id,
-        metadata: row
-            .metadata
-            .map(|m| m.0)
-            .unwrap_or_else(|| serde_json::json!({})),
+        metadata: row.metadata.unwrap_or_else(|| serde_json::json!({})),
         last_heartbeat: format_optional_time(row.last_heartbeat.or(row.status_observed_at)),
         created_at: format_time(row.created_at),
         updated_at: format_optional_time(row.updated_at),
