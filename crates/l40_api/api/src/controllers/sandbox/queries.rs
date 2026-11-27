@@ -677,7 +677,7 @@ async fn resolve_kubernetes_pool_configured_resources(
         return Ok(Some(assignment));
     }
 
-    let policy_assignment = WarmPoolStore::new(pool.clone())
+    let policy_assignment = WarmPoolStore::new(pplx_space_postgres_pool::Db::from(pool.clone()))
         .preferred_enabled_policy_assignment(template_name)
         .await
         .map_err(|err| pool_store_error("failed to load warm-pool policy resources", &err))?;
@@ -723,7 +723,7 @@ async fn enabled_pool_assignment(
     pool: &PgPool,
     template_release_id: Uuid,
 ) -> Result<Option<KubernetesPoolAssignment>, ControllerError> {
-    WarmPoolStore::new(pool.clone())
+    WarmPoolStore::new(pplx_space_postgres_pool::Db::from(pool.clone()))
         .preferred_enabled_plaintext_assignment(template_release_id)
         .await
         .map_err(|err| pool_store_error("failed to load Kubernetes pool resources", &err))?
@@ -3028,7 +3028,7 @@ async fn observed_only_responses(
         .iter()
         .map(|observed| observed.sandbox_id)
         .collect::<Vec<_>>();
-    let pool_ids = WarmPoolStore::new(pool.clone())
+    let pool_ids = WarmPoolStore::new(pplx_space_postgres_pool::Db::from(pool.clone()))
         .pool_reservations(&ids)
         .await
         .map_err(|error| {

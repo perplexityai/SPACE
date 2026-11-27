@@ -156,7 +156,8 @@ fn reconcile_stage_test_reconciler_inner() -> Reconciler {
             ready: ReflectorReady::always_ready(),
         },
         node_store,
-        store: WarmPoolStore::new(postgres.clone()),
+        store: WarmPoolStore::new(Db::from(postgres.clone())),
+        pool: postgres.clone(),
         // Direct is only a placeholder: the tests using this never reach the substrate.
         substrate: Arc::new(Substrate::from_direct(DirectSubstrate::new(postgres))),
         namespace: "space".to_string(),
@@ -209,6 +210,7 @@ fn reconcile_test_reconciler(
         },
         node_store,
         store,
+        pool: postgres.clone(),
         // Direct is only a placeholder: the tests using this never reach the substrate.
         substrate: Arc::new(Substrate::from_direct(DirectSubstrate::new(postgres))),
         namespace: "space".to_string(),
@@ -825,7 +827,7 @@ async fn observe_warming_slots_retries_not_started_probe_and_promotes_slot() -> 
     }
 
     let db = pg_test_db().await?;
-    let store = WarmPoolStore::new(db.pool.clone());
+    let store = WarmPoolStore::new(Db::from(db.pool.clone()));
     let template_name = TemplateName::parse("app-runtime")?;
     let template_release_id = Uuid::now_v7();
     let config_id = Uuid::now_v7();
@@ -886,6 +888,7 @@ async fn observe_warming_slots_retries_not_started_probe_and_promotes_slot() -> 
         },
         node_store,
         store: store.clone(),
+        pool: db.pool.clone(),
         // Direct is only a placeholder here: this test never reaches the substrate.
         substrate: Arc::new(Substrate::from_direct(DirectSubstrate::new(
             db.pool.clone(),
@@ -942,7 +945,7 @@ async fn observe_warming_slots_retries_not_started_probe_and_promotes_slot() -> 
 #[tokio::test]
 async fn observe_warming_slots_keeps_young_slot_missing_from_cache() -> TestResult {
     let db = pg_test_db().await?;
-    let store = WarmPoolStore::new(db.pool.clone());
+    let store = WarmPoolStore::new(Db::from(db.pool.clone()));
     let template_name = TemplateName::parse("app-runtime")?;
     let template_release_id = Uuid::now_v7();
     let config_id = Uuid::now_v7();
@@ -981,6 +984,7 @@ async fn observe_warming_slots_keeps_young_slot_missing_from_cache() -> TestResu
         },
         node_store,
         store: store.clone(),
+        pool: db.pool.clone(),
         // Direct is only a placeholder here: this test never reaches the substrate.
         substrate: Arc::new(Substrate::from_direct(DirectSubstrate::new(
             db.pool.clone(),
@@ -1022,7 +1026,7 @@ async fn observe_warming_slots_keeps_young_slot_missing_from_cache() -> TestResu
 #[tokio::test]
 async fn reconcile_config_refills_after_observation_failure() -> TestResult {
     let db = pg_test_db().await?;
-    let store = WarmPoolStore::new(db.pool.clone());
+    let store = WarmPoolStore::new(Db::from(db.pool.clone()));
     let template_name = TemplateName::parse("app-runtime")?;
     let template_release_id = Uuid::now_v7();
     let config_id = Uuid::now_v7();
@@ -1098,7 +1102,7 @@ async fn reconcile_config_refills_after_observation_failure() -> TestResult {
 #[tokio::test]
 async fn reconcile_config_refused_by_placement_still_runs_teardown() -> TestResult {
     let db = pg_test_db().await?;
-    let store = WarmPoolStore::new(db.pool.clone());
+    let store = WarmPoolStore::new(Db::from(db.pool.clone()));
     let template_name = TemplateName::parse("acme-private-tools")?;
     let template_release_id = Uuid::now_v7();
     let config_id = Uuid::now_v7();
@@ -1220,7 +1224,7 @@ async fn reconcile_config_refused_by_placement_still_runs_teardown() -> TestResu
 #[tokio::test]
 async fn reconcile_config_does_not_refill_when_slot_counts_fail() -> TestResult {
     let db = pg_test_db().await?;
-    let store = WarmPoolStore::new(db.pool.clone());
+    let store = WarmPoolStore::new(Db::from(db.pool.clone()));
     let template_name = TemplateName::parse("app-runtime")?;
     let template_release_id = Uuid::now_v7();
     let config_id = Uuid::now_v7();
@@ -1348,6 +1352,7 @@ fn pool_creating_reconciler(db: &TestDb, store: &WarmPoolStore) -> Reconciler {
         },
         node_store,
         store: store.clone(),
+        pool: db.pool.clone(),
         // Direct is only a placeholder here: these passes never reach the substrate.
         substrate: Arc::new(Substrate::from_direct(DirectSubstrate::new(
             db.pool.clone(),
@@ -1376,7 +1381,7 @@ fn pool_creating_reconciler(db: &TestDb, store: &WarmPoolStore) -> Reconciler {
 #[tokio::test]
 async fn reconcile_once_starts_preparing_republished_exact_release() -> TestResult {
     let db = pg_test_db().await?;
-    let store = WarmPoolStore::new(db.pool.clone());
+    let store = WarmPoolStore::new(Db::from(db.pool.clone()));
     let (republished_release_id, republished_hash, template_name) =
         seed_republished_policy_release(&db).await?;
     let reconciler = pool_creating_reconciler(&db, &store);
@@ -1420,7 +1425,7 @@ async fn reconcile_once_starts_preparing_republished_exact_release() -> TestResu
 #[tokio::test]
 async fn reconcile_once_reconciles_stored_configs_when_autoscaling_fails() -> TestResult {
     let db = pg_test_db().await?;
-    let store = WarmPoolStore::new(db.pool.clone());
+    let store = WarmPoolStore::new(Db::from(db.pool.clone()));
     let (republished_release_id, _, _) = seed_republished_policy_release(&db).await?;
     // Deleting retired configs is the step's last write, and it runs even when
     // nothing is retired. Nothing else in a pass deletes a pool config. An
@@ -2632,7 +2637,7 @@ async fn refill_creates_pool_pods_that_require_the_release_environment() -> Test
     use pplx_space_api::controllers::substrate::environment_placement::EnvironmentPlacementGate;
     const E1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
     let db = pg_test_db().await?;
-    let store = WarmPoolStore::new(db.pool.clone());
+    let store = WarmPoolStore::new(Db::from(db.pool.clone()));
     let template_name = TemplateName::parse("app-runtime")?;
     let template_release_id = Uuid::now_v7();
     let config_id = Uuid::now_v7();
@@ -2723,7 +2728,7 @@ async fn refill_requires_the_environment_a_holder_reported_during_the_tick() -> 
     use pplx_space_api::controllers::substrate::environment_placement::EnvironmentPlacementGate;
     const E1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
     let db = pg_test_db().await?;
-    let store = WarmPoolStore::new(db.pool.clone());
+    let store = WarmPoolStore::new(Db::from(db.pool.clone()));
     let template_name = TemplateName::parse("app-runtime")?;
     let template_release_id = Uuid::now_v7();
     let config_id = Uuid::now_v7();
@@ -2862,7 +2867,7 @@ async fn stalled_environment_read_tick(
 ) -> TestResult<ReconcileSummary> {
     // Room for the lock's holder and the abandoned read's connection.
     let db = pplx_space_db_test_fixtures::pg_test_db_with_max_connections(4).await?;
-    let store = WarmPoolStore::new(db.pool.clone());
+    let store = WarmPoolStore::new(Db::from(db.pool.clone()));
     let template_name = TemplateName::parse("app-runtime")?;
     let template_release_id = Uuid::now_v7();
     let config_id = Uuid::now_v7();
@@ -2930,7 +2935,7 @@ async fn stalled_environment_read_tick(
 async fn refill_books_a_failed_environment_read_when_the_gate_is_on() -> TestResult {
     use pplx_space_api::controllers::substrate::environment_placement::EnvironmentPlacementGate;
     let db = pg_test_db().await?;
-    let store = WarmPoolStore::new(db.pool.clone());
+    let store = WarmPoolStore::new(Db::from(db.pool.clone()));
     let template_name = TemplateName::parse("app-runtime")?;
     let template_release_id = Uuid::now_v7();
     let config_id = Uuid::now_v7();

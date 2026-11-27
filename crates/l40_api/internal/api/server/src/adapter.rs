@@ -773,10 +773,12 @@ impl ClusterApi for ClusterApiService {
         // release accumulates as a permanent GC pin — a frequently
         // republished template piles up hundreds of disabled configs and
         // its on-node builds are never reclaimed, filling `/space/cache`.
-        let rows = pplx_space_cluster_pool::WarmPoolStore::new(self.pool.clone())
-            .protected_template_releases()
-            .await
-            .map_err(|err| Status::internal(format!("query warm pool releases: {err}")))?;
+        let rows = pplx_space_cluster_pool::WarmPoolStore::new(pplx_space_postgres_pool::Db::from(
+            self.pool.clone(),
+        ))
+        .protected_template_releases()
+        .await
+        .map_err(|err| Status::internal(format!("query warm pool releases: {err}")))?;
 
         Ok(Response::new(ListWarmPoolTemplateReleasesResponse {
             releases: rows
@@ -1082,10 +1084,12 @@ impl ClusterApi for ClusterApiService {
         // baseline in `deleted_sandbox_ids`. Read the reservations BEFORE
         // the sandboxes read — a slot claimed between the two reads is
         // then present in at least one of them, never in neither.
-        let pool_reserved = pplx_space_cluster_pool::WarmPoolStore::new(self.pool.clone())
-            .pool_reservations(&sandbox_ids)
-            .await
-            .map_err(|err| Status::internal(format!("query pool slot reservations: {err}")))?;
+        let pool_reserved = pplx_space_cluster_pool::WarmPoolStore::new(
+            pplx_space_postgres_pool::Db::from(self.pool.clone()),
+        )
+        .pool_reservations(&sandbox_ids)
+        .await
+        .map_err(|err| Status::internal(format!("query pool slot reservations: {err}")))?;
         let pool_reserved = pool_reserved
             .into_iter()
             .map(|reservation| reservation.sandbox_id)

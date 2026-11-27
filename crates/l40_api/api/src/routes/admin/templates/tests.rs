@@ -236,9 +236,11 @@ async fn named_release_tag_moves_existing_release_into_warm_retention() -> TestR
     )
     .await
     .into_response();
-    let protected = pplx_space_cluster_pool::WarmPoolStore::new(db.pool.clone())
-        .protected_template_releases()
-        .await?;
+    let protected = pplx_space_cluster_pool::WarmPoolStore::new(
+        pplx_space_postgres_pool::Db::from(db.pool.clone()),
+    )
+    .protected_template_releases()
+    .await?;
 
     assert_eq!(response.status(), StatusCode::OK);
     assert!(protected.iter().any(|release| {

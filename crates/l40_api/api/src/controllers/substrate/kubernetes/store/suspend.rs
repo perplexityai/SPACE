@@ -78,7 +78,7 @@ impl K8sStore {
         // receipt with it. The stale-claimed sweep decides ownership from
         // slot state rather than the retired compatibility projection.
         let slot_deleted =
-            WarmPoolStore::delete_claimed_slot_for_retired_execution(&mut tx, sandbox_id)
+            WarmPoolStore::delete_claimed_slot_for_retired_execution(&mut *tx, sandbox_id)
                 .await
                 .db_context("failed to delete claimed pool slot")?;
         if slot_deleted {
@@ -420,7 +420,7 @@ impl K8sStore {
         )
         .await
         .db_context("failed to finalize missing suspended pod")?;
-        WarmPoolStore::delete_claimed_slot_for_retired_execution(&mut tx, sandbox_id)
+        WarmPoolStore::delete_claimed_slot_for_retired_execution(&mut *tx, sandbox_id)
             .await
             .db_context("failed to delete claimed pool slot")?;
         tx.commit()

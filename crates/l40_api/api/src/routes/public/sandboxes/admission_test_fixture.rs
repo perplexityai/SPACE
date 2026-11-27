@@ -120,7 +120,7 @@ impl AdmissionPoolFixture {
         .execute(&db.pool)
         .await?;
 
-        let store = WarmPoolStore::new(db.pool.clone());
+        let store = WarmPoolStore::new(pplx_space_postgres_pool::Db::from(db.pool.clone()));
         let template_name = TemplateName::parse(TEMPLATE)?;
         let mut slots = Vec::with_capacity(ready_slots);
         for index in 0..ready_slots {

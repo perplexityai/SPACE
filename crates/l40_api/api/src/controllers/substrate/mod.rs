@@ -821,9 +821,31 @@ pub(crate) fn durable_snapshot_rpc_error(error: tonic::Status) -> DurableSnapsho
 ///
 /// The `warn` lives here so the level tracks the disposition — a bounded lock
 /// wait is the expected outcome of enabling the bound, not a page.
+///
+/// [`substrate_store_db_error`] is the same classification for a converted
+/// store's `DbError`; change the two together.
 pub(crate) fn substrate_db_error(what: &str, error: &sqlx::Error) -> SubstrateError {
     let message = format!("{what}: {error}");
     if pplx_space_postgres_pool::contention::is_lock_contention(error) {
+        // `what` rather than `message`, which already interpolates `error`.
+        tracing::warn!(%error, what, "substrate statement lost a lock race; retryable");
+        return SubstrateError::LockContention { message };
+    }
+    SubstrateError::Failed { message }
+}
+
+/// [`substrate_db_error`] for a converted store's [`DbError`]: the same
+/// message, log line and disposition. `DbError` displays as the driver's error
+/// does, and [`DbError::is_lock_contention`] asks the same question of it.
+///
+/// [`DbError`]: pplx_space_postgres_pool::DbError
+/// [`DbError::is_lock_contention`]: pplx_space_postgres_pool::DbError::is_lock_contention
+pub(crate) fn substrate_store_db_error(
+    what: &str,
+    error: &pplx_space_postgres_pool::DbError,
+) -> SubstrateError {
+    let message = format!("{what}: {error}");
+    if error.is_lock_contention() {
         // `what` rather than `message`, which already interpolates `error`.
         tracing::warn!(%error, what, "substrate statement lost a lock race; retryable");
         return SubstrateError::LockContention { message };
@@ -838,7 +860,7 @@ pub(crate) fn substrate_db_error(what: &str, error: &sqlx::Error) -> SubstrateEr
 /// foreign: the orphan rule permits `impl LocalTrait for ForeignType` in the
 /// crate that owns the trait, which is what makes `.db_context(..)` available
 /// on a database result here. It is implemented only for `sqlx::Error`, the
-/// warm-pool store's `PoolError` (which wraps one) and postgres-pool's
+/// warm-pool store's `PoolError` (which wraps a `DbError`) and postgres-pool's
 /// `DbError` (which converted store verbs return), so reaching for it on a
 /// `kube` or `tonic` result does not compile. The type checker, not review, is
 /// what keeps the classification on database errors. During the store
@@ -878,7 +900,7 @@ impl<T> DbContext<T> for Result<T, pplx_space_postgres_pool::DbError> {
 /// Classify a warm-pool store error.
 ///
 /// `PoolError::Sql` is `#[error(transparent)]`, so routing it through
-/// [`substrate_db_error`] leaves the rendered message unchanged and only moves
+/// [`substrate_store_db_error`] leaves the rendered message unchanged and only moves
 /// the disposition. The other variants are slot-state and parse failures,
 /// which are genuine 500s: a slot that is not `warming` does not become
 /// `warming` on retry.
@@ -891,7 +913,7 @@ impl<T> DbContext<T> for Result<T, pplx_space_postgres_pool::DbError> {
 /// wraps this for them, so the variant split is written once.
 pub(crate) fn pool_error(what: &str, error: &pplx_space_cluster_pool::PoolError) -> SubstrateError {
     match error {
-        pplx_space_cluster_pool::PoolError::Sql(sql) => substrate_db_error(what, sql),
+        pplx_space_cluster_pool::PoolError::Sql(sql) => substrate_store_db_error(what, sql),
         other => SubstrateError::Failed {
             message: format!("{what}: {other}"),
         },

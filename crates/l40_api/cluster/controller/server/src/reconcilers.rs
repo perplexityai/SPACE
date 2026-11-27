@@ -91,7 +91,6 @@ use std::time::Duration;
 use pplx_space_api::controllers::substrate::{NodeApiTarget, Substrate, SubstrateError};
 use pplx_space_api::egress_profiles::EgressProfiles;
 use pplx_space_api::tls_interception_exemptions::TlsInterceptionExemptions;
-use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_cluster_reconciler::{
     TriggerEndpointResolver, TriggerFanoutConfig, TriggerNodeApiTarget, metrics, trigger_fanout,
 };
@@ -592,7 +591,7 @@ pub async fn run_reconcilers(
             let kube = Arc::new(kube.clone());
             let environment_placement = substrate.environment_placement();
             let warm_pool_token = shutdown_token.child_token();
-            let warm_pool_store = WarmPoolStore::new(pool.clone());
+            let warm_pool_pool = pool.clone();
             let warm_pool_kube = kube.k8s.client.clone();
             let warm_pool_cache = crate::warm_pool::WarmPoolKubeCache {
                 pods: crate::warm_pool::PodCache {
@@ -605,7 +604,7 @@ pub async fn run_reconcilers(
                 if let Err(err) = crate::warm_pool::run(
                     warm_pool_kube,
                     warm_pool_cache,
-                    warm_pool_store,
+                    warm_pool_pool,
                     substrate.clone(),
                     warm_pool_token,
                 )

@@ -599,9 +599,11 @@ async fn pool_store_contention_crosses_the_store_boundary() -> pplx_space_test_e
     };
     let sql = pplx_space_db_test_fixtures::raise_sqlstate(&db.pool, "55P03").await;
     let rendered = sql.to_string();
-    let error = Err::<(), _>(pplx_space_cluster_pool::PoolError::Sql(sql))
-        .db_context("failed to delete claimed pool slot")
-        .expect_err("the statement failed");
+    let error = Err::<(), _>(pplx_space_cluster_pool::PoolError::Sql(
+        pplx_space_postgres_pool::DbError::from(sql),
+    ))
+    .db_context("failed to delete claimed pool slot")
+    .expect_err("the statement failed");
     assert!(
         matches!(error, SubstrateError::LockContention { .. }),
         "got {error:?}"

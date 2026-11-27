@@ -34,6 +34,7 @@ use pplx_space_cluster_pool::{
     AutoscaleRun, InvalidPoolConfigRow, NewPoolSlot, PoolConfig, PoolConfigRead, PoolSlot,
     PoolSlotCounts, PoolSlotState, WarmPoolStore,
 };
+use pplx_space_postgres_pool::Db;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_pod::{
     DEFAULT_SANDBOX_PROXY_PORT, NodeGroupPlacement, PodEnvironment, SANDBOX_POOL_ROLE_WARM,
@@ -43,6 +44,7 @@ use pplx_space_sandbox_pod::{
 use pplx_space_sandbox_store::delete::delete_with_dependents;
 use pplx_space_sbx_mgr_client::proto::SpacedWaitReadyRequest;
 use pplx_space_template_model::{TemplateArtifactDigest, TemplateReference};
+use sqlx::PgPool;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::{
     sync::Semaphore,
@@ -170,7 +172,7 @@ impl Config {
 pub(crate) async fn run(
     kube: Client,
     cache: WarmPoolKubeCache,
-    store: WarmPoolStore,
+    pool: PgPool,
     substrate: Arc<Substrate>,
     shutdown_token: CancellationToken,
 ) -> Result<(), WarmPoolError> {
@@ -178,7 +180,7 @@ pub(crate) async fn run(
     let reconciler = Reconciler::new(
         kube,
         cache,
-        store,
+        pool,
         substrate,
         config.namespace,
         config.pod,
@@ -370,6 +372,9 @@ struct Reconciler {
     pod_cache: PodCache,
     node_store: Store<Node>,
     store: WarmPoolStore,
+    /// The pool `store` wraps, for the reads and transactions that still take
+    /// the driver's pool.
+    pool: PgPool,
     substrate: Arc<Substrate>,
     namespace: String,
     pod_config: SandboxPodConfigValues,
@@ -867,19 +872,20 @@ impl Reconciler {
     fn new(
         kube: Client,
         cache: WarmPoolKubeCache,
-        store: WarmPoolStore,
+        pool: PgPool,
         substrate: Arc<Substrate>,
         namespace: String,
         pod_config: SandboxPodConfigValues,
         tuning: ReconcilerTuning,
     ) -> Self {
         let node_group_placement =
-            NodeGroupPlacementResolver::new(store.pool().clone(), pod_config.node_group_placement);
+            NodeGroupPlacementResolver::new(pool.clone(), pod_config.node_group_placement);
         Self {
             kube,
             pod_cache: cache.pods,
             node_store: cache.nodes,
-            store,
+            store: WarmPoolStore::new(Db::from(pool.clone())),
+            pool,
             substrate,
             namespace,
             pod_config,
@@ -2006,7 +2012,7 @@ impl Reconciler {
 
     async fn delete_slot_pod(&self, slot: &PoolSlot) -> Result<bool, WarmPoolError> {
         let mut tx = self
-            .timed_postgres("delete-slot-txn-begin", self.store.pool().begin())
+            .timed_postgres("delete-slot-txn-begin", self.pool.begin())
             .await?;
         if !self
             .timed_postgres(
@@ -2098,7 +2104,7 @@ impl Reconciler {
             },
             || async {
                 let mut tx = self
-                    .timed_postgres("delete-claimed-slot-txn-begin", self.store.pool().begin())
+                    .timed_postgres("delete-claimed-slot-txn-begin", self.pool.begin())
                     .await?;
                 if !self
                     .timed_postgres(
@@ -2135,7 +2141,7 @@ impl Reconciler {
         .await?;
 
         let mut tx = self
-            .timed_postgres("cleanup-pending-txn-begin", self.store.pool().begin())
+            .timed_postgres("cleanup-pending-txn-begin", self.pool.begin())
             .await?;
         if !self
             .timed_postgres(
@@ -2234,7 +2240,7 @@ impl Reconciler {
             self.io_timeouts.postgres(),
             pool_pod_environment(
                 gate,
-                self.store.pool(),
+                &self.pool,
                 config.template_release_id,
                 config.template_name.as_str(),
                 &config.content_hash.to_string(),

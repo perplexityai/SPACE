@@ -1,6 +1,7 @@
 use pplx_space_byte_size::SizeParseError;
 use pplx_space_content_digest::DigestParseError;
 use pplx_space_execution_spec::{ComputeParseError, DiskIoLimitsError};
+use pplx_space_postgres_pool::DbError;
 use pplx_space_template_model::TemplateParseError;
 use uuid::Uuid;
 
@@ -36,15 +37,14 @@ pub enum PoolError {
     #[error(transparent)]
     Size(#[from] SizeParseError),
     #[error(transparent)]
-    Sql(#[from] sqlx::Error),
+    Sql(#[from] DbError),
 }
 
-/// Transition scaffolding: keeps a database error in `PoolError::Sql` while
-/// that variant holds the driver's error. Delete it when `Sql` holds a
-/// `DbError`.
-impl From<pplx_space_postgres_pool::DbError> for PoolError {
-    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
-        Self::from(sqlx::Error::from(error))
+/// Lets a verb's `?` turn the driver's error into this one, losslessly,
+/// through [`DbError`]'s own conversion.
+impl From<sqlx::Error> for PoolError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Sql(DbError::from(error))
     }
 }
 
