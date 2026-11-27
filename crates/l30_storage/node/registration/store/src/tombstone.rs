@@ -13,11 +13,11 @@ use pplx_space_sql_locator::sql;
 /// row cascades. Returns whether the row was deleted. A v2 drain's node is
 /// never deleted here. Run it in the transaction that then records the
 /// node's tombstone ([`record_admin_terminate_tombstone`]), and record one
-/// only when this returns `true`.
-pub async fn delete_terminating_k8s_node(
-    executor: impl Executor<'_>,
-    node_id: NodeId,
-) -> Result<bool, DbError> {
+/// only when this returns `true`. The caller must pass its open transaction.
+pub async fn delete_terminating_k8s_node<C>(tx: &mut C, node_id: NodeId) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let result = sqlx::query(sql!(
         "DELETE FROM nodes
          WHERE id = $1
@@ -27,20 +27,24 @@ pub async fn delete_terminating_k8s_node(
     ))
     .bind(node_id)
     .bind(SubstrateKind::Kubernetes)
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(result.rows_affected() > 0)
 }
 
 /// Tombstone `node_id` with reason `admin-terminate`, now, or re-date and
 /// rewrite its existing tombstone. Run it in the transaction that deletes the
-/// node, so the node is never gone without its tombstone.
-pub async fn record_admin_terminate_tombstone(
-    executor: impl Executor<'_>,
+/// node, so the node is never gone without its tombstone. The caller must
+/// pass its open transaction.
+pub async fn record_admin_terminate_tombstone<C>(
+    tx: &mut C,
     node_id: NodeId,
     k8s_node_name: &str,
     role: &str,
-) -> Result<(), DbError> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "INSERT INTO node_k8s_tombstones (node_id, k8s_node_name, role, reason)
          VALUES ($1, $2, $3, 'admin-terminate')
@@ -53,7 +57,7 @@ pub async fn record_admin_terminate_tombstone(
     .bind(node_id)
     .bind(k8s_node_name)
     .bind(role)
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }

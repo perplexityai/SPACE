@@ -58,19 +58,23 @@ async fn rows(pool: &PgPool, node_id: NodeId) -> TestDbResult<(bool, bool)> {
 async fn delete_terminating_k8s_node_refuses_all_but_a_v1_terminating_row() -> TestDbResult<()> {
     let db = pg_test_db().await?;
     let pool = &db.pool;
+    let mut conn = pool.acquire().await?;
     for (case, phase, engine, managed_by) in [
         ("drained", "drained", None, SubstrateKind::Kubernetes),
         ("v2", "terminating", Some("v2"), SubstrateKind::Kubernetes),
         ("direct", "terminating", None, SubstrateKind::Space),
     ] {
         let node_id = node(pool, phase, engine, managed_by).await?;
-        assert!(!delete_terminating_k8s_node(pool, node_id).await?, "{case}");
+        assert!(
+            !delete_terminating_k8s_node(&mut *conn, node_id).await?,
+            "{case}"
+        );
         assert_eq!(rows(pool, node_id).await?, (true, true), "{case}");
     }
 
     let terminating = node(pool, "terminating", None, SubstrateKind::Kubernetes).await?;
-    assert!(delete_terminating_k8s_node(pool, terminating).await?);
+    assert!(delete_terminating_k8s_node(&mut *conn, terminating).await?);
     assert_eq!(rows(pool, terminating).await?, (false, false));
-    assert!(!delete_terminating_k8s_node(pool, terminating).await?);
+    assert!(!delete_terminating_k8s_node(&mut *conn, terminating).await?);
     Ok(())
 }

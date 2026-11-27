@@ -44,7 +44,8 @@
 //! caller's transaction. The row locks in [`locks`] and
 //! [`direct::lock_admin_node`] take the caller's transaction instead, and
 //! hold until it ends. [`guarded_delete`]'s verbs take the caller's
-//! transaction too, and run under its row lock. Node drain's phase
+//! transaction too, and run under its row lock. [`tombstone`]'s delete and
+//! tombstone write take it too, so they commit together. Node drain's phase
 //! compare-and-sets (the cluster controller's `set_drain_phase`), whose
 //! `WHERE` re-checks the current phase, stay with their caller; the
 //! drained-node terminator's `drained → terminating` flip is
