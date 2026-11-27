@@ -123,7 +123,7 @@ async fn observed_states_name_the_direct_node_and_its_conditions() -> TestDbResu
         Some("cluster")
     );
     assert!(row.observed_network_policy_at.is_some());
-    let conditions = &row.network_policy_conditions.0;
+    let conditions = &row.network_policy_conditions;
     assert_eq!(conditions.len(), 1);
     assert_eq!(
         NetworkPolicyCondition {
@@ -164,7 +164,7 @@ async fn observed_only_lists_rowless_unknown_observations_newest_first() -> Test
     assert!(
         rows.iter()
             .all(|row| row.node_name.as_deref() == Some("worker-b")
-                && row.network_policy_conditions.0.is_empty())
+                && row.network_policy_conditions.is_empty())
     );
     Ok(())
 }

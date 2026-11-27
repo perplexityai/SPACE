@@ -206,7 +206,7 @@ pub(super) fn network_policy_status_for(
     };
     let mut conditions = vec![computed_condition];
     if let Some(observed) = observed {
-        for condition in &observed.network_policy_conditions.0 {
+        for condition in &observed.network_policy_conditions {
             if !conditions
                 .iter()
                 .any(|existing| existing.condition_type == condition.condition_type)
@@ -220,7 +220,7 @@ pub(super) fn network_policy_status_for(
     Some(NetworkPolicyStatus {
         observed_network_policy: observed
             .and_then(|state| state.observed_network_policy.as_ref())
-            .map(|policy| policy.0.clone()),
+            .cloned(),
         observed_generation,
         observed_source,
         observed_authority,

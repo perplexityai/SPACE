@@ -25,7 +25,6 @@ use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use serde::de::DeserializeOwned;
 use sqlx::FromRow;
-use sqlx::types::Json;
 
 pub mod direct;
 mod publish;
@@ -52,7 +51,8 @@ pub struct NodeTemplateBuild<Snapshots> {
     pub disk_size_mb: Option<i32>,
     pub runtime: Option<String>,
     pub arch: Option<String>,
-    pub snapshots: Json<Snapshots>,
+    #[sqlx(json)]
+    pub snapshots: Snapshots,
 }
 
 /// The builds `node_id` caches, by template name then content hash.

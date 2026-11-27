@@ -16,7 +16,7 @@ use crate::observed_states::ObservedSpacedVersion;
 mod tests;
 
 /// One `sandbox_observed_states` row as the api's responses read it.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub struct ObservedStateRow {
     pub sandbox_id: SandboxId,
     pub node_id: Option<NodeId>,
@@ -27,7 +27,6 @@ pub struct ObservedStateRow {
     pub substrate_node_id: Option<String>,
     pub template: Option<String>,
     pub status: Option<String>,
-    #[sqlx(flatten)]
     pub version: ObservedSpacedVersion,
     pub pid: Option<i32>,
     pub namespace: Option<String>,
@@ -41,13 +40,81 @@ pub struct ObservedStateRow {
     pub observed_created_at: Option<String>,
     pub observed_at: time::OffsetDateTime,
     pub release_tags: Vec<String>,
-    pub observed_network_policy: Option<Json<NetworkPolicy>>,
+    pub observed_network_policy: Option<NetworkPolicy>,
     pub observed_network_policy_generation: Option<i64>,
     pub observed_network_policy_source: Option<String>,
     pub observed_network_policy_authority: Option<String>,
     pub observed_network_policy_at: Option<time::OffsetDateTime>,
     /// Built by the statement from `node_facet_conditions`.
-    pub network_policy_conditions: Json<Vec<NetworkPolicyCondition>>,
+    pub network_policy_conditions: Vec<NetworkPolicyCondition>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ObservedStateDbRow {
+    sandbox_id: SandboxId,
+    node_id: Option<NodeId>,
+    node_name: Option<String>,
+    node_role: Option<String>,
+    node_managed_by: Option<String>,
+    node_api_endpoint: Option<String>,
+    substrate_node_id: Option<String>,
+    template: Option<String>,
+    status: Option<String>,
+    #[sqlx(flatten)]
+    version: ObservedSpacedVersion,
+    pid: Option<i32>,
+    namespace: Option<String>,
+    uptime: Option<String>,
+    sandbox_owner: Option<String>,
+    image_hash: Option<String>,
+    snapshots_enabled: bool,
+    disk_usage_bytes: Option<i64>,
+    pool_template: Option<String>,
+    failure_reason: Option<String>,
+    observed_created_at: Option<String>,
+    observed_at: time::OffsetDateTime,
+    release_tags: Vec<String>,
+    observed_network_policy: Option<Json<NetworkPolicy>>,
+    observed_network_policy_generation: Option<i64>,
+    observed_network_policy_source: Option<String>,
+    observed_network_policy_authority: Option<String>,
+    observed_network_policy_at: Option<time::OffsetDateTime>,
+    network_policy_conditions: Json<Vec<NetworkPolicyCondition>>,
+}
+
+impl From<ObservedStateDbRow> for ObservedStateRow {
+    fn from(row: ObservedStateDbRow) -> Self {
+        Self {
+            sandbox_id: row.sandbox_id,
+            node_id: row.node_id,
+            node_name: row.node_name,
+            node_role: row.node_role,
+            node_managed_by: row.node_managed_by,
+            node_api_endpoint: row.node_api_endpoint,
+            substrate_node_id: row.substrate_node_id,
+            template: row.template,
+            status: row.status,
+            version: row.version,
+            pid: row.pid,
+            namespace: row.namespace,
+            uptime: row.uptime,
+            sandbox_owner: row.sandbox_owner,
+            image_hash: row.image_hash,
+            snapshots_enabled: row.snapshots_enabled,
+            disk_usage_bytes: row.disk_usage_bytes,
+            pool_template: row.pool_template,
+            failure_reason: row.failure_reason,
+            observed_created_at: row.observed_created_at,
+            observed_at: row.observed_at,
+            release_tags: row.release_tags,
+            observed_network_policy: row.observed_network_policy.map(|json| json.0),
+            observed_network_policy_generation: row.observed_network_policy_generation,
+            observed_network_policy_source: row.observed_network_policy_source,
+            observed_network_policy_authority: row.observed_network_policy_authority,
+            observed_network_policy_at: row.observed_network_policy_at,
+            network_policy_conditions: row.network_policy_conditions.0,
+        }
+    }
 }
 
 /// The observed states of `ids`, in no particular order. The
@@ -58,7 +125,7 @@ pub async fn observed_states(
     ids: &[SandboxId],
     network_policy_facet: &str,
 ) -> Result<Vec<ObservedStateRow>, DbError> {
-    Ok(sqlx::query_as::<_, ObservedStateRow>(
+    let rows = sqlx::query_as::<_, ObservedStateDbRow>(
         sql!("SELECT sos.sandbox_id,
                 sos.node_id,
                 COALESCE(observed_direct.name, observed_k8s.k8s_node_name) AS node_name,
@@ -137,7 +204,8 @@ pub async fn observed_states(
     .bind(ids)
     .bind(network_policy_facet)
     .fetch_all(executor.into_sqlx())
-    .await?)
+    .await?;
+    Ok(rows.into_iter().map(ObservedStateRow::from).collect())
 }
 
 /// The observed states whose sandbox has no `sandboxes` row and is not
@@ -148,7 +216,7 @@ pub async fn observed_only(
     known_ids: &[SandboxId],
     network_policy_facet: &str,
 ) -> Result<Vec<ObservedStateRow>, DbError> {
-    Ok(sqlx::query_as::<_, ObservedStateRow>(
+    let rows = sqlx::query_as::<_, ObservedStateDbRow>(
         sql!("SELECT sos.sandbox_id,
                 sos.node_id,
                 COALESCE(observed_direct.name, observed_k8s.k8s_node_name) AS node_name,
@@ -229,5 +297,6 @@ pub async fn observed_only(
     .bind(known_ids)
     .bind(network_policy_facet)
     .fetch_all(executor.into_sqlx())
-    .await?)
+    .await?;
+    Ok(rows.into_iter().map(ObservedStateRow::from).collect())
 }

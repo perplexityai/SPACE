@@ -53,7 +53,8 @@ pub enum ReferenceState {
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct Reference {
     pub id: CredentialReferenceId,
-    pub config: Json<Config>,
+    #[sqlx(json)]
+    pub config: Config,
     pub state: ReferenceState,
 }
 

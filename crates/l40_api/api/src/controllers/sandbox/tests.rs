@@ -1662,8 +1662,6 @@ mod response_tests {
     use pplx_space_node_model::NodeManagedBy;
     use pplx_space_sandbox_model::SandboxId;
 
-    use sqlx::types::Json;
-
     fn sandbox_with_network_policy(
         override_policy: Option<NetworkPolicyV1>,
         override_generation: i64,
@@ -1771,7 +1769,7 @@ mod response_tests {
             observed_network_policy_source: Some(source.to_string()),
             observed_network_policy_authority: Some("cluster".to_string()),
             observed_network_policy_at: None,
-            network_policy_conditions: Json(Vec::new()),
+            network_policy_conditions: Vec::new(),
         }
     }
 

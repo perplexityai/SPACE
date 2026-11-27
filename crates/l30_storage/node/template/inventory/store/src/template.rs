@@ -6,7 +6,6 @@ use pplx_space_sql_locator::sql;
 use pplx_space_template_model::{TemplateDesiredState, TemplateName};
 use serde::de::DeserializeOwned;
 use sqlx::FromRow;
-use sqlx::types::Json;
 
 /// The VM shape a node reports a build of a template was built for, each
 /// value as stored.
@@ -22,7 +21,8 @@ pub struct TemplatePoolObserved {
     pub pool_target: Option<i32>,
     pub pool_current: i32,
     pub pool_pending: i32,
-    pub pool_sandbox_ids: Json<Vec<String>>,
+    #[sqlx(json)]
+    pub pool_sandbox_ids: Vec<String>,
 }
 
 /// One cached build variant (template, hash, runtime) of a template, from
@@ -37,7 +37,8 @@ pub struct TemplateVariant<Snapshots> {
     pub artifact_size_bytes: Option<i64>,
     pub has_base_snapshot: bool,
     pub base_snapshot_size_bytes: Option<i64>,
-    pub snapshots: Json<Snapshots>,
+    #[sqlx(json)]
+    pub snapshots: Snapshots,
     pub vcpu: Option<i32>,
     pub memory_mib: Option<i32>,
     pub disk_size_mb: Option<i32>,
