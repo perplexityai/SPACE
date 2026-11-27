@@ -95,18 +95,6 @@ where
     enqueue_triggers_on(tx, &node_ids, reason).await
 }
 
-pub async fn enqueue_triggers_conn(
-    executor: impl Executor<'_>,
-    node_ids: impl IntoIterator<Item = NodeId>,
-    reason: ReconcileReason,
-) -> Result<u64, DbError> {
-    let node_ids = normalized_node_ids(node_ids);
-    if node_ids.is_empty() {
-        return Ok(0);
-    }
-    enqueue_triggers_on(executor, &node_ids, reason).await
-}
-
 fn normalized_node_ids(node_ids: impl IntoIterator<Item = NodeId>) -> Vec<NodeId> {
     let node_ids = node_ids.into_iter().collect::<BTreeSet<_>>();
     node_ids.into_iter().collect::<Vec<_>>()

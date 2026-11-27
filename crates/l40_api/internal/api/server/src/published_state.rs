@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::metadata::artifact_kind_from_proto;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_cluster_trigger_queue::{
-    QueuedRefConflict, enqueue_triggers_conn, queue_node_reconcile_refs,
+    QueuedRefConflict, enqueue_triggers_tx, queue_node_reconcile_refs,
 };
 use pplx_space_cpu_arch::Arch;
 use pplx_space_events::{
@@ -750,7 +750,7 @@ async fn queue_policy_reconcile_refs_for_new_inventory(
             Status::internal(format!("enqueue first-seen inventory reconcile: {err}"))
         })?;
 
-    enqueue_triggers_conn(conn, [node_id], trigger_reason)
+    enqueue_triggers_tx(&mut *conn, [node_id], trigger_reason)
         .await
         .map_err(|err| Status::internal(format!("enqueue first-seen inventory trigger: {err}")))?;
 
