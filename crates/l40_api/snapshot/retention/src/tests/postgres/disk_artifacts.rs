@@ -87,7 +87,7 @@ async fn sweep_keeps_pinned_and_young_disk_rows_and_prunes_the_superseded_ones()
     policy.min_age = Some(std::time::Duration::from_secs(3600));
     let mut reconciler = Reconciler::new(
         policy,
-        SnapshotRetentionDbStore::new(pool.clone()),
+        SnapshotRetentionDbStore::new(Db::from(pool.clone())),
         registry_with(backend.clone()),
     );
     let report = reconciler.tick().await;
@@ -111,7 +111,7 @@ async fn sweep_keeps_pinned_and_young_disk_rows_and_prunes_the_superseded_ones()
             "disk row {kept} must survive the sweep"
         );
     }
-    let store = SnapshotRetentionDbStore::new(pool.clone());
+    let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
     for id in pinned {
         assert_eq!(
             store.claim_prune(id, 5).await?,
@@ -151,7 +151,7 @@ async fn restoring_stopped_evacuation_keeps_its_pinned_disk_source() -> TestResu
     .await?;
     let after = insert_unpinned_stop_disk(pool, sandbox, 900).await?;
 
-    let store = SnapshotRetentionDbStore::new(pool.clone());
+    let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
     assert_eq!(
         candidate_ids(&store, 1).await?,
         vec![before, after],
@@ -203,7 +203,7 @@ async fn named_fork_and_markerless_disk_rows_stay_unswept() -> TestResult {
     let markerless = insert_snapshot(pool, sandbox, "disk", "ready", 8000).await?;
     let stop = insert_unpinned_stop_disk(pool, sandbox, 7500).await?;
 
-    let store = SnapshotRetentionDbStore::new(pool.clone());
+    let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
     assert_eq!(
         candidate_ids(&store, 1).await?,
         vec![stop],
@@ -240,7 +240,7 @@ async fn full_keep_n_is_unchanged_by_disk_rows() -> TestResult {
         disk.push(insert_unpinned_stop_disk(pool, sandbox, age).await?);
     }
 
-    let store = SnapshotRetentionDbStore::new(pool.clone());
+    let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
     assert_eq!(candidate_ids(&store, 2).await?, disk);
     for id in full {
         assert_eq!(
@@ -280,7 +280,7 @@ async fn a_claimed_disk_row_pages_through_recovery() -> TestResult {
         .await?;
     insert_unpinned_stop_disk(pool, sandbox, 100).await?;
 
-    let store = SnapshotRetentionDbStore::new(pool.clone());
+    let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
     let epoch = store
         .claimed_scan_epoch()
         .await?

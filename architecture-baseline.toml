@@ -79,9 +79,6 @@ pplx-space-node-runtime-manager = [
   "aws-sdk-s3",
   "pplx-space-s3-http-client",
 ]
-pplx-space-snapshot-retention = [
-  "sqlx",
-]
 pplx-space-template-publisher = [
   "pplx-space-object-store",
 ]

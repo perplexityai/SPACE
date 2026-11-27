@@ -8487,6 +8487,7 @@ dependencies = [
  "pplx-space-events",
  "pplx-space-metrics-emit",
  "pplx-space-observability",
+ "pplx-space-postgres-pool",
  "pplx-space-sandbox-model",
  "pplx-space-sandbox-store",
  "pplx-space-snapshot-model",

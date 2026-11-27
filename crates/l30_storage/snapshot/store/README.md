@@ -137,12 +137,17 @@ orphan storage locations and deletes one that is still an orphan, for the
 storage sweeper.
 `quarantine_recovery` holds the recovery plan's two snapshot lookups and the
 `FOR SHARE` locks publication recovery takes on the snapshot and its location.
-`retention` holds retention's discovery read and the locks and re-checks its
-claim and finalize take: the snapshot `FOR UPDATE` locks, the usable location
-lock, the claim's safety re-check, and finalize's keep-N floor re-check.
+`retention` holds retention's discovery read, the locks and re-checks its
+claim and finalize take, and the claim's guarded write: the snapshot
+`FOR UPDATE` locks, the usable location lock, the claim's safety re-check,
+its `ready -> deleting` update (`claim`), and finalize's keep-N floor
+re-check.
 
-Add further typed CRUD incrementally with each migrated caller. Add
-claim/prune with its live retention workflow, after the workflow has a
-complete protection matrix for restore, fork, lifecycle, publication, the
-zero-or-one location invariant, encryption, and recovery; until then the
-claim's `ready -> deleting` update stays in the retention workflow.
+Add further typed CRUD incrementally with each migrated caller. The store
+holds no composite claim or prune operation: the retention workflow keeps
+the claim's and finalize's transactions, the order of their locks and
+re-checks, and what each outcome means, and calls `retention::claim` for the
+claim's `ready -> deleting` update. Move that orchestration into the store
+only after the workflow has a complete protection matrix for restore, fork,
+lifecycle, publication, the zero-or-one location invariant, encryption, and
+recovery.
