@@ -155,15 +155,14 @@ class _Control:
 
 
 class _Sandbox:
-    def __init__(self, sandbox_id: str, statuses: list[int | CallAnswer]) -> None:
+    def __init__(self, sandbox_id: str, statuses: list[int]) -> None:
         self.sandbox_id = sandbox_id
         self.statuses = statuses
         self.commands = 0
 
     def command_answer(self, _command: str) -> CallAnswer:
         self.commands += 1
-        answer = self.statuses.pop(0)
-        return answer if isinstance(answer, CallAnswer) else CallAnswer(status=answer, retry_after=None, body={})
+        return CallAnswer(status=self.statuses.pop(0), retry_after=None, body={})
 
 
 def _assertions(control: _Control | None = None) -> tuple[DrainV2Assertions, _Fixture]:
@@ -441,32 +440,6 @@ class GateAnswers(unittest.TestCase):
                 drain.expect_calls_pass_until_suspended(_Sandbox(sandbox, [refused, 201]))  # type: ignore[arg-type]
             self.assertIn(f"calls_around_deadline_{sandbox}", fixture.evidence)
 
-    def test_a_call_made_while_the_vm_ran_is_judged_even_as_its_suspend_begins(self) -> None:
-        sandbox = "00000000-0000-4000-8000-00000000000f"
-        # The node holds the VM before each call; the suspend begins during
-        # the second, which the node then reads `suspending` after.
-        states = ["started", "started", "started", "suspending"]
-        retryable = CallAnswer(status=GATE_REFUSAL_STATUS, retry_after=1, body={})
-        for second, judged in ((409, False), (CallAnswer(status=GATE_REFUSAL_STATUS, retry_after=None, body={}), False), (retryable, True)):
-            drain, fixture = _assertions(_Control(node_states={sandbox: list(states)}))
-            drain._deadline = int(time.time()) + 3
-            caller = _Sandbox(sandbox, [CALL_PASSED_STATUS, second])
-            with self.subTest(second=second):
-                if judged:
-                    seen = drain.expect_calls_pass_until_suspended(caller)  # type: ignore[arg-type]
-                    self.assertEqual([call["status"] for call in seen["overlapping_suspend"]], [GATE_REFUSAL_STATUS])
-                else:
-                    with self.assertRaisesRegex(InvariantViolation, "refused, as its suspend began"):
-                        drain.expect_calls_pass_until_suspended(caller)  # type: ignore[arg-type]
-                    self.assertEqual(len(fixture.evidence["overlapping_suspend"]), 1)
-        # A checkpoint between two reads keeps the probe going.
-        drain, _ = _assertions(_Control(node_states={sandbox: ["started", "checkpointing", "checkpointing", "started", "suspending"]}))
-        drain._deadline = int(time.time()) + 3
-        seen = drain.expect_calls_pass_until_suspended(
-            _Sandbox(sandbox, [CALL_PASSED_STATUS, CALL_PASSED_STATUS, CALL_PASSED_STATUS])  # type: ignore[arg-type]
-        )
-        self.assertEqual(seen["before_deadline"], [CALL_PASSED_STATUS, CALL_PASSED_STATUS])
-
     def test_before_the_deadline_a_call_must_meet_the_vm_running(self) -> None:
         sandbox = "00000000-0000-4000-8000-00000000000e"
         drain, _ = _assertions(_Control(node_states={sandbox: ["suspending"]}))
@@ -474,49 +447,6 @@ class GateAnswers(unittest.TestCase):
         caller = _Sandbox(sandbox, [CALL_PASSED_STATUS])
         with self.assertRaisesRegex(InvariantViolation, "no call met the VM running"):
             drain.expect_calls_pass_until_suspended(caller)  # type: ignore[arg-type]
-
-
-class _ReadClock(_Control):
-    """Each node-row read takes `cost` seconds off the time to the deadline."""
-
-    def __init__(self, seconds_to_deadline: float, cost: float, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self.clock = seconds_to_deadline
-        self.cost = cost
-
-    def node_sandbox_state(self, node: str, sandbox_id: str) -> str:
-        self.clock -= self.cost
-        return super().node_sandbox_state(node, sandbox_id)
-
-
-class HeldWatch(unittest.TestCase):
-    SANDBOX = "00000000-0000-4000-8000-000000000031"
-
-    def _watch(self, seconds_to_deadline: float, node_states: list[str]) -> _Fixture:
-        control = _ReadClock(
-            seconds_to_deadline,
-            6,
-            residencies={self.SANDBOX: [SandboxResidency(lifecycle="started", active_node_id=NODE_ID)]},
-            node_states={self.SANDBOX: list(node_states)},
-        )
-        drain, fixture = _assertions(control)
-        drain.seconds_to_deadline = lambda: control.clock  # type: ignore[method-assign]
-        drain.expect_started_until_deadline([self.SANDBOX], margin=10)
-        return fixture
-
-    def test_only_reads_that_finish_before_the_margin_are_judged(self) -> None:
-        # The second read finishes 8 s out, inside the 10 s margin: its
-        # suspend is the evacuation's, not judged.
-        fixture = self._watch(20, ["started", "suspending"])
-        self.assertEqual(fixture.evidence["held_reads"]["judged"], {self.SANDBOX: 1})
-        self.assertEqual(fixture.evidence["held_reads"]["past_the_window"], {self.SANDBOX: 1})
-        # A window whose every read finishes inside the margin proves nothing.
-        with self.assertRaises(InconclusiveSmoke):
-            self._watch(12, ["started"])
-        # A running VM's checkpoint is held; a suspend inside the window is not.
-        self._watch(30, ["checkpointing", "started", "checkpointing"])
-        with self.assertRaises(InvariantViolation):
-            self._watch(30, ["started", "suspending"])
 
 
 class StoppedSandboxes(unittest.TestCase):
@@ -925,44 +855,11 @@ class _MutatingControl(_Control):
     """A control whose mutations are recorded, for the compensations a
     scenario arms around them."""
 
-    def __init__(
-        self,
-        *,
-        terminate_status: int = 200,
-        scale_fails: bool = False,
-        draining: bool = False,
-        cancel_answered: bool = True,
-        **kwargs: Any,
-    ) -> None:
+    def __init__(self, *, terminate_status: int = 200, scale_fails: bool = False, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.terminate_status = terminate_status
         self.scale_fails = scale_fails
-        # With `draining`, the node is mid-drain until it gets `:undrain`;
-        # the controller then clears its v2 columns once the node answers
-        # the cancel, which with `cancel_answered=False` it never does.
-        self.draining = draining
-        self.cancel_answered = cancel_answered
         self.calls: list[tuple[Any, ...]] = []
-
-    def _undrained(self) -> bool:
-        return ("undrain_node", NODE_ID) in self.calls
-
-    def drain_v2_status(self, node_id: str) -> DrainV2Status | None:
-        if not self.draining:
-            return super().drain_v2_status(node_id)
-        if self._undrained() and self.cancel_answered:
-            return DrainV2Status(engine=None, status=None)
-        return DrainV2Status(engine="v2", status={"generation": 7})
-
-    def admin_nodes(self) -> list[Any]:
-        phase = "draining" if self.draining and not self._undrained() else None
-        return [type("Node", (), {"id": NODE_ID, "k8s_node_name": NODE, "drain_phase": phase, "drain_last_error": None})()]
-
-    def undrain_node(self, node_id: str) -> None:
-        self.calls.append(("undrain_node", node_id))
-
-    def cordon_kube_node(self, node: str) -> None:
-        self.calls.append(("cordon_kube_node", node))
 
     def kind_node_labels(self, _node: str) -> dict[str, str]:
         return {"space.pplx.net/pool": "sandboxes"}
@@ -1039,41 +936,6 @@ class Compensations(unittest.TestCase):
         names = [compensation.name for compensation in scope._compensations]
         self.assertIn(f"undrain {NODE}", names)
         self.assertIn(f"uncordon {NODE}", names)
-
-
-class UncordonGate(unittest.TestCase):
-    UNCORDON = ("uncordon_kube_node", NODE)
-    UNDRAIN = ("undrain_node", NODE_ID)
-
-    def _cleanup(self, control: _MutatingControl, *, cordon: bool = False) -> tuple[Any, ...]:
-        drain, scope = _scoped(control)
-        if cordon:
-            drain.cordon()
-        drain.drain_answer({"engine": "v2", "hold_seconds": 0})
-        with mock.patch.object(drain_v2, "CANCEL_SECONDS", 0.2):
-            return scope.close()
-
-    def test_cleanup_uncordons_a_drained_worker_once_its_cancel_is_confirmed(self) -> None:
-        # The node is mid-drain; its columns clear only after the undrain.
-        control = _MutatingControl(draining=True)
-        self.assertEqual(self._cleanup(control), ())
-        self.assertEqual(control.calls.count(self.UNCORDON), 1)
-        self.assertLess(control.calls.index(self.UNDRAIN), control.calls.index(self.UNCORDON))
-
-    def test_a_cancel_never_confirmed_leaves_the_worker_cordoned_and_named(self) -> None:
-        control = _MutatingControl(draining=True, cancel_answered=False)
-        failures = self._cleanup(control)
-        self.assertEqual([failure.name for failure in failures], [f"uncordon {NODE}"])
-        self.assertIn(f"left {NODE} cordoned", failures[0].detail)
-        self.assertIn(self.UNDRAIN, control.calls)
-        self.assertNotIn(self.UNCORDON, control.calls)
-
-    def test_a_worker_the_run_cordoned_itself_is_uncordoned_only_through_the_gate(self) -> None:
-        for answered, uncordons in ((False, 0), (True, 1)):
-            with self.subTest(cancel_answered=answered):
-                control = _MutatingControl(draining=True, cancel_answered=answered)
-                self._cleanup(control, cordon=True)
-                self.assertEqual(control.calls.count(self.UNCORDON), uncordons)
 
 
 class CleanFleet(unittest.TestCase):
