@@ -162,7 +162,9 @@ async fn insert_audit_event(
 }
 
 async fn audit_event_count(pool: &PgPool) -> Result<i64, sqlx::Error> {
-    pplx_space_admin_audit_store::count(pool).await
+    pplx_space_admin_audit_store::count(pool)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 async fn audit_path_exists(pool: &PgPool, path: &str) -> Result<bool, sqlx::Error> {
