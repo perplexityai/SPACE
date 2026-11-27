@@ -1,5 +1,7 @@
 //! `SubstrateAdapter` implementation for `KubernetesSubstrate`.
 
+use super::super::pod_ops::{MaterializeError, UpgradePod};
+use super::super::pod_runtime_upgrade::{MissingPod, PodUpgradeFailure, settled_pod_is_recorded};
 use super::pooled::PooledPodEnvironment;
 use super::*;
 use crate::controllers::substrate::runtime_upgrade::UpgradeActivation;
@@ -967,8 +969,10 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 .await;
         }
         // A stopped sandbox boots under the environment it last ran under
-        // unless the policy moves it. Decided before admission is charged or
-        // a pod exists, so a stranded sandbox costs nothing and places nothing.
+        // unless the policy moves it, in which case its pod boots it through
+        // the runtime upgrade (`pod_runtime_upgrade.rs`). Decided before
+        // admission is charged or a pod exists, so a stranded sandbox costs
+        // nothing and places nothing.
         let runtime_upgrade = if normalize_lifecycle(&sandbox.lifecycle) == "stopped" {
             self.activation_runtime_upgrade(sandbox_id, UpgradeActivation::Start, None)
                 .await?
@@ -1035,22 +1039,32 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         None,
                         Some(activation_assignment.clone()),
                     )
-                    .with_charge(&charge),
+                    .with_charge(&charge)
+                    .upgrading_runtime(runtime_upgrade.clone()),
                 ),
             )
             .await
             {
                 Ok(()) => (activation_assignment.assigned_or_requested(), None),
-                Err(SubstrateError::ActivationInFlight {
-                    same_target: true,
-                    owner_attempt_id,
+                Err(MaterializeError {
+                    error:
+                        SubstrateError::ActivationInFlight {
+                            same_target: true,
+                            owner_attempt_id,
+                            ..
+                        },
                     ..
                 }) => (requested_attempt_id, Some(owner_attempt_id)),
-                Err(error) => {
+                Err(MaterializeError { error, upgrade_pod }) => {
                     // Materialization can acquire ownership before placement
                     // is available. No Wake was dispatched, so a retry must
                     // re-enter recovery instead of joining this abandoned lease.
-                    if let Some((attempt_id, generation)) = activation_assignment.assigned() {
+                    // Unless a pod carrying the upgrade may exist: its shim
+                    // may be running it, so the attempt keeps the execution
+                    // until its lease ends, as for an unsettled upgrade.
+                    if upgrade_pod == UpgradePod::Absent
+                        && let Some((attempt_id, generation)) = activation_assignment.assigned()
+                    {
                         self.store
                             .give_up_activation_attempt_best_effort(
                                 sandbox_id, generation, attempt_id,
@@ -1074,6 +1088,53 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 .owned_attempt_id()
                 .map(|attempt_id| (attempt_id, fence.execution.generation));
             let active_execution = fence.execution;
+            // A start that joined another attempt's claim settles the upgrade
+            // that attempt's pod carries, whatever this replica decided: an
+            // owner on a replica with the flag on renders one this replica
+            // with the flag off doesn't, and an owner that read the policy or
+            // catalog at another moment may render another. The Wake needs
+            // the execution's recorded pod, so an owner's pod that isn't
+            // created yet can't be woken either way.
+            let runtime_upgrade = if joined_attempt_id.is_some() {
+                self.carried_runtime_upgrade(
+                    sandbox_id,
+                    &active_execution.pod_name,
+                    runtime_upgrade.as_ref(),
+                )
+                .await?
+                .or(runtime_upgrade)
+            } else {
+                runtime_upgrade
+            };
+            // The pod's shim runs the upgrade at container create, and the
+            // Wake below only acknowledges the route it leaves running. Wait
+            // for the node's outcome and the pod's create first: a rollback,
+            // or a pod the node refused, leaves nothing for the Wake to find.
+            // A start that joined another attempt's claim can't see whether
+            // that attempt has sent its pod's create yet, so no pod there
+            // settles nothing for it.
+            if let Some(upgrade) = runtime_upgrade.as_ref() {
+                let settled_pod_uid = self
+                    .settle_pod_runtime_upgrade_for_attempt(
+                        sandbox_id,
+                        &active_execution.pod_name,
+                        if joined_attempt_id.is_some() {
+                            MissingPod::NotCreatedYet
+                        } else {
+                            MissingPod::Gone
+                        },
+                        upgrade,
+                        phase_deadline,
+                        owned_attempt,
+                    )
+                    .await
+                    .map_err(PodUpgradeFailure::into_error)?;
+                settled_pod_is_recorded(
+                    sandbox_id,
+                    settled_pod_uid.as_deref(),
+                    active_execution.pod_uid.as_ref(),
+                )?;
+            }
             let wake_action = activation_wake_action(
                 &active_execution,
                 fence_ownership,
@@ -1152,7 +1213,9 @@ impl SubstrateAdapter for KubernetesSubstrate {
                                 },
                             ),
                             target_state: 0,
-                            runtime_upgrade: runtime_upgrade.clone(),
+                            // Kubernetes boots the upgrade in the pod's shim, which already
+                            // ran it; this Wake carries none.
+                            runtime_upgrade: None,
                         }
                     },
                     emit_wake_requested,

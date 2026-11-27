@@ -54,7 +54,8 @@ async fn a_start_that_meets_a_stale_pod_keeps_the_stopped_sandbox_on_its_node() 
 
     substrate
         .ensure_pod_exists(&sandbox, None, None, None, Default::default())
-        .await?;
+        .await
+        .map_err(|error| error.into_error())?;
 
     let after_conflict: (String, String, bool, Option<NodeId>) = sqlx::query_as(
         "SELECT s.lifecycle, e.state, e.active, s.active_node_id
@@ -79,7 +80,8 @@ async fn a_start_that_meets_a_stale_pod_keeps_the_stopped_sandbox_on_its_node() 
 
     substrate
         .ensure_pod_exists(&sandbox, None, None, None, Default::default())
-        .await?;
+        .await
+        .map_err(|error| error.into_error())?;
 
     let creates = captured_pod_creates
         .lock()

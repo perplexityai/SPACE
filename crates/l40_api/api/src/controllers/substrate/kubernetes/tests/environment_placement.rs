@@ -124,6 +124,7 @@ fn restore() -> PodCreateContext<'static> {
         suspend_restore_source_node: None,
         direct_node_name: None,
         preferred_node_name: None,
+        runtime_upgrade: None,
     })
 }
 
@@ -830,6 +831,7 @@ async fn every_pod_build_path_renders_the_environment() {
             suspend_restore_source_node: Some("source-node"),
             direct_node_name: Some("source-node"),
             preferred_node_name: None,
+            runtime_upgrade: None,
         }),
         PodCreateContext::Restore(RestoreContext::Evacuation {
             stopped_materialization: None,
@@ -1086,7 +1088,8 @@ async fn a_materialized_on_demand_pod_requires_its_release_environment() -> Resu
                 None,
             ),
         )
-        .await?;
+        .await
+        .map_err(|error| error.into_error())?;
 
     let creates = creates.lock().unwrap();
     let [pod] = creates.as_slice() else {
@@ -1133,6 +1136,7 @@ async fn a_cross_node_redrive_successor_requires_its_checkpoint_environment() ->
             SandboxLifecycle::Restoring,
             Some("source-node"),
             Some(URI),
+            None,
             None,
             None,
         )
@@ -1267,6 +1271,7 @@ async fn a_pinned_restore_is_refused_before_its_pod_when_the_source_node_lacks_t
             suspend_restore_source_node: Some(node_name),
             direct_node_name: Some(node_name),
             preferred_node_name: None,
+            runtime_upgrade: None,
         })
     };
 

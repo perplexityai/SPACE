@@ -395,6 +395,7 @@ impl KubernetesSubstrate {
                 suspend_restore_source_node,
                 direct_node_name,
                 preferred_node_name,
+                runtime_upgrade,
             }) => {
                 // Source-aware shortlist, computed at request-build time so
                 // every path that renders a source preference gets it: the
@@ -440,7 +441,7 @@ impl KubernetesSubstrate {
                     restore_node_shortlist,
                     extra_tolerations: &[],
                     extra_required_affinity: None,
-                    runtime_upgrade: None,
+                    runtime_upgrade: runtime_upgrade.map(|upgrade| Box::new(upgrade.rendered())),
                 }
             }
             PodCreateContext::Restore(RestoreContext::Evacuation {
