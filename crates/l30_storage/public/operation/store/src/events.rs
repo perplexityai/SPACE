@@ -14,7 +14,8 @@ pub struct PublicOperationEventRow {
     pub operation_id: Uuid,
     pub sequence: i64,
     pub event_type: String,
-    pub event_json: Json<serde_json::Value>,
+    #[sqlx(json)]
+    pub event_json: serde_json::Value,
     pub created_at: OffsetDateTime,
 }
 
@@ -143,7 +144,7 @@ pub async fn append(
 pub async fn append_to_each(
     executor: impl Executor<'_>,
     operation_ids: &[Uuid],
-    event_jsons: &[Json<serde_json::Value>],
+    event_jsons: &[serde_json::Value],
     event_type: PublicOperationEventType,
 ) -> Result<(), DbError> {
     sqlx::query(sql!(
@@ -160,7 +161,7 @@ pub async fn append_to_each(
          FROM UNNEST($1::UUID[], $2::JSONB[]) AS expired(operation_id, event_json)"
     ))
     .bind(operation_ids)
-    .bind(event_jsons)
+    .bind(event_jsons.iter().map(Json).collect::<Vec<_>>())
     .bind(event_type.as_str())
     .execute(executor.into_sqlx())
     .await?;

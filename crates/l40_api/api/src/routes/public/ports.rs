@@ -269,7 +269,7 @@ async fn find_idempotent_port_response(
             "idempotency key is already bound to an operation",
         ));
     };
-    serde_json::from_value(response_json.0)
+    serde_json::from_value(response_json)
         .map(Some)
         .map_err(|error| {
             tracing::error!(%error, "stored port idempotency response is invalid");

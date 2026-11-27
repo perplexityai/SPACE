@@ -94,7 +94,7 @@ impl PublicOperationStore {
             }
             let stored = row
                 .response_json
-                .map(|Json(value)| serde_json::from_value::<StoredReservation>(value));
+                .map(serde_json::from_value::<StoredReservation>);
             return match stored {
                 Some(Ok(StoredReservation::Completed { response })) => {
                     Ok(ResponseReservation::Completed(response))

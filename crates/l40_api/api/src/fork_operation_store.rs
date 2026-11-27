@@ -188,7 +188,7 @@ impl ForkOperationStore {
             payload_json: candidate_json,
         } in rows
         {
-            let Ok(candidate) = decode_fork_payload(candidate_json.0) else {
+            let Ok(candidate) = decode_fork_payload(candidate_json) else {
                 continue;
             };
             let candidate_id = OperationId::from_uuid(candidate_id);
@@ -258,7 +258,7 @@ impl ForkOperationStore {
         else {
             return Ok(CaptureLeaderObservation::Missing);
         };
-        let leader = decode_fork_payload(leader_json.0)?;
+        let leader = decode_fork_payload(leader_json)?;
         if !capture_leader_matches_source(&leader, expected_generation, expected_lifecycle) {
             return Ok(CaptureLeaderObservation::IncompatibleSource);
         }
