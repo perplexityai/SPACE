@@ -11,6 +11,7 @@ use pplx_space_accounts_store::{
     sessions, users,
 };
 use pplx_space_byok_model::{KekProvider, platform_default_kek_provider};
+use pplx_space_postgres_pool::{DbError, DbErrorKind};
 use pplx_space_sandbox_store::UserSandboxRows;
 use time::OffsetDateTime;
 
@@ -196,14 +197,11 @@ pub(super) enum UserDeleteBlocker {
 impl UserDeleteBlocker {
     /// The blocker named by a foreign-key violation from `DELETE FROM users`,
     /// or `None` for any other database error.
-    fn from_delete_error(error: &sqlx::Error) -> Option<Self> {
-        let sqlx::Error::Database(db) = error else {
-            return None;
-        };
-        if !db.is_foreign_key_violation() {
+    fn from_delete_error(error: &DbError) -> Option<Self> {
+        if error.kind() != DbErrorKind::ForeignKeyViolation {
             return None;
         }
-        match db.constraint()? {
+        match error.constraint()? {
             "sandboxes_user_id_fkey" => Some(Self::Sandboxes),
             "sandbox_archives_user_id_fkey" => Some(Self::ArchivedSandboxes),
             _ => None,
@@ -309,14 +307,11 @@ impl OrgDeleteBlocker {
     /// `DELETE FROM organizations`, or `None` for any other database error.
     /// [`Self::refine`] then tells apart the cases the constraint alone does
     /// not.
-    fn from_delete_error(error: &sqlx::Error) -> Option<Self> {
-        let sqlx::Error::Database(db) = error else {
-            return None;
-        };
-        if !db.is_foreign_key_violation() {
+    fn from_delete_error(error: &DbError) -> Option<Self> {
+        if error.kind() != DbErrorKind::ForeignKeyViolation {
             return None;
         }
-        match db.constraint()? {
+        match error.constraint()? {
             "users_org_id_fkey" => Some(Self::Users),
             "sandboxes_org_id_fkey"
             | "sandbox_encrypted_fields_master_key_id_org_id_fkey"
@@ -646,7 +641,6 @@ pub(super) async fn delete_org(
     let deleted = match organizations::delete_organization(&state.pool, org_id).await {
         Ok(deleted) => deleted,
         Err(error) => {
-            let error = sqlx::Error::from(error);
             return Err(match OrgDeleteBlocker::from_delete_error(&error) {
                 Some(blocker) => {
                     IdentityAdminError::OrgNotEmpty(blocker.refine(&state, org_id).await?)
@@ -781,7 +775,6 @@ pub(super) async fn delete_user(
     let deleted = match users::delete_user(&state.pool, user_id).await {
         Ok(deleted) => deleted,
         Err(error) => {
-            let error = sqlx::Error::from(error);
             return Err(match UserDeleteBlocker::from_delete_error(&error) {
                 Some(blocker) => {
                     IdentityAdminError::StillOwns(blocker.refine(&state, user_id).await?)

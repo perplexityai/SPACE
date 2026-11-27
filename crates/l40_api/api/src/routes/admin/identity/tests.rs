@@ -736,7 +736,7 @@ async fn org_delete_blockers_classify_the_database_constraint() -> pplx_space_te
         .await
         .expect_err("encrypted fields restrict their master key's delete");
     assert_eq!(
-        OrgDeleteBlocker::from_delete_error(&error),
+        OrgDeleteBlocker::from_delete_error(&DbError::from(error)),
         Some(OrgDeleteBlocker::Sandboxes)
     );
     tx.rollback().await?;
@@ -757,7 +757,7 @@ async fn org_delete_blockers_classify_the_database_constraint() -> pplx_space_te
         .await
         .expect_err("volume encryption restricts its master key's delete");
     assert_eq!(
-        OrgDeleteBlocker::from_delete_error(&error),
+        OrgDeleteBlocker::from_delete_error(&DbError::from(error)),
         Some(OrgDeleteBlocker::Sandboxes)
     );
     tx.rollback().await?;
@@ -779,7 +779,7 @@ async fn org_delete_blockers_classify_the_database_constraint() -> pplx_space_te
         .await
         .expect_err("template encrypted fields restrict their master key's delete");
     assert_eq!(
-        OrgDeleteBlocker::from_delete_error(&error),
+        OrgDeleteBlocker::from_delete_error(&DbError::from(error)),
         Some(OrgDeleteBlocker::Templates)
     );
     tx.rollback().await?;
@@ -792,7 +792,7 @@ async fn org_delete_blockers_classify_the_database_constraint() -> pplx_space_te
         .await
         .expect_err("encrypted snapshot storage restricts its master key's delete");
     assert_eq!(
-        OrgDeleteBlocker::from_delete_error(&error),
+        OrgDeleteBlocker::from_delete_error(&DbError::from(error)),
         Some(OrgDeleteBlocker::OrphanedSnapshotStorage)
     );
     tx.rollback().await?;
@@ -834,7 +834,7 @@ async fn org_delete_blockers_classify_the_database_constraint() -> pplx_space_te
         .await
         .expect_err("encrypted template release storage restricts its master key's delete");
     assert_eq!(
-        OrgDeleteBlocker::from_delete_error(&error),
+        OrgDeleteBlocker::from_delete_error(&DbError::from(error)),
         Some(OrgDeleteBlocker::Templates)
     );
     tx.rollback().await?;
@@ -860,7 +860,7 @@ async fn org_delete_blockers_classify_the_database_constraint() -> pplx_space_te
         .await
         .expect_err("the managing organization cannot be deleted");
     assert_eq!(
-        OrgDeleteBlocker::from_delete_error(&error),
+        OrgDeleteBlocker::from_delete_error(&DbError::from(error)),
         Some(OrgDeleteBlocker::ManagesCluster)
     );
     tx.rollback().await?;
