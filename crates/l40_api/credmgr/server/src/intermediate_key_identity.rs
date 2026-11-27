@@ -21,6 +21,7 @@ use pplx_space_federated_grant_store::{
     live_federated_grant_prefer_sandbox,
 };
 use pplx_space_federated_identity::FEDERATED_OWNER_GRANT_PURPOSE;
+use pplx_space_postgres_pool::{Db, DbError};
 use pplx_space_sandbox_model::SandboxId;
 
 /// `organizations.owner_source` for an org whose identity came from a trusted upstream client.
@@ -77,7 +78,7 @@ pub enum IdentityLookupError {
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityLookupUnavailable {
     #[error("organization identity query failed: {0}")]
-    OrganizationQuery(#[source] sqlx::Error),
+    OrganizationQuery(#[source] DbError),
     #[error(transparent)]
     FederatedGrant(#[from] FreshestLiveFederatedGrantError),
 }
@@ -126,12 +127,12 @@ impl IntermediateKeyIdentityLookup for SpaceIntermediateKeyIdentity {
 
 /// Reads the org's owner identity and its freshest live grant from Postgres.
 pub struct PgIntermediateKeyIdentityLookup {
-    pool: sqlx::PgPool,
+    pool: Db,
     grant_audience: FederatedGrantAudience,
 }
 
 impl PgIntermediateKeyIdentityLookup {
-    pub fn new(pool: sqlx::PgPool, grant_audience: FederatedGrantAudience) -> Self {
+    pub fn new(pool: Db, grant_audience: FederatedGrantAudience) -> Self {
         Self {
             pool,
             grant_audience,
@@ -147,7 +148,7 @@ impl PgIntermediateKeyIdentityLookup {
             .map_err(|error| {
                 IdentityLookupError::unavailable(
                     org,
-                    IdentityLookupUnavailable::OrganizationQuery(sqlx::Error::from(error)),
+                    IdentityLookupUnavailable::OrganizationQuery(error),
                 )
             })?;
 

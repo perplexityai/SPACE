@@ -3,6 +3,7 @@ use async_trait::async_trait;
 pub(super) use pplx_space_credential_injection_store::resolution::{
     NetworkPolicyResolutionCandidate, ResolutionState, ResolutionStateError,
 };
+use pplx_space_postgres_pool::Db;
 use pplx_space_sandbox_model::SandboxId;
 
 /// Internal state seam used by the authority and its tests.
@@ -17,11 +18,11 @@ pub(super) trait ResolutionStateReader: Send + Sync + 'static {
 }
 
 pub(super) struct PgResolutionStateReader {
-    pool: sqlx::PgPool,
+    pool: Db,
 }
 
 impl PgResolutionStateReader {
-    pub(super) fn new(pool: sqlx::PgPool) -> Self {
+    pub(super) fn new(pool: Db) -> Self {
         Self { pool }
     }
 }

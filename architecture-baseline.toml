@@ -69,9 +69,6 @@ pplx-space-build-mgr = [
 pplx-space-cluster-controller-server = [
   "sqlx",
 ]
-pplx-space-credmgr = [
-  "sqlx",
-]
 pplx-space-internal-api-server = [
   "sqlx",
 ]

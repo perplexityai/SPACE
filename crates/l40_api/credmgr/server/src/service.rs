@@ -16,7 +16,7 @@ use pplx_space_accounts::OrgId;
 use pplx_space_byok_model::{KekProvider, MasterKeyIdentifier, volume_wrap_aad};
 use pplx_space_host_layout::paths;
 use pplx_space_host_layout::{identities::user_names, identities::users};
-use pplx_space_postgres_pool::contention;
+use pplx_space_postgres_pool::{Db, DbError};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_uds_peer_auth::{
     ContentAddressedInstalls, PeerProcessCheckMode, UdsPeerAccount, UdsPeerAuthorizer,
@@ -153,7 +153,7 @@ pub struct CredentialManagerService {
     /// node-local instances refuse those RPCs with FAILED_PRECONDITION.
     kek_store: Option<Arc<dyn KekStore>>,
     /// Shared authority pool used for TCP caller node-registration checks.
-    pub(crate) database_pool: Option<sqlx::PgPool>,
+    pub(crate) database_pool: Option<Db>,
     /// Sandbox-owner reads for volume encryption.
     /// Present only on instances with database access.
     credential_store: Option<Arc<dyn CredentialStore>>,
@@ -1071,8 +1071,8 @@ fn dek_array(mut plaintext_dek: Vec<u8>) -> Result<zeroize::Zeroizing<[u8; 32]>,
 ///
 /// `warn`, not `error`: a bounded lock wait is the expected outcome of enabling
 /// the bound, and the callers below skip their own `error!` when this answers.
-fn contention_status(what: &'static str, error: &sqlx::Error) -> Option<Status> {
-    if !contention::is_lock_contention(error) {
+fn contention_status(what: &'static str, error: &DbError) -> Option<Status> {
+    if !error.is_lock_contention() {
         return None;
     }
     tracing::warn!(what, error = %error, "credmgr statement lost a lock race; retryable");
@@ -1100,8 +1100,9 @@ fn kek_store_error_to_status(e: KekStoreError) -> Status {
 }
 
 fn volume_wrap_store_error_to_status(e: crate::volume_wrap_store::VolumeWrapStoreError) -> Status {
-    let crate::volume_wrap_store::VolumeWrapStoreError::Query(error) = &e;
-    if let Some(contended) = contention_status("sandbox volume wrap lookup", error) {
+    if let crate::volume_wrap_store::VolumeWrapStoreError::Query(error) = &e
+        && let Some(contended) = contention_status("sandbox volume wrap lookup", error)
+    {
         return contended;
     }
     tracing::error!(error = %e, "sandbox volume wrap lookup failed");

@@ -66,7 +66,6 @@ rand = { workspace = true }
 rcgen = { workspace = true, features = ["aws_lc_rs", "pem", "x509-parser"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-sqlx = { workspace = true, features = ["derive", "postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid"] }
 subtle = { workspace = true }
 thiserror = { workspace = true }
 # rcgen states certificate validity in `time::OffsetDateTime`; x509-parser hands
@@ -138,6 +137,7 @@ pplx-space-test-env = { workspace = true }
 pplx-space-test-hooks = { workspace = true, features = ["test-hooks"] }
 prost-types = { workspace = true }
 rstest = { workspace = true }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 tonic-health = { workspace = true }

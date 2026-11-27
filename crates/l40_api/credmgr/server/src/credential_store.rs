@@ -2,6 +2,7 @@
 //! the read-only `space_credmgr` role.
 
 use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_postgres_pool::{Db, DbError};
 use pplx_space_sandbox_model::SandboxId;
 
 /// The owner identity a sandbox's credentials are resolved against.
@@ -19,13 +20,7 @@ pub struct SandboxOwner {
 #[derive(Debug, thiserror::Error)]
 pub enum CredentialStoreError {
     #[error("credential query failed: {0}")]
-    Query(#[from] sqlx::Error),
-}
-
-impl From<pplx_space_postgres_pool::DbError> for CredentialStoreError {
-    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
-        Self::from(sqlx::Error::from(error))
-    }
+    Query(#[from] DbError),
 }
 
 /// Sandbox-owner lookup. A trait so the handlers can be exercised without a
@@ -41,11 +36,11 @@ pub trait CredentialStore: Send + Sync + 'static {
 }
 
 pub struct PgCredentialStore {
-    pool: sqlx::PgPool,
+    pool: Db,
 }
 
 impl PgCredentialStore {
-    pub fn new(pool: sqlx::PgPool) -> Self {
+    pub fn new(pool: Db) -> Self {
         Self { pool }
     }
 }

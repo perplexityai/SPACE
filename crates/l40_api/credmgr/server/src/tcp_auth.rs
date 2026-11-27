@@ -27,6 +27,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use pplx_space_postgres_pool::Db;
 use subtle::ConstantTimeEq;
 use tonic::Status;
 use tower::{Layer, Service};
@@ -111,7 +112,7 @@ impl CredmgrTcpAuthLayer {
     /// client between TokenReview and the caller pod reflector.
     pub async fn projected_token(
         config: K8sAuthConfig,
-        database_pool: sqlx::PgPool,
+        database_pool: Db,
         shutdown: CancellationToken,
     ) -> Result<Self, K8sAuthConfigError> {
         let client = pplx_space_kube_client::traced_kube_client_from_env().await?;

@@ -6,15 +6,16 @@
 
 use pplx_space_accounts::OrgId;
 use pplx_space_byok_model::MasterKeyIdentifier;
+use pplx_space_postgres_pool::Db;
 
 use crate::intermediate_key_broker::{WrappedIntermediateKeyStore, WrappedKeyStoreError};
 
 pub struct PgWrappedIntermediateKeyStore {
-    pool: sqlx::PgPool,
+    pool: Db,
 }
 
 impl PgWrappedIntermediateKeyStore {
-    pub fn new(pool: sqlx::PgPool) -> Self {
+    pub fn new(pool: Db) -> Self {
         Self { pool }
     }
 }
@@ -30,6 +31,6 @@ impl WrappedIntermediateKeyStore for PgWrappedIntermediateKeyStore {
         // both rows to the asserted org so a cross-org claim reads as absent.
         pplx_space_byok_store::branching_key(&self.pool, org, key_id)
             .await
-            .map_err(|error| WrappedKeyStoreError::Lookup(sqlx::Error::from(error)))
+            .map_err(WrappedKeyStoreError::Lookup)
     }
 }

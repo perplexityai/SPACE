@@ -65,7 +65,7 @@ async fn reads_sandbox_template_and_per_org_vend_authority() -> TestDbResult<()>
     .execute(&db.pool)
     .await?;
 
-    let store = PgStorageVendStore::new(db.pool.clone());
+    let store = PgStorageVendStore::new(Db::from(db.pool.clone()));
     let sandbox = store
         .sandbox_context(sandbox_id, snapshot_id)
         .await?
@@ -159,7 +159,7 @@ async fn reads_unplaced_node_history_and_the_recorded_snapshot_uri() -> TestDbRe
     .execute(&db.pool)
     .await?;
 
-    let context = PgStorageVendStore::new(db.pool.clone())
+    let context = PgStorageVendStore::new(Db::from(db.pool.clone()))
         .sandbox_context(sandbox_id, snapshot_id)
         .await?
         .expect("sandbox context");

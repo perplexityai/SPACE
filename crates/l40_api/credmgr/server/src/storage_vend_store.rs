@@ -1,5 +1,6 @@
 //! Durable authorization context for scoped storage credential exchange.
 
+use pplx_space_postgres_pool::{Db, DbError};
 use pplx_space_snapshot_model::SnapshotId;
 
 use std::str::FromStr;
@@ -69,15 +70,9 @@ pub struct StorageVendIdentity {
 #[derive(Debug, thiserror::Error)]
 pub enum StorageVendStoreError {
     #[error("storage credential authorization query failed: {0}")]
-    Query(#[from] sqlx::Error),
+    Query(#[from] DbError),
     #[error("stored storage vend provider is unsupported")]
     UnsupportedProvider,
-}
-
-impl From<pplx_space_postgres_pool::DbError> for StorageVendStoreError {
-    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
-        Self::from(sqlx::Error::from(error))
-    }
 }
 
 #[tonic::async_trait]
@@ -109,11 +104,11 @@ pub trait StorageVendStore: Send + Sync + 'static {
 }
 
 pub struct PgStorageVendStore {
-    pool: sqlx::PgPool,
+    pool: Db,
 }
 
 impl PgStorageVendStore {
-    pub fn new(pool: sqlx::PgPool) -> Self {
+    pub fn new(pool: Db) -> Self {
         Self { pool }
     }
 }
