@@ -11,10 +11,11 @@
 //! A publication replaces a node's inventory with the one it reported: each
 //! `prune_*` verb deletes the node's rows the report no longer names, and the
 //! matching `insert_*` or `upsert_*` verb writes the rows it does, leaving
-//! unchanged rows alone. The verbs take an executor, so the publication runs
-//! all eight writes in its one transaction, under its node lock. Guests and
-//! state formats reference their runtime installation, so the installations
-//! are written before them.
+//! unchanged rows alone. The write verbs take the caller's transaction (a
+//! `Tx` or a `PgConnection`, never the pool), so the publication runs all
+//! eight in its one open transaction, under its node lock. Guests and state
+//! formats reference their runtime installation, so the installations are
+//! written before them.
 //!
 //! The write verbs bind their rows as one jsonb array and read it with
 //! `jsonb_to_recordset`, so the input types' field names are the column names
@@ -24,9 +25,10 @@
 //! and their guests.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
+use sqlx::FromRow;
 use sqlx::types::Json;
-use sqlx::{FromRow, PgExecutor};
 use time::OffsetDateTime;
 
 #[cfg(test)]
@@ -91,10 +93,10 @@ pub struct InstallationGuestRow {
 /// guest platform. Ordered by node, runtime and version, then guest, so a
 /// node's rows for one runtime version are adjacent.
 pub async fn list_installations_with_guests(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_ids: &[NodeId],
-) -> Result<Vec<InstallationGuestRow>, sqlx::Error> {
-    sqlx::query_as(sql!(
+) -> Result<Vec<InstallationGuestRow>, DbError> {
+    Ok(sqlx::query_as(sql!(
         "SELECT i.node_id,
                 i.runtime,
                 i.runtime_version,
@@ -110,17 +112,21 @@ pub async fn list_installations_with_guests(
          ORDER BY i.node_id, i.runtime, i.runtime_version, g.guest_os, g.guest_arch"
     ))
     .bind(node_ids)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Delete `node_id`'s runtime installations that `installations` doesn't
 /// name. Their guests and state formats go with them (`ON DELETE CASCADE`).
-pub async fn prune_runtime_installations(
-    executor: impl PgExecutor<'_>,
+/// The caller must pass its open transaction.
+pub async fn prune_runtime_installations<C>(
+    tx: &mut C,
     node_id: NodeId,
     installations: &[RuntimeInstallation],
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "DELETE FROM node_runtime_installations installed
          WHERE node_id = $1 AND NOT EXISTS (
@@ -132,17 +138,21 @@ pub async fn prune_runtime_installations(
     ))
     .bind(node_id)
     .bind(Json(installations))
-    .execute(executor)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
 
 /// Delete `node_id`'s artifact components that `components` doesn't name.
-pub async fn prune_artifact_components(
-    executor: impl PgExecutor<'_>,
+/// The caller must pass its open transaction.
+pub async fn prune_artifact_components<C>(
+    tx: &mut C,
     node_id: NodeId,
     components: &[ArtifactComponent],
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "DELETE FROM node_artifact_components installed
          WHERE node_id = $1 AND NOT EXISTS (
@@ -156,18 +166,22 @@ pub async fn prune_artifact_components(
     ))
     .bind(node_id)
     .bind(Json(components))
-    .execute(executor)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
 
 /// Insert `node_id`'s runtime installations that aren't stored yet; a stored
 /// one keeps its row and `observed_at`.
-pub async fn insert_runtime_installations(
-    executor: impl PgExecutor<'_>,
+/// The caller must pass its open transaction.
+pub async fn insert_runtime_installations<C>(
+    tx: &mut C,
     node_id: NodeId,
     installations: &[RuntimeInstallation],
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "WITH input AS (
              SELECT * FROM jsonb_to_recordset($2::jsonb) AS input(
@@ -180,18 +194,22 @@ pub async fn insert_runtime_installations(
     ))
     .bind(node_id)
     .bind(Json(installations))
-    .execute(executor)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
 
 /// Delete `node_id`'s runtime guests that `installations` doesn't name,
 /// including those of a runtime it still names.
-pub async fn prune_runtime_guests(
-    executor: impl PgExecutor<'_>,
+/// The caller must pass its open transaction.
+pub async fn prune_runtime_guests<C>(
+    tx: &mut C,
     node_id: NodeId,
     installations: &[RuntimeInstallation],
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "DELETE FROM node_runtime_guests installed
          WHERE node_id = $1 AND NOT EXISTS (
@@ -206,18 +224,22 @@ pub async fn prune_runtime_guests(
     ))
     .bind(node_id)
     .bind(Json(installations))
-    .execute(executor)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
 
 /// Insert `node_id`'s runtime guests that aren't stored yet. Run it after
 /// [`insert_runtime_installations`], whose rows they reference.
-pub async fn insert_runtime_guests(
-    executor: impl PgExecutor<'_>,
+/// The caller must pass its open transaction.
+pub async fn insert_runtime_guests<C>(
+    tx: &mut C,
     node_id: NodeId,
     installations: &[RuntimeInstallation],
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "WITH input AS (
              SELECT * FROM jsonb_to_recordset($2::jsonb) AS input(
@@ -237,18 +259,22 @@ pub async fn insert_runtime_guests(
     ))
     .bind(node_id)
     .bind(Json(installations))
-    .execute(executor)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
 
 /// Delete `node_id`'s runtime state formats that `installations` doesn't
 /// name, including those of a runtime it still names.
-pub async fn prune_runtime_state_formats(
-    executor: impl PgExecutor<'_>,
+/// The caller must pass its open transaction.
+pub async fn prune_runtime_state_formats<C>(
+    tx: &mut C,
     node_id: NodeId,
     installations: &[RuntimeInstallation],
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "DELETE FROM node_runtime_state_formats installed
          WHERE node_id = $1 AND NOT EXISTS (
@@ -264,7 +290,7 @@ pub async fn prune_runtime_state_formats(
     ))
     .bind(node_id)
     .bind(Json(installations))
-    .execute(executor)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -273,11 +299,15 @@ pub async fn prune_runtime_state_formats(
 /// taking each capability any report grants. A stored row is rewritten only
 /// when its capabilities change. Run it after
 /// [`insert_runtime_installations`], whose rows they reference.
-pub async fn upsert_runtime_state_formats(
-    executor: impl PgExecutor<'_>,
+/// The caller must pass its open transaction.
+pub async fn upsert_runtime_state_formats<C>(
+    tx: &mut C,
     node_id: NodeId,
     installations: &[RuntimeInstallation],
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "WITH input AS (
              SELECT * FROM jsonb_to_recordset($2::jsonb) AS input(
@@ -311,7 +341,7 @@ pub async fn upsert_runtime_state_formats(
     ))
     .bind(node_id)
     .bind(Json(installations))
-    .execute(executor)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -319,11 +349,15 @@ pub async fn upsert_runtime_state_formats(
 /// Write `node_id`'s artifact components, a component reported more than once
 /// taking each default flag any report sets. A stored row is rewritten, with
 /// a new `observed_at`, only when its flags or values change.
-pub async fn upsert_artifact_components(
-    executor: impl PgExecutor<'_>,
+/// The caller must pass its open transaction.
+pub async fn upsert_artifact_components<C>(
+    tx: &mut C,
     node_id: NodeId,
     components: &[ArtifactComponent],
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "WITH input AS (
              SELECT * FROM jsonb_to_recordset($2::jsonb) AS input(
@@ -356,7 +390,7 @@ pub async fn upsert_artifact_components(
     ))
     .bind(node_id)
     .bind(Json(components))
-    .execute(executor)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }

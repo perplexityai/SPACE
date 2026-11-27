@@ -262,6 +262,7 @@ impl AdminNodeStore {
             &self.pool, node_ids,
         )
         .await
+        .map_err(sqlx::Error::from)
     }
 
     /// Occupancy lookup keyed on `node_id`. Returns the count of
