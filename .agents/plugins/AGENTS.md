@@ -14,6 +14,10 @@ When adding or changing plugin content:
 
 1. Keep `plugin.yaml`, `.claude-plugin/plugin.json`, and
    `.codex-plugin/plugin.json` identity, version, and description aligned.
-2. Bump the plugin version in all three files when shipped content changes.
+2. Do not bump the plugin version in skill or content pull requests. Bump
+   versions only when cutting a plugin release with
+   `python3 scripts/bump_plugin_version.py --bump <plugin>`, which updates all
+   three manifests together.
 3. Update the repository marketplace entries when adding or renaming a plugin.
-4. Run the applicable skill and plugin validators.
+4. Run `python3 scripts/bump_plugin_version.py --check` and the applicable
+   skill and plugin validators.
