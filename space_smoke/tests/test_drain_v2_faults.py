@@ -410,13 +410,14 @@ class GateAnswers(unittest.TestCase):
         # the node suspends before any lands past it: no call there judged.
         drain._deadline = int(time.time()) + 3
         caller = _Sandbox(sandbox, [CALL_PASSED_STATUS, CALL_PASSED_STATUS])
-        seen = drain.expect_calls_pass_until_suspended(caller)  # type: ignore[arg-type]
+        with mock.patch.object(type(drain), "seconds_to_deadline", side_effect=[3, 2, 1]):
+            seen = drain.expect_calls_pass_until_suspended(caller)  # type: ignore[arg-type]
         self.assertEqual(
             seen,
             {
                 "before_deadline": [CALL_PASSED_STATUS],
                 "past_deadline": [],
-                "overlapping_suspend": [{"status": CALL_PASSED_STATUS, "retry_after": None, "body": {}, "seconds_to_deadline": seen["overlapping_suspend"][0]["seconds_to_deadline"]}],
+                "overlapping_suspend": [{"status": CALL_PASSED_STATUS, "retry_after": None, "body": {}, "seconds_to_deadline": 1}],
             },
         )
         self.assertEqual(caller.commands, 2)
@@ -436,7 +437,11 @@ class GateAnswers(unittest.TestCase):
         for refused in (409, GATE_REFUSAL_STATUS):
             drain, fixture = _assertions(_Control(node_states={sandbox: list(states)}))
             drain._deadline = int(time.time()) + 3
-            with self.subTest(refused=refused), self.assertRaises(InvariantViolation):
+            with (
+                self.subTest(refused=refused),
+                mock.patch.object(type(drain), "seconds_to_deadline", side_effect=[3, 2, 1]),
+                self.assertRaises(InvariantViolation),
+            ):
                 drain.expect_calls_pass_until_suspended(_Sandbox(sandbox, [refused, 201]))  # type: ignore[arg-type]
             self.assertIn(f"calls_around_deadline_{sandbox}", fixture.evidence)
 
