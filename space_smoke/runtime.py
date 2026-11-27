@@ -428,15 +428,22 @@ def run_concurrently(
     outcomes: list[T | BaseException] = [
         RuntimeError("the call did not finish") for _ in calls
     ]
+    # Set as each call ends. An interrupted `Thread.join` can leave CPython
+    # reading a worker still in native I/O as stopped, so that a second join
+    # returns at once and `is_alive` misses it: the bounded wait reads these
+    # instead.
+    finished = [threading.Event() for _ in calls]
 
     def run(index: int, call: Callable[[], T]) -> None:
-        _CALL_GROUP.set(group)
-        if parent is not None:
-            _EVIDENCE_SINK.set(evidence[index])
         try:
+            _CALL_GROUP.set(group)
+            if parent is not None:
+                _EVIDENCE_SINK.set(evidence[index])
             outcomes[index] = call()
         except BaseException as error:  # noqa: BLE001 - returned to the caller in order
             outcomes[index] = error
+        finally:
+            finished[index].set()
 
     threads = [
         threading.Thread(target=run, args=(index, call), daemon=True)
@@ -455,10 +462,10 @@ def run_concurrently(
             raise
         group.end()
         deadline = time.monotonic() + CANCEL_JOIN_SECONDS
-        for thread in threads:
-            if thread.ident is not None:
-                thread.join(max(0.0, deadline - time.monotonic()))
-        still = [index for index, thread in enumerate(threads) if thread.is_alive()]
+        started = [index for index, thread in enumerate(threads) if thread.ident is not None]
+        for index in started:
+            finished[index].wait(max(0.0, deadline - time.monotonic()))
+        still = [index for index in started if not finished[index].is_set()]
         if still:
             print(
                 f"NOTE: {len(still)} interrupted concurrent call(s) still running "
