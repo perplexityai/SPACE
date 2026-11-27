@@ -562,6 +562,7 @@ pplx-space-sandbox-teardown = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
   "pplx-space-internal-api-server",
+  "pplx-space-runtime-upgrade-campaign-store",
   "pplx-space-sandbox-store",
 ]
 pplx-space-sbx-mgr-migrations = ["pplx-space-sbx-mgr-store"]

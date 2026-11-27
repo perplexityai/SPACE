@@ -16,10 +16,13 @@
 //! network-policy authority onto the rows it reports.
 //! [`newest`] and [`window`] are unlocked reads of the rows' ids, as is
 //! [`rowless_sandbox_ids`]; [`last_published_execution`] is an unlocked read
-//! of one row's published execution.
+//! of one row's published execution. [`publish_carries_execution`] is the one
+//! rule for whether a row is evidence of what its sandbox runs.
 //! [`delete_absent_on_node`] is the publish path's unguarded delete of the
 //! rows a node no longer lists, and [`get_with_node`] an unlocked read of one
 //! sandbox's row with its publishing node's registration.
+
+use std::sync::LazyLock;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::{NodeAddress, NodeManagedBy, NodeRole};
@@ -300,30 +303,53 @@ impl From<PublishedExecutionRow> for PublishedExecution {
     }
 }
 
+/// A boolean SQL predicate, TRUE iff the `sandbox_observed_states` row
+/// aliased `observed` carries an execution: any of its execution metadata,
+/// runtime version or state format version. A publish that carried none is no
+/// evidence of what the sandbox runs; it isn't a record from before execution
+/// metadata existed, which an unbound read would attribute to the initial
+/// environment. FALSE, never NULL, when a `LEFT JOIN` found no row.
+///
+/// The one definition of that rule: every reader that judges a sandbox by
+/// its published execution interpolates it as built rather than re-spelling
+/// it, so a start and a runtime upgrade campaign find the same sandboxes on
+/// an environment. The predicate reads only `observed`, so a caller builds its
+/// statement once (a `LazyLock<String>`) and binds the rest.
+pub fn publish_carries_execution(observed: &str) -> String {
+    format!(
+        "({observed}.execution_metadata IS NOT NULL \
+          OR {observed}.runtime_version IS NOT NULL \
+          OR {observed}.state_format_version IS NOT NULL)"
+    )
+}
+
 /// The execution `sandbox_id`'s node last published; `None` when nothing is
-/// published or the publish carried no execution.
+/// published or the publish carried no execution
+/// ([`publish_carries_execution`]).
 pub async fn last_published_execution(
     executor: impl Executor<'_>,
     sandbox_id: SandboxId,
 ) -> Result<Option<PublishedExecution>, DbError> {
-    let row = sqlx::query_as::<_, PublishedExecutionRow>(sql!(
-        "SELECT md5(concat_ws('/', s.lifecycle_changed_at::text, o.execution_metadata::text,
-                                  o.runtime, o.runtime_version, o.state_format_name,
-                                  o.state_format_version)) AS subject,
-                    NULL::uuid AS local_artifact_id, o.execution_metadata, o.runtime,
-                    o.runtime_version, o.state_format_name, o.state_format_version
-               FROM sandbox_observed_states o
-               JOIN sandboxes s ON s.id = o.sandbox_id
-              WHERE o.sandbox_id = $1
-                -- A publish that carried no execution is no evidence: it
-                -- isn't a record from before execution metadata existed.
-                AND (o.execution_metadata IS NOT NULL
-                     OR o.runtime_version IS NOT NULL
-                     OR o.state_format_version IS NOT NULL)"
-    ))
-    .bind(sandbox_id)
-    .fetch_optional(executor.into_sqlx())
-    .await?;
+    /// Built once: the evidence predicate is the only interpolation.
+    static LAST_PUBLISHED: LazyLock<String> = LazyLock::new(|| {
+        sql!(format!(
+            "SELECT md5(concat_ws('/', s.lifecycle_changed_at::text, o.execution_metadata::text,
+                                      o.runtime, o.runtime_version, o.state_format_name,
+                                      o.state_format_version)) AS subject,
+                        NULL::uuid AS local_artifact_id, o.execution_metadata, o.runtime,
+                        o.runtime_version, o.state_format_name, o.state_format_version
+                   FROM sandbox_observed_states o
+                   JOIN sandboxes s ON s.id = o.sandbox_id
+                  WHERE o.sandbox_id = $1
+                    AND {}",
+            publish_carries_execution("o")
+        ))
+    });
+    let row =
+        sqlx::query_as::<_, PublishedExecutionRow>(sqlx::AssertSqlSafe(LAST_PUBLISHED.as_str()))
+            .bind(sandbox_id)
+            .fetch_optional(executor.into_sqlx())
+            .await?;
     Ok(row.map(PublishedExecution::from))
 }
 

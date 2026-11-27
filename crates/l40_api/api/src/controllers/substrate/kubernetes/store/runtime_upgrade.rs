@@ -4,7 +4,6 @@
 
 use super::*;
 use crate::controllers::substrate::runtime_upgrade::{CatalogEnvironment, RecordedExecution};
-use pplx_space_execution_spec::{ArtifactComponentKind, EnvironmentReference};
 use pplx_space_snapshot_model::LocalArtifactId;
 
 /// An execution the control plane recorded, with the identity of what it
@@ -48,45 +47,18 @@ impl From<pplx_space_sandbox_teardown::observed_states::PublishedExecution>
 
 impl From<RecordedExecutionRow> for RecordedActivation {
     fn from(row: RecordedExecutionRow) -> Self {
-        let metadata = row.execution_metadata.as_ref();
-        // Read leniently: a record is evidence, and a field it lacks or holds
-        // in another shape matches anything rather than failing the
-        // activation.
-        let environment = metadata
-            .and_then(|metadata| metadata.get("environment"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        let kernel_version = metadata
-            .and_then(|metadata| metadata.get("components"))
-            .and_then(serde_json::Value::as_array)
-            .and_then(|components| {
-                components.iter().find(|component| {
-                    component.get("kind").and_then(serde_json::Value::as_str)
-                        == Some(ArtifactComponentKind::Kernel.as_str())
-                })
-            })
-            .and_then(|kernel| kernel.get("version"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
         Self {
             subject: row.subject,
             local_artifact_id: row.local_artifact_id,
-            execution: RecordedExecution {
-                environment,
-                runtime: row.runtime,
-                runtime_version: row.runtime_version,
-                kernel_version,
-                state_format_name: row.state_format_name,
-                state_format_version: row.state_format_version,
-            },
+            execution: RecordedExecution::from_record(
+                row.execution_metadata.as_ref(),
+                row.runtime,
+                row.runtime_version,
+                row.state_format_name,
+                row.state_format_version,
+            ),
         }
     }
-}
-
-fn catalog_reference(value: &str) -> Result<EnvironmentReference, SubstrateError> {
-    value.parse().map_err(|error| SubstrateError::Failed {
-        message: format!("runtime_environments holds an invalid reference {value:?}: {error}"),
-    })
 }
 
 impl K8sStore {
@@ -148,23 +120,8 @@ impl K8sStore {
             .db_context("failed to read the runtime environment catalog")?;
         rows.into_iter()
             .map(|row| {
-                Ok(CatalogEnvironment {
-                    reference: catalog_reference(&row.environment_ref)?,
-                    runtime: row.runtime,
-                    runtime_version: row.runtime_version,
-                    kernel_version: row.kernel_version,
-                    state_format_name: row.state_format_name,
-                    state_format_version: row.state_format_version,
-                    upgrade_edges: row
-                        .upgrade_edges
-                        .iter()
-                        .map(|edge| catalog_reference(edge))
-                        .collect::<Result<_, _>>()?,
-                    memory_edges: row
-                        .memory_edges
-                        .iter()
-                        .map(|edge| catalog_reference(edge))
-                        .collect::<Result<_, _>>()?,
+                CatalogEnvironment::from_row(row).map_err(|error| SubstrateError::Failed {
+                    message: error.to_string(),
                 })
             })
             .collect()

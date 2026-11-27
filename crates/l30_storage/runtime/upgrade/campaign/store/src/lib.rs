@@ -7,9 +7,10 @@
 //! `runtime_upgrade` reconciler records the subjects a kind's driver finds
 //! ([`insert_pending`]), leases them under the campaign's pacing
 //! ([`lease_items`]), and records each outcome under its lease
-//! ([`finish_item`]). The admin API starts ([`create_campaign`]), pauses
-//! ([`pause_campaign`]), resumes ([`resume_campaign`]), aborts
-//! ([`abort_campaign`]) and reads
+//! ([`finish_item`]). A sandbox campaign's driver finds its subjects with
+//! [`sandbox_candidates`] and re-reads one with [`subject_sandbox`]. The
+//! admin API starts ([`create_campaign`]), pauses ([`pause_campaign`]),
+//! resumes ([`resume_campaign`]), aborts ([`abort_campaign`]) and reads
 //! ([`get_record`], [`list_records`]) campaigns.
 //!
 //! # Rules the store enforces
@@ -93,6 +94,7 @@ mod admin;
 mod create;
 mod items;
 mod phase;
+mod sandboxes;
 mod twin_readers;
 
 pub use admin::{
@@ -108,6 +110,7 @@ pub use items::{
 };
 pub use phase::{complete_if_drained, pause_if_over_budget};
 pub use pplx_space_rollout_queue::{MAX_LEASE, clamp_lease};
+pub use sandboxes::{SandboxCandidate, SubjectSandbox, sandbox_candidates, subject_sandbox};
 pub use twin_readers::{HOLDING_SAMPLE, TwinReaders, workers_not_reading_twins};
 
 #[cfg(test)]

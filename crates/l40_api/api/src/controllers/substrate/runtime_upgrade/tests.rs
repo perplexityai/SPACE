@@ -496,3 +496,59 @@ async fn the_policy_is_reused_until_it_ages_and_a_failed_read_is_not_cached() {
         .unwrap_err();
     assert_eq!(cache.get(|| read(4)).await.unwrap().generation, 4);
 }
+
+fn row(
+    upgrade_edges: &[&str],
+    memory_edges: &[&str],
+) -> pplx_space_runtime_environment_catalog_store::CatalogEnvironmentRow {
+    pplx_space_runtime_environment_catalog_store::CatalogEnvironmentRow {
+        environment_ref: e0().to_string(),
+        runtime: "firecracker".into(),
+        runtime_version: "1.15.1".into(),
+        kernel_version: "6.1.155".into(),
+        state_format_name: "firecracker-snapshot".into(),
+        state_format_version: "9.0.0".into(),
+        upgrade_edges: upgrade_edges
+            .iter()
+            .map(|edge| (*edge).to_owned())
+            .collect(),
+        memory_edges: memory_edges.iter().map(|edge| (*edge).to_owned()).collect(),
+    }
+}
+
+#[test]
+fn a_catalog_row_parses_into_its_environment_and_edges() {
+    let (e1, e2) = (e1().to_string(), e2().to_string());
+    assert_eq!(
+        CatalogEnvironment::from_row(row(&[&e1, &e2], &[&e1])).unwrap(),
+        with_edges(
+            environment(e0(), "1.15.1", "6.1.155", "9.0.0"),
+            &[self::e1(), self::e2()],
+            &[self::e1()],
+        )
+    );
+}
+
+#[test]
+fn a_malformed_reference_anywhere_in_a_row_fails_with_its_text() {
+    let e1 = e1().to_string();
+    for (upgrade, memory) in [
+        (vec!["sha256:bad"], vec![]),
+        (vec![e1.as_str()], vec!["sha256:bad"]),
+    ] {
+        let error = CatalogEnvironment::from_row(row(&upgrade, &memory)).unwrap_err();
+        assert_eq!(error.value, "sha256:bad");
+        assert!(
+            error
+                .to_string()
+                .starts_with("runtime_environments holds an invalid reference \"sha256:bad\": "),
+            "{error}"
+        );
+    }
+    let mut bad_own = row(&[], &[]);
+    bad_own.environment_ref = "sha256:bad".into();
+    assert_eq!(
+        CatalogEnvironment::from_row(bad_own).unwrap_err().value,
+        "sha256:bad"
+    );
+}
