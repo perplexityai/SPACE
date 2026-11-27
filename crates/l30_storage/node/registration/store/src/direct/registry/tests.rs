@@ -365,7 +365,7 @@ async fn registry_nodes_read_every_substrate_and_filter_deleted_registry_rows() 
     );
     assert_eq!(deleted_row.managed_by, NodeManagedBy::Space);
     assert_eq!(
-        deleted_row.metadata.map(|metadata| metadata.0),
+        deleted_row.metadata,
         Some(serde_json::json!({"rack": "r1"}))
     );
     assert!(deleted_row.updated_at.is_some());

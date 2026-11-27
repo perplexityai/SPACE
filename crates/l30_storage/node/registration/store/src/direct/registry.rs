@@ -205,7 +205,7 @@ pub async fn update_registered_node(
 /// A node as the admin node registry reads it: its `nodes` row, its
 /// `node_direct` row's columns when it has one and its Kubernetes node name
 /// when it has a `node_k8s` row.
-#[derive(Debug, Clone, PartialEq, FromRow)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RegistryNodeRow {
     pub id: NodeId,
     pub name: Option<String>,
@@ -214,7 +214,7 @@ pub struct RegistryNodeRow {
     pub role: NodeRole,
     pub managed_by: NodeManagedBy,
     pub state: Option<String>,
-    pub metadata: Option<Json<serde_json::Value>>,
+    pub metadata: Option<serde_json::Value>,
     pub last_heartbeat: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
     pub updated_at: Option<OffsetDateTime>,
@@ -222,12 +222,51 @@ pub struct RegistryNodeRow {
     pub node_name: Option<String>,
 }
 
+/// [`RegistryNodeRow`] as the statements decode it, `metadata` through
+/// [`Json`].
+#[derive(FromRow)]
+struct RegistryNodeDecodeRow {
+    id: NodeId,
+    name: Option<String>,
+    address: Option<String>,
+    node_api_endpoint: Option<String>,
+    role: NodeRole,
+    managed_by: NodeManagedBy,
+    state: Option<String>,
+    metadata: Option<Json<serde_json::Value>>,
+    last_heartbeat: Option<OffsetDateTime>,
+    created_at: OffsetDateTime,
+    updated_at: Option<OffsetDateTime>,
+    deleted_at: Option<OffsetDateTime>,
+    node_name: Option<String>,
+}
+
+impl From<RegistryNodeDecodeRow> for RegistryNodeRow {
+    fn from(row: RegistryNodeDecodeRow) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            address: row.address,
+            node_api_endpoint: row.node_api_endpoint,
+            role: row.role,
+            managed_by: row.managed_by,
+            state: row.state,
+            metadata: row.metadata.map(|json| json.0),
+            last_heartbeat: row.last_heartbeat,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            deleted_at: row.deleted_at,
+            node_name: row.node_name,
+        }
+    }
+}
+
 /// Node `id` of any substrate, deleted Direct rows included.
 pub async fn registry_node(
     executor: impl Executor<'_>,
     id: NodeId,
 ) -> Result<Option<RegistryNodeRow>, DbError> {
-    Ok(sqlx::query_as::<_, RegistryNodeRow>(sql!(
+    Ok(sqlx::query_as::<_, RegistryNodeDecodeRow>(sql!(
         "SELECT n.id,
                 nd.name,
                 host(n.address) AS address,
@@ -248,7 +287,8 @@ pub async fn registry_node(
     ))
     .bind(id)
     .fetch_optional(executor.into_sqlx())
-    .await?)
+    .await?
+    .map(RegistryNodeRow::from))
 }
 
 /// The nodes of any substrate, of `role` when given, by role, then name, then
@@ -259,7 +299,7 @@ pub async fn registry_nodes(
     role: Option<NodeRole>,
     include_deleted: bool,
 ) -> Result<Vec<RegistryNodeRow>, DbError> {
-    Ok(sqlx::query_as::<_, RegistryNodeRow>(sql!(
+    Ok(sqlx::query_as::<_, RegistryNodeDecodeRow>(sql!(
         "SELECT n.id,
                 nd.name,
                 host(n.address) AS address,
@@ -285,7 +325,10 @@ pub async fn registry_nodes(
     .bind(role.map(NodeRole::as_str))
     .bind(include_deleted)
     .fetch_all(executor.into_sqlx())
-    .await?)
+    .await?
+    .into_iter()
+    .map(RegistryNodeRow::from)
+    .collect())
 }
 
 /// A Direct node as internal-api lists it, with its id, role, substrate and

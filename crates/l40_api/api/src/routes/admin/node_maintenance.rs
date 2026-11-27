@@ -55,7 +55,7 @@ struct NodeRow {
     role: NodeRole,
     managed_by: NodeManagedBy,
     state: Option<String>,
-    metadata: Option<sqlx::types::Json<serde_json::Value>>,
+    metadata: Option<serde_json::Value>,
     last_heartbeat: Option<OffsetDateTime>,
     created_at: OffsetDateTime,
     updated_at: Option<OffsetDateTime>,
@@ -201,7 +201,7 @@ fn registered_row(node: DirectNode) -> NodeRow {
         role: node.role,
         managed_by: node.managed_by,
         state: node.state,
-        metadata: Some(sqlx::types::Json(node.metadata)),
+        metadata: Some(node.metadata),
         last_heartbeat: node.last_heartbeat,
         created_at: node.created_at,
         updated_at: Some(node.updated_at),
@@ -219,10 +219,7 @@ fn node_response(row: NodeRow) -> NodeResponse {
         role: row.role.to_string(),
         managed_by: row.managed_by.to_string(),
         state: row.state,
-        metadata: row
-            .metadata
-            .map(|m| m.0)
-            .unwrap_or_else(|| serde_json::json!({})),
+        metadata: row.metadata.unwrap_or_else(|| serde_json::json!({})),
         last_heartbeat: format_optional_time(row.last_heartbeat),
         created_at: format_time(row.created_at),
         updated_at: format_optional_time(row.updated_at),
