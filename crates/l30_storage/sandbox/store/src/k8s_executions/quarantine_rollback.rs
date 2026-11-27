@@ -92,7 +92,7 @@ const LOCK_ACTIVATION_ROLLBACK_CANDIDATES: &str = sql!(
 pub async fn lock_activation_rollback_candidates<C>(
     conn: &mut C,
     node_id: NodeId,
-    rows: Json<JsonValue>,
+    rows: JsonValue,
     receipt_kind: SandboxTransitionReceiptKind,
 ) -> Result<Vec<ActivationRollbackCandidateRow>, DbError>
 where
@@ -110,7 +110,7 @@ where
     );
     let rows: Vec<CandidateRow> = sqlx::query_as(LOCK_ACTIVATION_ROLLBACK_CANDIDATES)
         .bind(node_id)
-        .bind(rows)
+        .bind(Json(rows))
         .bind(receipt_kind.as_str())
         .fetch_all(conn.into_sqlx())
         .await?;

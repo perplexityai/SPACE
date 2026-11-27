@@ -169,9 +169,9 @@ async fn failed_projection_decides_on_the_row_committed_while_it_waits() -> Test
         let waiter_pid: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
             .fetch_one(&mut *projection_tx)
             .await?;
-        let rows_json = Json(serde_json::json!([
+        let rows_json = serde_json::json!([
             { "sandbox_id": sandbox_id.to_string(), "published_lifecycle": "failed" }
-        ]));
+        ]);
         let projection = tokio::spawn(async move {
             let moved =
                 project_node_published_failed_sandboxes(&mut projection_tx, node_id, rows_json)

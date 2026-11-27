@@ -90,7 +90,7 @@ pub const TRANSITION_RECEIPT_RECORD_COLUMNS: &str = "
 pub async fn mark_published_quarantined(
     executor: impl Executor<'_>,
     node_id: NodeId,
-    claimed: Json<JsonValue>,
+    claimed: JsonValue,
 ) -> Result<Vec<SandboxId>, DbError> {
     Ok(sqlx::query_scalar::<_, SandboxId>(sql!(
         "UPDATE sandboxes s
@@ -104,7 +104,7 @@ pub async fn mark_published_quarantined(
                    AND s.lifecycle = input.from_lifecycle
                  RETURNING s.id"
     ))
-    .bind(claimed)
+    .bind(Json(claimed))
     .bind(node_id)
     .fetch_all(executor.into_sqlx())
     .await?)
@@ -124,7 +124,7 @@ pub async fn mark_published_quarantined(
 pub async fn mark_published_failed(
     executor: impl Executor<'_>,
     node_id: NodeId,
-    rows: Json<JsonValue>,
+    rows: JsonValue,
 ) -> Result<Vec<(SandboxId, String)>, DbError> {
     let failed_sandboxes = sqlx::query_as::<_, (Uuid, String)>(sql!(
         "WITH input AS (
@@ -156,7 +156,7 @@ pub async fn mark_published_failed(
          RETURNING s.id, claimed.lifecycle"
     ))
     .bind(node_id)
-    .bind(rows)
+    .bind(Json(rows))
     .bind(SubstrateKind::Kubernetes)
     .fetch_all(executor.into_sqlx())
     .await?;
@@ -390,7 +390,7 @@ pub async fn finalize_suspended(
 pub async fn converge_published_restoring_to_started(
     executor: impl Executor<'_>,
     node_id: NodeId,
-    rows: Json<JsonValue>,
+    rows: JsonValue,
 ) -> Result<Vec<SandboxId>, DbError> {
     // Publishing `started` proves the node-local runtime finished, but for
     // Kubernetes sandboxes the control plane also needs a routable active
@@ -427,7 +427,7 @@ pub async fn converge_published_restoring_to_started(
         restored_convergence_query.as_str()
     )))
     .bind(node_id)
-    .bind(rows)
+    .bind(Json(rows))
     .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
     .bind(SubstrateKind::Kubernetes)
     .fetch_all(executor.into_sqlx())
@@ -455,7 +455,7 @@ pub async fn converge_published_restoring_to_started(
 pub async fn advance_published_activity(
     executor: impl Executor<'_>,
     node_id: NodeId,
-    rows: Json<JsonValue>,
+    rows: JsonValue,
 ) -> Result<(), DbError> {
     // PostgreSQL GREATEST ignores absent clocks and yields NULL if all are
     // absent. `advance` decides once per clock whether the published value
@@ -557,7 +557,7 @@ pub async fn advance_published_activity(
        AND (advance.move_access OR advance.move_command OR advance.move_used)"
     ))
     .bind(node_id)
-    .bind(rows)
+    .bind(Json(rows))
     .execute(executor.into_sqlx())
     .await?;
     Ok(())
@@ -577,7 +577,7 @@ pub async fn advance_published_activity(
 pub async fn record_published_idle_deadlines(
     executor: impl Executor<'_>,
     node_id: NodeId,
-    rows: Json<JsonValue>,
+    rows: JsonValue,
 ) -> Result<(), DbError> {
     sqlx::query(sql!(
         "WITH input AS (
@@ -604,7 +604,7 @@ pub async fn record_published_idle_deadlines(
             )"
     ))
     .bind(node_id)
-    .bind(rows)
+    .bind(Json(rows))
     .execute(executor.into_sqlx())
     .await?;
     Ok(())
@@ -628,7 +628,7 @@ pub async fn record_published_idle_deadlines(
 pub async fn converge_published_stopped(
     executor: impl Executor<'_>,
     node_id: NodeId,
-    rows: Json<JsonValue>,
+    rows: JsonValue,
 ) -> Result<Vec<SandboxId>, DbError> {
     Ok(sqlx::query_scalar::<_, SandboxId>(sql!(
         "WITH input AS (
@@ -668,7 +668,7 @@ pub async fn converge_published_stopped(
          RETURNING s.id"
     ))
     .bind(node_id)
-    .bind(rows)
+    .bind(Json(rows))
     .fetch_all(executor.into_sqlx())
     .await?)
 }
@@ -698,7 +698,7 @@ pub async fn converge_published_stopped(
 pub async fn release_completed_activations(
     executor: impl Executor<'_>,
     node_id: NodeId,
-    rows: Json<JsonValue>,
+    rows: JsonValue,
 ) -> Result<Vec<SandboxId>, DbError> {
     let query = format!(
         "WITH input AS (
@@ -776,7 +776,7 @@ pub async fn release_completed_activations(
     Ok(
         sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
             .bind(node_id)
-            .bind(rows)
+            .bind(Json(rows))
             .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
             .fetch_all(executor.into_sqlx())
             .await?,
