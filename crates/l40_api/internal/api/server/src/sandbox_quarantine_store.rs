@@ -20,7 +20,6 @@ use pplx_space_sandbox_store::quarantine_publication::{
 use pplx_space_sandbox_store::quarantine_recovery_authority;
 use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 use sqlx::PgPool;
-use sqlx::types::Json;
 use tonic::Status;
 use uuid::Uuid;
 
@@ -241,7 +240,7 @@ pub(super) async fn get_quarantine_recovery_plan(
 pub(super) async fn consume_activation_completion_receipts(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: serde_json::Value,
 ) -> Result<Vec<SandboxId>, Status> {
     pplx_space_sandbox_store::ingest::release_completed_activations(conn, node_id, rows_json)
         .await
@@ -257,7 +256,7 @@ pub(super) async fn consume_activation_completion_receipts(
 pub(super) async fn select_activation_rollback_candidates(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: serde_json::Value,
 ) -> Result<Vec<ActivationRollbackCandidate>, Status> {
     let rows = quarantine_rollback::lock_activation_rollback_candidates(
         conn,
@@ -447,7 +446,7 @@ pub(super) async fn apply_activation_rollback_candidates(
 pub(super) async fn recover_pause_failed_from_inventory(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: serde_json::Value,
 ) -> Result<Vec<PauseFailedQuarantineRecovery>, Status> {
     let candidates = quarantine_publication::lock_pause_failed_recovery_candidates(
         &mut *conn,
@@ -529,7 +528,7 @@ pub(super) async fn recover_pause_failed_from_inventory(
 pub(super) async fn select_suspended_projection_candidates(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: serde_json::Value,
 ) -> Result<Vec<SuspendedProjectionCandidate>, Status> {
     let rows = quarantine_publication::lock_suspended_projection_candidates(
         &mut *conn,

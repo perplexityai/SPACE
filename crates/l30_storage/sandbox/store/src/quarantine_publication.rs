@@ -50,7 +50,7 @@ pub struct PauseFailedRecoveryCandidate {
 pub async fn lock_pause_failed_recovery_candidates<C>(
     tx: &mut C,
     node_id: NodeId,
-    rows_json: Json<JsonValue>,
+    rows_json: JsonValue,
     quarantine_source: SandboxQuarantineSource,
     quarantine_reason: SandboxQuarantineReasonCode,
 ) -> Result<Vec<PauseFailedRecoveryCandidate>, DbError>
@@ -73,7 +73,7 @@ where
           FOR UPDATE OF s, qs"
     ))
     .bind(node_id)
-    .bind(rows_json)
+    .bind(Json(rows_json))
     .bind(quarantine_source.as_str())
     .bind(quarantine_reason.as_str())
     .fetch_all(tx.into_sqlx())
@@ -264,7 +264,7 @@ fn suspended_projection_candidates_query() -> String {
 pub async fn lock_suspended_projection_candidates<C>(
     tx: &mut C,
     node_id: NodeId,
-    rows_json: Json<JsonValue>,
+    rows_json: JsonValue,
     binds: SuspendedProjectionBinds,
 ) -> Result<Vec<SuspendedProjectionCandidateRow>, DbError>
 where
@@ -274,7 +274,7 @@ where
         LazyLock::new(|| sql!(suspended_projection_candidates_query().as_str()));
     Ok(sqlx::query_as(sqlx::AssertSqlSafe(QUERY.as_str()))
         .bind(node_id)
-        .bind(rows_json)
+        .bind(Json(rows_json))
         .bind(binds.recovery_receipt_kind.as_str())
         .bind(binds.quarantine_source.as_str())
         .bind(binds.exact_policy.as_str())

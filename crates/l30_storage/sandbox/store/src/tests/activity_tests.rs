@@ -4,8 +4,6 @@
 //! decide whether restoring it drops activity, so a dropped value must never
 //! move activity from after a snapshot to before it.
 
-use sqlx::types::Json;
-
 use super::*;
 use crate::ingest::advance_published_activity;
 
@@ -42,12 +40,12 @@ async fn publish(pool: &PgPool, node_id: NodeId, sandbox: Uuid, clock: &str) -> 
     advance_published_activity(
         pool,
         node_id,
-        Json(serde_json::json!([{
+        serde_json::json!([{
             "sandbox_id": sandbox,
             "last_used_at": clock,
             "last_access_at": clock,
             "last_command_at": clock,
-        }])),
+        }]),
     )
     .await?;
     Ok(())

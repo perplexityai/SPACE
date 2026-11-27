@@ -6,7 +6,6 @@ use pplx_space_sandbox_model::{
 use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
-use sqlx::types::Json;
 use uuid::Uuid;
 
 use super::super::ownership_test_fixture::{
@@ -168,7 +167,7 @@ async fn lock_activation_rollback_candidates_locks_the_sandbox_and_its_fenced_ex
     let candidates = lock_activation_rollback_candidates(
         &mut *tx,
         node_id,
-        Json(rows.clone()),
+        rows.clone(),
         SandboxTransitionReceiptKind::ActivationRollback,
     )
     .await?;
@@ -214,7 +213,7 @@ async fn lock_activation_rollback_candidates_locks_the_sandbox_and_its_fenced_ex
         ),
     ] {
         let candidates =
-            lock_activation_rollback_candidates(&mut *tx, node, Json(rows.clone()), kind).await?;
+            lock_activation_rollback_candidates(&mut *tx, node, rows.clone(), kind).await?;
         assert!(candidates.is_empty());
     }
     tx.rollback().await?;

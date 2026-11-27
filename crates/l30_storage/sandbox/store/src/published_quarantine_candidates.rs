@@ -33,7 +33,7 @@ pub struct PublishedQuarantineCandidate {
 pub async fn list(
     executor: impl Executor<'_>,
     node_id: NodeId,
-    inputs: Json<JsonValue>,
+    inputs: JsonValue,
 ) -> Result<Vec<PublishedQuarantineCandidate>, SandboxStoreError> {
     Ok(sqlx::query_as::<_, PublishedQuarantineCandidate>(sql!(
         "SELECT
@@ -57,7 +57,7 @@ pub async fn list(
                    AND LOWER(TRIM(s.lifecycle)) NOT IN ('quarantined', 'deleted')"
     ))
     .bind(node_id)
-    .bind(inputs)
+    .bind(Json(inputs))
     .fetch_all(executor.into_sqlx())
     .await?)
 }

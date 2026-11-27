@@ -1748,10 +1748,8 @@ pub(super) async fn publish_sandbox_states_with_census(
             .iter()
             .map(QuarantineProjectionInput::sql_input)
             .collect::<Vec<_>>();
-        let quarantine_rows_json = Json(
-            serde_json::to_value(&quarantine_sql_inputs)
-                .map_err(|err| Status::internal(format!("serialize quarantine input: {err}")))?,
-        );
+        let quarantine_rows_json = serde_json::to_value(&quarantine_sql_inputs)
+            .map_err(|err| Status::internal(format!("serialize quarantine input: {err}")))?;
         // Unlike failed projection, quarantine is a node-authored hold that
         // preserves local evidence and hot-node affiliation across substrates.
         // Quarantine is a stronger hold than cleanup/delete intent: it stops
@@ -1801,9 +1799,9 @@ pub(super) async fn publish_sandbox_states_with_census(
                 .iter()
                 .map(ClaimedQuarantineProjection::sql_projection)
                 .collect::<Vec<_>>();
-            let claimed_json = Json(serde_json::to_value(&claimed_sql).map_err(|err| {
+            let claimed_json = serde_json::to_value(&claimed_sql).map_err(|err| {
                 Status::internal(format!("serialize claimed quarantine input: {err}"))
-            })?);
+            })?;
             let updated_ids = pplx_space_sandbox_store::ingest::mark_published_quarantined(
                 &mut *conn,
                 node_id,
@@ -1931,7 +1929,7 @@ pub(super) async fn publish_sandbox_states_with_census(
 async fn project_node_published_failed_sandboxes(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: serde_json::Value,
 ) -> Result<Vec<(SandboxId, String)>, Status> {
     pplx_space_sandbox_store::ingest::mark_published_failed(&mut *conn, node_id, rows_json)
         .await
@@ -1959,9 +1957,9 @@ async fn project_node_published_suspended_sandboxes(
     if suspended_rows.is_empty() {
         return Ok(SuspendedProjectionOutcome::default());
     }
-    let rows_json = Json(serde_json::to_value(suspended_rows).map_err(|error| {
+    let rows_json = serde_json::to_value(suspended_rows).map_err(|error| {
         Status::internal(format!("serialize suspended publication rows: {error}"))
-    })?);
+    })?;
     let candidates = crate::sandbox_quarantine_store::select_suspended_projection_candidates(
         conn, node_id, rows_json,
     )
@@ -2237,11 +2235,9 @@ async fn apply_activation_receipts(
         })
         .collect::<Vec<_>>();
     if !activation_completions.is_empty() {
-        let receipt_rows = Json(
-            serde_json::to_value(activation_completions).map_err(|error| {
-                Status::internal(format!("serialize activation completion receipts: {error}"))
-            })?,
-        );
+        let receipt_rows = serde_json::to_value(activation_completions).map_err(|error| {
+            Status::internal(format!("serialize activation completion receipts: {error}"))
+        })?;
         crate::sandbox_quarantine_store::consume_activation_completion_receipts(
             conn,
             node_id,
@@ -2260,9 +2256,9 @@ async fn apply_activation_receipts(
     let rollback_candidates = if activation_rollbacks.is_empty() {
         Vec::new()
     } else {
-        let receipt_rows = Json(serde_json::to_value(activation_rollbacks).map_err(|error| {
+        let receipt_rows = serde_json::to_value(activation_rollbacks).map_err(|error| {
             Status::internal(format!("serialize activation rollback receipts: {error}"))
-        })?);
+        })?;
         crate::sandbox_quarantine_store::select_activation_rollback_candidates(
             conn,
             node_id,
@@ -2307,9 +2303,9 @@ async fn recover_pause_failed_sandboxes(
     let pause_failed_recoveries = if healthy_rows.is_empty() {
         Vec::new()
     } else {
-        let healthy_rows = Json(serde_json::to_value(healthy_rows).map_err(|error| {
+        let healthy_rows = serde_json::to_value(healthy_rows).map_err(|error| {
             Status::internal(format!("serialize healthy publication rows: {error}"))
-        })?);
+        })?;
         crate::sandbox_quarantine_store::recover_pause_failed_from_inventory(
             conn,
             node_id,
@@ -2340,9 +2336,9 @@ async fn update_activity_timestamps(
         .iter()
         .map(PublishedSandboxRow::activity_projection)
         .collect::<Vec<_>>();
-    let activity_rows = Json(serde_json::to_value(activity_rows).map_err(|error| {
+    let activity_rows = serde_json::to_value(activity_rows).map_err(|error| {
         Status::internal(format!("serialize published activity timestamps: {error}"))
-    })?);
+    })?;
     pplx_space_sandbox_store::ingest::advance_published_activity(
         &mut *conn,
         node_id,
@@ -2364,9 +2360,9 @@ async fn record_idle_deadlines(
         .iter()
         .map(PublishedSandboxRow::idle_deadline_projection)
         .collect::<Vec<_>>();
-    let deadline_rows = Json(serde_json::to_value(deadline_rows).map_err(|error| {
+    let deadline_rows = serde_json::to_value(deadline_rows).map_err(|error| {
         Status::internal(format!("serialize published idle deadlines: {error}"))
-    })?);
+    })?;
     pplx_space_sandbox_store::ingest::record_published_idle_deadlines(
         &mut *conn,
         node_id,
@@ -2394,9 +2390,9 @@ async fn converge_restored_sandboxes(
     let restored_ids = if restored_rows.is_empty() {
         Vec::new()
     } else {
-        let restored_rows = Json(serde_json::to_value(restored_rows).map_err(|error| {
+        let restored_rows = serde_json::to_value(restored_rows).map_err(|error| {
             Status::internal(format!("serialize restored publication rows: {error}"))
-        })?);
+        })?;
         pplx_space_sandbox_store::ingest::converge_published_restoring_to_started(
             &mut *conn,
             node_id,
@@ -2421,9 +2417,9 @@ async fn converge_stopped_sandboxes(
     let stopped_ids = if stopped_rows.is_empty() {
         Vec::new()
     } else {
-        let stopped_rows = Json(serde_json::to_value(stopped_rows).map_err(|error| {
+        let stopped_rows = serde_json::to_value(stopped_rows).map_err(|error| {
             Status::internal(format!("serialize stopped publication rows: {error}"))
-        })?);
+        })?;
         pplx_space_sandbox_store::ingest::converge_published_stopped(
             &mut *conn,
             node_id,
@@ -2448,9 +2444,8 @@ async fn converge_failed_sandboxes(
     if failed_rows.is_empty() {
         return Ok(Vec::new());
     }
-    let rows_json = Json(serde_json::to_value(failed_rows).map_err(|error| {
-        Status::internal(format!("serialize failed publication rows: {error}"))
-    })?);
+    let rows_json = serde_json::to_value(failed_rows)
+        .map_err(|error| Status::internal(format!("serialize failed publication rows: {error}")))?;
     project_node_published_failed_sandboxes(conn, node_id, rows_json).await
 }
 
