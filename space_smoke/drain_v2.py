@@ -559,6 +559,12 @@ STALL_ERROR_PREFIX = "the drain is stalled"
 # operation's `progress_message`.
 GATE_REFUSAL_STATUS = 503
 GATE_RETRY_TEXT = "retry shortly"
+# What the drain's refusal of a call says in its JSON `error`, beside
+# `GATE_RETRY_TEXT`, whether the gate refused it ("under a node drain") or
+# the sealed node did ("a node drain sealed its node"): the API's
+# `drain_refusal` and its sealed-activation answer. A busy API's 503 says
+# neither.
+GATE_DRAIN_TEXT = "node drain"
 # An operation the dispatcher retried on that refusal until its retry budget
 # ran out fails with this `terminal_error.reason`; its client asks again.
 RETRIES_EXHAUSTED_REASON = "retry_attempts_exhausted"
@@ -667,6 +673,27 @@ def retries_exhausted_on_the_gate(operation: Mapping[str, Any]) -> bool:
         and isinstance(error, Mapping)
         and error.get("reason") == RETRIES_EXHAUSTED_REASON
         and GATE_RETRY_TEXT in str(operation.get("progress_message") or "")
+    )
+
+
+def _valid_retry_after(value: object) -> bool:
+    """A `Retry-After` the gate sends: whole delta-seconds."""
+
+    return isinstance(value, str) and value.strip().isdigit()
+
+
+def drain_refused_the_call(call: Mapping[str, Any]) -> bool:
+    """A call the v2 drain refused: the gate's 503 with a valid
+    `Retry-After`, whose JSON `error` says it is the drain's
+    (`GATE_DRAIN_TEXT`) and to retry (`GATE_RETRY_TEXT`)."""
+
+    body = call.get("body")
+    error = str(body.get("error") or "") if isinstance(body, Mapping) else ""
+    return (
+        call.get("status") == GATE_REFUSAL_STATUS
+        and _valid_retry_after(call.get("retry_after"))
+        and GATE_DRAIN_TEXT in error
+        and GATE_RETRY_TEXT in error
     )
 
 
@@ -2373,17 +2400,19 @@ class DrainV2Assertions:
         """From `lead` seconds before the deadline until the node suspends the
         sandbox, one probe after another, each call judged by the node's state
         read just before it. A call made while the node held the VM running
-        must pass, before the deadline and past it, as a drain refuses no
-        call to a running sandbox. If the node read not running just after
-        it, the suspend began during the call: the call may still pass, and
-        the one refusal excused is the drain's documented retryable answer, a
-        `GATE_REFUSAL_STATUS` (503) with a `Retry-After`, recorded under
-        `overlapping_suspend`. Any other answer to a call made while the VM
-        ran fails the run; none is discarded. At least one call lands
-        before the deadline, when the node must still hold the VM. Past the
-        deadline the node suspends at the controller's first evacuating
-        call, up to a tick after it, so a run may or may not judge a call
-        there that the VM outlived: `expect_sampled_past_deadline` judges
+        must pass, before the deadline and past it, as a drain refuses no call
+        to a running sandbox. If the node read not running just after it, the
+        suspend began during the call: the call may still pass, and the one
+        refusal excused is the drain's documented retryable answer,
+        `drain_refused_the_call`, recorded with its body under
+        `overlapping_suspend`. A 503 with a valid `Retry-After` whose body
+        doesn't say it is the drain's can't be told from a busy API's, so it
+        ends the run inconclusive rather than excused. Any other answer to a
+        call made while the VM ran fails the run; none is discarded. At least
+        one call lands before the deadline, when the node must still hold the
+        VM. Past the deadline the node suspends at the controller's first
+        evacuating call, up to a tick after it, so a run may or may not judge a
+        call there that the VM outlived: `expect_sampled_past_deadline` judges
         that. The statuses before and past the deadline of the calls the VM
         outlived, and the overlapping ones."""
 
@@ -2409,6 +2438,7 @@ class DrainV2Assertions:
                     {
                         "status": answer.status,
                         "retry_after": answer.retry_after,
+                        "body": answer.body,
                         "seconds_to_deadline": round(asked, 1),
                     }
                 )
@@ -2436,16 +2466,28 @@ class DrainV2Assertions:
             "a call to a running sandbox around the deadline did not pass",
             **seen,
         )
+        judged = [
+            call
+            for call in overlapping
+            if call["status"] != CALL_PASSED_STATUS and not drain_refused_the_call(call)
+        ]
+        unattributed = [
+            call
+            for call in judged
+            if call["status"] == GATE_REFUSAL_STATUS and _valid_retry_after(call["retry_after"])
+        ]
         self._fixture.verify(
-            all(
-                call["status"] == CALL_PASSED_STATUS
-                or (call["status"] == GATE_REFUSAL_STATUS and call["retry_after"] is not None)
-                for call in overlapping
-            ),
+            len(judged) == len(unattributed),
             "a call made while the VM ran was refused, as its suspend began, with something "
             "but the drain's retryable 503 with Retry-After",
             **seen,
         )
+        if unattributed:
+            raise InconclusiveSmoke(
+                "a call made while the VM ran was answered, as its suspend began, with a 503 and "
+                "Retry-After that doesn't say it is the drain's, which a busy API's could be "
+                f"(calls_around_deadline_{bare})"
+            )
         return seen
 
     def expect_sampled_past_deadline(self, seen: Mapping[str, list[Any]]) -> None:

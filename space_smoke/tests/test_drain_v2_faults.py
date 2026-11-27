@@ -416,7 +416,7 @@ class GateAnswers(unittest.TestCase):
             {
                 "before_deadline": [CALL_PASSED_STATUS],
                 "past_deadline": [],
-                "overlapping_suspend": [{"status": CALL_PASSED_STATUS, "retry_after": None, "seconds_to_deadline": seen["overlapping_suspend"][0]["seconds_to_deadline"]}],
+                "overlapping_suspend": [{"status": CALL_PASSED_STATUS, "retry_after": None, "body": {}, "seconds_to_deadline": seen["overlapping_suspend"][0]["seconds_to_deadline"]}],
             },
         )
         self.assertEqual(caller.commands, 2)
