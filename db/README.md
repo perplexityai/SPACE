@@ -459,9 +459,13 @@ A release that applies these migrations without writing either leaves the
 column NULL and the table empty, so both downs go through. A non-NULL
 `attempt_id` doesn't hold back `20261114030001`'s down: it drops the ids, which
 a release without the column never reads. Once a node has recorded a guarded
-row, the down that guards it refuses while the row stays. No store code deletes
-attempt outcomes, so `20261114030002`'s down refuses on that node until an
-operator deletes them. An image-only rollback runs no down, so after a node
+row, the down that guards it refuses while the row stays. Sandbox-manager's
+idle retention pruner (`SPACE_SBXMGR_RUNTIME_UPGRADE_RETENTION_SECS`, 7 days by
+default) deletes idle attempt outcomes once neither their sandbox nor their
+operation holds local state; rows for sandboxes that remain on the node are
+never pruned, so long-lived sandboxes keep accumulating rows and blocking
+`20261114030002`'s down until the sandbox leaves the node or an operator deletes
+them. An image-only rollback runs no down, so after a node
 records an outcome the older release can't parse, such as `refused`, roll it
 back only to a release whose store parses that outcome. Bundling these
 migrations isn't enough: at the commit that adds them, the store's
@@ -522,6 +526,25 @@ SELECT COUNT(*) FROM sandbox_runtime_upgrade_abandoned;
 An image-only rollback runs no down, so once that count is nonzero, roll the
 binary back only to a release that enforces abandonment, or keep every caller
 of the abandoned operations quiet first.
+
+`20261124190900_sandbox_runtime_upgrade_retention` adds nullable
+`last_seen_at TEXT` to `sandbox_runtime_upgrade_attempt_outcomes` and
+`sandbox_runtime_upgrade_abandoned` for bounded idle retention
+(`SPACE_SBXMGR_RUNTIME_UPGRADE_RETENTION_SECS`) and backfills `NULL` rows to
+`strftime('%s', 'now')` without changing `recorded_at`, `recorded_seq`, or
+`rowid`. Initial writes stamp `last_seen_at = recorded_at`, and refusal or
+repeat-abandon hits refresh matching rows monotonically without changing
+`recorded_at`. Rows whose sandbox still has a local `sandboxes` row (or local
+artifact, transfer, or delete-outbox state) are never pruned, so long-lived
+sandboxes keep accumulating rows and blocking `20261114030002`'s and
+`20261120230000`'s downs until the sandbox leaves the node or an operator
+deletes them. Rows written during an image-only rollback to a pre-retention
+build leave `last_seen_at` `NULL` (falling back to `recorded_at`), whereas hits
+during that rollback on rows that already carry a non-`NULL` `last_seen_at`
+don't advance `last_seen_at`, so rolling forward measures their idle age from
+before the rollback. Its down migration drops `last_seen_at` from both tables
+without deleting rows, and re-applying `up` stamps a fresh `last_seen_at` across
+surviving rows.
 
 ## Console password provisioning
 

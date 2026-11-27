@@ -2031,7 +2031,22 @@ attempt's outcome under the sandbox's upgrade lock, since that lock doesn't
 serialize a request for another sandbox under the same operation id, and
 `UpgradeRuntime` refuses a stopped target's request for an attempt whose
 activation was refused the same way, as the operation's records did while
-they stood. Nothing prunes these rows yet. An upgraded or
+they stood. `SPACE_SBXMGR_RUNTIME_UPGRADE_RETENTION_SECS` (7 days by default;
+`0`, `false`, `no`, `off`, or `disabled` turns pruning off) bounds how long idle
+rows stay in `sandbox_runtime_upgrade_attempt_outcomes` and
+`sandbox_runtime_upgrade_abandoned`: same-sandbox refusal or repeat-abandon hits
+on `UpgradeRuntime`, a `Wake` carrying `runtime_upgrade`, and
+`AbandonRuntimeUpgrade` refresh matching rows' `last_seen_at` without changing
+`recorded_at` (`GetRuntimeUpgrade` stays read-only, and cross-sandbox calls
+never refresh another sandbox's retention). After a 15-minute startup grace, the
+recovery loop cursor-prunes rows whose `last_seen_at` (or `recorded_at` when
+`NULL`) has aged past that window once neither the sandbox nor the operation
+holds local state or the sandbox's upgrade lock; rows whose sandbox still has a
+local `sandboxes` row remain on the node until the sandbox leaves it. Once a row
+is pruned after the sandbox has left the node, a late call without `stage_from`
+gets `NotFound`, while preventing a late call carrying `stage_from` past the
+7-day window relies on the control plane having retired the operation and
+dropped its checkpoint within that window. An upgraded or
 already-on-target outcome is answered to any attempt, but for a started
 target the attempt's start can still fail after it: the sandbox runs another
 pod's execution, moved off the execution the start was decided on, or the
@@ -2389,8 +2404,9 @@ shim that sends its id.
 A sandbox-manager from this release applies the
 `sandbox_runtime_upgrade_outcomes`, `sandbox_runtime_upgrade_attempt_id`,
 `sandbox_runtime_upgrade_attempt_outcomes`,
-`sandbox_runtime_upgrade_attempt_identity` and
-`sandbox_runtime_upgrade_abandoned` migrations at startup, and an older one,
+`sandbox_runtime_upgrade_attempt_identity`,
+`sandbox_runtime_upgrade_abandoned` and
+`sandbox_runtime_upgrade_retention` migrations at startup, and an older one,
 from before SQLite rollbacks became image-only, refuses a database whose
 migration history holds a version it doesn't bundle. So a rollback build
 reverts the code but keeps those migrations, their files under
@@ -2453,9 +2469,18 @@ attempt its caller already gave up would run again. An outcome without them,
 which a build from before the columns writes, doesn't block it. The abandoned
 migration's down migration refuses while an abandoned operation is recorded,
 since an older release would let a late call for it change a disk the control
-plane has already captured. Nothing prunes those records, so once a node has
-abandoned an operation, that down migration refuses until an operator deletes
-them.
+plane has already captured. Idle retention
+(`SPACE_SBXMGR_RUNTIME_UPGRADE_RETENTION_SECS`, 7 days by default) prunes
+abandoned operations and attempt outcomes once they've gone unused past that
+window with no local sandbox or operation state; rows whose sandbox remains on
+the node aren't pruned, so long-lived sandboxes keep accumulating rows and
+blocking those downs until the sandbox leaves the node or an operator deletes
+them. The retention migration's down migration drops `last_seen_at` from both
+tables without deleting rows, and re-applying `up` stamps a fresh `last_seen_at`
+across surviving rows. Hits during an image-only rollback to a pre-retention
+build on rows that already carry a non-`NULL` `last_seen_at` don't advance
+`last_seen_at`, so rolling forward again measures their idle age from before the
+rollback.
 
 Before running a rollback build on a node that may have abandoned an
 operation, stop every caller of `AbandonRuntimeUpgrade`, and confirm that no

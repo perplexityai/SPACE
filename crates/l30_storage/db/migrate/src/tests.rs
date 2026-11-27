@@ -234,26 +234,28 @@ async fn capture_time_marker_round_trips_and_reupgrades_as_not_comparable() {
     );
 }
 
-/// The four runtime-upgrade migrations: the attempt id, the attempt outcomes,
-/// the attempt identity and abandoned operations.
-const RUNTIME_UPGRADE_MIGRATIONS: [i64; 4] = [
+/// The five runtime-upgrade migrations: the attempt id, the attempt outcomes,
+/// the attempt identity, abandoned operations and retention tracking.
+const RUNTIME_UPGRADE_MIGRATIONS: [i64; 5] = [
     20261114030001,
     20261114030002,
     ATTEMPT_IDENTITY_MIGRATION,
     20261120230000,
+    20261124190900,
 ];
 /// Another change's migration that sorts between them: the node's activation
 /// seal.
 const ACTIVATION_SEAL_MIGRATION: i64 = 20261117234108;
 /// The runtime-upgrade migrations with the one that sorts between them, in
-/// order: a database at the earlier head takes these as its next five, and a
+/// order: a database at the earlier head takes these as its next six, and a
 /// `down` reverts them newest first.
-const RUNTIME_UPGRADE_SPAN: [i64; 5] = [
+const RUNTIME_UPGRADE_SPAN: [i64; 6] = [
     RUNTIME_UPGRADE_MIGRATIONS[0],
     RUNTIME_UPGRADE_MIGRATIONS[1],
     ACTIVATION_SEAL_MIGRATION,
     RUNTIME_UPGRADE_MIGRATIONS[2],
     RUNTIME_UPGRADE_MIGRATIONS[3],
+    RUNTIME_UPGRADE_MIGRATIONS[4],
 ];
 /// The newest sandbox-manager migration that shipped before them.
 const BEFORE_RUNTIME_UPGRADE_MIGRATIONS: i64 = 20261114020000;
@@ -261,6 +263,11 @@ const BEFORE_RUNTIME_UPGRADE_MIGRATIONS: i64 = 20261114020000;
 const ATTEMPT_ID_TABLES: [&str; 2] = [
     "sandbox_runtime_upgrades",
     "sandbox_runtime_upgrade_outcomes",
+];
+/// The tables 20261124190900 adds `last_seen_at` to.
+const LAST_SEEN_AT_TABLES: [&str; 2] = [
+    "sandbox_runtime_upgrade_attempt_outcomes",
+    "sandbox_runtime_upgrade_abandoned",
 ];
 
 /// Whether `table` exists in the SQLite database at `path`.
@@ -293,9 +300,26 @@ fn tables_with_attempt_id(path: &Path) -> usize {
         .count()
 }
 
+/// The `LAST_SEEN_AT_TABLES` that have a `last_seen_at` column.
+fn tables_with_last_seen_at(path: &Path) -> usize {
+    let conn = Connection::open(path).unwrap();
+    LAST_SEEN_AT_TABLES
+        .iter()
+        .filter(|table| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_xinfo(?1) WHERE name = 'last_seen_at'",
+                [table],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+                == 1
+        })
+        .count()
+}
+
 /// The runtime-upgrade migrations come after every migration that shipped
 /// before them, next to each other but for the activation seal, so a database
-/// at that earlier head takes them and the seal as its next five
+/// at that earlier head takes them and the seal as its next six
 /// ([`RUNTIME_UPGRADE_SPAN`]) and a `down` reverts them, newest first, before
 /// it reaches any earlier migration. Up, down and up again round-trip; newer
 /// migrations are rolled back first. The attempt-outcome table has no foreign
@@ -373,6 +397,11 @@ async fn runtime_upgrade_migrations_follow_their_predecessors_and_round_trip() {
             ATTEMPT_ID_TABLES.len(),
             "round {round}: both tables have `attempt_id`"
         );
+        assert_eq!(
+            tables_with_last_seen_at(&path),
+            LAST_SEEN_AT_TABLES.len(),
+            "round {round}: both retained tables have `last_seen_at`"
+        );
         for reverted in RUNTIME_UPGRADE_SPAN.iter().rev() {
             rollback().await;
             assert!(
@@ -429,7 +458,7 @@ async fn an_image_rollback_past_the_abandoned_migration_keeps_every_abandonment(
                 .service
                 .migrations
                 .iter()
-                .filter(|migration| migration.version != RUNTIME_UPGRADE_MIGRATIONS[3])
+                .filter(|migration| migration.version < RUNTIME_UPGRADE_MIGRATIONS[3])
                 .cloned()
                 .collect(),
         )
@@ -483,6 +512,248 @@ async fn an_image_rollback_past_the_abandoned_migration_keeps_every_abandonment(
     // Rolling forward again.
     migrate_sqlite_up(current, &path).await.unwrap();
     assert_eq!(kept(&conn), (true, 1), "the roll-forward finds it recorded");
+}
+
+/// Upgrading past the retention migration stamps pre-existing rows'
+/// `last_seen_at` to the migration's Unix epoch second without touching
+/// `recorded_at`. An image rollback leaves `last_seen_at` in place, lets the
+/// prior release insert rows with `last_seen_at IS NULL`, and preserves both on
+/// roll-forward. Running `down`, re-`up`, and `down` on the retention migration
+/// drops and re-stamps `last_seen_at` without deleting rows, changing
+/// `recorded_at`, or renumbering `recorded_seq` / `rowid`, so a refreshed row
+/// keeps a full retention window across schema rollback and roll-forward and
+/// the earlier migrations' row guards still protect them.
+#[tokio::test]
+async fn retention_migration_keeps_rows_across_image_rollback_and_down() {
+    static PRIOR: std::sync::LazyLock<Migrator> = std::sync::LazyLock::new(|| {
+        Migrator::with_migrations(
+            pplx_space_sbx_mgr_store::db::migration::target()
+                .service
+                .migrations
+                .iter()
+                .filter(|migration| migration.version < RUNTIME_UPGRADE_MIGRATIONS[4])
+                .cloned()
+                .collect(),
+        )
+    });
+    type RowKeys = Vec<(i64, String, String)>;
+    let row_identities = |path: &Path| -> (RowKeys, RowKeys) {
+        let conn = Connection::open(path).unwrap();
+        let attempts = conn
+            .prepare(
+                "SELECT recorded_seq, operation_id, recorded_at
+                   FROM sandbox_runtime_upgrade_attempt_outcomes
+                  ORDER BY recorded_seq",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let abandoned = conn
+            .prepare(
+                "SELECT rowid, operation_id, recorded_at
+                   FROM sandbox_runtime_upgrade_abandoned
+                  ORDER BY rowid",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        (attempts, abandoned)
+    };
+    let op_seen = "00000000-0000-4000-8000-000000000001";
+    let op_prior = "00000000-0000-4000-8000-000000000002";
+    let op_abandoned_seen = "00000000-0000-4000-8000-000000000003";
+    let op_abandoned_prior = "00000000-0000-4000-8000-000000000004";
+    let sandbox_id = "00000000-0000-4000-8000-000000000010";
+    let expected_identities = (
+        vec![
+            (7, op_seen.to_string(), "10".to_string()),
+            (42, op_prior.to_string(), "40".to_string()),
+        ],
+        vec![
+            (11, op_abandoned_seen.to_string(), "10".to_string()),
+            (99, op_abandoned_prior.to_string(), "40".to_string()),
+        ],
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sandbox.sqlite");
+    let current = SqliteDatabase::from(pplx_space_sbx_mgr_store::db::migration::target());
+    let prior = SqliteDatabase {
+        migrator: &PRIOR,
+        ..current
+    };
+
+    // Pre-retention rows exist with ancient `recorded_at = '10'` before `up` runs.
+    migrate_sqlite_up(prior, &path).await.unwrap();
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO sandbox_runtime_upgrade_attempt_outcomes
+                 (recorded_seq, operation_id, attempt_id, sandbox_id, outcome, failure,
+                  recorded_at, target_environment, target_state, authorization_id)
+             VALUES (7, ?1, 'attempt-a', ?2, 'rolled_back', NULL, '10',
+                     'env', 'started', 'auth')",
+            params![op_seen, sandbox_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sandbox_runtime_upgrade_abandoned
+                 (rowid, operation_id, sandbox_id, recorded_at)
+             VALUES (11, ?1, ?2, '10')",
+            params![op_abandoned_seen, sandbox_id],
+        )
+        .unwrap();
+    }
+
+    let before_initial_up = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    migrate_sqlite_up(current, &path).await.unwrap();
+    let conn = Connection::open(&path).unwrap();
+    let initial_stamped: (String, String) = conn
+        .query_row(
+            "SELECT
+                 (SELECT last_seen_at FROM sandbox_runtime_upgrade_attempt_outcomes
+                   WHERE operation_id = ?1),
+                 (SELECT last_seen_at FROM sandbox_runtime_upgrade_abandoned
+                   WHERE operation_id = ?2)",
+            params![op_seen, op_abandoned_seen],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(initial_stamped.0.parse::<u64>().unwrap() >= before_initial_up.saturating_sub(1));
+    assert!(initial_stamped.1.parse::<u64>().unwrap() >= before_initial_up.saturating_sub(1));
+
+    // Set distinct refreshed timestamps, then simulate an image-only rollback to
+    // the prior release, which writes new rows without `last_seen_at`.
+    conn.execute(
+        "UPDATE sandbox_runtime_upgrade_attempt_outcomes
+            SET last_seen_at = '25'
+          WHERE operation_id = ?1",
+        params![op_seen],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE sandbox_runtime_upgrade_abandoned
+            SET last_seen_at = '30'
+          WHERE operation_id = ?1",
+        params![op_abandoned_seen],
+    )
+    .unwrap();
+
+    migrate_sqlite_up(prior, &path).await.unwrap();
+    conn.execute(
+        "INSERT INTO sandbox_runtime_upgrade_attempt_outcomes
+             (recorded_seq, operation_id, attempt_id, sandbox_id, outcome, failure,
+              recorded_at, target_environment, target_state, authorization_id)
+         VALUES (42, ?1, 'attempt-b', ?2, 'rolled_back', NULL, '40',
+                 'env', 'started', 'auth')",
+        params![op_prior, sandbox_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sandbox_runtime_upgrade_abandoned
+             (rowid, operation_id, sandbox_id, recorded_at)
+         VALUES (99, ?1, ?2, '40')",
+        params![op_abandoned_prior, sandbox_id],
+    )
+    .unwrap();
+
+    // Image roll-forward runs no migration, so stamped `last_seen_at` and NULL rows survive.
+    migrate_sqlite_up(current, &path).await.unwrap();
+    let seen_quad: (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = conn
+        .query_row(
+            "SELECT
+                 (SELECT last_seen_at FROM sandbox_runtime_upgrade_attempt_outcomes
+                   WHERE operation_id = ?1),
+                 (SELECT last_seen_at FROM sandbox_runtime_upgrade_attempt_outcomes
+                   WHERE operation_id = ?2),
+                 (SELECT last_seen_at FROM sandbox_runtime_upgrade_abandoned
+                   WHERE operation_id = ?3),
+                 (SELECT last_seen_at FROM sandbox_runtime_upgrade_abandoned
+                   WHERE operation_id = ?4)",
+            params![op_seen, op_prior, op_abandoned_seen, op_abandoned_prior],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        seen_quad,
+        (Some("25".to_string()), None, Some("30".to_string()), None,)
+    );
+    drop(conn);
+    assert_eq!(row_identities(&path), expected_identities);
+
+    // Roll back newer migrations, if any, then revert the retention migration,
+    // re-apply it, verify every surviving row gets a fresh `last_seen_at` that
+    // holds off the retention pruner despite ancient `recorded_at`, and revert again.
+    let revert_to_before_retention = || async {
+        let newer = current
+            .migrator
+            .iter()
+            .filter(|migration| {
+                migration.migration_type.is_up_migration()
+                    && migration.version > RUNTIME_UPGRADE_MIGRATIONS[4]
+            })
+            .count();
+        for _ in 0..newer {
+            rollback_last_sqlite_database(current, &path, &COMMON_SCHEMA_MIGRATOR)
+                .await
+                .unwrap();
+        }
+        rollback_last_sqlite_database(current, &path, &COMMON_SCHEMA_MIGRATOR)
+            .await
+            .unwrap();
+    };
+    revert_to_before_retention().await;
+    assert_eq!(tables_with_last_seen_at(&path), 0);
+    assert_eq!(row_identities(&path), expected_identities);
+
+    let before_reup = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    migrate_sqlite_up(current, &path).await.unwrap();
+    assert_eq!(tables_with_last_seen_at(&path), LAST_SEEN_AT_TABLES.len());
+    {
+        let conn = Connection::open(&path).unwrap();
+        for table in LAST_SEEN_AT_TABLES {
+            let stamps: Vec<String> = conn
+                .prepare(&format!("SELECT last_seen_at FROM {table}"))
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(stamps.len(), 2);
+            for stamp in stamps {
+                assert!(stamp.parse::<u64>().unwrap() >= before_reup.saturating_sub(1));
+            }
+        }
+    }
+    assert_eq!(row_identities(&path), expected_identities);
+
+    revert_to_before_retention().await;
+    assert_eq!(tables_with_last_seen_at(&path), 0);
+    assert_eq!(row_identities(&path), expected_identities);
+
+    // And the abandoned migration's own guard still blocks the next down.
+    let guarded = rollback_last_sqlite_database(current, &path, &COMMON_SCHEMA_MIGRATOR)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{guarded:?}").contains("CHECK constraint failed"),
+        "{guarded:?}"
+    );
 }
 
 /// Each runtime-upgrade down refuses while a row it guards is recorded (an

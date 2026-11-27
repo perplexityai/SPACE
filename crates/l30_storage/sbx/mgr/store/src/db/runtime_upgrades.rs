@@ -756,6 +756,7 @@ pub fn abandon_runtime_upgrade(
 ) -> Result<AbandonRuntimeUpgrade> {
     let tx = immediate_transaction(conn)?;
     let live = runtime_upgrade(&tx, operation_id)?;
+    let mut seen_for_siblings = None;
     let outcome = if live
         .as_ref()
         .is_some_and(|record| record.sandbox_id != sandbox_id)
@@ -772,15 +773,46 @@ pub fn abandon_runtime_upgrade(
     {
         AbandonRuntimeUpgrade::Unsettled
     } else {
+        let seen_at = now()?;
+        let seen_secs: i64 = seen_at
+            .parse()
+            .map_err(crate::db::Error::to_sql_conversion)?;
+        let operation_key = operation_id.to_string();
         tx.execute(
-            "INSERT OR IGNORE INTO sandbox_runtime_upgrade_abandoned
-                 (operation_id, sandbox_id, recorded_at)
-             VALUES (?1, ?2, ?3)",
-            params![operation_id.to_string(), sandbox_id, now()?],
+            concat!(
+                "INSERT INTO sandbox_runtime_upgrade_abandoned
+                     (operation_id, sandbox_id, recorded_at, last_seen_at)
+                 VALUES (?1, ?2, ?3, ?3)
+                 ON CONFLICT (operation_id) DO UPDATE
+                     SET last_seen_at = excluded.last_seen_at
+                   WHERE ",
+                super::runtime_upgrade_retention::stale_last_seen_sql!(
+                    "sandbox_runtime_upgrade_abandoned.last_seen_at",
+                    "?4"
+                ),
+            ),
+            params![operation_key, sandbox_id, seen_at, seen_secs],
         )?;
+        seen_for_siblings = Some((operation_key, seen_at, seen_secs));
         AbandonRuntimeUpgrade::Abandoned
     };
     tx.commit()?;
+    if let Some((operation_key, seen_at, seen_secs)) = seen_for_siblings
+        && let Err(error) = super::runtime_upgrade_retention::touch_attempt_outcomes_for_sandbox(
+            conn,
+            &operation_key,
+            sandbox_id,
+            &seen_at,
+            seen_secs,
+        )
+    {
+        tracing::warn!(
+            %operation_id,
+            sandbox_id,
+            %error,
+            "could not refresh sibling runtime-upgrade attempt outcomes on abandon"
+        );
+    }
     Ok(outcome)
 }
 
@@ -1186,8 +1218,8 @@ fn record_final_attempt_outcome(
     let changed = tx.execute(
         "INSERT INTO sandbox_runtime_upgrade_attempt_outcomes (
              operation_id, attempt_id, sandbox_id, outcome, failure, recorded_at,
-             target_environment, target_state, authorization_id
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             target_environment, target_state, authorization_id, last_seen_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?6)
          ON CONFLICT (operation_id, attempt_id) DO NOTHING",
         params![
             request.operation_id.to_string(),

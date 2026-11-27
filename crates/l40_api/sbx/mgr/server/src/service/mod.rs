@@ -469,6 +469,10 @@ pub struct SandboxManagerService {
     /// Whether runtime upgrade attempts are final
     /// ([`runtime_upgrade::ATTEMPT_FINALITY_ENABLED_ENV`], off by default).
     runtime_upgrade_attempt_finality: bool,
+    /// Idle retention window for settled runtime-upgrade attempt outcomes and
+    /// abandonments ([`runtime_upgrade::retention::RETENTION_ENV`]); `None`
+    /// disables pruning.
+    runtime_upgrade_retention: Option<Duration>,
     node_manager: NodeManagerConnector,
     /// See [`SandboxManagerServiceOptions::volume_manager_socket_path`].
     volume_manager_socket_path: PathBuf,
@@ -1956,6 +1960,7 @@ impl SandboxManagerService {
                 runtime_upgrade::ATTEMPT_FINALITY_ENABLED_ENV,
                 false,
             ),
+            runtime_upgrade_retention: runtime_upgrade::retention::retention_from_env(),
             gateway_caller_client: options.node_manager.lazy(),
             gateway_authority,
             snapshot_upload_config: {

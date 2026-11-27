@@ -30,11 +30,16 @@ use crate::service::activation_support::internal_request;
 use crate::state::{SandboxState, SandboxStatus};
 
 const POD_NETNS: &str = "/var/run/netns/cni-runtime-upgrade";
-const POD_UID: &str = "4f6b0d4e-6a59-4b5c-9e43-3a1d0d6f2a10";
+pub(in crate::service::runtime_upgrade) const POD_UID: &str =
+    "4f6b0d4e-6a59-4b5c-9e43-3a1d0d6f2a10";
 const OTHER_POD_UID: &str = "9d2c6f1b-0c1e-4a57-8b0e-5f7a3c2d1e40";
 
 /// The route identity a pod's shim sends: Kubernetes, with the pod's UID.
-fn pod_identity(sandbox_id: &str, pod_uid: &str, generation: i64) -> SpaceApiRouteIdentity {
+pub(in crate::service::runtime_upgrade) fn pod_identity(
+    sandbox_id: &str,
+    pod_uid: &str,
+    generation: i64,
+) -> SpaceApiRouteIdentity {
     SpaceApiRouteIdentity {
         sandbox_id: Some(sandbox_id.to_string()),
         route_generation: Some(generation.cast_unsigned()),
@@ -94,7 +99,7 @@ impl Fixture {
         }
     }
 
-    fn assert_no_node_calls(&self) {
+    pub(in crate::service::runtime_upgrade) fn assert_no_node_calls(&self) {
         assert!(self._node.calls().is_empty(), "{:?}", self._node.calls());
     }
 
@@ -3385,7 +3390,7 @@ async fn a_final_attempts_late_retry_never_replaces_the_latest_refused_attempt()
     );
 }
 
-fn abandon(
+pub(in crate::service::runtime_upgrade) fn abandon(
     service: &SandboxManagerService,
     sandbox_id: &str,
     operation_id: RuntimeUpgradeOperationId,
