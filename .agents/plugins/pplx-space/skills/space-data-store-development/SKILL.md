@@ -50,9 +50,31 @@ Exemplar: `crates/l30_storage/sandbox/store` (`pplx-space-sandbox-store`, the
   aliases; sqlx stays the store's own dependency. A Storage crate depends on
   `pplx-space-postgres-pool` without a `[rules.layers.store_users]` entry
   (archcheck's `[rules.layers] storage_handles`). A JSON column or argument
-  crosses the API as its Rust type (the typed document or
-  `serde_json::Value`): the store decodes it through `sqlx::types::Json` in a
-  private row struct, and wraps an argument in `Json(..)` where it binds it.
+  crosses the API as its plain Rust type (the typed document or
+  `serde_json::Value`): public rows, verb arguments and return types use
+  `T`, `Option<T>`, `&T`, `Vec<T>` or `&[T]`, and `sqlx::types::Json`
+  appears only inside the store. There it keeps the shape of the SQL value:
+  `Json<T>` for one document, `Option<Json<T>>` where the value can be SQL
+  NULL, `Json<Option<T>>` where a `NOT NULL` column stores `None` as JSON
+  `null`, and `Vec<Json<T>>` for a `JSONB[]`. Decode a document field of a
+  `FromRow` row with `#[sqlx(json)]` only when its type is not an `Option`:
+  the attribute decodes `Json<field type>`, which fails on SQL NULL. Decode
+  anything else as its shape, in a private row or at the `query_scalar` or
+  `try_get`, and map `.0` (per element for a `JSONB[]`). Don't use
+  `#[sqlx(json(nullable))]` where the column can hold JSON `null`: it
+  decodes a stored JSON `null` as `None`, like SQL NULL. A
+  `serde_json::Value` or `Option<serde_json::Value>` field or argument may
+  instead decode and bind as itself, with no `Json`: sqlx's `Value` impls go
+  through `Json`, as `SandboxNetworkPolicyInputs` shows. Bind a document as
+  `Json(&value)`, including an optional value that a `NOT NULL` column
+  stores as JSON `null`; an optional value of a nullable column as
+  `value.as_ref().map(Json)` (`Json(&None)` stores JSON `null`, not SQL
+  NULL); and a `JSONB[]` as `values.iter().map(Json).collect::<Vec<_>>()`
+  (`Json(&values)` binds one document holding an array, as
+  `jsonb_to_recordset($1::jsonb)` reads). A `JSONB[]` whose elements can be
+  SQL NULL is a `Vec<Option<Json<T>>>`, each element bound as
+  `v.as_ref().map(Json)`: `.map(Json)` turns a `None` into a JSON `null`
+  element, and `Json<T>` fails to decode a SQL NULL element.
 - `sql!` locators on every statement. Verbs return `DbError`, or a small
   operation-specific `thiserror` enum with a variant that wraps `DbError`
   (usually `#[from] DbError`); callers classify a failure with
