@@ -29,12 +29,13 @@ use uuid::Uuid;
 /// column changes what `SELECT *` returns, and every pooled connection that
 /// already ran one then fails it with `0A000` ("cached plan must not change
 /// result type") until the pool recycles that connection. A new column a read
-/// needs is selected here and decoded in [`PublicOperationRow`]; a record
-/// that exposes it also needs the field and its line in that record's
-/// conversion. The two admin reads ([`fetch_admin`], [`list_admin`]) also
-/// select the payload's `requested_by_user_id` and the joined actor's email,
-/// with every column qualified by its table, so they spell this list out and
-/// need the new column added there too.
+/// needs is selected here, decoded in [`PublicOperationDecodeRow`], and copied
+/// into a field of [`PublicOperationRow`] by a line in their `From`
+/// conversion; an API record that exposes it also needs the field and its
+/// line in that record's conversion. The two admin reads ([`fetch_admin`],
+/// [`list_admin`]) also select the payload's `requested_by_user_id` and the
+/// joined actor's email, with every column qualified by its table, so they
+/// spell this list out and need the new column added there too.
 const PUBLIC_OPERATION_COLUMNS: &str = "operation_id,
        org_id,
        actor_user_id,
@@ -66,7 +67,7 @@ fn public_operation_query(sql: &str) -> String {
 
 /// One whole operation, as [`PUBLIC_OPERATION_COLUMNS`] selects it. Both the
 /// public and the admin record are built from it.
-#[derive(Debug, FromRow)]
+#[derive(Debug)]
 pub struct PublicOperationRow {
     pub operation_id: Uuid,
     pub org_id: OrgId,
@@ -78,8 +79,8 @@ pub struct PublicOperationRow {
     pub state: String,
     pub progress_message: String,
     pub terminal_error_code: Option<String>,
-    pub terminal_error_json: Option<Json<serde_json::Value>>,
-    pub result_json: Option<Json<serde_json::Value>>,
+    pub terminal_error_json: Option<serde_json::Value>,
+    pub result_json: Option<serde_json::Value>,
     pub attempts: i32,
     pub requested_at: OffsetDateTime,
     pub next_attempt_at: OffsetDateTime,
@@ -89,14 +90,82 @@ pub struct PublicOperationRow {
     pub updated_at: OffsetDateTime,
 }
 
+/// A [`PublicOperationRow`] as read.
+#[derive(FromRow)]
+struct PublicOperationDecodeRow {
+    operation_id: Uuid,
+    org_id: OrgId,
+    actor_user_id: Option<UserId>,
+    api_product: String,
+    kind: String,
+    target_type: Option<String>,
+    target_id: Option<String>,
+    state: String,
+    progress_message: String,
+    terminal_error_code: Option<String>,
+    terminal_error_json: Option<Json<serde_json::Value>>,
+    result_json: Option<Json<serde_json::Value>>,
+    attempts: i32,
+    requested_at: OffsetDateTime,
+    next_attempt_at: OffsetDateTime,
+    created_at: OffsetDateTime,
+    started_at: Option<OffsetDateTime>,
+    completed_at: Option<OffsetDateTime>,
+    updated_at: OffsetDateTime,
+}
+
+impl From<PublicOperationDecodeRow> for PublicOperationRow {
+    fn from(record: PublicOperationDecodeRow) -> Self {
+        Self {
+            operation_id: record.operation_id,
+            org_id: record.org_id,
+            actor_user_id: record.actor_user_id,
+            api_product: record.api_product,
+            kind: record.kind,
+            target_type: record.target_type,
+            target_id: record.target_id,
+            state: record.state,
+            progress_message: record.progress_message,
+            terminal_error_code: record.terminal_error_code,
+            terminal_error_json: record.terminal_error_json.map(|json| json.0),
+            result_json: record.result_json.map(|json| json.0),
+            attempts: record.attempts,
+            requested_at: record.requested_at,
+            next_attempt_at: record.next_attempt_at,
+            created_at: record.created_at,
+            started_at: record.started_at,
+            completed_at: record.completed_at,
+            updated_at: record.updated_at,
+        }
+    }
+}
+
 /// [`PublicOperationRow`] plus the columns only the admin record has: the
 /// payload's `requested_by_user_id` and the joined actor's email.
-#[derive(Debug, FromRow)]
+#[derive(Debug)]
 pub struct AdminPublicOperationRow {
-    #[sqlx(flatten)]
     pub operation: PublicOperationRow,
     pub requested_by_user_id: Option<String>,
     pub actor_email: Option<String>,
+}
+
+/// An [`AdminPublicOperationRow`] as read.
+#[derive(FromRow)]
+struct AdminPublicOperationDecodeRow {
+    #[sqlx(flatten)]
+    operation: PublicOperationDecodeRow,
+    requested_by_user_id: Option<String>,
+    actor_email: Option<String>,
+}
+
+impl From<AdminPublicOperationDecodeRow> for AdminPublicOperationRow {
+    fn from(record: AdminPublicOperationDecodeRow) -> Self {
+        Self {
+            operation: record.operation.into(),
+            requested_by_user_id: record.requested_by_user_id,
+            actor_email: record.actor_email,
+        }
+    }
 }
 
 /// Whole seconds left before `hard_deadline_secs` after `operation_id` was
@@ -153,11 +222,14 @@ pub async fn fetch(
         ))
     });
     Ok(
-        sqlx::query_as::<_, PublicOperationRow>(sqlx::AssertSqlSafe(FETCH_OPERATION_SQL.as_str()))
-            .bind(org_id)
-            .bind(operation_id.as_uuid())
-            .fetch_optional(executor.into_sqlx())
-            .await?,
+        sqlx::query_as::<_, PublicOperationDecodeRow>(sqlx::AssertSqlSafe(
+            FETCH_OPERATION_SQL.as_str(),
+        ))
+        .bind(org_id)
+        .bind(operation_id.as_uuid())
+        .fetch_optional(executor.into_sqlx())
+        .await?
+        .map(Into::into),
     )
 }
 
@@ -189,12 +261,32 @@ pub async fn in_owner_scope(
 }
 
 /// What a fork operation's outcome is read from.
-#[derive(Debug, FromRow)]
+#[derive(Debug)]
 pub struct ForkOutcomeRow {
     pub state: String,
-    pub result_json: Option<Json<serde_json::Value>>,
+    pub result_json: Option<serde_json::Value>,
     pub terminal_error_code: Option<String>,
-    pub terminal_error_json: Option<Json<serde_json::Value>>,
+    pub terminal_error_json: Option<serde_json::Value>,
+}
+
+/// A [`ForkOutcomeRow`] as read.
+#[derive(FromRow)]
+struct ForkOutcomeDecodeRow {
+    state: String,
+    result_json: Option<Json<serde_json::Value>>,
+    terminal_error_code: Option<String>,
+    terminal_error_json: Option<Json<serde_json::Value>>,
+}
+
+impl From<ForkOutcomeDecodeRow> for ForkOutcomeRow {
+    fn from(record: ForkOutcomeDecodeRow) -> Self {
+        Self {
+            state: record.state,
+            result_json: record.result_json.map(|json| json.0),
+            terminal_error_code: record.terminal_error_code,
+            terminal_error_json: record.terminal_error_json.map(|json| json.0),
+        }
+    }
 }
 
 /// The state, result and terminal error of the fork operation `operation_id`.
@@ -203,7 +295,7 @@ pub async fn fork_outcome(
     org_id: OrgId,
     operation_id: OperationId,
 ) -> Result<Option<ForkOutcomeRow>, DbError> {
-    Ok(sqlx::query_as::<_, ForkOutcomeRow>(sql!(
+    Ok(sqlx::query_as::<_, ForkOutcomeDecodeRow>(sql!(
         "SELECT state, result_json, terminal_error_code, terminal_error_json
          FROM public_operations
          WHERE org_id = $1 AND operation_id = $2 AND kind = 'fork_sandbox'"
@@ -211,7 +303,8 @@ pub async fn fork_outcome(
     .bind(org_id)
     .bind(operation_id.as_uuid())
     .fetch_optional(executor.into_sqlx())
-    .await?)
+    .await?
+    .map(Into::into))
 }
 
 /// The payload of the fork operation `operation_id`.
@@ -219,7 +312,7 @@ pub async fn fork_payload(
     executor: impl Executor<'_>,
     org_id: OrgId,
     operation_id: OperationId,
-) -> Result<Option<Json<serde_json::Value>>, DbError> {
+) -> Result<Option<serde_json::Value>, DbError> {
     Ok(sqlx::query_scalar::<_, Json<serde_json::Value>>(sql!(
         "SELECT payload_json
          FROM public_operations
@@ -228,14 +321,16 @@ pub async fn fork_payload(
     .bind(org_id)
     .bind(operation_id.as_uuid())
     .fetch_optional(executor.into_sqlx())
-    .await?)
+    .await?
+    .map(|json| json.0))
 }
 
 /// The state and payload of a fork operation.
 #[derive(Debug, FromRow)]
 pub struct ForkStateRow {
     pub state: String,
-    pub payload_json: Json<serde_json::Value>,
+    #[sqlx(json)]
+    pub payload_json: serde_json::Value,
 }
 
 /// The state and payload of the fork operation `operation_id`.
@@ -259,7 +354,8 @@ pub async fn fork_state(
 #[derive(Debug, FromRow)]
 pub struct ActiveForkRow {
     pub operation_id: Uuid,
-    pub payload_json: Json<serde_json::Value>,
+    #[sqlx(json)]
+    pub payload_json: serde_json::Value,
 }
 
 /// The queued or running forks of `source_sandbox_id` in `org_id`, oldest
@@ -296,7 +392,7 @@ pub async fn fetch_admin(
     executor: impl Executor<'_>,
     operation_id: OperationId,
 ) -> Result<Option<AdminPublicOperationRow>, DbError> {
-    Ok(sqlx::query_as::<_, AdminPublicOperationRow>(sql!(
+    Ok(sqlx::query_as::<_, AdminPublicOperationDecodeRow>(sql!(
         "SELECT op.operation_id,
                     op.org_id,
                     op.actor_user_id,
@@ -327,7 +423,8 @@ pub async fn fetch_admin(
     .bind(operation_id.as_uuid())
     .bind(OperationKind::CreateSandbox.as_str())
     .fetch_optional(executor.into_sqlx())
-    .await?)
+    .await?
+    .map(Into::into))
 }
 
 /// The filters of [`list_admin`]. `None` matches every value.
@@ -348,7 +445,7 @@ pub async fn list_admin(
     executor: impl Executor<'_>,
     filter: AdminOperationFilter<'_>,
 ) -> Result<Vec<AdminPublicOperationRow>, DbError> {
-    Ok(sqlx::query_as::<_, AdminPublicOperationRow>(sql!(
+    Ok(sqlx::query_as::<_, AdminPublicOperationDecodeRow>(sql!(
         "SELECT op.operation_id,
                     op.org_id,
                     op.actor_user_id,
@@ -390,7 +487,10 @@ pub async fn list_admin(
     .bind(filter.limit)
     .bind(OperationKind::CreateSandbox.as_str())
     .fetch_all(executor.into_sqlx())
-    .await?)
+    .await?
+    .into_iter()
+    .map(Into::into)
+    .collect())
 }
 
 /// Whether `operation_id` exists in `org_id`.
@@ -793,7 +893,8 @@ pub struct ClaimedPublicOperationRow {
     pub kind: String,
     pub target_type: Option<String>,
     pub target_id: Option<String>,
-    pub payload_json: Json<serde_json::Value>,
+    #[sqlx(json)]
+    pub payload_json: serde_json::Value,
     pub attempts: i32,
     pub claim_generation: i64,
     pub traceparent: Option<String>,
@@ -879,7 +980,7 @@ pub struct Expiries<'a> {
     pub operation_ids: &'a [Uuid],
     pub progress_messages: &'a [String],
     pub terminal_error_codes: &'a [String],
-    pub terminal_error_jsons: &'a [Json<serde_json::Value>],
+    pub terminal_error_jsons: &'a [serde_json::Value],
 }
 
 /// Record each operation of `expiries`, whose rows the caller's transaction
@@ -908,7 +1009,13 @@ pub async fn expire_each(
     .bind(expiries.operation_ids)
     .bind(expiries.progress_messages)
     .bind(expiries.terminal_error_codes)
-    .bind(expiries.terminal_error_jsons)
+    .bind(
+        expiries
+            .terminal_error_jsons
+            .iter()
+            .map(Json)
+            .collect::<Vec<_>>(),
+    )
     .execute(executor.into_sqlx())
     .await?;
     Ok(())

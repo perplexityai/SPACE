@@ -16,7 +16,7 @@ use pplx_space_public_operation_store::operations::{ClaimedPublicOperationRow, J
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_store as sandbox_store;
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Postgres, Transaction, types::Json};
+use sqlx::{PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -284,7 +284,7 @@ impl PublicOperationStore {
             let state = parse_stored_enum("state", &state)?;
             match state {
                 OperationState::Succeeded => {
-                    let result = result.map_or(serde_json::Value::Null, |value| value.0);
+                    let result = result.unwrap_or(serde_json::Value::Null);
                     let results = match result {
                         serde_json::Value::Array(results) => results,
                         tagged => {
@@ -306,9 +306,7 @@ impl PublicOperationStore {
                             .as_deref()
                             .map(|value| parse_stored_enum("terminal_error_code", value))
                             .transpose()?,
-                        error: error
-                            .map(|value| value.0)
-                            .unwrap_or_else(|| serde_json::json!({})),
+                        error: error.unwrap_or_else(|| serde_json::json!({})),
                     })
                 }
                 OperationState::Queued | OperationState::Running => {
@@ -335,7 +333,7 @@ impl PublicOperationStore {
 
         payload
             .map(|payload| {
-                let payload = crate::fork_operations::decode_fork_payload(payload.0)
+                let payload = crate::fork_operations::decode_fork_payload(payload)
                     .map_err(PublicOperationStoreError::InvalidStoredForkPayload)?;
                 Ok(payload.hard_deadline())
             })
@@ -2588,12 +2586,9 @@ async fn expire_overdue_queued_operations(
         .collect::<Vec<_>>();
     let errors = expiries
         .iter()
-        .map(|expiry| Json(expiry.terminal_error_json.clone()))
+        .map(|expiry| expiry.terminal_error_json.clone())
         .collect::<Vec<_>>();
-    let events = expiries
-        .iter()
-        .map(|expiry| Json(expired_event(expiry)))
-        .collect::<Vec<_>>();
+    let events = expiries.iter().map(expired_event).collect::<Vec<_>>();
     operation_store::operations::expire_each(
         &mut *tx,
         operation_store::operations::Expiries {
@@ -2932,10 +2927,10 @@ fn public_operation_record(
             .as_deref()
             .map(|value| parse_stored_enum("terminal_error_code", value))
             .transpose()?,
-        terminal_error: row.terminal_error_json.map(|value| value.0),
+        terminal_error: row.terminal_error_json,
         result: row
             .result_json
-            .map(|value| serde_json::from_value::<PublicOperationResult>(value.0))
+            .map(serde_json::from_value::<PublicOperationResult>)
             .transpose()
             .map_err(PublicOperationStoreError::InvalidStoredResult)?,
         created_at: row.created_at,
@@ -2982,8 +2977,8 @@ fn admin_public_operation_record(
             .as_deref()
             .map(|value| parse_stored_enum("terminal_error_code", value))
             .transpose()?,
-        terminal_error: row.terminal_error_json.map(|value| value.0),
-        result: row.result_json.map(|value| value.0),
+        terminal_error: row.terminal_error_json,
+        result: row.result_json,
         attempts: row.attempts,
         requested_at: row.requested_at,
         next_attempt_at: row.next_attempt_at,
@@ -3001,7 +2996,7 @@ fn public_operation_event(
         operation_id: OperationId::from_uuid(row.operation_id),
         sequence: row.sequence,
         event_type: parse_stored_enum("event_type", &row.event_type)?,
-        event: row.event_json.0,
+        event: row.event_json,
         created_at: row.created_at,
     })
 }
@@ -3036,7 +3031,7 @@ impl TryFrom<ClaimedPublicOperationRow> for ClaimedPublicOperation {
                 .map(|value| parse_stored_enum("target_type", value))
                 .transpose()?,
             target_id: row.target_id,
-            payload: row.payload_json.0,
+            payload: row.payload_json,
             attempts: row.attempts,
             claim_generation: row.claim_generation,
             traceparent: row.traceparent.filter(|traceparent| {

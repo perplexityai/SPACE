@@ -30,7 +30,8 @@ pub struct IdempotencyKeyRef<'a> {
 #[derive(Debug, FromRow)]
 pub struct RecordedReply<T> {
     pub fingerprint: String,
-    pub response: Json<T>,
+    #[sqlx(json)]
+    pub response: T,
 }
 
 /// The reply recorded under the native API's `key`, expired or not.
@@ -414,10 +415,26 @@ pub async fn bind_native_key(
 }
 
 /// A live record's fingerprint and response, if it has one.
-#[derive(Debug, FromRow)]
+#[derive(Debug)]
 pub struct LiveReplyRow {
     pub request_fingerprint: String,
-    pub response_json: Option<Json<serde_json::Value>>,
+    pub response_json: Option<serde_json::Value>,
+}
+
+/// A [`LiveReplyRow`] as read.
+#[derive(FromRow)]
+struct LiveReplyDecodeRow {
+    request_fingerprint: String,
+    response_json: Option<Json<serde_json::Value>>,
+}
+
+impl From<LiveReplyDecodeRow> for LiveReplyRow {
+    fn from(record: LiveReplyDecodeRow) -> Self {
+        Self {
+            request_fingerprint: record.request_fingerprint,
+            response_json: record.response_json.map(|json| json.0),
+        }
+    }
 }
 
 /// The live record under the native API's `key`, by the database clock.
@@ -425,7 +442,7 @@ pub async fn find_live_native_reply(
     executor: impl Executor<'_>,
     key: IdempotencyKeyRef<'_>,
 ) -> Result<Option<LiveReplyRow>, DbError> {
-    Ok(sqlx::query_as::<_, LiveReplyRow>(sql!(
+    Ok(sqlx::query_as::<_, LiveReplyDecodeRow>(sql!(
         "SELECT request_fingerprint, response_json FROM public_idempotency_records
              WHERE org_id = $1 AND api_product = 'native' AND method = $2
                AND path_template = $3 AND idempotency_key = $4 AND expires_at > NOW()"
@@ -435,7 +452,8 @@ pub async fn find_live_native_reply(
     .bind(key.path_template)
     .bind(key.idempotency_key)
     .fetch_optional(executor.into_sqlx())
-    .await?)
+    .await?
+    .map(Into::into))
 }
 
 /// The live record under the native API's `POST` key `idempotency_key` at
@@ -446,7 +464,7 @@ pub async fn find_live_native_post_reply(
     path_template: &str,
     idempotency_key: &str,
 ) -> Result<Option<LiveReplyRow>, DbError> {
-    Ok(sqlx::query_as::<_, LiveReplyRow>(sql!(
+    Ok(sqlx::query_as::<_, LiveReplyDecodeRow>(sql!(
         "SELECT request_fingerprint, response_json
          FROM public_idempotency_records
          WHERE org_id = $1
@@ -460,18 +478,39 @@ pub async fn find_live_native_post_reply(
     .bind(path_template)
     .bind(idempotency_key)
     .fetch_optional(executor.into_sqlx())
-    .await?)
+    .await?
+    .map(Into::into))
 }
 
 /// A live record as a response reservation reads it.
-#[derive(Debug, FromRow)]
+#[derive(Debug)]
 pub struct ReservationRow {
     pub request_fingerprint: String,
-    pub response_json: Option<Json<serde_json::Value>>,
+    pub response_json: Option<serde_json::Value>,
     pub created_at: OffsetDateTime,
     /// Whether the record is older than the reservation lifetime, by the
     /// database clock.
     pub reservation_expired: bool,
+}
+
+/// A [`ReservationRow`] as read.
+#[derive(FromRow)]
+struct ReservationDecodeRow {
+    request_fingerprint: String,
+    response_json: Option<Json<serde_json::Value>>,
+    created_at: OffsetDateTime,
+    reservation_expired: bool,
+}
+
+impl From<ReservationDecodeRow> for ReservationRow {
+    fn from(record: ReservationDecodeRow) -> Self {
+        Self {
+            request_fingerprint: record.request_fingerprint,
+            response_json: record.response_json.map(|json| json.0),
+            created_at: record.created_at,
+            reservation_expired: record.reservation_expired,
+        }
+    }
 }
 
 /// The live record under `api_product`'s `key`, by the database clock, and
@@ -482,7 +521,7 @@ pub async fn find_live_reservation(
     key: IdempotencyKeyRef<'_>,
     lifetime_secs: f64,
 ) -> Result<Option<ReservationRow>, DbError> {
-    Ok(sqlx::query_as::<_, ReservationRow>(sql!(
+    Ok(sqlx::query_as::<_, ReservationDecodeRow>(sql!(
         "SELECT request_fingerprint, response_json, created_at,
                     created_at + make_interval(secs => $6) <= NOW() AS reservation_expired
              FROM public_idempotency_records
@@ -496,7 +535,8 @@ pub async fn find_live_reservation(
     .bind(key.idempotency_key)
     .bind(lifetime_secs)
     .fetch_optional(executor.into_sqlx())
-    .await?)
+    .await?
+    .map(Into::into))
 }
 
 /// Replace record `id`'s response with `replacement` while it still holds

@@ -40,7 +40,7 @@ impl PublicOperationStore {
             Some((fingerprint, Some(response)))
                 if fingerprint == idempotency.request_fingerprint.as_str() =>
             {
-                Some(response.0)
+                Some(response)
             }
             Some(_) => return Err(ResponseAdmissionError::Conflict),
             None => None,
