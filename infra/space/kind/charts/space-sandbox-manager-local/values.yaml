@@ -66,9 +66,7 @@ eppo:
 knownEgress:
   domains: ""
 
-# Keep cluster-deletion cleanup on the normal reconciler, with a short local
-# grace period in disposable Kind clusters. The worker default is 600 seconds.
-clusterDeletedEvictionQuiescenceSecs: "10"
+# Cluster-deleted eviction quiescence: unset (600 s); Kind's is in values-kind.yaml.
 
 # The window an operator's discard delete (`space-sbxmgr delete
 # --discard-retained-filesystem`) refuses within, from the suspend attempt's
@@ -81,54 +79,7 @@ clusterDeletedEvictionQuiescenceSecs: "10"
 # scenario sends a discard.
 discardAttemptWindowSecs: "60"
 
-# Cold-sandbox eviction — sandbox-manager's loop that removes a parked,
-# suspended sandbox's entire local presence (cache dir, instance subvolume,
-# node-local rows) once its state is provably restorable from a ready remote
-# snapshot. `EvictionConfig::from_env` reads these once at sandbox-manager
-# start, and without them the loop is off.
-#
-# Smoke-sized, and deliberately shaped for a bench:
-# - `engageFraction: "0"` always runs the loop, independent of local disk
-#   pressure. Target 0 keeps the pair valid (target < engage is only enforced
-#   when engage > 0).
-# - `minIdleSecs: "120"` makes the idle boundary reachable within a smoke.
-#   "Idle" is the loop's activity witness (`IDLE_WITNESS_SQL`): the newest of
-#   the sandbox's guest-activity clocks (`last_access_at` / `last_command_at`,
-#   touched only by data-plane traffic) when one exists, else the local row's
-#   `updated_at`, which every suspend bumps. So on a bench a sandbox becomes a
-#   candidate two minutes after its last command (or, with no clock, after its
-#   last suspend), once its upload is ready. Every scenario on the bench shares
-#   this floor, so it has two lower bounds. It must stay well above the longest
-#   time any other scenario leaves a suspended, backed sandbox idle before a
-#   reconnect that expects a local restore: about 20 s on a devbox, in
-#   `ecw.access_idle_reconnect_preserves_workspace`, which waits for the
-#   access-idle pause and its durable finalization; retention and restore
-#   cycles reconnect within about 8 s. It must also stay well above the
-#   eviction scenario's own last command → upload ready → presence probe
-#   (about 7 s), or the loop evicts before that positive probe. Both gaps grow
-#   on a slow CI runner; 30 s would leave no margin, two minutes keeps several
-#   times the measured gaps. Keep new scenarios' suspended idle gaps well under
-#   a minute, or expect a cold wake. The eviction scenario waits the floor out
-#   honestly instead of aging rows in the daemon's private DB the way the
-#   retired compose suites did.
-# - What it means for the bench: any sandbox left suspended for more than
-#   two minutes with a ready remote snapshot loses its local copy and restores
-#   from the Kind object store on the next wake — exactly what prod does under disk
-#   pressure, on a short clock.
-#
-# WORKERS ONLY; the builder release sets this to null. A change here rolls
-# sandbox-manager, which hands its sockets to the successor; sandboxes keep
-# running under the host runtime-supervisor.
-sandboxEviction:
-  enabled: true
-  engageFraction: "0"
-  targetFraction: "0"
-  minIdleSecs: "120"
-  intervalSecs: "15"
-  # The legacy-repair reupload pass runs whenever the gate is engaged — here,
-  # every tick. Nothing on a fresh bench qualifies (it needs an unpinned
-  # suspended row with no upload job), so keep its per-tick RPC budget minimal.
-  reuploadMaxPerTick: "1"
+# Cold-sandbox eviction (`sandboxEviction`): off, as it ships; Kind's is in values-kind.yaml.
 
 # On-node snapshot artifact reaper — sandbox-manager's LRU loop that deletes
 # local snapshot artifacts (named user snapshots, stopped disk artifacts,
@@ -138,7 +89,7 @@ sandboxEviction:
 # subvolume roots as well as plain directories). Read once at sandbox-manager
 # start.
 #
-# Smoke-sized like the two loops above: `engageFraction: "0"` is the
+# Smoke-sized like Kind's eviction loop: `engageFraction: "0"` is the
 # documented always-on gate; `idleSecs: "60"` and `graceSecs: "60"` let
 # `local.snapshot_reaper_reclaims_backed_fork_snapshot` wait out a candidate.
 # "Idle" is `local_artifacts.last_touched_at`,

@@ -941,8 +941,9 @@ k8s_resource(
 # here orders them; they wait only for the node layer and the bootstrap
 # resources their pods mount, and for label-kind-infra, so that the worker
 # image, which space-internal-api also runs on the infra node, is loaded
-# knowing which node that is. A chart's values-builder.yaml carries its
-# builder overrides.
+# knowing which node that is. A chart's values-kind.yaml carries its bench
+# overrides for both roles, which the caller-provided-cluster chart must not
+# inherit, and its values-builder.yaml, passed after it, its builder overrides.
 # SPACE_LOOP_DEVICE_TARGET sets the loop-device pool node-manager raises each
 # node to once it is up; the node image stages the library's floor of 64 before
 # that. Inherited from the environment so `SPACE_LOOP_DEVICE_TARGET=128 tilt up`
@@ -956,8 +957,10 @@ for line in NODE_RELEASES:
     release, role, service = line.split(" ")
     chart = "infra/space/kind/charts/space-{}-local".format(service)
     values = []
+    if os.path.exists(chart + "/values-kind.yaml"):
+        values.append(chart + "/values-kind.yaml")
     if role == "builder" and os.path.exists(chart + "/values-builder.yaml"):
-        values = [chart + "/values-builder.yaml"]
+        values.append(chart + "/values-builder.yaml")
     node_set = CHART_SET + ["node.role={}".format(role), "node.substrate=" + SUBSTRATE]
     if service == "node-manager" and LOOP_DEVICE_TARGET:
         node_set.append("loopDeviceTarget={}".format(LOOP_DEVICE_TARGET))

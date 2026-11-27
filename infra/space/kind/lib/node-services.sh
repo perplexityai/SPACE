@@ -5,8 +5,9 @@
 # Source it for the arrays and helpers, or run it to print one
 # `<release> <role> <service>` line per release (the Tiltfile reads that).
 # Each service's chart is infra/space/kind/charts/space-<service>-local, its
-# DaemonSet `<release>-<service>`, and its builder overrides, if any, the
-# chart's values-builder.yaml.
+# DaemonSet `<release>-<service>`, its bench overrides for both roles, if any,
+# the chart's values-kind.yaml, and its builder overrides, if any, the chart's
+# values-builder.yaml.
 
 # Sandbox workers (release `space`) run these; builders (release
 # `space-builder`) run them plus build-manager.
