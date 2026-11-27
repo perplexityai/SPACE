@@ -24,6 +24,7 @@ use pplx_space_sandbox_pod::{
 };
 
 mod api_faults;
+mod pod_environment;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -838,6 +839,7 @@ async fn a_resume_discards_memory_only_under_the_current_policy() -> Result<(), 
             sandbox_id,
             crate::controllers::substrate::runtime_upgrade::UpgradeActivation::Restore,
             None,
+            None,
         )
     };
     // Blocked: the decision upgrades, and the policy is now cached.
@@ -898,6 +900,7 @@ async fn a_pre_metadata_checkpoint_restores_as_recorded_while_legacy_work_is_per
             sandbox_id,
             crate::controllers::substrate::runtime_upgrade::UpgradeActivation::Restore,
             None,
+            None,
         )
         .await?;
     assert_eq!(upgrade, None);
@@ -932,6 +935,7 @@ async fn a_resume_upgrades_only_a_checkpoint_with_a_local_artifact_identity() ->
             sandbox_id,
             crate::controllers::substrate::runtime_upgrade::UpgradeActivation::Restore,
             Some(&storage_uri),
+            None,
         )
     };
     assert!(

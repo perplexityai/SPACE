@@ -1307,22 +1307,142 @@ async fn a_pinned_restore_is_refused_before_its_pod_when_the_source_node_lacks_t
     Ok(())
 }
 
-/// Startup checks the gate against the substrate's own resume-time upgrade
-/// switch: on runs while upgrades are off, and fails startup with them on.
+/// With `restore_source_node_hard_pin` on, `sandbox_node_affinity` repeats the
+/// required environment into every ORed `metadata.name` term of the restore
+/// shortlist. Out-of-environment fallbacks must be filtered before the
+/// shortlist is capped — and before `node_services_signal_trustworthy` scores
+/// the candidate set — while `off` and `shadow` leave fallbacks untouched.
 #[tokio::test(flavor = "current_thread")]
-async fn startup_refuses_on_only_alongside_resume_time_upgrades() -> Result<(), BoxError> {
-    use crate::controllers::substrate::runtime_upgrade::RuntimeUpgradeAtActivation;
-    // The check reads only the two switches, so the store never connects.
-    let mut substrate = substrate_with_unreachable_store();
-    substrate.k8s.environment_placement = EnvironmentPlacementGate::On;
-    substrate.k8s.runtime_upgrade_at_activation = RuntimeUpgradeAtActivation::Disabled;
-    substrate.k8s.check_environment_placement_support()?;
-    substrate.k8s.runtime_upgrade_at_activation = RuntimeUpgradeAtActivation::Enabled;
-    assert!(matches!(
-        substrate.k8s.check_environment_placement_support(),
-        Err(crate::controllers::substrate::SubstrateError::Unsupported { .. })
-    ));
-    substrate.k8s.environment_placement = EnvironmentPlacementGate::Shadow;
-    substrate.k8s.check_environment_placement_support()?;
-    Ok(())
+async fn restore_shortlist_drops_fallbacks_without_the_required_environment() {
+    use pplx_space_sandbox_pod::{
+        ENVIRONMENT_USABLE_LABEL_VALUE, NODE_SERVICES_NOT_READY_VALUE, NODE_SERVICES_READY_LABEL,
+        NODE_SERVICES_READY_VALUE, SandboxPodConfigValues, build_sandbox_pod,
+        environment_label_key,
+    };
+    let config = SandboxPodConfigValues {
+        restore_source_node_hard_pin: true,
+        node_services_ready_affinity: true,
+        ..SandboxPodConfigValues::default()
+    };
+    let node = |name: &str, publishes: Option<&str>, services_ready: bool| {
+        let mut labels = config.base_node_selector().into_labels();
+        if let Some(environment) = publishes {
+            labels.insert(
+                environment_label_key(&reference(environment)),
+                ENVIRONMENT_USABLE_LABEL_VALUE.to_string(),
+            );
+        }
+        labels.insert(
+            NODE_SERVICES_READY_LABEL.to_string(),
+            if services_ready {
+                NODE_SERVICES_READY_VALUE
+            } else {
+                NODE_SERVICES_NOT_READY_VALUE
+            }
+            .to_string(),
+        );
+        node_with_network_slots(name, labels, Some(8), None, true, false)
+    };
+    let mut nodes = vec![
+        node("e1-ready", Some(E1), true),
+        node("e1-rolling-a", Some(E1), false),
+        node("e1-rolling-b", Some(E1), false),
+        node("e1-rolling-c", Some(E1), false),
+        node("unlabeled-env", None, true),
+    ];
+    for idx in 0..20 {
+        nodes.push(node(&format!("e0-ready-{idx}"), Some(E0), true));
+    }
+    let substrate = substrate_with_node_cache_and_config(&nodes, true, config.clone());
+    let shadow = Some(PodEnvironment {
+        reference: reference(E1),
+        required: false,
+    });
+
+    for non_requiring in [None, shadow] {
+        let shortlist = substrate.restore_node_shortlist(
+            SandboxId::new(),
+            "source-node",
+            None,
+            non_requiring.as_ref(),
+        );
+        assert!(shortlist.iter().any(|name| name == "e0-ready-0"));
+        assert!(shortlist.iter().any(|name| name == "unlabeled-env"));
+    }
+
+    let on = required(E1);
+    let shortlist =
+        substrate.restore_node_shortlist(SandboxId::new(), "source-node", None, on.as_ref());
+    assert_eq!(shortlist[0], "source-node");
+    for expected in ["e1-ready", "e1-rolling-a", "e1-rolling-b", "e1-rolling-c"] {
+        assert!(
+            shortlist.iter().any(|name| name == expected),
+            "{expected} must survive candidate-set readiness suppression: {shortlist:?}"
+        );
+    }
+    assert!(
+        !shortlist
+            .iter()
+            .any(|name| name.starts_with("e0-ready-") || name == "unlabeled-env"),
+        "out-of-environment nodes must not occupy shortlist slots: {shortlist:?}"
+    );
+
+    let sandbox = test_sandbox_with_lifecycle("suspended");
+    let execution = SandboxExecutionRow {
+        generation: 2,
+        pod_name: "space-sbx-upgrade-shortlist-g2".to_string(),
+        pod_materialized: false,
+        state: ActiveExecutionState::Creating,
+        create_age_expired: false,
+        activation_attempt_id: None,
+        route_activation_id: None,
+    };
+    let owner = SandboxOwner::platform_user(sandbox.user_id);
+    let request = substrate.sandbox_pod_request(
+        &sandbox,
+        &execution,
+        crate::controllers::substrate::kubernetes::pod_ops::SandboxPodRequestInputs {
+            sandbox_owner: &owner,
+            auto_lifecycle_json: "{}",
+            network_policy_json: "{}",
+            node_group_placement: None,
+            environment: required(E1),
+            client_id: None,
+        },
+        PodCreateContext::Restore(RestoreContext::UserRestore {
+            suspend_restore_storage_uri: Some(URI),
+            suspend_restore_source_node: Some("source-node"),
+            direct_node_name: None,
+            preferred_node_name: Some("source-node"),
+            runtime_upgrade: None,
+        }),
+    );
+    let pod = build_sandbox_pod(&sandbox_pod_config(&substrate.k8s), request);
+    let rendered_names: Vec<String> = pod
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.affinity.as_ref())
+        .and_then(|affinity| affinity.node_affinity.as_ref())
+        .and_then(|na| {
+            na.required_during_scheduling_ignored_during_execution
+                .as_ref()
+        })
+        .map(|selector| {
+            selector
+                .node_selector_terms
+                .iter()
+                .flat_map(|term| term.match_fields.clone().unwrap_or_default())
+                .filter(|expr| expr.key == "metadata.name")
+                .flat_map(|expr| expr.values.unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(rendered_names.iter().any(|name| name == "source-node"));
+    assert!(rendered_names.iter().any(|name| name == "e1-ready"));
+    assert!(
+        !rendered_names
+            .iter()
+            .any(|name| name.starts_with("e0-ready-") || name == "unlabeled-env"),
+        "rendered pod shortlist must exclude E0-only and unlabeled fallbacks: {rendered_names:?}"
+    );
 }

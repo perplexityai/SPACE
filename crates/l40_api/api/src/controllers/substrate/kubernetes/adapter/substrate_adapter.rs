@@ -974,7 +974,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
         // admission is charged or a pod exists, so a stranded sandbox costs
         // nothing and places nothing.
         let runtime_upgrade = if normalize_lifecycle(&sandbox.lifecycle) == "stopped" {
-            self.activation_runtime_upgrade(sandbox_id, UpgradeActivation::Start, None)
+            self.activation_runtime_upgrade(sandbox_id, UpgradeActivation::Start, None, None)
                 .await?
         } else {
             None

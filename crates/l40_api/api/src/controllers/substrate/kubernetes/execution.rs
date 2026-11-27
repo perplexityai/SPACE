@@ -2131,6 +2131,7 @@ impl KubernetesSubstrate {
                             sandbox_id,
                             UpgradeActivation::Restore,
                             plan.storage_uri.as_deref(),
+                            plan.source_node_name.as_deref(),
                         )
                         .await;
                     // A kept upgrade that can't be read may still run, so

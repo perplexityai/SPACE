@@ -12,6 +12,7 @@ from space_smoke.execution_environment import (
 
 # What an unschedulable create answers (`SubstrateError::Unschedulable`).
 REFUSED_STATUS = 503
+UPGRADE_MARKER_PATH = "/tmp/space-smoke-activation-upgrade.txt"
 
 
 # The scenario drives the admission itself, in two stages: Firecracker
@@ -53,9 +54,11 @@ REFUSED_STATUS = 503
 def environment_placement_gate_on_places_bound_pods(test: smoke.KindEcw) -> None:
     """With the gate on, a create bound to an environment no worker can run
     is refused as unschedulable and leaves no sandbox, a create bound to E0
-    runs E0 on a worker labelled for it, and once the workers run the other
-    environment its create runs it there. Gate and allowlists are back to
-    what they were at the end."""
+    runs E0 on a worker labelled for it, once the workers run the other
+    environment its create runs it there, and resuming a suspended E0 sandbox
+    after E1 becomes the default and E0 is blocked records and requires E1 on
+    the activation pod and boots E1 with disk state intact. Gate, runtime
+    policy and allowlists are back to what they were at the end."""
 
     admission = test.admit_execution_environment(E1.name)
     gate = test.environment_placement_gate
@@ -94,8 +97,8 @@ def environment_placement_gate_on_places_bound_pods(test: smoke.KindEcw) -> None
             workers_without_label=sorted(workers - e0_nodes),
         )
 
-    with test.phase("turn the environment placement gate on"):
-        gate.turn_on()
+    with test.phase("turn on the environment placement gate and activation runtime upgrades"):
+        gate.turn_on(runtime_upgrade_at_activation=True)
 
     with test.phase(f"an {E0.name}-bound create runs {E0.name} on a worker labelled for it"):
         e0_sandbox = test.sandboxes.create(template=e0_selector)
@@ -148,6 +151,43 @@ def environment_placement_gate_on_places_bound_pods(test: smoke.KindEcw) -> None
 
     with test.phase(f"delete the {E1.name} sandbox"):
         test.delete_sandbox(e1_sandbox)
+
+    with test.phase(f"suspend an {E0.name}-bound sandbox with disk state"):
+        upgrading = test.sandboxes.create(template=e0_selector)
+        marker = f"activation-upgrade-{upgrading.sandbox_id}"
+        upgrading.files.write(UPGRADE_MARKER_PATH, marker)
+        gate.expect_pod_requires(upgrading.sandbox_id, e0_seed.reference)
+        test.expect_running_environment(upgrading.sandbox_id, E0, step="before activation upgrade")
+        upgrading.pause()
+        gate.wait_until_restore_portable(upgrading.sandbox_id)
+
+    with test.phase(f"make {E1.name} the default and block {E0.name}"):
+        policy_restore = gate.upgrade_default_and_block_source(
+            source_ref=e0_seed.reference,
+            target_ref=admission.reference,
+        )
+
+    with test.phase(f"resuming the suspended {E0.name} sandbox records and requires {E1.name} and boots {E1.name}"):
+        resumed = upgrading.connect(timeout=300)
+        render = gate.expect_pod_requires(upgrading.sandbox_id, admission.reference)
+        test.verify(
+            render.node_name in workers,
+            "the activation-upgraded sandbox must run on a worker",
+            node=render.node_name,
+        )
+        gate.expect_pod_runtime_upgrade_target(upgrading.sandbox_id, admission.reference)
+        admission.expect_running(upgrading.sandbox_id, step="after activation runtime upgrade")
+        observed_marker = resumed.files.read(UPGRADE_MARKER_PATH)
+        test.verify(
+            observed_marker == marker,
+            "activation runtime upgrade lost the sandbox's disk state",
+            expected=marker,
+            observed=observed_marker,
+        )
+
+    with test.phase("delete the activation-upgraded sandbox and restore runtime policy"):
+        test.delete_sandbox(upgrading)
+        policy_restore.release()
 
     with test.phase("put the environment placement gate back"):
         gate.restore()

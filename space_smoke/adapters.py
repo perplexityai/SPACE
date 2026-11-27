@@ -137,7 +137,10 @@ from space_smoke.drain_v2 import (
 )
 from space_smoke.environment_placement_gate import (
     GATE_ENV as ENVIRONMENT_PLACEMENT_GATE_ENV,
-    RUNTIME_UPGRADE_ENV as RUNTIME_UPGRADE_AT_ACTIVATION_ENV,
+    POLICY_PATH as RUNTIME_ENVIRONMENTS_POLICY_PATH,
+    RUNTIME_UPGRADE_AT_ACTIVATION_ENV,
+    RUNTIME_UPGRADE_AT_ACTIVATION_KEY,
+    activation_upgrade_left_behind,
 )
 from space_smoke.execution_environment import (
     ALLOWED_ENVIRONMENTS_ENV,
@@ -357,12 +360,19 @@ def _recorded_environment_placement_gate(recorded: str) -> dict[str, str | None]
         standing = json.loads(recorded)
     except json.JSONDecodeError as error:
         raise SmokeConfigurationError("the recorded environment placement gate is not JSON") from error
-    allowed = {f"{target}:{ENVIRONMENT_PLACEMENT_GATE_ENV}" for target in ("api", "admin-api", "controller")}
+    gate_keys = {f"{target}:{ENVIRONMENT_PLACEMENT_GATE_ENV}" for target in ("api", "admin-api", "controller")}
+    allowed = gate_keys | {RUNTIME_UPGRADE_AT_ACTIVATION_KEY}
+
+    def _entry_ok(key: str, value: object) -> bool:
+        if key == RUNTIME_UPGRADE_AT_ACTIVATION_KEY:
+            return value is None or (isinstance(value, str) and not activation_upgrade_left_behind(value))
+        return value is None or (isinstance(value, str) and value.strip().lower() == "off")
+
     if (
         not isinstance(standing, dict)
         or not standing
         or not set(standing) <= allowed
-        or not all(value is None or (isinstance(value, str) and value.strip().lower() == "off") for value in standing.values())
+        or not all(_entry_ok(key, value) for key, value in standing.items())
     ):
         raise SmokeConfigurationError(
             "the recorded environment placement gate holds an entry a restore cannot write"
@@ -829,6 +839,10 @@ LIMITER_ENV_ANNOTATION = "space.pplx.net/smoke-limiter-env"
 # The gate literals the environment placement gate found standing, recorded
 # before it turns the gate on and cleared once they're back.
 ENVIRONMENT_PLACEMENT_GATE_ANNOTATION = "space.pplx.net/smoke-environment-placement-gate"
+# The source environment reference an activation-upgrade check moved the
+# cluster default away from and blocked, put back to allowed + default on
+# repair if the run was killed before its own restore phase ran.
+ACTIVATION_UPGRADE_POLICY_SOURCE_ANNOTATION = "space.pplx.net/smoke-activation-upgrade-policy-source"
 # The template campaign's controller settings a run recorded before writing
 # them, put back by the next holder's repair as the gate's are.
 TEMPLATE_CAMPAIGN_ENV_ANNOTATION = "space.pplx.net/smoke-template-campaign-env"
@@ -4276,9 +4290,8 @@ ON CONFLICT (key_hash) DO NOTHING;
     # --- environment placement gate -----------------------------------------
     #
     # `SPACE_ENVIRONMENT_PLACEMENT_GATE` on the Deployments whose substrate
-    # reads it (`space_smoke/environment_placement_gate.py`), beside the
-    # resume-time upgrade flag it refuses `on` with. The captured literals go
-    # back verbatim.
+    # reads it (`space_smoke/environment_placement_gate.py`). The captured
+    # literals go back verbatim.
 
     def _admin_api_deployment(self) -> str | None:
         """The dedicated admin API Deployment, None on a bench that doesn't run one."""
@@ -4300,10 +4313,11 @@ ON CONFLICT (key_hash) DO NOTHING;
             raise SmokeConfigurationError("refusing an admin API env write on a bench that runs no admin API")
         return name
 
-    def environment_placement_env(self) -> dict[str, str | None]:
-        keys = (ENVIRONMENT_PLACEMENT_GATE_ENV, RUNTIME_UPGRADE_AT_ACTIVATION_ENV)
+    def environment_placement_env(self, *, include_activation_upgrade: bool = False) -> dict[str, str | None]:
+        keys = (ENVIRONMENT_PLACEMENT_GATE_ENV,)
+        api_name = self._public_api_deployment()
         deployments: dict[str, str | None] = {
-            "api": self._public_api_deployment(),
+            "api": api_name,
             "admin-api": self._admin_api_deployment(),
             "controller": self._controller_deployment(),
         }
@@ -4313,6 +4327,10 @@ ON CONFLICT (key_hash) DO NOTHING;
                 continue
             for key, value in self._deployment_env_literals(name, keys).items():
                 env[f"{target}:{key}"] = value
+        if include_activation_upgrade:
+            env[RUNTIME_UPGRADE_AT_ACTIVATION_KEY] = self._deployment_env_literals(
+                api_name, (RUNTIME_UPGRADE_AT_ACTIVATION_ENV,)
+            )[RUNTIME_UPGRADE_AT_ACTIVATION_ENV]
         return env
 
     def set_environment_placement_gate(
@@ -4322,7 +4340,11 @@ ON CONFLICT (key_hash) DO NOTHING;
         api_first: bool,
         record: Mapping[str, str | None] | None = None,
     ) -> None:
-        for value in values.values():
+        for key, value in values.items():
+            if key == RUNTIME_UPGRADE_AT_ACTIVATION_KEY:
+                if value is not None and not isinstance(value, str):
+                    raise ValueError(f"refusing activation runtime-upgrade value {value!r}")
+                continue
             if value is not None and value.strip().lower() not in {"off", "shadow", "on"}:
                 raise ValueError(f"refusing environment placement gate value {value!r}")
         action = "an environment placement gate write"
@@ -4344,12 +4366,31 @@ ON CONFLICT (key_hash) DO NOTHING;
             self._held_public_api_lease(action), action, {ENVIRONMENT_PLACEMENT_GATE_ANNOTATION: None}
         )
 
+    def record_activation_upgrade_policy_source(self, source_ref: str) -> None:
+        action = "recording the activation-upgrade source environment policy"
+        self._renew_lease(
+            self._held_public_api_lease(action),
+            action,
+            {ACTIVATION_UPGRADE_POLICY_SOURCE_ANNOTATION: source_ref},
+        )
+
+    def clear_activation_upgrade_policy_source(self) -> None:
+        action = "clearing the activation-upgrade source environment policy record"
+        self._renew_lease(
+            self._held_public_api_lease(action),
+            action,
+            {ACTIVATION_UPGRADE_POLICY_SOURCE_ANNOTATION: None},
+        )
+
     def _write_environment_placement_gate(
         self, values: Mapping[str, str | None], *, api_first: bool, ownership: _LeaseOwnership
     ) -> None:
+        gate_keys = {
+            f"{target}:{ENVIRONMENT_PLACEMENT_GATE_ENV}" for target in ("api", "admin-api", "controller")
+        }
         self._apply_renderer_env(
             values,
-            allowed={f"{target}:{ENVIRONMENT_PLACEMENT_GATE_ENV}" for target in ("api", "admin-api", "controller")},
+            allowed=gate_keys | {RUNTIME_UPGRADE_AT_ACTIVATION_KEY},
             controller_first=not api_first,
             what="environment placement gate",
             ownership=ownership,
@@ -5399,6 +5440,51 @@ ON CONFLICT (key_hash) DO NOTHING;
                 "clearing the template campaign settings record",
                 {TEMPLATE_CAMPAIGN_ENV_ANNOTATION: None},
             )
+        recorded_policy_source = annotations.get(ACTIVATION_UPGRADE_POLICY_SOURCE_ANNOTATION)
+        if isinstance(recorded_policy_source, str) and recorded_policy_source:
+            self._renew_lease(ownership, "an orphaned activation-upgrade runtime policy repair")
+            self.wait_public_api_ready(timeout=300)
+            policy_read = self.console_api("GET", RUNTIME_ENVIRONMENTS_POLICY_PATH)
+            if policy_read.status != 200 or not isinstance(policy_read.body, dict):
+                raise SmokeConfigurationError(
+                    f"could not read runtime environment policy to repair {recorded_policy_source} "
+                    f"({policy_read.status}); the record stays on the Lease"
+                )
+            encoded_source = quote(recorded_policy_source, safe="")
+            allow_resp = self.console_api(
+                "PUT",
+                f"{RUNTIME_ENVIRONMENTS_POLICY_PATH}/{encoded_source}/state",
+                {
+                    "state": "allowed",
+                    "reason": "space_smoke: repair orphaned activation-upgrade source state",
+                },
+                if_match=int(policy_read.body["generation"]),
+            )
+            if allow_resp.status != 200 or not isinstance(allow_resp.body, dict):
+                raise SmokeConfigurationError(
+                    f"could not restore {recorded_policy_source} to allowed ({allow_resp.status}): "
+                    f"{allow_resp.body}; the record stays on the Lease"
+                )
+            default_resp = self.console_api(
+                "PUT",
+                f"{RUNTIME_ENVIRONMENTS_POLICY_PATH}/default",
+                {
+                    "environment_ref": recorded_policy_source,
+                    "reason": "space_smoke: repair orphaned activation-upgrade default environment",
+                    "strand": True,
+                },
+                if_match=int(allow_resp.body["generation"]),
+            )
+            if default_resp.status != 200:
+                raise SmokeConfigurationError(
+                    f"could not restore default environment to {recorded_policy_source} "
+                    f"({default_resp.status}): {default_resp.body}; the record stays on the Lease"
+                )
+            self._renew_lease(
+                ownership,
+                "clearing the activation-upgrade runtime policy record",
+                {ACTIVATION_UPGRADE_POLICY_SOURCE_ANNOTATION: None},
+            )
         recorded_gate = annotations.get(ENVIRONMENT_PLACEMENT_GATE_ANNOTATION)
         if isinstance(recorded_gate, str) and recorded_gate:
             standing_gate = _recorded_environment_placement_gate(recorded_gate)
@@ -5418,7 +5504,11 @@ ON CONFLICT (key_hash) DO NOTHING;
                 ) from error
             self.wait_public_api_ready(timeout=300)
             after = {
-                key: value for key, value in self.environment_placement_env().items() if key in standing_gate
+                key: value
+                for key, value in self.environment_placement_env(
+                    include_activation_upgrade=RUNTIME_UPGRADE_AT_ACTIVATION_KEY in standing_gate
+                ).items()
+                if key in standing_gate
             }
             if after != standing_gate:
                 raise SmokeConfigurationError(
@@ -5458,6 +5548,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             LIMITER_ENV_ANNOTATION,
             REDIS_REPLICAS_ANNOTATION,
             ENVIRONMENT_PLACEMENT_GATE_ANNOTATION,
+            ACTIVATION_UPGRADE_POLICY_SOURCE_ANNOTATION,
             TEMPLATE_CAMPAIGN_ENV_ANNOTATION,
             NETWORK_POOL_MAX_SLOTS_ANNOTATION,
         )
