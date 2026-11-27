@@ -975,21 +975,28 @@ class DrainV2Assertions:
             env.update(AWS_TERMINATOR_ENV)
         if legacy_loops:
             env.update(LEGACY_LOOPS_ENV)
-        if stall_bound is not None and self.gate.test_hooks:
+        scoped = stall_bound is not None and self.gate.test_hooks
+        if scoped:
             env[STALL_BOUND_HOOK] = str(stall_bound)
-            self._stall_bound = stall_bound
-        self._fixture.record("stall_bound_seconds", self.stall_bound_seconds)
         if not env:
+            self._fixture.record("stall_bound_seconds", self.stall_bound_seconds)
             yield
             return
         if self._controller_lease:
             raise RuntimeError("the run already holds the controller-mutation lease")
+        previous = self._stall_bound
         with scoped_drain_v2_env(self._fixture, self._control, self._scope) as set_env:
             self._controller_lease = True
             try:
                 set_env(env)
+                # Only once the controller took it: a refused write leaves
+                # the assertions on the bound the controller still runs.
+                if scoped:
+                    self._stall_bound = stall_bound
+                self._fixture.record("stall_bound_seconds", self.stall_bound_seconds)
                 yield
             finally:
+                self._stall_bound = previous
                 self._controller_lease = False
 
     def _hold_controller_lease(self) -> None:
