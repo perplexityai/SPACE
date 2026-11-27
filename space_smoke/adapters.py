@@ -147,6 +147,13 @@ from space_smoke.execution_environment import (
 )
 from space_smoke.leader_election import RECONCILER_TICK_ENV
 from space_smoke.native import _URL_OPEN
+from space_smoke.restore_pin_repair import (
+    CLEAR_RESTORE_PIN_SQL,
+    REPAIR_ENV_KEYS as RESTORE_PIN_REPAIR_ENV_KEYS,
+    REPAIR_LOG_NEEDLE as RESTORE_PIN_REPAIR_LOG_NEEDLE,
+    validate_repair_keys as validate_restore_pin_repair_keys,
+    validate_repair_overrides as validate_restore_pin_repair_overrides,
+)
 from space_smoke.reconcile_queue_gc import (
     GC_ENV_KEYS as RECONCILE_QUEUE_GC_ENV_KEYS,
     validate_marker,
@@ -6798,6 +6805,82 @@ ON CONFLICT (key_hash) DO NOTHING;
             "logs", "deployment/space-kind-fake-ec2", "--tail=40", "--timestamps", timeout=30
         )
         return result.stdout if result.returncode == 0 else result.stderr
+
+    # --- restore-pin route and repair ------------------------------------------
+    #
+    # The admin route calls, the one named write and the repair's env; the
+    # SQL, key list, vocabulary and verdicts live in
+    # `space_smoke.restore_pin_repair`.
+
+    def _restore_pin_resource(self, sandbox_id: str) -> str:
+        sandbox = _sql_uuid(sandbox_id.removeprefix("sbx_"))
+        return f"sandboxes/sbx_{sandbox}/restore-pin"
+
+    def restore_pin_answer(self, sandbox_id: str) -> CallAnswer:
+        return self._admin_answer("GET", self._restore_pin_resource(sandbox_id))
+
+    def pin_restore_source_answer(
+        self, sandbox_id: str, body: Mapping[str, object]
+    ) -> CallAnswer:
+        return self._admin_answer("POST", self._restore_pin_resource(sandbox_id), body=dict(body))
+
+    def clear_restore_pin(self, sandbox_id: str, expected_artifact_id: str) -> bool:
+        self._require_isolated_kind("clearing a restore pin")
+        out = self._psql(
+            CLEAR_RESTORE_PIN_SQL.format(
+                sandbox_id=_sql_uuid(sandbox_id.removeprefix("sbx_")),
+                artifact_id=_sql_uuid(expected_artifact_id),
+            ),
+            action="clear the suspended sandbox's restore pin",
+        )
+        return bool(self._returned_value(out))
+
+    def restore_pin_repair_env(self) -> dict[str, str | None]:
+        return self._deployment_env_literals(
+            self._controller_deployment(), RESTORE_PIN_REPAIR_ENV_KEYS
+        )
+
+    def running_restore_pin_repair_envs(self) -> list[dict[str, str | None]]:
+        result = self.kubectl(
+            "get", "pods", "-l", KIND_CONTROLLER_SELECTOR, "-o", "json", timeout=15
+        )
+        _require_ok(result, "read cluster-controller pods")
+        envs = []
+        for pod in json.loads(result.stdout or "{}").get("items", []):
+            metadata = pod.get("metadata") or {}
+            if (pod.get("status") or {}).get("phase") != "Running" or metadata.get(
+                "deletionTimestamp"
+            ):
+                continue
+            containers = (pod.get("spec") or {}).get("containers") or [{}]
+            envs.append(
+                _env_literals(
+                    containers[0].get("env") or [],
+                    RESTORE_PIN_REPAIR_ENV_KEYS,
+                    owner=str(metadata.get("name", "a cluster-controller pod")),
+                    value_from_refusal="; refusing to judge a value this read cannot see",
+                )
+            )
+        return envs
+
+    def set_restore_pin_repair_env(self, overrides: Mapping[str, str]) -> None:
+        validate_restore_pin_repair_overrides(overrides)
+        self._set_controller_env(overrides, "a restore-pin repair controller deployment write")
+
+    def restore_restore_pin_repair_env(self, standing: Mapping[str, str | None]) -> None:
+        # The captured literals go back verbatim: the controller falls back to
+        # a default on an unparseable value, and restoring must not tighten it.
+        validate_restore_pin_repair_keys(standing)
+        self._set_controller_env(standing, "a restore-pin repair controller deployment write")
+
+    def restore_pin_repair_log_tail(self) -> str:
+        result = self.kubectl(
+            "logs", "-l", KIND_CONTROLLER_SELECTOR, "--tail=500", "--prefix", timeout=60
+        )
+        if result.returncode != 0:
+            return result.stderr[-4_000:]
+        lines = [line for line in result.stdout.splitlines() if RESTORE_PIN_REPAIR_LOG_NEEDLE in line]
+        return "\n".join(lines[-60:])
 
     # --- orphaned-restore-pod GC ---------------------------------------------
     #

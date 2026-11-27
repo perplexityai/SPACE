@@ -11676,6 +11676,54 @@ mod kubernetes_tests {
         Ok(())
     }
 
+    /// A Kubernetes node's target names its Kubernetes node, which the
+    /// substrate resolves its node-api endpoint from. An unregistered node, or
+    /// another substrate's, has no target.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_kubernetes_node_target_names_its_node() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let node_id = NodeId::new();
+        sqlx::query(
+            "INSERT INTO nodes (id, address, role, managed_by, state)
+             VALUES ($1, '10.0.0.12', 'worker', 'k8s', 'ready')",
+        )
+        .bind(node_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query("INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, 'worker-a')")
+            .bind(node_id)
+            .execute(&pool)
+            .await?;
+        let substrate = substrate_with_store_and_client(
+            pool.clone(),
+            mock_kubernetes_client(Arc::new(Mutex::new(Vec::new()))),
+        );
+        let target = substrate
+            .node_api_target(node_id)
+            .await?
+            .expect("registered node");
+        assert_eq!(target.substrate_node_id.as_deref(), Some("worker-a"));
+        assert!(substrate.node_api_target(NodeId::new()).await?.is_none());
+        // Another substrate's node isn't this one's.
+        let foreign = NodeId::new();
+        sqlx::query(
+            "INSERT INTO nodes (id, address, role, managed_by, state)
+             VALUES ($1, '10.0.0.14', 'worker', 'space', 'ready')",
+        )
+        .bind(foreign)
+        .execute(&pool)
+        .await?;
+        assert!(substrate.node_api_target(foreign).await?.is_none());
+        // A soft-deleted tombstone row has no live node-api target either.
+        sqlx::query("UPDATE nodes SET state = 'deleted' WHERE id = $1")
+            .bind(node_id)
+            .execute(&pool)
+            .await?;
+        assert!(substrate.node_api_target(node_id).await?.is_none());
+        Ok(())
+    }
+
     /// An unpinned sandbox whose history is unordered (a capture without a
     /// generation registered after one with a generation) gets no remote
     /// source. A restore on

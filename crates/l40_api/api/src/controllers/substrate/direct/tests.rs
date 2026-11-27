@@ -2043,6 +2043,60 @@ async fn a_pinned_retry_checks_the_source_node_against_its_pin() -> TestResult {
     Ok(())
 }
 
+/// A Direct node's target carries its live endpoint, which the Direct
+/// substrate resolves from, and none once its Direct row is deleted. An
+/// unregistered node, or another substrate's, has no target.
+#[tokio::test(flavor = "current_thread")]
+async fn a_direct_node_target_carries_its_live_endpoint() -> TestResult {
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    insert_ready_worker(&fixture.pool, node_id, "127.0.0.1:7", "9.0.0").await?;
+    let target = fixture
+        .substrate
+        .node_api_target(node_id)
+        .await?
+        .expect("registered node");
+    assert_eq!(target.direct_endpoint.as_deref(), Some("127.0.0.1:7"));
+    sqlx::query(sql!(
+        "UPDATE node_direct SET deleted_at = NOW() WHERE node_id = $1"
+    ))
+    .bind(node_id)
+    .execute(&fixture.pool)
+    .await?;
+    let target = fixture
+        .substrate
+        .node_api_target(node_id)
+        .await?
+        .expect("registered node");
+    assert_eq!(target.direct_endpoint, None);
+    assert!(
+        fixture
+            .substrate
+            .node_api_target(NodeId::new())
+            .await?
+            .is_none()
+    );
+    // Another substrate's node isn't this one's.
+    let foreign = NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '10.0.0.13', 'worker', 'k8s', 'ready')"
+    ))
+    .bind(foreign)
+    .execute(&fixture.pool)
+    .await?;
+    assert!(fixture.substrate.node_api_target(foreign).await?.is_none());
+    // A soft-deleted Direct tombstone row has no live node-api target either.
+    sqlx::query(sql!("UPDATE nodes SET state = 'deleted' WHERE id = $1"))
+        .bind(node_id)
+        .execute(&fixture.pool)
+        .await?;
+    assert!(fixture.substrate.node_api_target(node_id).await?.is_none());
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn fresh_restore_claim_preserves_suspended_source_semantics() -> TestResult {
     let Some(fixture) = postgres_fixture().await? else {
@@ -5361,4 +5415,138 @@ async fn wake_keeps_generation_observed_during_resident_transition(
 }
 
 mod environment_gate;
+mod main_remote_leg;
 mod runtime_evidence;
+
+/// A row of main's remote-leg statement: node, endpoint, storage URI, source
+/// node and environment refusal.
+type MainRemoteRow = (Uuid, String, Option<String>, Option<Uuid>, Option<String>);
+
+/// After a rollback, main's Direct remote leg ignores a pin this change wrote:
+/// a fresh restore and a retry both load the re-upload of an older capture
+/// that registered last, where this change restores the pinned capture.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rolled_back_direct_remote_restore_ignores_the_pin() -> TestResult {
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let sandbox_id = SandboxId::new();
+    let source_node_id = NodeId::new();
+    let alternate_node_id = NodeId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, Some(source_node_id)).await?;
+    insert_ready_worker(&fixture.pool, source_node_id, "127.0.0.1:1", "9.0.0").await?;
+    insert_ready_worker(&fixture.pool, alternate_node_id, "127.0.0.1:2", "9.0.0").await?;
+    let pinned = Uuid::now_v7();
+    let pinned_uri = "s3://bucket/snapshots/sandbox/pinned";
+    let reupload_uri = "s3://bucket/snapshots/sandbox/older-reupload";
+    // The older capture's artifact, backed up again after the suspend.
+    let older = Uuid::now_v7();
+    // (URI, artifact, capture generation, seconds ago)
+    for (uri, artifact, generation, seconds_ago) in [
+        ("s3://bucket/snapshots/sandbox/older", older, 3_i64, 30),
+        (pinned_uri, pinned, 5, 20),
+        (reupload_uri, older, 3, 1),
+    ] {
+        let snapshot_id = insert_ready_snapshot(
+            &fixture.pool,
+            sandbox_id,
+            source_node_id,
+            "9.0.0",
+            Some(uri),
+        )
+        .await?;
+        sqlx::query(sql!(
+            "UPDATE snapshots
+                SET local_artifact_id = $2,
+                    artifact_kind = 'full',
+                    artifact_origin = 'suspend',
+                    generation = $3,
+                    timestamp = NOW() - make_interval(secs => $4::INT)
+              WHERE id = $1"
+        ))
+        .bind(snapshot_id)
+        .bind(artifact)
+        .bind(generation)
+        .bind(seconds_ago)
+        .execute(&fixture.pool)
+        .await?;
+    }
+    let pin_state =
+        pplx_space_sandbox_store::restore_pin::restore_pin_state(&fixture.pool, sandbox_id)
+            .await?
+            .expect("sandbox");
+    let token = pin_state
+        .lifecycle_changed_at
+        .expect("lifecycle_changed_at");
+    assert!(
+        pplx_space_sandbox_store::restore_pin::pin_restore_source(
+            &fixture.pool,
+            sandbox_id,
+            pplx_space_snapshot_model::LocalArtifactId::from_uuid(pinned),
+            token,
+            pin_state.restore_node_id,
+        )
+        .await?
+    );
+    let main_remote = |statement: &'static str| {
+        let pool = fixture.pool.clone();
+        async move {
+            let rows: Vec<MainRemoteRow> = sqlx::query_as(sqlx::AssertSqlSafe(statement))
+                .bind(sandbox_id.as_uuid())
+                .bind(DIRECT_REMOTE_RESTORE_CANDIDATE_LIMIT)
+                .bind(SubstrateKind::Space)
+                .bind(false)
+                .fetch_all(&pool)
+                .await?;
+            TestResult::Ok(
+                rows.into_iter()
+                    .map(|(node, _, uri, _, _)| (node, uri))
+                    .collect::<Vec<_>>(),
+            )
+        }
+    };
+    let remote_uri = |candidates: &[DirectRestoreCandidate]| {
+        candidates
+            .iter()
+            .find(|candidate| candidate.kind == DirectRestoreCandidateKind::RemoteSnapshot)
+            .and_then(|candidate| candidate.storage_uri.clone())
+    };
+
+    assert_eq!(
+        main_remote(main_remote_leg::FRESH).await?,
+        [(alternate_node_id.as_uuid(), Some(reupload_uri.to_owned()))],
+        "main's fresh remote leg"
+    );
+    let candidates = fixture
+        .substrate
+        .direct_restore_candidates(sandbox_id)
+        .await?;
+    assert_eq!(
+        remote_uri(&candidates).as_deref(),
+        Some(pinned_uri),
+        "this change's fresh remote leg"
+    );
+
+    // A restore claimed the row.
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'restoring', lifecycle_changed_at = NOW() WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&fixture.pool)
+    .await?;
+    assert_eq!(
+        main_remote(main_remote_leg::RETRY).await?,
+        [(alternate_node_id.as_uuid(), Some(reupload_uri.to_owned()))],
+        "main's retry remote leg"
+    );
+    let candidates = fixture
+        .substrate
+        .direct_restore_retry_candidates(sandbox_id)
+        .await?;
+    assert_eq!(
+        remote_uri(&candidates).as_deref(),
+        Some(pinned_uri),
+        "this change's retry remote leg"
+    );
+    Ok(())
+}

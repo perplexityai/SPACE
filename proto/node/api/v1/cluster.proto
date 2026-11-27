@@ -243,9 +243,10 @@ service ClusterApi {
   // Sandbox-manager passes the refusal on as `FAILED_PRECONDITION` with
   // metadata `x-space-restore-refusal: source-unordered`, which its callers
   // treat as terminal for that restore attempt. A later attempt can succeed
-  // once the sandbox is pinned or a later capture with a generation ranks
-  // the unranked one, as above. A capture registered after a restore's
-  // claim doesn't lift the refusal for that restore.
+  // once the sandbox is pinned (by the restore-pin repair, or an operator's
+  // admin pin) or a later capture with a generation ranks the unranked one,
+  // as above. A capture registered after a restore's claim doesn't lift the
+  // refusal for that restore.
   // TODO: [legacy] Remove once all restore callers look up exact artifact
   // backups with `GetArtifactBackupLocation`.
   rpc GetSuspendSnapshotLocation(GetSuspendSnapshotLocationRequest) returns (GetSuspendSnapshotLocationResponse);

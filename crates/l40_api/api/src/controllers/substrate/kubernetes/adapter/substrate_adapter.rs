@@ -2815,6 +2815,29 @@ impl SubstrateAdapter for KubernetesSubstrate {
         }
     }
 
+    async fn node_api_target(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<OwnedNodeApiTarget>, SubstrateError> {
+        let row = node_lookup::node_api_target(self.store.pool(), node_id)
+            .await
+            .db_context("failed to look up Kubernetes node-api target")?;
+        Ok(row
+            .filter(|row| row.managed_by == pplx_space_node_model::NodeManagedBy::Kubernetes)
+            .map(
+                |node_lookup::NodeApiTargetRow {
+                     role,
+                     managed_by,
+                     substrate_node_id,
+                 }| OwnedNodeApiTarget {
+                    managed_by,
+                    role,
+                    direct_endpoint: None,
+                    substrate_node_id,
+                },
+            ))
+    }
+
     async fn select_ready_worker_node_api_target(
         &self,
     ) -> Result<OwnedNodeApiTarget, SubstrateError> {

@@ -2628,7 +2628,7 @@ impl KubernetesSubstrate {
 ///   (`restore_source_unordered_status`), returned before staging or booting
 ///   a VM, so the claim reverts as a clean failure does. With
 ///   abandoned-restore retirement enabled, the revert retires the claim's pod
-///   and `restore_pin` accepts a pin at once. Disabled, the execution stays
+///   and `restore-pin` accepts a pin at once. Disabled, the execution stays
 ///   active, as after any reverted claim, and the next restore claim is
 ///   refused while that execution holds its ownership. A row the revert kept
 ///   `restoring` takes a pin once it has no active owner

@@ -7,9 +7,13 @@
 //! a restore.
 //! A wake that finds its unplaced sandbox still running pays before it
 //! places the row on that node.
+//! Also the pin's view of a source node whose registration is deleted, which
+//! the restore doesn't load a local copy from.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use pplx_space_sandbox_store::restore_pin::{pin_restore_source, restore_pin_state};
 
 use super::*;
 use crate::controllers::substrate::{
@@ -564,5 +568,123 @@ async fn a_wake_admission_refuses_does_not_place_a_running_sandbox() -> TestResu
     assert_eq!(admission.asked.load(Ordering::SeqCst), 1);
     assert_eq!(placed().await?, ("started".to_owned(), Some(node_id)));
     drop(server);
+    Ok(())
+}
+
+/// A source node whose Direct registration is deleted can't take a restore,
+/// so an unordered history there is refused for good and the operator is told
+/// to pin a capture. The pin doesn't ask that node what it holds: it lands,
+/// and the restore then loads the pinned capture on another worker.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pin_does_not_ask_a_deregistered_source_node() -> TestResult {
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let sandbox_id = SandboxId::new();
+    let source_node_id = NodeId::new();
+    let alternate_node_id = NodeId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, Some(source_node_id)).await?;
+    insert_ready_worker(&fixture.pool, source_node_id, "127.0.0.1:1", "9.0.0").await?;
+    insert_ready_worker(&fixture.pool, alternate_node_id, "127.0.0.1:2", "9.0.0").await?;
+    let pinned = Uuid::now_v7();
+    let pinned_uri = "s3://bucket/snapshots/sandbox/with-generation";
+    // (URI, artifact, capture generation, seconds ago): the capture with no
+    // generation registered last, so capture order can't choose.
+    for (uri, artifact, generation, seconds_ago) in [
+        (pinned_uri, pinned, Some(5_i64), 20),
+        (
+            "s3://bucket/snapshots/sandbox/no-generation",
+            Uuid::now_v7(),
+            None,
+            10,
+        ),
+    ] {
+        let snapshot_id = insert_ready_snapshot(
+            &fixture.pool,
+            sandbox_id,
+            source_node_id,
+            "9.0.0",
+            Some(uri),
+        )
+        .await?;
+        sqlx::query(sql!(
+            "UPDATE snapshots
+                SET local_artifact_id = $2,
+                    artifact_kind = 'full',
+                    artifact_origin = 'suspend',
+                    generation = $3,
+                    timestamp = NOW() - make_interval(secs => $4::INT)
+              WHERE id = $1"
+        ))
+        .bind(snapshot_id)
+        .bind(artifact)
+        .bind(generation)
+        .bind(seconds_ago)
+        .execute(&fixture.pool)
+        .await?;
+    }
+    sqlx::query(sql!(
+        "UPDATE node_direct SET deleted_at = NOW() WHERE node_id = $1"
+    ))
+    .bind(source_node_id)
+    .execute(&fixture.pool)
+    .await?;
+
+    let refused = fixture
+        .substrate
+        .direct_restore_candidates(sandbox_id)
+        .await
+        .expect_err("no source node and no orderable capture");
+    assert!(
+        matches!(&refused, SubstrateError::RestoreContextUnavailable { .. }),
+        "{refused:?}"
+    );
+
+    let read = restore_pin_state(&fixture.pool, sandbox_id)
+        .await?
+        .expect("sandbox");
+    assert!(read.unordered);
+    assert_eq!(read.restore_node_id, Some(source_node_id));
+    let controller = crate::controllers::sandbox::SandboxController::new(
+        crate::controllers::substrate::Substrate::from_direct(DirectSubstrate::new(
+            fixture.pool.clone(),
+        )),
+    );
+    assert_eq!(
+        controller
+            .node_reported_artifact(source_node_id, sandbox_id)
+            .await?,
+        None
+    );
+    assert!(
+        pin_restore_source(
+            &fixture.pool,
+            sandbox_id,
+            LocalArtifactId::from_uuid(pinned),
+            read.lifecycle_changed_at.expect("lifecycle_changed_at"),
+            read.restore_node_id,
+        )
+        .await?
+    );
+
+    let candidates = fixture
+        .substrate
+        .direct_restore_candidates(sandbox_id)
+        .await?;
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| (
+                candidate.kind,
+                candidate.node.id,
+                candidate.storage_uri.as_deref()
+            ))
+            .collect::<Vec<_>>(),
+        [(
+            DirectRestoreCandidateKind::RemoteSnapshot,
+            alternate_node_id,
+            Some(pinned_uri)
+        )]
+    );
     Ok(())
 }

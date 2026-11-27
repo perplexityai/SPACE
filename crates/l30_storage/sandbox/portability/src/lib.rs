@@ -164,7 +164,7 @@ mod capture_order;
 mod pinnable;
 use capture_order::{Newest, Ranks};
 pub use pinnable::{
-    pinnable_pre_claim_suspend_capture, pinnable_suspend_capture,
+    pin_keeps_restore_loadable, pinnable_pre_claim_suspend_capture, pinnable_suspend_capture,
     pre_claim_restore_order_unordered, restore_pinnable_pre_claim_capture_exists,
     restore_retry_pinnable_revert_snapshot_exists, restoring_row_accepts_operator_pin,
 };
@@ -2295,8 +2295,9 @@ pub fn suspend_snapshot_is_current_capture(sandbox_alias: &str, snapshot_alias: 
 /// count.
 ///
 /// The node's report is the evidence, not the generation, so this pins a
-/// capture without one too: the node holds the bytes it suspended. A
-/// node-local suspend's finalization uses it to pin the row.
+/// capture without one too: the node holds the bytes it suspended. The
+/// restore-pin repair and a node-local suspend's finalization use it to pin
+/// the row.
 pub fn node_held_capture_is_latest(
     sandbox_alias: &str,
     snapshot_alias: &str,
@@ -2539,8 +2540,8 @@ pub fn snapshot_durable_for_source_release(sandbox_alias: &str) -> String {
 ///
 /// For an unpinned row only a suspend capture counts, as it does there. A
 /// named snapshot's or a stop's backup is no restore path for a suspended
-/// sandbox: the unpinned restore never loads one and an operator pin
-/// (`restore_pin`) never accepts one. Counting it would park the row for good, blocking
+/// sandbox: the unpinned restore never loads one and the admin restore-pin
+/// route never pins one. Counting it would park the row for good, blocking
 /// the drain or the reap of its node with nothing left to wait for, so the
 /// give-up fails the row. The backup itself is untouched.
 pub fn snapshot_durable_copy_exists(sandbox_alias: &str) -> String {
@@ -2575,7 +2576,8 @@ pub fn snapshot_durable_copy_exists(sandbox_alias: &str) -> String {
 /// bytes are gone. For an unmarked row the row isn't durable to the drain, so
 /// a forced drain's local-snapshot promotion re-uploads the node's copy; a
 /// gentle one leaves it blocking, as it does any unpinned row it can't
-/// promote, until an operator pins a capture (`restore_pin`) or escalates.
+/// promote, until an operator pins a capture through the admin restore-pin
+/// route or escalates.
 /// A failed re-upload of the same capture (its artifact) doesn't hold: it
 /// registered first with the ready copy, which holds the same bytes. Nor is
 /// a copy any capture outranks ([`full_snapshot_outranked_by_generation`])

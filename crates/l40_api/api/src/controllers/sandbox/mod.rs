@@ -1170,6 +1170,30 @@ impl SandboxController {
         self.substrate.check_node_pool_placement(node_pool)
     }
 
+    /// Whether the substrate confirms worker `node_id` gone
+    /// ([`Substrate::node_confirmed_gone`]).
+    pub async fn node_confirmed_gone(
+        &self,
+        node_id: NodeId,
+    ) -> Result<bool, super::substrate::SubstrateError> {
+        self.substrate.node_confirmed_gone(node_id).await
+    }
+
+    /// What node `node_id` reports holding for `sandbox_id`, as the admin
+    /// restore-pin route asks it ([`super::substrate::node_reported_artifact`],
+    /// which the restore-pin repair calls too): `None` when no node of this
+    /// substrate has that id, or when it's a Direct node whose registration
+    /// is deleted. The Direct restore doesn't restore from that node either:
+    /// it loads the capture the control plane selects on another worker.
+    pub async fn node_reported_artifact(
+        &self,
+        node_id: NodeId,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<super::substrate::NodeReportedArtifact>, super::substrate::SubstrateError>
+    {
+        super::substrate::node_reported_artifact(&self.substrate, node_id, sandbox_id).await
+    }
+
     /// Whether this deployment records activating clients (see
     /// [`super::substrate::ActivationClientAttribution`]).
     pub fn activation_client_attribution(&self) -> super::substrate::ActivationClientAttribution {

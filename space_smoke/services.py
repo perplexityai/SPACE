@@ -461,6 +461,7 @@ class SmokeServices:
             fixture._teardown_restart_control = cast(Any, kind)
             fixture._retained_only_copy_control = cast(Any, kind)
             fixture._orphaned_restore_pod_gc_control = cast(Any, kind)
+            fixture._restore_pin_control = cast(Any, kind)
             fixture._reconcile_queue_gc_control = cast(Any, kind)
             fixture._unanswered_template_control = cast(Any, kind)
             fixture._template_build_control = cast(Any, kind)

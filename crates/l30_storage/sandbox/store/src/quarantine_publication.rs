@@ -141,10 +141,11 @@ fn suspended_projection_candidates_query() -> String {
     let current_capture = suspend_snapshot_is_current_capture("s", "captured");
     // So is a capture without a generation that the node reports holding
     // suspended, while its backup from this node is still the latest capture
-    // of this run: the node's report is the proof the generation can't give.
-    // The report must come from the active execution when it names one, so a
-    // late report from an earlier execution can't pin its capture. A capture
-    // with another execution's generation stays unpinned.
+    // of this run: the node's report is the proof the generation can't give,
+    // as it is for the restore-pin repair. The report must come from the
+    // active execution when it names one, so a late report from an earlier
+    // execution can't pin its capture. A capture with another execution's
+    // generation stays unpinned.
     let held_capture =
         node_held_capture_is_latest("s", "held", "input.current_local_artifact_id", "$1");
     let held_captured = capture_registered_at("held");

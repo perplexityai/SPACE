@@ -34,6 +34,7 @@ from space_smoke.capabilities import (
     RetainedOnlyCopyControl,
     TeardownRestartControl,
     OrphanedRestorePodGcControl,
+    RestorePinControl,
     ReconcileQueueGcControl,
     UnansweredTemplateEvictionControl,
     TemplateBuildControl,
@@ -119,6 +120,7 @@ from space_smoke.pending_backup import PendingBackupAssertions
 from space_smoke.retained_only_copy import RetainedOnlyCopyAssertions
 from space_smoke.teardown_restart import TeardownRestartAssertions
 from space_smoke.reconcile_queue_gc import ReconcileQueueGcAssertions
+from space_smoke.restore_pin_repair import RestorePinAssertions
 from space_smoke.template_build import TemplateBuildAssertions
 from space_smoke.console import ConsoleAssertions
 from space_smoke.environment_placement_gate import (
@@ -3354,6 +3356,27 @@ class KindEcw(Ecw, KindAdmin):
                 self, self._orphaned_restore_pod_gc_control, self._context.scope
             )
         return self._orphaned_restore_pod_gc_assertions
+
+    _restore_pin_control: RestorePinControl | None = None
+    _restore_pin_assertions: RestorePinAssertions | None = None
+
+    @property
+    def restore_pin(self) -> RestorePinAssertions:
+        """The admin restore-pin route and a scoped cluster-controller restore-pin repair.
+
+        One instance per fixture: it carries the deferred repair-env restore
+        and the controller-mutation Lease across accesses.
+        """
+
+        if self._restore_pin_control is None:
+            raise SmokeConfigurationError(
+                "restore-pin control is only available on the kind backend"
+            )
+        if self._restore_pin_assertions is None:
+            self._restore_pin_assertions = RestorePinAssertions(
+                self, self._restore_pin_control, self._context.scope
+            )
+        return self._restore_pin_assertions
 
     _unanswered_template_control: UnansweredTemplateEvictionControl | None = None
     _unanswered_template_assertions: UnansweredTemplateEvictionAssertions | None = None

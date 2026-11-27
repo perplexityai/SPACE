@@ -144,7 +144,8 @@ pub enum RestoreError {
     /// a retry asks the same question until an operator pins a capture.
     #[error(
         "refusing to restore sandbox {0}: its captures can't be ordered, so the control plane \
-         won't guess which is the latest; it restores once a capture is pinned"
+         won't guess which is the latest; an operator can pin one through the admin restore-pin \
+         route"
     )]
     RestoreSourceUnordered(String),
     /// Restore lock admission or volume-manager refused new work.

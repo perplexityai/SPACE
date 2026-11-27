@@ -1813,6 +1813,14 @@ pub trait SubstrateAdapter: Send + Sync {
         target: &NodeApiTarget<'_>,
     ) -> Result<String, SubstrateError>;
 
+    /// The node-api target of this substrate's registered node `node_id`, for
+    /// a loop that asks one node about one of its sandboxes. `None` when no
+    /// node of this substrate has that id.
+    async fn node_api_target(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<OwnedNodeApiTarget>, SubstrateError>;
+
     /// Select a ready worker for node-local control-plane work using the
     /// substrate's placement and readiness policy.
     async fn select_ready_worker_node_api_target(
@@ -1957,6 +1965,25 @@ impl Substrate {
             Inner::Direct(_) => None,
             #[cfg(feature = "kubernetes")]
             Inner::Kubernetes(substrate) => substrate.node_cordon_states(),
+        }
+    }
+
+    /// Whether the substrate confirms worker `node_id` gone, not merely
+    /// unreachable. Direct has nothing but the node itself to ask, so it
+    /// never confirms one. Without the `kubernetes` feature only Direct is
+    /// built, so the parameter goes unread.
+    #[cfg_attr(
+        not(feature = "kubernetes"),
+        expect(
+            unused_variables,
+            reason = "Direct never confirms a node gone; only the Kubernetes arm reads the id"
+        )
+    )]
+    pub async fn node_confirmed_gone(&self, node_id: NodeId) -> Result<bool, SubstrateError> {
+        match &self.inner {
+            Inner::Direct(_) => Ok(false),
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => substrate.node_confirmed_gone(node_id).await,
         }
     }
 
@@ -2501,6 +2528,10 @@ pub struct NodeReportedArtifact {
     /// SQLite state as-is. So a row that says `stopped` while its Firecracker
     /// process is running reports `STOPPED` here.
     pub reports_stopped: bool,
+    /// The node reports the sandbox's lifecycle as `suspended`, so its pin
+    /// names the artifact it suspended with. Same caveat as
+    /// [`Self::reports_stopped`]: check [`Self::vm_alive`] too.
+    pub reports_suspended: bool,
     /// The Firecracker process is alive.
     ///
     /// This outranks [`Self::reports_stopped`], and the existing observation
@@ -2702,6 +2733,35 @@ pub async fn sandbox_state_with_node_api(
     Ok(node_reported_artifact_from_info(info, sandbox_id))
 }
 
+/// What node `node_id` reports holding for `sandbox_id`, reached through
+/// `substrate`'s endpoint resolution: `None` when no node of this substrate
+/// has that id, or when it's a Direct node whose registration is deleted, so
+/// its target has no endpoint (`DirectSubstrate::node_api_target`).
+pub async fn node_reported_artifact<A>(
+    substrate: &A,
+    node_id: NodeId,
+    sandbox_id: SandboxId,
+) -> Result<Option<NodeReportedArtifact>, SubstrateError>
+where
+    A: SubstrateAdapter + ?Sized,
+{
+    let Some(node) = substrate.node_api_target(node_id).await? else {
+        return Ok(None);
+    };
+    if node.managed_by == NodeManagedBy::Space && node.direct_endpoint.is_none() {
+        return Ok(None);
+    }
+    let (addr, mut client) = connect_retrying_node_api_client_for_target(
+        substrate,
+        &node.as_target(),
+        Duration::from_secs(30),
+    )
+    .await?;
+    sandbox_state_with_node_api(&mut client, &addr, sandbox_id)
+        .await
+        .map(Some)
+}
+
 /// What the node's `SandboxInfo` says about the evacuation guard's inputs.
 /// Extracted from the RPC so the mapping is testable without a node.
 fn node_reported_artifact_from_info(
@@ -2723,6 +2783,9 @@ fn node_reported_artifact_from_info(
         // treats as the node disagreeing: a deferral, never a teardown.
         reports_stopped: info.observed_status().is_ok_and(|status| {
             status.is_unowned(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Stopped)
+        }),
+        reports_suspended: info.observed_status().is_ok_and(|status| {
+            status.is_unowned(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Suspended)
         }),
         // `namespace`, not `pid`: the node sets `namespace` from its live
         // process probe alone, while `pid` also needs the row's persisted pid,
@@ -3314,6 +3377,17 @@ impl SubstrateAdapter for Substrate {
             Inner::Direct(substrate) => substrate.resolve_node_api_endpoint(target).await,
             #[cfg(feature = "kubernetes")]
             Inner::Kubernetes(substrate) => substrate.resolve_node_api_endpoint(target).await,
+        }
+    }
+
+    async fn node_api_target(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<OwnedNodeApiTarget>, SubstrateError> {
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.node_api_target(node_id).await,
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => substrate.node_api_target(node_id).await,
         }
     }
 

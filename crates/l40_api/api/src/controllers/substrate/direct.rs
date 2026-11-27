@@ -4813,6 +4813,21 @@ impl SubstrateAdapter for DirectSubstrate {
             })
     }
 
+    async fn node_api_target(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<OwnedNodeApiTarget>, SubstrateError> {
+        let node = direct_endpoints::node_api_target(&self.pool, node_id, SubstrateKind::Space)
+            .await
+            .db_context("failed to look up direct node-api target")?;
+        Ok(node.map(|node| OwnedNodeApiTarget {
+            managed_by: NodeManagedBy::Space,
+            role: node.role,
+            direct_endpoint: node.node_api_endpoint,
+            substrate_node_id: None,
+        }))
+    }
+
     async fn select_ready_worker_node_api_target(
         &self,
     ) -> Result<OwnedNodeApiTarget, SubstrateError> {
