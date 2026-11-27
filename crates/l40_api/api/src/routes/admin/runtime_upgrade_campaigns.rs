@@ -36,6 +36,7 @@ use axum::{
 };
 use pplx_space_accounts::UserId;
 use pplx_space_execution_spec::EnvironmentReference;
+use pplx_space_postgres_pool::Db;
 use pplx_space_runtime_upgrade_campaign_store::{
     self as store, CampaignId, CampaignKind, CampaignRecord, ChangePhaseError, CreateCampaignError,
     ItemCounts, NewCampaign, PhaseChange, ReadCampaignError,
@@ -783,9 +784,17 @@ pub(super) async fn dispatch_campaign_action(
         expected_generation,
     };
     let changed = match action {
-        Action::Pause => store::pause_campaign(&state.pool, campaign_id, &change).await,
+        Action::Pause => {
+            store::pause_campaign(&Db::from(state.pool.clone()), campaign_id, &change).await
+        }
         Action::Resume => {
-            store::resume_campaign(&state.pool, campaign_id, &change, retry_failed).await
+            store::resume_campaign(
+                &Db::from(state.pool.clone()),
+                campaign_id,
+                &change,
+                retry_failed,
+            )
+            .await
         }
         Action::Abort => store::abort_campaign(&state.pool, campaign_id, &change).await,
     };

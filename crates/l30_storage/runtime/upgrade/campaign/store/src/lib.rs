@@ -84,7 +84,7 @@ use std::str::FromStr;
 use pplx_space_accounts::UserId;
 use pplx_space_content_digest::DigestParseError;
 use pplx_space_execution_spec::EnvironmentReference;
-use pplx_space_postgres_pool::{DbError, Executor};
+use pplx_space_postgres_pool::{DbError, Executor, Tx};
 use pplx_space_rollout_queue::HeaderPhase;
 use pplx_space_sql_locator::sql;
 use time::OffsetDateTime;
@@ -127,6 +127,29 @@ pub(crate) async fn end_transaction<T, E: From<DbError>>(
     match result {
         Ok(value) => {
             tx.commit().await.map_err(DbError::from)?;
+            Ok(value)
+        }
+        Err(error) => {
+            if let Err(rollback) = tx.rollback().await {
+                tracing::warn!(
+                    error = %rollback,
+                    "couldn't roll back a runtime upgrade campaign verb's transaction"
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+/// [`end_transaction`] for a verb that began its transaction on a
+/// [`pplx_space_postgres_pool::Db`].
+pub(crate) async fn end_db_transaction<T, E: From<DbError>>(
+    tx: Tx<'_>,
+    result: Result<T, E>,
+) -> Result<T, E> {
+    match result {
+        Ok(value) => {
+            tx.commit().await?;
             Ok(value)
         }
         Err(error) => {

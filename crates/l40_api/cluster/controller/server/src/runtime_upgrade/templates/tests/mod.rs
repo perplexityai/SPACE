@@ -4,6 +4,7 @@
 
 use pplx_space_db_test_fixtures::{TestDb, try_pg_test_db_with_max_connections};
 use pplx_space_execution_catalog::catalog::initial_environment_reference;
+use pplx_space_postgres_pool::Db;
 use pplx_space_runtime_environment_policy_store::{PolicyChange, PolicyChangeReason, set_default};
 use pplx_space_runtime_upgrade_campaign_store::test_support::{CampaignSeed, insert_campaign};
 use pplx_space_runtime_upgrade_campaign_store::{
@@ -419,7 +420,13 @@ async fn a_campaign_twins_every_release_canary_first() -> TestResult {
     );
     assert_eq!(fixture.phase(campaign).await?, "canary");
 
-    store::resume_campaign(fixture.pool(), campaign, &PhaseChange::default(), false).await?;
+    store::resume_campaign(
+        &Db::from(fixture.pool().clone()),
+        campaign,
+        &PhaseChange::default(),
+        false,
+    )
+    .await?;
     for _ in 0..4 {
         fixture.tick(&reconciler).await;
     }
@@ -555,7 +562,12 @@ async fn a_paused_campaign_stays_paused() -> TestResult {
     let before = fixture.counts(campaign).await?;
     assert!(before.done >= 1 && before.pending >= 1, "{before:?}");
 
-    store::pause_campaign(fixture.pool(), campaign, &PhaseChange::default()).await?;
+    store::pause_campaign(
+        &Db::from(fixture.pool().clone()),
+        campaign,
+        &PhaseChange::default(),
+    )
+    .await?;
     for _ in 0..4 {
         fixture.tick(&reconciler).await;
     }

@@ -71,6 +71,7 @@ use std::time::{Duration, Instant};
 
 use pplx_space_artifact_model::{TRUSTED_TEMPLATE_STORAGE_BUCKETS_ENV, TrustedStorageBuckets};
 use pplx_space_env_vars::Environment;
+use pplx_space_postgres_pool::Db;
 use pplx_space_runtime_upgrade_campaign_store::{
     self as store, Campaign, CampaignId, CampaignKind, CampaignPhase, ItemOutcome, ItemPhase,
     LeasedItem,
@@ -602,7 +603,7 @@ impl Reconciler {
     /// Pause `campaign` if it's over its failure budget. `true` when it's
     /// paused now, or the check failed and nothing should be leased.
     async fn pause_if_over_budget(&self, campaign: &Campaign, report: &mut TickReport) -> bool {
-        match store::pause_if_over_budget(&self.pool, campaign.id).await {
+        match store::pause_if_over_budget(&Db::from(self.pool.clone()), campaign.id).await {
             Ok(true) => {
                 metrics::campaign_auto_paused(campaign.kind.as_str());
                 tracing::warn!(
