@@ -551,15 +551,17 @@ impl WarmPoolStore {
     /// the twin already has for a shape is kept, so a retry copies nothing
     /// twice; an autoscaler-owned one for the shape takes the copied manual
     /// settings. Returns how many configs were copied or taken over.
-    /// Pass the transaction that inserts the twin, so the copy commits with
-    /// that insert and a twin never wins resolution without its manual pools.
-    /// On a pool, or on a connection with no transaction open, the copy
-    /// commits on its own.
-    pub async fn copy_manual_configs_from_releases(
-        executor: impl Executor<'_>,
+    /// The caller must pass its open transaction: the one that inserts the
+    /// twin, so the copy commits with that insert and a twin never wins
+    /// resolution without its manual pools.
+    pub async fn copy_manual_configs_from_releases<C>(
+        tx: &mut C,
         originals: &[Uuid],
         twin: Uuid,
-    ) -> std::result::Result<u64, DbError> {
+    ) -> std::result::Result<u64, DbError>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let copied = sqlx::query(sql!(
             "INSERT INTO kubernetes_pool_configs (
                  template_release_id, vcpu, memory_mib, disk_mib, encryptable,
@@ -607,7 +609,7 @@ impl WarmPoolStore {
         .bind(originals)
         .bind(twin)
         .bind(PoolConfigOwner::Manual.as_str())
-        .execute(executor.into_sqlx())
+        .execute(tx.into_sqlx())
         .await?;
         Ok(copied.rows_affected())
     }
@@ -2235,20 +2237,22 @@ impl WarmPoolStore {
     /// sandboxes) at once. `reserved_sandbox_id` is unique per slot and ids
     /// without a receipt row are no-ops, so callers pass every finalized
     /// sandbox id without checking whether the sandbox was pool-claimed.
-    /// Returns the number of receipts deleted. Pass the transaction that
-    /// retires those pods or deletes those sandboxes, so the receipts go with
-    /// it; on a pool, or on a connection with no transaction open, the delete
-    /// commits on its own.
+    /// Returns the number of receipts deleted. The caller must pass its open
+    /// transaction: the one that retires those pods or deletes those
+    /// sandboxes, so the receipts go with it.
     ///
     /// Returns [`DbError`] rather than [`PoolError`] (this verb performs
     /// exactly one statement), so `?` works in a caller whose error type is
     /// `DbError`, such as the shared sandbox delete
     /// (`pplx_space_sandbox_store::delete::delete_with_dependents`), and in one
     /// whose error type is still `sqlx::Error`.
-    pub async fn delete_claimed_slots_for_retired_executions(
-        executor: impl Executor<'_>,
+    pub async fn delete_claimed_slots_for_retired_executions<C>(
+        tx: &mut C,
         reserved_sandbox_ids: &[SandboxId],
-    ) -> std::result::Result<u64, DbError> {
+    ) -> std::result::Result<u64, DbError>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         if reserved_sandbox_ids.is_empty() {
             return Ok(0);
         }
@@ -2264,7 +2268,7 @@ impl WarmPoolStore {
         .bind(ids)
         .bind(PoolSlotState::Bound.as_str())
         .bind(PoolSlotState::Claimed.as_str())
-        .execute(executor.into_sqlx())
+        .execute(tx.into_sqlx())
         .await?;
 
         Ok(result.rows_affected())

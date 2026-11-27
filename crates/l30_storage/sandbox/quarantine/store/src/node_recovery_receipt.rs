@@ -39,10 +39,11 @@ pub struct NodeRecovery {
 /// Append the recovery event to the sandbox's open episode when it is still
 /// `quarantine_id`, opened by `quarantined_by` for `reason_code`. Returns the
 /// rows inserted: `0` when the episode is gone or isn't that one.
-pub async fn record_node_recovery(
-    executor: impl Executor<'_>,
-    recovery: &NodeRecovery,
-) -> Result<u64, DbError> {
+/// The caller must pass its open transaction.
+pub async fn record_node_recovery<C>(tx: &mut C, recovery: &NodeRecovery) -> Result<u64, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let result = sqlx::query(sql!(
         "INSERT INTO sandbox_quarantine_history (
                  id, quarantine_id, sandbox_id, occurred_at, source, action,
@@ -67,25 +68,29 @@ pub async fn record_node_recovery(
     .bind(recovery.quarantine_id)
     .bind(recovery.reason_code.as_str())
     .bind(recovery.quarantined_by.as_str())
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(result.rows_affected())
 }
 
 /// Close the sandbox's open episode when it is still `quarantine_id`.
 /// Returns the rows deleted: `0` when the episode is gone or was replaced.
-pub async fn retire_node_recovered_episode(
-    executor: impl Executor<'_>,
+/// The caller must pass its open transaction.
+pub async fn retire_node_recovered_episode<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     quarantine_id: Uuid,
-) -> Result<u64, DbError> {
+) -> Result<u64, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let result = sqlx::query(sql!(
         "DELETE FROM sandbox_quarantine_state
               WHERE sandbox_id = $1 AND quarantine_id = $2"
     ))
     .bind(sandbox_id)
     .bind(quarantine_id)
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(result.rows_affected())
 }
