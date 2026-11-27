@@ -26,6 +26,9 @@ PATH = "/tmp/space-smoke-v2-drain.txt"
     "native.v2_drain_evacuates_every_resident",
     api_surfaces=("native",),
     substrates=("kubernetes",),
+    # The drain v2 controls are Kind's (`test.drain_v2`): a deployed suite
+    # run skips this, visibly, rather than fail it at setup.
+    backends=("kind",),
     # Three suspends, their uploads, three wakes and the drained edge on a
     # slow KVM bench.
     timeout_minutes=45,
