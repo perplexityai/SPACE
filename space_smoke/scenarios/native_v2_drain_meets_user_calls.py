@@ -54,9 +54,10 @@ def v2_drain_meets_user_calls(test: smoke.CommandSandboxFixture) -> None:
     on the sealed worker, and it keeps running there with its data intact.
     A wake of the one its user paused is told to retry with a 503, never a
     409, and lands it on the other worker once the drain made it durable.
-    The deadline is then brought in with a shorter hold; from just before
-    it, each call that meets the running one passes until the node suspends
-    it, and at least one meets it past the deadline, or the run ends
+    The deadline is then brought in with a shorter hold; the node holds the
+    running one until it, and from just before it each call that meets the
+    running one passes until the node suspends it, and at least one meets
+    it past the deadline, or the run ends
     inconclusive. Once the node suspends it, with its upload cut, a wake and
     a command of it are recorded, and no second execution of it runs off
     the worker; once the upload goes through, a wake lands it on the other

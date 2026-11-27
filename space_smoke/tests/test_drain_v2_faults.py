@@ -407,10 +407,12 @@ class GateAnswers(unittest.TestCase):
         states = ["started", "started", "started", "suspending"]
         drain, fixture = _assertions(_Control(node_states={sandbox: list(states)}))
         # Inside the lead: the calls start at once, before the deadline, and
-        # the node suspends before any lands past it: no call there judged.
+        # the node suspends at the deadline, before any call lands past it:
+        # no call there judged. The last clock reading is when the node is
+        # first read not running.
         drain._deadline = int(time.time()) + 3
         caller = _Sandbox(sandbox, [CALL_PASSED_STATUS, CALL_PASSED_STATUS])
-        with mock.patch.object(type(drain), "seconds_to_deadline", side_effect=[3, 2, 1]):
+        with mock.patch.object(type(drain), "seconds_to_deadline", side_effect=[3, 2, 1, 0]):
             seen = drain.expect_calls_pass_until_suspended(caller)  # type: ignore[arg-type]
         self.assertEqual(
             seen,
@@ -423,10 +425,21 @@ class GateAnswers(unittest.TestCase):
         self.assertEqual(caller.commands, 2)
         with self.assertRaises(InconclusiveSmoke):
             drain.expect_sampled_past_deadline(seen)
+        # The same, but the node is first read not running before the
+        # deadline: it took the VM down early, whatever the calls answered.
+        drain, fixture = _assertions(_Control(node_states={sandbox: list(states)}))
+        drain._deadline = int(time.time()) + 3
+        with (
+            mock.patch.object(type(drain), "seconds_to_deadline", side_effect=[3, 2, 1, 0.5]),
+            self.assertRaisesRegex(InvariantViolation, "before its deadline"),
+        ):
+            drain.expect_calls_pass_until_suspended(
+                _Sandbox(sandbox, [CALL_PASSED_STATUS, CALL_PASSED_STATUS])  # type: ignore[arg-type]
+            )
         # One call before the deadline and one past it, both meeting the VM.
         drain, fixture = _assertions(_Control(node_states={sandbox: ["started"] * 4 + ["suspending"]}))
         drain._deadline = int(time.time()) + 3
-        with mock.patch.object(type(drain), "seconds_to_deadline", side_effect=[3, 2, -1]):
+        with mock.patch.object(type(drain), "seconds_to_deadline", side_effect=[3, 2, -1, -2]):
             seen = drain.expect_calls_pass_until_suspended(
                 _Sandbox(sandbox, [CALL_PASSED_STATUS, CALL_PASSED_STATUS])  # type: ignore[arg-type]
             )
@@ -439,8 +452,8 @@ class GateAnswers(unittest.TestCase):
             drain._deadline = int(time.time()) + 3
             with (
                 self.subTest(refused=refused),
-                mock.patch.object(type(drain), "seconds_to_deadline", side_effect=[3, 2, 1]),
-                self.assertRaises(InvariantViolation),
+                mock.patch.object(type(drain), "seconds_to_deadline", side_effect=[3, 2, 1, 0]),
+                self.assertRaisesRegex(InvariantViolation, "did not pass"),
             ):
                 drain.expect_calls_pass_until_suspended(_Sandbox(sandbox, [refused, 201]))  # type: ignore[arg-type]
             self.assertIn(f"calls_around_deadline_{sandbox}", fixture.evidence)
@@ -450,7 +463,11 @@ class GateAnswers(unittest.TestCase):
         drain, _ = _assertions(_Control(node_states={sandbox: ["suspending"]}))
         drain._deadline = int(time.time()) + 3
         caller = _Sandbox(sandbox, [CALL_PASSED_STATUS])
-        with self.assertRaisesRegex(InvariantViolation, "no call met the VM running"):
+        # First read not running at the deadline, so no call met the VM.
+        with (
+            mock.patch.object(type(drain), "seconds_to_deadline", side_effect=[3, 0]),
+            self.assertRaisesRegex(InvariantViolation, "no call met the VM running"),
+        ):
             drain.expect_calls_pass_until_suspended(caller)  # type: ignore[arg-type]
 
 

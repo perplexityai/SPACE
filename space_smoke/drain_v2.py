@@ -2399,22 +2399,25 @@ class DrainV2Assertions:
     ) -> dict[str, list[Any]]:
         """From `lead` seconds before the deadline until the node suspends the
         sandbox, one probe after another, each call judged by the node's state
-        read just before it. A call made while the node held the VM running
-        must pass, before the deadline and past it, as a drain refuses no call
-        to a running sandbox. If the node read not running just after it, the
-        suspend began during the call: the call may still pass, and the one
-        refusal excused is the drain's documented retryable answer,
-        `drain_refused_the_call`, recorded with its body under
-        `overlapping_suspend`. A 503 with a valid `Retry-After` whose body
-        doesn't say it is the drain's can't be told from a busy API's, so it
-        ends the run inconclusive rather than excused. Any other answer to a
-        call made while the VM ran fails the run; none is discarded. At least
-        one call lands before the deadline, when the node must still hold the
-        VM. Past the deadline the node suspends at the controller's first
-        evacuating call, up to a tick after it, so a run may or may not judge a
-        call there that the VM outlived: `expect_sampled_past_deadline` judges
-        that. The statuses before and past the deadline of the calls the VM
-        outlived, and the overlapping ones."""
+        read just before it. The node must hold the VM until the deadline: the
+        run fails if it first reads the VM not running before then, and the
+        checks below judge only a suspend first seen at or past it. A call made
+        while the node held the VM running must pass, before the deadline and
+        past it, as a drain refuses no call to a running sandbox. If the node
+        read not running just after it, the suspend began during the call: the
+        call may still pass, and the one refusal excused is the drain's
+        documented retryable answer, `drain_refused_the_call`, recorded with
+        its body under `overlapping_suspend`. A 503 with a valid `Retry-After`
+        whose body doesn't say it is the drain's can't be told from a busy
+        API's, so it ends the run inconclusive rather than excused. Any other
+        answer to a call made while the VM ran fails the run; none is
+        discarded. At least one call lands before the deadline, when the node
+        must still hold the VM. Past the deadline the node suspends at the
+        controller's first evacuating call, up to a tick after it, so a run may
+        or may not judge a call there that the VM outlived:
+        `expect_sampled_past_deadline` judges that. The statuses before and
+        past the deadline of the calls the VM outlived, and the overlapping
+        ones."""
 
         subject = cast(RawCallSandbox, sandbox)
         bare = self.bare_id(sandbox.sandbox_id)
@@ -2428,12 +2431,18 @@ class DrainV2Assertions:
         deadline = time.monotonic() + lead + TICK_SECONDS + CALL_BUDGET_SECONDS + 30
         # No pause between probes: each takes seconds, and past the deadline
         # the window before the suspend is about a tick long.
-        while self.node_holds_vm_running(sandbox.sandbox_id):
+        while True:
+            if not self.node_holds_vm_running(sandbox.sandbox_id):
+                # When the node was first read not running: the suspend began
+                # at or before this.
+                suspend_seen = self.seconds_to_deadline()
+                break
             asked = self.seconds_to_deadline()
             answer = subject.command_answer("true")
             if self.node_holds_vm_running(sandbox.sandbox_id):
                 (before if asked > 0 else past).append(answer.status)
             else:
+                suspend_seen = self.seconds_to_deadline()
                 overlapping.append(
                     {
                         "status": answer.status,
@@ -2456,6 +2465,13 @@ class DrainV2Assertions:
             "overlapping_suspend": overlapping,
         }
         self._fixture.record(f"calls_around_deadline_{bare}", seen)
+        self._fixture.verify(
+            suspend_seen <= 0,
+            "the node took the running sandbox down before its deadline",
+            sandbox_id=bare,
+            not_running_seen_seconds_to_deadline=round(suspend_seen, 1),
+            **seen,
+        )
         self._fixture.verify(
             bool(before),
             "no call met the VM running in the seconds before the deadline",
