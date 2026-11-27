@@ -75,6 +75,7 @@ use crate::proto::{StartRequest, StartResponse};
 use crate::state::{SandboxState, SandboxStatus};
 
 mod node_effects;
+pub(in crate::service) mod retention;
 mod rpc;
 mod staged_disk;
 mod stale_copy;
@@ -92,6 +93,7 @@ fn abandoned_refusal(
         .map_err(|error| Status::internal(format!("read runtime upgrade: {error}")))?;
     Ok(abandoned_for.map(|abandoned_for| {
         if abandoned_for == sandbox_id {
+            retention::touch_operation_best_effort(conn, operation_id, sandbox_id);
             Status::failed_precondition(format!(
                 "runtime upgrade {operation_id} was abandoned on this node; a new decision \
                  names a new operation"
@@ -667,35 +669,36 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
         &self,
         request: &RuntimeUpgradeRequest,
     ) -> Result<(), Status> {
-        // All three under one lock of the connection every write takes: a
-        // rollback records its outcome and deletes the live row in one
-        // commit, which would otherwise fall between the reads and hide the
-        // operation from both.
-        let (recorded, retained, live) = {
-            let db = self.db()?;
-            let read = |error| Status::internal(format!("read runtime upgrade outcome: {error}"));
-            let operation_id = request.operation_id;
-            (
-                crate::db::read::recorded_runtime_upgrade_request(&db, operation_id)
-                    .map_err(read)?,
-                crate::db::read::retained_runtime_upgrade_requests(&db, operation_id)
-                    .map_err(read)?,
-                crate::db::read::runtime_upgrade(&db, operation_id)
-                    .map_err(|error| Status::internal(format!("read runtime upgrade: {error}")))?
-                    .map(|record| record.identity()),
-            )
-        };
+        // Read all three under one lock of the connection every write takes: a
+        // rollback records its outcome and deletes the live row in one commit,
+        // which would otherwise fall between the reads.
+        let db = self.db()?;
+        let read = |error| Status::internal(format!("read runtime upgrade outcome: {error}"));
+        let operation_id = request.operation_id;
+        let recorded =
+            crate::db::read::recorded_runtime_upgrade_request(&db, operation_id).map_err(read)?;
+        let retained =
+            crate::db::read::retained_runtime_upgrade_requests(&db, operation_id).map_err(read)?;
+        let live = crate::db::read::runtime_upgrade(&db, operation_id)
+            .map_err(|error| Status::internal(format!("read runtime upgrade: {error}")))?
+            .map(|record| record.identity());
         // Its attempts' final outcomes outlive the other two when the
         // sandbox's row is deleted, and still say what the operation asked
         // for: the sandbox, target, target state and authorization. A request
         // that differs, under any attempt id, is told so rather than given an
         // attempt's outcome or started as new work.
-        if recorded
-            .into_iter()
-            .chain(live)
-            .chain(retained)
-            .any(|identity| identity != request.identity())
+        let identities: Vec<_> = recorded.into_iter().chain(live).chain(retained).collect();
+        if identities
+            .iter()
+            .any(|identity| identity != &request.identity())
         {
+            // Refresh only same-sandbox mismatches while `db` is still held.
+            if identities
+                .iter()
+                .all(|identity| identity.sandbox_id == request.sandbox_id)
+            {
+                retention::touch_operation_best_effort(&db, operation_id, &request.sandbox_id);
+            }
             return Err(request.names_another());
         }
         Ok(())
@@ -774,23 +777,34 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
         request: &RuntimeUpgradeRequest,
     ) -> Result<(), Status> {
         let attempt_id = &request.attempt_id;
-        let Some((settled, recorded_for)) =
-            crate::db::read::runtime_upgrade_attempt_outcome_with_request(
-                &*self.db()?,
-                request.operation_id,
-                attempt_id,
-            )
-            .map_err(|error| Status::internal(format!("read runtime upgrade outcome: {error}")))?
-        else {
-            return Ok(());
+        let settled = {
+            let db = self.db()?;
+            let Some((settled, recorded_for)) =
+                crate::db::read::runtime_upgrade_attempt_outcome_with_request(
+                    &db,
+                    request.operation_id,
+                    attempt_id,
+                )
+                .map_err(|error| {
+                    Status::internal(format!("read runtime upgrade outcome: {error}"))
+                })?
+            else {
+                return Ok(());
+            };
+            // The per-sandbox lock doesn't serialize two sandboxes, so a request
+            // reusing the operation id for another sandbox may have recorded this
+            // outcome since `refuse_another_request` checked; it isn't this
+            // request's to replay, and cross-sandbox calls must not refresh
+            // another sandbox's retention window.
+            if recorded_for != request.identity() {
+                if recorded_for.sandbox_id == request.sandbox_id {
+                    retention::touch_attempt_best_effort(&db, request.operation_id, attempt_id);
+                }
+                return Err(request.names_another());
+            }
+            retention::touch_attempt_best_effort(&db, request.operation_id, attempt_id);
+            settled
         };
-        // The per-sandbox lock doesn't serialize two sandboxes, so a request
-        // reusing the operation id for another sandbox may have recorded this
-        // outcome since `refuse_another_request` checked; it isn't this
-        // request's to replay.
-        if recorded_for != request.identity() {
-            return Err(request.names_another());
-        }
         let operation_id = request.operation_id;
         let failure = settled.failure;
         let failure = failure.as_deref().unwrap_or("no reason recorded");
@@ -1977,9 +1991,15 @@ impl super::SandboxManagerService {
         tracker: &tokio_util::task::TaskTracker,
     ) {
         let service = self.clone();
+        let started_at = tokio::time::Instant::now();
         tracker.spawn(async move {
+            let mut pruner =
+                crate::db::runtime_upgrade_retention::RuntimeUpgradeRetentionPruner::default();
             loop {
                 service.recover_runtime_upgrades().await;
+                if started_at.elapsed() >= retention::STARTUP_PRUNE_GRACE {
+                    service.prune_retained_runtime_upgrades(&mut pruner).await;
+                }
                 tokio::select! {
                     () = shutdown.cancelled() => return,
                     () = tokio::time::sleep(RECOVERY_INTERVAL) => {}

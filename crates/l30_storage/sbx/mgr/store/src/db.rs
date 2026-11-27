@@ -56,6 +56,7 @@ pub mod local_artifact_leases;
 pub mod migration;
 pub mod quarantine_history;
 pub mod route_activation_claims;
+pub mod runtime_upgrade_retention;
 pub mod snapshot_gc;
 pub mod snapshot_upload_jobs;
 pub mod timestamps;
@@ -587,10 +588,11 @@ fn delete_sandbox_child_rows(tx: &Connection, id: &str) -> Result<()> {
     )?;
     // `sandbox_runtime_upgrade_attempt_outcomes` is kept, with no foreign
     // key: a delayed retry of an attempt whose outcome is final can arrive
-    // after the sandbox was staged again, and must still be refused.
+    // after the sandbox was staged again, and must still be refused until
+    // `runtime_upgrade_retention` prunes idle rows past the retention window.
     // `sandbox_runtime_upgrade_abandoned` is kept for the same reason: a late
     // call for an abandoned operation can stage the sandbox again, and must
-    // still be refused.
+    // still be refused until its retention window elapses.
     Ok(())
 }
 
