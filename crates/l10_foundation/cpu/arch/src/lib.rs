@@ -55,3 +55,6 @@ impl std::str::FromStr for Arch {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
