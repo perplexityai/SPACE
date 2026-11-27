@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 use uuid::Uuid;
 
 use super::*;

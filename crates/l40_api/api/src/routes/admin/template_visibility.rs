@@ -15,17 +15,13 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use pplx_space_common_core::types::OrgId;
-use pplx_space_common_core::types::TemplateName;
-use pplx_space_common_core::types::TemplateVisibility;
-use pplx_space_common_core::types::admin::{
-    AdminTemplateVisibilityResponse, SetTemplateVisibilityRequest,
-};
+use pplx_space_accounts::OrgId;
+use pplx_space_admin_protocol::{AdminTemplateVisibilityResponse, SetTemplateVisibilityRequest};
+use pplx_space_template_model::TemplateName;
+use pplx_space_template_model::TemplateVisibility;
 
 use super::audit::{self, AdminTemplateAuditEntry};
-use super::node_group_store::org_exists_in_tx;
 use super::support::{api_error, db_error, parse_json_body, require_managing_org_admin};
-use super::template_store;
 use crate::middleware::auth::AuthUser;
 use crate::routes::AppState;
 
@@ -112,14 +108,20 @@ pub async fn set_template_visibility(
         Ok(tx) => tx,
         Err(err) => return db_error(err).into_response(),
     };
-    let template =
-        match template_store::lock_template_for_update(&mut tx, template_name.as_str()).await {
-            Ok(Some(row)) => row,
-            Ok(None) => {
-                return api_error(StatusCode::NOT_FOUND, "Template not found").into_response();
-            }
-            Err(err) => return db_error(err).into_response(),
-        };
+    // `FOR UPDATE`: the visibility write and its guards share one lock window
+    // on the template row, so two operators cannot race the in-use guards.
+    let template = match pplx_space_template_store::templates::lock_visibility(
+        &mut *tx,
+        template_name.as_str(),
+    )
+    .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return api_error(StatusCode::NOT_FOUND, "Template not found").into_response();
+        }
+        Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
+    };
     let from_state = visibility_state_summary(template.visibility, template.org_id);
     let audit_failure = |error: &str| {
         audit::record_template(AdminTemplateAuditEntry {
@@ -161,7 +163,8 @@ pub async fn set_template_visibility(
         .into_response();
     }
     if let Some(org_id) = request.org_id {
-        match org_exists_in_tx(&mut tx, org_id).await {
+        match pplx_space_accounts_store::organizations::organization_exists(&mut *tx, org_id).await
+        {
             Ok(true) => {}
             Ok(false) => {
                 audit_failure("unknown org");
@@ -187,14 +190,31 @@ pub async fn set_template_visibility(
     // in-use template is the deferred follow-up); narrowing additionally
     // requires no cached rootfs anywhere — that residue is exactly what the
     // data-isolation guarantee forbids on shared nodes.
-    let in_use = match template_store::template_sandboxes_in_use_in_tx(
-        &mut tx,
+    //
+    // In use is anything not terminally gone. Suspended sandboxes count: a
+    // restore after a narrowing flip would cross the isolation boundary the
+    // flip establishes. So do `failed` rows the failed-restorable repair loop
+    // could still revert to `suspended`, judged by that loop's own
+    // snapshot-eligibility predicate, which is clock-safe for the poisoned
+    // lifecycle/placement stamps a failed transition leaves behind (the
+    // placement-freshness snapshot predicates are not).
+    //
+    // Scope of the guard: the template row lock serializes this count against
+    // the admin surface (compat edits take the matching shared lock), but the
+    // sandbox-create path does not yet read the template row under a lock, so
+    // a create committing between this count and the flip's commit can slip
+    // past it. Closing that window is the create-side half of the RFC's
+    // create-vs-flip lock (`FOR SHARE` across the placement decision), which
+    // lands with the create-time authorization gate; until then this guard is
+    // best-effort against concurrent creates.
+    let in_use = match pplx_space_sandbox_store::template_usage::template_sandboxes_in_use(
+        &mut *tx,
         template_name.as_str(),
     )
     .await
     {
         Ok(count) => count,
-        Err(err) => return db_error(err).into_response(),
+        Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
     };
     if in_use > 0 {
         audit_failure("conflict: template is in use");
@@ -218,16 +238,20 @@ pub async fn set_template_visibility(
     if widening {
         // The encryption sidecars are credential-fenced, so this check runs on
         // the credential pool rather than the `space_user` flip transaction
-        // (which has no grant on those tables).
-        let owner_encrypted = match template_store::template_has_owner_encryption(
-            state.credentials_pool.pool(),
-            template_name.as_str(),
-        )
-        .await
-        {
-            Ok(has) => has,
-            Err(err) => return db_error(err).into_response(),
-        };
+        // (which has no grant on those tables). They're written at
+        // template-encrypt time and don't change during a flip, so this
+        // unlocked read is consistent with the flip's other best-effort
+        // quiescence guards.
+        let owner_encrypted =
+            match pplx_space_template_release_store::template_has_owner_encryption(
+                state.credentials_pool.pool(),
+                template_name.as_str(),
+            )
+            .await
+            {
+                Ok(has) => has,
+                Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
+            };
         if owner_encrypted {
             audit_failure("conflict: owner-encrypted template cannot widen");
             return (
@@ -246,13 +270,17 @@ pub async fn set_template_visibility(
     let narrowing = matches!(request.visibility, TemplateVisibility::OrgSpecific)
         && matches!(template.visibility, TemplateVisibility::Generic);
     if narrowing {
-        let cached =
-            match template_store::template_cached_rootfs_in_tx(&mut tx, template_name.as_str())
-                .await
-            {
-                Ok(count) => count,
-                Err(err) => return db_error(err).into_response(),
-            };
+        // v1 is conservative: any cached copy blocks the narrow, including
+        // copies already on the owner's dedicated nodes.
+        let cached = match pplx_space_node_template_inventory_store::template_inventory_rows(
+            &mut *tx,
+            template_name.as_str(),
+        )
+        .await
+        {
+            Ok(count) => count,
+            Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
+        };
         if cached > 0 {
             audit_failure("conflict: rootfs still cached on nodes");
             return (
@@ -268,25 +296,34 @@ pub async fn set_template_visibility(
         }
     }
 
-    if let Err(err) = template_store::update_template_visibility_in_tx(
-        &mut tx,
+    if let Err(err) = pplx_space_template_store::templates::update_visibility(
+        &mut *tx,
         template_name.as_str(),
         request.visibility,
         request.org_id,
     )
     .await
     {
-        return db_error(err).into_response();
+        return db_error(sqlx::Error::from(err)).into_response();
     }
     let pruned_compat_rows = if narrowing {
         // `effective_org` is Some here: org-specific without an owner was
         // rejected above.
         let owner = effective_org.expect("narrowing flip validated to have an owner");
-        match template_store::prune_cross_org_compat_in_tx(&mut tx, template_name.as_str(), owner)
-            .await
+        // Allowlist rows naming this template in any other org's group are
+        // now illegal under the hard cross-org rule, so they go in the same
+        // transaction. Generic groups cannot have compat rows (the
+        // `restricted` policy is org-only), so every pruned row belonged to
+        // another org's group.
+        match pplx_space_node_group_store::prune_cross_org_template_compat(
+            &mut *tx,
+            template_name.as_str(),
+            owner,
+        )
+        .await
         {
             Ok(count) => count,
-            Err(err) => return db_error(err).into_response(),
+            Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
         }
     } else {
         0

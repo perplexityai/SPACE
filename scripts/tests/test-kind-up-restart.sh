@@ -165,7 +165,11 @@ up_case() {
     local tilt_pid=$!
     fakes+=("$tilt_pid")
     printf '%s\n' "$tilt_pid" >"$tilt_pidfile"
-    sleep 0.2
+    local attempt
+    for ((attempt = 0; attempt < 100; attempt++)); do
+        ps -p "$tilt_pid" -o command= | grep -q '^tilt up' && break
+        sleep 0.01
+    done
     if ! ps -p "$tilt_pid" -o command= | grep -q '^tilt up'; then
         echo "skip: this platform does not let exec -a rename the fake tilt; $name not exercised" >&2
         return 0
@@ -174,7 +178,12 @@ up_case() {
     env -i "${base_env[@]}" SPACE_TILT_PIDFILE="$work/tilt.pid" SPACE_TILT_STATE_DIR="$work/state" \
         ${run_env[@]+"${run_env[@]}"} \
         bash "$shadow/infra/space/kind/scripts/up.sh" >"$out" 2>&1 || rc=$?
-    sleep 0.2
+    if [[ "$expect" == restart ]]; then
+        for ((attempt = 0; attempt < 100; attempt++)); do
+            kill -0 "$tilt_pid" 2>/dev/null || break
+            sleep 0.01
+        done
+    fi
     (( rc != 0 )) || fail "$name: the stubbed run must end at the port-owner refusal" "$(cat "$out")"
     case "$expect" in
         restart)

@@ -13,10 +13,10 @@ use super::{
 use crate::metrics::sandbox::worker::{
     QuarantineRecoveryAttemptOutcome, QuarantineRecoveryOutcome,
 };
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_sandbox_model::SandboxId;
 
 /// Which of the pass's two recoveries a claimed candidate was admitted for, and
 /// the resource that admission reserved.

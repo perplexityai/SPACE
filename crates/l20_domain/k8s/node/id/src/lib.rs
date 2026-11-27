@@ -1,13 +1,16 @@
 //! SPACE node identity derived from a Kubernetes node: the role-scoped node
 //! UUID that node-local daemons and the control plane compute from
-//! `(k8s node name, SPACE node role)`, and the parser that accepts either a
-//! direct node UUID or a Kubernetes node name.
+//! `(k8s node name, SPACE node role)`, the parser that accepts either a
+//! direct node UUID or a Kubernetes node name, and the EC2 instance a
+//! Kubernetes node runs on, read from its `providerID`.
 //!
 //! It cannot live in `pplx-space-k8s-ids`, which holds only
-//! Kubernetes' own identifiers: it returns `NodeId` and reads `NodeRole`,
-//! which belong to `pplx-space-common-core`.
+//! Kubernetes' own identifiers: it returns `NodeId`, from
+//! `pplx-space-accounts`, and reads `NodeRole`, from `pplx-space-node-model`.
 
-use pplx_space_common_core::types::{K8sNodeName, K8sNodeNameParseError, NodeId, NodeRole};
+use pplx_space_accounts::NodeId;
+use pplx_space_k8s_ids::{K8sNodeName, K8sNodeNameParseError};
+use pplx_space_node_model::NodeRole;
 use uuid::Uuid;
 
 const SPACE_K8S_NODE_ID_NAMESPACE: Uuid =
@@ -31,6 +34,47 @@ pub fn space_node_id(value: &str, role: NodeRole) -> Result<NodeId, K8sNodeNameP
     }
     let node_name = K8sNodeName::parse(value)?;
     Ok(space_k8s_node_id(node_name.as_str(), role.as_str()))
+}
+
+/// An EC2 instance ID: `i-` and 8 or 17 lowercase hex digits, the form EC2
+/// issues. Whether such an instance exists is EC2's to say; an ID in any
+/// other form is never asked about, since EC2 would answer as for an
+/// instance that is gone.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Ec2InstanceId(String);
+
+impl Ec2InstanceId {
+    /// The instance ID in `aws:///<az>/<instance-id>`, the canonical pointer
+    /// from a Kubernetes Node back to its EC2 instance. Everything before the
+    /// final `/` is bookkeeping for the cloud-provider layer. `None` for any
+    /// other provider (Kind's `kind://…`, for one) or a last segment that is
+    /// not an instance ID.
+    pub fn from_provider_id(provider_id: &str) -> Option<Self> {
+        provider_id
+            .strip_prefix("aws:///")
+            .and_then(|rest| rest.rsplit('/').next())
+            .and_then(Self::parse)
+    }
+
+    /// `value`, when it is an instance ID.
+    pub fn parse(value: &str) -> Option<Self> {
+        let hex = value.strip_prefix("i-")?;
+        (matches!(hex.len(), 8 | 17)
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        .then(|| Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Ec2InstanceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 #[cfg(test)]

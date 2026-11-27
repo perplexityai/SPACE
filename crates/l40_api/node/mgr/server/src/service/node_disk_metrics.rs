@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use futures_util::{StreamExt, stream};
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 use serde::Serialize;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
@@ -736,7 +736,7 @@ fn classify_disk_metric_targets(
         for digest in budget.directories(&path)? {
             // Every cache partition's build dir counts, not only legacy ones.
             if digest.file_name().is_some_and(|n| {
-                pplx_space_common_core::types::TemplateCachePartition::parse_build_dir_name(
+                pplx_space_template_model::TemplateCachePartition::parse_build_dir_name(
                     &n.to_string_lossy(),
                 )
                 .is_some()

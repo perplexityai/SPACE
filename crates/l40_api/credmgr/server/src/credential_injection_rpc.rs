@@ -7,8 +7,8 @@
 
 use std::sync::Arc;
 
-use pplx_space_common_core::types::NodeRole;
 use pplx_space_credmgr_client::NETWORK_CREDENTIAL_RESOLUTION_TIMEOUT;
+use pplx_space_node_model::NodeRole;
 use tokio::sync::Semaphore;
 use tonic::Status;
 

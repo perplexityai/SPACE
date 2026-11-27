@@ -1,5 +1,6 @@
-use pplx_space_common_core::types::OrgId;
-use pplx_space_common_core::types::{SnapshotId, UserId};
+use pplx_space_accounts::OrgId;
+use pplx_space_accounts::UserId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use sqlx::types::Json;
@@ -83,6 +84,7 @@ fn new_admission_persists_the_explicit_v1_workflow() -> TestResult {
         federated_owner: None,
         federated_service_grant: None,
         idempotency_key: &idempotency_key,
+        client_id: &pplx_space_accounts::ClientId::unknown(),
     };
 
     let prepared = prepare_fork_operation(&input)?;
@@ -486,12 +488,10 @@ async fn fork_admission_waits_for_source_lifecycle_guard() -> TestResult {
     let store = PublicOperationStore::new(db.pool.clone());
 
     let mut delete_guard = db.pool.begin().await?;
-    sqlx::query(pplx_space_common_core::sql!(
-        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, $2))"
-    ))
-    .bind(source_sandbox_id.as_uuid())
-    .bind(pplx_space_sandbox_store::fork_source_lifecycle::FORK_SOURCE_LIFECYCLE_LOCK_SEED)
-    .execute(&mut *delete_guard)
+    pplx_space_sandbox_store::fork_source_lifecycle::lock_fork_source_lifecycle(
+        &mut *delete_guard,
+        source_sandbox_id,
+    )
     .await?;
 
     let admission = begin_fork_operation_admission(
@@ -517,6 +517,7 @@ async fn fork_admission_waits_for_source_lifecycle_guard() -> TestResult {
                 federated_owner: None,
                 federated_service_grant: None,
                 idempotency_key: &idempotency_key,
+                client_id: &pplx_space_accounts::ClientId::unknown(),
             },
         ),
     )
@@ -549,6 +550,7 @@ async fn fork_admission_waits_for_source_lifecycle_guard() -> TestResult {
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &missing_key,
+            client_id: &pplx_space_accounts::ClientId::unknown(),
         },
     )
     .await?;
@@ -597,6 +599,7 @@ async fn admission_reuses_matching_request_and_preserves_original_targets() -> T
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &idempotency_key,
+            client_id: &pplx_space_accounts::ClientId::unknown(),
         },
     )
     .await?;
@@ -616,6 +619,7 @@ async fn admission_reuses_matching_request_and_preserves_original_targets() -> T
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &idempotency_key,
+            client_id: &pplx_space_accounts::ClientId::unknown(),
         },
     )
     .await?;
@@ -656,6 +660,7 @@ async fn admitted_replay_survives_a_missing_source_sandbox() -> TestResult {
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &idempotency_key,
+            client_id: &pplx_space_accounts::ClientId::unknown(),
         },
     )
     .await?;
@@ -684,6 +689,7 @@ async fn admitted_replay_survives_a_missing_source_sandbox() -> TestResult {
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &idempotency_key,
+            client_id: &pplx_space_accounts::ClientId::unknown(),
         },
     )
     .await?;
@@ -715,6 +721,7 @@ async fn admission_rejects_same_key_with_different_request() -> TestResult {
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &idempotency_key,
+            client_id: &pplx_space_accounts::ClientId::unknown(),
         },
     )
     .await?;
@@ -734,6 +741,7 @@ async fn admission_rejects_same_key_with_different_request() -> TestResult {
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &idempotency_key,
+            client_id: &pplx_space_accounts::ClientId::unknown(),
         },
     )
     .await?;
@@ -775,4 +783,47 @@ async fn seed_user(pool: &sqlx::PgPool, org_id: OrgId) -> Result<Uuid, sqlx::Err
     .execute(pool)
     .await?;
     Ok(id)
+}
+
+/// An admitted fork persists the forking client, and the target's restore
+/// activates as that client. A payload persisted before forks carried their
+/// client inherits instead.
+#[test]
+fn a_fork_payload_carries_its_activating_client() -> TestResult {
+    use crate::controllers::substrate::ActivationClient;
+    use pplx_space_accounts::ClientId;
+
+    let idempotency_key = IdempotencyKey::parse("fork-client")?;
+    let forker = ClientId::parse("forker")?;
+    let prepared = prepare_fork_operation(&AdmitForkOperation {
+        org_id: OrgId::new(),
+        actor_user_id: Some(UserId::new()),
+        source_sandbox_id: SandboxId::new(),
+        request: ForkRequest::from_wire(Some(300), Some(1))?,
+        ecw_host_domain: "e2b.example.test",
+        hard_deadline: Duration::from_secs(240),
+        federated_owner: None,
+        federated_service_grant: None,
+        idempotency_key: &idempotency_key,
+        client_id: &forker,
+    })?;
+    assert_eq!(
+        prepared.payload_json.pointer("/payload/client_id"),
+        Some(&serde_json::json!("forker"))
+    );
+    assert_eq!(
+        decode_fork_payload(prepared.payload_json.clone())?.activating_client(),
+        ActivationClient::Client(forker)
+    );
+
+    let mut old = prepared.payload_json;
+    old.pointer_mut("/payload")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("fork payload is missing its body")?
+        .remove("client_id");
+    assert_eq!(
+        decode_fork_payload(old)?.activating_client(),
+        ActivationClient::Inherit
+    );
+    Ok(())
 }

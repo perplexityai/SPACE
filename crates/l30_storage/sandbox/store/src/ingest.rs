@@ -19,8 +19,14 @@
 //! tables (`sandbox_k8s_executions`, `sandbox_port_exposures`,
 //! `sandbox_observed_states`, the quarantine and node-facet tables,
 //! `sandbox_snapshot_inventory`, `snapshot_storage_locations`): splitting one
-//! would change what it does. The caller owns the transaction, the locking reads that select candidates,
-//! the other tables' own statements, and the events it emits.
+//! would change what it does. `sandbox_observed_states` and the node-facet
+//! tables are `pplx-space-sandbox-teardown`'s, and the quarantine tables
+//! `pplx-space-sandbox-quarantine-store`'s: the pause-failed recovery and the
+//! census prune write them under temporary co-writer grants in
+//! `ARCHITECTURE.toml`. The caller owns the transaction, the other
+//! tables' own statements and the events it emits, and takes the locking
+//! reads that select candidates, some of them through
+//! [`crate::quarantine_publication`].
 //!
 //! A new lifecycle write here from a node report follows the rule for such
 //! writes in `crates/l40_api/internal/api/server/AGENTS.md`, which also lists
@@ -29,24 +35,31 @@
 //! Recordset inputs are the JSON rows the internal API builds; each function
 //! names the record columns its statement reads.
 
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, NodeId, PodUid, SandboxId,
-    SandboxQuarantineHistoryAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SandboxTransitionReceiptKind, SandboxTransitionTargetState, SubstrateKind,
+use pplx_space_accounts::NodeId;
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, SandboxId, SandboxQuarantineHistoryAction, SandboxQuarantineReasonCode,
+    SandboxQuarantineSource, SandboxTransitionReceiptKind, SandboxTransitionTargetState,
 };
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 
 use std::sync::LazyLock;
 
-use pplx_space_common_core::sql;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_portability::node_published_execution_identity_matches;
+use pplx_space_sql_locator::sql;
 use sqlx::types::{Json, JsonValue};
 use uuid::Uuid;
 
 /// The `jsonb_to_recordset` column list of one published sandbox row with
-/// its transition receipt, as the publish path serializes it. Two statements
-/// still in the internal API splice it as well, and its names must match the
-/// fields that path serializes: `jsonb_to_recordset` reads a missing field as
-/// NULL.
+/// its transition receipt, as the publish path serializes it.
+/// [`lock_suspended_projection_candidates`](crate::quarantine_publication::lock_suspended_projection_candidates)
+/// splices it as well, and
+/// [`lock_activation_rollback_candidates`](crate::k8s_executions::quarantine_rollback::lock_activation_rollback_candidates)
+/// spells the same list out: change them together. Its names must match the
+/// fields that path serializes: `jsonb_to_recordset` reads a missing field
+/// as NULL.
 pub const TRANSITION_RECEIPT_RECORD_COLUMNS: &str = "
     sandbox_id UUID,
     published_lifecycle TEXT,
@@ -75,11 +88,11 @@ pub const TRANSITION_RECEIPT_RECORD_COLUMNS: &str = "
 /// a row lock: that compare-and-set is the only guard, and it compares the
 /// stored text exactly, where the claim compared it with `LOWER(TRIM(..))`.
 pub async fn mark_published_quarantined(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     claimed: Json<JsonValue>,
-) -> Result<Vec<SandboxId>, sqlx::Error> {
-    sqlx::query_scalar::<_, SandboxId>(sql!(
+) -> Result<Vec<SandboxId>, DbError> {
+    Ok(sqlx::query_scalar::<_, SandboxId>(sql!(
         "UPDATE sandboxes s
                  SET lifecycle = 'quarantined'
                  FROM jsonb_to_recordset($1::jsonb) AS input(
@@ -93,8 +106,8 @@ pub async fn mark_published_quarantined(
     ))
     .bind(claimed)
     .bind(node_id)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Move the publisher's Kubernetes rows that it published `failed` to
@@ -109,10 +122,10 @@ pub async fn mark_published_quarantined(
 /// the lifecycle the update actually replaced. The lock is part of the
 /// statement.
 pub async fn mark_published_failed(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     rows: Json<JsonValue>,
-) -> Result<Vec<(SandboxId, String)>, sqlx::Error> {
+) -> Result<Vec<(SandboxId, String)>, DbError> {
     let failed_sandboxes = sqlx::query_as::<_, (Uuid, String)>(sql!(
         "WITH input AS (
              SELECT *
@@ -145,7 +158,7 @@ pub async fn mark_published_failed(
     .bind(node_id)
     .bind(rows)
     .bind(SubstrateKind::Kubernetes)
-    .fetch_all(executor)
+    .fetch_all(executor.into_sqlx())
     .await?;
     Ok(failed_sandboxes
         .into_iter()
@@ -194,9 +207,9 @@ pub struct SuspendedFinalizationCandidate {
 /// relies on the caller's candidate selection, which holds the row locks
 /// (`FOR UPDATE OF s`) in the same transaction.
 pub async fn finalize_suspended(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     candidates: &[SuspendedFinalizationCandidate],
-) -> Result<Vec<(SandboxId, bool)>, sqlx::Error> {
+) -> Result<Vec<(SandboxId, bool)>, DbError> {
     let candidate_ids = candidates
         .iter()
         .map(|candidate| candidate.sandbox_id)
@@ -346,17 +359,19 @@ pub async fn finalize_suspended(
           RETURNING s.id, candidate.clear_marker"
         ))
     });
-    sqlx::query_as(sqlx::AssertSqlSafe(FINALIZATION_QUERY.as_str()))
-        .bind(&candidate_ids)
-        .bind(&clear_markers)
-        .bind(&published_artifact_ids)
-        .bind(&published_artifact_kinds)
-        .bind(&published_artifact_origins)
-        .bind(&published_execution_generations)
-        .bind(&published_pod_uids)
-        .bind(&published_pod_uids_were_missing)
-        .fetch_all(executor)
-        .await
+    Ok(
+        sqlx::query_as(sqlx::AssertSqlSafe(FINALIZATION_QUERY.as_str()))
+            .bind(&candidate_ids)
+            .bind(&clear_markers)
+            .bind(&published_artifact_ids)
+            .bind(&published_artifact_kinds)
+            .bind(&published_artifact_origins)
+            .bind(&published_execution_generations)
+            .bind(&published_pod_uids)
+            .bind(&published_pod_uids_were_missing)
+            .fetch_all(executor.into_sqlx())
+            .await?,
+    )
 }
 
 /// Converge the publisher's `restoring` rows it published `started` to
@@ -373,10 +388,10 @@ pub async fn finalize_suspended(
 /// ([`pplx_space_sandbox_routability::routable_execution_or_non_k8s`]), which
 /// stays `restoring` so the next connect can hydrate the in-flight pod.
 pub async fn converge_published_restoring_to_started(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     rows: Json<JsonValue>,
-) -> Result<Vec<SandboxId>, sqlx::Error> {
+) -> Result<Vec<SandboxId>, DbError> {
     // Publishing `started` proves the node-local runtime finished, but for
     // Kubernetes sandboxes the control plane also needs a routable active
     // execution row. The blocking wake/restore path is what hydrates that row
@@ -408,15 +423,15 @@ pub async fn converge_published_restoring_to_started(
            AND {routable_execution}
          RETURNING s.id"
     );
-    sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(sql!(
+    Ok(sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(sql!(
         restored_convergence_query.as_str()
     )))
     .bind(node_id)
     .bind(rows)
     .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
     .bind(SubstrateKind::Kubernetes)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Advance the publisher's activity clocks (`last_access_at`,
@@ -429,15 +444,28 @@ pub async fn converge_published_restoring_to_started(
 /// `rows` is a recordset of `{sandbox_id, last_used_at, last_access_at,
 /// last_command_at}`. A clock moves only forward and only when the published
 /// value is more than a minute past the stored one, so a publish that
-/// advances nothing writes nothing. The write re-checks only that the row is
-/// on `node_id`; it has no lifecycle or substrate predicate.
+/// advances nothing writes nothing. The one exception: `last_access_at` and
+/// `last_command_at` also move when a full snapshot falls between the stored
+/// value and the published one. Recovery restores a snapshot only if those
+/// clocks don't postdate it (`sn.timestamp >= last_command_at`), so a
+/// throttled value would let activity just after a snapshot read as having
+/// happened before it, and a restore would drop that activity's writes. The
+/// write re-checks only that the row is on `node_id`; it has no lifecycle or
+/// substrate predicate.
 pub async fn advance_published_activity(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     rows: Json<JsonValue>,
-) -> Result<(), sqlx::Error> {
-    // PostgreSQL GREATEST ignores absent clocks and yields NULL if all are absent.
-    // Keep publisher ownership on the updated row, avoiding a redundant self-join.
+) -> Result<(), DbError> {
+    // PostgreSQL GREATEST ignores absent clocks and yields NULL if all are
+    // absent. `advance` decides once per clock whether the published value
+    // moves the stored one: past the one-minute throttle, or across a full
+    // snapshot taken since the stored value (the readers compare
+    // `sn.timestamp >= last_*_at`, so a throttled clock left behind such a
+    // snapshot would make the snapshot look newer than the sandbox's last
+    // activity). The `SET` re-checks only that the clock still moves
+    // forward, against the row the UPDATE locks, so a concurrent writer that
+    // advanced it further is never moved back.
     sqlx::query(sql!(
         "WITH input AS (
          SELECT *
@@ -454,66 +482,130 @@ pub async fn advance_published_activity(
                 input.last_command_at,
                 GREATEST(input.last_used_at, input.last_access_at, input.last_command_at) AS last_used_at
          FROM input
+     ),
+     advance AS (
+         SELECT activity.*,
+                (
+                    activity.last_access_at IS NOT NULL
+                    AND (
+                        s.last_access_at IS NULL
+                        OR s.last_access_at < activity.last_access_at - INTERVAL '1 minute'
+                        OR (
+                            s.last_access_at < activity.last_access_at
+                            AND EXISTS (
+                                SELECT 1
+                                  FROM snapshots sn
+                                 WHERE sn.sandbox_id = s.id
+                                   AND sn.type = 'full'
+                                   AND sn.timestamp >= s.last_access_at
+                                   AND sn.timestamp < activity.last_access_at
+                            )
+                        )
+                    )
+                ) AS move_access,
+                (
+                    activity.last_command_at IS NOT NULL
+                    AND (
+                        s.last_command_at IS NULL
+                        OR s.last_command_at < activity.last_command_at - INTERVAL '1 minute'
+                        OR (
+                            s.last_command_at < activity.last_command_at
+                            AND EXISTS (
+                                SELECT 1
+                                  FROM snapshots sn
+                                 WHERE sn.sandbox_id = s.id
+                                   AND sn.type = 'full'
+                                   AND sn.timestamp >= s.last_command_at
+                                   AND sn.timestamp < activity.last_command_at
+                            )
+                        )
+                    )
+                ) AS move_command,
+                (
+                    activity.last_used_at IS NOT NULL
+                    AND (
+                        s.last_used_at IS NULL
+                        OR s.last_used_at < activity.last_used_at - INTERVAL '1 minute'
+                    )
+                ) AS move_used
+           FROM activity
+           JOIN sandboxes s ON s.id = activity.sandbox_id AND s.active_node_id = $1
+          WHERE activity.last_used_at IS NOT NULL
      )
      UPDATE sandboxes s
      SET last_access_at = CASE
-             WHEN activity.last_access_at IS NOT NULL
-              AND (
-                  s.last_access_at IS NULL
-                  OR s.last_access_at < activity.last_access_at - INTERVAL '1 minute'
-              )
-             THEN activity.last_access_at
+             WHEN advance.move_access
+              AND (s.last_access_at IS NULL OR s.last_access_at < advance.last_access_at)
+             THEN advance.last_access_at
              ELSE s.last_access_at
          END,
          last_command_at = CASE
-             WHEN activity.last_command_at IS NOT NULL
-              AND (
-                  s.last_command_at IS NULL
-                  OR s.last_command_at < activity.last_command_at - INTERVAL '1 minute'
-              )
-             THEN activity.last_command_at
+             WHEN advance.move_command
+              AND (s.last_command_at IS NULL OR s.last_command_at < advance.last_command_at)
+             THEN advance.last_command_at
              ELSE s.last_command_at
          END,
          last_used_at = CASE
-             WHEN activity.last_used_at IS NOT NULL
-              AND (
-                  s.last_used_at IS NULL
-                  OR s.last_used_at < activity.last_used_at - INTERVAL '1 minute'
-              )
-             THEN activity.last_used_at
+             WHEN advance.move_used
+              AND (s.last_used_at IS NULL OR s.last_used_at < advance.last_used_at)
+             THEN advance.last_used_at
              ELSE s.last_used_at
          END
-     FROM activity
-     WHERE s.id = activity.sandbox_id
+     FROM advance
+     WHERE s.id = advance.sandbox_id
        AND s.active_node_id = $1
-       AND activity.last_used_at IS NOT NULL
-       AND (
-           (
-               activity.last_access_at IS NOT NULL
-               AND (
-                   s.last_access_at IS NULL
-                   OR s.last_access_at < activity.last_access_at - INTERVAL '1 minute'
-               )
-           )
-           OR (
-               activity.last_command_at IS NOT NULL
-               AND (
-                   s.last_command_at IS NULL
-                   OR s.last_command_at < activity.last_command_at - INTERVAL '1 minute'
-               )
-           )
-           OR (
-               activity.last_used_at IS NOT NULL
-               AND (
-                   s.last_used_at IS NULL
-                   OR s.last_used_at < activity.last_used_at - INTERVAL '1 minute'
-               )
-           )
-       )"
+       AND (advance.move_access OR advance.move_command OR advance.move_used)"
     ))
     .bind(node_id)
     .bind(rows)
-    .execute(executor)
+    .execute(executor.into_sqlx())
+    .await?;
+    Ok(())
+}
+
+/// Record the idle deadline (`next_auto_event_at`, Unix seconds) the
+/// publisher reported for each of its rows. **Observed projection**: the node
+/// reported when it will next run an automatic lifecycle transition.
+///
+/// `rows` is a recordset of `{sandbox_id, next_auto_event_at}`, with a NULL
+/// deadline when none is scheduled. The deadline moves later each time the
+/// sandbox is used, so a later one is written only once it is a minute or more
+/// past the stored one. An earlier one is written at once, so the stored
+/// deadline is never later than the last one published. The
+/// `sandboxes_set_updated_at` trigger ignores this column. The write re-checks
+/// only that the row is on `node_id`.
+pub async fn record_published_idle_deadlines(
+    executor: impl Executor<'_>,
+    node_id: NodeId,
+    rows: Json<JsonValue>,
+) -> Result<(), DbError> {
+    sqlx::query(sql!(
+        "WITH input AS (
+             SELECT *
+               FROM jsonb_to_recordset($2::jsonb) AS input(
+                   sandbox_id UUID,
+                   next_auto_event_at TIMESTAMPTZ
+               )
+         ),
+         deadline AS (
+             SELECT sandbox_id,
+                    FLOOR(EXTRACT(EPOCH FROM next_auto_event_at))::BIGINT AS next_auto_event_at
+               FROM input
+         )
+         UPDATE sandboxes s
+            SET next_auto_event_at = deadline.next_auto_event_at
+           FROM deadline
+          WHERE s.id = deadline.sandbox_id
+            AND s.active_node_id = $1
+            AND (
+                (s.next_auto_event_at IS NULL) <> (deadline.next_auto_event_at IS NULL)
+                OR deadline.next_auto_event_at < s.next_auto_event_at
+                OR deadline.next_auto_event_at >= s.next_auto_event_at + 60
+            )"
+    ))
+    .bind(node_id)
+    .bind(rows)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -534,11 +626,11 @@ pub async fn advance_published_activity(
 /// `restoring` row marked for a stopped re-placement, the drain's restore in
 /// flight; the statement's comment says why.
 pub async fn converge_published_stopped(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     rows: Json<JsonValue>,
-) -> Result<Vec<SandboxId>, sqlx::Error> {
-    sqlx::query_scalar::<_, SandboxId>(sql!(
+) -> Result<Vec<SandboxId>, DbError> {
+    Ok(sqlx::query_scalar::<_, SandboxId>(sql!(
         "WITH input AS (
              SELECT *
              FROM jsonb_to_recordset($2::jsonb) AS input(
@@ -577,8 +669,8 @@ pub async fn converge_published_stopped(
     ))
     .bind(node_id)
     .bind(rows)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Release the exact activation attempts that published activation-completed
@@ -591,39 +683,44 @@ pub async fn converge_published_stopped(
 /// published lifecycle equals its target state, naming the active execution's
 /// generation, activation attempt and target state; a route activation to be
 /// present; and either a `created` lifecycle (for a `created` target) or a
-/// running execution with a pod IP (for `started` and `paused`). It checks
-/// `active_node_id` only through an unlocked join, as of the statement's
-/// snapshot, and the `sandboxes` update does not re-check it, so a change to
-/// `active_node_id` committed after that snapshot is not seen. The lifecycle
-/// projection re-checks only that the row is outside the suspend, hold and
-/// delete lifecycles: if a newer suspend owns the row, the attempt is still
-/// released but its stale target is not projected.
+/// running execution with a pod IP (for `started` and `paused`). Only matching
+/// receipts lock sandboxes still on `node_id`, before updating their executions
+/// to match teardown's lock order. The lifecycle projection also requires
+/// that the row is outside the suspend, hold and delete lifecycles: if a newer
+/// suspend owns the row, the attempt is still released but its stale target
+/// is not projected.
+///
+/// A projected `started` target also clears `command_ready_pending`. The node
+/// writes an activation-completed receipt only once the guest has passed its
+/// readiness gate, so the receipt for the attempt a create gave up waiting on
+/// is the evidence the marker was waiting for. A receipt that releases
+/// nothing leaves the marker to the data-plane confirmation.
 pub async fn release_completed_activations(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     rows: Json<JsonValue>,
-) -> Result<Vec<SandboxId>, sqlx::Error> {
+) -> Result<Vec<SandboxId>, DbError> {
     let query = format!(
         "WITH input AS (
              SELECT *
                FROM jsonb_to_recordset($2::jsonb) AS published({TRANSITION_RECEIPT_RECORD_COLUMNS})
-         ), released AS (
-             UPDATE sandbox_k8s_executions execution
-                SET activation_attempt_id = NULL,
-                    activation_attempt_expires_at = NULL,
-                    activation_attempt_target_state = NULL,
-                    updated_at = NOW()
-               FROM sandboxes sandbox, input
-              WHERE sandbox.id = execution.sandbox_id
-                AND input.sandbox_id = sandbox.id
-                AND sandbox.active_node_id = $1
+         ), locked AS MATERIALIZED (
+             SELECT execution.id AS execution_id,
+                    input.transition_receipt_execution_generation,
+                    input.transition_receipt_activation_attempt_id,
+                    input.transition_receipt_target_state
+               FROM input
+               JOIN sandboxes sandbox ON sandbox.id = input.sandbox_id
+               JOIN sandbox_k8s_executions execution ON execution.sandbox_id = sandbox.id
+              WHERE sandbox.active_node_id = $1
+                AND input.transition_receipt_kind = $3
+                AND input.published_lifecycle = input.transition_receipt_target_state
+                -- Retained receipts that no longer match need no sandbox lock.
                 AND execution.active
                 AND execution.generation = input.transition_receipt_execution_generation
                 AND execution.activation_attempt_id = input.transition_receipt_activation_attempt_id
                 AND execution.route_activation_id IS NOT NULL
                 AND execution.activation_attempt_target_state = input.transition_receipt_target_state
-                AND input.transition_receipt_kind = $3
-                AND input.published_lifecycle = input.transition_receipt_target_state
                 AND (
                     (
                         input.transition_receipt_target_state = 'created'
@@ -635,7 +732,27 @@ pub async fn release_completed_activations(
                         AND execution.pod_ip IS NOT NULL
                     )
                 )
-              RETURNING execution.sandbox_id, input.transition_receipt_target_state
+              ORDER BY sandbox.id
+              FOR NO KEY UPDATE OF sandbox
+         ), released AS (
+             UPDATE sandbox_k8s_executions execution
+                SET activation_attempt_id = NULL,
+                    activation_attempt_expires_at = NULL,
+                    activation_attempt_target_state = NULL,
+                    updated_at = NOW()
+               FROM locked
+              WHERE execution.id = locked.execution_id
+                -- Execution-only writers can change these without the sandbox lock.
+                AND execution.active
+                AND execution.generation = locked.transition_receipt_execution_generation
+                AND execution.activation_attempt_id = locked.transition_receipt_activation_attempt_id
+                AND execution.route_activation_id IS NOT NULL
+                AND execution.activation_attempt_target_state = locked.transition_receipt_target_state
+                AND (
+                    locked.transition_receipt_target_state = 'created'
+                    OR (execution.state = 'running' AND execution.pod_ip IS NOT NULL)
+                )
+              RETURNING execution.sandbox_id, locked.transition_receipt_target_state
          )
          UPDATE sandboxes sandbox
             SET lifecycle = released.transition_receipt_target_state,
@@ -643,6 +760,11 @@ pub async fn release_completed_activations(
                     WHEN released.transition_receipt_target_state IN ('started', 'paused')
                     THEN 'on_node'
                     ELSE sandbox.placement
+                END,
+                command_ready_pending = CASE
+                    WHEN released.transition_receipt_target_state = 'started'
+                    THEN FALSE
+                    ELSE sandbox.command_ready_pending
                 END
            FROM released
           WHERE sandbox.id = released.sandbox_id
@@ -651,12 +773,14 @@ pub async fn release_completed_activations(
             )
          RETURNING sandbox.id"
     );
-    sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(node_id)
-        .bind(rows)
-        .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
-        .fetch_all(executor)
-        .await
+    Ok(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
+            .bind(node_id)
+            .bind(rows)
+            .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
+            .fetch_all(executor.into_sqlx())
+            .await?,
+    )
 }
 
 /// The quarantine source of an sbx-manager pause failure, as recorded.
@@ -684,13 +808,13 @@ pub const PAUSE_FAILED_QUARANTINE_REASON: SandboxQuarantineReasonCode =
 /// row whose stored text is not canonical, such as ` Quarantined `, returns
 /// `false`.
 pub async fn recover_published_pause_failed(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     sandbox_id: SandboxId,
     quarantine_id: Uuid,
     target_state: SandboxTransitionTargetState,
     action: SandboxQuarantineHistoryAction,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let quarantine_source = PAUSE_FAILED_QUARANTINE_SOURCE.as_str();
     let quarantine_reason = PAUSE_FAILED_QUARANTINE_REASON.as_str();
     let recovered = sqlx::query_scalar::<_, Uuid>(sql!(
@@ -758,9 +882,31 @@ pub async fn recover_published_pause_failed(
     .bind(SandboxQuarantineSource::NodeStatePublish.as_str())
     .bind(action.as_str())
     .bind(node_id.to_string())
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(recovered == Some(sandbox_id.as_uuid()))
+}
+
+/// List the omitted IDs a complete census can mutate. Include active Direct
+/// sandboxes without an observation: the census can still tombstone them.
+/// The caller locks these IDs along with its explicit reports before writing.
+pub async fn census_prune_candidates(
+    executor: impl Executor<'_>,
+    node_id: NodeId,
+    present_sandbox_ids: &[SandboxId],
+) -> Result<Vec<SandboxId>, DbError> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT sandbox_id FROM sandbox_observed_states
+          WHERE node_id = $1 AND NOT (sandbox_id = ANY($2))
+         UNION
+         SELECT id FROM sandboxes
+          WHERE active_node_id = $1 AND managed_by = $3 AND NOT (id = ANY($2))"
+    ))
+    .bind(node_id)
+    .bind(present_sandbox_ids)
+    .bind(SubstrateKind::Space)
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Built once: every input is bound, so the text is the same on every publish.
@@ -778,7 +924,7 @@ static PRUNE_ABSENT_NODE_SANDBOXES_QUERY: LazyLock<String> = LazyLock::new(|| {
             "WITH removed AS (
              DELETE FROM sandbox_observed_states sos
              WHERE sos.node_id = $1
-               AND NOT (sos.sandbox_id = ANY($2))
+               AND sos.sandbox_id = ANY($2)
              RETURNING sos.sandbox_id
          ),
          removed_elements AS (
@@ -815,7 +961,7 @@ static PRUNE_ABSENT_NODE_SANDBOXES_QUERY: LazyLock<String> = LazyLock::new(|| {
                AND s.managed_by = $4
                AND s.lifecycle NOT IN ('deleted', 'deleting')
                AND NOT {released_with_durable_artifact}
-               AND NOT (s.id = ANY($2))
+               AND s.id = ANY($2)
              RETURNING s.id AS sandbox_id
          )
          DELETE FROM sandbox_snapshot_inventory
@@ -836,22 +982,24 @@ static PRUNE_ABSENT_NODE_SANDBOXES_QUERY: LazyLock<String> = LazyLock::new(|| {
 /// rows whose artifact is durable
 /// ([`pplx_space_sandbox_portability::stopped_artifact_durable`]). The caller
 /// decides the census is complete and documents why the absence is sound.
+/// Mutate only the captured, advisory-locked candidates. A row that became
+/// visible later may be newer than this census and was not locked by it.
 /// `network_policy_facet` is the facet name of the per-sandbox network-policy
 /// rows it forgets.
 pub async fn prune_census_absent_sandboxes(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
-    present_sandbox_ids: &[SandboxId],
+    locked_candidate_ids: &[SandboxId],
     network_policy_facet: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sqlx::AssertSqlSafe(
         PRUNE_ABSENT_NODE_SANDBOXES_QUERY.as_str(),
     ))
     .bind(node_id)
-    .bind(present_sandbox_ids)
+    .bind(locked_candidate_ids)
     .bind(network_policy_facet)
     .bind(SubstrateKind::Space)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -928,16 +1076,16 @@ static DELETE_ABSENT_STOPPED_SANDBOXES: LazyLock<String> = LazyLock::new(|| {
 /// cleanup either, so their `node_reconcile_queue` and `node_facet_conditions`
 /// rows are not deleted here.
 pub async fn delete_published_absent_stopped(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     absent_sandbox_ids: &[SandboxId],
-) -> Result<Vec<SandboxId>, sqlx::Error> {
-    sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(
+) -> Result<Vec<SandboxId>, DbError> {
+    Ok(sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(
         DELETE_ABSENT_STOPPED_SANDBOXES.as_str(),
     ))
     .bind(node_id)
     .bind(absent_sandbox_ids)
     .bind(SubstrateKind::Space)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }

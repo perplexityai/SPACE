@@ -125,6 +125,55 @@ The selected template must already be published. `seed` is the compatibility
 default when a create request omits `templateID`; a production deployment will
 usually publish and select a purpose-built runtime template instead.
 
+### Client attribution
+
+A client can identify itself with an `X-Client-ID` header. Create, fork and
+connect each take a slot under the per-client concurrency limit
+(`SPACE_API_CLIENT_CONCURRENCY_*` in [Configuration](configuration.md)), which
+gives each allowlisted id its own bucket and has every other request share
+one. Resume takes one too when `SPACE_ACTIVATION_CLIENT_ATTRIBUTION_ENABLED` is
+on.
+
+With `SPACE_ACTIVATION_CLIENT_ATTRIBUTION_ENABLED` on (it's off by default; see
+[Configuration](configuration.md)), the id is also recorded as the client whose
+activation created the sandbox's runtime. A value that is a Kubernetes label value is used as sent, after
+trimming. A missing or invalid value, or one of the reserved ids `unknown`,
+`native` and `overflow` in any case, becomes `unknown`. A native `/v1` create
+records `native`. On Direct, the record is written only when the sandbox is
+created.
+
+On Kubernetes, the pod an activation creates carries the id as its
+`space.pplx.net/client-id` label, and tracking that pod records it on the
+sandbox:
+
+- A create, fork, connect or resume labels its pod with the calling client,
+  and a native lifecycle operation that starts a runtime labels its pod
+  `native`.
+- An activation with no client of its own (an implicit wake from a command or
+  ingress, a reconciler, an evacuation) labels its pod with the recorded id,
+  and leaves it unlabeled when nothing is recorded.
+- A wake that reuses the resident runtime keeps its pod and label.
+- A warm-pool pod is labeled when it's adopted, before the create commits,
+  and no pod waiting in the pool carries one. If the label patch fails
+  transiently (throttling, a 408 or 5xx, a dropped connection, no answer
+  within 5 seconds), the pod isn't adopted and the create gets a retryable
+  503. A throttled patch never ran, so its slot goes back to the pool; after
+  any other failure the patch may still land, so the slot is taken out of the
+  pool and its label removal is attempted, and a label that can't be removed
+  stays until the pool deletes the pod. If the apiserver refuses the patch for
+  good, the pod isn't adopted and the create builds a cold pod instead.
+
+Ids are unbounded, since a client can send any value. Anything that needs a
+bounded set, such as a metric tag, has to map the id to one first.
+
+An operator can cap how many sandboxes with a live runtime each client holds
+(`SPACE_API_CLIENT_LIVE_CAP_*` in [Configuration](configuration.md)). A
+create, fork, connect or resume that would go over the cap gets a `429` with
+a `Retry-After`, and succeeds once the client pauses or kills one of
+its sandboxes. A connect to a sandbox that's already running is never refused.
+On the Direct substrate the cap always admits, since Direct keeps no
+per-client inventory.
+
 ## Sizing at create
 
 SPACE extends ECW create with the reserved metadata key `space.resources`. Its
@@ -148,10 +197,12 @@ not an upstream E2B create option. ECW already uses reserved metadata for
 [full network policies](ecw-network-policy.md). The current upstream E2B create
 schema and Python SDK 2.62.0 do not expose CPU, memory, or disk overrides.
 
-Provided values must be positive integers no larger than 2,147,483,647; actual
-allocation remains subject to runtime and available capacity. `disk_mib`
-overrides the template's disk size; it must be at least the template rootfs
-size, and a value above 128 GiB returns HTTP 400. A smaller value fails the
+`vcpu` must be 1 to 32, `memory_mib` 512 to 65,536 and `disk_mib` 1 to
+131,072; a value outside them returns HTTP 400 before anything is created. These
+are admission bounds, the same as the native API's. A node gives the guest at
+most its own configured guest maximum, and allocation remains subject to
+available capacity. `disk_mib` overrides the template's disk size; it must be
+at least the template rootfs size. A smaller value fails the
 create with HTTP 400 naming the rootfs size once the node refuses to start it,
 usually within seconds. Malformed JSON, unknown
 fields, and invalid values return HTTP 400. Omitted fields retain the normal
@@ -164,9 +215,12 @@ sandbox, change a template, or alter fork, connect, or resume behavior. Requests
 without the extension retain their existing behavior.
 
 Deploy an API version supporting this extension before enabling callers. Older
-versions accept the key as ordinary metadata and do not apply its sizing.
-Callers should verify the allocation returned by `get_info()` and reject an
-undersized sandbox.
+versions accept the key as ordinary metadata and do not apply its sizing;
+`get_info()` then reports the default sizing instead of the requested values.
+`get_info()` reports the requested `memory_mb`, not the memory the node gave the
+guest, so it cannot show that a request above the node's guest maximum was
+capped. To check a guest's memory, read it inside the sandbox, for example
+`MemTotal` in `/proc/meminfo`, which sits slightly below the allocation.
 
 ## Compatibility contract
 
@@ -190,6 +244,8 @@ Lifecycle names differ across the two APIs:
 | `resume` | `restore`: recreate the sandbox from the persisted state |
 
 ECW does not expose the SPACE API's resident-memory pause/resume operations.
+
+When a cluster runs drain v2 (`SPACE_DRAIN_V2_ENABLED`), a sandbox can also be paused for you when an operator drains its node: the drain pauses a running sandbox the way an idle auto-pause does. Reconnect with `connect`, which restores it: on another node while its node is still draining, drained or terminating, and possibly on the same node after an undrain, which makes the node schedulable again. While the drain is still making the sandbox durable, the connect is refused with a `503`; retry it. In the short window after the node paused it and before its snapshot is durable, the sandbox still reads running: a connect answers as if it were, and a command stays pending until the row catches up.
 
 Forks cold-boot a new sandbox from a durable disk artifact, without copying
 memory or changing the source lifecycle. Both live and suspended encrypted
@@ -314,6 +370,27 @@ within its limits; the pinned SDK's `commands.run` cannot set one per call.
 Stdin input and signals have no such protection, and resending them can
 deliver them twice. A sandbox at capacity still refuses before starting
 anything with `429` and `Retry-After`.
+
+`GET /files` starts its `200` once the guest sends the file's first bytes, or
+ends the read of an empty file, so a read that fails before then answers with
+that failure instead of an aborted body. It waits up to 120 seconds for the
+sandbox to open the read, then up to another 120 seconds for those first bytes
+or that end, so a response can take up to about four minutes. A directory
+answers `400` with the guest's reason, as envd answers it, except on a Windows
+guest, which cannot open a directory as a file and answers `403`. A FIFO and a
+socket also answer `400` with the guest's reason. On a Windows guest, a file
+that another process opened without sharing read access, or locked, answers
+`409` with the guest's reason; a file another process holds open but shares for
+reading is read as usual. Other failures keep their own status, such as `403`
+for a file the user may not read.
+
+While a release rolls out, a sandbox from an older template answers a FIFO or
+a socket with another error, and an older Windows template answers a file in
+use `400`. An older data plane answers a newer guest's FIFO or socket refusal
+`502` "Sandbox is not running". When the guest reports the failure on the
+read's stream rather than refusing the read, as it does for a directory and
+for a Windows file in use, an older data plane answers `200` and then aborts
+the body.
 
 `POST /files` accepts `multipart/form-data` and `application/octet-stream`
 uploads of up to 256 MiB per request, which the data plane streams to a spool

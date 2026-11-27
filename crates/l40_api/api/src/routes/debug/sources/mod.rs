@@ -1,4 +1,4 @@
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use sqlx::{PgPool, Postgres, Transaction};
 
 pub(super) mod lifecycle;
@@ -17,13 +17,8 @@ pub(super) mod timeline;
 pub(in crate::routes::debug) async fn begin_read_only(
     pool: &PgPool,
 ) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    sqlx::query(sql!(
-        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
-    ))
-    .execute(&mut *tx)
-    .await?;
-    Ok(tx)
+    pool.begin_with(sql!("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        .await
 }
 
 pub(in crate::routes::debug) fn source_error(error: impl std::fmt::Display) -> String {

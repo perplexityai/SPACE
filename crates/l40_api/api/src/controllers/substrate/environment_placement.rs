@@ -29,7 +29,8 @@
 //! On Kubernetes, kube-scheduler picks the node, so the gate reaches placement
 //! through the pod instead: `pod_environment` records the work's environment
 //! on the pod in shadow and on, and on adds a required node affinity on the
-//! label node-ctl writes for it. Kubernetes refuses on at startup for now
+//! label node-ctl writes for it. Kubernetes refuses on at startup while
+//! resume-time runtime upgrades are on
 //! ([`EnvironmentPlacementGate::check_kubernetes_support`]).
 //!
 //! The gate reads only what nodes publish. It doesn't apply the cluster's
@@ -40,13 +41,13 @@ use std::fmt;
 use std::str::FromStr;
 
 use crate::metrics::environment_placement::EnvironmentPlacementPath;
-use pplx_space_common_core::env::Environment;
+use pplx_space_accounts::NodeId;
+use pplx_space_env_vars::Environment;
 #[cfg(feature = "kubernetes")]
-use pplx_space_common_core::kubernetes::PodEnvironment;
-#[cfg(feature = "kubernetes")]
-use pplx_space_common_core::types::EnvironmentReference;
-use pplx_space_common_core::types::NodeId;
+use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_node_status_store::EnvironmentRefusal;
+#[cfg(feature = "kubernetes")]
+use pplx_space_sandbox_pod::PodEnvironment;
 use sqlx::PgPool;
 
 #[cfg(test)]
@@ -101,20 +102,30 @@ impl EnvironmentPlacementGate {
         matches!(self, Self::Shadow)
     }
 
-    /// Whether the Kubernetes substrate supports this mode (the gap table in
-    /// `kubernetes/mod.rs`). `off` and `shadow` are, since shadow places as
-    /// off. `on` is refused at startup: a Kubernetes create names no cache
-    /// partition, so the worker boots the digest's legacy-partition build
-    /// whatever environment the pod's affinity required, and the requirement
-    /// would claim enforcement the worker doesn't provide.
-    pub fn check_kubernetes_support(self) -> Result<(), super::SubstrateError> {
+    /// Whether the Kubernetes substrate supports this mode alongside
+    /// `runtime_upgrade` (the gap table in `kubernetes/mod.rs`). `off` and
+    /// `shadow` always are, since shadow places as off. `on` is, unless
+    /// resume-time runtime upgrades are on too: a runtime-upgrade
+    /// activation's pod requires the recorded environment rather than the
+    /// upgrade's target, so the requirement would claim enforcement the
+    /// worker doesn't provide. With upgrades off no activation upgrades, so
+    /// every pod's requirement is the environment it boots. That's the only
+    /// path this check knows: a later one that boots a pod in an environment
+    /// other than the one it requires has to refuse `on` here too.
+    pub fn check_kubernetes_support(
+        self,
+        runtime_upgrade: super::runtime_upgrade::RuntimeUpgradeAtActivation,
+    ) -> Result<(), super::SubstrateError> {
         match self {
             Self::Off | Self::Shadow => Ok(()),
+            Self::On if !runtime_upgrade.is_enabled() => Ok(()),
             Self::On => Err(super::SubstrateError::Unsupported {
                 message: format!(
-                    "{}=on isn't supported on the Kubernetes substrate yet: the worker doesn't \
-                     yet boot the environment a pod requires; use shadow",
-                    Self::ENV
+                    "{}=on isn't supported on the Kubernetes substrate while {} is on: \
+                     runtime-upgrade pods don't yet require the upgrade's target environment; \
+                     turn resume-time upgrades off or use shadow",
+                    Self::ENV,
+                    super::runtime_upgrade::RuntimeUpgradeAtActivation::ENV,
                 ),
             }),
         }
@@ -248,7 +259,8 @@ pub(crate) enum BindingScope {
     /// The release's binding, else the one every holder whose row names a
     /// binding reports, when they all agree. For a pull candidate that holds
     /// no row of the build: the build a pull fetches is the one those nodes
-    /// fetched.
+    /// fetched. A row bound to a twin's environment doesn't count: it's the
+    /// twin's build, which shares the template and hash.
     ReleaseOrHolders,
 }
 
@@ -260,6 +272,13 @@ pub(crate) enum BindingScope {
 /// which skips the reads. In shadow a failed read is logged and reads as
 /// `None`, so shadow places exactly as off; on, it fails the placement rather
 /// than place bound work as unbound.
+///
+/// The release is the original one for `template` at `content_hash`. The
+/// direct substrate's worker boots the build a create without an environment
+/// preference resolves, the legacy partition's, so its placement reads the
+/// original's binding. A Kubernetes pod reads `resolved_work_environment`
+/// with the gate `on` and this otherwise, and `pool_pod_environment` a
+/// chosen release.
 pub(crate) async fn work_environment(
     gate: EnvironmentPlacementGate,
     pool: &PgPool,
@@ -267,10 +286,67 @@ pub(crate) async fn work_environment(
     content_hash: Option<&str>,
     scope: BindingScope,
 ) -> Result<Option<String>, sqlx::Error> {
+    gated_work_environment(
+        gate,
+        pool,
+        BuildRelease::Original,
+        template,
+        content_hash,
+        scope,
+    )
+    .await
+}
+
+/// [`work_environment`] for the release a create of `template` at
+/// `content_hash` resolves (`pplx_space_template_release_store::resolved_release_sql`),
+/// else the original. A Kubernetes pod boots the environment its pod
+/// requires, so its binding follows the create's resolution.
+#[cfg(feature = "kubernetes")]
+pub(crate) async fn resolved_work_environment(
+    gate: EnvironmentPlacementGate,
+    pool: &PgPool,
+    template: &str,
+    content_hash: Option<&str>,
+    scope: BindingScope,
+) -> Result<Option<String>, sqlx::Error> {
+    gated_work_environment(
+        gate,
+        pool,
+        BuildRelease::Resolved,
+        template,
+        content_hash,
+        scope,
+    )
+    .await
+}
+
+/// Which release of a build records its binding.
+#[derive(Debug, Clone, Copy)]
+enum BuildRelease {
+    /// The original release of the template and hash.
+    Original,
+    /// The release a create of the template and hash resolves
+    /// (`pplx_space_template_release_store::resolved_release_sql`), else the
+    /// original.
+    #[cfg(feature = "kubernetes")]
+    Resolved,
+    /// A chosen release, the original or a twin.
+    #[cfg(feature = "kubernetes")]
+    Id(uuid::Uuid),
+}
+
+async fn gated_work_environment(
+    gate: EnvironmentPlacementGate,
+    pool: &PgPool,
+    release: BuildRelease,
+    template: &str,
+    content_hash: Option<&str>,
+    scope: BindingScope,
+) -> Result<Option<String>, sqlx::Error> {
     let Some(content_hash) = content_hash.filter(|_| gate.evaluates()) else {
         return Ok(None);
     };
-    match build_binding(pool, template, content_hash, scope).await {
+    match build_binding(pool, release, template, content_hash, scope).await {
         Err(error) if !gate.refuses() => {
             tracing::warn!(
                 template,
@@ -287,18 +363,72 @@ pub(crate) async fn work_environment(
 
 async fn build_binding(
     pool: &PgPool,
+    release: BuildRelease,
     template: &str,
     content_hash: &str,
     scope: BindingScope,
 ) -> Result<Option<String>, sqlx::Error> {
-    let release =
-        crate::template_releases_store::release_environment(pool, template, content_hash).await?;
+    let release = match release {
+        BuildRelease::Original => {
+            pplx_space_template_release_store::lookup::original_release_environment(
+                pool,
+                template,
+                content_hash,
+            )
+            .await?
+        }
+        #[cfg(feature = "kubernetes")]
+        BuildRelease::Resolved => {
+            match pplx_space_template_release_store::resolved_release(
+                pool,
+                template,
+                content_hash,
+                pplx_space_execution_catalog::catalog::initial_environment_reference(),
+            )
+            .await?
+            {
+                Some((_, environment)) => environment,
+                None => {
+                    pplx_space_template_release_store::lookup::original_release_environment(
+                        pool,
+                        template,
+                        content_hash,
+                    )
+                    .await?
+                }
+            }
+        }
+        #[cfg(feature = "kubernetes")]
+        BuildRelease::Id(release_id) => {
+            pplx_space_template_release_store::lookup::release_environment_by_id(pool, release_id)
+                .await?
+        }
+    };
     match (release, scope) {
         (Some(environment), _) => Ok(Some(environment)),
         (None, BindingScope::Release) => Ok(None),
         (None, BindingScope::ReleaseOrHolders) => {
-            crate::template_inventory_store::agreed_build_environment(pool, template, content_hash)
-                .await
+            // A twin's build shares the template and hash, so its holders'
+            // binding is the twin's, not this release's.
+            let twins = pplx_space_template_release_store::lookup::bound_release_environments(
+                pool,
+                template,
+                content_hash,
+                pplx_space_execution_catalog::catalog::initial_environment_reference(),
+            )
+            .await?;
+            // Holders that disagree give no binding: one hash can be cached
+            // bound to several environments. Both digest spellings match
+            // because a tag on a legacy unprefixed release reports that
+            // spelling while the digest's holders record the `sha256:` one.
+            pplx_space_node_template_inventory_store::agreed_build_environment(
+                pool,
+                template,
+                content_hash,
+                &twins,
+            )
+            .await
+            .map_err(sqlx::Error::from)
         }
     }
 }
@@ -311,7 +441,7 @@ pub enum BoundEnvironmentError {
         subject: String,
         value: String,
         #[source]
-        source: pplx_space_common_core::types::DigestParseError,
+        source: pplx_space_content_digest::DigestParseError,
     },
     #[error(transparent)]
     Database(#[from] sqlx::Error),
@@ -375,21 +505,25 @@ pub(crate) fn bound_pod_environment(
     }
 }
 
-/// The environment a warm-pool pod of `template` at `content_hash` renders
-/// under `gate` ([`work_environment`], [`bound_pod_environment`]); `None`
-/// while the gate is off or for unbound work.
+/// The environment a warm-pool pod of the pool's release `release_id`, of
+/// `template` at `content_hash`, renders under `gate`
+/// ([`work_environment`] read from that release, [`bound_pod_environment`]); `None` while
+/// the gate is off or for unbound work. The pool's own release records the
+/// binding, so a pool of a twin runs under the twin's environment.
 #[cfg(feature = "kubernetes")]
 pub async fn pool_pod_environment(
     gate: EnvironmentPlacementGate,
     pool: &sqlx::PgPool,
+    release_id: uuid::Uuid,
     template: &str,
     content_hash: &str,
 ) -> Result<Option<PodEnvironment>, BoundEnvironmentError> {
     // A pod may land on any node, so no candidate's own inventory row can
     // gate it: the build's holders have to agree.
-    let value = work_environment(
+    let value = gated_work_environment(
         gate,
         pool,
+        BuildRelease::Id(release_id),
         template,
         Some(content_hash),
         BindingScope::ReleaseOrHolders,

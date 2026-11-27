@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::Arch;
+use pplx_space_cpu_arch::Arch;
 
 #[test]
 fn standalone_configuration_refuses_unconfined_locators() {

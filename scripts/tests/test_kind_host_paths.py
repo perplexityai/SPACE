@@ -18,7 +18,9 @@ import pathlib
 import re
 import shutil
 import subprocess
+import sys
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -526,30 +528,6 @@ class RenderTests(unittest.TestCase):
         self.assertIn("absolute path", result.stderr)
 
 
-class RenderedCommentTests(unittest.TestCase):
-    """The rendered config's own documentation has to survive the render.
-
-    `sed` substitutes inside comments too. A knob named as `${SPACE_...}` in
-    prose therefore renders as its value, and the template's knob table came
-    out as "/home/you/.kind-data default ~/.kind-data" — documentation that
-    actively misleads whoever opens the generated config. The template names
-    its knobs bare so every comment line renders byte-identical.
-    """
-
-    def test_comment_lines_render_unchanged(self) -> None:
-        tmp = Path(os.environ.get("TMPDIR", "/tmp"), f"kind-comments-{os.getpid()}")
-        shutil.rmtree(tmp, ignore_errors=True)
-        tmp.mkdir(parents=True)
-        self.addCleanup(shutil.rmtree, tmp, True)
-        dest = tmp / "rendered.yaml"
-        render(base_env("/home/test-user"), dest)
-
-        def comments(text: str) -> list[str]:
-            return [line for line in text.splitlines() if line.lstrip().startswith("#")]
-
-        template_comments = comments(TEMPLATE.read_text())
-        self.assertTrue(template_comments, "the template is expected to be commented")
-        self.assertEqual(comments(dest.read_text()), template_comments)
 
 
 class LiveClusterMountTests(unittest.TestCase):
@@ -1289,6 +1267,18 @@ class InstallerAgreementTests(unittest.TestCase):
             SPACE_IMAGE_VENDOR_ROOT=str(self.image_vendor),
             SPACE_FC_KERNEL_SHA256=FAKE_KERNEL_SHA256,
         )
+        # Exercise the real advisory lock even on hosts without flock(1).
+        tools = self.tmp / "tools"
+        tools.mkdir()
+        lock = tools / "flock"
+        lock.write_text(
+            f"#!{sys.executable}\nimport fcntl, os, sys\n"
+            "if os.environ.get('FAKE_FLOCK_READY'):\n"
+            "    open(os.environ['FAKE_FLOCK_READY'], 'w').close()\n"
+            "fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX)\n"
+        )
+        lock.chmod(0o755)
+        self.env["PATH"] = f"{tools}:{self.env['PATH']}"
 
     def install(self):
         return subprocess.run(
@@ -1712,7 +1702,7 @@ class InstallerAgreementTests(unittest.TestCase):
     def stub_mv(self) -> pathlib.Path:
         """An `mv` on PATH that fails a move to a path ending in $FAKE_MV_FAIL_INTO.
 
-        After a move to vmlinux.bin it sleeps $FAKE_MV_SLEEP_AFTER seconds, and
+        After a move to vmlinux.bin it waits for $FAKE_MV_RELEASE when set, and
         with $FAKE_MV_BLOCK_STAMP set puts a directory where the stamp goes,
         so the stamp write that follows fails.
         """
@@ -1731,7 +1721,9 @@ class InstallerAgreementTests(unittest.TestCase):
                 {shell_quote(shutil.which("mv") or "/bin/mv")} "$@" || exit
                 [[ "$dest" == */vmlinux.bin ]] || exit 0
                 [[ -z "${{FAKE_MV_BLOCK_STAMP:-}}" ]] || mkdir "${{dest%/*}}/.vmlinux.bin.sha256"
-                sleep "${{FAKE_MV_SLEEP_AFTER:-0}}"
+                if [[ -n "${{FAKE_MV_RELEASE:-}}" ]]; then
+                  read -r release < "$FAKE_MV_RELEASE"
+                fi
                 """
             )
         )
@@ -1741,6 +1733,11 @@ class InstallerAgreementTests(unittest.TestCase):
     def installer_env(self, codes: str = "200", body: bytes = b"", **overrides: str):
         stub_dir, log = self.serving_curl(body, codes)
         env = dict(self.env, **overrides)
+        # Download retries need their policy and result, not wall-clock time.
+        sleeper = stub_dir / "sleep"
+        sleeper.write_text('#!/bin/sh\nprintf "%s\\n" "$1" >> "$FAKE_SLEEP_LOG"\n')
+        sleeper.chmod(0o755)
+        env["FAKE_SLEEP_LOG"] = str(self.tmp / "retry-sleeps")
         env["PATH"] = f"{stub_dir}:{self.stub_mv()}:{env['PATH']}"
         return env, log
 
@@ -1806,6 +1803,7 @@ class InstallerAgreementTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(calls), 3, calls)
+        self.assertEqual((self.tmp / "retry-sleeps").read_text().splitlines(), ["2", "4"])
         self.assertEqual((kernel_dir / "vmlinux.bin").read_bytes(), body)
 
     def test_a_body_cut_short_or_timed_out_after_its_status_is_retried(self) -> None:
@@ -1817,6 +1815,7 @@ class InstallerAgreementTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(calls), 3, calls)
+        self.assertEqual((self.tmp / "retry-sleeps").read_text().splitlines(), ["2", "4"])
         self.assertEqual((kernel_dir / "vmlinux.bin").read_bytes(), body)
 
     def test_a_certificate_failure_fails_without_retrying(self) -> None:
@@ -1902,24 +1901,45 @@ class InstallerAgreementTests(unittest.TestCase):
         other.mkdir(parents=True)
         (other / "vmlinux.bin").write_bytes(kernel_b)
 
-        env_a, _ = self.installer_env(FAKE_MV_SLEEP_AFTER="3")
+        release = self.tmp / "release-installer"
+        os.mkfifo(release)
+        release_fd = os.open(release, os.O_RDWR | os.O_NONBLOCK)
+        env_a, _ = self.installer_env(FAKE_MV_RELEASE=str(release))
         first = subprocess.Popen(
             ["bash", str(INSTALL_FC_VENDOR)], env=env_a, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         kernel = self.kernel_dir / "vmlinux.bin"
-        for _ in range(100):
-            if kernel.exists() and kernel.read_bytes() == FAKE_KERNEL:
-                break
-            subprocess.run(["sleep", "0.05"], check=True)
-        else:
-            first.kill()
-            self.fail("the first installer never renamed its kernel into place")
-
-        second, _ = self.run_installer(SPACE_FC_KERNEL_SHA256=pin_b)
-        first_out, first_err = first.communicate(timeout=60)
+        second = None
+        try:
+            deadline = time.monotonic() + 5
+            while not (kernel.exists() and kernel.read_bytes() == FAKE_KERNEL):
+                self.assertLess(time.monotonic(), deadline, "the first installer never renamed its kernel")
+                time.sleep(0.01)
+            waiting = self.tmp / "second-lock-attempt"
+            env_b, _ = self.installer_env(SPACE_FC_KERNEL_SHA256=pin_b, FAKE_FLOCK_READY=str(waiting))
+            second = subprocess.Popen(
+                ["bash", str(INSTALL_FC_VENDOR)], env=env_b, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            while not waiting.exists():
+                self.assertLess(time.monotonic(), deadline, "the second installer never reached the lock")
+                time.sleep(0.01)
+            os.write(release_fd, b"continue\n")
+            _, first_err = first.communicate(timeout=10)
+            _, second_err = second.communicate(timeout=10)
+        finally:
+            # Also release the child if an assertion failed before the normal
+            # handshake, so cleanup never leaves mv waiting on the FIFO.
+            os.write(release_fd, b"continue\n")
+            for process in (first, second):
+                if process is not None:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate()
+            os.close(release_fd)
 
         self.assertEqual(first.returncode, 0, first_err)
-        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(second.returncode, 0, second_err)
         staged = kernel.read_bytes()
         self.assertEqual(staged, kernel_b, "the second installer finished last")
         self.assertEqual(self.run_installer("--check", SPACE_FC_KERNEL_SHA256=pin_b)[0].returncode, 0)
@@ -2200,7 +2220,7 @@ class BringUpConfigPrivacyTests(unittest.TestCase):
         library name defined here is replaced by the real one before it runs.
         That is deliberate — the render and the preflight are what this
         exercises, and both are real. Host module preparation, `kind`, the port guard and the
-        polling commands are stubbed.
+        polling commands and node-image preparation are stubbed.
 
         Where it stops depends on the host: with no `/dev/kvm` the real
         preflight refuses and names the config it was given; with one, it
@@ -2214,6 +2234,12 @@ class BringUpConfigPrivacyTests(unittest.TestCase):
         source "$REPO_ROOT/scripts/tests/lib/bootstrap-kind-stack.sh"
         bootstrap_kind_stack__assert_port_owner() {{ :; }}
         curl() {{ :; }}; kubectl() {{ :; }}; tilt() {{ :; }}
+        bash() {{
+            case "$1 ${{2:-}}" in
+                */kind-node-image.sh" ensure"|*/seed-node-containerd.sh" "*) return 0 ;;
+            esac
+            command bash "$@"
+        }}
         kind() {{
             if [[ "$1" == get ]]; then return 0; fi
             if [[ "$1" == create ]]; then

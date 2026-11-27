@@ -4,8 +4,8 @@
 
 use crate::db::db_private_outside_tests;
 use crate::db::{Connection, Error, OptionalExtension, Result};
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{ArtifactKind, LocalArtifactId, SnapshotName};
+use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId, SnapshotName};
+use pplx_space_sql_locator::sql;
 use pplx_space_sqlite::SqliteU64;
 use rusqlite::params;
 
@@ -135,7 +135,7 @@ db_private_outside_tests! {
         sandbox_id: &str,
     ) -> std::result::Result<Vec<NamedArtifactPublication>, crate::db::inventory_read::InventoryReadError>
     {
-        use pplx_space_common_core::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
+        use pplx_space_rpc_contracts::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
         let mut statement = conn.prepare(sql!(
             "SELECT snapshot_name, local_path, artifact_kind, state
          FROM local_artifacts WHERE sandbox_id = ?1 AND artifact_origin = 'snapshot'"

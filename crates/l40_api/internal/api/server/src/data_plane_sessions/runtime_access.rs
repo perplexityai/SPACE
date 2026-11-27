@@ -6,11 +6,7 @@ pub(super) const SANDBOX_RUNTIME_CONVERGENCE_RETRY_AFTER_MS: u64 = 5_000;
 
 pub(super) const POST_WAKE_LISTENER_REBIND_GRACE_SECS: f64 = 150.0;
 
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct SandboxRuntimeAccessRow {
-    pub(super) lifecycle: String,
-    pub(super) lifecycle_changed_recently: bool,
-}
+pub(super) use pplx_space_sandbox_store::runtime_access::RuntimeAccessRecord as SandboxRuntimeAccessRow;
 
 pub(crate) async fn sandbox_runtime_access(
     pool: &sqlx::PgPool,
@@ -30,16 +26,11 @@ pub(super) async fn fetch_sandbox_runtime_access_row(
     pool: &sqlx::PgPool,
     sandbox_id: SandboxId,
 ) -> Result<SandboxRuntimeAccessRow, Status> {
-    sqlx::query_as::<_, SandboxRuntimeAccessRow>(sql!(
-        "SELECT lifecycle,
-                lifecycle_changed_at > NOW() - make_interval(secs => $2)
-                    AS lifecycle_changed_recently
-         FROM sandboxes
-         WHERE id = $1"
-    ))
-    .bind(sandbox_id)
-    .bind(POST_WAKE_LISTENER_REBIND_GRACE_SECS)
-    .fetch_optional(pool)
+    pplx_space_sandbox_store::runtime_access::runtime_access(
+        pool,
+        sandbox_id,
+        POST_WAKE_LISTENER_REBIND_GRACE_SECS,
+    )
     .await
     .map_err(|error| Status::internal(format!("get sandbox runtime access: {error}")))?
     .ok_or_else(|| Status::not_found("sandbox not found"))

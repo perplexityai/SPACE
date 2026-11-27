@@ -15,14 +15,14 @@
 //! the pre-change predicate disagreed. Without the second half these would
 //! pass just as well against the statement they replaced.
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_sandbox_portability::{
     drain_gate_blockers_for_node, inflight_suspend_upload_from_node_exists,
     snapshot_durable_for_source_release,
 };
 use pplx_space_sandbox_residency::ResidencyEvidence;
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -60,7 +60,7 @@ async fn insert_node(pool: &PgPool) -> TestResult<Uuid> {
 
 /// A sandbox pinned to `node` by `target_node_id` with `active_node_id` NULL —
 /// the shape the guard's `active` half cannot see.
-async fn insert_target_pinned(
+pub(in crate::routes::admin) async fn insert_target_pinned(
     pool: &PgPool,
     node: Uuid,
     lifecycle: &str,
@@ -103,8 +103,8 @@ async fn reconciler_gate(pool: &PgPool, node: Uuid) -> TestResult<i64> {
 /// What the `:terminate` guard counts, through the production function.
 async fn terminate_guard(pool: &PgPool, node: Uuid) -> TestResult<(i64, i64)> {
     let mut tx = pool.begin().await?;
-    let occ = super::sandbox_occupancy_for_node_in_tx(
-        &mut tx,
+    let occ = pplx_space_sandbox_store::admin_occupancy::terminate_occupancy(
+        &mut *tx,
         NodeId::from_uuid(node),
         ResidencyEvidence::LifecycleOnly,
     )

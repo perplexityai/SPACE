@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 
 use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
-use pplx_space_common_core::types::{AutoLifecyclePolicy, Email, OrgId, TemplateName, UserId};
+use pplx_space_accounts::{Email, OrgId, UserId};
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_net_common::NetworkPolicyV1;
+use pplx_space_template_model::TemplateName;
 use uuid::Uuid;
 
 use super::*;
@@ -10,7 +12,7 @@ use crate::controllers::substrate::{
     ActorRef, CreateBootMode, CreateExecutionRequest, PooledExecutionClaim,
     PooledExecutionClaimRequest, SandboxResources, TemplateRef,
 };
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 fn actor() -> ActorRef {
     ActorRef::new(
@@ -62,6 +64,7 @@ fn assert_cold_matches_adoption(
         command_ready_wait: None,
         volume_encryption: false,
         node_pool: None,
+        client_id: None,
     };
 
     let pooled = PooledExecutionClaimRequest {
@@ -80,12 +83,14 @@ fn assert_cold_matches_adoption(
         template_network_policy,
         template_network_policy_generation: 7,
         volume_encryption: false,
+        client_id: None,
     };
     let claim = PooledExecutionClaim {
         claim_id: Uuid::now_v7(),
         pool_slot_id: Some(Uuid::now_v7()),
         sandbox_id: SandboxId::new(),
         content_hash: "hash".to_string(),
+        template_release_id: None,
         pod_name: "space-sbx-test-g1".to_string(),
         pod_uid: None,
         execution_generation: 1,
@@ -136,6 +141,7 @@ fn setup_captures_owner_and_effective_policy() {
         &template_policy,
         true,
         Default::default(),
+        None,
     );
     assert!(setup.volume_encryption);
     assert_eq!(setup.sandbox_owner, actor.sandbox_owner);

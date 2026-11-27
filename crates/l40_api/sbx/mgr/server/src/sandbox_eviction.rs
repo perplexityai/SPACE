@@ -84,7 +84,7 @@
 //! `deleting` row as a current cleanup — a crash mid-eviction therefore
 //! converges through the existing cleanup recovery paths.
 
-use pplx_space_common_core::types::{ArtifactKind, LocalArtifactId, SnapshotId};
+use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId, SnapshotId};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -408,7 +408,7 @@ pub(crate) enum LocalEvidence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PinnedArtifact {
     pub(crate) artifact_id: LocalArtifactId,
-    pub(crate) artifact_kind: pplx_space_common_core::types::ArtifactKind,
+    pub(crate) artifact_kind: pplx_space_snapshot_model::ArtifactKind,
     /// `backup_completed_at IS NOT NULL` — stamped by the upload
     /// worker for exactly this artifact id, only after the cluster
     /// confirmed `FinalizeArtifactBackup(READY)` (which requires
@@ -857,7 +857,7 @@ fn uuid_v7_epoch_secs(id: Uuid) -> Option<u64> {
 pub(crate) fn sandbox_cache_dir(sandbox_id: &str) -> String {
     format!(
         "{}/{sandbox_id}",
-        pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR
+        pplx_space_host_layout::paths::SANDBOX_CACHE_DIR
     )
 }
 
@@ -1173,7 +1173,7 @@ fn classify_reupload_failure(
         tonic::Code::FailedPrecondition => {
             let message = status.message();
             if message.contains(
-                pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER,
+                pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER,
             ) {
                 Ok(LegacyRepairSkipReason::MissingLocalFiles)
             } else if message.contains("no snapshot upload destination configured") {

@@ -1,0 +1,30 @@
+[package]
+name = "pplx-space-byok-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[package.metadata.space.state]
+postgres = ["org_branching_keys", "org_master_keys", "sandbox_volume_encryption"]
+
+[lints]
+workspace = true
+
+[dependencies]
+sqlx = { workspace = true, features = ["derive", "postgres", "time", "uuid"] }
+time = { workspace = true }
+uuid = { workspace = true }
+
+# internal
+pplx-space-accounts = { workspace = true, features = ["sqlx"] }
+pplx-space-byok-model = { workspace = true }
+pplx-space-postgres-pool = { workspace = true }
+pplx-space-sandbox-model = { workspace = true, features = ["sqlx"] }
+pplx-space-sql-locator = { workspace = true }
+
+[dev-dependencies]
+pplx-space-db-test-fixtures = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

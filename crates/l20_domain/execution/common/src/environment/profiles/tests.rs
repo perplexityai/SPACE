@@ -1,4 +1,8 @@
 use super::*;
+use pplx_space_execution_spec::{
+    ArtifactComponentKind, ExecutionMetadata, GuestOperatingSystem, RuntimeKind,
+    StateFormatIdentity,
+};
 use prost::Message;
 
 fn portable_spec(kind: RuntimeKind) -> EnvironmentSpec {

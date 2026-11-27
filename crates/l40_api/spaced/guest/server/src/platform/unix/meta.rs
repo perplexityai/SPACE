@@ -1,5 +1,27 @@
 use super::*;
 
+const GUEST_MEMORY_READ_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Wait at most 100 ms for optional memory telemetry, leaving room in Ping's
+/// health-probe budget. A busy reader skips the sample without waiting.
+async fn read_guest_memory(
+    slots: Arc<Semaphore>,
+    read: impl FnOnce() -> Option<u64> + Send + 'static,
+) -> Option<u64> {
+    let permit = slots.try_acquire_owned().ok()?;
+    // Timeout or RPC cancellation cannot stop an active blocking read.
+    // Keep admission with the worker so later Pings cannot pile up readers.
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        read()
+    });
+    tokio::time::timeout(GUEST_MEMORY_READ_TIMEOUT, task)
+        .await
+        .ok()?
+        .ok()
+        .flatten()
+}
+
 #[cfg(target_os = "linux")]
 fn flush_filesystem_at_path_with_syncfs(
     path: &str,
@@ -73,10 +95,12 @@ fn sync_guest_clock_impl(_host_time: prost_types::Timestamp) -> Result<ClockSync
     ))
 }
 
-fn parse_mem_total_bytes(meminfo: &str) -> Option<u64> {
+/// The first `/proc/meminfo` line starting with `label`, a count of `kB`, in
+/// bytes.
+fn parse_meminfo_bytes(meminfo: &str, label: &str) -> Option<u64> {
     let mut fields = meminfo
         .lines()
-        .find(|line| line.starts_with("MemTotal:"))?
+        .find(|line| line.starts_with(label))?
         .split_ascii_whitespace();
     let _label = fields.next()?;
     let kibibytes = fields.next()?.parse::<u64>().ok()?;
@@ -85,10 +109,29 @@ fn parse_mem_total_bytes(meminfo: &str) -> Option<u64> {
         .flatten()
 }
 
+fn parse_mem_total_bytes(meminfo: &str) -> Option<u64> {
+    parse_meminfo_bytes(meminfo, "MemTotal:")
+}
+
+/// `MemTotal - MemAvailable` of one read, in bytes. `None` when either is
+/// missing or malformed, the total is zero, or more is available than the
+/// total.
+fn parse_memory_used_bytes(meminfo: &str) -> Option<u64> {
+    let total = parse_mem_total_bytes(meminfo).filter(|&total| total > 0)?;
+    let available = parse_meminfo_bytes(meminfo, "MemAvailable:")?;
+    total.checked_sub(available)
+}
+
+fn read_meminfo() -> Option<String> {
+    std::fs::read_to_string("/proc/meminfo").ok()
+}
+
 pub(crate) fn guest_mem_total_bytes() -> Option<u64> {
-    std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|meminfo| parse_mem_total_bytes(&meminfo))
+    read_meminfo().and_then(|meminfo| parse_mem_total_bytes(&meminfo))
+}
+
+pub(crate) fn guest_memory_used_bytes() -> Option<u64> {
+    read_meminfo().and_then(|meminfo| parse_memory_used_bytes(&meminfo))
 }
 
 fn guest_vcpu_count() -> Option<u32> {
@@ -104,11 +147,13 @@ impl SpacedGuestService {
     fn current_wait_ready_response(&self) -> BridgeGuestWaitReadyResponse {
         let ready = *self.inner.ready.borrow();
         BridgeGuestWaitReadyResponse {
-            platform: Some(pplx_space_spaced_common::platform::GuestPlatform::for_target().wire()),
+            platform: Some(
+                pplx_space_spaced_guest_protocol::platform::GuestPlatform::for_target().wire(),
+            ),
             ready,
             guest_uptime: ready.then(|| (self.inner.guest_uptime_source)()).flatten(),
-            version: pplx_space_spaced_common::spaced_version().to_string(),
-            compatibility_family: pplx_space_spaced_common::spaced_compatibility_family(),
+            version: pplx_space_spaced_protocol::spaced_version().to_string(),
+            compatibility_family: pplx_space_spaced_guest_protocol::spaced_compatibility_family(),
             mem_total_bytes: ready.then(guest_mem_total_bytes).flatten(),
             vcpu_count: ready.then(guest_vcpu_count).flatten(),
         }
@@ -220,8 +265,14 @@ impl BridgeGuestMeta for SpacedGuestService {
         if !request.into_inner().drain_diagnostics {
             return Ok(Response::new(BridgeGuestPingResponse::default()));
         }
+        // Only the watchdog requests diagnostics; readiness and connection
+        // checks need no memory read. Unavailable telemetry never fails Ping.
+        let read_memory = self.inner.guest_memory_used_source;
+        let memory_used_bytes =
+            read_guest_memory(self.inner.guest_memory_read_slots.clone(), read_memory).await;
         let drained = pplx_space_observability::warning_tap::drain();
         Ok(Response::new(BridgeGuestPingResponse {
+            memory_used_bytes,
             diagnostics: drained
                 .callsites
                 .into_iter()
@@ -242,8 +293,8 @@ impl BridgeGuestMeta for SpacedGuestService {
         request: Request<BridgeGuestWaitReadyRequest>,
     ) -> Result<Response<BridgeGuestWaitReadyResponse>, Status> {
         let request = request.into_inner();
-        pplx_space_spaced_common::platform::require_host_contract(
-            pplx_space_spaced_common::platform::target_os(),
+        pplx_space_spaced_guest_protocol::platform::require_host_contract(
+            pplx_space_spaced_guest_protocol::platform::target_os(),
             request.host_contract_revision,
         )?;
         let timeout = validate_timeout(request.timeout)?;
@@ -280,15 +331,20 @@ impl BridgeGuestMeta for SpacedGuestService {
         request: Request<NotifyResumeRequest>,
     ) -> Result<Response<NotifyResumeResponse>, Status> {
         let request = request.into_inner();
-        let reason =
-            pplx_space_spaced_common::proto::bridge_guest::ResumeReason::try_from(request.reason)
-                .map_err(|_| Status::invalid_argument("unknown resume_reason"))?;
-        if reason == pplx_space_spaced_common::proto::bridge_guest::ResumeReason::Unspecified {
+        let reason = pplx_space_spaced_guest_protocol::proto::bridge_guest::ResumeReason::try_from(
+            request.reason,
+        )
+        .map_err(|_| Status::invalid_argument("unknown resume_reason"))?;
+        if reason
+            == pplx_space_spaced_guest_protocol::proto::bridge_guest::ResumeReason::Unspecified
+        {
             return Err(Status::invalid_argument("resume_reason is required"));
         }
         // A restored guest's diagnostics record came with the snapshot: they
         // happened in the sandbox it was taken from.
-        if reason == pplx_space_spaced_common::proto::bridge_guest::ResumeReason::SnapshotRestore {
+        if reason
+            == pplx_space_spaced_guest_protocol::proto::bridge_guest::ResumeReason::SnapshotRestore
+        {
             pplx_space_observability::warning_tap::discard();
         }
         let clock_sync_status = sync_guest_clock(request.host_time)?;
@@ -319,7 +375,7 @@ impl BridgeGuestMeta for SpacedGuestService {
     }
 }
 
-use pplx_space_spaced_common::{validate_optional_reason, validate_timeout};
+use pplx_space_spaced_guest_protocol::{validate_optional_reason, validate_timeout};
 
 #[cfg(test)]
 mod tests;

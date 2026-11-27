@@ -26,5 +26,5 @@ anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 
 # internal
-pplx-space-common-core = { workspace = true }
+pplx-space-host-layout = { workspace = true }
 pplx-space-node-runtime-supervisor = { workspace = true }

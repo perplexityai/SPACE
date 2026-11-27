@@ -30,7 +30,7 @@ use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 use uuid::Uuid;
 
-use pplx_space_common_core::kubernetes::{
+use pplx_space_sandbox_pod::{
     SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_STOPPED_MATERIALIZATION_ARTIFACT_ID_ANNOTATION,
     SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION, STOPPED_MATERIALIZATION_CHECKPOINT,
 };
@@ -56,6 +56,36 @@ struct SucceedingWake {
 
 #[tonic::async_trait]
 impl WorkerApiInternal for SucceedingWake {
+    async fn drain_node(
+        &self,
+        _request: tonic::Request<pplx_space_sbx_mgr_client::proto::DrainNodeRequest>,
+    ) -> Result<tonic::Response<pplx_space_sbx_mgr_client::proto::DrainNodeResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("not used by this test"))
+    }
+
+    async fn preview_drain_node(
+        &self,
+        _request: tonic::Request<pplx_space_sbx_mgr_client::proto::PreviewDrainNodeRequest>,
+    ) -> Result<
+        tonic::Response<pplx_space_sbx_mgr_client::proto::PreviewDrainNodeResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented("not used by this test"))
+    }
+
+    async fn abandon_runtime_upgrade(
+        &self,
+        _request: tonic::Request<pplx_space_sbx_mgr_client::proto::AbandonRuntimeUpgradeRequest>,
+    ) -> Result<
+        tonic::Response<pplx_space_sbx_mgr_client::proto::AbandonRuntimeUpgradeResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "a restore runs no runtime upgrade",
+        ))
+    }
+
     async fn get_runtime_upgrade(
         &self,
         _request: tonic::Request<pplx_space_sbx_mgr_client::proto::GetRuntimeUpgradeRequest>,
@@ -121,6 +151,36 @@ struct StoppedWake {
 
 #[tonic::async_trait]
 impl WorkerApiInternal for StoppedWake {
+    async fn drain_node(
+        &self,
+        _request: tonic::Request<pplx_space_sbx_mgr_client::proto::DrainNodeRequest>,
+    ) -> Result<tonic::Response<pplx_space_sbx_mgr_client::proto::DrainNodeResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("not used by this test"))
+    }
+
+    async fn preview_drain_node(
+        &self,
+        _request: tonic::Request<pplx_space_sbx_mgr_client::proto::PreviewDrainNodeRequest>,
+    ) -> Result<
+        tonic::Response<pplx_space_sbx_mgr_client::proto::PreviewDrainNodeResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented("not used by this test"))
+    }
+
+    async fn abandon_runtime_upgrade(
+        &self,
+        _request: tonic::Request<pplx_space_sbx_mgr_client::proto::AbandonRuntimeUpgradeRequest>,
+    ) -> Result<
+        tonic::Response<pplx_space_sbx_mgr_client::proto::AbandonRuntimeUpgradeResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "a restore runs no runtime upgrade",
+        ))
+    }
+
     async fn get_runtime_upgrade(
         &self,
         _request: tonic::Request<pplx_space_sbx_mgr_client::proto::GetRuntimeUpgradeRequest>,
@@ -401,7 +461,7 @@ async fn restore_finalize_moves_only_a_row_still_restoring(
 /// network namespace. And the node answering with no route identity, as a real
 /// stopped materialization does, must still count as success. The shim's half
 /// runs in neither double; its own tests and the kind scenario
-/// `native.forced_drain_re_places_stopped_sandbox` cover it.
+/// `native.forced_drain_re_drains_restarted_re_placed_stopped_sandbox` cover it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_released_stopped_evacuation_is_re_placed_stopped() -> TestResult {
     if !enter_node_api_client_process()? {
@@ -627,17 +687,12 @@ async fn a_re_placement_every_worker_excludes_waits_unschedulable_and_backs_off(
         )
         .await?;
     assert_eq!(attempts, Some(1), "the failure must arm the backoff");
-    let sweep = restore_pending_evacuations_query(true);
-    let swept: Vec<(SandboxId, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(sweep.as_str())))
-        .fetch_all(pool)
-        .await?;
+    let swept = pplx_space_sandbox_store::evacuation_restores::pending(pool, true).await?;
     assert!(
-        !swept.iter().any(|(id, _)| *id == sandbox_id),
+        !swept.iter().any(|row| row.id == sandbox_id),
         "the backoff must keep the re-placement out of the next sweep: {swept:?}"
     );
-    let pending: i64 = sqlx::query_scalar(stopped_replacements_pending_query())
-        .fetch_one(pool)
-        .await?;
+    let pending = pplx_space_sandbox_store::stopped_replacements::pending(pool).await?;
     assert_eq!(
         pending, 1,
         "the pending gauge must count the stuck re-placement"

@@ -30,6 +30,11 @@ transitive version bump or does not change application source code.
 - Commit `Cargo.lock` with any resolution change. Keep the lockfile diff
   focused: use a targeted `cargo update -p <crate>` when updating one crate,
   and separate unrelated refreshes from feature changes where practical.
+- Cargo normally waits three days before selecting a newly published registry
+  version. Versions already in `Cargo.lock` remain eligible. If an urgent
+  security fix falls within that window, use
+  `CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update -p <crate> --precise <version>`
+  and review the resulting lockfile diff, including transitive updates.
 - Review *all* added and updated direct and transitive packages in the
   lockfile diff. For an unexpected package, use
   `cargo tree --locked -i <crate>` to find the parent and check whether a new

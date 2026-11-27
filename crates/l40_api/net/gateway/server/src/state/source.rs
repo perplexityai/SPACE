@@ -12,14 +12,14 @@ use pplx_space_net_common::{
     EffectiveNetworkPolicyRef, EffectiveNetworkPolicyRefParseError, NetworkPolicyV1,
     proto::NetworkPolicyV1 as NetworkPolicyProto,
 };
-use pplx_space_spaced_common::proto::host_control::{
+use pplx_space_spaced_protocol::proto::host_control::{
     GetNetworkPolicyRequest, GetNetworkPolicyResponse, host_control_client::HostControlClient,
 };
 
 use super::credentials::{InvalidNetworkCredentialSnapshot, NetworkCredentialSnapshot};
 use crate::stats::ProxyStats;
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_grpc::ExpectedGrpcStatus;
+use pplx_space_sandbox_model::SandboxId;
 
 pub type PolicyLoader = Arc<
     dyn Fn() -> Pin<
@@ -56,7 +56,7 @@ pub enum HydrateNetworkStateError {
     ConnectHostControl {
         sandbox_id: SandboxId,
         #[source]
-        source: pplx_space_spaced_common::UdsConnectError,
+        source: pplx_space_spaced_client::UdsConnectError,
     },
     #[error("failed to pull initial network policy for {sandbox_id} from host-control: {source}")]
     GetNetworkPolicy {
@@ -266,10 +266,8 @@ type HostControl =
 async fn connect_host_control(
     sandbox_id: SandboxId,
 ) -> Result<HostControl, HydrateNetworkStateError> {
-    let socket = std::path::Path::new(
-        pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET,
-    );
-    let channel = pplx_space_spaced_common::connect_uds_channel("sandbox-host-control", socket)
+    let socket = std::path::Path::new(pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET);
+    let channel = pplx_space_spaced_client::connect_uds_channel("sandbox-host-control", socket)
         .await
         .map_err(|source| HydrateNetworkStateError::ConnectHostControl { sandbox_id, source })?;
     Ok(HostControlClient::new(

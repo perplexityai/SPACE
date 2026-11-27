@@ -60,12 +60,12 @@ fn named_snapshot_stream_uses_restore_wire_basename() {
 fn named_snapshot_send_requires_the_template_instance_snapshot_lineage_chain() {
     let template_uuid = uuid::Uuid::now_v7();
     let instance_uuid = uuid::Uuid::now_v7();
-    let instance = pplx_space_common_core::host::btrfs::SubvolumeInfo {
+    let instance = pplx_space_btrfs::SubvolumeInfo {
         uuid: Some(instance_uuid),
         parent_uuid: Some(template_uuid),
         received_uuid: None,
     };
-    let snapshot = pplx_space_common_core::host::btrfs::SubvolumeInfo {
+    let snapshot = pplx_space_btrfs::SubvolumeInfo {
         uuid: Some(uuid::Uuid::now_v7()),
         parent_uuid: Some(instance_uuid),
         received_uuid: None,
@@ -73,7 +73,7 @@ fn named_snapshot_send_requires_the_template_instance_snapshot_lineage_chain() {
 
     validate_named_snapshot_lineage(template_uuid, &instance, &snapshot).unwrap();
 
-    let unrelated_snapshot = pplx_space_common_core::host::btrfs::SubvolumeInfo {
+    let unrelated_snapshot = pplx_space_btrfs::SubvolumeInfo {
         parent_uuid: Some(uuid::Uuid::now_v7()),
         ..snapshot
     };

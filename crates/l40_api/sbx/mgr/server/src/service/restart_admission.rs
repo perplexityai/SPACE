@@ -219,6 +219,12 @@ restart_rpcs! {
     SandboxListAutoLifecycleDeleteReceipts => ("/space.sandbox.manager.v1.SandboxManager/ListAutoLifecycleDeleteReceipts", ReadOnlyWithNarrowStateWrites),
     SandboxAcknowledgeAutoLifecycleDeleteReceipts => ("/space.sandbox.manager.v1.SandboxManager/AcknowledgeAutoLifecycleDeleteReceipts", StateWriter),
     SandboxListPendingLocalBackups => ("/space.sandbox.manager.v1.SandboxManager/ListPendingLocalBackups", ReadOnly),
+    // The call itself writes only the seal row. Each suspend, disk
+    // publication or upload it starts runs as a detached state writer.
+    SandboxDrainNode => ("/space.sandbox.manager.v1.SandboxManager/DrainNode", ReadOnlyWithNarrowStateWrites),
+    // Reads the rows, the drain's memory and node-manager's orphan
+    // inventory, and starts nothing.
+    SandboxPreviewDrainNode => ("/space.sandbox.manager.v1.SandboxManager/PreviewDrainNode", ReadOnly),
     SandboxState => ("/space.sandbox.manager.v1.SandboxManager/State", ReadOnly),
     SandboxGetHealth => ("/space.sandbox.manager.v1.SandboxManager/GetSandboxHealth", ReadOnly),
     SandboxGetEnv => ("/space.sandbox.manager.v1.SandboxManager/GetEnv", ReadOnly),
@@ -240,12 +246,16 @@ restart_rpcs! {
     SandboxEvictClusterDeletedSandbox => ("/space.sandbox.manager.v1.SandboxManager/EvictClusterDeletedSandbox", StateWriter),
     SandboxUpgradeRuntime => ("/space.sandbox.manager.v1.SandboxManager/UpgradeRuntime", StateWriter),
     SandboxGetRuntimeUpgrade => ("/space.sandbox.manager.v1.SandboxManager/GetRuntimeUpgrade", ReadOnly),
+    SandboxAbandonRuntimeUpgrade => ("/space.sandbox.manager.v1.SandboxManager/AbandonRuntimeUpgrade", StateWriter),
     SandboxEnableSnapshots => ("/space.sandbox.manager.v1.SandboxManager/EnableSnapshots", StateWriter),
     SandboxDisableSnapshots => ("/space.sandbox.manager.v1.SandboxManager/DisableSnapshots", StateWriter),
     SandboxListSnapshots => ("/space.sandbox.manager.v1.SandboxManager/ListSnapshots", ReadOnly),
     SandboxDeleteSnapshots => ("/space.sandbox.manager.v1.SandboxManager/DeleteSnapshots", StateWriter),
     SandboxRollback => ("/space.sandbox.manager.v1.SandboxManager/Rollback", StateWriter),
-    SandboxStats => ("/space.sandbox.manager.v1.SandboxManager/Stats", StateWriter),
+    // Container stats polls read cgroup and gateway counters. The only write
+    // raises the persisted network counters monotonically, so polls neither
+    // take nor wait for a lifecycle state-writer slot.
+    SandboxStats => ("/space.sandbox.manager.v1.SandboxManager/Stats", ReadOnlyWithNarrowStateWrites),
     SandboxUpdate => ("/space.sandbox.manager.v1.SandboxManager/Update", StateWriter),
     SandboxSetAutoLifecyclePolicy => ("/space.sandbox.manager.v1.SandboxManager/SetAutoLifecyclePolicy", StateWriter),
     SandboxTouchAutoLifecycle => ("/space.sandbox.manager.v1.SandboxManager/TouchAutoLifecycle", StateWriter),

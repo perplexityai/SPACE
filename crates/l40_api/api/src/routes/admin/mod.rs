@@ -32,11 +32,12 @@ use crate::{
     middleware::auth::{AuthOrg, AuthUser, bearer_token},
     routes::public::error::PublicApiError,
 };
+pub use runtime_upgrade_campaigns::RUNTIME_UPGRADE_DRIVEN_KINDS;
 
-mod api_key_store;
 mod api_keys;
 pub mod audit;
 mod docs;
+mod firewall_rules;
 mod identity;
 mod node_group_store;
 pub mod node_groups;
@@ -46,6 +47,7 @@ pub mod nodes;
 mod operations;
 mod runtime_environment_store;
 mod runtime_environments;
+mod runtime_upgrade_campaigns;
 // `pub(in crate::routes)`: the debug route takes the same sandbox ID forms.
 pub(in crate::routes) mod sandbox_id;
 mod sandbox_list;
@@ -138,9 +140,14 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
             "/nodes/{node_id}/sandboxes",
             get(nodes::list_node_sandboxes),
         )
+        .route("/nodes/{node_id}/holds", get(nodes::list_node_holds))
         .route(
             "/nodes/{node_id}/health",
             get(node_maintenance::node_health),
+        )
+        .route(
+            "/nodes/{node_id}/drain-v2-preview",
+            get(nodes::preview_node_drain),
         )
         .route(
             "/nodes/{node_id}/network-policy:reconcile",
@@ -160,6 +167,11 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
             get(operations::get_admin_operation),
         )
         .route("/audit-events", get(audit::list_audit_events))
+        .route("/firewall-rules", get(firewall_rules::get_adopted))
+        .route(
+            "/firewall-rollouts",
+            axum::routing::post(firewall_rules::start_rollout),
+        )
         .route(
             "/runtime-environments",
             get(runtime_environments::get_runtime_environments),
@@ -179,6 +191,16 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
         .route(
             "/runtime-environments/{environment_ref}/state",
             put(runtime_environments::set_runtime_environment_state),
+        )
+        .route(
+            "/runtime-upgrade-campaigns",
+            get(runtime_upgrade_campaigns::list_campaigns)
+                .post(runtime_upgrade_campaigns::start_campaign),
+        )
+        .route(
+            "/runtime-upgrade-campaigns/{spec}",
+            get(runtime_upgrade_campaigns::get_campaign)
+                .post(runtime_upgrade_campaigns::dispatch_campaign_action),
         )
         .route(
             "/warm-pools",

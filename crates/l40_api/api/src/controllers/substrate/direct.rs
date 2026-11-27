@@ -39,7 +39,8 @@
 //!   stays `suspended` until the stamp. A start and a stop also write over
 //!   `stopped` and `restoring`, so a start or stop that races a restore lease
 //!   can make the lease's completion miss.
-//! - Warm-pool claims adopt node-side.
+//! - Warm-pool claims adopt node-side, so `label_adopted_execution` has no
+//!   pod to label and answers `Labeled`.
 //! - Create, pool-adoption and restore candidates evaluate the environment
 //!   placement gate (`environment_placement.rs`) for bound work, by mode:
 //!   off ignores it, shadow counts and logs the candidates it would refuse,
@@ -55,6 +56,22 @@
 //!   holder a create that may pull (it names a build and needs neither a base
 //!   snapshot nor a pool) goes on to pull-on-create; one no holder was refused
 //!   for fails as off.
+//! - With `SPACE_ACTIVATION_CLIENT_ATTRIBUTION_ENABLED` on
+//!   ([`super::ActivationClientAttribution`], read in
+//!   `Substrate::from_env_with_lifecycle`), a create records its activating
+//!   client in `sandboxes.activating_client_id` when it inserts the row. Off,
+//!   the default, nothing records it. Because the worker creates each later
+//!   runtime, Direct also writes the record from its receipts, in the
+//!   transaction that commits the route identity: an owned restore, a
+//!   resident start charged here or upstream, and a wake whose transition
+//!   started or restored the VM. A reconnect, an adoption of a record still
+//!   running (including the route catch-up, after which the record lags if
+//!   the wake that started the VM never committed its receipt), an exempt
+//!   start, a rollback, a refused receipt, a start or wake
+//!   through a worker from before route-identity receipts (it returns none)
+//!   and an inheriting activation that found no record leave it as it was. An
+//!   owned restore through such a worker still writes, with the identity the
+//!   API supplied.
 //! - Custom vCPU or memory uses separate create and start calls: only
 //!   `StartRequest` carries those fields. A readiness wait still blocks on
 //!   start. Default shapes and disk-only overrides can use one-shot create,
@@ -68,21 +85,26 @@
 //!
 //! | Refused or missing | Effect today | Owner | Removed by |
 //! |---|---|---|---|
-//! | Node-pool placement | [`SubstrateError::Unsupported`]: a create naming a node pool is refused | ac-pplx | Node-pool membership for registered nodes, read by core placement |
+//! | Node-pool placement | [`SubstrateError::Unsupported`] from `create_execution` and `check_node_pool_placement`: a create naming a node pool is refused, and the admin create answers 400 before enqueueing it | ac-pplx | Node-pool membership for registered nodes, read by core placement |
 //! | Forks (restoring a durable fork disk as a new sandbox) | `Unsupported`: the create is refused | ac-pplx | A Direct launch that stages the fork disk on the chosen node |
 //! | Cluster pool configs (`list_pool_configs`, `upsert_pool_config`, `disable_pool_config`) | `Unsupported` from the trait defaults | ac-pplx | Pool-config handling in the core for both substrates |
+//! | Cold create shape ([`SubstrateCapabilities::resolves_cold_create_shape`] is false) | The controller resolves no shape for a create that adopts no warm-pool sandbox, so no such create records a shape source on its `create_completed` event or a compute sample in the requested-size metrics, even one that names both vCPU and memory. A fallthrough create takes neither an enabled, non-encryptable pool config's nor the template's warm-pool policy's vCPU, memory, disk size and disk I/O limits; it asks the worker for a base-snapshot boot, which falls back to a cold boot. A create that leaves vCPU or memory unset keeps them unset on its row. Booting cold, the worker takes unset vCPU and memory from the template's metadata (2 vCPU and 1024 MiB when it has none) and caps memory by the node's memory policy | ac-pplx | Cold create shape resolution in the core for both substrates, after which `resolves_cold_create_shape` is deleted |
 //! | Warm-pool claims with custom vCPU or memory, or with volume encryption | The claim misses and the create boots cold | ac-pplx | Pool members of that shape, or an adoption that applies it |
 //! | Admission-time pool slot claims (`claim_admission_pool_slot`) | Always miss | ac-pplx | A Direct warm-pool slot store the core claims from at admission |
 //! | Retire fence | `retire_execution` ignores its fence, but still stops the sandbox and clears its routing | ac-pplx | A fence check against the Direct execution it names |
 //! | Stopped-disk backup on retire | `retire_execution` enqueues none; the stopped disk stays on the node (see below) | ac-pplx | A retried Direct retire (next row), then the enqueue |
 //! | Retire retry | Nothing retries a failed Direct retire (see below) | ac-pplx | The sweeper's failed-cleanup retry running for both substrates |
 //! | Drain and evacuation | [`SubstrateCapabilities::supports_node_drain`] is false. Admin `:drain`, `:terminate`, `:cordon`, `:uncordon` and `:force-upload-local-snapshots` return 501 before reading or writing the node. `:undrain` clears a `draining` or `drained` phase an earlier drain left, without a substrate call | ac-pplx | Core drain and evacuation for both substrates over a Direct `set_node_schedulability` |
-//! | Drain, orphan, failed-row repair and node-sync loops | Not started on Direct (below) | ac-pplx | Those loops running for both substrates through the adapter |
+//! | Per-client live cap | `DirectSubstrate::live_sandboxes_for_client` answers `Unknown(Unsupported)`: Direct keeps no per-client inventory, so the cap admits every activation (reason `unsupported` while attribution is on). Direct also has no point that reserves for a `ReserveAtClaim` charge or checks a `Check` one, so a restore of a suspended sandbox, and a start or restore that reserved nothing at entry, go uncapped either way | the-gigi-pplx | A per-client count of Direct's live executions from its node records, plus reserving for `ReserveAtClaim` at Direct's restore entry and checking `Check` where Direct launches an execution, with `RecoveryCharge`'s live-cap methods built without the `kubernetes` feature |
+//! | Kubernetes-only state loops (drain, orphan, failed-row repair, node sync and others, listed in the cluster controller's `reconcilers.rs` module doc) | Not started on Direct (below) | ac-pplx | Those loops running for both substrates through the adapter |
+//! | Booting a create's required environment | [`SubstrateCapabilities::boots_required_environment`] is false: a Direct create names no environment, so its worker boots the legacy partition's build, so creates, placement and pools keep the release a tag or digest names rather than a twin | the-gigi-pplx | A Direct create that carries the required environment (`CreateRequest.required_environment`), with direct pools preferring the resolved release's partition |
+//! | Network-slot headroom (`Substrate::network_slot_headroom`) | Reads `Unknown(Unsupported)`, so the activation limiter's slot check (`SPACE_CLUSTER_ACTIVATION_ADMISSION_SLOT_CHECK_ENABLED`) admits every Direct cold create | ac-pplx | Slot capacity of registered nodes, read by an admission check that runs for both substrates |
 //!
 //! # Kubernetes-only reconcilers
 //!
 //! The cluster controller's `run_reconcilers` starts its drain, orphan,
-//! failed-row repair and node-sync loops only for Kubernetes. The loops it
+//! failed-row repair, node-sync and other state loops only for Kubernetes;
+//! its module doc classifies each Kubernetes-only loop. The loops it
 //! starts for both substrates include the public-operation dispatcher, which
 //! retries transient failures of the create, lifecycle and delete operations
 //! it executes. Direct reaches `retire_execution` only through the
@@ -95,24 +117,28 @@
 //! refuses it with `FailedPrecondition` on a node without cluster-api wiring
 //! and otherwise takes a btrfs snapshot of the stopped sandbox.
 
-use pplx_space_common_core::sql;
 use pplx_space_postgres_pool::contention;
-use std::{fmt, sync::LazyLock, time::Duration};
+use std::{fmt, time::Duration};
 
-use pplx_space_common_core::types::{
-    ArtifactOrigin, AutoLifecyclePolicy, ExecutionGeneration, ExecutionGenerationParseError,
-    NodeId, NodeManagedBy, NodeRole as SpaceNodeRole, PodUid, PodUidParseError, PolicyAuthority,
-    RouteGeneration, RouteGenerationParseError, SandboxActivationAttemptId, SandboxId,
-    SandboxLifecycle, SandboxRouteIdentity, SandboxRouteIdentityInvariantError, SubstrateKind,
-};
+use pplx_space_accounts::NodeId;
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
+use pplx_space_direct_store::{route_identities, route_provenance};
+use pplx_space_k8s_ids::{PodUid, PodUidParseError};
 use pplx_space_net_common::{NetworkPolicyV1, proto::NetworkPolicyV1 as NetworkPolicyProto};
-use pplx_space_sandbox_portability::{
-    no_newer_full_snapshot, restore_retry_source_snapshot_is_current,
+use pplx_space_node_model::{
+    NodeManagedBy, NodePoolName, NodeRole as SpaceNodeRole, SubstrateKind,
 };
-use pplx_space_sandbox_store::direct as direct_store;
+use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, ExecutionGenerationParseError, RouteGeneration, RouteGenerationParseError,
+    SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxRouteIdentity,
+    SandboxRouteIdentityInvariantError,
+};
+use pplx_space_sandbox_store::direct as sandbox_direct;
 use pplx_space_sbx_mgr_client::proto::{
     BootMode, StartRequest, SuspendRequest, WakeResponse, WakeTransition,
 };
+use pplx_space_snapshot_model::ArtifactOrigin;
 use sqlx::{FromRow, PgPool};
 use tonic::{Code, transport::Endpoint};
 use tracing::Instrument;
@@ -129,10 +155,15 @@ use super::{
     node_api_endpoint, substrate_db_error,
 };
 use crate::controllers::auto_lifecycle::policy_to_proto;
+use crate::controllers::substrate::{ChargeState, KeyResolution, RecoveryCharge};
 use crate::controllers::{ControllerError, db_contention_error};
 use crate::metrics::environment_placement::EnvironmentPlacementPath;
 use crate::models::Sandbox;
-use pplx_space_node_status_store::environment_refusal;
+use pplx_space_accounts::ClientId;
+use pplx_space_node_registration_store::direct::{
+    endpoints as direct_endpoints, placement_candidates,
+};
+use pplx_space_sandbox_store::attribute_runtime::set_activating_client;
 
 fn network_policy_to_proto(policy: &NetworkPolicyV1) -> NetworkPolicyProto {
     NetworkPolicyProto::from(policy)
@@ -149,11 +180,39 @@ struct DirectNode {
 /// A candidate from a statement the environment gate evaluates, with what
 /// the gate would refuse it for (an `EnvironmentRefusal` wire value); NULL
 /// when there's nothing to refuse.
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 struct GatedDirectNode {
     id: NodeId,
     node_api_endpoint: String,
     environment_refusal: Option<String>,
+}
+
+impl From<sandbox_direct::node_endpoints::DirectNodeEndpoint> for DirectNode {
+    fn from(node: sandbox_direct::node_endpoints::DirectNodeEndpoint) -> Self {
+        Self {
+            id: node.id,
+            node_api_endpoint: node.node_api_endpoint,
+        }
+    }
+}
+
+impl From<direct_endpoints::NodeEndpoint> for DirectNode {
+    fn from(row: direct_endpoints::NodeEndpoint) -> Self {
+        Self {
+            id: row.id,
+            node_api_endpoint: row.node_api_endpoint,
+        }
+    }
+}
+
+impl From<placement_candidates::GatedCandidateRow> for GatedDirectNode {
+    fn from(row: placement_candidates::GatedCandidateRow) -> Self {
+        Self {
+            id: row.id,
+            node_api_endpoint: row.node_api_endpoint,
+            environment_refusal: row.environment_refusal,
+        }
+    }
 }
 
 impl From<GatedDirectNode> for DirectNode {
@@ -165,7 +224,7 @@ impl From<GatedDirectNode> for DirectNode {
     }
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 struct DirectPoolCandidate {
     id: NodeId,
     node_api_endpoint: String,
@@ -174,6 +233,19 @@ struct DirectPoolCandidate {
     memory_mib: Option<i32>,
     /// As [`GatedDirectNode::environment_refusal`].
     environment_refusal: Option<String>,
+}
+
+impl From<placement_candidates::PooledCandidateRow> for DirectPoolCandidate {
+    fn from(row: placement_candidates::PooledCandidateRow) -> Self {
+        Self {
+            id: row.id,
+            node_api_endpoint: row.node_api_endpoint,
+            content_hash: row.content_hash,
+            vcpu: row.vcpu,
+            memory_mib: row.memory_mib,
+            environment_refusal: row.environment_refusal,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,18 +276,8 @@ struct DirectRestoreResult {
     execution_generation: u64,
 }
 
-#[derive(Debug, Clone, FromRow)]
-struct DirectRestoreCandidateRow {
-    id: NodeId,
-    node_api_endpoint: String,
-    storage_uri: Option<String>,
-    source_node_id: Option<NodeId>,
-    /// As [`GatedDirectNode::environment_refusal`].
-    environment_refusal: Option<String>,
-}
-
 impl DirectRestoreCandidate {
-    fn source_node(row: DirectRestoreCandidateRow) -> Self {
+    fn source_node(row: sandbox_direct::restore_candidates::RestoreCandidateRow) -> Self {
         Self {
             node: DirectNode {
                 id: row.id,
@@ -227,7 +289,7 @@ impl DirectRestoreCandidate {
         }
     }
 
-    fn remote_snapshot(row: DirectRestoreCandidateRow) -> Self {
+    fn remote_snapshot(row: sandbox_direct::restore_candidates::RestoreCandidateRow) -> Self {
         Self {
             node: DirectNode {
                 id: row.id,
@@ -255,6 +317,8 @@ pub struct DirectSubstrate {
     /// classifies with what on leaves out without reading telemetry.
     #[cfg(test)]
     recorded_refusals: std::sync::Arc<std::sync::Mutex<Vec<RecordedRefusal>>>,
+    /// Whether creates record their activating client; off unless set.
+    activation_client_attribution: super::ActivationClientAttribution,
 }
 
 const DIRECT_NODE_CREATE_FAILURE_TTL_SECS: i64 = 10;
@@ -444,7 +508,7 @@ enum DirectRouteIdentityReceiptError {
     #[error("node-api returned invalid direct route identity: missing current_node_id")]
     MissingCurrentNodeId,
     #[error("node-api returned invalid direct route identity: invalid current_node_id: {0}")]
-    InvalidCurrentNodeId(#[source] pplx_space_common_core::types::AuthIdParseError),
+    InvalidCurrentNodeId(#[source] pplx_space_accounts::AuthIdParseError),
     #[error("node-api returned invalid direct route identity: missing execution_generation")]
     MissingExecutionGeneration,
     #[error("node-api returned invalid direct route identity: {0}")]
@@ -754,10 +818,72 @@ fn wake_lifecycle_allows_restore_fallback(lifecycle: &str) -> bool {
 
 fn wake_response_requires_activation_identity(response: &WakeResponse) -> bool {
     response.route_identity.is_none()
-        && matches!(
-            WakeTransition::try_from(response.transition),
-            Ok(WakeTransition::Restore | WakeTransition::Start)
-        )
+        && WakeTransition::try_from(response.transition).is_ok_and(wake_transition_activates)
+}
+
+/// Whether a committed receipt writes the record
+/// (`sandboxes.activating_client_id`). The record follows the runtime, so only
+/// a receipt for a node response that started or restored a VM writes it, with
+/// the client id the activation resolved to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiptRecord<'a> {
+    /// The response created no runtime, or the activation has nothing of its
+    /// own to record: an inheriting activation that found the record `NULL`,
+    /// or one that never resolved it.
+    Unchanged,
+    /// Set the record to this client id.
+    Write(&'a ClientId),
+}
+
+impl<'a> ReceiptRecord<'a> {
+    /// The record a runtime this activation created carries.
+    fn for_runtime(charge: &'a RecoveryCharge) -> Self {
+        match charge.attribution().key() {
+            KeyResolution::Resolved(Some(id)) => Self::Write(id),
+            KeyResolution::Resolved(None) | KeyResolution::Unresolved => Self::Unchanged,
+        }
+    }
+
+    /// A resident start writes only when it's charged, here or upstream.
+    fn for_start(charge: &'a RecoveryCharge) -> Self {
+        match charge.state() {
+            ChargeState::Enforce | ChargeState::Paid => Self::for_runtime(charge),
+            ChargeState::Exempt => Self::Unchanged,
+        }
+    }
+
+    /// A wake writes only when it started or restored the VM: `transition` is
+    /// the answer whose receipt is committed, and `activated_earlier` says
+    /// whether an earlier, identity-free answer in the same wake already did.
+    fn for_wake(self, transition: WakeTransition, activated_earlier: bool) -> Self {
+        if activated_earlier || wake_transition_activates(transition) {
+            self
+        } else {
+            Self::Unchanged
+        }
+    }
+
+    /// Write the record, unless attribution is off: then no receipt writes it.
+    async fn write(
+        self,
+        attribution: super::ActivationClientAttribution,
+        connection: &mut sqlx::PgConnection,
+        sandbox_id: SandboxId,
+    ) -> Result<(), SubstrateError> {
+        if !attribution.is_enabled() {
+            return Ok(());
+        }
+        if let Self::Write(client_id) = self {
+            set_activating_client(connection, sandbox_id, Some(client_id))
+                .await
+                .db_context("failed to record the activating client")?;
+        }
+        Ok(())
+    }
+}
+
+fn wake_transition_activates(transition: WakeTransition) -> bool {
+    matches!(transition, WakeTransition::Restore | WakeTransition::Start)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -769,74 +895,14 @@ enum DirectRouteIdentityOperation {
     Wake,
 }
 
-async fn upsert_direct_route_provenance(
-    connection: &mut sqlx::PgConnection,
-    sandbox_id: SandboxId,
-    route_generation: RouteGeneration,
-    execution_generation: ExecutionGeneration,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "INSERT INTO sandbox_direct_route_provenance (
-             sandbox_id,
-             last_route_generation,
-             last_execution_generation,
-             updated_at
-         )
-         VALUES ($1, $2, $3, NOW())
-         ON CONFLICT (sandbox_id) DO UPDATE
-         SET last_route_generation = GREATEST(
-                 sandbox_direct_route_provenance.last_route_generation,
-                 EXCLUDED.last_route_generation
-             ),
-             last_execution_generation = GREATEST(
-                 sandbox_direct_route_provenance.last_execution_generation,
-                 EXCLUDED.last_execution_generation
-             ),
-             updated_at = NOW()"
-    ))
-    .bind(sandbox_id)
-    .bind(route_generation)
-    .bind(execution_generation)
-    .execute(connection)
-    .await?;
-    Ok(())
-}
-
 async fn persist_monotonic_direct_route_identity(
     connection: &mut sqlx::PgConnection,
     identity: &SandboxRouteIdentity,
 ) -> Result<bool, sqlx::Error> {
-    let persisted = sqlx::query_scalar::<_, i64>(sql!(
-        "INSERT INTO sandbox_direct_route_identities (
-             sandbox_id, route_generation, current_node_id, substrate_kind,
-             execution_generation, activation_attempt_id, pod_uid, updated_at
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-         ON CONFLICT (sandbox_id) DO UPDATE
-         SET route_generation = EXCLUDED.route_generation,
-             current_node_id = EXCLUDED.current_node_id,
-             substrate_kind = EXCLUDED.substrate_kind,
-             execution_generation = EXCLUDED.execution_generation,
-             activation_attempt_id = EXCLUDED.activation_attempt_id,
-             pod_uid = EXCLUDED.pod_uid,
-             updated_at = NOW()
-         WHERE sandbox_direct_route_identities.route_generation <= EXCLUDED.route_generation
-           AND sandbox_direct_route_identities.execution_generation <= EXCLUDED.execution_generation
-         RETURNING execution_generation"
-    ))
-    .bind(identity.sandbox_id().as_uuid())
-    .bind(identity.route_generation())
-    .bind(identity.current_node_id().as_uuid())
-    .bind(identity.substrate_kind().as_str())
-    .bind(identity.execution_generation())
-    .bind(identity.activation_attempt_id().as_uuid())
-    .bind(identity.pod_uid().map(ToString::to_string))
-    .fetch_optional(&mut *connection)
-    .await?;
-    if persisted.is_none() {
+    if !route_identities::store_unless_newer(&mut *connection, identity).await? {
         return Ok(false);
     }
-    upsert_direct_route_provenance(
+    route_provenance::retain_generations(
         connection,
         identity.sandbox_id(),
         identity.route_generation(),
@@ -999,6 +1065,7 @@ impl DirectSubstrate {
             environment_placement: EnvironmentPlacementGate::default(),
             #[cfg(test)]
             recorded_refusals: Default::default(),
+            activation_client_attribution: super::ActivationClientAttribution::Disabled,
         }
     }
 
@@ -1095,6 +1162,24 @@ impl DirectSubstrate {
         self
     }
 
+    pub fn with_activation_client_attribution(
+        mut self,
+        attribution: super::ActivationClientAttribution,
+    ) -> Self {
+        self.activation_client_attribution = attribution;
+        self
+    }
+
+    /// Direct keeps no per-client inventory of live executions, so it can't
+    /// count a client's live sandboxes (see the gap table above).
+    pub(super) fn live_sandboxes_for_client(&self) -> super::LiveSandboxCount {
+        super::LiveSandboxCount::Unknown(super::LiveSandboxCountUnknown::Unsupported)
+    }
+
+    pub(super) fn activation_client_attribution(&self) -> super::ActivationClientAttribution {
+        self.activation_client_attribution
+    }
+
     async fn persist_route_identity_receipt(
         &self,
         sandbox_id: SandboxId,
@@ -1102,6 +1187,7 @@ impl DirectSubstrate {
         response_sandbox_id: &str,
         route_identity: Option<pplx_space_sbx_mgr_client::proto::SpaceApiRouteIdentity>,
         operation: DirectRouteIdentityOperation,
+        record: ReceiptRecord<'_>,
     ) -> Result<Option<SandboxRouteIdentity>, SubstrateError> {
         if response_sandbox_id != sandbox_id.to_string() {
             return self
@@ -1118,6 +1204,8 @@ impl DirectSubstrate {
         let Some(identity) = route_identity else {
             // A successful activation through an older sandbox-manager must
             // not leave a strict receipt from the previous incarnation live.
+            // A start or wake writes no record either: the record rides only
+            // with an accepted route identity, so the previous one stays.
             self.clear_direct_route_identity(sandbox_id).await?;
             return Ok(None);
         };
@@ -1152,76 +1240,36 @@ impl DirectSubstrate {
             .begin()
             .await
             .db_context("failed to begin direct route identity transaction")?;
-        let persisted = sqlx::query_scalar::<_, i64>(sql!(
-            "INSERT INTO sandbox_direct_route_identities (
-                 sandbox_id,
-                 route_generation,
-                 current_node_id,
-                 substrate_kind,
-                 execution_generation,
-                 activation_attempt_id,
-                 pod_uid,
-                 updated_at
-             )
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-             ON CONFLICT (sandbox_id) DO UPDATE
-             SET route_generation = EXCLUDED.route_generation,
-                 current_node_id = EXCLUDED.current_node_id,
-                 substrate_kind = EXCLUDED.substrate_kind,
-                 execution_generation = EXCLUDED.execution_generation,
-                 activation_attempt_id = EXCLUDED.activation_attempt_id,
-                 pod_uid = EXCLUDED.pod_uid,
-                 updated_at = NOW()
-             WHERE (
-                 sandbox_direct_route_identities.current_node_id = EXCLUDED.current_node_id
-                 AND sandbox_direct_route_identities.route_generation
-                     <= EXCLUDED.route_generation
-                 AND (
-                     sandbox_direct_route_identities.execution_generation
-                         < EXCLUDED.execution_generation
-                     OR (
-                         sandbox_direct_route_identities.execution_generation
-                             = EXCLUDED.execution_generation
-                         AND sandbox_direct_route_identities.activation_attempt_id
-                             <= EXCLUDED.activation_attempt_id
-                     )
-                 )
-             )
-             OR (
-                 sandbox_direct_route_identities.current_node_id <> EXCLUDED.current_node_id
-                 AND EXISTS (
-                     SELECT 1
-                     FROM sandboxes s
-                     WHERE s.id = EXCLUDED.sandbox_id
-                       AND s.active_node_id = EXCLUDED.current_node_id
-                 )
-             )
-             RETURNING execution_generation"
-        ))
-        .bind(identity.sandbox_id().as_uuid())
-        .bind(identity.route_generation())
-        .bind(identity.current_node_id().as_uuid())
-        .bind(identity.substrate_kind().as_str())
-        .bind(identity.execution_generation())
-        .bind(identity.activation_attempt_id().as_uuid())
-        .bind(identity.pod_uid().map(ToString::to_string))
-        .fetch_optional(&mut *transaction)
-        .await
-        .db_context("failed to persist direct route identity")?;
-        if persisted.is_none() {
+        // The record first: when it changes, it takes the `sandboxes` row lock
+        // before the route identity rows, the order the owned restore receipt
+        // uses. A refused upsert below rolls it back with the rest of the
+        // transaction.
+        record
+            .write(
+                self.activation_client_attribution(),
+                &mut transaction,
+                sandbox_id,
+            )
+            .await?;
+        let persisted = route_identities::accept_receipt(&mut *transaction, &identity)
+            .await
+            .map_err(sqlx::Error::from)
+            .db_context("failed to persist direct route identity")?;
+        if !persisted {
             return Err(SubstrateError::Failed {
                 message: format!(
                     "refused stale direct route identity receipt for sandbox {sandbox_id}"
                 ),
             });
         }
-        upsert_direct_route_provenance(
-            &mut transaction,
+        route_provenance::retain_generations(
+            &mut *transaction,
             identity.sandbox_id(),
             identity.route_generation(),
             identity.execution_generation(),
         )
         .await
+        .map_err(sqlx::Error::from)
         .db_context("failed to retain direct route provenance")?;
         transaction
             .commit()
@@ -1237,6 +1285,7 @@ impl DirectSubstrate {
         response: &pplx_space_sbx_mgr_client::proto::StartResponse,
         supplied_identity: pplx_space_sbx_mgr_client::proto::SpaceApiRouteIdentity,
         lease: DirectRestoreLease,
+        record: ReceiptRecord<'_>,
     ) -> Result<Option<SandboxRouteIdentity>, SubstrateError> {
         // During a rolling deploy, an older sandbox-manager can apply the
         // supplied identity without returning a receipt. The API still owns
@@ -1269,19 +1318,11 @@ impl DirectSubstrate {
             .begin()
             .await
             .db_context("failed to begin owned direct restore transaction")?;
-        let owns_restore = sqlx::query_scalar::<_, bool>(sql!(
-            "SELECT TRUE
-               FROM sandboxes
-              WHERE id = $1
-                AND restore_lease_token = $2
-              FOR UPDATE"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(lease.token)
-        .fetch_optional(&mut *transaction)
-        .await
-        .db_context("failed to validate direct restore ownership")?;
-        if owns_restore.is_none() {
+        let owns_restore =
+            sandbox_direct::lock_restore_lease_owner(&mut *transaction, sandbox_id, lease.token)
+                .await
+                .db_context("failed to validate direct restore ownership")?;
+        if !owns_restore {
             return Err(SubstrateError::restore_in_flight(format!(
                 "direct restore ownership changed for sandbox {sandbox_id}"
             )));
@@ -1294,7 +1335,7 @@ impl DirectSubstrate {
                 message: format!("refused stale direct restore receipt for sandbox {sandbox_id}"),
             });
         }
-        let placed = direct_store::place_owned_restore_receipt(
+        let placed = sandbox_direct::place_owned_restore_receipt(
             &mut *transaction,
             sandbox_id,
             expected_node_id,
@@ -1307,6 +1348,13 @@ impl DirectSubstrate {
                 "direct restore ownership changed for sandbox {sandbox_id}"
             )));
         }
+        record
+            .write(
+                self.activation_client_attribution(),
+                &mut transaction,
+                sandbox_id,
+            )
+            .await?;
         transaction
             .commit()
             .await
@@ -1319,6 +1367,7 @@ impl DirectSubstrate {
         sandbox_id: SandboxId,
         expected_node_id: NodeId,
         response: &pplx_space_sbx_mgr_client::proto::StartResponse,
+        record: ReceiptRecord<'_>,
     ) -> Result<Option<SandboxRouteIdentity>, SubstrateError> {
         self.persist_route_identity_receipt(
             sandbox_id,
@@ -1326,6 +1375,7 @@ impl DirectSubstrate {
             &response.sandbox_id,
             response.route_identity.clone(),
             DirectRouteIdentityOperation::Start,
+            record,
         )
         .await
     }
@@ -1335,30 +1385,20 @@ impl DirectSubstrate {
         sandbox_id: SandboxId,
         expected_node_id: NodeId,
     ) -> Result<Option<SandboxRouteIdentity>, SubstrateError> {
-        let row: Option<(i64, Uuid, String, i64, Uuid, Option<String>)> = sqlx::query_as(sql!(
-            "SELECT route_generation,
-                        current_node_id,
-                        substrate_kind,
-                        execution_generation,
-                        activation_attempt_id,
-                        pod_uid
-                   FROM sandbox_direct_route_identities
-                  WHERE sandbox_id = $1"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await
-        .db_context_with(|| {
-            format!("failed to load current Direct route identity for sandbox {sandbox_id}")
-        })?;
-        let Some((
+        let row = route_identities::get(&self.pool, sandbox_id)
+            .await
+            .map_err(sqlx::Error::from)
+            .db_context_with(|| {
+                format!("failed to load current Direct route identity for sandbox {sandbox_id}")
+            })?;
+        let Some(route_identities::RouteIdentityRow {
             route_generation,
             current_node_id,
             substrate_kind,
             execution_generation,
             activation_attempt_id,
             pod_uid,
-        )) = row
+        }) = row
         else {
             return Ok(None);
         };
@@ -1406,6 +1446,8 @@ impl DirectSubstrate {
         sandbox_id: SandboxId,
         expected_node_id: NodeId,
         response: &WakeResponse,
+        record: ReceiptRecord<'_>,
+        activated_earlier: bool,
     ) -> Result<Option<SandboxRouteIdentity>, SubstrateError> {
         let transition =
             WakeTransition::try_from(response.transition).map_err(|_| SubstrateError::Failed {
@@ -1414,6 +1456,7 @@ impl DirectSubstrate {
                     response.transition
                 ),
             })?;
+        let record = record.for_wake(transition, activated_earlier);
         match (transition, response.route_identity.clone()) {
             (WakeTransition::Unspecified, _) => Err(SubstrateError::Failed {
                 message: "node-api wake omitted its transition".to_string(),
@@ -1425,6 +1468,7 @@ impl DirectSubstrate {
                     &response.sandbox_id,
                     Some(identity),
                     DirectRouteIdentityOperation::Wake,
+                    record,
                 )
                 .await
             }
@@ -1435,6 +1479,7 @@ impl DirectSubstrate {
                     &response.sandbox_id,
                     None,
                     DirectRouteIdentityOperation::Wake,
+                    record,
                 )
                 .await
             }
@@ -1502,6 +1547,7 @@ impl DirectSubstrate {
             &sandbox_id.to_string(),
             route_identity,
             DirectRouteIdentityOperation::Rollback,
+            ReceiptRecord::Unchanged,
         )
         .await?;
         Ok(())
@@ -1511,25 +1557,16 @@ impl DirectSubstrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<(i64, i64)>, SubstrateError> {
-        let reserved: Option<(i64, i64)> = sqlx::query_as(sql!(
-            "UPDATE sandbox_direct_route_provenance
-             SET last_route_generation = GREATEST(
-                     sandbox_direct_route_provenance.last_route_generation,
-                     sandbox_direct_route_provenance.last_execution_generation
-                 ) + 1,
-                 last_execution_generation = GREATEST(
-                     sandbox_direct_route_provenance.last_route_generation,
-                     sandbox_direct_route_provenance.last_execution_generation
-                 ) + 1,
-                 updated_at = NOW()
-             WHERE sandbox_id = $1
-             RETURNING last_route_generation, last_execution_generation"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(direct_route_generation_reservation_error)?;
-        Ok(reserved)
+        let reserved = route_provenance::advance_generations(&self.pool, sandbox_id)
+            .await
+            .map_err(sqlx::Error::from)
+            .map_err(direct_route_generation_reservation_error)?;
+        Ok(reserved.map(|reserved| {
+            (
+                reserved.last_route_generation,
+                reserved.last_execution_generation,
+            )
+        }))
     }
 
     async fn recover_direct_route_provenance(
@@ -1562,13 +1599,14 @@ impl DirectSubstrate {
                 .acquire()
                 .await
                 .db_context("failed to acquire direct route provenance connection")?;
-            upsert_direct_route_provenance(
-                &mut connection,
+            route_provenance::retain_generations(
+                &mut *connection,
                 sandbox_id,
                 route_generation,
                 execution_generation,
             )
             .await
+            .map_err(sqlx::Error::from)
             .db_context_with(|| {
                 format!("failed to recover direct route provenance for sandbox {sandbox_id}")
             })?;
@@ -1579,19 +1617,10 @@ impl DirectSubstrate {
         // generation 1. Initialize only this requested sandbox after active
         // and node-local sources have been exhausted; never scan the hot
         // sandboxes table from a startup migration.
-        sqlx::query(sql!(
-            "INSERT INTO sandbox_direct_route_provenance (
-                 sandbox_id,
-                 last_route_generation,
-                 last_execution_generation
-             )
-             VALUES ($1, 1, 1)
-             ON CONFLICT (sandbox_id) DO NOTHING"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .execute(&self.pool)
-        .await
-        .map_err(direct_route_generation_reservation_error)?;
+        route_provenance::initialize(&self.pool, sandbox_id)
+            .await
+            .map_err(sqlx::Error::from)
+            .map_err(direct_route_generation_reservation_error)?;
         Ok(())
     }
 
@@ -1683,20 +1712,11 @@ impl DirectSubstrate {
         sandbox_id: SandboxId,
         target_node_id: NodeId,
     ) -> Result<pplx_space_sbx_mgr_client::proto::SpaceApiRouteIdentity, SubstrateError> {
-        let inserted = sqlx::query(sql!(
-            "INSERT INTO sandbox_direct_route_provenance (
-                 sandbox_id,
-                 last_route_generation,
-                 last_execution_generation
-             )
-             VALUES ($1, 1, 1)
-             ON CONFLICT (sandbox_id) DO NOTHING"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .execute(&self.pool)
-        .await
-        .map_err(direct_route_generation_reservation_error)?;
-        if inserted.rows_affected() != 1 {
+        let inserted = route_provenance::initialize(&self.pool, sandbox_id)
+            .await
+            .map_err(sqlx::Error::from)
+            .map_err(direct_route_generation_reservation_error)?;
+        if !inserted {
             return Err(SubstrateError::Failed {
                 message: format!(
                     "sandbox {sandbox_id} already has direct route provenance before its initial activation"
@@ -1723,6 +1743,8 @@ impl DirectSubstrate {
                 response_sandbox_id,
                 route_identity,
                 operation,
+                // The row insert recorded the create's client.
+                ReceiptRecord::Unchanged,
             )
             .await
         {
@@ -1734,6 +1756,7 @@ impl DirectSubstrate {
                 sandbox_id: sandbox_id.to_string(),
                 template_filter: None,
                 blocking: false,
+                discard_retained_filesystem_reason: None,
             })
             .await;
         // `NotFound`, or `FailedPrecondition` naming a delete already in
@@ -1773,37 +1796,12 @@ impl DirectSubstrate {
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         sandbox_id: SandboxId,
     ) -> Result<bool, SubstrateError> {
-        let retained = sqlx::query(sql!(
-            "INSERT INTO sandbox_direct_route_provenance (
-                 sandbox_id,
-                 last_route_generation,
-                 last_execution_generation,
-                 updated_at
-             )
-             SELECT sandbox_id,
-                    route_generation,
-                    execution_generation,
-                    NOW()
-             FROM sandbox_direct_route_identities
-             WHERE sandbox_id = $1
-             ON CONFLICT (sandbox_id) DO UPDATE
-             SET last_route_generation = GREATEST(
-                     sandbox_direct_route_provenance.last_route_generation,
-                     EXCLUDED.last_route_generation
-                 ),
-                 last_execution_generation = GREATEST(
-                     sandbox_direct_route_provenance.last_execution_generation,
-                     EXCLUDED.last_execution_generation
-                 ),
-                 updated_at = NOW()"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .execute(&mut **transaction)
-        .await
-        .db_context_with(|| {
-            format!("failed to retain active direct route provenance for sandbox {sandbox_id}")
-        })?;
-        Ok(retained.rows_affected() > 0)
+        route_provenance::retain_route_identity_generations(&mut **transaction, sandbox_id)
+            .await
+            .map_err(sqlx::Error::from)
+            .db_context_with(|| {
+                format!("failed to retain active direct route provenance for sandbox {sandbox_id}")
+            })
     }
 
     async fn clear_direct_route_identity(
@@ -1817,14 +1815,10 @@ impl DirectSubstrate {
             .db_context("failed to begin direct route identity clear")?;
         self.retain_active_direct_route_provenance(&mut transaction, sandbox_id)
             .await?;
-        sqlx::query(sql!(
-            "DELETE FROM sandbox_direct_route_identities
-             WHERE sandbox_id = $1"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .execute(&mut *transaction)
-        .await
-        .db_context("failed to clear direct route identity")?;
+        route_identities::delete(&mut *transaction, sandbox_id)
+            .await
+            .map_err(sqlx::Error::from)
+            .db_context("failed to clear direct route identity")?;
         transaction
             .commit()
             .await
@@ -1858,35 +1852,22 @@ impl DirectSubstrate {
         node_api_endpoint(addr, DIRECT_NODE_CONNECT_TIMEOUT, request_timeout)
     }
 
-    async fn random_ready_nodes(&self, role: &str) -> Result<Vec<DirectNode>, SubstrateError> {
-        sqlx::query_as::<_, DirectNode>(sql!(
-            "SELECT n.id, nd.node_api_endpoint
-             FROM nodes n
-             JOIN node_direct nd ON nd.node_id = n.id
-             JOIN node_status_snapshots nss ON nss.node_id = n.id
-             WHERE n.managed_by = $2
-               AND n.role = $1
-               AND nd.deleted_at IS NULL
-               AND COALESCE(n.state, 'registered') = 'registered'
-               AND nss.reachable IS TRUE
-               AND nss.stale_after > NOW()
-               AND nss.scheduling_status = 'ready'
-             ORDER BY random()"
-        ))
-        .bind(role)
-        .bind(SubstrateKind::Space)
-        .fetch_all(&self.pool)
-        .await
-        .db_context_with(|| format!("failed to select cached-ready {role} node"))
-        .and_then(|nodes| {
-            if nodes.is_empty() {
-                Err(SubstrateError::Unavailable {
-                    message: format!("no cached-ready {role} node-api nodes"),
-                })
-            } else {
-                Ok(nodes)
-            }
-        })
+    async fn random_ready_nodes(
+        &self,
+        role: SpaceNodeRole,
+    ) -> Result<Vec<DirectNode>, SubstrateError> {
+        direct_endpoints::random_ready(&self.pool, role, SubstrateKind::Space)
+            .await
+            .db_context_with(|| format!("failed to select cached-ready {role} node"))
+            .and_then(|nodes| {
+                if nodes.is_empty() {
+                    Err(SubstrateError::Unavailable {
+                        message: format!("no cached-ready {role} node-api nodes"),
+                    })
+                } else {
+                    Ok(nodes.into_iter().map(DirectNode::from).collect())
+                }
+            })
     }
 
     pub(crate) async fn eligible_start_node_count(&self) -> Result<u64, SubstrateError> {
@@ -1899,22 +1880,10 @@ impl DirectSubstrate {
         // is template-agnostic by design — it gates before request-specific
         // template/runtime constraints — so only genuinely-absent workers
         // (zero rows) read as an empty cluster.
-        let count = sqlx::query_scalar::<_, i64>(
-            sql!("SELECT COUNT(*)
-             FROM nodes n
-             JOIN node_direct nd ON nd.node_id = n.id
-             LEFT JOIN node_status_snapshots nss ON nss.node_id = n.id
-             WHERE n.managed_by = $1
-               AND n.role = 'worker'
-               AND nd.deleted_at IS NULL
-               AND COALESCE(n.state, 'registered') = 'registered'
-               AND COALESCE(nss.reachable, TRUE) IS TRUE
-               AND COALESCE(nss.scheduling_status, 'ready') NOT IN ('full', 'draining', 'unavailable')"),
-        )
-        .bind(SubstrateKind::Space)
-        .fetch_one(&self.pool)
-        .await
-        .db_context("failed to count eligible direct start nodes")?;
+        let count =
+            placement_candidates::count_start_eligible_workers(&self.pool, SubstrateKind::Space)
+                .await
+                .db_context("failed to count eligible direct start nodes")?;
         Ok(u64::try_from(count).unwrap_or(0))
     }
 
@@ -1959,127 +1928,26 @@ impl DirectSubstrate {
         let environment = self
             .work_environment(template, content_hash, BindingScope::Release)
             .await?;
-        // Binds: $1 template, $2 content hash, $3 runtime, $4 whether a base
-        // snapshot is required, $5 the substrate, $6 whether the environment
-        // gate refuses, $7 the release's environment (`work_environment`). A
-        // candidate is gated by its own inventory row's binding, the build a
+        // A candidate is gated by its own inventory row's binding, the build a
         // create with no environment preference runs when the node has a
-        // legacy-partition one, and by $7 when the row names none.
-        static CACHED_READY_WORKER_CREATE_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
-            format!(
-                "SELECT n.id, nd.node_api_endpoint, environment_gate.refusal AS environment_refusal
-             FROM nodes n
-             JOIN node_direct nd ON nd.node_id = n.id
-             JOIN node_status_snapshots nss ON nss.node_id = n.id
-             JOIN node_template_inventory nti ON nti.node_id = n.id
-             CROSS JOIN LATERAL (
-                 SELECT {refusal} AS refusal
-             ) environment_gate
-             WHERE n.managed_by = $5
-               AND n.role = 'worker'
-               AND nd.deleted_at IS NULL
-               AND COALESCE(n.state, 'registered') = 'registered'
-               AND nss.reachable IS TRUE
-               AND nss.stale_after > NOW()
-               AND nss.scheduling_status = 'ready'
-               AND (($6::BOOLEAN IS TRUE AND COALESCE(nti.execution_metadata->>'environment', $7::TEXT) IS NOT NULL)
-                    OR $3 = 'fc' OR (
-                    nss.reachable IS TRUE
-                    AND nss.scheduling_status = 'ready'
-                    AND nss.stale_after > NOW()
-                    AND nss.execution_inventory_status = 'complete'
-                    AND nss.execution_inventory_received_at
-                        + (nss.stale_after - nss.observed_at) > NOW()
-                    AND EXISTS (
-                        SELECT 1 FROM node_runtime_guests guest
-                        WHERE guest.node_id = n.id
-                          AND guest.runtime = $3
-                          AND guest.guest_os = nti.guest_os
-                          AND guest.guest_arch = nti.arch
-                    )
-               ))
-               AND nti.template_name = $1
-               AND ($2::TEXT IS NULL OR nti.content_hash = $2)
-               AND (($3 = 'fc' AND nti.runtime IS NULL) OR nti.runtime = $3)
-               AND (
-                    ($6::BOOLEAN IS TRUE AND COALESCE(nti.execution_metadata->>'environment', $7::TEXT) IS NOT NULL)
-                    OR ($3 = 'fc' AND NOT EXISTS (
-                        SELECT 1 FROM node_runtime_installations inventory
-                        WHERE inventory.node_id = n.id
-                    ))
-                    OR EXISTS (
-                        SELECT 1 FROM node_runtime_installations runtime
-                        WHERE runtime.node_id = n.id
-                          AND runtime.runtime = $3
-                    )
-               )
-               AND (
-                    $4::BOOLEAN IS FALSE
-                    -- The environment gate's match replaces the format
-                    -- comparison for bound work on a node with evidence.
-                    OR ($6::BOOLEAN IS TRUE
-                        AND COALESCE(nti.execution_metadata->>'environment', $7::TEXT) IS NOT NULL)
-                    OR ($3 = 'fc' AND (
-                        nti.state_format_name IS NULL
-                        OR NOT EXISTS (
-                            SELECT 1 FROM node_runtime_installations inventory
-                            WHERE inventory.node_id = n.id
-                        )
-                    ))
-                    OR EXISTS (
-                        SELECT 1 FROM node_runtime_state_formats state_format
-                        WHERE state_format.node_id = n.id
-                          AND state_format.runtime = $3
-                          AND state_format.state_format_name = nti.state_format_name
-                          AND split_part(state_format.state_format_version, '.', 1)
-                              = split_part(nti.state_format_version, '.', 1)
-                          AND state_format.can_load IS TRUE
-                    )
-               )
-               AND NOT EXISTS (
-                    SELECT 1
-                    FROM node_template_components requested
-                    WHERE requested.node_id = nti.node_id
-                      -- On, the environment match stands in for the kernel
-                      -- check for bound work: a node publishes a managed
-                      -- environment's kernel only in its evidence.
-                      AND NOT (($6::BOOLEAN IS TRUE AND COALESCE(nti.execution_metadata->>'environment', $7::TEXT) IS NOT NULL) AND requested.kind = 'kernel')
-                      AND requested.template_name = nti.template_name
-                      AND requested.content_hash = nti.content_hash
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM node_artifact_components installed
-                          WHERE installed.node_id = n.id
-                            AND installed.kind = requested.kind
-                            AND installed.role_key = requested.role_key
-                            AND (
-                                (requested.digest IS NOT NULL AND installed.digest = requested.digest)
-                                OR (
-                                    requested.digest IS NULL
-                                    AND (requested.version IS NULL OR installed.version = requested.version)
-                                    AND (requested.format IS NULL OR installed.format = requested.format)
-                                )
-                            )
-                      )
-               )
-               AND ($4::BOOLEAN IS FALSE OR nti.has_base_snapshot IS TRUE)
-             ORDER BY random()",
-                refusal = environment_refusal("nss", "COALESCE(nti.execution_metadata->>'environment', $7::TEXT)"),
-            )
-        });
-        let cached_ready = sqlx::query_as::<_, GatedDirectNode>(sqlx::AssertSqlSafe(sql!(
-            CACHED_READY_WORKER_CREATE_CANDIDATES.as_str()
-        )))
-        .bind(template)
-        .bind(content_hash)
-        .bind(runtime)
-        .bind(require_base_snapshot)
-        .bind(SubstrateKind::Space)
-        .bind(refuse)
-        .bind(environment.as_deref())
-        .fetch_all(&self.pool)
-        .await
-        .db_context("failed to select cached-ready worker node")?;
+        // legacy-partition one, and by the release's environment
+        // (`work_environment`) when the row names none.
+        let binds = placement_candidates::CreateCandidateBinds {
+            template,
+            content_hash,
+            runtime,
+            require_base_snapshot,
+            managed_by: SubstrateKind::Space,
+            refuse,
+            release_environment: environment.as_deref(),
+        };
+        let cached_ready =
+            placement_candidates::cached_ready_worker_create_candidates(&self.pool, binds)
+                .await
+                .db_context("failed to select cached-ready worker node")?
+                .into_iter()
+                .map(GatedDirectNode::from)
+                .collect();
         let (cached_ready, _) =
             self.admit_environment_candidates(EnvironmentPlacementPath::CachedCreate, cached_ready);
 
@@ -2090,121 +1958,13 @@ impl DirectSubstrate {
         // Tolerates a missing or stale snapshot (LEFT JOIN), with the same
         // binds as the cached-ready statement. With the environment gate on,
         // bound work still needs a snapshot that's evidence.
-        static LAST_KNOWN_WORKER_CREATE_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
-            format!(
-                "SELECT DISTINCT ON (n.id) n.id, nd.node_api_endpoint,
-                    environment_gate.refusal AS environment_refusal
-             FROM nodes n
-             JOIN node_direct nd ON nd.node_id = n.id
-             JOIN node_template_inventory nti ON nti.node_id = n.id
-             LEFT JOIN node_status_snapshots nss ON nss.node_id = n.id
-             CROSS JOIN LATERAL (
-                 SELECT {refusal} AS refusal
-             ) environment_gate
-             WHERE n.managed_by = $5
-               AND n.role = 'worker'
-               AND nd.deleted_at IS NULL
-               AND COALESCE(n.state, 'registered') = 'registered'
-               AND COALESCE(nss.reachable, TRUE) IS TRUE
-               AND COALESCE(nss.scheduling_status, 'ready') NOT IN ('full', 'draining', 'unavailable')
-               AND (($6::BOOLEAN IS TRUE AND COALESCE(nti.execution_metadata->>'environment', $7::TEXT) IS NOT NULL)
-                    OR $3 = 'fc' OR (
-                    nss.reachable IS TRUE
-                    AND nss.scheduling_status = 'ready'
-                    AND nss.stale_after > NOW()
-                    AND nss.execution_inventory_status = 'complete'
-                    AND nss.execution_inventory_received_at
-                        + (nss.stale_after - nss.observed_at) > NOW()
-                    AND EXISTS (
-                        SELECT 1 FROM node_runtime_guests guest
-                        WHERE guest.node_id = n.id
-                          AND guest.runtime = $3
-                          AND guest.guest_os = nti.guest_os
-                          AND guest.guest_arch = nti.arch
-                    )
-               ))
-               AND nti.template_name = $1
-               AND ($2::TEXT IS NULL OR nti.content_hash = $2)
-               AND (($3 = 'fc' AND nti.runtime IS NULL) OR nti.runtime = $3)
-               AND (
-                    ($6::BOOLEAN IS TRUE AND COALESCE(nti.execution_metadata->>'environment', $7::TEXT) IS NOT NULL)
-                    OR ($3 = 'fc' AND NOT EXISTS (
-                        SELECT 1 FROM node_runtime_installations inventory
-                        WHERE inventory.node_id = n.id
-                    ))
-                    OR EXISTS (
-                        SELECT 1 FROM node_runtime_installations runtime
-                        WHERE runtime.node_id = n.id
-                          AND runtime.runtime = $3
-                    )
-               )
-               AND (
-                    $4::BOOLEAN IS FALSE
-                    -- The environment gate's match replaces the format
-                    -- comparison for bound work on a node with evidence.
-                    OR ($6::BOOLEAN IS TRUE
-                        AND COALESCE(nti.execution_metadata->>'environment', $7::TEXT) IS NOT NULL)
-                    OR ($3 = 'fc' AND (
-                        nti.state_format_name IS NULL
-                        OR NOT EXISTS (
-                            SELECT 1 FROM node_runtime_installations inventory
-                            WHERE inventory.node_id = n.id
-                        )
-                    ))
-                    OR EXISTS (
-                        SELECT 1 FROM node_runtime_state_formats state_format
-                        WHERE state_format.node_id = n.id
-                          AND state_format.runtime = $3
-                          AND state_format.state_format_name = nti.state_format_name
-                          AND split_part(state_format.state_format_version, '.', 1)
-                              = split_part(nti.state_format_version, '.', 1)
-                          AND state_format.can_load IS TRUE
-                    )
-               )
-               AND NOT EXISTS (
-                    SELECT 1
-                    FROM node_template_components requested
-                    WHERE requested.node_id = nti.node_id
-                      -- On, the environment match stands in for the kernel
-                      -- check for bound work: a node publishes a managed
-                      -- environment's kernel only in its evidence.
-                      AND NOT (($6::BOOLEAN IS TRUE AND COALESCE(nti.execution_metadata->>'environment', $7::TEXT) IS NOT NULL) AND requested.kind = 'kernel')
-                      AND requested.template_name = nti.template_name
-                      AND requested.content_hash = nti.content_hash
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM node_artifact_components installed
-                          WHERE installed.node_id = n.id
-                            AND installed.kind = requested.kind
-                            AND installed.role_key = requested.role_key
-                            AND (
-                                (requested.digest IS NOT NULL AND installed.digest = requested.digest)
-                                OR (
-                                    requested.digest IS NULL
-                                    AND (requested.version IS NULL OR installed.version = requested.version)
-                                    AND (requested.format IS NULL OR installed.format = requested.format)
-                                )
-                            )
-                      )
-               )
-               AND ($4::BOOLEAN IS FALSE OR nti.has_base_snapshot IS TRUE)
-             ORDER BY n.id, nti.observed_at DESC, nss.observed_at DESC NULLS LAST",
-                refusal = environment_refusal("nss", "COALESCE(nti.execution_metadata->>'environment', $7::TEXT)"),
-            )
-        });
-        let last_known = sqlx::query_as::<_, GatedDirectNode>(sqlx::AssertSqlSafe(sql!(
-            LAST_KNOWN_WORKER_CREATE_CANDIDATES.as_str()
-        )))
-        .bind(template)
-        .bind(content_hash)
-        .bind(runtime)
-        .bind(require_base_snapshot)
-        .bind(SubstrateKind::Space)
-        .bind(refuse)
-        .bind(environment.as_deref())
-        .fetch_all(&self.pool)
-        .await
-        .db_context("failed to select last-known worker node")?;
+        let last_known =
+            placement_candidates::last_known_worker_create_candidates(&self.pool, binds)
+                .await
+                .db_context("failed to select last-known worker node")?
+                .into_iter()
+                .map(GatedDirectNode::from)
+                .collect();
         let (last_known, refused_last_known) = self
             .admit_environment_candidates(EnvironmentPlacementPath::LastKnownCreate, last_known);
 
@@ -2281,90 +2041,23 @@ impl DirectSubstrate {
         let release_environment = self
             .work_environment(template, content_hash, BindingScope::Release)
             .await?;
-        // Binds: $1 runtime, $2 the substrate, $3 the build's environment for
-        // a candidate that doesn't hold it (`work_environment`), $4 whether
-        // the environment gate refuses, $5 template, $6 content hash, $7 the
-        // release's environment. A candidate holding the digest is gated as a
-        // cached one is: by its own row's binding, else by $7.
-        static PULL_ON_CREATE_WORKER_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
-            format!(
-                "SELECT n.id, nd.node_api_endpoint, environment_gate.refusal AS environment_refusal
-             FROM nodes n
-             JOIN node_direct nd ON nd.node_id = n.id
-             JOIN node_status_snapshots nss ON nss.node_id = n.id
-             -- A candidate that already holds the digest runs the build it
-             -- holds, so it's gated as a cached one is: by its own row's
-             -- binding, else the release's. A row that names a binding wins
-             -- over one that doesn't, then the exact spelling of the digest.
-             LEFT JOIN LATERAL (
-                 SELECT COALESCE(held.execution_metadata->>'environment', $7::TEXT)
-                            AS environment,
-                        TRUE AS holds
-                 FROM node_template_inventory held
-                 WHERE held.node_id = n.id
-                   AND held.template_name = $5
-                   AND held.content_hash IN ($6, replace($6, 'sha256:', ''))
-                 ORDER BY held.execution_metadata->>'environment' IS NULL,
-                          held.content_hash = $6 DESC
-                 LIMIT 1
-             ) held ON TRUE
-             CROSS JOIN LATERAL (
-                 SELECT {refusal} AS refusal
-             ) environment_gate
-             WHERE n.managed_by = $2
-               AND n.role = 'worker'
-               AND nd.deleted_at IS NULL
-               AND COALESCE(n.state, 'registered') = 'registered'
-               AND nss.reachable IS TRUE
-               AND nss.stale_after > NOW()
-               AND nss.scheduling_status = 'ready'
-               AND (
-                    ($4::BOOLEAN IS TRUE AND CASE WHEN held.holds THEN held.environment ELSE $3::TEXT END IS NOT NULL)
-                    OR ($1 = 'fc' AND NOT EXISTS (
-                        SELECT 1 FROM node_runtime_installations inventory
-                        WHERE inventory.node_id = n.id
-                    ))
-                    OR EXISTS (
-                        SELECT 1 FROM node_runtime_installations runtime
-                        WHERE runtime.node_id = n.id
-                          AND runtime.runtime = $1
-                    )
-               )
-               AND (($4::BOOLEAN IS TRUE AND CASE WHEN held.holds THEN held.environment ELSE $3::TEXT END IS NOT NULL)
-                    OR $1 = 'fc' OR (
-                    nss.reachable IS TRUE
-                    AND nss.scheduling_status = 'ready'
-                    AND nss.stale_after > NOW()
-                    AND nss.execution_inventory_status = 'complete'
-                    AND nss.execution_inventory_received_at
-                        + (nss.stale_after - nss.observed_at) > NOW()
-                    AND EXISTS (
-                        SELECT 1 FROM node_runtime_guests guest
-                        WHERE guest.node_id = n.id
-                          AND guest.runtime = $1
-                    )
-               ))
-               AND (
-                    $4::BOOLEAN IS FALSE
-                    OR environment_gate.refusal IS NULL
-               )
-             ORDER BY random()",
-                refusal = environment_refusal("nss", "CASE WHEN held.holds THEN held.environment ELSE $3::TEXT END"),
-            )
-        });
-        let candidates = sqlx::query_as::<_, GatedDirectNode>(sqlx::AssertSqlSafe(sql!(
-            PULL_ON_CREATE_WORKER_CANDIDATES.as_str()
-        )))
-        .bind(runtime)
-        .bind(SubstrateKind::Space)
-        .bind(environment)
-        .bind(self.environment_placement.refuses())
-        .bind(template)
-        .bind(content_hash)
-        .bind(release_environment.as_deref())
-        .fetch_all(&self.pool)
+        let candidates = placement_candidates::pull_on_create_worker_candidates(
+            &self.pool,
+            placement_candidates::PullOnCreateBinds {
+                runtime,
+                managed_by: SubstrateKind::Space,
+                build_environment: environment.as_deref(),
+                refuse: self.environment_placement.refuses(),
+                template,
+                content_hash,
+                release_environment: release_environment.as_deref(),
+            },
+        )
         .await
-        .db_context("failed to select pull-on-create worker node")?;
+        .db_context("failed to select pull-on-create worker node")?
+        .into_iter()
+        .map(GatedDirectNode::from)
+        .collect();
         Ok(self.take_environment_refusals(EnvironmentPlacementPath::PullCreate, candidates))
     }
 
@@ -2374,110 +2067,33 @@ impl DirectSubstrate {
         content_hash: Option<&str>,
         runtime: &str,
     ) -> Result<Vec<DirectPoolCandidate>, ControllerError> {
-        // Binds: $1 template, $2 content hash, $3 runtime, $4 the substrate,
-        // $5 whether the environment gate refuses, $6 the release's
-        // environment (`work_environment`). A candidate is gated by its own
-        // inventory row's binding, and by $6 when the row names none.
+        // A candidate is gated by its own inventory row's binding, and by the
+        // release's environment (`work_environment`) when the row names none.
         let environment = self
             .work_environment(template, content_hash, BindingScope::Release)
             .await
             .map_err(ControllerError::from)?;
-        static POOLED_WORKER_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
-            format!(
-                "SELECT n.id, nd.node_api_endpoint, nti.content_hash, nti.vcpu, nti.memory_mib,
-                    environment_gate.refusal AS environment_refusal
-             FROM nodes n
-             JOIN node_direct nd ON nd.node_id = n.id
-             JOIN node_status_snapshots nss ON nss.node_id = n.id
-             JOIN node_template_inventory nti ON nti.node_id = n.id
-             CROSS JOIN LATERAL (
-                 SELECT {refusal} AS refusal
-             ) environment_gate
-             WHERE n.managed_by = $4
-               AND n.role = 'worker'
-               AND nd.deleted_at IS NULL
-               AND COALESCE(n.state, 'registered') = 'registered'
-               AND nss.reachable IS TRUE
-               AND nss.stale_after > NOW()
-               AND nss.scheduling_status = 'ready'
-               AND (($5::BOOLEAN IS TRUE AND COALESCE(nti.execution_metadata->>'environment', $6::TEXT) IS NOT NULL)
-                    OR $3 = 'fc' OR (
-                    nss.reachable IS TRUE
-                    AND nss.scheduling_status = 'ready'
-                    AND nss.stale_after > NOW()
-                    AND nss.execution_inventory_status = 'complete'
-                    AND nss.execution_inventory_received_at
-                        + (nss.stale_after - nss.observed_at) > NOW()
-                    AND EXISTS (
-                        SELECT 1 FROM node_runtime_guests guest
-                        WHERE guest.node_id = n.id
-                          AND guest.runtime = $3
-                          AND guest.guest_os = nti.guest_os
-                          AND guest.guest_arch = nti.arch
-                    )
-               ))
-               AND nti.template_name = $1
-               AND ($2::TEXT IS NULL OR nti.content_hash = $2)
-               AND (($3 = 'fc' AND nti.runtime IS NULL) OR nti.runtime = $3)
-               AND (
-                    ($5::BOOLEAN IS TRUE AND COALESCE(nti.execution_metadata->>'environment', $6::TEXT) IS NOT NULL)
-                    OR ($3 = 'fc' AND NOT EXISTS (
-                        SELECT 1 FROM node_runtime_installations inventory
-                        WHERE inventory.node_id = n.id
-                    ))
-                    OR EXISTS (
-                        SELECT 1 FROM node_runtime_installations runtime
-                        WHERE runtime.node_id = n.id
-                          AND runtime.runtime = $3
-                    )
-               )
-               AND NOT EXISTS (
-                    SELECT 1
-                    FROM node_template_components requested
-                    WHERE requested.node_id = nti.node_id
-                      -- On, the environment match stands in for the kernel
-                      -- check for bound work: a node publishes a managed
-                      -- environment's kernel only in its evidence.
-                      AND NOT (($5::BOOLEAN IS TRUE AND COALESCE(nti.execution_metadata->>'environment', $6::TEXT) IS NOT NULL) AND requested.kind = 'kernel')
-                      AND requested.template_name = nti.template_name
-                      AND requested.content_hash = nti.content_hash
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM node_artifact_components installed
-                          WHERE installed.node_id = n.id
-                            AND installed.kind = requested.kind
-                            AND installed.role_key = requested.role_key
-                            AND (
-                                (requested.digest IS NOT NULL AND installed.digest = requested.digest)
-                                OR (
-                                    requested.digest IS NULL
-                                    AND (requested.version IS NULL OR installed.version = requested.version)
-                                    AND (requested.format IS NULL OR installed.format = requested.format)
-                                )
-                            )
-                      )
-               )
-               AND nti.pool_current > 0
-               AND (
-                    $5::BOOLEAN IS FALSE
-                    OR environment_gate.refusal IS NULL
-               )
-             ORDER BY nti.pool_current DESC, random()",
-                refusal = environment_refusal("nss", "COALESCE(nti.execution_metadata->>'environment', $6::TEXT)"),
-            )
-        });
-        let candidates = sqlx::query_as::<_, DirectPoolCandidate>(sqlx::AssertSqlSafe(sql!(
-            POOLED_WORKER_CANDIDATES.as_str()
-        )))
-        .bind(template)
-        .bind(content_hash)
-        .bind(runtime)
-        .bind(SubstrateKind::Space)
-        .bind(self.environment_placement.refuses())
-        .bind(environment.as_deref())
-        .fetch_all(&self.pool)
+        let candidates: Vec<DirectPoolCandidate> = placement_candidates::pooled_worker_candidates(
+            &self.pool,
+            placement_candidates::PooledCandidateBinds {
+                template,
+                content_hash,
+                runtime,
+                managed_by: SubstrateKind::Space,
+                refuse: self.environment_placement.refuses(),
+                release_environment: environment.as_deref(),
+            },
+        )
         .await
-        .map_err(|err| db_contention_error("failed to select direct pool candidates", &err))?;
+        .map_err(|err| {
+            db_contention_error(
+                "failed to select direct pool candidates",
+                &sqlx::Error::from(err),
+            )
+        })?
+        .into_iter()
+        .map(DirectPoolCandidate::from)
+        .collect();
         self.record_environment_refusals(
             EnvironmentPlacementPath::PoolAdoption,
             candidates
@@ -2506,7 +2122,7 @@ impl DirectSubstrate {
             (Some(vcpu), Some(memory_mib)) => Some(PooledExecutionPoolShape::new(
                 vcpu,
                 memory_mib,
-                pplx_space_common_core::types::DiskIoLimits::default(),
+                pplx_space_execution_spec::DiskIoLimits::default(),
             )),
             (None, None) => None,
             _ => {
@@ -2542,6 +2158,7 @@ impl DirectSubstrate {
                 sandbox_id: sandbox_id.to_string(),
                 template_filter: None,
                 blocking: false,
+                discard_retained_filesystem_reason: None,
             })
             .await
         {
@@ -2613,22 +2230,10 @@ impl DirectSubstrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<DirectNode>, SubstrateError> {
-        sqlx::query_as::<_, DirectNode>(sql!(
-            "SELECT n.id, nd.node_api_endpoint
-             FROM sandboxes s
-             JOIN nodes n ON n.id = s.active_node_id
-             JOIN node_direct nd ON nd.node_id = n.id
-             WHERE s.id = $1
-               AND n.managed_by = $2
-               AND n.role = 'worker'
-               AND nd.deleted_at IS NULL
-             LIMIT 1"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(SubstrateKind::Space)
-        .fetch_optional(&self.pool)
-        .await
-        .db_context_with(|| format!("failed to load worker placement for sandbox {sandbox_id}"))
+        sandbox_direct::node_endpoints::active_node(&self.pool, sandbox_id)
+            .await
+            .map(|node| node.map(DirectNode::from))
+            .db_context_with(|| format!("failed to load worker placement for sandbox {sandbox_id}"))
     }
 
     /// The worker holding a sandbox's node-local state: its active node, or,
@@ -2641,49 +2246,27 @@ impl DirectSubstrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<DirectNode, SubstrateError> {
-        sqlx::query_as::<_, DirectNode>(sql!(
-            "SELECT n.id, nd.node_api_endpoint
-             FROM sandboxes s
-             JOIN nodes n ON n.id = COALESCE(s.active_node_id, s.target_node_id)
-             JOIN node_direct nd ON nd.node_id = n.id
-             WHERE s.id = $1
-               AND n.managed_by = $2
-               AND n.role = 'worker'
-               AND nd.deleted_at IS NULL
-             LIMIT 1"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(SubstrateKind::Space)
-        .fetch_optional(&self.pool)
-        .await
-        .db_context_with(|| format!("failed to load local-state node for sandbox {sandbox_id}"))?
-        .ok_or_else(|| SubstrateError::Unavailable {
-            message: format!("sandbox {sandbox_id} has no worker node holding its local state"),
-        })
+        sandbox_direct::node_endpoints::local_state_node(&self.pool, sandbox_id)
+            .await
+            .map(|node| node.map(DirectNode::from))
+            .db_context_with(|| {
+                format!("failed to load local-state node for sandbox {sandbox_id}")
+            })?
+            .ok_or_else(|| SubstrateError::Unavailable {
+                message: format!("sandbox {sandbox_id} has no worker node holding its local state"),
+            })
     }
 
     async fn direct_provenance_source_node(
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<DirectNode>, SubstrateError> {
-        sqlx::query_as::<_, DirectNode>(sql!(
-            "SELECT n.id, nd.node_api_endpoint
-             FROM sandboxes s
-             JOIN nodes n ON n.id = COALESCE(s.target_node_id, s.active_node_id)
-             JOIN node_direct nd ON nd.node_id = n.id
-             WHERE s.id = $1
-               AND n.managed_by = $2
-               AND n.role = 'worker'
-               AND nd.deleted_at IS NULL
-             LIMIT 1"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(SubstrateKind::Space)
-        .fetch_optional(&self.pool)
-        .await
-        .db_context_with(|| {
-            format!("failed to load provenance source node for sandbox {sandbox_id}")
-        })
+        sandbox_direct::node_endpoints::provenance_source_node(&self.pool, sandbox_id)
+            .await
+            .map(|node| node.map(DirectNode::from))
+            .db_context_with(|| {
+                format!("failed to load provenance source node for sandbox {sandbox_id}")
+            })
     }
 
     async fn worker_client_for_node(
@@ -2702,24 +2285,13 @@ impl DirectSubstrate {
     }
 
     async fn direct_node_by_id(&self, node_id: NodeId) -> Result<DirectNode, SubstrateError> {
-        sqlx::query_as::<_, DirectNode>(sql!(
-            "SELECT n.id, nd.node_api_endpoint
-             FROM nodes n
-             JOIN node_direct nd ON nd.node_id = n.id
-             WHERE n.id = $1
-               AND n.managed_by = $2
-               AND n.role = 'worker'
-               AND nd.deleted_at IS NULL
-             LIMIT 1"
-        ))
-        .bind(node_id)
-        .bind(SubstrateKind::Space)
-        .fetch_optional(&self.pool)
-        .await
-        .db_context_with(|| format!("failed to load direct worker node {node_id}"))?
-        .ok_or_else(|| SubstrateError::Unavailable {
-            message: format!("direct worker node {node_id} is not registered"),
-        })
+        direct_endpoints::live_worker(&self.pool, node_id, SubstrateKind::Space)
+            .await
+            .db_context_with(|| format!("failed to load direct worker node {node_id}"))?
+            .map(DirectNode::from)
+            .ok_or_else(|| SubstrateError::Unavailable {
+                message: format!("direct worker node {node_id} is not registered"),
+            })
     }
 
     async fn worker_client_for_node_with_timeout(
@@ -2759,132 +2331,12 @@ impl DirectSubstrate {
         restore_retry: bool,
     ) -> Result<Vec<DirectRestoreCandidate>, SubstrateError> {
         let mut candidates = Vec::new();
-        let retry_source = restore_retry_source_snapshot_is_current("s", "sn");
-        let source_snapshot = if restore_retry {
-            retry_source.as_str()
-        } else {
-            "TRUE"
-        };
-
-        // A fresh restore uses the newest full row regardless of upload state:
-        // those execution columns describe the artifact held by the source
-        // node even when its upload failed or its durable copy was claimed.
-        // A retry instead uses the same pre-claim source row as the remote leg;
-        // newer post-claim attempts are not authoritative for compatibility.
-        // The observed-state join supplies only existence and placement.
-        let source_query = format!(
-            "WITH latest_snapshot AS (
-                 SELECT sn.runtime,
-                        sn.guest_os,
-                        sn.guest_arch,
-                        sn.state_format_name,
-                        sn.state_format_version,
-                        sn.execution_metadata
-                 FROM sandboxes s
-                 JOIN snapshots sn ON sn.sandbox_id = s.id
-                 WHERE s.id = $1
-                   AND sn.type = 'full'
-                   AND {source_snapshot}
-                 ORDER BY sn.timestamp DESC, sn.id DESC
-                 LIMIT 1
-             )
-             SELECT n.id,
-                    nd.node_api_endpoint,
-                    NULL::TEXT AS storage_uri,
-                    COALESCE(s.target_node_id, s.active_node_id) AS source_node_id,
-                    environment_gate.refusal AS environment_refusal
-             FROM sandboxes s
-             CROSS JOIN latest_snapshot
-             JOIN sandbox_observed_states sos
-               ON sos.sandbox_id = s.id
-              AND sos.node_id = COALESCE(s.target_node_id, s.active_node_id)
-             JOIN nodes n ON n.id = sos.node_id
-             JOIN node_direct nd ON nd.node_id = n.id
-             JOIN node_status_snapshots nss ON nss.node_id = n.id
-             CROSS JOIN LATERAL (
-                 SELECT {refusal} AS refusal
-             ) environment_gate
-             WHERE s.id = $1
-               AND n.managed_by = $2
-               AND n.role = 'worker'
-               AND nd.deleted_at IS NULL
-               AND COALESCE(n.state, 'registered') = 'registered'
-               AND nss.reachable IS TRUE
-               AND nss.stale_after > NOW()
-               AND nss.scheduling_status = 'ready'
-               AND (latest_snapshot.runtime = 'fc' OR (
-                    nss.execution_inventory_status = 'complete'
-                    AND nss.execution_inventory_received_at
-                        + (nss.stale_after - nss.observed_at) > NOW()
-                    AND latest_snapshot.execution_metadata IS NOT NULL
-               ))
-               AND latest_snapshot.runtime IS NOT NULL
-               AND latest_snapshot.guest_os IS NOT NULL
-               AND latest_snapshot.guest_arch IS NOT NULL
-               AND latest_snapshot.state_format_name IS NOT NULL
-               AND latest_snapshot.state_format_version IS NOT NULL
-               AND (($3::BOOLEAN IS TRUE AND latest_snapshot.execution_metadata->>'environment' IS NOT NULL)
-                    OR EXISTS (
-                    SELECT 1
-                    FROM node_runtime_installations runtime
-                    JOIN node_runtime_guests guest
-                      ON guest.node_id = runtime.node_id
-                     AND guest.runtime = runtime.runtime
-                     AND guest.runtime_version = runtime.runtime_version
-                    WHERE runtime.node_id = n.id
-                      AND runtime.runtime = latest_snapshot.runtime
-                      AND guest.guest_os = latest_snapshot.guest_os
-                      AND guest.guest_arch = latest_snapshot.guest_arch
-                      AND EXISTS (
-                              SELECT 1
-                              FROM node_runtime_state_formats state_format
-                              WHERE state_format.node_id = runtime.node_id
-                                AND state_format.runtime = runtime.runtime
-                                AND state_format.runtime_version = runtime.runtime_version
-                                AND state_format.state_format_name = latest_snapshot.state_format_name
-                                AND split_part(state_format.state_format_version, '.', 1)
-                                    = split_part(latest_snapshot.state_format_version, '.', 1)
-                                AND state_format.can_load IS TRUE
-                          )
-                   ))
-                   AND NOT EXISTS (
-                    SELECT 1
-                    FROM jsonb_to_recordset(
-                             COALESCE(latest_snapshot.execution_metadata->'components',
-                                      '[]'::jsonb)
-                         ) AS requested(kind text, role text, digest text,
-                                        version text, format text)
-                    WHERE (latest_snapshot.runtime <> 'fc' OR requested.kind IS DISTINCT FROM 'kernel')
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM node_artifact_components installed
-                          WHERE installed.node_id = n.id
-                            AND installed.kind = requested.kind
-                            AND installed.role_key = COALESCE(requested.role, '')
-                            AND (
-                                (requested.digest IS NOT NULL AND installed.digest = requested.digest)
-                                OR (
-                                    requested.digest IS NULL
-                                    AND (requested.version IS NULL OR installed.version = requested.version)
-                                    AND (requested.format IS NULL OR installed.format = requested.format)
-                                )
-                            )
-                      )
-               )
-               AND (
-                    $3::BOOLEAN IS FALSE
-                    OR environment_gate.refusal IS NULL
-               )
-             LIMIT 1",
-            refusal = environment_refusal("nss", "latest_snapshot.execution_metadata->>'environment'"),
-        );
-        let source_candidates = sqlx::query_as::<_, DirectRestoreCandidateRow>(
-            sqlx::AssertSqlSafe(sql!(source_query.as_str())),
+        let source_candidates = sandbox_direct::restore_candidates::source_candidates(
+            &self.pool,
+            sandbox_id,
+            restore_retry,
+            self.environment_placement.refuses(),
         )
-        .bind(sandbox_id.as_uuid())
-        .bind(SubstrateKind::Space)
-        .bind(self.environment_placement.refuses())
-        .fetch_all(&self.pool)
         .await
         .db_context("failed to select direct source restore candidate")?;
         self.record_environment_refusals(
@@ -2899,144 +2351,13 @@ impl DirectSubstrate {
                 .map(DirectRestoreCandidate::source_node),
         );
 
-        let no_newer = no_newer_full_snapshot("s", "sn");
-        let remote_source = if restore_retry {
-            retry_source.as_str()
-        } else {
-            no_newer.as_str()
-        };
-        let remote_query = format!(
-            "WITH latest_snapshot AS (
-                 SELECT sn.id AS snapshot_id,
-                        storage.storage_connection_string AS storage_uri,
-                        COALESCE(sn.source_node_id, s.target_node_id, s.active_node_id) AS source_node_id,
-                        sn.runtime,
-                        sn.guest_os,
-                        sn.guest_arch,
-                        sn.state_format_name,
-                        sn.state_format_version,
-                        sn.execution_metadata
-                 FROM sandboxes s
-                 JOIN snapshots sn ON sn.sandbox_id = s.id
-                 JOIN LATERAL (
-                     SELECT ssl.storage_connection_string
-                     FROM snapshot_storage_locations ssl
-                     WHERE ssl.snapshot_id = sn.id
-                     ORDER BY ssl.created_at DESC, ssl.id DESC
-                     LIMIT 1
-                 ) storage ON TRUE
-                 WHERE s.id = $1
-                   AND sn.type = 'full'
-                   AND sn.state = 'ready'
-                   AND {remote_source}
-                 ORDER BY sn.timestamp DESC, sn.id DESC
-                 LIMIT 1
-             )
-             SELECT n.id,
-                    nd.node_api_endpoint,
-                    latest_snapshot.storage_uri,
-                    latest_snapshot.source_node_id,
-                    environment_gate.refusal AS environment_refusal
-             FROM latest_snapshot
-             JOIN nodes n ON n.id IS DISTINCT FROM latest_snapshot.source_node_id
-             JOIN node_direct nd ON nd.node_id = n.id
-             JOIN node_status_snapshots nss ON nss.node_id = n.id
-             CROSS JOIN LATERAL (
-                 SELECT {refusal} AS refusal
-             ) environment_gate
-             WHERE n.managed_by = $3
-               AND n.role = 'worker'
-               AND nd.deleted_at IS NULL
-               AND COALESCE(n.state, 'registered') = 'registered'
-               AND nss.reachable IS TRUE
-               AND nss.stale_after > NOW()
-               AND nss.scheduling_status = 'ready'
-               AND (latest_snapshot.runtime = 'fc' OR (
-                    nss.execution_inventory_status = 'complete'
-                    AND nss.execution_inventory_received_at
-                        + (nss.stale_after - nss.observed_at) > NOW()
-                    AND latest_snapshot.execution_metadata IS NOT NULL
-               ))
-               AND latest_snapshot.runtime IS NOT NULL
-               AND latest_snapshot.guest_os IS NOT NULL
-               AND latest_snapshot.guest_arch IS NOT NULL
-               AND latest_snapshot.state_format_name IS NOT NULL
-               AND latest_snapshot.state_format_version IS NOT NULL
-               AND (($4::BOOLEAN IS TRUE AND latest_snapshot.execution_metadata->>'environment' IS NOT NULL)
-                    OR EXISTS (
-                    SELECT 1
-                    FROM node_runtime_installations runtime
-                    JOIN node_runtime_guests guest
-                      ON guest.node_id = runtime.node_id
-                     AND guest.runtime = runtime.runtime
-                     AND guest.runtime_version = runtime.runtime_version
-                    WHERE runtime.node_id = n.id
-                      AND runtime.runtime = latest_snapshot.runtime
-                      AND guest.guest_os = latest_snapshot.guest_os
-                      AND guest.guest_arch = latest_snapshot.guest_arch
-                      AND EXISTS (
-                              SELECT 1
-                              FROM node_runtime_state_formats state_format
-                              WHERE state_format.node_id = runtime.node_id
-                                AND state_format.runtime = runtime.runtime
-                                AND state_format.runtime_version = runtime.runtime_version
-                                AND state_format.state_format_name = latest_snapshot.state_format_name
-                                AND split_part(state_format.state_format_version, '.', 1)
-                                    = split_part(latest_snapshot.state_format_version, '.', 1)
-                                AND state_format.can_load IS TRUE
-                          )
-                   ))
-                   -- Component compatibility reads the components array of the
-                   -- execution_metadata document written by BeginArtifactBackup.
-                   -- Omitted optional keys surface as NULL
-                   -- columns: NULL digest/version/format arms are unconstrained,
-                   -- and an absent role maps to node_artifact_components'
-                   -- role_key ''. A NULL document (legacy rows) means no
-                   -- compatibility requirements. Malformed documents fail
-                   -- closed: a non-array components value errors the whole
-                   -- candidate query rather than silently passing, and a
-                   -- component with no kind can never match an installed
-                   -- component, so it excludes the node.
-                   AND NOT EXISTS (
-                    SELECT 1
-                    FROM jsonb_to_recordset(
-                             COALESCE(latest_snapshot.execution_metadata->'components',
-                                      '[]'::jsonb)
-                         ) AS requested(kind text, role text, digest text,
-                                        version text, format text)
-                    WHERE (latest_snapshot.runtime <> 'fc' OR requested.kind IS DISTINCT FROM 'kernel')
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM node_artifact_components installed
-                          WHERE installed.node_id = n.id
-                            AND installed.kind = requested.kind
-                            AND installed.role_key = COALESCE(requested.role, '')
-                            AND (
-                                (requested.digest IS NOT NULL AND installed.digest = requested.digest)
-                                OR (
-                                    requested.digest IS NULL
-                                    AND (requested.version IS NULL OR installed.version = requested.version)
-                                    AND (requested.format IS NULL OR installed.format = requested.format)
-                                )
-                            )
-                      )
-               )
-               AND (
-                    $4::BOOLEAN IS FALSE
-                    OR environment_gate.refusal IS NULL
-               )
-             ORDER BY random()
-             LIMIT $2",
-            refusal = environment_refusal("nss", "latest_snapshot.execution_metadata->>'environment'"),
-        );
-        let remote_candidates = sqlx::query_as::<_, DirectRestoreCandidateRow>(
-            sqlx::AssertSqlSafe(sql!(remote_query.as_str())),
+        let remote_candidates = sandbox_direct::restore_candidates::remote_candidates(
+            &self.pool,
+            sandbox_id,
+            restore_retry,
+            DIRECT_REMOTE_RESTORE_CANDIDATE_LIMIT,
+            self.environment_placement.refuses(),
         )
-        .bind(sandbox_id.as_uuid())
-        .bind(DIRECT_REMOTE_RESTORE_CANDIDATE_LIMIT)
-        .bind(SubstrateKind::Space)
-        .bind(self.environment_placement.refuses())
-        .fetch_all(&self.pool)
         .await
         .db_context("failed to select direct remote restore candidates")?;
         self.record_environment_refusals(
@@ -3089,19 +2410,10 @@ impl DirectSubstrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<bool, SubstrateError> {
-        let (lifecycle, lease_remaining_seconds) =
-            sqlx::query_as::<_, (String, Option<f64>)>(sql!(
-                "SELECT lifecycle,
-                    CASE
-                        WHEN restore_lease_expires_at > NOW() THEN
-                            EXTRACT(EPOCH FROM (restore_lease_expires_at - NOW()))::float8
-                        ELSE NULL
-                    END
-               FROM sandboxes
-              WHERE id = $1"
-            ))
-            .bind(sandbox_id.as_uuid())
-            .fetch_optional(&self.pool)
+        let sandbox_direct::UnexpiredRestoreLease {
+            lifecycle,
+            remaining_seconds: lease_remaining_seconds,
+        } = sandbox_direct::unexpired_restore_lease(&self.pool, sandbox_id)
             .await
             .db_context("failed to inspect direct restore lifecycle")?
             .ok_or_else(|| SubstrateError::NotFound {
@@ -3132,7 +2444,7 @@ impl DirectSubstrate {
         sandbox_id: SandboxId,
     ) -> Result<DirectRestoreLease, SubstrateError> {
         let token = Uuid::now_v7();
-        let claimed = direct_store::claim_restore_lease(
+        let claimed = sandbox_direct::claim_restore_lease(
             &self.pool,
             sandbox_id,
             i64::try_from(DIRECT_NODE_RPC_TIMEOUT.as_secs()).expect("node timeout fits i64"),
@@ -3140,7 +2452,7 @@ impl DirectSubstrate {
         )
         .await
         .db_context("failed to claim direct restore lease")?;
-        if let Some(direct_store::ClaimedRestoreLease {
+        if let Some(sandbox_direct::ClaimedRestoreLease {
             token: claimed_token,
             restore_retry,
         }) = claimed
@@ -3152,25 +2464,15 @@ impl DirectSubstrate {
             });
         }
 
-        let (lifecycle, remaining_seconds) = sqlx::query_as::<_, (String, Option<f64>)>(sql!(
-            "SELECT lifecycle,
-                    CASE
-                        WHEN restore_lease_expires_at IS NULL THEN NULL
-                        ELSE GREATEST(
-                            EXTRACT(EPOCH FROM (restore_lease_expires_at - NOW())),
-                            0.0
-                        )::float8
-                    END
-               FROM sandboxes
-              WHERE id = $1"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await
-        .db_context("failed to inspect direct restore lease")?
-        .ok_or_else(|| SubstrateError::NotFound {
-            message: format!("sandbox {sandbox_id} not found"),
-        })?;
+        let sandbox_direct::FlooredRestoreLease {
+            lifecycle,
+            remaining_seconds,
+        } = sandbox_direct::floored_restore_lease(&self.pool, sandbox_id)
+            .await
+            .db_context("failed to inspect direct restore lease")?
+            .ok_or_else(|| SubstrateError::NotFound {
+                message: format!("sandbox {sandbox_id} not found"),
+            })?;
         let lifecycle =
             lifecycle
                 .parse::<SandboxLifecycle>()
@@ -3195,7 +2497,7 @@ impl DirectSubstrate {
         sandbox_id: SandboxId,
         lease: DirectRestoreLease,
     ) -> Result<(), SubstrateError> {
-        let released = direct_store::release_restore_lease(
+        let released = sandbox_direct::release_restore_lease(
             &self.pool,
             sandbox_id,
             lease.token,
@@ -3232,7 +2534,7 @@ impl DirectSubstrate {
         sandbox_id: SandboxId,
         lease: DirectRestoreLease,
     ) -> Result<(), SubstrateError> {
-        let renewed = direct_store::renew_restore_lease(
+        let renewed = sandbox_direct::renew_restore_lease(
             &self.pool,
             sandbox_id,
             lease.token,
@@ -3254,7 +2556,7 @@ impl DirectSubstrate {
         sandbox_id: SandboxId,
         lease: DirectRestoreLease,
     ) -> Result<(), SubstrateError> {
-        let completed = direct_store::complete_restore_lease(&self.pool, sandbox_id, lease.token)
+        let completed = sandbox_direct::complete_restore_lease(&self.pool, sandbox_id, lease.token)
             .await
             .db_context("failed to complete direct restore lease")?;
         if !completed {
@@ -3269,6 +2571,7 @@ impl DirectSubstrate {
         &self,
         sandbox_id: SandboxId,
         options: ActivationOptions,
+        charge: &RecoveryCharge,
     ) -> Result<DirectRestoreResult, SubstrateError> {
         // A read-only preflight avoids two lifecycle writes for a wake that
         // has no usable source. It is only an optimization: the candidate set
@@ -3389,6 +2692,7 @@ impl DirectSubstrate {
                             response.get_ref(),
                             route_identity,
                             lease,
+                            ReceiptRecord::for_runtime(charge),
                         )
                         .await;
                     let route_identity = match persist_result {
@@ -3401,6 +2705,7 @@ impl DirectSubstrate {
                                             sandbox_id: sandbox_id.to_string(),
                                             template_filter: None,
                                             blocking: false,
+                                            discard_retained_filesystem_reason: None,
                                         },
                                     )
                                     .await
@@ -3507,6 +2812,7 @@ impl DirectSubstrate {
         &self,
         sandbox: &Sandbox,
         timeout: Duration,
+        charge: &RecoveryCharge,
     ) -> Result<ExecutionActivation, SubstrateError> {
         let restored = self
             .restore_execution_with_candidates(
@@ -3515,6 +2821,7 @@ impl DirectSubstrate {
                     blocking: true,
                     ready_timeout: timeout,
                 },
+                charge,
             )
             .await?;
         Ok(ExecutionActivation::owned(ExecutionBinding {
@@ -3606,30 +2913,15 @@ impl DirectSubstrate {
         ) else {
             return Ok(RouteCatchUp::NotNeeded);
         };
-        let trails = sqlx::query_scalar::<_, bool>(sql!(
-            "SELECT TRUE
-               FROM sandboxes s
-               JOIN sandbox_direct_route_identities route ON route.sandbox_id = s.id
-               JOIN sandbox_direct_route_provenance provenance
-                 ON provenance.sandbox_id = s.id
-              WHERE s.id = $1
-                AND s.managed_by = $4
-                AND s.active_node_id IS NULL
-                AND LOWER(TRIM(s.lifecycle)) = $5
-                AND s.restore_lease_token IS NULL
-                AND route.current_node_id = $2
-                AND route.execution_generation < $3
-                AND provenance.last_execution_generation >= $3"
-        ))
-        .bind(sandbox.id.as_uuid())
-        .bind(node.id.as_uuid())
-        .bind(record_generation)
-        .bind(SubstrateKind::Space)
-        .bind(read_lifecycle.as_str())
-        .fetch_optional(&self.pool)
+        let trails = sandbox_direct::adoption::route_identity_trails_record(
+            &self.pool,
+            sandbox.id,
+            node.id,
+            record_generation,
+            read_lifecycle,
+        )
         .await
-        .db_context("failed to read the unplaced sandbox's route identity")?
-        .is_some();
+        .db_context("failed to read the unplaced sandbox's route identity")?;
         if !trails {
             return Ok(RouteCatchUp::NotNeeded);
         }
@@ -3675,8 +2967,18 @@ impl DirectSubstrate {
         if response.route_identity.is_none() {
             return Ok(RouteCatchUp::NotNeeded);
         }
+        // The catch-up adopts a VM that's already running, so it writes no
+        // record. The wake that started that VM lost its record write with
+        // its receipt, and no client id survives it, so the record lags
+        // until the next activation that writes one.
         let receipt = self
-            .persist_wake_route_identity(sandbox.id, node.id, &response)
+            .persist_wake_route_identity(
+                sandbox.id,
+                node.id,
+                &response,
+                ReceiptRecord::Unchanged,
+                false,
+            )
             .await?;
         Ok(match receipt {
             Some(receipt) => RouteCatchUp::CaughtUp {
@@ -3695,11 +2997,13 @@ impl DirectSubstrate {
     /// from an older snapshot, so the row adopts the running one instead,
     /// with no new generation.
     ///
-    /// One guarded write fences on the lifecycle the caller read, no active
-    /// node, no live restore lease (whose owner's restore answers for
-    /// itself), and a route identity on `node` whose execution generation is
-    /// at most the record's. The record's generation must be at most the last
-    /// one reserved. A row that holds a restore-lease token is adopted only
+    /// One transaction adopts it. After taking the `sandboxes` row lock, it
+    /// reads the route identity and the last reservation, and requires the
+    /// route identity on `node` at an execution generation at most the
+    /// record's, and the record's generation at most the last one reserved.
+    /// Its guarded write then fences on the lifecycle the caller read, no
+    /// active node, and no live restore lease (whose owner's restore answers
+    /// for itself). A row that holds a restore-lease token is adopted only
     /// when the route identity, the record and the last reservation are one
     /// generation:
     ///
@@ -3764,6 +3068,17 @@ impl DirectSubstrate {
 
     /// [`Self::adopt_live_source_record`] for an execution on `node` at
     /// `execution_generation`, `started` when its worker runs it.
+    ///
+    /// One transaction selects the candidate with the full guard in one
+    /// statement, locks only that `sandboxes` row, and makes the guarded
+    /// write ([`sandbox_direct::adopt_live_execution`]) with the two facts the
+    /// route identity and the last reservation give. The joined `UPDATE ...
+    /// FROM` it replaced locked only a row its snapshot matched, and so does
+    /// this: a row another restore owns under a live lease returns no row
+    /// without waiting, so Wake still reports the restore in flight. The
+    /// route rows take no lock and come from the same snapshot. Locking them
+    /// would order the adoption against writers that take the route identity
+    /// and the provenance in different orders.
     async fn adopt_live_execution(
         &self,
         sandbox_id: SandboxId,
@@ -3772,46 +3087,52 @@ impl DirectSubstrate {
         execution_generation: i64,
         started: bool,
     ) -> Result<Option<DirectNode>, SubstrateError> {
-        let adopted = sqlx::query(sql!(
-            "UPDATE sandboxes s
-                SET active_node_id = $2,
-                    target_node_id = $2,
-                    placement = 'on_node',
-                    placement_changed_at = NOW(),
-                    lifecycle = CASE
-                        WHEN $5 AND route.execution_generation = $4 THEN 'started'
-                        ELSE s.lifecycle
-                    END
-               FROM sandbox_direct_route_identities route,
-                    sandbox_direct_route_provenance provenance
-              WHERE s.id = $1
-                AND s.managed_by = $6
-                AND s.active_node_id IS NULL
-                AND LOWER(TRIM(s.lifecycle)) = $3
-                AND (s.restore_lease_expires_at IS NULL OR s.restore_lease_expires_at <= NOW())
-                AND route.sandbox_id = s.id
-                AND route.current_node_id = $2
-                AND route.execution_generation <= $4
-                AND provenance.sandbox_id = s.id
-                AND provenance.last_execution_generation >= $4
-                AND (
-                    s.restore_lease_token IS NULL
-                    OR (
-                        route.execution_generation = $4
-                        AND provenance.last_execution_generation = $4
-                    )
-                )"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(node.id.as_uuid())
-        .bind(read_lifecycle.as_str())
-        .bind(execution_generation)
-        .bind(started)
-        .bind(SubstrateKind::Space)
-        .execute(&self.pool)
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .db_context("failed to begin the live record's adoption")?;
+        // The candidate's row lock is the transaction's first statement; see
+        // the verb for what it locks and why.
+        let route = sandbox_direct::adoption::lock_live_adoption_candidate(
+            &mut *transaction,
+            sandbox_id,
+            read_lifecycle,
+            node.id,
+            execution_generation,
+        )
         .await
-        .db_context("failed to adopt the live record's placement")?;
-        if adopted.rows_affected() == 1 {
+        .db_context("failed to select the sandbox for the live record's adoption")?;
+        let adoptable = route.map(
+            |sandbox_direct::adoption::LiveAdoptionGenerations {
+                 execution_generation: route_generation,
+                 last_execution_generation: last_generation,
+             }| {
+                (
+                    route_generation == execution_generation
+                        && last_generation == execution_generation,
+                    started && route_generation == execution_generation,
+                )
+            },
+        );
+        let adopted = match adoptable {
+            Some((one_generation, started_now)) => sandbox_direct::adopt_live_execution(
+                &mut *transaction,
+                sandbox_id,
+                node.id,
+                read_lifecycle,
+                one_generation,
+                started_now,
+            )
+            .await
+            .db_context("failed to adopt the live record's placement")?,
+            None => false,
+        };
+        transaction
+            .commit()
+            .await
+            .db_context("failed to commit the live record's adoption")?;
+        if adopted {
             tracing::info!(
                 sandbox_id = %sandbox_id,
                 node_id = %node.id,
@@ -3940,6 +3261,7 @@ impl DirectSubstrate {
                 sandbox_id: sandbox_id.to_string(),
                 template_filter: None,
                 blocking: false,
+                discard_retained_filesystem_reason: None,
             }),
         )
         .await;
@@ -3982,58 +3304,14 @@ impl DirectSubstrate {
     ) {
         let scheduling_status = failure.scheduling_status();
         let reachable = failure.reachable();
-        if let Err(error) = sqlx::query(sql!(
-            "INSERT INTO node_status_snapshots (
-                 node_id,
-                 observed_at,
-                 stale_after,
-                 reachable,
-                 error,
-                 role,
-                 scheduling_status,
-                 scheduling_reason,
-                 health_healthy,
-                 services,
-                 updated_at
-             )
-             SELECT n.id,
-                    NOW(),
-                    NOW() + ($4::TEXT || ' seconds')::INTERVAL,
-                    $2,
-                    CASE WHEN $2 THEN NULL ELSE $3 END,
-                    n.role,
-                    $5,
-                    $3,
-                    CASE WHEN $2 THEN NULL ELSE FALSE END,
-                    '[]'::JSONB,
-                    NOW()
-             FROM nodes n
-             WHERE n.id = $1
-             ON CONFLICT (node_id) DO UPDATE
-             SET observed_at = EXCLUDED.observed_at,
-                 stale_after = EXCLUDED.stale_after,
-                 reachable = EXCLUDED.reachable,
-                 error = EXCLUDED.error,
-                 role = EXCLUDED.role,
-                 scheduling_status = EXCLUDED.scheduling_status,
-                 scheduling_reason = EXCLUDED.scheduling_reason,
-                 network_slots_ready = CASE
-                     WHEN EXCLUDED.scheduling_status IN ('full', 'draining', 'unavailable')
-                     THEN 0
-                     ELSE node_status_snapshots.network_slots_ready
-                 END,
-                 health_healthy = CASE
-                     WHEN EXCLUDED.reachable THEN node_status_snapshots.health_healthy
-                     ELSE FALSE
-                 END,
-                 updated_at = NOW()"
-        ))
-        .bind(node.id)
-        .bind(reachable)
-        .bind(&reason)
-        .bind(DIRECT_NODE_CREATE_FAILURE_TTL_SECS)
-        .bind(scheduling_status)
-        .execute(&self.pool)
+        if let Err(error) = pplx_space_node_status_store::create_failure::record_create_failure(
+            &self.pool,
+            node.id,
+            reachable,
+            &reason,
+            DIRECT_NODE_CREATE_FAILURE_TTL_SECS,
+            scheduling_status,
+        )
         .await
         {
             tracing::warn!(
@@ -4105,6 +3383,10 @@ impl DirectSubstrate {
                             disk_io_max_bandwidth_mib_per_sec: Some(
                                 request.disk_io_limits.max_bandwidth_mib_per_sec(),
                             ),
+                            // The gate checked this candidate's own inventory
+                            // row, which names the build a create without a
+                            // preference resolves.
+                            required_environment: None,
                         })
                         .await;
 
@@ -4195,7 +3477,7 @@ impl DirectSubstrate {
     async fn builder_node_client(&self) -> Result<BuilderClient, ControllerError> {
         let mut failures = Vec::new();
         for node in self
-            .random_ready_nodes(SpaceNodeRole::Builder.as_str())
+            .random_ready_nodes(SpaceNodeRole::Builder)
             .await
             .map_err(ControllerError::from)?
         {
@@ -4238,6 +3520,10 @@ impl SubstrateAdapter for DirectSubstrate {
 
     fn capabilities(&self) -> SubstrateCapabilities {
         SubstrateCapabilities::DIRECT
+    }
+
+    fn check_node_pool_placement(&self, node_pool: &NodePoolName) -> Result<(), SubstrateError> {
+        refuse_node_pool_placement(node_pool)
     }
 
     fn pool_eligible_for_request(
@@ -4425,6 +3711,7 @@ impl SubstrateAdapter for DirectSubstrate {
                         pool_slot_id: None,
                         sandbox_id: sandbox_uuid,
                         content_hash: candidate.content_hash,
+                        template_release_id: None,
                         pod_name: sandbox_id.clone(),
                         pod_uid: None,
                         execution_generation: route_identity
@@ -4435,7 +3722,7 @@ impl SubstrateAdapter for DirectSubstrate {
                         vcpu,
                         memory_mib,
                         disk_mib: None,
-                        disk_io_limits: pplx_space_common_core::types::DiskIoLimits::default(),
+                        disk_io_limits: pplx_space_execution_spec::DiskIoLimits::default(),
                         active_node_id: Some(candidate.id),
                         route_identity: Some(route_identity),
                     };
@@ -4537,10 +3824,22 @@ impl SubstrateAdapter for DirectSubstrate {
             &sandbox_id.to_string(),
             response.into_inner().route_identity,
             DirectRouteIdentityOperation::Resume,
+            // The adoption's `insert_pooled` recorded the claiming client.
+            ReceiptRecord::Unchanged,
         )
         .await
         .map_err(ControllerError::from)?;
         Ok(())
+    }
+
+    /// Direct adopts node-side and has no pod to label.
+    async fn label_adopted_execution(
+        &self,
+        _claim: &PooledExecutionClaim,
+        _client_id: Option<&pplx_space_accounts::ClientId>,
+        _on_transient: crate::controllers::substrate::AdoptionLabelTransient,
+    ) -> Result<crate::controllers::substrate::AdoptionLabelOutcome, ControllerError> {
+        Ok(crate::controllers::substrate::AdoptionLabelOutcome::Labeled)
     }
 
     async fn rollback_pooled_execution_claim(
@@ -4572,6 +3871,7 @@ impl SubstrateAdapter for DirectSubstrate {
                 sandbox_id: claim.sandbox_id.to_string(),
                 template_filter: None,
                 blocking: false,
+                discard_retained_filesystem_reason: None,
             })
             .await
             && !is_idempotent_pool_rollback_delete(&err)
@@ -4591,11 +3891,7 @@ impl SubstrateAdapter for DirectSubstrate {
         request: CreateExecutionRequest<'a>,
     ) -> Result<CreateExecutionOutcome, SubstrateError> {
         if let Some(node_pool) = request.node_pool {
-            return Err(SubstrateError::Unsupported {
-                message: format!(
-                    "node-pool placement {node_pool} requires the Kubernetes substrate"
-                ),
-            });
+            refuse_node_pool_placement(node_pool)?;
         }
         ensure_direct_create_supported(request.restore_from.is_some())?;
         let one_shot_create = use_one_shot_create(
@@ -4721,6 +4017,7 @@ impl SubstrateAdapter for DirectSubstrate {
                             sandbox_id: sandbox_id.to_string(),
                             template_filter: None,
                             blocking: false,
+                            discard_retained_filesystem_reason: None,
                         })
                         .await
                     {
@@ -4788,6 +4085,7 @@ impl SubstrateAdapter for DirectSubstrate {
                         sandbox_id: sandbox_id.to_string(),
                         template_filter: None,
                         blocking: false,
+                        discard_retained_filesystem_reason: None,
                     })
                     .await
                 {
@@ -4846,6 +4144,7 @@ impl SubstrateAdapter for DirectSubstrate {
                         sandbox_id: sandbox_id.to_string(),
                         template_filter: None,
                         blocking: false,
+                        discard_retained_filesystem_reason: None,
                     })
                     .await
                 {
@@ -4897,6 +4196,7 @@ impl SubstrateAdapter for DirectSubstrate {
                 sandbox_id: sandbox_id.to_string(),
                 template_filter: None,
                 blocking: true,
+                discard_retained_filesystem_reason: None,
             })
             .await
             .map_err(|err| direct_delete_error(sandbox_id, err))?;
@@ -4994,7 +4294,12 @@ impl SubstrateAdapter for DirectSubstrate {
                 message: format!("node-api start error: {err}"),
             })?;
         let route_identity = self
-            .persist_start_route_identity(sandbox_id, node.id, response.get_ref())
+            .persist_start_route_identity(
+                sandbox_id,
+                node.id,
+                response.get_ref(),
+                ReceiptRecord::for_start(&charge),
+            )
             .await?;
         let execution_generation = receipt_execution_generation(route_identity.as_ref());
 
@@ -5016,7 +4321,7 @@ impl SubstrateAdapter for DirectSubstrate {
         // charged at entry because the Direct path does not support joining a
         // prior owner's completion.
         charge.charge_restore_claim().await?;
-        self.restore_execution_with_candidates(sandbox_id, options)
+        self.restore_execution_with_candidates(sandbox_id, options, &charge)
             .await?;
         Ok(ActivationCompletion::Owned)
     }
@@ -5126,7 +4431,7 @@ impl SubstrateAdapter for DirectSubstrate {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 match adopted {
                     Some(node) => (node, remaining),
-                    None => return self.restore_for_wake(sandbox, remaining).await,
+                    None => return self.restore_for_wake(sandbox, remaining, &charge).await,
                 }
             }
         };
@@ -5193,6 +4498,10 @@ impl SubstrateAdapter for DirectSubstrate {
                 .await?,
             )
             .await;
+        // Set when the first answer started or restored the VM without a
+        // receipt, so the hydrating retry's receipt writes the record even
+        // when that answer is `Noop`.
+        let mut activated_earlier = false;
         let wake = match initial_wake {
             Err(status)
                 if pplx_space_sbx_mgr_client::is_authoritative_route_identity_required(&status) =>
@@ -5216,6 +4525,7 @@ impl SubstrateAdapter for DirectSubstrate {
                 // Compatibility mode can allow an identity-free activation. Hydrate
                 // that now-active execution with the control-plane identity before
                 // returning it to callers or persisting its receipt.
+                activated_earlier = true;
                 let route_identity = self
                     .reserve_direct_activation_route_identity(sandbox_id, node.id)
                     .await?;
@@ -5239,13 +4549,19 @@ impl SubstrateAdapter for DirectSubstrate {
                 if wake_requires_restore(&status)
                     && wake_lifecycle_allows_restore_fallback(&sandbox.lifecycle) =>
             {
-                return self.restore_for_wake(sandbox, timeout).await;
+                return self.restore_for_wake(sandbox, timeout, &charge).await;
             }
             Err(status) => return Err(wake_rpc_error(&status, wake_activity)),
         };
         let response = response.into_inner();
         let route_identity = self
-            .persist_wake_route_identity(sandbox_id, node.id, &response)
+            .persist_wake_route_identity(
+                sandbox_id,
+                node.id,
+                &response,
+                ReceiptRecord::for_runtime(&charge),
+                activated_earlier,
+            )
             .await?;
         let execution_generation = receipt_execution_generation(route_identity.as_ref());
 
@@ -5286,14 +4602,17 @@ impl SubstrateAdapter for DirectSubstrate {
         sandbox: &Sandbox,
         activity: ExecutionActivityKind,
         timeout: Duration,
-        _charge: crate::controllers::substrate::RecoveryCharge,
+        charge: crate::controllers::substrate::RecoveryCharge,
     ) -> Result<RuntimeClient, ControllerError> {
-        if matches!(
-            sandbox.lifecycle.parse::<SandboxLifecycle>(),
-            Ok(SandboxLifecycle::Suspended | SandboxLifecycle::Restoring)
-        ) {
+        if let Ok(lifecycle @ (SandboxLifecycle::Suspended | SandboxLifecycle::Restoring)) =
+            sandbox.lifecycle.parse::<SandboxLifecycle>()
+        {
             if !activity.allows_implicit_wake(&sandbox.auto_lifecycle.0) {
-                return Err(ControllerError::conflict(
+                return Err(ControllerError::sandbox_not_running(
+                    crate::controllers::SandboxNotRunning {
+                        sandbox_id: sandbox.id,
+                        lifecycle,
+                    },
                     "automatic access wake is disabled",
                 ));
             }
@@ -5310,7 +4629,7 @@ impl SubstrateAdapter for DirectSubstrate {
                 sandbox,
                 timeout,
                 Some(activity),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                charge.after_charge(),
             )
             .await
             .map_err(ControllerError::from)?;
@@ -5326,28 +4645,19 @@ impl SubstrateAdapter for DirectSubstrate {
         &self,
         node_id: NodeId,
     ) -> Result<BuilderClient, ControllerError> {
-        let node = sqlx::query_as::<_, DirectNode>(sql!(
-            "SELECT n.id, nd.node_api_endpoint
-             FROM nodes n
-             JOIN node_direct nd ON nd.node_id = n.id
-             WHERE n.id = $1
-               AND n.managed_by = $2
-               AND n.role = 'builder'
-               AND nd.deleted_at IS NULL
-             LIMIT 1"
-        ))
-        .bind(node_id.as_uuid())
-        .bind(SubstrateKind::Space)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|error| {
-            db_contention_error(&format!("failed to load builder node {node_id}"), &error)
-        })?
-        .ok_or_else(|| {
-            ControllerError::service_unavailable(format!(
-                "builder node {node_id} is not registered"
-            ))
-        })?;
+        let node = direct_endpoints::live_builder(&self.pool, node_id, SubstrateKind::Space)
+            .await
+            .map_err(|error| {
+                db_contention_error(
+                    &format!("failed to load builder node {node_id}"),
+                    &sqlx::Error::from(error),
+                )
+            })?
+            .ok_or_else(|| {
+                ControllerError::service_unavailable(format!(
+                    "builder node {node_id} is not registered"
+                ))
+            })?;
         let endpoint = Self::endpoint(&node.node_api_endpoint).map_err(ControllerError::from)?;
         connect_builder(endpoint, self.builder_connect_retry_policy)
             .await
@@ -5374,7 +4684,7 @@ impl SubstrateAdapter for DirectSubstrate {
         &self,
     ) -> Result<OwnedNodeApiTarget, SubstrateError> {
         let node = self
-            .random_ready_nodes(SpaceNodeRole::Worker.as_str())
+            .random_ready_nodes(SpaceNodeRole::Worker)
             .await?
             .into_iter()
             .next()
@@ -5398,6 +4708,13 @@ impl SubstrateAdapter for DirectSubstrate {
     }
 }
 
+/// Direct's answer to any node-pool pin; see the module doc's gap table.
+fn refuse_node_pool_placement(node_pool: &NodePoolName) -> Result<(), SubstrateError> {
+    Err(SubstrateError::Unsupported {
+        message: format!("node-pool placement {node_pool} requires the Kubernetes substrate"),
+    })
+}
+
 fn ensure_direct_create_supported(fork_disk_restore: bool) -> Result<(), SubstrateError> {
     if fork_disk_restore {
         return Err(SubstrateError::Unsupported {
@@ -5407,8 +4724,6 @@ fn ensure_direct_create_supported(fork_disk_restore: bool) -> Result<(), Substra
     }
     Ok(())
 }
-
-pub(crate) mod reported_node;
 
 #[cfg(test)]
 mod cluster_admission_tests;

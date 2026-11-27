@@ -420,7 +420,7 @@ fn a_retry_names_the_same_operation_and_a_new_subject_a_new_one() {
     // The authorization names the environment's state, not a policy
     // generation, so a retry after an unrelated policy write names the same
     // upgrade under the same authorization.
-    let checkpoint = pplx_space_common_core::types::LocalArtifactId::new();
+    let checkpoint = pplx_space_snapshot_model::LocalArtifactId::new();
     let upgrade = to_default.wake_upgrade(
         sandbox,
         UpgradeActivation::Restore,

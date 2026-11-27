@@ -2,6 +2,7 @@
 //! including retirement when no active execution remains.
 
 use super::*;
+use pplx_space_accounts::NodeId;
 
 /// The address a fenced teardown may send its in-VM stop to, derived from the
 /// execution row and the pod the fence check already verified.
@@ -18,12 +19,14 @@ use super::*;
 /// applying the same filters `resolve_pod_ip` applies and none of its writes.
 /// Every filter resolves to "no runtime to stop", which is always safe: the
 /// teardown proceeds to the pod delete instead of talking to a VM.
+///
+/// The address is the pod's published IP, or the one the row records for the
+/// same pod UID before kubelet publishes it (see [`current_pod_ip_with_source`]).
 fn fenced_runtime_pod_ip(
-    lifecycle: &str,
-    state: ActiveExecutionState,
+    active: &ActiveExecutionStatusRow,
     live_pod: Option<&SandboxPodView>,
-) -> Option<PodIp> {
-    if is_suspended_lifecycle(lifecycle) || execution_pod_lookup_in_flight(state) {
+) -> Option<(PodIp, PodIpSource)> {
+    if is_suspended_lifecycle(&active.lifecycle) || execution_pod_lookup_in_flight(active.state) {
         return None;
     }
     let live_pod = live_pod?;
@@ -33,7 +36,30 @@ fn fenced_runtime_pod_ip(
     {
         return None;
     }
-    assigned_pod_ip(live_pod).ok().flatten()
+    current_pod_ip_with_source(live_pod, active.pod_uid.as_ref(), active.pod_ip.as_deref())
+        .ok()
+        .flatten()
+}
+
+/// Whether the node reports an ambiguously acknowledged delete as admitted:
+/// the requested row is in `deleting`, which sbx-mgr enters
+/// only after the delete's refusals pass. A missing row is not proof of
+/// admission: node-local files can outlive it. Anything else,
+/// including a probe that fails or does not answer in time, means the refusals
+/// may not have run.
+async fn node_delete_admitted(client: &mut RuntimeClient, sandbox_id: SandboxId) -> bool {
+    use pplx_space_sbx_mgr_client::proto::{SandboxLifecycleState, StateRequest};
+    let probe = client.sandbox_state(StateRequest {
+        sandbox_ids: vec![sandbox_id.to_string()],
+    });
+    let Ok(Ok(response)) = tokio::time::timeout(TEARDOWN_NODE_DELETE_ADMISSION_PROBE, probe).await
+    else {
+        return false;
+    };
+    response.into_inner().sandboxes.iter().any(|sandbox| {
+        sandbox.sandbox_id == sandbox_id.to_string()
+            && sandbox.lifecycle() == SandboxLifecycleState::Deleting
+    })
 }
 
 /// Project the world as it is now into the same shape the fence carries, so
@@ -101,10 +127,17 @@ pub(super) struct FencedTeardown {
     /// cleanup is most needed.
     identity: ExecutionIdentity,
     /// The address the in-VM stop may use, derived from the pod the fence
-    /// verified rather than from whatever is active at stop time. `None` means
-    /// there is no runtime to stop and the teardown goes straight to the pod
-    /// delete.
-    runtime_pod_ip: Option<PodIp>,
+    /// verified rather than from whatever is active at stop time, with where it
+    /// comes from. A node-reported one is confirmed through the teardown's
+    /// worker before use (see [`KubernetesSubstrate::confirmed_fenced_runtime`]).
+    /// `None` means there is no runtime to stop and the teardown goes straight
+    /// to the pod delete.
+    runtime_address: Option<(PodIp, PodIpSource)>,
+    /// The pod name, UID and generation of the execution the fence matched,
+    /// which a node-reported address is confirmed against.
+    pod_name: String,
+    pod_uid: Option<PodUid>,
+    generation: i64,
     /// The node the execution row places it on, which
     /// [`RetireStopRoute::Node`] stops through.
     node_name: Option<String>,
@@ -149,18 +182,36 @@ impl KubernetesSubstrate {
     ///
     /// This takes the [`RetireFence::NoExecution`] path in delete mode: only
     /// inactive executions' pods are deleted, no in-VM request is sent, and the
-    /// placement clear re-proves the absence inside the lock execution creation
-    /// also takes. Delete mode keeps the placement clock bump that
-    /// `delete_execution` makes.
+    /// tracking clear re-proves the absence inside the lock execution creation
+    /// also takes. That clear leaves a `stopped` row placed, as every pod
+    /// teardown does, so the node is then released on its own, by
+    /// [`K8sStore::release_stopped_evacuation_placement`]: only for a row
+    /// still `stopped` with the drain's evacuation marker, a durable pinned
+    /// disk artifact and no active execution, still placed on
+    /// `source_node_id`, the node the caller confirmed holds the artifact's
+    /// rootfs. The first release bumps the placement clock, as
+    /// `delete_execution` does; a retry that finds the row already released
+    /// leaves it.
     ///
-    /// `Ok(true)` when the sandbox was torn down (or had nothing left to tear
-    /// down), `Ok(false)` when an active execution appeared and this call
-    /// changed nothing. Reached through
-    /// [`Self::delete_execution_retired_by_current_stop`], `Ok(false)` can
-    /// follow that wrapper's committed retirement of the pre-stop execution.
+    /// `Ok(true)` when the sandbox was torn down and its node released, or a
+    /// retry found both already done. `Ok(false)` leaves the row on its node,
+    /// in two cases:
+    ///
+    /// * An active execution appeared before the teardown, which then deleted
+    ///   nothing.
+    /// * The release refused after the teardown deleted the inactive
+    ///   executions' pods and cleared the tracking: the row no longer
+    ///   qualifies (its marker or its durable disk artifact is gone, an
+    ///   execution appeared, it moved to another node, or it was deleted).
+    ///   The node keeps the rootfs, so nothing is lost.
+    ///
+    /// Reached through [`Self::delete_execution_retired_by_current_stop`],
+    /// `Ok(false)` can also follow that wrapper's committed retirement of the
+    /// pre-stop execution.
     pub async fn delete_execution_with_no_active_execution(
         &self,
         sandbox_id: SandboxId,
+        source_node_id: NodeId,
     ) -> Result<bool, SubstrateError> {
         let outcome = self
             .teardown_execution(
@@ -169,7 +220,12 @@ impl KubernetesSubstrate {
                 &RetireFence::NoExecution,
             )
             .await?;
-        Ok(matches!(outcome, RetireExecutionOutcome::Retired))
+        if !matches!(outcome, RetireExecutionOutcome::Retired) {
+            return Ok(false);
+        }
+        self.store
+            .release_stopped_evacuation_placement(sandbox_id, source_node_id)
+            .await
     }
 
     /// [`Self::delete_execution_with_no_active_execution`] for a `stopped`
@@ -181,13 +237,14 @@ impl KubernetesSubstrate {
     /// holds a live activation attempt on it
     /// ([`K8sStore::retire_executions_predating_current_stop`]). The no-execution
     /// teardown then runs as before: the now-inactive pods are deleted, no
-    /// in-VM request is sent, and the placement clear re-proves the absence. So
-    /// a `start` that lands at any point still keeps its pod, its rootfs and its
-    /// placement; the most it can lose is the pre-stop execution it would have
-    /// replaced anyway.
+    /// in-VM request is sent, and both the tracking clear and the node release
+    /// re-prove the absence. So a `start` that lands at any point still keeps
+    /// its pod, its rootfs and its placement; the most it can lose is the
+    /// pre-stop execution it would have replaced anyway.
     pub async fn delete_execution_retired_by_current_stop(
         &self,
         sandbox_id: SandboxId,
+        source_node_id: NodeId,
     ) -> Result<bool, SubstrateError> {
         if !self
             .store
@@ -196,7 +253,7 @@ impl KubernetesSubstrate {
         {
             return Ok(false);
         }
-        self.delete_execution_with_no_active_execution(sandbox_id)
+        self.delete_execution_with_no_active_execution(sandbox_id, source_node_id)
             .await
     }
 
@@ -293,7 +350,7 @@ impl KubernetesSubstrate {
             return Ok(PodFenceCheck::AlreadyRetired);
         };
         let live_pod = self
-            .read_fenced_pod(&active.lifecycle, active.state, &fence.pod_name, freshness)
+            .read_fenced_pod(&active, &fence.pod_name, freshness)
             .await?;
         // One comparison, over the whole identity. Every earlier bug on this
         // path was a site that compared a different subset of these fields, or
@@ -307,6 +364,10 @@ impl KubernetesSubstrate {
                     sandbox_id,
                     &current_execution_identity(&active, live_pod.as_deref()),
                     observed_uid,
+                    live_pod
+                        .as_deref()
+                        .and_then(SandboxPodView::client_id)
+                        .as_ref(),
                 )
                 .await;
             }
@@ -318,13 +379,112 @@ impl KubernetesSubstrate {
                 ObservedPod::Absent | ObservedPod::Unobserved => None,
             },
             identity: current_execution_identity(&active, live_pod.as_deref()),
-            runtime_pod_ip: fenced_runtime_pod_ip(
-                &active.lifecycle,
-                active.state,
-                live_pod.as_deref(),
-            ),
+            runtime_address: fenced_runtime_pod_ip(&active, live_pod.as_deref()),
+            pod_name: active.pod_name.as_str().to_owned(),
+            pod_uid: active.pod_uid.clone(),
+            generation: active.generation,
             node_name: active.k8s_node_name,
         })))
+    }
+
+    /// The address the fenced teardown stops and deletes the runtime at (see
+    /// [`Self::confirmed_runtime`]).
+    async fn confirmed_fenced_runtime(
+        &self,
+        sandbox_id: SandboxId,
+        fenced: &FencedTeardown,
+        mode: ExecutionTeardown,
+        stop_route: RetireStopRoute,
+    ) -> Result<Option<PodIp>, SubstrateError> {
+        let Some(address) = fenced.runtime_address else {
+            return Ok(None);
+        };
+        let target = PodProxyWaitTarget {
+            pod_name: &fenced.pod_name,
+            pod_uid: fenced.pod_uid.as_ref().map(PodUid::as_str),
+            generation: fenced.generation,
+        };
+        self.confirmed_runtime(
+            sandbox_id,
+            address,
+            &target,
+            fenced.node_name.as_deref(),
+            mode,
+            stop_route,
+        )
+        .await
+    }
+
+    /// The address an unfenced teardown stops and deletes the active
+    /// execution's runtime at (see [`Self::confirmed_runtime`]).
+    async fn confirmed_unfenced_runtime(
+        &self,
+        sandbox_id: SandboxId,
+        mode: ExecutionTeardown,
+        stop_route: RetireStopRoute,
+    ) -> Result<Option<PodIp>, SubstrateError> {
+        let Some(pod) = self.resolve_pod_instance(sandbox_id).await? else {
+            return Ok(None);
+        };
+        let node_name = match pod.source {
+            PodIpSource::Published => None,
+            PodIpSource::NodeReported => self
+                .store
+                .active_execution_status(sandbox_id)
+                .await?
+                .and_then(|active| active.k8s_node_name),
+        };
+        let pod_name = K8sStore::execution_pod_name(sandbox_id, pod.generation);
+        let target = PodProxyWaitTarget {
+            pod_name: &pod_name,
+            pod_uid: pod.pod_uid.as_ref().map(PodUid::as_str),
+            generation: pod.generation,
+        };
+        self.confirmed_runtime(
+            sandbox_id,
+            (pod.ip, pod.source),
+            &target,
+            node_name.as_deref(),
+            mode,
+            stop_route,
+        )
+        .await
+    }
+
+    /// `pod_ip` when the teardown may stop and delete `target`'s runtime
+    /// there: a published address as it is, a node-reported one only once the
+    /// worker the teardown will use confirms the execution (see
+    /// [`Self::runtime_at`]). That is `node_name`'s node-api on the node
+    /// route, and on the execution route the address itself, or the node's
+    /// node-api when a delete cannot reach it.
+    async fn confirmed_runtime(
+        &self,
+        sandbox_id: SandboxId,
+        (pod_ip, source): (PodIp, PodIpSource),
+        target: &PodProxyWaitTarget<'_>,
+        node_name: Option<&str>,
+        mode: ExecutionTeardown,
+        stop_route: RetireStopRoute,
+    ) -> Result<Option<PodIp>, SubstrateError> {
+        if source == PodIpSource::Published {
+            return Ok(Some(pod_ip));
+        }
+        let mut worker = self.teardown_worker(pod_ip, stop_route, node_name).await;
+        if worker.is_err()
+            && mode.sends_sandbox_delete()
+            && stop_route == RetireStopRoute::Execution
+        {
+            worker = self
+                .teardown_worker(pod_ip, RetireStopRoute::Node, node_name)
+                .await;
+        }
+        let (_, mut client) = worker.map_err(|cause| SubstrateError::Failed {
+            message: format!(
+                "{cause} confirming the node-reported address {pod_ip} of sandbox {sandbox_id}; \
+                 keeping execution tracked for retry"
+            ),
+        })?;
+        Self::runtime_at(&mut client, sandbox_id, pod_ip, target).await
     }
 
     /// The pod object the fence decision is made against.
@@ -347,15 +507,14 @@ impl KubernetesSubstrate {
     /// fence.
     async fn read_fenced_pod(
         &self,
-        lifecycle: &str,
-        state: ActiveExecutionState,
+        active: &ActiveExecutionStatusRow,
         pod_name: &PodName,
         freshness: FenceReadFreshness,
     ) -> Result<Option<Arc<SandboxPodView>>, SubstrateError> {
         let cached = self.lookup_sandbox_pod(pod_name.as_str());
         let authorizes_stop = cached
             .as_deref()
-            .is_some_and(|pod| fenced_runtime_pod_ip(lifecycle, state, Some(pod)).is_some());
+            .is_some_and(|pod| fenced_runtime_pod_ip(active, Some(pod)).is_some());
         if cached.is_some() && !authorizes_stop && freshness == FenceReadFreshness::CacheIsEnough {
             return Ok(cached);
         }
@@ -384,10 +543,11 @@ impl KubernetesSubstrate {
         sandbox_id: SandboxId,
         identity: &ExecutionIdentity,
         observed_uid: &str,
+        observed_client: Option<&pplx_space_accounts::ClientId>,
     ) {
         match self
             .store
-            .backfill_missing_pod_uid(sandbox_id, identity, observed_uid)
+            .backfill_missing_pod_uid(sandbox_id, identity, observed_uid, observed_client)
             .await
         {
             Ok(_) => tracing::info!(
@@ -467,12 +627,18 @@ impl KubernetesSubstrate {
         // fence verified. The unfenced path resolves one now: best-effort, and
         // never letting a missing runtime block the teardown. When the tracked
         // pod has nothing to talk to — no IP yet, or `Pending+Unschedulable` —
-        // `resolve_pod_ip` returns `Unavailable`; treat that as "no live
+        // `confirmed_unfenced_runtime` returns `Unavailable`; treat that as "no live
         // runtime" and fall through to the pod-delete loop instead of
         // short-circuiting. Genuine infra faults still propagate.
         let pod_ip = match &fenced {
-            Some(fenced) => fenced.runtime_pod_ip,
-            None => match self.resolve_pod_ip(sandbox_uuid).await {
+            Some(fenced) => {
+                self.confirmed_fenced_runtime(sandbox_id, fenced, mode, stop_route)
+                    .await?
+            }
+            None => match self
+                .confirmed_unfenced_runtime(sandbox_uuid, mode, stop_route)
+                .await
+            {
                 Ok(pod_ip) => pod_ip,
                 Err(err) if delete_can_skip_runtime_cleanup(&err) => {
                     tracing::info!(
@@ -501,7 +667,37 @@ impl KubernetesSubstrate {
             let node_name = fenced
                 .as_ref()
                 .and_then(|fenced| fenced.node_name.as_deref());
-            let worker = self.teardown_worker(pod_ip, stop_route, node_name).await;
+            let mut worker = self.teardown_worker(pod_ip, stop_route, node_name).await;
+            // A delete must reach sbx-mgr to be admitted. The pod's IP reaches
+            // it only through the pod's own network namespace, which a dead VM
+            // can take with it while the node itself answers (a runtime crash,
+            // or a quarantined sandbox an operator then discarded). The node's
+            // node-api, found by the execution's node name, still reaches the
+            // same sbx-mgr, which admits the delete or refuses it as before.
+            if worker.is_err()
+                && mode.sends_sandbox_delete()
+                && stop_route == RetireStopRoute::Execution
+            {
+                // A fenced teardown stays pinned to the node its fence read:
+                // asking what is active now could name a successor. Only an
+                // unfenced delete, which targets whatever execution backs the
+                // sandbox, reads the execution's node here.
+                let execution_node = match (&fenced, node_name) {
+                    (Some(_), node) => node.map(str::to_owned),
+                    (None, _) => self
+                        .store
+                        .active_execution_status(sandbox_id)
+                        .await?
+                        .and_then(|active| active.k8s_node_name),
+                };
+                if let Some(node) = execution_node.as_deref() {
+                    let unreachable = worker.as_ref().err().cloned().unwrap_or_default();
+                    worker = self
+                        .teardown_worker(pod_ip, RetireStopRoute::Node, Some(node))
+                        .await
+                        .map_err(|node_cause| format!("{unreachable}; {node_cause}"));
+                }
+            }
             if let Ok((endpoint_addr, mut client)) = worker {
                 if mode.sends_sandbox_stop() {
                     let stop_result = client
@@ -550,48 +746,77 @@ impl KubernetesSubstrate {
                         }
                     }
                 }
-                if mode.sends_sandbox_delete()
-                    && let Err(error) = client
-                        .delete_sandbox(pplx_space_sbx_mgr_client::proto::DeleteRequest {
+                if mode.sends_sandbox_delete() {
+                    let node_delete_wait = self.budgets.teardown_node_delete_wait;
+                    let node_delete = tokio::time::timeout(
+                        node_delete_wait,
+                        client.delete_sandbox(pplx_space_sbx_mgr_client::proto::DeleteRequest {
                             sandbox_id: sandbox_id.to_string(),
                             template_filter: None,
-                            blocking: true,
-                        })
-                        .await
-                {
-                    match classify_sandbox_delete_rpc_error(&error) {
-                        SandboxDeleteRpcErrorDisposition::DeferTeardown => {
-                            return Err(SubstrateError::SuspendInFlight {
-                                message: format!(
-                                    "sandbox {sandbox_id} node-local delete deferred while suspend publication is pending: {error}"
-                                ),
-                            });
-                        }
-                        SandboxDeleteRpcErrorDisposition::RetainedFilesystemOnlyCopy => {
-                            return Err(SubstrateError::RetainedFilesystemOnlyCopy {
-                                message: format!(
-                                    "sandbox {sandbox_id} node-local delete refused because the retained filesystem may be the only copy: {error}"
-                                ),
-                            });
-                        }
-                        SandboxDeleteRpcErrorDisposition::ContinueTeardown => {
-                            tracing::warn!(
-                                sandbox_id = %sandbox_id,
-                                error = %error,
-                                "best-effort sandbox delete RPC failed during execution teardown"
-                            );
+                            blocking: false,
+                            discard_retained_filesystem_reason: None,
+                        }),
+                    )
+                    .await;
+                    let error = match node_delete {
+                        Ok(Ok(_)) => None,
+                        Ok(Err(error)) => Some(error),
+                        Err(_elapsed) => Some(tonic::Status::deadline_exceeded(
+                            "node-local delete admission did not answer within its wait budget",
+                        )),
+                    };
+                    if let Some(error) = error {
+                        match classify_sandbox_delete_rpc_error(&error) {
+                            SandboxDeleteRpcErrorDisposition::DeferTeardown => {
+                                return Err(SubstrateError::SuspendInFlight {
+                                    message: format!(
+                                        "sandbox {sandbox_id} node-local delete deferred while suspend publication is pending: {error}"
+                                    ),
+                                });
+                            }
+                            SandboxDeleteRpcErrorDisposition::RetainedFilesystemOnlyCopy => {
+                                return Err(SubstrateError::RetainedFilesystemOnlyCopy {
+                                    message: format!(
+                                        "sandbox {sandbox_id} node-local delete refused because the retained filesystem may be the only copy: {error}"
+                                    ),
+                                });
+                            }
+                            SandboxDeleteRpcErrorDisposition::ProbeAdmission => {
+                                // A lost reply does not cancel durable cleanup.
+                                // Conversely, a transport or storage error is
+                                // not evidence that admission ever happened.
+                                if !node_delete_admitted(&mut client, sandbox_id).await {
+                                    return Err(SubstrateError::NodeDeleteNotAdmitted {
+                                        message: format!(
+                                            "sandbox {sandbox_id} node-local delete admission is unconfirmed; keeping execution tracked for retry: {error}"
+                                        ),
+                                    });
+                                }
+                                tracing::debug!(
+                                    sandbox_id = %sandbox_id,
+                                    error = %error,
+                                    "confirmed node-local delete admission after an ambiguous reply"
+                                );
+                            }
                         }
                     }
                 }
-            } else if let Err(cause) = worker
-                && mode.requires_stop_success()
-            {
-                return Err(SubstrateError::Failed {
-                    message: format!(
-                        "{cause} for in-VM stop during execution retire; \
-                         keeping execution tracked for retry"
-                    ),
-                });
+            } else if let Err(cause) = worker {
+                if mode.sends_sandbox_delete() {
+                    return Err(SubstrateError::NodeDeleteNotAdmitted {
+                        message: format!(
+                            "{cause} for node-local delete admission; keeping execution tracked for retry"
+                        ),
+                    });
+                }
+                if mode.requires_stop_success() {
+                    return Err(SubstrateError::Failed {
+                        message: format!(
+                            "{cause} for in-VM stop during execution retire; \
+                             keeping execution tracked for retry"
+                        ),
+                    });
+                }
             }
         }
 
@@ -624,8 +849,13 @@ impl KubernetesSubstrate {
                         })?
             {
                 if let Some(observed_uid) = materialized.uid() {
-                    self.hydrate_materialized_pod_uid(sandbox_id, &fenced.identity, observed_uid)
-                        .await;
+                    self.hydrate_materialized_pod_uid(
+                        sandbox_id,
+                        &fenced.identity,
+                        observed_uid,
+                        materialized.client_id().as_ref(),
+                    )
+                    .await;
                 }
                 return Ok(self.refuse_fenced_teardown(
                     sandbox_id,

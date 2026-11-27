@@ -1,6 +1,6 @@
 //! Per-client concurrency limiter for control-plane-touching API operations.
 //!
-//! Caps how many sandbox *create* and *reconnect* operations a single client
+//! Caps how many sandbox create, fork, reconnect and resume operations a single client
 //! (identified by the `X-Client-ID` header) may have in flight at once. One
 //! misbehaving client — a cron reconnect storm, a runaway create loop — must
 //! not saturate the Kubernetes control-plane API and starve every other client
@@ -88,17 +88,17 @@ use std::time::Duration;
 
 use crate::metrics::sandbox::api::ClientIdTag;
 use crate::metrics::sandbox::api::client_limit::{self, Decision, Operation, Reason};
-use pplx_space_common_core::types::LabelValue;
 use pplx_space_feature_flags::{
-    FeatureFlagClient, SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG,
+    Attributes, FeatureFlagClient, SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG,
     SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG,
 };
+use pplx_space_k8s_ids::LabelValue;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 mod redis_limiter;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use redis_limiter::RedisConcurrencyStore;
 
@@ -108,10 +108,6 @@ const KNOWN_CLIENTS_ENV: &str = "SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS";
 /// The shared counter store, injected from the same `api.redis` secret contract
 /// as the cluster activation limiter (rendered once for the process).
 const REDIS_URL_ENV: &str = "SPACE_REDIS_URL";
-
-/// Both Eppo flags are single cluster-wide config, so every replica evaluates
-/// them against one constant subject — not a per-sandbox or per-org rollout.
-const FLAG_SUBJECT: &str = "space-cluster";
 
 /// Redis key prefix for the per-client concurrency ZSETs. Namespaced (and
 /// versioned) so it never collides with other SPACE keys in a shared Redis and
@@ -465,6 +461,23 @@ fn is_reserved_client_id(id: &str) -> bool {
         .any(|reserved| id.eq_ignore_ascii_case(reserved))
 }
 
+/// The client ids the quotas flag's `overrides` map lists, decoded exactly as
+/// the limiter decodes the flag, so the live cap and the limiter agree on
+/// which override keys are listed while the flag resolves: `None` when the
+/// flag doesn't decode as
+/// [`QuotaOverrides`] (the limiter then applies no override), and otherwise
+/// only the keys that may name a client.
+pub(crate) fn override_ids(value: &serde_json::Value) -> Option<BTreeSet<String>> {
+    let overrides = serde_json::from_value::<QuotaOverrides>(value.clone()).ok()?;
+    Some(
+        overrides
+            .overrides
+            .into_keys()
+            .filter(|id| check_client_id(id).is_ok())
+            .collect(),
+    )
+}
+
 /// Why a key-set entry can't name a client of its own.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RejectedClientId {
@@ -681,6 +694,9 @@ struct Inner {
     /// interned.
     known: KnownClients,
     feature_flags: FeatureFlagClient,
+    /// What both flags are evaluated with besides their constant subject: this
+    /// process's cluster id (see [`crate::limiter_flags`]).
+    flag_attributes: Attributes,
     /// The shared ZSET store. `None` when no usable `SPACE_REDIS_URL` is
     /// configured — the limiter then fails open (`misconfigured`).
     store: Option<RedisConcurrencyStore>,
@@ -705,9 +721,23 @@ impl ClientConcurrencyLimiter {
                 config,
                 known,
                 feature_flags,
+                flag_attributes: crate::limiter_flags::process_attributes(),
                 store,
             }),
         }
+    }
+
+    /// This limiter with its flags evaluated as if this process ran in
+    /// `cluster_id`.
+    #[cfg(test)]
+    pub(crate) fn with_flag_cluster_id(
+        mut self,
+        cluster_id: Option<&pplx_space_cluster_id::ClusterId>,
+    ) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("flag cluster id set before the limiter is shared")
+            .flag_attributes = crate::limiter_flags::attributes(cluster_id);
+        self
     }
 
     pub fn config(&self) -> &ClientConcurrencyConfig {
@@ -721,10 +751,11 @@ impl ClientConcurrencyLimiter {
     /// whose provider is installed and cannot answer falls back to the flag's
     /// declaration, which is on.
     fn limiter_active(&self) -> bool {
-        self.inner.feature_flags.gate_enabled(
+        self.inner.feature_flags.gate_enabled_with_attributes(
             self.inner.config.mode != Mode::Off,
             SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG,
-            FLAG_SUBJECT,
+            crate::limiter_flags::SUBJECT,
+            self.inner.flag_attributes.clone(),
         )
     }
 
@@ -745,10 +776,11 @@ impl ClientConcurrencyLimiter {
         let value = self
             .inner
             .feature_flags
-            .json_override(
+            .json_override_with_attributes(
                 self.inner.config.mode != Mode::Off,
                 SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG,
-                FLAG_SUBJECT,
+                crate::limiter_flags::SUBJECT,
+                self.inner.flag_attributes.clone(),
             )
             .resolved()?;
         match serde_json::from_value::<QuotaOverrides>(value) {

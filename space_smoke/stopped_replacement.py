@@ -66,7 +66,7 @@ STOPPED_REPLACEMENT_ENV_KEYS: tuple[str, ...] = (
 )
 _FLAG_VALUES = frozenset({"true", "false"})
 
-# `crates/libs/common/core/src/k8s.rs`.
+# `crates/l40_api/sandbox/pod/src/lib.rs`.
 CHECKPOINT_ANNOTATION = "space.pplx.net/checkpoint"
 STOPPED_MATERIALIZATION_CHECKPOINT = "stopped-materialization"
 STOPPED_MATERIALIZATION_ARTIFACT_ID_ANNOTATION = (
@@ -545,9 +545,9 @@ class StoppedReplacementAssertions:
 
     # --- the emptied node ---------------------------------------------------------
 
-    def expect_drained_and_held(self) -> None:
+    def expect_drained_node_present(self) -> None:
         self._read()
-        self.drain.expect_drained_and_held()
+        self.drain.expect_drained_node_present()
         self._read()
 
     def undrain(self) -> None:

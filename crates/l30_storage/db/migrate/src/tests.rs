@@ -18,6 +18,90 @@ static ALL_MIGRATORS: &[(&str, &Migrator)] = &[
 ];
 
 #[tokio::test]
+async fn suspend_attempt_rollback_preserves_ownership_and_migration_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sandbox.sqlite");
+    let database = SqliteDatabase::from(pplx_space_sbx_mgr_store::db::migration::target());
+    migrate_sqlite_up(database, &path).await.unwrap();
+    // Step back past every newer migration first, the legacy_state restore
+    // and re-drop among them: the property is about suspend_attempt's own
+    // down, not whichever migration happens to be newest.
+    let newer = pplx_space_sbx_mgr_store::db::migration::target()
+        .service
+        .iter()
+        .filter(|migration| {
+            migration.migration_type.is_up_migration() && migration.version > 20261112160000
+        })
+        .count();
+    for _ in 0..newer {
+        rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+            .await
+            .unwrap();
+    }
+    let newest: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT MAX(version) FROM _sqlx_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(newest, 20261112160000, "suspend_attempt is the newest");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO sandboxes (id, uuid8, state, template, created_at, updated_at,
+             suspend_attempt_artifact_id, suspend_attempt_started_at)
+         VALUES ('sandbox', 'sandbox', 'suspending', 'template', '1', '1', 'attempt', 1)",
+        [],
+    )
+    .unwrap();
+    let history = || {
+        conn.query_row(
+            "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 20261112160000",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(history(), 1);
+    assert!(
+        rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+            .await
+            .is_err()
+    );
+    assert_eq!(history(), 1, "refused rollback must retain applied history");
+    assert_eq!(
+        conn.query_row(
+            "SELECT suspend_attempt_artifact_id FROM sandboxes WHERE id = 'sandbox'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        "attempt"
+    );
+
+    conn.execute(
+        "UPDATE sandboxes SET state = 'paused' WHERE id = 'sandbox'",
+        [],
+    )
+    .unwrap();
+    rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+        .await
+        .unwrap();
+    assert_eq!(history(), 0);
+    migrate_sqlite_up(database, &path).await.unwrap();
+    assert_eq!(history(), 1);
+    assert_eq!(
+        conn.query_row(
+            "SELECT suspend_attempt_artifact_id FROM sandboxes WHERE id = 'sandbox'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap(),
+        None,
+        "re-upgrade must not invent an admission identity"
+    );
+}
+
+#[tokio::test]
 async fn sandbox_baseline_refuses_down_without_changing_shared_jobs_or_history() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("sandbox.sqlite");
@@ -148,6 +232,662 @@ async fn capture_time_marker_round_trips_and_reupgrades_as_not_comparable() {
         0,
         "a row from before the downgrade isn't comparable"
     );
+}
+
+/// The four runtime-upgrade migrations: the attempt id, the attempt outcomes,
+/// the attempt identity and abandoned operations.
+const RUNTIME_UPGRADE_MIGRATIONS: [i64; 4] = [
+    20261114030001,
+    20261114030002,
+    ATTEMPT_IDENTITY_MIGRATION,
+    20261120230000,
+];
+/// Another change's migration that sorts between them: the node's activation
+/// seal.
+const ACTIVATION_SEAL_MIGRATION: i64 = 20261117234108;
+/// The runtime-upgrade migrations with the one that sorts between them, in
+/// order: a database at the earlier head takes these as its next five, and a
+/// `down` reverts them newest first.
+const RUNTIME_UPGRADE_SPAN: [i64; 5] = [
+    RUNTIME_UPGRADE_MIGRATIONS[0],
+    RUNTIME_UPGRADE_MIGRATIONS[1],
+    ACTIVATION_SEAL_MIGRATION,
+    RUNTIME_UPGRADE_MIGRATIONS[2],
+    RUNTIME_UPGRADE_MIGRATIONS[3],
+];
+/// The newest sandbox-manager migration that shipped before them.
+const BEFORE_RUNTIME_UPGRADE_MIGRATIONS: i64 = 20261114020000;
+/// The tables 20261114030001 adds `attempt_id` to.
+const ATTEMPT_ID_TABLES: [&str; 2] = [
+    "sandbox_runtime_upgrades",
+    "sandbox_runtime_upgrade_outcomes",
+];
+
+/// Whether `table` exists in the SQLite database at `path`.
+fn table_exists(path: &Path, table: &str) -> bool {
+    Connection::open(path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+        == 1
+}
+
+/// The `ATTEMPT_ID_TABLES` that have an `attempt_id` column.
+fn tables_with_attempt_id(path: &Path) -> usize {
+    let conn = Connection::open(path).unwrap();
+    ATTEMPT_ID_TABLES
+        .iter()
+        .filter(|table| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_xinfo(?1) WHERE name = 'attempt_id'",
+                [table],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+                == 1
+        })
+        .count()
+}
+
+/// The runtime-upgrade migrations come after every migration that shipped
+/// before them, next to each other but for the activation seal, so a database
+/// at that earlier head takes them and the seal as its next five
+/// ([`RUNTIME_UPGRADE_SPAN`]) and a `down` reverts them, newest first, before
+/// it reaches any earlier migration. Up, down and up again round-trip; newer
+/// migrations are rolled back first. The attempt-outcome table has no foreign
+/// key to `sandboxes`, and the downs drop that table and both `attempt_id`
+/// columns.
+#[tokio::test]
+async fn runtime_upgrade_migrations_follow_their_predecessors_and_round_trip() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sandbox.sqlite");
+    let database = SqliteDatabase::from(pplx_space_sbx_mgr_store::db::migration::target());
+    let migrator = pplx_space_sbx_mgr_store::db::migration::target().service;
+    let bundled: Vec<i64> = migrator
+        .iter()
+        .filter(|migration| migration.migration_type.is_up_migration())
+        .map(|migration| migration.version)
+        .collect();
+    assert!(RUNTIME_UPGRADE_MIGRATIONS[0] > BEFORE_RUNTIME_UPGRADE_MIGRATIONS);
+    assert!(bundled.contains(&BEFORE_RUNTIME_UPGRADE_MIGRATIONS));
+    let first = bundled
+        .iter()
+        .position(|version| *version == RUNTIME_UPGRADE_MIGRATIONS[0])
+        .unwrap();
+    assert_eq!(
+        bundled[first..first + RUNTIME_UPGRADE_SPAN.len()],
+        RUNTIME_UPGRADE_SPAN,
+        "the runtime-upgrade migrations and the seal are adjacent, in order"
+    );
+    let earlier = bundled[..first].to_vec();
+    assert_eq!(
+        earlier.last(),
+        Some(&BEFORE_RUNTIME_UPGRADE_MIGRATIONS),
+        "nothing sits between the newest earlier migration and them"
+    );
+    let newer = bundled.len() - first - RUNTIME_UPGRADE_SPAN.len();
+    let applied = || async {
+        let pool = sqlite_pool(&path).await.unwrap();
+        applied_versions_sqlite(&pool, migrator).await.unwrap()
+    };
+    let rollback = || async {
+        rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+            .await
+            .unwrap();
+    };
+
+    // The attempt outcomes' foreign keys, of any target.
+    let outcome_foreign_keys = || {
+        Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list(
+                     'sandbox_runtime_upgrade_attempt_outcomes'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+
+    migrate_sqlite_up(database, &path).await.unwrap();
+    for round in 0..2 {
+        for _ in 0..newer {
+            rollback().await;
+        }
+        assert!(
+            table_exists(&path, "sandbox_runtime_upgrade_attempt_outcomes"),
+            "round {round}: the attempt-outcome table exists"
+        );
+        assert_eq!(
+            outcome_foreign_keys(),
+            0,
+            "round {round}: the attempt outcomes don't reference `sandboxes`"
+        );
+        assert_eq!(
+            tables_with_attempt_id(&path),
+            ATTEMPT_ID_TABLES.len(),
+            "round {round}: both tables have `attempt_id`"
+        );
+        for reverted in RUNTIME_UPGRADE_SPAN.iter().rev() {
+            rollback().await;
+            assert!(
+                !applied().await.contains(reverted),
+                "round {round}: the down that follows is {reverted}'s"
+            );
+        }
+        assert_eq!(
+            applied().await,
+            earlier,
+            "round {round}: only the runtime-upgrade migrations and the seal were reverted"
+        );
+        let conn = Connection::open(&path).unwrap();
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (
+                     'sandbox_runtime_upgrade_attempt_outcomes',
+                     'sandbox_runtime_upgrade_abandoned'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0, "round {round}: their tables are gone");
+        assert_eq!(
+            tables_with_attempt_id(&path),
+            0,
+            "round {round}: both `attempt_id` columns are gone"
+        );
+        let unowned_state: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_xinfo('sandboxes') WHERE name = 'unowned_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unowned_state, 1, "round {round}: the earlier schema stays");
+        migrate_sqlite_up(database, &path).await.unwrap();
+        assert_eq!(applied().await, bundled, "round {round}: up again");
+    }
+}
+
+/// The release before this one, which predates the abandoned-operations
+/// migration, starts on a database that holds it: an image-only rollback
+/// leaves the migration applied and every abandonment in place. That release
+/// never reads them, so a late call for an abandoned operation can stage,
+/// fence and boot under it; rolling forward applies nothing new, and the
+/// recorded abandonments refuse late calls again.
+#[tokio::test]
+async fn an_image_rollback_past_the_abandoned_migration_keeps_every_abandonment() {
+    static OLDER: std::sync::LazyLock<Migrator> = std::sync::LazyLock::new(|| {
+        Migrator::with_migrations(
+            pplx_space_sbx_mgr_store::db::migration::target()
+                .service
+                .migrations
+                .iter()
+                .filter(|migration| migration.version != RUNTIME_UPGRADE_MIGRATIONS[3])
+                .cloned()
+                .collect(),
+        )
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sandbox.sqlite");
+    let current = SqliteDatabase::from(pplx_space_sbx_mgr_store::db::migration::target());
+    let older = SqliteDatabase {
+        migrator: &OLDER,
+        ..current
+    };
+    // A database the older release created takes this release's migration,
+    // and this release records an abandonment.
+    migrate_sqlite_up(older, &path).await.unwrap();
+    migrate_sqlite_up(current, &path).await.unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO sandbox_runtime_upgrade_abandoned
+             (operation_id, sandbox_id, recorded_at)
+         VALUES ('op', 'sandbox', '0')",
+        [],
+    )
+    .unwrap();
+    let kept = |conn: &Connection| -> (bool, i64) {
+        let applied = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ?1 AND success",
+                [RUNTIME_UPGRADE_MIGRATIONS[3]],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let abandoned = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sandbox_runtime_upgrade_abandoned
+                  WHERE operation_id = 'op' AND sandbox_id = 'sandbox'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        (applied == 1, abandoned)
+    };
+
+    // The image rollback.
+    migrate_sqlite_up(older, &path).await.unwrap();
+    assert_eq!(
+        kept(&conn),
+        (true, 1),
+        "the older release keeps the abandonment"
+    );
+
+    // Rolling forward again.
+    migrate_sqlite_up(current, &path).await.unwrap();
+    assert_eq!(kept(&conn), (true, 1), "the roll-forward finds it recorded");
+}
+
+/// Each runtime-upgrade down refuses while a row it guards is recorded (an
+/// attempt outcome it would drop, or a per-operation outcome an older release
+/// can't parse), leaves its migration applied and its schema in place, and
+/// goes through once the row is gone. The `rolled_back` and
+/// `already_on_target` outcomes, which an older release parses, don't hold
+/// back the attempt id's down. The attempt-outcome table keeps one row per
+/// operation and attempt id, every row names an attempt, and `recorded_seq`
+/// isn't reused after the newest row is deleted.
+#[tokio::test]
+async fn runtime_upgrade_downs_refuse_while_a_row_an_older_release_misreads_is_recorded() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sandbox.sqlite");
+    let database = SqliteDatabase::from(pplx_space_sbx_mgr_store::db::migration::target());
+    let migrator = pplx_space_sbx_mgr_store::db::migration::target().service;
+    let newer = migrator
+        .iter()
+        .filter(|migration| {
+            migration.migration_type.is_up_migration()
+                && migration.version > RUNTIME_UPGRADE_MIGRATIONS[3]
+        })
+        .count();
+    let applied = || async {
+        let pool = sqlite_pool(&path).await.unwrap();
+        applied_versions_sqlite(&pool, migrator).await.unwrap()
+    };
+    // The guards count rows, so seed them without a sandbox row behind them.
+    let execute = |sql: &str| {
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute(sql, []).unwrap();
+    };
+
+    let attempt_outcome = |operation: &str, attempt: &str| {
+        format!(
+            "INSERT INTO sandbox_runtime_upgrade_attempt_outcomes
+                 (operation_id, attempt_id, sandbox_id, outcome, failure, recorded_at)
+             VALUES ('{operation}', {attempt}, 'sandbox', 'rolled_back', NULL, '0')"
+        )
+    };
+    let operation_outcome = |operation: &str, outcome: &str| {
+        format!(
+            "INSERT INTO sandbox_runtime_upgrade_outcomes
+                 (operation_id, sandbox_id, outcome, target_environment, target_state,
+                  authorization_id, failure, recorded_at, attempt_id)
+             VALUES ('{operation}', 'sandbox', '{outcome}', 'env', 'started', 'auth', NULL,
+                     '0', 'attempt-a')"
+        )
+    };
+
+    migrate_sqlite_up(database, &path).await.unwrap();
+    for _ in 0..newer {
+        rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+            .await
+            .unwrap();
+    }
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(&attempt_outcome("op", "'attempt-a'"), [])
+        .unwrap();
+    let duplicate = conn
+        .execute(&attempt_outcome("op", "'attempt-a'"), [])
+        .unwrap_err();
+    assert!(
+        duplicate.to_string().contains("UNIQUE constraint failed"),
+        "one outcome per operation and attempt id: {duplicate}"
+    );
+    conn.execute(&attempt_outcome("op", "'attempt-b'"), [])
+        .unwrap();
+    let unnamed = conn
+        .execute(&attempt_outcome("op", "NULL"), [])
+        .unwrap_err();
+    assert!(
+        unnamed.to_string().contains("NOT NULL constraint failed"),
+        "every attempt outcome names an attempt: {unnamed}"
+    );
+    let newest = || -> i64 {
+        conn.query_row(
+            "SELECT MAX(recorded_seq) FROM sandbox_runtime_upgrade_attempt_outcomes",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    let deleted = newest();
+    conn.execute("DELETE FROM sandbox_runtime_upgrade_attempt_outcomes", [])
+        .unwrap();
+    conn.execute(&attempt_outcome("op", "'attempt-c'"), [])
+        .unwrap();
+    assert!(
+        newest() > deleted,
+        "a deleted row's `recorded_seq` isn't reused, so it still orders by recording"
+    );
+    conn.execute("DELETE FROM sandbox_runtime_upgrade_attempt_outcomes", [])
+        .unwrap();
+    drop(conn);
+
+    // Newest first: each down's guarded rows, each tried alone and then
+    // cleared.
+    let guarded = [
+        (
+            RUNTIME_UPGRADE_MIGRATIONS[3],
+            vec![
+                "INSERT INTO sandbox_runtime_upgrade_abandoned
+                 (operation_id, sandbox_id, recorded_at)
+             VALUES ('op', 'sandbox', '0')"
+                    .to_string(),
+            ],
+            "DELETE FROM sandbox_runtime_upgrade_abandoned",
+        ),
+        // The attempt identity's guard has its own test below; here it only
+        // has to go through, over a table with no rows.
+        (RUNTIME_UPGRADE_MIGRATIONS[2], vec![], ""),
+        // The seal, which sorts between them, guards none of their rows.
+        (ACTIVATION_SEAL_MIGRATION, vec![], ""),
+        (
+            RUNTIME_UPGRADE_MIGRATIONS[1],
+            vec![attempt_outcome("op", "'attempt-a'")],
+            "DELETE FROM sandbox_runtime_upgrade_attempt_outcomes",
+        ),
+        (
+            RUNTIME_UPGRADE_MIGRATIONS[0],
+            vec![
+                operation_outcome("refused-op", "refused"),
+                operation_outcome("unknown-op", "activation_refused"),
+            ],
+            "DELETE FROM sandbox_runtime_upgrade_outcomes
+              WHERE outcome NOT IN ('rolled_back', 'already_on_target')",
+        ),
+    ];
+    // An older release reads these outcomes, so they stay through the
+    // attempt id's down.
+    let parsed = ["rolled_back", "already_on_target"];
+    for outcome in parsed {
+        execute(&operation_outcome(&format!("{outcome}-op"), outcome));
+    }
+    for (version, inserts, clear) in guarded {
+        for insert in &inserts {
+            execute(insert);
+            let refused = rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{refused:?}").contains("CHECK constraint failed"),
+                "{version}: {refused:?}"
+            );
+            assert!(
+                applied().await.contains(&version),
+                "{version} stays applied while its guarded row is recorded"
+            );
+            if version == RUNTIME_UPGRADE_MIGRATIONS[1] {
+                assert!(
+                    table_exists(&path, "sandbox_runtime_upgrade_attempt_outcomes"),
+                    "{version}: the refused down keeps the attempt-outcome table"
+                );
+            }
+            assert_eq!(
+                tables_with_attempt_id(&path),
+                ATTEMPT_ID_TABLES.len(),
+                "{version}: the refused down keeps both `attempt_id` columns"
+            );
+            execute(clear);
+        }
+        rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+            .await
+            .unwrap();
+        assert!(!applied().await.contains(&version), "{version} reverted");
+    }
+    let kept: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM sandbox_runtime_upgrade_outcomes
+              WHERE outcome IN ('rolled_back', 'already_on_target')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        kept,
+        parsed.len() as i64,
+        "the outcomes an older release parses are kept"
+    );
+}
+
+/// Records the request with each final attempt outcome.
+const ATTEMPT_IDENTITY_MIGRATION: i64 = 20261120180000;
+
+/// The attempt-identity down refuses while a final attempt outcome (one that
+/// records its request) is recorded, since a release without the columns
+/// would take it as final for no attempt and run a retry its caller gave up.
+/// It leaves its migration and columns in place, and goes through over rows
+/// that don't record their request, which it keeps.
+#[tokio::test]
+async fn attempt_identity_down_refuses_while_a_final_attempt_outcome_is_recorded() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sandbox.sqlite");
+    let database = SqliteDatabase::from(pplx_space_sbx_mgr_store::db::migration::target());
+    let migrator = pplx_space_sbx_mgr_store::db::migration::target().service;
+    let newer = migrator
+        .iter()
+        .filter(|migration| {
+            migration.migration_type.is_up_migration()
+                && migration.version > ATTEMPT_IDENTITY_MIGRATION
+        })
+        .count();
+    let applied = || async {
+        let pool = sqlite_pool(&path).await.unwrap();
+        applied_versions_sqlite(&pool, migrator).await.unwrap()
+    };
+    let execute = |sql: &str| {
+        Connection::open(&path).unwrap().execute(sql, []).unwrap();
+    };
+    let identity_columns = || -> i64 {
+        Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_xinfo('sandbox_runtime_upgrade_attempt_outcomes')
+                  WHERE name IN ('target_environment', 'target_state', 'authorization_id')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+
+    migrate_sqlite_up(database, &path).await.unwrap();
+    for _ in 0..newer {
+        rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+            .await
+            .unwrap();
+    }
+    assert_eq!(identity_columns(), 3);
+    execute(
+        "INSERT INTO sandbox_runtime_upgrade_attempt_outcomes
+             (operation_id, attempt_id, sandbox_id, outcome, failure, recorded_at)
+         VALUES ('legacy-op', 'attempt-a', 'sandbox', 'rolled_back', NULL, '0')",
+    );
+    execute(
+        "INSERT INTO sandbox_runtime_upgrade_attempt_outcomes
+             (operation_id, attempt_id, sandbox_id, outcome, failure, recorded_at,
+              target_environment, target_state, authorization_id)
+         VALUES ('final-op', 'attempt-a', 'sandbox', 'rolled_back', NULL, '0',
+                 'env', 'started', 'auth')",
+    );
+
+    let refused = rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{refused:?}").contains("CHECK constraint failed"),
+        "{refused:?}"
+    );
+    assert!(applied().await.contains(&ATTEMPT_IDENTITY_MIGRATION));
+    assert_eq!(identity_columns(), 3, "the refused down keeps the columns");
+
+    execute(
+        "DELETE FROM sandbox_runtime_upgrade_attempt_outcomes
+          WHERE target_environment IS NOT NULL",
+    );
+    rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+        .await
+        .unwrap();
+    assert!(!applied().await.contains(&ATTEMPT_IDENTITY_MIGRATION));
+    assert_eq!(identity_columns(), 0);
+    let legacy: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM sandbox_runtime_upgrade_attempt_outcomes",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy, 1, "the row without a request is kept");
+    migrate_sqlite_up(database, &path).await.unwrap();
+    assert_eq!(identity_columns(), 3, "up again");
+}
+
+const DIRTY_REF_REVISIONS: i64 = 20261031050126;
+
+/// db/README.md has operators roll template-manager back past the dirty-ref
+/// revision migration with `space-db-migrator template-manager down`. That
+/// drops the revision column, its counter and the triggers that stamp it,
+/// keeps every queued outbox row, and `up` applies it again.
+#[tokio::test]
+async fn dirty_ref_revisions_down_keeps_outbox_rows_and_reapplies() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("template-manager.sqlite");
+    let database = sqlite_template_manager();
+    let recorded = |conn: &Connection| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ?1",
+            [DIRTY_REF_REVISIONS],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    let revision_objects = |conn: &Connection| -> Vec<String> {
+        let mut statement = conn
+            .prepare(
+                "SELECT name FROM pragma_table_info('node_dirty_refs') WHERE name = 'revision'
+                 UNION ALL
+                 SELECT name FROM sqlite_schema
+                 WHERE name IN ('node_dirty_ref_revision', 'node_dirty_refs_insert_revision',
+                                'node_dirty_refs_update_revision')
+                 ORDER BY name",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    let outbox = |conn: &Connection| -> Vec<(i64, String, String, String, String)> {
+        let mut statement = conn
+            .prepare(
+                "SELECT facet, element_kind, element_value, requested_at, updated_at
+                 FROM node_dirty_refs ORDER BY facet, element_kind, element_value",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    let all_revision_objects = vec![
+        "node_dirty_ref_revision".to_owned(),
+        "node_dirty_refs_insert_revision".to_owned(),
+        "node_dirty_refs_update_revision".to_owned(),
+        "revision".to_owned(),
+    ];
+
+    migrate_sqlite_up(database, &path).await.unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "INSERT INTO node_dirty_refs (facet, element_kind, element_value, requested_at, updated_at)
+         VALUES (1, 'template', 'a', '1', '1'), (2, 'pool', 'b', '2', '3');
+         UPDATE node_dirty_refs SET requested_at = '4', updated_at = '4' WHERE facet = 1;",
+    )
+    .unwrap();
+    let rows = outbox(&conn);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(recorded(&conn), 1);
+    assert_eq!(revision_objects(&conn), all_revision_objects);
+
+    // Revert any newer migration in either catalog first, as the README's
+    // procedure does, so the next `down` reaches the dirty-ref migration.
+    let newer = [&TEMPLATE_MANAGER_MIGRATOR, &COMMON_SCHEMA_MIGRATOR]
+        .into_iter()
+        .flat_map(|migrator| migrator.iter())
+        .filter(|migration| {
+            migration.migration_type.is_up_migration() && migration.version > DIRTY_REF_REVISIONS
+        })
+        .count();
+    for _ in 0..newer {
+        rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+            .await
+            .unwrap();
+    }
+    rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+        .await
+        .unwrap();
+    assert_eq!(recorded(&conn), 0);
+    assert_eq!(revision_objects(&conn), Vec::<String>::new());
+    assert_eq!(outbox(&conn), rows, "the down keeps every outbox row");
+
+    migrate_sqlite_up(database, &path).await.unwrap();
+    assert_eq!(recorded(&conn), 1);
+    assert_eq!(revision_objects(&conn), all_revision_objects);
+    assert_eq!(outbox(&conn), rows);
+}
+
+/// Some earlier template-manager releases don't bundle these migrations but
+/// reverse them at startup, and only when the recorded checksum is the one
+/// pinned here, so rolling back to them stays image-only. Change the schema
+/// with a new migration, never by editing one of these. See db/README.md.
+#[test]
+fn template_manager_migrations_keep_the_checksums_releases_reverse() {
+    let pins = [
+        (
+            20261026220935,
+            "bb39d295eee07bfc5ff54e6d2f076efb42a50b43d7cedffd8907e9cbf73e7e9b2837295cb1131306798e1c3a4bf4b820",
+        ),
+        (
+            DIRTY_REF_REVISIONS,
+            "c92d51875e4001e0346e759fcf75c45b1f3929e9c5b719eda3a32d6af21651fdb37559a1deea96f86c262efe8c6264dd",
+        ),
+    ];
+    for (version, checksum) in pins {
+        let up = TEMPLATE_MANAGER_MIGRATOR
+            .iter()
+            .find(|migration| {
+                migration.version == version && migration.migration_type.is_up_migration()
+            })
+            .unwrap_or_else(|| panic!("template-manager doesn't bundle {version}"));
+        assert_eq!(hex::encode(up.checksum.as_ref()), checksum, "{version}");
+    }
 }
 
 #[test]

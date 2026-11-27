@@ -11,8 +11,10 @@ clusterId: kind-local
 telemetry: {}
 node: {}
 
-# The agent drains for the shared 25 s lifecycle default, then releases its
-# service mutex (crates/l40_api/credmgr/server/src/run.rs,
+# On SIGTERM the agent closes its sockets and releases its service mutex, so
+# the successor takes over at once, then drains the RPCs it had accepted for
+# up to the shared 25 s lifecycle default
+# (crates/l40_api/credmgr/server/src/run.rs,
 # crates/l10_foundation/service/lifecycle/src/lib.rs).
 terminationGracePeriodSeconds: 60
 

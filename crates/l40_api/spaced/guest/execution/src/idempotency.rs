@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::{IdempotencyKey, ProcessId};
+use pplx_space_guest_process::{IdempotencyKey, ProcessId};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};

@@ -1,5 +1,6 @@
-use pplx_space_common_core::types::{BuildRunId, NodeId};
-use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_accounts::NodeId;
+use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_template_model::BuildRunId;
 
 use super::*;
 use crate::public_template_operations::tests::{
@@ -7,6 +8,7 @@ use crate::public_template_operations::tests::{
 };
 use pplx_space_cluster_pool::{PoolConfigOwner, PoolSlotState};
 use pplx_space_db_test_fixtures::pg_test_db;
+use pplx_space_sql_locator::sql;
 
 use pplx_space_test_env::TestResult;
 
@@ -61,36 +63,6 @@ async fn insert_node(pool: &sqlx::PgPool, node_id: NodeId, role: &str) -> TestRe
     ))
     .bind(node_id)
     .bind(role)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-struct InventoryInput<'a> {
-    node_id: NodeId,
-    template: &'a TemplateName,
-    content_hash: &'a str,
-    pool_target: Option<i32>,
-    pool_current: i32,
-    pool_pending: i32,
-    sandbox_ids: &'a [String],
-}
-
-async fn insert_inventory(pool: &sqlx::PgPool, input: InventoryInput<'_>) -> TestResult {
-    sqlx::query(sql!(
-        "INSERT INTO node_template_inventory (
-             node_id, template_name, content_hash, runtime,
-             pool_target, pool_current, pool_pending, pool_sandbox_ids
-         )
-         VALUES ($1, $2, $3, 'fc', $4, $5, $6, $7)"
-    ))
-    .bind(input.node_id)
-    .bind(input.template.as_str())
-    .bind(input.content_hash)
-    .bind(input.pool_target)
-    .bind(input.pool_current)
-    .bind(input.pool_pending)
-    .bind(serde_json::json!(input.sandbox_ids))
     .execute(pool)
     .await?;
     Ok(())
@@ -162,7 +134,7 @@ async fn template_rows_include_observed_base_snapshot_inventory() -> TestResult 
     .execute(&db.pool)
     .await?;
 
-    let templates = fetch_template_rows(&db.pool, None).await?;
+    let templates = pplx_space_template_store::templates::list_admin(&db.pool, None).await?;
     let response = templates
         .into_iter()
         .map(template_response)
@@ -200,7 +172,7 @@ async fn named_release_tag_moves_existing_release_into_warm_retention() -> TestR
         display_name: actor_display_name,
         org_id: OrgId::from_uuid(managing_org_id),
         role: crate::user_role::UserRole::OrganizationAdmin,
-        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        owner_source: pplx_space_accounts::SandboxOwnerSource::Local,
         created_at: time::OffsetDateTime::UNIX_EPOCH,
         updated_at: time::OffsetDateTime::UNIX_EPOCH,
     };
@@ -541,82 +513,6 @@ fn scratch_template_build_request_rejects_malformed_guest_kernel() {
     }
 }
 
-#[tokio::test]
-async fn template_pool_observed_does_not_multiply_counts_by_sandbox_ids() -> TestResult {
-    let db = pg_test_db().await?;
-    let template = TemplateName::parse("seed")?;
-    insert_template(&db.pool, &template).await?;
-
-    let builder_id = NodeId::new();
-    insert_node(&db.pool, builder_id, "builder").await?;
-    insert_inventory(
-        &db.pool,
-        InventoryInput {
-            node_id: builder_id,
-            template: &template,
-            content_hash: "sha256:current",
-            pool_target: None,
-            pool_current: 0,
-            pool_pending: 0,
-            sandbox_ids: &[],
-        },
-    )
-    .await?;
-
-    let worker_id = NodeId::new();
-    insert_node(&db.pool, worker_id, "worker").await?;
-    let sandbox_ids = (0..15)
-        .map(|index| format!("sandbox-{index}"))
-        .collect::<Vec<_>>();
-    insert_inventory(
-        &db.pool,
-        InventoryInput {
-            node_id: worker_id,
-            template: &template,
-            content_hash: "sha256:current",
-            pool_target: Some(15),
-            pool_current: 15,
-            pool_pending: 0,
-            sandbox_ids: &sandbox_ids,
-        },
-    )
-    .await?;
-
-    let stale_worker_id = NodeId::new();
-    insert_node(&db.pool, stale_worker_id, "worker").await?;
-    insert_inventory(
-        &db.pool,
-        InventoryInput {
-            node_id: stale_worker_id,
-            template: &template,
-            content_hash: "sha256:old",
-            pool_target: Some(100),
-            pool_current: 100,
-            pool_pending: 0,
-            sandbox_ids: &["stale-sandbox".to_string()],
-        },
-    )
-    .await?;
-
-    let observed = fetch_template_pool_observed(&db.pool, &template)
-        .await?
-        .expect("pool should be observed");
-
-    assert_eq!(observed.pool_target, Some(15));
-    assert_eq!(observed.pool_current, 15);
-    assert_eq!(observed.pool_pending, 0);
-    assert_eq!(observed.pool_sandbox_ids.0.len(), 15);
-    assert!(
-        !observed
-            .pool_sandbox_ids
-            .0
-            .iter()
-            .any(|id| id == "stale-sandbox")
-    );
-
-    Ok(())
-}
-
 /// The template surface's envelope must not contradict the disposition it
 /// carries, and its wrappers must forward the scope.
 ///
@@ -792,7 +688,7 @@ async fn a_fieldless_template_update_reaches_the_fanout_without_writing()
         display_name: "fieldless update probe".to_string(),
         org_id: OrgId::from_uuid(SEED_ORG_ID),
         role: crate::user_role::UserRole::OrganizationAdmin,
-        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        owner_source: pplx_space_accounts::SandboxOwnerSource::Local,
         created_at: OffsetDateTime::now_utc(),
         updated_at: OffsetDateTime::now_utc(),
     };
@@ -959,7 +855,7 @@ async fn a_contended_base_snapshot_reconcile_read_is_retryable()
         display_name: "reconcile read probe".to_string(),
         org_id: OrgId::from_uuid(SEED_ORG_ID),
         role: crate::user_role::UserRole::OrganizationAdmin,
-        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        owner_source: pplx_space_accounts::SandboxOwnerSource::Local,
         created_at: OffsetDateTime::now_utc(),
         updated_at: OffsetDateTime::now_utc(),
     };
@@ -1053,7 +949,7 @@ async fn a_delete_after_a_failed_delete_operation_starts_a_replacement()
         display_name: "failed delete retry probe".to_string(),
         org_id: OrgId::from_uuid(SEED_ORG_ID),
         role: crate::user_role::UserRole::OrganizationAdmin,
-        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        owner_source: pplx_space_accounts::SandboxOwnerSource::Local,
         created_at: OffsetDateTime::now_utc(),
         updated_at: OffsetDateTime::now_utc(),
     };
@@ -1489,7 +1385,7 @@ fn template_admin() -> User {
         display_name: "template admin".to_string(),
         org_id: OrgId::from_uuid(SEED_ORG_ID),
         role: crate::user_role::UserRole::OrganizationAdmin,
-        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        owner_source: pplx_space_accounts::SandboxOwnerSource::Local,
         created_at: OffsetDateTime::now_utc(),
         updated_at: OffsetDateTime::now_utc(),
     }
@@ -1717,7 +1613,7 @@ async fn template_builds_list_reports_each_jobs_builder_status() -> TestResult {
         display_name: "Builds test".into(),
         org_id: managing_org_id,
         role: crate::user_role::UserRole::OrganizationAdmin,
-        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        owner_source: pplx_space_accounts::SandboxOwnerSource::Local,
         created_at: time::OffsetDateTime::UNIX_EPOCH,
         updated_at: time::OffsetDateTime::UNIX_EPOCH,
     };
@@ -1904,4 +1800,514 @@ async fn template_builds_list_reports_each_jobs_builder_status() -> TestResult {
     let (status, _) = read(list(&missing, None).await.into_response()).await?;
     assert_eq!(status, StatusCode::NOT_FOUND);
     Ok(())
+}
+
+/// Twins exist only once `idx_template_releases_template_name_hash_unique`
+/// is dropped, which the test does to stand in for the contract migration.
+/// An admin can't tag a twin (tags resolve to the original) or delete an
+/// original that has twins (a twin would become the original); deleting the
+/// twin, then the original, works.
+#[tokio::test]
+async fn admin_tags_and_deletes_keep_the_original_release() -> TestResult {
+    let db = pg_test_db().await?;
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let actor = sqlx::query_as::<_, User>(sql!(
+        "SELECT u.*
+         FROM users u
+         JOIN clusters c ON c.managing_org_id = u.org_id
+         WHERE c.singleton
+           AND u.role = 'organization_admin'
+         ORDER BY u.id
+         LIMIT 1"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    let template = TemplateName::parse("twin-admin")?;
+    let original = Uuid::now_v7();
+    let twin = Uuid::now_v7();
+    insert_template(&db.pool, &template).await?;
+    sqlx::query(sql!("UPDATE templates SET org_id = $2 WHERE name = $1"))
+        .bind(template.as_str())
+        .bind(actor.org_id)
+        .execute(&db.pool)
+        .await?;
+    sqlx::query(sql!(
+        "DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique"
+    ))
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (id, template_name, type, hash, org_id, created_at, execution_metadata)
+         VALUES
+             ($1, $3, 'fc', 'sha256:1818181818181818181818181818181818181818181818181818181818181818', $4,
+              NOW() - INTERVAL '1 hour', NULL),
+             ($2, $3, 'fc', 'sha256:1818181818181818181818181818181818181818181818181818181818181818', $4,
+              NOW(), jsonb_build_object('environment', 'sha256:' || repeat('7', 64)))"
+    ))
+    .bind(original)
+    .bind(twin)
+    .bind(template.as_str())
+    .bind(actor.org_id)
+    .execute(&db.pool)
+    .await?;
+
+    let tag = |release_id: Uuid| {
+        let state = state.clone();
+        let actor = actor.clone();
+        async move {
+            tag_template_release(
+                State(state),
+                Extension(AuthUser(actor)),
+                Path(release_id),
+                Json(TemplateReleaseTagRequest {
+                    tag: "prod".to_string(),
+                    expected_current_release_id: None,
+                }),
+            )
+            .await
+            .into_response()
+            .status()
+        }
+    };
+    let delete = |release_id: Uuid| {
+        let state = state.clone();
+        let actor = actor.clone();
+        async move {
+            delete_template_release(State(state), Extension(AuthUser(actor)), Path(release_id))
+                .await
+                .into_response()
+                .status()
+        }
+    };
+
+    assert_eq!(
+        tag(twin).await,
+        StatusCode::CONFLICT,
+        "a twin can't be tagged"
+    );
+    assert_eq!(tag(original).await, StatusCode::OK);
+    sqlx::query(sql!(
+        "DELETE FROM template_release_tags WHERE template_release_id = $1"
+    ))
+    .bind(original)
+    .execute(&db.pool)
+    .await?;
+    assert_eq!(
+        delete(original).await,
+        StatusCode::CONFLICT,
+        "an original with twins can't be deleted"
+    );
+    assert_eq!(delete(twin).await, StatusCode::NO_CONTENT);
+    assert_eq!(delete(original).await, StatusCode::NO_CONTENT);
+    Ok(())
+}
+
+/// A digest stored under both spellings: an admin can tag only its original
+/// (`pplx_space_template_release_original::digest_original`), the release the
+/// internal API's tag writer and every lookup without an environment resolve.
+/// The other spelling's original and every twin are refused, and so is
+/// deleting the digest original while any tag on the other spelling's
+/// original serves it.
+#[rstest::rstest]
+#[case::without_twins(false)]
+#[case::with_twins(true)]
+#[tokio::test]
+async fn admin_tags_only_the_digest_original(#[case] twins: bool) -> TestResult {
+    use pplx_space_template_release_store::spelling_pairs::{OLD_INDEX, seed_spelling_pairs};
+    use pplx_space_template_store::test_support::tag_release;
+    let db = pg_test_db().await?;
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let actor = sqlx::query_as::<_, User>(sql!(
+        "SELECT u.*
+         FROM users u
+         JOIN clusters c ON c.managing_org_id = u.org_id
+         WHERE c.singleton
+           AND u.role = 'organization_admin'
+         ORDER BY u.id
+         LIMIT 1"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    let template = TemplateName::parse("spelling-pairs")?;
+    insert_template(&db.pool, &template).await?;
+    sqlx::query(sql!("UPDATE templates SET org_id = $2 WHERE name = $1"))
+        .bind(template.as_str())
+        .bind(actor.org_id)
+        .execute(&db.pool)
+        .await?;
+    if twins {
+        sqlx::query(sqlx::AssertSqlSafe(sql!(format!(
+            "DROP INDEX IF EXISTS {OLD_INDEX}"
+        ))))
+        .execute(&db.pool)
+        .await?;
+    }
+    let twin_metadata = twins.then_some(r#"{"environment": "fixture-twin"}"#);
+    let pairs = seed_spelling_pairs(&db.pool, template.as_str(), twin_metadata).await?;
+
+    for pair in &pairs {
+        for release_id in pair.releases() {
+            let status = tag_template_release(
+                State(state.clone()),
+                Extension(AuthUser(actor.clone())),
+                Path(release_id),
+                Json(TemplateReleaseTagRequest {
+                    tag: "prod".to_string(),
+                    expected_current_release_id: None,
+                }),
+            )
+            .await
+            .into_response()
+            .status();
+            let expected = if release_id == pair.original {
+                StatusCode::OK
+            } else {
+                StatusCode::CONFLICT
+            };
+            assert_eq!(status, expected, "{release_id} of {pair:?}");
+        }
+        // A tag left on the other spelling's original, as one written before
+        // the shared rule can be, serves the digest original, so deleting
+        // the digest original is refused: the tag would outlive it and
+        // resolve to another release.
+        tag_release(&db.pool, template.as_str(), pair.other(), "legacy").await?;
+        let delete = || {
+            delete_template_release(
+                State(state.clone()),
+                Extension(AuthUser(actor.clone())),
+                Path(pair.original),
+            )
+        };
+        let status = delete().await.into_response().status();
+        assert_eq!(status, StatusCode::CONFLICT, "delete {pair:?}");
+        if !twins {
+            // Once nothing else serves it, its own `prod` tag goes with it.
+            sqlx::query(sql!(
+                "DELETE FROM template_release_tags WHERE template_release_id = $1"
+            ))
+            .bind(pair.other())
+            .execute(&db.pool)
+            .await?;
+            let status = delete().await.into_response().status();
+            assert_eq!(status, StatusCode::NO_CONTENT, "delete {pair:?}");
+        }
+    }
+    Ok(())
+}
+
+/// Deleting a digest original waits for a tag insert on the other spelling,
+/// as a writer that predates the shared rule makes without the template
+/// lock, and then refuses: the tag it waited for serves the digest original.
+#[tokio::test]
+async fn deleting_a_digest_original_waits_for_a_tag_on_the_other_spelling() -> TestResult {
+    use pplx_space_template_release_store::spelling_pairs::seed_spelling_pairs;
+    let db = pg_test_db().await?;
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let actor = sqlx::query_as::<_, User>(sql!(
+        "SELECT u.*
+         FROM users u
+         JOIN clusters c ON c.managing_org_id = u.org_id
+         WHERE c.singleton
+           AND u.role = 'organization_admin'
+         ORDER BY u.id
+         LIMIT 1"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    let template = TemplateName::parse("spelling-delete-lock")?;
+    insert_template(&db.pool, &template).await?;
+    sqlx::query(sql!("UPDATE templates SET org_id = $2 WHERE name = $1"))
+        .bind(template.as_str())
+        .bind(actor.org_id)
+        .execute(&db.pool)
+        .await?;
+    let pair = seed_spelling_pairs(&db.pool, template.as_str(), None)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or("no spelling pair seeded")?;
+
+    // The older writer's uncommitted tag insert on the other spelling.
+    let mut writer = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_tags (template_release_id, template_name, tag)
+         VALUES ($1, $2, 'legacy')"
+    ))
+    .bind(pair.other())
+    .bind(template.as_str())
+    .execute(&mut *writer)
+    .await?;
+
+    let original = pair.original;
+    let delete = tokio::spawn(async move {
+        delete_template_release(State(state), Extension(AuthUser(actor)), Path(original))
+            .await
+            .into_response()
+            .status()
+    });
+    crate::test_support::wait_until_blocked_by(&mut writer).await?;
+    assert!(!delete.is_finished(), "the delete waits for the tag insert");
+    writer.commit().await?;
+    assert_eq!(delete.await?, StatusCode::CONFLICT);
+    let tagged: Option<Uuid> = sqlx::query_scalar(sql!(
+        "SELECT t.template_release_id
+         FROM template_release_tags t
+         JOIN template_releases r ON r.id = $3
+         WHERE t.template_name = $1 AND t.tag = $2"
+    ))
+    .bind(template.as_str())
+    .bind("legacy")
+    .bind(original)
+    .fetch_optional(&db.pool)
+    .await?;
+    assert_eq!(tagged, Some(pair.other()), "the original and its tag stay");
+    Ok(())
+}
+
+/// Deleting a release waits for the parent template's row lock, which a
+/// release registration holds while it inserts, so the twin check and the
+/// delete can't interleave with a registration adding the release's first
+/// twin.
+#[tokio::test]
+async fn deleting_a_release_waits_for_a_registration_holding_the_template() -> TestResult {
+    let db = pg_test_db().await?;
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let actor = sqlx::query_as::<_, User>(sql!(
+        "SELECT u.*
+         FROM users u
+         JOIN clusters c ON c.managing_org_id = u.org_id
+         WHERE c.singleton
+           AND u.role = 'organization_admin'
+         ORDER BY u.id
+         LIMIT 1"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    let template = TemplateName::parse("twin-delete-lock")?;
+    let release = Uuid::now_v7();
+    insert_template(&db.pool, &template).await?;
+    sqlx::query(sql!("UPDATE templates SET org_id = $2 WHERE name = $1"))
+        .bind(template.as_str())
+        .bind(actor.org_id)
+        .execute(&db.pool)
+        .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (id, template_name, type, hash, org_id)
+         VALUES ($1, $2, 'fc', 'sha256:1919191919191919191919191919191919191919191919191919191919191919', $3)"
+    ))
+    .bind(release)
+    .bind(template.as_str())
+    .bind(actor.org_id)
+    .execute(&db.pool)
+    .await?;
+
+    // A registration's publication lock.
+    let mut registration = db.pool.begin().await?;
+    sqlx::query(sql!("SELECT 1 FROM templates WHERE name = $1 FOR UPDATE"))
+        .bind(template.as_str())
+        .execute(&mut *registration)
+        .await?;
+
+    let delete = tokio::spawn(async move {
+        delete_template_release(State(state), Extension(AuthUser(actor)), Path(release))
+            .await
+            .into_response()
+            .status()
+    });
+    crate::test_support::wait_until_blocked_by(&mut registration).await?;
+    assert!(
+        !delete.is_finished(),
+        "the delete waits for the template lock"
+    );
+    registration.commit().await?;
+    assert_eq!(delete.await?, StatusCode::NO_CONTENT);
+    Ok(())
+}
+
+/// Tagging a release takes the template row before the release row, as
+/// deleting one does, so the two queue instead of deadlocking: while a tag
+/// waits for the release row, it already holds the template.
+#[tokio::test]
+async fn tagging_a_release_locks_the_template_before_the_release() -> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db_with_max_connections(6).await?;
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let actor = sqlx::query_as::<_, User>(sql!(
+        "SELECT u.*
+         FROM users u
+         JOIN clusters c ON c.managing_org_id = u.org_id
+         WHERE c.singleton
+           AND u.role = 'organization_admin'
+         ORDER BY u.id
+         LIMIT 1"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    let template = TemplateName::parse("tag-lock-order")?;
+    let release = Uuid::now_v7();
+    insert_template(&db.pool, &template).await?;
+    sqlx::query(sql!("UPDATE templates SET org_id = $2 WHERE name = $1"))
+        .bind(template.as_str())
+        .bind(actor.org_id)
+        .execute(&db.pool)
+        .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (id, template_name, type, hash, org_id)
+         VALUES ($1, $2, 'fc', 'sha256:2020202020202020202020202020202020202020202020202020202020202020', $3)"
+    ))
+    .bind(release)
+    .bind(template.as_str())
+    .bind(actor.org_id)
+    .execute(&db.pool)
+    .await?;
+
+    let mut holder = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "SELECT 1 FROM template_releases WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(release)
+    .execute(&mut *holder)
+    .await?;
+    let tag = tokio::spawn(async move {
+        tag_template_release(
+            State(state),
+            Extension(AuthUser(actor)),
+            Path(release),
+            Json(TemplateReleaseTagRequest {
+                tag: "prod".to_string(),
+                expected_current_release_id: None,
+            }),
+        )
+        .await
+        .into_response()
+        .status()
+    });
+    crate::test_support::wait_until_blocked_by(&mut holder).await?;
+    assert!(!tag.is_finished(), "the tag waits for the release row");
+    let mut probe = db.pool.begin().await?;
+    let template_lock = sqlx::query(sql!(
+        "SELECT 1 FROM templates WHERE name = $1 FOR NO KEY UPDATE NOWAIT"
+    ))
+    .bind(template.as_str())
+    .execute(&mut *probe)
+    .await;
+    assert!(
+        template_lock.is_err(),
+        "the waiting tag already holds the template row"
+    );
+    probe.rollback().await?;
+    holder.commit().await?;
+    assert_eq!(tag.await?, StatusCode::OK);
+    Ok(())
+}
+
+/// An admin release delete and the template delete's final mark, run at
+/// once, both finish. The admin delete takes the template row, then the
+/// release's tags, storage locations and row; the mark has to take the
+/// template row before any of those, or each ends up waiting on a row the
+/// other holds. A third session holds the release's tag row so the two meet
+/// in that order every run.
+#[tokio::test]
+async fn an_admin_release_delete_and_the_template_mark_queue_rather_than_deadlock() -> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db_with_max_connections(6).await?;
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let actor = sqlx::query_as::<_, User>(sql!(
+        "SELECT u.*
+         FROM users u
+         JOIN clusters c ON c.managing_org_id = u.org_id
+         WHERE c.singleton
+           AND u.role = 'organization_admin'
+         ORDER BY u.id
+         LIMIT 1"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    let template = TemplateName::parse("delete-lock-order")?;
+    insert_template(&db.pool, &template).await?;
+    let release = insert_release(&db.pool, &template, 0x21).await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_tags (template_release_id, template_name, tag)
+         VALUES ($1, $2, 'prod')"
+    ))
+    .bind(release)
+    .bind(template.as_str())
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_storage_locations (template_release_id, storage_connection_string)
+         VALUES ($1, 's3://synthetic-bucket/delete-lock-order')"
+    ))
+    .bind(release)
+    .execute(&db.pool)
+    .await?;
+
+    let operation =
+        crate::public_template_operations::tests::create_delete_operation(&db.pool, &template)
+            .await?;
+
+    let mut holder = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "SELECT 1 FROM template_release_tags WHERE template_release_id = $1 FOR UPDATE"
+    ))
+    .bind(release)
+    .execute(&mut *holder)
+    .await?;
+
+    let admin = tokio::spawn({
+        let actor = actor.clone();
+        async move {
+            delete_template_release(State(state), Extension(AuthUser(actor)), Path(release))
+                .await
+                .into_response()
+                .status()
+        }
+    });
+    wait_until_sessions_wait_on_locks(&db.pool, 1).await?;
+    let mark = tokio::spawn({
+        let pool = db.pool.clone();
+        let template = template.clone();
+        async move {
+            crate::public_template_operations::mark_template_deleted(
+                &pool,
+                &template,
+                operation.id.as_uuid(),
+            )
+            .await
+        }
+    });
+    wait_until_sessions_wait_on_locks(&db.pool, 2).await?;
+    holder.commit().await?;
+
+    let admin = admin.await?;
+    let mark = mark.await?;
+    assert_eq!(admin, StatusCode::NO_CONTENT, "the admin delete");
+    assert!(
+        matches!(
+            mark,
+            Ok(crate::public_template_operations::MarkTemplateDeleted::Deleted)
+        ),
+        "the template mark: {:?}",
+        mark.as_ref().err()
+    );
+    Ok(())
+}
+
+/// Wait until at least `sessions` sessions wait on a lock.
+async fn wait_until_sessions_wait_on_locks(pool: &sqlx::PgPool, sessions: i64) -> TestResult {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(sql!(
+            "SELECT COUNT(*) FROM pg_stat_activity
+              WHERE datname = current_database()
+                AND wait_event_type = 'Lock'"
+        ))
+        .fetch_one(pool)
+        .await?;
+        if waiting >= sessions {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("{waiting} of {sessions} sessions waited on a lock").into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }

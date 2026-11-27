@@ -5,7 +5,8 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::sync::{
     Arc,
@@ -14,9 +15,7 @@ use std::sync::{
 
 use k8s_openapi::api::core::v1::PodStatus;
 use kube::error::Status;
-use pplx_space_common_core::kubernetes::{
-    SANDBOX_EXECUTION_GENERATION_ANNOTATION, SANDBOX_ID_ANNOTATION,
-};
+use pplx_space_sandbox_pod::{SANDBOX_EXECUTION_GENERATION_ANNOTATION, SANDBOX_ID_ANNOTATION};
 
 use super::*;
 
@@ -28,8 +27,11 @@ fn activation_assignment_retains_the_database_canonical_id_across_clones() {
     let assigned_id = SandboxActivationAttemptId::from_uuid(
         Uuid::parse_str("019c0000-0000-7000-8000-000000000002").unwrap(),
     );
-    let assignment =
-        ActivationAttemptAssignment::new(requested_id, SandboxTransitionTargetState::Started);
+    let assignment = ActivationAttemptAssignment::new(
+        requested_id,
+        SandboxTransitionTargetState::Started,
+        crate::controllers::substrate::KeyResolution::Unresolved,
+    );
 
     assignment.clone().record_assigned(assigned_id, 1);
 
@@ -635,11 +637,11 @@ fn kube_api_server_error_maps_to_retryable_substrate_timeout() {
 async fn delete_throttling_retry_retries_429_until_success() {
     let calls = Arc::new(AtomicUsize::new(0));
 
-    let result = retry_kube_delete_throttling("test_delete", || {
+    let result = retry_kube_throttling("test_delete", || {
         let calls = Arc::clone(&calls);
         async move {
             let prior = calls.fetch_add(1, Ordering::SeqCst);
-            if prior + 1 < K8S_THROTTLE_DELETE_RETRY_ATTEMPTS {
+            if prior + 1 < K8S_THROTTLE_RETRY_ATTEMPTS {
                 Err(kube_api_error(429))
             } else {
                 Ok(())
@@ -649,17 +651,14 @@ async fn delete_throttling_retry_retries_429_until_success() {
     .await;
 
     result.unwrap();
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        K8S_THROTTLE_DELETE_RETRY_ATTEMPTS
-    );
+    assert_eq!(calls.load(Ordering::SeqCst), K8S_THROTTLE_RETRY_ATTEMPTS);
 }
 
 #[tokio::test]
 async fn delete_throttling_retry_stops_after_bounded_429_budget() {
     let calls = Arc::new(AtomicUsize::new(0));
 
-    let result = retry_kube_delete_throttling("test_delete", || {
+    let result = retry_kube_throttling("test_delete", || {
         let calls = Arc::clone(&calls);
         async move {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -669,17 +668,14 @@ async fn delete_throttling_retry_stops_after_bounded_429_budget() {
     .await;
 
     assert!(matches!(result, Err(ref err) if is_kube_api_throttling_error(err)));
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        K8S_THROTTLE_DELETE_RETRY_ATTEMPTS
-    );
+    assert_eq!(calls.load(Ordering::SeqCst), K8S_THROTTLE_RETRY_ATTEMPTS);
 }
 
 #[tokio::test]
 async fn delete_throttling_retry_does_not_retry_non_429_errors() {
     let calls = Arc::new(AtomicUsize::new(0));
 
-    let result = retry_kube_delete_throttling("test_delete", || {
+    let result = retry_kube_throttling("test_delete", || {
         let calls = Arc::clone(&calls);
         async move {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -701,11 +697,12 @@ mod stopped_restore_plan_tests {
     use crate::controllers::substrate::kubernetes::tests::{
         mock_kubernetes_client, substrate_with_store_and_client,
     };
-    use pplx_space_common_core::types::NodeRole;
-    use pplx_space_common_core::types::{LocalArtifactId, SandboxId};
     use pplx_space_db_test_fixtures::{
         SEED_ORG_ID, SEED_USER_ID, insert_ready_worker_node, publish_ready_disk_artifact,
     };
+    use pplx_space_node_model::NodeRole;
+    use pplx_space_sandbox_model::SandboxId;
+    use pplx_space_snapshot_model::LocalArtifactId;
     use pplx_space_test_env::TestResult;
     use sqlx::PgPool;
     use std::sync::Mutex;
@@ -742,7 +739,7 @@ mod stopped_restore_plan_tests {
                 "namespace": "space",
                 "uid": "lingering-pod-uid",
                 "annotations": {
-                    pplx_space_common_core::kubernetes::SANDBOX_ID_ANNOTATION: sandbox_id.to_string(),
+                    pplx_space_sandbox_pod::SANDBOX_ID_ANNOTATION: sandbox_id.to_string(),
                     SANDBOX_EXECUTION_GENERATION_ANNOTATION: "1"
                 }
             },
@@ -962,14 +959,15 @@ mod stopped_restore_plan_tests {
             .await?;
         substrate
             .store
-            .persist_pod_node_placement(
-                evacuated,
-                "since-terminated-node",
-                "since-terminated-node-uid",
+            .persist_pod_node_placement(PodNodePlacement {
+                sandbox_id: evacuated,
+                node_name: "since-terminated-node",
+                node_uid: "since-terminated-node-uid",
                 node_id,
-                NodeRole::Worker,
-                None,
-            )
+                role: NodeRole::Worker,
+                address: None,
+                instance_id: None,
+            })
             .await?;
         sqlx::query(
             "UPDATE sandboxes SET active_node_id = NULL, target_node_id = NULL WHERE id = $1",
@@ -1111,14 +1109,15 @@ mod stopped_restore_plan_tests {
             .await?;
         substrate
             .store
-            .persist_pod_node_placement(
+            .persist_pod_node_placement(PodNodePlacement {
                 sandbox_id,
-                "drained-node",
-                "drained-node-uid",
+                node_name: "drained-node",
+                node_uid: "drained-node-uid",
                 node_id,
-                NodeRole::Worker,
-                None,
-            )
+                role: NodeRole::Worker,
+                address: None,
+                instance_id: None,
+            })
             .await?;
         sqlx::query("UPDATE sandboxes SET evacuation_restore_target = 'stopped' WHERE id = $1")
             .bind(sandbox_id)
@@ -1347,14 +1346,15 @@ mod stopped_restore_plan_tests {
             .await?;
         substrate
             .store
-            .persist_pod_node_placement(
+            .persist_pod_node_placement(PodNodePlacement {
                 sandbox_id,
-                "drained-node",
-                "drained-node-uid",
+                node_name: "drained-node",
+                node_uid: "drained-node-uid",
                 node_id,
-                NodeRole::Worker,
-                None,
-            )
+                role: NodeRole::Worker,
+                address: None,
+                instance_id: None,
+            })
             .await?;
         sqlx::query("UPDATE sandbox_k8s_executions SET active = FALSE WHERE sandbox_id = $1")
             .bind(sandbox_id)
@@ -1405,7 +1405,7 @@ mod stopped_restore_plan_tests {
                 crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("start"),
                 sandbox_id,
                 BLOCKING_START,
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             )
             .await;
 

@@ -1,9 +1,9 @@
 //! Validate compatible-resolution acknowledgement before starting any work.
-use pplx_space_common_core::types::ExecutionMetadata;
 use pplx_space_execution_common::{
     ExecutionProtoError,
     environment::{EnvironmentBindingError, EnvironmentDecodeError, EnvironmentDefinition},
 };
+use pplx_space_execution_spec::ExecutionMetadata;
 
 use crate::proto::{
     ExecutionEnvironmentSelection, ResolveExecutionEnvironmentResponse,

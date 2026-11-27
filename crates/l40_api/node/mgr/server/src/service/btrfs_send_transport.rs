@@ -20,21 +20,15 @@ const ROOT: &str = "/space/cache/.btrfs-send-staging";
 const ALLOWED: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Role(LocalRole::Admin),
-    UdsPeerPrincipal::Service(
-        pplx_space_common_core::host::linux::identities::user_names::SPACE_VOLMGR,
-    ),
+    UdsPeerPrincipal::Service(pplx_space_host_layout::identities::user_names::SPACE_VOLMGR),
 ];
 /// Capabilities disclose nothing about any source. Sandbox-manager reads them
 /// to decide whether to defer a send; lease operations stay volume-manager's.
 const CAPABILITIES_ALLOWED: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Role(LocalRole::Admin),
-    UdsPeerPrincipal::Service(
-        pplx_space_common_core::host::linux::identities::user_names::SPACE_VOLMGR,
-    ),
-    UdsPeerPrincipal::Service(
-        pplx_space_common_core::host::linux::identities::user_names::SPACE_SBXMGR,
-    ),
+    UdsPeerPrincipal::Service(pplx_space_host_layout::identities::user_names::SPACE_VOLMGR),
+    UdsPeerPrincipal::Service(pplx_space_host_layout::identities::user_names::SPACE_SBXMGR),
 ];
 type Body = Pin<Box<dyn tokio_stream::Stream<Item = Result<BtrfsSendChunk, Status>> + Send>>;
 

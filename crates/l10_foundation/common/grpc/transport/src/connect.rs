@@ -224,15 +224,140 @@ pub async fn connect_uds_channel_with_endpoint_with_retry(
     .await
 }
 
+/// Connect a Unix-socket channel meant to be kept. Like
+/// [`connect_uds_channel_with_endpoint_with_retry`] it retries the first dial,
+/// and the channel retries every later redial, after its connection drops,
+/// with the same policy, spans and metrics: a call that arrives while the
+/// local server restarts waits for its successor to listen, as a call on a
+/// freshly dialed channel would, instead of failing at once with the refused
+/// dial. Only the socket dial is retried, so no request is ever sent twice.
+/// A redial whose attempts all fail fails its call with the last dial's
+/// [`std::io::Error`], which [`crate::is_client_connect_failure`] still reads
+/// as proof that the call was never sent.
+///
+/// The redial runs while the channel gets ready, before tonic starts a call's
+/// `grpc-timeout`, so that timeout does not count the wait: a call can take
+/// up to the policy's `max_elapsed` longer than it, and only while nothing
+/// listens on the socket. A caller that needs a hard deadline bounds the call
+/// future itself, with [`tokio::time::timeout`]; a call dropped while it waits
+/// for the redial is never sent.
+pub async fn connect_uds_channel_with_retrying_redials(
+    service_name: &'static str,
+    socket_path: &Path,
+    endpoint: tonic::transport::Endpoint,
+    retry_policy: GrpcRetryPolicy,
+) -> Result<tonic::transport::Channel, UdsConnectError> {
+    let connector = RetryingUdsConnector {
+        service_name,
+        socket_path: std::sync::Arc::from(socket_path),
+        retry_policy,
+    };
+    retry_uds_connect(service_name, socket_path, retry_policy, || {
+        let connector = connector.clone();
+        let endpoint = endpoint.clone();
+        async move {
+            endpoint
+                .connect_with_connector(connector)
+                .await
+                .map_err(|source| UdsConnectError::Transport {
+                    service_name,
+                    path: socket_path.to_path_buf(),
+                    source,
+                })
+        }
+    })
+    .await
+}
+
+#[derive(Clone)]
+struct RetryingUdsConnector {
+    service_name: &'static str,
+    socket_path: std::sync::Arc<Path>,
+    retry_policy: GrpcRetryPolicy,
+}
+
+impl tower::Service<http::Uri> for RetryingUdsConnector {
+    type Response = hyper_util::rt::TokioIo<tokio::net::UnixStream>;
+    type Error = std::io::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _uri: http::Uri) -> Self::Future {
+        let Self {
+            service_name,
+            socket_path,
+            retry_policy,
+        } = self.clone();
+        Box::pin(async move {
+            let stream = retry_uds_attempts(
+                service_name,
+                &socket_path,
+                retry_policy,
+                || {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "connecting to {service_name} at {} exceeded the {:?} total connect \
+                             budget",
+                            socket_path.display(),
+                            retry_policy.max_elapsed
+                        ),
+                    )
+                },
+                || tokio::net::UnixStream::connect(&*socket_path),
+            )
+            .await?;
+            Ok(hyper_util::rt::TokioIo::new(stream))
+        })
+    }
+}
+
 async fn retry_uds_connect<F, Fut>(
     service_name: &'static str,
     socket_path: &Path,
     retry_policy: GrpcRetryPolicy,
-    mut connect: F,
+    connect: F,
 ) -> Result<tonic::transport::Channel, UdsConnectError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<tonic::transport::Channel, UdsConnectError>>,
+{
+    retry_uds_attempts(
+        service_name,
+        socket_path,
+        retry_policy,
+        || UdsConnectError::Timeout {
+            service_name,
+            path: socket_path.to_path_buf(),
+            budget: retry_policy.max_elapsed,
+        },
+        connect,
+    )
+    .await
+}
+
+/// Run `connect` until it succeeds or `retry_policy` is spent, with the span,
+/// retry metric and logs every UDS connect shares. An attempt still running
+/// when the policy's `max_elapsed` ends fails with `timed_out()`.
+async fn retry_uds_attempts<T, E, F, Fut>(
+    service_name: &'static str,
+    socket_path: &Path,
+    retry_policy: GrpcRetryPolicy,
+    timed_out: impl Fn() -> E,
+    mut connect: F,
+) -> Result<T, E>
+where
+    E: std::fmt::Display,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
 {
     let started_at = tokio::time::Instant::now();
     let mut retry_index = 0;
@@ -250,17 +375,11 @@ where
             .saturating_sub(started_at.elapsed());
         let result = tokio::time::timeout(remaining, connect().instrument(connect_span.span()))
             .await
-            .unwrap_or_else(|_| {
-                Err(UdsConnectError::Timeout {
-                    service_name,
-                    path: socket_path.to_path_buf(),
-                    budget: retry_policy.max_elapsed,
-                })
-            });
+            .unwrap_or_else(|_| Err(timed_out()));
         match result {
-            Ok(channel) => {
+            Ok(connected) => {
                 connect_span.record_ok();
-                return Ok(channel);
+                return Ok(connected);
             }
             Err(error) => {
                 connect_span.record_error(&error);
@@ -1069,7 +1188,7 @@ fn log_uds_connect_exhausted(
     socket_path: &Path,
     started_at: tokio::time::Instant,
     attempts: usize,
-    error: &UdsConnectError,
+    error: &dyn std::fmt::Display,
 ) {
     pplx_space_observability::with_peer_service!(tracing::warn!(
         peer.service = service_name,

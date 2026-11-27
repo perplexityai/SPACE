@@ -1,7 +1,6 @@
 //! Wall-clock budgets a [`KubernetesSubstrate`](super::KubernetesSubstrate)
-//! carries as values rather than reading from its constants, so a test can
-//! shorten them while Postgres, the scripted apiserver and the scripted worker
-//! stay real.
+//! carries as values so tests can shorten them without changing the behavior
+//! of Postgres, the scripted apiserver, or the scripted worker.
 
 use std::time::Duration;
 
@@ -9,12 +8,11 @@ use tokio::time::Instant;
 
 /// The budgets of `create_execution`'s readiness wait and preserve decision,
 /// `suspend_execution`'s durability wait, started warm-pool adoption's
-/// split-receipt and command-readiness waits, teardown's worker connect, the
-/// pod reads' reflector-event wait and a deferring restore claim's in-place
-/// retry grace.
+/// split-receipt and command-readiness waits, warm-pool adoption's label write,
+/// teardown's worker connect, pod reads during readiness and a
+/// deferring restore claim's in-place retry grace.
 ///
-/// Production uses [`Default`], which is exactly the constants each field
-/// names, so production deadlines, error messages and logs are unchanged.
+/// Production uses [`Default`]; tests can shorten individual budgets.
 /// Other paths that share a constant (wake, start and access readiness, and
 /// the other warm-pool setup RPCs) still read it directly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,13 +36,22 @@ pub(super) struct SubstrateBudgets {
     /// adoption waits for its guest to report command readiness after the
     /// pool's Wake, within the adoption's own readiness budget.
     pub(super) pooled_command_ready: Duration,
+    /// [`super::adapter::ADOPTION_LABEL_TIMEOUT`]: the bound on each label
+    /// write warm-pool adoption makes, throttling retries included.
+    pub(super) adoption_label: Duration,
     /// [`super::POD_WORKER_CONNECT_TIMEOUT`], as teardown's connect bound for
     /// the pod's worker.
     pub(super) teardown_worker_connect: Duration,
+    /// [`super::adapter::TEARDOWN_NODE_DELETE_WAIT_BUDGET`]: how long a Delete
+    /// teardown waits for durable admission of a nonblocking sbx-mgr Delete.
+    pub(super) teardown_node_delete_wait: Duration,
     /// [`super::REFLECTOR_WAIT_BUDGET`]: how long a pod read waits for a
     /// reflector event before it falls back to an apiserver GET, and the
     /// re-check interval of a scheduling-outcome wait.
     pub(super) reflector_wait: Duration,
+    /// Maximum duration of a direct pod GET during IP readiness, further
+    /// clamped to the time left in that phase.
+    pub(super) readiness_pod_get: Duration,
     /// [`super::execution::RETRY_DEFERRAL_GRACE`]: how long a caller under
     /// the dispatcher's retry deferral keeps retrying a fenced restore claim
     /// in place before it hands the wait back.
@@ -59,8 +66,13 @@ impl SubstrateBudgets {
         suspend_durability: super::adapter::TEARDOWN_SUSPEND_DURABILITY_BUDGET,
         pooled_split_receipt_wait: super::adapter::WARM_POOL_SETUP_RPC_TIMEOUT,
         pooled_command_ready: super::adapter::POOLED_COMMAND_READY_BUDGET,
+        adoption_label: super::adapter::ADOPTION_LABEL_TIMEOUT,
         teardown_worker_connect: super::POD_WORKER_CONNECT_TIMEOUT,
+        teardown_node_delete_wait: super::adapter::TEARDOWN_NODE_DELETE_WAIT_BUDGET,
         reflector_wait: super::REFLECTOR_WAIT_BUDGET,
+        // Leave headroom for a slow single-object read without letting it
+        // displace the watch that can observe readiness independently.
+        readiness_pod_get: Duration::from_secs(5),
         retry_deferral_grace: super::execution::RETRY_DEFERRAL_GRACE,
     };
 

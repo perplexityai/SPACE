@@ -106,8 +106,8 @@ fn only_the_capturing_teardowns_record_orders_captures() {
 #[test]
 fn no_upload_carries_the_capture_record() {
     use crate::snapshot_upload::{encrypted_upload_artifacts, upload_artifacts_for_kind};
-    use pplx_space_common_core::types::ArtifactKind;
     use pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat;
+    use pplx_space_snapshot_model::ArtifactKind;
     let mut uploads = vec![
         encrypted_upload_artifacts(ArtifactKind::Full),
         encrypted_upload_artifacts(ArtifactKind::Disk),

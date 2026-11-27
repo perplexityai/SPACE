@@ -6,7 +6,7 @@
 //! host sandbox cache. The expected outcomes are written out here, not derived
 //! from the edge table.
 
-use pplx_space_common_core::types::SandboxQuarantineReasonCode;
+use pplx_space_sandbox_model::SandboxQuarantineReasonCode;
 
 use super::*;
 use crate::db::test_fixtures::state_write_fixtures::{

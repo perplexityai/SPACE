@@ -4,6 +4,26 @@ use pplx_space_metrics_emit::{
     counter, distribution, elapsed_ms, gauge, metric_vocabulary, tag, timing_ms,
 };
 
+#[cfg(target_os = "linux")]
+metric_vocabulary!(
+    /// Which sandbox cgroup tree supplied the memory event counters.
+    OomCgroup {
+        Vm => "vm",
+        Sidecar => "sidecar",
+    }
+);
+
+#[cfg(target_os = "linux")]
+pub(crate) fn cgroup_oom_events(cgroup: OomCgroup, kills: u64, group_kills: u64) {
+    let tags = [tag("cgroup", cgroup)];
+    if kills > 0 {
+        counter("node_memory.cgroup.oom_kills", kills, &tags);
+    }
+    if group_kills > 0 {
+        counter("node_memory.cgroup.oom_group_kills", group_kills, &tags);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuestUdp443Action {
     Observe,
@@ -226,7 +246,7 @@ pub fn balloon_snapshot_probe_failed(probe: BalloonSnapshotProbe) {
 /// `node_mgr.balloon.guest_free_mib` the guest's free memory, when the guest
 /// has reported it.
 pub fn balloon_snapshot_statistics(
-    mode: pplx_space_common_core::types::BalloonMode,
+    mode: pplx_space_execution_spec::BalloonMode,
     actual_mib: u64,
     guest_free_mib: Option<u64>,
 ) {

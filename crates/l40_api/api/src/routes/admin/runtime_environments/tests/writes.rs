@@ -500,7 +500,7 @@ async fn a_repeated_block_rechecks_after_a_concurrent_unblock() -> TestResult {
     // Another operator allows E0, holding the policy row lock until commit.
     let mut unblock = h.db.pool.begin().await?;
     policy_store::set_environment_state(
-        &mut unblock,
+        &mut *unblock,
         e0,
         RuntimeEnvironmentState::Allowed,
         &PolicyChange {
@@ -687,11 +687,16 @@ async fn only_releases_still_in_use_gate_a_block() -> TestResult {
     let Some(h) = harness().await? else {
         return Ok(());
     };
-    let (e0, e1) = (environment(0), environment(1));
+    let (e0, e1, e2) = (environment(0), environment(1), environment(2));
     h.set_default(e1).await;
     let allow_e0 = || h.set_state(e0, json!({"state": "allowed", "reason": "back"}));
     let block_e0 = || h.set_state(e0, json!({"state": "blocked", "reason": "0-day"}));
+    let block_e2 = || h.set_state(e2, json!({"state": "blocked", "reason": "0-day"}));
     let (status, _) = allow_e0().await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = h
+        .set_state(e2, json!({"state": "allowed", "reason": "new"}))
+        .await;
     assert_eq!(status, StatusCode::OK);
 
     // Superseded: untagged and unpooled, so reachable only by its exact hash.
@@ -721,11 +726,625 @@ async fn only_releases_still_in_use_gate_a_block() -> TestResult {
     assert_eq!(status, StatusCode::OK, "{body}");
     allow_e0().await;
 
+    // Tagged through the other spelling: a tag written before the shared
+    // original-release rule names the canonical release, and creates by tag
+    // resolve to the digest's original, the older bare one bound to e0.
+    let bare = insert_template_release(&h.db.pool, "spelled", Some(metadata(Some(e0)))).await?;
+    let hash: String = sqlx::query_scalar(sql!(
+        "UPDATE template_releases
+         SET hash = replace(hash, 'sha256:', ''), created_at = NOW() - INTERVAL '1 hour'
+         WHERE id = $1
+         RETURNING 'sha256:' || hash"
+    ))
+    .bind(bare)
+    .fetch_one(&h.db.pool)
+    .await?;
+    let canonical: Uuid = sqlx::query_scalar(sql!(
+        "INSERT INTO template_releases (template_name, type, hash, execution_metadata)
+         VALUES ('spelled', 'fc', $1, $2)
+         RETURNING id"
+    ))
+    .bind(&hash)
+    .bind(sqlx::types::Json(metadata(Some(e2))))
+    .fetch_one(&h.db.pool)
+    .await?;
+    tag_release(&h.db.pool, canonical, "spelled", "latest").await?;
+    let (status, body) = block_e0().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["at_risk"]["bound"]["template_releases_in_use"], 1);
+    // An API image that predates the rule creates from the tagged release
+    // itself, so its environment can't be blocked either while one may serve.
+    let (status, body) = block_e2().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["at_risk"]["bound"]["template_releases_in_use"], 1);
+    sqlx::query(sql!(
+        "DELETE FROM template_release_tags WHERE template_name = 'spelled'"
+    ))
+    .execute(&h.db.pool)
+    .await?;
+    allow_e0().await;
+
     // Tagged: creates by tag resolve to it.
     let tagged = insert_template_release(&h.db.pool, "tagged", Some(metadata(Some(e0)))).await?;
     tag_release(&h.db.pool, tagged, "tagged", "latest").await?;
     let (status, body) = block_e0().await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["at_risk"]["bound"]["template_releases_in_use"], 1);
+
+    // Twins exist only once the `(template_name, hash)` unique index is
+    // dropped; the test drops it to stand in for the contract migration.
+    sqlx::query(sql!(
+        "DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique"
+    ))
+    .execute(&h.db.pool)
+    .await?;
+    // It gets a twin bound to the default. This deployment's creates don't
+    // boot a twin's environment, so the tag's creates still boot the
+    // original's build and keep it in use.
+    sqlx::query(sql!(
+        "INSERT INTO template_releases
+             (template_name, type, hash, org_id, execution_metadata, created_at)
+         SELECT template_name, type, hash, org_id,
+                jsonb_build_object('environment', $2::TEXT), clock_timestamp()
+         FROM template_releases WHERE id = $1"
+    ))
+    .bind(tagged)
+    .bind(e1.to_string())
+    .execute(&h.db.pool)
+    .await?;
+    let (status, body) = block_e0().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["at_risk"]["bound"]["template_releases_in_use"], 1);
+
+    // Where creates boot the twin they resolve to, the tag no longer keeps
+    // the original in use.
+    let e0_in_use = |boots| {
+        let pool = h.db.pool.clone();
+        async move {
+            let rows = store::template_release_population(&pool, boots).await?;
+            TestResult::Ok(
+                rows.iter()
+                    .filter(|row| {
+                        row.environment_ref.as_deref() == Some(&e0.to_string()) && row.in_use
+                    })
+                    .map(|row| row.template_releases)
+                    .sum::<i64>(),
+            )
+        }
+    };
+    assert_eq!(e0_in_use(false).await?, 1);
+    assert_eq!(e0_in_use(true).await?, 0);
+    Ok(())
+}
+
+/// Where creates boot the twin they resolve to, a block reads the population
+/// as they do: a tag whose build has a twin in the default no longer keeps
+/// the original in use, so blocking the original's environment needs no
+/// `strand`. `only_releases_still_in_use_gate_a_block` has the same
+/// population where creates don't boot twins, and there the block needs it.
+#[cfg(feature = "kubernetes")]
+#[tokio::test(flavor = "current_thread")]
+async fn blocking_an_original_needs_no_strand_where_creates_boot_its_twin() -> TestResult {
+    let Some(h) = harness_booting_twins().await? else {
+        return Ok(());
+    };
+    let (e0, e1) = (environment(0), environment(1));
+    h.set_default(e1).await;
+    let (status, _) = h
+        .set_state(e0, json!({"state": "allowed", "reason": "back"}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let tagged = insert_template_release(&h.db.pool, "tagged", Some(metadata(Some(e0)))).await?;
+    tag_release(&h.db.pool, tagged, "tagged", "latest").await?;
+    let (status, body) = h
+        .set_state(e0, json!({"state": "blocked", "reason": "0-day"}))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "without a twin the tag resolves to the original: {body}"
+    );
+
+    // Twins exist only once the `(template_name, hash)` unique index is
+    // dropped; the test drops it to stand in for the contract migration.
+    sqlx::query(sql!(
+        "DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique"
+    ))
+    .execute(&h.db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_releases
+             (template_name, type, hash, org_id, execution_metadata, created_at)
+         SELECT template_name, type, hash, org_id,
+                jsonb_build_object('environment', $2::TEXT), clock_timestamp()
+         FROM template_releases WHERE id = $1"
+    ))
+    .bind(tagged)
+    .bind(e1.to_string())
+    .execute(&h.db.pool)
+    .await?;
+    let (status, body) = h
+        .set_state(e0, json!({"state": "blocked", "reason": "0-day"}))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the tag's creates boot the twin: {body}"
+    );
+    Ok(())
+}
+
+/// A tag on a release stored under the bare hash keeps in use the release
+/// its build resolves to under the canonical spelling, so blocking that
+/// release's environment still needs `strand`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_tag_keeps_its_resolved_release_in_use_across_hash_spellings() -> TestResult {
+    let Some(h) = harness().await? else {
+        return Ok(());
+    };
+    let (e0, e1) = (environment(0), environment(1));
+    h.set_default(e1).await;
+    sqlx::query(sql!(
+        "INSERT INTO templates (name, id) VALUES ('spelled', $1)"
+    ))
+    .bind(Uuid::now_v7())
+    .execute(&h.db.pool)
+    .await?;
+    let bare = "ab".repeat(32);
+    let insert = |hash: String, environment: EnvironmentReference| {
+        let pool = h.db.pool.clone();
+        async move {
+            TestResult::Ok(
+                sqlx::query_scalar::<_, Uuid>(sql!(
+                    "INSERT INTO template_releases
+                         (template_name, type, hash, execution_metadata, created_at)
+                     VALUES ('spelled', 'fc', $1,
+                             jsonb_build_object('environment', $2::TEXT), clock_timestamp())
+                     RETURNING id"
+                ))
+                .bind(hash)
+                .bind(environment.to_string())
+                .fetch_one(&pool)
+                .await?,
+            )
+        }
+    };
+    let original = insert(bare.clone(), e0).await?;
+    tag_release(&h.db.pool, original, "spelled", "latest").await?;
+    insert(format!("sha256:{bare}"), e1).await?;
+
+    let rows = store::template_release_population(&h.db.pool, true).await?;
+    let in_use = |environment: EnvironmentReference| {
+        rows.iter()
+            .filter(|row| {
+                row.environment_ref.as_deref() == Some(&environment.to_string()) && row.in_use
+            })
+            .map(|row| row.template_releases)
+            .sum::<i64>()
+    };
+    assert_eq!((in_use(e0), in_use(e1)), (0, 1));
+    Ok(())
+}
+
+/// A block that rechecks after a concurrent write reads what it would stop
+/// before writing the block: a tag whose build resolves to a twin in the
+/// environment keeps that twin in use. Read after the block is written, the
+/// twin would read as unused, since resolution never picks a release in a
+/// blocked environment, and the block would need no `strand`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_recheck_counts_a_twin_the_block_would_stop() -> TestResult {
+    let Some(h) = harness().await? else {
+        return Ok(());
+    };
+    let (e0, e1, e2) = (environment(0), environment(1), environment(2));
+    h.set_default(e1).await;
+    let (status, _) = h
+        .set_state(e0, json!({"state": "allowed", "reason": "twins"}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    // Twins exist only once the `(template_name, hash)` unique index is
+    // dropped; the test drops it to stand in for the contract migration.
+    sqlx::query(sql!(
+        "DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique"
+    ))
+    .execute(&h.db.pool)
+    .await?;
+    // The tagged original is bound to E2, which has no state; its twin in E0,
+    // allowed, is what the tag's creates resolve to.
+    let original = insert_template_release(&h.db.pool, "twinned", Some(metadata(Some(e2)))).await?;
+    tag_release(&h.db.pool, original, "twinned", "latest").await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_releases
+             (template_name, type, hash, execution_metadata, created_at)
+         SELECT template_name, type, hash, $2, clock_timestamp()
+         FROM template_releases WHERE id = $1"
+    ))
+    .bind(original)
+    .bind(sqlx::types::Json(metadata(Some(e0))))
+    .execute(&h.db.pool)
+    .await?;
+
+    // The block read E0 as stopped one generation ago; a write landed since.
+    let generation = policy_store::get_generation(&h.db.pool).await?;
+    let mut block = h.db.pool.begin().await?;
+    let recheck = recheck_block(&mut block, e0, Some(generation - 1), None, true)
+        .await
+        .map_err(|_| "recheck failed")?
+        .expect("a write landed since the block's check");
+    assert_eq!(recheck.generation, generation);
+    let at_risk = recheck
+        .at_risk
+        .expect("the tag keeps the twin in E0 in use");
+    assert_eq!(at_risk.environments, vec![e0]);
+    assert_eq!(at_risk.bound.template_releases_in_use, 1);
+    // A write conditional on another generation gets 412: nothing to recheck.
+    assert!(
+        recheck_block(
+            &mut block,
+            e0,
+            Some(generation - 1),
+            Some(generation - 1),
+            true
+        )
+        .await
+        .map_err(|_| "recheck failed")?
+        .is_none()
+    );
+    // No write since the check: nothing to recheck.
+    assert!(
+        recheck_block(&mut block, e0, Some(generation), None, true)
+            .await
+            .map_err(|_| "recheck failed")?
+            .is_none()
+    );
+
+    policy_store::set_environment_state(
+        &mut *block,
+        e0,
+        RuntimeEnvironmentState::Blocked,
+        &PolicyChange {
+            actor: Some(h.user_id),
+            reason: PolicyChangeReason::new("0-day")?,
+        },
+    )
+    .await?;
+    let after = read_population(&mut block, true).await?;
+    assert!(
+        AtRisk::of_block(&after, e0).is_empty(),
+        "after the block is written the twin reads as unused"
+    );
+    block.rollback().await?;
+    Ok(())
+}
+
+/// Which result a block uses: the recheck's when another write landed since
+/// the check, else the check's own, and a refusal when the write's
+/// generation doesn't follow what was read.
+#[test]
+fn a_block_uses_the_recheck_when_the_policy_moved() {
+    let at_risk = |environment: EnvironmentReference| {
+        Box::new(AtRisk::of_block(&Population::default(), environment))
+    };
+    let e0 = environment(0);
+    let recheck = |generation, risky: bool| Recheck {
+        generation,
+        at_risk: risky.then(|| at_risk(e0)),
+    };
+    let checked = |risky: bool, generation| BlockCheck::Checked {
+        at_risk: risky.then(|| at_risk(e0)),
+        generation,
+    };
+    // No write since the check: the check stands.
+    assert!(
+        block_at_risk(checked(true, Some(4)), None, 5)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        block_at_risk(checked(false, Some(4)), None, 5)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        block_at_risk(BlockCheck::AlreadyStopped { generation: 4 }, None, 5),
+        Ok(None)
+    );
+    // A write landed since: the recheck replaces the check, either way.
+    assert!(
+        block_at_risk(checked(false, Some(3)), Some(recheck(4, true)), 5)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        block_at_risk(checked(true, Some(3)), Some(recheck(4, false)), 5)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        block_at_risk(
+            BlockCheck::AlreadyStopped { generation: 3 },
+            Some(recheck(4, true)),
+            5
+        )
+        .unwrap()
+        .is_some()
+    );
+    // The write doesn't follow what was read.
+    assert_eq!(
+        block_at_risk(checked(false, Some(3)), Some(recheck(4, false)), 6),
+        Err(PolicyMovedDuringRecheck)
+    );
+    assert_eq!(
+        block_at_risk(BlockCheck::AlreadyStopped { generation: 3 }, None, 5),
+        Err(PolicyMovedDuringRecheck)
+    );
+}
+
+/// The cluster's first default stops every environment with no state, so it's
+/// refused while an unfinished template campaign moves one of them, and the
+/// refusal also reports the work it would stop. `strand: true` sets it anyway.
+#[tokio::test(flavor = "current_thread")]
+async fn the_first_default_is_refused_while_a_template_campaign_moves_an_environment_it_stops()
+-> TestResult {
+    use pplx_space_runtime_upgrade_campaign_store::test_support::{CampaignSeed, insert_campaign};
+    use pplx_space_runtime_upgrade_campaign_store::{CampaignKind, CampaignPhase};
+
+    let Some(h) = harness().await? else {
+        return Ok(());
+    };
+    let (e0, e1, e2) = (environment(0), environment(1), environment(2));
+    let campaign = |from, to| CampaignSeed {
+        from,
+        to,
+        kind: CampaignKind::Templates,
+        phase: CampaignPhase::Paused,
+        ..CampaignSeed::default()
+    };
+    // A campaign from the new default doesn't hold it: the default executes.
+    insert_campaign(&h.db.pool, campaign(e1, e2)).await?;
+    // One from E0, which has no state, does.
+    let holding = insert_campaign(&h.db.pool, campaign(e0, e1)).await?;
+
+    let (status, body) = h.set_default(e1).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_error_contains(
+        &body,
+        &format!(
+            "template runtime upgrade campaign {holding} still moves environment {e0}'s \
+             releases, which the cluster's first default stops"
+        ),
+    );
+    // The campaign waits for E1 to be the default, so the refusal names the
+    // way through that doesn't stop E0.
+    assert_error_contains(&body, &format!("record a state for {e0} first"));
+    assert!(body.get("at_risk").is_none(), "nothing else stops: {body}");
+    assert_eq!(h.generation().await?, 0, "nothing changed");
+
+    // With work bound to E0 too, the refusal reports it, since strand: true
+    // waives both.
+    let tagged = insert_template_release(&h.db.pool, "tagged", Some(metadata(Some(e0)))).await?;
+    tag_release(&h.db.pool, tagged, "tagged", "latest").await?;
+    let (status, body) = h.set_default(e1).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_error_contains(&body, &format!("campaign {holding}"));
+    assert_eq!(body["at_risk"]["environments"], json!([e0.to_string()]));
+    assert_eq!(body["at_risk"]["bound"]["template_releases_in_use"], 1);
+    assert_eq!(h.generation().await?, 0, "nothing changed");
+
+    let (status, body) = h
+        .put(
+            "/admin/api/v1/runtime-environments/default",
+            json!({"environment_ref": e1.to_string(), "reason": "move on", "strand": true}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        policy_store::get(&h.db.pool).await?.default_environment,
+        Some(e1)
+    );
+    Ok(())
+}
+
+/// A template campaign whose source keeps executing doesn't hold the first
+/// default.
+#[tokio::test(flavor = "current_thread")]
+async fn the_first_default_passes_a_template_campaign_whose_source_keeps_executing() -> TestResult {
+    use pplx_space_runtime_upgrade_campaign_store::test_support::{CampaignSeed, insert_campaign};
+    use pplx_space_runtime_upgrade_campaign_store::{CampaignKind, CampaignPhase};
+
+    let Some(h) = harness().await? else {
+        return Ok(());
+    };
+    let (e0, e1) = (environment(0), environment(1));
+    insert_template_release(&h.db.pool, "seed", Some(metadata(Some(e0)))).await?;
+    insert_campaign(
+        &h.db.pool,
+        CampaignSeed {
+            from: e0,
+            to: e1,
+            kind: CampaignKind::Templates,
+            phase: CampaignPhase::Rolling,
+            ..CampaignSeed::default()
+        },
+    )
+    .await?;
+    let (status, body) = h
+        .set_state(
+            e0,
+            json!({"state": "deprecated", "reason": "keep E0 running"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h.set_default(e1).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    Ok(())
+}
+
+/// A template campaign starting while the first default is written can't slip
+/// past it: the default takes the start lock of each environment with
+/// template releases that it stops, so it waits for the start to commit and
+/// then sees the campaign.
+#[tokio::test(flavor = "current_thread")]
+async fn the_first_default_waits_for_a_template_campaign_starting_on_an_environment_it_stops()
+-> TestResult {
+    use pplx_space_runtime_upgrade_campaign_store::test_support::{CampaignSeed, insert_campaign};
+    use pplx_space_runtime_upgrade_campaign_store::{
+        self as campaign_store, CampaignKind, CampaignPhase,
+    };
+
+    // The start's transaction, the default's and the lock poll's.
+    let Some(h) = harness_with_connections(4).await? else {
+        return Ok(());
+    };
+    let (e0, e1) = (environment(0), environment(1));
+    insert_template_release(&h.db.pool, "seed", Some(metadata(Some(e0)))).await?;
+    // A start in flight, as `create_campaign` makes one: E0's start lock
+    // held, the campaign written but not committed.
+    let mut start = h.db.pool.begin().await?;
+    assert_eq!(
+        campaign_store::unfinished_from_locked(&mut *start, CampaignKind::Templates, e0).await?,
+        None
+    );
+    let starting = insert_campaign(
+        &mut *start,
+        CampaignSeed {
+            from: e0,
+            to: e1,
+            kind: CampaignKind::Templates,
+            phase: CampaignPhase::Canary,
+            ..CampaignSeed::default()
+        },
+    )
+    .await?;
+
+    let holder: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *start)
+        .await?;
+    // Commit the start only once the default waits on its lock, so the
+    // default can't have read past the start before it committed.
+    let ((status, body), committed) = tokio::join!(h.set_default(e1), async {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            // Something waits on the start's backend: the default, on its
+            // start lock.
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                     WHERE $1 = ANY(pg_blocking_pids(pid))
+                 )",
+            )
+            .bind(holder)
+            .fetch_one(&h.db.pool)
+            .await?;
+            if waiting {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                return Err("the default never waited on the start lock".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        start.commit().await?;
+        TestResult::Ok(())
+    });
+    committed?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_error_contains(&body, &format!("campaign {starting}"));
+    assert_eq!(h.generation().await?, 0, "nothing changed");
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_block_is_refused_while_an_unfinished_template_campaign_moves_the_environment()
+-> TestResult {
+    use pplx_space_runtime_upgrade_campaign_store::test_support::{CampaignSeed, insert_campaign};
+    use pplx_space_runtime_upgrade_campaign_store::{CampaignKind, CampaignPhase};
+
+    let Some(h) = harness().await? else {
+        return Ok(());
+    };
+    let (e0, e1) = (environment(0), environment(1));
+    let (status, _) = h.set_default(e1).await;
+    assert_eq!(status, StatusCode::OK);
+    // Allowed, so a block stops it and the campaign check runs: with no
+    // state under a default it already doesn't execute.
+    let (status, body) = h
+        .set_state(e0, json!({"state": "allowed", "reason": "keep it"}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let campaign = |kind, phase| CampaignSeed {
+        from: e0,
+        to: e1,
+        kind,
+        phase,
+        ..CampaignSeed::default()
+    };
+    let block = || h.set_state(e0, json!({"state": "blocked", "reason": "0-day"}));
+
+    // A finished template campaign and an unfinished sandbox campaign don't
+    // hold the block.
+    insert_campaign(
+        &h.db.pool,
+        campaign(CampaignKind::Templates, CampaignPhase::Completed),
+    )
+    .await?;
+    insert_campaign(
+        &h.db.pool,
+        campaign(CampaignKind::Sandboxes, CampaignPhase::Rolling),
+    )
+    .await?;
+    let (status, body) = block().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h
+        .set_state(e0, json!({"state": "allowed", "reason": "undo"}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // An unfinished template campaign does, and the refusal names it.
+    let holding = insert_campaign(
+        &h.db.pool,
+        campaign(CampaignKind::Templates, CampaignPhase::Paused),
+    )
+    .await?;
+    let generation = h.generation().await?;
+    let (status, body) = block().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_error_contains(
+        &body,
+        &format!("template runtime upgrade campaign {holding} still moves"),
+    );
+    assert!(body.get("at_risk").is_none(), "nothing else stops: {body}");
+    assert_eq!(h.generation().await?, generation, "nothing changed");
+
+    // With work bound to the environment too, the refusal reports it, since
+    // the strand: true that overrides the campaign also waives that work.
+    let tagged = insert_template_release(&h.db.pool, "tagged", Some(metadata(Some(e0)))).await?;
+    tag_release(&h.db.pool, tagged, "tagged", "latest").await?;
+    let (status, body) = block().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_error_contains(&body, &format!("campaign {holding}"));
+    assert_eq!(body["at_risk"]["bound"]["template_releases_in_use"], 1);
+
+    // Deprecating doesn't stop the releases, so it isn't held.
+    let (status, body) = h
+        .set_state(e0, json!({"state": "deprecated", "reason": "superseded"}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h
+        .set_state(
+            e0,
+            json!({"state": "blocked", "reason": "0-day", "strand": true}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Blocking it again, say to update the reason, stops nothing new.
+    let (status, body) = h
+        .set_state(
+            e0,
+            json!({"state": "blocked", "reason": "0-day, confirmed"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     Ok(())
 }

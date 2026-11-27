@@ -20,8 +20,9 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Instant;
 
-use pplx_space_common_core::types::{MaterializationMode, SnapshotArtifact};
-use pplx_space_common_jobs::{Job, JobError, JobFailureReason};
+use crate::materialization::MaterializationMode;
+use pplx_space_artifact_model::SnapshotArtifact;
+use pplx_space_volmgr_store::jobs::{Job, JobError, JobFailureReason};
 
 use crate::codec_admission::CodecPermit;
 

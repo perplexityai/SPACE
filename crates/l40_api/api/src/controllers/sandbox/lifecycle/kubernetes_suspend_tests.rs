@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
-use pplx_space_common_core::types::{LocalArtifactId, SandboxId};
 use pplx_space_db_test_fixtures::pg_test_db;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::LocalArtifactId;
 use pplx_space_test_env::TestResult;
 
 use super::*;
@@ -95,6 +96,7 @@ async fn suspend_keeps_a_wake_that_claimed_after_the_suspend_committed() -> Test
             SandboxApiMetricIdentity::native(SandboxAction::Suspend.as_str()),
             SandboxAction::Suspend,
             None,
+            crate::controllers::substrate::ActivationClient::Native,
         )
         .await?;
 

@@ -35,7 +35,7 @@ from space_smoke.capabilities import (
 from space_smoke.runtime import Compensation, ResourceScope
 
 if TYPE_CHECKING:
-    from space_smoke.fixtures import KindEcw
+    from space_smoke.fixtures import KindAdmin
 
 # The 409 body's keys. `space-rollout-mng.py` reads `sandboxes_active` and
 # `sandboxes_drain_blockers` off it to report why a rollout wave stalled.
@@ -55,7 +55,7 @@ class DrainGateAssertions:
 
     def __init__(
         self,
-        fixture: KindEcw,
+        fixture: KindAdmin,
         control: DrainGateControl,
         scope: ResourceScope,
     ) -> None:

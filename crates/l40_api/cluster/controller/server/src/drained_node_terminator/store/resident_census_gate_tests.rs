@@ -1,5 +1,5 @@
 //! Postgres-backed coverage for the census term on the resident guard shared
-//! by `mark_terminating_query` and `delete_drained_node_if_orphan_query`.
+//! by `drained_node::mark_terminating` and `drained_node::delete_if_orphan`.
 //!
 //! The pairing with node-drain is the point. Node-drain's `draining → drained`
 //! gate discounts rows a node's own census proves absent; if this guard did not
@@ -9,19 +9,20 @@
 //! fail-closed direction is unchanged: a node the control plane cannot see
 //! keeps every row blocking.
 
-use pplx_space_common_core::types::{NodeId, SandboxId, SubstrateKind};
+use pplx_space_accounts::NodeId;
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::time::Duration;
 
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_sandbox_residency::{CENSUS_INVENTORY_MAX_AGE, CENSUS_PLACEMENT_SETTLE};
+use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
-use super::{
-    PHASE_DRAINED, PHASE_TERMINATING, ResidencyEvidence, delete_refusal_diagnostics_query,
-    mark_terminating_query,
-};
+use pplx_space_node_registration_store::{drained_node, orphan_reap_refusal};
+
+use super::ResidencyEvidence;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -146,14 +147,9 @@ async fn try_mark_terminating(
     node_id: NodeId,
     residency: ResidencyEvidence,
 ) -> TestResult<u64> {
-    let query = mark_terminating_query(residency);
-    Ok(sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(node_id)
-        .bind(PHASE_TERMINATING)
-        .bind(PHASE_DRAINED)
-        .execute(pool)
-        .await?
-        .rows_affected())
+    Ok(u64::from(
+        drained_node::mark_terminating(pool, node_id, residency).await?,
+    ))
 }
 
 /// A phantom `started` row on a node whose census does not list it must not
@@ -238,14 +234,16 @@ async fn refusal_diagnostics_count_residents_through_the_same_predicate() -> Tes
     let node_id = insert_drained_node(pool, true).await?;
     insert_started_sandbox(pool, node_id).await?;
 
-    let query = delete_refusal_diagnostics_query(ResidencyEvidence::NodeCensusAware);
-    let (_, _, _, active_residents): (bool, bool, i64, i64) =
-        sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(node_id)
-            .bind(Option::<String>::None)
-            .bind(SubstrateKind::Kubernetes)
-            .fetch_one(pool)
-            .await?;
+    let orphan_reap_refusal::OrphanReapRefusal {
+        active_residents, ..
+    } = orphan_reap_refusal::diagnose(
+        pool,
+        node_id,
+        None,
+        SubstrateKind::Kubernetes,
+        ResidencyEvidence::NodeCensusAware,
+    )
+    .await?;
     assert_eq!(
         active_residents, 0,
         "the diagnosis must discount the same rows the guard does"

@@ -3,9 +3,10 @@
 
 use crate::proto::*;
 use crate::runtime_paths::SnapshotFiles;
-use pplx_space_common_core::types::NodeSpacePath;
-use pplx_space_common_core::types::{EnvironmentReference, SandboxId};
+use pplx_space_artifact_model::NodeSpacePath;
+use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_node_mgr_client::execution_fence::ExecutionFence as ParsedExecutionFence;
+use pplx_space_sandbox_model::SandboxId;
 use tonic::Status;
 
 #[derive(Debug, thiserror::Error)]
@@ -59,6 +60,7 @@ impl TryFrom<CaptureVmStateRequest> for StateCapture {
         Ok(Self {
             sandbox_id,
             environment_reference,
+            capture_directory: parse_directory(storage.directory.clone())?,
             storage: SnapshotStorage::parse(storage, snapshot_path, mem_file_path)?,
             execution_fence,
         })
@@ -90,6 +92,7 @@ pub(crate) mod tests;
 
 #[derive(Clone, Debug)]
 pub(crate) struct StateCapture {
+    pub capture_directory: Option<NodeSpacePath>,
     pub sandbox_id: SnapshotSandbox,
     pub environment_reference: Option<EnvironmentReference>,
     pub storage: SnapshotStorage,

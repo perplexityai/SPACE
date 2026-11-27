@@ -38,16 +38,31 @@ const MIGRATED_TEMPLATE: &str = "execution_record_pins_template";
 /// among the pins sharing a server.
 const TEMPLATE_LOCK: i64 = 0x7069_6e73;
 
-/// The node inventory's upsert (`store/node_inventory.rs` in the api crate).
+/// Kubernetes node registration's `node_k8s` upsert (`register.rs` in
+/// `pplx-space-node-registration-store`), verbatim but for the `$1::uuid`
+/// cast this file's text node ids need, bound as a caller without an
+/// instance binds it.
 const NODE_INVENTORY_UPSERT: &str = sql!(
-    "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid)
-     VALUES ($1::uuid, $2, $3)
+    "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid, instance_id)
+     VALUES ($1::uuid, $2, $3, $4)
      ON CONFLICT (node_id) DO UPDATE
      SET k8s_node_name = EXCLUDED.k8s_node_name,
          k8s_node_uid = EXCLUDED.k8s_node_uid,
-         updated_at = NOW()
+         instance_id = CASE
+             WHEN node_k8s.k8s_node_uid IS DISTINCT FROM EXCLUDED.k8s_node_uid
+             THEN EXCLUDED.instance_id
+             ELSE COALESCE(EXCLUDED.instance_id, node_k8s.instance_id)
+         END,
+         updated_at = CASE
+             WHEN node_k8s.k8s_node_name IS DISTINCT FROM EXCLUDED.k8s_node_name
+               OR node_k8s.k8s_node_uid IS DISTINCT FROM EXCLUDED.k8s_node_uid
+             THEN NOW()
+             ELSE node_k8s.updated_at
+         END
      WHERE node_k8s.k8s_node_name IS DISTINCT FROM EXCLUDED.k8s_node_name
-        OR node_k8s.k8s_node_uid IS DISTINCT FROM EXCLUDED.k8s_node_uid"
+        OR node_k8s.k8s_node_uid IS DISTINCT FROM EXCLUDED.k8s_node_uid
+        OR (EXCLUDED.instance_id IS NOT NULL
+            AND node_k8s.instance_id IS DISTINCT FROM EXCLUDED.instance_id)"
 );
 
 /// The execution claim's shape: a targetless `ON CONFLICT DO NOTHING`, which
@@ -63,8 +78,9 @@ const EXECUTION_CLAIM_INSERT: &str = sql!(
 );
 
 /// The credential manager's storage-vend node lookup
-/// (`storage_vend_store.rs` in the credmgr crate), without its target-node and
-/// snapshot legs, which read only `sandboxes` and `snapshots`.
+/// (`k8s_node_attribution::attributed_k8s_nodes` in `pplx-space-sandbox-store`),
+/// without its target-node and snapshot legs, which read only `sandboxes` and
+/// `snapshots`.
 const STORAGE_VEND_NODE_LOOKUP: &str = sql!(
     "WITH latest_execution AS (
          SELECT k8s_node_name
@@ -85,8 +101,9 @@ const STORAGE_VEND_NODE_LOOKUP: &str = sql!(
      WHERE k.k8s_node_uid IS NOT NULL"
 );
 
-/// The execution claim's generation allocation (`execution_rows.rs` in the api
-/// crate), which reads through the view.
+/// The execution claim's generation allocation
+/// (`k8s_executions::claim::mint_generation` in the sandbox store), which
+/// reads through the view.
 const EXECUTION_GENERATION_ALLOCATION: &str = sql!(
     "SELECT COALESCE(MAX(generation), 0) + 1
      FROM sandbox_k8s_executions
@@ -259,6 +276,7 @@ async fn upsert_node_identity(
         .bind(node_id)
         .bind(name)
         .bind(uid)
+        .bind(None::<&str>)
         .execute(&mut *conn)
         .await?
         .rows_affected())
@@ -438,7 +456,9 @@ async fn views_keep_the_old_row_types_and_writes_reach_the_base_tables() -> Test
     assert_eq!(placed, 1);
 
     // The retired-generation insert's `INSERT ... SELECT ... WHERE NOT EXISTS
-    // ... ON CONFLICT DO NOTHING` (`execution_rows.rs` in the api crate).
+    // ... ON CONFLICT DO NOTHING`
+    // (`k8s_executions::claim::retire_pool_reserved_generation` in the sandbox
+    // store).
     let other_sandbox = seed_sandbox(&mut conn, &node_id).await?;
     let retired = sqlx::query(sql!(
         "INSERT INTO sandbox_k8s_executions (

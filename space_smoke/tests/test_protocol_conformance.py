@@ -13,7 +13,7 @@ from __future__ import annotations
 import inspect
 import unittest
 
-from space_smoke import adapters, capabilities
+from space_smoke import adapters, capabilities, native
 
 # (protocol name, implementing class); protocols added by later batches are
 # included when present so the list needs no edit per branch.
@@ -31,9 +31,12 @@ PAIRS: tuple[tuple[str, type], ...] = tuple(
         ("OrphanedRestorePodGcControl", adapters.KindHarness),
         ("ReconcileQueueGcControl", adapters.KindHarness),
         ("UnansweredTemplateEvictionControl", adapters.KindHarness),
+        ("NodeCtlFacetControl", adapters.KindHarness),
         ("TemplateBuildControl", adapters.KindHarness),
         ("SandboxNetworkIsolationControl", adapters.KindHarness),
         ("ConcurrentRestoreControl", adapters.KindHarness),
+        ("DrainV2Control", adapters.KindHarness),
+        ("RawCallSandbox", native._NativeSandbox),
         ("ConsoleControl", adapters.KindHarness),
     )
     if hasattr(capabilities, name)

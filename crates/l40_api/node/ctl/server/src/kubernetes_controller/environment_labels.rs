@@ -1,8 +1,8 @@
 //! This node's environment labels: one per environment its latest complete
 //! execution inventory lists as usable (`environment_label_key` in
-//! common-core). With the environment placement gate on, a sandbox pod bound
-//! to an environment requires its label, so these labels are what lets
-//! kube-scheduler place bound work.
+//! `pplx-space-sandbox-pod`). With the environment placement gate on, a
+//! sandbox pod bound to an environment requires its label, so these labels
+//! are what lets kube-scheduler place bound work.
 //!
 //! The labels follow node-manager's own report, the same observation node-ctl
 //! publishes to the cluster:
@@ -23,11 +23,11 @@ use std::collections::BTreeSet;
 use k8s_openapi::api::core::v1::Node;
 use kube::api::{Patch, PatchParams};
 use kube::{Api, Client};
-use pplx_space_common_core::kubernetes::{
-    ENVIRONMENT_USABLE_LABEL_VALUE, environment_label_key, is_environment_label_key,
-};
 use pplx_space_execution_common::environment::EnvironmentObservation;
 use pplx_space_execution_common::proto::NodeExecutionInventory;
+use pplx_space_sandbox_pod::{
+    ENVIRONMENT_USABLE_LABEL_VALUE, environment_label_key, is_environment_label_key,
+};
 
 use super::node_watch;
 use crate::facets::execution_inventory::CollectedExecutionInventory;

@@ -24,7 +24,8 @@
 //! in-place downgrade. It is called out here so the claim above is not read as
 //! covering the whole tick.
 
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxId;
 
 use pplx_space_db_test_fixtures::try_pg_test_db;
 
@@ -183,11 +184,15 @@ async fn unrecognized_column_value_still_lists_the_node_as_a_gentle_drain() -> T
     .await?;
     write_raw_mode(&db.pool, node_id, "gently").await?;
 
-    let rows: Vec<(NodeId, Option<String>)> = sqlx::query_as(draining_nodes_query())
-        .bind(PHASE_DRAINING)
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_all(&db.pool)
-        .await?;
+    let rows: Vec<(NodeId, Option<String>)> = drain_reads::nodes_in_drain_phase_with_mode(
+        &db.pool,
+        NodeDrainPhase::Draining,
+        SubstrateKind::Kubernetes,
+    )
+    .await?
+    .into_iter()
+    .map(|row| (row.id, row.drain_mode))
+    .collect();
     let raw = rows
         .iter()
         .find(|(id, _)| *id == node_id)
@@ -233,11 +238,15 @@ async fn draining_listing_reports_mode_with_null_reading_as_gentle() -> TestResu
     .await?;
     insert_drained_node(&db.pool, null_mode, "k8s", Some("draining"), None, Some(30)).await?;
 
-    let rows: Vec<(NodeId, Option<String>)> = sqlx::query_as(draining_nodes_query())
-        .bind(PHASE_DRAINING)
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_all(&db.pool)
-        .await?;
+    let rows: Vec<(NodeId, Option<String>)> = drain_reads::nodes_in_drain_phase_with_mode(
+        &db.pool,
+        NodeDrainPhase::Draining,
+        SubstrateKind::Kubernetes,
+    )
+    .await?
+    .into_iter()
+    .map(|row| (row.id, row.drain_mode))
+    .collect();
     let observed: HashMap<NodeId, NodeDrainMode> = rows
         .into_iter()
         .map(|(id, mode)| (id, NodeDrainMode::from_column_str(mode.as_deref())))
@@ -270,11 +279,15 @@ async fn draining_listing_skips_direct_nodes() -> TestResult {
         .await?;
     }
 
-    let rows: Vec<(NodeId, Option<String>)> = sqlx::query_as(draining_nodes_query())
-        .bind(PHASE_DRAINING)
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_all(&db.pool)
-        .await?;
+    let rows: Vec<(NodeId, Option<String>)> = drain_reads::nodes_in_drain_phase_with_mode(
+        &db.pool,
+        NodeDrainPhase::Draining,
+        SubstrateKind::Kubernetes,
+    )
+    .await?
+    .into_iter()
+    .map(|row| (row.id, row.drain_mode))
+    .collect();
     let listed: Vec<NodeId> = rows.into_iter().map(|(id, _)| id).collect();
     assert_eq!(listed, vec![k8s_node]);
     Ok(())

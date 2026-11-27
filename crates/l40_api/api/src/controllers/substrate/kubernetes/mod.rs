@@ -6,7 +6,8 @@
 //!
 //! | Refused or missing | Effect today | Owner | Removed by |
 //! |---|---|---|---|
-//! | Environment placement gate `on` (`SPACE_ENVIRONMENT_PLACEMENT_GATE`) | `on` fails startup with `SubstrateError::Unsupported`. A Kubernetes create names no cache partition, so the worker boots the digest's legacy-partition build whatever environment the pod requires, and a runtime-upgrade activation's pod requires the recorded environment rather than the upgrade's target. `shadow` records, labels and counts, and places as `off` | the-gigi-pplx | the worker taking the pod's environment as its cache-partition preference, and activation pods recording an upgrade's target |
+//! | Environment placement gate `on` (`SPACE_ENVIRONMENT_PLACEMENT_GATE`) with resume-time runtime upgrades on (`SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED`) | That pair fails startup with `SubstrateError::Unsupported`: a runtime-upgrade activation's pod requires the recorded environment rather than the upgrade's target. With upgrades off, `on` runs. A cold create requires the pod's environment (`space.pplx.net/environment-required`), so the worker boots that environment's build of the digest, pulling the release bound to it, a twin included, when the node holds the digest only under another environment; a warm pool asks its nodes for that environment's build. A shim that predates the annotation ignores it, so `on` also needs every worker's shim from that release. `shadow` records, labels and counts, and places as `off`. Until `on` runs, creates keep the release a tag or digest names rather than a twin | the-gigi-pplx | activation pods recording an upgrade's target |
+//! | Admin node template pull and delete (`POST /admin/api/v1/nodes/{node_id}/template-pulls`, `DELETE /admin/api/v1/nodes/{node_id}/templates/{template_name}`) | Operators cannot pull or evict a template build on one Kubernetes node by hand: after the admin check, both answer 501 before reading the node, because `require_admin_node_registry` admits them only where `registers_nodes_via_admin_api` holds. They dial the `node_api_endpoint` stored in a node's registry row (a pull also copies from the source node's stored endpoint), and Kubernetes nodes are discovered without one | ac-pplx | Both routes resolving nodes through `resolve_node_api_endpoint` without `require_admin_node_registry`, a liveness check that sees Kubernetes node tombstones (`ensure_template_capable_node` reads only `node_direct.deleted_at`), and a pull source address the target's registered-source check accepts |
 
 use std::{
     fmt,
@@ -24,31 +25,27 @@ use kube::{
     api::{DeleteParams, PostParams, WatchEvent, WatchParams},
     runtime::reflector::{ObjectRef, Store},
 };
-use pplx_space_common_core::{
-    kubernetes::{
-        DEFAULT_SANDBOX_PROXY_PORT, ForkDiskRestorePodContext,
-        MAX_SANDBOX_NETWORK_POLICY_ANNOTATION_BYTES, NodeGroupPlacement,
-        NodeSelectorLabelsParseError, SANDBOX_NETWORK_POLICY_ANNOTATION,
-        SANDBOX_NETWORK_POLICY_AUTHORITY_ANNOTATION, SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION,
-        SandboxPodCommon, SandboxPodConfig, SandboxPodConfigValues, SandboxPodRequest,
-        SandboxRuntimePodMetadata, StoppedMaterialization, build_sandbox_pod, node_group_label,
-    },
-    types::{
-        NodeRole as SpaceNodeRole, PodName, PodResourceVersion, PodUid, SandboxId, StorageUri,
-    },
-};
-use pplx_space_k8s_node_id::space_k8s_node_id;
+use pplx_space_artifact_model::StorageUri;
+use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
+use pplx_space_k8s_node_id::{Ec2InstanceId, space_k8s_node_id};
 use pplx_space_node_api_client::{
     NodeApiClient, WorkerApiClient as RetryingWorkerApiClient,
     WorkerApiInternalClient as RetryingWorkerApiInternalClient,
     proto::worker_api_internal_client::WorkerApiInternalClient,
 };
+use pplx_space_node_model::NodeRole as SpaceNodeRole;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sandbox_pod::{
+    DEFAULT_SANDBOX_PROXY_PORT, ForkDiskRestorePodContext,
+    MAX_SANDBOX_NETWORK_POLICY_ANNOTATION_BYTES, NodeGroupPlacement, NodeSelectorLabelsParseError,
+    SANDBOX_NETWORK_POLICY_ANNOTATION, SANDBOX_NETWORK_POLICY_AUTHORITY_ANNOTATION,
+    SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION, SandboxPodCommon, SandboxPodConfig,
+    SandboxPodConfigValues, SandboxPodRequest, SandboxRuntimePodMetadata, StoppedMaterialization,
+    build_sandbox_pod, node_group_label,
+};
 use pplx_space_sbx_mgr_client::proto::SpacedWaitReadyRequest;
 use sqlx::PgPool;
-use tokio::{
-    net::TcpStream,
-    time::{Instant, sleep, timeout, timeout_at},
-};
+use tokio::time::{Instant, sleep, timeout, timeout_at};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tonic::{Code, transport::Channel};
 use tracing::Instrument;
@@ -57,8 +54,10 @@ use uuid::Uuid;
 mod budgets;
 mod caches;
 mod cancel_rate_tracker;
+mod client_live_pods;
 mod pod_reflector;
 mod pod_worker_channels;
+mod restore_dispatch_fence;
 mod restore_waiters;
 mod sandbox_pod_view;
 mod store;
@@ -66,6 +65,8 @@ mod store;
 use budgets::SubstrateBudgets;
 pub use pod_reflector::ReflectorReady;
 use sandbox_pod_view::NodeNetworkSlots;
+#[cfg(any(test, feature = "test-hooks"))]
+use sandbox_pod_view::SandboxPodIndexes;
 pub use sandbox_pod_view::{
     SandboxContainerState, SandboxContainerStatuses, SandboxContainerTerminated,
     SandboxContainerWaiting, SandboxPodKey, SandboxPodView,
@@ -77,10 +78,11 @@ pub use sandbox_pod_view::{
 // cold-vs-genuinely-empty distinction the readiness flag exists to make.
 pub use caches::K8sCaches;
 use cancel_rate_tracker::CancelRateTracker;
+pub use restore_dispatch_fence::RestoreDispatchFence;
 use restore_waiters::RestoreWaiters;
 use store::{
-    ActiveExecutionState, K8sStore, NodeLifecycleState, NodeStateWrite, PlacementClock,
-    PreparedWakeSandbox, RestoreClaim, RestoreClaimRevert, RestoreSnapshotChoice,
+    ActiveExecutionState, K8sNodeRoleUpsert, K8sStore, NodeLifecycleState, NodeStateWrite,
+    PlacementClock, PreparedWakeSandbox, RestoreClaim, RestoreClaimRevert, RestoreSnapshotChoice,
     SandboxExecutionRow, StartedRecoveryClaim, StartedRecoveryCompletion,
     StartedRecoveryObservation, UserRestoreObservation,
 };
@@ -181,11 +183,11 @@ const DEFAULT_K8S_BLOCKING_DELETE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A materialized restore execution owns downstream work for longer than any
 /// API-to-node request can remain active. The same window decides when a
 /// missing creating Pod is stale enough for generation replacement. Derived
-/// from `common-core`'s `restore_ownership` module (which compile-asserts it
+/// from `rpc-contracts`'s `restore_ownership` module (which compile-asserts it
 /// outlives the node-RPC timeout) so every deriver of this window reads one
 /// value.
 const RESTORE_EXECUTION_OWNERSHIP_TTL_SECS: i64 =
-    pplx_space_common_core::restore_ownership::RESTORE_EXECUTION_OWNERSHIP_TTL.as_secs() as i64;
+    pplx_space_rpc_contracts::restore_ownership::RESTORE_EXECUTION_OWNERSHIP_TTL.as_secs() as i64;
 /// Activation ownership must outlive every bounded API-to-node operation. A
 /// crashed owner is reclaimable after this window; a healthy owner never has
 /// to heartbeat while it is waiting on the node.
@@ -386,6 +388,7 @@ impl PodIp {
 #[derive(Clone, Debug)]
 struct ResolvedPodInstance {
     ip: PodIp,
+    source: support::PodIpSource,
     pod_uid: Option<PodUid>,
     generation: i64,
     /// The sandbox row read with the execution was `restoring`. A path that
@@ -451,6 +454,12 @@ pub struct KubernetesState {
     /// (`SPACE_ENVIRONMENT_PLACEMENT_GATE`, default off): recorded in shadow
     /// and on, and required as a node label only when it's on.
     pub environment_placement: super::environment_placement::EnvironmentPlacementGate,
+    /// Whether pods are labeled and the record written
+    /// (`SPACE_ACTIVATION_CLIENT_ATTRIBUTION_ENABLED`, default off).
+    pub activation_client_attribution: super::ActivationClientAttribution,
+    /// Whether user restores fence their unsent Wake and re-drives take over
+    /// an expired fence (`SPACE_RESTORE_DISPATCH_FENCE_ENABLED`, default off).
+    pub restore_dispatch_fence: RestoreDispatchFence,
     pub caches: Arc<K8sCaches>,
 }
 
@@ -468,8 +477,17 @@ pub enum KubernetesStateInitError {
 }
 
 impl KubernetesState {
+    /// Whether this substrate runs its environment placement gate's mode
+    /// alongside its resume-time runtime upgrades
+    /// ([`super::environment_placement::EnvironmentPlacementGate::check_kubernetes_support`]),
+    /// both as it read them; startup fails otherwise.
+    pub fn check_environment_placement_support(&self) -> Result<(), super::SubstrateError> {
+        self.environment_placement
+            .check_kubernetes_support(self.runtime_upgrade_at_activation)
+    }
+
     pub async fn try_from_env() -> Result<Option<Self>, KubernetesStateInitError> {
-        if !pplx_space_common_core::env::env_flag_var("SPACE_K8S_CONTROL_PLANE", false) {
+        if !pplx_space_env_vars::env_flag_var("SPACE_K8S_CONTROL_PLANE", false) {
             return Ok(None);
         }
 
@@ -512,8 +530,10 @@ impl KubernetesState {
                 super::runtime_upgrade::RuntimeUpgradeAtActivation::from_env(),
             environment_placement:
                 super::environment_placement::EnvironmentPlacementGate::from_environment(
-                    &pplx_space_common_core::env::ProcessEnvironment,
+                    &pplx_space_env_vars::ProcessEnvironment,
                 )?,
+            activation_client_attribution: super::ActivationClientAttribution::from_env(),
+            restore_dispatch_fence: RestoreDispatchFence::from_env(),
             sandbox_proxy_port: DEFAULT_SANDBOX_PROXY_PORT,
             node_api_port: DEFAULT_SANDBOX_PROXY_PORT,
             sandbox_pod_config: SandboxPodConfigValues::from_env()?,
@@ -868,6 +888,9 @@ pub struct KubernetesSubstrate {
     /// Per-node active network-slot totals, written from the same reflector
     /// events as `pod_store`. Read by the create-path capacity preflight.
     pod_network_slots: NodeNetworkSlots,
+    /// Per-client live sandbox-pod index and reflector freshness, written
+    /// from the same reflector events as `pod_store`. Read by the live cap.
+    pod_client_index: client_live_pods::ClientLivePods,
     /// Per-pod-name event signaller fed by the same reflector watch. Lets
     /// `read_sandbox_pod` wait briefly for the next reflector update before
     /// falling through to a direct `GET` during the brief window between pod
@@ -919,14 +942,18 @@ pub struct KubernetesSubstrate {
 
 /// Shared across substrate clones so every request on a pod sees one gate.
 type WakeCoalescer = Arc<
-    pplx_space_common_work_coalescer::WorkCoalescer<
-        SandboxId,
-        super::ExecutionActivation,
-        SubstrateError,
-    >,
+    pplx_space_work_coalescer::WorkCoalescer<SandboxId, super::ExecutionActivation, SubstrateError>,
 >;
 
 impl KubernetesSubstrate {
+    /// Whether this substrate's creates boot the twin they resolve to: the
+    /// Kubernetes worker boots a create's required environment, which a pod
+    /// carries only with the environment placement gate `on`
+    /// ([`super::Substrate::boots_template_twins`]).
+    pub(crate) fn boots_template_twins(&self) -> bool {
+        self.capabilities().boots_required_environment && self.k8s.environment_placement.refuses()
+    }
+
     pub async fn try_from_env(
         pool: &PgPool,
         shutdown_token: CancellationToken,
@@ -934,9 +961,14 @@ impl KubernetesSubstrate {
     ) -> Result<Option<Self>, SubstrateError> {
         match KubernetesState::try_from_env().await {
             Ok(Some(k8s)) => {
-                let (pod_store, pod_network_slots, pod_events, pod_reflector_ready) =
+                let (pod_store, pod_indexes, pod_events, pod_reflector_ready) =
                     pod_reflector::start(k8s.client.clone(), k8s.sandbox_namespace.clone());
-                let store = K8sStore::new(pool.clone(), k8s.sandbox_namespace.clone());
+                let store = K8sStore::new(
+                    pool.clone(),
+                    k8s.sandbox_namespace.clone(),
+                    k8s.activation_client_attribution,
+                )
+                .with_restore_dispatch_fence(k8s.restore_dispatch_fence);
                 // Read before `k8s` is moved into the struct below.
                 let node_group_placement = NodeGroupPlacementResolver::new(
                     pool.clone(),
@@ -950,13 +982,14 @@ impl KubernetesSubstrate {
                     ),
                     pod_worker_channels: Arc::default(),
                     wake_coalescer: Arc::new(
-                        pplx_space_common_work_coalescer::WorkCoalescer::with_tracker(
+                        pplx_space_work_coalescer::WorkCoalescer::with_tracker(
                             task_tracker.clone(),
                         ),
                     ),
                     store,
                     pod_store,
-                    pod_network_slots,
+                    pod_network_slots: pod_indexes.network_slots,
+                    pod_client_index: pod_indexes.client_pods,
                     pod_events,
                     pod_reflector_ready,
                     k8s,
@@ -992,6 +1025,31 @@ impl KubernetesSubstrate {
         self.pod_reflector_ready.clone()
     }
 
+    /// Mark the sandbox-pod watch as failed, as a watch error does, so tests
+    /// can drive the live cap's stale path.
+    #[cfg(test)]
+    pub(crate) fn mark_pod_watch_error_for_test(&self) {
+        self.pod_client_index.mark_watch_error();
+    }
+
+    /// Count `ids`'s live sandboxes from the sandbox-pod reflector. See
+    /// [`crate::controllers::substrate::Substrate::live_sandboxes_for_client`].
+    pub(super) fn live_sandboxes_for_client(
+        &self,
+        ids: &super::CountedIds,
+        activating: Option<SandboxId>,
+        already_pending: &std::collections::HashSet<SandboxId>,
+    ) -> super::LiveSandboxCount {
+        self.pod_client_index.count(
+            ids,
+            &super::LiveCountExclusions {
+                activating,
+                already_pending,
+            },
+            self.pod_reflector_ready.is_ready(),
+        )
+    }
+
     /// Shorten the follower-join poll pacing for a test that needs a join to
     /// notice a published outcome promptly. Production never calls this and
     /// keeps [`Default`](execution::RecoveryJoinBackoffPolicy::default).
@@ -1021,6 +1079,13 @@ impl KubernetesSubstrate {
     /// rather than `nodes.is_empty()` is what keeps a total node outage from
     /// silently failing open forever.
     pub fn eligible_start_node_count(&self) -> Option<u64> {
+        self.eligible_start_nodes()
+            .map(|nodes| u64::try_from(nodes.len()).unwrap_or(u64::MAX))
+    }
+
+    /// The nodes [`Self::eligible_start_node_count`] counts, or `None` while
+    /// the node cache is cold.
+    fn eligible_start_nodes(&self) -> Option<Vec<std::sync::Arc<Node>>> {
         if !self.k8s.caches.nodes_ready() {
             return None;
         }
@@ -1031,17 +1096,38 @@ impl KubernetesSubstrate {
         // nodes stay schedulable, so the candidate filter must follow the same
         // switch or admission would report a false `empty_cluster`.
         let exclude_placement_blocked = config.ssd_headroom_tier_affinity;
-        let count = self
-            .k8s
-            .caches
-            .nodes
-            .state()
-            .iter()
-            .filter(|node| adapter::node_schedulable(node))
-            .filter(|node| selector.matches(node))
-            .filter(|node| !exclude_placement_blocked || adapter::node_not_placement_blocked(node))
-            .count();
-        Some(count as u64)
+        Some(
+            self.k8s
+                .caches
+                .nodes
+                .state()
+                .into_iter()
+                .filter(|node| adapter::node_schedulable(node))
+                .filter(|node| selector.matches(node))
+                .filter(|node| {
+                    !exclude_placement_blocked || adapter::node_not_placement_blocked(node)
+                })
+                .collect(),
+        )
+    }
+
+    /// Network-slot headroom over [`Self::eligible_start_nodes`]: allocatable
+    /// `space.pplx.net/network-slots` minus the slots that bound, live sandbox
+    /// pods request, from the node and sandbox-pod reflectors.
+    ///
+    /// Reads low by the pods created but not yet bound, which hold no node's
+    /// slot in the index until the scheduler places them. So concurrent
+    /// activations can pass a nearly full cluster and wait `Pending`; this
+    /// is a guardrail that catches a full cluster, not a reservation.
+    pub fn network_slot_headroom(&self) -> super::NetworkSlotHeadroom {
+        use super::{NetworkSlotHeadroom, NetworkSlotHeadroomUnknown};
+        let Some(nodes) = self.eligible_start_nodes() else {
+            return NetworkSlotHeadroom::Unknown(NetworkSlotHeadroomUnknown::NodeCacheCold);
+        };
+        if !self.pod_reflector_ready.is_ready() {
+            return NetworkSlotHeadroom::Unknown(NetworkSlotHeadroomUnknown::PodCacheCold);
+        }
+        adapter::network_slot_headroom(&nodes, &self.pod_network_slots)
     }
 
     /// Source-aware restore shortlist: the source node first, then up to
@@ -1329,4 +1415,7 @@ use pod_ops::ExecutionHydrationOutcome;
 use pod_ops::{ActivationAttemptAssignment, PodMaterializationOwnership, StartedRecoveryOwnership};
 use restore_intent::{RestoreClaimMode, RestoreIntent, RestorePodPlacement};
 #[cfg(any(test, feature = "test-hooks"))]
-pub use test_substrate::{TEST_SANDBOX_NAMESPACE, retire_executions_predating_current_stop};
+pub use test_substrate::{
+    TEST_SANDBOX_NAMESPACE, release_stopped_evacuation_placement,
+    retire_executions_predating_current_stop,
+};

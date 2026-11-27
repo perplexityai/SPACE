@@ -355,6 +355,7 @@ async fn early_server_exit_stops_parent_and_releases_mutex() {
         supervise_node_local_servers(
             servers,
             node_local,
+            Handoff::AfterDrain,
             shutdown_token,
             CancellationToken::new(),
         ),
@@ -374,6 +375,163 @@ async fn early_server_exit_stops_parent_and_releases_mutex() {
     .await
     .expect("replacement should acquire the released mutex");
     drop(replacement);
+}
+
+/// An agent service whose upstream is never dialed: these tests hold the
+/// drain open with a health watch, not a forwarded call.
+fn undialed_agent_service(shutdown: &CancellationToken) -> NodeCredentialManager {
+    let upstream = pplx_space_credmgr_client::CredentialManagerClient::new(
+        pplx_space_common_grpc::trace_grpc_client_transport(
+            tonic::service::interceptor::InterceptedService::new(
+                tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+                pplx_space_credmgr_client::CredmgrBearerInterceptor::None,
+            ),
+        ),
+    );
+    NodeCredentialManager::new(
+        upstream.clone(),
+        Arc::new(NodeCa::new(upstream).unwrap()),
+        PeerProcessCheckMode::Off,
+        shutdown.clone(),
+    )
+}
+
+/// A health watch on `socket`, held open after its first answer.
+async fn open_health_watch(
+    socket: &Path,
+) -> (
+    tonic_health::pb::health_client::HealthClient<tonic::transport::Channel>,
+    tonic::Streaming<tonic_health::pb::HealthCheckResponse>,
+) {
+    let socket = socket.to_path_buf();
+    let channel = tonic::transport::Endpoint::from_static("http://localhost")
+        .connect_with_connector(tower::service_fn(move |_| {
+            let path = socket.clone();
+            async move {
+                tokio::net::UnixStream::connect(path)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
+        .await
+        .unwrap();
+    let mut health = tonic_health::pb::health_client::HealthClient::new(channel);
+    let mut watch = health
+        .watch(tonic_health::pb::HealthCheckRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    watch.message().await.unwrap().unwrap();
+    (health, watch)
+}
+
+#[tokio::test]
+async fn shutdown_closes_the_listener_while_accepted_connections_drain() {
+    let dir = tempdir().unwrap();
+    let socket = dir.path().join("standard.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let shutdown = CancellationToken::new();
+    let server = tokio::spawn(serve_uds_until(
+        listener,
+        undialed_agent_service(&shutdown),
+        shutdown.clone(),
+        CredentialUdsAccess::Standard,
+    ));
+    let (health, watch) = open_health_watch(&socket).await;
+
+    shutdown.cancel();
+
+    let refused = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match tokio::net::UnixStream::connect(&socket).await {
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => break,
+                // Still open; the server has not yet seen the shutdown.
+                _ => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await;
+    assert!(
+        refused.is_ok(),
+        "a draining server must refuse new connections instead of queueing them"
+    );
+    assert!(
+        !server.is_finished(),
+        "the accepted watch must still be draining"
+    );
+
+    drop(watch);
+    drop(health);
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the drain should end once its last connection closes")
+        .unwrap()
+        .unwrap();
+}
+
+#[rstest::rstest]
+#[case::at_drain_start(Handoff::AtDrainStart, true)]
+#[case::after_drain(Handoff::AfterDrain, false)]
+#[tokio::test]
+async fn the_successor_takes_the_mutex_when_the_handoff_says(
+    #[case] handoff: Handoff,
+    #[case] during_drain: bool,
+) {
+    let dir = tempdir().unwrap();
+    let mutex_path = dir.path().join("service.mutex");
+    let socket = dir.path().join("standard.sock");
+    let service_mutex = ServiceMutex::acquire(
+        &mutex_path,
+        CancellationToken::new(),
+        Duration::from_millis(10),
+        None,
+    )
+    .await
+    .unwrap();
+    let shutdown = CancellationToken::new();
+    let predecessor = tokio::spawn(serve_node_local_uds(
+        CredentialListeners {
+            standard: tokio::net::UnixListener::bind(&socket).unwrap(),
+            volume: None,
+        },
+        undialed_agent_service(&shutdown),
+        socket.clone(),
+        NodeLocalActivation {
+            health_server: LocalHealthServer::disabled(),
+            service_mutex,
+        },
+        handoff,
+        shutdown.clone(),
+    ));
+    let (health, watch) = open_health_watch(&socket).await;
+
+    shutdown.cancel();
+
+    let successor = ServiceMutex::acquire(
+        &mutex_path,
+        CancellationToken::new(),
+        Duration::from_millis(10),
+        Some(Duration::from_millis(500)),
+    )
+    .await;
+    assert_eq!(
+        successor.is_ok(),
+        during_drain,
+        "successor acquired the mutex while the predecessor drained: {successor:?}"
+    );
+    assert!(
+        !predecessor.is_finished(),
+        "the accepted watch must still be draining"
+    );
+    drop(successor);
+
+    drop(watch);
+    drop(health);
+    tokio::time::timeout(Duration::from_secs(5), predecessor)
+        .await
+        .expect("the drain should end once its last connection closes")
+        .unwrap()
+        .unwrap();
 }
 
 #[test]

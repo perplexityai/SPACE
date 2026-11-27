@@ -1,15 +1,14 @@
 use super::*;
 use axum::{Router, body::Body, http::Method, http::Request, response::IntoResponse as _};
+use pplx_space_accounts::NodeId;
 use pplx_space_api_route::ed25519::{
     SPACE_API_ROUTE_ED25519_ISSUER_ENV, SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID_ENV,
     SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV, SpaceApiRouteEd25519Authority,
 };
-use pplx_space_common_core::{
-    sql,
-    types::{NodeId, SandboxId},
-};
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDb, TestDbResult, pg_test_db};
 use pplx_space_node_api_sim::{SimProcessSpec, SimWorkerHarness};
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sql_locator::sql;
 use serde_json::json;
 use tokio_stream::StreamExt as _;
 use tower::ServiceExt as _;
@@ -126,7 +125,7 @@ fn public_process_reports_an_exit_like_process_exited() {
 #[test]
 fn public_process_rejects_an_invalid_runtime_process_id() {
     let error = public_process(spaced_ops::ProcessInfo {
-        process_id: "x".repeat(pplx_space_common_core::types::MAX_PROCESS_ID_BYTES + 1),
+        process_id: "x".repeat(pplx_space_guest_process::MAX_PROCESS_ID_BYTES + 1),
         pid: 42,
         command: vec!["true".to_string()],
         cwd: None,
@@ -513,4 +512,43 @@ async fn processes_of_guests_that_keep_assigned_ids_answer_as_before() -> TestDb
     }
     assert_eq!(fixture.listed().await?, Vec::<String>::new());
     Ok(())
+}
+
+/// A process call refused because the sandbox is at rest and may not be woken
+/// answers as `createCommand` does, with the reason, state and wake request in
+/// `details`; any other conflict keeps none.
+#[tokio::test]
+async fn a_sandbox_at_rest_answers_with_the_command_refusal_details() {
+    use http_body_util::BodyExt;
+    use pplx_space_public_api::{PublicErrorCode, PublicErrorEnvelope};
+    use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+
+    async fn envelope(error: ControllerError) -> PublicErrorEnvelope {
+        let response = controller_error(error).into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    let sandbox_id = SandboxId::new();
+    let refused = envelope(ControllerError::sandbox_not_running(
+        crate::controllers::SandboxNotRunning {
+            sandbox_id,
+            lifecycle: SandboxLifecycle::Paused,
+        },
+        "sandbox is not running",
+    ))
+    .await;
+    assert_eq!(refused.code, PublicErrorCode::Conflict);
+    assert!(!refused.retryable);
+    assert_eq!(
+        refused.details,
+        pplx_space_public_api::sandbox_not_running_details(
+            sandbox_id.into(),
+            &pplx_space_public_api::SandboxLifecycleState::Paused,
+        )
+    );
+
+    let other = envelope(ControllerError::conflict("process is busy")).await;
+    assert!(other.details.is_empty(), "{other:?}");
 }

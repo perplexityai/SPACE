@@ -1,11 +1,15 @@
-use pplx_space_common_core::types::{OrgId, UserId};
+mod plan;
+
+use pplx_space_accounts::{OrgId, UserId};
 
 use std::time::Duration;
 
-use pplx_space_common_core::types::{
-    ContentHash, Digest, MemorySize, SandboxId, SandboxLifecycle, TemplateName, VcpuCount,
-};
+use pplx_space_byte_size::MemorySize;
+use pplx_space_content_digest::{ContentHash, Digest};
 use pplx_space_db_test_fixtures::{TestDb, pg_test_db};
+use pplx_space_execution_spec::VcpuCount;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+use pplx_space_template_model::TemplateName;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -631,7 +635,7 @@ async fn autoscale_configs_prepares_new_release_without_observed_demand() -> Tes
     let (release_id, _content_hash) = seed_release(&fixture.pool, "seed", 0x45).await?;
     upsert_warm_pool_policy(&fixture.pool, "seed", 2, 10, 1).await?;
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let config = sqlx::query_as::<_, (i32, i32, i32, String, bool, String)>(
         "SELECT target_ready_slots, refill_per_tick, max_warming_slots,
@@ -672,7 +676,7 @@ async fn autoscale_configs_materializes_warm_pool_disk_io_policy() -> TestResult
     .execute(&fixture.pool)
     .await?;
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let limits = sqlx::query_as::<_, (Option<i32>, i64, i64)>(
         "SELECT disk_mib, disk_io_max_operations_per_sec,
@@ -737,7 +741,7 @@ async fn autoscale_configs_prepares_republished_exact_release_without_observed_d
     .bind(previous_release_id)
     .execute(&fixture.pool)
     .await?;
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
     let previous_config_id = sqlx::query_scalar::<_, Uuid>(
         "SELECT id
          FROM kubernetes_pool_configs
@@ -778,7 +782,7 @@ async fn autoscale_configs_prepares_republished_exact_release_without_observed_d
     .bind(republished_hash.to_string())
     .execute(&fixture.pool)
     .await?;
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let configs = sqlx::query_as::<_, (Uuid, i32, bool, String)>(
         "SELECT template_release_id, target_ready_slots, enabled, managed_by
@@ -801,7 +805,7 @@ async fn autoscale_configs_uses_policy_refill_and_warming_slots() -> TestResult 
     let (release_id, _content_hash) = seed_release(&fixture.pool, "seed", 0x46).await?;
     upsert_warm_pool_policy_with_pacing(&fixture.pool, "seed", 5, 100, 20, 40, 1).await?;
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let config = sqlx::query_as::<_, (i32, i32, i32)>(
         "SELECT target_ready_slots, refill_per_tick, max_warming_slots
@@ -836,7 +840,7 @@ async fn autoscale_ignores_templates_without_policy() -> TestResult {
     .bind(config_id)
     .fetch_one(&fixture.pool)
     .await?;
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let config_count = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)::BIGINT
@@ -876,7 +880,7 @@ async fn autoscale_uses_per_template_min_and_max_when_set() -> TestResult {
         insert_k8s_sandbox(&fixture.pool, content_hash, None, None).await?;
     }
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let target_ready_slots = sqlx::query_scalar::<_, i32>(
         "SELECT target_ready_slots
@@ -898,7 +902,7 @@ async fn autoscale_prepares_multiple_retained_releases_without_demand() -> TestR
     seed_release(&fixture.pool, "seed", 0x43).await?;
     upsert_warm_pool_policy(&fixture.pool, "seed", 4, 7, 2).await?;
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let targets = sqlx::query_scalar::<_, i32>(
         "SELECT target_ready_slots
@@ -923,7 +927,7 @@ async fn autoscale_keeps_unretained_release_with_recent_demand() -> TestResult {
         insert_k8s_sandbox(&fixture.pool, old_hash, None, None).await?;
     }
     // act
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     // assert
     let old_target = sqlx::query_scalar::<_, i32>(
@@ -947,7 +951,7 @@ async fn autoscale_requires_sustained_demand_for_unretained_release() -> TestRes
     upsert_warm_pool_policy(&fixture.pool, "seed", 2, 10, 1).await?;
 
     insert_k8s_sandbox(&fixture.pool, old_hash, None, None).await?;
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
     let config_below_threshold = sqlx::query_scalar::<_, Uuid>(
         "SELECT id
          FROM kubernetes_pool_configs
@@ -960,7 +964,7 @@ async fn autoscale_requires_sustained_demand_for_unretained_release() -> TestRes
     for _ in 1..10 {
         insert_k8s_sandbox(&fixture.pool, old_hash, None, None).await?;
     }
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
     let target_at_threshold = sqlx::query_scalar::<_, i32>(
         "SELECT target_ready_slots
          FROM kubernetes_pool_configs
@@ -986,7 +990,7 @@ async fn autoscale_ignores_unretained_demand_for_unsupported_shape() -> TestResu
         insert_k8s_sandbox(&fixture.pool, old_hash, Some(4), Some(2048)).await?;
     }
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let old_config = sqlx::query_scalar::<_, Uuid>(
         "SELECT id
@@ -1017,7 +1021,7 @@ async fn autoscale_bounds_demand_selected_releases_per_policy() -> TestResult {
         insert_k8s_sandbox(&fixture.pool, second_demanded_hash, None, None).await?;
     }
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let selected_releases = sqlx::query_scalar::<_, Uuid>(
         "SELECT template_release_id
@@ -1060,7 +1064,7 @@ async fn autoscale_bounds_demand_selected_releases_per_policy() -> TestResult {
     for _ in 0..11 {
         insert_k8s_sandbox(&fixture.pool, second_demanded_hash, None, None).await?;
     }
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
     let configs_after_demand_shift = sqlx::query_as::<_, (Uuid, bool, i32)>(
         "SELECT template_release_id, enabled, target_ready_slots
          FROM kubernetes_pool_configs
@@ -1101,7 +1105,7 @@ async fn autoscale_counts_fallthrough_space_sandboxes_as_recent_demand() -> Test
     }
 
     // act
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     // assert
     let old_target = sqlx::query_scalar::<_, i32>(
@@ -1143,7 +1147,7 @@ async fn autoscale_matches_prefixed_sandbox_demand_to_bare_release_hash() -> Tes
     }
 
     // act
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     // assert
     let old_target = sqlx::query_scalar::<_, i32>(
@@ -1191,7 +1195,7 @@ async fn autoscale_deletes_empty_policy_owned_pool_when_policy_is_removed() -> T
 
     let retired_configs = fixture
         .store
-        .autoscale_configs("sandboxes")
+        .autoscale_configs("sandboxes", None)
         .await?
         .retired
         .configs;
@@ -1301,7 +1305,7 @@ async fn autoscale_keeps_retired_config_until_open_slots_are_drained() -> TestRe
         })
         .await?;
     // act
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
     let config_enabled = sqlx::query_scalar::<_, bool>(
         "SELECT enabled
          FROM kubernetes_pool_configs
@@ -1311,7 +1315,7 @@ async fn autoscale_keeps_retired_config_until_open_slots_are_drained() -> TestRe
     .fetch_one(&fixture.pool)
     .await?;
     fixture.store.delete_open_slot(slot.id).await?;
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     // assert
     assert!(!config_enabled);
@@ -1395,7 +1399,7 @@ async fn autoscale_disables_all_autoscaler_configs_when_all_policies_are_disable
         .execute(&fixture.pool)
         .await?;
     // act
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     // assert
     let configs = sqlx::query_as::<_, (bool, i32)>(
@@ -1417,7 +1421,7 @@ async fn autoscale_drains_old_shape_when_policy_shape_changes() -> TestResult {
     let template = TemplateName::parse("seed")?;
     let (release_id, content_hash) = seed_release(&fixture.pool, "seed", 0x53).await?;
     upsert_warm_pool_policy(&fixture.pool, "seed", 2, 10, 1).await?;
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
     let old_config_id = sqlx::query_scalar::<_, Uuid>(
         "SELECT id
          FROM kubernetes_pool_configs
@@ -1458,7 +1462,7 @@ async fn autoscale_drains_old_shape_when_policy_shape_changes() -> TestResult {
     .await?;
 
     // act
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     // assert
     let configs = sqlx::query_as::<_, (i32, i32, bool, i32)>(
@@ -1569,7 +1573,7 @@ async fn autoscale_configs_grows_target_when_traffic_increases() -> TestResult {
         insert_k8s_sandbox(&fixture.pool, content_hash, None, None).await?;
     }
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let target_ready_slots = sqlx::query_scalar::<_, i32>(
         "SELECT target_ready_slots
@@ -1611,7 +1615,7 @@ async fn autoscale_configs_shrinks_target_when_traffic_decreases_but_keeps_min()
 
     insert_k8s_sandbox(&fixture.pool, content_hash, None, None).await?;
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let target_ready_slots = sqlx::query_scalar::<_, i32>(
         "SELECT target_ready_slots
@@ -1653,7 +1657,7 @@ async fn autoscale_configs_deletes_empty_unretained_pool_after_lookback_with_no_
     seed_release(&fixture.pool, "seed", 0x58).await?;
     upsert_warm_pool_policy(&fixture.pool, "seed", 1, 10, 1).await?;
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let config_count = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)::BIGINT
@@ -1703,7 +1707,7 @@ async fn autoscale_disables_demand_selected_pool_after_demand_expires() -> TestR
         })
         .await?;
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
     sqlx::query(
         "UPDATE sandboxes
          SET created_at = NOW() - INTERVAL '25 hours'
@@ -1713,7 +1717,7 @@ async fn autoscale_disables_demand_selected_pool_after_demand_expires() -> TestR
     .bind(old_hash.to_string())
     .execute(&fixture.pool)
     .await?;
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let retired = sqlx::query_as::<_, (bool, i32)>(
         "SELECT enabled, target_ready_slots
@@ -1726,7 +1730,7 @@ async fn autoscale_disables_demand_selected_pool_after_demand_expires() -> TestR
     assert_eq!(retired, (false, 0));
 
     fixture.store.delete_open_slot(slot.id).await?;
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
     let config_count = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)::BIGINT
          FROM kubernetes_pool_configs
@@ -1761,7 +1765,7 @@ async fn autoscale_configs_does_not_touch_manual_configs() -> TestResult {
     .fetch_one(&fixture.pool)
     .await?;
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let after = sqlx::query_as::<_, (i32, i32, i32, String, bool, String)>(
         "SELECT target_ready_slots, refill_per_tick, max_warming_slots,
@@ -1837,7 +1841,7 @@ async fn store_claims_oldest_ready_slot_once() -> TestResult {
 
     let mut tx = fixture.pool.begin().await?;
     let claimed = WarmPoolStore::claim_ready_slot(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         vcpu,
         memory,
@@ -1898,14 +1902,14 @@ async fn store_claims_exclude_oversized_disks_without_consuming_slots() -> TestR
         (None, true),
         (Some(131072), true),
     ] {
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "UPDATE kubernetes_pool_configs SET disk_mib = $2 WHERE id = $1"
         ))
         .bind(config_id)
         .bind(disk_mib)
         .execute(&fixture.pool)
         .await?;
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "UPDATE kubernetes_pool_slots SET disk_mib = $2 WHERE id = $1"
         ))
         .bind(slot.id)
@@ -1916,7 +1920,7 @@ async fn store_claims_exclude_oversized_disks_without_consuming_slots() -> TestR
             let mut tx = fixture.pool.begin().await?;
             let claim = if exact_shape {
                 WarmPoolStore::claim_ready_slot(
-                    &mut tx,
+                    &mut *tx,
                     release_id,
                     vcpu,
                     memory,
@@ -1927,7 +1931,7 @@ async fn store_claims_exclude_oversized_disks_without_consuming_slots() -> TestR
                 .await?
             } else {
                 WarmPoolStore::claim_ready_slot_for_release(
-                    &mut tx,
+                    &mut *tx,
                     release_id,
                     "space",
                     Uuid::now_v7(),
@@ -1940,7 +1944,7 @@ async fn store_claims_exclude_oversized_disks_without_consuming_slots() -> TestR
                 allowed,
                 "{disk_mib:?}, exact={exact_shape}"
             );
-            let state: String = sqlx::query_scalar(pplx_space_common_core::sql!(
+            let state: String = sqlx::query_scalar(pplx_space_sql_locator::sql!(
                 "SELECT state FROM kubernetes_pool_slots WHERE id = $1"
             ))
             .bind(slot.id)
@@ -1985,7 +1989,7 @@ async fn store_claim_routes_by_encryptable_partition() -> TestResult {
     // While the config is plaintext, an encrypted claim must not touch it.
     let mut tx = fixture.pool.begin().await?;
     let encrypted_claim_on_plaintext = WarmPoolStore::claim_ready_slot(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         vcpu,
         memory,
@@ -1999,7 +2003,7 @@ async fn store_claim_routes_by_encryptable_partition() -> TestResult {
         "encrypted claim must not drain a plaintext pool"
     );
     let encrypted_shape_on_plaintext = WarmPoolStore::preferred_enabled_shape_for_release(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         "space",
         None,
@@ -2016,7 +2020,7 @@ async fn store_claim_routes_by_encryptable_partition() -> TestResult {
 
     let mut tx = fixture.pool.begin().await?;
     let plaintext_claim = WarmPoolStore::claim_ready_slot(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         vcpu,
         memory,
@@ -2030,7 +2034,7 @@ async fn store_claim_routes_by_encryptable_partition() -> TestResult {
         "plaintext claim must not see the encryptable pool"
     );
     let plaintext_release_claim = WarmPoolStore::claim_ready_slot_for_release(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         "space",
         Uuid::now_v7(),
@@ -2039,7 +2043,7 @@ async fn store_claim_routes_by_encryptable_partition() -> TestResult {
     .await?;
     assert!(plaintext_release_claim.is_none());
     let plaintext_shape = WarmPoolStore::preferred_enabled_shape_for_release(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         "space",
         None,
@@ -2052,7 +2056,7 @@ async fn store_claim_routes_by_encryptable_partition() -> TestResult {
     );
 
     let encrypted_shape = WarmPoolStore::preferred_enabled_shape_for_release(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         "space",
         None,
@@ -2061,7 +2065,7 @@ async fn store_claim_routes_by_encryptable_partition() -> TestResult {
     .await?;
     assert!(encrypted_shape.is_some());
     let encrypted_claim = WarmPoolStore::claim_ready_slot(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         vcpu,
         memory,
@@ -2095,10 +2099,10 @@ async fn manual_pool_creation_uses_platform_limits_and_updates_preserve_assignme
         encryptable: false,
     };
     let mut tx = fixture.pool.begin().await?;
-    let id = WarmPoolStore::upsert_manual_config(&mut tx, release_id, &spec).await?;
+    let id = WarmPoolStore::upsert_manual_config(&mut *tx, release_id, &spec).await?;
     tx.commit().await?;
     let created = fixture.store.config_with_counts(id).await?.unwrap();
-    let defaults = pplx_space_common_core::types::DiskIoLimits::default();
+    let defaults = pplx_space_execution_spec::DiskIoLimits::default();
     assert_eq!(
         created.disk_io_max_operations_per_sec,
         i64::try_from(defaults.max_operations_per_sec())?
@@ -2108,7 +2112,7 @@ async fn manual_pool_creation_uses_platform_limits_and_updates_preserve_assignme
         i64::try_from(defaults.max_bandwidth_mib_per_sec())?
     );
 
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE kubernetes_pool_configs
          SET disk_io_max_operations_per_sec = $2,
              disk_io_max_bandwidth_mib_per_sec = $3
@@ -2121,7 +2125,7 @@ async fn manual_pool_creation_uses_platform_limits_and_updates_preserve_assignme
     .await?;
     let mut tx = fixture.pool.begin().await?;
     assert_eq!(
-        WarmPoolStore::upsert_manual_config(&mut tx, release_id, &spec).await?,
+        WarmPoolStore::upsert_manual_config(&mut *tx, release_id, &spec).await?,
         id
     );
     tx.commit().await?;
@@ -2158,7 +2162,7 @@ async fn store_manual_upsert_fences_encryptable_partition() -> TestResult {
     };
 
     let mut tx = fixture.pool.begin().await?;
-    let err = WarmPoolStore::upsert_manual_config(&mut tx, template_release_id, &spec)
+    let err = WarmPoolStore::upsert_manual_config(&mut *tx, template_release_id, &spec)
         .await
         .expect_err("encryptable specs must be fenced in the store");
     assert!(matches!(err, PoolError::EncryptableConfigFenced));
@@ -2237,7 +2241,7 @@ async fn store_claim_skips_slot_with_stale_disk_io_assignment() -> TestResult {
 
     let mut tx = fixture.pool.begin().await?;
     let claimed = WarmPoolStore::claim_ready_slot(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         vcpu,
         memory,
@@ -2327,7 +2331,7 @@ async fn store_claim_ready_slot_skips_ready_slot_without_pod_ip() -> TestResult 
     // act
     let mut tx = fixture.pool.begin().await?;
     let claimed = WarmPoolStore::claim_ready_slot(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         vcpu,
         memory,
@@ -2383,7 +2387,7 @@ async fn store_claim_ready_slot_skips_other_namespaces() -> TestResult {
     // act
     let mut tx = fixture.pool.begin().await?;
     let claimed = WarmPoolStore::claim_ready_slot(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         vcpu,
         memory,
@@ -2458,7 +2462,7 @@ async fn store_claim_ready_slot_for_release_skips_ready_slot_without_pod_ip() ->
     // act
     let mut tx = fixture.pool.begin().await?;
     let claimed = WarmPoolStore::claim_ready_slot_for_release(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         "space",
         claim_id,
@@ -2542,7 +2546,7 @@ async fn store_delete_open_slot_skips_claimed_slot() -> TestResult {
     .await?;
     let mut tx = fixture.pool.begin().await?;
     WarmPoolStore::claim_ready_slot(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         vcpu,
         memory,
@@ -2596,7 +2600,7 @@ async fn store_stale_unbound_claimed_slots_can_be_locked_and_deleted() -> TestRe
     .await?;
     let mut claim_tx = fixture.pool.begin().await?;
     WarmPoolStore::claim_ready_slot(
-        &mut claim_tx,
+        &mut *claim_tx,
         template_release_id,
         vcpu,
         memory,
@@ -2629,13 +2633,13 @@ async fn store_stale_unbound_claimed_slots_can_be_locked_and_deleted() -> TestRe
     let mut delete_tx = fixture.pool.begin().await?;
     assert!(
         WarmPoolStore::lock_stale_unbound_claimed_slot_for_delete(
-            &mut delete_tx,
+            &mut *delete_tx,
             slot.id,
             Duration::from_secs(5 * 60),
         )
         .await?
     );
-    assert!(WarmPoolStore::delete_locked_claimed_slot(&mut delete_tx, slot.id).await?);
+    assert!(WarmPoolStore::delete_locked_claimed_slot(&mut *delete_tx, slot.id).await?);
     delete_tx.commit().await?;
 
     let exists: bool = sqlx::query_scalar(
@@ -2679,7 +2683,7 @@ async fn store_stale_claimed_slot_exists_tracks_staleness_and_bind_stamp() -> Te
     .await?;
     let mut claim_tx = fixture.pool.begin().await?;
     WarmPoolStore::claim_ready_slot(
-        &mut claim_tx,
+        &mut *claim_tx,
         template_release_id,
         vcpu,
         memory,
@@ -2761,7 +2765,7 @@ async fn store_stale_claimed_slot_exists_tracks_staleness_and_bind_stamp() -> Te
     // invisible to the sweep.
     let mut bind_tx = fixture.pool.begin().await?;
     assert!(
-        WarmPoolStore::bind_claimed_slot(&mut bind_tx, claim_id, slot.reserved_sandbox_id).await?
+        WarmPoolStore::bind_claimed_slot(&mut *bind_tx, claim_id, slot.reserved_sandbox_id).await?
     );
     bind_tx.commit().await?;
     assert!(
@@ -2803,7 +2807,7 @@ async fn store_cleanup_pending_slots_can_be_locked_and_deleted() -> TestResult {
     .await?;
     let mut claim_tx = fixture.pool.begin().await?;
     WarmPoolStore::claim_ready_slot(
-        &mut claim_tx,
+        &mut *claim_tx,
         template_release_id,
         vcpu,
         memory,
@@ -2814,7 +2818,7 @@ async fn store_cleanup_pending_slots_can_be_locked_and_deleted() -> TestResult {
     .await?;
     assert!(
         WarmPoolStore::mark_claimed_slot_cleanup_pending(
-            &mut claim_tx,
+            &mut *claim_tx,
             claim_id,
             reserved_sandbox_id,
         )
@@ -2831,8 +2835,8 @@ async fn store_cleanup_pending_slots_can_be_locked_and_deleted() -> TestResult {
     assert_eq!(cleanup_pending[0].state, PoolSlotState::CleanupPending);
 
     let mut delete_tx = fixture.pool.begin().await?;
-    assert!(WarmPoolStore::lock_cleanup_pending_slot_for_delete(&mut delete_tx, slot.id).await?);
-    assert!(WarmPoolStore::delete_locked_cleanup_pending_slot(&mut delete_tx, slot.id).await?);
+    assert!(WarmPoolStore::lock_cleanup_pending_slot_for_delete(&mut *delete_tx, slot.id).await?);
+    assert!(WarmPoolStore::delete_locked_cleanup_pending_slot(&mut *delete_tx, slot.id).await?);
     delete_tx.commit().await?;
 
     let exists: bool = sqlx::query_scalar(
@@ -2879,7 +2883,7 @@ async fn store_delete_claimed_slot_for_retired_execution_deletes_claimed_slot() 
     .await?;
     let mut claim_tx = fixture.pool.begin().await?;
     WarmPoolStore::claim_ready_slot(
-        &mut claim_tx,
+        &mut *claim_tx,
         template_release_id,
         vcpu,
         memory,
@@ -2953,7 +2957,7 @@ async fn store_delete_claimed_slot_for_retired_execution_skips_open_and_cleanup_
     .await?;
     let mut claim_tx = fixture.pool.begin().await?;
     WarmPoolStore::claim_ready_slot(
-        &mut claim_tx,
+        &mut *claim_tx,
         template_release_id,
         vcpu,
         memory,
@@ -2964,7 +2968,7 @@ async fn store_delete_claimed_slot_for_retired_execution_skips_open_and_cleanup_
     .await?;
     assert!(
         WarmPoolStore::mark_claimed_slot_cleanup_pending(
-            &mut claim_tx,
+            &mut *claim_tx,
             claim_id,
             cleanup_pending_sandbox_id,
         )
@@ -3047,7 +3051,7 @@ async fn store_delete_claimed_slots_for_retired_executions_deletes_receipts_in_b
     let mut claim_tx = fixture.pool.begin().await?;
     let bound_claim_id = Uuid::now_v7();
     let bound_slot = WarmPoolStore::claim_ready_slot(
-        &mut claim_tx,
+        &mut *claim_tx,
         template_release_id,
         vcpu,
         memory,
@@ -3059,14 +3063,14 @@ async fn store_delete_claimed_slots_for_retired_executions_deletes_receipts_in_b
     .expect("bound slot claim must hit");
     assert!(
         WarmPoolStore::bind_claimed_slot(
-            &mut claim_tx,
+            &mut *claim_tx,
             bound_claim_id,
             bound_slot.reserved_sandbox_id
         )
         .await?
     );
     let claimed_slot = WarmPoolStore::claim_ready_slot(
-        &mut claim_tx,
+        &mut *claim_tx,
         template_release_id,
         vcpu,
         memory,
@@ -3081,9 +3085,9 @@ async fn store_delete_claimed_slots_for_retired_executions_deletes_receipts_in_b
     // act
     let mut conn = fixture.pool.acquire().await?;
     let no_ids_deleted =
-        WarmPoolStore::delete_claimed_slots_for_retired_executions(&mut conn, &[]).await?;
+        WarmPoolStore::delete_claimed_slots_for_retired_executions(&mut *conn, &[]).await?;
     let deleted = WarmPoolStore::delete_claimed_slots_for_retired_executions(
-        &mut conn,
+        &mut *conn,
         &[
             bound_slot.reserved_sandbox_id,
             claimed_slot.reserved_sandbox_id,
@@ -3348,7 +3352,7 @@ async fn store_reserved_sandbox_delete_lock_deletes_ready_slot() -> TestResult {
     // act
     let mut tx = fixture.pool.begin().await?;
     let locked = match WarmPoolStore::lock_open_slot_for_delete_by_reserved_sandbox_id(
-        &mut tx,
+        &mut *tx,
         reserved_sandbox_id,
     )
     .await?
@@ -3356,7 +3360,7 @@ async fn store_reserved_sandbox_delete_lock_deletes_ready_slot() -> TestResult {
         OpenPoolSlotDeleteLock::Locked(locked) => locked,
         other => panic!("expected locked slot, got {other:?}"),
     };
-    let deleted = WarmPoolStore::delete_locked_open_slot(&mut tx, locked.id).await?;
+    let deleted = WarmPoolStore::delete_locked_open_slot(&mut *tx, locked.id).await?;
     tx.commit().await?;
 
     // assert
@@ -3419,7 +3423,7 @@ async fn store_claim_ready_slot_only_locks_slots() -> TestResult {
 
     let mut first_tx = fixture.pool.begin().await?;
     let first_claim = WarmPoolStore::claim_ready_slot(
-        &mut first_tx,
+        &mut *first_tx,
         template_release_id,
         vcpu,
         memory,
@@ -3433,7 +3437,7 @@ async fn store_claim_ready_slot_only_locks_slots() -> TestResult {
     // act
     let mut second_tx = fixture.pool.begin().await?;
     let second_claim = WarmPoolStore::claim_ready_slot(
-        &mut second_tx,
+        &mut *second_tx,
         template_release_id,
         vcpu,
         memory,
@@ -3493,7 +3497,7 @@ async fn claim_slot_for_bind(
 ) -> TestResult {
     let mut claim_tx = fixture.pool.begin().await?;
     WarmPoolStore::claim_ready_slot(
-        &mut claim_tx,
+        &mut *claim_tx,
         template_release_id,
         VcpuCount::try_from_u32(2)?,
         MemorySize::mib(1024)?,
@@ -3539,9 +3543,9 @@ async fn store_bind_claimed_slot_stamps_bound_exactly_once() -> TestResult {
     // act
     let mut bind_tx = fixture.pool.begin().await?;
     let bound =
-        WarmPoolStore::bind_claimed_slot(&mut bind_tx, claim_id, reserved_sandbox_id).await?;
+        WarmPoolStore::bind_claimed_slot(&mut *bind_tx, claim_id, reserved_sandbox_id).await?;
     let rebound =
-        WarmPoolStore::bind_claimed_slot(&mut bind_tx, claim_id, reserved_sandbox_id).await?;
+        WarmPoolStore::bind_claimed_slot(&mut *bind_tx, claim_id, reserved_sandbox_id).await?;
     bind_tx.commit().await?;
 
     // assert: the stamp is a CAS — the second attempt finds no claimed row.
@@ -3571,7 +3575,7 @@ async fn store_stale_sweep_ignores_bound_slots() -> TestResult {
     .await?;
     claim_slot_for_bind(&fixture, template_release_id, claim_id).await?;
     let mut bind_tx = fixture.pool.begin().await?;
-    assert!(WarmPoolStore::bind_claimed_slot(&mut bind_tx, claim_id, reserved_sandbox_id).await?);
+    assert!(WarmPoolStore::bind_claimed_slot(&mut *bind_tx, claim_id, reserved_sandbox_id).await?);
     bind_tx.commit().await?;
     sqlx::query(
         "UPDATE kubernetes_pool_slots
@@ -3619,13 +3623,13 @@ async fn store_cleanup_pending_marks_bound_slot() -> TestResult {
     .await?;
     claim_slot_for_bind(&fixture, template_release_id, claim_id).await?;
     let mut bind_tx = fixture.pool.begin().await?;
-    assert!(WarmPoolStore::bind_claimed_slot(&mut bind_tx, claim_id, reserved_sandbox_id).await?);
+    assert!(WarmPoolStore::bind_claimed_slot(&mut *bind_tx, claim_id, reserved_sandbox_id).await?);
     bind_tx.commit().await?;
 
     // act: a failed prepare parks the bound slot as reconciler-owned work.
     let mut mark_tx = fixture.pool.begin().await?;
     let marked = WarmPoolStore::mark_claimed_slot_cleanup_pending(
-        &mut mark_tx,
+        &mut *mark_tx,
         claim_id,
         reserved_sandbox_id,
     )
@@ -3658,7 +3662,7 @@ async fn store_retired_execution_delete_removes_bound_slot() -> TestResult {
     .await?;
     claim_slot_for_bind(&fixture, template_release_id, claim_id).await?;
     let mut bind_tx = fixture.pool.begin().await?;
-    assert!(WarmPoolStore::bind_claimed_slot(&mut bind_tx, claim_id, reserved_sandbox_id).await?);
+    assert!(WarmPoolStore::bind_claimed_slot(&mut *bind_tx, claim_id, reserved_sandbox_id).await?);
     bind_tx.commit().await?;
 
     // act
@@ -3702,7 +3706,7 @@ async fn store_dead_claimed_drain_deletes_suspended_bound_slot() -> TestResult {
     .await?;
     claim_slot_for_bind(&fixture, template_release_id, claim_id).await?;
     let mut bind_tx = fixture.pool.begin().await?;
-    assert!(WarmPoolStore::bind_claimed_slot(&mut bind_tx, claim_id, reserved_sandbox_id).await?);
+    assert!(WarmPoolStore::bind_claimed_slot(&mut *bind_tx, claim_id, reserved_sandbox_id).await?);
     bind_tx.commit().await?;
     insert_sandbox_with_lifecycle(
         &fixture.pool,
@@ -3773,7 +3777,7 @@ async fn store_bind_source_reads_locked_identity_and_normalizes_pod_uid() -> Tes
         .await?;
     let mut claim_tx = fixture.pool.begin().await?;
     WarmPoolStore::claim_ready_slot(
-        &mut claim_tx,
+        &mut *claim_tx,
         template_release_id,
         vcpu,
         memory,
@@ -3787,9 +3791,9 @@ async fn store_bind_source_reads_locked_identity_and_normalizes_pod_uid() -> Tes
 
     // act
     let mut bind_tx = fixture.pool.begin().await?;
-    let source = WarmPoolStore::bind_source(&mut bind_tx, claim_id, reserved_sandbox_id).await?;
+    let source = WarmPoolStore::bind_source(&mut *bind_tx, claim_id, reserved_sandbox_id).await?;
     let missing =
-        WarmPoolStore::bind_source(&mut bind_tx, Uuid::now_v7(), reserved_sandbox_id).await?;
+        WarmPoolStore::bind_source(&mut *bind_tx, Uuid::now_v7(), reserved_sandbox_id).await?;
     bind_tx.commit().await?;
 
     // assert: identity columns come back, and a blank pod_uid is normalized
@@ -4209,7 +4213,7 @@ async fn autoscale_merges_hash_spellings_and_default_shapes_into_one_demand_grou
             .await?;
     }
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let target = sqlx::query_scalar::<_, i32>(
         "SELECT target_ready_slots
@@ -4266,7 +4270,7 @@ async fn config_reads_decode_blake3_release_hashes() -> TestResult {
 
     let retired = fixture
         .store
-        .autoscale_configs("space")
+        .autoscale_configs("space", None)
         .await?
         .retired
         .configs;
@@ -4339,7 +4343,11 @@ async fn config_reads_keep_valid_rows_when_one_row_is_invalid() -> TestResult {
 
     // The autoscaler deletes the empty, disabled row although it is invalid,
     // and reports it. The valid manual config stays.
-    let retired = fixture.store.autoscale_configs("space").await?.retired;
+    let retired = fixture
+        .store
+        .autoscale_configs("space", None)
+        .await?
+        .retired;
     assert!(retired.configs.is_empty());
     assert_eq!(retired.invalid_rows.len(), 1);
     assert_eq!(retired.invalid_rows[0].id, bad_config_id);
@@ -4403,7 +4411,7 @@ async fn autoscale_skips_an_invalid_demand_row_and_holds_only_its_release() -> T
     )
     .await?;
 
-    let run = fixture.store.autoscale_configs("sandboxes").await?;
+    let run = fixture.store.autoscale_configs("sandboxes", None).await?;
 
     assert_eq!(run.invalid_rows.len(), 1);
     assert_eq!(run.invalid_rows[0].read, AutoscaleRead::ObservedDemand);
@@ -4432,7 +4440,7 @@ async fn autoscale_skips_an_invalid_demand_row_and_holds_only_its_release() -> T
     sqlx::query("DELETE FROM sandboxes WHERE template_id = 'held'")
         .execute(&fixture.pool)
         .await?;
-    let run = fixture.store.autoscale_configs("sandboxes").await?;
+    let run = fixture.store.autoscale_configs("sandboxes", None).await?;
 
     assert!(run.invalid_rows.is_empty());
     assert_eq!(
@@ -4489,7 +4497,7 @@ async fn autoscale_skips_an_invalid_policy_row_and_holds_its_releases() -> TestR
     )
     .await?;
 
-    let run = fixture.store.autoscale_configs("sandboxes").await?;
+    let run = fixture.store.autoscale_configs("sandboxes", None).await?;
 
     assert_eq!(run.invalid_rows.len(), 1);
     assert_eq!(
@@ -4575,7 +4583,7 @@ async fn autoscale_writes_the_other_candidates_when_one_write_fails() -> TestRes
     upsert_warm_pool_policy(&fixture.pool, "seed", 2, 10, 1).await?;
     refuse_config_writes_for_refused_template(&fixture.pool).await?;
 
-    let run = fixture.store.autoscale_configs("sandboxes").await?;
+    let run = fixture.store.autoscale_configs("sandboxes", None).await?;
 
     assert_eq!(
         run.failed_candidates
@@ -4627,7 +4635,7 @@ async fn autoscale_holds_a_failed_candidates_old_shape_config() -> TestResult {
     upsert_warm_pool_policy(&fixture.pool, "refused", 2, 10, 1).await?;
     refuse_config_writes_for_refused_template(&fixture.pool).await?;
 
-    let run = fixture.store.autoscale_configs("sandboxes").await?;
+    let run = fixture.store.autoscale_configs("sandboxes", None).await?;
 
     assert_eq!(
         run.failed_candidates
@@ -4662,7 +4670,6 @@ struct ResolverReleases {
     blake3: Uuid,
     latest_holder: Uuid,
     dual_bare: Uuid,
-    dual_prefixed: Uuid,
 }
 
 const RESOLVER_TEMPLATE: &str = "resolver-fixture";
@@ -4711,8 +4718,9 @@ async fn seed_resolver_releases(pool: &PgPool) -> TestResult<ResolverReleases> {
         blake3: release(pool, format!("blake3:{}", hex('c')), "3 days").await?,
         latest_holder: release(pool, format!("sha256:{}", hex('d')), "6 days").await?,
         dual_bare: release(pool, hex('9'), "8 days").await?,
-        dual_prefixed: release(pool, format!("sha256:{}", hex('9')), "7 days").await?,
     };
+    // `dual_bare`'s other spelling: never the digest's original.
+    release(pool, format!("sha256:{}", hex('9')), "7 days").await?;
     tag(pool, releases.bare, "legacy", "0 seconds").await?;
     tag(pool, releases.bare, "legacy", "2 days").await?;
     tag(pool, releases.bare, "archived", "0 seconds").await?;
@@ -4769,8 +4777,8 @@ async fn retained_policy_release_ranking_characterization() -> TestResult {
 }
 
 /// Characterization of observed-demand matching: a recent sandbox's
-/// `content_hash` names the release stored in the same form first, else the
-/// one stored in the other of the bare and `sha256:` forms. Each case records
+/// `content_hash` names its digest's original, stored in either of the bare
+/// and `sha256:` forms. Each case records
 /// enough demand for one unretained release and reports every release the
 /// autoscaler gave a pool beside the retained `latest_holder`. Matching never
 /// reads `templates`, so demand for a template being deleted still gets a pool.
@@ -4783,14 +4791,14 @@ async fn observed_demand_release_matching_characterization() -> TestResult {
         (hex('a'), "present", Some(|w| w.bare)),
         (sha('a'), "present", Some(|w| w.bare)),
         (sha('b'), "present", Some(|w| w.prefixed)),
-        // The pool config upsert answers not found for this bare request.
         (hex('b'), "present", Some(|w| w.prefixed)),
         (blake('c'), "present", Some(|w| w.blake3)),
         (hex('c'), "present", None),
         (blake('a'), "present", None),
-        // The exact form wins over the newer `dual_prefixed`.
+        // Both forms stored, neither with a storage location: the older
+        // `dual_bare` is the digest's original whichever form names it.
         (hex('9'), "present", Some(|w| w.dual_bare)),
-        (sha('9'), "present", Some(|w| w.dual_prefixed)),
+        (sha('9'), "present", Some(|w| w.dual_bare)),
         // A template being deleted still gets a pool. Pinned as today's
         // behaviour, not a contract: consolidating the resolvers is expected
         // to stop that.
@@ -4826,7 +4834,7 @@ async fn observed_demand_release_matching_characterization() -> TestResult {
             .await?;
         }
 
-        fixture.store.autoscale_configs("sandboxes").await?;
+        fixture.store.autoscale_configs("sandboxes", None).await?;
 
         let demanded = sqlx::query_scalar::<_, Uuid>(
             "SELECT template_release_id
@@ -4845,5 +4853,637 @@ async fn observed_demand_release_matching_characterization() -> TestResult {
             "demand={demand_hash} {desired_state}"
         );
     }
+    Ok(())
+}
+
+/// Twins: once `idx_template_releases_template_name_hash_unique` is gone, a
+/// release can have a twin with the same template and hash, bound to another
+/// execution environment and registered after it. Retention and demand
+/// matching count originals only, so a fresh, untagged twin neither uses up a
+/// retain slot nor takes its original's demand.
+#[tokio::test(flavor = "current_thread")]
+async fn retention_and_demand_ignore_twins() -> TestResult {
+    let fixture = postgres_fixture().await?;
+    let w = seed_resolver_releases(&fixture.pool).await?;
+    sqlx::query("DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique")
+        .execute(&fixture.pool)
+        .await?;
+    for original in [w.latest_holder, w.bare] {
+        sqlx::query(
+            "INSERT INTO template_releases (template_name, type, hash, execution_metadata)
+             SELECT template_name, type, hash,
+                    jsonb_build_object('environment', 'sha256:' || repeat('7', 64))
+             FROM template_releases WHERE id = $1",
+        )
+        .bind(original)
+        .execute(&fixture.pool)
+        .await?;
+    }
+    let sha = |c| format!("sha256:{}", hex(c));
+
+    upsert_warm_pool_policy(&fixture.pool, RESOLVER_TEMPLATE, 1, 10, 2).await?;
+    let mut protected = fixture
+        .store
+        .protected_template_releases()
+        .await?
+        .into_iter()
+        .map(|release| release.content_hash)
+        .collect::<Vec<_>>();
+    protected.sort();
+    assert_eq!(
+        protected,
+        vec![sha('d'), sha('e')],
+        "the twin of `latest_holder` takes no slot"
+    );
+
+    upsert_warm_pool_policy(&fixture.pool, RESOLVER_TEMPLATE, 2, 10, 1).await?;
+    for _ in 0..10 {
+        insert_sandbox_for_template(
+            &fixture.pool,
+            RESOLVER_TEMPLATE,
+            "k8s",
+            &hex('a'),
+            None,
+            None,
+        )
+        .await?;
+    }
+    fixture.store.autoscale_configs("sandboxes", None).await?;
+    let demanded = sqlx::query_scalar::<_, Uuid>(
+        "SELECT template_release_id
+         FROM kubernetes_pool_configs
+         WHERE template_release_id <> $1",
+    )
+    .bind(w.latest_holder)
+    .fetch_all(&fixture.pool)
+    .await?;
+    assert_eq!(
+        demanded,
+        vec![w.bare],
+        "demand for `bare` stays on the original"
+    );
+    Ok(())
+}
+
+/// A twin of `original` bound to the environment `environment_ref`,
+/// registered after it. Twins exist only once the `(template_name, hash)`
+/// unique index is dropped, which this does to stand in for the contract
+/// migration.
+async fn insert_twin_of(pool: &PgPool, original: Uuid, environment_ref: &str) -> TestResult<Uuid> {
+    sqlx::query("DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique")
+        .execute(pool)
+        .await?;
+    Ok(sqlx::query_scalar(
+        "INSERT INTO template_releases (template_name, type, hash, execution_metadata, created_at)
+         SELECT template_name, type, hash, jsonb_build_object('environment', $2::TEXT),
+                clock_timestamp()
+         FROM template_releases WHERE id = $1
+         RETURNING id",
+    )
+    .bind(original)
+    .bind(environment_ref)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// The autoscaler gives a build's retained slot and demand to the release
+/// creates of it resolve to (`pplx_space_template_release_store::resolved_release_sql`),
+/// and retires the original's pools once a twin takes over. Without
+/// resolution, or while the twin's environment has no policy state, they
+/// stay on the original; with the twin's environment the default, they move.
+#[tokio::test(flavor = "current_thread")]
+async fn autoscaling_follows_the_release_creates_resolve_to() -> TestResult {
+    let fixture = postgres_fixture().await?;
+    let (original, content_hash) = seed_release(&fixture.pool, "seed", 0x72).await?;
+    let initial = format!("sha256:{}", "0".repeat(64));
+    let e1 = format!("sha256:{}", "7".repeat(64));
+    let twin = insert_twin_of(&fixture.pool, original, &e1).await?;
+    upsert_warm_pool_policy(&fixture.pool, "seed", 2, 10, 1).await?;
+    // 21 recent creates set a demand target of 3, above the floor of 2.
+    for _ in 0..21 {
+        insert_sandbox_for_template(
+            &fixture.pool,
+            "seed",
+            "k8s",
+            &content_hash.to_string(),
+            None,
+            None,
+        )
+        .await?;
+    }
+    let enabled_releases = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT DISTINCT template_release_id
+             FROM kubernetes_pool_configs
+             WHERE enabled AND managed_by = 'autoscaler'",
+        )
+        .fetch_all(&pool)
+        .await
+    };
+
+    fixture.store.autoscale_configs("sandboxes", None).await?;
+    assert_eq!(
+        enabled_releases(fixture.pool.clone()).await?,
+        vec![original]
+    );
+    fixture
+        .store
+        .autoscale_configs("sandboxes", Some(&initial))
+        .await?;
+    assert_eq!(
+        enabled_releases(fixture.pool.clone()).await?,
+        vec![original],
+        "a twin whose environment has no policy state isn't resolved"
+    );
+
+    sqlx::query(
+        "INSERT INTO runtime_environment_states (environment_ref, state, reason)
+         VALUES ($1, 'allowed', 'test')",
+    )
+    .bind(&e1)
+    .execute(&fixture.pool)
+    .await?;
+    sqlx::query(
+        "UPDATE runtime_environment_policy
+         SET default_environment_ref = $1, generation = generation + 1
+         WHERE singleton",
+    )
+    .bind(&e1)
+    .execute(&fixture.pool)
+    .await?;
+    fixture
+        .store
+        .autoscale_configs("sandboxes", Some(&initial))
+        .await?;
+    assert_eq!(
+        enabled_releases(fixture.pool.clone()).await?,
+        vec![twin],
+        "the twin creates resolve to takes the pool; the original's is retired"
+    );
+    let twin_targets = sqlx::query_scalar::<_, i32>(
+        "SELECT target_ready_slots
+         FROM kubernetes_pool_configs
+         WHERE template_release_id = $1 AND enabled AND managed_by = 'autoscaler'",
+    )
+    .bind(twin)
+    .fetch_all(&fixture.pool)
+    .await?;
+    assert_eq!(
+        twin_targets,
+        vec![3],
+        "the twin takes the original's demand"
+    );
+    Ok(())
+}
+
+/// A digest stored under both spellings: retention protects only its
+/// original, ranked by a tag on either spelling, and demand under either
+/// spelling goes to its original, the
+/// release creates resolve and the pool config upsert targets, with twins and
+/// without.
+#[rstest::rstest]
+#[case::without_twins(false)]
+#[case::with_twins(true)]
+#[tokio::test(flavor = "current_thread")]
+async fn retention_and_demand_pick_the_digest_original(#[case] twins: bool) -> TestResult {
+    use pplx_space_template_release_store::spelling_pairs::{OLD_INDEX, seed_spelling_pairs};
+    use pplx_space_template_store::test_support::tag_release;
+    const TEMPLATE: &str = "spelling-pairs";
+    let fixture = postgres_fixture().await?;
+    let pool = &fixture.pool;
+    insert_template(pool, TEMPLATE).await?;
+    if twins {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP INDEX IF EXISTS {OLD_INDEX}"
+        )))
+        .execute(pool)
+        .await?;
+    }
+    let twin_metadata = twins.then_some(r#"{"environment": "fixture-twin"}"#);
+    let pairs = seed_spelling_pairs(pool, TEMPLATE, twin_metadata).await?;
+
+    upsert_warm_pool_policy(pool, TEMPLATE, 1, 10, 20).await?;
+    let mut protected = fixture
+        .store
+        .protected_template_releases()
+        .await?
+        .into_iter()
+        .map(|release| release.content_hash)
+        .collect::<Vec<_>>();
+    protected.sort();
+    let mut expected = pairs
+        .iter()
+        .map(|pair| pair.original_hash().to_owned())
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(protected, expected, "one retained release per digest");
+
+    // With one retain slot, a `latest` tag left on the other spelling's
+    // original, as one written before the shared rule can be, publishes its
+    // digest: the slot goes to that digest's original.
+    upsert_warm_pool_policy(pool, TEMPLATE, 1, 10, 1).await?;
+    for pair in &pairs {
+        tag_release(pool, TEMPLATE, pair.other(), "latest").await?;
+        let protected = fixture
+            .store
+            .protected_template_releases()
+            .await?
+            .into_iter()
+            .map(|release| release.content_hash)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            protected,
+            vec![pair.original_hash().to_owned()],
+            "latest on {}",
+            pair.other()
+        );
+    }
+
+    // The newest release holds the one retain slot, so demand alone decides
+    // which of the pairs' releases gets a pool.
+    let retained = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO template_releases (id, template_name, type, hash)
+         VALUES ($1, $2, 'fc', $3)",
+    )
+    .bind(retained)
+    .bind(TEMPLATE)
+    .bind(format!("sha256:{}", hex('e')))
+    .execute(pool)
+    .await?;
+    upsert_warm_pool_policy(pool, TEMPLATE, 2, 10, 1).await?;
+    for pair in &pairs {
+        for hash in [&pair.canonical_hash, &pair.bare_hash] {
+            sqlx::query("DELETE FROM sandboxes WHERE template_id = $1")
+                .bind(TEMPLATE)
+                .execute(pool)
+                .await?;
+            sqlx::query("DELETE FROM kubernetes_pool_configs")
+                .execute(pool)
+                .await?;
+            for _ in 0..10 {
+                insert_sandbox_for_template(pool, TEMPLATE, "k8s", hash, None, None).await?;
+            }
+            fixture.store.autoscale_configs("sandboxes", None).await?;
+            let demanded = sqlx::query_scalar::<_, Uuid>(
+                "SELECT template_release_id
+                 FROM kubernetes_pool_configs
+                 WHERE template_release_id <> $1",
+            )
+            .bind(retained)
+            .fetch_all(pool)
+            .await?;
+            assert_eq!(demanded, vec![pair.original], "demand={hash}");
+        }
+    }
+    Ok(())
+}
+
+/// A campaign hands a release's operator-managed pools to its twin: each
+/// plaintext manual config is copied with its shape, targets and `enabled`,
+/// once, and autoscaler-owned configs are left for the autoscaler.
+#[tokio::test(flavor = "current_thread")]
+async fn a_twin_gets_copies_of_its_originals_manual_configs() -> TestResult {
+    let fixture = postgres_fixture().await?;
+    let (original, _) = seed_release(&fixture.pool, "seed", 0x71).await?;
+    let spec = ManualPoolConfigSpec {
+        vcpu: 4,
+        memory_mib: 2048,
+        disk_mib: Some(8192),
+        reset_disk_to_template_default: false,
+        target_ready_slots: 3,
+        refill_per_tick: 2,
+        max_warming_slots: 2,
+        namespace: "space",
+        enabled: true,
+        encryptable: false,
+    };
+    let mut tx = fixture.pool.begin().await?;
+    WarmPoolStore::upsert_manual_config(&mut *tx, original, &spec).await?;
+    tx.commit().await?;
+    sqlx::query(
+        "INSERT INTO kubernetes_pool_configs (
+             template_release_id, vcpu, memory_mib, target_ready_slots, refill_per_tick,
+             max_warming_slots, namespace, enabled, managed_by
+         )
+         VALUES ($1, 2, 1024, 1, 1, 1, 'space', TRUE, 'autoscaler')",
+    )
+    .bind(original)
+    .execute(&fixture.pool)
+    .await?;
+    let twin = insert_twin_of(
+        &fixture.pool,
+        original,
+        &format!("sha256:{}", "7".repeat(64)),
+    )
+    .await?;
+
+    assert_eq!(
+        WarmPoolStore::copy_manual_configs_from_releases(
+            &mut *fixture.pool.acquire().await?,
+            &[original],
+            twin
+        )
+        .await?,
+        1
+    );
+    assert_eq!(
+        WarmPoolStore::copy_manual_configs_from_releases(
+            &mut *fixture.pool.acquire().await?,
+            &[original],
+            twin
+        )
+        .await?,
+        0,
+        "a retry copies nothing twice"
+    );
+    let configs = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            i32,
+            i32,
+            Option<i32>,
+            i32,
+            i32,
+            i32,
+            String,
+            bool,
+            String,
+        ),
+    >(
+        "SELECT template_release_id, vcpu, memory_mib, disk_mib, target_ready_slots,
+                refill_per_tick, max_warming_slots, namespace, enabled, managed_by
+         FROM kubernetes_pool_configs
+         WHERE managed_by = 'manual'
+         ORDER BY created_at",
+    )
+    .fetch_all(&fixture.pool)
+    .await?;
+    assert_eq!(configs.len(), 2);
+    assert_eq!(configs[1].0, twin);
+    assert_eq!(
+        (
+            &configs[0].1,
+            &configs[0].2,
+            &configs[0].3,
+            &configs[0].4,
+            &configs[0].5,
+            &configs[0].6,
+            &configs[0].7,
+            &configs[0].8
+        ),
+        (
+            &configs[1].1,
+            &configs[1].2,
+            &configs[1].3,
+            &configs[1].4,
+            &configs[1].5,
+            &configs[1].6,
+            &configs[1].7,
+            &configs[1].8
+        ),
+    );
+    let autoscaled_on_twin: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM kubernetes_pool_configs
+         WHERE template_release_id = $1 AND managed_by = 'autoscaler'",
+    )
+    .bind(twin)
+    .fetch_one(&fixture.pool)
+    .await?;
+    assert_eq!(autoscaled_on_twin, 0);
+    Ok(())
+}
+
+/// The autoscaler can make a twin's config as soon as the twin exists, before
+/// the campaign copies the original's manual configs. A shape the autoscaler
+/// took first is handed to the original's manual settings, since the
+/// autoscaler never overwrites a manual config; one the operator already set
+/// on the twin is kept.
+#[tokio::test(flavor = "current_thread")]
+async fn a_twin_copy_takes_over_the_autoscalers_config_of_a_manual_shape() -> TestResult {
+    let fixture = postgres_fixture().await?;
+    let (original, _) = seed_release(&fixture.pool, "seed", 0x73).await?;
+    let mut tx = fixture.pool.begin().await?;
+    for (vcpu, memory_mib, target_ready_slots) in [(4, 2048, 3), (8, 4096, 5)] {
+        WarmPoolStore::upsert_manual_config(
+            &mut *tx,
+            original,
+            &ManualPoolConfigSpec {
+                vcpu,
+                memory_mib,
+                disk_mib: Some(8192),
+                reset_disk_to_template_default: false,
+                target_ready_slots,
+                refill_per_tick: 2,
+                max_warming_slots: 2,
+                namespace: "space",
+                enabled: true,
+                encryptable: false,
+            },
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    let twin = insert_twin_of(
+        &fixture.pool,
+        original,
+        &format!("sha256:{}", "7".repeat(64)),
+    )
+    .await?;
+    // The autoscaler got to the 4x2048 shape first; the operator set 8x4096
+    // on the twin.
+    sqlx::query(
+        "INSERT INTO kubernetes_pool_configs (
+             template_release_id, vcpu, memory_mib, target_ready_slots, refill_per_tick,
+             max_warming_slots, namespace, enabled, managed_by
+         )
+         VALUES ($1, 4, 2048, 1, 1, 1, 'space', TRUE, 'autoscaler'),
+                ($1, 8, 4096, 9, 1, 1, 'space', FALSE, 'manual')",
+    )
+    .bind(twin)
+    .execute(&fixture.pool)
+    .await?;
+
+    WarmPoolStore::copy_manual_configs_from_releases(
+        &mut *fixture.pool.acquire().await?,
+        &[original],
+        twin,
+    )
+    .await?;
+    let configs = sqlx::query_as::<_, (i32, i32, Option<i32>, i32, bool, String)>(
+        "SELECT vcpu, memory_mib, disk_mib, target_ready_slots, enabled, managed_by
+         FROM kubernetes_pool_configs
+         WHERE template_release_id = $1
+         ORDER BY vcpu",
+    )
+    .bind(twin)
+    .fetch_all(&fixture.pool)
+    .await?;
+    assert_eq!(
+        configs,
+        vec![
+            (4, 2048, Some(8192), 3, true, "manual".to_owned()),
+            (8, 4096, None, 9, false, "manual".to_owned()),
+        ]
+    );
+    Ok(())
+}
+
+/// A ready slot on a node with a v2 drain, in any phase or being cancelled,
+/// or with a drain engine this build doesn't know, is never claimed, though
+/// it is the oldest, by a shape's claim or a release's. A v1 drain's node, in
+/// any phase, is claimed as before, oldest first, and so is an undrained one
+/// and a slot with no node name; with only those slots left the claim finds
+/// none.
+#[tokio::test(flavor = "current_thread")]
+async fn a_slot_on_a_v2_draining_node_is_never_claimed() -> TestResult {
+    for by_release in [false, true] {
+        a_slot_on_a_v2_draining_node_is_never_claimed_by(by_release).await?;
+    }
+    Ok(())
+}
+
+async fn a_slot_on_a_v2_draining_node_is_never_claimed_by(by_release: bool) -> TestResult {
+    let fixture = postgres_fixture().await?;
+    let template = TemplateName::parse("seed")?;
+    let (template_release_id, config_id, content_hash) =
+        seed_pool_config(&fixture.pool, 0x12).await?;
+    let (vcpu, memory) = default_shape()?;
+    // Oldest first: every v2 drain phase and a v2 drain being cancelled, an
+    // engine this build doesn't know with no phase, every v1 drain phase,
+    // then an undrained node.
+    let nodes = [
+        ("worker-v2-draining", Some("draining"), Some("v2")),
+        ("worker-v2-drained", Some("drained"), Some("v2")),
+        ("worker-v2-terminating", Some("terminating"), Some("v2")),
+        ("worker-v2-cancelling", None, Some("v2")),
+        ("worker-unknown-engine", None, Some("v9")),
+        ("worker-v1-draining", Some("draining"), None),
+        ("worker-v1-drained", Some("drained"), None),
+        ("worker-v1-terminating", Some("terminating"), None),
+        ("worker-undrained", None, None),
+    ];
+    let mut slots = Vec::new();
+    for (index, (node_name, phase, engine)) in nodes.into_iter().enumerate() {
+        let node_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO nodes (id, address, role, managed_by, state, drain_phase, drain_engine)
+             VALUES ($1, '10.0.0.50', 'worker', 'k8s', 'registered', $2, $3)",
+        )
+        .bind(node_id)
+        .bind(phase)
+        .bind(engine)
+        .execute(&fixture.pool)
+        .await?;
+        sqlx::query("INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, $2)")
+            .bind(node_id)
+            .bind(node_name)
+            .execute(&fixture.pool)
+            .await?;
+        let slot = fixture
+            .store
+            .insert_warming_slot(NewPoolSlot {
+                reserved_sandbox_id: SandboxId::new(),
+                ..new_slot(
+                    config_id,
+                    template_release_id,
+                    &template,
+                    content_hash,
+                    vcpu,
+                    memory,
+                    &format!("space-sbx-drain-{index}-g1"),
+                )
+            })
+            .await?;
+        sqlx::query(
+            "UPDATE kubernetes_pool_slots
+             SET state = 'ready',
+                 ready_at = NOW() - make_interval(secs => 10 - $2),
+                 pod_uid = 'pod-uid',
+                 pod_ip = '10.90.0.8',
+                 k8s_node_name = $3
+             WHERE id = $1",
+        )
+        .bind(slot.id)
+        .bind(index as i32)
+        .bind(node_name)
+        .execute(&fixture.pool)
+        .await?;
+        slots.push(slot.id);
+    }
+    // The newest: a ready slot whose pod has no node name yet.
+    let nameless = fixture
+        .store
+        .insert_warming_slot(NewPoolSlot {
+            reserved_sandbox_id: SandboxId::new(),
+            ..new_slot(
+                config_id,
+                template_release_id,
+                &template,
+                content_hash,
+                vcpu,
+                memory,
+                "space-sbx-drain-nameless-g1",
+            )
+        })
+        .await?;
+    sqlx::query(
+        "UPDATE kubernetes_pool_slots
+         SET state = 'ready',
+             ready_at = NOW() - make_interval(secs => 1),
+             pod_uid = 'pod-uid',
+             pod_ip = '10.90.0.8',
+             k8s_node_name = NULL
+         WHERE id = $1",
+    )
+    .bind(nameless.id)
+    .execute(&fixture.pool)
+    .await?;
+
+    let claim = || async {
+        let mut tx = fixture.pool.begin().await?;
+        let claimed = if by_release {
+            WarmPoolStore::claim_ready_slot_for_release(
+                &mut *tx,
+                template_release_id,
+                "space",
+                Uuid::now_v7(),
+                false,
+            )
+            .await?
+        } else {
+            WarmPoolStore::claim_ready_slot(
+                &mut *tx,
+                template_release_id,
+                vcpu,
+                memory,
+                "space",
+                Uuid::now_v7(),
+                false,
+            )
+            .await?
+        };
+        tx.commit().await?;
+        TestResult::Ok(claimed.map(|slot| slot.id))
+    };
+    for (index, node) in nodes.iter().enumerate().skip(5) {
+        assert_eq!(
+            claim().await?,
+            slots.get(index).copied(),
+            "by_release={by_release}: {}'s slot",
+            node.0
+        );
+    }
+    assert_eq!(
+        claim().await?,
+        Some(nameless.id),
+        "by_release={by_release}: the slot with no node name"
+    );
+    assert_eq!(
+        claim().await?,
+        None,
+        "by_release={by_release}: only v2 and unknown engines' slots are left"
+    );
     Ok(())
 }

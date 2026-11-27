@@ -1150,7 +1150,7 @@ fn restore_directory_metadata(path: &Path, before: &std::fs::Metadata) {
 fn bound_cold_boot_uses_the_recorded_runtime_and_never_the_node_default() {
     let component = kernel("6.18.44", 0x61, false, false);
     let candidate = requested("1.17.0", "12.0.0", vec![component.metadata.clone()])
-        .with_environment(pplx_space_common_core::types::EnvironmentReference::new(
+        .with_environment(pplx_space_execution_spec::EnvironmentReference::new(
             Digest::sha256([8; 32]),
         ));
     for candidate_present in [true, false] {

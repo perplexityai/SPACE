@@ -38,17 +38,18 @@
 //! Ships enabled and repairs eligible rows directly. It emits the sandbox
 //! transition event after the CAS succeeds.
 
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use std::time::{Duration, Instant};
 
 use crate::metrics::cluster_reconciler::{
     self as metrics, Loop, Mode, OutcomeEvent, RepairOutcome,
 };
-use pplx_space_common_core::types::{PositiveDuration, SandboxId};
+use pplx_space_durations::PositiveDuration;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_sandbox_model::SandboxId;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
@@ -93,10 +94,10 @@ impl ReconcilerConfig {
     /// Read config from env vars. Helm renders this under
     /// `clusterController.reconcilers.failedRestorableRepair.*`.
     pub fn from_env() -> Self {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
-    pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+    pub(crate) fn from_environment(env: &dyn pplx_space_env_vars::Environment) -> Self {
         Self {
             // Ships enabled and writes, so a malformed value must disable it
             // rather than leave it running.

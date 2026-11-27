@@ -1,28 +1,36 @@
-use pplx_space_common_core::types::JobId;
+use pplx_space_accounts::JobId;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::artifact::{ArtifactEntryRole, ArtifactId};
 use crate::crypto::wrap_aad;
-use pplx_space_common_core::types::{
-    MaterializationMode, SnapshotArtifact, StorageUri, SubjectId, TransferScopeId,
-    parse_snapshot_object_key,
-};
-use pplx_space_common_core::{host::linux::identities::user_names, host::linux::identities::users};
-use pplx_space_common_core::{types::KekProvider, types::MasterKeyIdentifier, types::OrgId};
-use pplx_space_common_jobs::{
-    BackgroundWorker, JobExecutor, JobFailure, JobFailureReason, JobPriority, PriorityBand,
-    WorkerConfig,
-};
+use crate::materialization::MaterializationMode;
+use pplx_space_accounts::OrgId;
+use pplx_space_artifact_model::{SnapshotArtifact, StorageUri, parse_snapshot_object_key};
+use pplx_space_byok_model::{KekProvider, MasterKeyIdentifier};
+use pplx_space_host_layout::{identities::user_names, identities::users};
 use pplx_space_sandbox_grpc::record_sandbox_id;
+use pplx_space_snapshot_model::TransferScopeId;
+use pplx_space_subject_model::SubjectId;
 use pplx_space_uds_peer_auth::{
     AuthorizedUdsPeer, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
 };
+use pplx_space_volmgr_store::jobs::{
+    DuplicatePolicy, Job, JobExecutor, JobFailure, JobFailureReason, JobPriority, JobWorker,
+    PriorityBand, WorkerConfig,
+};
+use pplx_space_volmgr_store::{
+    AttachmentSandboxKey, ConnectionGuard, JobPayloadRow, JobPayloadsError, SharedConnection,
+    VolumeAttachment, count_active_jobs, delete_attachment, list_attachments,
+    pending_or_running_job_payloads, transfer_scope_job_ids, upsert_attachment,
+};
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
+use crate::db;
 use crate::executor::{
     ArtifactEntryPayload, ArtifactPayload, FileMode, PullExistingPolicy,
     ShadowComparisonController, TransferDedupOptions, TransferEncryption, TransferExecutor,
@@ -30,7 +38,6 @@ use crate::executor::{
     snapshot_artifact_from_entry_role, snapshot_artifact_from_local_path,
 };
 use crate::staging::{StagingDir, StagingError};
-use crate::{VolumeAttachment, db};
 use pplx_space_volmgr_client::proto::cancel_transfer_request::Selector as CancelTransferSelector;
 use pplx_space_volmgr_client::proto::{
     AttachVolumeRequest, AttachVolumeResponse, BatchDecryptionConfig, BatchEncryptionConfig,
@@ -63,26 +70,10 @@ const TRANSFER_MANAGER_PEERS: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Service(user_names::SPACE_TMPLMGR),
 ];
 
-fn transfer_scope_job_ids(
-    conn: &rusqlite::Connection,
-    scope: TransferScopeId,
-) -> rusqlite::Result<Vec<pplx_space_common_jobs::JobId>> {
-    let mut stmt = conn.prepare(
-        "SELECT job_id
-           FROM jobs
-          WHERE kind = 'pull'
-            AND status IN ('pending', 'running', 'cancelling')
-            AND json_extract(payload, '$.transfer_scope_id') = ?1
-          ORDER BY created_at DESC, job_id DESC",
-    )?;
-    stmt.query_map([scope.to_string()], |row| row.get(0))?
-        .collect()
-}
-
 #[derive(Clone)]
 pub struct VolumeManagerService {
-    db: Arc<Mutex<rusqlite::Connection>>,
-    pub(crate) worker: BackgroundWorker<TransferExecutor>,
+    db: SharedConnection,
+    pub(crate) worker: JobWorker<TransferExecutor>,
     pub(crate) btrfs_submission: Arc<tokio::sync::Mutex<()>>,
     pub(crate) btrfs_push_enabled: bool,
     shadow_comparisons: ShadowComparisonController,
@@ -95,38 +86,60 @@ pub struct VolumeManagerService {
 pub struct TransferAdmission {
     state: Arc<Mutex<TransferAdmissionState>>,
     idle: Arc<tokio::sync::Notify>,
+    waits_ended: CancellationToken,
 }
 
 #[derive(Default)]
 struct TransferAdmissionState {
-    accepting: bool,
+    phase: AdmissionPhase,
     admitted: usize,
+}
+
+/// Which state mutations volume-manager admits during its lifetime.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum AdmissionPhase {
+    #[default]
+    Open,
+    /// Shutting down: queued submissions are persisted for the successor,
+    /// which recovers them, and everything else is refused.
+    HandingOff,
+    Closed,
 }
 
 struct TransferAdmissionLease {
     admission: TransferAdmission,
 }
 
+const HANDOFF_REFUSAL: &str = "volume-manager is handing off; retry transfer submission";
+
 impl TransferAdmission {
     pub fn open() -> Self {
         Self {
-            state: Arc::new(Mutex::new(TransferAdmissionState {
-                accepting: true,
-                admitted: 0,
-            })),
+            state: Arc::new(Mutex::new(TransferAdmissionState::default())),
             idle: Arc::new(tokio::sync::Notify::new()),
+            waits_ended: CancellationToken::new(),
         }
     }
 
+    /// Admit a mutation that needs this process to act on it: a transfer the
+    /// caller waits for, an attachment, or a cancellation.
     fn enter(&self) -> Result<TransferAdmissionLease, Status> {
+        self.enter_in(&[AdmissionPhase::Open])
+    }
+
+    /// Admit a submission that only persists a transfer. While handing off,
+    /// the job stays pending and the successor runs it.
+    fn enter_queued(&self) -> Result<TransferAdmissionLease, Status> {
+        self.enter_in(&[AdmissionPhase::Open, AdmissionPhase::HandingOff])
+    }
+
+    fn enter_in(&self, phases: &[AdmissionPhase]) -> Result<TransferAdmissionLease, Status> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| Status::internal("volume-manager transfer admission mutex poisoned"))?;
-        if !state.accepting {
-            return Err(Status::unavailable(
-                "volume-manager is handing off; retry transfer submission",
-            ));
+        if !phases.contains(&state.phase) {
+            return Err(Status::unavailable(HANDOFF_REFUSAL));
         }
         state.admitted += 1;
         Ok(TransferAdmissionLease {
@@ -134,14 +147,45 @@ impl TransferAdmission {
         })
     }
 
+    /// Refuses every mutation except queued transfer submissions, which keep
+    /// being persisted for the successor while running transfers finish.
+    pub fn hand_off(&self) {
+        match self.state.lock() {
+            Ok(mut state) if state.phase == AdmissionPhase::Open => {
+                state.phase = AdmissionPhase::HandingOff;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(%error, "volume-manager transfer admission mutex poisoned")
+            }
+        }
+    }
+
     /// Atomically rejects new state mutations. Existing polling remains
     /// available while admitted mutations reach a durable boundary.
     pub fn close(&self) {
         match self.state.lock() {
-            Ok(mut state) => state.accepting = false,
+            Ok(mut state) => state.phase = AdmissionPhase::Closed,
             Err(error) => {
                 tracing::error!(%error, "volume-manager transfer admission mutex poisoned")
             }
+        }
+    }
+
+    /// Answers every wait for a transfer this process will not finish with a
+    /// retryable refusal, so callers ask the successor instead of holding the
+    /// server open.
+    pub fn end_waits(&self) {
+        self.waits_ended.cancel();
+    }
+
+    async fn until_waits_end<T>(
+        &self,
+        wait: impl std::future::Future<Output = Result<T, Status>>,
+    ) -> Result<T, Status> {
+        tokio::select! {
+            result = wait => result,
+            _ = self.waits_ended.cancelled() => Err(Status::unavailable(HANDOFF_REFUSAL)),
         }
     }
 
@@ -205,7 +249,7 @@ impl VolumeManagerService {
         config: VolumeManagerServiceConfig,
     ) -> Result<Self, NewServiceError> {
         let conn = db::open(db_path).map_err(NewServiceError::OpenDb)?;
-        let db = Arc::new(Mutex::new(conn));
+        let db = SharedConnection::new(conn);
         let staging = StagingDir::ensure(staging_dir)?;
         let worker_config = WorkerConfig::new(1, config.transfer_timeout, config.max_attempts)
             .with_kind_concurrency(PUSH_KIND, config.push_concurrency)
@@ -218,7 +262,7 @@ impl VolumeManagerService {
             && config.executor.snapshot_upload_mode.buffer_budget_bytes() > 0;
         let executor = TransferExecutor::new(config.executor, staging.root().to_path_buf());
         let shadow_comparisons = executor.shadow_comparison_controller();
-        let worker = BackgroundWorker::new(Arc::clone(&db), executor, worker_config);
+        let worker = db.background_worker(executor, worker_config);
         Ok(Self {
             db,
             worker,
@@ -290,7 +334,7 @@ impl VolumeManagerService {
         &self,
         peer: &AuthorizedUdsPeer,
         requested_subject: &SubjectId,
-        job: &pplx_space_common_jobs::Job,
+        job: &Job,
         operation: &str,
     ) -> Result<(), Status> {
         if artifact_job_matches_subject_class(job, requested_subject) {
@@ -311,7 +355,7 @@ impl VolumeManagerService {
     fn authorize_job(
         &self,
         peer: &AuthorizedUdsPeer,
-        job: &pplx_space_common_jobs::Job,
+        job: &Job,
         operation: &str,
     ) -> Result<(), Status> {
         if matches!(peer.principal(), UdsPeerPrincipal::Root) {
@@ -363,9 +407,10 @@ impl VolumeManagerService {
         )))
     }
 
-    /// Returns a clone of the worker handle for calling `recover()` and
-    /// `drain()` from the service binary.
-    pub fn worker(&self) -> BackgroundWorker<TransferExecutor> {
+    /// Returns a clone of the worker handle for [`run`](fn@crate::run): startup
+    /// recovery, the terminal-job pruner and queue-metrics loops, and the drain
+    /// sequence.
+    pub fn worker(&self) -> JobWorker<TransferExecutor> {
         self.worker.clone()
     }
 
@@ -380,13 +425,13 @@ impl VolumeManagerService {
     /// Count durable transfer rows that have not reached a terminal state.
     pub fn active_transfer_count(&self) -> Result<u64, Status> {
         let conn = self.lock_db()?;
-        pplx_space_common_jobs::db::count_active_jobs(&conn)
+        count_active_jobs(&conn)
             .map_err(|error| Status::internal(format!("count active transfers: {error}")))
     }
 
     /// Sweep the staging dir, removing any file whose owning push job is
     /// no longer in `pending`/`running`. Call once at startup, **before**
-    /// [`BackgroundWorker::recover`], so that:
+    /// [`JobWorker::recover_and_log`], so that:
     ///   * files left by jobs that completed or permanently failed before
     ///     a prior process exit are reclaimed; and
     ///   * files still owned by jobs that the worker is about to re-spawn
@@ -396,30 +441,39 @@ impl VolumeManagerService {
         Ok(crate::staging::cleanup_orphans(self.staging.root(), &keep))
     }
 
-    /// Collect every `staged_path` referenced by a push job currently in
-    /// `pending` or `running`. Goes through the worker's SQLite connection
-    /// directly (rather than `worker.list_jobs`, which is bounded by a
-    /// caller-supplied limit) because the keep-set **must be complete**:
+    /// Collect every `staged_path` referenced by a push or artifact push job
+    /// currently in `pending` or `running`. Goes through the worker's SQLite
+    /// connection directly (rather than `worker.list_jobs`, which is bounded
+    /// by a caller-supplied limit) because the keep-set **must be complete**:
     /// if a single staged_path were missing, `cleanup_orphans` would
     /// delete a file the worker is about to re-execute, reproducing the
     /// exact "entity not found" failure this module exists to prevent.
     fn collect_active_staged_paths(&self) -> Result<HashSet<PathBuf>, Status> {
         let conn = self.lock_db()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT payload FROM jobs
-                 WHERE kind = 'push' AND status IN ('pending', 'running')",
-            )
-            .map_err(|e| Status::internal(format!("prepare staged-paths query: {e}")))?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| Status::internal(format!("execute staged-paths query: {e}")))?;
+        let rows = pending_or_running_job_payloads(&conn, [PUSH_KIND, PUSH_ARTIFACT_KIND])
+            .map_err(|error| match error {
+                JobPayloadsError::Prepare(e) => {
+                    Status::internal(format!("prepare staged-paths query: {e}"))
+                }
+                JobPayloadsError::Execute(e) => {
+                    Status::internal(format!("execute staged-paths query: {e}"))
+                }
+                JobPayloadsError::Row(e) => Status::internal(format!("read staged-paths row: {e}")),
+            })?;
 
         let mut out = HashSet::new();
-        for row in rows {
-            let payload =
-                row.map_err(|e| Status::internal(format!("read staged-paths row: {e}")))?;
-            if let Ok(p) = serde_json::from_str::<TransferPayload>(&payload)
+        for JobPayloadRow { kind, payload } in rows {
+            if kind == PUSH_ARTIFACT_KIND {
+                if let Ok(artifact) = serde_json::from_str::<ArtifactPayload>(&payload) {
+                    out.extend(
+                        artifact
+                            .entries
+                            .into_iter()
+                            .filter_map(|entry| entry.staged_path)
+                            .map(PathBuf::from),
+                    );
+                }
+            } else if let Ok(p) = serde_json::from_str::<TransferPayload>(&payload)
                 && let Some(staged) = p.staged_path
             {
                 out.insert(PathBuf::from(staged));
@@ -428,7 +482,7 @@ impl VolumeManagerService {
         Ok(out)
     }
 
-    pub(crate) fn lock_db(&self) -> Result<MutexGuard<'_, rusqlite::Connection>, Status> {
+    pub(crate) fn lock_db(&self) -> Result<ConnectionGuard<'_>, Status> {
         self.db
             .lock()
             .map_err(|e| Status::internal(format!("lock vol-mgr db: {e}")))
@@ -501,7 +555,7 @@ fn rootfs_materialization_mode(subject: &SubjectId) -> MaterializationMode {
 #[derive(Debug, thiserror::Error)]
 pub enum NewServiceError {
     #[error("open volume-manager db: {0}")]
-    OpenDb(#[source] rusqlite::Error),
+    OpenDb(#[source] pplx_space_volmgr_store::Error),
     #[error(transparent)]
     Staging(#[from] StagingError),
 }
@@ -528,7 +582,7 @@ fn proto_to_attachment(spec: VolumeSpec) -> VolumeAttachment {
     }
 }
 
-fn db_err(e: rusqlite::Error) -> Status {
+fn db_err(e: pplx_space_volmgr_store::Error) -> Status {
     Status::internal(format!("volume-manager db error: {e}"))
 }
 
@@ -562,10 +616,7 @@ fn parse_request_subject(raw: &str) -> Result<SubjectId, Status> {
     Ok(subject)
 }
 
-fn artifact_job_matches_subject_class(
-    job: &pplx_space_common_jobs::Job,
-    requested_subject: &SubjectId,
-) -> bool {
+fn artifact_job_matches_subject_class(job: &Job, requested_subject: &SubjectId) -> bool {
     job.subject_id
         .as_deref()
         .and_then(|subject_id| parse_subject(subject_id).ok())
@@ -580,7 +631,7 @@ fn job_bytes_to_u64(bytes: i64) -> Result<u64, Status> {
     })
 }
 
-fn pull_job_failure_status(job: &pplx_space_common_jobs::Job) -> Status {
+fn pull_job_failure_status(job: &Job) -> Status {
     let message = format!(
         "pull failed: {}",
         job.error.as_deref().unwrap_or("unknown error")
@@ -620,7 +671,7 @@ fn transfer_job_status_code(status: TransferJobStatus) -> i32 {
     }
 }
 
-fn job_to_proto(job: pplx_space_common_jobs::Job) -> Result<TransferJob, Status> {
+fn job_to_proto(job: Job) -> Result<TransferJob, Status> {
     let payload = serde_json::from_str::<TransferPayload>(&job.payload).ok();
     let local_path = payload
         .as_ref()
@@ -667,7 +718,7 @@ fn job_to_proto(job: pplx_space_common_jobs::Job) -> Result<TransferJob, Status>
 }
 
 async fn wait_for_transfer_job<E: JobExecutor>(
-    worker: &BackgroundWorker<E>,
+    worker: &JobWorker<E>,
     job_id: &JobId,
 ) -> Result<GetTransferJobResponse, Status> {
     let job = worker
@@ -679,10 +730,10 @@ async fn wait_for_transfer_job<E: JobExecutor>(
 }
 
 async fn submit_push(
-    worker: &BackgroundWorker<TransferExecutor>,
+    worker: &JobWorker<TransferExecutor>,
     staging: &StagingDir,
     req: &PushFileRequest,
-) -> Result<pplx_space_common_jobs::JobId, Status> {
+) -> Result<JobId, Status> {
     // Reflink the caller's source into vol-mgr-owned staging first. The
     // upload reads bytes from the staged copy, so an unlink or rewrite of
     // the original between submit time and worker dequeue (e.g. a later
@@ -727,10 +778,10 @@ async fn unstage_push_source(path: &Path) {
 /// pre-staged path explicitly so batched callers can hand in paths from
 /// [`stage_push_source`].
 async fn register_push_job(
-    worker: &BackgroundWorker<TransferExecutor>,
+    worker: &JobWorker<TransferExecutor>,
     req: &PushFileRequest,
     staged: PathBuf,
-) -> Result<pplx_space_common_jobs::JobId, Status> {
+) -> Result<JobId, Status> {
     let staged_str = staged.to_string_lossy().into_owned();
 
     // Single-file pushes are always plaintext: envelope encryption is a
@@ -815,15 +866,15 @@ async fn register_push_job(
     Ok(job_id)
 }
 
-fn push_duplicate_policy(req: &PushFileRequest) -> pplx_space_common_jobs::DuplicatePolicy {
+fn push_duplicate_policy(req: &PushFileRequest) -> DuplicatePolicy {
     if is_immutable_suspend_snapshot_push(req) {
         // Snapshot object keys include an immutable backup-attempt identity.
         // A retry may therefore rejoin a completed transfer across the
         // caller's submit-to-persist gap. Generic PushFile callers can reuse
         // paths and destinations for changed bytes and remain active-only.
-        pplx_space_common_jobs::DuplicatePolicy::ReuseExistingOrCompleted
+        DuplicatePolicy::ReuseExistingOrCompleted
     } else {
-        pplx_space_common_jobs::DuplicatePolicy::ReuseExisting
+        DuplicatePolicy::ReuseExisting
     }
 }
 
@@ -846,10 +897,10 @@ fn is_immutable_suspend_snapshot_push(req: &PushFileRequest) -> bool {
 }
 
 fn submit_pull<E: JobExecutor>(
-    worker: &BackgroundWorker<E>,
+    worker: &JobWorker<E>,
     req: &PullFileRequest,
     assignment: impl Into<MaterializationAssignment>,
-) -> Result<pplx_space_common_jobs::JobId, Status> {
+) -> Result<JobId, Status> {
     let assignment = assignment.into();
     let file_mode = req
         .file_mode
@@ -968,14 +1019,14 @@ impl<'a> ArtifactRetryIdentity<'a> {
 /// either satisfies a dense rootfs request or blocks an incompatible retry
 /// until it becomes terminal.
 fn classify_pull_artifact_retry<E: JobExecutor>(
-    worker: &BackgroundWorker<E>,
+    worker: &JobWorker<E>,
     identity: ArtifactRetryIdentity<'_>,
     assignment: impl Into<MaterializationAssignment>,
     entries: &[ArtifactEntryPayload],
     kek: Option<(&OrgId, &KekProvider, &MasterKeyIdentifier)>,
     wrapped_dek: Option<&[u8]>,
-    mut is_authorized: impl FnMut(&pplx_space_common_jobs::Job) -> bool,
-) -> Result<Option<pplx_space_common_jobs::Job>, Status> {
+    mut is_authorized: impl FnMut(&Job) -> bool,
+) -> Result<Option<Job>, Status> {
     let ArtifactRetryIdentity { artifact_id, dedup } = identity;
     let assignment = assignment.into();
     let mut reusable = None;
@@ -1057,10 +1108,10 @@ impl VolumeManager for VolumeManagerService {
         record_sandbox_id(&tracing::Span::current(), &req.sandbox_id);
         let sandbox_id = req
             .sandbox_id
-            .parse::<db::AttachmentSandboxKey>()
+            .parse::<AttachmentSandboxKey>()
             .map_err(|error| Status::invalid_argument(format!("invalid sandbox_id: {error}")))?;
         let conn = self.lock_db()?;
-        db::upsert_attachment(&conn, &sandbox_id, &attachment).map_err(db_err)?;
+        upsert_attachment(&conn, &sandbox_id, &attachment).map_err(db_err)?;
         tracing::info!(
             sandbox_id = %req.sandbox_id,
             volume_name = %attachment.name,
@@ -1081,10 +1132,10 @@ impl VolumeManager for VolumeManagerService {
         record_sandbox_id(&tracing::Span::current(), &req.sandbox_id);
         let sandbox_id = req
             .sandbox_id
-            .parse::<db::AttachmentSandboxKey>()
+            .parse::<AttachmentSandboxKey>()
             .map_err(|error| Status::invalid_argument(format!("invalid sandbox_id: {error}")))?;
         let conn = self.lock_db()?;
-        db::delete_attachment(&conn, &sandbox_id, &req.volume_name).map_err(db_err)?;
+        delete_attachment(&conn, &sandbox_id, &req.volume_name).map_err(db_err)?;
         tracing::info!(
             sandbox_id = %req.sandbox_id,
             volume_name = %req.volume_name,
@@ -1103,10 +1154,10 @@ impl VolumeManager for VolumeManagerService {
         record_sandbox_id(&tracing::Span::current(), &req.sandbox_id);
         let sandbox_id = req
             .sandbox_id
-            .parse::<db::AttachmentSandboxKey>()
+            .parse::<AttachmentSandboxKey>()
             .map_err(|error| Status::invalid_argument(format!("invalid sandbox_id: {error}")))?;
         let conn = self.lock_db()?;
-        let attachments = db::list_attachments(&conn, &sandbox_id).map_err(db_err)?;
+        let attachments = list_attachments(&conn, &sandbox_id).map_err(db_err)?;
         Ok(Response::new(ListVolumesResponse {
             volumes: attachments.into_iter().map(attachment_to_proto).collect(),
         }))
@@ -1158,15 +1209,15 @@ impl VolumeManager for VolumeManagerService {
         self.authorize_sandbox_subject(&peer, &subject, "push_file")?;
         parse_uri(&req.s3_uri)?;
         let job = self
-            .worker
-            .submit_and_wait(
+            .transfer_admission
+            .until_waits_end(self.worker.submit_and_wait(
                 async {
                     let job_id = submit_push(&self.worker, &self.staging, &req).await;
                     drop(admission);
                     job_id
                 },
                 self.worker.worst_case_runtime(),
-            )
+            ))
             .await?;
         if job.status == "completed" {
             Ok(Response::new(PushFileResponse {
@@ -1197,15 +1248,15 @@ impl VolumeManager for VolumeManagerService {
         let artifact = effective_pull_snapshot_artifact(&req)?;
         let assignment = self.materialization_assignment(&subject, [artifact]);
         let job = self
-            .worker
-            .submit_and_wait(
+            .transfer_admission
+            .until_waits_end(self.worker.submit_and_wait(
                 async {
                     let job_id = submit_pull(&self.worker, &req, assignment);
                     drop(admission);
                     job_id
                 },
                 self.worker.worst_case_runtime(),
-            )
+            ))
             .await?;
         if job.status == "completed" {
             Ok(Response::new(PullFileResponse {
@@ -1225,7 +1276,7 @@ impl VolumeManager for VolumeManagerService {
             "submit_push_file",
             TRANSFER_MANAGER_PEERS,
         )?;
-        let _admission = self.transfer_admission.enter()?;
+        let _admission = self.transfer_admission.enter_queued()?;
         let req = request.into_inner();
         let subject = parse_request_subject(&req.subject_id)?;
         self.authorize_sandbox_subject(&peer, &subject, "submit_push_file")?;
@@ -1278,7 +1329,7 @@ impl VolumeManager for VolumeManagerService {
             "submit_push_btrfs_send",
             TRANSFER_MANAGER_PEERS,
         )?;
-        let _admission = self.transfer_admission.enter()?;
+        let _admission = self.transfer_admission.enter_queued()?;
         let req = request.into_inner();
         let subject = parse_request_subject(&format!("sandbox:{}", req.sandbox_id))?;
         self.authorize_sandbox_subject(&peer, &subject, "submit_push_btrfs_send")?;
@@ -1296,7 +1347,7 @@ impl VolumeManager for VolumeManagerService {
             "submit_pull_file",
             TRANSFER_MANAGER_PEERS,
         )?;
-        let _admission = self.transfer_admission.enter()?;
+        let _admission = self.transfer_admission.enter_queued()?;
         let req = request.into_inner();
         let subject = parse_request_subject(&req.subject_id)?;
         self.authorize_transfer_subject(&peer, &subject, "submit_pull_file")?;
@@ -1318,7 +1369,7 @@ impl VolumeManager for VolumeManagerService {
             "submit_copy_object",
             SANDBOX_MANAGER_PEERS,
         )?;
-        let _admission = self.transfer_admission.enter()?;
+        let _admission = self.transfer_admission.enter_queued()?;
         let payload = crate::executor::copy::CopyPayload::try_from(request.into_inner())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         self.authorize_sandbox_subject(&peer, payload.subject(), "submit_copy_object")?;
@@ -1373,7 +1424,9 @@ impl VolumeManager for VolumeManagerService {
         })?;
         self.authorize_job(&peer, &job, "wait_transfer_job")?;
         Ok(Response::new(
-            wait_for_transfer_job(&self.worker, &job_id).await?,
+            self.transfer_admission
+                .until_waits_end(wait_for_transfer_job(&self.worker, &job_id))
+                .await?,
         ))
     }
 
@@ -1501,7 +1554,7 @@ impl VolumeManager for VolumeManagerService {
             "push_files_async",
             TRANSFER_MANAGER_PEERS,
         )?;
-        let _admission = self.transfer_admission.enter()?;
+        let _admission = self.transfer_admission.enter_queued()?;
         let req = request.into_inner();
         if req.files.is_empty() {
             return Err(Status::invalid_argument("files must not be empty"));
@@ -1699,7 +1752,7 @@ impl VolumeManager for VolumeManagerService {
             "pull_files_async",
             TRANSFER_MANAGER_PEERS,
         )?;
-        let _admission = self.transfer_admission.enter()?;
+        let _admission = self.transfer_admission.enter_queued()?;
         let req = request.into_inner();
         if req.files.is_empty() {
             return Err(Status::invalid_argument("files must not be empty"));
@@ -1984,7 +2037,7 @@ fn effective_entry_snapshot_artifact(entry: &ArtifactEntryPayload) -> Option<Sna
         .or_else(|| snapshot_artifact_from_entry_role(&entry.role))
 }
 
-/// Decide how to handle a [`BackgroundWorker::find_job_by_dedup_key`] hit for an
+/// Decide how to handle a [`JobWorker::find_job_by_dedup_key`] hit for an
 /// artifact retry:
 ///
 /// - `Ok(Some((job, payload)))` — reuse the existing job: an equivalent retry
@@ -1998,12 +2051,12 @@ fn effective_entry_snapshot_artifact(entry: &ArtifactEntryPayload) -> Option<Sna
 ///   persisted state (e.g. an upstream bug that derives the id from too few
 ///   inputs, or a stale id resurrected after a crash).
 fn classify_artifact_retry(
-    existing: pplx_space_common_jobs::Job,
+    existing: Job,
     artifact_id: &str,
     entries: &[ArtifactEntryPayload],
     kek: Option<(&OrgId, &KekProvider, &MasterKeyIdentifier)>,
     wrapped_dek: Option<&[u8]>,
-) -> Result<Option<(pplx_space_common_jobs::Job, ArtifactPayload)>, Status> {
+) -> Result<Option<(Job, ArtifactPayload)>, Status> {
     if existing.status == "failed" {
         return Ok(None);
     }
@@ -2050,7 +2103,7 @@ fn issue_dek_error_to_status(e: crate::credentials::IssueDekError) -> Status {
 #[cfg(test)]
 mod tests;
 
-fn parse_job_id(raw: &str) -> Result<pplx_space_common_jobs::JobId, Status> {
+fn parse_job_id(raw: &str) -> Result<JobId, Status> {
     raw.parse()
         .map_err(|error| Status::invalid_argument(format!("job_id: {error}")))
 }

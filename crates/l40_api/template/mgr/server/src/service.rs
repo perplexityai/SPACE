@@ -6,23 +6,30 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
 
-use pplx_space_common_core::host::linux::identities::{user_names, users};
-use pplx_space_common_core::host::linux::paths::{
-    TEMPLATE_CACHE_DIR_MODE, normalize_template_cache_tree as normalize_template_cache_tree_io,
-    set_template_cache_permissions as set_template_cache_permissions_io,
-};
-use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, DEFAULT_BASE_SNAPSHOT_MEMORY_MIB, DEFAULT_BASE_SNAPSHOT_VCPU, Digest,
-    HashAlg, MIN_BASE_SNAPSHOT_MEMORY_MIB, MIN_BASE_SNAPSHOT_VCPU, RUNTIME_FIRECRACKER_ALIAS,
+use pplx_space_artifact_model::{
     TEMPLATE_ROOTFS_FILE, TEMPLATE_ROOTFS_ZSTD_CODEC, TEMPLATE_ROOTFS_ZSTD_FILE,
-    TEMPLATE_ROOTFS_ZSTD_LEVEL, TemplateCachePartition,
+    TEMPLATE_ROOTFS_ZSTD_LEVEL,
 };
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
+use pplx_space_content_digest::{Digest, HashAlg};
+use pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS;
 use pplx_space_feature_flags::FeatureFlagClient;
+use pplx_space_host_layout::identities::{user_names, users};
+use pplx_space_host_layout::paths::TEMPLATE_CACHE_DIR_MODE;
 use pplx_space_net_common::{
     NetworkPolicyV1,
     proto::{NetworkPolicyApplyDecision, NetworkPolicyV1 as NetworkPolicyProto},
 };
 use pplx_space_sbx_mgr_client::proto as sbx_proto;
+use pplx_space_snapshot_model::{
+    DEFAULT_BASE_SNAPSHOT_MEMORY_MIB, DEFAULT_BASE_SNAPSHOT_VCPU, MIN_BASE_SNAPSHOT_MEMORY_MIB,
+    MIN_BASE_SNAPSHOT_VCPU,
+};
+use pplx_space_template_cache_permissions::{
+    normalize_template_cache_tree as normalize_template_cache_tree_io,
+    set_template_cache_permissions as set_template_cache_permissions_io,
+};
+use pplx_space_template_model::TemplateCachePartition;
 use pplx_space_uds_peer_auth::{
     AuthorizedUdsPeer, LocalRole, PeerIdentity, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
 };
@@ -41,7 +48,7 @@ use crate::proto::{
 };
 use uuid::Uuid;
 
-const TEMPLATE_DIR: &str = pplx_space_common_core::host::linux::paths::TEMPLATE_DIR;
+const TEMPLATE_DIR: &str = pplx_space_host_layout::paths::TEMPLATE_DIR;
 const SPACE_NODEAPI_ACCOUNT: &str = user_names::SPACE_NODEAPI;
 const SPACE_SBXMGR_ACCOUNT: &str = user_names::SPACE_SBXMGR;
 const SPACE_K8S_NODE_CONTROLLER_ACCOUNT: &str = user_names::SPACE_K8S_NODE_CONTROLLER;
@@ -218,9 +225,11 @@ fn remove_dir_all_if_exists(path: &Path) -> Result<(), io::Error> {
     }
 }
 
-fn lock_status<'a, T>(mutex: &'a Mutex<T>, context: &str) -> Result<MutexGuard<'a, T>, Status> {
-    mutex
-        .lock()
+fn lock_status<'a>(
+    db: &'a crate::db::SharedConnection,
+    context: &str,
+) -> Result<crate::db::ConnectionGuard<'a>, Status> {
+    db.lock()
         .map_err(|_| Status::internal(format!("{context} mutex poisoned")))
 }
 
@@ -303,13 +312,13 @@ impl Drop for ImportStagingGuard {
 /// makes Drop robust against the import pipeline failing at any step
 /// between subvolume creation and the atomic rename.
 fn remove_staging_path(path: &Path) -> std::io::Result<()> {
-    if pplx_space_common_core::host::btrfs::is_subvolume(path) {
+    if pplx_space_btrfs::is_subvolume(path) {
         // Clear RO first if some future import path stamps it pre-
         // rename — today nothing does, but `btrfs subvolume delete`
         // rejects RO targets and we want this helper to stay correct
         // if that ever changes.
-        let _ = pplx_space_common_core::host::btrfs::set_readonly(path, false);
-        match pplx_space_common_core::host::btrfs::delete_subvolume_if_present(path) {
+        let _ = pplx_space_btrfs::set_readonly(path, false);
+        match pplx_space_btrfs::delete_subvolume_if_present(path) {
             Ok(()) => return Ok(()),
             Err(err) => {
                 tracing::warn!(
@@ -383,7 +392,7 @@ type SnapshotRepairKey = (String, String, TemplateCachePartition);
 
 #[derive(Clone)]
 pub struct TemplateManagerService {
-    db: Arc<Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     artifact_store: TemplateArtifactStore,
     production_hash_algorithm: HashAlg,
     feature_flags: FeatureFlagClient,
@@ -404,7 +413,7 @@ pub struct TemplateManagerService {
     /// failed transiently). New job kinds add a `match` arm in
     /// [`crate::background_jobs::TemplateBackgroundExecutor`] — no
     /// new worker.
-    background_worker: pplx_space_common_jobs::BackgroundWorker<
+    background_worker: pplx_space_template_mgr_store::jobs::JobWorker<
         crate::background_jobs::TemplateBackgroundExecutor,
     >,
     /// Connect budget this service spends reaching sandbox-manager.
@@ -417,6 +426,10 @@ pub struct TemplateManagerService {
     /// Lists the node's sandboxes for pool counts. A field so a test can
     /// answer and count the listing without a sandbox-manager socket.
     pool_sandbox_lister: PoolSandboxLister,
+    /// The sandbox memory policy `ListTemplates` reports snapshot memory
+    /// under, kept off the listing's path. A field so a test can answer it
+    /// without a sandbox-manager socket.
+    sandbox_memory_policy: memory_policy_cache::SandboxMemoryPolicyCache,
     /// Shared by the GC loop, startup recovery and `DeleteIdleTemplate`.
     eviction_gate: crate::eviction::EvictionGate,
     /// The last `(template, build dir)` the GC tick's rowless check
@@ -443,7 +456,7 @@ pub struct TemplateManagerService {
 /// where `build_dir` is the content hash plus `@{environment}` outside the
 /// legacy cache partition.
 fn build_dir(name: &str, content_hash: &str, partition: TemplateCachePartition) -> String {
-    pplx_space_common_core::host::linux::paths::template_build_dir(name, content_hash, partition)
+    pplx_space_artifact_model::template_build_dir(name, content_hash, partition)
 }
 
 /// Path to the snapshots directory for a build: `{TEMPLATE_DIR}/{name}/snapshots/{build_dir}/{vcpu}vcpu-{memory_mib}mib/`
@@ -454,7 +467,7 @@ fn snapshot_dir(
     vcpu: u32,
     memory_mib: u32,
 ) -> String {
-    pplx_space_common_core::host::linux::paths::template_snapshot_dir(
+    pplx_space_artifact_model::template_snapshot_dir(
         name,
         content_hash,
         partition,
@@ -480,7 +493,7 @@ fn template_runtime_defaults(
         return TemplateRuntimeDefaults::default();
     };
     let Ok(metadata) =
-        serde_json::from_str::<pplx_space_common_core::types::TemplateMetadata>(&metadata_json)
+        serde_json::from_str::<pplx_space_template_manifest::TemplateMetadata>(&metadata_json)
     else {
         return TemplateRuntimeDefaults::default();
     };
@@ -526,7 +539,7 @@ fn copy_template_file(src: &Path, dst: &Path) -> Result<(), Status> {
             let times = std::fs::FileTimes::new()
                 .set_accessed(metadata.accessed()?)
                 .set_modified(metadata.modified()?);
-            pplx_space_common_io::reflink::copy_file(src, dst)?;
+            pplx_space_file_io::reflink::copy_file(src, dst)?;
             std::fs::File::open(dst)?.set_times(times)
         };
         copy().map_err(|error| {
@@ -715,7 +728,7 @@ fn snapshot_cache_size_bytes(
 }
 
 fn rootfs_artifact_size_from_manifest(
-    manifest: &pplx_space_common_core::types::TemplateManifest,
+    manifest: &pplx_space_template_manifest::TemplateManifest,
 ) -> Option<u64> {
     // Pre-typing this read returned `None` when `size` was absent from
     // the JSON and `Some(0)` when it was an explicit zero. Callers use
@@ -772,9 +785,9 @@ fn write_template_manifest_atomic(
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum NormalizeTemplateManifestError {
     #[error("invalid template metadata execution schema: {0}")]
-    Metadata(#[from] pplx_space_common_core::types::TemplateMetadataSchemaError),
+    Metadata(#[from] pplx_space_template_manifest::TemplateMetadataSchemaError),
     #[error("invalid template manifest execution schema: {0}")]
-    Manifest(#[from] pplx_space_common_core::types::TemplateManifestSchemaError),
+    Manifest(#[from] pplx_space_template_manifest::TemplateManifestSchemaError),
     #[error("template metadata and manifest execution metadata disagree")]
     ExecutionMismatch,
     #[error("template metadata and manifest guest image contracts disagree")]
@@ -784,8 +797,8 @@ pub(crate) enum NormalizeTemplateManifestError {
 /// Register keeps the digest-addressed manifest. Metadata refresh cannot change
 /// its environment binding, including an upgrade from an unbound release.
 fn validate_retained_environment_binding(
-    manifest: &pplx_space_common_core::types::TemplateManifest,
-    metadata: &pplx_space_common_core::types::TemplateMetadata,
+    manifest: &pplx_space_template_manifest::TemplateManifest,
+    metadata: &pplx_space_template_manifest::TemplateMetadata,
 ) -> Result<(), Status> {
     let retained = manifest
         .execution_metadata()
@@ -805,8 +818,8 @@ fn validate_retained_environment_binding(
 
 /// Cache partition of the environment a build's manifest binds.
 pub(crate) fn manifest_cache_partition(
-    manifest: &pplx_space_common_core::types::TemplateManifest,
-    metadata: &pplx_space_common_core::types::TemplateMetadata,
+    manifest: &pplx_space_template_manifest::TemplateManifest,
+    metadata: &pplx_space_template_manifest::TemplateMetadata,
 ) -> Result<TemplateCachePartition, Status> {
     let environment = effective_environment(manifest, metadata).map_err(Status::data_loss)?;
     Ok(pplx_space_node_runtime_core::catalog::template_cache_partition(environment))
@@ -818,9 +831,9 @@ pub(crate) fn manifest_cache_partition(
 /// Every reader that picks a build's partition goes through this, so it
 /// agrees with the binding `db::upsert_build` checks.
 pub(crate) fn effective_environment(
-    manifest: &pplx_space_common_core::types::TemplateManifest,
-    metadata: &pplx_space_common_core::types::TemplateMetadata,
-) -> Result<Option<pplx_space_common_core::types::EnvironmentReference>, String> {
+    manifest: &pplx_space_template_manifest::TemplateManifest,
+    metadata: &pplx_space_template_manifest::TemplateMetadata,
+) -> Result<Option<pplx_space_execution_spec::EnvironmentReference>, String> {
     match manifest
         .execution_metadata()
         .map_err(|error| error.to_string())?
@@ -832,7 +845,7 @@ pub(crate) fn effective_environment(
 
 /// Cache partition of the environment registration metadata binds.
 pub(crate) fn metadata_cache_partition(
-    metadata: &pplx_space_common_core::types::TemplateMetadata,
+    metadata: &pplx_space_template_manifest::TemplateMetadata,
 ) -> Result<TemplateCachePartition, Status> {
     let environment = metadata
         .environment()
@@ -853,9 +866,9 @@ pub(crate) struct BuildRowManifest {
 }
 
 pub(crate) fn build_row_manifest(
-    manifest: &pplx_space_common_core::types::TemplateManifest,
+    manifest: &pplx_space_template_manifest::TemplateManifest,
     manifest_json: String,
-    metadata: &pplx_space_common_core::types::TemplateMetadata,
+    metadata: &pplx_space_template_manifest::TemplateMetadata,
 ) -> BuildRowManifest {
     let manifest_execution = manifest.execution_metadata().ok().flatten().cloned();
     let metadata_execution = match metadata.execution_metadata() {
@@ -882,14 +895,14 @@ pub(crate) fn build_row_manifest(
 }
 
 pub(crate) fn normalize_template_manifest(
-    mut manifest: pplx_space_common_core::types::TemplateManifest,
+    mut manifest: pplx_space_template_manifest::TemplateManifest,
     name: &str,
     content_hash: &str,
-    metadata: &pplx_space_common_core::types::TemplateMetadata,
+    metadata: &pplx_space_template_manifest::TemplateMetadata,
     rootfs_size: u64,
     compressed_rootfs: Option<(&str, u64)>,
-) -> Result<pplx_space_common_core::types::TemplateManifest, NormalizeTemplateManifestError> {
-    use pplx_space_common_core::types::{TemplateManifestCompression, TemplateManifestFile};
+) -> Result<pplx_space_template_manifest::TemplateManifest, NormalizeTemplateManifestError> {
+    use pplx_space_template_manifest::{TemplateManifestCompression, TemplateManifestFile};
 
     manifest.name = name.to_string();
     manifest.content_hash = content_hash.to_string();
@@ -956,7 +969,7 @@ pub(crate) fn normalize_template_manifest(
 }
 
 fn manifest_has_compressed_rootfs_entry(
-    manifest: &pplx_space_common_core::types::TemplateManifest,
+    manifest: &pplx_space_template_manifest::TemplateManifest,
 ) -> bool {
     // Pre-typing this required `size` to be a present u64 (any value,
     // including 0). Match exactly: `entry.size.is_some()` not `> 0`.
@@ -1484,10 +1497,7 @@ fn gc_delete_disk_fn(artifact_store: TemplateArtifactStore) -> crate::eviction::
                     // The wrapping `Code::SQLITE_IOERR` is a
                     // synthetic carrier; the underlying error
                     // is logged by `run_loop`.
-                    rusqlite::Error::SqliteFailure(
-                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
-                        Some(err),
-                    )
+                    crate::db::Error::io_failure(err)
                 })
             })
         },
@@ -1763,10 +1773,10 @@ fn spawn_observed_background_loop(
 }
 
 impl TemplateManagerService {
-    pub fn new(conn: rusqlite::Connection) -> Result<Self, rusqlite::Error> {
+    pub fn new(conn: crate::db::Connection) -> Result<Self, crate::db::Error> {
         crate::db::ensure_template_settings_for_builds(&conn)?;
-        let db = Arc::new(Mutex::new(conn));
-        let background_worker = crate::background_jobs::build_worker(Arc::clone(&db));
+        let db = crate::db::SharedConnection::new(conn);
+        let background_worker = crate::background_jobs::build_worker(db.clone());
         Ok(Self {
             db,
             artifact_store: TemplateArtifactStore::default(),
@@ -1784,6 +1794,7 @@ impl TemplateManagerService {
             background_worker,
             sbx_connect_retry_policy: pplx_space_sbx_mgr_client::DEFAULT_CONNECT_RETRY_POLICY,
             pool_sandbox_lister: PoolSandboxLister::sandbox_manager(),
+            sandbox_memory_policy: memory_policy_cache::SandboxMemoryPolicyCache::sandbox_manager(),
             eviction_gate: crate::eviction::EvictionGate::default(),
             rowless_cursor: Arc::new(Mutex::new(None)),
             rowless_checks: Arc::new(tokio::sync::Semaphore::new(ROWLESS_BUILD_DIRS_PER_GC_TICK)),
@@ -1820,8 +1831,9 @@ impl TemplateManagerService {
     /// to call `recover_and_log` at startup and `shutdown` at exit.
     pub fn background_worker(
         &self,
-    ) -> pplx_space_common_jobs::BackgroundWorker<crate::background_jobs::TemplateBackgroundExecutor>
-    {
+    ) -> pplx_space_template_mgr_store::jobs::JobWorker<
+        crate::background_jobs::TemplateBackgroundExecutor,
+    > {
         self.background_worker.clone()
     }
 
@@ -1838,6 +1850,15 @@ impl TemplateManagerService {
     }
 
     #[cfg(test)]
+    fn with_sandbox_memory_policy(
+        mut self,
+        policy: memory_policy_cache::SandboxMemoryPolicyCache,
+    ) -> Self {
+        self.sandbox_memory_policy = policy;
+        self
+    }
+
+    #[cfg(test)]
     fn with_pool_sandbox_lister(mut self, lister: PoolSandboxLister) -> Self {
         self.pool_sandbox_lister = lister;
         self
@@ -1845,9 +1866,9 @@ impl TemplateManagerService {
 
     #[cfg(test)]
     pub(crate) fn new_with_template_root(
-        conn: rusqlite::Connection,
+        conn: crate::db::Connection,
         root: impl Into<PathBuf>,
-    ) -> Result<Self, rusqlite::Error> {
+    ) -> Result<Self, crate::db::Error> {
         // These protocol/cache fixtures use the host's temporary filesystem;
         // explicit NoCoW materialization has its own disposable btrfs coverage.
         let mut service = Self::new(conn)?
@@ -1927,32 +1948,32 @@ impl TemplateManagerService {
     /// dropped. Cooperative shutdown via `CancellationToken` is a
     /// follow-up.
     pub fn spawn_prefetch_loop(&self) {
-        let pins = crate::pinned_digests::PinnedDigestsStore::new(Arc::clone(&self.db));
+        let pins = crate::pinned_digests::PinnedDigestsStore::new(self.db.clone());
         let puller = self.volume_puller.clone();
         let cfg = crate::prefetch::PrefetchConfig::from_env();
         spawn_observed_background_loop("prefetch", crate::prefetch::run_loop(pins, puller, cfg));
     }
 
     pub fn spawn_node_state_dirty_syncer(&self) {
-        crate::node_state_sync::spawn_dirty_outbox_worker(Arc::clone(&self.db));
+        crate::node_state_sync::spawn_dirty_outbox_worker(self.db.clone());
     }
 
     /// Spawn the LRU eviction loop. Budgeted by
     /// `SPACE_TEMPLATE_CACHE_BUDGET_BYTES` (default 100 GiB): when it is
-    /// explicitly zero, [`crate::eviction::run_loop`] evicts nothing and
+    /// explicitly zero, `crate::eviction::run_loop` evicts nothing and
     /// only checks build dirs without a row on each tick.
     ///
     /// The loop owns:
-    /// - The shared `Arc<Mutex<Connection>>` (same instance as the
+    /// - The `SharedConnection` (same instance as the
     ///   prefetcher and the volume puller).
-    /// - A clone of [`TemplateArtifactStore`] for disk deletes.
+    /// - A clone of `TemplateArtifactStore` for disk deletes.
     /// - A closure that lazily connects to sbx-mgr per tick. A
     ///   failed `List` short-circuits the tick — without an active
     ///   set we cannot safely evict; grace-period age is the backstop
     ///   for any digest the snapshot might have missed.
     pub fn spawn_eviction_loop(&self, shutdown: CancellationToken) {
         let cfg = crate::eviction::GcConfig::from_env();
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let artifact_store = self.artifact_store.clone();
 
         let fetch_active: crate::eviction::FetchActiveFn =
@@ -2023,7 +2044,7 @@ impl TemplateManagerService {
     }
 
     pub fn spawn_network_policy_notification_syncer(&self) {
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         tokio::spawn(async move {
             let mut delay = std::time::Duration::from_secs(1);
             loop {
@@ -2120,7 +2141,7 @@ impl TemplateManagerService {
         let service = self.clone_for_snapshot_reconcile();
         tokio::spawn(async move {
             let snapshot_policies = {
-                let db = Arc::clone(&service.db);
+                let db = service.db.clone();
                 tokio::task::spawn_blocking(move || {
                     let Ok(conn) = db.lock() else {
                         tracing::warn!(
@@ -2239,7 +2260,7 @@ impl TemplateManagerService {
         let manifest_path = digest_path.join("manifest.json");
         let compressed_rootfs_path = digest_path.join(TEMPLATE_ROOTFS_ZSTD_FILE);
         let manifest_json = std::fs::read_to_string(&manifest_path).unwrap_or_default();
-        let manifest: pplx_space_common_core::types::TemplateManifest =
+        let manifest: pplx_space_template_manifest::TemplateManifest =
             serde_json::from_str(&manifest_json).unwrap_or_default();
 
         let generated_stats = if !compressed_rootfs_path.exists() {
@@ -2286,7 +2307,7 @@ impl TemplateManagerService {
         };
         let metadata_json =
             std::fs::read_to_string(digest_path.join("metadata.json")).unwrap_or_default();
-        let metadata: pplx_space_common_core::types::TemplateMetadata =
+        let metadata: pplx_space_template_manifest::TemplateMetadata =
             serde_json::from_str(&metadata_json).unwrap_or_default();
         let manifest = normalize_template_manifest(
             manifest,
@@ -2343,9 +2364,9 @@ impl TemplateManagerService {
             Status::internal(format!("read manifest {}: {e}", manifest_path.display()))
         })?;
         let metadata_json = std::fs::read_to_string(&metadata_path).unwrap_or_default();
-        let manifest: pplx_space_common_core::types::TemplateManifest =
+        let manifest: pplx_space_template_manifest::TemplateManifest =
             serde_json::from_str(&manifest_json).unwrap_or_default();
-        let metadata: pplx_space_common_core::types::TemplateMetadata =
+        let metadata: pplx_space_template_manifest::TemplateMetadata =
             serde_json::from_str(&metadata_json).unwrap_or_default();
         let build_date = manifest.build_date.clone();
         let BuildRowManifest {
@@ -2391,7 +2412,7 @@ impl TemplateManagerService {
                 })?,
         };
 
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let n = template_id.to_string();
         let h = content_hash.to_string();
         tokio::task::spawn_blocking(move || -> Result<(), Status> {
@@ -2665,7 +2686,7 @@ impl TemplateManagerService {
 
         let manifest_json =
             std::fs::read_to_string(digest_path.join("manifest.json")).unwrap_or_default();
-        let manifest: pplx_space_common_core::types::TemplateManifest =
+        let manifest: pplx_space_template_manifest::TemplateManifest =
             serde_json::from_str(&manifest_json).unwrap_or_default();
         let compressed_rootfs_needs_refresh = !digest_path.join(TEMPLATE_ROOTFS_ZSTD_FILE).exists()
             || !manifest_has_compressed_rootfs_entry(&manifest);
@@ -2747,6 +2768,7 @@ async fn expand_template_rootfs(
 mod adapter;
 mod import_helpers;
 mod lookup;
+mod memory_policy_cache;
 mod pools;
 mod snapshots;
 mod startup_recovery;
@@ -2756,6 +2778,7 @@ mod templates;
 mod tests;
 mod transfer;
 
+pub(crate) use import_helpers::template_arch;
 use import_helpers::*;
 use support::*;
 
@@ -2763,8 +2786,8 @@ use support::*;
 pub(crate) fn validate_guest_documents(
     metadata_bytes: &[u8],
     manifest_bytes: &[u8],
-) -> Result<pplx_space_common_core::types::TemplateMetadata, Status> {
-    let metadata: pplx_space_common_core::types::TemplateMetadata = if metadata_bytes.is_empty() {
+) -> Result<pplx_space_template_manifest::TemplateMetadata, Status> {
+    let metadata: pplx_space_template_manifest::TemplateMetadata = if metadata_bytes.is_empty() {
         Default::default()
     } else {
         serde_json::from_slice(metadata_bytes).map_err(|error| {
@@ -2782,7 +2805,7 @@ pub(crate) fn validate_guest_documents(
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
     }
     if !manifest_bytes.is_empty() {
-        let manifest: pplx_space_common_core::types::TemplateManifest =
+        let manifest: pplx_space_template_manifest::TemplateManifest =
             serde_json::from_slice(manifest_bytes).map_err(|error| {
                 Status::invalid_argument(format!("invalid template manifest: {error}"))
             })?;
@@ -2804,7 +2827,7 @@ impl TemplateManagerService {
         &self,
         template: &str,
     ) -> Result<Option<pplx_space_execution_catalog::guest::GuestProfile>, Status> {
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let template = template.to_owned();
         tokio::task::spawn_blocking(move || {
             let conn = db
@@ -2815,7 +2838,7 @@ impl TemplateManagerService {
                 Err(error) if error.code() == tonic::Code::NotFound => return Ok(None),
                 Err(error) => return Err(error),
             };
-            let manifest: pplx_space_common_core::types::TemplateManifest =
+            let manifest: pplx_space_template_manifest::TemplateManifest =
                 serde_json::from_str(&build.manifest_json).map_err(|error| {
                     Status::failed_precondition(format!("invalid template manifest: {error}"))
                 })?;
@@ -2827,10 +2850,10 @@ impl TemplateManagerService {
             // exact execution qualification still occurs at launch/restore.
             let runtime = build
                 .runtime
-                .parse::<pplx_space_common_core::types::RuntimeKind>()
+                .parse::<pplx_space_execution_spec::RuntimeKind>()
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
             if manifest.guest_image.unwrap_or_default().legacy_transport()
-                && runtime == pplx_space_common_core::types::RuntimeKind::Firecracker
+                && runtime == pplx_space_execution_spec::RuntimeKind::Firecracker
             {
                 return Ok(None);
             }

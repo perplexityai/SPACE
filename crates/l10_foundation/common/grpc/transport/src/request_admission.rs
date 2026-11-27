@@ -1,7 +1,7 @@
 //! Bounded admission before Tonic decodes payload-bearing requests.
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -22,9 +22,22 @@ pub struct RequestPermit {
 
 #[derive(Debug)]
 struct PermitInner {
-    permit: OwnedSemaphorePermit,
+    permit: Mutex<Held>,
+    semaphore: Arc<Semaphore>,
+    slots: usize,
+    acquired_at: Instant,
     observation: Option<Budget>,
     cancelled_at: OnceLock<Instant>,
+}
+
+/// What a permit holds: its payload slots, or, once
+/// [`WeakRequestPermit::exchange`] returned them, a permit from another budget
+/// held for the rest of the work.
+#[derive(Debug)]
+enum Held {
+    // Each permit is held only to return its slots when dropped.
+    Payload { _slots: OwnedSemaphorePermit },
+    Exchanged { _slots: OwnedSemaphorePermit },
 }
 
 impl PermitInner {
@@ -32,21 +45,47 @@ impl PermitInner {
         if let Some(budget) = self.observation {
             self.cancelled_at.get_or_init(|| {
                 let now = Instant::now();
-                payload::cancelled(budget, self.permit.num_permits());
+                payload::cancelled(budget, self.slots);
                 now
             });
+        }
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, Held> {
+        self.permit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn holds_slots(&self) -> bool {
+        matches!(*self.held(), Held::Payload { .. })
+    }
+
+    /// Swap the payload slots for `other`, for every clone, unless they are
+    /// already gone; then `other` comes back.
+    fn exchange(&self, other: OwnedSemaphorePermit) -> Result<(), OwnedSemaphorePermit> {
+        let mut held = self.held();
+        if !matches!(*held, Held::Payload { .. }) {
+            return Err(other);
+        }
+        // The payload slots drop here, returning to their budget.
+        *held = Held::Exchanged { _slots: other };
+        drop(held);
+        self.record_cancelled_release();
+        Ok(())
+    }
+
+    fn record_cancelled_release(&self) {
+        if let (Some(budget), Some(started)) = (self.observation, self.cancelled_at.get()) {
+            payload::released_after_cancellation(budget, self.slots, started.elapsed());
         }
     }
 }
 
 impl Drop for PermitInner {
     fn drop(&mut self) {
-        if let (Some(budget), Some(started)) = (self.observation, self.cancelled_at.get()) {
-            payload::released_after_cancellation(
-                budget,
-                self.permit.num_permits(),
-                started.elapsed(),
-            );
+        if self.holds_slots() {
+            self.record_cancelled_release();
         }
     }
 }
@@ -75,14 +114,61 @@ impl Drop for RequestLifetime {
     }
 }
 
+/// Refers to a [`RequestPermit`] without keeping its slots held.
+#[derive(Clone, Debug)]
+pub struct WeakRequestPermit {
+    permit: Weak<PermitInner>,
+}
+
+impl WeakRequestPermit {
+    /// How long the permit has held its slots, while it still holds them.
+    pub fn held_for(&self) -> Option<std::time::Duration> {
+        let permit = self.permit.upgrade()?;
+        permit.holds_slots().then(|| permit.acquired_at.elapsed())
+    }
+
+    /// Return the payload slots to their budget now, for every clone, and
+    /// hold `other` (from a separate, smaller budget) in their place for as
+    /// long as the permit lives. For work whose hold time must be bounded
+    /// where the payload budget cannot wait for it, such as a start stalled in
+    /// the kernel, while `other` still caps how much such work is live.
+    /// `other` comes back if every owner dropped the permit or it was already
+    /// exchanged.
+    pub fn exchange(&self, other: OwnedSemaphorePermit) -> Result<(), OwnedSemaphorePermit> {
+        match self.permit.upgrade() {
+            Some(permit) => permit.exchange(other),
+            None => Err(other),
+        }
+    }
+}
+
 impl RequestPermit {
     fn new(permit: OwnedSemaphorePermit, observation: Option<Budget>) -> Self {
         Self {
             inner: Arc::new(PermitInner {
-                permit,
+                semaphore: Arc::clone(permit.semaphore()),
+                slots: permit.num_permits(),
+                permit: Mutex::new(Held::Payload { _slots: permit }),
+                acquired_at: Instant::now(),
                 observation,
                 cancelled_at: OnceLock::new(),
             }),
+        }
+    }
+
+    /// The payload slots held, or 0 once exchanged.
+    pub fn slots(&self) -> usize {
+        if self.inner.holds_slots() {
+            self.inner.slots
+        } else {
+            0
+        }
+    }
+
+    /// A reference that does not keep the slots held.
+    pub fn downgrade(&self) -> WeakRequestPermit {
+        WeakRequestPermit {
+            permit: Arc::downgrade(&self.inner),
         }
     }
 
@@ -130,8 +216,8 @@ impl RequestPermit {
     ) -> Result<Self, TryAcquireError> {
         let supplied = admitted.is_some();
         if let Some(permit) = admitted
-            && Arc::ptr_eq(permit.inner.permit.semaphore(), &slots)
-            && permit.inner.permit.num_permits() >= weight as usize
+            && Arc::ptr_eq(&permit.inner.semaphore, &slots)
+            && permit.slots() >= weight as usize
         {
             if let Some(budget) = observation {
                 payload::admission(budget, Site::Handler, Outcome::Reused);

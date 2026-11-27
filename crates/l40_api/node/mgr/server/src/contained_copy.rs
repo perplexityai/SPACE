@@ -57,8 +57,9 @@ static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 pub enum ContainedCopyError {
     /// The path lexically escapes the root, contains a non-normal component,
     /// hits a symlink during resolution, or names a file that isn't a
-    /// regular file without multiple links. These are containment violations from the
-    /// (untrusted) caller, not I/O luck.
+    /// regular file without multiple links, or, for [`stage_disk_file_contained`],
+    /// an empty one. These are violations by the (untrusted) caller, not I/O
+    /// luck.
     #[error("{path} escapes containment under {root}: {detail}")]
     Escape {
         root: PathBuf,
@@ -106,6 +107,27 @@ pub fn stage_file_contained(
     src: &Path,
     dst: &Path,
 ) -> Result<File, ContainedCopyError> {
+    stage_contained(root, src, dst, false)
+}
+
+/// [`stage_file_contained`] for a disk file, such as an encrypted COW, that
+/// is never empty: an empty source is refused on the descriptor the copy
+/// reads, before anything replaces `dst`, so a retry finds `dst` as it was.
+/// Blocking — call from `spawn_blocking`.
+pub fn stage_disk_file_contained(
+    root: &Path,
+    src: &Path,
+    dst: &Path,
+) -> Result<File, ContainedCopyError> {
+    stage_contained(root, src, dst, true)
+}
+
+fn stage_contained(
+    root: &Path,
+    src: &Path,
+    dst: &Path,
+    refuse_empty: bool,
+) -> Result<File, ContainedCopyError> {
     // Source: pin the parent, then open the final component O_NOFOLLOW so a
     // symlinked source file is refused. O_NONBLOCK so a planted FIFO fails the
     // regular-file check below instead of blocking the open forever.
@@ -136,6 +158,13 @@ pub fn stage_file_contained(
             root,
             src,
             format!("source has {} hard links; refusing", src_meta.nlink()),
+        ));
+    }
+    if refuse_empty && src_meta.len() == 0 {
+        return Err(ContainedCopyError::escape(
+            root,
+            src,
+            "source is empty; refusing to replace the destination with it",
         ));
     }
 
@@ -294,7 +323,7 @@ fn unlinkat(dir: &File, name: &OsStr) -> io::Result<()> {
 /// the filesystem supports it, hole-preserving byte copy otherwise. The
 /// destination is a freshly created empty temp file.
 pub(crate) fn copy_on_descriptors(src: &File, dst: &File, len: u64) -> io::Result<()> {
-    pplx_space_common_io::reflink::copy_on_descriptors(src, dst, len).map(|_| ())
+    pplx_space_file_io::reflink::copy_on_descriptors(src, dst, len).map(|_| ())
 }
 
 #[cfg(test)]

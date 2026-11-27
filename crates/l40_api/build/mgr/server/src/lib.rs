@@ -1,13 +1,15 @@
 use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
+use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures_util::{FutureExt, TryStream, TryStreamExt};
 use prost::Message;
 
+use pplx_space_accounts::JobId;
 use pplx_space_build_mgr::{
     BuildError, BuildOutcome, BuildPhase, BuildVmEgressPolicyError, NetworkPolicyV1, PublishError,
     SystemPublicationGrantId, TemplateBuildErrorKind, TemplateBuilder, TemplateOrg,
@@ -22,18 +24,23 @@ use pplx_space_build_mgr_client::proto::{
     BuildState, GetBuildStatusRequest, GetBuildStatusResponse, StartBuildRequest,
     StartBuildResponse, UploadBlobChunk, UploadBlobPhase, UploadBlobResponse,
 };
-use pplx_space_common_jobs::metrics::JobCompletedResult;
-use pplx_space_common_jobs::{
-    BackgroundWorker, Job, JobError, JobExecutor, LeaseConfig, WorkerConfig,
+use pplx_space_build_mgr_store::database::{self, SharedConnection};
+use pplx_space_build_mgr_store::jobs::{
+    Job, JobCompletedResult, JobError, JobExecutor, JobWorker, LeaseConfig, WorkerConfig,
+    drain_outstanding,
 };
-use rusqlite::{Connection, params};
+use pplx_space_build_mgr_store::{
+    BUILD_JOB_KIND, BuildJobResult, BuildTerminalState, count_active_build_jobs,
+    count_other_active_builds_for_subject, count_running_build_jobs_by_lease_owner,
+    fail_expired_running_builds, get_build_result,
+};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 use tracing::Instrument as _;
 
 pub mod jobs;
 pub mod run;
-use jobs::{BuildJobPayload, BuildJobResult, BuildTerminalState};
+use jobs::BuildJobPayload;
 pub use run::{
     BuildMgrRunConfig, DEFAULT_DRAIN_TIMEOUT_SECONDS, DEFAULT_LISTEN, RunBuildMgrError,
     SERVICE_NAME, run,
@@ -41,8 +48,8 @@ pub use run::{
 
 #[derive(Clone)]
 pub struct BuildManagerDaemonService {
-    db: Arc<Mutex<Connection>>,
-    worker: BackgroundWorker<BuildExecutor>,
+    db: SharedConnection,
+    worker: JobWorker<BuildExecutor>,
     draining: Arc<AtomicBool>,
     blob_store: blob::BlobStore,
 }
@@ -59,7 +66,7 @@ const INTERRUPTED_BUILD_ERROR: &str =
 
 #[derive(Clone)]
 struct BuildExecutor {
-    db: Arc<Mutex<Connection>>,
+    db: SharedConnection,
     backend: Arc<dyn BuildBackend>,
     blob_store: blob::BlobStore,
 }
@@ -69,12 +76,12 @@ impl BuildManagerDaemonService {
         #[cfg(feature = "aws-ecr")]
         pplx_space_build_mgr::oci::validate_registry_configuration()
             .map_err(NewServiceError::OciRegistryConfiguration)?;
-        let conn = open_db(db_path).map_err(NewServiceError::OpenDb)?;
+        let conn = database::open(Path::new(db_path)).map_err(NewServiceError::OpenDb)?;
         let blob_store = blob::BlobStore::from_env().map_err(NewServiceError::BlobStore)?;
         let build_vm_network_policy =
             build_vm_egress_policy_from_env().map_err(NewServiceError::BuildVmEgressPolicy)?;
         Ok(Self::from_backend(
-            Arc::new(Mutex::new(conn)),
+            SharedConnection::new(conn),
             max_concurrent_builds,
             Arc::new(RuntimeBuildBackend {
                 build_vm_network_policy,
@@ -84,19 +91,18 @@ impl BuildManagerDaemonService {
     }
 
     fn from_backend(
-        db: Arc<Mutex<Connection>>,
+        db: SharedConnection,
         max_concurrent_builds: usize,
         backend: Arc<dyn BuildBackend>,
         blob_store: blob::BlobStore,
     ) -> Self {
         let max_concurrent_builds = max_concurrent_builds.max(1);
         let executor = BuildExecutor {
-            db: Arc::clone(&db),
+            db: db.clone(),
             backend,
             blob_store: blob_store.clone(),
         };
-        let worker = BackgroundWorker::new(
-            Arc::clone(&db),
+        let worker = db.background_worker(
             executor,
             WorkerConfig::new(
                 max_concurrent_builds,
@@ -113,7 +119,7 @@ impl BuildManagerDaemonService {
         }
     }
 
-    pub fn recover_jobs(&self) -> Vec<pplx_space_common_jobs::JobId> {
+    pub fn recover_jobs(&self) -> Vec<JobId> {
         self.mark_expired_build_leases_failed();
         self.worker.recover_and_log("build-manager.template_build")
     }
@@ -171,12 +177,10 @@ impl BuildManagerDaemonService {
     pub fn mark_expired_build_leases_failed(&self) -> usize {
         let expired = {
             let conn = self.db.lock().expect("build-manager db mutex poisoned");
-            jobs::fail_expired_running_builds(&conn, INTERRUPTED_BUILD_ERROR).unwrap_or_else(
-                |error| {
-                    tracing::error!(%error, "failed to mark expired build leases failed");
-                    Vec::new()
-                },
-            )
+            fail_expired_running_builds(&conn, INTERRUPTED_BUILD_ERROR).unwrap_or_else(|error| {
+                tracing::error!(%error, "failed to mark expired build leases failed");
+                Vec::new()
+            })
         };
         if !expired.is_empty() {
             tracing::warn!(
@@ -225,7 +229,7 @@ impl BuildManagerDaemonService {
 
         loop {
             let active = self.local_running_build_count();
-            pplx_space_common_jobs::metrics::drain_outstanding(active as u64);
+            drain_outstanding(active as u64);
 
             if active == 0 {
                 return;
@@ -265,7 +269,7 @@ pub enum NewServiceError {
     #[error("configure OCI registries: {0}")]
     OciRegistryConfiguration(#[source] pplx_space_build_mgr::oci::EcrConfigurationError),
     #[error("open build-manager db: {0}")]
-    OpenDb(#[source] rusqlite::Error),
+    OpenDb(#[source] database::Error),
     #[error("configure build input storage: {0}")]
     BlobStore(#[source] blob::BlobError),
     #[error("configure build VM egress: {0}")]
@@ -285,16 +289,16 @@ trait BuildBackend: Send + Sync {
         recipe_label: &str,
         recipe: pplx_space_build_mgr::PreparedRecipe,
         template_id: &str,
-        job_id: &pplx_space_common_jobs::JobId,
+        job_id: &JobId,
         template_org: Option<TemplateOrg>,
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     ) -> Result<BuildOutcome, BuildError>;
 
     async fn publish(
         &self,
         template_id: &str,
         content_hash: &str,
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        environment: Option<pplx_space_execution_spec::EnvironmentReference>,
         publish_tags: &[String],
         publication: TemplatePublication,
     ) -> Result<(), PublishError>;
@@ -324,9 +328,9 @@ impl BuildBackend for RuntimeBuildBackend {
         recipe_label: &str,
         recipe: pplx_space_build_mgr::PreparedRecipe,
         template_id: &str,
-        job_id: &pplx_space_common_jobs::JobId,
+        job_id: &JobId,
         template_org: Option<TemplateOrg>,
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     ) -> Result<BuildOutcome, BuildError> {
         TemplateBuilder::new()
             .with_environment(environment)
@@ -340,7 +344,7 @@ impl BuildBackend for RuntimeBuildBackend {
         &self,
         template_id: &str,
         content_hash: &str,
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        environment: Option<pplx_space_execution_spec::EnvironmentReference>,
         publish_tags: &[String],
         publication: TemplatePublication,
     ) -> Result<(), PublishError> {
@@ -600,7 +604,7 @@ impl JobExecutor for BuildExecutor {
                 }
             };
 
-            let result = build_result.state.as_metric_result();
+            let result = jobs::metric_result(build_result.state);
             pplx_space_build_mgr::metrics::build_completed(
                 &template_id,
                 result,
@@ -658,9 +662,7 @@ impl JobExecutor for BuildExecutor {
     /// successful job.
     fn completed_result(&self, job: &Job) -> JobCompletedResult {
         let stored = match self.db.lock() {
-            Ok(conn) => {
-                jobs::get_build_result(&conn, &job.job_id).map_err(|error| error.to_string())
-            }
+            Ok(conn) => get_build_result(&conn, &job.job_id).map_err(|error| error.to_string()),
             Err(error) => Err(error.to_string()),
         };
         match stored {
@@ -704,11 +706,7 @@ impl BuildExecutor {
     /// build but is still publishing would otherwise lose its artifacts to
     /// our prune. If template-manager has no cache budget, eviction cannot
     /// provide this cleanup for builder nodes.
-    async fn prune_replaced_builds_if_no_siblings(
-        &self,
-        job_id: &pplx_space_common_jobs::JobId,
-        result: &BuildJobResult,
-    ) {
+    async fn prune_replaced_builds_if_no_siblings(&self, job_id: &JobId, result: &BuildJobResult) {
         if result.state != BuildTerminalState::Succeeded {
             return;
         }
@@ -717,7 +715,7 @@ impl BuildExecutor {
         };
         let active_siblings = {
             let conn = self.db.lock().expect("build-manager db mutex poisoned");
-            match jobs::count_other_active_builds_for_subject(&conn, &result.template_id, job_id) {
+            match count_other_active_builds_for_subject(&conn, &result.template_id, job_id) {
                 Ok(count) => count,
                 Err(error) => {
                     tracing::warn!(
@@ -743,42 +741,6 @@ impl BuildExecutor {
             .prune_replaced_builds(&result.template_id, content_hash)
             .await;
     }
-}
-
-fn open_db(path: &str) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(path)?;
-    conn.busy_timeout(Duration::from_secs(30))?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=NORMAL;
-         PRAGMA foreign_keys=ON;",
-    )?;
-    Ok(conn)
-}
-
-fn count_active_build_jobs(conn: &Connection) -> rusqlite::Result<usize> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM jobs
-         WHERE kind = ?1 AND status IN ('pending', 'running')",
-        params![jobs::BUILD_JOB_KIND],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(jobs::sqlite_count_to_usize)
-}
-
-fn count_running_build_jobs_by_lease_owner(
-    conn: &Connection,
-    lease_owner: &str,
-) -> rusqlite::Result<usize> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM jobs
-         WHERE kind = ?1
-           AND status = 'running'
-           AND lease_owner = ?2",
-        params![jobs::BUILD_JOB_KIND, lease_owner],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(jobs::sqlite_count_to_usize)
 }
 
 fn build_job_lease_config() -> LeaseConfig {
@@ -845,7 +807,7 @@ impl BuildManager for BuildManagerDaemonService {
                 Some(
                     input
                         .reference
-                        .parse::<pplx_space_common_core::types::EnvironmentReference>()
+                        .parse::<pplx_space_execution_spec::EnvironmentReference>()
                         .map_err(|error| Status::invalid_argument(error.to_string()))?,
                 ),
             ),
@@ -915,7 +877,7 @@ impl BuildManager for BuildManagerDaemonService {
         // Every submission gets its own job; staging is isolated by job ID.
         let job_id = if let Some(environment) = environment {
             self.worker.submit_json(
-                jobs::BUILD_JOB_KIND,
+                BUILD_JOB_KIND,
                 &jobs::VersionedBuildJobPayload::Environment {
                     environment,
                     build: payload,
@@ -925,7 +887,7 @@ impl BuildManager for BuildManagerDaemonService {
             )?
         } else {
             self.worker
-                .submit_json(jobs::BUILD_JOB_KIND, &payload, Some(&template_id), None)?
+                .submit_json(BUILD_JOB_KIND, &payload, Some(&template_id), None)?
         };
         tracing::info!(
             job_id = %job_id,
@@ -947,7 +909,7 @@ impl BuildManager for BuildManagerDaemonService {
         let request = request.into_inner();
         let job_id = request
             .job_id
-            .parse::<pplx_space_common_jobs::JobId>()
+            .parse::<JobId>()
             .map_err(|error| Status::invalid_argument(format!("job_id: {error}")))?;
         let job = self
             .worker
@@ -962,14 +924,14 @@ impl BuildManager for BuildManagerDaemonService {
         })?;
         let result = {
             let conn = self.db.lock().expect("build-manager db mutex poisoned");
-            jobs::get_build_result(&conn, &job_id)
+            get_build_result(&conn, &job_id)
                 .map_err(|error| Status::internal(format!("read build result: {error}")))?
         };
 
         let (state, content_hash, error) = match (job.status.as_str(), result) {
             ("pending" | "running", _) => (BuildState::Running, String::new(), String::new()),
             ("completed", Some(result)) => (
-                result.state.as_build_state(),
+                jobs::proto_build_state(result.state),
                 result.content_hash.unwrap_or_default(),
                 result.error.unwrap_or_default(),
             ),
@@ -986,7 +948,7 @@ impl BuildManager for BuildManagerDaemonService {
                     error: job.error.clone(),
                 });
                 (
-                    result.state.as_build_state(),
+                    jobs::proto_build_state(result.state),
                     result.content_hash.unwrap_or_default(),
                     result
                         .error

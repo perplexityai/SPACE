@@ -3,11 +3,11 @@ use super::cleanup_support::{StateWriteRejected, state_write_result};
 use super::grpc_lifecycle::SuspendRequestContext;
 use super::network_runtime::*;
 use super::*;
-use pplx_space_common_core::types::SandboxRouteIdentityInvariantError;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
     emit_sandbox_event,
 };
+use pplx_space_sandbox_model::SandboxRouteIdentityInvariantError;
 
 const ROUTE_VERIFICATION_BUNDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const AUTO_LIFECYCLE_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
@@ -33,6 +33,11 @@ enum NetworkPolicyReconcileError {
     Operation(#[from] Status),
     #[error("network policy reconcile task failed: {0}")]
     Task(#[from] tokio::task::JoinError),
+    /// The gateway was launched before a route-security RPC this build pushes,
+    /// and answers it UNIMPLEMENTED until it is cycled. The policy was still
+    /// reconciled.
+    #[error(transparent)]
+    UnsupportedGateway(Status),
 }
 
 impl NetworkPolicyReconcileError {
@@ -41,6 +46,49 @@ impl NetworkPolicyReconcileError {
     /// sandbox becomes eligible again, but this queue row is complete.
     fn is_terminal(&self) -> bool {
         matches!(self, Self::Refresh(error) if error.is_abandoned())
+    }
+
+    /// A route-security push's error. Its UNIMPLEMENTED is only ever an older
+    /// gateway's answer (`route_identity_push_status`,
+    /// `route_verification_key_push_status`).
+    fn route_security(status: Status) -> Self {
+        if status.code() == tonic::Code::Unimplemented {
+            Self::UnsupportedGateway(status)
+        } else {
+            Self::Operation(status)
+        }
+    }
+}
+
+/// How one queued reconcile ends: `Ok` completes its queue row, an error
+/// retries it. An abandoned refresh and a gateway too old for route security
+/// complete it, since retrying the same gateway cannot change either; the
+/// periodic sweep, and cycling the gateway, queue the sandbox again.
+fn queued_network_policy_result(
+    sandbox_id: &str,
+    result: Result<ApplyDecisionKind, NetworkPolicyReconcileError>,
+) -> Result<(), NetworkPolicyReconcileError> {
+    match result {
+        Ok(ApplyDecisionKind::Conflict) => {
+            Err(Status::aborted("network policy reconcile returned conflict").into())
+        }
+        Ok(decision) => {
+            tracing::debug!(sandbox_id, ?decision, "network policy reconciled");
+            Ok(())
+        }
+        Err(error) if error.is_terminal() => {
+            tracing::info!(sandbox_id, %error, "network policy reconcile abandoned");
+            Ok(())
+        }
+        Err(NetworkPolicyReconcileError::UnsupportedGateway(status)) => {
+            tracing::info!(
+                sandbox_id,
+                error = %status.message(),
+                "network policy reconciled; the net-gateway predates route security"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -99,8 +147,12 @@ where
     // would leave the gateway on a stale policy until the retry.
     let identity_result = route_identity_push.await;
     let decision = policy_reconcile.await?;
-    let identity_profile_version = identity_result?.identity_profile_version();
-    route_security_push(identity_profile_version).await?;
+    let identity_profile_version = identity_result
+        .map_err(NetworkPolicyReconcileError::route_security)?
+        .identity_profile_version();
+    route_security_push(identity_profile_version)
+        .await
+        .map_err(NetworkPolicyReconcileError::route_security)?;
     Ok(decision)
 }
 
@@ -422,6 +474,29 @@ impl SandboxManagerService {
             )?;
             return Ok(());
         };
+        // A runtime upgrade that must leave the sandbox stopped fences it, then
+        // runs it on its boot's execution until it stops it; a suspend there
+        // would leave it suspended. Held like the non-actionable stage below,
+        // so the suspend is reconsidered once the fence lifts and that
+        // execution is gone. The suspend itself checks again under its locks.
+        // Bound first, so the connection's guard is dropped before the body
+        // takes the connection again.
+        let stay_stopped_upgrade = if action == AutoLifecycleIdleAction::Suspend {
+            let db = self.db_conn()?;
+            super::runtime_upgrade::stay_stopped_upgrade_awaiting_its_stop(&db, &sandbox.id)?
+        } else {
+            None
+        };
+        if let Some(operation_id) = stay_stopped_upgrade {
+            tracing::debug!(
+                sandbox_id = %sandbox.id,
+                %operation_id,
+                "holding a due auto-suspend while a runtime upgrade that ends stopped \
+                 hasn't stopped its boot; nothing recorded"
+            );
+            self.defer_gated_auto_lifecycle_row(&sandbox.id, now)?;
+            return Ok(());
+        }
         // A stage whose action can neither act on this state nor count it
         // as satisfied — a Suspend due on a mid-transition row, or on a
         // failed cross-node restore's retained `restoring` row — is left
@@ -444,6 +519,42 @@ impl SandboxManagerService {
             self.defer_gated_auto_lifecycle_row(&sandbox.id, now)?;
             return Ok(());
         }
+        // A v2 drain doesn't move a stopped sandbox, so a node known sealed
+        // doesn't stop a sandbox on its idle policy, whether suspended,
+        // started or paused: held like the stages above, the row keeps its
+        // state, and the first pass after the node is unsealed stops it. An
+        // admitted stop holds a producer token until its state write commits:
+        // it takes only the wake lock, which a drain's artifact-lock confirm
+        // doesn't exclude, so a drain that seals the node meanwhile reports
+        // the sandbox pending instead of finding it where it was. The stop
+        // leaves the sandbox without a VM, so it asks as a producer for a
+        // sandbox with none. An idle suspend isn't held, since the drain
+        // wants it. The node's Stop RPC isn't refused: the Kubernetes
+        // teardown calls it first in every delete.
+        let idle_stop = if action == AutoLifecycleIdleAction::Stop
+            && matches!(
+                sandbox.state.unowned(),
+                Some(SandboxState::Suspended | SandboxState::Started | SandboxState::Paused)
+            ) {
+            match self
+                .activation_seal
+                .admit_producer("idle auto-stop", &sandbox.id, false)
+            {
+                Ok(token) => Some(token),
+                Err(sealed) => {
+                    tracing::debug!(
+                        sandbox_id = %sandbox.id,
+                        state = %sandbox.state,
+                        reason = sealed.message(),
+                        "holding a due auto-stop while the node is sealed; nothing recorded"
+                    );
+                    self.defer_gated_auto_lifecycle_row(&sandbox.id, now)?;
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
         // Join the writer set only after wake arbitration and due-policy
         // revalidation; keep the supervisor pinned through the transition.
         let _state_writer = self.state_writer_lease("AutoLifecycle")?;
@@ -517,6 +628,9 @@ impl SandboxManagerService {
                     }
                     _ => {}
                 }
+                // The stop's state write has committed: a drain's next read
+                // finds the row where the stop left it.
+                drop(idle_stop);
                 AutoLifecycleTransition::Stop
             }
             AutoLifecycleIdleAction::Delete => {
@@ -525,6 +639,7 @@ impl SandboxManagerService {
                         sandbox_id: sandbox.id.clone(),
                         template_filter: None,
                         blocking: true,
+                        discard_retained_filesystem_reason: None,
                     }),
                     Some(
                         crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteExpectation {
@@ -917,20 +1032,10 @@ impl SandboxManagerService {
         sandbox_id: &str,
     ) -> Result<(), NetworkPolicyReconcileError> {
         let started_at = Instant::now();
-        let result = match self.reconcile_network_policy_for_sandbox(sandbox_id).await {
-            Ok(ApplyDecisionKind::Conflict) => {
-                Err(Status::aborted("network policy reconcile returned conflict").into())
-            }
-            Ok(decision) => {
-                tracing::debug!(sandbox_id, ?decision, "network policy reconciled");
-                Ok(())
-            }
-            Err(error) if error.is_terminal() => {
-                tracing::info!(sandbox_id, %error, "network policy reconcile abandoned");
-                Ok(())
-            }
-            Err(error) => Err(error),
-        };
+        let result = queued_network_policy_result(
+            sandbox_id,
+            self.reconcile_network_policy_for_sandbox(sandbox_id).await,
+        );
         if let Err(error) = &result {
             tracing::warn!(sandbox_id, %error, "network policy reconcile failed");
         }
@@ -1059,7 +1164,7 @@ impl SandboxManagerService {
         requested: BootMode,
         template: &str,
         snapshot_dir: Option<&str>,
-        execution: &pplx_space_common_core::types::ExecutionMetadata,
+        execution: &pplx_space_execution_spec::ExecutionMetadata,
     ) -> Result<BootMode, Status> {
         if requested == BootMode::Pool {
             let has_pool = {
@@ -1107,4 +1212,4 @@ fn network_policy_reconcile_entry_decision(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

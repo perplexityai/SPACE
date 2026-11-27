@@ -50,8 +50,9 @@ pub(super) mod service_tests {
     use crate::service::runtime::{
         AllocateNewLeaseError, registered_firecracker_pid_with_vm_processes,
     };
-    use pplx_space_common_core::host::linux::identities::users;
-    use pplx_space_common_core::types::{LinuxPid, SandboxId};
+    use pplx_space_host_layout::identities::users;
+    use pplx_space_linux_ids::LinuxPid;
+    use pplx_space_sandbox_model::SandboxId;
     use pplx_space_uds_peer_auth::PeerIdentity;
     use std::str::FromStr;
 
@@ -59,10 +60,13 @@ pub(super) mod service_tests {
     fn allocation_storage_failures_are_retryable_at_the_rpc_boundary() {
         for error in [
             crate::slot_pool::SlotStoreError::LockPoisoned,
-            crate::slot_pool::SlotStoreError::Database(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-                None,
-            )),
+            crate::slot_pool::SlotStoreError::Database(
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    None,
+                )
+                .into(),
+            ),
         ] {
             assert_eq!(
                 allocate_error_to_status(AllocateSlotError::Store(error)).code(),
@@ -256,12 +260,38 @@ pub(super) mod service_tests {
             .authorize_identity(node_ctl.clone(), "GetVmState", ALLOW_NODE_STATUS)
             .expect("node-ctl may inspect runtime state without gaining mutation access");
         authorizer
-            .authorize_identity(node_ctl.clone(), "GetExecutionInventory", ALLOW_NODE_STATUS)
+            .authorize_identity(
+                node_ctl.clone(),
+                "GetExecutionInventory",
+                ALLOW_EXECUTION_INVENTORY,
+            )
             .expect("node-ctl needs runtime compatibility evidence");
 
         let error = authorizer
             .authorize_identity(node_ctl, "SetNetworkPoolDrain", ALLOW_NODE_ADMIN)
             .expect_err("node-ctl must not get broad node-manager admin access");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn template_manager_can_read_execution_inventory_only() {
+        let authorizer = node_peer_authorizer();
+        let template_manager = PeerIdentity::new(
+            users::SPACE_TMPLMGR.uid,
+            users::SPACE_TMPLMGR.primary_group.gid,
+            None,
+        );
+
+        authorizer
+            .authorize_identity(
+                template_manager.clone(),
+                "GetExecutionInventory",
+                ALLOW_EXECUTION_INVENTORY,
+            )
+            .expect("template-manager warms and pools builds per usable environment");
+        let error = authorizer
+            .authorize_identity(template_manager, "InspectSandbox", ALLOW_NODE_STATUS)
+            .expect_err("reading environments grants no other node status");
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
     }
 
@@ -382,7 +412,7 @@ pub(super) mod service_tests {
                 sandbox_id: id.to_string(),
                 artifact_dir: format!(
                     "{}/{id}/snapshot",
-                    pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR
+                    pplx_space_host_layout::paths::SANDBOX_CACHE_DIR
                 ),
                 source_id: uuid::Uuid::now_v7().to_string(),
             });
@@ -568,7 +598,7 @@ pub(super) mod service_tests {
         sandbox_id: &str,
     ) -> crate::proto::ExecutionFence {
         let fence = pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
-            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+            pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
             None,
         );
         service.pool.bind_execution(sandbox_id, fence).unwrap();
@@ -578,7 +608,7 @@ pub(super) mod service_tests {
     /// An execution fence no sandbox is bound to.
     pub(in crate::service) fn stale_test_fence() -> crate::proto::ExecutionFence {
         pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
-            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+            pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
             None,
         )
         .into()
@@ -714,6 +744,7 @@ pub(super) mod service_tests {
             send_source_locks: Default::default(),
             send_source_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             artifact_work: None,
+            artifact_work_cancel: tokio_util::sync::CancellationToken::new(),
             device_op_tasks: tokio_util::task::TaskTracker::new(),
             blocking_probe_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_BLOCKING_PROBES,
@@ -734,7 +765,7 @@ pub(super) mod service_tests {
                 kernels: vacant.join("kernels"),
                 store: crate::config::ArtifactStorePaths {
                     releases: [(
-                        pplx_space_common_core::types::RuntimeKind::Firecracker,
+                        pplx_space_execution_spec::RuntimeKind::Firecracker,
                         vacant.join("store/releases"),
                     )]
                     .into(),
@@ -750,7 +781,7 @@ pub(super) mod service_tests {
                         None,
                         None,
                         &pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-                            pplx_space_common_core::types::Arch::X86_64,
+                            pplx_space_cpu_arch::Arch::X86_64,
                         )
                         .unwrap(),
                     )
@@ -763,7 +794,7 @@ pub(super) mod service_tests {
             ),
             disk_admission: std::sync::Arc::new(
                 crate::disk_admission::DiskAdmission::new(
-                    pplx_space_common_core::host::disk_admission::CacheDiskAdmissionConfig {
+                    pplx_space_node_disk_admission::CacheDiskAdmissionConfig {
                         enabled: false,
                         ..Default::default()
                     },
@@ -776,6 +807,9 @@ pub(super) mod service_tests {
             cleanup_operations: CleanupOperationRegistry::default(),
             orphan_inventory: orphan_inventory::OrphanInventory::default(),
             snapshot_inventory: snapshot_inventory::SnapshotInventory::default(),
+            encrypted_capture_io: None,
+            #[cfg(target_os = "linux")]
+            firewall_sync: None,
         }
     }
 
@@ -817,7 +851,7 @@ pub(super) mod service_tests {
         std::fs::create_dir(&assets).unwrap();
         let store = crate::config::ArtifactStorePaths {
             releases: [(
-                pplx_space_common_core::types::RuntimeKind::Firecracker,
+                pplx_space_execution_spec::RuntimeKind::Firecracker,
                 root.path().join("store/releases"),
             )]
             .into(),
@@ -933,10 +967,12 @@ pub(super) mod service_tests {
                     .is_empty()
             );
         }
+        // Template-manager may read the inventory; volume-manager reads no
+        // node status at all.
         let mut denied = Request::new(GetExecutionInventoryRequest {});
         denied.extensions_mut().insert(PeerIdentity::new(
-            users::SPACE_TMPLMGR.uid,
-            users::SPACE_TMPLMGR.primary_group.gid,
+            users::SPACE_VOLMGR.uid,
+            users::SPACE_VOLMGR.primary_group.gid,
             None,
         ));
         assert_eq!(
@@ -947,6 +983,16 @@ pub(super) mod service_tests {
                 .code(),
             tonic::Code::PermissionDenied
         );
+        let mut allowed = Request::new(GetExecutionInventoryRequest {});
+        allowed.extensions_mut().insert(PeerIdentity::new(
+            users::SPACE_TMPLMGR.uid,
+            users::SPACE_TMPLMGR.primary_group.gid,
+            None,
+        ));
+        service
+            .get_execution_inventory(allowed)
+            .await
+            .expect("template-manager reads the environments it warms and pools builds for");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2388,30 +2434,30 @@ table inet space {
         let sandbox_uid = 10_042;
         let args = vec![
             "--socket".to_string(),
-            pplx_space_common_core::host::linux::paths::spaced_host_socket(sandbox_id),
+            pplx_space_host_layout::paths::spaced_host_socket(sandbox_id),
             "--sandbox-id".to_string(),
             sandbox_id.to_string(),
             "--vsock-uds".to_string(),
             format!("{JAIL_DIR}/firecracker/{sandbox_id}/root/v.sock"),
             "--host-control-socket".to_string(),
-            pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
+            pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
         ];
 
         let prepared = prepare_sidecar_launch_args(
-            pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN,
+            pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN,
             sandbox_id,
             &args,
             Some(ExpectedSpacedHostPeer::new(
                 LinuxPid::try_from_u32(runtime_pid).unwrap(),
                 sandbox_uid,
-                pplx_space_common_core::types::guest_image::QualifiedGuestAgent::LinuxV1,
+                pplx_space_execution_spec::guest_image::QualifiedGuestAgent::LinuxV1,
             )),
         )
         .unwrap();
         assert_eq!(
             require_launch_arg(
                 &prepared,
-                pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN,
+                pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN,
                 "--firecracker-pid",
             )
             .unwrap(),
@@ -2420,18 +2466,18 @@ table inet space {
         assert_eq!(
             require_launch_arg(
                 &prepared,
-                pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN,
+                pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN,
                 "--firecracker-uid",
             )
             .unwrap(),
             sandbox_uid.to_string()
         );
-        use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
-        let program = pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN;
+        use pplx_space_execution_spec::guest_image::QualifiedGuestAgent;
+        let program = pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN;
         require_launch_arg(&prepared, program, "--guest-agent").unwrap_err();
         let mut ch_args = args.clone();
         ch_args[5] = pplx_space_node_runtime_core::control::guest_socket_path(
-            pplx_space_common_core::types::RuntimeKind::CloudHypervisor,
+            pplx_space_execution_spec::RuntimeKind::CloudHypervisor,
             sandbox_id,
         )
         .unwrap()
@@ -2440,9 +2486,9 @@ table inet space {
         let peer = ExpectedSpacedHostPeer::new(
             LinuxPid::try_from_u32(runtime_pid).unwrap(),
             sandbox_uid,
-            pplx_space_common_core::types::guest_image::QualifiedGuestAgent::LinuxV1,
+            pplx_space_execution_spec::guest_image::QualifiedGuestAgent::LinuxV1,
         )
-        .for_runtime(pplx_space_common_core::types::RuntimeKind::CloudHypervisor)
+        .for_runtime(pplx_space_execution_spec::RuntimeKind::CloudHypervisor)
         .for_guest_agent(QualifiedGuestAgent::WindowsV1);
         let native =
             prepare_sidecar_launch_args(program, sandbox_id, &ch_args, Some(peer)).unwrap();
@@ -2481,7 +2527,7 @@ table inet space {
         let sandbox_id = "sbx-123";
         let args = vec![
             "--socket".to_string(),
-            pplx_space_common_core::host::linux::paths::spaced_host_socket(sandbox_id),
+            pplx_space_host_layout::paths::spaced_host_socket(sandbox_id),
             "--sandbox-id".to_string(),
             sandbox_id.to_string(),
             "--vsock-uds".to_string(),
@@ -2491,17 +2537,17 @@ table inet space {
             "--firecracker-uid".to_string(),
             "10042".to_string(),
             "--host-control-socket".to_string(),
-            pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
+            pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
         ];
 
         let error = prepare_sidecar_launch_args(
-            pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN,
+            pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN,
             sandbox_id,
             &args,
             Some(ExpectedSpacedHostPeer::new(
                 LinuxPid::try_from_u32(4_242).unwrap(),
                 10_042,
-                pplx_space_common_core::types::guest_image::QualifiedGuestAgent::LinuxV1,
+                pplx_space_execution_spec::guest_image::QualifiedGuestAgent::LinuxV1,
             )),
         )
         .expect_err("node-manager must reject a caller-selected Firecracker peer");
@@ -2515,7 +2561,7 @@ table inet space {
         let sandbox_uid = 10_042;
         let args = vec![
             "--socket".to_string(),
-            pplx_space_common_core::host::linux::paths::spaced_host_socket(sandbox_id),
+            pplx_space_host_layout::paths::spaced_host_socket(sandbox_id),
             "--sandbox-id".to_string(),
             sandbox_id.to_string(),
             "--vsock-uds".to_string(),
@@ -2526,17 +2572,17 @@ table inet space {
             "--firecracker-uid".to_string(),
             sandbox_uid.to_string(),
             "--host-control-socket".to_string(),
-            pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
+            pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
         ];
 
         let error = prepare_sidecar_launch_args(
-            pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN,
+            pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN,
             sandbox_id,
             &args,
             Some(ExpectedSpacedHostPeer::new(
                 LinuxPid::try_from_u32(runtime_pid).unwrap(),
                 sandbox_uid,
-                pplx_space_common_core::types::guest_image::QualifiedGuestAgent::LinuxV1,
+                pplx_space_execution_spec::guest_image::QualifiedGuestAgent::LinuxV1,
             )),
         )
         .expect_err("node-manager must reject an equals-form override");
@@ -2584,13 +2630,13 @@ table inet space {
         let sandbox_id = "sbx-123";
         let args = vec![
             "--socket".to_string(),
-            pplx_space_common_core::host::linux::paths::net_gateway_control_socket("sbx-other"),
+            pplx_space_host_layout::paths::net_gateway_control_socket("sbx-other"),
             "--sandbox-id".to_string(),
             sandbox_id.to_string(),
         ];
 
         let err = prepare_sidecar_launch_args(
-            pplx_space_common_core::host::linux::paths::NET_GATEWAY_SVC_BIN,
+            pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN,
             sandbox_id,
             &args,
             None,

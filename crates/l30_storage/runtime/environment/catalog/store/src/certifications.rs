@@ -24,8 +24,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{EnvironmentReference, NodeId, VersionSortKey};
+use pplx_space_accounts::NodeId;
+use pplx_space_execution_spec::{EnvironmentReference, VersionSortKey};
+use pplx_space_postgres_pool::{Db, DbError, Executor};
+use pplx_space_sql_locator::sql;
 use sqlx::types::Json;
 
 /// Separates this lock from every other advisory lock on the database.
@@ -115,11 +117,15 @@ pub enum CertificationOutcome {
 /// periodic recompute, which would hold its node and sandbox locks behind a
 /// cluster-wide queue during a build rollout and fail it at the lock timeout.
 /// Same-node publications serialize on the node row lock before reaching it.
-pub async fn record_node_certifications(
-    conn: &mut sqlx::PgConnection,
+/// The caller must pass its open transaction.
+pub async fn record_node_certifications<C>(
+    tx: &mut C,
     node_id: NodeId,
     certified: &[CertifiedEnvironment],
-) -> Result<CertificationOutcome, sqlx::Error> {
+) -> Result<CertificationOutcome, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let desired: BTreeMap<String, Stored> = certified
         .iter()
         .map(|environment| (environment.reference.to_string(), stored_form(environment)))
@@ -131,7 +137,7 @@ pub async fn record_node_certifications(
              WHERE node_id = $1"
         ))
         .bind(node_id)
-        .fetch_all(&mut *conn)
+        .fetch_all((&mut *tx).into_sqlx())
         .await?
         .into_iter()
         .map(|(reference, key, upgrade, memory)| (reference, (key, upgrade, memory)))
@@ -140,7 +146,7 @@ pub async fn record_node_certifications(
         return Ok(CertificationOutcome::Unchanged);
     }
 
-    if !try_aggregate_lock(&mut *conn).await? {
+    if !try_aggregate_lock(&mut *tx).await? {
         return Ok(CertificationOutcome::Deferred);
     }
 
@@ -181,7 +187,7 @@ pub async fn record_node_certifications(
                IS DISTINCT FROM EXCLUDED.version_sort_key"
     ))
     .bind(Json(serde_json::Value::Array(catalog_rows)))
-    .execute(&mut *conn)
+    .execute((&mut *tx).into_sqlx())
     .await?;
 
     let desired_refs: Vec<String> = desired.keys().cloned().collect();
@@ -191,7 +197,7 @@ pub async fn record_node_certifications(
     ))
     .bind(node_id)
     .bind(&desired_refs)
-    .execute(&mut *conn)
+    .execute((&mut *tx).into_sqlx())
     .await?;
     let certification_rows: Vec<serde_json::Value> = desired
         .iter()
@@ -225,13 +231,13 @@ pub async fn record_node_certifications(
     ))
     .bind(node_id)
     .bind(Json(serde_json::Value::Array(certification_rows)))
-    .execute(&mut *conn)
+    .execute((&mut *tx).into_sqlx())
     .await?;
 
     // Every environment this node certified before or certifies now may have
     // gained or lost a vote.
     let affected: Vec<String> = stored.into_keys().chain(desired.into_keys()).collect();
-    recompute_edges(&mut *conn, Some(&affected)).await?;
+    recompute_edges(&mut *tx, Some(&affected)).await?;
     Ok(CertificationOutcome::Recorded)
 }
 
@@ -242,8 +248,8 @@ pub async fn record_node_certifications(
 /// a steady fleet may never happen. It takes the same aggregate lock as
 /// [`record_node_certifications`] and only tries it, in its own transaction:
 /// `Deferred` means a publication held it, and the next call recomputes.
-pub async fn recompute_all_edges(pool: &sqlx::PgPool) -> Result<RecomputeOutcome, sqlx::Error> {
-    let mut tx = pool.begin().await?;
+pub async fn recompute_all_edges(db: &Db) -> Result<RecomputeOutcome, DbError> {
+    let mut tx = db.begin().await?;
     if !try_aggregate_lock(&mut tx).await? {
         return Ok(RecomputeOutcome::Deferred);
     }
@@ -262,14 +268,17 @@ pub enum RecomputeOutcome {
     Recomputed { changed: u64 },
 }
 
-async fn try_aggregate_lock(conn: &mut sqlx::PgConnection) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+async fn try_aggregate_lock<C>(tx: &mut C) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar(sql!(
         "SELECT pg_try_advisory_xact_lock(hashtextextended($1::text, $2))"
     ))
     .bind(CATALOG_AGGREGATE_LOCK_KEY)
     .bind(CATALOG_AGGREGATE_LOCK_SEED)
-    .fetch_one(&mut *conn)
-    .await
+    .fetch_one(tx.into_sqlx())
+    .await?)
 }
 
 /// Recompute the edges of `sources`, or of every certified environment when
@@ -277,10 +286,10 @@ async fn try_aggregate_lock(conn: &mut sqlx::PgConnection) -> Result<bool, sqlx:
 /// kept when every one of them certifies it. Only an environment some node
 /// still certifies is recomputed. Returns how many catalog rows changed. The
 /// caller holds the aggregate lock.
-async fn recompute_edges(
-    conn: &mut sqlx::PgConnection,
-    sources: Option<&[String]>,
-) -> Result<u64, sqlx::Error> {
+async fn recompute_edges<C>(tx: &mut C, sources: Option<&[String]>) -> Result<u64, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let result = sqlx::query(sql!(
         "WITH source AS (
              SELECT DISTINCT environment_ref
@@ -342,7 +351,7 @@ async fn recompute_edges(
                IS DISTINCT FROM (aggregate.upgrade_edges, aggregate.memory_edges)"
     ))
     .bind(sources)
-    .execute(&mut *conn)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(result.rows_affected())
 }

@@ -3,7 +3,7 @@ use super::forward::authorize_authority;
 use super::*;
 use crate::certificates::NetworkCredentialAccessError;
 use http::HeaderMap;
-use pplx_space_common_core::types::CredentialReferenceId;
+use pplx_space_accounts::CredentialReferenceId;
 
 #[test]
 fn authority_binds_every_http_routing_field_to_the_tls_origin() {
@@ -130,7 +130,7 @@ async fn credential_provider_with_material(
     crate::state::GatewayNetworkState,
     crate::certificates::CertificateProvider,
 ) {
-    use pplx_space_credential_injection_core::proto::ResolvedNetworkCredential;
+    use pplx_space_credential_injection::proto::ResolvedNetworkCredential;
     use pplx_space_net_common::{
         CredentialHeaderBindingV1, NetworkCredentialDestinationV1, NetworkCredentialHttpMethodV1,
         NetworkCredentialRuleV1, TlsInterception,

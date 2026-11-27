@@ -4,7 +4,7 @@
 //! `managed_by` is `'space'`, so only the `managed_by` predicates decide
 //! which one the inventory statements act on.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 use tokio_util::task::AbortOnDropHandle;
 
 use super::*;
@@ -29,14 +29,15 @@ async fn insert_stale_ready_k8s_node(
 ) -> TestResult {
     fixture
         .store
-        .persist_k8s_node_inventory(
+        .persist_k8s_node_inventory(K8sNodeRoleUpsert {
             node_name,
-            &format!("uid-{node_id}"),
+            node_uid: &format!("uid-{node_id}"),
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.60"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.60"),
+            state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            instance_id: None,
+        })
         .await?;
     let age_secs = i64::try_from(age.as_secs())?;
     sqlx::query(sql!(
@@ -221,14 +222,15 @@ async fn inventory_upsert_writes_only_kubernetes_rows() -> TestResult {
         let store = fixture.store.clone();
         async move {
             store
-                .persist_k8s_node_inventory(
-                    &format!("space-test-upsert-{}", node_id.as_uuid().simple()),
-                    &format!("uid-{node_id}"),
+                .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+                    node_name: &format!("space-test-upsert-{}", node_id.as_uuid().simple()),
+                    node_uid: &format!("uid-{node_id}"),
                     node_id,
-                    NodeRole::Worker,
-                    Some("10.0.0.62"),
-                    NodeStateWrite::Manage(NodeLifecycleState::Ready),
-                )
+                    role: NodeRole::Worker,
+                    address: Some("10.0.0.62"),
+                    state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+                    instance_id: None,
+                })
                 .await
         }
     };

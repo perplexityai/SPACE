@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
-use pplx_space_common_core::host::linux::paths::{NET_GATEWAY_SVC_BIN, SPACED_HOST_SVC_BIN};
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_host_layout::paths::{NET_GATEWAY_SVC_BIN, SPACED_HOST_SVC_BIN};
 use pplx_space_node_runtime_core::launch;
+use pplx_space_sandbox_model::SandboxId;
 use tonic::Status;
 
 pub(crate) fn parse_sandbox_id(sandbox_id: &str) -> Result<SandboxId, Status> {

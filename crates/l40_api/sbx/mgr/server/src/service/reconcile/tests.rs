@@ -1,4 +1,5 @@
 use super::*;
+use crate::node_manager_transport::fake::ServedNodeManager;
 
 #[tokio::test]
 async fn dirty_outbox_poison_requests_fatal_service_drain_without_unwinding_callers() {
@@ -43,7 +44,25 @@ fn insert_due_suspended_sandbox(
     storage_id: &str,
     overdue_by_secs: u64,
 ) {
-    use pplx_space_common_core::types::{
+    insert_due_sandbox(
+        service,
+        storage_id,
+        SandboxState::Suspended,
+        AutoLifecycleIdleAction::Stop,
+        overdue_by_secs,
+    );
+}
+
+/// A `state` row whose only idle stage, `action`, is overdue by
+/// `overdue_by_secs`.
+pub(in crate::service) fn insert_due_sandbox(
+    service: &SandboxManagerService,
+    storage_id: &str,
+    state: SandboxState,
+    action: AutoLifecycleIdleAction,
+    overdue_by_secs: u64,
+) {
+    use pplx_space_auto_lifecycle::{
         AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleStage,
     };
 
@@ -56,7 +75,7 @@ fn insert_due_suspended_sandbox(
         stages: vec![AutoLifecycleStage {
             condition_set: AutoLifecycleConditionSetId::AccessIdle,
             at: 1,
-            action: AutoLifecycleIdleAction::Stop,
+            action,
         }],
     }
     .normalized();
@@ -67,10 +86,7 @@ fn insert_due_suspended_sandbox(
     recompute_runtime_state(&mut runtime_state, &policy);
     let db = service.db.lock().expect("mutex poisoned");
     crate::service::tests::service_tests::insert_test_sandbox_with_policy(
-        &db,
-        storage_id,
-        SandboxState::Suspended,
-        &policy,
+        &db, storage_id, state, &policy,
     );
     crate::db::update_auto_lifecycle_state(&db, storage_id, &runtime_state)
         .expect("make scheduler test sandbox due");
@@ -382,7 +398,8 @@ fn reconcile_entry_skips_states_that_cannot_authorize_a_gateway() {
 }
 #[tokio::test]
 async fn activation_reconcile_hydrates_policy_before_runtime_identity_publication() {
-    use pplx_space_common_core::types::{NodeId, RouteGeneration, SandboxActivationAttemptId};
+    use pplx_space_accounts::NodeId;
+    use pplx_space_sandbox_model::{RouteGeneration, SandboxActivationAttemptId};
     use tonic::Code;
 
     // Full suspend retains execution metadata, but clears the live route.
@@ -676,6 +693,72 @@ async fn persistent_route_identity_divergence_does_not_prevent_verification_key_
     );
 }
 
+/// A gateway launched before route identity or verification keys answers
+/// their push UNIMPLEMENTED until it is cycled. The policy still converges and
+/// the queue row completes rather than retrying a push that cannot succeed;
+/// any other push failure keeps the row pending.
+#[tokio::test]
+async fn a_gateway_older_than_route_security_completes_the_queued_reconcile() {
+    for (identity_push, key_push, unsupported, expected_operations) in [
+        (
+            Err(Status::unimplemented("")),
+            Ok(()),
+            true,
+            &["policy"][..],
+        ),
+        (
+            Ok(NetGatewayRouteIdentityPushOutcome::Applied {
+                identity_profile_version: 1,
+            }),
+            Err(Status::unimplemented("")),
+            true,
+            &["policy", "route_keys"][..],
+        ),
+        (
+            Err(Status::unavailable("net-gateway restarting")),
+            Ok(()),
+            false,
+            &["policy"][..],
+        ),
+        (
+            Ok(NetGatewayRouteIdentityPushOutcome::Applied {
+                identity_profile_version: 1,
+            }),
+            Err(Status::internal("verification-key push failed")),
+            false,
+            &["policy", "route_keys"][..],
+        ),
+    ] {
+        let operations = std::sync::Mutex::new(Vec::new());
+        let result = reconcile_policy_and_route_security(
+            SandboxState::Started,
+            &SpaceApiRouteIdentity::default(),
+            async { identity_push },
+            async {
+                operations.lock().unwrap().push("policy");
+                Ok(ApplyDecisionKind::Apply)
+            },
+            async |_| {
+                operations.lock().unwrap().push("route_keys");
+                key_push
+            },
+        )
+        .await;
+
+        assert_eq!(*operations.lock().unwrap(), expected_operations);
+        let error = result.expect_err("every case fails a route-security push");
+        assert_eq!(
+            matches!(error, NetworkPolicyReconcileError::UnsupportedGateway(_)),
+            unsupported,
+            "{error}"
+        );
+        assert_eq!(
+            queued_network_policy_result("sandbox-id", Err(error)).is_ok(),
+            unsupported
+        );
+    }
+}
+
 #[test]
 fn only_abandoned_network_policy_refresh_is_terminal() {
     let abandoned = NetworkPolicyReconcileError::from(NetworkPolicyRefreshError::Abandoned(
@@ -896,6 +979,7 @@ async fn auto_lifecycle_stop_writes_only_over_a_still_suspended_row() {
         .await;
 
         assert!(result.is_ok(), "{case}: {result:?}");
+        service.activation_seal.assert_quiesced();
         let db = service.db.lock().unwrap();
         if stops {
             let row = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
@@ -912,6 +996,270 @@ async fn auto_lifecycle_stop_writes_only_over_a_still_suspended_row() {
             crate::db::test_fixtures::state_write_fixtures::assert_unchanged(&case, &before, &db);
         }
     }
+}
+
+/// A v2 drain doesn't move a stopped sandbox, so a due auto-lifecycle Stop of
+/// a `suspended` row waits while the node is sealed: the row stays
+/// `suspended`, the stage isn't recorded as fired, and nothing is reported as
+/// an error. The first run after the node is unsealed stops it.
+#[tokio::test]
+async fn auto_lifecycle_stop_of_a_suspended_row_waits_for_an_unseal() {
+    let scratch = tempfile::tempdir().unwrap();
+    let service = isolated_service(scratch.path());
+    let id = SandboxId::new().to_string();
+    insert_due_suspended_sandbox(&service, &id, 10);
+    service.activation_seal.seal(&service.db, 5).unwrap();
+
+    service.run_due_auto_lifecycle(&id).await.unwrap();
+    {
+        let db = service.db.lock().unwrap();
+        let row = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
+        assert_eq!(row.state, SandboxStatus::from(SandboxState::Suspended));
+        assert!(
+            row.auto_lifecycle_state.next_auto_event_at.is_some(),
+            "the Stop stage is still due"
+        );
+    }
+
+    service.activation_seal.assert_quiesced();
+
+    service.activation_seal.unseal(&service.db, 5).unwrap();
+    service.run_due_auto_lifecycle(&id).await.unwrap();
+    service.activation_seal.assert_quiesced();
+    let db = service.db.lock().unwrap();
+    let row = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Stopped));
+    assert_eq!(row.auto_lifecycle_state.next_auto_event_at, None);
+}
+
+/// The node-manager calls a test service made, by method.
+type NodeCalls = Arc<std::sync::Mutex<Vec<&'static str>>>;
+
+/// A service whose node-manager confirms cleanup, signals, pauses and disk
+/// snapshots and records each call, holding the `state` row `id` whose only
+/// idle stage, `action`, is due. Its runtime is live (`fc.pid` linked), so
+/// Stop selects it, and its volume is encrypted, so Suspend skips the
+/// plaintext-COW probe of the host cache directory. The node-manager serves
+/// only while the returned handle lives, so a caller binds it for the whole
+/// test.
+fn service_with_a_live_runtime(
+    run_dir: &std::path::Path,
+    id: &str,
+    state: SandboxState,
+    action: AutoLifecycleIdleAction,
+) -> (SandboxManagerService, NodeCalls, ServedNodeManager) {
+    use crate::node_manager_transport::fake::FakeNodeManager;
+    use pplx_space_node_mgr_client::proto::{
+        CleanupSandboxRequest, CleanupSandboxResponse, CreateBtrfsSnapshotRequest,
+        CreateBtrfsSnapshotResponse, PauseSandboxRequest, PauseSandboxResponse, StopProcessRequest,
+        StopProcessResponse,
+    };
+
+    let calls = NodeCalls::default();
+    let record = |method: &'static str| {
+        let calls = Arc::clone(&calls);
+        move || calls.lock().unwrap().push(method)
+    };
+    let node_manager = FakeNodeManager::default()
+        .unary("CleanupSandbox", {
+            let record = record("CleanupSandbox");
+            move |_: CleanupSandboxRequest| {
+                record();
+                Ok(CleanupSandboxResponse::default())
+            }
+        })
+        .unary("PauseSandbox", {
+            let record = record("PauseSandbox");
+            move |_: PauseSandboxRequest| {
+                record();
+                Ok(PauseSandboxResponse {})
+            }
+        })
+        .unary("StopProcess", {
+            let record = record("StopProcess");
+            move |_: StopProcessRequest| {
+                record();
+                Ok(StopProcessResponse::default())
+            }
+        })
+        .unary("CreateBtrfsSnapshot", {
+            let record = record("CreateBtrfsSnapshot");
+            move |_: CreateBtrfsSnapshotRequest| {
+                record();
+                Ok(CreateBtrfsSnapshotResponse {})
+            }
+        })
+        .serve();
+    std::fs::create_dir(run_dir.join(id)).unwrap();
+    std::os::unix::fs::symlink(run_dir, run_dir.join(id).join("fc.pid")).unwrap();
+    let service = SandboxManagerService::new_with_options(
+        crate::db::test_conn(),
+        SandboxManagerServiceOptions {
+            node_manager: node_manager.connector(),
+            ..SandboxManagerServiceOptions::for_test_in(run_dir)
+        },
+    );
+    insert_due_sandbox(&service, id, state, action, 10);
+    service
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE sandboxes SET volume_encryption = 1 WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+    (service, calls, node_manager)
+}
+
+/// Run the due auto-lifecycle transition of `id` with the guest's snapshot
+/// preparation stubbed.
+async fn run_due_with_a_prepared_guest(
+    service: SandboxManagerService,
+    id: String,
+) -> Result<(), Status> {
+    use crate::service::grpc_lifecycle::{GUEST_PREPARATION, GuestPreparation};
+
+    let prepared: GuestPreparation = Arc::new(|_| Box::pin(async { Ok(()) }));
+    GUEST_PREPARATION
+        .scope(prepared, service.run_due_auto_lifecycle(&id))
+        .await
+}
+
+/// Start the due auto-lifecycle transition of `id` and wait for the row to
+/// leave `state`: the transition ran rather than being held. The fake
+/// node-manager can't finish it (a stop waits for the VM process to exit,
+/// and a suspend for the guest's snapshot), so it is then cancelled. The
+/// state the row moved to.
+async fn state_left_by_the_transition(
+    service: &SandboxManagerService,
+    id: &str,
+    state: SandboxState,
+) -> SandboxStatus {
+    let run = tokio::spawn(run_due_with_a_prepared_guest(
+        service.clone(),
+        id.to_owned(),
+    ));
+    let left = poll_until(|| row_state(service, id).0 != SandboxStatus::from(state)).await;
+    run.abort();
+    assert!(left, "the transition never left the row {state}");
+    row_state(service, id).0
+}
+
+/// The row of `id` and whether its idle stage is still due.
+fn row_state(service: &SandboxManagerService, id: &str) -> (SandboxStatus, bool) {
+    let db = service.db.lock().unwrap();
+    let row = crate::db::get_sandbox(&db, id).unwrap().unwrap();
+    (
+        row.state,
+        row.auto_lifecycle_state.next_auto_event_at.is_some(),
+    )
+}
+
+/// The same hold for a sandbox with a VM: a due auto-lifecycle Stop of a
+/// `started` or `paused` row waits while the node is sealed, since the
+/// stopped sandbox it would leave isn't moved by a v2 drain. It asks
+/// node-manager nothing, the row keeps its state, the stage isn't recorded
+/// as fired, and nothing is reported as an error. The first run after the
+/// node is unsealed stops it.
+#[tokio::test]
+async fn auto_lifecycle_stop_of_a_running_or_paused_row_waits_for_an_unseal() {
+    for state in [SandboxState::Started, SandboxState::Paused] {
+        let run_dir = tempfile::tempdir().unwrap();
+        let id = SandboxId::new().to_string();
+        let (service, calls, _node_manager) =
+            service_with_a_live_runtime(run_dir.path(), &id, state, AutoLifecycleIdleAction::Stop);
+        service.activation_seal.seal(&service.db, 5).unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            run_due_with_a_prepared_guest(service.clone(), id.clone()),
+        )
+        .await
+        .expect("a held stop returns at once")
+        .unwrap();
+        assert_eq!(row_state(&service, &id), (state.into(), true), "{state}");
+        assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new(), "{state}");
+        service.activation_seal.assert_quiesced();
+
+        service.activation_seal.unseal(&service.db, 5).unwrap();
+        assert_eq!(
+            state_left_by_the_transition(&service, &id, state).await,
+            SandboxStatus::from(SandboxState::Stopping),
+            "{state}"
+        );
+    }
+}
+
+/// On a node that isn't sealed, which with drain v2 off is every node, a due
+/// auto-lifecycle Stop of a `started` or `paused` row runs at once, as
+/// before.
+#[tokio::test]
+async fn auto_lifecycle_stop_of_a_running_or_paused_row_runs_unsealed() {
+    for state in [SandboxState::Started, SandboxState::Paused] {
+        let run_dir = tempfile::tempdir().unwrap();
+        let id = SandboxId::new().to_string();
+        let (service, _, _node_manager) =
+            service_with_a_live_runtime(run_dir.path(), &id, state, AutoLifecycleIdleAction::Stop);
+
+        assert_eq!(
+            state_left_by_the_transition(&service, &id, state).await,
+            SandboxStatus::from(SandboxState::Stopping),
+            "{state}"
+        );
+    }
+}
+
+/// An admitted auto-lifecycle Stop of a `started` or `paused` row counts as a
+/// producer in flight while it runs, until its state write commits: a seal
+/// that lands mid-stop finds it, so the drain reports the sandbox pending
+/// rather than reading the row as the stop leaves it. The count ends however
+/// the stop ends, cancelled included.
+#[tokio::test]
+async fn auto_lifecycle_stop_of_a_running_or_paused_row_is_in_flight_until_it_ends() {
+    for state in [SandboxState::Started, SandboxState::Paused] {
+        let run_dir = tempfile::tempdir().unwrap();
+        let id = SandboxId::new().to_string();
+        let (service, _, _node_manager) =
+            service_with_a_live_runtime(run_dir.path(), &id, state, AutoLifecycleIdleAction::Stop);
+        let run = tokio::spawn(run_due_with_a_prepared_guest(service.clone(), id.clone()));
+        assert!(
+            poll_until(|| row_state(&service, &id).0 == SandboxStatus::from(SandboxState::Stopping))
+                .await,
+            "{state}: the stop runs"
+        );
+
+        service.activation_seal.seal(&service.db, 5).unwrap();
+        assert_eq!(
+            service.activation_seal.status().producers_in_flight,
+            std::slice::from_ref(&id),
+            "{state}"
+        );
+        run.abort();
+        assert!(run.await.unwrap_err().is_cancelled(), "{state}");
+        service.activation_seal.assert_quiesced();
+    }
+}
+
+/// A due auto-lifecycle Suspend isn't held while the node is sealed: the drain
+/// wants the sandbox suspended.
+#[tokio::test]
+async fn auto_lifecycle_suspend_runs_while_the_node_is_sealed() {
+    let run_dir = tempfile::tempdir().unwrap();
+    let id = SandboxId::new().to_string();
+    let (service, _, _node_manager) = service_with_a_live_runtime(
+        run_dir.path(),
+        &id,
+        SandboxState::Started,
+        AutoLifecycleIdleAction::Suspend,
+    );
+    service.activation_seal.seal(&service.db, 5).unwrap();
+
+    assert_eq!(
+        state_left_by_the_transition(&service, &id, SandboxState::Started).await,
+        SandboxStatus::from(SandboxState::Pausing),
+        "the suspend pauses the VM first"
+    );
 }
 
 /// Stop admits a `suspended` row only while its runtime is live: in the

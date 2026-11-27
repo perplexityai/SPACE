@@ -2,11 +2,14 @@ use pplx_space_net_common::proto::{
     EgressDefaultAction as NetworkPolicyAction, NetworkPolicyV1 as NetworkPolicyProto,
     NetworkPolicyVersion,
 };
-use pplx_space_spaced_common::proto::bridge_host::meta_client::MetaClient as BridgeHostClient;
-use pplx_space_spaced_common::proto::host_control::host_control_server::{
+use pplx_space_spaced_host_server::{
+    BridgeGuestConnector, SpacedHostPeerAuthorization, SpacedHostService, SpacedHostServiceConfig,
+};
+use pplx_space_spaced_protocol::proto::bridge_host::meta_client::MetaClient as BridgeHostClient;
+use pplx_space_spaced_protocol::proto::host_control::host_control_server::{
     HostControl, HostControlServer,
 };
-use pplx_space_spaced_common::proto::host_control::{
+use pplx_space_spaced_protocol::proto::host_control::{
     Accepted as HostControlAccepted, ActiveForAccepted as HostControlActiveForAccepted,
     GetNetworkPolicyRequest as HostControlGetNetworkPolicyRequest,
     GetNetworkPolicyResponse as HostControlGetNetworkPolicyResponse,
@@ -19,9 +22,6 @@ use pplx_space_spaced_common::proto::host_control::{
     SetActivityStateResponse as HostControlSetActivityStateResponse,
     request_active_for_response::Outcome as HostControlActiveForOutcome,
     request_shutdown_response::Outcome as HostControlShutdownOutcome,
-};
-use pplx_space_spaced_host_server::{
-    BridgeGuestConnector, SpacedHostPeerAuthorization, SpacedHostService, SpacedHostServiceConfig,
 };
 use std::time::Duration;
 use tokio::net::UnixListener;
@@ -130,7 +130,7 @@ pub(crate) async fn connect_bridge_host(
 ) -> BridgeHostClient<tonic::transport::Channel> {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            match pplx_space_spaced_common::connect_uds_channel("spaced bridge host", &socket_path)
+            match pplx_space_spaced_client::connect_uds_channel("spaced bridge host", &socket_path)
                 .await
             {
                 Ok(channel) => return BridgeHostClient::new(channel),
@@ -163,14 +163,14 @@ impl BridgeHostFixture {
     }
 
     pub(crate) async fn start_with_expected_peer(
-        expected_peer: pplx_space_spaced_common::ExpectedUdsPeer,
+        expected_peer: pplx_space_spaced_client::ExpectedUdsPeer,
     ) -> Self {
         Self::start_with_host_control_failure(false, Some(expected_peer)).await
     }
 
     async fn start_with_host_control_failure(
         fail: bool,
-        expected_peer: Option<pplx_space_spaced_common::ExpectedUdsPeer>,
+        expected_peer: Option<pplx_space_spaced_client::ExpectedUdsPeer>,
     ) -> Self {
         let temp_dir = tempfile::tempdir().expect("temp dir created");
         let temp_path = temp_dir.path();
@@ -196,7 +196,7 @@ impl BridgeHostFixture {
             || BridgeGuestConnector::Uds(bridge_guest_socket_path),
             |expected_peer| BridgeGuestConnector::FirecrackerVsock {
                 vsock_uds_path: temp_path.join("v.sock"),
-                port: pplx_space_spaced_common::BRIDGE_GUEST_VSOCK_PORT,
+                port: pplx_space_spaced_guest_protocol::BRIDGE_GUEST_VSOCK_PORT,
                 expected_peer,
             },
         );

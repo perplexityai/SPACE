@@ -8,7 +8,7 @@
 use uuid::Uuid;
 
 pub mod operations {
-    pub use pplx_space_spaced_common::proto::operations::*;
+    pub use pplx_space_spaced_guest_protocol::proto::operations::*;
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -54,14 +54,15 @@ pub mod proto {
     ///
     /// Every caller that puts an artifact kind on the wire needs it, and the
     /// crate that owns the generated enum is the only place a single copy
-    /// can live: `pplx-space-common-core` cannot depend on the proto crate.
+    /// can live: `pplx-space-snapshot-model`, a model, cannot depend on a
+    /// protocol crate.
     /// Several sites in `pplx-space-sbx-mgr` still inline the same two-arm
     /// match; they can move onto this without any behavior change.
-    impl From<pplx_space_common_core::types::ArtifactKind> for ArtifactKind {
-        fn from(artifact_kind: pplx_space_common_core::types::ArtifactKind) -> Self {
+    impl From<pplx_space_snapshot_model::ArtifactKind> for ArtifactKind {
+        fn from(artifact_kind: pplx_space_snapshot_model::ArtifactKind) -> Self {
             match artifact_kind {
-                pplx_space_common_core::types::ArtifactKind::Disk => Self::Disk,
-                pplx_space_common_core::types::ArtifactKind::Full => Self::Full,
+                pplx_space_snapshot_model::ArtifactKind::Disk => Self::Disk,
+                pplx_space_snapshot_model::ArtifactKind::Full => Self::Full,
             }
         }
     }
@@ -137,16 +138,49 @@ pub const RETAINED_FILESYSTEM_ONLY_COPY_REASON: &str = "retained_filesystem_only
 /// cluster's absent-row report remains the sole authority for that.
 pub const TEARDOWN_SUSPEND_BACKUP_PERMANENTLY_FAILED_REASON: &str =
     "teardown_suspend_backup_permanently_failed";
+/// `failure_reason` sandbox-manager stamps on a sandbox it quarantined
+/// because a suspend lost its runtime without a usable capture of its own:
+/// the retained instance filesystem may be the sandbox's only copy.
+pub const SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE: &str =
+    "suspend_publish_failed_no_artifact_runtime_gone";
+/// `failure_reason` for an admitted capture with no conclusive completion
+/// evidence. Its runtime may still be live; deleting its files is not a safe
+/// recovery action.
+pub const SUSPEND_CAPTURE_UNRESOLVED: &str = "suspend_capture_unresolved";
+
+/// The shared retention policy for suspend evidence: whether a quarantined or
+/// failed sandbox with this `failure_reason` keeps its retained filesystem.
+/// An ordinary delete refuses such a row, and so does the eviction that
+/// follows a cluster-deleted report. Only an operator's discard delete
+/// (`DeleteRequest.discard_retained_filesystem_reason`) removes it.
+/// Here so the CLI checks a row by the same rule before it sends a discard,
+/// which an older sandbox-manager would run as an ordinary delete.
+pub fn suspend_evidence_requires_retention(failure_reason: Option<&str>) -> bool {
+    matches!(
+        failure_reason,
+        Some(SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE | SUSPEND_CAPTURE_UNRESOLVED)
+    )
+}
 pub const PROCESS_OUTPUT_CURSOR_HEALTH_SERVICE: &str =
     "space.sandbox-manager.capability.process-output-cursor.v1";
 /// Start can install the supplied cluster policy before runtime activation.
 pub const ACTIVATION_POLICY_HEALTH_SERVICE: &str =
     "space.sandbox-manager.capability.activation-policy.v1";
+/// Create honors `CreateRequest.required_environment`, which an older
+/// sandbox-manager ignores.
+pub const CREATE_REQUIRED_ENVIRONMENT_HEALTH_SERVICE: &str =
+    "space.sandbox-manager.capability.create-required-environment.v1";
 pub const OPERATION_ACTIVATION_RECEIPT_HEALTH_SERVICE: &str =
     "space.sandbox-manager.capability.operation-activation-receipt.v1";
 
 pub fn restart_retry_on_successor_status(message: impl Into<String>) -> tonic::Status {
-    let mut status = tonic::Status::unavailable(message);
+    mark_restart_retry_on_successor(tonic::Status::unavailable(message))
+}
+
+/// `status`, keeping its code, marked as a call refused before it was served.
+/// Only an `Unavailable` status reads as the marker
+/// ([`is_restart_retry_on_successor`]).
+pub fn mark_restart_retry_on_successor(mut status: tonic::Status) -> tonic::Status {
     status.metadata_mut().insert(
         RESTART_RETRY_ON_SUCCESSOR_METADATA,
         tonic::metadata::MetadataValue::from_static("true"),

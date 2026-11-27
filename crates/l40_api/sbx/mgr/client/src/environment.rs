@@ -1,6 +1,6 @@
 //! Explicit environment creation across rolling service upgrades.
 use crate::{SandboxManagerGrpcClient, proto};
-use pplx_space_common_core::types::EnvironmentReference;
+use pplx_space_execution_spec::EnvironmentReference;
 use tonic::Status;
 
 /// Move both legacy inputs: old servers reject the missing required runtime.

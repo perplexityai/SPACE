@@ -42,6 +42,9 @@ enum NetGatewayKillOutcome {
     Sigterm,
     Sigkill,
     OldProcessAlreadyGone,
+    /// The runtime supervisor stopped the old gateway while launching its
+    /// replacement on the old gateway's listening sockets.
+    Replaced,
 }
 
 impl NetGatewayKillOutcome {
@@ -50,6 +53,7 @@ impl NetGatewayKillOutcome {
             Self::Sigterm => "sigterm",
             Self::Sigkill => "sigkill",
             Self::OldProcessAlreadyGone => "old_process_already_gone",
+            Self::Replaced => "replaced",
         }
     }
 }
@@ -121,70 +125,10 @@ impl SandboxManagerService {
             Status::internal(error)
         };
 
-        // Kill the old gateway through node-manager: SIGTERM with a bounded
-        // wait, then SIGKILL. The explicit pid matters — node-manager's
-        // fallback pid is whichever sidecar launched most recently.
-        // `success: false` (no error) means the target pid was already gone —
-        // the gateway died (or the watchdog replaced it) between our liveness
-        // check and the signal. That is not a failure: skip further signaling
-        // and fall through to the relaunch, which either forks a fresh
-        // gateway or recovers the watchdog's already-live replacement.
-        let mut node_client = connect_node(&self.node_manager)
+        let (new_pid, inherited_sockets, kill_outcome) = self
+            .replace_or_relaunch_netgtw(&sandbox, uid, old_pid, req.hand_over_sockets)
             .await
-            .map_err(|error| fail(format!("cannot connect to node-manager: {error}")))?;
-        let term_signalled = node_client
-            .stop_process(StopProcessRequest {
-                execution_fence: sandbox.node_execution_fence(),
-                sandbox_id: id.clone(),
-                signal: libc::SIGTERM as u32,
-                pid: Some(old_pid),
-            })
-            .await
-            .map_err(|error| fail(format!("stop net-gateway (SIGTERM) failed: {error}")))?
-            .get_ref()
-            .success;
-        let mut kill_outcome = if term_signalled {
-            NetGatewayKillOutcome::Sigterm
-        } else {
-            NetGatewayKillOutcome::OldProcessAlreadyGone
-        };
-        if term_signalled && !wait_for_netgtw_death(&id, NETGTW_CYCLE_TERM_GRACE).await {
-            let kill_signalled = node_client
-                .stop_process(StopProcessRequest {
-                    execution_fence: sandbox.node_execution_fence(),
-                    sandbox_id: id.clone(),
-                    signal: libc::SIGKILL as u32,
-                    pid: Some(old_pid),
-                })
-                .await
-                .map_err(|error| fail(format!("stop net-gateway (SIGKILL) failed: {error}")))?
-                .get_ref()
-                .success;
-            kill_outcome = if kill_signalled {
-                NetGatewayKillOutcome::Sigkill
-            } else {
-                NetGatewayKillOutcome::OldProcessAlreadyGone
-            };
-            // Only a pid we actually signalled can legitimately still be
-            // alive; if it survives SIGKILL past the grace, something is
-            // wrong on the node. An unsignalled (already-gone) pid with a
-            // live symlink means the watchdog already relaunched — converge.
-            if kill_signalled && !wait_for_netgtw_death(&id, NETGTW_CYCLE_KILL_GRACE).await {
-                return Err(fail("net-gateway did not exit after SIGKILL".to_string()));
-            }
-        }
-
-        // Relaunch from the current on-disk binary. The watchdog method also
-        // drops its cached (old-process) sha so State/--stale report the new
-        // gateway as "unknown" until its first stats probe. If the watchdog's
-        // dead-sidecar sweep races us and restarts the gateway first, the
-        // runtime-supervisor recovers the already-live pid instead of forking
-        // a duplicate, so this converges to one gateway either way.
-        let new_pid = self
-            .watchdog
-            .relaunch_netgtw(&id, uid)
-            .await
-            .map_err(|error| fail(format!("relaunch net-gateway failed: {error}")))?;
+            .map_err(fail)?;
 
         crate::metrics::sandbox::worker::net_gateway_cycle(
             crate::metrics::sandbox::worker::NetGatewayCycleResult::Ok,
@@ -202,7 +146,127 @@ impl SandboxManagerService {
             old_pid,
             new_pid,
             old_build_git_sha,
+            inherited_sockets,
         }))
+    }
+
+    /// Cycle the gateway, returning its replacement's pid, the sockets it
+    /// took over and how the old one ended. With handover, one node-manager
+    /// launch replaces the old gateway and passes its listening sockets on.
+    /// Any other answer falls back to stopping and relaunching it: a node
+    /// that predates the handover returns the old pid, or refuses a gateway
+    /// without launch evidence, and a handover can fail after the old
+    /// gateway stopped. The fallback converges whether the old gateway is
+    /// still running, already gone, or replaced.
+    async fn replace_or_relaunch_netgtw(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        uid: u32,
+        old_pid: u32,
+        hand_over_sockets: bool,
+    ) -> Result<(u32, u32, NetGatewayKillOutcome), String> {
+        let id = &sandbox.id;
+        if hand_over_sockets {
+            match self.watchdog.replace_netgtw(id, uid, old_pid).await {
+                Ok(replaced) if replaced.pid != old_pid => {
+                    return Ok((
+                        replaced.pid,
+                        replaced.inherited_sockets,
+                        NetGatewayKillOutcome::Replaced,
+                    ));
+                }
+                Ok(_) => tracing::info!(
+                    sandbox_id = %id,
+                    old_pid,
+                    "node cannot hand net-gateway sockets over; stopping and relaunching it"
+                ),
+                Err(error) => tracing::warn!(
+                    sandbox_id = %id,
+                    old_pid,
+                    %error,
+                    "net-gateway handover failed; stopping and relaunching it"
+                ),
+            }
+        }
+        let (new_pid, kill_outcome) = self.stop_and_relaunch_netgtw(sandbox, uid, old_pid).await?;
+        Ok((new_pid, 0, kill_outcome))
+    }
+
+    /// Cycle by stopping the old gateway, then launching one that binds
+    /// fresh sockets: what every node supports.
+    async fn stop_and_relaunch_netgtw(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        uid: u32,
+        old_pid: u32,
+    ) -> Result<(u32, NetGatewayKillOutcome), String> {
+        let id = sandbox.id.clone();
+        // Kill the old gateway through node-manager: SIGTERM with a bounded
+        // wait, then SIGKILL. The explicit pid matters — node-manager's
+        // fallback pid is whichever sidecar launched most recently.
+        // `success: false` (no error) means the target pid was already gone —
+        // the gateway died (or the watchdog replaced it) between our liveness
+        // check and the signal. That is not a failure: skip further signaling
+        // and fall through to the relaunch, which either forks a fresh
+        // gateway or recovers the watchdog's already-live replacement.
+        let mut node_client = connect_node(&self.node_manager)
+            .await
+            .map_err(|error| format!("cannot connect to node-manager: {error}"))?;
+        let term_signalled = node_client
+            .stop_process(StopProcessRequest {
+                execution_fence: sandbox.node_execution_fence(),
+                sandbox_id: id.clone(),
+                signal: libc::SIGTERM as u32,
+                pid: Some(old_pid),
+            })
+            .await
+            .map_err(|error| format!("stop net-gateway (SIGTERM) failed: {error}"))?
+            .get_ref()
+            .success;
+        let mut kill_outcome = if term_signalled {
+            NetGatewayKillOutcome::Sigterm
+        } else {
+            NetGatewayKillOutcome::OldProcessAlreadyGone
+        };
+        if term_signalled && !wait_for_netgtw_death(&id, NETGTW_CYCLE_TERM_GRACE).await {
+            let kill_signalled = node_client
+                .stop_process(StopProcessRequest {
+                    execution_fence: sandbox.node_execution_fence(),
+                    sandbox_id: id.clone(),
+                    signal: libc::SIGKILL as u32,
+                    pid: Some(old_pid),
+                })
+                .await
+                .map_err(|error| format!("stop net-gateway (SIGKILL) failed: {error}"))?
+                .get_ref()
+                .success;
+            kill_outcome = if kill_signalled {
+                NetGatewayKillOutcome::Sigkill
+            } else {
+                NetGatewayKillOutcome::OldProcessAlreadyGone
+            };
+            // Only a pid we actually signalled can legitimately still be
+            // alive; if it survives SIGKILL past the grace, something is
+            // wrong on the node. An unsignalled (already-gone) pid with a
+            // live symlink means the watchdog already relaunched — converge.
+            if kill_signalled && !wait_for_netgtw_death(&id, NETGTW_CYCLE_KILL_GRACE).await {
+                return Err("net-gateway did not exit after SIGKILL".to_string());
+            }
+        }
+
+        // Relaunch from the current on-disk binary. The watchdog method also
+        // drops its cached (old-process) sha so State/--stale report the new
+        // gateway as "unknown" until its first stats probe. If the watchdog's
+        // dead-sidecar sweep races us and restarts the gateway first, the
+        // runtime-supervisor recovers the already-live pid instead of forking
+        // a duplicate, so this converges to one gateway either way.
+        let new_pid = self
+            .watchdog
+            .relaunch_netgtw(&id, uid)
+            .await
+            .map_err(|error| format!("relaunch net-gateway failed: {error}"))?;
+
+        Ok((new_pid, kill_outcome))
     }
 }
 
@@ -218,3 +282,6 @@ async fn wait_for_netgtw_death(sandbox_id: &str, grace: Duration) -> bool {
     }
     true
 }
+
+#[cfg(test)]
+mod tests;

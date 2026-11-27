@@ -103,7 +103,7 @@ The point: you should be able to build the cluster-agnostic core of SPACE withou
 
 ## Logging / tracing: `tracing` everywhere, `tracing-subscriber` only in apps
 
-- **Libraries (`crates/libs/**` and the `l10`–`l40` layer directories) use the `tracing` crate.** Emit spans and events; never configure a global subscriber from a library. Never use `log`, `slog`, `env_logger`, or `println!` for diagnostic output in library code.
+- **Libraries (the `l10`–`l40` layer directories) use the `tracing` crate.** Emit spans and events; never configure a global subscriber from a library. Never use `log`, `slog`, `env_logger`, or `println!` for diagnostic output in library code.
 - **Apps (`crates/l50_app/**`) own the subscriber.** They call into our common helpers for service / CLI runtime to set up subscribers consistently. Those helpers decide when to send to `journald`, when to send to Datadog, when to render to a terminal, what JSON layer to use in production, etc.
 - **Choosing the output sink is the app's job, not the library's.** A library that prints to stderr is broken in a service that wants structured JSON to Datadog and broken in a CLI that wants pretty terminal output.
 
@@ -128,11 +128,11 @@ Reach for `Mutex<HashMap<_, _>>` or `RwLock<HashMap<_, _>>` only when you genuin
 ## SQL statements: wrap in the `sql!` locator macro
 
 Every SQL statement handed to `sqlx::query*` is wrapped in
-`pplx_space_sql_locator::sql!` (re-exported as `pplx_space_common_core::sql!`),
-which prepends a `/*module_path:line*/` comment to the statement:
+`pplx_space_sql_locator::sql!`, which prepends a `/*module_path:line*/`
+comment to the statement:
 
 ```rust
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 
 // Static SQL: expands to a `&'static str` via `concat!` — drop-in.
 sqlx::query(sql!("SELECT drain_phase FROM nodes WHERE id = $1"))
@@ -161,12 +161,13 @@ precedent. Node-local `rusqlite` call sites are not annotated today.
 
 Control-plane Postgres `sandboxes.managed_by` and `nodes.managed_by` hold the
 substrate that owns a row, `'k8s'` or `'space'`.
-`pplx_space_common_core::types::SubstrateKind` (an alias of `NodeManagedBy`)
+`pplx_space_node_model::SubstrateKind` (an alias of `NodeManagedBy`)
 names that value and encodes as the column's text, so new code binds it as a
 parameter instead of spelling the literal:
 
 ```rust
-use pplx_space_common_core::{sql, types::SubstrateKind};
+use pplx_space_sql_locator::sql;
+use pplx_space_node_model::SubstrateKind;
 
 sqlx::query_scalar::<_, NodeId>(sql!(
     "SELECT id FROM nodes WHERE drain_phase = $1 AND managed_by = $2"
@@ -178,9 +179,8 @@ sqlx::query_scalar::<_, NodeId>(sql!(
 The statement stays syntactically whole, as the store rules require: new code
 writes whole statements with bound values, not fragments around the value.
 The failed-restorable repair guard builder
-(`failed_repair_row_state_guards` in
-`crates/l30_storage/sandbox/store/src/repair.rs`, public only because the cluster
-controller's candidate scan composes it) and the shared
+(`failed_repair_row_state_guards`, private to
+`crates/l30_storage/sandbox/store/src/repair.rs`) and the shared
 `routable_execution_or_non_k8s` routability fragment
 (`crates/l30_storage/sandbox/routability/src/lib.rs`) take their placeholder as an
 argument only because they are existing fragments; they are not a pattern for
@@ -285,11 +285,10 @@ attribute, rustc resolves its children in the host's **own directory**, not in
 a `<host-stem>/` subdirectory. A bare `mod tests;` in such a file would land
 the tests as a confusing top-level sibling. Put an explicit
 `#[path = "<host-stem>/tests.rs"]` on the declaration (with a one-line comment
-saying why) so the file still lands where this table predicts —
-`crates/libs/common/core/src/k8s.rs` (loaded as `mod kubernetes` via
-`#[path]`) is the worked example. This is the one *correct* use of `#[path]`
-on a test declaration: it exists to land on the convention, unlike the legacy
-flat variant at the end of this section, which exists to dodge it.
+saying why) so the file still lands where this table predicts. This is the
+one *correct* use of `#[path]` on a test declaration: it exists to land on the
+convention, unlike the legacy flat variant at the end of this section, which
+exists to dodge it.
 
 One module, one file. A src file with two named test modules gets two sibling
 files, not one file with two `mod` blocks inside it. Nesting follows Rust's
@@ -321,7 +320,7 @@ why this is a mechanical move rather than a refactor:
 
 Whatever gated the inline module gates the declaration, character for character.
 The workspace has `#[cfg(all(test, feature = "serde"))]`
-(`crates/libs/common/core/src/types/template/metadata.rs`),
+(`crates/l20_domain/execution/spec/src/balloon.rs`),
 `#[cfg(all(test, target_os = "linux"))]`, `#[cfg(all(test, unix))]`, and
 `#[cfg(all(test, feature = "kubernetes"))]`. **Never** simplify one of these to
 a plain `#[cfg(test)]` while moving it — that silently compiles a test module
@@ -359,7 +358,7 @@ A top-level `crates/<crate>/tests/*.rs` file is **not** the default home for
 unit tests. Use one only when the test genuinely wants integration semantics:
 
 - It deliberately exercises **only the public API**, and the inability to reach
-  private helpers is the point. `crates/libs/common/core/tests/template_manifest_api.rs:1-9`
+  private helpers is the point. `crates/l20_domain/template/manifest/tests/template_manifest_api.rs:1-9`
   states that rationale in its own module doc: the file "acts as a guard against
   accidentally relying on a private helper."
 - It **spawns the built binary** via `CARGO_BIN_EXE_*`.
@@ -400,8 +399,8 @@ enables it on its own dev-dependency.
   which also drops the trailing commas vertical layouts carry. The diff is
   AST-identical; don't hand-rewrap to fight it, and don't mistake it for a
   content change in review.
-- **`insta::with_settings!({ snapshot_path => "fixtures" })` is file-relative
-  too** (`crates/libs/common/core/src/k8s.rs`,
+- **`insta::with_settings!({ snapshot_path => "../fixtures" })` is
+  file-relative too** (`crates/l40_api/sandbox/pod/src/tests.rs`,
   `crates/l40_api/node/mgr/server/src/firewall.rs`). Either move the fixture
   directory with the tests or adjust the setting; a stale relative path fails as
   a missing snapshot, not as a compile error.
@@ -537,8 +536,7 @@ holds exactly:
   the shutdown token, one `lib::run(config, shutdown).await?`.
 
 Everything else is the service and lives in the library: environment
-resolution and its precedence, `sqlx::migrate!` statics, binding and layering
-servers, service-mutex and handoff sequencing, and every test. The library's
+resolution and its precedence, binding and layering servers, service-mutex and handoff sequencing, and every test. The library's
 `run` returns a `thiserror` enum, never `anyhow` (see
 `scripts/check-rust-error-policy.sh`). The reason is the SPACE OSS model: a
 deployment that needs private wiring supplies its own `main` against the

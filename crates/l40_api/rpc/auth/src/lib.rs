@@ -40,9 +40,9 @@ const SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED_ENV: &str =
     "SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED";
 
 /// Node role for an auth surface. Reuses the shared registry vocabulary from
-/// `pplx-space-common-core` (with its `FromStr`/`Display`) rather than forking a
+/// `pplx-space-node-model` (with its `FromStr`/`Display`) rather than forking a
 /// parallel enum; parse inbound role strings at the boundary via `FromStr`.
-pub use pplx_space_common_core::types::NodeRole;
+pub use pplx_space_node_model::NodeRole;
 
 #[derive(Clone)]
 pub struct NodeApiAuthLayer {
@@ -200,7 +200,7 @@ impl NodeApiAuthConfig {
         static_control_token: Option<String>,
     ) -> Result<Self, AuthConfigError> {
         Self::from_environment_impl(
-            &pplx_space_common_core::env::ProcessEnvironment,
+            &pplx_space_env_vars::ProcessEnvironment,
             role,
             static_token,
             static_control_token,
@@ -208,7 +208,7 @@ impl NodeApiAuthConfig {
     }
     #[cfg(any(test, feature = "test-support"))]
     pub fn from_environment(
-        env: &dyn pplx_space_common_core::env::Environment,
+        env: &dyn pplx_space_env_vars::Environment,
         role: NodeRole,
         static_token: String,
         static_control_token: Option<String>,
@@ -216,8 +216,20 @@ impl NodeApiAuthConfig {
         Self::from_environment_impl(env, role, static_token, static_control_token)
     }
 
+    /// Grant `service_account` the firewall-rules fetch authority that
+    /// production grants no one; panics without Kubernetes auth.
+    #[cfg(all(feature = "k8s", any(test, feature = "test-support")))]
+    #[must_use]
+    pub fn grant_firewall_rules_fetch_for_test(mut self, service_account: &str) -> Self {
+        self.k8s
+            .as_mut()
+            .expect("firewall-rules fetch grant needs Kubernetes auth")
+            .grant_firewall_rules_fetch(service_account);
+        self
+    }
+
     fn from_environment_impl(
-        env: &dyn pplx_space_common_core::env::Environment,
+        env: &dyn pplx_space_env_vars::Environment,
         role: NodeRole,
         static_token: String,
         static_control_token: Option<String>,
@@ -301,6 +313,7 @@ pub struct NodeApiAuthenticatedCaller {
     data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority,
     template_release_read_authority: TemplateReleaseReadAuthority,
     template_transfer_authority: template_transfer::TemplateTransferAuthority,
+    firewall_rules_fetch_authority: FirewallRulesFetchAuthority,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -360,6 +373,16 @@ pub enum TemplateReleaseReadAuthority {
     Unscoped,
 }
 
+/// Whether the caller may fetch its node's firewall instructions as node-ctl
+/// (`FetchFirewallRules`). No node-ctl principal is approved yet, so no
+/// production caller, static or reviewed, is granted it; tests grant it to a
+/// named service account.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirewallRulesFetchAuthority {
+    Denied,
+    Granted,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum KubernetesAuthenticationMode {
     Disabled,
@@ -411,6 +434,7 @@ impl NodeApiAuthenticatedCaller {
                     template_transfer::TemplateTransferAuthority::Denied
                 }
             },
+            firewall_rules_fetch_authority: FirewallRulesFetchAuthority::Denied,
         }
     }
 
@@ -427,6 +451,7 @@ impl NodeApiAuthenticatedCaller {
             data_plane_session_refresh_authority,
             template_release_read_authority: TemplateReleaseReadAuthority::NodeScoped,
             template_transfer_authority: template_transfer::TemplateTransferAuthority::Denied,
+            firewall_rules_fetch_authority: FirewallRulesFetchAuthority::Denied,
         }
     }
 
@@ -441,6 +466,7 @@ impl NodeApiAuthenticatedCaller {
             data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority::Granted,
             template_release_read_authority: TemplateReleaseReadAuthority::NodeScoped,
             template_transfer_authority: template_transfer::TemplateTransferAuthority::Denied,
+            firewall_rules_fetch_authority: FirewallRulesFetchAuthority::Denied,
         }
     }
 
@@ -454,6 +480,7 @@ impl NodeApiAuthenticatedCaller {
             data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority::Denied,
             template_release_read_authority: TemplateReleaseReadAuthority::NodeScoped,
             template_transfer_authority: template_transfer::TemplateTransferAuthority::Denied,
+            firewall_rules_fetch_authority: FirewallRulesFetchAuthority::Denied,
         }
     }
 
@@ -481,6 +508,10 @@ impl NodeApiAuthenticatedCaller {
 
     pub const fn template_release_read_authority(&self) -> TemplateReleaseReadAuthority {
         self.template_release_read_authority
+    }
+
+    pub const fn firewall_rules_fetch_authority(&self) -> FirewallRulesFetchAuthority {
+        self.firewall_rules_fetch_authority
     }
 }
 
@@ -711,20 +742,13 @@ fn env_bool(name: &str) -> bool {
 }
 
 fn env_bool_default(name: &str, default: bool) -> bool {
-    env_bool_default_from_environment(
-        &pplx_space_common_core::env::ProcessEnvironment,
-        name,
-        default,
-    )
+    env_bool_default_from_environment(&pplx_space_env_vars::ProcessEnvironment, name, default)
 }
-fn env_bool_from_environment(
-    env: &dyn pplx_space_common_core::env::Environment,
-    name: &str,
-) -> bool {
+fn env_bool_from_environment(env: &dyn pplx_space_env_vars::Environment, name: &str) -> bool {
     env_bool_default_from_environment(env, name, false)
 }
 fn env_bool_default_from_environment(
-    env: &dyn pplx_space_common_core::env::Environment,
+    env: &dyn pplx_space_env_vars::Environment,
     name: &str,
     default: bool,
 ) -> bool {

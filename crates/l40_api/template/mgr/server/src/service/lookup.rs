@@ -1,27 +1,46 @@
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
 use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
 
+use super::support::PartitionChoice;
 use super::*;
+
+/// The environment a request's `TemplateRef.environment` names; `None` when
+/// it names none.
+pub(super) fn requested_environment(
+    environment: Option<&str>,
+) -> Result<Option<pplx_space_execution_spec::EnvironmentReference>, Status> {
+    environment
+        .map(|environment| {
+            environment.parse().map_err(|error| {
+                Status::invalid_argument(format!("invalid template environment: {error}"))
+            })
+        })
+        .transpose()
+}
 
 /// Cache partition a request's `TemplateRef.environment` selects; `None`
 /// when the request names no environment.
 pub(super) fn requested_cache_partition(
     environment: Option<&str>,
 ) -> Result<Option<crate::db::TemplateCachePartition>, Status> {
-    environment
-        .map(|environment| {
-            environment
-                .parse::<pplx_space_common_core::types::EnvironmentReference>()
-                .map(|environment| {
-                    pplx_space_node_runtime_core::catalog::template_cache_partition(Some(
-                        environment,
-                    ))
-                })
-                .map_err(|error| {
-                    Status::invalid_argument(format!("invalid template environment: {error}"))
-                })
-        })
-        .transpose()
+    Ok(requested_environment(environment)?.map(|environment| {
+        pplx_space_node_runtime_core::catalog::template_cache_partition(Some(environment))
+    }))
+}
+
+/// The environment a lookup that requires its environment's build names. Its
+/// authorized resolution names it too, so it resolves the release bound to
+/// it. One that doesn't parse, or a combination `environment_required`
+/// refuses, fails in `get_template_resolving` before anything resolves.
+pub(super) fn required_lookup_environment(
+    request: &crate::proto::GetTemplateRequest,
+) -> Option<pplx_space_execution_spec::EnvironmentReference> {
+    request
+        .environment_required
+        .then_some(request.template.as_ref())
+        .flatten()
+        .and_then(|template| template.environment.as_deref())
+        .and_then(|environment| environment.parse().ok())
 }
 
 pub(super) const fn pull_failure_code(failure: crate::volume::PullFailure) -> tonic::Code {
@@ -45,15 +64,24 @@ impl TemplateManagerService {
                 "missing_scope",
             );
         }
+        let required_environment = required_lookup_environment(request.get_ref());
         let mut response = self
             .get_template_resolving(
                 request,
                 async |name, hash, tag, org| {
-                    crate::volume::find_release_in_scope(name, hash, tag, org, scope).await
+                    crate::volume::find_release_in_environment(
+                        name,
+                        hash,
+                        tag,
+                        org,
+                        scope,
+                        required_environment,
+                    )
+                    .await
                 },
                 async |spec, resolve_elapsed, release| {
                     self.volume_puller
-                        .materialize_release(Arc::clone(&self.db), spec, resolve_elapsed, release)
+                        .materialize_release(self.db.clone(), spec, resolve_elapsed, release)
                         .await
                 },
             )
@@ -82,6 +110,39 @@ impl TemplateManagerService {
             crate::volume::ResolvedRelease,
         ) -> crate::volume::PullOutcome,
     ) -> Result<Response<crate::proto::GetTemplateResponse>, Status> {
+        self.get_template_with(request, resolve, materialize, async |spec, scope| {
+            self.volume_puller
+                .pull_in_scope(self.db.clone(), spec, scope)
+                .await
+        })
+        .await
+    }
+
+    /// [`Self::get_template_resolving`], with the pull of a lookup that
+    /// resolves its release inside the puller (an untagged lookup with no
+    /// caller org) supplied too.
+    pub(super) async fn get_template_with(
+        &self,
+        request: Request<crate::proto::GetTemplateRequest>,
+        resolve: impl AsyncFnOnce(
+            &str,
+            &str,
+            &str,
+            Option<OrgId>,
+        ) -> Result<
+            crate::volume::ResolvedRelease,
+            crate::volume::FindReleaseError,
+        >,
+        materialize: impl AsyncFnOnce(
+            crate::volume::PullSpec<'_>,
+            std::time::Duration,
+            crate::volume::ResolvedRelease,
+        ) -> crate::volume::PullOutcome,
+        pull: impl AsyncFnOnce(
+            crate::volume::PullSpec<'_>,
+            Option<TemplateLookupScope>,
+        ) -> crate::volume::PullOutcome,
+    ) -> Result<Response<crate::proto::GetTemplateResponse>, Status> {
         self.authorize_peer(&request, "GetTemplate", ALLOW_TEMPLATE_OBSERVER)?;
         let scope = TemplateLookupScope::from_request(&request)?;
         let req = request.get_ref();
@@ -99,7 +160,34 @@ impl TemplateManagerService {
             validate_content_hash(&req_hash)?;
         }
         let req_tag = tmpl_ref.tag.clone().unwrap_or_default();
-        let requested_partition = requested_cache_partition(tmpl_ref.environment.as_deref())?;
+        let requested = requested_environment(tmpl_ref.environment.as_deref())?;
+        let requested_partition = requested.map(|environment| {
+            pplx_space_node_runtime_core::catalog::template_cache_partition(Some(environment))
+        });
+        // Which partition the lookup answers from, and a required one pulls
+        // for.
+        let choice = match (requested_partition, req.environment_required) {
+            (None, false) => PartitionChoice::Any,
+            (Some(partition), false) => PartitionChoice::Prefer(partition),
+            (Some(partition), true) if !req_hash.is_empty() && !req.cached_only => {
+                PartitionChoice::Require(partition)
+            }
+            (_, true) => {
+                return Err(Status::invalid_argument(
+                    "environment_required takes an environment and an exact content_hash, \
+                     and excludes cached_only",
+                ));
+            }
+        };
+        // A lookup that requires its environment's build pulls, on a miss, the
+        // release bound to that environment: a twin of the digest, or the
+        // release itself. One that only prefers it pulls the release a lookup
+        // without an environment resolves, as before twins; prefetch warms
+        // the twins.
+        let required_environment = match choice {
+            PartitionChoice::Require(_) => requested,
+            PartitionChoice::Any | PartitionChoice::Prefer(_) => None,
+        };
         let caller_org = req
             .caller_org_id
             .as_deref()
@@ -130,11 +218,12 @@ impl TemplateManagerService {
             }
             let mut response = build_get_template_response(
                 self.artifact_store.root.clone(),
-                Arc::clone(&self.db),
+                self.db.clone(),
                 TemplateSelection {
                     name: template_id.clone(),
                     content_hash: req_hash,
-                    partition: requested_partition,
+                    partition: requested_partition
+                        .map_or(PartitionChoice::Any, PartitionChoice::Prefer),
                 },
                 None,
                 None,
@@ -150,7 +239,7 @@ impl TemplateManagerService {
                         build_dir.display()
                     )));
                 }
-                let rootfs = build_dir.join(pplx_space_common_core::types::TEMPLATE_ROOTFS_FILE);
+                let rootfs = build_dir.join(pplx_space_artifact_model::TEMPLATE_ROOTFS_FILE);
                 match std::fs::symlink_metadata(&rootfs) {
                     Ok(metadata) if metadata.is_file() => Ok(()),
                     Ok(_) => Err(Status::failed_precondition(format!(
@@ -183,10 +272,12 @@ impl TemplateManagerService {
                         crate::volume::FindReleaseError::NotFound => {
                             Status::not_found("template release not found")
                         }
-                        crate::volume::FindReleaseError::Unavailable => {
+                        crate::volume::FindReleaseError::Unavailable
+                        | crate::volume::FindReleaseError::SelectorIgnored { .. } => {
                             Status::unavailable("cluster metadata unavailable")
                         }
-                        crate::volume::FindReleaseError::InvalidResponse => {
+                        crate::volume::FindReleaseError::InvalidResponse
+                        | crate::volume::FindReleaseError::InvalidBinding { .. } => {
                             Status::failed_precondition(
                                 "cluster did not return an authorized exact release",
                             )
@@ -205,23 +296,31 @@ impl TemplateManagerService {
         let snapshot_selector = optional_snapshot_dimensions(req.vcpu, req.memory_mib)?;
         let policy_snapshot_memory_mib = if snapshot_selector.is_none() {
             let desired_memory_mib = {
-                let db = Arc::clone(&self.db);
+                let db = self.db.clone();
                 let template_id = template_id.clone();
                 let req_hash = req_hash.clone();
-                let preferred = requested_partition;
                 tokio::task::spawn_blocking(move || {
                     let conn = db
                         .lock()
                         .map_err(|_| Status::internal("template DB mutex poisoned"))?;
-                    // Resolve with the request's preference, so the build
-                    // whose LRU this touches is the one the request serves.
-                    let name = TemplateManagerService::resolve_template_build(
-                        &conn,
-                        &template_id,
-                        &req_hash,
-                        preferred,
-                    )?
-                    .name;
+                    // Settings are the template's, whichever build serves
+                    // it. Resolve with the request's preference, so the build
+                    // whose LRU this touches is the one the request serves. A
+                    // required lookup reads them by name and touches nothing:
+                    // the node may hold the digest only under another
+                    // environment, whose build it won't serve.
+                    let name = match choice {
+                        PartitionChoice::Require(_) => template_id,
+                        PartitionChoice::Any | PartitionChoice::Prefer(_) => {
+                            TemplateManagerService::resolve_selected_build(
+                                &conn,
+                                &template_id,
+                                &req_hash,
+                                choice,
+                            )?
+                            .name
+                        }
+                    };
                     let settings = crate::db::get_template_settings(&conn, &name)
                         .map_err(|e| Status::internal(format!("db get_template_settings: {e}")))?;
                     Ok::<_, Status>(
@@ -279,13 +378,13 @@ impl TemplateManagerService {
         let selection = |content_hash: String| TemplateSelection {
             name: template_id.clone(),
             content_hash,
-            partition: requested_partition,
+            partition: choice,
         };
 
         // First attempt: local-only lookup.
         match build_get_template_response(
             self.artifact_store.root.clone(),
-            Arc::clone(&self.db),
+            self.db.clone(),
             selection(req_hash.clone()),
             snapshot_selector,
             policy_snapshot_memory_mib,
@@ -324,20 +423,24 @@ impl TemplateManagerService {
                     req_hash: &requested_hash,
                     req_tag: &req_tag,
                     trigger: crate::volume::PullTrigger::OnDemand,
+                    required: choice.required(),
+                    environment: required_environment,
                 };
                 materialize(spec, resolve_elapsed, release).await
             }
             None => {
-                self.volume_puller
-                    .pull_in_scope(
-                        Arc::clone(&self.db),
-                        template_id,
-                        &req_hash,
-                        &req_tag,
-                        crate::volume::PullTrigger::OnDemand,
-                        scope,
-                    )
-                    .await
+                pull(
+                    crate::volume::PullSpec {
+                        name: template_id,
+                        req_hash: &req_hash,
+                        req_tag: &req_tag,
+                        trigger: crate::volume::PullTrigger::OnDemand,
+                        required: choice.required(),
+                        environment: required_environment,
+                    },
+                    scope,
+                )
+                .await
             }
         };
         match outcome {
@@ -347,7 +450,7 @@ impl TemplateManagerService {
                 let req_tag_for_err = req_tag.clone();
                 build_get_template_response(
                     self.artifact_store.root.clone(),
-                    Arc::clone(&self.db),
+                    self.db.clone(),
                     selection(req_hash),
                     snapshot_selector,
                     policy_snapshot_memory_mib,
@@ -471,7 +574,7 @@ impl TemplateManagerService {
             )?;
         }
 
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let template = req.template.clone();
         let network_policy_generation = req.network_policy_generation;
         let update_outcome = tokio::task::spawn_blocking(move || {
@@ -557,7 +660,7 @@ impl TemplateManagerService {
             optional_positive_or_default("snapshot_memory_mib", req.snapshot_memory_mib, 1024)?;
 
         {
-            let db = Arc::clone(&self.db);
+            let db = self.db.clone();
             let template = template.clone();
             tokio::task::spawn_blocking(move || {
                 let conn = db
@@ -622,7 +725,7 @@ impl TemplateManagerService {
 
         // Check that no pools or local sandboxes reference this build before
         // deleting its master rootfs.
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let root = self.artifact_store.root.clone();
         let n = name.clone();
         let h = content_hash.clone();
@@ -704,7 +807,7 @@ impl TemplateManagerService {
         name: &str,
         content_hash: &str,
     ) -> Result<(), Status> {
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let root = self.artifact_store.root.clone();
         let n = name.to_string();
         let h = content_hash.to_string();
@@ -741,7 +844,7 @@ impl TemplateManagerService {
             )
             .await?;
 
-            let db = Arc::clone(&self.db);
+            let db = self.db.clone();
             let n = name.to_string();
             let h = content_hash.to_string();
             tokio::task::spawn_blocking(move || {
@@ -829,7 +932,7 @@ impl TemplateManagerService {
             build_artifacts_dir(&self.artifact_store.root, name, content_hash, partition);
         let is_subvol = tokio::task::spawn_blocking({
             let build_dir = build_dir.clone();
-            move || pplx_space_common_core::host::btrfs::is_subvolume(&build_dir)
+            move || pplx_space_btrfs::is_subvolume(&build_dir)
         })
         .await
         .map_err(|e| {
@@ -990,12 +1093,7 @@ pub(super) fn cached_partition_dirs(
     content_hash: &str,
 ) -> Result<Vec<crate::db::TemplateCachePartition>, Status> {
     let list = |dir: &Path, template: &str| {
-        pplx_space_common_core::host::linux::paths::cached_template_partitions_in(
-            dir,
-            template,
-            content_hash,
-        )
-        .map_err(|error| {
+        cached_template_partitions_in(dir, template, content_hash).map_err(|error| {
             Status::unavailable(format!(
                 "list cached builds of {name}@{content_hash} under {}: {error}",
                 dir.join(template).display()
@@ -1006,6 +1104,39 @@ pub(super) fn cached_partition_dirs(
     // Base-snapshot dirs under `{name}/snapshots/` carry the same build dir
     // names.
     partitions.extend(list(&template_artifacts_dir(root, name), "snapshots")?);
+    Ok(partitions)
+}
+
+/// Cache partitions holding a build dir for a template digest under
+/// `template_root`, legacy first; none when the template dir doesn't
+/// exist. A dir's presence says nothing about whether its build is
+/// verified; only template-manager's catalog does. Any other read error
+/// is returned rather than read as no dirs, since callers act on a
+/// partition's absence: a delete would report success over it.
+fn cached_template_partitions_in(
+    template_root: &std::path::Path,
+    template: &str,
+    content_hash: &str,
+) -> std::io::Result<Vec<pplx_space_template_model::TemplateCachePartition>> {
+    let entries = match std::fs::read_dir(template_root.join(template)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut partitions = Vec::new();
+    for entry in entries {
+        let name = entry?.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if let Some((hash, partition)) =
+            pplx_space_template_model::TemplateCachePartition::parse_build_dir_name(name)
+            && hash == content_hash
+        {
+            partitions.push(partition);
+        }
+    }
+    partitions.sort();
     Ok(partitions)
 }
 
@@ -1021,7 +1152,7 @@ pub(super) fn cached_partition_dirs(
 /// so a stalled disk holds up this delete and not every DB user. The
 /// caller's digest claim keeps a row from appearing in between.
 pub(super) fn cached_builds_to_delete(
-    db: &Mutex<rusqlite::Connection>,
+    db: &crate::db::SharedConnection,
     root: &Path,
     name: &str,
     content_hash: &str,
@@ -1043,3 +1174,6 @@ pub(super) fn cached_builds_to_delete(
     }
     Ok(builds)
 }
+
+#[cfg(test)]
+mod tests;

@@ -7,18 +7,21 @@ import json
 import secrets
 import shlex
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass
 from enum import StrEnum
+from functools import cached_property
 from http.client import IncompleteRead
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
+    DrainV2Control,
     ConcurrentRestoreControl,
     ConsoleControl,
     DrainGateControl,
@@ -26,7 +29,9 @@ from space_smoke.capabilities import (
     NodeGroupControl,
     NodeFenceControl,
     NodeSelectorExtrasControl,
+    NodeCtlFacetControl,
     PendingBackupControl,
+    RetainedOnlyCopyControl,
     TeardownRestartControl,
     OrphanedRestorePodGcControl,
     ReconcileQueueGcControl,
@@ -59,6 +64,7 @@ from space_smoke.capabilities import (
     RestoreStateRead,
     SandboxPodPlacement,
     ColdCreateObserver,
+    NetworkPolicyObserver,
     CommandResult,
     CommandSandbox,
     DurableLifecycleSandbox,
@@ -97,9 +103,11 @@ from space_smoke.adapters import (
     NODE_MANAGER,
     NODE_TEMPLATE_MANAGER,
     RESTORE_STORAGE_URI_ANNOTATION,
+    SANDBOX_CACHE_ROOT,
     SUSPEND_ROOTFS_OBJECTS,
     template_received_uuid,
 )
+from space_smoke.drain_v2 import DrainV2Assertions
 from space_smoke.concurrent_restore import ConcurrentRestoreAssertions
 from space_smoke.node_drain import NodeDrainAssertions
 from space_smoke.node_groups import NodeGroupAssertions
@@ -108,11 +116,26 @@ from space_smoke.node_selector_extras import NodeSelectorExtrasAssertions
 from space_smoke.orphaned_restore_pod_gc import OrphanedRestorePodGcAssertions
 from space_smoke.unanswered_template_eviction import UnansweredTemplateEvictionAssertions
 from space_smoke.pending_backup import PendingBackupAssertions
+from space_smoke.retained_only_copy import RetainedOnlyCopyAssertions
 from space_smoke.teardown_restart import TeardownRestartAssertions
 from space_smoke.reconcile_queue_gc import ReconcileQueueGcAssertions
 from space_smoke.template_build import TemplateBuildAssertions
 from space_smoke.console import ConsoleAssertions
+from space_smoke.environment_placement_gate import (
+    EnvironmentPlacementGate,
+    EnvironmentPlacementGateControl,
+)
+from space_smoke.execution_environment import (
+    BoundSeed,
+    ExecutionEnvironmentAdmission,
+    ExecutionEnvironmentControl,
+    SelectableEnvironment,
+    catalog_reference,
+    expect_runtime,
+)
+from space_smoke.runtime_upgrade_campaign import CampaignControl, TemplateCampaignAssertions
 from space_smoke.drain_gate import DrainGateAssertions
+from space_smoke.no_free_slot import NoFreeSlotAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
 from space_smoke.sandbox_network_isolation import SandboxNetworkIsolationAssertions
 from space_smoke.storage_exchange import StorageExchangeScopingAssertions
@@ -123,6 +146,7 @@ from space_smoke.config import DEFAULT_SANDBOX_TIMEOUT_SECONDS
 from space_smoke.identity import EcwIdentityAssertions
 from space_smoke.invariants.lifecycle import prove_idle_deadline_reset
 from space_smoke.network_policy import NetworkPolicyAssertions
+from space_smoke.node_ctl_facets import sync_node_ctl_facet
 from space_smoke.runtime import (
     Compensation,
     InconclusiveSmoke,
@@ -147,6 +171,18 @@ SANDBOX_CLEANUP_RETRY_SECONDS = 1.0
 # row's idle time in.
 LOCAL_CLEANUP_MAX_QUIESCENCE_SECONDS = 60
 LOCAL_CLEANUP_QUIESCENCE_MARGIN_SECONDS = 2
+# After the delete, the retained rootfs has this long to leave the worker:
+# node-ctl's 60 s poll (`DEFAULT_NODE_CTL_POLL_INTERVAL`, which Kind renders)
+# and, should the eviction be refused, its retry a poll later, plus margin.
+# The on-demand runs below spend from it; they never extend it.
+LOCAL_CLEANUP_DEADLINE_SECONDS = 180
+# The facet that evicts cluster-deleted sandboxes, and how long one on-demand
+# run may take: it waits behind a poll already running, so a poll period.
+LOCAL_CLEANUP_FACET = "sandbox-desired-state"
+LOCAL_CLEANUP_FACET_RUN_SECONDS = 60
+# sandbox-manager tears an evicted sandbox down detached from the eviction
+# call, so the rootfs may outlive the run that claimed it by a moment.
+LOCAL_CLEANUP_TEARDOWN_SECONDS = 10
 
 
 def snapshot_reap_residue(before: Iterable[str], after: Iterable[str]) -> list[str]:
@@ -306,6 +342,7 @@ class HttpsProbeSample:
     def blocked_by_network(self) -> bool:
         return (
             self.command_exit_code == 0
+            and not self.network_reachable
             and self.curl_exit_code in _CURL_NETWORK_FAILURE_EXIT_CODES
         )
 
@@ -617,7 +654,7 @@ set -eu
 while IFS= read -r header; do
   [ "$header" = "$(printf '\\r')" ] && break
 done
-content_length=$(wc -c < {quoted_body_path})
+content_length=$(wc -c < {quoted_body_path} | tr -d '[:space:]')
 printf 'HTTP/1.1 200 OK\\r\\nContent-Length: %s\\r\\nConnection: close\\r\\n\\r\\n' "$content_length"
 cat {quoted_body_path}
 """
@@ -844,23 +881,44 @@ class EcwSandboxCollection(SandboxCollection):
         self,
         *,
         metadata: Mapping[str, str] | None = None,
+        allow_internet_access: bool | None = None,
+        network: NetworkConfig | None = None,
+        template: str | None = None,
     ) -> EcwSandbox:
-        """Create another run-owned sandbox with critical cleanup pre-armed."""
+        """Create another run-owned sandbox with critical cleanup pre-armed.
 
-        return self._sandboxes.create(metadata)
+        `template` overrides the scenario's template for this create.
+        """
+
+        options: dict[str, Any] = {}
+        if allow_internet_access is not None:
+            options["allow_internet_access"] = allow_internet_access
+        if network is not None:
+            options["network"] = network
+        if template is not None:
+            options["template"] = template
+        return self._sandboxes.create(metadata, **options)
 
     def attempt_create(
         self,
         *,
         allow_internet_access: bool | None = None,
         network: NetworkConfig | None = None,
+        template: str | None = None,
+        refused_statuses: Collection[int] = (),
     ) -> EcwCreateAttempt:
-        """Observe a raw create using this scenario's template and timeout."""
+        """Observe a raw create using this scenario's template (or `template`) and timeout.
+
+        A status in `refused_statuses` is a server refusal the scenario
+        expects; its cleanup is dropped once the run's markers list no sandbox.
+        """
 
         with self._context.phase("attempt sandbox creation"):
             return self._sandboxes.attempt_create(
                 allow_internet_access=allow_internet_access,
                 network=network,
+                template=template,
+                refused_statuses=refused_statuses,
             )
 
     def fork(
@@ -876,18 +934,69 @@ class EcwSandboxCollection(SandboxCollection):
 
 
 @dataclass(frozen=True)
-class CommandSandboxFixture:
-    """Shared scenario behavior over a command-capable sandbox."""
+class ScenarioFixture:
+    """Evidence and bounded waits shared by deployed scenario fixtures."""
 
     _context: ScenarioContext
+
+    def phase(self, name: str) -> AbstractContextManager[None]:
+        return self._context.phase(name)
+
+    def record(self, name: str, value: object) -> None:
+        """Attach a named fact to the scenario's evidence without asserting it."""
+        self._context.record(name, value)
+
+    def wait(self, seconds: float, *, reason: str | None = None) -> None:
+        if reason is None:
+            self._context.wait(seconds)
+            return
+        with self.phase(f"wait {reason}"):
+            self._context.wait(seconds)
+
+    def verify(
+        self,
+        condition: bool,
+        message: str,
+        *,
+        failure_evidence: Callable[[], Mapping[str, object]] | None = None,
+        **evidence: object,
+    ) -> None:
+        if not condition and failure_evidence is not None:
+            # Evidence must never replace the verdict it explains.
+            try:
+                evidence.update(failure_evidence())
+            except ScenarioTimedOut:
+                raise
+            except Exception as error:  # noqa: BLE001 - attached, the violation still raises
+                evidence["failure_evidence_error"] = f"{type(error).__name__}: {error}"[:500]
+        self._context.verify(condition, message, **evidence)
+
+    def warn(self, message: str, **evidence: object) -> None:
+        """End the scenario QUARANTINED: a known, narrowly classified failure.
+
+        The evidence is recorded and the run stays visible in the log without
+        turning the suite red. Callers must classify before calling — an
+        unclassified failure is a `verify` failure, never a warning.
+        """
+
+        self._context.warn(message, **evidence)
+
+
+@dataclass(frozen=True)
+class CommandSandboxFixture(ScenarioFixture):
+    """Shared scenario behavior over a command-capable sandbox."""
+
     sandbox: CommandSandbox
     _sandboxes: ScenarioSandboxes | None = None
     _durable_lifecycle: DurableLifecycleSandbox | None = None
     _resident_lifecycle: ResidentLifecycleSandbox | None = None
     _stoppable_lifecycle: StoppableLifecycleSandbox | None = None
     _local_cleanup_control: ColdEvictionControl | None = None
+    _node_ctl_facet_control: NodeCtlFacetControl | None = None
     _encrypted_resuspend_control: EncryptedResuspendControl | None = None
     _stopped_replacement_control: StoppedReplacementControl | None = None
+    _drain_v2_control: DrainV2Control | None = None
+    _create_sandbox: Callable[..., DurableLifecycleSandbox] | None = None
     _processes: ProcessSandbox | None = None
 
     fixture_name: ClassVar[str] = "command_sandbox"
@@ -934,47 +1043,22 @@ class CommandSandboxFixture:
             self, self._stopped_replacement_control, self._context.scope
         )
 
-    def phase(self, name: str) -> AbstractContextManager[None]:
-        return self._context.phase(name)
+    @property
+    def drain_v2(self) -> DrainV2Assertions:
+        """Drain the sandbox's worker with the v2 engine and judge what follows.
 
-    def record(self, name: str, value: object) -> None:
-        """Attach a named fact to the scenario's evidence without asserting it."""
-        self._context.record(name, value)
-
-    def wait(self, seconds: float, *, reason: str | None = None) -> None:
-        if reason is None:
-            self._context.wait(seconds)
-            return
-        with self.phase(f"wait {reason}"):
-            self._context.wait(seconds)
-
-    def verify(
-        self,
-        condition: bool,
-        message: str,
-        *,
-        failure_evidence: Callable[[], Mapping[str, object]] | None = None,
-        **evidence: object,
-    ) -> None:
-        if not condition and failure_evidence is not None:
-            # Evidence must never replace the verdict it explains.
-            try:
-                evidence.update(failure_evidence())
-            except ScenarioTimedOut:
-                raise
-            except Exception as error:  # noqa: BLE001 - attached, the violation still raises
-                evidence["failure_evidence_error"] = f"{type(error).__name__}: {error}"[:500]
-        self._context.verify(condition, message, **evidence)
-
-    def warn(self, message: str, **evidence: object) -> None:
-        """End the scenario QUARANTINED: a known, narrowly classified failure.
-
-        The evidence is recorded and the run stays visible in the log without
-        turning the suite red. Callers must classify before calling — an
-        unclassified failure is a `verify` failure, never a warning.
+        Each access builds fresh assertions that own the scenario's cordon,
+        drain and unseal compensations, so a scenario takes it once.
         """
 
-        self._context.warn(message, **evidence)
+        if self._drain_v2_control is None or self._create_sandbox is None:
+            raise SmokeConfigurationError(
+                "drain v2 control is only available on the kind backend "
+                "with a native sandbox collection"
+            )
+        return DrainV2Assertions(
+            self, self._drain_v2_control, self._create_sandbox, self._context.scope
+        )
 
     def delete_sandbox(self, sandbox: CommandSandbox | None = None) -> int:
         """Delete a run-owned sandbox through the selected API adapter."""
@@ -1322,19 +1406,31 @@ class CommandSandboxFixture:
         since_time = _log_since_time()
         self.delete_sandbox()
         self.wait_until_deleted()
+        deleted_at = time.monotonic()
         # Allow a node-ctl poll and, should the row have moved after the stop
         # after all, the refused eviction's retry a poll later. The retained
         # rootfs leaving the worker is the outcome, whichever reclaim path
         # removed it: the eviction itself, or the durable cleanup that retries
         # an eviction refused while node-manager reset the network slot the
         # stop released.
-        deadline = time.monotonic() + 180
-        while control.sandbox_cache_dir_present(worker, sandbox_id):
+        deadline = deleted_at + LOCAL_CLEANUP_DEADLINE_SECONDS
+        facets = self._node_ctl_facet_control
+        present = control.sandbox_cache_dir_present(worker, sandbox_id)
+        # A rootfs a poll already removed needs no run, and no second probe.
+        if present and facets is not None:
+            # Probed again unless the run saw it go: a failed or timed-out run
+            # says nothing about the rootfs, which may have gone meanwhile.
+            gone = self._run_cluster_deleted_eviction(facets, control, worker, sandbox_id, deadline)
+            present = not gone and control.sandbox_cache_dir_present(worker, sandbox_id)
+        while present:
             self.verify(
                 time.monotonic() < deadline,
-                "deleted stopped sandbox was not reclaimed by node reconciliation",
+                "deleted stopped sandbox was not reclaimed by node reconciliation: "
+                f"{SANDBOX_CACHE_ROOT}/{sandbox_id} is still on {worker} "
+                f"{LOCAL_CLEANUP_DEADLINE_SECONDS} s after the delete",
                 worker=worker,
                 sandbox_id=sandbox_id,
+                cache_dir=f"{SANDBOX_CACHE_ROOT}/{sandbox_id}",
                 failure_evidence=lambda: {
                     "sandbox_manager_log": control.sandbox_manager_log(
                         sandbox_id, node_names=[worker], since_time=since_time
@@ -1342,7 +1438,74 @@ class CommandSandboxFixture:
                 },
             )
             self._context.wait(2)
+            present = control.sandbox_cache_dir_present(worker, sandbox_id)
         self.record("stopped_delete_local_cleanup", "retained rootfs removed")
+        self.record("stopped_delete_local_cleanup_seconds", round(time.monotonic() - deleted_at, 1))
+
+    def _run_cluster_deleted_eviction(
+        self,
+        facets: NodeCtlFacetControl,
+        control: ColdEvictionControl,
+        worker: str,
+        sandbox_id: str,
+        deadline: float,
+    ) -> bool:
+        """Run the worker's sandbox desired-state facet now rather than wait for its poll;
+        return whether the rootfs was seen gone.
+
+        The facet's full-scope run is what node-ctl's poll makes, and the one
+        that evicts a cluster-deleted local row, so the rootfs leaves through
+        the same eviction. That the facet also runs on node-ctl's timer, which
+        this no longer waits for, is pinned by
+        `policy_facets_pull_periodically_but_do_not_publish_unprompted`
+        (crates/l40_api/node/ctl/server/src/facets/tests.rs). The run is
+        asked for only after the quiescence wait: one inside the window would
+        be refused and backed off past the following poll. A run that still
+        left the rootfs, such as an element-scoped run for another sandbox or
+        an eviction deferred to the next sync, is asked for once more. Nothing
+        here fails the scenario: a request or run that fails is recorded, and
+        the caller's poll, within the same deadline, decides.
+        """
+
+        for attempt in (1, 2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 1:
+                return False
+            try:
+                sync = sync_node_ctl_facet(
+                    facets,
+                    worker,
+                    LOCAL_CLEANUP_FACET,
+                    timeout=LOCAL_CLEANUP_FACET_RUN_SECONDS,
+                    deadline=deadline,
+                    wait=self.wait,
+                )
+            except (ScenarioTimedOut, SmokeConfigurationError):
+                raise
+            except Exception as error:  # noqa: BLE001 - recorded; the caller's poll decides
+                failure = f"{type(error).__name__}: {error}"
+            else:
+                if sync.completed_at is None:
+                    failure = f"no run finished: {asdict(sync.latest)}"
+                elif not sync.succeeded:
+                    failure = f"the run failed: {asdict(sync.latest)}"
+                else:
+                    failure = None
+            if failure is not None:
+                self.record(
+                    "stopped_delete_eviction_run_failure",
+                    {"attempt": attempt, "facet": LOCAL_CLEANUP_FACET, "error": failure[:1_000]},
+                )
+                return False
+            self.record("stopped_delete_eviction_runs", attempt)
+            settled = min(time.monotonic() + LOCAL_CLEANUP_TEARDOWN_SECONDS, deadline)
+            while control.sandbox_cache_dir_present(worker, sandbox_id):
+                if time.monotonic() >= settled:
+                    break
+                self._context.wait(1)
+            else:
+                return True
+        return False
 
     def start_background_process(
         self, command: str, *, timeout: int = 60
@@ -1483,7 +1646,7 @@ class Ecw(CommandSandboxFixture):
 
         return EcwIdentityAssertions(self)
 
-    @property
+    @cached_property
     def network_policy(self) -> NetworkPolicyAssertions:
         """Assertions for ECW network-policy contracts."""
 
@@ -1826,6 +1989,7 @@ class Ecw(CommandSandboxFixture):
         *,
         timeout_seconds: float = 60,
         every_seconds: float = 2,
+        probe_timeout_seconds: int = _HTTPS_PROBE_CURL_TIMEOUT_SECONDS,
     ) -> HttpsAccessObservation:
         """Poll until any HTTP response proves the route is network-reachable."""
 
@@ -1833,11 +1997,13 @@ class Ecw(CommandSandboxFixture):
             raise ValueError("network access timeout must be positive")
         if every_seconds <= 0:
             raise ValueError("network access interval must be positive")
+        if probe_timeout_seconds <= 0:
+            raise ValueError("network probe timeout must be positive")
         deadline = time.monotonic() + timeout_seconds
         samples: list[HttpsProbeSample] = []
         with self.phase("wait for in-guest network access"):
             while True:
-                sample = self._probe_https(url)
+                sample = self._probe_https(url, timeout_seconds=probe_timeout_seconds)
                 samples.append(sample)
                 if sample.network_reachable or time.monotonic() >= deadline:
                     break
@@ -1853,6 +2019,7 @@ class Ecw(CommandSandboxFixture):
         after_seconds: float = 0,
         samples: int = 1,
         every_seconds: float = 2,
+        probe_timeout_seconds: int = _HTTPS_PROBE_CURL_TIMEOUT_SECONDS,
     ) -> HttpsAccessObservation:
         """Collect a fixed sample set after an optional policy settle window."""
 
@@ -1862,12 +2029,14 @@ class Ecw(CommandSandboxFixture):
             raise ValueError("HTTPS access sample count must be positive")
         if every_seconds <= 0:
             raise ValueError("HTTPS access interval must be positive")
+        if probe_timeout_seconds <= 0:
+            raise ValueError("HTTPS probe timeout must be positive")
         if after_seconds:
             self.wait(after_seconds, reason="for the network policy to settle")
         observed: list[HttpsProbeSample] = []
         with self.phase("sample in-guest HTTPS access"):
             for sample_number in range(samples):
-                observed.append(self._probe_https(url))
+                observed.append(self._probe_https(url, timeout_seconds=probe_timeout_seconds))
                 if sample_number + 1 < samples:
                     self._context.wait(every_seconds)
         return self._record_https_observation(url, observed)
@@ -1895,10 +2064,7 @@ class Ecw(CommandSandboxFixture):
     def expect_https_blocked(self, observed: HttpsAccessObservation) -> None:
         """Require every policy-settled sample to be rejected by curl."""
 
-        reached = any(
-            sample.command_exit_code == 0 and sample.curl_exit_code == 0
-            for sample in observed.samples
-        )
+        reached = any(sample.network_reachable for sample in observed.samples)
         self.verify(
             not reached,
             "sandbox unexpectedly reached an HTTPS endpoint that should be blocked",
@@ -1913,11 +2079,13 @@ class Ecw(CommandSandboxFixture):
             https_access=observed.evidence(),
         )
 
-    def _probe_https(self, url: str) -> HttpsProbeSample:
+    def _probe_https(
+        self, url: str, *, timeout_seconds: int = _HTTPS_PROBE_CURL_TIMEOUT_SECONDS
+    ) -> HttpsProbeSample:
         command = (
             "set +e; "
             "curl -fsS "
-            f"-m {_HTTPS_PROBE_CURL_TIMEOUT_SECONDS} "
+            f"-m {timeout_seconds} "
             f"-o /dev/null -w '%{{http_code}}' {shlex.quote(url)}; "
             "curl_rc=$?; printf '\\nrc=%s\\n' \"$curl_rc\""
         )
@@ -2141,6 +2309,7 @@ class Ecw(CommandSandboxFixture):
         reset_after: float,
         verify_after_reset: float,
         reset: Callable[[], None],
+        additional_resets: Sequence[tuple[EcwSandbox, Callable[[], None]]] = (),
     ) -> None:
         """Prove one action resets the configured sandbox idle deadline."""
 
@@ -2151,6 +2320,7 @@ class Ecw(CommandSandboxFixture):
             reset_after=reset_after,
             verify_after_reset=verify_after_reset,
             reset=reset,
+            additional_resets=additional_resets,
         )
 
     def expect_unavailable(
@@ -2640,17 +2810,16 @@ class RetentionAssertions:
         )
 
 
-class KindEcw(Ecw):
-    """[`Ecw`] plus narrow privileged control-plane operations.
+class KindAdmin(ScenarioFixture):
+    """Kind control-plane capabilities without provisioning an unused VM.
 
-    The fixture *type* is the privilege declaration: requesting it makes a
-    scenario kind-only, enforced at service construction — a deployed
-    backend refuses with a configuration error rather than mis-running a
-    white-box scenario against production.
+    Scenarios that create their own sandbox or only inspect the control plane
+    own those resources through their capability scopes.
     """
 
-    fixture_name: ClassVar[str] = "kind_ecw"
-    allow_committed_pause_not_running: ClassVar[bool] = True
+    fixture_name: ClassVar[str] = "kind_admin"
+    timeout_minutes: ClassVar[int] = 30
+    _template_selector: str | None = None
 
     _private_template_build_setup: Callable[[], PrivateTemplateBuildAssertions] | None = None
     _private_template_build_assertions: PrivateTemplateBuildAssertions | None = None
@@ -2662,6 +2831,232 @@ class KindEcw(Ecw):
         if self._private_template_build_assertions is None:
             self._private_template_build_assertions = self._private_template_build_setup()
         return self._private_template_build_assertions
+
+    _template_build_control: TemplateBuildControl | None = None
+    _template_builder: TemplateBuilder | None = None
+    _template_build_assertions: TemplateBuildAssertions | None = None
+
+    @property
+    def template_build(self) -> TemplateBuildAssertions:
+        """Privileged assertions for a public template build through the kind builders."""
+
+        if self._template_build_control is None or self._template_builder is None:
+            raise SmokeConfigurationError(
+                "template build control is only available on the kind backend"
+            )
+        if self._template_build_assertions is None:
+            self._template_build_assertions = TemplateBuildAssertions(
+                self, self._template_build_control, self._template_builder, self._context.scope
+            )
+        return self._template_build_assertions
+
+    _reconcile_queue_gc_control: ReconcileQueueGcControl | None = None
+    _reconcile_queue_gc_assertions: ReconcileQueueGcAssertions | None = None
+
+    @property
+    def reconcile_queue_gc(self) -> ReconcileQueueGcAssertions:
+        """Privileged assertions for the cluster-controller's reconcile-queue GC."""
+
+        if self._reconcile_queue_gc_control is None:
+            raise SmokeConfigurationError(
+                "reconcile-queue GC control is only available on the kind backend"
+            )
+        if self._reconcile_queue_gc_assertions is None:
+            self._reconcile_queue_gc_assertions = ReconcileQueueGcAssertions(
+                self, self._reconcile_queue_gc_control, self._context.scope
+            )
+        return self._reconcile_queue_gc_assertions
+
+    _leader_election_control: LeaderElectionControl | None = None
+    _leader_election_assertions: LeaderElectionAssertions | None = None
+
+    @property
+    def leader_election(self) -> LeaderElectionAssertions:
+        """Privileged faults and reads for the cluster-controller's leader election."""
+
+        if self._leader_election_control is None:
+            raise SmokeConfigurationError(
+                "leader-election control is only available on the kind backend"
+            )
+        if self._leader_election_assertions is None:
+            self._leader_election_assertions = LeaderElectionAssertions(
+                self, self._leader_election_control, self._context.scope
+            )
+        return self._leader_election_assertions
+
+    _drain_gate_control: DrainGateControl | None = None
+    _drain_gate_assertions: DrainGateAssertions | None = None
+
+    @property
+    def drain_gate(self) -> DrainGateAssertions:
+        """Privileged assertions for the admin `:terminate` occupancy guard."""
+
+        if self._drain_gate_control is None:
+            raise SmokeConfigurationError(
+                "drain gate control is only available on the kind backend"
+            )
+        if self._drain_gate_assertions is None:
+            self._drain_gate_assertions = DrainGateAssertions(
+                self, self._drain_gate_control, self._context.scope
+            )
+        return self._drain_gate_assertions
+
+    _console_control: ConsoleControl | None = None
+    _console_assertions: ConsoleAssertions | None = None
+
+    @property
+    def console(self) -> ConsoleAssertions:
+        """The admin console, driven through a browser and judged against the admin API."""
+
+        if self._console_control is None:
+            raise SmokeConfigurationError(
+                "admin console control is only available on the kind backend"
+            )
+        if self._console_assertions is None:
+            self._console_assertions = ConsoleAssertions(
+                self, self._console_control, self._context.scope
+            )
+        return self._console_assertions
+
+    _execution_environment_control: ExecutionEnvironmentControl | None = None
+
+    def _environment_control(self) -> ExecutionEnvironmentControl:
+        if self._execution_environment_control is None:
+            raise SmokeConfigurationError(
+                "execution-environment control is only available on the kind backend"
+            )
+        return self._execution_environment_control
+
+    def admit_execution_environment(self, name: str) -> ExecutionEnvironmentAdmission:
+        """An admission of `name` the scenario drives itself, stage by stage.
+
+        For a scenario that needs some nodes to run the environment and others
+        not; nothing is admitted until it calls `admit(roles)`. It withdraws
+        the admission after deleting what runs it, as setup's admission does.
+        """
+
+        return ExecutionEnvironmentAdmission(
+            self, self._environment_control(), self._context.scope, name
+        )
+
+    _environment_placement_gate_control: EnvironmentPlacementGateControl | None = None
+    _environment_placement_gate: EnvironmentPlacementGate | None = None
+
+    @property
+    def environment_placement_gate(self) -> EnvironmentPlacementGate:
+        """Turn the environment placement gate on for this scenario, and put it back."""
+
+        if self._environment_placement_gate_control is None:
+            raise SmokeConfigurationError(
+                "environment placement gate control is only available on the kind backend"
+            )
+        if self._environment_placement_gate is None:
+            self._environment_placement_gate = EnvironmentPlacementGate(
+                self, self._environment_placement_gate_control, self._context.scope
+            )
+        return self._environment_placement_gate
+
+    _ecw_creator: Any = None
+
+    def create_ecw_sandbox(self) -> str:
+        """A sandbox of this scenario's template created through the ECW API; its bare id.
+
+        It names no shape, so it can claim a default-shape warm-pool slot,
+        which an admin or native create doesn't. Until the create answers,
+        cleanup finds what it made by this call's own metadata, so a lost
+        reply leaves nothing behind; once it answers, cleanup kills that
+        sandbox by ID, which also succeeds once its timeout has removed it.
+        """
+
+        if self._ecw_creator is None:
+            raise SmokeConfigurationError("ECW creates need the ECW SDK surface")
+        creator = self._ecw_creator
+        metadata = {"space_smoke_ecw_create": uuid.uuid4().hex}
+        by_metadata = self._context.scope.defer(
+            "kill the ECW sandbox", lambda: creator.kill_matching(metadata), critical=True
+        )
+        sandbox = creator.create(template=self.sandbox_template_name(), timeout=600, metadata=metadata)
+        sandbox_id = str(sandbox.sandbox_id)
+        self._context.scope.defer(
+            f"kill ECW sandbox {sandbox_id}", lambda: creator.kill_sandbox(sandbox_id), critical=True
+        )
+        by_metadata.disarm()
+        return sandbox_id
+
+    _campaign_control: CampaignControl | None = None
+    _campaign_assertions: TemplateCampaignAssertions | None = None
+
+    @property
+    def template_campaigns(self) -> TemplateCampaignAssertions:
+        """Template runtime-upgrade campaigns, driven and read through the admin API."""
+
+        if self._campaign_control is None:
+            raise SmokeConfigurationError("campaign control is only available on the kind backend")
+        if self._campaign_assertions is None:
+            self._campaign_assertions = TemplateCampaignAssertions(
+                self, self._campaign_control, self._context.scope
+            )
+        return self._campaign_assertions
+
+    def sandbox_template_name(self) -> str:
+        """The bare template name (no tag or digest) selected for this scenario."""
+
+        return self.sandbox_template_selector().split("@", 1)[0].split(":", 1)[0]
+
+    def sandbox_template_selector(self) -> str:
+        """The full template selector (including any `:tag` or `@digest`) for this scenario."""
+
+        if not self._template_selector:
+            raise SmokeConfigurationError("the fixture template is unknown")
+        return self._template_selector
+
+
+class KindNetworkEcw(Ecw):
+    """ECW plus live gateway observation on either Kind substrate.
+
+    This fixture observes the node's gateway without Kubernetes sandbox-pod
+    operations or the privileged teardown used by KindEcw.
+    """
+
+    fixture_name: ClassVar[str] = "kind_network_ecw"
+    _network_policy_observer: NetworkPolicyObserver | None = None
+
+    def expect_network_policy_installed(self) -> str:
+        """Require live gateway readiness, not a startup hold that drops traffic."""
+        if self._network_policy_observer is None:
+            raise SmokeConfigurationError("network-policy observation requires kind")
+        deadline = time.monotonic() + 30
+        observations = self._context.evidence.setdefault("installed_network_policy_checks", [])
+        assert isinstance(observations, list)
+        while True:
+            observed = self._network_policy_observer.network_policy_state(self.sandbox.sandbox_id)
+            observations.append(dict(observed))
+            reference = observed.get("installed_policy_ref", "")
+            if (
+                observed.get("state") == "ready"
+                and reference
+                and observed.get("interception_readiness") in {"ready", "not_required"}
+            ):
+                return reference
+            self.verify(
+                time.monotonic() < deadline,
+                "sandbox gateway did not install a ready network policy",
+                installed_network_policy_checks=observations,
+            )
+            self.wait(min(1, max(0, deadline - time.monotonic())))
+
+
+class KindEcw(Ecw, KindAdmin):
+    """[`Ecw`] plus narrow privileged control-plane operations.
+
+    The fixture *type* is the privilege declaration: requesting it makes a
+    scenario kind-only, enforced at service construction — a deployed
+    backend refuses with a configuration error rather than mis-running a
+    white-box scenario against production.
+    """
+
+    fixture_name: ClassVar[str] = "kind_ecw"
+    allow_committed_pause_not_running: ClassVar[bool] = True
 
     _cold_create_observer: ColdCreateObserver | None = None
     _warm_pool_observer: WarmPoolObserver | None = None
@@ -2732,9 +3127,30 @@ class KindEcw(Ecw):
 
     _template_cache_control: TemplateCacheControl | None = None
     _template_cache_assertions: TemplateCacheAssertions | None = None
-    # The template selector the fixture sandbox was created from, recorded by
-    # the service so privileged scenarios can name the pinned build.
-    _template_selector: str | None = None
+
+    def create_gc_sandbox(self) -> KindEcw:
+        """Bind GC assertions to another run-owned sandbox without sharing its state.
+
+        Cold eviction needs a suspended guest, snapshot reaping a live fork
+        source, and template eviction a live template pin. Their eligibility
+        clocks can overlap, but those roles must never share a sandbox or a
+        cached assertion object. Collection creation arms cleanup before the
+        request, including when preparation fails partway through.
+        The child receives only the template selector and these three GC
+        controls; it is not a general clone of the parent's privileged fixture.
+        """
+
+        fixture = KindEcw(
+            self._context,
+            self.sandboxes.create(),
+            self._sandboxes,
+            _sandbox_timeout=self._sandbox_timeout,
+        )
+        fixture._template_selector = self._template_selector
+        fixture._template_cache_control = self._template_cache_control
+        fixture._snapshot_reaper_control = self._snapshot_reaper_control
+        fixture._cold_eviction_control = self._cold_eviction_control
+        return fixture
 
     @property
     def template_cache(self) -> TemplateCacheAssertions:
@@ -2749,13 +3165,6 @@ class KindEcw(Ecw):
                 self, self._template_cache_control, self._context.scope
             )
         return self._template_cache_assertions
-
-    def sandbox_template_name(self) -> str:
-        """The bare template name (no tag or digest) this sandbox runs."""
-
-        if not self._template_selector:
-            raise SmokeConfigurationError("the fixture sandbox template is unknown")
-        return self._template_selector.split("@", 1)[0].split(":", 1)[0]
 
     _snapshot_reaper_control: SnapshotReaperControl | None = None
     _snapshot_reaper_assertions: SnapshotReaperAssertions | None = None
@@ -2878,24 +3287,6 @@ class KindEcw(Ecw):
             raise SmokeConfigurationError("admin org lookup is only available on the kind backend")
         return self._node_group_control.admin_org_id()
 
-    _template_build_control: TemplateBuildControl | None = None
-    _template_builder: TemplateBuilder | None = None
-    _template_build_assertions: TemplateBuildAssertions | None = None
-
-    @property
-    def template_build(self) -> TemplateBuildAssertions:
-        """Privileged assertions for a public template build through the kind builders."""
-
-        if self._template_build_control is None or self._template_builder is None:
-            raise SmokeConfigurationError(
-                "template build control is only available on the kind backend"
-            )
-        if self._template_build_assertions is None:
-            self._template_build_assertions = TemplateBuildAssertions(
-                self, self._template_build_control, self._template_builder, self._context.scope
-            )
-        return self._template_build_assertions
-
     _pending_backup_control: PendingBackupControl | None = None
     _pending_backup_assertions: PendingBackupAssertions | None = None
 
@@ -2912,6 +3303,23 @@ class KindEcw(Ecw):
                 self, self._pending_backup_control, self._context.scope
             )
         return self._pending_backup_assertions
+
+    _retained_only_copy_control: RetainedOnlyCopyControl | None = None
+    _retained_only_copy_assertions: RetainedOnlyCopyAssertions | None = None
+
+    @property
+    def retained_only_copy(self) -> RetainedOnlyCopyAssertions:
+        """Privileged assertions for an interrupted suspend that leaves the only copy."""
+
+        if self._retained_only_copy_control is None:
+            raise SmokeConfigurationError(
+                "retained only-copy control is only available on the kind backend"
+            )
+        if self._retained_only_copy_assertions is None:
+            self._retained_only_copy_assertions = RetainedOnlyCopyAssertions(
+                self, self._retained_only_copy_control, self._context.scope
+            )
+        return self._retained_only_copy_assertions
 
     _teardown_restart_control: TeardownRestartControl | None = None
     _teardown_restart_assertions: TeardownRestartAssertions | None = None
@@ -2964,23 +3372,6 @@ class KindEcw(Ecw):
             )
         return self._unanswered_template_assertions
 
-    _reconcile_queue_gc_control: ReconcileQueueGcControl | None = None
-    _reconcile_queue_gc_assertions: ReconcileQueueGcAssertions | None = None
-
-    @property
-    def reconcile_queue_gc(self) -> ReconcileQueueGcAssertions:
-        """Privileged assertions for the cluster-controller's reconcile-queue GC."""
-
-        if self._reconcile_queue_gc_control is None:
-            raise SmokeConfigurationError(
-                "reconcile-queue GC control is only available on the kind backend"
-            )
-        if self._reconcile_queue_gc_assertions is None:
-            self._reconcile_queue_gc_assertions = ReconcileQueueGcAssertions(
-                self, self._reconcile_queue_gc_control, self._context.scope
-            )
-        return self._reconcile_queue_gc_assertions
-
     _rate_limiter_control: RateLimiterControl | None = None
     _rate_limit_probe: RateLimitProbe | None = None
     _rate_limiter_assertions: RateLimiterAssertions | None = None
@@ -2998,6 +3389,71 @@ class KindEcw(Ecw):
                 self, self._rate_limiter_control, self._rate_limit_probe, self._context.scope
             )
         return self._rate_limiter_assertions
+
+    _execution_environment: ExecutionEnvironmentAdmission | None = None
+
+    @property
+    def execution_environment(self) -> ExecutionEnvironmentAdmission:
+        """The environment setup admitted and built this sandbox's seed in.
+
+        Only for a scenario whose `SandboxConfig.kind_execution_environment`
+        names one; the scenario withdraws it after deleting the sandbox.
+        """
+
+        if self._execution_environment is None:
+            raise SmokeConfigurationError(
+                "this scenario's sandbox config names no kind_execution_environment"
+            )
+        return self._execution_environment
+
+    def bound_seed(self, environment: SelectableEnvironment) -> BoundSeed:
+        """Seed bound to an environment every node already runs (E0), built under no tag.
+
+        Its release is deleted by `delete()`, or in cleanup.
+        """
+
+        control = self._environment_control()
+        return BoundSeed(
+            self,
+            control,
+            self._context.scope,
+            name=environment.name,
+            reference=catalog_reference(self, control, environment),
+            evidence=f"{environment.name}_seed",
+        )
+
+    def node_manager_nodes(self, roles: Collection[str]) -> tuple[str, ...]:
+        """The kube nodes running a node-manager of `roles` (`execution_environment.NODE_ROLES`)."""
+
+        return self._environment_control().node_manager_nodes(roles)
+
+    def nodes_carrying_label(self, key: str, value: str | None = None) -> list[str]:
+        """The kube nodes carrying label `key`, with `value` when one is given."""
+
+        return self._environment_control().nodes_carrying_label(key, value)
+
+    def expect_running_environment(
+        self, sandbox_id: str, environment: SelectableEnvironment, *, step: str
+    ) -> None:
+        """The sandbox's running VM reports `environment`'s Firecracker."""
+
+        expect_runtime(self, self._environment_control(), environment, sandbox_id, step=step)
+
+    _no_free_slot_assertions: NoFreeSlotAssertions | None = None
+
+    @property
+    def no_free_slot(self) -> NoFreeSlotAssertions:
+        """Privileged assertions for the activation limiter's network-slot check."""
+
+        if self._rate_limiter_control is None or self._rate_limit_probe is None:
+            raise SmokeConfigurationError(
+                "slot-check control is only available on the kind backend"
+            )
+        if self._no_free_slot_assertions is None:
+            self._no_free_slot_assertions = NoFreeSlotAssertions(
+                self, self._rate_limiter_control, self._rate_limit_probe, self._context.scope
+            )
+        return self._no_free_slot_assertions
 
     _cross_node_control: CrossNodeRestoreControl | None = None
     _cross_node_assertions: CrossNodeRestoreAssertions | None = None
@@ -3098,57 +3554,6 @@ class KindEcw(Ecw):
             )
         return self._telemetry_assertions
 
-    _leader_election_control: LeaderElectionControl | None = None
-    _leader_election_assertions: LeaderElectionAssertions | None = None
-
-    @property
-    def leader_election(self) -> LeaderElectionAssertions:
-        """Privileged faults and reads for the cluster-controller's leader election."""
-
-        if self._leader_election_control is None:
-            raise SmokeConfigurationError(
-                "leader-election control is only available on the kind backend"
-            )
-        if self._leader_election_assertions is None:
-            self._leader_election_assertions = LeaderElectionAssertions(
-                self, self._leader_election_control, self._context.scope
-            )
-        return self._leader_election_assertions
-
-    _drain_gate_control: DrainGateControl | None = None
-    _drain_gate_assertions: DrainGateAssertions | None = None
-
-    @property
-    def drain_gate(self) -> DrainGateAssertions:
-        """Privileged assertions for the admin `:terminate` occupancy guard."""
-
-        if self._drain_gate_control is None:
-            raise SmokeConfigurationError(
-                "drain gate control is only available on the kind backend"
-            )
-        if self._drain_gate_assertions is None:
-            self._drain_gate_assertions = DrainGateAssertions(
-                self, self._drain_gate_control, self._context.scope
-            )
-        return self._drain_gate_assertions
-
-    _console_control: ConsoleControl | None = None
-    _console_assertions: ConsoleAssertions | None = None
-
-    @property
-    def console(self) -> ConsoleAssertions:
-        """The admin console, driven through a browser and judged against the admin API."""
-
-        if self._console_control is None:
-            raise SmokeConfigurationError(
-                "admin console control is only available on the kind backend"
-            )
-        if self._console_assertions is None:
-            self._console_assertions = ConsoleAssertions(
-                self, self._console_control, self._context.scope
-            )
-        return self._console_assertions
-
     _startup_recovery_control: StartupRecoveryControl | None = None
     _startup_recovery_assertions: StartupRecoveryAssertions | None = None
 
@@ -3218,13 +3623,6 @@ class EncryptedResuspendAssertions:
             },
         )
         return observation
-
-    def clear_completed_pods(self) -> tuple[str, ...]:
-        cleared = self._control.clear_completed_sandbox_pods(
-            self._sandbox_id
-        )
-        self._fixture.record("force_cleared_completed_pods", list(cleared))
-        return cleared
 
     def expect_base_reused(
         self,
@@ -3367,7 +3765,7 @@ class TemplateCacheAssertions:
         digests = self._control.template_digest_dirs(node_name, template)
         selector = self._fixture._template_selector
         if not selector:
-            raise SmokeConfigurationError("the fixture sandbox template is unknown")
+            raise SmokeConfigurationError("the fixture template is unknown")
         protected = self._control.protected_template_builds(
             node_name, self._fixture.sandbox.sandbox_id, selector
         )
@@ -3379,6 +3777,26 @@ class TemplateCacheAssertions:
             cached_digests=list(digests),
         )
         return protected
+
+    def over_budget_plant_bytes(
+        self, node_name: str, protected: str, digests: tuple[str, ...]
+    ) -> int:
+        """Fill only the deficit above bytes the live sandbox and seed pin keep.
+
+        Count rootfs allocation alone, a lower bound on the GC's full build
+        footprint. The compressed sibling and unprotected builds are extra
+        headroom, so their deletion cannot invalidate the pressure witness.
+        """
+        if self._config is None:
+            raise SmokeConfigurationError("require_smoke_sized_gc must run before sizing the plant")
+        protected_bytes = sum(
+            self._control.template_rootfs_allocated_bytes(node_name, protected, digest)
+            for digest in digests
+        )
+        size = max(4 * 1024**2, self._config.budget_bytes - protected_bytes + 1024**2)
+        self._fixture.record("protected_rootfs_allocated_bytes", protected_bytes)
+        self._fixture.record("lru_plant_bytes", size)
+        return size
 
     def plant_unpinned_build(self, node_name: str, *, size_bytes: int) -> str:
         """Register a throwaway build on the worker; returns its template name.
@@ -3863,16 +4281,6 @@ class SuspendCodecAssertions:
             entries=entries,
         )
         return entries
-
-    def require_btrfs_send_default(self, node_name: str) -> str:
-        """The worker resolves an omitted suspend format to the stream codec, or refuse.
-
-        Require `suspendDefaultFormat: btrfs-send`; otherwise the bench would
-        exercise Full and provide no stream-codec evidence. Read the running
-        pod, not the chart, and report a mismatch as a configuration error.
-        """
-
-        return "btrfs-send"
 
     def expect_suspend_codec(
         self, codec: str = BTRFS_SEND_V1, *, timeout: float = 300
@@ -4548,8 +4956,11 @@ class StartupRecoveryAssertions:
     def tamper(self, planted: PlantedBuild) -> None:
         """No row, and the bootable artifact's bytes changed under an unchanged size."""
 
-        self.orphan(planted)
+        # Keep the catalog row until corruption is complete. Exposing valid
+        # row-less bytes first lets background recovery register them before
+        # the later corruption, which defeats this fixture's precondition.
         self._control.corrupt_template_rootfs(self._current_node(), planted.name, planted.digest)
+        self.orphan(planted)
 
     def drift(self, planted: PlantedBuild, *, bytes_removed: int = 4096) -> None:
         """Row kept, but the artifact on disk is shorter than the manifest declares."""

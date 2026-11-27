@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::str::FromStr;
 
-use pplx_space_job_id::uuid_id;
+use pplx_space_uuid_id::uuid_id;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -41,9 +41,9 @@ impl AuthParseError {
 }
 
 /// Error returned when an auth/account UUID cannot be parsed. Defined in
-/// `pplx-space-job-id` beside the `uuid_id!` macro, so the job ID and every
+/// `pplx-space-uuid-id` beside the `uuid_id!` macro, so the job ID and every
 /// identifier here share one parse error.
-pub use pplx_space_job_id::AuthIdParseError;
+pub use pplx_space_uuid_id::AuthIdParseError;
 
 /// The owner principal stored on a sandbox-manager sandbox row.
 ///

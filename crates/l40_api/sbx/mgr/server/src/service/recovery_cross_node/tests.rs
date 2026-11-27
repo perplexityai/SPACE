@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{LocalArtifactId, SandboxId, SnapshotId};
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 
 use super::*;
 use crate::service::tests::service_tests::service_with_runtime_probe;
@@ -166,7 +167,7 @@ fn canonical_conflict_failure_does_not_change_transfer_scope() {
         [sandbox_id.to_string()],
     )
     .unwrap();
-    let scope = pplx_space_common_core::types::TransferScopeId::new();
+    let scope = pplx_space_snapshot_model::TransferScopeId::new();
     assert!(
         crate::db::insert_restore_transfer_scope(
             &conn,
@@ -223,17 +224,17 @@ async fn exchanged_restore_cleanup_failure_retains_scope_until_retry() {
         [&sandbox_id],
     )
     .unwrap();
-    let generation = pplx_space_common_core::types::ExecutionGeneration::new(7).unwrap();
-    let attempt_a = pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
+    let generation = pplx_space_sandbox_model::ExecutionGeneration::new(7).unwrap();
+    let attempt_a = pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
         uuid::Uuid::parse_str("019c0000-0000-7000-8000-000000000001").unwrap(),
     );
-    let attempt_b = pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
+    let attempt_b = pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
         uuid::Uuid::parse_str("019c0000-0000-7000-8000-000000000002").unwrap(),
     );
-    let attempt_c = pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
+    let attempt_c = pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
         uuid::Uuid::parse_str("019c0000-0000-7000-8000-000000000003").unwrap(),
     );
-    let transfer_scope_id = pplx_space_common_core::types::TransferScopeId::new();
+    let transfer_scope_id = pplx_space_snapshot_model::TransferScopeId::new();
     assert!(
         crate::db::insert_restore_transfer_scope(
             &conn,
@@ -340,7 +341,7 @@ async fn exchanged_restore_cleanup_failure_retains_scope_until_retry() {
 
 fn restore_artifact_as_new_context(
     artifact_snapshot_id: SnapshotId,
-    artifact_kind: pplx_space_common_core::types::ArtifactKind,
+    artifact_kind: pplx_space_snapshot_model::ArtifactKind,
 ) -> RestoreArtifactAsNewContext {
     RestoreArtifactAsNewContext {
         source_sandbox_id: SandboxId::new(),
@@ -404,7 +405,7 @@ fn interrupted_restore_as_new_publishes_metadata_and_finalizes_as_stopped() {
         .unwrap(),
         SandboxState::Stopped.as_str(),
     );
-    let published: pplx_space_common_core::types::SandboxArtifactMetadata = serde_json::from_slice(
+    let published: pplx_space_artifact_model::SandboxArtifactMetadata = serde_json::from_slice(
         &std::fs::read(sandbox_dir.path().join("metadata.json"))
             .expect("restore-as-new recovery must publish sandbox metadata"),
     )
@@ -414,14 +415,14 @@ fn interrupted_restore_as_new_publishes_metadata_and_finalizes_as_stopped() {
 
 fn disk_artifact_meta() -> (
     crate::snapshot_upload::SnapshotMeta,
-    pplx_space_common_core::types::SnapshotName,
+    pplx_space_snapshot_model::SnapshotName,
 ) {
-    let capture_name: pplx_space_common_core::types::SnapshotName =
+    let capture_name: pplx_space_snapshot_model::SnapshotName =
         "d-operation-019f8000-0000-7000-8000-000000000006"
             .parse()
             .unwrap();
-    let execution = pplx_space_common_core::types::SnapshotExecutionMetadata::new(
-        pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+    let execution = pplx_space_execution_spec::SnapshotExecutionMetadata::new(
+        pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
             std::env::consts::ARCH.parse().unwrap(),
             vec![],
         ),
@@ -436,7 +437,7 @@ fn disk_artifact_meta() -> (
             rootfs_size_bytes: None,
             created_at: "2026-07-31T00:00:00Z".to_string(),
             source: crate::snapshot_upload::SnapshotSource {
-                runtime: pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS.to_string(),
+                runtime: pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS.to_string(),
                 runtime_version: None,
                 state_format_version: None,
                 template_id: "seed".to_string(),
@@ -452,15 +453,15 @@ fn disk_artifact_meta() -> (
                 owner: "user:019f8000-0000-7000-8000-000000000003".to_string(),
                 snapshots_enabled: true,
                 process_env: std::collections::BTreeMap::new(),
-                auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+                auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
             }),
             rootfs_diff_format: None,
             rootfs_send_source_id: None,
             encrypted: false,
             rootfs_encryption_source: None,
             local_artifact_id: Some(LocalArtifactId::new()),
-            artifact_kind: Some(pplx_space_common_core::types::ArtifactKind::Disk),
-            artifact_origin: Some(pplx_space_common_core::types::ArtifactOrigin::Snapshot),
+            artifact_kind: Some(pplx_space_snapshot_model::ArtifactKind::Disk),
+            artifact_origin: Some(pplx_space_snapshot_model::ArtifactOrigin::Snapshot),
             artifact_snapshot_name: Some(capture_name.clone()),
         },
         capture_name,
@@ -471,7 +472,7 @@ fn disk_artifact_meta() -> (
 /// resident, and the only artifact shape a stopped materialization may pin.
 fn evacuated_stop_disk_meta() -> crate::snapshot_upload::SnapshotMeta {
     let (mut meta, _) = disk_artifact_meta();
-    meta.artifact_origin = Some(pplx_space_common_core::types::ArtifactOrigin::Stop);
+    meta.artifact_origin = Some(pplx_space_snapshot_model::ArtifactOrigin::Stop);
     meta.artifact_snapshot_name = None;
     meta
 }
@@ -513,7 +514,7 @@ fn a_stop_origin_disk_artifact_is_the_pin_a_stopped_materialization_takes() {
 /// a legacy sidecar from before typed artifacts existed.
 #[test]
 fn a_stopped_materialization_refuses_every_artifact_that_is_not_its_own_disk() {
-    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin};
+    use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin};
 
     type MetaMutation = Box<dyn Fn(&mut crate::snapshot_upload::SnapshotMeta)>;
     let cases: Vec<(&str, MetaMutation)> = vec![
@@ -589,7 +590,7 @@ fn a_stopped_materialization_refuses_every_artifact_that_is_not_its_own_disk() {
 fn the_stopped_pin_refuses_an_unexpected_artifact() {
     let meta = evacuated_stop_disk_meta();
     let staged = meta.local_artifact_id.unwrap();
-    let asked_for = pplx_space_common_core::types::LocalArtifactId::new();
+    let asked_for = pplx_space_snapshot_model::LocalArtifactId::new();
 
     let error = stopped_materialization_pin(&meta, asked_for)
         .expect_err("a sidecar naming a different artifact must not be pinned");
@@ -618,7 +619,7 @@ fn an_unexpected_artifact_leaves_the_row_alone() {
         &conn,
         &sandbox_id,
         &meta,
-        pplx_space_common_core::types::LocalArtifactId::new(),
+        pplx_space_snapshot_model::LocalArtifactId::new(),
     )
     .expect_err("a mismatch must not publish");
 
@@ -680,7 +681,7 @@ fn materializing_a_stopped_sandbox_lands_stopped_with_its_pin() {
         .expect("the pin names a local artifact row");
     assert_eq!(
         row.local_path,
-        pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
+        pplx_space_host_layout::paths::sandbox_snapshot_dir(
             &sandbox_id,
             &format!("d-stop-{}", meta.local_artifact_id.unwrap()),
         ),
@@ -858,10 +859,8 @@ fn quarantine_recovery_requires_matching_artifact_identity_shape() {
 #[test]
 fn restore_artifact_as_new_context_requires_the_exact_snapshot_uri() {
     let snapshot_id = SnapshotId::new();
-    let context = restore_artifact_as_new_context(
-        snapshot_id,
-        pplx_space_common_core::types::ArtifactKind::Disk,
-    );
+    let context =
+        restore_artifact_as_new_context(snapshot_id, pplx_space_snapshot_model::ArtifactKind::Disk);
     let matching_uri = format!(
         "s3://space-test/suspend_snapshots/00/{}/{snapshot_id}?region=us-east-1",
         context.source_sandbox_id
@@ -903,7 +902,7 @@ fn full_artifact_restore_as_new_is_reserved_but_not_routed_through_disk_restore(
     let (meta, _) = disk_artifact_meta();
     let context = restore_artifact_as_new_context(
         SnapshotId::new(),
-        pplx_space_common_core::types::ArtifactKind::Full,
+        pplx_space_snapshot_model::ArtifactKind::Full,
     );
     let error = validate_artifact_restore_as_new(&meta, &context, &context.source_sandbox_id)
         .expect_err("full restore semantics are not implemented in the disk PR");
@@ -938,7 +937,7 @@ fn restore_artifact_as_new_rebind_clears_source_snapshot_identity() {
     assert_eq!(meta.local_artifact_id, None);
     assert_eq!(
         meta.artifact_origin,
-        Some(pplx_space_common_core::types::ArtifactOrigin::Snapshot)
+        Some(pplx_space_snapshot_model::ArtifactOrigin::Snapshot)
     );
     assert_eq!(meta.artifact_snapshot_name, None);
     assert_eq!(
@@ -977,7 +976,7 @@ fn restore_artifact_as_new_accepts_only_bound_disk_artifacts() {
     let (mut meta, _) = disk_artifact_meta();
     let mut context = restore_artifact_as_new_context(
         SnapshotId::new(),
-        pplx_space_common_core::types::ArtifactKind::Disk,
+        pplx_space_snapshot_model::ArtifactKind::Disk,
     );
     context.source_sandbox_id = meta.sandbox_id.parse().unwrap();
     validate_artifact_restore_as_new(&meta, &context, &context.source_sandbox_id)
@@ -993,18 +992,18 @@ fn restore_artifact_as_new_accepts_only_bound_disk_artifacts() {
         .expect_err("encrypted disk must not select a plaintext target");
     meta.encrypted = false;
 
-    meta.artifact_kind = Some(pplx_space_common_core::types::ArtifactKind::Full);
+    meta.artifact_kind = Some(pplx_space_snapshot_model::ArtifactKind::Full);
     let error = validate_artifact_restore_as_new(&meta, &context, &context.source_sandbox_id)
         .expect_err("full checkpoint must not enter the disk-only restore path");
     assert!(error.to_string().contains("does not match requested disk"));
 
-    meta.artifact_kind = Some(pplx_space_common_core::types::ArtifactKind::Disk);
-    meta.artifact_origin = Some(pplx_space_common_core::types::ArtifactOrigin::Suspend);
+    meta.artifact_kind = Some(pplx_space_snapshot_model::ArtifactKind::Disk);
+    meta.artifact_origin = Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend);
     let error = validate_artifact_restore_as_new(&meta, &context, &context.source_sandbox_id)
         .expect_err("suspend checkpoints are not disk-only fork artifacts");
     assert!(error.to_string().contains("snapshot or fork disk artifact"));
 
-    meta.artifact_origin = Some(pplx_space_common_core::types::ArtifactOrigin::Fork);
+    meta.artifact_origin = Some(pplx_space_snapshot_model::ArtifactOrigin::Fork);
     meta.sandbox_id = SandboxId::new().to_string();
     let error = validate_artifact_restore_as_new(&meta, &context, &context.source_sandbox_id)
         .expect_err("projected fork identity must stay bound to the target");
@@ -1019,10 +1018,10 @@ fn projected_fork_metadata_is_validated_against_the_target_identity() {
     let (mut meta, _) = disk_artifact_meta();
     let context = restore_artifact_as_new_context(
         SnapshotId::new(),
-        pplx_space_common_core::types::ArtifactKind::Disk,
+        pplx_space_snapshot_model::ArtifactKind::Disk,
     );
     let target_sandbox_id = SandboxId::new();
-    meta.artifact_origin = Some(pplx_space_common_core::types::ArtifactOrigin::Fork);
+    meta.artifact_origin = Some(pplx_space_snapshot_model::ArtifactOrigin::Fork);
     meta.sandbox_id = target_sandbox_id.to_string();
 
     validate_artifact_restore_as_new(&meta, &context, &target_sandbox_id)
@@ -1032,7 +1031,7 @@ fn projected_fork_metadata_is_validated_against_the_target_identity() {
 #[test]
 fn restore_artifact_as_new_keeps_unnamed_fork_metadata_for_child_publication() {
     let (mut meta, _) = disk_artifact_meta();
-    meta.artifact_origin = Some(pplx_space_common_core::types::ArtifactOrigin::Fork);
+    meta.artifact_origin = Some(pplx_space_snapshot_model::ArtifactOrigin::Fork);
     meta.artifact_snapshot_name = None;
     let target = "019f8000-0000-7000-8000-000000000004";
 
@@ -1045,7 +1044,7 @@ fn restore_artifact_as_new_keeps_unnamed_fork_metadata_for_child_publication() {
 
     assert_eq!(
         meta.artifact_origin,
-        Some(pplx_space_common_core::types::ArtifactOrigin::Fork)
+        Some(pplx_space_snapshot_model::ArtifactOrigin::Fork)
     );
     assert_eq!(meta.artifact_snapshot_name, None);
 }
@@ -1069,7 +1068,7 @@ fn restore_artifact_as_new_publishes_execution_metadata_for_cold_start() {
     .unwrap();
     publish_rebound_sandbox_artifact_metadata(&meta, temp.path()).unwrap();
 
-    let published: pplx_space_common_core::types::SandboxArtifactMetadata =
+    let published: pplx_space_artifact_model::SandboxArtifactMetadata =
         serde_json::from_slice(&std::fs::read(temp.path().join("metadata.json")).unwrap()).unwrap();
     assert_eq!(
         published.sandbox_id.to_string(),
@@ -1348,7 +1347,7 @@ async fn claimed_operation_gives_up_after_repeated_renewal_failures() {
 fn a_superseded_recovery_claim_leaves_no_adopted_row() {
     let conn = crate::db::test_conn();
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let sandbox_id =
         crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
     let candidate = crate::db::scan_quarantine_recovery_candidates(&conn)
@@ -1387,16 +1386,16 @@ fn a_superseded_recovery_claim_leaves_no_adopted_row() {
     let orphan_id = SandboxId::new();
     let (mut meta, _) = disk_artifact_meta();
     meta.sandbox_id = orphan_id.to_string();
-    let restore_source = pplx_space_common_core::types::ExactStorageUri::parse(
+    let restore_source = pplx_space_artifact_model::ExactStorageUri::parse(
         "s3://bucket/snapshots/orphan/vmstate?region=us-east-1",
     )
     .expect("the fixture URI should parse");
     let plan = crate::snapshot_restore::QuarantineRecoveryPlan {
-        recovery_id: pplx_space_common_core::types::SandboxCleanupEpisodeId::new(),
+        recovery_id: pplx_space_sandbox_model::SandboxCleanupEpisodeId::new(),
         snapshot_id: SnapshotId::new(),
         storage_uri: "s3://bucket/snapshots/orphan/vmstate?region=us-east-1".to_string(),
         local_artifact_id: None,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration::new(7).unwrap(),
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration::new(7).unwrap(),
         reason_code,
     };
     let recovery = super::QuarantineRecoveryContext {
@@ -1446,7 +1445,7 @@ fn an_adoption_inside_the_claim_transaction_commits_the_row() {
     let orphan_id = SandboxId::new();
     let (mut meta, _) = disk_artifact_meta();
     meta.sandbox_id = orphan_id.to_string();
-    let restore_source = pplx_space_common_core::types::ExactStorageUri::parse(
+    let restore_source = pplx_space_artifact_model::ExactStorageUri::parse(
         "s3://bucket/snapshots/orphan/vmstate?region=us-east-1",
     )
     .expect("the fixture URI should parse");
@@ -1490,8 +1489,8 @@ fn an_adoption_inside_the_claim_transaction_commits_the_row() {
 fn an_ordinary_cross_node_retry_takes_no_write_lock() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sbxmgr.db");
-    let mut conn = crate::db::Connection::open_at(&path).unwrap();
-    crate::db::create_test_schema(&mut conn);
+    crate::db::create_test_schema_on_disk(&path);
+    let conn = crate::db::Connection::open_at(&path).unwrap();
     conn.busy_timeout(std::time::Duration::ZERO).unwrap();
 
     let blocker = crate::db::Connection::open_at(&path).unwrap();
@@ -1501,7 +1500,7 @@ fn an_ordinary_cross_node_retry_takes_no_write_lock() {
     let sandbox_id = SandboxId::new();
     let (mut meta, _) = disk_artifact_meta();
     meta.sandbox_id = sandbox_id.to_string();
-    let restore_source = pplx_space_common_core::types::ExactStorageUri::parse(
+    let restore_source = pplx_space_artifact_model::ExactStorageUri::parse(
         "s3://bucket/snapshots/orphan/vmstate?region=us-east-1",
     )
     .expect("the fixture URI should parse");
@@ -1531,7 +1530,7 @@ fn an_ordinary_cross_node_retry_takes_no_write_lock() {
 fn a_sandbox_that_left_an_activatable_state_is_refused_before_adoption() {
     let conn = crate::db::test_conn();
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let sandbox_id =
         crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
     let candidate = crate::db::scan_quarantine_recovery_candidates(&conn)
@@ -1557,16 +1556,16 @@ fn a_sandbox_that_left_an_activatable_state_is_refused_before_adoption() {
 
     let (mut meta, _) = disk_artifact_meta();
     meta.sandbox_id = sandbox_id.to_string();
-    let restore_source = pplx_space_common_core::types::ExactStorageUri::parse(
+    let restore_source = pplx_space_artifact_model::ExactStorageUri::parse(
         "s3://bucket/snapshots/orphan/vmstate?region=us-east-1",
     )
     .expect("the fixture URI should parse");
     let plan = crate::snapshot_restore::QuarantineRecoveryPlan {
-        recovery_id: pplx_space_common_core::types::SandboxCleanupEpisodeId::new(),
+        recovery_id: pplx_space_sandbox_model::SandboxCleanupEpisodeId::new(),
         snapshot_id: SnapshotId::new(),
         storage_uri: "s3://bucket/snapshots/orphan/vmstate?region=us-east-1".to_string(),
         local_artifact_id: None,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration::new(7).unwrap(),
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration::new(7).unwrap(),
         reason_code,
     };
     let recovery = super::QuarantineRecoveryContext {
@@ -1800,15 +1799,15 @@ fn the_only_unfenced_staging_failure_write_is_the_no_claim_arm() {
 // the host either.
 // ---------------------------------------------------------------------------
 
-fn attempt(sequence: u8) -> pplx_space_common_core::types::SandboxActivationAttemptId {
-    pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
+fn attempt(sequence: u8) -> pplx_space_sandbox_model::SandboxActivationAttemptId {
+    pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
         uuid::Uuid::parse_str(&format!("019c0000-0000-7000-8000-0000000000{sequence:02x}"))
             .unwrap(),
     )
 }
 
-fn generation(value: i64) -> pplx_space_common_core::types::ExecutionGeneration {
-    pplx_space_common_core::types::ExecutionGeneration::new(value).unwrap()
+fn generation(value: i64) -> pplx_space_sandbox_model::ExecutionGeneration {
+    pplx_space_sandbox_model::ExecutionGeneration::new(value).unwrap()
 }
 
 /// A staging path that `remote_restore_metadata_staging_dir` never produces, so
@@ -2019,7 +2018,7 @@ async fn cross_node_restore_declines_an_existing_row_that_is_not_an_interrupted_
             crate::db::insert_restore_transfer_scope(
                 &conn,
                 &sandbox_id,
-                pplx_space_common_core::types::TransferScopeId::new(),
+                pplx_space_snapshot_model::TransferScopeId::new(),
                 Some(generation(7)),
                 Some(attempt(2)),
                 UNOWNED_STAGING_DIR,
@@ -2122,7 +2121,7 @@ async fn retryable_scope_takeover_requires_a_current_or_newer_attempt() {
     for (name, (incoming_generation, incoming_attempt), taken_over) in cases {
         let conn = crate::db::test_conn();
         let (sandbox_id, _) = insert_interrupted_remote_restore(&conn);
-        let scope_id = pplx_space_common_core::types::TransferScopeId::new();
+        let scope_id = pplx_space_snapshot_model::TransferScopeId::new();
         assert!(
             crate::db::insert_restore_transfer_scope(
                 &conn,
@@ -2187,7 +2186,7 @@ async fn retryable_scope_takeover_requires_a_current_or_newer_attempt() {
 async fn retryable_scope_takeover_refuses_a_row_that_gained_runtime_state() {
     let conn = crate::db::test_conn();
     let (sandbox_id, _) = insert_interrupted_remote_restore(&conn);
-    let scope_id = pplx_space_common_core::types::TransferScopeId::new();
+    let scope_id = pplx_space_snapshot_model::TransferScopeId::new();
     assert!(
         crate::db::insert_restore_transfer_scope(
             &conn,
@@ -2240,7 +2239,7 @@ async fn retryable_scope_takeover_refuses_a_row_that_gained_runtime_state() {
 async fn rowless_restore_keeps_a_superseded_scope_it_cannot_retire() {
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new().to_string();
-    let scope_id = pplx_space_common_core::types::TransferScopeId::new();
+    let scope_id = pplx_space_snapshot_model::TransferScopeId::new();
     assert!(
         crate::db::insert_restore_transfer_scope(
             &conn,
@@ -2287,7 +2286,7 @@ fn claim_orphan_episode(
 ) -> (SandboxId, crate::db::ClaimedQuarantineRecoveryCandidate) {
     let sandbox_id = crate::db::test_fixtures::setup_quarantine_recovery_episode(
         conn,
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing,
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing,
     );
     let candidate = crate::db::scan_quarantine_recovery_candidates(conn)
         .unwrap()
@@ -2306,10 +2305,10 @@ fn claim_orphan_episode(
 }
 
 fn orphan_plan(
-    reason_code: pplx_space_common_core::types::SandboxQuarantineReasonCode,
+    reason_code: pplx_space_sandbox_model::SandboxQuarantineReasonCode,
 ) -> crate::snapshot_restore::QuarantineRecoveryPlan {
     crate::snapshot_restore::QuarantineRecoveryPlan {
-        recovery_id: pplx_space_common_core::types::SandboxCleanupEpisodeId::new(),
+        recovery_id: pplx_space_sandbox_model::SandboxCleanupEpisodeId::new(),
         snapshot_id: SnapshotId::new(),
         storage_uri: "s3://bucket/snapshots/orphan/vmstate?region=us-east-1".to_string(),
         local_artifact_id: None,
@@ -2319,8 +2318,8 @@ fn orphan_plan(
 }
 
 /// Fails to compile when a reason code is added, until the sweep below lists it.
-fn _all_reasons_listed(reason: pplx_space_common_core::types::SandboxQuarantineReasonCode) {
-    use pplx_space_common_core::types::SandboxQuarantineReasonCode as Reason;
+fn _all_reasons_listed(reason: pplx_space_sandbox_model::SandboxQuarantineReasonCode) {
+    use pplx_space_sandbox_model::SandboxQuarantineReasonCode as Reason;
     match reason {
         Reason::Unspecified
         | Reason::RuntimeProbeInconsistent
@@ -2361,7 +2360,7 @@ fn _all_reasons_listed(reason: pplx_space_common_core::types::SandboxQuarantineR
 /// refusal before probing the canonical cache root.
 #[tokio::test]
 async fn orphan_restore_declines_a_plan_for_a_different_quarantine_reason() {
-    use pplx_space_common_core::types::SandboxQuarantineReasonCode as Reason;
+    use pplx_space_sandbox_model::SandboxQuarantineReasonCode as Reason;
     // Written out because the enum has no `all()`; `_all_reasons_listed` keeps
     // the list complete. `OrphanedSandboxRowMissing` is excluded because it is the
     // plan reason that proceeds.
@@ -2447,7 +2446,7 @@ async fn orphan_restore_declines_a_row_that_now_holds_a_local_artifact() {
         .run_quarantined_orphan_restore(
             &claimed,
             &orphan_plan(
-                pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing,
+                pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing,
             ),
         )
         .await

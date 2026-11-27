@@ -45,6 +45,22 @@ fn backing_size_floors_at_btrfs_minimum() {
     // A large request gets headroom on top.
     let big = 4 * 1024 * 1024 * 1024;
     assert_eq!(volume_backing_size_bytes(big), big + VOLUME_HEADROOM_BYTES);
+    // A size that is only 512-byte aligned rounds up to a whole 4 KiB block.
+    let unaligned = 256 * 1024 * 1024 + 512;
+    assert_eq!(
+        volume_backing_size_bytes(unaligned),
+        unaligned + VOLUME_HEADROOM_BYTES - 512 + 4096
+    );
+}
+
+#[test]
+fn only_whole_4k_backings_use_direct_io() {
+    assert!(backing_supports_direct_io(volume_backing_size_bytes(1)));
+    assert!(backing_supports_direct_io(volume_backing_size_bytes(
+        256 * 1024 * 1024 + 512
+    )));
+    // An older backing with a partial trailing block stays buffered.
+    assert!(!backing_supports_direct_io(335_544_832));
 }
 
 /// Fix 1: the unwind enumerates the device's mountpoints from mountinfo —
@@ -785,4 +801,87 @@ fn only_writable_leaks_over_the_current_backing_keep_a_volume_unsealed() {
         ]),
         ["held", "unprobed"]
     );
+}
+
+/// A snapshot volume's loop device runs direct I/O with 4 KiB blocks, for
+/// fast cold faults. That survives a reopen of the same backing, and the data
+/// round-trips.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires root, loop/dm-crypt and an explicitly supplied disposable btrfs fixture directory"]
+async fn snapshot_volume_uses_direct_io() {
+    use std::os::unix::fs::MetadataExt;
+
+    // CI includes ignored tests; host mutation still requires explicit opt-in.
+    let Some(root) = std::env::var_os("SPACE_NODEMGR_TEST_BTRFS_DIR") else {
+        eprintln!("not opted in: set SPACE_NODEMGR_TEST_BTRFS_DIR to a disposable btrfs directory");
+        return;
+    };
+    assert!(nix::unistd::geteuid().is_root());
+    let temp = tempfile::tempdir_in(root).unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let sandbox_id = SandboxId::new();
+    let mapper = mapper_name(&sandbox_id, "snapshot");
+    let backing_path = root.join("snapshot.luks");
+    let mount_dir = root.join("snapshot-vol");
+    let dek = zeroize::Zeroizing::new(vec![42; 32]);
+    let params = |fresh| PrepareParams {
+        sandbox_id,
+        volume_name: "snapshot".to_string(),
+        backing_path: backing_path.clone(),
+        restore_source: None,
+        mount_dir: mount_dir.clone(),
+        size_bytes: 64 * 1024 * 1024,
+        dek: &dek,
+        fresh,
+    };
+    let stack = || {
+        let rdev = std::fs::metadata(format!("/dev/mapper/{mapper}"))
+            .unwrap()
+            .rdev();
+        let dm = format!("/sys/dev/block/{}:{}", libc::major(rdev), libc::minor(rdev));
+        let slaves: Vec<_> = std::fs::read_dir(format!("{dm}/slaves"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(slaves.len(), 1, "{slaves:?}");
+        let loop_dev = std::path::Path::new("/sys/block").join(&slaves[0]);
+        let read =
+            |path: std::path::PathBuf| std::fs::read_to_string(path).unwrap().trim().to_string();
+        (
+            read(loop_dev.join("loop/dio")),
+            read(loop_dev.join("queue/logical_block_size")),
+        )
+    };
+    let expected = ("1".to_string(), "4096".to_string());
+
+    let memory = mount_dir.join("memory");
+    let payload: Vec<u8> = (0..4 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    // Checks run under catch_unwind so a failed assertion still releases
+    // the mounted volume before the test panics; `temp` outlives release.
+    let checked = |check: &dyn Fn()| std::panic::catch_unwind(std::panic::AssertUnwindSafe(check));
+
+    prepare(params(true)).await.unwrap();
+    let first = checked(&|| {
+        assert_eq!(stack(), expected);
+        std::fs::write(&memory, &payload).unwrap();
+    });
+    release(&sandbox_id, "snapshot", &backing_path, &mount_dir)
+        .await
+        .unwrap();
+    if let Err(panic) = first {
+        std::panic::resume_unwind(panic);
+    }
+
+    prepare(params(false)).await.unwrap();
+    let second = checked(&|| {
+        assert_eq!(stack(), expected);
+        assert_eq!(std::fs::read(&memory).unwrap(), payload);
+    });
+    release(&sandbox_id, "snapshot", &backing_path, &mount_dir)
+        .await
+        .unwrap();
+    if let Err(panic) = second {
+        std::panic::resume_unwind(panic);
+    }
 }

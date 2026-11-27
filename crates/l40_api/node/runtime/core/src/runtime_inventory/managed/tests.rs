@@ -187,7 +187,7 @@ fn managed_e0_survives_cache_loss_without_selecting_other_installs() {
         std::os::unix::fs::symlink("custom", cache.join("kernels").join(alias)).unwrap();
     }
     let inventory = discover().unwrap();
-    let legacy = pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+    let legacy = pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
         selected.execution.guest().architecture,
         Vec::new(),
     );
@@ -229,7 +229,7 @@ fn managed_e0_survives_cache_loss_without_selecting_other_installs() {
     let mut component = selected.components[0].metadata.clone();
     component.version = Some("custom".parse().unwrap());
     component.digest = Some(sha256(&binary(99)));
-    let explicit = pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+    let explicit = pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
         selected.execution.guest().architecture,
         vec![component],
     );

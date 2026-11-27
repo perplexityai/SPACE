@@ -46,12 +46,19 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlsplit
 
 from space_smoke.capabilities import ConsoleControl
+from space_smoke.execution_environment import (
+    E1,
+    SEED_BUILD_TERMINAL_STATES,
+    catalog_reference,
+    latest_tags,
+    unpromoted_seed_releases,
+)
 from space_smoke.runtime import ResourceScope, SmokeConfigurationError
 
 if TYPE_CHECKING:
     from playwright.sync_api import Browser, Locator, Page
 
-    from space_smoke.fixtures import KindEcw
+    from space_smoke.fixtures import KindAdmin
 
 BROWSER_CHROMIUM = "chromium"
 BROWSERS = frozenset({BROWSER_CHROMIUM})
@@ -258,7 +265,7 @@ class ConsoleSession:
 class ConsoleAssertions:
     """Drive the admin console and judge it against the admin API."""
 
-    def __init__(self, fixture: KindEcw, control: ConsoleControl, scope: ResourceScope) -> None:
+    def __init__(self, fixture: KindAdmin, control: ConsoleControl, scope: ResourceScope) -> None:
         self._fixture = fixture
         self._control = control
         self._scope = scope
@@ -414,20 +421,10 @@ class ConsoleAssertions:
 
     def build_seed_with_qualified_pair(self, session: ConsoleSession) -> None:
         """A real UI request builds a digest, does not promote it, and boots it."""
-        catalog = self._api("GET", "/admin/api/v1/system-template-environments")["environments"]
-        candidates = [
-            entry for entry in catalog
-            if entry["runtime"] == "firecracker" and entry["runtime_version"] == "1.17.0"
-            and entry["kernel_version"] == "6.1.155" and entry["architecture"] == "x86_64"
-        ]
-        self._fixture.verify(len(candidates) == 1, "the server catalog must qualify the tested pair", candidates=candidates)
-        selected = candidates[0]
+        environment = catalog_reference(self._fixture, self._control, E1)
         releases_before = self._api("GET", "/admin/api/v1/template-releases")
         prior_ids = {entry["id"] for entry in releases_before}
-        latest_before = {
-            entry["template_name"]: entry["content_hash"]
-            for entry in releases_before if "latest" in entry.get("tags", [])
-        }
+        latest_before = latest_tags(releases_before)
         page = session.page
         session.open("/dashboard/templates?tab=system")
         page.get_by_role("button", name="Build seed", exact=True).click()
@@ -448,7 +445,7 @@ class ConsoleAssertions:
         response = started.value
         submitted = response.request.post_data_json
         self._fixture.verify(
-            response.status == 202 and submitted.get("environment") == selected["environment"]
+            response.status == 202 and submitted.get("environment") == environment
             and submitted.get("publish_tags") == [],
             "the UI must submit the selected pair without promotion",
             status=response.status, submitted=submitted,
@@ -462,17 +459,13 @@ class ConsoleAssertions:
         status: dict[str, Any] = {}
         while time.monotonic() < deadline:
             status = self._api("GET", f"/admin/api/v1/templates/seed/builds/{job_id}")
-            if status["state"] in {"succeeded", "failed", "publish_failed"}:
+            if status["state"] in SEED_BUILD_TERMINAL_STATES:
                 break
             self._wait(2)
         self._fixture.verify(status.get("state") == "succeeded", "the selected seed build must succeed", build=status)
-        self._fixture.record("seed_build", {**status, "environment": selected["environment"]})
+        self._fixture.record("seed_build", {**status, "environment": environment})
         releases = self._api("GET", "/admin/api/v1/template-releases")
-        latest_after = {
-            entry["template_name"]: entry["content_hash"]
-            for entry in releases if "latest" in entry.get("tags", [])
-        }
-        self._fixture.verify(latest_after == latest_before, "building must leave every latest tag unchanged")
+        self._fixture.verify(latest_tags(releases) == latest_before, "building must leave every latest tag unchanged")
         with page.expect_response(
             lambda answer: answer.request.method == "POST" and answer.url.endswith("/sandboxes"),
             timeout=90_000,
@@ -490,7 +483,7 @@ class ConsoleAssertions:
                              "the boot test must pin the newly built seed digest")
         runtime_version = self._control.console_runtime_version(sandbox_id)
         self._fixture.verify(
-            runtime_version == "Firecracker v1.17.0",
+            runtime_version == E1.executable_version,
             "the real sandbox process must use the selected Firecracker release",
             runtime_version=runtime_version,
         )
@@ -538,13 +531,11 @@ class ConsoleAssertions:
 
     def _cleanup_seed_build_release(self, job_id: str, prior_ids: set[str]) -> None:
         status = self._api("GET", f"/admin/api/v1/templates/seed/builds/{job_id}")
-        if status.get("state") not in {"succeeded", "failed", "publish_failed"}:
+        if status.get("state") not in SEED_BUILD_TERMINAL_STATES:
             raise SmokeConfigurationError(f"seed build {job_id} is still active; inspect its release after completion")
-        for entry in self._api("GET", "/admin/api/v1/template-releases"):
-            if (entry["template_name"] == "seed" and entry["content_hash"] == status.get("content_hash")
-                    and entry["id"] not in prior_ids
-                    and set(entry.get("tags", [])) <= {entry["content_hash"]}):
-                self._delete(f"/admin/api/v1/template-releases/{entry['id']}")
+        releases = self._api("GET", "/admin/api/v1/template-releases")
+        for entry in unpromoted_seed_releases(releases, str(status.get("content_hash")), prior_ids):
+            self._delete(f"/admin/api/v1/template-releases/{entry['id']}")
 
     def sign_in_operator(self) -> ConsoleSession:
         """The bench's seeded operator, signed in through the login page."""
@@ -669,6 +660,11 @@ class ConsoleAssertions:
         self._fixture.record("console_foreign_sandbox_id", sandbox_id)
         self._await_status(sandbox_id, "started")
         return sandbox_id
+
+    def delete_foreign_sandbox(self, sandbox_id: str) -> None:
+        """Force-delete a sandbox `create_foreign_sandbox` made, before its cleanup would."""
+
+        self._force_delete(sandbox_id)
 
     # --- the admin API: reads, and the cleanup writes ---------------------
 

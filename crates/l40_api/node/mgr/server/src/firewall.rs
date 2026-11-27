@@ -10,7 +10,13 @@ use crate::host_command::Command;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::process::Output;
+pub mod assignment;
+pub mod config_version;
 mod host_cache;
+pub mod rules;
+
+#[cfg(test)]
+pub(crate) use tests::packaged_pre_tproxy_guardrails_policy as packaged_pre_tproxy_guardrails_policy_for_test;
 
 use crate::metrics::node_manager::GuestUdp443Action;
 use crate::net::{SANDBOX_SUBNET, SANDBOX_SUBNET_PREFIX_LEN};
@@ -279,6 +285,9 @@ fn namespace_rules_json(
     // "inet" would require "snat ip" qualifier which the JSON API doesn't support cleanly.
     let namespace_guardrail_rules =
         platform_guardrail_drop_rules_json("ip", SANDBOX_TABLE, "guardrails", "tap0");
+    // Create, not add: these commands only append, so over a table that a
+    // best-effort teardown left behind they would duplicate its rules. The
+    // whole transaction fails instead, and the caller rebuilds the namespace.
     // These rules must precede the packaged policy's established/related return.
     // A guest can otherwise forge the reverse tuple of a gateway-owned socket,
     // inherit its conntrack state, and reach the local socket without TPROXY.
@@ -287,7 +296,7 @@ fn namespace_rules_json(
     // listener speaks MPTCP, so guest TCP is unaffected; non-TCP never matches.
     format!(
         r#"{{ "nftables": [
-  {{ "add": {{ "table": {{ "family": "ip", "name": "{SANDBOX_TABLE}" }} }} }},
+  {{ "create": {{ "table": {{ "family": "ip", "name": "{SANDBOX_TABLE}" }} }} }},
   {{ "add": {{ "chain": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "name": "{PRE_TPROXY_GUARDRAILS_CHAIN}",
     "type": "filter", "hook": "prerouting", "prio": {PRE_TPROXY_GUARDRAILS_PRIO} }} }} }},
   {{ "add": {{ "rule": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "chain": "{PRE_TPROXY_GUARDRAILS_CHAIN}",
@@ -504,6 +513,19 @@ pub fn teardown_proxy_rules(ns: &str) {
     if let Err(error) = nft_status(Some(ns), &["delete", "table", "ip", PROXY_TABLE]) {
         tracing::debug!(ns, %error, "proxy nft table cleanup failed");
     }
+}
+
+/// Remove every nft table SPACE owns in a reusable slot's namespace, ahead of
+/// the in-place reset's rebuild. The next occupant starts like a fresh slot,
+/// which has no firewall-rules table: the next apply installs the current
+/// assignment. Failing to delete the firewall-rules table
+/// leaves an unverified one, so that is an error and the caller rebuilds the
+/// slot; the sandbox table's teardown is best effort because its rebuild
+/// refuses to run over a leftover.
+pub fn scrub_namespace_tables(ns: &str) -> FirewallResult<()> {
+    teardown_proxy_rules(ns);
+    teardown_namespace_rules(ns);
+    rules::delete_in_namespace(ns)
 }
 
 /// Check if the "space" table has wildcard forward rules — in a specific namespace, or root if None.
@@ -945,11 +967,7 @@ fn validate_guest_l2_ingress_native_binding(chain: &str) -> Result<(), FirewallV
         else {
             return false;
         };
-        device
-            .strip_prefix('"')
-            .and_then(|device| device.strip_suffix('"'))
-            .unwrap_or(device)
-            == crate::net::TAP_DEVICE
+        device.strip_circumfix('"', '"').unwrap_or(device) == crate::net::TAP_DEVICE
     });
     if !bound_to_tap {
         return Err(FirewallValidationError::Missing(
@@ -1379,42 +1397,21 @@ fn ensure_namespace_forward_drop_rules(ns: &str, vpeer: &str) -> FirewallResult<
         return Ok(());
     }
 
+    let [add_chain, egress_drop_rule, ingress_drop_rule] = forward_install_commands_json(vpeer);
     let add_chain = if chain_exists {
         String::new()
     } else {
-        format!(
-            r#"  {{ "add": {{ "chain": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "name": "forward",
-    "type": "filter", "hook": "forward", "prio": 0 }} }} }}
-"#
-        )
+        add_chain
     };
     let egress_drop_rule = if has_egress_drop {
         String::new()
     } else {
-        format!(
-            r#"  {{ "add": {{ "rule": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "chain": "forward",
-    "comment": "fail-closed-guest-egress",
-    "expr": [
-      {{ "match": {{ "left": {{ "meta": {{ "key": "iifname" }} }},
-                     "right": "tap0", "op": "==" }} }},
-      {{ "drop": null }}
-    ] }} }} }}"#
-        )
+        egress_drop_rule
     };
     let ingress_drop_rule = if has_ingress_drop {
         String::new()
     } else {
-        format!(
-            r#"  {{ "add": {{ "rule": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "chain": "forward",
-    "comment": "fail-closed-guest-ingress",
-    "expr": [
-      {{ "match": {{ "left": {{ "meta": {{ "key": "iifname" }} }},
-                     "right": "{vpeer}", "op": "==" }} }},
-      {{ "match": {{ "left": {{ "meta": {{ "key": "oifname" }} }},
-                     "right": "tap0", "op": "==" }} }},
-      {{ "drop": null }}
-    ] }} }} }}"#
-        )
+        ingress_drop_rule
     };
     let rules = inbound_reply_rules
         .into_iter()
@@ -1427,7 +1424,7 @@ fn ensure_namespace_forward_drop_rules(ns: &str, vpeer: &str) -> FirewallResult<
     }
     let mut nftables = Vec::new();
     if !add_chain.is_empty() {
-        nftables.push(add_chain.trim_end().to_string());
+        nftables.push(add_chain);
     }
     nftables.extend(rules);
     let json = format!(
@@ -1437,6 +1434,37 @@ fn ensure_namespace_forward_drop_rules(ns: &str, vpeer: &str) -> FirewallResult<
         nftables.join(",\n")
     );
     apply_nft_json(&json, Some(ns))
+}
+
+/// The forward chain and its two fail-closed drops, as one transaction
+/// installs them into a namespace that has no forward chain yet.
+fn forward_install_commands_json(vpeer: &str) -> [String; 3] {
+    [
+        format!(
+            r#"  {{ "add": {{ "chain": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "name": "forward",
+    "type": "filter", "hook": "forward", "prio": 0 }} }} }}"#
+        ),
+        format!(
+            r#"  {{ "add": {{ "rule": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "chain": "forward",
+    "comment": "fail-closed-guest-egress",
+    "expr": [
+      {{ "match": {{ "left": {{ "meta": {{ "key": "iifname" }} }},
+                     "right": "tap0", "op": "==" }} }},
+      {{ "drop": null }}
+    ] }} }} }}"#
+        ),
+        format!(
+            r#"  {{ "add": {{ "rule": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "chain": "forward",
+    "comment": "fail-closed-guest-ingress",
+    "expr": [
+      {{ "match": {{ "left": {{ "meta": {{ "key": "iifname" }} }},
+                     "right": "{vpeer}", "op": "==" }} }},
+      {{ "match": {{ "left": {{ "meta": {{ "key": "oifname" }} }},
+                     "right": "tap0", "op": "==" }} }},
+      {{ "drop": null }}
+    ] }} }} }}"#
+        ),
+    ]
 }
 
 /// Check if a namespace has net-gateway TPROXY rules.

@@ -351,7 +351,7 @@ fn absent_sources_skip_probing_and_supported_sources_require_protection() {
                     .insert(std::fs::metadata(&parent).unwrap().dev(), true);
             }
             let initial = crate::catalog::InitialEnvironment::for_architecture(
-                pplx_space_common_core::types::Arch::X86_64,
+                pplx_space_cpu_arch::Arch::X86_64,
             )
             .unwrap();
             let error = if kernel {
@@ -413,10 +413,9 @@ fn unsupported_backend_does_not_apply_sealed_layout_requirements() {
             .join("assets/version/kernel/vmlinux.bin");
         std::fs::create_dir_all(image.parent().unwrap()).unwrap();
         std::fs::write(&image, binary(42)).unwrap();
-        let initial = crate::catalog::InitialEnvironment::for_architecture(
-            pplx_space_common_core::types::Arch::X86_64,
-        )
-        .unwrap();
+        let initial =
+            crate::catalog::InitialEnvironment::for_architecture(pplx_space_cpu_arch::Arch::X86_64)
+                .unwrap();
         fixture
             .store
             .verity_support
@@ -508,12 +507,11 @@ fn kernel_source_name_never_substitutes_a_different_file() {
         let canonical = image.with_file_name(KERNEL_IMAGE);
         std::fs::write(&canonical, binary(42)).unwrap();
         std::fs::write(&image, b"not the pinned kernel").unwrap();
-        let mut pin = crate::catalog::InitialEnvironment::for_architecture(
-            pplx_space_common_core::types::Arch::X86_64,
-        )
-        .unwrap()
-        .kernel()
-        .clone();
+        let mut pin =
+            crate::catalog::InitialEnvironment::for_architecture(pplx_space_cpu_arch::Arch::X86_64)
+                .unwrap()
+                .kernel()
+                .clone();
         pin.sha256 = sha256(&binary(42));
         pin.size = binary(42).len() as u64;
         // The valid sibling must never authenticate a different input path.
@@ -548,10 +546,9 @@ fn kernel_source_name_never_substitutes_a_different_file() {
 fn cached_kernel_validation_precedes_unused_source_validation() {
     for empty in [false, true] {
         let fixture = Fixture::new();
-        let initial = crate::catalog::InitialEnvironment::for_architecture(
-            pplx_space_common_core::types::Arch::X86_64,
-        )
-        .unwrap();
+        let initial =
+            crate::catalog::InitialEnvironment::for_architecture(pplx_space_cpu_arch::Arch::X86_64)
+                .unwrap();
         let pin = initial.kernel();
         let parent = fixture._dir.path().join("cache/firecracker");
         let cached = ArtifactStore::execution_kernel_path(&parent, pin).unwrap();

@@ -203,3 +203,115 @@ async fn mixed_catalog_down_removes_the_newest_migration_and_reopens_the_previou
         );
     }
 }
+
+/// `migrator` plus a reversible migration at `version` creating `table`.
+fn with_table_migration(migrator: &Migrator, version: i64, table: &str) -> Migrator {
+    let mut migrations = migrator.iter().cloned().collect::<Vec<_>>();
+    migrations.extend([
+        Migration::new(
+            version,
+            "newer table".into(),
+            MigrationType::ReversibleUp,
+            sqlx::AssertSqlSafe(format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY);"))
+                .into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            version,
+            "newer table".into(),
+            MigrationType::ReversibleDown,
+            sqlx::AssertSqlSafe(format!("DROP TABLE {table};")).into_sql_str(),
+            false,
+        ),
+    ]);
+    Migrator::with_migrations(migrations)
+}
+
+#[tokio::test]
+async fn previous_up_keeps_newer_migrations_that_the_newer_down_still_reverts() {
+    let baseline = baselines::PUBLIC_SQLITE_BASELINE;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("newer.sqlite");
+    let previous = SqliteDatabase {
+        name: "newer-rollback-test",
+        default_path: "unused",
+        migrator: &SERVICE,
+        common_schema: true,
+    };
+    static NEWER_SERVICE: LazyLock<Migrator> = LazyLock::new(|| {
+        with_table_migration(
+            &SERVICE,
+            baselines::PUBLIC_SQLITE_BASELINE + 4,
+            "newer_service_state",
+        )
+    });
+    let newer_service = &*NEWER_SERVICE;
+    let newer_common = with_table_migration(&COMMON_SCHEMA_MIGRATOR, baseline + 3, "newer_shared");
+    let newer = SqliteDatabase {
+        migrator: newer_service,
+        ..previous
+    };
+    sqlite::migrate_embedded(
+        newer.name,
+        &path,
+        sqlite::EmbeddedMigrators {
+            service: newer_service,
+            common: Some(&newer_common),
+        },
+    )
+    .await
+    .unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO jobs (job_id, kind, status) VALUES ('retained', 'test', 'running')",
+        [],
+    )
+    .unwrap();
+    let tables = |conn: &Connection| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('newer_service_state', 'newer_shared')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
+    let service_max = |conn: &Connection| {
+        conn.query_row("SELECT MAX(version) FROM _sqlx_migrations", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
+    let history = (common_history(&conn).unwrap(), service_max(&conn));
+
+    // The image rollback: the previous release's `up` leaves both in place.
+    migrate_sqlite_up(previous, &path).await.unwrap();
+
+    assert_eq!(
+        (common_history(&conn).unwrap(), service_max(&conn)),
+        history
+    );
+    assert_eq!(tables(&conn), 2);
+    // The newer release's `down` reverts them newest first, after which the
+    // previous release has nothing newer to keep.
+    for _ in 0..2 {
+        rollback_last_sqlite_database(newer, &path, &newer_common)
+            .await
+            .unwrap();
+    }
+    assert_eq!(tables(&conn), 0);
+    assert_eq!(service_max(&conn), baseline + 2);
+    assert_eq!(
+        common_history(&conn).unwrap().keys().copied().max(),
+        Some(baseline)
+    );
+    migrate_sqlite_up(previous, &path).await.unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT status FROM jobs WHERE job_id = 'retained'",
+            [],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "running"
+    );
+}

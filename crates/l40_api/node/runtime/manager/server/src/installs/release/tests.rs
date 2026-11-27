@@ -168,7 +168,6 @@ async fn standalone_payloads_use_the_same_verified_release_pipeline() {
     use super::super::executor::ExecutorParts;
     use super::super::test_support::{FakeSource, LocalPublisher, TestPins};
     use pplx_space_node_runtime_core::catalog::PinnedFile;
-    use std::sync::Mutex;
 
     #[derive(Clone, Copy, Debug)]
     enum Case {
@@ -268,7 +267,9 @@ async fn standalone_payloads_use_the_same_verified_release_pipeline() {
                 publisher,
                 pins,
             },
-            Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap())),
+            pplx_space_node_runtime_manager_store::database::SharedConnection::new(
+                pplx_space_node_runtime_manager_store::database::Connection::open_in_memory(),
+            ),
         );
         let cancellation = CancellationToken::new();
         if matches!(case, Case::Cancelled) {

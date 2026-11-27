@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::RuntimeVersion;
+use pplx_space_execution_spec::RuntimeVersion;
 
 use super::*;
 use crate::installs::release_source::FIRECRACKER_RELEASE_SOURCE;

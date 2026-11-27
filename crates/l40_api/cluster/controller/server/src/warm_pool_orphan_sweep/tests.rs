@@ -3,7 +3,7 @@
 //! carry the load-bearing correctness (never delete a live/adopted pod) and run
 //! with plain values, no kube client or Postgres.
 
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::collections::HashSet;
 
@@ -12,7 +12,7 @@ use k8s_openapi::api::core::v1::{
     ContainerState, ContainerStateTerminated, ContainerStatus, Pod, PodStatus,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
-use pplx_space_common_core::kubernetes::{
+use pplx_space_sandbox_pod::{
     SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_ID_ANNOTATION, SANDBOX_POOL_ROLE_KEY,
     SANDBOX_POOL_ROLE_WARM, SANDBOX_POOL_SLOT_ID_KEY,
 };

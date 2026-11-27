@@ -1,7 +1,7 @@
 use super::*;
 use crate::federated_identity::FederatedOwner;
-use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_core::types::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
+use pplx_space_accounts::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
+use pplx_space_sandbox_model::SandboxId;
 
 const DEFAULT_POOL_VCPU: &str = "2";
 const DEFAULT_POOL_MEMORY_MIB: &str = "2048";
@@ -33,6 +33,7 @@ fn pool_event_details(
                 pool_slot_id: Some(Uuid::now_v7()),
                 sandbox_id: SandboxId::new(),
                 content_hash: "sha256:pooled".to_string(),
+                template_release_id: None,
                 pod_name: "space-sbx-pooled-g1".to_string(),
                 pod_uid: None,
                 execution_generation: 1,
@@ -66,6 +67,7 @@ fn pool_slot_claimed_event_details_preserve_federated_owner() {
         pool_slot_id: Some(Uuid::now_v7()),
         sandbox_id: SandboxId::new(),
         content_hash: "sha256:pooled".to_string(),
+        template_release_id: None,
         pod_name: "space-sbx-pooled-g1".to_string(),
         pod_uid: None,
         execution_generation: 1,

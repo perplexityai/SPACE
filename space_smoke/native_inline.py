@@ -13,22 +13,34 @@ An inline execution can end before a scenario acts on it: a fast runner
 finishes a wake in well under a second. A scenario that needs one still
 `running` (to kill its API pod, or to hold its permit) sets `hold`, the API's
 `SPACE_NATIVE_INLINE_TEST_HOLD_SECS` test hook: each operation the API claims
-inline then waits that long, with its claim renewed, before it starts.
+inline waits with its claim renewed until a run-owned release file appears,
+or the fail-safe hold deadline ends. The returned callback releases every
+API replica without rolling it out.
 """
 
 from __future__ import annotations
 
 import time
-from collections.abc import Iterable, Iterator
+import uuid
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 
 from space_smoke.native_hardening import NativeTransportError
-from space_smoke.native_recovery import KindNativeHardeningFixture, NativeRecoveryControl, expect_response
+from space_smoke.native_recovery import (
+    KindNativeHardeningFixture,
+    NativeRecoveryControl,
+    attach_after_recovery,
+    expect_response,
+    expect_success,
+    stdout_bytes,
+)
+from space_smoke.runtime import SmokeConfigurationError
 
 INLINE_ENABLED_ENV = "SPACE_NATIVE_INLINE_OPERATIONS_ENABLED"
 INLINE_KINDS_ENV = "SPACE_NATIVE_INLINE_KINDS"
 INLINE_MAX_CONCURRENT_ENV = "SPACE_NATIVE_INLINE_MAX_CONCURRENT"
 INLINE_TEST_HOLD_ENV = "SPACE_NATIVE_INLINE_TEST_HOLD_SECS"
+INLINE_TEST_RELEASE_ENV = "SPACE_NATIVE_INLINE_TEST_RELEASE_FILE"
 TERMINAL = frozenset({"succeeded", "failed", "canceled", "expired"})
 TERMINAL_EVENTS = frozenset({"operation.completed", "operation.failed", "operation.canceled", "operation.expired"})
 # How long the API may take to answer through its local forward once its
@@ -44,10 +56,10 @@ def inline_execution(
     *,
     permits: int | None = None,
     hold: int | None = None,
-) -> Iterator[None]:
+) -> Iterator[Callable[[], None]]:
     """Run with the API executing `kinds` inline, with each API pod holding
     `permits` inline permits when given, and with each inline execution held
-    `running` for `hold` seconds before it starts when given.
+    `running` until released, bounded by `hold` seconds when given.
 
     Written under the public API mutation Lease, which records the standing
     values first so a later run repairs them if this one dies, and restored
@@ -59,14 +71,30 @@ def inline_execution(
     overrides = {INLINE_ENABLED_ENV: "true", INLINE_KINDS_ENV: ",".join(kinds)}
     if permits is not None:
         overrides[INLINE_MAX_CONCURRENT_ENV] = str(permits)
+    release_file = None
     if hold is not None:
         overrides[INLINE_TEST_HOLD_ENV] = str(hold)
+        release_file = f"/tmp/space-inline-{uuid.uuid4().hex}"
+        overrides[INLINE_TEST_RELEASE_ENV] = release_file
     release = harness.acquire_public_api_mutation()
     released = fixture.context.scope.defer("release the public API mutation lease", release)
     standing = harness.public_api_env(tuple(overrides))
     fixture.context.record("inline_env_before", dict(standing))
 
+    hold_released = False
+
+    def release_hold() -> None:
+        nonlocal hold_released
+        if release_file is None or hold_released:
+            return
+        if "space-api" not in control._captures:
+            raise SmokeConfigurationError("inline hold release requires captured API ownership")
+        control.release_inline_hold(release_file)
+        hold_released = True
+
     def restore() -> None:
+        # Restoring the env replaces the pods, removing their run-owned files
+        # and canceling any held executions if the scenario failed before release.
         harness.restore_public_api_env(standing)
         harness.wait_public_api_ready(timeout=240)
 
@@ -74,12 +102,23 @@ def inline_execution(
     with fixture.context.phase(f"run {overrides[INLINE_KINDS_ENV]} inline on the API"):
         harness.set_public_api_env(overrides)
         harness.wait_public_api_ready(timeout=240)
-    yield
-    with fixture.context.phase("restore the API's inline switches"):
-        restore()
-        restored.disarm()
-    release()
-    released.disarm()
+    primary = None
+    try:
+        yield release_hold
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        try:
+            with fixture.context.phase("restore the API's inline switches"):
+                restore()
+                restored.disarm()
+            release()
+            released.disarm()
+        except Exception as error:
+            if primary is None:
+                raise
+            primary.add_note(f"Inline configuration restoration also failed: {error}")
 
 
 def terminal_events(fixture: KindNativeHardeningFixture, operation_id: str) -> int:
@@ -146,6 +185,54 @@ def lifecycle(fixture: KindNativeHardeningFixture, sandbox_id: str, action: str)
         202,
     )
     return accepted["operation_id"]
+
+
+def queue_suspend_then_wake(
+    fixture: KindNativeHardeningFixture, sandbox_id: str
+) -> tuple[str, str]:
+    """With dispatch stopped and inline permits free, require request ordering.
+
+    Call before filling inline permits: otherwise permit exhaustion, rather
+    than the earlier suspend, could explain why the wake stayed queued.
+    """
+
+    with fixture.context.phase("queue a suspend, then a wake, with no dispatcher running"):
+        suspend = lifecycle(fixture, sandbox_id, "suspend")
+        wake = lifecycle(fixture, sandbox_id, "wake")
+        # An inline claim is committed before its admission answers.
+        states = {
+            "suspend": operation(fixture, suspend)["state"],
+            "wake": operation(fixture, wake)["state"],
+        }
+        fixture.context.verify(
+            states == {"suspend": "queued", "wake": "queued"},
+            "a wake behind a queued suspend must stay queued",
+            inline_ordering_states=states,
+        )
+    return suspend, wake
+
+
+def expect_ordered_wake(
+    fixture: KindNativeHardeningFixture,
+    sandbox_id: str,
+    suspend: str,
+    wake: str,
+) -> None:
+    """Both queued operations succeed, and their order leaves an executing guest."""
+
+    with fixture.context.phase("await the ordered suspend and wake, then execute"):
+        fixture.wait_operation(suspend, timeout=240)
+        fixture.wait_operation(wake, timeout=240)
+        fixture.wait_sandbox(sandbox_id, timeout=120)
+        command = expect_response(
+            fixture, fixture.command(sandbox_id, ["sh", "-c", "printf ordered"]), 201
+        )
+        events = attach_after_recovery(fixture, command)
+        expect_success(fixture, events)
+        fixture.context.verify(
+            stdout_bytes(events) == b"ordered",
+            "the wake must run after the suspend, leaving the sandbox running",
+        )
 
 
 def suspended_sandbox(fixture: KindNativeHardeningFixture) -> str:

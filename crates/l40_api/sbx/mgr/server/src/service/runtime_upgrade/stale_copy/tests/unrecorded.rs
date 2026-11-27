@@ -168,7 +168,9 @@ fn add_non_directories(snapshots_dir: &std::path::Path) -> [String; 3] {
 /// A directory whose name isn't UTF-8 is left out of the inventory: the
 /// listing can't show it and no snapshot RPC can name it. Decoded lossily, it
 /// would pass for a real snapshot named with the replacement character, which
-/// is listed once, beside it.
+/// is listed once, beside it. Linux only: APFS refuses a name that isn't
+/// UTF-8 (`EILSEQ`), so the fixture can't be made on macOS.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_name_that_isnt_utf8_is_left_out() {
     use std::os::unix::ffi::OsStrExt as _;

@@ -17,14 +17,7 @@ fn capture_and_restore_preserve_storage_and_execution_ownership() {
     };
     for encrypted in [false, true] {
         let storage = VmStateStorage {
-            directory: Some(
-                if encrypted {
-                    "../ignored"
-                } else {
-                    "/snapshot/staging"
-                }
-                .into(),
-            ),
+            directory: Some("/snapshot/staging".into()),
             encrypted_volume_mount: encrypted.then(|| "/snapshot/encrypted".into()),
         };
         let files = if encrypted {
@@ -40,6 +33,10 @@ fn capture_and_restore_preserve_storage_and_execution_ownership() {
             execution_fence: Some(fence.clone()),
         })
         .unwrap();
+        assert_eq!(
+            path_str(capture.capture_directory.as_ref().unwrap()).unwrap(),
+            "/snapshot/staging"
+        );
         let restore = StateRestore::try_from(RestoreVmStateRequest {
             sandbox_id: id.into(),
             artifacts: files,

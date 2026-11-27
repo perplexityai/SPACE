@@ -1,6 +1,9 @@
 //! Match execution observations to an already approved environment. Binary
 //! integrity and host prerequisites remain the node resolver's responsibility.
 use super::*;
+use pplx_space_execution_spec::{
+    ArtifactComponentMetadata, ExecutionMetadata, ExecutionMetadataError,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EnvironmentBindingError {

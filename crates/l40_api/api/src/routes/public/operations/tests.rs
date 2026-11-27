@@ -2,10 +2,10 @@ use crate::public_operations::{
     ApiProduct, CreatePublicOperation, CreatePublicOperationResult, PublicOperationStore,
 };
 use futures_util::StreamExt;
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_public_api::{OperationKind, OperationTargetType};
+use pplx_space_sql_locator::sql;
 use uuid::Uuid;
 
 use super::*;

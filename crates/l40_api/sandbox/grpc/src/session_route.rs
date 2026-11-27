@@ -1,5 +1,5 @@
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_common_grpc::{SANDBOX_SERVICE_ROUTE_ERROR_METADATA, SANDBOX_STATE_METADATA};
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use tonic::metadata::MetadataValue;
 use tonic::{Code, Status};
 

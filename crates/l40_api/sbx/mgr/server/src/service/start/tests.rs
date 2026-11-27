@@ -1,11 +1,12 @@
-use pplx_space_common_core::types::{LocalArtifactId, SandboxId, SnapshotId};
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 
 use super::*;
 use crate::db::CleanupCompletion;
 use crate::service::recovery::tests::{insert_suspended_test_sandbox, recovery_test_service};
 use crate::service::suspend_snapshot_publication::LOCAL_SNAPSHOT_DIR;
 use crate::state::SandboxStatus;
-use pplx_space_common_core::types::ExecutionGeneration;
+use pplx_space_sandbox_model::ExecutionGeneration;
 
 // A cold boot and a snapshot load give a sandbox the same rootfs limiter,
 // sized by its row's assignment, with both buckets holding the configured
@@ -20,7 +21,7 @@ async fn rootfs_rate_limiter_uses_the_assignment_and_configured_burst() {
             ..Default::default()
         },
     );
-    let limits = pplx_space_common_core::types::DiskIoLimits::try_new(5_000, 200).unwrap();
+    let limits = pplx_space_execution_spec::DiskIoLimits::try_new(5_000, 200).unwrap();
     let limiter = service
         .rootfs_rate_limiter(false, limits)
         .expect("sandbox is limited");
@@ -48,9 +49,9 @@ async fn rootfs_rate_limiter_uses_the_assignment_and_configured_burst() {
 
     assert_eq!(service.rootfs_rate_limiter(true, limits), None);
 }
-use pplx_space_common_core::types::{
-    NodeId, NodeManagedBy, RouteGeneration, SandboxActivationAttemptId,
-};
+use pplx_space_accounts::NodeId;
+use pplx_space_node_model::NodeManagedBy;
+use pplx_space_sandbox_model::{RouteGeneration, SandboxActivationAttemptId};
 
 fn restore_artifact_as_new_request() -> StartRequest {
     let source_sandbox_id = SandboxId::new();
@@ -91,7 +92,7 @@ fn restore_artifact_as_new_parses_target_disk_io_assignment() {
             .restore_artifact_as_new
             .unwrap()
             .target_disk_io_limits,
-        Some(pplx_space_common_core::types::DiskIoLimits::try_new(5_000, 200).unwrap())
+        Some(pplx_space_execution_spec::DiskIoLimits::try_new(5_000, 200).unwrap())
     );
 }
 
@@ -300,7 +301,7 @@ async fn restore_rootfs_policy_failure_is_permanent_not_a_retry_response() {
         &mut provenance,
         |_, _| async {
             Err(crate::snapshot_restore::RestoreError::RootfsPolicy(
-                pplx_space_common_core::sandbox_storage::RootfsSizeError::TooLarge {
+                pplx_space_sandbox_model::sandbox_storage::RootfsSizeError::TooLarge {
                     requested_bytes: u64::MAX,
                     maximum_bytes: 128 * 1024 * 1024 * 1024,
                 },
@@ -341,7 +342,7 @@ async fn run_selected_remote_stage_for_test(
                         storage_uri,
                         local_artifact_id: stage_local_artifact_id,
                         artifact_kind: stage_local_artifact_id
-                            .map(|_| pplx_space_common_core::types::ArtifactKind::Full),
+                            .map(|_| pplx_space_snapshot_model::ArtifactKind::Full),
                     })
                 }
             }
@@ -760,6 +761,62 @@ fn template_balloon_is_validated_against_effective_memory() {
 // a template hash would otherwise continue to template-manager, which every
 // test service fails to reach; only the hash-less row is meant to reach
 // template resolution.
+/// On a sealed node, a warm start of a stopped sandbox is refused with the
+/// sealed refusal under its artifact lock, before anything is staged: the
+/// row stays stopped with its pinned disk. Its checkpoint is staged already,
+/// so a warm start the seal didn't refuse there would restage the row at
+/// once, before its activation's own admission.
+#[tokio::test]
+async fn a_sealed_node_refuses_a_warm_start_before_it_restages_the_row() {
+    let scratch = tempfile::tempdir().unwrap();
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Stopped);
+    let service = SandboxManagerService::new_with_options(
+        conn,
+        crate::service::SandboxManagerServiceOptions::for_test_in(scratch.path()),
+    );
+    let pin = LocalArtifactId::new();
+    let execution = service.lookup_sandbox(&id).unwrap().node_execution_id;
+    service
+        .local_artifacts()
+        .publish_stopped(&id, execution, pin, "/tmp/stopped-disk")
+        .unwrap();
+    let snapshot_dir = crate::service::suspend_snapshot_publication::canonical_suspend_snapshot_dir(
+        &service.cache_root().join(&id),
+    );
+    std::fs::create_dir_all(&snapshot_dir).unwrap();
+    std::fs::write(snapshot_dir.join("vmstate"), b"vmstate").unwrap();
+    service.activation_seal.seal(&service.db, 3).unwrap();
+
+    let refused = service
+        .start_sandbox(
+            StartRequest {
+                sandbox_id: id.clone(),
+                from_warm: true,
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        refused.code(),
+        tonic::Code::FailedPrecondition,
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .message()
+            .starts_with(crate::activation_seal::ACTIVATIONS_SEALED_MARKER),
+        "{refused:?}"
+    );
+    let row = service.lookup_sandbox(&id).unwrap();
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Stopped));
+    assert_eq!(row.current_local_artifact_id, Some(pin));
+}
+
 #[tokio::test(start_paused = true)]
 async fn start_refusals_before_activation_leave_the_row_state_unchanged() {
     use crate::service::tests::service_tests::insert_test_sandbox;
@@ -947,7 +1004,7 @@ async fn suspend_restore_dir_keeps_a_previous_scope_it_cannot_cancel() {
     let id = SandboxId::new().to_string();
     crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Suspended);
     let previous = crate::db::RestoreTransferScopeRow {
-        transfer_scope_id: pplx_space_common_core::types::TransferScopeId::new(),
+        transfer_scope_id: pplx_space_snapshot_model::TransferScopeId::new(),
         execution_generation: Some(ExecutionGeneration::new(2).unwrap()),
         activation_attempt_id: Some(SandboxActivationAttemptId::new()),
         staging_dir: "/synthetic/foreign/staging".to_owned(),
@@ -997,7 +1054,7 @@ fn materialize_stopped_request() -> StartRequest {
 }
 
 pub(in crate::service) fn materialize_stopped_request_for(sandbox_id: &str) -> StartRequest {
-    let artifact_snapshot_id = pplx_space_common_core::types::SnapshotId::new();
+    let artifact_snapshot_id = pplx_space_snapshot_model::SnapshotId::new();
     StartRequest {
         sandbox_id: sandbox_id.to_string(),
         checkpoint: Some(SUSPEND_CHECKPOINT.to_string()),
@@ -1006,7 +1063,7 @@ pub(in crate::service) fn materialize_stopped_request_for(sandbox_id: &str) -> S
         )),
         target_state: crate::proto::WakeTargetState::Stopped as i32,
         expected_local_artifact_id: Some(
-            pplx_space_common_core::types::LocalArtifactId::new().to_string(),
+            pplx_space_snapshot_model::LocalArtifactId::new().to_string(),
         ),
         route_identity: Some(crate::proto::SpaceApiRouteIdentity {
             execution_generation: Some(7),
@@ -1085,7 +1142,7 @@ fn a_stopped_target_is_refused_on_every_request_shape_that_would_boot() {
 #[test]
 fn a_stopped_target_and_a_fork_cannot_be_requested_together() {
     let source_sandbox_id = SandboxId::new();
-    let artifact_snapshot_id = pplx_space_common_core::types::SnapshotId::new();
+    let artifact_snapshot_id = pplx_space_snapshot_model::SnapshotId::new();
     let fork_context = crate::proto::RestoreArtifactAsNewContext {
         source_sandbox_id: source_sandbox_id.to_string(),
         artifact_snapshot_id: artifact_snapshot_id.to_string(),
@@ -1152,7 +1209,7 @@ fn a_stopped_target_and_a_fork_cannot_be_requested_together() {
 /// rather than a suspend checkpoint or a user's named snapshot.
 #[test]
 fn only_the_requested_artifact_lets_a_stopped_row_pass() {
-    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
+    use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
     let pinned = LocalArtifactId::new();
     let other = LocalArtifactId::new();
 
@@ -1318,7 +1375,7 @@ async fn a_resumed_stopped_materialization_is_answered_before_the_launch() {
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new().to_string();
     insert_suspended_test_sandbox(&conn, &sandbox_id);
-    let pin = pplx_space_common_core::types::LocalArtifactId::new();
+    let pin = pplx_space_snapshot_model::LocalArtifactId::new();
     conn.execute(
         "UPDATE sandboxes
          SET state = 'stopped',
@@ -1403,7 +1460,7 @@ fn a_stopped_target_requires_the_expected_artifact_id() {
 #[test]
 fn the_stopped_target_selects_the_evacuation_finalize_arm() {
     let request = materialize_stopped_request();
-    let expected: pplx_space_common_core::types::LocalArtifactId = request
+    let expected: pplx_space_snapshot_model::LocalArtifactId = request
         .expected_local_artifact_id
         .as_deref()
         .unwrap()
@@ -1591,7 +1648,7 @@ async fn a_stopped_row_is_reported_materialized_only_when_inert_and_present() {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_suspended_test_sandbox(&conn, &sandbox_id);
-        let pin = pplx_space_common_core::types::LocalArtifactId::new();
+        let pin = pplx_space_snapshot_model::LocalArtifactId::new();
         conn.execute(
             "UPDATE sandboxes
              SET state = 'stopped',
@@ -1688,7 +1745,7 @@ async fn a_stopped_row_is_not_vouched_for_to_a_request_fenced_elsewhere() {
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new().to_string();
     insert_suspended_test_sandbox(&conn, &sandbox_id);
-    let pin = pplx_space_common_core::types::LocalArtifactId::new();
+    let pin = pplx_space_snapshot_model::LocalArtifactId::new();
     conn.execute(
         "UPDATE sandboxes
          SET state = 'stopped',
@@ -1734,7 +1791,7 @@ async fn the_second_stopped_boundary_fences_the_request_too() {
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new().to_string();
     insert_suspended_test_sandbox(&conn, &sandbox_id);
-    let pin = pplx_space_common_core::types::LocalArtifactId::new();
+    let pin = pplx_space_snapshot_model::LocalArtifactId::new();
     conn.execute(
         "UPDATE sandboxes
          SET state = 'stopped',
@@ -1778,9 +1835,10 @@ async fn the_second_stopped_boundary_fences_the_request_too() {
 }
 
 /// A cold boot of a `created` row passes the VM launch-time admission as a
-/// cold activation. The row's local owner holds no route identity, so the
-/// start is refused at the route-identity check that follows admission,
-/// before it claims the row.
+/// cold activation. While the node is sealed the admission refuses it, and
+/// the row stays `created`. After the unseal the row's local owner holds no
+/// route identity, so the start is refused at the route-identity check that
+/// follows admission, before it claims the row.
 #[tokio::test]
 async fn cold_boot_is_admitted_as_a_cold_activation() {
     use crate::service::start_support::REQUESTED_VM_ACTIVATIONS;
@@ -1792,8 +1850,8 @@ async fn cold_boot_is_admitted_as_a_cold_activation() {
         template.path().join("metadata.json"),
         serde_json::json!({
             "arch": std::env::consts::ARCH,
-            "spaced_version": pplx_space_spaced_common::spaced_version(),
-            "spaced_compatibility_family": pplx_space_spaced_common::spaced_compatibility_family(),
+            "spaced_version": pplx_space_spaced_protocol::spaced_version(),
+            "spaced_compatibility_family": pplx_space_spaced_guest_protocol::spaced_compatibility_family(),
         })
         .to_string(),
     )
@@ -1823,8 +1881,8 @@ async fn cold_boot_is_admitted_as_a_cold_activation() {
     );
 
     let admitted = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let error = REQUESTED_VM_ACTIVATIONS
-        .scope(
+    let start = || {
+        REQUESTED_VM_ACTIVATIONS.scope(
             Arc::clone(&admitted),
             service.start_sandbox(
                 StartRequest {
@@ -1834,6 +1892,29 @@ async fn cold_boot_is_admitted_as_a_cold_activation() {
                 false,
             ),
         )
+    };
+    service.activation_seal.seal(&service.db, 1).unwrap();
+    let sealed = start()
+        .await
+        .expect_err("a sealed node refuses the cold boot");
+    assert_eq!(sealed.code(), tonic::Code::FailedPrecondition, "{sealed:?}");
+    assert!(
+        sealed
+            .message()
+            .contains(crate::activation_seal::ACTIVATIONS_SEALED_MARKER),
+        "{sealed:?}"
+    );
+    assert_eq!(
+        service.lookup_sandbox(&sandbox_id).unwrap().state,
+        SandboxStatus::from(SandboxState::Created)
+    );
+    assert_eq!(
+        std::mem::take(&mut *admitted.lock().unwrap()),
+        vec![ActivationAdmissionKind::Cold]
+    );
+
+    service.activation_seal.unseal(&service.db, 1).unwrap();
+    let error = start()
         .await
         .expect_err("a local owner's start has no route identity to activate with");
 
@@ -1851,4 +1932,7 @@ async fn cold_boot_is_admitted_as_a_cold_activation() {
         service.lookup_sandbox(&sandbox_id).unwrap().state,
         SandboxStatus::from(SandboxState::Created)
     );
+    service.activation_seal.assert_quiesced();
 }
+
+mod encrypted_cold_start;

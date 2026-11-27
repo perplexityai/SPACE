@@ -27,7 +27,7 @@ fn map_io_error_uses_errno_matrix() {
 
 #[test]
 fn a_full_disk_or_quota_is_marked_apart_from_admission_limits() {
-    use pplx_space_common_core::spaced::{ERROR_REASON_METADATA_KEY, GUEST_STORAGE_FULL};
+    use pplx_space_guest_process::status::{ERROR_REASON_METADATA_KEY, GUEST_STORAGE_FULL};
     let reason = |status: &tonic::Status| {
         status
             .metadata()

@@ -56,7 +56,6 @@ fn credential_exchange_classifies_retriable_statuses(
 #[test]
 fn storage_access_requests_only_the_actions_each_operation_needs() {
     assert_eq!(StorageAccess::Read.scope(), STORAGE_READ_SCOPE);
-    assert_eq!(StorageAccess::Write.scope(), STORAGE_WRITE_SCOPE);
     assert_eq!(
         StorageAccess::ReadWrite.scope(),
         format!("{STORAGE_READ_SCOPE} {STORAGE_WRITE_SCOPE}")

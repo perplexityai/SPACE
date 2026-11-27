@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{ClusterId, SandboxId, process_cluster_id};
+use pplx_space_cluster_id::{ClusterId, process_cluster_id};
+use pplx_space_sandbox_model::SandboxId;
 
 use crate::details::{SandboxEventDetails, detail_bool, detail_str};
 use crate::event_type::SandboxEventType;

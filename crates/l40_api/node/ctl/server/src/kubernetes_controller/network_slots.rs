@@ -1,8 +1,8 @@
 use k8s_openapi::api::core::v1::Node;
 use kube::api::{Patch, PatchParams};
 use kube::{Api, Client};
-use pplx_space_common_core::kubernetes::SANDBOX_NETWORK_SLOTS_RESOURCE;
 use pplx_space_node_mgr_client::proto::NetworkPoolStatusRequest;
+use pplx_space_sandbox_pod::SANDBOX_NETWORK_SLOTS_RESOURCE;
 
 use super::node_watch;
 use crate::local_manager_request;

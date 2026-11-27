@@ -3,16 +3,22 @@ use crate::metrics::sandbox::api::{
     ReconnectTerminalPhase, SandboxApiMetricIdentity, SandboxApiSurface,
 };
 use futures_core::Stream;
-use pplx_space_common_core::sql;
+use pplx_space_accounts::{Email, NodeId, OrgId};
 #[cfg(test)]
-use pplx_space_common_core::types::AutoLifecycleRuntimeState;
-use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, DEFAULT_TEMPLATE_TAG, Email, EnvMap, EnvSanitizationIssue, NodeId, OrgId,
-    PolicyAuthority, RuntimeKind, SandboxAutoLifecyclePatch, SandboxId, SandboxLifecycle, SemVer,
-    TemplateDesiredState, TemplateName, TemplateReference, TemplateTag, TemplateVisibility,
-};
+use pplx_space_auto_lifecycle::AutoLifecycleRuntimeState;
+use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, SandboxAutoLifecyclePatch};
+use pplx_space_content_digest::DigestPrefixResolveError;
+use pplx_space_execution_spec::RuntimeKind;
+use pplx_space_guest_process::{EnvMap, EnvSanitizationIssue};
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyV1, proto::NetworkPolicySource};
 use pplx_space_node_mgr_client::proto::{AllowPortRequest, ExposePortRequest, NetworkProtocol};
+use pplx_space_node_model::NodePoolName;
+use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+use pplx_space_sandbox_teardown::observed_states::ObservedSpacedVersion;
+use pplx_space_sandbox_teardown::{
+    delete_reconcile_state_for_elements, sandbox_reconcile_cleanup_refs,
+};
 use pplx_space_sbx_mgr_client::operations as spaced_ops;
 use pplx_space_sbx_mgr_client::proto::{
     AutoLifecycleTouchResult, CreateSnapshotRequest, KillRequest, ListSnapshotsRequest,
@@ -32,8 +38,12 @@ use pplx_space_sbx_mgr_client::proto::{
     SpacedWriteRequest, SpacedWriteResponse, StatsRequest, StopRequest, TouchAutoLifecycleRequest,
     TouchAutoLifecycleResponse, UpdateRequest, WakeRequest,
 };
+use pplx_space_semver::SemVer;
 use pplx_space_state_reconciliation::{NetworkPolicyTarget, ReconcileFacet};
-use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use pplx_space_template_model::{
+    TemplateDesiredState, TemplateName, TemplateReference, TemplateTag, TemplateVisibility,
+};
+use sqlx::{PgPool, Postgres, Transaction};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -53,12 +63,11 @@ use crate::models::{
     SandboxStateInput, UpdateSandboxRequest, User,
 };
 use crate::reconcile_queue::{
-    FinalizeSandboxDbDeleteError, ReconcileRef, delete_reconcile_state_for_elements,
-    enqueue_node_reconcile_refs_and_trigger_tx, enqueue_sandbox_reconcile_and_trigger,
-    enqueue_sandbox_reconcile_and_trigger_tx, finalize_sandbox_db_delete_user_initiated,
-    in_flight_snapshot_upload_idle_for, sandbox_reconcile_cleanup_refs,
+    FinalizeSandboxDbDeleteError, ReconcileRef, enqueue_node_reconcile_refs_and_trigger_tx,
+    enqueue_sandbox_reconcile_and_trigger, enqueue_sandbox_reconcile_and_trigger_tx,
+    finalize_sandbox_db_delete_user_initiated,
 };
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 struct SandboxObservedState {
     sandbox_id: SandboxId,
     node_id: Option<NodeId>,
@@ -69,7 +78,7 @@ struct SandboxObservedState {
     substrate_node_id: Option<String>,
     template: Option<String>,
     status: Option<String>,
-    spaced_version: Option<SemVer>,
+    version: ObservedSpacedVersion,
     pid: Option<i32>,
     namespace: Option<String>,
     uptime: Option<String>,
@@ -88,6 +97,43 @@ struct SandboxObservedState {
     observed_network_policy_authority: Option<String>,
     observed_network_policy_at: Option<time::OffsetDateTime>,
     network_policy_conditions: sqlx::types::Json<Vec<NetworkPolicyCondition>>,
+}
+
+impl From<pplx_space_sandbox_teardown::direct::observed_reads::ObservedStateRow>
+    for SandboxObservedState
+{
+    fn from(row: pplx_space_sandbox_teardown::direct::observed_reads::ObservedStateRow) -> Self {
+        Self {
+            sandbox_id: row.sandbox_id,
+            node_id: row.node_id,
+            node_name: row.node_name,
+            node_role: row.node_role,
+            node_managed_by: row.node_managed_by,
+            node_api_endpoint: row.node_api_endpoint,
+            substrate_node_id: row.substrate_node_id,
+            template: row.template,
+            status: row.status,
+            version: row.version,
+            pid: row.pid,
+            namespace: row.namespace,
+            uptime: row.uptime,
+            sandbox_owner: row.sandbox_owner,
+            image_hash: row.image_hash,
+            snapshots_enabled: row.snapshots_enabled,
+            disk_usage_bytes: row.disk_usage_bytes,
+            pool_template: row.pool_template,
+            failure_reason: row.failure_reason,
+            observed_created_at: row.observed_created_at,
+            observed_at: row.observed_at,
+            release_tags: row.release_tags,
+            observed_network_policy: row.observed_network_policy,
+            observed_network_policy_generation: row.observed_network_policy_generation,
+            observed_network_policy_source: row.observed_network_policy_source,
+            observed_network_policy_authority: row.observed_network_policy_authority,
+            observed_network_policy_at: row.observed_network_policy_at,
+            network_policy_conditions: row.network_policy_conditions,
+        }
+    }
 }
 
 /// Budget for blocking create/restore/wake/access waits. Sized below the
@@ -140,15 +186,6 @@ struct CreateTemplateDefaults {
     default_auto_lifecycle: Option<sqlx::types::Json<AutoLifecyclePolicy>>,
 }
 
-fn validate_create_template_reference(template: &TemplateReference) -> Result<(), ControllerError> {
-    if template.artifact_digest_prefix().is_some() {
-        return Err(ControllerError::bad_request(
-            "template digest prefixes are not supported yet; use a full sha256 digest",
-        ));
-    }
-    Ok(())
-}
-
 /// Builds the not-found error for an unresolvable template reference.
 ///
 /// The create-time authorization gate reuses this for cross-org denials so a
@@ -162,6 +199,12 @@ fn template_release_not_found(
     if let Some(digest) = template.artifact_digest() {
         return ControllerError::not_found(format!(
             "no release found for template '{template_name}' runtime '{}' hash '{digest}'",
+            runtime.alias(),
+        ));
+    }
+    if let Some(prefix) = template.artifact_digest_prefix() {
+        return ControllerError::not_found(format!(
+            "no release found for template '{template_name}' runtime '{}' hash prefix '{prefix}'",
             runtime.alias(),
         ));
     }
@@ -214,16 +257,18 @@ pub(crate) async fn gate_template_access(
     caller_org: OrgId,
 ) -> Result<TemplateAccess, ControllerError> {
     let template_name = template_name.as_str();
-    let Some((visibility, owner_org, desired_state)) =
-        sqlx::query_as::<_, (String, Option<Uuid>, String)>(sql!(
-            "SELECT visibility, org_id, desired_state
-         FROM templates
-         WHERE name = $1"
-        ))
-        .bind(template_name)
-        .fetch_optional(pool)
+    let Some(pplx_space_template_store::templates::TemplateAccess {
+        visibility,
+        org_id: owner_org,
+        desired_state,
+    }) = pplx_space_template_store::templates::access(pool, template_name)
         .await
-        .map_err(|err| db_contention_error("failed to load template for authorization", &err))?
+        .map_err(|err| {
+            db_contention_error(
+                "failed to load template for authorization",
+                &sqlx::Error::from(err),
+            )
+        })?
     else {
         return Ok(TemplateAccess::Absent);
     };
@@ -256,6 +301,15 @@ pub(super) enum ReleaseMissReport {
     NotFound,
 }
 
+/// The release a create of `template` runs: among the releases of the build
+/// its tag or digest names ([`resolve_original_release`]), the one
+/// `pplx_space_template_release_store::resolved_release_sql` picks: the one
+/// bound to the cluster default, else the newest-catalog twin in an allowed,
+/// then a deprecated, environment, else the original, never one in a blocked
+/// environment. A template's creates move to a twin as the twin appears.
+/// When none qualifies, the named release stays, as before twins, and the
+/// node's policy decides. Returns the release id and the named release's
+/// stored hash.
 async fn resolve_template_release(
     pool: &PgPool,
     template: &TemplateReference,
@@ -263,7 +317,43 @@ async fn resolve_template_release(
     caller_org: OrgId,
     miss_report: ReleaseMissReport,
 ) -> Result<(Uuid, String), ControllerError> {
-    validate_create_template_reference(template)?;
+    let (original, hash) =
+        resolve_original_release(pool, template, runtime, caller_org, miss_report).await?;
+    let resolved =
+        crate::controllers::resolved_create_release(pool, template.name().as_str(), &hash, true)
+            .await?;
+    Ok((resolved.unwrap_or(original), hash))
+}
+
+/// The release a create of `template` runs and claims the slots of. A create
+/// runs a twin only where it boots the twin's environment
+/// (`boots_template_twins`, [`super::substrate::Substrate::boots_template_twins`]):
+/// then [`resolve_template_release`]; anywhere else the release its tag or
+/// digest names, whose build the worker boots.
+async fn resolve_create_release(
+    pool: &PgPool,
+    template: &TemplateReference,
+    runtime: RuntimeKind,
+    caller_org: OrgId,
+    miss_report: ReleaseMissReport,
+    boots_template_twins: bool,
+) -> Result<(Uuid, String), ControllerError> {
+    if boots_template_twins {
+        resolve_template_release(pool, template, runtime, caller_org, miss_report).await
+    } else {
+        resolve_original_release(pool, template, runtime, caller_org, miss_report).await
+    }
+}
+
+/// The release `template`'s tag or digest names: the tagged release, or a
+/// digest's original release, never a twin.
+async fn resolve_original_release(
+    pool: &PgPool,
+    template: &TemplateReference,
+    runtime: RuntimeKind,
+    caller_org: OrgId,
+    miss_report: ReleaseMissReport,
+) -> Result<(Uuid, String), ControllerError> {
     let template_name = template.name().as_str();
 
     let access = gate_template_access(pool, template.name(), caller_org).await?;
@@ -275,8 +365,44 @@ async fn resolve_template_release(
     // the gate and the lookups are separate READ COMMITTED statements, so a
     // template published or flipped to org_specific in between must still
     // not resolve cross-org at read time.
-    if let Some(digest) = template.artifact_digest() {
-        let resolved = crate::template_releases_store::resolve_template_release_by_digest(
+    let digest = match template.artifact_digest_prefix() {
+        Some(prefix) => {
+            let candidates = crate::template_releases_store::template_release_digests_with_prefix(
+                pool,
+                template.name(),
+                prefix,
+                runtime,
+                caller_org,
+            )
+            .await
+            .map_err(|err| {
+                db_contention_error("failed to resolve template release by hash prefix", &err)
+            })?;
+            match prefix.resolve_unique(candidates) {
+                Ok(digest) => Some(digest),
+                Err(DigestPrefixResolveError::NoMatch(_)) => {
+                    return Err(release_miss(
+                        pool,
+                        template,
+                        runtime,
+                        caller_org,
+                        access,
+                        miss_report,
+                    )
+                    .await?);
+                }
+                Err(DigestPrefixResolveError::Ambiguous(_)) => {
+                    return Err(ControllerError::bad_request(format!(
+                        "template digest prefix '{prefix}' matches more than one release of \
+                         template '{template_name}'; use a longer prefix or the full digest"
+                    )));
+                }
+            }
+        }
+        None => template.artifact_digest(),
+    };
+    if let Some(digest) = digest {
+        let resolved = pplx_space_template_release_store::lookup::resolve_by_digest(
             pool,
             template.name(),
             digest,
@@ -284,6 +410,7 @@ async fn resolve_template_release(
             caller_org,
         )
         .await
+        .map_err(sqlx::Error::from)
         .map_err(|err| db_contention_error("failed to resolve template release by hash", &err))?;
 
         return match resolved {
@@ -297,32 +424,12 @@ async fn resolve_template_release(
     let tag = template
         .tag()
         .ok_or_else(|| ControllerError::bad_request("template must use a tag or full digest"))?;
-    let runtime_alias = runtime.alias();
+    // An unknown tag is a miss, never another tag's release: running `latest`
+    // in its place would boot something the caller did not ask for.
     if let Some(release) =
         resolve_template_release_by_tag(pool, template.name(), tag, runtime, caller_org).await?
     {
         return Ok(release);
-    }
-
-    if tag.as_str() != DEFAULT_TEMPLATE_TAG {
-        tracing::warn!(
-            template_name_len = template_name.len(),
-            runtime = runtime_alias,
-            requested_tag_len = tag.as_str().len(),
-            fallback_tag = DEFAULT_TEMPLATE_TAG,
-            "template tag not found; falling back to latest",
-        );
-        if let Some(release) = resolve_template_release_by_tag(
-            pool,
-            template.name(),
-            &TemplateTag::latest(),
-            runtime,
-            caller_org,
-        )
-        .await?
-        {
-            return Ok(release);
-        }
     }
 
     Err(release_miss(pool, template, runtime, caller_org, access, miss_report).await?)
@@ -362,12 +469,13 @@ async fn classify_release_miss(
     if !matches!(access, TemplateAccess::Authorized { .. }) {
         return Ok(not_found);
     }
-    let has_release = crate::template_releases_store::template_has_visible_release(
+    let has_release = pplx_space_template_release_store::lookup::template_has_visible_release(
         pool,
         template.name(),
         caller_org,
     )
     .await
+    .map_err(sqlx::Error::from)
     .map_err(|err| db_contention_error("failed to check template releases", &err))?;
     Ok(not_found.with_template_release_miss(if has_release {
         TemplateReleaseMiss::NoMatchingRelease
@@ -383,7 +491,7 @@ pub(crate) async fn resolve_template_release_by_tag(
     runtime: RuntimeKind,
     caller_org: OrgId,
 ) -> Result<Option<(Uuid, String)>, ControllerError> {
-    crate::template_releases_store::resolve_template_release_by_tag(
+    pplx_space_template_release_store::lookup::resolve_by_tag(
         pool,
         template_name,
         tag,
@@ -391,6 +499,7 @@ pub(crate) async fn resolve_template_release_by_tag(
         caller_org,
     )
     .await
+    .map_err(sqlx::Error::from)
     .map_err(|err| db_contention_error("failed to resolve template release by tag", &err))
 }
 
@@ -401,50 +510,31 @@ async fn load_create_template_defaults(
     runtime: &str,
 ) -> Result<CreateTemplateDefaults, ControllerError> {
     let (network_policy, network_policy_generation) =
-        sqlx::query_as::<_, (sqlx::types::Json<NetworkPolicy>, i64)>(sql!(
-            "SELECT network_policy_json, network_policy_generation
-         FROM templates
-         WHERE name = $1
-           AND desired_state = $2"
-        ))
-        .bind(template_name)
-        .bind(TemplateDesiredState::Present.as_str())
-        .fetch_optional(pool)
-        .await
-        .map_err(|err| db_contention_error("failed to load template network policy", &err))?
-        .unwrap_or_else(|| (sqlx::types::Json(NetworkPolicyV1::deny_all()), 0));
+        pplx_space_template_store::templates::present_network_policy(pool, template_name)
+            .await
+            .map_err(|err| {
+                db_contention_error(
+                    "failed to load template network policy",
+                    &sqlx::Error::from(err),
+                )
+            })?
+            .map(|row| (row.network_policy_json, row.network_policy_generation))
+            .unwrap_or_else(|| (sqlx::types::Json(NetworkPolicyV1::deny_all()), 0));
 
     let default_auto_lifecycle =
-        sqlx::query_scalar::<_, sqlx::types::Json<AutoLifecyclePolicy>>(sql!(
-            "WITH desired AS (
-             SELECT default_auto_lifecycle_json
-             FROM template_default_auto_lifecycle_policies
-             WHERE template = $1
-         ),
-         observed AS (
-             SELECT nti.default_auto_lifecycle_json
-             FROM node_template_inventory nti
-             JOIN nodes n ON n.id = nti.node_id
-             WHERE nti.template_name = $1
-               AND nti.content_hash = $2
-               AND (nti.runtime IS NULL OR nti.runtime = '' OR nti.runtime = $3)
-               AND nti.default_auto_lifecycle_json IS NOT NULL
-               AND n.role = 'builder'
-             ORDER BY nti.observed_at DESC
-             LIMIT 1
-         )
-         SELECT default_auto_lifecycle_json FROM desired
-         UNION ALL
-         SELECT default_auto_lifecycle_json FROM observed
-         WHERE NOT EXISTS (SELECT 1 FROM desired)
-         LIMIT 1"
-        ))
-        .bind(template_name)
-        .bind(content_hash)
-        .bind(runtime)
-        .fetch_optional(pool)
+        pplx_space_template_store::default_auto_lifecycle_policies::for_create(
+            pool,
+            template_name,
+            content_hash,
+            runtime,
+        )
         .await
-        .map_err(|err| db_contention_error("failed to load template auto lifecycle", &err))?;
+        .map_err(|err| {
+            db_contention_error(
+                "failed to load template auto lifecycle",
+                &sqlx::Error::from(err),
+            )
+        })?;
 
     Ok(CreateTemplateDefaults {
         network_policy,
@@ -467,7 +557,6 @@ fn create_auto_lifecycle_policy(
 fn reconnect_entrypoint(identity: SandboxApiMetricIdentity) -> Option<ReconnectEntrypoint> {
     match (identity.surface, identity.op) {
         (SandboxApiSurface::Ecw, "connect") => Some(ReconnectEntrypoint::Connect),
-        (_, "access") => Some(ReconnectEntrypoint::Dataplane),
         _ => None,
     }
 }
@@ -528,44 +617,6 @@ fn wait_ready_reason(phase: WaitReadyTimeoutPhase) -> ReconnectReason {
     }
 }
 
-fn retry_after_cause_terminal_phase(cause: ControllerRetryAfterCause) -> ReconnectTerminalPhase {
-    match cause {
-        ControllerRetryAfterCause::RestoreInFlight => ReconnectTerminalPhase::Restore,
-        ControllerRetryAfterCause::PodNeverReady => ReconnectTerminalPhase::PodNeverReady,
-        ControllerRetryAfterCause::ProxyUnreachable => ReconnectTerminalPhase::ProxyUnreachable,
-        ControllerRetryAfterCause::GuestNotReady => ReconnectTerminalPhase::GuestNotReady,
-        // Cluster-admission backpressure is a front-door 429, not a reconnect
-        // outcome; it shouldn't reach the reconnect terminal path. Map it to the
-        // API phase defensively.
-        ControllerRetryAfterCause::ClusterActivationAdmission
-        | ControllerRetryAfterCause::PoolSlotRelease => ReconnectTerminalPhase::Api,
-    }
-}
-
-fn retry_after_cause_reason(cause: ControllerRetryAfterCause) -> ReconnectReason {
-    match cause {
-        ControllerRetryAfterCause::RestoreInFlight => ReconnectReason::RestoreInFlight,
-        ControllerRetryAfterCause::PodNeverReady => ReconnectReason::PodNeverReady,
-        ControllerRetryAfterCause::ProxyUnreachable => ReconnectReason::ProxyUnreachable,
-        ControllerRetryAfterCause::GuestNotReady => ReconnectReason::GuestNotReady,
-        // See note above: not a reconnect cause. Treat as a retryable wait.
-        ControllerRetryAfterCause::ClusterActivationAdmission
-        | ControllerRetryAfterCause::PoolSlotRelease => ReconnectReason::WaitBudget,
-    }
-}
-
-fn retry_after_cause_outcome(cause: ControllerRetryAfterCause) -> ReconnectOutcome {
-    match cause {
-        ControllerRetryAfterCause::RestoreInFlight => ReconnectOutcome::WakeInProgress,
-        ControllerRetryAfterCause::PodNeverReady
-        | ControllerRetryAfterCause::ProxyUnreachable
-        | ControllerRetryAfterCause::GuestNotReady
-        // See note above: not a reconnect cause. Treat as retryable (exhausted).
-        | ControllerRetryAfterCause::ClusterActivationAdmission
-        | ControllerRetryAfterCause::PoolSlotRelease => ReconnectOutcome::Exhausted,
-    }
-}
-
 fn reconnect_timeout_phase_and_reason(
     initial_lifecycle: &str,
     err: &SubstrateError,
@@ -621,14 +672,32 @@ fn reconnect_error_outcome(
         // wait_budget) so restore-path and direct-wake admission rejections land
         // on one outcome/reason series instead of being split across
         // `rejected/unavailable` vs `exhausted/wait_budget`.
+        // A client at its live cap is a per-client refusal, recorded like the
+        // concurrency limiter's rather than as cluster saturation.
+        SubstrateError::AdmissionRejected { live_cap: true, .. } => (
+            ReconnectOutcome::Rejected,
+            ReconnectTerminalPhase::Api,
+            ReconnectReason::RateLimited,
+        ),
         SubstrateError::AdmissionRejected { .. } => (
             ReconnectOutcome::Exhausted,
             ReconnectTerminalPhase::Api,
             ReconnectReason::WaitBudget,
         ),
-        // Only suspend returns `SandboxNoPod`, so a wake never sees it; it
-        // shares `Unavailable`'s arm, as it shares its 503.
-        SubstrateError::Unavailable { .. } | SubstrateError::SandboxNoPod { .. } => (
+        // A node a drain sealed refused the wake before any VM work: a drain
+        // refusal, as the drain gate's own is, with the same 503.
+        SubstrateError::NodeSealed { .. } => (
+            ReconnectOutcome::Rejected,
+            ReconnectTerminalPhase::Api,
+            ReconnectReason::DrainBlocked,
+        ),
+        // Only suspend returns `SandboxNoPod` and only a Delete teardown
+        // returns `NodeDeleteNotAdmitted`, so a wake never sees either; they
+        // share `Unavailable`'s arm, as they share its 503.
+        SubstrateError::Unavailable { .. }
+        | SubstrateError::SandboxNoPod { .. }
+        | SubstrateError::Unschedulable { .. }
+        | SubstrateError::NodeDeleteNotAdmitted { .. } => (
             ReconnectOutcome::WakeFailed,
             initial_lifecycle_terminal_phase(initial_lifecycle),
             ReconnectReason::Unavailable,
@@ -664,91 +733,41 @@ fn reconnect_error_outcome(
     }
 }
 
-fn reconnect_controller_error_outcome(
-    initial_lifecycle: &str,
+/// Classify a wake that activation admission refused. The only caller, the
+/// `Wake` / `ImplicitWake` admission check in `SandboxController::action`,
+/// passes what `admit_action_cluster_activation` returns: a live-cap refusal,
+/// or a cluster-activation 429. That check never runs the slot check, so a
+/// `NoFreeSlot` 503 doesn't arrive here.
+fn reconnect_admission_refusal_outcome(
     err: &ControllerError,
 ) -> (ReconnectOutcome, ReconnectTerminalPhase, ReconnectReason) {
-    if err.is_restore_context_unavailable() {
+    // A client at its live cap is a per-client refusal, recorded like the
+    // concurrency limiter's. Without this its bare 429 and `Retry-After` read
+    // as `wait_budget`, the cluster-saturation tag.
+    if err.is_live_cap_refusal() {
         return (
-            ReconnectOutcome::WakeFailed,
-            initial_lifecycle_terminal_phase(initial_lifecycle),
-            ReconnectReason::RestoreContextUnavailable,
+            ReconnectOutcome::Rejected,
+            ReconnectTerminalPhase::Api,
+            ReconnectReason::RateLimited,
         );
     }
-    // Mirroring `reconnect_error_outcome`'s `LockContention` arm.
-    // A contention error is a 503 carrying neither a cause nor a `retry_after`,
-    // so without this it falls to the `SERVICE_UNAVAILABLE` arm below and is
-    // labelled `wake_failed` / `unavailable` — the wake-fault series a lost
-    // race must never enter, and with no `lock_contention` reason for the
-    // `lock_timeout` rollout to watch.
-    //
-    // Pre-emptive today. The only production caller, the `Wake` /
-    // `ImplicitWake` admission check in `SandboxController::action`, passes a
-    // cluster-admission rejection (a 429), which never carries the
-    // lock-contention marker. The arm is for a caller that forwards a
-    // substrate error: `From<SubstrateError>` turns `LockContention` into
-    // `ControllerError::lock_contention`, which would otherwise be labelled
-    // `wake_failed` / `unavailable` here. `reconnect_metrics_tests` pins it.
-    if err.is_lock_contention() {
+    // Cluster-activation backpressure: the rate-limited case carries a
+    // `ClusterActivationAdmission` cause, and the empty-cluster (zero-capacity)
+    // case is a bare 429 with only a Retry-After header. Both are admission
+    // exhaustion, not a substrate failure — classify them the same so a
+    // capacity outage isn't misattributed on the retry-storm dashboard.
+    if err.status() == axum::http::StatusCode::TOO_MANY_REQUESTS {
         return (
             ReconnectOutcome::Exhausted,
-            initial_lifecycle_terminal_phase(initial_lifecycle),
-            ReconnectReason::LockContention,
-        );
-    }
-    if let Some(cause) = err.retry_after_cause() {
-        return (
-            retry_after_cause_outcome(cause),
-            retry_after_cause_terminal_phase(cause),
-            retry_after_cause_reason(cause),
-        );
-    }
-    if err.retry_after().is_some() {
-        return (
-            ReconnectOutcome::Exhausted,
-            initial_lifecycle_terminal_phase(initial_lifecycle),
+            ReconnectTerminalPhase::Api,
             ReconnectReason::WaitBudget,
         );
     }
-
-    match err.status() {
-        axum::http::StatusCode::CONFLICT | axum::http::StatusCode::PRECONDITION_FAILED => (
-            ReconnectOutcome::Rejected,
-            ReconnectTerminalPhase::Api,
-            ReconnectReason::Conflict,
-        ),
-        axum::http::StatusCode::NOT_FOUND => (
-            ReconnectOutcome::Rejected,
-            ReconnectTerminalPhase::Api,
-            ReconnectReason::NotFound,
-        ),
-        axum::http::StatusCode::SERVICE_UNAVAILABLE => (
-            ReconnectOutcome::WakeFailed,
-            initial_lifecycle_terminal_phase(initial_lifecycle),
-            ReconnectReason::Unavailable,
-        ),
-        axum::http::StatusCode::REQUEST_TIMEOUT | axum::http::StatusCode::GATEWAY_TIMEOUT => (
-            ReconnectOutcome::Exhausted,
-            initial_lifecycle_terminal_phase(initial_lifecycle),
-            ReconnectReason::Timeout,
-        ),
-        // Cluster-activation backpressure. The rate-limited case carries a
-        // `ClusterActivationAdmission` cause and is classified above; the
-        // empty-cluster (zero-capacity) case is a bare 429 with only a
-        // Retry-After header and no cause, so it lands here. Both are admission
-        // exhaustion, not a substrate failure — classify them the same so a
-        // capacity outage isn't misattributed on the retry-storm dashboard.
-        axum::http::StatusCode::TOO_MANY_REQUESTS => (
-            ReconnectOutcome::Exhausted,
-            ReconnectTerminalPhase::Api,
-            ReconnectReason::WaitBudget,
-        ),
-        _ => (
-            ReconnectOutcome::WakeFailed,
-            ReconnectTerminalPhase::Api,
-            ReconnectReason::Substrate,
-        ),
-    }
+    (
+        ReconnectOutcome::WakeFailed,
+        ReconnectTerminalPhase::Api,
+        ReconnectReason::Substrate,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -868,31 +887,15 @@ async fn load_tcp_sandbox_port_exposure(
     sandbox_id: SandboxId,
     port: u16,
 ) -> Result<Option<SandboxPortExposure>, ControllerError> {
-    sqlx::query_as::<_, SandboxPortExposure>(sql!(
-        "SELECT sandbox_id,
-                protocol,
-                guest_port,
-                visibility,
-                source,
-                desired_state,
-                apply_state,
-                last_applied_node_id,
-                last_error,
-                last_bridge_status,
-                last_applied_bridge_generation,
-                last_observed_at,
-                created_at,
-                updated_at
-         FROM sandbox_port_exposures
-         WHERE sandbox_id = $1
-           AND protocol = 'tcp'
-           AND guest_port = $2"
-    ))
-    .bind(sandbox_id)
-    .bind(port as i32)
-    .fetch_optional(pool)
-    .await
-    .map_err(|err| db_contention_error("failed to load sandbox port exposure", &err))
+    pplx_space_sandbox_store::port_exposures::get_tcp(pool, sandbox_id, port as i32)
+        .await
+        .map(|exposure| exposure.map(SandboxPortExposure::from))
+        .map_err(|err| {
+            db_contention_error(
+                "failed to load sandbox port exposure",
+                &sqlx::Error::from(err),
+            )
+        })
 }
 
 async fn mark_sandbox_port_exposure_applied(
@@ -902,42 +905,21 @@ async fn mark_sandbox_port_exposure_applied(
     active_node_id: NodeId,
     observation: &SandboxPortExposureApplyObservation,
 ) -> Result<SandboxPortExposure, ControllerError> {
-    sqlx::query_as::<_, SandboxPortExposure>(sql!(
-        "UPDATE sandbox_port_exposures
-         SET apply_state = 'applied',
-             last_applied_node_id = $3,
-             last_error = NULL,
-             last_bridge_status = $4,
-             last_applied_bridge_generation = $5,
-             last_observed_at = NOW(),
-             updated_at = NOW()
-         WHERE sandbox_id = $1
-           AND protocol = 'tcp'
-           AND guest_port = $2
-           AND desired_state = 'open'
-         RETURNING sandbox_id,
-                   protocol,
-                   guest_port,
-                   visibility,
-                   source,
-                   desired_state,
-                   apply_state,
-                   last_applied_node_id,
-                   last_error,
-                   last_bridge_status,
-                   last_applied_bridge_generation,
-                   last_observed_at,
-                   created_at,
-                   updated_at"
-    ))
-    .bind(sandbox_id)
-    .bind(port as i32)
-    .bind(active_node_id)
-    .bind(observation.bridge_status)
-    .bind(observation.service_generation.as_deref())
-    .fetch_optional(pool)
+    pplx_space_sandbox_store::port_exposures::mark_applied(
+        pool,
+        sandbox_id,
+        port as i32,
+        active_node_id,
+        observation.as_bridge_observation(),
+    )
     .await
-    .map_err(|err| db_contention_error("failed to mark sandbox port exposure applied", &err))?
+    .map_err(|err| {
+        db_contention_error(
+            "failed to mark sandbox port exposure applied",
+            &sqlx::Error::from(err),
+        )
+    })?
+    .map(SandboxPortExposure::from)
     .ok_or_else(|| ControllerError::conflict("sandbox port exposure is no longer open"))
 }
 
@@ -950,38 +932,15 @@ async fn mark_sandbox_port_exposure_failed(
     observation: Option<&SandboxPortExposureApplyObservation>,
 ) {
     let error_message = error.to_string();
-    let bridge_status = observation.map(|observation| observation.bridge_status);
-    let service_generation =
-        observation.and_then(|observation| observation.service_generation.as_deref());
-    if let Err(update_error) = sqlx::query(sql!(
-        "UPDATE sandbox_port_exposures
-         SET apply_state = 'failed',
-             last_error = $4,
-             last_bridge_status = COALESCE($5::TEXT, last_bridge_status),
-             last_applied_bridge_generation =
-                 COALESCE($6::TEXT, last_applied_bridge_generation),
-             last_observed_at =
-                 CASE WHEN $5::TEXT IS NOT NULL THEN NOW() ELSE last_observed_at END,
-             updated_at = NOW()
-         WHERE sandbox_id = $1
-           AND protocol = 'tcp'
-           AND guest_port = $2
-           AND desired_state = 'open'
-           AND NOT (
-               apply_state = 'applied'
-               AND last_applied_node_id IS NOT DISTINCT FROM $3
-               AND last_bridge_status IN ('direct', 'loopback_forwarded')
-               AND last_observed_at >= NOW() - ($7::BIGINT * INTERVAL '1 second')
-           )"
-    ))
-    .bind(sandbox_id)
-    .bind(port as i32)
-    .bind(active_node_id)
-    .bind(error_message)
-    .bind(bridge_status)
-    .bind(service_generation)
-    .bind(SANDBOX_PORT_OBSERVATION_FRESHNESS_SECS)
-    .execute(pool)
+    if let Err(update_error) = pplx_space_sandbox_store::port_exposures::mark_failed(
+        pool,
+        sandbox_id,
+        port as i32,
+        active_node_id,
+        &error_message,
+        observation.map(SandboxPortExposureApplyObservation::as_bridge_observation),
+        SANDBOX_PORT_OBSERVATION_FRESHNESS_SECS,
+    )
     .await
     {
         tracing::warn!(
@@ -999,9 +958,22 @@ struct SandboxPortExposureApplyObservation {
     service_generation: Option<String>,
 }
 
+impl SandboxPortExposureApplyObservation {
+    fn as_bridge_observation(
+        &self,
+    ) -> pplx_space_sandbox_store::port_exposures::BridgeObservation<'_> {
+        pplx_space_sandbox_store::port_exposures::BridgeObservation {
+            bridge_status: self.bridge_status,
+            service_generation: self.service_generation.as_deref(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SandboxPortExposureApplyError {
-    error: ControllerError,
+    // Boxed: with the observation beside it, an inline `ControllerError`
+    // makes this the large `Err` that `clippy::result_large_err` refuses.
+    error: Box<ControllerError>,
     observation: Option<SandboxPortExposureApplyObservation>,
 }
 
@@ -1010,7 +982,10 @@ impl SandboxPortExposureApplyError {
         error: ControllerError,
         observation: Option<SandboxPortExposureApplyObservation>,
     ) -> Self {
-        Self { error, observation }
+        Self {
+            error: Box::new(error),
+            observation,
+        }
     }
 }
 
@@ -1067,7 +1042,7 @@ pub struct SandboxController {
     pub(crate) egress_profiles: crate::egress_profiles::EgressProfiles,
     tls_interception_exemptions:
         Option<crate::tls_interception_exemptions::TlsInterceptionExemptions>,
-    federated_grant_audience: pplx_space_common_core::types::FederatedGrantAudience,
+    federated_grant_audience: pplx_space_accounts::FederatedGrantAudience,
     substrate: Substrate,
     feature_flags: pplx_space_feature_flags::FeatureFlagClient,
     cluster_admission: Option<std::sync::Arc<crate::cluster_admission::ClusterSandboxAdmission>>,
@@ -1113,7 +1088,7 @@ impl SandboxController {
 
     pub fn with_federated_grant_audience(
         mut self,
-        audience: pplx_space_common_core::types::FederatedGrantAudience,
+        audience: pplx_space_accounts::FederatedGrantAudience,
     ) -> Self {
         self.federated_grant_audience = audience;
         self
@@ -1172,8 +1147,33 @@ impl SandboxController {
         self.substrate.managed_by()
     }
 
+    /// The substrate this controller drives.
+    pub fn substrate(&self) -> &Substrate {
+        &self.substrate
+    }
+
     pub fn substrate_capabilities(&self) -> super::substrate::SubstrateCapabilities {
         self.substrate.capabilities()
+    }
+
+    /// [`super::substrate::Substrate::boots_template_twins`].
+    pub fn boots_template_twins(&self) -> bool {
+        self.substrate.boots_template_twins()
+    }
+
+    /// Whether the substrate accepts a create pinned to a node pool (see
+    /// [`SubstrateAdapter::check_node_pool_placement`]).
+    pub fn check_node_pool_placement(
+        &self,
+        node_pool: &NodePoolName,
+    ) -> Result<(), SubstrateError> {
+        self.substrate.check_node_pool_placement(node_pool)
+    }
+
+    /// Whether this deployment records activating clients (see
+    /// [`super::substrate::ActivationClientAttribution`]).
+    pub fn activation_client_attribution(&self) -> super::substrate::ActivationClientAttribution {
+        self.substrate.activation_client_attribution()
     }
 
     pub async fn set_node_schedulability(
@@ -1209,8 +1209,8 @@ impl SandboxController {
         self.substrate
             .enqueue_artifact_backup(
                 sandbox_id,
-                pplx_space_common_core::types::ArtifactKind::Full,
-                pplx_space_common_core::types::BackupSource::CurrentInstance,
+                pplx_space_snapshot_model::ArtifactKind::Full,
+                pplx_space_snapshot_model::BackupSource::CurrentInstance,
                 target,
             )
             .await
@@ -1258,27 +1258,24 @@ pub(crate) async fn fetch_sandbox_wake_signal(
     pool: &PgPool,
     sandbox_id: SandboxId,
 ) -> Result<Option<SandboxWakeSignal>, sqlx::Error> {
-    let row: Option<(String, bool)> = sqlx::query_as(sql!(
-        "SELECT lifecycle,
-                lifecycle_changed_at > NOW() - make_interval(secs => $2)
-           FROM sandboxes
-          WHERE id = $1"
-    ))
-    .bind(sandbox_id)
-    .bind(POST_WAKE_LISTENER_REBIND_GRACE.as_secs_f64())
-    .fetch_optional(pool)
+    let row = pplx_space_sandbox_store::runtime_access::runtime_access(
+        pool,
+        sandbox_id,
+        POST_WAKE_LISTENER_REBIND_GRACE.as_secs_f64(),
+    )
     .await?;
-    Ok(row.map(|(lifecycle, lifecycle_changed_recently)| {
+    Ok(row.map(|row| {
         SandboxWakeSignal {
             // Normalize before parsing: the lifecycle column is fed from
             // substrate-reported status, so tolerate casing/whitespace
             // rather than silently treating `Restoring` as unknown.
-            lifecycle: lifecycle
+            lifecycle: row
+                .lifecycle
                 .trim()
                 .to_ascii_lowercase()
                 .parse::<SandboxLifecycle>()
                 .ok(),
-            lifecycle_changed_recently,
+            lifecycle_changed_recently: row.lifecycle_changed_recently,
         }
     }))
 }
@@ -1368,8 +1365,6 @@ mod ports;
 mod queries;
 mod requested_size_metrics;
 mod responses;
-#[cfg(test)]
-mod sandbox_portability_tests;
 pub(crate) mod spaced;
 pub(crate) use ingress::ingress_activation;
 mod wake_completion;
@@ -1383,10 +1378,8 @@ use responses::*;
 pub(crate) use org::sandbox_matches_federated_owner;
 pub use org::{SandboxAccessScope, SandboxPageCursor};
 pub(crate) use queries::org_byok_enabled;
-#[cfg(test)]
+#[cfg(all(test, feature = "kubernetes"))]
 pub(crate) use queries::pooled_prepare_error_is_reclaimable;
 pub use queries::{FederatedSandboxCreateContext, RestoreForkDiskAsNewContext};
-pub use responses::{
-    fetch_sandbox, sandbox_query, sandbox_to_response, update_and_fetch_post_wake_sandbox,
-};
+pub use responses::{fetch_sandbox, sandbox_to_response, update_and_fetch_post_wake_sandbox};
 pub(crate) use updates::{AccessIdleTimeoutOutcome, AutoLifecycleTouchOutcome};

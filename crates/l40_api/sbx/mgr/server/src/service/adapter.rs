@@ -101,6 +101,20 @@ impl SandboxManager for SandboxManagerService {
         SandboxManagerService::list_pending_local_backups(self, request).await
     }
 
+    async fn drain_node(
+        &self,
+        request: Request<crate::proto::DrainNodeRequest>,
+    ) -> Result<Response<crate::proto::DrainNodeResponse>, Status> {
+        SandboxManagerService::drain_node(self, request).await
+    }
+
+    async fn preview_drain_node(
+        &self,
+        request: Request<crate::proto::PreviewDrainNodeRequest>,
+    ) -> Result<Response<crate::proto::PreviewDrainNodeResponse>, Status> {
+        SandboxManagerService::preview_drain_node(self, request).await
+    }
+
     async fn list(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
         SandboxManagerService::list(self, request).await
     }
@@ -245,6 +259,16 @@ impl SandboxManager for SandboxManagerService {
         request: Request<crate::proto::GetRuntimeUpgradeRequest>,
     ) -> Result<Response<crate::proto::GetRuntimeUpgradeResponse>, Status> {
         SandboxManagerService::get_runtime_upgrade(self, &request).map(Response::new)
+    }
+
+    async fn abandon_runtime_upgrade(
+        &self,
+        request: Request<crate::proto::AbandonRuntimeUpgradeRequest>,
+    ) -> Result<Response<crate::proto::AbandonRuntimeUpgradeResponse>, Status> {
+        record_entry_sandbox_id(&request.get_ref().sandbox_id);
+        SandboxManagerService::abandon_runtime_upgrade(self, request)
+            .await
+            .map(Response::new)
     }
 
     async fn kill(&self, request: Request<KillRequest>) -> Result<Response<KillResponse>, Status> {

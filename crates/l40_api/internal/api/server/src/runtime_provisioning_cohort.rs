@@ -13,7 +13,7 @@
 
 use std::collections::BTreeSet;
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 use sha2::{Digest as _, Sha256};
 
 /// Serves recipes when truthy. Off by default; an unrecognized value reads as

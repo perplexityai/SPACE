@@ -31,7 +31,7 @@ impl SpacedHostClient {
         let include_metadata_events = options.include_metadata_events;
         let use_default_excludes = options.use_default_excludes;
         let user = options.user;
-        pplx_space_spaced_common::retry_status(
+        pplx_space_spaced_client::retry_status(
             "spaced host",
             "watch",
             self.config.command_retry_policy,

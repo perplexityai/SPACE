@@ -5,11 +5,10 @@
 // rest are cloned from it.
 // Exponential backoff on failures (5s → 160s max).
 
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pplx_space_common_core::ids::sandbox_label_or_id;
-use pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER;
+use pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER;
+use pplx_space_sandbox_model::ids::sandbox_label_or_id;
 
 const BASE_TICK: u64 = 5;
 const MAX_TICK: u64 = 160;
@@ -23,7 +22,7 @@ pub(crate) enum PoolError {
     #[error("sandbox-manager RPC failed: {0}")]
     SandboxRpc(#[from] tonic::Status),
     #[error("template-manager DB failed: {0}")]
-    Db(#[from] rusqlite::Error),
+    Db(#[from] crate::db::Error),
     #[error("pool clone task failed: {0}")]
     Join(#[from] tokio::task::JoinError),
     #[error("template has no build that supports memory pools")]
@@ -39,7 +38,7 @@ type PoolResult<T> = Result<T, PoolError>;
 /// advances the build's LRU in its own partition; a failed touch only costs
 /// LRU accuracy.
 pub(crate) fn pool_refill_build(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     template: &str,
 ) -> PoolResult<Option<crate::db::BuildRow>> {
     if let Some(build) = pool_build(conn, template)? {
@@ -59,7 +58,7 @@ pub(crate) fn pool_refill_build(
 /// Admission and refill share eligibility, including the distinction between
 /// absent builds (intent may precede publication) and present but unusable builds.
 pub(crate) fn pool_build(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     template: &str,
 ) -> PoolResult<Option<crate::db::BuildRow>> {
     if let Some(build) = pool_base_build(conn, template)? {
@@ -86,9 +85,9 @@ pub(crate) fn pool_build(
 /// recovery adopts legacy-layout builds bound to another environment in
 /// place; an environment partition's row bound to something else is never one.
 pub(crate) fn pool_base_build(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     template: &str,
-) -> rusqlite::Result<Option<crate::db::BuildRow>> {
+) -> crate::db::Result<Option<crate::db::BuildRow>> {
     use crate::db::TemplateCachePartition;
     let builds = crate::db::list_builds_by_name(conn, template)?;
     let mut resolved: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -113,9 +112,9 @@ pub(crate) fn pool_base_build(
                 && resolved.get(&build.content_hash) == Some(&build.cache_partition.key())
         })
         .filter_map(|build| {
-            use pplx_space_common_core::types::RuntimeKind;
+            use pplx_space_execution_spec::RuntimeKind;
             let runtime = build.runtime.parse::<RuntimeKind>().ok()?;
-            let manifest: pplx_space_common_core::types::TemplateManifest =
+            let manifest: pplx_space_template_manifest::TemplateManifest =
                 serde_json::from_str(&build.manifest_json).ok()?;
             let execution = manifest.execution_metadata().ok()?;
             if let Some(execution) = execution {
@@ -174,7 +173,7 @@ impl PoolTickOutcome {
 }
 
 /// Main loop: runs forever with adaptive tick interval.
-pub async fn pool_loop(db: Arc<Mutex<rusqlite::Connection>>) {
+pub async fn pool_loop(db: crate::db::SharedConnection) {
     let mut consecutive_failures: u32 = 0;
 
     loop {
@@ -213,7 +212,7 @@ pub async fn pool_loop(db: Arc<Mutex<rusqlite::Connection>>) {
 }
 
 /// Returns the tick outcome, including any pool sandboxes that failed this tick.
-async fn pool_tick(db: &Arc<Mutex<rusqlite::Connection>>) -> PoolResult<PoolTickOutcome> {
+async fn pool_tick(db: &crate::db::SharedConnection) -> PoolResult<PoolTickOutcome> {
     let mut outcome = PoolTickOutcome::default();
     let pools = {
         let conn = db
@@ -267,6 +266,7 @@ async fn pool_tick(db: &Arc<Mutex<rusqlite::Connection>>) -> PoolResult<PoolTick
                     sandbox_id: sbx.sandbox_id.clone(),
                     template_filter: None,
                     blocking: true,
+                    discard_retained_filesystem_reason: None,
                 })
                 .await
             {
@@ -350,7 +350,7 @@ async fn pool_tick(db: &Arc<Mutex<rusqlite::Connection>>) -> PoolResult<PoolTick
             );
             for _ in 0..clones_this_tick {
                 handles.push(tokio::spawn(clone_and_start(
-                    Arc::clone(db),
+                    db.clone(),
                     source_id.clone(),
                     pool.template.clone(),
                     pool.vcpu,
@@ -364,7 +364,7 @@ async fn pool_tick(db: &Arc<Mutex<rusqlite::Connection>>) -> PoolResult<PoolTick
                 pool.template
             );
             match create_from_base(
-                Arc::clone(db),
+                db.clone(),
                 pool.template.clone(),
                 pool.from_snapshot(),
                 pool.vcpu,
@@ -382,7 +382,7 @@ async fn pool_tick(db: &Arc<Mutex<rusqlite::Connection>>) -> PoolResult<PoolTick
                     let remaining = deficit.saturating_sub(1);
                     for _ in 0..remaining {
                         handles.push(tokio::spawn(clone_and_start(
-                            Arc::clone(db),
+                            db.clone(),
                             new_id.clone(),
                             pool.template.clone(),
                             pool.vcpu,
@@ -410,14 +410,14 @@ async fn pool_tick(db: &Arc<Mutex<rusqlite::Connection>>) -> PoolResult<PoolTick
 
 /// Create a pool sandbox from base snapshot (slow path). Returns sandbox_id on success.
 pub(crate) async fn create_from_base(
-    db: Arc<Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     template: String,
     from_snapshot: bool,
     vcpu: u32,
     memory_mib: u32,
 ) -> PoolResult<String> {
     let build = {
-        let db = Arc::clone(&db);
+        let db = db.clone();
         let template = template.clone();
         tokio::task::spawn_blocking(move || {
             let conn = db
@@ -431,14 +431,11 @@ pub(crate) async fn create_from_base(
         Some(build) => {
             let runtime = build
                 .runtime
-                .parse::<pplx_space_common_core::types::RuntimeKind>()
+                .parse::<pplx_space_execution_spec::RuntimeKind>()
                 .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
             (Some(build.content_hash), runtime)
         }
-        None => (
-            None,
-            pplx_space_common_core::types::RuntimeKind::Firecracker,
-        ),
+        None => (None, pplx_space_execution_spec::RuntimeKind::Firecracker),
     };
     match do_create_from_base(
         &template,
@@ -464,7 +461,7 @@ pub(crate) async fn create_from_base(
 async fn do_create_from_base(
     template: &str,
     content_hash: Option<String>,
-    runtime: pplx_space_common_core::types::RuntimeKind,
+    runtime: pplx_space_execution_spec::RuntimeKind,
     from_snapshot: bool,
     vcpu: u32,
     memory_mib: u32,
@@ -498,6 +495,7 @@ async fn do_create_from_base(
             rootfs_size_mb: None,
             disk_io_max_operations_per_sec: None,
             disk_io_max_bandwidth_mib_per_sec: None,
+            required_environment: None,
             network_policy: None,
             network_policy_generation: 0,
             network_policy_authority: crate::db::PolicyAuthority::Cluster.as_proto_i32(),
@@ -564,6 +562,7 @@ async fn do_create_from_base(
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: true,
+                discard_retained_filesystem_reason: None,
             })
             .await
         {
@@ -579,7 +578,7 @@ async fn do_create_from_base(
 
 /// Clone from a paused sandbox, start, and pause. Returns sandbox_id on success.
 async fn clone_and_start(
-    db: Arc<Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     source_id: String,
     template: String,
     vcpu: u32,
@@ -679,6 +678,7 @@ async fn do_clone_and_start(
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: true,
+                discard_retained_filesystem_reason: None,
             })
             .await
         {

@@ -24,8 +24,10 @@ use tokio_util::task::TaskTracker;
 use crate::metrics::sandbox::worker::{
     NetGatewayRouteVerificationStatus, NetGatewayTlsInterceptionMode,
 };
-use pplx_space_common_core::types::{LinuxPid, SandboxId, SemVer};
+use pplx_space_linux_ids::LinuxPid;
 use pplx_space_node_runtime_core::vm_state::VmState;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_semver::SemVer;
 
 use crate::auto_lifecycle::AutoLifecycleCoordinator;
 use crate::db::guest_health_scan::SandboxGuestHealthRow;
@@ -36,6 +38,7 @@ use crate::sidecar::{sidecar_alive, sidecar_live_pid};
 use crate::snapshot_scheduler::SnapshotScheduler;
 
 mod diagnostics;
+mod vm_memory;
 
 /// Health transition lines keep the watchdog's target, which log searches
 /// already select on, though `diagnostics` writes them.
@@ -57,6 +60,16 @@ const HEALTH_FAILURE_THRESHOLD: usize = 2;
 const HEALTH_SUCCESS_THRESHOLD: usize = 2;
 const GUEST_HEALTH_FAILURE_THRESHOLD: u32 = 3;
 const HEALTH_STALE_AFTER: Duration = Duration::from_secs(72);
+/// From this many consecutive Firecracker state timeouts on, the sandbox's
+/// next composed probe waits an extra [`HEALTH_PROBE_TIMEOUT_BACKOFF_EXTRA`]
+/// on top of the regular jittered interval.
+/// Node-manager answers a timed-out state read only after its own deadline,
+/// so repeating it on the regular cadence adds load to a host that is already
+/// slow. The backed-off interval leaves a wide margin below
+/// [`HEALTH_STALE_AFTER`] for a slow sweep, so backed-off health is not
+/// reported stale.
+const HEALTH_PROBE_TIMEOUT_BACKOFF_STREAK: u32 = 2;
+const HEALTH_PROBE_TIMEOUT_BACKOFF_EXTRA: Duration = Duration::from_secs(12);
 const HEALTH_PROBE_CONCURRENCY: usize = 32;
 const SPACED_HOST_HEALTH_TIMEOUT: Duration = Duration::from_millis(250);
 const SPACED_GUEST_HEALTH_TIMEOUT: Duration = Duration::from_millis(500);
@@ -69,7 +82,7 @@ const SIDECAR_RESTART_CONCURRENCY: usize = 16;
 const NODE_LEASE_MISSING_BACKOFF_INITIAL: Duration = SIDECAR_CHECK_INTERVAL;
 const NODE_LEASE_MISSING_BACKOFF_MAX: Duration = Duration::from_secs(300);
 const NODE_LEASE_MISSING_HEALTH_DETAIL: &str = "node lease missing: the last sidecar relaunch found no node-manager network lease; relaunches are backing off";
-const RUN_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_RUN_DIR;
+const RUN_DIR: &str = pplx_space_host_layout::paths::SANDBOX_RUN_DIR;
 const GUEST_HEALTH_LIFECYCLES: [crate::state::SandboxState; 9] = [
     crate::state::SandboxState::Starting,
     crate::state::SandboxState::Started,
@@ -284,9 +297,11 @@ struct GuestHealthGaugeValue {
 
 #[derive(Clone)]
 pub struct SidecarInfo {
-    pub guest_image: pplx_space_common_core::types::guest_image::GuestImageContract,
-    pub node_execution_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+    pub guest_image: pplx_space_execution_spec::guest_image::GuestImageContract,
+    pub node_execution_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     pub sandbox_id: String,
+    pub(crate) created_at: Option<crate::db::timestamps::EpochSeconds>,
+    pub template: String,
     pub uid: Option<u32>,
     pub runtime_pid: Option<u32>,
     pub spaced_host_pid: Option<u32>,
@@ -302,6 +317,8 @@ fn sidecar_info_from_row(row: &crate::db::SandboxRow) -> SidecarInfo {
         guest_image: row.guest_image,
         node_execution_id: row.node_execution_id,
         sandbox_id: row.id.clone(),
+        created_at: crate::db::timestamps::EpochSeconds::parse(&row.created_at).ok(),
+        template: row.template.clone(),
         uid: row.uid,
         runtime_pid: row.pid,
         spaced_host_pid: row.spaced_host_pid,
@@ -546,6 +563,8 @@ pub struct SandboxHealth {
     lifecycle_epoch: u64,
     next_health_probe_at: Instant,
     health_probe_sequence: u64,
+    /// Consecutive composed probes whose Firecracker state read timed out.
+    firecracker_timeout_streak: u32,
     /// When a degraded transition last carried console tails, so a flapping
     /// sandbox cannot repeat them more often than
     /// `diagnostics::CONSOLE_TAIL_MIN_INTERVAL`.
@@ -716,8 +735,20 @@ struct HealthObservation {
 }
 
 struct ComposedProbeResult {
+    template: String,
     observations: [HealthObservation; 4],
     guest_status: Option<pplx_space_spaced_host_client::proto::GetStatusResponse>,
+    /// The guest's used memory from its successful Ping. Telemetry beside the
+    /// health observations, never part of them.
+    memory_used_bytes: Option<u64>,
+}
+
+/// Outputs of an accepted probe. Memory is emitted by the caller,
+/// not retained in watchdog state.
+struct AcceptedHealthResult {
+    template: String,
+    transition: Option<diagnostics::HealthTransition>,
+    memory_used_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -878,6 +909,14 @@ impl SandboxWatchdog {
             drain_state,
         );
         let restored_guests = crate::vm_diagnostics::RestoredGuests::default();
+        let host_reads = diagnostics::host_reads();
+        if pplx_space_observability::metrics_enabled() {
+            task_tracker.spawn(vm_memory::run(
+                Arc::clone(&sidecars),
+                host_reads.clone(),
+                shutdown_token.child_token(),
+            ));
+        }
         let health = composed_health_loop(
             state.clone(),
             sidecars.clone(),
@@ -888,6 +927,7 @@ impl SandboxWatchdog {
             shutdown_token.child_token(),
             node_manager.clone(),
             restored_guests.clone(),
+            host_reads,
         );
         task_tracker.spawn(async move {
             let _guard = health_guard;
@@ -923,6 +963,7 @@ impl SandboxWatchdog {
                 auto_lifecycle: auto_lifecycle.clone(),
                 health_lifecycle: lifecycle_epochs.clone(),
                 node_manager: node_manager.clone(),
+                activation_seal: Arc::new(crate::activation_seal::ActivationSeal::unsealed()),
             },
         )));
         Self::new(
@@ -982,6 +1023,7 @@ impl SandboxWatchdog {
             lifecycle_epoch: 0,
             next_health_probe_at: now + initial_health_probe_delay(&id),
             health_probe_sequence: 0,
+            firecracker_timeout_streak: 0,
             last_console_tail_at: None,
             guest_unresponsive: None,
             node_lease_backoff: None,
@@ -1135,6 +1177,31 @@ impl SandboxWatchdog {
     /// relaunch entry point for callers outside the watchdog loop — the clear
     /// cannot be forgotten because it is not the caller's job.
     pub async fn relaunch_netgtw(&self, sandbox_id: &str, uid: u32) -> Result<u32, String> {
+        self.relaunch_netgtw_replacing(sandbox_id, uid, None)
+            .await
+            .map(|relaunch| relaunch.pid)
+    }
+
+    /// Replace the live net-gateway at `old_pid` in one node-manager launch
+    /// that hands its listening sockets to the replacement. A returned pid
+    /// equal to `old_pid` means the node predates the handover and left the
+    /// old gateway running; nothing is committed then.
+    pub async fn replace_netgtw(
+        &self,
+        sandbox_id: &str,
+        uid: u32,
+        old_pid: u32,
+    ) -> Result<NetGatewayRelaunch, String> {
+        self.relaunch_netgtw_replacing(sandbox_id, uid, Some(old_pid))
+            .await
+    }
+
+    async fn relaunch_netgtw_replacing(
+        &self,
+        sandbox_id: &str,
+        uid: u32,
+        replace_gateway_pid: Option<u32>,
+    ) -> Result<NetGatewayRelaunch, String> {
         let info = self
             .sidecars
             .lock()
@@ -1155,6 +1222,7 @@ impl SandboxWatchdog {
             &self.state,
             &self.feature_flags,
             &self.node_manager,
+            replace_gateway_pid,
         )
         .await
         .map_err(|error| error.to_string())
@@ -2460,6 +2528,7 @@ async fn composed_health_loop(
     shutdown_token: CancellationToken,
     node_manager: NodeManagerConnector,
     restored_guests: crate::vm_diagnostics::RestoredGuests,
+    host_reads: diagnostics::HostReads,
 ) {
     let mut interval = tokio::time::interval(HEALTH_SCHEDULER_TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2469,8 +2538,12 @@ async fn composed_health_loop(
     let evidence_queue = Arc::new(diagnostics::admission::EvidenceQueue::new(
         diagnostics::admission::EVIDENCE_QUEUE_CAPACITY,
     ));
-    let host_reads = diagnostics::host_reads();
     let cgroup_parent = diagnostics::sandbox_cgroup_parent().await;
+    tracing::info!(
+        target: LOG_TARGET,
+        cgroup_parent = %cgroup_parent.display(),
+        "guest-health evidence samples VM jailer cgroups under this parent"
+    );
     let mut evidence_collectors = tokio::task::JoinSet::new();
     for _ in 0..diagnostics::admission::EVIDENCE_COLLECTORS {
         evidence_collectors.spawn(diagnostics::run_evidence_collector(
@@ -2634,7 +2707,7 @@ async fn probe_composed_health(
     };
     let spaced_guest = probe_spaced_guest_health(info, lifecycle, restored_guests);
     let net_gateway = probe_net_gateway_health(sandbox_id);
-    let (firecracker, spaced_host, spaced_guest, net_gateway) =
+    let (firecracker, spaced_host, (spaced_guest, memory_used_bytes), net_gateway) =
         tokio::join!(firecracker, spaced_host, spaced_guest, net_gateway);
     let guest_status = if spaced_host.outcome == HealthProbeOutcome::Success {
         read_guest_status_via_spaced_host(sandbox_id).await
@@ -2642,8 +2715,10 @@ async fn probe_composed_health(
         None
     };
     ComposedProbeResult {
+        template: info.template.clone(),
         observations: [firecracker, spaced_host, spaced_guest, net_gateway],
         guest_status,
+        memory_used_bytes,
     }
 }
 
@@ -2683,13 +2758,11 @@ async fn probe_firecracker_health(
         }
     };
     match crate::runtime_via_nodemgr::get_vm_state(sandbox_id, node_manager).await {
-        Err(crate::runtime_via_nodemgr::RuntimeStateReadError::Timeout { .. }) => {
-            health_observation(
-                started,
-                HealthProbeOutcome::Timeout,
-                "Firecracker state request timed out",
-            )
-        }
+        Err(error) if error.is_timeout() => health_observation(
+            started,
+            HealthProbeOutcome::Timeout,
+            "Firecracker state request timed out",
+        ),
         Err(error) => health_observation(
             started,
             HealthProbeOutcome::Unavailable,
@@ -2733,77 +2806,99 @@ async fn probe_spaced_host_health(sandbox_id: &str) -> HealthObservation {
     observation_from_probe_result(started, result, "pong")
 }
 
+/// The guest's health, and the used memory its successful Ping reported.
 async fn probe_spaced_guest_health(
     info: &SidecarInfo,
     lifecycle: Option<crate::state::SandboxState>,
     restored_guests: &crate::vm_diagnostics::RestoredGuests,
-) -> HealthObservation {
+) -> (HealthObservation, Option<u64>) {
     let started = Instant::now();
     if !info.guest_image.expects_agent() || lifecycle == Some(crate::state::SandboxState::Paused) {
-        return health_observation(
-            started,
-            HealthProbeOutcome::NotApplicable,
-            if info.guest_image.expects_agent() {
-                "guest vCPUs are paused"
-            } else {
-                "guest image has no SPACE guest agent"
-            },
+        return (
+            health_observation(
+                started,
+                HealthProbeOutcome::NotApplicable,
+                if info.guest_image.expects_agent() {
+                    "guest vCPUs are paused"
+                } else {
+                    "guest image has no SPACE guest agent"
+                },
+            ),
+            None,
         );
     }
     let Some(vsock_uds_path) = info.vsock_uds_path.as_deref() else {
-        return health_observation(
-            started,
-            HealthProbeOutcome::Unavailable,
-            "v.sock path is absent",
+        return (
+            health_observation(
+                started,
+                HealthProbeOutcome::Unavailable,
+                "v.sock path is absent",
+            ),
+            None,
         );
     };
     let (Some(runtime_pid), Some(uid)) = (info.runtime_pid, info.uid) else {
-        return health_observation(
-            started,
-            HealthProbeOutcome::Unavailable,
-            "Firecracker peer credentials are absent",
+        return (
+            health_observation(
+                started,
+                HealthProbeOutcome::Unavailable,
+                "Firecracker peer credentials are absent",
+            ),
+            None,
         );
     };
     let Ok(runtime_pid) = i32::try_from(runtime_pid) else {
-        return health_observation(
-            started,
-            HealthProbeOutcome::Unavailable,
-            "Firecracker pid is outside the peer-credential range",
+        return (
+            health_observation(
+                started,
+                HealthProbeOutcome::Unavailable,
+                "Firecracker pid is outside the peer-credential range",
+            ),
+            None,
         );
     };
     let result = tokio::time::timeout(SPACED_GUEST_HEALTH_TIMEOUT, async {
         let (channel, _) =
-            pplx_space_spaced_common::connect_firecracker_vsock_channel_with_expected_peer(
+            pplx_space_spaced_client::connect_firecracker_vsock_channel_with_expected_peer(
                 "spaced guest health",
                 Path::new(vsock_uds_path),
-                pplx_space_spaced_common::BRIDGE_GUEST_VSOCK_PORT,
-                pplx_space_spaced_common::ExpectedUdsPeer::new(runtime_pid, uid),
+                pplx_space_spaced_guest_protocol::BRIDGE_GUEST_VSOCK_PORT,
+                pplx_space_spaced_client::ExpectedUdsPeer::new(runtime_pid, uid),
             )
             .await
             .map_err(|error| error.to_string())?;
         let mut client =
-            pplx_space_spaced_common::proto::bridge_guest::meta_client::MetaClient::new(channel)
-                .max_decoding_message_size(
-                    pplx_space_spaced_common::BRIDGE_GUEST_PING_MAX_DECODE_BYTES,
-                );
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::meta_client::MetaClient::new(
+                channel,
+            )
+            .max_decoding_message_size(
+                pplx_space_spaced_client::BRIDGE_GUEST_PING_MAX_DECODE_BYTES,
+            );
         // This probe is the one host caller that drains the guest's
         // diagnostics; spaced-host's own pings leave them in place.
         client
-            .ping(pplx_space_spaced_common::proto::bridge_guest::PingRequest {
-                drain_diagnostics: true,
-            })
+            .ping(
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::PingRequest {
+                    drain_diagnostics: true,
+                },
+            )
             .await
             .map_err(|error| error.to_string())
     })
     .await;
+    let mut memory_used_bytes = None;
     if let Ok(Ok(response)) = &result {
         crate::vm_diagnostics::forward_guest_diagnostics(
             &info.sandbox_id,
             response.get_ref(),
             restored_guests,
         );
+        memory_used_bytes = response.get_ref().memory_used_bytes;
     }
-    observation_from_probe_result(started, result, "pong")
+    (
+        observation_from_probe_result(started, result, "pong"),
+        memory_used_bytes,
+    )
 }
 
 // The probe dials afresh, unlike the gateway's kept clients: a dial is what
@@ -2958,7 +3053,12 @@ async fn apply_and_reconcile_composed_health_result(
             .map(|id| (id, *lifecycle_epoch)),
         _ => None,
     };
-    let transition = apply_composed_health_result(state, db, result).await;
+    let accepted = apply_composed_health_result(state, db, result).await;
+    if let Some(accepted) = accepted.as_ref()
+        && let Some(memory_used_bytes) = accepted.memory_used_bytes
+    {
+        crate::metrics::sandbox::worker::guest_memory_used(&accepted.template, memory_used_bytes);
+    }
     if let Some((sandbox_id, lifecycle_epoch)) = pause_failed_recovery {
         reconcile_pause_failed_quarantine(
             db,
@@ -2970,20 +3070,46 @@ async fn apply_and_reconcile_composed_health_result(
         )
         .await;
     }
-    transition
+    accepted.and_then(|accepted| accepted.transition)
 }
 
+/// Tracks consecutive Firecracker state timeouts and pushes the sandbox's
+/// next probe out while they continue.
+fn record_firecracker_probe_outcome(
+    health: &mut SandboxHealth,
+    sandbox_id: &str,
+    outcome: HealthProbeOutcome,
+) {
+    if outcome != HealthProbeOutcome::Timeout {
+        health.firecracker_timeout_streak = 0;
+        return;
+    }
+    health.firecracker_timeout_streak = health.firecracker_timeout_streak.saturating_add(1);
+    if health.firecracker_timeout_streak >= HEALTH_PROBE_TIMEOUT_BACKOFF_STREAK {
+        let backoff = timeout_backoff_probe_delay(sandbox_id, health.health_probe_sequence);
+        health.next_health_probe_at = health.next_health_probe_at.max(Instant::now() + backoff);
+    }
+}
+
+fn timeout_backoff_probe_delay(sandbox_id: &str, sequence: u64) -> Duration {
+    HEALTH_PROBE_TIMEOUT_BACKOFF_EXTRA + next_health_probe_delay(sandbox_id, sequence)
+}
+
+/// Apply a completed probe unless it is from an older lifecycle epoch or its
+/// sandbox is gone, which discards it: `None`.
 async fn apply_composed_health_result(
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
     db: &crate::db::SharedConnection,
     result: Option<CompletedHealthProbe>,
-) -> Option<diagnostics::HealthTransition> {
+) -> Option<AcceptedHealthResult> {
     let Some(Ok((sandbox_id, lifecycle, lifecycle_epoch, result))) = result else {
         return None;
     };
     let ComposedProbeResult {
+        template,
         observations,
         guest_status,
+        memory_used_bytes,
     } = result;
     let mut map = state.lock().await;
     let health = map.get_mut(&sandbox_id)?;
@@ -3009,6 +3135,9 @@ async fn apply_composed_health_result(
             ));
         }
         let outcome = observation.outcome;
+        if component == HealthComponent::Firecracker {
+            record_firecracker_probe_outcome(health, &sandbox_id, outcome);
+        }
         crate::metrics::sandbox::worker::sandbox_health_probe(
             component.as_metric(),
             outcome.as_metric(),
@@ -3068,7 +3197,14 @@ async fn apply_composed_health_result(
             }
         }
     }
-    transition
+    // Memory takes the epoch fence above with the rest of the result: a
+    // lifecycle edge since dispatch discarded it all.
+    Some(AcceptedHealthResult {
+        template,
+        transition,
+        memory_used_bytes: memory_used_bytes
+            .filter(|_| lifecycle == Some(crate::state::SandboxState::Started)),
+    })
 }
 
 async fn reconcile_pause_failed_quarantine(
@@ -3287,11 +3423,12 @@ async fn restart_spaced_host(
                 pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(id, None).into()
             }),
             sandbox_id: id.clone(),
-            program: pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN.to_string(),
+            program: pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN.to_string(),
             args: spaced_host_restart_args(id, vsock_uds_path, agent),
             uid,
             gid: uid,
             env: crate::sidecar_env::telemetry_env_for_service("space-spaced-host"),
+            replace_gateway_pid: None,
         })
         .await
         .map_err(SpacedHostRestartError::Launch)?;
@@ -3300,12 +3437,12 @@ async fn restart_spaced_host(
     let config =
         pplx_space_spaced_host_client::SpacedHostClientConfig::default().with_socket_path(format!(
             "{RUN_DIR}/{id}/{}",
-            pplx_space_common_core::host::linux::paths::SPACED_HOST_SOCKET_FILE
+            pplx_space_host_layout::paths::SPACED_HOST_SOCKET_FILE
         ));
     let spaced_host =
         pplx_space_spaced_host_client::SpacedHostClient::new_with_config_and_expected_peer(
             config,
-            pplx_space_spaced_common::ExpectedUdsPeer::new(
+            pplx_space_spaced_client::ExpectedUdsPeer::new(
                 i32::try_from(pid).map_err(|_| SpacedHostRestartError::PidOutOfRange(pid))?,
                 uid,
             ),
@@ -3356,17 +3493,17 @@ async fn restart_spaced_host(
 fn spaced_host_restart_args(
     sandbox_id: &str,
     vsock_uds_path: String,
-    agent: pplx_space_common_core::types::guest_image::QualifiedGuestAgent,
+    agent: pplx_space_execution_spec::guest_image::QualifiedGuestAgent,
 ) -> Vec<String> {
     vec![
         "--socket".to_string(),
-        pplx_space_common_core::host::linux::paths::spaced_host_socket(sandbox_id),
+        pplx_space_host_layout::paths::spaced_host_socket(sandbox_id),
         "--sandbox-id".to_string(),
         sandbox_id.to_string(),
         "--vsock-uds".to_string(),
         vsock_uds_path,
         "--host-control-socket".to_string(),
-        pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
+        pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
         "--boot-type".to_string(),
         if agent.supports_memory_lifecycle() {
             "resume"
@@ -3394,9 +3531,18 @@ async fn restart_netgtw(
         state,
         feature_flags,
         node_manager,
+        None,
     )
     .await?;
     Ok(())
+}
+
+/// A relaunched net-gateway, and how many listening sockets it took over
+/// from the gateway it replaced.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetGatewayRelaunch {
+    pub pid: u32,
+    pub inherited_sockets: u32,
 }
 
 /// Launch (or relaunch) the net-gateway sidecar for a sandbox via node-manager,
@@ -3408,6 +3554,10 @@ async fn restart_netgtw(
 /// launch succeeded but its PID was not committed, runtime-supervisor returns
 /// that live process and this call finishes the interrupted commit instead of
 /// forking a duplicate.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the watchdog's shared state is passed through unchanged"
+)]
 async fn relaunch_netgtw(
     info: &SidecarInfo,
     db: &crate::db::SharedConnection,
@@ -3416,7 +3566,8 @@ async fn relaunch_netgtw(
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
     feature_flags: &pplx_space_feature_flags::FeatureFlagClient,
     node_manager: &NodeManagerConnector,
-) -> Result<u32, NetGatewayRelaunchError> {
+    replace_gateway_pid: Option<u32>,
+) -> Result<NetGatewayRelaunch, NetGatewayRelaunchError> {
     let failed = NetGatewayRelaunchError::Failed;
     let sandbox_id = &info.sandbox_id;
     let uid = info
@@ -3438,15 +3589,25 @@ async fn relaunch_netgtw(
                 pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(id, None).into()
             }),
             sandbox_id: sandbox_id.to_string(),
-            program: pplx_space_common_core::host::linux::paths::NET_GATEWAY_SVC_BIN.to_string(),
+            program: pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN.to_string(),
             args,
             uid: process_uid,
             gid: process_uid,
             env: crate::sidecar_env::net_gateway_env(),
+            replace_gateway_pid,
         })
         .await
-        .map_err(NetGatewayRelaunchError::Launch)?;
-    let pid = resp.get_ref().pid;
+        .map_err(NetGatewayRelaunchError::Launch)?
+        .into_inner();
+    let relaunch = NetGatewayRelaunch {
+        pid: resp.pid,
+        inherited_sockets: resp.inherited_gateway_sockets,
+    };
+    if replace_gateway_pid == Some(relaunch.pid) {
+        // The node predates the handover and returned the live gateway.
+        return Ok(relaunch);
+    }
+    let pid = relaunch.pid;
 
     commit_netgtw_replacement(sandbox_id, uid, info.netgtw_pid, pid, db, sidecars, state)
         .await
@@ -3455,10 +3616,11 @@ async fn relaunch_netgtw(
     tracing::info!(
         sandbox_id = %sandbox_id,
         pid,
+        inherited_sockets = relaunch.inherited_sockets,
         "net-gateway restarted"
     );
     network_policy_reconcile_queue.enqueue(sandbox_id.to_string());
-    Ok(pid)
+    Ok(relaunch)
 }
 
 async fn commit_netgtw_replacement(
@@ -3541,7 +3703,7 @@ fn clear_netgtw_probe_state(state: &mut HashMap<String, SandboxHealth>, sandbox_
 fn spaced_host_socket_path(sandbox_id: &str) -> String {
     format!(
         "{RUN_DIR}/{sandbox_id}/{}",
-        pplx_space_common_core::host::linux::paths::SPACED_HOST_SOCKET_FILE
+        pplx_space_host_layout::paths::SPACED_HOST_SOCKET_FILE
     )
 }
 

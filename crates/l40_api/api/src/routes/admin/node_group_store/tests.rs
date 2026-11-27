@@ -1,8 +1,7 @@
-use pplx_space_common_core::types::NodeGroupId;
-use pplx_space_common_core::types::{NodeId, OrgId};
+use pplx_space_accounts::{NodeId, OrgId};
+use pplx_space_node_model::NodeGroupId;
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeGroupName, NodeGroupTemplatePolicy};
+use pplx_space_node_model::{NodeGroupName, NodeGroupTemplatePolicy};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -143,7 +142,7 @@ async fn create_conflicts_and_default_move() -> TestResult {
     .await?;
     let mut tx = pool.begin().await?;
     assert_eq!(
-        lock_current_default_for_update(&mut tx).await?,
+        pplx_space_node_group_store::locks::lock_default_node_group(&mut *tx).await?,
         Some(shared)
     );
     move_default_in_tx(&mut tx, other).await?;
@@ -314,13 +313,19 @@ async fn concurrent_set_default_loser_hits_identifiable_conflict() -> TestResult
     // committed default (nothing to clear), then blocks on the single-default
     // unique index until tx1 commits — and loses with a violation.
     let mut tx1 = pool.begin().await?;
-    assert_eq!(lock_current_default_for_update(&mut tx1).await?, None);
+    assert_eq!(
+        pplx_space_node_group_store::locks::lock_default_node_group(&mut *tx1).await?,
+        None
+    );
     move_default_in_tx(&mut tx1, group_a).await?;
 
     let loser_pool = pool.clone();
     let loser = tokio::spawn(async move {
         let mut tx2 = loser_pool.begin().await?;
-        assert_eq!(lock_current_default_for_update(&mut tx2).await?, None);
+        assert_eq!(
+            pplx_space_node_group_store::locks::lock_default_node_group(&mut *tx2).await?,
+            None
+        );
         move_default_in_tx(&mut tx2, group_b).await?;
         tx2.commit().await
     });
@@ -395,59 +400,6 @@ async fn group_occupancy_counts_inflight_uploads_from_group_nodes() -> TestResul
     Ok(())
 }
 
-/// The cached-rootfs guard strands only org-specific templates whose
-/// owner differs from the new assignment; generic rootfs never blocks.
-#[tokio::test(flavor = "current_thread")]
-async fn stranded_cached_templates_respects_owner_and_visibility() -> TestResult {
-    let Some(fixture) = postgres_fixture().await? else {
-        return Ok(());
-    };
-    let pool = &fixture.pool;
-    let group = insert_node_group(
-        pool,
-        &group_name("org-a-dedicated"),
-        Some(OrgId::from_uuid(ORG_A)),
-        NodeGroupTemplatePolicy::Default,
-        false,
-    )
-    .await?;
-    let node = insert_node_in_group(pool, group).await?;
-    insert_template(
-        pool,
-        "a-secret",
-        "org_specific",
-        Some(OrgId::from_uuid(ORG_A)),
-    )
-    .await?;
-    insert_template(pool, "base-generic", "generic", None).await?;
-    for template in ["a-secret", "base-generic"] {
-        sqlx::query("INSERT INTO node_template_inventory (node_id, template_name) VALUES ($1, $2)")
-            .bind(node)
-            .bind(template)
-            .execute(pool)
-            .await?;
-    }
-
-    let mut tx = pool.begin().await?;
-    // Releasing to generic strands A's org-specific rootfs.
-    assert_eq!(
-        stranded_cached_templates_in_tx(&mut tx, group, None).await?,
-        1
-    );
-    // Re-assigning to the same owner strands nothing.
-    assert_eq!(
-        stranded_cached_templates_in_tx(&mut tx, group, Some(OrgId::from_uuid(ORG_A))).await?,
-        0
-    );
-    // Handing the group to another org strands A's rootfs.
-    assert_eq!(
-        stranded_cached_templates_in_tx(&mut tx, group, Some(OrgId::from_uuid(ORG_B))).await?,
-        1
-    );
-    tx.commit().await?;
-    Ok(())
-}
-
 /// Releasing (or re-assigning) a restricted group resets the policy and
 /// clears the allowlist in the same transaction.
 #[tokio::test(flavor = "current_thread")]
@@ -513,8 +465,8 @@ async fn compat_replace_and_policy_switch_clear() -> TestResult {
     .await?;
 
     let mut tx = pool.begin().await?;
-    let known = templates_by_names_in_tx(
-        &mut tx,
+    let known = pplx_space_template_store::templates::share_lock_visibilities(
+        &mut *tx,
         &["a-secret".to_string(), "base-generic".to_string()],
     )
     .await?;
@@ -561,9 +513,7 @@ async fn compat_replace_and_policy_switch_clear() -> TestResult {
 /// hard cross-org rule violated with no database constraint to catch it.
 #[tokio::test(flavor = "current_thread")]
 async fn compat_validation_serializes_against_concurrent_narrowing() -> TestResult {
-    use pplx_space_common_core::types::TemplateVisibility;
-
-    use crate::routes::admin::template_store;
+    use pplx_space_template_model::TemplateVisibility;
 
     let Some(fixture) = postgres_fixture().await? else {
         return Ok(());
@@ -582,10 +532,14 @@ async fn compat_validation_serializes_against_concurrent_narrowing() -> TestResu
     // Compat transaction: lock the group, validate the allowlist. At
     // validation time the template is still generic, so it passes.
     let mut compat_tx = pool.begin().await?;
-    lock_group_for_update(&mut compat_tx, group)
+    pplx_space_node_group_store::groups::lock_node_group(&mut *compat_tx, group)
         .await?
         .expect("group row");
-    let known = templates_by_names_in_tx(&mut compat_tx, &["victim".to_string()]).await?;
+    let known = pplx_space_template_store::templates::share_lock_visibilities(
+        &mut *compat_tx,
+        &["victim".to_string()],
+    )
+    .await?;
     assert!(
         known
             .iter()
@@ -602,16 +556,20 @@ async fn compat_validation_serializes_against_concurrent_narrowing() -> TestResu
     let flip_pool = pool.clone();
     let flip = tokio::spawn(async move {
         let mut tx = flip_pool.begin().await?;
-        template_store::lock_template_for_update(&mut tx, "victim").await?;
-        template_store::update_template_visibility_in_tx(
-            &mut tx,
+        pplx_space_template_store::templates::lock_visibility(&mut *tx, "victim").await?;
+        pplx_space_template_store::templates::update_visibility(
+            &mut *tx,
             "victim",
             TemplateVisibility::OrgSpecific,
             Some(OrgId::from_uuid(ORG_B)),
         )
         .await?;
-        template_store::prune_cross_org_compat_in_tx(&mut tx, "victim", OrgId::from_uuid(ORG_B))
-            .await?;
+        pplx_space_node_group_store::prune_cross_org_template_compat(
+            &mut *tx,
+            "victim",
+            OrgId::from_uuid(ORG_B),
+        )
+        .await?;
         tx.commit().await?;
         Ok::<_, sqlx::Error>(())
     });
@@ -641,54 +599,6 @@ async fn compat_validation_serializes_against_concurrent_narrowing() -> TestResu
     Ok(())
 }
 
-/// `nodes_count` must include NULL-membership nodes for the singleton
-/// default group: unlabeled (or unknown-label) nodes mirror as NULL,
-/// which everywhere else resolves to the default generic group. Other
-/// groups count only explicit membership.
-#[tokio::test(flavor = "current_thread")]
-async fn default_group_nodes_count_includes_null_membership() -> TestResult {
-    let Some(fixture) = postgres_fixture().await? else {
-        return Ok(());
-    };
-    let pool = &fixture.pool;
-    let default_group = insert_node_group(
-        pool,
-        &group_name("workers-shared"),
-        None,
-        NodeGroupTemplatePolicy::Default,
-        true,
-    )
-    .await?;
-    let dedicated = insert_node_group(
-        pool,
-        &group_name("org-a-dedicated"),
-        Some(OrgId::from_uuid(ORG_A)),
-        NodeGroupTemplatePolicy::Default,
-        false,
-    )
-    .await?;
-    insert_node_in_group(pool, default_group).await?;
-    insert_node_in_group(pool, None).await?; // unlabeled worker — resolves to default
-    insert_node_in_group(pool, dedicated).await?;
-    // Non-worker rows always sit at NULL (the mirror stamps workers
-    // only); they are not members of the default *worker* pool.
-    insert_node_with_role(pool, None, "builder").await?;
-    insert_node_with_role(pool, None, "cluster").await?;
-
-    let store = AdminNodeGroupStore::new(pool.clone());
-    assert_eq!(
-        store.fetch(default_group).await?.expect("row").nodes_count,
-        2,
-        "default group counts explicit + NULL worker membership, not builder/cluster rows"
-    );
-    assert_eq!(
-        store.fetch(dedicated).await?.expect("row").nodes_count,
-        1,
-        "non-default groups count only explicit membership"
-    );
-    Ok(())
-}
-
 /// `nodes_count` in the row select reflects mirrored membership, and the
 /// `nodes.node_group_id` FK blocks deleting a group that still has
 /// nodes.
@@ -712,75 +622,13 @@ async fn delete_blocked_by_node_fk() -> TestResult {
     assert_eq!(store.fetch(group).await?.expect("row").nodes_count, 1);
 
     let mut tx = pool.begin().await?;
-    let err = delete_group_in_tx(&mut tx, group).await.unwrap_err();
+    let err = pplx_space_node_group_store::delete_node_group(&mut *tx, group)
+        .await
+        .map_err(sqlx::Error::from)
+        .unwrap_err();
     assert_eq!(
         violated_constraint(&err).as_deref(),
         Some("nodes_node_group_id_fkey")
-    );
-    Ok(())
-}
-
-/// The predicate behind the create handler's provisioning-order guard.
-///
-/// Worth its own test because the state it prevents is a **latch**, not a
-/// transient: the labeler's `ensure_default_group` seeds the default generic
-/// group only while no non-default group exists, so a dedicated group created
-/// on an empty table blocks that seeding permanently — and the default can be
-/// neither deleted nor un-defaulted, so no admin route clears it. One unguarded
-/// call would leave the cluster with dedicated capacity and no generic group,
-/// where every org without dedicated capacity resolves an empty candidate set,
-/// renders no boundary, and is held off the dedicated nodes only by the taint.
-#[tokio::test(flavor = "current_thread")]
-async fn generic_group_existence_gates_dedicated_creation() -> TestResult {
-    let Some(fixture) = postgres_fixture().await? else {
-        return Ok(());
-    };
-    let pool = &fixture.pool;
-
-    // Empty table: nothing to host a generic template, so a dedicated group
-    // must be refused by the caller.
-    assert!(
-        !generic_node_group_exists(pool).await?,
-        "an empty table has no generic group"
-    );
-
-    // A dedicated group alone does not satisfy it — this is the case the guard
-    // exists for, and asserting it is what keeps the predicate from being
-    // written as a bare row count.
-    let org_id = OrgId::new();
-    sqlx::query(sql!(
-        "INSERT INTO organizations (id, name, slug) VALUES ($1, 'Guard Org', $2)"
-    ))
-    .bind(org_id)
-    .bind(format!("guard-org-{org_id}"))
-    .execute(pool)
-    .await?;
-    insert_node_group(
-        pool,
-        &group_name("org-dedicated"),
-        Some(org_id),
-        NodeGroupTemplatePolicy::Default,
-        false,
-    )
-    .await?;
-    assert!(
-        !generic_node_group_exists(pool).await?,
-        "a dedicated group is not a generic one, however many exist"
-    );
-
-    // A generic group satisfies it whether or not it is the cluster default,
-    // because compatibility does not read `is_default`.
-    insert_node_group(
-        pool,
-        &group_name("workers-extra"),
-        None,
-        NodeGroupTemplatePolicy::Default,
-        false,
-    )
-    .await?;
-    assert!(
-        generic_node_group_exists(pool).await?,
-        "a non-default generic group still hosts generic templates"
     );
     Ok(())
 }

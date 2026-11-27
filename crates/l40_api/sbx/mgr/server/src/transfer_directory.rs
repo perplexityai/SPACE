@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs::File;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path};
@@ -5,7 +6,7 @@ use std::path::{Component, Path};
 use nix::fcntl::{OFlag, open, openat};
 use nix::sys::stat::{Mode, mkdirat};
 use nix::unistd::{Gid, fchown, geteuid};
-use pplx_space_common_core::host::linux::{identities::groups, paths};
+use pplx_space_host_layout::{identities::groups, paths};
 
 /// Sandbox-manager creates the destination; volume-manager writes the pull.
 /// Establish shared access even when the cache does not inherit its group.
@@ -24,7 +25,8 @@ pub(crate) fn prepare(path: &Path) -> std::io::Result<()> {
     prepare_under(root, relative)
 }
 
-fn prepare_under(root: &Path, relative: &Path) -> std::io::Result<()> {
+/// [`prepare`] for `relative` below the installation root `root`.
+pub(crate) fn prepare_under(root: &Path, relative: &Path) -> std::io::Result<()> {
     if relative.components().next().is_none()
         || relative
             .components()
@@ -63,16 +65,59 @@ fn prepare_under(root: &Path, relative: &Path) -> std::io::Result<()> {
         directory = File::from(openat(&directory, name, flags, Mode::empty())?);
         // A restrictive umask must not make newly created parents untraversable.
         if created {
-            share_directory(&directory, 0o2050)?;
+            share_directory(&directory, shared_cache_group(), 0o2050)?;
         }
     }
-    share_directory(&directory, 0o2070)
+    share_directory(&directory, shared_cache_group(), 0o2070)
 }
 
-fn share_directory(directory: &File, required_mode: u32) -> std::io::Result<()> {
+/// The group through which sandbox-manager and volume-manager share cache
+/// transfers.
+pub(crate) fn shared_cache_group() -> Gid {
+    Gid::from_raw(groups::SPACE_CACHE_RW.gid)
+}
+
+/// Create directory `name` in `parent` for members of `group` to read
+/// through, whatever the umask and whether `parent` passes its group on.
+/// Production passes [`shared_cache_group`].
+///
+/// `parent` must be the administrator-controlled cache directory: it is opened
+/// following symlinks, unlike the anchored walk in [`prepare`]. Only `name`
+/// is opened without following one.
+pub(crate) fn prepare_readable_child(
+    parent: &Path,
+    name: &OsStr,
+    group: Gid,
+) -> std::io::Result<()> {
+    let mut parts = Path::new(name).components();
+    if !matches!(
+        (parts.next(), parts.next()),
+        (Some(Component::Normal(_)), None)
+    ) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "expected one directory name",
+        ));
+    }
+    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+    let parent = File::from(open(parent, flags, Mode::empty())?);
+    match mkdirat(&parent, name, Mode::from_bits_truncate(0o750)) {
+        Ok(()) | Err(nix::errno::Errno::EEXIST) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let directory = File::from(openat(
+        &parent,
+        name,
+        flags | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )?);
+    share_directory(&directory, group, 0o2050)
+}
+
+fn share_directory(directory: &File, group: Gid, required_mode: u32) -> std::io::Result<()> {
     let metadata = directory.metadata()?;
     let mode = metadata.permissions().mode();
-    let shared_gid = groups::SPACE_CACHE_RW.gid;
+    let shared_gid = group.as_raw();
     // Correct root- or sibling-owned directories need no chmod/chown on retry.
     if metadata.gid() == shared_gid && mode & required_mode == required_mode {
         return Ok(());
@@ -84,7 +129,7 @@ fn share_directory(directory: &File, required_mode: u32) -> std::io::Result<()> 
         ));
     }
     if metadata.gid() != shared_gid {
-        fchown(directory, None, Some(Gid::from_raw(shared_gid)))?;
+        fchown(directory, None, Some(group))?;
     }
     directory.set_permissions(std::fs::Permissions::from_mode(
         (mode & 0o7777) | required_mode,

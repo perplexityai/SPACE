@@ -76,7 +76,7 @@ generates its own keys and leaf certificates. Origin peers serve the public
 `*.127-0-0-1.dev` development identity published by
 [AppCove](https://github.com/appcove/127-0-0-1.dev) under BSD-2-Clause. The runner
 pins the source revision and SHA-256 of the chain, key and license. The pinned
-certificate expires **2026-11-18**; renewal requires updating the reviewed pins.
+certificate expires **2027-02-03** (UTC); renewal requires updating the reviewed pins.
 An expired or unverifiable identity fails the suite. Downloads and private keys
 stay in temporary directories and are removed after the run.
 

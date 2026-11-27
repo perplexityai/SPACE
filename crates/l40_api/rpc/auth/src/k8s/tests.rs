@@ -36,6 +36,7 @@ fn test_k8s_config() -> K8sTokenAuthConfig {
         cluster_api_allowed_usernames: BTreeSet::from([
             "system:serviceaccount:space:space-cluster-controller".to_string(),
         ]),
+        firewall_rules_fetch_usernames: BTreeSet::new(),
         cache_ttl: Duration::from_secs(30),
         negative_cache_ttl: Duration::from_secs(2),
         cache_max_entries: 2,
@@ -140,6 +141,7 @@ async fn data_plane_identity_cannot_reuse_guest_authority_for_control_or_transfe
             ("ResolveDataPlaneSessionRoute", true),
             ("BindDataPlaneSessionProcess", true),
             ("RecordDataPlaneSessionReconnect", true),
+            ("RecordDataPlaneSessionProcessExited", true),
             ("GetDataPlaneSessionRevocationState", true),
             ("GetDataPlaneOrgRevocationEpoch", true),
             ("GetSandboxRuntimeAccess", true),

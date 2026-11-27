@@ -387,7 +387,7 @@ async fn public_baseline_preserves_rejected_history() {
         "UPDATE _sqlx_migrations SET version = 1",
         "UPDATE _sqlx_migrations SET version = version + 1",
         "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
-         SELECT version + 1, description, success, checksum, execution_time FROM _sqlx_migrations",
+         SELECT version + 1, description, FALSE, checksum, execution_time FROM _sqlx_migrations",
     ] {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("test.db");
@@ -778,4 +778,459 @@ async fn public_embedded_migrations_resume_after_common_schema_initialization() 
             .unwrap(),
         "intent"
     );
+}
+
+/// A catalog bundling `versions`, each of which creates `{prefix}_{version}`.
+fn numbered_catalog(prefix: &str, versions: &[i64]) -> Migrator {
+    use sqlx::SqlSafeStr as _;
+    use sqlx::migrate::MigrationType;
+    use std::borrow::Cow;
+
+    Migrator::with_migrations(
+        versions
+            .iter()
+            .map(|&version| {
+                Migration::new(
+                    version,
+                    Cow::Borrowed("step"),
+                    MigrationType::Simple,
+                    sqlx::AssertSqlSafe(format!(
+                        "CREATE TABLE {prefix}_{version} (id INTEGER PRIMARY KEY);"
+                    ))
+                    .into_sql_str(),
+                    false,
+                )
+            })
+            .collect(),
+    )
+}
+
+/// The newer release's catalogs: three service and three shared migrations.
+const NEWER: &[i64] = &[1, 2, 3];
+
+/// A database the newer release migrated and then wrote to.
+async fn newer_release_database(path: &Path) {
+    let (service, common) = (
+        numbered_catalog("service", NEWER),
+        numbered_catalog("common", NEWER),
+    );
+    migrate_embedded(
+        "test",
+        path,
+        EmbeddedMigrators {
+            service: &service,
+            common: Some(&common),
+        },
+    )
+    .await
+    .unwrap();
+    Connection::open(path)
+        .unwrap()
+        .execute_batch("INSERT INTO service_1 VALUES (42); INSERT INTO common_1 VALUES (7);")
+        .unwrap();
+}
+
+type StoredState = (
+    Vec<(String, String)>,
+    Vec<(String, i64, bool, Vec<u8>)>,
+    Vec<(String, i64)>,
+);
+
+/// The schema, both histories and the rows written: everything a refused or
+/// accepted rollback must leave as it found it.
+fn stored_state(path: &Path) -> StoredState {
+    let conn = Connection::open(path).unwrap();
+    let schema = conn
+        .prepare("SELECT name, sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let rows = conn
+        .prepare(
+            "SELECT 'service', id FROM service_1 UNION ALL SELECT 'common', id FROM common_1
+             ORDER BY 1, 2",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    (schema, embedded_history(&conn), rows)
+}
+
+const SERVICE_HISTORY: &str = "_sqlx_migrations";
+const COMMON_HISTORY: &str = "_space_common_schema_migrations";
+
+/// What the newer release's database records before the older release starts.
+#[derive(Clone, Copy)]
+enum Recorded {
+    /// Every migration succeeded with the checksum its catalog bundles.
+    AsApplied,
+    /// Migration 3 failed in this history.
+    Failed(&'static str),
+    /// Migration 2 records another well-formed checksum in this history.
+    Modified(&'static str),
+    /// Migration 2 is missing from this history.
+    Missing(&'static str),
+    /// Migration 3 records a checksum that isn't a SHA-384 digest.
+    Malformed(&'static str),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Outcome {
+    /// Starts twice and leaves the store unchanged, as does the newer release
+    /// afterwards.
+    Starts,
+    /// Refused with this history's message for this version.
+    Invalid(&'static str, i64),
+    /// Refused because the first history records newer migration 3 but the
+    /// second doesn't record bundled migration 2.
+    MissingBelowNewer(&'static str, &'static str),
+}
+
+/// Starts the older release, which bundles `older_service` and `older_common`
+/// of the newer release's catalogs, on a database the newer release left as
+/// `recorded`, and checks `outcome`.
+async fn run_older_release(
+    case: &'static str,
+    older_service: &[i64],
+    older_common: &[i64],
+    recorded: Recorded,
+    outcome: Outcome,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("database.sqlite");
+    newer_release_database(&path).await;
+    let change = match recorded {
+        Recorded::AsApplied => None,
+        Recorded::Failed(history) => Some(format!(
+            "UPDATE {history} SET success = 0 WHERE version = 3"
+        )),
+        // A SHA-384 digest's length, so only the comparison refuses it.
+        Recorded::Modified(history) => Some(format!(
+            "UPDATE {history} SET checksum = zeroblob(48) WHERE version = 2"
+        )),
+        Recorded::Missing(history) => Some(format!("DELETE FROM {history} WHERE version = 2")),
+        Recorded::Malformed(history) => Some(format!(
+            "UPDATE {history} SET checksum = x'00' WHERE version = 3"
+        )),
+    };
+    if let Some(change) = change {
+        Connection::open(&path)
+            .unwrap()
+            .execute(&change, [])
+            .unwrap();
+    }
+    let before = stored_state(&path);
+    let (older_service, older_common) = (
+        numbered_catalog("service", older_service),
+        numbered_catalog("common", older_common),
+    );
+    let older = EmbeddedMigrators {
+        service: &older_service,
+        common: Some(&older_common),
+    };
+
+    let result = migrate_embedded("test", &path, older).await;
+
+    match outcome {
+        Outcome::Starts => {
+            assert!(result.is_ok(), "{case}: {result:?}");
+            assert_eq!(stored_state(&path), before, "{case}");
+            migrate_embedded("test", &path, older).await.unwrap();
+            assert_eq!(stored_state(&path), before, "{case}");
+            // Rolling forward again applies nothing.
+            let (newer_service, newer_common) = (
+                numbered_catalog("service", NEWER),
+                numbered_catalog("common", NEWER),
+            );
+            migrate_embedded(
+                "test",
+                &path,
+                EmbeddedMigrators {
+                    service: &newer_service,
+                    common: Some(&newer_common),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        Outcome::Invalid(history, version) => {
+            let error = format!("{:#}", result.expect_err(case));
+            assert!(
+                error.ends_with(&format!(
+                    "{history} has failed, modified, or unbundled migration {version}; \
+                     see db/README.md"
+                )),
+                "{case}: {error}"
+            );
+        }
+        Outcome::MissingBelowNewer(newer, missing) => {
+            let error = format!("{:#}", result.expect_err(case));
+            let expected = if newer == missing {
+                format!(
+                    "{newer} records newer migration 3 but not bundled migration 2; \
+                     see db/README.md"
+                )
+            } else {
+                format!(
+                    "{newer} records newer migration 3 but {missing} does not record \
+                     bundled migration 2; see db/README.md"
+                )
+            };
+            assert!(error.ends_with(&expected), "{case}: {error}");
+        }
+    }
+    assert_eq!(stored_state(&path), before, "{case}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_older_release_runs_on_newer_successful_migrations() {
+    use Outcome::{Invalid, MissingBelowNewer, Starts};
+    use Recorded::{AsApplied, Failed, Malformed, Missing, Modified};
+    // (case, what the older release bundles of the service and shared
+    // catalogs, what the database records, outcome)
+    type Case = (
+        &'static str,
+        &'static [i64],
+        &'static [i64],
+        Recorded,
+        Outcome,
+    );
+    let cases: [Case; 17] = [
+        ("same release", NEWER, NEWER, AsApplied, Starts),
+        ("service newer", &[1, 2], NEWER, AsApplied, Starts),
+        ("common newer", NEWER, &[1, 2], AsApplied, Starts),
+        ("two service newer", &[1], NEWER, AsApplied, Starts),
+        ("both newer", &[1, 2], &[1], AsApplied, Starts),
+        (
+            "service withdrawn",
+            &[1, 3],
+            NEWER,
+            AsApplied,
+            Invalid(SERVICE_HISTORY, 2),
+        ),
+        (
+            "common withdrawn",
+            NEWER,
+            &[1, 3],
+            AsApplied,
+            Invalid(COMMON_HISTORY, 2),
+        ),
+        (
+            "service newer but failed",
+            &[1, 2],
+            NEWER,
+            Failed(SERVICE_HISTORY),
+            Invalid(SERVICE_HISTORY, 3),
+        ),
+        (
+            "common newer but failed",
+            NEWER,
+            &[1, 2],
+            Failed(COMMON_HISTORY),
+            Invalid(COMMON_HISTORY, 3),
+        ),
+        (
+            "bundled but failed",
+            NEWER,
+            NEWER,
+            Failed(SERVICE_HISTORY),
+            Invalid(SERVICE_HISTORY, 3),
+        ),
+        (
+            "bundled but modified",
+            &[1, 2],
+            NEWER,
+            Modified(COMMON_HISTORY),
+            Invalid(COMMON_HISTORY, 2),
+        ),
+        (
+            "service newer but bundled missing",
+            &[1, 2],
+            NEWER,
+            Missing(SERVICE_HISTORY),
+            MissingBelowNewer(SERVICE_HISTORY, SERVICE_HISTORY),
+        ),
+        (
+            "common newer but bundled missing",
+            NEWER,
+            &[1, 2],
+            Missing(COMMON_HISTORY),
+            MissingBelowNewer(COMMON_HISTORY, COMMON_HISTORY),
+        ),
+        // The newer release applied the shared catalog in full before the
+        // service one, and the service catalog in full after it.
+        (
+            "service newer but bundled common missing",
+            &[1, 2],
+            NEWER,
+            Missing(COMMON_HISTORY),
+            MissingBelowNewer(SERVICE_HISTORY, COMMON_HISTORY),
+        ),
+        (
+            "common newer but bundled service missing",
+            NEWER,
+            &[1, 2],
+            Missing(SERVICE_HISTORY),
+            MissingBelowNewer(COMMON_HISTORY, SERVICE_HISTORY),
+        ),
+        (
+            "service newer with a malformed checksum",
+            &[1, 2],
+            NEWER,
+            Malformed(SERVICE_HISTORY),
+            Invalid(SERVICE_HISTORY, 3),
+        ),
+        (
+            "common newer with a malformed checksum",
+            NEWER,
+            &[1, 2],
+            Malformed(COMMON_HISTORY),
+            Invalid(COMMON_HISTORY, 3),
+        ),
+    ];
+    // Each case has a database of its own, so they run at once.
+    let runs: Vec<_> = cases
+        .into_iter()
+        .map(|(case, older_service, older_common, recorded, outcome)| {
+            tokio::spawn(run_older_release(
+                case,
+                older_service,
+                older_common,
+                recorded,
+                outcome,
+            ))
+        })
+        .collect();
+    for run in runs {
+        run.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn the_retired_acceptance_setting_changes_nothing() {
+    // Malformed, and listing a withdrawn version: the release that read it
+    // would have refused to start on either.
+    if !pplx_space_test_env::enter_test_process(&[(
+        RETIRED_ACCEPT_NEWER_MIGRATIONS,
+        Some(std::ffi::OsStr::new("test:2,not an entry")),
+    )]) {
+        return;
+    }
+    run_older_release("newer", &[1, 2], &[1], Recorded::AsApplied, Outcome::Starts).await;
+    run_older_release(
+        "withdrawn",
+        &[1, 3],
+        NEWER,
+        Recorded::AsApplied,
+        Outcome::Invalid(SERVICE_HISTORY, 2),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn the_retired_acceptance_setting_is_ignored_when_valid() {
+    // Well formed, and listing none of the newer rows: the release that read
+    // it would have refused newer migration 3 because it isn't listed.
+    if !pplx_space_test_env::enter_test_process(&[(
+        RETIRED_ACCEPT_NEWER_MIGRATIONS,
+        Some(std::ffi::OsStr::new("test:2")),
+    )]) {
+        return;
+    }
+    run_older_release(
+        "newer",
+        &[1, 2],
+        NEWER,
+        Recorded::AsApplied,
+        Outcome::Starts,
+    )
+    .await;
+    // Nor does a valid entry admit a withdrawn migration.
+    run_older_release(
+        "withdrawn",
+        &[1, 3],
+        NEWER,
+        Recorded::AsApplied,
+        Outcome::Invalid(SERVICE_HISTORY, 2),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sqlx_refuses_a_history_that_changes_after_validation_accepted_a_newer_row() {
+    use sqlx::migrate::MigrateError;
+
+    // (case, what another runner does to the service history between
+    // validation and this release's run, the error SQLx then returns)
+    type Case = (&'static str, &'static str, fn(&MigrateError) -> bool);
+    let cases: [Case; 2] = [
+        (
+            "records an unaccepted row",
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+             VALUES (4, 'concurrent', TRUE, x'00', 0)",
+            |error| matches!(error, MigrateError::VersionMissing(4)),
+        ),
+        (
+            "reverses the accepted row",
+            "DROP TABLE service_3; DELETE FROM _sqlx_migrations WHERE version = 3",
+            |error| matches!(error, MigrateError::ExecuteMigration(_, 3)),
+        ),
+    ];
+    let checksums = AcceptedChecksums::from_toml("migrations = []").unwrap();
+    let older_service = numbered_catalog("service", &[1, 2]);
+    let common = numbered_catalog("common", NEWER);
+    for (case, change, refused) in cases {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("database.sqlite");
+        newer_release_database(&path).await;
+        let validated = validate_schema(
+            "test",
+            &path,
+            EmbeddedMigrators {
+                service: &older_service,
+                common: Some(&common),
+            },
+            &checksums,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            validated
+                .service
+                .accepted_newer
+                .iter()
+                .map(|(version, _)| *version)
+                .collect::<Vec<_>>(),
+            [3],
+            "{case}"
+        );
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(change)
+            .unwrap();
+        let before = stored_state(&path);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(&path))
+            .await
+            .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+
+        let result = checksums
+            .run(
+                "test",
+                &with_newer_placeholders(&older_service, &validated.service.accepted_newer),
+                &mut *conn,
+            )
+            .await;
+
+        assert!(result.as_ref().is_err_and(refused), "{case}: {result:?}");
+        drop(conn);
+        pool.close().await;
+        assert_eq!(stored_state(&path), before, "{case}");
+    }
 }

@@ -84,6 +84,12 @@ grep -qx -- "type=registry,ref=$repository:kind-x,mode=max,image-manifest=true,o
 result="$(flags kind-x SPACE_KIND_BUILD_CACHE_REPOSITORY="$repository" SPACE_KIND_BUILD_CACHE_WRITE=1 \
     "${main_push[@]}" GITHUB_REPOSITORY=example-owner/SPACE)"
 [[ "$(head -1 <<<"$result")" != 0 ]] || fail "a fork's main push must not export" "$result"
+# A loopback registry is the caller's own and takes its writes outside CI.
+result="$(flags kind-x SPACE_KIND_BUILD_CACHE_REPOSITORY=localhost:5001/space-kind-build-cache SPACE_KIND_BUILD_CACHE_WRITE=1)"
+[[ "$(head -1 <<<"$result")" == 0 ]] || fail "a loopback registry must take a local export" "$result"
+grep -x -A1 -- --cache-to <<<"$result" \
+    | grep -qx -- "type=registry,ref=localhost:5001/space-kind-build-cache:kind-x,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true" \
+    || fail "a loopback export must write the scope" "$result"
 result="$(flags kind-x SPACE_KIND_BUILD_CACHE_REPOSITORY="$repository" SPACE_KIND_BUILD_CACHE_WRITE=yes)"
 [[ "$(head -1 <<<"$result")" != 0 ]] || fail "a write setting other than 0 or 1 must be refused" "$result"
 
@@ -158,7 +164,7 @@ expected="build --cache-from type=registry,ref=$repository:kind-api-smoke-build-
 [[ "$(builds)" == "$expected" ]] || fail "space-api must import both stages and take its mirrored bases" "$(builds)"
 run_build SPACE_KIND_BUILD_CACHE_REPOSITORY="$repository" SPACE_KIND_BUILD_CACHE_WRITE=1 "${main_push[@]}" -- space-worker . \
     || fail "build must not refuse a build with writes enabled" "$(cat "$work/err")"
-[[ "$(builds)" == "build --cache-from type=registry,ref=$repository:kind-worker-runtime-deps-e1 -f docker/Dockerfile.worker ." ]] \
+[[ "$(builds)" == "build --cache-from type=registry,ref=$repository:kind-worker-runtime-deps-e1 --cache-from type=registry,ref=$repository:kind-worker-guest-bundle-deps-e1 -f docker/Dockerfile.worker ." ]] \
     || fail "build must import and never export" "$(builds)"
 run_build -- space-api . || fail "build without a repository failed" "$(cat "$work/err")"
 [[ "$(builds)" == "build -f docker/Dockerfile.api ." ]] || fail "build without a repository must import nothing" "$(builds)"
@@ -207,6 +213,7 @@ for build in \
     "docker/Dockerfile.data-plane runtime-deps kind-data-plane-runtime-deps-e1" \
     "docker/Dockerfile.cluster-controller runtime-deps kind-cluster-controller-runtime-deps-e1" \
     "docker/Dockerfile.worker runtime-deps kind-worker-runtime-deps-e1" \
+    "docker/Dockerfile.worker guest-bundle-deps kind-worker-guest-bundle-deps-e1" \
     "docker/Dockerfile.seed-publish runtime-deps kind-seed-publish-runtime-deps-e1" \
     "docker/Dockerfile.ui deps kind-ui-deps-e1"; do
     read -r dockerfile stage scope <<<"$build"
@@ -216,9 +223,9 @@ done
 grep -- "--target cloud-image --output type=cacheonly" "$log" | grep -qF -- "$(export_of kind-seed-builder-e1)" \
     || fail "publish must export the seed builder's cloud-image stage to its own scope" "$(builds)"
 grep -q "Dockerfile.kind-key-broker" "$log" && fail "an image without cached stages must not be built"
-[[ "$(builds | wc -l)" -eq 8 ]] || fail "publish must run exactly one build per cached stage" "$(builds)"
+[[ "$(builds | wc -l)" -eq 9 ]] || fail "publish must run exactly one build per cached stage" "$(builds)"
 publish STUB_MODE=fail && fail "publish must fail when its builds or exports fail"
-[[ "$(builds | wc -l)" -eq 8 ]] || fail "a failed build must not stop the others" "$(builds)"
+[[ "$(builds | wc -l)" -eq 9 ]] || fail "a failed build must not stop the others" "$(builds)"
 grep -q "keeps main's previous layers" "$work/err" || fail "a failed export must say what it leaves" "$(cat "$work/err")"
 : >"$log"
 env -i PATH="$stubs:$PATH" HOME="$work" DOCKER_LOG="$log" SPACE_MIRRORED_IMAGES="$mirrors" SPACE_CI_IMAGE_MIRROR=ghcr \

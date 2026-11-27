@@ -1,5 +1,5 @@
 use futures_util::{Stream, StreamExt};
-use pplx_space_spaced_common::proto::bridge_guest::{
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
     ProcessEvent, process_event::Event, process_exit::Outcome,
 };
 

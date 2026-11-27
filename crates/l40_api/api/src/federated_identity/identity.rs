@@ -2,7 +2,7 @@
 
 use super::{FederatedOwner, store};
 use crate::models::{Organization, User};
-use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
 use sqlx::PgPool;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

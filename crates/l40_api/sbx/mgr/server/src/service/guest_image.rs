@@ -1,7 +1,7 @@
 //! Persist image semantics before allocation; never infer them from a missing agent.
 use super::*;
 const FIRMWARE_SHUTDOWN_BUDGET: Duration = Duration::from_secs(120);
-use pplx_space_common_core::types::guest_image::GuestImageContract;
+use pplx_space_execution_spec::guest_image::GuestImageContract;
 
 pub(super) fn require_agent(sandbox: &crate::db::SandboxRow) -> Result<(), Status> {
     if !sandbox.guest_image.expects_agent() {
@@ -44,7 +44,7 @@ pub(super) fn require_memory_lifecycle(sandbox: &crate::db::SandboxRow) -> Resul
 
 pub(super) fn validate_policy(
     image: GuestImageContract,
-    execution: Option<&pplx_space_common_core::types::ExecutionMetadata>,
+    execution: Option<&pplx_space_execution_spec::ExecutionMetadata>,
     policy: &AutoLifecyclePolicy,
 ) -> Result<(), Status> {
     let profile = pplx_space_execution_catalog::guest::GuestProfile::for_existing(execution, image)
@@ -61,7 +61,7 @@ impl SandboxManagerService {
     pub(super) async fn admit_guest_image(
         &self,
         image: GuestImageContract,
-        execution: Option<&pplx_space_common_core::types::ExecutionMetadata>,
+        execution: Option<&pplx_space_execution_spec::ExecutionMetadata>,
     ) -> Result<(), Status> {
         let Some(execution) = execution else {
             return if image.legacy_transport() {
@@ -88,7 +88,7 @@ impl SandboxManagerService {
 pub(super) async fn wait_service(
     connector: &crate::node_manager_transport::NodeManagerConnector,
     id: &str,
-    execution: pplx_space_common_core::types::SandboxActivationAttemptId,
+    execution: pplx_space_sandbox_model::SandboxActivationAttemptId,
     port: std::num::NonZeroU16,
     budget: Duration,
 ) -> Result<(), Status> {
@@ -192,7 +192,7 @@ impl SandboxManagerService {
     pub(super) async fn stop_firmware_guest(
         &self,
         id: &str,
-        job_id: Option<&pplx_space_common_core::types::JobId>,
+        job_id: Option<&pplx_space_accounts::JobId>,
         force: bool,
     ) -> Result<ShutdownOutcome, Status> {
         if force {

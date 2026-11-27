@@ -5,8 +5,9 @@ mod btrfs_push;
 mod codec_admission;
 pub mod credentials;
 pub mod crypto;
-pub mod db;
+pub(crate) mod db;
 pub mod executor;
+mod materialization;
 pub mod metrics;
 pub mod run;
 pub mod service;
@@ -23,18 +24,6 @@ pub use run::{
     VolmgrRunConfig, run,
 };
 
-pub use pplx_space_common_jobs::{JobPriority, PriorityBand};
 pub use pplx_space_object_store::ObjectCredentials;
 pub use pplx_space_volmgr_client::VOLMGR_SOCKET;
 pub use pplx_space_volmgr_client::proto;
-
-/// In-memory representation of a volume attachment row.
-#[derive(Debug, Clone)]
-pub struct VolumeAttachment {
-    pub name: String,
-    pub s3_bucket: String,
-    pub s3_prefix: String,
-    pub s3_region: String,
-    pub read_only: bool,
-    pub byok_key_id: Option<String>,
-}

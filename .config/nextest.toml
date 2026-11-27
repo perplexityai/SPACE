@@ -40,6 +40,7 @@ filter = '''
  and not package(pplx-space-db-migrate))
 or test(postgres_collision_repair_tests)
 or test(postgres_lock_retry_tests)
+or test(postgres_invalid_index_tests)
 or (package(pplx-space-db-migrate) and test(user_password::))
 or (package(pplx-space-db-migrate) and test(postgres_baseline_tests::))
 '''
@@ -106,11 +107,13 @@ test-group = "state-render"
 # Shared btrfs tests receive a disposable filesystem from the privileged CI
 # wrapper. Other opt-in tests keep their separate activation requirements.
 #
-# Root alone: clone_tree, transfer_directory, the credmgr volume-socket tests
-# and the spaced worker binaries switch between real service uids. The
-# router's descriptor reads use pidfd_getfd,
-# which Docker's default seccomp profile allows only with CAP_SYS_PTRACE. The
-# bootstrap-role tests each start a virgin Postgres container, and the
+# Root alone: clone_tree, transfer_directory, snapshot_upload's deferred
+# metadata test, snapshot_restore's staging test, the credmgr volume-socket
+# tests and the spaced worker binaries switch between real service uids. The
+# router's descriptor reads and the runtime supervisor's net-gateway socket
+# handover use pidfd_getfd, which Docker's default seccomp profile allows only
+# with CAP_SYS_PTRACE; the handover's namespace check also needs CAP_NET_ADMIN.
+# The bootstrap-role tests each start a virgin Postgres container, and the
 # execution-record view pins share one.
 #
 # Root halves of split tests, whose unprivileged halves run outside the group:
@@ -119,6 +122,9 @@ test-group = "state-render"
 # gateway_isolation and the net-gateway-client test (which mounts a private
 # root over the node's fixed paths) skip when not root, and fail instead when
 # CI sets SPACE_CI_REQUIRE_TEST_PRIVILEGE, as the root halves do.
+#
+# Root to create network namespaces and nftables tables: the node-mgr firewall
+# installation tests and the external address read.
 #
 # Root only for an incidental step, until the test loses it: the net-gateway
 # exemption test's relay sets SO_MARK (CAP_NET_RAW).
@@ -131,7 +137,8 @@ test-group = "state-render"
 filter = '''
 (package(pplx-space-node-runtime-supervisor) and test(/^contained_launcher::linux::tests::/))
 or (package(pplx-space-node-runtime-core) and test(/^control::cloud_hypervisor::tests::/))
-or (package(pplx-space-common-io) and test(=reflink::tests::nocow_preparation_clones_shared_extents_and_rejects_aliases))
+or (package(pplx-space-node-runtime-supervisor) and test(/^service::tests::replaced_gateway_/))
+or (package(pplx-space-file-io) and test(=reflink::tests::nocow_preparation_clones_shared_extents_and_rejects_aliases))
 or (package(pplx-space-node-mgr) and test(=btrfs::tests::signal_during_backpressured_send_does_not_replay_the_ioctl))
 or (package(pplx-space-node-runtime-core) and test(=tests::restored_nocow_file_remains_reflink_compatible))
 or (package(pplx-space-node-mgr) and test(=service::cleanup_helpers::tests::teardown_preserves_backing_files_below_stacked_directory_binds))
@@ -164,7 +171,22 @@ or (package(pplx-space-node-mgr) and test(=service::btrfs_send_source::tests::st
 or (package(pplx-space-node-mgr) and test(=service::btrfs_send_transport::tests::durable_lease_survives_producer_removal_and_cancelled_grpc_reader))
 or (package(pplx-space-node-mgr) and test(=service::prepared_rootfs::tests::prepared_instance_and_clone_use_real_btrfs_subvolumes))
 or (package(pplx-space-node-mgr) and test(/::startup_containment::tests::linux::linux_containment_benchmark$/))
+or (package(pplx-space-node-mgr) and test(=firewall::tests::linux::reinstall_over_a_leftover_sandbox_table_fails_whole))
+or (package(pplx-space-node-mgr) and test(=firewall::tests::linux::scrub_removes_every_owned_table_including_firewall_rules))
+or (package(pplx-space-node-mgr) and test(=firewall::rules::install::tests::install_creates_and_replaces_only_the_owned_table))
+or (package(pplx-space-node-mgr) and test(=firewall::rules::install::tests::late_kernel_refusal_leaves_the_previous_table))
+or (package(pplx-space-node-mgr) and test(=firewall::rules::install::tests::timeout_after_dispatch_is_unknown_and_reaps_the_child))
+or (package(pplx-space-node-mgr) and test(=firewall::rules::verify::tests::linux::live_tables_match_only_their_revision))
+or (package(pplx-space-node-mgr) and test(=firewall::rules::verify::tests::linux::guardless_rule_installed_by_the_installer_is_a_mismatch))
+or (package(pplx-space-node-mgr) and test(=firewall::rules::verify::tests::linux::verified_table_drops_denied_and_established_traffic_only))
+or (package(pplx-space-node-mgr) and test(=slot_pool::firewall_rules::tests::linux::applies_the_accepted_revision_only_to_the_slot_namespace))
+or (package(pplx-space-node-mgr) and test(=service::firewall_sync::fixture::tests::linux::a_delivery_applies_only_to_the_bound_namespace))
+or (package(pplx-space-node-mgr) and test(=service::firewall_sync::fixture::tests::linux::a_delivery_applies_to_every_eligible_namespace))
+or (package(pplx-space-node-mgr) and test(=slot_pool::firewall_rules::observe::tests::linux::reads_real_tables_and_leaves_drift_alone))
+or (package(pplx-space-node-mgr) and test(=net::tests::external_address_is_the_shim_redirect_address))
 or (package(pplx-space-sbx-mgr) and test(=transfer_directory::tests::distinct_service_uids_can_exchange_downloads))
+or (package(pplx-space-sbx-mgr) and test(=snapshot_upload::tests::volume_manager_reads_deferred_metadata_through_the_shared_cache_group))
+or (package(pplx-space-sbx-mgr) and test(=snapshot_restore::tests::volume_manager_downloads_into_scoped_restore_staging_through_the_shared_cache_group))
 or (package(pplx-space-credmgr) and test(=run::tests::volume_socket::real_peers_obey_volume_listener_policy))
 or (package(pplx-space-credmgr) and test(=run::volume_socket::tests::preflight_checks_real_permissions_without_replacing_live_socket))
 or binary_id(pplx-space-spaced-guest-server::worker_subprocess)

@@ -1,30 +1,26 @@
 //! Transaction-scoped Postgres operations for node-authored quarantine recovery.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
-use std::sync::LazyLock;
-
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{
-    ExecutionGeneration, LocalArtifactId, PodUid, QuarantineRecoveryPlanRejectionCause,
-    SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId, SandboxLifecycle,
-    SandboxQuarantineHistoryAction, SandboxQuarantineReasonCode, SandboxQuarantineRecoveryPolicy,
-    SandboxQuarantineSource, SandboxTransitionReceiptKind, SandboxTransitionTargetState,
-    SnapshotId,
-};
+use pplx_space_k8s_ids::PodUid;
 use pplx_space_sandbox_metrics::publication::{
     StatePublicationComponent, StatePublicationDisposition, StatePublicationField,
 };
-use pplx_space_sandbox_portability::{
-    current_suspend_origin_marker_snapshot_ready, exact_marker_snapshot_backup_current,
-    node_published_suspend_evidence, pre_quarantine_suspend_snapshot_current,
-    quarantine_recovery_suspend_snapshot_current, started_suspend_revert_eligibility,
-    suspended_projection_lifecycle_eligible_with_node_evidence,
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, QuarantineRecoveryPlanRejectionCause, SandboxActivationAttemptId,
+    SandboxCleanupEpisodeId, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
+    SandboxQuarantineReasonCode, SandboxQuarantineRecoveryPolicy, SandboxQuarantineSource,
+    SandboxTransitionReceiptKind, SandboxTransitionTargetState,
 };
-use pplx_space_sandbox_store::ingest::TRANSITION_RECEIPT_RECORD_COLUMNS;
+use pplx_space_sandbox_quarantine_store::node_recovery_receipt::{self, NodeRecovery};
+use pplx_space_sandbox_store::k8s_executions::quarantine_rollback;
+use pplx_space_sandbox_store::quarantine_publication::{
+    self, PauseFailedRecoveryCandidate, SuspendedProjectionBinds,
+};
+use pplx_space_sandbox_store::quarantine_recovery_authority;
+use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
+use sqlx::PgPool;
 use sqlx::types::Json;
-use sqlx::{FromRow, PgPool};
-use time::OffsetDateTime;
 use tonic::Status;
 use uuid::Uuid;
 
@@ -78,26 +74,6 @@ pub(super) struct QuarantineRecoveryPlanRow {
     pub(super) bytes_uploaded: i64,
 }
 
-#[derive(FromRow)]
-struct RecoveryAuthorityRow {
-    quarantine_id: Uuid,
-    reason_code: String,
-    entered_at: OffsetDateTime,
-    active_node_id: Option<NodeId>,
-    execution_generation: Option<i64>,
-    current_local_artifact_id: Option<LocalArtifactId>,
-    current_local_artifact_kind: Option<String>,
-    current_local_artifact_origin: Option<String>,
-}
-
-#[derive(FromRow)]
-struct RecoverySnapshotRow {
-    snapshot_id: SnapshotId,
-    local_artifact_id: Option<LocalArtifactId>,
-    storage_uri: String,
-    size_bytes: Option<i64>,
-}
-
 fn reject_quarantine_recovery_plan(
     sandbox_id: SandboxId,
     node_id: NodeId,
@@ -113,47 +89,6 @@ fn reject_quarantine_recovery_plan(
     );
     Status::failed_precondition(message)
 }
-
-/// The recovery snapshot lookup, differing between the two policies only in which
-/// currency predicate selects the row.
-///
-/// One builder rather than two copies of the same twelve-line SELECT: a column
-/// added to the projection has to reach both, and both decode into the same
-/// `RecoverySnapshotRow`, so a miss is a runtime Postgres decode error on the
-/// rarely-taken pre-quarantine arm rather than a compile error. Built once — every
-/// input is a literal, so rebuilding it per request only allocated.
-fn recovery_snapshot_query(predicate: &str) -> String {
-    format!(
-        "SELECT snapshot.id AS snapshot_id,
-                snapshot.local_artifact_id,
-                location.storage_connection_string AS storage_uri,
-                snapshot.size_bytes
-           FROM snapshots snapshot
-           JOIN snapshot_storage_locations location
-             ON location.snapshot_id = snapshot.id
-           JOIN sandboxes current_sandbox
-             ON current_sandbox.id = snapshot.sandbox_id
-          WHERE current_sandbox.id = $1
-            AND {predicate}
-          ORDER BY snapshot.timestamp DESC
-          LIMIT 1"
-    )
-}
-
-/// The exact-artifact lookup: the snapshot must name the artifact the node holds.
-static EXACT_ARTIFACT_SNAPSHOT_QUERY: LazyLock<String> = LazyLock::new(|| {
-    let current = quarantine_recovery_suspend_snapshot_current("current_sandbox", "snapshot");
-    sql!(
-        recovery_snapshot_query(&format!("snapshot.local_artifact_id = $2 AND {current}")).as_str()
-    )
-});
-
-/// The pre-quarantine fallback: the newest suspend snapshot from before the
-/// episode was entered, which only `OrphanedSandboxRowMissing`'s policy admits.
-static PRE_QUARANTINE_SNAPSHOT_QUERY: LazyLock<String> = LazyLock::new(|| {
-    let current = pre_quarantine_suspend_snapshot_current("current_sandbox", "snapshot", "$2");
-    sql!(recovery_snapshot_query(&current).as_str())
-});
 
 /// The one message every rejection that turns on node ownership returns.
 ///
@@ -179,38 +114,18 @@ pub(super) async fn get_quarantine_recovery_plan(
     sandbox_id: SandboxId,
     node_id: NodeId,
 ) -> Result<QuarantineRecoveryPlanRow, Status> {
-    let recovery: RecoveryAuthorityRow = sqlx::query_as(sql!(
-        "SELECT quarantine.quarantine_id,
-                quarantine.reason_code,
-                quarantine.entered_at,
-                sandbox.active_node_id,
-                execution.generation AS execution_generation,
-                sandbox.current_local_artifact_id,
-                sandbox.current_local_artifact_kind,
-                sandbox.current_local_artifact_origin
-           FROM sandboxes sandbox
-           JOIN sandbox_quarantine_state quarantine
-             ON quarantine.sandbox_id = sandbox.id
-           LEFT JOIN sandbox_k8s_executions execution
-             ON execution.sandbox_id = sandbox.id AND execution.active
-          WHERE sandbox.id = $1
-            AND sandbox.lifecycle = 'quarantined'
-            AND quarantine.source = $2
-            AND quarantine.entered_from_lifecycle = 'restoring'"
-    ))
-    .bind(sandbox_id.as_uuid())
-    .bind(SandboxQuarantineSource::SbxManager.as_str())
-    .fetch_optional(pool)
-    .await
-    .map_err(|error| Status::internal(format!("quarantine recovery lookup: {error}")))?
-    .ok_or_else(|| {
-        reject_quarantine_recovery_plan(
-            sandbox_id,
-            node_id,
-            QuarantineRecoveryPlanRejectionCause::NoActiveQuarantine,
-            no_recovery_authority_message(sandbox_id),
-        )
-    })?;
+    let recovery =
+        quarantine_recovery_authority::get(pool, sandbox_id, SandboxQuarantineSource::SbxManager)
+            .await
+            .map_err(|error| Status::internal(format!("quarantine recovery lookup: {error}")))?
+            .ok_or_else(|| {
+                reject_quarantine_recovery_plan(
+                    sandbox_id,
+                    node_id,
+                    QuarantineRecoveryPlanRejectionCause::NoActiveQuarantine,
+                    no_recovery_authority_message(sandbox_id),
+                )
+            })?;
 
     match recovery.active_node_id {
         None => {
@@ -265,17 +180,18 @@ pub(super) async fn get_quarantine_recovery_plan(
         (Some(id), Some("full"), Some("suspend")) => Some(id),
         _ => None,
     };
-    let snapshot: Option<RecoverySnapshotRow> = match (policy, exact_artifact) {
+    let snapshot = match (policy, exact_artifact) {
         (
             SandboxQuarantineRecoveryPolicy::ExactSuspendArtifact
             | SandboxQuarantineRecoveryPolicy::ExactOrPreQuarantineSuspendArtifact,
             Some(local_artifact_id),
         ) => {
-            sqlx::query_as(sqlx::AssertSqlSafe(EXACT_ARTIFACT_SNAPSHOT_QUERY.as_str()))
-                .bind(sandbox_id.as_uuid())
-                .bind(local_artifact_id)
-                .fetch_optional(pool)
-                .await
+            pplx_space_snapshot_store::quarantine_recovery::exact_artifact_snapshot(
+                pool,
+                sandbox_id,
+                local_artifact_id,
+            )
+            .await
         }
         (SandboxQuarantineRecoveryPolicy::ExactSuspendArtifact, None) => {
             return Err(reject_quarantine_recovery_plan(
@@ -286,11 +202,12 @@ pub(super) async fn get_quarantine_recovery_plan(
             ));
         }
         (SandboxQuarantineRecoveryPolicy::ExactOrPreQuarantineSuspendArtifact, None) => {
-            sqlx::query_as(sqlx::AssertSqlSafe(PRE_QUARANTINE_SNAPSHOT_QUERY.as_str()))
-                .bind(sandbox_id.as_uuid())
-                .bind(recovery.entered_at)
-                .fetch_optional(pool)
-                .await
+            pplx_space_snapshot_store::quarantine_recovery::pre_quarantine_snapshot(
+                pool,
+                sandbox_id,
+                recovery.entered_at,
+            )
+            .await
         }
     }
     .map_err(|error| Status::internal(format!("recovery snapshot lookup: {error}")))?;
@@ -342,54 +259,17 @@ pub(super) async fn select_activation_rollback_candidates(
     node_id: NodeId,
     rows_json: Json<serde_json::Value>,
 ) -> Result<Vec<ActivationRollbackCandidate>, Status> {
-    type CandidateRow = (
-        SandboxId,
-        SandboxCleanupEpisodeId,
-        i64,
-        SandboxActivationAttemptId,
-        String,
-        String,
-        String,
-        Option<String>,
-    );
-    let query = format!(
-        "SELECT s.id,
-                input.transition_receipt_id,
-                input.transition_receipt_execution_generation,
-                input.transition_receipt_activation_attempt_id,
-                input.transition_receipt_target_state,
-                input.transition_receipt_reason_code,
-                LOWER(TRIM(s.lifecycle)),
-                input.failure_reason
-           FROM sandboxes s
-           JOIN jsonb_to_recordset($2::jsonb) AS input({TRANSITION_RECEIPT_RECORD_COLUMNS})
-             ON input.sandbox_id = s.id
-           JOIN sandbox_k8s_executions execution
-             ON execution.sandbox_id = s.id
-            AND execution.active
-            AND execution.generation = input.transition_receipt_execution_generation
-            AND execution.activation_attempt_id = input.transition_receipt_activation_attempt_id
-          WHERE s.active_node_id = $1
-            AND input.transition_receipt_kind = $3
-            AND input.published_lifecycle = input.transition_receipt_target_state
-            AND input.transition_receipt_target_state IN ('created', 'stopped', 'suspended')
-            AND LOWER(TRIM(s.lifecycle)) NOT IN (
-                'quarantined', 'deleted', 'deleting'
-            )
-          FOR UPDATE OF s, execution"
-    );
-    let rows: Vec<CandidateRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(node_id)
-        .bind(rows_json)
-        .bind(SandboxTransitionReceiptKind::ActivationRollback.as_str())
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(|error| {
-            Status::internal(format!("select activation rollback receipts: {error}"))
-        })?;
+    let rows = quarantine_rollback::lock_activation_rollback_candidates(
+        conn,
+        node_id,
+        rows_json,
+        SandboxTransitionReceiptKind::ActivationRollback,
+    )
+    .await
+    .map_err(|error| Status::internal(format!("select activation rollback receipts: {error}")))?;
 
     let mut candidates = Vec::with_capacity(rows.len());
-    for (
+    for quarantine_rollback::ActivationRollbackCandidateRow {
         sandbox_id,
         receipt_id,
         execution_generation,
@@ -398,7 +278,7 @@ pub(super) async fn select_activation_rollback_candidates(
         reason_code,
         prior_lifecycle,
         failure_message,
-    ) in rows
+    } in rows
     {
         // The stored column has no CHECK, so it can hold text no lifecycle
         // names. That is one row's problem: skip its receipt and leave its
@@ -493,7 +373,7 @@ pub(super) async fn apply_activation_rollback_candidates(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     candidates: Vec<ActivationRollbackCandidate>,
-    retirement: pplx_space_common_core::types::AbandonedRestoreRetirement,
+    retirement: pplx_space_sandbox_model::AbandonedRestoreRetirement,
 ) -> Result<Vec<ActivationRollbackCandidate>, Status> {
     let mut applied = Vec::with_capacity(candidates.len());
     for candidate in candidates {
@@ -515,43 +395,23 @@ pub(super) async fn apply_activation_rollback_candidates(
         } else {
             "replaced"
         };
-        let retired = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-                SET active = FALSE,
-                    state = $3,
-                    pod_ip = NULL,
-                    terminated_at = COALESCE(terminated_at, NOW()),
-                    updated_at = NOW()
-              WHERE sandbox_id = $1
-                AND generation = $2
-                AND activation_attempt_id = $4
-                AND active"
-        ))
-        .bind(candidate.sandbox_id)
-        .bind(candidate.execution_generation)
-        .bind(execution_state)
-        .bind(candidate.activation_attempt_id)
-        .execute(&mut *conn)
+        let retired = quarantine_rollback::retire_rolled_back_execution(
+            &mut *conn,
+            candidate.sandbox_id,
+            candidate.execution_generation,
+            execution_state,
+            candidate.activation_attempt_id,
+        )
         .await
         .map_err(|error| Status::internal(format!("retire rollback execution: {error}")))?;
-        if retired.rows_affected() == 0 {
+        if !retired {
             continue;
         }
 
-        sqlx::query(sql!(
-            "UPDATE sandbox_port_exposures
-                SET apply_state = 'pending',
-                    last_applied_node_id = NULL,
-                    last_error = NULL,
-                    last_bridge_status = NULL,
-                    last_applied_bridge_generation = NULL,
-                    last_observed_at = NULL,
-                    updated_at = NOW()
-              WHERE sandbox_id = $1
-                AND desired_state = 'open'"
-        ))
-        .bind(candidate.sandbox_id)
-        .execute(&mut *conn)
+        pplx_space_sandbox_store::port_exposures::invalidate_open_observations(
+            &mut *conn,
+            candidate.sandbox_id,
+        )
         .await
         .map_err(|error| Status::internal(format!("invalidate rollback port state: {error}")))?;
         let converged = pplx_space_sandbox_store::quarantine::converge_activation_rollback(
@@ -589,30 +449,13 @@ pub(super) async fn recover_pause_failed_from_inventory(
     node_id: NodeId,
     rows_json: Json<serde_json::Value>,
 ) -> Result<Vec<PauseFailedQuarantineRecovery>, Status> {
-    let quarantine_source =
-        pplx_space_sandbox_store::ingest::PAUSE_FAILED_QUARANTINE_SOURCE.as_str();
-    let quarantine_reason =
-        pplx_space_sandbox_store::ingest::PAUSE_FAILED_QUARANTINE_REASON.as_str();
-    let candidates: Vec<(SandboxId, Uuid, String, String)> = sqlx::query_as(sql!(
-        "SELECT s.id, qs.quarantine_id, input.published_lifecycle, s.lifecycle
-           FROM sandboxes s
-           JOIN jsonb_to_recordset($2::jsonb) AS input(
-               sandbox_id UUID,
-               published_lifecycle TEXT
-           ) ON input.sandbox_id = s.id
-           JOIN sandbox_quarantine_state qs ON qs.sandbox_id = s.id
-          WHERE s.active_node_id = $1
-            AND LOWER(TRIM(s.lifecycle)) = 'quarantined'
-            AND input.published_lifecycle IN ('started', 'paused')
-            AND qs.source = $3
-            AND qs.reason_code = $4
-          FOR UPDATE OF s, qs"
-    ))
-    .bind(node_id)
-    .bind(rows_json)
-    .bind(quarantine_source)
-    .bind(quarantine_reason)
-    .fetch_all(&mut *conn)
+    let candidates = quarantine_publication::lock_pause_failed_recovery_candidates(
+        &mut *conn,
+        node_id,
+        rows_json,
+        pplx_space_sandbox_store::ingest::PAUSE_FAILED_QUARANTINE_SOURCE,
+        pplx_space_sandbox_store::ingest::PAUSE_FAILED_QUARANTINE_REASON,
+    )
     .await
     .map_err(|error| {
         Status::internal(format!(
@@ -621,7 +464,13 @@ pub(super) async fn recover_pause_failed_from_inventory(
     })?;
 
     let mut recoveries = Vec::with_capacity(candidates.len());
-    for (sandbox_id, quarantine_id, target_state, stored_lifecycle) in candidates {
+    for PauseFailedRecoveryCandidate {
+        id: sandbox_id,
+        quarantine_id,
+        published_lifecycle: target_state,
+        lifecycle: stored_lifecycle,
+    } in candidates
+    {
         if !matches!(
             stored_lifecycle.parse::<SandboxLifecycle>(),
             Ok(SandboxLifecycle::Quarantined)
@@ -682,170 +531,22 @@ pub(super) async fn select_suspended_projection_candidates(
     node_id: NodeId,
     rows_json: Json<serde_json::Value>,
 ) -> Result<Vec<SuspendedProjectionCandidate>, Status> {
-    let eligibility = started_suspend_revert_eligibility("s");
-    let clear_marker = eligibility.clear_marker;
-    let eligible = eligibility.eligible;
-    // Recovery may retire only the active execution whose generation the node
-    // cleaned. The caller holds the sandbox row lock through finalization.
-    let recovery_marker_current = exact_marker_snapshot_backup_current("s");
-    let pre_quarantine_snapshot_current =
-        pre_quarantine_suspend_snapshot_current("s", "recovered_snapshot", "qs.entered_at");
-    let committed_suspend_marker_current = current_suspend_origin_marker_snapshot_ready("s");
-    let committed_suspend_evidence = format!(
-        "input.current_local_artifact_id = s.current_local_artifact_id\n\
-         AND input.current_local_artifact_kind = s.current_local_artifact_kind\n\
-         AND input.current_local_artifact_origin = s.current_local_artifact_origin\n\
-         AND input.current_local_artifact_origin = 'suspend'\n\
-         AND ({committed_suspend_marker_current})"
-    );
-    let node_suspend_evidence = node_published_suspend_evidence("s", "input");
-    let lifecycle_eligible = suspended_projection_lifecycle_eligible_with_node_evidence(
-        "s",
-        &committed_suspend_evidence,
-        Some(&node_suspend_evidence),
-    );
-    let query = format!(
-        "WITH input AS (
-             SELECT published.*,
-                    published.transition_receipt_kind = $3
-                    AND published.transition_receipt_id IS NOT NULL
-                    AND NOT EXISTS (
-                        SELECT 1
-                          FROM sandbox_quarantine_history consumed
-                         WHERE consumed.id = published.transition_receipt_id
-                    ) AS has_unconsumed_recovery_receipt
-               FROM jsonb_to_recordset($2::jsonb) AS published({TRANSITION_RECEIPT_RECORD_COLUMNS})
-         )
-         SELECT s.id,
-                CASE WHEN LOWER(TRIM(s.lifecycle)) = 'quarantined'
-                     THEN FALSE ELSE {clear_marker} END AS clear_marker,
-                CASE WHEN LOWER(TRIM(s.lifecycle)) = 'quarantined'
-                     THEN qs.quarantine_id END AS quarantine_id,
-                CASE WHEN input.has_unconsumed_recovery_receipt
-                          AND LOWER(TRIM(s.lifecycle)) IN ('quarantined', 'restoring')
-                     THEN input.transition_receipt_reason_code END AS reason_code,
-                CASE WHEN input.has_unconsumed_recovery_receipt
-                          AND LOWER(TRIM(s.lifecycle)) IN ('quarantined', 'restoring')
-                     THEN input.transition_receipt_id END AS receipt_id,
-                LOWER(TRIM(s.lifecycle)) AS prior_lifecycle,
-                CASE WHEN ({node_suspend_evidence})
-                     THEN input.current_local_artifact_id END AS published_artifact_id,
-                CASE WHEN ({node_suspend_evidence})
-                     THEN input.current_local_artifact_kind END AS published_artifact_kind,
-                CASE WHEN ({node_suspend_evidence})
-                     THEN input.current_local_artifact_origin END AS published_artifact_origin,
-                CASE WHEN ({node_suspend_evidence})
-                     THEN input.execution_generation END AS published_execution_generation,
-                CASE WHEN ({node_suspend_evidence})
-                     THEN input.pod_uid END AS published_pod_uid,
-                CASE WHEN ({node_suspend_evidence})
-                     THEN EXISTS (
-                         SELECT 1
-                           FROM sandbox_k8s_executions execution
-                          WHERE execution.sandbox_id = s.id
-                            AND execution.active
-                            AND execution.state = 'running'
-                            AND execution.generation = input.execution_generation
-                            AND execution.pod_uid IS NULL
-                     ) END AS published_pod_uid_was_missing
-           FROM sandboxes s
-           JOIN input ON input.sandbox_id = s.id
-           LEFT JOIN sandbox_quarantine_state qs ON qs.sandbox_id = s.id
-          WHERE s.active_node_id = $1
-            AND input.published_lifecycle = 'suspended'
-            AND (
-                (
-                    {lifecycle_eligible}
-                    AND (
-                        NOT input.has_unconsumed_recovery_receipt
-                        OR LOWER(TRIM(s.lifecycle)) != 'restoring'
-                    )
-                    AND {eligible}
-                )
-                OR (
-                    input.has_unconsumed_recovery_receipt
-                    AND input.transition_receipt_kind = $3
-                    AND input.transition_receipt_target_state = 'suspended'
-                    AND input.transition_receipt_recovery_policy IN ($5, $6)
-                    AND input.transition_receipt_execution_generation IS NOT NULL
-                    AND LOWER(TRIM(s.lifecycle)) = 'quarantined'
-                    AND qs.quarantine_id = input.transition_receipt_id
-                    AND qs.source = $4
-                    AND qs.reason_code = input.transition_receipt_reason_code
-                    AND qs.entered_from_lifecycle = 'restoring'
-                    AND EXISTS (
-                        SELECT 1
-                          FROM sandbox_k8s_executions execution
-                         WHERE execution.sandbox_id = s.id
-                           AND execution.active
-                           AND execution.generation = input.transition_receipt_execution_generation
-                    )
-                    AND (
-                        (
-                            s.current_local_artifact_id = input.current_local_artifact_id
-                            AND {recovery_marker_current}
-                        )
-                        OR (
-                            input.transition_receipt_recovery_policy = $6
-                            AND s.current_local_artifact_id IS NULL
-                            AND (
-                                (
-                                    input.current_local_artifact_id IS NOT NULL
-                                    AND EXISTS (
-                                        SELECT 1
-                                          FROM snapshots recovered_snapshot
-                                          JOIN snapshot_storage_locations recovered_location
-                                            ON recovered_location.snapshot_id = recovered_snapshot.id
-                                         WHERE recovered_snapshot.sandbox_id = s.id
-                                           AND recovered_snapshot.local_artifact_id = input.current_local_artifact_id
-                                           AND {pre_quarantine_snapshot_current}
-                                    )
-                                )
-                                OR (
-                                    input.current_local_artifact_id IS NULL
-                                    AND EXISTS (
-                                        SELECT 1
-                                          FROM snapshots recovered_snapshot
-                                          JOIN snapshot_storage_locations recovered_location
-                                            ON recovered_location.snapshot_id = recovered_snapshot.id
-                                         WHERE recovered_snapshot.sandbox_id = s.id
-                                           AND recovered_snapshot.local_artifact_id IS NULL
-                                           AND {pre_quarantine_snapshot_current}
-                                    )
-                                )
-                            )
-                        )
-                    )
-                )
-            )
-          FOR UPDATE OF s",
-    );
-    type CandidateRow = (
-        SandboxId,
-        bool,
-        Option<Uuid>,
-        Option<String>,
-        Option<SandboxCleanupEpisodeId>,
-        SandboxLifecycle,
-        Option<Uuid>,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<String>,
-        Option<bool>,
-    );
-    let rows: Vec<CandidateRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(node_id)
-        .bind(rows_json)
-        .bind(SandboxTransitionReceiptKind::QuarantineRecovery.as_str())
-        .bind(SandboxQuarantineSource::SbxManager.as_str())
-        .bind(SandboxQuarantineRecoveryPolicy::ExactSuspendArtifact.as_str())
-        .bind(SandboxQuarantineRecoveryPolicy::ExactOrPreQuarantineSuspendArtifact.as_str())
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(|error| {
-            Status::internal(format!("select suspended projection candidates: {error}"))
-        })?;
+    let rows = quarantine_publication::lock_suspended_projection_candidates(
+        &mut *conn,
+        node_id,
+        rows_json,
+        SuspendedProjectionBinds {
+            recovery_receipt_kind: SandboxTransitionReceiptKind::QuarantineRecovery,
+            quarantine_source: SandboxQuarantineSource::SbxManager,
+            exact_policy: SandboxQuarantineRecoveryPolicy::ExactSuspendArtifact,
+            exact_or_pre_quarantine_policy:
+                SandboxQuarantineRecoveryPolicy::ExactOrPreQuarantineSuspendArtifact,
+        },
+    )
+    .await
+    .map_err(|error| {
+        Status::internal(format!("select suspended projection candidates: {error}"))
+    })?;
 
     rows.into_iter()
         .map(
@@ -959,49 +660,30 @@ pub(super) async fn record_quarantine_recovery(
 ) -> Result<(), Status> {
     let history_id = recovery.receipt_id.as_uuid();
     let quarantine_id = recovery.quarantine_id;
-    let inserted = sqlx::query(sql!(
-        "INSERT INTO sandbox_quarantine_history (
-                 id, quarantine_id, sandbox_id, occurred_at, source, action,
-                 reason_code, message, next_action, attempt_count, evidence
-             )
-             SELECT $1, qs.quarantine_id, qs.sandbox_id, NOW(), $2, $3,
-                    qs.reason_code,
-                    'node validated its canonical suspend artifact after runtime cleanup',
-                    NULL, qs.attempt_count,
-                    qs.evidence || jsonb_build_object('recovered_by_node_id', $4::TEXT)
-               FROM sandbox_quarantine_state qs
-              WHERE qs.sandbox_id = $5
-                AND qs.quarantine_id = $6
-                AND qs.source = $8
-                AND qs.reason_code = $7"
-    ))
-    .bind(history_id)
-    .bind(SandboxQuarantineSource::NodeStatePublish.as_str())
-    .bind(SandboxQuarantineHistoryAction::RecoveredToSuspended.as_str())
-    .bind(node_id.to_string())
-    .bind(sandbox_id)
-    .bind(quarantine_id)
-    .bind(recovery.reason_code.as_str())
-    .bind(SandboxQuarantineSource::SbxManager.as_str())
-    .execute(&mut *conn)
+    let inserted = node_recovery_receipt::record_node_recovery(
+        &mut *conn,
+        &NodeRecovery {
+            history_id,
+            sandbox_id,
+            quarantine_id,
+            quarantined_by: SandboxQuarantineSource::SbxManager,
+            reason_code: recovery.reason_code,
+            recorded_by: SandboxQuarantineSource::NodeStatePublish,
+            action: SandboxQuarantineHistoryAction::RecoveredToSuspended,
+            node_id,
+        },
+    )
     .await
-    .map_err(|error| Status::internal(format!("record quarantine recovery: {error}")))?
-    .rows_affected();
+    .map_err(|error| Status::internal(format!("record quarantine recovery: {error}")))?;
     if inserted != 1 {
         return Err(Status::aborted(format!(
             "quarantine recovery history CAS affected {inserted} rows for {sandbox_id}"
         )));
     }
-    let removed = sqlx::query(sql!(
-        "DELETE FROM sandbox_quarantine_state
-              WHERE sandbox_id = $1 AND quarantine_id = $2"
-    ))
-    .bind(sandbox_id)
-    .bind(quarantine_id)
-    .execute(&mut *conn)
-    .await
-    .map_err(|error| Status::internal(format!("retire quarantine recovery: {error}")))?
-    .rows_affected();
+    let removed =
+        node_recovery_receipt::retire_node_recovered_episode(&mut *conn, sandbox_id, quarantine_id)
+            .await
+            .map_err(|error| Status::internal(format!("retire quarantine recovery: {error}")))?;
     if removed != 1 {
         return Err(Status::aborted(format!(
             "quarantine recovery retirement CAS affected {removed} rows for {sandbox_id}"

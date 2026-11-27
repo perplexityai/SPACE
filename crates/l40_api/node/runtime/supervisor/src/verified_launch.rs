@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use pplx_space_common_core::types::EnvironmentReference;
+use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_node_runtime_core::{
     artifact_store::VerifyError,
     catalog::{CompiledEnvironment, compiled_verity_digest},
@@ -197,7 +197,7 @@ fn source_status(error: SourceError) -> Status {
         | SourceError::Metadata { source, .. } => Some(source),
         _ => None,
     };
-    if io.is_some_and(pplx_space_common_core::host::path_errors::host_path_io_error_is_transient) {
+    if io.is_some_and(pplx_space_host_linux::path_errors::host_path_io_error_is_transient) {
         Status::internal(error.to_string())
     } else {
         Status::failed_precondition(error.to_string())

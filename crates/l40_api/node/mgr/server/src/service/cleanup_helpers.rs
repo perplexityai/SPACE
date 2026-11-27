@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::host::linux::paths;
+use pplx_space_host_layout::paths;
 use std::path::{Path, PathBuf};
 
 pub(super) fn validate_sandbox_uid(
@@ -91,14 +91,12 @@ impl NodeManagerService {
         let span = tracing::Span::current();
         self.device_op_tasks
             .spawn_blocking(move || {
+                // Cancellation stops work before a section, never discards the
+                // result of one that ran.
                 if let Some(owner) = &owner {
                     owner.check()?;
                 }
-                let result = span.in_scope(section);
-                if let Some(owner) = &owner {
-                    owner.check()?;
-                }
-                result
+                span.in_scope(section)
             })
             .await
             .map_err(|error| {
@@ -386,7 +384,7 @@ impl CleanupCommandRunner for SystemCleanupCommandRunner {
             prune_snapshots,
             uid,
             0,
-            pplx_space_common_core::host::linux::identities::gids::SPACE_CACHE_RW,
+            pplx_space_host_layout::identities::gids::SPACE_CACHE_RW,
         )
         .map_err(|source| CleanupCommandError::Execution {
             program: "cache ownership rewrite".into(),
@@ -1715,10 +1713,10 @@ fn sandbox_backing_roots(
 }
 
 fn backing_belongs_to_sandbox(backing: &str, roots: &[std::path::PathBuf]) -> bool {
-    let path = Path::new(backing.strip_suffix(" (deleted)").unwrap_or(backing));
+    let path = Path::new(backing.trim_suffix(" (deleted)"));
     roots.iter().any(|root| {
         path.strip_prefix(root)
-            .is_ok_and(|relative| !relative.as_os_str().is_empty())
+            .is_ok_and(|relative| !relative.is_empty())
     })
 }
 

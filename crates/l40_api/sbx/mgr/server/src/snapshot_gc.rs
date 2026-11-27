@@ -25,7 +25,7 @@
 //!    lifecycle transition that opens the artifact's `local_path`,
 //!    so an artifact that hasn't been touched for a day is genuinely
 //!    cold.
-//! 4. **Outside the grace period.** Per [`pplx_space_common_lru_reaper`]'s
+//! 4. **Outside the grace period.** Per [`pplx_space_lru_reaper`]'s
 //!    grace rule: `now - max(created_at, last_touched_at) >= grace`.
 //!    The grace period (default 1800 s, floor 60 s) defends against
 //!    the create/touch race where a sandbox has just produced an
@@ -62,8 +62,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pplx_space_common_core::types::LocalArtifactId;
-use pplx_space_common_lru_reaper::{self as lru_reaper, EvictionInput};
+use pplx_space_lru_reaper::{self as lru_reaper, EvictionInput};
+use pplx_space_snapshot_model::LocalArtifactId;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -113,7 +113,7 @@ pub struct GcConfig {
 impl GcConfig {
     const ENV_ENABLED: &'static str = "SPACE_SBX_GC_ENABLED";
     const ENV_ENGAGE_FRACTION: &'static str = "SPACE_SBX_GC_ENGAGE_FRACTION";
-    /// Test hooks (`pplx_space_common_core::env::test_hook`): compiled in only
+    /// Test hooks (`pplx_space_test_hooks::test_hook`): compiled in only
     /// with the `test-hooks` feature, so release binaries cannot shrink these
     /// timers. Smoke benches use them to make the loop observable.
     const ENV_TARGET_FRACTION: &'static str = "SPACE_SBX_GC_TARGET_FRACTION";
@@ -143,7 +143,7 @@ impl GcConfig {
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(Self::DEFAULT_ENGAGE_FRACTION);
-        let target = pplx_space_common_core::env::test_hook_var(Self::ENV_TARGET_FRACTION)
+        let target = pplx_space_test_hooks::test_hook_var(Self::ENV_TARGET_FRACTION)
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(Self::DEFAULT_TARGET_FRACTION);
         let (engage_fraction, target_fraction) = crate::disk_usage::validate_fraction_pair(
@@ -153,14 +153,14 @@ impl GcConfig {
             Self::ENV_ENGAGE_FRACTION,
             Self::ENV_TARGET_FRACTION,
         );
-        let interval_secs = pplx_space_common_core::env::test_hook_var(Self::ENV_INTERVAL_SECS)
+        let interval_secs = pplx_space_test_hooks::test_hook_var(Self::ENV_INTERVAL_SECS)
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(Self::DEFAULT_INTERVAL_SECS);
-        let grace_secs = pplx_space_common_core::env::test_hook_var(Self::ENV_GRACE_SECS)
+        let grace_secs = pplx_space_test_hooks::test_hook_var(Self::ENV_GRACE_SECS)
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(Self::DEFAULT_GRACE_SECS);
-        let idle_secs = pplx_space_common_core::env::test_hook_var(Self::ENV_IDLE_SECS)
+        let idle_secs = pplx_space_test_hooks::test_hook_var(Self::ENV_IDLE_SECS)
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(Self::DEFAULT_IDLE_SECS);
         if enabled && grace_secs < Self::SAFETY_GRACE_FLOOR_SECS {
@@ -596,7 +596,7 @@ async fn gc_tick(
 /// other services' private directories, such as node-mgr's root-only
 /// `.btrfs-send-staging`, and warned about each on every pass. Tests drive
 /// bounded discovery through a tempdir.
-const CACHE_ROOT_FOR_SWEEP: &str = pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR;
+const CACHE_ROOT_FOR_SWEEP: &str = pplx_space_host_layout::paths::SANDBOX_CACHE_DIR;
 
 /// Maximum directory-walk depth below [`CACHE_ROOT_FOR_SWEEP`]. Staging
 /// directories sit at `<sandbox_id>/.gc-pending-<id>` and

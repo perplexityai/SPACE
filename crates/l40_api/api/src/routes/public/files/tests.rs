@@ -1,5 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use pplx_space_common_core::types::{GuestUserName, SandboxId};
+use pplx_space_guest_process::GuestUserName;
 use pplx_space_native_files::limits::{
     FILE_WRITE_CHUNK_BYTES, MAX_FILE_READ_BYTES, MAX_FILE_WRITE_BYTES,
 };
@@ -8,6 +8,7 @@ use pplx_space_native_files::{
     spaced_mkdir_request, write_parent_directory,
 };
 use pplx_space_public_api::{FileEventKind, FileType, PublicSandboxId};
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::proto::{SpacedFileInfo, SpacedFileType, spaced_write_request};
 
 use super::*;
@@ -177,9 +178,9 @@ async fn a_full_sandbox_disk_is_not_a_retryable_rate_limit() {
     let mut storage_full =
         tonic::Status::resource_exhausted("No space left on device (os error 28)");
     storage_full.metadata_mut().insert(
-        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
         tonic::metadata::MetadataValue::from_static(
-            pplx_space_common_core::spaced::GUEST_STORAGE_FULL,
+            pplx_space_guest_process::status::GUEST_STORAGE_FULL,
         ),
     );
     let (status, full) = envelope(storage_full).await;
@@ -199,6 +200,46 @@ async fn a_full_sandbox_disk_is_not_a_retryable_rate_limit() {
         let (status, envelope) = envelope(tonic::Status::resource_exhausted(other)).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{other}");
         assert_eq!(envelope.code, PublicErrorCode::RateLimited, "{other}");
+    }
+}
+
+/// A file call refused because the sandbox is at rest and may not be woken
+/// answers as `createCommand` does: a non-retryable `conflict` whose details
+/// name the reason, the state and the request that wakes it. A mutation the
+/// sandbox never saw answers the same.
+#[tokio::test]
+async fn a_sandbox_at_rest_answers_with_the_command_refusal_details() {
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+    use pplx_space_public_api::{PublicErrorCode, PublicErrorEnvelope};
+    use pplx_space_sandbox_model::SandboxLifecycle;
+
+    let sandbox_id = SandboxId::new();
+    let refusal = || {
+        ControllerError::sandbox_not_running(
+            crate::controllers::SandboxNotRunning {
+                sandbox_id,
+                lifecycle: SandboxLifecycle::Suspended,
+            },
+            "sandbox is not running",
+        )
+    };
+    for response in [
+        controller_error(refusal()).into_response(),
+        unprotected_mutation_error(refusal()).into_response(),
+    ] {
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let envelope: PublicErrorEnvelope = serde_json::from_slice(&body).unwrap();
+        assert_eq!(envelope.code, PublicErrorCode::Conflict);
+        assert!(!envelope.retryable);
+        assert_eq!(
+            envelope.details,
+            pplx_space_public_api::sandbox_not_running_details(
+                sandbox_id.into(),
+                &pplx_space_public_api::SandboxLifecycleState::Suspended,
+            )
+        );
     }
 }
 
@@ -390,10 +431,10 @@ mod batch_body_limits {
         body::Body,
         http::{Method, Request},
     };
-    use pplx_space_common_core::sql;
     use pplx_space_db_test_fixtures::{
         SEED_ORG_ID, SEED_USER_ID, TestDb, TestDbResult, pg_test_db,
     };
+    use pplx_space_sql_locator::sql;
     use serde_json::{Value, json};
     use tower::ServiceExt;
     use uuid::Uuid;
@@ -639,8 +680,8 @@ mod key_binding {
         body::Body,
         http::{Method, Request},
     };
-    use pplx_space_common_core::sql;
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDbResult};
+    use pplx_space_sql_locator::sql;
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
@@ -1131,4 +1172,39 @@ mod write_creating_parents {
         assert_eq!(status_of(result), StatusCode::NOT_FOUND);
         assert_eq!(guest.writes.borrow().len(), 2, "retried once only");
     }
+}
+
+/// A read the guest refuses before its first chunk, as it refuses a
+/// directory, answers with that refusal instead of a 200 and an aborted body;
+/// a read that starts streams every chunk.
+#[tokio::test]
+async fn a_read_refused_before_its_first_chunk_answers_with_the_refusal() {
+    use http_body_util::BodyExt;
+    use pplx_space_public_api::{PublicErrorCode, PublicErrorEnvelope};
+    use pplx_space_sbx_mgr_client::proto::SpacedFileChunk;
+
+    let refused = stream::iter([Err(tonic::Status::failed_precondition(
+        "Is a directory (os error 21)",
+    ))]);
+    let response = read_response(refused)
+        .await
+        .expect_err("the refusal is the answer")
+        .into_response();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let envelope: PublicErrorEnvelope = serde_json::from_slice(&body).unwrap();
+    assert_eq!(envelope.code, PublicErrorCode::FailedPrecondition);
+    assert_eq!(envelope.message, "Is a directory (os error 21)");
+
+    let chunk = |data: &'static [u8]| {
+        Ok(SpacedFileChunk {
+            data: data.to_vec().into(),
+        })
+    };
+    let response = read_response(stream::iter([chunk(b"hel"), chunk(b"lo")]))
+        .await
+        .expect("a read whose first chunk arrives starts");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.as_ref(), b"hello");
 }

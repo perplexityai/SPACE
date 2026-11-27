@@ -17,7 +17,10 @@ datadog = ["otel", "pplx-space-observability/datadog"]
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
 # Compiles in the test-only environment hooks; never enabled for release builds.
-test-hooks = ["pplx-space-common-core/test-hooks"]
+test-hooks = [
+    "pplx-space-node-disk-admission/test-hooks",
+    "pplx-space-test-hooks/test-hooks",
+]
 
 [dependencies]
 arc-swap = { workspace = true }
@@ -27,9 +30,13 @@ h2 = { workspace = true }
 hyper = { workspace = true }
 jiff = { workspace = true }
 libc = { workspace = true }
+pplx-space-artifact-model = { workspace = true, features = ["serde"] }
+pplx-space-firewall-rules-model = { workspace = true }
+pplx-space-firewall-rules-protocol = { workspace = true }
+pplx-space-snapshot-model = { workspace = true, features = ["serde"] }
+pplx-space-template-model = { workspace = true }
 rustix = { workspace = true, features = ["fs", "mount", "process"] }
 nix = { workspace = true, features = ["dir", "fs", "mount", "sched", "process", "resource", "signal", "user"] }
-rusqlite = { workspace = true }
 socket2 = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -43,18 +50,31 @@ tonic = { workspace = true }
 tonic-health = { workspace = true }
 tracing = { workspace = true }
 futures-util = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
 zeroize = { workspace = true }
 
 # internal
-pplx-space-common-core = { workspace = true }
+pplx-space-accounts = { workspace = true }
+pplx-space-sandbox-model = { workspace = true }
+pplx-space-node-mgr-store = { workspace = true }
+pplx-space-btrfs = { workspace = true }
+pplx-space-host-layout = { workspace = true }
+pplx-space-host-linux = { workspace = true }
+pplx-space-node-disk-admission = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
-pplx-space-common-io = { workspace = true, features = ["reflink"] }
+pplx-space-env-vars = { workspace = true }
+pplx-space-file-io = { workspace = true, features = ["reflink"] }
+pplx-space-content-digest = { workspace = true }
+pplx-space-cpu-arch = { workspace = true }
+pplx-space-execution-spec = { workspace = true }
 pplx-space-grpc-rate-limiter = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
+pplx-space-linux-ids = { workspace = true }
 pplx-space-local-health = { workspace = true }
+pplx-space-rpc-contracts = { workspace = true }
 pplx-space-service-lifecycle = { workspace = true }
 pplx-space-service-mutex = { workspace = true }
-pplx-space-sqlite = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
 pplx-space-events = { workspace = true }
 pplx-space-execution-common = { workspace = true }
@@ -65,16 +85,15 @@ pplx-space-node-ctl-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
 pplx-space-node-runtime-core = { workspace = true, features = ["artifact-store", "host-runtime"] }
 pplx-space-observability = { workspace = true, default-features = false }
+pplx-space-test-hooks = { workspace = true }
 pplx-space-uds-peer-auth = { workspace = true }
 pplx-space-unix-socket-bind = { workspace = true }
-sqlx = { workspace = true, features = ["macros", "migrate"] }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["serde"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = { workspace = true }
 
 [dev-dependencies]
-pplx-space-common-core = { workspace = true, features = ["test-hooks"] }
 insta = { workspace = true, features = ["json"] }
 rstest = { workspace = true }
 # test-capture lets the encrypted-volume tests assert which BYOK counters a
@@ -82,7 +101,13 @@ rstest = { workspace = true }
 # reviewed.
 pplx-space-metrics-emit = { workspace = true, features = ["test-capture"] }
 hyper-util = { workspace = true, features = ["tokio"] }
+# The slot pool tests seed and inspect rows through the store's raw
+# connection with rusqlite, binding u64 values as SqliteU64.
+pplx-space-node-mgr-store = { workspace = true, features = ["test-support"] }
+pplx-space-sqlite = { workspace = true }
+rusqlite = { workspace = true }
 pplx-space-test-env = { workspace = true }
+pplx-space-test-hooks = { workspace = true, features = ["test-hooks"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 tower = { workspace = true }

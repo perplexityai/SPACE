@@ -1,7 +1,7 @@
 //! Internal activation RPCs hosted beside the API's existing lifecycle owner:
 //! ingress activation, and the native file access RPCs
 //! ([`crate::native_file_access`]).
-use pplx_space_common_core::types::{SandboxId, parse_grpc_timeout};
+use pplx_space_durations::parse_grpc_timeout;
 use pplx_space_ingress_admission::{IngressPreparationPermit, preparation_timeout};
 use pplx_space_node_api_client::{
     activation::IngressActivation,
@@ -12,6 +12,7 @@ use pplx_space_node_api_client::{
     },
 };
 use pplx_space_rpc_auth as auth;
+use pplx_space_sandbox_model::SandboxId;
 use std::{future::Future, pin::Pin, sync::Arc};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tonic::{Request, Response, Status};

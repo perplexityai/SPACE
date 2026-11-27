@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
-use pplx_space_common_core::types::{CLUSTER_ID_ENV, GuestUserName};
+use pplx_space_cluster_id::CLUSTER_ID_ENV;
+use pplx_space_guest_process::GuestUserName;
 use pplx_space_spaced_guest_protocol::proto::worker::worker_filesystem_client::WorkerFilesystemClient as FilesystemClient;
 use pplx_space_spaced_guest_protocol::proto::worker::worker_filesystem_server::WorkerFilesystemServer as FilesystemServer;
 use tokio::process::{Child, Command as ChildCommand};
@@ -33,7 +34,7 @@ const SPACE_SERVICE_NAME_ENV: &str = "SPACE_SERVICE_NAME";
 /// Whether the forwarded environment would give the worker its launcher's
 /// service name. Only the OTel settings outrank the worker's own default, and
 /// `DD_SERVICE` is not forwarded.
-fn inherits_parent_service_name(env: &dyn pplx_space_common_core::env::Environment) -> bool {
+fn inherits_parent_service_name(env: &dyn pplx_space_env_vars::Environment) -> bool {
     if env
         .var("OTEL_SERVICE_NAME")
         .is_ok_and(|value| !value.trim().is_empty())
@@ -789,7 +790,7 @@ fn worker_command(
         user,
         worker_raw_fd,
         identity_policy,
-        &pplx_space_common_core::env::ProcessEnvironment,
+        &pplx_space_env_vars::ProcessEnvironment,
     )
 }
 fn worker_command_from_environment(
@@ -797,7 +798,7 @@ fn worker_command_from_environment(
     user: &GuestUserName,
     worker_raw_fd: RawFd,
     identity_policy: crate::IdentityPolicy,
-    env: &dyn pplx_space_common_core::env::Environment,
+    env: &dyn pplx_space_env_vars::Environment,
 ) -> ChildCommand {
     let mut command = ChildCommand::new(executable);
     // Executing /proc/self/fd/N otherwise exposes the descriptor as argv[0].
@@ -910,7 +911,7 @@ pub(crate) enum FilesystemWorkerError {
     #[error("filesystem worker user is missing: {0}")]
     MissingUser(#[source] std::env::VarError),
     #[error("filesystem worker user is invalid: {0}")]
-    InvalidUser(#[source] pplx_space_common_core::types::ProcessParseError),
+    InvalidUser(#[source] pplx_space_guest_process::ProcessParseError),
     #[error("filesystem worker fd is missing: {0}")]
     MissingFd(#[source] std::env::VarError),
     #[error("filesystem worker fd is invalid: {0}")]

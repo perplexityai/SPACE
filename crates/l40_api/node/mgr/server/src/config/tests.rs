@@ -40,7 +40,7 @@ fn malformed_policy_prevents_startup() {
 
 #[test]
 fn candidate_catalog_failure_preserves_all_spellings_of_initial_policy() {
-    use pplx_space_common_core::types::Arch;
+    use pplx_space_cpu_arch::Arch;
     use pplx_space_node_runtime_core::catalog::CatalogError;
     let resolve = |allowed, default| {
         execution_policy_with_catalog(

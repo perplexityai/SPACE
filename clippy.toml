@@ -1,5 +1,7 @@
 disallowed-methods = [
-    { path = "uuid::Uuid::new_v4", reason = "Use UUIDv7 (`Uuid::now_v7`) for SPACE-owned durable identifiers. See AGENTS.md for justified UUIDv4 exceptions." },
+    # A crate linted on its own (`cargo clippy -p`) can build uuid without its
+    # v4 feature: aws-runtime, for one, depends on uuid without it.
+    { path = "uuid::Uuid::new_v4", allow-invalid = true, reason = "Use UUIDv7 (`Uuid::now_v7`) for SPACE-owned durable identifiers. See AGENTS.md for justified UUIDv4 exceptions." },
 ]
 
 disallowed-macros = [

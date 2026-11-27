@@ -34,18 +34,15 @@ use pplx_space_cluster_pool::{
     AutoscaleRun, InvalidPoolConfigRow, NewPoolSlot, PoolConfig, PoolConfigRead, PoolSlot,
     PoolSlotCounts, PoolSlotState, WarmPoolStore,
 };
-use pplx_space_common_core::kubernetes::NodeGroupPlacement;
-use pplx_space_common_core::kubernetes::PodEnvironment;
-use pplx_space_common_core::{
-    kubernetes::{
-        DEFAULT_SANDBOX_PROXY_PORT, SANDBOX_POOL_ROLE_WARM, SandboxPodConfigValues,
-        TEMPLATE_PRESENT_LABEL_VALUE, template_build_presence_label_key,
-        template_write_annotation_key_for,
-    },
-    types::{SandboxId, TemplateArtifactDigest, TemplateReference},
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sandbox_pod::{
+    DEFAULT_SANDBOX_PROXY_PORT, NodeGroupPlacement, PodEnvironment, SANDBOX_POOL_ROLE_WARM,
+    SandboxPodConfigValues, TEMPLATE_PRESENT_LABEL_VALUE, TemplateEnvironmentWrite,
+    template_presence_label_key_for, template_write_annotation_key_for,
 };
 use pplx_space_sandbox_store::delete::delete_with_dependents;
 use pplx_space_sbx_mgr_client::proto::SpacedWaitReadyRequest;
+use pplx_space_template_model::{TemplateArtifactDigest, TemplateReference};
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::{
     sync::Semaphore,
@@ -67,7 +64,7 @@ use crate::pod::{build_pool_pod, pool_pod_name, ready_pod_metadata};
 #[derive(Debug, thiserror::Error)]
 pub enum WarmPoolError {
     #[error(transparent)]
-    PodConfig(#[from] pplx_space_common_core::kubernetes::NodeSelectorLabelsParseError),
+    PodConfig(#[from] pplx_space_sandbox_pod::NodeSelectorLabelsParseError),
     #[error("warm slot create semaphore closed")]
     CreatePermitsClosed(#[source] tokio::sync::AcquireError),
     #[error("warm pool config reconcile worker panicked: {0}")]
@@ -304,6 +301,15 @@ enum TimedIoError<E> {
     Timeout(ReconcileIoTimeout),
 }
 
+/// A read of the environment a pool config's pods run under, bounded by the
+/// Postgres I/O timeout.
+type PoolEnvironmentRead = Result<
+    Option<PodEnvironment>,
+    TimedIoError<
+        pplx_space_api::controllers::substrate::environment_placement::BoundEnvironmentError,
+    >,
+>;
+
 async fn timed_io<T, E, F>(
     operation: &'static str,
     timeout_duration: Duration,
@@ -348,11 +354,11 @@ fn pool_pod_config_from_env() -> Result<SandboxPodConfigValues, WarmPoolError> {
 }
 
 fn sandbox_namespace_from_env() -> String {
-    sandbox_namespace_from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+    sandbox_namespace_from_environment(&pplx_space_env_vars::ProcessEnvironment)
 }
 
 pub(crate) fn sandbox_namespace_from_environment(
-    env: &dyn pplx_space_common_core::env::Environment,
+    env: &dyn pplx_space_env_vars::Environment,
 ) -> String {
     env.var(SANDBOX_NAMESPACE_ENV)
         .or_else(|_| env.var(POD_NAMESPACE_ENV))
@@ -941,10 +947,20 @@ impl Reconciler {
     /// still need their slots reconciled, so a failed step does not end the
     /// pass. Returns the configs it retired.
     async fn autoscale(&self) -> PoolConfigRead {
+        // Pools follow the release creates of each build resolve to, which
+        // may be a twin, where creates boot the twin they resolve to;
+        // unbound releases count as the initial environment's. Anywhere else
+        // creates run the named release, and its pools stay.
+        let initial_environment =
+            pplx_space_execution_catalog::catalog::initial_environment_reference().to_string();
+        let resolving = self
+            .substrate
+            .boots_template_twins()
+            .then_some(initial_environment.as_str());
         let (outcome, retired) = match self
             .timed_postgres(
                 "autoscale-configs",
-                self.store.autoscale_configs(&self.namespace),
+                self.store.autoscale_configs(&self.namespace, resolving),
             )
             .await
         {
@@ -1286,11 +1302,29 @@ impl Reconciler {
         )
         .await;
         let mut summary = ReconcileSummary::default();
+        // With the gate on, the pods' environment decides which build nodes
+        // are asked for, so it's read here too. The create stage reads it
+        // again: a release without a binding takes its build's holders', and
+        // a holder can report one while this tick's I/O runs.
+        //
+        // Whether that first read failed, and so already warned: a failing
+        // read keeps failing, and one warn per config per tick says it.
+        let mut environment_read_warned = false;
         let node_group_placement = match placement {
             Ok(resolved) => {
+                let read = if self.substrate.environment_placement().refuses() {
+                    Some(self.pool_environment(config).await)
+                } else {
+                    None
+                };
+                environment_read_warned = matches!(read, Some(Err(_)));
+                let required = read
+                    .as_ref()
+                    .and_then(|read| required_pool_environment(config, read));
                 summary += template_write_annotation_result(
                     config,
-                    self.ensure_template_write_annotations(config).await,
+                    self.ensure_template_write_annotations(config, required)
+                        .await,
                 );
                 Some(resolved)
             }
@@ -1419,21 +1453,24 @@ impl Reconciler {
         let environment = if wanted == 0 {
             Ok(None)
         } else {
-            pool_pod_environment(
-                self.substrate.environment_placement(),
-                self.store.pool(),
-                config.template_name.as_str(),
-                &config.content_hash.to_string(),
-            )
-            .await
-            .inspect_err(|error| {
-                tracing::warn!(
-                    pool_config_id = %config.id,
-                    template_release_id = %config.template_release_id,
-                    %error,
-                    "warm pool: the template build's environment could not be read; \
-                     not creating slots for this config this tick"
-                );
+            self.pool_environment(config).await.inspect_err(|error| {
+                if environment_read_warned {
+                    tracing::debug!(
+                        pool_config_id = %config.id,
+                        template_release_id = %config.template_release_id,
+                        %error,
+                        "warm pool: the template build's environment could not be read; \
+                         not creating slots for this config this tick"
+                    );
+                } else {
+                    tracing::warn!(
+                        pool_config_id = %config.id,
+                        template_release_id = %config.template_release_id,
+                        %error,
+                        "warm pool: the template build's environment could not be read; \
+                         not creating slots for this config this tick"
+                    );
+                }
             })
         };
         let create_count = match environment {
@@ -1974,7 +2011,7 @@ impl Reconciler {
         if !self
             .timed_postgres(
                 "delete-slot-lock-open-slot",
-                WarmPoolStore::lock_open_slot_for_delete(&mut tx, slot.id),
+                WarmPoolStore::lock_open_slot_for_delete(&mut *tx, slot.id),
             )
             .await?
         {
@@ -1994,7 +2031,7 @@ impl Reconciler {
         }
         self.timed_postgres(
             "delete-slot-row",
-            WarmPoolStore::delete_locked_open_slot(&mut tx, slot.id),
+            WarmPoolStore::delete_locked_open_slot(&mut *tx, slot.id),
         )
         .await?;
         self.timed_postgres("delete-slot-txn-commit", tx.commit())
@@ -2067,7 +2104,7 @@ impl Reconciler {
                     .timed_postgres(
                         "delete-claimed-slot-lock",
                         WarmPoolStore::lock_stale_unbound_claimed_slot_for_delete(
-                            &mut tx,
+                            &mut *tx,
                             slot.id,
                             self.claimed_slot_timeout,
                         ),
@@ -2078,7 +2115,7 @@ impl Reconciler {
                 }
                 self.timed_postgres(
                     "delete-claimed-slot-row",
-                    WarmPoolStore::delete_locked_claimed_slot(&mut tx, slot.id),
+                    WarmPoolStore::delete_locked_claimed_slot(&mut *tx, slot.id),
                 )
                 .await?;
                 self.timed_postgres("delete-claimed-slot-txn-commit", tx.commit())
@@ -2103,7 +2140,7 @@ impl Reconciler {
         if !self
             .timed_postgres(
                 "cleanup-pending-lock-slot",
-                WarmPoolStore::lock_cleanup_pending_slot_for_delete(&mut tx, slot.id),
+                WarmPoolStore::lock_cleanup_pending_slot_for_delete(&mut *tx, slot.id),
             )
             .await?
         {
@@ -2111,12 +2148,12 @@ impl Reconciler {
         }
         self.timed_postgres(
             "cleanup-pending-finalize-sandbox-delete",
-            delete_with_dependents(&mut tx, slot.reserved_sandbox_id),
+            delete_with_dependents(&mut *tx, slot.reserved_sandbox_id),
         )
         .await?;
         self.timed_postgres(
             "cleanup-pending-delete-slot-row",
-            WarmPoolStore::delete_locked_cleanup_pending_slot(&mut tx, slot.id),
+            WarmPoolStore::delete_locked_cleanup_pending_slot(&mut *tx, slot.id),
         )
         .await?;
         self.timed_postgres("cleanup-pending-txn-commit", tx.commit())
@@ -2183,9 +2220,49 @@ impl Reconciler {
         .await
     }
 
+    /// The environment the config's pods run under
+    /// ([`pool_pod_environment`]): the template build's binding, while the
+    /// environment placement gate evaluates. Bounded by the Postgres I/O
+    /// timeout like the placement read: with the gate on it runs before the
+    /// teardown stages, which a stalled query must not hold up, and a timeout
+    /// is a failed read. In shadow a timeout reads as unbound, as the
+    /// resolver's own read failures do there, so shadow places as off would.
+    async fn pool_environment(&self, config: &PoolConfig) -> PoolEnvironmentRead {
+        let gate = self.substrate.environment_placement();
+        let read = timed_io(
+            "read-pool-environment",
+            self.io_timeouts.postgres(),
+            pool_pod_environment(
+                gate,
+                self.store.pool(),
+                config.template_release_id,
+                config.template_name.as_str(),
+                &config.content_hash.to_string(),
+            ),
+        )
+        .await;
+        match read {
+            Err(TimedIoError::Timeout(timeout)) if !gate.refuses() => {
+                tracing::warn!(
+                    pool_config_id = %config.id,
+                    template_release_id = %config.template_release_id,
+                    error = %timeout,
+                    "warm pool: the template build's environment read timed out; \
+                     shadow places as off"
+                );
+                Ok(None)
+            }
+            read => read,
+        }
+    }
+
+    /// Ask every sandbox node lacking the config's build to write it: the
+    /// build bound to `required`, the environment the pods require, or the
+    /// digest in any partition.
     async fn ensure_template_write_annotations(
         &self,
         config: &PoolConfig,
+        required: Option<pplx_space_execution_spec::EnvironmentReference>,
     ) -> Result<TemplateWriteAnnotationSummary, WarmPoolError> {
         let nodes: Api<Node> = Api::all(self.kube.clone());
         let list_params = template_write_node_list_params(&self.pod_config);
@@ -2193,13 +2270,7 @@ impl Reconciler {
         let node_list = self
             .timed_k8s("template-write-node-list", node_list)
             .await?;
-        let request = template_write_request(config);
-        let annotation_key = template_write_annotation_key_for(&request);
-        let annotation_value = request.to_string();
-        let presence_label = template_build_presence_label_key(
-            config.template_name.as_str(),
-            &config.content_hash.to_string(),
-        );
+        let target = template_write_target(config, required);
         let mut patched = 0;
         let mut failed = 0;
 
@@ -2207,13 +2278,7 @@ impl Reconciler {
             let Some(node_name) = node.metadata.name.as_deref() else {
                 continue;
             };
-            if !needs_template_write_annotation(
-                &node,
-                &self.pod_config,
-                &presence_label,
-                &annotation_key,
-                &annotation_value,
-            ) {
+            if !needs_template_write_annotation(&node, &self.pod_config, &target) {
                 continue;
             }
 
@@ -2224,8 +2289,8 @@ impl Reconciler {
                         node_name,
                         &template_write_annotation_patch_params(),
                         &Patch::Merge(template_write_annotation_patch(
-                            &annotation_key,
-                            &annotation_value,
+                            &target.annotation_key,
+                            &target.annotation_value,
                         )),
                     ),
                 )
@@ -2236,7 +2301,7 @@ impl Reconciler {
                     failed += 1;
                     tracing::warn!(
                         node = %node_name,
-                        annotation = %annotation_key,
+                        annotation = %target.annotation_key,
                         template = %config.template_name,
                         template_release_id = %config.template_release_id,
                         error = %err,
@@ -2391,6 +2456,79 @@ fn template_write_request(config: &PoolConfig) -> TemplateReference {
     )
 }
 
+/// The environment the config's pods require, from the gate-on read of their
+/// environment: they then run only on a node holding that environment's
+/// build, so that's the build a node is asked to write. `None` for unbound
+/// work, and for a failed read, which is logged and asks for the
+/// environment-less build, as before twins; the create stage books the
+/// failure.
+fn required_pool_environment(
+    config: &PoolConfig,
+    read: &PoolEnvironmentRead,
+) -> Option<pplx_space_execution_spec::EnvironmentReference> {
+    match read {
+        Ok(environment) => environment
+            .filter(|environment| environment.required)
+            .map(|environment| environment.reference),
+        Err(error) => {
+            tracing::warn!(
+                pool_config_id = %config.id,
+                template_release_id = %config.template_release_id,
+                %error,
+                "warm pool: the template build's environment could not be read; \
+                 asking nodes for the environment-less build"
+            );
+            None
+        }
+    }
+}
+
+/// What a node is asked to hold for a pool config, and the label saying it
+/// does.
+#[derive(Debug, PartialEq, Eq)]
+struct TemplateWriteTarget {
+    presence_label: String,
+    annotation_key: String,
+    annotation_value: String,
+    /// The environment an environment write names. Only a node publishing
+    /// it is asked: the pods require its label, so a build anywhere else
+    /// would be a rootfs no pool pod can use.
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
+}
+
+/// The write a node is asked for: with `environment`, the one exact build
+/// bound to it, in its cache partition, whose partition presence label says
+/// it's there (a twin shares its original's digest, so the partition-less
+/// label would match the original too); without, the pool release's digest
+/// in any partition, as before twins.
+fn template_write_target(
+    config: &PoolConfig,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
+) -> TemplateWriteTarget {
+    let request = template_write_request(config);
+    let template = config.template_name.as_str();
+    let content_hash = config.content_hash.to_string();
+    let presence_label = template_presence_label_key_for(template, &content_hash, environment);
+    // A pool's write always names its release's digest, so the environment
+    // write is built whenever the pods require an environment.
+    match environment
+        .and_then(|environment| TemplateEnvironmentWrite::new(request.clone(), environment))
+    {
+        Some(write) => TemplateWriteTarget {
+            presence_label,
+            annotation_key: write.annotation_key(),
+            annotation_value: write.annotation_value(),
+            environment: Some(write.environment),
+        },
+        None => TemplateWriteTarget {
+            presence_label,
+            annotation_key: template_write_annotation_key_for(&request),
+            annotation_value: request.to_string(),
+            environment: None,
+        },
+    }
+}
+
 fn template_write_node_list_params(config: &SandboxPodConfigValues) -> ListParams {
     ListParams::default().labels(&format!(
         "{}={}",
@@ -2420,9 +2558,7 @@ fn warm_pool_pod_matches_config(pod: &SandboxPodView, config_id: &str) -> bool {
 fn needs_template_write_annotation(
     node: &Node,
     config: &SandboxPodConfigValues,
-    presence_label: &str,
-    annotation_key: &str,
-    annotation_value: &str,
+    target: &TemplateWriteTarget,
 ) -> bool {
     let labels = node.metadata.labels.as_ref();
     if labels
@@ -2432,8 +2568,17 @@ fn needs_template_write_annotation(
     {
         return false;
     }
+    // A node that doesn't publish the environment yet is asked on a later
+    // reconcile, once it does.
+    if let Some(environment) = &target.environment
+        && !labels.is_some_and(|labels| {
+            pplx_space_sandbox_pod::node_publishes_environment(labels, environment)
+        })
+    {
+        return false;
+    }
     if labels
-        .and_then(|labels| labels.get(presence_label))
+        .and_then(|labels| labels.get(&target.presence_label))
         .map(String::as_str)
         == Some(TEMPLATE_PRESENT_LABEL_VALUE)
     {
@@ -2443,9 +2588,9 @@ fn needs_template_write_annotation(
     node.metadata
         .annotations
         .as_ref()
-        .and_then(|annotations| annotations.get(annotation_key))
+        .and_then(|annotations| annotations.get(&target.annotation_key))
         .map(String::as_str)
-        != Some(annotation_value)
+        != Some(target.annotation_value.as_str())
 }
 
 fn template_write_annotation_patch(

@@ -1,14 +1,16 @@
 //! Decode publication evidence without treating omission or collection failure
 //! as an empty inventory. Existing placement projections remain unchanged.
 
-use pplx_space_common_core::{
-    sql,
-    types::{
-        ArtifactComponentMetadata, GuestPlatform, NodeId, RuntimeIdentity, StateFormatIdentity,
-    },
-};
+use pplx_space_accounts::NodeId;
 use pplx_space_execution_common::proto::NodeExecutionInventory;
-use sqlx::types::Json;
+use pplx_space_execution_spec::{
+    ArtifactComponentMetadata, GuestPlatform, RuntimeIdentity, StateFormatIdentity,
+};
+use pplx_space_node_execution_inventory_store::{
+    self as inventory_store, ArtifactComponent, RuntimeGuest, RuntimeInstallation,
+    RuntimeStateFormat,
+};
+use pplx_space_node_registration_store::locks;
 use tonic::Status;
 
 use crate::proto::{ExecutionInventoryObservation, execution_inventory_observation::Outcome};
@@ -95,18 +97,18 @@ pub(super) async fn prepare<'a>(
     // Keep artifact writes before the status upsert, as legacy readers do.
     // Locking the status row first would invert that order during rollout.
     // NO KEY UPDATE permits the foreign-key key-share locks of node reports.
-    sqlx::query_scalar::<_, NodeId>(sql!("SELECT id FROM nodes WHERE id = $1 FOR NO KEY UPDATE"))
-        .bind(node_id)
-        .fetch_optional(&mut **tx)
+    let exists = locks::lock_node_for_no_key_update(&mut **tx, node_id)
         .await
-        .map_err(|error| Status::internal(format!("lock node execution publication: {error}")))?
-        .ok_or_else(|| Status::not_found("publishing node no longer exists"))?;
+        .map_err(|error| Status::internal(format!("lock node execution publication: {error}")))?;
+    if !exists {
+        return Err(Status::not_found("publishing node no longer exists"));
+    }
     Ok(Some(PreparedObservation { node_id, report }))
 }
 
 pub(super) struct PublishedExecutionObservation {
     pub status: InventoryStatus,
-    pub policy: Option<pplx_space_common_core::types::ExecutionPolicyObservation>,
+    pub policy: Option<pplx_space_execution_spec::ExecutionPolicyObservation>,
     pub environments: crate::environment_observation::EnvironmentRefs,
 }
 
@@ -135,7 +137,7 @@ pub(super) async fn publish(
     let policy = inventory
         .and_then(|inventory| inventory.policy.as_ref())
         .and_then(|policy| {
-            match pplx_space_common_core::types::ExecutionPolicyObservation::try_from(policy) {
+            match pplx_space_execution_spec::ExecutionPolicyObservation::try_from(policy) {
                 Ok(policy) => Some(policy),
                 Err(error) => {
                     tracing::warn!(%error, %node_id, "invalid execution policy observation; withholding policy evidence");
@@ -174,11 +176,9 @@ async fn publish_inventory(
             .iter()
             .map(|guest| {
                 GuestPlatform::try_from(guest)
-                    .map(|guest| {
-                        serde_json::json!({
-                            "guest_os": guest.os.as_str(),
-                            "guest_arch": guest.architecture.as_str(),
-                        })
+                    .map(|guest| RuntimeGuest {
+                        guest_os: guest.os.as_str().to_owned(),
+                        guest_arch: guest.architecture.as_str().to_owned(),
                     })
                     .map_err(|error| Status::invalid_argument(error.to_string()))
             })
@@ -192,20 +192,20 @@ async fn publish_inventory(
                 })?;
                 let identity = StateFormatIdentity::try_from(identity)
                     .map_err(|error| Status::invalid_argument(error.to_string()))?;
-                Ok(serde_json::json!({
-                    "state_format_name": identity.format.as_str(),
-                    "state_format_version": identity.version.as_str(),
-                    "can_create": capability.can_create,
-                    "can_load": capability.can_load,
-                }))
+                Ok(RuntimeStateFormat {
+                    state_format_name: identity.format.as_str().to_owned(),
+                    state_format_version: identity.version.as_str().to_owned(),
+                    can_create: capability.can_create,
+                    can_load: capability.can_load,
+                })
             })
             .collect::<Result<Vec<_>, Status>>()?;
-        runtime_rows.push(serde_json::json!({
-            "runtime": runtime.kind.alias(),
-            "runtime_version": runtime.version.as_str(),
-            "guests": guests,
-            "state_formats": state_formats,
-        }));
+        runtime_rows.push(RuntimeInstallation {
+            runtime: runtime.kind.alias().to_owned(),
+            runtime_version: runtime.version.as_str().to_owned(),
+            guests,
+            state_formats,
+        });
     }
 
     let component_rows = inventory
@@ -217,200 +217,65 @@ async fn publish_inventory(
             })?;
             let component = ArtifactComponentMetadata::try_from(component)
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            Ok(serde_json::json!({
-                "kind": component.kind.as_str(),
-                "role_key": component.role.as_ref().map_or("", |role| role.as_str()),
-                "version_key": component.version.as_ref().map(ToString::to_string).unwrap_or_default(),
-                "digest_key": component.digest.as_ref().map(ToString::to_string).unwrap_or_default(),
-                "format_key": component.format.as_ref().map(ToString::to_string).unwrap_or_default(),
-                "version": component.version.as_ref().map(ToString::to_string),
-                "digest": component.digest.as_ref().map(ToString::to_string),
-                "format": component.format.as_ref().map(ToString::to_string),
-                "default_for_new": installation.default_for_new,
-                "legacy_default": installation.legacy_default,
-            }))
+            Ok(ArtifactComponent {
+                kind: component.kind.as_str().to_owned(),
+                role_key: component
+                    .role
+                    .as_ref()
+                    .map_or("", |role| role.as_str())
+                    .to_owned(),
+                version_key: component
+                    .version
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                digest_key: component
+                    .digest
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                format_key: component
+                    .format
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                version: component.version.as_ref().map(ToString::to_string),
+                digest: component.digest.as_ref().map(ToString::to_string),
+                format: component.format.as_ref().map(ToString::to_string),
+                default_for_new: installation.default_for_new,
+                legacy_default: installation.legacy_default,
+            })
         })
         .collect::<Result<Vec<_>, Status>>()?;
 
-    let runtime_rows = Json(serde_json::Value::Array(runtime_rows));
-    let component_rows = Json(serde_json::Value::Array(component_rows));
-    sqlx::query(sql!(
-        "DELETE FROM node_runtime_installations installed
-         WHERE node_id = $1 AND NOT EXISTS (
-             SELECT 1 FROM jsonb_to_recordset($2::jsonb)
-                 AS input(runtime TEXT, runtime_version TEXT)
-             WHERE (input.runtime, input.runtime_version) =
-                   (installed.runtime, installed.runtime_version)
-         )"
-    ))
-    .bind(node_id)
-    .bind(&runtime_rows)
-    .execute(&mut *conn)
-    .await
-    .map_err(|error| Status::internal(format!("replace node runtime inventory: {error}")))?;
-    sqlx::query(sql!(
-        "DELETE FROM node_artifact_components installed
-         WHERE node_id = $1 AND NOT EXISTS (
-             SELECT 1 FROM jsonb_to_recordset($2::jsonb) AS input(
-                 kind TEXT, role_key TEXT, version_key TEXT, digest_key TEXT, format_key TEXT
-             )
-             WHERE (input.kind, input.role_key, input.version_key, input.digest_key, input.format_key) =
-                   (installed.kind, installed.role_key, installed.version_key,
-                    installed.digest_key, installed.format_key)
-         )"
-    ))
-    .bind(node_id)
-    .bind(&component_rows)
-    .execute(&mut *conn)
-    .await
-    .map_err(|error| Status::internal(format!("replace node component inventory: {error}")))?;
+    inventory_store::prune_runtime_installations(&mut *conn, node_id, &runtime_rows)
+        .await
+        .map_err(|error| Status::internal(format!("replace node runtime inventory: {error}")))?;
+    inventory_store::prune_artifact_components(&mut *conn, node_id, &component_rows)
+        .await
+        .map_err(|error| Status::internal(format!("replace node component inventory: {error}")))?;
 
-    sqlx::query(sql!(
-        "WITH input AS (
-             SELECT * FROM jsonb_to_recordset($2::jsonb) AS input(
-                 runtime TEXT, runtime_version TEXT, guests JSONB, state_formats JSONB
-             )
-         )
-         INSERT INTO node_runtime_installations (node_id, runtime, runtime_version, observed_at)
-         SELECT DISTINCT $1, runtime, runtime_version, NOW() FROM input WHERE TRUE
-         ON CONFLICT (node_id, runtime, runtime_version) DO NOTHING"
-    ))
-    .bind(node_id)
-    .bind(runtime_rows.clone())
-    .execute(&mut *conn)
-    .await
-    .map_err(|error| Status::internal(format!("insert node runtime inventory: {error}")))?;
+    inventory_store::insert_runtime_installations(&mut *conn, node_id, &runtime_rows)
+        .await
+        .map_err(|error| Status::internal(format!("insert node runtime inventory: {error}")))?;
     // A retained runtime can lose a guest or format; pruning only removed
     // runtime parents would leave those capabilities advertised indefinitely.
-    sqlx::query(sql!(
-        "DELETE FROM node_runtime_guests installed
-         WHERE node_id = $1 AND NOT EXISTS (
-             SELECT 1 FROM jsonb_to_recordset($2::jsonb)
-                 AS input(runtime TEXT, runtime_version TEXT, guests JSONB)
-             CROSS JOIN LATERAL jsonb_to_recordset(input.guests)
-                 AS guest(guest_os TEXT, guest_arch TEXT)
-             WHERE (input.runtime, input.runtime_version, guest.guest_os, guest.guest_arch) =
-                   (installed.runtime, installed.runtime_version,
-                    installed.guest_os, installed.guest_arch)
-         )"
-    ))
-    .bind(node_id)
-    .bind(&runtime_rows)
-    .execute(&mut *conn)
-    .await
-    .map_err(|error| Status::internal(format!("prune node runtime guests: {error}")))?;
-    sqlx::query(sql!(
-        "WITH input AS (
-             SELECT * FROM jsonb_to_recordset($2::jsonb) AS input(
-                 runtime TEXT, runtime_version TEXT, guests JSONB
-             )
-         )
-         INSERT INTO node_runtime_guests (
-             node_id, runtime, runtime_version, guest_os, guest_arch
-         )
-         SELECT DISTINCT $1, input.runtime, input.runtime_version,
-                guest.guest_os, guest.guest_arch
-         FROM input
-         CROSS JOIN LATERAL jsonb_to_recordset(COALESCE(input.guests, '[]'::jsonb))
-             AS guest(guest_os TEXT, guest_arch TEXT)
-         WHERE TRUE
-         ON CONFLICT (node_id, runtime, runtime_version, guest_os, guest_arch) DO NOTHING"
-    ))
-    .bind(node_id)
-    .bind(runtime_rows.clone())
-    .execute(&mut *conn)
-    .await
-    .map_err(|error| Status::internal(format!("insert node runtime guests: {error}")))?;
-    sqlx::query(sql!(
-        "DELETE FROM node_runtime_state_formats installed
-         WHERE node_id = $1 AND NOT EXISTS (
-             SELECT 1 FROM jsonb_to_recordset($2::jsonb)
-                 AS input(runtime TEXT, runtime_version TEXT, state_formats JSONB)
-             CROSS JOIN LATERAL jsonb_to_recordset(input.state_formats)
-                 AS state_format(state_format_name TEXT, state_format_version TEXT)
-             WHERE (input.runtime, input.runtime_version,
-                    state_format.state_format_name, state_format.state_format_version) =
-                   (installed.runtime, installed.runtime_version,
-                    installed.state_format_name, installed.state_format_version)
-         )"
-    ))
-    .bind(node_id)
-    .bind(&runtime_rows)
-    .execute(&mut *conn)
-    .await
-    .map_err(|error| Status::internal(format!("prune node state formats: {error}")))?;
-    sqlx::query(sql!(
-        "WITH input AS (
-             SELECT * FROM jsonb_to_recordset($2::jsonb) AS input(
-                 runtime TEXT, runtime_version TEXT, state_formats JSONB
-             )
-         )
-         INSERT INTO node_runtime_state_formats (
-             node_id, runtime, runtime_version, state_format_name,
-             state_format_version, can_create, can_load
-         )
-         SELECT $1, input.runtime, input.runtime_version,
-                state_format.state_format_name, state_format.state_format_version,
-                bool_or(state_format.can_create), bool_or(state_format.can_load)
-         FROM input
-         CROSS JOIN LATERAL jsonb_to_recordset(
-             COALESCE(input.state_formats, '[]'::jsonb)
-         ) AS state_format(
-             state_format_name TEXT, state_format_version TEXT,
-             can_create BOOLEAN, can_load BOOLEAN
-         )
-         GROUP BY input.runtime, input.runtime_version,
-                  state_format.state_format_name, state_format.state_format_version
-         ON CONFLICT (
-             node_id, runtime, runtime_version,
-             state_format_name, state_format_version
-         ) DO UPDATE SET
-             can_create = EXCLUDED.can_create,
-             can_load = EXCLUDED.can_load
-         WHERE (node_runtime_state_formats.can_create, node_runtime_state_formats.can_load)
-               IS DISTINCT FROM (EXCLUDED.can_create, EXCLUDED.can_load)"
-    ))
-    .bind(node_id)
-    .bind(runtime_rows)
-    .execute(&mut *conn)
-    .await
-    .map_err(|error| Status::internal(format!("insert node state formats: {error}")))?;
+    inventory_store::prune_runtime_guests(&mut *conn, node_id, &runtime_rows)
+        .await
+        .map_err(|error| Status::internal(format!("prune node runtime guests: {error}")))?;
+    inventory_store::insert_runtime_guests(&mut *conn, node_id, &runtime_rows)
+        .await
+        .map_err(|error| Status::internal(format!("insert node runtime guests: {error}")))?;
+    inventory_store::prune_runtime_state_formats(&mut *conn, node_id, &runtime_rows)
+        .await
+        .map_err(|error| Status::internal(format!("prune node state formats: {error}")))?;
+    inventory_store::upsert_runtime_state_formats(&mut *conn, node_id, &runtime_rows)
+        .await
+        .map_err(|error| Status::internal(format!("insert node state formats: {error}")))?;
 
-    sqlx::query(sql!(
-        "WITH input AS (
-             SELECT * FROM jsonb_to_recordset($2::jsonb) AS input(
-                 kind TEXT, role_key TEXT, version_key TEXT, digest_key TEXT,
-                 format_key TEXT, version TEXT, digest TEXT, format TEXT,
-                 default_for_new BOOLEAN, legacy_default BOOLEAN
-             )
-         )
-         INSERT INTO node_artifact_components (
-             node_id, kind, role_key, version_key, digest_key, format_key,
-             version, digest, format, default_for_new, legacy_default, observed_at
-         )
-         SELECT $1, kind, role_key, version_key, digest_key, format_key,
-                version, digest, format, bool_or(default_for_new), bool_or(legacy_default), NOW()
-         FROM input
-         GROUP BY kind, role_key, version_key, digest_key, format_key, version, digest, format
-         ON CONFLICT (node_id, kind, role_key, version_key, digest_key, format_key)
-         DO UPDATE SET
-             default_for_new = EXCLUDED.default_for_new,
-             legacy_default = EXCLUDED.legacy_default,
-             version = EXCLUDED.version,
-             digest = EXCLUDED.digest,
-             format = EXCLUDED.format,
-             observed_at = EXCLUDED.observed_at
-         WHERE (node_artifact_components.default_for_new, node_artifact_components.legacy_default,
-                node_artifact_components.version, node_artifact_components.digest,
-                node_artifact_components.format)
-               IS DISTINCT FROM (EXCLUDED.default_for_new, EXCLUDED.legacy_default,
-                                 EXCLUDED.version, EXCLUDED.digest, EXCLUDED.format)"
-    ))
-    .bind(node_id)
-    .bind(component_rows)
-    .execute(&mut *conn)
-    .await
-    .map_err(|error| Status::internal(format!("insert node component inventory: {error}")))?;
+    inventory_store::upsert_artifact_components(&mut *conn, node_id, &component_rows)
+        .await
+        .map_err(|error| Status::internal(format!("insert node component inventory: {error}")))?;
     Ok(())
 }
 

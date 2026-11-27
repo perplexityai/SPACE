@@ -458,6 +458,8 @@ pub(super) struct K8sTokenAuthConfig {
     template_transfer_usernames: BTreeSet<String>,
     node_api_internal_allowed_usernames: BTreeSet<String>,
     cluster_api_allowed_usernames: BTreeSet<String>,
+    /// Empty outside tests: no node-ctl principal is approved.
+    firewall_rules_fetch_usernames: BTreeSet<String>,
     pub(super) cache_ttl: Duration,
     negative_cache_ttl: Duration,
     pub(super) cache_max_entries: usize,
@@ -473,11 +475,11 @@ impl K8sTokenAuthConfig {
     /// caller falls back to the static-token-only path. When enabled, requires
     /// `KUBERNETES_SERVICE_HOST` to be present.
     pub(super) fn from_env() -> Result<Option<Self>, AuthConfigError> {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
     pub(crate) fn from_environment(
-        env: &dyn pplx_space_common_core::env::Environment,
+        env: &dyn pplx_space_env_vars::Environment,
     ) -> Result<Option<Self>, AuthConfigError> {
         if !super::env_bool_from_environment(env, SPACE_K8S_TOKEN_AUTH_ENABLED_ENV) {
             return Ok(None);
@@ -525,6 +527,7 @@ impl K8sTokenAuthConfig {
             cluster_api_allowed_usernames: qualified_env_set(
                 SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS_ENV,
             ),
+            firewall_rules_fetch_usernames: BTreeSet::new(),
             cache_ttl: Duration::from_secs(DEFAULT_TOKEN_REVIEW_CACHE_TTL_SECS),
             negative_cache_ttl: Duration::from_secs(DEFAULT_TOKEN_REVIEW_NEGATIVE_CACHE_TTL_SECS),
             cache_max_entries: DEFAULT_TOKEN_REVIEW_CACHE_MAX_ENTRIES,
@@ -536,6 +539,12 @@ impl K8sTokenAuthConfig {
             ),
             review_timeout: Duration::from_secs(DEFAULT_TOKEN_REVIEW_TIMEOUT_SECS),
         }))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn grant_firewall_rules_fetch(&mut self, service_account: &str) {
+        self.firewall_rules_fetch_usernames
+            .insert(service_account_username(&self.namespace, service_account));
     }
 
     pub(super) fn validate_for_role(&self, role: NodeRole) -> Result<(), AuthConfigError> {
@@ -618,6 +627,7 @@ impl K8sTokenAuthConfig {
             peer_node_usernames: &self.node_api_peer_node_usernames,
             trusted_policy_usernames,
             template_transfer_usernames: &self.template_transfer_usernames,
+            firewall_rules_fetch_usernames: &self.firewall_rules_fetch_usernames,
         })
     }
 }
@@ -653,6 +663,7 @@ struct AuthPolicy<'a> {
     peer_node_usernames: &'a BTreeSet<String>,
     trusted_policy_usernames: Option<&'a BTreeSet<String>>,
     template_transfer_usernames: &'a BTreeSet<String>,
+    firewall_rules_fetch_usernames: &'a BTreeSet<String>,
 }
 
 /// Guest operations retain their sandbox-scoped route-token checks downstream.
@@ -681,6 +692,7 @@ fn guest_bridge_method(role: NodeRole, path: &str) -> bool {
             "ResolveDataPlaneSessionRoute"
                 | "BindDataPlaneSessionProcess"
                 | "RecordDataPlaneSessionReconnect"
+                | "RecordDataPlaneSessionProcessExited"
                 | "GetDataPlaneSessionRevocationState"
                 | "GetDataPlaneOrgRevocationEpoch"
                 | "GetSandboxRuntimeAccess"
@@ -798,6 +810,9 @@ impl AuthPolicy<'_> {
         {
             caller.template_transfer_authority =
                 super::template_transfer::TemplateTransferAuthority::Granted;
+        }
+        if self.firewall_rules_fetch_usernames.contains(username) {
+            caller.firewall_rules_fetch_authority = super::FirewallRulesFetchAuthority::Granted;
         }
         caller
     }
@@ -962,7 +977,7 @@ fn service_account_username(namespace: &str, name: &str) -> String {
     }
 }
 
-fn env_csv_set(env: &dyn pplx_space_common_core::env::Environment, name: &str) -> BTreeSet<String> {
+fn env_csv_set(env: &dyn pplx_space_env_vars::Environment, name: &str) -> BTreeSet<String> {
     env.var(name)
         .ok()
         .into_iter()
@@ -977,7 +992,7 @@ fn env_csv_set(env: &dyn pplx_space_common_core::env::Environment, name: &str) -
         .collect()
 }
 
-fn env_u64(env: &dyn pplx_space_common_core::env::Environment, name: &str, default: u64) -> u64 {
+fn env_u64(env: &dyn pplx_space_env_vars::Environment, name: &str, default: u64) -> u64 {
     env.var(name)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -985,9 +1000,7 @@ fn env_u64(env: &dyn pplx_space_common_core::env::Environment, name: &str, defau
         .unwrap_or(default)
 }
 
-fn auth_namespace(
-    env: &dyn pplx_space_common_core::env::Environment,
-) -> Result<String, AuthConfigError> {
+fn auth_namespace(env: &dyn pplx_space_env_vars::Environment) -> Result<String, AuthConfigError> {
     auth_namespace_from_file(
         env,
         Path::new("/var/run/secrets/kubernetes.io/serviceaccount/namespace"),
@@ -995,10 +1008,10 @@ fn auth_namespace(
 }
 
 fn auth_namespace_from_file(
-    env: &dyn pplx_space_common_core::env::Environment,
+    env: &dyn pplx_space_env_vars::Environment,
     namespace_path: &Path,
 ) -> Result<String, AuthConfigError> {
-    pplx_space_common_core::env::test_hook(env, SPACE_K8S_TOKEN_AUTH_NAMESPACE_ENV)
+    pplx_space_test_hooks::test_hook(env, SPACE_K8S_TOKEN_AUTH_NAMESPACE_ENV)
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .or_else(|| {

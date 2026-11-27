@@ -2,8 +2,8 @@
 //! sandbox.
 
 use crate::db::{
-    Connection, Result, RuntimeUpgradeOperationId, RuntimeUpgradeRecord, RuntimeUpgradeReport,
-    RuntimeUpgradeRequestIdentity,
+    Connection, Result, RuntimeUpgradeAttemptOutcome, RuntimeUpgradeOperationId,
+    RuntimeUpgradeRecord, RuntimeUpgradeReport, RuntimeUpgradeRequestIdentity,
 };
 
 /// The upgrade row, `None` without one; a row that does not decode fails the
@@ -22,6 +22,34 @@ pub fn unretired_runtime_upgrade(
     sandbox_id: &str,
 ) -> Result<Option<RuntimeUpgradeOperationId>> {
     crate::db::unretired_runtime_upgrade(conn, sandbox_id)
+}
+
+/// The upgrade of `sandbox_id` that must leave it `stopped` while its boot's
+/// execution may yet run it, if one exists: a fencing one, or a verified one
+/// whose boot's execution still runs. Other unretired upgrades of the sandbox
+/// don't hide it.
+pub fn stay_stopped_runtime_upgrade_awaiting_its_stop(
+    conn: &Connection,
+    sandbox_id: &str,
+) -> Result<Option<RuntimeUpgradeOperationId>> {
+    crate::db::stay_stopped_runtime_upgrade_awaiting_its_stop(conn, sandbox_id)
+}
+
+/// Whether the control plane abandoned `operation_id` on this node.
+pub fn runtime_upgrade_abandoned(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+) -> Result<bool> {
+    crate::db::runtime_upgrade_abandoned(conn, operation_id)
+}
+
+/// The sandbox the control plane abandoned `operation_id` for on this node,
+/// if it did.
+pub fn runtime_upgrade_abandoned_sandbox(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+) -> Result<Option<String>> {
+    crate::db::runtime_upgrades::abandoned_runtime_upgrade_sandbox(conn, operation_id)
 }
 
 /// The upgrade that refuses other activations of `sandbox_id`, if one does.
@@ -48,4 +76,36 @@ pub fn recorded_runtime_upgrade_request(
     operation_id: RuntimeUpgradeOperationId,
 ) -> Result<Option<RuntimeUpgradeRequestIdentity>> {
     crate::db::recorded_runtime_upgrade_request(conn, operation_id)
+}
+
+/// The final outcome of the attempt `attempt_id` under `operation_id` (a
+/// rollback, a refusal before the fence, or a refusal after the operation
+/// reached its target), whatever later attempts recorded since; `None`
+/// without one.
+pub fn runtime_upgrade_attempt_outcome(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+    attempt_id: &str,
+) -> Result<Option<RuntimeUpgradeAttemptOutcome>> {
+    crate::db::runtime_upgrade_attempt_outcome(conn, operation_id, attempt_id)
+}
+
+/// [`runtime_upgrade_attempt_outcome`], with the request the outcome was
+/// recorded for, from the same row; see [`RuntimeUpgradeRequestIdentity`].
+pub fn runtime_upgrade_attempt_outcome_with_request(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+    attempt_id: &str,
+) -> Result<Option<(RuntimeUpgradeAttemptOutcome, RuntimeUpgradeRequestIdentity)>> {
+    crate::db::runtime_upgrade_attempt_outcome_with_request(conn, operation_id, attempt_id)
+}
+
+/// What the operation `operation_id` asked for, as its attempts' final
+/// outcomes recorded it, one entry per distinct request; empty without one.
+/// These outlive the sandbox's row.
+pub fn retained_runtime_upgrade_requests(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+) -> Result<Vec<crate::db::RuntimeUpgradeRequestIdentity>> {
+    crate::db::retained_runtime_upgrade_requests(conn, operation_id)
 }

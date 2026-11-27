@@ -1,21 +1,23 @@
-use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
 
-use pplx_space_common_core::sql;
 use std::time::Duration;
 
 use crate::metrics::sandbox::api::{SandboxApiMetricIdentity, scope_request_client_id};
 use axum::http::StatusCode;
-use pplx_space_common_core::types::{
-    NodeId, NodePoolName, SandboxId, SandboxLifecycle, SandboxLifecycleParseError,
-};
+use pplx_space_accounts::NodeId;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_node_model::NodePoolName;
 use pplx_space_public_api::{
     OperationKind, OperationState, PublicErrorCode, PublicOperationResult, PublicSandboxId,
     PublicSandboxOperationResult, RollbackSandboxRequest, SandboxLifecycleAction,
     SandboxLifecycleState, SandboxNetworkPolicyPatch as PublicSandboxNetworkPolicyPatch,
     UpdateSandboxRequest as PublicUpdateSandboxRequest,
+};
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle, SandboxLifecycleParseError};
+use pplx_space_sandbox_store::{
+    SandboxMetadata, SandboxMetadataValue as ControllerSandboxMetadataValue,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -32,8 +34,7 @@ use crate::controllers::sandbox::{SandboxController, fetch_sandbox};
 use crate::controllers::substrate::ExecutionActivityKind;
 use crate::controllers::{ControllerError, SnapshotUploadCheck, SnapshotUploadInFlight};
 use crate::models::{
-    CreateSandboxRequest as ControllerCreateSandboxRequest, SandboxMetadata,
-    SandboxMetadataValue as ControllerSandboxMetadataValue,
+    CreateSandboxRequest as ControllerCreateSandboxRequest,
     SandboxNetworkPolicyPatch as ControllerSandboxNetworkPolicyPatch,
     UpdateSandboxRequest as ControllerUpdateSandboxRequest, User,
 };
@@ -220,7 +221,7 @@ pub(crate) const IMPLICIT_WAKE_ACTIVITY_ENV: &str = "SPACE_IMPLICIT_WAKE_ACTIVIT
 /// Whether the API records the activity on the system's wakes it queues; see
 /// [`IMPLICIT_WAKE_ACTIVITY_ENV`].
 pub(crate) fn implicit_wake_activity_enabled() -> bool {
-    pplx_space_common_core::env::env_flag_var(IMPLICIT_WAKE_ACTIVITY_ENV, false)
+    pplx_space_env_vars::env_flag_var(IMPLICIT_WAKE_ACTIVITY_ENV, false)
 }
 
 /// The switch for recording
@@ -244,7 +245,7 @@ pub(crate) const ADMIN_CREATE_REQUESTED_BY_ENV: &str = "SPACE_ADMIN_CREATE_REQUE
 /// Whether admin creates record their requester; see
 /// [`ADMIN_CREATE_REQUESTED_BY_ENV`].
 pub(crate) fn admin_create_requested_by_enabled() -> bool {
-    pplx_space_common_core::env::env_flag_var(ADMIN_CREATE_REQUESTED_BY_ENV, true)
+    pplx_space_env_vars::env_flag_var(ADMIN_CREATE_REQUESTED_BY_ENV, true)
 }
 
 /// The switch for recording [`CreateSandboxOperationPayload::metric_client_id`]
@@ -265,7 +266,7 @@ pub(crate) const NATIVE_CREATE_CLIENT_ATTRIBUTION_ENV: &str =
 /// Whether native creates record their client; see
 /// [`NATIVE_CREATE_CLIENT_ATTRIBUTION_ENV`].
 pub(crate) fn native_create_client_attribution_enabled() -> bool {
-    pplx_space_common_core::env::env_flag_var(NATIVE_CREATE_CLIENT_ATTRIBUTION_ENV, false)
+    pplx_space_env_vars::env_flag_var(NATIVE_CREATE_CLIENT_ATTRIBUTION_ENV, false)
 }
 
 impl SandboxLifecycleOperationPayload {
@@ -890,14 +891,23 @@ impl SandboxLifecycleOperationExecutor {
                 "sandbox rollback completed",
             ));
         }
-        let controller_action = if is_implicit_wake(operation, payload.action) {
+        // A system wake acts for the sandbox's recorded client; a caller's
+        // own native operation is native.
+        let (controller_action, activating_client) = if is_implicit_wake(operation, payload.action)
+        {
             let activity = implicit_wake_activity(payload.wake_activity);
             if !activity.allows_implicit_wake(&sandbox.auto_lifecycle.0) {
                 return Err(SandboxLifecycleExecutionError::ImplicitWakeNotAllowed);
             }
-            SandboxAction::ImplicitWake(activity)
+            (
+                SandboxAction::ImplicitWake(activity),
+                crate::controllers::substrate::ActivationClient::Inherit,
+            )
         } else {
-            sandbox_action(payload.action)?
+            (
+                sandbox_action(payload.action)?,
+                crate::controllers::substrate::ActivationClient::Native,
+            )
         };
         let body = self
             .controller
@@ -908,6 +918,7 @@ impl SandboxLifecycleOperationExecutor {
                 SandboxApiMetricIdentity::native(payload.action.as_str()),
                 controller_action,
                 None,
+                activating_client,
             )
             .await?;
         let updated = fetch_sandbox(&self.pool, sandbox_uuid.into()).await?;
@@ -1023,15 +1034,7 @@ async fn fetch_actor(
     user_id: UserId,
     org_id: OrgId,
 ) -> Result<User, CreateSandboxExecutionError> {
-    let actor = sqlx::query_as::<_, User>(sql!(
-        "SELECT *
-         FROM users
-         WHERE id = $1 AND org_id = $2"
-    ))
-    .bind(user_id)
-    .bind(org_id)
-    .fetch_optional(pool)
-    .await?;
+    let actor = pplx_space_accounts_store::users::organization_user(pool, org_id, user_id).await?;
     actor.ok_or(CreateSandboxExecutionError::ActorNotFound)
 }
 

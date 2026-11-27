@@ -10,13 +10,14 @@ use std::time::{Duration, Instant};
 
 use crate::metrics::cluster_reconciler::{self as metrics, OrphanedRestorePodOutcome as O};
 use pplx_space_api::controllers::substrate::kubernetes::KubernetesSubstrate;
-use pplx_space_common_core::types::{PodUid, SandboxId};
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_sandbox_model::SandboxId;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
 use super::backend::{DeleteOutcome, KubernetesPodBackend, PodBackend, SandboxStore};
 use super::classify::{
-    Disposition, RestorePodSnapshot, SandboxRestoreState, SkipClass, classify_disposition,
+    Disposition, RestorePodSnapshot, SandboxRestoreState, SkipClass, classify_pod,
 };
 use super::config::ReconcilerConfig;
 use super::events::{CleanupOutcome, emit_cleanup_event};
@@ -98,7 +99,8 @@ struct PendingTeardown {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TickReport {
-    /// Restore pods present in the reflector cache this tick.
+    /// Pods present in the reflector cache this tick that this loop
+    /// classifies: restore pods, and terminal pods when `terminal_pods` is on.
     pub scanned: u32,
     /// Orphans past the observation threshold (the actionable candidate set).
     pub orphans_detected: u32,
@@ -552,7 +554,14 @@ impl<P: PodBackend, S: SandboxStore> Reconciler<P, S> {
         }
         self.trim_rate_window(now);
 
-        let pods = self.pod_backend.list_restore_pods().await;
+        let terminal_pods = self.config.terminal_pods;
+        let pods: Vec<RestorePodSnapshot> = self
+            .pod_backend
+            .list_restore_pods()
+            .await
+            .into_iter()
+            .filter(|pod| pod.is_scanned(terminal_pods))
+            .collect();
         report.scanned = u32::try_from(pods.len()).unwrap_or(u32::MAX);
 
         let mut eligible: Vec<EligiblePod> = Vec::new();
@@ -638,7 +647,12 @@ impl<P: PodBackend, S: SandboxStore> Reconciler<P, S> {
         let mut candidates: Vec<Candidate> = Vec::new();
         let mut still_orphan: HashSet<PodUid> = HashSet::new();
         for eligible in eligible {
-            match classify_disposition(states.get(&eligible.sandbox_id), eligible.generation) {
+            match classify_pod(
+                states.get(&eligible.sandbox_id),
+                &eligible.pod,
+                eligible.generation,
+                terminal_pods,
+            ) {
                 Disposition::Orphaned(_reason) => {
                     still_orphan.insert(eligible.uid.clone());
                     let first_seen = *self
@@ -832,14 +846,16 @@ impl<P: PodBackend, S: SandboxStore> Reconciler<P, S> {
             self.emit_outcome(O::AlreadyGone, candidate, &fresh);
             return CandidateFlow::Processed;
         }
-        if !fresh.is_restore
+        if !fresh.is_scanned(self.config.terminal_pods)
             || fresh.sandbox_id != Some(candidate.sandbox_id)
             || fresh.generation != Some(candidate.generation)
         {
-            // Same UID, but the identity the scan classified (restore marker,
-            // owning sandbox, execution generation) no longer holds, so the
-            // cached verdict says nothing about this object. Drop its clock so
-            // it re-ages under whatever it now is.
+            // Same UID, but the identity the scan classified (a pod this loop
+            // scans, owning sandbox, execution generation) no longer holds, so
+            // the cached verdict says nothing about this object. Drop its
+            // clock so it re-ages under whatever it now is. The recheck below
+            // classifies the fresh snapshot, so a restore marker or phase that
+            // changed since the scan decides from what the pod is now.
             self.first_seen_orphan.remove(&candidate.uid);
             self.emit_outcome(O::StaleIdentity, candidate, &fresh);
             return CandidateFlow::Processed;
@@ -859,9 +875,12 @@ impl<P: PodBackend, S: SandboxStore> Reconciler<P, S> {
         )
         .await
         {
-            Ok(Ok(states)) => {
-                classify_disposition(states.get(&candidate.sandbox_id), candidate.generation)
-            }
+            Ok(Ok(states)) => classify_pod(
+                states.get(&candidate.sandbox_id),
+                &fresh,
+                candidate.generation,
+                self.config.terminal_pods,
+            ),
             Ok(Err(err)) => {
                 // An unverifiable recheck must not count as continuous-orphan
                 // time (the same rule as a failed scan), or the pod could be
@@ -1054,6 +1073,7 @@ pub async fn run(
         tick_budget_secs = config.tick_budget.as_secs(),
         batch_size = config.batch_size,
         teardown_stuck_after_secs = config.teardown_stuck_after.get().as_secs(),
+        terminal_pods = config.terminal_pods,
         dry_run = config.dry_run,
         "starting orphaned_restore_pod_gc"
     );

@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SimpleDuration;
+use pplx_space_durations::SimpleDuration;
 
 use super::PublicApiParseError;
 

@@ -1,14 +1,15 @@
 """The Kind CI Rust artifact handoff's reuse and record/load decisions.
 
-Never touches the Docker daemon: a fake `docker` on PATH answers from the
-environment, and the checkout's input key is fixed (the shell test
-test-kind-rust-input-key.sh owns how it is computed).
+Never touches the Docker daemon or the network: fakes of `docker` and `gh`
+answer from the environment, and the checkout's input key is fixed (the shell
+test test-kind-rust-input-key.sh owns how it is computed).
 """
 
 import importlib.util
 import json
 import pathlib
 import subprocess
+import zipfile
 
 import pytest
 
@@ -47,9 +48,17 @@ def run(tmp_path, monkeypatch):
     bin_dir.mkdir()
     (bin_dir / "docker").write_text(FAKE_DOCKER)
     (bin_dir / "docker").chmod(0o755)
-    head = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
-    ).strip()
+    # The GitHub context must compare the run SHA with a checkout's HEAD,
+    # but this fixture need not depend on the developer checkout's VCS.
+    head = "e" * 40
+    real_check_output = subprocess.check_output
+
+    def check_output(args, **kwargs):
+        if args == ["git", "rev-parse", "HEAD"]:
+            return head + "\n"
+        return real_check_output(args, **kwargs)
+
+    monkeypatch.setattr(handoff.subprocess, "check_output", check_output)
     for name, value in {
         "PATH": f"{bin_dir}:{handoff.os.environ['PATH']}",
         "FAKE_DOCKER_LOG": str(tmp_path / "docker.log"),
@@ -63,6 +72,9 @@ def run(tmp_path, monkeypatch):
         "GITHUB_ENV": str(tmp_path / "env"),
     }.items():
         monkeypatch.setenv(name, value)
+    # A host that exports these for the runner must not change the results.
+    monkeypatch.delenv(handoff.MIRROR_ENV, raising=False)
+    monkeypatch.delenv(handoff.DIGESTS_FILE_ENV, raising=False)
     monkeypatch.setattr(handoff, "input_key", lambda: KEY)
     (tmp_path / "docker.log").touch()
     (tmp_path / "output").touch()
@@ -83,7 +95,9 @@ def labels(key=KEY, revision=MAIN_SHA) -> str:
 def test_reuse_takes_the_published_image_for_this_key(run, monkeypatch):
     monkeypatch.setenv("FAKE_LABELS", labels())
     handoff.reuse(REPOSITORY)
-    assert (run / "output").read_text() == "reused=true\n"
+    assert (run / "output").read_text() == (
+        f"reused=true\nreused_from=registry\nreused_image={REFERENCE}\n"
+    )
     assert f"tag {REFERENCE} {handoff.IMAGE}" in (run / "docker.log").read_text()
 
 
@@ -113,6 +127,131 @@ def test_reuse_falls_back_to_the_build(run, monkeypatch, environment, input_key)
     assert (run / "output").read_text() == ""
     log = (run / "docker.log").read_text().splitlines()
     assert not any(line.startswith("tag ") for line in log)
+
+
+GHCR_REPOSITORY = "ghcr.io/example/kind-rust-artifacts"
+MIRROR_DIGEST = "sha256:" + "d" * 64
+MIRROR_REFERENCE = f"mirror.example/ghcr/example/kind-rust-artifacts@{MIRROR_DIGEST}"
+
+
+@pytest.mark.parametrize(
+    "records, image_labels, output",
+    [
+        pytest.param(
+            [{"key": KEY, "digest": MIRROR_DIGEST, "commit": MAIN_SHA}],
+            labels(),
+            f"reused=true\nreused_from=mirror\nreused_image={GHCR_REPOSITORY}@{MIRROR_DIGEST}\n",
+            id="takes the mirrored image",
+        ),
+        pytest.param(
+            [{"key": KEY, "digest": MIRROR_DIGEST, "commit": "f" * 40}],
+            labels(),
+            f"reused=true\nreused_from=registry\nreused_image={GHCR_REPOSITORY}:{KEY}\n",
+            id="other commit falls through to the tagged pull",
+        ),
+        pytest.param(
+            [{"key": KEY, "digest": MIRROR_DIGEST, "commit": MAIN_SHA}],
+            labels(key="d" * 64),
+            "",
+            id="other key falls back to the build",
+        ),
+        pytest.param(
+            [{"key": "e" * 64, "digest": MIRROR_DIGEST}],
+            labels(),
+            f"reused=true\nreused_from=registry\nreused_image={GHCR_REPOSITORY}:{KEY}\n",
+            id="no record for the key",
+        ),
+        pytest.param(
+            [{"key": KEY, "digest": "sha256:xyz"}],
+            labels(),
+            f"reused=true\nreused_from=registry\nreused_image={GHCR_REPOSITORY}:{KEY}\n",
+            id="invalid digest",
+        ),
+    ],
+)
+def test_reuse_through_the_mirror(run, monkeypatch, records, image_labels, output):
+    digests = run / "digests.json"
+    digests.write_text(json.dumps(records))
+    monkeypatch.setenv(handoff.MIRROR_ENV, "mirror.example/ghcr")
+    monkeypatch.setenv(handoff.DIGESTS_FILE_ENV, str(digests))
+    monkeypatch.setenv("FAKE_LABELS", image_labels)
+    handoff.reuse(GHCR_REPOSITORY)
+    assert (run / "output").read_text() == output
+    tagged = f"tag {MIRROR_REFERENCE} {handoff.IMAGE}" in (run / "docker.log").read_text()
+    assert tagged == output.startswith("reused=true\nreused_from=mirror\n")
+
+
+OTHER_KEY = "f" * 64
+PUSHED_DIGEST = "sha256:f97baa533a26513c453a362be331a43eb60214302f449c16571b23cea141dce4"
+# Captured from `docker push --all-tags` of two tags to a local registry:2 by a
+# daemon with the containerd image store, which also names the index digest
+# of which it pushed only one platform's manifest.
+PUSH_TRANSCRIPT = f"""\
+The push refers to repository [127.0.0.1:5999/kind-rust-artifacts]
+37bb94b0940b: Layer already exists
+{KEY}: digest: {PUSHED_DIGEST} size: 610
+37bb94b0940b: Layer already exists
+e4389c0c9ca8: Pushed
+44136fa355b3: Pushed
+{OTHER_KEY}: digest: sha256:fb748a30439cae3343c8367b02d91306e19022390afa1c9d95ef2222de5c4d11 size: 855
+
+ Info -> Not all multiplatform-content is present and only the available single-platform image was pushed
+         sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4 -> {PUSHED_DIGEST}
+"""
+
+
+def test_pushed_digest_takes_the_digest_reported_for_its_tag():
+    assert handoff.pushed_digest(PUSH_TRANSCRIPT, KEY) == PUSHED_DIGEST
+    without = "".join(
+        line
+        for line in PUSH_TRANSCRIPT.splitlines(keepends=True)
+        if not line.startswith(f"{KEY}: ")
+    )
+    with pytest.raises(ValueError, match="reported no digest"):
+        handoff.pushed_digest(without, KEY)
+
+
+FAKE_GH = """#!/usr/bin/env bash
+case "$1 $2" in
+  "api "*"/artifacts?name="*) exec cat "$FAKE_GH_DIR/artifacts.json" ;;
+  "api "*"/runs?"*) exec cat "$FAKE_GH_DIR/runs.json" ;;
+  "api "*"/zip") id="${2%/zip}"; exec cat "$FAKE_GH_DIR/${id##*/}.zip" ;;
+esac
+exit 1
+"""
+
+
+def test_mirror_digest_reads_only_main_push_records_for_its_repository(run, monkeypatch):
+    served = run / "gh"
+    served.mkdir()
+    (run / "bin" / "gh").write_text(FAKE_GH)
+    (run / "bin" / "gh").chmod(0o755)
+    monkeypatch.setenv("FAKE_GH_DIR", str(served))
+    # A pull request run uploads a record under the same name, after main's.
+    uploads = [
+        (11, 101, "2026-01-02T00:00:00Z", "sha256:" + "e" * 64, "f" * 40),
+        (12, 102, "2026-01-01T00:00:00Z", MIRROR_DIGEST, MAIN_SHA),
+    ]
+    artifacts = []
+    for artifact, run_id, created, found, commit in uploads:
+        artifacts.append(
+            {
+                "id": artifact,
+                "name": handoff.DIGEST_ARTIFACT,
+                "expired": False,
+                "created_at": created,
+                "workflow_run": {"id": run_id, "head_sha": commit},
+            }
+        )
+        record = {"key": KEY, "digest": found, "repository": GHCR_REPOSITORY, "commit": commit}
+        with zipfile.ZipFile(served / f"{artifact}.zip", "w") as archive:
+            archive.writestr("record.json", json.dumps(record))
+    (served / "artifacts.json").write_text(json.dumps({"artifacts": artifacts}))
+    (served / "runs.json").write_text(json.dumps({"workflow_runs": [{"id": 102}]}))
+
+    assert handoff.mirror_digest(GHCR_REPOSITORY, KEY) == (MIRROR_DIGEST, MAIN_SHA)
+    with pytest.raises(handoff.Miss, match="has no digest for input key"):
+        handoff.mirror_digest("ghcr.io/example/other-artifacts", KEY)
 
 
 def stub_build(run, monkeypatch) -> pathlib.Path:

@@ -10,7 +10,6 @@ use axum::http::StatusCode;
 use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519Token, ed25519::insert_space_api_route_ed25519_token,
 };
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_grpc::{
     GrpcClientTrace, RetriedOnTransportFailure,
     trace_grpc_client_transport as wrap_grpc_client_channel,
@@ -23,6 +22,7 @@ use pplx_space_node_api_client::NodeApiOperationBudget;
 use pplx_space_node_api_client::proto::{NativeFileRouteGrant, worker_api_client::WorkerApiClient};
 use pplx_space_public_api::RequestFingerprint;
 use pplx_space_public_api_http::PublicApiError;
+use pplx_space_sandbox_model::SandboxId;
 use tonic::transport::Channel;
 
 use super::{FileRequest, Refusal};

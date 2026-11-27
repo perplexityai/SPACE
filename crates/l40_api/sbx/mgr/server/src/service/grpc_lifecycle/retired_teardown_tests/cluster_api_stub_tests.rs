@@ -382,8 +382,8 @@ pub(super) fn bound_upload_payload(
         std::path::PathBuf::from("/var/lib/space/sandboxes/s/suspend"),
     );
     payload.meta.execution = Some(
-        pplx_space_common_core::types::SnapshotExecutionMetadata::new(
-            pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+        pplx_space_execution_spec::SnapshotExecutionMetadata::new(
+            pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
                 std::env::consts::ARCH.parse().unwrap(),
                 vec![],
             ),

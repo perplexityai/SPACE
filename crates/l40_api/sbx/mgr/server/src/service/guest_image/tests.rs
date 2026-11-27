@@ -1,8 +1,10 @@
 use super::*;
 use crate::node_manager_transport::fake::FakeNodeManager;
-use pplx_space_common_core::types::guest_image::{GuestDiskLayout, GuestNetwork, GuestReadiness};
-use pplx_space_common_core::types::{PolicyAuthority, SandboxOwner, SandboxRuntimeLabel};
+use pplx_space_accounts::SandboxOwner;
+use pplx_space_execution_spec::guest_image::{GuestDiskLayout, GuestNetwork, GuestReadiness};
 use pplx_space_node_mgr_client::proto::{ProbeGuestServiceRequest, ProbeGuestServiceResponse};
+use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_model::SandboxRuntimeLabel;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn image() -> GuestImageContract {
@@ -12,7 +14,7 @@ fn image() -> GuestImageContract {
             port: std::num::NonZeroU16::new(3389).unwrap(),
         },
         GuestNetwork::SlotDhcpV1,
-        pplx_space_common_core::types::guest_image::GuestAgent::Absent,
+        pplx_space_execution_spec::guest_image::GuestAgent::Absent,
     )
     .unwrap()
 }
@@ -128,7 +130,7 @@ async fn service_readiness_retries_false_but_stops_at_execution_refusal_or_deadl
     ] {
         let calls = Arc::new(AtomicUsize::new(0));
         let id = SandboxId::new().to_string();
-        let execution = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+        let execution = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
         let node = FakeNodeManager::default()
             .unary("ProbeGuestService", {
                 let calls = Arc::clone(&calls);
@@ -175,7 +177,7 @@ async fn shutdown_inspection_requires_matching_execution_and_positive_process_ev
     use pplx_space_node_mgr_client::proto::{InspectSandboxRequest, InspectSandboxResponse};
     let id = SandboxId::new().to_string();
     let fence = ExecutionFence::new(
-        pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+        pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
         None,
     );
     for case in 0..6 {
@@ -194,7 +196,7 @@ async fn shutdown_inspection_requires_matching_execution_and_positive_process_ev
             4 => {
                 response.execution_fence = Some(
                     ExecutionFence::new(
-                        pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+                        pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
                         None,
                     )
                     .into(),
@@ -255,7 +257,7 @@ async fn shutdown_wait_finishes_on_exit_but_not_on_missing_process_evidence() {
     };
     let id = SandboxId::new().to_string();
     let fence = ExecutionFence::new(
-        pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+        pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
         None,
     );
     for (pid, forced, expected) in [
@@ -314,7 +316,7 @@ async fn agentless_memory_lifecycle_refuses_before_changing_state_or_contacting_
         let id = SandboxId::new().to_string();
         insert_firmware_sandbox(&conn, &id, state, image());
         let catalog = pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
-            pplx_space_common_core::types::Arch::X86_64,
+            pplx_space_cpu_arch::Arch::X86_64,
         )
         .unwrap();
         let execution = catalog
@@ -375,7 +377,7 @@ async fn agentless_memory_lifecycle_refuses_before_changing_state_or_contacting_
 
 #[tokio::test]
 async fn windows_environment_update_refuses_before_persistence_but_allows_clearing() {
-    use pplx_space_common_core::types::guest_image::GuestAgent;
+    use pplx_space_execution_spec::guest_image::GuestAgent;
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();
     let image = GuestImageContract::new(
@@ -387,7 +389,7 @@ async fn windows_environment_update_refuses_before_persistence_but_allows_cleari
     .unwrap();
     insert_firmware_sandbox(&conn, &id, SandboxState::Started, image);
     let catalog = pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap();
     let execution = catalog
@@ -438,12 +440,12 @@ async fn windows_environment_update_refuses_before_persistence_but_allows_cleari
 #[tokio::test]
 async fn restored_windows_registration_preserves_guest_identity_and_native_app_readiness() {
     use crate::service::activation_support::internal_request;
-    use pplx_space_common_core::types::Arch;
+    use pplx_space_cpu_arch::Arch;
     let native = GuestImageContract::new(
         GuestDiskLayout::OpaqueRawDisk,
         GuestReadiness::Agent,
         GuestNetwork::SlotDhcpV1,
-        pplx_space_common_core::types::guest_image::GuestAgent::Spaced,
+        pplx_space_execution_spec::guest_image::GuestAgent::Spaced,
     )
     .unwrap();
     let catalog =
@@ -463,7 +465,7 @@ async fn restored_windows_registration_preserves_guest_identity_and_native_app_r
     crate::db::update_user(
         &conn,
         &id,
-        &pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER,
+        &pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER,
     )
     .unwrap();
     let service = SandboxManagerService::for_test(conn);
@@ -475,7 +477,7 @@ async fn restored_windows_registration_preserves_guest_identity_and_native_app_r
     let row = service.lookup_sandbox(&id).unwrap();
     assert_eq!(
         profile_for_sandbox(&row).unwrap().agent_protocol(),
-        pplx_space_common_core::types::guest_image::QualifiedGuestAgent::WindowsV1
+        pplx_space_execution_spec::guest_image::QualifiedGuestAgent::WindowsV1
     );
     let response = service
         .wait_template_apps(internal_request(crate::proto::WaitTemplateAppsRequest {

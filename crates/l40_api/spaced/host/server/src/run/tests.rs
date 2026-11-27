@@ -79,9 +79,9 @@ fn vsock_uds_builds_the_firecracker_connector_and_wins_over_the_uds_flags() {
 
     assert_eq!(
         resolved.bridge_host_socket_path,
-        pplx_space_spaced_common::firecracker_vsock_port_path(
+        pplx_space_spaced_client::firecracker_vsock_port_path(
             std::path::Path::new("/tmp/fc.vsock"),
-            pplx_space_spaced_common::BRIDGE_HOST_VSOCK_PORT,
+            pplx_space_spaced_guest_protocol::BRIDGE_HOST_VSOCK_PORT,
         )
     );
     match resolved.bridge_guest_connector {
@@ -91,7 +91,10 @@ fn vsock_uds_builds_the_firecracker_connector_and_wins_over_the_uds_flags() {
             expected_peer,
         } => {
             assert_eq!(vsock_uds_path, PathBuf::from("/tmp/fc.vsock"));
-            assert_eq!(port, pplx_space_spaced_common::BRIDGE_GUEST_VSOCK_PORT);
+            assert_eq!(
+                port,
+                pplx_space_spaced_guest_protocol::BRIDGE_GUEST_VSOCK_PORT
+            );
             assert_eq!(expected_peer.pid, 4242);
             assert_eq!(expected_peer.uid, 1000);
         }

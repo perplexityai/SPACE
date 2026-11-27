@@ -73,10 +73,12 @@ fn unclassified_mounts_sit_under_a_declared_operation() {
         .map(|operation| operation.path())
         .collect::<Vec<_>>();
 
-    assert!(
-        declared
-            .iter()
-            .any(|path| PROXY_SESSION_SUBPATH_MOUNT.starts_with(&format!("{path}/"))),
-        "{PROXY_SESSION_SUBPATH_MOUNT} is not under any declared data-plane operation: {declared:?}"
-    );
+    for mount in [PROXY_SESSION_ROOT_MOUNT, PROXY_SESSION_SUBPATH_MOUNT] {
+        assert!(
+            declared
+                .iter()
+                .any(|path| mount.starts_with(&format!("{path}/"))),
+            "{mount} is not under any declared data-plane operation: {declared:?}"
+        );
+    }
 }

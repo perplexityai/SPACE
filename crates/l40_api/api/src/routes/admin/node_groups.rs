@@ -13,8 +13,8 @@
 //! writes. `nodes.node_group_id` is likewise never set here — the
 //! cluster-controller mirror reconciler copies it from the live node label.
 
-use pplx_space_common_core::types::NodeGroupId;
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
+use pplx_space_node_model::NodeGroupId;
 
 use std::str::FromStr;
 
@@ -25,11 +25,13 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use pplx_space_common_core::types::admin::{
+use pplx_space_admin_protocol::{
     AdminNodeGroupResponse, AssignOrgRequest, CreateNodeGroupRequest, SetCompatRequest,
     SetTemplatePolicyRequest,
 };
-use pplx_space_common_core::types::{NodeGroupTemplatePolicy, TemplateVisibility};
+use pplx_space_node_group_store::groups::lock_node_group;
+use pplx_space_node_model::NodeGroupTemplatePolicy;
+use pplx_space_template_model::TemplateVisibility;
 use uuid::Uuid;
 
 use super::audit::{self, AdminNodeGroupAuditEntry};
@@ -272,7 +274,7 @@ pub async fn create_node_group(
     // candidate set to check an already-running pod against. Refusing the
     // create is cheaper than defending that state everywhere downstream.
     if request.org_id.is_some() {
-        match node_group_store::generic_node_group_exists(&state.pool).await {
+        match pplx_space_node_group_store::generic_node_group_exists(&state.pool).await {
             Ok(true) => {}
             Ok(false) => {
                 return api_error(
@@ -419,12 +421,12 @@ async fn apply_assign_org(
         Ok(tx) => tx,
         Err(err) => return db_error(err).into_response(),
     };
-    let group = match node_group_store::lock_group_for_update(&mut tx, node_group_id).await {
+    let group = match lock_node_group(&mut *tx, node_group_id).await {
         Ok(Some(row)) => row,
         Ok(None) => {
             return api_error(StatusCode::NOT_FOUND, "Node group not found").into_response();
         }
-        Err(err) => return db_error(err).into_response(),
+        Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
     };
     let from_state = row_state_summary(&group);
     let audit_failure = |error: &str| {
@@ -459,7 +461,8 @@ async fn apply_assign_org(
         .into_response();
     }
     if let Some(org_id) = request.org_id {
-        match node_group_store::org_exists_in_tx(&mut tx, org_id).await {
+        match pplx_space_accounts_store::organizations::organization_exists(&mut *tx, org_id).await
+        {
             Ok(true) => {}
             Ok(false) => {
                 audit_failure("unknown org");
@@ -489,15 +492,17 @@ async fn apply_assign_org(
         )
             .into_response();
     }
-    let stranded = match node_group_store::stranded_cached_templates_in_tx(
-        &mut tx,
+    // Cached generic rootfs never blocks: generic templates are placeable on
+    // any group.
+    let stranded = match pplx_space_node_template_inventory_store::stranded_org_specific_templates(
+        &mut *tx,
         node_group_id,
         request.org_id,
     )
     .await
     {
         Ok(count) => count,
-        Err(err) => return db_error(err).into_response(),
+        Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
     };
     if stranded > 0 {
         audit_failure("conflict: cached org-specific rootfs would be stranded");
@@ -565,16 +570,17 @@ async fn apply_set_default(
         Ok(tx) => tx,
         Err(err) => return db_error(err).into_response(),
     };
-    let incumbent = match node_group_store::lock_current_default_for_update(&mut tx).await {
-        Ok(incumbent) => incumbent,
-        Err(err) => return db_error(err).into_response(),
-    };
-    let group = match node_group_store::lock_group_for_update(&mut tx, node_group_id).await {
+    let incumbent =
+        match pplx_space_node_group_store::locks::lock_default_node_group(&mut *tx).await {
+            Ok(incumbent) => incumbent,
+            Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
+        };
+    let group = match lock_node_group(&mut *tx, node_group_id).await {
         Ok(Some(row)) => row,
         Ok(None) => {
             return api_error(StatusCode::NOT_FOUND, "Node group not found").into_response();
         }
-        Err(err) => return db_error(err).into_response(),
+        Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
     };
     let from_state = row_state_summary(&group);
     if group.org_id.is_some() {
@@ -667,12 +673,12 @@ pub async fn delete_node_group(
         Ok(tx) => tx,
         Err(err) => return db_error(err).into_response(),
     };
-    let group = match node_group_store::lock_group_for_update(&mut tx, node_group_id).await {
+    let group = match lock_node_group(&mut *tx, node_group_id).await {
         Ok(Some(row)) => row,
         Ok(None) => {
             return api_error(StatusCode::NOT_FOUND, "Node group not found").into_response();
         }
-        Err(err) => return db_error(err).into_response(),
+        Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
     };
     let from_state = row_state_summary(&group);
     let audit_failure = |error: &str| {
@@ -707,7 +713,9 @@ pub async fn delete_node_group(
         )
             .into_response();
     }
-    if let Err(err) = node_group_store::delete_group_in_tx(&mut tx, node_group_id).await {
+    if let Err(err) = pplx_space_node_group_store::delete_node_group(&mut *tx, node_group_id).await
+    {
+        let err = sqlx::Error::from(err);
         // The empty-group guard above can race a concurrent label mirror;
         // the nodes FK is the backstop.
         if violated_constraint(&err).as_deref() == Some("nodes_node_group_id_fkey") {
@@ -762,12 +770,12 @@ pub async fn set_template_policy(
         Ok(tx) => tx,
         Err(err) => return db_error(err).into_response(),
     };
-    let group = match node_group_store::lock_group_for_update(&mut tx, node_group_id).await {
+    let group = match lock_node_group(&mut *tx, node_group_id).await {
         Ok(Some(row)) => row,
         Ok(None) => {
             return api_error(StatusCode::NOT_FOUND, "Node group not found").into_response();
         }
-        Err(err) => return db_error(err).into_response(),
+        Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
     };
     let from_state = row_state_summary(&group);
     if group.org_id.is_none()
@@ -854,12 +862,12 @@ pub async fn set_compat(
         Ok(tx) => tx,
         Err(err) => return db_error(err).into_response(),
     };
-    let group = match node_group_store::lock_group_for_update(&mut tx, node_group_id).await {
+    let group = match lock_node_group(&mut *tx, node_group_id).await {
         Ok(Some(row)) => row,
         Ok(None) => {
             return api_error(StatusCode::NOT_FOUND, "Node group not found").into_response();
         }
-        Err(err) => return db_error(err).into_response(),
+        Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
     };
     let from_state = row_state_summary(&group);
     let audit_failure = |error: &str| {
@@ -893,10 +901,19 @@ pub async fn set_compat(
         .into_response();
     }
 
-    let known = match node_group_store::templates_by_names_in_tx(&mut tx, &names).await {
-        Ok(rows) => rows,
-        Err(err) => return db_error(err).into_response(),
-    };
+    // `FOR SHARE` so the validation serializes against a concurrent visibility
+    // flip, which takes `FOR UPDATE` on the template row: without it a
+    // narrowing flip could commit between this read and the allowlist insert,
+    // leaving another org's org-specific template in the allowlist with no
+    // database constraint to catch it. With it, either this transaction sees
+    // the post-flip row and rejects, or the flip waits and its cross-org prune
+    // removes the freshly inserted row.
+    let known =
+        match pplx_space_template_store::templates::share_lock_visibilities(&mut *tx, &names).await
+        {
+            Ok(rows) => rows,
+            Err(err) => return db_error(sqlx::Error::from(err)).into_response(),
+        };
     let missing: Vec<&str> = {
         let known_names: std::collections::HashSet<&str> =
             known.iter().map(|row| row.name.as_str()).collect();

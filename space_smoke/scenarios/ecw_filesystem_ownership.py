@@ -3,6 +3,7 @@
 import space_smoke as smoke
 
 WORKDIR = "/home/user/ecw-filesystem-ownership"
+DEFAULT_OWNED_PATH = f"{WORKDIR}/default-user.txt"
 ROOT_OWNED_PATH = f"{WORKDIR}/owned-by-root.txt"
 USER_OWNED_PATH = f"{WORKDIR}/owned-by-user.txt"
 WORKSPACE_FILE_PATH = "/home/user/workspace/projects/example/data/probe.txt"
@@ -19,7 +20,7 @@ WORKSPACE_TREE = (
 
 @smoke.scenario("ecw.filesystem_ownership")
 def filesystem_ownership(test: smoke.Ecw) -> None:
-    """Files written as root and user retain the requested owner, and parents
+    """Files written as root, explicit user, and default user retain their owner; parents
     auto-created for a user-owned workspace file remain writable by that user.
     """
 
@@ -27,12 +28,14 @@ def filesystem_ownership(test: smoke.Ecw) -> None:
 
     with test.phase("write files as root and user"):
         test.sandbox.files.make_dir(WORKDIR)
+        test.sandbox.files.write(DEFAULT_OWNED_PATH, "owned by default user")
         test.sandbox.files.write(ROOT_OWNED_PATH, "owned by root", user="root")
         test.sandbox.files.write(USER_OWNED_PATH, "owned by user", user="user")
-        owners = test.identity.file_owner_uids((ROOT_OWNED_PATH, USER_OWNED_PATH))
+        owners = test.identity.file_owner_uids((DEFAULT_OWNED_PATH, ROOT_OWNED_PATH, USER_OWNED_PATH))
         test.verify(
             owners
             == {
+                DEFAULT_OWNED_PATH: user_uid,
                 ROOT_OWNED_PATH: 0,
                 USER_OWNED_PATH: user_uid,
             },

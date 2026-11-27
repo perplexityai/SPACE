@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::error::Error as _;
 use std::str::FromStr;
@@ -10,8 +10,8 @@ use pplx_space_api_route::SpaceApiRoutePurpose as CommonSpaceApiRoutePurpose;
 use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519Token, ed25519::decode_unverified_space_api_route_ed25519_claims,
 };
-use pplx_space_common_core::types::SpaceApiRouteIdentity;
 use pplx_space_node_api_client::proto::SpaceApiRouteToken as ProtoSpaceApiRouteToken;
+use pplx_space_sandbox_model::SpaceApiRouteIdentity;
 
 use super::*;
 
@@ -488,9 +488,7 @@ pub(super) async fn build_backend_channels(
         endpoint,
     )
     .await?;
-    Ok((0..pool_size)
-        .map(|_| endpoint.clone().connect_lazy())
-        .collect())
+    Ok(Vec::from_fn(pool_size, |_| endpoint.clone().connect_lazy()))
 }
 
 fn normalize_backend_endpoint(endpoint: &str) -> Result<String, tonic::transport::Error> {
@@ -1476,21 +1474,29 @@ pub(super) fn host_without_port(host: &str) -> &str {
 #[derive(Debug)]
 pub(super) enum AttachError {
     BadRequest(&'static str),
+    Unauthorized(&'static str),
 }
 
 impl IntoResponse for AttachError {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
-            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
-        };
-        data_plane_http_error(
-            status,
-            DataPlaneHttpErrorCode::InvalidRequest,
-            message,
-            false,
-            ResponseOrigin::Client,
-            ResponseKind::Validation,
-        )
+        match self {
+            Self::BadRequest(message) => data_plane_http_error(
+                StatusCode::BAD_REQUEST,
+                DataPlaneHttpErrorCode::InvalidRequest,
+                message,
+                false,
+                ResponseOrigin::Client,
+                ResponseKind::Validation,
+            ),
+            Self::Unauthorized(message) => data_plane_http_error(
+                StatusCode::UNAUTHORIZED,
+                DataPlaneHttpErrorCode::Unauthorized,
+                message,
+                false,
+                ResponseOrigin::Client,
+                ResponseKind::Auth,
+            ),
+        }
     }
 }
 
@@ -1532,7 +1538,7 @@ impl IntoResponse for ProxyError {
                     RouteResolutionError::Unauthenticated => (
                         StatusCode::UNAUTHORIZED,
                         DataPlaneHttpErrorCode::Unauthorized,
-                        "invalid or expired data-plane token",
+                        crate::native::INVALID_TOKEN_MESSAGE,
                         origin,
                         kind,
                     ),
@@ -1592,11 +1598,13 @@ impl IntoResponse for ProxyError {
         observe_data_plane_http_error(status, origin, kind);
         (
             status,
-            Json(DataPlaneHttpError {
-                code,
-                message: message.to_string(),
-                retryable,
-                details: Vec::new(),
+            Json(DataPlaneHttpErrorEnvelope {
+                error: DataPlaneHttpError {
+                    code,
+                    message: message.to_string(),
+                    retryable,
+                    details: Vec::new(),
+                },
             }),
         )
             .into_response()
@@ -1607,6 +1615,7 @@ impl From<AttachError> for ProxyError {
     fn from(error: AttachError) -> Self {
         match error {
             AttachError::BadRequest(message) => Self::BadRequest(message),
+            AttachError::Unauthorized(message) => Self::Unauthorized(message),
         }
     }
 }

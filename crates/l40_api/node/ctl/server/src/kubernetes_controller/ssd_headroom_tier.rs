@@ -1,12 +1,12 @@
 use k8s_openapi::api::core::v1::Node;
 use kube::api::{Patch, PatchParams};
 use kube::{Api, Client};
-use pplx_space_common_core::kubernetes::{
+use pplx_space_node_mgr_client::proto::{CacheDiskStatus, NodeResourceStatusRequest};
+use pplx_space_node_mgr_client::{CacheDiskSchedulingEffect, NodeResourceStatusReader};
+use pplx_space_sandbox_pod::{
     SSD_HEADROOM_TIER_LABEL, SSD_PLACEMENT_BLOCKED_LABEL, SSD_PLACEMENT_BLOCKED_VALUE,
     SsdHeadroomTier,
 };
-use pplx_space_node_mgr_client::proto::{CacheDiskStatus, NodeResourceStatusRequest};
-use pplx_space_node_mgr_client::{CacheDiskSchedulingEffect, NodeResourceStatusReader};
 
 use super::node_watch;
 use crate::local_manager_request;

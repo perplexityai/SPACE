@@ -6,13 +6,13 @@ import base64
 import http.client
 import json
 import socket
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 
 from space_smoke.model import Verdict
 from space_smoke.native_hardening import NativeResponse
+from space_smoke.native_recovery import DataPlaneShape, UploadAdmission
 from space_smoke.runtime import execute_scenario
 from space_smoke.scenarios import native_contract_file_upload_admission_429 as admission
 from space_smoke.scenarios import native_contract_file_write_size_boundary_on_the_data_plane as boundary
@@ -155,7 +155,7 @@ def test_a_write_read_back_whole_passes(small_cap):
 def test_a_byte_changed_anywhere_it_reads_fails(small_cap, where, at):
     result = _run_boundary(_flip(at(small_cap)))
     assert result.verdict == Verdict.FAIL, result
-    assert result.summary == f"the {where} of the file at the cap is not what was written"
+    assert result.summary == "the file at the cap is not what was written"
 
 
 class _Connection:
@@ -197,7 +197,8 @@ class _Connection:
 @pytest.fixture
 def connections(monkeypatch):
     _Connection.opened = []
-    monkeypatch.setattr(admission, "REFUSAL_SECONDS", 0.01)
+    # With no wait (STANDING), the refusal window is only this margin.
+    monkeypatch.setattr(admission, "REFUSAL_MARGIN_SECONDS", 0.01)
     yield _Connection.opened
     for connection in _Connection.opened:
         connection.close()
@@ -212,12 +213,21 @@ def test_a_held_upload_whose_setup_fails_is_closed(monkeypatch, connections):
     assert [connection.closed for connection in connections] == [True]
 
 
+# The Kind data plane's standing settings, the binary's slots and the
+# chart's 128 MiB byte budgets, but with no wait (`connections`).
+STANDING = UploadAdmission(
+    enabled=True, slots_per_replica=256, slots_per_org=64, slots_per_sandbox=8,
+    bytes_per_replica=128 << 20, bytes_per_org=128 << 20, bytes_per_sandbox=128 << 20, wait_ms=0,
+)
+
+
 def _admission_fixture(context) -> SimpleNamespace:
+    shape = DataPlaneShape("uid", "template", 2, frozenset({"pod-a", "pod-b"}))
     recovery = SimpleNamespace(
-        owned_faults=nullcontext,
-        data_plane_replicas=lambda: 2,
-        one_upload_per_sandbox=nullcontext,
+        standing_upload_admission=lambda: (STANDING, shape),
+        require_same_data_plane=lambda before: None,
     )
+
     return SimpleNamespace(
         context=context,
         recovery=recovery,
@@ -230,7 +240,7 @@ def _admission_fixture(context) -> SimpleNamespace:
 @pytest.mark.parametrize(
     "fail",
     [
-        # The second of three held writes fails while it is being sent.
+        # The second held write fails while it is being sent.
         lambda index: {"fail_send": index == 1},
         # Every write is held, and the first to be finished loses its answer.
         lambda index: {"fail_response": True},

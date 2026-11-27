@@ -6,7 +6,7 @@ pub use pplx_space_node_mgr_protocol::execution_fence::{
 
 pub async fn inspect_execution(
     client: &mut crate::NodeManagerGrpcClient,
-    sandbox: pplx_space_common_core::types::SandboxId,
+    sandbox: pplx_space_sandbox_model::SandboxId,
 ) -> Result<Option<ExecutionFence>, tonic::Status> {
     // Store-only read: bound a wedged receiver instead of pinning startup.
     // Process supervision retries startup without changing persisted authority.

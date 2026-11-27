@@ -26,12 +26,12 @@
 //! (`cleanup_runtime_artifacts`), which sweeps the `sbxroot-*` /
 //! `sbxvol-*` dm devices without needing a caller.
 
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
 
 use std::path::{Component, Path, PathBuf};
 
-use pplx_space_common_core::host::linux::paths;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_host_layout::paths;
+use pplx_space_sandbox_model::SandboxId;
 use tonic::{Request, Response, Status};
 use zeroize::Zeroizing;
 
@@ -564,7 +564,7 @@ async fn stage_contained(sandbox_id: &SandboxId, src: PathBuf, dst: PathBuf) -> 
             &root,
             &src,
             &dst,
-            pplx_space_common_core::host::linux::identities::gids::SPACE_CACHE_RW,
+            pplx_space_host_layout::identities::gids::SPACE_CACHE_RW,
         )
     })
     .await

@@ -1,9 +1,10 @@
 use super::idempotency;
-use pplx_space_common_core::types::{CredentialReferenceId, IdempotencyKey, OrgId};
-use pplx_space_credential_injection_core::validation::{
+use pplx_space_accounts::{CredentialReferenceId, OrgId};
+use pplx_space_credential_injection::validation::{
     ReferenceValidationError, ValidatedCredentialReference,
 };
 use pplx_space_credential_injection_store::references::{self as store, ReferenceState};
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::credential_references as wire;
 
 #[derive(Debug, thiserror::Error)]
@@ -16,6 +17,12 @@ pub(crate) enum ReferenceError {
     Invalid(#[from] ReferenceValidationError),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
+}
+
+impl From<pplx_space_postgres_pool::DbError> for ReferenceError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
 }
 
 pub(crate) fn definition(

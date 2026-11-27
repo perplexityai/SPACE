@@ -17,6 +17,61 @@ export interface Ctx {
   shared: Record<string, string>;
 }
 
+// Every IPv4 address outside 127.0.0.0/8 in `text` as 127.0.0.<its last
+// octet>, so distinct hosts stay distinct.
+export function loopbackAddresses(text: string): string {
+  return text.replace(/\b(\d{1,3})\.\d{1,3}\.\d{1,3}\.(\d{1,3})\b/g, (address, first, last) => (first === '127' ? address : `127.0.0.${last}`));
+}
+
+// With --loopback-hosts: the JSON responses to the page's /admin/ and /api/
+// requests reach it with their IPv4 literals rewritten by `loopbackAddresses`
+// (a Kind node's address among them). Nothing else is: a hostname, an IPv6
+// address, any other response or an event stream reaches the screenshots and
+// videos as it is. A redirect is handed to the page unfollowed, as the
+// console would get it.
+export async function showLoopbackHostsOnly(context: BrowserContext): Promise<void> {
+  await context.route((url) => /^\/(admin|api)\//.test(url.pathname), async (route) => {
+    if ((route.request().headers().accept ?? '').includes('text/event-stream')) return route.fallback();
+    const response = await route.fetch({ maxRedirects: 0 });
+    if (!(response.headers()['content-type'] ?? '').includes('json')) return route.fulfill({ response });
+    return route.fulfill({ response, body: loopbackAddresses(await response.text()) });
+  });
+}
+
+// A button on the page: its visible text, whitespace collapsed, and its
+// accessible name. An icon inside a button lends the name its label, so the
+// name of a button showing "Preview v2 drain" is "eye Preview v2 drain".
+export interface ButtonCandidate {
+  text: string;
+  name: string;
+}
+
+// The index of the one button `label` names: by its visible text, or by its
+// whole accessible name, either exactly, so a label never picks a longer
+// button that only starts with it. Null when no button matches; an error
+// when more than one does, since clicking the first would be a guess.
+export function clickTarget(buttons: ButtonCandidate[], label: string): number | null {
+  const wanted = label.trim().replace(/\s+/g, ' ');
+  const matches = buttons.flatMap((button, index) => (button.text === wanted || button.name === wanted ? [index] : []));
+  if (matches.length > 1) {
+    throw new Error(`--click ${JSON.stringify(label)} matches ${matches.length} buttons: ${matches.map((i) => JSON.stringify(buttons[i].text || buttons[i].name)).join(', ')}`);
+  }
+  return matches.length ? matches[0] : null;
+}
+
+// The page's visible buttons as `clickTarget` reads them.
+export async function buttonCandidates(page: Page): Promise<{ locator: Locator; candidate: ButtonCandidate }[]> {
+  const found = [];
+  for (const locator of await page.getByRole('button').all()) {
+    const text = (await locator.innerText().catch(() => '')).trim().replace(/\s+/g, ' ');
+    const snapshot = await locator.ariaSnapshotJSON({ depth: 1 }).catch(() => null);
+    const node = Array.isArray(snapshot) ? snapshot[0] : null;
+    const name = node && typeof node === 'object' && !Array.isArray(node) && typeof node.name === 'string' ? node.name : text;
+    found.push({ locator, candidate: { text, name } });
+  }
+  return found;
+}
+
 export async function newContext(
   browser: Browser,
   { viewport = { width: 1440, height: 900 }, videoDir }: { viewport?: { width: number; height: number }; videoDir?: string } = {},

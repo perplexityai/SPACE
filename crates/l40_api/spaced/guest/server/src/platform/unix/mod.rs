@@ -21,17 +21,20 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
-use pplx_space_common_connection_admission::{
+use pplx_space_connection_admission::{
     ConnectionAdmissionConfig, ConnectionAdmissionFailure, ConnectionAdmissionObservation,
     admit_connections,
 };
-use pplx_space_spaced_common::lazy_client::FailedGeneration;
-use pplx_space_spaced_common::proto::bridge_guest::meta_server::{
+use pplx_space_spaced_client::lazy_client::FailedGeneration;
+use pplx_space_spaced_client::{
+    DEFAULT_COMMAND_RETRY_POLICY, LazyClient, RetryContext, RetryPolicy,
+};
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::meta_server::{
     Meta as BridgeGuestMeta, MetaServer as BridgeGuestMetaServer,
 };
-use pplx_space_spaced_common::proto::bridge_guest::networking_server::NetworkingServer as BridgeGuestNetworkingServer;
-use pplx_space_spaced_common::proto::bridge_guest::process_server::Process;
-use pplx_space_spaced_common::proto::bridge_guest::{
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::networking_server::NetworkingServer as BridgeGuestNetworkingServer;
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_server::Process;
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
     ClockSyncStatus, CloseStdinRequest, CloseStdinResponse, ConfigureProcessEnvRequest,
     ConfigureProcessEnvResponse, ConnectProcessRequest, FlushFilesystemsRequest,
     FlushFilesystemsResponse, GuestDiagnosticCallsite, ListProcessesRequest, NotifyResumeRequest,
@@ -41,8 +44,9 @@ use pplx_space_spaced_common::proto::bridge_guest::{
     WaitReadyRequest as BridgeGuestWaitReadyRequest,
     WaitReadyResponse as BridgeGuestWaitReadyResponse,
 };
-use pplx_space_spaced_common::proto::bridge_host::meta_client::MetaClient as BridgeHostClient;
-use pplx_space_spaced_common::proto::bridge_host::{
+use pplx_space_spaced_guest_protocol::{parse_env, validate_duration};
+use pplx_space_spaced_protocol::proto::bridge_host::meta_client::MetaClient as BridgeHostClient;
+use pplx_space_spaced_protocol::proto::bridge_host::{
     ActivityState as BridgeHostActivityState,
     RequestActiveForRequest as BridgeHostRequestActiveForRequest,
     RequestActiveForResponse as BridgeHostRequestActiveForResponse,
@@ -51,10 +55,10 @@ use pplx_space_spaced_common::proto::bridge_host::{
     SetActivityStateRequest as BridgeHostSetActivityStateRequest,
     SetActivityStateResponse as BridgeHostSetActivityStateResponse,
 };
-use pplx_space_spaced_common::proto::guest::meta_server::{
+use pplx_space_spaced_protocol::proto::guest::meta_server::{
     Meta as LocalMeta, MetaServer as LocalMetaServer,
 };
-use pplx_space_spaced_common::proto::guest::{
+use pplx_space_spaced_protocol::proto::guest::{
     ActivityState as LocalActivityState, PingRequest, PingResponse,
     RequestActiveForRequest as LocalRequestActiveForRequest,
     RequestActiveForResponse as LocalRequestActiveForResponse,
@@ -63,15 +67,11 @@ use pplx_space_spaced_common::proto::guest::{
     SetActivityStateRequest as LocalSetActivityStateRequest,
     SetActivityStateResponse as LocalSetActivityStateResponse,
 };
-use pplx_space_spaced_common::{
-    DEFAULT_COMMAND_RETRY_POLICY, LazyClient, RetryContext, RetryPolicy, parse_env,
-    validate_duration,
-};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
-use pplx_space_common_core::types::GuestUserName;
+use pplx_space_guest_process::GuestUserName;
 const BRIDGE_HOST_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONCURRENT_BRIDGE_HOST_CALLS: usize = 32;
 const LOCAL_GUEST_SOCKET_MODE: u32 = 0o666;
@@ -126,15 +126,15 @@ fn observe_connection_admission(
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectBridgeHostError {
     #[error(transparent)]
-    Uds(#[from] pplx_space_spaced_common::UdsConnectError),
+    Uds(#[from] pplx_space_spaced_client::UdsConnectError),
     #[error(transparent)]
-    Vsock(#[from] pplx_space_spaced_common::VsockConnectError),
+    Vsock(#[from] pplx_space_spaced_client::VsockConnectError),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunLocalGuestServerError {
     #[error("failed to bind local guest unix socket: {0}")]
-    Bind(#[from] pplx_space_spaced_common::BindUdsError),
+    Bind(#[from] pplx_space_spaced_client::BindUdsError),
     #[error("local guest gRPC server failed: {0}")]
     Serve(#[source] tonic::transport::Error),
     #[error(transparent)]
@@ -146,7 +146,7 @@ pub enum RunBridgeGuestServerError {
     #[error("failed to bind bridge guest vsock: {0}")]
     BindVsock(#[source] std::io::Error),
     #[error(transparent)]
-    BindUds(#[from] pplx_space_spaced_common::BindUdsError),
+    BindUds(#[from] pplx_space_spaced_client::BindUdsError),
     #[error("bridge guest gRPC server failed: {0}")]
     Serve(#[source] tonic::transport::Error),
     #[error(transparent)]
@@ -194,8 +194,8 @@ pub use run::{RunSpacedGuestError, SERVICE_NAME, SpacedGuestRunConfig, run, serv
 
 use port_forward::LoopbackBridgeManager;
 
-const HOST_CONNECTION_PORT: u32 = pplx_space_spaced_common::BRIDGE_HOST_VSOCK_PORT;
-const GUEST_BRIDGE_PORT: u32 = pplx_space_spaced_common::BRIDGE_GUEST_VSOCK_PORT;
+const HOST_CONNECTION_PORT: u32 = pplx_space_spaced_guest_protocol::BRIDGE_HOST_VSOCK_PORT;
+const GUEST_BRIDGE_PORT: u32 = pplx_space_spaced_guest_protocol::BRIDGE_GUEST_VSOCK_PORT;
 
 /// A request refused before any of its work started: an admission limit, or
 /// the guest shutting down. The status says so on the wire, with a retry hint,
@@ -245,6 +245,10 @@ pub struct SpacedGuestServiceConfig {
     pub local_socket_path: Option<PathBuf>,
     pub bridge_socket_path: Option<PathBuf>,
     pub guest_uptime_source: fn() -> Option<prost_types::Duration>,
+    /// What a diagnostic-draining bridge Ping reports as used memory, in bytes.
+    /// Configurable so a test can fix the value or its absence; the deployed
+    /// configuration reads `/proc/meminfo`.
+    pub guest_memory_used_source: fn() -> Option<u64>,
     pub default_operation_user: GuestUserName,
     /// Image WORKDIR; explicit process cwd takes precedence.
     pub default_working_dir: Option<PathBuf>,
@@ -265,12 +269,13 @@ impl Default for SpacedGuestServiceConfig {
         Self {
             host_connector_type: HostConnectorType::default(),
             local_socket_path: Some(
-                pplx_space_common_core::guest::linux::paths::default_guest_uds_path(
-                    pplx_space_common_core::guest::linux::paths::SPACED_GUEST_SOCKET_FILE,
+                pplx_space_guest_process::linux::paths::default_guest_uds_path(
+                    pplx_space_guest_process::linux::paths::SPACED_GUEST_SOCKET_FILE,
                 ),
             ),
-            bridge_socket_path: Some(pplx_space_spaced_common::default_bridge_guest_uds_path()),
+            bridge_socket_path: Some(pplx_space_spaced_client::default_bridge_guest_uds_path()),
             guest_uptime_source: read_guest_uptime,
+            guest_memory_used_source: meta::guest_memory_used_bytes,
             default_operation_user: execution.default_operation_user,
             default_working_dir: execution.default_working_dir,
             filesystem_execution: execution.filesystem_execution,
@@ -305,6 +310,8 @@ struct SpacedGuestServiceInner {
     bridge_socket_path: Option<PathBuf>,
     http2_preface_timeout: Duration,
     guest_uptime_source: fn() -> Option<prost_types::Duration>,
+    guest_memory_used_source: fn() -> Option<u64>,
+    guest_memory_read_slots: Arc<Semaphore>,
     ready: watch::Sender<bool>,
     ready_events: watch::Sender<u64>,
     loopback_bridge: LoopbackBridgeManager,
@@ -395,6 +402,8 @@ impl SpacedGuestService {
                 bridge_socket_path: config.bridge_socket_path,
                 http2_preface_timeout: config.http2_preface_timeout,
                 guest_uptime_source: config.guest_uptime_source,
+                guest_memory_used_source: config.guest_memory_used_source,
+                guest_memory_read_slots: Arc::new(Semaphore::new(1)),
                 ready,
                 ready_events,
                 loopback_bridge,
@@ -489,7 +498,9 @@ impl SpacedGuestService {
         self.call_bridge_host("bridge_host_request_active_for", |mut client| async move {
             client
                 .request_active_for(BridgeHostRequestActiveForRequest {
-                    hold_for: Some(pplx_space_spaced_common::duration_to_proto(hold_for)?),
+                    hold_for: Some(pplx_space_spaced_guest_protocol::duration_to_proto(
+                        hold_for,
+                    )?),
                 })
                 .await
         })
@@ -581,7 +592,7 @@ impl SpacedGuestService {
     ) -> Result<BridgeHostClient<tonic::transport::Channel>, ConnectBridgeHostError> {
         match &self.inner.host_connector_type {
             HostConnectorType::Auto if native_vsock_available() => {
-                let channel = pplx_space_spaced_common::connect_vsock_channel(
+                let channel = pplx_space_spaced_client::connect_vsock_channel(
                     "spaced bridge host",
                     tokio_vsock::VMADDR_CID_HOST,
                     HOST_CONNECTION_PORT,
@@ -590,20 +601,20 @@ impl SpacedGuestService {
                 Ok(BridgeHostClient::new(channel))
             }
             HostConnectorType::Auto => {
-                let path = pplx_space_spaced_common::default_bridge_host_uds_path();
+                let path = pplx_space_spaced_client::default_bridge_host_uds_path();
                 let channel =
-                    pplx_space_spaced_common::connect_uds_channel("spaced bridge host", &path)
+                    pplx_space_spaced_client::connect_uds_channel("spaced bridge host", &path)
                         .await?;
                 Ok(BridgeHostClient::new(channel))
             }
             HostConnectorType::Uds(path) => {
                 let channel =
-                    pplx_space_spaced_common::connect_uds_channel("spaced bridge host", path)
+                    pplx_space_spaced_client::connect_uds_channel("spaced bridge host", path)
                         .await?;
                 Ok(BridgeHostClient::new(channel))
             }
             HostConnectorType::Vsock => {
-                let channel = pplx_space_spaced_common::connect_vsock_channel(
+                let channel = pplx_space_spaced_client::connect_vsock_channel(
                     "spaced bridge host",
                     tokio_vsock::VMADDR_CID_HOST,
                     HOST_CONNECTION_PORT,
@@ -634,7 +645,7 @@ impl SpacedGuestService {
                 ))
             })?;
         let failed_generation = FailedGeneration::default();
-        pplx_space_spaced_common::retry_status_with_context_and_retry_hook(
+        pplx_space_spaced_client::retry_status_with_context_and_retry_hook(
             "spaced bridge host",
             command,
             self.inner.bridge_retry_policy,
@@ -690,7 +701,7 @@ impl SpacedGuestService {
             self.inner.shutdown.cancelled().await;
             return Ok(());
         };
-        let incoming = pplx_space_spaced_common::bind_uds_with_mode(
+        let incoming = pplx_space_spaced_client::bind_uds_with_mode(
             &socket_path,
             Some(LOCAL_GUEST_SOCKET_MODE),
         )?;
@@ -721,7 +732,7 @@ impl SpacedGuestService {
     async fn run_bridge_guest_server(self) -> Result<(), RunBridgeGuestServerError> {
         match self.inner.host_connector_type {
             HostConnectorType::Vsock | HostConnectorType::Auto if native_vsock_available() => {
-                let incoming = pplx_space_spaced_common::bind_vsock(GUEST_BRIDGE_PORT)
+                let incoming = pplx_space_spaced_client::bind_vsock(GUEST_BRIDGE_PORT)
                     .map_err(RunBridgeGuestServerError::BindVsock)?
                     .incoming();
                 // Guest-local vsock must never reach privileged bridge RPCs,
@@ -751,7 +762,7 @@ impl SpacedGuestService {
                     .supervise(move |incoming| {
                         guest_grpc_server_builder(MAX_BRIDGE_GUEST_STREAMS)
                             .add_service(BridgeGuestMetaServer::new(self.clone()))
-                            .add_service(pplx_space_spaced_common::proto::bridge_guest::guest_update_server::GuestUpdateServer::new(self.clone()).max_decoding_message_size(128 * 1024))
+                            .add_service(pplx_space_spaced_guest_protocol::proto::bridge_guest::guest_update_server::GuestUpdateServer::new(self.clone()).max_decoding_message_size(128 * 1024))
                             .add_service(self.inner.execution.filesystem_grpc_service())
                             .add_service(self.inner.execution.process_grpc_service(self.clone()))
                             .add_service(BridgeGuestNetworkingServer::new(self.clone()))
@@ -769,7 +780,7 @@ impl SpacedGuestService {
                     return Ok(());
                 };
                 let incoming =
-                    pplx_space_spaced_common::bind_uds_with_mode(&socket_path, Some(0o600))?;
+                    pplx_space_spaced_client::bind_uds_with_mode(&socket_path, Some(0o600))?;
                 let preface_timeout = self.inner.http2_preface_timeout;
                 let incoming = tokio_stream::StreamExt::map(incoming, move |io| {
                     io.map(|io| pplx_space_common_grpc::PrefaceDeadline::new(io, preface_timeout))
@@ -788,7 +799,7 @@ impl SpacedGuestService {
                     .supervise(move |incoming| {
                         guest_grpc_server_builder(MAX_BRIDGE_GUEST_STREAMS)
                             .add_service(BridgeGuestMetaServer::new(self.clone()))
-                            .add_service(pplx_space_spaced_common::proto::bridge_guest::guest_update_server::GuestUpdateServer::new(self.clone()).max_decoding_message_size(128 * 1024))
+                            .add_service(pplx_space_spaced_guest_protocol::proto::bridge_guest::guest_update_server::GuestUpdateServer::new(self.clone()).max_decoding_message_size(128 * 1024))
                             .add_service(self.inner.execution.filesystem_grpc_service())
                             .add_service(self.inner.execution.process_grpc_service(self.clone()))
                             .add_service(BridgeGuestNetworkingServer::new(self.clone()))

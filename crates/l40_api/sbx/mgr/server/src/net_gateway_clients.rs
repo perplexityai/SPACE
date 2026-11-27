@@ -20,8 +20,9 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use pplx_space_common_core::types::{LinuxPid, SandboxId};
+use pplx_space_linux_ids::LinuxPid;
 use pplx_space_net_gateway_client::{ConnectError, NetGatewayControlGrpcClient};
+use pplx_space_sandbox_model::SandboxId;
 use tokio::time::Instant;
 
 const MAX_AGE: Duration = Duration::from_secs(60);

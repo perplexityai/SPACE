@@ -13,8 +13,8 @@ spec:
     matchLabels:
       {{- include "space-node-service.selectorLabels" $ctx | nindent 6 }}
   # Surge: credential-manager holds /space/run/credential-manager/service.mutex
-  # and its successor waits passively for it
-  # (crates/l40_api/credmgr/server/src/run.rs).
+  # and its successor waits passively for it; the agent hands it over as its
+  # drain starts (crates/l40_api/credmgr/server/src/run.rs).
   {{- include "space-node-service.updateStrategy" (dict "strategy" "surge") | nindent 2 }}
   template:
     metadata:

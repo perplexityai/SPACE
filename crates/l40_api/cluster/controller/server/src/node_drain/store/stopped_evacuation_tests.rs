@@ -12,6 +12,9 @@
 //! be: each near-miss is a *possible* yes turned into a no by exactly one field,
 //! seeded alongside a real yes so no assertion holds vacuously.
 
+use pplx_space_sandbox_portability::current_disk_artifact_backup_ready;
+use pplx_space_snapshot_model::SnapshotId;
+
 use super::*;
 
 pub(super) type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -159,12 +162,11 @@ async fn disk_backup_ready(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<b
 }
 
 async fn restore_pending(pool: &PgPool) -> TestResult<Vec<(SandboxId, String)>> {
-    let query = restore_pending_evacuations_query(true);
-    Ok(
-        sqlx::query_as::<_, (SandboxId, String)>(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .fetch_all(pool)
-            .await?,
-    )
+    Ok(sandbox_store::evacuation_restores::pending(pool, true)
+        .await?
+        .into_iter()
+        .map(|row| (row.id, row.evacuation_restore_target))
+        .collect())
 }
 
 /// Claim with new evacuations enabled — what a cluster that has opted in does.
@@ -628,7 +630,10 @@ async fn a_stopped_evacuation_is_re_placed_only_after_its_local_copy_is_gone() -
     let resident = insert_sandbox(&db.pool, Some(node_id), "stopped").await?;
     claim_and_publish(&db.pool, resident, node_id, pin, "ready").await?;
 
-    // Torn down but not yet durable: nowhere, and not restorable either.
+    // Unplaced but not durable: nowhere, and not restorable either. The
+    // release refuses a row without a durable disk, so only a writer that
+    // orphans the artifact's location after the release leaves this shape.
+    // The sweep's read must still skip it.
     let unpublished = insert_sandbox(&db.pool, Some(node_id), "stopped").await?;
     claim(&db.pool, unpublished, node_id).await?;
     set_current_artifact(&db.pool, unpublished, pin, ArtifactKind::Disk).await?;
@@ -660,7 +665,8 @@ async fn a_stopped_evacuation_is_re_placed_only_after_its_local_copy_is_gone() -
 }
 
 /// What the drain's teardown does to the cluster row, applied directly: the
-/// placement clear that `forget_pod_tracking` performs.
+/// placement clear that `release_published_stopped_evacuation` performs, minus
+/// its `placement_changed_at` bump, which a test that orders on it sets itself.
 async fn clear_placement(pool: &PgPool, sandbox_id: SandboxId) -> TestResult {
     sqlx::query(sql!(
         "UPDATE sandboxes
@@ -876,9 +882,7 @@ async fn the_pending_count_sees_sandboxes_the_retry_backoff_hides() -> TestResul
          the shape that makes deriving the gauge from it wrong"
     );
 
-    let pending: i64 = sqlx::query_scalar(stopped_replacements_pending_query())
-        .fetch_one(&db.pool)
-        .await?;
+    let pending = pplx_space_sandbox_store::stopped_replacements::pending(&db.pool).await?;
     assert_eq!(
         pending, 4,
         "every sandbox that can't serve a start must count — the eligible one, the one waiting \
@@ -1287,7 +1291,7 @@ pub(super) fn enqueued(pin: LocalArtifactId) -> EnqueuedArtifactBackup {
             id: pin,
             kind: ArtifactKind::Disk,
         },
-        attempt_id: pplx_space_common_core::types::BackupAttemptId::new(),
+        attempt_id: pplx_space_snapshot_model::BackupAttemptId::new(),
     }
 }
 
@@ -2437,6 +2441,63 @@ async fn an_execution_that_appears_after_authorization_stops_the_teardown() -> T
         marker_of(&db.pool, sandbox).await?,
         Some("stopped".to_owned()),
         "the claim survives, so a later tick can still finish if the start fails"
+    );
+    Ok(())
+}
+
+/// A release refused after the teardown deleted the sandbox's pods leaves the
+/// row on its node and reports `Deferred`, never `Released`.
+///
+/// Another writer clears the evacuation marker between the pod delete and the
+/// node release, as a `start` moving the lifecycle would. The claim held and the
+/// durability verdict authorized, so the teardown ran. The release re-checks
+/// the marker under the row lock and refuses, so the node keeps the rootfs. The
+/// durability test above shows the same claim with no such writer releases.
+#[tokio::test(flavor = "current_thread")]
+async fn a_release_refused_after_the_pod_delete_keeps_the_node() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = forced_draining_node(&db.pool).await?;
+    let sandbox = insert_sandbox(&db.pool, Some(node_id), "stopped").await?;
+    let pin = LocalArtifactId::new();
+    let sink = SubstrateSink::with_stopped_path_before_release(
+        db.pool.clone(),
+        enqueued(pin),
+        "UPDATE sandboxes SET evacuation_restore_target = NULL WHERE id = $1",
+    );
+    insert_backup(
+        &db.pool,
+        sandbox,
+        pin,
+        ArtifactKind::Disk,
+        "disk",
+        "ready",
+        false,
+    )
+    .await?;
+
+    let outcome = sink.evacuate_stopped_sandbox(sandbox, node_id).await?;
+
+    assert_eq!(
+        sink.recorded_teardowns(),
+        vec![sandbox],
+        "precondition: the claim was authorized and the pods were deleted"
+    );
+    assert!(
+        matches!(outcome, StoppedEvacuationOutcome::Deferred { .. }),
+        "a refused release must defer rather than report the node released; got {outcome:?}"
+    );
+    let (placement, active_node_id): (String, Option<NodeId>) = sqlx::query_as(sql!(
+        "SELECT placement, active_node_id FROM sandboxes WHERE id = $1"
+    ))
+    .bind(sandbox)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        (placement.as_str(), active_node_id),
+        ("on_node", Some(node_id)),
+        "the row must still name the node that holds its rootfs, or the drain terminates it"
     );
     Ok(())
 }

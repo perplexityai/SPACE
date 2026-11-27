@@ -173,6 +173,13 @@ service NodeManager {
   // Deny inbound traffic to a guest port (remove from sandbox allowlist).
   rpc DenyPort(DenyPortRequest) returns (DenyPortResponse);
 
+  // Durably accept the node's firewall assignment, then apply it to one slot
+  // or to every eligible slot. Acceptance and a single slot's dispatch are
+  // reported separately; neither is node-wide, and node-wide work leaves the
+  // dispatch unset. A node that can't sync answers FAILED_PRECONDITION after
+  // authorization.
+  rpc SyncFirewallRules(SyncFirewallRulesRequest) returns (SyncFirewallRulesResponse);
+
   // ─── Node artifact store ─────────────────────────────────────────────
   //
   // The node's root-owned store of runtime releases and guest kernels. The
@@ -300,6 +307,21 @@ service NodeManager {
   rpc BtrfsDeleteSandboxInstance(BtrfsDeleteSandboxInstanceRequest)
       returns (BtrfsDeleteSandboxInstanceResponse);
 
+  // Finish the disk of a suspend checkpoint staged on this node without a
+  // launch, so a runtime upgrade can cold-boot it as it would a copy
+  // suspended here. `metadata.json`, when absent, is written from the
+  // request, and a `metadata.json` already there is kept. For an encrypted
+  // sandbox `instance/` is created as a subvolume and the checkpoint's
+  // `snapshot/cow.luks` is laid over whatever `instance/cow.luks` holds, as
+  // a restore lays it, since a suspended sandbox's disk is its checkpoint.
+  // Idempotent; the response names what was written and what kept, and the
+  // checkpoint it laid. The staged `snapshot.json` must name the sandbox,
+  // the requested artifact and template. The caller validates the
+  // checkpoint too and holds its artifact lock. Only
+  // served when CloneCapabilitiesResponse.staged_checkpoint_disk is true.
+  rpc MaterializeStagedCheckpointDisk(MaterializeStagedCheckpointDiskRequest)
+      returns (MaterializeStagedCheckpointDiskResponse);
+
   // Create a sandbox's empty `instance/` as a btrfs subvolume, owned by
   // sandbox-manager, for a restore that writes the rootfs into it itself (the
   // Full codec). A plain directory there would work for the boot, but nothing
@@ -414,6 +436,65 @@ message ApplyExecutionPolicyResponse {
   ClusterDefaultOutcome default_outcome = 2;
 }
 
+// The assignment node-ctl fetches from the control plane, as fetched.
+message FirewallRulesAssignment {
+  uint64 generation = 1;
+  // Canonical UUID.
+  string revision_id = 2;
+  // The revision's canonical JSON document (pplx-space-firewall-rules-protocol).
+  string revision = 3;
+}
+
+message SyncFirewallRulesRequest {
+  // Canonical node ID the assignment names, checked against this node's own.
+  string node_id = 1;
+  FirewallRulesAssignment assignment = 2;
+}
+
+enum FirewallAssignmentAcceptance {
+  FIREWALL_ASSIGNMENT_ACCEPTANCE_UNSPECIFIED = 0;
+  FIREWALL_ASSIGNMENT_ACCEPTANCE_COMMITTED = 1;
+  // Already the accepted assignment; this is no proof it was applied.
+  FIREWALL_ASSIGNMENT_ACCEPTANCE_REPLAYED = 2;
+}
+
+// What happened to the accepted generation in the slot, as of the reply.
+enum FirewallSlotDispatchOutcome {
+  FIREWALL_SLOT_DISPATCH_OUTCOME_UNSPECIFIED = 0;
+  // Queued or running when the bounded wait ended.
+  FIREWALL_SLOT_DISPATCH_OUTCOME_PENDING = 1;
+  // A newer generation was accepted before this one's result.
+  FIREWALL_SLOT_DISPATCH_OUTCOME_SUPERSEDED = 2;
+  // Nothing reached nft.
+  FIREWALL_SLOT_DISPATCH_OUTCOME_NOT_RUN = 3;
+  // Submitted once, and the slot's readback listed exactly this revision.
+  // A point-in-time observation of one slot, not node-wide verification.
+  FIREWALL_SLOT_DISPATCH_OUTCOME_MATCHED = 4;
+  // Submitted once; the readback listed something else.
+  FIREWALL_SLOT_DISPATCH_OUTCOME_MISMATCHED = 5;
+  // Submitted once; the readback could not tell.
+  FIREWALL_SLOT_DISPATCH_OUTCOME_INCONCLUSIVE = 6;
+  // Submitted once, but the assignment, slot or namespace changed, or could no
+  // longer be confirmed, before the final check.
+  FIREWALL_SLOT_DISPATCH_OUTCOME_STALE = 7;
+  // The slot apply's job ended without a result, so nft may have run.
+  FIREWALL_SLOT_DISPATCH_OUTCOME_UNKNOWN = 8;
+}
+
+message FirewallSlotDispatch {
+  FirewallSlotDispatchOutcome outcome = 1;
+  // Diagnostic only.
+  string detail = 2;
+}
+
+message SyncFirewallRulesResponse {
+  // The request's generation, now durably accepted.
+  uint64 accepted_generation = 1;
+  FirewallAssignmentAcceptance acceptance = 2;
+  // Unset when the work spans slots.
+  FirewallSlotDispatch dispatch = 3;
+}
+
 message ResolveExecutionEnvironmentRequest {
   // Highest definition schema understood, including its identity encoding.
   // Values below 2 are unsupported. This changes encoding, never selection.
@@ -514,6 +595,11 @@ message AllocateResponse {
   string slot_label = 9;
   // Slot-derived UID that owns lease-scoped host resources.
   uint32 sandbox_uid = 10;
+  // First IPv4 address, in interface index order, that is neither loopback
+  // nor link-local in the request's netns_path, the externally created
+  // namespace the sandbox bridges to; the same address the shim selects.
+  // Absent without a netns_path or when the node manager could not read it.
+  optional string external_address = 11;
 }
 
 message LaunchRequest {
@@ -524,10 +610,20 @@ message LaunchRequest {
   uint32 gid = 5;
   map<string, string> env = 6;
   ExecutionFence execution_fence = 7;
+  // Net-gateway only: replace the live gateway with this pid, handing its
+  // listening sockets to the replacement when the runtime supervisor can.
+  // A node-manager or supervisor that predates the field returns the live
+  // pid unchanged, or refuses a gateway without launch evidence. Callers
+  // that see either, or any other error, fall back to stopping the gateway
+  // themselves.
+  optional uint32 replace_gateway_pid = 8;
 }
 
 message LaunchResponse {
   uint32 pid = 1;
+  // How many listening sockets a replacement gateway took over from the one
+  // it replaced; zero when it bound fresh ones.
+  uint32 inherited_gateway_sockets = 2;
 }
 
 message ReleaseRequest {
@@ -582,6 +678,11 @@ message NetworkPoolStatusRequest {}
 message CloneCapabilitiesRequest {}
 message CloneCapabilitiesResponse {
   bool prepared_clone_disposal = 1;
+  // MaterializeStagedCheckpointDisk is served, and RestoreInstanceSnapshot
+  // accepts an encrypted copy holding a COW and no rootfs. An older
+  // node-manager leaves this false, and sandbox-manager then refuses a
+  // runtime upgrade that would preserve such a copy before it fences.
+  bool staged_checkpoint_disk = 2;
 }
 
 message NetworkPoolStatusResponse {
@@ -800,6 +901,11 @@ message InspectSandboxRequest {
   optional string template = 5;
   // Read durable authority without host probes; works after lease release too.
   bool execution_only = 6;
+  // Read only the sandbox cgroup files, without network, process or
+  // filesystem probes. Ignored when execution_only is set. The response
+  // leaves every non-cgroup field at its default, and an unknown sandbox
+  // answers OK with cgroup_exists = false.
+  bool cgroup_only = 7;
 }
 
 message InspectSandboxResponse {
@@ -1358,6 +1464,42 @@ message BtrfsCreateSandboxInstanceRequest {
   string sandbox_id = 1;
   InstanceTarget target = 2;
 }
+message MaterializeStagedCheckpointDiskRequest {
+  string sandbox_id = 1;
+  // Required; an execution fence, as for BtrfsCreateSandboxInstance.
+  InstanceTarget target = 2;
+  // The checkpoint the caller validated. The call refuses a staged
+  // checkpoint whose `snapshot.json` names another artifact or sandbox.
+  string local_artifact_id = 3;
+  // The `metadata.json` to write when the sandbox has none, naming the
+  // execution that wrote the disk. Empty writes none.
+  string metadata_json = 4;
+  // Lay the checkpoint's encrypted COW into `instance/`.
+  bool encrypted = 5;
+  // The template digest the checkpoint's `snapshot.json` names, which the
+  // caller checked against the row; empty when it names none, which only an
+  // unencrypted checkpoint may. The call refuses a checkpoint whose
+  // `snapshot.json` names another.
+  string template_digest = 6;
+}
+
+enum StagedDiskPart {
+  STAGED_DISK_PART_UNSPECIFIED = 0;
+  STAGED_DISK_PART_NOT_REQUESTED = 1;
+  STAGED_DISK_PART_WRITTEN = 2;
+  STAGED_DISK_PART_KEPT = 3;
+}
+
+message MaterializeStagedCheckpointDiskResponse {
+  StagedDiskPart metadata = 1;
+  StagedDiskPart cow = 2;
+  // The disk this call prepared, as the staged checkpoint's `snapshot.json`
+  // names it: its artifact and the template digest it was written over
+  // (empty when it names none).
+  string local_artifact_id = 3;
+  string template_digest = 4;
+}
+
 message BtrfsCreateSandboxInstanceResponse {
   // Whether `instance/` is now a btrfs subvolume: false for a plain directory
   // the call kept, or made on a filesystem that isn't btrfs.

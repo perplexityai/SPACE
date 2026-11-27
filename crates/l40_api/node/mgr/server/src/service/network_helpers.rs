@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::host::linux::identities::users;
+use pplx_space_host_layout::identities::users;
 
 const UNIX_SOCKET_READY_RETRY_DELAYS: [std::time::Duration; 9] = [
     std::time::Duration::from_millis(0),
@@ -114,8 +114,8 @@ pub(super) fn network_lease_from_record(record: &SlotRecord) -> Option<NetworkLe
         vpeer: net.vpeer(),
         slot_label: info.slot_label(),
         slot_generation: info.generation,
-        slot_state: record.state.proto(),
-        slot_health: record.health.proto(),
+        slot_state: crate::slot_pool::slot_state_proto(record.state),
+        slot_health: crate::slot_pool::slot_health_proto(record.health),
         last_error: record.last_error.clone(),
         sandbox_uid: (info.sandbox_uid != 0).then_some(info.sandbox_uid),
         pod_netns_path: info.pod_netns.clone(),

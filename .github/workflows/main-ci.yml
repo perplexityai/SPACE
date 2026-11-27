@@ -108,7 +108,8 @@ jobs:
     with:
       base_sha: ${{ github.event.before }}
       # One push can land a whole merge-queue batch, so before..after can span
-      # several PRs; judge migration isolation per landed commit instead.
+      # several PRs; judge migration isolation and SQLite rollback safety per
+      # landed commit instead.
       per_commit_migration_isolation: true
       # Main is the one pipeline that pays for the full-scale runs. Pull
       # requests and the merge queue keep the default and rely on the
@@ -201,6 +202,8 @@ jobs:
       contents: read
       packages: write
     uses: ./.github/workflows/kind-ci.yml
+    with:
+      smoke_tiers: routine,main
 
   # The only job that writes the Kind runtime images' and the seed builder's
   # tags in ghcr.io/perplexityai/space-kind-build-cache, which every Kind

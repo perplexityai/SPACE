@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use pplx_space_common_core::types::{
+use pplx_space_auto_lifecycle::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
     AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStage,
 };
@@ -86,8 +86,8 @@ fn policy_from_proto_returns_normalized_policy() {
     assert_eq!(
         policy.wake.on,
         vec![
-            pplx_space_common_core::types::AutoLifecycleWakeSource::Access,
-            pplx_space_common_core::types::AutoLifecycleWakeSource::Command,
+            pplx_space_auto_lifecycle::AutoLifecycleWakeSource::Access,
+            pplx_space_auto_lifecycle::AutoLifecycleWakeSource::Command,
         ]
     );
     assert_eq!(

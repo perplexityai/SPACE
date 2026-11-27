@@ -398,7 +398,7 @@ fn insert_named_rows(conn: &Connection, sandbox_id: &str, count: usize) {
 #[test]
 fn named_publication_inventory_fails_rather_than_returning_a_partial_answer() {
     use crate::db::inventory_read::InventoryReadError;
-    use pplx_space_common_core::inventory::MAX_ITEMS;
+    use pplx_space_rpc_contracts::inventory::MAX_ITEMS;
 
     let conn = crate::db::test_conn();
     insert_named_rows(&conn, "full", MAX_ITEMS);

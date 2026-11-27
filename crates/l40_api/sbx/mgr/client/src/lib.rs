@@ -11,16 +11,18 @@ use tonic::transport::{Channel, Endpoint};
 pub use pplx_space_sbx_mgr_protocol::{
     ACCESS_IDLE_UPDATE_ACK_METADATA, ACTIVATION_POLICY_HEALTH_SERVICE,
     AUTHORITATIVE_ROUTE_IDENTITY_REQUIRED_METADATA, CLEANUP_REFUSAL_REASON_METADATA,
-    OPERATION_ACTIVATION_RECEIPT_HEALTH_SERVICE, PROCESS_OUTPUT_CURSOR_HEALTH_SERVICE,
-    RESTART_RETRY_ON_SUCCESSOR_METADATA, RETAINED_FILESYSTEM_ONLY_COPY_REASON,
-    STOP_NOT_ADMITTED_METADATA, SUSPEND_PUBLICATION_PENDING_REASON,
+    CREATE_REQUIRED_ENVIRONMENT_HEALTH_SERVICE, OPERATION_ACTIVATION_RECEIPT_HEALTH_SERVICE,
+    PROCESS_OUTPUT_CURSOR_HEALTH_SERVICE, RESTART_RETRY_ON_SUCCESSOR_METADATA,
+    RETAINED_FILESYSTEM_ONLY_COPY_REASON, STOP_NOT_ADMITTED_METADATA, SUSPEND_CAPTURE_UNRESOLVED,
+    SUSPEND_PUBLICATION_PENDING_REASON, SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE,
     TEARDOWN_SUSPEND_BACKUP_PERMANENTLY_FAILED_REASON,
     authoritative_route_identity_required_status, auto_lifecycle, direct_restore_start_request,
     encode_optional_sandbox_id, is_authoritative_route_identity_required,
     is_restart_retry_on_successor, is_retained_filesystem_only_copy_status, is_stop_not_admitted,
-    is_suspend_publication_pending_status, is_template_policy_dependency, lifecycle, operations,
-    proto, restart_retry_on_successor_status, retained_filesystem_only_copy_status,
-    stop_not_admitted_status, suspend_publication_pending_status,
+    is_suspend_publication_pending_status, is_template_policy_dependency, lifecycle,
+    mark_restart_retry_on_successor, operations, proto, restart_retry_on_successor_status,
+    retained_filesystem_only_copy_status, stop_not_admitted_status,
+    suspend_evidence_requires_retention, suspend_publication_pending_status,
     template_policy_dependency_status,
 };
 
@@ -28,7 +30,7 @@ pub use pplx_space_sbx_mgr_protocol::{
 pub mod test_support;
 
 /// Unix socket path for the sbx-manager gRPC service.
-pub const SOCKET_PATH: &str = pplx_space_common_core::host::linux::paths::SANDBOX_MANAGER_SOCKET;
+pub const SOCKET_PATH: &str = pplx_space_host_layout::paths::SANDBOX_MANAGER_SOCKET;
 
 pub type SandboxManagerGrpcClient =
     proto::sandbox_manager_client::SandboxManagerClient<GrpcClientTrace<Channel>>;
@@ -174,7 +176,7 @@ pub fn lazy() -> SandboxManagerGrpcClient {
 
 /// Sandboxes requested per `List` page: one inventory-client round trip.
 const LIST_PAGE_SIZE: u32 = {
-    let size = pplx_space_common_core::inventory::READ_BATCH_ITEMS;
+    let size = pplx_space_rpc_contracts::inventory::READ_BATCH_ITEMS;
     assert!(size <= u32::MAX as usize);
     size as u32
 };

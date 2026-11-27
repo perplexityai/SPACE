@@ -5,19 +5,26 @@ A PR's producer either builds the image or, with `reuse`, takes the one main
 CI published for the same Rust input key (`build-rust-artifacts.sh
 --input-key`) from a registry package that only main writes. Main always
 builds; a job of its own then `publish`es the image, so the shards never wait
-for the push. Either way the shards load and verify the exact image the
-producer recorded.
+for the push, and records the digest it pushed. Either way the shards load and
+verify the exact image the producer recorded.
+
+Where the package cannot be read directly, `reuse` can pull main's image by
+digest through a pull-through mirror of ghcr.io that serves content by digest
+(SPACE_KIND_REGISTRY_MIRROR), finding the digest for its key in main's digest
+records.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
 import subprocess
 import time
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -33,6 +40,20 @@ REVISION_LABEL = "org.opencontainers.image.revision"
 PULL_TIMEOUT_SECONDS = 90
 # How often `started` reads the producer's status while it waits for a runner.
 STARTED_POLL_SECONDS = 3
+# A host and path prefix under which a pull-through mirror of ghcr.io serves
+# ghcr.io/<owner>/<repo> as <mirror>/<owner>/<repo>, by digest only.
+MIRROR_ENV = "SPACE_KIND_REGISTRY_MIRROR"
+# A JSON list of {"key", "digest"} records to read instead of main's (tests,
+# offline use).
+DIGESTS_FILE_ENV = "SPACE_KIND_RUST_DIGESTS_FILE"
+# Main CI's digest record of each image it publishes: one file in an Actions
+# artifact of this name, uploaded by main push runs of this workflow.
+DIGEST_ARTIFACT = "kind-rust-artifact-digest"
+DIGEST_SOURCE = "perplexityai/SPACE"
+DIGEST_WORKFLOW = "main-ci.yml"
+# The registry keeps the twenty newest images; older records name pruned ones.
+DIGEST_CANDIDATES = 20
+DIGEST_LOOKUP_SECONDS = 60
 
 
 def context() -> dict:
@@ -65,12 +86,13 @@ def digest(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def labels(reference: str) -> dict:
+def labels(reference: str, quiet: bool = False) -> dict:
     value = json.loads(
         subprocess.check_output(
             ["docker", "image", "inspect", "-f", "{{json .Config.Labels}}", reference],
             text=True,
             timeout=60,
+            stderr=subprocess.DEVNULL if quiet else None,
         )
     )
     return value if isinstance(value, dict) else {}
@@ -106,49 +128,241 @@ def image_source(identity: dict) -> tuple[str, str]:
     return built_from, key
 
 
+def pull(reference: str) -> tuple[int | None, float]:
+    """`docker pull`'s exit status (None when it stalled) and its duration."""
+
+    started = time.monotonic()
+    try:
+        # Never echo a remote error body or authentication diagnostics.
+        pulled = subprocess.run(
+            ["docker", "pull", "--quiet", reference],
+            capture_output=True,
+            text=True,
+            timeout=PULL_TIMEOUT_SECONDS,
+            check=False,
+        ).returncode
+    except subprocess.TimeoutExpired:
+        pulled = None
+    return pulled, time.monotonic() - started
+
+
+def main_build_commit(reference: str, key: str, quiet: bool = False) -> str | None:
+    """The commit a pulled image was built from, if it carries this input key."""
+
+    image_labels = labels(reference, quiet)
+    built_from = image_labels.get(REVISION_LABEL, "")
+    if image_labels.get(INPUT_KEY_LABEL) != key or not re.fullmatch(
+        r"[a-f0-9]{40}", built_from
+    ):
+        return None
+    return built_from
+
+
+class Miss(Exception):
+    """Why the mirror cannot serve this key's image; reuse goes on without it."""
+
+
+def gh_output(path: str, deadline: float) -> bytes:
+    """One `gh api` GET within the deadline; never prints its error output."""
+
+    seconds = int(deadline - time.monotonic())
+    if seconds < 1:
+        raise Miss("the GitHub API lookup ran out of time")
+    try:
+        result = subprocess.run(
+            ["gh", "api", path], capture_output=True, timeout=seconds, check=False
+        )
+    except subprocess.TimeoutExpired:
+        raise Miss("the GitHub API did not answer in time") from None
+    if result.returncode:
+        match = re.search(rb"HTTP ([0-9]{3})", result.stderr)
+        raise Miss(
+            "the GitHub API refused the lookup"
+            + (f" (HTTP {match.group(1).decode()})" if match else "")
+        )
+    return result.stdout
+
+
+def published_records(key: str) -> list:
+    """Main's digest records, those likeliest to hold this key first.
+
+    Each record is a downloaded Actions artifact, so only the newest
+    DIGEST_CANDIDATES records of main push runs are read, records from this
+    checkout's own history first: its key is most often its main base's. Only
+    main push runs count, so a pull request's upload under the same name never
+    does; a record exists only where publish pushed a verified image.
+    """
+
+    deadline = time.monotonic() + DIGEST_LOOKUP_SECONDS
+    prefix = f"repos/{DIGEST_SOURCE}/actions"
+    artifacts = json.loads(
+        gh_output(f"{prefix}/artifacts?name={DIGEST_ARTIFACT}&per_page=100", deadline)
+    )["artifacts"]
+    runs = json.loads(
+        gh_output(
+            f"{prefix}/workflows/{DIGEST_WORKFLOW}/runs"
+            "?branch=main&event=push&per_page=100",
+            deadline,
+        )
+    )["workflow_runs"]
+    main_runs = {run["id"] for run in runs}
+    candidates = [
+        artifact
+        for artifact in artifacts
+        if artifact["name"] == DIGEST_ARTIFACT
+        and not artifact["expired"]
+        and artifact["workflow_run"]["id"] in main_runs
+    ]
+    if not candidates:
+        raise Miss(f"no main push run has a {DIGEST_ARTIFACT} artifact yet")
+    candidates.sort(key=lambda artifact: artifact["created_at"], reverse=True)
+    candidates = candidates[:DIGEST_CANDIDATES]
+    # One bounded walk of local history: it reads only commits HEAD reaches,
+    # so a partial or shallow clone never fetches. Ordering only saves
+    # downloads, so a walk that fails keeps the newest-first order.
+    try:
+        walk = subprocess.run(
+            ["git", "rev-list", "--max-count=2000", "HEAD"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=max(1, int(deadline - time.monotonic())),
+            check=False,
+        )
+        history = set(walk.stdout.split()) if not walk.returncode else set()
+    except (OSError, subprocess.SubprocessError):
+        history = set()
+    candidates.sort(key=lambda artifact: artifact["workflow_run"].get("head_sha") not in history)
+    records = []
+    for artifact in candidates:
+        archive = zipfile.ZipFile(
+            io.BytesIO(gh_output(f"{prefix}/artifacts/{artifact['id']}/zip", deadline))
+        )
+        for name in archive.namelist():
+            record = json.loads(archive.read(name))
+            records.append(record)
+            if isinstance(record, dict) and record.get("key") == key:
+                return records
+    return records
+
+
+def mirror_digest(repository: str, key: str) -> tuple[str, str | None]:
+    """The digest main published for this key, and the commit its record names
+    if it names one, from a records file or main's runs."""
+
+    path = os.environ.get(DIGESTS_FILE_ENV)
+    if path:
+        records = json.loads(Path(path).read_text())
+        where = DIGESTS_FILE_ENV
+    else:
+        records = published_records(key)
+        where = f"main's {DIGEST_ARTIFACT} artifacts"
+    if isinstance(records, dict):
+        records = [records]
+    if not isinstance(records, list):
+        raise Miss(f"{where} is not a list of digest records")
+    for record in records:
+        if (
+            isinstance(record, dict)
+            and record.get("key") == key
+            and record.get("repository", repository) == repository
+        ):
+            found = record.get("digest")
+            commit = record.get("commit")
+            if (
+                not isinstance(found, str)
+                or not re.fullmatch(r"sha256:[a-f0-9]{64}", found)
+                or not (commit is None or isinstance(commit, str))
+            ):
+                raise Miss(f"{where} names an invalid digest for input key {key[:12]}")
+            return found, commit
+    raise Miss(f"{where} has no digest for input key {key[:12]}")
+
+
+def reuse_through_mirror(repository: str, key: str) -> tuple[str, str] | None:
+    """Pull main's image for this key by digest through the mirror and tag it.
+
+    Returns (commit it was built from, its digest reference under the
+    registry's own name). Logs neither the mirror's address nor a remote
+    error, so the log is safe to share.
+    """
+
+    mirror = os.environ.get(MIRROR_ENV, "").strip().rstrip("/")
+    if not mirror:
+        return None
+    try:
+        if not re.fullmatch(r"[A-Za-z0-9.-]+(?::[0-9]+)?(?:/[A-Za-z0-9._-]+)*", mirror):
+            raise Miss(f"{MIRROR_ENV} is not a registry host and path")
+        if not repository.startswith("ghcr.io/"):
+            raise Miss("the mirror serves ghcr.io repositories only")
+        found, commit = mirror_digest(repository, key)
+        upstream = f"{repository}@{found}"
+        reference = f"{mirror}/{repository.removeprefix('ghcr.io/')}@{found}"
+        pulled, elapsed = pull(reference)
+        if pulled != 0:
+            raise Miss(
+                f"the pull of {upstream} through it "
+                f"{'timed out' if pulled is None else 'failed'} after {elapsed:.0f} s"
+            )
+        print(f"Pulled {upstream} through the registry mirror in {elapsed:.0f} s", flush=True)
+        # Quiet: Docker's errors would name the mirror.
+        built_from = main_build_commit(reference, key, quiet=True)
+        if built_from is None or commit not in (None, built_from):
+            raise Miss("the image it served does not carry its input key and commit")
+        subprocess.run(
+            ["docker", "tag", reference, IMAGE], capture_output=True, check=True, timeout=60
+        )
+    except (
+        Miss,
+        KeyError,
+        TypeError,
+        ValueError,
+        OSError,
+        zipfile.BadZipFile,
+        subprocess.SubprocessError,
+    ) as error:
+        reason = error if isinstance(error, Miss) else f"the lookup stopped ({type(error).__name__})"
+        print(f"Not reusing the Rust artifact image through a registry mirror: {reason}", flush=True)
+        return None
+    return built_from, upstream
+
+
 def reuse(repository: str) -> None:
     """Take main's image for this checkout's Rust input key, if it has one.
 
-    Never fails: any miss leaves the build step to run, as without reuse.
+    With SPACE_KIND_REGISTRY_MIRROR set, first by digest through that mirror,
+    then by tag from the repository itself. Never fails: any miss leaves the
+    build step to run, as without reuse.
     """
 
     try:
         key = input_key()
-        reference = f"{repository}:{key}"
-        started = time.monotonic()
-        try:
-            # Never echo a remote error body or authentication diagnostics.
-            pulled = subprocess.run(
-                ["docker", "pull", "--quiet", reference],
-                capture_output=True,
-                text=True,
-                timeout=PULL_TIMEOUT_SECONDS,
-                check=False,
-            ).returncode
-        except subprocess.TimeoutExpired:
-            pulled = None
-        elapsed = time.monotonic() - started
-        if pulled != 0:
-            outcome = "timed out" if pulled is None else "failed"
-            print(
-                f"::notice::The pull of the Rust artifact image for input key "
-                f"{key[:12]} {outcome} after {elapsed:.0f} s; building it",
-                flush=True,
-            )
-            return
-        print(f"Pulled {reference} in {elapsed:.0f} s", flush=True)
-        image_labels = labels(reference)
-        built_from = image_labels.get(REVISION_LABEL, "")
-        if image_labels.get(INPUT_KEY_LABEL) != key or not re.fullmatch(
-            r"[a-f0-9]{40}", built_from
-        ):
-            print(
-                "::notice::The published Rust artifact image does not carry its "
-                "input key; building it",
-                flush=True,
-            )
-            return
-        subprocess.run(["docker", "tag", reference, IMAGE], check=True, timeout=60)
+        mirrored = reuse_through_mirror(repository, key)
+        if mirrored:
+            built_from, reference = mirrored
+            via = "mirror"
+        else:
+            via = "registry"
+            reference = f"{repository}:{key}"
+            pulled, elapsed = pull(reference)
+            if pulled != 0:
+                outcome = "timed out" if pulled is None else "failed"
+                print(
+                    f"::notice::The pull of the Rust artifact image for input key "
+                    f"{key[:12]} {outcome} after {elapsed:.0f} s; building it",
+                    flush=True,
+                )
+                return
+            print(f"Pulled {reference} in {elapsed:.0f} s", flush=True)
+            built_from = main_build_commit(reference, key)
+            if built_from is None:
+                print(
+                    "::notice::The published Rust artifact image does not carry its "
+                    "input key; building it",
+                    flush=True,
+                )
+                return
+            subprocess.run(["docker", "tag", reference, IMAGE], check=True, timeout=60)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         print(
             f"::notice::Rust artifact reuse stopped ({type(error).__name__}); "
@@ -157,7 +371,7 @@ def reuse(repository: str) -> None:
         )
         return
     with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
-        output.write("reused=true\n")
+        output.write(f"reused=true\nreused_from={via}\nreused_image={reference}\n")
     print(
         f"::notice::Reusing the Rust artifact image main built from {built_from} "
         f"for input key {key[:12]}; skipping the build",
@@ -165,11 +379,28 @@ def reuse(repository: str) -> None:
     )
 
 
-def publish(repository: str) -> None:
+def pushed_digest(output: str, tag: str) -> str:
+    """The digest `docker push` reports for the tag it pushed.
+
+    Only the push's own report: the local image's RepoDigests can name an
+    index of which the push sent one platform's manifest.
+    """
+
+    reported = re.findall(
+        rf"^{re.escape(tag)}: digest: (sha256:[a-f0-9]{{64}}) ", output, re.MULTILINE
+    )
+    if not reported:
+        raise ValueError("the push reported no digest")
+    return reported[-1]
+
+
+def publish(repository: str, record_path: Path | None) -> None:
     """Publish the loaded producer image under its input key (main only).
 
-    Main builds on every push, so this replaces the key's earlier image.
-    Never fails: a later PR with the same key then builds it.
+    Main builds on every push, so this replaces the key's earlier image. With
+    `--record`, also writes {key, digest, repository, commit} for the digest it
+    pushed, for readers that can only pull by digest. Never fails: a later PR
+    with the same key then builds it, and a missing record costs a box the same.
     """
 
     try:
@@ -185,9 +416,10 @@ def publish(repository: str) -> None:
             raise ValueError("artifact image was not built from this checkout")
         reference = f"{repository}:{key}"
         subprocess.run(["docker", "tag", IMAGE, reference], check=True, timeout=60)
-        subprocess.run(
-            ["docker", "push", "--quiet", reference],
+        pushed = subprocess.run(
+            ["docker", "push", reference],
             capture_output=True,
+            text=True,
             check=True,
             timeout=600,
         )
@@ -198,6 +430,31 @@ def publish(repository: str) -> None:
         )
         return
     print(f"Published the Rust artifact image for input key {key}", flush=True)
+    if record_path is None:
+        return
+    try:
+        found = pushed_digest(pushed.stdout, key)
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        partial = record_path.with_name(record_path.name + ".tmp")
+        partial.write_text(
+            json.dumps(
+                {
+                    "key": key,
+                    "digest": found,
+                    "repository": repository,
+                    "commit": built_from,
+                }
+            )
+            + "\n"
+        )
+        partial.replace(record_path)
+    except (OSError, ValueError) as error:
+        print(
+            f"::warning::Could not record the published image's digest ({type(error).__name__})",
+            flush=True,
+        )
+        return
+    print(f"Recorded its digest {found}", flush=True)
 
 
 def record(directory: Path) -> None:
@@ -485,8 +742,10 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("record", "load"):
         commands.add_parser(name).add_argument("directory", type=Path)
-    for name in ("reuse", "publish"):
-        commands.add_parser(name).add_argument("repository")
+    commands.add_parser("reuse").add_argument("repository")
+    publish_parser = commands.add_parser("publish")
+    publish_parser.add_argument("repository")
+    publish_parser.add_argument("--record", type=Path, help="write the pushed digest's record here")
     commands.add_parser("wait").add_argument("--timeout", type=int, default=65 * 60)
     commands.add_parser("started").add_argument("--timeout", type=int, default=75)
     args = parser.parse_args()
@@ -501,7 +760,7 @@ def main() -> None:
     elif args.command == "reuse":
         reuse(args.repository)
     elif args.command == "publish":
-        publish(args.repository)
+        publish(args.repository, args.record)
     else:
         load(args.directory)
 

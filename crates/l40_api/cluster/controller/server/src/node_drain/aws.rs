@@ -1,9 +1,10 @@
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
+use pplx_space_k8s_node_id::Ec2InstanceId;
 
-use pplx_space_common_core::sql;
+use pplx_space_node_registration_store::drain_reads::{self, TerminateTarget};
 use std::future::Future;
 
-use sqlx::{FromRow, PgPool};
+use sqlx::PgPool;
 
 use super::InstanceTerminator;
 
@@ -65,18 +66,6 @@ impl AsgTerminateClient for pplx_space_aws_client::autoscaling::Client {
     }
 }
 
-/// Row shape produced by [`Ec2InstanceTerminator::load_node_row`]. Held in
-/// one struct so the AWS-call helper takes a single typed argument and the
-/// row decode is named — clippy flagged the previous tuple decode as too
-/// complex to read at a glance.
-#[derive(Debug, Clone, FromRow)]
-struct TerminateNodeRow {
-    phase: Option<String>,
-    node_name: Option<String>,
-    stored_uid: Option<String>,
-    decrement_capacity: bool,
-}
-
 /// Production [`InstanceTerminator`] that calls AWS EC2 Auto Scaling
 /// `TerminateInstanceInAutoScalingGroup`. The `should_decrement_desired_capacity`
 /// flag is read from the per-node `nodes.terminate_decrement_capacity` column
@@ -113,20 +102,10 @@ impl<C: AsgTerminateClient> Ec2InstanceTerminator<C> {
         }
     }
 
-    async fn load_node_row(&self, node_id: NodeId) -> Result<TerminateNodeRow, TerminateError> {
-        let row: Option<TerminateNodeRow> = sqlx::query_as(sql!(
-            "SELECT n.drain_phase AS phase,
-                    k.k8s_node_name AS node_name,
-                    k.k8s_node_uid  AS stored_uid,
-                    n.terminate_decrement_capacity AS decrement_capacity
-             FROM nodes n
-             LEFT JOIN node_k8s k ON k.node_id = n.id
-             WHERE n.id = $1"
-        ))
-        .bind(node_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|err| TerminateError::KubeLookup(err.to_string()))?;
+    async fn load_node_row(&self, node_id: NodeId) -> Result<TerminateTarget, TerminateError> {
+        let row = drain_reads::terminate_target(&self.pool, node_id)
+            .await
+            .map_err(|err| TerminateError::KubeLookup(err.to_string()))?;
 
         row.ok_or_else(|| {
             TerminateError::KubeLookup(format!("node {node_id} row vanished before terminate"))
@@ -201,4 +180,21 @@ impl<C: AsgTerminateClient> InstanceTerminator for Ec2InstanceTerminator<C> {
             .terminate_instance(instance_id.to_string(), row.decrement_capacity)
             .await
     }
+}
+
+/// Ask Auto Scaling to terminate exactly `instance_id`, the instance a v2
+/// drain fenced, passing the node's `terminate_decrement_capacity`. The v2
+/// loop's terminate: unlike [`Ec2InstanceTerminator`], it reads no
+/// Kubernetes Node, since the fence already names the machine.
+pub(crate) async fn terminate_fenced_instance<C: AsgTerminateClient>(
+    autoscaling: &C,
+    instance_id: &Ec2InstanceId,
+    should_decrement_desired_capacity: bool,
+) -> Result<(), TerminateError> {
+    autoscaling
+        .terminate_instance(
+            instance_id.as_str().to_owned(),
+            should_decrement_desired_capacity,
+        )
+        .await
 }

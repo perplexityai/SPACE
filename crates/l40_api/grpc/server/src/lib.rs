@@ -1,6 +1,7 @@
 //! The gRPC server conventions every SPACE service shares: the server builder
 //! with its request timeout and HTTP/2 keepalives, the health service, and the
-//! trace layer that names each request's method, caller, status and latency.
+//! trace layer that names each request's method, caller, status and latency,
+//! and a Unix listener that closes when shutdown starts.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -19,9 +20,13 @@ use pplx_space_request_id::request_id_from_headers;
 
 mod grpc_request_params;
 mod grpc_trace;
+mod method_timeout;
+mod unix_incoming;
 
 pub use grpc_request_params::*;
 pub use grpc_trace::*;
+pub use method_timeout::MethodTimeoutLayer;
+pub use unix_incoming::{UnixIncomingUntilShutdown, unix_incoming_until_shutdown};
 
 pub const GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 pub const GRPC_HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);

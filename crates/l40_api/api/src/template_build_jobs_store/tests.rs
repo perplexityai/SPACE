@@ -1,5 +1,5 @@
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{TestDb, TestDbResult, pg_test_db};
+use pplx_space_sql_locator::sql;
 use rstest::{fixture, rstest};
 
 use super::*;

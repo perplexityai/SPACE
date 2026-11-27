@@ -27,7 +27,7 @@
 
 use std::path::{Path, PathBuf};
 
-use pplx_space_common_core::host::linux::identities::user_names;
+use pplx_space_host_layout::identities::user_names;
 use pplx_space_uds_peer_auth::UdsPeerPrincipal;
 use tonic::{Request, Response, Status};
 
@@ -42,8 +42,8 @@ use crate::proto::{
     BtrfsReceiveInstanceRequest, BtrfsReceiveInstanceResponse, EnvironmentTemplateBuild,
 };
 
-use pplx_space_common_core::host::linux::paths::TEMPLATE_CACHE_DIR_MODE;
-use pplx_space_common_core::{host::linux::identities::gids, host::linux::identities::users};
+use pplx_space_host_layout::paths::TEMPLATE_CACHE_DIR_MODE;
+use pplx_space_host_layout::{identities::gids, identities::users};
 
 use super::validation::validate_sandbox_id;
 use super::{CACHE_DIR, NodeManagerService};
@@ -107,7 +107,7 @@ fn validate_template_name(name: &str) -> Result<(), Status> {
 }
 
 fn validate_content_hash(hash: &str) -> Result<(), Status> {
-    hash.parse::<pplx_space_common_core::types::Digest>()
+    hash.parse::<pplx_space_content_digest::Digest>()
         .map(|_| ())
         .map_err(|error| {
             Status::invalid_argument(format!("invalid content_hash '{hash}': {error}"))
@@ -122,7 +122,7 @@ fn validate_content_hash(hash: &str) -> Result<(), Status> {
 struct TemplateBuildTarget {
     name: String,
     content_hash: String,
-    partition: pplx_space_common_core::types::TemplateCachePartition,
+    partition: pplx_space_template_model::TemplateCachePartition,
 }
 
 /// The parent template build a sandbox codec request names; see
@@ -246,7 +246,7 @@ fn with_cached_partitions(candidates: Vec<TemplateBuildTarget>) -> Vec<TemplateB
 /// carried no `environment_build`.
 fn names_legacy_build(candidates: &[TemplateBuildTarget]) -> bool {
     candidates.first().is_none_or(|first| {
-        first.partition == pplx_space_common_core::types::TemplateCachePartition::Legacy
+        first.partition == pplx_space_template_model::TemplateCachePartition::Legacy
     })
 }
 
@@ -265,9 +265,7 @@ fn append_partitions(
         .into_iter()
         .filter_map(|dir_name| {
             let (content_hash, partition) =
-                pplx_space_common_core::types::TemplateCachePartition::parse_build_dir_name(
-                    &dir_name,
-                )?;
+                pplx_space_template_model::TemplateCachePartition::parse_build_dir_name(&dir_name)?;
             (content_hash == first.content_hash
                 && !candidates.iter().any(|known| known.partition == partition))
             .then(|| TemplateBuildTarget {
@@ -295,7 +293,7 @@ macro_rules! sandbox_codec_request {
 
             fn parent_candidates(&self) -> Result<Vec<TemplateBuildTarget>, Status> {
                 let primary = self.parent_target()?;
-                if primary.partition == pplx_space_common_core::types::TemplateCachePartition::Legacy {
+                if primary.partition == pplx_space_template_model::TemplateCachePartition::Legacy {
                     return Ok(vec![primary]);
                 }
                 let legacy = TemplateBuildTarget::parse(&self.template_name, &self.content_hash, None)?;
@@ -318,10 +316,10 @@ sandbox_codec_request!(
 /// legacy builds name with `content_hash` alone.
 fn environment_build_partition(
     build: &EnvironmentTemplateBuild,
-) -> Result<pplx_space_common_core::types::TemplateCachePartition, Status> {
+) -> Result<pplx_space_template_model::TemplateCachePartition, Status> {
     let environment = build
         .environment
-        .parse::<pplx_space_common_core::types::EnvironmentReference>()
+        .parse::<pplx_space_execution_spec::EnvironmentReference>()
         .map_err(|error| {
             Status::invalid_argument(format!(
                 "invalid environment_build.environment '{}': {error}",
@@ -330,7 +328,7 @@ fn environment_build_partition(
         })?;
     let partition =
         pplx_space_node_runtime_core::catalog::template_cache_partition(Some(environment));
-    if partition == pplx_space_common_core::types::TemplateCachePartition::Legacy {
+    if partition == pplx_space_template_model::TemplateCachePartition::Legacy {
         return Err(Status::invalid_argument(
             "environment_build names the initial environment; use content_hash",
         ));
@@ -371,7 +369,7 @@ impl TemplateBuildTarget {
         let (content_hash, partition) = match environment_build {
             None => (
                 content_hash,
-                pplx_space_common_core::types::TemplateCachePartition::Legacy,
+                pplx_space_template_model::TemplateCachePartition::Legacy,
             ),
             Some(build) => {
                 if !content_hash.is_empty() {
@@ -398,20 +396,15 @@ impl TemplateBuildTarget {
     }
 
     fn digest_dir(&self) -> PathBuf {
-        PathBuf::from(
-            pplx_space_common_core::host::linux::paths::template_build_dir(
-                &self.name,
-                &self.content_hash,
-                self.partition,
-            ),
-        )
+        PathBuf::from(pplx_space_artifact_model::template_build_dir(
+            &self.name,
+            &self.content_hash,
+            self.partition,
+        ))
     }
 
     fn received_uuid(&self) -> uuid::Uuid {
-        pplx_space_common_core::host::btrfs::deterministic_template_received_uuid(
-            &self.name,
-            &self.dir_name(),
-        )
+        pplx_space_btrfs::deterministic_template_received_uuid(&self.name, &self.dir_name())
     }
 }
 
@@ -457,7 +450,7 @@ fn instance_ro_in_snapshot_dir(snapshot_dir: &Path) -> PathBuf {
 fn rootfs_btrfs_send_path(snapshot_dir: &Path) -> PathBuf {
     // Wire-format filename for the btrfs-send rootfs codec. Mirrors
     // `crate::snapshot_upload::ROOTFS_BTRFS_SEND_FILENAME` in sbxmgr;
-    // not promoted to common_core yet so we duplicate the literal
+    // not promoted to a shared crate yet so we duplicate the literal
     // here. Both sides MUST agree.
     snapshot_dir.join("rootfs.btrfs-send")
 }
@@ -465,7 +458,7 @@ fn rootfs_btrfs_send_path(snapshot_dir: &Path) -> PathBuf {
 /// Where the Full-codec rootfs lives — superseded by btrfs-send
 /// stream on the suspend side, removed after a successful encode.
 fn rootfs_ext4_in_snapshot_dir(snapshot_dir: &Path) -> PathBuf {
-    snapshot_dir.join(pplx_space_common_core::types::TEMPLATE_ROOTFS_FILE)
+    snapshot_dir.join(pplx_space_artifact_model::TEMPLATE_ROOTFS_FILE)
 }
 
 struct ValidatedSendParent {
@@ -659,8 +652,8 @@ impl LineageFallbackCause {
 
 fn validate_named_snapshot_lineage(
     template_uuid: uuid::Uuid,
-    instance: &pplx_space_common_core::host::btrfs::SubvolumeInfo,
-    snapshot: &pplx_space_common_core::host::btrfs::SubvolumeInfo,
+    instance: &pplx_space_btrfs::SubvolumeInfo,
+    snapshot: &pplx_space_btrfs::SubvolumeInfo,
 ) -> Result<(), Status> {
     if instance.parent_uuid != Some(template_uuid) {
         return Err(lineage_precondition(
@@ -1585,6 +1578,9 @@ fn create_sandbox_instance_subvolume(
 #[cfg(test)]
 #[path = "btrfs_delegation/create_instance_tests.rs"]
 mod create_instance_tests;
+
+#[path = "btrfs_delegation/staged_disk.rs"]
+mod staged_disk;
 
 fn delete_sandbox_instance_artifacts(
     sandbox_id: &str,

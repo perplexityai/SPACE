@@ -26,4 +26,12 @@ thiserror = { workspace = true }
 tonic = { workspace = true, default-features = false }
 
 # internal
-pplx-space-common-core = { workspace = true, features = ["serde"] }
+pplx-space-cluster-id = { workspace = true, features = ["serde"] }
+pplx-space-sandbox-model = { workspace = true, features = ["serde"] }
+pplx-space-env-vars = { workspace = true }
+pplx-space-network-roles = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+pplx-space-accounts = { workspace = true, features = ["serde"] }
+pplx-space-k8s-ids = { workspace = true, features = ["serde"] }
+pplx-space-node-model = { workspace = true }

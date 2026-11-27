@@ -22,9 +22,10 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519Claims, ed25519::SpaceApiRouteEd25519Error,
     ed25519::SpaceApiRouteEd25519Verifier, ed25519::space_api_route_ed25519_token_from_metadata,
 };
-use pplx_space_common_core::types::{GuestPort, SandboxId, SpaceApiRouteIdentity};
 use pplx_space_net_common::{EffectiveNetworkPolicyRef, NetworkPolicy};
+use pplx_space_network_roles::GuestPort;
 use pplx_space_sandbox_metrics::admission::AdmissionPermitOutcome;
+use pplx_space_sandbox_model::{SandboxId, SpaceApiRouteIdentity};
 use tonic::metadata::MetadataMap;
 
 mod resume_begin;
@@ -836,11 +837,16 @@ impl SandboxManagerService {
         // policy is unchanged.
         self.apply_network_policy_before_wake(sandbox_id, "resume")
             .await?;
-        let activation_admission_permit = self
+        // The in-flight token is held to the end of the resume: past the
+        // permit, through guest setup and the rollback pause a failed setup
+        // takes.
+        let (activation_admission_permit, _in_flight) = self
             .admit_vm_activation(ActivationAdmissionKind::ResidentResume, &sandbox.id)
-            .await?;
+            .await?
+            .into_parts();
         self.begin_resident_resume(&sandbox.id, activation_policy)
             .await?;
+        self.guest_auto_updates.activation(&sandbox.id);
         self.watchdog.record_lifecycle_edge(&sandbox.id).await;
 
         let mut node_client = connect_node(&self.node_manager)
@@ -1136,13 +1142,12 @@ impl SandboxManagerService {
         pid: u32,
         uid: u32,
     ) -> Result<crate::db::SandboxRow, Status> {
-        let uid = pplx_space_common_core::host::linux::gateway::sandbox_uid(
-            pplx_space_common_core::types::LinuxUid::new(uid),
-        )
-        .map(|owner| owner.get())
-        // Local runtimes and legacy gateways retain their registered identity.
-        // The exact PID/owner lookup below remains mandatory in either case.
-        .unwrap_or(uid);
+        let uid =
+            pplx_space_host_layout::gateway::sandbox_uid(pplx_space_linux_ids::LinuxUid::new(uid))
+                .map(|owner| owner.get())
+                // Local runtimes and legacy gateways retain their registered identity.
+                // The exact PID/owner lookup below remains mandatory in either case.
+                .unwrap_or(uid);
         let db = self.db_conn()?;
         let mut matches = crate::db::scan::by_peer(
             &db,

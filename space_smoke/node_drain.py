@@ -1,7 +1,7 @@
 """Both node-drain modes, proven on a real cluster.
 
 `smoke-kind-node-drain-gentle.sh` drained the worker hosting a live sandbox
-with a bodiless `:drain`, held it there through ~20 reconciler ticks, and
+with a bodiless `:drain`, held it there for 20 seconds, and
 asserted that nothing moved: the node is cordoned and parked in `draining`
 with `drain_mode = gentle`, the resident sandbox keeps its lifecycle, pod, pod
 UID, node pin and user-API access, no suspend snapshot appears, and the node
@@ -10,13 +10,12 @@ reaches `drained` only once the resident suspends of its own accord.
 opposite: the drain reconciler suspends the resident and restores it on the
 other worker. This module is both suites in typed form.
 
-Because the kind chart runs the drained-node terminator with a 1 s tick and
-the `kube-delete` backend, the node is guarded with the
-`space.pplx.net/drain-keep` operator override before either drain and
-asserted to stay `drained`. That gives the override its runtime coverage and
-leaves no tombstone behind, where the forced shell suite let the node be
-deleted and restarted kubelet to get it back. The terminator's own contracts
-are crate tests (`drained_node_terminator/tests.rs`,
+The kind chart enables the drained-node terminator's `kube-delete` backend,
+so the node is guarded with the `space.pplx.net/drain-keep` operator override
+before either drain. These scenarios observe convergence to `drained` with
+the Kubernetes node still present, then undrain it. They do not wait for the
+terminator's 60-second sweep; annotation-present and annotation-absent
+behavior is covered by crate tests (`drained_node_terminator/tests.rs`,
 `node_drain/kube_delete/kube_delete_tests.rs`). The control surface is
 [`NodeDrainControl`]; the compensations (undrain first, then drop the
 override, then uncordon) are armed before the drain is dispatched.
@@ -222,12 +221,12 @@ class NodeDrainAssertions:
         self._fixture.record("drain_mode", after.drain_mode)
 
     def expect_resident_untouched(self, *, hold_seconds: float = 20) -> None:
-        """Hold ~20 reconciler ticks; the node stays draining and nothing about the sandbox moves."""
+        """Observe the resident after a bounded hold under a gentle drain."""
 
         node, before, residency = self._node, self._placement_before, self._residency_before
         if node is None or before is None or residency is None:
             raise RuntimeError("drain_gently() must run before expect_resident_untouched()")
-        self._fixture.wait(hold_seconds, reason="for reconciler ticks under the gentle drain")
+        self._fixture.wait(hold_seconds, reason="to observe the resident under the gentle drain")
         now = self._admin_node(node.id)
         placement = self._control.sandbox_pod_placement(self.sandbox_id)
         after = self._control.sandbox_residency(self.sandbox_id)
@@ -299,12 +298,12 @@ class NodeDrainAssertions:
         self._fixture.record("evacuated_to", placement.node_name)
         return placement
 
-    def expect_drained_and_held(self, *, timeout: float = 120, hold_seconds: float = 5) -> None:
-        """Once the resident has left, the node reaches drained on its own and stays there."""
+    def expect_drained_node_present(self, *, timeout: float = 120) -> None:
+        """Observe drain convergence with the guarded Kubernetes node still present."""
 
         node = self._node
         if node is None:
-            raise RuntimeError("the drain must run before expect_drained_and_held()")
+            raise RuntimeError("the drain must run before expect_drained_node_present()")
         deadline = time.monotonic() + timeout
         while True:
             now = self._admin_node(node.id)
@@ -316,15 +315,12 @@ class NodeDrainAssertions:
                 drain_phase=now.drain_phase,
             )
             self._fixture.wait(1)
-        # The kind terminator ticks every second with the kube-delete backend;
-        # if the override were not honoured the node would already be gone.
-        self._fixture.wait(hold_seconds, reason="for terminator ticks under the drain-keep override")
-        held = self._admin_node(node.id)
+        present = self._control.kube_node_exists(node.k8s_node_name)
         self._fixture.verify(
-            held.drain_phase == "drained" and self._control.kube_node_exists(node.k8s_node_name),
-            "the drain-keep override did not hold the drained node",
-            drain_phase=held.drain_phase,
-            kube_node_present=self._control.kube_node_exists(node.k8s_node_name),
+            present,
+            "the Kubernetes node disappeared before the drained node could be undrained",
+            drain_phase=now.drain_phase,
+            kube_node_present=present,
         )
 
     def undrain(self, *, timeout: float = 30) -> None:
@@ -355,7 +351,7 @@ class NodeDrainAssertions:
         # The override outlives a failed undrain on purpose. `ResourceScope.close`
         # keeps unwinding after a critical compensation raises, so as two
         # compensations a failed `:undrain` would still clear the guard on a node
-        # that is still `drained`, and the one-second kind terminator could
+        # that is still `drained`, and the next terminator sweep could
         # delete the worker in that gap. Clearing only after the undrain returns
         # leaves the node guarded, drained and reported as a critical cleanup
         # failure for an operator instead.

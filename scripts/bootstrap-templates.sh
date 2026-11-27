@@ -47,6 +47,17 @@ command -v aws  >/dev/null 2>&1 || die "aws CLI is required"
 command -v jq   >/dev/null 2>&1 || die "jq is required"
 command -v psql >/dev/null 2>&1 || die "psql is required"
 
+# The rule that picks a digest's original release, shared with the internal
+# API, the API and the warm pool: a whole SQL predicate over a candidate row,
+# with `{release}` standing for the row's alias. Reading it here, rather than
+# spelling the rule again, keeps this script attaching its tag and storage
+# location to the release every other caller resolves.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DIGEST_ORIGINAL_SQL="$SCRIPT_DIR/../crates/l30_storage/template/release/original/src/digest_original.sql"
+[[ -r "$DIGEST_ORIGINAL_SQL" ]] || die "missing $DIGEST_ORIGINAL_SQL; run this script from a SPACE checkout"
+DIGEST_ORIGINAL="$(<"$DIGEST_ORIGINAL_SQL")"
+DIGEST_ORIGINAL="${DIGEST_ORIGINAL//\{release\}/r}"
+
 BUCKET="$TEMPLATE_BOOTSTRAP_BUCKET"
 FILTER="${TEMPLATE_BOOTSTRAP_FILTER:-*}"
 export AWS_REGION="${AWS_REGION:-us-east-1}"
@@ -96,9 +107,13 @@ register_template_in_postgres() {
   local storage_uri="$3"
 
   # psql `-v` + `:'name'` placeholders quote values safely; never
-  # interpolate bash $vars directly into the SQL body.
+  # interpolate bash $vars directly into the SQL body. `:digest_original` is
+  # the repository's own predicate, not a value, so it goes in unquoted.
   psql "$POSTGRES_CONNECTION_STRING" -v ON_ERROR_STOP=1 \
-    -v name="$name" -v hash="$hash" -v storage_uri="$storage_uri" <<'SQL'
+    -v name="$name" -v hash="$hash" -v storage_uri="$storage_uri" \
+    -v digest_original="$DIGEST_ORIGINAL" <<'SQL'
+BEGIN;
+
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM clusters WHERE singleton) THEN
@@ -131,18 +146,58 @@ ON CONFLICT (name) DO UPDATE
 SET org_id = COALESCE(templates.org_id, EXCLUDED.org_id)
 WHERE templates.org_id IS NULL;
 
-INSERT INTO template_releases (template_name, type, hash, org_id)
-SELECT :'name', 'fc', :'hash', org_id
+-- A release is unique per template, hash and execution environment, so a hash
+-- can have twins bound to other environments. This registration carries no
+-- execution metadata, so it inserts a release only when the digest has none
+-- under either spelling (bare `<hex>` beside `sha256:<hex>`). The tag and
+-- storage location below go to the digest's original, whichever spelling it's
+-- stored under. The internal API registers under this same template row lock
+-- and stamps created_at with clock_timestamp(), so the existence check can't
+-- race its insert and insert order is registration order.
+SELECT 1 FROM templates WHERE name = :'name' FOR UPDATE;
+
+INSERT INTO template_releases (template_name, type, hash, org_id, created_at)
+SELECT :'name', 'fc', :'hash', org_id, clock_timestamp()
 FROM templates
 WHERE name = :'name'
-ON CONFLICT (template_name, hash) DO UPDATE
-SET org_id = COALESCE(template_releases.org_id, EXCLUDED.org_id)
-WHERE template_releases.org_id IS NULL;
+  AND NOT EXISTS (
+    SELECT 1
+    FROM template_releases other
+    WHERE other.template_name = :'name'
+      AND other.hash IN (replace(:'hash', 'sha256:', ''),
+                         'sha256:' || replace(:'hash', 'sha256:', ''))
+  )
+ON CONFLICT DO NOTHING;
+
+-- An owner filled in later goes to every release of this spelling that has
+-- none, twins included.
+UPDATE template_releases
+SET org_id = templates.org_id
+FROM templates
+WHERE templates.name = :'name'
+  AND template_releases.template_name = :'name'
+  AND template_releases.hash = :'hash'
+  AND template_releases.org_id IS NULL;
+
+-- The digest's original can be stored under the other spelling, which the
+-- update above doesn't reach, so give it the template's owner here too.
+UPDATE template_releases r
+SET org_id = t.org_id
+FROM templates t
+WHERE t.name = :'name'
+  AND r.template_name = :'name'
+  AND r.hash IN (replace(:'hash', 'sha256:', ''),
+                 'sha256:' || replace(:'hash', 'sha256:', ''))
+  AND r.org_id IS NULL
+  AND :digest_original;
 
 INSERT INTO template_release_tags (template_release_id, template_name, tag)
-SELECT id, template_name, 'latest'
-FROM template_releases
-WHERE template_name = :'name' AND hash = :'hash'
+SELECT r.id, r.template_name, 'latest'
+FROM template_releases r
+WHERE r.template_name = :'name'
+  AND r.hash IN (replace(:'hash', 'sha256:', ''),
+                 'sha256:' || replace(:'hash', 'sha256:', ''))
+  AND :digest_original
 ON CONFLICT (template_name, tag) DO UPDATE
 SET template_release_id = EXCLUDED.template_release_id;
 
@@ -151,15 +206,20 @@ INSERT INTO template_release_storage_locations (
   storage_connection_string,
   org_id
 )
-SELECT id, :'storage_uri', org_id
-FROM template_releases
-WHERE template_name = :'name' AND hash = :'hash'
+SELECT r.id, :'storage_uri', r.org_id
+FROM template_releases r
+WHERE r.template_name = :'name'
+  AND r.hash IN (replace(:'hash', 'sha256:', ''),
+                 'sha256:' || replace(:'hash', 'sha256:', ''))
+  AND :digest_original
 ON CONFLICT (template_release_id, storage_connection_string) DO UPDATE
 SET org_id = COALESCE(
   template_release_storage_locations.org_id,
   EXCLUDED.org_id
 )
 WHERE template_release_storage_locations.org_id IS NULL;
+
+COMMIT;
 SQL
 }
 

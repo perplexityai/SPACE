@@ -3,8 +3,8 @@
 import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
-import { Alert, App, Button, Card, Descriptions, Result, Space, Table, Tag, Tooltip, Typography } from 'antd';
-import { ArrowLeftOutlined, ReloadOutlined } from '@ant-design/icons';
+import { Alert, App, Button, Card, Collapse, Descriptions, Result, Select, Space, Switch, Table, Tag, Tooltip, Typography, type TableColumnsType } from 'antd';
+import { ArrowLeftOutlined, EyeOutlined, ReloadOutlined } from '@ant-design/icons';
 
 import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
@@ -23,25 +23,71 @@ import {
   drainElapsedMs,
   drainHistory,
   formatDuration,
+  drainStage,
+  groupHolds,
   heartbeat,
   historyMayBeTruncated,
+  holdGatesLabel,
+  holdSentence,
   kubeNodePresence,
-  lifecycleCounts,
+  residencyLabel,
   terminateRefusal,
   type ActionRefusal,
   type AuditEventRow,
+  type NodeHold,
+  type NodeHoldsResponse,
 } from '@/lib/node-drain';
 import { TypedConfirmModal } from '@/components/typed-confirm-modal';
+import { DrainPreviewPanel } from '@/components/drain-preview';
+import { DrainProgressPanel, DrainProgressUnreadable, HoldPicker } from '@/components/drain-progress';
+import {
+  DRAIN_CHANGED,
+  HOLD_PRESETS,
+  controllerTerminateRefusal,
+  closesOnDrainChange,
+  drainSeen,
+  holdDeadlineMs,
+  holdWhy,
+  isV2Drain,
+  isV2DrainBody,
+  parseHoldSeconds,
+  readDrain,
+  shortenLengthens,
+  unknownEngine,
+  v2DrainBodyFor,
+  v2DrainRefusal,
+  v2HoldRefusal,
+  type DrainSeen,
+} from '@/lib/drain-progress';
+import {
+  DRAIN_PREVIEW_TIMEOUT_MS,
+  PREVIEW_TOOLTIP,
+  previewFailure,
+  previewPath,
+  type DrainPreview,
+  type PreviewFailure,
+} from '@/lib/drain-preview';
 import { serialReads, withTimeout, type SerialReads } from '@/lib/serial-reads';
 import { publicSandboxIdFromAny } from '@/lib/sandbox-id';
+import { STORED_LIFECYCLE_FILTER_STATES } from '@/lib/sandbox-lifecycle';
 import type { AdminNodeResponse, NodeHealthStatus } from '@/lib/types';
 import { cordonedText, runtimeInstallationLines } from '@/lib/node-state';
 
 const { Title, Text } = Typography;
 
+// `GET /v1/nodes/{id}/sandboxes?order=lifecycle_changed_desc`: every row that
+// names the node, newest lifecycle change first. An API without these
+// parameters ignores them and answers its first page by id, with
+// `next_after` and no `next_cursor` or change times.
 interface NodeSandboxPage {
-  sandboxes: { id: string; lifecycle: string; active_node_id: string | null; target_node_id: string | null }[];
-  next_after: string | null;
+  sandboxes: {
+    id: string;
+    lifecycle: string;
+    active_node_id: string | null;
+    target_node_id: string | null;
+    lifecycle_changed_at?: string;
+  }[];
+  next_cursor?: string | null;
 }
 
 function formatUnix(secs: number) {
@@ -49,9 +95,10 @@ function formatUnix(secs: number) {
 }
 
 // The node is re-read every NODE_POLL_MS while the tab is visible, so a drain
-// can be followed without Refresh. Its sandboxes and the audit log are larger
-// reads and follow every HISTORY_POLL_MS; the sandbox counts run a counting
-// query and follow every COUNTS_POLL_MS, like the nodes list's occupancy.
+// can be followed without Refresh. What holds the node, its sandboxes and the
+// audit log are larger reads and follow every HISTORY_POLL_MS; the sandbox
+// counts run a counting query and follow every COUNTS_POLL_MS, like the nodes
+// list's occupancy.
 //
 // Every read gives up after READ_TIMEOUT_MS, the sandbox page's bound
 // (`SANDBOX_READ_TIMEOUT_MS`), and then fails like any other: before the
@@ -97,14 +144,19 @@ export default function NodeDetailPage() {
   const countsReads = useRef(serialReads()).current;
   const pageReads = useRef(serialReads()).current;
   const eventsReads = useRef(serialReads()).current;
+  const holdsReads = useRef(serialReads()).current;
   const nodeRequest = useRef(0);
   const countsRequest = useRef(0);
   const pageRequest = useRef(0);
   const eventsRequest = useRef(0);
+  const holdsRequest = useRef(0);
   const nodeLoaded = useRef(false);
   // Set once a node read fails with 403 or 404: the page then shows "Node not
   // found" or the access error, and the interval stops reading.
   const nodeGone = useRef(false);
+  // Set once the holds read answers 403 or 404 (an API without the route
+  // answers 404): the panel says so and its poll stops.
+  const holdsGone = useRef(false);
   const [loadedAtMs, setLoadedAtMs] = useState<number | null>(null);
   // `error` replaces the page; `refreshError` keeps the last loaded node.
   const [error, setError] = useState<{ status: number | null; message: string } | null>(null);
@@ -115,10 +167,28 @@ export default function NodeDetailPage() {
   const [nowMs, setNowMs] = useState(() => Date.now());
   // The action waiting on a typed confirmation, and the last refused one.
   const [typedAction, setTypedAction] = useState<NodeAction | null>(null);
-  const [refusal, setRefusal] = useState<ActionRefusal | null>(null);
+  // The node's drain when the typed dialog opened: a confirm after it
+  // changed closes the dialog instead.
+  const [typedSeen, setTypedSeen] = useState<DrainSeen | null>(null);
+  // The hold a v2 drain's start or shorten asks for: a preset's seconds, or
+  // `custom` with the typed text.
+  const [holdChoice, setHoldChoice] = useState<number | 'custom'>(HOLD_PRESETS[1].seconds);
+  const [holdCustom, setHoldCustom] = useState('');
+  const [refusal, setRefusal] = useState<(ActionRefusal & { sandboxIds?: string[] }) | null>(null);
   const [events, setEvents] = useState<AuditEventRow[] | null>(null);
   const [eventsError, setEventsError] = useState<string | null>(null);
+  const [holds, setHolds] = useState<NodeHoldsResponse | null>(null);
+  const [holdsError, setHoldsError] = useState<{ status: number | null; message: string } | null>(null);
+  // The history's filters: lifecycles, and failed since the drain started.
+  const [historyLifecycles, setHistoryLifecycles] = useState<string[]>([]);
+  const [failedDuringDrain, setFailedDuringDrain] = useState(false);
   const busyRef = useRef(false);
+  // The last v2 drain preview of this node, which only the operator asks for.
+  const [preview, setPreview] = useState<DrainPreview | null>(null);
+  const [previewError, setPreviewError] = useState<PreviewFailure | null>(null);
+  const [previewing, setPreviewing] = useState(false);
+  const [previewedAt, setPreviewedAt] = useState<number | null>(null);
+  const previewRequest = useRef(0);
 
   // A poll tick skips while a read of the same kind is pending; any other
   // read waits for it.
@@ -168,11 +238,26 @@ export default function NodeDetailPage() {
       }));
   };
 
+  // The history's query: every row that names the node, newest lifecycle
+  // change first, narrowed by its filters. "Failed during this drain" is the
+  // failed rows whose lifecycle changed since the drain started; it replaces
+  // the lifecycle filter while it is on.
+  const drainStartedAt = node?.drain_started_at ?? null;
+  const failedOnly = failedDuringDrain && !!drainStartedAt;
+  const since = failedOnly ? drainStartedAt : null;
+  const historyKey = JSON.stringify([historyLifecycles, since]);
+  const historyParams = (after: string | undefined) => {
+    const params = new URLSearchParams({ order: 'lifecycle_changed_desc' });
+    for (const lifecycle of since ? ['failed'] : historyLifecycles) params.append('lifecycle', lifecycle);
+    if (since) params.set('changed_since', since);
+    if (after) params.set('cursor', after);
+    return params;
+  };
+
   // A poll keeps the rows on screen until its answer lands.
   const loadSandboxes = (after: string | undefined = cursor, mode: ReadMode = 'next') => {
     const request = pageRequest.current;
-    const params = new URLSearchParams();
-    if (after) params.set('after', after);
+    const params = historyParams(after);
     if (mode === 'next') {
       setPage(null);
       setPageError(null);
@@ -203,28 +288,67 @@ export default function NodeDetailPage() {
       }));
   };
 
+  // What the gates count against the node. A 403 or 404 stops the poll: the
+  // operator may not see the node, it is gone, or the API predates the route.
+  const loadHolds = (mode: ReadMode = 'next') => {
+    const request = holdsRequest.current;
+    return read(holdsReads, mode, () => get<NodeHoldsResponse>(`/v1/nodes/${id}/holds`)
+      .then((loaded) => {
+        if (request !== holdsRequest.current) return;
+        holdsGone.current = false;
+        setHolds(loaded);
+        setHoldsError(null);
+      })
+      .catch((err: any) => {
+        if (request !== holdsRequest.current) return;
+        const status = typeof err?.status === 'number' ? err.status : null;
+        if (status === 403 || status === 404) holdsGone.current = true;
+        setHoldsError({ status, message: err?.message || 'Failed to load what holds this node' });
+      }));
+  };
+
   const refreshAll = () => {
     void loadNode();
     void loadCounts();
+    if (holdsShown.current) void loadHolds();
     void loadSandboxes();
     void loadEvents();
   };
 
-  // The poll reads the page of sandboxes the operator is on. Set from an
-  // effect, since a ref must not be written during render.
+  // The poll, and the reload after an action, read the page of sandboxes the
+  // operator is on, with the filters on screen. Set from an effect, since a
+  // ref must not be written during render.
   const pollSandboxesRef = useRef(() => {});
-  const cursorRef = useRef<string | undefined>(undefined);
+  const reloadSandboxesRef = useRef(() => {});
   useEffect(() => {
     pollSandboxesRef.current = () => void loadSandboxes(cursor, 'poll');
-    cursorRef.current = cursor;
-  }, [id, cursor]);
+    reloadSandboxesRef.current = () => void loadSandboxes(cursor);
+  }, [id, cursor, historyKey]);
+
+  // Ending or restarting the drain clears "Failed during this drain" and the
+  // History's paging.
+  useEffect(() => {
+    setFailedDuringDrain(false);
+    setCursor(undefined);
+  }, [drainStartedAt]);
+
+  // Only worker and builder nodes show the holds panel, so only theirs are
+  // read: once the node's role is known, and on every poll after.
+  const holdsFor = node && (node.role === 'worker' || node.role === 'builder') ? node.id : null;
+  const holdsShown = useRef(false);
+  useEffect(() => {
+    holdsShown.current = holdsFor !== null;
+    if (holdsFor !== null) void loadHolds();
+  }, [holdsFor]);
 
   useEffect(() => {
     nodeRequest.current += 1;
     countsRequest.current += 1;
     eventsRequest.current += 1;
+    holdsRequest.current += 1;
     nodeLoaded.current = false;
     nodeGone.current = false;
+    holdsGone.current = false;
     setNode(null);
     setLoadedAtMs(null);
     setError(null);
@@ -233,7 +357,14 @@ export default function NodeDetailPage() {
     setCountsFailed(false);
     setEvents(null);
     setEventsError(null);
+    setHolds(null);
+    setHoldsError(null);
     setRefusal(null);
+    previewRequest.current += 1;
+    setPreview(null);
+    setPreviewError(null);
+    setPreviewing(false);
+    setPreviewedAt(null);
     void loadNode();
     void loadCounts();
     void loadEvents();
@@ -251,6 +382,7 @@ export default function NodeDetailPage() {
       if (ms % NODE_POLL_MS === 0) void loadNode('poll');
       if (ms % HISTORY_POLL_MS === 0) {
         void loadEvents('poll');
+        if (holdsShown.current && !holdsGone.current) void loadHolds('poll');
         pollSandboxesRef.current();
       }
       if (ms % COUNTS_POLL_MS === 0) void loadCounts('poll');
@@ -270,7 +402,7 @@ export default function NodeDetailPage() {
   useEffect(() => {
     pageRequest.current += 1;
     void loadSandboxes(cursor);
-  }, [id, cursor]);
+  }, [id, cursor, historyKey]);
 
   const showUploadResult = (result: ForceUploadResponse) => {
     const accepted = result.reuploaded.length;
@@ -302,6 +434,7 @@ export default function NodeDetailPage() {
     // Earlier reads describe the node before this action: drop them.
     nodeRequest.current += 1;
     countsRequest.current += 1;
+    holdsRequest.current += 1;
     try {
       const result = await adminApi.post<ForceUploadResponse | unknown>(`/v1/nodes/${id}:${item.action}`, item.body);
       if (item.action === 'force-upload-local-snapshots' && result && typeof result === 'object' && 'reuploaded' in result) {
@@ -310,7 +443,13 @@ export default function NodeDetailPage() {
         message.success(`${item.label} requested`);
       }
     } catch (err: any) {
-      const refused = item.action === 'terminate' ? terminateRefusal(err) : null;
+      const v2 = !!item.hold || isV2DrainBody(item.body);
+      // A hold body names no engine: refused on a node with no drain left,
+      // the drain it was for has ended.
+      const holdOnly = item.hold === 'shorten' || (v2 && !item.hold && !(item.body as { engine?: unknown }).engine);
+      const refused = item.action === 'terminate'
+        ? terminateRefusal(err)
+        : v2 ? (holdOnly ? v2HoldRefusal(err) : null) ?? v2DrainRefusal(err) : null;
       if (refused) {
         setRefusal(refused);
         message.error(refused.title);
@@ -319,11 +458,11 @@ export default function NodeDetailPage() {
       }
     } finally {
       // Some actions commit and then report an error: always reload, and
-      // keep the actions disabled until that read settles.
-      // The page the operator is on now, not the one at the click. An empty
-      // string is the first page: undefined would fall back to the closure's.
-      void loadSandboxes(cursorRef.current ?? '');
+      // keep the actions disabled until that read settles. The History reads
+      // the page and filters on screen now, not the ones at the click.
+      reloadSandboxesRef.current();
       void loadCounts();
+      if (holdsShown.current) void loadHolds();
       void loadEvents();
       await loadNode();
       busyRef.current = false;
@@ -331,8 +470,39 @@ export default function NodeDetailPage() {
     }
   };
 
+  // Read-only on the node, so it asks no confirmation and leaves the node's
+  // own reads alone.
+  const runPreview = () => {
+    const request = ++previewRequest.current;
+    setPreviewing(true);
+    setPreviewError(null);
+    withTimeout(DRAIN_PREVIEW_TIMEOUT_MS, (signal) => adminApi.get<DrainPreview>(previewPath(id), { signal }))
+      .then((loaded) => {
+        if (request !== previewRequest.current) return;
+        setPreview(loaded);
+        setPreviewedAt(Date.now());
+      })
+      .catch((err: unknown) => {
+        if (request === previewRequest.current) setPreviewError(previewFailure(err));
+      })
+      .finally(() => {
+        if (request === previewRequest.current) setPreviewing(false);
+      });
+  };
+
   const runAction = (item: NodeAction) => {
     if (item.typed) {
+      if (item.hold) {
+        setHoldChoice(HOLD_PRESETS[1].seconds);
+        setHoldCustom('');
+      }
+      if (node) {
+        setTypedSeen(drainSeen({
+          drain_engine: node.drain_engine,
+          drain_phase: node.drain_phase,
+          drain: isV2Drain(node) ? readDrain(node.drain) : null,
+        }));
+      }
       setTypedAction(item);
       return;
     }
@@ -367,13 +537,71 @@ export default function NodeDetailPage() {
   const status = node.status;
   const health: NodeHealthStatus | null = status?.health ?? null;
   const hasHealth = node.role === 'worker' || node.role === 'builder';
+  // Only a worker's node-api serves a drain preview.
+  const previewable = node.role === 'worker';
+  // A v2 drain, its cancel included, which has no phase, and its progress
+  // as the panel can read it; an engine this console doesn't know is named.
+  const v2Drain = isV2Drain(node);
+  const drain = v2Drain ? readDrain(node.drain) : null;
+  const otherEngine = unknownEngine(node);
+  // The cluster controller's refusal of the last `:terminate`, which
+  // returned the node to drained.
+  const terminateRefused = controllerTerminateRefusal(node);
+  // The hold a v2 start or shorten would send; null while the custom value
+  // isn't one.
+  const holdSeconds = holdChoice === 'custom' ? parseHoldSeconds(holdCustom) : holdChoice;
+  // A shorten that would end the drain later, which the API refuses.
+  // Without a readable drain the deadline isn't known, and the API decides.
+  const holdLengthens = typedAction?.hold === 'shorten' && holdSeconds !== null && drain
+    ? shortenLengthens(holdDeadlineMs(holdSeconds, node.drain_started_at, true, nowMs), drain.deadline)
+    : null;
   const cordoned = cordonedText(node.cordoned);
   const runtimeLines = runtimeInstallationLines(node.runtime_installations);
   const beat = heartbeat(node, nowMs);
   const elapsed = drainElapsedMs(node, nowMs);
   const kubeNode = kubeNodePresence(node);
   const history = events ? drainHistory(events, node.id) : [];
-  const residents = page ? lifecycleCounts(page.sandboxes) : [];
+  const actions = nodeActions(node, substrate);
+  const uploadAction = actions.find((item) => item.action === 'force-upload-local-snapshots');
+  const stage = drainStage(node);
+  const holdGroups = holds ? groupHolds(holds.holds, stage) : [];
+  const residency = holds ? residencyLabel(holds.residency_evidence) : null;
+  const terminateCounted = holds?.holds.filter((h) => h.counted_by.terminate).length ?? 0;
+  // Whether any term counts a row: the rows listed but not counted do not
+  // hold the node.
+  const heldByTerms = holds ? holds.term_counts.resident + holds.term_counts.drain_blocker + holds.term_counts.active_resident > 0 : false;
+  const nothingHolds = 'Nothing holds this node: no sandbox the drain or terminate counts.';
+  const age = (at: string) => formatDuration(nowMs - new Date(at).getTime());
+  // An API without the History's parameters answers no `next_cursor`.
+  const historyIgnored = page !== null && !('next_cursor' in page);
+  const holdColumns: TableColumnsType<NodeHold> = [
+    {
+      title: 'Sandbox', dataIndex: 'sandbox_id', width: 300,
+      render: (sid: string) => <Link href={`/dashboard/sandboxes/${publicSandboxIdFromAny(sid)}`}><code>{publicSandboxIdFromAny(sid)}</code></Link>,
+    },
+    {
+      title: 'Lifecycle', width: 190,
+      render: (_, h) => (
+        <Space size={4}>
+          <Tag>{h.lifecycle}</Tag>
+          <Tooltip title={`changed ${new Date(h.lifecycle_changed_at).toLocaleString()}`}><Text type="secondary">{age(h.lifecycle_changed_at)}</Text></Tooltip>
+        </Space>
+      ),
+    },
+    {
+      title: 'Why',
+      // A v2 drain's holds aren't the v1 drain's to act on: its progress
+      // panel says what it waits on.
+      render: (_, h) => holdWhy(node, () => holdSentence(h, nowMs, holds?.stuck_transient_after_secs ?? 600, stage, node.drain_phase)),
+    },
+    {
+      title: 'Counted by', width: 250,
+      render: (_, h) => {
+        const terms = Object.entries(h.terms).filter(([, on]) => on).map(([term]) => term);
+        return <Tooltip title={`Gate terms: ${terms.join(', ') || 'none'}. Placement on this node: ${h.placement.replace('_', ' ')}.`}>{holdGatesLabel(h)}</Tooltip>;
+      },
+    },
+  ];
 
   return (
     <Space orientation="vertical" size={16} style={{ width: '100%' }}>
@@ -382,16 +610,21 @@ export default function NodeDetailPage() {
           <Link href="/dashboard/nodes"><ArrowLeftOutlined /> Nodes</Link>
           <Title level={3} style={{ margin: 0 }}>{node.name || node.address || node.id}</Title>
           <Tag>{node.role}</Tag>
-          {node.drain_phase ? <Tag color="orange">{node.drain_phase} · {node.drain_mode ?? 'gentle'}</Tag> : null}
+          {node.drain_phase ? <Tag color="orange">{node.drain_phase} · {v2Drain ? 'v2' : otherEngine ?? node.drain_mode ?? 'gentle'}</Tag> : null}
           {node.cordoned ? <Tag color="orange">cordoned</Tag> : null}
           <Tag color={node.scheduling_status === 'ready' ? 'green' : 'default'}>{node.scheduling_status ?? 'unknown'}</Tag>
         </Space>
         <Space wrap>
-          {nodeActions(node, substrate).map((item) => (
+          {actions.map((item) => (
             <Button key={item.label} danger={item.dangerous} loading={busy === item.label} disabled={!!busy} onClick={() => runAction(item)}>
               {item.label}
             </Button>
           ))}
+          {previewable ? (
+            <Tooltip title={PREVIEW_TOOLTIP}>
+              <Button icon={<EyeOutlined />} loading={previewing} onClick={runPreview}>Preview v2 drain</Button>
+            </Tooltip>
+          ) : null}
           <Button icon={<ReloadOutlined />} onClick={refreshAll} disabled={!!busy}>Refresh</Button>
         </Space>
       </Space>
@@ -420,9 +653,34 @@ export default function NodeDetailPage() {
               closable={{ onClose: () => setRefusal(null) }}
               title={refusal.title}
               description={(
-                <ul style={{ margin: 0, paddingInlineStart: 20 }}>
-                  {refusal.reasons.map((reason) => <li key={reason}>{reason}</li>)}
-                </ul>
+                <>
+                  <ul style={{ margin: 0, paddingInlineStart: 20 }}>
+                    {refusal.reasons.map((reason) => <li key={reason}>{reason}</li>)}
+                  </ul>
+                  {refusal.sandboxIds?.length ? (
+                    <Space wrap size={4} style={{ marginTop: 8 }} data-testid="drain-refusal-sandboxes">
+                      {refusal.sandboxIds.map((sandboxId) => (
+                        <Link key={sandboxId} href={`/dashboard/sandboxes/${publicSandboxIdFromAny(sandboxId)}`}>
+                          {publicSandboxIdFromAny(sandboxId)}
+                        </Link>
+                      ))}
+                    </Space>
+                  ) : null}
+                  {refusal.counts ? (
+                    <div style={{ marginTop: 8 }}>
+                      <a href="#node-holds">See what holds this node</a>
+                      {holds ? (
+                        <Text>
+                          {' '}— the panel counts {holds.term_counts.active_resident} occupying and {holds.term_counts.drain_blocker} held for the node
+                          {holds.truncated ? '' : `, ${terminateCounted} sandbox${terminateCounted === 1 ? '' : 'es'} in all`}
+                          {holds.term_counts.active_resident === refusal.counts.active && holds.term_counts.drain_blocker === refusal.counts.blockers
+                            ? ', as the refusal did.'
+                            : `; the refusal counted ${refusal.counts.active} and ${refusal.counts.blockers}. They were read at different moments: Refresh to compare again.`}
+                        </Text>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </>
               )}
               style={{ marginBottom: 12 }}
             />
@@ -431,8 +689,13 @@ export default function NodeDetailPage() {
             <Descriptions.Item label="Phase">
               {node.drain_phase ? <Tag color={drainPhaseColor(node.drain_phase)}>{node.drain_phase}</Tag> : <Text type="secondary">not draining</Text>}
             </Descriptions.Item>
-            {/* A missing mode on a drain is gentle, as the API resolves it. */}
-            <Descriptions.Item label="Mode">{node.drain_phase ? node.drain_mode ?? 'gentle' : '—'}</Descriptions.Item>
+            {/* A missing mode on a drain is gentle, as the API resolves it. A v2
+                drain takes no mode. */}
+            {v2Drain || otherEngine ? (
+              <Descriptions.Item label="Engine">{otherEngine ?? 'v2'}</Descriptions.Item>
+            ) : (
+              <Descriptions.Item label="Mode">{node.drain_phase ? node.drain_mode ?? 'gentle' : '—'}</Descriptions.Item>
+            )}
             <Descriptions.Item label="Started">
               {node.drain_started_at
                 ? `${new Date(node.drain_started_at).toLocaleString()}${elapsed !== null ? ` (${formatDuration(elapsed)} ago)` : ''}`
@@ -463,19 +726,16 @@ export default function NodeDetailPage() {
                 <Text type="secondary">—</Text>
               )}
             </Descriptions.Item>
-            <Descriptions.Item label="Sandboxes on the node" span="filled">
-              {pageError ? (
-                <Text type="secondary">not loaded</Text>
-              ) : !page ? (
-                <Text type="secondary">loading</Text>
-              ) : residents.length ? (
+            <Descriptions.Item label="Holding the node" span="filled">
+              {!holds ? (
+                <Text type="secondary">{holdsError ? 'not loaded' : 'loading'}</Text>
+              ) : heldByTerms ? (
                 <Space size={4} wrap>
-                  {residents.map(([lifecycle, n]) => <Tag key={lifecycle}>{lifecycle} {n}</Tag>)}
-                  <a href="#node-sandboxes">listed below</a>
-                  {page.next_after || cursor ? <Text type="secondary">(this page of the list only)</Text> : null}
+                  {holdGroups.filter((group) => group.key !== 'not_counted').map((group) => <Tag key={group.key}>{group.title} {group.rows.length}</Tag>)}
+                  <a href="#node-holds">what holds it</a>
                 </Space>
               ) : (
-                <Text type="secondary">{cursor ? 'none on this page of the list' : 'none placed on this node'}</Text>
+                <Text type="secondary">{nothingHolds}</Text>
               )}
             </Descriptions.Item>
           </Descriptions>
@@ -522,6 +782,69 @@ export default function NodeDetailPage() {
             </Text>
           </Space>
         </Card>
+      ) : null}
+
+      {hasHealth ? (
+        <Card
+          size="small"
+          title="What holds this node"
+          id="node-holds"
+          extra={holds && residency ? (
+            <Space size={8} wrap>
+              <Tooltip title={residency.tooltip}><Tag>residency: {residency.label}</Tag></Tooltip>
+              <Text type="secondary">every {HISTORY_POLL_MS / 1000} s</Text>
+              <Button size="small" icon={<ReloadOutlined />} onClick={() => void loadHolds()}>Reload</Button>
+            </Space>
+          ) : null}
+        >
+          {holdsError ? (
+            <Alert
+              type={holds ? 'warning' : 'error'}
+              showIcon
+              title={holdsError.status === 404 && !holds ? 'This API does not list what holds a node' : `Could not load what holds this node: ${holdsError.message}`}
+              description={holds ? 'Showing them as last loaded.' : undefined}
+              action={<Button size="small" onClick={() => void loadHolds()}>Retry</Button>}
+              style={{ marginBottom: 8 }}
+            />
+          ) : null}
+          {!holds && !holdsError ? <Text type="secondary">Loading</Text> : null}
+          {holds && !heldByTerms ? <Text type="secondary">{nothingHolds}</Text> : null}
+          {holds?.truncated ? (
+            <Text type="warning">Listing the first {holds.holds.length} of {holds.total}; the group counts in the Drain section cover only those.</Text>
+          ) : null}
+          {holdGroups.map((group) => (
+            <div key={group.key} data-hold-group={group.key} style={{ marginTop: 12 }}>
+              <Space align="center" style={{ marginBottom: 4 }} wrap>
+                <Title level={5} style={{ margin: 0 }}>{group.title}</Title>
+                <Tag>{group.rows.length}</Tag>
+                {uploadAction && group.rows.some((h) => h.reason === 'local_only_snapshot') ? (
+                  <Button size="small" danger loading={busy === uploadAction.label} disabled={!!busy} onClick={() => runAction(uploadAction)}>
+                    {uploadAction.label}
+                  </Button>
+                ) : null}
+              </Space>
+              <Table size="small" rowKey="sandbox_id" pagination={false} dataSource={group.rows} columns={holdColumns} />
+            </div>
+          ))}
+          <Text type="secondary" style={{ display: 'block', marginTop: 12 }}>
+            The sandboxes the drain and terminate gates count against this node, as the API reads them now. The drain also waits for the evacuations it has in flight, which only the cluster-controller knows; a sandbox an evacuation is moving still shows here, as evacuating. Whether the drain also waits on a row only terminate counts depends on the cluster-controller&apos;s termination-blocking gate, which the API does not report.
+          </Text>
+        </Card>
+      ) : null}
+
+      {terminateRefused ? (
+        <Alert
+          type="warning"
+          showIcon
+          title={terminateRefused.title}
+          description={terminateRefused.reasons.map((reason) => <div key={reason}>{reason}</div>)}
+          style={{ marginBottom: 16 }}
+        />
+      ) : null}
+      {v2Drain ? (drain ? <DrainProgressPanel drain={drain} nowMs={nowMs} /> : <DrainProgressUnreadable />) : null}
+
+      {previewable && (preview || previewError || previewing) ? (
+        <DrainPreviewPanel preview={preview} failure={previewError} loading={previewing} previewedAt={previewedAt} />
       ) : null}
 
       <Card size="small" title="Node">
@@ -614,47 +937,98 @@ export default function NodeDetailPage() {
         </Card>
       ) : null}
 
-      <Card
-        size="small"
-        title="Sandboxes on this node"
-        id="node-sandboxes"
-        extra={
-          <Space>
-            <Button size="small" disabled={!cursor} onClick={() => setCursor(undefined)}>First page</Button>
-            <Button size="small" icon={<ReloadOutlined />} onClick={() => void loadSandboxes()}>Reload</Button>
-            <Button size="small" disabled={!page?.next_after} onClick={() => page?.next_after && setCursor(page.next_after)}>Next 100</Button>
-          </Space>
-        }
-      >
-        {pageError ? (
-          <Alert
-            type="error"
-            showIcon
-            title={`Could not load this node's sandboxes: ${pageError}`}
-            action={<Button size="small" onClick={() => void loadSandboxes()}>Retry</Button>}
-            style={{ marginBottom: 8 }}
-          />
-        ) : null}
-        <Table
-          size="small"
-          rowKey="id"
-          loading={page === null && !pageError}
-          dataSource={page?.sandboxes ?? []}
-          pagination={false}
-          locale={{ emptyText: pageError ? 'Not loaded' : 'No sandboxes placed on this node' }}
-          columns={[
-            {
-              title: 'Sandbox', dataIndex: 'id',
-              render: (sid: string) => <Link href={`/dashboard/sandboxes/${publicSandboxIdFromAny(sid)}`}><code>{publicSandboxIdFromAny(sid)}</code></Link>,
-            },
-            { title: 'Lifecycle', dataIndex: 'lifecycle', width: 140, render: (v: string) => <Tag>{v}</Tag> },
-            {
-              title: 'Placement', width: 160,
-              render: (_, row) => [row.active_node_id === node.id ? 'active' : '', row.target_node_id === node.id ? 'target' : ''].filter(Boolean).join(', '),
-            },
-          ]}
+      <div id="node-sandboxes">
+        <Collapse
+          items={[{
+            key: 'history',
+            label: 'History: every sandbox that names this node, newest change first',
+            children: (
+              <>
+                <Space wrap style={{ marginBottom: 8, width: '100%', justifyContent: 'space-between' }}>
+                  <Space wrap>
+                    <Select
+                      mode="multiple"
+                      allowClear
+                      aria-label="Lifecycle filter"
+                      placeholder="Any lifecycle"
+                      style={{ minWidth: 260 }}
+                      disabled={failedOnly}
+                      value={historyLifecycles}
+                      options={STORED_LIFECYCLE_FILTER_STATES.map((value) => ({ value, label: value }))}
+                      onChange={(values: string[]) => {
+                        setHistoryLifecycles(values);
+                        setCursor(undefined);
+                      }}
+                    />
+                    <Tooltip title={drainStartedAt ? `Failed sandboxes whose lifecycle changed since ${new Date(drainStartedAt).toLocaleString()}, when the drain started.` : 'The node is not draining.'}>
+                      <Space size={4}>
+                        <Switch
+                          size="small"
+                          aria-label="Failed during this drain"
+                          checked={failedOnly}
+                          disabled={!drainStartedAt}
+                          onChange={(on) => {
+                            setFailedDuringDrain(on);
+                            setCursor(undefined);
+                          }}
+                        />
+                        <Text>Failed during this drain</Text>
+                      </Space>
+                    </Tooltip>
+                  </Space>
+                  <Space>
+                    <Button size="small" disabled={!cursor} onClick={() => setCursor(undefined)}>First page</Button>
+                    <Button size="small" icon={<ReloadOutlined />} onClick={() => void loadSandboxes()}>Reload</Button>
+                    <Button size="small" disabled={!page?.next_cursor} onClick={() => page?.next_cursor && setCursor(page.next_cursor)}>Next 100</Button>
+                  </Space>
+                </Space>
+                {historyIgnored ? (
+                  <Alert
+                    type="warning"
+                    showIcon
+                    title="This API ignores the History's order, filters and paging: the list shows the node's first 100 sandboxes by id, unfiltered."
+                    style={{ marginBottom: 8 }}
+                  />
+                ) : null}
+                {pageError ? (
+                  <Alert
+                    type="error"
+                    showIcon
+                    title={`Could not load this node's sandboxes: ${pageError}`}
+                    action={<Button size="small" onClick={() => void loadSandboxes()}>Retry</Button>}
+                    style={{ marginBottom: 8 }}
+                  />
+                ) : null}
+                <Table
+                  size="small"
+                  rowKey="id"
+                  loading={page === null && !pageError}
+                  dataSource={page?.sandboxes ?? []}
+                  pagination={false}
+                  locale={{ emptyText: pageError ? 'Not loaded' : historyLifecycles.length || failedOnly ? 'No sandboxes match the filter' : 'No sandboxes placed on this node' }}
+                  columns={[
+                    {
+                      title: 'Sandbox', dataIndex: 'id',
+                      render: (sid: string) => <Link href={`/dashboard/sandboxes/${publicSandboxIdFromAny(sid)}`}><code>{publicSandboxIdFromAny(sid)}</code></Link>,
+                    },
+                    { title: 'Lifecycle', dataIndex: 'lifecycle', width: 140, render: (v: string) => <Tag>{v}</Tag> },
+                    {
+                      title: 'Changed', dataIndex: 'lifecycle_changed_at', width: 160,
+                      render: (v: string | undefined) => (v !== undefined && Number.isFinite(Date.parse(v))
+                        ? <Tooltip title={new Date(v).toLocaleString()}>{age(v)} ago</Tooltip>
+                        : '—'),
+                    },
+                    {
+                      title: 'Placement', width: 160,
+                      render: (_, row) => [row.active_node_id === node.id ? 'active' : '', row.target_node_id === node.id ? 'target' : ''].filter(Boolean).join(', '),
+                    },
+                  ]}
+                />
+              </>
+            ),
+          }]}
         />
-      </Card>
+      </div>
 
       <TypedConfirmModal
         open={typedAction !== null}
@@ -663,12 +1037,38 @@ export default function NodeDetailPage() {
         phrase={confirmationPhrase(node)}
         okText={typedAction?.label ?? 'OK'}
         onCancel={() => setTypedAction(null)}
+        ready={!typedAction?.hold || (holdSeconds !== null && holdLengthens === null)}
         onConfirm={async () => {
           if (!typedAction) return;
-          await send(typedAction);
+          if (typedSeen && closesOnDrainChange(typedAction, typedSeen, drainSeen({ drain_engine: node.drain_engine, drain_phase: node.drain_phase, drain }))) {
+            message.warning(DRAIN_CHANGED);
+            setTypedAction(null);
+            return;
+          }
+          if (typedAction.hold) {
+            if (holdSeconds === null) return;
+            await send({ ...typedAction, body: v2DrainBodyFor(typedAction.hold, holdSeconds) });
+          } else {
+            await send(typedAction);
+          }
           setTypedAction(null);
         }}
-      />
+      >
+        {typedAction?.hold ? (
+          <HoldPicker
+            shorten={typedAction.hold === 'shorten'}
+            startedAt={node.drain_started_at}
+            currentDeadline={drain ? drain.deadline : undefined}
+            nowMs={nowMs}
+            choice={holdChoice}
+            custom={holdCustom}
+            onChange={(choice, custom) => {
+              setHoldChoice(choice);
+              setHoldCustom(custom);
+            }}
+          />
+        ) : null}
+      </TypedConfirmModal>
     </Space>
   );
 }

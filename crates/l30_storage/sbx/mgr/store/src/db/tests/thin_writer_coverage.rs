@@ -4,10 +4,12 @@
 
 use crate::db::Connection;
 use crate::state::SandboxStatus;
-use pplx_space_common_core::types::{
-    LocalArtifactId, RuntimeKind, SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineNextAction,
-    SandboxQuarantineReasonCode, SandboxQuarantineSource, TransferScopeId,
+use pplx_space_execution_spec::RuntimeKind;
+use pplx_space_sandbox_model::{
+    SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
+    SandboxQuarantineSource,
 };
+use pplx_space_snapshot_model::{LocalArtifactId, TransferScopeId};
 use rusqlite::params;
 
 use super::accepted_shapes_quarantine::{adoptable, insert_claimed_adoptable};
@@ -989,8 +991,8 @@ fn quarantine_adoption_binds_the_quarantined_full_suspend_pin_and_generation() {
 fn suspended_cleanup_pin_reuses_a_staged_identity_and_keeps_its_backup_marker() {
     let conn = test_conn();
     let id = insert_row(&conn, SandboxState::Paused);
-    begin_teardown_suspend(&conn, &id, generation(7)).unwrap();
     let staged = LocalArtifactId::new();
+    begin_teardown_suspend(&conn, &id, generation(7), staged).unwrap();
     stage_teardown_suspend_artifact(&conn, &id, generation(7), staged, "/cache/staged/snapshot")
         .unwrap();
     mark_local_artifact_backup_completed(&conn, &staged.to_string()).unwrap();

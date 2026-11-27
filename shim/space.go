@@ -87,8 +87,16 @@ const (
 	sandboxOwnerAnnotation                       = "space.pplx.net/sandbox-owner"
 	sandboxUserAnnotation                        = "space.pplx.net/sandbox-user"
 	sandboxVolumeEncryptionAnnotation            = "space.pplx.net/volume-encryption"
-	kubernetesPodUIDAnnotation                   = "io.kubernetes.pod.uid"
-	kubernetesCriSandboxUIDAnnotation            = "io.kubernetes.cri.sandbox-uid"
+	// The environment a bound pod's work runs under, and whether the
+	// environment placement gate requires it. They mirror
+	// SANDBOX_ENVIRONMENT_ANNOTATION and
+	// SANDBOX_ENVIRONMENT_REQUIRED_ANNOTATION in
+	// crates/l40_api/sandbox/pod/src/environment_labels.rs, which renders
+	// them. The shim reads the environment only when it's required.
+	sandboxEnvironmentAnnotation         = "space.pplx.net/environment"
+	sandboxEnvironmentRequiredAnnotation = "space.pplx.net/environment-required"
+	kubernetesPodUIDAnnotation           = "io.kubernetes.pod.uid"
+	kubernetesCriSandboxUIDAnnotation    = "io.kubernetes.cri.sandbox-uid"
 
 	sandboxStateMaxAttempts       = 3
 	sandboxStateRetryDelay        = 100 * time.Millisecond
@@ -297,18 +305,22 @@ type task struct {
 	sandboxDetached     bool   // sbx-manager released this execution; teardown never polls it again
 	materializedStopped bool   // the sandbox was staged stopped with no VM; nothing may wake it through this pod
 	legacyStopIssued    bool   // this task initiated the stop preceding legacy deletion
-	releasedAfterExit   bool   // release proof arrived after the VM exited; Kill re-announces the exit
-	containerID         string // OCI container type
-	pid                 int
-	podIP               string
-	netnsPath           string
-	status              tasktypes.Status
-	exitCode            uint32
-	exitedAt            time.Time
-	bundle              string
-	stdout              *os.File
-	stderr              *os.File
-	execs               map[string]*execProcess
+	// exitDeleteRefused records that a Delete of this stopped task ended
+	// without sbx-manager's release, refused or unreachable. containerd v2.1
+	// doesn't retry that exit-path Delete, so Kill retries its release instead.
+	exitDeleteRefused bool
+	releasedAfterExit bool   // release proof arrived after the VM exited; Kill re-announces the exit
+	containerID       string // OCI container type
+	pid               int
+	podIP             string
+	netnsPath         string
+	status            tasktypes.Status
+	exitCode          uint32
+	exitedAt          time.Time
+	bundle            string
+	stdout            *os.File
+	stderr            *os.File
+	execs             map[string]*execProcess
 }
 
 type execProcess struct {
@@ -586,7 +598,9 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 			case materializeStopped || (sandboxCheckpoint != nil && *sandboxCheckpoint == "stopped" && startRequest.Checkpoint != nil):
 				startResp, err = startStoppedCheckpoint(startCtx, client, startRequest)
 			default:
-				startResp, err = client.Start(startCtx, startRequest)
+				startResp, err = callPastUnreadableSeal(startCtx, func(ctx context.Context) (*pb.StartResponse, error) {
+					return client.Start(ctx, startRequest)
+				})
 			}
 		}
 		startSpanSbxmgr.End(err)
@@ -660,6 +674,11 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 		emitShimStepError("create", "parse_volume_encryption", "parse_volume_encryption", err)
 		return nil, status.Errorf(codes.InvalidArgument, "parse sandbox volume encryption: %v", err)
 	}
+	requiredEnvironment, err := spec.sandboxRequiredEnvironment()
+	if err != nil {
+		emitShimStepError("create", "parse_required_environment", "parse_required_environment", err)
+		return nil, status.Errorf(codes.InvalidArgument, "parse sandbox required environment: %v", err)
+	}
 	// Only a cold create seeds the manager's policy; restores keep the stored one.
 	sandboxNetworkPolicy, err := spec.sandboxNetworkPolicy()
 	if err != nil {
@@ -691,6 +710,19 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 	}
 	if requestedSandboxID != nil {
 		createReq.SandboxId = ptr(requestedSandboxID.String())
+	}
+	if requiredEnvironment != nil {
+		if err := requireCreateRequiredEnvironmentSupport(ctx, conn); err != nil {
+			emitShimStepError("create", "required_environment_support", "required_environment_support", err)
+			return nil, err
+		}
+		createReq.RequiredEnvironment = requiredEnvironment
+		// The required build's binding names the runtime, so the create
+		// names none. A sandbox-manager that predates required_environment
+		// drops it and then refuses a create without a runtime, rather than
+		// boot whichever build it prefers. That closes the window between the
+		// probe above and this create, if a rollback swaps the manager.
+		createReq.Runtime = ""
 	}
 	createRPCStartedAt := time.Now()
 	createSpan, createCtx := startSpan(ctx, "shim.sbxmgr.create", attribute.String("template", sandboxTemplate))
@@ -733,7 +765,7 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 		attribute.String("template", sandboxTemplate),
 		attribute.String("sandbox_id", sbxID),
 	)
-	_, err = client.Wake(wakeCtx, &pb.WakeRequest{
+	wakeRequest := &pb.WakeRequest{
 		SandboxId: sbxID,
 		Blocking:  false,
 		StartContext: &pb.WakeStartContext{
@@ -748,6 +780,9 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 				sandboxActivationAttemptID,
 			),
 		},
+	}
+	_, err = callPastUnreadableSeal(wakeCtx, func(ctx context.Context) (*pb.WakeResponse, error) {
+		return client.Wake(ctx, wakeRequest)
 	})
 	wakeSpanSbxmgr.End(err)
 	redirect := <-redirectCh
@@ -852,6 +887,7 @@ type taskTeardownIdentity struct {
 	generationTeardown  bool
 	sandboxDetached     bool
 	legacyStopIssued    bool
+	exitDeleteRefused   bool
 }
 
 func (task *task) teardownIdentity() taskTeardownIdentity {
@@ -861,6 +897,7 @@ func (task *task) teardownIdentity() taskTeardownIdentity {
 		generationTeardown:  task.generationTeardown,
 		sandboxDetached:     task.sandboxDetached,
 		legacyStopIssued:    task.legacyStopIssued,
+		exitDeleteRefused:   task.exitDeleteRefused,
 	}
 }
 
@@ -1122,7 +1159,18 @@ func releaseLegacyTaskTeardown(ctx context.Context, client pb.SandboxManagerClie
 		if stopRefused(err, trailer) && recordStopIssued != nil {
 			recordStopIssued(identity.legacyStopIssued)
 		}
+		// Durable deletion may finish while the Stop runs, as for Delete.
+		if status.Code(err) == codes.NotFound {
+			return true, nil
+		}
 	case "delete":
+		// A retried release only observes. The id-only Delete carries no
+		// execution, and by the retry the row may belong to a successor
+		// execution started in another pod, so the task waits for the row to
+		// go or be handed off instead.
+		if identity.exitDeleteRefused {
+			return false, status.Error(codes.FailedPrecondition, "sbx-manager still holds the sandbox; a retried exit release doesn't resend its delete")
+		}
 		_, err = client.Delete(ctx, &pb.DeleteRequest{SandboxId: identity.sandboxID})
 		// Durable deletion may finish after State observed the live sandbox.
 		if status.Code(err) == codes.NotFound {
@@ -1248,6 +1296,43 @@ func startStoppedCheckpoint(ctx context.Context, client pb.SandboxManagerClient,
 	}
 }
 
+// sandbox-manager refuses every VM activation with this marker, as
+// Unavailable, while it can't read its activation seal, and reads the seal
+// again within seconds.
+const activationSealUnreadableMarker = "activation seal unreadable; retrying"
+
+const (
+	// The longest a call waits for sandbox-manager to read its activation
+	// seal again before it answers the refusal.
+	activationSealUnreadableWait = 30 * time.Second
+	// The first and the longest wait between two calls.
+	activationSealRetryInitial = 100 * time.Millisecond
+	activationSealRetryMax     = 2 * time.Second
+)
+
+// callPastUnreadableSeal makes call, and makes it again, with the same
+// request, while sandbox-manager refuses the activation because it can't
+// read its activation seal: after 100 ms, then twice as long each time up to
+// 2 s, for at most activationSealUnreadableWait and never past ctx's
+// deadline. Each call keeps ctx's own deadline. Any other answer, a sealed
+// node's FailedPrecondition or another Unavailable included, is returned at
+// once.
+func callPastUnreadableSeal[T any](ctx context.Context, call func(context.Context) (T, error)) (T, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, activationSealUnreadableWait)
+	defer cancel()
+	delay := activationSealRetryInitial
+	for {
+		response, err := call(ctx)
+		if status.Code(err) != codes.Unavailable || !strings.Contains(status.Convert(err).Message(), activationSealUnreadableMarker) {
+			return response, err
+		}
+		if sleepContext(waitCtx, delay) != nil {
+			return response, err
+		}
+		delay = min(2*delay, activationSealRetryMax)
+	}
+}
+
 func retryableSandboxStatusError(err error) bool {
 	switch status.Code(err) {
 	case codes.Unavailable, codes.DeadlineExceeded, codes.ResourceExhausted, codes.Aborted:
@@ -1316,27 +1401,51 @@ func (s *spaceTaskService) waitForTaskTeardownRelease(
 	// when a pod sits in Terminating.
 	if err != nil {
 		logShim("%s: task %s keeps running because sbx-manager has not released it (%s); containerd will retry: %v", operation, taskID, identity.logContext(), err)
+		s.markExitDeleteUnreleased(operation, taskID, expected)
 	}
 	return detach, err
 }
 
+// The health services naming sandbox-manager capabilities the shim probes
+// for. They mirror ACTIVATION_POLICY_HEALTH_SERVICE and
+// CREATE_REQUIRED_ENVIRONMENT_HEALTH_SERVICE in
+// crates/l20_domain/sbx/mgr/protocol/src/lib.rs.
+const (
+	activationPolicyCapability          = "space.sandbox-manager.capability.activation-policy.v1"
+	createRequiredEnvironmentCapability = "space.sandbox-manager.capability.create-required-environment.v1"
+)
+
 // Probe the same connection used by Start, without caching across reconnects.
 // An old worker would otherwise accept Start and silently discard its policy.
 func requireActivationPolicySupport(ctx context.Context, connection io.Closer) error {
+	return requireSandboxManagerCapability(ctx, connection, activationPolicyCapability, "activation policy")
+}
+
+// Probe the connection Create uses. An old worker would otherwise accept the
+// create, ignore its required environment and boot whichever build of the
+// digest it prefers.
+func requireCreateRequiredEnvironmentSupport(ctx context.Context, connection io.Closer) error {
+	return requireSandboxManagerCapability(ctx, connection, createRequiredEnvironmentCapability, "a create's required environment")
+}
+
+// requireSandboxManagerCapability fails with Unavailable unless the
+// sandbox-manager on connection serves the health service that names a
+// capability. what names the capability in the error.
+func requireSandboxManagerCapability(ctx context.Context, connection io.Closer, service, what string) error {
 	channel, ok := connection.(grpc.ClientConnInterface)
 	if !ok {
-		return status.Error(codes.Internal, "sandbox-manager connection cannot check activation policy support")
+		return status.Errorf(codes.Internal, "sandbox-manager connection cannot check support for %s", what)
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	response, err := healthpb.NewHealthClient(channel).Check(ctx, &healthpb.HealthCheckRequest{
-		Service: "space.sandbox-manager.capability.activation-policy.v1",
+		Service: service,
 	})
 	if err != nil {
-		return status.Errorf(codes.Unavailable, "sandbox-manager activation policy support: %v", err)
+		return status.Errorf(codes.Unavailable, "sandbox-manager support for %s: %v", what, err)
 	}
 	if response.GetStatus() != healthpb.HealthCheckResponse_SERVING {
-		return status.Error(codes.Unavailable, "sandbox-manager does not support activation policy")
+		return status.Errorf(codes.Unavailable, "sandbox-manager does not support %s", what)
 	}
 	return nil
 }
@@ -1350,6 +1459,20 @@ func (s *spaceTaskService) sandboxManagerClient() (pb.SandboxManagerClient, io.C
 		return nil, nil, err
 	}
 	return pb.NewSandboxManagerClient(conn), conn, nil
+}
+
+// markExitDeleteUnreleased records that a Delete of a stopped task ended
+// without sbx-manager's release, refused or unreachable, so a later Kill
+// retries the release that containerd won't.
+func (s *spaceTaskService) markExitDeleteUnreleased(operation, taskID string, expected *task) {
+	if operation != "delete" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if current, ok := s.tasks[taskID]; ok && current == expected && current.status == tasktypes.Status_STOPPED {
+		current.exitDeleteRefused = true
+	}
 }
 
 func (s *spaceTaskService) mutateTaskAfterTeardownRelease(
@@ -1372,6 +1495,7 @@ func (s *spaceTaskService) mutateTaskAfterTeardownRelease(
 			identity := expected.teardownIdentity()
 			s.mu.Unlock()
 			logShim("%s: task %s keeps running because sbx-manager is unreachable (%s); containerd will retry: %v", operation, taskID, identity.logContext(), err)
+			s.markExitDeleteUnreleased(operation, taskID, expected)
 			return false, status.Errorf(codes.Unavailable, "connect to sbx-manager during task %s: %v", operation, err)
 		}
 		defer func() {
@@ -1538,9 +1662,11 @@ func (s *spaceTaskService) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ 
 	needsTeardown := t.sandboxID != "" && !t.sandboxDetached
 	// A VM that exits stops its task without release proof. containerd's
 	// exit-path Delete can time out before a slow durable suspend finishes,
-	// and its retries arrive here first, so a stopped generation task still
-	// waits for the release. Legacy and released tasks have nothing to wait for.
-	if t.status == tasktypes.Status_STOPPED && !(needsTeardown && t.generationTeardown) {
+	// or be refused while sbx-manager still holds the sandbox, and its
+	// retries arrive here first, so a stopped generation task still waits for
+	// the release, as does a legacy one whose Delete was refused. Other legacy
+	// and released tasks have nothing to wait for.
+	if t.status == tasktypes.Status_STOPPED && !(needsTeardown && (t.generationTeardown || t.exitDeleteRefused)) {
 		// Until Delete removes the task, containerd has not finished handling
 		// its exit, and an earlier announcement may have been lost.
 		var exit *eventstypes.TaskExit
@@ -1553,8 +1679,21 @@ func (s *spaceTaskService) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ 
 		}
 		return &ptypes.Empty{}, nil
 	}
+	operation := "kill"
 	if t.status == tasktypes.Status_STOPPED {
-		logShim("Kill: task %s stopped before sbx-manager released it; waiting for release", r.ID)
+		if t.generationTeardown {
+			logShim("Kill: task %s stopped before sbx-manager released it; waiting for release", r.ID)
+		} else {
+			// A legacy task's exit-path Delete is refused while sbx-manager
+			// holds the sandbox, such as a quarantined only copy, and
+			// containerd v2.1 doesn't retry it, so StopPodSandbox waits on a
+			// task nothing releases. Re-check that Delete's release here: a
+			// row that's gone (an operator discarded it) or handed off
+			// releases the task and its exit is re-announced; any other row
+			// keeps it, and the Delete isn't sent again.
+			logShim("Kill: legacy task %s stopped before sbx-manager released it; retrying its delete release", r.ID)
+			operation = "delete"
+		}
 	}
 	sandboxID := t.sandboxID
 	traceparent := t.traceparent
@@ -1577,7 +1716,7 @@ func (s *spaceTaskService) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ 
 	// suspend or has been superseded. Any inconclusive outcome leaves the task
 	// running so containerd can retry without destroying guest state.
 	var exit *eventstypes.TaskExit
-	_, err := s.mutateTaskAfterTeardownRelease(ctx, "kill", r.ID, t, needsTeardown, func(current *task) {
+	_, err := s.mutateTaskAfterTeardownRelease(ctx, operation, r.ID, t, needsTeardown, func(current *task) {
 		if current.status == tasktypes.Status_STOPPED {
 			// Overlapping Kills of one exited task each reach this point and
 			// each announce the exit; containerd handles a repeated exit of a
@@ -1875,24 +2014,28 @@ func (s *spaceTaskService) Stats(ctx context.Context, r *taskAPI.StatsRequest) (
 	}
 	s.mu.Unlock()
 
-	// Always return a typed cgroup v2 Metrics so containerd's CRI can
-	// typeurl.UnmarshalAny it without erroring. Missing data leaves the
-	// corresponding fields zero — we'd rather report zeros than fail
-	// kubelet's /stats/summary for the entire node.
-	metrics := &cgroupsv2.Metrics{
-		CPU:    &cgroupsv2.CPUStat{},
-		Memory: &cgroupsv2.MemoryStat{},
-		Pids:   &cgroupsv2.PidsStat{},
-	}
+	// Always return a typed cgroup v2 Metrics, the payload containerd's CRI
+	// decodes. A figure sandbox-manager could not read leaves its section
+	// absent, which CRI reports as no sample, rather than zero, which reads as
+	// an idle sandbox and, for the cumulative CPU counter, as a reset.
+	metrics := &cgroupsv2.Metrics{}
 	if sandboxID != "" {
-		if resp, err := fetchSandboxStats(ctx, sandboxID); err == nil {
-			metrics.CPU.UsageUsec = resp.CpuUsageUsec
-			metrics.Memory.Usage = resp.MemoryCurrent
-			metrics.Memory.UsageLimit = resp.MemoryMax
-			metrics.Pids.Current = resp.PidsCurrent
-			metrics.Pids.Limit = resp.PidsMax
-		} else {
-			logShim("Stats: sbx-manager Stats(%s) failed: %v", sandboxID, err)
+		resp, err := s.fetchSandboxStats(ctx, sandboxID)
+		switch {
+		case err != nil:
+			statsFailures.report(time.Now(), "Stats: sbx-manager Stats(%s) failed: %v", sandboxID, err)
+		case resp.MemoryCurrent == 0:
+			// A running VM always charges memory to its cgroup. Zero means
+			// sandbox-manager answered without the cgroup figures.
+			statsFailures.report(time.Now(), "Stats: sbx-manager Stats(%s) answered without cgroup figures", sandboxID)
+		default:
+			metrics.Memory = &cgroupsv2.MemoryStat{Usage: resp.MemoryCurrent, UsageLimit: resp.MemoryMax}
+			metrics.Pids = &cgroupsv2.PidsStat{Current: resp.PidsCurrent, Limit: resp.PidsMax}
+			// A running VM has used CPU time. Zero means the cgroup's
+			// cpu.stat had no usage line, so CPU is reported as no sample.
+			if resp.CpuUsageUsec != 0 {
+				metrics.CPU = &cgroupsv2.CPUStat{UsageUsec: resp.CpuUsageUsec}
+			}
 		}
 	}
 
@@ -1908,13 +2051,44 @@ func (s *spaceTaskService) Stats(ctx context.Context, r *taskAPI.StatsRequest) (
 	}, nil
 }
 
-func fetchSandboxStats(ctx context.Context, sandboxID string) (*pb.StatsResponse, error) {
-	conn, err := dialSbxManager()
+func (s *spaceTaskService) fetchSandboxStats(ctx context.Context, sandboxID string) (*pb.StatsResponse, error) {
+	client, closer, err := s.sandboxManagerClient()
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-	return pb.NewSandboxManagerClient(conn).Stats(ctx, &pb.StatsRequest{SandboxId: sandboxID})
+	defer closer.Close()
+	return client.Stats(ctx, &pb.StatsRequest{SandboxId: sandboxID})
+}
+
+// statsFailureLogInterval bounds how often one shim logs failed stats
+// samples. kubelet polls container stats every few seconds, so an outage of
+// sandbox-manager would otherwise log on every poll in every shim.
+const statsFailureLogInterval = time.Minute
+
+var statsFailures failureLog
+
+// failureLog logs at most one line per statsFailureLogInterval and counts
+// the failures it held back in the next line.
+type failureLog struct {
+	mu         sync.Mutex
+	logged     time.Time
+	suppressed int
+}
+
+func (l *failureLog) report(now time.Time, format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.logged.IsZero() && now.Sub(l.logged) < statsFailureLogInterval {
+		l.suppressed++
+		return
+	}
+	if l.suppressed > 0 {
+		format += " (%d more failed samples since the last log)"
+		args = append(args, l.suppressed)
+	}
+	logShim(format, args...)
+	l.logged = now
+	l.suppressed = 0
 }
 
 func (s *spaceTaskService) Pids(ctx context.Context, r *taskAPI.PidsRequest) (*taskAPI.PidsResponse, error) {
@@ -2557,6 +2731,26 @@ func (s *ociSpec) sandboxPodUID() *string {
 	return nil
 }
 
+// kubeletPodUID is the UID kubelet gave the pod, or nil outside Kubernetes.
+// Unlike sandboxPodUID it never reads space.pplx.net/pod-uid: the control
+// plane writes that annotation, so a replacement pod could carry an earlier
+// pod's value, while kubelet's UID is the pod's own and new for every pod.
+// The pod UID and CRI sandbox UID annotations both carry it; a pod whose two
+// disagree names no pod for certain, and is refused.
+func (s *ociSpec) kubeletPodUID() (*string, error) {
+	pod := strings.TrimSpace(s.Annotations[kubernetesPodUIDAnnotation])
+	cri := strings.TrimSpace(s.Annotations[kubernetesCriSandboxUIDAnnotation])
+	switch {
+	case pod != "" && cri != "" && pod != cri:
+		return nil, fmt.Errorf("%s %q and %s %q name different pods", kubernetesPodUIDAnnotation, pod, kubernetesCriSandboxUIDAnnotation, cri)
+	case pod != "":
+		return ptr(pod), nil
+	case cri != "":
+		return ptr(cri), nil
+	}
+	return nil, nil
+}
+
 func (s *ociSpec) sandboxOwner() (string, error) {
 	value := strings.TrimSpace(s.Annotations[sandboxOwnerAnnotation])
 	if value == "" {
@@ -2591,6 +2785,27 @@ func sandboxCreateBootMode(rootfsSizeMb *uint32) pb.BootMode {
 		return pb.BootMode_BOOT_MODE_COLD
 	}
 	return pb.BootMode_BOOT_MODE_UNSPECIFIED
+}
+
+// sandboxRequiredEnvironment is the environment a cold create must boot a
+// build of: the pod's environment annotation while its environment-required
+// annotation is "true", which the control plane renders only with the
+// environment placement gate on. In shadow the environment is recorded for
+// the census alone and the create names none, so the worker boots what it
+// would with the gate off. sbx-manager parses the reference.
+func (s *ociSpec) sandboxRequiredEnvironment() (*string, error) {
+	environment := strings.TrimSpace(s.Annotations[sandboxEnvironmentAnnotation])
+	switch required := strings.TrimSpace(s.Annotations[sandboxEnvironmentRequiredAnnotation]); required {
+	case "", "false":
+		return nil, nil
+	case "true":
+		if environment == "" {
+			return nil, fmt.Errorf("%s requires %s", sandboxEnvironmentRequiredAnnotation, sandboxEnvironmentAnnotation)
+		}
+		return &environment, nil
+	default:
+		return nil, fmt.Errorf("%s must be \"true\" or \"false\", not %q", sandboxEnvironmentRequiredAnnotation, required)
+	}
 }
 
 // sandboxVolumeEncryption reads the BYOK immutable encrypted-volumes flag.

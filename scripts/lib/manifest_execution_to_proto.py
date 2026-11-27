@@ -10,7 +10,7 @@ so a manifest whose schema does not vouch for its execution payload is an
 error, not a silent omission: exits non-zero with a message on stderr.
 
 The schema gate mirrors `TemplateManifest::execution_metadata()` in
-`crates/libs/common/core/src/types/template/manifest.rs`, and the value maps
+`crates/l20_domain/template/manifest/src/manifest.rs`, and the value maps
 mirror the enums in `proto/execution/v1/execution.proto`. Used by
 `infra/space/kind/scripts/seed-publish-entry.sh` (staged into the
 seed-publish Job image) and `scripts/space-upload-template.sh`.

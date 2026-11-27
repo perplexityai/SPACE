@@ -11,7 +11,7 @@ use axum::{
 use futures_util::StreamExt as _;
 use pplx_space_native_files::{
     FileOperation, admit_list_entry, list_depth, list_request, parse_guest_path, parse_guest_user,
-    public_file_info, read_request, stat_request, validate_read_length,
+    public_file_info, read_request, start_read, stat_request, validate_read_length,
 };
 use pplx_space_node_api_client::NodeApiOperationBudget;
 use pplx_space_public_api::{
@@ -52,10 +52,14 @@ pub(super) async fn read_file(
 
 async fn stat(state: &DataPlaneState, request: Request<Body>) -> Result<Response, Refusal> {
     const OPERATION: FileOperation = FileOperation::Stat;
-    let (request, body) = FileRequest::authorize(state, OPERATION, request).await?;
-    let body: FileStatRequest = json_body(&request, body).await?;
-    let user = parse_guest_user(body.user).map_err(rejected)?;
-    let path = parse_guest_path(body.path).map_err(rejected)?;
+    let (request, body) = FileRequest::receive(state, OPERATION, request).await?;
+    let checks = async {
+        let body: FileStatRequest = json_body(&request, body).await?;
+        let user = parse_guest_user(body.user).map_err(rejected)?;
+        let path = parse_guest_path(body.path).map_err(rejected)?;
+        Ok((user, path))
+    };
+    let (user, path) = request.checked(checks.await).await?;
     let call = SandboxCall::prepare(state, &request, None).await?;
     let message = stat_request(call.grant().sandbox_id, path, user.as_ref());
     let response = call
@@ -77,11 +81,15 @@ async fn stat(state: &DataPlaneState, request: Request<Body>) -> Result<Response
 
 async fn list(state: &DataPlaneState, request: Request<Body>) -> Result<Response, Refusal> {
     const OPERATION: FileOperation = FileOperation::List;
-    let (request, body) = FileRequest::authorize(state, OPERATION, request).await?;
-    let body: FileListRequest = json_body(&request, body).await?;
-    let depth = list_depth(body.depth).map_err(rejected)?;
-    let user = parse_guest_user(body.user).map_err(rejected)?;
-    let path = parse_guest_path(body.path).map_err(rejected)?;
+    let (request, body) = FileRequest::receive(state, OPERATION, request).await?;
+    let checks = async {
+        let body: FileListRequest = json_body(&request, body).await?;
+        let depth = list_depth(body.depth).map_err(rejected)?;
+        let user = parse_guest_user(body.user).map_err(rejected)?;
+        let path = parse_guest_path(body.path).map_err(rejected)?;
+        Ok((depth, user, path))
+    };
+    let (depth, user, path) = request.checked(checks.await).await?;
     let call = SandboxCall::prepare(state, &request, None).await?;
     let message = list_request(call.grant().sandbox_id, path, Some(depth), user.as_ref());
     let mut stream = call
@@ -107,19 +115,17 @@ async fn list(state: &DataPlaneState, request: Request<Body>) -> Result<Response
 
 async fn read(state: &DataPlaneState, request: Request<Body>) -> Result<Response, Refusal> {
     const OPERATION: FileOperation = FileOperation::Read;
-    let (request, body) = FileRequest::authorize(state, OPERATION, request).await?;
-    let body: FileReadRequest = json_body(&request, body).await?;
-    validate_read_length(body.length).map_err(rejected)?;
-    let user = parse_guest_user(body.user).map_err(rejected)?;
-    let path = parse_guest_path(body.path).map_err(rejected)?;
+    let (request, body) = FileRequest::receive(state, OPERATION, request).await?;
+    let checks = async {
+        let body: FileReadRequest = json_body(&request, body).await?;
+        validate_read_length(body.length).map_err(rejected)?;
+        let user = parse_guest_user(body.user).map_err(rejected)?;
+        let path = parse_guest_path(body.path).map_err(rejected)?;
+        Ok((body.offset, body.length, user, path))
+    };
+    let (offset, length, user, path) = request.checked(checks.await).await?;
     let call = SandboxCall::prepare(state, &request, None).await?;
-    let message = read_request(
-        call.grant().sandbox_id,
-        path,
-        body.offset,
-        body.length,
-        user.as_ref(),
-    );
+    let message = read_request(call.grant().sandbox_id, path, offset, length, user.as_ref());
     let stream = call
         .call(
             "spaced_read",
@@ -130,13 +136,21 @@ async fn read(state: &DataPlaneState, request: Request<Body>) -> Result<Response
         )
         .await
         .map_err(|failure| failure.into_refusal(OPERATION))?;
+    let stream = start_read(
+        stream,
+        NodeApiOperationBudget::FilesystemTransferOpen.timeout(),
+    )
+    .await
+    .map_err(|status| {
+        CallFailure::Worker(WorkerCallError::Status(status)).into_refusal(OPERATION)
+    })?;
     let stream = stream.map(|chunk| {
         chunk.map(|chunk| chunk.data).map_err(|status| {
             // The 200 and part of the body are already sent, so only the
             // aborted response tells the client. Record it on this side too.
             tracing::warn!(
                 code = ?status.code(),
-                message = status.message(),
+                grpc_message = status.message(),
                 "native file read failed mid-stream"
             );
             std::io::Error::other(status.message().to_owned())

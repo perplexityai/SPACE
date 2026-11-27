@@ -21,11 +21,20 @@ space-admin-cli warm-pool create --template NAME --vcpu N --memory-mib N \
   --target-ready-slots N --refill-per-tick N --max-warming-slots N
 space-admin-cli warm-pool add ...             # alias for warm-pool create
 space-admin-cli warm-pool update --template NAME@sha256:... --vcpu N ...
+space-admin-cli warm-pool disable <uuid> [--json]
+                                               DELETE /admin/api/v1/warm-pools/{pool_id}
 space-admin-cli runtime env list [--json]
 space-admin-cli runtime env default <environment> --reason TEXT [--strand] [--if-generation N] [--json]
 space-admin-cli runtime env state <environment> <allowed|deprecated|blocked> --reason TEXT [--strand] [--if-generation N] [--json]
 space-admin-cli runtime env nodes [--after NODE_ID | --all] [--json]
 space-admin-cli runtime env population [--json]
+space-admin-cli runtime campaign start --kind <templates|sandboxes> --from <environment> --to <environment> \
+  --wave-size N --failure-budget N --reason TEXT [--canary-size 0|1] [--per-node N] [--include-running] [--json]
+space-admin-cli runtime campaign pause <campaign> --reason TEXT [--if-generation N] [--json]
+space-admin-cli runtime campaign resume <campaign> --reason TEXT [--retry-failed] [--if-generation N] [--json]
+space-admin-cli runtime campaign abort <campaign> --reason TEXT [--if-generation N] [--json]
+space-admin-cli runtime campaign show <campaign> [--json]
+space-admin-cli runtime campaign list [--unfinished] [--json]
 ```
 
 `<node>` accepts a full UUID or a unique short prefix (≥4 chars). Prefix
@@ -49,6 +58,50 @@ takes the generation `runtime env list` showed and refuses the write if the
 policy has changed since, so a write from a stale read can't undo someone
 else's, such as re-allowing an environment another operator just blocked. See "Cluster desired policy" in
 [Execution environments](../../../../docs/execution-environments.md).
+
+`runtime campaign` starts and steers runtime upgrade campaigns through
+`/admin/api/v1/runtime-upgrade-campaigns`. A campaign moves one kind of subject,
+template releases or sandboxes, from the `--from` environment to the `--to`
+environment. `--wave-size` caps the items in flight across the cluster and
+`--per-node` caps them on any one node (default 1, at most the wave size). `--include-running` asks a
+sandbox campaign to take running and paused sandboxes too; the sandbox driver
+gives it its meaning, and a template campaign refuses it. A campaign starts in
+`canary`: it upgrades one subject at a time until one is done, then waits until
+you resume it. A canary whose items all fail or are skipped, under the failure
+budget, doesn't wait: it completes once its plan moves and a pass begins and
+ends with nothing pending or in flight and leases nothing. `--canary-size 0` starts the campaign
+`rolling` instead (only 0 and 1 are accepted). When its failed items reach
+`--failure-budget`, it pauses itself. An invalid `start` is refused with 400;
+a valid one is refused with 409 while no driver moves the kind yet or a
+conflicting campaign exists.
+
+Every write needs `--reason`, and the audit log records it. A start's is also
+recorded with you on the campaign.
+`pause` stops a `canary` or `rolling` campaign from leasing anything new;
+items already in flight finish under their leases. `resume` continues a paused
+campaign, or moves a canary whose item is done on to `rolling`. A resume goes
+to `rolling` once any item is done; with no done item it goes back to `canary`,
+whichever phase the campaign started in, so it upgrades one subject and waits
+again. A campaign at its failure budget isn't resumed as it is, since it would
+pause again on the next tick: `--retry-failed` returns its failed items to
+pending, with their attempts reset, so the budget counts only new failures.
+`abort` ends a `canary`, `rolling` or `paused` campaign for good. Nothing
+already upgraded is undone. Items in flight stop at their next lease renewal
+and go back to pending when their leases lapse; until then no other campaign
+upgrades those subjects. An upgrade that finishes before that renewal still
+records its outcome. A new campaign for the same source can start at once.
+`--if-generation` takes the generation `runtime campaign show` printed and
+refuses the change with 412 if the campaign has moved since. A change the
+campaign's phase doesn't allow is refused with 409, and that check comes
+first: pausing a campaign that has since paused itself answers 409, not 412.
+
+`show` prints a campaign's settings, phase, generation and item counts
+(pending, in flight, done, failed, skipped). For a sandbox campaign it also
+prints how many pending items are stranded: ones the campaign can't move
+because the catalog certifies no upgrade edge from the source environment to
+the target. A finished campaign moves nothing more and shows 0. `list` follows every page in creation order; `--unfinished` keeps
+only `canary`, `rolling` and `paused` campaigns, and `--json` prints every
+page's campaigns in one `campaigns` array.
 
 ## Install
 
@@ -259,8 +312,13 @@ pod can't be evacuated, so it keeps the node in `draining`. Find it like this:
   `DRAIN ERROR` column carries the last recorded error.
 - `get-node <node> --diagnostics` shows counts only (`Drain Gate Blockers`,
   `Live Residents`). The sandbox IDs come from
-  `GET /admin/api/v1/nodes/{node_id}/sandboxes`, 100 per page, continued with
-  `?after=`, or from the controller logs below.
+  `GET /admin/api/v1/nodes/{node_id}/holds`, which lists the rows those counts
+  count with the reason each holds the node, or from the controller logs
+  below. The holds list also carries rows the node's census discounts, with
+  every `terms` field false; compare only the rows whose `counted_by` names a
+  gate.
+  `GET /admin/api/v1/nodes/{node_id}/sandboxes` lists every row that
+  names the node, history included, 100 per page.
 - With the pod-less give-up off (the default), the controller logs
   `node_drain: sandbox evacuation (suspend) failed; will retry on next tick`
   every tick, with an error such as `sandbox is not assigned to a pod`, and
@@ -337,14 +395,51 @@ space-admin-cli warm-pool create \
 Use `--disabled` to write the config without allowing the reconciler to fill
 it yet, and `--json` to print the raw API response.
 
-A template can't be deleted while one of its pool configs or rolling policies
-is enabled, or while one of its pools still has slots. Disable each config with
-`warm-pool update ... --disabled` and each policy through the Admin API, and
-wait for the open slots to drain; a slot claimed by a create still in flight
+### Disable one config
+
+`warm-pool disable <uuid>` disables exactly one config through
+`DELETE /admin/api/v1/warm-pools/{pool_id}` and prints it. `<uuid>` must be the
+config's full UUID. Unlike `warm-pool get`, `disable` refuses ID prefixes and
+template references, even one that matches a single config. Config IDs are
+UUIDv7, which start with their creation time, so configs created close
+together, such as the ones one autoscaler pass creates, often share the
+8-character ID `warm-pool list` shows, and a prefix that names one config today
+can name another once the first is deleted. Copy the full ID from
+`warm-pool get <id-prefix|template-reference> --json` or
+`warm-pool list --json`. An unknown UUID gets the API's 404.
+
+```bash
+space-admin-cli warm-pool get my-template@sha256:a710c90b3897 --json
+space-admin-cli warm-pool disable 01937b2e-4c1a-7d3f-9a2b-5e6f7a8b9c0d
+```
+
+The API sets the config's `enabled` to false and its target ready slots to 0, so
+the reconciler drains its open slots. It leaves the config's other settings and
+its owner alone, which matters for a config a rolling policy created: while an
+enabled policy still selects that release, the autoscaler re-enables the config
+and sets its target from the policy again on its next pass. To make the disable
+stick, either disable the policy, after which a later autoscaler pass drains
+every config it manages across all its releases, or use
+`warm-pool update ... --disabled` on just this config, which takes it over as
+manual for good: the policy no longer manages that release and shape, even
+after you re-enable the config. Once a disabled autoscaler-owned config has no
+slots left, the autoscaler deletes it.
+
+Use `warm-pool disable` to turn off a config you've identified by ID. Use
+`warm-pool update ... --disabled` when you're also changing the config's sizing
+in the same write. That goes through the upsert, so it finds the config by
+template release, `--vcpu` and `--memory-mib` rather than by ID, needs every
+sizing flag restated, keeps the target you pass, and marks the config manually
+owned.
+
+A template can't be deleted while one of its pool configs or rolling policies is
+enabled, or while one of its pools still has slots. Disable each policy through
+the Admin API first, then each remaining config with `warm-pool disable <uuid>`,
+and wait for the open slots to drain; a slot claimed by a create still in flight
 settles within minutes. A slot held by a sandbox created from the pool clears
-only when that sandbox's pod is retired, for example when the sandbox is
-deleted or suspended. Then delete the template again, with a new
-`Idempotency-Key` if an earlier delete failed. The CLI has no template-delete
+only when that sandbox's pod is retired, for example when the sandbox is deleted
+or suspended. Then delete the template again, with a new `Idempotency-Key` if an
+earlier delete failed. The CLI has no template-delete
 command; see [Delete a template that has pools](../../../../docs/warm-pools.md#delete-a-template-that-has-pools).
 
 List configs:

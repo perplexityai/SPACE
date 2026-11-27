@@ -30,6 +30,7 @@ OPTIONS = {
     "SPACE_KIND_OTLP_METRICS_ENDPOINT",
     "SPACE_KIND_OTLP_TRACES_ENDPOINT",
     "SPACE_KIND_OBSERVABILITY",
+    "SPACE_KIND_OBSERVABILITY_LAYOUT",
 }
 PHASES = {"before-main", "after-datadog", "after-otel"}
 # Each mode's (SPACE_METRICS_SINK, SPACE_TRACE_EXPORTER), for the Rust
@@ -229,11 +230,15 @@ def configuration(env):
     observability = env.get("SPACE_KIND_OBSERVABILITY", "auto")
     if observability not in {"auto", "off"}:
         raise ValueError("SPACE_KIND_OBSERVABILITY must be auto or off")
+    layout = env.get("SPACE_KIND_OBSERVABILITY_LAYOUT", "full")
+    if layout not in {"full", "ci"}:
+        raise ValueError("SPACE_KIND_OBSERVABILITY_LAYOUT must be full or ci")
     config = {
         "mode": mode,
         "metrics_sink": metrics,
         "trace_exporter": traces,
         "observability": observability,
+        "observability_layout": layout,
         "install_observability": observability == "auto" and mode == "otel",
         "endpoints": endpoints,
         "local_signals": [signal for signal, endpoint in endpoints.items() if not endpoint],

@@ -2,7 +2,14 @@
 
 Build a pinned x86_64 Linux kernel from the checksum-pinned Firecracker CI base
 config and commit-pinned Amazon Linux source. The default is Linux 6.1.155 from
-Firecracker CI v1.15. No vendor fragment is required.
+Firecracker CI v1.15, with built-in nf_tables support for IPv4/IPv6 and inet-family
+filtering, connection tracking, reject rules, NAT, masquerade and redirect.
+This lets containers use modern
+`iptables-nft` with `NET_ADMIN` without requiring `NET_RAW` or switching to the
+legacy frontend. Legacy iptables also includes IPv4/IPv6 raw tables and
+comment, multiport, owner and mark matches. The build verifies these options
+after Kconfig resolution in both the default and optional profiles.
+No vendor fragment is required.
 
 ```bash
 ./templates/firecracker/kernel/build.sh

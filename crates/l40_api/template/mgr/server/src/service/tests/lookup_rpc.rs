@@ -20,7 +20,7 @@ impl Drop for LookupServer {
 #[case::local(Some(TemplateLookupScope::LocalExecution))]
 #[case::forwarded(Some(TemplateLookupScope::Node("127.0.0.2".parse().unwrap())))]
 #[case::sandbox(Some(TemplateLookupScope::Sandbox {
-    id: pplx_space_common_core::types::SandboxId::new(), caller_node: None
+    id: pplx_space_sandbox_model::SandboxId::new(), caller_node: None
 }))]
 #[tokio::test]
 async fn cached_lookup_preserves_offline_behavior_during_rollout(

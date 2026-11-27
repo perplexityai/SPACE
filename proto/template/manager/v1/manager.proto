@@ -62,6 +62,20 @@ service TemplateManager {
 
   // Persist and reconcile desired base-snapshot policy for a template.
   rpc UpdateTemplateSnapshotPolicy(UpdateTemplateSnapshotPolicyRequest) returns (UpdateTemplateSnapshotPolicyResponse);
+
+  // What this template-manager supports, for node-ctl to report. A server that
+  // predates it answers Unimplemented, which means it supports none of it.
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
+}
+
+message GetCapabilitiesRequest {}
+
+message GetCapabilitiesResponse {
+  // Whether a pull of a template twin's build reads the twin's own
+  // `environments/<environment>/metadata.json` and binds the build's shared
+  // `manifest.json` to it. node-ctl reports this as
+  // `NodeCtlStatus.reads_twin_metadata`.
+  bool reads_twin_metadata = 1;
 }
 
 message CreatePoolRequest {
@@ -239,6 +253,15 @@ message GetTemplateRequest {
   // doesn't make these checks; its answer leaves GetTemplateResponse's
   // cached_only false.
   bool cached_only = 5;
+  // Answer only with a build bound to template.environment's cache partition,
+  // never another environment's build of the digest. Requires
+  // template.environment and an exact content_hash, and excludes cached_only.
+  // A lookup that holds no such build pulls the release even when another
+  // partition holds the digest: the release's manifest decides where it
+  // lands, and if it isn't that partition the lookup is NOT_FOUND. A
+  // template-manager that predates the field ignores it and answers with its
+  // preferred build, which the caller checks.
+  bool environment_required = 6;
 }
 
 message GetTemplateResponse {

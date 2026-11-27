@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use axum::{
     Extension, Json,
@@ -17,7 +17,7 @@ use crate::{
         admin::support::{self, ContentionScope},
         authz::is_managing_org_admin,
         debug::{
-            response::{DebugSection, SandboxDebugResponse},
+            response::{DebugSection, SandboxDebugResponse, sandbox_sections},
             sources::{self, source_error},
         },
     },
@@ -108,7 +108,7 @@ async fn fetch_postgres_debug_sections(
     let (observed, pods, snapshots, ports, timeline, quarantine) =
         tokio::join!(observed, pods, snapshots, ports, timeline, quarantine);
     let observed = observed.map_err(source_error);
-    let sections = sandbox.into_sections(observed.as_ref().ok().cloned().flatten());
+    let sections = sandbox_sections(sandbox, observed.as_ref().ok().cloned().flatten());
 
     Ok(Some(SandboxDebugResponse {
         sandbox_id,

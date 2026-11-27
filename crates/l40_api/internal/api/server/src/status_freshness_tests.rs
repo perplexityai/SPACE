@@ -4,14 +4,14 @@
 
 use std::time::Duration;
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 use pplx_space_db_test_fixtures::{TestDb, insert_ready_worker_node, try_pg_test_db};
 use pplx_space_node_api_client::node_status_freshness::{
     DEFAULT_NODE_CTL_POLL_INTERVAL, DEFAULT_NODE_STATUS_FRESHNESS, NODE_STATUS_OUTBOUND_RECONCILER,
     node_status_freshness,
 };
 use pplx_space_sandbox_residency::node_heartbeat_fresh;
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 
 use crate::ClusterApiService;
@@ -55,6 +55,7 @@ impl Node {
                     ..Default::default()
                 }],
                 sync_overrides: Vec::new(),
+                reads_twin_metadata: None,
             }),
             ..Default::default()
         }))
@@ -177,5 +178,51 @@ async fn status_publication_with_a_shorter_interval_replaces_the_deadline() -> T
     let tick = Duration::from_secs(20);
     node.publish_status(tick).await?;
     assert_eq!(node.window().await?, node_status_freshness(tick));
+    Ok(())
+}
+
+/// node-ctl's `reads_twin_metadata` reaches the stored `node_ctl` document as
+/// JSON `true`, the only value the node status store's
+/// `reads_twin_metadata` predicate accepts. A publication without it, from a
+/// node that predates it, stores `null` over an earlier `true`, and one
+/// without a node-ctl status leaves the stored document as it was.
+#[tokio::test(flavor = "current_thread")]
+async fn the_twin_metadata_report_reaches_the_node_ctl_document() -> TestResult {
+    let Some(node) = node().await? else {
+        return Ok(());
+    };
+    let published = |reads_twin_metadata| {
+        Some(PublishedNodeStatus {
+            node_ctl: Some(NodeCtlStatus {
+                reachable: true,
+                reads_twin_metadata,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    };
+    let stored = || async {
+        sqlx::query_scalar::<_, Option<String>>(sql!(
+            "SELECT (node_ctl -> 'reads_twin_metadata')::text
+             FROM node_status_snapshots WHERE node_id = $1"
+        ))
+        .bind(node.node_id)
+        .fetch_one(&node.db.pool)
+        .await
+    };
+    node.publish(published(Some(true))).await?;
+    assert_eq!(stored().await?.as_deref(), Some("true"));
+    node.publish(None).await?;
+    assert_eq!(
+        stored().await?.as_deref(),
+        Some("true"),
+        "kept without a status"
+    );
+    node.publish(published(None)).await?;
+    assert_eq!(
+        stored().await?.as_deref(),
+        Some("null"),
+        "an older node clears it"
+    );
     Ok(())
 }

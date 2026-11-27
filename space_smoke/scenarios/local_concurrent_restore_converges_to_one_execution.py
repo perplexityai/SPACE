@@ -46,8 +46,7 @@ def concurrent_restore_converges_to_one_execution(test: smoke.KindEcw) -> None:
     same contention onto one new generation restored from its suspend
     checkpoint; pod POSTs refused at admission retire their generations and
     the callers converge on the one that was admitted, the refused callers
-    seeing the failure; and a delete issued while the pod cap is refusing the
-    callers' claims leaves no pod that ever runs, no live sandbox, and no hung or crashed
+    seeing the failure; and a delete issued after capped restore claims leaves no pod that ever runs, no live sandbox, and no hung or crashed
     caller behind."""
 
     marker = f"{MARKER}-{test.sandbox.sandbox_id}"
@@ -122,7 +121,7 @@ def concurrent_restore_converges_to_one_execution(test: smoke.KindEcw) -> None:
         race.expect_converged_through_refusals(outcomes, before=before, label="failed_post")
         test.reconnect_by_id()
 
-    with test.phase("teardown: delete while the pod cap refuses the restore; nothing survives"):
+    with test.phase("teardown: delete after capped restore claims; nothing survives"):
         test.pause()
         restore.wait_until_restore_portable()
         # The previous pod is still Terminating after the pause; the quota
@@ -146,7 +145,7 @@ def concurrent_restore_converges_to_one_execution(test: smoke.KindEcw) -> None:
             "the twenty concurrent callers",
             lambda: outcomes.extend(race.race_connects(CALLERS, timeout=180)),
         )
-        race.wait_for_restore_in_flight(before=before)
+        race.wait_for_restore_claim(before=before)
         # Snapshot the generations the cap has retired right before the
         # delete — a lower bound on the refused-claim 500s, since more can be
         # retired between here and the fence and the cascade erases the rows.

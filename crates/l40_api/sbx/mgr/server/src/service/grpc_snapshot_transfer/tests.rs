@@ -1,7 +1,7 @@
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use pplx_space_common_core::types::{ArtifactKind, LocalArtifactId};
+use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId};
 
 use crate::db::transfer::{
     ReserveImportError, SnapshotPublication, TransferBinding, publish_snapshot,
@@ -342,7 +342,7 @@ fn snapshot_retry_handles_either_retained_half_without_replacing_published_files
                 &db,
                 &id,
                 LocalArtifactId::new(),
-                pplx_space_common_core::types::ArtifactKind::Disk,
+                pplx_space_snapshot_model::ArtifactKind::Disk,
                 &"d-imported".parse().unwrap(),
                 destination.to_str().unwrap(),
             )
@@ -777,4 +777,55 @@ fn import_refuses_the_reserved_staging_marker() {
         import_target_name(Some("f-user"), "d").unwrap_err().code(),
         tonic::Code::InvalidArgument
     );
+}
+
+/// On a sealed node, a snapshot import into a stopped or suspended sandbox,
+/// which has no VM, is refused with the sealed refusal once it holds the
+/// sandbox's locks, before its body is read or anything is staged or
+/// published.
+#[tokio::test]
+async fn a_sealed_node_refuses_a_snapshot_import_into_a_sandbox_without_a_vm() {
+    for state in [SandboxState::Stopped, SandboxState::Suspended] {
+        let conn = crate::db::test_conn();
+        let id = uuid::Uuid::now_v7().to_string();
+        crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, state);
+        let service = SandboxManagerService::for_test(conn);
+        service.activation_seal.seal(&service.db, 3).unwrap();
+        let stream = tokio_stream::iter([Ok(ImportSnapshotRequest {
+            payload: Some(crate::proto::import_snapshot_request::Payload::Header(
+                crate::proto::ImportSnapshotHeader {
+                    sandbox_id: id.clone(),
+                    template_id: "seed".into(),
+                    content_hash: "hash".into(),
+                    snapshot_type: crate::proto::SnapshotType::Disk as i32,
+                    target_name: Some("d-imported".into()),
+                    ..Default::default()
+                },
+            )),
+        })]);
+        let refused = service.import_snapshot_owned(stream).await.unwrap_err();
+        assert_eq!(
+            refused.code(),
+            tonic::Code::FailedPrecondition,
+            "{refused:?}"
+        );
+        assert!(
+            refused
+                .message()
+                .starts_with(crate::activation_seal::ACTIVATIONS_SEALED_MARKER),
+            "{refused:?}"
+        );
+        let artifacts: i64 = service
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM local_artifacts WHERE sandbox_id = ?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(artifacts, 0, "{state}");
+        service.activation_seal.assert_quiesced();
+    }
 }

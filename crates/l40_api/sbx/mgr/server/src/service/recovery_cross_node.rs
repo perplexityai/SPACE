@@ -1,16 +1,16 @@
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::suspend_snapshot_publication::{
     canonical_suspend_snapshot_dir, recovered_sandbox_row_fields,
 };
 use super::*;
 use crate::service::start_support::start_stage;
-use pplx_space_common_core::types::{
-    ArtifactKind, ExactStorageUri, SandboxId, SnapshotId, StorageUri,
-};
+use pplx_space_artifact_model::{ExactStorageUri, StorageUri};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::{ArtifactKind, SnapshotId};
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug)]
@@ -19,7 +19,7 @@ pub(super) struct RestoreArtifactAsNewContext {
     pub(super) artifact_snapshot_id: SnapshotId,
     pub(super) target_owner: SandboxOwner,
     pub(super) artifact_kind: ArtifactKind,
-    pub(super) target_disk_io_limits: Option<pplx_space_common_core::types::DiskIoLimits>,
+    pub(super) target_disk_io_limits: Option<pplx_space_execution_spec::DiskIoLimits>,
     pub(super) volume_encryption: bool,
 }
 
@@ -60,7 +60,7 @@ impl RestoreArtifactAsNewContext {
             || context.disk_io_max_bandwidth_mib_per_sec.is_some()
         {
             Some(
-                pplx_space_common_core::types::DiskIoLimits::try_from_optional(
+                pplx_space_execution_spec::DiskIoLimits::try_from_optional(
                     context.disk_io_max_operations_per_sec,
                     context.disk_io_max_bandwidth_mib_per_sec,
                 )
@@ -347,16 +347,15 @@ pub(super) enum CrossNodeRestoreTarget {
     /// a disagreement found after the publication has already written the pin
     /// costs a multi-gigabyte pull and leaves a row the boundary then refuses.
     StoppedDiskArtifact {
-        expected: pplx_space_common_core::types::LocalArtifactId,
+        expected: pplx_space_snapshot_model::LocalArtifactId,
     },
 }
 
 pub(super) struct CrossNodeRestoreRequest<'a> {
     pub(super) sandbox_id: &'a str,
     pub(super) storage_uri: Option<&'a str>,
-    pub(super) execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
-    pub(super) activation_attempt_id:
-        Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+    pub(super) execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
+    pub(super) activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     pub(super) recovery: Option<QuarantineRecoveryContext<'a>>,
     pub(super) restore_artifact_as_new: Option<&'a RestoreArtifactAsNewContext>,
     pub(super) target: CrossNodeRestoreTarget,
@@ -653,15 +652,15 @@ fn validate_quarantine_recovery_artifact_identity(
 #[derive(Clone, Copy)]
 struct RestoringRowInput<'a> {
     meta: &'a crate::snapshot_upload::SnapshotMeta,
-    restore_source: &'a pplx_space_common_core::types::ExactStorageUri,
-    disk_io_limits_override: Option<pplx_space_common_core::types::DiskIoLimits>,
+    restore_source: &'a pplx_space_artifact_model::ExactStorageUri,
+    disk_io_limits_override: Option<pplx_space_execution_spec::DiskIoLimits>,
 }
 
 impl<'a> RestoringRowInput<'a> {
     fn new(
         meta: &'a crate::snapshot_upload::SnapshotMeta,
-        restore_source: &'a pplx_space_common_core::types::ExactStorageUri,
-        disk_io_limits_override: Option<pplx_space_common_core::types::DiskIoLimits>,
+        restore_source: &'a pplx_space_artifact_model::ExactStorageUri,
+        disk_io_limits_override: Option<pplx_space_execution_spec::DiskIoLimits>,
     ) -> Self {
         Self {
             meta,
@@ -807,8 +806,8 @@ pub(super) fn insert_restoring_sandbox_row_from_snapshot(
     conn: &crate::db::Connection,
     canonical_id: &str,
     meta: &crate::snapshot_upload::SnapshotMeta,
-    restore_source: &pplx_space_common_core::types::ExactStorageUri,
-    disk_io_limits_override: Option<pplx_space_common_core::types::DiskIoLimits>,
+    restore_source: &pplx_space_artifact_model::ExactStorageUri,
+    disk_io_limits_override: Option<pplx_space_execution_spec::DiskIoLimits>,
 ) -> Result<(), crate::snapshot_restore::RestoreError> {
     let sandbox_id = SandboxId::from_str(canonical_id).map_err(|source| {
         crate::snapshot_restore::RestoreError::InvalidSandboxId {
@@ -869,11 +868,11 @@ fn transition_restored_sandbox_to_suspended_parts(
     conn: &crate::db::Connection,
     canonical_id: &str,
     local_artifact_id: Option<LocalArtifactId>,
-    artifact_kind: Option<pplx_space_common_core::types::ArtifactKind>,
+    artifact_kind: Option<pplx_space_snapshot_model::ArtifactKind>,
     snapshot_dir: &str,
 ) -> Result<(), crate::snapshot_restore::RestoreError> {
     if let Some(local_artifact_id) = local_artifact_id {
-        if artifact_kind != Some(pplx_space_common_core::types::ArtifactKind::Full) {
+        if artifact_kind != Some(pplx_space_snapshot_model::ArtifactKind::Full) {
             return Err(crate::snapshot_restore::RestoreError::Other(
                 "checkpoint restore backup metadata must identify a full artifact".to_string(),
             ));
@@ -906,11 +905,11 @@ fn transition_restored_sandbox_to_suspended_parts(
 /// left pinning. Shared by the staged-sidecar check and the local-row check so
 /// the two can't disagree on what "evacuated disk" means.
 pub(super) fn is_stop_origin_disk(
-    kind: Option<pplx_space_common_core::types::ArtifactKind>,
-    origin: Option<pplx_space_common_core::types::ArtifactOrigin>,
+    kind: Option<pplx_space_snapshot_model::ArtifactKind>,
+    origin: Option<pplx_space_snapshot_model::ArtifactOrigin>,
 ) -> bool {
-    kind == Some(pplx_space_common_core::types::ArtifactKind::Disk)
-        && origin == Some(pplx_space_common_core::types::ArtifactOrigin::Stop)
+    kind == Some(pplx_space_snapshot_model::ArtifactKind::Disk)
+        && origin == Some(pplx_space_snapshot_model::ArtifactOrigin::Stop)
 }
 
 /// The artifact a same-id stopped materialization is allowed to pin.
@@ -923,8 +922,8 @@ pub(super) fn is_stop_origin_disk(
 /// pinned to bytes that are not the disk it was evacuated with.
 fn stopped_materialization_pin(
     meta: &crate::snapshot_upload::SnapshotMeta,
-    expected: pplx_space_common_core::types::LocalArtifactId,
-) -> Result<pplx_space_common_core::types::LocalArtifactId, crate::snapshot_restore::RestoreError> {
+    expected: pplx_space_snapshot_model::LocalArtifactId,
+) -> Result<pplx_space_snapshot_model::LocalArtifactId, crate::snapshot_restore::RestoreError> {
     let unsuitable =
         || crate::snapshot_restore::RestoreError::StoppedMaterializationArtifactUnsuitable {
             kind: meta.artifact_kind,
@@ -984,14 +983,14 @@ pub(super) fn transition_restored_sandbox_to_stopped(
     conn: &crate::db::Connection,
     canonical_id: &str,
     meta: &crate::snapshot_upload::SnapshotMeta,
-    expected: pplx_space_common_core::types::LocalArtifactId,
+    expected: pplx_space_snapshot_model::LocalArtifactId,
 ) -> Result<(), crate::snapshot_restore::RestoreError> {
     let local_artifact_id = stopped_materialization_pin(meta, expected)?;
     crate::db::publish_restored_stopped_artifact(
         conn,
         canonical_id,
         local_artifact_id,
-        &pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
+        &pplx_space_host_layout::paths::sandbox_snapshot_dir(
             canonical_id,
             &format!("d-stop-{local_artifact_id}"),
         ),
@@ -1063,8 +1062,8 @@ fn claim_exchanged_restore_cleanup(
     db: &crate::db::SharedConnection,
     sandbox_id: &str,
     existing: &crate::db::RestoreTransferScopeRow,
-    execution_generation: pplx_space_common_core::types::ExecutionGeneration,
-    activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+    execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
+    activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
 ) -> Result<crate::db::RestoreTransferScopeRow, crate::snapshot_restore::RestoreError> {
     let db = db.lock().map_err(|_| {
         crate::snapshot_restore::RestoreError::Other("sandbox database mutex poisoned".to_string())
@@ -1226,11 +1225,11 @@ impl SandboxManagerService {
     pub(super) fn create_restore_transfer_scope(
         &self,
         sandbox_id: &str,
-        execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
-        activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
-    ) -> Result<pplx_space_common_core::types::TransferScopeId, crate::snapshot_restore::RestoreError>
+        execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
+        activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
+    ) -> Result<pplx_space_snapshot_model::TransferScopeId, crate::snapshot_restore::RestoreError>
     {
-        let scope = pplx_space_common_core::types::TransferScopeId::new();
+        let scope = pplx_space_snapshot_model::TransferScopeId::new();
         let staging_dir =
             crate::snapshot_restore::remote_restore_metadata_staging_dir(sandbox_id, scope);
         let inserted = {
@@ -1263,10 +1262,10 @@ impl SandboxManagerService {
         &self,
         sandbox_id: &str,
         existing: &crate::db::RestoreTransferScopeRow,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
-        activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
+        activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
     ) -> Result<
-        Option<pplx_space_common_core::types::TransferScopeId>,
+        Option<pplx_space_snapshot_model::TransferScopeId>,
         crate::snapshot_restore::RestoreError,
     > {
         // Pre-fencing releases wrote scopes without attempt ownership. A
@@ -1413,7 +1412,7 @@ impl SandboxManagerService {
         if let Some(row) = existing_row {
             if let Some(recovery) = recovery {
                 if recovery.plan.reason_code
-                    != pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing
+                    != pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing
                     || !matches!(
                         row.state.unowned(),
                         Some(SandboxState::Quarantined | SandboxState::Restoring)
@@ -1441,8 +1440,7 @@ impl SandboxManagerService {
                         "refusing to remove orphan residue for live sandbox {canonical_id}"
                     )));
                 }
-                let canonical_dir =
-                    pplx_space_common_core::host::linux::paths::sandbox_cache_dir(&canonical_id);
+                let canonical_dir = pplx_space_host_layout::paths::sandbox_cache_dir(&canonical_id);
                 if std::path::Path::new(&canonical_dir).exists() {
                     // This is intentionally whole-sandbox disposal, not partial
                     // restore cleanup. Keep teardown and recursive removal with
@@ -1598,9 +1596,7 @@ impl SandboxManagerService {
                         activation_attempt_id,
                     )?;
                     let canonical_dir =
-                        pplx_space_common_core::host::linux::paths::sandbox_cache_dir(
-                            &canonical_id,
-                        );
+                        pplx_space_host_layout::paths::sandbox_cache_dir(&canonical_id);
                     let old_source = canonical_restore_exchange_old_source_at(
                         std::path::Path::new(&canonical_dir),
                         sandbox_id,
@@ -1623,8 +1619,7 @@ impl SandboxManagerService {
                 } else {
                     None
                 };
-                let canonical_dir =
-                    pplx_space_common_core::host::linux::paths::sandbox_cache_dir(&canonical_id);
+                let canonical_dir = pplx_space_host_layout::paths::sandbox_cache_dir(&canonical_id);
                 if let Some(scope) = exchanged_scope_to_clean {
                     finalize_exchanged_restore_after_cleanup(
                         &self.db,
@@ -1745,8 +1740,7 @@ impl SandboxManagerService {
         };
 
         let restore_as_new_destination = restore_artifact_as_new.map(|_| {
-            let canonical_dir =
-                pplx_space_common_core::host::linux::paths::sandbox_cache_dir(&canonical_id);
+            let canonical_dir = pplx_space_host_layout::paths::sandbox_cache_dir(&canonical_id);
             restore_as_new_metadata_destination(
                 retrying_interrupted_restore,
                 std::path::Path::new(&canonical_dir).exists(),
@@ -1829,7 +1823,7 @@ impl SandboxManagerService {
             // the staged metadata to this same sandbox id.
             stopped_materialization_pin(&staged.meta, expected)?;
         }
-        let restore_source: pplx_space_common_core::types::ExactStorageUri = staged
+        let restore_source: pplx_space_artifact_model::ExactStorageUri = staged
             .storage_uri
             .parse()
             .map_err(|source| RestoreError::InvalidRestoreSource {
@@ -2083,8 +2077,7 @@ impl SandboxManagerService {
                 reclaimable_published_remote_restore_source_at(&staged.sandbox_dir, sandbox_id)?;
             ensure_staged_restore_source(&restore_source, current_staged_source.as_ref())?;
 
-            let canonical_dir =
-                pplx_space_common_core::host::linux::paths::sandbox_cache_dir(&canonical_id);
+            let canonical_dir = pplx_space_host_layout::paths::sandbox_cache_dir(&canonical_id);
             let current_source = reclaimable_published_remote_restore_source(sandbox_id).await?;
             match canonical_root_reclaim_decision(
                 initially_observed_source,
@@ -2335,10 +2328,10 @@ fn validate_artifact_restore_as_new(
         ));
     }
     let expected_kind = match context.artifact_kind {
-        pplx_space_common_core::types::ArtifactKind::Disk => {
-            pplx_space_common_core::types::ArtifactKind::Disk
+        pplx_space_snapshot_model::ArtifactKind::Disk => {
+            pplx_space_snapshot_model::ArtifactKind::Disk
         }
-        pplx_space_common_core::types::ArtifactKind::Full => {
+        pplx_space_snapshot_model::ArtifactKind::Full => {
             return Err(crate::snapshot_restore::RestoreError::Other(
                 "full artifact restore-as-new is not implemented".to_string(),
             ));
@@ -2352,8 +2345,8 @@ fn validate_artifact_restore_as_new(
     }
     match meta.artifact_origin {
         Some(
-            pplx_space_common_core::types::ArtifactOrigin::Snapshot
-            | pplx_space_common_core::types::ArtifactOrigin::Fork,
+            pplx_space_snapshot_model::ArtifactOrigin::Snapshot
+            | pplx_space_snapshot_model::ArtifactOrigin::Fork,
         ) => {}
         _ => {
             return Err(crate::snapshot_restore::RestoreError::Other(
@@ -2389,7 +2382,7 @@ fn publish_rebound_artifact_snapshot_metadata(
 fn rebind_artifact_snapshot_identity(
     meta: &mut crate::snapshot_upload::SnapshotMeta,
     target_sandbox_id: &str,
-    target_owner: &pplx_space_common_core::types::SandboxOwner,
+    target_owner: &pplx_space_accounts::SandboxOwner,
 ) -> Result<(), crate::snapshot_restore::RestoreError> {
     if meta.encrypted && meta.rootfs_encryption_source.is_none() {
         meta.rootfs_encryption_source = Some(meta.sandbox_id.parse().map_err(|source| {
@@ -2446,7 +2439,7 @@ fn publish_rebound_sandbox_artifact_metadata(
                 "invalid restored artifact content hash: {error}"
             ))
         })?;
-    let sandbox_metadata = pplx_space_common_core::types::SandboxArtifactMetadata::new(
+    let sandbox_metadata = pplx_space_artifact_model::SandboxArtifactMetadata::new(
         sandbox_id,
         execution,
         template,
@@ -2469,7 +2462,7 @@ fn publish_rebound_sandbox_artifact_metadata(
 
 fn rebind_artifact_snapshot_owner(
     sandbox: Option<&mut crate::snapshot_upload::SnapshotSandbox>,
-    target_owner: &pplx_space_common_core::types::SandboxOwner,
+    target_owner: &pplx_space_accounts::SandboxOwner,
 ) -> Result<(), crate::snapshot_restore::RestoreError> {
     let sandbox =
         sandbox.ok_or(crate::snapshot_restore::RestoreError::MissingSandboxOwnershipMetadata)?;

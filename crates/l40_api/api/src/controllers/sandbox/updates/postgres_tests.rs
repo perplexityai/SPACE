@@ -10,13 +10,15 @@
 //! worker. `auto_lifecycle` and `network_policy` are untouched by this
 //! migration and keep their own SQL.
 
-use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sandbox_store::{SandboxMetadata, SandboxMetadataValue};
 
 use super::*;
-use crate::models::{SandboxMetadata, SandboxMetadataValue, User};
+use crate::models::User;
 use pplx_space_db_test_fixtures::pg_test_db;
 use pplx_space_feature_flags::{FeatureFlagClient, SPACE_API_TIMEOUT_LOCK_BYPASS_FLAG};
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 
 async fn insert_actor(pool: &PgPool) -> TestResult<User> {
@@ -92,9 +94,9 @@ async fn seed_timeout_sandbox(
     actor: &User,
     lifecycle: &str,
     policy: &AutoLifecyclePolicy,
-    managed_by: pplx_space_common_core::types::SubstrateKind,
+    managed_by: pplx_space_node_model::SubstrateKind,
     running_on: Option<(
-        pplx_space_common_core::types::NodeId,
+        pplx_space_accounts::NodeId,
         &pplx_space_node_api_sim::SimWorkerHarness,
     )>,
 ) -> TestResult<Sandbox> {
@@ -228,12 +230,12 @@ struct TimeoutLockFixture {
     absent: FeatureFlagClient,
     controller: SandboxController,
     policy: AutoLifecyclePolicy,
-    node: pplx_space_common_core::types::NodeId,
+    node: pplx_space_accounts::NodeId,
     worker: pplx_space_node_api_sim::SimWorkerHarness,
 }
 
 async fn timeout_lock_fixture() -> TestResult<TimeoutLockFixture> {
-    use pplx_space_common_core::types::SubstrateKind;
+    use pplx_space_node_model::SubstrateKind;
     // The lock holder, the lock-wait observer and the update each need a
     // connection.
     let db = pplx_space_db_test_fixtures::pg_test_db_with_max_connections(3).await?;
@@ -245,7 +247,7 @@ async fn timeout_lock_fixture() -> TestResult<TimeoutLockFixture> {
     let absent = FeatureFlagClient::disabled();
     let controller = direct_sandbox_controller(&db.pool).with_feature_flags(enabled.clone());
     let policy = crate::e2b::auto_lifecycle_policy(90, true, false);
-    let node = pplx_space_common_core::types::NodeId::new();
+    let node = pplx_space_accounts::NodeId::new();
     let worker = pplx_space_node_api_sim::SimWorkerHarness::builder(node.to_string())
         .with_internal_api()
         .start()
@@ -288,7 +290,7 @@ async fn unchanged_timeout_does_not_wait_for_an_unrelated_row_lock(
     #[case] lifecycle: &str,
     #[case] decision: &str,
 ) -> TestResult {
-    use pplx_space_common_core::types::SubstrateKind;
+    use pplx_space_node_model::SubstrateKind;
     if !crate::test_support::enter_sim_worker_process() {
         return Ok(());
     }
@@ -406,7 +408,7 @@ async fn an_ineligible_timeout_update_waits_for_the_row_lock(
     #[case] call: Call,
     #[case] decision: &str,
 ) -> TestResult {
-    use pplx_space_common_core::types::SubstrateKind;
+    use pplx_space_node_model::SubstrateKind;
     if !crate::test_support::enter_sim_worker_process() {
         return Ok(());
     }

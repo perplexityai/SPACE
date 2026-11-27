@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use pplx_space_common_core::host::linux::paths::SANDBOX_RUN_DIR;
+use pplx_space_host_layout::paths::SANDBOX_RUN_DIR;
 
 pub(crate) fn sidecar_alive(sandbox_id: &str, service_name: &str) -> bool {
     sidecar_live_pid(sandbox_id, service_name).is_some()

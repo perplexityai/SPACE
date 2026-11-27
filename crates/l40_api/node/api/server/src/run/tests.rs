@@ -484,7 +484,7 @@ async fn shutdown_releases_listener_while_accepted_connections_drain() {
     let server_shutdown = shutdown_token.clone();
     let (_, health_service) = pplx_space_grpc_server::grpc_health_service();
     struct PlaintextDev;
-    impl pplx_space_common_core::env::Environment for PlaintextDev {
+    impl pplx_space_env_vars::Environment for PlaintextDev {
         fn var_os(&self, name: &str) -> Option<std::ffi::OsString> {
             (name == pplx_space_common_grpc::internal_transport::INSECURE_DEV_ENV)
                 .then(|| "true".into())
@@ -546,4 +546,40 @@ async fn shutdown_releases_listener_while_accepted_connections_drain() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn open_stream_drain_starts_its_grace_at_shutdown() {
+    let shutdown_token = CancellationToken::new();
+    let grace = std::time::Duration::from_secs(10);
+    let drain = open_stream_drain_token(&shutdown_token, Some(grace));
+
+    tokio::time::sleep(grace * 2).await;
+    assert!(
+        !drain.is_cancelled(),
+        "the grace runs from shutdown, not from start"
+    );
+
+    shutdown_token.cancel();
+    tokio::time::sleep(grace - std::time::Duration::from_millis(1)).await;
+    assert!(
+        !drain.is_cancelled(),
+        "streams keep their grace after shutdown"
+    );
+    tokio::time::timeout(std::time::Duration::from_millis(2), drain.cancelled())
+        .await
+        .expect("the drain fires once the grace has passed");
+}
+
+#[tokio::test(start_paused = true)]
+async fn open_streams_keep_the_whole_drain_without_a_grace() {
+    let shutdown_token = CancellationToken::new();
+    let drain = open_stream_drain_token(&shutdown_token, None);
+
+    shutdown_token.cancel();
+    tokio::time::sleep(std::time::Duration::from_secs(
+        DEFAULT_SHUTDOWN_GRACE_SECS * 2,
+    ))
+    .await;
+    assert!(!drain.is_cancelled());
 }

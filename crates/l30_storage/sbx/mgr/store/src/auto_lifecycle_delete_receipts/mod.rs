@@ -2,9 +2,10 @@ use std::fmt;
 use std::str::FromStr;
 
 use pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint;
-use pplx_space_common_core::types::{
-    AutoLifecycleDeleteReceiptId, ExecutionGeneration, NodeManagedBy, SandboxActivationAttemptId,
-    SandboxId, SpaceApiRouteIdentity,
+use pplx_space_node_model::NodeManagedBy;
+use pplx_space_sandbox_model::{
+    AutoLifecycleDeleteReceiptId, ExecutionGeneration, SandboxActivationAttemptId, SandboxId,
+    SpaceApiRouteIdentity,
 };
 
 #[cfg(test)]
@@ -241,7 +242,7 @@ impl RouteEvidence {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AutoLifecycleDeleteExpectation {
     pub policy_fingerprint: AutoLifecyclePolicyFingerprint,
-    pub authority: pplx_space_common_core::types::PolicyAuthority,
+    pub authority: pplx_space_policy_authority::PolicyAuthority,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

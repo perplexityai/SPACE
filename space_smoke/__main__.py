@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from space_smoke.registry import SUBSTRATES, Scenario
+from space_smoke.registry import SUBSTRATES, TIERS, Scenario
 from space_smoke.runtime import SmokeConfigurationError, execute_scenario
 from space_smoke.scenarios import REGISTRY
 from space_smoke.services import (
@@ -19,7 +19,7 @@ from space_smoke.services import (
     SmokeServices,
     repair_orphaned_kind_faults,
 )
-from space_smoke.sharding import JOINT_SURFACES, select_shard
+from space_smoke.sharding import JOINT_SURFACES, joint_inventories, select_shard
 from space_smoke.suite import (
     KNOWN_FAILURES_ENV,
     RESULT_PREFIX,
@@ -42,10 +42,12 @@ def _describe(scenario_id: str) -> int:
         "fixture": scenario.fixture_name,
         "api_surfaces": sorted(scenario.api_surfaces),
         "quarantined": scenario.quarantined,
-        "ignored": scenario.ignored,
+        "tier": scenario.tier,
+        "manual_reason": scenario.manual_reason,
         "telemetry_mode": scenario.telemetry_mode,
         "storage_credentials": scenario.storage_credentials,
         "test_hooks": scenario.test_hooks,
+        "drain_v1": scenario.drain_v1,
         "browser": scenario.browser,
         "selected_api_surface": os.environ.get("SPACE_SMOKE_API_SURFACE", "ecw"),
         "sandbox": {
@@ -85,9 +87,8 @@ def _describe(scenario_id: str) -> int:
 def _run(scenario_id: str) -> int:
     scenario = REGISTRY.get(scenario_id)
     template = os.environ.get("E2B_TEMPLATE") or None
-    # An empty template set opts a scenario out of implicit selection; naming
-    # the scenario explicitly still runs it against the requested template.
-    if scenario.templates != frozenset() and not scenario.applies_to(template):
+    # Naming a scenario bypasses its tier, never its template prerequisites.
+    if not scenario.applies_to(template):
         supported = ", ".join(sorted(scenario.templates or ()))
         print(
             f"ERROR: {scenario_id} applies to template(s) {supported}; "
@@ -106,7 +107,7 @@ def _run(scenario_id: str) -> int:
     # Outside the scenario's budget: the repair may wait out two rollouts.
     try:
         if repair_orphaned_kind_faults(os.environ):
-            print("REPAIRED: a limiter fault or rollout pace an earlier run left recorded", flush=True)
+            print("REPAIRED: a limiter fault, environment placement gate or rollout pace an earlier run left recorded", flush=True)
     except Exception as error:  # noqa: BLE001 - a fault left up makes any verdict untrustworthy
         print(f"ERROR: {type(error).__name__}: {error}", file=sys.stderr)
         return 2
@@ -353,7 +354,10 @@ def _write_failure_details(results: tuple[ScenarioProcessResult, ...]) -> None:
 
 
 def _run_all(
-    *, category: str | None = None, shard: tuple[int, int] | None = None
+    *,
+    category: str | None = None,
+    shard: tuple[int, int] | None = None,
+    tiers: tuple[str, ...] | None = None,
 ) -> int:
     template = os.environ.get("E2B_TEMPLATE") or None
     backend = os.environ.get("SPACE_SMOKE_BACKEND", "kind")
@@ -374,16 +378,37 @@ def _run_all(
         except ValueError as error:
             print(f"ERROR: {error}", file=sys.stderr)
             return 2
-    eligible = REGISTRY.select(category=category, template=template)
-    # A quarantine is a visible hole in coverage, never a pass: name each one
-    # and its reason so the run log shows what the suite did not prove.
+    selected_tiers = tiers if tiers is not None else tuple(
+        part.strip() for part in os.environ.get("SPACE_SMOKE_TIERS", "routine").split(",")
+    )
+    included = tuple(
+        part.strip()
+        for part in os.environ.get("SPACE_SMOKE_INCLUDE_SCENARIOS", "").split(",")
+        if part.strip()
+    )
+    try:
+        if "manual" in selected_tiers:
+            raise ValueError("manual scenarios run only by name, not through --all or --category")
+        eligible = REGISTRY.select(
+            category=category, template=template, tiers=selected_tiers,
+            include_scenarios=included,
+        )
+    except (ValueError, KeyError) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 2
+    print(f"TIERS: {', '.join(selected_tiers)}")
+    if included:
+        print(f"ADDITIONAL MAIN SCENARIOS: {', '.join(included)}")
+    # Withheld cases are visible holes in coverage, never passes.
     for held in REGISTRY.select(
-        category=category, template=template, include_quarantined=True, include_ignored=True
+        category=category, template=template, include_quarantined=True, tiers=TIERS,
     ):
         if held.quarantined is not None:
             print(f"QUARANTINED {held.id}: {held.quarantined}")
-        if held.ignored is not None:
-            print(f"IGNORED {held.id}: {held.ignored}")
+        elif held.tier == "manual":
+            print(f"MANUAL {held.id}: {held.manual_reason}")
+        elif held.tier not in selected_tiers and held.id not in included:
+            print(f"SKIPPED {held.id}: tier {held.tier} is not selected")
     api_surface = os.environ.get("SPACE_SMOKE_API_SURFACE", "ecw")
     if category is None:
         eligible = tuple(
@@ -441,16 +466,14 @@ def _run_all(
         # pass of the run computes one partition.
         inventories = None
         if category is None and api_surface in JOINT_SURFACES:
-            inventories = {
-                surface: tuple(
-                    scenario
-                    for scenario in REGISTRY.select(category=None, template=template)
-                    if surface in scenario.api_surfaces
-                    and backend in scenario.backends
-                    and (browser_selection != "withhold" or scenario.browser is None)
-                )
-                for surface in JOINT_SURFACES
-            }
+            inventories = joint_inventories(
+                REGISTRY,
+                template=template,
+                tiers=selected_tiers,
+                include_scenarios=included,
+                backend=backend,
+                browser_selection=browser_selection,
+            )
         inventory = scenarios
         scenarios = select_shard(
             scenarios,
@@ -534,6 +557,9 @@ def _run_all(
     telemetry_error = telemetry_error or rust_build_error
     if not scenarios:
         return _mode_emptied(selection, "Rust build", shard, telemetry_error)
+    scenarios = _apply_drain_v1(scenarios, services)
+    if not scenarios:
+        return _mode_emptied(selection, "drain v2 state", shard, telemetry_error)
     scenarios, browser_error = _apply_browser(scenarios, browser_selection, services)
     telemetry_error = telemetry_error or browser_error
     if not scenarios:
@@ -752,6 +778,41 @@ def _apply_rust_build(
     return tuple(scenario for scenario in scenarios if scenario.test_hooks is None), None
 
 
+def _apply_drain_v1(
+    scenarios: tuple[Scenario, ...], services: SmokeServices
+) -> tuple[Scenario, ...]:
+    """Skip the scenarios that drive v1 drains on a bench running drain v2.
+
+    With SPACE_DRAIN_V2_ENABLED on, the admin API refuses every v1 `:drain`
+    (v1 and v2 drains never run together), so a v1 drain scenario can only
+    fail there. The switch is read from the bench's public API, which is
+    what refuses; a bench the read cannot classify keeps the scenarios, whose
+    own drains then report it.
+    """
+
+    declared = tuple(scenario for scenario in scenarios if scenario.drain_v1)
+    if not declared:
+        return scenarios
+    try:
+        drain_v2 = services.drain_v2_enabled()
+    except Exception as error:  # noqa: BLE001 - the scenarios report their own reads
+        names = ", ".join(scenario.id for scenario in declared)
+        print(
+            f"WARN: could not read whether the bench runs drain v2, so {names} will run: "
+            f"{type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+        return scenarios
+    if not drain_v2:
+        return scenarios
+    for skipped in declared:
+        print(
+            f"SKIPPED {skipped.id}: drives v1 drains, which the bench's API refuses while "
+            "drain v2 is on (SPACE_DRAIN_V2_ENABLED); run it on a bench with drain v2 off"
+        )
+    return tuple(scenario for scenario in scenarios if not scenario.drain_v1)
+
+
 BROWSER_SCENARIOS_ENV = "SPACE_SMOKE_BROWSER_SCENARIOS"
 BROWSER_SELECTIONS = ("run", "require", "withhold")
 
@@ -869,13 +930,32 @@ def _parse_shard(value: str) -> tuple[int, int]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("list")
+    inventory = subparsers.add_parser("list")
+    inventory.add_argument("--tier", action="append", choices=sorted(TIERS))
+    inventory.add_argument("--prefix", help="only scenarios whose ID starts with this")
+    inventory.add_argument(
+        "--shard",
+        type=_parse_shard,
+        metavar="INDEX/COUNT",
+        help="only one duration-balanced partition of the listed scenarios, for runs by name "
+        "on several benches (1-based)",
+    )
+    inventory.add_argument(
+        "--api-surface",
+        choices=JOINT_SURFACES,
+        default="native",
+        help="the surface whose duration hints weigh the partition (default: native)",
+    )
     describe = subparsers.add_parser("describe")
     describe.add_argument("scenario")
     run = subparsers.add_parser("run")
     run.add_argument("scenario", nargs="?")
     run.add_argument("--all", action="store_true", dest="run_all")
     run.add_argument("--category", choices=REGISTRY.categories)
+    run.add_argument(
+        "--tier", action="append", choices=("routine", "main"),
+        help="implicit selection tier; repeat to combine (default: SPACE_SMOKE_TIERS or routine)",
+    )
     run.add_argument(
         "--shard",
         type=_parse_shard,
@@ -885,7 +965,16 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.command == "list":
-        for scenario in REGISTRY:
+        listed = tuple(
+            scenario
+            for scenario in REGISTRY
+            if (args.tier is None or scenario.tier in args.tier)
+            and (args.prefix is None or scenario.id.startswith(args.prefix))
+        )
+        if args.shard is not None:
+            index, count = args.shard
+            listed = select_shard(listed, index=index, count=count, api_surface=args.api_surface)
+        for scenario in listed:
             print(f"{scenario.id}\t{scenario.invariant}")
         return 0
     if args.command == "describe":
@@ -901,10 +990,13 @@ def main() -> int:
         parser.error("run requires exactly one scenario, --all, or --category")
     if args.shard is not None and args.scenario is not None:
         parser.error("--shard requires --all or --category")
+    if args.tier is not None and args.scenario is not None:
+        parser.error("--tier requires --all or --category; a named scenario runs regardless of tier")
+    selection = {"tiers": tuple(args.tier)} if args.tier is not None else {}
     if args.run_all:
-        return _run_all(shard=args.shard)
+        return _run_all(shard=args.shard, **selection)
     if args.category is not None:
-        return _run_all(category=args.category, shard=args.shard)
+        return _run_all(category=args.category, shard=args.shard, **selection)
     assert args.scenario is not None
     return _run(args.scenario)
 

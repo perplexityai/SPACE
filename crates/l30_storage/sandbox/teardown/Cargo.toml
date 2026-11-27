@@ -8,14 +8,34 @@ license.workspace = true
 publish.workspace = true
 
 [package.metadata.space.state]
-postgres = []
+postgres = [
+  "node_facet_conditions",
+  "node_facet_observed_status",
+  "sandbox_observed_states",
+]
 
 [lints]
 workspace = true
 
 [dependencies]
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sqlx = { workspace = true, features = ["derive", "json", "postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid", "time"] }
+time = { workspace = true }
+uuid = { workspace = true }
 
 # internal
-pplx-space-common-core = { workspace = true, features = ["sqlx"] }
+pplx-space-accounts = { workspace = true, features = ["sqlx"] }
+pplx-space-net-common = { workspace = true, features = ["serde"] }
+pplx-space-node-model = { workspace = true, features = ["sqlx"] }
+pplx-space-postgres-pool = { workspace = true }
+pplx-space-sandbox-model = { workspace = true, features = ["serde", "sqlx"] }
+pplx-space-semver = { workspace = true, features = ["sqlx"] }
+pplx-space-snapshot-model = { workspace = true, features = ["sqlx"] }
+pplx-space-sql-locator = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }
+
+[dev-dependencies]
+pplx-space-db-test-fixtures = { workspace = true }
+pplx-space-test-env = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

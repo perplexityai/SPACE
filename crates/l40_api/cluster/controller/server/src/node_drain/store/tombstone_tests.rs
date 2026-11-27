@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use std::time::Duration;
 
@@ -132,11 +132,12 @@ async fn terminating_direct_node_is_neither_listed_nor_deleted() -> TestResult {
         insert_terminating_node(&db.pool, node_id, &node_name, managed_by).await?;
     }
 
-    let listed: Vec<NodeId> = sqlx::query_scalar(terminating_nodes_query())
-        .bind(PHASE_TERMINATING)
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_all(&db.pool)
-        .await?;
+    let listed = drain_reads::nodes_in_drain_phase(
+        &db.pool,
+        NodeDrainPhase::Terminating,
+        SubstrateKind::Kubernetes,
+    )
+    .await?;
     assert_eq!(listed, vec![k8s_node]);
 
     assert!(!delete_terminating_node_and_record_tombstone(&db.pool, direct_node).await?);

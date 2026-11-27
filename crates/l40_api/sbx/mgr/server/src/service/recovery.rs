@@ -1,6 +1,6 @@
 //! Startup and periodic repair of interrupted lifecycle operations.
 
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::cache_cleanup::{ReconcileSource, cleanup_orphaned_dirs, ensure_sandbox_cache_root_in};
 use super::cleanup_support::{CleanupCompletion, CleanupLockTryResult, CleanupRecoveryTarget};
@@ -17,12 +17,12 @@ use crate::metrics::sandbox::worker::{
 };
 use futures_util::{StreamExt, stream};
 use orphan_dispatch::AdmittedRecoveryKind;
-use pplx_space_common_core::types::{
-    SandboxId, SandboxIdParseError, SandboxQuarantineNextAction, SandboxQuarantineSource,
-};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
     emit_sandbox_event,
+};
+use pplx_space_sandbox_model::{
+    SandboxId, SandboxIdParseError, SandboxQuarantineNextAction, SandboxQuarantineSource,
 };
 
 const SUSPEND_RECOVERY_KIND: &str = "suspend";
@@ -731,12 +731,6 @@ impl SandboxManagerService {
         schedule: &mut crate::retained_source::InspectionSchedule,
         hold: impl Send + 'static,
     ) -> crate::retained_source::RetainedSourceVerdicts {
-        for row in rows.iter().filter(|row| unowned_publication(row)) {
-            if shutdown.is_cancelled() {
-                break;
-            }
-            self.spawn_encrypted_capture_seal(cache_dir, row);
-        }
         let verdicts = self
             .inspect_retained_sources_in(
                 rows.iter()
@@ -746,22 +740,41 @@ impl SandboxManagerService {
                 schedule,
             )
             .await;
-        let (service, cache_dir, shutdown) =
+        let (service, recovery_cache_dir, recovery_shutdown) =
             (self.clone(), cache_dir.to_path_buf(), shutdown.clone());
+        let recovery_rows = rows.clone();
         let recovered = tokio::task::spawn_blocking(move || {
             let _hold = hold;
-            if let Err(error) = service
-                .recover_deferred_suspend_publications_in(&cache_dir, rows, &shutdown, &verdicts)
-            {
+            if let Err(error) = service.recover_deferred_suspend_publications_in(
+                &recovery_cache_dir,
+                recovery_rows,
+                &recovery_shutdown,
+                &verdicts,
+            ) {
                 tracing::warn!(%error, "periodic suspend publication recovery failed; will retry");
             }
             verdicts
         })
         .await;
-        recovered.unwrap_or_else(|error| {
-            tracing::warn!(%error, "periodic suspend publication recovery task failed");
-            Default::default()
-        })
+        let verdicts = match recovered {
+            Ok(verdicts) => verdicts,
+            Err(error) => {
+                // Seal retries do not depend on classification, so a failed
+                // classification task still dispatches them.
+                tracing::warn!(%error, "periodic suspend publication recovery task failed");
+                Default::default()
+            }
+        };
+        // Classify completed captures before seal retries take their fences.
+        // Otherwise a no-op seal can exclude publication on every pass, even
+        // after the previous pass sealed the capture successfully.
+        for row in rows.iter().filter(|row| unowned_publication(row)) {
+            if shutdown.is_cancelled() {
+                break;
+            }
+            self.spawn_encrypted_capture_seal(cache_dir, row);
+        }
+        verdicts
     }
 
     /// Retry, in its own task, the seal of an encrypted capture that a suspend
@@ -777,16 +790,6 @@ impl SandboxManagerService {
     ) {
         if !row.volume_encryption {
             return;
-        }
-        match suspend_snapshot_publication::recorded_encrypted_capture_to_seal(
-            &cache_dir.join(&row.id),
-        ) {
-            Ok(Some(_)) => {}
-            Ok(None) => return,
-            Err(error) => {
-                tracing::warn!(sandbox_id = %row.id, %error, "cannot select an unsealed encrypted capture; will retry");
-                return;
-            }
         }
         let (Ok(wake), Ok(artifact)) = (
             self.auto_lifecycle.wake_lock(&row.id).try_lock_owned(),
@@ -926,11 +929,21 @@ impl SandboxManagerService {
             });
         }
         let sandbox_dir = cache_dir.join(&row.id);
-        let runtime_live = (self.sandbox_runtime_live)(&row.id);
-        let decision = suspend_snapshot_publication::classify_suspend_snapshot_publication(
+        let runtime = if row.volume_encryption {
+            self.capture_runtime_observation(&row.id)
+        } else {
+            (self.sandbox_runtime_live)(&row.id).into()
+        };
+        let attempt = {
+            let db = self.startup_recovery_db()?;
+            crate::db::read::suspend_attempt(&db, &row.id)?
+        };
+        let decision = suspend_snapshot_publication::classify_suspend_attempt(
             &sandbox_dir,
             row.current_local_artifact_id,
-            runtime_live,
+            attempt,
+            row.volume_encryption,
+            runtime,
             verdicts,
         )?;
         self.apply_suspend_snapshot_publication_recovery_decision(
@@ -949,9 +962,17 @@ impl SandboxManagerService {
         sandbox_dir: std::path::PathBuf,
         decision: SuspendSnapshotPublicationDecision,
         origin: SuspendSnapshotPublicationRecoveryOrigin,
-        teardown_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+        teardown_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
         verdicts: &crate::retained_source::RetainedSourceVerdicts,
     ) -> Result<crate::db::StartupRecoveryRecord, StartupRecoveryError> {
+        let refused = matches!(decision, SuspendSnapshotPublicationDecision::CaptureRefused);
+        let blocked_reason = match &decision {
+            SuspendSnapshotPublicationDecision::BlockedAttempt(reason) => {
+                tracing::warn!(sandbox_id = %row.id, reason, "retaining unresolved encrypted capture");
+                crate::db::SUSPEND_CAPTURE_UNRESOLVED
+            }
+            _ => crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE,
+        };
         match decision {
             SuspendSnapshotPublicationDecision::CanonicalReady(artifact) => {
                 if let Some(execution_generation) = teardown_generation {
@@ -1073,10 +1094,31 @@ impl SandboxManagerService {
                     )
                 }
             }
-            SuspendSnapshotPublicationDecision::RuntimeLiveWithoutUsableArtifact => {
+            SuspendSnapshotPublicationDecision::RuntimeLiveWithoutUsableArtifact
+            | SuspendSnapshotPublicationDecision::CaptureRefused => {
                 let db = self.startup_recovery_db()?;
                 if crate::db::rollback_suspending_to_paused(&db, &row.id)? {
                     drop(db);
+                    if refused {
+                        let service = self.clone();
+                        let id = row.id.clone();
+                        self.task_tracker.spawn(async move {
+                            // Serialize with a new suspend: a delayed re-arm
+                            // must not follow its monitoring unsubscribe.
+                            let _wake = tokio::select! {
+                                biased;
+                                _ = service.shutdown_token.cancelled() => return,
+                                guard = service.auto_lifecycle.wake_lock(&id).lock_owned() => guard,
+                            };
+                            if service
+                                .lookup_sandbox(&id)
+                                .is_ok_and(|row| row.state.is_unowned(SandboxState::Paused))
+                                && (service.sandbox_runtime_live)(&id)
+                            {
+                                service.watchdog.rearm_sandbox_from_db(&id).await;
+                            }
+                        });
+                    }
                     // Staging is rediscovered independently of this transition
                     // by the inventory loop, including after restart or a failed
                     // deletion. A rollback is not evidence that a writer exited.
@@ -1110,13 +1152,11 @@ impl SandboxManagerService {
                     outcome: crate::db::StartupRecoveryOutcome::Deferred,
                 })
             }
-            SuspendSnapshotPublicationDecision::RuntimeGoneWithoutUsableArtifact => {
+            SuspendSnapshotPublicationDecision::RuntimeGoneWithoutUsableArtifact
+            | SuspendSnapshotPublicationDecision::BlockedAttempt(_) => {
                 let db = self.startup_recovery_db()?;
-                let quarantined = crate::db::mark_suspending_quarantined(
-                    &db,
-                    &row.id,
-                    crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE,
-                )?;
+                let quarantined =
+                    crate::db::mark_suspending_quarantined(&db, &row.id, blocked_reason)?;
                 drop(db);
                 if !quarantined {
                     crate::metrics::snapshot::create_recovery(
@@ -1139,7 +1179,7 @@ impl SandboxManagerService {
                     SandboxEventSource::SbxManager,
                     SandboxEventDetails::default()
                         .trigger(SandboxEventTrigger::System)
-                        .reason(crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE)
+                        .reason(blocked_reason)
                         .with_from_status(row.state)
                         .with_to_status(SandboxState::Quarantined),
                 );
@@ -1155,7 +1195,7 @@ impl SandboxManagerService {
     fn stage_recovered_teardown_artifact(
         &self,
         row: crate::db::SandboxRow,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         local_artifact_id: LocalArtifactId,
         snapshot_dir: std::path::PathBuf,
     ) -> Result<crate::db::StartupRecoveryRecord, StartupRecoveryError> {

@@ -1,83 +1,39 @@
-use pplx_space_common_core::types::{OrgId, SandboxId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_sandbox_model::SandboxId;
 
-use crate::api_surface::ApiSurface;
 use serde::{Deserialize, Deserializer, Serialize};
 use sqlx::FromRow;
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use pplx_space_common_core::types::{
-    ArtifactVersion, AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStatus, Digest,
-    EcwCredentialEpoch, NodeAddress, NodeId, NodeManagedBy, NodePoolName, NodeRole, PodUid,
-    SandboxActivationAttemptId, SandboxAutoLifecyclePatch, SandboxOwnerSource, SemVer,
-    TemplateReference,
+use pplx_space_accounts::{NodeId, SandboxOwnerSource};
+use pplx_space_auto_lifecycle::{
+    AutoLifecyclePolicy, AutoLifecycleStatus, SandboxAutoLifecyclePatch,
 };
+use pplx_space_content_digest::Digest;
+use pplx_space_execution_spec::ArtifactVersion;
+pub use pplx_space_net_common::NetworkPolicyCondition;
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyV1};
+use pplx_space_node_model::{NodeAddress, NodeManagedBy, NodePoolName, NodeRole};
+use pplx_space_semver::SemVer;
+use pplx_space_template_model::TemplateReference;
 
 use crate::user_role::UserRole;
 use pplx_space_cluster_pool::PoolConfigOwner;
+use pplx_space_sandbox_store::SandboxMetadata;
 
-/// The `sandboxes.metadata` document shape, owned by the sandbox store
-/// (it is the shape of a column on that table) and re-exported here so the
-/// api's existing `crate::models::SandboxMetadata` paths keep resolving.
-pub use pplx_space_sandbox_store::{SandboxMetadata, SandboxMetadataValue};
+/// The account rows, owned by the accounts store; this crate-internal alias
+/// keeps the api's `crate::models::{Organization, User, ApiKey, Cluster}`
+/// paths resolving.
+pub(crate) use pplx_space_accounts_store::{ApiKey, Cluster, Organization, User};
 
-mod sandbox_state;
-pub use sandbox_state::{SandboxStateInput, is_tombstone};
-
-// --- Database models ---
-
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct Organization {
-    pub id: OrgId,
-    pub name: String,
-    pub slug: String,
-    pub parent_id: Option<Uuid>,
-    pub theme_primary: Option<String>,
-    pub theme_secondary: Option<String>,
-    pub logo_url: Option<String>,
-    /// Advisory BYOK opt-in flag. Signals callers to route writes
-    /// through credmgr + populate the matching `*_encrypted_fields`
-    /// sidecar; does not itself encrypt or decrypt anything.
-    pub byok_enabled: bool,
-    /// Per-org object storage override for base snapshot uploads.
-    /// `s3://bucket/prefix?region=...` URI. When set, snapshot files
-    /// are uploaded to the org's own bucket instead of the cluster
-    /// default. NULL falls through to the cluster-wide env-var config.
-    pub snapshot_base_object_storage_uri: Option<String>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub updated_at: OffsetDateTime,
-}
-
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct Cluster {
-    pub id: Uuid,
-    pub name: String,
-    pub managing_org_id: OrgId,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub updated_at: OffsetDateTime,
-}
-
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct User {
-    pub id: UserId,
-    pub email: String,
-    #[serde(skip_serializing)]
-    pub password_hash: String,
-    pub display_name: String,
-    pub org_id: OrgId,
-    pub role: UserRole,
-    #[serde(skip_serializing)]
-    pub owner_source: SandboxOwnerSource,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub updated_at: OffsetDateTime,
+/// Which users may sign in to the console: the api's rules over the
+/// accounts store's `User` row.
+pub trait ConsoleSignIn {
+    fn password_login_configured(&self) -> bool;
+    /// Whether a verified external console identity may act as this user.
+    fn external_console_sign_in_allowed(&self) -> bool;
 }
 
 // Bootstrap service users created before password markers were normalized
@@ -85,8 +41,8 @@ pub struct User {
 // service-user provisioning writes the shared `!` marker.
 const LEGACY_DISABLED_SERVICE_ACCOUNT: &str = "disabled-service-account";
 
-impl User {
-    pub fn password_login_configured(&self) -> bool {
+impl ConsoleSignIn for User {
+    fn password_login_configured(&self) -> bool {
         self.owner_source == SandboxOwnerSource::Local
             && self.password_hash != "!"
             && self.password_hash != LEGACY_DISABLED_SERVICE_ACCOUNT
@@ -99,11 +55,16 @@ impl User {
     /// stays disabled. A local user whose password is locked (`!`) remains
     /// eligible: the external authenticator replaces the password, and its
     /// admission policy decides which identities reach this lookup at all.
-    pub fn external_console_sign_in_allowed(&self) -> bool {
+    fn external_console_sign_in_allowed(&self) -> bool {
         self.owner_source == SandboxOwnerSource::Local
             && self.password_hash != LEGACY_DISABLED_SERVICE_ACCOUNT
     }
 }
+
+mod sandbox_state;
+pub use sandbox_state::{SandboxStateInput, is_tombstone};
+
+// --- Database models ---
 
 /// User metadata returned only by the authenticated admin surface.
 ///
@@ -135,90 +96,10 @@ pub struct Session {
     pub created_at: OffsetDateTime,
 }
 
-#[derive(Debug, Clone, FromRow)]
-pub struct ApiKey {
-    pub id: Uuid,
-    pub org_id: OrgId,
-    pub name: String,
-    pub key_hash: String,
-    pub created_by: Option<Uuid>,
-    pub last_used_at: Option<OffsetDateTime>,
-    pub federated_owner_assertions_enabled: bool,
-    /// Surfaces this credential may authenticate against. Enforced at the
-    /// lookup rather than by each caller, so a new surface cannot forget.
-    pub allowed_surfaces: Vec<ApiSurface>,
-    pub created_at: OffsetDateTime,
-    pub updated_at: OffsetDateTime,
-}
-
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct Sandbox {
-    pub id: SandboxId,
-    pub name: Option<String>,
-    /// SPACE user row that owns the sandbox. Federated owners map onto local
-    /// user/org rows so downstream paths keep the normal sandbox FK shape.
-    pub user_id: UserId,
-    /// The current email of `user_id`'s user, read with the row. A federated
-    /// owner's user row holds a generated placeholder, which no response
-    /// shows (see `SandboxResponse::user_email`).
-    #[serde(default)]
-    pub user_email: Option<String>,
-    pub org_id: OrgId,
-    pub owner_source: SandboxOwnerSource,
-    pub upstream_issuer: Option<String>,
-    pub upstream_org_id: Option<String>,
-    pub upstream_subject_id: Option<String>,
-    pub managed_by: String,
-    pub lifecycle: String,
-    pub placement: String,
-    pub active_node_id: Option<NodeId>,
-    pub active_node_name: Option<String>,
-    pub active_node_role: Option<NodeRole>,
-    pub active_node_address: Option<NodeAddress>,
-    pub active_node_managed_by: Option<NodeManagedBy>,
-    pub target_node_id: Option<NodeId>,
-    pub active_execution_generation: Option<i64>,
-    pub active_pod_uid: Option<PodUid>,
-    pub active_activation_attempt_id: Option<SandboxActivationAttemptId>,
-    pub ecw_credential_epoch: EcwCredentialEpoch,
-    pub placement_changed_at: Option<OffsetDateTime>,
-    pub template_id: Option<String>,
-    pub content_hash: Option<String>,
-    pub release_tags: Vec<String>,
-    pub vcpu: Option<i32>,
-    pub memory_mib: Option<i32>,
-    pub disk_mib: Option<i32>,
-    pub disk_io_max_operations_per_sec: i64,
-    pub disk_io_max_bandwidth_mib_per_sec: i64,
-    pub env: sqlx::types::Json<BTreeMap<String, String>>,
-    pub metadata: sqlx::types::Json<SandboxMetadata>,
-    pub auto_lifecycle: sqlx::types::Json<AutoLifecyclePolicy>,
-    pub auto_lifecycle_state: sqlx::types::Json<AutoLifecycleRuntimeState>,
-    pub network_policy: Option<sqlx::types::Json<NetworkPolicy>>,
-    pub network_policy_generation: i64,
-    pub template_network_policy: Option<sqlx::types::Json<NetworkPolicyV1>>,
-    pub template_network_policy_generation: Option<i64>,
-    pub next_auto_event_at: Option<i64>,
-    pub snapshots_enabled_desired: bool,
-    /// BYOK: this sandbox runs on dm-crypt encrypted volumes. Immutable for
-    /// the sandbox's lifetime — stamped in the create INSERT, never UPDATEd.
-    /// Loaded with COALESCE so pre-column (NULL) rows read plaintext.
-    pub volume_encryption: bool,
-    /// `started` was reported to the caller before the guest command API was
-    /// confirmed ready (a budget-exhausted slow create whose pod proxy was
-    /// reachable). The access path forces a command-ready confirmation and
-    /// clears this on success; until then a data-plane op gets the
-    /// SDK-recoverable `sandbox_timeout` rather than a bare upstream error.
-    #[serde(default)]
-    pub command_ready_pending: bool,
-    pub last_used_at: Option<OffsetDateTime>,
-    pub last_access_at: Option<OffsetDateTime>,
-    pub last_command_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub updated_at: OffsetDateTime,
-}
+/// A sandbox's response row, owned by the sandbox store with the
+/// statements that read it; this crate-internal alias keeps the api's
+/// `crate::models::Sandbox` paths resolving.
+pub(crate) use pplx_space_sandbox_store::direct::sandbox_listing::Sandbox;
 
 /// Per-organization Key Encryption Key. Populated by tenant
 /// onboarding; consumed by the credmgr at wrap/unwrap time.
@@ -229,7 +110,7 @@ pub struct Sandbox {
 /// active key for new wraps.
 ///
 /// `updated_at` is trigger-maintained; do not set manually.
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrgMasterKey {
     pub id: Uuid,
     pub org_id: OrgId,
@@ -241,6 +122,20 @@ pub struct OrgMasterKey {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+}
+
+impl From<pplx_space_byok_store::MasterKeyRecord> for OrgMasterKey {
+    fn from(record: pplx_space_byok_store::MasterKeyRecord) -> Self {
+        Self {
+            id: record.id,
+            org_id: record.org_id,
+            provider: record.provider,
+            key_identifier: record.key_identifier,
+            retired_at: record.retired_at,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        }
+    }
 }
 
 /// Per-sandbox encryption sidecar. Presence-of-row IS the encryption
@@ -337,16 +232,6 @@ pub struct SandboxNodeSummary {
     pub role: Option<NodeRole>,
     pub address: Option<NodeAddress>,
     pub managed_by: Option<NodeManagedBy>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct NetworkPolicyCondition {
-    #[serde(rename = "type")]
-    pub condition_type: String,
-    pub status: String,
-    pub reason: Option<String>,
-    pub message: Option<String>,
-    pub last_transition_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -450,7 +335,7 @@ impl SandboxResponse {
     }
 }
 
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxPortExposure {
     pub sandbox_id: SandboxId,
     pub protocol: String,
@@ -476,6 +361,43 @@ pub struct SandboxPortExposure {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+}
+
+impl From<pplx_space_sandbox_store::port_exposures::PortExposureRecord> for SandboxPortExposure {
+    fn from(record: pplx_space_sandbox_store::port_exposures::PortExposureRecord) -> Self {
+        let pplx_space_sandbox_store::port_exposures::PortExposureRecord {
+            sandbox_id,
+            protocol,
+            guest_port,
+            visibility,
+            source,
+            desired_state,
+            apply_state,
+            last_applied_node_id,
+            last_error,
+            last_bridge_status,
+            last_applied_bridge_generation,
+            last_observed_at,
+            created_at,
+            updated_at,
+        } = record;
+        Self {
+            sandbox_id,
+            protocol,
+            guest_port,
+            visibility,
+            source,
+            desired_state,
+            apply_state,
+            last_applied_node_id,
+            last_error,
+            last_bridge_status,
+            last_applied_bridge_generation,
+            last_observed_at,
+            created_at,
+            updated_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -865,9 +787,9 @@ pub struct TemplateBuildRequest {
 pub struct SystemTemplateBuildRequest {
     /// Exact qualified runtime/kernel pair. Omitted: retain the bundled recipe's behavior.
     #[serde(default)]
-    pub environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    pub environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     #[serde(default)]
-    pub base: Option<pplx_space_common_core::types::TemplateReference>,
+    pub base: Option<pplx_space_template_model::TemplateReference>,
     #[serde(default)]
     pub force: bool,
     #[serde(default)]
@@ -913,7 +835,7 @@ pub struct TemplateBuildConfig {
     #[serde(default)]
     pub disk_bytes: Option<u64>,
     #[serde(default)]
-    pub balloon: Option<pplx_space_common_core::types::BalloonConfig>,
+    pub balloon: Option<pplx_space_execution_spec::BalloonConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -965,7 +887,7 @@ pub struct TemplateBuildUbuntuMinimalCloudSquashfs {
 #[serde(deny_unknown_fields)]
 pub struct TemplateBuildStep {
     #[serde(default)]
-    pub set_runtime: Option<pplx_space_common_core::types::TemplateRuntime>,
+    pub set_runtime: Option<pplx_space_template_runtime::TemplateRuntime>,
     #[serde(default)]
     pub clear_runtime: Option<TemplateBuildClearRuntime>,
     #[serde(default)]
@@ -1048,7 +970,7 @@ pub struct TemplateBuildStartResponse {
     pub template_name: String,
 }
 
-pub use pplx_space_common_core::types::TemplateBuildJobState as TemplateBuildStateResponse;
+pub use pplx_space_template_model::TemplateBuildJobState as TemplateBuildStateResponse;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TemplateBuildStatusResponse {
@@ -1132,6 +1054,14 @@ pub struct ClusterPoolConfigRequest {
     /// Members of an encryptable config serve only encrypted creates.
     #[serde(default)]
     pub encryptable: bool,
+    /// The release whose config this changes, for an edit of an existing
+    /// pool: the change goes to that release's config, not to the release
+    /// `template_name` and `content_hash` resolve to now. A twin named here
+    /// keeps the change to itself. The release must be one of
+    /// `template_name`'s, and `content_hash`, when given, its own spelling of
+    /// the hash.
+    #[serde(default)]
+    pub template_release_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize)]

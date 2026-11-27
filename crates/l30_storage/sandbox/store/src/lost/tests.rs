@@ -1,7 +1,9 @@
-use pplx_space_common_core::types::{NodeId, SandboxId, SubstrateKind};
+use pplx_space_accounts::NodeId;
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::SandboxId;
 
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -162,7 +164,7 @@ async fn write_off_lost_sandboxes_clears_only_the_gone_nodes_rows() -> TestResul
     let inactive_before = execution(pool, lost_inactive).await?;
 
     let mut tx = pool.begin().await?;
-    write_off_lost_sandboxes(&mut tx, gone, &[lost]).await?;
+    write_off_lost_sandboxes(&mut *tx, gone, &[lost]).await?;
     tx.commit().await?;
 
     assert_eq!(

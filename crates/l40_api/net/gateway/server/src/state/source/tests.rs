@@ -76,7 +76,7 @@ async fn initial_hydration_treats_refusal_before_registration_as_pending() {
     const SLOW_REPLY: Duration = Duration::from_millis(100);
     const IN_FLIGHT: Duration = Duration::from_millis(400);
     let window_closed = REGISTRATION_WINDOW + Duration::from_millis(1);
-    let sandbox_id = pplx_space_common_core::types::SandboxId::new();
+    let sandbox_id = pplx_space_sandbox_model::SandboxId::new();
     for (registered_after, crosses_window) in [
         (Some(Duration::from_millis(300)), false),
         (None, false),
@@ -248,7 +248,7 @@ async fn policy_pull_attaches_its_pending_refusal_mark_to_the_request() {
     }
 
     let capture = CaptureMark::default();
-    let sandbox_id = pplx_space_common_core::types::SandboxId::new();
+    let sandbox_id = pplx_space_sandbox_model::SandboxId::new();
     let pending = ExpectedGrpcStatus::new(tonic::Code::PermissionDenied);
     for mark in [Some(pending), None] {
         let pulled =

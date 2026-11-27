@@ -1,27 +1,8 @@
-//! Binding a session to its process and recording reconnects.
+//! Binding a session to its process, recording its exit, and recording
+//! reconnects.
 
 use super::*;
-
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct BoundProcessRow {
-    pub(super) session_id: String,
-    pub(super) protocol_session_id: Option<String>,
-    pub(super) backend_process_id: String,
-    pub(super) newly_bound: bool,
-}
-
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct ExistingProcessBindingRow {
-    pub(super) backend_process_id: Option<String>,
-}
-
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct ReconnectRow {
-    pub(super) session_id: String,
-    pub(super) protocol_session_id: Option<String>,
-    pub(super) reconnect_count: i64,
-    pub(super) last_reconnect_reason: String,
-}
+use pplx_space_data_plane_session_store as data_plane_session_store;
 
 pub(crate) async fn bind_session_process(
     pool: &sqlx::PgPool,
@@ -30,44 +11,13 @@ pub(crate) async fn bind_session_process(
     let session_id = required(&request.session_id, "session_id")?;
     let protocol_session_id = optional(request.protocol_session_id.as_deref());
     let process_id = required(&request.process_id, "process_id")?;
-    let row = sqlx::query_as::<_, BoundProcessRow>(sql!(
-        "WITH target AS (
-             SELECT session_id,
-                    protocol_session_id,
-                    backend_process_id IS NULL AS newly_bound
-             FROM data_plane_sessions
-             WHERE session_id = $1
-               AND ($2::TEXT IS NULL OR protocol_session_id = $2)
-               AND kind IN ('terminal', 'process')
-               AND (expires_at IS NULL OR expires_at > NOW())
-               AND (backend_process_id IS NULL OR backend_process_id = $3)
-             FOR UPDATE
-         ),
-         updated AS (
-             UPDATE data_plane_sessions d
-             SET backend_process_id = COALESCE(d.backend_process_id, $3),
-                 backend_process_bound_at = CASE
-                     WHEN d.backend_process_id IS NULL THEN NOW()
-                     ELSE d.backend_process_bound_at
-                 END,
-                 updated_at = NOW()
-             FROM target
-             WHERE d.session_id = target.session_id
-             RETURNING d.session_id,
-                       d.protocol_session_id,
-                       d.backend_process_id,
-                       target.newly_bound
-         )
-         SELECT session_id,
-                protocol_session_id,
-                backend_process_id,
-                newly_bound
-         FROM updated"
-    ))
-    .bind(&session_id)
-    .bind(protocol_session_id.as_deref())
-    .bind(&process_id)
-    .fetch_optional(pool)
+    let row = data_plane_session_store::bind_session_process(
+        pool,
+        &session_id,
+        protocol_session_id.as_deref(),
+        &process_id,
+        request.records_exit,
+    )
     .await
     .map_err(|error| Status::internal(format!("bind data-plane session process: {error}")))?;
 
@@ -80,21 +30,15 @@ pub(crate) async fn bind_session_process(
         });
     }
 
-    let existing = sqlx::query_as::<_, ExistingProcessBindingRow>(sql!(
-        "SELECT backend_process_id
-         FROM data_plane_sessions
-         WHERE session_id = $1
-           AND ($2::TEXT IS NULL OR protocol_session_id = $2)
-           AND kind IN ('terminal', 'process')
-           AND (expires_at IS NULL OR expires_at > NOW())"
-    ))
-    .bind(&session_id)
-    .bind(protocol_session_id.as_deref())
-    .fetch_optional(pool)
+    let existing = data_plane_session_store::live_process_session_bound_process_id(
+        pool,
+        &session_id,
+        protocol_session_id.as_deref(),
+    )
     .await
     .map_err(|error| Status::internal(format!("lookup data-plane session process: {error}")))?;
 
-    match existing.and_then(|row| row.backend_process_id) {
+    match existing {
         Some(existing_process_id) => Err(Status::already_exists(format!(
             "data-plane session already bound to process {existing_process_id}"
         ))),
@@ -104,6 +48,28 @@ pub(crate) async fn bind_session_process(
     }
 }
 
+/// Closes a terminal or process session whose bound process a stream saw
+/// exit. Only a pending or open session bound to `process_id` closes: a
+/// revoked one stays revoked, and a stale report about another process
+/// changes nothing. Repeating it is a no-op that reports `closed: false`.
+pub(crate) async fn record_session_process_exited(
+    pool: &sqlx::PgPool,
+    request: RecordDataPlaneSessionProcessExitedRequest,
+) -> Result<RecordDataPlaneSessionProcessExitedResponse, Status> {
+    let session_id = required(&request.session_id, "session_id")?;
+    let protocol_session_id = optional(request.protocol_session_id.as_deref());
+    let process_id = required(&request.process_id, "process_id")?;
+    let closed = data_plane_session_store::close_exited_process_session(
+        pool,
+        &session_id,
+        protocol_session_id.as_deref(),
+        &process_id,
+    )
+    .await
+    .map_err(|error| Status::internal(format!("record data-plane session exit: {error}")))?;
+    Ok(RecordDataPlaneSessionProcessExitedResponse { closed })
+}
+
 pub(crate) async fn record_session_reconnect(
     pool: &sqlx::PgPool,
     request: RecordDataPlaneSessionReconnectRequest,
@@ -111,23 +77,12 @@ pub(crate) async fn record_session_reconnect(
     let session_id = required(&request.session_id, "session_id")?;
     let protocol_session_id = optional(request.protocol_session_id.as_deref());
     let reason = reconnect_reason(request.reason)?;
-    let row = sqlx::query_as::<_, ReconnectRow>(sql!(
-        "UPDATE data_plane_sessions
-         SET reconnect_count = reconnect_count + 1,
-             last_reconnect_reason = $3,
-             updated_at = NOW()
-         WHERE session_id = $1
-           AND ($2::TEXT IS NULL OR protocol_session_id = $2)
-           AND (expires_at IS NULL OR expires_at > NOW())
-         RETURNING session_id,
-                   protocol_session_id,
-                   reconnect_count,
-                   last_reconnect_reason"
-    ))
-    .bind(&session_id)
-    .bind(protocol_session_id.as_deref())
-    .bind(reason.as_str())
-    .fetch_optional(pool)
+    let row = data_plane_session_store::record_reconnect(
+        pool,
+        &session_id,
+        protocol_session_id.as_deref(),
+        reason.as_str(),
+    )
     .await
     .map_err(|error| Status::internal(format!("record data-plane session reconnect: {error}")))?
     .ok_or_else(|| Status::not_found("data-plane session not found"))?;

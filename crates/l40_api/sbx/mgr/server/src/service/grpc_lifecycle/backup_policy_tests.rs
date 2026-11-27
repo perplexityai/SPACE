@@ -1,29 +1,32 @@
 //! Characterization of the artifact-backup admission, network-policy, and
 //! `Kill` handler contracts that are reachable without host runtime state.
 //!
-//! Fixtures fail closed: no passing case reaches node-manager, vol-mgr, the
-//! template-manager socket, or a real cluster-api endpoint. The one exception
-//! under regression is `Kill`: if the restart drain stops refusing at cleanup
+//! Fixtures fail closed: no case reaches the host's node-manager, vol-mgr, the
+//! template-manager socket, or a real cluster-api endpoint; a test that
+//! scripts node-manager serves its own. Under regression, `Kill` is the
+//! exception: if the restart drain stops refusing at cleanup
 //! admission, a fatal signal to a started or paused row attempts its
 //! node-manager dispatch before the refusal bound fails the test.
 
 use super::{ArtifactBackupHandoff, ArtifactBackupSubmission, SubmitSuspendSnapshotOutcome};
 use crate::db::PolicyAuthority;
+use crate::node_manager_transport::fake::FakeNodeManager;
 use crate::proto::enqueue_artifact_backup_request::Source;
-use crate::service::SandboxManagerService;
 use crate::service::activation_support::internal_request;
 use crate::service::network_policy::EffectiveNetworkPolicy;
 use crate::service::tests::service_tests::insert_test_sandbox;
+use crate::service::{SandboxManagerService, SandboxManagerServiceOptions};
 use crate::state::{SandboxState, SandboxStatus};
-use pplx_space_common_core::node_drain_signals::{
-    REUPLOAD_ARTIFACT_MISSING_MARKER, REUPLOAD_SANDBOX_UNKNOWN_MARKER,
-};
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, BackupAttemptId, LocalArtifactId, SandboxId, SnapshotName,
-};
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::proto as policy_proto;
+use pplx_space_rpc_contracts::node_drain_signals::{
+    REUPLOAD_ARTIFACT_MISSING_MARKER, REUPLOAD_SANDBOX_UNKNOWN_MARKER,
+};
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat;
+use pplx_space_snapshot_model::{
+    ArtifactKind, ArtifactOrigin, BackupAttemptId, LocalArtifactId, SnapshotName,
+};
 use std::ffi::OsStr;
 use std::sync::Arc;
 
@@ -94,7 +97,7 @@ async fn artifact_backup_refuses_a_runtime_upgrade_and_its_internal_copy() {
         return;
     }
     let execution = pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap()
     .first()
@@ -110,6 +113,7 @@ async fn artifact_backup_refuses_a_runtime_upgrade_and_its_internal_copy() {
         &conn,
         &id,
         execution.environment().unwrap(),
+        crate::db::RuntimeUpgradeTargetState::Started,
         None,
     )
     .operation_id;
@@ -345,6 +349,112 @@ async fn artifact_backup_admission_refuses_sources_it_cannot_back_up() {
     }
 }
 
+/// A stopped sandbox's current-instance disk backup first snapshots its disk
+/// through node-manager, which refuses while another host mutation, such as
+/// the network-slot reset after its cleanup, holds the sandbox. That refusal,
+/// which carries node-manager's busy marker, stays retryable through the
+/// enqueue; any other failure is internal, an `Unavailable` without the
+/// marker and a transport `Unavailable` included.
+#[tokio::test]
+async fn stopped_disk_adoption_keeps_a_node_manager_refusal_retryable() {
+    let token_dir = tempfile::tempdir().unwrap();
+    let token_path = token_dir.path().join("cluster-api.token");
+    if !pplx_space_test_env::enter_test_process(&cluster_api_env(
+        LOOPBACK_ENDPOINT,
+        STATIC_TOKEN,
+        &token_path,
+    )) {
+        return;
+    }
+    let refused = format!(
+        "sandbox host mutation or reset {}",
+        pplx_space_rpc_contracts::artifact_backup_signals::NODE_MANAGER_SANDBOX_BUSY_MARKER
+    );
+    for (refusal, expected) in [
+        (
+            tonic::Status::unavailable(refused),
+            tonic::Code::Unavailable,
+        ),
+        (
+            tonic::Status::unavailable("quiesce encrypted disk capture: resume failed"),
+            tonic::Code::Internal,
+        ),
+        (
+            tonic::Status::internal("btrfs snapshot failed"),
+            tonic::Code::Internal,
+        ),
+    ] {
+        let node_manager = FakeNodeManager::default()
+            .unary(
+                "CreateBtrfsSnapshot",
+                move |_: pplx_space_node_mgr_client::proto::CreateBtrfsSnapshotRequest| -> Result<
+                    pplx_space_node_mgr_client::proto::CreateBtrfsSnapshotResponse,
+                    tonic::Status,
+                > { Err(refusal.clone()) },
+            )
+            .serve();
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &id, SandboxState::Stopped);
+        let service = SandboxManagerService::new_with_options(
+            conn,
+            SandboxManagerServiceOptions {
+                node_manager: node_manager.connector(),
+                ..SandboxManagerServiceOptions::for_test()
+            },
+        );
+
+        let error = service
+            .enqueue_artifact_backup(artifact_backup_request(
+                &id,
+                crate::proto::ArtifactKind::Disk,
+                Some(Source::CurrentInstance(
+                    crate::proto::CurrentInstanceSource {},
+                )),
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), expected, "{error}");
+        assert_eq!(node_manager.calls(), ["CreateBtrfsSnapshot"]);
+        assert_eq!(snapshot_upload_jobs(&service, &id), 0);
+    }
+
+    // A transport failure reads `Unavailable` too, but carries no busy
+    // marker, so it isn't passed through as node-manager's refusal.
+    let sockets = tempfile::tempdir().unwrap();
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &id, SandboxState::Stopped);
+    let service = SandboxManagerService::new_with_options(
+        conn,
+        SandboxManagerServiceOptions {
+            node_manager: crate::node_manager_transport::fake::unbound_on_call(
+                &sockets.path().join("node-manager.sock"),
+            ),
+            ..SandboxManagerServiceOptions::for_test()
+        },
+    );
+    let error = service
+        .enqueue_artifact_backup(artifact_backup_request(
+            &id,
+            crate::proto::ArtifactKind::Disk,
+            Some(Source::CurrentInstance(
+                crate::proto::CurrentInstanceSource {},
+            )),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Internal, "{error}");
+    assert!(
+        error
+            .message()
+            .contains("The service is currently unavailable"),
+        "{error}"
+    );
+    assert_eq!(snapshot_upload_jobs(&service, &id), 0);
+}
+
 /// Empty cluster-api wiring is retryable, operator-fixable configuration. It
 /// is refused before sandbox lookup, so the drain promoter finds no terminal
 /// marker in the backup refusal. Eviction's reading of the matching reupload
@@ -401,8 +511,8 @@ fn upload_config(bucket: &str) -> crate::snapshot_upload::SnapshotUploadConfig {
 /// Write a published artifact directory whose metadata names no artifact
 /// identity, so any identity in the durable intent came from the submission.
 fn write_artifact(dir: &std::path::Path, sandbox_id: &str, files: &[&str]) {
-    let execution = pplx_space_common_core::types::SnapshotExecutionMetadata::new(
-        pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+    let execution = pplx_space_execution_spec::SnapshotExecutionMetadata::new(
+        pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
             std::env::consts::ARCH.parse().unwrap(),
             vec![],
         ),
@@ -644,7 +754,7 @@ async fn an_upload_names_its_capture_generation_only_on_evidence() {
     )) {
         return;
     }
-    let generation = |n| pplx_space_common_core::types::ExecutionGeneration::new(n).unwrap();
+    let generation = |n| pplx_space_sandbox_model::ExecutionGeneration::new(n).unwrap();
     use crate::capture_record::RecordWriter::{CapturingTeardown as Teardown, Recovery};
     // (case, generation sent, caller vouches, record's generation and writer,
     // expected)
@@ -1129,7 +1239,7 @@ async fn get_network_policy_reports_each_sandbox_policy_source() {
     conn.execute(
         "UPDATE sandboxes SET template = ?1 WHERE id = ?2",
         crate::db::fixture::params![
-            pplx_space_common_core::types::ORPHANED_SANDBOX_TEMPLATE,
+            pplx_space_template_model::ORPHANED_SANDBOX_TEMPLATE,
             orphaned
         ],
     )

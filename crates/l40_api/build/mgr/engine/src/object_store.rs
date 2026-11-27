@@ -6,7 +6,7 @@ use pplx_space_credmgr_client::{
 };
 use pplx_space_object_store::ObjectCredentials;
 
-use pplx_space_common_core::types::TemplateName;
+use pplx_space_template_model::TemplateName;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ObjectStoreConfig {
@@ -129,7 +129,8 @@ pub(crate) enum CredentialSubject<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StorageAccess {
     Read,
-    Write,
+    /// Publication reads back a control object another publication already
+    /// put, to tell a retry from a twin, so there's no write-only access.
     ReadWrite,
 }
 
@@ -137,7 +138,6 @@ impl StorageAccess {
     fn scope(self) -> String {
         match self {
             Self::Read => STORAGE_READ_SCOPE.to_string(),
-            Self::Write => STORAGE_WRITE_SCOPE.to_string(),
             Self::ReadWrite => format!("{STORAGE_READ_SCOPE} {STORAGE_WRITE_SCOPE}"),
         }
     }

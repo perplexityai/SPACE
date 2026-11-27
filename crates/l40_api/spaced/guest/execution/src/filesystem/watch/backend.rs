@@ -936,7 +936,7 @@ fn relative_event_path(root: &Path, path: &Path) -> Result<PathBuf, Status> {
     let relative = path
         .strip_prefix(root)
         .map_err(|_| Status::internal("file watcher event escaped root"))?;
-    let relative = if relative.as_os_str().is_empty() {
+    let relative = if relative.is_empty() {
         Path::new(".")
     } else {
         relative

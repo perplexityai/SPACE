@@ -33,16 +33,15 @@
 //! whose owner commit didn't land, and a redrive that finds the row already
 //! `started` has nothing left to do.
 
-use pplx_space_common_core::sql;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use crate::metrics::sandbox::api::{WakeCompletionAction, WakeCompletionRedriveOutcome};
 use futures_util::future::BoxFuture;
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_store as sandbox_store;
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
@@ -302,15 +301,7 @@ const fn completed_event_for(action: WakeCompletionAction) -> SandboxEventType {
 /// ref). Best-effort: on failure the per-node exposure reconciler's periodic
 /// tick remains the backstop.
 async fn enqueue_open_port_exposure_reconcile(pool: &PgPool, sandbox_id: SandboxId) {
-    let has_open = match sqlx::query_scalar::<_, bool>(sql!(
-        "SELECT EXISTS (
-             SELECT 1 FROM sandbox_port_exposures
-             WHERE sandbox_id = $1 AND desired_state = 'open'
-         )"
-    ))
-    .bind(sandbox_id)
-    .fetch_one(pool)
-    .await
+    let has_open = match pplx_space_sandbox_store::port_exposures::any_open(pool, sandbox_id).await
     {
         Ok(has_open) => has_open,
         Err(err) => {

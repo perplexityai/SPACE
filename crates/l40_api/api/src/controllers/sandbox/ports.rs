@@ -3,9 +3,8 @@ use crate::controllers::db_contention_error;
 use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519Authority, ed25519::insert_space_api_route_ed25519_token,
 };
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{MAX_SANDBOX_PORT_EXPOSURES, SandboxId};
 use pplx_space_events::{SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventType};
+use pplx_space_sandbox_model::{MAX_SANDBOX_PORT_EXPOSURES, SandboxId};
 use pplx_space_state_reconciliation::ReconcileReason;
 
 impl SandboxController {
@@ -14,29 +13,15 @@ impl SandboxController {
         pool: &PgPool,
         sandbox: &Sandbox,
     ) -> Result<Vec<SandboxPortExposure>, ControllerError> {
-        sqlx::query_as::<_, SandboxPortExposure>(sql!(
-            "SELECT sandbox_id,
-                    protocol,
-                    guest_port,
-                    visibility,
-                    source,
-                    desired_state,
-                    apply_state,
-                    last_applied_node_id,
-                    last_error,
-                    last_bridge_status,
-                    last_applied_bridge_generation,
-                    last_observed_at,
-                    created_at,
-                    updated_at
-             FROM sandbox_port_exposures
-             WHERE sandbox_id = $1
-             ORDER BY guest_port ASC, protocol ASC"
-        ))
-        .bind(sandbox.id)
-        .fetch_all(pool)
-        .await
-        .map_err(|err| db_contention_error("failed to list sandbox port exposures", &err))
+        pplx_space_sandbox_store::port_exposures::list(pool, sandbox.id)
+            .await
+            .map(|exposures| exposures.into_iter().map(Into::into).collect())
+            .map_err(|err| {
+                db_contention_error(
+                    "failed to list sandbox port exposures",
+                    &sqlx::Error::from(err),
+                )
+            })
     }
 
     pub async fn open_sandbox_port(
@@ -83,46 +68,45 @@ impl SandboxController {
         // Serialize admission per sandbox so concurrent API and internal ECW
         // opens cannot both observe the last free slot. Existing desired-open
         // rows remain idempotent and do not consume another slot.
-        let locked_sandbox = sqlx::query_scalar::<_, Uuid>(sql!(
-            "SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"
-        ))
-        .bind(sandbox.id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|err| db_contention_error("failed to lock sandbox for port admission", &err))?;
+        // Allow foreign-key checks while this transaction waits on reconciliation.
+        let locked_sandbox =
+            pplx_space_sandbox_store::row_locks::lock_id_no_key_update(&mut *tx, sandbox.id)
+                .await
+                .map_err(|err| {
+                    db_contention_error(
+                        "failed to lock sandbox for port admission",
+                        &sqlx::Error::from(err),
+                    )
+                })?;
         if locked_sandbox.is_none() {
             return Err(ControllerError::not_found("Sandbox"));
         }
-        let already_open = sqlx::query_scalar::<_, bool>(sql!(
-            "SELECT EXISTS (
-                 SELECT 1 FROM sandbox_port_exposures
-                 WHERE sandbox_id = $1
-                   AND protocol = $2
-                   AND guest_port = $3
-                   AND desired_state = 'open'
-             )"
-        ))
-        .bind(sandbox.id)
-        .bind(protocol)
-        .bind(port as i32)
-        .fetch_one(&mut *tx)
+        let already_open = pplx_space_sandbox_store::port_exposures::open_exists(
+            &mut *tx,
+            sandbox.id,
+            protocol,
+            port as i32,
+        )
         .await
         .map_err(|err| {
-            db_contention_error("failed to check existing sandbox port exposure", &err)
+            db_contention_error(
+                "failed to check existing sandbox port exposure",
+                &sqlx::Error::from(err),
+            )
         })?;
-        let other_open_ports = sqlx::query_scalar::<_, i64>(sql!(
-            "SELECT COUNT(*)
-             FROM sandbox_port_exposures
-             WHERE sandbox_id = $1
-               AND desired_state = 'open'
-               AND NOT (protocol = $2 AND guest_port = $3)"
-        ))
-        .bind(sandbox.id)
-        .bind(protocol)
-        .bind(port as i32)
-        .fetch_one(&mut *tx)
+        let other_open_ports = pplx_space_sandbox_store::port_exposures::count_other_open(
+            &mut *tx,
+            sandbox.id,
+            protocol,
+            port as i32,
+        )
         .await
-        .map_err(|err| db_contention_error("failed to count sandbox port exposures", &err))?;
+        .map_err(|err| {
+            db_contention_error(
+                "failed to count sandbox port exposures",
+                &sqlx::Error::from(err),
+            )
+        })?;
         if let Err(error) = enforce_sandbox_port_exposure_capacity(other_open_ports, already_open) {
             SandboxEvent::new(
                 sandbox.id,
@@ -132,48 +116,16 @@ impl SandboxController {
             .emit_with(event_details().error(error.to_string()));
             return Err(error);
         }
-        let exposure = sqlx::query_as::<_, SandboxPortExposure>(sql!(
-            "INSERT INTO sandbox_port_exposures (
-                 sandbox_id,
-                 protocol,
-                 guest_port,
-                 visibility,
-                 source,
-                 desired_state,
-                 apply_state,
-                 last_applied_node_id,
-                 last_error
-             )
-             VALUES ($1, $2, $3, $4, $5, 'open', 'pending', NULL, NULL)
-             ON CONFLICT (sandbox_id, protocol, guest_port) DO UPDATE
-             SET visibility = EXCLUDED.visibility,
-                 source = EXCLUDED.source,
-                 desired_state = 'open',
-                 apply_state = 'pending',
-                 last_error = NULL,
-                 updated_at = NOW()
-             RETURNING sandbox_id,
-                       protocol,
-                       guest_port,
-                       visibility,
-                       source,
-                       desired_state,
-                       apply_state,
-                       last_applied_node_id,
-                       last_error,
-                       last_bridge_status,
-                       last_applied_bridge_generation,
-                       last_observed_at,
-                       created_at,
-                       updated_at"
-        ))
-        .bind(sandbox.id)
-        .bind(protocol)
-        .bind(port as i32)
-        .bind(visibility)
-        .bind(source)
-        .fetch_one(&mut *tx)
+        let exposure = pplx_space_sandbox_store::port_exposures::upsert_open(
+            &mut *tx,
+            sandbox.id,
+            protocol,
+            port as i32,
+            visibility,
+            source,
+        )
         .await
+        .map(SandboxPortExposure::from)
         .map_err(|err| {
             let error = "failed to persist sandbox port exposure";
             // This upsert blocks on any uncommitted writer of the same
@@ -181,7 +133,7 @@ impl SandboxController {
             // sandbox row lock this transaction took. A lost race is not a
             // failed open: the caller retries and it succeeds, so it must not
             // leave a permanent-looking failure on the sandbox's timeline.
-            let mapped = db_contention_error(error, &err);
+            let mapped = db_contention_error(error, &sqlx::Error::from(err));
             if !mapped.is_lock_contention() {
                 SandboxEvent::new(
                     sandbox.id,
@@ -259,31 +211,16 @@ impl SandboxController {
         source: &str,
     ) -> Result<SandboxPortExposure, ControllerError> {
         let port = validate_sandbox_port(port)?;
-        let existing = sqlx::query_as::<_, SandboxPortExposure>(sql!(
-            "SELECT sandbox_id,
-                    protocol,
-                    guest_port,
-                    visibility,
-                    source,
-                    desired_state,
-                    apply_state,
-                    last_applied_node_id,
-                    last_error,
-                    last_bridge_status,
-                    last_applied_bridge_generation,
-                    last_observed_at,
-                    created_at,
-                    updated_at
-             FROM sandbox_port_exposures
-             WHERE sandbox_id = $1
-               AND protocol = 'tcp'
-               AND guest_port = $2"
-        ))
-        .bind(sandbox.id)
-        .bind(port as i32)
-        .fetch_optional(pool)
-        .await
-        .map_err(|err| db_contention_error("failed to load sandbox port exposure", &err))?;
+        let existing =
+            pplx_space_sandbox_store::port_exposures::get_tcp(pool, sandbox.id, port as i32)
+                .await
+                .map(|exposure| exposure.map(SandboxPortExposure::from))
+                .map_err(|err| {
+                    db_contention_error(
+                        "failed to load sandbox port exposure",
+                        &sqlx::Error::from(err),
+                    )
+                })?;
 
         if let Some(exposure) = existing
             && exposure.desired_state == SANDBOX_PORT_DESIRED_OPEN
@@ -349,15 +286,18 @@ impl SandboxController {
         // which restores/recreates it — charge the cluster activation limiter
         // for that implicit wake (no-op for a live sandbox with a ready pod,
         // which returns early above).
-        super::lifecycle::charge_implicit_access_activation(
-            self.cluster_admission.as_ref(),
-            &sandbox,
-            ExecutionActivityKind::Access,
-        )
-        .await?;
+        let live = crate::client_live_cap::LiveHandoff::new(
+            super::lifecycle::charge_implicit_access_activation(
+                self.cluster_admission.as_ref(),
+                &sandbox,
+                ExecutionActivityKind::Access,
+            )
+            .await?,
+        );
 
-        match self.apply_open_sandbox_port(&sandbox, port).await {
+        match self.apply_open_sandbox_port(&sandbox, port, &live).await {
             Ok(observation) => {
+                live.keep();
                 let exposure = mark_sandbox_port_exposure_applied(
                     pool,
                     sandbox.id,
@@ -416,7 +356,7 @@ impl SandboxController {
                     SandboxEventSource::Api,
                 )
                 .emit_with(details);
-                Err(error.error)
+                Err(*error.error)
             }
         }
     }
@@ -432,28 +372,20 @@ impl SandboxController {
         let mut tx = pool.begin().await.map_err(|err| {
             db_contention_error("failed to begin port exposure invalidation", &err)
         })?;
-        let result = sqlx::query(sql!(
-            "UPDATE sandbox_port_exposures
-             SET apply_state = 'pending',
-                 last_applied_node_id = NULL,
-                 last_error = $3,
-                 last_bridge_status = NULL,
-                 last_applied_bridge_generation = NULL,
-                 last_observed_at = NULL,
-                 updated_at = NOW()
-             WHERE sandbox_id = $1
-               AND protocol = 'tcp'
-               AND guest_port = $2
-               AND desired_state = 'open'"
-        ))
-        .bind(sandbox_id)
-        .bind(port as i32)
-        .bind(reason)
-        .execute(&mut *tx)
-        .await
-        .map_err(|err| db_contention_error("failed to invalidate sandbox port exposure", &err))?;
-
-        let invalidated = result.rows_affected() > 0;
+        let invalidated =
+            pplx_space_sandbox_store::port_exposures::invalidate_open_tcp_exposure_after_proxy_failure(
+                &mut *tx,
+                sandbox_id,
+                port as i32,
+                reason,
+            )
+            .await
+            .map_err(|err| {
+                db_contention_error(
+                    "failed to invalidate sandbox port exposure",
+                    &sqlx::Error::from(err),
+                )
+            })?;
 
         tx.commit().await.map_err(|error| {
             db_contention_error("failed to commit port exposure invalidation", &error)
@@ -614,10 +546,13 @@ impl SandboxController {
         }
     }
 
+    /// `live`: the live-cap reservation this request holds for waking a
+    /// dormant sandbox, if any.
     async fn apply_open_sandbox_port(
         &self,
         sandbox: &Sandbox,
         port: u16,
+        live: &crate::client_live_cap::LiveHandoff,
     ) -> Result<SandboxPortExposureApplyObservation, SandboxPortExposureApplyError> {
         let mut client = self
             .substrate
@@ -626,8 +561,10 @@ impl SandboxController {
                 sandbox,
                 ExecutionActivityKind::Access,
                 DEFAULT_BLOCKING_WAIT_TIMEOUT,
-                crate::controllers::substrate::RecoveryCharge::enforce(
+                super::lifecycle::implicit_activation_charge(
                     self.cluster_admission.as_ref(),
+                    sandbox,
+                    live,
                 ),
             )
             .await?;
@@ -787,54 +724,26 @@ impl SandboxController {
         // Keep the same sandbox-row-first lock order as open admission. The
         // reconcile enqueue below also locks this row, so updating the port
         // row first would permit an open/close deadlock.
-        let locked_sandbox = sqlx::query_scalar::<_, Uuid>(sql!(
-            "SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"
-        ))
-        .bind(sandbox.id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|err| db_contention_error("failed to lock sandbox for port close", &err))?;
+        let locked_sandbox =
+            pplx_space_sandbox_store::row_locks::lock_id_no_key_update(&mut *tx, sandbox.id)
+                .await
+                .map_err(|err| {
+                    db_contention_error(
+                        "failed to lock sandbox for port close",
+                        &sqlx::Error::from(err),
+                    )
+                })?;
         if locked_sandbox.is_none() {
             return Err(ControllerError::not_found("Sandbox"));
         }
-        let exposure = sqlx::query_as::<_, SandboxPortExposure>(sql!(
-            "INSERT INTO sandbox_port_exposures (
-                 sandbox_id,
-                 protocol,
-                 guest_port,
-                 visibility,
-                 source,
-                 desired_state,
-                 apply_state,
-                 last_applied_node_id,
-                 last_error
-             )
-             VALUES ($1, $2, $3, 'private', 'api', 'closed', 'pending', NULL, NULL)
-             ON CONFLICT (sandbox_id, protocol, guest_port) DO UPDATE
-             SET desired_state = 'closed',
-                 apply_state = 'pending',
-                 last_error = NULL,
-                 updated_at = NOW()
-             RETURNING sandbox_id,
-                       protocol,
-                       guest_port,
-                       visibility,
-                       source,
-                       desired_state,
-                       apply_state,
-                       last_applied_node_id,
-                       last_error,
-                       last_bridge_status,
-                       last_applied_bridge_generation,
-                       last_observed_at,
-                       created_at,
-                       updated_at"
-        ))
-        .bind(sandbox.id)
-        .bind(protocol)
-        .bind(port as i32)
-        .fetch_one(&mut *tx)
+        let exposure = pplx_space_sandbox_store::port_exposures::upsert_closed(
+            &mut *tx,
+            sandbox.id,
+            protocol,
+            port as i32,
+        )
         .await
+        .map(SandboxPortExposure::from)
         .map_err(|err| {
             let error = "failed to persist sandbox port exposure";
             // This upsert blocks on any uncommitted writer of the same
@@ -842,7 +751,7 @@ impl SandboxController {
             // sandbox row lock this transaction took. A lost race is not a
             // failed close: the caller retries and it succeeds, so it must not
             // leave a permanent-looking failure on the sandbox's timeline.
-            let mapped = db_contention_error(error, &err);
+            let mapped = db_contention_error(error, &sqlx::Error::from(err));
             if !mapped.is_lock_contention() {
                 SandboxEvent::new(
                     sandbox.id,
@@ -947,29 +856,8 @@ impl SandboxController {
         let Ok(Some(sandbox)) = fetch_sandbox(pool, sandbox_id).await else {
             return;
         };
-        let Ok(exposures) = sqlx::query_as::<_, SandboxPortExposure>(sql!(
-            "SELECT sandbox_id,
-                    protocol,
-                    guest_port,
-                    visibility,
-                    source,
-                    desired_state,
-                    apply_state,
-                    last_applied_node_id,
-                    last_error,
-                    last_bridge_status,
-                    last_applied_bridge_generation,
-                    last_observed_at,
-                    created_at,
-                    updated_at
-             FROM sandbox_port_exposures
-             WHERE sandbox_id = $1
-               AND desired_state = 'open'
-             ORDER BY guest_port ASC, protocol ASC"
-        ))
-        .bind(sandbox_id)
-        .fetch_all(pool)
-        .await
+        let Ok(exposures) =
+            pplx_space_sandbox_store::port_exposures::list_open(pool, sandbox_id).await
         else {
             tracing::warn!(
                 sandbox_id = %sandbox_id,
@@ -980,7 +868,7 @@ impl SandboxController {
 
         for exposure in exposures {
             if let Err(error) = self
-                .reconcile_sandbox_port_exposure(pool, &sandbox, exposure)
+                .reconcile_sandbox_port_exposure(pool, &sandbox, exposure.into())
                 .await
             {
                 tracing::warn!(

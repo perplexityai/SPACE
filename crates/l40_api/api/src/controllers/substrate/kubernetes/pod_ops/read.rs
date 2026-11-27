@@ -2,8 +2,14 @@
 //! and remembering the node a resolved pod landed on.
 
 use super::*;
+use crate::controllers::substrate::kubernetes::wait_ready::PodProxyWaitTarget;
 
 const SUCCEEDED_POD_SUSPEND_PUBLICATION_GRACE: Duration = Duration::from_secs(180);
+
+enum PodGet {
+    Observed(Option<Arc<SandboxPodView>>),
+    TimedOut,
+}
 
 pub(super) fn terminal_cleanup_phase_after_uncached_check(
     cached_phase: TerminalPodPhase,
@@ -99,29 +105,68 @@ impl KubernetesSubstrate {
         &self,
         pod_name: &str,
     ) -> Result<Option<Arc<SandboxPodView>>, KubeError> {
+        if let Some(pod) = self
+            .read_settled_sandbox_pod(pod_name, self.budgets.reflector_wait)
+            .await
+        {
+            return Ok(Some(pod));
+        }
+        fetch_sandbox_pod_uncached(&self.k8s, pod_name).await
+    }
+
+    async fn read_settled_sandbox_pod(
+        &self,
+        pod_name: &str,
+        reflector_wait: Duration,
+    ) -> Option<Arc<SandboxPodView>> {
         if let Some(pod) = self.lookup_sandbox_pod(pod_name)
             && pod_status_is_settled(&pod)
         {
             crate::metrics::sandbox::api::read_sandbox_pod_outcome("cache_settled");
-            return Ok(Some(pod));
+            return Some(pod);
         }
         // Wait for either a matching reflector event or the budget to elapse.
         // The boolean is informational — re-check the cache regardless. The
         // reflector store is updated by the same task that drives the event
         // broadcast, so even on a `Lagged`-then-timeout path the store may
         // already have the assignment we were waiting for.
-        let _ = self
-            .pod_events
-            .wait_for(pod_name, self.budgets.reflector_wait)
-            .await;
+        let _ = self.pod_events.wait_for(pod_name, reflector_wait).await;
         if let Some(pod) = self.lookup_sandbox_pod(pod_name)
             && pod_status_is_settled(&pod)
         {
             crate::metrics::sandbox::api::read_sandbox_pod_outcome("event_settled");
-            return Ok(Some(pod));
+            return Some(pod);
         }
         crate::metrics::sandbox::api::read_sandbox_pod_outcome("get_fallback");
-        fetch_sandbox_pod_uncached(&self.k8s, pod_name).await
+        None
+    }
+
+    /// A budget expiry is an unknown observation, never an authoritative 404.
+    async fn get_pod_for_resolution(
+        &self,
+        pod_name: &str,
+        readiness_deadline: Option<Instant>,
+        error_context: &str,
+    ) -> Result<PodGet, SubstrateError> {
+        let get = fetch_sandbox_pod_uncached(&self.k8s, pod_name);
+        let observed = if let Some(deadline) = readiness_deadline {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(PodGet::TimedOut);
+            }
+            match timeout_at(deadline.min(now + self.budgets.readiness_pod_get), get).await {
+                Ok(observed) => observed,
+                Err(_) => {
+                    tracing::debug!(pod_name, "readiness pod GET timed out");
+                    return Ok(PodGet::TimedOut);
+                }
+            }
+        } else {
+            get.await
+        };
+        observed
+            .map(PodGet::Observed)
+            .map_err(|err| kube_error_for_substrate(error_context, err))
     }
 
     /// `retry` states what the calling operation's retry would do; see
@@ -177,6 +222,7 @@ impl KubernetesSubstrate {
             })?;
         let role = SpaceNodeRole::Worker;
         let node_id = space_k8s_node_id(node_name, role.as_str());
+        let instance_id = k8s_node_instance_id(&node);
         let address = k8s_node_internal_ip(&node).ok_or_else(|| SubstrateError::Unavailable {
             message: format!(
                 "Kubernetes node {node_name} has no InternalIP; cannot authenticate node-local reconciliation"
@@ -192,6 +238,7 @@ impl KubernetesSubstrate {
                     node_id,
                     role,
                     address: Some(address.as_str()),
+                    instance_id: instance_id.as_ref(),
                 },
                 retry,
             )
@@ -217,14 +264,22 @@ impl KubernetesSubstrate {
         {
             return Ok(None);
         }
-        let Some(pod) = self
-            .read_sandbox_pod(&row.pod_name)
-            .await
-            .map_err(|error| {
-                kube_error_for_substrate("failed to read reachable sandbox pod", error)
-            })?
-        else {
-            return Ok(None);
+        // The row's IP for the cached pod it names is current before kubelet
+        // publishes it; only a pod the row does not describe needs a settled read.
+        let cached = self.lookup_sandbox_pod(&row.pod_name).filter(|pod| {
+            row.pod_ip.is_some() && row.pod_uid.as_ref().map(PodUid::as_str) == pod.uid()
+        });
+        let pod = match cached {
+            Some(pod) => pod,
+            None => match self
+                .read_sandbox_pod(&row.pod_name)
+                .await
+                .map_err(|error| {
+                    kube_error_for_substrate("failed to read reachable sandbox pod", error)
+                })? {
+                Some(pod) => pod,
+                None => return Ok(None),
+            },
         };
         if pod.is_deleting()
             || terminal_pod_phase(&pod).is_some()
@@ -234,15 +289,30 @@ impl KubernetesSubstrate {
         {
             return Ok(None);
         }
-        let pod_ip = assigned_pod_ip(&pod)?;
+        let address =
+            current_pod_ip_with_source(&pod, row.pod_uid.as_ref(), row.pod_ip.as_deref())?;
         // Let the owned path publish changed routing evidence before returning
         // a client; otherwise ingress would repeatedly resolve stale metadata.
-        if row.pod_ip != pod_ip.map(|ip| ip.to_string())
+        if row.pod_ip != address.map(|(ip, _)| ip.to_string())
             || row.k8s_node_name.as_deref() != assigned_pod_node_name(&pod)
         {
             return Ok(None);
         }
-        Ok(pod_ip)
+        let Some(address) = address else {
+            return Ok(None);
+        };
+        // An address kubelet has not published is reachable only while the
+        // worker behind it reports this execution.
+        let target = PodProxyWaitTarget {
+            pod_name: row.pod_name.as_str(),
+            pod_uid: row.pod_uid.as_ref().map(PodUid::as_str),
+            generation: row.generation,
+        };
+        Ok(self
+            .verified_runtime_pod_ip(sandbox_id, address, &target)
+            .await
+            .ok()
+            .flatten())
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn resolve_pod_ip(
@@ -255,11 +325,42 @@ impl KubernetesSubstrate {
             .map(|pod| pod.ip))
     }
 
+    /// Bound direct pod GETs without putting the store mutations in the
+    /// resolver under the shorter GET timeout. A timed-out read leaves the
+    /// IP unresolved so readiness can keep observing the reflector or watch.
+    /// Only an address for the execution and pod `target` names is returned,
+    /// with where it comes from.
+    pub(in crate::controllers::substrate::kubernetes) async fn resolve_pod_ip_for_readiness(
+        &self,
+        sandbox_id: SandboxId,
+        target: &PodProxyWaitTarget<'_>,
+        deadline: Instant,
+    ) -> Result<Option<(PodIp, PodIpSource)>, SubstrateError> {
+        Ok(self
+            .resolve_pod_instance_inner(sandbox_id, Some(deadline))
+            .await?
+            .filter(|pod| {
+                pod.generation == target.generation
+                    && target
+                        .pod_uid
+                        .is_none_or(|uid| pod.pod_uid.as_ref().map(PodUid::as_str) == Some(uid))
+            })
+            .map(|pod| (pod.ip, pod.source)))
+    }
+
     /// [`Self::resolve_pod_ip`], with the identity of the pod the address
     /// belongs to.
     pub(in crate::controllers::substrate::kubernetes) async fn resolve_pod_instance(
         &self,
         sandbox_id: SandboxId,
+    ) -> Result<Option<ResolvedPodInstance>, SubstrateError> {
+        self.resolve_pod_instance_inner(sandbox_id, None).await
+    }
+
+    async fn resolve_pod_instance_inner(
+        &self,
+        sandbox_id: SandboxId,
+        readiness_deadline: Option<Instant>,
     ) -> Result<Option<ResolvedPodInstance>, SubstrateError> {
         let Some(row) = self.store.active_execution_status(sandbox_id).await? else {
             return Ok(None);
@@ -272,17 +373,37 @@ impl KubernetesSubstrate {
             if !stale_restore_execution_create(&row.lifecycle, row.state, row.create_age_expired) {
                 return Ok(None);
             }
-            fetch_sandbox_pod_uncached(&self.k8s, &row.pod_name)
-                .await
-                .map_err(|err| {
-                    kube_error_for_substrate("failed to verify stale creating restore pod", err)
-                })?
+            self.get_pod_for_resolution(
+                &row.pod_name,
+                readiness_deadline,
+                "failed to verify stale creating restore pod",
+            )
+            .await?
         } else {
-            self.read_sandbox_pod(&row.pod_name)
+            let reflector_wait =
+                readiness_deadline.map_or(self.budgets.reflector_wait, |deadline| {
+                    self.budgets
+                        .reflector_wait
+                        .min(deadline.saturating_duration_since(Instant::now()))
+                });
+            if let Some(pod) = self
+                .read_settled_sandbox_pod(&row.pod_name, reflector_wait)
                 .await
-                .map_err(|err| kube_error_for_substrate("failed to query K8s pod", err))?
+            {
+                PodGet::Observed(Some(pod))
+            } else {
+                self.get_pod_for_resolution(
+                    &row.pod_name,
+                    readiness_deadline,
+                    "failed to query K8s pod",
+                )
+                .await?
+            }
         };
 
+        let PodGet::Observed(pod) = pod else {
+            return Ok(None);
+        };
         let pod = match pod {
             Some(pod) => pod,
             None => {
@@ -290,14 +411,17 @@ impl KubernetesSubstrate {
                 // suspend that creates a cache miss before a finalizer-blocked
                 // Kubernetes object is actually absent, so a cache miss alone
                 // must never authorize execution retirement.
-                match fetch_sandbox_pod_uncached(&self.k8s, &row.pod_name)
-                    .await
-                    .map_err(|err| {
-                        kube_error_for_substrate(
-                            "failed to verify missing Kubernetes sandbox pod",
-                            err,
-                        )
-                    })? {
+                let PodGet::Observed(pod) = self
+                    .get_pod_for_resolution(
+                        &row.pod_name,
+                        readiness_deadline,
+                        "failed to verify missing Kubernetes sandbox pod",
+                    )
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                match pod {
                     Some(pod) => pod,
                     None => {
                         if row.state == ActiveExecutionState::RecoveryFailed {
@@ -369,14 +493,16 @@ impl KubernetesSubstrate {
         };
 
         let pod = if let Some(cached_phase) = terminal_pod_phase(&pod) {
-            let authoritative_pod = fetch_sandbox_pod_uncached(&self.k8s, &row.pod_name)
-                .await
-                .map_err(|err| {
-                    kube_error_for_substrate(
-                        "failed to verify terminal Kubernetes sandbox pod",
-                        err,
-                    )
-                })?;
+            let PodGet::Observed(authoritative_pod) = self
+                .get_pod_for_resolution(
+                    &row.pod_name,
+                    readiness_deadline,
+                    "failed to verify terminal Kubernetes sandbox pod",
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
             if let Some(phase) = terminal_cleanup_phase_after_uncached_check(
                 cached_phase,
                 authoritative_pod.as_deref(),
@@ -432,7 +558,7 @@ impl KubernetesSubstrate {
         };
 
         if let Some(message) = pod.unschedulable_message() {
-            return Err(SubstrateError::Unavailable {
+            return Err(SubstrateError::Unschedulable {
                 message: format!("sandbox pod is unschedulable: {message}"),
             });
         }
@@ -449,8 +575,11 @@ impl KubernetesSubstrate {
         }
 
         let pod_uid = pod.uid().map(str::to_owned);
-        let pod_ip = assigned_pod_ip(&pod)?;
+        let resolved =
+            current_pod_ip_with_source(&pod, row.pod_uid.as_ref(), row.pod_ip.as_deref())?;
+        let pod_ip = resolved.map(|(ip, _)| ip);
         let pod_ip_string = pod_ip.map(|ip| ip.to_string());
+        let pod_client = pod.client_id();
         if row.pod_uid.as_ref().map(PodUid::as_str) != pod_uid.as_deref()
             || row.pod_ip.as_deref() != pod_ip_string.as_deref()
         {
@@ -461,6 +590,7 @@ impl KubernetesSubstrate {
                     row.generation,
                     pod_uid.as_deref(),
                     pod_ip_string.as_deref(),
+                    pod_client.as_ref(),
                 )
                 .await
             {
@@ -478,10 +608,41 @@ impl KubernetesSubstrate {
                     "failed to persist Kubernetes pod metadata after pod lookup"
                 ),
             }
+        } else if self.k8s.activation_client_attribution.is_enabled()
+            && let Some(pod_uid) = pod_uid.as_deref()
+            && crate::controllers::substrate::kubernetes::store::attribution_update(
+                &row.lifecycle,
+                Some(pod_uid),
+                Some(pod_uid),
+                pod_client.as_ref(),
+                row.activating_client_id.as_ref(),
+            )
+            .is_some()
+        {
+            // The pod is the one the row tracks, and only the record lags its
+            // label: repair the record alone, leaving the row's state as it is.
+            if let Err(err) = self
+                .store
+                .repair_runtime_attribution(
+                    sandbox_id,
+                    row.generation,
+                    pod_uid,
+                    pod_client.as_ref(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    generation = row.generation,
+                    error = %err,
+                    "failed to repair the sandbox's activating client after pod lookup"
+                );
+            }
         }
 
-        Ok(pod_ip.map(|ip| ResolvedPodInstance {
+        Ok(resolved.map(|(ip, source)| ResolvedPodInstance {
             ip,
+            source,
             pod_uid: pod_uid.as_deref().and_then(|uid| PodUid::parse(uid).ok()),
             generation: row.generation,
             sandbox_restoring: is_restoring_lifecycle(&row.lifecycle),

@@ -12,8 +12,8 @@
 //! whatever crate holds the macro: only the job that applies them should
 //! carry that weight, and no long-running service links this.
 
+use pplx_space_node_runtime_manager_store::database::MIGRATOR as RUNTIME_MANAGER_MIGRATOR;
 use pplx_space_sql_locator::sql;
-use pplx_space_sqlite::runtime_manager::MIGRATOR as RUNTIME_MANAGER_MIGRATOR;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -249,7 +249,7 @@ impl From<pplx_space_sbx_mgr_store::db::migration::MigrationTarget> for SqliteDa
 fn sqlite_template_manager() -> SqliteDatabase {
     SqliteDatabase {
         name: "template-manager",
-        default_path: pplx_space_common_core::host::linux::paths::TEMPLATE_MANAGER_DB,
+        default_path: pplx_space_host_layout::paths::TEMPLATE_MANAGER_DB,
         migrator: &TEMPLATE_MANAGER_MIGRATOR,
         common_schema: true,
     }
@@ -258,7 +258,7 @@ fn sqlite_template_manager() -> SqliteDatabase {
 fn sqlite_node_manager() -> SqliteDatabase {
     SqliteDatabase {
         name: "node-manager",
-        default_path: pplx_space_common_core::host::linux::paths::NODE_MANAGER_DB,
+        default_path: pplx_space_host_layout::paths::NODE_MANAGER_DB,
         migrator: &NODE_MANAGER_MIGRATOR,
         common_schema: false,
     }
@@ -267,7 +267,7 @@ fn sqlite_node_manager() -> SqliteDatabase {
 fn sqlite_node_ctl() -> SqliteDatabase {
     SqliteDatabase {
         name: "node-ctl",
-        default_path: pplx_space_common_core::host::linux::paths::NODE_CTL_DB,
+        default_path: pplx_space_host_layout::paths::NODE_CTL_DB,
         migrator: &NODE_CTL_MIGRATOR,
         common_schema: false,
     }
@@ -276,7 +276,7 @@ fn sqlite_node_ctl() -> SqliteDatabase {
 fn sqlite_runtime_manager() -> SqliteDatabase {
     SqliteDatabase {
         name: "runtime-manager",
-        default_path: pplx_space_common_core::host::linux::paths::RUNTIME_MANAGER_DB,
+        default_path: pplx_space_host_layout::paths::RUNTIME_MANAGER_DB,
         migrator: &RUNTIME_MANAGER_MIGRATOR,
         common_schema: true,
     }
@@ -285,7 +285,7 @@ fn sqlite_runtime_manager() -> SqliteDatabase {
 fn sqlite_volume_manager() -> SqliteDatabase {
     SqliteDatabase {
         name: "volume-manager",
-        default_path: pplx_space_common_core::host::linux::paths::VOLUME_MANAGER_DB,
+        default_path: pplx_space_host_layout::paths::VOLUME_MANAGER_DB,
         migrator: &VOLUME_MANAGER_MIGRATOR,
         common_schema: true,
     }
@@ -294,7 +294,7 @@ fn sqlite_volume_manager() -> SqliteDatabase {
 fn sqlite_build_manager() -> SqliteDatabase {
     SqliteDatabase {
         name: "build-manager",
-        default_path: pplx_space_common_core::host::linux::paths::BUILD_MANAGER_DB,
+        default_path: pplx_space_host_layout::paths::BUILD_MANAGER_DB,
         migrator: &BUILD_MANAGER_MIGRATOR,
         common_schema: true,
     }
@@ -389,7 +389,7 @@ async fn run_sqlite(database: SqliteDatabase, args: SqliteArgs) -> Result<(), Ru
     let database = if database.name == "runtime-manager" && !matches!(args.command, Command::Reset)
     {
         SqliteDatabase {
-            migrator: sqlite::runtime_manager::catalog(&database_path)?,
+            migrator: pplx_space_node_runtime_manager_store::database::catalog(&database_path)?,
             ..database
         }
     } else {
@@ -538,10 +538,20 @@ async fn rollback_last_postgres(
     ensure_sqlx_migrations_table_postgres(pool).await?;
     let applied_versions = applied_versions_postgres(pool).await?;
     rollback_last(migrator, &applied_versions, |target| async move {
-        migrator
-            .undo(pool, target)
-            .await
-            .map_err(RunDbMigrateError::RollbackPostgres)
+        let result = migrator.undo(pool, target).await;
+        // As `run_up` does for an up: a failed `-- no-transaction` down, such
+        // as a `CREATE INDEX CONCURRENTLY` that restores an index, can leave an
+        // INVALID index behind while the up's history row stays.
+        if let Err(MigrateError::ExecuteMigration(_, version)) = &result
+            && migrator.iter().any(|migration| {
+                migration.version == *version
+                    && migration.migration_type.is_down_migration()
+                    && migration.no_tx
+            })
+        {
+            migration_retry::report_invalid_indexes(pool, *version).await;
+        }
+        result.map_err(RunDbMigrateError::RollbackPostgres)
     })
     .await
 }

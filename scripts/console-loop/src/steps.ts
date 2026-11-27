@@ -3,18 +3,25 @@
 // (errors, failed and slow requests, screenshots). Steps that create or
 // change something are marked `mutates` and clean up after themselves.
 import { randomBytes } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 
-import type { Page, Request, Response, Route } from 'playwright';
+import type { Locator, Page, Request, Response, Route } from 'playwright';
 
 import {
   SECRET_PLACEHOLDER, adminFetch, carriesSecret, confirmPopover, content, fetchWithoutRedirect, pickSelect, settle, shortLabel,
   signIn, takeToasts, text, visit, waitForStatus, withoutSecret, type Ctx,
 } from './browser.ts';
-import { TERMINAL_OPERATION_STATES } from './api.ts';
+import { Api, ApiError, TERMINAL_OPERATION_STATES, sleep } from './api.ts';
 import { verifyFixtures } from './fixtures.ts';
 import { SYNTHETIC_HEADER } from './recorder.ts';
 import { orgDisplayName, recordCreated } from './seed.ts';
-import { DRAIN_KEEP_ANNOTATION, KindNodes, drainCandidate, type AdminNode } from './nodes.ts';
+import {
+  CONSOLE_PREVIEW_CONCURRENCY, DRAIN_KEEP_ANNOTATION, HOLD_WAIT, KindNodes, bareSandboxId, drainCandidate, drainCountsOf, drainFinished, everyPage,
+  panelMismatches, previewAllWaitMs, previewResultsMismatches, previewVerdictIn, previewWaitMs, reportedUnder, rowMismatches,
+  type AdminNode, type ApiDrain, type PanelRead, type ResultVerdict,
+} from './nodes.ts';
+import { DRAIN_V2_SWITCH, KindV2Control, V2_CONTROLLER_ENV, V2_CONTROLLER_KEYS, drainV2Enabled, v1DrainSkip, type Lease } from './drain-v2.ts';
 
 export interface Step {
   name: string;
@@ -1480,7 +1487,7 @@ step('node-drain-section', ['nodes'], async (c) => {
   const card = drainCard(c.page);
   c.rec.check(await card.count() === 1, "the node page has a Drain section");
   const t = (await card.innerText()).replace(/\s+/g, ' ');
-  for (const label of ['Phase', 'Mode', 'Started', 'Last error', 'Heartbeat', 'Kubernetes Node', 'Sandboxes on the node', 'History']) {
+  for (const label of ['Phase', 'Mode', 'Started', 'Last error', 'Heartbeat', 'Kubernetes Node', 'Holding the node', 'History']) {
     c.rec.check(t.includes(label), `the Drain section shows ${label}`);
   }
   c.rec.check(/\d+(s|m \d+s|h \d+m|d \d+h) ago|never/.test(t), 'the heartbeat age is shown');
@@ -1489,27 +1496,171 @@ step('node-drain-section', ['nodes'], async (c) => {
   c.rec.check(/updated \S+/.test(t), 'the section says when it was last read');
 });
 
-step('node-remaining-sandboxes', ['nodes'], async (c) => {
-  const nodes = await adminNodes(c);
-  const node = nodes.filter((n) => n.role === 'worker').sort((a, b) => (b.sandboxes_active ?? 0) - (a.sandboxes_active ?? 0))[0];
-  if (!node) return c.rec.check(false, 'a worker node exists');
-  await visit(c, `/dashboard/nodes/${node.id}`, 4000);
-  const summary = (await drainCard(c.page).innerText()).replace(/\s+/g, ' ');
-  const listed = c.page.locator('#node-sandboxes a[href^="/dashboard/sandboxes/"]');
-  const count = await listed.count();
-  if ((node.sandboxes_active ?? 0) > 0) {
-    c.rec.check(count > 0, `the node's sandboxes are listed (${count})`);
-    c.rec.check(/listed below/.test(summary), 'the Drain section counts them by lifecycle');
-    const first = await listed.first().getAttribute('href');
-    await listed.first().click();
-    await c.page.waitForURL(/\/dashboard\/sandboxes\//, { timeout: 15_000 }).catch(() => {});
-    c.rec.check(c.page.url().endsWith(first ?? '-'), "a listed sandbox links to the sandbox's page");
-  } else {
-    c.rec.check(/none placed on this node/.test(summary) || count > 0, 'an empty node says so');
+// The holds read for every worker, the most held first: a node in a drain
+// phase leads, since that is where an operator reads the panel.
+async function workersByHolds(c: Ctx): Promise<{ node: AdminNode; holds: Holds }[]> {
+  const workers = (await adminNodes(c)).filter((n) => n.role === 'worker');
+  const read: { node: AdminNode; holds: Holds }[] = [];
+  for (const node of workers) {
+    const res = await adminFetch(c.page, 'GET', `/admin/api/v1/nodes/${node.id}/holds`, undefined, { timeoutMs: 30_000 });
+    if (res.status !== 200) throw new Error(`reading what holds ${node.id} answered ${res.status}`);
+    read.push({ node, holds: res.json as Holds });
   }
+  return read.sort((a, b) => Number(b.node.drain_phase !== null) - Number(a.node.drain_phase !== null) || b.holds.total - a.holds.total);
+}
+
+interface Holds {
+  residency_evidence: string;
+  total: number;
+  term_counts: { resident: number; drain_blocker: number; active_resident: number };
+  holds: { sandbox_id: string; reason: string; counted_by: { terminate: boolean; drain: boolean; drain_with_termination_blocking_gate: boolean } }[];
+}
+
+// The panel's Counted by label for a row: `holdGatesLabel` in the UI's
+// `lib/node-drain.ts`.
+function holdGatesLabel({ terminate, drain, drain_with_termination_blocking_gate: gated }: Holds['holds'][number]['counted_by']): string {
+  if (drain && terminate) return 'drain and terminate';
+  if (drain) return 'drain';
+  if (terminate && gated) return 'terminate; drain only with the termination-blocking gate on';
+  if (terminate) return 'terminate';
+  return 'neither';
+}
+
+const holdsCard = (page: Page) => page.locator('#node-holds');
+const historyPanel = (page: Page) => page.locator('#node-sandboxes');
+
+async function openHistory(c: Ctx): Promise<void> {
+  const header = historyPanel(c.page).locator('.ant-collapse-header');
+  if ((await header.getAttribute('aria-expanded')) !== 'true') await header.click();
+  await historyPanel(c.page).locator('.ant-collapse-panel-active').waitFor({ timeout: 5000 });
+  await settle(c.page, 800);
+}
+
+// The panel lists every row the holds read returns, each linked, with its
+// reason in a sentence and the gates that count it, grouped under the five
+// headings; the header says which residency evidence the gates use. The rows
+// expected are the ones in the holds answer the page itself received.
+step('node-holds-panel', ['nodes'], async (c) => {
+  const [first] = await workersByHolds(c);
+  if (!first) return c.rec.check(false, 'a worker node exists');
+  const { node } = first;
+  const pageRead = c.page.waitForResponse((res) => new URL(res.url()).pathname.endsWith(`/nodes/${node.id}/holds`), { timeout: 30_000 }).catch(() => null);
+  await visit(c, `/dashboard/nodes/${node.id}`, 4000);
+  const holds = (await jsonOf(await pageRead)) as Holds | null;
+  if (!holds) return c.rec.check(false, 'the node page read what holds the node');
+  c.rec.note(`node ${node.name ?? node.id} (${node.drain_phase ?? 'not draining'}): ${holds.total} holds, ${JSON.stringify(holds.term_counts)}`);
+  const card = holdsCard(c.page);
+  c.rec.check(await card.count() === 1, 'the node page has a "What holds this node" panel');
+  const panel = (await card.innerText()).replace(/\s+/g, ' ');
+  const mode = holds.residency_evidence === 'node_census_aware' ? 'node census' : 'rows only';
+  c.rec.check(panel.includes(`residency: ${mode}`), `the header shows the residency evidence once (${mode})`);
+  await card.locator('.ant-card-extra .ant-tag', { hasText: 'residency:' }).hover();
+  c.rec.check(/census absent/.test(await c.page.locator('.ant-tooltip:visible').innerText().catch(() => '')), 'its tooltip says what the mode means for rows the node does not report');
+  // The page's `heldByTerms`: rows no term counts do not hold the node.
+  const counted = holds.term_counts.resident + holds.term_counts.drain_blocker + holds.term_counts.active_resident > 0;
+  const summary = (await drainCard(c.page).innerText()).replace(/\s+/g, ' ');
+  if (!counted) {
+    c.rec.check(/Nothing holds this node/.test(panel) && /Nothing holds this node/.test(summary), 'a node no term counts reads "Nothing holds this node" in the panel and the Drain section');
+  }
+  if (!holds.total) {
+    c.rec.note('no worker is held: the groups are not exercised');
+    return;
+  }
+  const order = ['Needs you', 'Handled automatically', 'Waiting on users', 'Blocks terminate', 'Listed, not counted'];
+  const shown = (await card.locator('[data-hold-group] h5').allInnerTexts()).map((t) => t.trim());
+  c.rec.check(shown.length > 0 && shown.every((t, i) => order.indexOf(t) >= 0 && (i === 0 || order.indexOf(t) > order.indexOf(shown[i - 1]))), `the groups come in order (${shown.join(', ')})`);
+  const rows = card.locator('[data-hold-group] tbody tr.ant-table-row');
+  c.rec.check(await rows.count() === holds.holds.length, `every listed hold is a row (${await rows.count()} of ${holds.holds.length})`);
+  for (const hold of holds.holds) {
+    // The link carries the sandbox's public ID, which ends in the UUID's hex.
+    const row = rows.filter({ has: c.page.locator(`a[href*="${hold.sandbox_id.slice(-8).toLowerCase()}"]`) }).first();
+    const cells = (await row.innerText().catch(() => '')).replace(/\s+/g, ' ');
+    const gates = holdGatesLabel(hold.counted_by);
+    c.rec.check(cells.length > 40 && cells.includes(gates), `${hold.reason} row reads as a sentence counted by ${gates}`);
+    const why = (await row.locator('td:nth-child(3)').innerText().catch(() => '')).trim();
+    c.rec.check(why.length > 0 && why.endsWith('.'), `${hold.reason} row's Why is a sentence (${why.slice(0, 60)})`);
+    const countedBy = (await row.locator('td').last().innerText().catch(() => '')).trim();
+    c.rec.check(countedBy === gates, `${hold.reason} row's Counted by is exactly "${gates}" (${countedBy})`);
+  }
+  if (counted) c.rec.check(/Holding the node .*what holds it/.test(summary), 'the Drain section summarizes the groups and links to the panel');
+  const needsUpload = holds.holds.some((h) => h.reason === 'local_only_snapshot');
+  const uploadOffered = await card.getByRole('button', { name: 'Upload local snapshots' }).count();
+  const uploadOpen = node.drain_phase === 'drained' || node.drain_phase === 'terminating' || (node.drain_phase === 'draining' && node.drain_mode === 'forced');
+  c.rec.check(uploadOffered === Number(needsUpload && uploadOpen), `Upload local snapshots sits by the local-only rows exactly when the API accepts it (${uploadOffered})`);
+  await card.screenshot({ path: `${c.rec.outDir}/${c.rec.stepName()}-panel.png` }).catch(() => {});
+  // The href, not a click: a held row need not have a sandbox the public API
+  // can read (a census-absent row has nothing behind it).
+  const href = await rows.first().locator('a[href^="/dashboard/sandboxes/sbx_"]').getAttribute('href');
+  c.rec.check(href !== null && holds.holds.some((h) => href.endsWith(h.sandbox_id)), "a held sandbox links to the sandbox's page");
+});
+
+// The collapsed History lists every row naming the node, newest change
+// first, filtered by lifecycle, and by "Failed during this drain" while the
+// node drains; each filter is checked against the request the page sends.
+step('node-history-filters', ['nodes'], async (c) => {
+  const [first] = await workersByHolds(c);
+  if (!first) return c.rec.check(false, 'a worker node exists');
+  const { node } = first;
+  await visit(c, `/dashboard/nodes/${node.id}`, 4000);
+  c.rec.check(await historyPanel(c.page).locator('.ant-collapse-panel-active').count() === 0, 'the History starts collapsed');
+  const historyRead = (want: (params: URLSearchParams) => boolean) => c.page.waitForResponse((res) => {
+    const url = new URL(res.url());
+    return url.pathname.endsWith(`/nodes/${node.id}/sandboxes`) && want(url.searchParams);
+  }, { timeout: 20_000 }).catch(() => null);
+  const newestFirst = (rows: { lifecycle_changed_at: string }[]) => rows.every((r, i) => i === 0 || Date.parse(rows[i - 1].lifecycle_changed_at) >= Date.parse(r.lifecycle_changed_at));
+  const bareId = (id: string) => id.replace(/^sbx_/, '').replaceAll('-', '').toLowerCase();
+  // The History's rows, in order, are the answer the page just received, and
+  // read newest change first through their ids.
+  const showsAnswer = async (answer: any, what: string) => {
+    await settle(c.page, 800);
+    const shown = (await historyPanel(c.page).locator('tbody tr.ant-table-row td:first-child code').allInnerTexts()).map((t) => bareId(t.trim()));
+    const rows: { id: string; lifecycle_changed_at: string }[] = Array.isArray(answer?.sandboxes) ? answer.sandboxes : [];
+    c.rec.check(answer !== null && shown.join(',') === rows.map((r) => bareId(r.id)).join(','), `${what}: the History shows the answer's sandboxes in its order (${shown.length} of ${rows.length})`);
+    const byId = new Map(rows.map((r) => [bareId(r.id), r]));
+    const ordered = shown.map((id) => byId.get(id));
+    c.rec.check(ordered.every((r) => r !== undefined) && newestFirst(ordered as typeof rows), `${what}: the shown rows run newest change first`);
+  };
+  await openHistory(c);
+  const all = historyRead((p) => p.get('order') === 'lifecycle_changed_desc');
+  await c.page.getByRole('button', { name: 'Reload' }).last().click();
+  const allJson = await jsonOf(await all);
+  c.rec.check(Array.isArray(allJson?.sandboxes) && newestFirst(allJson.sandboxes), `the history is read newest change first (${allJson?.sandboxes?.length ?? 'no'} rows)`);
+  await showsAnswer(allJson, 'after Reload');
+
+  const filter = historyPanel(c.page).locator('.ant-select', { has: c.page.getByLabel('Lifecycle filter') });
+  const failed = historyRead((p) => p.getAll('lifecycle').join(',') === 'failed');
+  // The option list is virtual: type to bring `failed` into it.
+  await filter.click();
+  await c.page.keyboard.type('failed');
+  await c.page.locator('.ant-select-dropdown:visible .ant-select-item-option', { hasText: /^failed$/ }).first().click({ timeout: 5000 });
+  await c.page.keyboard.press('Escape');
+  const failedJson = await jsonOf(await failed);
+  await settle(c.page, 800);
+  const tags = await historyPanel(c.page).locator('tbody tr.ant-table-row td:nth-child(2)').allInnerTexts();
+  c.rec.check(failedJson !== null && tags.length === failedJson.sandboxes.length && tags.every((t) => t.trim() === 'failed'), `the lifecycle filter keeps only failed rows (${tags.length} of ${failedJson?.sandboxes?.length ?? 'no'})`);
+  await shot(c, 'failed-filter');
+  await filter.locator('.ant-select-clear').click({ force: true }).catch(() => {});
+
+  const toggle = historyPanel(c.page).getByLabel('Failed during this drain');
+  if (!node.drain_started_at) {
+    c.rec.check(await toggle.isDisabled(), '"Failed during this drain" is off while the node is not draining');
+    return;
+  }
+  const during = historyRead((p) => p.get('changed_since') === node.drain_started_at && p.getAll('lifecycle').join(',') === 'failed');
+  await toggle.click();
+  const duringJson = await jsonOf(await during);
+  c.rec.check(duringJson !== null, 'the toggle asks for failed rows changed since the drain started');
+  const started = Date.parse(node.drain_started_at);
+  c.rec.check(Array.isArray(duringJson?.sandboxes) && duringJson.sandboxes.every((r: any) => r.lifecycle === 'failed' && Date.parse(r.lifecycle_changed_at) >= started), `every row failed during the drain (${duringJson?.sandboxes?.length ?? 0})`);
+  c.rec.check(await filter.locator('.ant-select-disabled').count() + Number(await filter.evaluate((el) => el.classList.contains('ant-select-disabled'))) > 0, 'the lifecycle filter is replaced while the toggle is on');
+  await showsAnswer(duringJson, 'with the toggle on');
+  await shot(c, 'failed-during-drain');
+  await toggle.click();
 });
 
 step('node-forced-drain-undrain', ['nodes', 'flows'], async (c) => {
+  const skip = v1DrainSkip(drainV2On(c));
+  if (skip) return c.rec.note(skip);
   await withDrainableWorker(c, async (node, kube) => {
     await visit(c, `/dashboard/nodes/${node.id}`, 3000);
     const phrase = node.name ?? node.id;
@@ -1532,6 +1683,7 @@ step('node-forced-drain-undrain', ['nodes', 'flows'], async (c) => {
     // An empty worker can pass through draining faster than the page's poll.
     c.rec.check(await waitForSection(c, /Phase\s+(draining|drained)/, 15_000), 'the Drain section shows the drain (draining, or drained already)');
     c.rec.check(/Mode forced/.test((await drainCard(c.page).innerText()).replace(/\s+/g, ' ')), 'the Drain section shows mode forced');
+    c.rec.check(!/Engine/.test(await drainCard(c.page).innerText()) && !(await c.page.locator('#drain-progress').count()), 'a v1 forced drain shows no engine and no Drain progress panel');
     c.rec.check(kube.unschedulable(node.k8s_node_name!), 'the Kubernetes Node is cordoned');
     await shot(c, 'draining');
     c.rec.check(await waitForPhase(c, node.id, ['drained'], 120_000) === 'drained', 'the empty worker reaches drained');
@@ -1552,6 +1704,8 @@ step('node-forced-drain-undrain', ['nodes', 'flows'], async (c) => {
 }, true);
 
 step('node-terminate-refused', ['nodes', 'flows'], async (c) => {
+  const skip = v1DrainSkip(drainV2On(c));
+  if (skip) return c.rec.note(skip);
   await withDrainableWorker(c, async (node) => {
     const phrase = node.name ?? node.id;
     const drained = await adminFetch(c.page, 'POST', `/admin/api/v1/nodes/${node.id}:drain`, { mode: 'forced' });
@@ -1638,6 +1792,42 @@ step('node-terminate-refused', ['nodes', 'flows'], async (c) => {
   });
 }, true);
 
+// A v1 gentle drain, as on main: Drain sends `mode: gentle` and no engine,
+// and the page shows no v2 drain.
+step('node-gentle-drain-undrain', ['nodes', 'flows'], async (c) => {
+  const skip = v1DrainSkip(drainV2On(c));
+  if (skip) return c.rec.note(skip);
+  await withDrainableWorker(c, async (node, kube) => {
+    await visit(c, `/dashboard/nodes/${node.id}`, 3000);
+    await exactButton(c.page, 'Drain').click();
+    const confirm = c.page.locator('.ant-modal-confirm:visible');
+    await confirm.waitFor({ timeout: 5000 });
+    c.rec.check(/waits for its sandboxes to leave on their own/.test(await confirm.innerText()), 'the confirmation says a gentle drain waits for sandboxes to leave');
+    await shot(c, 'confirmation', { dialog: true });
+    const sent = nextPost(c.page, (p) => p.endsWith(`/nodes/${node.id}:drain`));
+    await confirm.getByRole('button', { name: 'Drain', exact: true }).click();
+    const answer = await sent;
+    c.rec.check(answer?.status() === 200, `the gentle drain is accepted (${answer?.status()})`);
+    c.rec.check(JSON.stringify(answer?.request().postDataJSON()) === '{"mode":"gentle"}', `the request asks for mode gentle and names no engine (${answer?.request().postData()})`);
+    c.rec.check(await waitForSection(c, /Phase\s+(draining|drained)/, 15_000), 'the Drain section shows the drain');
+    const section = (await drainCard(c.page).innerText()).replace(/\s+/g, ' ');
+    c.rec.check(/Mode gentle/.test(section) && !/Engine/.test(section), 'the Drain section shows mode gentle and no engine');
+    c.rec.check(!(await c.page.locator('#drain-progress').count()), 'a v1 drain shows no Drain progress panel');
+    c.rec.check(kube.unschedulable(node.k8s_node_name!), 'the Kubernetes Node is cordoned');
+    await shot(c, 'draining');
+    c.rec.check(await waitForPhase(c, node.id, ['drained'], 180_000) === 'drained', 'the empty worker reaches drained');
+    c.rec.check(await waitForSection(c, /Phase\s+drained/, 15_000), "the page's poll shows drained without a reload");
+    await shot(c, 'drained');
+    await content(c.page).getByRole('button', { name: 'Undrain' }).click();
+    const undo = c.page.locator('.ant-modal-confirm:visible');
+    await undo.waitFor({ timeout: 5000 });
+    const undrain = nextPost(c.page, (p) => p.endsWith(`/nodes/${node.id}:undrain`));
+    await undo.getByRole('button', { name: 'Undrain' }).click();
+    c.rec.check((await undrain)?.status() === 200, 'the undrain is accepted');
+    c.rec.check(await waitForSection(c, /Phase\s+not draining/, 15_000), 'the Drain section shows not draining');
+  });
+}, true);
+
 // ------------------------------------------------------------ other roles
 for (const [local, label] of [['acme-admin', 'a tenant organization admin'], ['ops-viewer', 'a member of the managing organization']] as const) {
   step(`role-${local}`, ['roles'], async (c) => {
@@ -1650,6 +1840,1373 @@ for (const [local, label] of [['acme-admin', 'a tenant organization admin'], ['o
     await signIn(c, c.config.email, c.config.password);
   });
 }
+
+// ------------------------------------------------------- v2 drain preview
+// A preview asks the node what a v2 drain would find and changes nothing on
+// it, so these flows create nothing and need no cleanup. Each records every
+// admin request the page sends while it runs and fails on a write, and
+// checks the node is in the drain phase it started in. They are `flows` for
+// the node they act on, but not `mutates`: --no-mutate keeps them.
+
+// The admin writes the page sends from now until `stop()`, and the preview
+// reads in flight at most at once.
+function watchAdminRequests(page: Page) {
+  const writes: string[] = [];
+  let inFlight = 0;
+  let most = 0;
+  const isPreview = (req: Request) => new URL(req.url()).pathname.endsWith('/drain-v2-preview');
+  const onRequest = (req: Request) => {
+    const path = new URL(req.url()).pathname;
+    if (!path.startsWith('/admin/')) return;
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method())) writes.push(`${req.method()} ${path}`);
+    if (isPreview(req)) most = Math.max(most, ++inFlight);
+  };
+  const onDone = (req: Request) => {
+    if (isPreview(req)) inFlight -= 1;
+  };
+  page.on('request', onRequest);
+  page.on('requestfinished', onDone);
+  page.on('requestfailed', onDone);
+  return {
+    stop: () => {
+      page.off('request', onRequest);
+      page.off('requestfinished', onDone);
+      page.off('requestfailed', onDone);
+      return { writes, most };
+    },
+  };
+}
+
+const previewCard = (page: Page) => page.locator('#drain-preview');
+
+// The node a preview request is for, from its path, or null for another request.
+const previewedNode = (url: string): string | null => {
+  const match = /\/nodes\/([^/]+)\/drain-v2-preview$/.exec(new URL(url).pathname);
+  return match ? decodeURIComponent(match[1]) : null;
+};
+
+// The console's own verdict for a preview (`previewVerdict` in
+// `ui/src/lib/drain-preview.ts`). Loaded at run time: `ui/` is not a module
+// package, so the typecheck can't follow a static import of it.
+async function consolePreviewVerdict(): Promise<(preview: unknown) => ResultVerdict> {
+  const consoleModule = '../../../ui/src/lib/drain-preview.ts';
+  return (await import(consoleModule)).previewVerdict;
+}
+
+// The verdict each node's preview answered while the page ran, as the
+// console reads it: its verdict, or `error` for a preview that failed, the
+// console's own timeout among them. Keyed by node id until `stop()`.
+function watchPreviewAnswers(page: Page, verdictOf: (preview: unknown) => ResultVerdict) {
+  const answers = new Map<string, Promise<ResultVerdict>>();
+  const onResponse = (res: Response) => {
+    const node = previewedNode(res.url());
+    if (node === null) return;
+    const verdict = async (): Promise<ResultVerdict> => {
+      if (!res.ok()) return 'error';
+      try {
+        return verdictOf(await res.json());
+      } catch {
+        return 'error';
+      }
+    };
+    answers.set(node, verdict());
+  };
+  const onFailed = (req: Request) => {
+    const node = previewedNode(req.url());
+    if (node !== null) answers.set(node, Promise.resolve('error'));
+  };
+  page.on('response', onResponse);
+  page.on('requestfailed', onFailed);
+  return {
+    stop: async (): Promise<Map<string, ResultVerdict>> => {
+      page.off('response', onResponse);
+      page.off('requestfailed', onFailed);
+      const settled = new Map<string, ResultVerdict>();
+      for (const [node, verdict] of answers) settled.set(node, await verdict);
+      return settled;
+    },
+  };
+}
+const CHANGES_NOTHING = /A preview changes nothing on the node/;
+
+step('node-drain-preview', ['nodes', 'flows'], async (c) => {
+  const workers = (await adminNodes(c)).filter((n) => n.role === 'worker');
+  if (!workers.length) return c.rec.check(false, 'a worker node exists');
+  const node = workers.sort((a, b) => (b.sandboxes_active ?? 0) - (a.sandboxes_active ?? 0))[0];
+  await visit(c, `/dashboard/nodes/${node.id}`, 3000);
+  const button = content(c.page).getByRole('button', { name: 'Preview v2 drain' });
+  if (!(await button.count())) return c.rec.check(false, 'the node page offers Preview v2 drain');
+  await button.hover();
+  c.rec.check(CHANGES_NOTHING.test(await c.page.locator('.ant-tooltip:visible').innerText().catch(() => '')), 'the action says a preview changes nothing on the node');
+  const watch = watchAdminRequests(c.page);
+  const answered = c.page.waitForResponse((res) => new URL(res.url()).pathname.endsWith(`/nodes/${node.id}/drain-v2-preview`), { timeout: previewWaitMs() }).catch(() => null);
+  await button.click();
+  const answer = await answered;
+  c.rec.check(answer?.request().method() === 'GET' && answer.status() === 200, `the preview is a GET the API answers 200 (${answer?.request().method()} ${answer?.status()})`);
+  await previewCard(c.page).locator('[data-testid="drain-preview-verdict"]').waitFor({ timeout: 15_000 }).catch(() => {});
+  const t = (await previewCard(c.page).innerText().catch(() => '')).replace(/\s+/g, ' ');
+  const body = await jsonOf(answer);
+  const verdict = previewVerdictIn(await previewCard(c.page).locator('[data-testid="drain-preview-verdict"]').innerText().catch(() => ''));
+  const tag = previewVerdictIn(await previewCard(c.page).locator('[data-testid="drain-preview-verdict-tag"]').innerText().catch(() => ''));
+  c.rec.check(CHANGES_NOTHING.test(t), 'the panel says a preview changes nothing on the node');
+  c.rec.check(verdict !== null, `the panel says whether a drain would finish, wait or block (${verdict})`);
+  c.rec.check(tag !== null && tag === verdict, `the verdict is tagged with the same verdict (${tag})`);
+  c.rec.check(/Blockers \(\d+\)/.test(t) && /What a drain would do \(\d+\)/.test(t), 'the panel lists the blockers and what a drain would do');
+  if (body) {
+    c.rec.check(t.includes(`Blockers (${body.blocked.length})`), `the panel counts the ${body.blocked.length} blockers the API reported`);
+    c.rec.check(t.includes(`What a drain would do (${body.pending.length})`), `the panel counts the ${body.pending.length} items the API reported`);
+    for (const blocked of body.blocked.slice(0, 5)) {
+      c.rec.check(t.includes(blocked.reason), `the panel shows the blocker "${blocked.reason.slice(0, 80)}"`);
+    }
+    c.rec.check(new RegExp(`Already evacuated\\s*${body.evacuated.length}(?!\\d)`).test(t), `the panel counts the ${body.evacuated.length} sandboxes the API reported already evacuated`);
+    const running = body.pending.filter((p: { running: boolean }) => p.running).length;
+    c.rec.check(new RegExp(`Running\\s*${running}(?!\\d)`).test(t), `the panel counts the ${running} pending sandboxes the API reported running`);
+    c.rec.note(`preview of ${node.name ?? node.id}: ${body.evacuated.length} evacuated, ${body.blocked.length} blocked, ${body.pending.length} pending (${body.pending.map((p: { wait: string }) => p.wait).join(', ') || 'none'})`);
+  }
+  await previewCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+  await shot(c, 'panel');
+  const { writes } = watch.stop();
+  c.rec.check(writes.length === 0, `the page sent no admin write (${writes.join(', ') || 'none'})`);
+  c.rec.check((await adminNode(c, node.id))?.drain_phase === node.drain_phase, 'the node keeps its drain phase');
+});
+
+step('nodes-drain-preview-all', ['nodes', 'flows'], async (c) => {
+  const workers = (await adminNodes(c)).filter((n) => n.role === 'worker');
+  await visit(c, '/dashboard/nodes', 4000);
+  const button = content(c.page).getByRole('button', { name: 'Preview v2 drain on all workers' });
+  if (!(await button.count())) return c.rec.check(false, 'the nodes list offers Preview v2 drain on all workers');
+  const watch = watchAdminRequests(c.page);
+  const answers = watchPreviewAnswers(c.page, await consolePreviewVerdict());
+  await button.click();
+  const card = c.page.locator('#drain-preview-all');
+  c.rec.check(await card.waitFor({ timeout: 10_000 }).then(() => true, () => false), 'the results card appears');
+  c.rec.check(CHANGES_NOTHING.test(await card.innerText().catch(() => '')), 'the card says a preview changes nothing on the node');
+  const total = workers.length;
+  const progress = card.locator('[data-testid="drain-preview-progress"]');
+  const deadline = Date.now() + previewAllWaitMs(total);
+  let shown = '';
+  while (Date.now() < deadline) {
+    shown = await progress.innerText().catch(() => '');
+    if (shown === `${total} of ${total} previewed`) break;
+    await c.page.waitForTimeout(500);
+  }
+  c.rec.check(shown === `${total} of ${total} previewed`, `progress reaches every listed worker (${shown})`);
+  await settle(c.page, 800);
+  const answered = await answers.stop();
+  const expected = new Map(workers.map((w) => [w.id, answered.get(w.id) ?? null] as const));
+  // The table pages its rows, so every page is read: each row's node, from
+  // its link, and its verdict cell.
+  const nextPage = card.locator('.ant-pagination-next');
+  const activePage = card.locator('.ant-pagination-item-active');
+  let stuck = false;
+  const read = () => card.locator('.ant-table-tbody tr.ant-table-row').evaluateAll((trs) => trs.map((tr) => ({
+    nodeId: tr.querySelector('a[href^="/dashboard/nodes/"]')?.getAttribute('href')?.slice('/dashboard/nodes/'.length) ?? null,
+    verdict: ((tr.querySelectorAll('td')[1] as HTMLElement | undefined)?.innerText ?? '').replace(/\s+/g, ' ').trim(),
+  })));
+  const turn = async () => {
+    if (!(await nextPage.count()) || /\bant-pagination-disabled\b/.test((await nextPage.getAttribute('class')) ?? '')) return false;
+    const before = await activePage.innerText().catch(() => '');
+    await nextPage.click();
+    for (let tries = 0; tries < 40 && (await activePage.innerText().catch(() => before)) === before; tries += 1) {
+      await c.page.waitForTimeout(250);
+    }
+    stuck = (await activePage.innerText().catch(() => before)) === before;
+    return !stuck;
+  };
+  // Every page holds a row, so a table of `total` rows has at most `total`
+  // pages; one more is read to see a table with too many.
+  const { rows, pages, complete } = await everyPage(read, turn, total + 1);
+  c.rec.check(complete && !stuck, `every page of the table could be read (${pages} read${stuck ? ', the next page never showed' : ''})`);
+  const mismatches = previewResultsMismatches(expected, rows);
+  c.rec.check(
+    mismatches.length === 0,
+    `across its ${pages} ${pages === 1 ? 'page' : 'pages'} the table has one row per worker, with the verdict its preview answered (${mismatches.slice(0, 5).join('; ') || `${rows.length} of ${total}`})`,
+  );
+  const { writes, most } = watch.stop();
+  c.rec.check(most > 0 && most <= CONSOLE_PREVIEW_CONCURRENCY, `at most ${CONSOLE_PREVIEW_CONCURRENCY} previews were in flight at once (${most})`);
+  c.rec.check(writes.length === 0, `the page sent no admin write (${writes.join(', ') || 'none'})`);
+  const after = await adminNodes(c);
+  c.rec.check(workers.every((w) => after.find((n) => n.id === w.id)?.drain_phase === w.drain_phase), 'every worker keeps its drain phase');
+  await shot(c, 'results');
+  await card.getByRole('button', { name: 'Close' }).click().catch(() => {});
+});
+
+// ------------------------------------------------------------- v2 drains
+// The v2 drain flows on a real Kind worker. `nodes-v2-setup` turns the
+// cluster controller's v2 loop on (the `aws` terminator against Kind's fake
+// EC2) under the smokes' controller Lease, and gives each empty worker a
+// fake EC2 instance; `nodes-v2-teardown` puts the controller's config back.
+// Every v2 step lists both, so `--only <a v2 step>` runs them around it. A
+// flow drains only a worker that holds nothing of anyone else's, under the
+// drain-keep override, and undrains it in `finally`, waiting for the v2
+// cancel to finish on the node. Where a flow shows an answer the stack can't
+// give on demand (the cap, a 503, a stalled drain, an unrecognized state), it
+// answers the page itself with the API's own shape, marked synthetic, and
+// says so in its notes.
+
+const V2_STEPS = [
+  'node-v2-drain-now', 'node-v2-hold-shorten-undrain', 'node-v2-refusals', 'node-v2-states', 'node-drain-progress',
+];
+// Setup and teardown also carry each flow's name, so selecting a flow runs them.
+const V2_TAGS = ['nodes', 'flows', 'drain-v2'];
+const V2_AROUND = [...V2_TAGS, ...V2_STEPS];
+
+interface V2Setup {
+  control: KindV2Control;
+  lease: Lease;
+  cordonLease: Lease;
+  // node id → its Kubernetes Node, each with a fake instance recorded.
+  workers: Map<string, string>;
+}
+let v2: V2Setup | null = null;
+
+// Whether the bench runs drain v2, read once per run from the controller.
+let drainV2Read: boolean | null = null;
+function drainV2On(c: Ctx): boolean {
+  if (drainV2Read === null) drainV2Read = drainV2Enabled(new KindV2Control(c.config.kubeContext).drainV2Switch());
+  return drainV2Read;
+}
+
+// Put the controller's standing config, recorded in `file`, back: the keys a
+// run writes and its replicas. The config put back.
+function putStandingBack(control: KindV2Control, lease: Lease, file: string): Record<string, string | null> {
+  const { env: recorded, replicas } = JSON.parse(fs.readFileSync(file, 'utf8'));
+  // Only the keys a run writes go back; a record from before the switch
+  // moved to Kind's values may also hold it.
+  const env = Object.fromEntries(V2_CONTROLLER_KEYS.map((key) => [key, recorded[key] ?? null]));
+  if (control.controllerReplicas() !== replicas) control.scaleController(lease, replicas);
+  control.setControllerEnv(lease, env);
+  return env;
+}
+const v2StandingPath = (c: Ctx) => path.join(c.config.outDir, 'drain-v2-standing.json');
+
+const progressCard = (page: Page) => page.locator('#drain-progress');
+
+// The page, and beside it the Drain progress panel alone, which a full-page
+// capture of a long node page shows far down.
+const panelShot = async (c: Ctx, name: string) => {
+  await shot(c, name);
+  if (await progressCard(c.page).isVisible().catch(() => false)) {
+    await progressCard(c.page).screenshot({ path: `${c.rec.outDir}/${c.rec.stepName()}-${name}-panel.png`, timeout: 10_000 }).catch(() => {});
+  }
+};
+// A button by its whole label. antd can leave a button's loading icon, named
+// "loading", in its accessible name for a while after a fast answer, though
+// it no longer shows; the label alone is matched.
+const exactButton = (page: Page, name: string) =>
+  content(page).getByRole('button', { name: new RegExp(`^(?:loading )?${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`) });
+
+// The node's preview, whose blockers name what the API refuses a v2 drain
+// of it for, the unrecorded instance among them: it reads, and changes
+// nothing.
+async function v2Refusals(c: Ctx, nodeId: string): Promise<string[] | null> {
+  const res = await adminFetch(c.page, 'GET', `/admin/api/v1/nodes/${nodeId}/drain-v2-preview`, undefined, { timeoutMs: 80_000 });
+  // A node busy with another preview (503 `node_busy`) is retryable
+  // contention: no answer yet.
+  if (res.status === 503 && res.json?.reason === 'node_busy') return null;
+  if (res.status !== 200) return Array.isArray(res.json?.refusals) ? res.json.refusals : null;
+  // Every blocker is node-wide; the API's own refusals come first among them.
+  return (res.json?.blocked ?? []).map((b: { reason: string }) => b.reason);
+}
+
+// Waits until the API would start a v2 drain of the node: its instance is
+// recorded and nothing else node-wide refuses it.
+async function waitForV2Ready(c: Ctx, nodeId: string, timeoutMs: number): Promise<string[] | null> {
+  const deadline = Date.now() + timeoutMs;
+  let refusals: string[] | null = null;
+  while (Date.now() < deadline) {
+    refusals = await v2Refusals(c, nodeId).catch(() => null);
+    if (refusals !== null && !refusals.some((r) => /EC2 instance recorded|Kubernetes nodes only/.test(r))) return refusals;
+    await c.page.waitForTimeout(5000);
+  }
+  return refusals;
+}
+
+step('nodes-v2-setup', V2_AROUND, async (c) => {
+  if (v2) return c.rec.note('already set up in this run');
+  const control = new KindV2Control(c.config.kubeContext);
+  const lease = control.acquireLease('retention');
+  let cordonLease: Lease | null = null;
+  try {
+    cordonLease = control.acquireLease('cordon');
+    const enabled = control.drainV2Switch();
+    c.rec.check(enabled === 'true', `the bench's values turn drain v2 on for the controller (${DRAIN_V2_SWITCH}=${enabled})`);
+    // A standing config an interrupted run recorded is the one to put back.
+    const file = v2StandingPath(c);
+    const standing = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')).env : control.controllerEnv();
+    const replicas = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')).replicas : control.controllerReplicas();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ env: standing, replicas }, null, 2));
+    c.rec.note(`standing controller config: ${JSON.stringify(standing)}, ${replicas} replicas (kept in ${file})`);
+    if (control.controllerReplicas() !== replicas) control.scaleController(lease, replicas);
+    const rolled = control.setControllerEnv(lease, V2_CONTROLLER_ENV);
+    c.rec.note(rolled ? 'turned the controller\'s aws terminator on and waited for its rollout' : 'the controller\'s aws terminator was already on');
+    const env = control.controllerEnv();
+    c.rec.check(Object.entries(V2_CONTROLLER_ENV).every(([key, value]) => env[key] === value), `the controller runs the v2 loop with the aws terminator (${JSON.stringify(env)})`);
+    // Every empty Kubernetes worker gets a fake instance; one that holds a
+    // sandbox is left alone, since re-registering deletes its pods.
+    const workers = new Map<string, string>();
+    for (const node of (await adminNodes(c)).filter((n) => n.role === 'worker' && n.managed_by === 'k8s' && n.k8s_node_name)) {
+      const name = node.k8s_node_name!;
+      if (node.drain_phase || node.drain_engine) {
+        c.rec.note(`${name} is in a drain (${node.drain_phase ?? node.drain_engine}); left alone`);
+        continue;
+      }
+      if (node.sandboxes_active !== 0 || node.sandboxes_local_snapshots !== 0 || control.sandboxPods(name)) {
+        c.rec.note(`${name} holds sandboxes; it keeps its providerID and the v2 flows leave it alone`);
+        continue;
+      }
+      const { instanceId, reRegistered } = control.giveFakeInstance(cordonLease, name);
+      c.rec.note(`${name}: fake instance ${instanceId}${reRegistered ? ', re-registered' : ''}`);
+      const refusals = await waitForV2Ready(c, node.id, 300_000);
+      c.rec.check(refusals !== null && !refusals.some((r) => /EC2 instance recorded/.test(r)), `${name}'s row records its fake instance (${refusals?.join('; ') || 'no node-wide refusal'})`);
+      const slotsBy = Date.now() + 120_000;
+      while (control.networkSlots(name) === 0 && Date.now() < slotsBy) await c.page.waitForTimeout(2000);
+      workers.set(node.id, name);
+    }
+    c.rec.check(workers.size > 0, `an empty worker is ready for v2 drains (${[...workers.values()].join(', ') || 'none'})`);
+    v2 = { control, lease, cordonLease, workers };
+  } catch (error) {
+    // The standing config goes back while the Leases are still held, so no
+    // other run sees the controller this setup changed.
+    const file = v2StandingPath(c);
+    try {
+      if (fs.existsSync(file)) {
+        putStandingBack(control, lease, file);
+        fs.rmSync(file, { force: true });
+      }
+    } catch (restoreError) {
+      c.rec.note(`putting the controller's standing config back failed: ${restoreError}; ${file} keeps it`);
+    }
+    if (cordonLease) control.releaseLease(cordonLease);
+    control.releaseLease(lease);
+    throw error;
+  }
+}, true);
+
+// The v2-ready worker a flow drains, or null after a failed check. It must
+// still hold nothing: a flow never drains anyone else's sandbox.
+async function v2Worker(c: Ctx): Promise<{ node: AdminNode; kube: KindNodes } | null> {
+  if (!v2) {
+    c.rec.check(false, 'nodes-v2-setup prepared a worker for v2 drains');
+    return null;
+  }
+  const nodes = await adminNodes(c);
+  const busy = nodes.filter((n) => n.drain_phase || n.drain_engine);
+  if (busy.length) {
+    c.rec.check(false, `no node is in a drain (${busy.map((n) => `${n.name}: ${n.drain_phase ?? n.drain_engine}`).join(', ')})`);
+    return null;
+  }
+  const node = nodes.find((n) => v2!.workers.has(n.id) && n.sandboxes_active === 0 && n.sandboxes_local_snapshots === 0);
+  if (!node) {
+    c.rec.check(false, 'a v2-ready worker holds no sandboxes');
+    return null;
+  }
+  const kube = new KindNodes(c.config.kubeContext);
+  kube.requireLocalNode(node.k8s_node_name!);
+  return { node, kube };
+}
+
+// Runs `body` on the v2-ready worker under the drain-keep override, then
+// undrains it unless it has no drain phase, and waits until the v2 drain is
+// gone from it, its cancel included, before the override is removed.
+async function withV2Worker(c: Ctx, body: (node: AdminNode, kube: KindNodes) => Promise<void>): Promise<void> {
+  const picked = await v2Worker(c);
+  if (!picked) return;
+  const { node, kube } = picked;
+  const name = node.k8s_node_name!;
+  const claim = kube.claimDrainKeep(name);
+  if ('held' in claim) return c.rec.check(false, `${name} already carries ${DRAIN_KEEP_ANNOTATION}=${claim.held}; nothing is drained`);
+  c.rec.note(`v2-draining worker ${name} (${node.id}) under ${DRAIN_KEEP_ANNOTATION}=${claim.token}`);
+  try {
+    await body(node, kube);
+  } finally {
+    // A flow may have scaled the controller down; the cancel needs it.
+    try {
+      const file = v2StandingPath(c);
+      const replicas = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')).replicas : 1;
+      if (v2 && v2.control.controllerReplicas() !== replicas) v2.control.scaleController(v2.lease, replicas);
+    } catch (error) {
+      c.rec.check(false, `cleanup: scaling the controller back failed: ${String(error).split('\n')[0]}`);
+    }
+    const current = await apiNode(c, node.id).catch(() => null);
+    if (!current || current.drain_phase) {
+      const undrain = await adminFetch(c.page, 'POST', `/admin/api/v1/nodes/${node.id}:undrain`).catch(() => null);
+      c.rec.note(`cleanup undrain answered ${undrain?.status}`);
+    }
+    const gone = await waitForV2Gone(c, node.id, 180_000);
+    c.rec.check(gone, 'the worker is left with no drain phase and no v2 drain');
+    if (gone) c.rec.check(kube.releaseDrainKeep(name, claim.token), `the drain-keep override on ${name} was this claim's and was removed`);
+    else c.rec.note(`the drain-keep override ${claim.token} stays on ${name}`);
+  }
+}
+
+// The node as the API answers the loop's own client: the v2 flows read the
+// node outside the page, so the answers the page receives are the console's
+// own (`watchNodeAnswers`).
+async function apiNode(c: Ctx, id: string): Promise<AdminNode | null> {
+  try {
+    return await (await stepApi(c)).admin<AdminNode>('GET', `/nodes/${id}?include_occupancy=false`);
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) return null;
+    throw error;
+  }
+}
+
+async function waitForV2Gone(c: Ctx, id: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const node = await apiNode(c, id).catch(() => null);
+    if (node && !node.drain_phase && !node.drain_engine) return true;
+    await c.page.waitForTimeout(2000);
+  }
+  return false;
+}
+
+// Waits for an answer of the API's for the node that satisfies `want`.
+async function waitForNode(
+  c: Ctx, id: string, want: (node: AdminNode) => boolean, timeoutMs: number, everyMs = 1500, seen?: (node: AdminNode) => void,
+): Promise<AdminNode | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const node = await apiNode(c, id).catch(() => null);
+    if (node) seen?.(node);
+    if (node && want(node)) return node;
+    await c.page.waitForTimeout(everyMs);
+  }
+  return null;
+}
+
+// Waits until the progress panel's text matches `pattern`.
+async function waitForPanel(c: Ctx, pattern: RegExp, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (pattern.test((await progressCard(c.page).innerText().catch(() => '')).replace(/\s+/g, ' '))) return true;
+    await c.page.waitForTimeout(1000);
+  }
+  return false;
+}
+
+// Opens the typed confirmation of the node page's action `label`, answering
+// with the dialog.
+async function openTyped(c: Ctx, label: string) {
+  await exactButton(c.page, label).click();
+  const dialog = typedModal(c.page);
+  await dialog.waitFor({ timeout: 5000 });
+  return dialog;
+}
+
+// Picks a hold in an open v2 dialog: a preset by its label, or a custom
+// number of seconds.
+async function pickHold(dialog: Locator, hold: string | number) {
+  if (typeof hold === 'string') {
+    await dialog.getByRole('radio', { name: hold, exact: true }).check();
+    return;
+  }
+  await typeHold(dialog, String(hold));
+}
+
+// Types `text` as a custom hold.
+async function typeHold(dialog: Locator, text: string) {
+  await dialog.getByRole('radio', { name: 'Custom', exact: true }).check();
+  await dialog.getByLabel('Hold in seconds').fill(text);
+}
+
+const okOf = (dialog: Locator, label: string) => dialog.getByRole('button', { name: label, exact: true });
+
+// Sends the open typed dialog's action and answers with the API's answer.
+// It clicks once the action is enabled and has settled: a click in the
+// same instant the typed name enables it can be lost.
+async function confirmTyped(c: Ctx, dialog: Locator, label: string, nodeId: string, action: string, phrase: string): Promise<Response | null> {
+  await dialog.getByLabel('Type the node name to confirm').fill(phrase);
+  const ok = okOf(dialog, label);
+  for (let tries = 0; tries < 20 && !(await ok.isEnabled().catch(() => false)); tries += 1) await c.page.waitForTimeout(250);
+  await c.page.waitForTimeout(300);
+  const sent = nextPost(c.page, (p) => p.endsWith(`/nodes/${nodeId}:${action}`));
+  await ok.click();
+  return sent;
+}
+
+// The Drain progress panel as an operator reads it.
+async function readPanel(page: Page): Promise<PanelRead> {
+  const card = progressCard(page);
+  const tags = await card.locator('.ant-card-body > .ant-space > .ant-space-item').first().locator('.ant-tag').allInnerTexts().catch(() => []);
+  const text = (await card.innerText().catch(() => '')).replace(/\s+/g, ' ');
+  const table = (title: string) => card.locator('.ant-table-wrapper', { has: page.locator('.ant-table-title', { hasText: new RegExp(`^${title}$`) }) });
+  const rows = async (title: string) => table(title).locator('.ant-table-tbody tr.ant-table-row').evaluateAll((trs) => trs.map((tr) => Array.from(tr.querySelectorAll('td')).map((td) => (td as HTMLElement).innerText.replace(/\s+/g, ' ').trim())));
+  // The Sandbox cell is the id, then a `warm-pool member` tag for a pool
+  // member; the Wait cell is the wait's tag, then `running` for a running one.
+  const pending = (await rows('Pending').catch(() => [] as string[][])).map(([sandbox = '', wait = '', state = '']) => ({
+    sandbox: sandbox.split(' ')[0] ?? '',
+    pool: /\bwarm-pool member\b/.test(sandbox),
+    wait: wait.split(' ')[0] ?? '',
+    running: /\brunning\b/.test(wait.split(' ').slice(1).join(' ')),
+    state,
+  }));
+  const evacuated = (await rows('Evacuated').catch(() => [] as string[][])).map(([sandbox, artifact, wasRunning, controller]) => ({ sandbox, artifact, wasRunning, controller }));
+  return { tags, text, pending, evacuated };
+}
+
+// The node answers the page received, newest last, while `stop()` isn't
+// called: what the panel was drawn from.
+function watchNodeAnswers(page: Page, nodeId: string) {
+  let latest: { at: number; body: any } | null = null;
+  const onResponse = async (res: Response) => {
+    const url = new URL(res.url());
+    if (url.pathname !== `/admin/api/v1/nodes/${nodeId}` || url.searchParams.get('include_occupancy') !== 'false' || !res.ok()) return;
+    const body = await res.json().catch(() => null);
+    if (body) latest = { at: Date.now(), body };
+  };
+  page.on('response', onResponse);
+  return {
+    latest: () => latest,
+    stop: () => page.off('response', onResponse),
+  };
+}
+
+// Checks the panel against the answer the page last rendered it from, once
+// the page has drawn it, and the sandboxes' own rows against that answer.
+// `reached` says which answer shows the stage: the check waits (up to 30 s)
+// until the page has received one after the call, or, with `current`, takes
+// the answer the page has already received when it shows the stage.
+async function panelMatchesAnswer(
+  c: Ctx, answers: ReturnType<typeof watchNodeAnswers>, residents: string[], stage: string,
+  reached: (drain: ApiDrain) => boolean = () => true, { current = false }: { current?: boolean } = {},
+): Promise<ApiDrain | null> {
+  const before = current ? 0 : answers.latest()?.at ?? 0;
+  const deadline = Date.now() + 30_000;
+  const ready = () => {
+    const latest = answers.latest();
+    return !!latest && latest.at > before && !!latest.body?.drain && reached(latest.body.drain);
+  };
+  while (!ready() && Date.now() < deadline) await c.page.waitForTimeout(300);
+  if (!ready()) c.rec.check(false, `${stage}: the page received an answer showing the stage within 30 s`);
+  await c.page.waitForTimeout(700);
+  const answer = answers.latest()?.body;
+  const drain = answer?.drain as ApiDrain | undefined;
+  if (!drain) {
+    c.rec.check(false, `${stage}: the page received the node's drain`);
+    return null;
+  }
+  const mismatches = panelMismatches(await readPanel(c.page), drain, Date.now());
+  c.rec.check(mismatches.length === 0, `${stage}: the panel matches the node's report (${mismatches.slice(0, 4).join('; ') || `${drain.evacuated.length} evacuated, ${drain.pending.length} pending`})`);
+  const statuses = new Map<string, string | null>();
+  for (const id of residents) statuses.set(bareSandboxId(id), await sandboxStatus(c, id));
+  const rows = rowMismatches(drain, statuses);
+  c.rec.check(rows.length === 0, `${stage}: the sandboxes' rows agree with the report (${rows.slice(0, 3).join('; ') || [...statuses].map(([id, s]) => `${id.slice(-8)} ${s}`).join(', ')})`);
+  return drain;
+}
+
+// Answers the page's reads of the node with the API's own answer, changed by
+// `change`, marked synthetic so the recorder doesn't count them. Returns the
+// unroute.
+async function overlayNode(c: Ctx, nodeId: string, change: (node: any) => any): Promise<() => Promise<void>> {
+  const match = (url: URL) => url.pathname === `/admin/api/v1/nodes/${nodeId}`;
+  const handler = async (route: Route) => {
+    const res = await fetchWithoutRedirect(route);
+    if (!res) return;
+    const body = await res.json().catch(() => null);
+    return route.fulfill({ status: res.status(), contentType: 'application/json', headers: { [SYNTHETIC_HEADER]: '1' }, body: JSON.stringify(body ? change(body) : body) });
+  };
+  await c.page.route(match, handler);
+  return () => c.page.unroute(match, handler);
+}
+
+// Answers the page's next `:action` POST for the node itself, marked
+// synthetic: nothing reaches the API.
+async function answerAction(c: Ctx, nodeId: string, action: string, status: number, body: unknown, headers: Record<string, string> = {}): Promise<() => Promise<void>> {
+  const match = (url: URL) => url.pathname.endsWith(`/nodes/${nodeId}:${action}`);
+  const handler = (route: Route) => route.fulfill({ status, contentType: 'application/json', headers: { ...headers, [SYNTHETIC_HEADER]: '1' }, body: JSON.stringify(body) });
+  await c.page.route(match, handler);
+  return () => c.page.unroute(match, handler);
+}
+
+// Sends the page's `:action` POSTs for the node to the API, with the body
+// `body` makes of the page's (as it is by default), and hands the page the
+// API's answer marked synthetic: a refusal the step provokes is checked by
+// the step, not counted by the recorder. `statuses` collects the answers.
+async function forwardAction(c: Ctx, nodeId: string, action: string, statuses: number[], body: (sent: any) => any = (sent) => sent): Promise<() => Promise<void>> {
+  const match = (url: URL) => url.pathname.endsWith(`/nodes/${nodeId}:${action}`);
+  const handler = async (route: Route) => {
+    const sent = route.request().postData();
+    const res = await route.fetch({ maxRedirects: 0, postData: JSON.stringify(body(sent ? JSON.parse(sent) : undefined)) });
+    statuses.push(res.status());
+    return route.fulfill({ response: res, headers: { ...res.headers(), [SYNTHETIC_HEADER]: '1' } });
+  };
+  await c.page.route(match, handler);
+  return () => c.page.unroute(match, handler);
+}
+
+// The error toast a refusal is also announced with, checked and noted.
+async function expectToast(c: Ctx, pattern: RegExp, what: string): Promise<void> {
+  const toasts = await takeToasts(c.page);
+  for (const toast of toasts) {
+    if (toast.type === 'error' && pattern.test(toast.text)) c.rec.note(`expected toast error: ${toast.text}`);
+    else c.rec.check(toast.type !== 'error' && toast.type !== 'warning', `toast ${toast.type}: ${toast.text}`);
+  }
+  c.rec.check(toasts.some((t) => t.type === 'error' && pattern.test(t.text)), `${what} is announced (${toasts.map((t) => t.text).join(' | ') || 'no toast'})`);
+}
+
+const refusalAlert = (page: Page, title: RegExp) => drainCard(page).locator('.ant-alert-error', { hasText: title });
+
+// Waits for a refusal alert in the Drain section and returns its reasons.
+async function refusalReasons(c: Ctx, title: RegExp): Promise<string[] | null> {
+  const alert = refusalAlert(c.page, title);
+  if (!(await alert.waitFor({ timeout: 15_000 }).then(() => true, () => false))) return null;
+  return alert.locator('li').allInnerTexts();
+}
+
+// The page shows no crash: its title and Drain section render, and no page
+// error was thrown (the recorder counts those).
+async function rendersNode(c: Ctx, what: string): Promise<void> {
+  const fine = await drainCard(c.page).isVisible().catch(() => false);
+  c.rec.check(fine, `${what}: the node page renders its Drain section`);
+  c.rec.check(!/Application error|Something went wrong/i.test(await c.page.locator('body').innerText().catch(() => '')), `${what}: no error page`);
+}
+
+step('node-v2-drain-now', V2_TAGS, async (c) => {
+  await withV2Worker(c, async (node) => {
+    const phrase = node.name ?? node.id;
+    await visit(c, `/dashboard/nodes/${node.id}`, 3000);
+    await shot(c, '01-before');
+    if (!(await exactButton(c.page, 'v2 drain').count())) return c.rec.check(false, 'the node page offers v2 drain on an idle worker');
+    const dialog = await openTyped(c, 'v2 drain');
+    const said = (await dialog.innerText()).replace(/\s+/g, ' ');
+    c.rec.check(/keeps running sandboxes running until the deadline/.test(said), 'the confirmation says running sandboxes run until the deadline');
+    c.rec.check(/refused when every slot is held/.test(said), 'the confirmation says a drain is refused at the cap');
+    for (const preset of ['Now', '10 minutes', '1 hour', 'Custom']) {
+      c.rec.check(await dialog.getByRole('radio', { name: preset, exact: true }).count() === 1, `the hold offers ${preset}`);
+    }
+    await pickHold(dialog, 'Now');
+    c.rec.check(/already passed, so the hold ends at once|in 0s/.test((await dialog.innerText()).replace(/\s+/g, ' ')), 'a hold of Now ends at once');
+    c.rec.check(await okOf(dialog, 'v2 drain').isDisabled(), 'v2 drain is disabled before the name is typed');
+    await dialog.getByLabel('Type the node name to confirm').fill(phrase);
+    await shot(c, '02-confirm-now', { dialog: true });
+    const answer = await confirmTyped(c, dialog, 'v2 drain', node.id, 'drain', phrase);
+    c.rec.check(answer?.status() === 200, `the v2 drain is accepted (${answer?.status()})`);
+    c.rec.check(JSON.stringify(answer?.request().postDataJSON()) === '{"engine":"v2","hold_seconds":0,"require_undrained":true}', `the request asks for engine v2 with hold 0, start-only, and no mode (${answer?.request().postData()})`);
+    c.rec.check(await waitForSection(c, /Engine\s+v2/, 15_000), 'the Drain section shows engine v2');
+    c.rec.check(await waitForPanel(c, /Drain progress/, 15_000), 'the Drain progress panel appears');
+    await panelShot(c, '03-draining');
+    c.rec.check(!!(await waitForNode(c, node.id, (n) => n.drain_phase === 'drained', 300_000)), 'the empty worker reaches drained');
+    c.rec.check(await waitForSection(c, /Phase\s+drained/, 20_000), "the page's poll shows drained without a reload");
+    c.rec.check(await waitForPanel(c, /Finished: everything on the node is durable elsewhere/, 20_000), 'the panel says the drain is finished');
+    c.rec.check(await exactButton(c.page, 'Terminate').count() === 1, 'a drained v2 node offers Terminate');
+    await panelShot(c, '04-drained');
+
+    // Terminate's refusal: `:terminate` refuses a v2 node only on its phase.
+    // The API's own, for a terminate sent after the node is undrained while
+    // the confirmation is open.
+    let refusedStatus: number | null = null;
+    const terminateUrl = (url: URL) => url.pathname.endsWith(`/nodes/${node.id}:terminate`);
+    const guard = async (route: Route) => {
+      const current = await apiNode(c, node.id);
+      if (current?.drain_phase !== null) {
+        c.rec.check(false, `the terminate was not sent: the node is still ${current?.drain_phase}`);
+        return route.abort();
+      }
+      const res = await fetchWithoutRedirect(route);
+      if (!res) return;
+      refusedStatus = res.status();
+      return route.fulfill({ response: res, headers: { ...res.headers(), [SYNTHETIC_HEADER]: '1' } });
+    };
+    await c.page.route(terminateUrl, guard);
+    try {
+      const confirm = await openTyped(c, 'Terminate');
+      // A v2 node can be undrained from terminating until its instance is
+      // fenced (`V2_TERMINATE_ENDS` in ui/src/lib/node-actions.ts).
+      c.rec.check(/can still be undrained/.test(await confirm.innerText()), 'the terminate confirmation says the node can be undrained until its instance is fenced');
+      const undrained = await adminFetch(c.page, 'POST', `/admin/api/v1/nodes/${node.id}:undrain`);
+      c.rec.check(undrained.status === 200, 'the node is undrained while the confirmation is open');
+      if (!(await waitForNode(c, node.id, (n) => n.drain_phase === null, 30_000))) return c.rec.check(false, 'the undrain cleared the phase');
+      await confirmTyped(c, confirm, 'Terminate', node.id, 'terminate', phrase);
+      const reasons = await refusalReasons(c, /not drained/);
+      c.rec.check(refusedStatus === 409, `the API refuses the terminate (${refusedStatus})`);
+      c.rec.check(reasons !== null && reasons.some((r) => /accepted only from: drained/.test(r)), `the phase refusal is listed as reasons (${reasons?.join(' | ')})`);
+      await expectToast(c, /Terminate refused: the node is not drained/, 'the refusal');
+      await typedModal(c.page).waitFor({ state: 'hidden', timeout: 15_000 }).catch(() => {});
+      await shot(c, '05-refused-phase');
+    } finally {
+      await c.page.unroute(terminateUrl, guard);
+    }
+    c.rec.check(await waitForV2Gone(c, node.id, 120_000), 'the undrain\'s cancel finishes on the node');
+    c.rec.check(await waitForSection(c, /Phase\s+not draining/, 20_000), 'the Drain section shows not draining');
+    c.rec.check(await progressCard(c.page).waitFor({ state: 'detached', timeout: 15_000 }).then(() => true, () => false), 'the Drain progress panel is gone once the cancel finished');
+    await shot(c, '06-undrained');
+  });
+}, true);
+
+step('node-v2-hold-shorten-undrain', V2_TAGS, async (c) => {
+  await withV2Worker(c, async (node) => {
+    const phrase = node.name ?? node.id;
+    const answers = watchNodeAnswers(c.page, node.id);
+    let residents: string[] = [];
+    try {
+      // A running sandbox, so the drain holds until its deadline: a drain of
+      // an empty node is done at once.
+      residents = await createResidents(c, node, [['held', null]]);
+      await visit(c, `/dashboard/nodes/${node.id}`, 3000);
+      // 1. A start with a custom hold of N seconds.
+      c.rec.note('stage 1');
+      const dialog = await openTyped(c, 'v2 drain');
+      await pickHold(dialog, 600);
+      c.rec.check(/Deadline .* \(in (9|10)m\)/.test((await dialog.innerText()).replace(/\s+/g, ' ')), 'a custom hold of 600 s puts the deadline 10 minutes from now');
+      await typeHold(dialog, '1.5');
+      c.rec.check(await okOf(dialog, 'v2 drain').isDisabled(), 'a hold that is no whole number of seconds holds v2 drain');
+      c.rec.check(/A whole number of seconds/.test(await dialog.innerText()), 'the dialog says what a hold must be');
+      await pickHold(dialog, 600);
+      await dialog.getByLabel('Type the node name to confirm').fill(phrase);
+      await shot(c, '01-confirm-hold', { dialog: true });
+      const started = await confirmTyped(c, dialog, 'v2 drain', node.id, 'drain', phrase);
+      c.rec.check(started?.status() === 200, `the v2 drain is accepted (${started?.status()})`);
+      c.rec.check(JSON.stringify(started?.request().postDataJSON()) === '{"engine":"v2","hold_seconds":600,"require_undrained":true}', `the request asks for engine v2 with hold 600, start-only (${started?.request().postData()})`);
+      // The API doesn't show the node's seal: the controller storing a report
+      // under the drain's generation is what shows the node answered it.
+      const generation = (await waitForNode(c, node.id, (n) => n.drain_engine === 'v2' && !!n.drain, 30_000))?.drain?.generation;
+      c.rec.check(generation !== undefined, `the drain records its generation (${generation})`);
+      const reported = await waitForNode(c, node.id, (n) => reportedUnder(n.drain, generation), 120_000);
+      c.rec.check(!!reported, 'the controller stores the node\'s report under the drain\'s generation');
+      c.rec.check(await waitForPanel(c, /deadline in (9|10)m/, 20_000), 'the panel counts down to the deadline');
+      await panelMatchesAnswer(c, answers, residents, 'holding', (d) => reportedUnder(d, generation) && d.pending.some((p) => p.wait === HOLD_WAIT));
+      await progressCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+      await panelShot(c, '02-holding');
+
+      // 2. The nodes list's cell.
+      c.rec.note('stage 2');
+      await visit(c, '/dashboard/nodes', 3000);
+      const row = content(c.page).locator('tr', { has: c.page.locator(`a[href="/dashboard/nodes/${node.id}"]`) });
+      const cell = (await row.innerText().catch(() => '')).replace(/\s+/g, ' ');
+      // Counted as the panel counts, from the answer: the worker may also
+      // hold an earlier run's durable sandbox, which the report lists
+      // evacuated.
+      const listed = (await apiNode(c, node.id))?.drain;
+      const counts = listed ? drainCountsOf(listed) : null;
+      const progress = counts ? `${counts.evacuated}/${counts.total} evacuated` : 'no drain answer';
+      c.rec.check(/draining · v2/.test(cell) && cell.includes(`${progress} · deadline`) && /deadline (9|10)m/.test(cell), `the nodes list shows the drain in one line, ${progress} (${cell.slice(0, 160)})`);
+      await shot(c, '03-nodes-list');
+      await visit(c, `/dashboard/nodes/${node.id}`, 3000);
+
+      // 3. A preview of the drained node: the API answers a node a v2 drain
+      // holds with a 409 and asks the node nothing. The step passes the
+      // API's answer on, marked synthetic so the recorder doesn't count the
+      // 409 it expects.
+      c.rec.note('stage 3');
+      const previewUrl = (url: URL) => url.pathname.endsWith(`/nodes/${node.id}/drain-v2-preview`);
+      let previewed: { status: number; body: any } | null = null;
+      const passOn = async (route: Route) => {
+        const res = await fetchWithoutRedirect(route);
+        if (!res) return;
+        const text = await res.text().catch(() => '');
+        previewed = { status: res.status(), body: (() => { try { return JSON.parse(text); } catch { return null; } })() };
+        return route.fulfill({ status: res.status(), headers: { ...res.headers(), [SYNTHETIC_HEADER]: '1' }, body: text });
+      };
+      await c.page.route(previewUrl, passOn);
+      try {
+        await content(c.page).getByRole('button', { name: 'Preview v2 drain' }).click();
+        const refused = previewCard(c.page).locator('.ant-alert', { hasText: 'Could not preview this node (v2 drain in progress)' });
+        c.rec.check(await refused.waitFor({ timeout: previewWaitMs() }).then(() => true, () => false), 'the preview panel says a v2 drain holds the node');
+        const got = previewed as { status: number; body: any } | null;
+        c.rec.check(got?.status === 409 && got.body?.reason === 'drain_v2_in_progress', `the API answers the preview of a node a v2 drain holds with 409 drain_v2_in_progress (${got?.status} ${got?.body?.reason})`);
+        await previewCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+        await shot(c, '04-preview-draining');
+      } finally {
+        await c.page.unroute(previewUrl, passOn);
+      }
+
+      // 4. A longer hold: the deadline only moves earlier.
+      c.rec.note('stage 4');
+      const shorten = await openTyped(c, 'Shorten hold');
+      c.rec.check(/only moves earlier|can't be moved later/.test((await shorten.innerText()).replace(/\s+/g, ' ')), 'the dialog says a deadline moves only earlier');
+      await pickHold(shorten, '1 hour');
+      await shorten.getByLabel('Type the node name to confirm').fill(phrase);
+      const longerHeld = await okOf(shorten, 'Shorten hold').isDisabled();
+      c.rec.check(longerHeld, 'a hold that would end the drain later is caught before it is sent');
+      c.rec.check(/a deadline only moves earlier/.test(await shorten.innerText()), 'the dialog says why');
+      await shot(c, '05-shorten-longer', { dialog: true });
+      if (!longerHeld) {
+        // A console that sends it shows what the API answers.
+        const sent = nextPost(c.page, (p) => p.endsWith(`/nodes/${node.id}:drain`));
+        await okOf(shorten, 'Shorten hold').click();
+        c.rec.note(`the longer hold was sent and answered ${(await sent)?.status()}`);
+        await expectToast(c, /Shorten refused/, 'the refusal');
+        await typedModal(c.page).waitFor({ state: 'hidden', timeout: 15_000 }).catch(() => {});
+        await shot(c, '05b-shorten-longer-sent');
+      } else {
+        await shorten.getByRole('button', { name: 'Cancel' }).click();
+      }
+
+      // 5. A shorten: 600 s to 300 s from the drain's start.
+      c.rec.note('stage 5');
+      const shorter = await openTyped(c, 'Shorten hold');
+      await pickHold(shorter, 300);
+      c.rec.check(await okOf(shorter, 'Shorten hold').isDisabled(), 'Shorten hold is disabled before the name is typed');
+      await shorter.getByLabel('Type the node name to confirm').fill(phrase);
+      c.rec.check(await okOf(shorter, 'Shorten hold').isEnabled(), 'a shorter hold can be sent');
+      await shot(c, '06a-shorten-confirm', { dialog: true });
+      const shortened = await confirmTyped(c, shorter, 'Shorten hold', node.id, 'drain', phrase);
+      c.rec.check(shortened?.status() === 200 && JSON.stringify(shortened.request().postDataJSON()) === '{"hold_seconds":300}', `the shorten sends hold 300, naming no engine, and is accepted (${shortened?.status()} ${shortened?.request().postData()})`);
+      const moved = await waitForNode(c, node.id, (n) => !!n.drain?.deadline && !!n.drain_started_at && Math.abs(Date.parse(n.drain.deadline) - (Date.parse(n.drain_started_at) + 300_000)) <= 1500, 30_000);
+      c.rec.check(!!moved, `the deadline moves to the drain's start plus 300 s (${moved?.drain?.deadline})`);
+      c.rec.check(await waitForPanel(c, /deadline in [0-4]m/, 20_000), 'the panel counts down to the earlier deadline');
+      await progressCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+      await panelShot(c, '06b-shortened');
+
+      // 6. The API's own 409: another operator shortened the drain while
+      // this page read the node as it was. The page's reads are answered
+      // with the node as last read (synthetic, stale), so the console can't
+      // know; the shorten goes to the API, which refuses it.
+      c.rec.note('stage 6');
+      const stale = answers.latest()?.body;
+      const unstale = await overlayNode(c, node.id, () => stale);
+      const staleAnswers: number[] = [];
+      const unforward = await forwardAction(c, node.id, 'drain', staleAnswers);
+      try {
+        const again = await openTyped(c, 'Shorten hold');
+        await pickHold(again, 200);
+        // Another client: the loop's own, outside the page.
+        const elsewhere = await (await stepApi(c)).admin<AdminNode>('POST', `/nodes/${node.id}:drain`, { engine: 'v2', hold_seconds: 120 }, { idempotent: true }).then(() => 200, (error) => (error instanceof ApiError ? error.status : 0));
+        c.rec.check(elsewhere === 200, `another client shortens the hold to 120 s (${elsewhere})`);
+        await confirmTyped(c, again, 'Shorten hold', node.id, 'drain', phrase);
+        c.rec.check(staleAnswers.length === 1 && staleAnswers[0] === 409, `the API refuses a shorten that is now longer (${staleAnswers.join(', ')})`);
+        c.rec.note('SYNTHETIC: the page read the node as it was before the other client\'s shorten (its reads answered with that answer); the 409 is the API\'s');
+        const reasons = await refusalReasons(c, /Shorten refused/);
+        c.rec.check(reasons !== null && reasons.some((r) => /only moves earlier/.test(r)), `the refusal is listed (${reasons?.join(' | ')})`);
+        await expectToast(c, /Shorten refused/, 'the refusal');
+        await typedModal(c.page).waitFor({ state: 'hidden', timeout: 15_000 }).catch(() => {});
+        await shot(c, '07-shorten-refused');
+      } finally {
+        await unforward();
+        await unstale();
+      }
+      await drainCard(c.page).locator('.ant-alert-error .ant-alert-close-icon').click({ timeout: 3000 }).catch(() => {});
+
+      // 7. `mode` with v2: the step adds `mode: forced` to the End hold now
+      // the page sends, and the API refuses it.
+      c.rec.note('stage 7');
+      const drainUrl = (url: URL) => url.pathname.endsWith(`/nodes/${node.id}:drain`);
+      const modeAnswers: number[] = [];
+      const unmode = await forwardAction(c, node.id, 'drain', modeAnswers, (sent) => ({ ...(sent ?? {}), mode: 'forced' }));
+      try {
+        const end = await openTyped(c, 'End hold now');
+        c.rec.check(/Moves this v2 drain's deadline to now/.test(await end.innerText()), 'End hold now says it moves the deadline to now');
+        await shot(c, '08-end-hold-confirm', { dialog: true });
+        await confirmTyped(c, end, 'End hold now', node.id, 'drain', phrase);
+        const reasons = await refusalReasons(c, /takes no mode/);
+        c.rec.note('the step added mode forced to the request the page sent; the 400 is the API\'s');
+        c.rec.check(reasons !== null, `a v2 drain with a mode is refused as such (${reasons?.join(' | ')})`);
+        await expectToast(c, /takes no mode/, 'the refusal');
+        await typedModal(c.page).waitFor({ state: 'hidden', timeout: 15_000 }).catch(() => {});
+        await shot(c, '09-mode-refused');
+      } finally {
+        await unmode();
+      }
+      c.rec.check(modeAnswers[0] === 400, `the API answers mode with v2 with a 400 (${modeAnswers.join(', ')})`);
+      await drainCard(c.page).locator('.ant-alert-error .ant-alert-close-icon').click({ timeout: 3000 }).catch(() => {});
+
+      // 8. A 503 and a network error, answered by the step.
+      c.rec.note('stage 8');
+      for (const [name, how] of [['10-unavailable', 503], ['11-network-error', 0]] as const) {
+        const match = drainUrl;
+        const handler = (route: Route) => (how === 0
+          ? route.abort('aborted')
+          : route.fulfill({ status: 503, contentType: 'application/json', headers: { 'retry-after': '5', [SYNTHETIC_HEADER]: '1' }, body: JSON.stringify({ error: 'service temporarily unavailable; retry shortly' }) }));
+        await c.page.route(match, handler);
+        try {
+          const dlg = await openTyped(c, 'Shorten hold');
+          await pickHold(dlg, 60);
+          await confirmTyped(c, dlg, 'Shorten hold', node.id, 'drain', phrase);
+          await c.page.waitForTimeout(1500);
+          c.rec.note(`SYNTHETIC: ${how === 0 ? 'the request is cut off before it reaches the API' : "a 503 with Retry-After, answered by the step"}`);
+          await expectToast(c, how === 0 ? /fetch|network|failed/i : /unavailable|retry shortly/i, how === 0 ? 'the network error' : 'the 503');
+          await typedModal(c.page).waitFor({ state: 'hidden', timeout: 15_000 }).catch(() => {});
+          c.rec.check(await waitForPanel(c, /Drain progress/, 5000), 'the panel stays');
+          await shot(c, name);
+        } finally {
+          await c.page.unroute(match, handler);
+        }
+      }
+      c.rec.check(!!(await apiNode(c, node.id))?.drain_phase, 'the drain is untouched by them');
+
+      // 9. Stale data while polling: the page's node reads fail for a while.
+      c.rec.note('stage 9');
+      const nodeUrl = (url: URL) => url.pathname === `/admin/api/v1/nodes/${node.id}`;
+      // Aborted, so the recorder takes them as cut off by the step.
+      const cut = (route: Route) => route.abort('aborted');
+      await c.page.route(nodeUrl, cut);
+      try {
+        const warned = await c.page.locator('.ant-alert-warning', { hasText: 'Could not refresh the node' }).waitFor({ timeout: 15_000 }).then(() => true, () => false);
+        c.rec.check(warned, 'a failed poll says the node may be stale');
+        c.rec.check(await progressCard(c.page).isVisible(), 'the panel keeps the last answer while the reads fail');
+        c.rec.note('SYNTHETIC: the page\'s node reads are cut off by the step for one poll');
+        await shot(c, '12-stale-poll');
+      } finally {
+        await c.page.unroute(nodeUrl, cut);
+      }
+      c.rec.check(await c.page.locator('.ant-alert-warning', { hasText: 'Could not refresh the node' }).waitFor({ state: 'hidden', timeout: 15_000 }).then(() => true, () => false), 'the warning clears once a read answers');
+
+      // 10. End hold now, then undrain mid-drain, with the controller down,
+      // so the node's state stays where the API left it: past the deadline,
+      // then cancelling until the controller runs again.
+      c.rec.note('stage 10');
+      v2!.control.scaleController(v2!.lease, 0);
+      c.rec.note('scaled the cluster controller to 0');
+      const end = await openTyped(c, 'End hold now');
+      const ended = await confirmTyped(c, end, 'End hold now', node.id, 'drain', phrase);
+      c.rec.check(ended?.status() === 200 && JSON.stringify(ended.request().postDataJSON()) === '{"hold_seconds":0}', `End hold now sends hold 0, naming no engine, and is accepted (${ended?.status()} ${ended?.request().postData()})`);
+      c.rec.check(await waitForPanel(c, /past the deadline/, 20_000), 'the panel says the drain is past its deadline');
+      await panelShot(c, '13-past-deadline');
+      await exactButton(c.page, 'Undrain').click();
+      const confirm = c.page.locator('.ant-modal-confirm:visible');
+      await confirm.waitFor({ timeout: 5000 });
+      const undrain = nextPost(c.page, (p) => p.endsWith(`/nodes/${node.id}:undrain`));
+      await confirm.getByRole('button', { name: 'Undrain' }).click();
+      c.rec.check((await undrain)?.status() === 200, 'the undrain is accepted mid-drain');
+      c.rec.check(await waitForPanel(c, /Undrained: cancelling the drain on the node/, 20_000), 'the panel says the cancel is in progress');
+      c.rec.check(await waitForSection(c, /Phase\s+not draining.*Engine\s+v2/s, 15_000), 'the Drain section shows no phase, under engine v2');
+      const offered = { drain: await exactButton(c.page, 'Drain').count(), forced: await exactButton(c.page, 'Forced drain').count(), v2: await exactButton(c.page, 'v2 drain').count() };
+      // The API refuses every drain until the cancel finishes ("undrain still
+      // finishing"), so the page offers none.
+      c.rec.check(offered.drain === 0 && offered.forced === 0 && offered.v2 === 0, `while the cancel is pending no drain is offered (${JSON.stringify(offered)})`);
+      await progressCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+      await panelShot(c, '14-cancelling');
+      await visit(c, '/dashboard/nodes', 3000);
+      const cancelCell = (await content(c.page).locator('tr', { has: c.page.locator(`a[href="/dashboard/nodes/${node.id}"]`) }).innerText().catch(() => '')).replace(/\s+/g, ' ');
+      c.rec.check(/cancelling on the node/.test(cancelCell), `the nodes list says the cancel is in progress (${cancelCell.slice(0, 120)})`);
+      await shot(c, '15-nodes-list-cancelling');
+      await visit(c, `/dashboard/nodes/${node.id}`, 2000);
+      const file = v2StandingPath(c);
+      v2!.control.scaleController(v2!.lease, JSON.parse(fs.readFileSync(file, 'utf8')).replicas);
+      c.rec.note('scaled the cluster controller back');
+      c.rec.check(await waitForV2Gone(c, node.id, 180_000), 'the cancel finishes once the controller runs');
+      c.rec.check(await waitForSection(c, /Phase\s+not draining/, 20_000) && await progressCard(c.page).waitFor({ state: 'detached', timeout: 15_000 }).then(() => true, () => false), 'the page shows no drain');
+      await shot(c, '16-let-go');
+    } finally {
+      answers.stop();
+      if (residents.length) await deleteResidents(c, residents);
+    }
+  });
+}, true);
+
+step('node-v2-refusals', V2_TAGS, async (c) => {
+  const picked = await v2Worker(c);
+  if (!picked) return;
+  const { node } = picked;
+  const phrase = node.name ?? node.id;
+  await visit(c, `/dashboard/nodes/${node.id}`, 3000);
+  // The cap and the stale heartbeat: the API's 409s for a v2 start
+  // (`v2_start_refusal`), answered by the step; nothing reaches the API.
+  const cases: [string, number, unknown, Record<string, string>, RegExp, RegExp[]][] = [
+    ['01-cap', 409, {
+      error: "4 nodes' v2 drains hold every evacuation slot (SPACE_DRAIN_V2_MAX_EVACUATING_NODES is 4); retry once one reaches drained, or free a slot: shorten a drain in flight with hold_seconds 0, or undrain one",
+      code: 'drain_v2_evacuation_cap', evacuating: 4, max_evacuating: 4,
+    }, { 'retry-after': '60' }, /every evacuation slot is held/, [/4 of 4 evacuation slots are held/, /Retry after 60 s/]],
+    ['02-heartbeat-stale', 409, {
+      error: "the node's heartbeat is stale: a v2 drain starts only on a node that answers, since its node does the drain",
+      code: 'drain_v2_node_heartbeat_stale',
+    }, {}, /heartbeat is stale/, [/starts only on a node that answers/]],
+    ['03-switched-off', 400, { error: 'drain engine v2 is not enabled on this cluster' }, {}, /switched off/, [/SPACE_DRAIN_V2_ENABLED/]],
+  ];
+  for (const [name, status, body, headers, title, reasons] of cases) {
+    c.rec.note(`stage ${name}`);
+    const unroute = await answerAction(c, node.id, 'drain', status, body, headers);
+    try {
+      const dialog = await openTyped(c, 'v2 drain');
+      await pickHold(dialog, '10 minutes');
+      await confirmTyped(c, dialog, 'v2 drain', node.id, 'drain', phrase);
+      const shown = await refusalReasons(c, title);
+      c.rec.note(`SYNTHETIC: ${name} is the API's ${status} for a v2 start, answered by the step`);
+      c.rec.check(shown !== null && reasons.every((r) => shown.some((s) => r.test(s))), `${name}: the refusal is listed with what the API said (${shown?.join(' | ') ?? 'none'})`);
+      await expectToast(c, title, 'the refusal');
+      await typedModal(c.page).waitFor({ state: 'hidden', timeout: 15_000 }).catch(() => {});
+      await shot(c, name);
+      await drainCard(c.page).locator('.ant-alert-error .ant-alert-close-icon').click({ timeout: 3000 }).catch(() => {});
+    } finally {
+      await unroute();
+    }
+  }
+  c.rec.check(!(await apiNode(c, node.id))?.drain_phase, 'the node was never drained');
+});
+
+step('node-v2-states', V2_TAGS, async (c) => {
+  const picked = await v2Worker(c);
+  if (!picked) return;
+  const { node } = picked;
+  const now = Date.now();
+  const at = (ms: number) => new Date(now + ms).toISOString();
+  const report = (over: Record<string, unknown> = {}) => ({
+    generation: 1_763_553_600_000_000, deadline: at(-60_000), cancelling: false, fenced: false, reported_at: at(-5_000), evacuated_grew_at: at(-60_000),
+    evacuated_total: [], evacuated: [], pending: [], blocked: [], ...over,
+  });
+  // Each is the API's answer for the node with its drain fields changed;
+  // the page renders it, and must neither crash nor misread it.
+  const states: [string, (n: any) => any, RegExp][] = [
+    ['01-terminating', (n) => ({ ...n, drain_phase: 'terminating', drain_engine: 'v2', drain_started_at: at(-600_000), drain: report({ fenced: true }) }), /Finished: everything on the node is durable elsewhere.*instance fenced for termination/],
+    ['02-unreadable', (n) => ({ ...n, drain_phase: 'draining', drain_engine: 'v2', drain_started_at: at(-600_000), drain: undefined }), /can't be shown|Drain/],
+    ['03-unknown-phase-engine', (n) => ({ ...n, drain_phase: 'quiescing', drain_engine: 'v3', drain_started_at: at(-600_000) }), /quiescing/],
+    ['04-malformed-report', (n) => ({ ...n, drain_phase: 'draining', drain_engine: 'v2', drain_started_at: at(-600_000), drain: { generation: 7, deadline: at(60_000), pending: [{ sandbox_id: '01a1f4900000700080000000000000bb', wait: 'reticulate' }] } }), /deadline in|Drain progress/],
+    ['05-unknown-entries', (n) => ({ ...n, drain_phase: 'draining', drain_engine: 'v2', drain_started_at: at(-600_000), drain: report({
+      evacuated: [{ sandbox_id: '01a1f4900000700080000000000000cc', artifact_kind: 'unknown', was_running: false, recorded: true }],
+      pending: [{ sandbox_id: '01a1f4900000700080000000000000dd', wait: 'reticulate', running: false, pool_member: false, reason: 'a newer node reports it', since: at(-120_000) }],
+    }) }), /reticulate/],
+    // `:terminate` refuses a v2 node only on its phase; the terminating
+    // tick's fresh check, refused, returns it to drained with why.
+    ['06-terminate-refused', (n) => ({ ...n, drain_phase: 'drained', drain_engine: 'v2', drain_started_at: at(-600_000), drain_last_error: 'terminate refused: the node reports 1 pending, 0 blocked: synthetic', drain: report() }), /The last terminate was refused: the node is back in drained/],
+  ];
+  for (const [name, change, shows] of states) {
+    const unroute = await overlayNode(c, node.id, change);
+    try {
+      await visit(c, `/dashboard/nodes/${node.id}`, 3000);
+      c.rec.note(`SYNTHETIC: ${name}: the node's answer with its drain fields changed by the step`);
+      await rendersNode(c, name);
+      c.rec.check(shows.test((await content(c.page).innerText().catch(() => '')).replace(/\s+/g, ' ')), `${name}: the page shows the state (${shows})`);
+      if (name === '02-unreadable') c.rec.check(await progressCard(c.page).filter({ hasText: "can't be shown" }).count() === 1, `${name}: the page says the drain's progress can't be read`);
+      if (name === '03-unknown-phase-engine') {
+        const section = (await drainCard(c.page).innerText()).replace(/\s+/g, ' ');
+        c.rec.check(/Engine v3/.test(section) && !/Mode gentle/.test(section), `${name}: the Drain section names the engine rather than reading it as a v1 gentle drain (${section.slice(0, 120)})`);
+      }
+      await progressCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+      await panelShot(c, name);
+    } finally {
+      await unroute();
+    }
+  }
+  // The nodes list with an unrecognized and a malformed v2 drain.
+  const listUrl = (url: URL) => url.pathname === '/admin/api/v1/nodes';
+  const list = async (route: Route) => {
+    const res = await fetchWithoutRedirect(route);
+    if (!res) return;
+    const body = await res.json().catch(() => null);
+    const changed = Array.isArray(body) ? body.map((n: any) => (n.id === node.id ? { ...n, drain_phase: 'draining', drain_engine: 'v2', drain_started_at: at(-600_000), drain: { generation: 7, deadline: at(60_000) } } : n)) : body;
+    return route.fulfill({ status: res.status(), contentType: 'application/json', headers: { [SYNTHETIC_HEADER]: '1' }, body: JSON.stringify(changed) });
+  };
+  await c.page.route(listUrl, list);
+  try {
+    await visit(c, '/dashboard/nodes', 3000);
+    c.rec.note('SYNTHETIC: the nodes list with a v2 drain whose report has no entries, answered by the step');
+    c.rec.check(await content(c.page).locator('tr', { has: c.page.locator(`a[href="/dashboard/nodes/${node.id}"]`) }).count() === 1, 'the nodes list renders the node');
+    await shot(c, '07-nodes-list-malformed');
+  } finally {
+    await c.page.unroute(listUrl, list);
+  }
+  // Let go: a terminated v2 node's row is deleted, so its page reads it gone.
+  const gone = async (route: Route) => route.fulfill({ status: 404, contentType: 'application/json', headers: { [SYNTHETIC_HEADER]: '1' }, body: JSON.stringify({ error: 'Node not found' }) });
+  const nodeUrl = (url: URL) => url.pathname === `/admin/api/v1/nodes/${node.id}`;
+  await c.page.route(nodeUrl, gone);
+  try {
+    await visit(c, `/dashboard/nodes/${node.id}`, 3000);
+    c.rec.note('SYNTHETIC: the node read answers 404, as for a v2 node the drain let go and deleted');
+    c.rec.check(/Node not found/.test(await content(c.page).innerText()), 'a let-go node\'s page says the node is not found');
+    await shot(c, '08-let-go');
+  } finally {
+    await c.page.unroute(nodeUrl, gone);
+  }
+});
+
+// The loop's own API client, signed in as the console account: the steps'
+// reads and writes of the residents go through it, outside the page, so a
+// read that finds a sandbox gone is never counted against the console.
+let apiClient: Api | null = null;
+async function stepApi(c: Ctx): Promise<Api> {
+  if (!apiClient) {
+    const api = new Api(c.config);
+    await api.signIn(c.config.email, c.config.password);
+    apiClient = api;
+  }
+  return apiClient;
+}
+
+// A sandbox's admin status, or null once it is gone.
+async function sandboxStatus(c: Ctx, id: string): Promise<string | null> {
+  try {
+    return (await (await stepApi(c)).admin<{ status: string | null }>('GET', `/sandboxes/${id}`)).status;
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) return null;
+    throw error;
+  }
+}
+
+async function waitForSandbox(c: Ctx, id: string, want: (string | null)[], timeoutMs: number): Promise<string | null> {
+  const deadline = Date.now() + timeoutMs;
+  let status: string | null = null;
+  while (Date.now() < deadline) {
+    status = await sandboxStatus(c, id);
+    if (want.includes(status)) return status;
+    await c.page.waitForTimeout(2000);
+  }
+  return status;
+}
+
+// The residents of a v2 drain: by default running, running and paused
+// sandboxes in the managing organization, all on `node`, which the step pins
+// them to by cordoning every other worker while it creates them. A v2 drain
+// refuses a node that holds a stopped sandbox, so none is stopped.
+const ALL_RESIDENTS = [['run-a', null], ['run-b', null], ['paused', 'pause']] as const;
+
+async function createResidents(c: Ctx, node: AdminNode, kinds: readonly (readonly [string, 'pause' | null])[] = ALL_RESIDENTS): Promise<string[]> {
+  const api = await stepApi(c);
+  const others = (await adminNodes(c)).filter((n) => n.role === 'worker' && n.id !== node.id);
+  const managing = seeded(c).managingOrgId;
+  const ids: string[] = [];
+  for (const other of others) c.rec.check((await adminFetch(c.page, 'POST', `/admin/api/v1/nodes/${other.id}:cordon`)).status === 200, `${other.name} is cordoned while the residents are placed`);
+  try {
+    for (const [suffix] of kinds) {
+      const name = `${c.runTag}-v2-${suffix}`;
+      const accepted = await api.admin<{ operation_id: string; sandbox_id?: string }>('POST', '/sandboxes', { org_id: managing, sandbox: { template: 'seed:latest', runtime: 'fc', name } }, { idempotent: true, timeoutMs: 120_000 });
+      if (accepted.sandbox_id) recordCreated(c.config, { kind: 'sandbox', id: sbxId(accepted.sandbox_id), name, orgId: managing, createOperation: { id: accepted.operation_id, admin: true } });
+      // The answer names the sandbox before its operation has made it.
+      const op = await api.waitForOperation(accepted.operation_id, { admin: true, timeoutMs: 300_000 });
+      const target = accepted.sandbox_id ?? op.target_id;
+      c.rec.check(op.state === 'succeeded' && !!target, `the create of ${name} succeeds (${op.state})`);
+      if (!target) continue;
+      recordCreated(c.config, { kind: 'sandbox', id: sbxId(target), name, orgId: managing });
+      ids.push(sbxId(target));
+    }
+    for (const id of ids) c.rec.check(await waitForSandbox(c, id, ['started'], 300_000) === 'started', `${id} starts`);
+  } finally {
+    for (const other of others) await adminFetch(c.page, 'POST', `/admin/api/v1/nodes/${other.id}:uncordon`).catch(() => null);
+  }
+  for (const id of ids) {
+    const row = await api.admin<{ active_node_id: string | null; active_node?: { name: string } }>('GET', `/sandboxes/${id}`);
+    c.rec.check(row.active_node_id === node.id, `${id} runs on ${node.name} (${row.active_node?.name})`);
+  }
+  for (const [index, [, action]] of kinds.entries()) {
+    if (!action || !ids[index]) continue;
+    const state = 'paused';
+    const accepted = await api.admin<{ operation_id: string }>('POST', `/sandboxes/${ids[index]}:force-${action}`, undefined, { idempotent: true, timeoutMs: 120_000 });
+    const op = await api.waitForOperation(accepted.operation_id, { admin: true, timeoutMs: 300_000 });
+    c.rec.check(op.state === 'succeeded', `${action} ${ids[index]} succeeds (${op.state})`);
+    c.rec.check(await waitForSandbox(c, ids[index], [state], 300_000) === state, `${ids[index]} is ${state}`);
+  }
+  return ids;
+}
+
+// Deletes the residents and waits for them to go.
+async function deleteResidents(c: Ctx, ids: string[]): Promise<void> {
+  const api = await stepApi(c);
+  for (const id of ids) {
+    try {
+      const accepted = await api.admin<{ operation_id: string }>('POST', `/sandboxes/${id}:force-delete`, undefined, { idempotent: true, timeoutMs: 120_000 });
+      const op = await api.waitForOperation(accepted.operation_id, { admin: true, timeoutMs: 300_000 });
+      c.rec.note(`cleanup: delete ${id}: ${op.state}`);
+    } catch (error) {
+      c.rec.check(false, `cleanup: deleting ${id} failed: ${String(error).split('\n')[0]}`);
+    }
+  }
+  for (const id of ids) {
+    const status = await waitForSandbox(c, id, ['deleted', null], 300_000);
+    c.rec.check(status === 'deleted' || status === null, `cleanup: ${id} is deleted (${status})`);
+  }
+}
+
+const HOLD_SECONDS = 150;
+
+step('node-drain-progress', V2_TAGS, async (c) => {
+  await withV2Worker(c, async (node) => {
+    const phrase = node.name ?? node.id;
+    let residents: string[] = [];
+    const answers = watchNodeAnswers(c.page, node.id);
+    // Every report the loop reads, and each resident's evacuated entry the
+    // first time a report lists it: the node's report lists only what is
+    // still on the node, so a sandbox the drain has released drops out.
+    const timeline: { at: string; phase: string | null; drain: ApiDrain | undefined }[] = [];
+    const firstEvacuated = new Map<string, ApiDrain['evacuated'][number]>();
+    const seen = (n: AdminNode) => {
+      const last = timeline.at(-1);
+      if (!last || JSON.stringify(last.drain) !== JSON.stringify(n.drain) || last.phase !== n.drain_phase) {
+        timeline.push({ at: new Date().toISOString(), phase: n.drain_phase, drain: n.drain });
+      }
+      for (const entry of n.drain?.evacuated ?? []) if (!firstEvacuated.has(bareSandboxId(entry.sandbox_id))) firstEvacuated.set(bareSandboxId(entry.sandbox_id), entry);
+    };
+    // The loop reads the node every 2 s for the whole flow.
+    let polling = true;
+    const poll = (async () => {
+      while (polling) {
+        const n = await apiNode(c, node.id).catch(() => null);
+        if (n) seen(n);
+        await sleep(2000);
+      }
+    })();
+    try {
+      residents = await createResidents(c, node);
+      const [runA, runB, paused] = residents;
+      await visit(c, `/dashboard/nodes/${node.id}`, 3000);
+      await shot(c, '01-before');
+      const dialog = await openTyped(c, 'v2 drain');
+      await pickHold(dialog, HOLD_SECONDS);
+      await dialog.getByLabel('Type the node name to confirm').fill(phrase);
+      await shot(c, '02-confirm', { dialog: true });
+      const started = await confirmTyped(c, dialog, 'v2 drain', node.id, 'drain', phrase);
+      c.rec.check(started?.status() === 200, `the v2 drain is accepted (${started?.status()})`);
+      const startedAt = Date.now();
+      const generation = (await waitForNode(c, node.id, (n) => n.drain_engine === 'v2' && !!n.drain, 30_000))?.drain?.generation;
+      c.rec.check(generation !== undefined, `the drain records its generation (${generation})`);
+
+      // Before the deadline: the running sandboxes are held and the paused
+      // one suspended at once. A report
+      // stored under the drain's generation is what shows the node answered.
+      const holds = (d: ApiDrain) => reportedUnder(d, generation)
+        && [runA, runB].every((id) => d.pending.some((p) => p.wait === HOLD_WAIT && p.running && bareSandboxId(p.sandbox_id) === bareSandboxId(id)));
+      const holding = await waitForNode(c, node.id, (n) => !!n.drain && holds(n.drain), 120_000);
+      c.rec.check(!!holding, 'the node holds both running sandboxes until the deadline, each pending hold and running');
+      await panelMatchesAnswer(c, answers, residents, 'holding', holds);
+      c.rec.check(/running until the deadline/.test(await progressCard(c.page).innerText()), 'a held sandbox reads "running until the deadline"');
+      await progressCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+      await panelShot(c, '03-holding');
+      const early = await waitForNode(c, node.id, (n) => !!n.drain?.evacuated.some((e) => bareSandboxId(e.sandbox_id) === bareSandboxId(paused)), 90_000);
+      c.rec.check(!!early, 'the paused sandbox is evacuated before the deadline');
+      const earlyDone = (d: ApiDrain) => d.evacuated.some((e) => bareSandboxId(e.sandbox_id) === bareSandboxId(paused));
+      const earlyDrain = await panelMatchesAnswer(c, answers, residents, 'evacuated before the deadline', earlyDone);
+      if (earlyDrain) {
+        const kind = (id: string) => earlyDrain.evacuated.find((e) => bareSandboxId(e.sandbox_id) === bareSandboxId(id));
+        c.rec.check(kind(paused)?.artifact_kind === 'full' && kind(paused)?.was_running === false, 'the paused sandbox is a snapshot that was not running');
+      }
+      await panelShot(c, '04-evacuated-early');
+
+      // The nodes list's cell.
+      await visit(c, '/dashboard/nodes', 2500);
+      const cell = (await content(c.page).locator('tr', { has: c.page.locator(`a[href="/dashboard/nodes/${node.id}"]`) }).innerText().catch(() => '')).replace(/\s+/g, ' ');
+      c.rec.check(/[0-9]+\/3 evacuated · deadline \d+(s|m)/.test(cell), `the nodes list reads evacuated of 3 and the deadline (${cell.slice(0, 160)})`);
+      await shot(c, '05-nodes-list');
+      await visit(c, `/dashboard/nodes/${node.id}`, 2500);
+
+      // A warm-pool member, stalled and cancelling: the node's own answer
+      // with the fields that make each set by the step, as the API reports
+      // them. Stalled is past the deadline with nothing evacuated for 15
+      // minutes since `evacuated_grew_at`.
+      const POOL_MEMBER = '01a1f4900000700080000000000000ee';
+      for (const [name, change, pattern] of [
+        ['06-pool-member', (d: any) => ({ ...d, pending: [...d.pending, { sandbox_id: POOL_MEMBER, wait: 'external', running: false, pool_member: true, since: null }] }), /warm-pool member.*\(1 warm-pool\)|\(1 warm-pool\).*warm-pool member/],
+        ['07-stalled', (d: any) => ({ ...d, deadline: new Date(Date.now() - 20 * 60_000).toISOString(), evacuated_grew_at: new Date(Date.now() - 16 * 60_000).toISOString() }), /stalled since/],
+        ['08-cancelling', (d: any) => ({ ...d, cancelling: true }), /Undrained: cancelling the drain on the node/],
+      ] as const) {
+        const unroute = await overlayNode(c, node.id, (n) => (n.drain ? {
+          ...n,
+          drain: change(n.drain),
+          ...(name === '07-stalled' ? { drain_last_error: 'the drain is stalled: synthetic' } : {}),
+          ...(name === '08-cancelling' ? { drain_phase: null } : {}),
+        } : n));
+        try {
+          c.rec.note(`SYNTHETIC: ${name}: the node's own answer with one field set by the step`);
+          c.rec.check(await waitForPanel(c, pattern, 15_000), `${name}: the panel shows it (${pattern})`);
+          if (name === '06-pool-member') {
+            const row = (await readPanel(c.page)).pending.find((r) => bareSandboxId(r.sandbox) === POOL_MEMBER);
+            c.rec.check(!!row?.pool && row.wait === 'external' && !row.running, `${name}: the member's row is labelled a warm-pool member, with its wait and not running (${JSON.stringify(row)})`);
+          }
+          if (name === '07-stalled') {
+            const listUrl = (url: URL) => url.pathname === '/admin/api/v1/nodes';
+            const list = async (route: Route) => {
+              const res = await fetchWithoutRedirect(route);
+              if (!res) return;
+              const body = await res.json().catch(() => null);
+              const changed = Array.isArray(body) ? body.map((n: any) => (n.id === node.id && n.drain ? { ...n, drain: change(n.drain) } : n)) : body;
+              return route.fulfill({ status: res.status(), contentType: 'application/json', headers: { [SYNTHETIC_HEADER]: '1' }, body: JSON.stringify(changed) });
+            };
+            await c.page.route(listUrl, list);
+            await visit(c, '/dashboard/nodes', 2000);
+            c.rec.check(/stalled/.test(await content(c.page).locator('tr', { has: c.page.locator(`a[href="/dashboard/nodes/${node.id}"]`) }).innerText().catch(() => '')), 'the nodes list marks the drain stalled');
+            await shot(c, '07b-nodes-list-stalled');
+            await c.page.unroute(listUrl, list);
+            await visit(c, `/dashboard/nodes/${node.id}`, 2000);
+            await waitForPanel(c, pattern, 10_000);
+          }
+          await progressCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+          await panelShot(c, name);
+        } finally {
+          await unroute();
+        }
+      }
+
+      // Past the deadline: the node suspends what it held.
+      const due = startedAt + HOLD_SECONDS * 1000 - Date.now();
+      if (due > 0) await c.page.waitForTimeout(due);
+      const suspending = await waitForNode(c, node.id, (n) => !!n.drain && n.drain.deadline !== null && Date.now() >= Date.parse(n.drain.deadline) && n.drain.pending.some((p) => p.wait !== HOLD_WAIT), 60_000, 1000);
+      // The node lists the held sandboxes pending, moving, for a few seconds;
+      // the page polls every 5 s, so its own answers may miss them.
+      const pendingSuspends = (d: ApiDrain) => !!d.deadline && Date.now() >= Date.parse(d.deadline) && d.pending.some((p) => p.wait !== HOLD_WAIT);
+      const pageCaught = async () => {
+        const by = Date.now() + 15_000;
+        while (Date.now() < by) {
+          const latest = answers.latest()?.body?.drain;
+          if (latest && pendingSuspends(latest)) return true;
+          await c.page.waitForTimeout(250);
+        }
+        return false;
+      };
+      if (suspending && await pageCaught()) {
+        await panelMatchesAnswer(c, answers, residents, 'past the deadline, pending suspends', pendingSuspends, { current: true });
+        await progressCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+        await panelShot(c, '09-past-deadline');
+      } else {
+        c.rec.note(`the page's poll did not catch the pending suspends past the deadline (${suspending ? 'the loop read them' : 'no read listed them'}); the panel is checked against the next answer`);
+        await panelMatchesAnswer(c, answers, residents, 'past the deadline');
+        await progressCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+        await panelShot(c, '09-past-deadline');
+      }
+      // Each resident is reported evacuated, as what it was, by some report:
+      // a report lists only what is still on the node.
+      const reported = (id: string) => firstEvacuated.get(bareSandboxId(id));
+      c.rec.check(!!(await waitForNode(c, node.id, () => residents.every((id) => reported(id)), 300_000, 2000)), 'every resident is reported evacuated');
+      c.rec.check([runA, runB].every((id) => reported(id)?.artifact_kind === 'full' && reported(id)?.was_running === true), 'the held sandboxes are reported as snapshots that were running');
+      c.rec.check(reported(paused)?.artifact_kind === 'full' && reported(paused)?.was_running === false, 'the paused sandbox is reported as a snapshot that was not running');
+      const heldOut = (d: ApiDrain) => [runA, runB].some((id) => d.evacuated.some((e) => bareSandboxId(e.sandbox_id) === bareSandboxId(id)));
+      if (answers.latest()?.body?.drain && heldOut(answers.latest()!.body.drain)) {
+        await panelMatchesAnswer(c, answers, residents, 'evacuated', heldOut);
+        await progressCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+        await panelShot(c, '10-evacuated');
+      } else {
+        await panelMatchesAnswer(c, answers, residents, 'evacuated');
+        await progressCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+        await panelShot(c, '10-evacuated');
+      }
+      c.rec.check(!!(await waitForNode(c, node.id, (n) => n.drain_phase === 'drained', 300_000)), 'the drain reaches drained');
+      await waitForPanel(c, /Finished: everything on the node is durable elsewhere/, 20_000);
+      const final = await panelMatchesAnswer(c, answers, residents, 'drained', drainFinished);
+      c.rec.check(await waitForSection(c, /Phase\s+drained/, 15_000), 'the Drain section shows drained');
+      await progressCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+      await panelShot(c, '11-drained');
+      // A sandbox the drain released drops out of the node's report, and
+      // stays in `evacuated_total`, which the panel counts from.
+      if (final) {
+        const total = new Set(final.evacuated_total.map(bareSandboxId));
+        const missing = residents.filter((id) => !total.has(bareSandboxId(id)) && !final.evacuated.some((e) => bareSandboxId(e.sandbox_id) === bareSandboxId(id)));
+        c.rec.check(missing.length === 0, `the drained drain counts every resident evacuated, a released one through evacuated_total (${final.evacuated.length} in the report, ${final.evacuated_total.length} recorded${missing.length ? `; missing ${missing.join(', ')}` : ''})`);
+        const counts = drainCountsOf(final);
+        c.rec.check((await progressCard(c.page).innerText().catch(() => '')).includes(`${counts.evacuated}/${counts.total} evacuated`), `the panel reads ${counts.evacuated}/${counts.total} evacuated`);
+      }
+      await visit(c, '/dashboard/nodes', 2500);
+      const done = (await content(c.page).locator('tr', { has: c.page.locator(`a[href="/dashboard/nodes/${node.id}"]`) }).innerText().catch(() => '')).replace(/\s+/g, ' ');
+      const finalCounts = final ? drainCountsOf(final) : null;
+      const listed = finalCounts ? `${finalCounts.evacuated}/${finalCounts.total} evacuated · finished` : 'evacuated · finished';
+      c.rec.check(done.includes(listed), `the nodes list reads "${listed}", as the report says (${done.slice(0, 160)})`);
+      await shot(c, '12-nodes-list-done');
+    } finally {
+      answers.stop();
+      polling = false;
+      await poll;
+      fs.writeFileSync(path.join(c.rec.outDir, 'node-drain-progress-timeline.json'), JSON.stringify(timeline, null, 2));
+      // The drain is undrained by withV2Worker; the residents go first, so
+      // the worker is empty again for the next run.
+      if (residents.length) await deleteResidents(c, residents);
+    }
+  });
+}, true);
+
+step('nodes-v2-teardown', V2_AROUND, async (c) => {
+  if (!v2) return c.rec.note('nodes-v2-setup did not run in this run');
+  const { control, lease, cordonLease } = v2;
+  try {
+    const file = v2StandingPath(c);
+    const env = putStandingBack(control, lease, file);
+    const now = control.controllerEnv();
+    c.rec.check(JSON.stringify(now) === JSON.stringify(env), `the controller's standing config is back (${JSON.stringify(now)})`);
+    fs.rmSync(file, { force: true });
+    c.rec.note('the workers keep their fake EC2 instances, as the v2 smokes leave them');
+  } finally {
+    control.releaseLease(cordonLease);
+    control.releaseLease(lease);
+    v2 = null;
+  }
+}, true);
 
 step('logout', ['auth'], async (c) => {
   await visit(c, '/dashboard', 1500);

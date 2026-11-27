@@ -16,9 +16,9 @@ fn the_inline_wait_defaults_and_is_capped() {
 mod postgres {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use pplx_space_common_core::sql;
     use pplx_space_db_test_fixtures::TestDbResult;
     use pplx_space_public_api::{OperationId, OperationKind, OperationState, PublicErrorCode};
+    use pplx_space_sql_locator::sql;
     use tokio::sync::Notify;
 
     use pplx_space_service_lifecycle::DrainSignal;
@@ -26,7 +26,7 @@ mod postgres {
 
     use super::*;
     use crate::controllers::sandbox::SandboxController;
-    use crate::inline_operations::InlineOperationsConfig;
+    use crate::inline_operations::{InlineExecution, InlineOperationsConfig};
     use crate::public_operation_driver::{OperationExecutionConfig, OperationExecutor};
     use crate::public_operation_driver::{OperationExecutionResult, drive_claimed_operation};
     use crate::public_operations::{
@@ -144,7 +144,7 @@ mod postgres {
                             .expect("create has a target")
                             .parse()
                             .expect("target is a sandbox ID"),
-                        pplx_space_common_core::types::SandboxLifecycle::Started,
+                        pplx_space_sandbox_model::SandboxLifecycle::Started,
                         "sandbox created",
                     )
                     .into(),
@@ -1062,6 +1062,7 @@ mod postgres {
                     max_concurrent,
                     org_limit: org_limit.and_then(std::num::NonZeroU32::new),
                     test_hold: None,
+                    test_release_file: None,
                 },
                 TaskTracker::new(),
                 DrainSignal::new(),
@@ -1088,7 +1089,7 @@ mod postgres {
             &fixture.db.pool,
             fixture.org_id,
             fixture.user_id,
-            &pplx_space_common_core::types::IdempotencyKey::parse(idempotency_key)
+            &pplx_space_guest_process::IdempotencyKey::parse(idempotency_key)
                 .expect("test key parses"),
             fixture.request(),
             None,
@@ -1213,15 +1214,17 @@ mod postgres {
     }
 
     /// Under the test hold, a cold create admission claims stays `running`,
-    /// renewing its claim, and starts only once the hold ends; it then runs
+    /// renewing its claim, and starts only once the hold is released; it then runs
     /// once.
     #[tokio::test(flavor = "current_thread")]
     async fn a_held_inline_create_renews_its_claim_and_starts_after_the_hold() -> TestDbResult<()> {
         let fixture = AdmissionPoolFixture::new(1).await?;
         let script = ScriptedCreate::new(Script::Succeed);
-        // Long beside the 60 ms claim staleness, so the claim renews several
-        // times within its first third.
-        let hold = Duration::from_millis(300);
+        // The release is controlled by the test after observing claim renewal.
+        // A long deadline makes an ignored release fail promptly.
+        let hold = Duration::from_secs(30);
+        let directory = tempfile::tempdir()?;
+        let release_file = directory.path().join("release");
         let inline = crate::inline_operations::InlineLifecycle::new(
             InlineOperations::new(
                 InlineOperationsConfig {
@@ -1229,6 +1232,7 @@ mod postgres {
                     kinds: vec![OperationKind::CreateSandbox],
                     max_concurrent: 1,
                     test_hold: Some(hold),
+                    test_release_file: Some(release_file.clone()),
                     ..Default::default()
                 },
                 TaskTracker::new(),
@@ -1255,7 +1259,7 @@ mod postgres {
             .await
         };
         let first = claimed_at().await?;
-        tokio::time::sleep(hold / 3).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
             script.calls(),
             0,
@@ -1267,10 +1271,11 @@ mod postgres {
             claimed_at().await? > first,
             "the claim is renewed while the hold keeps the execution from starting"
         );
+        tokio::fs::write(release_file, b"release").await?;
         started(&script).await;
         assert!(
-            admitted.elapsed() >= hold,
-            "the execution starts after the hold"
+            admitted.elapsed() < hold,
+            "the release file ends the hold before its fail-safe deadline"
         );
         let row = wait_for_state(&fixture, response.operation_id, "succeeded").await?;
         assert_eq!((row.attempts, row.claim_generation), (1, 1));

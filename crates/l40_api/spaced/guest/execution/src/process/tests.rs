@@ -1,6 +1,6 @@
 use super::*;
 use futures_util::StreamExt;
-use pplx_space_common_core::types::GuestUserName;
+use pplx_space_guest_process::GuestUserName;
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::StartRequest;
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_server::Process;
 
@@ -75,6 +75,88 @@ async fn pty_close_stdin_rejects_without_disabling_input() {
     service.inner.process_tasks.wait().await;
     assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
     input.expect("unsupported close must preserve PTY input");
+}
+
+// A pty-backed process gets a terminal type and a character set unless the
+// sandbox's environment or the request sets them; a process without a pty
+// gets neither.
+#[tokio::test]
+async fn a_pty_starts_with_terminal_defaults_the_sandbox_and_request_override() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{PtyConfig, process_event::Event};
+
+    let service = cancellation_service();
+    let print = || {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf '[%s][%s]' \"$TERM\" \"$LANG\"".to_string(),
+        ]
+    };
+    let output = |request: StartRequest| {
+        let service = &service;
+        async move {
+            let response = Process::start(service, Request::new(request))
+                .await
+                .expect("process starts");
+            let mut stream = response.into_inner();
+            let mut stdout = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(event) = stream.next().await {
+                    match event.expect("process stream").event {
+                        Some(Event::Stdout(output)) => stdout.extend(output.data),
+                        Some(Event::Exit(_)) => break,
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("the process exits");
+            String::from_utf8(stdout).expect("utf-8 output")
+        }
+    };
+    let pty = || Some(PtyConfig { size: None });
+
+    for (label, configured, env, pty, expected) in [
+        ("pty", None, vec![], pty(), "[xterm-256color][C.UTF-8]"),
+        (
+            "request overrides",
+            None,
+            vec![("TERM", "vt100"), ("LANG", "en_US.UTF-8")],
+            pty(),
+            "[vt100][en_US.UTF-8]",
+        ),
+        (
+            "sandbox overrides",
+            Some(("LANG", "ja_JP.UTF-8")),
+            vec![],
+            pty(),
+            "[xterm-256color][ja_JP.UTF-8]",
+        ),
+        ("no pty", None, vec![], None, "[][]"),
+    ] {
+        let configured = configured
+            .map(|(key, value)| HashMap::from([(key.to_string(), value.to_string())]))
+            .unwrap_or_default();
+        service
+            .configure_process_env(EnvMap::try_from(configured).unwrap())
+            .await
+            .unwrap();
+        let printed = output(StartRequest {
+            command: print(),
+            env: env
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            pty,
+            idempotency_key: Some(format!("pty-defaults-{label}")),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(printed, expected, "{label}");
+    }
+    service.inner.shutdown.cancel();
+    service.inner.process_tasks.close();
+    service.inner.process_tasks.wait().await;
 }
 
 // A reconnect re-sends Start for a session whose process may already run. It
@@ -371,7 +453,7 @@ async fn losing_start_response_preserves_output_supervision_and_idempotency() {
                             assert_eq!(error.code(), tonic::Code::ResourceExhausted);
                             assert_eq!(
                                 error.message(),
-                                pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED_MESSAGE
+                                pplx_space_guest_process::status::PROCESS_OUTPUT_LAGGED_MESSAGE
                             );
                             lagged = true;
                             assert!(replay.next().await.is_none());
@@ -941,9 +1023,9 @@ async fn cursor_past_the_output_fails_instead_of_waiting() {
         assert_eq!(
             error
                 .metadata()
-                .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+                .get(pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY)
                 .and_then(|value| value.to_str().ok()),
-            Some(pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD)
+            Some(pplx_space_guest_process::status::PROCESS_OUTPUT_CURSOR_AHEAD)
         );
         assert!(ahead.next().await.is_none());
 
@@ -986,11 +1068,11 @@ async fn lagged_cursor_reports_the_oldest_retained_output() {
             .map(str::to_owned)
     };
     assert_eq!(
-        metadata(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY).as_deref(),
-        Some(pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED)
+        metadata(pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY).as_deref(),
+        Some(pplx_space_guest_process::status::PROCESS_OUTPUT_LAGGED)
     );
     let first_sequence: u64 =
-        metadata(pplx_space_common_core::spaced::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY)
+        metadata(pplx_space_guest_process::status::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY)
             .expect("the oldest retained output")
             .parse()
             .unwrap();
@@ -1126,6 +1208,7 @@ async fn cancelled_account_lookup_retains_admission_until_nss_returns() {
     let lookup = tokio::spawn(resolve_process_account(
         service.inner.process_tasks.clone(),
         slots.clone(),
+        service.inner.start_admission.clone(),
         None,
         move || {
             let _ = started_tx.send(());
@@ -1139,6 +1222,7 @@ async fn cancelled_account_lookup_retains_admission_until_nss_returns() {
     let retry = resolve_process_account(
         service.inner.process_tasks.clone(),
         slots.clone(),
+        service.inner.start_admission.clone(),
         None,
         || Err(Status::unavailable("lookup ran")),
     )
@@ -1266,9 +1350,10 @@ fn stalled_placement_service() -> (ExecutionService, StalledPlacement) {
         let _ = io::copy(&mut reader, &mut io::sink());
     });
     let mut service = cancellation_service();
-    Arc::get_mut(&mut service.inner)
-        .expect("service is not shared yet")
-        .guest_cgroups = Some(Arc::new(crate::ExecutionCgroups::new(
+    let inner = Arc::get_mut(&mut service.inner).expect("service is not shared yet");
+    // Long enough that a start refused while two stall lands well inside it.
+    inner.start_admission.hold_limit = Duration::from_secs(1);
+    inner.guest_cgroups = Some(Arc::new(crate::ExecutionCgroups::new(
         std::fs::File::from(OwnedFd::from(
             writer.try_clone().expect("clone placement pipe"),
         )),
@@ -1292,6 +1377,112 @@ async fn wait_for_start_owner(service: &ExecutionService) {
 async fn shut_down(service: &ExecutionService) {
     service.cancel();
     service.drain().await.expect("complete shutdown");
+}
+
+// A repeated start whose process the guest no longer holds may have run, so
+// the guest says so rather than answer as a start that failed.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_repeated_start_whose_process_is_gone_says_its_replay_expired() {
+    let service = cancellation_service();
+    let mut events = Process::start(&service, cancellation_start_request())
+        .await
+        .expect("first start")
+        .into_inner();
+    while let Some(event) = events.next().await {
+        event.expect("first start's events");
+    }
+    service.inner.processes.records.clear();
+
+    let Err(error) = Process::start(&service, cancellation_start_request()).await else {
+        panic!("a start whose process is gone must not replay");
+    };
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error:?}");
+    assert_eq!(
+        error
+            .metadata()
+            .get(pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY)
+            .and_then(|reason| reason.to_str().ok()),
+        Some(pplx_space_guest_process::status::PROCESS_REPLAY_EXPIRED)
+    );
+    shut_down(&service).await;
+}
+
+fn start_reason(status: &Status) -> Option<&str> {
+    status
+        .metadata()
+        .get(pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY)
+        .and_then(|reason| reason.to_str().ok())
+}
+
+/// Spawn `program` in `working_dir` with the hooks a start registers, run
+/// `after_spawn` once the spawn has failed, and return the start's status.
+fn failed_spawn_status(
+    program: &std::path::Path,
+    working_dir: &std::path::Path,
+    after_spawn: impl FnOnce(),
+) -> Status {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+        .expect("current user lookup")
+        .expect("process tests require a passwd entry for the current uid");
+    let user = GuestUserName::parse(user.name).expect("valid current user");
+    let account = GuestAccount::resolve(user).expect("current account");
+    let progress = SpawnProgress::new().expect("spawn stage mapping");
+    let mut command = Command::new(program);
+    account
+        .configure_child_credentials(&mut command, IdentityPolicy::Guest, working_dir, &progress)
+        .expect("current account's credentials");
+    progress.record_exec(&mut command);
+    let error = command.spawn().expect_err("the spawn must fail");
+    after_spawn();
+    spawn_error_status(error, progress.stage())
+}
+
+// The kernel says ENOENT for a missing working directory and a missing
+// executable alike. The field named is the one the child failed on, however
+// the directory looks by the time the failure is answered.
+#[tokio::test]
+async fn a_failed_spawn_names_the_field_it_failed_on() {
+    use pplx_space_guest_process::status::{PROCESS_START_COMMAND, PROCESS_START_CWD};
+    let directory = tempfile::tempdir().unwrap();
+
+    let created_after = directory.path().join("created-after-the-spawn");
+    let status = failed_spawn_status(std::path::Path::new("/bin/true"), &created_after, || {
+        std::fs::create_dir(&created_after).unwrap();
+    });
+    assert_eq!(start_reason(&status), Some(PROCESS_START_CWD), "{status:?}");
+
+    let removed_after = directory.path().join("removed-after-the-spawn");
+    std::fs::create_dir(&removed_after).unwrap();
+    let missing_executable = directory.path().join("missing-executable");
+    let status = failed_spawn_status(&missing_executable, &removed_after, || {
+        std::fs::remove_dir(&removed_after).unwrap();
+    });
+    assert_eq!(
+        start_reason(&status),
+        Some(PROCESS_START_COMMAND),
+        "{status:?}"
+    );
+}
+
+// A permission error can be the executable's, the working directory's or a
+// parent's, so it names no field whichever step failed.
+#[test]
+fn a_spawn_permission_error_names_no_field() {
+    for stage in [SpawnStage::Setup, SpawnStage::WorkingDir, SpawnStage::Exec] {
+        for errno in [libc::EACCES, libc::EPERM] {
+            let status = spawn_error_status(io::Error::from_raw_os_error(errno), stage);
+            assert_eq!(start_reason(&status), None, "{stage:?}, errno {errno}");
+        }
+    }
+    let status = spawn_error_status(
+        io::Error::from_raw_os_error(libc::ENOENT),
+        SpawnStage::WorkingDir,
+    );
+    assert_eq!(
+        start_reason(&status),
+        Some(pplx_space_guest_process::status::PROCESS_START_CWD)
+    );
 }
 
 // A spawn can stall for seconds under memory or I/O pressure. It must hold up
@@ -1374,6 +1565,205 @@ fn a_stalled_spawn_does_not_hold_up_other_starts() {
     });
 }
 
+/// Wait, well past the fixture's hold limit, until `semaphore` has exactly
+/// `permits` free, rather than sleep for the limit and race the timer.
+#[cfg(target_os = "linux")]
+async fn wait_for_permits(semaphore: &Semaphore, permits: usize, what: &str) {
+    let waited = tokio::time::timeout(Duration::from_secs(3), async {
+        while semaphore.available_permits() != permits {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        waited.is_ok(),
+        "{what}: {} free",
+        semaphore.available_permits()
+    );
+}
+
+// Payload admission fits two starts at once. Two starts stalled in `spawn`,
+// as under guest memory pressure, used to keep both admissions until the
+// kernel let them go, and refused every later start (a reconnect included)
+// with RESOURCE_EXHAUSTED for as long as that took. Past the hold limit they
+// trade their slots for detached-start slots and carry on, so a later start
+// is admitted.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn starts_stalled_in_spawn_release_admission_at_the_hold_limit() {
+    use pplx_space_spaced_guest_protocol::process_limits;
+    let (service, placement) = stalled_placement_service();
+    let start = |key: &'static str| {
+        let service = service.clone();
+        tokio::spawn(async move {
+            Process::start(
+                &service,
+                Request::new(StartRequest {
+                    command: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+                    idempotency_key: Some(key.into()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map(drop)
+        })
+    };
+    let stalled = [start("stalled-1"), start("stalled-2")];
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while service.inner.processes.records.len() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("both starts reach their owners");
+    let slots = &service.inner.process_payload_slots;
+    assert_eq!(
+        slots.available_permits(),
+        process_limits::PAYLOAD_SLOTS - 2 * process_limits::START_PAYLOAD_SLOTS as usize,
+        "two stalled starts hold every start slot"
+    );
+
+    let refused = Process::start(
+        &service,
+        Request::new(StartRequest {
+            command: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+            idempotency_key: Some("refused".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .map(drop)
+    .expect_err("a start is refused while both stalled starts are within the hold limit");
+    assert_eq!(
+        refused.code(),
+        tonic::Code::ResourceExhausted,
+        "{refused:?}"
+    );
+
+    wait_for_permits(
+        slots,
+        process_limits::PAYLOAD_SLOTS,
+        "stalled starts return their slots at the hold limit",
+    )
+    .await;
+    assert!(
+        stalled.iter().all(|start| !start.is_finished()),
+        "both starts are still stalled in spawn"
+    );
+    let admitted = start("admitted");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while service.inner.processes.records.len() < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a start is admitted once the stalled starts pass the hold limit");
+
+    placement.release();
+    for start in stalled {
+        start
+            .await
+            .unwrap()
+            .expect("a stalled start completes once its spawn resumes");
+    }
+    admitted
+        .await
+        .unwrap()
+        .expect("the admitted start completes");
+    shut_down(&service).await;
+}
+
+// Starts that carry on past the hold limit are capped: with one detached
+// slot left, only one of two stalled starts gives up its payload slots, the
+// other keeps them, and admission refuses again once a third start stalls.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_detached_start_cap_keeps_admission_with_starts_past_it() {
+    use pplx_space_spaced_guest_protocol::process_limits;
+    let (service, placement) = stalled_placement_service();
+    let detached = service.inner.start_admission.detached_starts.clone();
+    let _taken = detached
+        .clone()
+        .try_acquire_many_owned(detached.available_permits() as u32 - 1)
+        .expect("leave one detached slot");
+    let start = |key: &'static str| {
+        let service = service.clone();
+        tokio::spawn(async move {
+            Process::start(
+                &service,
+                Request::new(StartRequest {
+                    command: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+                    idempotency_key: Some(key.into()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map(drop)
+        })
+    };
+    let wait_for_owners = |owners: usize| {
+        let service = service.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while service.inner.processes.records.len() < owners {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("starts reach their owners");
+        }
+    };
+    let stalled = [start("stalled-1"), start("stalled-2")];
+    wait_for_owners(2).await;
+    let slots = &service.inner.process_payload_slots;
+    // The exchange takes the detached slot before it returns the payload
+    // slots, so once these are back the detached slot is taken.
+    wait_for_permits(
+        slots,
+        process_limits::START_PAYLOAD_SLOTS as usize,
+        "one start returns its payload slots at the hold limit",
+    )
+    .await;
+    assert_eq!(
+        detached.available_permits(),
+        0,
+        "the detached slot is taken"
+    );
+    assert_eq!(
+        slots.available_permits(),
+        process_limits::START_PAYLOAD_SLOTS as usize,
+        "the start past the detached cap keeps its payload slots"
+    );
+
+    let third = start("third");
+    wait_for_owners(3).await;
+    let refused = Process::start(
+        &service,
+        Request::new(StartRequest {
+            command: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+            idempotency_key: Some("refused".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .map(drop)
+    .expect_err("admission refuses once the detached cap is reached");
+    assert_eq!(
+        refused.code(),
+        tonic::Code::ResourceExhausted,
+        "{refused:?}"
+    );
+
+    placement.release();
+    for start in stalled.into_iter().chain([third]) {
+        start
+            .await
+            .unwrap()
+            .expect("a stalled start completes once its spawn resumes");
+    }
+    shut_down(&service).await;
+}
+
 // A reconnect for an assigned id whose start is still inside its spawn must
 // not be told the process is attachable: nothing can be connected to yet. The
 // same key waits for the original start and replays it; another key is told
@@ -1382,7 +1772,7 @@ fn a_stalled_spawn_does_not_hold_up_other_starts() {
 #[tokio::test]
 async fn a_reconnect_before_its_process_is_published_waits_or_retries() {
     let (service, placement) = stalled_placement_service();
-    let process_id = pplx_space_common_core::types::ProcessId::new();
+    let process_id = pplx_space_guest_process::ProcessId::new();
     let request = |key: &str| {
         Request::new(StartRequest {
             command: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],

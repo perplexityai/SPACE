@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
+use pplx_space_public_api_http::PublicJson;
 
 use std::sync::Arc;
 
@@ -10,15 +11,16 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use futures_util::{StreamExt, stream};
-use pplx_space_common_core::types::IdempotencyKey;
+use futures_util::{Stream, StreamExt, stream};
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_native_files::{
     BatchEntry, FileCallFailure, admit_list_entry, decode_write_batch_entries, decode_write_chunks,
     guest_key, list_depth, parse_guest_path, parse_guest_user, public_file_info,
-    shared_spaced_write_requests, spaced_write_requests, validate_modified_filters,
+    shared_spaced_write_requests, spaced_write_requests, start_read, validate_modified_filters,
     validate_read_length, validate_tracking_enabled, validate_write_batch_shape,
     write_creating_parents,
 };
+use pplx_space_node_api_client::NodeApiOperationBudget;
 use pplx_space_public_api::routes::{
     CREATE_DIRECTORY, REMOVE_FILE, RENAME_FILE, WRITE_FILE, WRITE_FILE_BATCH,
 };
@@ -28,7 +30,9 @@ use pplx_space_public_api::{
     FileReadRequest, FileRemoveRequest, FileRenameRequest, FileStatRequest, FileStatResponse,
     FileWriteBatchRequest, FileWriteBatchResponse, FileWriteRequest, FileWriteResponse,
 };
-use pplx_space_sbx_mgr_client::proto::{SpacedMkdirRequest, SpacedWriteBatchEntry};
+use pplx_space_sbx_mgr_client::proto::{
+    SpacedFileChunk, SpacedMkdirRequest, SpacedWriteBatchEntry,
+};
 
 use crate::{
     controllers::ControllerError, middleware::auth::AuthOrg, models::Sandbox, routes::AppState,
@@ -49,7 +53,7 @@ pub async fn stat_file(
     Extension(AuthOrg(org)): Extension<AuthOrg>,
     authorized: Option<Extension<AuthorizedSandbox>>,
     Path(sandbox_id): Path<String>,
-    Json(request): Json<FileStatRequest>,
+    PublicJson(request): PublicJson<FileStatRequest>,
 ) -> Result<Json<FileStatResponse>, PublicApiError> {
     let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, &sandbox_id).await?;
     let user = parse_guest_user(request.user)?;
@@ -78,7 +82,7 @@ pub async fn list_files(
     Extension(AuthOrg(org)): Extension<AuthOrg>,
     authorized: Option<Extension<AuthorizedSandbox>>,
     Path(sandbox_id): Path<String>,
-    Json(request): Json<FileListRequest>,
+    PublicJson(request): PublicJson<FileListRequest>,
 ) -> Result<Json<FileListResponse>, PublicApiError> {
     let depth = list_depth(request.depth)?;
     let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, &sandbox_id).await?;
@@ -116,7 +120,7 @@ pub async fn read_file(
     Extension(AuthOrg(org)): Extension<AuthOrg>,
     authorized: Option<Extension<AuthorizedSandbox>>,
     Path(sandbox_id): Path<String>,
-    Json(request): Json<FileReadRequest>,
+    PublicJson(request): PublicJson<FileReadRequest>,
 ) -> Result<Response, PublicApiError> {
     let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, &sandbox_id).await?;
     validate_read_length(request.length)?;
@@ -138,6 +142,22 @@ pub async fn read_file(
         )
         .await
         .map_err(controller_error)?;
+    read_response(stream).await
+}
+
+/// The response to a read whose stream the sandbox opened. It starts once the
+/// first chunk arrives, so a read refused before then answers with its
+/// failure rather than a 200.
+async fn read_response(
+    stream: impl Stream<Item = Result<SpacedFileChunk, tonic::Status>> + Send + Unpin + 'static,
+) -> Result<Response, PublicApiError> {
+    let stream = start_read(
+        stream,
+        NodeApiOperationBudget::FilesystemTransferOpen.timeout(),
+    )
+    .await
+    .map_err(ControllerError::from)
+    .map_err(controller_error)?;
     let stream = stream.map(|chunk| {
         chunk.map(|chunk| chunk.data).map_err(|status| {
             // The 200 and part of the body are already sent, so only the
@@ -164,7 +184,7 @@ pub async fn write_file(
     authorized: Option<Extension<AuthorizedSandbox>>,
     headers: HeaderMap,
     Path(sandbox_id): Path<String>,
-    Json(request): Json<FileWriteRequest>,
+    PublicJson(request): PublicJson<FileWriteRequest>,
 ) -> Result<Json<FileWriteResponse>, PublicApiError> {
     let idempotency_key = idempotency_key(&headers)?;
     let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, &sandbox_id).await?;
@@ -241,7 +261,7 @@ pub async fn write_file_batch(
     authorized: Option<Extension<AuthorizedSandbox>>,
     headers: HeaderMap,
     Path(sandbox_id): Path<String>,
-    Json(request): Json<FileWriteBatchRequest>,
+    PublicJson(request): PublicJson<FileWriteBatchRequest>,
 ) -> Result<Json<FileWriteBatchResponse>, PublicApiError> {
     let idempotency_key = idempotency_key(&headers)?;
     validate_write_batch_shape(&request)?;
@@ -303,7 +323,7 @@ pub async fn mkdir_file(
     authorized: Option<Extension<AuthorizedSandbox>>,
     headers: HeaderMap,
     Path(sandbox_id): Path<String>,
-    Json(request): Json<FileMkdirRequest>,
+    PublicJson(request): PublicJson<FileMkdirRequest>,
 ) -> Result<Json<FileMutationResponse>, PublicApiError> {
     let idempotency_key = idempotency_key(&headers)?;
     let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, &sandbox_id).await?;
@@ -341,7 +361,7 @@ pub async fn remove_file(
     authorized: Option<Extension<AuthorizedSandbox>>,
     headers: HeaderMap,
     Path(sandbox_id): Path<String>,
-    Json(request): Json<FileRemoveRequest>,
+    PublicJson(request): PublicJson<FileRemoveRequest>,
 ) -> Result<Json<FileMutationResponse>, PublicApiError> {
     let idempotency_key = idempotency_key(&headers)?;
     let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, &sandbox_id).await?;
@@ -379,7 +399,7 @@ pub async fn rename_file(
     authorized: Option<Extension<AuthorizedSandbox>>,
     headers: HeaderMap,
     Path(sandbox_id): Path<String>,
-    Json(request): Json<FileRenameRequest>,
+    PublicJson(request): PublicJson<FileRenameRequest>,
 ) -> Result<Json<FileMutationResponse>, PublicApiError> {
     let idempotency_key = idempotency_key(&headers)?;
     let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, &sandbox_id).await?;
@@ -422,10 +442,10 @@ pub async fn enable_file_change_tracking(
     authorized: Option<Extension<AuthorizedSandbox>>,
     headers: HeaderMap,
     Path(sandbox_id): Path<String>,
-    body: Option<Json<FileChangeTrackingRequest>>,
+    body: Option<PublicJson<FileChangeTrackingRequest>>,
 ) -> Result<Json<FileChangeTrackingResponse>, PublicApiError> {
     let _idempotency_key = idempotency_key(&headers)?;
-    let request = body.map(|Json(request)| request).unwrap_or_default();
+    let request = body.map(|PublicJson(request)| request).unwrap_or_default();
     validate_tracking_enabled(&request)?;
     let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, &sandbox_id).await?;
     let user = parse_guest_user(request.user)?;
@@ -465,10 +485,10 @@ pub async fn disable_file_change_tracking(
     authorized: Option<Extension<AuthorizedSandbox>>,
     headers: HeaderMap,
     Path(sandbox_id): Path<String>,
-    body: Option<Json<FileChangeTrackingRequest>>,
+    body: Option<PublicJson<FileChangeTrackingRequest>>,
 ) -> Result<Json<FileMutationResponse>, PublicApiError> {
     let _idempotency_key = idempotency_key(&headers)?;
-    let request = body.map(|Json(request)| request).unwrap_or_default();
+    let request = body.map(|PublicJson(request)| request).unwrap_or_default();
     let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, &sandbox_id).await?;
     let user = parse_guest_user(request.user)?;
     state
@@ -489,7 +509,7 @@ pub async fn modified_files(
     Extension(AuthOrg(org)): Extension<AuthOrg>,
     authorized: Option<Extension<AuthorizedSandbox>>,
     Path(sandbox_id): Path<String>,
-    Json(request): Json<FileModifiedRequest>,
+    PublicJson(request): PublicJson<FileModifiedRequest>,
 ) -> Result<Json<FileModifiedResponse>, PublicApiError> {
     validate_modified_filters(&request)?;
     let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, &sandbox_id).await?;
@@ -569,6 +589,16 @@ impl FileCallFailure for ControllerError {
 
     fn is_lock_contention(&self) -> bool {
         ControllerError::is_lock_contention(self)
+    }
+
+    fn sandbox_not_running(
+        &self,
+    ) -> Option<(
+        pplx_space_sandbox_model::SandboxId,
+        pplx_space_sandbox_model::SandboxLifecycle,
+    )> {
+        self.sandbox_not_running_refusal()
+            .map(|refusal| (refusal.sandbox_id, refusal.lifecycle))
     }
 }
 

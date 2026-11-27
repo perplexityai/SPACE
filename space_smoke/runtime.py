@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+import json
 import signal
 import subprocess
 import sys
@@ -146,10 +147,14 @@ class Compensation:
         callback: Callable[[], None],
         *,
         critical: bool,
+        timeout_seconds: float | None = None,
     ) -> None:
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise ValueError("compensation timeout must be positive")
         self.name = name
         self.callback = callback
         self.critical = critical
+        self.timeout_seconds = timeout_seconds
         self.armed = True
 
     def release(self) -> None:
@@ -332,10 +337,29 @@ class ResourceScope:
         callback: Callable[[], None],
         *,
         critical: bool = False,
+        timeout_seconds: float | None = None,
     ) -> Compensation:
-        compensation = Compensation(name, callback, critical=critical)
+        compensation = Compensation(
+            name, callback, critical=critical, timeout_seconds=timeout_seconds
+        )
         self._compensations.append(compensation)
         return compensation
+
+    def redefer(self, *compensations: Compensation) -> None:
+        """Move armed compensations to the top of LIFO teardown in one atomic update."""
+
+        for compensation in compensations:
+            if compensation not in self._compensations:
+                raise ValueError(
+                    f"compensation {compensation.name!r} is not registered in this scope"
+                )
+        promoted = [comp for comp in compensations if comp.armed]
+        if not promoted:
+            return
+        promoted_ids = {id(comp) for comp in promoted}
+        self._compensations = [
+            comp for comp in self._compensations if id(comp) not in promoted_ids
+        ] + promoted
 
     def close(
         self,
@@ -343,10 +367,14 @@ class ResourceScope:
         timeout_seconds: float | None = None,
     ) -> tuple[CleanupFailure, ...]:
         failures: list[CleanupFailure] = []
+        seen: set[int] = set()
         deadline = (
             time.monotonic() + timeout_seconds if timeout_seconds is not None else None
         )
         for compensation in reversed(self._compensations):
+            if id(compensation) in seen:
+                continue
+            seen.add(id(compensation))
             if not compensation.armed:
                 continue
             remaining = None if deadline is None else deadline - time.monotonic()
@@ -359,8 +387,9 @@ class ResourceScope:
                     )
                 )
                 continue
+            step_timeout = _compensation_deadline_seconds(remaining, compensation.timeout_seconds)
             try:
-                with _scenario_deadline(remaining, label="cleanup"):
+                with _scenario_deadline(step_timeout, label="cleanup"):
                     compensation.release()
             except Exception as error:  # noqa: BLE001 - cleanup must continue
                 failures.append(
@@ -373,12 +402,77 @@ class ResourceScope:
         return tuple(failures)
 
 
+def _compensation_deadline_seconds(
+    remaining: float | None, step_cap: float | None
+) -> float | None:
+    if remaining is not None:
+        return remaining if step_cap is None else min(remaining, step_cap)
+    if step_cap is None:
+        return None
+    if threading.current_thread() is not threading.main_thread():
+        return None
+    if signal.getitimer(signal.ITIMER_REAL) != (0.0, 0.0):
+        return None
+    return step_cap
+
+
+UNENCODABLE_EVIDENCE = "unencodable_evidence"
+"""The evidence key naming the values a failing verdict kept as `repr`."""
+
+
+def _json_error(value: object) -> Exception | None:
+    """Why the runner can't print `value`, encoding as it does, if it can't."""
+
+    try:
+        json.dumps(value, sort_keys=True)
+    except (TypeError, ValueError) as error:
+        return error
+    return None
+
+
+def require_json_evidence(evidence: Mapping[str, object]) -> None:
+    """Refuse evidence the runner can't print. It writes each verdict's
+    evidence as JSON once the scenario ends, so a value it can't encode ends
+    even a passed run with a traceback; refused here, it fails the call that
+    recorded it, by name."""
+
+    for name, value in evidence.items():
+        error = _json_error(value)
+        if error is not None:
+            raise TypeError(
+                f"evidence {name!r} is not JSON-serializable ({type(value).__name__}): {error}"
+            ) from error
+
+
+def printable_evidence(
+    evidence: Mapping[str, object], already: Mapping[str, object]
+) -> dict[str, object]:
+    """`evidence` as a failing verdict keeps it: each value the runner can't
+    print becomes its `repr`, and `UNENCODABLE_EVIDENCE` lists those names
+    beside the ones `already` lists, so the verdict and its message stand."""
+
+    printable: dict[str, object] = {}
+    unencodable: list[str] = []
+    for name, value in evidence.items():
+        if _json_error(value) is None:
+            printable[name] = value
+        else:
+            printable[name] = repr(value)
+            unencodable.append(name)
+    if unencodable:
+        listed = already.get(UNENCODABLE_EVIDENCE)
+        earlier = [str(name) for name in listed] if isinstance(listed, list) else []
+        printable[UNENCODABLE_EVIDENCE] = sorted({*earlier, *unencodable})
+    return printable
+
+
 @dataclass
 class ScenarioContext:
     scope: ResourceScope
     evidence: dict[str, object]
 
     def record(self, name: str, value: object) -> None:
+        require_json_evidence({name: value})
         self.evidence[name] = value
 
     def verify(
@@ -387,12 +481,23 @@ class ScenarioContext:
         message: str,
         **evidence: object,
     ) -> None:
-        self.evidence.update(evidence)
-        if not condition:
-            raise InvariantViolation(message)
+        """Keep `evidence` and raise `message` unless `condition` holds. A
+        held check refuses evidence the runner can't print, naming it; a
+        failing one keeps such a value as its `repr` instead, so the failure
+        and its message are what the run reports."""
+
+        if condition:
+            require_json_evidence(evidence)
+            self.evidence.update(evidence)
+            return
+        self.evidence.update(printable_evidence(evidence, self.evidence))
+        raise InvariantViolation(message)
 
     def warn(self, message: str, **evidence: object) -> None:
-        self.evidence.update(evidence)
+        """Keep `evidence`, each value the runner can't print as its `repr`,
+        and end the run with a warning saying `message`."""
+
+        self.evidence.update(printable_evidence(evidence, self.evidence))
         raise QuarantinedSmoke(message)
 
     def wait(self, seconds: float) -> None:

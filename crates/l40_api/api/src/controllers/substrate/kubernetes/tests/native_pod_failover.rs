@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use k8s_openapi::api::core::v1::{Pod, PodIP, PodStatus};
-use pplx_space_common_core::types::{PodUid, SandboxId};
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_test_env::TestResult;
 
 use super::*;
@@ -50,6 +51,7 @@ async fn silent_listener(
 fn stale_instance() -> ResolvedPodInstance {
     ResolvedPodInstance {
         ip: PodIp::parse("127.0.0.2").unwrap(),
+        source: super::super::support::PodIpSource::Published,
         pod_uid: Some(PodUid::parse("space-sbx-old-uid").unwrap()),
         generation: 1,
         sandbox_restoring: false,

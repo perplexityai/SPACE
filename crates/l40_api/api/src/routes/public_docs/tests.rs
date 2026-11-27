@@ -3,9 +3,7 @@ use super::{OPENAPI_HTTP_METHODS, m1_sdk_openapi_value, public_openapi_value};
 use axum::response::IntoResponse;
 use http_body_util::BodyExt;
 use jsonschema::{Draft, Validator};
-use pplx_space_common_core::types::{
-    GuestUserName, ProcessCommand, validate_linux_guest_path_input,
-};
+use pplx_space_guest_process::{GuestUserName, ProcessCommand, validate_linux_guest_path_input};
 use pplx_space_public_api::{
     CreateCommandRequest, CreateProcessRequest, CreateSandboxRequest, SandboxLifecycleState,
 };
@@ -861,7 +859,7 @@ fn command_request_schema_matches_runtime_boundaries() {
                 "command": ["true"],
                 "env": {
                     "VALUE": "é".repeat(
-                        pplx_space_common_core::types::MAX_ENV_VALUE_BYTES / 2 + 1
+                        pplx_space_guest_process::MAX_ENV_VALUE_BYTES / 2 + 1
                     )
                 }
             }),
@@ -878,7 +876,7 @@ fn command_request_schema_matches_runtime_boundaries() {
             json!({
                 "command": ["true"],
                 "user": "u".repeat(
-                    pplx_space_common_core::types::MAX_GUEST_USER_NAME_BYTES + 1
+                    pplx_space_guest_process::MAX_GUEST_USER_NAME_BYTES + 1
                 )
             }),
             false,

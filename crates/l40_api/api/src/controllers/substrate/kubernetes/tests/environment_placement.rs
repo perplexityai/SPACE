@@ -2,15 +2,15 @@
 //! placement gate is on, requires a node label for: the binding of what it
 //! boots.
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{
-    EnvironmentReference, NodeId, SandboxId, SandboxLifecycle, SandboxOwner,
-};
+use pplx_space_accounts::{NodeId, SandboxOwner};
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, insert_ready_worker_node};
+use pplx_space_execution_spec::EnvironmentReference;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+use pplx_space_sql_locator::sql;
 
 use super::*;
 use crate::controllers::substrate::environment_placement::EnvironmentPlacementGate;
-use pplx_space_common_core::kubernetes::PodEnvironment;
+use pplx_space_sandbox_pod::PodEnvironment;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -71,7 +71,7 @@ async fn sandbox(
     .bind(binding(release_environment))
     .execute(pool)
     .await?;
-    let snapshot_id = pplx_space_common_core::types::SnapshotId::new();
+    let snapshot_id = pplx_space_snapshot_model::SnapshotId::new();
     sqlx::query(sql!(
         "INSERT INTO snapshots (id, sandbox_id, type, state, timestamp, org_id, execution_metadata)
          VALUES ($1, $2, 'full', 'ready', NOW(), $3, $4)"
@@ -107,6 +107,15 @@ async fn sandbox(
         content_hash: Some(HASH.to_string()),
         ..test_sandbox_with_lifecycle(lifecycle)
     })
+}
+
+/// The id of the release [`sandbox`] registers.
+async fn seed_release(pool: &sqlx::PgPool) -> Result<uuid::Uuid, BoxError> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT id FROM template_releases WHERE template_name = 'seed'"
+    ))
+    .fetch_one(pool)
+    .await?)
 }
 
 fn restore() -> PodCreateContext<'static> {
@@ -242,14 +251,28 @@ async fn shadow_places_work_with_an_invalid_binding_as_off_would() -> Result<(),
             None
         );
     }
+    let release = seed_release(&db.pool).await?;
     assert_eq!(
-        pool_pod_environment(EnvironmentPlacementGate::Shadow, &db.pool, "seed", HASH).await?,
+        pool_pod_environment(
+            EnvironmentPlacementGate::Shadow,
+            &db.pool,
+            release,
+            "seed",
+            HASH
+        )
+        .await?,
         None
     );
     assert!(
-        pool_pod_environment(EnvironmentPlacementGate::On, &db.pool, "seed", HASH)
-            .await
-            .is_err(),
+        pool_pod_environment(
+            EnvironmentPlacementGate::On,
+            &db.pool,
+            release,
+            "seed",
+            HASH
+        )
+        .await
+        .is_err(),
         "on fails it"
     );
     Ok(())
@@ -261,6 +284,7 @@ async fn a_pool_pod_records_its_release_binding_and_requires_it_only_when_on()
     use crate::controllers::substrate::environment_placement::pool_pod_environment;
     let db = pplx_space_db_test_fixtures::pg_test_db().await?;
     sandbox(&db.pool, "suspended", Some(E1), None, None).await?;
+    let release = seed_release(&db.pool).await?;
     for (gate, expected) in [
         (EnvironmentPlacementGate::Off, None),
         (
@@ -273,7 +297,7 @@ async fn a_pool_pod_records_its_release_binding_and_requires_it_only_when_on()
         (EnvironmentPlacementGate::On, required(E1)),
     ] {
         assert_eq!(
-            pool_pod_environment(gate, &db.pool, "seed", HASH).await?,
+            pool_pod_environment(gate, &db.pool, release, "seed", HASH).await?,
             expected,
             "{gate}"
         );
@@ -282,12 +306,245 @@ async fn a_pool_pod_records_its_release_binding_and_requires_it_only_when_on()
         pool_pod_environment(
             EnvironmentPlacementGate::On,
             &db.pool,
+            uuid::Uuid::now_v7(),
             "seed",
             "sha256:other"
         )
         .await?,
         None,
         "no such build"
+    );
+    Ok(())
+}
+
+/// A warm pool of a release's twin runs under the twin's environment, while
+/// template work that names no release reads the original's, as before twins.
+/// Twins exist only once `idx_template_releases_template_name_hash_unique` is
+/// dropped, which the test does to stand in for the contract migration.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pool_of_a_twin_runs_under_the_twin_binding() -> Result<(), BoxError> {
+    use crate::controllers::substrate::environment_placement::pool_pod_environment;
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let mut substrate = substrate_with_store(db.pool.clone());
+    substrate.k8s.environment_placement = EnvironmentPlacementGate::On;
+    sandbox(&db.pool, "suspended", Some(E1), None, None).await?;
+    let original = seed_release(&db.pool).await?;
+    sqlx::query(sql!(
+        "DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique"
+    ))
+    .execute(&db.pool)
+    .await?;
+    let twin: uuid::Uuid = sqlx::query_scalar(sql!(
+        "INSERT INTO template_releases (template_name, type, hash, execution_metadata)
+         VALUES ('seed', 'fc', $1, jsonb_build_object('environment', $2::TEXT, 'components', '[]'::jsonb))
+         RETURNING id"
+    ))
+    .bind(HASH)
+    .bind(E0)
+    .fetch_one(&db.pool)
+    .await?;
+    // Rewrite the table in environment order, which puts the twin (E0)
+    // before the original (E1) in the heap and in every index's tie order,
+    // so only an explicit original-first order answers with the original.
+    sqlx::query(sql!(
+        "CLUSTER template_releases USING template_releases_template_name_hash_environment_key"
+    ))
+    .execute(&db.pool)
+    .await?;
+
+    let gate = EnvironmentPlacementGate::On;
+    assert_eq!(
+        pool_pod_environment(gate, &db.pool, twin, "seed", HASH).await?,
+        required(E0),
+        "the twin's pool"
+    );
+    assert_eq!(
+        pool_pod_environment(gate, &db.pool, original, "seed", HASH).await?,
+        required(E1),
+        "the original's pool"
+    );
+    assert_eq!(
+        substrate.template_pod_environment("seed", HASH).await?,
+        required(E1),
+        "work that names no release reads the original"
+    );
+    Ok(())
+}
+
+/// A pod of a create renders the binding of the release the create resolves
+/// to only with the gate on, when the pod requires it and the worker boots
+/// it. In shadow the worker boots the named release's build, so its pod
+/// records that release's binding.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pod_renders_the_resolved_twin_only_with_the_gate_on() -> Result<(), BoxError> {
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let mut substrate = substrate_with_store(db.pool.clone());
+    sandbox(&db.pool, "suspended", Some(E1), None, None).await?;
+    let original = seed_release(&db.pool).await?;
+    // Twins exist only once the `(template_name, hash)` unique index is
+    // dropped; the test drops it to stand in for the contract migration.
+    sqlx::query(sql!(
+        "DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique"
+    ))
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (template_name, type, hash, execution_metadata, created_at)
+         SELECT template_name, type, hash,
+                jsonb_build_object('environment', $2::TEXT, 'components', '[]'::jsonb),
+                clock_timestamp()
+         FROM template_releases WHERE id = $1"
+    ))
+    .bind(original)
+    .bind(E0)
+    .execute(&db.pool)
+    .await?;
+    crate::test_support::set_default_environment(&db.pool, E0).await?;
+
+    substrate.k8s.environment_placement = EnvironmentPlacementGate::On;
+    assert_eq!(
+        substrate.template_pod_environment("seed", HASH).await?,
+        required(E0),
+        "with the gate on, the twin the create resolves to"
+    );
+    substrate.k8s.environment_placement = EnvironmentPlacementGate::Shadow;
+    assert_eq!(
+        substrate.template_pod_environment("seed", HASH).await?,
+        Some(PodEnvironment {
+            reference: reference(E1),
+            required: false,
+        }),
+        "in shadow, the named release's binding"
+    );
+    Ok(())
+}
+
+/// With the gate on, a claimed warm pod is checked against the environment
+/// its slot's release runs under, which the pool rendered it for, even once
+/// the default moves creates to a twin bound elsewhere: a node that publishes
+/// only the twin's environment doesn't vouch for the original's pod. A claim
+/// that holds no slot release reads the release a create resolves to, the
+/// twin, which the original's pod didn't boot.
+#[tokio::test(flavor = "current_thread")]
+async fn a_warm_pod_is_checked_against_its_slots_release_after_the_default_moves()
+-> Result<(), BoxError> {
+    use crate::controllers::substrate::PooledExecutionClaim;
+    use crate::controllers::substrate::kubernetes::adapter::PooledPodEnvironment;
+    use k8s_openapi::api::core::v1::{Pod, PodSpec};
+    use pplx_space_sandbox_pod::{
+        ENVIRONMENT_REQUIRED_ANNOTATION_VALUE, ENVIRONMENT_USABLE_LABEL_VALUE,
+        SANDBOX_ENVIRONMENT_ANNOTATION, SANDBOX_ENVIRONMENT_REQUIRED_ANNOTATION,
+        SandboxPodConfigValues, environment_label_key,
+    };
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    sandbox(&db.pool, "suspended", Some(E1), None, None).await?;
+    let original = seed_release(&db.pool).await?;
+    // Twins exist only once the `(template_name, hash)` unique index is
+    // dropped; the test drops it to stand in for the contract migration.
+    sqlx::query(sql!(
+        "DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique"
+    ))
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (template_name, type, hash, execution_metadata, created_at)
+         SELECT template_name, type, hash,
+                jsonb_build_object('environment', $2::TEXT, 'components', '[]'::jsonb),
+                clock_timestamp()
+         FROM template_releases WHERE id = $1"
+    ))
+    .bind(original)
+    .bind(E0)
+    .execute(&db.pool)
+    .await?;
+    crate::test_support::set_default_environment(&db.pool, E0).await?;
+    let node = |name: &str, publishes: &str| {
+        let mut labels = SandboxPodConfigValues::default()
+            .base_node_selector()
+            .into_labels();
+        labels.insert(
+            environment_label_key(&reference(publishes)),
+            ENVIRONMENT_USABLE_LABEL_VALUE.to_string(),
+        );
+        (*node_with_network_slots(name, labels, Some(8), None, true, false)).clone()
+    };
+    let mut substrate = substrate_with_inventory_caches_and_pool(
+        Vec::new(),
+        vec![node("publishes-e1", E1), node("publishes-e0", E0)],
+        db.pool.clone(),
+    );
+    substrate.k8s.environment_placement = EnvironmentPlacementGate::On;
+    let claim = |template_release_id| PooledExecutionClaim {
+        claim_id: uuid::Uuid::now_v7(),
+        pool_slot_id: Some(uuid::Uuid::now_v7()),
+        sandbox_id: SandboxId::new(),
+        content_hash: HASH.to_string(),
+        template_release_id,
+        pod_name: "space-sbx-pooled-e1".to_string(),
+        pod_uid: None,
+        execution_generation: 1,
+        pod_ip: "10.90.0.11".to_string(),
+        vcpu: Some(4),
+        memory_mib: Some(2048),
+        disk_mib: None,
+        disk_io_limits: Default::default(),
+        active_node_id: None,
+        route_identity: None,
+    };
+    // The pool rendered the original's pod with the gate on, so it tells
+    // its shim to boot the original's environment.
+    let pod_on = |node_name: &str| {
+        SandboxPodView::from(Pod {
+            metadata: kube::api::ObjectMeta {
+                annotations: Some(
+                    [
+                        (SANDBOX_ENVIRONMENT_ANNOTATION.to_string(), E1.to_string()),
+                        (
+                            SANDBOX_ENVIRONMENT_REQUIRED_ANNOTATION.to_string(),
+                            ENVIRONMENT_REQUIRED_ANNOTATION_VALUE.to_string(),
+                        ),
+                    ]
+                    .into(),
+                ),
+                ..Default::default()
+            },
+            spec: Some(PodSpec {
+                node_name: Some(node_name.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    };
+
+    assert_eq!(
+        substrate
+            .pooled_pod_environment(
+                "seed",
+                &claim(Some(original)),
+                Some(&pod_on("publishes-e1"))
+            )
+            .await?,
+        PooledPodEnvironment::Admitted,
+        "the original's pod on a node publishing the original's environment"
+    );
+    assert_eq!(
+        substrate
+            .pooled_pod_environment(
+                "seed",
+                &claim(Some(original)),
+                Some(&pod_on("publishes-e0"))
+            )
+            .await?,
+        PooledPodEnvironment::NotPublished,
+        "the new default's environment doesn't vouch for the original's pod"
+    );
+    assert_eq!(
+        substrate
+            .pooled_pod_environment("seed", &claim(None), Some(&pod_on("publishes-e0")))
+            .await?,
+        PooledPodEnvironment::NotBooted,
+        "a claim with no slot release reads the release creates resolve to, the E0 \
+         twin, which the pod didn't boot"
     );
     Ok(())
 }
@@ -309,48 +566,238 @@ async fn a_release_without_a_binding_takes_its_environment_from_the_build_invent
         "nothing records a binding yet"
     );
 
-    let hold = |environment: &'static str| {
-        let pool = db.pool.clone();
-        async move {
-            let holder = NodeId::new();
-            insert_ready_worker_node(&pool, holder).await?;
-            sqlx::query(sql!(
-                "INSERT INTO node_template_inventory (
-                     node_id, template_name, content_hash, runtime, arch,
-                     has_base_snapshot, vcpu, memory_mib, guest_os,
-                     state_format_name, state_format_version, execution_metadata
-                 )
-                 VALUES ($1, 'seed', $2, 'fc', 'aarch64', TRUE, 1, 512, 'linux',
-                         'firecracker-snapshot', '9.0.0',
-                         jsonb_build_object('environment', $3::TEXT))"
-            ))
-            .bind(holder)
-            .bind(HASH)
-            .bind(environment)
-            .execute(&pool)
-            .await?;
-            Ok::<_, BoxError>(())
-        }
-    };
-    hold(E1).await?;
+    hold_build(&db.pool, E1).await?;
     assert_eq!(
         substrate.template_pod_environment("seed", HASH).await?,
         required(E1),
         "a cold create or an on-demand pod"
     );
     assert_eq!(
-        pool_pod_environment(EnvironmentPlacementGate::On, &db.pool, "seed", HASH).await?,
+        pool_pod_environment(
+            EnvironmentPlacementGate::On,
+            &db.pool,
+            seed_release(&db.pool).await?,
+            "seed",
+            HASH
+        )
+        .await?,
         required(E1),
         "a warm-pool pod"
     );
 
     // A pod requires one label, so holders that disagree leave the work
     // unbound on Kubernetes.
-    hold(E0).await?;
+    hold_build(&db.pool, E0).await?;
     assert_eq!(
         substrate.template_pod_environment("seed", HASH).await?,
         None,
         "the holders disagree"
+    );
+    Ok(())
+}
+
+/// Add a ready worker holding the seed build at `HASH`, bound to
+/// `environment`.
+async fn hold_build(pool: &sqlx::PgPool, environment: &str) -> Result<(), BoxError> {
+    hold_build_at(pool, HASH, environment).await
+}
+
+async fn hold_build_at(
+    pool: &sqlx::PgPool,
+    content_hash: &str,
+    environment: &str,
+) -> Result<(), BoxError> {
+    let holder = NodeId::new();
+    insert_ready_worker_node(pool, holder).await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_template_inventory (
+             node_id, template_name, content_hash, runtime, arch,
+             has_base_snapshot, vcpu, memory_mib, guest_os,
+             state_format_name, state_format_version, execution_metadata
+         )
+         VALUES ($1, 'seed', $2, 'fc', 'aarch64', TRUE, 1, 512, 'linux',
+                 'firecracker-snapshot', '9.0.0',
+                 jsonb_build_object('environment', $3::TEXT))"
+    ))
+    .bind(holder)
+    .bind(content_hash)
+    .bind(environment)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A twin's build shares its original's template and hash, so a node
+/// holding only the twin's build reports the twin's binding. With the
+/// original recording none, that row mustn't bind the original's pool or
+/// work that names no release: only the original's own holders can.
+#[tokio::test(flavor = "current_thread")]
+async fn a_twin_holder_doesnt_bind_an_unbound_original() -> Result<(), BoxError> {
+    use crate::controllers::substrate::environment_placement::pool_pod_environment;
+    const E2: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let mut substrate = substrate_with_store(db.pool.clone());
+    substrate.k8s.environment_placement = EnvironmentPlacementGate::On;
+    sandbox(&db.pool, "suspended", None, None, None).await?;
+    let original = seed_release(&db.pool).await?;
+    sqlx::query(sql!(
+        "DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique"
+    ))
+    .execute(&db.pool)
+    .await?;
+    let twin: uuid::Uuid = sqlx::query_scalar(sql!(
+        "INSERT INTO template_releases (template_name, type, hash, execution_metadata)
+         VALUES ('seed', 'fc', $1, jsonb_build_object('environment', $2::TEXT, 'components', '[]'::jsonb))
+         RETURNING id"
+    ))
+    .bind(HASH)
+    .bind(E2)
+    .fetch_one(&db.pool)
+    .await?;
+    let gate = EnvironmentPlacementGate::On;
+
+    hold_build(&db.pool, E2).await?;
+    assert_eq!(
+        pool_pod_environment(gate, &db.pool, original, "seed", HASH).await?,
+        None,
+        "the original's pool, with only the twin's holder"
+    );
+    assert_eq!(
+        substrate.template_pod_environment("seed", HASH).await?,
+        None,
+        "work that names no release, with only the twin's holder"
+    );
+
+    hold_build(&db.pool, E1).await?;
+    assert_eq!(
+        pool_pod_environment(gate, &db.pool, original, "seed", HASH).await?,
+        required(E1),
+        "the original's pool takes its own holder's binding"
+    );
+    assert_eq!(
+        substrate.template_pod_environment("seed", HASH).await?,
+        required(E1),
+        "work that names no release takes the original's holder's binding"
+    );
+    assert_eq!(
+        pool_pod_environment(gate, &db.pool, twin, "seed", HASH).await?,
+        required(E2),
+        "the twin's pool reads the twin's own binding"
+    );
+    Ok(())
+}
+
+/// A pool's content hash is its release's stored spelling, which is bare for a
+/// release registered before the prefix was required. The holders' exclusion
+/// still reads the bindings of the releases under `sha256:`, so a bare holder
+/// row of a build bound elsewhere doesn't bind the bare original's pool.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bare_originals_pool_excludes_bindings_under_the_prefixed_spelling()
+-> Result<(), BoxError> {
+    use crate::controllers::substrate::environment_placement::pool_pod_environment;
+    const E2: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    let bare = HASH.trim_start_matches("sha256:");
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    sandbox(&db.pool, "suspended", None, None, None).await?;
+    let prefixed = seed_release(&db.pool).await?;
+    sqlx::query(sql!(
+        "UPDATE template_releases
+         SET execution_metadata = jsonb_build_object('environment', $1::TEXT, 'components', '[]'::jsonb)
+         WHERE id = $2"
+    ))
+    .bind(E2)
+    .bind(prefixed)
+    .execute(&db.pool)
+    .await?;
+    let original: uuid::Uuid = sqlx::query_scalar(sql!(
+        "INSERT INTO template_releases (template_name, type, hash)
+         VALUES ('seed', 'fc', $1)
+         RETURNING id"
+    ))
+    .bind(bare)
+    .fetch_one(&db.pool)
+    .await?;
+
+    hold_build_at(&db.pool, bare, E2).await?;
+    assert_eq!(
+        pool_pod_environment(
+            EnvironmentPlacementGate::On,
+            &db.pool,
+            original,
+            "seed",
+            bare
+        )
+        .await?,
+        None,
+        "the bare original's pool, with only a holder of the prefixed release's build"
+    );
+    Ok(())
+}
+
+/// An unbound release and one bound to the initial environment share the
+/// legacy cache partition, so a node holding the build bound to the initial
+/// environment holds the unbound release's build. While the old index stands
+/// the two coexist only under the digest's two spellings. That holder still
+/// binds the unbound original; a twin's holder under the other spelling
+/// still doesn't.
+#[tokio::test(flavor = "current_thread")]
+async fn an_initial_environment_release_doesnt_hide_the_originals_holder() -> Result<(), BoxError> {
+    use crate::controllers::substrate::environment_placement::pool_pod_environment;
+    const E2: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    let initial =
+        pplx_space_execution_catalog::catalog::initial_environment_reference().to_string();
+    let bare = HASH.trim_start_matches("sha256:");
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let mut substrate = substrate_with_store(db.pool.clone());
+    substrate.k8s.environment_placement = EnvironmentPlacementGate::On;
+    sandbox(&db.pool, "suspended", None, None, None).await?;
+    let original = seed_release(&db.pool).await?;
+    let insert_bound = |environment: String| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query(sql!(
+                "INSERT INTO template_releases (template_name, type, hash, execution_metadata)
+                 VALUES ('seed', 'fc', $1,
+                         jsonb_build_object('environment', $2::TEXT, 'components', '[]'::jsonb))"
+            ))
+            .bind(bare)
+            .bind(environment)
+            .execute(&pool)
+            .await?;
+            Ok::<_, BoxError>(())
+        }
+    };
+    let gate = EnvironmentPlacementGate::On;
+
+    insert_bound(initial.clone()).await?;
+    hold_build(&db.pool, &initial).await?;
+    assert_eq!(
+        pool_pod_environment(gate, &db.pool, original, "seed", HASH).await?,
+        required(&initial),
+        "the original's pool takes the initial environment's holder"
+    );
+    assert_eq!(
+        substrate.template_pod_environment("seed", HASH).await?,
+        required(&initial),
+        "work that names no release takes the initial environment's holder"
+    );
+
+    sqlx::query(sql!(
+        "DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique"
+    ))
+    .execute(&db.pool)
+    .await?;
+    insert_bound(E2.to_owned()).await?;
+    hold_build(&db.pool, E2).await?;
+    assert_eq!(
+        pool_pod_environment(gate, &db.pool, original, "seed", HASH).await?,
+        required(&initial),
+        "the original's pool, beside a twin's holder under the other spelling"
+    );
+    assert_eq!(
+        substrate.template_pod_environment("seed", HASH).await?,
+        required(&initial),
+        "work that names no release, beside a twin's holder under the other spelling"
     );
     Ok(())
 }
@@ -361,7 +808,7 @@ async fn a_release_without_a_binding_takes_its_environment_from_the_build_invent
 /// `common` through, so a dropped field renders an unbound pod.
 #[tokio::test(flavor = "current_thread")]
 async fn every_pod_build_path_renders_the_environment() {
-    use pplx_space_common_core::kubernetes::{
+    use pplx_space_sandbox_pod::{
         SANDBOX_ENVIRONMENT_ANNOTATION, build_sandbox_pod, environment_label_key,
     };
     let substrate = substrate_with_unreachable_store();
@@ -400,6 +847,7 @@ async fn every_pod_build_path_renders_the_environment() {
                 network_policy_json: "{}",
                 node_group_placement: None,
                 environment: required(E1),
+                client_id: None,
             },
             context,
         );
@@ -451,7 +899,7 @@ async fn a_stopped_replacement_requires_its_pinned_disk_environment_while_restor
     substrate.k8s.environment_placement = EnvironmentPlacementGate::On;
     let restoring = sandbox(&db.pool, "restoring", Some(E1), Some(E1), Some(E0)).await?;
     let excluded: Vec<String> = Vec::new();
-    let artifact_id = pplx_space_common_core::types::LocalArtifactId::new();
+    let artifact_id = pplx_space_snapshot_model::LocalArtifactId::new();
     let evacuation = |stopped| {
         PodCreateContext::Restore(RestoreContext::Evacuation {
             stopped_materialization: stopped,
@@ -461,12 +909,10 @@ async fn a_stopped_replacement_requires_its_pinned_disk_environment_while_restor
         })
     };
     let pinned = || {
-        evacuation(Some(
-            pplx_space_common_core::kubernetes::StoppedMaterialization {
-                artifact_id,
-                excluded_node_names: &excluded,
-            },
-        ))
+        evacuation(Some(pplx_space_sandbox_pod::StoppedMaterialization {
+            artifact_id,
+            excluded_node_names: &excluded,
+        }))
     };
     assert_eq!(
         substrate
@@ -489,7 +935,7 @@ async fn a_stopped_replacement_requires_its_pinned_disk_environment_while_restor
                                 execution_metadata)
          VALUES ($1, $2, 'disk', 'ready', NOW(), $3, $4, 'disk', 'stop', $5)"
     ))
-    .bind(pplx_space_common_core::types::SnapshotId::new())
+    .bind(pplx_space_snapshot_model::SnapshotId::new())
     .bind(restoring.id)
     .bind(SEED_ORG_ID)
     .bind(artifact_id.as_uuid())
@@ -542,7 +988,7 @@ fn pod_environment_follows_the_gate() {
 pub(in crate::controllers::substrate::kubernetes) fn created_pod_environment(
     pod: &serde_json::Value,
 ) -> (Option<String>, bool) {
-    use pplx_space_common_core::kubernetes::SANDBOX_ENVIRONMENT_ANNOTATION;
+    use pplx_space_sandbox_pod::SANDBOX_ENVIRONMENT_ANNOTATION;
     let annotation = pod
         .pointer("/metadata/annotations")
         .and_then(|annotations| annotations.get(SANDBOX_ENVIRONMENT_ANNOTATION))
@@ -556,7 +1002,7 @@ pub(in crate::controllers::substrate::kubernetes) fn created_pod_environment(
         .cloned()
         .unwrap_or_default();
     let required = annotation.as_deref().is_some_and(|recorded| {
-        let key = pplx_space_common_core::kubernetes::environment_label_key(&reference(recorded));
+        let key = pplx_space_sandbox_pod::environment_label_key(&reference(recorded));
         !terms.is_empty()
             && terms.iter().all(|term| {
                 term.get("matchExpressions")
@@ -649,7 +1095,7 @@ async fn a_materialized_on_demand_pod_requires_its_release_environment() -> Resu
     assert_eq!(
         pod.pointer("/metadata/annotations")
             .and_then(|annotations| {
-                annotations.get(pplx_space_common_core::kubernetes::SANDBOX_CHECKPOINT_ANNOTATION)
+                annotations.get(pplx_space_sandbox_pod::SANDBOX_CHECKPOINT_ANNOTATION)
             }),
         None,
         "an on-demand pod restores no checkpoint"
@@ -687,6 +1133,7 @@ async fn a_cross_node_redrive_successor_requires_its_checkpoint_environment() ->
             SandboxLifecycle::Restoring,
             Some("source-node"),
             Some(URI),
+            None,
             None,
         )
         .await;
@@ -738,7 +1185,7 @@ async fn a_stopped_start_requires_its_disk_environment_after_the_published_execu
     let mut substrate = substrate_with_store(db.pool.clone());
     substrate.k8s.environment_placement = EnvironmentPlacementGate::On;
     let stopped = sandbox(&db.pool, "stopped", Some(E0), Some(E0), Some(E0)).await?;
-    let artifact_id = pplx_space_common_core::types::LocalArtifactId::new();
+    let artifact_id = pplx_space_snapshot_model::LocalArtifactId::new();
     sqlx::query(sql!(
         "UPDATE sandboxes
             SET current_local_artifact_id = $2,
@@ -756,7 +1203,7 @@ async fn a_stopped_start_requires_its_disk_environment_after_the_published_execu
                                 execution_metadata)
          VALUES ($1, $2, 'disk', 'ready', NOW(), $3, $4, 'disk', 'stop', $5)"
     ))
-    .bind(pplx_space_common_core::types::SnapshotId::new())
+    .bind(pplx_space_snapshot_model::SnapshotId::new())
     .bind(stopped.id)
     .bind(SEED_ORG_ID)
     .bind(artifact_id.as_uuid())
@@ -788,7 +1235,7 @@ async fn a_stopped_start_requires_its_disk_environment_after_the_published_execu
 #[tokio::test(flavor = "current_thread")]
 async fn a_pinned_restore_is_refused_before_its_pod_when_the_source_node_lacks_the_environment()
 -> Result<(), BoxError> {
-    use pplx_space_common_core::kubernetes::{
+    use pplx_space_sandbox_pod::{
         ENVIRONMENT_USABLE_LABEL_VALUE, SandboxPodConfigValues, environment_label_key,
     };
     let db = pplx_space_db_test_fixtures::pg_test_db().await?;
@@ -852,5 +1299,25 @@ async fn a_pinned_restore_is_refused_before_its_pod_when_the_source_node_lacks_t
             .is_ok(),
         "shadow places as off"
     );
+    Ok(())
+}
+
+/// Startup checks the gate against the substrate's own resume-time upgrade
+/// switch: on runs while upgrades are off, and fails startup with them on.
+#[tokio::test(flavor = "current_thread")]
+async fn startup_refuses_on_only_alongside_resume_time_upgrades() -> Result<(), BoxError> {
+    use crate::controllers::substrate::runtime_upgrade::RuntimeUpgradeAtActivation;
+    // The check reads only the two switches, so the store never connects.
+    let mut substrate = substrate_with_unreachable_store();
+    substrate.k8s.environment_placement = EnvironmentPlacementGate::On;
+    substrate.k8s.runtime_upgrade_at_activation = RuntimeUpgradeAtActivation::Disabled;
+    substrate.k8s.check_environment_placement_support()?;
+    substrate.k8s.runtime_upgrade_at_activation = RuntimeUpgradeAtActivation::Enabled;
+    assert!(matches!(
+        substrate.k8s.check_environment_placement_support(),
+        Err(crate::controllers::substrate::SubstrateError::Unsupported { .. })
+    ));
+    substrate.k8s.environment_placement = EnvironmentPlacementGate::Shadow;
+    substrate.k8s.check_environment_placement_support()?;
     Ok(())
 }

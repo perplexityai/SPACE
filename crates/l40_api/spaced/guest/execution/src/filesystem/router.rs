@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{Stream, StreamExt};
-use pplx_space_common_core::types::GuestUserName;
+use pplx_space_guest_process::GuestUserName;
 use pplx_space_spaced_guest_protocol::invalid_argument_status;
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::filesystem_server::Filesystem;
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
@@ -347,7 +347,7 @@ impl FilesystemHandle {
     async fn mutate(
         &self,
         user: GuestUserName,
-        key: Option<pplx_space_common_core::types::IdempotencyKey>,
+        key: Option<pplx_space_guest_process::IdempotencyKey>,
         kind: Kind,
         command: Command,
         admission: RequestPermit,
@@ -976,7 +976,7 @@ impl FilesystemHandle {
         let task = self.tasks.spawn(async move {
             let _permit = permit;
             let budget =
-                pplx_space_common_core::operation_budget::RuntimeOperationBudget::FilesystemMetadata
+                pplx_space_rpc_contracts::operation_budget::RuntimeOperationBudget::FilesystemMetadata
                     .timeout();
             let result = tokio::select! {
                 biased;
@@ -1213,7 +1213,7 @@ impl Filesystem for FilesystemHandle {
             filesystem_limits::MAX_MESSAGE_BYTES,
         )?;
         let request = request.into_inner();
-        if request.entries.len() > pplx_space_common_core::spaced::MAX_WRITE_BATCH_ENTRIES {
+        if request.entries.len() > pplx_space_guest_process::MAX_WRITE_BATCH_ENTRIES {
             return Err(Status::invalid_argument("too many write_batch entries"));
         }
         let user = self.effective_user(request.user)?;

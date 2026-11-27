@@ -19,7 +19,7 @@ template-manager).
 {{/*
 The Rust build the bring-up deploys (`rustBuild`, infra/space/kind/lib/rust-build.sh):
 `test-hooks`, the default, or `release`, whose binaries read no test hook
-(`pplx_space_common_core::env::test_hook`), so no chart renders one for it.
+(`pplx_space_test_hooks::test_hook`), so no chart renders one for it.
 */}}
 {{- define "space-node-service.rustBuild" -}}
 {{- $build := .Values.rustBuild | default "test-hooks" -}}

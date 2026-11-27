@@ -26,7 +26,7 @@ from space_smoke.suite import ScenarioProcessResult
 
 BROWSER_IDS = {
     scenario.id for scenario in REGISTRY
-    if scenario.browser is not None and scenario.ignored is None
+    if scenario.browser is not None and scenario.tier == "routine"
 }
 MISSING = "Playwright for Python is not installed (uv sync --frozen --python 3.11 --group console)"
 
@@ -36,6 +36,7 @@ def _services(browser_unavailable: str | None) -> mock.Mock:
     services.telemetry_mode.return_value = "otel"
     services.storage_credentials.return_value = "exchange"
     services.substrate.return_value = "kubernetes"
+    services.drain_v2_enabled.return_value = False
     services.browser_unavailable.return_value = browser_unavailable
     return services
 

@@ -1,5 +1,6 @@
 //! The sandbox-specific parts of SPACE's gRPC plumbing, which name
-//! common-core's sandbox types and so sit above `pplx-space-common-grpc`:
+//! `pplx-space-sandbox-model`'s types and so sit above
+//! `pplx-space-common-grpc`:
 //!
 //! - [`SandboxTraceContext`], the sandbox identity a call records on its
 //!   spans, and [`record_sandbox_id`];

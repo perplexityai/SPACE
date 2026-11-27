@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::JobId;
+use pplx_space_accounts::JobId;
 
 use tonic::Status;
 
@@ -19,12 +19,14 @@ use crate::service::SandboxManagerService;
 use crate::service::suspend_snapshot_publication::publish_suspend_snapshot_dir;
 use crate::service::suspend_snapshot_publication::write_full_suspend_artifact;
 use crate::state::{SandboxState, SandboxStatus};
-use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, HostCpu, LocalArtifactId, SandboxId, SandboxOwner, SandboxRuntimeLabel,
-};
+use pplx_space_accounts::SandboxOwner;
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_events::SandboxEventTrigger;
+use pplx_space_execution_spec::HostCpu;
 use pplx_space_node_runtime_core::vm_state::VmState;
+use pplx_space_sandbox_model::{SandboxId, SandboxRuntimeLabel};
 use pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat;
+use pplx_space_snapshot_model::LocalArtifactId;
 use std::collections::BTreeMap;
 use tokio::sync::oneshot;
 
@@ -35,7 +37,7 @@ use tokio::sync::oneshot;
 #[tokio::test]
 async fn set_network_policy_rejects_local_authority_from_forwarded_service_peer() {
     use crate::service::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::host::linux::identities::users;
+    use pplx_space_host_layout::identities::users;
     use pplx_space_sbx_mgr_client::proto::SetNetworkPolicyRequest;
     use pplx_space_uds_peer_auth::PeerIdentity;
 
@@ -106,7 +108,7 @@ async fn set_network_policy_rejects_local_authority_from_forwarded_service_peer(
 #[tokio::test]
 async fn set_auto_lifecycle_policy_rejects_local_authority_from_forwarded_service_peer() {
     use crate::service::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::host::linux::identities::users;
+    use pplx_space_host_layout::identities::users;
     use pplx_space_sbx_mgr_client::proto::SetAutoLifecyclePolicyRequest;
     use pplx_space_uds_peer_auth::PeerIdentity;
 
@@ -417,14 +419,14 @@ fn active_artifact_backup_jobs_reuse_the_persisted_attempt() {
 
 #[test]
 fn current_instance_backup_preserves_scoped_drain_signals() {
-    use pplx_space_common_core::artifact_backup_signals::{
+    use pplx_space_rpc_contracts::artifact_backup_signals::{
         CURRENT_INSTANCE_BACKUP_PUBLISHES_FULL_MARKER,
         CURRENT_INSTANCE_BACKUP_SANDBOX_FAILED_MARKER,
     };
-    use pplx_space_common_core::node_drain_signals::{
+    use pplx_space_rpc_contracts::node_drain_signals::{
         REUPLOAD_SANDBOX_RESTORING_MARKER, REUPLOAD_SANDBOX_UNKNOWN_MARKER,
     };
-    use pplx_space_common_core::types::ArtifactKind;
+    use pplx_space_snapshot_model::ArtifactKind;
     for kind in [ArtifactKind::Disk, ArtifactKind::Full] {
         for state in SandboxStatus::sweep() {
             let result = current_instance_backup_precondition(state, kind);
@@ -435,7 +437,29 @@ fn current_instance_backup_preserves_scoped_drain_signals() {
             );
             assert_eq!(result.is_ok(), valid, "{state:?}/{kind:?}");
             if let Err(error) = result {
-                assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+                // Only a state no retry leaves, or the other backup kind's
+                // state, is a lasting refusal; any other may still reach a
+                // backupable state, and callers may retry it.
+                let lasting = matches!(
+                    state.unowned(),
+                    Some(
+                        SandboxState::Stopped
+                            | SandboxState::Suspended
+                            | SandboxState::Failed
+                            | SandboxState::Deleting
+                            | SandboxState::Quarantined
+                    )
+                ) || (state.is_unowned(SandboxState::Restoring)
+                    && kind == ArtifactKind::Full);
+                assert_eq!(
+                    error.code(),
+                    if lasting {
+                        tonic::Code::FailedPrecondition
+                    } else {
+                        tonic::Code::Aborted
+                    },
+                    "{state:?}/{kind:?}"
+                );
                 for (marker, expected) in [
                     (
                         REUPLOAD_SANDBOX_RESTORING_MARKER,
@@ -486,8 +510,8 @@ fn current_instance_backup_preserves_scoped_drain_signals() {
 
 #[tokio::test]
 async fn artifact_backup_file_proof_distinguishes_absence_from_io_failure() {
-    use pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
-    use pplx_space_common_core::types::ArtifactKind;
+    use pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
+    use pplx_space_snapshot_model::ArtifactKind;
     let inspector = crate::retained_source::FakeInspector::new(
         crate::retained_source::RetainedSourceCheck::Absent,
     );
@@ -568,8 +592,8 @@ fn disk_artifact_backup_uses_the_codec_witnessed_by_its_bytes() {
     let artifact = crate::db::LocalArtifactRow {
         local_artifact_id: LocalArtifactId::new(),
         sandbox_id: "01900000-0000-7000-8000-000000000001".to_string(),
-        artifact_kind: pplx_space_common_core::types::ArtifactKind::Disk,
-        artifact_origin: pplx_space_common_core::types::ArtifactOrigin::Snapshot,
+        artifact_kind: pplx_space_snapshot_model::ArtifactKind::Disk,
+        artifact_origin: pplx_space_snapshot_model::ArtifactOrigin::Snapshot,
         snapshot_name: None,
         local_path: artifact_dir.to_string_lossy().into_owned(),
     };
@@ -599,7 +623,7 @@ fn disk_artifact_backup_uses_the_codec_witnessed_by_its_bytes() {
 #[tokio::test]
 async fn encrypted_backup_admission_requires_the_published_container_files() {
     use super::artifact_backup::BackupFilesPolicy;
-    use pplx_space_common_core::types::ArtifactKind;
+    use pplx_space_snapshot_model::ArtifactKind;
 
     let sandbox_id = "01900000-0000-7000-8000-000000000001";
     for format in [
@@ -687,8 +711,8 @@ async fn encrypted_backup_admission_requires_the_published_container_files() {
 #[tokio::test]
 async fn retained_source_backup_precondition_follows_node_manager() {
     use crate::retained_source::{FakeInspector, RetainedSourceCheck};
-    use pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
-    use pplx_space_common_core::types::ArtifactKind;
+    use pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
+    use pplx_space_snapshot_model::ArtifactKind;
     let sandbox_id = "01900000-0000-7000-8000-000000000001";
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().to_str().unwrap();
@@ -846,9 +870,9 @@ fn only_a_captured_suspend_records_this_hosts_cpu() {
 /// whatever its metadata says; a full artifact keeps the CPU it recorded.
 #[test]
 fn artifact_backup_execution_keeps_a_capture_cpu_only_for_full_artifacts() {
-    use pplx_space_common_core::types::{
-        Arch, ArtifactKind, ExecutionMetadata, SnapshotExecutionMetadata,
-    };
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{ExecutionMetadata, SnapshotExecutionMetadata};
+    use pplx_space_snapshot_model::ArtifactKind;
 
     let host_cpu = HostCpu::parse("genuineintel-6-85-7").unwrap();
     let execution = SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
@@ -870,7 +894,7 @@ fn artifact_backup_execution_keeps_a_capture_cpu_only_for_full_artifacts() {
 
 #[test]
 fn current_instance_handler_refuses_incomplete_suspend_without_publishing_a_pin() {
-    use pplx_space_common_core::node_drain_signals::{
+    use pplx_space_rpc_contracts::node_drain_signals::{
         REUPLOAD_ARTIFACT_MISSING_MARKER, REUPLOAD_SANDBOX_RESTORING_MARKER,
         REUPLOAD_SANDBOX_UNKNOWN_MARKER,
     };
@@ -1066,7 +1090,7 @@ fn reupload_sidecar_corrupt_json_is_internal_error_not_silent_full() {
 /// older snapshot would lose work. Mirrors the producer's per-state branch.
 #[test]
 fn reupload_restoring_message_carries_marker_running_states_do_not() {
-    use pplx_space_common_core::node_drain_signals::REUPLOAD_SANDBOX_RESTORING_MARKER;
+    use pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_SANDBOX_RESTORING_MARKER;
 
     // Mirror the producer's per-state rendering.
     let render = |state: SandboxState| -> String {
@@ -1172,8 +1196,8 @@ async fn restore_consumer_cannot_observe_suspend_staging_before_publication() {
     let artifact_lock = coordinator.artifact_lock(sandbox_id);
     let publication_guard = artifact_lock.lock().await;
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let snapshot_dir = tmp.path().join("snapshot");
-    let staging_dir = tmp.path().join("staging");
+    let snapshot_dir = tmp.path().join(sandbox_id).join("snapshot");
+    let staging_dir = tmp.path().join(sandbox_id).join("staging");
     let local_artifact_id = LocalArtifactId::new();
     write_full_suspend_artifact(
         &staging_dir,
@@ -1252,7 +1276,8 @@ async fn permanently_refused_teardown_backup_marks_the_suspending_row_terminal()
     use crate::service::tests::service_tests::{
         insert_stranded_teardown_suspend_sandbox, prepare_teardown_suspend_request,
     };
-    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, ExecutionGeneration};
+    use pplx_space_sandbox_model::ExecutionGeneration;
+    use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin};
 
     for (failure, expected_marker) in [
         (pplx_space_common_jobs::JobFailure::Retriable, None),
@@ -1427,7 +1452,7 @@ async fn teardown_suspend_terminal_driver_failures_stop_polling_without_release_
     use crate::service::tests::service_tests::{
         insert_test_sandbox, prepare_teardown_suspend_request,
     };
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
     // A deleting sandbox keeps polling for its delete receipt; see
     // `teardown_suspend_keeps_polling_until_a_deleting_sandbox_commits_its_delete`.
     for state in [Some(SandboxState::Quarantined), None] {
@@ -1483,9 +1508,9 @@ async fn teardown_suspend_terminal_driver_failures_stop_polling_without_release_
 /// Deleting by the production transition, which closes that job.
 fn deleting_sandbox_with_closed_teardown_suspend(
     conn: &crate::db::Connection,
-) -> (String, pplx_space_common_core::types::ExecutionGeneration) {
+) -> (String, pplx_space_sandbox_model::ExecutionGeneration) {
     use crate::service::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
     let sandbox_id = SandboxId::new();
     let id = sandbox_id.to_string();
     let generation = ExecutionGeneration::new(7).unwrap();
@@ -1494,7 +1519,7 @@ fn deleting_sandbox_with_closed_teardown_suspend(
     crate::db::update_space_api_route_identity(
         conn,
         sandbox_id,
-        &pplx_space_common_core::types::SpaceApiRouteIdentity {
+        &pplx_space_sandbox_model::SpaceApiRouteIdentity {
             execution_generation: Some(generation),
             ..Default::default()
         },
@@ -1565,7 +1590,7 @@ async fn observed_teardown_outcome(
 async fn observe_only_answers_each_generation_from_the_nodes_own_record() {
     use crate::proto::TeardownSuspendOutcome;
     use crate::service::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new();
     let id = sandbox_id.to_string();
@@ -1573,7 +1598,7 @@ async fn observe_only_answers_each_generation_from_the_nodes_own_record() {
     crate::db::update_space_api_route_identity(
         &conn,
         sandbox_id,
-        &pplx_space_common_core::types::SpaceApiRouteIdentity {
+        &pplx_space_sandbox_model::SpaceApiRouteIdentity {
             execution_generation: Some(ExecutionGeneration::new(2).unwrap()),
             ..Default::default()
         },
@@ -1724,7 +1749,7 @@ async fn teardown_suspend_terminal_decision_releases_a_delete_committed_after_th
         service
             .close_terminal_teardown_suspend(
                 &id,
-                pplx_space_common_core::types::ExecutionGeneration::new(8).unwrap()
+                pplx_space_sandbox_model::ExecutionGeneration::new(8).unwrap()
             )
             .unwrap(),
         super::TerminalTeardownSuspend::Open
@@ -1734,7 +1759,7 @@ async fn teardown_suspend_terminal_decision_releases_a_delete_committed_after_th
 #[tokio::test]
 async fn teardown_suspend_preserves_retryable_and_superseded_driver_work() {
     use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new();
     let generation = ExecutionGeneration::new(7).unwrap();
@@ -1802,7 +1827,7 @@ async fn teardown_suspend_preserves_retryable_and_superseded_driver_work() {
 #[tokio::test]
 async fn teardown_suspend_registration_failure_closes_only_the_requested_generation() {
     use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new();
     let generation = ExecutionGeneration::new(7).unwrap();
@@ -1886,22 +1911,19 @@ async fn teardown_suspend_registration_failure_closes_only_the_requested_generat
             crate::db::TeardownSuspendOperationStatus::Running
         );
     }
-    {
-        let db = service.db.lock().unwrap();
-        crate::db::stage_teardown_suspend_artifact(
-            &db,
-            &sandbox_id.to_string(),
-            generation,
-            LocalArtifactId::new(),
-            "/synthetic/replacement",
-        )
-        .unwrap();
-    }
+    // A late failure for another artifact cannot close this admitted attempt.
+    let stale_missing = teardown_artifact_backup_status(
+        ArtifactBackupSubmissionError::Begin {
+            error: pplx_space_common_jobs::JobError::permanent("registration refused"),
+            superseded_generation: None,
+        },
+        LocalArtifactId::new(),
+    );
     service
         .record_teardown_suspend_driver_failure(
             sandbox_id,
             generation,
-            &missing,
+            &stale_missing,
             Some(&OrgSnapshotConfigResolution::ClusterRowMissing),
         )
         .unwrap();
@@ -1922,14 +1944,6 @@ async fn teardown_suspend_registration_failure_closes_only_the_requested_generat
             status.operation.unwrap().status,
             crate::db::TeardownSuspendOperationStatus::Running
         );
-        crate::db::stage_teardown_suspend_artifact(
-            &db,
-            &sandbox_id.to_string(),
-            generation,
-            failed_artifact,
-            "/synthetic/original",
-        )
-        .unwrap();
         db.execute_batch(
             "CREATE TRIGGER reject_terminal_job BEFORE UPDATE ON jobs
              WHEN NEW.status = 'failed' BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END",
@@ -1996,7 +2010,7 @@ async fn teardown_suspend_pause_failure_recovery_allows_same_generation_retry() 
     use crate::service::tests::service_tests::{
         insert_test_sandbox, prepare_teardown_suspend_request,
     };
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
 
     for target in [
         crate::db::PauseFailedRecoveryTarget::Started,
@@ -2010,7 +2024,7 @@ async fn teardown_suspend_pause_failure_recovery_allows_same_generation_retry() 
         crate::db::update_space_api_route_identity(
             &conn,
             sandbox_id,
-            &pplx_space_common_core::types::SpaceApiRouteIdentity {
+            &pplx_space_sandbox_model::SpaceApiRouteIdentity {
                 execution_generation: Some(generation),
                 ..Default::default()
             },
@@ -2030,10 +2044,10 @@ async fn teardown_suspend_pause_failure_recovery_allows_same_generation_retry() 
             &conn,
             &id,
             SandboxState::Pausing,
-            pplx_space_common_core::types::SandboxQuarantineSource::SbxManager,
-            pplx_space_common_core::types::SandboxQuarantineReasonCode::PauseFailed,
+            pplx_space_sandbox_model::SandboxQuarantineSource::SbxManager,
+            pplx_space_sandbox_model::SandboxQuarantineReasonCode::PauseFailed,
             "ambiguous pause response",
-            pplx_space_common_core::types::SandboxQuarantineNextAction::RequiresOperatorAttention,
+            pplx_space_sandbox_model::SandboxQuarantineNextAction::RequiresOperatorAttention,
         )
         .unwrap();
         let service = SandboxManagerService::for_test(conn);
@@ -2310,7 +2324,7 @@ async fn pause_refuses_rows_that_cannot_enter_pausing_before_writing_state() {
 #[tokio::test]
 async fn suspend_refuses_rows_that_are_neither_started_nor_paused() {
     use crate::service::activation_support::internal_request;
-    use pplx_space_common_core::node_drain_signals::SUSPEND_SANDBOX_FAILED_MARKER;
+    use pplx_space_rpc_contracts::node_drain_signals::SUSPEND_SANDBOX_FAILED_MARKER;
 
     let sockets = tempfile::tempdir().unwrap();
     for state in SandboxStatus::sweep().into_iter().filter(|state| {
@@ -2356,7 +2370,7 @@ async fn suspend_refuses_rows_that_are_neither_started_nor_paused() {
 #[tokio::test]
 async fn paused_suspend_admission_requires_a_free_row_and_the_owning_generation() {
     use crate::service::cleanup_support::CleanupLockTryResult;
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
 
     enum Admission {
         NodeLocal,
@@ -2469,7 +2483,7 @@ async fn paused_suspend_admission_requires_a_free_row_and_the_owning_generation(
 async fn suspend_completion_refuses_a_superseded_row_before_runtime_cleanup() {
     use crate::service::cleanup_support::CleanupLockTryResult;
     use crate::service::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::types::{ExecutionGeneration, SpaceApiRouteIdentity};
+    use pplx_space_sandbox_model::{ExecutionGeneration, SpaceApiRouteIdentity};
 
     #[derive(Debug)]
     enum Supersession {
@@ -2502,7 +2516,7 @@ async fn suspend_completion_refuses_a_superseded_row_before_runtime_cleanup() {
             crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
         )
         .unwrap();
-        assert!(crate::db::begin_suspend(&conn, &id).unwrap());
+        assert!(crate::db::begin_suspend(&conn, &id, LocalArtifactId::new()).unwrap());
         let mut captured = crate::db::get_sandbox(&conn, &id).unwrap().unwrap();
         match supersession {
             Supersession::CleanupActive => {}
@@ -2531,7 +2545,7 @@ async fn suspend_completion_refuses_a_superseded_row_before_runtime_cleanup() {
                     crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
                 )
                 .unwrap();
-                assert!(crate::db::begin_suspend(&conn, &id).unwrap());
+                assert!(crate::db::begin_suspend(&conn, &id, LocalArtifactId::new()).unwrap());
             }
         }
         let before = crate::db::get_sandbox(&conn, &id).unwrap();
@@ -2602,7 +2616,7 @@ async fn suspend_completion_refuses_a_superseded_row_before_runtime_cleanup() {
 #[tokio::test]
 async fn suspend_publication_failure_persists_only_against_the_suspending_row() {
     use crate::service::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::types::SandboxQuarantineReasonCode;
+    use pplx_space_sandbox_model::SandboxQuarantineReasonCode;
 
     let reject_state = |conn: &crate::db::Connection, state: SandboxState| {
         conn.execute_batch(&format!(
@@ -2743,13 +2757,13 @@ async fn suspend_publication_failure_after_staging_preserves_only_owned_evidence
             None,
         ),
         (
-            "unlistable staging is quarantined",
+            "unreadable staging defers classification",
             false,
             Row::At(SandboxState::Suspending),
             Disk::UnlistableStaging,
             false,
-            Disposition::Cleanup,
-            Some(SandboxState::Quarantined),
+            Disposition::Preserve,
+            Some(SandboxState::Suspending),
         ),
         (
             "no usable artifact is quarantined",
@@ -2855,7 +2869,7 @@ async fn suspend_publication_failure_after_staging_preserves_only_owned_evidence
 #[tokio::test]
 async fn teardown_suspend_driver_completes_a_generation_whose_artifact_is_already_durable() {
     use crate::service::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
 
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new();
@@ -2866,7 +2880,7 @@ async fn teardown_suspend_driver_completes_a_generation_whose_artifact_is_alread
     let snapshot_dir = snapshot_dir.to_string_lossy();
     let local_artifact_id = LocalArtifactId::new();
     insert_test_sandbox(&conn, &id, SandboxState::Paused);
-    crate::db::begin_teardown_suspend(&conn, &id, generation).unwrap();
+    crate::db::begin_teardown_suspend(&conn, &id, generation, local_artifact_id).unwrap();
     crate::db::stage_teardown_suspend_artifact(
         &conn,
         &id,
@@ -2922,7 +2936,7 @@ async fn teardown_suspend_driver_completes_a_generation_whose_artifact_is_alread
 #[tokio::test]
 async fn teardown_suspend_without_a_capture_quarantines_as_an_only_copy() {
     use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new();
     let generation = ExecutionGeneration::new(7).unwrap();
@@ -2957,5 +2971,79 @@ async fn teardown_suspend_without_a_capture_quarantines_as_an_only_copy() {
             .unwrap()
             .status,
         crate::db::TeardownSuspendOperationStatus::Failed
+    );
+}
+
+/// A teardown suspend of a sandbox that an unretired runtime upgrade to a
+/// `stopped` target runs is refused retryably, as a user's Suspend is: the
+/// upgrade stops the sandbox itself, and a suspend in between would leave it
+/// suspended. The drive fails `Unavailable` before it captures anything, the
+/// sandbox stays started and its suspend job stays running for a later
+/// drive.
+#[tokio::test]
+async fn teardown_suspend_waits_while_a_stay_stopped_upgrade_runs() {
+    use crate::service::tests::service_tests::insert_test_sandbox;
+    use pplx_space_sandbox_model::ExecutionGeneration;
+    let execution = pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
+        pplx_space_cpu_arch::Arch::X86_64,
+    )
+    .unwrap()
+    .first()
+    .unwrap()
+    .definition()
+    .execution_requirements()
+    .unwrap();
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new();
+    let id = sandbox_id.to_string();
+    insert_test_sandbox(&conn, &id, SandboxState::Stopped);
+    crate::db::upsert_sandbox_execution_metadata(&conn, &id, &execution).unwrap();
+    let operation_id = crate::db::test_fixtures::fence_runtime_upgrade(
+        &conn,
+        &id,
+        execution.environment().unwrap(),
+        crate::db::RuntimeUpgradeTargetState::Stopped,
+        None,
+    )
+    .operation_id;
+    // The boot's execution runs the sandbox: the upgrade still owes its stop.
+    let boot = uuid::Uuid::now_v7().to_string();
+    conn.execute(
+        "UPDATE sandbox_runtime_upgrades SET phase = 'verified', boot_execution_id = ?2
+          WHERE operation_id = ?1",
+        crate::db::fixture::params![operation_id.to_string(), boot],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE sandboxes SET state = 'started', node_execution_id = ?2 WHERE id = ?1",
+        crate::db::fixture::params![id, boot],
+    )
+    .unwrap();
+    let generation = ExecutionGeneration::new(7).unwrap();
+    crate::db::begin_teardown_suspend_operation(&conn, &id, generation).unwrap();
+    let service = SandboxManagerService::for_test(conn);
+
+    let error = service
+        .drive_teardown_suspend(sandbox_id, generation, SandboxEventTrigger::System)
+        .await
+        .expect_err("the teardown suspend waits for the upgrade");
+
+    assert_eq!(error.code(), tonic::Code::Unavailable, "{error}");
+    assert!(
+        error.message().contains("must stop this sandbox first"),
+        "{error}"
+    );
+    assert_eq!(
+        service.lookup_sandbox(&id).unwrap().state,
+        SandboxStatus::from(SandboxState::Started)
+    );
+    let db = service.db.lock().unwrap();
+    assert_eq!(
+        crate::db::latest_teardown_suspend_operation(&db, &id)
+            .unwrap()
+            .unwrap()
+            .status,
+        crate::db::TeardownSuspendOperationStatus::Running,
+        "the job stays for a later drive"
     );
 }

@@ -7,8 +7,6 @@ use pplx_space_node_mgr::slot_pool::{NetworkPool, NetworkPoolConfig, NodeCtlNode
 use pplx_space_node_mgr::{firewall, net};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../../../../db/node-manager");
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let namespace = "sns-reply-test";
@@ -39,8 +37,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // Real migrations and startup worker, inside the harness's disposable /space.
 async fn recover_pool() -> Result<(), Box<dyn std::error::Error>> {
-    let db = Path::new(pplx_space_common_core::host::linux::paths::NODE_MANAGER_DB);
-    pplx_space_sqlite::migrate("node-manager", db, &MIGRATOR).await?;
+    let db = Path::new(pplx_space_host_layout::paths::NODE_MANAGER_DB);
+    pplx_space_node_mgr_store::database::migrate(db).await?;
     let mut config = NetworkPoolConfig::new(3);
     config.pod_netns_path = Some("host".into());
     NetworkPool::validate_startup(&config, db)?;

@@ -10,11 +10,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use pplx_space_common_core::host::linux::identities::group_names;
+use pplx_space_host_layout::identities::group_names;
 use pplx_space_local_health::LocalHealthServer;
 use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
 use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
-use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::DB_PATH;
@@ -29,10 +28,6 @@ const BACKGROUND_WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 // Hard-coded so two instances on the same host cannot be configured to use
 // different mutex files and both acquire concurrently.
 const SERVICE_MUTEX_PATH: &str = "/space/run/template-manager/service.mutex";
-
-static COMMON_SCHEMA_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../../../../db/common");
-static TEMPLATE_MANAGER_MIGRATOR: sqlx::migrate::Migrator =
-    sqlx::migrate!("../../../../../db/template-manager");
 
 /// Everything [`run`] needs from the process that hosts it: the binary's
 /// flags, already parsed. Environment-driven tuning (cache budget, prefetch
@@ -61,16 +56,16 @@ pub enum RunTemplateMgrError {
     RootfsBacking(#[source] crate::RootfsBackingConfigError),
     #[error("template cache cannot honor the rootfs backing policy: {0}")]
     RootfsBackingFilesystem(#[source] std::io::Error),
-    #[error("failed to bind the template-manager health socket: {0}")]
-    HealthSocket(#[source] pplx_space_unix_socket_bind::BindUnixSocketError),
+    #[error("failed to start the template-manager health server: {0}")]
+    HealthSocket(#[source] pplx_space_local_health::LocalHealthServerError),
     #[error("failed to acquire the template-manager service mutex: {0}")]
     ServiceMutex(#[source] pplx_space_service_mutex::AcquireError),
     #[error("failed to migrate the template-manager SQLite database: {0}")]
-    Migrate(#[source] pplx_space_sqlite::SqliteError),
+    Migrate(#[source] pplx_space_template_mgr_store::database::SqliteError),
     #[error("failed to open the template-manager SQLite database: {0}")]
-    OpenDatabase(#[source] pplx_space_sqlite::SqliteError),
+    OpenDatabase(#[source] pplx_space_template_mgr_store::database::SqliteError),
     #[error("failed to initialize template-manager service state: {0}")]
-    InitializeService(#[source] rusqlite::Error),
+    InitializeService(#[source] crate::db::Error),
     #[error("failed to bind the template-manager socket: {0}")]
     BindSocket(#[source] pplx_space_unix_socket_bind::BindUnixSocketError),
 }
@@ -150,13 +145,13 @@ async fn run_service(
     health_server.mark_starting();
 
     let production_hash_algorithm = crate::content_hash::production_algorithm_from_environment(
-        &pplx_space_common_core::env::ProcessEnvironment,
+        &pplx_space_env_vars::ProcessEnvironment,
     )
     .map_err(RunTemplateMgrError::TemplateHash)?;
     let backing_policy = crate::rootfs_backing::RootfsBackingPolicy::from_env()
         .map_err(RunTemplateMgrError::RootfsBacking)?;
     if backing_policy == crate::rootfs_backing::RootfsBackingPolicy::NoCow {
-        let root = std::path::Path::new(pplx_space_common_core::host::linux::paths::TEMPLATE_DIR);
+        let root = std::path::Path::new(pplx_space_host_layout::paths::TEMPLATE_DIR);
         tokio::fs::create_dir_all(root)
             .await
             .map_err(RunTemplateMgrError::RootfsBackingFilesystem)?;
@@ -165,16 +160,9 @@ async fn run_service(
             .map_err(RunTemplateMgrError::RootfsBackingFilesystem)?;
     }
 
-    pplx_space_sqlite::migrate_embedded(
-        "template-manager",
-        std::path::Path::new(DB_PATH),
-        pplx_space_sqlite::EmbeddedMigrators {
-            service: &TEMPLATE_MANAGER_MIGRATOR,
-            common: Some(&COMMON_SCHEMA_MIGRATOR),
-        },
-    )
-    .await
-    .map_err(RunTemplateMgrError::Migrate)?;
+    pplx_space_template_mgr_store::database::migrate(std::path::Path::new(DB_PATH))
+        .await
+        .map_err(RunTemplateMgrError::Migrate)?;
 
     let conn = crate::db::open().map_err(RunTemplateMgrError::OpenDatabase)?;
 
@@ -229,15 +217,12 @@ async fn run_service(
     // syncers don't yet accept a token and are dropped at process exit.
     service.spawn_startup_recovery(shutdown_token.clone());
 
-    // Production server runs under its own token so it keeps accepting
-    // traffic while the local health server drains on shutdown_token.
+    // The production server stops on its own token, which the drain below
+    // cancels; its listener closes then, so connects are refused rather than
+    // queued until the drain ends.
     let production_shutdown_token = CancellationToken::new();
 
     let (_, health_service) = pplx_space_grpc_server::grpc_health_service();
-    let production_shutdown = {
-        let token = production_shutdown_token.clone();
-        async move { token.cancelled().await }
-    };
     let server_handle = tokio::spawn(
         pplx_space_grpc_server::grpc_server_builder()
             .timeout(crate::GRPC_REQUEST_TIMEOUT)
@@ -249,7 +234,13 @@ async fn run_service(
             .layer(pplx_space_grpc_server::grpc_trace_layer())
             .add_service(health_service)
             .add_service(TemplateManagerServer::new(service))
-            .serve_with_incoming_shutdown(UnixListenerStream::new(listener), production_shutdown),
+            .serve_with_incoming_shutdown(
+                pplx_space_grpc_server::unix_incoming_until_shutdown(
+                    listener,
+                    production_shutdown_token.clone(),
+                ),
+                std::future::pending(),
+            ),
     );
 
     shutdown_token.cancelled().await;

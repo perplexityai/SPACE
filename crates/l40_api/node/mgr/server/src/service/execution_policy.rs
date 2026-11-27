@@ -3,12 +3,11 @@
 //! ceiling, so inventory discovery and artifact publication keep using them;
 //! every admission decision reads the effective policy.
 
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use pplx_space_common_core::types::{
+use pplx_space_execution_spec::{
     EXECUTION_POLICY_APPLIED_SCHEMA_VERSION, EXECUTION_POLICY_SCHEMA_VERSION, EnvironmentReference,
     ExecutionPolicyObservation, ExecutionPolicyObservationError,
 };
@@ -18,18 +17,15 @@ use pplx_space_node_runtime_core::selection::{
 use tonic::{Request, Response, Status};
 
 use super::NodeManagerService;
+use super::artifact_fs::{BoundedReadError, MAX_RECORD_BYTES};
 use crate::proto::{ApplyExecutionPolicyRequest, ApplyExecutionPolicyResponse};
 
 const ALLOW_POLICY_WRITER: &[pplx_space_uds_peer_auth::UdsPeerPrincipal] = &[
     pplx_space_uds_peer_auth::UdsPeerPrincipal::Root,
     pplx_space_uds_peer_auth::UdsPeerPrincipal::Service(
-        pplx_space_common_core::host::linux::identities::user_names::SPACE_NODECTL,
+        pplx_space_host_layout::identities::user_names::SPACE_NODECTL,
     ),
 ];
-/// Twice the 4 MiB request bound of node-manager's gRPC server (tonic's
-/// default): a record is about the size of the request it came from, so any
-/// accepted policy fits, and `write_record` refuses one that wouldn't.
-const MAX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
 /// With `RECORD_LOCK_BUDGET`, well under node-ctl's 10-second deadline for the
 /// whole call, leaving room for the durable write. A slower check, such as a
 /// first inventory discovery, refuses the default for this application
@@ -266,22 +262,20 @@ fn read_record(path: &Path) -> Result<Option<PolicyRecord>, RecordError> {
         }
         Ok(_) => {}
     }
-    let file = super::artifact_fs::parent(path)
-        .and_then(|(directory, name)| super::trusted_paths::open_regular_file(&directory, name))
-        .map_err(|status| RecordError::Open {
-            path: path.to_owned(),
-            status,
-        })?;
-    let mut bytes = Vec::new();
-    file.take(MAX_RECORD_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|source| RecordError::Read {
-            path: path.to_owned(),
-            source,
-        })?;
-    if bytes.len() as u64 > MAX_RECORD_BYTES {
-        return Err(RecordError::TooLarge(path.to_owned()));
-    }
+    let bytes = super::artifact_fs::read_bounded(path, MAX_RECORD_BYTES, false).map_err(
+        |error| match error {
+            BoundedReadError::Open(status) => RecordError::Open {
+                path: path.to_owned(),
+                status,
+            },
+            // The parent isn't synced, so `Sync` doesn't occur.
+            BoundedReadError::Read(source) | BoundedReadError::Sync(source) => RecordError::Read {
+                path: path.to_owned(),
+                source,
+            },
+            BoundedReadError::TooLarge => RecordError::TooLarge(path.to_owned()),
+        },
+    )?;
     let record: PolicyRecord =
         serde_json::from_slice(&bytes).map_err(|source| RecordError::Decode {
             path: path.to_owned(),

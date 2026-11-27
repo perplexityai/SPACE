@@ -1,7 +1,6 @@
 //! Durable requests and operation views for the shared install/delete worker.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::executor::{ExecutorParts, InstallExecutor};
@@ -9,9 +8,14 @@ use super::release_source::VerifiableRelease;
 use super::source::{KernelVersion, RuntimeLine, SourceError, VerifiableKernel};
 use super::staging::{self, PrepareStagingError};
 use super::store::{self, JobOutcome, JobResult, StoreError};
-use pplx_space_common_core::types::{ComponentIdentity, Digest, JobId, RuntimeIdentity};
-use pplx_space_common_jobs::{BackgroundWorker, Job, JobStatus, ParseJobStatusError, WorkerConfig};
+use pplx_space_accounts::JobId;
+use pplx_space_content_digest::Digest;
+use pplx_space_execution_spec::{ComponentIdentity, RuntimeIdentity};
 use pplx_space_node_runtime_core::catalog::{CatalogError, PinnedBootArtifact};
+use pplx_space_node_runtime_manager_store::database::SharedConnection;
+use pplx_space_node_runtime_manager_store::jobs::{
+    Job, JobStatus, JobWorker, ParseJobStatusError, WorkerConfig,
+};
 use tokio_util::sync::CancellationToken;
 
 pub(super) const INSTALL_JOB_KIND: &str = "artifact-install";
@@ -292,7 +296,7 @@ pub(crate) enum CancelOperationError {
 
 #[derive(Clone)]
 pub(crate) struct Installer {
-    worker: BackgroundWorker<InstallExecutor>,
+    worker: JobWorker<InstallExecutor>,
     pub(super) executor: InstallExecutor,
 }
 
@@ -311,16 +315,16 @@ impl Installer {
         let pins = parts.pins.clone();
         tokio::task::spawn_blocking(move || pins.catalog()).await??;
         let db = store::open(state_dir).await?;
-        let orphaned = store::delete_orphaned_job_results(&db)?;
+        let orphaned = store::delete_orphaned_job_results(&db).map_err(StoreError::from)?;
         if orphaned > 0 {
             tracing::info!(orphaned, "dropped results of pruned kernel jobs");
         }
-        let db = Arc::new(Mutex::new(db));
+        let db = SharedConnection::new(db);
         let executor = InstallExecutor::new(parts, db.clone());
         let config = WorkerConfig::new(1, JOB_TIMEOUT, limits.max_attempts)
             .with_kind_concurrency(INSTALL_JOB_KIND, 1)
             .with_recovery_job_kind(INSTALL_JOB_KIND);
-        let worker = BackgroundWorker::new(db, executor.clone(), config);
+        let worker = db.background_worker(executor.clone(), config);
         worker.recover_and_log(WORKER_LABEL);
         Ok(Self { worker, executor })
     }
@@ -513,7 +517,8 @@ impl Installer {
         let Some(job) = job.filter(|job| job.kind == INSTALL_JOB_KIND) else {
             return Ok(None);
         };
-        let result = store::get_job_result(&self.executor.db(), &job_id)?;
+        let result =
+            store::get_job_result(&self.executor.db(), &job_id).map_err(StoreError::from)?;
         operation(&job, result).map(Some)
     }
 
@@ -543,7 +548,7 @@ impl Installer {
             tokio::task::spawn_blocking(move || store::get_job_result(&reading.db(), &job_id))
                 .await
                 .map_err(LookupOperationError::from)?
-                .map_err(LookupOperationError::from)?;
+                .map_err(|error| LookupOperationError::from(StoreError::from(error)))?;
         if committed.is_some() {
             return Err(CancelOperationError::TooLate(job_id));
         }

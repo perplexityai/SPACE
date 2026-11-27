@@ -85,9 +85,9 @@ async fn connect_replays_the_journal_from_the_cursor_only() {
     assert_eq!(
         error
             .metadata()
-            .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+            .get(pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY)
             .and_then(|value| value.to_str().ok()),
-        Some(pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD)
+        Some(pplx_space_guest_process::status::PROCESS_OUTPUT_CURSOR_AHEAD)
     );
 }
 

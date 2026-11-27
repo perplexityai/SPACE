@@ -11,10 +11,10 @@
 //! and `start_arms_access_idle_only_after_guest_readiness` cover arming.
 
 use crate::db::Connection;
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, LocalArtifactId, SandboxId, SandboxQuarantineNextAction,
-    SandboxQuarantineReasonCode, SandboxQuarantineSource, TransferScopeId,
+use pplx_space_sandbox_model::{
+    SandboxId, SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
 };
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId, TransferScopeId};
 
 use super::state_write_fixtures::{
     Cell, ExpectedDiff, NULL, assert_accepts, backdate, decorate, generation, insert_row,
@@ -126,7 +126,12 @@ fn eviction_claims_move_the_row_to_deleting_and_close_its_teardown_job() {
     assert_accepts(
         "quarantined",
         &conn,
-        || assert!(claim_quarantined_sandbox_for_eviction(&conn, &quarantined, "1").unwrap()),
+        || {
+            assert_eq!(
+                claim_quarantined_sandbox_for_eviction(&conn, &quarantined, "1").unwrap(),
+                crate::db::QuarantinedEvictionClaim::Claimed
+            )
+        },
         teardown_job_failed(&quarantined, DELETING).sandbox(&quarantined, deleting_claimed()),
     );
 
@@ -186,8 +191,8 @@ fn eviction_claims_move_the_row_to_deleting_and_close_its_teardown_job() {
 
     // The terminal backup refusal already failed the row's teardown job.
     let stuck = insert_row(&conn, SandboxState::Paused);
-    begin_teardown_suspend(&conn, &stuck, generation(7)).unwrap();
     let staged = LocalArtifactId::new();
+    begin_teardown_suspend(&conn, &stuck, generation(7), staged).unwrap();
     stage_teardown_suspend_artifact(&conn, &stuck, generation(7), staged, &snapshot_path(&stuck))
         .unwrap();
     assert!(fail_teardown_suspend_backup_operation(&conn, &stuck, generation(7), staged).unwrap());
@@ -210,10 +215,13 @@ fn eviction_claims_move_the_row_to_deleting_and_close_its_teardown_job() {
 fn suspend_begin_and_rollback_move_the_artifact_pin_through_the_predecessor() {
     let conn = test_conn();
     let id = insert_row(&conn, SandboxState::Paused);
+    let attempt = LocalArtifactId::new();
     let pin = set_suspend_pin(&conn, &id);
     decorate(&conn, &id, SandboxState::Started);
     let mut cells = vec![
         ("state", text("suspending")),
+        ("suspend_attempt_artifact_id", text(attempt.to_string())),
+        ("suspend_attempt_started_at", Cell::NowInteger),
         ("suspend_predecessor_artifact_id", text(pin.to_string())),
         ("failure_reason", NULL),
         ("state_changed_at", Cell::NowText),
@@ -223,7 +231,7 @@ fn suspend_begin_and_rollback_move_the_artifact_pin_through_the_predecessor() {
     assert_accepts(
         "begin suspend",
         &conn,
-        || assert!(begin_suspend(&conn, &id).unwrap()),
+        || assert!(begin_suspend(&conn, &id, attempt).unwrap()),
         ExpectedDiff::new().sandbox(&id, cells),
     );
 
@@ -232,6 +240,8 @@ fn suspend_begin_and_rollback_move_the_artifact_pin_through_the_predecessor() {
     backdate(&conn, &id);
     let mut cells = vec![
         ("state", text("paused")),
+        ("suspend_attempt_artifact_id", NULL),
+        ("suspend_attempt_started_at", NULL),
         ("suspend_predecessor_artifact_id", NULL),
         ("cleanup_completion", NULL),
         ("cleanup_keep_filesystem", NULL),
@@ -448,7 +458,7 @@ fn suspended_cleanup_pin_hands_the_staged_artifact_to_suspend_cleanup() {
     let conn = test_conn();
     let id = insert_row(&conn, SandboxState::Paused);
     let predecessor = set_suspend_pin(&conn, &id);
-    assert!(begin_suspend(&conn, &id).unwrap());
+    assert!(begin_suspend(&conn, &id, LocalArtifactId::new()).unwrap());
     let stale = LocalArtifactId::new();
     insert_local_artifact(
         &conn,

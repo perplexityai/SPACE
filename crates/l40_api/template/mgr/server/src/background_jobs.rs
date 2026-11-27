@@ -1,6 +1,6 @@
 //! Generic durable background worker for tmplmgr.
 //!
-//! tmplmgr's background work goes through one [`BackgroundWorker`]
+//! tmplmgr's background work goes through one [`JobWorker`]
 //! instance whose [`TemplateBackgroundExecutor`] dispatches on
 //! `job.kind`. Today the only job kind is [`STAMP_JOB_KIND`] — the
 //! durable retry for the privileged `received_uuid` stamp on template
@@ -9,7 +9,7 @@
 //!
 //! ## Why a single worker
 //!
-//! The [`pplx_space_common_jobs::BackgroundWorker`] is generic over
+//! The [`JobWorker`] is generic over
 //! one [`JobExecutor`] type, and that executor dispatches per-job by
 //! inspecting [`Job::kind`]. Standing up one worker per job kind
 //! would duplicate the SQLite recovery loop, the bounded-concurrency
@@ -20,7 +20,7 @@
 //!
 //! ## Stamp job
 //!
-//! See [`stamp::execute`] for the per-attempt logic. The classifier
+//! See `stamp::execute` for the per-attempt logic. The classifier
 //! is:
 //!
 //! - `FailedPrecondition` from nodemgr → [`JobError::Permanent`].
@@ -42,10 +42,9 @@
 //! itself is idempotent — re-stamping an already-stamped subvolume
 //! is a no-op on the kernel side.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_common_jobs::{BackgroundWorker, Job, JobError, JobExecutor, WorkerConfig};
+use pplx_space_template_mgr_store::jobs::{Job, JobError, JobExecutor, JobWorker, WorkerConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::btrfs_via_nodemgr::BtrfsViaNodemgrError;
@@ -64,14 +63,14 @@ pub struct StampPayload {
     /// Environment of the build's cache partition. Absent for the legacy
     /// partition, including every job enqueued before partitions existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub partition_environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    pub partition_environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 }
 
 impl StampPayload {
     pub fn new(
         name: &str,
         content_hash: &str,
-        partition: pplx_space_common_core::types::TemplateCachePartition,
+        partition: pplx_space_template_model::TemplateCachePartition,
     ) -> Self {
         Self {
             name: name.to_string(),
@@ -80,8 +79,8 @@ impl StampPayload {
         }
     }
 
-    pub fn partition(&self) -> pplx_space_common_core::types::TemplateCachePartition {
-        use pplx_space_common_core::types::TemplateCachePartition;
+    pub fn partition(&self) -> pplx_space_template_model::TemplateCachePartition {
+        use pplx_space_template_model::TemplateCachePartition;
         self.partition_environment.map_or(
             TemplateCachePartition::Legacy,
             TemplateCachePartition::Environment,
@@ -100,19 +99,17 @@ impl StampPayload {
     }
 }
 
-/// Build the shared `BackgroundWorker` for tmplmgr's durable jobs.
+/// Build the shared `JobWorker` for tmplmgr's durable jobs.
 ///
-/// Caller owns the `rusqlite::Connection` (tmplmgr's local
-/// `template-manager.db`). The `db/common/` migrations install the required
+/// Caller owns the shared connection to tmplmgr's local
+/// `template-manager.db`. The `db/common/` migrations install the required
 /// `jobs` table before this worker starts. Call
-/// [`BackgroundWorker::recover_and_log`] at startup and
-/// [`BackgroundWorker::shutdown`] at exit.
-pub fn build_worker(
-    db: Arc<std::sync::Mutex<rusqlite::Connection>>,
-) -> BackgroundWorker<TemplateBackgroundExecutor> {
+/// [`JobWorker::recover_and_log`] at startup and
+/// [`JobWorker::shutdown`] at exit.
+pub fn build_worker(db: crate::db::SharedConnection) -> JobWorker<TemplateBackgroundExecutor> {
     let config = WorkerConfig::new(DEFAULT_CONCURRENCY, JOB_TIMEOUT, MAX_ATTEMPTS)
         .with_kind_concurrency(STAMP_JOB_KIND, DEFAULT_CONCURRENCY);
-    BackgroundWorker::new(db, TemplateBackgroundExecutor, config)
+    db.background_worker(TemplateBackgroundExecutor, config)
 }
 
 /// Dispatches durable jobs by `job.kind`. Stateless — all per-job

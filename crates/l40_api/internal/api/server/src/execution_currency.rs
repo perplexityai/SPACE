@@ -3,8 +3,7 @@
 
 use std::str::FromStr;
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{ExecutionGeneration, SandboxId};
+use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use tonic::{Request, Response, Status};
 
 use crate::ClusterApiService;
@@ -24,18 +23,9 @@ impl ClusterApiService {
         // Scoped to the execution's own node, the way the node-bound reads are
         // scoped to sandboxes placed on the caller: only the node that may run
         // the runtime learns whether it may.
-        let active = sqlx::query_scalar::<_, bool>(sql!(
-            "SELECT e.active
-               FROM sandbox_k8s_executions e
-               JOIN node_k8s nk ON nk.k8s_node_name = e.k8s_node_name
-              WHERE e.sandbox_id = $1
-                AND e.generation = $2
-                AND nk.node_id = ANY($3)"
-        ))
-        .bind(sandbox_id)
-        .bind(generation.get())
-        .bind(&node_ids)
-        .fetch_optional(&self.pool)
+        let active = pplx_space_sandbox_store::k8s_executions::generation_active_on_nodes(
+            &self.pool, sandbox_id, generation, &node_ids,
+        )
         .await
         .map_err(|e| Status::internal(format!("execution currency lookup: {e}")))?;
         let currency = match active {

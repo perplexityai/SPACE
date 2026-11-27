@@ -3,7 +3,7 @@
 //! metadata and do not change release, kernel or environment identities.
 
 use crate::verity::VerityDigest;
-use pplx_space_common_core::types::Digest;
+use pplx_space_content_digest::Digest;
 use std::collections::BTreeMap;
 
 pub fn compiled_verity_digest(

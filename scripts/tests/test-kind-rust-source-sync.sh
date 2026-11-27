@@ -46,8 +46,10 @@ mirror="$work/mirror"
 make_checkout "$work/one"
 out="$(python3 "$sync" "$work/one" "$mirror" "${inputs[@]}")"
 [[ "$out" == "6 0" ]] || fail "the first sync must copy every input file" "$out"
+# Give the mirror an explicit old timestamp: freshness assertions must not
+# depend on waiting for the host filesystem's clock to advance.
+touch -t 200001010000 "$mirror/crates/a/src/lib.rs" "$mirror/crates/b/src/lib.rs"
 before="$(mtime "$mirror/crates/b/src/lib.rs")"
-sleep 1
 make_checkout "$work/two"
 out="$(python3 "$sync" "$work/two" "$mirror" "${inputs[@]}")"
 [[ "$out" == "0 0" ]] || fail "a fresh checkout of identical content must write nothing" "$out"
@@ -55,7 +57,6 @@ out="$(python3 "$sync" "$work/two" "$mirror" "${inputs[@]}")"
     || fail "an unchanged file must keep its mirror mtime"
 
 # Case 2.
-sleep 1
 printf 'fn a() { 1; }\n' >"$work/two/crates/a/src/lib.rs"
 touch -t 200001010000 "$work/two/crates/a/src/lib.rs"
 out="$(python3 "$sync" "$work/two" "$mirror" "${inputs[@]}")"

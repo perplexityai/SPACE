@@ -1,5 +1,5 @@
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_node_mgr_client::proto::{GetVmStateRequest, VmState as WireVmState};
+use pplx_space_sandbox_model::SandboxId;
 
 use pplx_space_node_runtime_core::vm_state::VmState;
 use std::time::Duration;
@@ -19,6 +19,18 @@ pub(crate) enum RuntimeStateReadError {
     Timeout { timeout_ms: u64 },
 }
 
+impl RuntimeStateReadError {
+    /// Whether the read ran out of time, here or in node-manager, whose own
+    /// Firecracker deadline answers `DEADLINE_EXCEEDED` before ours expires.
+    pub(crate) fn is_timeout(&self) -> bool {
+        match self {
+            Self::Timeout { .. } => true,
+            Self::Rpc(status) => status.code() == tonic::Code::DeadlineExceeded,
+            Self::UnsupportedState(_) => false,
+        }
+    }
+}
+
 async fn get_vm_state_inner(
     sandbox_id: SandboxId,
     node_manager: &NodeManagerConnector,
@@ -26,12 +38,14 @@ async fn get_vm_state_inner(
     // Reuse the reconnecting channel; the outer read deadline also covers
     // channel readiness after a node-manager restart.
     let mut client = node_manager.lazy();
-    let response = client
-        .get_vm_state(GetVmStateRequest {
-            sandbox_id: sandbox_id.to_string(),
-        })
-        .await?
-        .into_inner();
+    // Every caller handles a failed read itself, as a health observation, a
+    // warning or another poll, so a dial that finds node-manager restarting
+    // is not also an error of its client trace.
+    let mut request = tonic::Request::new(GetVmStateRequest {
+        sandbox_id: sandbox_id.to_string(),
+    });
+    pplx_space_common_grpc::ExpectedConnectFailure.mark(&mut request);
+    let response = client.get_vm_state(request).await?.into_inner();
     match response.state() {
         WireVmState::NotStarted => Ok(VmState::NotStarted),
         WireVmState::Running => Ok(VmState::Running),

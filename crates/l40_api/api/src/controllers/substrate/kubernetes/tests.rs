@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{NodeGroupId, SnapshotId};
+use pplx_space_node_model::NodeGroupId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use super::execution::{ensure_wake_recovery_lifecycle, should_join_started_recovery};
 use super::pod_ops::{
@@ -10,7 +11,7 @@ use super::*;
 use k8s_openapi::api::core::v1::PodStatus;
 
 pub(crate) use kubernetes_tests::{
-    SequencedWakeWorker, deleted_pod_kubernetes_client,
+    SequencedWakeWorker, conflict_then_created_kubernetes_client, deleted_pod_kubernetes_client,
     existing_then_created_running_pod_kubernetes_client, inert_kubernetes_client,
     insert_k8s_execution, insert_ready_full_snapshot_relative_to_lifecycle,
     insert_test_sandbox_row, mock_kubernetes_client, node_api_pod_on_node, node_with_network_slots,
@@ -23,14 +24,20 @@ pub(crate) use kubernetes_tests::{
     test_sandbox_with_lifecycle,
 };
 
+mod activating_client;
 pub(super) mod environment_placement;
 mod native_pod_failover;
+mod node_instance;
 mod runtime_upgrade_dispatch;
+mod slot_headroom;
+mod stopped_start_stale_pod;
 mod substrate_scope;
 
 mod kubernetes_tests {
 
-    use pplx_space_common_core::types::{LocalArtifactId, SandboxId, UserId};
+    use pplx_space_accounts::UserId;
+    use pplx_space_sandbox_model::SandboxId;
+    use pplx_space_snapshot_model::LocalArtifactId;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -60,37 +67,42 @@ mod kubernetes_tests {
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
     use kube::client::{Body, ClientBuilder};
     use kube::runtime::{reflector, watcher::Event};
+    use pplx_space_accounts::{NodeId, OrgId, SandboxOwner, SandboxOwnerSource};
     use pplx_space_api_route::{
         ed25519::SPACE_API_ROUTE_ED25519_ISSUER_ENV,
         ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID_ENV,
         ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV,
         ed25519::SpaceApiRouteEd25519Authority,
     };
-    use pplx_space_common_core::kubernetes::{
-        NodeGroupPlacement, SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_EXECUTION_GENERATION_ANNOTATION,
-        SANDBOX_NETWORK_SLOTS_RESOURCE, SANDBOX_NODE_GROUP_LABEL,
-        SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION,
-        SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION,
-    };
-    use pplx_space_common_core::sql;
-    use pplx_space_common_core::types::{
-        ArtifactKind, ArtifactOrigin, ExecutionGeneration, NodeAddress, NodeGroup, NodeGroupName,
-        NodeGroupPolicy, NodeId, NodeManagedBy as SpaceNodeManagedBy, NodeRole as SpaceNodeRole,
-        OrgId, PodName, PodResourceVersion, PodUid, SandboxActivationAttemptId, SandboxLifecycle,
-        SandboxOwner, SandboxOwnerSource, SandboxTransitionTargetState, TemplateCompatSpec,
-        TemplateName, TemplateVisibility,
-    };
     use pplx_space_internal_api_server::publish_sandbox_states;
+    use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
     use pplx_space_node_api_client::proto::PublishedSandboxState;
     use pplx_space_node_api_client::proto::worker_api_internal_server::{
         WorkerApiInternal, WorkerApiInternalServer,
     };
     use pplx_space_node_api_client::proto::worker_api_server::WorkerApiServer;
     use pplx_space_node_api_sim::{SimState, SimWorkerApiService, SimWorkerHarness};
+    use pplx_space_node_model::{
+        NodeAddress, NodeGroup, NodeGroupName, NodeGroupPolicy,
+        NodeManagedBy as SpaceNodeManagedBy, NodeRole as SpaceNodeRole, TemplateCompatSpec,
+    };
+    use pplx_space_sandbox_model::{
+        ExecutionGeneration, SandboxActivationAttemptId, SandboxLifecycle,
+        SandboxTransitionTargetState,
+    };
+    use pplx_space_sandbox_pod::{
+        NodeGroupPlacement, SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_EXECUTION_GENERATION_ANNOTATION,
+        SANDBOX_NETWORK_SLOTS_RESOURCE, SANDBOX_NODE_GROUP_LABEL,
+        SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION,
+        SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION,
+    };
     use pplx_space_sbx_mgr_client::{
         operations as spaced_ops,
         proto::{SpacedStartProcessRequest, spaced_process_event},
     };
+    use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin};
+    use pplx_space_sql_locator::sql;
+    use pplx_space_template_model::{TemplateName, TemplateVisibility};
 
     use sqlx::{PgPool, postgres::PgPoolOptions};
     use tokio::sync::Semaphore;
@@ -268,11 +280,44 @@ mod kubernetes_tests {
         );
     }
 
+    /// Access to a sandbox at rest whose wake policy does not let it wake is
+    /// refused naming the sandbox and its state, which the Native routes
+    /// answer with `createCommand`'s `sandbox_not_running` details.
+    #[test]
+    fn a_disallowed_access_wake_names_the_sandbox_at_rest() {
+        for lifecycle in [
+            SandboxLifecycle::Created,
+            SandboxLifecycle::Stopped,
+            SandboxLifecycle::Paused,
+            SandboxLifecycle::Suspended,
+        ] {
+            let sandbox = test_sandbox_with_lifecycle(lifecycle.as_str());
+            let error = KubernetesSubstrate::should_allow_access_recovery(
+                &sandbox,
+                ExecutionActivityKind::Access,
+            )
+            .expect_err("the disabled policy does not wake on access");
+            assert_eq!(
+                error.status(),
+                axum::http::StatusCode::CONFLICT,
+                "{lifecycle}"
+            );
+            assert_eq!(
+                error.sandbox_not_running_refusal(),
+                Some(crate::controllers::SandboxNotRunning {
+                    sandbox_id: sandbox.id,
+                    lifecycle,
+                }),
+                "{lifecycle}"
+            );
+        }
+    }
+
     #[test]
     fn paused_restore_does_not_join_started_recovery() {
         let should_join = should_join_started_recovery(
-            pplx_space_common_core::types::SandboxLifecycle::Started,
-            pplx_space_common_core::types::SandboxLifecycle::Paused,
+            pplx_space_sandbox_model::SandboxLifecycle::Started,
+            pplx_space_sandbox_model::SandboxLifecycle::Paused,
         );
 
         assert!(!should_join);
@@ -561,9 +606,9 @@ mod kubernetes_tests {
 
     /// The per-node slot index the reflector would build from `pods`.
     fn network_slots_for(pods: &[Arc<Pod>]) -> NodeNetworkSlots {
-        let (_, network_slots, _) =
+        let (_, indexes, _) =
             sandbox_pod_view::seeded_sandbox_pod_cache(pods.iter().map(|pod| (**pod).clone()));
-        network_slots
+        indexes.network_slots
     }
 
     #[test]
@@ -692,8 +737,8 @@ mod kubernetes_tests {
         let config = SandboxPodConfigValues::default();
         let mut blocked_labels = config.base_node_selector().into_labels();
         blocked_labels.insert(
-            pplx_space_common_core::kubernetes::SSD_PLACEMENT_BLOCKED_LABEL.to_string(),
-            pplx_space_common_core::kubernetes::SSD_PLACEMENT_BLOCKED_VALUE.to_string(),
+            pplx_space_sandbox_pod::SSD_PLACEMENT_BLOCKED_LABEL.to_string(),
+            pplx_space_sandbox_pod::SSD_PLACEMENT_BLOCKED_VALUE.to_string(),
         );
         let mut wrong_selector = config.base_node_selector().into_labels();
         wrong_selector.insert(
@@ -756,10 +801,10 @@ mod kubernetes_tests {
     ///
     /// Driven through `eligible_start_node_count` rather than the matcher
     /// directly: equality-on-every-entry is owned and tested one layer down,
-    /// in `common-core`'s `node_selector::tests`, so what this asserts is the
-    /// api-crate delta — that the count admission actually gates on carries
-    /// the extra labels through, and reports a confident zero rather than
-    /// counting a partially-labeled worker.
+    /// in `pplx-space-sandbox-pod`'s `node_selector::tests`, so what this
+    /// asserts is the api-crate delta — that the count admission actually
+    /// gates on carries the extra labels through, and reports a confident zero
+    /// rather than counting a partially-labeled worker.
     #[tokio::test(flavor = "current_thread")]
     async fn sandbox_start_candidate_selector_requires_extra_labels() {
         let capacity_class = "space.pplx.net/capacity-class";
@@ -1278,6 +1323,12 @@ mod kubernetes_tests {
                                 )
                             })?
                             .to_string();
+                        // The apiserver echoes the created labels, which pod tracking
+                        // reads the activating client from.
+                        let labels = request_pod
+                            .pointer("/metadata/labels")
+                            .cloned()
+                            .unwrap_or_default();
                         captured_pod_creates
                             .lock()
                             .expect("capture mutex poisoned")
@@ -1288,7 +1339,8 @@ mod kubernetes_tests {
                             "metadata": {
                                 "name": pod_name,
                                 "namespace": "space",
-                                "uid": format!("{pod_name}-uid")
+                                "uid": format!("{pod_name}-uid"),
+                                "labels": labels
                             },
                             "status": {
                                 "phase": "Pending"
@@ -1354,7 +1406,7 @@ mod kubernetes_tests {
             .and_then(serde_json::Value::as_object)
             .expect("created pod request should carry annotations");
         // Golden snapshots pin the rest of the restore-branch annotation set
-        // (`sandbox_pod_restore*.snap` in `pplx-space-common-core`), so it is
+        // (`sandbox_pod_restore*.snap` in `pplx-space-sandbox-pod`), so it is
         // not re-asserted here.
         assert_eq!(
             annotation_value(annotations, SANDBOX_CHECKPOINT_ANNOTATION),
@@ -1367,7 +1419,7 @@ mod kubernetes_tests {
         );
     }
 
-    fn conflict_then_created_kubernetes_client(
+    pub(crate) fn conflict_then_created_kubernetes_client(
         captured_pod_creates: Arc<Mutex<Vec<serde_json::Value>>>,
     ) -> Client {
         let create_attempts = Arc::new(Mutex::new(0usize));
@@ -1623,6 +1675,12 @@ mod kubernetes_tests {
                                 )
                             })?
                             .to_string();
+                        // The apiserver echoes the created labels, which pod tracking
+                        // reads the activating client from.
+                        let labels = request_pod
+                            .pointer("/metadata/labels")
+                            .cloned()
+                            .unwrap_or_default();
                         captured_pod_creates
                             .lock()
                             .expect("capture mutex poisoned")
@@ -1633,7 +1691,8 @@ mod kubernetes_tests {
                             "metadata": {
                                 "name": pod_name,
                                 "namespace": "space",
-                                "uid": format!("{pod_name}-uid")
+                                "uid": format!("{pod_name}-uid"),
+                                "labels": labels
                             },
                             "status": {
                                 "phase": "Running",
@@ -1925,7 +1984,7 @@ mod kubernetes_tests {
         nodes: Vec<Node>,
     ) -> KubernetesSubstrate {
         let (node_api_pod_store, mut node_api_pod_writer) = reflector::store::<Pod>();
-        let (pod_store, pod_network_slots, mut pod_writer) = sandbox_pod_view::sandbox_pod_cache();
+        let (pod_store, pod_indexes, mut pod_writer) = sandbox_pod_view::sandbox_pod_cache();
         if !pods.is_empty() {
             use kube::runtime::watcher::Event;
             node_api_pod_writer.apply_watcher_event(&Event::Init);
@@ -1951,7 +2010,7 @@ mod kubernetes_tests {
             sandbox_proxy_port,
             SandboxPodConfigValues::default(),
             caches,
-            (pod_store, pod_network_slots),
+            (pod_store, pod_indexes),
         )
     }
 
@@ -1962,6 +2021,7 @@ mod kubernetes_tests {
     async fn start_sim_worker() -> Result<SimWorkerHarness, BoxError> {
         Ok(SimWorkerHarness::builder("node-a")
             .with_internal_api()
+            .as_sandbox_pod()
             .start()
             .await?)
     }
@@ -1973,10 +2033,44 @@ mod kubernetes_tests {
         /// Every Wake received, in arrival order.
         pub(crate) received:
             Arc<std::sync::Mutex<Vec<pplx_space_sbx_mgr_client::proto::WakeRequest>>>,
+        /// When set, every Wake is answered with this status instead.
+        pub(crate) rejection: Arc<std::sync::Mutex<Option<tonic::Status>>>,
     }
 
     #[tonic::async_trait]
     impl WorkerApiInternal for SequencedWakeWorker {
+        async fn drain_node(
+            &self,
+            _request: tonic::Request<pplx_space_sbx_mgr_client::proto::DrainNodeRequest>,
+        ) -> Result<
+            tonic::Response<pplx_space_sbx_mgr_client::proto::DrainNodeResponse>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+
+        async fn preview_drain_node(
+            &self,
+            _request: tonic::Request<pplx_space_sbx_mgr_client::proto::PreviewDrainNodeRequest>,
+        ) -> Result<
+            tonic::Response<pplx_space_sbx_mgr_client::proto::PreviewDrainNodeResponse>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+
+        async fn abandon_runtime_upgrade(
+            &self,
+            _request: tonic::Request<
+                pplx_space_sbx_mgr_client::proto::AbandonRuntimeUpgradeRequest,
+            >,
+        ) -> Result<
+            tonic::Response<pplx_space_sbx_mgr_client::proto::AbandonRuntimeUpgradeResponse>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+
         async fn get_runtime_upgrade(
             &self,
             _request: tonic::Request<pplx_space_sbx_mgr_client::proto::GetRuntimeUpgradeRequest>,
@@ -2005,12 +2099,15 @@ mod kubernetes_tests {
             let request = request.into_inner();
             self.received.lock().unwrap().push(request.clone());
             let attempt = self.wake_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some(rejection) = self.rejection.lock().unwrap().clone() {
+                return Err(rejection);
+            }
             if self
                 .succeed_after_attempt
                 .is_none_or(|succeed_after| attempt < succeed_after)
             {
                 return Err(tonic::Status::failed_precondition(
-                    pplx_space_common_core::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER,
+                    pplx_space_rpc_contracts::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER,
                 ));
             }
             Ok(tonic::Response::new(
@@ -2043,6 +2140,7 @@ mod kubernetes_tests {
         pub(crate) port: u16,
         pub(crate) received:
             Arc<std::sync::Mutex<Vec<pplx_space_sbx_mgr_client::proto::WakeRequest>>>,
+        pub(crate) rejection: Arc<std::sync::Mutex<Option<tonic::Status>>>,
         health_reporter: tonic_health::server::HealthReporter,
         shutdown: CancellationToken,
         task: JoinHandle<()>,
@@ -2088,11 +2186,13 @@ mod kubernetes_tests {
         );
         let worker_service = SimWorkerApiService::new(sim_state);
         let received = Arc::default();
+        let rejection = Arc::default();
         let service = SequencedWakeWorker {
             wake_attempts,
             succeed_after_attempt,
             echo_route_identity,
             received: Arc::clone(&received),
+            rejection: Arc::clone(&rejection),
         };
         let (health_reporter, health_service) = pplx_space_grpc_server::grpc_health_service();
         health_reporter
@@ -2126,6 +2226,7 @@ mod kubernetes_tests {
         Ok(SequencedWakeWorkerHandle {
             port,
             received,
+            rejection,
             health_reporter,
             shutdown,
             task,
@@ -2655,6 +2756,48 @@ mod kubernetes_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn wake_rejecting_the_callers_credential_is_retryable() -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process() {
+            return Ok(());
+        }
+
+        // Arrange: node-api refuses this process's token, as it does once
+        // the API's Pod is deleted while the process still runs.
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let sandbox_id = SandboxId::new();
+        let (substrate, wake_attempts, _pod_gets, worker) =
+            paused_restore_test_subject(&db.pool, sandbox_id, Some(1), true).await?;
+        *worker.rejection.lock().unwrap() =
+            Some(tonic::Status::unauthenticated("token validation failed"));
+
+        // Act.
+        let result = substrate
+            .restore_evacuated_execution(
+                SandboxApiMetricIdentity::ecw("evacuation"),
+                sandbox_id,
+                ActivationOptions {
+                    blocking: true,
+                    ready_timeout: Duration::from_secs(2),
+                },
+                None,
+                SandboxLifecycle::Paused,
+            )
+            .await;
+
+        // Assert: a retryable answer, given at once, rather than a conflict
+        // that ends the operation.
+        let error = result.expect_err("a refused credential cannot wake the sandbox");
+        let status = crate::controllers::ControllerError::from(error).status();
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            wake_attempts.load(Ordering::SeqCst),
+            1,
+            "the credential will not validate again, so the wake must not be retried in place"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn split_operation_waits_for_transient_receipt_capability() -> Result<(), BoxError> {
         if !crate::test_support::enter_sim_worker_process() {
             return Ok(());
@@ -2964,7 +3107,7 @@ mod kubernetes_tests {
                     ready_timeout,
                 },
                 None,
-                pplx_space_common_core::types::SandboxLifecycle::Paused,
+                pplx_space_sandbox_model::SandboxLifecycle::Paused,
             ),
             async {
                 // The worker keeps reporting missing runtime context, so the
@@ -3109,6 +3252,7 @@ mod kubernetes_tests {
                 SandboxApiMetricIdentity::ecw("connect"),
                 SandboxAction::Wake,
                 None,
+                crate::controllers::substrate::ActivationClient::Native,
             )
             .await?;
 
@@ -3272,8 +3416,7 @@ mod kubernetes_tests {
                     &leader_sandbox,
                     SandboxApiMetricIdentity::ecw("connect"),
                     Duration::from_secs(3),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
-                    None,
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                 )
                 .await
         });
@@ -3290,8 +3433,7 @@ mod kubernetes_tests {
                     &follower_sandbox,
                     SandboxApiMetricIdentity::ecw("connect"),
                     Duration::from_secs(3),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
-                    None,
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                 )
                 .await
         });
@@ -3443,8 +3585,7 @@ mod kubernetes_tests {
                     &access_sandbox,
                     SandboxApiMetricIdentity::native("runtime_client"),
                     Duration::from_secs(5),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
-                    None,
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                 )
                 .await
         });
@@ -3773,7 +3914,7 @@ mod kubernetes_tests {
                     &sandbox,
                     budget,
                     SandboxApiMetricIdentity::ecw("connect"),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                 )
                 .await
         });
@@ -4010,8 +4151,7 @@ mod kubernetes_tests {
             StartedRecoveryClaim::ExistingExecution { generation } => generation,
             claim => panic!("expected the tracked execution recovery claim, got {claim:?}"),
         };
-        let activation_attempt_id =
-            pplx_space_common_core::types::SandboxActivationAttemptId::new();
+        let activation_attempt_id = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
         let event_capture = SandboxEventCapture::default();
         let subscriber = tracing_subscriber::registry().with(event_capture.clone());
         let event_guard = tracing::subscriber::set_default(subscriber);
@@ -4032,6 +4172,7 @@ mod kubernetes_tests {
                     Some(ActivationAttemptAssignment::new(
                         activation_attempt_id,
                         SandboxTransitionTargetState::Started,
+                        crate::controllers::substrate::KeyResolution::Unresolved,
                     )),
                 ),
             ),
@@ -4172,7 +4313,7 @@ mod kubernetes_tests {
             StartedRecoveryClaim::ExistingExecution { generation } => generation,
             claim => panic!("expected the expired recovery to be reclaimed, got {claim:?}"),
         };
-        let fallback_attempt_id = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+        let fallback_attempt_id = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
 
         // Act.
         fallback_substrate
@@ -4189,6 +4330,7 @@ mod kubernetes_tests {
                     Some(ActivationAttemptAssignment::new(
                         fallback_attempt_id,
                         SandboxTransitionTargetState::Started,
+                        crate::controllers::substrate::KeyResolution::Unresolved,
                     )),
                 ),
             )
@@ -4323,7 +4465,7 @@ mod kubernetes_tests {
                     &owner_sandbox,
                     Duration::from_secs(1),
                     SandboxApiMetricIdentity::ecw("connect"),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                 )
                 .await
         });
@@ -4505,7 +4647,7 @@ mod kubernetes_tests {
                 &stale_sandbox,
                 Duration::from_secs(5),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             )
             .await?;
 
@@ -4537,7 +4679,7 @@ mod kubernetes_tests {
                 &stale_sandbox,
                 Duration::from_secs(5),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             )
             .await?;
 
@@ -4571,7 +4713,7 @@ mod kubernetes_tests {
                 &stale_sandbox,
                 Duration::from_secs(5),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             )
             .await
             .expect_err("restore without a source must fail");
@@ -4609,8 +4751,8 @@ mod kubernetes_tests {
                     ready_timeout: Duration::from_secs(5),
                 },
                 RestoreIntent::user(
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
-                    WakeTarget::Explicit(pplx_space_common_core::types::SandboxLifecycle::Started),
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
+                    WakeTarget::Explicit(pplx_space_sandbox_model::SandboxLifecycle::Started),
                 ),
             )
             .await?;
@@ -4640,8 +4782,8 @@ mod kubernetes_tests {
                     ready_timeout: Duration::from_secs(5),
                 },
                 RestoreIntent::user(
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
-                    WakeTarget::Explicit(pplx_space_common_core::types::SandboxLifecycle::Started),
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
+                    WakeTarget::Explicit(pplx_space_sandbox_model::SandboxLifecycle::Started),
                 ),
             )
             .await
@@ -4696,7 +4838,7 @@ mod kubernetes_tests {
                         RestoreIntent::drain(None, target)
                     } else {
                         RestoreIntent::user(
-                            crate::controllers::substrate::RecoveryCharge::Exempt,
+                            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                             WakeTarget::Explicit(target),
                         )
                     },
@@ -4757,7 +4899,7 @@ mod kubernetes_tests {
                 &sandbox,
                 Duration::from_secs(5),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             )
             .await?;
         completer.await??;
@@ -4808,8 +4950,8 @@ mod kubernetes_tests {
                     ready_timeout: Duration::from_secs(5),
                 },
                 RestoreIntent::user(
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
-                    WakeTarget::Explicit(pplx_space_common_core::types::SandboxLifecycle::Started),
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
+                    WakeTarget::Explicit(pplx_space_sandbox_model::SandboxLifecycle::Started),
                 ),
             )
             .await?;
@@ -5086,7 +5228,7 @@ mod kubernetes_tests {
                         blocking: true,
                         ready_timeout: Duration::from_secs(1),
                     },
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                 )
                 .await
                 .expect_err("no worker Wake can be dispatched");
@@ -5172,7 +5314,7 @@ mod kubernetes_tests {
                     blocking: true,
                     ready_timeout: Duration::from_secs(5),
                 },
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             )
             .await?;
         completer.await??;
@@ -5211,7 +5353,7 @@ mod kubernetes_tests {
                 &sandbox,
                 Duration::from_millis(200),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             ),
         )
         .await
@@ -5276,7 +5418,7 @@ mod kubernetes_tests {
                 &stale_restoring,
                 Duration::from_secs(1),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             )
             .await
             .expect_err("wake must defer to suspend after refreshing its joined restore");
@@ -5329,7 +5471,7 @@ mod kubernetes_tests {
                 &sandbox,
                 Duration::from_millis(200),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             ),
         )
         .await
@@ -5389,7 +5531,7 @@ mod kubernetes_tests {
                     &sandbox,
                     Duration::from_secs(60),
                     SandboxApiMetricIdentity::native("wake"),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                 ),
             ),
         )
@@ -5467,7 +5609,7 @@ mod kubernetes_tests {
                     &first_sandbox,
                     Duration::from_secs(15),
                     SandboxApiMetricIdentity::ecw("connect"),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                 )
                 .await
         });
@@ -5479,7 +5621,7 @@ mod kubernetes_tests {
                     &second_sandbox,
                     Duration::from_millis(400),
                     SandboxApiMetricIdentity::ecw("connect"),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                 )
                 .await
         });
@@ -5560,7 +5702,7 @@ mod kubernetes_tests {
                 &sandbox,
                 Duration::from_secs(2),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             )
             .await?;
 
@@ -5605,7 +5747,7 @@ mod kubernetes_tests {
                 &sandbox,
                 Duration::from_secs(2),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             )
             .await?;
 
@@ -5616,6 +5758,219 @@ mod kubernetes_tests {
                 .fetch_one(&pool)
                 .await?;
         assert_eq!(lifecycle, "started");
+        Ok(())
+    }
+
+    /// With the restore dispatch fence on, a user restore fences its
+    /// execution when it claims it and clears the fence as it sends its Wake,
+    /// so a finished restore leaves nothing a re-drive could take over.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fenced_restore_clears_its_fence_as_it_sends_its_wake() -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process() {
+            return Ok(());
+        }
+        // Arrange.
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        seed_restoring_sandbox_with_active_lease(&pool, sandbox_id, Duration::from_millis(200))
+            .await?;
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("inserted sandbox must be visible");
+        let wake_attempts = Arc::new(AtomicUsize::new(0));
+        let worker = start_sequenced_wake_worker(Arc::clone(&wake_attempts), Some(1), true).await?;
+        let mut substrate = substrate_with_store_client_and_proxy_port(
+            pool.clone(),
+            running_pod_kubernetes_client(Arc::new(Mutex::new(Vec::new())), "127.0.0.1"),
+            worker.port,
+        );
+        substrate.store = substrate
+            .store
+            .clone()
+            .with_restore_dispatch_fence(RestoreDispatchFence::Enabled);
+
+        // Act.
+        let binding = substrate
+            .wake_execution_with_metric_identity(
+                &sandbox,
+                Duration::from_secs(2),
+                SandboxApiMetricIdentity::ecw("connect"),
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
+            )
+            .await?;
+
+        // Assert.
+        assert_eq!(binding.completion, ActivationCompletion::Owned);
+        let fenced: i64 = sqlx::query_scalar(sql!(
+            "SELECT COUNT(*) FROM sandbox_k8s_executions
+              WHERE sandbox_id = $1 AND restore_dispatch_fence_token IS NOT NULL"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(fenced, 0, "the Wake's dispatch clears the fence");
+        assert_eq!(wake_attempts.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// An owner that claimed its restore and execution and died before
+    /// creating the pod leaves a `creating` execution nothing will ever
+    /// materialize. Once its fence expires, a re-drive takes the restore over,
+    /// creates the pod under the same generation itself instead of waiting for
+    /// the dead owner, and finishes the restore.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_takeover_creates_the_pod_its_dead_owner_never_created() -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process() {
+            return Ok(());
+        }
+        // Arrange.
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        seed_restoring_sandbox_with_active_lease(&pool, sandbox_id, Duration::from_secs(5)).await?;
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("inserted sandbox must be visible");
+        let dead_owner: Uuid = sqlx::query_scalar(sql!(
+            "SELECT restore_lease_token FROM sandboxes WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&pool)
+        .await?;
+        let captured_pod_creates = Arc::new(Mutex::new(Vec::new()));
+        let wake_attempts = Arc::new(AtomicUsize::new(0));
+        let worker = start_sequenced_wake_worker(Arc::clone(&wake_attempts), Some(1), true).await?;
+        let mut substrate = substrate_with_store_client_and_proxy_port(
+            pool.clone(),
+            running_pod_kubernetes_client(Arc::clone(&captured_pod_creates), "127.0.0.1"),
+            worker.port,
+        );
+        substrate.store = substrate
+            .store
+            .clone()
+            .with_restore_dispatch_fence(RestoreDispatchFence::Enabled);
+        let claim = substrate
+            .store
+            .ensure_active_execution_claim_for_lifecycle(
+                sandbox_id,
+                SandboxLifecycle::Restoring,
+                Some(dead_owner),
+                Some((
+                    pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
+                    SandboxTransitionTargetState::Started,
+                )),
+            )
+            .await?;
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions
+                SET restore_dispatch_fence_expires_at = NOW() - INTERVAL '1 second'
+              WHERE sandbox_id = $1 AND active"
+        ))
+        .bind(sandbox_id)
+        .execute(&pool)
+        .await?;
+
+        // Act.
+        let binding = substrate
+            .wake_execution_with_metric_identity(
+                &sandbox,
+                Duration::from_secs(2),
+                SandboxApiMetricIdentity::ecw("connect"),
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
+            )
+            .await?;
+
+        // Assert.
+        assert_eq!(binding.completion, ActivationCompletion::Owned);
+        assert_eq!(
+            i64::try_from(binding.execution_generation)?,
+            claim.row.generation
+        );
+        assert_eq!(
+            captured_pod_creates
+                .lock()
+                .expect("capture mutex poisoned")
+                .len(),
+            1,
+            "the re-drive creates the dead owner's pod itself"
+        );
+        assert_eq!(wake_attempts.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// A restore a re-drive took over between the owner's execution claim and
+    /// its Wake sends no Wake: the owner confirms its lease token as it sends,
+    /// and finds another. The takeover is simulated by a trigger that changes
+    /// the row's token as soon as the owner fences its execution.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_restore_taken_over_before_its_wake_sends_none() -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process() {
+            return Ok(());
+        }
+        // Arrange.
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        seed_restoring_sandbox_with_active_lease(&pool, sandbox_id, Duration::from_millis(200))
+            .await?;
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("inserted sandbox must be visible");
+        sqlx::query(
+            "CREATE FUNCTION take_over_on_fence() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                 UPDATE sandboxes SET restore_lease_token = gen_random_uuid()
+                  WHERE id = NEW.sandbox_id;
+                 RETURN NEW;
+             END $$",
+        )
+        .execute(&pool)
+        .await?;
+        // A row trigger needs the table, which a schema variant may have
+        // renamed out from under a compatibility view.
+        let create_trigger = format!(
+            "CREATE TRIGGER take_over_on_fence
+                 AFTER UPDATE OF restore_dispatch_fence_token ON {}
+                 FOR EACH ROW WHEN (NEW.restore_dispatch_fence_token IS NOT NULL)
+                 EXECUTE FUNCTION take_over_on_fence()",
+            pplx_space_db_test_fixtures::physical_table("sandbox_k8s_executions")?
+        );
+        sqlx::query(sqlx::AssertSqlSafe(sql!(create_trigger.as_str())))
+            .execute(&pool)
+            .await?;
+        let wake_attempts = Arc::new(AtomicUsize::new(0));
+        let worker = start_sequenced_wake_worker(Arc::clone(&wake_attempts), Some(1), true).await?;
+        let mut substrate = substrate_with_store_client_and_proxy_port(
+            pool.clone(),
+            running_pod_kubernetes_client(Arc::new(Mutex::new(Vec::new())), "127.0.0.1"),
+            worker.port,
+        );
+        substrate.store = substrate
+            .store
+            .clone()
+            .with_restore_dispatch_fence(RestoreDispatchFence::Enabled);
+
+        // Act.
+        let result = substrate
+            .wake_execution_with_metric_identity(
+                &sandbox,
+                Duration::from_secs(2),
+                SandboxApiMetricIdentity::ecw("connect"),
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
+            )
+            .await;
+
+        // Assert.
+        assert!(
+            matches!(result, Err(SubstrateError::RestoreInFlight { .. })),
+            "a restore taken over before its Wake must answer retryably, got {result:?}"
+        );
+        assert_eq!(
+            wake_attempts.load(Ordering::SeqCst),
+            0,
+            "no Wake may reach the node for a restore another owner holds"
+        );
         Ok(())
     }
 
@@ -5647,7 +6002,7 @@ mod kubernetes_tests {
                 sandbox_id,
                 SandboxApiMetricIdentity::native("restoring_access"),
                 Duration::from_secs(5),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             )
             .await;
 
@@ -5727,7 +6082,7 @@ mod kubernetes_tests {
                 Some(1),
                 tokio::time::Instant::now() + Duration::from_millis(1_200),
                 SandboxApiMetricIdentity::native("restoring_access"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             )
             .await;
 
@@ -5872,7 +6227,7 @@ mod kubernetes_tests {
                 &sandbox,
                 Duration::from_secs(1),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             )
             .await
             .expect_err("injected Kubernetes Pod create failure must reach the caller");
@@ -5948,7 +6303,7 @@ mod kubernetes_tests {
                     &sandbox,
                     Duration::from_secs(5),
                     SandboxApiMetricIdentity::ecw("connect"),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                 )
                 .await
         });
@@ -6000,6 +6355,286 @@ mod kubernetes_tests {
         Ok(())
     }
 
+    /// Admits every charge and decides only the live cap, through a real cap.
+    struct LiveCapOnly(crate::client_live_cap::ClientLiveCap);
+
+    fn live_cap_rejection(
+        refusal: crate::client_live_cap::LiveCapRefusal,
+    ) -> crate::controllers::substrate::ActivationAdmissionRejection {
+        crate::controllers::substrate::ActivationAdmissionRejection::new(
+            refusal.message,
+            Some(refusal.retry_after),
+            crate::controllers::substrate::ActivationRejectionKind::LiveCap,
+        )
+    }
+
+    impl crate::controllers::substrate::ActivationAdmission for LiveCapOnly {
+        fn admit(
+            &self,
+            _class: crate::controllers::substrate::ActivationAdmissionClass,
+        ) -> crate::controllers::substrate::ActivationAdmissionFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn reserve_live(
+            &self,
+            client: pplx_space_accounts::ClientId,
+            sandbox: SandboxId,
+        ) -> crate::controllers::substrate::LiveCapFuture<'_> {
+            Box::pin(async move {
+                self.0
+                    .reserve(&client, sandbox)
+                    .await
+                    .map_err(live_cap_rejection)
+            })
+        }
+
+        fn precheck_live(
+            &self,
+            client: pplx_space_accounts::ClientId,
+            sandbox: SandboxId,
+        ) -> crate::controllers::substrate::ActivationAdmissionFuture<'_> {
+            Box::pin(async move {
+                self.0
+                    .precheck(&client, sandbox)
+                    .await
+                    .map_err(live_cap_rejection)
+            })
+        }
+
+        fn live_cap_configured(&self) -> bool {
+            true
+        }
+    }
+
+    /// The member TTL the disconnected-reservation tests give their cap.
+    /// Redis's clock decides expiry, so they wait out real time.
+    ///
+    /// The renewer ticks every third of a TTL from when it starts, after the
+    /// reservation lands, while the member's expiry already runs in Redis.
+    /// The member lapses only if no renewal reaches Redis within a full TTL
+    /// of the previous write, and the renewer's startup, scheduling and Redis
+    /// latency all come out of that TTL.
+    ///
+    /// The tests check two TTLs after the cancel. A renewal refuses a member
+    /// that has already lapsed, so a member renewed only once expires less
+    /// than two TTLs after its reservation, before the check: only repeated
+    /// renewal keeps it counted that long.
+    const DISCONNECTED_RESERVATION_TTL: Duration = Duration::from_millis(600);
+
+    /// A restore's live-cap reservation moves into its detached leader, so a
+    /// caller that disconnects while the pod is still being created doesn't
+    /// stop its renewal: past the member's TTL the restore still counts.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_disconnected_restore_keeps_its_live_cap_reservation() -> Result<(), BoxError> {
+        let Some((_node, redis_url)) = crate::client_concurrency::tests::try_redis_url().await?
+        else {
+            return Ok(());
+        };
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox_row(&pool, sandbox_id, "suspended").await?;
+        insert_ready_full_snapshot_relative_to_lifecycle(
+            &pool,
+            sandbox_id,
+            "s3://space-test/suspend-snapshots/disconnected-reservation?region=us-east-1",
+            0,
+            Uuid::now_v7(),
+        )
+        .await?;
+        let request_started = Arc::new(Semaphore::new(0));
+        let release_request = Arc::new(Semaphore::new(0));
+        let substrate = substrate_with_store_and_client(
+            pool.clone(),
+            blocking_failed_pod_create_kubernetes_client(
+                Arc::new(AtomicUsize::new(0)),
+                Arc::clone(&request_started),
+                Arc::clone(&release_request),
+            ),
+        );
+        let leader_tasks = substrate.task_tracker.clone();
+        let ttl = DISCONNECTED_RESERVATION_TTL;
+        let cap = crate::client_live_cap::ClientLiveCap::for_tests(
+            Substrate::from_kubernetes(KubernetesSubstrate::with_seeded_caches(
+                pool.clone(),
+                inert_kubernetes_client(),
+                1,
+                Vec::new(),
+            )),
+            &redis_url,
+            "alpha",
+            std::num::NonZeroU64::new(1).expect("nonzero"),
+            ttl,
+        );
+        let admission = Arc::new(LiveCapOnly(cap.clone()));
+        let alpha = pplx_space_accounts::ClientId::parse("alpha")?;
+        let charge = crate::controllers::substrate::RecoveryCharge::enforce(
+            Some(&admission),
+            crate::controllers::substrate::CapPolicy::ReserveAtClaim,
+            crate::controllers::substrate::ActivationAttribution::resolve(
+                crate::controllers::substrate::ActivationClient::Client(alpha.clone()),
+                None,
+            ),
+        );
+
+        let handler = tokio::spawn(async move {
+            substrate
+                .restore_execution_inner(
+                    SandboxApiMetricIdentity::ecw("resume"),
+                    sandbox_id,
+                    ActivationOptions {
+                        blocking: true,
+                        ready_timeout: Duration::from_secs(5),
+                    },
+                    super::super::restore_intent::RestoreIntent::user(
+                        charge,
+                        super::super::execution::WakeTarget::Explicit(SandboxLifecycle::Started),
+                    ),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), request_started.acquire())
+            .await
+            .expect("the restore must reach its pod create")?
+            .forget();
+        handler.abort();
+        assert!(
+            handler
+                .await
+                .expect_err("handler must be cancelled")
+                .is_cancelled()
+        );
+        tokio::time::sleep(ttl * 2).await;
+        cap.precheck(&alpha, SandboxId::new())
+            .await
+            .expect_err("the detached restore still holds its slot past the TTL");
+
+        release_request.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !leader_tasks.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached restore leader must finish");
+        Ok(())
+    }
+
+    /// A reservation a request took at entry rides in its charge, so a wake
+    /// that goes on in a detached task after the request disconnects (the
+    /// implicit wake's leader, or a coalesced run) keeps it renewed: past the
+    /// member's TTL the wake still counts.
+    #[rstest::rstest]
+    #[case::implicit_wake(Some(ExecutionActivityKind::Access))]
+    #[case::coalesced_wake(None)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_disconnected_wake_keeps_the_reservation_its_request_took(
+        #[case] activity: Option<ExecutionActivityKind>,
+    ) -> Result<(), BoxError> {
+        let Some((_node, redis_url)) = crate::client_concurrency::tests::try_redis_url().await?
+        else {
+            return Ok(());
+        };
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox_row(&pool, sandbox_id, "suspended").await?;
+        insert_ready_full_snapshot_relative_to_lifecycle(
+            &pool,
+            sandbox_id,
+            "s3://space-test/suspend-snapshots/disconnected-wake-reservation?region=us-east-1",
+            0,
+            Uuid::now_v7(),
+        )
+        .await?;
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("inserted sandbox must be visible");
+        let request_started = Arc::new(Semaphore::new(0));
+        let release_request = Arc::new(Semaphore::new(0));
+        let substrate = substrate_with_store_and_client(
+            pool.clone(),
+            blocking_failed_pod_create_kubernetes_client(
+                Arc::new(AtomicUsize::new(0)),
+                Arc::clone(&request_started),
+                Arc::clone(&release_request),
+            ),
+        );
+        let leader_tasks = substrate.task_tracker.clone();
+        let ttl = DISCONNECTED_RESERVATION_TTL;
+        let cap = crate::client_live_cap::ClientLiveCap::for_tests(
+            Substrate::from_kubernetes(KubernetesSubstrate::with_seeded_caches(
+                pool.clone(),
+                inert_kubernetes_client(),
+                1,
+                Vec::new(),
+            )),
+            &redis_url,
+            "alpha",
+            std::num::NonZeroU64::new(1).expect("nonzero"),
+            ttl,
+        );
+        let admission = Arc::new(LiveCapOnly(cap.clone()));
+        let alpha = pplx_space_accounts::ClientId::parse("alpha")?;
+        // As an entry site does: reserve, mark that the substrate call comes
+        // next, and hand the reservation to the charge.
+        let mut entry = cap
+            .reserve(&alpha, sandbox_id)
+            .await?
+            .expect("admitted under the cap");
+        entry.pod_may_exist();
+        let live = crate::client_live_cap::LiveHandoff::new(Some(entry));
+        let charge = crate::controllers::substrate::RecoveryCharge::enforce(
+            Some(&admission),
+            crate::controllers::substrate::CapPolicy::Reserved,
+            crate::controllers::substrate::ActivationAttribution::resolve(
+                crate::controllers::substrate::ActivationClient::Client(alpha.clone()),
+                None,
+            ),
+        )
+        .with_live(&live);
+
+        let handler = tokio::spawn(async move {
+            // The request's own handle goes with it when it's cancelled.
+            let _live = live;
+            substrate
+                .wake_execution_with_metric_identity_and_activity(
+                    &sandbox,
+                    Duration::from_secs(5),
+                    SandboxApiMetricIdentity::ecw("connect"),
+                    charge,
+                    activity,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), request_started.acquire())
+            .await
+            .expect("the wake must reach its pod create")?
+            .forget();
+        handler.abort();
+        assert!(
+            handler
+                .await
+                .expect_err("handler must be cancelled")
+                .is_cancelled()
+        );
+        tokio::time::sleep(ttl * 2).await;
+        cap.precheck(&alpha, SandboxId::new())
+            .await
+            .expect_err("the detached wake still holds its slot past the TTL");
+
+        release_request.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !leader_tasks.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the detached wake must finish");
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn joined_restore_does_not_resurrect_concurrent_delete() -> Result<(), BoxError> {
         // Arrange: the caller holds a stale restoring snapshot after the owner
@@ -6038,6 +6673,7 @@ mod kubernetes_tests {
                     SandboxApiMetricIdentity::ecw("restore"),
                     SandboxAction::Restore,
                     None,
+                    crate::controllers::substrate::ActivationClient::Native,
                 )
                 .await
         });
@@ -6144,7 +6780,7 @@ mod kubernetes_tests {
                         &sandbox,
                         Duration::from_secs(2),
                         SandboxApiMetricIdentity::ecw("connect"),
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                     )
                     .await
             }));
@@ -6255,6 +6891,7 @@ mod kubernetes_tests {
                     SandboxApiMetricIdentity::ecw("restore"),
                     SandboxAction::Restore,
                     None,
+                    crate::controllers::substrate::ActivationClient::Native,
                 )
                 .await
         });
@@ -6353,10 +6990,9 @@ mod kubernetes_tests {
                 crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
             ),
             crate::cluster_admission::ClusterSandboxAdmissionConfig {
-                enabled: true,
                 refill_rps: 1.0,
                 burst: 1.0,
-                redis_url: None,
+                ..crate::test_support::enabled_config()
             },
             pplx_space_feature_flags::FeatureFlagClient::disabled(),
         )
@@ -6394,6 +7030,7 @@ mod kubernetes_tests {
                 SandboxApiMetricIdentity::native("start"),
                 SandboxAction::Start,
                 None,
+                crate::controllers::substrate::ActivationClient::Native,
             )
             .await
             .expect_err("the refreshed cold start must pay admission");
@@ -6437,6 +7074,7 @@ mod kubernetes_tests {
                 SandboxApiMetricIdentity::native("start"),
                 SandboxAction::Start,
                 None,
+                crate::controllers::substrate::ActivationClient::Native,
             )
             .await
             .expect_err("a restore takeover must pay admission");
@@ -6497,6 +7135,7 @@ mod kubernetes_tests {
                 SandboxApiMetricIdentity::ecw("connect"),
                 SandboxAction::Wake,
                 None,
+                crate::controllers::substrate::ActivationClient::Native,
             )
             .await?;
         completer.await??;
@@ -6563,6 +7202,7 @@ mod kubernetes_tests {
                 SandboxApiMetricIdentity::ecw("connect"),
                 SandboxAction::Wake,
                 None,
+                crate::controllers::substrate::ActivationClient::Native,
             )
             .await
             .expect_err("a rejected takeover charge must fail the wake");
@@ -6627,6 +7267,7 @@ mod kubernetes_tests {
                 SandboxApiMetricIdentity::ecw("connect"),
                 SandboxAction::Restore,
                 None,
+                crate::controllers::substrate::ActivationClient::Native,
             )
             .await
             .expect_err("a rejected fresh-claim charge must fail the restore");
@@ -6699,8 +7340,7 @@ mod kubernetes_tests {
                     &first_sandbox,
                     SandboxApiMetricIdentity::ecw("spaced"),
                     Duration::from_secs(1),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
-                    None,
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                 )
                 .await
         });
@@ -6722,8 +7362,7 @@ mod kubernetes_tests {
                     &second_sandbox,
                     SandboxApiMetricIdentity::ecw("spaced"),
                     Duration::from_secs(1),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
-                    None,
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                 )
                 .await
         });
@@ -6791,7 +7430,7 @@ mod kubernetes_tests {
                 &sandbox,
                 ExecutionActivityKind::Access,
                 Duration::from_secs(2),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             )
             .await;
         let state: String = sqlx::query_scalar(
@@ -6865,7 +7504,7 @@ mod kubernetes_tests {
                     &first_sandbox,
                     Duration::from_secs(1),
                     SandboxApiMetricIdentity::ecw("connect"),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                 )
                 .await
         });
@@ -6881,7 +7520,7 @@ mod kubernetes_tests {
                     &second_sandbox,
                     Duration::from_secs(1),
                     SandboxApiMetricIdentity::ecw("connect"),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                 )
                 .await
         });
@@ -6945,7 +7584,7 @@ mod kubernetes_tests {
                 &sandbox,
                 Duration::from_secs(1),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             )
             .await
             .expect_err("an unobservable pod create must remain retryable");
@@ -7026,7 +7665,7 @@ mod kubernetes_tests {
                     &follower_sandbox,
                     Duration::from_secs(8),
                     SandboxApiMetricIdentity::ecw("connect"),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                 )
                 .await
         });
@@ -7080,7 +7719,7 @@ mod kubernetes_tests {
                 &sandbox,
                 Duration::from_secs(1),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             ),
         )
         .await?
@@ -7137,7 +7776,7 @@ mod kubernetes_tests {
                 &sandbox,
                 Duration::from_secs(5),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             ),
         )
         .await?
@@ -7364,7 +8003,7 @@ mod kubernetes_tests {
             active_execution_generation: None,
             active_pod_uid: None,
             active_activation_attempt_id: None,
-            ecw_credential_epoch: pplx_space_common_core::types::EcwCredentialEpoch::new(1)
+            ecw_credential_epoch: pplx_space_sandbox_model::EcwCredentialEpoch::new(1)
                 .expect("credential epoch is valid"),
             target_node_id: None,
             placement_changed_at: None,
@@ -7379,10 +8018,10 @@ mod kubernetes_tests {
             env: sqlx::types::Json(BTreeMap::new()),
             metadata: sqlx::types::Json(BTreeMap::new()),
             auto_lifecycle: sqlx::types::Json(
-                pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+                pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
             ),
             auto_lifecycle_state: sqlx::types::Json(
-                pplx_space_common_core::types::AutoLifecycleRuntimeState::default(),
+                pplx_space_auto_lifecycle::AutoLifecycleRuntimeState::default(),
             ),
             network_policy: Some(sqlx::types::Json(
                 pplx_space_net_common::NetworkPolicyV1::default(),
@@ -7399,6 +8038,7 @@ mod kubernetes_tests {
             last_command_at: None,
             created_at: time::OffsetDateTime::UNIX_EPOCH,
             updated_at: time::OffsetDateTime::UNIX_EPOCH,
+            activating_client_id: None,
         }
     }
 
@@ -7447,6 +8087,7 @@ mod kubernetes_tests {
                     network_policy_json: "{}",
                     node_group_placement: None,
                     environment: None,
+                    client_id: None,
                 },
                 PodCreateContext::OnDemand,
             );
@@ -7456,7 +8097,7 @@ mod kubernetes_tests {
                     .annotations
                     .as_ref()
                     .unwrap()
-                    .get(pplx_space_common_core::kubernetes::SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION)
+                    .get(pplx_space_sandbox_pod::SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION)
                     .map(String::as_str),
                 Some(seeded_generation),
                 "{label}"
@@ -7550,14 +8191,17 @@ mod kubernetes_tests {
                     network_policy_json,
                     node_group_placement: Some(&placement),
                     environment: None,
+                    client_id: None,
                 },
                 context,
             );
             let pod = build_sandbox_pod(&sandbox_pod_config(&substrate.k8s), request);
             assert_eq!(
-                pod.metadata.annotations.as_ref().unwrap().get(
-                    pplx_space_common_core::kubernetes::SANDBOX_ACTIVATION_ATTEMPT_ID_ANNOTATION
-                ),
+                pod.metadata
+                    .annotations
+                    .as_ref()
+                    .unwrap()
+                    .get(pplx_space_sandbox_pod::SANDBOX_ACTIVATION_ATTEMPT_ID_ANNOTATION),
                 Some(&route.to_string()),
                 "{label}: shim bootstrap must install the published route, not the operation lease"
             );
@@ -7683,6 +8327,7 @@ mod kubernetes_tests {
                         Some(ActivationAttemptAssignment::new(
                             SandboxActivationAttemptId::new(),
                             SandboxTransitionTargetState::Started,
+                            crate::controllers::substrate::KeyResolution::Unresolved,
                         )),
                     ),
                 )
@@ -7775,6 +8420,364 @@ mod kubernetes_tests {
         .await?;
         assert_eq!(state.as_deref(), Some("recovering"));
 
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn node_reported_pod_ip_holds_until_kubelet_publishes_one() -> Result<(), BoxError> {
+        // A create bound the IP its node reported; kubelet publishes
+        // `status.podIP` later, and may publish a different one.
+        for (published_ip, expected_ip) in [(None, "10.0.0.7"), (Some("10.0.0.9"), "10.0.0.9")] {
+            let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+            let pool = db.pool.clone();
+            let sandbox_id = SandboxId::new();
+            let pod_name = "space-sbx-node-bound-g1";
+            insert_test_sandbox_row(&pool, sandbox_id, "started").await?;
+            sqlx::query(sql!(
+                "INSERT INTO sandbox_k8s_executions
+                     (sandbox_id, generation, pod_name, pod_namespace, pod_uid,
+                      pod_ip, state, active)
+                 VALUES ($1, 1, $2, 'space', 'node-bound-uid',
+                         '10.0.0.7', 'running', TRUE)",
+            ))
+            .bind(sandbox_id)
+            .bind(pod_name)
+            .execute(&pool)
+            .await?;
+            let mut status = serde_json::json!({ "phase": "Running" });
+            if let Some(ip) = published_ip {
+                status["podIP"] = ip.into();
+            }
+            let pod: Pod = serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": { "name": pod_name, "namespace": "space", "uid": "node-bound-uid" },
+                "status": status
+            }))?;
+            let substrate = substrate_with_store_client_proxy_port_pod_and_nodes(
+                pool.clone(),
+                replace_existing_pod_kubernetes_client(
+                    pod.clone(),
+                    Arc::new(Mutex::new(Vec::new())),
+                    Arc::new(AtomicUsize::new(0)),
+                ),
+                DEFAULT_SANDBOX_PROXY_PORT,
+                Some(pod),
+                Vec::new(),
+            );
+            let expected = Some(PodIp::parse(expected_ip)?);
+
+            assert_eq!(substrate.resolve_pod_ip(sandbox_id).await?, expected);
+            // No worker answers at the node-reported address to confirm it.
+            assert_eq!(
+                substrate.resolve_reachable_pod_ip(sandbox_id).await?,
+                published_ip.and(expected)
+            );
+            // A hydration write that observed no published IP keeps the bound one.
+            substrate
+                .store
+                .persist_pod_metadata(sandbox_id, 1, Some("node-bound-uid"), published_ip, None)
+                .await?;
+            let row: (String, Option<String>) = sqlx::query_as(sql!(
+                "SELECT state, host(pod_ip)
+                   FROM sandbox_k8s_executions
+                  WHERE sandbox_id = $1 AND active",
+            ))
+            .bind(sandbox_id)
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(row, ("running".to_owned(), Some(expected_ip.to_owned())));
+            // A confirmation for a replaced pod, or committing late with
+            // another address, is not recorded.
+            for (pod_uid, pod_ip) in [("replaced-uid", "10.0.0.6"), ("node-bound-uid", "10.0.0.8")]
+            {
+                assert!(
+                    !substrate
+                        .store
+                        .record_confirmed_pod_ip(sandbox_id, 1, pod_uid, PodIp::parse(pod_ip)?)
+                        .await?
+                );
+            }
+            assert_eq!(substrate.resolve_pod_ip(sandbox_id).await?, expected);
+            // An older API replica's hydration keeps no node address: the row
+            // returns to `created` without it, and the pod resolves only once
+            // kubelet publishes, or a readiness wait confirms it again.
+            sqlx::query(sql!(
+                "UPDATE sandbox_k8s_executions
+                    SET pod_ip = $2::INET,
+                        state = CASE WHEN $2::INET IS NULL THEN 'created' ELSE 'running' END
+                  WHERE sandbox_id = $1 AND active",
+            ))
+            .bind(sandbox_id)
+            .bind(published_ip)
+            .execute(&pool)
+            .await?;
+            let published = published_ip.map(PodIp::parse).transpose()?;
+            assert_eq!(
+                substrate.resolve_reachable_pod_ip(sandbox_id).await?,
+                published
+            );
+            if published.is_none() {
+                assert!(
+                    substrate
+                        .store
+                        .record_confirmed_pod_ip(
+                            sandbox_id,
+                            1,
+                            "node-bound-uid",
+                            PodIp::parse(expected_ip)?
+                        )
+                        .await?
+                );
+                assert_eq!(substrate.resolve_pod_ip(sandbox_id).await?, expected);
+            }
+        }
+        Ok(())
+    }
+
+    /// Before kubelet publishes a pod's IP, the one its node reported serves:
+    /// a create that outlives its budget is preserved on its node while that
+    /// node affirms the execution at the address, and a request resolves the
+    /// pod from the cache, without a pod GET. A proxy that merely accepts, or
+    /// a node serving another pod there, does not preserve it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn node_reported_pod_ip_serves_from_the_cache_before_kubelet_publishes()
+    -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process() {
+            return Ok(());
+        }
+        for served_pod_uid in [Some("node-preserved-uid"), Some("other-uid"), None] {
+            let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+            let pool = db.pool.clone();
+            let sandbox_id = SandboxId::new();
+            let (pod_name, node_name) = ("space-sbx-node-preserved-g1", "node-preserved");
+            insert_test_sandbox_row(&pool, sandbox_id, "started").await?;
+            sqlx::query(sql!(
+                "INSERT INTO sandbox_k8s_executions
+                     (sandbox_id, generation, pod_name, pod_namespace, pod_uid,
+                      pod_ip, k8s_node_name, state, active)
+                 VALUES ($1, 1, $2, 'space', 'node-preserved-uid', '127.0.0.1', $3,
+                         'running', TRUE)",
+            ))
+            .bind(sandbox_id)
+            .bind(pod_name)
+            .bind(node_name)
+            .execute(&pool)
+            .await?;
+            let worker = start_sim_worker().await?;
+            if let Some(pod_uid) = served_pod_uid {
+                let mut record = pplx_space_node_api_sim::SandboxRecord::new_creating(
+                    sandbox_id.to_string(),
+                    "seed".into(),
+                    "fc".into(),
+                    "test".into(),
+                    None,
+                    false,
+                )
+                .with_allocation(1, pod_uid, "127.0.0.1");
+                record.status = "running".into();
+                worker.state().insert_new(record).await?;
+            }
+            let pod: Pod = serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": { "name": pod_name, "namespace": "space", "uid": "node-preserved-uid" },
+                "spec": { "nodeName": node_name, "containers": [] },
+                "status": { "phase": "Running" }
+            }))?;
+            let kube_requests: KubeRequestLog = Arc::new(Mutex::new(Vec::new()));
+            let substrate = substrate_with_store_client_proxy_port_pod_and_nodes(
+                pool,
+                logged_kubernetes_client(
+                    replace_existing_pod_kubernetes_client(
+                        pod.clone(),
+                        Arc::new(Mutex::new(Vec::new())),
+                        Arc::new(AtomicUsize::new(0)),
+                    ),
+                    Arc::clone(&kube_requests),
+                ),
+                worker.port(),
+                Some(pod),
+                vec![k8s_node_with_internal_ip(node_name, "10.0.0.60")],
+            );
+
+            let serves = served_pod_uid == Some("node-preserved-uid");
+            assert_eq!(
+                substrate
+                    .preservable_create_node(sandbox_id, pod_name)
+                    .await
+                    .is_some(),
+                serves,
+                "{served_pod_uid:?}"
+            );
+            kube_requests.lock().unwrap().clear();
+            assert_eq!(
+                substrate.resolve_reachable_pod_ip(sandbox_id).await?,
+                serves.then(|| PodIp::parse("127.0.0.1")).transpose()?
+            );
+            assert_eq!(*kube_requests.lock().unwrap(), Vec::new());
+        }
+        Ok(())
+    }
+
+    /// A readiness wait binds only the pod it targets: a same-name pod with
+    /// another UID never supplies the address, so the returned address and
+    /// the binding name the same pod.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pod_proxy_wait_binds_the_address_of_its_target_pod() -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process() {
+            return Ok(());
+        }
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        let pod_name = "space-sbx-replaced-g1";
+        insert_test_sandbox_row(&pool, sandbox_id, "started").await?;
+        sqlx::query(sql!(
+            "INSERT INTO sandbox_k8s_executions
+                 (sandbox_id, generation, pod_name, pod_namespace, pod_uid,
+                  pod_ip, state, active)
+             VALUES ($1, 1, $2, 'space', 'replacement-uid', '127.0.0.1',
+                     'running', TRUE)",
+        ))
+        .bind(sandbox_id)
+        .bind(pod_name)
+        .execute(&pool)
+        .await?;
+        let worker = start_sim_worker().await?;
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": pod_name, "namespace": "space", "uid": "replacement-uid" },
+            "status": { "phase": "Running", "podIP": "127.0.0.1" }
+        }))?;
+        let mut substrate = substrate_with_store_client_proxy_port_pod_and_nodes(
+            pool,
+            replace_existing_pod_kubernetes_client(
+                pod.clone(),
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+            worker.port(),
+            Some(pod),
+            Vec::new(),
+        );
+        async fn wait(
+            substrate: &KubernetesSubstrate,
+            sandbox_id: SandboxId,
+            pod_uid: &str,
+        ) -> Result<(PodIp, ExecutionBinding), SubstrateError> {
+            substrate
+                .wait_for_pod_proxy_reachable(
+                    SandboxApiMetricIdentity::ecw("create"),
+                    sandbox_id,
+                    super::wait_ready::PodProxyWaitTarget {
+                        pod_name: "space-sbx-replaced-g1",
+                        pod_uid: Some(pod_uid),
+                        generation: 1,
+                    },
+                    "create",
+                    Instant::now() + Duration::from_millis(500),
+                )
+                .await
+        }
+
+        let (pod_ip, binding) = wait(&substrate, sandbox_id, "replacement-uid").await?;
+        assert_eq!(pod_ip, PodIp::parse("127.0.0.1")?);
+        assert_eq!(binding.execution_object_id, "replacement-uid");
+        assert!(matches!(
+            wait(&substrate, sandbox_id, "first-uid").await,
+            Err(SubstrateError::Timeout {
+                phase: Some(WaitReadyTimeoutPhase::PodNeverReady),
+                ..
+            })
+        ));
+
+        // A node that does not run the sandbox at that address is not bound.
+        let other_node = SimWorkerHarness::builder("node-b").start().await?;
+        substrate.k8s.sandbox_proxy_port = other_node.port();
+        assert!(matches!(
+            wait(&substrate, sandbox_id, "replacement-uid").await,
+            Err(SubstrateError::Timeout {
+                phase: Some(WaitReadyTimeoutPhase::ProxyUnreachable),
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    /// A node-reported address binds only once its node affirms the
+    /// execution there. A node that serves the sandbox without reporting its
+    /// generation, Pod UID and address leaves the wait to kubelet's
+    /// published IP, which binds as without a node report.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unconfirmed_node_address_waits_for_kubelet() -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process() {
+            return Ok(());
+        }
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        let pod_name = "space-sbx-unconfirmed-g1";
+        insert_test_sandbox_row(&pool, sandbox_id, "started").await?;
+        sqlx::query(sql!(
+            "INSERT INTO sandbox_k8s_executions
+                 (sandbox_id, generation, pod_name, pod_namespace, pod_uid,
+                  pod_ip, state, active)
+             VALUES ($1, 1, $2, 'space', 'unconfirmed-uid', '127.0.0.1',
+                     'running', TRUE)",
+        ))
+        .bind(sandbox_id)
+        .bind(pod_name)
+        .execute(&pool)
+        .await?;
+        let worker = start_sim_worker().await?;
+        for published_ip in [None, Some("127.0.0.1")] {
+            let mut status = serde_json::json!({ "phase": "Running" });
+            if let Some(ip) = published_ip {
+                status["podIP"] = ip.into();
+            }
+            let pod: Pod = serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": { "name": pod_name, "namespace": "space", "uid": "unconfirmed-uid" },
+                "status": status
+            }))?;
+            let substrate = substrate_with_store_client_proxy_port_pod_and_nodes(
+                pool.clone(),
+                replace_existing_pod_kubernetes_client(
+                    pod.clone(),
+                    Arc::new(Mutex::new(Vec::new())),
+                    Arc::new(AtomicUsize::new(0)),
+                ),
+                worker.port(),
+                Some(pod),
+                Vec::new(),
+            );
+            let waited = substrate
+                .wait_for_pod_proxy_reachable(
+                    SandboxApiMetricIdentity::ecw("create"),
+                    sandbox_id,
+                    super::wait_ready::PodProxyWaitTarget {
+                        pod_name,
+                        pod_uid: Some("unconfirmed-uid"),
+                        generation: 1,
+                    },
+                    "create",
+                    Instant::now() + Duration::from_millis(500),
+                )
+                .await;
+            match published_ip {
+                None => assert!(matches!(
+                    waited,
+                    Err(SubstrateError::Timeout {
+                        phase: Some(WaitReadyTimeoutPhase::ProxyUnreachable),
+                        ..
+                    })
+                )),
+                Some(ip) => assert_eq!(waited?.0, PodIp::parse(ip)?),
+            }
+        }
         Ok(())
     }
 
@@ -8109,7 +9112,7 @@ mod kubernetes_tests {
             let error = substrate
                 .runtime_client(
                     sandbox_id,
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                 )
                 .await
                 .expect_err("unverified prior state must fail closed");
@@ -8297,6 +9300,7 @@ mod kubernetes_tests {
         let assignment = ActivationAttemptAssignment::new(
             SandboxActivationAttemptId::new(),
             SandboxTransitionTargetState::Started,
+            crate::controllers::substrate::KeyResolution::Unresolved,
         );
 
         // Act.
@@ -8461,6 +9465,7 @@ mod kubernetes_tests {
                     Some(ActivationAttemptAssignment::new(
                         SandboxActivationAttemptId::new(),
                         SandboxTransitionTargetState::Started,
+                        crate::controllers::substrate::KeyResolution::Unresolved,
                     )),
                 ),
             )
@@ -8971,7 +9976,7 @@ mod kubernetes_tests {
                 "namespace": "space",
                 "uid": "lingering-pod-uid",
                 "annotations": {
-                    pplx_space_common_core::kubernetes::SANDBOX_ID_ANNOTATION: sandbox_id.to_string(),
+                    pplx_space_sandbox_pod::SANDBOX_ID_ANNOTATION: sandbox_id.to_string(),
                     SANDBOX_EXECUTION_GENERATION_ANNOTATION: "1"
                 }
             },
@@ -9073,7 +10078,7 @@ mod kubernetes_tests {
                          SELECT 1 FROM pg_stat_activity
                          WHERE datname = current_database()
                            AND wait_event_type = 'Lock'
-                           AND query LIKE '%SELECT lifecycle FROM sandboxes%FOR UPDATE%'
+                           AND query LIKE '%SELECT s.lifecycle, n.drain_engine%FOR UPDATE OF s%'
                      )"
                 ))
                 .fetch_one(&pool)
@@ -9105,9 +10110,8 @@ mod kubernetes_tests {
         let encoded = pods[0]["metadata"]["annotations"]["space.pplx.net/auto-lifecycle"]
             .as_str()
             .expect("materialized pod must carry the auto-lifecycle policy");
-        let actual: pplx_space_common_core::types::AutoLifecyclePolicy =
-            serde_json::from_str(encoded)?;
-        let expected: pplx_space_common_core::types::AutoLifecyclePolicy =
+        let actual: pplx_space_auto_lifecycle::AutoLifecyclePolicy = serde_json::from_str(encoded)?;
+        let expected: pplx_space_auto_lifecycle::AutoLifecyclePolicy =
             serde_json::from_value(expected_policy)?;
         assert_eq!(
             actual, expected,
@@ -9140,7 +10144,7 @@ mod kubernetes_tests {
             .claim_active_execution_pod_materialization(
                 sandbox_id,
                 claim.row.generation,
-                pplx_space_common_core::types::SandboxLifecycle::Restoring,
+                pplx_space_sandbox_model::SandboxLifecycle::Restoring,
             )
             .await;
 
@@ -9379,7 +10383,7 @@ mod kubernetes_tests {
                 &sandbox,
                 Duration::from_secs(1),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             )
             .await
             .expect_err("unconfirmed Pod deletion must keep recovery retryable");
@@ -9434,7 +10438,11 @@ mod kubernetes_tests {
     ) -> KubernetesSubstrate {
         let substrate = substrate_with_node_cache_and_config(nodes, true, sandbox_pod_config);
         KubernetesSubstrate {
-            store: K8sStore::new(pool.clone(), "space".to_string()),
+            store: K8sStore::new(
+                pool.clone(),
+                "space".to_string(),
+                crate::controllers::substrate::ActivationClientAttribution::Enabled,
+            ),
             node_group_placement: NodeGroupPlacementResolver::new(pool, true),
             ..substrate
         }
@@ -9454,7 +10462,7 @@ mod kubernetes_tests {
         node_writer.apply_watcher_event(&Event::InitDone);
 
         let (node_api_pod_store, _) = reflector::store::<Pod>();
-        let (pod_store, pod_network_slots, _) = sandbox_pod_view::sandbox_pod_cache();
+        let (pod_store, pod_indexes, _) = sandbox_pod_view::sandbox_pod_cache();
         let caches = Arc::new(K8sCaches::for_test(
             node_api_pod_store,
             node_store,
@@ -9471,7 +10479,7 @@ mod kubernetes_tests {
             DEFAULT_SANDBOX_PROXY_PORT,
             sandbox_pod_config,
             caches,
-            (pod_store, pod_network_slots),
+            (pod_store, pod_indexes),
         )
     }
 
@@ -9485,11 +10493,11 @@ mod kubernetes_tests {
         let mut labels = config.base_node_selector().into_labels();
         if let Some(ready) = services_ready {
             labels.insert(
-                pplx_space_common_core::kubernetes::NODE_SERVICES_READY_LABEL.to_string(),
+                pplx_space_sandbox_pod::NODE_SERVICES_READY_LABEL.to_string(),
                 if ready {
-                    pplx_space_common_core::kubernetes::NODE_SERVICES_READY_VALUE
+                    pplx_space_sandbox_pod::NODE_SERVICES_READY_VALUE
                 } else {
-                    pplx_space_common_core::kubernetes::NODE_SERVICES_NOT_READY_VALUE
+                    pplx_space_sandbox_pod::NODE_SERVICES_NOT_READY_VALUE
                 }
                 .to_string(),
             );
@@ -9788,11 +10796,11 @@ mod kubernetes_tests {
         }
         if let Some(ready) = services_ready {
             labels.insert(
-                pplx_space_common_core::kubernetes::NODE_SERVICES_READY_LABEL.to_string(),
+                pplx_space_sandbox_pod::NODE_SERVICES_READY_LABEL.to_string(),
                 if ready {
-                    pplx_space_common_core::kubernetes::NODE_SERVICES_READY_VALUE
+                    pplx_space_sandbox_pod::NODE_SERVICES_READY_VALUE
                 } else {
-                    pplx_space_common_core::kubernetes::NODE_SERVICES_NOT_READY_VALUE
+                    pplx_space_sandbox_pod::NODE_SERVICES_NOT_READY_VALUE
                 }
                 .to_string(),
             );
@@ -9894,8 +10902,8 @@ mod kubernetes_tests {
         // spare capacity the scheduler can't actually use.
         let mut blocked_labels = config.base_node_selector().into_labels();
         blocked_labels.insert(
-            pplx_space_common_core::kubernetes::SSD_PLACEMENT_BLOCKED_LABEL.to_string(),
-            pplx_space_common_core::kubernetes::SSD_PLACEMENT_BLOCKED_VALUE.to_string(),
+            pplx_space_sandbox_pod::SSD_PLACEMENT_BLOCKED_LABEL.to_string(),
+            pplx_space_sandbox_pod::SSD_PLACEMENT_BLOCKED_VALUE.to_string(),
         );
         let blocked =
             node_with_network_slots("blocked", blocked_labels, Some(8), None, true, false);
@@ -9951,12 +10959,7 @@ mod kubernetes_tests {
                 Substrate::from_direct(
                     crate::controllers::substrate::direct::DirectSubstrate::new(pool),
                 ),
-                crate::cluster_admission::ClusterSandboxAdmissionConfig {
-                    enabled: true,
-                    refill_rps: 6.0,
-                    burst: 60.0,
-                    redis_url: None,
-                },
+                crate::test_support::enabled_config(),
                 pplx_space_feature_flags::FeatureFlagClient::disabled(),
             ),
         );
@@ -9967,8 +10970,7 @@ mod kubernetes_tests {
                 &sandbox,
                 SandboxApiMetricIdentity::native("runtime_client"),
                 Duration::from_secs(1),
-                crate::controllers::substrate::RecoveryCharge::enforce(Some(&admission)),
-                None,
+                crate::controllers::substrate::RecoveryCharge::enforce_for_tests(Some(&admission)),
             )
             .await
             .expect_err("a follower must wait for the active recovery owner");
@@ -10015,12 +11017,7 @@ mod kubernetes_tests {
                 Substrate::from_direct(
                     crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
                 ),
-                crate::cluster_admission::ClusterSandboxAdmissionConfig {
-                    enabled: true,
-                    refill_rps: 6.0,
-                    burst: 60.0,
-                    redis_url: None,
-                },
+                crate::test_support::enabled_config(),
                 pplx_space_feature_flags::FeatureFlagClient::disabled(),
             ),
         );
@@ -10031,8 +11028,7 @@ mod kubernetes_tests {
                 &sandbox,
                 SandboxApiMetricIdentity::native("runtime_client"),
                 Duration::from_secs(1),
-                crate::controllers::substrate::RecoveryCharge::enforce(Some(&admission)),
-                None,
+                crate::controllers::substrate::RecoveryCharge::enforce_for_tests(Some(&admission)),
             )
             .await
             .expect_err("access must join suspend finalization before activation admission");
@@ -10093,12 +11089,7 @@ mod kubernetes_tests {
                 Substrate::from_direct(
                     crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
                 ),
-                crate::cluster_admission::ClusterSandboxAdmissionConfig {
-                    enabled: true,
-                    refill_rps: 6.0,
-                    burst: 60.0,
-                    redis_url: None,
-                },
+                crate::test_support::enabled_config(),
                 pplx_space_feature_flags::FeatureFlagClient::disabled(),
             ),
         );
@@ -10106,7 +11097,7 @@ mod kubernetes_tests {
         let result = substrate
             .runtime_client(
                 sandbox_id,
-                crate::controllers::substrate::RecoveryCharge::enforce(Some(&admission)),
+                crate::controllers::substrate::RecoveryCharge::enforce_for_tests(Some(&admission)),
             )
             .await;
         let execution_state: String = sqlx::query_scalar(
@@ -10160,12 +11151,7 @@ mod kubernetes_tests {
                 Substrate::from_direct(
                     crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
                 ),
-                crate::cluster_admission::ClusterSandboxAdmissionConfig {
-                    enabled: true,
-                    refill_rps: 6.0,
-                    burst: 60.0,
-                    redis_url: None,
-                },
+                crate::test_support::enabled_config(),
                 pplx_space_feature_flags::FeatureFlagClient::disabled(),
             ),
         );
@@ -10223,12 +11209,7 @@ mod kubernetes_tests {
             Substrate::from_direct(crate::controllers::substrate::direct::DirectSubstrate::new(
                 pool.clone(),
             )),
-            crate::cluster_admission::ClusterSandboxAdmissionConfig {
-                enabled: true,
-                refill_rps: 6.0,
-                burst: 60.0,
-                redis_url: None,
-            },
+            crate::test_support::enabled_config(),
             pplx_space_feature_flags::FeatureFlagClient::disabled(),
         );
         let controller = crate::controllers::sandbox::SandboxController::with_cluster_admission(
@@ -11099,7 +12080,7 @@ mod kubernetes_tests {
         let message = pod
             .unschedulable_message()
             .expect("pod should be unschedulable");
-        let err = SubstrateError::Unavailable {
+        let err = SubstrateError::Unschedulable {
             message: format!("sandbox pod is unschedulable: {message}"),
         };
 
@@ -11187,15 +12168,15 @@ mod kubernetes_tests {
         );
         assert_eq!(
             classify_sandbox_delete_rpc_error(&tonic::Status::aborted("another cleanup conflict",)),
-            SandboxDeleteRpcErrorDisposition::ContinueTeardown
+            SandboxDeleteRpcErrorDisposition::ProbeAdmission
         );
         assert_eq!(
             classify_sandbox_delete_rpc_error(&tonic::Status::not_found("already gone")),
-            SandboxDeleteRpcErrorDisposition::ContinueTeardown
+            SandboxDeleteRpcErrorDisposition::ProbeAdmission
         );
         assert_eq!(
             classify_sandbox_delete_rpc_error(&tonic::Status::internal("cleanup failed")),
-            SandboxDeleteRpcErrorDisposition::ContinueTeardown
+            SandboxDeleteRpcErrorDisposition::ProbeAdmission
         );
     }
 
@@ -11211,7 +12192,7 @@ mod kubernetes_tests {
     /// still-stopping row) and must keep the execution active for retry.
     #[test]
     fn retire_skips_backup_for_missing_source_or_terminal_refusal() {
-        use pplx_space_common_core::artifact_backup_signals::{
+        use pplx_space_rpc_contracts::artifact_backup_signals::{
             CURRENT_INSTANCE_BACKUP_PUBLISHES_FULL_MARKER,
             CURRENT_INSTANCE_BACKUP_SANDBOX_FAILED_MARKER,
         };
@@ -11303,7 +12284,7 @@ mod kubernetes_tests {
             test_sandbox_id(),
             "space-sbx-test".into(),
             1,
-            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+            pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
             test_cancel_tracker(),
             tokio_util::task::TaskTracker::new(),
         );
@@ -11319,7 +12300,7 @@ mod kubernetes_tests {
             test_sandbox_id(),
             "space-sbx-test".into(),
             1,
-            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+            pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
             test_cancel_tracker(),
             tokio_util::task::TaskTracker::new(),
         );
@@ -11529,7 +12510,7 @@ mod kubernetes_tests {
         let actor = crate::controllers::substrate::ActorRef::new(
             UserId::from_uuid(pplx_space_db_test_fixtures::SEED_USER_ID),
             OrgId::from_uuid(pplx_space_db_test_fixtures::SEED_ORG_ID),
-            pplx_space_common_core::types::Email::parse("early-create-exit@example.com")?,
+            pplx_space_accounts::Email::parse("early-create-exit@example.com")?,
         );
         let template = TemplateName::parse("seed")?;
         let template_ref = crate::controllers::substrate::TemplateRef {
@@ -11544,7 +12525,7 @@ mod kubernetes_tests {
             disk_mib: None,
         };
         let env = BTreeMap::new();
-        let auto_lifecycle = pplx_space_common_core::types::AutoLifecyclePolicy::disabled();
+        let auto_lifecycle = pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled();
         let template_network_policy = pplx_space_net_common::NetworkPolicyV1::default();
         // Well past the annotation limit: each address serializes to more
         // than eight bytes.
@@ -11590,6 +12571,7 @@ mod kubernetes_tests {
             command_ready_wait: None,
             volume_encryption: false,
             node_pool: None,
+            client_id: None,
         };
         let executions = |sandbox_id| {
             sqlx::query_as::<_, (i64, bool)>(sql!(
@@ -12125,7 +13107,7 @@ mod kubernetes_tests {
         release_id: Uuid,
         actor: crate::controllers::substrate::ActorRef,
         env: BTreeMap<String, String>,
-        auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy,
+        auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy,
         network_policy: pplx_space_net_common::NetworkPolicyV1,
     }
 
@@ -12152,6 +13134,7 @@ mod kubernetes_tests {
                 template_network_policy: &self.network_policy,
                 template_network_policy_generation: 1,
                 volume_encryption: false,
+                client_id: None,
             }
         }
 
@@ -12178,16 +13161,20 @@ mod kubernetes_tests {
     }
 
     async fn pool_claim_fixture(pod: PooledSlotPod<'_>) -> Result<PoolClaimFixture, BoxError> {
-        pool_claim_fixture_with_node_labels(pod, &[]).await
+        pool_claim_fixture_with_node_labels(pod, &[], &[]).await
     }
 
-    /// [`pool_claim_fixture`] with `node_labels` set on every node.
+    /// [`pool_claim_fixture`] with `node_labels` set on every node and
+    /// `pod_annotations` on the pooled pod.
     async fn pool_claim_fixture_with_node_labels(
         pod: PooledSlotPod<'_>,
         node_labels: &[(String, String)],
+        pod_annotations: &[(&str, &str)],
     ) -> Result<PoolClaimFixture, BoxError> {
+        use pplx_space_byte_size::MemorySize;
         use pplx_space_cluster_pool::{NewPoolSlot, WarmPoolStore};
-        use pplx_space_common_core::types::{ContentHash, Digest, MemorySize, VcpuCount};
+        use pplx_space_content_digest::{ContentHash, Digest};
+        use pplx_space_execution_spec::VcpuCount;
 
         use crate::controllers::substrate::ActorRef;
 
@@ -12276,6 +13263,12 @@ mod kubernetes_tests {
                 name: Some("space-sbx-pooled-g1".to_string()),
                 namespace: Some("space".to_string()),
                 uid: Some("pool-pod-uid".to_string()),
+                annotations: (!pod_annotations.is_empty()).then(|| {
+                    pod_annotations
+                        .iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                        .collect()
+                }),
                 ..Default::default()
             },
             spec: Some(k8s_openapi::api::core::v1::PodSpec {
@@ -12301,7 +13294,11 @@ mod kubernetes_tests {
             })
             .collect();
         let substrate = KubernetesSubstrate {
-            store: K8sStore::new(db.pool.clone(), "space".to_string()),
+            store: K8sStore::new(
+                db.pool.clone(),
+                "space".to_string(),
+                crate::controllers::substrate::ActivationClientAttribution::Enabled,
+            ),
             node_group_placement: NodeGroupPlacementResolver::new(db.pool.clone(), true),
             ..substrate_with_inventory_caches(vec![pooled_pod], nodes)
         };
@@ -12314,10 +13311,10 @@ mod kubernetes_tests {
             actor: ActorRef::new(
                 user_id,
                 org_id,
-                pplx_space_common_core::types::Email::parse("pool-claim@example.com")?,
+                pplx_space_accounts::Email::parse("pool-claim@example.com")?,
             ),
             env: BTreeMap::new(),
-            auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+            auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
             network_policy: pplx_space_net_common::NetworkPolicyV1::default(),
         })
     }
@@ -12331,9 +13328,7 @@ mod kubernetes_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn claiming_a_warm_slot_requires_its_node_to_publish_the_environment()
     -> Result<(), BoxError> {
-        use pplx_space_common_core::kubernetes::{
-            ENVIRONMENT_USABLE_LABEL_VALUE, environment_label_key,
-        };
+        use pplx_space_sandbox_pod::{ENVIRONMENT_USABLE_LABEL_VALUE, environment_label_key};
         const E0: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
         const E1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
         let label = |environment: &str| {
@@ -12350,6 +13345,7 @@ mod kubernetes_tests {
                     nodes: &[("in-set-worker", Some("workers"))],
                 },
                 &label(node_publishes),
+                &booted(E1),
             )
             .await?;
             sqlx::query(sql!(
@@ -12385,6 +13381,86 @@ mod kubernetes_tests {
         Ok(())
     }
 
+    /// The annotations of a pool pod rendered with the gate `on` for work
+    /// bound to `environment`, which tell its shim to boot that environment.
+    fn booted(environment: &'static str) -> [(&'static str, &'static str); 2] {
+        use pplx_space_sandbox_pod::{
+            ENVIRONMENT_REQUIRED_ANNOTATION_VALUE, SANDBOX_ENVIRONMENT_ANNOTATION,
+            SANDBOX_ENVIRONMENT_REQUIRED_ANNOTATION,
+        };
+        [
+            (SANDBOX_ENVIRONMENT_ANNOTATION, environment),
+            (
+                SANDBOX_ENVIRONMENT_REQUIRED_ANNOTATION,
+                ENVIRONMENT_REQUIRED_ANNOTATION_VALUE,
+            ),
+        ]
+    }
+
+    /// With the environment gate on, a warm pod is adopted only if its worker
+    /// was told to boot the work's environment, even on a node that publishes
+    /// it: a pod warmed before the gate went `on` carries no requirement, so
+    /// its worker booted what it would with the gate off. Any other pod has
+    /// its slot invalidated, and the create misses the pool and boots cold.
+    #[tokio::test(flavor = "current_thread")]
+    async fn claiming_a_warm_slot_requires_its_pod_to_have_booted_the_environment()
+    -> Result<(), BoxError> {
+        use pplx_space_sandbox_pod::{
+            ENVIRONMENT_USABLE_LABEL_VALUE, SANDBOX_ENVIRONMENT_ANNOTATION, environment_label_key,
+        };
+        const E0: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        const E1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let shadow_built = [(SANDBOX_ENVIRONMENT_ANNOTATION, E1)];
+        type Annotations<'a> = &'a [(&'a str, &'a str)];
+        let cases: [(&str, Annotations, bool); 4] = [
+            ("warmed with the gate off", &[], false),
+            ("warmed in shadow", &shadow_built, false),
+            ("booted another environment", &booted(E0), false),
+            ("booted the work's environment", &booted(E1), true),
+        ];
+        for (pod_case, annotations, adopted) in cases {
+            let mut fixture = pool_claim_fixture_with_node_labels(
+                PooledSlotPod {
+                    phase: "Running",
+                    node_name: Some("in-set-worker"),
+                    nodes: &[("in-set-worker", Some("workers"))],
+                },
+                &[(
+                    environment_label_key(&E1.parse().unwrap()),
+                    ENVIRONMENT_USABLE_LABEL_VALUE.to_string(),
+                )],
+                annotations,
+            )
+            .await?;
+            sqlx::query(sql!(
+                "UPDATE template_releases SET execution_metadata = $2 WHERE id = $1"
+            ))
+            .bind(fixture.release_id)
+            .bind(sqlx::types::Json(
+                serde_json::json!({"environment": E1, "components": []}),
+            ))
+            .execute(&fixture.db.pool)
+            .await?;
+            fixture.substrate.k8s.environment_placement =
+                crate::controllers::substrate::environment_placement::EnvironmentPlacementGate::On;
+
+            let attempt = fixture
+                .substrate
+                .claim_pooled_execution(&fixture.request())
+                .await?;
+
+            assert_eq!(attempt.claim.is_some(), adopted, "a pod {pod_case}");
+            if !adopted {
+                assert_eq!(
+                    fixture.slot_disposition().await?,
+                    ("claimed".to_string(), None),
+                    "a pod {pod_case} leaves the pool"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// A warm pod whose node the cache doesn't have proves nothing against
     /// the slot, so the claim gives it back and builds cold, as for a node
     /// group the cache can't answer: invalidating would destroy warm pods on
@@ -12393,52 +13469,65 @@ mod kubernetes_tests {
     async fn a_warm_slot_whose_node_the_cache_lacks_goes_back_under_the_environment_gate()
     -> Result<(), BoxError> {
         const E1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
-        let mut fixture = pool_claim_fixture(PooledSlotPod {
-            phase: "Running",
-            node_name: Some("uncached-worker"),
-            nodes: &[],
-        })
-        .await?;
-        sqlx::query(sql!(
-            "UPDATE template_releases SET execution_metadata = $2 WHERE id = $1"
-        ))
-        .bind(fixture.release_id)
-        .bind(sqlx::types::Json(
-            serde_json::json!({"environment": E1, "components": []}),
-        ))
-        .execute(&fixture.db.pool)
-        .await?;
-        fixture.substrate.k8s.environment_placement =
-            crate::controllers::substrate::environment_placement::EnvironmentPlacementGate::On;
-
-        let attempt = fixture
-            .substrate
-            .claim_pooled_execution(&fixture.request())
+        let booted_e1 = booted(E1);
+        // A pod that didn't boot the environment is refused whatever its
+        // node, so its slot leaves the pool even when the node is unknown.
+        for (annotations, disposition) in [(&booted_e1[..], "ready"), (&[][..], "claimed")] {
+            let mut fixture = pool_claim_fixture_with_node_labels(
+                PooledSlotPod {
+                    phase: "Running",
+                    node_name: Some("uncached-worker"),
+                    nodes: &[],
+                },
+                &[],
+                annotations,
+            )
             .await?;
+            sqlx::query(sql!(
+                "UPDATE template_releases SET execution_metadata = $2 WHERE id = $1"
+            ))
+            .bind(fixture.release_id)
+            .bind(sqlx::types::Json(
+                serde_json::json!({"environment": E1, "components": []}),
+            ))
+            .execute(&fixture.db.pool)
+            .await?;
+            fixture.substrate.k8s.environment_placement =
+                crate::controllers::substrate::environment_placement::EnvironmentPlacementGate::On;
 
-        assert!(attempt.claim.is_none());
-        assert_eq!(
-            fixture.slot_disposition().await?,
-            ("ready".to_string(), None),
-            "the slot goes back to the pool"
-        );
+            let attempt = fixture
+                .substrate
+                .claim_pooled_execution(&fixture.request())
+                .await?;
+
+            assert!(attempt.claim.is_none());
+            assert_eq!(
+                fixture.slot_disposition().await?,
+                (disposition.to_string(), None),
+                "a pod annotated {annotations:?}"
+            );
+        }
         Ok(())
     }
 
     /// The slot a create admitted is adopted under the same environment rule
-    /// as an ordinary claim. Its reserved ID is already the create's public
+    /// as an ordinary claim: its node publishes the environment, and its pod
+    /// booted it. Its reserved ID is already the create's public
     /// ID, so a refusal takes it out of the inventory rather than give it
     /// back.
     #[tokio::test(flavor = "current_thread")]
     async fn adopting_an_admitted_warm_slot_requires_its_node_to_publish_the_environment()
     -> Result<(), BoxError> {
         use crate::controllers::substrate::{AdmittedPoolClaim, AdmittedPoolClaimLookup};
-        use pplx_space_common_core::kubernetes::{
-            ENVIRONMENT_USABLE_LABEL_VALUE, environment_label_key,
-        };
+        use pplx_space_sandbox_pod::{ENVIRONMENT_USABLE_LABEL_VALUE, environment_label_key};
         const E0: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
         const E1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
-        for (node_publishes, adopted) in [(E0, false), (E1, true)] {
+        let booted_e1 = booted(E1);
+        for (node_publishes, annotations, adopted) in [
+            (E0, &booted_e1[..], false),
+            (E1, &[][..], false),
+            (E1, &booted_e1[..], true),
+        ] {
             let mut fixture = pool_claim_fixture_with_node_labels(
                 PooledSlotPod {
                     phase: "Running",
@@ -12449,6 +13538,7 @@ mod kubernetes_tests {
                     environment_label_key(&node_publishes.parse().unwrap()),
                     ENVIRONMENT_USABLE_LABEL_VALUE.to_string(),
                 )],
+                annotations,
             )
             .await?;
             sqlx::query(sql!(
@@ -12489,7 +13579,7 @@ mod kubernetes_tests {
             assert_eq!(
                 matches!(lookup, AdmittedPoolClaimLookup::Adoptable { .. }),
                 adopted,
-                "node publishes {node_publishes}"
+                "node publishes {node_publishes}, pod annotated {annotations:?}"
             );
             if !adopted {
                 assert_eq!(
@@ -13143,6 +14233,7 @@ mod kubernetes_tests {
             pool_slot_id: Some(Uuid::now_v7()),
             sandbox_id: SandboxId::new(),
             content_hash: "sha256:pooled".to_string(),
+            template_release_id: None,
             pod_name: "space-sbx-pooled-g1".to_string(),
             pod_uid: Some(PodUid::parse("pod-uid").unwrap()),
             execution_generation: 1,
@@ -13191,6 +14282,7 @@ mod kubernetes_tests {
             pool_slot_id: Some(pool_slot_id),
             sandbox_id,
             content_hash: "sha256:pooled".to_string(),
+            template_release_id: None,
             pod_name: "space-sbx-pooled-g1".to_string(),
             pod_uid: Some(PodUid::parse("pod-uid").unwrap()),
             execution_generation: 1,
@@ -13831,6 +14923,7 @@ mod kubernetes_tests {
                 create_age_expired: false,
                 activation_attempt_id: Some(operation),
                 route_activation_id: selected,
+                activating_client_id: None,
             };
             let action = activation_wake_action(
                 &execution,
@@ -13867,6 +14960,7 @@ mod kubernetes_tests {
             create_age_expired: false,
             activation_attempt_id: None,
             route_activation_id,
+            activating_client_id: None,
         };
         assert!(matches!(
             activation_wake_action(
@@ -14293,7 +15387,7 @@ mod kubernetes_tests {
         use super::super::support::{WakeRpcErrorDisposition, classify_wake_rpc_error};
 
         let error = tonic::Status::failed_precondition(
-            pplx_space_common_core::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER,
+            pplx_space_rpc_contracts::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER,
         );
 
         let disposition = classify_wake_rpc_error(&error);
@@ -14301,6 +15395,34 @@ mod kubernetes_tests {
         assert_eq!(
             disposition,
             WakeRpcErrorDisposition::ReadinessPoll("missing_runtime_context")
+        );
+    }
+
+    /// A node a drain sealed refuses the wake with the shared marker; the
+    /// wake answers it as the drain gate's retryable refusal, never as a
+    /// failed wake, and nothing else reads as one.
+    #[test]
+    fn a_sealed_nodes_refusal_is_its_own_disposition() {
+        use super::super::support::{WakeRpcErrorDisposition, classify_wake_rpc_error};
+
+        let sealed = tonic::Status::failed_precondition(format!(
+            "{} (generation 7); refusing the resume activation of sandbox s",
+            pplx_space_rpc_contracts::wake_signals::ACTIVATIONS_SEALED_MARKER
+        ));
+        assert_eq!(
+            classify_wake_rpc_error(&sealed),
+            WakeRpcErrorDisposition::NodeSealed
+        );
+        assert_eq!(
+            classify_wake_rpc_error(&tonic::Status::failed_precondition("something else")),
+            WakeRpcErrorDisposition::Fail
+        );
+        assert_eq!(
+            classify_wake_rpc_error(&tonic::Status::internal(
+                pplx_space_rpc_contracts::wake_signals::ACTIVATIONS_SEALED_MARKER
+            )),
+            WakeRpcErrorDisposition::Fail,
+            "only the node's FailedPrecondition carries the refusal"
         );
     }
 
@@ -14502,70 +15624,211 @@ mod kubernetes_tests {
         ClientBuilder::new(service, "space").build()
     }
 
-    /// The in-VM stop addresses the *sandbox*, not the pod, so the address it
-    /// uses decides which VM gets stopped. A fenced teardown derives that
-    /// address from the pod the fence verified — never from the execution row,
-    /// and never by re-resolving whatever is active by then, which on a race
-    /// is the successor. Here the row advertises a runtime the verified pod
-    /// does not have: a teardown that trusted the row would try to stop
-    /// 127.0.0.1 and fail the retire; this one sees no runtime to stop and
-    /// proceeds straight to the pod delete.
+    /// Before kubelet publishes `status.podIP`, the row's node-reported IP for
+    /// the same pod UID is the fenced pod's runtime while its node reports the
+    /// execution there, with or without the address (a restarted sandbox
+    /// manager): the retire stops that runtime, and leaves a worker now
+    /// reached at the address, serving another pod, untouched.
     #[tokio::test(flavor = "current_thread")]
-    async fn fenced_retire_ignores_a_runtime_the_fenced_pod_does_not_have() -> Result<(), BoxError>
-    {
-        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
-        let pool = db.pool.clone();
-        let sandbox_id = SandboxId::new();
-        let pod_name = format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple());
-        insert_test_sandbox_row(&pool, sandbox_id, "failed").await?;
-        insert_k8s_execution(
-            &pool,
-            sandbox_id,
-            1,
-            &pod_name,
-            "uid-observed",
-            Some("127.0.0.1"),
-            true,
-        )
-        .await?;
-        // The verified pod carries no IP; the execution row claims one.
-        let fenced_pod = Pod {
-            metadata: kube::api::ObjectMeta {
-                name: Some(pod_name.clone()),
-                namespace: Some("space".to_string()),
-                uid: Some("uid-observed".to_string()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
-        let substrate = substrate_with_store_client_proxy_port_and_pod(
-            pool.clone(),
-            delete_capturing_kubernetes_client(
-                Arc::clone(&captured_deletes),
-                Some(fenced_pod.clone()),
-            ),
-            DEFAULT_SANDBOX_PROXY_PORT,
-            Some(fenced_pod),
-        );
-
-        let outcome = substrate
-            .retire_execution(RetireExecutionRequest::fenced(
+    async fn fenced_retire_stops_the_runtime_recorded_for_an_unpublished_pod()
+    -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process() {
+            return Ok(());
+        }
+        for (served_pod_uid, reports_address, stopped) in [
+            ("uid-observed", true, true),
+            ("uid-observed", false, true),
+            ("uid-other", true, false),
+        ] {
+            let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+            let pool = db.pool.clone();
+            let sandbox_id = SandboxId::new();
+            let pod_name = format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple());
+            insert_test_sandbox_row(&pool, sandbox_id, "failed").await?;
+            insert_k8s_execution(
+                &pool,
                 sandbox_id,
-                PodIdentityFence::new(PodName::parse(&pod_name)?)
-                    .with_pod_uid(PodUid::parse("uid-observed")?),
-            ))
+                1,
+                &pod_name,
+                "uid-observed",
+                Some("127.0.0.1"),
+                true,
+            )
             .await?;
+            // Kubelet has not published an IP; the row records the node's.
+            let fenced_pod = Pod {
+                metadata: kube::api::ObjectMeta {
+                    name: Some(pod_name.clone()),
+                    namespace: Some("space".to_string()),
+                    uid: Some("uid-observed".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let sim_worker = start_sim_worker().await?;
+            let mut record = pplx_space_node_api_sim::SandboxRecord::new_creating(
+                sandbox_id.to_string(),
+                "seed".into(),
+                "fc".into(),
+                "test".into(),
+                None,
+                false,
+            )
+            .with_allocation(1, served_pod_uid, "127.0.0.1");
+            if !reports_address {
+                record.external_address = None;
+            }
+            record.status = "running".into();
+            sim_worker.state().insert_new(record).await?;
+            let captured_deletes = Arc::new(Mutex::new(Vec::new()));
+            let substrate = substrate_with_store_client_proxy_port_and_pod(
+                pool.clone(),
+                delete_capturing_kubernetes_client(
+                    Arc::clone(&captured_deletes),
+                    Some(fenced_pod.clone()),
+                ),
+                sim_worker.port(),
+                Some(fenced_pod),
+            );
 
-        assert_eq!(outcome, RetireExecutionOutcome::Retired);
-        assert_eq!(
-            captured_deletes
+            substrate
+                .retire_execution(RetireExecutionRequest::fenced(
+                    sandbox_id,
+                    PodIdentityFence::new(PodName::parse(&pod_name)?)
+                        .with_pod_uid(PodUid::parse("uid-observed")?),
+                ))
+                .await?;
+
+            let status = sim_worker
+                .state()
+                .get(&sandbox_id.to_string())
+                .await?
+                .status;
+            assert_eq!(status == "stopped", stopped, "{served_pod_uid}: {status}");
+            assert_eq!(
+                captured_deletes
+                    .lock()
+                    .expect("capture mutex poisoned")
+                    .len(),
+                1
+            );
+        }
+        Ok(())
+    }
+
+    /// A node-reported address whose pod proxy does not answer is no evidence
+    /// the runtime is gone. The execution route keeps the execution tracked
+    /// for retry without deleting the pod; the node route confirms and stops
+    /// the runtime through the node's node-api.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fenced_retire_confirms_an_unanswered_node_address_through_its_route()
+    -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process() {
+            return Ok(());
+        }
+        for stop_route in [RetireStopRoute::Execution, RetireStopRoute::Node] {
+            let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+            let pool = db.pool.clone();
+            let sandbox_id = SandboxId::new();
+            let (pod_name, node_name) = (
+                format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple()),
+                "node-a",
+            );
+            insert_test_sandbox_row(&pool, sandbox_id, "failed").await?;
+            insert_k8s_execution(
+                &pool,
+                sandbox_id,
+                1,
+                &pod_name,
+                "uid-observed",
+                Some("127.0.0.1"),
+                true,
+            )
+            .await?;
+            sqlx::query(sql!(
+                "UPDATE sandbox_k8s_executions SET k8s_node_name = $2 WHERE sandbox_id = $1"
+            ))
+            .bind(sandbox_id)
+            .bind(node_name)
+            .execute(&pool)
+            .await?;
+            let fenced_pod = Pod {
+                metadata: kube::api::ObjectMeta {
+                    name: Some(pod_name.clone()),
+                    namespace: Some("space".to_string()),
+                    uid: Some("uid-observed".to_string()),
+                    ..Default::default()
+                },
+                spec: Some(K8sPodSpec {
+                    node_name: Some(node_name.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let sim_worker = start_sim_worker().await?;
+            let mut record = pplx_space_node_api_sim::SandboxRecord::new_creating(
+                sandbox_id.to_string(),
+                "seed".into(),
+                "fc".into(),
+                "test".into(),
+                None,
+                false,
+            )
+            .with_allocation(1, "uid-observed", "127.0.0.1");
+            record.status = "running".into();
+            sim_worker.state().insert_new(record).await?;
+            let mut node_api = node_api_pod_on_node("space-worker-node-a", node_name);
+            node_api.metadata.annotations = Some(BTreeMap::from([(
+                "space.pplx.net/node-api-port".to_string(),
+                sim_worker.port().to_string(),
+            )]));
+            node_api
+                .status
+                .as_mut()
+                .expect("node-api pod has status")
+                .pod_ip = Some("127.0.0.1".to_string());
+            let closed_pod_port = std::net::TcpListener::bind("127.0.0.1:0")?
+                .local_addr()?
+                .port();
+            let captured_deletes = Arc::new(Mutex::new(Vec::new()));
+            let substrate = substrate_with_store_client_proxy_port_and_pods(
+                pool.clone(),
+                delete_capturing_kubernetes_client(
+                    Arc::clone(&captured_deletes),
+                    Some(fenced_pod.clone()),
+                ),
+                closed_pod_port,
+                vec![fenced_pod, node_api],
+            );
+
+            let retired = substrate
+                .retire_execution(RetireExecutionRequest {
+                    sandbox_id,
+                    fence: RetireFence::Pod(
+                        PodIdentityFence::new(PodName::parse(&pod_name)?)
+                            .with_pod_uid(PodUid::parse("uid-observed")?),
+                    ),
+                    stop_route,
+                })
+                .await;
+
+            let status = sim_worker
+                .state()
+                .get(&sandbox_id.to_string())
+                .await?
+                .status;
+            let deletes = captured_deletes
                 .lock()
                 .expect("capture mutex poisoned")
-                .len(),
-            1,
-            "the fenced pod is still deleted; only the in-VM stop was skipped"
-        );
+                .len();
+            if stop_route == RetireStopRoute::Node {
+                assert!(retired.is_ok(), "{retired:?}");
+                assert_eq!((status.as_str(), deletes), ("stopped", 1));
+            } else {
+                assert!(retired.is_err(), "{retired:?}");
+                assert_eq!((status.as_str(), deletes), ("running", 0));
+            }
+        }
         Ok(())
     }
 
@@ -14944,6 +16207,15 @@ mod kubernetes_tests {
         .expect("placement must be queryable")
     }
 
+    /// The row's `placement_changed_at`, exactly.
+    async fn placement_changed_at(pool: &PgPool, sandbox_id: SandboxId) -> OffsetDateTime {
+        sqlx::query_scalar("SELECT placement_changed_at FROM sandboxes WHERE id = $1")
+            .bind(sandbox_id)
+            .fetch_one(pool)
+            .await
+            .expect("placement clock must be queryable")
+    }
+
     /// A drain tearing down an evacuated `stopped` sandbox must not touch one
     /// its owner has started since the teardown was authorized. The start's
     /// execution is the only trace of it the teardown can see, and the
@@ -14968,7 +16240,7 @@ mod kubernetes_tests {
         );
 
         let torn_down = substrate
-            .delete_execution_with_no_active_execution(sandbox_id)
+            .delete_execution_with_no_active_execution(sandbox_id, node_id)
             .await?;
 
         assert!(!torn_down, "the teardown must report that it did nothing");
@@ -14995,7 +16267,9 @@ mod kubernetes_tests {
     /// The other half: with no active execution, the same call releases the
     /// node the way `delete_execution` does — the stopped sandbox's retired
     /// pods deleted, its placement cleared, and the placement clock bumped,
-    /// which the restore sweep's stopped arm orders on.
+    /// which the restore sweep's stopped arm orders on. As in production, the
+    /// drain has marked the row and published its disk first: the unplace
+    /// keeps a `stopped` row on its node otherwise.
     #[tokio::test(flavor = "current_thread")]
     async fn a_stopped_teardown_releases_the_node_when_nothing_is_running() -> Result<(), BoxError>
     {
@@ -15005,6 +16279,8 @@ mod kubernetes_tests {
         let pod_name = format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple());
         insert_test_sandbox_row(&pool, sandbox_id, "stopped").await?;
         let node_id = place_on_fresh_node(&pool, sandbox_id).await?;
+        mark_stopped_evacuation(&pool, sandbox_id).await?;
+        publish_durable_disk(&pool, sandbox_id).await?;
         insert_k8s_execution(&pool, sandbox_id, 1, &pod_name, "uid-retired", None, false).await?;
         assert_eq!(
             placement_of(&pool, sandbox_id).await,
@@ -15020,7 +16296,7 @@ mod kubernetes_tests {
         );
 
         let torn_down = substrate
-            .delete_execution_with_no_active_execution(sandbox_id)
+            .delete_execution_with_no_active_execution(sandbox_id, node_id)
             .await?;
 
         assert!(torn_down, "with nothing running the teardown must proceed");
@@ -15036,6 +16312,20 @@ mod kubernetes_tests {
                 .iter()
                 .any(|(path, _)| path.ends_with(&pod_name)),
             "the retired execution's pod must be deleted"
+        );
+        let released_at = placement_changed_at(&pool, sandbox_id).await;
+        assert!(
+            substrate
+                .delete_execution_with_no_active_execution(sandbox_id, node_id)
+                .await?,
+            "a retry after the release must converge, not defer the drain"
+        );
+        assert_eq!(placement_of(&pool, sandbox_id).await.0, None);
+        assert_eq!(
+            placement_changed_at(&pool, sandbox_id).await,
+            released_at,
+            "the retry must keep the first release's placement clock, which the restore \
+             sweep's stopped arm orders on"
         );
         Ok(())
     }
@@ -15057,14 +16347,15 @@ mod kubernetes_tests {
         let stopped = SandboxId::new();
         let stopped_pod = format!("space-sbx-{}-g1", stopped.as_uuid().simple());
         insert_test_sandbox_row(&pool, stopped, "started").await?;
-        place_on_fresh_node(&pool, stopped).await?;
+        let stopped_node = place_on_fresh_node(&pool, stopped).await?;
         insert_k8s_execution(&pool, stopped, 1, &stopped_pod, "uid-pre-stop", None, true).await?;
         sqlx::query("UPDATE sandboxes SET lifecycle = 'stopped' WHERE id = $1")
             .bind(stopped)
             .execute(&pool)
             .await?;
-        // The drain's claim on it.
+        // The drain's claim on it, and the disk it published.
         mark_stopped_evacuation(&pool, stopped).await?;
+        publish_durable_disk(&pool, stopped).await?;
 
         // A whole start→stop cycle since the drain's claim: the execution
         // predates the new stop, but the start cleared the marker.
@@ -15107,13 +16398,13 @@ mod kubernetes_tests {
 
         assert!(
             !substrate
-                .delete_execution_with_no_active_execution(stopped)
+                .delete_execution_with_no_active_execution(stopped, stopped_node)
                 .await?,
             "precondition: the plain no-execution teardown refuses the shape a stop leaves"
         );
         assert!(
             substrate
-                .delete_execution_retired_by_current_stop(stopped)
+                .delete_execution_retired_by_current_stop(stopped, stopped_node)
                 .await?,
             "the execution the stop left active must not block the teardown"
         );
@@ -15134,7 +16425,7 @@ mod kubernetes_tests {
 
         assert!(
             !substrate
-                .delete_execution_retired_by_current_stop(starting)
+                .delete_execution_retired_by_current_stop(starting, starting_node)
                 .await?,
             "an execution newer than the stop must refuse the teardown"
         );
@@ -15154,7 +16445,7 @@ mod kubernetes_tests {
 
         assert!(
             !substrate
-                .delete_execution_retired_by_current_stop(cycled)
+                .delete_execution_retired_by_current_stop(cycled, cycled_node)
                 .await?,
             "a start→stop cycle since the claim must refuse the teardown"
         );
@@ -15200,6 +16491,7 @@ mod kubernetes_tests {
                 .execute(&pool)
                 .await?;
             mark_stopped_evacuation(&pool, sandbox_id).await?;
+            publish_durable_disk(&pool, sandbox_id).await?;
             sqlx::query(
                 "UPDATE sandbox_k8s_executions
                     SET activation_attempt_id = $2,
@@ -15208,13 +16500,13 @@ mod kubernetes_tests {
                   WHERE sandbox_id = $1 AND active",
             )
             .bind(sandbox_id)
-            .bind(pplx_space_common_core::types::SandboxActivationAttemptId::new())
+            .bind(pplx_space_sandbox_model::SandboxActivationAttemptId::new())
             .bind(expires_in)
             .execute(&pool)
             .await?;
             rows.push((sandbox_id, node));
         }
-        let [(starting, starting_node), (abandoned, _)] = rows[..] else {
+        let [(starting, starting_node), (abandoned, abandoned_node)] = rows[..] else {
             unreachable!("two rows were seeded");
         };
 
@@ -15227,7 +16519,7 @@ mod kubernetes_tests {
 
         assert!(
             !substrate
-                .delete_execution_retired_by_current_stop(starting)
+                .delete_execution_retired_by_current_stop(starting, starting_node)
                 .await?,
             "a start holding a live attempt on the pre-stop execution must refuse the teardown"
         );
@@ -15239,7 +16531,7 @@ mod kubernetes_tests {
 
         assert!(
             substrate
-                .delete_execution_retired_by_current_stop(abandoned)
+                .delete_execution_retired_by_current_stop(abandoned, abandoned_node)
                 .await?,
             "an expired attempt must not hold the node"
         );
@@ -15268,10 +16560,23 @@ mod kubernetes_tests {
 
         assert!(
             !substrate
-                .delete_execution_retired_by_current_stop(SandboxId::new())
+                .delete_execution_retired_by_current_stop(SandboxId::new(), NodeId::new())
                 .await?,
             "a teardown with no sandbox row must refuse"
         );
+        Ok(())
+    }
+
+    /// The durable disk artifact a drain publishes before it releases a
+    /// stopped sandbox's node.
+    async fn publish_durable_disk(pool: &PgPool, sandbox_id: SandboxId) -> Result<(), BoxError> {
+        pplx_space_db_test_fixtures::publish_ready_disk_artifact(
+            pool,
+            sandbox_id,
+            LocalArtifactId::new(),
+            "s3://space-test/stopped-teardown-disk?region=us-east-1",
+        )
+        .await?;
         Ok(())
     }
 
@@ -15420,7 +16725,7 @@ mod kubernetes_tests {
               WHERE sandbox_id = $1 AND active",
         )
         .bind(in_flight)
-        .bind(pplx_space_common_core::types::SandboxActivationAttemptId::new())
+        .bind(pplx_space_sandbox_model::SandboxActivationAttemptId::new())
         .execute(&pool)
         .await?;
         for sandbox_id in [recreated, unrecorded, in_flight] {
@@ -15581,7 +16886,11 @@ mod kubernetes_tests {
     async fn the_uid_backfill_touches_nothing_it_should_not() -> Result<(), BoxError> {
         let db = pplx_space_db_test_fixtures::pg_test_db().await?;
         let pool = db.pool.clone();
-        let store = K8sStore::new(pool.clone(), "space".to_string());
+        let store = K8sStore::new(
+            pool.clone(),
+            "space".to_string(),
+            crate::controllers::substrate::ActivationClientAttribution::Enabled,
+        );
         let sandbox_id = SandboxId::new();
         let pod_name = format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple());
         insert_test_sandbox_row(&pool, sandbox_id, "failed").await?;
@@ -15598,7 +16907,12 @@ mod kubernetes_tests {
 
         assert!(
             !store
-                .backfill_missing_pod_uid(sandbox_id, &backfill_identity(&pod_name), "uid-observed")
+                .backfill_missing_pod_uid(
+                    sandbox_id,
+                    &backfill_identity(&pod_name),
+                    "uid-observed",
+                    None,
+                )
                 .await?,
             "a recorded UID must not be overwritten"
         );
@@ -15621,7 +16935,12 @@ mod kubernetes_tests {
             .await?;
         assert!(
             store
-                .backfill_missing_pod_uid(sandbox_id, &backfill_identity(&pod_name), "uid-observed")
+                .backfill_missing_pod_uid(
+                    sandbox_id,
+                    &backfill_identity(&pod_name),
+                    "uid-observed",
+                    None,
+                )
                 .await?
         );
         let (uid, ip, state): (Option<String>, Option<String>, String) = sqlx::query_as(

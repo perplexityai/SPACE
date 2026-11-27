@@ -14,7 +14,7 @@
 
 use std::str::FromStr;
 
-use pplx_space_common_core::types::{SandboxLifecycle, SandboxLifecycleParseError};
+use pplx_space_sandbox_model::{SandboxLifecycle, SandboxLifecycleParseError};
 
 /// A `sandboxes.lifecycle` value as stored in Postgres: a live
 /// [`SandboxLifecycle`] state or the terminal tombstone.
@@ -33,15 +33,6 @@ impl StoredSandboxLifecycle {
         match self {
             Self::Live(lifecycle) => lifecycle.as_str(),
             Self::Deleted => "deleted",
-        }
-    }
-
-    /// The live-state view: `Some` for shared-vocabulary states, `None` for
-    /// the terminal tombstone.
-    pub const fn live(self) -> Option<SandboxLifecycle> {
-        match self {
-            Self::Live(lifecycle) => Some(lifecycle),
-            Self::Deleted => None,
         }
     }
 }

@@ -21,7 +21,7 @@ use crate::{
 /// `LayersConfig` requires each, but the state checks' (`state.*` and
 /// `unowned.*`), which come together, and denies others, so this list is
 /// its list.
-const BEHAVIOURS: [&str; 32] = [
+const BEHAVIOURS: [&str; 35] = [
     "placement",
     "layout",
     "direction.no_crossing",
@@ -52,6 +52,9 @@ const BEHAVIOURS: [&str; 32] = [
     "test_only",
     "clients",
     "store_edges",
+    "coordinators",
+    "coordinator_edges",
+    "driver_reexports",
     "stale_entries",
     "policy_changed",
 ];
@@ -150,6 +153,7 @@ fn features_with_implicit_ones() {
     let krate = Crate {
         name: "x".to_owned(),
         lib: None,
+        lib_path: None,
         member: "crates/x".to_owned(),
         name_line: 1,
         lib_name_line: None,
@@ -243,6 +247,7 @@ fn items_used_through_a_dependency() {
     let krate = Crate {
         name: "pplx-space-member".to_owned(),
         lib: Some("pplx_space_member".to_owned()),
+        lib_path: None,
         member: "member".to_owned(),
         name_line: 2,
         lib_name_line: None,
@@ -461,6 +466,38 @@ fn the_domain_policy_and_its_lines() {
     );
     let modes: Vec<&str> = policy.modes.keys().map(String::as_str).collect();
     assert_eq!(modes, ["model_protocol.stale_entries"]);
+}
+
+/// `storage_handles` is read as a set of packages, and leniently for its
+/// lines, the key's too; a misspelt key is still rejected.
+#[test]
+fn storage_handles() {
+    let behaviours = behaviour_tables("");
+    let parse = |key: &str| {
+        toml::from_str::<LayersConfig>(&format!("{key} = [\"pplx-space-pool\"]\n{behaviours}"))
+    };
+    let config = parse("storage_handles").expect("it parses");
+    assert!(config.storage_handles.contains("pplx-space-pool"));
+    assert!(!config.storage_handles.contains("pplx-space-s"));
+    let found = parse("storage_handle")
+        .expect_err("an unknown key is rejected")
+        .to_string();
+    assert!(found.contains("unknown field `storage_handle`"), "{found}");
+
+    let policy = |text: &str| {
+        LayersPolicy::parse(text)
+            .expect("the table parses")
+            .expect("the text has the table")
+    };
+    let listed = policy("[rules.layers]\nstorage_handles = [\n  \"pplx-space-pool\",\n]\n");
+    assert_eq!(
+        listed.storage_handles,
+        BTreeMap::from([("pplx-space-pool".to_owned(), 3)])
+    );
+    assert_eq!(listed.storage_handles_line, Some(2));
+    let unlisted = policy("[rules.layers.placement]\nmode = \"required\"\n[rules.layers]\n");
+    assert!(unlisted.storage_handles.is_empty());
+    assert_eq!(unlisted.storage_handles_line, Some(3));
 }
 
 /// `domain_fences` is read as package to family, each package in one family.

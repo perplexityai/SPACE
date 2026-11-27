@@ -261,7 +261,7 @@ mod tests;
 
 pub(crate) async fn load(
     pool: &sqlx::PgPool,
-    sandbox_id: pplx_space_common_core::types::SandboxId,
+    sandbox_id: pplx_space_sandbox_model::SandboxId,
 ) -> Result<EgressProfileSelection, crate::controllers::ControllerError> {
     use crate::controllers::ControllerError;
     let value = pplx_space_sandbox_store::egress_profiles(pool, sandbox_id)

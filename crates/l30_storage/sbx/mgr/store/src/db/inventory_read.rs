@@ -4,7 +4,7 @@
 
 use crate::db::db_private_outside_tests;
 use crate::db::{Connection, Error};
-use pplx_space_common_core::inventory::{
+use pplx_space_rpc_contracts::inventory::{
     InventoryBudget, InventoryLimitExceeded, MAX_ITEMS, MAX_RAW_BYTES,
 };
 use rusqlite::{Row, types::ValueRef};
@@ -35,15 +35,19 @@ impl InventoryReadError {
     }
 }
 
+/// The bytes one column value costs an inventory budget, whatever its type.
+pub(in crate::db) fn value_raw_bytes(value: ValueRef<'_>) -> usize {
+    match value {
+        ValueRef::Text(value) | ValueRef::Blob(value) => value.len(),
+        ValueRef::Null => 0,
+        ValueRef::Integer(_) | ValueRef::Real(_) => 8,
+    }
+}
+
 fn row_raw_bytes(row: &Row<'_>) -> rusqlite::Result<usize> {
     let mut bytes = 0usize;
     for index in 0..row.as_ref().column_count() {
-        let size = match row.get_ref(index)? {
-            ValueRef::Text(value) | ValueRef::Blob(value) => value.len(),
-            ValueRef::Null => 0,
-            ValueRef::Integer(_) | ValueRef::Real(_) => 8,
-        };
-        bytes = bytes.saturating_add(size);
+        bytes = bytes.saturating_add(value_raw_bytes(row.get_ref(index)?));
     }
     Ok(bytes)
 }
@@ -277,7 +281,7 @@ db_private_outside_tests! {
         while let Some(row) = rows.next()? {
             check_row(row, &mut budget)?;
             let id: String = row.get(0)?;
-            if pplx_space_common_core::ids::sandbox_id_matches(&id, selector) {
+            if pplx_space_sandbox_model::ids::sandbox_id_matches(&id, selector) {
                 if matched.is_some() {
                     return Err(InventoryReadError::Ambiguous);
                 }

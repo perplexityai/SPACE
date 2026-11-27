@@ -3,6 +3,12 @@ name: Kind CI
 on:
   workflow_call:
     inputs:
+      smoke_tiers:
+        type: string
+        default: routine
+      placement_scenarios:
+        type: boolean
+        default: false
       # test-hooks, every caller's default, or release: kind-release-ci.yml's
       # on-demand lane of binaries built without test hooks
       # (infra/space/kind/lib/rust-build.sh). Only the release lane sets
@@ -208,6 +214,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 infra/space/kind/scripts/rust-artifact-handoff.py wait --timeout 300
 
+      # For a moment after the producer job reports completed, which is what
+      # `wait` reads, the artifact service can still answer "Artifact not
+      # found for name" or "No artifacts found for ID". So every download of
+      # the producer's image is retried once after a pause.
       - name: Download this attempt's Rust artifact image
         id: download
         if: steps.producer.outcome == 'success'
@@ -217,17 +227,50 @@ jobs:
           name: kind-rust-${{ github.sha }}-${{ env.SPACE_KIND_RUST_PRODUCER_ATTEMPT }}
           path: ${{ runner.temp }}/kind-rust
 
+      - &pause-before-download-retry
+        name: Give the artifact service time to serve the image
+        if: steps.download.outcome == 'failure'
+        run: sleep 30
+
+      - name: Download this attempt's Rust artifact image again
+        id: download_retry
+        if: steps.download.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kind-rust-${{ github.sha }}-${{ env.SPACE_KIND_RUST_PRODUCER_ATTEMPT }}
+          path: ${{ runner.temp }}/kind-rust
+
       - name: Load and verify the Rust artifact image
         id: load
-        if: steps.download.outcome == 'success'
+        if: steps.download.outcome == 'success' || steps.download_retry.outcome == 'success'
         continue-on-error: true
         run: python3 infra/space/kind/scripts/rust-artifact-handoff.py load "${RUNNER_TEMP}/kind-rust"
 
       # Main builds on every push, so this replaces the key's earlier image.
+      # The record names the digest it pushed, for readers that can pull only
+      # by digest: a box behind a pull-through mirror of ghcr.io that serves
+      # content by digest (rust-artifact-handoff.py reuse).
       - name: Publish the artifact image under its Rust input key
+        id: publish
         if: steps.load.outcome == 'success'
         continue-on-error: true
-        run: python3 infra/space/kind/scripts/rust-artifact-handoff.py publish ghcr.io/perplexityai/space-kind-rust-artifacts
+        run: >-
+          python3 infra/space/kind/scripts/rust-artifact-handoff.py publish
+          ghcr.io/perplexityai/space-kind-rust-artifacts
+          --record "${RUNNER_TEMP}/kind-rust-artifact-digest/kind-rust-artifact-digest.json"
+
+      # {key, digest, repository, commit}; publish writes it only after a push.
+      - name: Upload the published image's digest record
+        if: steps.publish.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kind-rust-artifact-digest
+          path: ${{ runner.temp }}/kind-rust-artifact-digest/kind-rust-artifact-digest.json
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 30
 
       # Only this dedicated cache package is pruned, never release images.
       # Fixed tagged heads stay intact; retain ten untagged versions for readers
@@ -299,12 +342,9 @@ jobs:
       packages: read
     strategy:
       fail-fast: false
-      # Fourteen shards, balanced across both API surfaces together
-      # (space_smoke/sharding.py). The typed scenarios' medians sum to about
-      # 4060 s: twelve shards carried about 340 s each, more than the
-      # leader-election brownout's 297 s. At fourteen the brownout's shard
-      # holds it alone and is the slowest, so a fifteenth would not lower it.
-      # Keep the list, the job name and SMOKE_SHARD's count in step.
+      # Fourteen shards, balanced across both API surfaces together by
+      # space_smoke/sharding.py. Keep the list, the job name and SMOKE_SHARD's
+      # count in step; optimize scenario latency within this parallelism.
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     env:
@@ -325,7 +365,10 @@ jobs:
       # rather than inherited so a default change cannot alter the shards
       # silently.
       SPACE_KIND_TELEMETRY_MODE: otel
+      SPACE_KIND_OBSERVABILITY_LAYOUT: ci
       SPACE_SMOKE_BROWSER_SCENARIOS: ${{ inputs.console_scenarios && 'require' || 'withhold' }}
+      SPACE_SMOKE_TIERS: ${{ inputs.smoke_tiers }}
+      SPACE_SMOKE_INCLUDE_SCENARIOS: ${{ inputs.placement_scenarios && 'local.node_selector_extras_render_and_enforce' || '' }}
     runs-on: ubuntu-24.04-16core
     timeout-minutes: 180
     steps:
@@ -454,8 +497,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 infra/space/kind/scripts/rust-artifact-handoff.py wait
 
+      # Retried once after a pause, as in rust_artifacts_publish; a second
+      # failure fails the shard.
       - &download-rust-artifacts
         name: Download this attempt's Rust artifact image
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kind-rust-${{ github.sha }}-${{ env.SPACE_KIND_RUST_PRODUCER_ATTEMPT }}
+          path: ${{ runner.temp }}/kind-rust
+
+      - *pause-before-download-retry
+
+      - &download-rust-artifacts-again
+        name: Download this attempt's Rust artifact image again
+        if: steps.download.outcome == 'failure'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: kind-rust-${{ github.sha }}-${{ env.SPACE_KIND_RUST_PRODUCER_ATTEMPT }}
@@ -528,7 +585,7 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-      # Together the shards cover every ecw, network_policy, native, and local scenario.
+      # Together the shards cover the selected tiers on both API surfaces.
       # Each shard stays serial against the isolated stack its baseline proved. The suite
       # exits 1 on any failed scenario and 2 on an inconclusive one or a missing tool, so a
       # partial run cannot report green. A scenario declared `quarantined=` is withheld and
@@ -549,43 +606,16 @@ jobs:
           SPACE_M1_GENERATOR_MIRROR: ghcr.io/perplexityai/space-ci-mirror
           SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE: ${{ runner.temp }}/space-smoke-admin-token
           SPACE_SMOKE_KIND_COLD_RECEIPTS: ${{ runner.temp }}/space-smoke-cold-receipts
+        # The admin token, cold-receipts directory and data-plane wait are the
+        # script's, which every scripts/tests/smoke-kind-parallel.sh bench runs too.
         run: |
           set -euo pipefail
-          for tool in aws curl jq; do
-            if ! command -v "${tool}" >/dev/null 2>&1; then
-              echo "::error::The typed Kind smoke needs ${tool} on the runner"
-              exit 1
-            fi
-          done
           uv_bin="$(bash ci/scripts/ensure-uv.sh)"
           uv_dir="$(dirname "${uv_bin}")"
           export PATH="${uv_dir}:${PATH}"
-          install -d -m 0700 "${SPACE_SMOKE_KIND_COLD_RECEIPTS}"
-          curl -fsS -X POST http://localhost:8080/auth/v1/sessions \
-            -H 'content-type: application/json' \
-            -d '{"email":"root@local","password":"password"}' \
-            | jq -r '.token // empty' >"${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE}"
-          chmod 0600 "${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE}"
-          if [[ ! -s "${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE}" ]]; then
-            echo "::error::Could not obtain an admin session token from the Kind API"
-            exit 1
-          fi
-          # Belt and braces for the baseline's wait: the typed scenarios talk to the data
-          # plane from their first command, so prove it answers before starting any of them.
-          for _ in $(seq 1 150); do
-            if curl -sf -m 2 http://127.0.0.1:8090/healthz >/dev/null 2>&1; then
-              break
-            fi
-            sleep 2
-          done
-          if ! curl -sf -m 2 http://127.0.0.1:8090/healthz >/dev/null 2>&1; then
-            echo "::error::The Kind data plane at 127.0.0.1:8090 never became healthy"
-            exit 1
-          fi
-          # Kept for the failure-telemetry step, which reads the failed
-          # scenarios' sandbox ids from it.
-          bash scripts/tests/smoke-kind-typed.sh all "${SMOKE_SHARD}" 2>&1 \
-            | tee "${RUNNER_TEMP}/kind-typed-smoke.log"
+          # The log is kept for the failure-telemetry step, which reads the
+          # failed scenarios' sandbox ids from it.
+          bash scripts/tests/lib/kind-typed-shard.sh "${RUNNER_TEMP}/kind-typed-smoke.log"
 
       # Every command below is bounded, and each step has a deadline: a wedged
       # apiserver, Tilt, or node must not hold the job until its own deadline and
@@ -750,11 +780,13 @@ jobs:
       # The shards' telemetry profile, so both lanes run the same scenarios
       # and a failure leaves the same telemetry evidence.
       SPACE_KIND_TELEMETRY_MODE: otel
+      SPACE_KIND_OBSERVABILITY_LAYOUT: ci
       # The lane runs only with static storage credentials: the
       # credential-manager authority admits a node by its Kubernetes node
       # registration, which a Direct node does not have.
       SPACE_KIND_SUBSTRATE: direct
       SPACE_KIND_STORAGE_CREDENTIALS: static
+      SPACE_SMOKE_TIERS: ${{ inputs.smoke_tiers }}
     runs-on: ubuntu-24.04-16core
     timeout-minutes: 180
     steps:
@@ -769,6 +801,8 @@ jobs:
       - *install-observability
       - *wait-producer
       - *download-rust-artifacts
+      - *pause-before-download-retry
+      - *download-rust-artifacts-again
       - *load-rust-artifacts
       - *record-bringup-timeline
 

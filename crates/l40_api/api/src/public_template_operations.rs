@@ -1,16 +1,18 @@
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
-use pplx_space_common_core::sql;
 use std::time::Duration;
 
 use pplx_space_cluster_pool::{TemplateWarmPoolUsage, WarmPoolStore};
-use pplx_space_common_core::types::{SubstrateKind, TemplateDesiredState, TemplateName};
+use pplx_space_cluster_trigger_queue::enqueue_triggers;
+use pplx_space_node_model::SubstrateKind;
 use pplx_space_public_api::{
     OperationState, PublicErrorCode, PublicErrorDetail, PublicOperationResult,
     PublicTemplateOperationResult,
 };
+use pplx_space_sandbox_teardown::delete_reconcile_state_for_elements;
+use pplx_space_template_model::{TemplateDesiredState, TemplateName};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgConnection, PgPool, Row};
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::{
@@ -18,9 +20,8 @@ use crate::{
     public_sandbox_operations::PublicOperationExecutionResult,
     reconcile_queue::{
         NetworkPolicyTarget, ReconcileElementRef, ReconcileRef,
-        delete_reconcile_state_for_elements, enqueue_node_reconcile_refs_for_nodes,
+        enqueue_node_reconcile_refs_for_nodes,
     },
-    reconcile_trigger::enqueue_triggers,
 };
 
 const TEMPLATE_DELETE_RETRY_AFTER: Duration = Duration::from_secs(5);
@@ -368,15 +369,8 @@ async fn fetch_template_desired_state(
     pool: &PgPool,
     template: &TemplateName,
 ) -> Result<Option<TemplateDesiredState>, sqlx::Error> {
-    let row = sqlx::query(sql!("SELECT desired_state FROM templates WHERE name = $1"))
-        .bind(template.as_str())
-        .fetch_optional(pool)
-        .await?;
-    Ok(row.and_then(|row| {
-        row.try_get::<String, _>("desired_state")
-            .ok()
-            .and_then(|state| state.parse().ok())
-    }))
+    let state = pplx_space_template_store::templates::desired_state(pool, template).await?;
+    Ok(state.and_then(|state| state.parse().ok()))
 }
 
 async fn mark_template_deleting(
@@ -384,43 +378,27 @@ async fn mark_template_deleting(
     template: &TemplateName,
     operation: &ClaimedPublicOperation,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "UPDATE templates
-         SET desired_state = $2,
-             delete_requested_at = COALESCE(delete_requested_at, NOW()),
-             delete_requested_by = COALESCE(delete_requested_by, $3),
-             delete_operation_id = COALESCE(delete_operation_id, $4),
-             updated_at = NOW()
-         WHERE name = $1"
-    ))
-    .bind(template.as_str())
-    .bind(TemplateDesiredState::Deleting.as_str())
-    .bind(operation.actor_user_id)
-    .bind(operation.id.as_uuid())
-    .execute(pool)
-    .await?;
-    Ok(())
+    pplx_space_template_store::templates::mark_deleting(
+        pool,
+        template,
+        operation.actor_user_id,
+        operation.id.as_uuid(),
+    )
+    .await
+    .map_err(sqlx::Error::from)
 }
 
 async fn nodes_with_template_inventory(
     pool: &PgPool,
     template: &TemplateName,
 ) -> Result<Vec<NodeId>, sqlx::Error> {
-    sqlx::query_scalar::<_, NodeId>(sql!(
-        "SELECT DISTINCT nti.node_id
-         FROM node_template_inventory nti
-         JOIN nodes n ON n.id = nti.node_id
-         LEFT JOIN node_direct nd ON nd.node_id = n.id
-         WHERE nti.template_name = $1
-           AND (
-             n.managed_by != $2
-             OR (nd.node_id IS NOT NULL AND nd.deleted_at IS NULL)
-           )"
-    ))
-    .bind(template.as_str())
-    .bind(SubstrateKind::Space)
-    .fetch_all(pool)
+    pplx_space_node_template_inventory_store::direct::template_holder_ids(
+        pool,
+        template,
+        SubstrateKind::Space,
+    )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 async fn enqueue_template_delete_reconcile(
@@ -439,21 +417,28 @@ async fn enqueue_template_delete_reconcile(
     Ok(())
 }
 
-enum MarkTemplateDeleted {
+pub(crate) enum MarkTemplateDeleted {
     Deleted,
     InUse(TemplateInUse),
 }
 
-async fn mark_template_deleted(
+pub(crate) async fn mark_template_deleted(
     pool: &PgPool,
     template: &TemplateName,
     operation_id: Uuid,
 ) -> Result<MarkTemplateDeleted, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    // The template row first, as an admin release delete and a release
+    // registration take it, then the release rows. Taking it only at the
+    // final update would let an admin delete that holds it wait on a
+    // storage location this transaction deleted, while this one waits on
+    // that delete's tag row. `NO KEY UPDATE` is the lock the final update
+    // takes anyway, and doesn't conflict with foreign-key checks.
+    pplx_space_template_store::templates::lock_no_key_update(&mut *tx, template).await?;
     if let Some(in_use) = TemplateInUse::check(&mut tx, template).await? {
         return Ok(MarkTemplateDeleted::InUse(in_use));
     }
-    let retired = WarmPoolStore::delete_disabled_for_template(&mut tx, template).await?;
+    let retired = WarmPoolStore::delete_disabled_for_template(&mut *tx, template).await?;
     if retired != Default::default() {
         tracing::info!(
             template = template.as_str(),
@@ -468,28 +453,19 @@ async fn mark_template_deleted(
         ReconcileElementRef::template_desired_state(template.clone()),
         ReconcileElementRef::template_base_snapshot_policy(template.clone()),
     ];
-    delete_reconcile_state_for_elements(&mut tx, &cleanup_refs).await?;
-    sqlx::query(sql!(
-        "DELETE FROM template_release_storage_locations
-         WHERE template_release_id IN (
-           SELECT id FROM template_releases WHERE template_name = $1
-         )"
-    ))
-    .bind(template.as_str())
-    .execute(&mut *tx)
+    delete_reconcile_state_for_elements(&mut *tx, &cleanup_refs).await?;
+    pplx_space_template_release_store::removal::delete_storage_locations_of_template(
+        &mut *tx,
+        template.as_str(),
+    )
     .await?;
-    sqlx::query(sql!(
-        "DELETE FROM template_release_tags WHERE template_name = $1"
-    ))
-    .bind(template.as_str())
-    .execute(&mut *tx)
-    .await?;
-    let releases = sqlx::query(sql!(
-        "DELETE FROM template_releases WHERE template_name = $1"
-    ))
-    .bind(template.as_str())
-    .execute(&mut *tx)
-    .await;
+    pplx_space_template_store::release_tags::delete_for_template(&mut *tx, template).await?;
+    let releases = pplx_space_template_release_store::removal::delete_releases_of_template(
+        &mut *tx,
+        template.as_str(),
+    )
+    .await
+    .map_err(sqlx::Error::from);
     if let Err(error) = releases {
         // A reference that committed after the check above. A new slot or
         // enabled config is reported, rather than retrying a delete that
@@ -508,36 +484,10 @@ async fn mark_template_deleted(
         }
         return Err(error);
     }
-    sqlx::query(sql!(
-        "DELETE FROM template_pool_policies WHERE template = $1"
-    ))
-    .bind(template.as_str())
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(sql!(
-        "DELETE FROM template_default_auto_lifecycle_policies WHERE template = $1"
-    ))
-    .bind(template.as_str())
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(sql!(
-        "DELETE FROM template_base_snapshot_policies WHERE template = $1"
-    ))
-    .bind(template.as_str())
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(sql!(
-        "UPDATE templates
-         SET desired_state = $2,
-             delete_operation_id = COALESCE(delete_operation_id, $3),
-             updated_at = NOW()
-         WHERE name = $1"
-    ))
-    .bind(template.as_str())
-    .bind(TemplateDesiredState::Deleted.as_str())
-    .bind(operation_id)
-    .execute(&mut *tx)
-    .await?;
+    pplx_space_template_store::pool_policies::delete(&mut *tx, template).await?;
+    pplx_space_template_store::default_auto_lifecycle_policies::delete(&mut *tx, template).await?;
+    pplx_space_template_store::base_snapshot_policies::delete(&mut *tx, template).await?;
+    pplx_space_template_store::templates::mark_deleted(&mut *tx, template, operation_id).await?;
     tx.commit().await?;
     Ok(MarkTemplateDeleted::Deleted)
 }

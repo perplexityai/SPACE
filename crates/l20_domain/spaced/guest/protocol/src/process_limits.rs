@@ -4,4 +4,4 @@
 pub const PAYLOAD_SLOTS: usize = 8;
 pub const START_PAYLOAD_SLOTS: u32 = 4;
 pub const PAYLOAD_METHODS: &[(&str, u32)] = &[("Start", START_PAYLOAD_SLOTS), ("SendInput", 1)];
-pub const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_MESSAGE_BYTES: usize = pplx_space_guest_process::MAX_MESSAGE_BYTES;

@@ -340,3 +340,35 @@ fn rejects_non_regular_source_without_blocking() {
         "FIFO source",
     );
 }
+
+/// A disk file is never empty. An empty source is refused before anything
+/// replaces the destination, so the destination's bytes survive the refusal
+/// and its retry; a non-empty source is copied over them as before, and the
+/// general copy still copies an empty file.
+#[test]
+fn a_disk_file_copy_refuses_an_empty_source_and_keeps_the_destination() {
+    let (_tmp, root) = setup();
+    let src = root.join("snapshot").join("cow.luks");
+    let dst = root.join("instance").join("cow.luks");
+    std::fs::write(&src, b"").unwrap();
+    std::fs::write(&dst, b"retained guest writes").unwrap();
+
+    for attempt in ["first attempt", "retry"] {
+        assert_escape(stage_disk_file_contained(&root, &src, &dst), attempt);
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            b"retained guest writes",
+            "{attempt}"
+        );
+    }
+
+    std::fs::write(&src, b"sealed checkpoint writes").unwrap();
+    stage_disk_file_contained(&root, &src, &dst).unwrap();
+    assert_eq!(std::fs::read(&dst).unwrap(), b"sealed checkpoint writes");
+
+    let empty = root.join("snapshot").join("empty");
+    std::fs::write(&empty, b"").unwrap();
+    let out = root.join("instance").join("out");
+    stage_file_contained(&root, &empty, &out).unwrap();
+    assert_eq!(std::fs::read(&out).unwrap(), b"");
+}

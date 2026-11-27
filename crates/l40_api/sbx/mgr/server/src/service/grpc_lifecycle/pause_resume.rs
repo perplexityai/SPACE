@@ -37,7 +37,7 @@ fn roll_back_pause_best_effort(
 }
 
 #[cfg(test)]
-pub(super) type GuestPreparation = Arc<
+pub(in crate::service) type GuestPreparation = Arc<
     dyn Fn(
             String,
         ) -> futures_util::future::BoxFuture<
@@ -52,7 +52,20 @@ tokio::task_local! {
     /// Replaces the guest snapshot preparation of pause and the suspend
     /// auto-pause, which dials the host's per-sandbox spaced-host socket, and
     /// lets a test act between their state writes.
-    pub(super) static GUEST_PREPARATION: GuestPreparation;
+    pub(in crate::service) static GUEST_PREPARATION: GuestPreparation;
+}
+
+#[cfg(test)]
+pub(super) fn inherit_guest_preparation<F: std::future::Future>(
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let prepare = GUEST_PREPARATION.try_with(Clone::clone).ok();
+    async move {
+        match prepare {
+            Some(prepare) => GUEST_PREPARATION.scope(prepare, future).await,
+            None => future.await,
+        }
+    }
 }
 
 pub(super) async fn prepare_guest_for_pause(
@@ -248,7 +261,7 @@ impl SandboxManagerService {
         let sandbox = self.lookup_sandbox(sandbox_id)?;
         self.authorize_template_manager_sandbox(&peer, &sandbox, "Pause")?;
         crate::service::guest_image::require_memory_lifecycle(&sandbox)?;
-        let runtime: pplx_space_common_core::types::RuntimeKind = sandbox
+        let runtime: pplx_space_execution_spec::RuntimeKind = sandbox
             .runtime
             .parse()
             .map_err(|e| Status::failed_precondition(format!("runtime: {e}")))?;
@@ -556,17 +569,18 @@ impl SandboxManagerService {
             }
             // A Kubernetes sandbox launches in its pod's shim at container
             // create, which never sees this Wake, and the Wake has no pod
-            // namespace to boot in. Its upgrade is the pod's own
-            // `runtime-upgrade` checkpoint, so here it is refused before
+            // namespace to boot in. Reading pod hosting from the substrate
+            // relies on substrate == hosting today. Its upgrade is the pod's
+            // own `runtime-upgrade` checkpoint, so here it is refused before
             // anything is staged, fenced or booted. Whether the sandbox is a
             // Kubernetes one is the request's identity or, for a sandbox the
             // node holds, its row's, so for a sandbox here a request that
             // leaves its substrate out can't pass for a Direct one. One that
             // names neither substrate nor pod for a sandbox the node doesn't
             // hold is an identity-free Direct activation.
-            let kubernetes = |identity: &pplx_space_common_core::types::SpaceApiRouteIdentity| {
+            let kubernetes = |identity: &pplx_space_sandbox_model::SpaceApiRouteIdentity| {
                 identity.effective_substrate_kind()
-                    == Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes)
+                    == Some(pplx_space_node_model::NodeManagedBy::Kubernetes)
             };
             let row_kubernetes = match self.lookup_sandbox(&req.sandbox_id) {
                 Ok(row) => kubernetes(&row.space_api_route_identity),
@@ -673,11 +687,23 @@ impl SandboxManagerService {
                 ..Default::default()
             };
             // An upgrade boots the staged disk, so the checkpoint is staged
-            // and left suspended rather than launched.
-            let staged = if start.runtime_upgrade.is_some() {
-                // Boxed, like the upgrade it precedes: inlined, the staging
-                // future would grow every Wake's state machine.
-                Box::pin(self.stage_missing_checkpoint(staging_start)).await
+            // and left suspended rather than launched. An abandoned one
+            // stages nothing. This runs outside the upgrade lock, so it only
+            // spares the transfer: the check under that lock, before the
+            // upgrade itself, is the one an abandon is ordered against.
+            // Each failure carries the reason its event names.
+            const STAGING: &str = "stage_from_checkpoint";
+            let staged = if let Some(upgrade) = &start.runtime_upgrade {
+                match self.abandoned_runtime_upgrade_refusal(upgrade.operation_id(), &sandbox_id) {
+                    // Boxed, like the upgrade it precedes: inlined, the
+                    // staging future would grow every Wake's state machine.
+                    Ok(None) => Box::pin(self.stage_missing_checkpoint(staging_start))
+                        .await
+                        .map_err(|error| (error, STAGING)),
+                    Ok(Some(refused)) => Err((refused, "runtime_upgrade_abandoned")),
+                    // A read that failed isn't an abandonment.
+                    Err(error) => Err((error, STAGING)),
+                }
             } else {
                 self.start_sandbox_with_authority(
                     staging_start,
@@ -686,15 +712,16 @@ impl SandboxManagerService {
                 )
                 .await
                 .map(drop)
+                .map_err(|error| (error, STAGING))
             };
-            if let Err(error) = staged {
+            if let Err((error, reason)) = staged {
                 emit_sandbox_event(
                     &sandbox_id,
                     SandboxEventType::WakeFailed,
                     SandboxEventSource::SbxManager,
                     SandboxEventDetails::default()
                         .target_state(target_state.to_string())
-                        .reason("stage_from_checkpoint")
+                        .reason(reason)
                         .error(error.to_string()),
                 );
                 return Err(error);

@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::{DEPLOY_SANDBOX_OWNER, DEV_SANDBOX_OWNER};
+use pplx_space_accounts::{DEPLOY_SANDBOX_OWNER, DEV_SANDBOX_OWNER};
 
 #[test]
 fn local_sandbox_owner_for_effective_identity_maps_core_cases() {

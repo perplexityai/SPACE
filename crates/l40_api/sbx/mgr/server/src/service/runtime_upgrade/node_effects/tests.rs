@@ -7,13 +7,14 @@ use std::path::PathBuf;
 use crate::node_manager_transport::fake::{FakeNodeManager, ServedNodeManager};
 use crate::service::SandboxManagerServiceOptions;
 use crate::state::SandboxStatus;
-use pplx_space_common_core::types::{LocalArtifactId, SandboxActivationAttemptId};
-use pplx_space_common_core::types::{
-    SandboxArtifactMetadata, SandboxId, SnapshotExecutionMetadata,
-};
+use pplx_space_artifact_model::SandboxArtifactMetadata;
+use pplx_space_execution_spec::SnapshotExecutionMetadata;
 use pplx_space_node_mgr_client::proto::{
     CreateBtrfsSnapshotResponse, DeleteBtrfsSnapshotResponse, RestoreInstanceSnapshotResponse,
 };
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::LocalArtifactId;
 use std::sync::{Arc, Mutex};
 
 pub(in crate::service::runtime_upgrade) struct Fixture {
@@ -29,7 +30,7 @@ pub(in crate::service::runtime_upgrade) struct Fixture {
 pub(in crate::service::runtime_upgrade) fn environments() -> (ExecutionMetadata, ExecutionMetadata)
 {
     let compiled = pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap();
     (
@@ -86,7 +87,7 @@ pub(in crate::service::runtime_upgrade) fn fixture(
         std::fs::write(checkpoint.join("vmstate"), b"vmstate").unwrap();
     }
     let node = node.serve();
-    let service = SandboxManagerService::new_with_options(
+    let mut service = SandboxManagerService::new_with_options(
         conn,
         SandboxManagerServiceOptions {
             node_manager: node.connector(),
@@ -94,6 +95,9 @@ pub(in crate::service::runtime_upgrade) fn fixture(
             ..SandboxManagerServiceOptions::for_test()
         },
     );
+    // The fixture exercises attempt finality; the switch-off tests turn it
+    // off.
+    service.runtime_upgrade_attempt_finality = true;
     Fixture {
         _directory: directory,
         cache,
@@ -114,6 +118,22 @@ impl Fixture {
         self.service.lookup_sandbox(&self.sandbox_id).unwrap()
     }
 
+    /// The sandbox's cache directory.
+    pub(in crate::service::runtime_upgrade) fn dir(&self) -> PathBuf {
+        self.cache.join(&self.sandbox_id)
+    }
+
+    pub(in crate::service::runtime_upgrade) fn write_sidecar(
+        &self,
+        meta: crate::snapshot_upload::SnapshotMeta,
+    ) {
+        std::fs::write(
+            self.checkpoint().join("snapshot.json"),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
     pub(in crate::service::runtime_upgrade) fn checkpoint(&self) -> PathBuf {
         self.cache.join(&self.sandbox_id).join("snapshot")
     }
@@ -125,6 +145,7 @@ impl Fixture {
             &self.service.db.lock().unwrap(),
             &self.sandbox_id,
             self.target.environment().unwrap(),
+            crate::db::RuntimeUpgradeTargetState::Started,
             identity,
         )
     }
@@ -235,17 +256,368 @@ async fn inspection_refuses_a_sandbox_without_its_local_disk() {
     // A cold start without the rootfs would boot a fresh template clone.
     let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
     std::fs::remove_file(f.cache.join(&f.sandbox_id).join("instance/rootfs.ext4")).unwrap();
-    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    let Refusal::Final(error) = f.effects().inspect_local_disk(&f.row()).await.unwrap_err() else {
+        panic!("a missing rootfs is final for the pod");
+    };
     assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
     assert!(error.message().contains("rootfs"), "{error}");
+    // And one the rollback of its preserved copy restores: a non-empty
+    // regular file, not followed through a link.
+    let rootfs = f.cache.join(&f.sandbox_id).join("instance/rootfs.ext4");
+    let elsewhere = f.cache.join("plaintext-elsewhere.ext4");
+    std::fs::write(&elsewhere, b"disk").unwrap();
+    for unrestorable in ["empty", "directory", "link"] {
+        match unrestorable {
+            "empty" => std::fs::write(&rootfs, b"").unwrap(),
+            "directory" => std::fs::create_dir(&rootfs).unwrap(),
+            _ => std::os::unix::fs::symlink(&elsewhere, &rootfs).unwrap(),
+        }
+        let error = f
+            .effects()
+            .inspect_local_disk(&f.row())
+            .await
+            .unwrap_err()
+            .into_status();
+        assert_eq!(
+            error.code(),
+            tonic::Code::FailedPrecondition,
+            "{unrestorable}: {error}"
+        );
+        assert!(
+            error
+                .message()
+                .contains("rootfs.ext4 is empty or not a regular file"),
+            "{unrestorable}: {error}"
+        );
+        if rootfs.is_dir() && !rootfs.is_symlink() {
+            std::fs::remove_dir(&rootfs).unwrap();
+        } else {
+            std::fs::remove_file(&rootfs).unwrap();
+        }
+    }
+    std::fs::write(&rootfs, b"disk").unwrap();
+    f.effects().inspect_local_disk(&f.row()).await.unwrap();
 
     // An encrypted sandbox needs its COW too.
     let f = fixture(SandboxState::Suspended, true, FakeNodeManager::default());
     f.effects().inspect_local_disk(&f.row()).await.unwrap();
     std::fs::remove_file(f.cache.join(&f.sandbox_id).join("instance/cow.luks")).unwrap();
-    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    // Retryable: finishing a checkpoint staged here lays the COW down once
+    // the staged-checkpoint switch is on, so a retry may find it.
+    let Refusal::Retry(error) = f.effects().inspect_local_disk(&f.row()).await.unwrap_err() else {
+        panic!("a missing COW may be laid down for a retry");
+    };
     assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
     assert!(error.message().contains("COW"), "{error}");
+}
+
+/// The sidecar of a suspend checkpoint of `f`'s sandbox, naming `artifact`.
+pub(in crate::service::runtime_upgrade) fn checkpoint_sidecar(
+    f: &Fixture,
+    encrypted: bool,
+    artifact: Option<LocalArtifactId>,
+) -> crate::snapshot_upload::SnapshotMeta {
+    crate::snapshot_upload::SnapshotMeta {
+        version: 1,
+        execution: None,
+        sandbox_id: f.sandbox_id.clone(),
+        size_bytes: 900,
+        rootfs_size_bytes: None,
+        created_at: "2026-11-09T00:00:00Z".to_string(),
+        source: crate::snapshot_upload::SnapshotSource {
+            runtime: "fc".to_string(),
+            runtime_version: None,
+            state_format_version: None,
+            template_id: "seed".to_string(),
+            content_hash: Some(DIGEST.to_string()),
+            rootfs_size_mib: None,
+            rootfs_version: None,
+            kernel_version: None,
+            kernel_digest: None,
+            disk_io_max_operations_per_sec: None,
+            disk_io_max_bandwidth_mib_per_sec: None,
+        },
+        sandbox: None,
+        rootfs_diff_format: None,
+        rootfs_send_source_id: None,
+        encrypted,
+        rootfs_encryption_source: None,
+        local_artifact_id: artifact,
+        artifact_kind: Some(pplx_space_snapshot_model::ArtifactKind::Full),
+        artifact_origin: Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend),
+        artifact_snapshot_name: None,
+    }
+}
+
+/// A template digest that parses, naming the bytes an encrypted COW was
+/// written over.
+pub(in crate::service::runtime_upgrade) const DIGEST: &str =
+    "sha256:5e0f1d2c3b4a59687766554433221100ffeeddccbbaa99887766554433221100";
+
+/// A node-manager answering `GetCloneCapabilities` with or without
+/// `staged_checkpoint_disk`.
+pub(in crate::service::runtime_upgrade) fn node_restoring_cow_only_copies(
+    supported: bool,
+) -> FakeNodeManager {
+    FakeNodeManager::default().unary(
+        "GetCloneCapabilities",
+        move |_: pplx_space_node_mgr_client::proto::CloneCapabilitiesRequest| {
+            Ok(
+                pplx_space_node_mgr_client::proto::CloneCapabilitiesResponse {
+                    prepared_clone_disposal: false,
+                    staged_checkpoint_disk: supported,
+                },
+            )
+        },
+    )
+}
+
+/// In a mixed-version rollout, an encrypted copy without its rootfs is
+/// refused before the fence by a node-manager that can't restore one, as it
+/// is by one older than `GetCloneCapabilities`. A copy with its rootfs needs
+/// no such node-manager and asks nothing.
+#[tokio::test]
+async fn a_cow_only_copy_needs_a_node_manager_that_restores_one() {
+    for node in [
+        node_restoring_cow_only_copies(false),
+        FakeNodeManager::default(),
+    ] {
+        let mut f = fixture(SandboxState::Suspended, true, node);
+        f.service.staged_checkpoint_disk = true;
+        f.service
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sandboxes SET template_hash = ?2 WHERE id = ?1",
+                crate::db::fixture::params![f.sandbox_id, DIGEST],
+            )
+            .unwrap();
+        f.effects().inspect_local_disk(&f.row()).await.unwrap();
+        assert!(f._node.calls().is_empty(), "{:?}", f._node.calls());
+
+        std::fs::remove_file(f.cache.join(&f.sandbox_id).join("instance/rootfs.ext4")).unwrap();
+        let error = f
+            .effects()
+            .inspect_local_disk(&f.row())
+            .await
+            .unwrap_err()
+            .into_status();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+        assert!(
+            error.message().contains("roll node-manager out first"),
+            "{error}"
+        );
+        assert_eq!(f._node.calls(), ["GetCloneCapabilities"]);
+    }
+}
+
+/// With the switch off, an encrypted copy without its rootfs is refused as
+/// it was before the switch existed, even by a node-manager that restores
+/// one, so a copy an earlier upgrade finished starts no new upgrade once the
+/// switch is turned off ahead of a node-manager downgrade.
+#[tokio::test]
+async fn the_switch_off_refuses_a_cow_only_copy() {
+    let f = fixture(
+        SandboxState::Suspended,
+        true,
+        node_restoring_cow_only_copies(true),
+    );
+    assert!(!f.service.staged_checkpoint_disk);
+    f.service
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE sandboxes SET template_hash = ?2 WHERE id = ?1",
+            crate::db::fixture::params![f.sandbox_id, DIGEST],
+        )
+        .unwrap();
+    std::fs::remove_file(f.cache.join(&f.sandbox_id).join("instance/rootfs.ext4")).unwrap();
+    let error = f
+        .effects()
+        .inspect_local_disk(&f.row())
+        .await
+        .unwrap_err()
+        .into_status();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert!(
+        error
+            .message()
+            .contains(crate::service::STAGED_CHECKPOINT_DISK_ENV),
+        "{error}"
+    );
+    assert!(f._node.calls().is_empty(), "{:?}", f._node.calls());
+}
+
+#[tokio::test]
+async fn an_encrypted_sandbox_needs_its_cow_and_a_template_digest_for_its_origin() {
+    // Its writes are all in the COW, over the template's rootfs, which the
+    // cold start clones when the instance has none, as a staged checkpoint's
+    // instance doesn't.
+    let mut f = fixture(
+        SandboxState::Suspended,
+        true,
+        node_restoring_cow_only_copies(true),
+    );
+    f.service.staged_checkpoint_disk = true;
+    let set_digest = |digest: Option<&str>| {
+        f.service
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sandboxes SET template_hash = ?2 WHERE id = ?1",
+                crate::db::fixture::params![f.sandbox_id, digest],
+            )
+            .unwrap();
+    };
+    set_digest(Some(DIGEST));
+    std::fs::remove_file(f.cache.join(&f.sandbox_id).join("instance/rootfs.ext4")).unwrap();
+    f.effects().inspect_local_disk(&f.row()).await.unwrap();
+
+    // One that doesn't parse names nothing either.
+    set_digest(Some("not a digest"));
+    let error = f
+        .effects()
+        .inspect_local_disk(&f.row())
+        .await
+        .unwrap_err()
+        .into_status();
+    assert!(error.message().contains("template digest"), "{error}");
+
+    // Without a digest, nothing names the bytes the COW was written over.
+    f.service
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE sandboxes SET template_hash = NULL WHERE id = ?1",
+            crate::db::fixture::params![f.sandbox_id],
+        )
+        .unwrap();
+    let error = f
+        .effects()
+        .inspect_local_disk(&f.row())
+        .await
+        .unwrap_err()
+        .into_status();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert!(error.message().contains("template digest"), "{error}");
+
+    // An origin on disk needs no digest, but must be one the rollback of the
+    // preserved copy restores: not empty, and not a link to a file.
+    let rootfs = f.cache.join(&f.sandbox_id).join("instance/rootfs.ext4");
+    for digest in [None, Some(DIGEST)] {
+        set_digest(digest);
+        std::fs::write(&rootfs, b"").unwrap();
+        let error = f
+            .effects()
+            .inspect_local_disk(&f.row())
+            .await
+            .unwrap_err()
+            .into_status();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+        assert!(error.message().contains("rootfs.ext4"), "{error}");
+        assert!(
+            error.message().contains("empty or not a regular file"),
+            "{error}"
+        );
+    }
+    let elsewhere = f.cache.join("elsewhere.ext4");
+    std::fs::write(&elsewhere, b"disk").unwrap();
+    std::fs::remove_file(&rootfs).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &rootfs).unwrap();
+    let error = f
+        .effects()
+        .inspect_local_disk(&f.row())
+        .await
+        .unwrap_err()
+        .into_status();
+    assert!(
+        error.message().contains("empty or not a regular file"),
+        "{error}"
+    );
+    std::fs::remove_file(&rootfs).unwrap();
+    std::fs::write(&rootfs, b"disk").unwrap();
+    set_digest(None);
+    f.effects().inspect_local_disk(&f.row()).await.unwrap();
+
+    // The COW must be a non-empty regular file, as the rollback of a
+    // preserved copy without the rootfs requires: not empty, and not a link
+    // to one that isn't.
+    let cow = f.cache.join(&f.sandbox_id).join("instance/cow.luks");
+    std::fs::write(&cow, b"").unwrap();
+    let error = f
+        .effects()
+        .inspect_local_disk(&f.row())
+        .await
+        .unwrap_err()
+        .into_status();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert!(
+        error.message().contains("empty or not a regular file"),
+        "{error}"
+    );
+    let target = f.cache.join("elsewhere.luks");
+    std::fs::write(&target, b"cow").unwrap();
+    std::fs::remove_file(&cow).unwrap();
+    std::os::unix::fs::symlink(&target, &cow).unwrap();
+    let error = f
+        .effects()
+        .inspect_local_disk(&f.row())
+        .await
+        .unwrap_err()
+        .into_status();
+    assert!(
+        error.message().contains("empty or not a regular file"),
+        "{error}"
+    );
+}
+
+/// A required file whose path can't be checked, here because a file sits
+/// where its parent directory belongs, may be checkable on a retry, so the
+/// refusal is a retry; one that's absent is final.
+#[test]
+fn a_required_file_that_cant_be_checked_is_a_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let not_a_directory = directory.path().join("instance");
+    std::fs::write(&not_a_directory, b"").unwrap();
+    let Refusal::Retry(error) =
+        required_file(&not_a_directory.join("rootfs.ext4"), "rootfs").unwrap_err()
+    else {
+        panic!("a path that can't be checked is not final for the pod");
+    };
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+
+    let Refusal::Final(_) =
+        required_file(&directory.path().join("rootfs.ext4"), "rootfs").unwrap_err()
+    else {
+        panic!("an absent file is final for the pod");
+    };
+}
+
+/// Runtime metadata that can't be read, here a directory where the file
+/// belongs, may be readable on a retry, so its refusal is a retry; metadata
+/// that reads but doesn't parse answers every retry the same way and is
+/// final. Both answer `FAILED_PRECONDITION`.
+#[tokio::test]
+async fn inspection_retries_metadata_it_cant_read_and_refuses_metadata_it_cant_parse() {
+    let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
+    let metadata = f.cache.join(&f.sandbox_id).join("metadata.json");
+    let _ = std::fs::remove_file(&metadata);
+    std::fs::create_dir(&metadata).unwrap();
+    let Refusal::Retry(error) = f.effects().inspect_local_disk(&f.row()).await.unwrap_err() else {
+        panic!("unreadable metadata is not final for the pod");
+    };
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+
+    std::fs::remove_dir(&metadata).unwrap();
+    std::fs::write(&metadata, b"not json").unwrap();
+    let Refusal::Final(error) = f.effects().inspect_local_disk(&f.row()).await.unwrap_err() else {
+        panic!("unparseable metadata is final for the pod");
+    };
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
 }
 
 #[tokio::test]
@@ -594,7 +966,10 @@ async fn a_stopped_sandbox_has_no_checkpoint_to_retire() {
     assert!(f.lane_garbage().is_empty());
 }
 
-fn set_execution(f: &Fixture, execution: SandboxActivationAttemptId) {
+pub(in crate::service::runtime_upgrade) fn set_execution(
+    f: &Fixture,
+    execution: SandboxActivationAttemptId,
+) {
     f.service
         .db
         .lock()
@@ -646,7 +1021,7 @@ async fn the_stop_is_admitted_only_for_the_boots_execution() {
         let f = fixture(state, false, FakeNodeManager::default());
         let boot = SandboxActivationAttemptId::new();
         set_execution(&f, boot);
-        let sandbox_id: pplx_space_common_core::types::SandboxId = f.sandbox_id.parse().unwrap();
+        let sandbox_id: pplx_space_sandbox_model::SandboxId = f.sandbox_id.parse().unwrap();
 
         let refused = f
             .service
@@ -680,7 +1055,7 @@ async fn the_stop_leaves_the_boots_execution_alone_once_it_is_at_rest() {
         let f = fixture(state, false, FakeNodeManager::default());
         let boot = SandboxActivationAttemptId::new();
         set_execution(&f, boot);
-        let sandbox_id: pplx_space_common_core::types::SandboxId = f.sandbox_id.parse().unwrap();
+        let sandbox_id: pplx_space_sandbox_model::SandboxId = f.sandbox_id.parse().unwrap();
 
         let refused = f
             .service
@@ -710,7 +1085,7 @@ async fn a_stop_that_cant_open_its_claim_is_refused() {
     let f = fixture(SandboxState::Started, false, FakeNodeManager::default());
     let boot = SandboxActivationAttemptId::new();
     set_execution(&f, boot);
-    let sandbox_id: pplx_space_common_core::types::SandboxId = f.sandbox_id.parse().unwrap();
+    let sandbox_id: pplx_space_sandbox_model::SandboxId = f.sandbox_id.parse().unwrap();
     // A transaction left open makes the claim's own BEGIN fail.
     f.service.db.lock().unwrap().execute_batch("BEGIN").unwrap();
 
@@ -762,7 +1137,7 @@ pub(in crate::service::runtime_upgrade) fn certified_target(
 ) -> ExecutionMetadata {
     use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
     let compiled =
-        CompiledEnvironment::for_architecture(pplx_space_common_core::types::Arch::X86_64).unwrap();
+        CompiledEnvironment::for_architecture(pplx_space_cpu_arch::Arch::X86_64).unwrap();
     let target = CompiledEnvironment::of_execution(&compiled, source)
         .unwrap()
         .upgrade_targets()[0];
@@ -773,6 +1148,30 @@ pub(in crate::service::runtime_upgrade) fn certified_target(
         .definition()
         .execution_requirements()
         .unwrap()
+}
+
+/// What node-manager answers when asked to resolve `target`, so the upgrade
+/// gets past selecting its consumer to the cold boot.
+pub(in crate::service::runtime_upgrade) fn resolution_of(
+    target: &ExecutionMetadata,
+) -> pplx_space_node_mgr_client::proto::ResolveExecutionEnvironmentResponse {
+    use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
+    let compiled =
+        CompiledEnvironment::for_architecture(pplx_space_cpu_arch::Arch::X86_64).unwrap();
+    let definition = compiled
+        .iter()
+        .find(|environment| Some(environment.definition().reference()) == target.environment())
+        .unwrap()
+        .definition()
+        .clone();
+    let execution = definition
+        .bind_execution(definition.execution_requirements().unwrap())
+        .unwrap();
+    pplx_space_node_mgr_client::proto::ResolveExecutionEnvironmentResponse {
+        accepted_selection: 0,
+        definition: Some((&definition).into()),
+        execution: Some((&execution).into()),
+    }
 }
 
 fn wake_upgrade_to(
@@ -898,6 +1297,190 @@ async fn a_wake_upgrade_of_a_sandbox_already_on_its_target_wakes_it_as_usual() {
             .any(|call| call.contains("BtrfsSnapshot") || call.contains("InstanceSnapshot")),
         "{:?}",
         f._node.calls()
+    );
+}
+
+/// Record `operation_id` abandoned for `sandbox_id`, as the control plane's
+/// `AbandonRuntimeUpgrade` does.
+fn abandon(service: &crate::service::SandboxManagerService, sandbox_id: &str, operation_id: &str) {
+    assert_eq!(
+        crate::db::abandon_runtime_upgrade(
+            &service.db.lock().unwrap(),
+            sandbox_id,
+            operation_id.parse().unwrap(),
+        )
+        .unwrap(),
+        crate::db::AbandonRuntimeUpgrade::Abandoned
+    );
+}
+
+/// A Wake carrying an upgrade the control plane abandoned on this node is
+/// refused, even for a sandbox already on its target, which the Wake would
+/// otherwise go on to start.
+#[tokio::test]
+async fn a_wake_carrying_an_abandoned_upgrade_never_wakes_the_sandbox() {
+    // Abandoned for this sandbox, or for another one, which the operation id
+    // then doesn't name.
+    for (for_this_sandbox, code) in [
+        (true, tonic::Code::FailedPrecondition),
+        (false, tonic::Code::InvalidArgument),
+    ] {
+        let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
+        crate::db::upsert_sandbox_execution_metadata(
+            &f.service.db.lock().unwrap(),
+            &f.sandbox_id,
+            &f.target,
+        )
+        .unwrap();
+        let operation_id = uuid::Uuid::now_v7().to_string();
+        let abandoned_for = if for_this_sandbox {
+            f.sandbox_id.clone()
+        } else {
+            SandboxId::new().to_string()
+        };
+        abandon(&f.service, &abandoned_for, &operation_id);
+
+        let error = f
+            .service
+            .wake(crate::service::activation_support::internal_request(
+                upgrade_wake(
+                    &f.sandbox_id,
+                    Some(wake_upgrade_to(&f.target, &operation_id)),
+                ),
+            ))
+            .await
+            .expect_err("an abandoned upgrade is refused");
+
+        assert_eq!(error.code(), code, "{error}");
+        assert!(error.message().contains("abandoned"), "{error}");
+        assert_eq!(
+            f.row().state,
+            crate::state::SandboxStatus::from(SandboxState::Stopped)
+        );
+        assert!(f._node.calls().is_empty(), "{:?}", f._node.calls());
+    }
+}
+
+/// A Wake carrying an abandoned operation that already retired is refused
+/// under the upgrade lock, before the upgrade answers it as a replay: a
+/// replay would have the Wake go on to start the sandbox. As in the RPC, one
+/// whose identity differs from the operation's is refused as naming another,
+/// and one matching it as abandoned.
+#[tokio::test]
+async fn a_wake_carrying_an_abandoned_retired_upgrade_never_wakes_the_sandbox() {
+    use crate::db::RuntimeUpgradePhase as Phase;
+    for (authorization_id, code, answered_by) in [
+        (
+            "environment-block",
+            tonic::Code::FailedPrecondition,
+            "abandoned",
+        ),
+        (
+            "another-authorization",
+            tonic::Code::InvalidArgument,
+            "names a different",
+        ),
+    ] {
+        let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
+        let operation_id = uuid::Uuid::now_v7().to_string();
+        let parsed: crate::db::RuntimeUpgradeOperationId = operation_id.parse().unwrap();
+        {
+            let db = f.service.db.lock().unwrap();
+            // `ObservedSandbox` borrows the row, so the row outlives it here.
+            let row = crate::db::get_sandbox(&db, &f.sandbox_id).unwrap().unwrap();
+            // The Wake's own upgrade names "environment-block", so only the
+            // first case is this operation's replay.
+            let begun = crate::db::begin_runtime_upgrade(
+                &db,
+                crate::db::NewRuntimeUpgrade {
+                    operation_id: parsed,
+                    sandbox_id: &f.sandbox_id,
+                    observed: crate::db::ObservedSandbox::of(&row),
+                    target_environment: f.target.environment().unwrap(),
+                    target_state: crate::db::RuntimeUpgradeTargetState::Started,
+                    authorization: &crate::db::RuntimeUpgradeAuthorization {
+                        id: authorization_id.to_string(),
+                        reason: "the source environment is blocked".to_string(),
+                        memory_loss: true,
+                    },
+                    checkpoint_dir_identity: None,
+                    previous_execution: &f.source,
+                    attempt_id: Some("attempt-a"),
+                },
+            )
+            .unwrap();
+            assert!(matches!(begun, crate::db::BeginRuntimeUpgrade::Fenced(_)));
+            for (from, to) in [
+                (Phase::Fenced, Phase::Preserved),
+                (Phase::Preserved, Phase::Booting),
+                (Phase::Booting, Phase::Verified),
+                (Phase::Verified, Phase::Retired),
+            ] {
+                assert!(crate::db::advance_runtime_upgrade(&db, parsed, from, to).unwrap());
+            }
+        }
+        abandon(&f.service, &f.sandbox_id, &operation_id);
+
+        let error = f
+            .service
+            .wake(crate::service::activation_support::internal_request(
+                upgrade_wake(
+                    &f.sandbox_id,
+                    Some(wake_upgrade_to(&f.target, &operation_id)),
+                ),
+            ))
+            .await
+            .expect_err("an abandoned upgrade is refused");
+
+        assert_eq!(error.code(), code, "{authorization_id}: {error}");
+        assert!(
+            error.message().contains(answered_by),
+            "{authorization_id}: {error}"
+        );
+        assert_eq!(
+            f.row().state,
+            crate::state::SandboxStatus::from(SandboxState::Stopped)
+        );
+        assert!(f._node.calls().is_empty(), "{:?}", f._node.calls());
+    }
+}
+
+/// A Wake carrying an abandoned upgrade for a sandbox the node doesn't hold
+/// is refused before it stages the sandbox from its checkpoint.
+#[tokio::test]
+async fn a_wake_carrying_an_abandoned_upgrade_stages_nothing() {
+    let service = crate::service::SandboxManagerService::for_test(crate::db::test_conn());
+    let sandbox_id = SandboxId::new().to_string();
+    let source = environments().0;
+    let target = certified_target(&source);
+    let operation_id = uuid::Uuid::now_v7().to_string();
+    abandon(&service, &sandbox_id, &operation_id);
+    let mut upgrade = wake_upgrade_to(&target, &operation_id);
+    upgrade.checkpoint_local_artifact_id = Some(LocalArtifactId::new().to_string());
+    let mut request = upgrade_wake(&sandbox_id, Some(upgrade));
+    request
+        .start_context
+        .as_mut()
+        .unwrap()
+        .suspend_restore_storage_uri = Some(format!(
+        "s3://space-test/suspend/{sandbox_id}/{}?region=us-east-1",
+        uuid::Uuid::now_v7()
+    ));
+
+    let error = service
+        .wake(crate::service::activation_support::internal_request(
+            request,
+        ))
+        .await
+        .expect_err("an abandoned upgrade is refused");
+
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert!(error.message().contains("abandoned"), "{error}");
+    assert!(
+        crate::db::get_sandbox(&service.db.lock().unwrap(), &sandbox_id)
+            .unwrap()
+            .is_none(),
+        "nothing was staged"
     );
 }
 

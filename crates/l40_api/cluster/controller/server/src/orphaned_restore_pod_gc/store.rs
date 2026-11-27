@@ -2,32 +2,14 @@
 
 use std::collections::HashMap;
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle, SubstrateKind};
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_portability::execution_supersession::ExecutionSupersessionRow;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::backend::SandboxStore;
 use super::classify::{RowLifecycle, SandboxRestoreState};
-
-/// One row of the classification query, decoded by column name so a
-/// reordered `SELECT` can't swap two of the flags. `managed_by` and
-/// `lifecycle` are read as text and parsed per row so one unrecognized value
-/// can't fail the batch. The last four are one [`ExecutionSupersessionRow`].
-/// When the LEFT JOIN found no execution to return, the first three are `NULL`
-/// and the materialized expression reads `FALSE`, so the row is skipped on
-/// `generation`.
-#[derive(sqlx::FromRow)]
-struct ClassifyRow {
-    id: Uuid,
-    managed_by: String,
-    lifecycle: String,
-    generation: Option<i64>,
-    active: Option<bool>,
-    replaced: Option<bool>,
-    materialized: Option<bool>,
-}
 
 /// Map a raw row's `managed_by` + `lifecycle` to what the classifier may act
 /// on: anything but a row with a known lifecycle whose substrate
@@ -77,34 +59,12 @@ impl SandboxStore for SandboxDbStore {
             .iter()
             .map(|(id, floor)| (id.as_uuid(), *floor))
             .unzip();
-        // `$1` = sandbox ids, `$2` = each id's lowest scanned pod generation
-        // (the floor). One row per sandbox and execution that is active or at
-        // or above its floor, or one with NULL execution columns when there is
-        // none. A single statement, so the active execution and the rows above
-        // the floor come from one snapshot.
-        //
-        // `lifecycle <> 'deleted'` excludes soft-delete **tombstone** rows,
-        // which the control plane retains (with `lifecycle = 'deleted'`) until
-        // tombstone-retention hard-deletes them. Excluding them makes a deleted
-        // sandbox's restore pod fall to the row-absent (`SandboxMissing`) path
-        // and be reaped, which is correct: a deleted sandbox has no legitimate
-        // owner for the pod.
-        let rows: Vec<ClassifyRow> = sqlx::query_as(sql!(
-            "SELECT s.id, s.managed_by, s.lifecycle,
-                    e.generation, e.active, e.state = 'replaced' AS replaced,
-                    e.pod_materialized_at IS NOT NULL OR NULLIF(BTRIM(e.pod_uid), '') IS NOT NULL
-                        AS materialized
-               FROM UNNEST($1::uuid[], $2::bigint[]) AS p(sandbox_id, floor_generation)
-               JOIN sandboxes s ON s.id = p.sandbox_id
-               LEFT JOIN sandbox_k8s_executions e
-                 ON e.sandbox_id = s.id
-                AND (e.active OR e.generation >= p.floor_generation)
-              WHERE s.lifecycle <> 'deleted'"
-        ))
-        .bind(&raw_ids)
-        .bind(&raw_floors)
-        .fetch_all(&self.pool)
-        .await?;
+        // One statement, so the active execution and the rows above each
+        // floor come from one snapshot; tombstone rows read as missing, so a
+        // deleted sandbox's restore pod falls to the `SandboxMissing` path.
+        let rows =
+            pplx_space_sandbox_store::restore_pod_owners::list(&self.pool, &raw_ids, &raw_floors)
+                .await?;
         let mut states: HashMap<SandboxId, SandboxRestoreState> = HashMap::new();
         for row in rows {
             let state = states

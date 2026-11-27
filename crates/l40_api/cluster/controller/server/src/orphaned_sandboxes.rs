@@ -9,6 +9,16 @@
 //! recoverable row back to `suspended`, or moves genuinely ambiguous state to
 //! the inert `quarantined` hold state.
 //!
+//! A recovery to `suspended` restores the row's snapshot, which loses what
+//! the node holding the sandbox wrote since, and the activity clocks can't
+//! rule that out. The candidate listing skips a row whose active node has
+//! reported it, for as long as that observed state exists. Live classification
+//! acquires the per-sandbox observation advisory lock before its plan read, so
+//! any `present: true` publication already holding the shared lock finishes
+//! first: if the active node's publication committed, the plan sees it and
+//! defers to the node, just as it does for an already-committed report, and
+//! `recover_orphan_to_suspended` re-checks the invariant itself.
+//!
 //! The reconciler's actions (deletes, recoveries to `suspended` and
 //! quarantines) are capped at `max_classifications_per_minute` in a 60-second
 //! window; anything else, such as a deferral, a terminal skip or an error,
@@ -43,9 +53,8 @@
 //! the operator opts into writes; the deployment itself is the master
 //! enable/disable.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
-use pplx_space_common_core::sql;
 use pplx_space_sandbox_store::delete::delete_with_dependents;
 use pplx_space_sandbox_teardown::delete_reconcile_state_for_elements;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -55,24 +64,18 @@ use std::time::{Duration, Instant};
 use crate::metrics::sandbox::reconciler::{
     self as reconciler_metrics, ClassificationOutcome, ClassificationReason, PodEvidence,
 };
-use pplx_space_common_core::types::{
-    PodUid, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
-    SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SubstrateKind,
-};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
-use pplx_space_sandbox_portability::orphan_recovery_revert_eligibility;
-use pplx_space_sandbox_quarantine_store::{
-    quarantine_history_insert_columns, quarantine_state_conflict_assignments,
-    quarantine_state_insert_columns,
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::{
+    SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
+    SandboxQuarantineReasonCode, SandboxQuarantineSource,
 };
-use pplx_space_sandbox_store::orphan::{
-    self, OrphanGuard, classify_guard_from_sql, classify_guard_lock_sql, classify_guard_sql,
-};
+use pplx_space_sandbox_quarantine_store::orphan_quarantine::{self, OrphanQuarantine};
+use pplx_space_sandbox_store::orphan::{self, OrphanGuard};
 use sqlx::PgPool;
-use sqlx::types::Json;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -211,10 +214,10 @@ impl ReconcilerConfig {
     /// explicitly so deployments can keep the loop observable without giving
     /// it write authority.
     pub fn from_env() -> Self {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
-    pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+    pub(crate) fn from_environment(env: &dyn pplx_space_env_vars::Environment) -> Self {
         let config = env_config::EnvConfig(env);
         Self {
             enabled: config.destructive_gate("SPACE_ORPHANED_SANDBOX_RECONCILER_ENABLED"),
@@ -275,14 +278,6 @@ impl OrphanCandidate {
         // Mirrors the `FinalizeDelete` arms of `plan_orphan_in_tx`; keep in sync.
         self.kind == OrphanKind::LegacyDeleting || self.lifecycle == SandboxLifecycle::Creating
     }
-}
-
-#[derive(sqlx::FromRow)]
-struct OrphanCandidateRow {
-    sandbox_id: SandboxId,
-    pod_name: Option<String>,
-    pod_uid: Option<PodUid>,
-    lifecycle: SandboxLifecycle,
 }
 
 /// How the candidate was identified, which determines the action path.
@@ -446,6 +441,15 @@ impl std::fmt::Display for OrphanDeleteReason {
 pub enum OrphanDeferReason {
     InFlightSnapshot,
     PodCleanupUnconfirmed,
+    /// The row's active node has reported the sandbox, so its copy may hold
+    /// writes newer than any snapshot. The candidate listing already
+    /// skips a row its node reports, so the plan sees the report only when
+    /// the node's publish lands after the sweep listed the row: a sandbox
+    /// whose node hadn't published it yet, such as one restored onto a node
+    /// whose publishes there failed. Without this defer that row would revert
+    /// past the node's copy. The next listing skips the row while the node
+    /// keeps reporting it.
+    NodeReportsLocalCopy,
 }
 
 impl OrphanDeferReason {
@@ -453,6 +457,7 @@ impl OrphanDeferReason {
         match self {
             Self::InFlightSnapshot => "in_flight_snapshot",
             Self::PodCleanupUnconfirmed => "pod_cleanup_unconfirmed",
+            Self::NodeReportsLocalCopy => "node_reports_local_copy",
         }
     }
 }
@@ -529,6 +534,12 @@ fn non_empty_string(value: String) -> Option<String> {
 pub enum OrphanClassifyError {
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
+}
+
+impl From<pplx_space_postgres_pool::DbError> for OrphanClassifyError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -789,6 +800,14 @@ impl<P: PodPresence, S: OrphanActionSink> Reconciler<P, S> {
                         error = %err,
                         "reconciler disposition planning failed; will retry when the sweep reaches it again"
                     );
+                    reconciler_metrics::rows_failed(
+                        reconciler_metrics::FailedStep::Plan,
+                        if self.config.dry_run {
+                            reconciler_metrics::Mode::DryRun
+                        } else {
+                            reconciler_metrics::Mode::Live
+                        },
+                    );
                     continue;
                 }
             };
@@ -836,6 +855,12 @@ impl<P: PodPresence, S: OrphanActionSink> Reconciler<P, S> {
                     plan.from_lifecycle,
                     pod_evidence,
                 );
+                if let OrphanDisposition::Defer(defer_reason) = plan.disposition {
+                    reconciler_metrics::rows_deferred(
+                        defer_reason.as_str(),
+                        reconciler_metrics::Mode::DryRun,
+                    );
+                }
                 report.dry_run_classified += 1;
                 if quarantine_blocked {
                     report.circuit_breaker += 1;
@@ -948,6 +973,10 @@ impl<P: PodPresence, S: OrphanActionSink> Reconciler<P, S> {
                         from_lifecycle,
                         pod_evidence,
                     );
+                    reconciler_metrics::rows_deferred(
+                        defer_reason.as_str(),
+                        reconciler_metrics::Mode::Live,
+                    );
                     report.deferred += 1;
                 }
                 Ok(ClassifyOutcome::SkippedTerminal) => {
@@ -965,6 +994,10 @@ impl<P: PodPresence, S: OrphanActionSink> Reconciler<P, S> {
                         pod_name = %candidate.pod_name,
                         error = %err,
                         "reconciler classify_orphan failed; will retry when the sweep reaches it again"
+                    );
+                    reconciler_metrics::rows_failed(
+                        reconciler_metrics::FailedStep::Classify,
+                        reconciler_metrics::Mode::Live,
                     );
                 }
             }
@@ -1160,7 +1193,7 @@ impl OrphanActionSink for SubstrateActionSink {
 
         rows.into_iter()
             .map(|row| {
-                let OrphanCandidateRow {
+                let orphan::OrphanCandidateRow {
                     sandbox_id,
                     pod_name,
                     pod_uid,
@@ -1185,17 +1218,13 @@ impl OrphanActionSink for SubstrateActionSink {
     }
 
     async fn current_max_sandbox_id(&self) -> Result<Option<SandboxId>, sqlx::Error> {
-        // Pre-PG-15 has no `max(uuid)` aggregate, so use ORDER BY DESC
-        // LIMIT 1 instead. The primary key index makes this an index-only
-        // scan that returns immediately. `fetch_optional` correctly returns
-        // `None` for an empty table.
-        let row: Option<(SandboxId,)> = sqlx::query_as(sql!(
-            "SELECT id FROM sandboxes WHERE managed_by = $1 ORDER BY id DESC LIMIT 1"
-        ))
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|(id,)| id))
+        Ok(
+            pplx_space_sandbox_store::sandbox_id_bounds::newest_managed_by(
+                &self.pool,
+                SubstrateKind::Kubernetes,
+            )
+            .await?,
+        )
     }
 
     async fn classify_orphan(
@@ -1250,7 +1279,7 @@ impl OrphanActionSink for SubstrateActionSink {
                 finalize_tx.rollback().await?;
                 return Ok(ClassifyOutcome::SkippedTerminal);
             };
-            delete_with_dependents(&mut finalize_tx, sandbox_id).await?;
+            delete_with_dependents(&mut *finalize_tx, sandbox_id).await?;
             finalize_tx.commit().await?;
             emit_orphan_reconcile_event(
                 sandbox_id,
@@ -1269,7 +1298,7 @@ impl OrphanActionSink for SubstrateActionSink {
 
         if matches!(plan.disposition, OrphanDisposition::RecoverSuspended)
             && let Some(row) = orphan::recover_orphan_to_suspended(
-                &mut tx,
+                &mut *tx,
                 sandbox_id,
                 ORPHAN_RECONCILER_STOP_LIFECYCLES,
                 &guard.store_guard(),
@@ -1281,7 +1310,7 @@ impl OrphanActionSink for SubstrateActionSink {
             // refs). Drop the old node's queue ref/condition in the same
             // transaction — same rule as the quarantine branch below.
             delete_reconcile_state_for_elements(
-                &mut tx,
+                &mut *tx,
                 &[ReconcileElementRef::sandbox_desired_state(sandbox_id)],
             )
             .await?;
@@ -1313,7 +1342,7 @@ impl OrphanActionSink for SubstrateActionSink {
 
         if matches!(plan.disposition, OrphanDisposition::QuarantineAmbiguous)
             && let Some(row) = orphan::quarantine_orphan(
-                &mut tx,
+                &mut *tx,
                 sandbox_id,
                 ORPHAN_RECONCILER_STOP_LIFECYCLES,
                 &guard.store_guard(),
@@ -1325,7 +1354,7 @@ impl OrphanActionSink for SubstrateActionSink {
             // ref/condition in the same transaction so the old node stops
             // retrying a poison ref that can never converge.
             delete_reconcile_state_for_elements(
-                &mut tx,
+                &mut *tx,
                 &[ReconcileElementRef::sandbox_desired_state(sandbox_id)],
             )
             .await?;
@@ -1333,43 +1362,29 @@ impl OrphanActionSink for SubstrateActionSink {
             let history_id = Uuid::now_v7();
             let evidence = quarantine_evidence(&guard, row.active_node_id);
             let (reason_code, reason_message) = quarantine_reason(&guard);
-            let state_columns = quarantine_state_insert_columns();
-            let state_conflict_assignments = quarantine_state_conflict_assignments();
-            let query = format!(
-                "INSERT INTO sandbox_quarantine_state ({state_columns})
-                 VALUES ($1, $2, NOW(), NOW(), $3, $4, $5, $6, $7, $8, $9)
-                 ON CONFLICT (sandbox_id) DO UPDATE SET {state_conflict_assignments}",
-            );
-            sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                .bind(sandbox_id)
-                .bind(quarantine_id)
-                .bind(row.from_lifecycle)
-                .bind(SandboxQuarantineSource::ClusterController.as_str())
-                .bind(reason_code.as_str())
-                .bind(reason_message)
-                .bind(Json(evidence.clone()))
-                .bind(SandboxQuarantineNextAction::RequiresOperatorAttention.as_str())
-                .bind(row.active_node_id)
-                .execute(&mut *tx)
-                .await?;
-
-            let history_columns = quarantine_history_insert_columns();
-            let query = format!(
-                "INSERT INTO sandbox_quarantine_history ({history_columns})
-                 VALUES ($1, $2, $3, NOW(), $4, $5, $6, $7, $8, $9)",
-            );
-            sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                .bind(history_id)
-                .bind(quarantine_id)
-                .bind(sandbox_id)
-                .bind(SandboxQuarantineSource::ClusterController.as_str())
-                .bind(SandboxQuarantineHistoryAction::EnteredQuarantine.as_str())
-                .bind(reason_code.as_str())
-                .bind(reason_message)
-                .bind(SandboxQuarantineNextAction::RequiresOperatorAttention.as_str())
-                .bind(Json(evidence))
-                .execute(&mut *tx)
-                .await?;
+            let quarantine = OrphanQuarantine {
+                sandbox_id,
+                quarantine_id,
+                source: SandboxQuarantineSource::ClusterController,
+                reason_code,
+                reason_message,
+                next_action: SandboxQuarantineNextAction::RequiresOperatorAttention,
+                evidence: &evidence,
+            };
+            orphan_quarantine::upsert_state(
+                &mut *tx,
+                &quarantine,
+                row.from_lifecycle,
+                row.active_node_id,
+            )
+            .await?;
+            orphan_quarantine::insert_history(
+                &mut *tx,
+                &quarantine,
+                history_id,
+                SandboxQuarantineHistoryAction::EnteredQuarantine,
+            )
+            .await?;
 
             tx.commit().await?;
             let mut details = details_for_guard(&guard)
@@ -1407,14 +1422,9 @@ impl OrphanActionSink for SubstrateActionSink {
     }
 
     async fn active_quarantine_count(&self) -> Result<u32, OrphanClassifyError> {
-        let count: i64 = sqlx::query_scalar(sql!(
-            "SELECT COUNT(*)::BIGINT
-               FROM sandbox_quarantine_state quarantine
-               JOIN sandboxes sandbox ON sandbox.id = quarantine.sandbox_id
-              WHERE sandbox.lifecycle = 'quarantined'"
-        ))
-        .fetch_one(&self.pool)
-        .await?;
+        let count = pplx_space_sandbox_store::active_quarantines::count(&self.pool)
+            .await
+            .map_err(sqlx::Error::from)?;
         Ok(u32::try_from(count).unwrap_or(u32::MAX))
     }
 }
@@ -1547,44 +1557,31 @@ fn quarantine_reason(guard: &ClassifyGuard) -> (SandboxQuarantineReasonCode, &'s
     }
 }
 
-#[derive(sqlx::FromRow)]
-struct OrphanPlanRow {
-    from_lifecycle: SandboxLifecycle,
-    recoverable: bool,
-    creating_snapshot: bool,
-}
-
 async fn plan_orphan_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     sandbox_id: SandboxId,
     guard: &ClassifyGuard,
     lock: bool,
 ) -> Result<Option<OrphanPlan>, sqlx::Error> {
-    let eligibility = orphan_recovery_revert_eligibility("s");
-    let recoverable = eligibility.eligible;
     let store_guard = guard.store_guard();
-    let guard_sql = classify_guard_sql(&store_guard);
-    let guard_from_sql = classify_guard_from_sql(&store_guard);
-    let lock_sql = if lock {
-        format!(" FOR UPDATE OF {}", classify_guard_lock_sql(&store_guard))
+    let row = if lock {
+        orphan::lock_orphan_observation(&mut **tx, sandbox_id).await?;
+        orphan::plan::lock_plan(
+            &mut **tx,
+            sandbox_id,
+            ORPHAN_RECONCILER_STOP_LIFECYCLES,
+            &store_guard,
+        )
+        .await?
     } else {
-        String::new()
+        orphan::plan::read_plan(
+            &mut **tx,
+            sandbox_id,
+            ORPHAN_RECONCILER_STOP_LIFECYCLES,
+            &store_guard,
+        )
+        .await?
     };
-    let query = format!(
-        "SELECT s.lifecycle AS from_lifecycle,
-                ({recoverable}) AS recoverable,
-                EXISTS (
-                    SELECT 1
-                      FROM snapshots creating_snapshot
-                     WHERE creating_snapshot.sandbox_id = s.id
-                       AND creating_snapshot.state = 'creating'
-                ) AS creating_snapshot
-           FROM {guard_from_sql}
-          WHERE s.id = $1
-            AND s.lifecycle <> ALL($2)
-            AND {guard_sql}{lock_sql}"
-    );
-    let row = fetch_guarded_plan(tx, query, sandbox_id, guard).await?;
     let Some(row) = row else {
         return Ok(None);
     };
@@ -1597,6 +1594,8 @@ async fn plan_orphan_in_tx(
         OrphanDisposition::FinalizeDelete(OrphanDeleteReason::ExplicitDeleting)
     } else if row.from_lifecycle == SandboxLifecycle::Creating && !row.recoverable {
         OrphanDisposition::FinalizeDelete(OrphanDeleteReason::AbandonedCreate)
+    } else if row.recoverable && row.node_reports_copy {
+        OrphanDisposition::Defer(OrphanDeferReason::NodeReportsLocalCopy)
     } else if row.recoverable {
         OrphanDisposition::RecoverSuspended
     } else {
@@ -1609,43 +1608,13 @@ async fn plan_orphan_in_tx(
     }))
 }
 
-async fn fetch_guarded_plan(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    query: String,
-    sandbox_id: SandboxId,
-    guard: &ClassifyGuard,
-) -> Result<Option<OrphanPlanRow>, sqlx::Error> {
-    let query = sqlx::query_as::<_, OrphanPlanRow>(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(sandbox_id)
-        .bind(ORPHAN_RECONCILER_STOP_LIFECYCLES);
-    match guard {
-        ClassifyGuard::PodName { name, uid } => {
-            query
-                .bind(name)
-                .bind(uid)
-                .bind(LIVE_POD_REQUIRED_LIFECYCLES)
-                .bind(PENDING_POD_LIFECYCLES)
-                .bind(CREATE_AGE_THRESHOLD_SECS)
-                .fetch_optional(&mut **tx)
-                .await
-        }
-        ClassifyGuard::Forgotten => {
-            query
-                .bind(ACTIVE_EXECUTION_REQUIRED_LIFECYCLES)
-                .fetch_optional(&mut **tx)
-                .await
-        }
-        ClassifyGuard::LegacyDeleting { .. } => query.fetch_optional(&mut **tx).await,
-    }
-}
-
 impl SubstrateActionSink {
     async fn list_candidates_after(
         &self,
         after_sandbox_id: Option<SandboxId>,
         upper_bound: SandboxId,
         limit: i64,
-    ) -> Result<Vec<OrphanCandidateRow>, sqlx::Error> {
+    ) -> Result<Vec<orphan::OrphanCandidateRow>, sqlx::Error> {
         list_candidates_after(&self.pool, after_sandbox_id, upper_bound, limit).await
     }
 }
@@ -1655,110 +1624,23 @@ async fn list_candidates_after(
     after_sandbox_id: Option<SandboxId>,
     upper_bound: SandboxId,
     limit: i64,
-) -> Result<Vec<OrphanCandidateRow>, sqlx::Error> {
-    // The second predicate branch picks up "forgotten" rows: a sandbox
-    // whose **most recent** execution is `state='forgotten'` (set by
-    // `finish_active_execution_in(..., "forgotten")` inside
-    // `forget_pod_tracking`). The "most recent" qualifier is critical:
-    // if an old `forgotten` execution exists but a later execution
-    // succeeded (e.g. a recovery + suspend with `state='suspended'`),
-    // that newer execution carries recoverable on-disk state. Looking
-    // only for *any* `forgotten` would quarantine that recoverable
-    // sandbox and orphan its snapshot. Looking at the *latest*
-    // execution's state is the precise orphan signal.
-    //
-    // The final branch picks up rows stranded in `lifecycle='deleting'` by
-    // the old orphan cleanup path so their durable delete claim can complete.
-    //
-    // `s.id <= $3` bounds the sweep against new sandboxes created after
-    // the high-water mark was captured; the next sweep picks them up.
-    sqlx::query_as(sql!(
-        r"
-            SELECT s.id AS sandbox_id,
-                   e.pod_name,
-                   NULLIF(BTRIM(e.pod_uid), '') AS pod_uid,
-                   s.lifecycle
-            FROM sandboxes s
-            LEFT JOIN sandbox_k8s_executions e
-              ON e.sandbox_id = s.id AND e.active
-            WHERE s.managed_by = $9
-              AND s.lifecycle <> ALL($1)
-              AND (
-                  -- Normal: active execution observed.
-                  --   Live-pod lifecycles ($5) — pod must be alive unless
-                  --   a fresh materialization lease says creation/recovery
-                  --   is still in flight.
-                  --   Pending-pod lifecycles ($6) — pod creation may still
-                  --   be in flight, so require the execution row to be
-                  --   stale by $7 seconds (crashed-create signal) before
-                  --   acting; younger rows are presumed healthy.
-                  --   Dormant lifecycles (stopped/suspended/created) are
-                  --   excluded entirely — those are intentionally-dormant
-                  --   sandboxes the user can recover via `start`.
-                  (e.pod_name IS NOT NULL AND (
-                      (
-                          s.lifecycle = ANY($5)
-                          AND (
-                              e.state NOT IN ('creating', 'recovering')
-                              OR e.updated_at <= NOW() - ($7 * INTERVAL '1 second')
-                          )
-                      )
-                      OR (
-                          s.lifecycle = ANY($6)
-                          AND e.updated_at <= NOW() - ($7 * INTERVAL '1 second')
-                      )
-                  ))
-                  -- Forgotten: state='forgotten' is the precise orphan
-                  -- signal. Uses the broader active-required set ($8)
-                  -- because failed `creating`/`starting` rows must be
-                  -- reachable here.
-                  OR (
-                      s.lifecycle = ANY($8)
-                      AND EXISTS (
-                          SELECT 1 FROM sandbox_k8s_executions f
-                          WHERE f.sandbox_id = s.id
-                            AND f.state = 'forgotten'
-                            AND f.generation = (
-                                SELECT MAX(generation)
-                                FROM sandbox_k8s_executions
-                                WHERE sandbox_id = s.id
-                            )
-                      )
-                  )
-                  OR s.lifecycle = 'deleting'
-              )
-              -- A node-local observed state excludes the row from every
-              -- orphan path: the kube pod may be missing, but the sandbox
-              -- still exists in sbx-mgr and can converge through node publish
-              -- or a later wake. Deleting the stable row here would strand
-              -- external references to the sandbox id. The projection GC is
-              -- the authority that bounds stale observed-state rows.
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM sandbox_observed_states sos
-                  WHERE sos.sandbox_id = s.id
-                    AND (
-                        s.active_node_id IS NULL
-                        OR sos.node_id IS NOT DISTINCT FROM s.active_node_id
-                    )
-              )
-              AND ($2::uuid IS NULL OR s.id > $2)
-              AND s.id <= $3
-            ORDER BY s.id
-            LIMIT $4
-            "
-    ))
-    .bind(ORPHAN_RECONCILER_STOP_LIFECYCLES)
-    .bind(after_sandbox_id)
-    .bind(upper_bound)
-    .bind(limit)
-    .bind(LIVE_POD_REQUIRED_LIFECYCLES)
-    .bind(PENDING_POD_LIFECYCLES)
-    .bind(CREATE_AGE_THRESHOLD_SECS)
-    .bind(ACTIVE_EXECUTION_REQUIRED_LIFECYCLES)
-    .bind(SubstrateKind::Kubernetes)
-    .fetch_all(pool)
+) -> Result<Vec<orphan::OrphanCandidateRow>, sqlx::Error> {
+    orphan::list_candidates_after(
+        pool,
+        orphan::CandidateScan {
+            stop_lifecycles: ORPHAN_RECONCILER_STOP_LIFECYCLES,
+            after: after_sandbox_id,
+            upper_bound,
+            limit,
+            live_pod_required_lifecycles: LIVE_POD_REQUIRED_LIFECYCLES,
+            pending_pod_lifecycles: PENDING_POD_LIFECYCLES,
+            create_age_threshold_secs: CREATE_AGE_THRESHOLD_SECS,
+            active_execution_required_lifecycles: ACTIVE_EXECUTION_REQUIRED_LIFECYCLES,
+            managed_by: SubstrateKind::Kubernetes,
+        },
+    )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 /// Run the orphaned-sandbox reconcile loop on the current task until the

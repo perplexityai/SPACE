@@ -155,6 +155,8 @@ if TELEMETRY_MODE == "otel":
     ]:
         if signal in ["metrics", "traces"] and signal not in TELEMETRY_CONFIG["local_signals"]:
             continue
+        if signal == "grafana" and TELEMETRY_CONFIG["observability_layout"] == "ci":
+            continue
         # Reuse-only mode requires logs and implicit receivers, not Grafana.
         if signal == "grafana" and not TELEMETRY_CONFIG["install_observability"]:
             existing = str(local([
@@ -251,13 +253,17 @@ def pull_base_images(*dockerfiles):
 # change on every build, unchanged content or not, and the workload would roll.
 BUILD_INPUTS_SNAPSHOT = 'SPACE_BUILD_INPUTS="$(python3 infra/space/kind/scripts/image-provenance.py snapshot)"'
 
+def runtime_image_build(image):
+    return ("bash infra/space/kind/scripts/runtime-image-cache.sh build {} " +
+            "--provenance=false --sbom=false").format(image)
+
 def image_build(image, revision_label = False):
     return ("python3 infra/space/kind/scripts/image-provenance.py build --cluster {cluster} --image {image} " +
             '--since "$SPACE_BUILD_INPUTS"{label} -- ' +
-            "bash infra/space/kind/scripts/runtime-image-cache.sh build {image} " +
-            "--provenance=false --sbom=false").format(
+            "{build}").format(
                 cluster = KIND_CLUSTER,
                 image = image,
+                build = runtime_image_build(image),
                 label = " --revision-label" if revision_label else "",
             )
 
@@ -381,6 +387,16 @@ SEED_DEPS = RUST_ARTIFACT_DEPS + [
     "templates/firecracker/recipes/seed.toml",
     "infra/space/kind/scripts/build-seed.sh",
 ]
+SEED_IMAGE_DEPS = SEED_DEPS + [
+    "docker/Dockerfile.seed-publish",
+    "infra/space/kind/scripts/seed-publish-entry.sh",
+    "scripts/lib/manifest_execution_to_proto.py",
+]
+
+def seed_image_build(command):
+    return ('SPACE_SEED_OUTPUT_DIR="$seed_dir" bash infra/space/kind/scripts/build-seed.sh --read-lock -- ' +
+            command + ' --build-context seed="$seed_dir" .')
+
 space_image(
     ref = "space-seed-publish:local",
     command = " && ".join([
@@ -388,13 +404,9 @@ space_image(
         pull_base_images("docker/Dockerfile.seed-publish"),
         RUST_ARTIFACT_BUILD,
         SEED_BUILD,
-        ('SPACE_SEED_OUTPUT_DIR="$seed_dir" bash infra/space/kind/scripts/build-seed.sh --read-lock -- ' +
-         image_build("space-seed-publish", revision_label = True) + " -t $SPACE_BUILD_REF " +
-         '--build-context seed="$seed_dir" .'),
+        seed_image_build(image_build("space-seed-publish", revision_label = True) + " -t $SPACE_BUILD_REF"),
     ]),
-    deps = SEED_DEPS + [
-            "docker/Dockerfile.seed-publish",
-            "infra/space/kind/scripts/seed-publish-entry.sh"],
+    deps = SEED_IMAGE_DEPS,
 )
 
 # Kind-only: the STS bridge fixture the credential-manager authority's storage
@@ -656,10 +668,19 @@ local_resource(
 # when this resource holds it, it finds the seed up to date or rebuilds it,
 # and then builds the image from the directory while holding the lock shared.
 # Only the publish Job needs space-internal-api; its resource keeps that gate.
+# Export the publisher image, including compressed layers, locally while the
+# control plane starts. This tag is never loaded into
+# Kind or deployed; the custom_build checks the current inputs, certifies its
+# own final image, and reuses unchanged layers from the local build cache.
 local_resource(
     "seed-artifacts",
-    cmd = " && ".join([RUST_ARTIFACT_BUILD, SEED_BUILD]),
-    deps = SEED_DEPS,
+    cmd = " && ".join([
+        RUST_ARTIFACT_BUILD,
+        SEED_BUILD,
+        pull_base_images("docker/Dockerfile.seed-publish"),
+        seed_image_build(runtime_image_build("space-seed-publish") + " -t space-seed-publish:prewarm"),
+    ]),
+    deps = SEED_IMAGE_DEPS,
     allow_parallel = True,
     resource_deps = ["rust-artifacts"],
     labels = ["build"],

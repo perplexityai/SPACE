@@ -6,11 +6,12 @@
 //! time, so that a wedged lifecycle is visible whether or not any of them is
 //! enabled.
 
-use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_sandbox_model::SandboxLifecycle;
 
 use std::time::Duration;
 
-use pplx_space_common_core::sql;
+use pplx_space_postgres_pool::{DbError, Executor};
+use pplx_space_sql_locator::sql;
 
 /// The census of one transient lifecycle.
 #[derive(Clone, Debug, PartialEq)]
@@ -33,7 +34,7 @@ pub enum StuckSandboxesError {
     #[error("age bucket bounds must be strictly ascending, got {bounds:?}")]
     UnorderedBounds { bounds: Vec<Duration> },
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 }
 
 /// One `(lifecycle, bucket)` group of the census statement.
@@ -95,7 +96,7 @@ const TRANSIENT_LIFECYCLE_AGES: &str = sql!(
 ///
 /// One statement, so the counts are one consistent snapshot.
 pub async fn transient_lifecycle_ages(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     bounds: &[Duration],
 ) -> Result<Vec<TransientLifecycleAges>, StuckSandboxesError> {
     if !bounds.is_sorted_by(|lower, upper| lower < upper) {
@@ -114,8 +115,9 @@ pub async fn transient_lifecycle_ages(
     let groups = sqlx::query_as::<_, AgeBucketRow>(TRANSIENT_LIFECYCLE_AGES)
         .bind(&lifecycle_binds)
         .bind(&bound_secs)
-        .fetch_all(executor)
-        .await?;
+        .fetch_all(executor.into_sqlx())
+        .await
+        .map_err(DbError::from)?;
 
     let mut census: Vec<TransientLifecycleAges> = lifecycles
         .into_iter()

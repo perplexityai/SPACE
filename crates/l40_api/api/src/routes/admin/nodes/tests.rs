@@ -1,16 +1,20 @@
-use pplx_space_common_core::types::OrgId;
-use pplx_space_common_core::types::UserId;
+use pplx_space_accounts::OrgId;
+use pplx_space_accounts::UserId;
 use uuid::Uuid;
 
 use super::*;
 use crate::models::User;
 use crate::user_role::UserRole;
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::try_pg_test_db;
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use tower::ServiceExt;
 
-use pplx_space_common_core::types::{NodeAddress, NodeDrainMode, NodeId, NodeManagedBy, NodeRole};
+use pplx_space_accounts::NodeId;
+use pplx_space_node_model::{NodeAddress, NodeDrainMode, NodeManagedBy, NodeRole};
+use pplx_space_sandbox_store::node_holds;
+
+use super::holds::{NODE_HOLDS_LIMIT, holds_response};
 
 fn test_admin_node_row() -> AdminNodeRow {
     AdminNodeRow {
@@ -39,6 +43,8 @@ fn test_admin_node_row() -> AdminNodeRow {
         drain_mode: None,
         drain_started_at: None,
         drain_last_error: None,
+        drain_engine: None,
+        drain_status: None,
         terminate_decrement_capacity: false,
         node_group_id: None,
         metadata: None,
@@ -166,8 +172,8 @@ fn escalating_a_gentle_drain_keeps_the_drains_age() {
 }
 
 /// That a NULL or unparseable `nodes.drain_mode` is escalatable is a
-/// composition of two properties pinned elsewhere —
-/// `types::node::tests::{absent,unrecognized}_drain_mode_column_reads_as_gentle`
+/// composition of two properties pinned elsewhere — node-model's
+/// `node::tests::{absent,unrecognized}_drain_mode_column_reads_as_gentle`
 /// for the resolution, and `escalating_a_gentle_drain_keeps_the_drains_age` for
 /// the transition. There was a test here restating that composition; it asserted
 /// nothing independently breakable, and its docstring claimed to pin the
@@ -303,7 +309,7 @@ fn force_upload_local_snapshots_never_changes_drain_phase() {
 /// `/space/cache/<id>/snapshot/` directory and a concurrent wake plus re-suspend
 /// would let it register a torn snapshot.
 ///
-/// The handler expresses that as `NodeDrainState::blocks_placement`, the same
+/// The handler expresses that as `NodeDrain::blocks_placement`, the same
 /// predicate the gate itself uses — sharing it is the point, since the hazard is
 /// precisely a reader that believes wakes are blocked when they are not. This
 /// test pins the truth table that makes the sharing correct: a **gentle**
@@ -324,11 +330,11 @@ fn force_upload_local_snapshots_never_changes_drain_phase() {
 /// on the source is what gives this an oracle.
 #[test]
 fn force_upload_refusal_text_has_no_embedded_indentation() {
-    use pplx_space_common_core::types::{NodeDrainPhase, NodeDrainState};
+    use pplx_space_node_model::{NodeDrain, NodeDrainPhase};
 
     let states = [
         None,
-        NodeDrainState::from_columns(Some(NodeDrainPhase::Draining), Some("gentle")),
+        NodeDrain::from_v1_columns(Some(NodeDrainPhase::Draining), Some("gentle")),
     ];
     for state in states {
         let (error, detail) = super::force_upload_gate_open_message(state);
@@ -341,25 +347,48 @@ fn force_upload_refusal_text_has_no_embedded_indentation() {
     }
 }
 
+/// The force-upload gate aborts on an engine or a phase this build doesn't
+/// know, as an unknown phase did before v2, rather than reading the drain:
+/// it can't tell whether such a drain refuses wakes. Known drains read as
+/// they are.
+#[test]
+fn force_upload_aborts_on_an_unknown_drain() {
+    use pplx_space_node_drain::V2DrainPhase;
+    for (engine, phase, expected) in [
+        (Some("v9"), Some("drained"), "unrecognized drain engine"),
+        (None, Some("unrecognized"), "unrecognized drain phase"),
+        (Some("v2"), Some("unrecognized"), "unrecognized drain phase"),
+    ] {
+        let err = super::force_upload_drain_state(engine, phase, None)
+            .expect_err("an unknown drain aborts the upload");
+        assert!(err.contains(expected), "{err}");
+    }
+    assert_eq!(
+        super::force_upload_drain_state(Some("v2"), Some("drained"), None),
+        Ok(Some(NodeDrain::V2 {
+            phase: V2DrainPhase::Drained
+        }))
+    );
+    assert_eq!(super::force_upload_drain_state(None, None, None), Ok(None));
+}
+
 #[test]
 fn force_upload_requires_a_closed_wake_gate() {
-    use pplx_space_common_core::types::{NodeDrainMode, NodeDrainPhase, NodeDrainState};
+    use pplx_space_node_model::{NodeDrain, NodeDrainMode, NodeDrainPhase};
 
     // No drain at all: the gate is open, so the action is refused.
-    assert!(
-        !NodeDrainState::from_columns(None, None).is_some_and(NodeDrainState::blocks_placement)
-    );
+    assert!(!NodeDrain::from_v1_columns(None, None).is_some_and(NodeDrain::blocks_placement));
 
     // Gentle + draining: non-NULL phase, but the gate is deliberately open.
     let gentle_draining =
-        NodeDrainState::from_columns(Some(NodeDrainPhase::Draining), Some("gentle"))
+        NodeDrain::from_v1_columns(Some(NodeDrainPhase::Draining), Some("gentle"))
             .expect("a phase was supplied");
     assert!(
         !gentle_draining.blocks_placement(),
         "a gentle drain must not satisfy the force-upload precondition"
     );
     // ...and the same is true when nobody set a mode, since that reads as gentle.
-    let unset_mode = NodeDrainState::from_columns(Some(NodeDrainPhase::Draining), None)
+    let unset_mode = NodeDrain::from_v1_columns(Some(NodeDrainPhase::Draining), None)
         .expect("a phase was supplied");
     assert!(!unset_mode.blocks_placement());
 
@@ -372,7 +401,7 @@ fn force_upload_requires_a_closed_wake_gate() {
         (NodeDrainPhase::Terminating, NodeDrainMode::Forced),
         (NodeDrainPhase::Terminating, NodeDrainMode::Gentle),
     ] {
-        let state = NodeDrainState::from_columns(Some(phase), Some(mode.as_str()))
+        let state = NodeDrain::from_v1_columns(Some(phase), Some(mode.as_str()))
             .expect("a phase was supplied");
         assert!(
             state.blocks_placement(),
@@ -438,8 +467,8 @@ fn an_omitted_replace_after_terminate_is_unexpressed_and_defaults_to_replace() {
         // This pins the parse only. That an omitted field *resolves* to
         // auto-replace is a separate, independently-breakable property — flipping
         // `unwrap_or(true)` leaves this assertion green — and lives with the type
-        // in
-        // `types::admin::tests::an_unexpressed_replace_after_terminate_resolves_to_auto_replace`.
+        // in `pplx_space_admin_protocol`'s
+        // `admin::tests::an_unexpressed_replace_after_terminate_resolves_to_auto_replace`.
         assert_eq!(
             req.replace_after_terminate, None,
             "{body:?}: an omitted field must stay distinguishable from an explicit true"
@@ -1743,12 +1772,13 @@ async fn inventory_reads_skip_locked_sandbox_accounting_but_diagnostics_do_not()
     sqlx::query(sql!("SET LOCAL lock_timeout = '20ms'"))
         .execute(&mut *guard_tx)
         .await?;
-    let error = node_store::sandbox_occupancy_for_node_in_tx(
-        &mut guard_tx,
+    let error = pplx_space_sandbox_store::admin_occupancy::terminate_occupancy(
+        &mut *guard_tx,
         node_id,
         ResidencyEvidence::LifecycleOnly,
     )
     .await
+    .map_err(sqlx::Error::from)
     .unwrap_err();
     assert_eq!(
         error.as_database_error().unwrap().code().as_deref(),
@@ -1782,10 +1812,16 @@ fn inventory_test_actor(org_id: OrgId) -> User {
         display_name: "Inventory test".into(),
         org_id,
         role: UserRole::OrganizationAdmin,
-        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        owner_source: pplx_space_accounts::SandboxOwnerSource::Local,
         created_at: OffsetDateTime::UNIX_EPOCH,
         updated_at: OffsetDateTime::UNIX_EPOCH,
     }
+}
+
+fn node_sandboxes_uri(query: &str) -> axum::http::Uri {
+    format!("/nodes/n/sandboxes?{query}")
+        .parse()
+        .expect("valid URI")
 }
 
 #[tokio::test]
@@ -1813,14 +1849,15 @@ async fn node_sandbox_pages_are_scoped_deduplicated_and_complete() -> TestResult
     .bind(other_node)
     .execute(&db.pool)
     .await?;
-    let mut after = None;
+    let mut after: Option<SandboxId> = None;
     let mut ids = Vec::new();
     for expected_len in [100, 100, 5] {
+        let query = after.map(|after| format!("after={after}"));
         let response = list_node_sandboxes(
             State(state.clone()),
             Extension(AuthUser(actor.clone())),
             Path(node_id),
-            Query(NodeSandboxesQuery { after }),
+            node_sandboxes_uri(query.as_deref().unwrap_or("")),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1844,7 +1881,7 @@ async fn node_sandbox_pages_are_scoped_deduplicated_and_complete() -> TestResult
         State(state.clone()),
         Extension(AuthUser(actor.clone())),
         Path(NodeId::new()),
-        Query(NodeSandboxesQuery { after: None }),
+        node_sandboxes_uri(""),
     )
     .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1854,10 +1891,396 @@ async fn node_sandbox_pages_are_scoped_deduplicated_and_complete() -> TestResult
         State(state),
         Extension(AuthUser(member)),
         Path(node_id),
-        Query(NodeSandboxesQuery { after: None }),
+        node_sandboxes_uri(""),
     )
     .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    Ok(())
+}
+
+async fn node_sandboxes_body(
+    state: &AppState,
+    actor: &User,
+    node_id: NodeId,
+    query: &str,
+) -> TestResult<(StatusCode, Vec<u8>)> {
+    let response = list_node_sandboxes(
+        State(state.clone()),
+        Extension(AuthUser(actor.clone())),
+        Path(node_id),
+        node_sandboxes_uri(query),
+    )
+    .await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1_000_000).await?;
+    Ok((status, body.to_vec()))
+}
+
+/// `count` rows on `node`, all changed at `changed_at`.
+async fn insert_history_rows(
+    pool: &sqlx::PgPool,
+    node_id: NodeId,
+    lifecycle: &str,
+    active: bool,
+    changed_at: &str,
+    count: i32,
+) -> TestResult {
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (id, user_id, org_id, lifecycle, placement, managed_by,
+            active_node_id, target_node_id, lifecycle_changed_at, network_policy_generation)
+         SELECT space_uuid_v7(), '00000000-0000-0000-0000-000000000010',
+            '00000000-0000-0000-0000-000000000001', $2, 'placed', 'k8s',
+            CASE WHEN $3 THEN $1::UUID END, CASE WHEN $3 THEN NULL ELSE $1::UUID END,
+            $4::TIMESTAMPTZ, 1
+         FROM generate_series(1, $5) n"
+    ))
+    .bind(node_id)
+    .bind(lifecycle)
+    .bind(active)
+    .bind(changed_at)
+    .bind(count)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The history parameters filter, order newest change first and page across
+/// rows that share a timestamp; with none of them the body is what it was.
+#[tokio::test]
+async fn node_sandbox_history_filters_orders_and_pages_by_change() -> TestResult<()> {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let actor =
+        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let node_id = NodeId::new();
+    let other_node = NodeId::new();
+    sqlx::query(sql!("INSERT INTO nodes (id, address, role) VALUES ($1, '127.0.0.3', 'worker'), ($2, '127.0.0.4', 'worker')"))
+        .bind(node_id).bind(other_node).execute(&db.pool).await?;
+    let drain_started = "2026-01-01T00:00:00.123456Z";
+    // 120 failures in one microsecond, so a page boundary falls inside a tie.
+    insert_history_rows(&db.pool, node_id, "failed", true, drain_started, 70).await?;
+    insert_history_rows(&db.pool, node_id, "failed", false, drain_started, 50).await?;
+    insert_history_rows(&db.pool, node_id, "failed", true, "2025-12-31T23:00:00Z", 5).await?;
+    insert_history_rows(
+        &db.pool,
+        node_id,
+        "started",
+        true,
+        "2026-01-01T01:00:00Z",
+        3,
+    )
+    .await?;
+    insert_history_rows(
+        &db.pool,
+        node_id,
+        "deleted",
+        false,
+        "2026-01-01T02:00:00Z",
+        2,
+    )
+    .await?;
+    insert_history_rows(&db.pool, other_node, "failed", true, drain_started, 4).await?;
+
+    // Failed during the drain, newest change first, across two pages.
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    for expected in [100, 20] {
+        let mut query =
+            format!("order=lifecycle_changed_desc&lifecycle=failed&changed_since={drain_started}");
+        if let Some(cursor) = &cursor {
+            query.push_str(&format!("&cursor={cursor}"));
+        }
+        let (status, body) = node_sandboxes_body(&state, &actor, node_id, &query).await?;
+        assert_eq!(status, StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&body)?;
+        let rows = body["sandboxes"].as_array().expect("rows");
+        assert_eq!(rows.len(), expected);
+        for row in rows {
+            assert_eq!(row["lifecycle"], "failed");
+            assert_eq!(row["lifecycle_changed_at"], drain_started);
+            seen.push(row["id"].as_str().expect("id").to_string());
+        }
+        assert!(body.get("next_after").is_none());
+        cursor = body["next_cursor"].as_str().map(str::to_string);
+        assert_eq!(cursor.is_some(), expected == 100);
+    }
+    assert_eq!(seen.len(), 120);
+    assert!(
+        seen.windows(2).all(|pair| pair[0] > pair[1]),
+        "ids descend within the tie"
+    );
+
+    // Newest change first across lifecycles; a repeated and a comma list agree.
+    let (_, body) = node_sandboxes_body(
+        &state,
+        &actor,
+        node_id,
+        "order=lifecycle_changed_desc&lifecycle=started&lifecycle=deleted",
+    )
+    .await?;
+    let (_, comma) = node_sandboxes_body(
+        &state,
+        &actor,
+        node_id,
+        "order=lifecycle_changed_desc&lifecycle=deleted,started",
+    )
+    .await?;
+    assert_eq!(body, comma);
+    let body: serde_json::Value = serde_json::from_slice(&body)?;
+    let lifecycles: Vec<&str> = body["sandboxes"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row["lifecycle"].as_str().expect("lifecycle"))
+        .collect();
+    assert_eq!(
+        lifecycles,
+        ["deleted", "deleted", "started", "started", "started"]
+    );
+
+    // A filter in id order keeps the id order and its cursor.
+    let (_, body) = node_sandboxes_body(&state, &actor, node_id, "lifecycle=failed").await?;
+    let body: serde_json::Value = serde_json::from_slice(&body)?;
+    let ids: Vec<&str> = body["sandboxes"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row["id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(ids.len(), 100);
+    assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(body["next_after"].is_string());
+    assert!(body["sandboxes"][0].get("lifecycle_changed_at").is_none());
+    // The last page holds the rest of the failures and none of the rows
+    // inserted after them in another lifecycle.
+    let after = body["next_after"].as_str().expect("next_after");
+    let (_, body) = node_sandboxes_body(
+        &state,
+        &actor,
+        node_id,
+        &format!("lifecycle=failed&after={after}"),
+    )
+    .await?;
+    let body: serde_json::Value = serde_json::from_slice(&body)?;
+    let rows = body["sandboxes"].as_array().expect("rows");
+    assert_eq!(rows.len(), 25);
+    assert!(rows.iter().all(|row| row["lifecycle"] == "failed"));
+    assert!(body["next_after"].is_null());
+
+    for refused in [
+        "lifecycle=running",
+        "changed_since=yesterday",
+        "order=newest",
+        "cursor=abc",
+        &format!("order=lifecycle_changed_desc&after={}", Uuid::now_v7()),
+        "order=lifecycle_changed_desc&cursor=not-a-cursor",
+    ] {
+        let (status, _) = node_sandboxes_body(&state, &actor, node_id, refused).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    }
+
+    // Empty history parameters are unset: the request takes the default path.
+    let (status, empty) = node_sandboxes_body(
+        &state,
+        &actor,
+        node_id,
+        "lifecycle=&changed_since=&order=&cursor=",
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let (_, unset) = node_sandboxes_body(&state, &actor, node_id, "").await?;
+    assert_eq!(empty, unset);
+
+    // No new parameter: the body is the list's original shape, field for
+    // field, and the bytes the original statement and serialization give.
+    // Key order depends on serde_json's `preserve_order`, which feature
+    // unification decides per build, so the bytes are compared with that
+    // serialization rather than a literal.
+    let small = NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role) VALUES ($1, '127.0.0.5', 'worker')"
+    ))
+    .bind(small)
+    .execute(&db.pool)
+    .await?;
+    insert_history_rows(&db.pool, small, "failed", true, drain_started, 1).await?;
+    let id: Uuid = sqlx::query_scalar(sql!("SELECT id FROM sandboxes WHERE active_node_id = $1"))
+        .bind(small)
+        .fetch_one(&db.pool)
+        .await?;
+    let (status, body) = node_sandboxes_body(&state, &actor, small, "").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body)?,
+        serde_json::json!({
+            "sandboxes": [{
+                "id": id.to_string(),
+                "lifecycle": "failed",
+                "active_node_id": small.to_string(),
+                "target_node_id": null
+            }],
+            "next_after": null
+        })
+    );
+    let rows = AdminNodeStore::new(db.pool.clone())
+        .list_sandboxes(small, None, 101)
+        .await?;
+    assert_eq!(
+        body,
+        serde_json::to_vec(&serde_json::json!({ "sandboxes": rows, "next_after": null }))?
+    );
+    Ok(())
+}
+
+/// The store recognizes a lifecycle only in the exact form the filter
+/// compares; another case, surrounding whitespace or a non-ASCII letter is
+/// listed as stored and matched by no lifecycle filter, in both orders.
+#[tokio::test]
+async fn node_placements_list_only_the_exact_stored_form_as_recognized() -> TestResult<()> {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role) VALUES ($1, '127.0.0.6', 'worker')"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    insert_history_rows(
+        &db.pool,
+        node_id,
+        "started",
+        true,
+        "2026-01-01T00:00:00Z",
+        1,
+    )
+    .await?;
+    insert_history_rows(
+        &db.pool,
+        node_id,
+        " Started ",
+        true,
+        "2026-01-01T01:00:00Z",
+        1,
+    )
+    .await?;
+    // A capital I with a dot (U+0130), which a collation-aware `lower` folds
+    // to an ASCII `i`.
+    insert_history_rows(
+        &db.pool,
+        node_id,
+        "FA\u{130}LED",
+        true,
+        "2026-01-01T02:00:00Z",
+        1,
+    )
+    .await?;
+    let started = StoredSandboxLifecycle::Live(pplx_space_sandbox_model::SandboxLifecycle::Started);
+    let failed = StoredSandboxLifecycle::Live(pplx_space_sandbox_model::SandboxLifecycle::Failed);
+    let exact = node_placements::NodePlacementLifecycle::Stored(started);
+    let spaced = node_placements::NodePlacementLifecycle::Unrecognized(" Started ".to_string());
+    let dotted = node_placements::NodePlacementLifecycle::Unrecognized("FA\u{130}LED".to_string());
+
+    let (by_id, by_change) =
+        placement_lifecycles(&db.pool, node_id, NodePlacementFilter::default()).await?;
+    assert_eq!(by_id, [exact.clone(), spaced.clone(), dotted.clone()]);
+    assert_eq!(by_change, [dotted, spaced, exact.clone()]);
+    assert_eq!(
+        by_id
+            .iter()
+            .map(|lifecycle| lifecycle.as_str())
+            .collect::<Vec<_>>(),
+        ["started", " Started ", "FA\u{130}LED"]
+    );
+
+    let only = |lifecycle| NodePlacementFilter {
+        lifecycles: Some(vec![lifecycle]),
+        ..NodePlacementFilter::default()
+    };
+    let (by_id, by_change) = placement_lifecycles(&db.pool, node_id, only(started)).await?;
+    assert_eq!((by_id, by_change), (vec![exact.clone()], vec![exact]));
+    let (by_id, by_change) = placement_lifecycles(&db.pool, node_id, only(failed)).await?;
+    assert_eq!((by_id, by_change), (Vec::new(), Vec::new()));
+    Ok(())
+}
+
+/// The node's placement lifecycles through `filter`, by id and by change.
+async fn placement_lifecycles(
+    pool: &sqlx::PgPool,
+    node_id: NodeId,
+    filter: NodePlacementFilter,
+) -> TestResult<(
+    Vec<node_placements::NodePlacementLifecycle>,
+    Vec<node_placements::NodePlacementLifecycle>,
+)> {
+    let by_id = node_placements::list_by_id(pool, node_id, &filter, None, 10)
+        .await?
+        .into_iter()
+        .map(|row| row.lifecycle)
+        .collect();
+    let by_change = node_placements::list_by_change(pool, node_id, &filter, None, 10)
+        .await?
+        .into_iter()
+        .map(|row| row.lifecycle)
+        .collect();
+    Ok((by_id, by_change))
+}
+
+/// A lifecycle the store doesn't recognize is listed as stored, and the rows
+/// around it on the page are still returned, in both orders.
+#[tokio::test]
+async fn node_placements_list_an_unrecognized_lifecycle_as_stored() -> TestResult<()> {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role) VALUES ($1, '127.0.0.7', 'worker')"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    insert_history_rows(&db.pool, node_id, "failed", true, "2026-01-01T00:00:00Z", 2).await?;
+    insert_history_rows(
+        &db.pool,
+        node_id,
+        "not-a-lifecycle",
+        false,
+        "2026-01-01T01:00:00Z",
+        1,
+    )
+    .await?;
+    insert_history_rows(&db.pool, node_id, "failed", true, "2026-01-01T02:00:00Z", 2).await?;
+    let unrecognized =
+        node_placements::NodePlacementLifecycle::Unrecognized("not-a-lifecycle".to_string());
+    let failed = node_placements::NodePlacementLifecycle::Stored(StoredSandboxLifecycle::Live(
+        pplx_space_sandbox_model::SandboxLifecycle::Failed,
+    ));
+    let filter = NodePlacementFilter::default();
+
+    let by_id: Vec<_> = node_placements::list_by_id(&db.pool, node_id, &filter, None, 10)
+        .await?
+        .into_iter()
+        .map(|row| row.lifecycle)
+        .collect();
+    let by_change: Vec<_> = node_placements::list_by_change(&db.pool, node_id, &filter, None, 10)
+        .await?
+        .into_iter()
+        .map(|row| row.lifecycle)
+        .collect();
+    let expected = [
+        failed.clone(),
+        failed.clone(),
+        unrecognized,
+        failed.clone(),
+        failed,
+    ];
+    assert_eq!(by_id, expected);
+    assert_eq!(by_change, expected);
+    assert_eq!(by_id[2].as_str(), "not-a-lifecycle");
     Ok(())
 }
 
@@ -2272,11 +2695,8 @@ async fn node_inspection_reports_execution_receipt_independently_of_heartbeat() 
         assert_eq!(observation.policy.is_some(), expected);
         assert_eq!(observation.policy_received_at.is_some(), expected);
         let mut tx = db.pool.begin().await?;
-        assert!(
-            node_store::lock_node_for_update(&mut tx, node_id)
-                .await?
-                .is_some()
-        );
+        let row: Option<AdminNodeRow> = direct::lock_admin_node(&mut *tx, node_id).await?;
+        assert!(row.is_some());
         tx.rollback().await?;
     }
     Ok(())
@@ -2365,7 +2785,7 @@ async fn node_reads_report_cordon_group_trigger_and_runtimes() -> TestResult {
     .bind(busy)
     .execute(&db.pool)
     .await?;
-    crate::reconcile_trigger::enqueue_triggers(
+    pplx_space_cluster_trigger_queue::enqueue_triggers(
         &db.pool,
         [busy],
         pplx_space_state_reconciliation::ReconcileReason::ManualNodeReconcile,
@@ -2505,7 +2925,7 @@ async fn node_reads_survive_a_failed_read_state_read() -> TestResult {
     let actor =
         inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
     let node_id = insert_drain_test_node(&db.pool, NodeManagedBy::Space, None).await?;
-    crate::reconcile_trigger::enqueue_triggers(
+    pplx_space_cluster_trigger_queue::enqueue_triggers(
         &db.pool,
         [node_id],
         pplx_space_state_reconciliation::ReconcileReason::ManualNodeReconcile,
@@ -2571,4 +2991,134 @@ async fn node_reads_survive_a_failed_read_state_read() -> TestResult {
         assert_eq!(node.runtime_installations, Some(Vec::new()));
     }
     Ok(())
+}
+
+/// The holds route's wire shape for one phantom row, and its refusals. The
+/// rows and terms are the store's and its agreement test's; this pins what
+/// the console reads. The route reads the residency switch once per process,
+/// so the pinned body is rendered from the store under an explicit mode, and
+/// the route's body is checked against the same rendering under whatever mode
+/// this process holds.
+#[tokio::test]
+async fn node_holds_reports_each_row_with_its_gates_and_refuses_as_its_siblings() -> TestResult<()>
+{
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let actor =
+        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let node_id = NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role) VALUES ($1, '127.0.0.6', 'worker')"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_status_snapshots (
+             node_id, observed_at, stale_after, reachable, services,
+             sandbox_inventory_pruned_at, updated_at
+         ) VALUES ($1, NOW(), NOW() + INTERVAL '1 hour', TRUE, '[]'::JSONB, NOW(), NOW())"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    let sandbox: Uuid = sqlx::query_scalar(sql!(
+        "INSERT INTO sandboxes (id, user_id, org_id, lifecycle, placement, managed_by,
+            active_node_id, placement_changed_at, lifecycle_changed_at, network_policy_generation)
+         VALUES (space_uuid_v7(), '00000000-0000-0000-0000-000000000010',
+            '00000000-0000-0000-0000-000000000001', 'started', 'placed', 'k8s', $1,
+            NOW() - INTERVAL '2 hours', '2026-01-01T00:00:00Z', 1)
+         RETURNING id"
+    ))
+    .bind(node_id)
+    .fetch_one(&db.pool)
+    .await?;
+
+    let pool = &db.pool;
+    let rendered = |residency: ResidencyEvidence| async move {
+        let holds = node_holds::list(pool, node_id, residency, NODE_HOLDS_LIMIT).await?;
+        TestResult::Ok(serde_json::to_value(holds_response(
+            node_id, residency, holds,
+        ))?)
+    };
+    assert_eq!(
+        rendered(ResidencyEvidence::LifecycleOnly).await?,
+        serde_json::json!({
+            "node_id": node_id.to_string(),
+            "residency_evidence": "lifecycle_only",
+            "stuck_transient_after_secs": 600,
+            "total": 1,
+            "truncated": false,
+            "reason_counts": {
+                "census_absent": 1, "evacuating": 0, "local_only_snapshot": 0,
+                "resident": 0, "stuck_transient": 0, "termination_blocking": 0,
+                "transient": 0, "upload_in_flight": 0
+            },
+            "term_counts": { "resident": 1, "drain_blocker": 0, "active_resident": 1 },
+            "holds": [{
+                "sandbox_id": sandbox.to_string(),
+                "lifecycle": "started",
+                "lifecycle_changed_at": "2026-01-01T00:00:00Z",
+                "placement": "active",
+                "reason": "census_absent",
+                "counted_by": {
+                    "terminate": true,
+                    "drain": true,
+                    "drain_with_termination_blocking_gate": true
+                },
+                "terms": { "resident": true, "drain_blocker": false, "active_resident": true },
+                "facts": {
+                    "census_absent": true, "durable_snapshot": false,
+                    "upload_in_flight": false, "upload_started_at": null,
+                    "evacuation_restore_target": null, "restore_attempt_count": null,
+                    "next_restore_attempt_at": null, "past_stuck_threshold": true
+                }
+            }]
+        })
+    );
+
+    let holds = |actor: User, node_id: NodeId| {
+        list_node_holds(
+            State(state.clone()),
+            Extension(AuthUser(actor)),
+            Path(node_id),
+        )
+    };
+    let response = holds(actor.clone(), node_id).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 100_000).await?)?;
+    assert_eq!(body, rendered(cluster_residency_evidence()).await?);
+    assert_eq!(
+        holds(actor.clone(), NodeId::new()).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    let mut member = actor;
+    member.role = UserRole::Member;
+    assert_eq!(holds(member, node_id).await.status(), StatusCode::FORBIDDEN);
+    Ok(())
+}
+
+#[test]
+fn the_evacuation_cap_is_validated_only_while_drain_v2_is_on() {
+    for raw in ["0", "1025", "four", ""] {
+        assert!(
+            drain_v2_max_evacuating_nodes(true, Some(raw)).is_err(),
+            "{raw:?} must stop an API with drain v2 on from starting"
+        );
+        assert_eq!(
+            drain_v2_max_evacuating_nodes(false, Some(raw)),
+            Ok(drain_v2::DEFAULT_DRAIN_V2_MAX_EVACUATING_NODES),
+            "{raw:?} must be ignored while drain v2 is off"
+        );
+    }
+    for enabled in [true, false] {
+        assert_eq!(drain_v2_max_evacuating_nodes(enabled, Some(" 2 ")), Ok(2));
+        assert_eq!(
+            drain_v2_max_evacuating_nodes(enabled, None),
+            Ok(drain_v2::DEFAULT_DRAIN_V2_MAX_EVACUATING_NODES)
+        );
+    }
 }

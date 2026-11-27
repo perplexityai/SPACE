@@ -13,6 +13,7 @@ pub mod proto {
     tonic::include_proto!("space.node.v1");
 }
 
+pub mod capture_receipt;
 pub mod execution_fence;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

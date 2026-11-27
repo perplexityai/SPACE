@@ -14,7 +14,10 @@
 # the content store, and falls back to the local image when its tag lookup
 # fails.
 #
-# Usage: pull-base-images.sh <dockerfile>...
+# Usage: pull-base-images.sh [--list] <dockerfile>...
+#   --list prints the images instead of pulling them, so a caller that hands
+#   images to other Docker daemons (scripts/tests/smoke-kind-parallel.sh) can
+#   name exactly the set these builds read.
 #   Pulls the images named by FROM lines, directly or through an ARG default,
 #   and by `# syntax=` directives. Build stages, `scratch`, the `:local` images
 #   this repository builds, and references an ARG only partly expands are left
@@ -81,12 +84,21 @@ pull_with_retries() {
     done
 }
 
+list=0
+if [[ "${1:-}" == --list ]]; then
+    list=1
+    shift
+fi
 if (( $# == 0 )); then
-    echo "usage: $0 <dockerfile>..." >&2
+    echo "usage: $0 [--list] <dockerfile>..." >&2
     exit 64
 fi
 
 images="$(base_images "$@")"
+if (( list )); then
+    printf '%s\n' "$images"
+    exit 0
+fi
 while IFS= read -r image; do
     [[ -n "$image" ]] || continue
     docker image inspect "$image" >/dev/null 2>&1 && continue

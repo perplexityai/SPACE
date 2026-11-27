@@ -65,7 +65,7 @@ pub(crate) fn scripted_kube_client(
 
 /// [`scripted_kube_client`] for replies that must first observe or change
 /// other test state, such as the database, at the moment a request arrives.
-pub(super) fn scripted_kube_client_async<F, Fut>(reply: F) -> (Client, KubeLog)
+pub(crate) fn scripted_kube_client_async<F, Fut>(reply: F) -> (Client, KubeLog)
 where
     F: Fn(KubeRequest) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = KubeReply> + Send + 'static,
@@ -376,7 +376,8 @@ pub(super) async fn start_scripted_worker(
         dir.path().join("snapshots"),
         dir.path().join("sandboxes"),
         WORKER_NODE.to_string(),
-    );
+    )
+    .as_sandbox_pod();
     let calls: CallLog = Arc::default();
     let replies = Arc::new(config.replies);
     let observers = Arc::new(config.observers);
@@ -415,6 +416,7 @@ pub(super) async fn start_scripted_worker(
             succeed_after_attempt: Some(config.wake_succeeds_from_attempt),
             echo_route_identity: true,
             received: Arc::default(),
+            rejection: Arc::default(),
         }),
         replies: Arc::clone(&replies),
         observers: Arc::clone(&observers),

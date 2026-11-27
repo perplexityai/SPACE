@@ -8,8 +8,7 @@
 # inventory, including ignored tests.
 #
 # clippy lints every feature of workspace libraries and binaries while every
-# target is compiled in the same Cargo graph. isolated-crates lints each
-# library that lib/rust-isolated-crates.sh selects in a Cargo graph of its own.
+# target is compiled in the same Cargo graph.
 #
 # GitHub CI splits `tests` across two containers on one runner, built once:
 # `tests-unprivileged` builds everything and runs the nextest inventory outside
@@ -38,8 +37,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 source "${SCRIPT_DIR}/lib/test-deps.sh"
 # shellcheck source=lib/rust-side-checks.sh
 source "${SCRIPT_DIR}/lib/rust-side-checks.sh"
-# shellcheck source=lib/rust-isolated-crates.sh
-source "${SCRIPT_DIR}/lib/rust-isolated-crates.sh"
+# shellcheck source=lib/rust-affected-crates.sh
+source "${SCRIPT_DIR}/lib/rust-affected-crates.sh"
 
 PROTOC_VERSION="${PROTOC_VERSION:-35.0}"
 CARGO_NEXTEST_VERSION="${CARGO_NEXTEST_VERSION:-0.9.133}"
@@ -332,13 +331,12 @@ run_sbxmgr_production_checks() {
         sbxmgr_assert_direct_dependents pplx-space-sqlite "${sbxmgr_feature_args[@]}" -- \
             pplx-space-sbx-mgr-store
         # rusqlite enters only through the store, the helpers it depends on,
-        # and four shared crates whose rusqlite use hands no connection out:
-        # common-jobs' functions take a connection in, and common-core,
-        # accounts and job-id only implement rusqlite's value conversion
-        # traits for their types.
+        # and two shared crates whose rusqlite use hands no connection out:
+        # common-jobs' functions take a connection in, and sql-codec, through
+        # which job-id implements rusqlite's value conversion traits for its
+        # type, re-exports only those traits and their value types.
         sbxmgr_assert_direct_dependents rusqlite "${sbxmgr_feature_args[@]}" -- \
-            pplx-space-sbx-mgr-store pplx-space-sqlite pplx-space-common-jobs pplx-space-common-core \
-            pplx-space-accounts pplx-space-job-id
+            pplx-space-sbx-mgr-store pplx-space-sqlite pplx-space-common-jobs pplx-space-sql-codec
     done
 }
 
@@ -369,7 +367,7 @@ run_clippy_checks() {
     fi
 
     # Pull CI and the merge queue run these only when the change can affect
-    # the crates they lint (lint_affects_any in lib/rust-isolated-crates.sh).
+    # the crates they lint (lint_affects_any in lib/rust-affected-crates.sh).
     if lint_affects_any "${target_dir}" "${SBXMGR_PRODUCTION_CRATES[@]}"; then
         run_sbxmgr_production_checks "${target_dir}"
     else
@@ -396,31 +394,25 @@ run_clippy_checks() {
         -D warnings
 
     # Each feature of the account and job identity crates by itself, so one
-    # that relies on another being enabled fails here; the isolated-crates
-    # mode builds them only with no features and with all of them. Both call
-    # job-id's uuid_id! macro, whose impls follow the calling crate's own
-    # features. No workspace crate enables job-id's sqlx, so only the
+    # that relies on another being enabled fails here. Both call uuid-id's
+    # uuid_id! macro, whose impls follow the calling crate's own features.
+    # No workspace crate enables job-id's sqlx, so only the
     # --all-features builds and this loop compile its Postgres impls, and only
     # this loop compiles them without serde and rusqlite.
     echo "--- :rust: Running account and job identity clippy with each feature alone"
-    local identity_crate identity_feature
-    for identity_crate in pplx-space-accounts pplx-space-job-id; do
-        for identity_feature in serde sqlx rusqlite; do
-            CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-                --locked \
-                -p "${identity_crate}" \
-                --no-default-features \
-                --features "${identity_feature}" \
-                --all-targets \
-                -- \
-                -D warnings
-        done
+    local identity_build
+    for identity_build in \
+        pplx-space-accounts/serde pplx-space-accounts/sqlx \
+        pplx-space-job-id/serde pplx-space-job-id/sqlx pplx-space-job-id/rusqlite; do
+        CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+            --locked \
+            -p "${identity_build%/*}" \
+            --no-default-features \
+            --features "${identity_build#*/}" \
+            --all-targets \
+            -- \
+            -D warnings
     done
-
-    # The libraries that reach common-core at most directly, and those its
-    # ALSO list names, are linted alone by run_isolated_crate_checks in
-    # lib/rust-isolated-crates.sh (the isolated-crates mode), which finds them
-    # in the workspace metadata. A new crate needs no step here.
 }
 
 nextest_test_threads() {
@@ -870,13 +862,13 @@ main() {
 cd "$REPO_ROOT"
 
 validation_mode="${1:-all}"
-usage="Usage: $0 [fmt|clippy|isolated-crates|tests|tests-unprivileged|tests-privileged|all]"
+usage="Usage: $0 [fmt|clippy|tests|tests-unprivileged|tests-privileged|all]"
 if [ "$#" -gt 1 ]; then
     echo "${usage}" >&2
     exit 2
 fi
 case "${validation_mode}" in
-    fmt | clippy | isolated-crates | tests | tests-unprivileged | tests-privileged | all) ;;
+    fmt | clippy | tests | tests-unprivileged | tests-privileged | all) ;;
     *)
         echo "${usage}" >&2
         exit 2
@@ -910,7 +902,7 @@ on_exit() {
 }
 trap on_exit EXIT
 case "${validation_mode}" in
-    clippy | isolated-crates)
+    clippy)
         needs_build_dependencies=true
         ;;
     tests | all)
@@ -1084,9 +1076,6 @@ case "${validation_mode}" in
     clippy)
         run_clippy_checks
         ;;
-    isolated-crates)
-        run_isolated_crate_checks
-        ;;
     tests | tests-unprivileged)
         run_test_checks
         ;;
@@ -1096,7 +1085,6 @@ case "${validation_mode}" in
     all)
         run_fmt_check
         run_clippy_checks
-        run_isolated_crate_checks
         run_test_checks
         ;;
 esac

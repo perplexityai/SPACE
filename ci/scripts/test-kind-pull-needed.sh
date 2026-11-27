@@ -61,6 +61,9 @@ assert_needed true crates/l40_api/internal/api/server/src/template_builds.rs
 assert_needed true shim/telemetry_export.go
 assert_needed true docs/unrelated.md crates/l40_api/template/mgr/server/src/volume.rs
 assert_needed true .github/workflows/pull-ci.yml
+# The spaced transport and protocol crates run in every sandbox.
+assert_needed true crates/l40_api/spaced/client/src/retry_policy.rs
+assert_needed true crates/l20_domain/spaced/protocol/src/lib.rs
 assert_needed false crates/l40_api/internal/api/server/src/template_x/nested.rs
 assert_needed false shim/telemetry/nested.go
 assert_needed false scripts/tests/smoke-kind-x/nested.sh
@@ -80,6 +83,18 @@ SPACE_KIND_PULL_DRAFT=true SPACE_KIND_PULL_OPT_IN=true assert_needed true space_
 SPACE_KIND_PULL_DRAFT=false assert_needed true space_smoke/adapters.py
 SPACE_KIND_PULL_DRAFT=true SPACE_KIND_PULL_OPT_IN=true assert_needed false docs/unrelated.md
 SPACE_KIND_PULL_DRAFT=true assert_needed false docs/unrelated.md
+# The label's force runs the smoke when no listed path changed, draft or not;
+# opting in alone does not.
+SPACE_KIND_PULL_FORCE=true assert_needed true docs/unrelated.md
+grep -qF "No path in kind-pull-paths.txt changed; the kind-smoke label requires the smoke anyway" "${tmp_dir}/stderr" || {
+    echo "a forced selection must say why" >&2
+    exit 1
+}
+SPACE_KIND_PULL_DRAFT=true SPACE_KIND_PULL_OPT_IN=true SPACE_KIND_PULL_FORCE=true \
+    assert_needed true crates/l40_api/template/mgr/server/src/service.rs
+SPACE_KIND_PULL_FORCE=false assert_needed false docs/unrelated.md
+# A forced draft that changes a listed path runs it too, rather than defer.
+SPACE_KIND_PULL_DRAFT=true SPACE_KIND_PULL_FORCE=true assert_needed true space_smoke/adapters.py
 
 # Run a command in the fixture; it must fail with $1 on stderr, so an unrelated
 # crash cannot pass for a refusal.
@@ -122,5 +137,7 @@ assert_refused "SPACE_KIND_PULL_DRAFT must be true or false" "a malformed draft 
     env SPACE_KIND_PULL_DRAFT=yes bash "${selector}" "${head}"
 assert_refused "SPACE_KIND_PULL_OPT_IN must be true or false" "a malformed opt-in flag" \
     env SPACE_KIND_PULL_OPT_IN=1 bash "${selector}" "${head}"
+assert_refused "SPACE_KIND_PULL_FORCE must be true or false" "a malformed force flag" \
+    env SPACE_KIND_PULL_FORCE=on bash "${selector}" "${head}"
 
 echo "kind-pull-needed: ok"

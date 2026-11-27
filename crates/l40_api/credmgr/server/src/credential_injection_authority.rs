@@ -16,13 +16,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use pplx_space_common_core::{
-    types::CredentialReferenceId, types::ExecutionGeneration, types::K8sNodeUid, types::NodeId,
-    types::SandboxId,
-};
-use pplx_space_credential_injection_core::proto::ResolvedNetworkCredential;
+use pplx_space_accounts::{CredentialReferenceId, NodeId};
+use pplx_space_credential_injection::proto::ResolvedNetworkCredential;
 use pplx_space_credential_injection_store::references::ReferenceState;
+use pplx_space_k8s_ids::K8sNodeUid;
 use pplx_space_net_common::EffectiveNetworkPolicyRef;
+use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 
 use crate::credential_injection_bundle::{
     BundleMaterializationError, CredentialInjectionBundleMaterializer,
@@ -269,7 +268,7 @@ pub(crate) enum BundleResolutionError {
 impl From<ResolutionStateError> for BundleResolutionError {
     fn from(error: ResolutionStateError) -> Self {
         match error {
-            ResolutionStateError::Query(error) => Self::StateUnavailable(error),
+            ResolutionStateError::Query(error) => Self::StateUnavailable(sqlx::Error::from(error)),
             ResolutionStateError::InvalidData(message) => Self::InvalidState(message),
         }
     }

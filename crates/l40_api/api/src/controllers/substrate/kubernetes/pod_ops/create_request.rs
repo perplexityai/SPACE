@@ -227,10 +227,7 @@ impl KubernetesSubstrate {
             context.direct_node_name(),
         ) && let Some(node) = self.k8s.caches.node_by_name(node_name)
             && !node.metadata.labels.as_ref().is_some_and(|labels| {
-                pplx_space_common_core::kubernetes::node_publishes_environment(
-                    labels,
-                    &required.reference,
-                )
+                pplx_space_sandbox_pod::node_publishes_environment(labels, &required.reference)
             })
         {
             return Err(SubstrateError::Conflict {
@@ -329,12 +326,13 @@ impl KubernetesSubstrate {
             network_policy_json,
             node_group_placement,
             environment,
+            client_id,
         } = inputs;
         let disk_io_limits = u64::try_from(sandbox.disk_io_max_operations_per_sec)
             .ok()
             .zip(u64::try_from(sandbox.disk_io_max_bandwidth_mib_per_sec).ok())
             .and_then(|(operations, bandwidth)| {
-                pplx_space_common_core::types::DiskIoLimits::try_new(operations, bandwidth).ok()
+                pplx_space_execution_spec::DiskIoLimits::try_new(operations, bandwidth).ok()
             })
             .unwrap_or_else(|| {
                 tracing::warn!(
@@ -343,12 +341,13 @@ impl KubernetesSubstrate {
                     bandwidth_mib_per_sec = sandbox.disk_io_max_bandwidth_mib_per_sec,
                     "invalid persisted sandbox disk I/O limits; using platform defaults"
                 );
-                pplx_space_common_core::types::DiskIoLimits::default()
+                pplx_space_execution_spec::DiskIoLimits::default()
             });
         let runtime = SandboxRuntimePodMetadata {
             sandbox_owner,
             user_id: sandbox.user_id,
             org_id: sandbox.org_id,
+            client_id,
             auto_lifecycle_json,
             auto_lifecycle_authority: PolicyAuthority::Cluster,
             network_policy_json,
@@ -419,9 +418,9 @@ impl KubernetesSubstrate {
                     artifact_kind: if sandbox.lifecycle.parse::<SandboxLifecycle>()
                         == Ok(SandboxLifecycle::Stopped)
                     {
-                        pplx_space_common_core::types::ArtifactKind::Disk
+                        pplx_space_snapshot_model::ArtifactKind::Disk
                     } else {
-                        pplx_space_common_core::types::ArtifactKind::Full
+                        pplx_space_snapshot_model::ArtifactKind::Full
                     },
                     common,
                     runtime,
@@ -456,9 +455,9 @@ impl KubernetesSubstrate {
                     || sandbox.lifecycle.parse::<SandboxLifecycle>()
                         == Ok(SandboxLifecycle::Stopped)
                 {
-                    pplx_space_common_core::types::ArtifactKind::Disk
+                    pplx_space_snapshot_model::ArtifactKind::Disk
                 } else {
-                    pplx_space_common_core::types::ArtifactKind::Full
+                    pplx_space_snapshot_model::ArtifactKind::Full
                 },
                 stopped_materialization,
                 common,

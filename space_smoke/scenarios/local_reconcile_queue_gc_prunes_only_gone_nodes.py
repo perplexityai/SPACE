@@ -5,13 +5,11 @@ import space_smoke as smoke
 
 # The GC runs at Kind's 10 s tick and the binary's 24 h retention, so the body
 # seeds synthetic non-ready nodes with backdated refs and waits out one tick; its EC2 lookups reach Kind's fake EC2 endpoint, which answers
-# from the Nodes (see `space_smoke.reconcile_queue_gc`). The sandbox is the
-# fixture's and unused; its timeout outlasts the wait.
+# from the Nodes (see `space_smoke.reconcile_queue_gc`). No VM is needed.
 @smoke.scenario(
     "local.reconcile_queue_gc_prunes_only_gone_nodes",
-    sandbox=smoke.SandboxConfig(timeout=1200),
 )
-def reconcile_queue_gc_prunes_only_gone_nodes(test: smoke.KindEcw) -> None:
+def reconcile_queue_gc_prunes_only_gone_nodes(test: smoke.KindAdmin) -> None:
     """With the reconcile-queue GC on against the fake EC2 endpoint, one tick
     deletes a 25 h-old dead letter and the 25 h-old live ref of a non-ready
     node whose Kubernetes Node does not exist, and keeps a 1 h-old dead

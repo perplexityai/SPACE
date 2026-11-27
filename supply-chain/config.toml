@@ -823,20 +823,24 @@ version = "1.1.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.kube]]
-version = "4.2.0"
+version = "4.2.1"
 criteria = "safe-to-deploy"
+notes = "Carry forward the existing exemption to the release fixing RUSTSEC-2026-0600. No imported audit covers this version; this is not an independent audit."
 
 [[exemptions.kube-client]]
-version = "4.2.0"
+version = "4.2.1"
 criteria = "safe-to-deploy"
+notes = "Carry forward the existing exemption to the release fixing RUSTSEC-2026-0600. No imported audit covers this version; this is not an independent audit."
 
 [[exemptions.kube-core]]
-version = "4.2.0"
+version = "4.2.1"
 criteria = "safe-to-deploy"
+notes = "Carry forward the existing exemption to the release fixing RUSTSEC-2026-0600. No imported audit covers this version; this is not an independent audit."
 
 [[exemptions.kube-runtime]]
-version = "4.2.0"
+version = "4.2.1"
 criteria = "safe-to-deploy"
+notes = "Carry forward the existing exemption to the release fixing RUSTSEC-2026-0600. No imported audit covers this version; this is not an independent audit."
 
 [[exemptions.libc]]
 version = "0.2.189"
@@ -1405,8 +1409,9 @@ version = "4.1.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustix]]
-version = "1.1.4"
+version = "1.1.6"
 criteria = "safe-to-deploy"
+notes = "Carry forward the existing exemption to the release fixing RUSTSEC-2026-0486. No imported audit covers this version; this is not an independent audit."
 
 [[exemptions.rustls]]
 version = "0.23.46"
@@ -1829,8 +1834,9 @@ version = "0.6.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.url]]
-version = "2.5.8"
+version = "2.5.9"
 criteria = "safe-to-deploy"
+notes = "Carry forward the existing exemption only to 2.5.9, the release fixing RUSTSEC-2026-0592. No configured imported audit covers this version. This is not an independent audit of url."
 
 [[exemptions.urlencoding]]
 version = "2.1.3"
@@ -2101,6 +2107,11 @@ criteria = "safe-to-deploy"
 [[exemptions.x509-parser]]
 version = "0.18.1"
 criteria = "safe-to-deploy"
+
+[[exemptions.xattr]]
+version = "1.7.0"
+criteria = "safe-to-deploy"
+notes = "Imported audits cover xattr through 1.6.1. 1.7.0 adapts to rustix 1.1.6, the release fixing RUSTSEC-2026-0486, with which 1.6.1 reads attribute values and name lists over 4 KiB as empty. No imported audit covers 1.7.0. Source diff from 1.6.1 reviewed for the exemption, not certified as an audit: src/sys/linux_macos.rs queries sizes with the new rustix *_query functions instead of an empty buffer, lib.rs drops one clippy allow, and no unsafe code is added."
 
 [[exemptions.xmlparser]]
 version = "0.13.6"

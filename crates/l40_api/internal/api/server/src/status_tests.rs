@@ -1,14 +1,26 @@
 use super::*;
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, NodeId, SandboxId, SandboxLifecycle, SnapshotState, SubstrateKind,
-};
+use pplx_space_accounts::NodeId;
 use pplx_space_db_test_fixtures::{
     SEED_ORG_ID, SEED_USER_ID, insert_ready_worker_node, pg_test_db,
     pg_test_db_with_max_connections, try_pg_test_db,
 };
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_store::test_support::stored_lifecycle_matrix;
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, SnapshotState};
+use sqlx::Connection as _;
 
 use pplx_space_test_env::TestResult;
+
+async fn prune_empty_census(conn: &mut sqlx::PgConnection, node_id: NodeId) -> TestResult {
+    let mut tx = conn.begin().await?;
+    let ids =
+        pplx_space_sandbox_store::ingest::census_prune_candidates(&mut *tx, node_id, &[]).await?;
+    pplx_space_sandbox_store::orphan::lock_published_sandbox_observations(&mut *tx, &ids).await?;
+    prune_absent_node_sandboxes(&mut tx, node_id, &ids).await?;
+    tx.commit().await?;
+    Ok(())
+}
 
 /// A `sandboxes` row placed on `node_id` and labelled with `managed_by`.
 /// `SubstrateKind::Space` is what puts it inside the prune's `marked_deleted`
@@ -44,7 +56,7 @@ async fn insert_placed_sandbox(
 /// One variant rather than a `(kind, origin)` plus `(state, location)` pair of
 /// tuples: those are two same-shaped tuples whose slots mean different things,
 /// so a case can be misassembled at the call site without failing to compile.
-/// Mirrors `sandbox_portability_tests`' `SnapshotSetup`.
+/// Mirrors `SnapshotSetup` in sandbox-portability's `portable_predicate_tests`.
 #[derive(Debug, Clone, Copy)]
 enum ArtifactPin {
     /// No `current_local_artifact_*` marker and no catalog row.
@@ -432,12 +444,12 @@ async fn sandbox_is_observed(pool: &sqlx::PgPool, sandbox_id: SandboxId) -> Test
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn complete_inventory_marks_missing_space_sandbox_deleted() -> TestResult {
+async fn complete_inventory_prunes_only_captured_missing_space_sandboxes() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
     let node_id = NodeId::new();
-    let sandbox_id = SandboxId::new();
+    let sandbox_id = SandboxId::new(); // Direct, but no observation yet.
     // Otherwise identical, but Kubernetes-managed: the census does not own it.
     let k8s_sandbox_id = SandboxId::new();
     insert_ready_worker_node(&db.pool, node_id).await?;
@@ -458,9 +470,26 @@ async fn complete_inventory_marks_missing_space_sandbox_deleted() -> TestResult 
     )
     .await?;
 
-    let mut conn = db.pool.acquire().await?;
-    prune_absent_node_sandboxes(&mut conn, node_id, &[]).await?;
-    drop(conn);
+    let mut tx = db.pool.begin().await?;
+    let ids =
+        pplx_space_sandbox_store::ingest::census_prune_candidates(&mut *tx, node_id, &[]).await?;
+    assert_eq!(ids, vec![sandbox_id]);
+    pplx_space_sandbox_store::orphan::lock_published_sandbox_observations(&mut *tx, &ids).await?;
+
+    // A different connection commits a new placement and observation after
+    // capture. It matches the prune predicates but was not captured or locked.
+    let late_sandbox_id = SandboxId::new();
+    insert_placed_sandbox(
+        &db.pool,
+        late_sandbox_id,
+        node_id,
+        SandboxLifecycle::Started,
+        SubstrateKind::Space,
+    )
+    .await?;
+    observe_sandbox_on_node(&db.pool, late_sandbox_id, node_id).await?;
+    prune_absent_node_sandboxes(&mut tx, node_id, &ids).await?;
+    tx.commit().await?;
 
     assert_eq!(
         pruned_sandbox_row(&db.pool, sandbox_id).await?,
@@ -470,6 +499,11 @@ async fn complete_inventory_marks_missing_space_sandbox_deleted() -> TestResult 
         pruned_sandbox_row(&db.pool, k8s_sandbox_id).await?,
         PrunedSandboxRow::placed("started", node_id)
     );
+    assert_eq!(
+        pruned_sandbox_row(&db.pool, late_sandbox_id).await?,
+        PrunedSandboxRow::placed("started", node_id)
+    );
+    assert!(sandbox_is_observed(&db.pool, late_sandbox_id).await?);
     Ok(())
 }
 
@@ -528,7 +562,7 @@ async fn complete_inventory_tombstones_every_stored_lifecycle_but_the_delete_sta
     }
 
     let mut conn = db.pool.acquire().await?;
-    prune_absent_node_sandboxes(&mut conn, node_id, &[]).await?;
+    prune_empty_census(&mut conn, node_id).await?;
     drop(conn);
 
     let mut mismatches = Vec::new();
@@ -701,7 +735,7 @@ async fn complete_inventory_spares_only_a_stopped_sandbox_with_a_durable_pinned_
     }
 
     let mut conn = db.pool.acquire().await?;
-    prune_absent_node_sandboxes(&mut conn, node_id, &[]).await?;
+    prune_empty_census(&mut conn, node_id).await?;
     drop(conn);
 
     for &(case, sandbox_id) in &seeded {
@@ -730,7 +764,7 @@ async fn complete_inventory_spares_only_a_stopped_sandbox_with_a_durable_pinned_
     // unobserved" as lost, every exemption above would be revoked one tick
     // later.
     let mut conn = db.pool.acquire().await?;
-    prune_absent_node_sandboxes(&mut conn, node_id, &[]).await?;
+    prune_empty_census(&mut conn, node_id).await?;
     drop(conn);
     for &(case, sandbox_id) in &seeded {
         assert_eq!(
@@ -866,7 +900,7 @@ async fn complete_inventory_decides_on_the_row_committed_while_it_waits() -> Tes
             .fetch_one(&mut *prune_conn)
             .await?;
         let prune = tokio::spawn(async move {
-            prune_absent_node_sandboxes(&mut prune_conn, node_id, &[]).await?;
+            prune_empty_census(&mut prune_conn, node_id).await?;
             TestResult::Ok(())
         });
         tokio::time::timeout(RACE_BUDGET, async {

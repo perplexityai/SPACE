@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::GuestFileInfoStream;
 use futures_util::StreamExt;
-use pplx_space_common_core::types::GuestPath;
+use pplx_space_guest_process::GuestPath;
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::FileType;
 use tokio::sync::OwnedSemaphorePermit;
 use tonic::Status;

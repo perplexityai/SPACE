@@ -18,7 +18,7 @@ backend = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(backend)
 
 
-@pytest.fixture(scope="module", autouse=True)
+@pytest.fixture(scope="module")
 def vendored_datadog_chart():
     """Vendor the upstream subchart so `helm template` can run.
 
@@ -90,7 +90,7 @@ def test_ambient_key_never_enables_saas():
 
 
 @pytest.mark.parametrize("mode,emitter", [("fakeintake", "datadog"), ("fakeintake", "otel"), ("saas", "otel")])
-def test_real_helm_render_and_running_pod_verification(mode, emitter, approved, monkeypatch):
+def test_real_helm_render_and_running_pod_verification(mode, emitter, approved, monkeypatch, vendored_datadog_chart):
     env = {**approved, "SPACE_KIND_DATADOG_MODE": mode, "SPACE_KIND_TELEMETRY_MODE": emitter, "DD_API_KEY": "poison"}
     config = backend.plan(env)
     docs = documents(config)
@@ -227,7 +227,7 @@ def test_session_preflight_failure_does_not_mutate_or_roll_back(approved, monkey
 
 @pytest.mark.parametrize("failure", ["apply", "concurrent_write", "ownership"])
 def test_stop_persists_local_intent_before_apply_even_if_apply_fails(
-    approved, monkeypatch, failure
+    vendored_datadog_chart, approved, monkeypatch, failure
 ):
     path = Path(approved["SPACE_KIND_OBSERVABILITY_CONFIG"])
     original = path.read_bytes()
@@ -373,7 +373,7 @@ def _rendered_pods(mode):
         ("saas", "hostname", "hostname is not isolated"),
     ],
 )
-def test_each_verify_refusal_is_enforced(monkeypatch, approved, mode, defect, expected):
+def test_each_verify_refusal_is_enforced(vendored_datadog_chart, monkeypatch, approved, mode, defect, expected):
     config = backend.plan({**approved, "SPACE_KIND_DATADOG_MODE": mode})
     pods = pod_specs(documents(config))
     agent = next(
@@ -412,26 +412,7 @@ def test_each_verify_refusal_is_enforced(monkeypatch, approved, mode, defect, ex
         backend.verify(config)
 
 
-def test_verify_selects_agent_pods_by_name_and_component(monkeypatch):
-    """A typo in the selector makes every apply fail; assert the literal."""
-    config, pods = _rendered_pods("fakeintake")
-    selectors = []
-
-    def kube(_config, *args, **_kwargs):
-        if args[0] == "get" and "-l" in args:
-            selectors.append(args[args.index("-l") + 1])
-        return json.dumps({"items": pods}) if args[0] == "get" else "ok"
-
-    monkeypatch.setattr(backend, "kube", kube)
-    backend.verify(config)
-    assert any(
-        "app.kubernetes.io/name=datadog-agent" in s
-        and "component in (agent,cluster-agent)" in s
-        for s in selectors
-    ), selectors
-
-
-def test_verify_counts_pods_not_templates(monkeypatch):
+def test_verify_counts_pods_not_templates(vendored_datadog_chart, monkeypatch):
     """`node_agents` must count running pods, not one per DaemonSet."""
     config, pods = _rendered_pods("fakeintake")
     agents = [

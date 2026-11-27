@@ -128,6 +128,50 @@ async fn restart_yield_returns_job_to_pending_without_consuming_attempt() {
 }
 
 #[tokio::test]
+async fn stopped_worker_finishes_running_jobs_and_leaves_new_ones_for_its_successor() {
+    let path = test_db_path("stop-starting");
+    let db = Arc::new(Mutex::new(open_test_db(&path)));
+    let executor = TestExecutor::blocking();
+    let worker = BackgroundWorker::new(
+        Arc::clone(&db),
+        executor.clone(),
+        WorkerConfig::new(2, Duration::from_secs(5), 1),
+    );
+    let running = worker.submit("test", "{}", None, None).unwrap();
+    executor.wait_started(1).await;
+
+    worker.stop_starting_jobs();
+    let submitted_while_stopping = worker.submit("test", "{}", None, None).unwrap();
+    assert!(!worker.wait_for_executors(Duration::from_millis(50)).await);
+    executor.release();
+
+    assert!(worker.wait_for_executors(Duration::from_secs(1)).await);
+    let finished = worker.get_job(&running).unwrap().unwrap();
+    assert_eq!(finished.status, "completed");
+    assert_eq!(
+        finished.bytes_processed, 1,
+        "the running job was not cancelled"
+    );
+    let left = worker.get_job(&submitted_while_stopping).unwrap().unwrap();
+    assert_eq!(left.status, "pending");
+    assert_eq!(left.attempts, 0);
+    assert_eq!(executor.started.load(Ordering::SeqCst), 1);
+
+    let successor = BackgroundWorker::new(
+        db,
+        TestExecutor::immediate(),
+        WorkerConfig::new(1, Duration::from_secs(5), 1),
+    );
+    assert_eq!(successor.recover(), vec![submitted_while_stopping]);
+    let recovered = successor
+        .wait_for_job(&submitted_while_stopping, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(recovered.status, "completed");
+    remove_test_db(path);
+}
+
+#[tokio::test]
 async fn quiescent_drain_waits_for_executor_after_its_row_is_terminal() {
     let path = test_db_path("quiescent-drain");
     let executor = TestExecutor::blocking();

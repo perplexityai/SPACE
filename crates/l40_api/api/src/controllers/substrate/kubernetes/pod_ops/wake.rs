@@ -41,6 +41,10 @@ struct SelectedWakeSettings {
     policy: WakeWaitPolicy,
     require_split_receipt_capability: bool,
     phase_deadline: Instant,
+    /// The user restore lease the Wake is sent under, when the restore
+    /// dispatch fence is on: ownership is confirmed under it, and its fence
+    /// cleared, before the first send.
+    restore_dispatch: Option<Uuid>,
 }
 
 impl ActivationWakeFailure {
@@ -140,7 +144,7 @@ impl KubernetesSubstrate {
                     .to_string(),
             });
         }
-        let Some(pod_ip) = assigned_pod_ip(&pod)? else {
+        let Some(pod_ip) = current_pod_ip(&pod, Some(pod_uid), execution.pod_ip.as_deref())? else {
             return Ok(None);
         };
         let live_pod_ip = pod_ip.to_string();
@@ -290,6 +294,7 @@ impl KubernetesSubstrate {
         sandbox_id: SandboxId,
         action: ActivationWakeAction,
         phase_deadline: Instant,
+        restore_dispatch: Option<Uuid>,
         build_request: F,
         on_dispatch: D,
     ) -> Result<
@@ -340,6 +345,7 @@ impl KubernetesSubstrate {
                             policy,
                             require_split_receipt_capability,
                             phase_deadline,
+                            restore_dispatch,
                         },
                         on_dispatch,
                     )
@@ -392,6 +398,7 @@ impl KubernetesSubstrate {
             policy,
             require_split_receipt_capability,
             phase_deadline,
+            mut restore_dispatch,
         } = settings;
         let probe = policy == WakeWaitPolicy::ResidentProbe;
         let deadline = if probe {
@@ -489,6 +496,23 @@ impl KubernetesSubstrate {
                         };
                     }
                     if let Some((_, client)) = connection.as_mut() {
+                        // The last point at which nothing can be running for
+                        // this restore on the node: a re-drive that took the
+                        // restore over from an owner it judged dead has
+                        // changed the token, and this Wake must not go out.
+                        if let Some(restore_lease_token) = restore_dispatch.take()
+                            && !self
+                                .store
+                                .confirm_user_restore_dispatch(sandbox_id, restore_lease_token)
+                                .await?
+                        {
+                            return Err(SubstrateError::RestoreInFlight {
+                                message: format!(
+                                    "sandbox {sandbox_id}'s restore was taken over before its Wake was sent"
+                                ),
+                                lease_remaining: None,
+                            });
+                        }
                         // Once the RPC future is polled, transport failure does
                         // not prove the server skipped the request. Preserve
                         // durable lifecycle/operation evidence on deadline.
@@ -533,6 +557,30 @@ impl KubernetesSubstrate {
                                     });
                                 }
                                 WakeRpcErrorDisposition::ReadinessPoll(_) => {}
+                                // The refusal is of this process's credential,
+                                // which a retry here would only send again:
+                                // hand the wake back for any executor to
+                                // re-drive. An earlier attempt may have landed,
+                                // so the dispatch status stays as it is.
+                                WakeRpcErrorDisposition::CallerUnauthenticated => {
+                                    return Err(SubstrateError::Unavailable {
+                                        message: format!(
+                                            "worker node-api did not accept this API process's credential: {error}"
+                                        ),
+                                    });
+                                }
+                                WakeRpcErrorDisposition::NodeSealed => {
+                                    self.store
+                                        .note_sealed_refusal(sandbox_id, error.message())
+                                        .await;
+                                    return Err(SubstrateError::NodeSealed {
+                                        message: format!(
+                                            "sandbox cannot be woken yet: its node is \
+                                             draining; retry shortly: {}",
+                                            error.message()
+                                        ),
+                                    });
+                                }
                                 WakeRpcErrorDisposition::Fail => {
                                     return Err(SubstrateError::Conflict {
                                         message: format!("sandbox wake failed: {error}"),

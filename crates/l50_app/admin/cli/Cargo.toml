@@ -17,16 +17,20 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true, features = ["derive", "env"] }
 comfy-table = { workspace = true }
+pplx-space-admin-protocol = { workspace = true, features = ["serde"] }
+pplx-space-node-model = { workspace = true }
+pplx-space-template-model = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["serde"] }
 
 # internal
 pplx-space-common-cli = { workspace = true }
-pplx-space-common-core = { workspace = true, features = ["serde"] }
+pplx-space-content-digest = { workspace = true, features = ["serde"] }
+pplx-space-execution-spec = { workspace = true, features = ["serde"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["term"] }
@@ -35,6 +39,7 @@ nix = { workspace = true, features = ["term"] }
 axum = { workspace = true }
 insta = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+pplx-space-accounts = { workspace = true, features = ["serde"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 nix = { workspace = true, features = ["signal"] }

@@ -91,7 +91,7 @@ pub(crate) async fn flush_guest_root_filesystem_before_stop(
     let budget = GUEST_FILESYSTEM_FLUSH_TIMEOUT;
     let started = tokio::time::Instant::now();
     let config = pplx_space_spaced_host_client::SpacedHostClientConfig::default().with_socket_path(
-        pplx_space_common_core::host::linux::paths::spaced_host_socket(sandbox_id),
+        pplx_space_host_layout::paths::spaced_host_socket(sandbox_id),
     );
     let client = tokio::time::timeout(
         budget,
@@ -143,7 +143,7 @@ where
 async fn flush_guest_filesystems_via_spaced_host_unbounded(
     sandbox_id: &str,
 ) -> Result<(), GuestFlushError> {
-    let socket_path = pplx_space_common_core::host::linux::paths::spaced_host_socket(sandbox_id);
+    let socket_path = pplx_space_host_layout::paths::spaced_host_socket(sandbox_id);
     flush_guest_filesystems_at_socket(socket_path).await
 }
 
@@ -152,7 +152,7 @@ async fn prepare_guest_for_vm_snapshot_via_spaced_host_unbounded(
     timeout: Duration,
 ) -> Result<(), GuestFlushError> {
     let started_at = tokio::time::Instant::now();
-    let socket_path = pplx_space_common_core::host::linux::paths::spaced_host_socket(sandbox_id);
+    let socket_path = pplx_space_host_layout::paths::spaced_host_socket(sandbox_id);
     let config = pplx_space_spaced_host_client::SpacedHostClientConfig::default()
         .with_socket_path(socket_path);
     let client = pplx_space_spaced_host_client::SpacedHostClient::new_with_config(config)

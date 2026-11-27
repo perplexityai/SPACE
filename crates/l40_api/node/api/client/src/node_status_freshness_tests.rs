@@ -14,6 +14,7 @@ fn node_ctl(reconciliations: &[(&str, u64)]) -> NodeCtlStatus {
             })
             .collect(),
         sync_overrides: Vec::new(),
+        reads_twin_metadata: None,
     }
 }
 

@@ -37,9 +37,9 @@ fn recovery_scope_discovery_retains_bad_evidence_and_retires_valid_siblings() {
     let conn = test_conn();
     let bad = SandboxId::new().to_string();
     let good = SandboxId::new().to_string();
-    let good_scope = pplx_space_common_core::types::TransferScopeId::new();
+    let good_scope = pplx_space_snapshot_model::TransferScopeId::new();
     for (id, scope) in [
-        (&bad, pplx_space_common_core::types::TransferScopeId::new()),
+        (&bad, pplx_space_snapshot_model::TransferScopeId::new()),
         (&good, good_scope),
     ] {
         insert_restore_transfer_scope(&conn, id, scope, None, None, "/retained/staging").unwrap();
@@ -144,7 +144,7 @@ fn deadline_lane_alone_skips_deleting_rows() {
 
 #[test]
 fn auto_lifecycle_action_gate_is_exhaustive_over_states() {
-    use pplx_space_common_core::types::AutoLifecycleIdleAction as Action;
+    use pplx_space_auto_lifecycle::AutoLifecycleIdleAction as Action;
     let transient = [
         SandboxState::Creating,
         SandboxState::Starting,

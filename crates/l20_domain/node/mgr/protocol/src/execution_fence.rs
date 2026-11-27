@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SandboxActivationAttemptId;
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
 
 /// Response header older sandbox managers require from `InspectSandbox` before
 /// startup admission. Current sandbox managers do not read it.
@@ -30,7 +30,7 @@ pub fn execution_preflight_result(unadopted: &[String]) -> Result<(), tonic::Sta
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InstanceTarget {
     Execution(ExecutionFence),
-    RestoreScope(pplx_space_common_core::types::TransferScopeId),
+    RestoreScope(pplx_space_snapshot_model::TransferScopeId),
 }
 
 impl TryFrom<&crate::proto::InstanceTarget> for InstanceTarget {

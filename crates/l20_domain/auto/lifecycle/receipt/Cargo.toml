@@ -16,4 +16,8 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 # internal
-pplx-space-common-core = { workspace = true }
+pplx-space-auto-lifecycle = { workspace = true }
+pplx-space-content-digest = { workspace = true }
+
+[dev-dependencies]
+pplx-space-durations = { workspace = true }

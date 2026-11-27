@@ -1,4 +1,6 @@
-use pplx_space_common_core::types::{JobId, SandboxId, SnapshotId, UserId};
+use pplx_space_accounts::{JobId, UserId};
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use super::activation::{
     WAKE_ROUTE_SECURITY_CONNECT_RETRY_POLICY, WAKE_ROUTE_SECURITY_SYNC_TIMEOUT,
@@ -100,9 +102,9 @@ fn startup_cleanup_discovery_reports_database_failure_instead_of_empty_inventory
 async fn restore_scope_cleanup_rejects_paths_not_owned_by_its_identity_before_remote_calls() {
     let service = SandboxManagerService::for_test(crate::db::test_conn());
     let id = SandboxId::new().to_string();
-    let scope_id = pplx_space_common_core::types::TransferScopeId::new();
+    let scope_id = pplx_space_snapshot_model::TransferScopeId::new();
     let other_id = SandboxId::new().to_string();
-    let other_scope = pplx_space_common_core::types::TransferScopeId::new();
+    let other_scope = pplx_space_snapshot_model::TransferScopeId::new();
     for staging_dir in [
         "/".to_string(),
         crate::snapshot_restore::remote_restore_metadata_staging_dir(&other_id, scope_id)
@@ -234,6 +236,8 @@ fn encrypted_restore_snapshot_error_preserves_invalid_key_status() {
 }
 
 #[cfg(test)]
+mod activation_seal_teardown_tests;
+#[cfg(test)]
 mod cancelled_cleanup_rpc_tests;
 
 #[cfg(test)]
@@ -264,6 +268,9 @@ pub(crate) mod service_tests {
         SuspendSnapshotPublicationDecision, canonical_suspend_snapshot_dir,
         suspend_snapshot_staging_dir, write_deferred_suspend_artifact, write_full_suspend_artifact,
     };
+    use pplx_space_accounts::{
+        BUILDER_SANDBOX_OWNER, DEPLOY_SANDBOX_OWNER, DEV_SANDBOX_OWNER, NodeId, ROOT_SANDBOX_OWNER,
+    };
     use pplx_space_api_route::{
         SPACE_API_ROUTE_ED25519_TOKEN_METADATA_KEY, SpaceApiBridgeCallerPolicy,
         set_space_api_bridge_caller_policy,
@@ -275,16 +282,20 @@ pub(crate) mod service_tests {
         ed25519::SpaceApiRouteEd25519VerificationGeneration,
         ed25519::insert_space_api_route_ed25519_token,
     };
-    use pplx_space_common_core::host::linux::identities::{user_names, users};
-    use pplx_space_common_core::types::{
-        ArtifactKind, ArtifactOrigin, AutoLifecycleConditionSet, AutoLifecycleConditionSetId,
-        AutoLifecycleStage, BUILDER_SANDBOX_OWNER, ClusterId, DEPLOY_SANDBOX_OWNER,
-        DEV_SANDBOX_OWNER, ExecutionGeneration, LocalArtifactId, NodeId, NodeManagedBy, PodUid,
-        ROOT_SANDBOX_OWNER, RouteGeneration, SandboxActivationAttemptId,
+    use pplx_space_auto_lifecycle::{
+        AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleStage,
+    };
+    use pplx_space_cluster_id::ClusterId;
+    use pplx_space_host_layout::identities::{user_names, users};
+    use pplx_space_k8s_ids::PodUid;
+    use pplx_space_k8s_node_id::space_k8s_node_id;
+    use pplx_space_node_model::NodeManagedBy;
+    use pplx_space_sandbox_model::{
+        ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId,
         SandboxQuarantineHistoryAction, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
         SandboxQuarantineSource, SandboxRouteIdentity, SpaceApiRouteIdentity,
     };
-    use pplx_space_k8s_node_id::space_k8s_node_id;
+    use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 
     use prost::Message as _;
 
@@ -2399,16 +2410,24 @@ pub(crate) mod service_tests {
     async fn split_operation_wake_join_restart_receipt_proof() {
         use crate::db::SandboxStatePublicationMetadata;
         use crate::service::recovery::CleanupRecoveryAuthority;
-        use pplx_space_common_core::types::SandboxTransitionReceiptKind;
+        use pplx_space_sandbox_model::SandboxTransitionReceiptKind;
         // Exercise the real Wake join before dropping all request/service state.
         // The NULL injection models carrying B only in volatile request memory.
+        // The test models a process restart, not a host crash, so neither
+        // connection needs SQLite's per-commit fsyncs, which wait behind every
+        // other writer on a busy disk.
+        let open = |path: &std::path::Path| {
+            let conn = crate::db::Connection::open_at(path).unwrap();
+            conn.pragma_update(None, "synchronous", "OFF").unwrap();
+            conn
+        };
         for (persist_operation, allocated) in
             [(false, false), (true, false), (false, true), (true, true)]
         {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("manager.sqlite");
-            let mut conn = crate::db::Connection::open_at(&path).unwrap();
-            crate::db::create_test_schema(&mut conn);
+            crate::db::create_test_schema_on_disk(&path);
+            let conn = open(&path);
             let sandbox_id = SandboxId::new();
             let id = sandbox_id.to_string();
             insert_test_sandbox(&conn, &id, SandboxState::Stopped);
@@ -2480,8 +2499,7 @@ pub(crate) mod service_tests {
                     .unwrap();
             }
             drop(service);
-            let recovered =
-                service_for_teardown_test(crate::db::Connection::open_at(&path).unwrap());
+            let recovered = service_for_teardown_test(open(&path));
             recovered
                 .recover_interrupted_startup_states()
                 .await
@@ -2698,7 +2716,7 @@ pub(crate) mod service_tests {
         let service = service_for_teardown_test(conn);
 
         let node_id = NodeId::new();
-        let pod_uid: pplx_space_common_core::types::PodUid =
+        let pod_uid: pplx_space_k8s_ids::PodUid =
             "019f8000-0000-7000-8000-0000000000bb".parse().unwrap();
         // A pooled pod boots with no activation-attempt annotation, so the
         // runtime published a locally minted placeholder the control plane
@@ -2722,7 +2740,7 @@ pub(crate) mod service_tests {
         // Claiming the pod mints an attempt and wakes an already-Started VM.
         let claimed_attempt = SandboxActivationAttemptId::new();
         let stale_node_id = NodeId::new();
-        let stale_pod_uid: pplx_space_common_core::types::PodUid =
+        let stale_pod_uid: pplx_space_k8s_ids::PodUid =
             "019f8000-0000-7000-8000-0000000000cc".parse().unwrap();
         assert_ne!(claimed_attempt, placeholder_attempt);
         let start = WakeStartConfig {
@@ -2979,6 +2997,91 @@ pub(crate) mod service_tests {
             row.space_api_route_identity.activation_attempt_id,
             Some(next_attempt),
             "a successful resume must adopt before the wake returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_info_reports_the_allocated_external_address_only_for_that_execution() {
+        use pplx_space_k8s_ids::PodUid;
+        use pplx_space_sandbox_model::{ExecutionGeneration, SpaceApiRouteIdentity};
+        let conn = crate::db::test_conn();
+        let started = SandboxId::new();
+        insert_test_sandbox(&conn, &started.to_string(), SandboxState::Started);
+        let service = SandboxManagerService::for_test(conn);
+        let execution = |generation: i64, pod_uid: &str| SpaceApiRouteIdentity {
+            execution_generation: Some(ExecutionGeneration::new(generation).unwrap()),
+            pod_uid: Some(PodUid::parse(pod_uid).unwrap()),
+            ..Default::default()
+        };
+        let set_execution = |sandbox_id: SandboxId, identity: &SpaceApiRouteIdentity| {
+            crate::db::update_space_api_route_identity(
+                &service.db.lock().unwrap(),
+                sandbox_id,
+                identity,
+                crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::ClusterFenced,
+            )
+            .unwrap();
+        };
+        let reported_ip = async |sandbox_id: SandboxId| {
+            let sandbox = service.lookup_sandbox(&sandbox_id.to_string()).unwrap();
+            service
+                .build_sandbox_info(sandbox, None, None, None, None)
+                .await
+                .unwrap()
+                .external_address
+        };
+
+        set_execution(started, &execution(1, "pod-a"));
+        assert_eq!(reported_ip(started).await, None);
+        service.external_addresses.record(
+            &started.to_string(),
+            &execution(1, "pod-a"),
+            Some("10.1.2.3"),
+        );
+        assert_eq!(reported_ip(started).await.as_deref(), Some("10.1.2.3"));
+
+        set_execution(started, &execution(1, "pod-b"));
+        assert_eq!(
+            reported_ip(started).await,
+            None,
+            "an instance re-created under the same generation must not inherit the address"
+        );
+        set_execution(started, &execution(2, "pod-a"));
+        assert_eq!(
+            reported_ip(started).await,
+            None,
+            "a later execution must not inherit the address"
+        );
+
+        service.external_addresses.record(
+            &started.to_string(),
+            &execution(2, "pod-a"),
+            Some("10.1.2.4"),
+        );
+        assert_eq!(reported_ip(started).await.as_deref(), Some("10.1.2.4"));
+        service
+            .external_addresses
+            .record(&started.to_string(), &execution(2, "pod-a"), None);
+        assert_eq!(
+            reported_ip(started).await,
+            None,
+            "an allocation without an address must not report the previous one"
+        );
+        service.external_addresses.record(
+            &started.to_string(),
+            &execution(2, "pod-a"),
+            Some("10.1.2.4"),
+        );
+        service
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE sandboxes SET state = 'stopped'", [])
+            .unwrap();
+        assert_eq!(
+            reported_ip(started).await,
+            None,
+            "a stopped sandbox released its external network"
         );
     }
 
@@ -3799,8 +3902,7 @@ pub(crate) mod service_tests {
             activation_attempt_id: Some(SandboxActivationAttemptId::new()),
             ..SpaceApiRouteIdentity::default()
         };
-        let pending_receipt_id =
-            pplx_space_common_core::types::AutoLifecycleDeleteReceiptId::generate();
+        let pending_receipt_id = pplx_space_sandbox_model::AutoLifecycleDeleteReceiptId::generate();
         {
             let db = service.db.lock().unwrap();
             crate::db::update_space_api_route_identity(
@@ -3883,7 +3985,7 @@ pub(crate) mod service_tests {
             ..SpaceApiRouteIdentity::default()
         };
         let pending = crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt {
-            receipt_id: pplx_space_common_core::types::AutoLifecycleDeleteReceiptId::generate(),
+            receipt_id: pplx_space_sandbox_model::AutoLifecycleDeleteReceiptId::generate(),
             sandbox_id,
             execution_generation: ExecutionGeneration::new(4).unwrap(),
             route_activation_id: attempt,
@@ -4062,7 +4164,7 @@ pub(crate) mod service_tests {
         };
 
         let user = SandboxOwner::parse("user:00000000-0000-0000-0000-000000000042").unwrap();
-        let tmplmgr = &pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER;
+        let tmplmgr = &pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER;
 
         // Adopted user sandbox holding a live instance subvolume.
         let user_sandbox = SandboxId::new().to_string();
@@ -4244,7 +4346,7 @@ pub(crate) mod service_tests {
                 "UPDATE sandboxes SET user = ?2 WHERE id = ?1",
                 crate::db::fixture::params![
                     id,
-                    pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER.as_str()
+                    pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER.as_str()
                 ],
             )
             .unwrap();
@@ -4336,7 +4438,7 @@ pub(crate) mod service_tests {
             "UPDATE sandboxes SET user = ?2, pool_template = 'seed' WHERE id = ?1",
             crate::db::fixture::params![
                 &ids[window],
-                pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER.as_str()
+                pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER.as_str()
             ],
         )
         .unwrap();
@@ -4371,7 +4473,7 @@ pub(crate) mod service_tests {
 
     #[tokio::test]
     async fn paged_list_splits_at_the_encoded_budget_and_degrades_undecodable_rows() {
-        use pplx_space_common_core::inventory::MAX_ENCODED_BYTES;
+        use pplx_space_rpc_contracts::inventory::MAX_ENCODED_BYTES;
         let conn = crate::db::test_conn();
         let mut ids = (0..3)
             .map(|_| {
@@ -4438,7 +4540,7 @@ pub(crate) mod service_tests {
 
     #[tokio::test]
     async fn an_encoded_budget_split_continues_a_pool_member_page_after_its_last_listed_member() {
-        use pplx_space_common_core::inventory::MAX_ENCODED_BYTES;
+        use pplx_space_rpc_contracts::inventory::MAX_ENCODED_BYTES;
         let window = crate::db::inventory_read::POOL_MEMBER_WINDOW_ROWS;
         let conn = crate::db::test_conn();
         let mut ids = (0..=window)
@@ -4460,7 +4562,7 @@ pub(crate) mod service_tests {
                 crate::db::fixture::params![
                     id,
                     template,
-                    pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER.as_str()
+                    pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER.as_str()
                 ],
             )
             .unwrap();
@@ -4495,7 +4597,7 @@ pub(crate) mod service_tests {
 
     #[tokio::test]
     async fn unary_build_referencing_list_reports_rather_than_rejects_an_over_budget_inventory() {
-        use pplx_space_common_core::inventory::MAX_RAW_BYTES;
+        use pplx_space_rpc_contracts::inventory::MAX_RAW_BYTES;
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &id, SandboxState::Started);
@@ -4526,7 +4628,7 @@ pub(crate) mod service_tests {
 
     #[tokio::test]
     async fn inventory_limits_are_errors_not_partial_or_degraded_success() {
-        use pplx_space_common_core::inventory::{MAX_ITEMS, MAX_RAW_BYTES};
+        use pplx_space_rpc_contracts::inventory::{MAX_ITEMS, MAX_RAW_BYTES};
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &id, SandboxState::Started);
@@ -4573,7 +4675,7 @@ pub(crate) mod service_tests {
 
     #[test]
     fn net_gateway_sidecar_pid_name_matches_launched_binary() {
-        let bin_name = Path::new(pplx_space_common_core::host::linux::paths::NET_GATEWAY_SVC_BIN)
+        let bin_name = Path::new(pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN)
             .file_name()
             .and_then(|name| name.to_str())
             .expect("net-gateway service path has a file name");
@@ -4916,7 +5018,10 @@ pub(crate) mod service_tests {
         let (gateway_arm_done_tx, gateway_arm_done_rx) = tokio::sync::oneshot::channel();
         let netgtw_arm = async {
             let result = register_net_gateway_launch(&db, &sandbox_id, sbx_uid, async {
-                Ok(pplx_space_node_mgr_client::proto::LaunchResponse { pid: netgtw_pid })
+                Ok(pplx_space_node_mgr_client::proto::LaunchResponse {
+                    pid: netgtw_pid,
+                    inherited_gateway_sockets: 0,
+                })
             })
             .await;
             gateway_arm_done_tx
@@ -5845,15 +5950,15 @@ pub(crate) mod service_tests {
 
         assert_eq!(
             execution.runtime().kind,
-            pplx_space_common_core::types::RuntimeKind::CloudHypervisor
+            pplx_space_execution_spec::RuntimeKind::CloudHypervisor
         );
         assert_eq!(
             execution.guest().os,
-            pplx_space_common_core::types::GuestOperatingSystem::Windows
+            pplx_space_execution_spec::GuestOperatingSystem::Windows
         );
         assert_eq!(
             execution.guest().architecture,
-            pplx_space_common_core::types::Arch::X86_64
+            pplx_space_cpu_arch::Arch::X86_64
         );
     }
 
@@ -5871,13 +5976,13 @@ pub(crate) mod service_tests {
 
         assert_eq!(
             execution.runtime().kind,
-            pplx_space_common_core::types::RuntimeKind::Firecracker
+            pplx_space_execution_spec::RuntimeKind::Firecracker
         );
         assert_eq!(execution.runtime().version.as_str(), "1.15.1");
         assert_eq!(execution.state_format().unwrap().version.as_str(), "9.0.0");
         assert_eq!(
             execution.guest().architecture,
-            pplx_space_common_core::types::Arch::Aarch64
+            pplx_space_cpu_arch::Arch::Aarch64
         );
     }
 
@@ -5885,7 +5990,7 @@ pub(crate) mod service_tests {
     fn template_spaced_compatibility_uses_supported_guest_versions() {
         // A release bump must preserve legacy templates without accepting a
         // future breaking guest or trusting inconsistent provenance.
-        // Detailed range and provenance cases are owned by spaced-common.
+        // Detailed range and provenance cases are owned by spaced-protocol.
         for (version, family, supported) in [
             (Some("0.1.0"), Some("0.1"), true),
             (Some("0.8.0"), Some("0.8"), true),
@@ -6252,8 +6357,8 @@ pub(crate) mod service_tests {
             Some(crate::db::LocalArtifactRow {
                 local_artifact_id,
                 sandbox_id: sandbox_id_string,
-                artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
-                artifact_origin: pplx_space_common_core::types::ArtifactOrigin::Suspend,
+                artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
+                artifact_origin: pplx_space_snapshot_model::ArtifactOrigin::Suspend,
                 snapshot_name: None,
                 local_path: snapshot_dir.to_string_lossy().into_owned(),
             })
@@ -6481,8 +6586,8 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         let local_artifact_id = LocalArtifactId::new().to_string();
         let credential_marker = "runtime-restore-secret";
-        let execution = pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
-            pplx_space_common_core::types::Arch::Aarch64,
+        let execution = pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
+            pplx_space_cpu_arch::Arch::Aarch64,
             vec![],
         );
 
@@ -6834,8 +6939,8 @@ pub(crate) mod service_tests {
         std::fs::create_dir_all(&live_target).unwrap();
         std::os::unix::fs::symlink(&live_target, sandbox_run_dir.join("fc.pid")).unwrap();
         let receiver = pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
-            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
-            Some(pplx_space_common_core::types::SandboxActivationAttemptId::new()),
+            pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
+            Some(pplx_space_sandbox_model::SandboxActivationAttemptId::new()),
         );
 
         let report = reconcile_sandbox_inventory_ids(
@@ -7005,7 +7110,7 @@ pub(crate) mod service_tests {
     #[tokio::test]
     async fn inventory_requests_keep_all_ids_across_internal_batches() {
         let service = service_for_teardown_test(crate::db::test_conn());
-        let ids = (0..=pplx_space_common_core::inventory::READ_BATCH_ITEMS)
+        let ids = (0..=pplx_space_rpc_contracts::inventory::READ_BATCH_ITEMS)
             .map(|_| Uuid::now_v7().to_string())
             .collect::<Vec<_>>();
         assert_eq!(canonical_batched_sandbox_ids(&ids).unwrap(), ids);
@@ -7037,7 +7142,7 @@ pub(crate) mod service_tests {
 
     #[test]
     fn canonical_batched_sandbox_ids_bounds_raw_work_before_deduplication() {
-        use pplx_space_common_core::inventory::{MAX_ENCODED_BYTES, MAX_ITEMS};
+        use pplx_space_rpc_contracts::inventory::{MAX_ENCODED_BYTES, MAX_ITEMS};
         let id = Uuid::now_v7().to_string();
         assert_eq!(
             canonical_batched_sandbox_ids(&vec![id.clone(); MAX_ITEMS]).unwrap(),
@@ -7057,7 +7162,7 @@ pub(crate) mod service_tests {
 
     #[tokio::test]
     async fn state_raw_budget_is_not_reset_between_internal_batches() {
-        use pplx_space_common_core::inventory::{MAX_RAW_BYTES, READ_BATCH_ITEMS};
+        use pplx_space_rpc_contracts::inventory::{MAX_RAW_BYTES, READ_BATCH_ITEMS};
         let conn = crate::db::test_conn();
         let mut ids = Vec::new();
         // Valid, padded JSON consumes raw-read budget but produces a tiny wire
@@ -7397,8 +7502,8 @@ pub(crate) mod service_tests {
                 vsock_uds_path: "/space/run/firecracker/sandboxes/test/root/v.sock",
                 api_socket_path: "/space/run/firecracker/sandboxes/test/api.sock",
                 spaced_endpoint_proof: None,
-                space_api_route_identity:
-                    pplx_space_common_core::types::SpaceApiRouteIdentity::default(),
+                space_api_route_identity: pplx_space_sandbox_model::SpaceApiRouteIdentity::default(
+                ),
                 route_identity_provenance:
                     crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
             },
@@ -7505,7 +7610,7 @@ pub(crate) mod service_tests {
         request
     }
 
-    fn insert_platform_owned_sandbox(
+    pub(crate) fn insert_platform_owned_sandbox(
         conn: &crate::db::Connection,
         id: &str,
         state: SandboxState,
@@ -7713,7 +7818,7 @@ pub(crate) mod service_tests {
                 _ => {
                     let compiled =
                         pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-                            pplx_space_common_core::types::Arch::X86_64,
+                            pplx_space_cpu_arch::Arch::X86_64,
                         )
                         .unwrap();
                     crate::db::upsert_sandbox_execution_metadata(
@@ -7726,6 +7831,7 @@ pub(crate) mod service_tests {
                         &conn,
                         &sandbox_id,
                         compiled[1].definition().reference(),
+                        crate::db::RuntimeUpgradeTargetState::Started,
                         None,
                     );
                     Some("UPDATE sandbox_runtime_upgrades SET phase = 'rolled_back'")
@@ -8254,19 +8360,28 @@ pub(crate) mod service_tests {
             .unwrap()
             .unwrap()
             .updated_at;
-        assert!(!crate::db::claim_quarantined_sandbox_for_eviction(&conn, &id, "0").unwrap());
+        assert_eq!(
+            crate::db::claim_quarantined_sandbox_for_eviction(&conn, &id, "0").unwrap(),
+            crate::db::QuarantinedEvictionClaim::Moved
+        );
         conn.execute(
             "UPDATE sandboxes SET state = 'suspended' WHERE id = ?1",
             [&id],
         )
         .unwrap();
-        assert!(!crate::db::claim_quarantined_sandbox_for_eviction(&conn, &id, &version).unwrap());
+        assert_eq!(
+            crate::db::claim_quarantined_sandbox_for_eviction(&conn, &id, &version).unwrap(),
+            crate::db::QuarantinedEvictionClaim::Moved
+        );
         conn.execute(
             "UPDATE sandboxes SET state = 'quarantined' WHERE id = ?1",
             [&id],
         )
         .unwrap();
-        assert!(crate::db::claim_quarantined_sandbox_for_eviction(&conn, &id, &version).unwrap());
+        assert_eq!(
+            crate::db::claim_quarantined_sandbox_for_eviction(&conn, &id, &version).unwrap(),
+            crate::db::QuarantinedEvictionClaim::Claimed
+        );
         assert_eq!(
             crate::db::get_sandbox(&conn, &id).unwrap().unwrap().state,
             SandboxStatus::from(SandboxState::Deleting)
@@ -8392,8 +8507,14 @@ pub(crate) mod service_tests {
             crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::ClusterFenced,
         )
         .unwrap();
-        crate::db::begin_teardown_suspend(conn, &sandbox_id_string, execution_generation).unwrap();
         let local_artifact_id = LocalArtifactId::new();
+        crate::db::begin_teardown_suspend(
+            conn,
+            &sandbox_id_string,
+            execution_generation,
+            local_artifact_id,
+        )
+        .unwrap();
         crate::db::stage_teardown_suspend_artifact(
             conn,
             &sandbox_id_string,
@@ -9207,7 +9328,7 @@ pub(crate) mod service_tests {
             vsock_uds_path: "/space/run/firecracker/sandboxes/test/root/v.sock",
             api_socket_path: "/space/run/firecracker/sandboxes/test/api.sock",
             spaced_endpoint_proof: None,
-            space_api_route_identity: pplx_space_common_core::types::SpaceApiRouteIdentity {
+            space_api_route_identity: pplx_space_sandbox_model::SpaceApiRouteIdentity {
                 route_generation: Some(route_generation),
                 current_node_id: Some(NodeId::from_uuid(uuid::Uuid::from_u128(1))),
                 substrate_kind: Some(NodeManagedBy::Space),
@@ -9229,7 +9350,7 @@ pub(crate) mod service_tests {
         insert_test_sandbox(&conn, &sandbox_id.to_string(), SandboxState::Started);
         let generation = ExecutionGeneration::new(4).unwrap();
         let receipt = crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt {
-            receipt_id: pplx_space_common_core::types::AutoLifecycleDeleteReceiptId::generate(),
+            receipt_id: pplx_space_sandbox_model::AutoLifecycleDeleteReceiptId::generate(),
             sandbox_id,
             execution_generation: generation,
             route_activation_id: SandboxActivationAttemptId::new(),
@@ -9283,7 +9404,7 @@ pub(crate) mod service_tests {
         crate::db::auto_lifecycle_delete_receipts::insert_pending_receipt(
             &conn,
             crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt {
-                receipt_id: pplx_space_common_core::types::AutoLifecycleDeleteReceiptId::generate(),
+                receipt_id: pplx_space_sandbox_model::AutoLifecycleDeleteReceiptId::generate(),
                 sandbox_id,
                 execution_generation: generation,
                 route_activation_id: receipt_attempt,
@@ -9963,7 +10084,8 @@ pub(crate) mod service_tests {
 
         {
             let conn = service.db_conn().unwrap();
-            crate::db::begin_suspend(&conn, &sandbox_id.to_string()).unwrap();
+            crate::db::begin_suspend(&conn, &sandbox_id.to_string(), LocalArtifactId::new())
+                .unwrap();
             crate::db::complete_row_intent_cleanup(
                 &conn,
                 &sandbox_id.to_string(),
@@ -10448,7 +10570,7 @@ pub(crate) mod service_tests {
     fn persisted_activation_owner_cannot_change_substrate_at_same_generation() {
         let sandbox_id = SandboxId::new();
         let current = RouteStreamEpochIdentity(
-            pplx_space_common_core::types::SandboxRouteIdentity::try_new(
+            pplx_space_sandbox_model::SandboxRouteIdentity::try_new(
                 sandbox_id,
                 RouteGeneration::new(1).unwrap(),
                 NodeId::new(),
@@ -10460,7 +10582,7 @@ pub(crate) mod service_tests {
             .unwrap(),
         );
         let replacement = RouteStreamEpochIdentity(
-            pplx_space_common_core::types::SandboxRouteIdentity::try_new(
+            pplx_space_sandbox_model::SandboxRouteIdentity::try_new(
                 sandbox_id,
                 RouteGeneration::new(1).unwrap(),
                 NodeId::new(),
@@ -10743,8 +10865,11 @@ pub(crate) mod service_tests {
         let current_generation = ExecutionGeneration::new(2).unwrap();
 
         {
-            let mut conn = crate::db::Connection::open_at(&db_path).unwrap();
-            crate::db::create_test_schema(&mut conn);
+            crate::db::create_test_schema_on_disk(&db_path);
+            let conn = crate::db::Connection::open_at(&db_path).unwrap();
+            // The test models a process restart, not a host crash, so no
+            // commit needs an fsync.
+            conn.pragma_update(None, "synchronous", "OFF").unwrap();
             insert_test_sandbox(&conn, &sandbox_id.to_string(), SandboxState::Paused);
             let service = service_for_teardown_test(conn);
             service
@@ -10900,6 +11025,198 @@ pub(crate) mod service_tests {
         assert!(service.route_stream_epochs.lock().unwrap().is_empty());
     }
 
+    /// The route identity a Kubernetes pod's shim sends in its start
+    /// (`routeIdentity` in `shim/space.go`): every dimension but the sandbox,
+    /// with `route_generation` defaulted to the execution generation, as the
+    /// shim does without its annotation. Converted the way the cold start
+    /// converts its request's identity.
+    fn shim_route_identity(generation: i64, pod_uid: &str) -> SpaceApiRouteIdentity {
+        let wire = crate::proto::SpaceApiRouteIdentity {
+            route_generation: Some(u64::try_from(generation).unwrap()),
+            current_node_id: Some(uuid::Uuid::from_u128(1).to_string()),
+            execution_generation: Some(generation),
+            pod_uid: Some(pod_uid.to_string()),
+            activation_attempt_id: Some(uuid::Uuid::now_v7().to_string()),
+            substrate_kind: crate::proto::SandboxSubstrateKind::Kubernetes as i32,
+            ..Default::default()
+        };
+        let start = StartRequest {
+            route_identity: Some(wire),
+            ..Default::default()
+        };
+        space_api_route_identity_for_runtime_activation(
+            space_api_route_identity_from_start_request(&start).unwrap(),
+        )
+        .identity
+    }
+
+    /// A Kubernetes sandbox whose execution of generation 1 ran in a pod and
+    /// stopped, with no route stream epoch cached.
+    fn stopped_kubernetes_sandbox(service: &SandboxManagerService) -> SandboxId {
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox(
+            &service.db_conn().unwrap(),
+            &sandbox_id.to_string(),
+            SandboxState::Paused,
+        );
+        let mut running = runtime_fields(ExecutionGeneration::new(1).unwrap(), 7);
+        running.space_api_route_identity =
+            shim_route_identity(1, &uuid::Uuid::now_v7().to_string());
+        service.update_runtime_fields(sandbox_id, running).unwrap();
+        let db = service.db_conn().unwrap();
+        crate::db::mark_cleanup_required(
+            &db,
+            &sandbox_id.to_string(),
+            true,
+            CleanupCompletion::MarkStopped,
+            "stopped execution",
+        )
+        .unwrap();
+        crate::db::complete_row_intent_cleanup(
+            &db,
+            &sandbox_id.to_string(),
+            CleanupCompletion::MarkStopped,
+            None,
+        )
+        .unwrap();
+        drop(db);
+        service.route_stream_epochs.lock().unwrap().clear();
+        sandbox_id
+    }
+
+    /// A runtime upgrade cold-boots a stopped Kubernetes sandbox from its new
+    /// pod. The stop kept the old execution's generation and pod UID, but no
+    /// route generation, as teardown proof; the boot's identity, which
+    /// carries all of them, replaces it when it's a newer execution.
+    #[tokio::test]
+    async fn cold_activation_replaces_a_stopped_kubernetes_executions_teardown_proof() {
+        let service = service_for_teardown_test(crate::db::test_conn());
+        for (generation, admitted) in [(1, false), (2, true)] {
+            let sandbox_id = stopped_kubernetes_sandbox(&service);
+            let retained = service
+                .lookup_sandbox(&sandbox_id.to_string())
+                .unwrap()
+                .space_api_route_identity;
+            assert!(
+                retained.pod_uid.is_some() && retained.route_generation.is_none(),
+                "the stop keeps the pod UID but no route generation: {retained:?}"
+            );
+            let mut boot = runtime_fields(ExecutionGeneration::new(generation).unwrap(), 8);
+            boot.space_api_route_identity =
+                shim_route_identity(generation, &uuid::Uuid::now_v7().to_string());
+            let incoming = boot.space_api_route_identity.clone();
+            let cleanup_id = {
+                let db = service.db_conn().unwrap();
+                crate::db::begin_activation(
+                    &db,
+                    &sandbox_id.to_string(),
+                    SandboxState::Stopped,
+                    crate::db::ActivationKind::ColdStart,
+                    incoming.execution_generation,
+                    incoming.activation_attempt_id,
+                )
+                .unwrap()
+                .unwrap()
+                .id
+            };
+            let result = service.update_runtime_fields_for_activation(sandbox_id, cleanup_id, boot);
+            let row = service.lookup_sandbox(&sandbox_id.to_string()).unwrap();
+            if admitted {
+                result.unwrap();
+                let expected = SpaceApiRouteIdentity {
+                    sandbox_id: Some(sandbox_id),
+                    ..incoming
+                };
+                assert_eq!(row.space_api_route_identity, expected);
+            } else {
+                let error = result.expect_err("a cold activation must advance the execution");
+                assert_eq!(error.code(), tonic::Code::Aborted, "{error}");
+                assert_eq!(row.space_api_route_identity, retained);
+            }
+        }
+    }
+
+    /// The teardown proof a stop retains is exactly an execution generation,
+    /// with a Kubernetes execution's pod UID and the substrate the row reads
+    /// back from it. Any routing dimension, a missing generation, or a
+    /// substrate that disagrees with the pod UID is another shape.
+    #[test]
+    fn stop_teardown_provenance_accepts_only_what_a_stop_retains() {
+        let generation = Some(ExecutionGeneration::new(3).unwrap());
+        let pod_uid = Some(PodUid::parse("stopped-pod").unwrap());
+        let native = SpaceApiRouteIdentity {
+            execution_generation: generation,
+            ..Default::default()
+        };
+        let kubernetes = SpaceApiRouteIdentity {
+            pod_uid: pod_uid.clone(),
+            substrate_kind: Some(NodeManagedBy::Kubernetes),
+            ..native.clone()
+        };
+        for (identity, accepted, case) in [
+            (native.clone(), true, "a native execution"),
+            (
+                kubernetes.clone(),
+                true,
+                "a Kubernetes execution and its pod",
+            ),
+            (
+                SpaceApiRouteIdentity {
+                    execution_generation: None,
+                    ..kubernetes.clone()
+                },
+                false,
+                "no execution generation",
+            ),
+            (
+                SpaceApiRouteIdentity {
+                    route_generation: Some(RouteGeneration::INITIAL),
+                    ..kubernetes.clone()
+                },
+                false,
+                "a live route generation",
+            ),
+            (
+                SpaceApiRouteIdentity {
+                    current_node_id: Some(NodeId::new()),
+                    ..kubernetes.clone()
+                },
+                false,
+                "a current node",
+            ),
+            (
+                SpaceApiRouteIdentity {
+                    activation_attempt_id: Some(SandboxActivationAttemptId::new()),
+                    ..kubernetes.clone()
+                },
+                false,
+                "an activation attempt",
+            ),
+            (
+                SpaceApiRouteIdentity {
+                    substrate_kind: Some(NodeManagedBy::Space),
+                    ..kubernetes.clone()
+                },
+                false,
+                "a pod UID on a native substrate",
+            ),
+            (
+                SpaceApiRouteIdentity {
+                    substrate_kind: Some(NodeManagedBy::Kubernetes),
+                    ..native.clone()
+                },
+                false,
+                "a Kubernetes substrate without a pod UID",
+            ),
+        ] {
+            assert_eq!(
+                crate::service::stop_teardown_provenance(&identity),
+                accepted,
+                "{case}: {identity:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn delayed_cleanup_cannot_remove_a_newer_runtime_generation() {
         for cached_epoch in [true, false] {
@@ -11010,7 +11327,7 @@ pub(crate) mod service_tests {
         insert_test_sandbox(&conn, &sandbox_id.to_string(), SandboxState::Started);
         let receipt_generation = ExecutionGeneration::new(4).unwrap();
         let receipt = crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt {
-            receipt_id: pplx_space_common_core::types::AutoLifecycleDeleteReceiptId::generate(),
+            receipt_id: pplx_space_sandbox_model::AutoLifecycleDeleteReceiptId::generate(),
             sandbox_id,
             execution_generation: receipt_generation,
             route_activation_id: SandboxActivationAttemptId::new(),
@@ -11308,9 +11625,11 @@ pub(crate) mod service_tests {
         service
             .watchdog
             .add_sandbox(crate::watchdog::SidecarInfo {
+                template: "seed".to_string(),
                 guest_image: Default::default(),
                 node_execution_id: None,
                 sandbox_id: sandbox_id.to_string(),
+                created_at: None,
                 uid: None,
                 runtime_pid: None,
                 spaced_host_pid: None,
@@ -11337,6 +11656,7 @@ pub(crate) mod service_tests {
 
         let error = service
             .delete(internal_request(DeleteRequest {
+                discard_retained_filesystem_reason: None,
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: false,
@@ -11378,6 +11698,7 @@ pub(crate) mod service_tests {
 
         let error = service
             .delete(internal_request(DeleteRequest {
+                discard_retained_filesystem_reason: None,
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: false,
@@ -11456,6 +11777,7 @@ pub(crate) mod service_tests {
 
         let error = service
             .delete(internal_request(DeleteRequest {
+                discard_retained_filesystem_reason: None,
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: false,
@@ -11487,6 +11809,7 @@ pub(crate) mod service_tests {
 
         let response = service
             .delete(internal_request(DeleteRequest {
+                discard_retained_filesystem_reason: None,
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: false,
@@ -11514,6 +11837,7 @@ pub(crate) mod service_tests {
         let delete = tokio::spawn(async move {
             delete_service
                 .delete(internal_request(DeleteRequest {
+                    discard_retained_filesystem_reason: None,
                     sandbox_id: delete_id,
                     template_filter: None,
                     blocking: false,
@@ -11614,6 +11938,7 @@ pub(crate) mod service_tests {
                 let code = if delete {
                     service
                         .delete(internal_request(DeleteRequest {
+                            discard_retained_filesystem_reason: None,
                             sandbox_id: selector.to_string(),
                             template_filter: Some("seed".to_string()),
                             blocking: false,
@@ -12272,7 +12597,8 @@ pub(crate) mod service_tests {
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
         let local_artifact_id = LocalArtifactId::new();
         let generation = teardown_generation();
-        crate::db::begin_teardown_suspend(&conn, &sandbox_id, generation).unwrap();
+        crate::db::begin_teardown_suspend(&conn, &sandbox_id, generation, local_artifact_id)
+            .unwrap();
         crate::db::stage_teardown_suspend_artifact(
             &conn,
             &sandbox_id,
@@ -12676,8 +13002,11 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         let deleted_generation = ExecutionGeneration::new(2).unwrap();
         {
-            let mut conn = crate::db::Connection::open_at(&db_path).unwrap();
-            crate::db::create_test_schema(&mut conn);
+            crate::db::create_test_schema_on_disk(&db_path);
+            let conn = crate::db::Connection::open_at(&db_path).unwrap();
+            // The test models a process restart, not a host crash, so no
+            // commit needs an fsync.
+            conn.pragma_update(None, "synchronous", "OFF").unwrap();
             delete_sandbox_with_generation_receipt(&conn, &sandbox_id, deleted_generation);
         }
         let service = service_for_teardown_test(crate::db::Connection::open_at(&db_path).unwrap());
@@ -12993,8 +13322,13 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
         let local_artifact_id = LocalArtifactId::new();
-        crate::db::begin_teardown_suspend(&conn, &sandbox_id, ExecutionGeneration::new(2).unwrap())
-            .unwrap();
+        crate::db::begin_teardown_suspend(
+            &conn,
+            &sandbox_id,
+            ExecutionGeneration::new(2).unwrap(),
+            local_artifact_id,
+        )
+        .unwrap();
         crate::db::stage_teardown_suspend_artifact(
             &conn,
             &sandbox_id,
@@ -13047,6 +13381,7 @@ pub(crate) mod service_tests {
             &conn,
             &sandbox_id.to_string(),
             ExecutionGeneration::new(1).unwrap(),
+            LocalArtifactId::new(),
         )
         .unwrap();
         crate::db::test_fixtures::state_write_fixtures::apply_edge(
@@ -13146,11 +13481,10 @@ pub(crate) mod service_tests {
                     vsock_uds_path: "/space/run/firecracker/sandboxes/replacement/root/v.sock",
                     api_socket_path: "/space/run/firecracker/sandboxes/replacement/api.sock",
                     spaced_endpoint_proof: None,
-                    space_api_route_identity:
-                        pplx_space_common_core::types::SpaceApiRouteIdentity {
-                            execution_generation: Some(ExecutionGeneration::new(2).unwrap()),
-                            ..pplx_space_common_core::types::SpaceApiRouteIdentity::default()
-                        },
+                    space_api_route_identity: pplx_space_sandbox_model::SpaceApiRouteIdentity {
+                        execution_generation: Some(ExecutionGeneration::new(2).unwrap()),
+                        ..pplx_space_sandbox_model::SpaceApiRouteIdentity::default()
+                    },
                     route_identity_provenance:
                         crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
                 },
@@ -13274,7 +13608,8 @@ pub(crate) mod service_tests {
             runtime_fields(generation, 7),
         )
         .unwrap();
-        crate::db::begin_teardown_suspend(&conn, &sandbox_id, generation).unwrap();
+        crate::db::begin_teardown_suspend(&conn, &sandbox_id, generation, LocalArtifactId::new())
+            .unwrap();
         let service = service_for_teardown_test(conn);
 
         let response = service
@@ -13315,8 +13650,13 @@ pub(crate) mod service_tests {
             runtime_fields(teardown_generation(), 7),
         )
         .unwrap();
-        crate::db::begin_teardown_suspend(&conn, &sandbox_id.to_string(), teardown_generation())
-            .unwrap();
+        crate::db::begin_teardown_suspend(
+            &conn,
+            &sandbox_id.to_string(),
+            teardown_generation(),
+            LocalArtifactId::new(),
+        )
+        .unwrap();
         let service = service_for_teardown_test(conn);
         let wake_lock = service.auto_lifecycle.wake_lock(&sandbox_id.to_string());
         let wake_guard = wake_lock.lock_owned().await;
@@ -13503,7 +13843,7 @@ pub(crate) mod service_tests {
             crate::db::fixture::params![predecessor.to_string(), id],
         )
         .unwrap();
-        assert!(crate::db::begin_suspend(conn, id).unwrap());
+        assert!(crate::db::begin_suspend(conn, id, LocalArtifactId::new()).unwrap());
         predecessor
     }
 
@@ -13547,7 +13887,7 @@ pub(crate) mod service_tests {
                     current_local_artifact_origin = 'suspend'
               WHERE id = ?2",
             crate::db::fixture::params![
-                pplx_space_common_core::types::LocalArtifactId::new().to_string(),
+                pplx_space_snapshot_model::LocalArtifactId::new().to_string(),
                 sandbox_id
             ],
         )
@@ -13564,45 +13904,6 @@ pub(crate) mod service_tests {
             crate::snapshot_encryption::capture_volume_is_fresh(&started),
             "a successful cold start must not reuse an older suspend memory image"
         );
-    }
-
-    #[test]
-    fn failed_encrypted_capture_keeps_live_memory_base_mounted() {
-        assert!(!super::grpc_lifecycle::failed_encrypted_capture_may_release_volume(true));
-        assert!(super::grpc_lifecycle::failed_encrypted_capture_may_release_volume(false));
-    }
-
-    #[tokio::test]
-    async fn node_local_backup_fence_failure_preserves_runtime_and_rolls_back_to_paused() {
-        let conn = crate::db::test_conn();
-        let sandbox_id = SandboxId::new().to_string();
-        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspending);
-        let generation = ExecutionGeneration::new(2).unwrap();
-        crate::db::update_runtime_fields(
-            &conn,
-            sandbox_id.parse().unwrap(),
-            runtime_fields(generation, 7),
-        )
-        .unwrap();
-        let local_artifact_id = LocalArtifactId::new();
-        let service = service_with_runtime_probe(conn, true);
-        let begin_failure = super::grpc_lifecycle::artifact_backup_fence_status(
-            "ClusterApi BeginArtifactBackup unavailable".to_string(),
-        );
-
-        let returned = service
-            .require_node_local_backup_handoff(&sandbox_id, local_artifact_id, Err(begin_failure))
-            .expect_err("failed Begin must stop before runtime finalization");
-
-        assert_eq!(returned.code(), tonic::Code::Internal);
-        let row = service.lookup_sandbox(&sandbox_id).unwrap();
-        assert_eq!(row.state, SandboxStatus::from(SandboxState::Paused));
-        assert_eq!(row.pid, Some(std::process::id()));
-        assert_eq!(
-            row.space_api_route_identity.execution_generation,
-            Some(generation)
-        );
-        assert!(row.current_local_artifact_id.is_none());
     }
 
     #[tokio::test]
@@ -13625,7 +13926,7 @@ pub(crate) mod service_tests {
             "s3://test-bucket/prefix?region=us-east-1",
         )
         .unwrap();
-        let first_attempt = pplx_space_common_core::types::BackupAttemptId::new();
+        let first_attempt = pplx_space_snapshot_model::BackupAttemptId::new();
 
         let first = service
             .submit_artifact_backup_for_test(
@@ -13637,7 +13938,7 @@ pub(crate) mod service_tests {
             )
             .await
             .unwrap();
-        let second_attempt = pplx_space_common_core::types::BackupAttemptId::new();
+        let second_attempt = pplx_space_snapshot_model::BackupAttemptId::new();
         let second = service
             .submit_artifact_backup_for_test(
                 &sandbox,
@@ -13689,7 +13990,7 @@ pub(crate) mod service_tests {
             "s3://test-bucket/prefix?region=us-east-1",
         )
         .unwrap();
-        let attempt_id = pplx_space_common_core::types::BackupAttemptId::new();
+        let attempt_id = pplx_space_snapshot_model::BackupAttemptId::new();
 
         let error = service
             .submit_artifact_backup_for_test(
@@ -13810,6 +14111,122 @@ pub(crate) mod service_tests {
                 .last_auto_error
                 .as_deref()
                 .is_some_and(|error| error.contains("BeginArtifactBackup unavailable"))
+        );
+    }
+
+    /// A suspend that fails with its runtime gone and keeps no capture of its
+    /// own (the failure came before the capture returned, or discarded its
+    /// staging) records the only-copy failure reason, so the shared retention
+    /// policy refuses an ordinary delete. A failure that may keep a usable
+    /// capture records its cause. Both quarantine at the same moment: the
+    /// evidence decides only the reason.
+    #[tokio::test]
+    async fn a_failure_that_keeps_no_capture_holds_the_only_copy() {
+        for keeps_none in [true, false] {
+            let conn = crate::db::test_conn();
+            let sandbox_id = SandboxId::new().to_string();
+            insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspending);
+            let service = service_with_runtime_probe(conn, false);
+            let cause = "snapshot failed: firecracker exited";
+            if keeps_none {
+                service.record_suspend_snapshot_publication_failure_without_capture(
+                    &sandbox_id,
+                    cause,
+                );
+            } else {
+                service.record_suspend_snapshot_publication_failure_after_begin(&sandbox_id, cause);
+            }
+
+            let db = service.db.lock().expect("mutex poisoned");
+            let row = crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap();
+            assert_eq!(
+                row.state,
+                SandboxStatus::from(SandboxState::Quarantined),
+                "{keeps_none}"
+            );
+            let (reason, safety) = if keeps_none {
+                (
+                    crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE,
+                    crate::db::SandboxEraseSafety::RetainedFilesystemOnlyCopy,
+                )
+            } else {
+                (cause, crate::db::SandboxEraseSafety::Safe)
+            };
+            assert_eq!(row.failure_reason.as_deref(), Some(reason), "{keeps_none}");
+            assert_eq!(row.erase_safety(), safety, "{keeps_none}");
+            if keeps_none {
+                let message: String = db
+                    .query_row(
+                        "SELECT reason_message FROM sandbox_quarantine_state WHERE sandbox_id = ?1",
+                        [&sandbox_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(message, cause, "the quarantine keeps the cause");
+            }
+        }
+    }
+
+    /// A failure that keeps no capture while the runtime is still live, and
+    /// whose rollback to paused fails, quarantines under its cause, not the
+    /// only-copy reason: the runtime gone isn't what happened, and the live
+    /// runtime, not a retained filesystem, holds the sandbox.
+    #[tokio::test]
+    async fn a_live_runtime_whose_rollback_fails_keeps_its_cause() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspending);
+        conn.raw()
+            .execute_batch(
+                "CREATE TRIGGER refuse_rollback BEFORE UPDATE OF state ON sandboxes
+                 WHEN NEW.state = 'paused'
+                 BEGIN SELECT RAISE(ABORT, 'injected rollback failure'); END;",
+            )
+            .unwrap();
+        let service = service_with_runtime_probe(conn, true);
+        let cause = "node-manager unreachable before the capture returned";
+        service.record_suspend_snapshot_publication_failure_without_capture(&sandbox_id, cause);
+
+        let db = service.db.lock().expect("mutex poisoned");
+        let row = crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap();
+        assert_eq!(row.state, SandboxStatus::from(SandboxState::Quarantined));
+        assert_eq!(row.failure_reason.as_deref(), Some(cause));
+        assert_eq!(row.erase_safety(), crate::db::SandboxEraseSafety::Safe);
+    }
+
+    /// A plaintext suspend whose publication fails with its runtime gone and
+    /// whose classification finds no capture of its admitted attempt
+    /// quarantines, as before, under the only-copy failure reason.
+    #[tokio::test]
+    async fn a_classified_missing_capture_holds_the_only_copy() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
+        let attempt = LocalArtifactId::new();
+        assert!(crate::db::begin_suspend(&conn, &sandbox_id, attempt).unwrap());
+        let cache = tempfile::tempdir().unwrap();
+        let sandbox_dir = cache.path().join(&sandbox_id);
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+        let staging = suspend_snapshot_staging_dir(&sandbox_dir, attempt);
+        let service = service_with_runtime_probe(conn, false);
+        service.record_suspend_snapshot_publication_failure_after_staging(
+            &sandbox_id,
+            &sandbox_dir,
+            &staging,
+            "local artifact publication failed: disk full",
+            &Default::default(),
+        );
+
+        let db = service.db.lock().expect("mutex poisoned");
+        let row = crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap();
+        assert_eq!(row.state, SandboxStatus::from(SandboxState::Quarantined));
+        assert_eq!(
+            row.failure_reason.as_deref(),
+            Some(crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE)
+        );
+        assert_eq!(
+            row.erase_safety(),
+            crate::db::SandboxEraseSafety::RetainedFilesystemOnlyCopy
         );
     }
 
@@ -14328,11 +14745,11 @@ pub(crate) mod service_tests {
         assert_eq!(row.current_local_artifact_id, Some(local_artifact_id));
         assert_eq!(
             row.current_local_artifact_kind,
-            Some(pplx_space_common_core::types::ArtifactKind::Full)
+            Some(pplx_space_snapshot_model::ArtifactKind::Full)
         );
         assert_eq!(
             row.current_local_artifact_origin,
-            Some(pplx_space_common_core::types::ArtifactOrigin::Suspend)
+            Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend)
         );
         assert_eq!(
             row.cleanup_completion,
@@ -14528,6 +14945,7 @@ pub(crate) mod service_tests {
                 &rpc_service,
                 "/space.sandbox.manager.v1.SandboxManager/Delete",
                 internal_request(DeleteRequest {
+                    discard_retained_filesystem_reason: None,
                     sandbox_id: rpc_sandbox_id,
                     template_filter: None,
                     blocking: true,
@@ -15271,7 +15689,7 @@ pub(crate) mod service_tests {
         crate::db::insert_restore_transfer_scope(
             &conn,
             &transfer,
-            pplx_space_common_core::types::TransferScopeId::new(),
+            pplx_space_snapshot_model::TransferScopeId::new(),
             None,
             None,
             "/retained/staging",
@@ -15788,7 +16206,10 @@ pub(crate) mod service_tests {
         let id = SandboxId::new().to_string();
         insert_suspending_resuspend(&conn, &id);
         let cache = tempfile::tempdir().unwrap();
-        let artifact_id = LocalArtifactId::new();
+        let artifact_id = crate::db::read::suspend_attempt(&conn, &id)
+            .unwrap()
+            .unwrap()
+            .artifact_id;
         let staging = suspend_snapshot_staging_dir(&cache.path().join(&id), artifact_id);
         write_full_suspend_artifact(&staging, &id, artifact_id, b"retained-capture");
         let service = service_with_runtime_probe(conn, false);
@@ -15881,7 +16302,10 @@ pub(crate) mod service_tests {
         insert_suspending_resuspend(&conn, &id);
         let cache = tempfile::tempdir().unwrap();
         let sandbox_dir = cache.path().join(&id);
-        let artifact_id = LocalArtifactId::new();
+        let artifact_id = crate::db::read::suspend_attempt(&conn, &id)
+            .unwrap()
+            .unwrap()
+            .artifact_id;
         let staging = suspend_snapshot_staging_dir(&sandbox_dir, artifact_id);
         let _bundle =
             write_deferred_suspend_artifact(&staging, &id, artifact_id, uuid::Uuid::now_v7(), 64);
@@ -15927,7 +16351,10 @@ pub(crate) mod service_tests {
             let id = SandboxId::new().to_string();
             insert_suspending_resuspend(&conn, &id);
             let cache = tempfile::tempdir().unwrap();
-            let artifact_id = LocalArtifactId::new();
+            let artifact_id = crate::db::read::suspend_attempt(&conn, &id)
+                .unwrap()
+                .unwrap()
+                .artifact_id;
             let source_id = uuid::Uuid::now_v7();
             let staging = suspend_snapshot_staging_dir(&cache.path().join(&id), artifact_id);
             let bundle = write_deferred_suspend_artifact(&staging, &id, artifact_id, source_id, 64);
@@ -16208,11 +16635,11 @@ pub(crate) mod service_tests {
             assert_eq!(row.current_local_artifact_id, Some(local_artifact_id));
             assert_eq!(
                 row.current_local_artifact_kind,
-                Some(pplx_space_common_core::types::ArtifactKind::Full)
+                Some(pplx_space_snapshot_model::ArtifactKind::Full)
             );
             assert_eq!(
                 row.current_local_artifact_origin,
-                Some(pplx_space_common_core::types::ArtifactOrigin::Suspend)
+                Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend)
             );
             assert!(row.failure_reason.is_none());
             assert!(
@@ -16279,10 +16706,11 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
         let generation = teardown_generation();
-        crate::db::begin_teardown_suspend(&conn, &sandbox_id, generation).unwrap();
+        let local_artifact_id = LocalArtifactId::new();
+        crate::db::begin_teardown_suspend(&conn, &sandbox_id, generation, local_artifact_id)
+            .unwrap();
 
         let cache_dir = tempfile::tempdir().unwrap();
-        let local_artifact_id = LocalArtifactId::new();
         let snapshot_dir = canonical_suspend_snapshot_dir(&cache_dir.path().join(&sandbox_id));
         write_full_suspend_artifact(
             &snapshot_dir,
@@ -16327,10 +16755,16 @@ pub(crate) mod service_tests {
             let conn = crate::db::test_conn();
             let sandbox_id = SandboxId::new().to_string();
             insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
-            crate::db::begin_teardown_suspend(&conn, &sandbox_id, teardown_generation()).unwrap();
+            let local_artifact_id = LocalArtifactId::new();
+            crate::db::begin_teardown_suspend(
+                &conn,
+                &sandbox_id,
+                teardown_generation(),
+                local_artifact_id,
+            )
+            .unwrap();
 
             let cache_dir = tempfile::tempdir().unwrap();
-            let local_artifact_id = LocalArtifactId::new();
             let sandbox_dir = cache_dir.path().join(&sandbox_id);
             let snapshot_dir = canonical_suspend_snapshot_dir(&sandbox_dir);
             let written_dir = if staged {
@@ -16408,7 +16842,10 @@ pub(crate) mod service_tests {
         assert!(admitted.current_local_artifact_id.is_none());
 
         let cache_dir = tempfile::tempdir().unwrap();
-        let local_artifact_id = LocalArtifactId::new();
+        let local_artifact_id = crate::db::read::suspend_attempt(&conn, &sandbox_id)
+            .unwrap()
+            .unwrap()
+            .artifact_id;
         let sandbox_dir = cache_dir.path().join(&sandbox_id);
         let snapshot_dir = canonical_suspend_snapshot_dir(&sandbox_dir);
         write_full_suspend_artifact(
@@ -16904,8 +17341,8 @@ pub(crate) mod service_tests {
                 vsock_uds_path: "/space/run/firecracker/sandboxes/test/root/v.sock",
                 api_socket_path: "/space/run/firecracker/sandboxes/test/api.sock",
                 spaced_endpoint_proof: None,
-                space_api_route_identity:
-                    pplx_space_common_core::types::SpaceApiRouteIdentity::default(),
+                space_api_route_identity: pplx_space_sandbox_model::SpaceApiRouteIdentity::default(
+                ),
                 route_identity_provenance:
                     crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
             },
@@ -17271,7 +17708,7 @@ pub(crate) mod service_tests {
         let mut request = internal_request(SpacedConnectProcessRequest {
             sandbox_id: sandbox_id.to_string(),
             operation: Some(
-                pplx_space_spaced_common::proto::operations::ConnectProcessRequest {
+                pplx_space_spaced_guest_protocol::proto::operations::ConnectProcessRequest {
                     process_id: "process".to_string(),
                     timeout: None,
                     output_cursor: Some(7),
@@ -17293,7 +17730,7 @@ pub(crate) mod service_tests {
     fn route_authorized_service_for_port(
         conn: crate::db::Connection,
         sandbox_id: SandboxId,
-        port: Option<pplx_space_common_core::types::GuestPort>,
+        port: Option<pplx_space_network_roles::GuestPort>,
     ) -> (SandboxManagerService, SpaceApiRouteEd25519Token) {
         let identity = SandboxRouteIdentity::try_new(
             sandbox_id,
@@ -17377,7 +17814,7 @@ pub(crate) mod service_tests {
                 policy
                     .wake
                     .on
-                    .push(pplx_space_common_core::types::AutoLifecycleWakeSource::Access);
+                    .push(pplx_space_auto_lifecycle::AutoLifecycleWakeSource::Access);
             }
             insert_test_sandbox_with_policy(&conn, &id.to_string(), SandboxState::Paused, &policy);
             let (service, token) = route_authorized_service(conn, id);
@@ -17397,7 +17834,7 @@ pub(crate) mod service_tests {
             }
             {
                 let db = service.db_conn().unwrap();
-                crate::db::begin_suspend(&db, &id.to_string()).unwrap();
+                crate::db::begin_suspend(&db, &id.to_string(), LocalArtifactId::new()).unwrap();
                 crate::db::complete_row_intent_cleanup(
                     &db,
                     &id.to_string(),
@@ -17421,10 +17858,12 @@ pub(crate) mod service_tests {
             }
             let mut request = internal_request(SpacedReadRequest {
                 sandbox_id: id.to_string(),
-                operation: Some(pplx_space_spaced_common::proto::operations::ReadRequest {
-                    path: "/marker".to_string(),
-                    ..Default::default()
-                }),
+                operation: Some(
+                    pplx_space_spaced_guest_protocol::proto::operations::ReadRequest {
+                        path: "/marker".to_string(),
+                        ..Default::default()
+                    },
+                ),
             });
             insert_space_api_route_ed25519_token(request.metadata_mut(), &token).unwrap();
             let error = service
@@ -17613,7 +18052,7 @@ pub(crate) mod service_tests {
             cluster_policy
                 .wake
                 .on
-                .push(pplx_space_common_core::types::AutoLifecycleWakeSource::Access);
+                .push(pplx_space_auto_lifecycle::AutoLifecycleWakeSource::Access);
             service
                 .set_auto_lifecycle_policy(internal_request(
                     crate::proto::SetAutoLifecyclePolicyRequest {
@@ -17677,13 +18116,13 @@ pub(crate) mod service_tests {
             policy
                 .wake
                 .on
-                .push(pplx_space_common_core::types::AutoLifecycleWakeSource::Access);
+                .push(pplx_space_auto_lifecycle::AutoLifecycleWakeSource::Access);
             insert_test_sandbox_with_policy(&conn, &id.to_string(), SandboxState::Paused, &policy);
             let (service, token) = route_authorized_service(conn, id);
             {
                 // Teardown retires the route binding; only the end state differs.
                 let db = service.db_conn().unwrap();
-                crate::db::begin_suspend(&db, &id.to_string()).unwrap();
+                crate::db::begin_suspend(&db, &id.to_string(), LocalArtifactId::new()).unwrap();
                 crate::db::complete_row_intent_cleanup(
                     &db,
                     &id.to_string(),
@@ -17699,10 +18138,12 @@ pub(crate) mod service_tests {
             }
             let mut request = internal_request(SpacedReadRequest {
                 sandbox_id: id.to_string(),
-                operation: Some(pplx_space_spaced_common::proto::operations::ReadRequest {
-                    path: "/marker".to_string(),
-                    ..Default::default()
-                }),
+                operation: Some(
+                    pplx_space_spaced_guest_protocol::proto::operations::ReadRequest {
+                        path: "/marker".to_string(),
+                        ..Default::default()
+                    },
+                ),
             });
             insert_space_api_route_ed25519_token(request.metadata_mut(), &token).unwrap();
             let error = service.spaced_read(request).await.err().expect("refused");
@@ -17860,7 +18301,7 @@ pub(crate) mod service_tests {
                             network_context
                                 .expect_err("Kubernetes wake requires a network namespace")
                                 .message(),
-                            pplx_space_common_core::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER
+                            pplx_space_rpc_contracts::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER
                         );
                     }
                 }
@@ -17924,7 +18365,7 @@ pub(crate) mod service_tests {
                     suspend_restore_storage_uri: populated.then(|| "s3://bucket/checkpoint".into()),
                     suspend_restore_source_node: populated.then(|| "source-node".into()),
                     expected_local_artifact_id: populated
-                        .then(|| pplx_space_common_core::types::LocalArtifactId::new().to_string()),
+                        .then(|| pplx_space_snapshot_model::LocalArtifactId::new().to_string()),
                     operation_activation_attempt_id: populated
                         .then(SandboxActivationAttemptId::new),
                     ..Default::default()
@@ -18568,6 +19009,119 @@ pub(crate) mod service_tests {
         assert_gated_row_deferred_not_repicked(&service, &sandbox_id, &runtime_state);
     }
 
+    /// A started sandbox whose runtime upgrade must leave it stopped, booted
+    /// and verified but not yet retired: the upgrade stops it itself. Its
+    /// access-idle suspend is due. Answers the service, the sandbox id and
+    /// its auto-lifecycle runtime state.
+    fn sandbox_a_stay_stopped_upgrade_runs()
+    -> (SandboxManagerService, String, AutoLifecycleRuntimeState) {
+        let execution =
+            pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
+                pplx_space_cpu_arch::Arch::X86_64,
+            )
+            .unwrap()
+            .first()
+            .unwrap()
+            .definition()
+            .execution_requirements()
+            .unwrap();
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        let policy = access_idle_policy(1);
+        insert_test_sandbox_with_policy(&conn, &sandbox_id, SandboxState::Stopped, &policy);
+        let mut runtime_state = initial_runtime_state(&policy, now_secs().saturating_sub(10));
+        recompute_runtime_state(&mut runtime_state, &policy);
+        crate::db::update_auto_lifecycle_state(&conn, &sandbox_id, &runtime_state).unwrap();
+        crate::db::upsert_sandbox_execution_metadata(&conn, &sandbox_id, &execution).unwrap();
+        let operation_id = crate::db::test_fixtures::fence_runtime_upgrade(
+            &conn,
+            &sandbox_id,
+            execution.environment().unwrap(),
+            crate::db::RuntimeUpgradeTargetState::Stopped,
+            None,
+        )
+        .operation_id;
+        // The boot's execution runs the sandbox: the upgrade still owes its stop.
+        let boot = uuid::Uuid::now_v7().to_string();
+        conn.execute(
+            "UPDATE sandbox_runtime_upgrades SET phase = 'verified', boot_execution_id = ?2
+              WHERE operation_id = ?1",
+            crate::db::fixture::params![operation_id.to_string(), boot],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sandboxes SET state = 'started', node_execution_id = ?2 WHERE id = ?1",
+            crate::db::fixture::params![sandbox_id, boot],
+        )
+        .unwrap();
+        (
+            SandboxManagerService::for_test(conn),
+            sandbox_id,
+            runtime_state,
+        )
+    }
+
+    /// A due auto-suspend is held while a runtime upgrade that must leave the
+    /// sandbox stopped runs it, unretired: the upgrade stops the sandbox
+    /// itself, and a suspend in between would leave it suspended, which the
+    /// upgrade never reports. Nothing is recorded as fired, and the row is
+    /// reconsidered once the upgrade retires.
+    #[tokio::test]
+    async fn due_auto_suspend_is_held_while_a_stay_stopped_upgrade_runs() {
+        let (service, sandbox_id, runtime_state) = sandbox_a_stay_stopped_upgrade_runs();
+
+        service
+            .run_due_auto_lifecycle(&sandbox_id)
+            .await
+            .expect("a held suspend is skipped, not an error");
+
+        let row = service.lookup_sandbox(&sandbox_id).unwrap();
+        assert_eq!(
+            row.state,
+            crate::state::SandboxStatus::from(SandboxState::Started),
+            "state untouched"
+        );
+        assert_eq!(
+            row.auto_lifecycle_state, runtime_state,
+            "no stage may be recorded as fired"
+        );
+        assert_gated_row_deferred_not_repicked(&service, &sandbox_id, &runtime_state);
+    }
+
+    /// A user's Suspend while such an upgrade runs the sandbox is refused
+    /// retryably, before anything is captured.
+    #[tokio::test]
+    async fn suspend_is_refused_while_a_stay_stopped_upgrade_runs() {
+        let (service, sandbox_id, _) = sandbox_a_stay_stopped_upgrade_runs();
+
+        let error = service
+            .suspend(internal_request(SuspendRequest {
+                sandbox_id: sandbox_id.clone(),
+                blocking: true,
+                format: 0,
+            }))
+            .await
+            .expect_err("the suspend is refused");
+
+        assert_eq!(
+            error.code(),
+            tonic::Code::Unavailable,
+            "{}",
+            error.message()
+        );
+        assert!(
+            error.message().contains("must stop this sandbox first"),
+            "{}",
+            error.message()
+        );
+        let row = service.lookup_sandbox(&sandbox_id).unwrap();
+        assert_eq!(
+            row.state,
+            crate::state::SandboxStatus::from(SandboxState::Started),
+            "state untouched"
+        );
+    }
+
     /// A gated row's scan deadline is pushed out by the grace — and only
     /// that: the runtime state still carries the true deadline — so the scan
     /// does not re-pick it inside the grace.
@@ -18917,7 +19471,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Stopped);
-        let pin = pplx_space_common_core::types::LocalArtifactId::new();
+        let pin = pplx_space_snapshot_model::LocalArtifactId::new();
         conn.execute(
             "UPDATE sandboxes
              SET current_local_artifact_id = ?1,
@@ -18949,7 +19503,7 @@ pub(crate) mod service_tests {
         // for, and the row is left exactly as found.
         let mut stale = crate::service::start::tests::materialize_stopped_request_for(&sandbox_id);
         stale.expected_local_artifact_id =
-            Some(pplx_space_common_core::types::LocalArtifactId::new().to_string());
+            Some(pplx_space_snapshot_model::LocalArtifactId::new().to_string());
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             service.start_sandbox(stale, false),
@@ -19026,7 +19580,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Stopped);
-        let pin = pplx_space_common_core::types::LocalArtifactId::new();
+        let pin = pplx_space_snapshot_model::LocalArtifactId::new();
         conn.execute(
             "UPDATE sandboxes
              SET current_local_artifact_id = ?1,
@@ -19046,9 +19600,7 @@ pub(crate) mod service_tests {
                 blocking: true,
                 start_context: Some(pplx_space_sbx_mgr_client::proto::WakeStartContext {
                     netns_path: Some("/var/run/netns/test".to_string()),
-                    expected_local_artifact_id: Some(
-                        pplx_space_common_core::types::LocalArtifactId::new().to_string(),
-                    ),
+                    expected_local_artifact_id: Some(LocalArtifactId::new().to_string()),
                     suspend_restore_storage_uri: Some(format!(
                         "s3://snapshots/suspend/{sandbox_id}/{}?region=us-east-1",
                         Uuid::now_v7()
@@ -19091,7 +19643,7 @@ pub(crate) mod service_tests {
             let conn = crate::db::test_conn();
             let sandbox_id = SandboxId::new().to_string();
             insert_test_sandbox(&conn, &sandbox_id, SandboxState::Stopped);
-            let pin = pplx_space_common_core::types::LocalArtifactId::new();
+            let pin = pplx_space_snapshot_model::LocalArtifactId::new();
             conn.execute(
                 "UPDATE sandboxes
                  SET current_local_artifact_id = ?1,
@@ -19321,9 +19873,7 @@ pub(crate) mod service_tests {
                 blocking: true,
                 start_context: Some(pplx_space_sbx_mgr_client::proto::WakeStartContext {
                     netns_path: Some("/var/run/netns/test".to_string()),
-                    expected_local_artifact_id: Some(
-                        pplx_space_common_core::types::LocalArtifactId::new().to_string(),
-                    ),
+                    expected_local_artifact_id: Some(LocalArtifactId::new().to_string()),
                     suspend_restore_storage_uri: Some(format!(
                         "s3://snapshots/suspend/{sandbox_id}/{}?region=us-east-1",
                         Uuid::now_v7()
@@ -19742,7 +20292,7 @@ pub(crate) mod service_tests {
         )
         .unwrap();
         let receipt = crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt {
-            receipt_id: pplx_space_common_core::types::AutoLifecycleDeleteReceiptId::generate(),
+            receipt_id: pplx_space_sandbox_model::AutoLifecycleDeleteReceiptId::generate(),
             sandbox_id,
             execution_generation: ExecutionGeneration::new(4).unwrap(),
             route_activation_id: SandboxActivationAttemptId::new(),
@@ -20736,7 +21286,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let id = SandboxId::new();
         let key = id.to_string();
-        let port = pplx_space_common_core::types::GuestPort::try_from_u16(8080).unwrap();
+        let port = pplx_space_network_roles::GuestPort::try_from_u16(8080).unwrap();
         seed_due_access_idle_sandbox(&conn, &key, 120, 300);
         let (service, token) = route_authorized_service_for_port(conn, id, Some(port));
         let before = access_idle_last_touched(&service, &key);
@@ -21383,6 +21933,7 @@ pub(crate) mod service_tests {
             volume_encryption: false,
             auto_lifecycle: &requested_policy,
             environment: None,
+            required_environment: None,
         };
 
         assert!(
@@ -21436,6 +21987,7 @@ pub(crate) mod service_tests {
             volume_encryption: false,
             auto_lifecycle: &policy,
             environment: None,
+            required_environment: None,
         };
 
         assert!(
@@ -21472,6 +22024,7 @@ pub(crate) mod service_tests {
             volume_encryption: true,
             auto_lifecycle: &policy,
             environment: None,
+            required_environment: None,
         };
 
         assert_eq!(
@@ -21510,6 +22063,7 @@ pub(crate) mod service_tests {
             volume_encryption: false,
             auto_lifecycle: &requested_policy,
             environment: None,
+            required_environment: None,
         };
 
         assert!(requested_sandbox_create_mismatches(&existing, &requested).is_empty());
@@ -21543,14 +22097,14 @@ pub(crate) mod service_tests {
         let policy = AutoLifecyclePolicy {
             wake: Default::default(),
             condition_sets: BTreeMap::from([(
-                pplx_space_common_core::types::AutoLifecycleConditionSetId::GuestActivity,
-                pplx_space_common_core::types::AutoLifecycleConditionSet::guest_activity(Some(
+                pplx_space_auto_lifecycle::AutoLifecycleConditionSetId::GuestActivity,
+                pplx_space_auto_lifecycle::AutoLifecycleConditionSet::guest_activity(Some(
                     test_guest_activity_hold_cap(),
                 )),
             )]),
-            stages: vec![pplx_space_common_core::types::AutoLifecycleStage {
+            stages: vec![pplx_space_auto_lifecycle::AutoLifecycleStage {
                 condition_set:
-                    pplx_space_common_core::types::AutoLifecycleConditionSetId::GuestActivity,
+                    pplx_space_auto_lifecycle::AutoLifecycleConditionSetId::GuestActivity,
                 at: 30,
                 action: AutoLifecycleIdleAction::Suspend,
             }],
@@ -21575,7 +22129,7 @@ pub(crate) mod service_tests {
         let condition = row
             .auto_lifecycle_state
             .conditions
-            .get(&pplx_space_common_core::types::AutoLifecycleConditionSetId::GuestActivity)
+            .get(&pplx_space_auto_lifecycle::AutoLifecycleConditionSetId::GuestActivity)
             .expect("guest activity condition");
         let epoch_at = condition.epoch_at.expect("future guest idle epoch");
         assert!(condition.armed);
@@ -21596,12 +22150,12 @@ pub(crate) mod service_tests {
         let policy = AutoLifecyclePolicy {
             wake: Default::default(),
             condition_sets: BTreeMap::from([(
-                pplx_space_common_core::types::AutoLifecycleConditionSetId::GuestActivity,
-                pplx_space_common_core::types::AutoLifecycleConditionSet::guest_activity(None),
+                pplx_space_auto_lifecycle::AutoLifecycleConditionSetId::GuestActivity,
+                pplx_space_auto_lifecycle::AutoLifecycleConditionSet::guest_activity(None),
             )]),
-            stages: vec![pplx_space_common_core::types::AutoLifecycleStage {
+            stages: vec![pplx_space_auto_lifecycle::AutoLifecycleStage {
                 condition_set:
-                    pplx_space_common_core::types::AutoLifecycleConditionSetId::GuestActivity,
+                    pplx_space_auto_lifecycle::AutoLifecycleConditionSetId::GuestActivity,
                 at: 30,
                 action: AutoLifecycleIdleAction::Suspend,
             }],
@@ -21626,14 +22180,14 @@ pub(crate) mod service_tests {
         let policy = AutoLifecyclePolicy {
             wake: Default::default(),
             condition_sets: BTreeMap::from([(
-                pplx_space_common_core::types::AutoLifecycleConditionSetId::GuestActivity,
-                pplx_space_common_core::types::AutoLifecycleConditionSet::guest_activity(Some(
+                pplx_space_auto_lifecycle::AutoLifecycleConditionSetId::GuestActivity,
+                pplx_space_auto_lifecycle::AutoLifecycleConditionSet::guest_activity(Some(
                     test_guest_activity_hold_cap(),
                 )),
             )]),
-            stages: vec![pplx_space_common_core::types::AutoLifecycleStage {
+            stages: vec![pplx_space_auto_lifecycle::AutoLifecycleStage {
                 condition_set:
-                    pplx_space_common_core::types::AutoLifecycleConditionSetId::GuestActivity,
+                    pplx_space_auto_lifecycle::AutoLifecycleConditionSetId::GuestActivity,
                 at: 30,
                 action: AutoLifecycleIdleAction::Suspend,
             }],
@@ -21653,7 +22207,7 @@ pub(crate) mod service_tests {
         let condition = row
             .auto_lifecycle_state
             .conditions
-            .get(&pplx_space_common_core::types::AutoLifecycleConditionSetId::GuestActivity)
+            .get(&pplx_space_auto_lifecycle::AutoLifecycleConditionSetId::GuestActivity)
             .expect("guest activity condition");
         let epoch_at = condition.epoch_at.expect("future guest idle epoch");
         assert!(condition.armed);
@@ -22137,7 +22691,7 @@ pub(crate) mod service_tests {
     /// Tests for suspend-vs-wake arbitration: the ordering predicate that
     /// decides whether a suspend queued behind a concurrent wake. (The
     /// kill-switch value vocabulary is the shared
-    /// `pplx_space_common_core::env::env_flag`, tested in common-core.)
+    /// `pplx_space_env_vars::env_flag`, tested in env-vars.)
     mod suspend_wake_arbitration {
         use std::time::{Duration, Instant};
 
@@ -22184,7 +22738,7 @@ pub(crate) mod service_tests {
     /// a transient cluster-api blip as terminal.
     mod reupload_cluster_api_env {
         use super::super::grpc_lifecycle::reupload_precondition_for_cluster_api_env;
-        use pplx_space_common_core::node_drain_signals::{
+        use pplx_space_rpc_contracts::node_drain_signals::{
             REUPLOAD_ARTIFACT_MISSING_MARKER, REUPLOAD_SANDBOX_UNKNOWN_MARKER,
         };
 

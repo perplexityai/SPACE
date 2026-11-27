@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_sandbox_model::SandboxLifecycle;
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use serde::Serialize;
 

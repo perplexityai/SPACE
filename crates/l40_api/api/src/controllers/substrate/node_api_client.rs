@@ -203,14 +203,14 @@ pub type BuilderClient =
 /// The 150s timeout leaves a 135s blocking budget after reserving 15s for
 /// completing the response.
 ///
-/// The value comes from `common-core`'s `restore_ownership` module, which
+/// The value comes from `rpc-contracts`'s `restore_ownership` module, which
 /// compile-asserts that the restore execution-ownership window outlives it.
 /// The Direct and Kubernetes restore lease claims pass this timeout as their
 /// lease TTL, and other crates derive their own timeouts and windows from the
 /// module, so a future timeout bump reaches every use of it and fails the
 /// build if it would reach the ownership window.
 pub(crate) const NODE_RPC_TIMEOUT: Duration =
-    pplx_space_common_core::restore_ownership::NODE_RPC_TIMEOUT;
+    pplx_space_rpc_contracts::restore_ownership::NODE_RPC_TIMEOUT;
 
 pub(crate) const NODE_RPC_TIMEOUT_SECS: u64 = NODE_RPC_TIMEOUT.as_secs();
 
@@ -307,6 +307,25 @@ where
             message: format!("node-api not reachable at {endpoint_addr}: {err}"),
         })?;
     Ok((endpoint_addr, client))
+}
+
+/// The internal (control-plane) node-api client of the node `target` names,
+/// for the RPCs only the control plane may call, such as `DrainNode`.
+pub async fn connect_internal_node_api_client_for_target<A>(
+    substrate: &A,
+    target: &NodeApiTarget<'_>,
+    request_timeout: Duration,
+) -> Result<RuntimeInternalClient, SubstrateError>
+where
+    A: SubstrateAdapter + ?Sized,
+{
+    let endpoint_addr = substrate.resolve_node_api_endpoint(target).await?;
+    let endpoint = node_api_endpoint(&endpoint_addr, Duration::from_secs(3), request_timeout)?;
+    connect_worker_internal(endpoint)
+        .await
+        .map_err(|err| SubstrateError::Unavailable {
+            message: format!("node-api not reachable at {endpoint_addr}: {err}"),
+        })
 }
 
 pub async fn connect_retrying_node_api_client_for_target<A>(

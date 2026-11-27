@@ -1,4 +1,3 @@
-use pplx_space_common_core::sql;
 use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
@@ -40,7 +39,7 @@ impl ReconcilerConfig {
                 "SPACE_ADMIN_AUDIT_RETENTION_GRACE_SECS",
                 default.retention,
             ),
-            max_records: env_config::EnvConfig(&pplx_space_common_core::env::ProcessEnvironment)
+            max_records: env_config::EnvConfig(&pplx_space_env_vars::ProcessEnvironment)
                 .bounded_u32(
                     "SPACE_ADMIN_AUDIT_RETENTION_MAX_RECORDS",
                     default.max_records,
@@ -96,60 +95,28 @@ impl RetentionSink for AdminAuditRetentionStore {
         let max_delete_per_tick = i64::from(max_delete_per_tick);
         let mut tx = self.pool.begin().await?;
 
-        let aged_deleted = sqlx::query_scalar::<_, String>(sql!(
-            "WITH candidates AS (
-                 SELECT id
-                   FROM admin_audit_events
-                  WHERE created_at < NOW() - ($1::BIGINT * INTERVAL '1 second')
-                  ORDER BY created_at ASC, id ASC
-                  LIMIT $2
-             )
-             DELETE FROM admin_audit_events e
-              USING candidates c
-              WHERE e.id = c.id
-              RETURNING e.id::TEXT"
-        ))
-        .bind(retention_secs)
-        .bind(max_delete_per_tick)
-        .fetch_all(&mut *tx)
-        .await?
-        .len();
+        let aged_deleted = pplx_space_admin_audit_store::delete_older_than(
+            &mut *tx,
+            retention_secs,
+            max_delete_per_tick,
+        )
+        .await?;
 
         let remaining_delete_budget =
             max_delete_per_tick.saturating_sub(i64::try_from(aged_deleted).unwrap_or(i64::MAX));
 
         let overflow_deleted = if remaining_delete_budget > 0 {
-            sqlx::query_scalar::<_, String>(sql!(
-                "WITH ranked AS (
-                     SELECT id,
-                            ROW_NUMBER() OVER (ORDER BY created_at DESC, id DESC) AS row_num
-                       FROM admin_audit_events
-                 ),
-                 candidates AS (
-                     SELECT id
-                       FROM ranked
-                      WHERE row_num > $1
-                      ORDER BY row_num DESC
-                      LIMIT $2
-                 )
-                 DELETE FROM admin_audit_events e
-                  USING candidates c
-                  WHERE e.id = c.id
-                  RETURNING e.id::TEXT"
-            ))
-            .bind(max_records)
-            .bind(remaining_delete_budget)
-            .fetch_all(&mut *tx)
+            pplx_space_admin_audit_store::delete_beyond_newest(
+                &mut *tx,
+                max_records,
+                remaining_delete_budget,
+            )
             .await?
-            .len()
         } else {
             0
         };
 
-        let retained_rows_count =
-            sqlx::query_scalar::<_, i64>(sql!("SELECT COUNT(*) FROM admin_audit_events"))
-                .fetch_one(&mut *tx)
-                .await?;
+        let retained_rows_count = pplx_space_admin_audit_store::count(&mut *tx).await?;
         let retained_rows = count_to_u64(retained_rows_count);
 
         tx.commit().await?;

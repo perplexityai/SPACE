@@ -2689,6 +2689,153 @@ func TestLegacyKillThenDeleteStillCallsManagerDelete(t *testing.T) {
 	}
 }
 
+// A legacy task whose VM exited while sbx-manager held its sandbox (a
+// quarantined only copy) had its exit-path Delete refused, and containerd
+// v2.1 doesn't retry it. StopPodSandbox's Kill retries that Delete's release:
+// while the row is held it is still refused and the task is kept; once an
+// operator discarded the row, the task is released and its exit re-announced,
+// so containerd finishes stopping the pod.
+func TestLegacyKillOfExitedTaskRetriesItsDeleteRelease(t *testing.T) {
+	quarantined := sandboxStateResult{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_QUARANTINED.Enum()}}}}
+	discarded := sandboxStateResult{resp: &pb.StateResponse{}}
+	// containerd v2.1 doesn't retry the refused Delete; StopPodSandbox's Kill
+	// arrives instead.
+	client := &fakeSandboxManagerClient{
+		results:     []sandboxStateResult{quarantined, discarded},
+		deleteError: status.Error(codes.FailedPrecondition, "retained filesystem may be the only copy"),
+	}
+	publisher := &fakePublisher{}
+	service := &spaceTaskService{
+		tasks: map[string]*task{"task": {id: "task", sandboxID: "sbx", status: tasktypes.Status_STOPPED, pid: 42}},
+		sandboxManagerClientFactory: func() (pb.SandboxManagerClient, io.Closer, error) {
+			return client, fakeConn{}, nil
+		},
+		publisher: publisher,
+	}
+
+	// containerd's exit-path Delete, refused while the row is held.
+	if _, err := service.Delete(context.Background(), &taskAPI.DeleteRequest{ID: "task"}); err == nil {
+		t.Fatal("Delete() released a task whose sandbox sbx-manager still holds")
+	}
+	if client.deleteCalls != 1 || client.stopCalls != 0 || len(publisher.events) != 0 {
+		t.Fatalf("held row: delete:%d stop:%d events:%d, want 1, 0, 0", client.deleteCalls, client.stopCalls, len(publisher.events))
+	}
+	if _, ok := service.tasks["task"]; !ok {
+		t.Fatal("Delete() dropped a task sbx-manager refused to release")
+	}
+
+	if _, err := service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"}); err != nil {
+		t.Fatalf("Kill() after the discard error = %v", err)
+	}
+	if client.deleteCalls != 1 || client.stopCalls != 0 {
+		t.Fatalf("discarded row: delete:%d stop:%d, want no further destructive call", client.deleteCalls, client.stopCalls)
+	}
+	if len(publisher.events) != 1 || publisher.topics[0] != "/tasks/exit" {
+		t.Fatalf("published %v %v, want the released task's exit", publisher.topics, publisher.events)
+	}
+	if exit, ok := publisher.events[0].(*eventstypes.TaskExit); !ok || exit.ID != "task" || exit.Pid != 42 {
+		t.Fatalf("published exit = %+v, want the task's exit", publisher.events[0])
+	}
+	if !service.tasks["task"].sandboxDetached {
+		t.Fatal("Kill() did not record the release")
+	}
+}
+
+// An exit-path Delete that can't reach sbx-manager leaves the release
+// unasked, just as a refused one does: the next Kill, with sbx-manager back
+// and the row gone, releases the task and re-announces its exit.
+func TestLegacyKillRetriesAnExitDeleteThatCouldNotReachTheManager(t *testing.T) {
+	client := &fakeSandboxManagerClient{results: []sandboxStateResult{{resp: &pb.StateResponse{}}}}
+	publisher := &fakePublisher{}
+	connections := 0
+	service := &spaceTaskService{
+		tasks: map[string]*task{"task": {id: "task", sandboxID: "sbx", status: tasktypes.Status_STOPPED, pid: 7}},
+		sandboxManagerClientFactory: func() (pb.SandboxManagerClient, io.Closer, error) {
+			connections++
+			if connections == 1 {
+				return nil, nil, status.Error(codes.Unavailable, "sbx-manager restarting")
+			}
+			return client, fakeConn{}, nil
+		},
+		publisher: publisher,
+	}
+
+	if _, err := service.Delete(context.Background(), &taskAPI.DeleteRequest{ID: "task"}); err == nil {
+		t.Fatal("Delete() released a task without reaching sbx-manager")
+	}
+	if _, err := service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"}); err != nil {
+		t.Fatalf("Kill() error = %v", err)
+	}
+	if connections != 2 || client.deleteCalls != 0 || client.stopCalls != 0 {
+		t.Fatalf("connections:%d delete:%d stop:%d, want 2, 0, 0", connections, client.deleteCalls, client.stopCalls)
+	}
+	if len(publisher.events) != 1 || !service.tasks["task"].sandboxDetached {
+		t.Fatalf("events:%d detached:%v, want the released task's exit", len(publisher.events), service.tasks["task"].sandboxDetached)
+	}
+}
+
+// A retried release never resends the id-only Delete. By the retry the row
+// may belong to a successor execution started in another pod, and the Delete
+// can't tell it from the one that exited, so the task stays until the row is
+// gone or handed off.
+func TestLegacyKillRetryNeverDeletesALiveRow(t *testing.T) {
+	quarantined := sandboxStateResult{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_QUARANTINED.Enum()}}}}
+	successor := sandboxStateResult{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTED.Enum()}}}}
+	client := &fakeSandboxManagerClient{
+		results:     []sandboxStateResult{quarantined, successor},
+		deleteError: status.Error(codes.FailedPrecondition, "retained filesystem may be the only copy"),
+	}
+	publisher := &fakePublisher{}
+	service := &spaceTaskService{
+		tasks: map[string]*task{"task": {id: "task", sandboxID: "sbx", status: tasktypes.Status_STOPPED, pid: 42}},
+		sandboxManagerClientFactory: func() (pb.SandboxManagerClient, io.Closer, error) {
+			return client, fakeConn{}, nil
+		},
+		publisher: publisher,
+	}
+
+	if _, err := service.Delete(context.Background(), &taskAPI.DeleteRequest{ID: "task"}); err == nil {
+		t.Fatal("Delete() released a task whose sandbox sbx-manager still holds")
+	}
+	if _, err := service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"}); err == nil {
+		t.Fatal("Kill() released a task whose row is live")
+	}
+	if client.deleteCalls != 1 || client.stopCalls != 0 {
+		t.Fatalf("live row: delete:%d stop:%d, want only the exit-path delete", client.deleteCalls, client.stopCalls)
+	}
+	if task, ok := service.tasks["task"]; !ok || task.sandboxDetached || len(publisher.events) != 0 {
+		t.Fatalf("retained:%v events:%d, want the task kept and no exit", ok, len(publisher.events))
+	}
+}
+
+// Durable deletion can remove the row while Kill's Stop runs. The Stop then
+// answers NotFound, which releases the task as Delete's NotFound does; any
+// other failure keeps it for containerd's retry.
+func TestLegacyKillAfterLiveStateReleasesADeletedSandbox(t *testing.T) {
+	for _, code := range []codes.Code{codes.NotFound, codes.Unavailable} {
+		t.Run(code.String(), func(t *testing.T) {
+			client := &fakeSandboxManagerClient{
+				results: []sandboxStateResult{
+					{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTED.Enum()}}}},
+				},
+				stopErrors: []error{status.Error(code, "stop raced with deletion")},
+			}
+			identity := taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 1}
+			detached, err := releaseLegacyTaskTeardown(context.Background(), client, "kill", identity, func(bool) {})
+			if code == codes.NotFound {
+				if err != nil || !detached {
+					t.Fatalf("deleted sandbox was not released: detached=%v err=%v", detached, err)
+				}
+			} else if err == nil || detached {
+				t.Fatalf("unavailable manager must keep the task: detached=%v err=%v", detached, err)
+			}
+			if client.calls != 1 || client.stopCalls != 1 || client.deleteCalls != 0 {
+				t.Fatalf("manager calls = state:%d stop:%d delete:%d, want state:1 stop:1 delete:0", client.calls, client.stopCalls, client.deleteCalls)
+			}
+		})
+	}
+}
+
 func TestLegacyDeleteAfterLiveStateHandlesManagerError(t *testing.T) {
 	for _, code := range []codes.Code{codes.NotFound, codes.Unavailable} {
 		t.Run(code.String(), func(t *testing.T) {
@@ -3089,6 +3236,102 @@ func TestStoppedCheckpointContinuation(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+type activationClient struct {
+	pb.SandboxManagerClient
+	answer func() error
+}
+
+func (f activationClient) Start(context.Context, *pb.StartRequest, ...grpc.CallOption) (*pb.StartResponse, error) {
+	if err := f.answer(); err != nil {
+		return nil, err
+	}
+	return &pb.StartResponse{Pid: 123}, nil
+}
+
+func (f activationClient) Wake(context.Context, *pb.WakeRequest, ...grpc.CallOption) (*pb.WakeResponse, error) {
+	if err := f.answer(); err != nil {
+		return nil, err
+	}
+	return &pb.WakeResponse{}, nil
+}
+
+// A Start or a Wake refused because sandbox-manager can't read its
+// activation seal is made again with the same request, backing off, until
+// the seal reads; after 30 s, or at the caller's deadline if that comes
+// first, the refusal is answered. Any other refusal, a sealed node's or
+// another Unavailable, is answered after the first call.
+func TestCallPastUnreadableSeal(t *testing.T) {
+	unreadable := status.Error(codes.Unavailable, "activation seal unreadable; retrying; refusing the cold activation of sandbox sandbox")
+	for _, tc := range []struct {
+		name     string
+		deadline time.Duration
+		refuse   func(call int) error
+		code     codes.Code
+		calls    int
+		elapsed  time.Duration
+	}{
+		{"unreadable then readable", 0, func(call int) error {
+			if call < 4 {
+				return unreadable
+			}
+			return nil
+		}, codes.OK, 4, 700 * time.Millisecond},
+		{"unreadable throughout", 0, func(int) error { return unreadable }, codes.Unavailable, 19, activationSealUnreadableWait},
+		{"unreadable past the caller's deadline", 5 * time.Second, func(int) error { return unreadable }, codes.Unavailable, 6, 5 * time.Second},
+		{"sealed", 0, func(int) error {
+			return status.Error(codes.FailedPrecondition, "node activations are sealed (generation 3); refusing the cold activation of sandbox sandbox")
+		}, codes.FailedPrecondition, 1, 0},
+		{"another unavailable", 0, func(int) error {
+			return status.Error(codes.Unavailable, "sandbox sandbox activation admission is busy; retry")
+		}, codes.Unavailable, 1, 0},
+	} {
+		for _, rpc := range []string{"Start", "Wake"} {
+			t.Run(rpc+"/"+tc.name, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					ctx := context.Background()
+					if tc.deadline > 0 {
+						var cancel context.CancelFunc
+						ctx, cancel = context.WithTimeout(ctx, tc.deadline)
+						defer cancel()
+					}
+					calls := 0
+					client := activationClient{answer: func() error {
+						calls++
+						return tc.refuse(calls)
+					}}
+					began := time.Now()
+					var err error
+					switch rpc {
+					case "Start":
+						request := &pb.StartRequest{SandboxId: "sandbox"}
+						var response *pb.StartResponse
+						response, err = callPastUnreadableSeal(ctx, func(ctx context.Context) (*pb.StartResponse, error) {
+							return client.Start(ctx, request)
+						})
+						if err == nil && response.GetPid() != 123 {
+							t.Fatal("lost admitted runtime")
+						}
+					case "Wake":
+						request := &pb.WakeRequest{SandboxId: "sandbox"}
+						_, err = callPastUnreadableSeal(ctx, func(ctx context.Context) (*pb.WakeResponse, error) {
+							return client.Wake(ctx, request)
+						})
+					}
+					if status.Code(err) != tc.code {
+						t.Fatalf("code=%s want=%s err=%v", status.Code(err), tc.code, err)
+					}
+					if calls != tc.calls {
+						t.Fatalf("calls=%d want=%d", calls, tc.calls)
+					}
+					if waited := time.Since(began); waited != tc.elapsed {
+						t.Fatalf("waited %s want %s", waited, tc.elapsed)
+					}
+				})
+			})
+		}
 	}
 }
 

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 const PROC_MEMINFO_PATH: &str = "/proc/meminfo";
 const FIRECRACKER_CGROUP_BASE: &str = "/sys/fs/cgroup/space";

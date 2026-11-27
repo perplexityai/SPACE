@@ -24,7 +24,7 @@ fn retention_is_bounded_and_preserves_recent_malformed_and_active_evidence() {
     history(&conn, "recent", UNUSED, &now.to_string());
     let active = crate::db::tests::setup_quarantine_recovery_episode(
         &conn,
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing,
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing,
     );
     history(&conn, "active-old-episode", &active.to_string(), "1");
     let mut cursor = QuarantineHistoryPruner::default();

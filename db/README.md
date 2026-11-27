@@ -30,11 +30,11 @@ migrations for every store.
 Postgres migrations under `db/postgres/` use SQLx numeric versions. Retired
 legacy migrations used `NNN_name.up.sql` / `NNN_name.down.sql` names through
 `093`. New Postgres migrations must use a UTC creation timestamp:
-`YYYYMMDDHHMMSS_name.up.sql` and `YYYYMMDDHHMMSS_name.down.sql`. The migration
-version guard only evaluates newly added Postgres files, requires their numeric
-prefix to be greater than the fixed legacy cutoff, and rejects a new timestamp
-that is not newer than the max Postgres migration version already on the base
-branch.
+`YYYYMMDDHHMMSS_name.up.sql` and `YYYYMMDDHHMMSS_name.down.sql`. For Postgres,
+the migration version guard evaluates only newly added files, including files
+moved or renamed into `db/postgres/`, requires their numeric prefix to be
+greater than the fixed legacy cutoff, and rejects a new timestamp that is not
+newer than the max Postgres migration version already on the base branch.
 
 Generate the version prefix with:
 
@@ -83,50 +83,294 @@ This is not a mechanism for changing schema or data behavior: those
 changes still require a new migration. Rollbacks to versions predating a registry
 entry can reject a database created with the revised SQL.
 
-## Unbundled template-manager migrations
+## Rolling back past a newer SQLite migration
 
-A rollout can migrate template-manager's node-local database from an init
-container while the previous pod still serves, so a template-manager schema
-change must be readable by the release before it, and a rollback must need
-nothing beyond the image. A release can still find a migration recorded that it
-doesn't bundle: a withdrawn one, or the next release's after an image rollback.
-The runner keeps a list of those it can reverse, with each one's original up
-SQL (for its checksum) and down SQL under `db/template-manager/history/`. A new
-template-manager migration joins that list one release before the release that
-bundles it, so the image a rollback returns to can reverse it. Once a release
-lists a migration, the release that bundles it must ship the same up SQL byte
-for byte, comments included. The listing release compares the recorded
-checksum only with its own copy, so a changed file, even one registered as an
-accepted checksum, makes it refuse the database. A changed migration needs a
-new version.
+SQLite rollbacks are image-only, as Postgres rollbacks are: the older release
+starts on the schema the newer one left. A release that accepts newer
+migrations by default finds, in its service history and in the shared `common`
+history, each recorded migration that succeeded, that it doesn't bundle, that
+records a SHA-384 checksum, and that is newer than every migration that catalog
+bundles. It leaves each one applied and logs a warning per row with the
+`store`, `migration_version` and `recorded_checksum` (the recorded SHA-384, in
+hex). Accepting a migration only leaves it in place; it doesn't verify that the
+older release can still read and write the data that migration left. The
+allowlist and markers in 'Rollback-safe SQLite migrations' are what make that
+safe. It still refuses, before any write:
 
-When a release migrates a database that records listed migrations it doesn't
-bundle, the runner first checks each one: its history row must hold the
-original checksum, and the migration's own check must find no data worth
-keeping that reversing would drop. Any failed check stops migration before any
-write. The runner then applies their down SQL newest first and removes their
-history rows, all in one transaction. History validation runs after that
-transaction commits and still refuses any other recorded version the release
-doesn't bundle, so such a database is reversed and then refused. Only `up` and
-template-manager's own startup reverse them; `space-db-migrator
-template-manager down` and `status` don't. A catalog that bundles a version
-applies it normally.
+- a failed row;
+- a bundled row whose recorded checksum it doesn't accept (see 'Equivalent
+  historical revisions');
+- an unbundled row whose checksum isn't a 48-byte SHA-384 digest;
+- an unbundled row older than the newest migration its catalog bundles: one
+  withdrawn after a newer migration was bundled, one merged out of timestamp
+  order, or a newer row that a later release's migration has overtaken;
+- a newer row in either history while either history is missing a migration
+  the release bundles, since the newer release that recorded the row applied
+  both catalogs in full, the shared one first.
 
-`20261031050126_node_dirty_ref_revisions` adds a `revision` column to
-`node_dirty_refs`, the `node_dirty_ref_revision` counter and the triggers that
-stamp it. Reversing it drops only those and keeps every outbox row, so its
-check never refuses. It does give up what the revision is for: a release
-without the migration acknowledges rows by key, so, as before the migration, a
-re-enqueue made while a send is in flight can be lost, and re-applying the
-migration restarts every revision at 0. Where a rollout runs
-`space-db-migrator` in an init container beside a serving pod of the newer
-release, that pod still reads `revision` after the reversal: its outbox reads
-and acknowledgements fail, and its rows stay queued, until it exits or a
-migrator re-applies the migration. A send it started before the reversal and
-acknowledges after a re-apply can match a restarted revision and delete a
-re-enqueue made during that send. A release without the migration writes the
-outbox without naming `revision`, so it keeps serving while a migrator applies
-it.
+The overtaken case means that after a rollback, deploying a release that
+bundles a newer migration in that store, but not the newer rows, refuses the
+database: for example, a hotfix of the rollback target that adds its own
+migration, or a release built after a revert deleted a migration's file. Undo
+the newer rows with the newer image's `down`, as below, before deploying such a
+release. A withdrawn migration stays bundled once any environment has applied
+it, and a forward migration undoes its change, as
+`20261113190000_restore_sandbox_legacy_state` does for
+`20261109120000_drop_sandbox_legacy_state` in sandbox-manager.
+
+Rolling forward again applies nothing new: the newer release finds its
+migrations recorded. Its code then runs on rows the older release wrote in the
+meantime, which is why the allowlist admits only nullable or defaulted columns,
+and a `data` marker's reason says how those rows are handled.
+
+Image-only rollback past a migration that a `space-allow-rollback-unsafe`
+marker exempts is safe only to a release its reason allows. A reason such as
+"release N stopped reading it" means a release older than N still uses what
+the migration drops or changes; a reason such as "the new code reads both
+forms" allows any target. Before a rollback that skips releases, list the
+marked migrations between the two:
+
+```bash
+bash scripts/list-rollback-unsafe-migrations.sh <target-ref> <current-ref>
+```
+
+It prints one line per marker in the SQLite up migrations `<current-ref>` has
+and `<target-ref>` doesn't, with the store, version, kind, object and reason,
+newest first per store. A `db/common` marker is listed once for each consumer
+store in `ARCHITECTURE.toml`, under that store: each consumer's database has
+its own common history. It exits 0 when there are none, 1 when it lists some,
+and 2 when it can't read the refs or files. The list marks rollback
+boundaries, not the commands to run. Read each reason against the target. For
+each marker whose reason names a release newer than the target, stop that
+store and run the newer image's `space-db-migrator <store> … down` until the
+marked version is gone from its histories, as below; for a `common` line that
+is the consumer store's migrator, until `_space_common_schema_migrations` no
+longer records it. Each run reverts the newest migration across the store's
+history and `common`'s, so every migration newer than the marked one is
+reverted first.
+
+A release that doesn't accept newer migrations by default refuses every
+recorded migration it doesn't bundle, unless the setting below lists it.
+Rolling back to one needs, on every node, the newer image's `space-db-migrator
+<store> … down`: first stop the store's daemon on the node and keep the newer
+release from restarting it or re-running its migrations until the older release
+starts, since a daemon still serving would read and write a schema being
+reverted under it. Each run reverts only the newest applied migration across
+the store's history and `common`'s, so run it once per migration, newest first.
+Some down migrations are rollback floors that refuse by design, such as
+runtime-manager's `20261012064915_artifact_operations`, so read each down
+script first, and where one refuses, follow its recovery instructions instead.
+For template-manager, read 'Node dirty-ref revision migration' and 'Template
+cache partition migration' first: some earlier releases reverse certain newer
+migrations themselves at startup, with data checks that a manual `down` skips,
+and those sections say which targets need which steps.
+
+Such releases from #1818 on accept a newer migration only when
+`SPACE_SQLITE_ACCEPT_NEWER_MIGRATIONS` lists it as a `<store>:<version>` entry
+(`common` for the shared catalog), set on the containers that run the store's
+migrations at startup, in the same deploy as the image revert. That setting
+still works for a rollback to one of them, after checking each entry:
+
+1. Find the entries without starting the older release on the node: take a
+   consistent copy of the store's database with
+   `sqlite3 -readonly <db> ".backup <copy>"`, and run the target image's
+   `space-db-migrator <store> --database-path <copy> up` against the copy with
+   the setting unset. Its refusal names each entry, unless another invalid row,
+   one that failed, was modified or isn't bundled, stops the check first: it
+   then names only that row, and the list is incomplete. Resolve that row as
+   its recovery guidance says, and run it again.
+2. For each one, read the migration in the newer release and check it against
+   the target's code: whether the target uses anything it drops or renames,
+   whether the target's writes can violate a constraint, index or trigger it
+   adds, a new table's foreign key into a table the target deletes rows of
+   included, whether it rewrites rows the target reads, and whether the newer
+   release writes values the target doesn't handle. A migration with no
+   marker passes the first three. If a node may have run a
+   pre-release build, compare the recorded checksum
+   (`SELECT lower(hex(checksum)) FROM _sqlx_migrations WHERE version = …`, or
+   `_space_common_schema_migrations` for `common`) with `shasum -a 384` of the
+   file you checked.
+3. After rolling forward again to a release that accepts newer migrations by
+   default, remove the setting. That release ignores it, but a release from
+   #1818 up to the one that accepts newer migrations by default still reads it
+   on a later rollback, and an entry left over would accept its migration
+   unchecked.
+
+A release that accepts newer migrations by default no longer reads the setting:
+if it is set, the release logs a warning at startup and ignores it. While a
+database records a newer migration, an older image's `down` refuses too,
+because SQLx validates the applied history, so undo newer migrations with the
+newer image.
+
+The `sqlite3` commands in this section need the `sqlite3` command-line tool,
+which a store's own image may not include. Run them where it is available,
+against the database file on the node. In the charts in this repository, a
+store's pods mount the node's `/space/run` directory, so one way is an
+ephemeral debug container on the node:
+`kubectl debug node/<node> -it --image=<an image with sqlite3>` mounts the
+node's root filesystem at `/host`, which puts sandbox-manager's database at
+`/host/space/run/sandbox-manager/sbx-manager.db`. Run `space-db-migrator`
+itself from the store's image.
+
+## Rollback-safe SQLite migrations
+
+Because the release before a SQLite migration runs on the schema the migration
+leaves, the [SQLite rollback guard](../scripts/check-sqlite-migrations-rollback.sh)
+classifies every statement a change adds to a `db/<store>/*.up.sql` outside
+`db/postgres/`, `db/common` included. It runs in CI's migration guards after the
+version guard. It applies the store's base-branch migrations to a database, after
+`db/common`'s for the stores `[rules.layers.state.shared_catalogs]` in
+`ARCHITECTURE.toml` lists as its consumers, and then runs the change's
+statements one at a time under SQLite's authorizer. An object that database
+has before the change's statements run is existing; what the change creates is
+new, `db/common`'s new objects included for its consumers. Names compare as
+SQLite compares them, folding ASCII case only. A statement that fails to apply
+fails the check with SQLite's message.
+
+A statement needs no marker only when it is one of these:
+
+1. `CREATE TABLE` of a new name with no foreign key into an existing table.
+   Keys into other new tables are fine.
+2. `CREATE INDEX` that isn't `UNIQUE`, on any table, partial ones included, or
+   `CREATE UNIQUE INDEX` on a new table.
+3. `CREATE VIEW` of a new name.
+4. `ALTER TABLE <existing> ADD COLUMN` that adds one trailing column and
+   changes nothing else, with no `CHECK` and no `REFERENCES`: nullable with or
+   without a constant default, `NOT NULL` with a non-NULL constant default, or
+   `GENERATED ALWAYS AS (…) VIRTUAL` without `NOT NULL`.
+5. Any statement on new tables, indexes and views, but for a copy of an
+   existing table's rows into a new one.
+6. `INSERT … VALUES` or `INSERT … DEFAULT VALUES` into an existing table that
+   doesn't declare `ON CONFLICT REPLACE`, with no `REPLACE`, `OR REPLACE` or
+   upsert clause. A seeded value must be one the previous release can read.
+
+Objects in `temp` or attached databases are ignored, and so are the writes of
+a trigger the base already has, which the previous release makes too.
+
+An `ADD COLUMN` is safe only while the previous release never inserts without
+a column list (`INSERT INTO t VALUES (…)`) and never reads `SELECT *` by
+position. The stores' code does neither; keep it that way.
+
+Everything else needs a marker of one of two kinds. `schema` covers any other
+`ALTER` of an existing table, such as a rename or a dropped column; a `DROP` of
+an existing table, index, view or trigger; `CREATE UNIQUE INDEX` on an existing
+table; any `CREATE TRIGGER`, since its body can write existing tables; a
+foreign key from a new table into an existing one, whatever its `ON DELETE`,
+since the previous release deletes parent rows without knowing the new table;
+`PRAGMA`; and any other kind of statement. `data` covers an `UPDATE` or
+`DELETE` of an existing table's rows, cascaded deletes included; an `INSERT …
+SELECT`, `REPLACE`, `INSERT OR REPLACE` or upsert into an existing table; any
+`INSERT` into one that declares `ON CONFLICT REPLACE`; and an `INSERT` or
+`CREATE TABLE … AS` that copies an existing table's rows into a new one, which
+freezes data the previous release keeps writing after a rollback. What a
+trigger the change creates writes to an existing table while the change's own
+statements run counts as `data` too.
+
+The marker sits in a SQL comment of the migration that holds the statement,
+and exempts only that kind on that object in that file:
+
+```sql
+ALTER TABLE sandboxes DROP COLUMN legacy_state;
+-- space-allow-rollback-unsafe: sandboxes.legacy_state: schema: release N stopped reading it
+```
+
+The object is the one the guard reports: a table, index, view or trigger's own
+name, `<table>.<column>`, or for a foreign key `<new_table>.<column>`, or
+`<new_table>` when the key is composite. The guard prints each finding it
+exempts with its marker. A marker fails when no finding in its file matches
+it, when it names an unknown kind, when its reason is empty or still the
+placeholder the guard prints, and when it is added to a landed migration, one
+whose version the base has: a marker there never exempts anything. In a landed
+migration only the statements its base revision lacks are classified, so a
+comment edit passes. Deleting or renaming a landed migration fails with no
+marker to exempt it: a merged migration must be assumed already applied
+wherever main is deployed, and a release that doesn't bundle an applied
+migration refuses the database. Keep the file and undo its change with a
+forward migration, as `20261113190000_restore_sandbox_legacy_state` does. A
+migration that is a symlink or another non-regular file fails too, and so does
+`ATTACH`, `DETACH` or `VACUUM`, which open or create other database files. On
+main, CI runs the guard once per first-parent commit, so the PRs a push lands
+together are judged as they merged.
+
+A destructive change takes two releases. Release N stops reading and writing
+the object, and stops relying on any rule it enforces; release N+1 drops it,
+with a `schema` marker whose reason names release N.
+
+A `data` marker's reason says why the rows the previous release writes after a
+rollback, in the old form, are fine: that release never writes the old form;
+the new code reads both forms; or an idempotent startup or reconciler fixup
+converts the rows left over. It must also hold for the rollback target: the
+target has to read every row the migration converted, not only the newer
+code. A copy into a new table needs the same: the previous release keeps
+writing the source, so the copy goes stale.
+
+A statement the guard flags wrongly takes a marker too, with a reason that
+starts `false positive: …`, and the guard is then fixed.
+
+Limits: the guard judges statements, not the code that uses the schema. The
+newer release must handle rows the older release writes while rolled back,
+and must not write values, such as a new state, that the older release can't
+read.
+
+A new or changed `db/common` migration always needs one marker that names the
+shared catalog, `-- space-allow-rollback-unsafe: common: schema: <reason>`,
+whose reason covers every consumer store `ARCHITECTURE.toml` lists, and the
+guard names them when it is missing. The guard doesn't classify the migration
+against each consumer's own schema: a shared table with a foreign key into a
+consumer's table, for one, passes the common catalog's check. So the marker
+exempts every finding in that file, and the reason is where its effect on
+each consumer is argued. The migration must also apply on each consumer's
+base schema and on a new node, which runs the whole common catalog before the
+consumer's own.
+
+## Node dirty-ref revision migration
+
+Template-manager bundles `20261031050126_node_dirty_ref_revisions`. Some
+earlier template-manager releases don't bundle it but list it among the
+migrations they reverse on rollback, with a copy of its SQL under their own
+`db/template-manager/history/`. Their reversal compares the recorded checksum
+only with that copy and ignores `db/accepted-checksums.toml`, so it reverses
+the migration only while the bundled file keeps that checksum:
+`template_manager_migrations_keep_the_checksums_releases_reverse` pins it.
+Change the schema with a new migration, never by editing this one.
+
+Rolling back to one of those releases reverses the migration with the image
+alone, unless that release also lists the partition migration below without
+bundling it. Such a release checks every migration it would reverse before
+reversing any, so a row that blocks the partition reversal blocks this one
+too; follow the restrictions under 'Template cache partition migration'.
+Those releases' `space-db-migrator template-manager up` and template-manager's
+startup reverse it before validating the rest of the history, so a database
+that also records a later migration they don't bundle is reversed and then
+refused.
+Where a rollback runs that migrator in an init container beside a serving pod
+of a release that bundles the migration, the serving pod still reads
+`node_dirty_refs.revision`: its outbox reads and acknowledgements fail and its
+rows stay queued until it exits or a migrator re-applies the migration. The
+older release acknowledges rows by key, so a re-enqueue made while a send is
+in flight can be lost again, and re-applying the migration restarts revisions
+at 0. A send the serving pod started before the reversal and acknowledges
+after a re-apply can then match a restarted revision and delete a re-enqueue
+made during that send.
+
+A release that neither bundles nor lists `20261031050126` refuses a database
+that records it. That covers every release from before #1277, including the
+withdrawn-interval ones that list only the partition migration below, and they
+all predate `SPACE_SQLITE_ACCEPT_NEWER_MIGRATIONS`. Rolling back to one needs,
+first, with template-manager stopped and the newer one kept from restarting
+until the older one starts, `20261031050126` reverted with
+`space-db-migrator template-manager --database-path <db> down`, run with a
+migrator that bundles every migration the database records, such as the newer
+release's. Each run reverts only the newest applied migration across
+template-manager's history and the shared `common` catalog's, so check both
+first: `sqlite3 -readonly <db> "SELECT max(version) FROM _sqlx_migrations"`
+and `sqlite3 -readonly <db> "SELECT max(version) FROM _space_common_schema_migrations"`.
+If either prints a version later than `20261031050126`, revert those later
+migrations first, newest first across both, reading each down script as
+'Rolling back past a newer SQLite migration' describes. Then run it once more
+to revert `20261031050126`, and check that `_sqlx_migrations`' `max(version)`
+no longer prints it. 'Template cache partition migration' and
+`docs/execution-environments.md` say when this applies to a partition rollback.
 
 ## Template cache partition migration
 
@@ -135,11 +379,26 @@ after some nodes had applied it, and is bundled again with the same SQL.
 Releases from the withdrawn interval don't bundle it. Their writes succeed on either
 schema, so one can keep serving while a migrator applies the migration.
 When one finds the migration recorded with its original checksum, it applies
-the down SQL and removes the history row at startup, so rolling back to it
-needs no database step beyond the image. A release that bundles it keeps its entry in the runner's list
-of unbundled migrations, reading its SQL from the bundled catalog rather than
-`history/`; the runner skips a version its catalog bundles, so the entry never
-reverses it there.
+the down SQL and removes the history row at startup. Whether rolling back to
+it needs more than the image depends on how it treats
+`20261031050126_node_dirty_ref_revisions`, as 'Node dirty-ref revision
+migration' describes. One from before #1277 doesn't list that version and
+refuses a database that records it. First stop template-manager and keep the
+newer one from restarting until the older one starts: a restart can apply a
+migration the database doesn't yet record. Then check the database's history:
+`sqlite3 -readonly <db> "SELECT max(version) FROM _sqlx_migrations"` must
+print `20261031050126`, or `20261026220935` if the node doesn't record the
+dirty-ref migration, and
+`sqlite3 -readonly <db> "SELECT version FROM _space_common_schema_migrations WHERE version > 20260930000000"`
+must print nothing, since `down` reverts the newest migration across both
+histories. If either check fails, stop and follow 'Node dirty-ref revision
+migration' instead. If the first printed `20261026220935`, no `down` is
+needed. If it printed `20261031050126`, run
+`space-db-migrator template-manager --database-path <db> down` once, with a
+migrator from #1235 on such as the newer release's, before starting the older
+one; it reverts only that migration. `docs/execution-environments.md`
+describes the steps. A release that bundles it applies it normally and never
+reverses it.
 
 The reversal counts rows only. A `{hash}@{environment}` build or snapshot
 directory left without a row stays on disk, and that release's startup
@@ -169,11 +428,100 @@ Where a rollback runs `space-db-migrator` in an init container beside the
 serving pod, that pod still names `cache_partition` after the reversal, so its reads and writes fail
 until it exits.
 
-That reversal compares the recorded checksum with the original file's and
-has no registry of accepted revisions, so the migration's SQL must stay
-byte-identical: `partition_migration_keeps_the_checksum_releases_reverse` pins
-its checksum.
+Their reversal compares the recorded checksum only with its own copy and
+ignores `db/accepted-checksums.toml`, so the migration's SQL must stay
+byte-identical: `template_manager_migrations_keep_the_checksums_releases_reverse`
+pins its checksum.
 Change the schema with a new migration, never by editing this one.
+
+## Sandbox-manager runtime upgrade attempts
+
+Sandbox-manager's `20261114030001_sandbox_runtime_upgrade_attempt_id` adds a
+nullable `attempt_id` column to `sandbox_runtime_upgrades` and
+`sandbox_runtime_upgrade_outcomes`.
+`20261114030002_sandbox_runtime_upgrade_attempt_outcomes` adds
+`sandbox_runtime_upgrade_attempt_outcomes`, which holds at most one final
+outcome per operation and attempt id. That table has no foreign key to
+`sandboxes`, so deleting a sandbox's row leaves its attempt outcomes in place.
+
+Each down refuses, before it changes the schema, while a row it guards is
+recorded:
+
+- `20261114030002`'s while the attempt-outcome table holds any row. Dropping
+  the table would lose it, and `sandbox_runtime_upgrade_outcomes` keeps only
+  one outcome per operation.
+- `20261114030001`'s while an operation's outcome in
+  `sandbox_runtime_upgrade_outcomes` is anything but `rolled_back` or
+  `already_on_target`, the two a release without these migrations parses.
+  It guards outcomes only, not the other columns an older release parses.
+
+A release that applies these migrations without writing either leaves the
+column NULL and the table empty, so both downs go through. A non-NULL
+`attempt_id` doesn't hold back `20261114030001`'s down: it drops the ids, which
+a release without the column never reads. Once a node has recorded a guarded
+row, the down that guards it refuses while the row stays. No store code deletes
+attempt outcomes, so `20261114030002`'s down refuses on that node until an
+operator deletes them. An image-only rollback runs no down, so after a node
+records an outcome the older release can't parse, such as `refused`, roll it
+back only to a release whose store parses that outcome. Bundling these
+migrations isn't enough: at the commit that adds them, the store's
+`RecordedRuntimeUpgradeOutcome` parses only `rolled_back` and
+`already_on_target`. While both migrations are applied, this read-only query
+counts the rows that block the reversal:
+
+```sql
+SELECT (SELECT COUNT(*) FROM sandbox_runtime_upgrade_attempt_outcomes)
+     + (SELECT COUNT(*) FROM sandbox_runtime_upgrade_outcomes
+         WHERE outcome NOT IN ('rolled_back', 'already_on_target'));
+```
+
+Once `20261114030002`'s down has run, its table is gone and that query fails.
+Only `20261114030001`'s guard is left then, and this read-only query counts
+the rows that hold it back:
+
+```sql
+SELECT COUNT(*) FROM sandbox_runtime_upgrade_outcomes
+ WHERE outcome NOT IN ('rolled_back', 'already_on_target');
+```
+
+`20261120180000_sandbox_runtime_upgrade_attempt_identity` adds nullable
+`target_environment`, `target_state` and `authorization_id` columns to
+`sandbox_runtime_upgrade_attempt_outcomes`: what the operation an attempt
+outcome belongs to asked for, kept after the sandbox's row is deleted. A row
+that has them is final for its attempt; one without them is final for no
+attempt. Its down refuses, before it changes the schema, while any row has
+them, since dropping the columns would leave every final outcome final for no
+attempt and let a retry of an attempt its caller gave up run again. It goes
+through over rows without them, and keeps those. This read-only query counts
+the rows that hold it back:
+
+```sql
+SELECT COUNT(*) FROM sandbox_runtime_upgrade_attempt_outcomes
+ WHERE target_environment IS NOT NULL;
+```
+
+Those rows also need `20261114030002`'s down to wait, which it does while the
+table holds any row. An image-only rollback runs no down, so once that count
+is nonzero, roll the binary back only to a release that honors recorded
+finality (see "Upgrading a sandbox's runtime" in
+`docs/execution-environments.md`).
+
+`20261120230000_sandbox_runtime_upgrade_abandoned` adds
+`sandbox_runtime_upgrade_abandoned`, which records each operation the control
+plane abandoned. It has no foreign key to `sandboxes`, so a record outlives its
+sandbox's row and can precede it. Its down refuses, before it changes the
+schema, while the table holds any row: a release without it doesn't know an
+operation was abandoned, so a late call for one could change a disk the
+control plane has already captured. This read-only query counts the rows that
+hold it back:
+
+```sql
+SELECT COUNT(*) FROM sandbox_runtime_upgrade_abandoned;
+```
+
+An image-only rollback runs no down, so once that count is nonzero, roll the
+binary back only to a release that enforces abandonment, or keep every caller
+of the abandoned operations quiet first.
 
 ## Console password provisioning
 
@@ -298,6 +646,27 @@ which is safe because SQLx rolls the file and its `_sqlx_migrations` row back
 together. A `-- no-transaction` migration is not retried at all, because a
 failed `CREATE INDEX CONCURRENTLY` can leave an INVALID index behind with no
 history row, and recovering that needs a `DROP INDEX CONCURRENTLY` and a rerun.
+A failed `DROP INDEX CONCURRENTLY` can leave one too, and so can a
+`-- no-transaction` down, whose failure keeps the up's history row. When the
+statement of a `-- no-transaction` file fails under `control-plane up`,
+`reset` or `down`, the migrator logs one error per INVALID index in the
+database before it exits, with the `failed_version`, the `index`, its `table`,
+`ready` (whether writes still maintain it) and `in_progress`. The list is not
+capped or filtered to the failed file, so it can name an index from an earlier
+failure or another session's build; check which file names it before
+recovering.
+A Job killed partway through such a file logs none of this, and its statement
+keeps running on the server: the index it leaves is INVALID while the build or
+drop runs, and stays INVALID only if that statement later fails or is
+terminated. So `control-plane up`, and `reset` after it drops the schema, also
+run the same query before they apply anything, and log a warning per INVALID
+index with the same fields but no `failed_version`; the run goes on either way.
+`in_progress` is true when another session holds `SHARE UPDATE EXCLUSIVE` on
+the table, as a running `CONCURRENTLY` build or drop does. `VACUUM`, `ANALYZE`
+and a build or drop of another index on that table hold it too, so true means
+it may be running. Do not drop an index while it is true: wait for the
+statement to end, then check again. When it is false, no build or drop holds
+the table now; one still waiting for the lock also shows false.
 
 [The migration lint guard](../scripts/check-postgres-migrations-squawk.sh)
 checks changed `db/postgres/*.up.sql` files with Squawk. Squawk catches generic
@@ -320,8 +689,13 @@ semantics; only its exact reviewed content is exempt from the new-migration lint
 The same guard lane also rejects PRs that combine `db/postgres/*.sql`
 migrations with runtime/deployable app changes. Land Postgres migrations in a
 separate PR from application behavior changes so lock risk, rollout, and
-rollback are reviewed independently. Docs, tests, and migration-guard
-maintenance can travel with migration-only PRs.
+rollback are reviewed independently. Docs, tests under `scripts/tests/`, the
+SQL files directly in `crates/test_support/db/test/fixtures/schema-variants/`,
+and the migration guards under `scripts/` with their tests can travel with
+migration-only PRs. Apart from the bootstrap-role exceptions below, every other
+file under `crates/`, Rust tests included, counts as a runtime change, so a
+migration must keep every existing Rust test passing: tighten a constraint
+they violate only after a separate PR updates them.
 
 The sole production-code exception is the credential fence required by a
 credential-table migration. That PR may change the canonical table-name entries
@@ -372,10 +746,16 @@ volume, template, build, and runtime-manager stores.
 Public-catalog startup validates both service and shared histories before
 writes, then applies common schema before service schema. Failed, modified,
 missing, or unbundled applied versions are rejected without recreating the
-database. A binary rollback therefore requires a catalog compatible with the
-complete applied history, even for an otherwise backward-compatible schema.
-Use expand/contract sequencing and retain verified backups. Template-manager's
-exceptions are described under 'Unbundled template-manager migrations'.
+database, except a successful version newer than everything the catalog
+bundles, which a binary rollback leaves applied as described under 'Rolling
+back past a newer SQLite migration'. Some earlier template-manager releases
+reverse `20261026220935` and `20261031050126` themselves instead, as described
+under 'Node dirty-ref revision migration' and 'Template cache partition
+migration'. A template-manager migration must also leave the database readable
+and writable by the release before it: a rollout can run
+`space-db-migrator template-manager up` in an init container while the
+previous release's pod still serves from the same node-local database. Use
+expand/contract sequencing and retain verified backups.
 
 The migrator never adopts untracked schemas, repairs rejected history, or
 recreates a database after a migration failure. Baseline history conversion is
@@ -393,8 +773,16 @@ state-preserving recovery plan. Never edit history rows to bypass validation.
 
 For stores with shared jobs, `down` removes the greatest applied timestamp across
 both catalogs, choosing the service migration first when timestamps match.
-Migration timestamps must reflect release/dependency order. Baseline down
-migrations reject rollback below the supported schema floor.
+Migration timestamps must reflect release/dependency order. The migration
+version guard enforces this for SQLite catalogs too. An up migration added or
+moved directly into a service catalog `db/<store>/` must be newer than the
+newest version on the base branch in both that catalog and `db/common/`. One
+added or moved into `db/common/` must be newer than the newest version on the
+base branch in every SQLite catalog, not only the consumers. `history/`
+subdirectories are not part of a catalog, and a catalog absent from the base
+branch is not compared. A branch overtaken by a newer migration renumbers on
+rebase, as Postgres branches already do. Baseline down migrations reject
+rollback below the supported schema floor.
 
 The `jobs` table belongs to `db/common/`. Add shared tables, columns, and indexes
 there instead of copying jobs DDL into service directories. Service-owned
@@ -557,13 +945,14 @@ the caller, not of the statement:
 Inside the substrate the classification is reached through an extension trait,
 `DbContext::db_context`, rather than a bare `map_err` at each site. That is
 partly ergonomics — one line per call site instead of a five-line closure — but
-mostly a type check: the trait is implemented only for `Result<_, sqlx::Error>`
-and for the warm-pool store's error, so reaching for it on a `kube` or `tonic`
-result does not compile, and the compiler rather than review is what keeps the
-classification on database errors. A `SubstrateError::Failed` built directly
-from a `sqlx::Error` is the regression to look for. `direct.rs` keeps one
-hand-written mapper on top of it, because its route reservation classifies
-`Io`/`PoolTimedOut`/`57014` as retryable-but-not-contention.
+mostly a type check: the trait is implemented only for `Result<_, sqlx::Error>`,
+for the warm-pool store's error and for postgres-pool's `DbError`, so reaching
+for it on a `kube` or `tonic` result does not compile, and the compiler rather
+than review is what keeps the classification on database errors. A
+`SubstrateError::Failed` built directly from a `sqlx::Error` or a `DbError` is
+the regression to look for. `direct.rs` keeps one hand-written mapper on top of
+it, because its route reservation classifies `Io`/`PoolTimedOut`/`57014` as
+retryable-but-not-contention.
 
 Finding a gap like this is a matter of reading the error mapping, not the SQL:
 the statement looks ordinary and the disposition lives at the boundary, often
@@ -606,9 +995,9 @@ Two shapes need care when adding code:
 ### Application pools
 
 Long-running services connect only as the managed logins, with no selector
-and no fallback to the connecting admin. `pplx-space-postgres-pool`
-exposes three constructors: `connect_space_user_pool` (the service's
-general-purpose pool, as `space_user`), `CredentialsPool::connect` (the
+and no fallback to the connecting admin. They build their pools with three
+`pplx-space-postgres-pool` constructors: `connect_space_user_pool_lazy` (the service's
+general-purpose pool, as `space_user`), `CredentialsPool::connect_lazy` (the
 credential-fenced lane, as `space_creds`), and
 `connect_space_user_sideline_pool_lazy` (a *sideline* pool, also `space_user`,
 with an explicit connection cap). A sideline pool exists for one reason: a

@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Parser;
-use pplx_space_common_core::host::linux::paths::CREDENTIAL_MANAGER_SOCKET;
 use pplx_space_credmgr::{CredmgrRole, CredmgrRunConfig, SERVICE_NAME};
+use pplx_space_host_layout::paths::CREDENTIAL_MANAGER_SOCKET;
 use pplx_space_service_lifecycle::DEFAULT_SERVICE_MUTEX_TIMEOUT;
 
 #[derive(Parser)]

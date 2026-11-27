@@ -13,12 +13,33 @@ pub(crate) mod kubernetes;
 const SIM_WORKER_TOKEN: &str = "sim-worker-test-token";
 const SIM_WORKER_CONTROL_TOKEN: &str = "sim-worker-test-control-token";
 
+/// Make `environment` the cluster default through the policy store, which
+/// records it as `allowed`, as an operator's `PUT .../default` does.
+#[cfg(feature = "kubernetes")]
+pub(crate) async fn set_default_environment(
+    pool: &PgPool,
+    environment: &str,
+) -> pplx_space_db_test_fixtures::TestDbResult<()> {
+    use pplx_space_runtime_environment_policy_store::{
+        PolicyChange, PolicyChangeReason, set_default,
+    };
+    let change = PolicyChange {
+        actor: None,
+        reason: PolicyChangeReason::new("test")?,
+    };
+    let mut tx = pool.begin().await?;
+    set_default(&mut *tx, environment.parse()?, &change).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Enter before awaiting fixtures: authenticated clients need process credentials.
 pub(crate) fn enter_sim_worker_process() -> bool {
     enter_sim_worker_process_with_token_paths(None, None, &[])
 }
 
 /// [`enter_sim_worker_process`], with `extra` set in the child as well.
+#[cfg(feature = "kubernetes")]
 pub(crate) fn enter_sim_worker_process_with(extra: &[(&str, Option<&std::ffi::OsStr>)]) -> bool {
     enter_sim_worker_process_with_token_paths(None, None, extra)
 }
@@ -31,6 +52,12 @@ pub(crate) fn enter_sim_worker_process_with(extra: &[(&str, Option<&std::ffi::Os
 /// The parent creates the files and keeps them until its child exits; the
 /// child's own copy of the directory is unused.
 pub(crate) fn enter_sim_worker_process_with_owned_token_files() -> bool {
+    enter_sim_worker_process_with_owned_token_files_and(&[])
+}
+
+pub(crate) fn enter_sim_worker_process_with_owned_token_files_and(
+    extra: &[(&str, Option<&std::ffi::OsStr>)],
+) -> bool {
     let tokens = tempfile::tempdir().expect("create test token directory");
     let node_api = tokens.path().join("node-api.token");
     let node_api_internal = tokens.path().join("node-api-internal.token");
@@ -40,7 +67,7 @@ pub(crate) fn enter_sim_worker_process_with_owned_token_files() -> bool {
     enter_sim_worker_process_with_token_paths(
         Some(node_api.as_os_str()),
         Some(node_api_internal.as_os_str()),
-        &[],
+        extra,
     )
 }
 
@@ -82,6 +109,7 @@ pub(crate) fn enabled_config() -> ClusterSandboxAdmissionConfig {
         refill_rps: 6.0,
         burst: 60.0,
         redis_url: None,
+        slot_check_enabled: false,
     }
 }
 
@@ -94,7 +122,7 @@ pub(crate) async fn start_a_request_blocked_on_operations<T: Send + 'static>(
     lock: &mut sqlx::PgConnection,
     request: impl std::future::Future<Output = T> + Send + 'static,
 ) -> pplx_space_db_test_fixtures::TestDbResult<tokio::task::JoinHandle<T>> {
-    use pplx_space_common_core::sql;
+    use pplx_space_sql_locator::sql;
 
     sqlx::query(sql!(
         "LOCK TABLE public_operations IN ACCESS EXCLUSIVE MODE"
@@ -125,14 +153,19 @@ pub(crate) async fn start_a_request_blocked_on_operations<T: Send + 'static>(
 }
 
 /// Wait until some backend is blocked on a lock `holder` holds: proof that
-/// the request under test queued behind it.
+/// the request under test queued behind it. `holder` is usually inside a
+/// transaction, where `pg_stat_activity` keeps the snapshot of its first
+/// read, so each poll clears it to see backends that connected since.
 pub(crate) async fn wait_until_blocked_by(
     holder: &mut sqlx::PgConnection,
 ) -> pplx_space_db_test_fixtures::TestDbResult<()> {
-    use pplx_space_common_core::sql;
+    use pplx_space_sql_locator::sql;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
+        sqlx::query(sql!("SELECT pg_stat_clear_snapshot()"))
+            .execute(&mut *holder)
+            .await?;
         let blocked: bool = sqlx::query_scalar(sql!(
             "SELECT EXISTS (
                  SELECT 1 FROM pg_stat_activity
@@ -159,7 +192,7 @@ pub(crate) async fn record_the_row_and_succeed(
     create: pplx_space_public_api::OperationId,
     sandbox_id: pplx_space_public_api::PublicSandboxId,
 ) -> pplx_space_db_test_fixtures::TestDbResult<()> {
-    use pplx_space_common_core::sql;
+    use pplx_space_sql_locator::sql;
 
     sqlx::query(sql!(
         "INSERT INTO sandboxes (id, user_id, org_id, lifecycle, network_policy_override_json,

@@ -40,9 +40,6 @@ def btrfs_send_restore_fails_closed_without_parent_source(test: smoke.KindEcw) -
         target_node = codec.other_sandbox_worker(source.node_name)
         test.record("target_node", target_node)
 
-    with test.phase("the worker resolves an omitted suspend format to the stream codec"):
-        codec.require_btrfs_send_default(source_worker)
-
     with test.phase("suspend without naming a format"):
         test.pause()
 

@@ -50,6 +50,11 @@ impl NodeManagerService {
     /// Disconnect requests cancellation, not abandonment. The task cooperatively
     /// stops before its next phase. Cleanup waits for the same target; a retry
     /// rejects contention without parking with global capacity held.
+    ///
+    /// Shutdown does not cancel admitted work: the drain lets it finish and
+    /// cancels it only once the drain budget runs out
+    /// ([`Self::cancel_admitted_artifact_work`]). Work that finished returns
+    /// its result even when cancellation arrives after its last phase.
     pub(super) async fn run_artifact_mutation<T, F, Fut>(
         &self,
         sandbox_id: &str,
@@ -61,7 +66,7 @@ impl NodeManagerService {
         Fut: std::future::Future<Output = Result<T, Status>> + Send + 'static,
     {
         super::validation::validate_sandbox_id(sandbox_id)?;
-        let cancel = self.pool.shutdown_token.child_token();
+        let cancel = self.artifact_work_cancel.child_token();
         let _cancel_on_disconnect = cancel.clone().drop_guard();
         let permit = self
             .lifecycle_limiter
@@ -71,7 +76,12 @@ impl NodeManagerService {
             .sandbox_artifact_lock(sandbox_id)
             .await?
             .try_lock_owned()
-            .map_err(|_| Status::unavailable("sandbox artifact work is in progress; retry"))?;
+            .map_err(|_| {
+                Status::unavailable(format!(
+                    "sandbox artifact work {}",
+                    pplx_space_rpc_contracts::artifact_backup_signals::NODE_MANAGER_SANDBOX_BUSY_MARKER
+                ))
+            })?;
         let claim = self.claim_sandbox_mutation(sandbox_id)?;
         let owner = Arc::new(ArtifactWork {
             cancel,
@@ -84,9 +94,8 @@ impl NodeManagerService {
         service.artifact_work = Some(owner.clone());
         self.device_op_tasks
             .spawn(async move {
-                let result = work(service).await;
-                owner.check()?;
-                result
+                let _owner = owner;
+                work(service).await
             })
             .await
             .map_err(|error| Status::internal(format!("artifact task failed: {error}")))?

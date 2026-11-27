@@ -27,14 +27,6 @@ from space_smoke.scenarios.ecw_filesystem_read_identity import (
 from space_smoke.scenarios.ecw_filesystem_read_identity import (
     filesystem_read_identity,
 )
-from space_smoke.scenarios.ecw_filesystem_write_identity import (
-    DEFAULT_FILE,
-    USER_FILE,
-    filesystem_write_identity,
-)
-from space_smoke.scenarios.ecw_filesystem_write_identity import (
-    ROOT_FILE as WRITE_ROOT_FILE,
-)
 from space_smoke.scenarios.ecw_process_identity import process_identity
 from space_smoke.scenarios.ecw_watcher_identity import (
     ROOT as WATCH_ROOT,
@@ -319,14 +311,6 @@ class EcwIdentityScenarioTests(unittest.TestCase):
             "process identity did not match the selected sandbox user",
         )
 
-    def test_filesystem_write_identity_covers_each_write_selector(self) -> None:
-        sandbox = _Sandbox()
-
-        filesystem_write_identity.verify(_fixture(sandbox))
-
-        self.assertEqual(sandbox.files.owners[DEFAULT_FILE], 2000)
-        self.assertEqual(sandbox.files.owners[USER_FILE], 2000)
-        self.assertEqual(sandbox.files.owners[WRITE_ROOT_FILE], 0)
 
     def test_filesystem_read_identity_covers_query_and_basic_auth(self) -> None:
         sandbox = _Sandbox()

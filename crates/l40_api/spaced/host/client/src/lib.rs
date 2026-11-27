@@ -7,10 +7,11 @@
 //! Dropping a process response stream does not terminate the guest process.
 
 use futures_util::StreamExt;
-use pplx_space_common_core::types::{
-    GuestPath, GuestUserName, IdempotencyKey, Pii, ProcessCommand, ProcessId, ProcessSignal,
+use pplx_space_guest_process::{
+    GuestPath, GuestUserName, IdempotencyKey, ProcessCommand, ProcessId, ProcessSignal,
     ReadyTimeout, RelativeGlobPattern, WatchRoot,
 };
+use pplx_space_pii::Pii;
 use prost::Message as _;
 use proto::{
     ConfigureProcessEnvRequest, ConnectProcessRequest, CreateWatcherRequest,
@@ -26,14 +27,14 @@ use tonic::Response;
 mod config;
 
 pub mod operations {
-    pub use pplx_space_spaced_common::proto::operations::*;
+    pub use pplx_space_spaced_guest_protocol::proto::operations::*;
 }
 
-pub use pplx_space_spaced_common::proto::host as proto;
+pub use pplx_space_spaced_protocol::proto::host as proto;
 
 pub use config::SpacedHostClientConfig;
-pub use pplx_space_spaced_common::ConnectError;
-use pplx_space_spaced_common::{
+pub use pplx_space_spaced_client::ConnectError;
+use pplx_space_spaced_guest_protocol::{
     invalid_argument_status, parse_env, proto_duration, proto_env, proto_globs,
     proto_idempotency_key,
 };
@@ -48,13 +49,23 @@ pub type RawSpacedHostNetworkingClient =
 pub type RawSpacedHostGuestUpdateClient =
     proto::guest_update_client::GuestUpdateClient<tonic::transport::Channel>;
 
-pub use pplx_space_spaced_common::{
+pub use pplx_space_spaced_client::{
     DEFAULT_COMMAND_RETRY_POLICY, DEFAULT_CONNECT_RETRY_POLICY, RetryPolicy,
 };
 
+/// The spaced-host socket: under [`SPACED_HOST_SOCKET_DIR`] on Linux, and in
+/// the temporary directory on other hosts, which have no node layout.
+///
+/// [`SPACED_HOST_SOCKET_DIR`]: pplx_space_host_layout::paths::SPACED_HOST_SOCKET_DIR
 pub fn default_host_uds_path() -> std::path::PathBuf {
-    pplx_space_common_core::host::linux::paths::default_host_uds_path(
-        pplx_space_common_core::host::linux::paths::SPACED_HOST_SOCKET_FILE,
+    let socket_dir = if cfg!(target_os = "linux") {
+        std::path::PathBuf::from(pplx_space_host_layout::paths::SPACED_HOST_SOCKET_DIR)
+    } else {
+        std::env::temp_dir()
+    };
+    pplx_space_host_layout::paths::host_uds_path(
+        socket_dir,
+        pplx_space_host_layout::paths::SPACED_HOST_SOCKET_FILE,
     )
 }
 
@@ -72,7 +83,7 @@ pub struct SpacedHostClient {
 pub struct StartProcessOptions {
     pub command: ProcessCommand,
     pub cwd: Option<GuestPath>,
-    pub env: pplx_space_common_core::types::EnvMap,
+    pub env: pplx_space_guest_process::EnvMap,
     pub user: Option<GuestUserName>,
     pub timeout: Option<std::time::Duration>,
     pub background: bool,
@@ -130,7 +141,7 @@ macro_rules! client_call {
             F: FnMut($client) -> Fut,
             Fut: std::future::Future<Output = Result<Response<T>, tonic::Status>>,
         {
-            pplx_space_spaced_common::retry_status(
+            pplx_space_spaced_client::retry_status(
                 "spaced host",
                 command,
                 if $replay {
@@ -178,7 +189,7 @@ impl SpacedHostClient {
     );
 
     pub async fn new_with_config(config: SpacedHostClientConfig) -> Result<Self, ConnectError> {
-        let channel = pplx_space_spaced_common::connect_uds_channel_with_retry(
+        let channel = pplx_space_spaced_client::connect_uds_channel_with_retry(
             "spaced host service",
             &config.socket_path,
             config.connect_retry_policy,
@@ -192,9 +203,9 @@ impl SpacedHostClient {
     /// callers must construct a new client after re-attesting the endpoint.
     pub async fn new_with_config_and_expected_peer(
         config: SpacedHostClientConfig,
-        expected_peer: pplx_space_spaced_common::ExpectedUdsPeer,
+        expected_peer: pplx_space_spaced_client::ExpectedUdsPeer,
     ) -> Result<Self, ConnectError> {
-        let channel = pplx_space_spaced_common::connect_uds_channel_with_expected_peer_and_retry(
+        let channel = pplx_space_spaced_client::connect_uds_channel_with_expected_peer_and_retry(
             "spaced host service",
             &config.socket_path,
             expected_peer,

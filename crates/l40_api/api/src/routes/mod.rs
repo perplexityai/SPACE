@@ -50,6 +50,9 @@ pub struct AppState {
     /// fresh replica does not receive traffic with a cold cache.
     pub readiness: crate::controllers::substrate::ReflectorReady,
     pub drain_signal: pplx_space_service_lifecycle::DrainSignal,
+    /// The API's task tracker: graceful shutdown waits for request work
+    /// spawned on it to finish, after its request is gone.
+    pub task_tracker: TaskTracker,
     /// Claimed operations this process executes itself instead of leaving
     /// them to the dispatcher. See [`crate::inline_operations`].
     pub inline_operations: crate::inline_operations::InlineOperations,
@@ -72,6 +75,22 @@ pub struct AppState {
     /// [`public::hidden_operations`].
     pub native_hidden_operations: public::hidden_operations::HiddenOperationsGate,
     pub ecw_credential_keyring: std::sync::Arc<pplx_space_ecw_credential::EcwCredentialKeyring>,
+    /// Campaign kinds the admin API starts runtime upgrade campaigns for:
+    /// those a cluster-controller driver moves. See
+    /// [`admin::RUNTIME_UPGRADE_DRIVEN_KINDS`].
+    pub runtime_upgrade_driven_kinds:
+        &'static [pplx_space_runtime_upgrade_campaign_store::CampaignKind],
+    /// Whether `:drain` may start a v2 drain (`SPACE_DRAIN_V2_ENABLED`, read
+    /// once at startup).
+    pub drain_v2_enabled: bool,
+    /// How many nodes v2 drains may evacuate at once, which `:drain` counts
+    /// when it starts one (`SPACE_DRAIN_V2_MAX_EVACUATING_NODES`, read once
+    /// at startup).
+    pub drain_v2_max_evacuating: usize,
+    /// The node call the admin API makes of a v2 node: the `PreviewDrainNode`
+    /// call `GET /nodes/{node_id}/drain-v2-preview` and `:drain`'s up-front
+    /// stopped-sandbox check make.
+    pub v2_drain_probe: std::sync::Arc<dyn admin::nodes::V2DrainProbe>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -98,6 +117,8 @@ pub enum AppStateError {
     CommandStream(#[from] crate::command_stream::CommandStreamConfigError),
     #[error(transparent)]
     NativeHiddenOperations(#[from] public::hidden_operations::HiddenOperationsConfigError),
+    #[error("{0}")]
+    DrainV2MaxEvacuatingNodes(String),
 }
 
 impl AppState {
@@ -253,6 +274,15 @@ impl AppState {
         let ecw_credential_keyring =
             std::sync::Arc::new(pplx_space_ecw_credential::EcwCredentialKeyring::load_from_env()?);
 
+        let drain_v2_enabled =
+            pplx_space_env_vars::env_flag_var(admin::nodes::DRAIN_V2_ENABLED_ENV, false);
+        let drain_v2_max_evacuating = admin::nodes::drain_v2_max_evacuating_nodes(
+            drain_v2_enabled,
+            std::env::var(admin::nodes::DRAIN_V2_MAX_EVACUATING_NODES_ENV)
+                .ok()
+                .as_deref(),
+        )
+        .map_err(AppStateError::DrainV2MaxEvacuatingNodes)?;
         Ok(Self {
             pool,
             credentials_pool,
@@ -263,6 +293,7 @@ impl AppState {
             native_sandbox_limits,
             readiness,
             drain_signal,
+            task_tracker,
             inline_operations,
             inline_lifecycle,
             template_build_state,
@@ -273,6 +304,10 @@ impl AppState {
             feature_flags,
             native_hidden_operations,
             ecw_credential_keyring,
+            runtime_upgrade_driven_kinds: admin::RUNTIME_UPGRADE_DRIVEN_KINDS,
+            drain_v2_enabled,
+            drain_v2_max_evacuating,
+            v2_drain_probe: std::sync::Arc::new(admin::nodes::NodeApiV2DrainProbe),
         })
     }
 

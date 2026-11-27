@@ -58,18 +58,21 @@ pub enum ManifestError {
     Checksums { store: String, version: i64 },
 }
 
+/// Whether `store` can name a migration store: its `db/` directory, such as
+/// `sandbox-manager`, or `common` for the shared catalog.
+fn valid_store_name(store: &str) -> bool {
+    !store.is_empty()
+        && store
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+}
+
 impl AcceptedChecksums {
     pub fn from_toml(source: &str) -> Result<Self, ManifestError> {
         let registry: Self = toml::from_str(source)?;
         let mut identities = BTreeSet::new();
         for entry in &registry.migrations {
-            if entry.version <= 0
-                || entry.store.is_empty()
-                || !entry
-                    .store
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
-            {
+            if entry.version <= 0 || !valid_store_name(&entry.store) {
                 return Err(ManifestError::Identity {
                     store: entry.store.clone(),
                     version: entry.version,

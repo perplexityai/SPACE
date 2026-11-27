@@ -1,10 +1,12 @@
 use std::collections::VecDeque;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures_util::stream::iter;
 use pplx_space_build_mgr_client::proto::{
     BuildOptions, ClientContext, Recipe as ProtoRecipe, UploadBlobChunk, UploadBlobPhase, recipe,
 };
+use rusqlite::params;
 use tonic::Code;
 
 use super::*;
@@ -45,9 +47,8 @@ impl BuildManagerDaemonService {
         max_concurrent_builds: usize,
         backend: Arc<dyn BuildBackend>,
     ) -> Result<Self, NewServiceError> {
-        let conn = open_in_memory_db().map_err(NewServiceError::OpenDb)?;
         Ok(Self::from_backend(
-            Arc::new(Mutex::new(conn)),
+            SharedConnection::new(open_in_memory_db()),
             max_concurrent_builds,
             backend,
             blob::BlobStore::local(),
@@ -59,10 +60,10 @@ impl BuildManagerDaemonService {
         max_concurrent_builds: usize,
         backend: Arc<dyn BuildBackend>,
     ) -> Result<Self, NewServiceError> {
-        let mut conn = open_db(db_path).map_err(NewServiceError::OpenDb)?;
-        initialize_schema(&mut conn);
+        let conn = database::open(Path::new(db_path)).map_err(NewServiceError::OpenDb)?;
+        initialize_schema(conn.raw());
         Ok(Self::from_backend(
-            Arc::new(Mutex::new(conn)),
+            SharedConnection::new(conn),
             max_concurrent_builds,
             backend,
             blob::BlobStore::local(),
@@ -70,13 +71,13 @@ impl BuildManagerDaemonService {
     }
 }
 
-fn open_in_memory_db() -> rusqlite::Result<Connection> {
-    let mut conn = Connection::open_in_memory()?;
-    initialize_schema(&mut conn);
-    Ok(conn)
+fn open_in_memory_db() -> database::Connection {
+    let conn = database::Connection::open_in_memory();
+    initialize_schema(conn.raw());
+    conn
 }
 
-pub(super) fn initialize_schema(conn: &mut Connection) {
+pub(super) fn initialize_schema(conn: &rusqlite::Connection) {
     if conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'jobs')",
@@ -102,12 +103,12 @@ pub(super) fn initialize_schema(conn: &mut Connection) {
 struct MockBuildBackend {
     build_results: Mutex<VecDeque<Result<BuildOutcome, BuildError>>>,
     build_calls: Mutex<Vec<String>>,
-    environment_calls: Mutex<Vec<Option<pplx_space_common_core::types::EnvironmentReference>>>,
+    environment_calls: Mutex<Vec<Option<pplx_space_execution_spec::EnvironmentReference>>>,
     cluster_template_results: Mutex<VecDeque<Result<(), PublishError>>>,
     cluster_template_calls: Mutex<Vec<(String, TemplatePublication)>>,
     publish_results: Mutex<VecDeque<Result<(), PublishError>>>,
     publish_calls: Mutex<Vec<PublishCall>>,
-    publish_environments: Mutex<Vec<Option<pplx_space_common_core::types::EnvironmentReference>>>,
+    publish_environments: Mutex<Vec<Option<pplx_space_execution_spec::EnvironmentReference>>>,
     prune_calls: Mutex<Vec<(String, String)>>,
 }
 
@@ -189,9 +190,9 @@ impl BuildBackend for MockBuildBackend {
         _recipe_label: &str,
         _recipe: pplx_space_build_mgr::PreparedRecipe,
         template_id: &str,
-        _job_id: &pplx_space_common_jobs::JobId,
+        _job_id: &JobId,
         template_org: Option<TemplateOrg>,
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     ) -> Result<BuildOutcome, BuildError> {
         assert!(
             self.cluster_template_calls
@@ -221,7 +222,7 @@ impl BuildBackend for MockBuildBackend {
         &self,
         template_id: &str,
         content_hash: &str,
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        environment: Option<pplx_space_execution_spec::EnvironmentReference>,
         publish_tags: &[String],
         publication: TemplatePublication,
     ) -> Result<(), PublishError> {
@@ -257,9 +258,9 @@ impl BuildBackend for BlockingBuildBackend {
         _recipe_label: &str,
         _recipe: pplx_space_build_mgr::PreparedRecipe,
         _template_id: &str,
-        _job_id: &pplx_space_common_jobs::JobId,
+        _job_id: &JobId,
         _template_org: Option<TemplateOrg>,
-        _environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        _environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     ) -> Result<BuildOutcome, BuildError> {
         self.started.fetch_add(1, Ordering::SeqCst);
         while !self.released.load(Ordering::SeqCst) {
@@ -278,7 +279,7 @@ impl BuildBackend for BlockingBuildBackend {
         &self,
         _template_id: &str,
         _content_hash: &str,
-        _environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        _environment: Option<pplx_space_execution_spec::EnvironmentReference>,
         _publish_tags: &[String],
         _publication: TemplatePublication,
     ) -> Result<(), PublishError> {
@@ -314,7 +315,7 @@ async fn stalled_empty_data_marker_does_not_start_blob_upload() -> TestResult {
     let tempdir = tempfile::tempdir()?;
     let blob_dir = tempdir.path().join("blobs");
     let service = BuildManagerDaemonService::from_backend(
-        Arc::new(Mutex::new(open_in_memory_db()?)),
+        SharedConnection::new(open_in_memory_db()),
         1,
         Arc::new(MockBuildBackend::default()),
         blob::BlobStore::local_in(blob_dir.clone()),
@@ -351,7 +352,7 @@ async fn interrupted_explicit_blob_upload_is_not_published() -> TestResult {
     let tempdir = tempfile::tempdir()?;
     let blob_dir = tempdir.path().join("blobs");
     let service = BuildManagerDaemonService::from_backend(
-        Arc::new(Mutex::new(open_in_memory_db()?)),
+        SharedConnection::new(open_in_memory_db()),
         1,
         Arc::new(MockBuildBackend::default()),
         blob::BlobStore::local_in(blob_dir.clone()),
@@ -373,7 +374,7 @@ async fn committed_blob_upload_is_published() -> TestResult {
     let tempdir = tempfile::tempdir()?;
     let blob_dir = tempdir.path().join("blobs");
     let service = BuildManagerDaemonService::from_backend(
-        Arc::new(Mutex::new(open_in_memory_db()?)),
+        SharedConnection::new(open_in_memory_db()),
         1,
         Arc::new(MockBuildBackend::default()),
         blob::BlobStore::local_in(blob_dir.clone()),
@@ -403,7 +404,7 @@ async fn unspecified_blob_upload_phase_is_rejected() -> TestResult {
     let tempdir = tempfile::tempdir()?;
     let blob_dir = tempdir.path().join("blobs");
     let service = BuildManagerDaemonService::from_backend(
-        Arc::new(Mutex::new(open_in_memory_db()?)),
+        SharedConnection::new(open_in_memory_db()),
         1,
         Arc::new(MockBuildBackend::default()),
         blob::BlobStore::local_in(blob_dir.clone()),
@@ -548,10 +549,10 @@ async fn prune_skipped_while_sibling_same_template_job_active() -> TestResult {
     // for a build that finishes with no siblings in flight.
     {
         let conn = service.db.lock().expect("test db lock");
-        conn.execute(
+        conn.raw().execute(
             "INSERT INTO jobs (job_id, kind, payload, subject_id, status)
              VALUES ('sibling-job', ?1, '{}', 'seed', 'pending')",
-            params![jobs::BUILD_JOB_KIND],
+            params![BUILD_JOB_KIND],
         )?;
     }
 
@@ -667,8 +668,8 @@ async fn build_publish_carries_publication_authority() -> TestResult {
 /// environment to `publish` unchanged.
 #[tokio::test(flavor = "current_thread")]
 async fn publish_receives_the_registered_build_s_environment() -> TestResult {
-    let environment = pplx_space_common_core::types::EnvironmentReference::new(
-        pplx_space_common_core::types::Digest::sha256([2; 32]),
+    let environment = pplx_space_execution_spec::EnvironmentReference::new(
+        pplx_space_content_digest::Digest::sha256([2; 32]),
     );
     let backend = MockBuildBackend::with_build_result(Ok(BuildOutcome {
         content_hash: Some(
@@ -987,18 +988,18 @@ async fn expired_running_job_lease_is_marked_failed() -> TestResult {
         environment: None,
     }));
     let service = BuildManagerDaemonService::with_backend(1, backend)?;
-    let job_id = pplx_space_common_jobs::JobId::new();
+    let job_id = JobId::new();
     let payload = serde_json::to_string(&build_job_payload("seed"))?;
     {
         let conn = service.db.lock().unwrap();
-        conn.execute(
+        conn.raw().execute(
             "INSERT INTO jobs (
                 job_id, kind, status, payload, subject_id, dedup_key,
                 max_attempts, lease_owner, lease_expires_at
              )
              VALUES (?1, ?2, 'running', ?3, ?4, ?4, 1, 'dead-worker',
                      datetime('now', '-1 second'))",
-            params![job_id, jobs::BUILD_JOB_KIND, payload, "seed"],
+            params![job_id, BUILD_JOB_KIND, payload, "seed"],
         )?;
     }
 
@@ -1232,7 +1233,7 @@ async fn stale_lease_owner_cannot_write_build_result() -> TestResult {
     backend.wait_started().await;
     {
         let conn = service.db.lock().unwrap();
-        conn.execute(
+        conn.raw().execute(
             "UPDATE jobs SET lease_owner = 'other-worker' WHERE job_id = ?1",
             params![response.job_id],
         )?;
@@ -1242,7 +1243,7 @@ async fn stale_lease_owner_cannot_write_build_result() -> TestResult {
     tokio::time::sleep(Duration::from_millis(100)).await;
     {
         let conn = service.db.lock().unwrap();
-        let result_count: i64 = conn.query_row(
+        let result_count: i64 = conn.raw().query_row(
             "SELECT COUNT(*) FROM build_job_results WHERE job_id = ?1",
             params![response.job_id],
             |row| row.get(0),

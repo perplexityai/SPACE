@@ -7,8 +7,9 @@
 //! caller owns everything around it: the transaction and the reconcile
 //! enqueue that has to commit with the write.
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_postgres_pool::{DbError, Executor};
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sql_locator::sql;
 use sqlx::types::JsonValue;
 
 /// **Intent.** Replace the sandbox's network policy override
@@ -22,12 +23,12 @@ use sqlx::types::JsonValue;
 /// The generation check is the only guard: there is no lifecycle predicate,
 /// so the override is recorded on a row in any lifecycle.
 pub async fn set_network_policy_override(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     policy_override_json: Option<JsonValue>,
     expected_generation: Option<i64>,
-) -> Result<Option<i64>, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>(sql!(
+) -> Result<Option<i64>, DbError> {
+    Ok(sqlx::query_scalar::<_, i64>(sql!(
         "UPDATE sandboxes
              SET network_policy_override_json = $1,
                  network_policy_generation =
@@ -43,8 +44,8 @@ pub async fn set_network_policy_override(
     .bind(policy_override_json)
     .bind(sandbox_id)
     .bind(expected_generation)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// **Intent.** Record whether the owner wants snapshots taken for the
@@ -53,10 +54,10 @@ pub async fn set_network_policy_override(
 /// No guard beyond the id, and the row count is not reported: a missing row
 /// writes nothing and is not an error, as before the move.
 pub async fn set_snapshots_enabled_desired(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     enabled: bool,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE sandboxes
              SET snapshots_enabled_desired = $1
@@ -64,7 +65,7 @@ pub async fn set_snapshots_enabled_desired(
     ))
     .bind(enabled)
     .bind(sandbox_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }

@@ -9,7 +9,7 @@
 //! The scanner takes the image in chunks, so it rides along with a pass that
 //! is already hashing the file.
 
-use pplx_space_common_core::types::ArtifactVersion;
+use pplx_space_execution_spec::ArtifactVersion;
 
 const BANNER_PREFIX: &[u8] = b"Linux version ";
 /// What follows the release in the banner.

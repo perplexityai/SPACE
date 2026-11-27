@@ -3,7 +3,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::Stream;
-use pplx_space_common_core::types::{GuestPath, RelativeGlobPattern, WatchRoot as GuestWatchRoot};
+use pplx_space_guest_process::{GuestPath, RelativeGlobPattern, WatchRoot as GuestWatchRoot};
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
     FileEvent, FileEventKind, GetModifiedFilesRequest, GetModifiedFilesResponse,
 };

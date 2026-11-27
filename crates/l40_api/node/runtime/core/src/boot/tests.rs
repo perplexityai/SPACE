@@ -1,6 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::ExecutionMetadata;
-use pplx_space_common_core::types::{BalloonDevice, TokenBucket};
+use pplx_space_execution_spec::{BalloonDevice, ExecutionMetadata, TokenBucket};
 use serde_json::{Value, json};
 
 pub(crate) fn input() -> GuestBoot<'static> {
@@ -139,7 +138,8 @@ fn firecracker_retains_balloon_network_and_console_configuration() {
         let args = config["boot-source"]["boot_args"].as_str().unwrap();
         assert!(args.contains("8250.nr_uarts=1 console=ttyS0"));
         assert!(args.contains("clocksource=kvm-clock"));
-        assert!(args.contains(pplx_space_common_core::types::TEMPLATE_RUNTIME_BUILD_MASK));
+        assert!(args.contains("pci=off i8042.noaux i8042.nomux i8042.dumbkbd"));
+        assert!(args.contains(pplx_space_template_runtime::TEMPLATE_RUNTIME_BUILD_MASK));
         assert_eq!(config["machine-config"]["huge_pages"], "2M");
         assert_eq!(
             config["balloon"]["free_page_hinting"],
@@ -158,6 +158,17 @@ fn firecracker_retains_balloon_network_and_console_configuration() {
             config["drives"][0]["rate_limiter"]
         );
     }
+}
+
+#[test]
+fn firecracker_adds_i8042_boot_args_only_on_x86_64() {
+    let mut boot = input();
+    boot.guest.architecture = Arch::Aarch64;
+    let config: Value =
+        serde_json::from_str(&configuration(RuntimeKind::Firecracker, &boot).unwrap()).unwrap();
+    let args = config["boot-source"]["boot_args"].as_str().unwrap();
+    assert!(args.contains("pci=off"));
+    assert!(!args.contains("i8042"));
 }
 
 #[test]
@@ -243,12 +254,12 @@ fn persisted_ch_state_rebinds_host_resources_but_preserves_guest_identity() {
             source_kind,
         )
         .unwrap();
-        let rate = pplx_space_common_core::types::RateLimiter {
-            bandwidth: pplx_space_common_core::types::TokenBucket {
+        let rate = pplx_space_execution_spec::RateLimiter {
+            bandwidth: pplx_space_execution_spec::TokenBucket {
                 size: 123456,
                 refill_time_ms: 1000,
             },
-            operations: pplx_space_common_core::types::TokenBucket {
+            operations: pplx_space_execution_spec::TokenBucket {
                 size: 123,
                 refill_time_ms: 1000,
             },
@@ -365,7 +376,7 @@ fn firmware_boot_keeps_linux_inputs_out_of_the_device_model() {
 
 #[test]
 fn image_policy_is_qualified_by_boot_contract() {
-    use pplx_space_common_core::types::guest_image::{
+    use pplx_space_execution_spec::guest_image::{
         GuestAgent, GuestDiskLayout, GuestImageContract, GuestNetwork, GuestReadiness,
     };
     let catalog =
@@ -410,7 +421,7 @@ fn image_policy_is_qualified_by_boot_contract() {
 
 #[test]
 fn historical_arm_firecracker_resolves_without_qualifying_unknown_bindings() {
-    use pplx_space_common_core::types::{ArtifactComponentKind, ArtifactComponentMetadata};
+    use pplx_space_execution_spec::{ArtifactComponentKind, ArtifactComponentMetadata};
     let kernel = ArtifactComponentMetadata {
         kind: ArtifactComponentKind::Kernel,
         role: None,

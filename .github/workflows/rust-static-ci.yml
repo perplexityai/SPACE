@@ -48,21 +48,6 @@ jobs:
             cargo_registry: restore
             timeout: 45
             archcheck: true
-          # Lints libraries one at a time (ci/scripts/lib/rust-isolated-crates.sh)
-          # in a job of its own, so it lengthens neither clippy nor the tests.
-          # Its compiler cache is a family of its own: its crates build with
-          # other feature sets than the workspace pass, and two jobs saving one
-          # family would replace and trim each other's snapshots.
-          - name: Rust isolated crates
-            scope: rust
-            command: bash ci/scripts/run-rust-checks.sh isolated-crates
-            runner: ubuntu-24.04-16core
-            rust_cache: true
-            rust_cache_key: isolated-crates
-            rust_cache_size: 2G
-            rust_cache_refresh_misses: 20
-            cargo_registry: restore
-            timeout: 45
 
     steps:
       - name: Check out SPACE
@@ -180,7 +165,8 @@ jobs:
           SPACE_CI_SCCACHE_DIR: ${{ runner.temp }}/space-sccache
           SPACE_CI_SCCACHE_RUN_DIR: ${{ runner.temp }}/space-sccache-run
           SPACE_CI_SCCACHE_SIZE: ${{ matrix.rust_cache_size }}
-          # The lint jobs check alone only the crates this change can affect.
+          # Clippy runs the sbx-mgr production checks only when this change
+          # can affect their crates (ci/scripts/lib/rust-affected-crates.sh).
           SPACE_RUST_LINT_BASE: ${{ steps.scope.outputs.base }}
           # Unset, run-rust-checks.sh uses its default; 1 turns the parallel
           # front end off.

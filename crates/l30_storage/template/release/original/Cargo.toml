@@ -1,0 +1,23 @@
+[package]
+name = "pplx-space-template-release-original"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[package.metadata.space.state]
+postgres = []
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+pplx-space-db-test-fixtures = { workspace = true }
+pplx-space-sql-locator = { workspace = true }
+pplx-space-template-release-store = { workspace = true, features = ["test-support"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "process"] }
+uuid = { workspace = true }

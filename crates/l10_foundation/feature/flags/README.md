@@ -137,9 +137,9 @@ can match on beyond the subject.
 
 | Flag key | Type | Subject | Attributes | Declared fallback |
 | -- | -- | -- | -- | -- |
-| `space-cluster-rate-limiter` | boolean | constant `space-cluster` | none | on |
-| `space-api-client-concurrency-limiter` | boolean | constant `space-cluster` | none | on |
-| `space-api-client-concurrency-quotas` | JSON object | constant `space-cluster` | none | env-configured caps |
+| `space-cluster-rate-limiter` | boolean | constant `space-cluster` | `cluster_id` | on |
+| `space-api-client-concurrency-limiter` | boolean | constant `space-cluster` | `cluster_id` | on |
+| `space-api-client-concurrency-quotas` | JSON object | constant `space-cluster` | `cluster_id` | env-configured caps |
 | `space-api-timeout-lock-bypass` | boolean | canonical sandbox UUID string | none | off |
 | `space-net-gateway-known-egress-domains` | JSON object | sandbox id | none | the deployment's local list |
 | `space-cluster-api-client-side-balancing` | boolean | `sandbox:`/`session:`/`org:` prefixed id | `cluster_id` | off |
@@ -158,6 +158,28 @@ operation run it, under an env master that is off by default, so it falls back
 to whatever their deployment configured locally rather than to a value chosen
 here, because an override that resolves nothing should leave local
 configuration standing — see `policy::override_allowed`.
+
+The three limiter flags (`space-cluster-rate-limiter`,
+`space-api-client-concurrency-limiter` and
+`space-api-client-concurrency-quotas`) keep the constant subject and carry the
+process's `SPACE_CLUSTER_ID` as the `cluster_id` attribute, the same value the
+limiters' decision metrics are tagged with. When several clusters read one
+flag environment, a rule on `cluster_id` can switch off or retune one of them
+while the rest fall through to the default. A definition with no such rule
+resolves as it did before the attribute existed.
+
+A process sends no attribute when it has no valid `SPACE_CLUSTER_ID`, or when
+it runs a version that predates the attribute, as old replicas do during a
+rollout and every replica does after a rollback. In Eppo, every condition on a
+missing attribute fails except `IS_NULL` set to true, so that process resolves
+as if the rule weren't there. In flagd, JSONLogic reads a missing `cluster_id`
+as null, so a negated rule (`!=`, or `!` around `in`) does match it. Match the
+clusters you mean positively, with `==` or `in` against an array: `in` against
+a string is a substring test, so `cluster-1` is in `"cluster-10,cluster-11"`.
+`space-api` evaluates all three flags, and the cluster controller evaluates
+`space-cluster-rate-limiter` and `space-api-client-concurrency-quotas` for its
+own admission, so a positive `cluster_id` rule takes full effect once both run
+a version that sends the attribute.
 
 `space-api-timeout-lock-bypass` lets a timeout update that leaves the policy
 unchanged skip the sandbox row lock when one unlocked read settles runtime
@@ -206,7 +228,8 @@ rather than an accident:
 
 - **A constant** (`space-cluster`) is a cluster-wide switch. Every
   caller hashes identically, so a fractional rule on one of these is all-or-
-  nothing — use variants, not percentages.
+  nothing — use variants, not percentages. Where the flag carries a
+  `cluster_id` attribute, match on it to set one cluster apart.
 - **A sandbox id** gives a deterministic percentage rollout: the same sandbox
   lands in the same bucket every time, so a ramp never re-rolls a sandbox it
   already admitted.

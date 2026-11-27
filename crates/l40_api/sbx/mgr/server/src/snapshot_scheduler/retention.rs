@@ -6,16 +6,17 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::metrics::snapshot::SchedulerCaptureSkip;
-use pplx_space_common_core::types::{LocalArtifactId, SandboxId};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
     emit_sandbox_event,
 };
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::LocalArtifactId;
 use tokio::sync::Mutex;
 
 use super::{CheckpointContext, SandboxSnapshotState};
-use pplx_space_common_core::types::ArtifactKind;
 use pplx_space_node_mgr_client::NodeManagerGrpcClient;
+use pplx_space_snapshot_model::ArtifactKind;
 
 use crate::local_artifacts::{CheckoutError, LocalArtifacts, NamedSnapshotDelete};
 
@@ -167,6 +168,10 @@ pub(super) fn retention_candidate(
 /// with the locks released as the flush always ran, so the delete time does
 /// not separate it from the capture. Its value is handed to `capture` and
 /// returned.
+///
+/// Under the capture's locks, the capture asks the activation seal first
+/// ([`super::admit_scheduled_producer`]): on a sealed node, a sandbox that no
+/// longer has a VM is refused, and the tick fails with nothing captured.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn prune_and_capture<T>(
     node_client: &mut NodeManagerGrpcClient,
@@ -213,6 +218,7 @@ pub(super) async fn prune_and_capture<T>(
         .auto_lifecycle
         .artifact_publication_locks(sandbox_id, ArtifactKind::Disk)
         .await;
+    let _producer = super::admit_scheduled_producer(ctx, "scheduled disk snapshot", sandbox_id)?;
     capture(node_client, &prepared).await?;
     Ok(prepared)
 }
@@ -468,7 +474,7 @@ async fn prune_scheduled_snapshots(
     {
         for snapshot in snapshots {
             if crate::local_artifacts::is_gc_staging_name(&snapshot.name) {
-                let staging = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir_in(
+                let staging = pplx_space_host_layout::paths::sandbox_snapshot_dir_in(
                     cache_root,
                     sandbox_id,
                     &snapshot.name,
@@ -488,7 +494,7 @@ async fn prune_scheduled_snapshots(
             // DeleteBtrfsSnapshot deletes this path. A catalogued one is
             // renamed to its GC staging sibling, which the caller deletes
             // with DeleteCacheArtifact once it releases its locks.
-            let delete_path = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir_in(
+            let delete_path = pplx_space_host_layout::paths::sandbox_snapshot_dir_in(
                 cache_root, sandbox_id, &name,
             );
             let request = pplx_space_node_mgr_client::proto::DeleteBtrfsSnapshotRequest {

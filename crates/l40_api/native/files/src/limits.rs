@@ -1,7 +1,7 @@
 //! The size limits of Native file requests. A server that answers them uses
 //! these, so a request accepted by one is accepted by every other.
 
-use pplx_space_common_core::spaced::{MAX_MESSAGE_BYTES, MAX_WRITE_BATCH_ENTRIES};
+use pplx_space_guest_process::{MAX_MESSAGE_BYTES, MAX_WRITE_BATCH_ENTRIES};
 
 pub const MAX_FILE_LIST_ENTRIES: usize = 10_000;
 pub const MAX_FILE_WRITE_BYTES: usize = 16 * 1024 * 1024;
@@ -39,7 +39,7 @@ const _: () = assert!(MAX_FILE_WRITE_BATCH_BYTES <= MAX_MESSAGE_BYTES - 512 * 10
 /// count toward `MAX_FILE_WRITE_BATCH_BYTES`, so heavier escaping only matters
 /// for paths far shorter than the limit.
 const FILE_WRITE_BATCH_ENTRY_JSON_OVERHEAD_BYTES: usize =
-    2 * pplx_space_common_core::types::MAX_GUEST_PATH_BYTES + 256;
+    2 * pplx_space_guest_process::MAX_GUEST_PATH_BYTES + 256;
 /// The request body limit for `files:write_batch`: the base64 of the batch
 /// cap plus 1/32 for `\/` escaping, per-entry JSON overhead for the maximum
 /// entry count, and 64 KiB for the remaining fields. Without it the

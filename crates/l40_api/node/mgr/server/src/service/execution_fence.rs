@@ -33,7 +33,7 @@ impl NodeManagerService {
                         .map_err(|error| Status::unavailable(format!("read {root}: {error}")))?;
                     let name = entry.file_name();
                     let Some(name) = name.to_str() else { continue };
-                    let id = name.strip_prefix("sbx-").unwrap_or(name);
+                    let id = name.trim_prefix("sbx-");
                     if id.parse::<SandboxId>().is_ok()
                         && !crate::cgroup::sandbox_is_quiescent(id).map_err(|error| {
                             Status::unavailable(format!("inspect {id}: {error}"))
@@ -56,7 +56,9 @@ impl NodeManagerService {
             let _claim = tokio::select! {
                 biased;
                 _ = self.pool.shutdown_token.cancelled() => {
-                    return Err(Status::unavailable("node-manager is shutting down"));
+                    return Err(Status::unavailable(
+                        pplx_space_node_mgr_client::SHUTTING_DOWN_MESSAGE,
+                    ));
                 }
                 claim = self.pool.claim_sandbox_mutation(&sandbox_id) => claim,
             };
@@ -106,7 +108,7 @@ impl NodeManagerService {
         use pplx_space_node_mgr_client::execution_fence::InstanceTarget;
         match target {
             InstanceTarget::RestoreScope(scope) => Ok(PathBuf::from(
-                pplx_space_common_core::host::linux::paths::sandbox_restore_staging_dir(
+                pplx_space_host_layout::paths::sandbox_restore_staging_dir(
                     sandbox_id,
                     &scope.to_string(),
                 ),

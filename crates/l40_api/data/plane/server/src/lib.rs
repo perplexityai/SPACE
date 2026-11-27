@@ -33,15 +33,17 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
+use pplx_space_accounts::{NodeId, OrgId};
 use pplx_space_bearer_token::{SpaceBearerToken, insert_space_bearer_token};
-use pplx_space_common_core::types::cluster::process_cluster_id;
-use pplx_space_common_core::types::{NodeId, OrgId, ProcessId, SandboxId, SimpleDuration};
+use pplx_space_cluster_id::process_cluster_id;
 use pplx_space_common_grpc::{
     GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
 };
+use pplx_space_durations::SimpleDuration;
 use pplx_space_feature_flags::{
     Attributes, FeatureFlagClient, SPACE_CLUSTER_API_CLIENT_SIDE_BALANCING_FLAG,
 };
+use pplx_space_guest_process::ProcessId;
 use pplx_space_http_server::{HttpServerMakeSpan, HttpSpanMetadata};
 use pplx_space_net_gateway_client::proto::{
     ServicePortIngressFrame, ServicePortIngressStart, service_port_ingress_frame,
@@ -53,10 +55,11 @@ use pplx_space_node_api_client::proto::{
     BindDataPlaneSessionProcessRequest, DataPlaneReconnectReason, DataPlaneRevocationState,
     DataPlaneRevocationStatus, GetDataPlaneOrgRevocationEpochRequest,
     GetDataPlaneSessionRevocationStateRequest, GetSandboxRuntimeAccessRequest,
-    RecordDataPlaneSessionReconnectRequest, ResolveDataPlaneSessionRouteRequest,
-    ResolveDataPlaneSessionRouteResponse, SandboxRuntimeAccess, SandboxRuntimeAccessDecision,
-    SandboxServiceRouteKey, SandboxServiceRouteKind, SandboxServiceRouteTransport,
-    UnstableResetSandboxServiceRouteRequest, worker_api_client::WorkerApiClient,
+    RecordDataPlaneSessionProcessExitedRequest, RecordDataPlaneSessionReconnectRequest,
+    ResolveDataPlaneSessionRouteRequest, ResolveDataPlaneSessionRouteResponse,
+    SandboxRuntimeAccess, SandboxRuntimeAccessDecision, SandboxServiceRouteKey,
+    SandboxServiceRouteKind, SandboxServiceRouteTransport, UnstableResetSandboxServiceRouteRequest,
+    worker_api_client::WorkerApiClient,
 };
 use pplx_space_public_api::{
     CreateFileWatchSessionRequest, CreateProcessRequest, CreateTerminalSessionRequest,
@@ -66,6 +69,7 @@ use pplx_space_public_api::{
     SessionTargetProtocol, StreamCloseReason, TerminalSize, process_id_for_session,
     routes::{self as native_routes, NativeHttpMethod},
 };
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::operations::{
     CloseLoopbackBridgeRequest, CloseStdinRequest, ConnectProcessRequest, ListProcessesRequest,
     PtyConfig, PtySize, ResizePtyRequest, SendInputRequest, SendSignalRequest, StartRequest,
@@ -87,6 +91,7 @@ use tonic::transport::{Channel, Endpoint};
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
+mod cluster_api_retry;
 mod drain;
 mod ecw_connect;
 mod ecw_files;
@@ -120,14 +125,15 @@ use drain::{
 };
 #[cfg(test)]
 use native::{
-    CdpProxyBase, HeaderTokenSource, MAX_LAST_EVENT_ID, StreamBridgeError, UpgradedProxyClose,
-    attached_json, attached_session_from_route_response, file_event_frame, file_event_kind,
-    file_watch_request, last_event_id, native_requested_transport, process_event_frames,
-    process_frame_advances_backend_cursor, process_start_request, proto_reconnect_reason,
-    proxy_path_and_query, proxy_streams, reconnect_reason_for_route_change,
+    CdpProxyBase, HeaderTokenSource, MAX_LAST_EVENT_ID, MalformedToken, StreamBridgeError,
+    UpgradedProxyClose, attached_json, attached_session_from_route_response, file_event_frame,
+    file_event_kind, file_watch_request, last_event_id, native_requested_transport,
+    process_event_frames, process_frame_advances_backend_cursor, process_start_request,
+    proto_reconnect_reason, proxy_path_and_query, proxy_streams, reconnect_reason_for_route_change,
     refresh_file_watch_attached_if_route_token_stale_with, reject_query_tokens,
     resume_resync_frame, rewrite_cdp_discovery_value, server_frame_event_name, server_frame_json,
     stream_bridge_error_label, strip_data_plane_auth_headers, token_from_headers,
+    token_from_headers_with_source,
 };
 use native::{
     RouteResolutionError, attach_session, data_plane_http_error, is_upgrade_request,
@@ -157,6 +163,17 @@ const REVOCATION_MAX_STALENESS: Duration = Duration::from_secs(60);
 /// How long one revocation check may wait on the cluster API, across all of
 /// its reads. A check that takes longer counts as unavailable.
 const REVOCATION_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+/// How often an attached process, terminal or file-watch WebSocket is pinged.
+/// The `/sessions/{session_id}/attach` description in the public OpenAPI
+/// document states it.
+const WEBSOCKET_PING_INTERVAL: Duration = Duration::from_secs(5);
+/// How long a stream waits to record its process's exit before it reports
+/// the exit anyway. Only the session's public state waits on the record, so a
+/// slow cluster API must not hold `process_exited` for its full RPC timeout.
+const PROCESS_EXIT_RECORD_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long an exit record the cluster API could not take for now waits
+/// before it is sent again; each later retry waits twice as long.
+const PROCESS_EXIT_RECORD_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// The longest revocation check interval the service accepts: a third of
 /// what is left of the staleness bound after one check timeout, 19 s at the
 /// defaults. A failed check keeps a verdict until it is that bound less one
@@ -289,7 +306,10 @@ struct DataPlaneState {
     revocation_check_interval: Duration,
     revocation_max_staleness: Duration,
     revocation_check_timeout: Duration,
+    process_exit_record_timeout: Duration,
+    process_exit_record_retry_delay: Duration,
     route_cache_ttl: Duration,
+    websocket_ping_interval: Duration,
     /// Cancelled on SIGTERM: a child of the caller's shutdown token. New
     /// streams are refused once it is cancelled, and sockets still
     /// authenticating are told to reconnect; streams already attached keep
@@ -490,7 +510,10 @@ pub async fn run(
             .max(Duration::from_millis(1)),
         revocation_max_staleness: REVOCATION_MAX_STALENESS,
         revocation_check_timeout: REVOCATION_CHECK_TIMEOUT,
+        process_exit_record_timeout: PROCESS_EXIT_RECORD_TIMEOUT,
+        process_exit_record_retry_delay: PROCESS_EXIT_RECORD_RETRY_DELAY,
         route_cache_ttl: config.route_cache_ttl.max(Duration::from_millis(1)),
+        websocket_ping_interval: WEBSOCKET_PING_INTERVAL,
         drain_started,
         stream_shutdown_token: stream_shutdown_token.clone(),
         upgrade_tasks: upgrade_tasks.clone(),
@@ -675,19 +698,22 @@ fn router(state: DataPlaneState) -> Router {
             on(
                 native_method_filter(native_routes::ATTACH_SESSION.method()),
                 attach_session,
-            ),
+            )
+            .fallback(native_method_not_allowed),
         )
         .route(
             native_routes::STREAM_SESSION_EVENTS.runtime_path(),
             on(
                 native_method_filter(native_routes::STREAM_SESSION_EVENTS.method()),
                 session_events,
-            ),
+            )
+            .fallback(native_method_not_allowed),
         )
         .route(
             native_routes::PROXY_SESSION.runtime_path(),
             any(proxy_session),
         )
+        .route(native_routes::PROXY_SESSION_ROOT_MOUNT, any(proxy_session))
         .route(
             native_routes::PROXY_SESSION_SUBPATH_MOUNT,
             any(proxy_session),
@@ -823,7 +849,42 @@ async fn record_request_latency(
     response
 }
 
-async fn unsupported_ecw_envd_endpoint() -> Response {
+/// A request that matches no data-plane route and names no ECW sandbox host
+/// is a Native client's, so it is answered in the Native data-plane envelope.
+/// One for an ECW sandbox host keeps the ECW error shape its SDK reads.
+fn native_route_not_found() -> Response {
+    data_plane_http_error(
+        StatusCode::NOT_FOUND,
+        DataPlaneHttpErrorCode::NotFound,
+        "route not found",
+        false,
+        ResponseOrigin::Client,
+        ResponseKind::Validation,
+    )
+}
+
+/// A Native route's answer to a method it does not serve. The method router
+/// adds the `Allow` header to it.
+async fn native_method_not_allowed() -> Response {
+    data_plane_http_error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        DataPlaneHttpErrorCode::InvalidRequest,
+        "this HTTP method is not supported for this route",
+        false,
+        ResponseOrigin::Client,
+        ResponseKind::Validation,
+    )
+}
+
+/// envd endpoints SPACE does not serve. They exist only on an ECW sandbox
+/// host; anywhere else the path is just not a data-plane route.
+async fn unsupported_ecw_envd_endpoint(
+    State(state): State<DataPlaneState>,
+    headers: HeaderMap,
+) -> Response {
+    if state.ecw_hosts.parse_sandbox_host(&headers).is_none() {
+        return native_route_not_found();
+    }
     EcwProxyError::new(
         StatusCode::NOT_IMPLEMENTED,
         "This E2B envd endpoint is not supported by SPACE ECW",
@@ -916,10 +977,9 @@ async fn ecw_service_proxy(
     State(state): State<DataPlaneState>,
     request: Request<Body>,
 ) -> Result<Response, EcwProxyError> {
-    let target = state
-        .ecw_hosts
-        .parse_sandbox_host(request.headers())
-        .ok_or_else(|| EcwProxyError::not_found("Endpoint"))?;
+    let Some(target) = state.ecw_hosts.parse_sandbox_host(request.headers()) else {
+        return Ok(native_route_not_found());
+    };
     validate_ecw_sandbox_headers(request.headers(), &target)?;
 
     if target.port == ECW_ENVD_PORT {
@@ -1231,7 +1291,7 @@ async fn open_service_port_ingress_io(
     // Enrichment must not change ingress admission or route-repair behavior.
     let trace_context = u16::try_from(port)
         .ok()
-        .and_then(|value| pplx_space_common_core::types::GuestPort::try_from_u16(value).ok())
+        .and_then(|value| pplx_space_network_roles::GuestPort::try_from_u16(value).ok())
         .map(|port| pplx_space_sandbox_grpc::SandboxTraceContext {
             sandbox_id: *sandbox_id,
             port,

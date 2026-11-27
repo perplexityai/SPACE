@@ -4,7 +4,8 @@
 //! exact machinery the Delete RPC drives so eviction cannot diverge from
 //! normal deletion semantics.
 
-use pplx_space_common_core::types::{LocalArtifactId, SandboxId};
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use std::time::Duration;
 use tonic::Status;
@@ -152,7 +153,7 @@ pub(crate) enum EvictionClaim {
     /// [`Self::TeardownSuspendPermanentlyFailed`], the runtime may still be
     /// resident, and the `DeleteRow` cleanup tears it down.
     TeardownExecutionRetired {
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         staged_artifact: LocalArtifactId,
     },
 }
@@ -401,7 +402,7 @@ impl SandboxManagerService {
     pub(super) async fn release_retired_teardown_execution(
         &self,
         sandbox_id: &str,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         staged_artifact: LocalArtifactId,
     ) -> Result<(), Status> {
         // Ask the cluster only for a release the claim could take: one whose
@@ -788,11 +789,34 @@ impl SandboxManagerService {
                     let expected_updated_at = expected_updated_at.ok_or_else(|| {
                         Status::internal("a quarantined eviction claim requires the row version")
                     })?;
-                    crate::db::claim_quarantined_sandbox_for_eviction(
+                    match crate::db::claim_quarantined_sandbox_for_eviction(
                         &db,
                         sandbox_id,
                         expected_updated_at,
-                    )
+                    ) {
+                        Ok(crate::db::QuarantinedEvictionClaim::Claimed) => Ok(true),
+                        Ok(crate::db::QuarantinedEvictionClaim::Moved) => Ok(false),
+                        // The node-local delete's refusal: a cluster delete
+                        // that skipped that delete still can't erase what may
+                        // be the only copy. The row stays for an operator's
+                        // discard; node-ctl defers and retries the eviction.
+                        Ok(crate::db::QuarantinedEvictionClaim::RetainedFilesystemOnlyCopy) => {
+                            tracing::warn!(
+                                sandbox_id,
+                                "refusing cluster-deleted eviction: the retained filesystem may \
+                                 be the sandbox's only copy; discard it explicitly to release it"
+                            );
+                            return Err(
+                                pplx_space_sbx_mgr_client::retained_filesystem_only_copy_status(
+                                    format!(
+                                        "sandbox {sandbox_id}'s retained filesystem may be its \
+                                         only copy; only a discard delete erases it"
+                                    ),
+                                ),
+                            );
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
                 EvictionClaim::TeardownSuspendPermanentlyFailed {
                     staged_artifact,

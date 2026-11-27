@@ -17,9 +17,10 @@ node: {}
 # `exchange` through the node's credential-manager agent, or `static` keys.
 storageCredentials: exchange
 
-# On SIGTERM volume-manager closes transfer admission, drains queued
-# transfers for up to --drain-timeout-secs (100 s), then stops its gRPC server
-# within --server-drain-timeout-secs (10 s)
+# On SIGTERM volume-manager stops starting transfers, persisting new
+# submissions for its successor, lets running transfers finish for up to
+# --drain-timeout-secs (100 s), then stops its gRPC server within
+# --server-drain-timeout-secs (10 s)
 # (crates/l40_api/volmgr/server/src/run.rs). The grace covers both plus exit.
 terminationGracePeriodSeconds: 120
 

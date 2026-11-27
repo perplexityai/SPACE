@@ -7,9 +7,11 @@
 
 use std::sync::LazyLock;
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeId, SandboxId, SandboxTransitionTargetState};
+use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
+use pplx_space_sandbox_model::{SandboxId, SandboxTransitionTargetState};
 use pplx_space_sandbox_portability::restore_retry_suspended_revert_snapshot_exists;
+use pplx_space_sql_locator::sql;
 
 /// Converge a sandbox whose node rolled back an activation to the receipt's
 /// `target_state`, unplaced, keeping the node as its `target_node_id` when it
@@ -25,12 +27,12 @@ use pplx_space_sandbox_portability::restore_retry_suspended_revert_snapshot_exis
 /// holds the row `FOR UPDATE` in the same transaction. The caller treats
 /// `false` as lost ownership and rolls back.
 pub async fn converge_activation_rollback(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     sandbox_id: SandboxId,
     target_state: SandboxTransitionTargetState,
     clear_placement_changed_at: bool,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let converged = sqlx::query(sql!(
         "UPDATE sandboxes
                 SET lifecycle = $3,
@@ -48,7 +50,7 @@ pub async fn converge_activation_rollback(
     .bind(node_id)
     .bind(target_state.as_str())
     .bind(clear_placement_changed_at)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(converged.rows_affected() == 1)
 }
@@ -64,10 +66,10 @@ pub async fn converge_activation_rollback(
 /// this separate statement reads the snapshots and executions as of after
 /// that lock.
 pub async fn rollback_restore_retirable(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     generation: i64,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     static QUERY: LazyLock<String> = LazyLock::new(|| {
         let proof = restore_retry_suspended_revert_snapshot_exists("s");
         sql!(
@@ -87,9 +89,9 @@ pub async fn rollback_restore_retirable(
             .as_str()
         )
     });
-    sqlx::query_scalar(sqlx::AssertSqlSafe(QUERY.as_str()))
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(QUERY.as_str()))
         .bind(sandbox_id)
         .bind(generation)
-        .fetch_one(executor)
-        .await
+        .fetch_one(executor.into_sqlx())
+        .await?)
 }

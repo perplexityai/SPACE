@@ -379,7 +379,8 @@ async fn restore_publication_waits_for_network_readiness_and_preserves_activatio
 
 #[test]
 fn separate_operation_requires_a_kubernetes_route_but_not_an_api_supplied_node() {
-    use pplx_space_common_core::types::{ExecutionGeneration, NodeManagedBy, RouteGeneration};
+    use pplx_space_node_model::NodeManagedBy;
+    use pplx_space_sandbox_model::{ExecutionGeneration, RouteGeneration};
     let attempt = SandboxActivationAttemptId::new();
     let route = SpaceApiRouteIdentity {
         route_generation: Some(RouteGeneration::new(7).unwrap()),

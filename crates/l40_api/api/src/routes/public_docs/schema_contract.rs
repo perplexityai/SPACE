@@ -117,7 +117,7 @@ pub(super) fn insert_command_event_stream_schema(spec: &mut Value) {
             "name": "Last-Event-ID",
             "in": "header",
             "required": false,
-            "description": "SSE `id` of the last frame received.\n\n- Echo the `id` exactly as received, on the same session's stream.\n- A process stream resumes with the output after that frame while it is retained; otherwise `resync_required` precedes the output it continues with: `cursor_out_of_window` when the output is evicted or the `id` is past it, `cursor_replay_unavailable` when the `id` does not resume exactly.\n- A file-watch stream resumes live; its first identified frame is `resync_required` (`cursor_replay_unavailable`), with id `Last-Event-ID + 1`.\n- Values above the `int64` maximum, and process stream values too high to number a later frame above, return 400.",
+            "description": "SSE `id` of the last frame received.\n\n- Echo the `id` exactly as received, on the same session's stream.\n- A process stream resumes with the output after that frame while it is retained; otherwise `resync_required` precedes the output it continues with: `cursor_out_of_window` when the output is evicted or the `id` is past it, `cursor_replay_unavailable` when the `id` does not resume exactly.\n- A file-watch stream resumes live; its first identified frame is `resync_required` (`cursor_replay_unavailable`), with id `Last-Event-ID + 1`.\n- Values above the `int64` maximum return 400.",
             "schema": {
                 "type": "integer",
                 "format": "int64",
@@ -130,10 +130,10 @@ pub(super) fn insert_command_event_stream_schema(spec: &mut Value) {
         "responses".to_string(),
         json!({
             "200": response,
-            "400": data_plane_error_response("Invalid session id, session kind, token transport, or Last-Event-ID, or a pty process session that has not started"),
-            "401": data_plane_error_response("Missing, invalid, or expired data-plane token"),
-            "403": data_plane_error_response("Token does not authorize this session"),
-            "404": data_plane_error_response("Session not found"),
+            "400": data_plane_error_response("Invalid session id, session kind, token transport, or Last-Event-ID, a pty process session that has not started, or a command the sandbox could not start: `details` carry `reason` (`command_not_started`) and, from current templates, `field` (`command`, `cwd` or `user`) when the sandbox can tell which one failed; a permission error carries no `field`, since either the executable or the working directory could be what the user may not use. Over WebSocket the same refusal is an `error` frame with code `backend_stream_error` and the same `details`"),
+            "401": data_plane_error_response("Missing, malformed, invalid, or expired data-plane token, including a token issued for another session. The `Bearer` scheme is case-insensitive"),
+            "403": data_plane_error_response("The token was issued for this session but does not grant this access"),
+            "404": data_plane_error_response("Session not found, or the sandbox no longer retains the process session's process: its record expired, or a repeated start whose earlier response was lost found its replay expired. The command may have run, and its exit status is unavailable, so do not read this 404 as a command that never started. Sandboxes from older templates answer that repeated start 400 `command_not_started` instead"),
             "409": data_plane_error_response("Process session is already attached (retryable), or the sandbox is not running and this command cannot wake it (not retryable; `details` as on createCommand's conflict). The same 409 answers whether the node refused to start the command or the sandbox has no node and nothing is about to wake it. Over WebSocket the same refusal is an `error` frame with code `backend_stream_error` and the same `details`: branch on `details` `reason` (`sandbox_not_running`), not on the code"),
             "429": data_plane_error_response("Attached-stream limit exceeded"),
             "500": data_plane_error_response("Session route state is invalid"),

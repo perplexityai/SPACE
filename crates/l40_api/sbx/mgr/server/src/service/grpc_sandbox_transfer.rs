@@ -2,19 +2,20 @@ use super::cleanup_support::{ActivationCleanupSpec, CleanupLockTryResult};
 use super::create_support::{sanitize_process_env, validate_path_component};
 use super::tail_support::{host_architecture, sandbox_execution_metadata};
 use super::*;
+use std::mem::DropGuard;
 
 fn import_header_execution_metadata(
     header: &crate::proto::ImportSandboxHeader,
-) -> Result<pplx_space_common_core::types::ExecutionMetadata, Status> {
+) -> Result<pplx_space_execution_spec::ExecutionMetadata, Status> {
     let runtime_kind = header
         .runtime
-        .parse::<pplx_space_common_core::types::RuntimeKind>()
+        .parse::<pplx_space_execution_spec::RuntimeKind>()
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let execution = match header.execution.as_ref() {
-        Some(execution) => pplx_space_common_core::types::ExecutionMetadata::try_from(execution)
+        Some(execution) => pplx_space_execution_spec::ExecutionMetadata::try_from(execution)
             .map_err(|error| Status::invalid_argument(error.to_string())),
-        None if runtime_kind == pplx_space_common_core::types::RuntimeKind::Firecracker => Ok(
-            pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+        None if runtime_kind == pplx_space_execution_spec::RuntimeKind::Firecracker => Ok(
+            pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
                 host_architecture().map_err(|error| Status::invalid_argument(error.to_string()))?,
                 vec![],
             ),
@@ -42,7 +43,7 @@ struct ValidatedSandboxImport {
     network_policy_authority: crate::db::PolicyAuthority,
     auto_lifecycle_authority: crate::db::PolicyAuthority,
     process_env: BTreeMap<String, String>,
-    execution: pplx_space_common_core::types::ExecutionMetadata,
+    execution: pplx_space_execution_spec::ExecutionMetadata,
 }
 
 struct SandboxImportPaths {
@@ -55,8 +56,7 @@ struct SandboxImportPaths {
 
 impl SandboxImportPaths {
     fn new(sandbox_id: &str) -> Self {
-        let sandbox_base =
-            pplx_space_common_core::host::linux::paths::sandbox_cache_dir(sandbox_id);
+        let sandbox_base = pplx_space_host_layout::paths::sandbox_cache_dir(sandbox_id);
         let instance_dir = format!("{sandbox_base}/instance");
         let snapshot_dir = format!("{sandbox_base}/snapshot");
         let import_id = uuid::Uuid::now_v7();
@@ -122,7 +122,7 @@ fn validate_import_sandbox_header(
     validate_path_component("template_id", &header.template_id)?;
     validate_path_component("content_hash", &header.content_hash)?;
     if let Some(size_mib) = header.rootfs_size_mb {
-        pplx_space_common_core::sandbox_storage::validate_rootfs_mib(size_mib)
+        pplx_space_sandbox_model::sandbox_storage::validate_rootfs_mib(size_mib)
             .map_err(|error| Status::invalid_argument(format!("rootfs_size_mb: {error}")))?;
     }
     let process_env: BTreeMap<String, String> = header.env.clone().into_iter().collect();
@@ -223,6 +223,7 @@ pub(super) async fn verify_delta_base(
             memory_mib: None,
             caller_org_id: None,
             cached_only: true,
+            environment_required: false,
         });
     let scope = pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope::LocalExecution;
     scope.attach(&mut request);
@@ -264,7 +265,7 @@ pub(super) async fn verify_delta_base(
                 ));
             }
             Ok(std::path::Path::new(&response.template_dir)
-                .join(pplx_space_common_core::types::TEMPLATE_ROOTFS_FILE))
+                .join(pplx_space_artifact_model::TEMPLATE_ROOTFS_FILE))
         }
         Err(crate::template_resolver::TemplateLookupError::Rpc(status))
             if status.code() == tonic::Code::NotFound =>
@@ -481,7 +482,7 @@ async fn apply_sandbox_delta_import(
         &header.content_hash,
         std::path::PathBuf::from(&diff_file),
         std::path::PathBuf::from(format!("{}/rootfs.ext4", paths.instance_staging)),
-        pplx_space_common_core::sandbox_storage::MAX_SANDBOX_ROOTFS_BYTES,
+        pplx_space_sandbox_model::sandbox_storage::MAX_SANDBOX_ROOTFS_BYTES,
     )
     .await?;
     let _ = tokio::fs::remove_file(diff_file).await;
@@ -675,18 +676,18 @@ async fn publish_imported_snapshot(
 async fn write_imported_sandbox_metadata(
     sandbox_id: &str,
     header: &crate::proto::ImportSandboxHeader,
-    execution: pplx_space_common_core::types::ExecutionMetadata,
-) -> Result<pplx_space_common_core::types::SandboxArtifactMetadata, Status> {
+    execution: pplx_space_execution_spec::ExecutionMetadata,
+) -> Result<pplx_space_artifact_model::SandboxArtifactMetadata, Status> {
     let parsed_sandbox_id = sandbox_id
         .parse::<SandboxId>()
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    let template = pplx_space_common_core::types::TemplateName::parse(&header.template_id)
+    let template = pplx_space_template_model::TemplateName::parse(&header.template_id)
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let content_hash = header
         .content_hash
-        .parse::<pplx_space_common_core::types::ContentHash>()
+        .parse::<pplx_space_content_digest::ContentHash>()
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    let sandbox_metadata = pplx_space_common_core::types::SandboxArtifactMetadata::new(
+    let sandbox_metadata = pplx_space_artifact_model::SandboxArtifactMetadata::new(
         parsed_sandbox_id,
         execution,
         template,
@@ -694,8 +695,7 @@ async fn write_imported_sandbox_metadata(
     );
     let sandbox_metadata_bytes = serde_json::to_vec_pretty(&sandbox_metadata)
         .map_err(|error| Status::internal(format!("serialize sandbox metadata: {error}")))?;
-    let sandbox_metadata_path =
-        pplx_space_common_core::host::linux::paths::sandbox_metadata_path(sandbox_id);
+    let sandbox_metadata_path = pplx_space_host_layout::paths::sandbox_metadata_path(sandbox_id);
     let sandbox_metadata_staging = format!("{sandbox_metadata_path}.importing");
     tokio::fs::write(&sandbox_metadata_staging, sandbox_metadata_bytes)
         .await
@@ -762,8 +762,7 @@ impl SandboxManagerService {
             ));
         }
 
-        let instance_dir =
-            pplx_space_common_core::host::linux::paths::sandbox_instance_dir(&sandbox.id);
+        let instance_dir = pplx_space_host_layout::paths::sandbox_instance_dir(&sandbox.id);
         if !std::path::Path::new(&instance_dir).is_dir() {
             return Err(Status::not_found("sandbox instance directory not found"));
         }
@@ -817,9 +816,7 @@ impl SandboxManagerService {
                             let mut required = vec![sandbox_rootfs.clone()];
                             if include_snapshot {
                                 let directory =
-                                    pplx_space_common_core::host::linux::paths::sandbox_cache_dir(
-                                        &sandbox_id,
-                                    );
+                                    pplx_space_host_layout::paths::sandbox_cache_dir(&sandbox_id);
                                 required.extend([
                                     format!("{directory}/snapshot/vmstate"),
                                     format!("{directory}/snapshot/memory"),
@@ -856,21 +853,18 @@ impl SandboxManagerService {
                                 (None, false)
                             };
 
-                            // RAII guard: clean up temp diff file on any exit path
-                            struct DiffCleanup(Option<String>);
-                            impl Drop for DiffCleanup {
-                                fn drop(&mut self) {
-                                    if let Some(ref p) = self.0 {
-                                        let _ = std::fs::remove_file(p);
-                                    }
+                            let diff_path = DropGuard::new(diff_path, |path| {
+                                if let Some(path) = path
+                                    && let Err(error) = std::fs::remove_file(&path)
+                                    && error.kind() != std::io::ErrorKind::NotFound
+                                {
+                                    tracing::warn!(%path, %error, "failed to remove temporary rootfs diff");
                                 }
-                            }
-                            let _diff_guard = DiffCleanup(diff_path.clone());
+                            });
 
                             let snapshot_working_dir =
-                                pplx_space_common_core::host::linux::paths::sandbox_cache_dir(
-                                    &sandbox_id,
-                                ) + "/snapshot";
+                                pplx_space_host_layout::paths::sandbox_cache_dir(&sandbox_id)
+                                    + "/snapshot";
                             let (files, total_size) = match receive::sandbox_export_files(
                                 std::path::Path::new(&instance_dir),
                                 include_snapshot
@@ -955,7 +949,6 @@ impl SandboxManagerService {
                                 }
                             }
 
-                            // diff file cleanup handled by _diff_guard (RAII Drop)
                         })();
                         Ok(())
                     })
@@ -1041,7 +1034,7 @@ impl SandboxManagerService {
                     runtime: &header.runtime,
                     snapshots_enabled: header.snapshots_enabled,
                     rootfs_size_mb: header.rootfs_size_mb,
-                    disk_io_limits: pplx_space_common_core::types::DiskIoLimits::try_from_optional(
+                    disk_io_limits: pplx_space_execution_spec::DiskIoLimits::try_from_optional(
                         header.disk_io_max_operations_per_sec,
                         header.disk_io_max_bandwidth_mib_per_sec,
                     )
@@ -1148,6 +1141,10 @@ impl SandboxManagerService {
         };
         self.reject_existing_sandbox_import(validated.sandbox_id)
             .await?;
+        // The sandbox doesn't exist yet, so it has no VM.
+        let _producer =
+            self.activation_seal
+                .admit_producer("sandbox import", &sandbox_id, false)?;
 
         let paths = SandboxImportPaths::new(&sandbox_id);
         let cleanup_id = SandboxCleanupEpisodeId::new();

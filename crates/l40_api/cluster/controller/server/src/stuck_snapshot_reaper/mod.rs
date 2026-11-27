@@ -79,16 +79,18 @@
 //! substrate-agnostic Postgres CAS plus telemetry, so it runs in both Direct
 //! and Kubernetes modes.
 
-use pplx_space_common_core::types::{NodeId, SnapshotId};
+use pplx_space_accounts::NodeId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::metrics::cluster_reconciler::{self as metrics, Loop, OutcomeEvent};
-use pplx_space_common_core::types::{PositiveDuration, SandboxId};
+use pplx_space_durations::PositiveDuration;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_sandbox_model::SandboxId;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 

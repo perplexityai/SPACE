@@ -25,18 +25,20 @@ pub async fn node_ctl_status() -> NodeCtlStatus {
             error: None,
             reconciliations,
             sync_overrides,
+            reads_twin_metadata: None,
         },
         Err(error) => NodeCtlStatus {
             reachable: false,
             error: Some(error.message().to_string()),
             reconciliations: Vec::new(),
             sync_overrides: Vec::new(),
+            reads_twin_metadata: None,
         },
     }
 }
 
 pub async fn node_ctl_status_if_present() -> Option<NodeCtlStatus> {
-    if !std::path::Path::new(pplx_space_common_core::host::linux::paths::NODE_CTL_SOCKET).exists() {
+    if !std::path::Path::new(pplx_space_host_layout::paths::NODE_CTL_SOCKET).exists() {
         return None;
     }
     Some(node_ctl_status().await)

@@ -9,7 +9,9 @@ mod templates;
 
 use admin_client::{AdminClient, CliError, WarmPoolConfigRequest};
 use cli::{Cli, Commands, EnvConfig, WarmPoolCommands, WarmPoolConfigArgs, WarmPoolUpdateArgs};
-use pplx_space_common_core::types::{NodeDrainMode, TemplateReference, admin::DrainRequest};
+use pplx_space_admin_protocol::DrainRequest;
+use pplx_space_node_model::NodeDrainMode;
+use pplx_space_template_model::TemplateReference;
 use std::str::FromStr;
 
 #[tokio::main]
@@ -64,6 +66,13 @@ async fn main() {
                 // This command is how an operator escalates a drain in place,
                 // so it never asks for the start-only precondition.
                 require_undrained: false,
+                // The engine stays the server's choice: one in flight keeps
+                // its own, and a new drain runs on v1 while the server's
+                // SPACE_DRAIN_V2_ENABLED is off; with it on, a new drain that
+                // names no engine is refused.
+                engine: None,
+                // A hold is a v2 drain's, which this command doesn't start.
+                hold_seconds: None,
             };
             client.post_drain(&node, &request).await
         }
@@ -93,6 +102,7 @@ async fn main() {
             }
             WarmPoolCommands::List { json } => client.list_warm_pools(json).await,
             WarmPoolCommands::Get { pool, json } => client.get_warm_pool(&pool, json).await,
+            WarmPoolCommands::Disable { pool, json } => client.disable_warm_pool(&pool, json).await,
         },
     };
 

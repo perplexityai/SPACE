@@ -4,8 +4,8 @@ use super::*;
 
 // The no-progress reason vocabulary is a durable noun, not a tag vocabulary:
 // its rendered form is persisted into `sandbox_quarantine_state.last_error`. It
-// therefore lives in common-core next to the other quarantine vocabularies, so
-// renaming a metric tag cannot change what rows persist.
+// therefore lives in `pplx-space-sandbox-model` next to the other quarantine
+// vocabularies, so renaming a metric tag cannot change what rows persist.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QuarantineRecoveryAttemptOutcome {

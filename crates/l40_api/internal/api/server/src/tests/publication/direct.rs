@@ -1,6 +1,6 @@
 use super::*;
 use crate::proto::{cluster_api_client::ClusterApiClient, cluster_api_server::ClusterApiServer};
-use pplx_space_common_core::types::SubstrateKind;
+use pplx_space_node_model::SubstrateKind;
 use pplx_space_rpc_auth as auth;
 use pplx_space_rpc_auth::build::BuildAuthLayer;
 use tokio_stream::wrappers::TcpListenerStream;

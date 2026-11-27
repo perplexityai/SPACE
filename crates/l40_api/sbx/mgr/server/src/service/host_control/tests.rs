@@ -5,7 +5,7 @@ use pplx_space_credmgr_client::proto::{
     ResolveNetworkCredentialsRequest as NetworkResolveRequest,
     ResolveNetworkCredentialsResponse as NetworkResolveResponse,
 };
-use pplx_space_spaced_common::proto::host_control::{
+use pplx_space_spaced_protocol::proto::host_control::{
     GetNetworkPolicyRequest, host_control_client::HostControlClient,
     host_control_server::HostControlServer,
 };
@@ -25,6 +25,12 @@ struct Agent {
     network_requests: Mutex<Vec<NetworkResolveRequest>>,
     entered: Notify,
     resume: Notify,
+    /// Stops serving, as a restarting credential-manager does: connections
+    /// are told to go away and the listener closes, leaving its socket file.
+    stop: Notify,
+    stopped: Notify,
+    /// Binds the socket again and serves, as the successor does.
+    restart: Notify,
 }
 
 const NETWORK_REFERENCE_ID: &str = "018f1e9d-7b7a-7d3a-8000-000000000001";
@@ -130,6 +136,7 @@ async fn with_agent_gate<F, Fut>(
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("credmgr.sock");
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let serving_socket = socket.clone();
     let agent = Arc::new(Agent::default());
     let recorded = agent.clone();
     let resolve_network = tower::service_fn(move |request: Request<NetworkResolveRequest>| {
@@ -163,8 +170,26 @@ async fn with_agent_gate<F, Fut>(
             Ok::<_, Infallible>(response)
         }
     });
-    let server = tonic::transport::Server::builder()
-        .serve_with_incoming(rpc, UnixListenerStream::new(listener));
+    let serving = agent.clone();
+    let server = async move {
+        let mut listener = listener;
+        loop {
+            if let Err(error) = tonic::transport::Server::builder()
+                .serve_with_incoming_shutdown(
+                    rpc.clone(),
+                    UnixListenerStream::new(listener),
+                    serving.stop.notified(),
+                )
+                .await
+            {
+                return error;
+            }
+            serving.stopped.notify_one();
+            serving.restart.notified().await;
+            std::fs::remove_file(&serving_socket).unwrap();
+            listener = tokio::net::UnixListener::bind(&serving_socket).unwrap();
+        }
+    };
 
     let (peer, _other) = tokio::net::UnixStream::pair().unwrap();
     let credentials = peer.peer_cred().unwrap();
@@ -378,11 +403,19 @@ async fn network_policy_survives_credential_resolution_failure() {
             false,
             async move |service, sandbox_id, _, agent, mut client, _gateway| {
                 install_policy(&service, sandbox_id, &credential_policy());
+                let started = tokio::time::Instant::now();
                 let response = client
                     .get_network_policy(policy_request())
                     .await
                     .unwrap()
                     .into_inner();
+                // An answer, UNAVAILABLE included, gets only the local retry
+                // window, not the one for an unreachable agent.
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "an answered failure was retried for {:?}",
+                    started.elapsed()
+                );
                 assert!(response.effective_policy.is_some());
                 assert!(!response.effective_policy_ref.is_empty());
                 assert!(response.network_credentials.is_empty());
@@ -396,6 +429,48 @@ async fn network_policy_survives_credential_resolution_failure() {
         )
         .await;
     }
+}
+
+#[tokio::test]
+async fn network_policy_waits_out_a_credential_manager_restart() {
+    with_agent(
+        Ok(resolved_network()),
+        false,
+        async |service, sandbox_id, _, agent, mut client, _gateway| {
+            install_policy(&service, sandbox_id, &credential_policy());
+            // The first call opens the cached credential-manager channel.
+            let first = client
+                .get_network_policy(policy_request())
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(first.network_credentials.len(), 1);
+
+            agent.stop.notify_one();
+            agent.stopped.notified().await;
+            // Longer than the local retry window, well within the connect
+            // budget a handoff gets.
+            let gap = Duration::from_secs(1);
+            let successor = agent.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(gap).await;
+                successor.restart.notify_one();
+            });
+
+            let response = client
+                .get_network_policy(policy_request())
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                response.network_credentials.len(),
+                1,
+                "a credential-manager restart must not hand the gateway a policy without material"
+            );
+            assert_eq!(agent.network_requests.lock().unwrap().len(), 2);
+        },
+    )
+    .await;
 }
 
 #[tokio::test]

@@ -1,20 +1,26 @@
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
+use crate::client_live_cap::{LiveHandoff, LiveReservation};
 use crate::controllers::db_contention_error;
+use crate::controllers::substrate::{
+    ActivationAttribution, ActivationClient, CapPolicy, RecoveryCharge,
+};
 use crate::metrics::sandbox::api::RequestedKind;
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeDrainPhase, NodeDrainState, NodeManagedBy, NodeRole};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_node_drain::{NODE_DRAIN_ENGINE_V2, V2DrainPhase};
+use pplx_space_node_model::{NodeDrain, NodeDrainPhase, NodeManagedBy, NodeRole};
+use pplx_space_node_registration_store::drain_reads;
 use pplx_space_postgres_pool::contention;
-use pplx_space_sandbox_portability::portable_for_restore_affinity;
 use pplx_space_sandbox_store as sandbox_store;
 use pplx_space_sandbox_store::delete::{mark_deleting, restore_lifecycle_from_deleting};
 use pplx_space_sandbox_store::fork_source_lifecycle::{
     active_fork_source_operation_exists, lock_fork_source_lifecycle,
 };
+#[cfg(test)]
+use pplx_space_sql_locator::sql;
 use user_admission::{UserLifecycleRequest, admit_user_lifecycle};
 
 const FINALIZE_SANDBOX_DB_DELETE_ATTEMPTS: usize = 4;
@@ -34,11 +40,14 @@ fn cluster_delete_miss_reason(err: &SubstrateError) -> &'static str {
         // set does not name a registered worker), or the node is unreachable.
         // The node was never contacted, so any local state definitely
         // survives.
-        SubstrateError::Unavailable { .. } => "node_unavailable",
+        SubstrateError::Unavailable { .. } | SubstrateError::Unschedulable { .. } => {
+            "node_unavailable"
+        }
         // The node was reached but the delete RPC failed / timed out / was
         // cancelled — local teardown is unconfirmed.
         SubstrateError::Failed { .. } => "node_delete_failed",
         SubstrateError::RetainedFilesystemOnlyCopy { .. } => "retained_filesystem_only_copy",
+        SubstrateError::NodeDeleteNotAdmitted { .. } => "node_delete_not_admitted",
         SubstrateError::Timeout { .. } => "node_delete_timeout",
         SubstrateError::Cancelled { .. } => "node_delete_cancelled",
         // The node had no such sandbox — local state is already gone (not an
@@ -57,7 +66,9 @@ fn cluster_delete_miss_reason(err: &SubstrateError) -> &'static str {
 fn cluster_delete_must_defer_control_plane(err: &SubstrateError) -> bool {
     matches!(
         err,
-        SubstrateError::SuspendInFlight { .. } | SubstrateError::RetainedFilesystemOnlyCopy { .. }
+        SubstrateError::SuspendInFlight { .. }
+            | SubstrateError::RetainedFilesystemOnlyCopy { .. }
+            | SubstrateError::NodeDeleteNotAdmitted { .. }
     )
 }
 
@@ -149,7 +160,7 @@ fn fork_in_progress_conflict() -> ControllerError {
 async fn begin_delete_against_active_fork(
     pool: &PgPool,
     sandbox_id: SandboxId,
-) -> Result<Option<pplx_space_common_core::types::SandboxLifecycle>, ControllerError> {
+) -> Result<Option<pplx_space_sandbox_model::SandboxLifecycle>, ControllerError> {
     let mut guard = pool.begin().await.map_err(|error| {
         // Classified like the advisory-lock acquisition on the next line,
         // which would otherwise be unreachable on a contended `begin`. A
@@ -163,36 +174,50 @@ async fn begin_delete_against_active_fork(
         }
         mapped
     })?;
-    lock_fork_source_lifecycle(&mut guard, sandbox_id)
-        .await
-        .map_err(|error| db_contention_error("failed to lock sandbox delete lifecycle", &error))?;
-    let active_fork = active_fork_source_operation_exists(&mut guard, sandbox_id)
+    lock_fork_source_lifecycle(&mut *guard, sandbox_id)
         .await
         .map_err(|error| {
-            db_contention_error("fork precheck failed before sandbox DELETE", &error)
+            db_contention_error(
+                "failed to lock sandbox delete lifecycle",
+                &sqlx::Error::from(error),
+            )
+        })?;
+    let active_fork = active_fork_source_operation_exists(&mut *guard, sandbox_id)
+        .await
+        .map_err(|error| {
+            db_contention_error(
+                "fork precheck failed before sandbox DELETE",
+                &sqlx::Error::from(error),
+            )
         })?;
     if active_fork {
         return Err(fork_in_progress_conflict());
     }
-    let previous_lifecycle = sqlx::query_scalar::<_, String>(sql!(
-        "SELECT lifecycle FROM sandboxes WHERE id = $1 FOR UPDATE"
-    ))
-    .bind(sandbox_id)
-    .fetch_optional(&mut *guard)
-    .await
-    .map_err(|error| db_contention_error("failed to read sandbox lifecycle before delete", &error))?
-    .map(|lifecycle| {
-        lifecycle
-            .parse::<pplx_space_common_core::types::SandboxLifecycle>()
-            .map_err(|error| {
-                tracing::error!(%sandbox_id, %error, "sandbox has invalid lifecycle before delete");
-                ControllerError::internal("sandbox has invalid lifecycle")
-            })
-    })
-    .transpose()?;
-    mark_deleting(&mut guard, sandbox_id)
+    let previous_lifecycle = sandbox_store::row_locks::lock_lifecycle(&mut *guard, sandbox_id)
         .await
-        .map_err(|error| db_contention_error("failed to persist sandbox delete intent", &error))?;
+        .map_err(|error| {
+            db_contention_error(
+                "failed to read sandbox lifecycle before delete",
+                &sqlx::Error::from(error),
+            )
+        })?
+        .map(|lifecycle| {
+            lifecycle
+                .parse::<pplx_space_sandbox_model::SandboxLifecycle>()
+                .map_err(|error| {
+                    tracing::error!(%sandbox_id, %error, "sandbox has invalid lifecycle before delete");
+                    ControllerError::internal("sandbox has invalid lifecycle")
+                })
+        })
+        .transpose()?;
+    mark_deleting(&mut *guard, sandbox_id)
+        .await
+        .map_err(|error| {
+            db_contention_error(
+                "failed to persist sandbox delete intent",
+                &sqlx::Error::from(error),
+            )
+        })?;
     guard
         .commit()
         .await
@@ -203,7 +228,7 @@ async fn begin_delete_against_active_fork(
 async fn restore_lifecycle_after_failed_delete(
     pool: &PgPool,
     sandbox_id: SandboxId,
-    lifecycle: pplx_space_common_core::types::SandboxLifecycle,
+    lifecycle: pplx_space_sandbox_model::SandboxLifecycle,
 ) -> Result<(), ControllerError> {
     let restored = restore_lifecycle_from_deleting(pool, sandbox_id, lifecycle)
         .await
@@ -215,7 +240,10 @@ async fn restore_lifecycle_after_failed_delete(
         // so the caller is at least told to retry; the residual is that a failed
         // restore still leaves the row pinned until that retry lands.
         .map_err(|error| {
-            db_contention_error("failed to restore sandbox after deferred deletion", &error)
+            db_contention_error(
+                "failed to restore sandbox after deferred deletion",
+                &sqlx::Error::from(error),
+            )
         })?;
     if restored {
         Ok(())
@@ -229,7 +257,7 @@ async fn restore_lifecycle_after_failed_delete(
 async fn restore_lifecycle_after_failed_finalize_delete(
     pool: &PgPool,
     sandbox_id: SandboxId,
-    previous_lifecycle: Option<pplx_space_common_core::types::SandboxLifecycle>,
+    previous_lifecycle: Option<pplx_space_sandbox_model::SandboxLifecycle>,
 ) -> Result<(), ControllerError> {
     let Some(previous_lifecycle) = previous_lifecycle else {
         return Ok(());
@@ -246,7 +274,7 @@ async fn restore_lifecycle_after_failed_finalize_delete(
         .map_err(|error| {
             db_contention_error(
                 "failed to restore sandbox after deletion finalization",
-                &error,
+                &sqlx::Error::from(error),
             )
         })?;
     if restored {
@@ -259,8 +287,9 @@ async fn restore_lifecycle_after_failed_finalize_delete(
             // Reached only when the compensating UPDATE above matched no rows,
             // so it decides that path's outcome and can block on the same row
             // the UPDATE just contended for. `SandboxStoreError` wraps one
-            // transparent `sqlx::Error`, so the classification survives the
-            // store boundary — without this the statement one line above
+            // transparent `DbError`, which `sqlx::Error::from` turns back into
+            // the driver's error, so the classification survives the store
+            // boundary — without this the statement one line above
             // returns 503 and this one returns 500 for the same race.
             let error = sqlx::Error::from(error);
             db_contention_error(
@@ -684,30 +713,6 @@ impl TryFrom<pplx_space_public_api::SandboxLifecycleAction> for SandboxAction {
 #[error("Unknown action: {0}")]
 pub struct UnknownSandboxActionError(pub String);
 
-fn cluster_admission_controller_error(
-    error: crate::cluster_admission::ClusterAdmissionError,
-) -> ControllerError {
-    // Admission only errors when out of capacity (fail-open cases are handled
-    // inside `admit_activation` and never reach here). Both map to a 429 +
-    // Retry-After, but only the rate-limit case carries the
-    // `ClusterActivationAdmission` cause that the async dispatcher treats as
-    // indefinite backpressure. Empty-cluster omits the cause so the dispatcher
-    // gives it a *bounded* retry (counted against the transient-error budget) —
-    // a durable capacity outage must eventually terminate the create rather than
-    // re-queue forever.
-    use crate::cluster_admission::ClusterAdmissionError;
-    match error {
-        ClusterAdmissionError::RateLimited {
-            message,
-            retry_after,
-        } => ControllerError::cluster_admission_rejected(message, Some(retry_after), true),
-        ClusterAdmissionError::EmptyCluster {
-            message,
-            retry_after,
-        } => ControllerError::cluster_admission_rejected(message, Some(retry_after), false),
-    }
-}
-
 /// Classify the cluster-activation cost of *implicitly* waking a sandbox from
 /// its currently-observed lifecycle. Covers the data-plane access path
 /// (`access_runtime_client`) and the control-plane `control_runtime_client`
@@ -733,28 +738,112 @@ fn implicit_activation_class(
     SandboxAction::Wake.activation_class(Some(lifecycle))
 }
 
+/// The substrate charge for an implicit activation of `sandbox` (an access,
+/// opening a port, a rollback, the spaced control path): it acts for the
+/// sandbox's recorded client. Its live cap counts as `Reserved` only when this
+/// request holds a reservation for a dormant sandbox (`live`), which the
+/// charge carries so a detached wake can take it over; otherwise it's checked
+/// where a pod gets created. A live sandbox creates a pod only if its running
+/// pod is gone, and a request that skipped the entry reservation (a
+/// mid-stream reconnect) may still rebuild one.
+pub(super) fn implicit_activation_charge(
+    admission: Option<&std::sync::Arc<crate::cluster_admission::ClusterSandboxAdmission>>,
+    sandbox: &Sandbox,
+    live: &LiveHandoff,
+) -> RecoveryCharge {
+    let cap = match sandbox.lifecycle.parse::<SandboxLifecycle>() {
+        Ok(lifecycle) if live.is_held() && implicit_activation_class(lifecycle).is_some() => {
+            CapPolicy::Reserved
+        }
+        _ => CapPolicy::Check,
+    };
+    RecoveryCharge::enforce(
+        admission,
+        cap,
+        ActivationAttribution::inherit(sandbox.activating_client_id.as_ref()),
+    )
+    .with_live(live)
+}
+
+/// Reserve the live slot of an activation of `sandbox_id` charged before the
+/// substrate runs (`CapPolicy::Reserved`). `Ok(None)` when no limiter is
+/// configured, the activation has no client id, or no cap applies.
+pub(super) async fn reserve_live_cap(
+    admission: Option<&std::sync::Arc<crate::cluster_admission::ClusterSandboxAdmission>>,
+    sandbox_id: SandboxId,
+    attribution: &ActivationAttribution,
+) -> Result<Option<LiveReservation>, ControllerError> {
+    let (Some(admission), Some(client)) = (admission, attribution.key().pod_label(None)) else {
+        return Ok(None);
+    };
+    // Boxed: the callers' futures are already large, and tests build them
+    // unoptimized.
+    Box::pin(admission.live_cap().reserve(&client, sandbox_id))
+        .await
+        .map_err(live_cap_controller_error)
+}
+
+/// A client at its live cap: a `429` with the jittered `Retry-After`, and no
+/// cluster-backpressure cause, so the async dispatcher retries it against its
+/// attempt budget.
+pub(super) fn live_cap_controller_error(
+    refusal: crate::client_live_cap::LiveCapRefusal,
+) -> ControllerError {
+    ControllerError::live_cap_refused(refusal.message, Some(refusal.retry_after))
+}
+
+/// The activation is admitted and its substrate call comes next, which may
+/// create a pod even if it then fails: any later drop lets the member lapse.
+fn substrate_may_create(mut live: Option<LiveReservation>) -> Option<LiveReservation> {
+    if let Some(live) = live.as_mut() {
+        live.pod_may_exist();
+    }
+    live
+}
+
+/// A pod exists or may exist (the activation succeeded, joined one that did,
+/// or got past its runtime's creation): let its pending member lapse within
+/// one TTL.
+pub(super) fn keep_live(live: Option<LiveReservation>) {
+    if let Some(live) = live {
+        live.keep();
+    }
+}
+
 /// Charge cluster activation admission for a sandbox about to be implicitly
 /// woken from its observed lifecycle. A `None` handle (limiter not configured)
 /// is a no-op, and an unparseable lifecycle fails open (no charge) — the
 /// substrate remains the correctness gate. Fail-open on Redis errors is
 /// inherited from [`crate::cluster_admission::ClusterSandboxAdmission::admit_activation`].
+///
+/// A dormant sandbox gets a new runtime for certain, so its live slot is
+/// reserved first (`CapPolicy::Reserved`), before any token is spent. Hold the
+/// returned reservation until the wake ends, and keep it if the wake succeeds.
 async fn charge_implicit_activation(
     admission: Option<&std::sync::Arc<crate::cluster_admission::ClusterSandboxAdmission>>,
-    lifecycle: &str,
-) -> Result<(), ControllerError> {
-    let Some(admission) = admission else {
-        return Ok(());
+    sandbox: &Sandbox,
+) -> Result<Option<LiveReservation>, ControllerError> {
+    let Some(cluster_admission) = admission else {
+        return Ok(None);
     };
-    let Ok(lifecycle) = lifecycle.parse::<SandboxLifecycle>() else {
-        return Ok(());
+    let Ok(lifecycle) = sandbox.lifecycle.parse::<SandboxLifecycle>() else {
+        return Ok(None);
     };
     let Some(class) = implicit_activation_class(lifecycle) else {
-        return Ok(());
+        return Ok(None);
     };
-    admission
+    let live = reserve_live_cap(
+        admission,
+        sandbox.id,
+        &ActivationAttribution::inherit(sandbox.activating_client_id.as_ref()),
+    )
+    .await?;
+
+    cluster_admission
         .admit_activation(class)
         .await
-        .map_err(cluster_admission_controller_error)
+        .map_err(ControllerError::from)?;
+    Ok(substrate_may_create(live))
 }
 
 /// Access-path admission charge. The substrate honors the sandbox's auto-wake
@@ -764,11 +853,11 @@ pub(super) async fn charge_implicit_access_activation(
     admission: Option<&std::sync::Arc<crate::cluster_admission::ClusterSandboxAdmission>>,
     sandbox: &Sandbox,
     activity: ExecutionActivityKind,
-) -> Result<(), ControllerError> {
+) -> Result<Option<LiveReservation>, ControllerError> {
     if !activity.allows_implicit_wake(&sandbox.auto_lifecycle.0) {
-        return Ok(());
+        return Ok(None);
     }
-    charge_implicit_activation(admission, &sandbox.lifecycle).await
+    charge_implicit_activation(admission, sandbox).await
 }
 
 /// Control-plane wake admission charge for `control_runtime_client`. Its
@@ -777,8 +866,8 @@ pub(super) async fn charge_implicit_access_activation(
 pub(super) async fn charge_control_wake_activation(
     admission: Option<&std::sync::Arc<crate::cluster_admission::ClusterSandboxAdmission>>,
     sandbox: &Sandbox,
-) -> Result<(), ControllerError> {
-    charge_implicit_activation(admission, &sandbox.lifecycle).await
+) -> Result<Option<LiveReservation>, ControllerError> {
+    charge_implicit_activation(admission, sandbox).await
 }
 
 impl SandboxController {
@@ -842,18 +931,68 @@ impl SandboxController {
         admission
             .admit_activation(class)
             .await
-            .map_err(cluster_admission_controller_error)
+            .map_err(ControllerError::from)
     }
 
+    /// [`Self::admit_cluster_activation`] for a cold create, the one activation
+    /// that always builds a new pod kube-scheduler places, which the slot check
+    /// also reads.
+    pub(super) async fn admit_cluster_cold_create(&self) -> Result<(), ControllerError> {
+        let Some(admission) = self.cluster_admission.as_ref() else {
+            return Ok(());
+        };
+        admission
+            .admit_cold_create()
+            .await
+            .map_err(ControllerError::from)
+    }
+
+    /// Admit an explicit action charged at entry: reserve its live slot
+    /// first, so a client at its cap is refused before it spends a cluster
+    /// token, then charge the cluster bucket. The reservation is `None` when
+    /// the action isn't charged here or no cap applies; hold it until the
+    /// action ends, and keep it if the action succeeds.
     async fn admit_action_cluster_activation(
         &self,
         action: SandboxAction,
         lifecycle: Option<SandboxLifecycle>,
-    ) -> Result<(), ControllerError> {
+        sandbox_id: SandboxId,
+        attribution: &ActivationAttribution,
+    ) -> Result<Option<LiveReservation>, ControllerError> {
         let Some(class) = action.activation_class(lifecycle) else {
-            return Ok(());
+            return Ok(None);
         };
-        self.admit_cluster_activation(class).await
+        let live =
+            reserve_live_cap(self.cluster_admission.as_ref(), sandbox_id, attribution).await?;
+        self.admit_cluster_activation(class).await?;
+        Ok(substrate_may_create(live))
+    }
+
+    /// Snapshot `sandbox_id`'s pending live-cap entries before a teardown's
+    /// substrate call, for [`Self::forget_live_sandbox`] once it confirms.
+    pub(super) async fn live_teardown(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Option<crate::client_live_cap::LiveTeardown> {
+        match self.cluster_admission.as_ref() {
+            Some(admission) => {
+                Some(Box::pin(admission.live_cap().teardown_snapshot(sandbox_id)).await)
+            }
+            None => None,
+        }
+    }
+
+    /// Stop counting the entries `teardown` snapshotted once the sandbox's
+    /// pods are deleted, so a client that tears sandboxes down doesn't stay
+    /// counted for them until they lapse. An entry a later activation added
+    /// isn't in the snapshot, so it keeps counting.
+    pub(super) async fn forget_live_sandbox(
+        &self,
+        teardown: Option<crate::client_live_cap::LiveTeardown>,
+    ) {
+        if let (Some(admission), Some(teardown)) = (self.cluster_admission.as_ref(), teardown) {
+            Box::pin(admission.live_cap().forget(teardown)).await;
+        }
     }
 
     /// Deferred activation charge for lease-claiming wakes/restores. When
@@ -861,17 +1000,46 @@ impl SandboxController {
     /// charged by the restore-lease claim-winner inside the substrate
     /// instead of at request entry: coalesced followers never spend a
     /// token, and a lease takeover always does.
-    fn restore_claim_charge(
-        &self,
-        lifecycle: Option<SandboxLifecycle>,
-    ) -> Option<crate::controllers::substrate::RecoveryCharge> {
+    fn defers_to_restore_claim(lifecycle: Option<SandboxLifecycle>) -> bool {
         matches!(
             lifecycle,
             Some(SandboxLifecycle::Suspended) | Some(SandboxLifecycle::Restoring)
         )
-        .then(|| {
-            crate::controllers::substrate::RecoveryCharge::enforce(self.cluster_admission.as_ref())
-        })
+    }
+
+    /// The substrate charge for an explicit lifecycle action on a sandbox
+    /// observed in `lifecycle`:
+    ///
+    /// - entering `suspended` or `restoring`, the restore-lease winner
+    ///   charges it ([`Self::defers_to_restore_claim`]);
+    /// - otherwise, an action [`Self::action`] charged at entry is paid;
+    /// - an action on a live lifecycle isn't charged, and can create a pod
+    ///   only if the running one is gone.
+    fn action_charge(
+        &self,
+        action: SandboxAction,
+        lifecycle: Option<SandboxLifecycle>,
+        attribution: &ActivationAttribution,
+    ) -> RecoveryCharge {
+        if Self::defers_to_restore_claim(lifecycle) {
+            RecoveryCharge::enforce(
+                self.cluster_admission.as_ref(),
+                CapPolicy::ReserveAtClaim,
+                attribution.clone(),
+            )
+        } else if action.activation_class(lifecycle).is_some() {
+            RecoveryCharge::paid(
+                self.cluster_admission.as_ref(),
+                CapPolicy::Reserved,
+                attribution.clone(),
+            )
+        } else {
+            RecoveryCharge::exempt(
+                self.cluster_admission.as_ref(),
+                CapPolicy::Check,
+                attribution.clone(),
+            )
+        }
     }
 }
 
@@ -939,16 +1107,26 @@ async fn run_stop_or_kill(
     }
 }
 
-/// The drain gate's single read of the sandbox row and its primary node.
-#[derive(sqlx::FromRow)]
-struct DrainGateRow {
-    portable: bool,
-    drain_phase: Option<NodeDrainPhase>,
-    drain_mode: Option<String>,
-    /// Whether `COALESCE(target_node_id, active_node_id)` names a node row.
-    primary_found: bool,
-    /// Whether that node has a `node_k8s` row.
-    mapped: bool,
+/// What the drain gate's read says about a sandbox: the drain of the node
+/// its next placement-affecting call would land on
+/// ([`fetch_node_drain_gate`]), whether its active or target node, or a
+/// candidate the executions fallback read, has a drain engine recorded (a
+/// v2 drain, or an engine this build doesn't know), whether one of those
+/// engines is one this build doesn't know, and whether it is stopped.
+pub(super) struct NodeDrainGate {
+    pub(super) state: Option<NodeDrain>,
+    pub(super) non_v1_drain_named: bool,
+    pub(super) unknown_engine_named: bool,
+    pub(super) stopped: bool,
+}
+
+/// The drain state of [`fetch_node_drain_gate`]'s read alone.
+#[cfg(test)]
+pub(super) async fn fetch_active_node_drain_state(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+) -> Result<Option<NodeDrain>, sqlx::Error> {
+    Ok(fetch_node_drain_gate(pool, sandbox_id).await?.state)
 }
 
 /// Fetch the `drain_phase` of the node that the next placement-affecting
@@ -980,28 +1158,38 @@ struct DrainGateRow {
 ///
 /// Returns `Ok(Some(state))` when either the primary or fallback node is
 /// in some drain phase (`draining` / `drained` / `terminating`), carrying that
-/// node's `drain_mode` alongside it; the primary's phase wins when both
+/// node's `drain_mode` alongside it, or has a v2 drain whose cancel is still
+/// pending, or a drain engine this build doesn't know
+/// ([`NodeDrain::Unknown`]); the primary's phase wins when both
 /// produce a non-NULL value (so a draining `target_node_id` is reported as the
 /// source of the conflict). Returns `Ok(None)` when neither candidate resolves
 /// to a draining node — direct-substrate sandboxes always fall through here
 /// because they have no `sandbox_k8s_executions` rows and no drain phase in
-/// practice.
+/// practice. A drain phase this build doesn't know fails the read with a
+/// decode error.
 ///
 /// The mode is resolved through [`NodeDrainMode::from_column_str`], so a NULL
 /// or unrecognized `drain_mode` on a node that *is* draining reads as
 /// [`NodeDrainMode::Gentle`] and leaves this gate open. That direction is
 /// deliberate: a mode nobody set must not 409 every access and placement call
 /// for the sandboxes on that node.
-pub(super) async fn fetch_active_node_drain_state(
+///
+/// The rest of [`NodeDrainGate`] comes from the same statement. The drain
+/// engines its active and target nodes record and whether it is stopped are
+/// read whatever its portability: a portable sandbox has no drain state, but a stop there
+/// still leaves it on its node. The engines of the executions fallback's
+/// candidates come from the fallback's own read, when it runs.
+pub(super) async fn fetch_node_drain_gate(
     pool: &PgPool,
     sandbox_id: SandboxId,
-) -> Result<Option<NodeDrainState>, sqlx::Error> {
+) -> Result<NodeDrainGate, sqlx::Error> {
     // Suspended-or-restoring sandboxes with a fresh ready S3 snapshot are
     // portable — restore can land them on any healthy node, so a drain phase
     // on their historical placement is no longer a reason to block
     // placement-affecting calls. Skip the rest of the gate in that case via
-    // the shared portability predicate. The `lifecycle IN ('suspended',
-    // 'restoring')` scope is load-bearing: for `started` / `paused` the
+    // the shared portability predicate `portable_for_restore_affinity`, which
+    // `placement_gate` reads. The `lifecycle IN ('suspended', 'restoring')`
+    // scope is load-bearing: for `started` / `paused` the
     // canonical state lives in the VM's live memory on the source node, not
     // in the snapshot, so a ready prior-cycle snapshot is stale relative to
     // the live VM and must not release the gate. `restoring` is included
@@ -1013,51 +1201,79 @@ pub(super) async fn fetch_active_node_drain_state(
     // sandbox row, so they are one statement: a snapshot at least as
     // consistent as the two reads it replaces. `portable` is only consulted
     // first; the primary columns are ignored when it is true.
-    let portable_predicate = portable_for_restore_affinity("s");
-    let gate_query = format!(
-        "SELECT COALESCE(({portable_predicate}), FALSE) AS portable,
-                n.drain_phase,
-                n.drain_mode,
-                n.id IS NOT NULL AS primary_found,
-                EXISTS (SELECT 1 FROM node_k8s nk WHERE nk.node_id = n.id) AS mapped
-           FROM sandboxes s
-           LEFT JOIN nodes n ON n.id = COALESCE(s.target_node_id, s.active_node_id)
-          WHERE s.id = $1"
-    );
-    let gate: Option<DrainGateRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(gate_query.as_str())))
-        .bind(sandbox_id)
-        .fetch_optional(pool)
-        .await?;
+    let gate = sandbox_store::placement_gate::placement_gate(pool, sandbox_id).await?;
+    let mut engines = gate
+        .as_ref()
+        .map_or_else(Vec::new, |row| row.drain_engines_named.clone());
+    let stopped = gate.as_ref().is_some_and(|row| row.stopped);
+    let resolved = resolve_drain_state(pool, sandbox_id, gate).await?;
+    engines.extend(resolved.fallback_engines);
+    let non_v1_drain_named = !engines.is_empty();
+    let unknown_engine_named = engines
+        .iter()
+        .any(|engine| engine.as_str() != NODE_DRAIN_ENGINE_V2);
+    Ok(NodeDrainGate {
+        state: resolved.state,
+        non_v1_drain_named,
+        unknown_engine_named,
+        stopped,
+    })
+}
+
+/// [`resolve_drain_state`]'s answer: the drain state, and the drain engines
+/// recorded on the executions fallback's candidates it read, whichever of
+/// them won the state.
+struct ResolvedDrain {
+    state: Option<NodeDrain>,
+    fallback_engines: Vec<String>,
+}
+
+/// The drain state [`fetch_node_drain_gate`] answers, from the gate's
+/// read of the sandbox row and its primary node, and the drain engines the
+/// executions fallback's candidates record, when it read them: a candidate
+/// whose drain didn't win the state may still be sealed under a v2 drain.
+async fn resolve_drain_state(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    gate: Option<sandbox_store::placement_gate::PlacementGateRow>,
+) -> Result<ResolvedDrain, sqlx::Error> {
+    let primary_only = |state| ResolvedDrain {
+        state,
+        fallback_engines: Vec::new(),
+    };
     if gate.as_ref().is_some_and(|row| row.portable) {
-        return Ok(None);
+        return Ok(primary_only(None));
     }
 
     // Primary lookup: drain phase + mode of the node that the next placement-
     // affecting call would land on. `target_node_id` wins over
     // `active_node_id` so this mirrors `preferred_restore_node_name`.
     // Yields `None` when the sandbox row is missing or both placement
-    // columns are NULL (or name no node row), and `Some((None, _))` when the
-    // node exists but is not draining — both cases fall through to the
+    // columns are NULL (or name no node row), and a row without a phase when
+    // the node exists but is not draining — both cases fall through to the
     // executions fallback below.
-    let primary: Option<(Option<NodeDrainPhase>, Option<String>, bool)> = gate
-        .filter(|row| row.primary_found)
-        .map(|row| (row.drain_phase, row.drain_mode, row.mapped));
+    let primary = gate.filter(|row| row.primary_found);
     // `mapped` is whether the primary node has a `node_k8s` row. It decides
     // whether the executions fallback is even reachable: the substrate uses the
     // fallback only when the primary can't be resolved to a k8s node, so for a
     // mapped primary the fallback is not where placement lands and consulting it
     // would 409 on a node nothing is going to touch.
-    let primary_mapped = primary.as_ref().is_some_and(|(_, _, mapped)| *mapped);
-    let primary_state =
-        primary.and_then(|(phase, mode, _)| NodeDrainState::from_columns(phase, mode.as_deref()));
+    let primary_mapped = primary.as_ref().is_some_and(|row| row.mapped);
+    let primary_state = primary.and_then(|row| {
+        NodeDrain::from_columns(
+            row.drain_engine.as_deref(),
+            row.drain_phase.map(NodeDrainPhase::as_str),
+            row.drain_mode.as_deref(),
+        )
+    });
     // Return early **only** when the primary actually blocks. A non-blocking
     // primary must still fall through to the executions fallback, because
     // `preferred_restore_node_name` uses that fallback when the primary has no
     // `node_k8s` mapping — so it, not the primary, is the node placement lands
     // on. Short-circuiting on a gentle primary would mask a forced or
     // terminating fallback and let wake/access race an evacuation there.
-    if primary_state.is_some_and(NodeDrainState::blocks_placement) {
-        return Ok(primary_state);
+    if primary_state.is_some_and(NodeDrain::blocks_placement) {
+        return Ok(primary_only(primary_state));
     }
     // A non-blocking *mapped* primary is the whole answer: placement resolves to
     // it, so a historical execution row naming some older drained node is not a
@@ -1067,26 +1283,16 @@ pub(super) async fn fetch_active_node_drain_state(
     // absent or unmapped — that is when the substrate itself falls back, and
     // when a gentle primary could otherwise mask a forced fallback.
     if primary_mapped {
-        return Ok(primary_state);
+        return Ok(primary_only(primary_state));
     }
 
     // Fallback: the latest `sandbox_k8s_executions.k8s_node_name`. The
     // unique index on (sandbox_id, generation) makes the LIMIT 1
     // deterministic per sandbox.
-    let latest_k8s_name: Option<String> = sqlx::query_scalar(sql!(
-        "SELECT ske.k8s_node_name
-           FROM sandbox_k8s_executions ske
-          WHERE ske.sandbox_id = $1
-            AND ske.k8s_node_name IS NOT NULL
-          ORDER BY ske.generation DESC
-          LIMIT 1"
-    ))
-    .bind(sandbox_id)
-    .fetch_optional(pool)
-    .await?
-    .flatten();
+    let latest_k8s_name =
+        pplx_space_sandbox_store::k8s_executions::latest_k8s_node_name(pool, sandbox_id).await?;
     let Some(k8s_node_name) = latest_k8s_name else {
-        return Ok(primary_state);
+        return Ok(primary_only(primary_state));
     };
 
     // Resolve the latest execution's k8s node name to drain state via
@@ -1100,41 +1306,82 @@ pub(super) async fn fetch_active_node_drain_state(
     // whether the gate fires. Preferring a blocking sibling happens below, in
     // Rust, so the mode policy stays where `from_column_str` is rather than
     // being restated in an `ORDER BY`.
-    let siblings: Vec<(NodeDrainPhase, Option<String>)> = sqlx::query_as(sql!(
-        "SELECT n.drain_phase, n.drain_mode
-           FROM node_k8s nk
-           JOIN nodes n ON n.id = nk.node_id
-          WHERE nk.k8s_node_name = $1
-            AND n.drain_phase IS NOT NULL"
-    ))
-    .bind(k8s_node_name)
-    .fetch_all(pool)
-    .await?;
-    let siblings: Vec<NodeDrainState> = siblings
-        .into_iter()
-        .filter_map(|(phase, mode)| NodeDrainState::from_columns(Some(phase), mode.as_deref()))
-        .collect();
-    // Precedence: any blocking candidate wins, whichever side it came from; else
-    // the primary if it had a phase at all (so a caller can still see "draining,
-    // gently"); else any sibling.
-    Ok(siblings
+    //
+    // A v2 drain being cancelled has no phase, and its node may still be
+    // sealed: an engine without a phase is a candidate too.
+    let siblings = drain_reads::draining_nodes_for_k8s_node_name(pool, &k8s_node_name).await?;
+    let fallback_engines = siblings
         .iter()
-        .copied()
+        .filter_map(|node| node.drain_engine.clone())
+        .collect();
+    let siblings: Vec<NodeDrain> = siblings
+        .into_iter()
+        .filter_map(|node| {
+            NodeDrain::from_columns(
+                node.drain_engine.as_deref(),
+                node.drain_phase.map(NodeDrainPhase::as_str),
+                node.drain_mode.as_deref(),
+            )
+        })
+        .collect();
+    Ok(ResolvedDrain {
+        state: drain_state_precedence(primary_state, &siblings),
+        fallback_engines,
+    })
+}
+
+/// The candidate the gate answers with, of the primary and the siblings of
+/// the latest execution's node: one that blocks placement, whichever side it
+/// came from; else one that refuses VM activations, the primary first; else
+/// the primary if it had a phase at all (so a caller can still see
+/// "draining, gently"); else the first sibling.
+fn drain_state_precedence(primary: Option<NodeDrain>, siblings: &[NodeDrain]) -> Option<NodeDrain> {
+    let candidates = || primary.iter().chain(siblings).copied();
+    // A candidate that blocks wins over one that only refuses activations,
+    // which wins over the primary.
+    candidates()
         .find(|state| state.blocks_placement())
-        .or(primary_state)
-        .or_else(|| siblings.first().copied()))
+        .or_else(|| candidates().find(|state| state.refuses_activations()))
+        .or(primary)
+        .or_else(|| siblings.first().copied())
 }
 
 /// Build the 409 returned when a drained-node guard fires. Centralised so
 /// the explicit-action path and the implicit-wake path return identically
 /// shaped errors.
-pub(super) fn drain_block_conflict(
-    action: SandboxAction,
-    phase: NodeDrainPhase,
-) -> ControllerError {
+pub(super) fn drain_block_conflict(action: SandboxAction, drain: NodeDrain) -> ControllerError {
     ControllerError::conflict(format!(
-        "sandbox cannot {action} while its resident node is {phase}; \
+        "sandbox cannot {action} while its resident node is {drain}; \
          the node-drain reconciler is migrating it off"
+    ))
+}
+
+/// The refusal of a call a drain refuses: v1's 409
+/// ([`drain_block_conflict`]), and, under a v2 drain or one this build
+/// doesn't know, a 503 with `Retry-After`, a client that gives up on a 409
+/// retries. Its text says what the call waits for: a v2 drain's node makes a
+/// sandbox that isn't `stopped` durable while it is sealed, and once it has,
+/// the same call lands on another node; a `stopped` one stays where it is
+/// until the node is undrained or the sandbox is deleted; a cancel pending
+/// ends once the node is undrained.
+pub(crate) fn drain_refusal(
+    action: SandboxAction,
+    drain: NodeDrain,
+    stopped: bool,
+) -> ControllerError {
+    let waits_for = match drain {
+        NodeDrain::V1 { .. } => return drain_block_conflict(action, drain),
+        NodeDrain::V2 {
+            phase: V2DrainPhase::Cancelling,
+        } => "the node is being undrained; retry shortly",
+        NodeDrain::V2 { .. } if stopped => {
+            "a v2 drain doesn't move stopped sandboxes: undrain the node or delete the sandbox"
+        }
+        NodeDrain::V2 { .. } => "the drain is making it durable elsewhere; retry shortly",
+        NodeDrain::Unknown => "retry shortly",
+    };
+    ControllerError::node_draining(format!(
+        "sandbox cannot {action} yet: its node is {drain} under a node drain; {waits_for}"
     ))
 }
 
@@ -1146,25 +1393,189 @@ pub(super) fn drain_block_conflict(
 /// runtime is unreachable (including non-dormant lifecycles like `started`
 /// or `restoring`).
 ///
-/// Returns 409 when the resolved node is `drained` or `terminating`, or is
-/// `draining` under a **forced** drain. A gentle drain does not block — see
-/// [`NodeDrainState::blocks_placement`].
+/// Refuses when the resolved node is `drained` or `terminating`, or is
+/// `draining` under a **forced** v1 drain. A gentle v1 drain does not block —
+/// see [`NodeDrain::blocks_placement`]. A v1 refusal is a 409; every v2
+/// refusal is a 503 with a `Retry-After` ([`drain_refusal`]): retried once
+/// the drain has made the sandbox durable, the call lands on another node.
+///
+/// It refuses nothing for a sandbox whose current state is durable: a
+/// `suspended` or `restoring` row whose current snapshot is durable gets no
+/// drain state from [`fetch_node_drain_gate`], whatever its node,
+/// and its activation lands elsewhere. A stopped row gets main's answer: a
+/// v2 drain doesn't move a stopped sandbox.
+///
+/// A **forced** v1 drain, and a v2 drain once `drained` or `terminating`,
+/// refuse every call this gate sees on any other sandbox of the node,
+/// running or not ([`NodeDrain::blocks_placement`]). A v2 drain while
+/// `draining`, or with its cancel pending, blocks no placement: its node
+/// keeps running sandboxes running. But the node is sealed and would refuse
+/// a VM activation itself ([`NodeDrain::refuses_activations`]), so it
+/// refuses every action on a sandbox that isn't `started` except the ones
+/// that activate no VM ([`activates_no_vm`]). That covers an access path's call
+/// as well (an exec, a `spaced` call, a port open, an update), whose runtime
+/// client wakes a sandbox it finds dormant. Under it a `started` sandbox's
+/// calls go through, and so does every suspend, stop, kill, pause,
+/// checkpoint, snapshot setting and stats read; a delete doesn't pass this
+/// gate. A stop, a kill and a rollback without restart of a sandbox whose
+/// active or target node has a v2 drain, or an engine this build doesn't
+/// know, recorded are refused apart
+/// ([`ensure_stop_admitted_by_v2_drain`], [`ensure_stop_admitted_by_drain`]).
 pub(super) async fn ensure_resolved_node_not_draining(
     pool: &PgPool,
     sandbox_id: SandboxId,
     action: SandboxAction,
 ) -> Result<(), ControllerError> {
-    let drain_state = fetch_active_node_drain_state(pool, sandbox_id)
+    let gate = fetch_drain_gate(pool, sandbox_id).await?;
+    refuse_under_drain(pool, sandbox_id, action, &gate).await
+}
+
+/// The drain gate's read, as a controller error when it fails.
+async fn fetch_drain_gate(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+) -> Result<NodeDrainGate, ControllerError> {
+    fetch_node_drain_gate(pool, sandbox_id)
         .await
         .map_err(|err| {
             crate::controllers::db_contention_error("failed to load node drain state", &err)
-        })?;
+        })
+}
+
+/// [`ensure_resolved_node_not_draining`]'s decision from the gate's read.
+async fn refuse_under_drain(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    action: SandboxAction,
+    gate: &NodeDrainGate,
+) -> Result<(), ControllerError> {
+    let drain_state = gate.state;
+    let refused = match drain_state {
+        Some(state) if state.blocks_placement() => true,
+        Some(state) if !activates_no_vm(action) && state.refuses_activations() => {
+            !sandbox_started(pool, sandbox_id).await.map_err(|err| {
+                crate::controllers::db_contention_error("failed to load the sandbox", &err)
+            })?
+        }
+        _ => false,
+    };
     if let Some(state) = drain_state
-        && state.blocks_placement()
+        && refused
     {
-        return Err(drain_block_conflict(action, state.phase));
+        return Err(drain_refusal(action, state, gate.stopped));
     }
     Ok(())
+}
+
+/// The drain gate of a rollback without restart, which ends the sandbox
+/// stopped: it refuses what [`ensure_resolved_node_not_draining`] refuses, as
+/// every rollback's gate does, then the rollback itself while a node the
+/// sandbox names, active or target, has a v2 drain or an unknown engine
+/// recorded, or its drain state is one ([`refuse_stop_under_v2_drain`]), from
+/// one read.
+pub(super) async fn ensure_stop_admitted_by_drain(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    action: SandboxAction,
+) -> Result<(), ControllerError> {
+    let gate = fetch_drain_gate(pool, sandbox_id).await?;
+    refuse_under_drain(pool, sandbox_id, action, &gate).await?;
+    refuse_stop_under_v2_drain(action, &gate)
+}
+
+/// The stop gate of a stop or kill (`:stop`, `:kill`, and the admin
+/// `:force-stop` and `:force-kill`, which all run [`SandboxAction::Stop`] or
+/// [`SandboxAction::Kill`]): [`refuse_stop_under_v2_drain`] from the drain
+/// gate's read, which a v1 drain's stop never had refused. The drain state
+/// the read returns ([`fetch_node_drain_gate`]'s) is the caller's,
+/// to pick its runtime client, so the stop reads the gate once.
+pub(super) async fn ensure_stop_admitted_by_v2_drain(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    action: SandboxAction,
+) -> Result<Option<NodeDrain>, ControllerError> {
+    let gate = fetch_drain_gate(pool, sandbox_id).await?;
+    refuse_stop_under_v2_drain(action, &gate)?;
+    Ok(gate.state)
+}
+
+/// Refuse an action that ends the gate's sandbox stopped while a node it names,
+/// active or target, has a v2 drain recorded: in any phase, its cancel
+/// pending included, the node is sealed. A v2 drain doesn't move a stopped
+/// sandbox and never terminates a node that holds one, so a stop there would
+/// hold the drain. The refusal is a retryable 503 with `Retry-After`; once
+/// the node is undrained the call goes through. A delete isn't refused.
+///
+/// It fails closed: a drain engine this build doesn't know on either node is
+/// refused too, and so is a gate whose drain state is a v2 drain or
+/// [`NodeDrain::Unknown`], which the executions fallback answers when both
+/// placement columns are NULL or the primary node is unmapped. So is any
+/// fallback candidate with a drain engine recorded, though a placement-
+/// blocking v1 drain on another candidate won the drain state: that
+/// candidate's node is sealed all the same. The refusal
+/// and the state the Stop arm picks its runtime client from then agree. A v1
+/// drain (no engine) is never refused here.
+///
+/// It follows the node's persisted drain, not this process's
+/// `SPACE_DRAIN_V2_ENABLED`: with no drain engine recorded, which with drain
+/// v2 off is every node, everything is admitted, and a v2 drain keeps its
+/// stops refused on a replica whose switch is off, during the switch-on
+/// rollout and after a switch-off that left a drain or its cancel pending.
+fn refuse_stop_under_v2_drain(
+    action: SandboxAction,
+    gate: &NodeDrainGate,
+) -> Result<(), ControllerError> {
+    let state_v2 = matches!(gate.state, Some(NodeDrain::V2 { .. }));
+    let state_unknown = matches!(gate.state, Some(NodeDrain::Unknown));
+    if !(gate.non_v1_drain_named || state_v2 || state_unknown) {
+        return Ok(());
+    }
+    if gate.unknown_engine_named || state_unknown {
+        return Err(ControllerError::node_draining(format!(
+            "sandbox cannot {action} yet: its node is in a drain state this build doesn't know \
+             under a node drain; retry shortly"
+        )));
+    }
+    Err(ControllerError::node_draining(format!(
+        "sandbox cannot {action} yet: its node is under a v2 node drain, which doesn't move \
+         stopped sandboxes; retry once the node is undrained, or delete the sandbox"
+    )))
+}
+
+/// Whether `action` is known to activate no VM, so a sealed node lets it
+/// through on a sandbox that isn't running. Every other action is refused
+/// there: a start, wake, restore or resume, and an access path's call or an
+/// update, whose runtime client wakes a dormant sandbox. A stats read uses
+/// the non-recovering client ([`SandboxController::stats`]), so it wakes
+/// nothing. An allow-list, so a new action is refused until it is known to
+/// activate nothing.
+const fn activates_no_vm(action: SandboxAction) -> bool {
+    match action {
+        SandboxAction::Suspend
+        | SandboxAction::Stop
+        | SandboxAction::Kill
+        | SandboxAction::Pause
+        | SandboxAction::Checkpoint
+        | SandboxAction::EnableSnapshots
+        | SandboxAction::DisableSnapshots
+        | SandboxAction::Stats => true,
+        SandboxAction::Start
+        | SandboxAction::Wake
+        | SandboxAction::ImplicitWake(_)
+        | SandboxAction::Restore
+        | SandboxAction::Resume
+        | SandboxAction::OpenPort
+        | SandboxAction::Rollback
+        | SandboxAction::Spaced
+        | SandboxAction::Update => false,
+    }
+}
+
+/// Whether the sandbox row is `started`.
+async fn sandbox_started(pool: &PgPool, sandbox_id: SandboxId) -> Result<bool, sqlx::Error> {
+    sandbox_store::row_reads::is_started(pool, sandbox_id)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 /// Access-path drain gate. Returns 409 when the sandbox's resolved node
@@ -1179,10 +1590,14 @@ pub(super) async fn ensure_resolved_node_not_draining(
 /// for the short window before the reconciler suspends + migrates it; users
 /// see a clear "node is draining" error rather than a flaky stuck pod.
 ///
-/// Under a **gentle** drain there is no migration window to protect, so this
-/// does not fire while the node is `draining` — serving traffic normally is
-/// the mode's entire purpose. It still fires once the node reaches `drained`
-/// or `terminating`.
+/// Under a **gentle** v1 drain a running sandbox keeps serving traffic, which
+/// is the mode's entire purpose, so this lets its calls through while the
+/// node is `draining`: there is no migration window to protect. A v2 drain
+/// does the same while `draining` or with its cancel pending, since its
+/// sealed node keeps running VMs running; a call on a sandbox that isn't
+/// `started` is refused with a 503, since its runtime client would wake the
+/// sandbox on the sealed node ([`ensure_resolved_node_not_draining`]).
+/// Every drain fires this once the node reaches `drained` or `terminating`.
 pub(super) async fn ensure_access_path_not_blocked_by_drain(
     pool: &PgPool,
     sandbox: &Sandbox,
@@ -1243,11 +1658,25 @@ impl SandboxController {
         id: SandboxId,
         sandbox: Option<&Sandbox>,
     ) -> Result<(), ControllerError> {
+        // Snapshotted before the teardown, so only entries that predate it
+        // are forgotten.
+        let teardown = self.live_teardown(id).await;
         if sandbox.is_none() {
-            return self.delete_observed_sandbox(pool, id).await;
+            let deleted = self.delete_observed_sandbox(pool, id).await;
+            if deleted.is_ok() {
+                self.forget_live_sandbox(teardown).await;
+            }
+            return deleted;
         }
 
-        if let Err(err) = self.substrate.delete_execution(id).await {
+        let deleted = self.substrate.delete_execution(id).await;
+        // Only a confirmed teardown, or a node that had no such sandbox,
+        // uncounts it: after a failed one its pod may still exist, so its
+        // pending member stays to lapse.
+        if matches!(deleted, Ok(()) | Err(SubstrateError::NotFound { .. })) {
+            self.forget_live_sandbox(teardown).await;
+        }
+        if let Err(err) = deleted {
             if cluster_delete_must_defer_control_plane(&err) {
                 return Err(ControllerError::from(err));
             }
@@ -1296,7 +1725,9 @@ impl SandboxController {
         // self-healing (retry the DELETE once the upload finalizes).
         let phase_started = std::time::Instant::now();
         tracing::info!(sandbox_id = %id, phase = "snapshot_precheck", result = "started", "sandbox delete phase started");
-        let snapshot_precheck = in_flight_snapshot_upload_idle_for(pool, id).await;
+        let snapshot_precheck = pplx_space_snapshot_store::upload::in_flight_idle_for(pool, id)
+            .await
+            .map_err(sqlx::Error::from);
         tracing::info!(
             sandbox_id = %id,
             phase = "snapshot_precheck",
@@ -1451,6 +1882,8 @@ impl SandboxController {
         Ok(())
     }
 
+    // The activation request plus the client the activation is for.
+    #[allow(clippy::too_many_arguments)]
     pub async fn action(
         &self,
         pool: &PgPool,
@@ -1459,14 +1892,20 @@ impl SandboxController {
         metric_identity: SandboxApiMetricIdentity,
         action: SandboxAction,
         activation: Option<SandboxActivationRequest>,
+        activating_client: ActivationClient,
     ) -> Result<serde_json::Value, ControllerError> {
         admit_user_lifecycle(id, UserLifecycleRequest::Action(action));
         let Some(sandbox) = sandbox else {
             return self
-                .untracked_action(id, metric_identity, action, activation)
+                .untracked_action(id, metric_identity, action, activation, activating_client)
                 .await;
         };
-
+        // Resolved once, from the row this action loaded, so the charge and
+        // the pod label agree even if pod tracking moves the record meanwhile.
+        let attribution = ActivationAttribution::resolve(
+            activating_client,
+            sandbox.activating_client_id.as_ref(),
+        );
         // Classify at entry; callers that join another activation clear this.
         let entry_lifecycle = sandbox.lifecycle.parse::<SandboxLifecycle>().ok();
         let mut requested_kind = action.requested_size_kind(entry_lifecycle);
@@ -1491,6 +1930,17 @@ impl SandboxController {
                 return Err(err);
             }
 
+            // A stop or kill answers to the node's v2 drain here, before its
+            // `*_requested` event, so a refused stop leaves none on each retry
+            // of its operation. The drain state the same read returns picks the
+            // Stop arm's runtime client below, so a stop reads the gate once,
+            // as it did.
+            let stop_drain_state = if matches!(action, SandboxAction::Stop | SandboxAction::Kill) {
+                Some(ensure_stop_admitted_by_v2_drain(pool, id, action).await?)
+            } else {
+                None
+            };
+
             // Validate activation options before admission and the requested event:
             // a malformed request (e.g. `ready_timeout_secs=0`) must be rejected
             // without spending a token or leaving an orphaned `*_requested` event.
@@ -1507,15 +1957,22 @@ impl SandboxController {
             // not a consistency guard for races with other lifecycle writers. For
             // Wake the terminal-lifecycle check runs first — a Wake the guard
             // rejects must not spend a shared token or draw a 429 either.
-            match action {
+            let live = match action {
                 SandboxAction::Start | SandboxAction::Restore => {
                     let lifecycle = sandbox.lifecycle.parse::<SandboxLifecycle>().ok();
                     // Restore-shaped starts defer admission to the restore-lease
                     // claim-winner too. Direct has no lease and spends the same
                     // policy at its substrate entry.
-                    if self.restore_claim_charge(lifecycle).is_none() {
-                        self.admit_action_cluster_activation(action, lifecycle)
-                            .await?;
+                    if Self::defers_to_restore_claim(lifecycle) {
+                        None
+                    } else {
+                        self.admit_action_cluster_activation(
+                            action,
+                            lifecycle,
+                            typed_id,
+                            &attribution,
+                        )
+                        .await?
                     }
                 }
                 SandboxAction::Wake | SandboxAction::ImplicitWake(_) => {
@@ -1549,29 +2006,44 @@ impl SandboxController {
                     // cluster-activation 429/backpressure here is the
                     // control-plane-saturation signature the retry-storm alert
                     // exists to catch, so record it on the reconnect series (the
-                    // error classifier maps the retry-after to exhausted/wait_budget)
-                    // before returning — otherwise a storm throttled by the cluster
-                    // limiter is invisible to the monitor.
-                    if self.restore_claim_charge(Some(lifecycle)).is_none()
-                        && let Err(err) = self
-                            .admit_action_cluster_activation(action, Some(lifecycle))
+                    // classifier records a cluster-activation 429 as
+                    // exhausted/wait_budget and a live-cap refusal as
+                    // rejected/rate_limited) before returning — otherwise a storm
+                    // throttled by the cluster limiter is invisible to the monitor.
+                    if Self::defers_to_restore_claim(Some(lifecycle)) {
+                        None
+                    } else {
+                        match self
+                            .admit_action_cluster_activation(
+                                action,
+                                Some(lifecycle),
+                                typed_id,
+                                &attribution,
+                            )
                             .await
-                    {
-                        let (outcome, terminal_phase, reason) =
-                            reconnect_controller_error_outcome(sandbox.lifecycle.as_str(), &err);
-                        record_reconnect_attempt(
-                            metric_identity,
-                            sandbox.lifecycle.as_str(),
-                            outcome,
-                            terminal_phase,
-                            reason,
-                            reconnect_started_at,
-                        );
-                        return Err(err);
+                        {
+                            Ok(live) => live,
+                            Err(err) => {
+                                let (outcome, terminal_phase, reason) =
+                                    reconnect_admission_refusal_outcome(&err);
+                                record_reconnect_attempt(
+                                    metric_identity,
+                                    sandbox.lifecycle.as_str(),
+                                    outcome,
+                                    terminal_phase,
+                                    reason,
+                                    reconnect_started_at,
+                                );
+                                return Err(err);
+                            }
+                        }
                     }
                 }
-                _ => {}
-            }
+                _ => None,
+            };
+            // The substrate charge carries it, so a wake that goes on after
+            // this request ends (a detached restore leader) takes it over.
+            let live = LiveHandoff::new(live);
 
             let id_str = id.to_string();
             let body =
@@ -1584,6 +2056,10 @@ impl SandboxController {
                     .lifecycle_state(sandbox.lifecycle.as_str())
                     .placement(sandbox.placement.as_str()),
             );
+            // A suspend snapshots the entries it may forget before its
+            // substrate call, so a wake that reserves once it commits keeps
+            // counting.
+            let mut suspend_teardown = None;
             let result: Result<
                 (Option<SandboxLifecycleStatus>, serde_json::Value),
                 ControllerError,
@@ -1596,10 +2072,12 @@ impl SandboxController {
                             metric_identity,
                             typed_id,
                             activation,
-                            self.restore_claim_charge(
+                            self.action_charge(
+                                action,
                                 sandbox.lifecycle.parse::<SandboxLifecycle>().ok(),
+                                &attribution,
                             )
-                            .unwrap_or(crate::controllers::substrate::RecoveryCharge::Exempt),
+                            .with_live(&live),
                         )
                         .await
                     {
@@ -1622,6 +2100,9 @@ impl SandboxController {
                         }
                     };
                     if !execution.completion.should_finalize_lifecycle() {
+                        // Joined an activation that's already finishing: its
+                        // pod exists, so this member lapses as on success.
+                        live.keep();
                         requested_kind = None;
                         return Ok(body);
                     }
@@ -1672,10 +2153,12 @@ impl SandboxController {
                             sandbox,
                             DEFAULT_BLOCKING_WAIT_TIMEOUT,
                             action.wake_activity(),
-                            self.restore_claim_charge(
+                            self.action_charge(
+                                action,
                                 sandbox.lifecycle.parse::<SandboxLifecycle>().ok(),
+                                &attribution,
                             )
-                            .unwrap_or(crate::controllers::substrate::RecoveryCharge::Exempt),
+                            .with_live(&live),
                         )
                         .await
                     {
@@ -1708,6 +2191,8 @@ impl SandboxController {
                         }
                     };
                     if !execution.completion.should_finalize_lifecycle() {
+                        // As for Start: a joined activation's pod exists.
+                        live.keep();
                         completion_guard.defuse();
                         requested_kind = None;
                         record_reconnect_attempt(
@@ -1841,10 +2326,12 @@ impl SandboxController {
                             metric_identity,
                             typed_id,
                             activation,
-                            self.restore_claim_charge(
+                            self.action_charge(
+                                action,
                                 sandbox.lifecycle.parse::<SandboxLifecycle>().ok(),
+                                &attribution,
                             )
-                            .unwrap_or(crate::controllers::substrate::RecoveryCharge::Exempt),
+                            .with_live(&live),
                         )
                         .await
                     {
@@ -1954,6 +2441,7 @@ impl SandboxController {
                     Ok((None, body))
                 }
                 SandboxAction::Suspend => {
+                    suspend_teardown = self.live_teardown(typed_id).await;
                     match self.substrate.suspend_execution(typed_id).await {
                         Ok(_) => {}
                         Err(err) => {
@@ -2016,12 +2504,8 @@ impl SandboxController {
                 // user their sandbox; it returns 503 for a cleanup whose pod
                 // is already gone.
                 SandboxAction::Stop | SandboxAction::Kill => {
-                    let drain_state =
-                        fetch_active_node_drain_state(pool, id)
-                            .await
-                            .map_err(|err| {
-                                db_contention_error("failed to load node drain state", &err)
-                            })?;
+                    // Read at the entry's stop gate.
+                    let drain_state = stop_drain_state.flatten();
                     if drain_state.is_some() {
                         let maybe_client =
                             self.substrate.reachable_runtime_client(typed_id).await?;
@@ -2042,7 +2526,15 @@ impl SandboxController {
                             .substrate
                             .runtime_client(
                                 typed_id,
-                                crate::controllers::substrate::RecoveryCharge::Exempt,
+                                // A rebuild as a side effect of a stop acts
+                                // for the sandbox's recorded client.
+                                RecoveryCharge::exempt(
+                                    self.cluster_admission.as_ref(),
+                                    CapPolicy::Skip,
+                                    ActivationAttribution::inherit(
+                                        sandbox.activating_client_id.as_ref(),
+                                    ),
+                                ),
                             )
                             .await?;
                         run_stop_or_kill(&mut client, action, typed_id).await?;
@@ -2080,8 +2572,10 @@ impl SandboxController {
                                 .substrate
                                 .runtime_client(
                                     typed_id,
-                                    crate::controllers::substrate::RecoveryCharge::enforce(
+                                    RecoveryCharge::enforce(
                                         self.cluster_admission.as_ref(),
+                                        CapPolicy::Check,
+                                        attribution.clone(),
                                     ),
                                 )
                                 .await?;
@@ -2143,6 +2637,16 @@ impl SandboxController {
                     return Err(err);
                 }
             };
+            // The activation succeeded, so its pod exists: the member lapses
+            // within one TTL, covering the reflectors' watch delay.
+            live.keep();
+            // A suspend deletes the pod, so the sandbox stops counting. A stop's
+            // pod ends with its VM; its pending member is left to lapse within
+            // one TTL, covering the reflectors' watch delay until the pod reads
+            // as ended.
+            if status == Some(SandboxLifecycleStatus::Suspended) {
+                self.forget_live_sandbox(suspend_teardown).await;
+            }
             if let Some(status) = status {
                 if let Some(stamp) = post_action_stamp(action, self.substrate.capabilities()) {
                     maybe_update_sandbox_lifecycle(pool, id, stamp).await;
@@ -2177,23 +2681,46 @@ impl SandboxController {
         metric_identity: SandboxApiMetricIdentity,
         action: SandboxAction,
         activation: Option<SandboxActivationRequest>,
+        activating_client: ActivationClient,
     ) -> Result<serde_json::Value, ControllerError> {
         let typed_id = id;
         let id_str = id.to_string();
+        // No sandbox was loaded, so an inheriting activation leaves the record
+        // for the substrate to read when it builds the pod.
+        let attribution = match activating_client {
+            ActivationClient::Inherit => ActivationAttribution::inherit_unresolved(),
+            client => ActivationAttribution::resolve(client, None),
+        };
 
         let status = match action {
             SandboxAction::Start => {
                 let activation = resolve_activation_options(activation.as_ref(), true)?;
-                self.admit_action_cluster_activation(action, None).await?;
+                let live = LiveHandoff::new(
+                    self.admit_action_cluster_activation(action, None, typed_id, &attribution)
+                        .await?,
+                );
+                // No row was loaded, so an inheriting action reserved nothing
+                // at entry: its cap is then checked where the pod is created.
+                let cap = if live.is_held() {
+                    CapPolicy::Reserved
+                } else {
+                    CapPolicy::Check
+                };
                 self.substrate
                     .start_execution(
                         metric_identity,
                         typed_id,
                         activation,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        RecoveryCharge::paid(
+                            self.cluster_admission.as_ref(),
+                            cap,
+                            attribution.clone(),
+                        )
+                        .with_live(&live),
                     )
                     .await
                     .map_err(ControllerError::from)?;
+                live.keep();
                 SandboxLifecycleStatus::Started
             }
             SandboxAction::Wake | SandboxAction::ImplicitWake(_) => {
@@ -2202,7 +2729,11 @@ impl SandboxController {
                 self.substrate
                     .runtime_client(
                         typed_id,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        RecoveryCharge::exempt(
+                            self.cluster_admission.as_ref(),
+                            CapPolicy::Check,
+                            attribution.clone(),
+                        ),
                     )
                     .await?
                     .internal_client()
@@ -2221,16 +2752,30 @@ impl SandboxController {
             }
             SandboxAction::Restore => {
                 let activation = resolve_activation_options(activation.as_ref(), true)?;
-                self.admit_action_cluster_activation(action, None).await?;
+                let live = LiveHandoff::new(
+                    self.admit_action_cluster_activation(action, None, typed_id, &attribution)
+                        .await?,
+                );
+                let cap = if live.is_held() {
+                    CapPolicy::Reserved
+                } else {
+                    CapPolicy::Check
+                };
                 self.substrate
                     .restore_execution(
                         metric_identity,
                         typed_id,
                         activation,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        RecoveryCharge::paid(
+                            self.cluster_admission.as_ref(),
+                            cap,
+                            attribution.clone(),
+                        )
+                        .with_live(&live),
                     )
                     .await
                     .map_err(ControllerError::from)?;
+                live.keep();
                 SandboxLifecycleStatus::Started
             }
             SandboxAction::Suspend => {
@@ -2245,7 +2790,11 @@ impl SandboxController {
                     .substrate
                     .runtime_client(
                         typed_id,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        RecoveryCharge::exempt(
+                            self.cluster_admission.as_ref(),
+                            CapPolicy::Skip,
+                            attribution.clone(),
+                        ),
                     )
                     .await?;
                 client
@@ -2263,7 +2812,11 @@ impl SandboxController {
                     .substrate
                     .runtime_client(
                         typed_id,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        RecoveryCharge::exempt(
+                            self.cluster_admission.as_ref(),
+                            CapPolicy::Skip,
+                            attribution.clone(),
+                        ),
                     )
                     .await?;
                 client
@@ -2278,7 +2831,11 @@ impl SandboxController {
                     .substrate
                     .runtime_client(
                         typed_id,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        RecoveryCharge::exempt(
+                            self.cluster_admission.as_ref(),
+                            CapPolicy::Check,
+                            attribution.clone(),
+                        ),
                     )
                     .await?;
                 let activation = resolve_activation_options(activation.as_ref(), true)?;
@@ -2298,7 +2855,11 @@ impl SandboxController {
                     .substrate
                     .runtime_client(
                         typed_id,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        RecoveryCharge::exempt(
+                            self.cluster_admission.as_ref(),
+                            CapPolicy::Skip,
+                            attribution.clone(),
+                        ),
                     )
                     .await?;
                 client
@@ -2315,7 +2876,11 @@ impl SandboxController {
                     .substrate
                     .runtime_client(
                         typed_id,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        RecoveryCharge::exempt(
+                            self.cluster_admission.as_ref(),
+                            CapPolicy::Skip,
+                            attribution.clone(),
+                        ),
                     )
                     .await?;
                 client

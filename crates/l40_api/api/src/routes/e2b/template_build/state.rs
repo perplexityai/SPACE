@@ -17,18 +17,14 @@
 //!   the same alias would otherwise clobber each other's tags or
 //!   sizing).
 //!
-use pplx_space_common_core::{
-    sql,
-    types::{OrgId, TemplateName},
-};
+use pplx_space_accounts::OrgId;
+use pplx_space_template_model::TemplateName;
 use std::sync::Arc;
 
 use sqlx::PgPool;
 
 pub(super) use crate::template_build_jobs_store::{BuildJob, BuildSpec};
-use crate::template_build_jobs_store::{
-    TemplateBuildJobsStore, TemplateBuildJobsStoreError, template_build_owner_matches,
-};
+use crate::template_build_jobs_store::{TemplateBuildJobsStore, TemplateBuildJobsStoreError};
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum RecordBlobError {
@@ -36,6 +32,12 @@ pub(super) enum RecordBlobError {
     Storage(#[from] sqlx::Error),
     #[error("template build upload conflicts with existing ownership or content")]
     Conflict,
+}
+
+impl From<pplx_space_postgres_pool::DbError> for RecordBlobError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
 }
 
 pub struct TemplateBuildState {
@@ -69,29 +71,24 @@ impl TemplateBuildState {
         files_hash: &str,
         blob_sha256: &str,
     ) -> Result<(), RecordBlobError> {
-        if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
+        if !pplx_space_template_store::templates::not_owned_by_another_org(
+            &self.pool,
+            template_name,
+            org_id,
+        )
+        .await?
+        {
             return Err(RecordBlobError::Conflict);
         }
-        // The SDK's file hash excludes archive metadata, so same-owner reuploads can
-        // have different blob digests even when the file contents are unchanged.
-        // Mappings recorded before uploads carried an owner have a NULL org_id;
-        // the first owned upload claims them so later writers meet the owner check.
-        let result = sqlx::query(sql!(
-            "INSERT INTO template_build_blobs (template_id, files_hash, blob_sha256, org_id)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (template_id, files_hash) DO UPDATE
-             SET blob_sha256 = EXCLUDED.blob_sha256,
-                 org_id = EXCLUDED.org_id
-             WHERE template_build_blobs.org_id IS NULL
-                OR template_build_blobs.org_id = EXCLUDED.org_id"
-        ))
-        .bind(template_name.as_str())
-        .bind(files_hash)
-        .bind(blob_sha256)
-        .bind(org_id.as_uuid())
-        .execute(&self.pool)
+        let recorded = pplx_space_template_store::build_blobs::record(
+            &self.pool,
+            template_name,
+            files_hash,
+            blob_sha256,
+            org_id,
+        )
         .await?;
-        if result.rows_affected() == 0 {
+        if !recorded {
             return Err(RecordBlobError::Conflict);
         }
         Ok(())
@@ -103,23 +100,23 @@ impl TemplateBuildState {
         template_name: &TemplateName,
         files_hash: &str,
     ) -> Result<Option<String>, sqlx::Error> {
-        if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
+        if !pplx_space_template_store::templates::not_owned_by_another_org(
+            &self.pool,
+            template_name,
+            org_id,
+        )
+        .await?
+        {
             return Ok(None);
         }
-        sqlx::query_scalar::<_, String>(sql!(
-            r#"
-            SELECT blob_sha256
-            FROM template_build_blobs
-            WHERE template_id = $1
-              AND files_hash = $2
-              AND (org_id = $3 OR org_id IS NULL)
-            "#
-        ))
-        .bind(template_name.as_str())
-        .bind(files_hash)
-        .bind(org_id.as_uuid())
-        .fetch_optional(&self.pool)
+        pplx_space_template_store::build_blobs::blob_sha256(
+            &self.pool,
+            template_name,
+            files_hash,
+            org_id,
+        )
         .await
+        .map_err(sqlx::Error::from)
     }
 
     pub(super) async fn record_build_spec(

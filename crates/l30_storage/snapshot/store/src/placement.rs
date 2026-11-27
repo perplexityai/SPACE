@@ -1,8 +1,11 @@
 //! Where each catalog snapshot's bytes are: the object store, the node that
 //! holds the sandbox's current local artifact, both, or neither.
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeId, SandboxId, SandboxLifecycle, SnapshotId};
+use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+use pplx_space_snapshot_model::SnapshotId;
+use pplx_space_sql_locator::sql;
 use sqlx::FromRow;
 
 /// Where one catalog snapshot's bytes are, as the catalog records it.
@@ -67,14 +70,16 @@ static STORAGE_PLACEMENTS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock
 /// first. A snapshot can be in both places, or in neither: still uploading,
 /// failed, or an older artifact whose stored copy has been orphaned.
 pub async fn storage_placements(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Vec<SnapshotStoragePlacement>, sqlx::Error> {
-    sqlx::query_as::<_, SnapshotStoragePlacement>(sqlx::AssertSqlSafe(sql!(
-        STORAGE_PLACEMENTS_SQL.as_str()
-    )))
-    .bind(sandbox_id)
-    .bind(NODE_LOCAL_LIFECYCLES.map(SandboxLifecycle::as_str).to_vec())
-    .fetch_all(executor)
-    .await
+) -> Result<Vec<SnapshotStoragePlacement>, DbError> {
+    Ok(
+        sqlx::query_as::<_, SnapshotStoragePlacement>(sqlx::AssertSqlSafe(sql!(
+            STORAGE_PLACEMENTS_SQL.as_str()
+        )))
+        .bind(sandbox_id)
+        .bind(NODE_LOCAL_LIFECYCLES.map(SandboxLifecycle::as_str).to_vec())
+        .fetch_all(executor.into_sqlx())
+        .await?,
+    )
 }

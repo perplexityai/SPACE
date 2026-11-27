@@ -343,8 +343,8 @@ fn record_deduplicated_submission(job_id: &JobId) {
 /// The bare sandbox UUID a `sandbox:<uuid>` subject names: the canonical
 /// `sandbox_id` that every service's spans and logs carry, so a sandbox's
 /// jobs are found by the same value as the rest of its telemetry. This reads
-/// the sandbox form of common-core's `SubjectId` wire text, whose sandbox ID
-/// is a UUID displayed hyphenated, without depending on it.
+/// the sandbox form of `pplx-space-subject-model`'s `SubjectId` wire text,
+/// whose sandbox ID is a UUID displayed hyphenated, without depending on it.
 fn subject_sandbox_id(subject_id: Option<&str>) -> Option<String> {
     let sandbox_id = subject_id?.strip_prefix("sandbox:")?;
     uuid::Uuid::parse_str(sandbox_id)
@@ -599,6 +599,37 @@ impl<E: JobExecutor> BackgroundWorker<E> {
                 tracing::error!(
                     inflight,
                     "restart yield timed out before executor quiescence"
+                );
+                self.log_permanent_failures();
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Stop starting jobs, including jobs submitted from now on, and let
+    /// running executors finish. Jobs that have not started stay pending for
+    /// the next owner of the queue to recover, and so does a running job that
+    /// fails retriably.
+    pub fn stop_starting_jobs(&self) {
+        self.stopping.cancel();
+    }
+
+    /// Wait until no executor task remains, returning false at the deadline.
+    /// Unlike [`Self::shutdown`], pending jobs do not hold this open; pair it
+    /// with [`Self::stop_starting_jobs`].
+    pub async fn wait_for_executors(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let inflight = self.inflight();
+            if inflight == 0 {
+                self.log_permanent_failures();
+                return true;
+            }
+            if Instant::now() >= deadline {
+                tracing::error!(
+                    inflight,
+                    "executors were still running at the drain deadline"
                 );
                 self.log_permanent_failures();
                 return false;

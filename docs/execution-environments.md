@@ -435,7 +435,7 @@ of existing data.
 | Existing boundary | Disposition and target semantics | Owner and delivery | Compatibility/removal criterion |
 |---|---|---|---|
 | `RuntimeIdentity`, `RuntimeInstallation`, `NodeExecutionInventory`; PostgreSQL `node_runtime_installations` keyed by `(node_id, runtime, runtime_version)` and its dependent projections | **Keep** release metadata. **Replace with first consumer** its use as sufficient environment capability: observations need complete environment reference plus host/usability evidence. This PR adds the separate definition/reference, not a renamed installation row. | Execution-common owns definitions; node-ctl publication and cluster storage own the later provisioning projection; placement migration follows publication. | Preserve old inventory for old readers during rollout. New admission requires new evidence. Remove the old admission dependency only after every reader migrates; old release diagnostics may remain useful. |
-| `GuestOperatingSystem`, `GuestPlatform`, `ArtifactComponentKind` | **Keep** their current meanings. **Replace now** missing host identity with separate `HostPlatform`; do not infer host OS from guest OS. | Common-core/execution-common, this contract. Template owner adds distribution/release with its first guest-image consumer. | Additive messages preserve old guest fields and enum numbers. There is no guest-field migration/removal in this change. |
+| `GuestOperatingSystem`, `GuestPlatform`, `ArtifactComponentKind` | **Keep** their current meanings. **Replace now** missing host identity with separate `HostPlatform`; do not infer host OS from guest OS. | Execution-spec/execution-common, this contract. Template owner adds distribution/release with its first guest-image consumer. | Additive messages preserve old guest fields and enum numbers. There is no guest-field migration/removal in this change. |
 | Runtime-manager `AvailableArtifact.architecture` and `ExecutionArtifact.architecture` | **Keep** legacy architecture evidence; it is not a full target or placement requirement. **Replace now** in new descriptors with explicit host target for runtime bytes and guest platform for the direct-boot kernel. | Execution-common owns descriptor targets now; runtime-manager owns richer diagnostic target fields with the first additional installer/target. | Do not silently change the old strings' meaning. Retire their placement use when consumers use typed targets; keep diagnostic evidence as needed. |
 | `ExecutionMetadata`, node `requested_execution`, string runtime selectors and CLI `--runtime fc` | **Keep** current adapter selection/recorded metadata. **Replace with first consumer** as complete selection authority: explicit environment references and actual resolved execution metadata through seed/build, then benchmark launch. | Template/build and node-manager owners: E0 binding is implemented here; explicit selection uses the compiled catalog and deployment admission. | Validate legacy aliases and reject contradictory old/new selectors at the consuming boundary. Unbound legacy paths remain unchanged until stock-image attribution is implemented; removal requires migrated writers/readers and durable records. |
 | Runtime-manager SQLite `operation_results`, shared `jobs`, `InstallOperation` JSON and dedupe | **Keep** `install_kernel`, `uninstall_kernel`, `install_release`, `uninstall_release` as accurate existing operations. Environment policy does not change their identity or replay semantics. | Runtime-manager owns the first new operation kind and any versioned payload migration. | Preserve retained-job decode/replay and `(action, artifact identity)` dedupe; policy revision is correlation only. Verify deployed migration level before evolution. The historical prototype reset is not a future migration strategy. |
@@ -894,9 +894,17 @@ the node settings stay the upper bound on what a node may execute.
 Until placement consumes environment eligibility and fresh usability evidence,
 keep allowed/default policy uniform within each role/host-platform cohort and
 verify that builder outputs work on every worker cohort that may receive them.
-Keep shared fleet defaults at E0: cluster-owned non-default Create remains refused.
-Additional bindings can be exercised through designated node-local paths without
-publishing their templates for shared fleet consumption.
+Keep shared fleet defaults at E0. Sandbox-manager's create validation
+(`validate_environment_create`) doesn't refuse a cluster-owned create because
+its Firecracker binding isn't the default. It refuses a cluster-owned Cloud
+Hypervisor binding, and memory-state operations (pools, snapshots, a
+base-snapshot boot) for a binding that must boot cold. Before the row is
+persisted, it asks the serving node to admit the exact binding
+(`admit_exact_execution`), so a template built bound to another Firecracker
+environment runs it on any node whose policy allows it. Publish no named tag for such a template
+until that environment is meant for shared fleet use, and create from it by
+digest, as `local.selected_environment_survives_suspend_and_cross_node_restore`
+does.
 
 `GetExecutionInventory` reports resolved references and the separate legacy permission.
 Node-ctl forwards it through periodic publication; the cluster records it with
@@ -1148,17 +1156,58 @@ have keeps the pin, with kubelet as the backstop.
 With the gate `on`, a create adopts a warm pod only from a node that publishes
 the environment of the pod's build: a warm pod built while the gate was off
 carries no requirement, and a node can lose its label under a pod it already
-runs. A refused slot leaves the pool, and the warm pool replaces it with a pod
-that requires the label.
+runs. The pod must also have booted that environment: it must carry
+`space.pplx.net/environment-required: "true"` and name the environment in
+`space.pplx.net/environment`. A node's labels say where a pod may run, not what
+its worker booted, and a pod warmed before the gate went `on` booted what the
+worker boots with the gate off. A refused slot leaves the pool, and the warm
+pool replaces it with a pod that requires both. The create tries the next slot,
+and a create that finds none misses the pool as it would otherwise: it boots
+cold, or, with `boot_mode=pool`, gets a 503. A pod that booted the environment
+on a node the Node reflector doesn't have isn't refused: its slot goes back to
+the pool as `ready`, so a cache miss doesn't replace it.
 
 The labels say what node-ctl last observed, not how fresh that is: a node
 whose node-ctl stops reconciling keeps its labels. They also don't drop
 retired environments, which the cluster filters out of
 `usable_environment_refs` only.
 
-On Kubernetes, `on` fails startup for now (see "Not covered"), so what
-follows describes what it does once it's supported. It has no fleet-wide
-fallback and no E0 exemption. If every node lacks the
+With the gate `on`, a bound pod also carries
+`space.pplx.net/environment-required: "true"`, and the shim's cold create
+sends the pod's environment to sandbox-manager as
+`CreateRequest.required_environment`, with no runtime: the create takes it
+from the required build's binding. The shim first checks that sandbox-manager
+serves the `create-required-environment` capability and fails the create as
+unavailable if it doesn't. An older sandbox-manager that the create reaches
+anyway, after a rollback between the check and the create, drops the field
+and refuses a create without a runtime, so it never boots its preferred build.
+A shim that predates the annotation ignores it and boots as with `off`, so
+enabling `on` on Kubernetes needs every worker's shim from this release first,
+and rolling the shim, sandbox-manager or template-manager back below it needs
+the gate back at `shadow` first. Sandbox-manager asks
+template-manager for that environment's build of the digest only
+(`GetTemplateRequest.environment_required`), and refuses the create unless the
+build it gets is bound to that environment's partition: a node holding a
+digest under E0 and E1 boots the E1 build for an E1 pod, and an E0 pod boots
+the legacy-partition build, which unbound builds share. A node holding the
+digest only under another environment pulls the release, which its manifest
+places. A release that lands in another partition leaves the lookup
+`NOT_FOUND`. One that lands in the legacy partition while it holds an adopted
+build bound to another environment leaves it `FAILED_PRECONDITION` ("Template
+caches per environment" below). Either way the create fails rather than boot
+the build that's there. An
+older template-manager answers with its preferred build, which the
+partition check refuses. The
+sandbox runs the build's own binding, which the node admits first when it
+isn't E0's, never a compatible consumer selected on the node. It always boots
+cold: never from a base snapshot or a warm-pool donor, which could load under
+another environment. A restore, fork or stopped start
+pod boots through Start, not Create, and doesn't send it. In `shadow` the
+annotation is absent and the create names no environment.
+
+On Kubernetes, `on` runs while resume-time runtime upgrades are off; with
+`SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED` on it fails startup (see "Not
+covered"). It has no fleet-wide fallback and no E0 exemption. If every node lacks the
 labels at once, as on a new cluster or after node-managers roll out an
 observation this node-ctl can't decode, kube-scheduler can place no new bound
 pod, E0 included, and every restore pinned to its source node is refused: by
@@ -1171,21 +1220,24 @@ running keep running and count as `no_evidence` in
 placement shadow" in [observability.md](observability.md)). Switching the
 gate to `shadow` stops new pods from requiring the label.
 
+The Kind smoke `local.environment_placement_gate_on_places_bound_pods` turns
+the gate `on` on a bench and checks this against kube-scheduler. A create bound
+to an environment no worker publishes is refused as unschedulable, an E0-bound
+create runs E0, and the first create runs once the workers publish its
+environment.
+
 #### Not covered
 
-On Kubernetes, `on` fails startup with `SubstrateError::Unsupported` until the
-worker takes the pod's environment as its cache-partition preference. Today a
-Kubernetes create passes no preference, so template-manager boots the digest's
-legacy-partition build when the node holds one, whatever environment the pod's
-affinity required: a node that publishes the required environment can boot
-another environment's build of the same digest. A runtime-upgrade activation's
-pod also requires the recorded environment rather than the upgrade's target.
+On Kubernetes, `on` fails startup with `SubstrateError::Unsupported` while
+`SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED` is on: a runtime-upgrade
+activation's pod requires the recorded environment rather than the upgrade's
+target. With resume-time upgrades off no activation upgrades, so `on` runs.
+It also needs every worker on a shim that reads
+`space.pplx.net/environment-required`, since an older shim ignores it.
 `shadow` runs: it records, labels and counts without changing placement.
 
 The gate doesn't yet:
 
-- align the build a Kubernetes worker boots with the environment its pod
-  requires (above);
 - gate a Kubernetes pod whose release records no binding while the nodes
   holding its build report different ones. Direct gates each candidate by its
   own inventory row, but a pod requires one label, so with no agreed binding
@@ -1243,8 +1295,24 @@ are bound to an environment it stops, or while any sandbox has no environment
 binding, an unreadable one, or no binding record. Unbound legacy sandboxes count
 because they execute as the environment they match, which only a node can
 resolve, and a sandbox with no observation from its node may be bound to one
-that stops. A release is in use while a tag points to it, which creates by tag
-resolve to, or an enabled pool config pins it, which keeps creating slots. An
+that stops. A release is in use while creates by tag run it, or an enabled
+pool config pins it, which keeps creating slots. Where creates boot the twin
+they resolve to ([Resolving creates to template
+twins](#resolving-creates-to-template-twins)), a tag keeps in use the release
+its build resolves to, which may be a twin, not the tagged release; anywhere
+else, or when no release of the build qualifies, the tagged digest's original
+release, whichever spelling the tag sits on. Until no API image that predates
+that rule can serve or be rolled back to, the tagged release counts there too,
+since such an image creates from it. The reverse doesn't hold while API
+images are mixed, in a rollout or a partial rollback: an older image's guard
+counts only the tagged release, so a block or default change it serves can stop
+the environment of a digest original that newer images create from by tag.
+Make those writes only while every API replica runs the same image. That's
+not enough for a block an older image already allowed: before this rule
+serves, check that no environment that's blocked, or stopped by the default,
+holds the digest original of a tagged digest whose tag sits on the other
+spelling's release, and allow that environment or retag the digest original
+first, since creates by that tag will run it. An
 in-use release counts when it's bound to an environment that stops, or when its
 environment can't be told, since new creates from it may run there. A superseded
 release doesn't count: it strands work only through the sandboxes made from it,
@@ -1255,6 +1323,21 @@ execution still active or holding a pod IP) that the repair loop, which runs
 only on Kubernetes, has nothing to revert to. Later defaults stop nothing, and
 nor does blocking an environment that already doesn't execute, so neither is
 checked, unless another policy write lands while the block waits for the lock.
+A block also needs `strand: true` while an unfinished template runtime upgrade
+campaign moves releases off the environment, since it would stop the releases
+the campaign hasn't given a twin on its target yet; that refusal carries the
+same `at_risk` report when work is bound to the environment too. It skips an
+environment that already doesn't execute in the same way. A block checks a
+campaign's source, not its target. The first default needs `strand: true` the
+same way while such a campaign moves an environment it stops. A campaign waits
+for its target to be the default, so the way through is recording a state for
+the source first: `allowed` or `deprecated` keeps it executing. It reads each
+environment it stops that has template releases or an unfinished template
+campaign under the lock a campaign start for it takes, so no campaign can
+start on one before the default commits. A campaign on any other environment
+had no release to move when the default read them; one started there after
+that read, on a release registered after it, isn't caught. Both refusals name
+the campaign.
 Both writes take an optional `If-Match: <generation>` (`--if-generation` in the
 CLI) and answer 412 without changing anything unless the policy is still at
 that generation, so an operator writing from a stale read can't undo another's
@@ -1418,6 +1501,221 @@ orders and identifies policy versions only within one schema lifetime. `updated_
 on either table isn't policy history: deleting a user changes it through the
 `ON DELETE SET NULL` cascade.
 
+### Resolving creates to template twins
+
+A template release can have *twins*: other `template_releases` rows with the
+same template name and hash, each bound to another environment in
+`execution_metadata`. A create by tag, digest or digest prefix finds the build
+as before, then runs one of its releases, picked in this order:
+
+1. the release bound to the cluster default;
+2. else a twin in an `allowed` environment, the one whose catalog entry
+   (`runtime_environments.version_sort_key`) sorts highest;
+3. else a twin in a `deprecated` environment, the same way;
+4. else the original.
+
+A release in a `blocked` environment is never picked, nor a twin in an
+environment with no policy state. An unbound release counts as the initial
+environment's. When nothing qualifies, the create keeps the release its tag or
+digest names, as before twins, and the node's policy decides. So with E1 twins
+in place, moving the default to E2 keeps creates on a build's E1 twin until its
+E2 twin exists, as long as E1 still sorts highest among the build's twins in
+`allowed` environments; an `allowed` E3 twin that sorts higher takes them.
+
+One definition of that order
+(`pplx_space_template_release_store::resolved_release_sql`) serves create
+resolution, pod placement, pool claims, the warm-pool autoscaler and the block
+check above. It applies only where creates boot the twin they resolve to: a
+Kubernetes substrate with the placement gate `on`
+(`Substrate::boots_template_twins`), which the substrate refuses at startup
+today. The API and the cluster controller each read the gate
+(`SPACE_ENVIRONMENT_PLACEMENT_GATE`, [configuration.md](configuration.md)):
+creates and pool claims follow the API's, and the warm-pool autoscaler the
+controller's, so set it the same on both. Anywhere else all of them keep the
+release a tag or digest names, whose build the worker boots, so twins left
+from an earlier configuration don't take its creates or its pools.
+
+A Kubernetes pod of the create renders the release its build resolves to when
+the pod is built, which may differ from the create's if a twin, the default or
+a state changes between the two reads. It requires that environment while the
+placement gate is `on`, and a pool claim takes only that release's slots. The
+Direct substrate still places and boots on the original's binding: its worker
+boots the build a create without an environment preference resolves. The
+warm-pool autoscaler credits a build's demand and its retained slot to the same
+release, so when resolution picks a twin its pools move there and the
+original's autoscaled pools retire. The original's manual pools stay enabled
+for a rollback that resolves the original. A twin takes nothing while
+resolution still picks the original, as it does while the original is bound to
+the default. Once resolution picks a twin, creates claim only its pools, which
+start empty, so a template with a warm pool boots cold until the twin's pool
+fills. For a template with no enabled warm-pool policy, a fallthrough cold
+create of a twin with no enabled plaintext pool config of its own takes its
+shape, disk size and disk I/O limits from the original's, so the operator's
+shape survives a twin that got no copy. With a policy, the policy shapes it, as
+for any release without a config. An operator's upsert of a release's manual
+pool config through the admin API changes the config of the twin creates pick
+too, since creates claim that twin's slots. Like the original's, the twin's
+config becomes operator-managed, so the autoscaler stops adjusting it, and it
+takes the original's disk size and disk I/O limits. The response reports the
+original's. The upsert reaches only the twin resolution picks when it runs: a
+twin picked later, after the default moves, gets no copy. An upsert that names
+a twin's release (`template_release_id`, which the admin console sends when it
+edits or detaches an existing pool) changes exactly that twin's config, so an
+edit of an earlier twin's pool stays on that twin after the default moves. An
+upsert of an original, named or resolved, also reaches the twin creates pick;
+only an original's upsert reaches a twin. Disabling an
+original's config by its id disables the config for the same shape on every one
+of its twins, whether or not creates boot twins, so an earlier twin's
+operator-managed config doesn't keep warming slots; disabling a twin's config
+changes only that config, though without a policy the twin's cold creates then
+take the original's shape. An autoscaler-owned config that's disabled is
+enabled again on the autoscaler's next pass, as an original's is.
+
+### Template runtime upgrade campaigns
+
+A template campaign gives each release on its source a *twin*: a second
+`template_releases` row with the same template name and hash, bound to the
+campaign's target in `execution_metadata`. A release recorded without an
+environment counts as the initial environment's, since nodes cache unbound and
+initial-bound builds in the same legacy partition. The twin shares its
+original's artifacts and storage locations and has no tags. Its own
+`metadata.json` is the original's with the target's execution metadata, under
+`<build>/environments/<target>/metadata.json` beside the build's shared one,
+which isn't rewritten. Template-manager reads it when it pulls a twin's
+build, binding the build's shared `manifest.json` to the twin's document: the
+shared manifest keeps the source's execution metadata, and template-manager
+refuses a build whose manifest and metadata disagree. Template-manager's
+`GetCapabilities` answers `reads_twin_metadata: true`, and node-ctl reports
+that answer in its status (`reads_twin_metadata`); a template-manager that
+predates the RPC reports `false`, and one that doesn't answer reports
+nothing. A template campaign holds until every worker reports `true`, as
+below. The cluster controller reads the shared
+document and writes the twin's with its own object-storage credentials; the
+EKS module
+grants its role read access to builds' `metadata.json` and `manifest.json`,
+and write access only to `environments/*/metadata.json` keys
+(`infra/space/aws/eks/modules/space/cluster_controller_pod_identity.tf`). Each
+operator-managed (`manual`), plaintext Kubernetes warm pool
+config of the original is copied to the twin. The autoscaler moves
+autoscaler-owned pools itself ([Resolving creates to template
+twins](#resolving-creates-to-template-twins)).
+
+The driver holds every template campaign unless the cluster's pods boot the
+environment a twin is bound to (`twins_not_booted`): only a Kubernetes pod
+with the environment placement gate `on` requires its work's environment, and
+otherwise a create resolved to a twin still boots its build's legacy
+partition. A campaign that completed there would have moved nothing, and the
+environment block check would pass on it. The campaign read reports this hold
+(`held: {reason: "twins_not_booted", detail}`). It also holds a campaign until its target
+is the cluster default (`target_not_default`), the target is a compiled environment
+(`target_not_compiled`), for a compiled source, the catalog certifies the
+edge from it (`edge_not_certified`), and every worker reads a twin's own
+metadata (`nodes_dont_read_twins`). That last hold counts each of the
+substrate's workers, draining or not and whatever environments it lists,
+whose node status isn't current evidence of its environments (no snapshot, or
+an incomplete or stale one) or whose node-ctl `reads_twin_metadata` isn't
+`true`: node-ctl's labels decide where a create lands, and a draining node can
+still admit pods. A substrate with no worker registered holds too, since a
+node that joins later takes creates whatever it supports; a node that runs
+pods before its `nodes` row exists isn't seen at all. A node from before that
+report never sends it, so a fleet mid-rollout holds until its last old worker
+is replaced or removed. The campaign read reports this hold too
+(`held: {reason: "nodes_dont_read_twins", detail}`), and the cluster
+controller logs it with up to five of the holding workers' ids. A twin's
+commit checks the workers again and releases its item if one doesn't report
+it. That narrows the window between the plan and the commit but doesn't close
+it: the check takes no lock on node registration or status, so a change that
+commits after it isn't seen. Neither check reaches twins already made: if a worker's
+template-manager is rolled back after twins exist, creates resolved to a twin
+can still land there. Moving the default back makes the release bound to the
+new default win resolution, and that's the original only when the original is
+bound to it: where an earlier campaign made twins, the previous default's
+release may itself be a twin, so moving the default doesn't recover from a
+reader rollback. Twins made earlier would sit unresolved: a release
+bound to the default comes first, and until the default moves, that's each
+build's original when the original is on the default. Once the default moves,
+a template's creates move as its twin appears, at the campaign's pace.
+
+For each item, the driver:
+
+1. skips a release that's gone or whose template is being deleted;
+2. ends done when the release is already in the target's partition, or the
+   build already has a release there under either spelling of its hash;
+3. skips a release that's no longer on the source, and fails one whose
+   storage locations carry an owner-scoped encryption sidecar, which a twin
+   can't share yet. That release is still the campaign's to move, so it
+   counts against the failure budget rather than letting the campaign
+   complete without it;
+4. reads the build's `metadata.json` from the first of its storage locations
+   that serves it;
+5. checks that the build cold boots under the target and that the target
+   runs its guest image. A build recording no execution metadata in its
+   release or its `metadata.json` is checked against its `manifest.json`'s,
+   which template-manager reads first; a manifest the schema refuses fails.
+   Only a build recording none in any of the three is taken as the initial
+   environment's, and only when its image is x86_64, its architecture
+   resolved as template-manager resolves it; any other fails. Its
+   `manifest.json` comes from the location that served `metadata.json`, else
+   the first other location that has it;
+6. then makes its base's twin first, for a derived template, however deep
+   its lineage. The base is `base_resolved` in that `metadata.json`
+   (`<template>@<hash>`). The lease takes pending items in id order, so a
+   derived item that waited for its base's item could hold the base back.
+   Instead it makes the base's twin, and the base's own item then ends done.
+   A base that is its own ancestor fails the item. One item can therefore
+   commit several twins, and a canary's single item moves its lineage up to
+   the first base that already has a twin: the canary limits items, not
+   twins. The checks come first so
+   that a derived build the target can't run fails without moving its base,
+   whose twin would take the base's creates as soon as it committed;
+7. writes the twin's `metadata.json` beside the build in each storage
+   location that still serves the build's own `metadata.json` and
+   `manifest.json`, which every pull reads, and takes the write, then inserts
+   the twin with only those locations,
+   after rechecking under the policy row's share lock that the target is
+   still the cluster default (a default that moved while the item was in
+   flight returns it to pending without spending an attempt, and the plan
+   then holds the campaign),
+   in one transaction holding the template's row lock, which release
+   registration's lock conflicts with. Once nodes read the twin's document, a
+   pull from a location the write missed would find the source's, so the
+   twin keeps only the locations it reached;
+8. copies the manual, plaintext pool configs of every original of the build
+   on the campaign's source, under either hash spelling, to the twin in that
+   same transaction: a twin bound to the default wins resolution as soon as
+   it commits, so it never commits without them. Creates of both spellings
+   resolve to the one twin, and the other spelling's item finds it and ends
+   done, so the copy takes both originals' configs at the insert; for a shape
+   both configure, the newer original's settings win. A manual config the twin
+   already has for a shape is kept; one the autoscaler made for it first
+   takes the original's manual settings. An operator's pool-config disable
+   for the template, and an upsert where creates boot twins (the only case
+   it changes a twin), take the template's row lock before they look up the
+   twins they change too (the one creates resolve to, for an upsert; every
+   twin of the original, for a disable), so each either lands before the copy
+   reads the original's configs or sees the committed twin and changes its
+   config too. That holds for an edit or disable named by an original's
+   release ID. One named by a twin's release ID changes only that twin's
+   config, so after a later campaign, name the newest twin's release ID to
+   change its pool.
+   The original's configs stay enabled, so a rollback that moves the default
+   back finds its pools warm; until an operator disables them, each copied
+   pool warms slots for both releases, and only the twin's are claimed.
+
+A pass reads the releases on the source as it pages through them. A release
+registered on the source behind the cursor, by a builder that hasn't adopted
+the new default, is found by the next pass, as long as the current one leased
+work. Only a pass that leased nothing completes the campaign, so a release
+registered behind that final pass's cursor isn't moved. If a completed
+campaign leaves source releases that have no twin on the target, start
+another once builders have converged.
+
+While `idx_template_releases_template_name_hash_unique` still stands, no
+release can have a twin: the insert does nothing, and the item fails saying
+so, which counts against the failure budget. A release without storage
+locations that already holds the build's slot in the target's partition keeps
+the twin out the same way, and the item fails naming that release.
+
 ### Selecting a restore consumer
 
 The snapshot manifest retains original runtime, kernel and state-format identity.
@@ -1503,9 +1801,18 @@ blocking cold `Start` to run, and whether the sandbox ends started or stopped.
    encrypted sandbox `cow.luks` and the suspend volume. The sandbox's
    `metadata.json`, the disk's record of its execution, sits outside the
    subvolume and the boot rewrites it, so sandbox-manager keeps its bytes beside
-   it. The checkpoint directory isn't touched. A sandbox without its local rootfs, or an encrypted one without
-   `cow.luks`, is refused before the fence: a cold start would otherwise boot a
-   fresh template clone.
+   it. The checkpoint directory isn't touched. An unencrypted sandbox without
+   its local rootfs is refused before the fence: a cold start would boot a
+   fresh template clone. An encrypted sandbox's writes are all in `cow.luks`,
+   over a read-only origin cloned from its template, so it's refused without
+   a non-empty regular `cow.luks` with one link, which node-manager's restore
+   of a copy without the rootfs requires. A rootfs that is there must also be
+   a non-empty regular file with one link, which the restore of any copy
+   requires (node-manager opens no hard-linked file as a disk), and
+   without one the sandbox is refused only when its row records no template
+   digest. Without the rootfs the copy holds the COW alone, which
+   node-manager's instance restore accepts, and the cold start clones the
+   origin, as a restore staged on another node does.
 3. **Select the consumer.** The move must follow a certified upgrade edge from
    the environment the sandbox last ran under: its checkpoint's producer when
    suspended, otherwise its saved consumer. Unbound metadata counts as the
@@ -1516,11 +1823,25 @@ blocking cold `Start` to run, and whether the sandbox ends started or stopped.
    format may differ: a cold start loads no memory, and neither sandbox-manager's
    disk binding nor node-manager's cold-boot admission compares state formats.
    The target is saved as the sandbox's consumer in the same transaction that
-   moves the row to `booting`. The checkpoint's producer evidence isn't rewritten.
+   moves the row to `booting`. The boot is the ordinary cold start, which reads
+   the target from that saved consumer, so the target is saved before the boot
+   rather than when it's verified. The checkpoint's producer evidence isn't
+   rewritten.
+   From the fence until the boot is verified, the State RPC that node-ctl
+   publishes from reports the previous consumer instead (the one a rollback
+   restores, which for a sandbox with no saved consumer is its disk's
+   execution), or no execution if that doesn't decode: a failed boot's
+   cleanup stops the sandbox with the target still saved, and the control
+   plane reads a stopped sandbox published under the target as an upgrade
+   that reached it.
 4. **Boot.** The ordinary blocking cold start runs as the caller. It reads the
    saved consumer, and guest readiness verifies the boot: the transaction that
    marks the sandbox started also records the upgrade verified, so a later
-   stop or suspend can never make a verified boot look interrupted.
+   stop or suspend can never make a verified boot look interrupted. On
+   Kubernetes the boot's route identity, a new execution in the upgrade's pod,
+   replaces the teardown proof the sandbox's stop kept (the old execution's
+   generation and pod UID), as any cold start's does, provided it's a newer
+   execution.
 5. **Settle.** After a verified boot, the old checkpoint is retired and the
    preserved copy deleted. Then a request to end stopped stops the execution the
    boot started, never a later one, and only while it's started or paused: the
@@ -1538,7 +1859,10 @@ blocking cold `Start` to run, and whether the sandbox ends started or stopped.
    Bytes several rows claim are left, as the reaper leaves them, and the upgrade
    stays `verified`, refusing warm start and restore, until the conflict
    clears: the sandbox's next suspend replaces every older suspend row, or an
-   operator resolves it. Moving the bytes off the checkpoint path is the
+   operator resolves it. A request to end stopped retires before it stops, so
+   its boot keeps running, and the suspend holds below refuse its suspend: the
+   conflict then clears once the boot's execution ends, by a `Stop` or
+   otherwise, and a later execution suspends, or an operator resolves it. Moving the bytes off the checkpoint path is the
    durable retirement: a catalogued checkpoint goes to the snapshot reaper's GC
    staging, an uncatalogued one to the suspend-garbage lane, and each lane's
    sweep deletes what the immediate reclaim leaves. An encrypted sandbox's next suspend writes a fresh suspend
@@ -1553,18 +1877,205 @@ blocking cold `Start` to run, and whether the sandbox ends started or stopped.
    on its old environment.
 
 A retry with the same operation id resumes from the row: an interrupted upgrade
-rolls back and starts again, and a verified one finishes its retirement. A
-rolled-back upgrade leaves no row, so a retry after it starts over. Its failure
-stays in `sandbox_runtime_upgrade_outcomes`, as does an upgrade that found the
-sandbox already on its target, for `GetRuntimeUpgrade` below. An upgrade
+rolls back, and a verified one finishes its retirement. A rolled-back upgrade
+leaves no row; its failure stays in `sandbox_runtime_upgrade_outcomes`, as does
+an upgrade that found the sandbox already on its target, for
+`GetRuntimeUpgrade` below. Both tables record the attempt each upgrade ran
+as: the request's opaque `attempt_id`, or an id the node generates for a
+request that names none. The node returns a generated id only in a successful
+response. A caller that needs retry finality after a failed request must send
+its own `attempt_id` on the first request. An unfiltered `GetRuntimeUpgrade`
+names the operation's latest attempt, which can be a later one, so a retry
+under that id would replay another attempt's outcome. On Kubernetes the shim
+sends kubelet's pod UID (`io.kubernetes.pod.uid`, or
+`io.kubernetes.cri.sandbox-uid` without it), never the control plane's
+`space.pplx.net/pod-uid` annotation, which a replacement pod could carry over:
+kubelet retries one pod's create under its UID and gives a replacement pod a
+new one, so a pod's retries are one attempt and a new pod is a new attempt.
+The shim also names that UID as the start's route identity pod UID, whatever
+`space.pplx.net/pod-uid` says, so the attempt and the pod sandbox-manager
+judges ownership against are the same pod, and it fails the create when the
+two kubelet annotations name different pods or the pod carries neither. It
+also fails the create when the answer names an attempt other than its own,
+before it runs the execution or leaves a stopped placeholder. A
+CLI or SDK generates one and reuses it on retries. Sandbox-manager never reads
+the attempt id as a pod: it's opaque, and the only pod facts it reads are the
+start's route identity, in the guard below that keeps a VM's pod from being
+settled on.
+
+The api owns operation ids: it derives one from the sandbox, the activation,
+the cause, the move and what the upgrade boots (the checkpoint for a restore,
+the recorded execution for a start; `EnvironmentMove::operation_id` in
+`crates/l40_api/api/src/controllers/substrate/runtime_upgrade.rs`). A retry of
+the same decision keeps the operation id, under a new attempt when it's a new
+pod, and a sandbox that moved since gets a new operation id from its next
+decision.
+
+Attempt finality is off by default: `SPACE_SBXMGR_RUNTIME_UPGRADE_ATTEMPT_FINALITY_ENABLED`
+turns it on. The switch decides which attempts acquire finality, not which
+recorded finality is honored. Off, sandbox-manager makes no new outcome final
+for an attempt: it records no final rollback or refusal (no `refused` outcome
+and no refused activation), and an upgrade it begins or finds already on
+target, and a rollback it runs, names no attempt, then or after the switch is
+turned on, so that attempt's retry is decided again.
+Neither RPC names an attempt in a new answer (no `attempt_id` in an
+`UpgradeRuntime` response or a report, and no `refused_attempt_id`), as a node
+that predates attempt ids doesn't. What it recorded as final while the switch
+was on stays final: a retry of that attempt still gets its outcome back,
+`GetRuntimeUpgrade` still answers that attempt from it, and the operation id
+still names the request it recorded. Turning the switch off stops new
+finality; it doesn't release an attempt a caller may already have settled on.
+That holds only for retries that still name the attempt: a request with no
+`attempt_id` runs as a new attempt, switch on or off, so a shim rolled back to
+one that sends none releases every final outcome its pods' retries would have
+met (see "Booting an upgrade in its pod" below for the rollout order). The rest of this
+section describes finality on.
+
+A rollback is final for its attempt. A retry with the same attempt id gets the
+recorded failure back with `FailedPrecondition` and never fences or boots
+again; only a new attempt starts over. The rollback records the attempt's
+final outcome in the transaction that makes it reportable, before its disk
+discard runs, so a discard that fails and a copy eviction that then deletes
+the sandbox's row can't let a retry of an attempt a caller already read as
+rolled back run again. A request that's refused before it
+fences anything for a reason no retry changes (the edge isn't certified, the
+checkpoint isn't the decided one, consent is missing, a stopped or suspended
+unencrypted sandbox's local rootfs is missing or its runtime metadata doesn't
+parse) is
+recorded the same way, as a `refused` outcome for that attempt, final for it
+as a rollback is. Refusals from the stale-copy eviction and the staging that
+run before the upgrade aren't recorded, even one whose code says this node
+can't stage the start: both belong to the restore path, whose refusals depend
+on copies and transfers the upgrade doesn't own, some of which clear on their
+own (a canonical root another stage still publishes, say), so a retry of the
+same attempt evicts and stages again. Recording is best effort: a write that
+fails leaves a final refusal unrecorded. A refusal decided from the sandbox's
+row is recorded only while the row is still as the refusal read it (its state,
+local artifact, execution metadata and the activation it last recorded, which
+every start replaces, so a start and stop in between count as a change), compared in the transaction that
+records it, so a sandbox that moved since isn't left with a final answer it
+no longer earns. A cleanup that owns the sandbox (a pending cleanup intent on
+its row, an outstanding cleanup episode, or a cleanup-owned state) takes
+precedence: it's checked before the checkpoint, the already-on-target check
+and the disk are, and again in that transaction. The upgrade records the
+refusal before it releases the sandbox's artifact lock, which staging the
+sandbox again takes. So a cleanup admitted meanwhile is either still on the
+row when the store checks, or, if it deleted the row, leaves no row to
+match: the sandbox can't be staged again under the same columns until the
+refusal is recorded. An already-on-target outcome gets the same
+checks: it's recorded only while no cleanup owns the sandbox and its row is
+still as the upgrade read it. So a disk the cleanup is
+removing doesn't make the refusal final, and once the row is staged again a
+retry of the same attempt inspects the new copy. A sandbox a cleanup owns
+answers `UNAVAILABLE`, not `ALREADY_ON_TARGET`, until the cleanup is done.
+Finality is decided once, where each refusal is made, as final or retryable
+(`Refusal` in
+`crates/l40_api/sbx/mgr/server/src/service/runtime_upgrade.rs`), and only a
+final refusal is ever recorded. It isn't read from the refusal's gRPC code, so
+every refusal answers the code it always did, and an error nothing classified
+is retryable. A refusal before the fence that a retry may not repeat (the
+sandbox isn't stopped or suspended yet, or its disk can't be inspected before
+it is, a disk that can't be read, the sandbox changed while it was inspected,
+a cleanup owns it, another upgrade fences it, node-manager failed or
+restarted) isn't recorded, so a retry of the same attempt tries again. Nor is
+one from finishing a staged checkpoint's disk: a checkpoint that can't be read
+or pinned yet, an encrypted disk without a bootable `cow.luks` (the staged
+checkpoint completion lays one down once its switch is on), a copy without its
+rootfs while `SPACE_SBXMGR_STAGED_CHECKPOINT_DISK` is off or node-manager
+doesn't advertise `staged_checkpoint_disk`, and a rootfs that's there but isn't
+a non-empty regular file with one link. Of the disk's own refusals, only an
+absent unencrypted rootfs, or runtime metadata that reads but doesn't parse or
+validate, is final for a stopped or suspended sandbox's attempt, whichever read
+finds it first: a suspended checkpoint's first read, finishing its staged disk,
+or the inspection. After the fence there's no such refusal: a node-manager fault or restart mid-boot
+ends in a rollback, final for its attempt like any other. A refusal replaces an earlier attempt's
+rollback or refusal as the operation's outcome, so the report never gives a
+newer attempt's refusal an older attempt's reason, but never an
+already-on-target outcome, and it's recorded only while the node holds the
+sandbox. A refusal that meets an already-on-target outcome (a stopped target's
+attempt refused after the sandbox moved off the target, say) is still recorded
+as its own attempt's final outcome, under the same checks, while the node
+holds the sandbox and the operation has no live upgrade row; the report keeps the already-on-target outcome and the
+attempt it names. The attempt that found the target keeps that answer, so a
+refusal of its own retry isn't recorded beside it. A sandbox that moved off
+the target and isn't stopped or suspended may still hold a VM for the
+caller's pod, so that refusal is retryable and recorded for no attempt. Each attempt's final outcome also stays in
+`sandbox_runtime_upgrade_attempt_outcomes`, one row per operation and attempt
+id, which the finality check reads: a later attempt's outcome replaces the
+earlier one in the report, but a delayed retry of the earlier attempt still
+gets its own outcome back and never fences again. That finality survives
+the sandbox row's deletion: the table declares no foreign key and keeps its
+rows when the sandbox is deleted, so an attempt refused for a stale suspended
+copy still gets its refusal back after a later attempt's eviction deleted the
+row and the sandbox was staged again under the same id. `GetRuntimeUpgrade`
+answers a caller that names that attempt and this sandbox from the same row,
+though the operation's report went with the deleted sandbox row: a rollback
+or refusal as its status, whatever report stands since, and a refused
+activation as `refused_attempt_id` with `ABSENT`, while no report stands or a
+later attempt's hasn't reached the target. Each of these rows also keeps what its operation asked
+for (target environment, target state and authorization id, beside the sandbox),
+so after the sandbox's row is gone the operation id still names that one
+request: `UpgradeRuntime` refuses, with `InvalidArgument`, a request under
+that operation id that names another sandbox, target or authorization id,
+for any attempt. It compares only the authorization's id, not its `reason`
+or `memory_loss`, so a request that changes only those isn't refused this way.
+`GetRuntimeUpgrade` carries no target or authorization, so it
+checks only the sandbox, and its report doesn't confirm a target or
+authorization. It refuses a request that names another sandbox the same way
+only when the request names an attempt. Without an attempt id it checks only
+the operation's report, so once the sandbox's row is gone it answers another
+sandbox with `ABSENT`, and that query can't confirm the sandbox. Both RPCs also
+refuse a request that names another sandbox for that attempt with
+`InvalidArgument`, and `UpgradeRuntime` checks that again when it replays the
+attempt's outcome under the sandbox's upgrade lock, since that lock doesn't
+serialize a request for another sandbox under the same operation id, and
+`UpgradeRuntime` refuses a stopped target's request for an attempt whose
+activation was refused the same way, as the operation's records did while
+they stood. Nothing prunes these rows yet. An upgraded or
+already-on-target outcome is answered to any attempt, but for a started
+target the attempt's start can still fail after it: the sandbox runs another
+pod's execution, moved off the execution the start was decided on, or the
+activation itself failed. The node records that refusal for the attempt
+as an `activation_refused` outcome in the same table, only while the
+operation's report is upgraded or already on target, and it's final for that attempt as a
+rollback is: the attempt's retries get it back with `FailedPrecondition` and
+never activate the sandbox, while a new attempt is answered afresh. Those are
+the activation's final refusals. A sandbox another call is moving, or a start
+claim another call won, is retryable and never recorded, and neither is a
+refusal the upgrade itself retries before it reaches the target. The store
+writes the record only while the sandbox's row is still the one the refusal
+was decided from (its runtime label, state, execution and route identity), in
+the same transaction, since a plain start, stop or suspend doesn't take the
+upgrade lock: one that moved the sandbox meanwhile leaves the refusal
+unrecorded, and the attempt's retry decides it again. Nothing is
+recorded while another activation or stop is moving the sandbox, whichever pod
+it runs for: it comes to rest on its own, and the attempt's retry is answered
+afresh then. Nor is anything recorded for a start the operation claimed that
+never began, admission or staging refusing it while the sandbox stayed at
+rest on the execution the claim found: the operation runs that start again
+for a retry. Nor is anything recorded while the sandbox may still hold the VM
+of the pod the start's route
+identity names: one running that pod's execution in any state but stopped or
+suspended, and one an activation is creating, starting or restoring, or a
+cleanup owns or left quarantined or failed, whichever pod its route identity
+names, since an activation writes that identity only once it runs. A caller
+that settled on the refusal would delete the pod and the VM with it. A retry
+of an attempt whose rollback or refusal is already final gets that back and
+records no refused activation, so it never replaces the later attempt a
+caller waits on. An upgrade
 that must end stopped leaves the sandbox as it finds it if the sandbox stopped,
 suspended or started another execution first. A
 sandbox-manager recovery loop settles unfinished upgrades at startup and every
 minute without booting or stopping anything: it rolls back, or retires, and
-leaves a sandbox it can't settle yet for the next pass. An upgrade that must end
+leaves a sandbox it can't settle yet for the next pass. Each transition it,
+or a caller's retry, makes names the sandbox whose upgrade lock it holds, and
+changes nothing once the operation's row is another sandbox's, as when the
+row was deleted and another sandbox began the same operation id: that
+sandbox's own driver settles it. An upgrade that must end
 stopped stays verified while its sandbox runs, until its caller's retry stops it
-or the sandbox stops some other way. Deleting the sandbox deletes its
-upgrade rows; evicting it removes the preserved copy with the rest of its local
+or the sandbox stops some other way. Deleting the sandbox deletes its live
+upgrade row and its outcome, but keeps each attempt's final outcome; evicting
+it removes the preserved copy with the rest of its local
 presence, and the upgrade fails at its next claim.
 
 ### Booting an upgrade in its pod
@@ -1582,7 +2093,7 @@ doesn't render it yet.
   the target environment, the authorization's id, reason and memory-loss
   consent, the target state (`started` or `stopped`), and for a suspended
   source the local artifact of the checkpoint the upgrade was decided from
-  (`PodRuntimeUpgrade` in `crates/libs/common/core/src/k8s/runtime_upgrade.rs`).
+  (`PodRuntimeUpgrade` in `crates/l40_api/sandbox/pod/src/runtime_upgrade.rs`).
   The restore's storage URI and source node stay where they are.
 - **Shim.** The shim builds the `Start` it would send, with the pod's
   namespace and route identity, as the blocking cold start the upgrade boots,
@@ -1616,25 +2127,204 @@ doesn't render it yet.
   keeps the sandbox. A sandbox already started, a replay of
   an upgrade that already finished, and a retry of an activation answer with
   the live execution only when its route identity names the same pod (pod UID
-  and execution generation), or to a caller that names no pod, such as an
+  and execution generation), or to a caller that isn't a pod (its route
+  identity is Direct or absent and has no pod UID field), such as an
   operator upgrading a Direct sandbox, and are refused with
-  `FailedPrecondition` otherwise. A stopped target already reached, or
-  replayed, is answered only for a sandbox at rest; one that runs is refused.
+  `FailedPrecondition` otherwise. For a
+  sandbox that's still started, that refusal is final for the attempt only
+  when its row names another pod's UID; one that isn't started any more is
+  the moved-off-the-execution refusal described above, recorded under the
+  same checks. For a started sandbox, a pod caller (Kubernetes, or with a
+  pod UID field) that names no pod UID, a row that names none, or
+  the same pod at another execution generation leaves the owner unproven, and
+  a retry decides it again. A stopped target already reached, or
+  replayed, is answered only for a sandbox at rest; one that runs is refused,
+  retryably, since it may stop again.
   A Wake replaying a retired upgrade is refused once the sandbox holds another
   checkpoint than the one the upgrade names, even one the target produced:
-  the retry needs a new operation id. A replay never moves the
+  the operation never activates it again, and the sandbox's next decision
+  gets a new operation id (see the operation ids above). A replay never moves the
   sandbox, and a retry must name the
   sandbox, target and authorization the operation's recorded outcome names,
   as for a live row. An operation that found its sandbox on the target never
-  boots it on a replay; one that finds the sandbox moved since is refused. An
+  boots it on a replay, for a stopped target as for a started one, and its
+  replay holds only while the sandbox stays on that target: once it moves,
+  the same operation id is refused. An
   operation id names one upgrade of one sandbox across both tables.
   `GetRuntimeUpgrade` reports the upgrade's outcome, not the pod's: read it
   with the pod's status.
 - **`GetRuntimeUpgrade`.** The shim's response doesn't reach the control
   plane, which reads the outcome from this read-only RPC instead: absent, in
-  progress (with its phase), upgraded, rolled back (with its failure) or
-  already on target. Node-api forwards it on `WorkerApiInternal` only for a
-  caller with the control-plane authority a policy write needs.
+  progress (with its phase), upgraded, rolled back (with its failure),
+  refused (with its failure) or already on target, with the attempt the
+  reported outcome ran for (`attempt_id`). An upgraded or already-on-target
+  report also names the latest attempt whose activation it refused, with that
+  refusal (`refused_attempt_id`, `refused_attempt_failure`). A request that
+  names an attempt (`attempt_id`) gets that attempt's own answer instead, from
+  its own rows: its rollback or refusal, or `ABSENT` in place of another
+  attempt's, and its own refused activation, never another attempt's (with
+  `ABSENT` when it was kept from before the sandbox's row was deleted and no
+  report that reached the target stands), so a later attempt never changes
+  what the caller waiting on one reads. That holds for failures only: an
+  attempt with no rollback or refusal of its own gets the operation's
+  in-progress, upgraded or already-on-target report, whichever attempt it ran
+  for, so a caller checks the returned `attempt_id` and
+  `refused_attempt_id` before reading anything as its attempt's (see "Waiting
+  on an attempt" below). A set
+  `attempt_id` that `UpgradeRuntime` would refuse (empty, whitespace-only or
+  over 256 bytes) is refused here too, with `INVALID_ARGUMENT`. Node-api
+  forwards it on `WorkerApiInternal` only for a caller with the control-plane
+  authority a policy write needs. It also reports `abandoned` once
+  the operation is abandoned (below).
+- **`AbandonRuntimeUpgrade`.** A pod that's gone doesn't prove its shim's
+  `UpgradeRuntime` call is: one force-deleted mid-create can still have the
+  call on its way to the node. So a caller that's about to capture the
+  sandbox's disk first abandons the operation. Sandbox-manager takes the
+  sandbox's upgrade lock, which an `UpgradeRuntime` holds for its whole call,
+  so an upgrade running there finishes first. If the lock stays held for 5 s
+  (`LOCK_WAIT`), the abandon answers `UNAVAILABLE` and the caller asks again.
+  An unsettled operation whose target is `stopped` is settled first, as a
+  retry of it would be: an interrupted one rolls back, and a verified boot
+  retires what it superseded and then stops the execution it booted, if that
+  execution is still running; a later execution is left alone. A rolled-back
+  operation is already done with the sandbox for either target: its disk is
+  restored, so it's abandoned as it stands, and the preserved copy it still
+  owes deleting is left to recovery. A settling that fails answers its error
+  and records nothing. An unsettled operation whose
+  target is `started` answers `ABORTED`: it's left to its own retry or to the
+  recovery loop, which runs every 60 s (`RECOVERY_INTERVAL`), and the caller
+  asks again. Then the operation is recorded
+  abandoned in `sandbox_runtime_upgrade_abandoned`, in that node's
+  sandbox-manager database, and every later `UpgradeRuntime` for it that
+  reaches that node, from any pod, is refused before it stages, fences or
+  boots, under any attempt id or none. It's keyed by the operation id, so a
+  retry from a shim that sends no `attempt_id` is refused too, and abandonment,
+  unlike attempt finality, doesn't depend on the shim's place in the rollout
+  order (see "Booting an upgrade in its pod"). The refusal is
+  `FAILED_PRECONDITION`, or `INVALID_ARGUMENT` for one that names another
+  sandbox, target, target state
+  or authorization id than the operation's upgrade row or outcome, or another
+  sandbox than the abandonment's. A call naming another sandbox than the
+  abandonment's takes its own sandbox's lock, so it can pass its own check
+  before the abandon lands. The writes it can still reach refuse the
+  operation in the same statement or transaction, so it never fences, starts
+  or records an outcome, though such a call may be answered with the first
+  refusal it reaches rather than `INVALID_ARGUMENT`, and one carrying
+  `stage_from` may still evict a stale copy of its own sandbox and stage it
+  first.
+
+  A Wake carrying an abandoned operation is refused with the same codes
+  where the Wake would run the upgrade: before the
+  upgrade of a stopped or suspended sandbox, including one already on the
+  upgrade's target. A Wake for an absent sandbox checks before staging it
+  too, but outside the upgrade lock, so one already past that check when the
+  abandon lands still stages the checkpoint, and is then refused before the
+  upgrade. A Wake that doesn't reach the upgrade (the sandbox is already
+  started, paused or created) wakes it as a Wake without the upgrade would,
+  which abandonment doesn't bar. Nor does abandonment wait for a Wake
+  already past its check: once the upgrade answers that it found the sandbox
+  on its target, or that the operation's upgrade had already retired, the
+  Wake starts or restores the sandbox after the upgrade lock is released.
+  None of this reaches a Kubernetes sandbox, which never takes an upgrade on
+  a Wake, and abandonment is for a Kubernetes pod's operation.
+
+  Abandoning an operation already abandoned, settled or never seen succeeds,
+  and so does one for a sandbox the node doesn't hold, since a late call
+  carrying `stage_from` would stage it; the record outlives the sandbox's
+  row, and nothing prunes it. One recorded for another sandbox answers
+  `INVALID_ARGUMENT`, to an abandon and to a `GetRuntimeUpgrade` alike,
+  including one naming no attempt after the sandbox's row is gone, which would
+  otherwise answer `ABSENT`.
+  Node-api forwards it on `WorkerApiInternal` under the same authority as
+  `GetRuntimeUpgrade`.
+
+  Abandonment bars one operation, so a caller that issued several for the
+  sandbox, as a retry under a new operation id does, abandons each before it
+  captures the disk. The record is node-local: another node never reads it,
+  so a call for the operation that reaches another node isn't refused on its
+  account. A pod's shim calls only its own node's sandbox-manager, over the
+  node-local socket, so abandoning on the pod's node covers that pod's late
+  calls. A caller whose calls for the operation could reach more than one node
+  abandons it on each of them before it captures the disk. An abandon bars
+  later calls; it doesn't stop what the operation already started. A
+  `started` target's retired boot keeps running the sandbox on the new
+  runtime. For either target, once the abandon has
+  settled the operation, nothing in it stops an ordinary Wake or start of the
+  sandbox, and a Direct sandbox's Wake already past its check may still start
+  or restore it (above). So a caller captures the disk only once the sandbox
+  is at rest, whatever the operation's target.
+
+A failed upgrade fails the pod's sandbox create, so the pod stays pending in
+`ContainerCreating`, with no container ever ending, while kubelet retries the
+create under the same pod UID, and so as the same attempt. Per-attempt
+finality is what makes that safe to wait on: once the node records an
+attempt's rollback or final refusal, no retry of that attempt can still
+upgrade the disk, and the report names the attempt it's for (`attempt_id`,
+`refused_attempt_id`), so a caller waiting on one attempt can tell its own
+outcome from another's.
+
+#### Waiting on an attempt
+
+No consumer in this repository reads `GetRuntimeUpgrade` yet. A control plane
+waiting on attempt `A` of an operation (a pod whose UID is `A`) names `A` in
+the request and acts on the first row that matches the answer. `Release A` means the attempt
+is over and failed: delete the pod, and decide the sandbox's next move, which
+a new pod runs as a new attempt. `Done` means the attempt succeeded. Anything
+else waits, up to the caller's own deadline.
+
+| Answer | Action |
+| ------ | ------ |
+| Any status with `refused_attempt_id` = `A` | Release `A`: its retries get the same refused activation and never activate the sandbox |
+| `ROLLED_BACK` or `REFUSED` with `attempt_id` = `A` | Release `A`: its retries get the same failure and never fence again |
+| `UPGRADED` or `ALREADY_ON_TARGET` | Done once the pod runs (a started target) or its create succeeded (a stopped one), since the report alone doesn't say `A`'s sandbox runs; until then, wait |
+| `ROLLED_BACK` or `REFUSED` naming no attempt (finality off, or a node that predates attempt ids) | Wait: nothing in it is final for `A`, whose retry may still upgrade |
+| `IN_PROGRESS` or `ABSENT` | Wait: the upgrade is still running, the node has recorded nothing for `A`, or it holds another attempt's failure |
+| `INVALID_ARGUMENT` | Fix the request: the operation or attempt names another sandbox, or the attempt id is malformed |
+| `INTERNAL`, `UNAVAILABLE` or any other RPC error | Wait and read again; never settle on an error |
+
+`a_consumer_settles_an_attempt_only_on_its_own_final_answer` in
+`crates/l40_api/sbx/mgr/server/src/service/runtime_upgrade/rpc/tests.rs`
+drives a fake consumer through these answers against the node.
+
+An attempt's records live on the node that decided them, in its
+sandbox-manager database, and nothing deletes them: they survive the
+sandbox's deletion and eviction (above), and no pruning runs yet. A pod is
+bound to one node, so kubelet's retries of an attempt reach the node that
+holds its records. Finality is per node: a Direct caller that reuses an
+attempt id on another node gets a fresh decision there.
+
+Only failures outlive the sandbox's local row. A rollback or refusal is kept
+per attempt in `sandbox_runtime_upgrade_attempt_outcomes`, but an activation's
+claim lives on the operation's outcome in `sandbox_runtime_upgrade_outcomes`,
+which is deleted with the sandbox's local row. So once a sandbox's row is
+removed and the sandbox staged on the node again, a delayed retry of an
+attempt that succeeded gets a fresh `Start` claim: the at-most-once start
+holds only while the node keeps the operation's records. A consumer that
+settled `Done` on `A` decides a move that removes the sandbox's row and stages
+the sandbox on that node again only once no retry of `A` can arrive: the
+node's kubelet has retired `A`'s pod and no create of it is still in flight,
+or an executor-side fence rejects a stale create. Deleting the pod isn't
+enough. The api's UID-preconditioned delete reports `Deleted` once the API
+server accepts the delete, and even its blocking delete, which reports
+`Deleted` once the pod object is gone, doesn't show it: a forced delete
+removes the object without waiting for kubelet to confirm the pod stopped
+([Kubernetes](https://kubernetes.io/docs/concepts/workloads/pods/pod-termination/#pod-termination-forced)).
+While the node's worker can't be reached to confirm that, defer the move.
+Nothing in this release enforces it; the first cluster consumer does.
+
+After a verified boot to a `stopped` target, the sandbox runs the boot's
+execution unfenced until the upgrade stops it, and a suspend there would
+leave it suspended. So while such an upgrade fences the sandbox, or is
+verified with its boot's execution still running, a due auto-suspend is held
+like a non-actionable stage, and a user's `Suspend` and a teardown suspend
+(`PrepareTeardownSuspend`'s drive) answer a retryable `UNAVAILABLE` under the
+artifact lock, before anything is captured; the teardown drive is deferred and
+asked again. Once the upgrade is verified, a stop ends the hold, whoever stops
+the sandbox: the upgrade never stops a later execution, so a later one
+suspends as usual even while the upgrade stays `verified`, and a checkpoint
+conflict that keeps it there still clears on that suspend. While an upgrade
+fences the sandbox, the State RPC publishes the execution a rollback restores,
+not the target.
 
 Only the control plane writes sandbox pods, and the annotations are the
 upgrade's authorization: a principal that can create a sandbox pod can request
@@ -1651,15 +2341,152 @@ predates the checkpoint passes `runtime-upgrade` through as a `Start`
 checkpoint, which sandbox-manager refuses for a local row in any state and for
 a sandbox absent from the node, so the pod fails without booting anything. A
 sandbox-manager that predates activation answers `ALREADY_ON_TARGET` with no
-execution, and the shim fails the create.
+execution, and the shim fails the create. Node-manager ships no later than
+sandbox-manager: an older node-manager refuses to restore an upgrade's
+preserved copy that holds a staged encrypted checkpoint's COW and no rootfs,
+so a failed cold boot of one would leave the upgrade unable to roll back, and
+the sandbox fenced, until node-manager is updated. The same holds for a
+rollback of node-manager. First stop new upgrades from starting on the node:
+keep `SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED` off on the API and cluster
+controller, the only switch that sends one today, or downgrade sandbox-manager
+below this release, since an older one never preserves a copy without its
+rootfs. Then downgrade node-manager only once every upgrade on the node that
+preserved such a copy has settled, since the copy stays until a verified boot
+deletes it.
+
+Wherever upgrade requests can run, roll out sandbox-manager first, the shim
+second and attempt finality last:
+
+1. Every node's sandbox-manager from this release. One from before it that
+   records attempt outcomes refuses, with `INVALID_ARGUMENT`, an unchanged
+   retry under a stable `attempt_id` once the attempt rolled back and another
+   operation moved the sandbox to the target; this release answers it
+   `ALREADY_ON_TARGET` when the older build recorded that rollback. A rollback
+   this release records with attempt finality on is final, and the retry gets
+   its failure back. This shim sends a stable `attempt_id`, so it can't go
+   first unless no upgrade request runs until both are out.
+2. The shim from this release, which sends kubelet's pod UID as `attempt_id`.
+   With an older shim each kubelet retry names no attempt and runs under a new
+   generated id, so nothing is final for the pod.
+3. `SPACE_SBXMGR_RUNTIME_UPGRADE_ATTEMPT_FINALITY_ENABLED` on.
+
+Once the switch has been on, keep a shim that sends `attempt_id` until no retry
+of an attempt with a final outcome can arrive, whether the switch is on or off:
+until the node's kubelet has retired each such pod and no create of it is
+still in flight, or an executor-side fence rejects a stale create. A pod
+object that's gone doesn't show that, nor does either of the api's pod
+deletes reporting `Deleted`: a forced delete removes the object without
+waiting for kubelet to confirm the pod stopped (see "Waiting on an attempt"
+above).
+While a node's worker can't be reached to confirm it, defer the shim downgrade
+there. Nothing in this release enforces it; the first cluster consumer does.
+Rolling the shim back sooner releases the outcomes: the pod's next retry names
+no attempt, runs as a new one and can fence and boot again
+(`a_retry_naming_no_attempt_runs_again_after_its_pods_final_rollback`).
+Honoring a final outcome takes both a sandbox-manager that reads it and a
+shim that sends its id.
 
 A sandbox-manager from this release applies the
-`sandbox_runtime_upgrade_outcomes` migration at startup, and an older one
-refuses a database whose migration history holds a version it doesn't bundle.
-So a rollback build reverts the code but keeps that migration, its files under
-`db/sandbox-manager/` and its entry in the store's migration list, as
-`db/README.md` requires of any binary rollback. The table only adds rows, and
-nothing older reads it.
+`sandbox_runtime_upgrade_outcomes`, `sandbox_runtime_upgrade_attempt_id`,
+`sandbox_runtime_upgrade_attempt_outcomes`,
+`sandbox_runtime_upgrade_attempt_identity` and
+`sandbox_runtime_upgrade_abandoned` migrations at startup, and an older one,
+from before SQLite rollbacks became image-only, refuses a database whose
+migration history holds a version it doesn't bundle. So a rollback build
+reverts the code but keeps those migrations, their files under
+`db/sandbox-manager/` and their entries in the store's migration list, as
+`db/README.md` requires of any binary rollback. A binary rollback keeps the
+schema, so the down migrations' guards don't protect it. The older code never
+reads the new tables or columns, so it ignores per-attempt finality, refused
+activations and abandonment; it doesn't delete the attempt outcomes or
+abandonments with their sandbox either, so those rows stay, unread. A binary
+rollback to it therefore releases every attempt this release made final and
+every operation abandoned here: a caller that settled on an attempt's rollback
+may see that attempt's retry fence and boot again. It can't parse a
+`refused` outcome: for an operation that recorded one, `GetRuntimeUpgrade`
+answers `INTERNAL`, and so does an `UpgradeRuntime` once it reads the
+operation's outcome. Only attempt finality writes `refused` outcomes and
+refused activations, so with the switch off, its default, a node writes
+neither, and a binary rollback parses every outcome this release wrote. Once the
+switch has been on, a rollback has to plan for what it wrote: nothing drains
+an attempt's retries first, so on the older binary a rolled-back or refused
+attempt's retry fences and boots again, and an operation that recorded a
+`refused` outcome answers `INTERNAL`. Turning the switch off again stops new
+final outcomes but keeps the ones written, and this release keeps honoring
+them with the switch off. So once a node has recorded a final outcome, roll
+its binary back only to a release that honors recorded finality, as this one
+does, not to one that predates it, whatever the switch says. The
+release that added the attempt-outcome table (PR #2027 and PR #1754) sits
+between the two: its store parses `refused`, so it doesn't answer
+`INTERNAL`, but its upgrade never checks an attempt's final outcome before it
+fences, so it releases every final attempt too. It
+also loses a report this release would keep: this release records a rolled-back
+attempt's outcome when the rollback starts, and that release's rollback finish
+skips the operation's outcome for an attempt that already has one, then
+deletes the rolled-back row. So a rollback whose disk discard hadn't finished
+when the binary rolled back answers `GetRuntimeUpgrade` with no outcome, or
+with an earlier attempt's. This read-only
+query counts a node's final attempt outcomes; while it's nonzero, the node
+needs such a release. The count holds only once nothing can add to it. While
+the switch is on, an upgrade still running when the count is taken can record
+a final rollback or refusal right after. The sandbox-manager reads the switch
+when it starts, and every writer of a final outcome checks it, so restart the
+node's sandbox-manager with the switch off first, then take the count, and
+keep the switch off until the binary rollback is done:
+
+```sql
+SELECT COUNT(*) FROM sandbox_runtime_upgrade_attempt_outcomes
+ WHERE target_environment IS NOT NULL;
+```
+
+The attempt id columns are nullable, and every row written before them reads
+as naming no attempt, which proves nothing to the control plane. The attempt id migration's down migration refuses while a
+`refused` outcome is recorded, since an older release can't read one. The
+attempt-outcomes migration's down migration refuses while any attempt's
+outcome is recorded, since an older release reads only the operation's latest
+outcome: it would let a delayed retry of an earlier attempt fence the sandbox
+again, and a refused attempt's retry activate it. The attempt-identity
+migration's down migration is narrower: it refuses only while a final attempt
+outcome, one that records what its operation asked for, is recorded. Dropping
+those columns makes every such outcome final for no attempt, so a retry of an
+attempt its caller already gave up would run again. An outcome without them,
+which a build from before the columns writes, doesn't block it. The abandoned
+migration's down migration refuses while an abandoned operation is recorded,
+since an older release would let a late call for it change a disk the control
+plane has already captured. Nothing prunes those records, so once a node has
+abandoned an operation, that down migration refuses until an operator deletes
+them.
+
+Before running a rollback build on a node that may have abandoned an
+operation, stop every caller of `AbandonRuntimeUpgrade`, and confirm that no
+`UpgradeRuntime`, and no Wake carrying `runtime_upgrade`, for an abandoned
+operation can still reach the node: the rolled-back sandbox-manager never
+reads `sandbox_runtime_upgrade_abandoned`, so such a call would stage, fence
+and boot as if nothing were abandoned. A late `UpgradeRuntime` lives no
+longer than the container create request it runs in. A Wake carrying the
+upgrade comes from its own caller, so block or drain that caller's Wakes for
+the operation too; a Wake without `runtime_upgrade` needs no block, since
+abandonment never bars one. Keep the `sandbox_runtime_upgrade_abandoned` rows
+through the rollback, and record a reviewed recovery plan before deleting any;
+the down migration needs them gone, and nothing in this release enforces any
+of this for you.
+
+No caller in this repository invokes `AbandonRuntimeUpgrade` yet, so until
+one does, no node records an abandoned operation, and rolling this release
+back leaves nothing abandoned to honor. The release that adds a caller makes
+this one its rollback floor: a node that ran it rolls back only to a release
+that checks `sandbox_runtime_upgrade_abandoned`, as this one does, and the
+abandoned migration's down migration refuses while any row is recorded.
+
+A sandbox-manager that predates these fields returns no `attempt_id`,
+`refused_attempt_id` or `abandoned`, and ignores a request's `attempt_id`,
+answering the latest outcome. One that predates `AbandonRuntimeUpgrade`, or
+sits behind a node-api that does, answers it `UNIMPLEMENTED`. A caller has to
+treat a report that doesn't name its attempt, and an abandon that isn't OK,
+as an outcome it can't confirm, so deploy sandbox-manager and node-api before
+any control plane that relies on them. That's the sandbox-manager-first step of
+the rollout order in "Booting an upgrade in its pod"; abandonment adds only that
+its caller goes last, after node-api, and it has no switch of its own.
 
 ### Upgrading at resume and start
 
@@ -1762,7 +2589,7 @@ is stranded.
    An unproven copy may be the only one of something, so it's refused with
    `FailedPrecondition` before any node work, as is an unpinned one, one the
    named checkpoint wasn't captured after (the decision is stale, and staging
-   it would roll the sandbox back) and an encrypted one. Which checkpoint is
+   it would roll the sandbox back). Which checkpoint is
    newer isn't read from the checkpoint ids, whose order depends on the clocks
    of the nodes that minted them, nor from which backup registered last, since
    a re-upload registers an old checkpoint again. A backup registration
@@ -1810,21 +2637,197 @@ is stranded.
    refused as retryable until the upload settles (when that upload is the
    pin's own backup, the pin isn't proven yet, and it's refused as unproven
    until the backup lands), and a sandbox the
-   operation already recorded an outcome for is left to that record. Once the
+   operation already ran on (it upgraded, rolled back or found the target)
+   is left to that record; an operation only refused before it fenced
+   anything never touched the copy, so a later attempt's eviction goes ahead,
+   and the refused attempt's own retries are still answered with its
+   refusal, which the eviction's delete of the row keeps.
+   The check reads the operation's latest outcome, which a later attempt's
+   refusal can replace, so after one an earlier rollback doesn't hold the
+   copy back. Once the
    copy is gone the sandbox is absent, so a retry stages it as it would any
    absent sandbox; the eviction's claim re-asserts the row's activation
    generations rather than its `updated_at`, which is kept in whole seconds;
    a cleanup that fails after the eviction's claim leaves the
    row's cleanup failed, with its delete intent kept, until the cleanup
-   machinery finishes it. Staging an
-   encrypted checkpoint writes no plaintext rootfs, so an encrypted sandbox
-   restored away from its checkpoint is refused before the fence, and an
-   encrypted stale copy is left in place.
+   machinery finishes it.
+
+   With `SPACE_SBXMGR_STAGED_CHECKPOINT_DISK` on, before reading the disk the
+   upgrade finishes the parts of a staged checkpoint a restore would finish at
+   launch, since it boots the disk cold instead
+   (`service/runtime_upgrade/staged_disk.rs`), under the same artifact lock it
+   fences under. It first checks what it can refuse without touching the node:
+   a suspended sandbox already on its target, an operation that already found
+   its target, an uncertified edge from the checkpoint's producer, and an
+   authorization that doesn't accept memory loss, and then a cleanup that owns
+   the sandbox, which the fence refuses again in its own transaction. It then
+   requires the row's
+   pin to name the checkpoint, as an encrypted full suspend checkpoint of this
+   sandbox written over the template the row names, even when `metadata.json`
+   and the instance COW are both there already. Node-manager does the writes
+   as root through one idempotent call, `MaterializeStagedCheckpointDisk`,
+   since a launched instance belongs to the VM owner. It creates the
+   `instance/` subvolume when absent and always copies the checkpoint's
+   non-empty `cow.luks` over whatever the instance holds, as a restore does,
+   refusing an empty one, so the disk the upgrade preserves is the pinned
+   checkpoint's. It keeps a `metadata.json` already there and otherwise writes
+   the one sandbox-manager built from the checkpoint's producer, with the same
+   writer `PrepareSandbox` uses. Before it writes anything it checks that the
+   staged `snapshot.json` names the sandbox, the pinned artifact and the
+   template, and it answers with that checkpoint and which parts it wrote and
+   which it kept; sandbox-manager requires the answer to name the pinned
+   checkpoint and the COW to be written, so every attempt, from the pod's `UpgradeRuntime` or a Direct Wake,
+   finishes whatever an earlier one left missing. The cold start clones the
+   rootfs origin from the template.
+
+   Sandbox-manager asks node-manager's `GetCloneCapabilities` for
+   `staged_checkpoint_disk` on every call and refuses with
+   `FailedPrecondition` before fencing when it's absent, so a new
+   sandbox-manager next to an older node-manager changes nothing on the node.
+   Roll node-manager out first, then turn the switch on. To roll back, turn
+   the switch off, let the upgrades it started finish, and only then downgrade
+   node-manager. With the switch off, an upgrade of an encrypted copy without
+   its `rootfs.ext4` is refused before it fences, as it was before the switch
+   existed, so a copy an earlier upgrade finished starts no new upgrade.
+
+   A cold start of an encrypted sandbox whose instance has no `cow.luks` while
+   its checkpoint has one is refused with `FailedPrecondition` whether the
+   switch is on or off: node-manager would format a fresh COW and boot the
+   guest without its writes. With the switch on, a cold start of a suspended
+   encrypted sandbox, as the upgrade boots it, hands node-manager the COW of
+   the checkpoint the row pins to lay over whatever the instance holds, as a
+   restore does, since a suspended sandbox's checkpoint is its disk; any other
+   checkpoint, or a row that pins none, is refused. So is a pinned checkpoint
+   whose `cow.luks` isn't a non-empty regular file with one link, with
+   `FailedPrecondition` before node-manager is asked, since node-manager
+   replaces the instance's COW with the one it's handed. Node-manager also
+   refuses to lay an empty COW, for a restore too, and keeps the instance's.
+   Off, the instance's own COW is opened as before.
 
 While an upgrade holds the sandbox, other activations get the retryable 503
 the restore and activation leases already give, and a Wake that meets the
 node's fence is retried to its deadline and answers a retryable 503. The
 decision is counted by `runtime_upgrade.activation.decision`.
+
+### Runtime upgrade campaigns
+
+A campaign moves one kind of subject, template releases (`templates`) or
+sandboxes (`sandboxes`), off one execution environment and onto another, at a
+pace an operator sets. Campaigns live in `runtime_upgrade_campaigns`, with one
+row per subject in `runtime_upgrade_items`. The cluster controller's
+`runtime_upgrade` loop drives them, and the admin API starts and steers them.
+Both read `runtime_upgrade_campaigns.generation`, so the migration that adds it
+(`20261118041622_runtime_upgrade_campaigns_generation`) has to be applied to a
+cluster before a build with campaigns runs there, and stay applied for as long
+as such a build may be rolled back to.
+
+The loop is off unless `SPACE_RUNTIME_UPGRADE_RECONCILER_ENABLED` turns it on
+([configuration.md](configuration.md)). Off, it reads and writes no campaign
+table. What a kind's subjects are, and how one is upgraded, belong to that
+kind's driver. Only template campaigns have one ([Template runtime upgrade
+campaigns](#template-runtime-upgrade-campaigns)), so the admin API refuses to
+start a valid sandbox campaign (409), and the loop only reports one it finds;
+a campaign row of a kind from a newer build is logged and skipped. Each tick the
+loop also returns a finished campaign's in-flight items whose leases lapsed to
+pending (see abort below), and for every unfinished campaign whose kind has a
+driver, it:
+
+1. returns items whose lease lapsed to pending, or fails them after five
+   leases;
+2. pauses the campaign once its failed items reach its failure budget;
+3. asks the driver whether the campaign is held this tick, and whether what
+   it finds moves or is stranded;
+4. records one page of the driver's subjects on the source as pending items.
+   Stranded subjects are recorded too, but not leased;
+5. completes a rolling campaign on the tick a whole pass of subjects ends
+   with no item pending or in flight, its failures under budget and the
+   driver's plan moving (a stranded campaign stays open until its plan
+   moves or an operator aborts it), when the
+   pass also began with nothing open and leased nothing, so a subject
+   skipped mid-pass is found again first. A canary none of whose items is
+   done completes the same way. A subject that reaches the source behind the
+   pass's cursor is left to a later campaign;
+6. leases pending items within the campaign's pacing and hands each to the
+   driver on its own task, renewing the lease while the driver works and
+   failing the item past `SPACE_RUNTIME_UPGRADE_ITEM_DEADLINE_SECS`.
+
+Steps 2 to 6 run only for a canary or rolling campaign. A paused campaign
+gets step 1 alone, so it records no new items while it waits.
+
+Pacing is `max_in_flight_per_cluster`, the wave size. A sandbox item also
+counts against `max_in_flight_per_node` on the node that last published its
+sandbox, and is leased only while that node is reachable with fresh
+environment evidence; until then it stays pending. A sandbox item whose
+sandbox no node has published counts against the cluster cap only and is
+leased, so the driver can skip it instead of holding the campaign open. A
+template release has no node, so only the cluster
+cap applies to it. A campaign that starts as a canary leases one item at a
+time until one is done, then waits for a resume; one whose items all fail or
+are skipped, under the budget, completes instead (step 5).
+
+Every change to a campaign row raises its `generation` by one: an operator's
+pause, resume or abort, and the loop's pause at the failure budget or its
+completion. A trigger on the table does the raising, on any update that
+changes a column other than `generation`, `updated_at` and the user columns.
+Item progress doesn't touch the row.
+
+#### Admin API and CLI
+
+The routes are under `/admin/api/v1/runtime-upgrade-campaigns`, for a
+managing-organization admin. `space-admin-cli runtime campaign` wraps them
+(see the CLI README).
+
+* `POST /runtime-upgrade-campaigns` starts a campaign from a kind, source,
+  target, `canary_size` (`1`, the default, or `0` to start rolling; a canary
+  is one subject, so nothing else is accepted),
+  `max_in_flight_per_cluster`, `max_in_flight_per_node` (default 1),
+  `failure_budget`, `include_running` (sandbox campaigns only: also take
+  running and paused sandboxes, as the sandbox driver defines it) and a
+  required `reason`. An invalid request is refused (400) first. A valid one is
+  refused (409) for a kind with no driver, and while an unfinished campaign of
+  the same kind moves the same source.
+* `POST /runtime-upgrade-campaigns/{id}:pause`, `:resume` and `:abort` take
+  a required `reason`, which the audit log records, and an optional
+  `If-Match` generation. A stale generation answers 412 and changes nothing.
+  The phase check comes first: a change the campaign's phase doesn't allow
+  answers 409 even when the generation is stale too.
+* `GET /runtime-upgrade-campaigns` and `GET /runtime-upgrade-campaigns/{id}`
+  report each campaign's phase, generation, items by phase and stranded
+  count; a campaign of a kind this build doesn't know is skipped (`GET
+  .../{id}` answers 404). For a sandbox campaign, `stranded` is its pending items while the
+  catalog certifies no upgrade edge from its source to its target, and 0
+  once the campaign is finished. It's `null` for template campaigns.
+
+A resume goes to `rolling` once any item is done. A campaign with no done
+item goes back to `canary`, whichever phase it started in, since nothing has
+shown the upgrade works yet. The failure budget counts every failed item, so
+a campaign that paused itself at its budget would pause again on the next
+tick. Resume refuses it (409) unless the request sets `retry_failed`, which
+returns every failed item to pending with its attempts reset. Each item keeps
+its last error until a new outcome replaces it, and the budget then counts
+only new failures.
+
+Abort ends a canary, rolling or paused campaign for good: `aborted` is final.
+Nothing already upgraded is undone, and nothing leases the campaign's items
+again. The source is free for a new campaign at once. Items in flight keep
+their leases. A finished campaign's lease can't be renewed, so the worker
+holding one drops its upgrade at its next renewal attempt, or at its local
+lease deadline (a tenth short of the lease) if the database is out of reach,
+before the lease lapses. The loop returns the item to pending once it does. An
+upgrade that finishes before that renewal still records its outcome, which is
+true of the subject. A lease never takes a subject another campaign holds in flight under a
+live lease, so a new campaign for the same source upgrades such a subject
+only after the aborted campaign's worker has stopped: one worker upgrades a
+subject at a time.
+
+Blocking an environment needs `strand: true` while an unfinished template
+campaign moves its releases: a block mid-campaign stops the releases that
+don't have a twin on the target yet. The refusal (409) names the campaign and,
+when the block would also stop other work, reports it in `at_risk`, since
+`strand: true` waives that check too. A block of an environment that already
+doesn't execute (blocked, or with no state under a cluster default) stops
+nothing new and needs no `strand`, unless another policy write lands while the
+block waits for the lock; then both checks run in full.
 
 ### Node runtime provisioning
 
@@ -2130,8 +3133,12 @@ template-cache eviction disabled.
 the selected environment's partition, else the legacy build, else any other
 build of the digest. Absent, it prefers the legacy build, so
 environment-unaware callers keep their behavior; E0 selects the legacy
-partition. A lookup of a template's latest build returns the newest build of
-any partition, as before partitions existed. New tie-breaks send same-date
+partition. A lookup of a template's latest build that names an environment
+returns the newest ready build bound to that environment's partition, however
+old: for the legacy partition an unbound or initial-environment build, for
+another partition a build in it or an adopted legacy-layout build bound to it.
+With no such build on the node, or with no environment named, it returns the
+newest build of any partition, as before partitions existed. New tie-breaks send same-date
 builds to the larger content hash, and builds of one digest to the preferred
 partition, then the legacy one. The caller checks the build it gets as a
 compatible cold-boot source for the environment it runs under, which keeps
@@ -2141,7 +3148,30 @@ binding's environment, and checks the disk and boot inputs against that
 binding. A cache miss pulls the
 release without a selector: the pull reads the release manifest and metadata
 before choosing a directory and reuses those bytes. Responses echo the resolved
-build's environment. `ListTemplates` reports each build's partition key in
+build's environment.
+`GetTemplateRequest.environment_required` turns the preference into a
+requirement, for a Kubernetes create the placement gate requires an
+environment of: only a ready build bound to that environment's partition
+answers, which is the build in that partition or an adopted legacy build bound
+to it. It needs an exact digest and excludes `cached_only`. A node holding no
+such build pulls the release even when another partition holds the digest,
+since the pull's fast path then counts only a build bound to the required
+partition. If the release's manifest places it in a partition that already
+holds the digest's build bound to that partition, the pull writes nothing, and
+the lookup is `NOT_FOUND`. If that partition is the legacy one and its build
+is an adopted one bound to another environment, or one whose stored metadata
+doesn't parse, which reads as unbound, the pull fails instead, and the lookup
+is `FAILED_PRECONDITION` (fetch-error reason
+`partition_held_by_another_environment`). The build stays.
+A pull of a release bound to an environment has a flight per cache partition
+and shares only a pull of the same partition. It waits out a claim, or any
+pull of the digest whose partition its manifest decides, and then pulls again.
+Pulls whose partition their manifest decides share one flight per digest and
+wait out every partition's pull, so an environment-less pull waits for each
+twin's. A required pull
+that joins a flight whose owner found the digest cached in another partition
+goes round again, and pulls as the owner when nobody else has started one.
+`ListTemplates` reports each build's partition key in
 `TemplateFullInfo.cache_partition`, and sandbox-manager's template catalog
 reads a build's supplemental `metadata.json` from the directory that key names,
 not its binding's, so an adopted build's metadata comes from its legacy
@@ -2231,15 +3261,50 @@ holds it. An older node-ctl publishes a template's last listed build, which can
 be a twin.
 
 Roll back in the reverse order, template-manager before or together with the
-others. A template-manager released while this migration was withdrawn
-reverses it at startup when every build, tag pin and unfinished stamp job is in
-the legacy partition, so rolling back to one needs no database step;
-`db/README.md` describes the check and a read-only query that runs it. Remove
-the directories listed in step 3 first: the check counts rows, not
-directories. A database with environment-partition rows, or a rollback to a
-release that predates the migration, needs the procedure below: such a
-template-manager refuses the migrated database, and its migrator doesn't
-bundle the migration.
+others. A template-manager released while this migration was withdrawn, from
+#1070 until #1075 bundled it again, reverses it at startup when every build,
+tag pin and unfinished stamp job is in the legacy partition; `db/README.md`
+describes the check and a read-only query that runs it. The check counts rows,
+not directories, so before starting one, follow steps 1 to 3 below: stop
+template-manager and sandbox-manager and keep the newer ones from restarting,
+copy the database, run step 2's checks, and remove the directories step 3
+lists. One from #1277 on also reverses the newer
+`20261031050126_node_dirty_ref_revisions` at startup, along with this
+migration, so rolling back to it needs no other database step. One from before
+#1277 doesn't: it reverses this migration, then refuses a database that still
+records `20261031050126`.
+Before starting it, check that
+`sqlite3 -readonly <db> "SELECT max(version) FROM _sqlx_migrations"` prints
+`20261031050126` and that
+`sqlite3 -readonly <db> "SELECT version FROM _space_common_schema_migrations WHERE version > 20260930000000"`
+prints nothing, since `down` reverts the newest migration across both
+histories; if the first prints `20261026220935`, skip this, and otherwise
+stop. Then run `space-db-migrator template-manager --database-path <db> down`
+once with a migrator that bundles `20261031050126`, that is from #1235 on,
+such as the release you are rolling back from. It reverts only that migration.
+A migrator without it, the target's own included, refuses the database instead
+of running. The same run recovers a database on which such a
+template-manager already started and refused that version. Then start the
+older template-manager, and the older sandbox-manager after it, as in step 5.
+If any build, tag pin or unfinished stamp job is outside the legacy partition,
+a release from this interval refuses the database instead of reversing the
+migration: use the procedure below.
+
+A template-manager from #988 until #1070 bundles this migration, with the same
+checksum, but not `20261031050126`. To roll back to one, stop template-manager,
+keep the newer one from restarting until the older one starts (at startup it
+re-applies the dirty-ref migration), copy the database with its `-wal` and
+`-shm` files as step 2 describes, and run the same two checks: if
+`max(version)` prints `20261031050126` and the common check prints nothing,
+continue; if `max(version)` prints `20261026220935`, skip the `down`; and
+otherwise stop. If it printed
+`20261031050126`, run
+`space-db-migrator template-manager --database-path <db> down` once with a
+migrator from #1235 on, reverting only the dirty-ref migration. Nothing else is
+needed: the target keeps this migration, so neither the partition-row check
+nor the procedure below applies to it. A rollback to a release that predates this
+migration needs the procedure below: such a template-manager refuses the
+migrated database, and its migrator doesn't bundle the migration.
 
 1. Stop template-manager on the node and keep the new version from restarting:
    at startup it re-applies the migration. Stop sandbox-manager too, and keep a
@@ -2258,7 +3323,8 @@ bundle the migration.
    migrator's `status` lists only migrations its catalog bundles and would
    omit a newer applied one:
    `sqlite3 -readonly <db> "SELECT max(version) FROM _sqlx_migrations"` must
-   print `20261026220935`, and
+   print `20261031050126`, or `20261026220935` if the node doesn't record the
+   dirty-ref migration, and
    `sqlite3 -readonly <db> "SELECT version FROM _space_common_schema_migrations WHERE version > 20260930000000"`
    must print nothing. If either check fails, stop: this procedure doesn't
    cover that database, and no directory has been removed yet.
@@ -2272,27 +3338,187 @@ bundle the migration.
    `btrfs subvolume show <dir>` succeeds with `btrfs subvolume delete <dir>`,
    and remove any other, a plain directory left on a host without btrfs or by a
    pull whose subvolume request failed, with `rm -rf <dir>`.
-4. Run a migrator that bundles this migration, last: once it commits, an older
-   template-manager can open the database. Run
-   `space-db-migrator template-manager --database-path <db> down` once. It
-   drops the rows of every environment partition and removes the migration's
-   history row. A second run reaches the baseline, which is a rollback floor:
-   it fails and changes nothing.
+4. Run a migrator that bundles every migration step 2 found, such as the newer
+   release's, last: once it commits, an older template-manager can open the
+   database. Each `space-db-migrator template-manager --database-path <db> down`
+   reverts only the newest applied migration, so run it once per migration,
+   newest first. If step 2 printed `20261031050126`, run it once to revert the
+   dirty-ref migration, keeping every outbox row, and check that `max(version)`
+   now prints `20261026220935`; if it prints `20260930000000`, the partition
+   migration is already reverted: go to step 5. Revert it here even for a
+   target from #1277 on: `down` reaches the partition migration only after it.
+   Then run it once to revert the partition migration. That run drops the rows
+   of every environment partition and removes the migration's history row.
+   Another run reaches the baseline, which is a rollback floor: it fails and
+   changes nothing.
 5. Start the older template-manager, then the older sandbox-manager.
 
 Known limits until the cluster side carries partitions:
 
-- Release identity is `(template_name, hash)` in the control plane, its object
-  store layout and its node inventory, so a twin of a published release can't
-  be registered or published yet. Node-ctl publishes a template's
-  legacy-partition build, and another partition's only when it has none.
+- The control plane gives a release an identity per template, hash and
+  execution environment: a twin, bound to another environment, can be
+  registered and resolved by environment once the old
+  `(template_name, hash)` unique index is dropped. A server that predates
+  the `environment` selector ignores it and answers with the tagged or
+  original release, so a client that sends `environment` to
+  `FindTemplateRelease`, `FindTemplateReleaseByHash` or
+  `ListLatestTemplateReleases` must require `environment_applied` in the
+  response before it uses the release or any storage location in it.
+  Template-manager is the one client that sends it. An on-demand pull that
+  requires an environment (`environment_required`, which takes an exact
+  digest) names it on `FindTemplateReleaseByHash`; when a server ignores
+  it, the pull drops that answer and asks again without a selector. It takes
+  the second answer when its release is unbound, and the partition check
+  decides, as before twins, or bound to the environment; one bound elsewhere
+  isn't found. Environment prefetch
+  (`SPACE_TEMPLATE_ENVIRONMENT_PREFETCH_ENABLED`) names it on tag lookups,
+  `ListLatestTemplateReleases` and the digest lookups of the pulls it starts.
+  To prefetch, an ignored selector makes the answer unknown, so it warms
+  nothing. On a tag lookup or `ListLatestTemplateReleases`, it also holds that
+  lookup's pins for up to 10 minutes after the lookup's last acknowledged
+  answer (or after the prefetch loop started), then prunes them as before
+  environments; an answer that says the template is org-specific drops its
+  pins at once. The template campaign driver creates twins (see "Template
+  runtime upgrade campaigns"), and once the old index is gone the build
+  publisher can too:
+  while a release has no storage location, a build of the same hash bound to
+  another environment registers its execution metadata, and the registration
+  inserts a twin when every tag it names is already on the hash (a twin
+  writes no tags). An unbound or initial-environment build is a twin too
+  when the hash's original is bound to another environment and no release
+  under the original's spelling of the digest was recorded without
+  execution metadata (one under the other spelling is never filled), so a
+  tag it names that isn't on the hash yet refuses it.
+  After that, recreating the old index fails, so an image rollback past the
+  drop isn't possible. A twin's own `metadata.json`
+  (`<build>/environments/<environment>/metadata.json`) is written only by the
+  template campaign driver. Node
+  inventory is still keyed by template and hash: node-ctl publishes a
+  template's legacy-partition build, and another partition's only when it has
+  none, so central inventory can't yet tell which nodes hold a twin's build.
+  Node presence labels already carry a separate label for each partition's
+  build. The warm pool reads that label when its pods require an environment;
+  other readers still use the partition-less one.
+- A twin's build shares its original's `manifest.json` and `metadata.json`
+  keys, since object keys carry only template and hash, and template-manager's
+  pull derives a build's cache partition and execution from those two
+  objects. So the build publisher reads both first and, when one already
+  exists, replaces it only if it names the same execution and guest image (a
+  retry, or a rebuild in the same environment, whose manifest has to match
+  its new rootfs). Otherwise, or when the stored object doesn't parse, it
+  fails the publish before writing either. It creates an absent one with a
+  conditional put (`If-None-Match: *`), and checks again if that finds one
+  another publish created meanwhile, so a refusal never replaces a stored
+  object, and two environments publishing one hash at once, a publisher
+  using static object-store credentials, or a stale release lookup can't
+  repoint the original's pulls at another environment. The publisher vends
+  read and write access to read the stored objects back. The store has to
+  honor conditional puts; AWS S3 does, and so does the versitygw release the
+  Kind stack runs. A build-manager image that predates this check still puts
+  unconditionally, so the guard holds only once every build-manager runs it.
+  A publish from another environment that dies before registering leaves its
+  `manifest.json`, `metadata.json` or both behind, and later publishes of that
+  hash from other environments fail until both are removed. Remove them only
+  after confirming that no release of the hash has a storage location and no
+  publish of it is running; the retry of the interrupted publish completes
+  without removing anything. Two publishes of one hash in the same
+  environment can still interleave, as before, so one's manifest can end up
+  beside the other's rootfs: the publisher doesn't serialize them.
+- One rule picks a digest's original release, owned by
+  `crates/l30_storage/template/release/original`: among the releases of a
+  template whose hash spells the digest either way (`sha256:<hex>` or bare
+  `<hex>`), each spelling's original is its earliest release by
+  `(created_at, id)`, and the digest's original is the spelling original that
+  owns a storage location, or the earlier one when both or neither do. The
+  internal API's registration, tag writer, hash and tag lookups and listing,
+  the API's create-by-digest, create-by-tag and placement lookups, the admin
+  tag refusal and delete guard, the runtime environment in-use count, the
+  warm-pool store's retention and demand reads, and
+  `scripts/bootstrap-templates.sh` all interpolate that one predicate. Twin
+  resolution (`resolved_release_sql`, above) breaks a tie between a build's
+  releases under the two spellings with it too, so a create naming either
+  spelling runs the release the warm pool warms. It still ranks the original
+  tier by the build's earliest storage-owning release, twins included, so the
+  two can differ when a twin owns a storage location its spelling's original
+  lacks. A tag
+  written before the rule can sit on the other spelling's original; tag
+  lookups, the pool's `latest` preference and retention's publish time read
+  it as a tag on the digest, so it resolves to the digest original. A manual
+  pool config upserted before the rule can still name the other spelling's
+  original and keeps warming it until it's disabled with
+  `DELETE /admin/api/v1/warm-pools/{id}`. Upserting the same config again
+  doesn't retire it: the upsert adds a config on the digest original and
+  leaves the old one enabled. A rollback to an image that predates the rule
+  half-strands a config the new API upserted on a bare digest original:
+  old creates by digest resolve to its `sha256:` spelling and miss it, while
+  old creates by a tag on the bare release still hit it. Disabling it and
+  upserting again with the `sha256:` hash, which the old API matches
+  exactly, swaps which of the two goes cold, so keep the one that carries
+  the traffic. Mixed versions can
+  still disagree: an image that predates the rule resolves a digest stored
+  under both spellings as it did before (the API preferring the canonical
+  spelling, the warm pool counting each spelling's original), so don't
+  deploy the migration that drops the old index (below) until the internal
+  API, the API and the cluster controller all run the shared rule and no
+  rollback target predates it. Until the API
+  and the cluster controller have both rolled, creates for such a digest can
+  miss the warm pool in either order: an old controller ranks each spelling's
+  original separately for retention and maps demand to the spelling a
+  sandbox records.
+- Migration `20261119015950` drops the old `(template_name, hash)` unique
+  index. The migration job applies it on deploy, so don't deploy a release
+  that contains it until every SPACE service image that's deployed on a
+  cluster, or kept as a rollback target, registers twins without that index
+  and runs the shared original-release rule above: api, worker,
+  cluster-controller, data-plane and builder-bundle.
+  `scripts/bootstrap-templates.sh` doesn't depend on the index: under the
+  `templates` row lock it inserts a release only when the digest has none
+  under either spelling, and puts the `latest` tag and the storage location
+  on the digest's original. A
+  checkout of the script from before that change still uses `ON CONFLICT
+  (template_name, hash)`, which fails once the index is gone, after its
+  template upsert has committed. Recreating the index isn't a rollback once a
+  twin exists: the twin and its original share a template and hash, so the
+  index build fails.
+- `scripts/admin/prune_cluster_artifacts.py superseded-templates` ranks
+  each digest once, by its first release under either spelling, and
+  never selects a release that shares its template and digest, under either
+  spelling, with another release, or whose storage location equals another
+  release's or is a string prefix of it, either way round. While any storage
+  location isn't an `s3://<bucket>/<key>` URI, it refuses to list anything,
+  and `scan` and `verify` stop without a report: a bucket root such as
+  `s3://bucket/`, or a malformed location such as `s3:`, would count as a
+  prefix of every location in its bucket, or of every location. The internal
+  API accepts a bucket-root location, so such a row has to be corrected in the
+  database before any of the three runs. A twin shares its original's whole build prefix
+  (rootfs, manifest and the shared `metadata.json`), so deleting either
+  one's storage would delete a build the other still serves. The delete
+  transaction locks the candidate's `templates` row in a mode that conflicts
+  with the lock registration under that template takes, but not with
+  foreign-key checks, and re-checks these rules under it, so no
+  twin or other release of that template can appear before its row deletes
+  commit. A registration under another template doesn't take that lock: one
+  whose storage location falls under the candidate's prefix can commit while
+  the check runs, and the check doesn't see it. The transaction also commits
+  the row deletes before it deletes the storage, and nothing fences a prefix
+  in between, so a registration of any template in that window that attaches
+  a storage location under the pruned prefix loses its artifacts. These rules
+  never prune an original that has a twin, the twin itself, or releases that
+  share a storage prefix, however superseded they are, so their storage stays
+  until a twin-aware rule exists. A run of the script from before these rules
+  can delete an original whose first twin is registered meanwhile, so let any
+  such run finish before dropping the index. Once twins exist, don't run a
+  checkout from before these rules at all: it ranks twins as the newest
+  releases, so it can select a superseded original and delete the build
+  prefix its twin still serves.
 - A restore of a btrfs-send stream needs the build its stream descends from.
   Its lookup prefers the snapshot's binding but falls back to another
   partition of the digest without pulling, so a node holding only another
   partition's build of that digest can't restore a stream whose parent it
   lacks, and nothing pulls that build for it: the restore keeps failing. Twins
   exist only where a node admits an environment besides the initial one.
-- Prefetch names no environment: it pulls without a selector, counts a build
+- With `SPACE_TEMPLATE_ENVIRONMENT_PREFETCH_ENABLED` off, prefetch names no
+  environment: it pulls without a selector, counts a build
   in any partition of a digest as cached, and its tag pins use the legacy
   partition key.
 

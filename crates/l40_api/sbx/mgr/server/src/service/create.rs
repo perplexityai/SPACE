@@ -27,20 +27,20 @@ pub(super) struct StartFromCheckpointLaunch<'a> {
     pub(super) vcpu: Option<u32>,
     pub(super) activation_auto_lifecycle: Option<&'a AutoLifecyclePolicy>,
     pub(super) operation_activation_attempt_id:
-        Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+        Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     pub(super) sandbox: &'a crate::db::SandboxRow,
     pub(super) blocking: bool,
     pub(super) netns_path: Option<String>,
     pub(super) target_state: SandboxState,
-    pub(super) execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
-    pub(super) space_api_route_identity: pplx_space_common_core::types::SpaceApiRouteIdentity,
+    pub(super) execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
+    pub(super) space_api_route_identity: pplx_space_sandbox_model::SpaceApiRouteIdentity,
     pub(super) route_identity_provenance:
         crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance,
     pub(super) open_activation_claim_eligible: bool,
     pub(super) restored_snapshot: RestoredSnapshotProvenance,
     /// See [`super::start::StartAdmission::expected_node_execution`].
     pub(super) expected_node_execution:
-        Option<Option<pplx_space_common_core::types::SandboxActivationAttemptId>>,
+        Option<Option<pplx_space_sandbox_model::SandboxActivationAttemptId>>,
 }
 
 /// BYOK restore: rebuild the encrypted rootfs from the suspended `cow.luks` and
@@ -69,7 +69,9 @@ pub(super) struct StartFromCheckpointLaunch<'a> {
 /// kept `instance/` in place and whose publication dir was already reclaimed),
 /// `None` opens the canonical backing directly.
 async fn reconstruct_encrypted_restore_devices(
+    cache_root: &std::path::Path,
     sandbox_id: &str,
+    pinned: crate::rootfs_encryption::PinnedCheckpoint<'_>,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
     snapshot_dir: &str,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
@@ -82,7 +84,9 @@ async fn reconstruct_encrypted_restore_devices(
     let snapshot_restore_source = restore_source_if_present("snapshot.luks");
 
     let rootfs_block_device_path = crate::rootfs_encryption::prepare_encrypted_rootfs(
+        cache_root,
         sandbox_id,
+        pinned,
         execution_fence,
         cow_source.as_deref(),
         node_manager,
@@ -142,7 +146,7 @@ fn snapshot_memory_file_mib(snapshot_dir: &str) -> Result<Option<u64>, Status> {
 }
 
 fn restored_guest_memory_mib(
-    captured: Option<pplx_space_common_core::types::MemorySize>,
+    captured: Option<pplx_space_byte_size::MemorySize>,
     file_mib: Option<u64>,
 ) -> Result<Option<u64>, Status> {
     let captured = captured.map(|size| size.as_mib_ceil());
@@ -184,10 +188,10 @@ fn ensure_snapshot_memory_allowed(
 /// captured allocation. Legacy snapshots without either source stay unknown.
 pub(super) fn restore_cpu_budget(
     requested: Option<u32>,
-    captured: Option<pplx_space_common_core::types::VcpuCount>,
-) -> Result<Option<pplx_space_common_core::types::VcpuCount>, Status> {
+    captured: Option<pplx_space_execution_spec::VcpuCount>,
+) -> Result<Option<pplx_space_execution_spec::VcpuCount>, Status> {
     requested
-        .map(pplx_space_common_core::types::VcpuCount::try_from_u32)
+        .map(pplx_space_execution_spec::VcpuCount::try_from_u32)
         .transpose()
         .map(|requested| requested.or(captured))
         .map_err(|error| {
@@ -292,12 +296,19 @@ impl SandboxManagerService {
         )))
     }
 
+    // End the span before the returned guard is used: measure acquisition,
+    // not the SQL work or the time the connection stays locked.
+    #[tracing::instrument(name = "sbxmgr.create.db_lock", skip_all, err)]
+    fn create_db_conn(&self) -> Result<crate::db::ConnectionGuard<'_>, Status> {
+        self.db_conn()
+    }
+
     pub(super) fn lookup_requested_sandbox(
         &self,
         requested_id: Uuid,
     ) -> Result<Option<crate::db::SandboxRow>, Status> {
         let requested_id_str = requested_id.to_string();
-        let db = self.db_conn()?;
+        let db = self.create_db_conn()?;
         crate::db::read::sandbox(&db, &requested_id_str)
             .map_err(|e| Status::internal(format!("db lookup failed: {e}")))
     }
@@ -410,7 +421,7 @@ impl SandboxManagerService {
 
         let create_cleanup_id = SandboxCleanupEpisodeId::new();
         {
-            let db = self.db_conn()?;
+            let db = self.create_db_conn()?;
             crate::db::insert_sandbox_with_cleanup_episode_and_route_evidence(
                 &db,
                 crate::db::InsertSandboxParams {
@@ -424,7 +435,7 @@ impl SandboxManagerService {
                     runtime,
                     snapshots_enabled: req.snapshots_enabled,
                     rootfs_size_mb: req.rootfs_size_mb,
-                    disk_io_limits: pplx_space_common_core::types::DiskIoLimits::try_from_optional(
+                    disk_io_limits: pplx_space_execution_spec::DiskIoLimits::try_from_optional(
                         req.disk_io_max_operations_per_sec,
                         req.disk_io_max_bandwidth_mib_per_sec,
                     )
@@ -479,7 +490,7 @@ impl SandboxManagerService {
         }
 
         let update_result = {
-            let db = self.db_conn()?;
+            let db = self.create_db_conn()?;
             write_create_completed(&db, &id)
         };
         if let Err(status) = update_result {
@@ -595,7 +606,7 @@ impl SandboxManagerService {
 
             {
                 let update_result = {
-                    let db = self.db_conn()?;
+                    let db = self.create_db_conn()?;
                     write_base_snapshot_create_completed(&db, &id)
                 };
                 if let Err(status) = update_result {
@@ -609,7 +620,7 @@ impl SandboxManagerService {
         }
 
         let completed = {
-            let db = self.db_conn()?;
+            let db = self.create_db_conn()?;
             crate::db::complete_create(&db, &id, create_cleanup_id, !req.autostart)
                 .map_err(|error| Status::internal(format!("complete create: {error}")))?
         };
@@ -824,6 +835,12 @@ impl SandboxManagerService {
         // to see, or can't finish before this restore claims the row.
         self.refuse_retired_activation_retry(id, open_route_activation.as_ref())
             .await?;
+        // A node that refuses activations, sealed or with an unreadable seal,
+        // refuses the restore here, before its claim, its network allocation
+        // or its cleanup episode: the row stays as it was. The admission
+        // below still refuses a seal that lands after this check.
+        self.activation_seal
+            .check(ActivationAdmissionKind::Restore.as_str(), id)?;
 
         let cleanup_episode = {
             let db = self.db_conn()?;
@@ -915,6 +932,11 @@ impl SandboxManagerService {
                 ))
             })?
             .into_inner();
+        self.external_addresses.record(
+            id,
+            &space_api_route_identity,
+            alloc.external_address.as_deref(),
+        );
         let sbx_uid = alloc.sandbox_uid;
         if sbx_uid < 10000 {
             // No VM, sidecar, cgroup, or filesystem work has been launched yet.
@@ -995,7 +1017,7 @@ impl SandboxManagerService {
             alloc.guest_mac, alloc.tap_device, guest_cid
         );
 
-        let vm_config = if runtime == pplx_space_common_core::types::RuntimeKind::CloudHypervisor {
+        let vm_config = if runtime == pplx_space_execution_spec::RuntimeKind::CloudHypervisor {
             let memory_mib = snapshot_memory_mib
                 .and_then(|mib| std::num::NonZeroU64::new(u64::from(mib)))
                 .ok_or_else(|| {
@@ -1085,7 +1107,7 @@ impl SandboxManagerService {
                     )
                 })?;
             let resolved_execution_metadata =
-                pplx_space_common_core::types::ExecutionMetadata::try_from(&resolved_execution)
+                pplx_space_execution_spec::ExecutionMetadata::try_from(&resolved_execution)
                     .map_err(|error| Status::internal(error.to_string()))?;
             super::validation::require_environment_acknowledgement(
                 &requested_execution,
@@ -1123,7 +1145,12 @@ impl SandboxManagerService {
         // sandboxes take the plaintext path with no service round-trip.
         let (rootfs_block_device_path, snapshot_volume_mount_dir) = if sandbox.volume_encryption {
             match reconstruct_encrypted_restore_devices(
+                cache_root,
                 id,
+                crate::rootfs_encryption::PinnedCheckpoint::of(
+                    sandbox,
+                    self.staged_checkpoint_disk,
+                ),
                 execution_fence,
                 &snapshot_dir,
                 &self.node_manager,
@@ -1159,8 +1186,8 @@ impl SandboxManagerService {
             .admit_vm_activation(ActivationAdmissionKind::Restore, id)
             .await
         {
-            Ok(permit) => {
-                activation_cleanup.admit(permit);
+            Ok(admission) => {
+                activation_cleanup.admit_activation(admission);
             }
             Err(status) => {
                 activation_cleanup.cleanup();
@@ -1532,7 +1559,7 @@ pub(super) fn autostart_request(
     sandbox_id: String,
     from_warm: bool,
     blocking: bool,
-    create_route_identity: &pplx_space_common_core::types::SpaceApiRouteIdentity,
+    create_route_identity: &pplx_space_sandbox_model::SpaceApiRouteIdentity,
 ) -> StartRequest {
     StartRequest {
         sandbox_id,
@@ -1547,7 +1574,7 @@ pub(super) fn autostart_request(
 }
 
 pub(super) fn create_route_evidence_before_start(
-    identity: &pplx_space_common_core::types::SpaceApiRouteIdentity,
+    identity: &pplx_space_sandbox_model::SpaceApiRouteIdentity,
     provenance: crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance,
     autostart: bool,
 ) -> Option<crate::auto_lifecycle_delete_receipts::RouteEvidence> {

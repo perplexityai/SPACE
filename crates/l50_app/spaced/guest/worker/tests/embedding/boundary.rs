@@ -12,7 +12,7 @@ use futures_util::{FutureExt, StreamExt};
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
-use pplx_space_common_core::types::GuestUserName;
+use pplx_space_guest_process::GuestUserName;
 use pplx_space_spaced_guest_execution::{
     ExecutionCgroups, ExecutionService, ExecutionServiceConfig, WorkerExecutable,
 };

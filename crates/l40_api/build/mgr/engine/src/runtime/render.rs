@@ -1,5 +1,5 @@
 //! Compile restricted app data into systemd syntax; no tenant text is shell code.
-use pplx_space_common_core::types::{RuntimeReadiness, TemplateRuntime};
+use pplx_space_template_runtime::{RuntimeReadiness, TemplateRuntime};
 use std::collections::BTreeMap;
 use std::io::{self, Read};
 
@@ -174,7 +174,7 @@ pub(super) fn read_archive(bytes: &[u8]) -> io::Result<Files> {
         if entry.header().entry_type().is_dir() && path == std::path::Path::new(".") {
             continue;
         }
-        let path = path.strip_prefix(".").unwrap_or(&path);
+        let path = path.trim_prefix(".");
         if !entry.header().entry_type().is_file() || path.components().count() != 1 {
             return Err(io::Error::other(
                 "runtime bundle must contain only regular files",

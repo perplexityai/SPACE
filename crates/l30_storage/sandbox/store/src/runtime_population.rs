@@ -4,12 +4,13 @@
 
 use std::sync::LazyLock;
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::SubstrateKind;
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_portability::{
     failed_repair_revert_eligibility, no_newer_full_snapshot,
     restore_retry_source_snapshot_is_current, snapshot_is_current_local_artifact,
 };
+use pplx_space_sql_locator::sql;
 
 /// One group of [`sandbox_population`]: sandboxes with the same binding
 /// record and lifecycle.
@@ -197,11 +198,13 @@ static SANDBOX_POPULATION_QUERY: LazyLock<String> = LazyLock::new(|| {
 /// environment here: that needs the legacy-equivalence rule, which only a
 /// node's compiled catalog can apply.
 pub async fn sandbox_population(
-    executor: impl sqlx::PgExecutor<'_>,
-) -> Result<Vec<SandboxPopulationRow>, sqlx::Error> {
-    sqlx::query_as(sqlx::AssertSqlSafe(SANDBOX_POPULATION_QUERY.as_str()))
-        .bind(SubstrateKind::Space)
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_all(executor)
-        .await
+    executor: impl Executor<'_>,
+) -> Result<Vec<SandboxPopulationRow>, DbError> {
+    Ok(
+        sqlx::query_as(sqlx::AssertSqlSafe(SANDBOX_POPULATION_QUERY.as_str()))
+            .bind(SubstrateKind::Space)
+            .bind(SubstrateKind::Kubernetes)
+            .fetch_all(executor.into_sqlx())
+            .await?,
+    )
 }

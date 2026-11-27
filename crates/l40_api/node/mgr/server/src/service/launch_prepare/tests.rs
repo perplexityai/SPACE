@@ -1,6 +1,7 @@
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
-use pplx_space_common_core::types::{Arch, ExecutionMetadata, RuntimeKind};
+use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{ExecutionMetadata, RuntimeKind};
 
 use super::{parse_runtime_request, prepare_sandbox_cache_paths, prepare_sandbox_owned_paths};
 
@@ -13,7 +14,7 @@ fn oversized_rootfs_resize_is_rejected_before_touching_disk() {
         let error = super::resize_guest_disk(
             rootfs.to_str().unwrap(),
             mib,
-            pplx_space_common_core::types::guest_image::GuestDiskLayout::Ext4Filesystem,
+            pplx_space_execution_spec::guest_image::GuestDiskLayout::Ext4Filesystem,
         )
         .unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
@@ -467,9 +468,11 @@ async fn launch_sandbox_refuses_invalid_requests_before_touching_the_jail() {
 #[tokio::test]
 async fn prepare_sandbox_refuses_invalid_requests_before_touching_the_cache() {
     use crate::service::tests::service_tests::{refusal_mismatch, root_request, stale_test_fence};
-    use pplx_space_common_core::types::{ContentHash, SandboxArtifactMetadata, TemplateName};
+    use pplx_space_artifact_model::SandboxArtifactMetadata;
+    use pplx_space_content_digest::ContentHash;
     use pplx_space_execution_common::proto::ExecutionSelectionMode as Mode;
     use pplx_space_node_runtime_core::runtime_inventory::RuntimeInventoryError;
+    use pplx_space_template_model::TemplateName;
     use std::str::FromStr;
     use tonic::Code;
 
@@ -493,7 +496,7 @@ async fn prepare_sandbox_refuses_invalid_requests_before_touching_the_cache() {
     ))
     .unwrap();
     let rootfs_size = |mib| {
-        pplx_space_common_core::sandbox_storage::validate_rootfs_mib(mib)
+        pplx_space_sandbox_model::sandbox_storage::validate_rootfs_mib(mib)
             .unwrap_err()
             .to_string()
     };
@@ -654,7 +657,7 @@ async fn prepare_sandbox_refuses_invalid_requests_before_touching_the_cache() {
 #[tokio::test]
 async fn sidecar_launch_refuses_invalid_requests_before_resolving_its_identity() {
     use crate::service::tests::service_tests::{refusal_mismatch, root_request, stale_test_fence};
-    use pplx_space_common_core::host::linux::paths;
+    use pplx_space_host_layout::paths;
     use tonic::Code;
 
     let admitted = AdmittedSandbox::new().await;

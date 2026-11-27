@@ -117,8 +117,8 @@ const POOL_DONOR_SCAN_LIMIT: u32 = 32;
 /// What the node said about each donor execution this adoption asked about.
 #[derive(Default)]
 struct DonorAdmissions {
-    admitted: Vec<pplx_space_common_core::types::ExecutionMetadata>,
-    refused: Vec<(pplx_space_common_core::types::ExecutionMetadata, Status)>,
+    admitted: Vec<pplx_space_execution_spec::ExecutionMetadata>,
+    refused: Vec<(pplx_space_execution_spec::ExecutionMetadata, Status)>,
 }
 
 /// The donor adoption may claim, or the node's refusal of every one.
@@ -615,6 +615,7 @@ impl SandboxManagerService {
             sandbox_id: id.to_string(),
             template_filter: None,
             blocking: false,
+            discard_retained_filesystem_reason: None,
         }))
         .await?;
         Ok(())

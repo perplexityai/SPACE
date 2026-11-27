@@ -6,11 +6,11 @@
 //! refusal.
 
 use crate::proto::{ArtifactIntegrityRequirement, LaunchRuntimeRequest};
-use pplx_space_common_core::types::{
-    DigestParseError, EnvironmentReference, NodePathError, NodeSpacePath,
-    SandboxActivationAttemptId, SandboxId, SandboxIdParseError,
-};
+use pplx_space_artifact_model::{NodePathError, NodeSpacePath};
+use pplx_space_content_digest::DigestParseError;
 use pplx_space_execution_common::proto::RuntimeKind;
+use pplx_space_execution_spec::EnvironmentReference;
+use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId, SandboxIdParseError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LaunchContractError {

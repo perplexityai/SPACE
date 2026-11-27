@@ -114,6 +114,10 @@ async fn direct_route_to_a_restoring_sandbox_waits_for_its_restore() -> TestResu
                     error.message().contains("restoring"),
                     "{owner:?}: the refusal must be the restoring one, not the owner's: {error:?}"
                 );
+                assert!(
+                    pplx_space_common_grpc::RetryableNotReady::from_status(&error).is_some(),
+                    "{owner:?}: a restore in progress is a designed retry, not a failed call: {error:?}"
+                );
                 assert_eq!(
                     unavailable.0.load(std::sync::atomic::Ordering::SeqCst),
                     usize::from(matches!(owner, Owner::Unavailable)),
@@ -194,6 +198,10 @@ async fn session_route_to_a_restoring_sandbox_waits_for_its_restore() -> TestRes
                 assert!(
                     error.message().contains("restoring"),
                     "{owner:?}: {error:?}"
+                );
+                assert!(
+                    pplx_space_common_grpc::RetryableNotReady::from_status(&error).is_some(),
+                    "{owner:?}: a restore in progress is a designed retry, not a failed call: {error:?}"
                 );
                 assert_eq!(
                     unavailable.0.load(std::sync::atomic::Ordering::SeqCst),

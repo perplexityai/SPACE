@@ -1,5 +1,7 @@
-use pplx_space_common_core::types::{
-    ExecutionGeneration, NodeManagedBy, PodUid, SandboxActivationAttemptId, SpaceApiRouteIdentity,
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_model::NodeManagedBy;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, SandboxActivationAttemptId, SpaceApiRouteIdentity,
 };
 
 use super::*;

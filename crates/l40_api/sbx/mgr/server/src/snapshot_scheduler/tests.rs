@@ -1,7 +1,7 @@
 use super::retention::{
     KEEP_D_1M, KEEP_D_5M, KEEP_F_1H, KEEP_F_6H, KEEP_F_10M, retention_candidate,
 };
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 use crate::state::SandboxStatus;
@@ -153,6 +153,7 @@ fn checkpoint_context(state: impl Into<SandboxStatus>) -> (CheckpointContext, St
             auto_lifecycle: crate::auto_lifecycle::AutoLifecycleCoordinator::default(),
             health_lifecycle: crate::watchdog::HealthLifecycleEpochs::default(),
             node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
+            activation_seal: Arc::new(crate::activation_seal::ActivationSeal::unsealed()),
         },
         sandbox_id,
     )
@@ -509,7 +510,9 @@ fn retention_keeps_newest_per_tier_without_waiting_for_the_whole_census() {
 /// test rather than letting it compare `None` with `None`.
 #[test]
 fn checkpoint_sidecar_execution_metadata_records_the_capturing_host_cpu() {
-    use pplx_space_common_core::types::{Arch, ExecutionMetadata, HostCpu, TemplateName};
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{ExecutionMetadata, HostCpu};
+    use pplx_space_template_model::TemplateName;
 
     #[cfg(target_os = "linux")]
     assert!(
@@ -523,9 +526,7 @@ fn checkpoint_sidecar_execution_metadata_records_the_capturing_host_cpu() {
         TemplateName::parse("seed").unwrap(),
         None,
     )
-    .with_guest_memory(Some(
-        pplx_space_common_core::types::MemorySize::mib(2048).unwrap(),
-    ));
+    .with_guest_memory(Some(pplx_space_byte_size::MemorySize::mib(2048).unwrap()));
     let execution = checkpoint_sidecar_execution_metadata(metadata).unwrap();
 
     assert_eq!(execution.host_cpu(), HostCpu::current());
@@ -620,7 +621,7 @@ async fn retention_prune_skips_pinned_and_leased_snapshot_artifacts() {
         for (name, setup) in names.iter().zip(candidates) {
             let id = LocalArtifactId::new();
             ids.push(id);
-            let local_path = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir_in(
+            let local_path = pplx_space_host_layout::paths::sandbox_snapshot_dir_in(
                 &cache_root,
                 &sandbox_id,
                 name,
@@ -1654,3 +1655,116 @@ fn gc_staging_ids_are_canonical() {
 }
 
 mod incomplete_checkpoint;
+
+/// `ctx` with its own seal, read from its database, sealed when `sealed`.
+fn with_seal(mut ctx: CheckpointContext, sealed: bool) -> CheckpointContext {
+    ctx.activation_seal = Arc::new(crate::activation_seal::ActivationSeal::load(
+        &ctx.db.lock().unwrap(),
+    ));
+    if sealed {
+        ctx.activation_seal.seal(&ctx.db, 3).unwrap();
+    }
+    ctx
+}
+
+/// A scheduled capture asks the seal under the artifact lock: a node known
+/// sealed refuses it, with the seal's plain refusal, for every row without a
+/// VM, and admits it, counted in flight, for a started or paused one. A node
+/// never sealed admits every row, as before.
+#[test]
+fn a_sealed_node_admits_a_scheduled_capture_only_of_a_sandbox_with_a_vm() {
+    for state in SandboxStatus::sweep() {
+        let has_vm = matches!(
+            state.unowned(),
+            Some(SandboxState::Started | SandboxState::Paused)
+        );
+        for sealed in [false, true] {
+            let (ctx, sandbox_id) = checkpoint_context(state);
+            let ctx = with_seal(ctx, sealed);
+            match admit_scheduled_producer(&ctx, "scheduled disk snapshot", &sandbox_id) {
+                Ok(token) => {
+                    assert!(!sealed || has_vm, "{state} admitted sealed");
+                    assert_eq!(
+                        ctx.activation_seal.status().producers_in_flight,
+                        std::slice::from_ref(&sandbox_id)
+                    );
+                    drop(token);
+                }
+                Err(refused) => {
+                    assert!(sealed && !has_vm, "{state} refused: {refused}");
+                    assert!(
+                        refused.starts_with(crate::activation_seal::ACTIVATIONS_SEALED_MARKER),
+                        "{state}: {refused}"
+                    );
+                }
+            }
+            ctx.activation_seal.assert_quiesced();
+        }
+    }
+}
+
+/// On a sealed node, the scheduler's disk capture and its checkpoint of a
+/// sandbox that no longer has a VM are refused once they hold the artifact
+/// lock, before anything is captured or published. A started sandbox's
+/// capture runs, its producer in flight meanwhile.
+#[tokio::test]
+async fn a_sealed_node_refuses_the_scheduled_capture_of_a_sandbox_without_a_vm() {
+    use pplx_space_node_mgr_client::proto::{
+        ListBtrfsSnapshotsRequest, ListBtrfsSnapshotsResponse,
+    };
+
+    let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
+        .unary("ListBtrfsSnapshots", |_: ListBtrfsSnapshotsRequest| {
+            Ok(ListBtrfsSnapshotsResponse::default())
+        })
+        .serve();
+    for state in [
+        SandboxState::Stopped,
+        SandboxState::Suspended,
+        SandboxState::Started,
+    ] {
+        let root = tempfile::TempDir::new().unwrap();
+        let (ctx, sandbox_id) = checkpoint_context(state);
+        let ctx = with_seal(ctx, true);
+        let before = crate::db::test_fixtures::database_rows(&ctx.db.lock().unwrap());
+        let mut in_flight = None;
+        let captured = super::retention::prune_and_capture(
+            &mut node_manager.connector().lazy(),
+            &ctx,
+            &sandbox_id,
+            root.path().to_str().unwrap(),
+            1,
+            &mut None,
+            async |_| Ok(()),
+            async |_, ()| {
+                in_flight = Some(ctx.activation_seal.status().producers_in_flight);
+                Ok(())
+            },
+        )
+        .await;
+        if state == SandboxState::Started {
+            captured.unwrap();
+            assert_eq!(in_flight, Some(vec![sandbox_id.clone()]));
+        } else {
+            let refused = captured.unwrap_err();
+            assert!(
+                refused.starts_with(crate::activation_seal::ACTIVATIONS_SEALED_MARKER),
+                "{state}: {refused}"
+            );
+            assert_eq!(in_flight, None, "{state}");
+            let refused = do_scheduled_checkpoint(&ctx, &sandbox_id, "f-10m-20260916T120000Z")
+                .await
+                .unwrap_err();
+            assert!(
+                refused.starts_with(crate::activation_seal::ACTIVATIONS_SEALED_MARKER),
+                "{state}: {refused}"
+            );
+            assert_eq!(
+                crate::db::test_fixtures::database_rows(&ctx.db.lock().unwrap()),
+                before,
+                "{state}"
+            );
+        }
+        ctx.activation_seal.assert_quiesced();
+    }
+}

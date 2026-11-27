@@ -1,6 +1,6 @@
 use super::super::tests::service_tests::insert_test_sandbox;
 use super::*;
-use pplx_space_common_core::types::RouteGeneration;
+use pplx_space_sandbox_model::RouteGeneration;
 
 struct Fixture {
     _gateway: super::super::gateway_identity::tests::GatewayNode,

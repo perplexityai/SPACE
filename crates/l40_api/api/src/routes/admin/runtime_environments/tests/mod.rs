@@ -1,8 +1,11 @@
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request};
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{Digest, OrgId, SandboxId, SubstrateKind};
+use pplx_space_accounts::OrgId;
+use pplx_space_content_digest::Digest;
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sql_locator::sql;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -11,7 +14,9 @@ use uuid::Uuid;
 use super::*;
 use pplx_space_db_test_fixtures::insert_ready_worker_node;
 
-use crate::routes::admin::test_fixtures::{Fixture, TestResult, postgres_fixture};
+use crate::routes::admin::test_fixtures::{
+    Fixture, TestResult, assert_error_contains, postgres_fixture,
+};
 
 /// The managing org the migrations seed.
 const SEED_ORG: Uuid = Uuid::from_u128(0x1);
@@ -545,8 +550,35 @@ async fn harness_with_connections(max_connections: u32) -> TestResult<Option<Har
 }
 
 async fn harness_on(db: Fixture) -> TestResult<Option<Harness>> {
-    let (user_id, token) = insert_session_user(&db.pool, "organization_admin").await?;
     let state = AppState::from_pool(db.pool.clone()).await?;
+    harness_with_state(db, state).await
+}
+
+/// A harness on a deployment whose creates boot the twin they resolve to: a
+/// Kubernetes substrate with the environment placement gate `on`.
+#[cfg(feature = "kubernetes")]
+async fn harness_booting_twins() -> TestResult<Option<Harness>> {
+    use crate::controllers::substrate::kubernetes::tests::{
+        mock_kubernetes_client, substrate_with_store_and_client,
+    };
+    let Some(db) = postgres_fixture().await? else {
+        return Ok(None);
+    };
+    let mut kubernetes = substrate_with_store_and_client(
+        db.pool.clone(),
+        mock_kubernetes_client(std::sync::Arc::default()),
+    );
+    kubernetes.k8s.environment_placement =
+        crate::controllers::substrate::environment_placement::EnvironmentPlacementGate::On;
+    let substrate = crate::controllers::substrate::Substrate::from_kubernetes(kubernetes);
+    assert!(substrate.boots_template_twins());
+    let mut state = AppState::from_pool(db.pool.clone()).await?;
+    state.sandbox_controller = crate::controllers::sandbox::SandboxController::new(substrate);
+    harness_with_state(db, state).await
+}
+
+async fn harness_with_state(db: Fixture, state: AppState) -> TestResult<Option<Harness>> {
+    let (user_id, token) = insert_session_user(&db.pool, "organization_admin").await?;
     let app = crate::routes::admin::shared_host_router(state.clone()).with_state(state);
     Ok(Some(Harness {
         db,
@@ -649,12 +681,6 @@ async fn call_with_if_match(
             .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
     };
     (status, value)
-}
-
-#[track_caller]
-fn assert_error_contains(body: &Value, needle: &str) {
-    let error = body["error"].as_str().unwrap_or_default();
-    assert!(error.contains(needle), "expected {needle:?} in {body}");
 }
 
 fn state_path_suffix(environment: EnvironmentReference) -> String {

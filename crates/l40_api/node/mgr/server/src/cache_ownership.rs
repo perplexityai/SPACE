@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const RETAINED_SOURCE_BUNDLE: &str = "rootfs.btrfs-source";
 pub(crate) const RETAINED_SOURCE_GID: u32 =
-    pplx_space_common_core::host::linux::identities::gids::SPACE_CACHE_RW;
+    pplx_space_host_layout::identities::gids::SPACE_CACHE_RW;
 pub(crate) const RETAINED_SOURCE_MODE: u32 = 0o750;
 
 /// Capture seals immutable send inputs behind this neutral access boundary.

@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{NodeId, OrgId, SandboxId};
+use pplx_space_accounts::{NodeId, OrgId};
+use pplx_space_sandbox_model::SandboxId;
 
 use std::time::Instant;
 
@@ -6,13 +7,12 @@ use crate::metrics::template::{
     VisibilityLookupCacheOutcome, VisibilityLookupDegradation, visibility_lookup_cache,
     visibility_lookup_degraded,
 };
-use pplx_space_common_core::types::TemplateVisibility as CoreTemplateVisibility;
+use pplx_space_template_model::TemplateVisibility as CoreTemplateVisibility;
 
 use crate::template_visibility_cache::TemplateVisibilityCache;
 
 use super::status::*;
 use super::*;
-use pplx_space_common_core::sql;
 
 // ── Template metadata: row types and helpers ──────────────────────────────
 
@@ -21,13 +21,6 @@ pub(super) struct TemplateRow {
     pub(super) name: String,
     pub(super) description: Option<String>,
     pub(super) created_at: OffsetDateTime,
-    pub(super) network_policy_json: Json<NetworkPolicyV1>,
-    pub(super) network_policy_generation: i64,
-}
-
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct TemplatePolicyRow {
-    pub(super) template: String,
     pub(super) network_policy_json: Json<NetworkPolicyV1>,
     pub(super) network_policy_generation: i64,
 }
@@ -88,58 +81,6 @@ pub(super) fn sandbox_effective_policy_generation(row: &SandboxPolicyRow) -> i64
     row.network_policy_generation
 }
 
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct NodeTemplateBaseSnapshotPolicyRow {
-    pub(super) template: String,
-    pub(super) ensure_base_snapshot: bool,
-    pub(super) snapshot_vcpu: Option<i32>,
-    pub(super) snapshot_memory_mib: Option<i32>,
-}
-
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct TemplateDesiredStateRow {
-    pub(super) template: String,
-    pub(super) desired_state: String,
-    pub(super) default_auto_lifecycle_json: Option<Json<AutoLifecyclePolicy>>,
-    pub(super) pool_target: Option<i32>,
-    pub(super) pool_boot_mode: Option<String>,
-    pub(super) pool_vcpu: Option<i32>,
-    pub(super) pool_memory_mib: Option<i32>,
-    /// The node has a reason to hold the template, so it is answered.
-    pub(super) admitted: bool,
-    /// The node's published inventory lists the template.
-    pub(super) held_here: bool,
-}
-
-/// One row per requested id that exists. The desired-state payload
-/// columns are conditionally projected: populated only when the row is
-/// assigned to the querying node, NULL otherwise — rows that exist but
-/// live elsewhere are fetched solely for the exists/deleted partition,
-/// and shipping their jsonb policy fleet-wide would multiply the result
-/// bytes ~30x for data the handler discards.
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct SandboxDesiredStateRow {
-    pub(super) sandbox_id: SandboxId,
-    pub(super) assigned_here: bool,
-    pub(super) snapshots_enabled_desired: Option<bool>,
-    pub(super) auto_lifecycle_json: Option<Json<AutoLifecyclePolicy>>,
-}
-
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct SandboxPortExposureDesiredStateRow {
-    pub(super) sandbox_id: SandboxId,
-    pub(super) protocol: String,
-    pub(super) guest_port: i32,
-    pub(super) desired_state: String,
-}
-
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct PortExposureApplyMissRow {
-    pub(super) sandbox_id: SandboxId,
-    pub(super) protocol: String,
-    pub(super) guest_port: i32,
-}
-
 #[derive(Debug, Clone)]
 pub(super) struct ParsedPortExposureApplyState {
     pub(super) sandbox_id: SandboxId,
@@ -163,9 +104,7 @@ pub(super) struct ParsedPortExposureApplyState {
 /// than rolling the 347-node node-ctl DaemonSet. Fail-safe: unset means
 /// enabled; any set value other than an explicit truthy disables.
 pub(super) fn deleted_partition_enabled() -> bool {
-    pplx_space_common_core::env::env_destructive_gate_var(
-        "SPACE_INTERNAL_API_DELETED_PARTITION_ENABLED",
-    )
+    pplx_space_env_vars::env_destructive_gate_var("SPACE_INTERNAL_API_DELETED_PARTITION_ENABLED")
 }
 
 /// Plausibility ceiling for the desired-state deleted partition.
@@ -211,7 +150,9 @@ pub(super) struct QueuedFacetRefRow {
 /// claim picked the refs: longest queued first, by `requested_at`, then facet
 /// and element. A traceparent shared by several refs takes its first ref's
 /// place.
-pub(super) fn claimed_origin_traceparents(rows: &[ClaimedFacetRefRow]) -> Vec<String> {
+pub(super) fn claimed_origin_traceparents(
+    rows: &[pplx_space_cluster_trigger_queue::ref_claims::ClaimedReconcileRef],
+) -> Vec<String> {
     let mut picked = rows.iter().collect::<Vec<_>>();
     picked.sort_by(|left, right| {
         (left.requested_at, &left.facet, &left.element).cmp(&(
@@ -228,16 +169,6 @@ pub(super) fn claimed_origin_traceparents(rows: &[ClaimedFacetRefRow]) -> Vec<St
         .filter(|traceparent| seen.insert(*traceparent))
         .map(str::to_string)
         .collect()
-}
-
-/// A claimed ref, its saved trace context, and when it was first queued:
-/// the claim's own ordering key.
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct ClaimedFacetRefRow {
-    pub(super) facet: String,
-    pub(super) element: Option<String>,
-    pub(super) traceparent: Option<String>,
-    pub(super) requested_at: time::OffsetDateTime,
 }
 
 pub(super) fn proto_facet(value: ReconcileFacet) -> ProtoReconcileFacet {
@@ -358,7 +289,7 @@ pub(super) fn proto_network_policy_target_to_storage(
 ) -> Result<String, Status> {
     match target.target {
         Some(network_policy_target_ref::Target::Template(template)) => {
-            let template = pplx_space_common_core::types::TemplateName::parse(template)
+            let template = pplx_space_template_model::TemplateName::parse(template)
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
             Ok(NetworkPolicyTarget::template(template).as_element_string())
         }
@@ -379,17 +310,12 @@ pub(super) async fn clear_facet_apply_failed_condition(
     node_id: NodeId,
     reference: &QueuedFacetRefRow,
 ) -> Result<(), Status> {
-    sqlx::query(sql!(
-        "DELETE FROM node_facet_conditions
-         WHERE node_id = $1
-           AND facet = $2
-           AND element = COALESCE($3, '')
-           AND condition_type = 'ApplyFailed'"
-    ))
-    .bind(node_id)
-    .bind(&reference.facet)
-    .bind(reference.element.as_deref())
-    .execute(&mut **tx)
+    pplx_space_sandbox_teardown::conditions::clear_apply_failed(
+        &mut **tx,
+        node_id,
+        &reference.facet,
+        reference.element.as_deref(),
+    )
     .await
     .map_err(|err| Status::internal(format!("clear facet apply condition: {err}")))?;
     Ok(())
@@ -401,46 +327,22 @@ pub(super) async fn record_facet_apply_failed_condition(
     reference: &QueuedFacetRefRow,
     error: &str,
 ) -> Result<(), Status> {
-    sqlx::query(sql!(
-        "INSERT INTO node_facet_observed_status (
-             node_id, facet, element, observed_at, updated_at
-         )
-         VALUES ($1, $2, COALESCE($3, ''), NOW(), NOW())
-         ON CONFLICT (node_id, facet, element) DO UPDATE
-         SET updated_at = NOW()"
-    ))
-    .bind(node_id)
-    .bind(&reference.facet)
-    .bind(reference.element.as_deref())
-    .execute(&mut **tx)
+    pplx_space_sandbox_teardown::observed_status::touch(
+        &mut **tx,
+        node_id,
+        &reference.facet,
+        reference.element.as_deref(),
+    )
     .await
     .map_err(|err| Status::internal(format!("ensure facet status for condition: {err}")))?;
 
-    sqlx::query(
-        sql!("INSERT INTO node_facet_conditions (
-             node_id, facet, element, condition_type, condition_status,
-             reason, message, last_transition_at, updated_at
-         )
-         VALUES (
-             $1, $2, COALESCE($3, ''), 'ApplyFailed', 'True',
-             'ReconcileFailed', $4, NOW(), NOW()
-         )
-         ON CONFLICT (node_id, facet, element, condition_type) DO UPDATE
-         SET condition_status = EXCLUDED.condition_status,
-             reason = EXCLUDED.reason,
-             message = EXCLUDED.message,
-             last_transition_at = CASE
-                 WHEN node_facet_conditions.condition_status IS DISTINCT FROM EXCLUDED.condition_status
-                 THEN NOW()
-                 ELSE node_facet_conditions.last_transition_at
-             END,
-             updated_at = NOW()"),
+    pplx_space_sandbox_teardown::conditions::record_apply_failed(
+        &mut **tx,
+        node_id,
+        &reference.facet,
+        reference.element.as_deref(),
+        error,
     )
-    .bind(node_id)
-    .bind(&reference.facet)
-    .bind(reference.element.as_deref())
-    .bind(error)
-    .execute(&mut **tx)
     .await
     .map_err(|err| Status::internal(format!("record facet apply condition: {err}")))?;
     Ok(())
@@ -455,6 +357,25 @@ pub(super) struct TemplateReleaseRow {
     pub(super) hash: String,
     pub(super) org_id: Option<OrgId>,
     pub(super) created_at: OffsetDateTime,
+    /// `execution_metadata->>'environment'`: the environment the release is
+    /// bound to, `None` when unbound.
+    pub(super) environment: Option<String>,
+}
+
+impl From<pplx_space_template_release_store::registration::RegisteredRelease>
+    for TemplateReleaseRow
+{
+    fn from(release: pplx_space_template_release_store::registration::RegisteredRelease) -> Self {
+        Self {
+            id: release.id,
+            template_name: release.template_name,
+            release_type: release.release_type,
+            hash: release.hash,
+            org_id: release.org_id,
+            created_at: release.created_at,
+            environment: release.environment,
+        }
+    }
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -464,11 +385,25 @@ pub(super) struct TemplateReleaseTagRow {
     pub(super) created_at: OffsetDateTime,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub(super) struct TemplateReleaseStorageLocationRow {
     pub(super) id: Uuid,
     pub(super) storage_connection_string: String,
     pub(super) created_at: OffsetDateTime,
+}
+
+impl From<pplx_space_template_release_store::registration::RegisteredStorageLocation>
+    for TemplateReleaseStorageLocationRow
+{
+    fn from(
+        location: pplx_space_template_release_store::registration::RegisteredStorageLocation,
+    ) -> Self {
+        Self {
+            id: location.id,
+            storage_connection_string: location.storage_connection_string,
+            created_at: location.created_at,
+        }
+    }
 }
 
 /// SQLSTATE `undefined_column`, raised when the control-plane schema has no
@@ -561,9 +496,10 @@ fn visibility_degraded_with(
 /// never by a conversion.
 ///
 /// A free function rather than a `From` impl because it has to be: both types
-/// are foreign to this crate (`CoreTemplateVisibility` from `common-core`, the
-/// proto enum re-exported from `pplx-space-node-api-client` at `lib.rs`'s
-/// `pub use … ::proto`), so an impl here would violate Rust's orphan rule.
+/// are foreign to this crate (`CoreTemplateVisibility` from
+/// `pplx-space-template-model`, the proto enum re-exported from
+/// `pplx-space-node-api-client` at `lib.rs`'s `pub use … ::proto`), so an impl
+/// here would violate Rust's orphan rule.
 const fn proto_visibility(visibility: CoreTemplateVisibility) -> TemplateVisibility {
     match visibility {
         CoreTemplateVisibility::Generic => TemplateVisibility::Generic,
@@ -932,25 +868,12 @@ pub(super) async fn template_visibility(
         visibility_lookup_cache(VisibilityLookupCacheOutcome::Fresh);
         return proto_visibility(visibility);
     }
-    // Shaped as a scalar subselect rather than `SELECT visibility ... WHERE
-    // name = $1` so it returns exactly one row whether or not the template
-    // exists, which is what lets one query carry both the value and the
-    // server-side instant the cache orders writes on. `visibility` is `NOT
-    // NULL`, so a NULL here unambiguously means "no such row" rather than "a row
-    // with no value" — and `templates.name` is the primary key, so the subselect
-    // cannot return more than one row.
-    //
-    // The no-row arm discards the instant: it invalidates, and a removal needs
-    // no ordering. An earlier revision retained a dated marker there and did
-    // need it; that is gone, so only the value/NULL disambiguation still
-    // justifies this shape.
-    let observed: Result<(OffsetDateTime, Option<String>), sqlx::Error> = sqlx::query_as(sql!(
-        "SELECT clock_timestamp() AS observed_at,
-                (SELECT visibility FROM templates WHERE name = $1) AS visibility"
-    ))
-    .bind(template_name)
-    .fetch_one(pool)
-    .await;
+    // One read carries both the value and the server-side instant the cache
+    // orders writes on; see `observed_visibility`. The no-row arm discards the
+    // instant: it invalidates, and a removal needs no ordering.
+    let observed = pplx_space_template_store::templates::observed_visibility(pool, template_name)
+        .await
+        .map(|row| (row.observed_at, row.visibility));
     match observed {
         Ok((observed_at, Some(value))) => match CoreTemplateVisibility::parse(&value) {
             Ok(parsed) => {
@@ -1010,6 +933,7 @@ pub(super) async fn template_visibility(
             visibility_absent()
         }
         Err(error) => {
+            let error = sqlx::Error::from(error);
             let code = error.as_database_error().and_then(|error| error.code());
             let reason = degradation_for_sqlstate(code.as_deref());
             // `reason` below drives only the log line and the `degraded` tag; it
@@ -1054,21 +978,6 @@ pub(super) async fn template_visibility(
             visibility_miss(reason, observations)
         }
     }
-}
-
-/// Flat row from the `find_template_release` LEFT JOIN. Storage fields are
-/// `NULL` when a release exists but has no storage locations yet.
-#[derive(Debug, FromRow)]
-pub(super) struct FindTemplateReleaseRow {
-    pub(super) generic_authorized: bool,
-    pub(super) release_id: Uuid,
-    pub(super) release_template_name: String,
-    pub(super) release_type: String,
-    pub(super) release_hash: String,
-    pub(super) release_created_at: OffsetDateTime,
-    pub(super) storage_id: Option<Uuid>,
-    pub(super) storage_connection_string: Option<String>,
-    pub(super) storage_created_at: Option<OffsetDateTime>,
 }
 
 pub(super) fn trimmed_required(value: &str, field: &str) -> Result<String, Status> {
@@ -1323,6 +1232,20 @@ pub(super) fn common_auto_lifecycle_to_proto(
 /// enough to dominate the LEFT JOIN expansion to storage locations.
 pub(super) const LIST_LATEST_TEMPLATE_RELEASES_MAX_LIMIT: u32 = 50;
 
+/// The execution environment a release lookup selects, parsed from the
+/// request's optional `environment`; `None` selects the original release.
+pub(super) fn environment_selector(
+    value: Option<&str>,
+) -> Result<Option<pplx_space_execution_spec::EnvironmentReference>, Status> {
+    value
+        .map(|value| {
+            value.parse().map_err(|error| {
+                Status::invalid_argument(format!("invalid environment {value:?}: {error}"))
+            })
+        })
+        .transpose()
+}
+
 pub(super) fn validated_list_limit(value: u32) -> Result<u32, Status> {
     if value == 0 {
         return Err(Status::invalid_argument("limit must be >= 1"));
@@ -1360,7 +1283,7 @@ pub(super) fn unsupported_template_runtime(value: &str) -> Status {
 }
 
 /// Parses `hash` into a canonical
-/// [`pplx_space_common_core::types::ContentHash`]
+/// [`pplx_space_content_digest::ContentHash`]
 /// (`<algorithm>:<64 lowercase hex>`), tolerating a bare 64-hex digest by
 /// assuming SHA-256, and returns the canonical algorithm-prefixed string.
 /// Validating at insertion time means every consumer downstream —
@@ -1369,7 +1292,7 @@ pub(super) fn unsupported_template_runtime(value: &str) -> Status {
 /// path lets a digest stored bare round-trip back through prefetch.
 pub(super) fn validated_release_hash(value: &str) -> Result<String, Status> {
     let trimmed = trimmed_required(value, "hash")?;
-    let Ok(content_hash) = trimmed.parse::<pplx_space_common_core::types::ContentHash>() else {
+    let Ok(content_hash) = trimmed.parse::<pplx_space_content_digest::ContentHash>() else {
         return Err(Status::invalid_argument(format!(
             "hash '{trimmed}' must be formatted as 'sha256:<64 lowercase hex chars>' or 'blake3:<64 lowercase hex chars>'"
         )));
@@ -1385,12 +1308,12 @@ pub(super) fn validated_release_hash(value: &str) -> Result<String, Status> {
 pub(super) fn validated_storage_connection_strings(
     values: Vec<String>,
     trusted: &super::trusted_storage::TrustedTemplateStorageBuckets,
-) -> Result<Vec<pplx_space_common_core::types::ExactStorageUri>, Status> {
+) -> Result<Vec<pplx_space_artifact_model::ExactStorageUri>, Status> {
     dedupe_nonempty_strings(values, "storage_connection_string")?
         .into_iter()
         .map(|value| {
             // Connection strings and parser errors can contain endpoint credentials.
-            let uri = pplx_space_common_core::types::ExactStorageUri::parse(&value)
+            let uri = pplx_space_artifact_model::ExactStorageUri::parse(&value)
                 .map_err(|_| Status::invalid_argument("invalid template storage URI"))?;
             trusted
                 .check(uri.parsed())
@@ -1400,174 +1323,26 @@ pub(super) fn validated_storage_connection_strings(
         .collect()
 }
 
-/// Validates and re-serializes the registration's execution metadata into the
-/// JSONB shape stored on `template_releases.execution_metadata` (the same
-/// serialization the node publish path produces, so both writers agree).
-pub(super) fn validated_execution_metadata(
-    execution: Option<&pplx_space_execution_common::proto::ExecutionMetadata>,
-) -> Result<Option<serde_json::Value>, Status> {
-    let Some(execution) = execution else {
-        return Ok(None);
-    };
-    let execution = pplx_space_common_core::types::ExecutionMetadata::try_from(execution)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    serde_json::to_value(&execution)
-        .map(Some)
-        .map_err(|error| Status::internal(format!("serialize execution metadata: {error}")))
-}
-
-pub(super) async fn ensure_template_release(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    template_name: &str,
-    runtime: &str,
-    hash: &str,
-    org_id: Option<OrgId>,
-    execution_metadata: Option<&serde_json::Value>,
-) -> Result<TemplateReleaseRow, Status> {
-    if let Some(existing) = find_template_release_row(tx, template_name, hash).await? {
-        if existing.release_type != runtime {
-            return Err(Status::already_exists(format!(
-                "release '{template_name}@{hash}' already exists with runtime '{}' instead of '{runtime}'",
-                existing.release_type,
-            )));
-        }
-        if existing.org_id != org_id {
-            return Err(Status::permission_denied(
-                "release ownership does not match template ownership",
-            ));
-        }
-        if let Some(metadata) = execution_metadata {
-            check_template_release_execution_metadata(tx, existing.id, metadata).await?;
-        }
-        return Ok(existing);
-    }
-
-    if let Some(inserted) = super::template_releases_store::insert_release(
-        &mut **tx,
-        template_name,
-        runtime,
-        hash,
-        org_id,
-        execution_metadata,
-    )
-    .await
-    .map_err(|error| {
-        crate::template_publication::storage_status("insert template release", &error)
-    })? {
-        return Ok(inserted);
-    }
-
-    let existing = find_template_release_row(tx, template_name, hash)
-        .await?
-        .ok_or_else(|| {
-            Status::internal(format!(
-                "release '{template_name}@{hash}' conflicted on insert but could not be reloaded",
-            ))
-        })?;
-    if existing.release_type != runtime {
-        return Err(Status::already_exists(format!(
-            "release '{template_name}@{hash}' already exists with runtime '{}' instead of '{runtime}'",
-            existing.release_type,
-        )));
-    }
-    if existing.org_id != org_id {
-        return Err(Status::permission_denied(
-            "release ownership does not match template ownership",
-        ));
-    }
-    if let Some(metadata) = execution_metadata {
-        check_template_release_execution_metadata(tx, existing.id, metadata).await?;
-    }
-    Ok(existing)
-}
-
-/// Find the release for `(template_name, hash)` under either spelling of the
-/// hash. `hash` arrives canonical (`sha256:<hex>`); releases registered before
-/// the prefix was required are stored bare, and a republication of one of
-/// those must attach its tags to that row rather than create a second,
-/// artifact-less release beside it.
-///
-/// Where both spellings already exist, the row that owns a recorded storage
-/// location wins regardless of age: tags attached to an artifact-less
-/// duplicate would resolve to a release nothing can pull. Age breaks ties.
-async fn find_template_release_row(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    template_name: &str,
-    hash: &str,
-) -> Result<Option<TemplateReleaseRow>, Status> {
-    let bare_hash = hash.strip_prefix("sha256:").unwrap_or(hash);
-    sqlx::query_as::<_, TemplateReleaseRow>(sql!(
-        "SELECT r.id, r.template_name, r.type, r.hash, r.org_id, r.created_at
-         FROM template_releases r
-         WHERE r.template_name = $1
-           AND r.hash IN ($2, $3)
-         ORDER BY EXISTS (
-                      SELECT 1
-                      FROM template_release_storage_locations l
-                      WHERE l.template_release_id = r.id) DESC,
-                  r.created_at ASC
-         LIMIT 1"
-    ))
-    .bind(template_name)
-    .bind(hash)
-    .bind(bare_hash)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|err| crate::template_publication::storage_status("query template_release", &err))
-}
-
-/// Release identity is immutable. A row without evidence may be filled once;
-/// an identical retry is read-only, and contradictory evidence is never acknowledged.
-async fn check_template_release_execution_metadata(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    release_id: Uuid,
-    execution: &serde_json::Value,
-) -> Result<(), Status> {
-    // Fence the check and backfill against node publication and other writers,
-    // including those that do not take the parent-template publication lock.
-    let existing: Option<serde_json::Value> = sqlx::query_scalar(sql!(
-        "SELECT execution_metadata FROM template_releases WHERE id = $1 FOR UPDATE"
-    ))
-    .bind(release_id)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(|error| {
-        crate::template_publication::storage_status("lock release execution metadata", &error)
-    })?;
-    match existing {
-        Some(existing) if &existing != execution => Err(Status::already_exists(
-            "template release already has different execution metadata",
-        )),
-        Some(_) => Ok(()),
-        None => super::template_releases_store::fill_execution_metadata(
-            &mut **tx, release_id, execution,
-        )
-        .await
-        .map_err(|error| {
-            crate::template_publication::storage_status("fill release execution metadata", &error)
-        }),
-    }
-}
-
 pub(super) async fn ensure_template_release_tag(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     release: &TemplateReleaseRow,
     tag: &str,
 ) -> Result<TemplateReleaseTagRow, Status> {
-    sqlx::query_as::<_, TemplateReleaseTagRow>(sql!(
-        "INSERT INTO template_release_tags (template_release_id, template_name, tag)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (template_name, tag) DO UPDATE
-             SET template_release_id = EXCLUDED.template_release_id,
-                 modified_at = NOW()
-         RETURNING id, tag, created_at"
-    ))
-    .bind(release.id)
-    .bind(&release.template_name)
-    .bind(tag)
-    .fetch_one(&mut **tx)
+    pplx_space_template_store::release_tags::upsert(
+        &mut **tx,
+        release.id,
+        &release.template_name,
+        tag,
+    )
     .await
-    .map_err(|err| crate::template_publication::storage_status("insert tag", &err))
+    .map(|row| TemplateReleaseTagRow {
+        id: row.id,
+        tag: row.tag,
+        created_at: row.created_at,
+    })
+    .map_err(|err| {
+        crate::template_publication::storage_status("insert tag", &sqlx::Error::from(err))
+    })
 }
 
 pub(super) async fn ensure_template_release_storage_location(
@@ -1607,16 +1382,14 @@ async fn find_template_release_storage_location_row(
     release_id: Uuid,
     connection_string: &str,
 ) -> Result<Option<TemplateReleaseStorageLocationRow>, Status> {
-    sqlx::query_as::<_, TemplateReleaseStorageLocationRow>(sql!(
-        "SELECT id, storage_connection_string, created_at
-         FROM template_release_storage_locations
-         WHERE template_release_id = $1
-           AND storage_connection_string = $2"
-    ))
-    .bind(release_id)
-    .bind(connection_string)
-    .fetch_optional(&mut **tx)
+    pplx_space_template_release_store::registration::storage_location(
+        &mut **tx,
+        release_id,
+        connection_string,
+    )
     .await
+    .map(|location| location.map(TemplateReleaseStorageLocationRow::from))
+    .map_err(sqlx::Error::from)
     .map_err(|err| {
         crate::template_publication::storage_status("query storage_connection_string", &err)
     })
@@ -1628,24 +1401,15 @@ async fn insert_template_release_storage_location_row(
     org_id: Option<OrgId>,
     connection_string: &str,
 ) -> Result<Option<TemplateReleaseStorageLocationRow>, Status> {
-    sqlx::query_as::<_, TemplateReleaseStorageLocationRow>(sql!(
-        "INSERT INTO template_release_storage_locations
-             (template_release_id, storage_connection_string, org_id)
-         SELECT $1, $3, COALESCE($2, org_id)
-         FROM template_releases
-         WHERE id = $1
-         ON CONFLICT (template_release_id, storage_connection_string) DO UPDATE
-             SET org_id = COALESCE(
-                 template_release_storage_locations.org_id,
-                 EXCLUDED.org_id
-             )
-         RETURNING id, storage_connection_string, created_at"
-    ))
-    .bind(release_id)
-    .bind(org_id)
-    .bind(connection_string)
-    .fetch_optional(&mut **tx)
+    pplx_space_template_release_store::registration::insert_storage_location(
+        &mut **tx,
+        release_id,
+        org_id,
+        connection_string,
+    )
     .await
+    .map(|location| location.map(TemplateReleaseStorageLocationRow::from))
+    .map_err(sqlx::Error::from)
     .map_err(|err| {
         crate::template_publication::storage_status("insert storage_connection_string", &err)
     })
@@ -1655,17 +1419,12 @@ async fn adopt_template_release_storage_location_org_id(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     location_id: Uuid,
 ) -> Result<(), Status> {
-    sqlx::query(sql!(
-        "UPDATE template_release_storage_locations location
-         SET org_id = release.org_id
-         FROM template_releases release
-         WHERE location.id = $1
-           AND release.id = location.template_release_id
-           AND location.org_id IS NULL"
-    ))
-    .bind(location_id)
-    .execute(&mut **tx)
+    pplx_space_template_release_store::registration::adopt_storage_location_owner(
+        &mut **tx,
+        location_id,
+    )
     .await
+    .map_err(sqlx::Error::from)
     .map_err(|err| {
         crate::template_publication::storage_status(
             "adopt template_release_storage_location org_id",
@@ -1692,6 +1451,7 @@ pub(super) fn template_release_proto(row: TemplateReleaseRow) -> TemplateRelease
         runtime: row.release_type,
         hash: row.hash,
         created_at: format_time(row.created_at),
+        environment: row.environment,
     }
 }
 

@@ -43,10 +43,10 @@ impl SandboxManagerService {
         });
     }
 
-    async fn observe_guest_configuration(
+    pub(super) async fn observe_guest_configuration(
         &self,
         id: &str,
-        execution: pplx_space_common_core::types::SandboxActivationAttemptId,
+        execution: pplx_space_sandbox_model::SandboxActivationAttemptId,
     ) {
         let mut delay = Duration::from_millis(100);
         loop {
@@ -57,8 +57,26 @@ impl SandboxManagerService {
             if !row.state.is_unowned(SandboxState::Started) {
                 return;
             }
+            let client = match self.connect_spaced_host(&row).await {
+                Err(error) if error.code() == tonic::Code::PermissionDenied => {
+                    // Every PermissionDenied from connect_spaced_host (node-manager's
+                    // refusal, a stored-proof, UDS-peer or socket-owner mismatch) is
+                    // bound to this spaced-host launch, so it stands until a relaunch
+                    // records a new pid.
+                    tracing::info!(sandbox_id = id, %error, "guest configuration observation awaits a spaced-host relaunch");
+                    if !self
+                        .await_spaced_host_relaunch(id, execution, row.spaced_host_pid)
+                        .await
+                    {
+                        return;
+                    }
+                    delay = Duration::from_millis(100);
+                    continue;
+                }
+                client => client,
+            };
             let result = async {
-                let mut client = self.connect_spaced_host(&row).await?.guest_update();
+                let mut client = client?.guest_update();
                 let subscription = tokio::time::timeout(RPC_BUDGET, client.subscribe(wire::StatusRequest {})).await
                     .map_err(|_| Status::deadline_exceeded("metadata subscription connect deadline"))?;
                 let mut stream = match subscription {
@@ -96,7 +114,7 @@ impl SandboxManagerService {
                     if crate::db::read::active_guest_update(&*self.db_conn()?, id).map_err(internal)?.is_some() { continue; }
                     // Stable identity across manager restarts lets the next
                     // observer recover an acknowledgement interrupted by one.
-                    let owner = pplx_space_spaced_common::update::HoldOwner::configuration(uuid(&execution.to_string())?);
+                    let owner = pplx_space_spaced_guest_protocol::update::HoldOwner::configuration(uuid(&execution.to_string())?);
                     client.hold(request(owner.clone())).await?;
                     client.configure(request(wire::ConfigureRequest { attempt: None, owner: Some(owner.clone()),
                         environment: current.process_env.into_iter().collect(), forward_ports: seen.forward_ports,
@@ -123,4 +141,33 @@ impl SandboxManagerService {
             delay = (delay * 2).min(Duration::from_secs(1));
         }
     }
+
+    /// Whether the execution is still resident and running once its
+    /// spaced-host pid differs from `refused`.
+    async fn await_spaced_host_relaunch(
+        &self,
+        id: &str,
+        execution: pplx_space_sandbox_model::SandboxActivationAttemptId,
+        refused: Option<u32>,
+    ) -> bool {
+        loop {
+            tokio::select! {
+                _ = self.shutdown_token.cancelled() => return false,
+                _ = tokio::time::sleep(SPACED_HOST_RELAUNCH_POLL) => {}
+            }
+            match self.lookup_sandbox(id) {
+                Ok(row)
+                    if row.node_execution_id == Some(execution)
+                        && row.state.is_unowned(SandboxState::Started) =>
+                {
+                    if row.spaced_host_pid != refused {
+                        return true;
+                    }
+                }
+                _ => return false,
+            }
+        }
+    }
 }
+
+pub(super) const SPACED_HOST_RELAUNCH_POLL: Duration = Duration::from_secs(5);

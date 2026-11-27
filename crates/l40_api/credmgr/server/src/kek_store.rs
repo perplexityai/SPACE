@@ -7,8 +7,8 @@
 //! cryptographic context binding. The Postgres connection uses the dedicated
 //! read-only `space_credmgr` role.
 
-use pplx_space_common_core::{types::KekProvider, types::MasterKeyIdentifier, types::OrgId};
-use pplx_space_sql_locator::sql;
+use pplx_space_accounts::OrgId;
+use pplx_space_byok_model::{KekProvider, MasterKeyIdentifier};
 use uuid::Uuid;
 
 /// A resolved `org_master_keys` row, narrowed to what the key wrapper needs.
@@ -32,6 +32,12 @@ pub enum KekStoreError {
     InvalidKeyIdentifier { cmk_id: Uuid, message: String },
     #[error("KEK lookup query failed: {0}")]
     Query(#[from] sqlx::Error),
+}
+
+impl From<pplx_space_postgres_pool::DbError> for KekStoreError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
 }
 
 /// Lookup of a KEK row scoped to an organization. A trait so the service
@@ -68,17 +74,10 @@ impl PgKekStore {
 #[tonic::async_trait]
 impl KekStore for PgKekStore {
     async fn active_kek_for_org(&self, org: OrgId) -> Result<Option<KekRecord>, KekStoreError> {
-        let row: Option<(Uuid, String, String)> = sqlx::query_as(sql!(
-            "SELECT id, provider, key_identifier \
-             FROM org_master_keys WHERE org_id = $1 AND retired_at IS NULL"
-        ))
-        .bind(org.as_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some((cmk_id, provider, key_identifier)) = row else {
+        let Some(key) = pplx_space_byok_store::active_master_key(&self.pool, org).await? else {
             return Ok(None);
         };
-        parse_record(cmk_id, provider, key_identifier, false).map(Some)
+        parse_record(key.id, key.provider, key.key_identifier, false).map(Some)
     }
 
     async fn kek_for_org(
@@ -86,19 +85,11 @@ impl KekStore for PgKekStore {
         cmk_id: Uuid,
         org: OrgId,
     ) -> Result<Option<KekRecord>, KekStoreError> {
-        let row: Option<(String, String, bool)> = sqlx::query_as(sql!(
-            "SELECT provider, key_identifier, retired_at IS NOT NULL \
-             FROM org_master_keys WHERE id = $1 AND org_id = $2"
-        ))
-        .bind(cmk_id)
-        .bind(org.as_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
-
-        let Some((provider, key_identifier, retired)) = row else {
+        let Some(key) = pplx_space_byok_store::org_master_key(&self.pool, cmk_id, org).await?
+        else {
             return Ok(None);
         };
-        parse_record(cmk_id, provider, key_identifier, retired).map(Some)
+        parse_record(cmk_id, key.provider, key.key_identifier, key.retired).map(Some)
     }
 }
 

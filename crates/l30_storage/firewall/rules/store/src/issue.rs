@@ -1,0 +1,293 @@
+//! Issuing a leased target's first assignment: the node's assignment, its
+//! wakeup and the item's issuance stamp commit together or not at all. Only
+//! the database changes; the node learns of it when its wakeup is drained,
+//! and a delivered wakeup proves nothing about what it enforces.
+//!
+//! Locks, in order: the rollout row, the lease handoff lock (shared, as a
+//! renewal takes it), the item row, the node's `nodes` row (key share), the
+//! node's assignment row, and the wakeup's rows. The first three are
+//! [`lease_targets`](crate::lease_targets)' order, taken as a round's opening
+//! takes them; nothing in the lease verbs takes the rest. The control row
+//! isn't locked. A release in [`issue_canary_and_release`] writes the item
+//! row it already holds.
+
+use std::time::Duration;
+
+use jiff::Timestamp;
+use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
+use pplx_space_sql_locator::sql;
+use sqlx::{Connection, PgConnection};
+use time::OffsetDateTime;
+
+use crate::lease::item_timestamp;
+use crate::leased_item::{HeaderLock, lock_leased_item};
+use crate::{LeasedTarget, Requeue, Scope, Work, requeue, roll_back};
+
+/// The wakeup issuance or a round's opening queues for its node, on its
+/// transaction.
+pub trait Wakeup {
+    /// Queue `node`'s wakeup on `tx`, the verb's open transaction, returning
+    /// how many nodes it queued.
+    fn wake<C>(
+        &mut self,
+        tx: &mut C,
+        node: NodeId,
+    ) -> impl Future<Output = Result<u64, DbError>> + Send
+    where
+        for<'a> &'a mut C: Executor<'a>;
+}
+
+/// Queue `node`'s wakeup through `wakeup` on `tx`; queuing any other number
+/// of nodes than that one is an error.
+pub(crate) async fn wake_one(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    wakeup: &mut impl Wakeup,
+    node: NodeId,
+) -> Result<(), sqlx::Error> {
+    let queued = wakeup.wake(&mut **tx, node).await?;
+    if queued != 1 {
+        return Err(sqlx::Error::Protocol(format!(
+            "firewall rules wakeup for node {node} queued {queued} nodes, not 1"
+        )));
+    }
+    Ok(())
+}
+
+/// What an item's issuance stamp records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Stamp {
+    pub assignment_generation: u64,
+    pub issued_at: Timestamp,
+    /// `None` only if a later writer unscheduled it.
+    pub next_check_at: Option<Timestamp>,
+}
+
+/// What [`issue_first_assignment`] or [`issue_canary_and_release`] did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Issuance {
+    /// This call issued, and committed.
+    Issued(Stamp),
+    /// The item was already issued; nothing changed.
+    AlreadyIssued(Stamp),
+    /// Nothing changed.
+    Refused(Refusal),
+}
+
+/// Why nothing was issued.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Refusal {
+    /// The lease is for a check; the item was issued when it was leased.
+    CheckLease,
+    /// The rollout has no such saved target.
+    NotATarget,
+    /// The rollout isn't in canary or rolling, or for
+    /// [`issue_canary_and_release`] isn't in canary.
+    NotIssuing,
+    /// The item isn't in flight under this token, or its lease lapsed.
+    LeaseLost,
+    /// In canary, another target was issued first.
+    CanaryChosen,
+    /// The node is deregistered, unreachable or stale.
+    NodeUnavailable,
+    /// The lease lapsed or the node went offline while issuance waited.
+    Lapsed,
+}
+
+/// Issue `target`'s first assignment: advance its node's assignment to the
+/// rollout's revision, queue the node's wakeup through `wakeup`, and stamp the
+/// item with the generation, the database time and a first check
+/// `first_check_in` after it. Commits only when it returns
+/// [`Issuance::Issued`]; the lease stays in flight for the caller to end.
+///
+/// Authorized under the locks, on the database clock: the rollout in canary
+/// or rolling, the item in flight under `target`'s live token and not issued,
+/// in canary no other item issued, and the node registered and online. The
+/// stamp rechecks the lease and the node after the assignment and wakeup,
+/// either of which can wait on a lock.
+pub async fn issue_first_assignment(
+    conn: &mut PgConnection,
+    target: &LeasedTarget,
+    first_check_in: Duration,
+    wakeup: &mut impl Wakeup,
+) -> Result<Issuance, DbError> {
+    Ok(issue_and_commit(conn, target, first_check_in, Scope::Any, wakeup).await?)
+}
+
+/// [`issue_first_assignment`], only while the rollout is in canary, ending
+/// the lease with [`Requeue::Release`] before the same commit: the item is
+/// left pending and stamped, its attempt given back. A release that matches
+/// nothing is an error, and nothing commits. [`Issuance::AlreadyIssued`]
+/// releases nothing: the lease may now be a check's.
+pub async fn issue_canary_and_release(
+    conn: &mut PgConnection,
+    target: &LeasedTarget,
+    first_check_in: Duration,
+    wakeup: &mut impl Wakeup,
+) -> Result<Issuance, DbError> {
+    Ok(issue_and_commit(conn, target, first_check_in, Scope::FirstCanary, wakeup).await?)
+}
+
+async fn issue_and_commit(
+    conn: &mut PgConnection,
+    target: &LeasedTarget,
+    first_check_in: Duration,
+    scope: Scope,
+    wakeup: &mut impl Wakeup,
+) -> Result<Issuance, sqlx::Error> {
+    // A hint only: a first assignment is rechecked below, a check never issues.
+    if target.work != Work::FirstAssignment {
+        return Ok(Issuance::Refused(Refusal::CheckLease));
+    }
+    // Its own transaction, as the lease verbs': a caller's locks would break
+    // the lock order.
+    let mut tx = conn
+        .begin_with(sql!("BEGIN ISOLATION LEVEL READ COMMITTED"))
+        .await?;
+    match issue(&mut tx, target, first_check_in, scope, wakeup).await {
+        Ok(Issuance::Issued(stamp)) => {
+            tx.commit().await?;
+            Ok(Issuance::Issued(stamp))
+        }
+        other => {
+            roll_back(tx).await;
+            other
+        }
+    }
+}
+
+async fn issue(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    target: &LeasedTarget,
+    first_check_in: Duration,
+    scope: Scope,
+    wakeup: &mut impl Wakeup,
+) -> Result<Issuance, sqlx::Error> {
+    // The header for update, so canary issuances serialize on it.
+    let Some(item) = lock_leased_item(tx, target, HeaderLock::Update).await? else {
+        return Ok(Issuance::Refused(Refusal::NotATarget));
+    };
+    let issuing = item.working && (item.canary || scope == Scope::Any);
+    let timestamp = |what, at| item_timestamp(target.rollout_id, target.node_id, what, at);
+    // A replay, or a commit whose response was lost: the stamp says what was
+    // issued, whoever holds the lease now.
+    if let Work::Check {
+        assignment_generation,
+        issued_at,
+    } = item.work(target)?
+    {
+        return Ok(Issuance::AlreadyIssued(Stamp {
+            assignment_generation,
+            issued_at,
+            next_check_at: item
+                .next_check_at
+                .map(|at| timestamp("an out-of-range check time", at))
+                .transpose()?,
+        }));
+    }
+    if !issuing {
+        return Ok(Issuance::Refused(Refusal::NotIssuing));
+    }
+    if !item.leased {
+        return Ok(Issuance::Refused(Refusal::LeaseLost));
+    }
+    // Every item, online or not, due or not: an offline canary still holds
+    // the rollout.
+    if item.canary
+        && sqlx::query_scalar::<_, bool>(sql!(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM firewall_rules_rollout_items
+                 WHERE rollout_id = $1
+                   AND issued_at IS NOT NULL)"
+        ))
+        .bind(target.rollout_id)
+        .fetch_one(&mut **tx)
+        .await?
+    {
+        return Ok(Issuance::Refused(Refusal::CanaryChosen));
+    }
+    // Key share: the node can't be deleted before this commits, and other
+    // writers of the row don't wait. Online as the lease verbs judge it.
+    // A node deleted later orphans its assignment and other firewall state.
+    let online = sqlx::query_scalar::<_, Option<bool>>(sql!(
+        "SELECT nss.reachable AND nss.stale_after > clock_timestamp()
+         FROM nodes n
+         LEFT JOIN node_status_snapshots nss ON nss.node_id = n.id
+         WHERE n.id = $1
+         FOR KEY SHARE OF n"
+    ))
+    .bind(target.node_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if online.flatten() != Some(true) {
+        return Ok(Issuance::Refused(Refusal::NodeUnavailable));
+    }
+    // The node's own sequence: overflow is an error, not a wrap.
+    let generation = sqlx::query_scalar::<_, i64>(sql!(
+        "INSERT INTO firewall_rules_node_assignments (node_id, assignment_generation, revision_id)
+         VALUES ($1, 1, $2)
+         ON CONFLICT (node_id) DO UPDATE
+         SET assignment_generation = firewall_rules_node_assignments.assignment_generation + 1,
+             revision_id = EXCLUDED.revision_id
+         RETURNING assignment_generation"
+    ))
+    .bind(target.node_id)
+    .bind(item.revision)
+    .fetch_one(&mut **tx)
+    .await?;
+    wake_one(tx, wakeup, target.node_id).await?;
+    // After the waits above, on one clock reading: the lease may have lapsed
+    // or the node gone offline while they waited. The item lock, held since
+    // the item was read, keeps its phase, token and stamp as checked.
+    let stamped = sqlx::query_as::<_, (OffsetDateTime, OffsetDateTime)>(sql!(
+        "WITH clock AS (SELECT clock_timestamp() AS reading)
+         UPDATE firewall_rules_rollout_items i
+         SET issued_assignment_generation = $3,
+             issued_at = clock.reading,
+             next_check_at = clock.reading + make_interval(secs => $4)
+         FROM clock
+         WHERE i.rollout_id = $1
+           AND i.node_id = $2
+           AND i.lease_expires_at > clock.reading
+           AND EXISTS (
+               SELECT 1
+               FROM node_status_snapshots nss
+               WHERE nss.node_id = $2
+                 AND nss.reachable
+                 AND nss.stale_after > clock.reading)
+         RETURNING i.issued_at, i.next_check_at"
+    ))
+    .bind(target.rollout_id)
+    .bind(target.node_id)
+    .bind(generation)
+    .bind(first_check_in.as_secs_f64())
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((issued_at, next_check_at)) = stamped else {
+        return Ok(Issuance::Refused(Refusal::Lapsed));
+    };
+    let stamp = Stamp {
+        assignment_generation: u64::try_from(generation).map_err(|_| {
+            sqlx::Error::Decode(
+                format!(
+                    "node {} has a negative assignment generation",
+                    target.node_id
+                )
+                .into(),
+            )
+        })?,
+        issued_at: timestamp("an out-of-range issuance time", issued_at)?,
+        next_check_at: Some(timestamp("an out-of-range check time", next_check_at)?),
+    };
+    // Under the item lock held since the read; the caller rolls back on error.
+    if scope == Scope::FirstCanary
+        && !requeue(&mut **tx, target, &Requeue::Release { error: None }).await?
+    {
+        return Err(sqlx::Error::Protocol(format!(
+            "firewall rules item {}/{} issued but didn't release",
+            target.rollout_id, target.node_id
+        )));
+    }
+    Ok(Issuance::Issued(stamp))
+}

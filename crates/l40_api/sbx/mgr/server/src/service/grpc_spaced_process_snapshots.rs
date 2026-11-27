@@ -11,14 +11,16 @@ use super::cleanup_support::{
 use super::create::StartFromCheckpointLaunch;
 use super::create_support::*;
 use super::spaced_bridge::*;
+use super::start_support::ActivationAdmissionKind;
 use super::tail_support::*;
 use super::*;
 use futures_util::StreamExt;
-use pplx_space_common_core::types::{GuestPort, SandboxId};
 use pplx_space_events::{
     SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventType,
     emit_sandbox_event,
 };
+use pplx_space_network_roles::GuestPort;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::operations as spaced_ops;
 use rollback_state::restage_rolled_back_full_snapshot;
 use std::str::FromStr;
@@ -29,7 +31,7 @@ const LOG_TARGET: &str = module_path!();
 
 const CURRENT_INSTANCE_DISK_ARTIFACT_PREFIX: &str = "d-stop-";
 const OPERATION_DISK_ARTIFACT_PREFIX: &str =
-    pplx_space_common_core::host::linux::paths::INTERNAL_OPERATION_SNAPSHOT_PREFIX;
+    pplx_space_host_layout::paths::INTERNAL_OPERATION_SNAPSHOT_PREFIX;
 
 /// The VM state files a full snapshot can't restore without.
 const FULL_SNAPSHOT_REQUIRED_FILES: &[&str] = &["vmstate", "memory"];
@@ -909,7 +911,7 @@ impl SandboxManagerService {
     ) -> Result<Response<ListSnapshotsResponse>, Status> {
         self.authorize_peer(&request, "ListSnapshots", ALLOW_SANDBOX_OBSERVER)?;
         let req = request.get_ref();
-        use pplx_space_common_core::inventory::{InventoryBudget, MAX_ENCODED_BYTES, MAX_ITEMS};
+        use pplx_space_rpc_contracts::inventory::{InventoryBudget, MAX_ENCODED_BYTES, MAX_ITEMS};
         use prost::Message as _;
         let mut request_budget = InventoryBudget::new(MAX_ITEMS, MAX_ENCODED_BYTES);
         for id in &req.sandbox_ids {
@@ -1013,8 +1015,7 @@ async fn list_snapshots_for_sandbox(
         let publications = artifacts
             .list_named_publications(&sandbox_id)
             .map_err(|error| error.into_status())?;
-        let snapshots_dir =
-            pplx_space_common_core::host::linux::paths::sandbox_snapshots_dir(&sandbox_id);
+        let snapshots_dir = pplx_space_host_layout::paths::sandbox_snapshots_dir(&sandbox_id);
         project_snapshot_inventory(
             &sandbox_id,
             &template,
@@ -1036,7 +1037,7 @@ fn project_snapshot_inventory(
     btrfs: Vec<pplx_space_node_mgr_client::proto::BtrfsSnapshotInfo>,
     publications: Vec<crate::local_artifacts::NamedArtifactPublication>,
 ) -> Result<Vec<SnapshotDetail>, Status> {
-    use pplx_space_common_core::inventory::{
+    use pplx_space_rpc_contracts::inventory::{
         InventoryBudget, InventoryLimitExceeded, MAX_ENCODED_BYTES, MAX_ITEMS, MAX_RAW_BYTES,
     };
     use prost::Message as _;
@@ -1055,7 +1056,7 @@ fn project_snapshot_inventory(
         if is_internal_snapshot_name(&snapshot.name) {
             continue;
         }
-        pplx_space_common_core::types::SnapshotName::parse(&snapshot.name).map_err(|error| {
+        pplx_space_snapshot_model::SnapshotName::parse(&snapshot.name).map_err(|error| {
             Status::data_loss(format!("invalid snapshot inventory name: {error}"))
         })?;
         snapshots.insert(
@@ -1150,9 +1151,9 @@ fn project_snapshot_inventory(
             snapshot.state = "incomplete".into();
         } else if full || transfer_binding.is_some() {
             let kind = if full {
-                pplx_space_common_core::types::ArtifactKind::Full
+                pplx_space_snapshot_model::ArtifactKind::Full
             } else {
-                pplx_space_common_core::types::ArtifactKind::Disk
+                pplx_space_snapshot_model::ArtifactKind::Disk
             };
             let publication = publications.get(&snapshot.id).filter(|publication| {
                 publication.artifact_kind == kind
@@ -1240,7 +1241,7 @@ impl SandboxManagerService {
         snapshot_name: &str,
     ) -> Result<Option<crate::local_artifacts::RestoreLease>, Status> {
         let name = snapshot_name
-            .parse::<pplx_space_common_core::types::SnapshotName>()
+            .parse::<pplx_space_snapshot_model::SnapshotName>()
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let Some(publication) = self
             .local_artifacts
@@ -1250,10 +1251,8 @@ impl SandboxManagerService {
             // Older locally created snapshots may predate the artifact catalog.
             return Ok(None);
         };
-        let expected_path = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
-            sandbox_id,
-            snapshot_name,
-        );
+        let expected_path =
+            pplx_space_host_layout::paths::sandbox_snapshot_dir(sandbox_id, snapshot_name);
         if publication.local_path != expected_path {
             return Err(Status::failed_precondition(
                 "rollback publication path differs",
@@ -1307,6 +1306,32 @@ impl SandboxManagerService {
         let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
         let artifact_guard = artifact_lock.lock().await;
         let sandbox = self.lookup_sandbox(&sandbox.id)?;
+        // A rollback that doesn't restart rewrites the sandbox's disk, which a
+        // drain may already have reported durable, and leaves it stopped. It
+        // is a producer like any other: a node known sealed refuses it for a
+        // sandbox without a VM before it stops or rewrites anything, and it
+        // holds its token until it returns, so a drain that seals the node
+        // meanwhile reports the sandbox pending until it ends. A running or
+        // paused sandbox's rollback is admitted; the stopped sandbox it leaves
+        // keeps a v2 drain pending, since the drain doesn't move one. A
+        // restarting rollback is refused below by the seal's check of its
+        // restart.
+        let _producer = if auto_restart {
+            None
+        } else {
+            Some(self.activation_seal.admit_producer(
+                "rollback",
+                &sandbox.id,
+                crate::activation_seal::has_vm(sandbox.state),
+            )?)
+        };
+        #[cfg(test)]
+        if !auto_restart {
+            crate::auto_lifecycle::AutoLifecycleCoordinator::rendezvous(
+                &self.auto_lifecycle.rollback_admission_barrier,
+            )
+            .await;
+        }
         self.require_snapshot_mutation_ownership(&sandbox.id)?;
         // A full rollback restages the canonical checkpoint, which a verified
         // upgrade still owes the retirement of the old runtime's checkpoint at.
@@ -1329,7 +1354,7 @@ impl SandboxManagerService {
         // don't restore from it: a running sandbox is stopped first, and a
         // stopped row's pin is dropped before the disk is rewritten.
         let pins_suspend_artifact = sandbox.current_local_artifact_origin
-            == Some(pplx_space_common_core::types::ArtifactOrigin::Suspend);
+            == Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend);
         if sandbox.state.is_unowned(SandboxState::Suspended)
             || sandbox.cleanup_completion == Some(CleanupCompletion::MarkSuspended)
             || (pins_suspend_artifact
@@ -1344,10 +1369,8 @@ impl SandboxManagerService {
                  been restored",
             ));
         }
-        let transferred_path = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
-            &sandbox.id,
-            snapshot_name,
-        );
+        let transferred_path =
+            pplx_space_host_layout::paths::sandbox_snapshot_dir(&sandbox.id, snapshot_name);
         // GC owns a catalog lease, not the per-sandbox artifact lock. Checkout
         // before any destructive RPC, and retain it through the last file read.
         let snapshot_lease = self.checkout_rollback_snapshot(&sandbox.id, snapshot_name)?;
@@ -1366,7 +1389,7 @@ impl SandboxManagerService {
         let published_route_identity = sandbox.space_api_route_identity.clone();
         let preserves_kubernetes_identity = req.route_identity.is_none()
             && published_route_identity.effective_substrate_kind()
-                == Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes);
+                == Some(pplx_space_node_model::NodeManagedBy::Kubernetes);
         let requested_route_identity = if preserves_kubernetes_identity {
             published_route_identity
         } else {
@@ -1387,9 +1410,25 @@ impl SandboxManagerService {
             ));
         }
 
+        // A full snapshot restarts by restoring it, a disk snapshot by a cold
+        // boot.
+        let is_full = snapshot_name.starts_with("f-");
+        let restart_activation = if is_full {
+            ActivationAdmissionKind::Restore
+        } else {
+            ActivationAdmissionKind::Cold
+        };
+        // A sealed node refuses the restart's activation: refuse the rollback
+        // before it stops or rewrites anything, rather than leave a
+        // rolled-back sandbox stopped. A seal that lands after this check
+        // still refuses the restart ([`Self::rollback_restart_failure`]).
+        if auto_restart {
+            self.activation_seal
+                .check(restart_activation.as_str(), &sandbox.id)?;
+        }
+
         // Check every required input before stopping the VM. A published full
         // transfer may intentionally omit rootfs and is not disk-rollbackable.
-        let is_full = snapshot_name.starts_with("f-");
         if is_full {
             self.ensure_snapshot_restore_supported("rollback_full_snapshot")?;
         }
@@ -1649,13 +1688,24 @@ impl SandboxManagerService {
                     restored_snapshot: RestoredSnapshotProvenance::default(),
                     expected_node_execution: None,
                 })
-                .await?;
+                .await
+                .map_err(|status| {
+                    self.rollback_restart_failure(&id, snapshot_name, restart_activation, status)
+                })?;
             } else {
                 // Disk-only snapshot: fresh boot
                 let mut start = disk_snapshot_rollback_start_request(id.clone(), netns_path);
                 start.route_identity = space_api_route_identity_to_wire(&route_identity);
                 self.start_sandbox_with_authority(start, false, restart_authority)
-                    .await?;
+                    .await
+                    .map_err(|status| {
+                        self.rollback_restart_failure(
+                            &id,
+                            snapshot_name,
+                            restart_activation,
+                            status,
+                        )
+                    })?;
             }
         }
 
@@ -1664,6 +1714,38 @@ impl SandboxManagerService {
             rolled_back_to: snapshot_name.clone(),
             route_identity: applied_route_identity,
         }))
+    }
+
+    /// The error of a rollback whose restart failed after the disk was
+    /// rewritten. When the seal refuses the restart's `activation` (a seal
+    /// that landed after [`Self::rollback`] checked it) and the row is
+    /// stopped, the error says the rollback was applied and the sandbox is
+    /// stopped, so the caller starts it rather than rolling back again. It
+    /// carries neither the seal's refusal nor its marker, which callers retry
+    /// on: a retry would roll back again. Any other failure is the restart's
+    /// own.
+    pub(super) fn rollback_restart_failure(
+        &self,
+        sandbox_id: &str,
+        snapshot_name: &str,
+        activation: ActivationAdmissionKind,
+        status: Status,
+    ) -> Status {
+        let sealed = status.code() == tonic::Code::FailedPrecondition
+            && self
+                .activation_seal
+                .check(activation.as_str(), sandbox_id)
+                .is_err();
+        let stopped = self
+            .lookup_sandbox(sandbox_id)
+            .is_ok_and(|row| row.state.is_unowned(SandboxState::Stopped));
+        if !(sealed && stopped) {
+            return status;
+        }
+        Status::failed_precondition(format!(
+            "the rollback of sandbox {sandbox_id} to {snapshot_name} was applied; the sandbox is \
+             stopped because the node was sealed during the rollback: start it"
+        ))
     }
 }
 
@@ -1678,15 +1760,15 @@ fn start_process_options(
 ) -> Result<pplx_space_spaced_host_client::StartProcessOptions, Status> {
     let invalid = |error: std::fmt::Arguments<'_>| Status::invalid_argument(error.to_string());
     Ok(pplx_space_spaced_host_client::StartProcessOptions {
-        command: pplx_space_common_core::types::ProcessCommand::new(operation.command.clone())
+        command: pplx_space_guest_process::ProcessCommand::new(operation.command.clone())
             .map_err(|error| invalid(format_args!("{error}")))?,
         cwd: operation
             .cwd
             .clone()
-            .map(pplx_space_common_core::types::GuestPath::parse)
+            .map(pplx_space_guest_process::GuestPath::parse)
             .transpose()
             .map_err(|error| invalid(format_args!("{error}")))?,
-        env: pplx_space_spaced_common::parse_env(operation.env.clone()),
+        env: pplx_space_spaced_guest_protocol::parse_env(operation.env.clone()),
         user: operation
             .user
             .clone()
@@ -1698,7 +1780,7 @@ fn start_process_options(
         idempotency_key: operation
             .idempotency_key
             .clone()
-            .map(pplx_space_common_core::types::IdempotencyKey::parse)
+            .map(pplx_space_guest_process::IdempotencyKey::parse)
             .transpose()
             .map_err(|error| invalid(format_args!("{error}")))?,
         tag: operation.tag.clone(),
@@ -1708,7 +1790,7 @@ fn start_process_options(
         process_id: operation
             .process_id
             .clone()
-            .map(pplx_space_common_core::types::ProcessId::parse)
+            .map(pplx_space_guest_process::ProcessId::parse)
             .transpose()
             .map_err(|error| invalid(format_args!("{error}")))?,
     })

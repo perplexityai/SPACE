@@ -5,12 +5,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
-use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_core::{
-    host::linux::identities::gids, host::linux::identities::group_names,
-    host::linux::identities::user_names,
-};
+use pplx_space_host_layout::{identities::gids, identities::group_names, identities::user_names};
 use pplx_space_node_runtime_core::runtime_inventory::{RuntimeInventory, RuntimeInventoryError};
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_uds_peer_auth::{LocalRole, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
 use tonic::{Request, Response, Status};
 
@@ -74,10 +71,10 @@ const FIRECRACKER_API_SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRECRACKER_VM_STATE_TIMEOUT: Duration = Duration::from_millis(250);
 const FIRECRACKER_VSOCK_POLL: Duration = Duration::from_millis(50);
 const FIRECRACKER_VSOCK_TIMEOUT: Duration = Duration::from_secs(1);
-const RUN_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_RUN_DIR;
-const CACHE_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR;
-const TEMPLATE_DIR: &str = pplx_space_common_core::host::linux::paths::TEMPLATE_DIR;
-const JAIL_DIR: &str = pplx_space_common_core::host::linux::paths::FIRECRACKER_JAIL_DIR;
+const RUN_DIR: &str = pplx_space_host_layout::paths::SANDBOX_RUN_DIR;
+const CACHE_DIR: &str = pplx_space_host_layout::paths::SANDBOX_CACHE_DIR;
+const TEMPLATE_DIR: &str = pplx_space_host_layout::paths::TEMPLATE_DIR;
+const JAIL_DIR: &str = pplx_space_host_layout::paths::FIRECRACKER_JAIL_DIR;
 
 const ALLOW_NODE_STATUS: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
@@ -85,6 +82,16 @@ const ALLOW_NODE_STATUS: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Service(user_names::SPACE_SBXMGR),
     UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
     UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
+];
+/// Node-status readers, plus template-manager, which reads the environments
+/// the node can run to warm and pool their template builds.
+const ALLOW_EXECUTION_INVENTORY: &[UdsPeerPrincipal] = &[
+    UdsPeerPrincipal::Root,
+    UdsPeerPrincipal::Role(LocalRole::Observer),
+    UdsPeerPrincipal::Service(user_names::SPACE_SBXMGR),
+    UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
+    UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
+    UdsPeerPrincipal::Service(user_names::SPACE_TMPLMGR),
 ];
 const ALLOW_NODE_ADMIN: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
@@ -208,6 +215,9 @@ pub struct NodeManagerService {
     send_source_locks: SandboxCgroupFamilyLocks,
     send_source_slots: std::sync::Arc<tokio::sync::Semaphore>,
     artifact_work: Option<std::sync::Arc<filesystem_work::ArtifactWork>>,
+    /// Cancels admitted artifact mutations. Shutdown leaves them running and
+    /// cancels them only once the drain budget runs out.
+    artifact_work_cancel: tokio_util::sync::CancellationToken,
     /// Shared drain ownership for detached mutations and lifecycle permits.
     device_op_tasks: tokio_util::task::TaskTracker,
     blocking_probe_slots: std::sync::Arc<tokio::sync::Semaphore>,
@@ -231,6 +241,10 @@ pub struct NodeManagerService {
     cleanup_operations: cleanup_inspect::CleanupOperationRegistry,
     orphan_inventory: orphan_inventory::OrphanInventory,
     snapshot_inventory: snapshot_inventory::SnapshotInventory,
+    #[cfg(test)]
+    encrypted_capture_io: Option<snapshots::EncryptedCaptureTestIo>,
+    #[cfg(all(test, target_os = "linux"))]
+    firewall_sync: Option<std::sync::Arc<firewall_sync::FirewallSync>>,
 }
 
 type SandboxCgroupGateLock = std::sync::Arc<tokio::sync::RwLock<()>>;
@@ -316,7 +330,7 @@ impl NodeManagerService {
         &self,
         request: Request<GetExecutionInventoryRequest>,
     ) -> Result<Response<pplx_space_execution_common::proto::NodeExecutionInventory>, Status> {
-        self.authorize_peer(&request, "GetExecutionInventory", ALLOW_NODE_STATUS)?;
+        self.authorize_peer(&request, "GetExecutionInventory", ALLOW_EXECUTION_INVENTORY)?;
         // Before discovery, so a node that can't report inventory still reports this.
         crate::metrics::node_manager::execution_policy_record_unreadable(
             self.execution_policy().cluster_policy_unreadable(),
@@ -424,6 +438,7 @@ impl NodeManagerService {
             send_source_locks: Default::default(),
             send_source_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             artifact_work: None,
+            artifact_work_cancel: tokio_util::sync::CancellationToken::new(),
             blocking_probe_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_BLOCKING_PROBES,
             )),
@@ -452,6 +467,10 @@ impl NodeManagerService {
             cleanup_operations: cleanup_inspect::CleanupOperationRegistry::new(task_tracker),
             orphan_inventory: orphan_inventory::OrphanInventory::default(),
             snapshot_inventory: snapshot_inventory::SnapshotInventory::default(),
+            #[cfg(test)]
+            encrypted_capture_io: None,
+            #[cfg(all(test, target_os = "linux"))]
+            firewall_sync: None,
         })
     }
 
@@ -604,7 +623,9 @@ impl NodeManagerService {
 
     fn adopt_validated_lease(&self, sandbox_id: &str, expected: &SlotInfo) -> Result<(), Status> {
         if self.pool.shutdown_token.is_cancelled() {
-            return Err(Status::unavailable("node-manager is shutting down"));
+            return Err(Status::unavailable(
+                pplx_space_node_mgr_client::SHUTTING_DOWN_MESSAGE,
+            ));
         }
         self.pool
             .adopt_lease(sandbox_id, expected)
@@ -622,7 +643,10 @@ impl NodeManagerService {
         self.pool
             .try_claim_sandbox_mutation(sandbox_id)
             .ok_or_else(|| {
-                Status::unavailable("sandbox host mutation or reset is in progress; retry")
+                Status::unavailable(format!(
+                    "sandbox host mutation or reset {}",
+                    pplx_space_rpc_contracts::artifact_backup_signals::NODE_MANAGER_SANDBOX_BUSY_MARKER
+                ))
             })
     }
 
@@ -723,7 +747,9 @@ impl NodeManagerService {
         self.peer_authorizer
             .authorize_request(request, operation, allowed)?;
         if self.pool.shutdown_token.is_cancelled() {
-            return Err(Status::unavailable("node-manager is shutting down"));
+            return Err(Status::unavailable(
+                pplx_space_node_mgr_client::SHUTTING_DOWN_MESSAGE,
+            ));
         }
         Ok(())
     }
@@ -731,12 +757,14 @@ impl NodeManagerService {
 
 /// Validate sandbox_id is a safe UUID-like string (prevents path traversal).
 mod adapter;
-mod artifact_fs;
+pub(crate) mod artifact_fs;
 pub mod btrfs_balance;
 mod btrfs_delegation;
 mod btrfs_send_source;
 mod btrfs_send_stream;
 mod btrfs_send_transport;
+#[cfg(target_os = "linux")]
+pub(crate) mod cgroup_oom;
 pub mod cgroup_reclaim;
 #[cfg(test)]
 mod claim_contention_tests;
@@ -749,12 +777,15 @@ mod encrypted_volumes;
 mod endpoint_attestation;
 mod execution_fence;
 mod execution_policy;
+mod firewall_sync;
 mod gateway_isolation;
 mod launch_prepare;
 mod network_helpers;
 pub mod network_pool_metrics;
 mod node_artifacts;
+pub mod node_cpu_metrics;
 pub mod node_disk_metrics;
+pub mod node_memory_metrics;
 mod orphan_inventory;
 mod permission_tree;
 mod prepared_rootfs;

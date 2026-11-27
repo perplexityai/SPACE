@@ -358,7 +358,7 @@ async fn timer_test_worker(
 ) -> (
     NodeCtlWorker,
     mpsc::Sender<WorkItem>,
-    Arc<Mutex<Connection>>,
+    SharedConnection,
     NodeObjectPasses,
 ) {
     worker_publishing_to(
@@ -376,20 +376,16 @@ async fn worker_publishing_to(
 ) -> (
     NodeCtlWorker,
     mpsc::Sender<WorkItem>,
-    Arc<Mutex<Connection>>,
+    SharedConnection,
     NodeObjectPasses,
 ) {
     let db_path = dir.join("node-ctl.db");
-    pplx_space_sqlite::migrate("node-ctl", &db_path, &NODE_CTL_MIGRATOR)
+    pplx_space_node_ctl_store::database::migrate(&db_path)
         .await
         .expect("migrate node-ctl database");
-    let conn = pplx_space_sqlite::open_rusqlite(
-        &db_path,
-        pplx_space_sqlite::RusqliteOpenOptions::default(),
-    )
-    .expect("open node-ctl database");
+    let conn = pplx_space_node_ctl_store::database::open(&db_path).expect("open node-ctl database");
     init_reconciliation_status(&conn, DEFAULT_POLL_INTERVAL_SECS).expect("seed statuses");
-    let db = Arc::new(Mutex::new(conn));
+    let db = SharedConnection::new(conn);
     let (tx, rx) = mpsc::channel(WORK_QUEUE_CAPACITY);
     let passes = NodeObjectPasses::default();
     let worker = NodeCtlWorker {
@@ -427,15 +423,25 @@ async fn published_node_ctl_status_reports_the_node_status_poll_interval() {
     init_reconciliation_status(&db.lock().expect("lock node-ctl db"), configured_secs)
         .expect("reseed statuses");
 
-    let status = worker.node_ctl_status_for_publish();
+    let status = worker.node_ctl_status_for_publish(Some(true));
     assert_eq!(
         pplx_space_node_api_client::node_status_freshness::reported_status_poll_interval(&status),
         Some(Duration::from_secs(configured_secs)),
     );
+    // Template-manager's report rides in the published status as given.
+    assert_eq!(status.reads_twin_metadata, Some(true));
+    for report in [Some(false), None] {
+        assert_eq!(
+            worker
+                .node_ctl_status_for_publish(report)
+                .reads_twin_metadata,
+            report
+        );
+    }
 }
 
 /// When each outbound reconciler last completed a pass (0: never).
-fn outbound_completions(db: &Arc<Mutex<Connection>>) -> BTreeMap<String, u64> {
+fn outbound_completions(db: &SharedConnection) -> BTreeMap<String, u64> {
     let outbound = [
         SANDBOX_INVENTORY_OUTBOUND_RECONCILER,
         TEMPLATE_INVENTORY_OUTBOUND_RECONCILER,
@@ -704,7 +710,7 @@ async fn run_against(
 ) -> (
     CancellationToken,
     mpsc::Sender<WorkItem>,
-    Arc<Mutex<Connection>>,
+    SharedConnection,
     NodeObjectPasses,
 ) {
     let (worker, tx, db, passes) =
@@ -1021,7 +1027,7 @@ async fn dirty_node_status_syncs_do_not_put_off_the_inventory_retry() {
     let mut at = 1.0;
     while at < outage_end {
         advance_to(&cluster, at).await;
-        dirty_state::mark_refs(&mut db.lock().expect("lock node-ctl db"), &node_status)
+        dirty_state::mark_refs(&db.lock().expect("lock node-ctl db"), &node_status)
             .expect("mark node status dirty");
         tx.send(WorkItem::SyncDirty)
             .await

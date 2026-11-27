@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pplx_space_common_core::types::StorageUri;
+use pplx_space_artifact_model::StorageUri;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -92,10 +92,11 @@ impl SweeperSink for Arc<FakeSink> {
         after: Option<Uuid>,
         _min_age: Option<Duration>,
     ) -> Result<Vec<SweepCandidate>, sqlx::Error> {
-        // The fake doesn't model `min_age` — the postgres-integration
-        // tests cover the SQL-level grace filter. Unit tests here
-        // assert that the reconciler *threads* `min_age` through to
-        // the sink call site via the helper below.
+        // The fake doesn't model `min_age` —
+        // `pplx-space-snapshot-store`'s `orphan_locations` tests cover the
+        // SQL-level grace filter. Unit tests here assert that the
+        // reconciler *threads* `min_age` through to the sink call site via
+        // the helper below.
         self.last_min_age.lock().unwrap().replace(_min_age);
         let all = self.candidates.lock().unwrap().clone();
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
@@ -657,8 +658,8 @@ async fn t12_cross_bucket_row_skipped_with_metric() {
 
 /// Verify that the reconciler threads `config.min_age` through to
 /// the sink's `list_candidates(min_age=...)`. The in-process fake
-/// captures the value; the real SQL filter coverage lives with the
-/// `SnapshotStorageDbStore` postgres-integration tests.
+/// captures the value; the real SQL filter coverage lives in
+/// `pplx-space-snapshot-store`'s `orphan_locations` tests.
 #[tokio::test(flavor = "current_thread")]
 async fn t13_min_age_is_threaded_through_to_sink() {
     let sink = FakeSink::new();

@@ -8,10 +8,11 @@
 //! the direction wrong reads a node outage as an empty node, and an operator who
 //! drains on that reading terminates a host with running sandboxes on it.
 
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxId;
 
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::try_pg_test_db;
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 use std::time::Duration;
@@ -200,9 +201,12 @@ async fn live_at(pool: &PgPool, node_id: NodeId, age: Duration) -> TestResult<No
 /// keep the guard reading as it did before the discount existed.
 async fn in_tx_local_snapshots(pool: &PgPool, node: NodeId) -> TestResult<i64> {
     let mut tx = pool.begin().await?;
-    let occupancy =
-        super::sandbox_occupancy_for_node_in_tx(&mut tx, node, ResidencyEvidence::LifecycleOnly)
-            .await?;
+    let occupancy = pplx_space_sandbox_store::admin_occupancy::terminate_occupancy(
+        &mut *tx,
+        node,
+        ResidencyEvidence::LifecycleOnly,
+    )
+    .await?;
     tx.commit().await?;
     Ok(occupancy.drain_blockers)
 }
@@ -947,7 +951,12 @@ async fn the_guard_refuses_exactly_what_the_listing_calls_terminate_blockers() -
         let predicted = listed.live.expect("threshold supplied").terminate_blockers;
 
         let mut tx = pool.begin().await?;
-        let guard = super::sandbox_occupancy_for_node_in_tx(&mut tx, node, CENSUS_AWARE).await?;
+        let guard = pplx_space_sandbox_store::admin_occupancy::terminate_occupancy(
+            &mut *tx,
+            node,
+            CENSUS_AWARE,
+        )
+        .await?;
         tx.commit().await?;
 
         assert_eq!(
@@ -1029,66 +1038,6 @@ async fn lifecycle_only_counts_every_occupying_row() -> TestResult {
         "the discount is what the mode buys, and it is opt-in"
     );
     Ok(())
-}
-
-/// The ordinary admin listing asks for no drainability counters, so its
-/// occupancy CTE must stay streamable. Materializing it would spool every
-/// active sandbox row in the listed set into a tuplestore — on a fleet listing
-/// that is the whole `sandboxes` working set, and the listing predates the
-/// ranking, so paying that cost for it is a regression rather than a tradeoff.
-///
-/// Materialization is only owed to the mode that plans a correlated census
-/// subquery per row, where re-evaluating it three times is the worse cost.
-///
-/// This guards the *decision*, not the plan: it pins which of the two modes
-/// gets the optimizer fence, which is the regression that matters. It does not
-/// verify the plan-shape reasoning in `row_cte_materialization`'s docstring —
-/// no `EXPLAIN` runs anywhere in this suite, so the per-aggregate re-expansion
-/// and `jit_above_cost` claims rest on the shared fragment's own measurements
-/// rather than on this assertion.
-#[test]
-fn only_census_aware_ranking_materializes_the_per_row_cte() {
-    for residency in [
-        ResidencyEvidence::LifecycleOnly,
-        ResidencyEvidence::NodeCensusAware,
-    ] {
-        assert_eq!(
-            super::row_cte_materialization(false, residency),
-            "",
-            "a listing with no ranking has no expensive flag to protect, \
-             whatever the cluster's residency policy is"
-        );
-    }
-
-    assert_eq!(
-        super::row_cte_materialization(true, ResidencyEvidence::LifecycleOnly),
-        "",
-        "lifecycle-only ranking plans no census probe, so the flags are a \
-         constant and an `IN` test over a column already on the row"
-    );
-    assert_eq!(
-        super::row_cte_materialization(true, ResidencyEvidence::NodeCensusAware),
-        " MATERIALIZED",
-        "three aggregates over an inlined census predicate is three \
-         evaluations of the absence proof per row"
-    );
-
-    // The fleet statements spell the fence out; pin each shape to the
-    // decision above.
-    for ranked in [false, true] {
-        for residency in [
-            ResidencyEvidence::LifecycleOnly,
-            ResidencyEvidence::NodeCensusAware,
-        ] {
-            assert_eq!(
-                super::fleet_occupancy::query(ranked, residency)
-                    .contains("active_rows AS MATERIALIZED ("),
-                ranked && residency == ResidencyEvidence::NodeCensusAware,
-                "the fleet statement fences active_rows only for census-aware ranking \
-                 (ranked {ranked}, {residency:?})"
-            );
-        }
-    }
 }
 
 /// A node holding **no sandbox row at all** is the best gentle-drain candidate

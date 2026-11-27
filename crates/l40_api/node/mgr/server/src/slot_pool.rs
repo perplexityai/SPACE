@@ -8,14 +8,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
-use pplx_space_common_core::types::{SandboxId, SandboxIdParseError};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use pplx_space_node_mgr_store::{Connection, Transaction, executions, meta, slots};
+pub(crate) use pplx_space_node_mgr_store::{LeaseKind, PoolValueParseError, SlotHealth, SlotState};
+use pplx_space_sandbox_model::{SandboxId, SandboxIdParseError};
+#[cfg(test)]
+use rusqlite::params;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::memory_admission::ActiveLeaseMemoryReservation;
 use crate::net::{self, NetId, SlotInfo};
 pub use crate::node_state_sync::{NodeCtlNodeStatusDirtySink, NodeStatusDirtySink};
+#[cfg(target_os = "linux")]
+pub use firewall_rules::observe::{CensusGap, FirewallObservation, SlotEvidence, SlotOutcome};
+#[cfg(target_os = "linux")]
+pub use firewall_rules::{
+    NamespaceIdentity, NotRun, NotRunnable, SlotFirewallAttempt, SlotFirewallReport,
+    SlotFirewallRequest, SlotTarget, Stale,
+};
 
 pub const NETWORK_POOL_SCHEMA_VERSION: u32 = 4;
 pub const DEFAULT_NETWORK_POOL_TARGET: u32 = 100;
@@ -24,16 +34,19 @@ const REPAIR_CONCURRENCY: usize = 10;
 const CREATE_CONCURRENCY: usize = 2;
 const VALIDATION_CONCURRENCY: usize = 16;
 const POOL_FILL_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// How long after its last write a lease that node-manager finds at startup
+/// without a runtime is kept rather than reset. During a handoff the
+/// predecessor allocates a slot, then stops serving and drains for up to its
+/// pod's 60 s termination grace before this process starts; the activation
+/// that allocated it launches here once this process listens. 90 s covers that
+/// grace plus 30 s for this process's startup and the caller's redial. A lease
+/// with no runtime once the grace ends is reset as before, at the next
+/// validation retry ([`POOL_FILL_RETRY_DELAY`]).
+const STARTUP_YOUNG_LEASE_GRACE: Duration = Duration::from_secs(90);
 const MAX_SLOT_CLEANUP_RESET_RETRIES: u32 = 5;
 const MAX_SLOT_TRANSIENT_VALIDATION_RETRIES: u32 = 5;
 const MAX_SLOT_TRANSIENT_SETUP_RETRIES: u32 = 5;
 const MAX_SLOT_TRANSIENT_RESET_RETRIES: u32 = 5;
-
-macro_rules! clear_cleanup_reset_retry_sql {
-    () => {
-        "cleanup_reset_attempts = 0, last_reset_retry_at = NULL"
-    };
-}
 
 #[derive(Clone, Debug)]
 pub struct NetworkPoolConfig {
@@ -55,9 +68,7 @@ impl NetworkPoolConfig {
             min_ready_slots: max_slots.min(32),
             pod_netns_path: None,
             service_port_ingress_isolation: ServicePortIngressIsolation::ExclusiveHost,
-            sandbox_cache_dir: PathBuf::from(
-                pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR,
-            ),
+            sandbox_cache_dir: PathBuf::from(pplx_space_host_layout::paths::SANDBOX_CACHE_DIR),
         }
     }
 
@@ -115,171 +126,29 @@ pub struct NetworkPoolConfigUpdate {
     pub min_ready_slots: Option<u32>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SlotState {
-    Missing,
-    Creating,
-    Ready,
-    Leasing,
-    Leased,
-    Dirty,
-    Resetting,
-    Quarantined,
-    Destroying,
+pub fn slot_state_proto(state: SlotState) -> i32 {
+    use crate::proto::NetworkSlotState;
+    (match state {
+        SlotState::Missing => NetworkSlotState::Missing,
+        SlotState::Creating => NetworkSlotState::Creating,
+        SlotState::Ready => NetworkSlotState::Ready,
+        SlotState::Leasing => NetworkSlotState::Leasing,
+        SlotState::Leased => NetworkSlotState::Leased,
+        SlotState::Dirty => NetworkSlotState::Dirty,
+        SlotState::Resetting => NetworkSlotState::Resetting,
+        SlotState::Quarantined => NetworkSlotState::Quarantined,
+        SlotState::Destroying => NetworkSlotState::Destroying,
+    }) as i32
 }
 
-impl SlotState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Missing => "missing",
-            Self::Creating => "creating",
-            Self::Ready => "ready",
-            Self::Leasing => "leasing",
-            Self::Leased => "leased",
-            Self::Dirty => "dirty",
-            Self::Resetting => "resetting",
-            Self::Quarantined => "quarantined",
-            Self::Destroying => "destroying",
-        }
-    }
-
-    pub fn proto(self) -> i32 {
-        use crate::proto::NetworkSlotState;
-        (match self {
-            Self::Missing => NetworkSlotState::Missing,
-            Self::Creating => NetworkSlotState::Creating,
-            Self::Ready => NetworkSlotState::Ready,
-            Self::Leasing => NetworkSlotState::Leasing,
-            Self::Leased => NetworkSlotState::Leased,
-            Self::Dirty => NetworkSlotState::Dirty,
-            Self::Resetting => NetworkSlotState::Resetting,
-            Self::Quarantined => NetworkSlotState::Quarantined,
-            Self::Destroying => NetworkSlotState::Destroying,
-        }) as i32
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SlotHealth {
-    Unknown,
-    Healthy,
-    Degraded,
-    Invalid,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LeaseKind {
-    Pooled,
-    Ephemeral,
-}
-
-impl LeaseKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Pooled => "pooled",
-            Self::Ephemeral => "ephemeral",
-        }
-    }
-}
-
-impl SlotHealth {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Unknown => "unknown",
-            Self::Healthy => "healthy",
-            Self::Degraded => "degraded",
-            Self::Invalid => "invalid",
-        }
-    }
-
-    pub fn proto(self) -> i32 {
-        use crate::proto::NetworkSlotHealth;
-        (match self {
-            Self::Unknown => NetworkSlotHealth::Unknown,
-            Self::Healthy => NetworkSlotHealth::Healthy,
-            Self::Degraded => NetworkSlotHealth::Degraded,
-            Self::Invalid => NetworkSlotHealth::Invalid,
-        }) as i32
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("invalid persisted {kind}: {value}")]
-pub struct PoolValueParseError {
-    kind: &'static str,
-    value: String,
-}
-
-impl FromStr for SlotState {
-    type Err = PoolValueParseError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "missing" => Ok(Self::Missing),
-            "creating" => Ok(Self::Creating),
-            "ready" => Ok(Self::Ready),
-            "leasing" => Ok(Self::Leasing),
-            "leased" => Ok(Self::Leased),
-            "dirty" => Ok(Self::Dirty),
-            "resetting" => Ok(Self::Resetting),
-            "quarantined" => Ok(Self::Quarantined),
-            "destroying" => Ok(Self::Destroying),
-            _ => Err(PoolValueParseError {
-                kind: "slot state",
-                value: value.into(),
-            }),
-        }
-    }
-}
-
-impl FromStr for SlotHealth {
-    type Err = PoolValueParseError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "unknown" => Ok(Self::Unknown),
-            "healthy" => Ok(Self::Healthy),
-            "degraded" => Ok(Self::Degraded),
-            "invalid" => Ok(Self::Invalid),
-            _ => Err(PoolValueParseError {
-                kind: "slot health",
-                value: value.into(),
-            }),
-        }
-    }
-}
-
-impl FromStr for LeaseKind {
-    type Err = PoolValueParseError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "pooled" => Ok(Self::Pooled),
-            "ephemeral" => Ok(Self::Ephemeral),
-            _ => Err(PoolValueParseError {
-                kind: "lease kind",
-                value: value.into(),
-            }),
-        }
-    }
-}
-
-impl fmt::Display for SlotState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl fmt::Display for SlotHealth {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl fmt::Display for LeaseKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
+pub fn slot_health_proto(health: SlotHealth) -> i32 {
+    use crate::proto::NetworkSlotHealth;
+    (match health {
+        SlotHealth::Unknown => NetworkSlotHealth::Unknown,
+        SlotHealth::Healthy => NetworkSlotHealth::Healthy,
+        SlotHealth::Degraded => NetworkSlotHealth::Degraded,
+        SlotHealth::Invalid => NetworkSlotHealth::Invalid,
+    }) as i32
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -289,7 +158,7 @@ pub enum SlotStoreError {
     #[error("network lease setup or recovery for {0} is incomplete; retry allocation")]
     LeaseNotReady(String),
     #[error("network slot database: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] pplx_space_node_mgr_store::Error),
     #[error(transparent)]
     InvalidValue(#[from] PoolValueParseError),
     #[error(
@@ -317,7 +186,7 @@ pub enum PoolOpenError {
         source: std::io::Error,
     },
     #[error("cannot open network pool database: {0}")]
-    Open(#[from] pplx_space_sqlite::SqliteError),
+    Open(#[from] pplx_space_node_mgr_store::database::SqliteError),
     #[error(transparent)]
     Store(#[from] SlotStoreError),
     #[error("cannot install guest L2 ingress policy in namespace {namespace}: {source}")]
@@ -499,7 +368,7 @@ pub(crate) enum ActiveLeaseMemoryReservationError {
     #[error("active lease memory reservation database lock is poisoned")]
     LockPoisoned,
     #[error("failed to query active lease memory reservations: {0}")]
-    Query(#[from] rusqlite::Error),
+    Query(#[from] pplx_space_node_mgr_store::Error),
     #[error("active lease contains invalid sandbox id {sandbox_id}: {source}")]
     InvalidSandboxId {
         sandbox_id: String,
@@ -578,6 +447,12 @@ pub struct NetworkPool {
     startup_leasing: Mutex<Vec<LeaseKey>>,
     // Lock after db: adoption and recovery must decide ownership atomically.
     startup_leases: Mutex<HashSet<LeaseKey>>,
+    // Startup leases written within STARTUP_YOUNG_LEASE_GRACE before open,
+    // with the time (secs) their grace ends. Fixed at open: later health
+    // writes must not extend it.
+    startup_young_leases: HashMap<LeaseKey, u64>,
+    // Slots owned by a live `reset::SlotGuard`; only a guard inserts or removes
+    // an entry. The scheduler and worker read it directly; one test seeds it.
     active_resets: Mutex<HashSet<u32>>,
     sandbox_mutations: std::sync::Arc<Mutex<HashMap<String, SandboxMutationOwnership>>>,
     sandbox_mutations_released: std::sync::Arc<tokio::sync::Notify>,
@@ -700,9 +575,7 @@ impl NetworkPool {
         db_path: &Path,
     ) -> Result<(), PoolOpenError> {
         validate_config(config).map_err(PoolOpenError::Configuration)?;
-        let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(SlotStoreError::from)?;
-        conn.busy_timeout(Duration::from_secs(5))
+        let conn = pplx_space_node_mgr_store::database::open_read_only(db_path)
             .map_err(SlotStoreError::from)?;
         validate_startup_ownership(&conn, config)?;
         Ok(())
@@ -717,26 +590,25 @@ impl NetworkPool {
     ) -> Result<std::sync::Arc<Self>, PoolOpenError> {
         config.pod_netns_path = config.pod_netns_path.as_deref().map(normalize_netns_name);
         validate_config(&config).map_err(PoolOpenError::Configuration)?;
-        let db_path = pplx_space_common_core::host::linux::paths::NODE_MANAGER_DB;
+        let db_path = pplx_space_host_layout::paths::NODE_MANAGER_DB;
         if let Some(parent) = std::path::Path::new(db_path).parent() {
             std::fs::create_dir_all(parent).map_err(|source| PoolOpenError::Directory {
                 path: parent.to_path_buf(),
                 source,
             })?;
         }
-        let mut conn = pplx_space_sqlite::open_rusqlite(
-            Path::new(db_path),
-            pplx_space_sqlite::RusqliteOpenOptions {
-                foreign_keys: true,
-                ..Default::default()
-            },
-        )?;
+        let mut conn = pplx_space_node_mgr_store::database::open(Path::new(db_path))?;
         init_db(&mut conn, &config)?;
-        reconcile_runtime_state(&mut conn, &config).map_err(SlotStoreError::from)?;
+        // Before the runtime reconcile, which would dirty a young lease the
+        // predecessor allocated moments ago.
+        let startup_young_leases =
+            query_startup_young_leases(&conn, now_secs(), STARTUP_YOUNG_LEASE_GRACE)?;
+        reconcile_runtime_state(&mut conn, &config, &startup_young_leases)
+            .map_err(SlotStoreError::from)?;
         // Existing durable TAP namespaces must carry both containments before
         // the node admits work: guest L2 ingress filtering and the constrained
         // direct inbound reply path. Probe each TAP once and apply both.
-        let namespaces: Vec<_> = query_records(&conn, None)
+        let namespaces: Vec<_> = query_all_records(&conn)
             .map_err(SlotStoreError::from)?
             .into_iter()
             .map(|record| record.info.ns_name())
@@ -749,7 +621,7 @@ impl NetworkPool {
         )?;
         let startup_leasing = query_startup_leasing(&conn)?;
         let startup_leases = query_startup_leases(&conn)?;
-        backfill_active_memory_reservations(&conn, legacy_active_memory_reservation_mib)
+        slots::backfill_active_memory_reservations(&conn, legacy_active_memory_reservation_mib)
             .map_err(SlotStoreError::from)?;
 
         let (job_tx, job_rx) = mpsc::channel(1);
@@ -765,6 +637,7 @@ impl NetworkPool {
             lease_health_recovery_pending: AtomicBool::new(true),
             startup_leasing: Mutex::new(startup_leasing),
             startup_leases: Mutex::new(startup_leases),
+            startup_young_leases,
             active_resets: Mutex::new(HashSet::new()),
             sandbox_mutations: Default::default(),
             sandbox_mutations_released: Default::default(),
@@ -803,7 +676,7 @@ impl NetworkPool {
     ) -> std::sync::Arc<Self> {
         config.pod_netns_path = config.pod_netns_path.as_deref().map(normalize_netns_name);
         validate_config(&config).unwrap();
-        let mut conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory();
         configure_db(&conn).unwrap();
         init_in_memory_db(&mut conn, &config).unwrap();
         let (job_tx, _job_rx) = mpsc::channel(1);
@@ -819,6 +692,7 @@ impl NetworkPool {
             lease_health_recovery_pending: AtomicBool::new(false),
             startup_leasing: Mutex::new(Vec::new()),
             startup_leases: Mutex::new(HashSet::new()),
+            startup_young_leases: HashMap::new(),
             active_resets: Mutex::new(HashSet::new()),
             sandbox_mutations: Default::default(),
             sandbox_mutations_released: Default::default(),
@@ -835,6 +709,7 @@ impl NetworkPool {
         self.db
             .lock()
             .unwrap()
+            .raw()
             .execute(
                 "UPDATE network_slots
                  SET state = 'ready', health = 'healthy', pod_netns_path = NULL,
@@ -939,7 +814,7 @@ impl NetworkPool {
     ) -> Result<ClaimedSlotAllocation, AllocateSlotError> {
         if self.shutdown_token.is_cancelled() {
             return Err(AllocateSlotError::InProgress(
-                "node-manager is shutting down".into(),
+                pplx_space_node_mgr_client::SHUTTING_DOWN_MESSAGE.into(),
             ));
         }
         if self.is_draining()? {
@@ -982,7 +857,7 @@ impl NetworkPool {
         memory_reservation: Option<NewLeaseMemoryReservation>,
     ) -> Result<SlotInfo, AllocateSlotError> {
         let mut conn = self.db.lock().map_err(|_| SlotStoreError::LockPoisoned)?;
-        let tx = conn.transaction().map_err(SlotStoreError::from)?;
+        let tx = Transaction::deferred(&mut conn).map_err(SlotStoreError::from)?;
 
         let stale_slot_to_reset = match query_current_lease_by_sandbox(&tx, sandbox_id)
             .map_err(SlotStoreError::from)?
@@ -1007,20 +882,10 @@ impl NetworkPool {
             None => None,
         };
 
-        let row = tx
-            .query_row(
-                "SELECT slot_id, generation FROM network_slots
-                 WHERE state = 'ready' AND health = 'healthy' AND sandbox_id IS NULL
-                   AND ((pod_netns_path IS NULL AND ?1 IS NULL) OR pod_netns_path = ?1)
-                 ORDER BY slot_id
-                 LIMIT 1",
-                params![requested_pod_netns],
-                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, SqliteU64>(1)?.0)),
-            )
-            .optional()
+        let ready = slots::ready_slot_to_lease(&tx, requested_pod_netns.as_deref())
             .map_err(SlotStoreError::from)?;
 
-        let Some((slot_id, generation)) = row else {
+        let Some(ready) = ready else {
             tx.commit().map_err(SlotStoreError::from)?;
             drop(conn);
             if let Some(slot_id) = stale_slot_to_reset {
@@ -1033,32 +898,19 @@ impl NetworkPool {
             ));
         };
 
+        let slot_id = ready.slot_id();
         let memory_reservation_mib = persist_new_lease_memory_reservation(memory_reservation)?;
-        let lease_generation = generation + 1;
+        let lease_generation = ready.generation() + 1;
         let sandbox_uid = net::sandbox_uid_for_slot(slot_id);
-        tx.execute(
-            concat!(
-                "UPDATE network_slots
-                 SET generation = ?1, state = 'leased', health = 'healthy',
-                     sandbox_id = ?2, sandbox_uid = ?3, pid = NULL,
-                     lease_kind = ?4, memory_reservation_mib = ?5, last_error = NULL,
-                     ",
-                clear_cleanup_reset_retry_sql!(),
-                ",
-                     updated_at = ?6, reuse_count = reuse_count + 1
-                 WHERE slot_id = ?7"
-            ),
-            params![
-                SqliteU64(lease_generation),
+        ready
+            .lease(&slots::PooledLease {
+                generation: lease_generation,
                 sandbox_id,
                 sandbox_uid,
-                LeaseKind::Pooled.as_str(),
-                SqliteU64(memory_reservation_mib),
-                SqliteU64(now_secs()),
-                slot_id
-            ],
-        )
-        .map_err(SlotStoreError::from)?;
+                memory_reservation_mib,
+                now: now_secs(),
+            })
+            .map_err(SlotStoreError::from)?;
         tx.commit().map_err(SlotStoreError::from)?;
         clear_stale_transient_setup_failures_for_slot(self, slot_id, None);
 
@@ -1182,7 +1034,7 @@ impl NetworkPool {
     ) -> Result<EphemeralSlotClaimResult, AllocateSlotError> {
         let config = self.config();
         let mut conn = self.db.lock().map_err(|_| SlotStoreError::LockPoisoned)?;
-        let tx = conn.transaction().map_err(SlotStoreError::from)?;
+        let tx = Transaction::deferred(&mut conn).map_err(SlotStoreError::from)?;
 
         let stale_slot_to_reset = match query_current_lease_by_sandbox(&tx, sandbox_id)
             .map_err(SlotStoreError::from)?
@@ -1207,29 +1059,15 @@ impl NetworkPool {
             None => None,
         };
 
-        let mut statement = tx
-            .prepare(
-                "SELECT slot_id, generation, state, pod_netns_path FROM network_slots
-                 WHERE slot_id < ?1 AND sandbox_id IS NULL
-                   AND (state = 'missing' OR (state = 'ready' AND health = 'healthy'))
-                 ORDER BY CASE state WHEN 'missing' THEN 0 ELSE 1 END, slot_id",
-            )
-            .map_err(SlotStoreError::from)?;
-        let mut candidates = statement
-            .query_map(params![config.max_slots], |row| {
-                Ok((
-                    row.get::<_, u32>(0)?,
-                    row.get::<_, SqliteU64>(1)?.0,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
-            })
+        let mut scan = slots::idle_slot_scan(&tx).map_err(SlotStoreError::from)?;
+        let mut candidates = scan
+            .rows(config.max_slots)
             .map_err(SlotStoreError::from)?
             .peekable();
 
         if candidates.peek().is_none() {
             drop(candidates);
-            drop(statement);
+            drop(scan);
             tx.commit().map_err(SlotStoreError::from)?;
             if let Some(slot_id) = stale_slot_to_reset {
                 self.enqueue_reset(slot_id);
@@ -1248,47 +1086,39 @@ impl NetworkPool {
         let mut claimed = None;
         for candidate in candidates {
             let candidate = candidate.map_err(SlotStoreError::from)?;
-            if let Some(ownership) = ResetClaim::acquire(self, candidate.0) {
+            if let Some(ownership) = ResetClaim::acquire(self, candidate.slot_id) {
                 claimed = Some((candidate, ownership));
                 break;
             }
         }
-        drop(statement);
-        let ((slot_id, generation, previous_state, previous_pod_netns), ownership) = claimed
-            .ok_or_else(|| {
-                AllocateSlotError::InProgress("slot mutation already in progress".into())
-            })?;
+        drop(scan);
+        let (candidate, ownership) = claimed.ok_or_else(|| {
+            AllocateSlotError::InProgress("slot mutation already in progress".into())
+        })?;
+        let slots::IdleSlot {
+            slot_id,
+            generation,
+            state: previous_state,
+            pod_netns_path: previous_pod_netns,
+        } = candidate;
         let lease_generation = generation + 1;
         let sandbox_uid = net::sandbox_uid_for_slot(slot_id);
         let committed = (|| -> Result<(), AllocateSlotError> {
-            let changed = tx
-                .execute(
-                    concat!(
-                        "UPDATE network_slots
-                     SET generation = ?1, state = 'leasing', health = 'unknown',
-                         sandbox_id = ?2, sandbox_uid = ?3, pid = NULL,
-                         pod_netns_path = ?4, lease_kind = ?5, memory_reservation_mib = ?6,
-                         last_error = NULL,
-                         ",
-                        clear_cleanup_reset_retry_sql!(),
-                        ",
-                         updated_at = ?7, reuse_count = reuse_count + 1
-                     WHERE slot_id = ?8 AND generation = ?9 AND state = ?10 AND sandbox_id IS NULL"
-                    ),
-                    params![
-                        SqliteU64(lease_generation),
-                        sandbox_id,
-                        sandbox_uid,
-                        previous_pod_netns,
-                        LeaseKind::Ephemeral.as_str(),
-                        SqliteU64(memory_reservation_mib),
-                        SqliteU64(now_secs()),
-                        slot_id,
-                        SqliteU64(generation),
-                        previous_state,
-                    ],
-                )
-                .map_err(SlotStoreError::from)?;
+            let changed = slots::claim_ephemeral_lease(
+                &tx,
+                &slots::EphemeralClaim {
+                    slot_id,
+                    read_generation: generation,
+                    read_state: &previous_state,
+                    generation: lease_generation,
+                    sandbox_id,
+                    sandbox_uid,
+                    pod_netns_path: previous_pod_netns.as_deref(),
+                    memory_reservation_mib,
+                    now: now_secs(),
+                },
+            )
+            .map_err(SlotStoreError::from)?;
             if changed != 1 {
                 return Err(AllocateSlotError::InProgress(
                     "network slot changed while claiming dynamic lease".to_string(),
@@ -1359,20 +1189,16 @@ impl NetworkPool {
         let net = NetId::from_slot(slot);
         teardown(&net.ns(), &net, previous.as_deref())?;
         let conn = self.db.lock().map_err(|_| SlotStoreError::LockPoisoned)?;
-        let changed = conn
-            .execute(
-                "UPDATE network_slots SET pod_netns_path = ?1, updated_at = ?2
-             WHERE slot_id = ?3 AND generation = ?4 AND state = ?5 AND pod_netns_path IS ?6",
-                params![
-                    target,
-                    SqliteU64(now_secs()),
-                    slot,
-                    SqliteU64(generation),
-                    state.as_str(),
-                    previous
-                ],
-            )
-            .map_err(SlotStoreError::from)?;
+        let changed = slots::hand_off_namespace(
+            &conn,
+            slot,
+            generation,
+            state,
+            previous.as_deref(),
+            target,
+            now_secs(),
+        )
+        .map_err(SlotStoreError::from)?;
         if changed != 1 {
             return Err(NetworkHandoffError::Superseded { slot, generation });
         }
@@ -1384,27 +1210,14 @@ impl NetworkPool {
         claim: &EphemeralSlotClaim,
     ) -> Result<(), AllocateSlotError> {
         let conn = self.db.lock().map_err(|_| SlotStoreError::LockPoisoned)?;
-        let changed = conn
-            .execute(
-                concat!(
-                    "UPDATE network_slots
-                     SET state = 'leased', health = 'healthy', last_error = NULL,
-                         ",
-                    clear_cleanup_reset_retry_sql!(),
-                    ",
-                         updated_at = ?1
-                     WHERE slot_id = ?2 AND generation = ?3 AND sandbox_id = ?4
-                       AND state = 'leasing' AND lease_kind = ?5"
-                ),
-                params![
-                    SqliteU64(now_secs()),
-                    claim.info.slot,
-                    SqliteU64(claim.info.generation),
-                    claim.info.sandbox_id,
-                    LeaseKind::Ephemeral.as_str(),
-                ],
-            )
-            .map_err(SlotStoreError::from)?;
+        let changed = slots::mark_ephemeral_leased(
+            &conn,
+            claim.info.slot,
+            claim.info.generation,
+            &claim.info.sandbox_id,
+            now_secs(),
+        )
+        .map_err(SlotStoreError::from)?;
         if changed == 1 {
             self.mark_node_status_dirty();
             Ok(())
@@ -1483,48 +1296,21 @@ impl NetworkPool {
         increment_quarantine: bool,
     ) -> Result<(), SlotStoreError> {
         let conn = self.db.lock().map_err(|_| SlotStoreError::LockPoisoned)?;
-        let sql = if increment_quarantine {
-            concat!(
-                "UPDATE network_slots
-                     SET state = ?1, health = ?2,
-                         sandbox_id = NULL, sandbox_uid = NULL, pid = NULL,
-                         lease_kind = ?3, memory_reservation_mib = NULL,
-                         ",
-                clear_cleanup_reset_retry_sql!(),
-                ",
-                         last_error = ?4, updated_at = ?5,
-                         quarantine_count = quarantine_count + 1
-                     WHERE slot_id = ?6 AND generation = ?7 AND sandbox_id = ?8
-                   AND state = 'leasing' AND lease_kind = ?9"
-            )
-        } else {
-            concat!(
-                "UPDATE network_slots
-                     SET state = ?1, health = ?2,
-                         sandbox_id = NULL, sandbox_uid = NULL, pid = NULL,
-                         lease_kind = ?3, memory_reservation_mib = NULL,
-                         ",
-                clear_cleanup_reset_retry_sql!(),
-                ",
-                         last_error = ?4, updated_at = ?5
-                     WHERE slot_id = ?6 AND generation = ?7 AND sandbox_id = ?8
-                   AND state = 'leasing' AND lease_kind = ?9"
-            )
+        let failure = slots::EphemeralSetupFailure {
+            slot_id: claim.info.slot,
+            generation: claim.info.generation,
+            sandbox_id: &claim.info.sandbox_id,
+            state,
+            health,
+            error,
+            now: now_secs(),
         };
-        match conn.execute(
-            sql,
-            params![
-                state.as_str(),
-                health.as_str(),
-                LeaseKind::Pooled.as_str(),
-                error,
-                SqliteU64(now_secs()),
-                claim.info.slot,
-                SqliteU64(claim.info.generation),
-                claim.info.sandbox_id,
-                LeaseKind::Ephemeral.as_str(),
-            ],
-        ) {
+        let result = if increment_quarantine {
+            slots::quarantine_ephemeral_setup(&conn, &failure)
+        } else {
+            slots::fail_ephemeral_setup(&conn, &failure)
+        };
+        match result {
             Ok(changed) => {
                 if changed > 0 {
                     self.mark_node_status_dirty();
@@ -1565,19 +1351,12 @@ impl NetworkPool {
 
     fn mark_ephemeral_for_cleanup(&self, claim: &EphemeralSlotClaim) -> Result<(), SlotStoreError> {
         let conn = self.db.lock().map_err(|_| SlotStoreError::LockPoisoned)?;
-        conn.execute(
-            "UPDATE network_slots SET state = 'dirty', health = 'degraded',
-                 memory_reservation_mib = NULL,
-                 last_error = 'ephemeral completion failed; cleanup required', updated_at = ?1
-             WHERE slot_id = ?2 AND generation = ?3 AND sandbox_id = ?4
-               AND state = 'leasing' AND lease_kind = ?5",
-            params![
-                SqliteU64(now_secs()),
-                claim.info.slot,
-                SqliteU64(claim.info.generation),
-                claim.info.sandbox_id,
-                LeaseKind::Ephemeral.as_str()
-            ],
+        slots::dirty_failed_ephemeral_completion(
+            &conn,
+            claim.info.slot,
+            claim.info.generation,
+            &claim.info.sandbox_id,
+            now_secs(),
         )?;
         self.mark_node_status_dirty();
         Ok(())
@@ -1589,49 +1368,32 @@ impl NetworkPool {
                 .db
                 .lock()
                 .map_err(|error| format!("slot pool db lock poisoned: {error}"))?;
-            let tx = conn.transaction().map_err(|e| e.to_string())?;
-            let Some(record) =
-                query_current_lease_by_sandbox(&tx, sandbox_id).map_err(|e| e.to_string())?
+            let tx = Transaction::deferred(&mut conn).map_err(|e| e.to_string())?;
+            let Some(current) =
+                slots::lease_to_release(&tx, sandbox_id).map_err(|e| e.to_string())?
             else {
                 return Ok(None);
             };
+            let record = SlotRecord::from(current.row().clone());
             match record.state {
                 SlotState::Dirty | SlotState::Resetting => return Ok(Some(record.info)),
                 SlotState::Leased | SlotState::Leasing => {
                     let Some(lease) = LeaseKey::from_record(&record) else {
-                        tx.execute(
-                            "UPDATE network_slots
-                             SET state = 'quarantined', health = 'invalid',
-                                 last_error = 'active slot has no sandbox lease',
-                                 updated_at = ?1,
-                                 quarantine_count = quarantine_count + 1
-                             WHERE slot_id = ?2",
-                            params![SqliteU64(now_secs()), record.info.slot],
-                        )
-                        .map_err(|e| e.to_string())?;
+                        current
+                            .quarantine_unowned(now_secs())
+                            .map_err(|e| e.to_string())?;
                         tx.commit().map_err(|e| e.to_string())?;
                         self.mark_node_status_dirty();
                         return Ok(Some(record.info));
                     };
-                    let changed = tx
-                        .execute(
-                            // Keep sandbox_id/sandbox_uid on dirty slots as previous-lease
-                            // metadata. Active lease lookups only consider leasing/leased, so
-                            // the same sandbox can acquire a new slot while reset still knows
-                            // which retained cache UID must be scrubbed before reuse.
-                            "UPDATE network_slots
-                         SET state = 'dirty', health = 'unknown',
-                             memory_reservation_mib = NULL, updated_at = ?1
-                         WHERE slot_id = ?2 AND generation = ?3 AND sandbox_id = ?4
-                           AND state IN ('leasing', 'leased')",
-                            params![
-                                SqliteU64(now_secs()),
-                                lease.slot_id,
-                                SqliteU64(lease.generation),
-                                lease.sandbox_id
-                            ],
-                        )
-                        .map_err(|e| e.to_string())?;
+                    let changed = slots::release_lease(
+                        &tx,
+                        lease.slot_id,
+                        lease.generation,
+                        &lease.sandbox_id,
+                        now_secs(),
+                    )
+                    .map_err(|e| e.to_string())?;
                     if changed == 0 {
                         return Err(format!(
                             "network lease changed while releasing sandbox {sandbox_id}"
@@ -1665,10 +1427,10 @@ impl NetworkPool {
             .db
             .lock()
             .map_err(|_| ActiveLeaseMemoryReservationError::LockPoisoned)?;
-        query_active_memory_reservations(&conn)?
+        slots::active_memory_reservations(&conn)?
             .into_iter()
             .map(
-                |MemoryReservationRow {
+                |slots::MemoryReservationRow {
                      slot_id,
                      sandbox_id,
                      generation,
@@ -1701,14 +1463,11 @@ impl NetworkPool {
         sandbox_id: &str,
     ) -> Result<Vec<SlotInfo>, SlotStoreError> {
         let conn = self.db.lock().map_err(|_| SlotStoreError::LockPoisoned)?;
-        let records = query_records(
-            &conn,
-            Some((
-                "sandbox_id = ?1 AND state IN ('dirty', 'resetting')",
-                sandbox_id,
-            )),
-        )?;
-        Ok(records.into_iter().map(|record| record.info).collect())
+        let rows = slots::previous_leases(&conn, sandbox_id)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| SlotRecord::from(row).info)
+            .collect())
     }
 
     /// Transfer a validated lease to the lifecycle owner immediately before host work.
@@ -1759,6 +1518,13 @@ impl NetworkPool {
         Ok(Some(record.info))
     }
 
+    /// Whether a startup lease is still inside its handoff grace at `now`.
+    fn startup_lease_is_young(&self, key: &LeaseKey, now: u64) -> bool {
+        self.startup_young_leases
+            .get(key)
+            .is_some_and(|grace_ends| now < *grace_ends)
+    }
+
     // Caller holds db. Never acquire db while holding startup_leases.
     fn adopt_record(&self, record: &SlotRecord) -> Result<(), SlotStoreError> {
         if let Some(key) = LeaseKey::from_record(record) {
@@ -1789,23 +1555,13 @@ impl NetworkPool {
 
     pub fn all_records(&self) -> Result<Vec<SlotRecord>, SlotStoreError> {
         let conn = self.db.lock().map_err(|_| SlotStoreError::LockPoisoned)?;
-        Ok(query_records(&conn, None)?)
+        Ok(query_all_records(&conn)?)
     }
 
     pub fn counts(&self) -> Result<PoolCounts, SlotStoreError> {
         let conn = self.db.lock().map_err(|_| SlotStoreError::LockPoisoned)?;
         let mut counts = PoolCounts::default();
-        let mut stmt = conn
-            .prepare("SELECT state, health, COUNT(*) FROM network_slots GROUP BY state, health")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, u32>(2)?,
-            ))
-        })?;
-        for row in rows {
-            let (state, health, count) = row?;
+        for (state, health, count) in slots::state_health_counts(&conn)? {
             let parsed_state = state.parse::<SlotState>()?;
             let parsed_health = health.parse::<SlotHealth>()?;
             counts.total += count;
@@ -1830,12 +1586,12 @@ impl NetworkPool {
 
     pub fn is_draining(&self) -> Result<bool, SlotStoreError> {
         let conn = self.db.lock().map_err(|_| SlotStoreError::LockPoisoned)?;
-        Ok(meta_bool(&conn, "draining")?)
+        Ok(meta::meta_bool(&conn, "draining")?)
     }
 
     pub fn set_draining(&self, draining: bool) -> Result<(), String> {
         let conn = self.db.lock().map_err(|e| e.to_string())?;
-        set_meta_bool(&conn, "draining", draining).map_err(|e| e.to_string())?;
+        meta::set_meta_bool(&conn, "draining", draining, now_secs()).map_err(|e| e.to_string())?;
         if !draining {
             self.nudge_topup();
         }
@@ -1846,22 +1602,7 @@ impl NetworkPool {
     pub fn repair(&self, rebuild_quarantined: bool) -> Result<PoolRepairResult, String> {
         if rebuild_quarantined {
             let conn = self.db.lock().map_err(|e| e.to_string())?;
-            conn.execute(
-                concat!(
-                    "UPDATE network_slots
-                     SET state = 'missing', health = 'degraded',
-                         last_error = 'operator requested quarantined slot rebuild',
-                         sandbox_id = NULL, sandbox_uid = NULL, pid = NULL,
-                         lease_kind = ?1, memory_reservation_mib = NULL,
-                         ",
-                    clear_cleanup_reset_retry_sql!(),
-                    ",
-                         updated_at = ?2
-                     WHERE state = 'quarantined' AND sandbox_id IS NULL"
-                ),
-                params![LeaseKind::Pooled.as_str(), SqliteU64(now_secs())],
-            )
-            .map_err(|e| e.to_string())?;
+            slots::rebuild_idle_quarantined(&conn, now_secs()).map_err(|e| e.to_string())?;
         }
 
         let reset_enqueued = self
@@ -1914,7 +1655,7 @@ impl NetworkPool {
 
     fn enqueue_pending_resets(&self) -> Result<u32, SlotStoreError> {
         let conn = self.db.lock().map_err(|_| SlotStoreError::LockPoisoned)?;
-        let count = query_pending_reset_count(&conn)?;
+        let count = slots::pending_reset_count(&conn)?;
         drop(conn);
         self.nudge_topup();
         Ok(count)
@@ -2015,22 +1756,15 @@ fn retire_stale_pod_namespace_lease(
         "retired stale network lease for sandbox {} after pod namespace {:?} disappeared; requested {:?}",
         record.info.sandbox_id, record.info.pod_netns, requested_pod_netns
     );
-    let changed = tx
-        .execute(
-            "UPDATE network_slots
-             SET state = 'dirty', health = 'degraded',
-                 last_error = ?1, updated_at = ?2
-             WHERE slot_id = ?3 AND generation = ?4 AND sandbox_id = ?5
-               AND state = 'leased'",
-            params![
-                last_error,
-                SqliteU64(now_secs()),
-                record.info.slot,
-                SqliteU64(record.info.generation),
-                record.info.sandbox_id,
-            ],
-        )
-        .map_err(SlotStoreError::from)?;
+    let changed = slots::retire_stale_pod_namespace_lease(
+        tx,
+        record.info.slot,
+        record.info.generation,
+        &record.info.sandbox_id,
+        &last_error,
+        now_secs(),
+    )
+    .map_err(SlotStoreError::from)?;
     if changed != 1 {
         return Err(AllocateSlotError::InProgress(format!(
             "stale network lease changed while retiring sandbox {}",
@@ -2052,11 +1786,15 @@ fn retire_stale_pod_namespace_lease(
 mod claim_contention_tests;
 mod db;
 mod execution;
+#[cfg(target_os = "linux")]
+pub(crate) mod firewall_rules;
 mod liveness;
 #[cfg(test)]
 mod node_status_tests;
 mod reset;
 mod scheduler;
+#[cfg(test)]
+mod slot_guard_tests;
 mod startup_containment;
 use liveness::{LeaseLiveness, lease_liveness, lease_may_be_live};
 #[cfg(test)]

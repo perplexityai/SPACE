@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	gatewaypb "github.com/perplexityai/SPACE/shim/proto/net/gateway/v1"
 	pb "github.com/perplexityai/SPACE/shim/proto/sandbox/manager/v1"
 )
 
@@ -188,10 +189,90 @@ func TestARuntimeUpgradePodRunsTheUpgradedExecution(t *testing.T) {
 			if start.GetRouteIdentity().GetPodUid() != upgradeTestPodUID || start.GetRouteIdentity().GetExecutionGeneration() != 4 {
 				t.Fatalf("the upgrade's start must carry the pod's route identity: %+v", start.GetRouteIdentity())
 			}
+			if request.AttemptId == nil || request.GetAttemptId() != upgradeTestPodUID {
+				t.Fatalf("the upgrade must run as the pod's attempt, named by its pod UID: %v", request.AttemptId)
+			}
 			if request.StageFrom != nil || request.CheckpointLocalArtifactId != nil {
 				t.Fatalf("a stopped source has nothing to stage or check: %+v", request)
 			}
 		})
+	}
+}
+
+// The attempt is kubelet's pod UID, falling back to the CRI sandbox UID,
+// and never space.pplx.net/pod-uid, which the control plane writes and a
+// replacement pod could inherit. A pod with neither is refused, since its
+// route identity could only name that annotation's pod.
+func TestARuntimeUpgradeRunsAsKubeletsPodUID(t *testing.T) {
+	const criSandboxUID = "7c1e2d3f-4a5b-4c6d-8e7f-9a0b1c2d3e40"
+	const annotatedPodUID = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c50"
+	for _, tc := range []struct {
+		name        string
+		annotations map[string]string
+		want        *string
+	}{
+		{"kubelet's pod UID", map[string]string{sandboxPodUIDAnnotation: annotatedPodUID}, ptr(upgradeTestPodUID)},
+		{"the CRI sandbox UID", map[string]string{kubernetesPodUIDAnnotation: "", kubernetesCriSandboxUIDAnnotation: criSandboxUID}, ptr(criSandboxUID)},
+		{"not the control plane's annotation", map[string]string{kubernetesPodUIDAnnotation: " ", sandboxPodUIDAnnotation: annotatedPodUID}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			annotations := runtimeUpgradeAnnotationsFor("started", false)
+			for key, value := range tc.annotations {
+				annotations[key] = value
+			}
+			intent, err := (&ociSpec{Annotations: annotations}).sandboxRuntimeUpgrade()
+			if tc.want == nil {
+				if err == nil || !strings.Contains(err.Error(), kubernetesCriSandboxUIDAnnotation) {
+					t.Fatalf("sandboxRuntimeUpgrade() error = %v, want a refusal naming the kubelet UIDs", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("sandboxRuntimeUpgrade() error = %v", err)
+			}
+			start := &pb.StartRequest{
+				SandboxId:     upgradeTestSandboxID,
+				RouteIdentity: &gatewaypb.SpaceApiRouteIdentity{PodUid: ptr(annotatedPodUID)},
+			}
+			got := runtimeUpgradeRequest(start, intent).AttemptId
+			switch {
+			case tc.want == nil && got != nil:
+				t.Fatalf("attempt id = %q, want none", *got)
+			case tc.want != nil && (got == nil || *got != *tc.want):
+				t.Fatalf("attempt id = %v, want %q", got, *tc.want)
+			}
+		})
+	}
+}
+
+// An answer that names another attempt isn't this pod's, for either target
+// state: the create fails and never runs, releases or falls back to Start.
+// An answer naming the pod's own attempt, or none, is the pod's.
+func TestARuntimeUpgradeAnswerForAnotherAttemptFailsTheCreate(t *testing.T) {
+	const otherAttempt = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c50"
+	for _, targetState := range []string{"started", "stopped"} {
+		for _, tc := range []struct {
+			attempt *string
+			ok      bool
+		}{{ptr(otherAttempt), false}, {ptr(upgradeTestPodUID), true}, {nil, true}} {
+			t.Run(targetState, func(t *testing.T) {
+				client := answering(&pb.UpgradeRuntimeResponse{
+					Outcome:   pb.RuntimeUpgradeOutcome_RUNTIME_UPGRADE_OUTCOME_UPGRADED,
+					Start:     &pb.StartResponse{Pid: 77},
+					AttemptId: tc.attempt,
+				}, nil)
+				_, _, err := createRuntimeUpgradePod(t, client, runtimeUpgradeAnnotationsFor(targetState, false))
+				if tc.ok && err != nil {
+					t.Fatalf("Create() error = %v, want the pod's own answer accepted", err)
+				}
+				if !tc.ok && (err == nil || !strings.Contains(err.Error(), otherAttempt)) {
+					t.Fatalf("Create() error = %v, want a refusal naming attempt %s", err, otherAttempt)
+				}
+				if client.starts != 0 || client.states != 0 {
+					t.Fatalf("starts:%d states:%d, want no fallback", client.starts, client.states)
+				}
+			})
+		}
 	}
 }
 
@@ -301,7 +382,7 @@ func TestRuntimeUpgradeAnnotationsAreParsedStrictly(t *testing.T) {
 // control plane actually writes rather than a copy of its keys.
 func renderedPodAnnotations(t *testing.T, shape string) map[string]string {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join("..", "crates", "libs", "common", "core", "src", "fixtures", shape+".snap"))
+	data, err := os.ReadFile(filepath.Join("..", "crates", "l40_api", "sandbox", "pod", "fixtures", shape+".snap"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,6 +425,8 @@ func TestTheShimParsesEveryRenderedRuntimeUpgradePod(t *testing.T) {
 	} {
 		t.Run(tc.shape, func(t *testing.T) {
 			spec := &ociSpec{Annotations: renderedPodAnnotations(t, tc.shape)}
+			// The node, not the control plane, adds the pod's own UID at create.
+			spec.Annotations[kubernetesPodUIDAnnotation] = upgradeTestPodUID
 			checkpoint, _, useStart, err := spec.sandboxStartIntent()
 			if err != nil || !useStart || checkpoint == nil || *checkpoint != runtimeUpgradeCheckpoint {
 				t.Fatalf("start intent: checkpoint=%v useStart=%v err=%v", checkpoint, useStart, err)
@@ -367,6 +450,38 @@ func TestTheShimParsesEveryRenderedRuntimeUpgradePod(t *testing.T) {
 			}
 			if request.GetAuthorization().GetMemoryLoss() != tc.stages {
 				t.Fatalf("memory loss = %v", request.GetAuthorization().GetMemoryLoss())
+			}
+		})
+	}
+}
+
+func TestUpgradeClosureUsesTheActualPodForBothIdentities(t *testing.T) {
+	const prior = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c50"
+	for _, tc := range []struct{ name, pod, cri string }{
+		{"pod UID and stale control-plane annotation", upgradeTestPodUID, ""},
+		{"CRI UID and stale control-plane annotation", "", upgradeTestPodUID},
+		{"conflicting pod and CRI UIDs", prior, upgradeTestPodUID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := runtimeUpgradeAnnotationsFor("started", false)
+			a[kubernetesPodUIDAnnotation], a[kubernetesCriSandboxUIDAnnotation], a[sandboxPodUIDAnnotation] = tc.pod, tc.cri, prior
+			client := answering(&pb.UpgradeRuntimeResponse{Outcome: pb.RuntimeUpgradeOutcome_RUNTIME_UPGRADE_OUTCOME_ALREADY_ON_TARGET, Start: &pb.StartResponse{Pid: 4242}}, nil)
+			_, _, err := createRuntimeUpgradePod(t, client, a)
+			if tc.pod != "" && tc.cri != "" {
+				if err == nil || !strings.Contains(err.Error(), kubernetesPodUIDAnnotation) || !strings.Contains(err.Error(), kubernetesCriSandboxUIDAnnotation) || len(client.upgrades) != 0 {
+					t.Fatalf("conflicting UIDs: error = %v, %d upgrade requests; want a refusal naming both and none sent", err, len(client.upgrades))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Create() error = %v", err)
+			}
+			if len(client.upgrades) != 1 {
+				t.Fatalf("sent %d upgrade requests", len(client.upgrades))
+			}
+			req := client.upgrades[0]
+			if req.GetAttemptId() != upgradeTestPodUID || req.GetStart().GetRouteIdentity().GetPodUid() != upgradeTestPodUID {
+				t.Fatalf("upgrade has attempt %q and route pod %q, actual pod %q", req.GetAttemptId(), req.GetStart().GetRouteIdentity().GetPodUid(), upgradeTestPodUID)
 			}
 		})
 	}

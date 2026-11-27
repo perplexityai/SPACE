@@ -9,7 +9,7 @@ struct TemplateExportFile {
 
 fn compressed_template_export_files(
     build_path: &Path,
-    manifest: &pplx_space_common_core::types::TemplateManifest,
+    manifest: &pplx_space_template_manifest::TemplateManifest,
 ) -> Option<Vec<TemplateExportFile>> {
     let compressed_rootfs_path = build_path.join(TEMPLATE_ROOTFS_ZSTD_FILE);
     if !compressed_rootfs_path.is_file() || !manifest_has_compressed_rootfs_entry(manifest) {
@@ -59,10 +59,12 @@ impl TemplateManagerService {
                 crate::volume::FindReleaseError::NotFound => {
                     Status::not_found("template release not found")
                 }
-                crate::volume::FindReleaseError::Unavailable => {
+                crate::volume::FindReleaseError::Unavailable
+                | crate::volume::FindReleaseError::SelectorIgnored { .. } => {
                     Status::unavailable("cluster metadata unavailable")
                 }
-                crate::volume::FindReleaseError::InvalidResponse => {
+                crate::volume::FindReleaseError::InvalidResponse
+                | crate::volume::FindReleaseError::InvalidBinding { .. } => {
                     Status::failed_precondition("cluster did not return an exact release")
                 }
                 crate::volume::FindReleaseError::Status(status) => status,
@@ -74,7 +76,7 @@ impl TemplateManagerService {
             super::lookup::requested_cache_partition(tmpl_ref.environment.as_deref())?;
 
         // Verify build exists and is ready
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let name = template_id.clone();
         let hash = content_hash.clone();
         let build = tokio::task::spawn_blocking(move || {
@@ -131,7 +133,7 @@ impl TemplateManagerService {
                 "firmware templates cannot be exported or distributed",
             ));
         }
-        let manifest: pplx_space_common_core::types::TemplateManifest =
+        let manifest: pplx_space_template_manifest::TemplateManifest =
             serde_json::from_slice(&manifest_json)
                 .map_err(|error| Status::data_loss(error.to_string()))?;
         let (rootfs_hash, mut files) = if let Some(files) =

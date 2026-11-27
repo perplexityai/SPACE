@@ -44,6 +44,39 @@ async fn retained_writer_capacity_preserves_cleanup_progress_and_releases_slots(
 }
 
 #[tokio::test]
+async fn stats_is_served_while_lifecycle_writers_hold_every_slot() {
+    let manager = test_service();
+    let mut service =
+        manager
+            .restart_admission_layer()
+            .layer(tower::service_fn(|_request: Request<()>| async {
+                Ok::<_, Infallible>(Response::new(tonic::body::Body::default()))
+            }));
+    let _slow_writers = (0..super::super::drain::MAX_ACTIVE_STATE_WRITERS)
+        .map(|_| manager.state_writer_lease("SlowWriter").unwrap())
+        .collect::<Vec<_>>();
+    let mut statuses = Vec::new();
+    for path in [
+        "/space.sandbox.manager.v1.SandboxManager/Create",
+        "/space.sandbox.manager.v1.SandboxManager/Stats",
+    ] {
+        let response = service
+            .call(Request::builder().uri(path).body(()).unwrap())
+            .await
+            .unwrap();
+        statuses.push(
+            response
+                .headers()
+                .get("grpc-status")
+                .map(|value| value.to_str().unwrap().to_string()),
+        );
+    }
+    // A lifecycle call gets RESOURCE_EXHAUSTED; a stats poll still reaches
+    // its handler.
+    assert_eq!(statuses, [Some("8".to_string()), None]);
+}
+
+#[tokio::test]
 async fn critical_worker_exit_preserves_failure_status_through_shutdown() {
     for (expected_exit, panic) in [(true, false), (false, false), (false, true)] {
         let manager = test_service();
@@ -173,6 +206,9 @@ async fn restart_drain_rejects_writers_but_serves_both_read_classes() {
     for path in [
         "/space.sandbox.manager.v1.SandboxManager/List",
         "/space.sandbox.manager.v1.SandboxManager/SpacedStat",
+        // A drain preview only reads, so a restart drain still serves it.
+        "/space.sandbox.manager.v1.SandboxManager/PreviewDrainNode",
+        "/space.sandbox.manager.v1.SandboxManager/Stats",
     ] {
         let response = service
             .call(Request::builder().uri(path).body(()).unwrap())
@@ -187,7 +223,6 @@ async fn restart_drain_rejects_writers_but_serves_both_read_classes() {
         );
     }
     for path in [
-        "/space.sandbox.manager.v1.SandboxManager/Stats",
         "/space.sandbox.manager.v1.SandboxManager/EvictClusterDeletedSandbox",
         "/space.spaced.host.control.v1.HostControl/SetActivityState",
         "/space.spaced.host.control.v1.HostControl/IssueGatewayIntermediateCertificate",
@@ -211,7 +246,7 @@ async fn restart_drain_rejects_writers_but_serves_both_read_classes() {
             Some("true")
         );
     }
-    assert_eq!(calls.load(Ordering::Acquire), 2);
+    assert_eq!(calls.load(Ordering::Acquire), 4);
 }
 
 #[tokio::test]
@@ -312,7 +347,8 @@ async fn cancelled_activation_retries_release_admission_without_releasing_the_lo
     use crate::service::activation_support::internal_request;
     use crate::service::tests::service_tests::insert_test_sandbox;
     use crate::state::SandboxState;
-    use pplx_space_common_core::types::{NodeId, SandboxActivationAttemptId, SandboxId};
+    use pplx_space_accounts::NodeId;
+    use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId};
 
     enum LockSite {
         Staging,
@@ -517,7 +553,7 @@ async fn activation_admission_bounds_live_waiters_and_rejects_cancelled_ready_wo
 async fn blocking_wake_without_client_deadline_has_bounded_passive_wait() {
     use crate::service::tests::service_tests::insert_test_sandbox;
     use crate::state::SandboxState;
-    use pplx_space_common_core::types::SandboxId;
+    use pplx_space_sandbox_model::SandboxId;
 
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new().to_string();

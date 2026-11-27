@@ -12,21 +12,22 @@
 //! per queue row, which no answer test can see, so
 //! `the_delete_guard_resolves_through_indexes_not_a_history_scan` reads the
 //! plan instead. It lives beside the real statement in
-//! `crates/l40_api/internal/api/server/src/node_local_backup_pending.rs`,
+//! `crates/l30_storage/sandbox/store/src/node_local_backup_pending.rs`,
 //! because the plan belongs to a whole statement rather than to this
-//! fragment, and this crate cannot depend on internal-api.
+//! fragment, and this crate cannot depend on the store that composes it.
 //!
 //! The `MarkerlessFresh` row is the one to look at first if this file ever
 //! goes red on a predicate change: it is the case a timestamp-based
 //! supersession test gets wrong, and the whole reason the predicate is keyed
 //! on artifact identity instead.
 
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxId;
 
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{
     SEED_ORG_ID, SEED_USER_ID, insert_ready_worker_node, try_pg_test_db,
 };
+use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 use uuid::Uuid;
 

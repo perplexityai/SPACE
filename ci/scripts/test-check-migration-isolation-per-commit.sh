@@ -6,6 +6,7 @@ unset MIGRATION_ISOLATION_BASE_REF MIGRATION_VERSION_GUARD_BASE_REF BUILDKITE_BR
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 checker="${repo_root}/ci/scripts/check-migration-isolation-per-commit.sh"
 guard="${repo_root}/scripts/check-postgres-migrations-isolated.sh"
+base_helper="${repo_root}/scripts/lib/migration-base.sh"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
 
@@ -13,8 +14,9 @@ fixture="${tmp_dir}/repo"
 git init -q -b main "${fixture}"
 git -C "${fixture}" config user.name test
 git -C "${fixture}" config user.email test@example.com
-mkdir -p "${fixture}/scripts"
+mkdir -p "${fixture}/scripts/lib"
 cp "${guard}" "${fixture}/scripts/check-postgres-migrations-isolated.sh"
+cp "${base_helper}" "${fixture}/scripts/lib/migration-base.sh"
 git -C "${fixture}" add .
 git -C "${fixture}" commit -q -m base
 

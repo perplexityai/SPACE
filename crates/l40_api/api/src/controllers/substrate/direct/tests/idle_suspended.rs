@@ -147,7 +147,7 @@ async fn wake_restores_an_idle_suspended_sandbox_on_its_artifact_node(
         &sandbox,
         Duration::from_secs(5),
         wake_activity,
-        crate::controllers::substrate::RecoveryCharge::Exempt,
+        crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
     ))
     .await?;
 
@@ -234,7 +234,7 @@ async fn implicit_wake_of_an_idle_suspended_sandbox_honors_the_local_override() 
             &sandbox,
             Duration::from_secs(5),
             Some(ExecutionActivityKind::Command),
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         ))
         .await;
 
@@ -349,7 +349,7 @@ async fn implicit_access_wake_of_a_target_only_row_honors_the_local_override() -
             &sandbox,
             ExecutionActivityKind::Access,
             Duration::from_secs(5),
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         ))
         .await;
 
@@ -690,7 +690,7 @@ async fn wake_adopts_a_live_record_on_its_artifact_node(#[case] case: Case) -> T
         &sandbox,
         Duration::from_secs(5),
         None,
-        crate::controllers::substrate::RecoveryCharge::Exempt,
+        crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
     ))
     .await;
 
@@ -887,7 +887,7 @@ async fn wake_adopts_a_started_record_only_at_its_route_identity() -> TestResult
                         &sandbox,
                         Duration::from_secs(5),
                         None,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                     ))
                     .await
                     .map(drop)
@@ -897,7 +897,7 @@ async fn wake_adopts_a_started_record_only_at_its_route_identity() -> TestResult
                         &sandbox,
                         ExecutionActivityKind::Access,
                         Duration::from_secs(5),
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                     ))
                     .await
                     .map(drop)
@@ -1031,7 +1031,7 @@ async fn lookup_of_a_started_row_without_an_active_node_adopts_its_live_record()
 
         let result = Box::pin(fixture.substrate.runtime_client(
             sandbox_id,
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         ))
         .await;
 
@@ -1089,7 +1089,7 @@ async fn wake_of_a_placed_suspended_sandbox_still_asks_its_worker() -> TestResul
         &sandbox,
         Duration::from_secs(5),
         None,
-        crate::controllers::substrate::RecoveryCharge::Exempt,
+        crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
     ))
     .await?;
 
@@ -1153,5 +1153,69 @@ async fn delete_without_any_node_placement_stays_unavailable() -> TestResult {
         matches!(error, SubstrateError::Unavailable { .. }),
         "{error:?}"
     );
+    Ok(())
+}
+
+/// An implicit access wake the sandbox's own policy does not allow is refused
+/// before it reaches the node, naming the sandbox and the state it rests in,
+/// which the Native routes answer with `createCommand`'s refusal details.
+#[tokio::test(flavor = "current_thread")]
+async fn an_access_wake_the_sandbox_policy_refuses_names_the_sandbox_at_rest() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let sandbox_id = SandboxId::new();
+    let node_id = NodeId::new();
+    let (server, state) = start_sim_worker(node_id).await?;
+    seed_idle_suspended(
+        &fixture.pool,
+        &state,
+        sandbox_id,
+        node_id,
+        server.endpoint(),
+    )
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET auto_lifecycle_json = $2 WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(sqlx::types::Json(crate::e2b::auto_lifecycle_policy(
+        60, true, false,
+    )))
+    .execute(&fixture.pool)
+    .await?;
+    let sandbox = crate::controllers::sandbox::fetch_sandbox(&fixture.pool, sandbox_id)
+        .await?
+        .expect("sandbox row");
+
+    let error = match Box::pin(fixture.substrate.access_runtime_client(
+        crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("files_read"),
+        &sandbox,
+        ExecutionActivityKind::Access,
+        Duration::from_secs(5),
+        crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
+    ))
+    .await
+    {
+        Ok(_) => panic!("a policy that does not wake on access must not restore"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.status(), axum::http::StatusCode::CONFLICT);
+    assert_eq!(
+        error.sandbox_not_running_refusal(),
+        Some(crate::controllers::SandboxNotRunning {
+            sandbox_id,
+            lifecycle: SandboxLifecycle::Suspended,
+        })
+    );
+    assert_eq!(
+        state.get(&sandbox_id.to_string()).await?.status,
+        "suspended"
+    );
+    drop(server);
     Ok(())
 }

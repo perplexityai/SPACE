@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_sql_locator::sql;
 use uuid::Uuid;
 
 use pplx_space_db_test_fixtures::try_pg_test_db;
@@ -51,22 +52,40 @@ fn admin_create_fingerprint_omits_node_pool_key_when_absent() {
 }
 
 #[test]
-fn admin_node_pool_requires_enabled_gate_and_kubernetes_substrate() {
+fn admin_node_pool_requires_enabled_gate_and_substrate_placement() {
     let node_pool = NodePoolName::parse("isolated-test-pool").unwrap();
+    let unsupported = |_: &NodePoolName| {
+        Err(SubstrateError::Unsupported {
+            message: "no node pools here".to_owned(),
+        })
+    };
 
-    let disabled = validate_admin_node_pool(Some(&node_pool), false, true).unwrap_err();
+    // The gate answers first: a substrate that would refuse is never asked.
+    let disabled = validate_admin_node_pool(Some(&node_pool), false, |_| {
+        panic!("the substrate must not be asked while placement is disabled")
+    })
+    .unwrap_err();
     assert_eq!(disabled.status, StatusCode::BAD_REQUEST);
     assert_eq!(disabled.message, "sandbox node-pool placement is disabled");
 
-    let unsupported = validate_admin_node_pool(Some(&node_pool), true, false).unwrap_err();
-    assert_eq!(unsupported.status, StatusCode::BAD_REQUEST);
+    let refused = validate_admin_node_pool(Some(&node_pool), true, unsupported).unwrap_err();
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
     assert_eq!(
-        unsupported.message,
+        refused.message,
         "sandbox node-pool placement requires the Kubernetes substrate"
     );
 
-    validate_admin_node_pool(Some(&node_pool), true, true).unwrap();
-    validate_admin_node_pool(None, false, false).unwrap();
+    let failed = validate_admin_node_pool(Some(&node_pool), true, |_| {
+        Err(SubstrateError::Unavailable {
+            message: "down".to_owned(),
+        })
+    })
+    .unwrap_err();
+    assert_eq!(failed.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(failed.message, "Internal server error");
+
+    validate_admin_node_pool(Some(&node_pool), true, |_| Ok(())).unwrap();
+    validate_admin_node_pool(None, false, unsupported).unwrap();
 }
 
 #[test]
@@ -542,7 +561,7 @@ async fn admin_pinned_create_follows_the_running_substrate() -> TestResult {
     // chooses from the process environment Direct whatever the host sets.
     if !pplx_space_test_env::enter_test_process(&[
         (
-            pplx_space_common_core::env::SANDBOX_ALLOW_PLACEMENT_ENV,
+            SANDBOX_ALLOW_PLACEMENT_ENV,
             Some(std::ffi::OsStr::new("true")),
         ),
         (
@@ -1226,7 +1245,7 @@ mod cross_org_routes {
         assert_eq!(
             data[0]["id"],
             pplx_space_public_api::PublicSnapshotId::from(
-                pplx_space_common_core::types::SnapshotId::from_uuid(snapshot_id)
+                pplx_space_snapshot_model::SnapshotId::from_uuid(snapshot_id)
             )
             .to_string()
         );
@@ -1597,7 +1616,7 @@ mod cross_org_routes {
                 answers[0],
                 Some(serde_json::Value::String(
                     pplx_space_public_api::PublicSnapshotId::from(
-                        pplx_space_common_core::types::SnapshotId::from_uuid(snapshot_id)
+                        pplx_space_snapshot_model::SnapshotId::from_uuid(snapshot_id)
                     )
                     .to_string()
                 )),
@@ -1637,6 +1656,72 @@ mod cross_org_routes {
                 "{path}: {error}"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_create_validates_sandbox_request_limits() -> TestResult {
+        use pplx_space_public_api::limits::MIN_SANDBOX_MEMORY_MIB;
+
+        let Some(harness) = admin_router_harness().await? else {
+            return Ok(());
+        };
+        let create = |resources: serde_json::Value| {
+            json!({
+                "org_id": harness.tenant_org,
+                "sandbox": {
+                    "name": null,
+                    "template": "seed",
+                    "runtime": "fc",
+                    "env": {},
+                    "metadata": {},
+                    "resources": resources,
+                },
+            })
+        };
+
+        let (status, error) = harness
+            .as_operator(
+                Method::POST,
+                "/sandboxes",
+                &[("idempotency-key", "create-below-min-memory")],
+                Some(create(json!({ "memory_mib": MIN_SANDBOX_MEMORY_MIB - 1 }))),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert!(
+            error.to_string().contains("resources.memory_mib"),
+            "{error}"
+        );
+        let enqueued: i64 = sqlx::query_scalar(sql!(
+            "SELECT COUNT(*) FROM public_operations WHERE org_id = $1 AND kind = $2"
+        ))
+        .bind(harness.tenant_org.as_uuid())
+        .bind(OperationKind::CreateSandbox.as_str())
+        .fetch_one(&harness.db.pool)
+        .await?;
+        assert_eq!(enqueued, 0, "rejected create must not enqueue an operation");
+
+        let (status, accepted) = harness
+            .as_operator(
+                Method::POST,
+                "/sandboxes",
+                &[("idempotency-key", "create-at-min-memory")],
+                Some(create(json!({ "memory_mib": MIN_SANDBOX_MEMORY_MIB }))),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+
+        let (status, accepted) = harness
+            .as_operator(
+                Method::POST,
+                "/sandboxes",
+                &[("idempotency-key", "create-omitted-resources")],
+                Some(create(serde_json::Value::Null)),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+
         Ok(())
     }
 }

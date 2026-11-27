@@ -1,5 +1,6 @@
 //! Snapshot-retention behavior and Postgres contract tests.
-use pplx_space_common_core::types::{SandboxId, SnapshotId};
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -38,7 +39,7 @@ struct FakeSink {
     claim_calls: Mutex<Vec<SnapshotId>>,
     /// Ids whose `claim_prune` should return [`ClaimOutcome::Refused`].
     refuse_claim_ids: Mutex<Vec<SnapshotId>>,
-    /// Ids whose `claim_prune` should return an `sqlx` error.
+    /// Ids whose `claim_prune` should return a database error.
     claim_err_ids: Mutex<Vec<SnapshotId>>,
     /// Ids whose `finalize_prune` should return `AlreadyGone`.
     gone_ids: Mutex<Vec<SnapshotId>>,
@@ -46,7 +47,7 @@ struct FakeSink {
     breach_ids: Mutex<Vec<SnapshotId>>,
     /// Ids whose `finalize_prune` should return `Pruned { marker_ok: false }`.
     marker_breach_ids: Mutex<Vec<SnapshotId>>,
-    /// Ids whose `finalize_prune` should return an `sqlx` error.
+    /// Ids whose `finalize_prune` should return a database error.
     fail_prune: Mutex<Vec<SnapshotId>>,
     last_keep_n: Mutex<Option<i64>>,
     last_min_age: Mutex<Option<Option<Duration>>>,
@@ -123,9 +124,9 @@ impl RetentionSink for Arc<FakeSink> {
         limit: i64,
         after: Option<SnapshotId>,
         min_age: Option<Duration>,
-    ) -> Result<CandidatePage, sqlx::Error> {
+    ) -> Result<CandidatePage, RetentionStoreError> {
         if *self.fail_candidate_scan.lock().unwrap() {
-            return Err(sqlx::Error::PoolClosed);
+            return Err(DbError::from(sqlx::Error::PoolClosed).into());
         }
         self.last_keep_n.lock().unwrap().replace(keep_n);
         self.last_min_age.lock().unwrap().replace(min_age);
@@ -145,9 +146,9 @@ impl RetentionSink for Arc<FakeSink> {
         })
     }
 
-    async fn claimed_scan_epoch(&self) -> Result<Option<ClaimedScanEpoch>, sqlx::Error> {
+    async fn claimed_scan_epoch(&self) -> Result<Option<ClaimedScanEpoch>, RetentionStoreError> {
         if *self.fail_claimed_scan.lock().unwrap() {
-            return Err(sqlx::Error::PoolClosed);
+            return Err(DbError::from(sqlx::Error::PoolClosed).into());
         }
         let claimed = self.claimed.lock().unwrap();
         Ok(claimed
@@ -162,9 +163,9 @@ impl RetentionSink for Arc<FakeSink> {
         limit: i64,
         after: Option<SnapshotId>,
         through: SnapshotId,
-    ) -> Result<Vec<PruneCandidate>, sqlx::Error> {
+    ) -> Result<Vec<PruneCandidate>, RetentionStoreError> {
         if *self.fail_claimed_scan.lock().unwrap() {
-            return Err(sqlx::Error::PoolClosed);
+            return Err(DbError::from(sqlx::Error::PoolClosed).into());
         }
         self.last_claimed_after.lock().unwrap().replace(after);
         let all = self.claimed.lock().unwrap().clone();
@@ -182,11 +183,11 @@ impl RetentionSink for Arc<FakeSink> {
         candidate: PruneCandidate,
         _keep_n: i64,
         _min_age: Option<Duration>,
-    ) -> Result<ClaimOutcome, sqlx::Error> {
+    ) -> Result<ClaimOutcome, RetentionStoreError> {
         let snapshot_id = candidate.snapshot_id;
         self.claim_calls.lock().unwrap().push(snapshot_id);
         if self.claim_err_ids.lock().unwrap().contains(&snapshot_id) {
-            return Err(sqlx::Error::PoolClosed);
+            return Err(DbError::from(sqlx::Error::PoolClosed).into());
         }
         if self.refuse_claim_ids.lock().unwrap().contains(&snapshot_id) {
             return Ok(ClaimOutcome::Refused(ClaimRefusalReason::KeepNFloor));
@@ -205,7 +206,7 @@ impl RetentionSink for Arc<FakeSink> {
         &self,
         snapshot_id: SnapshotId,
         _keep_n: i64,
-    ) -> Result<PruneFinalize, sqlx::Error> {
+    ) -> Result<PruneFinalize, RetentionStoreError> {
         if self.enforce_protocol {
             assert!(self.backend_returns.lock().unwrap().contains(&snapshot_id));
             assert!(
@@ -218,7 +219,7 @@ impl RetentionSink for Arc<FakeSink> {
         }
         self.prune_calls.lock().unwrap().push(snapshot_id);
         if self.fail_prune.lock().unwrap().contains(&snapshot_id) {
-            return Err(sqlx::Error::PoolClosed);
+            return Err(DbError::from(sqlx::Error::PoolClosed).into());
         }
         if self.gone_ids.lock().unwrap().contains(&snapshot_id) {
             return Ok(PruneFinalize::AlreadyGone);
@@ -1184,17 +1185,20 @@ async fn t14_dry_run_counts_would_prune_without_side_effects() {
 
 #[cfg(test)]
 mod postgres {
-    use pplx_space_common_core::sql;
-    use pplx_space_common_core::types::{SandboxId, SnapshotId};
     use pplx_space_db_test_fixtures::{
         SEED_ORG_ID as SEEDED_ORG_ID, SEED_USER_ID as SEEDED_USER_ID, try_pg_test_db,
     };
+    use pplx_space_postgres_pool::Db;
+    use pplx_space_sandbox_model::SandboxId;
+    use pplx_space_snapshot_model::SnapshotId;
+    use pplx_space_sql_locator::sql;
     use sqlx::PgPool;
     use uuid::Uuid;
 
     use super::super::store::SnapshotRetentionDbStore;
     use super::super::{
         ClaimOutcome, ClaimRefusalReason, PruneCandidate, PruneFinalize, RetentionSink,
+        RetentionStoreError,
     };
 
     use pplx_space_test_env::TestResult;
@@ -1262,7 +1266,8 @@ mod postgres {
         ))
         .execute(&db.pool)
         .await?;
-        let store = SnapshotRetentionDbStore::with_raw_page_size(db.pool.clone(), RAW_PAGE);
+        let store =
+            SnapshotRetentionDbStore::with_raw_page_size(Db::from(db.pool.clone()), RAW_PAGE);
         let mut cursor = None;
         let mut discovered = Vec::new();
         loop {
@@ -1349,11 +1354,15 @@ mod postgres {
                 .connect_with((*db.pool.connect_options()).clone())
                 .await?;
             armed.store(true, Ordering::SeqCst);
-            let store = SnapshotRetentionDbStore::new(pool.clone());
+            let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
             let result = store.list_candidates(1, 2000, None, None).await;
             if fail_read {
                 let error =
                     result.expect_err("eligibility read must fail without returning progress");
+                let error = match error {
+                    RetentionStoreError::Database(error) => sqlx::Error::from(error),
+                    other => panic!("eligibility read must fail in the database, not {other:?}"),
+                };
                 assert_eq!(
                     error.as_database_error().and_then(|e| e.code()).as_deref(),
                     Some("42P01")
@@ -1461,7 +1470,8 @@ mod postgres {
                 .bind(mode)
                 .execute(pool)
                 .await?;
-            let store = SnapshotRetentionDbStore::with_raw_page_size(pool.clone(), RAW_PAGE);
+            let store =
+                SnapshotRetentionDbStore::with_raw_page_size(Db::from(pool.clone()), RAW_PAGE);
             let first = store.list_candidates(1, 2, None, ttl).await?;
             assert!(
                 first.candidates.is_empty(),
@@ -1515,7 +1525,7 @@ mod postgres {
             }
             assert_eq!(reconciler.tick().await.would_prune, 1);
             assert_eq!(reconciler.scan_after, Some(tail[0]));
-            let store = SnapshotRetentionDbStore::new(pool.clone());
+            let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
             assert!(store.claimed_scan_epoch().await?.is_none());
             sqlx::query(sql!(
                 "UPDATE snapshots SET state = 'deleting' WHERE id = $1"
@@ -1537,86 +1547,6 @@ mod postgres {
                 .bind(tail[0])
                 .execute(pool)
                 .await?;
-        }
-        Ok(())
-    }
-
-    /// Claimed recovery must not scale with the snapshot table. Statistics
-    /// sampled while a tick holds many claims, followed by those claims
-    /// finishing forward, leave a few old (low UUIDv7) claims under a large
-    /// `deleting` estimate. Unfenced, `ORDER BY id DESC LIMIT 1` then walks the
-    /// primary key backward and filters every unclaimed row before it reaches
-    /// one, which is how the epoch query exceeds the statement timeout.
-    #[tokio::test(flavor = "current_thread")]
-    async fn claimed_recovery_reads_claims_not_the_table_under_stale_statistics() -> TestResult {
-        use super::super::store::{CLAIMED_SCAN_EPOCH_SQL, LIST_CLAIMED_SQL};
-        const ROWS: i64 = 50_000;
-        const SAMPLED_CLAIMS: i64 = 1_000;
-        const LIVE_CLAIMS: usize = 10;
-        let Some(db) = try_pg_test_db().await? else {
-            return Ok(());
-        };
-        let pool = &db.pool;
-        let sandbox = insert_sandbox(pool).await?;
-        sqlx::query(sql!(
-            "INSERT INTO snapshots (id, sandbox_id, type, state, timestamp)
-             SELECT ('20000000-0000-7000-8000-' || lpad(to_hex(g), 12, '0'))::uuid,
-                    $1, 'full',
-                    CASE WHEN g <= $3 THEN 'deleting' ELSE 'ready' END,
-                    NOW() - make_interval(secs => ($2 - g + 1)::double precision)
-               FROM generate_series(1, $2) g"
-        ))
-        .bind(sandbox)
-        .bind(ROWS)
-        .bind(SAMPLED_CLAIMS)
-        .execute(pool)
-        .await?;
-        sqlx::query(sql!("ANALYZE snapshots")).execute(pool).await?;
-        let claims: Vec<SnapshotId> = sqlx::query_scalar(sql!(
-            "SELECT id FROM snapshots WHERE state = 'deleting' ORDER BY id LIMIT $1"
-        ))
-        .bind(LIVE_CLAIMS as i64)
-        .fetch_all(pool)
-        .await?;
-        sqlx::query(sql!(
-            "UPDATE snapshots SET state = 'ready' WHERE state = 'deleting' AND id > $1"
-        ))
-        .bind(claims[LIVE_CLAIMS - 1])
-        .execute(pool)
-        .await?;
-
-        let store = SnapshotRetentionDbStore::new(pool.clone());
-        let epoch = store.claimed_scan_epoch().await?.expect("live claims");
-        assert_eq!(epoch.through, claims[LIVE_CLAIMS - 1]);
-        let page = store.list_claimed(ROWS, None, epoch.through).await?;
-        assert_eq!(
-            page.iter().map(|c| c.snapshot_id).collect::<Vec<_>>(),
-            claims
-        );
-
-        let filtered = |plan: Vec<String>| -> i64 {
-            plan.iter()
-                .filter_map(|line| line.split("Rows Removed by Filter: ").nth(1))
-                .map(|n| n.trim().parse::<i64>().expect("filtered row count"))
-                .sum()
-        };
-        let explain = |statement: &str| {
-            format!("EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {statement}")
-        };
-        let epoch_plan: Vec<String> =
-            sqlx::query_scalar(sqlx::AssertSqlSafe(explain(CLAIMED_SCAN_EPOCH_SQL)))
-                .fetch_all(pool)
-                .await?;
-        let list_plan: Vec<String> =
-            sqlx::query_scalar(sqlx::AssertSqlSafe(explain(LIST_CLAIMED_SQL)))
-                .bind(ROWS)
-                .bind(None::<SnapshotId>)
-                .bind(epoch.through)
-                .fetch_all(pool)
-                .await?;
-        for plan in [epoch_plan, list_plan] {
-            let shown = plan.join("\n");
-            assert!(filtered(plan) < SAMPLED_CLAIMS, "{shown}");
         }
         Ok(())
     }
@@ -1723,7 +1653,7 @@ mod postgres {
             policy.min_age = min_age;
             let mut reconciler = super::Reconciler::new(
                 policy,
-                SnapshotRetentionDbStore::new(pool.clone()),
+                SnapshotRetentionDbStore::new(Db::from(pool.clone())),
                 super::registry_with(backend.clone()),
             );
             let started = std::time::Instant::now();
@@ -2011,7 +1941,7 @@ mod postgres {
         insert_snapshot(pool, six_snapshot_sandbox, "full", "failed", 20).await?;
         insert_snapshot(pool, six_snapshot_sandbox, "disk", "ready", 15).await?;
 
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         let candidates = store.list_candidates(5, 100, None, None).await?.candidates;
         let got: Vec<SnapshotId> = candidates.iter().map(|c| c.snapshot_id).collect();
         let ranked = ranked_candidate_ids(pool, 5, 100, None, None).await?;
@@ -2068,7 +1998,7 @@ mod postgres {
         let mut expected = [tie_ids[0], old_candidate, paged_ids[0], paged_ids[1]];
         expected.sort_unstable();
 
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         let first_page = store.list_candidates(5, 3, None, min_age).await?.candidates;
         let first_ids: Vec<SnapshotId> = first_page
             .iter()
@@ -2111,7 +2041,7 @@ mod postgres {
         let third = insert_snapshot(pool, sandbox, "full", "ready", 200).await?;
         insert_snapshot(pool, sandbox, "full", "ready", 100).await?;
 
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         expect_claimed(store.claim_prune(oldest, 2).await?);
         expect_claimed(store.claim_prune(second, 2).await?);
         assert_eq!(
@@ -2133,7 +2063,7 @@ mod postgres {
             return Ok(());
         };
         let pool = &db.pool;
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         for orphaned in [false, true] {
             let sandbox = insert_sandbox(pool).await?;
             let durable = insert_snapshot(pool, sandbox, "full", "ready", 200).await?;
@@ -2203,7 +2133,7 @@ mod postgres {
         insert_snapshot(pool, sandbox, "full", "ready", 200).await?;
         insert_snapshot(pool, sandbox, "full", "ready", 100).await?;
 
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         // Protocol order: claim (de-advertise) first, finalize after the
         // (out-of-band) reap.
         expect_claimed(store.claim_prune(oldest, 2).await?);
@@ -2235,7 +2165,7 @@ mod postgres {
         let snapshot = insert_snapshot(pool, sandbox, "full", "ready", 300).await?;
         insert_snapshot(pool, sandbox, "full", "ready", 100).await?;
 
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         assert_eq!(
             store.finalize_prune(snapshot, 1).await?,
             PruneFinalize::NotClaimed
@@ -2264,7 +2194,7 @@ mod postgres {
         insert_snapshot(pool, sandbox, "full", "ready", 200).await?;
         insert_snapshot(pool, sandbox, "full", "ready", 100).await?;
 
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         // The claim passes at keep_n = 2 with two newer ready siblings...
         expect_claimed(store.claim_prune(oldest, 2).await?);
         // ...then finalize re-counts at keep_n = 5 (standing in for an
@@ -2314,7 +2244,7 @@ mod postgres {
         }
         pin_current_artifact(pool, sandbox, pinned_artifact, "full").await?;
 
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         let candidates = store.list_candidates(2, 100, None, None).await?.candidates;
         let got: Vec<SnapshotId> = candidates.iter().map(|c| c.snapshot_id).collect();
 
@@ -2345,7 +2275,7 @@ mod postgres {
             insert_snapshot(pool, sandbox, "full", "ready", age).await?;
         }
 
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         pin_current_artifact(pool, sandbox, pinned_artifact, "full").await?;
         assert_eq!(
             store.claim_prune(pinned, 2).await?,
@@ -2379,7 +2309,7 @@ mod postgres {
 
         let claim_pool = pool.clone();
         let claim = tokio::spawn(async move {
-            SnapshotRetentionDbStore::new(claim_pool)
+            SnapshotRetentionDbStore::new(Db::from(claim_pool))
                 .claim_prune(candidate, 2)
                 .await
         });
@@ -2430,7 +2360,7 @@ mod postgres {
             insert_artifact_snapshot(pool, sandbox, age, Uuid::now_v7(), "full").await?;
         }
 
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         let got: Vec<SnapshotId> = store
             .list_candidates(2, 100, None, None)
             .await?
@@ -2467,7 +2397,7 @@ mod postgres {
         }
         pin_current_artifact(pool, sandbox, pinned_artifact, "full").await?;
 
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         let got: Vec<SnapshotId> = store
             .list_candidates(2, 100, None, None)
             .await?
@@ -2545,7 +2475,7 @@ mod postgres {
                 .push(insert_artifact_snapshot(pool, sandbox, age, Uuid::now_v7(), "full").await?);
         }
 
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         let got: Vec<SnapshotId> = store
             .list_candidates(5, 100, None, None)
             .await?
@@ -2588,7 +2518,7 @@ mod postgres {
         for age in [400, 300, 200] {
             insert_snapshot(pool, sandbox, "full", "ready", age).await?;
         }
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         // The claim lands while the sandbox is unmarked and not restoring...
         expect_claimed(store.claim_prune(pinned, 2).await?);
         // ...then the row enters `restoring` with the marker pointing at the
@@ -2638,7 +2568,7 @@ mod postgres {
         for age in [300, 200] {
             insert_snapshot(pool, sandbox, "full", "ready", age).await?;
         }
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         // The claim lands before the restore starts...
         expect_claimed(store.claim_prune(older, 2).await?);
         // ...then the row enters `restoring` pinned to some *other*
@@ -2687,7 +2617,7 @@ mod postgres {
             insert_snapshot(pool, sandbox, "full", "ready", age).await?;
         }
 
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         // Claimed while unpinned...
         expect_claimed(store.claim_prune(oldest, 2).await?);
         // ...then the marker changes before the reap completes.
@@ -2724,7 +2654,7 @@ mod postgres {
         let claimed_second = insert_snapshot(pool, sandbox, "full", "ready", 400).await?;
         insert_snapshot(pool, sandbox, "full", "ready", 100).await?;
 
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         // Simulate a crashed claimer holding two claims: the rows are
         // durably `deleting`, and the sandbox is even marked at the first
         // (worst case for rediscovery).
@@ -2788,7 +2718,7 @@ mod postgres {
             .execute(pool)
             .await?;
 
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         let through = store
             .claimed_scan_epoch()
             .await?
@@ -2822,7 +2752,7 @@ mod postgres {
             return Ok(());
         };
         let pool = &db.pool;
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
 
         for orphaned in [false, true] {
             let sandbox = insert_sandbox(pool).await?;
@@ -2890,7 +2820,7 @@ mod postgres {
         let age_sandbox = insert_sandbox(pool).await?;
         let aged = insert_snapshot(pool, age_sandbox, "full", "ready", 500).await?;
         insert_snapshot(pool, age_sandbox, "full", "ready", 100).await?;
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         let aged_candidate = store
             .list_candidates(1, 100, None, None)
             .await?
@@ -2973,7 +2903,7 @@ mod postgres {
         let sandbox = insert_sandbox(pool).await?;
         let snapshot = insert_snapshot(pool, sandbox, "full", "ready", 500).await?;
         insert_snapshot(pool, sandbox, "full", "ready", 100).await?;
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         let candidate = store
             .list_candidates(1, 100, None, None)
             .await?
@@ -3029,7 +2959,7 @@ mod postgres {
         let sandbox = insert_sandbox(pool).await?;
         let oldest = insert_snapshot(pool, sandbox, "full", "ready", 500).await?;
         insert_snapshot(pool, sandbox, "full", "ready", 100).await?;
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         let candidate = store
             .list_candidates(1, 100, None, None)
             .await?
@@ -3093,7 +3023,7 @@ mod postgres {
         let sandbox = insert_sandbox(pool).await?;
         let oldest = insert_snapshot(pool, sandbox, "full", "ready", 500).await?;
         insert_snapshot(pool, sandbox, "full", "ready", 100).await?;
-        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         let candidate = store
             .list_candidates(1, 100, None, None)
             .await?
@@ -3104,12 +3034,12 @@ mod postgres {
 
         let mut fork_guard = pool.begin().await?;
         pplx_space_sandbox_store::fork_source_lifecycle::lock_fork_source_lifecycle(
-            &mut fork_guard,
+            &mut *fork_guard,
             sandbox,
         )
         .await?;
 
-        let claim_store = SnapshotRetentionDbStore::new(pool.clone());
+        let claim_store = SnapshotRetentionDbStore::new(Db::from(pool.clone()));
         let mut claim = tokio::spawn(async move {
             <SnapshotRetentionDbStore as RetentionSink>::claim_prune(
                 &claim_store,

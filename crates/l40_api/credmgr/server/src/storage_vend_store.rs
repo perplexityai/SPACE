@@ -1,14 +1,15 @@
 //! Durable authorization context for scoped storage credential exchange.
 
-use pplx_space_common_core::types::SnapshotId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::str::FromStr;
 
-use pplx_space_common_core::{
-    types::ContentHash, types::K8sNodeName, types::K8sNodeUid, types::OrgId, types::SandboxId,
-    types::StorageUri, types::TemplateName,
-};
-use pplx_space_sql_locator::sql;
+use pplx_space_accounts::OrgId;
+use pplx_space_artifact_model::StorageUri;
+use pplx_space_content_digest::ContentHash;
+use pplx_space_k8s_ids::{K8sNodeName, K8sNodeUid};
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_template_model::TemplateName;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxStorageContext {
@@ -69,10 +70,14 @@ pub struct StorageVendIdentity {
 pub enum StorageVendStoreError {
     #[error("storage credential authorization query failed: {0}")]
     Query(#[from] sqlx::Error),
-    #[error("stored sandbox node identity is invalid")]
-    InvalidNodeIdentity,
     #[error("stored storage vend provider is unsupported")]
     UnsupportedProvider,
+}
+
+impl From<pplx_space_postgres_pool::DbError> for StorageVendStoreError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
 }
 
 #[tonic::async_trait]
@@ -120,84 +125,41 @@ impl StorageVendStore for PgStorageVendStore {
         sandbox_id: SandboxId,
         snapshot_id: SnapshotId,
     ) -> Result<Option<SandboxStorageContext>, StorageVendStoreError> {
-        let row: Option<(uuid::Uuid, Option<String>)> = sqlx::query_as(sql!(
-            "SELECT s.org_id, o.snapshot_base_object_storage_uri
-             FROM sandboxes s
-             JOIN organizations o ON o.id = s.org_id
-             WHERE s.id = $1"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some((organization_id, current_snapshot_storage)) = row else {
+        let Some(pplx_space_sandbox_store::org_storage::SandboxOrgStorage {
+            organization_id,
+            snapshot_base_object_storage_uri: current_snapshot_storage,
+        }) = pplx_space_sandbox_store::org_storage::sandbox_org_storage(&self.pool, sandbox_id)
+            .await?
+        else {
             return Ok(None);
         };
 
-        let node_rows: Vec<(String, String)> = sqlx::query_as(sql!(
-            "WITH latest_execution AS (
-                 SELECT k8s_node_name
-                 FROM sandbox_k8s_executions
-                 WHERE sandbox_id = $1 AND k8s_node_name IS NOT NULL
-                 ORDER BY generation DESC
-                 LIMIT 1
-             ), candidate_nodes AS (
-                 SELECT active_node_id AS node_id FROM sandboxes WHERE id = $1
-                 UNION
-                 SELECT target_node_id AS node_id FROM sandboxes WHERE id = $1
-                 UNION
-                 SELECT snapshot.source_node_id AS node_id
-                 FROM snapshots snapshot
-                 JOIN sandboxes subject ON subject.id = $1
-                 WHERE snapshot.id = $2
-                   AND snapshot.source_node_id IS NOT NULL
-                   AND (
-                       snapshot.sandbox_id = $1
-                       OR (
-                           snapshot.artifact_origin = 'fork'
-                           AND snapshot.org_id = subject.org_id
-                       )
-                   )
-                 UNION
-                 SELECT k.node_id
-                 FROM latest_execution e
-                 JOIN node_k8s k ON k.k8s_node_name = e.k8s_node_name
-             )
-             SELECT k.k8s_node_name, k.k8s_node_uid
-             FROM candidate_nodes candidates
-             JOIN node_k8s k ON k.node_id = candidates.node_id
-             WHERE k.k8s_node_uid IS NOT NULL"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(snapshot_id)
-        .fetch_all(&self.pool)
-        .await?;
-        let nodes = node_rows
-            .into_iter()
-            .map(|(name, uid)| {
-                Ok(SandboxNodeIdentity {
-                    name: K8sNodeName::parse(name)
-                        .map_err(|_| StorageVendStoreError::InvalidNodeIdentity)?,
-                    uid: K8sNodeUid::parse(uid)
-                        .map_err(|_| StorageVendStoreError::InvalidNodeIdentity)?,
-                })
-            })
-            .collect::<Result<Vec<_>, StorageVendStoreError>>()?;
+        let nodes = pplx_space_sandbox_store::k8s_node_attribution::attributed_k8s_nodes(
+            &self.pool,
+            sandbox_id,
+            snapshot_id,
+        )
+        .await?
+        .into_iter()
+        .map(|node| SandboxNodeIdentity {
+            name: node.k8s_node_name,
+            uid: node.k8s_node_uid,
+        })
+        .collect();
 
-        let recorded_snapshot: Option<(String, Option<bool>)> = sqlx::query_as(sql!(
-            "SELECT location.storage_connection_string,
-                    snapshot.artifact_origin = 'fork' AND snapshot.state = 'creating'
-             FROM snapshot_storage_locations location
-             JOIN snapshots snapshot ON snapshot.id = location.snapshot_id
-             WHERE location.snapshot_id = $1
-               AND location.orphaned_at IS NULL
-               AND COALESCE(snapshot.org_id, $2) = $2"
-        ))
-        .bind(snapshot_id)
-        .bind(organization_id)
-        .fetch_optional(&self.pool)
+        let recorded_snapshot = pplx_space_snapshot_store::org_storage_location(
+            &self.pool,
+            snapshot_id,
+            organization_id,
+        )
         .await?;
         let (recorded_snapshot_storage, portable_snapshot_write) = recorded_snapshot
-            .map(|(uri, portable): (String, Option<bool>)| (Some(uri), portable.unwrap_or(false)))
+            .map(|location| {
+                (
+                    Some(location.storage_connection_string),
+                    location.creating_fork_copy,
+                )
+            })
             .unwrap_or((None, false));
 
         let mut snapshot_storage = Vec::with_capacity(2);
@@ -231,7 +193,7 @@ impl StorageVendStore for PgStorageVendStore {
         }
 
         Ok(Some(SandboxStorageContext {
-            organization_id: OrgId::from_uuid(organization_id),
+            organization_id,
             nodes,
             snapshot_storage,
             snapshot_storage_configuration_invalid,
@@ -245,12 +207,7 @@ impl StorageVendStore for PgStorageVendStore {
         &self,
         template: &TemplateName,
     ) -> Result<Option<Option<OrgId>>, StorageVendStoreError> {
-        let owner: Option<Option<uuid::Uuid>> =
-            sqlx::query_scalar(sql!("SELECT org_id FROM templates WHERE name = $1"))
-                .bind(template.as_str())
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(owner.map(|organization_id| organization_id.map(OrgId::from_uuid)))
+        Ok(pplx_space_template_store::templates::owner(&self.pool, template).await?)
     }
 
     async fn template_release_published(
@@ -258,52 +215,30 @@ impl StorageVendStore for PgStorageVendStore {
         template: &TemplateName,
         hash: &ContentHash,
     ) -> Result<bool, StorageVendStoreError> {
-        // `template_releases.hash` holds the canonical `sha256:<hex>` form
-        // and, for releases registered before the prefix was required, the
-        // bare hex. A published release must be found under either spelling.
-        let canonical = hash.to_string();
-        let bare = canonical
-            .strip_prefix("sha256:")
-            .unwrap_or(&canonical)
-            .to_string();
-        let published: bool = sqlx::query_scalar(sql!(
-            "SELECT EXISTS (
-                 SELECT 1
-                 FROM template_release_storage_locations location
-                 JOIN template_releases release
-                   ON release.id = location.template_release_id
-                 WHERE release.template_name = $1
-                   AND release.hash IN ($2, $3))"
-        ))
-        .bind(template.as_str())
-        .bind(canonical)
-        .bind(bare)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(published)
+        Ok(pplx_space_template_release_store::release_published(
+            &self.pool,
+            template.as_str(),
+            hash,
+        )
+        .await?)
     }
 
     async fn org_vend_identity(
         &self,
         organization_id: OrgId,
     ) -> Result<Option<StorageVendIdentity>, StorageVendStoreError> {
-        let row: Option<(String, String)> = sqlx::query_as(sql!(
-            "SELECT provider, identity
-             FROM org_storage_vend_identities
-             WHERE org_id = $1"
-        ))
-        .bind(organization_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(|(provider, identity)| {
-            Ok(StorageVendIdentity {
-                provider: provider
-                    .parse()
-                    .map_err(|_| StorageVendStoreError::UnsupportedProvider)?,
-                identity,
+        pplx_space_storage_vend_store::org_vend_identity(&self.pool, organization_id)
+            .await?
+            .map(|record| {
+                Ok(StorageVendIdentity {
+                    provider: record
+                        .provider
+                        .parse()
+                        .map_err(|_| StorageVendStoreError::UnsupportedProvider)?,
+                    identity: record.identity,
+                })
             })
-        })
-        .transpose()
+            .transpose()
     }
 }
 

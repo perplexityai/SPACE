@@ -1,7 +1,8 @@
 use crate::routes::public::error::database_error;
-use pplx_space_common_core::types::{OrgId, SandboxId, SnapshotId};
+use pplx_space_accounts::OrgId;
+use pplx_space_snapshot_model::SnapshotId;
 
-use pplx_space_common_core::sql;
+use pplx_space_snapshot_store::public::PublicSnapshotRow as SnapshotRow;
 use std::str::FromStr;
 
 use axum::{
@@ -13,7 +14,7 @@ use pplx_space_public_api::{
     PublicSnapshotType, SandboxResources,
 };
 use serde::Deserialize;
-use sqlx::{FromRow, PgPool};
+use sqlx::PgPool;
 use time::OffsetDateTime;
 
 use crate::{middleware::auth::AuthOrg, routes::AppState};
@@ -102,23 +103,6 @@ impl ListSnapshotsQuery {
     }
 }
 
-#[derive(Debug, FromRow)]
-struct SnapshotRow {
-    id: SnapshotId,
-    sandbox_id: SandboxId,
-    snapshot_type: String,
-    state: String,
-    created_at: OffsetDateTime,
-    label: Option<String>,
-    retention_tier: Option<String>,
-    size_bytes: Option<i64>,
-    vcpu: Option<i32>,
-    memory_mib: Option<i32>,
-    template_id: Option<String>,
-    content_hash: Option<String>,
-    failure_reason: Option<String>,
-}
-
 async fn fetch_snapshot_rows(
     pool: &PgPool,
     org_id: OrgId,
@@ -126,46 +110,15 @@ async fn fetch_snapshot_rows(
     cursor: Option<(OffsetDateTime, SnapshotId)>,
     limit: u16,
 ) -> Result<Vec<SnapshotRow>, sqlx::Error> {
-    let (cursor_created_at, cursor_id) = cursor
-        .map(|(created_at, id)| (Some(created_at), Some(id)))
-        .unwrap_or((None, None));
-    // `deleting` rows are claimed for prune and de-advertised: they must
-    // read as gone on this surface, and `PublicSnapshotState` deliberately
-    // has no such wire variant.
-    sqlx::query_as::<_, SnapshotRow>(sql!(
-        "SELECT sn.id,
-                sn.sandbox_id,
-                sn.type AS snapshot_type,
-                sn.state,
-                sn.timestamp AS created_at,
-                sn.label,
-                sn.retention_tier,
-                sn.size_bytes,
-                sn.vcpu,
-                sn.memory_mib,
-                sn.template_id,
-                sn.content_hash,
-                sn.failure_reason
-         FROM snapshots sn
-         JOIN sandboxes s ON s.id = sn.sandbox_id
-         WHERE sn.sandbox_id = $1
-           AND s.org_id = $2
-           AND sn.artifact_origin IS DISTINCT FROM 'fork'
-           AND sn.state <> 'deleting'
-           AND (
-               $3::TIMESTAMPTZ IS NULL
-               OR (sn.timestamp, sn.id) < ($3::TIMESTAMPTZ, $4::UUID)
-           )
-         ORDER BY sn.timestamp DESC, sn.id DESC
-         LIMIT $5"
-    ))
-    .bind(sandbox_id.as_uuid())
-    .bind(org_id)
-    .bind(cursor_created_at)
-    .bind(cursor_id)
-    .bind(i64::from(limit) + 1)
-    .fetch_all(pool)
+    pplx_space_snapshot_store::public::page(
+        pool,
+        org_id,
+        sandbox_id.into(),
+        cursor,
+        i64::from(limit) + 1,
+    )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 async fn fetch_snapshot_row(
@@ -174,35 +127,9 @@ async fn fetch_snapshot_row(
     sandbox_id: PublicSandboxId,
     snapshot_id: SnapshotId,
 ) -> Result<Option<SnapshotRow>, sqlx::Error> {
-    // Excluding `deleting` turns a get on a claimed row into a 404, matching
-    // the list surface above.
-    sqlx::query_as::<_, SnapshotRow>(sql!(
-        "SELECT sn.id,
-                sn.sandbox_id,
-                sn.type AS snapshot_type,
-                sn.state,
-                sn.timestamp AS created_at,
-                sn.label,
-                sn.retention_tier,
-                sn.size_bytes,
-                sn.vcpu,
-                sn.memory_mib,
-                sn.template_id,
-                sn.content_hash,
-                sn.failure_reason
-         FROM snapshots sn
-         JOIN sandboxes s ON s.id = sn.sandbox_id
-         WHERE sn.sandbox_id = $1
-           AND sn.id = $2
-           AND s.org_id = $3
-           AND sn.artifact_origin IS DISTINCT FROM 'fork'
-           AND sn.state <> 'deleting'"
-    ))
-    .bind(sandbox_id.as_uuid())
-    .bind(snapshot_id)
-    .bind(org_id)
-    .fetch_optional(pool)
-    .await
+    pplx_space_snapshot_store::public::get(pool, org_id, sandbox_id.into(), snapshot_id)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 fn public_snapshot_from_row(row: SnapshotRow) -> Result<PublicSnapshot, PublicApiError> {

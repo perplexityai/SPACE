@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use lru::LruCache;
-use pplx_space_credential_injection_core::secret_arn::SecretArn;
+use pplx_space_credential_injection::secret_arn::SecretArn;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 

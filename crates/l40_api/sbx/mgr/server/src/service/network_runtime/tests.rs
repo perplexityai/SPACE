@@ -3,7 +3,8 @@ use super::{
     NetGatewayLaunchConfig, NetGatewayRouteIdentityPushError, NetGatewayRouteIdentityPushOutcome,
     NetGatewayRouteVerificationKeyPushError, NetGatewayRouteVerificationKeyPushOutcome, Operation,
     Outcome, RefreshAbandonReason, classify_route_identity_push,
-    classify_route_verification_key_response, known_egress_domains_from_assignment,
+    classify_route_verification_key_response, finish_route_identity_push,
+    finish_route_verification_key_push, known_egress_domains_from_assignment,
     local_known_egress_domains, net_gateway_client_span, net_gateway_launch_config_with,
     netgtw_launch_args, network_policy_refresh_error_to_status, push_route_identity,
     record_route_security_push_span, require_local_authority_peer,
@@ -11,8 +12,8 @@ use super::{
 };
 use crate::db::PolicyAuthority;
 use crate::state::SandboxState;
-use pplx_space_common_core::host::linux::identities::user_names;
 use pplx_space_feature_flags::{FeatureFlagClient, SPACE_NET_GATEWAY_KNOWN_EGRESS_DOMAINS_FLAG};
+use pplx_space_host_layout::identities::user_names;
 use pplx_space_uds_peer_auth::{LocalRole, UdsPeerPrincipal};
 
 // `authority=local` pins a node-local, cluster-immune policy (network or
@@ -202,7 +203,7 @@ impl tracing::field::Visit for SpanFieldGrabber {
 
 fn captured_route_security_push_span(
     operation: Operation,
-    outcome: Result<Outcome, &NetGatewayRouteVerificationKeyPushError>,
+    outcome: Outcome,
     failure: Option<&str>,
 ) -> SpanFieldCapture {
     use tracing_subscriber::layer::SubscriberExt as _;
@@ -216,19 +217,45 @@ fn captured_route_security_push_span(
     capture
 }
 
+/// A gateway launched before route security answers its pushes UNIMPLEMENTED,
+/// or reports an older identity profile, until it is cycled. Both pushes answer
+/// that with UNIMPLEMENTED, which the reconcile completes on; any other failure
+/// stays INTERNAL, which it retries.
 #[test]
-fn unsupported_verification_key_push_records_an_error_span() {
-    let error = NetGatewayRouteVerificationKeyPushError::Rpc(tonic::Status::unimplemented(
-        "gateway does not implement verification-key synchronization",
-    ));
-    let failure = error.to_string();
-    let capture =
-        captured_route_security_push_span(Operation::VerificationKeys, Err(&error), Some(&failure));
+fn a_gateway_older_than_route_security_answers_unimplemented() {
+    let unimplemented = || tonic::Status::unimplemented("");
+    let identity = |push: Result<u32, NetGatewayRouteIdentityPushError>| {
+        finish_route_identity_push("sandbox-id", &tracing::Span::none(), push)
+            .expect_err("the push failed")
+            .code()
+    };
+    let keys = |error: NetGatewayRouteVerificationKeyPushError| {
+        finish_route_verification_key_push(&tracing::Span::none(), Err(error))
+            .expect_err("the push failed")
+            .code()
+    };
+    let older_profile = pplx_space_net_gateway_client::IDENTITY_PROFILE_VERSION - 1;
 
-    assert_eq!(capture.get("otel.status_code").as_deref(), Some("ERROR"));
     assert_eq!(
-        capture.get("route_security.outcome").as_deref(),
-        Some("failed")
+        identity(Err(NetGatewayRouteIdentityPushError::Rpc(unimplemented()))),
+        tonic::Code::Unimplemented
+    );
+    assert_eq!(identity(Ok(older_profile)), tonic::Code::Unimplemented);
+    assert_eq!(
+        keys(NetGatewayRouteVerificationKeyPushError::Rpc(unimplemented())),
+        tonic::Code::Unimplemented
+    );
+    assert_eq!(
+        identity(Err(NetGatewayRouteIdentityPushError::Rpc(
+            tonic::Status::unavailable("restarting")
+        ))),
+        tonic::Code::Internal
+    );
+    assert_eq!(
+        keys(NetGatewayRouteVerificationKeyPushError::Rpc(
+            tonic::Status::unavailable("restarting")
+        )),
+        tonic::Code::Internal
     );
 }
 
@@ -238,7 +265,7 @@ fn unsupported_verification_key_push_records_an_error_span() {
 fn tolerated_identity_push_outcomes_record_ok_spans() {
     for outcome in [Outcome::Applied, Outcome::Absent, Outcome::Diverged] {
         let capture =
-            captured_route_security_push_span(Operation::Identity, Ok(outcome), Some("ignored"));
+            captured_route_security_push_span(Operation::Identity, outcome, Some("ignored"));
         assert_eq!(
             capture.get("otel.status_code").as_deref(),
             Some("OK"),
@@ -281,7 +308,7 @@ fn failed_verification_key_push_records_an_error_span() {
     let failure = error.to_string();
     let capture = captured_route_security_push_span(
         Operation::VerificationKeys,
-        Err(&error),
+        error.metric_outcome(),
         Some(failure.as_str()),
     );
 
@@ -338,8 +365,8 @@ fn verification_key_response_requires_matching_generation_and_supported_rpc() {
 #[tokio::test(start_paused = true)]
 async fn refresh_waits_for_delayed_readiness_but_bounds_pending_and_hung_requests() {
     use super::super::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::types::SandboxId;
     use pplx_space_net_gateway_client::proto::{NetworkState, RefreshNetworkPolicyResponse};
+    use pplx_space_sandbox_model::SandboxId;
 
     use std::time::Duration;
 
@@ -421,8 +448,8 @@ async fn refresh_waits_for_delayed_readiness_but_bounds_pending_and_hung_request
 #[tokio::test(start_paused = true)]
 async fn refresh_rechecks_deletion_after_rpc_and_honors_a_shorter_caller_deadline() {
     use super::super::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::types::SandboxId;
     use pplx_space_net_gateway_client::proto::{NetworkState, RefreshNetworkPolicyResponse};
+    use pplx_space_sandbox_model::SandboxId;
 
     use std::time::Duration;
 
@@ -498,9 +525,9 @@ async fn refresh_abandons_schedule_when_sandbox_row_is_gone() {
     );
 }
 
-use pplx_space_common_core::types::{
-    ExecutionGeneration, NodeId, PodUid, RouteGeneration, SpaceApiRouteIdentity,
-};
+use pplx_space_accounts::NodeId;
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_sandbox_model::{ExecutionGeneration, RouteGeneration, SpaceApiRouteIdentity};
 
 fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
@@ -524,7 +551,7 @@ fn test_route_identity() -> SpaceApiRouteIdentity {
     SpaceApiRouteIdentity {
         route_generation: Some(RouteGeneration::new(42).expect("route generation parses")),
         current_node_id: Some(NodeId::new()),
-        substrate_kind: Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes),
+        substrate_kind: Some(pplx_space_node_model::NodeManagedBy::Kubernetes),
         execution_generation: Some(ExecutionGeneration::new(7).expect("generation parses")),
         pod_uid: Some(PodUid::parse("pod-uid-42").expect("pod uid parses")),
         ..Default::default()
@@ -769,10 +796,10 @@ fn a_known_egress_object_with_the_wrong_keys_is_rejected() {
 #[tokio::test(start_paused = true)]
 async fn unavailable_interception_dependencies_still_converge_the_start_gate() {
     use super::super::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::types::SandboxId;
     use pplx_space_net_gateway_client::proto::{
         InterceptionReadiness, NetworkState, RefreshNetworkPolicyResponse,
     };
+    use pplx_space_sandbox_model::SandboxId;
 
     use std::time::Duration;
 
@@ -833,8 +860,8 @@ async fn unavailable_interception_dependencies_still_converge_the_start_gate() {
 async fn interception_recheck_answers_for_the_registered_gateway_only() {
     use super::super::tests::service_tests::insert_test_sandbox;
     use super::InterceptionRecheck;
-    use pplx_space_common_core::types::SandboxId;
     use pplx_space_net_gateway_client::proto::{GetNetworkStateResponse, InterceptionReadiness};
+    use pplx_space_sandbox_model::SandboxId;
 
     #[derive(Clone, Copy, Debug)]
     enum During {

@@ -111,7 +111,7 @@ impl TryFrom<SandboxStatus> for InsertedStatus {
 }
 
 pub struct InsertSandboxParams<'a> {
-    pub guest_image: pplx_space_common_core::types::guest_image::GuestImageContract,
+    pub guest_image: pplx_space_execution_spec::guest_image::GuestImageContract,
     pub id: &'a str,
     pub uuid8: &'a SandboxRuntimeLabel,
     pub state: InsertedStatus,
@@ -121,7 +121,7 @@ pub struct InsertSandboxParams<'a> {
     pub runtime: &'a str,
     pub snapshots_enabled: bool,
     pub rootfs_size_mb: Option<u32>,
-    pub disk_io_limits: pplx_space_common_core::types::DiskIoLimits,
+    pub disk_io_limits: pplx_space_execution_spec::DiskIoLimits,
     pub pool_template: Option<&'a str>,
     pub volume_encryption: bool,
     pub process_env: &'a BTreeMap<String, String>,
@@ -565,7 +565,7 @@ pub fn acknowledge_node_cleanup(
 pub fn upsert_sandbox_execution_metadata(
     conn: &Connection,
     sandbox_id: &str,
-    execution: &pplx_space_common_core::types::ExecutionMetadata,
+    execution: &pplx_space_execution_spec::ExecutionMetadata,
 ) -> Result<()> {
     let tx = immediate_transaction(conn)?;
     upsert_sandbox_execution_metadata_in_transaction(&tx, sandbox_id, execution)?;
@@ -576,7 +576,7 @@ pub fn upsert_sandbox_execution_metadata(
 pub(super) fn upsert_sandbox_execution_metadata_in_transaction(
     conn: &Connection,
     sandbox_id: &str,
-    execution: &pplx_space_common_core::types::ExecutionMetadata,
+    execution: &pplx_space_execution_spec::ExecutionMetadata,
 ) -> Result<()> {
     let runtime: String = conn.query_row(
         "SELECT runtime FROM sandboxes WHERE id = ?1",
@@ -901,9 +901,7 @@ db_private_outside_tests! {
         if sandbox_ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let placeholders = std::iter::repeat_n("?", sandbox_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let placeholders = crate::db::sql_placeholders(sandbox_ids.len());
         let query = format!(
             "SELECT id, state_changed_at
          FROM sandboxes
@@ -1356,9 +1354,7 @@ db_private_outside_tests! {
         if sandbox_ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let placeholders = std::iter::repeat_n("?", sandbox_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let placeholders = crate::db::sql_placeholders(sandbox_ids.len());
         let query = format!(
             "SELECT id,
                 space_api_route_generation,
@@ -1432,7 +1428,7 @@ db_private_outside_tests! {
         let mut matches = Vec::new();
         while let Some(row) = rows.next()? {
             let id = row.get::<_, String>(0)?;
-            if pplx_space_common_core::ids::sandbox_id_matches(&id, prefix) {
+            if pplx_space_sandbox_model::ids::sandbox_id_matches(&id, prefix) {
                 matches.push(id);
                 if matches.len() == 2 {
                     break;

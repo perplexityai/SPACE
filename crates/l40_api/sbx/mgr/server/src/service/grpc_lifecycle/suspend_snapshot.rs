@@ -27,8 +27,12 @@ pub(in crate::service) enum SuspendSnapshotStagingDisposition {
 
 #[derive(Debug, thiserror::Error)]
 pub(in crate::service) enum EncryptedCaptureSealError {
-    #[error("staging directory has no encrypted capture record")]
-    MissingRecord,
+    #[error("capture record does not belong to the admitted attempt")]
+    RecordIdentityMismatch,
+    #[error("capture owner unavailable: {0}")]
+    OwnerUnavailable(#[source] Status),
+    #[error("read capture owner: {0}")]
+    OwnerRead(#[source] crate::db::Error),
     #[error(transparent)]
     Record(#[from] crate::service::suspend_snapshot_publication::SuspendSnapshotPublicationError),
     #[error("{0}")]
@@ -37,10 +41,6 @@ pub(in crate::service) enum EncryptedCaptureSealError {
     Metadata(#[from] crate::snapshot_upload::SnapshotMetadataWriteError),
     #[error("remove encrypted capture record failed: {0}")]
     RemoveRecord(#[source] std::io::Error),
-}
-
-pub(in crate::service) fn failed_encrypted_capture_may_release_volume(runtime_live: bool) -> bool {
-    !runtime_live
 }
 
 /// Whether a failed btrfs-send encode demotes this suspend to the Full codec.
@@ -55,27 +55,12 @@ pub(in crate::service) fn btrfs_send_encode_falls_back_to_full(
         && requested_format != pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::BtrfsSend
 }
 
-/// Re-arms watchdog monitoring for a still-live sandbox if the suspend
-/// publication is abandoned before its intentional teardown — a failure that
-/// rolls the sandbox back to `paused` *or* a dropped handler future (client
-/// disconnect / deadline mid-`create_snapshot`).
-///
-/// The encrypted capture unsubscribes the watchdog and the snapshot scheduler
-/// *before* the fallible `create_snapshot` teardown, so the watchdog does not
-/// fight the intentional runtime stop with sidecar-restart attempts. Anything
-/// that abandons the suspend after that point would otherwise leave a live,
-/// paused sandbox with unmonitored sidecars. This guard restores the watchdog
-/// on drop when the runtime is still live. Re-arming reloads the current
-/// SQLite row by sandbox ID instead of restoring this lifecycle operation's
-/// older PID snapshot, so a concurrent sidecar replacement remains
-/// authoritative.
-///
-/// It deliberately re-arms **only the watchdog, not the snapshot scheduler**:
-/// the rolled-back state is `paused`, and a paused sandbox is watchdog-
-/// monitored but not snapshot-scheduled (matching the `pause` RPC, which
-/// removes the scheduler and keeps the watchdog). The scheduler is re-added by
-/// the resume/restore/start path when the sandbox next goes live. Disarm on
-/// the intentional-teardown path, where monitoring is meant to end.
+/// Re-arm watchdog monitoring after a pre-submission failure leaves a live
+/// paused runtime. Encrypted capture disarms this guard before submission:
+/// its producer may still stop the VM, so only refusal recovery may re-arm it.
+/// Reload endpoint authority on re-arm instead of restoring a stale PID.
+/// The snapshot scheduler stays off for paused sandboxes and is restored by
+/// the normal resume/start path.
 pub(super) struct SuspendMonitoringGuard {
     armed: bool,
     watchdog: Arc<crate::watchdog::SandboxWatchdog>,
@@ -144,6 +129,22 @@ impl SandboxManagerService {
     }
 }
 
+/// What a suspend publication failure knows about this suspend's own capture
+/// when it quarantines the row. It decides only the failure reason the
+/// quarantine records, never whether or when the row quarantines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::service) enum CaptureEvidence {
+    /// Classification just found no usable capture of this suspend.
+    ClassifiedNone,
+    /// The failure keeps no capture of this suspend: it came before the
+    /// capture returned, or while the capture's staging was still set to be
+    /// discarded.
+    NoneKept,
+    /// The capture may be kept and nothing classified it since: it may be a
+    /// usable copy on disk.
+    Unclassified,
+}
+
 impl SandboxManagerService {
     pub(in crate::service) fn record_suspend_snapshot_publication_failure_after_begin(
         &self,
@@ -155,6 +156,24 @@ impl SandboxManagerService {
             sandbox_id,
             reason,
             runtime_live,
+            CaptureEvidence::Unclassified,
+        )
+    }
+
+    /// Record a failure that keeps no capture of this suspend: it came before
+    /// the capture returned, or while the capture's staging guard is armed,
+    /// so the staging is discarded on the way out.
+    pub(in crate::service) fn record_suspend_snapshot_publication_failure_without_capture(
+        &self,
+        sandbox_id: &str,
+        reason: &str,
+    ) -> SuspendSnapshotPublicationFailurePersistence {
+        let runtime_live = (self.sandbox_runtime_live)(sandbox_id);
+        self.record_suspend_snapshot_publication_failure_after_begin_with_liveness(
+            sandbox_id,
+            reason,
+            runtime_live,
+            CaptureEvidence::NoneKept,
         )
     }
 
@@ -163,6 +182,7 @@ impl SandboxManagerService {
         sandbox_id: &str,
         reason: &str,
         runtime_live: bool,
+        capture: CaptureEvidence,
     ) -> SuspendSnapshotPublicationFailurePersistence {
         if runtime_live {
             let rolled_back = {
@@ -200,11 +220,30 @@ impl SandboxManagerService {
             }
         }
 
+        // When the runtime is gone and no capture of this suspend is kept,
+        // the retained instance may hold the sandbox's only copy. That's what
+        // the failure reason then records: the shared retention policy reads
+        // it to refuse an ordinary delete and to admit an operator's discard,
+        // and the quarantine keeps the cause as its message. Any other failure
+        // records the cause, as before: its capture may be a usable copy, or,
+        // when a live runtime's rollback failed, the runtime still holds the
+        // sandbox.
         let quarantined = {
             let Ok(db) = self.db_conn() else {
                 return SuspendSnapshotPublicationFailurePersistence::PersistFailed;
             };
-            crate::db::mark_suspending_quarantined(&db, sandbox_id, reason)
+            match capture {
+                CaptureEvidence::ClassifiedNone | CaptureEvidence::NoneKept if !runtime_live => {
+                    crate::db::mark_suspending_quarantined_retaining_only_copy(
+                        &db, sandbox_id, reason,
+                    )
+                }
+                CaptureEvidence::ClassifiedNone
+                | CaptureEvidence::NoneKept
+                | CaptureEvidence::Unclassified => {
+                    crate::db::mark_suspending_quarantined(&db, sandbox_id, reason)
+                }
+            }
         };
         match quarantined {
             Ok(true) => {
@@ -262,25 +301,64 @@ impl SandboxManagerService {
             .map_err(EncryptedCaptureSealError::RemoveRecord)
     }
 
-    /// Seal the newest recorded capture of `sandbox` that is still inside its
-    /// retry window, unless a complete staged capture already awaits
-    /// publication. Every seal retry selects through this; the caller has
-    /// already established that it owns the row's publication. Returns the
-    /// sealed capture, if any.
+    /// Seal only the admitted capture, within its fixed retry window and with
+    /// runtime evidence consistent with the producer's confirmed stop. Both
+    /// periodic and teardown callers hold the row's lifecycle/cleanup guards.
     pub(in crate::service) async fn seal_recorded_encrypted_capture(
         &self,
         sandbox: &crate::db::SandboxRow,
         cache_dir: &std::path::Path,
     ) -> Result<Option<LocalArtifactId>, EncryptedCaptureSealError> {
-        let Some(capture) = recorded_encrypted_capture_to_seal(&cache_dir.join(&sandbox.id))?
-        else {
+        if !sandbox.volume_encryption {
+            return Ok(None);
+        }
+        let attempt = {
+            let db = self
+                .db_conn()
+                .map_err(EncryptedCaptureSealError::OwnerUnavailable)?;
+            crate::db::read::suspend_attempt(&db, &sandbox.id)
+                .map_err(EncryptedCaptureSealError::OwnerRead)?
+        };
+        let Some(attempt) = attempt else {
             return Ok(None);
         };
-        let metadata = read_encrypted_capture_record(&capture.staging_dir)?
-            .ok_or(EncryptedCaptureSealError::MissingRecord)?;
-        self.seal_encrypted_capture(sandbox, &capture.staging_dir, &metadata)
+        if !crate::service::suspend_snapshot_publication::suspend_attempt_retry_open(attempt) {
+            return Ok(None);
+        }
+        let staging_dir =
+            suspend_snapshot_staging_dir(&cache_dir.join(&sandbox.id), attempt.artifact_id);
+        if crate::service::suspend_snapshot_publication::read_capture_refusal(&staging_dir)?
+            .is_some()
+            || crate::service::suspend_snapshot_publication::read_capture_failure(&staging_dir)?
+                .is_some()
+        {
+            // Classification must resolve failed or contradictory refusal/completion
+            // evidence before any seal can remove the completion receipt.
+            return Ok(None);
+        }
+        let Some(metadata) = read_encrypted_capture_record(&staging_dir)? else {
+            return Ok(None);
+        };
+        // Both periodic and teardown recovery enter here. A receipt cannot
+        // authorize sealing while a runtime still holds the memory mapping.
+        // Let classification bound contradictory evidence by admission time.
+        let runtime = self.capture_runtime_observation(&sandbox.id);
+        if runtime != crate::service::suspend_snapshot_publication::RuntimeObservation::Gone {
+            if runtime == crate::service::suspend_snapshot_publication::RuntimeObservation::Live {
+                crate::service::suspend_snapshot_publication::report_live_capture_receipt(
+                    &sandbox.id,
+                );
+            }
+            return Ok(None);
+        }
+        if metadata.local_artifact_id != Some(attempt.artifact_id)
+            || metadata.sandbox_id != sandbox.id
+        {
+            return Err(EncryptedCaptureSealError::RecordIdentityMismatch);
+        }
+        self.seal_encrypted_capture(sandbox, &staging_dir, &metadata)
             .await?;
-        Ok(Some(capture.local_artifact_id))
+        Ok(Some(attempt.artifact_id))
     }
 
     pub(in crate::service) fn record_suspend_snapshot_publication_failure_after_staging(
@@ -292,18 +370,6 @@ impl SandboxManagerService {
         verdicts: &crate::retained_source::RetainedSourceVerdicts,
     ) -> SuspendSnapshotStagingDisposition {
         let runtime_live = (self.sandbox_runtime_live)(sandbox_id);
-        if runtime_live {
-            self.record_suspend_snapshot_publication_failure_after_begin_with_liveness(
-                sandbox_id, reason, true,
-            );
-            // The attempt's guard asks node-manager to remove its staging
-            // after remote transfer ownership ends. State rollback alone is
-            // not evidence that the encoder stopped writing.
-            // A live rollback leaves the watchdog to be re-armed by the
-            // caller's SuspendMonitoringGuard on return.
-            return SuspendSnapshotStagingDisposition::Cleanup;
-        }
-
         let row = {
             let Ok(db) = self.db_conn() else {
                 return SuspendSnapshotStagingDisposition::Preserve;
@@ -342,10 +408,23 @@ impl SandboxManagerService {
             }
         };
 
-        let decision = match classify_suspend_snapshot_publication(
+        let attempt = match self.db_conn().and_then(|db| {
+            crate::db::read::suspend_attempt(&db, sandbox_id)
+                .map_err(|e| Status::internal(e.to_string()))
+        }) {
+            Ok(attempt) => attempt,
+            Err(_) => return SuspendSnapshotStagingDisposition::Preserve,
+        };
+        let decision = match crate::service::suspend_snapshot_publication::classify_suspend_attempt(
             sandbox_dir,
             row.current_local_artifact_id,
-            false,
+            attempt,
+            row.volume_encryption,
+            if row.volume_encryption {
+                self.capture_runtime_observation(sandbox_id)
+            } else {
+                runtime_live.into()
+            },
             verdicts,
         ) {
             Ok(decision) => decision,
@@ -362,31 +441,21 @@ impl SandboxManagerService {
                 return SuspendSnapshotStagingDisposition::Preserve;
             }
             Err(error) => {
-                tracing::warn!(
-                    sandbox_id,
-                    reason,
-                    %error,
-                    "failed to classify interrupted suspend publication"
-                );
-                // `runtime_live` is false on this path (the live branch
-                // returned above), so the rollback-to-paused arm of the
-                // persistence handler is unreachable here.
-                self.record_suspend_snapshot_publication_failure_after_begin_with_liveness(
-                    sandbox_id,
-                    reason,
-                    runtime_live,
-                );
-                if current_staging_dir.exists() {
-                    return SuspendSnapshotStagingDisposition::Preserve;
-                }
-                return SuspendSnapshotStagingDisposition::Cleanup;
+                tracing::warn!(sandbox_id, reason, %error, "suspend publication evidence unavailable; recovery will retry");
+                return SuspendSnapshotStagingDisposition::Preserve;
             }
         };
 
         match decision {
-            SuspendSnapshotPublicationDecision::RuntimeLiveWithoutUsableArtifact => unreachable!(
-                "runtime-live suspend publication failures return before artifact classification"
-            ),
+            SuspendSnapshotPublicationDecision::RuntimeLiveWithoutUsableArtifact => {
+                self.record_suspend_snapshot_publication_failure_after_begin_with_liveness(
+                    sandbox_id,
+                    reason,
+                    true,
+                    CaptureEvidence::Unclassified,
+                );
+                SuspendSnapshotStagingDisposition::Cleanup
+            }
             decision @ (SuspendSnapshotPublicationDecision::StagedComplete(_)
             | SuspendSnapshotPublicationDecision::CanonicalReady(_)) => {
                 let preserve_current_staging = matches!(
@@ -449,28 +518,40 @@ impl SandboxManagerService {
                         }
                     }
                     Err(error) => {
-                        tracing::warn!(
-                            sandbox_id,
-                            reason,
-                            %error,
-                            "failed to finish complete suspend publication after live publish failure"
-                        );
-                        self.record_suspend_snapshot_publication_failure_after_begin_with_liveness(
-                            sandbox_id, reason, false,
-                        );
-                        if preserve_current_staging && current_staging_dir.exists() {
-                            SuspendSnapshotStagingDisposition::Preserve
-                        } else {
-                            SuspendSnapshotStagingDisposition::Cleanup
-                        }
+                        tracing::warn!(sandbox_id, reason, %error, "complete suspend artifact awaits persistence; recovery will retry");
+                        SuspendSnapshotStagingDisposition::Preserve
                     }
                 }
             }
             SuspendSnapshotPublicationDecision::RuntimeGoneWithoutUsableArtifact => {
                 self.record_suspend_snapshot_publication_failure_after_begin_with_liveness(
-                    sandbox_id, reason, false,
+                    sandbox_id,
+                    reason,
+                    false,
+                    CaptureEvidence::ClassifiedNone,
                 );
                 SuspendSnapshotStagingDisposition::Cleanup
+            }
+            decision @ (SuspendSnapshotPublicationDecision::BlockedAttempt(_)
+            | SuspendSnapshotPublicationDecision::CaptureRefused) => {
+                let refused =
+                    matches!(decision, SuspendSnapshotPublicationDecision::CaptureRefused);
+                if let Err(error) = self.apply_suspend_snapshot_publication_recovery_decision(
+                    row,
+                    sandbox_dir.to_path_buf(),
+                    decision,
+                    SuspendSnapshotPublicationRecoveryOrigin::LivePublishFailure,
+                    None,
+                    verdicts,
+                ) {
+                    tracing::warn!(sandbox_id, %error, "cannot persist capture recovery; retaining evidence");
+                    return SuspendSnapshotStagingDisposition::Preserve;
+                }
+                if refused {
+                    SuspendSnapshotStagingDisposition::Cleanup
+                } else {
+                    SuspendSnapshotStagingDisposition::Preserve
+                }
             }
         }
     }
@@ -510,7 +591,7 @@ impl SandboxManagerService {
                 create_started_at,
             );
             let error = format!("cannot connect to node-manager: {e}");
-            self.record_suspend_snapshot_publication_failure_after_begin(&sandbox.id, &error);
+            self.record_suspend_snapshot_publication_failure_without_capture(&sandbox.id, &error);
             emit_suspend_failed_event(
                 &sandbox.id,
                 &suspend_event_details,
@@ -529,7 +610,7 @@ impl SandboxManagerService {
             .await
         {
             let reason = format!("host rootfs sync failed: {e}");
-            self.record_suspend_snapshot_publication_failure_after_begin(&sandbox.id, &reason);
+            self.record_suspend_snapshot_publication_failure_without_capture(&sandbox.id, &reason);
             crate::metrics::snapshot::create_failed(
                 create_kind,
                 create_codec,
@@ -583,7 +664,7 @@ impl SandboxManagerService {
             .await
         {
             let reason = format!("prepare local artifact directory failed: {e}");
-            self.record_suspend_snapshot_publication_failure_after_begin(&sandbox.id, &reason);
+            self.record_suspend_snapshot_publication_failure_without_capture(&sandbox.id, &reason);
             record_artifact_stage_failure(&reason);
             return Err(Status::internal(reason));
         }
@@ -592,7 +673,7 @@ impl SandboxManagerService {
                 "create local artifact staging parent {} failed: {err}",
                 staging_parent.display()
             );
-            self.record_suspend_snapshot_publication_failure_after_begin(&sandbox.id, &reason);
+            self.record_suspend_snapshot_publication_failure_without_capture(&sandbox.id, &reason);
             record_artifact_stage_failure(&reason);
             Status::internal(reason)
         })?;
@@ -601,7 +682,7 @@ impl SandboxManagerService {
                 "create local artifact staging directory {} failed: {err}",
                 staging_dir.display()
             );
-            self.record_suspend_snapshot_publication_failure_after_begin(&sandbox.id, &reason);
+            self.record_suspend_snapshot_publication_failure_without_capture(&sandbox.id, &reason);
             record_artifact_stage_failure(&reason);
             Status::internal(reason)
         })?;
@@ -630,7 +711,7 @@ impl SandboxManagerService {
                     Err(status) => {
                         let reason =
                             format!("local artifact metadata construction failed: {status}");
-                        self.record_suspend_snapshot_publication_failure_after_begin(
+                        self.record_suspend_snapshot_publication_failure_without_capture(
                             &sandbox.id,
                             &reason,
                         );
@@ -639,7 +720,10 @@ impl SandboxManagerService {
                 };
                 if let Err(error) = prepare_encrypted_capture_record(&staging_dir, &metadata) {
                     let reason = format!("record encrypted capture failed: {error}");
-                    self.record_suspend_snapshot_publication_failure_after_begin(&sandbox.id, &reason);
+                    self.record_suspend_snapshot_publication_failure_without_capture(
+                        &sandbox.id,
+                        &reason,
+                    );
                     record_artifact_stage_failure(&reason);
                     return Err(Status::internal(reason));
                 }
@@ -667,7 +751,7 @@ impl SandboxManagerService {
                     Err(error) => {
                         let status = encrypted_snapshot_prepare_error_status(error);
                         let reason = status.message().to_string();
-                        self.record_suspend_snapshot_publication_failure_after_begin(
+                        self.record_suspend_snapshot_publication_failure_without_capture(
                             &sandbox.id,
                             &reason,
                         );
@@ -686,9 +770,8 @@ impl SandboxManagerService {
             // Stop watching first so the watchdog does not race that teardown with
             // sidecar-restart attempts. Idempotent: the removes near the end of
             // suspend are a no-op once already removed. Plaintext keeps its
-            // existing ordering (removed only there). `monitoring_guard` re-arms
-            // the watchdog on any live rollback (or dropped future) after this
-            // point, so the unsubscribe here can never strand a live sandbox.
+            // existing ordering (removed only there). After submission, recovery
+            // re-arms only when producer refusal has settled the row to paused.
             if encrypted {
                 self.watchdog.remove_sandbox(&sandbox.id).await;
                 self.snapshot_scheduler.remove_sandbox(&sandbox.id).await;
@@ -709,40 +792,36 @@ impl SandboxManagerService {
                 },
                 sandbox.execution_metadata.as_ref(),
             );
-            if let Err(e) = node_client
-                .capture_vm_state(request)
-                .await
-            {
+            if encrypted {
+                // All pre-submission checks passed. From this point only a
+                // settled refusal may re-arm monitoring through recovery.
+                monitoring_guard.disarm();
+            }
+            if let Err(e) = node_client.capture_vm_state(request).await {
                 let reason = format!("snapshot failed: {e}");
-                // An RPC failure is not proof that Firecracker stopped. While
-                // it is still live, its mmap is the Diff snapshot's memory base:
-                // unmounting or force-freeing that volume would leave the retry
-                // unable to reuse the base safely. A stopped runtime cannot be
-                // rolled back to paused, so only that path may release before
-                // the failure is quarantined.
-                let runtime_live = (self.sandbox_runtime_live)(&sandbox.id);
-                if enc_snapshot.is_some()
-                    && failed_encrypted_capture_may_release_volume(runtime_live)
-                    && let Err(release_error) =
-                        crate::snapshot_encryption::release_encrypted_snapshot_volume(
-                            &sandbox.id,
-                            sandbox.node_execution_fence(),
-                            "",
-                            &self.node_manager,
-                        )
-                        .await
-                {
-                    tracing::warn!(
-                        sandbox_id = %sandbox.id,
-                        %release_error,
-                        "failed to release encrypted snapshot volume after stopped capture failure"
+                if enc_snapshot.is_some() {
+                    // Only producer-written refusal proves the Diff base was
+                    // untouched. All status codes alone remain ambiguous.
+                    if self.record_suspend_snapshot_publication_failure_after_staging(
+                        &sandbox.id,
+                        &sandbox_dir,
+                        &staging_dir,
+                        &reason,
+                        &crate::retained_source::RetainedSourceVerdicts::default(),
+                    ) == SuspendSnapshotStagingDisposition::Preserve
+                    {
+                        staging_guard.disarm();
+                    }
+                } else {
+                    // The plaintext capture's staging guard is armed, so a
+                    // failed capture keeps nothing of this suspend.
+                    self.record_suspend_snapshot_publication_failure_after_begin_with_liveness(
+                        &sandbox.id,
+                        &reason,
+                        (self.sandbox_runtime_live)(&sandbox.id),
+                        CaptureEvidence::NoneKept,
                     );
                 }
-                self.record_suspend_snapshot_publication_failure_after_begin_with_liveness(
-                    &sandbox.id,
-                    &reason,
-                    runtime_live,
-                );
                 crate::metrics::snapshot::create_failed(
                     create_kind,
                     create_codec,
@@ -775,56 +854,56 @@ impl SandboxManagerService {
             // carried to durable storage as opaque blobs; reflink keeps the copy
             // instant and sparse. The plaintext rootfs codec branch below is skipped
             // for encrypted snapshots (there is no plaintext `rootfs.ext4` to diff).
-            if let Some(metadata) = &encrypted_capture_metadata {
-                // The runtime is gone, so this capture now exists only in the
-                // volume. Commit its record before sealing, so a failed seal
-                // leaves a capture recovery can still seal and publish. The
-                // commit is a rename of the record written before the capture;
-                // if even that fails, the staging filesystem is failing, and
-                // sealing now is the capture's only chance.
-                if let Err(error) = commit_encrypted_capture_record(&staging_dir) {
-                    tracing::error!(
+            if encrypted_capture_metadata.is_some() {
+                match commit_capture_for_receiptless_producer(&staging_dir) {
+                    Ok(true) => tracing::info!(
+                        sandbox_id = %sandbox.id,
+                        "node-manager predates capture receipts; committed the capture record on its reply"
+                    ),
+                    Ok(false) => {}
+                    Err(error) => tracing::error!(
                         sandbox_id = %sandbox.id,
                         %error,
                         "cannot commit encrypted capture record; a failed seal will not be recoverable"
-                    );
+                    ),
                 }
-                if let Err(error) = self
+            }
+            if let Some(metadata) = &encrypted_capture_metadata
+                && let Err(error) = self
                     .seal_encrypted_capture(&sandbox, &staging_dir, metadata)
                     .await
+            {
+                let reason = format!("seal/stage encrypted snapshot volume failed: {error}");
+                if self.record_suspend_snapshot_publication_failure_after_staging(
+                    &sandbox.id,
+                    &sandbox_dir,
+                    &staging_dir,
+                    &reason,
+                    &crate::retained_source::RetainedSourceVerdicts::default(),
+                ) == SuspendSnapshotStagingDisposition::Preserve
                 {
-                    let reason = format!("seal/stage encrypted snapshot volume failed: {error}");
-                    if self.record_suspend_snapshot_publication_failure_after_staging(
-                        &sandbox.id,
-                        &sandbox_dir,
-                        &staging_dir,
-                        &reason,
-                        &crate::retained_source::RetainedSourceVerdicts::default(),
-                    ) == SuspendSnapshotStagingDisposition::Preserve
-                    {
-                        staging_guard.disarm();
-                    }
-                    if matches!(error, EncryptedCaptureSealError::Metadata(_)) {
-                        crate::metrics::snapshot::create_failed(
-                            create_kind,
-                            create_codec,
-                            sandbox.volume_encryption,
-                            "publish",
-                            "metadata_failed",
-                            create_started_at,
-                        );
-                        emit_suspend_failed_event(
-                            &sandbox.id,
-                            &suspend_event_details,
-                            "publish",
-                            "metadata_failed",
-                            reason.clone(),
-                        );
-                    } else {
-                        record_artifact_stage_failure(&reason);
-                    }
-                    return Err(Status::internal(reason));
+                    staging_guard.disarm();
                 }
+                if matches!(error, EncryptedCaptureSealError::Metadata(_)) {
+                    crate::metrics::snapshot::create_failed(
+                        create_kind,
+                        create_codec,
+                        sandbox.volume_encryption,
+                        "publish",
+                        "metadata_failed",
+                        create_started_at,
+                    );
+                    emit_suspend_failed_event(
+                        &sandbox.id,
+                        &suspend_event_details,
+                        "publish",
+                        "metadata_failed",
+                        reason.clone(),
+                    );
+                } else {
+                    record_artifact_stage_failure(&reason);
+                }
+                return Err(Status::internal(reason));
             }
 
             // Codec branch: when the resolved format is `BtrfsSend`,
@@ -922,7 +1001,10 @@ impl SandboxManagerService {
                         // If the runtime is still present, leave the caller
                         // a paused sandbox it can retry with `format=full`.
                         let reason = format!("btrfs-send encode failed: {status}");
-                        self.record_suspend_snapshot_publication_failure_after_begin(&sandbox.id, &reason);
+                        self.record_suspend_snapshot_publication_failure_without_capture(
+                            &sandbox.id,
+                            &reason,
+                        );
                         crate::metrics::snapshot::create_failed(
                             create_kind,
                             create_codec,
@@ -980,7 +1062,7 @@ impl SandboxManagerService {
                     Err(status) => {
                         let reason =
                             format!("local artifact metadata construction failed: {status}");
-                        self.record_suspend_snapshot_publication_failure_after_begin(
+                        self.record_suspend_snapshot_publication_failure_without_capture(
                             &sandbox.id,
                             &reason,
                         );
@@ -994,7 +1076,10 @@ impl SandboxManagerService {
                     retained_rootfs_bytes,
                 ) {
                     let reason = format!("local artifact metadata creation failed: {error}");
-                    self.record_suspend_snapshot_publication_failure_after_begin(&sandbox.id, &reason);
+                    self.record_suspend_snapshot_publication_failure_without_capture(
+                        &sandbox.id,
+                        &reason,
+                    );
                     crate::metrics::snapshot::create_failed(
                         create_kind,
                         create_codec,
@@ -1029,11 +1114,13 @@ impl SandboxManagerService {
             let publish_error = match published {
                 Ok(garbage) => {
                     for path in garbage {
-                        drop(crate::service::recovery::staging_cleanup::reclaim_garbage_now(
-                            sandbox.id.clone(),
-                            path,
-                            self.node_manager.clone(),
-                        ));
+                        drop(
+                            crate::service::recovery::staging_cleanup::reclaim_garbage_now(
+                                sandbox.id.clone(),
+                                path,
+                                self.node_manager.clone(),
+                            ),
+                        );
                     }
                     None
                 }
@@ -1086,6 +1173,9 @@ impl SandboxManagerService {
             );
 
             let snapshot_dir_string = snapshot_dir.to_string_lossy().into_owned();
+            // Sized before the backup handoff: once it's queued, an uploaded
+            // rootfs stream can be reclaimed from the directory.
+            let published_bytes = published_snapshot_bytes(&snapshot_dir).await;
             if let SuspendDurability::RemoteBeforeTeardown {
                 execution_generation,
             } = durability
@@ -1101,16 +1191,20 @@ impl SandboxManagerService {
                     )
                 };
                 if let Err(error) = stage_result {
-                    let reason = format!("persist durable suspend artifact before teardown: {error}");
-                    self.record_suspend_snapshot_publication_failure_after_begin(&sandbox.id, &reason);
+                    let reason =
+                        format!("persist durable suspend artifact before teardown: {error}");
+                    self.record_suspend_snapshot_publication_failure_after_begin(
+                        &sandbox.id,
+                        &reason,
+                    );
                     return Err(Status::internal(reason));
                 }
 
                 let staged_artifact = crate::db::LocalArtifactRow {
                     local_artifact_id,
                     sandbox_id: sandbox.id.clone(),
-                    artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
-                    artifact_origin: pplx_space_common_core::types::ArtifactOrigin::Suspend,
+                    artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
+                    artifact_origin: pplx_space_snapshot_model::ArtifactOrigin::Suspend,
                     snapshot_name: None,
                     local_path: snapshot_dir_string.clone(),
                 };
@@ -1137,15 +1231,13 @@ impl SandboxManagerService {
             // the runtime intact and makes this suspend retryable.
             let upload_queue_started_at = std::time::Instant::now();
             if durability == SuspendDurability::NodeLocal {
-                let enqueue_result = self
-                    .enqueue_node_local_suspend_backup(
-                        &sandbox,
-                        local_artifact_id,
-                        &snapshot_dir_string,
-                        published_format,
-                    )
-                    .await;
-                self.require_node_local_backup_handoff(&sandbox.id, local_artifact_id, enqueue_result)?;
+                self.prepare_node_local_suspend_cleanup(
+                    &sandbox,
+                    local_artifact_id,
+                    &snapshot_dir_string,
+                    published_format,
+                )
+                .await?;
             }
             crate::metrics::snapshot::create_step(
                 create_kind,
@@ -1200,6 +1292,7 @@ impl SandboxManagerService {
                 create_kind,
                 create_codec,
                 sandbox.volume_encryption,
+                published_bytes,
                 create_started_at,
             );
             Ok(())
@@ -1218,6 +1311,55 @@ impl SandboxManagerService {
             }
         }
         result
+    }
+
+    /// Publication is already validated under wake, artifact and cleanup fences.
+    /// A live plaintext VM can roll back, but must keep the newly published
+    /// artifact: publication retired its predecessor. Otherwise cleanup owns
+    /// handoff retries and the bounded terminal decision.
+    pub(super) async fn prepare_node_local_suspend_cleanup(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        artifact: LocalArtifactId,
+        path: &str,
+        format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
+    ) -> Result<(), Status> {
+        if !sandbox.volume_encryption
+            && (self.sandbox_runtime_live)(&sandbox.id)
+            && let Err(error) = tokio::time::timeout(
+                Duration::from_secs(30),
+                self.enqueue_node_local_suspend_backup(sandbox, artifact, path, Some(format)),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(ArtifactBackupSubmissionError::Other(
+                    "backup handoff attempt timed out".to_owned(),
+                ))
+            })
+            && (self.sandbox_runtime_live)(&sandbox.id)
+        {
+            let applied = crate::db::rollback_published_suspend_to_paused(
+                &*self.db_conn()?,
+                sandbox,
+                artifact,
+                path,
+            )
+            .map_err(|error| {
+                Status::internal(format!("retain published suspend on rollback: {error}"))
+            })?;
+            if !applied {
+                return Err(Status::aborted("published suspend rollback superseded"));
+            }
+            mark_sandbox_dirty(&self.db, &sandbox.id);
+            return Err(artifact_backup_fence_status(error.to_string()));
+        }
+        crate::db::pin_suspended_artifact_for_cleanup(
+            &*self.db_conn()?,
+            &sandbox.id,
+            artifact,
+            path,
+        )
+        .map_err(|error| Status::internal(format!("persist published suspend cleanup: {error}")))
     }
 
     pub(super) async fn finalize_suspended_runtime(
@@ -1423,4 +1565,19 @@ pub(in crate::service) enum RetainedUploadError {
         retained: crate::retained_source::RetainedSource,
         check: crate::retained_source::RetainedSourceCheck,
     },
+}
+
+/// Apparent size of the files a published snapshot directory holds, for the
+/// create metrics' size bucket. The directory is flat: each artifact is a
+/// top-level file. `None` when the directory can't be read.
+async fn published_snapshot_bytes(dir: &std::path::Path) -> Option<u64> {
+    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+    let mut total = 0u64;
+    while let Some(entry) = entries.next_entry().await.ok()? {
+        let metadata = entry.metadata().await.ok()?;
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Some(total)
 }

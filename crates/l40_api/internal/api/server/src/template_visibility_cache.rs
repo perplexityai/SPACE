@@ -143,7 +143,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use pplx_space_common_core::types::TemplateVisibility;
+use pplx_space_template_model::TemplateVisibility;
 use time::OffsetDateTime;
 
 /// Both windows default to **disabled**. Unset means off, everywhere.
@@ -164,7 +164,7 @@ const DEFAULT_MAX_ENTRIES: NonZeroUsize = NonZeroUsize::new(1024).expect("1024 i
 ///
 /// Sized against the **name validator**, not against the prefetch set: template
 /// names are rejected above 255 bytes
-/// (`common/core/src/types/template/identity.rs`), and only a successful read
+/// (`l20_domain/template/model/src/identity.rs`), and only a successful read
 /// reaches [`TemplateVisibilityCache::store`], so every cacheable key came
 /// through that validator and fits with one byte to spare. That one byte is the
 /// whole headroom — if the validator's limit ever rises, this must rise with it,

@@ -101,3 +101,28 @@ fn the_drain_stub_states_what_forced_mode_destroys() {
         "the body description must cover the already-draining edge; got {body:?}"
     );
 }
+
+/// The `:drain` stub declares the v2 drain's fields: `engine`'s values,
+/// `hold_seconds`'s type and bounds, and no `deadline`, and its `409` names
+/// the two stable codes callers match on.
+#[test]
+fn the_drain_stub_declares_the_v2_fields() {
+    let spec = admin_openapi_value();
+    let drain = &spec["paths"]["/nodes/{node_id}:drain"]["post"];
+    let properties = &drain["requestBody"]["content"]["application/json"]["schema"]["properties"];
+    assert_eq!(
+        properties["engine"]["enum"],
+        serde_json::json!(["v1", "v2"])
+    );
+    assert!(properties.get("deadline").is_none());
+    let hold = &properties["hold_seconds"];
+    assert_eq!(hold["type"], "integer");
+    assert_eq!(hold["minimum"], 0);
+    assert_eq!(hold["maximum"], 31_536_000);
+    let conflict = drain["responses"]["409"]["description"]
+        .as_str()
+        .expect("the 409 description");
+    for code in ["drain_v2_node_heartbeat_stale", "drain_v2_evacuation_cap"] {
+        assert!(conflict.contains(code), "{code:?}: {conflict:?}");
+    }
+}

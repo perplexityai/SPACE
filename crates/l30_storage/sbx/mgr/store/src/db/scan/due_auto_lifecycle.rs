@@ -1,6 +1,6 @@
 //! Sandboxes whose auto-lifecycle deadline has passed.
 
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use crate::db::{AutoLifecycleScan, Connection, DueAutoLifecycleSandbox, Result};
 

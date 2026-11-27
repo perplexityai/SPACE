@@ -31,6 +31,8 @@ class SandboxConfig:
     allow_internet_access: bool | None = None
     network: NetworkConfig | None = None
     envs: Mapping[str, str] | None = None
+    metadata: Mapping[str, str] | None = None
+    """Create metadata for the scenario's sandboxes, such as `space.resources`."""
     kind_byok: bool = False
     kind_cold_create: KindColdCreateConfig | None = None
     kind_warm_pool: KindWarmPoolConfig | None = None
@@ -39,6 +41,14 @@ class SandboxConfig:
 
     For scenarios that need a worker to stay without the sandbox's template
     once it is removed there; `template` is then not used.
+    """
+    kind_execution_environment: str | None = None
+    """Create the sandbox from a seed bound to this compiled environment.
+
+    Setup admits the environment on every Kind node and builds seed bound to
+    it under no tag (`space_smoke/execution_environment.py`); the sandbox is
+    created from that build's digest, and `template` is not used. The
+    scenario withdraws the admission itself, after deleting the sandbox.
     """
 
     def __post_init__(self) -> None:
@@ -56,6 +66,16 @@ class SandboxConfig:
             raise ValueError(
                 "a dedicated template replaces the configured template and its "
                 "cold-create or warm-pool setup"
+            )
+        if self.kind_execution_environment is not None and (
+            self.template != "seed"
+            or self.kind_dedicated_template
+            or self.kind_cold_create is not None
+            or self.kind_warm_pool is not None
+        ):
+            raise ValueError(
+                "an execution environment's seed replaces the configured template and "
+                "its dedicated, cold-create or warm-pool setup"
             )
 
 

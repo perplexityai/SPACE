@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
-use pplx_space_common_core::host::linux::paths::RUNTIME_SUPERVISOR_SOCKET;
+use pplx_space_host_layout::paths::RUNTIME_SUPERVISOR_SOCKET;
 use pplx_space_node_runtime_supervisor::{
     DEFAULT_JAILER_START_TIMEOUT, RuntimeSupervisorRunConfig, SIDECAR_LAUNCHER_FD_ARG_NAME,
 };

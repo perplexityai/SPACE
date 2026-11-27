@@ -3,8 +3,13 @@ use super::disk::*;
 use super::network_helpers::*;
 use super::validation::*;
 use super::*;
-use pplx_space_common_core::host::linux::paths;
-use pplx_space_common_core::types::{LinuxPid, SandboxId};
+use pplx_space_host_layout::paths;
+use pplx_space_linux_ids::LinuxPid;
+use pplx_space_sandbox_model::SandboxId;
+
+use crate::metrics::node_memory::{
+    MemoryAdmissionOutcome, admission_booked_growth, admission_decision,
+};
 
 pub(super) fn registered_firecracker_pid(
     run_dir: &Path,
@@ -114,6 +119,32 @@ pub(super) enum AllocateNewLeaseError {
     Slot(#[from] AllocateSlotError),
 }
 
+fn record_memory_admission_error(error: &MemoryAdmissionEvaluationError) {
+    let (outcome, booked_growth_mib) = match error {
+        MemoryAdmissionEvaluationError::NodeMemory(_) => {
+            (MemoryAdmissionOutcome::NodeMemoryUnobservable, None)
+        }
+        MemoryAdmissionEvaluationError::Admission(MemoryAdmissionError::InsufficientCapacity {
+            existing_growth_reserve_mib,
+            ..
+        }) => (
+            MemoryAdmissionOutcome::InsufficientCapacity,
+            Some(*existing_growth_reserve_mib),
+        ),
+        MemoryAdmissionEvaluationError::Admission(MemoryAdmissionError::RequirementOverflow {
+            existing_growth_reserve_mib,
+            ..
+        }) => (
+            MemoryAdmissionOutcome::RequirementOverflow,
+            Some(*existing_growth_reserve_mib),
+        ),
+    };
+    admission_decision(outcome);
+    if let Some(booked_growth_mib) = booked_growth_mib {
+        admission_booked_growth("host", booked_growth_mib);
+    }
+}
+
 impl NodeManagerService {
     pub(super) async fn allocate_new_lease(
         &self,
@@ -121,22 +152,32 @@ impl NodeManagerService {
         pod_netns: Option<&str>,
         sandbox_cgroup_memory_mib: u64,
     ) -> Result<SlotInfo, AllocateNewLeaseError> {
-        let observed_active_leases = self.pool.active_memory_reservations()?;
+        let observed_active_leases = self.pool.active_memory_reservations().inspect_err(|_| {
+            admission_decision(MemoryAdmissionOutcome::ReservationsUnobservable)
+        })?;
         let observation = self
             .memory_admission_config
             .observe_active_leases(&observed_active_leases, &self.memory_admission_sources)
             .await
-            .map_err(MemoryAdmissionEvaluationError::from)?;
+            .map_err(MemoryAdmissionEvaluationError::from)
+            .inspect_err(record_memory_admission_error)?;
         let allocation = {
             let _guard = self.memory_admission_lock.lock().await;
-            let active_leases_at_commit = self.pool.active_memory_reservations()?;
-            self.memory_admission_config
+            let active_leases_at_commit =
+                self.pool.active_memory_reservations().inspect_err(|_| {
+                    admission_decision(MemoryAdmissionOutcome::ReservationsUnobservable)
+                })?;
+            let measurement = self
+                .memory_admission_config
                 .check_new_allocation_at_commit(
                     sandbox_cgroup_memory_mib,
                     &observation,
                     &active_leases_at_commit,
                 )
-                .map_err(MemoryAdmissionEvaluationError::from)?;
+                .map_err(MemoryAdmissionEvaluationError::from)
+                .inspect_err(record_memory_admission_error)?;
+            admission_decision(MemoryAdmissionOutcome::Accepted);
+            admission_booked_growth("host", measurement.existing_growth_reserve_mib);
             self.pool.claim_allocation(
                 &sandbox_id.to_string(),
                 pod_netns,
@@ -349,7 +390,10 @@ impl NodeManagerService {
                     SandboxEventSource::NodeManager,
                 )
                 .emit_with(details);
-                return Err(Status::resource_exhausted(error.to_string()));
+                return Err(Status::resource_exhausted(format!(
+                    "{} {error}",
+                    pplx_space_node_mgr_client::MEMORY_ADMISSION_REFUSAL_PREFIX
+                )));
             }
             Err(AllocateNewLeaseError::Slot(error)) => {
                 let status = allocate_error_to_status(error);
@@ -426,6 +470,10 @@ impl NodeManagerService {
         let ns_name = info.ns_name();
 
         let ns_path = info.ns_path();
+        let external_address = match pod_netns {
+            Some(netns) => read_external_address(sandbox_id, netns).await,
+            None => None,
+        };
 
         Ok(Response::new(AllocateResponse {
             slot: info.slot,
@@ -438,6 +486,7 @@ impl NodeManagerService {
             slot_generation: info.generation,
             slot_label: info.slot_label(),
             sandbox_uid: info.sandbox_uid,
+            external_address,
         }))
     }
 
@@ -509,13 +558,13 @@ impl NodeManagerService {
             let sandbox_uid = info.sandbox_uid;
             let net_id = NetId::from_slot_info(info);
             let expected_spaced_host_peer = (req.program
-                == pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN)
+                == pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN)
                 .then(|| {
                     registered_firecracker_pid(Path::new(RUN_DIR), &req.sandbox_id).map(|pid| {
                         ExpectedSpacedHostPeer::new(
                             pid,
                             sandbox_uid,
-                            pplx_space_common_core::types::guest_image::QualifiedGuestAgent::Absent,
+                            pplx_space_execution_spec::guest_image::QualifiedGuestAgent::Absent,
                         )
                     })
                 })
@@ -536,10 +585,9 @@ impl NodeManagerService {
                 let runtime = self
                     .recorded_execution(req.sandbox_id.clone())
                     .await?
-                    .map_or(
-                        pplx_space_common_core::types::RuntimeKind::Firecracker,
-                        |e| e.runtime().kind,
-                    );
+                    .map_or(pplx_space_execution_spec::RuntimeKind::Firecracker, |e| {
+                        e.runtime().kind
+                    });
                 let guest_agent = self
                     .recorded_guest_profile(req.sandbox_id.clone())
                     .await
@@ -548,7 +596,7 @@ impl NodeManagerService {
                     })?
                     .map_or(
                         // Missing records belong to pre-contract Linux sandboxes.
-                        pplx_space_common_core::types::guest_image::QualifiedGuestAgent::LinuxV1,
+                        pplx_space_execution_spec::guest_image::QualifiedGuestAgent::LinuxV1,
                         |profile| profile.agent_protocol(),
                     );
                 Some(peer.for_runtime(runtime).for_guest_agent(guest_agent))
@@ -629,7 +677,7 @@ impl NodeManagerService {
         })?;
 
         // Set up TPROXY rules if launching net-gateway (needs UID for anti-loop rule).
-        if req.program == pplx_space_common_core::host::linux::paths::NET_GATEWAY_SVC_BIN {
+        if req.program == pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN {
             let details = || {
                 SandboxEventDetails::default()
                     .operation("tproxy_setup")
@@ -644,7 +692,7 @@ impl NodeManagerService {
             )
             .emit_with(details());
             let dhcp = self.recorded_guest_network(req.sandbox_id.clone()).await?
-                == pplx_space_common_core::types::guest_image::GuestNetwork::SlotDhcpV1;
+                == pplx_space_execution_spec::guest_image::GuestNetwork::SlotDhcpV1;
             net::setup_tproxy(&ns_name, process_uid, &vpeer, dhcp).map_err(|e| {
                 let status = Status::internal(format!("setup tproxy failed: {e}"));
                 SandboxEvent::new(
@@ -665,8 +713,7 @@ impl NodeManagerService {
         }
 
         // Build pre-exec sockets for net-gateway (TPROXY needs IP_TRANSPARENT as root)
-        let pre_exec_sockets = if req.program
-            == pplx_space_common_core::host::linux::paths::NET_GATEWAY_SVC_BIN
+        let pre_exec_sockets = if req.program == pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN
         {
             vec![
                 launch::PreExecSocket {
@@ -682,6 +729,7 @@ impl NodeManagerService {
                     transparent: true,
                     recvorigdstaddr: false,
                     fd_arg: "--tcp-fd".to_string(),
+                    inherited_fd: None,
                 },
                 launch::PreExecSocket {
                     bind_addr: format!("0.0.0.0:{}", crate::firewall::NETGTW_UDP_PORT)
@@ -696,15 +744,15 @@ impl NodeManagerService {
                     transparent: true,
                     recvorigdstaddr: true,
                     fd_arg: "--udp-fd".to_string(),
+                    inherited_fd: None,
                 },
             ]
         } else {
             vec![]
         };
 
-        let grant_cap =
-            req.program == pplx_space_common_core::host::linux::paths::NET_GATEWAY_SVC_BIN;
-        let pid = self
+        let grant_cap = req.program == pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN;
+        let launched = self
             .runtime_supervisor
             .launch_sidecar(pplx_space_node_runtime_core::proto::LaunchSidecarRequest {
                 execution_id: req
@@ -731,6 +779,7 @@ impl NodeManagerService {
                     )
                     .collect(),
                 grant_cap_net_admin: grant_cap,
+                replace_pid: req.replace_gateway_pid.filter(|_| is_gateway),
             })
             .await
             .map_err(|error| {
@@ -738,8 +787,8 @@ impl NodeManagerService {
                 emit_launch_failed(typed_sandbox_id, &req.program, status.message());
                 status
             })?
-            .into_inner()
-            .pid;
+            .into_inner();
+        let (pid, inherited_gateway_sockets) = (launched.pid, launched.inherited_sockets);
 
         if let Err(error) = self.pool.set_pid(&req.sandbox_id, pid) {
             tracing::error!(
@@ -766,7 +815,7 @@ impl NodeManagerService {
             )));
         }
 
-        if req.program == pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN {
+        if req.program == pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN {
             if let Some(socket_path) = req.args.windows(2).find_map(|args| {
                 (args.first()? == "--socket")
                     .then(|| args.get(1).map(String::as_str))
@@ -801,7 +850,10 @@ impl NodeManagerService {
                 .sandbox_uid(sandbox_uid.to_string()),
         );
 
-        Ok(Response::new(LaunchResponse { pid }))
+        Ok(Response::new(LaunchResponse {
+            pid,
+            inherited_gateway_sockets,
+        }))
     }
 
     pub(super) async fn release(
@@ -1253,3 +1305,18 @@ impl NodeManagerService {
 #[cfg(test)]
 #[cfg(target_os = "linux")]
 pub(super) mod tests;
+
+/// Best effort: a caller without the address falls back to its own source.
+async fn read_external_address(sandbox_id: &str, netns: String) -> Option<String> {
+    match tokio::task::spawn_blocking(move || net::external_ipv4(&netns)).await {
+        Ok(Ok(ip)) => Some(ip.to_string()),
+        Ok(Err(error)) => {
+            tracing::warn!(sandbox_id, %error, "failed to read external netns address");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(sandbox_id, %error, "external netns address read task failed");
+            None
+        }
+    }
+}

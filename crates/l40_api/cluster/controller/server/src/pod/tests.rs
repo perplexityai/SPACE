@@ -1,5 +1,6 @@
-use pplx_space_common_core::types::UserId;
-use pplx_space_common_core::types::{OrgId, SandboxId};
+use pplx_space_accounts::OrgId;
+use pplx_space_accounts::UserId;
+use pplx_space_sandbox_model::SandboxId;
 use uuid::Uuid;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -7,8 +8,16 @@ use std::str::FromStr;
 
 use k8s_openapi::api::core::v1::{NodeSelectorRequirement, PodCondition, PodSpec, PodStatus};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use pplx_space_accounts::SandboxOwner;
+use pplx_space_byte_size::MemorySize;
 use pplx_space_cluster_pool::{PoolSlot, PoolSlotState};
-use pplx_space_common_core::kubernetes::{
+use pplx_space_content_digest::{ContentHash, Digest};
+use pplx_space_execution_spec::VcpuCount;
+use pplx_space_node_model::{
+    NodeGroup, NodeGroupId, NodeGroupName, NodeGroupPolicy, TemplateCompatSpec,
+};
+use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_pod::{
     DEFAULT_SANDBOX_INTERNAL_CONTROL_TOKEN_KEY, DEFAULT_SANDBOX_INTERNAL_SECRET_NAME,
     DEFAULT_SANDBOX_INTERNAL_TOKEN_KEY, DEFAULT_SANDBOX_POD_IMAGE, DEFAULT_SANDBOX_RUNTIME_CLASS,
     PodToleration, SANDBOX_ACTIVATION_ATTEMPT_ID_ANNOTATION, SANDBOX_AUTO_LIFECYCLE_ANNOTATION,
@@ -18,10 +27,7 @@ use pplx_space_common_core::kubernetes::{
     SANDBOX_POOL_ROLE_KEY, SANDBOX_POOL_ROLE_WARM, SANDBOX_POOL_SLOT_ID_KEY,
     SANDBOX_TEMPLATE_ANNOTATION, SANDBOX_VCPU_ANNOTATION, SandboxRuntimePodMetadata,
 };
-use pplx_space_common_core::types::{
-    ContentHash, Digest, MemorySize, NodeGroup, NodeGroupId, NodeGroupName, NodeGroupPolicy,
-    PolicyAuthority, SandboxOwner, TemplateCompatSpec, TemplateName, TemplateVisibility, VcpuCount,
-};
+use pplx_space_template_model::{TemplateName, TemplateVisibility};
 use time::OffsetDateTime;
 
 use super::*;
@@ -243,7 +249,7 @@ fn cluster_controller_built_restore_drops_source_node_pin_and_omits_tolerations(
         &pool_pod_config().for_namespace("space"),
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: evacuation_common("space-sbx-evac-1", &env),
             runtime,
             fork_disk_restore: None,
@@ -309,7 +315,7 @@ fn cluster_controller_built_restore_renders_configured_placement() {
         &pool_pod_config().for_namespace("space"),
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: evacuation_common("space-sbx-evac-2", &env),
             runtime,
             fork_disk_restore: None,
@@ -505,6 +511,7 @@ fn evacuation_runtime(_sandbox_owner: &SandboxOwner) -> SandboxRuntimePodMetadat
         memory_mib: None,
         disk_mib: None,
         disk_io_limits: Default::default(),
+        client_id: None,
     }
 }
 
@@ -529,7 +536,7 @@ fn evacuation_common<'a>(
 /// so the selector it composes must equal the `nodeSelector` this module
 /// actually renders. Both sides now go through `base_node_selector`, so the
 /// composition itself cannot drift — that half is covered by
-/// `common/core/src/k8s/node_selector/tests.rs`.
+/// `crates/l40_api/sandbox/pod/src/node_selector/tests.rs`.
 ///
 /// This is not therefore tautological. `build_sandbox_pod` seeds its map from
 /// `base_node_selector().into_labels()` and then keeps writing to it, so the
@@ -554,7 +561,7 @@ fn node_group_labeler_selector_matches_the_rendered_pod_node_selector() {
         &values.for_namespace("space"),
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: evacuation_common("space-sbx-selector-diff", &env),
             runtime,
             fork_disk_restore: None,
@@ -589,7 +596,7 @@ fn node_group_labeler_selector_matches_the_rendered_pod_node_selector() {
 
 #[test]
 fn build_pool_pod_records_its_environment_and_requires_it_only_when_on() {
-    use pplx_space_common_core::kubernetes::{
+    use pplx_space_sandbox_pod::{
         PodEnvironment, SANDBOX_ENVIRONMENT_ANNOTATION, environment_label_key,
     };
     let slot = pool_slot();

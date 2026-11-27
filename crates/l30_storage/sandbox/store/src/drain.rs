@@ -30,21 +30,23 @@
 //! (`*_query`) are public only because the drain's Postgres tests run them
 //! directly. Production code calls the function here that binds each one.
 
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, LocalArtifactId, NodeDrainMode, NodeDrainPhase, NodeId,
-    PositiveDuration, SandboxId, SandboxLifecycle,
-};
+use pplx_space_accounts::NodeId;
+use pplx_space_durations::PositiveDuration;
+use pplx_space_node_model::{NodeDrainMode, NodeDrainPhase};
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 
 use std::sync::LazyLock;
+use std::time::Duration;
 
-use pplx_space_common_core::sql;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_portability::{
     current_disk_artifact_backup_ready, current_suspend_snapshot_ready,
     failed_repair_revert_eligibility, inflight_suspend_upload_exists, latest_full_snapshot_ready,
     newest_full_snapshot_unambiguous, pod_less_drain_revert_loses_no_newer_bytes,
     recoverable_suspend_snapshot_exists, snapshot_durable_for_source_release,
 };
-use sqlx::{Postgres, Transaction};
+use pplx_space_sql_locator::sql;
 
 /// Saturating seconds-as-`i64` for SQL binds; any value above `i64::MAX`
 /// is "never" in human terms.
@@ -73,11 +75,11 @@ fn secs_bind(duration: PositiveDuration) -> i64 {
 /// it to `suspending` with the pre-evacuation lifecycle as the marker, or
 /// resumes a claim that already carries the same marker.
 pub async fn claim_evacuation_suspend(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     source_node_id: NodeId,
     pre_lifecycle: SandboxLifecycle,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let claimed = sqlx::query(sql!(
         "UPDATE sandboxes
             SET lifecycle = 'suspending',
@@ -97,6 +99,7 @@ pub async fn claim_evacuation_suspend(
                  WHERE n.id = $3
                    AND n.drain_phase = $4
                    AND n.drain_mode = $5
+                   AND n.drain_engine IS NULL
             )"
     ))
     .bind(sandbox_id)
@@ -104,7 +107,7 @@ pub async fn claim_evacuation_suspend(
     .bind(source_node_id)
     .bind(NodeDrainPhase::Draining)
     .bind(NodeDrainMode::Forced)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(claimed.rows_affected() == 1)
 }
@@ -285,12 +288,12 @@ pub async fn claim_evacuation_suspend(
 /// Writes an **operation step**: the marker is the evacuation's claim on the
 /// row.
 pub async fn claim_stopped_evacuation(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     source_node_id: NodeId,
     allow_new_claims: bool,
     reused_durable_artifact: Option<LocalArtifactId>,
-) -> Result<StoppedEvacuationClaim, sqlx::Error> {
+) -> Result<StoppedEvacuationClaim, DbError> {
     let durable = current_disk_artifact_backup_ready("s");
     // The `prior` CTE reads the marker as it was before this statement: a
     // single statement evaluates against one snapshot, so the join yields the
@@ -373,6 +376,7 @@ pub async fn claim_stopped_evacuation(
                  WHERE n.id = $2
                    AND n.drain_phase = $3
                    AND n.drain_mode = $4
+                   AND n.drain_engine IS NULL
             )
       RETURNING prior.evacuation_restore_target IS NULL"
     );
@@ -383,7 +387,7 @@ pub async fn claim_stopped_evacuation(
         .bind(NodeDrainMode::Forced)
         .bind(allow_new_claims)
         .bind(reused_durable_artifact)
-        .fetch_optional(executor)
+        .fetch_optional(executor.into_sqlx())
         .await?;
     Ok(match claimed {
         Some(true) => StoppedEvacuationClaim::Claimed,
@@ -437,8 +441,10 @@ impl StoppedEvacuationClaim {
 ///
 /// * Without the `nodes` term an `:undrain` landing between the claim and here
 ///   would still plant a pin. The claim and the teardown authorization both
-///   ask too; the teardown's placement clear does not (it re-proves only that
-///   no execution is active), which is recorded as an enablement blocker.
+///   ask too; the teardown's placement clear does not (it re-proves the
+///   `stopped` lifecycle, the marker, the durable disk, residence on the
+///   source node and that no execution is active, not the node's drain
+///   state), which is recorded as an enablement blocker.
 /// * Without the pin term it wrote whatever identity the node handed back over
 ///   whatever was already there. Benign in the shape the claim guarantees —
 ///   the claim proved the row pinless, so there is nothing to overwrite — but
@@ -468,11 +474,11 @@ impl StoppedEvacuationClaim {
 /// Writes an **observed projection**: the identity of the artifact the node
 /// just published.
 pub async fn record_stopped_evacuation_artifact(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     source_node_id: NodeId,
     local_artifact_id: LocalArtifactId,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let written = sqlx::query(sql!(
         "UPDATE sandboxes
             SET current_local_artifact_id = $4,
@@ -496,6 +502,7 @@ pub async fn record_stopped_evacuation_artifact(
                  WHERE n.id = $2
                    AND n.drain_phase = $8
                    AND n.drain_mode = $9
+                   AND n.drain_engine IS NULL
             )"
     ))
     .bind(sandbox_id)
@@ -507,7 +514,7 @@ pub async fn record_stopped_evacuation_artifact(
     .bind(SandboxLifecycle::Stopped.as_str())
     .bind(NodeDrainPhase::Draining)
     .bind(NodeDrainMode::Forced)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(written.rows_affected() == 1)
 }
@@ -524,10 +531,10 @@ pub async fn record_stopped_evacuation_artifact(
 /// calls it only from the `SubstrateSink::evacuate_sandbox` call that made the
 /// claim, after that call's suspend failed.
 pub async fn revert_evacuation_suspend_claim(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     pre_lifecycle: SandboxLifecycle,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let reverted = sqlx::query(sql!(
         "UPDATE sandboxes s
             SET lifecycle = $2,
@@ -544,7 +551,7 @@ pub async fn revert_evacuation_suspend_claim(
     ))
     .bind(sandbox_id)
     .bind(pre_lifecycle.as_str())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(reverted.rows_affected() == 1)
 }
@@ -557,15 +564,15 @@ pub async fn revert_evacuation_suspend_claim(
 /// re-checked. A row that already left `suspending` matches nothing, and the
 /// drain does not ask whether it matched.
 pub async fn commit_evacuation_suspend(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE sandboxes SET lifecycle = 'suspended'
              WHERE id = $1 AND lifecycle = 'suspending'"
     ))
     .bind(sandbox_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -579,10 +586,10 @@ pub async fn commit_evacuation_suspend(
 /// Writes an **operation step**: it ends the evacuation. The guard is the
 /// `restoring` lifecycle alone; the marker is not re-checked.
 pub async fn finalize_evacuation_restore(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     target_lifecycle: SandboxLifecycle,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let finalized = sqlx::query(sql!(
         "UPDATE sandboxes
                 SET lifecycle = $2,
@@ -592,7 +599,7 @@ pub async fn finalize_evacuation_restore(
     ))
     .bind(sandbox_id)
     .bind(target_lifecycle.as_str())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(finalized.rows_affected() == 1)
 }
@@ -639,17 +646,17 @@ pub fn schedule_restore_retry_query() -> &'static str {
 /// absurd setting degrades to "interval out of range" instead of a negative
 /// interval that would silently disable the backoff.
 pub async fn schedule_restore_retry(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     backoff_base: PositiveDuration,
     backoff_cap: PositiveDuration,
-) -> Result<Option<i32>, sqlx::Error> {
-    sqlx::query_scalar::<_, i32>(schedule_restore_retry_query())
+) -> Result<Option<i32>, DbError> {
+    Ok(sqlx::query_scalar::<_, i32>(schedule_restore_retry_query())
         .bind(sandbox_id)
         .bind(secs_bind(backoff_base))
         .bind(secs_bind(backoff_cap))
-        .fetch_optional(executor)
-        .await
+        .fetch_optional(executor.into_sqlx())
+        .await?)
 }
 
 /// Re-drive evacuation rows stranded after their local suspended artifact was
@@ -691,12 +698,14 @@ pub fn redrive_stranded_suspending_query() -> String {
 /// execution and the published artifact or ready snapshot, that a suspend the
 /// controller never committed did finish.
 pub async fn redrive_stranded_suspending_evacuations(
-    executor: impl sqlx::PgExecutor<'_>,
-) -> Result<Vec<SandboxId>, sqlx::Error> {
+    executor: impl Executor<'_>,
+) -> Result<Vec<SandboxId>, DbError> {
     let query = redrive_stranded_suspending_query();
-    sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .fetch_all(executor)
-        .await
+    Ok(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
+            .fetch_all(executor.into_sqlx())
+            .await?,
+    )
 }
 
 /// `$1` = sandbox id, `$2` = source node id. Atomic mark-failed for a sandbox
@@ -737,15 +746,15 @@ pub fn mark_sandbox_lost_query() -> String {
 /// Writes an **inference**: a drain give-up. It refuses while a durable
 /// snapshot exists or an upload is in flight from any node.
 pub async fn mark_sandbox_lost(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     source_node_id: NodeId,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let query = mark_sandbox_lost_query();
     let result = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
         .bind(sandbox_id)
         .bind(source_node_id)
-        .execute(executor)
+        .execute(executor.into_sqlx())
         .await?;
     Ok(result.rows_affected())
 }
@@ -805,17 +814,17 @@ pub fn mark_sandbox_lost_on_gone_node_query() -> String {
 ///
 /// Writes an **inference**: a drain give-up on the cloud provider's verdict.
 pub async fn mark_sandbox_lost_on_gone_node(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     source_node_id: NodeId,
     expected_uid: Option<&str>,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let query = mark_sandbox_lost_on_gone_node_query();
     let result = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
         .bind(sandbox_id)
         .bind(source_node_id)
         .bind(expected_uid)
-        .execute(executor)
+        .execute(executor.into_sqlx())
         .await?;
     Ok(result.rows_affected())
 }
@@ -907,12 +916,12 @@ pub fn adopt_remote_snapshot_on_gone_node_query() -> String {
 /// place of the local artifact that died with the node. The lifecycle stays
 /// `suspended`.
 pub async fn adopt_remote_snapshot_on_gone_node(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     source_node_id: NodeId,
     settle: PositiveDuration,
     expected_uid: Option<&str>,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let flipped = sqlx::query(sqlx::AssertSqlSafe(sql!(
         adopt_remote_snapshot_on_gone_node_query(),
     )))
@@ -920,7 +929,7 @@ pub async fn adopt_remote_snapshot_on_gone_node(
     .bind(source_node_id)
     .bind(expected_uid)
     .bind(secs_bind(settle))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected();
     Ok(flipped)
@@ -980,17 +989,17 @@ pub fn mark_sandbox_failed_on_node_query() -> &'static str {
 ///
 /// Writes an **inference**: a drain give-up on the node's refusal.
 pub async fn mark_sandbox_failed_on_node(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     source_node_id: NodeId,
     suspend_evacuable: &[&str],
-) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar(mark_sandbox_failed_on_node_query())
+) -> Result<Vec<String>, DbError> {
+    Ok(sqlx::query_scalar(mark_sandbox_failed_on_node_query())
         .bind(sandbox_id)
         .bind(source_node_id)
         .bind(suspend_evacuable)
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }
 
 /// `$1` = sandbox id, `$2` = source node id, `$3` = settle seconds (BIGINT).
@@ -1084,11 +1093,11 @@ pub fn adopt_remote_snapshot_for_drain_query() -> String {
 /// Writes an **inference**: a drain give-up that adopts the remote snapshot.
 /// The lifecycle stays `suspended`.
 pub async fn adopt_remote_snapshot_for_drain(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     source_node_id: NodeId,
     settle: PositiveDuration,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     // `PositiveDuration` guarantees a non-zero settle, so the SQL never
     // sees a zero interval that would fire on a just-suspended row.
     let flipped = sqlx::query(sqlx::AssertSqlSafe(sql!(
@@ -1097,11 +1106,17 @@ pub async fn adopt_remote_snapshot_for_drain(
     .bind(sandbox_id)
     .bind(source_node_id)
     .bind(secs_bind(settle))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected();
     Ok(flipped)
 }
+
+/// How long a sandbox may sit in a non-evacuable resident transient
+/// lifecycle before a forced drain's [`abandon_stale_resident_sandboxes`]
+/// fails it. The cluster-controller's stale-abandon default and the node holds
+/// read's [`crate::node_holds::STUCK_TRANSIENT_AFTER`] are both this constant.
+pub const STALE_ABANDON_AFTER: Duration = Duration::from_secs(600);
 
 /// `$1` = node id, `$2` = age seconds (BIGINT), `$3` = the non-evacuable
 /// resident transient lifecycle strings (the drain's
@@ -1189,18 +1204,18 @@ pub fn abandon_stale_resident_sandboxes_query() -> String {
 ///
 /// Writes an **inference**: the drain's age limit.
 pub async fn abandon_stale_resident_sandboxes(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     age: PositiveDuration,
     lifecycles: &[&str],
-) -> Result<Vec<(SandboxId, String)>, sqlx::Error> {
+) -> Result<Vec<(SandboxId, String)>, DbError> {
     let query = abandon_stale_resident_sandboxes_query();
-    sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
         .bind(node_id)
         .bind(secs_bind(age))
         .bind(lifecycles)
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }
 
 /// `$1` = node id, `$2` = the resident lifecycle strings
@@ -1308,18 +1323,18 @@ pub fn fail_resident_sandboxes_on_gone_node_query() -> String {
 ///
 /// Writes an **inference**: a drain give-up on the cloud provider's verdict.
 pub async fn fail_resident_sandboxes_on_gone_node(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     lifecycles: &[&str],
     expected_uid: Option<&str>,
-) -> Result<Vec<(SandboxId, String)>, sqlx::Error> {
+) -> Result<Vec<(SandboxId, String)>, DbError> {
     let query = fail_resident_sandboxes_on_gone_node_query();
-    sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
         .bind(node_id)
         .bind(lifecycles)
         .bind(expected_uid)
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }
 
 /// The pod-less give-up's revert of a resident with no pod to `suspended`,
@@ -1336,11 +1351,14 @@ pub async fn fail_resident_sandboxes_on_gone_node(
 /// nothing runs the sandbox. The statement has no lifecycle, placement or
 /// node guard of its own; it relies on the caller's precheck re-run in the
 /// same transaction under the node row's shared lock and the sandbox and
-/// execution row locks.
-pub async fn revert_pod_less_resident_to_suspended(
-    tx: &mut Transaction<'_, Postgres>,
+/// execution row locks. The caller must pass its open transaction.
+pub async fn revert_pod_less_resident_to_suspended<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     /// Built once: every input is a literal or a bind placeholder.
     static QUERY: LazyLock<String> = LazyLock::new(|| {
         let eligibility = failed_repair_revert_eligibility("s");
@@ -1374,7 +1392,7 @@ pub async fn revert_pod_less_resident_to_suspended(
     });
     let reverted = sqlx::query(sqlx::AssertSqlSafe(QUERY.as_str()))
         .bind(sandbox_id)
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?
         .rows_affected();
     Ok(reverted > 0)

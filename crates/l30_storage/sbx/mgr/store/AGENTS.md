@@ -24,6 +24,11 @@ there, but not a build or dev dependency, nor `libsqlite3-sys`.
   view of it) and `db::scan` (named many-row scans). Extend those before
   adding a public reader; the readers they consolidate are declared through
   `db_private_outside_tests!`, so only tests outside the store still call them.
+- sbx-mgr reaches the job queue's worker only through `db::jobs::JobWorker`
+  (`src/db/jobs.rs`). A worker operation sbx-mgr does not call yet is a new
+  forwarding method there; never re-export `BackgroundWorker`. A read of job
+  rows that must run under the caller's held connection or transaction goes
+  in `db::read`, as `read::cleanup_job` and `read::local_artifact_upload` do.
 - Write `sandboxes.state` only through `update_state_from` with an explicit
   edge, or through a named specialized writer. A new edge in
   `src/db/state_write.rs` needs a kind and a doc comment naming its writer;
@@ -45,7 +50,9 @@ there, but not a build or dev dependency, nor `libsqlite3-sys`.
   result unknown, as under `NOT`. A write of a lifecycle state clears
   `cleanup_state`, and a cleanup write sets both in one statement; the
   triggers in `db/sandbox-manager/20261105142930_sandbox_cleanup_state.up.sql`
-  reject any other shape.
+  reject any other shape. The generated `legacy_state` is gone:
+  `20261109120000` dropped it, `20261113190000` restored it while the
+  rollback target still read it, and `20261114020000` drops it again.
 - Only some child tables declare `ON DELETE CASCADE`: register a new sandbox
   child table in `delete_sandbox_child_rows` (`src/db.rs`).
 - Fixtures that sbx-mgr's other test suites share live in `db::fixture` and

@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -39,11 +39,18 @@ fn admission_with_flags(
     bucket: Option<RedisTokenBucket>,
     feature_flags: FeatureFlagClient,
 ) -> ClusterSandboxAdmission {
+    let live_cap = crate::client_live_cap::ClientLiveCap::with_config(
+        substrate.clone(),
+        crate::client_live_cap::ClientLiveCapConfig::default(),
+        feature_flags.clone(),
+    );
     ClusterSandboxAdmission {
         substrate,
         bucket,
         config: sanitize_config(config),
         feature_flags,
+        flag_attributes: crate::limiter_flags::attributes(None),
+        live_cap,
     }
 }
 
@@ -129,7 +136,7 @@ fn sanitize_config_falls_back_to_absolute_cluster_defaults() {
         enabled: false,
         refill_rps: f64::NAN,
         burst: 0.0,
-        redis_url: None,
+        ..crate::test_support::enabled_config()
     });
 
     assert!(!config.enabled);
@@ -142,10 +149,8 @@ fn sanitize_config_clamps_sub_one_burst_up_to_one() {
     // A burst below one token can never satisfy the one-token consume, which
     // would permanently rate-limit the cluster; it must clamp up to 1.0.
     let config = sanitize_config(ClusterSandboxAdmissionConfig {
-        enabled: true,
-        refill_rps: 6.0,
         burst: 0.25,
-        redis_url: None,
+        ..crate::test_support::enabled_config()
     });
     assert!((config.burst - 1.0).abs() < f64::EPSILON);
 }
@@ -683,8 +688,9 @@ async fn empty_cluster_rejects_activation() -> TestResult {
         .admit_activation(ClusterActivationClass::Cold)
         .await
         .expect_err("empty cluster must reject");
-    assert!(
-        matches!(error, ClusterAdmissionError::EmptyCluster { .. }),
+    assert_eq!(
+        error.kind(),
+        ActivationRejectionKind::EmptyCluster,
         "{error:?}"
     );
     // No bucket was consulted, so the hint starts at the header floor — and
@@ -696,13 +702,13 @@ async fn empty_cluster_rejects_activation() -> TestResult {
     // it would have passed against the unfixed code. This is the only coverage
     // the empty-cluster call site's jitter has.
     let mut hints = BTreeSet::new();
-    hints.insert(error.retry_after().expect("empty cluster carries a hint"));
+    hints.insert(error.retry_after());
     for _ in 0..100 {
         let error = admission
             .admit_activation(ClusterActivationClass::Cold)
             .await
             .expect_err("an empty cluster keeps rejecting");
-        hints.insert(error.retry_after().expect("empty cluster carries a hint"));
+        hints.insert(error.retry_after());
     }
     let expected: BTreeSet<Duration> = (0..=RETRY_AFTER_JITTER.as_secs())
         .map(|offset| RETRY_AFTER_FLOOR + Duration::from_secs(offset))
@@ -744,10 +750,9 @@ async fn exhausted_bucket_rate_limits_activation() -> TestResult {
     // second is rate limited through the full admission path.
     let config_refill_rps = 0.001;
     let config = ClusterSandboxAdmissionConfig {
-        enabled: true,
         refill_rps: config_refill_rps,
         burst: 1.0,
-        redis_url: None,
+        ..crate::test_support::enabled_config()
     };
     let admission = admission(direct_substrate(&db.pool), config, Some(bucket));
 
@@ -758,8 +763,9 @@ async fn exhausted_bucket_rate_limits_activation() -> TestResult {
         .admit_activation(ClusterActivationClass::Cold)
         .await
         .expect_err("second activation must be rate limited");
-    assert!(
-        matches!(error, ClusterAdmissionError::RateLimited { .. }),
+    assert_eq!(
+        error.kind(),
+        ActivationRejectionKind::RateLimited,
         "{error:?}"
     );
 
@@ -780,13 +786,13 @@ async fn exhausted_bucket_rate_limits_activation() -> TestResult {
     let paced_above = RETRY_AFTER_FLOOR + RETRY_AFTER_JITTER;
     let widest = Duration::from_secs(1000) + RETRY_AFTER_JITTER;
     let mut hints = BTreeSet::new();
-    hints.insert(error.retry_after().expect("rate limit carries a hint"));
+    hints.insert(error.retry_after());
     for _ in 0..11 {
         let error = admission
             .admit_activation(ClusterActivationClass::Cold)
             .await
             .expect_err("the drained bucket keeps rate limiting");
-        hints.insert(error.retry_after().expect("rate limit carries a hint"));
+        hints.insert(error.retry_after());
     }
     for hint in &hints {
         assert!(
@@ -829,10 +835,10 @@ async fn with_config_builds_bucket_from_config_redis_url() -> TestResult {
     // interface a caller can point at a test Redis. A single-token bucket
     // exhausts on the second activation.
     let config = ClusterSandboxAdmissionConfig {
-        enabled: true,
         refill_rps: 0.001,
         burst: 1.0,
         redis_url: Some(url),
+        ..crate::test_support::enabled_config()
     };
     let admission = ClusterSandboxAdmission::with_config(
         direct_substrate(&db.pool),
@@ -847,9 +853,56 @@ async fn with_config_builds_bucket_from_config_redis_url() -> TestResult {
         .admit_activation(ClusterActivationClass::Cold)
         .await
         .expect_err("second activation must be rate limited through with_config");
-    assert!(
-        matches!(error, ClusterAdmissionError::RateLimited { .. }),
+    assert_eq!(
+        error.kind(),
+        ActivationRejectionKind::RateLimited,
         "{error:?}"
     );
     Ok(())
+}
+
+/// A `cluster_id` rule on the rate-limiter flag turns the limiter off in the
+/// cluster it names and nowhere else, and a process with no cluster id is
+/// never matched. With no rule, every cluster reads what it read before the
+/// attribute existed.
+#[tokio::test]
+async fn a_cluster_id_rule_switches_off_only_the_cluster_it_names() {
+    use crate::limiter_flags::tests::{cluster, targeting_one_cluster, without_a_rule};
+
+    // Lazy pool: admission_enabled() never reaches the substrate.
+    let pool = PgPool::connect_lazy("postgres://unused").expect("lazy pool");
+    let enabled_in = |flags: &FeatureFlagClient, cluster_id: Option<&str>| {
+        admission_with_flags(
+            direct_substrate(&pool),
+            enabled_config(),
+            None,
+            flags.clone(),
+        )
+        .with_flag_cluster_id(cluster_id.map(cluster).as_ref())
+        .admission_enabled()
+    };
+    let key = SPACE_CLUSTER_RATE_LIMITER_FLAG.key();
+
+    let off_in_a = targeting_one_cluster(key, "cluster-a", serde_json::json!(false), None);
+    assert!(!enabled_in(&off_in_a, Some("cluster-a")));
+    assert!(enabled_in(&off_in_a, Some("cluster-b")));
+    assert!(enabled_in(&off_in_a, None));
+
+    // No rule: each cluster gets the answer the attribute-free read gives,
+    // for an assigned default either way and for no assignment at all.
+    for default in [Some(true), Some(false), None] {
+        let today = match default {
+            Some(value) => FeatureFlagClient::fixed_bools([(key, value)]),
+            None => FeatureFlagClient::fixed_bools([("other", true)]),
+        };
+        let expected = enabled_in(&today, None);
+        let untargeted = without_a_rule(key, default.map(serde_json::Value::Bool));
+        for cluster_id in [Some("cluster-a"), Some("cluster-b"), None] {
+            assert_eq!(
+                enabled_in(&untargeted, cluster_id),
+                expected,
+                "default {default:?} in {cluster_id:?}"
+            );
+        }
+    }
 }

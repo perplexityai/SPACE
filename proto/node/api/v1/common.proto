@@ -125,6 +125,8 @@ enum StateReconciliationReason {
   STATE_RECONCILIATION_REASON_TEMPLATE_POOL_POLICY_DELETED = 15;
   STATE_RECONCILIATION_REASON_NODE_SANDBOX_INVENTORY_PUBLISHED = 16;
   STATE_RECONCILIATION_REASON_NODE_TEMPLATE_INVENTORY_PUBLISHED = 17;
+  // A wakeup only, like every reason: the request carries no rules.
+  STATE_RECONCILIATION_REASON_FIREWALL_RULES_CHANGED = 18;
 }
 
 message TriggerStateReconciliationRequest {
@@ -238,6 +240,18 @@ message NodeCtlStatus {
   optional string error = 2;
   repeated ReconciliationStatus reconciliations = 3;
   repeated FacetSyncOverride sync_overrides = 4;
+  // Whether this node's template-manager reads a template twin's own
+  // `environments/<environment>/metadata.json` when it pulls the twin's build,
+  // and binds the build's shared `manifest.json` to it: the twin's document
+  // carries the target's execution metadata while the shared manifest keeps
+  // the source's, and template-manager otherwise refuses a build whose two
+  // disagree.
+  // Set only from template-manager's report of that support, not from
+  // node-ctl's own version, and only in node-ctl's PublishNodeState, which is
+  // what the cluster stores; node-api's GetNodeInfo copy leaves it unset.
+  // Absent from nodes that predate it, which means it doesn't: a runtime
+  // upgrade campaign of templates holds until every worker reports true.
+  optional bool reads_twin_metadata = 5;
 }
 
 // ── Template transfer messages ─────────────────────────────────────────────

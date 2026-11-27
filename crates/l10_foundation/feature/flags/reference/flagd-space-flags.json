@@ -5,6 +5,7 @@
     "space-cluster-rate-limiter": {
       "state": "ENABLED",
       "defaultVariant": "on",
+      "_comment": "The subject is the constant `space-cluster` and `cluster_id` is supplied as an attribute, so a rule matching `cluster_id` can set one cluster apart while the others fall through to the default. A process with no valid SPACE_CLUSTER_ID, or one running a version that predates the attribute, sends none, and a negated rule (`!=`) still matches it, so match clusters positively with `==` or `in` against an array.",
       "variants": {
         "on": true,
         "off": false
@@ -14,6 +15,7 @@
     "space-api-client-concurrency-limiter": {
       "state": "ENABLED",
       "defaultVariant": "on",
+      "_comment": "The subject is the constant `space-cluster` and `cluster_id` is supplied as an attribute, so a rule matching `cluster_id` can set one cluster apart while the others fall through to the default. A process with no valid SPACE_CLUSTER_ID, or one running a version that predates the attribute, sends none, and a negated rule (`!=`) still matches it, so match clusters positively with `==` or `in` against an array.",
       "variants": {
         "on": true,
         "off": false
@@ -32,7 +34,7 @@
     "space-api-client-concurrency-quotas": {
       "state": "ENABLED",
       "defaultVariant": "env",
-      "_comment": "An empty object leaves every cap at its env/Helm value. Both fields are optional; an entry under `overrides` also allowlists that client id.",
+      "_comment": "An empty object leaves every cap at its env/Helm value. Both fields are optional; an entry under `overrides` also allowlists that client id. The subject is the constant `space-cluster` and `cluster_id` is supplied as an attribute, so a rule matching `cluster_id` can give one cluster its own caps while the others fall through to the default. A process with no valid SPACE_CLUSTER_ID, or one running a version that predates the attribute, sends none, and a negated rule (`!=`) still matches it, so match clusters positively with `==` or `in` against an array.",
       "variants": {
         "env": {},
         "example": {

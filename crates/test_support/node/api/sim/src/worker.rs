@@ -14,9 +14,7 @@
 
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 
-use pplx_space_common_core::types::{
-    BackupAttemptId, EnvMap, EnvSanitizationIssue, LocalArtifactId, NodeManagedBy, PolicyAuthority,
-};
+use pplx_space_guest_process::{EnvMap, EnvSanitizationIssue};
 use pplx_space_net_gateway_client::proto::{ServicePortIngressFrame, service_port_ingress_frame};
 use pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternal;
 use pplx_space_node_api_client::proto::worker_api_server::WorkerApi;
@@ -24,7 +22,10 @@ use pplx_space_node_api_client::proto::{
     ListNodeTemplatesRequest, ListNodeTemplatesResponse, PullTemplateRequest, PullTemplateResponse,
     TriggerStateReconciliationRequest, TriggerStateReconciliationResponse,
 };
+use pplx_space_node_model::NodeManagedBy;
+use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sbx_mgr_client::proto as sbx;
+use pplx_space_snapshot_model::{BackupAttemptId, LocalArtifactId};
 use pplx_space_template_mgr_client::proto as tmpl;
 use tokio::sync::Mutex;
 use tokio_stream::Stream;
@@ -318,7 +319,8 @@ fn sandbox_info_from_record(rec: &crate::state::SandboxRecord) -> sbx::SandboxIn
         cleanup: None,
         state_changed_at: None,
         execution_generation: rec.execution_generation,
-        pod_uid: None,
+        pod_uid: rec.pod_uid.clone(),
+        external_address: rec.external_address.clone(),
         activation_attempt_id: None,
         spaced_version: None,
         netgtw_git_sha: None,
@@ -464,6 +466,9 @@ impl WorkerApi for SimWorkerApiService {
         &self,
         request: Request<sbx::CreateRequest>,
     ) -> Result<Response<sbx::CreateResponse>, Status> {
+        if let Some(code) = self.state.take_create_refusal().await {
+            return Err(Status::new(code, "create refused"));
+        }
         let req = request.into_inner();
         let sandbox_id = req
             .sandbox_id
@@ -866,6 +871,19 @@ impl WorkerApi for SimWorkerApiService {
         request: Request<sbx::EnqueueArtifactBackupRequest>,
     ) -> Result<Response<sbx::EnqueueArtifactBackupResponse>, Status> {
         let request = request.into_inner();
+        if let Some(code) = self
+            .state
+            .take_artifact_backup_refusal(&request.sandbox_id)
+            .await
+        {
+            return Err(Status::new(
+                code,
+                format!(
+                    "sandbox {} isn't stopped or suspended yet",
+                    request.sandbox_id
+                ),
+            ));
+        }
         let local_artifact_id = match request.source {
             Some(sbx::enqueue_artifact_backup_request::Source::LocalArtifactId(value)) => value,
             _ => LocalArtifactId::new().to_string(),
@@ -891,6 +909,14 @@ impl WorkerApi for SimWorkerApiService {
         request: Request<sbx::UpdateRequest>,
     ) -> Result<Response<sbx::UpdateResponse>, Status> {
         let req = request.into_inner();
+        if (req.vcpu.is_some() || req.memory_mib.is_some() || req.pids_max.is_some())
+            && let Some(code) = self
+                .state
+                .take_resource_update_refusal(&req.sandbox_id)
+                .await
+        {
+            return Err(Status::new(code, "resource update refused"));
+        }
         if !req.replace_process_env && !req.process_env.is_empty() {
             return Err(Status::invalid_argument(
                 "replace_process_env must be true when process_env is provided",
@@ -1629,11 +1655,10 @@ async fn sim_install_activation_policy(
 ) -> Result<(), Status> {
     use prost::Message;
     if let Some(policy) = policy {
-        pplx_space_common_core::types::AutoLifecyclePolicy::try_from(policy)
-            .map_err(Status::from)?;
+        pplx_space_auto_lifecycle::AutoLifecyclePolicy::try_from(policy).map_err(Status::from)?;
         let encoded = policy.encode_to_vec();
         let record = state.get(sandbox_id).await.map_err(map_state_error)?;
-        if record.auto_lifecycle_authority != pplx_space_common_core::types::PolicyAuthority::Local
+        if record.auto_lifecycle_authority != pplx_space_policy_authority::PolicyAuthority::Local
             && record.access_idle_policy != encoded
         {
             state
@@ -1677,7 +1702,7 @@ async fn sim_wake(
     // observation is only a resume fence and cannot authorize reusing its ID.
     if let Ok(record) = &rec
         && matches!(record.status.as_str(), status::STOPPED | status::SUSPENDED)
-        && record.route_substrate_kind == Some(pplx_space_common_core::types::NodeManagedBy::Space)
+        && record.route_substrate_kind == Some(pplx_space_node_model::NodeManagedBy::Space)
         && let Some(retained) = record.execution_generation
     {
         let Some(identity) = &requested_identity else {
@@ -1705,7 +1730,7 @@ async fn sim_wake(
             let policy = match activation_policy.as_ref() {
                 Some(policy)
                     if record.auto_lifecycle_authority
-                        != pplx_space_common_core::types::PolicyAuthority::Local =>
+                        != pplx_space_policy_authority::PolicyAuthority::Local =>
                 {
                     policy.clone()
                 }
@@ -1792,7 +1817,7 @@ async fn sim_wake(
         sbx::WakeTransition::Noop | sbx::WakeTransition::Resume | sbx::WakeTransition::Wait
             if requested_identity.is_none() =>
         {
-            (rec.route_substrate_kind == Some(pplx_space_common_core::types::NodeManagedBy::Space))
+            (rec.route_substrate_kind == Some(pplx_space_node_model::NodeManagedBy::Space))
                 .then(|| record_route_identity(state.node_id(), &rec))
                 .flatten()
         }
@@ -1893,6 +1918,15 @@ impl SimWorkerApiInternalService {
 
 #[tonic::async_trait]
 impl WorkerApiInternal for SimWorkerApiInternalService {
+    async fn abandon_runtime_upgrade(
+        &self,
+        _request: tonic::Request<sbx::AbandonRuntimeUpgradeRequest>,
+    ) -> Result<tonic::Response<sbx::AbandonRuntimeUpgradeResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "the simulator runs no runtime upgrades",
+        ))
+    }
+
     async fn get_runtime_upgrade(
         &self,
         _request: Request<sbx::GetRuntimeUpgradeRequest>,
@@ -1900,6 +1934,20 @@ impl WorkerApiInternal for SimWorkerApiInternalService {
         Err(Status::unimplemented(
             "the simulator runs no runtime upgrades",
         ))
+    }
+
+    async fn drain_node(
+        &self,
+        _request: Request<sbx::DrainNodeRequest>,
+    ) -> Result<Response<sbx::DrainNodeResponse>, Status> {
+        Err(Status::unimplemented("the simulator has no node drain"))
+    }
+
+    async fn preview_drain_node(
+        &self,
+        _request: Request<sbx::PreviewDrainNodeRequest>,
+    ) -> Result<Response<sbx::PreviewDrainNodeResponse>, Status> {
+        Err(Status::unimplemented("the simulator has no node drain"))
     }
 
     async fn adopt_pool_sandbox(

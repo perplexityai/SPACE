@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::JobId;
+use pplx_space_accounts::JobId;
 
 use super::cleanup::{AsyncCleanupRequest, CleanupAdmission, SynchronousCleanupRequest};
 use super::cleanup_support::{
@@ -9,7 +9,7 @@ use super::*;
 use crate::db::cleanup_jobs::{
     self, CleanupEligibility, CleanupFailure, CleanupOutcome, CleanupWork,
 };
-use pplx_space_common_jobs::{JobPriority, JobStatus};
+use crate::db::jobs::{JobPriority, JobStatus};
 
 type AttemptResult = Result<(), Status>;
 type CleanupResult = Result<CleanupOutcome, Status>;
@@ -491,7 +491,7 @@ impl SandboxManagerService {
             } else {
                 [(0, background), (1, foreground)]
             };
-            foreground_first = !foreground_first;
+            foreground_first.toggle();
             let jobs = self
                 .storage(move |db| {
                     let tx = crate::db::Transaction::deferred(db).map_err(storage_status)?;

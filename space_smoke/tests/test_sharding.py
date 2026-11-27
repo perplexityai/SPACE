@@ -2,6 +2,7 @@
 
 from contextlib import redirect_stdout
 from io import StringIO
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -18,7 +19,7 @@ def _inventory(surface):
         if surface in scenario.api_surfaces
         and "kind" in scenario.backends
         and scenario.quarantined is None
-        and scenario.ignored is None
+        and scenario.tier == "routine"
         and scenario.applies_to(None)
     }
 
@@ -58,6 +59,7 @@ def test_shards_run_every_eligible_scenario_once_and_propagate_failures(count):
                     "return_value.browser_unavailable.return_value": None,
                     "return_value.storage_credentials.return_value": "exchange",
                     "return_value.substrate.return_value": "kubernetes",
+                    "return_value.drain_v2_enabled.return_value": False,
                 },
             ) as bootstrap,
             mock.patch("space_smoke.__main__.run_scenarios", side_effect=execute),
@@ -103,6 +105,25 @@ def test_shard_cli_routes_to_the_selected_inventory():
     run.assert_called_once_with(shard=(2, 3))
 
 
+def _listed(*args):
+    out = StringIO()
+    with mock.patch("sys.argv", ["space-smoke", "list", *args]), redirect_stdout(out):
+        assert main() == 0
+    return [line.split("\t", 1)[0] for line in out.getvalue().splitlines()]
+
+
+def test_a_listed_set_splits_into_shards_that_run_by_name_each_once():
+    """The drain set, manual scenarios included, runs by name; its listed
+    shards cover it exactly once and each holds a share of it."""
+
+    selection = ["--prefix", "native.v2_", "--tier", "routine", "--tier", "manual"]
+    listed = _listed(*selection)
+    assert listed and all(scenario_id.startswith("native.v2_") for scenario_id in listed)
+    shards = [_listed(*selection, "--shard", f"{index}/4") for index in range(1, 5)]
+    assert sorted(scenario_id for shard in shards for scenario_id in shard) == sorted(listed)
+    assert all(shards)
+
+
 def test_shard_cannot_silently_ignore_a_named_scenario():
     with (
         mock.patch(
@@ -125,29 +146,26 @@ def test_empty_shard_does_not_bootstrap_or_report_green():
     bootstrap.assert_not_called()
 
 
-def test_the_joint_partition_is_lighter_than_balancing_each_surface_alone():
-    from space_smoke.sharding import _DURATION_SECONDS, select_shard
+def test_the_joint_partition_is_lighter_than_balancing_each_surface_alone(monkeypatch):
+    from space_smoke.sharding import select_shard
 
-    pools = {
-        surface: tuple(
-            sorted(
-                (s for s in REGISTRY if s.id in _inventory(surface)), key=lambda s: s.id
+    # Each surface has one heavy and one light case. Independent balancing
+    # stacks the heavy cases on shard one; joint balancing separates them.
+    weights = {surface: {f"{surface}.heavy": 100, f"{surface}.light": 10}
+               for surface in ("ecw", "native")}
+    monkeypatch.setattr("space_smoke.sharding._DURATION_SECONDS", weights)
+    pools = {surface: tuple(SimpleNamespace(id=name) for name in cases)
+             for surface, cases in weights.items()}
+
+    def loads(joint):
+        return [sum(
+            weights[surface][scenario.id]
+            for surface, scenarios in pools.items()
+            for scenario in select_shard(
+                scenarios, index=index, count=2, api_surface=surface,
+                inventories=pools if joint else None,
             )
-        )
-        for surface in ("ecw", "native")
-    }
+        ) for index in (1, 2)]
 
-    def heaviest(joint):
-        loads = []
-        for index in range(1, 9):
-            load = 0
-            for surface, scenarios in pools.items():
-                share = select_shard(
-                    scenarios, index=index, count=8, api_surface=surface,
-                    inventories=pools if joint else None,
-                )
-                load += sum(_DURATION_SECONDS[surface].get(s.id, 30) for s in share)
-            loads.append(load)
-        return max(loads)
-
-    assert heaviest(joint=True) < heaviest(joint=False)
+    assert loads(joint=False) == [200, 20]
+    assert loads(joint=True) == [110, 110]

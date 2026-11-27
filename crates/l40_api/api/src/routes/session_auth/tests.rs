@@ -1,8 +1,8 @@
-use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
 
 use axum::{Router, routing::get};
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::pg_test_db;
+use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 use uuid::Uuid;
 

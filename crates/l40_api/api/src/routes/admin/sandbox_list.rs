@@ -13,7 +13,10 @@ use axum::{
     response::IntoResponse,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use pplx_space_common_core::types::{NodeId, OrgId, SandboxId, TemplateName, UserId};
+use pplx_space_accounts::{NodeId, OrgId, UserId};
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sandbox_store::StoredSandboxLifecycle;
+use pplx_space_template_model::TemplateName;
 use serde::de::{self, DeserializeOwned};
 use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;
@@ -21,8 +24,8 @@ use time::OffsetDateTime;
 use super::support::{self, ContentionScope, api_error, require_managing_org_admin};
 use crate::controllers::sandbox::SandboxPageCursor;
 use crate::controllers::sandbox::list_page::admin::{
-    AdminSandboxFilter, AdminStoredLifecycle, NodeAssignment, PageBudget, SandboxPrefix,
-    SandboxSearch, SpacedVersionCount,
+    AdminSandboxFilter, NodeAssignment, PageBudget, SandboxPrefix, SandboxSearch,
+    SpacedVersionCount,
 };
 use crate::middleware::auth::AuthUser;
 use crate::models::{Sandbox, SandboxResponse};
@@ -184,7 +187,9 @@ impl AdminSandboxListQuery {
         // Postgres keeps microseconds and the bound value is truncated to
         // them, so a bound inside a microsecond rounds up: a row created
         // earlier in that microsecond is still before it.
-        let created_before = created_before.map(round_up_to_microsecond).transpose()?;
+        let created_before = created_before
+            .map(|value| round_up_to_microsecond("created_before", value))
+            .transpose()?;
         let filter = AdminSandboxFilter {
             org_id: self.org_id,
             lifecycles: self
@@ -241,8 +246,9 @@ fn parse_query<T: DeserializeOwned>(uri: &Uri) -> Result<T, QueryError> {
 /// A filter parameter whose empty value (`name=`) is unset, as leaving the
 /// name out is: the unpaged list ignored these names before they were
 /// filters, so a caller that sends one empty keeps its list. `org_id`, which
-/// that list already parsed, still refuses an empty value.
-fn empty_as_unset<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+/// that list already parsed, still refuses an empty value. A node's sandbox
+/// history parameters use it for the same reason.
+pub(super) fn empty_as_unset<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: FromStr,
@@ -254,10 +260,10 @@ where
     }
 }
 
-fn parse_lifecycles(value: &str) -> Result<Vec<AdminStoredLifecycle>, QueryError> {
+fn parse_lifecycles(value: &str) -> Result<Vec<StoredSandboxLifecycle>, QueryError> {
     let mut lifecycles = Vec::new();
     for part in value.split(',') {
-        let lifecycle = AdminStoredLifecycle::from_str(part)
+        let lifecycle = StoredSandboxLifecycle::from_str(part)
             .map_err(|_| bad_request(format!("unknown lifecycle {part:?}")))?;
         if !lifecycles.contains(&lifecycle) {
             lifecycles.push(lifecycle);
@@ -266,7 +272,7 @@ fn parse_lifecycles(value: &str) -> Result<Vec<AdminStoredLifecycle>, QueryError
     Ok(lifecycles)
 }
 
-fn parse_timestamp(name: &str, value: &str) -> Result<OffsetDateTime, QueryError> {
+pub(super) fn parse_timestamp(name: &str, value: &str) -> Result<OffsetDateTime, QueryError> {
     let invalid = || bad_request(format!("{name} must be an RFC 3339 timestamp"));
     let timestamp = jiff::Timestamp::from_str(value).map_err(|_| invalid())?;
     let nanos = timestamp.as_nanosecond();
@@ -278,14 +284,17 @@ fn parse_timestamp(name: &str, value: &str) -> Result<OffsetDateTime, QueryError
     OffsetDateTime::from_unix_timestamp_nanos(nanos).map_err(|_| invalid())
 }
 
-fn round_up_to_microsecond(value: OffsetDateTime) -> Result<OffsetDateTime, QueryError> {
+pub(super) fn round_up_to_microsecond(
+    name: &str,
+    value: OffsetDateTime,
+) -> Result<OffsetDateTime, QueryError> {
     let nanos = value.unix_timestamp_nanos();
     let rounded = match nanos.rem_euclid(NANOSECONDS_PER_MICROSECOND) {
         0 => nanos,
         within => nanos + NANOSECONDS_PER_MICROSECOND - within,
     };
     OffsetDateTime::from_unix_timestamp_nanos(rounded)
-        .map_err(|_| bad_request("created_before must be an RFC 3339 timestamp"))
+        .map_err(|_| bad_request(format!("{name} must be an RFC 3339 timestamp")))
 }
 
 /// `v1:<created_at unix nanoseconds>:<id>`, base64url without padding. Not

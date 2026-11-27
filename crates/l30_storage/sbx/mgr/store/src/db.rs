@@ -1,7 +1,7 @@
 //! Sandbox-manager persistence and guarded lifecycle transitions.
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
-use pplx_space_common_core::types::JobId;
+use pplx_space_accounts::JobId;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -9,28 +9,32 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
-pub use pplx_space_common_core::types::PolicyAuthority;
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, AutoLifecycleRuntimeState,
-    ExecutionGeneration, ExecutionMetadata, LocalArtifactId, NodeManagedBy, ORPHANED_SANDBOX_OWNER,
-    ORPHANED_SANDBOX_TEMPLATE, RuntimeIdentity, RuntimeKind, RuntimeVersion,
-    SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId, SandboxOwner,
-    SandboxQuarantineHistoryAction, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
-    SandboxQuarantineSource, SandboxRuntimeLabel, SandboxTransitionReceipt,
-    SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
-    SandboxTransitionTargetState, SnapshotName,
-};
+use pplx_space_accounts::{ORPHANED_SANDBOX_OWNER, SandboxOwner};
+use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, AutoLifecycleRuntimeState};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
     emit_sandbox_event,
 };
+use pplx_space_execution_spec::RuntimeVersion;
+use pplx_space_execution_spec::{ExecutionMetadata, RuntimeIdentity, RuntimeKind};
 #[cfg(test)]
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::{NetworkPolicy, proto::NetworkPolicySource};
+use pplx_space_node_model::NodeManagedBy;
+pub use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId,
+    SandboxQuarantineHistoryAction, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
+    SandboxQuarantineSource, SandboxRuntimeLabel, SandboxTransitionReceipt,
+    SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
+    SandboxTransitionTargetState,
+};
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotName};
 use pplx_space_sqlite::SqliteU64;
+use pplx_space_template_model::ORPHANED_SANDBOX_TEMPLATE;
 use rusqlite::types::Type;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use rusqlite::{OptionalExtension as _, params};
 
 mod handle;
@@ -38,6 +42,7 @@ pub use handle::OptionalExtension;
 use handle::db_private_outside_tests;
 pub use handle::{Connection, ConnectionGuard, Error, Result, SharedConnection, Transaction};
 
+pub mod activation_seal;
 pub mod auto_lifecycle_delete_receipts;
 pub mod cleanup_jobs;
 pub mod cleanup_target_scan;
@@ -46,6 +51,7 @@ pub mod guest_health_scan;
 pub mod guest_updates;
 pub mod inventory;
 pub mod inventory_read;
+pub mod jobs;
 pub mod local_artifact_leases;
 pub mod migration;
 pub mod quarantine_history;
@@ -61,9 +67,10 @@ use crate::state::{
     CleanupState, SandboxState, SandboxStatus, SandboxStatusEventDetails, StateTransitionError,
     Teardown,
 };
-use pplx_space_common_core::types::{PodUid, RouteGeneration, SpaceApiRouteIdentity};
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_sandbox_model::{RouteGeneration, SpaceApiRouteIdentity};
 
-const DB_PATH: &str = pplx_space_common_core::host::linux::paths::SANDBOX_MANAGER_DB;
+const DB_PATH: &str = pplx_space_host_layout::paths::SANDBOX_MANAGER_DB;
 
 mod quarantine_scan;
 mod sandbox_row;
@@ -119,19 +126,22 @@ pub use teardown_suspend::*;
 // Most of the no-progress vocabulary is durable: its rendered form is persisted
 // into `sandbox_quarantine_state.last_error`. Pre-claim reasons and a detached
 // task failure are metric-only, but share the same bounded classification so one
-// pass does not invent a second reason type. It therefore belongs in common-core
+// pass does not invent a second reason type. It therefore belongs in pplx-space-sandbox-model
 // rather than in sbx-mgr's `metrics::sandbox::worker`, whose tag it also happens
 // to be. Re-exported here so
 // `crate::db::QuarantineRecoveryNoProgressReason` stays the name callers use.
-pub use pplx_space_common_core::types::QuarantineRecoveryNoProgressReason;
+pub use pplx_space_sandbox_model::QuarantineRecoveryNoProgressReason;
 
 /// Typed reads: one sandbox's whole row, the narrow views that keep working
 /// without one, a State RPC batch, one local artifact, one cleanup job and
 /// the node-wide counts. Each keeps the decoder, missing-row rule and
 /// tolerance of the reader it consolidates.
 pub mod read {
+    mod suspend_attempt;
+    pub use suspend_attempt::*;
     mod guest_update;
     pub use guest_update::*;
+    mod activation_seal;
     mod cleanup_job;
     mod counts;
     mod eviction;
@@ -140,6 +150,7 @@ pub mod read {
     mod sandbox;
     mod sandbox_view;
     mod state_page;
+    pub use activation_seal::*;
     pub use cleanup_job::*;
     pub use counts::*;
     pub use eviction::*;
@@ -164,6 +175,7 @@ pub mod scan {
     mod eviction_candidates;
     mod list_page;
     mod local_artifacts;
+    mod local_only_artifacts;
     mod node_dirty_batch;
     mod pending_backups;
     mod pool_donor;
@@ -171,6 +183,7 @@ pub mod scan {
     mod resolve_selector;
     mod rowless_restore_scopes;
     mod sandbox_pages;
+    mod status_entered;
     mod teardown_owned_suspending;
     mod unbound_executions;
     mod unsettled_runtime_upgrades;
@@ -180,6 +193,7 @@ pub mod scan {
     pub use eviction_candidates::*;
     pub use list_page::*;
     pub use local_artifacts::*;
+    pub use local_only_artifacts::*;
     pub use node_dirty_batch::*;
     pub use pending_backups::*;
     pub use pool_donor::*;
@@ -187,6 +201,7 @@ pub mod scan {
     pub use resolve_selector::*;
     pub use rowless_restore_scopes::*;
     pub use sandbox_pages::*;
+    pub use status_entered::*;
     pub use teardown_owned_suspending::*;
     pub use unbound_executions::*;
     pub use unsettled_runtime_upgrades::*;
@@ -356,6 +371,13 @@ fn describe_raw_error(error: &rusqlite::Error) -> String {
         ),
         None => error.to_string(),
     }
+}
+
+/// `n` comma-separated positional placeholders (`?, ?, ?`) for an `IN` list
+/// of bound values. A caller whose list can be empty returns before building
+/// the query, since an empty list matches nothing.
+pub(crate) fn sql_placeholders(n: usize) -> String {
+    std::iter::repeat_n("?", n).collect::<Vec<_>>().join(", ")
 }
 
 pub(crate) fn immediate_transaction(conn: &Connection) -> Result<Transaction<'_>> {
@@ -563,6 +585,12 @@ fn delete_sandbox_child_rows(tx: &Connection, id: &str) -> Result<()> {
         "DELETE FROM sandbox_runtime_upgrade_outcomes WHERE sandbox_id = ?1",
         params![id],
     )?;
+    // `sandbox_runtime_upgrade_attempt_outcomes` is kept, with no foreign
+    // key: a delayed retry of an attempt whose outcome is final can arrive
+    // after the sandbox was staged again, and must still be refused.
+    // `sandbox_runtime_upgrade_abandoned` is kept for the same reason: a late
+    // call for an abandoned operation can stage the sandbox again, and must
+    // still be refused.
     Ok(())
 }
 
@@ -580,6 +608,7 @@ fn quarantine_blocks_cleanup(previous_state: Option<SandboxStatus>) -> bool {
     previous_state.is_some_and(|state| state.is_unowned(SandboxState::Quarantined))
 }
 
+/// Record that the sandbox's row was deleted at `execution_generation`.
 fn record_execution_delete_receipt(
     conn: &Connection,
     sandbox_id: &str,
@@ -588,6 +617,74 @@ fn record_execution_delete_receipt(
     let Some(execution_generation) = execution_generation else {
         return Ok(());
     };
+    write_execution_delete_receipt(conn, sandbox_id, execution_generation)
+}
+
+/// Record that a cleanup deleted the sandbox's row, covering the newest of
+/// `execution_generation`, the latest teardown suspend's generation, and the
+/// row's retained route high-water mark (`last_observed_execution_generation`,
+/// which nothing clears). A cleanup's quarantine clears the row's route, and
+/// sbx-mgr prunes a failed teardown job after its retention, so the high-water
+/// mark is what still names the generation of an old stranded teardown. The
+/// teardown poll answers DELETED only for a generation a receipt covers, so a
+/// row deleted under a pod whose teardown waits on it must cover that
+/// teardown's generation or the pod is never released. A teardown operation
+/// that doesn't decode can't name a generation: the delete records the others
+/// rather than failing on it. Call it before deleting the row.
+fn record_cleanup_execution_delete_receipt(
+    conn: &Connection,
+    sandbox_id: &str,
+    execution_generation: Option<ExecutionGeneration>,
+) -> Result<()> {
+    let teardown_generation = match teardown_suspend::latest_teardown_suspend_operation(
+        conn, sandbox_id,
+    ) {
+        Ok(operation) => operation.map(|operation| operation.execution_generation),
+        Err(error) if is_row_decode_error(error.raw()) => {
+            tracing::warn!(
+                sandbox_id,
+                error = %describe_error(&error),
+                "teardown suspend operation does not decode; delete receipt covers the row's generation"
+            );
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    let retained_generation = match conn
+        .query_row(
+            "SELECT last_observed_execution_generation FROM sandboxes WHERE id = ?1",
+            params![sandbox_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()
+    {
+        Ok(value) => value
+            .flatten()
+            .and_then(|raw| ExecutionGeneration::new(raw).ok()),
+        Err(error) if is_row_decode_error(error.raw()) => {
+            tracing::warn!(
+                sandbox_id,
+                error = %describe_error(&error),
+                "retained route generation does not decode; delete receipt covers the others"
+            );
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    record_execution_delete_receipt(
+        conn,
+        sandbox_id,
+        execution_generation
+            .max(teardown_generation)
+            .max(retained_generation),
+    )
+}
+
+fn write_execution_delete_receipt(
+    conn: &Connection,
+    sandbox_id: &str,
+    execution_generation: ExecutionGeneration,
+) -> Result<()> {
     let deleted_at = now_epoch_i64()?;
     conn.execute(
         "DELETE FROM sandbox_execution_delete_receipts WHERE deleted_at < ?1",
@@ -762,9 +859,9 @@ pub mod fixture {
     use std::collections::BTreeMap;
     use std::str::FromStr;
 
-    use pplx_space_common_core::types::{
-        AutoLifecyclePolicy, SandboxId, SandboxOwner, SandboxRuntimeLabel,
-    };
+    use pplx_space_accounts::SandboxOwner;
+    use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
+    use pplx_space_sandbox_model::{SandboxId, SandboxRuntimeLabel};
 
     use crate::state::SandboxStatus;
 

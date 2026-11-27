@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 use std::os::unix::fs::PermissionsExt;
 
 use super::cache_cleanup::is_sandbox_running;
@@ -11,7 +11,7 @@ use super::template_snapshot_support::{
 };
 use super::validation::{canonical_batched_sandbox_ids, snapshot_type_from_proto};
 use super::*;
-use pplx_space_common_core::inventory::InventoryBudget;
+use pplx_space_rpc_contracts::inventory::InventoryBudget;
 
 fn state_publication_metric_field(
     field: crate::db::SandboxStatePublicationMetadataField,
@@ -47,10 +47,10 @@ fn state_publication_metadata_disposition(
 }
 
 use futures_util::{StreamExt, stream};
-use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin};
 
 const STATE_INFO_CONCURRENCY: usize = 16;
 const MIB_BYTES: u64 = 1024 * 1024;
@@ -184,7 +184,7 @@ impl OperationSnapshotPlan {
 
 fn disk_operation_snapshot_response(
     local_artifact_id: LocalArtifactId,
-    snapshot_name: &pplx_space_common_core::types::SnapshotName,
+    snapshot_name: &pplx_space_snapshot_model::SnapshotName,
 ) -> crate::proto::CreateSnapshotResponse {
     crate::proto::CreateSnapshotResponse {
         snapshot_name: snapshot_name.to_string(),
@@ -201,8 +201,8 @@ fn disk_operation_snapshot_response(
 
 fn disk_operation_snapshot_name(
     request_id: Uuid,
-) -> Result<pplx_space_common_core::types::SnapshotName, Status> {
-    pplx_space_common_core::types::SnapshotName::parse(format!("d-operation-{request_id}"))
+) -> Result<pplx_space_snapshot_model::SnapshotName, Status> {
+    pplx_space_snapshot_model::SnapshotName::parse(format!("d-operation-{request_id}"))
         .map_err(|error| Status::internal(format!("invalid generated snapshot name: {error}")))
 }
 
@@ -225,12 +225,10 @@ impl DiskOperationSnapshotPaths {
 
 fn disk_operation_snapshot_paths(
     sandbox_id: &str,
-    snapshot_name: &pplx_space_common_core::types::SnapshotName,
+    snapshot_name: &pplx_space_snapshot_model::SnapshotName,
 ) -> DiskOperationSnapshotPaths {
-    let capture = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
-        sandbox_id,
-        snapshot_name.as_str(),
-    );
+    let capture =
+        pplx_space_host_layout::paths::sandbox_snapshot_dir(sandbox_id, snapshot_name.as_str());
     DiskOperationSnapshotPaths {
         artifact: format!("{capture}-artifact"),
         capture,
@@ -240,7 +238,7 @@ fn disk_operation_snapshot_paths(
 fn disk_operation_snapshot_artifact_id(
     sandbox_id: &str,
     request_id: Uuid,
-    execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+    execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
     source_state: SandboxState,
 ) -> LocalArtifactId {
     let identity = format!(
@@ -257,7 +255,7 @@ fn disk_operation_snapshot_artifact_id(
 fn emit_disk_operation_snapshot_published(
     sandbox_id: &str,
     local_artifact_id: LocalArtifactId,
-    snapshot_name: &pplx_space_common_core::types::SnapshotName,
+    snapshot_name: &pplx_space_snapshot_model::SnapshotName,
 ) {
     emit_sandbox_event(
         sandbox_id,
@@ -265,7 +263,7 @@ fn emit_disk_operation_snapshot_published(
         SandboxEventSource::SbxManager,
         SandboxEventDetails::default()
             .local_artifact_id(local_artifact_id.to_string())
-            .artifact_kind(pplx_space_common_core::types::ArtifactKind::Disk.as_str())
+            .artifact_kind(pplx_space_snapshot_model::ArtifactKind::Disk.as_str())
             .artifact_origin("snapshot")
             .snapshot_id(snapshot_name.to_string()),
     );
@@ -275,13 +273,13 @@ fn disk_operation_snapshot_artifact_matches(
     artifact: &crate::db::LocalArtifactRow,
     expected_local_artifact_id: LocalArtifactId,
     sandbox_id: &str,
-    snapshot_name: &pplx_space_common_core::types::SnapshotName,
+    snapshot_name: &pplx_space_snapshot_model::SnapshotName,
     paths: &DiskOperationSnapshotPaths,
 ) -> bool {
     artifact.local_artifact_id == expected_local_artifact_id
         && artifact.sandbox_id == sandbox_id
-        && artifact.artifact_kind == pplx_space_common_core::types::ArtifactKind::Disk
-        && artifact.artifact_origin == pplx_space_common_core::types::ArtifactOrigin::Snapshot
+        && artifact.artifact_kind == pplx_space_snapshot_model::ArtifactKind::Disk
+        && artifact.artifact_origin == pplx_space_snapshot_model::ArtifactOrigin::Snapshot
         && artifact.snapshot_name.as_ref() == Some(snapshot_name)
         && paths.contains(&artifact.local_path)
 }
@@ -358,7 +356,7 @@ fn operation_snapshot_post_create_disposition(
 async fn remove_created_disk_operation_snapshot(
     node_client: &mut pplx_space_node_mgr_client::NodeManagerGrpcClient,
     sandbox_id: &str,
-    snapshot_name: &pplx_space_common_core::types::SnapshotName,
+    snapshot_name: &pplx_space_snapshot_model::SnapshotName,
     failure: &Status,
 ) -> Result<(), Status> {
     match node_client
@@ -384,7 +382,7 @@ async fn remove_created_disk_operation_snapshot(
 async fn remove_disk_operation_snapshot_attempt(
     node_client: &mut pplx_space_node_mgr_client::NodeManagerGrpcClient,
     sandbox_id: &str,
-    snapshot_name: &pplx_space_common_core::types::SnapshotName,
+    snapshot_name: &pplx_space_snapshot_model::SnapshotName,
     paths: &DiskOperationSnapshotPaths,
     failure: &Status,
 ) -> Result<(), Status> {
@@ -450,7 +448,7 @@ fn operation_snapshot_next_step(
 
 fn live_sandbox_namespace(
     pid_alive: bool,
-    runtime_label: &pplx_space_common_core::types::SandboxRuntimeLabel,
+    runtime_label: &pplx_space_sandbox_model::SandboxRuntimeLabel,
 ) -> Option<String> {
     pid_alive.then(|| format!("sns-{runtime_label}"))
 }
@@ -500,17 +498,14 @@ fn apply_route_identity_provenance_to_state(
         provenance.current_substrate_kind,
         provenance.retained_substrate_kind,
     ];
-    let substrate_kind = if observed_substrates.contains(&Some(
-        pplx_space_common_core::types::NodeManagedBy::Kubernetes,
-    )) {
-        crate::proto::SandboxSubstrateKind::Kubernetes
-    } else if observed_substrates
-        .contains(&Some(pplx_space_common_core::types::NodeManagedBy::Space))
-    {
-        crate::proto::SandboxSubstrateKind::Direct
-    } else {
-        crate::proto::SandboxSubstrateKind::Unspecified
-    };
+    let substrate_kind =
+        if observed_substrates.contains(&Some(pplx_space_node_model::NodeManagedBy::Kubernetes)) {
+            crate::proto::SandboxSubstrateKind::Kubernetes
+        } else if observed_substrates.contains(&Some(pplx_space_node_model::NodeManagedBy::Space)) {
+            crate::proto::SandboxSubstrateKind::Direct
+        } else {
+            crate::proto::SandboxSubstrateKind::Unspecified
+        };
     sandbox.route_provenance_substrate_kind = substrate_kind as i32;
 
     let generation = [
@@ -551,12 +546,12 @@ impl SandboxManagerService {
             return Err(Status::invalid_argument("sandbox_ids is required"));
         }
 
-        use pplx_space_common_core::inventory::{MAX_ITEMS, MAX_RAW_BYTES};
+        use pplx_space_rpc_contracts::inventory::{MAX_ITEMS, MAX_RAW_BYTES};
         // Release SQLite between batches without resetting the RPC's budgets.
         let mut raw_budget = InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES);
         let mut metadata_budget = InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES);
         let mut response = StateResponse::default();
-        for batch in sandbox_ids.chunks(pplx_space_common_core::inventory::READ_BATCH_ITEMS) {
+        for batch in sandbox_ids.chunks(pplx_space_rpc_contracts::inventory::READ_BATCH_ITEMS) {
             let (batch, remaining_raw, remaining_metadata) = self
                 .state_batch(batch.to_vec(), raw_budget, metadata_budget)
                 .await?;
@@ -614,6 +609,9 @@ impl SandboxManagerService {
                         StatePageError::PinnedArtifactCreatedAt(error) => Status::internal(
                             format!("load pinned artifact capture times: {error}"),
                         ),
+                        StatePageError::RuntimeUpgrades(error) => {
+                            Status::internal(format!("load runtime upgrade fences: {error}"))
+                        }
                         StatePageError::RecoveryObservations(error) => {
                             tracing::warn!(%error, "failed to load quarantine recovery observations");
                             Status::internal(format!("load quarantine recovery observations: {error}"))
@@ -649,7 +647,7 @@ impl SandboxManagerService {
                             if let Some(observation) = decoded.recovery_observation {
                                 recovery_observations.insert(id, observation);
                             }
-                            rows.push(decoded.row);
+                            rows.push((decoded.row, decoded.published_execution));
                         }
                         StatePageRow::StateOnly(row) => {
                             let crate::db::read::StateOnlyRow {
@@ -729,7 +727,8 @@ impl SandboxManagerService {
         })
         .await?;
         let mut route_identity_provenance = route_identity_provenance;
-        let sandbox_results = stream::iter(rows.into_iter().map(|sandbox| {
+        let sandbox_results = stream::iter(rows.into_iter().map(|row| {
+            let (sandbox, published_execution) = row;
             let sandbox_id = sandbox.id.clone();
             let status = (sandbox.state, sandbox.cleanup_completion);
             let metadata = publication_metadata.remove(&sandbox.id);
@@ -753,6 +752,7 @@ impl SandboxManagerService {
                 sandbox_id,
                 status,
                 sandbox,
+                published_execution,
                 metadata,
                 state_changed_at,
                 pinned_artifact_created_at,
@@ -766,6 +766,7 @@ impl SandboxManagerService {
                 sandbox_id,
                 status,
                 sandbox,
+                published_execution,
                 metadata,
                 state_changed_at,
                 pinned_artifact_created_at,
@@ -785,7 +786,14 @@ impl SandboxManagerService {
                         pinned_artifact_created_at,
                         recovery_observation,
                     )
-                    .await,
+                    .await
+                    // The State page names the execution to publish, which
+                    // differs from the saved one while an upgrade fences the
+                    // sandbox.
+                    .map(|mut info| {
+                        info.execution = published_execution.as_ref().map(Into::into);
+                        info
+                    }),
                 )
             },
         )
@@ -1107,26 +1115,26 @@ impl SandboxManagerService {
             }),
             current_local_artifact_kind: sandbox.current_local_artifact_kind.map(
                 |kind| match kind {
-                    pplx_space_common_core::types::ArtifactKind::Disk => {
+                    pplx_space_snapshot_model::ArtifactKind::Disk => {
                         crate::proto::ArtifactKind::Disk as i32
                     }
-                    pplx_space_common_core::types::ArtifactKind::Full => {
+                    pplx_space_snapshot_model::ArtifactKind::Full => {
                         crate::proto::ArtifactKind::Full as i32
                     }
                 },
             ),
             current_local_artifact_origin: sandbox.current_local_artifact_origin.map(|origin| {
                 match origin {
-                    pplx_space_common_core::types::ArtifactOrigin::Stop => {
+                    pplx_space_snapshot_model::ArtifactOrigin::Stop => {
                         crate::proto::ArtifactOrigin::Stop as i32
                     }
-                    pplx_space_common_core::types::ArtifactOrigin::Suspend => {
+                    pplx_space_snapshot_model::ArtifactOrigin::Suspend => {
                         crate::proto::ArtifactOrigin::Suspend as i32
                     }
-                    pplx_space_common_core::types::ArtifactOrigin::Snapshot => {
+                    pplx_space_snapshot_model::ArtifactOrigin::Snapshot => {
                         crate::proto::ArtifactOrigin::Snapshot as i32
                     }
-                    pplx_space_common_core::types::ArtifactOrigin::Fork => {
+                    pplx_space_snapshot_model::ArtifactOrigin::Fork => {
                         crate::proto::ArtifactOrigin::Fork as i32
                     }
                 }
@@ -1149,6 +1157,14 @@ impl SandboxManagerService {
                 .pod_uid
                 .as_ref()
                 .map(ToString::to_string),
+            external_address: (!sandbox.state.lifecycle().completes_wait())
+                .then(|| id.parse::<SandboxId>().ok())
+                .flatten()
+                .and_then(|sandbox_id| {
+                    self.external_addresses
+                        .get(&sandbox_id, &sandbox.space_api_route_identity)
+                })
+                .map(|address| address.to_string()),
             activation_attempt_id: sandbox
                 .space_api_route_identity
                 .activation_attempt_id
@@ -1183,8 +1199,8 @@ impl SandboxManagerService {
         self.authorize_peer(&request, "CreateSnapshot", ALLOW_SANDBOX_OPERATOR)?;
         let req = request.into_inner();
         let artifact_kind = match snapshot_type_from_proto(req.r#type)? {
-            crate::proto::SnapshotType::Disk => pplx_space_common_core::types::ArtifactKind::Disk,
-            _ => pplx_space_common_core::types::ArtifactKind::Full,
+            crate::proto::SnapshotType::Disk => pplx_space_snapshot_model::ArtifactKind::Disk,
+            _ => pplx_space_snapshot_model::ArtifactKind::Full,
         };
         if let Some(crate::proto::create_snapshot_source::Source::DurableArtifact(source)) = req
             .source
@@ -1202,6 +1218,7 @@ impl SandboxManagerService {
             .artifact_publication_locks(&sandbox.id, artifact_kind)
             .await;
         let sandbox = self.lookup_sandbox(&sandbox.id)?;
+        let _producer = self.admit_artifact_producer("snapshot", &sandbox)?;
         self.ensure_memory_state_supported(&sandbox, "create snapshot")?;
         self.ensure_not_pool_sandbox_for_snapshots(&sandbox, "create snapshot")?;
         self.ensure_no_plaintext_pool_cow_for_snapshots(&sandbox, "create snapshot")?;
@@ -1215,8 +1232,8 @@ impl SandboxManagerService {
 
         // Determine snapshot type (default to full for backward compat)
         let snap_type = match artifact_kind {
-            pplx_space_common_core::types::ArtifactKind::Disk => "disk",
-            pplx_space_common_core::types::ArtifactKind::Full => "full",
+            pplx_space_snapshot_model::ArtifactKind::Disk => "disk",
+            pplx_space_snapshot_model::ArtifactKind::Full => "full",
         };
 
         // For full snapshots, validate state transition
@@ -1236,7 +1253,7 @@ impl SandboxManagerService {
         let snapshot_name = format!("{type_prefix}-manual-{now}");
         validate_snapshot_name(&snapshot_name)?;
         let typed_snapshot_name =
-            pplx_space_common_core::types::SnapshotName::parse(snapshot_name.clone()).map_err(
+            pplx_space_snapshot_model::SnapshotName::parse(snapshot_name.clone()).map_err(
                 |error| Status::internal(format!("generated snapshot name is invalid: {error}")),
             )?;
         let local_artifact_id = LocalArtifactId::new();
@@ -1248,6 +1265,7 @@ impl SandboxManagerService {
                 auto_lifecycle: self.auto_lifecycle.clone(),
                 health_lifecycle: self.watchdog.lifecycle_epochs(),
                 node_manager: self.node_manager.clone(),
+                activation_seal: Arc::clone(&self.activation_seal),
             };
 
             let completion = crate::snapshot_scheduler::do_checkpoint(&ctx, id, &snapshot_name)
@@ -1285,10 +1303,7 @@ impl SandboxManagerService {
         // Write label to sidecar JSON if provided (full snapshots only — disk snapshots
         // are read-only btrfs subvolumes, sidecar writes would fail silently)
         if !label.is_empty() && snap_type == "full" {
-            let snap_dir = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
-                id,
-                &snapshot_name,
-            );
+            let snap_dir = pplx_space_host_layout::paths::sandbox_snapshot_dir(id, &snapshot_name);
             let sidecar_path = format!("{snap_dir}/snapshot.json");
             // Read existing sidecar (written by do_checkpoint for full snapshots)
             let mut meta: serde_json::Value = std::fs::read_to_string(&sidecar_path)
@@ -1311,8 +1326,7 @@ impl SandboxManagerService {
         } else {
             crate::proto::SnapshotType::Disk
         };
-        let local_path =
-            pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(id, &snapshot_name);
+        let local_path = pplx_space_host_layout::paths::sandbox_snapshot_dir(id, &snapshot_name);
         let publish_result = {
             let db = self.db_conn()?;
             crate::db::publish_named_local_artifact(
@@ -1377,8 +1391,7 @@ impl SandboxManagerService {
             r#type: actual_type.into(),
             published_artifact: Some(crate::proto::PublishedArtifact {
                 local_artifact_id: local_artifact_id.to_string(),
-                artifact_kind: if artifact_kind == pplx_space_common_core::types::ArtifactKind::Full
-                {
+                artifact_kind: if artifact_kind == pplx_space_snapshot_model::ArtifactKind::Full {
                     crate::proto::ArtifactKind::Full as i32
                 } else {
                     crate::proto::ArtifactKind::Disk as i32
@@ -1394,9 +1407,9 @@ impl SandboxManagerService {
         &self,
         req: &crate::proto::CreateSnapshotRequest,
         initial_sandbox: &crate::db::SandboxRow,
-        artifact_kind: pplx_space_common_core::types::ArtifactKind,
+        artifact_kind: pplx_space_snapshot_model::ArtifactKind,
     ) -> Result<Response<crate::proto::CreateSnapshotResponse>, Status> {
-        if artifact_kind != pplx_space_common_core::types::ArtifactKind::Disk {
+        if artifact_kind != pplx_space_snapshot_model::ArtifactKind::Disk {
             return Err(Status::unimplemented(
                 "operation-safe full snapshots are reserved for rich runtime capture",
             ));
@@ -1407,12 +1420,11 @@ impl SandboxManagerService {
         let precondition = current_snapshot_precondition(req)?;
         let request_id = Uuid::parse_str(&identity.request_id)
             .map_err(|error| Status::invalid_argument(format!("invalid request_id: {error}")))?;
-        let expected_generation = pplx_space_common_core::types::ExecutionGeneration::new(
-            precondition.execution_generation,
-        )
-        .map_err(|error| {
-            Status::invalid_argument(format!("invalid execution_generation: {error}"))
-        })?;
+        let expected_generation =
+            pplx_space_sandbox_model::ExecutionGeneration::new(precondition.execution_generation)
+                .map_err(|error| {
+                Status::invalid_argument(format!("invalid execution_generation: {error}"))
+            })?;
         let expected_state =
             match crate::proto::SnapshotSourceLifecycle::try_from(precondition.lifecycle) {
                 Ok(crate::proto::SnapshotSourceLifecycle::Started) => SandboxState::Started,
@@ -1470,7 +1482,7 @@ impl SandboxManagerService {
                 &db,
                 &sandbox_id,
                 local_artifact_id,
-                pplx_space_common_core::types::ArtifactKind::Disk,
+                pplx_space_snapshot_model::ArtifactKind::Disk,
                 &snapshot_name,
                 local_path,
             )
@@ -1659,13 +1671,10 @@ impl SandboxManagerService {
                 crate::transfer_directory::prepare(&artifact_dir).map_err(|error| {
                     Status::internal(format!("prepare encrypted disk artifact: {error}"))
                 })?;
-                pplx_space_common_io::reflink::reflink_file(
-                    &capture,
-                    &artifact_dir.join("cow.luks"),
-                )
-                .map_err(|error| {
-                    Status::internal(format!("copy encrypted disk artifact: {error}"))
-                })?;
+                pplx_space_file_io::reflink::reflink_file(&capture, &artifact_dir.join("cow.luks"))
+                    .map_err(|error| {
+                        Status::internal(format!("copy encrypted disk artifact: {error}"))
+                    })?;
                 let cow = artifact_dir.join("cow.luks");
                 std::fs::set_permissions(&cow, std::fs::Permissions::from_mode(0o660))
                     .map_err(|error| Status::internal(error.to_string()))?;

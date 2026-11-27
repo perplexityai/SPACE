@@ -1,5 +1,124 @@
 use super::*;
 
+#[rstest::rstest]
+#[case(Some("6144"), Some(4096), Some(2048), Some(4096))]
+#[case(Some(" 6144 "), None, Some(2048), Some(6144))]
+#[case(Some("6144"), None, None, Some(6144))]
+#[case(None, None, Some(2048), Some(2048))]
+#[case(Some(" "), None, Some(2048), Some(2048))]
+#[case(None, None, None, crate::service::SandboxCgroupConfig::default().memory_mib)]
+fn sandbox_memory_environment_precedence(
+    #[case] env: Option<&str>,
+    #[case] cli: Option<u64>,
+    #[case] file: Option<u64>,
+    #[case] expected: Option<u64>,
+) {
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_NODEMGR_SANDBOX_CGROUP_MEMORY_MIB",
+        env.map(std::ffi::OsStr::new),
+    )]) {
+        return;
+    }
+    let config = resolve_sandbox_cgroup_config(
+        &memory_cli_config(cli),
+        &SandboxCgroupFileConfig {
+            memory_mib: file,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(config.memory_mib, expected);
+}
+
+fn memory_cli_config(memory_mib: Option<u64>) -> NodeMgrRunConfig {
+    NodeMgrRunConfig {
+        socket_path: PathBuf::new(),
+        health_socket_path: None,
+        service_mutex_timeout: Duration::ZERO,
+        config_path: PathBuf::new(),
+        network_pool_max_slots: None,
+        network_pool_target: None,
+        network_pool_retain_ready: None,
+        network_pool_min_ready: None,
+        pod_netns_path: None,
+        service_port_ingress_isolation: None,
+        sandbox_cgroup_memory_mib: memory_mib,
+        sandbox_cgroup_vcpu_count: None,
+        sandbox_cgroup_parent_memory_reserve_mib: None,
+        memory_admission_reserve_mib: None,
+    }
+}
+
+#[rstest::rstest]
+#[case(Some("8192"), Some(4096), Some(2048), Some(4096))]
+#[case(Some("invalid"), Some(4096), Some(2048), Some(4096))]
+#[case(Some(" 8192 "), None, Some(2048), Some(8192))]
+#[case(Some("8192"), None, None, Some(8192))]
+#[case(None, None, Some(2048), Some(2048))]
+#[case(Some(" "), None, Some(2048), Some(2048))]
+#[case(None, None, None, None)]
+fn parent_memory_reserve_precedence(
+    #[case] env: Option<&str>,
+    #[case] cli: Option<u64>,
+    #[case] file: Option<u64>,
+    #[case] expected: Option<u64>,
+) {
+    if !pplx_space_test_env::enter_test_process(&[(
+        ENV_SANDBOX_CGROUP_PARENT_MEMORY_RESERVE_MIB,
+        env.map(std::ffi::OsStr::new),
+    )]) {
+        return;
+    }
+    let mut cli_config = memory_cli_config(None);
+    cli_config.sandbox_cgroup_parent_memory_reserve_mib = cli;
+    let resolved = resolve_parent_memory_reserve_mib(
+        &cli_config,
+        &SandboxCgroupFileConfig {
+            parent_memory_reserve_mib: file,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(resolved, expected);
+}
+
+#[rstest::rstest]
+#[case("invalid")]
+#[case("-1")]
+#[case("18446744073709551616")]
+fn parent_memory_reserve_environment_rejects_invalid_values(#[case] value: &str) {
+    if !pplx_space_test_env::enter_test_process(&[(
+        ENV_SANDBOX_CGROUP_PARENT_MEMORY_RESERVE_MIB,
+        Some(std::ffi::OsStr::new(value)),
+    )]) {
+        return;
+    }
+    assert!(matches!(
+        resolve_parent_memory_reserve_mib(&memory_cli_config(None), &Default::default()),
+        Err(RunNodeMgrError::EnvNotU64 { .. })
+    ));
+}
+
+#[rstest::rstest]
+#[case("invalid")]
+#[case("-1")]
+#[case("18446744073709551616")]
+#[case("0")]
+#[case("128")]
+fn sandbox_memory_environment_rejects_invalid_limits(#[case] value: &str) {
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_NODEMGR_SANDBOX_CGROUP_MEMORY_MIB",
+        Some(std::ffi::OsStr::new(value)),
+    )]) {
+        return;
+    }
+    assert!(matches!(
+        resolve_sandbox_cgroup_config(&memory_cli_config(None), &Default::default()),
+        Err(RunNodeMgrError::EnvNotU64 { .. }
+            | RunNodeMgrError::SandboxCgroupMemoryBelowHeadroom { .. })
+    ));
+}
+
 #[test]
 fn configuration_precedence_and_owned_sections() {
     for (cli, env, file, expected) in [
@@ -21,11 +140,12 @@ fn configuration_precedence_and_owned_sections() {
     }
     // The shared file contains sections owned by other daemons.
     let config: NodeConfig = toml::from_str(
-        "[other_service]\nnew_setting = true\n[network_pool]\ntarget = 3\nretain_ready = 2\nmin_ready = 1",
+        "[other_service]\nnew_setting = true\n[network_pool]\ntarget = 3\nretain_ready = 2\nmin_ready = 1\n[sandbox_cgroup]\nparent_memory_reserve_mib = 4096",
     ).unwrap();
     assert_eq!(config.network_pool.target_ready_slots, Some(3));
     assert_eq!(config.network_pool.retained_ready_slots, Some(2));
     assert_eq!(config.network_pool.min_ready_slots, Some(1));
+    assert_eq!(config.sandbox_cgroup.parent_memory_reserve_mib, Some(4096));
     toml::from_str::<NodeConfig>("[network_pool]\nmax_slots = -1").unwrap_err();
     toml::from_str::<NodeConfig>("[network_pool]\ntarget = 1\ntarget_ready_slots = 2").unwrap_err();
 }
@@ -93,7 +213,7 @@ async fn drain_deadline_retains_mutex_until_owned_child_exits() {
     });
     tracker.close();
     let drain = tokio::spawn(async move {
-        drain_before_handoff(tracker.wait(), Duration::ZERO).await;
+        drain_before_handoff(tracker.wait(), Duration::ZERO, || {}).await;
         drop(mutex);
     });
     let mut drain = Box::pin(drain);
@@ -162,4 +282,21 @@ fn service_port_ingress_isolation_explicit_values_override_auto() {
         ServicePortIngressIsolation::ExclusiveHost
     );
     resolve_service_port_ingress_isolation(Some("k8s"), true).unwrap_err();
+}
+
+// A drain that outlasts its budget asks the remaining work to stop, and then
+// keeps waiting for it rather than giving up ownership.
+#[tokio::test(start_paused = true)]
+async fn an_exhausted_drain_budget_asks_the_remaining_work_to_stop() {
+    let stop = tokio_util::sync::CancellationToken::new();
+    let work = {
+        let stop = stop.clone();
+        async move { stop.cancelled().await }
+    };
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        drain_before_handoff(work, Duration::from_secs(25), || stop.cancel()),
+    )
+    .await
+    .expect("the drain ends once its budget asks the work to stop");
 }

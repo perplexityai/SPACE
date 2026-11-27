@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 
@@ -107,8 +108,9 @@ async fn create_refusals_before_insert_persist_nothing() {
 /// qualifies for memory state.
 #[tokio::test]
 async fn restore_persists_consumer_before_allocation_and_reselects_from_checkpoint() {
-    use pplx_space_common_core::types::{Arch, EnvironmentDescriptor, RuntimeBinding};
+    use pplx_space_cpu_arch::Arch;
     use pplx_space_execution_common::environment::EnvironmentDefinition;
+    use pplx_space_execution_spec::{EnvironmentDescriptor, RuntimeBinding};
     if !crate::service::tests::enter_route_test_process(&[
         ("EPPO_SDK_KEY", None),
         ("SPACE_FLAGD_ENABLED", None),
@@ -143,19 +145,19 @@ async fn restore_persists_consumer_before_allocation_and_reselects_from_checkpoi
 }
 
 async fn restore_selects_its_consumer_from_the_checkpoint(
-    producer: pplx_space_common_core::types::ExecutionMetadata,
+    producer: pplx_space_execution_spec::ExecutionMetadata,
     consumer_definition: pplx_space_execution_common::environment::EnvironmentDefinition,
 ) {
     use crate::node_manager_transport::fake::FakeNodeManager;
-    use pplx_space_common_core::types::{
-        ContentHash, RuntimeKind, SandboxArtifactMetadata, SandboxRuntimeLabel,
-        SnapshotExecutionMetadata,
-    };
+    use pplx_space_artifact_model::SandboxArtifactMetadata;
+    use pplx_space_content_digest::ContentHash;
+    use pplx_space_execution_spec::{RuntimeKind, SnapshotExecutionMetadata};
     use pplx_space_node_mgr_client::proto::{
         AllocateResponse, ExecutionEnvironmentSelection, NetworkPoolStatusResponse,
         ReleaseResponse, ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
         resolve_execution_environment_request::Compatible,
     };
+    use pplx_space_sandbox_model::SandboxRuntimeLabel;
     let consumer = consumer_definition.execution_requirements().unwrap();
     let directory = tempfile::tempdir().unwrap();
     let cache = directory.path().join("cache");
@@ -231,7 +233,7 @@ async fn restore_selects_its_consumer_from_the_checkpoint(
                     panic!("restore must use its operation-specific resolver");
                 };
                 assert_eq!(
-                    pplx_space_common_core::types::ExecutionMetadata::try_from(&source).unwrap(),
+                    pplx_space_execution_spec::ExecutionMetadata::try_from(&source).unwrap(),
                     expected_producer
                 );
                 Ok(ResolveExecutionEnvironmentResponse {
@@ -322,14 +324,15 @@ async fn restore_selects_its_consumer_from_the_checkpoint(
 #[tokio::test]
 async fn a_runtime_upgrade_fence_refuses_a_concurrent_restore_before_allocation() {
     use crate::node_manager_transport::fake::FakeNodeManager;
-    use pplx_space_common_core::types::{
-        Arch, ContentHash, RuntimeKind, SandboxArtifactMetadata, SandboxRuntimeLabel,
-        SnapshotExecutionMetadata,
-    };
+    use pplx_space_artifact_model::SandboxArtifactMetadata;
+    use pplx_space_content_digest::ContentHash;
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{RuntimeKind, SnapshotExecutionMetadata};
     use pplx_space_node_mgr_client::proto::{
         AllocateResponse, ExecutionEnvironmentSelection, NetworkPoolStatusResponse,
         ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
     };
+    use pplx_space_sandbox_model::SandboxRuntimeLabel;
     if !crate::service::tests::enter_route_test_process(&[
         ("EPPO_SDK_KEY", None),
         ("SPACE_FLAGD_ENABLED", None),
@@ -376,9 +379,14 @@ async fn a_runtime_upgrade_fence_refuses_a_concurrent_restore_before_allocation(
     )
     .unwrap();
     crate::db::upsert_sandbox_execution_metadata(&conn, &id.to_string(), &producer).unwrap();
-    let operation_id =
-        crate::db::test_fixtures::fence_runtime_upgrade(&conn, &id.to_string(), target, None)
-            .operation_id;
+    let operation_id = crate::db::test_fixtures::fence_runtime_upgrade(
+        &conn,
+        &id.to_string(),
+        target,
+        crate::db::RuntimeUpgradeTargetState::Started,
+        None,
+    )
+    .operation_id;
     let instance = cache.join(id.to_string()).join("instance");
     let snapshot = cache.join(id.to_string()).join("snapshot");
     std::fs::create_dir_all(&instance).unwrap();
@@ -479,7 +487,7 @@ async fn a_runtime_upgrade_fence_refuses_a_concurrent_restore_before_allocation(
 
 #[test]
 fn restore_guest_memory_uses_capture_shape_or_legacy_payload_and_rejects_conflict() {
-    use pplx_space_common_core::types::MemorySize;
+    use pplx_space_byte_size::MemorySize;
     for (captured, file, expected) in [
         (None, None, Ok(None)),
         (None, Some(2048), Ok(Some(2048))),
@@ -495,23 +503,41 @@ fn restore_guest_memory_uses_capture_shape_or_legacy_payload_and_rejects_conflic
     }
 }
 
+/// What the node's activation seal says when a restore asks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Seal {
+    Unsealed,
+    Sealed,
+    /// The service's startup read of the seal row failed.
+    Unreadable,
+}
+
 /// A restore of a suspended sandbox from its local snapshot passes the VM
 /// launch-time admission as a restore activation before it asks node-manager
 /// to launch Firecracker. Node-manager refuses the launch, so the restore
-/// stops there.
+/// stops there. While the node refuses activations, sealed or with a seal
+/// row its startup couldn't read, the restore is refused before its claim:
+/// it requests no admission, allocates no network, begins no cleanup
+/// episode and leaves every row as it was, and node-manager is never asked
+/// to launch.
+#[rstest::rstest]
 #[tokio::test]
-async fn suspend_restore_is_admitted_before_the_vm_launches() {
+async fn suspend_restore_is_admitted_before_the_vm_launches(
+    #[values(Seal::Unsealed, Seal::Sealed, Seal::Unreadable)] seal: Seal,
+) {
     use crate::node_manager_transport::fake::FakeNodeManager;
     use crate::service::start_support::{ActivationAdmissionKind, REQUESTED_VM_ACTIVATIONS};
-    use pplx_space_common_core::types::{
-        Arch, AutoLifecyclePolicy, ContentHash, RuntimeKind, SandboxArtifactMetadata,
-        SandboxRuntimeLabel, SnapshotExecutionMetadata,
-    };
+    use pplx_space_artifact_model::SandboxArtifactMetadata;
+    use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
+    use pplx_space_content_digest::ContentHash;
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{RuntimeKind, SnapshotExecutionMetadata};
     use pplx_space_node_mgr_client::proto::{
         AllocateRequest, AllocateResponse, ExecutionEnvironmentSelection, LaunchSandboxResponse,
         NetworkPoolStatusRequest, NetworkPoolStatusResponse, PrepareSandboxResponse,
         ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
     };
+    use pplx_space_sandbox_model::SandboxRuntimeLabel;
 
     let compiled =
         pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(Arch::X86_64)
@@ -576,8 +602,17 @@ async fn suspend_restore_is_admitted_before_the_vm_launches() {
     std::fs::write(snapshot.join("vmstate"), b"vmstate").unwrap();
     std::fs::write(snapshot.join("memory"), b"memory").unwrap();
 
+    if seal == Seal::Unreadable {
+        conn.execute_batch("ALTER TABLE activation_seal RENAME TO activation_seal_hidden")
+            .unwrap();
+    }
+    let allocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let admitted = Arc::new(std::sync::Mutex::new(Vec::new()));
     let admitted_at_launch = Arc::new(std::sync::Mutex::new(None));
+    let in_flight_at_launch = Arc::new(std::sync::Mutex::new(None));
+    let seal_slot = Arc::new(std::sync::Mutex::new(
+        None::<Arc<crate::activation_seal::ActivationSeal>>,
+    ));
     let selected = producer.clone();
     let node = FakeNodeManager::default()
         .unary("GetNetworkPoolStatus", |_: NetworkPoolStatusRequest| {
@@ -598,11 +633,15 @@ async fn suspend_restore_is_admitted_before_the_vm_launches() {
                 })
             },
         )
-        .unary("Allocate", |_: AllocateRequest| {
-            Ok(AllocateResponse {
-                sandbox_uid: 10_000,
-                ..Default::default()
-            })
+        .unary("Allocate", {
+            let allocations = Arc::clone(&allocations);
+            move |_: AllocateRequest| {
+                allocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(AllocateResponse {
+                    sandbox_uid: 10_000,
+                    ..Default::default()
+                })
+            }
         })
         .unary("PrepareSandbox", |request: PrepareSandboxRequest| {
             Ok(PrepareSandboxResponse {
@@ -613,8 +652,12 @@ async fn suspend_restore_is_admitted_before_the_vm_launches() {
         .unary("LaunchSandbox", {
             let admitted = Arc::clone(&admitted);
             let admitted_at_launch = Arc::clone(&admitted_at_launch);
+            let in_flight_at_launch = Arc::clone(&in_flight_at_launch);
+            let seal_slot = Arc::clone(&seal_slot);
             move |_: LaunchSandboxRequest| -> Result<LaunchSandboxResponse, Status> {
                 *admitted_at_launch.lock().unwrap() = Some(admitted.lock().unwrap().clone());
+                let seal = seal_slot.lock().unwrap().clone().unwrap();
+                *in_flight_at_launch.lock().unwrap() = Some(seal.status().in_flight);
                 Err(Status::unavailable(
                     "firecracker launch refused by the test",
                 ))
@@ -630,6 +673,13 @@ async fn suspend_restore_is_admitted_before_the_vm_launches() {
         },
     );
 
+    *seal_slot.lock().unwrap() = Some(Arc::clone(&service.activation_seal));
+    if seal == Seal::Sealed {
+        service.activation_seal.seal(&service.db, 2).unwrap();
+    }
+    // The rows as the restore finds them, the seal's own row included.
+    let before =
+        crate::db::test_fixtures::state_write_fixtures::snapshot(&service.db.lock().unwrap());
     let result = tokio::time::timeout(
         Duration::from_secs(30),
         REQUESTED_VM_ACTIVATIONS.scope(
@@ -650,15 +700,56 @@ async fn suspend_restore_is_admitted_before_the_vm_launches() {
     .expect("the restore finishes within 30 seconds");
 
     let error = result.expect_err("node-manager refuses the launch");
-    assert_eq!(
-        *admitted_at_launch.lock().unwrap(),
-        Some(vec![ActivationAdmissionKind::Restore]),
-        "node-manager was asked to launch the VM only after it requested admission: {error}"
-    );
-    assert_eq!(
-        *admitted.lock().unwrap(),
-        vec![ActivationAdmissionKind::Restore]
-    );
+    if seal != Seal::Unsealed {
+        let (code, marker) = match seal {
+            Seal::Sealed => (
+                tonic::Code::FailedPrecondition,
+                crate::activation_seal::ACTIVATIONS_SEALED_MARKER,
+            ),
+            _ => (
+                tonic::Code::Unavailable,
+                crate::activation_seal::ACTIVATION_SEAL_UNREADABLE_MARKER,
+            ),
+        };
+        assert_eq!(error.code(), code, "{seal:?}: {error:?}");
+        assert!(error.message().contains(marker), "{seal:?}: {error:?}");
+        assert_eq!(
+            *admitted_at_launch.lock().unwrap(),
+            None,
+            "{seal:?}: node-manager is never asked to launch the VM"
+        );
+        assert_eq!(
+            *admitted.lock().unwrap(),
+            Vec::new(),
+            "{seal:?}: refused before it requests admission"
+        );
+        assert_eq!(
+            allocations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{seal:?}: refused before the network allocation"
+        );
+        crate::db::test_fixtures::state_write_fixtures::assert_unchanged(
+            &format!("{seal:?}"),
+            &before,
+            &service.db.lock().unwrap(),
+        );
+    } else {
+        assert_eq!(
+            *admitted_at_launch.lock().unwrap(),
+            Some(vec![ActivationAdmissionKind::Restore]),
+            "node-manager was asked to launch the VM only after it requested admission: {error}"
+        );
+        assert_eq!(
+            *in_flight_at_launch.lock().unwrap(),
+            Some(vec![id.clone()]),
+            "the restore is in flight while it launches the VM"
+        );
+        assert_eq!(
+            *admitted.lock().unwrap(),
+            vec![ActivationAdmissionKind::Restore]
+        );
+    }
+    service.activation_seal.assert_quiesced();
     service.shutdown_token.cancel();
     service.task_tracker.close();
     tokio::time::timeout(Duration::from_secs(30), service.task_tracker.wait())

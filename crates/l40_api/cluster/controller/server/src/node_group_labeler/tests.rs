@@ -1,9 +1,9 @@
 //! # Test matrix
 //!
 //! ## C — `ReconcilerConfig` + env parsing
-//! The name grammar is `NodeGroupName`'s (in `common-core`, with its own
-//! tests); `store/tests.rs` additionally pins that it still agrees with the
-//! `node_groups.name` CHECK. `write_concurrency` isn't read from the
+//! The name grammar is `NodeGroupName`'s (in `pplx-space-node-model`, with
+//! its own tests); `store/tests.rs` additionally pins that it still agrees
+//! with the `node_groups.name` CHECK. `write_concurrency` isn't read from the
 //! environment; its clamp is pinned where it bites: `t53` measures the patch
 //! fan-out's clamp through a real tick — the ceiling that actually bounds
 //! concurrent apiserver writes — and `t52` the clamp function's boundaries.
@@ -83,10 +83,11 @@
 //!   tick)
 //! - `t53_write_concurrency_ceiling_bounds_the_patch_fan_out`
 
-use pplx_space_common_core::types::NodeGroupId;
+use pplx_space_node_model::NodeGroupId;
 use std::sync::Mutex;
 
-use pplx_space_common_core::types::{NodeGroupName, PositiveDuration};
+use pplx_space_durations::PositiveDuration;
+use pplx_space_node_model::NodeGroupName;
 use pplx_space_observability::test_capture::{CapturedEventsLayer, field_value};
 use tracing_subscriber::layer::SubscriberExt;
 

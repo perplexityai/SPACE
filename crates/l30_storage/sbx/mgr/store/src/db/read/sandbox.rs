@@ -1,11 +1,9 @@
 //! One sandbox's whole row, decoded strictly, and the two raw projections
 //! that a whole-row read cannot stand in for.
 
-use pplx_space_common_core::inventory::InventoryBudget;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use crate::db::auto_lifecycle_delete_receipts::RouteIdentityAdoptionMetadata;
-use crate::db::inventory_read::InventoryReadError;
 use crate::db::{Connection, Result, SandboxEraseSafety, SandboxRow};
 
 /// The sandbox's whole row, `None` without one.
@@ -15,16 +13,6 @@ use crate::db::{Connection, Result, SandboxEraseSafety, SandboxRow};
 /// without a decodable row reads the narrower [`super::sandbox_view`].
 pub fn sandbox(conn: &Connection, id: &str) -> Result<Option<SandboxRow>> {
     crate::db::get_sandbox(conn, id)
-}
-
-/// [`sandbox`] for a bounded inventory: the row's raw bytes are charged to
-/// `budget` before it is decoded, so a limit failure allocates nothing.
-pub fn sandbox_within_budget(
-    conn: &Connection,
-    id: &str,
-    budget: &mut InventoryBudget,
-) -> Result<Option<SandboxRow>, InventoryReadError> {
-    crate::db::inventory_read::get(conn, id, budget)
 }
 
 /// The row's `state_changed_at` exactly as stored, `None` without a row.

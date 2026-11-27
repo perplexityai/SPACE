@@ -11,7 +11,10 @@
 //! [`RESTART_RETRY_ON_SUCCESSOR_METADATA`]: pplx_space_sbx_mgr_client::RESTART_RETRY_ON_SUCCESSOR_METADATA
 
 use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
+
+use futures_util::{Stream, StreamExt};
 
 use pplx_space_common_grpc::{GrpcRetryContext, GrpcRetryPolicy};
 use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
@@ -20,15 +23,22 @@ use tonic::{Request, Response, Status};
 
 use pplx_space_sbx_mgr_client::{
     SandboxManagerGrpcClient, connect_fresh, is_restart_retry_on_successor,
+    mark_restart_retry_on_successor,
 };
 
-/// Retry budget spanning a full sandbox-manager restart handoff: the
-/// predecessor drains state writers for up to [`DEFAULT_DRAIN_TIMEOUT`]
-/// before it exits and the successor can bind the socket. The budget is a
-/// hard deadline covering backoff sleeps, fresh dials, and in-flight
-/// replays — not just the decision to retry. Callers with a tighter
-/// `grpc-timeout` deadline are still bounded by it.
-const RESTART_HANDOFF_RETRY_POLICY: GrpcRetryPolicy = GrpcRetryPolicy {
+use crate::clients::BackendClients;
+
+/// Retry budget spanning a restart of a node-local peer, sandbox-manager or
+/// node-manager: it covers a predecessor drain that finishes within
+/// [`DEFAULT_DRAIN_TIMEOUT`] plus about 5 s for the successor to start and
+/// bind the socket. node-manager's drain timeout is when its predecessor
+/// escalates, not a bound, so a longer drain surfaces the error when this
+/// budget runs out. The budget is a hard deadline covering backoff sleeps,
+/// dials, and the attempt in flight, not just the decision to retry; the
+/// sandbox-manager handoff starts it at the first failure, the node-manager
+/// port forward at the first attempt. Callers with a tighter `grpc-timeout`
+/// deadline are still bounded by it.
+pub(crate) const PEER_RESTART_RETRY_POLICY: GrpcRetryPolicy = GrpcRetryPolicy {
     max_retries: 128,
     initial_delay: Duration::from_millis(50),
     backoff_multiplier: 2.0,
@@ -56,10 +66,15 @@ pub(crate) enum RpcReplaySafety {
     /// The RPC is read-only and inherently replay-safe, so a
     /// transport-shaped failure (which may have executed) earns one
     /// fresh-connection probe in case the shared channel was the problem.
-    /// The drain-sized budget stays reserved for handoff proofs: a live
-    /// handler returning unmarked `UNAVAILABLE` (for example, a started
-    /// sandbox whose spaced-host socket is absent) must not be re-executed
-    /// in a loop. Never use this for an RPC with side effects.
+    /// That includes an `UNAVAILABLE` the server answered: sandbox-manager
+    /// ends every call still in flight with an unmarked one when it hands
+    /// its socket to a successor, and that interruption is an intended
+    /// trigger of the probe. The drain-sized budget stays reserved for
+    /// handoff proofs: a live handler returning unmarked `UNAVAILABLE` (for
+    /// example, a started sandbox whose spaced-host socket is absent) must
+    /// not be re-executed in a loop. Never use this for an RPC that changes
+    /// or consumes state its caller can observe; waking the sandbox or
+    /// refreshing its activity clock, as a client's retry would, is fine.
     ReadOnly,
 }
 
@@ -113,6 +128,8 @@ struct RestartHandoffDialer<C> {
 
 struct DialerState<C> {
     epoch: u64,
+    /// When the dial behind `result` began.
+    started_at: Option<tokio::time::Instant>,
     dialed_at: Option<tokio::time::Instant>,
     result: Option<Result<C, Status>>,
 }
@@ -123,6 +140,7 @@ impl<C: Clone> RestartHandoffDialer<C> {
             ttl,
             state: tokio::sync::Mutex::new(DialerState {
                 epoch: 0,
+                started_at: None,
                 dialed_at: None,
                 result: None,
             }),
@@ -131,6 +149,9 @@ impl<C: Clone> RestartHandoffDialer<C> {
 
     /// Returns the shared dial result for an epoch newer than `seen_epoch`,
     /// dialing at most once per TTL window across all concurrent callers.
+    /// With `not_before`, a cached result counts only if its dial began at or
+    /// after that instant: an earlier dial may have reached the process whose
+    /// failure the caller is replaying.
     /// The lock is held across the dial deliberately: queued callers wake to
     /// the cached result instead of dialing themselves. Each dial attempt is
     /// itself bounded by the TTL, so a stalled connect (for example, one
@@ -139,7 +160,12 @@ impl<C: Clone> RestartHandoffDialer<C> {
     /// blocking every follower behind one dead generation. Callers remain
     /// bounded by their own deadlines and cancellation — dropping a queued
     /// or dialing caller releases the lock.
-    async fn fresh_client<D, DFut>(&self, seen_epoch: u64, dial: &D) -> (u64, Result<C, Status>)
+    async fn fresh_client<D, DFut>(
+        &self,
+        seen_epoch: u64,
+        not_before: Option<tokio::time::Instant>,
+        dial: &D,
+    ) -> (u64, Result<C, Status>)
     where
         D: Fn() -> DFut,
         DFut: Future<Output = Result<C, Status>>,
@@ -148,9 +174,13 @@ impl<C: Clone> RestartHandoffDialer<C> {
         if state.epoch > seen_epoch
             && let Some(result) = &state.result
             && matches!(state.dialed_at, Some(at) if at.elapsed() < self.ttl)
+            && not_before.is_none_or(
+                |not_before| matches!(state.started_at, Some(started) if started >= not_before),
+            )
         {
             return (state.epoch, result.clone());
         }
+        let started_at = tokio::time::Instant::now();
         let result = match tokio::time::timeout(self.ttl, dial()).await {
             Ok(result) => result,
             Err(_) => Err(Status::unavailable(format!(
@@ -159,6 +189,7 @@ impl<C: Clone> RestartHandoffDialer<C> {
             ))),
         };
         state.epoch += 1;
+        state.started_at = Some(started_at);
         state.dialed_at = Some(tokio::time::Instant::now());
         state.result = Some(result.clone());
         (state.epoch, result)
@@ -196,6 +227,21 @@ impl std::fmt::Display for RestartHandoffOutcome {
     }
 }
 
+/// Mark a call node-api's dial to sandbox-manager failed before sending it as
+/// sandbox-manager's restart drain marks a call it refused before dispatch,
+/// so a caller that still holds the call's input can send it again once the
+/// successor owns the socket. Only a typed client-side dial failure proves the
+/// call was never sent; every other failure, an answered drain refusal
+/// included, is returned unchanged. For calls node-api cannot rebuild and
+/// replay itself, such as a client-streamed write.
+pub(crate) fn mark_unsent_for_successor(status: Status) -> Status {
+    if pplx_space_common_grpc::is_client_connect_failure(&status) {
+        mark_restart_retry_on_successor(status)
+    } else {
+        status
+    }
+}
+
 /// Forward one sandbox-manager RPC, replaying it only across a restart
 /// handoff.
 ///
@@ -208,9 +254,11 @@ impl std::fmt::Display for RestartHandoffOutcome {
 /// the request never executed, so replay is safe for every RPC, idempotent
 /// or not. RPCs declared [`RpcReplaySafety::ReadOnly`] additionally earn a
 /// single fresh-connection probe on an ambiguous transport-shaped failure —
-/// enough to escape a dead pinned channel, without re-executing a live
-/// erroring handler for the drain-sized budget. Every other failure is
-/// returned unchanged because the RPC may have executed.
+/// enough to escape a dead pinned channel, or to reach the successor after
+/// sandbox-manager's handoff interrupted the call in flight with an unmarked
+/// `UNAVAILABLE`, without re-executing a live erroring handler for the
+/// drain-sized budget. Every other failure is returned unchanged because the
+/// RPC may have executed.
 ///
 /// Replays never reuse `client`; each one uses a fresh, uncached connection
 /// to reach whichever process currently owns the socket, because an
@@ -227,7 +275,7 @@ pub(crate) async fn call_with_restart_handoff<Req, Resp, F, Fut>(
     method: &'static str,
     safety: RpcReplaySafety,
     request: Request<Req>,
-    client: SandboxManagerGrpcClient,
+    clients: &BackendClients,
     call: F,
 ) -> Result<Response<Resp>, Status>
 where
@@ -235,11 +283,31 @@ where
     F: Fn(SandboxManagerGrpcClient, Request<Req>) -> Fut + Send,
     Fut: Future<Output = Result<Response<Resp>, Status>> + Send,
 {
+    #[cfg(test)]
+    if let Some(successor) = clients.sbx_successor_for_tests() {
+        // Never the process-wide dialer: its shared result would hand one
+        // test's successor to another test running concurrently.
+        let dialer = RestartHandoffDialer::new(Duration::ZERO);
+        let dial = move || {
+            let successor = successor.clone();
+            async move { Ok(successor) }
+        };
+        return call_with_restart_handoff_via(
+            method,
+            safety,
+            request,
+            clients.sbx(),
+            &dialer,
+            dial,
+            call,
+        )
+        .await;
+    }
     call_with_restart_handoff_via(
         method,
         safety,
         request,
-        client,
+        clients.sbx(),
         production_dialer(),
         dial_fresh,
         call,
@@ -267,7 +335,7 @@ where
     let message = request.into_inner();
     retry_restart_handoff(
         method,
-        RESTART_HANDOFF_RETRY_POLICY,
+        PEER_RESTART_RETRY_POLICY,
         safety,
         metadata,
         message,
@@ -326,9 +394,16 @@ where
     // wording cannot enter here), or — for read-only RPCs — one
     // fresh-connection probe on an ambiguous transport-shaped failure.
     let mut probes_remaining = safety.probe_allowance();
+    // A read probe must reach a connection dialed after the failure it
+    // replays, never a shared dial from before it, which can still lead to
+    // the process that failed the read. Proof replays keep sharing dials.
+    let mut probe_not_before = None;
     match safety.classify(&status) {
         ReplayClass::Proof => {}
-        ReplayClass::ReadProbe => probes_remaining -= 1,
+        ReplayClass::ReadProbe => {
+            probes_remaining -= 1;
+            probe_not_before = Some(tokio::time::Instant::now());
+        }
         ReplayClass::Fatal => return Err(status),
     }
 
@@ -357,7 +432,11 @@ where
         attempts += 1;
         pplx_space_grpc_metrics::client_retry("sandbox-manager", method, "rpc", "restart_handoff");
         let budget = attempt_budget(&context, handoff_deadline);
-        let shared_dial = async { Ok(dialer.fresh_client(seen_epoch, &dial).await) };
+        let shared_dial = async {
+            Ok(dialer
+                .fresh_client(seen_epoch, probe_not_before, &dial)
+                .await)
+        };
         let (epoch, dialed) = match run_within(budget, method, shared_dial).await {
             Ok(shared) => shared,
             Err(deadline_status) => {
@@ -394,6 +473,7 @@ where
                 }
                 ReplayClass::ReadProbe if probes_remaining > 0 => {
                     probes_remaining -= 1;
+                    probe_not_before = Some(tokio::time::Instant::now());
                     last_status = status;
                 }
                 ReplayClass::ReadProbe | ReplayClass::Fatal => {
@@ -405,6 +485,35 @@ where
     };
     log_restart_handoff_outcome(method, outcome, attempts, started_at);
     Err(last_status)
+}
+
+/// A response stream whose first item has been read.
+pub(crate) type HeldStream<Item> = Pin<Box<dyn Stream<Item = Result<Item, Status>> + Send>>;
+
+/// Read a stream's first item before handing the stream on. If that item is
+/// an error `safety` would replay (sandbox-manager's handoff interruption is
+/// the intended case), the attempt fails and the handoff loop may replay it;
+/// such an error that outlasts the replay becomes the call's status. Any other
+/// first item is delivered unchanged, and nothing after the first item is
+/// replayed.
+pub(crate) async fn hold_first_item<Item, S>(
+    safety: RpcReplaySafety,
+    response: Response<S>,
+) -> Result<Response<HeldStream<Item>>, Status>
+where
+    Item: Send + 'static,
+    S: Stream<Item = Result<Item, Status>> + Send + 'static,
+{
+    let (metadata, stream, extensions) = response.into_parts();
+    let mut stream = Box::pin(stream);
+    let first = match stream.next().await {
+        Some(Err(status)) if safety.classify(&status) != ReplayClass::Fatal => {
+            return Err(status);
+        }
+        first => first,
+    };
+    let held: HeldStream<Item> = Box::pin(futures_util::stream::iter(first).chain(stream));
+    Ok(Response::from_parts(metadata, held, extensions))
 }
 
 async fn run_until_deadline<T>(

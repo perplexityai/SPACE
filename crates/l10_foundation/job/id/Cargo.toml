@@ -11,19 +11,21 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-rusqlite = { workspace = true, optional = true }
+pplx-space-sql-codec = { workspace = true, optional = true }
+pplx-space-uuid-id = { workspace = true }
 serde = { workspace = true, features = ["derive"], optional = true }
-sqlx = { workspace = true, features = ["postgres", "uuid"], optional = true }
-thiserror = { workspace = true }
-uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
+# The unit tests compile sqlite_uuid!(JobId) without the feature.
+pplx-space-sql-codec = { workspace = true, features = ["sqlite"] }
 rusqlite = { workspace = true }
+# JobId's generated doc examples and the unit tests call uuid.
+uuid = { workspace = true }
 
 [features]
 default = []
 serde = ["dep:serde"]
 # JobId's Postgres impls: uuid_id! compiles them when its caller, here this
 # crate, enables `sqlx`.
-sqlx = ["dep:sqlx"]
-rusqlite = ["dep:rusqlite"]
+sqlx = ["dep:pplx-space-sql-codec", "pplx-space-sql-codec/postgres"]
+rusqlite = ["dep:pplx-space-sql-codec", "pplx-space-sql-codec/sqlite"]

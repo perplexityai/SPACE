@@ -14,7 +14,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
 };
 use futures_util::{Stream, StreamExt, stream};
-use pplx_space_common_core::types::{GuestUserName, MAX_GUEST_PATH_BYTES};
+use pplx_space_guest_process::{GuestUserName, MAX_GUEST_PATH_BYTES};
 
 use super::{
     E2B_FILE_CONTENT_LIMIT_BYTES, EcwProxyError, ResponseKind, ResponseOrigin, SpoolFiles,

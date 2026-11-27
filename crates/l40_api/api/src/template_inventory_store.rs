@@ -1,10 +1,9 @@
-//! Template releases as worker nodes report them in their inventory.
+//! Template releases as worker nodes report them in their inventory, read
+//! through `pplx-space-node-template-inventory-store`.
 
-use pplx_space_common_core::{
-    sql,
-    types::{MemorySize, RuntimeKind, TemplateName, VcpuCount},
-};
-use sqlx::PgExecutor;
+use pplx_space_byte_size::MemorySize;
+use pplx_space_execution_spec::{RuntimeKind, VcpuCount};
+use pplx_space_template_model::TemplateName;
 
 /// The VM shape a template release was built for, from its `metadata.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,58 +27,19 @@ impl TemplateBuildShape {
 /// metadata; the builder's row is preferred, as for the lifecycle default,
 /// but the shape survives the builder evicting the release.
 pub(crate) async fn release_build_shape(
-    executor: impl PgExecutor<'_>,
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
     template: &TemplateName,
     content_hash: &str,
     runtime: RuntimeKind,
 ) -> Result<Option<TemplateBuildShape>, sqlx::Error> {
-    let row = sqlx::query_as::<_, (Option<i32>, Option<i32>)>(sql!(
-        "SELECT nti.vcpu, nti.memory_mib
-         FROM node_template_inventory nti
-         JOIN nodes n ON n.id = nti.node_id
-         WHERE nti.template_name = $1
-           AND nti.content_hash = $2
-           AND (nti.runtime IS NULL OR nti.runtime = '' OR nti.runtime = $3)
-           AND nti.vcpu > 0
-           AND nti.memory_mib > 0
-         ORDER BY (n.role = 'builder') DESC, nti.observed_at DESC
-         LIMIT 1"
-    ))
-    .bind(template.as_str())
-    .bind(content_hash)
-    .bind(runtime.alias())
-    .fetch_optional(executor)
+    let row = pplx_space_node_template_inventory_store::release_build_shape(
+        executor,
+        template,
+        content_hash,
+        runtime,
+    )
     .await?;
-    Ok(row.and_then(|(vcpu, memory_mib)| TemplateBuildShape::from_inventory(vcpu, memory_mib)))
-}
-
-/// The execution environment every node holding `content_hash` of
-/// `template` with a binding reports it bound to, unparsed. `None` when no
-/// node reports one, or when nodes report different ones: one hash can be
-/// cached bound to several environments, and then no single binding is the
-/// build's. A row without a binding doesn't count either way. A legacy
-/// unprefixed hash matches its `sha256:` spelling, as the template release
-/// lookups match it.
-pub(crate) async fn agreed_build_environment(
-    executor: impl PgExecutor<'_>,
-    template: &str,
-    content_hash: &str,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, Option<String>>(sql!(
-        "SELECT CASE WHEN COUNT(DISTINCT bindings.environment) = 1
-                     THEN MIN(bindings.environment) END
-         FROM (
-             SELECT nti.execution_metadata->>'environment' AS environment
-             FROM node_template_inventory nti
-             WHERE nti.template_name = $1
-               AND nti.content_hash IN ($2, replace($2, 'sha256:', ''))
-               AND nti.execution_metadata->>'environment' IS NOT NULL
-         ) bindings"
-    ))
-    .bind(template)
-    .bind(content_hash)
-    .fetch_one(executor)
-    .await
+    Ok(row.and_then(|row| TemplateBuildShape::from_inventory(row.vcpu, row.memory_mib)))
 }
 
 #[cfg(test)]

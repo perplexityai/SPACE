@@ -1,17 +1,20 @@
+use pplx_space_sql_locator::sql;
 use std::{collections::BTreeMap, fmt};
 use uuid::Uuid;
 
-use pplx_space_common_core::types::{
-    NodeId, OrgId, RuntimeKind, SnapshotId, TemplateReference, UpstreamIssuer, UpstreamOrgId,
-    UpstreamSubjectId, UserId,
+use pplx_space_accounts::{
+    NodeId, OrgId, UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId, UserId,
 };
 use pplx_space_db_test_fixtures::{
     insert_suspended_sandbox, insert_uploading_snapshot, pg_test_db,
 };
+use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_public_api::{
     OperationId, OperationTargetType, PublicSandboxMetadataValue,
     SandboxResources as PublicSandboxResources,
 };
+use pplx_space_snapshot_model::SnapshotId;
+use pplx_space_template_model::TemplateReference;
 
 use super::*;
 
@@ -165,6 +168,7 @@ async fn native_create_executor_preserves_operator_policy_across_replacements(
     // proxy port answers for.
     let worker = pplx_space_node_api_sim::SimWorkerHarness::builder(NodeId::new().to_string())
         .with_internal_api()
+        .as_sandbox_pod()
         .start()
         .await?;
     let substrate = crate::controllers::substrate::Substrate::from_kubernetes(
@@ -815,6 +819,37 @@ fn cluster_admission_429_is_marked_backpressure() {
         result.requeue_reason,
         PublicOperationRequeueReason::ActivationBackpressure
     );
+}
+
+/// Each activation-admission refusal requeues the create the way its kind
+/// says: only the shared bucket is backpressure, and the capacity refusals
+/// spend the transient-error budget. The hint is the admission's own.
+#[test]
+fn activation_rejection_kinds_requeue_as_their_kind_says() {
+    use crate::controllers::substrate::ActivationRejectionKind;
+    let op = claimed_create_operation();
+    let hint = std::time::Duration::from_secs(4);
+    for (kind, reason) in [
+        (
+            ActivationRejectionKind::RateLimited,
+            PublicOperationRequeueReason::ActivationBackpressure,
+        ),
+        (
+            ActivationRejectionKind::EmptyCluster,
+            PublicOperationRequeueReason::TransientFailure,
+        ),
+        (
+            ActivationRejectionKind::NoFreeSlot,
+            PublicOperationRequeueReason::TransientFailure,
+        ),
+    ] {
+        let result = controller_error_result(
+            &op,
+            kind.controller_error("refused".to_string(), Some(hint)),
+        );
+        assert_eq!(result.requeue_reason, reason, "{kind:?}");
+        assert_eq!(result.retry_after, Some(hint), "{kind:?}");
+    }
 }
 
 #[test]

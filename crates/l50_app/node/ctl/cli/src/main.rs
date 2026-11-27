@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 use comfy_table::{Cell, Table, presets::UTF8_FULL};
-use pplx_space_common_core::types::{SimpleDurationParseError, parse_simple_duration_secs};
+use pplx_space_durations::{SimpleDurationParseError, parse_simple_duration_secs};
 use pplx_space_node_api_client::proto::node_ctl_client::NodeCtlClient;
 use pplx_space_node_api_client::proto::{
     FacetControllerState, FacetDirection, FacetQueueItem, FacetRef, FacetSyncOverride,
@@ -26,7 +26,7 @@ struct Cli {
     #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
     _version: (),
 
-    #[arg(long, default_value = pplx_space_common_core::host::linux::paths::NODE_CTL_SOCKET)]
+    #[arg(long, default_value = pplx_space_host_layout::paths::NODE_CTL_SOCKET)]
     socket: PathBuf,
 
     #[command(subcommand)]

@@ -4,10 +4,11 @@ use std::time::Duration;
 use k8s_openapi::api::core::v1::Node;
 use kube::api::{Patch, PatchParams};
 use kube::{Api, Client};
-use pplx_space_common_core::kubernetes::{
-    is_template_write_annotation_key, parse_template_write_annotation,
+use pplx_space_sandbox_pod::{
+    is_template_environment_write_annotation_key, is_template_write_annotation_key,
+    parse_template_environment_write_annotation, parse_template_write_annotation,
 };
-use pplx_space_common_core::types::{DEFAULT_TEMPLATE_TAG, TemplateReference, TemplateSelector};
+use pplx_space_template_model::{DEFAULT_TEMPLATE_TAG, TemplateReference, TemplateSelector};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -138,6 +139,7 @@ impl TemplatePullRequestReconciler {
                         %node_name,
                         annotation = %key,
                         reference = %request.reference,
+                        environment = ?request.environment,
                         resolved_artifact_digest = ?outcome.content_hash,
                         state = "ready",
                         "template write annotation satisfied"
@@ -151,6 +153,7 @@ impl TemplatePullRequestReconciler {
                         %node_name,
                         annotation = %key,
                         reference = %request.reference,
+                        environment = ?request.environment,
                         error = %err,
                         "template write annotation materialization failed"
                     );
@@ -160,6 +163,7 @@ impl TemplatePullRequestReconciler {
                         %node_name,
                         annotation = %key,
                         reference = %request.reference,
+                        environment = ?request.environment,
                         "template write task cancelled"
                     );
                 }
@@ -168,6 +172,7 @@ impl TemplatePullRequestReconciler {
                         %node_name,
                         annotation = %key,
                         reference = %request.reference,
+                        environment = ?request.environment,
                         error = %err,
                         "template write task failed"
                     );
@@ -259,8 +264,13 @@ impl TemplatePullRequestReconciler {
                         );
                         let (template, artifact_selector, tag) =
                             template_reference_lookup_parts(&task_request.reference);
-                        tmpl.ensure_template(&template, artifact_selector.as_deref(), tag.as_deref())
-                            .await
+                        tmpl.ensure_template(
+                            &template,
+                            artifact_selector.as_deref(),
+                            tag.as_deref(),
+                            task_request.environment,
+                        )
+                        .await
                     } => result.map_err(TemplateWriteTaskError::TemplateManager),
                 }
             });
@@ -282,11 +292,25 @@ impl TemplatePullRequestReconciler {
         let mut malformed = BTreeMap::new();
 
         for (key, value) in &current_metadata.annotations {
-            if !is_template_write_annotation_key(key) {
+            let request = if is_template_write_annotation_key(key) {
+                parse_template_write_annotation(key, value).map(|reference| {
+                    TemplateWriteTaskRequest {
+                        reference,
+                        environment: None,
+                    }
+                })
+            } else if is_template_environment_write_annotation_key(key) {
+                parse_template_environment_write_annotation(key, value).map(|write| {
+                    TemplateWriteTaskRequest {
+                        reference: write.reference,
+                        environment: Some(write.environment),
+                    }
+                })
+            } else {
                 continue;
-            }
+            };
 
-            let Some(reference) = parse_template_write_annotation(key, value) else {
+            let Some(request) = request else {
                 malformed.insert(key.clone(), value.clone());
                 if self.last_malformed_warnings.get(key) != Some(value) {
                     tracing::warn!(
@@ -299,7 +323,7 @@ impl TemplatePullRequestReconciler {
             };
 
             self.last_malformed_warnings.remove(key);
-            requests.insert(key.clone(), TemplateWriteTaskRequest { reference });
+            requests.insert(key.clone(), request);
         }
 
         self.last_malformed_warnings = malformed;
@@ -310,6 +334,10 @@ impl TemplatePullRequestReconciler {
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct TemplateWriteTaskRequest {
     reference: TemplateReference,
+    /// The environment whose cache partition must hold the build, from a
+    /// `template-environment-write` annotation; see
+    /// [`pplx_space_sandbox_pod::TemplateEnvironmentWrite`].
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 }
 
 fn template_reference_lookup_parts(

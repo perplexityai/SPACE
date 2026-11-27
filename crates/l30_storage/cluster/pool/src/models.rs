@@ -1,8 +1,9 @@
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
-use pplx_space_common_core::types::{
-    ContentHash, DiskIoLimits, MemorySize, TemplateName, VcpuCount,
-};
+use pplx_space_byte_size::MemorySize;
+use pplx_space_content_digest::ContentHash;
+use pplx_space_execution_spec::{DiskIoLimits, VcpuCount};
+use pplx_space_template_model::TemplateName;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -114,7 +115,7 @@ pub enum AutoscaleRead {
 }
 
 impl AutoscaleRead {
-    pub const fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::RetainedPolicyReleases => "retained-policy-releases",
             Self::DemandedPolicyReleases => "demanded-policy-releases",
@@ -220,6 +221,16 @@ pub struct ClaimedSlotBindSource {
     pub pod_uid: Option<String>,
     pub pod_ip: Option<String>,
     pub k8s_node_name: Option<String>,
+}
+
+/// A config [`crate::WarmPoolStore::disable_config`] disabled: its release
+/// and shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisabledPoolConfig {
+    pub template_release_id: uuid::Uuid,
+    pub vcpu: i32,
+    pub memory_mib: i32,
+    pub encryptable: bool,
 }
 
 /// Operator-requested (`managed_by = 'manual'`) pool config shape for
@@ -352,7 +363,7 @@ pub struct TemplateWarmPoolUsage {
     /// sandboxes created from the pool. Each stays until its sandbox's pod
     /// is retired, whatever its config's state.
     pub sandbox_held_slots: i64,
-    /// Up to [`TEMPLATE_USAGE_SANDBOX_ID_LIMIT`] of the sandboxes holding
+    /// Up to `TEMPLATE_USAGE_SANDBOX_ID_LIMIT` of the sandboxes holding
     /// those slots, oldest claim first, then by id.
     pub sandbox_ids: Vec<SandboxId>,
     /// Enabled policies for the template name, by shape.
@@ -360,7 +371,7 @@ pub struct TemplateWarmPoolUsage {
 }
 
 /// How many sandbox ids [`TemplateWarmPoolUsage::sandbox_ids`] names.
-pub const TEMPLATE_USAGE_SANDBOX_ID_LIMIT: usize = 5;
+pub(crate) const TEMPLATE_USAGE_SANDBOX_ID_LIMIT: usize = 5;
 
 impl TemplateWarmPoolUsage {
     pub fn is_empty(&self) -> bool {

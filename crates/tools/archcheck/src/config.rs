@@ -25,9 +25,10 @@ use crate::{
 mod layers;
 
 pub use layers::{
-    CoWriters, DomainFences, DomainFencesError, Drivers, DriversError, DuplicateGrantError,
-    DuplicatePackageError, EdgeBehaviours, Entries, Layer, LayersConfig, LayersPolicy, PackageSet,
-    StateConfig, StorageConfig, StoragePolicy, UnknownLayerError, Unmoved, UnmovedError,
+    CoWriters, CodecFacade, DomainFences, DomainFencesError, Drivers, DriversError,
+    DuplicateGrantError, DuplicatePackageError, EdgeBehaviours, Entries, Layer, LayersConfig,
+    LayersPolicy, PackageSet, StateConfig, StorageConfig, StoragePolicy, UnknownLayerError,
+    Unmoved, UnmovedError,
 };
 
 pub const CONFIG_FILE: &str = "ARCHITECTURE.toml";

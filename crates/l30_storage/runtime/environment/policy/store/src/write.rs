@@ -14,13 +14,15 @@
 //! row for its foreign key, while the deletion's `ON DELETE SET NULL` cascade
 //! holds the user row and needs the locked one, and Postgres aborts one side.
 //!
-//! The verbs take a transaction rather than any executor: each runs several
-//! statements under one row lock, which only a transaction the caller commits
-//! can hold.
+//! The verbs take the caller's open transaction rather than any executor:
+//! each runs several statements under one row lock, which only a transaction
+//! the caller commits can hold. Their bound refuses a pool but not a
+//! connection without a transaction open, so pass the open transaction.
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{EnvironmentReference, UserId};
-use sqlx::{Postgres, Transaction};
+use pplx_space_accounts::UserId;
+use pplx_space_execution_spec::EnvironmentReference;
+use pplx_space_postgres_pool::{DbError, Executor};
+use pplx_space_sql_locator::sql;
 
 use crate::{RuntimeEnvironmentState, UnknownRuntimeEnvironmentState};
 
@@ -85,7 +87,7 @@ pub enum SetDefaultError {
         source: UnknownRuntimeEnvironmentState,
     },
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -102,7 +104,7 @@ pub enum SetEnvironmentStateError {
     #[error("blocking environment {0} requires a cluster default")]
     BlockRequiresDefault(EnvironmentReference),
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -110,7 +112,7 @@ pub enum SetLegacyUnboundAllowedError {
     #[error("the runtime environment policy row is missing")]
     PolicyRowMissing,
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 }
 
 /// The policy row as seen under its row lock.
@@ -119,16 +121,17 @@ struct LockedPolicy {
 }
 
 /// Lock the policy row. `None` when the row is gone.
-async fn lock_policy(
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<Option<LockedPolicy>, sqlx::Error> {
+async fn lock_policy<C>(tx: &mut C) -> Result<Option<LockedPolicy>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let row = sqlx::query_as::<_, (Option<String>,)>(sql!(
         "SELECT default_environment_ref
          FROM runtime_environment_policy
          WHERE singleton
          FOR UPDATE"
     ))
-    .fetch_optional(&mut **tx)
+    .fetch_optional(tx.into_sqlx())
     .await?;
     Ok(row.map(|(default_environment_ref,)| LockedPolicy {
         default_environment_ref,
@@ -137,12 +140,15 @@ async fn lock_policy(
 
 /// Make `environment` the cluster default, recording it as `allowed` if it
 /// isn't already. A replaced default keeps its `allowed` state. Returns the
-/// new generation.
-pub async fn set_default(
-    tx: &mut Transaction<'_, Postgres>,
+/// new generation. The caller must pass its open transaction.
+pub async fn set_default<C>(
+    tx: &mut C,
     environment: EnvironmentReference,
     change: &PolicyChange,
-) -> Result<u64, SetDefaultError> {
+) -> Result<u64, SetDefaultError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     if lock_policy(tx).await?.is_none() {
         return Err(SetDefaultError::PolicyRowMissing);
     }
@@ -151,8 +157,9 @@ pub async fn set_default(
         "SELECT state FROM runtime_environment_states WHERE environment_ref = $1"
     ))
     .bind(&environment_ref)
-    .fetch_optional(&mut **tx)
-    .await?;
+    .fetch_optional((&mut *tx).into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     let current = current
         .map(|(state,)| state.parse::<RuntimeEnvironmentState>())
         .transpose()
@@ -181,24 +188,29 @@ pub async fn set_default(
          WHERE singleton"
     ))
     .bind(&environment_ref)
-    .execute(&mut **tx)
-    .await?;
+    .execute((&mut *tx).into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     Ok(bump_generation(tx, change).await?)
 }
 
 /// Record `state` for `environment`. The default must stay `allowed`, and
-/// blocking requires a cluster default. Returns the new generation.
+/// blocking requires a cluster default. Returns the new generation. The
+/// caller must pass its open transaction.
 ///
 /// It assigns the state without reading the old one, so it also replaces a
 /// stored value this binary doesn't know. That's the repair for a state that
 /// fails [`crate::get`]. [`set_default`] refuses such an environment instead,
 /// since it would have to decide what the unknown state means.
-pub async fn set_environment_state(
-    tx: &mut Transaction<'_, Postgres>,
+pub async fn set_environment_state<C>(
+    tx: &mut C,
     environment: EnvironmentReference,
     state: RuntimeEnvironmentState,
     change: &PolicyChange,
-) -> Result<u64, SetEnvironmentStateError> {
+) -> Result<u64, SetEnvironmentStateError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let Some(locked) = lock_policy(tx).await? else {
         return Err(SetEnvironmentStateError::PolicyRowMissing);
     };
@@ -222,12 +234,15 @@ pub async fn set_environment_state(
 }
 
 /// Set whether unbound historical contracts may execute. Returns the new
-/// generation.
-pub async fn set_legacy_unbound_allowed(
-    tx: &mut Transaction<'_, Postgres>,
+/// generation. The caller must pass its open transaction.
+pub async fn set_legacy_unbound_allowed<C>(
+    tx: &mut C,
     allowed: bool,
     change: &PolicyChange,
-) -> Result<u64, SetLegacyUnboundAllowedError> {
+) -> Result<u64, SetLegacyUnboundAllowedError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     if lock_policy(tx).await?.is_none() {
         return Err(SetLegacyUnboundAllowedError::PolicyRowMissing);
     }
@@ -237,17 +252,21 @@ pub async fn set_legacy_unbound_allowed(
          WHERE singleton"
     ))
     .bind(allowed)
-    .execute(&mut **tx)
-    .await?;
+    .execute((&mut *tx).into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     Ok(bump_generation(tx, change).await?)
 }
 
-async fn upsert_state(
-    tx: &mut Transaction<'_, Postgres>,
+async fn upsert_state<C>(
+    tx: &mut C,
     environment_ref: &str,
     state: RuntimeEnvironmentState,
     change: &PolicyChange,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "INSERT INTO runtime_environment_states
              (environment_ref, state, updated_by_user_id, reason)
@@ -261,17 +280,17 @@ async fn upsert_state(
     .bind(state.as_str())
     .bind(change.actor)
     .bind(change.reason.as_str())
-    .execute(&mut **tx)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
 
 /// Raise the generation and stamp the change on the locked policy row. Every
 /// write ends with this, in the same transaction as its change.
-async fn bump_generation(
-    tx: &mut Transaction<'_, Postgres>,
-    change: &PolicyChange,
-) -> Result<u64, sqlx::Error> {
+async fn bump_generation<C>(tx: &mut C, change: &PolicyChange) -> Result<u64, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let (generation,) = sqlx::query_as::<_, (i64,)>(sql!(
         "UPDATE runtime_environment_policy
          SET generation = generation + 1,
@@ -282,7 +301,7 @@ async fn bump_generation(
     ))
     .bind(change.actor)
     .bind(change.reason.as_str())
-    .fetch_one(&mut **tx)
+    .fetch_one(tx.into_sqlx())
     .await?;
     // The schema keeps the generation non-negative, but it's still a stored
     // value: report a violation as a decode error rather than panicking.
@@ -290,5 +309,6 @@ async fn bump_generation(
         sqlx::Error::Decode(
             format!("runtime environment policy generation {generation} is negative").into(),
         )
+        .into()
     })
 }

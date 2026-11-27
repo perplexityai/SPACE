@@ -11,7 +11,7 @@ fn armed_clone() -> (SandboxManagerService, SandboxId, SandboxCleanupEpisodeId) 
 }
 
 fn armed_clone_with_image(
-    guest_image: pplx_space_common_core::types::guest_image::GuestImageContract,
+    guest_image: pplx_space_execution_spec::guest_image::GuestImageContract,
 ) -> (SandboxManagerService, SandboxId, SandboxCleanupEpisodeId) {
     let conn = crate::db::test_conn();
     let id = SandboxId::new();
@@ -25,7 +25,7 @@ fn armed_clone_with_image(
             state: SandboxState::Creating.into(),
             template: "seed",
             template_hash: Some("sha256:test"),
-            user: &pplx_space_common_core::types::SandboxOwner::parse("deploy").unwrap(),
+            user: &pplx_space_accounts::SandboxOwner::parse("deploy").unwrap(),
             runtime: if guest_image.legacy_transport() {
                 RuntimeKind::Firecracker.as_str()
             } else {
@@ -83,7 +83,7 @@ async fn cloning_preserves_guest_contract_and_requires_current_checkpoint() {
     }))
     .unwrap();
     let definition = pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap()
     .into_iter()
@@ -122,8 +122,8 @@ async fn cloning_preserves_guest_contract_and_requires_current_checkpoint() {
         let template = tempfile::tempdir().unwrap();
         std::fs::write(template.path().join("metadata.json"), serde_json::json!({
             "arch": std::env::consts::ARCH,
-            "spaced_version": pplx_space_spaced_common::spaced_version(),
-            "spaced_compatibility_family": pplx_space_spaced_common::spaced_compatibility_family(),
+            "spaced_version": pplx_space_spaced_protocol::spaced_version(),
+            "spaced_compatibility_family": pplx_space_spaced_guest_protocol::spaced_compatibility_family(),
         }).to_string()).unwrap();
         let directory = template.path().to_str().unwrap().to_string();
         service.template_resolver = Arc::new(FakeTemplateResolver::new(move || {
@@ -156,6 +156,7 @@ async fn cloning_preserves_guest_contract_and_requires_current_checkpoint() {
             .unary("GetCloneCapabilities", |_: CloneCapabilitiesRequest| {
                 Ok(CloneCapabilitiesResponse {
                     prepared_clone_disposal: true,
+                    staged_checkpoint_disk: false,
                 })
             })
             .unary("CaptureVmState", move |_: CaptureVmStateRequest| {
@@ -465,10 +466,10 @@ async fn pool_clone_restart_preserves_disposal_ownership() {
             &db,
             &id.to_string(),
             SandboxState::Creating,
-            pplx_space_common_core::types::SandboxQuarantineSource::SbxManager,
+            pplx_space_sandbox_model::SandboxQuarantineSource::SbxManager,
             SandboxQuarantineReasonCode::CreateInterrupted,
             "operator hold during publication",
-            pplx_space_common_core::types::SandboxQuarantineNextAction::RequiresOperatorAttention,
+            pplx_space_sandbox_model::SandboxQuarantineNextAction::RequiresOperatorAttention,
         )
         .unwrap()
     );
@@ -526,7 +527,7 @@ async fn pool_clone_requires_a_stable_donor_and_pins_its_template_revision() {
 
 #[tokio::test]
 async fn pool_clone_and_adoption_keep_donor_ownership_exclusive() {
-    use pplx_space_common_core::host::linux::identities::users;
+    use pplx_space_host_layout::identities::users;
 
     let (service, id, cleanup_id) = armed_clone();
     let id = id.to_string();
@@ -643,6 +644,7 @@ impl<B> tower::Service<http::Request<B>> for CleanupPeer {
             use prost::Message;
             let response = pplx_space_node_mgr_client::proto::CloneCapabilitiesResponse {
                 prepared_clone_disposal: supported,
+                staged_checkpoint_disk: false,
             }
             .encode_to_vec();
             let mut frame = vec![0];

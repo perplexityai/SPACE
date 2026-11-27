@@ -4,7 +4,7 @@ use pplx_space_api_route::{
     SPACE_API_ROUTE_ED25519_TOKEN_METADATA_KEY, SpaceApiBridgeCallerPolicy,
     set_space_api_bridge_caller_policy,
 };
-use pplx_space_common_core::host::linux::identities::users;
+use pplx_space_host_layout::identities::users;
 
 fn service() -> SandboxManagerService {
     SandboxManagerService::for_test(crate::db::Connection::open_in_memory())

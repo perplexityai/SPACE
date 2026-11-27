@@ -266,7 +266,7 @@ down the stack. The layers are directories under `crates/`, bottom-up:
 |---|---|
 | `l10_foundation` | generic building blocks that name nothing SPACE-specific |
 | `l20_domain` | models (types and the rules that keep them valid) and protocols (wire schemas and conversions), without I/O |
-| `l30_storage` | stores: the only crates that reach a database, private to the crates that own their state |
+| `l30_storage` | stores, the only crates that reach a database, private to the crates that own their state; and coordinators, which run one transaction across stores |
 | `l40_api` | use cases and their entry points (handlers, loops, sweepers, jobs), and each service's `*-client` |
 | `l50_app` | thin mains that compose API crates |
 | `test_support` | test doubles and fixtures, reachable only through `[dev-dependencies]` |
@@ -281,11 +281,7 @@ service: `sbx-mgr` beside `sbx-mgr-client` is at
 `crates/l40_api/sbx/mgr/server`. The crates that predate the layer
 directories are listed by layer in `[rules.layers.unmoved]` until they move;
 a new crate goes in a layer directory, and a crate changes layer by moving
-into that layer's directory, not by editing its entry. `[rules.layers]
-legacy` names the crates being dissolved, such as `pplx-space-common-core`,
-which predate the layers and mix SPACE-specific code in until they are split
-up: every check covers them like any other crate, with today's edges
-baselined.
+into that layer's directory, not by editing its entry.
 
 Normal and build dependencies follow this matrix; the checks below say what
 each finding means and how to fix it.
@@ -294,17 +290,20 @@ each finding means and how to fix it.
 |---|---|
 | Foundation | Foundation |
 | Domain | Domain, Foundation |
-| Storage | Domain, Foundation, and another store that lists it as a user |
-| API | API, Domain, Foundation, and the stores that list it as a user; a `*-client` only Domain, Foundation and other clients |
-| App | API, Domain, Foundation; never another app or a store |
+| Storage | Domain, Foundation, a `storage_handles` crate, and another store that lists it as a user; never a coordinator |
+| API | API, Domain, Foundation, and the stores and coordinators that list it as a user; a `*-client` only Domain, Foundation and other clients |
+| App | API, Domain, Foundation; never another app or an `l30_storage` crate |
 | test_support, tools | anything but tools |
 
 ```toml
 [rules.layers.unmoved]                 # crates outside the layer directories
 l10_foundation = ["pplx-space-byte-size"]
 
-[rules.layers.store_users]             # store → the crates that own its state and use it
+[rules.layers.store_users]             # store → the crates that own its state and use it, and the coordinators that call it
 pplx-space-sandbox-store = ["pplx-space-api"]
+
+[rules.layers.coordinator_users]       # coordinator → the API crates that run its transaction
+pplx-space-sandbox-coordinator = ["pplx-space-api"]
 
 [rules.layers.allowed_edges]           # edges the matrix forbids, allowed by name
 pplx-space-db-migrator = ["pplx-space-db-migrate"]
@@ -313,9 +312,12 @@ pplx-space-db-migrator = ["pplx-space-db-migrate"]
 drivers = ["sqlx", "rusqlite"]         # packages that reach a database or object storage
 helpers = ["pplx-space-s3-http-client", "pplx-space-sqlite"]  # every storage helper
 
+[rules.layers.storage.codec_facades."pplx-space-sql-codec".exports]  # what a codec facade re-exports
+sqlx = ["Type", "postgres::PgTypeInfo"]   # paths below each driver's root, each exactly
+
 [rules.layers]
-legacy = ["pplx-space-common-core"]    # crates being dissolved; see Storage access below
 protocols = ["pplx-space-events"]      # protocols without a *-protocol or *-proto name; see Domain
+storage_handles = ["pplx-space-postgres-pool"]  # Storage crates that provide the Postgres stores' database handles; API users stay listed
 
 [rules.layers.domain_fences]           # packages no Domain crate depends on, by family
 runtime = ["tokio"]
@@ -323,7 +325,8 @@ http = ["hyper", "reqwest"]
 
 [rules.layers.placement]
 mode = "required"
-# ...and layout, test_only, clients, store_edges, stale_entries and
+# ...and layout, test_only, clients, store_edges, coordinators,
+# coordinator_edges, driver_reexports, stale_entries and
 # policy_changed, each with a mode, and direction, dev_direction,
 # storage_access, codec_features, domain_dependencies and model_protocol, each
 # with no_crossing, no_new_entries and stale_entries.
@@ -366,7 +369,8 @@ The checks, each with its own mode:
 - `test_only`: a normal or build dependency on a test_support crate from a
   layer crate, or any dependency on a tools crate. Tools may use test_support
   as a normal dependency. An `allowed_edges` entry, which exempts an edge
-  from `direction`, `clients` and `store_edges`, never exempts one from
+  from `direction`, `clients`, `store_edges`, `coordinators` and
+  `coordinator_edges`, never exempts one from
   `test_only`.
 - `clients`: a `*-client` crate in `l40_api` depending on anything but
   Domain, Foundation and other clients, such as its own service or a store.
@@ -374,30 +378,48 @@ The checks, each with its own mode:
 - `store_edges`: an API or Storage crate depending on a store whose
   `store_users` doesn't list it. The fix is the owner's API, or for a store,
   which can't depend on one, moving the read into the owning store; or, if
-  the crate owns the state, listing it.
+  the crate owns the state, listing it. A coordinator is listed as a user of
+  each store it has a normal or build dependency on. The exception is a
+  store in `[rules.layers] storage_handles`, which provides the database
+  handle types Postgres stores use (`pplx-space-postgres-pool`'s `Db`, `Tx`,
+  `Executor` and `DbError`): any Storage crate, store or coordinator, may
+  depend on it without an entry. An API crate still needs one, so its list
+  says which services hold a database handle.
+- `coordinators`, `coordinator_edges` and `driver_reexports`: see
+  [Coordinators](#coordinators).
 - `stale_entries`: an `unmoved` entry for a crate that is gone or now in a
-  layer directory; a `legacy` entry for a crate that is gone; a `store_users`
-  entry for something that isn't a store, or listing a crate that is gone, a
-  client, or one outside API and Storage, which allows nothing, or a user
-  that no longer uses the store: one with no normal or build dependency on
-  it, directly or through a `legacy` crate that depends on it, since the list
-  says who uses the store today; an `allowed_edges` entry whose normal or
-  build dependency is gone, that needs no exception, or that is for a
-  `test_only` edge, which it can't exempt; a `[rules.layers.storage]`
-  `helpers` entry that is gone, outside `l10_foundation` or also `legacy`; a
-  `protocols` entry that is gone, outside `l20_domain` or a protocol by its
-  name already; a `[rules.layers.domain_fences]` package that is a driver or
+  layer directory; a `store_users` entry for something that isn't a store,
+  or listing a crate that is gone, a client, one outside API and Storage, or,
+  in a `storage_handles` crate's entry, a Storage crate, which allows
+  nothing, or a user that no longer uses the store: one with no normal or
+  build dependency on it, since the list says who uses the store today; a
+  `storage_handles` entry that is gone, outside `l30_storage` or a
+  coordinator; an `allowed_edges` entry whose normal or build dependency is
+  gone, that needs no exception, or that is for a `test_only` edge, which it can't
+  exempt; a `[rules.layers.storage]` `helpers` entry that is gone or outside
+  `l10_foundation`; a `codec_facades` entry that is gone, outside
+  `l10_foundation` or also a helper, and one of its exports that no file of the
+  facade re-exports, an empty export list, or an export key for no driver
+  it depends on; a `protocols` entry that is gone, outside `l20_domain` or a protocol by its
+  name already; a `coordinator_users` entry for something that isn't a
+  coordinator, or listing a crate that is gone, a client, or one outside
+  API, which allows nothing, or a user with no normal or build dependency on
+  the coordinator; a `store_users` entry for a coordinator, whose users go
+  in `coordinator_users`; a `[rules.layers.domain_fences]` package that is a driver or
   a storage helper, which `storage_access` checks instead, or a Foundation
   crate that its own dependencies fence already; and, with the state
   checks, a `[rules.layers.state.co_writers]` grant that allows nothing (see
   [State ownership](#state-ownership)). An entry naming a crate without a
   layer isn't stale: the crate's `placement` finding covers it. Each is
-  shown on its line in `ARCHITECTURE.toml`.
+  shown on its line in `ARCHITECTURE.toml`, except an empty export list,
+  which is shown on its facade's header line.
 - `policy_changed`: every difference in `[rules.layers]` from the base
   branch's `ARCHITECTURE.toml`, given with `--base-architecture`: an
   `unmoved` entry added or moved to another layer, a store user or allowed
-  edge added or removed, a legacy crate or a protocol added or removed, a
-  driver or helper added to or removed from `[rules.layers.storage]`, a
+  edge added or removed, a coordinator user added or removed, a protocol
+  or storage handle crate added or removed, a driver, helper or
+  codec facade added to or removed from
+  `[rules.layers.storage]`, a facade's export added or removed, a
   package added to, removed from or moved between
   `[rules.layers.domain_fences]` families, a shared catalog, or one of its
   databases, or a co-writer grant added or removed (see [State
@@ -451,11 +473,73 @@ layers table, `[layers.unowned]` with the state checks, after the tables of
 caps and before `[crate_names]`; `--write-baseline=layers.<check>` updates
 one, creating it if the file lacks it.
 
+### Coordinators
+
+`l30_storage` holds two kinds of crate. A **store** owns its tables or
+objects and holds all of their SQL; every statement it runs writes only its
+own tables, except where a `[rules.layers.state.co_writers]` grant allows
+another store's table. A **coordinator** is an `l30_storage` crate whose package name
+ends in `-coordinator`, at `<area>/coordinator` (`pplx-space-<area>-coordinator`):
+it runs one transaction across two or more stores, calling each store's
+verb for that store's own rows, and documents the lock order. Every other
+`l30_storage` crate is a store. A coordinator owns no tables, holds no SQL
+and depends on no driver, storage helper or codec facade
+(`[rules.layers.storage]` in `ARCHITECTURE.toml`): only Domain crates, other
+Foundation crates, the stores that list it as a user, and the
+`storage_handles` crates, such as `pplx-space-postgres-pool`, which need no
+entry. The checks:
+
+- `coordinators`: a coordinator with a `[package.metadata.space.state]`,
+  shown on the table's line, since it owns no tables; an `l30_storage` crate
+  whose path below the layer ends in `coordinator` but whose name doesn't
+  end in `-coordinator`, shown on its `name =` line, since archcheck would
+  check it as a store (`layout`'s leaf rule accepts `<area>/coordinator`
+  for `pplx-space-<area>`, so only this check makes name and path agree); a
+  coordinator in a leaf directory below `<area>/coordinator`, such as
+  `<area>/coordinator/server`, shown on its `name =` line, since the same
+  leaf rule would accept it but a coordinator sits exactly at
+  `<area>/coordinator` (`layout` reports any other path); and a
+  coordinator's normal or build dependency on another coordinator, shown on
+  the manifest line that declares it: coordinators don't nest, so
+  the outer one calls the stores' verbs itself, in the inner one's lock
+  order, or the two merge.
+- `coordinator_edges`: an API crate depending on a coordinator whose
+  `[rules.layers.coordinator_users]` entry doesn't list it, and a store
+  depending on any coordinator, listed or not: a coordinator's edges point at
+  stores, never from them. Only API crates are listed; `stale_entries`
+  reports any other user.
+- `driver_reexports`: a `pub use` or `pub extern crate` that starts with one
+  of a Storage crate's driver dependencies, by the name its code uses for
+  it, at the top level of the crate's library root or in a `pub mod` block
+  there, which would hand the crate's users the driver. The root is read
+  with syn, as a codec facade's source is (see [Storage
+  access](#storage-access)), so a finding is on line 1 of the file and names
+  the full path re-exported. Items only tests compile, under `cfg(test)`
+  or an `all(…)` that includes `test`, are skipped; `any(test, …)` is not.
+  A root syn can't parse is skipped, since rustc reports it, and so is a
+  root outside the crate's `src/`, which archcheck doesn't read; a driver
+  re-exported from another module, or through a type alias, is not seen.
+
+A coordinator is no store for the other checks either: `storage_access` and
+`codec_features` report its driver, helper and codec facade dependencies and
+the driver features it enables, as they do an API crate's, with a fix that
+moves the code into the store that owns the rows; `state.declarations` asks
+it for no state table, and its declaration makes no table owned;
+`state.writes` reports its write statement that names a store's table,
+whatever it declares or is granted, since a coordinator holds no SQL; and a
+co-writer grant to a coordinator allows nothing. Like `store_users`, a
+`coordinator_users` entry is a policy change that
+`policy_changed` reports, and an `allowed_edges` entry exempts an edge from
+`coordinators` and `coordinator_edges` as it does from `store_edges`.
+
 ### Storage access
 
 Nothing above Storage talks to a database or object storage directly,
-Domain never does, and Foundation does only in a storage helper, which names
-nothing SPACE-specific. `[rules.layers.storage]` says what that means:
+Foundation does only in a storage helper, which names nothing
+SPACE-specific, and Domain and other Foundation crates hold at most a
+**codec**, the impls that encode a type into a driver's values and decode it
+back, written against a codec facade. `[rules.layers.storage]` says what
+that means:
 
 - `drivers`: the packages outside the workspace that reach a database or
   object storage, such as `sqlx`, `rusqlite`, `redis`, `deadpool-redis` and
@@ -472,60 +556,122 @@ nothing SPACE-specific. `[rules.layers.storage]` says what that means:
   driver: `pplx-space-s3-http-client`, which plugs an HTTP connector into
   an `aws-sdk-s3` client without depending on it, is the one derivation
   can't see.
-- `[rules.layers] legacy` (see [Layers](#layers)): for these checks, a
-  legacy `l10_foundation` crate is no helper, listed or with a required
-  driver dependency, so it is checked like every other crate, with today's
-  edges baselined, and a crate that depends on one does not reach storage
-  through it. Test support and tools are left out of both checks.
+- `codec_facades` (`[rules.layers.storage.codec_facades.<package>]`): the
+  **codec facades**, `l10_foundation` crates that re-export only the items
+  a codec needs from a driver, behind features that turn on an optional
+  dependency on it, such as `pplx-space-sql-codec`, whose `postgres`
+  feature gives `Type`, `Encode`, `Decode` and the Postgres value types of
+  `sqlx`, and whose `sqlite` feature gives `ToSql`, `FromSql` and the
+  value types of `rusqlite`. Each facade's `exports` lists, by driver, the
+  paths below the driver's root that its `pub use` items may name, each
+  exactly, such as `postgres::PgTypeInfo` for `sqlx` or `types::ValueRef`
+  for `rusqlite`; where the facade puts an item doesn't matter. These are
+  what every codec may use, so `policy_changed` reports a facade or an
+  export added or removed, for review as a change to this policy: a query,
+  pool, connection, executor, transaction or row is never one.
+  `storage_access` reads each facade's source, all of its `src/`, which
+  must hold its library's root `src/lib.rs`, with syn, a Rust parser, and
+  strictly: only `pub mod name { … }` blocks of such items and `pub use
+  <driver>::<path>;` items, a path or a `{…}` group of them with no
+  `self`, glob or rename, each path listed for that driver, with
+  `#[cfg(…)]` and `#[doc = "…"]` attributes, which doc comments are, and
+  comments. Anything else, such as a `fn`, a `struct`, a `macro_rules!`,
+  `mod name;`, a `pub(crate)` item, a `pub use` of another crate, an
+  unlisted path, or a file syn can't parse, is a `storage_access` finding,
+  which no baseline entry tolerates. It is on line 1 of the file, naming
+  the item, or, for a file syn can't parse, giving syn's error without a
+  position: without proc-macro2's `span-locations` feature, which would
+  build proc-macro2 a second time in a workspace build and rebuild every
+  proc macro once, syn gives no line numbers. A listed crate that is outside
+  `l10_foundation` or a helper is no facade, and its entry is a
+  `stale_entries` finding. Once the facade's library is `src/lib.rs`,
+  these are `stale_entries` findings too, so the lists only shrink: an
+  empty list, a driver key naming no driver the facade has a normal
+  dependency on, and, when every file reads cleanly, a listed path that no
+  file of its `src/` re-exports. Only a driver whose list is non-empty, and
+  that the facade depends on, gets the hint to use the facade.
 
 Two checks, each with the three baselined behaviours above and a table
 keyed by package:
 
 - `storage_access`: only stores and helpers may have a normal or build
-  dependency on a driver or helper. An optional dependency counts too, since
-  a feature turns it on, except from an `l10_foundation` crate: there it is a
-  codec behind a feature, such as `sqlx` impls for an identifier type, and
-  `codec_features` covers whoever turns it on. The finding is shown on the
+  dependency on a driver, helper or codec facade; a coordinator is no
+  store. An optional dependency
+  counts too, since a feature turns it on, with two exceptions, each an
+  optional normal dependency, under `[dependencies]` or a
+  `[target.'cfg(…)'.dependencies]` table: an `l10_foundation` or `l20_domain`
+  crate's on a facade, a codec behind a feature of the crate's own, and a
+  facade's own on a driver, behind the facade's features. `codec_features`
+  covers whoever turns those features on. Nothing else is exempt: an
+  optional driver dependency of any other `l10_foundation` or `l20_domain`
+  crate, a required dependency on a facade, a `[build-dependencies]` entry
+  on a facade or driver, the facade's included, and a facade's dependency
+  on a helper are findings. With `pplx-space-sql-codec` a facade, for a
+  Domain crate's `sqlx` feature:
+
+  | The crate's manifest | Finding |
+  |---|---|
+  | `pplx-space-sql-codec = { workspace = true, optional = true }`, `sqlx = ["dep:pplx-space-sql-codec", "pplx-space-sql-codec/postgres"]` | none: a codec, written against `pplx_space_sql_codec::Type` and the rest |
+  | `sqlx = { workspace = true, optional = true }`, `sqlx = ["dep:sqlx"]` | one: an optional driver dependency |
+  | `pplx-space-sql-codec = { workspace = true }` | one: a codec's facade is optional |
+  | the facade under `[build-dependencies]`, optional | one: a build script is no codec |
+  | `pplx-space-sql-codec` itself, with `sqlx = { workspace = true, optional = true }` behind `postgres` | none, if its source re-exports only its listed exports |
+
+  A facade's items are the drivers' own, so an impl of
+  `pplx_space_sql_codec::Type` is one of `sqlx::Type` for the store that
+  binds the type. The finding is shown on the
   manifest line that declares the dependency, names the items the crate
   uses from it, and gives the fixes for its kind: an API crate moves that
   code into a store that lists it as a user and calls the store, or, for a
   generic mechanism, into a storage helper that such a store calls; an app,
   which never depends on a store, uses the API crate that owns the state;
   a client, which never depends on one either, moves the storage work into
-  its server, behind its protocol; from Domain, a codec's impls move into
-  the store that persists the types; from Foundation, a crate that names
-  nothing SPACE-specific can be added to `helpers`. Moving the code into a
+  its server, behind its protocol; from Domain or Foundation, anything but
+  a codec belongs in a store (the one that persists the types, from
+  Domain), or, from Foundation, a crate that names nothing SPACE-specific
+  can be added to `helpers`, and for a driver that a facade exports, a
+  codec depends on that facade instead, optional and behind its codec
+  feature; a required or build dependency on a facade becomes an optional
+  normal one; and a facade's own forbidden dependency becomes an optional
+  normal dependency on a driver or goes, since listing the facade in
+  `helpers` would make it no facade (`--write-baseline`'s `not added`
+  line says the same). Moving the code into a
   new helper never lets the original crate depend on that helper:
   `storage_access` checks that edge too. `[layers.storage_access]` maps each
-  package to the drivers and helpers it depends on, such as
+  package to the drivers, helpers and codec facades it depends on, such as
   `pplx-space-api = ["sqlx"]`.
-- `codec_features`: a **driver feature** is a feature of a crate outside
-  Storage that turns on an optional dependency on a driver or helper, with
+- `codec_features`: a **driver feature** is a feature of a crate other
+  than a store that turns on an optional dependency on a driver or helper, with
   `dep:<name>`, `<name>/<feature>` or Cargo's implicit feature for the
   dependency, that turns on an optional dependency whose `features` or
   default features include another crate's driver feature, or that
   forwards to another driver feature, its own or another such crate's
-  (`<name>/<feature>` or `<name>?/<feature>`). Only stores and
-  helpers may enable one: with `features = […]` on a normal or build
-  dependency, through its default features when `default` is a driver
-  feature, or by forwarding from their own `[features]`. As an optional
-  driver dependency of an `l10_foundation` crate is exempt from
-  `storage_access`, so is its enabling behind a feature of its own, on an
-  optional dependency or by forwarding: that feature is a driver feature
-  itself, and whoever turns it on is checked. The finding is shown
+  (`<name>/<feature>` or `<name>?/<feature>`). Stores and helpers may
+  enable one: with `features = […]` on a normal or build dependency,
+  through its default features when `default` is a driver feature, or by
+  forwarding from their own `[features]`. An `l10_foundation` or
+  `l20_domain` crate may enable one only behind a feature of its own, on an
+  optional dependency or by forwarding, such as `sqlx =
+  ["dep:pplx-space-sql-codec", "pplx-space-sql-codec/postgres"]`, or a
+  Domain crate's `sqlx = ["pplx-space-semver/sqlx"]`, as its codec is
+  exempt from `storage_access`: that feature is then a driver feature
+  itself, checked the same way. Any other crate's enabling is a finding,
+  so an API crate that enables a codec feature gets one and a store does
+  not. The finding is shown
   on that dependency's or `[features]` item's line and says which driver the
   feature reaches. `[layers.codec_features]` maps each package to the
   `<package>/<feature>` entries it enables, such as `pplx-space-api =
-  ["pplx-space-common-core/sqlx"]`. A store's own driver features are not
+  ["pplx-space-sandbox-model/sqlx"]`. A store's own driver features are not
   checked: depending on a store is how an API crate reaches storage, and a
   feature that reaches a driver only through a store's is no driver feature.
 
-Dev-dependencies are not checked: tests may open a database. A finding that
-is stale names the reason: the crate or the dependency is gone, the crate is
-now a store, a helper or left out, the target is no longer a driver or
-helper, an optional Foundation dependency or a Foundation crate's enabling
-behind its own feature is a codec, or the feature no longer reaches a
-driver.
+Dev-dependencies are not checked: tests may open a database. Test support
+and tools are left out of both checks. A finding that is stale names the
+reason: the crate or the dependency is gone, the crate is
+now a store, a helper or left out, the target is no longer a driver, helper
+or facade, a Foundation or Domain crate's dependency on a facade or its
+enabling behind its own feature is a codec, a facade's driver dependency is
+its feature, or the feature no longer reaches a driver.
 
 There are no per-edge exceptions, as `allowed_edges` gives the matrix: a
 crate that has to reach storage for good becomes a store, in `l30_storage`,
@@ -545,7 +691,9 @@ name ends in `-protocol` or `-proto`, or that `[rules.layers] protocols`
 lists, such as `pplx-space-events`. Every other Domain crate is a **model**:
 types and the rules that keep them valid. A crate that holds both, until it
 is split, counts as a model. Domain does no I/O, except generating IDs in ID
-constructors and logging. Two checks, each with the three baselined
+constructors and logging, and reaches a database driver only for a codec,
+through an optional dependency on a codec facade (see [Storage
+access](#storage-access)). Two checks, each with the three baselined
 behaviours above and a table keyed by package:
 
 - `domain_dependencies`: no Domain crate has a normal or build dependency,
@@ -554,10 +702,10 @@ behaviours above and a table keyed by package:
   `kube`, is an exact list of package names, so a new package is added by
   hand. tonic and prost are not listed: protocols build on them. The
   workspace's own I/O crates are derived, as storage helpers are: an
-  `l10_foundation` crate, legacy or not, with a required (normal or build,
-  not optional) dependency on a fenced package is fenced under that
-  package's family, to a fixpoint, so a crate wrapping such a crate is fenced
-  too, and the finding names the dependency that fenced it. Features are
+  `l10_foundation` crate with a required (normal or build, not optional)
+  dependency on a fenced package is fenced under that package's family, to a
+  fixpoint, so a crate wrapping such a crate is fenced too, and the finding
+  names the dependency that fenced it. Features are
   not followed, neither in that derivation nor in the features a Domain
   crate turns on, so a crate that does I/O only behind a feature is listed,
   such as `pplx-space-observability` under `runtime`, whose `otel` feature
@@ -574,7 +722,7 @@ behaviours above and a table keyed by package:
   the Domain crate plain values or a trait it defines; or move a crate that
   is not Domain code to its layer. `[layers.domain_dependencies]` maps each
   package to the fenced packages it depends on, such as
-  `pplx-space-spaced-common = ["tokio"]`. Dev-dependencies are not checked,
+  `pplx-space-net-common = ["tokio"]`. Dev-dependencies are not checked,
   and only declared dependencies are: a protocol's tonic brings tokio and
   hyper into its build regardless.
 - `model_protocol`: no model has a normal or build dependency on a protocol.
@@ -685,7 +833,8 @@ a shared catalog listed as a database, and `[rules.layers.state]` without
 The checks, each with its own mode, shown on the manifest line they are
 about unless said otherwise:
 
-- `state.declarations`: a store (`l30_storage`) without a state table, shown
+- `state.declarations`: a store (`l30_storage`, other than a coordinator)
+  without a state table, shown
   on its `name =` line; a crate outside Storage with one, since only stores
   own or co-write tables; a namespace that is no database, such as a shared
   catalog's, whose tables are declared in each database instead.
@@ -798,21 +947,18 @@ so a new table is declared by its owner before its migration lands (see
 
 ### Limits
 
-- The checks see direct dependencies only. An edge through a re-export, such
-  as a `legacy` crate's, is not seen. Only `stale_entries` looks one crate
-  further: a store user that depends on a `legacy` crate depending on the
-  store still uses it, so its entry stays.
+- The checks see direct dependencies only: an edge through a re-export is
+  not seen.
 - A Foundation crate that gains a required driver dependency gets a
   `storage_access` finding until it is added to `helpers`, and is no helper
   before: its dependents get `storage_access` findings only once it is
-  listed. Stores, other helpers, test support and tools, and
-  `l10_foundation` crates whose dependency on it is optional are exempt.
+  listed. Stores, other helpers, test support and tools are exempt.
 - `codec_features` reads the feature requests in each crate's own manifest,
-  not the features Cargo unifies for a build. A crate that enables
-  `common-core/sqlx` makes its dependents build against `common-core`'s
-  `sqlx` impls whatever they request; one that drops `"sqlx"` from its own
-  manifest loses its baseline entry, which `stale_entries` reports, but
-  keeps the impls.
+  not the features Cargo unifies for a build. A store that enables
+  `sandbox-model/sqlx` makes every crate that depends on it build against
+  `sandbox-model`'s `sqlx` impls whatever they request; one that drops
+  `"sqlx"` from its own manifest loses its baseline entry, which
+  `stale_entries` reports, but keeps the impls.
 - The drivers are a hand-kept list, and `cargo metadata` runs with
   `--no-deps`, so a crate outside the workspace that wraps or re-exports a
   driver is not seen unless it is listed. A workspace crate that does is a
@@ -832,7 +978,12 @@ so a new table is declared by its owner before its migration lands (see
   to the store's list in `[rules.layers.store_users]` with the dependency
   that uses it. `policy_changed` reports the change for review. A crate that
   only needs the data uses the owner's API instead, and one that stops using
-  the store leaves the list, which `stale_entries` asks for.
+  the store leaves the list, which `stale_entries` asks for. A Storage crate
+  needs no entry for a `storage_handles` crate; an API crate does.
+- **A coordinator user:** an API crate that runs a coordinator's
+  transaction goes in its list in `[rules.layers.coordinator_users]` with
+  the dependency that uses it, and the coordinator in the `store_users` list
+  of each store it calls; `policy_changed` reports both.
 - **An exception:** an edge the matrix forbids for good reason, such as the
   database migrator applying every store's migrations, goes in
   `[rules.layers.allowed_edges]` with a comment saying why; `policy_changed`
@@ -863,8 +1014,9 @@ Each behaviour has a `mode`: `advisory` findings are reported, `required` ones
 also fail the check. Unknown keys, sections or modes, a missing file, bad TOML,
 an invalid regex, glob or instance name, an empty `patterns` or `include`
 list, a layer name that is not one of the seven, a package listed twice in
-`unmoved` or in one `store_users` or `allowed_edges` list or in a
-`[rules.layers.storage]` list, a package listed twice in `protocols` or in two
+`unmoved` or in one `store_users`, `coordinator_users` or `allowed_edges` list or in a
+`[rules.layers.storage]` list, a package listed twice in `protocols` or
+`storage_handles` or in two
 `[rules.layers.domain_fences]` families, an empty `drivers`, a baseline table
 for an instance or layers check that is not configured, a state configuration
 or declaration that can't be read (see [State ownership](#state-ownership)),
@@ -985,7 +1137,8 @@ raised cap, a stale entry for a deleted file and a stale `[crate_names]` entry
 at the entry's line in the baseline. `layers` findings point at a crate's `name
 =` line (`placement`, `layout`), the manifest line declaring a dependency (an
 edge), the entry's line in `ARCHITECTURE.toml` (a new or changed `unmoved`
-entry, `stale_entries`, `policy_changed`) or the edge's line in the baseline.
+entry, `stale_entries`, `policy_changed`), the edge's line in the baseline
+or, for a codec facade's source findings, line 1 of the source file.
 `pattern_ratchet`'s `no_crossing`, `listed_no_growth` and shrank
 `stale_entries` findings point at the file's first matching line; one for a
 file with no matches left, at its line 1. Required findings are `ERROR`,

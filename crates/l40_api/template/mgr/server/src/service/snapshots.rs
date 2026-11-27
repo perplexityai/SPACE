@@ -1,6 +1,6 @@
 use super::*;
 mod retry_backoff;
-use pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER;
+use pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER;
 pub(super) use retry_backoff::RetryBackoff;
 
 pub(super) struct BuildBaseSnapshotArgs<'a> {
@@ -55,7 +55,7 @@ pub(super) fn base_snapshot_create_request(
     content_hash: &str,
     partition: crate::db::TemplateCachePartition,
     snapshot_rootfs_size_mb: Option<u32>,
-    runtime: pplx_space_common_core::types::RuntimeKind,
+    runtime: pplx_space_execution_spec::RuntimeKind,
 ) -> pplx_space_sbx_mgr_client::proto::CreateRequest {
     let (environment, template, runtime) = match partition.environment() {
         None => (None, template_name.to_string(), runtime.alias().to_string()),
@@ -86,6 +86,7 @@ pub(super) fn base_snapshot_create_request(
         rootfs_size_mb: snapshot_rootfs_size_mb,
         disk_io_max_operations_per_sec: None,
         disk_io_max_bandwidth_mib_per_sec: None,
+        required_environment: None,
         network_policy: None,
         network_policy_generation: 0,
         network_policy_authority: crate::db::PolicyAuthority::Cluster.as_proto_i32(),
@@ -118,7 +119,7 @@ impl TemplateManagerService {
     /// `NotFound` instead lets the caller fail fast with a clean
     /// error.
     pub(super) fn resolve_template_build(
-        conn: &rusqlite::Connection,
+        conn: &crate::db::Connection,
         name: &str,
         content_hash: &str,
         preferred: Option<crate::db::TemplateCachePartition>,
@@ -138,6 +139,48 @@ impl TemplateManagerService {
                     Status::not_found(format!("build not found: {name}@{content_hash}"))
                 })?
         };
+        Self::serve_resolved_build(conn, build)
+    }
+
+    /// [`Self::resolve_template_build`] for the partition a request chooses
+    /// ([`super::support::PartitionChoice`]). A required partition is
+    /// answered only by a ready build bound to it
+    /// ([`crate::db::find_ready_build_bound_to`]), never by another
+    /// environment's build of the digest.
+    pub(super) fn resolve_selected_build(
+        conn: &crate::db::Connection,
+        name: &str,
+        content_hash: &str,
+        choice: super::support::PartitionChoice,
+    ) -> Result<crate::db::BuildRow, Status> {
+        use super::support::PartitionChoice;
+        let partition = match choice {
+            PartitionChoice::Any => None,
+            PartitionChoice::Prefer(partition) => Some(partition),
+            PartitionChoice::Require(partition) => {
+                let build =
+                    crate::db::find_ready_build_bound_to(conn, name, content_hash, partition)
+                        .map_err(|e| {
+                            Status::internal(format!("db find_ready_build_bound_to: {e}"))
+                        })?
+                        .ok_or_else(|| {
+                            Status::not_found(format!(
+                                "build not found: {name}@{content_hash} bound to cache partition \
+                                 {partition}"
+                            ))
+                        })?;
+                return Self::serve_resolved_build(conn, build);
+            }
+        };
+        Self::resolve_template_build(conn, name, content_hash, partition)
+    }
+
+    /// The step every resolution ends with: the build's digest is checked,
+    /// and its LRU recency touched (see [`Self::resolve_template_build`]).
+    fn serve_resolved_build(
+        conn: &crate::db::Connection,
+        build: crate::db::BuildRow,
+    ) -> Result<crate::db::BuildRow, Status> {
         validate_content_hash(&build.content_hash)?;
         touch_lru(
             conn,
@@ -323,6 +366,7 @@ impl TemplateManagerService {
                             sandbox_id,
                             template_filter: None,
                             blocking: true,
+                            discard_retained_filesystem_reason: None,
                         })
                         .await;
                 }
@@ -420,7 +464,7 @@ impl TemplateManagerService {
             .claim_digest(key.name, key.content_hash)
             .await;
         let published = {
-            let db = Arc::clone(&self.db);
+            let db = self.db.clone();
             let (name, hash, snapshot_hash) = (
                 key.name.to_string(),
                 key.content_hash.to_string(),
@@ -540,7 +584,7 @@ impl TemplateManagerService {
                 })?;
 
         let runtime = {
-            let db = Arc::clone(&self.db);
+            let db = self.db.clone();
             let name = template_name.to_owned();
             let hash = content_hash.to_owned();
             tokio::task::spawn_blocking(move || {
@@ -552,7 +596,7 @@ impl TemplateManagerService {
                     .ok_or_else(|| Status::not_found("base snapshot template build disappeared"))?;
                 build
                     .runtime
-                    .parse::<pplx_space_common_core::types::RuntimeKind>()
+                    .parse::<pplx_space_execution_spec::RuntimeKind>()
                     .map_err(|error| Status::failed_precondition(error.to_string()))
             })
             .await
@@ -642,6 +686,7 @@ impl TemplateManagerService {
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: true,
+                discard_retained_filesystem_reason: None,
             }),
         )
         .await
@@ -688,7 +733,7 @@ impl TemplateManagerService {
     ) -> Result<bool, Status> {
         validate_template_name(template)?;
 
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let template_for_db = template.to_string();
         let db_had_snapshots = tokio::task::spawn_blocking(move || {
             let conn = db
@@ -744,7 +789,7 @@ impl TemplateManagerService {
     ) -> Result<bool, Status> {
         validate_template_name(template)?;
 
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let keep_name = keep_name.to_string();
         let keep_content_hash = keep_content_hash.to_string();
         let stale_snapshots = tokio::task::spawn_blocking(move || {
@@ -784,7 +829,7 @@ impl TemplateManagerService {
                 }
             }
 
-            let db = Arc::clone(&self.db);
+            let db = self.db.clone();
             tokio::task::spawn_blocking(move || {
                 let conn = db.lock().map_err(|_| {
                     Status::internal("db mutex poisoned while deleting stale snapshot")
@@ -853,7 +898,7 @@ impl TemplateManagerService {
         };
 
         let settings = {
-            let db = Arc::clone(&self.db);
+            let db = self.db.clone();
             let template = template.clone();
             match tokio::task::spawn_blocking(move || {
                 let conn = db
@@ -947,7 +992,7 @@ impl TemplateManagerService {
         // an environment's twin of a release cold-boots and is captured under
         // that environment, so its memory state never comes from another one.
         let partitions = {
-            let db = Arc::clone(&self.db);
+            let db = self.db.clone();
             let template = template.clone();
             tokio::task::spawn_blocking(move || {
                 let conn = db.lock().map_err(|_| {
@@ -1037,7 +1082,7 @@ impl TemplateManagerService {
         snapshot_memory_mib: u32,
     ) -> PartitionReconcile {
         let resolved = {
-            let db = Arc::clone(&self.db);
+            let db = self.db.clone();
             let template = template.to_string();
             tokio::task::spawn_blocking(move || {
                 let conn = db.lock().map_err(|_| {
@@ -1128,7 +1173,7 @@ impl TemplateManagerService {
             });
         }
         {
-            let db = Arc::clone(&self.db);
+            let db = self.db.clone();
             let template_to_record = template.to_string();
             let (build_name, build_hash) = (name.clone(), content_hash.clone());
             let recorded = tokio::task::spawn_blocking(move || {
@@ -1227,7 +1272,7 @@ impl TemplateManagerService {
         template: &str,
         error: Option<&str>,
     ) {
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let template = template.to_string();
         let error = error.map(str::to_string);
         let _ = tokio::task::spawn_blocking(move || {
@@ -1259,7 +1304,7 @@ pub(super) fn snapshot_invalidates_pool_sandbox(
 pub(super) fn pool_sandbox_partition(
     execution: Option<&pplx_space_execution_common::proto::ExecutionMetadata>,
 ) -> Option<crate::db::TemplateCachePartition> {
-    let execution = pplx_space_common_core::types::ExecutionMetadata::try_from(execution?).ok()?;
+    let execution = pplx_space_execution_spec::ExecutionMetadata::try_from(execution?).ok()?;
     Some(pplx_space_node_runtime_core::catalog::template_cache_partition(execution.environment()))
 }
 
@@ -1346,7 +1391,7 @@ impl PartitionReconcile {
 /// recency guards read this column (see `resolve_template`), so a failed
 /// touch can let them evict the build.
 fn touch_lru(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     name: &str,
     content_hash: &str,
     partition: crate::db::TemplateCachePartition,

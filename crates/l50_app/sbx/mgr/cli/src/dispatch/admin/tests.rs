@@ -28,7 +28,7 @@ async fn cycle_state_collection_retries_oversized_batches_without_losing_order()
 
     // The trailing three-ID batch forces an odd split; the one-ID limit also
     // exercises the two-ID boundary before collection can succeed.
-    let ids = (0..pplx_space_common_core::inventory::READ_BATCH_ITEMS + 3)
+    let ids = (0..pplx_space_rpc_contracts::inventory::READ_BATCH_ITEMS + 3)
         .map(|index| format!("019d84bd-280d-7331-99c6-{index:012x}"))
         .collect::<Vec<_>>();
     let mut reader = SizeLimitedReader {
@@ -156,4 +156,26 @@ fn explicit_cycle_selection_keeps_live_members_after_missing_or_stopped_members(
             assert_eq!(selection.no_gateway, vec![ids[1]]);
         }
     }
+}
+
+#[test]
+fn cycle_socket_handover_is_opt_in() {
+    for (args, expected) in [(vec![], false), (vec!["--hand-over-sockets"], true)] {
+        let cli = Cli::try_parse_from(
+            ["space-sbxmgr", "cycle-net-gateway", "--stale", "--execute"]
+                .into_iter()
+                .chain(args),
+        )
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::CycleNetGateway { hand_over_sockets, .. } if hand_over_sockets == expected
+        ));
+    }
+    assert_eq!(handover_note(false, 0), "");
+    assert_eq!(handover_note(true, 2), " (2 sockets handed over)");
+    assert_eq!(
+        handover_note(true, 0),
+        " (sockets not handed over; stopped and relaunched)"
+    );
 }

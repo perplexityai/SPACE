@@ -1,4 +1,5 @@
-//! Postgres-backed implementation of [`super::NodeGroupSink`].
+//! Postgres-backed implementation of [`super::NodeGroupSink`], over
+//! `pplx-space-node-group-store`'s verbs. The seed's `lock_timeout` stays here.
 //!
 //! - **Seed**: a lock-free `SELECT ... WHERE is_default` fast path, and — only
 //!   when no default exists — a short transaction taking
@@ -22,9 +23,9 @@
 
 use std::time::Duration;
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::NodeGroupId;
-use pplx_space_common_core::types::{NodeGroupName, NodeGroupTemplatePolicy};
+use pplx_space_node_model::NodeGroupId;
+use pplx_space_node_model::NodeGroupName;
+use pplx_space_postgres_pool::TxSettings as _;
 use sqlx::PgPool;
 
 use super::{DefaultNodeGroup, EnsureDefaultGroupError, EnsuredDefaultGroup, NodeGroupSink};
@@ -97,18 +98,12 @@ fn to_default_group(
     }
 }
 
-async fn select_default_group<'e, E>(
-    executor: E,
-) -> Result<Option<DefaultNodeGroup>, EnsureDefaultGroupError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    let row: Option<(NodeGroupId, String)> = sqlx::query_as(sql!(
-        "SELECT id, name FROM node_groups WHERE is_default LIMIT 1"
-    ))
-    .fetch_optional(executor)
-    .await?;
-    row.map(|(id, name)| to_default_group(id, name)).transpose()
+async fn select_default_group(
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
+) -> Result<Option<DefaultNodeGroup>, EnsureDefaultGroupError> {
+    let row = pplx_space_node_group_store::default_node_group(executor).await?;
+    row.map(|row| to_default_group(row.id, row.name))
+        .transpose()
 }
 
 impl NodeGroupSink for NodeGroupDbStore {
@@ -148,11 +143,8 @@ impl NodeGroupSink for NodeGroupDbStore {
         // admin create surface this lock exists to exclude, forever. Racy on
         // purpose: the under-lock check below stays authoritative, and losing
         // this race only costs the lock we would have taken anyway.
-        let (blocking_groups,): (i64,) = sqlx::query_as(sql!(
-            "SELECT COUNT(*) FROM node_groups WHERE NOT is_default"
-        ))
-        .fetch_one(&self.pool)
-        .await?;
+        let blocking_groups =
+            pplx_space_node_group_store::non_default_node_group_count(&self.pool).await?;
         if blocking_groups != 0 {
             return Err(EnsureDefaultGroupError::SeedBlockedByExistingGroups {
                 other_groups: blocking_groups,
@@ -170,18 +162,10 @@ impl NodeGroupSink for NodeGroupDbStore {
         // invisible to a plain SELECT, because ACCESS SHARE conflicts only with
         // ACCESS EXCLUSIVE — Postgres admits a lock request that doesn't
         // conflict with the wait queue's mask. The bound is for this tick alone.
-        //
-        // `set_config(..., is_local => true)` rather than `SET LOCAL` because
-        // `SET` takes no bind parameter. It is the same statement in function
-        // form: transaction-local scope, the same value, and a wait past it
-        // still fails with `55P03`.
-        sqlx::query(sql!("SELECT set_config('lock_timeout', $1, TRUE)"))
-            .bind(format!("{}ms", self.seed_lock_timeout.as_millis()))
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(sql!("LOCK TABLE node_groups IN SHARE ROW EXCLUSIVE MODE"))
-            .execute(&mut *tx)
-            .await?;
+        tx.set_local_lock_timeout(self.seed_lock_timeout)
+            .await
+            .map_err(sqlx::Error::from)?;
+        pplx_space_node_group_store::locks::lock_node_groups_share_row_exclusive(&mut *tx).await?;
 
         // Both facts are re-read under the lock: another replica may have
         // seeded a default since the fast path (making us a reader), or a
@@ -195,11 +179,8 @@ impl NodeGroupSink for NodeGroupDbStore {
             // return would need moving below it or committing here.
             return Ok(EnsuredDefaultGroup::Existing(existing));
         }
-        let (other_groups,): (i64,) = sqlx::query_as(sql!(
-            "SELECT COUNT(*) FROM node_groups WHERE NOT is_default"
-        ))
-        .fetch_one(&mut *tx)
-        .await?;
+        let other_groups =
+            pplx_space_node_group_store::non_default_node_group_count(&mut *tx).await?;
         if other_groups != 0 {
             // Same: rollback-on-drop releases the table lock, and no write has
             // happened. Returning an error while holding a table-level lock is
@@ -208,31 +189,18 @@ impl NodeGroupSink for NodeGroupDbStore {
         }
 
         let id = NodeGroupId::new();
-        // `RETURNING id` for the row's *presence*, not its value: `ON CONFLICT
-        // DO NOTHING` means the only id this can return is the one bound above.
-        // The name is deliberately not read back — see below.
-        let inserted: Option<(NodeGroupId,)> = sqlx::query_as(sql!(
-            "INSERT INTO node_groups (id, name, org_id, template_policy, is_default)
-             VALUES ($1, $2, NULL, $3, TRUE)
-             ON CONFLICT DO NOTHING
-             RETURNING id"
-        ))
-        .bind(id)
-        .bind(seed_name.as_str())
-        // Bound from the enum rather than written as a `'default'` literal, for
-        // the same reason the audit summary renders through the admin surface's
-        // formatter: the enum owns the token, and the admin create surface
-        // already binds this column the same way.
-        .bind(NodeGroupTemplatePolicy::Default)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if inserted.is_none() {
+        // The insert reports only whether the row went in; the name is
+        // deliberately not read back — see below.
+        let inserted =
+            pplx_space_node_group_store::insert_default_node_group(&mut *tx, id, seed_name).await?;
+        if !inserted {
             // Unreachable as reasoned above: under the lock we have just
             // established the table holds no default and no other group, so
             // it is empty and nothing can conflict. Kept rather than
-            // `fetch_one` so that if that reasoning is ever wrong, the
-            // operator sees "the name is taken" instead of a generic DB error
-            // reported as "the migration probably isn't applied".
+            // treating no row as an error so that if that reasoning is ever
+            // wrong, the operator sees "the name is taken" instead of a
+            // generic DB error reported as "the migration probably isn't
+            // applied".
             return Err(EnsureDefaultGroupError::NameConflict {
                 name: seed_name.to_string(),
             });
@@ -259,12 +227,9 @@ impl NodeGroupSink for NodeGroupDbStore {
 
     async fn non_default_group_count(&self) -> Result<i64, sqlx::Error> {
         // `is_default` is NOT NULL, so `NOT is_default` has no third case.
-        let (count,): (i64,) = sqlx::query_as(sql!(
-            "SELECT COUNT(*) FROM node_groups WHERE NOT is_default"
-        ))
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(count)
+        pplx_space_node_group_store::non_default_node_group_count(&self.pool)
+            .await
+            .map_err(sqlx::Error::from)
     }
 }
 

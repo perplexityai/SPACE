@@ -13,24 +13,23 @@ use std::{collections::HashMap, time::Duration};
 use super::PodIp;
 use crate::controllers::substrate::ExecutionIdentity;
 use crate::metrics::sandbox::api::RouteIdentityDecisionReason;
+use pplx_space_accounts::{NodeId, SandboxOwner, UserId};
+use pplx_space_artifact_model::{ExactStorageUri, StorageUri};
 use pplx_space_cluster_pool::WarmPoolStore;
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExactStorageUri, ExecutionGeneration, LocalArtifactId, NodeId,
-    NodeRole, PodUid, SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxOwner,
-    SandboxTransitionTargetState, SnapshotState, StorageUri, UserId,
-};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_k8s_node_id::Ec2InstanceId;
 use pplx_space_net_common::NetworkPolicyV1;
-use pplx_space_sandbox_portability::{
-    fresh_ready_snapshot_exists, missing_suspending_pod_revert_eligibility, no_newer_full_snapshot,
-    restore_retry_source_snapshot_is_current, restore_retry_suspended_revert_snapshot_exists,
-    snapshot_is_current_local_artifact,
+use pplx_space_node_model::NodeRole;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
+    SandboxTransitionTargetState,
 };
-use pplx_space_state_reconciliation::{FACET_SANDBOX_DESIRED_STATE, SANDBOX_LOCAL_SUSPEND_KEY};
-use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction, postgres::PgRow};
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotState};
+use pplx_space_sql_locator::sql;
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{controllers::sandbox::fetch_sandbox as fetch_api_sandbox, models::Sandbox};
@@ -45,8 +44,12 @@ mod execution_rows;
 mod node_inventory;
 mod pod_placement;
 mod pod_tracking;
+mod pool_template_lock;
 mod restore_lease;
 mod restore_source;
+mod runtime_attribution;
+pub(super) use runtime_attribution::attribution_update;
+mod restore_dispatch_fence;
 mod runtime_upgrade;
 mod started_recovery;
 mod suspend;
@@ -57,6 +60,10 @@ pub(super) use restore_source::RestoreSnapshotChoice;
 pub(super) struct K8sStore {
     pool: PgPool,
     namespace: String,
+    /// Off, pod tracking never writes the sandbox's record.
+    attribution: crate::controllers::substrate::ActivationClientAttribution,
+    /// Off, user restores write no dispatch fence and claims take none over.
+    restore_dispatch_fence: super::RestoreDispatchFence,
 }
 
 /// Where a sandbox's pod landed. Groups the identity columns
@@ -71,6 +78,10 @@ pub(super) struct PodNodePlacement<'a> {
     pub node_id: NodeId,
     pub role: NodeRole,
     pub address: Option<&'a str>,
+    /// The EC2 instance the Node's `providerID` names. `None` keeps the
+    /// recorded instance while the Node's UID is unchanged; on a UID change
+    /// it clears it, since a new Node may be another machine.
+    pub instance_id: Option<&'a Ec2InstanceId>,
 }
 
 /// What a caller's retry of the *whole operation* would do, for statements that
@@ -286,16 +297,16 @@ pub(super) enum NodeStateWrite {
     InsertOnly(NodeLifecycleState),
 }
 
-struct K8sNodeRoleUpsert<'a> {
-    node_name: &'a str,
-    node_uid: &'a str,
-    node_id: NodeId,
-    role: NodeRole,
-    address: Option<&'a str>,
-    state: NodeStateWrite,
+pub(super) struct K8sNodeRoleUpsert<'a> {
+    pub node_name: &'a str,
+    pub node_uid: &'a str,
+    pub node_id: NodeId,
+    pub role: NodeRole,
+    pub address: Option<&'a str>,
+    pub state: NodeStateWrite,
+    pub instance_id: Option<&'a Ec2InstanceId>,
 }
 
-#[derive(sqlx::FromRow)]
 pub(super) struct ActiveExecutionStatusRow {
     pub(super) generation: i64,
     pub(super) pod_name: String,
@@ -303,12 +314,46 @@ pub(super) struct ActiveExecutionStatusRow {
     pub(super) pod_ip: Option<String>,
     pub(super) k8s_node_name: Option<String>,
     pub(super) current_node_id: Option<NodeId>,
-    #[sqlx(try_from = "String")]
     pub(super) state: ActiveExecutionState,
     pub(super) lifecycle: String,
     pub(super) create_age_expired: bool,
     pub(super) activation_attempt_id: Option<SandboxActivationAttemptId>,
     pub(super) route_activation_id: Option<SandboxActivationAttemptId>,
+    /// The sandbox's record of whose activation created its runtime.
+    pub(super) activating_client_id: Option<pplx_space_accounts::ClientId>,
+}
+
+impl TryFrom<pplx_space_sandbox_store::k8s_executions::ActiveExecutionStatus>
+    for ActiveExecutionStatusRow
+{
+    type Error = sqlx::Error;
+
+    /// Parses `state` as the `#[sqlx(try_from = "String")]` column it
+    /// replaced did, failing with the same `ColumnDecode` error.
+    fn try_from(
+        status: pplx_space_sandbox_store::k8s_executions::ActiveExecutionStatus,
+    ) -> Result<Self, Self::Error> {
+        let state = ActiveExecutionState::try_from(status.state).map_err(|error| {
+            sqlx::Error::ColumnDecode {
+                index: "state".to_string(),
+                source: Box::new(error),
+            }
+        })?;
+        Ok(Self {
+            generation: status.generation,
+            pod_name: status.pod_name,
+            pod_uid: status.pod_uid,
+            pod_ip: status.pod_ip,
+            k8s_node_name: status.k8s_node_name,
+            current_node_id: status.current_node_id,
+            state,
+            lifecycle: status.lifecycle,
+            create_age_expired: status.create_age_expired,
+            activation_attempt_id: status.activation_attempt_id,
+            route_activation_id: status.route_activation_id,
+            activating_client_id: status.activating_client_id,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,17 +397,52 @@ impl ReconciledActivationFence {
     }
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub(super) struct SandboxExecutionRow {
     pub(super) generation: i64,
     pub(super) pod_name: String,
     pub(super) pod_materialized: bool,
-    #[sqlx(try_from = "String")]
     pub(super) state: ActiveExecutionState,
     pub(super) create_age_expired: bool,
-    pub(super) activation_attempt_id:
-        Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+    pub(super) activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     pub(super) route_activation_id: Option<SandboxActivationAttemptId>,
+}
+
+/// Parses `state`, failing with a `state` column-decode error, so a stored
+/// state this crate does not know fails the store read as an undecodable
+/// column does.
+impl TryFrom<pplx_space_sandbox_store::k8s_executions::ActiveExecutionRecord>
+    for SandboxExecutionRow
+{
+    type Error = sqlx::Error;
+
+    fn try_from(
+        record: pplx_space_sandbox_store::k8s_executions::ActiveExecutionRecord,
+    ) -> Result<Self, Self::Error> {
+        let pplx_space_sandbox_store::k8s_executions::ActiveExecutionRecord {
+            generation,
+            pod_name,
+            pod_materialized,
+            state,
+            create_age_expired,
+            activation_attempt_id,
+            route_activation_id,
+        } = record;
+        let state =
+            ActiveExecutionState::try_from(state).map_err(|error| sqlx::Error::ColumnDecode {
+                index: "state".to_string(),
+                source: Box::new(error),
+            })?;
+        Ok(Self {
+            generation,
+            pod_name,
+            pod_materialized,
+            state,
+            create_age_expired,
+            activation_attempt_id,
+            route_activation_id,
+        })
+    }
 }
 
 impl SandboxExecutionRow {
@@ -536,22 +616,26 @@ impl std::str::FromStr for ActiveExecutionState {
     }
 }
 
-impl<'row> sqlx::FromRow<'row, PgRow> for CommittedSuspendArtifactRow {
-    fn from_row(row: &'row PgRow) -> Result<Self, sqlx::Error> {
-        let execution_state = row
-            .try_get::<String, _>("execution_state")?
+impl TryFrom<pplx_space_sandbox_store::suspend_reads::CommittedSuspendMarker>
+    for CommittedSuspendArtifactRow
+{
+    type Error = sqlx::Error;
+
+    fn try_from(
+        marker: pplx_space_sandbox_store::suspend_reads::CommittedSuspendMarker,
+    ) -> Result<Self, Self::Error> {
+        let execution_state = marker
+            .execution_state
             .try_into()
             .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
-        let artifact_id = row
-            .try_get::<Option<Uuid>, _>("artifact_id")?
-            .map(LocalArtifactId::from_uuid);
-        let artifact_kind = row
-            .try_get::<Option<String>, _>("artifact_kind")?
+        let artifact_id = marker.artifact_id.map(LocalArtifactId::from_uuid);
+        let artifact_kind = marker
+            .artifact_kind
             .map(ArtifactKind::try_from)
             .transpose()
             .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
-        let artifact_origin = row
-            .try_get::<Option<String>, _>("artifact_origin")?
+        let artifact_origin = marker
+            .artifact_origin
             .map(ArtifactOrigin::try_from)
             .transpose()
             .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
@@ -647,7 +731,7 @@ pub(super) enum RestoreClaim {
     /// node outside the evacuation claim's window. Left `restoring` with the
     /// marker, it stays inside that window, and the claim's next call takes it
     /// as `RedroveRestoring`; the drain's restore sweep lists such a row
-    /// (the stopped arm of `restore_pending_evacuations_query` admits
+    /// (the stopped arm of `pplx_space_sandbox_store::evacuation_restores::pending` admits
     /// `restoring`). Its restore plan resolves the disk artifact for that
     /// `restoring` row through `selected_stopped_evacuation_restore_source`,
     /// since `selected_stopped_restore_storage_uri` serves only `lifecycle =
@@ -729,8 +813,29 @@ fn emit_started_suspend_recovery_event(
 }
 
 impl K8sStore {
-    pub(super) fn new(pool: PgPool, namespace: String) -> Self {
-        Self { pool, namespace }
+    pub(super) fn new(
+        pool: PgPool,
+        namespace: String,
+        attribution: crate::controllers::substrate::ActivationClientAttribution,
+    ) -> Self {
+        Self {
+            pool,
+            namespace,
+            attribution,
+            restore_dispatch_fence: super::RestoreDispatchFence::Disabled,
+        }
+    }
+
+    pub(super) fn with_restore_dispatch_fence(
+        mut self,
+        restore_dispatch_fence: super::RestoreDispatchFence,
+    ) -> Self {
+        self.restore_dispatch_fence = restore_dispatch_fence;
+        self
+    }
+
+    pub(super) fn restore_dispatch_fence(&self) -> super::RestoreDispatchFence {
+        self.restore_dispatch_fence
     }
 
     pub(super) fn pool(&self) -> &PgPool {
@@ -745,16 +850,9 @@ impl K8sStore {
         &self,
         template: &str,
     ) -> Result<Option<NetworkPolicyV1>, SubstrateError> {
-        let policy = sqlx::query_scalar::<_, Option<sqlx::types::Json<NetworkPolicyV1>>>(sql!(
-            "SELECT network_policy_json
-             FROM templates
-             WHERE name = $1"
-        ))
-        .bind(template)
-        .fetch_optional(&self.pool)
-        .await
-        .db_context("failed to load template network policy")?;
-        Ok(policy.flatten().map(|policy| policy.0))
+        pplx_space_template_store::templates::network_policy(&self.pool, template)
+            .await
+            .db_context("failed to load template network policy")
     }
 
     pub(super) fn sandbox_owner_for_user(&self, user_id: UserId) -> SandboxOwner {

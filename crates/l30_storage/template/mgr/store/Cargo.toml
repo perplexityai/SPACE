@@ -8,7 +8,44 @@ license.workspace = true
 publish.workspace = true
 
 [package.metadata.space.state]
-sqlite.template-manager = ["node_dirty_ref_revision"]
+sqlite.template-manager = [
+  "jobs",
+  "node_dirty_ref_revision",
+  "node_dirty_refs",
+  "pools",
+  "template_build_components",
+  "template_builds",
+  "template_local_policy_sequence",
+  "template_network_policy_notifications",
+  "template_pinned_releases",
+  "template_pinned_tags",
+  "template_settings",
+  "template_snapshots",
+]
 
 [lints]
 workspace = true
+
+[features]
+default = []
+# Exposes the raw connection to template-manager's test suites, which enable
+# it as a dev-dependency to seed and inspect the database directly.
+test-support = []
+
+[dependencies]
+ref-cast = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+sqlx = { workspace = true, features = ["macros", "migrate"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tonic = { workspace = true }
+
+# internal
+pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
+pplx-space-common-jobs = { workspace = true }
+pplx-space-net-common = { workspace = true, features = ["serde"] }
+pplx-space-policy-authority = { workspace = true }
+pplx-space-sql-locator = { workspace = true }
+pplx-space-sqlite = { workspace = true }
+pplx-space-template-model = { workspace = true }

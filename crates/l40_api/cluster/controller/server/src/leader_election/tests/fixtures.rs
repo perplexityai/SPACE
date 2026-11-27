@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::time::Duration;
 
-use pplx_space_common_core::types::PositiveDuration;
+use pplx_space_durations::PositiveDuration;
 use tokio_util::sync::CancellationToken;
 
 use crate::leader_election::store::{LeaseError, LeaseStore};

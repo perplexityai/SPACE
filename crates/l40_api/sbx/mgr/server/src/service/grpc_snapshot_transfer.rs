@@ -1,6 +1,7 @@
 use super::cleanup_support::CleanupLockTryResult;
 use super::create_support::{validate_path_component, validate_snapshot_name};
 use super::*;
+use std::mem::DropGuard;
 
 /// The name an import publishes its snapshot under: the client's
 /// `target_name`, which must be a valid name of the snapshot's type, or a
@@ -117,10 +118,8 @@ impl SandboxManagerService {
         // Both d-* (disk) and f-* (full) snapshots are exportable.
         // d-* contains rootfs.ext4 only, f-* contains rootfs.ext4 + VM state files.
 
-        let snapshot_dir = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
-            &sandbox.id,
-            &snapshot_name,
-        );
+        let snapshot_dir =
+            pplx_space_host_layout::paths::sandbox_snapshot_dir(&sandbox.id, &snapshot_name);
         crate::db::transfer::validate_snapshot_binding(
             std::path::Path::new(&snapshot_dir),
             &sandbox,
@@ -145,7 +144,7 @@ impl SandboxManagerService {
         );
         let writer = self.state_writer_lease("ExportSnapshot")?;
         let snapshot_key = snapshot_name
-            .parse::<pplx_space_common_core::types::SnapshotName>()
+            .parse::<pplx_space_snapshot_model::SnapshotName>()
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let lease = self
             .local_artifacts
@@ -215,16 +214,14 @@ impl SandboxManagerService {
                                 files.push(("memory", format!("{snapshot_dir}/memory"), true));
                             }
 
-                            // Track diff cleanup for rootfs delta
-                            struct DiffCleanup(Option<String>);
-                            impl Drop for DiffCleanup {
-                                fn drop(&mut self) {
-                                    if let Some(ref p) = self.0 {
-                                        let _ = std::fs::remove_file(p);
-                                    }
+                            let mut rootfs_diff_guard = DropGuard::new(None::<String>, |path| {
+                                if let Some(path) = path
+                                    && let Err(error) = std::fs::remove_file(&path)
+                                    && error.kind() != std::io::ErrorKind::NotFound
+                                {
+                                    tracing::warn!(%path, %error, "failed to remove temporary rootfs diff");
                                 }
-                            }
-                            let mut _rootfs_diff_guard = DiffCleanup(None);
+                            });
 
                             if include_rootfs {
                                 // Prefer rootfs from the snapshot itself (full snapshots are btrfs clones of instance/)
@@ -241,7 +238,7 @@ impl SandboxManagerService {
                                     let diff_id = uuid::Uuid::now_v7();
                                     let diff_path =
                                         format!("{snapshot_dir}/.rootfs.diff.{diff_id}.tmp");
-                                    _rootfs_diff_guard = DiffCleanup(Some(diff_path.clone()));
+                                    *rootfs_diff_guard = Some(diff_path.clone());
                                     if super::grpc_sandbox_transfer::diff_against_verified_base(
                                         &lookup_runtime,
                                         resolver.as_ref(),
@@ -307,7 +304,7 @@ impl SandboxManagerService {
 
     async fn import_snapshot_owned(
         &self,
-        mut stream: tonic::Streaming<ImportSnapshotRequest>,
+        mut stream: impl tokio_stream::Stream<Item = Result<ImportSnapshotRequest, Status>> + Unpin,
     ) -> Result<Response<ImportSnapshotResponse>, Status> {
         use super::grpc_sandbox_transfer::receive;
         let deadline = receive::ImportDeadline::new();
@@ -374,7 +371,8 @@ impl SandboxManagerService {
                 "snapshot target identity or state does not match",
             ));
         }
-        let base = pplx_space_common_core::host::linux::paths::sandbox_snapshots_dir(&sandbox_id);
+        let _producer = self.admit_artifact_producer("snapshot import", &sandbox)?;
+        let base = pplx_space_host_layout::paths::sandbox_snapshots_dir(&sandbox_id);
         let final_dir = format!("{base}/{name}");
         match tokio::fs::symlink_metadata(&final_dir).await {
             Ok(metadata)
@@ -397,7 +395,7 @@ impl SandboxManagerService {
         }
         let staging = format!(
             "{}/.snapshot-import-{sandbox_id}_{}",
-            pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR,
+            pplx_space_host_layout::paths::SANDBOX_CACHE_DIR,
             uuid::Uuid::now_v7()
         );
         let staging_claim = staging.clone();

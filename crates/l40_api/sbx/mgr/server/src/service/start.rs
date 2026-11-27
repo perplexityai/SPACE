@@ -3,7 +3,8 @@
 //! Startup and periodic repair stay in `recovery`; this module owns activation
 //! request parsing, placement and memory-policy resolution, and launch sequencing.
 
-use pplx_space_common_core::types::{LocalArtifactId, RateLimiter, TokenBucket};
+use pplx_space_execution_spec::{RateLimiter, TokenBucket};
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::activation_support::{
     ActivationFailureStage, IdentityFreeDirectActivationAuthority, NodeIdentitySource,
@@ -57,10 +58,8 @@ use crate::{
     proto::{StartRequest, StartResponse},
     state::{SandboxState, SandboxStatus, SandboxStatusEventDetails},
 };
-use pplx_space_common_core::types::{
-    SandboxCleanupEpisodeId, SandboxId, SandboxOwnerKind, SandboxQuarantineReasonCode,
-    SpaceApiRouteIdentity, StorageUri,
-};
+use pplx_space_accounts::SandboxOwnerKind;
+use pplx_space_artifact_model::StorageUri;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
     emit_sandbox_event,
@@ -73,6 +72,9 @@ use pplx_space_node_mgr_client::{
     },
 };
 use pplx_space_sandbox_metrics::admission::AdmissionPermitOutcome;
+use pplx_space_sandbox_model::{
+    SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineReasonCode, SpaceApiRouteIdentity,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::{Response, Status};
@@ -93,9 +95,8 @@ fn resolve_missing_checkpoint_restore_route_identity(
 }
 
 struct StartSandboxContext {
-    activation_auto_lifecycle: Option<pplx_space_common_core::types::AutoLifecyclePolicy>,
-    operation_activation_attempt_id:
-        Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+    activation_auto_lifecycle: Option<pplx_space_auto_lifecycle::AutoLifecyclePolicy>,
+    operation_activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     checkpoint: String,
     suspend_restore_storage_uri: Option<String>,
     restore_placement: SuspendRestorePlacement,
@@ -111,8 +112,8 @@ struct StartSandboxContext {
     restore_target: CrossNodeRestoreTarget,
     req_vcpu: Option<u32>,
     req_memory_mib: Option<u32>,
-    execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
-    space_api_route_identity: pplx_space_common_core::types::SpaceApiRouteIdentity,
+    execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
+    space_api_route_identity: pplx_space_sandbox_model::SpaceApiRouteIdentity,
     route_identity_provenance: crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance,
     open_activation_claim_eligible: bool,
     restore_artifact_as_new: Option<RestoreArtifactAsNewContext>,
@@ -122,8 +123,7 @@ struct StartSandboxContext {
     runtime_upgrade: Option<crate::db::RuntimeUpgradeOperationId>,
     /// Set only by the runtime upgrade operation, never from the wire; see
     /// [`StartAdmission::expected_node_execution`].
-    expected_node_execution:
-        Option<Option<pplx_space_common_core::types::SandboxActivationAttemptId>>,
+    expected_node_execution: Option<Option<pplx_space_sandbox_model::SandboxActivationAttemptId>>,
 }
 
 /// What a `Start` from inside sandbox-manager may claim beyond the wire
@@ -135,7 +135,7 @@ pub(super) struct StartAdmission {
     /// The node execution the caller decided to start the sandbox on. The
     /// claim refuses a sandbox another activation moved off it since.
     pub(super) expected_node_execution:
-        Option<Option<pplx_space_common_core::types::SandboxActivationAttemptId>>,
+        Option<Option<pplx_space_sandbox_model::SandboxActivationAttemptId>>,
 }
 
 struct StartSandboxLookup {
@@ -213,7 +213,7 @@ impl DeferredRestoreStart {
 /// whose expectation disagrees with the artifact its own URI resolved to.
 fn verify_stopped_materialization(
     sandbox: &crate::db::SandboxRow,
-    expected: pplx_space_common_core::types::LocalArtifactId,
+    expected: pplx_space_snapshot_model::LocalArtifactId,
 ) -> Result<(), Status> {
     if !sandbox.state.is_unowned(SandboxState::Stopped) {
         return Err(Status::failed_precondition(format!(
@@ -363,7 +363,7 @@ impl StartSandboxContext {
         let expected_local_artifact_id = req
             .expected_local_artifact_id
             .as_deref()
-            .map(str::parse::<pplx_space_common_core::types::LocalArtifactId>)
+            .map(str::parse::<pplx_space_snapshot_model::LocalArtifactId>)
             .transpose()
             .map_err(|error| {
                 Status::invalid_argument(format!("invalid expected_local_artifact_id: {error}"))
@@ -575,14 +575,14 @@ pub(super) struct ResolvedSandboxMemoryPolicy {
 
 async fn prepare_suspend_restore_dir(
     service: &SandboxManagerService,
-    owner: &pplx_space_common_core::types::SandboxOwner,
+    owner: &pplx_space_accounts::SandboxOwner,
     sandbox_id: String,
     storage_uri: Option<String>,
-    execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
-    activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+    execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
+    activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
 ) -> Result<crate::snapshot_restore::RestorePrepared, crate::snapshot_restore::RestoreError> {
     let retire_scope = |
-        transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+        transfer_scope_id: pplx_space_snapshot_model::TransferScopeId,
     | -> Result<(), crate::snapshot_restore::RestoreError> {
         let db = service.db.lock().map_err(|_| {
             crate::snapshot_restore::RestoreError::Other(
@@ -1011,7 +1011,7 @@ impl SandboxManagerService {
     fn materialized_stopped_response(
         &self,
         sandbox: &crate::db::SandboxRow,
-        expected: pplx_space_common_core::types::LocalArtifactId,
+        expected: pplx_space_snapshot_model::LocalArtifactId,
     ) -> Result<Response<StartResponse>, Status> {
         tracing::Span::current().record(
             "start_execution_path",
@@ -1778,6 +1778,14 @@ impl SandboxManagerService {
         )
         .await?;
         self.refuse_unretired_runtime_upgrade(&sandbox.id)?;
+        // The staging below moves a stopped row onto a restaged checkpoint
+        // before the restore's activation admission. A sealed node refuses
+        // that activation, so it refuses the warm start here, under the
+        // artifact lock and before anything is staged or written: the row
+        // stays as it was, stopped with its pin, which a v2 drain reports
+        // pending.
+        self.activation_seal
+            .check(ActivationAdmissionKind::Restore.as_str(), &sandbox.id)?;
         tracing::Span::current().record(
             "start_execution_path",
             SandboxStartExecutionPath::WarmSnapshot.as_str(),
@@ -1833,7 +1841,7 @@ impl SandboxManagerService {
             let execution = match sandbox.execution_metadata.as_ref() {
                 Some(execution) => execution,
                 None => {
-                    legacy = pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+                    legacy = pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
                         super::tail_support::host_architecture()
                             .map_err(|error| Status::failed_precondition(error.to_string()))?,
                         vec![],
@@ -2023,6 +2031,9 @@ impl SandboxManagerService {
                 .await?;
         }
         let sandbox = start_lookup.sandbox;
+        if !sandbox.state.is_unowned(SandboxState::Started) {
+            self.guest_auto_updates.activation(&sandbox.id);
+        }
         if let Some(policy) = &start_ctx.activation_auto_lifecycle {
             let runtime = sandbox
                 .runtime
@@ -2327,7 +2338,7 @@ impl SandboxManagerService {
                 return Err(error);
             }
         };
-        activation_cleanup.admit(activation_admission_permit);
+        activation_cleanup.admit_activation(activation_admission_permit);
         let mut node_client = start_stage_timeout(
             "fresh.connect_node_mgr",
             START_NODE_METADATA_TIMEOUT,
@@ -2418,6 +2429,11 @@ impl SandboxManagerService {
                 ))
             })?
             .into_inner();
+        self.external_addresses.record(
+            id,
+            &start_ctx.space_api_route_identity,
+            alloc.external_address.as_deref(),
+        );
         let sbx_uid = alloc.sandbox_uid;
         if sbx_uid < 10000 {
             // No VM, sidecar, cgroup, or filesystem work has been launched yet.
@@ -2476,9 +2492,9 @@ impl SandboxManagerService {
         })?;
         let boot = pplx_space_node_runtime_core::boot::GuestBoot {
             guest: prepare_source.execution.guest(),
-            cpus: pplx_space_common_core::types::VcpuCount::try_from_u32(vcpu).map_err(
-                |error| activation_cleanup.failure(Status::invalid_argument(error.to_string())),
-            )?,
+            cpus: pplx_space_execution_spec::VcpuCount::try_from_u32(vcpu).map_err(|error| {
+                activation_cleanup.failure(Status::invalid_argument(error.to_string()))
+            })?,
             memory_mib: std::num::NonZeroU64::new(u64::from(mem_mib)).ok_or_else(|| {
                 activation_cleanup
                     .failure(Status::invalid_argument("guest memory must be positive"))
@@ -2548,11 +2564,11 @@ impl SandboxManagerService {
                     metadata_json: super::tail_support::activation_metadata_json(
                         &sandbox,
                         Some(
-                            pplx_space_common_core::types::VcpuCount::try_from_u32(vcpu)
+                            pplx_space_execution_spec::VcpuCount::try_from_u32(vcpu)
                                 .map_err(|error| Status::invalid_argument(error.to_string()))?,
                         ),
                         Some(
-                            pplx_space_common_core::types::MemorySize::mib(u64::from(mem_mib))
+                            pplx_space_byte_size::MemorySize::mib(u64::from(mem_mib))
                                 .map_err(|error| Status::invalid_argument(error.to_string()))?,
                         ),
                     )?,
@@ -2575,7 +2591,7 @@ impl SandboxManagerService {
         // DHCP guests also need the persisted image contract so the gateway's
         // atomic ruleset includes the DHCP exception on its first launch.
         let (network_contract_ready, wait_for_network_contract) = if sandbox.guest_image.network()
-            == pplx_space_common_core::types::guest_image::GuestNetwork::SlotDhcpV1
+            == pplx_space_execution_spec::guest_image::GuestNetwork::SlotDhcpV1
         {
             let (sender, receiver) = tokio::sync::oneshot::channel();
             (Some(sender), Some(receiver))
@@ -2654,7 +2670,7 @@ impl SandboxManagerService {
                 )
             })?;
             let resolved_execution_metadata =
-                pplx_space_common_core::types::ExecutionMetadata::try_from(&resolved_execution)
+                pplx_space_execution_spec::ExecutionMetadata::try_from(&resolved_execution)
                     .map_err(|error| Status::internal(error.to_string()))?;
             super::validation::require_environment_acknowledgement(
                 &prepare_source.execution,
@@ -2691,7 +2707,12 @@ impl SandboxManagerService {
         // — a device-layout choice, not an encryption decision.
         let rootfs_block_device_path = if sandbox.volume_encryption {
             match crate::rootfs_encryption::prepare_encrypted_rootfs(
+                self.cache_root(),
                 id,
+                crate::rootfs_encryption::PinnedCheckpoint::of(
+                    &sandbox,
+                    self.staged_checkpoint_disk,
+                ),
                 execution_fence,
                 None,
                 &self.node_manager,
@@ -3091,7 +3112,7 @@ impl SandboxManagerService {
     pub(super) fn rootfs_rate_limiter(
         &self,
         is_builder: bool,
-        limits: pplx_space_common_core::types::DiskIoLimits,
+        limits: pplx_space_execution_spec::DiskIoLimits,
     ) -> Option<RateLimiter> {
         (!is_builder).then(|| RateLimiter::for_disk(limits, self.config.disk_io_burst_secs()))
     }

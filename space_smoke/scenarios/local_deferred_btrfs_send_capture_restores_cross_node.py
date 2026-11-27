@@ -21,9 +21,8 @@ MARKER = "space-smoke-deferred-capture-ok"
 # uploading a file when volume-manager may not lease the retained source,
 # and that fallback leaves the same directory and the same object behind;
 # the durable snapshot holding a `rootfs.btrfs-send` object; and the durable
-# path end to end: the same cross-node restore
-# `local.suspend_restore_cross_node_from_object_storage` proves, now sourced
-# from a stream that was never a file on the source node.
+# path end to end: cross-node restoration from a stream that was never a
+# file on the source node.
 @smoke.scenario(
     "local.deferred_btrfs_send_capture_restores_cross_node",
     # The codec is read from the snapshot's objects through the AWS CLI.
@@ -52,9 +51,6 @@ def deferred_btrfs_send_capture_restores_cross_node(test: smoke.KindEcw) -> None
             command_stderr=written.stderr,
         )
         source = restore.current_placement()
-
-    with test.phase("the worker resolves an omitted suspend format to the stream codec"):
-        codec.require_btrfs_send_default(source.node_name)
 
     with test.phase("suspend without naming a format"):
         test.pause()

@@ -1,9 +1,9 @@
 //! Bounded ingress waiting over independently owned access activation.
 use super::*;
 use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_node_api_client::activation::IngressActivation;
 use pplx_space_node_api_client::proto::ImplicitWakeActivity;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
@@ -209,6 +209,8 @@ impl AccessBackend for StoredAccess {
                     SandboxApiMetricIdentity::native("ingress"),
                     super::lifecycle::SandboxAction::ImplicitWake(ExecutionActivityKind::Access),
                     None,
+                    // Ingress acts for the sandbox's recorded client.
+                    crate::controllers::substrate::ActivationClient::Inherit,
                 )
                 .await
                 .map_err(|error| Status::unavailable(error.to_string()))?;

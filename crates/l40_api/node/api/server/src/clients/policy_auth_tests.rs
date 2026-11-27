@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 use std::sync::{
@@ -372,6 +372,7 @@ async fn backend_with_scope(
         tmpl: TemplateManagerGrpcClient::new(wrap_grpc_client_channel(channel.clone())),
         build_mgr: pplx_space_build_mgr_client::client_with_token(channel, STATIC_TOKEN)
             .expect("backend bearer"),
+        sbx_successor: None,
     };
     (clients, calls, shutdown, servers)
 }

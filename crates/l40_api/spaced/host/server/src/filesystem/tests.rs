@@ -90,7 +90,7 @@ async fn payload_bursts_queue_until_slots_free() {
     let process = statuses_of_a_queued_burst(
         service.process_grpc_service(),
         service.inner.process_admission.clone(),
-        pplx_space_spaced_common::process_limits::PAYLOAD_SLOTS as u32,
+        pplx_space_spaced_guest_protocol::process_limits::PAYLOAD_SLOTS as u32,
         process_path,
     )
     .await;
@@ -101,7 +101,7 @@ async fn payload_bursts_queue_until_slots_free() {
     let filesystem = statuses_of_a_queued_burst(
         service.filesystem_grpc_service(),
         service.inner.filesystem_admission.clone(),
-        pplx_space_spaced_common::filesystem_limits::PAYLOAD_SLOTS as u32,
+        pplx_space_spaced_guest_protocol::filesystem_limits::PAYLOAD_SLOTS as u32,
         filesystem_path,
     )
     .await;

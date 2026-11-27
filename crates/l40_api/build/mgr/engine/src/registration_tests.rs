@@ -1,6 +1,8 @@
 use super::*;
-use pplx_space_common_core::types::{ContentHash, Digest, EnvironmentReference, TemplateName};
+use pplx_space_content_digest::{ContentHash, Digest};
+use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_template_mgr_client::proto::RegisterTemplateResponse;
+use pplx_space_template_model::TemplateName;
 
 fn hash() -> String {
     format!("sha256:{}", "a".repeat(64))
@@ -67,7 +69,7 @@ fn a_registered_build_publishes_from_its_partition_s_directory() {
     let other = EnvironmentReference::new(Digest::sha256([2; 32]));
     let legacy = std::path::PathBuf::from(format!(
         "{}/seed/{}",
-        pplx_space_common_core::host::linux::paths::TEMPLATE_DIR,
+        pplx_space_host_layout::paths::TEMPLATE_DIR,
         hash()
     ));
     for environment in [None, Some(e0)] {

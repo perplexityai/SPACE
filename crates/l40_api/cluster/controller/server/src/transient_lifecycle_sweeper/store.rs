@@ -1,6 +1,5 @@
 //! Production [`SweepSink`] backed by Postgres and the substrate.
 
-use pplx_space_common_core::sql;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,11 +12,13 @@ use pplx_space_api::controllers::substrate::{
     SubstrateAdapter, SubstrateError, connect_node_api_client_for_target,
     sandbox_states_with_client,
 };
-use pplx_space_common_core::types::{
-    NodeManagedBy, NodeRole, PodName, PodUid, PositiveDuration, SandboxActivationAttemptId,
-    SandboxId, SandboxLifecycle, SubstrateKind,
-};
-use pplx_space_sandbox_store::sweeper::{self, unrestorable_restoring_guards};
+use pplx_space_durations::PositiveDuration;
+use pplx_space_k8s_ids::{PodName, PodUid};
+use pplx_space_node_model::{NodeManagedBy, NodeRole, SubstrateKind};
+use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId, SandboxLifecycle};
+use pplx_space_sandbox_store::k8s_executions::transient_sweeper;
+use pplx_space_sandbox_store::row_locks;
+use pplx_space_sandbox_store::sweeper;
 use sqlx::PgPool;
 
 use super::classify::{ExecutionRoutability, ProbeObservation};
@@ -36,139 +37,6 @@ use pplx_space_api::controllers::substrate::AbandonedRestoreRetirement;
 /// ever retried), so this rarely binds.
 const COMMAND_READY_PENDING_BATCH: i64 = 50;
 
-/// Candidate query for the command-ready-pending reaper. Bind order: `$1` =
-/// `managed_by`, `$2` = age threshold seconds (`BIGINT`), `$3` = batch limit.
-/// `lifecycle_changed_at` is the age clock because the create preserve path
-/// sets the marker in the same write that flips the row to `started`.
-///
-/// Ordered by `random()`, not oldest-first: a probe outcome of `Unreachable`
-/// leaves the row unchanged, so a strict oldest-first `LIMIT` would re-select
-/// the same front rows every tick and let a batch of stuck/unreachable rows
-/// permanently starve the ready/wedged candidates behind them. Random sampling
-/// gives every candidate a fair shot each tick — healed/reaped rows leave the
-/// set, and no fixed front-of-queue can monopolize the batch. The matching set
-/// (aged, never-retried preserved creates) is small, so the random sort is
-/// cheap.
-pub(super) const LIST_COMMAND_READY_PENDING_SQL: &str = sql!(
-    "SELECT
-         s.id,
-         EXTRACT(EPOCH FROM (NOW() - s.lifecycle_changed_at))::BIGINT AS age_secs,
-         e.pod_name,
-         e.activation_attempt_id,
-         NULLIF(BTRIM(e.pod_uid), '') AS pod_uid,
-         e.route_activation_id,
-         e.generation
-     FROM sandboxes s
-     LEFT JOIN sandbox_k8s_executions e
-       ON e.sandbox_id = s.id AND e.active
-     WHERE s.managed_by = $1
-       AND s.lifecycle = 'started'
-       AND s.command_ready_pending = true
-       AND s.lifecycle_changed_at < NOW() - make_interval(secs => $2)
-     ORDER BY random()
-     LIMIT $3"
-);
-
-/// Failed-cleanup candidates: `failed` rows that still carry an active
-/// execution, oldest attempt first. Bind order: `$1` =
-/// [`SubstrateKind::Kubernetes`] (see [`failed_active_execution_scope`]),
-/// `$2` = batch limit.
-///
-/// `first_activation_unfinished` says the execution's first activation, for
-/// a cold create the create itself, never finished: the execution never
-/// reached `running` (still `creating`, or `created` once its pod UID was
-/// written; the wake dial can record a pod IP without moving it on), and
-/// it still holds an activation attempt, the route's or a later one.
-/// `first_activation_abandoned` adds that the attempt's lease has expired. It
-/// is the same predicate the repair CAS refuses, without the expiry. A finished
-/// activation leaves the execution `running`, and a started recovery
-/// `recovering`, even when the best-effort release of its attempt was missed.
-/// Like the sweep's `creating` owner check, it reads whichever attempt the
-/// execution holds. Unlike it, it needs no full age window past the expiry:
-/// that window spares a create that may still finish, and this row is already
-/// `failed`, so its create can't. An owner that finds its row failed rolls the
-/// create back and deletes the sandbox.
-///
-/// An execution that never reached `running` and whose last owner gave up its
-/// activation without dispatching it counts too: it holds no attempt, but
-/// keeps the expiry `give_up_activation_attempt_best_effort` cut to when it
-/// gave up, so it reads as abandoned once that passes. A start that adopts a
-/// crashed create's row and fails before its wake leaves this shape when it
-/// never recorded the pod as running. A finished activation clears its expiry
-/// along with its attempt, so it can't take this shape, and an execution with
-/// no lease at all (a non-blocking warm-pool adoption never takes one) counts
-/// as finished. A start that found the pod up records it first
-/// (`ensure_pod_exists` moves the execution to `running`), and a `running`
-/// execution counts as finished here: the sweep still fails that row (no
-/// attempt is left for a completion receipt to finish it), but if its retire
-/// doesn't complete, the repair below can put it back to `started`.
-pub(super) const LIST_FAILED_ACTIVE_EXECUTIONS_SQL: &str = sql!(
-    "SELECT s.id, e.k8s_node_name, e.pod_name, e.activation_attempt_id, e.generation,
-            NULLIF(BTRIM(e.pod_uid), '') AS pod_uid, e.route_activation_id,
-            COALESCE(
-                e.state IN ('creating', 'created')
-                    AND (e.activation_attempt_id IS NOT NULL
-                         OR e.activation_attempt_expires_at IS NOT NULL),
-                FALSE
-            ) AS first_activation_unfinished,
-            COALESCE(
-                e.state IN ('creating', 'created')
-                    AND (e.activation_attempt_id IS NOT NULL
-                         OR e.activation_attempt_expires_at IS NOT NULL)
-                    AND e.activation_attempt_expires_at < NOW(),
-                FALSE
-            ) AS first_activation_abandoned
-     FROM sandboxes s
-     JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id
-     WHERE s.managed_by = $1
-       AND s.lifecycle = 'failed'
-       AND e.active
-     ORDER BY e.updated_at ASC, s.id
-     LIMIT $2"
-);
-
-/// Re-read one failed-cleanup candidate's first activation just before an
-/// alive retire, so an execution that reached `running` since the listing
-/// (and the probe) moves it off the retire. Its two columns are the listing's, spelled the same way.
-/// Bind order: `$1` = sandbox id, `$2` = [`SubstrateKind::Kubernetes`] (see
-/// [`failed_active_execution_scope`]). No row: the sandbox is no longer
-/// `failed` with an active execution.
-pub(super) const FIRST_ACTIVATION_SQL: &str = sql!(
-    "SELECT COALESCE(
-                e.state IN ('creating', 'created')
-                    AND (e.activation_attempt_id IS NOT NULL
-                         OR e.activation_attempt_expires_at IS NOT NULL),
-                FALSE
-            ) AS first_activation_unfinished,
-            COALESCE(
-                e.state IN ('creating', 'created')
-                    AND (e.activation_attempt_id IS NOT NULL
-                         OR e.activation_attempt_expires_at IS NOT NULL)
-                    AND e.activation_attempt_expires_at < NOW(),
-                FALSE
-            ) AS first_activation_abandoned
-     FROM sandboxes s
-     JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id
-     WHERE s.id = $1
-       AND s.managed_by = $2
-       AND s.lifecycle = 'failed'
-       AND e.active"
-);
-
-/// Rotate a failed-cleanup candidate behind the others by bumping its active
-/// execution's `updated_at`. Bind order: `$1` = sandbox id, `$2` =
-/// [`SubstrateKind::Kubernetes`] (see [`failed_active_execution_scope`]).
-pub(super) const NOTE_FAILED_CLEANUP_ATTEMPT_SQL: &str = sql!(
-    "UPDATE sandbox_k8s_executions e
-     SET updated_at = NOW()
-     FROM sandboxes s
-     WHERE e.sandbox_id = s.id
-       AND s.id = $1
-       AND s.managed_by = $2
-       AND s.lifecycle = 'failed'
-       AND e.active"
-);
-
 /// The `managed_by` the failed-active-execution cleanup binds, or `None` when
 /// the running substrate is not Kubernetes. That cleanup's statements scope to
 /// Kubernetes-managed rows only, so on any other substrate they match nothing
@@ -185,32 +53,6 @@ pub(super) fn failed_active_execution_scope(managed_by: &str) -> Option<Substrat
 /// cluster-wide incident wedges a large population at once; the remainder
 /// rolls to the next tick.
 const SWEEP_CANDIDATE_BATCH: i64 = 100;
-
-/// Raw row shape of the failed-cleanup listing.
-#[derive(sqlx::FromRow)]
-struct FailedCleanupRow {
-    id: SandboxId,
-    k8s_node_name: Option<String>,
-    pod_name: String,
-    activation_attempt_id: Option<SandboxActivationAttemptId>,
-    generation: i64,
-    pod_uid: Option<PodUid>,
-    route_activation_id: Option<SandboxActivationAttemptId>,
-    first_activation_unfinished: bool,
-    first_activation_abandoned: bool,
-}
-
-/// Raw row shape of [`LIST_COMMAND_READY_PENDING_SQL`].
-#[derive(sqlx::FromRow)]
-struct CommandReadyPendingRow {
-    id: SandboxId,
-    age_secs: i64,
-    pod_name: Option<String>,
-    activation_attempt_id: Option<SandboxActivationAttemptId>,
-    generation: Option<i64>,
-    pod_uid: Option<PodUid>,
-    route_activation_id: Option<SandboxActivationAttemptId>,
-}
 
 /// Build the retire fence for a candidate from its active execution row's
 /// `(pod_name, pod_uid)`.
@@ -349,32 +191,24 @@ async fn observe_candidate_pods(
     substrate.observe_pod_identities(&names).await
 }
 
-/// Lock an activation-owned row before a CAS re-checks its owner. Bind order:
-/// `$1` = sandbox id.
+/// Begin a transaction holding the sandbox row lock
+/// ([`row_locks::lock_id`]), for a CAS whose owner check must see any
+/// activation attempt claimed while it waited for the row.
 ///
 /// The fail, converge and revert CASes check the owner with a subquery on the
-/// execution ([`activation_owner_guard`](sweeper::activation_owner_guard)), and every activation-attempt
+/// execution (`activation_owner_guard`), and every activation-attempt
 /// assignment (`assign_activation_attempt_in`'s callers) locks the sandbox row
 /// without changing it before it writes a new lease there. An `UPDATE` that
 /// waits on that lock goes ahead on its original snapshot once the lock is
 /// released, so it would act on a row a new owner had just claimed. Taking the
 /// lock first, in the CAS's own transaction, makes the CAS read a snapshot
 /// that includes any such claim.
-pub(crate) const LOCK_SANDBOX_ROW_SQL: &str =
-    sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE");
-
-/// Begin a transaction holding the sandbox row lock, for a CAS whose owner
-/// check must see any activation attempt claimed while it waited for the row
-/// (see [`LOCK_SANDBOX_ROW_SQL`]).
 async fn begin_locked(
     pool: &PgPool,
     sandbox_id: SandboxId,
 ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query(LOCK_SANDBOX_ROW_SQL)
-        .bind(sandbox_id)
-        .execute(&mut *tx)
-        .await?;
+    row_locks::lock_id(&mut *tx, sandbox_id).await?;
     Ok(tx)
 }
 
@@ -394,72 +228,28 @@ async fn retire_reverted_restore_execution(
     if fence.recorded == RecordedExecution::Unread {
         return Ok(false);
     }
-    let retired = sqlx::query(sql!(
-        "UPDATE sandbox_k8s_executions
-            SET active = FALSE,
-                state = 'replaced',
-                pod_ip = NULL,
-                terminated_at = COALESCE(terminated_at, NOW()),
-                updated_at = NOW()
-          WHERE sandbox_id = $1
-            AND active
-            AND pod_name = $2
-            AND generation IS NOT DISTINCT FROM $3
-            AND activation_attempt_id IS NOT DISTINCT FROM $4
-            AND NULLIF(BTRIM(pod_uid), '') IS NOT DISTINCT FROM $5::TEXT
-            AND route_activation_id IS NOT DISTINCT FROM $6"
-    ))
-    .bind(sandbox_id)
-    .bind(fence.pod_name.as_str())
-    .bind(fence.generation)
-    .bind(fence.activation_attempt_id)
-    .bind(fence.recorded.pod_uid().map(PodUid::as_str))
-    .bind(fence.recorded.route_activation_id())
-    .execute(&mut **tx)
-    .await?
-    .rows_affected()
-        == 1;
+    let retired = transient_sweeper::retire_reverted_restore_execution(
+        &mut **tx,
+        sandbox_id,
+        fence.pod_name.as_str(),
+        fence.generation,
+        fence.activation_attempt_id,
+        fence.recorded.pod_uid().map(PodUid::as_str),
+        fence.recorded.route_activation_id(),
+    )
+    .await?;
     if retired {
         // The retired execution no longer places the row. The cleanup that
         // follows unplaces it too, but it is best-effort, and a `suspended`
         // row left reading as placed is one nothing revisits.
-        sweeper::unplace_reverted_restore(tx, sandbox_id).await?;
+        sweeper::unplace_reverted_restore(&mut **tx, sandbox_id).await?;
         // The node state the open exposures described died with the runtime.
-        sqlx::query(sql!(
-            "UPDATE sandbox_port_exposures
-                SET apply_state = 'pending',
-                    last_applied_node_id = NULL,
-                    last_error = NULL,
-                    last_bridge_status = NULL,
-                    last_applied_bridge_generation = NULL,
-                    last_observed_at = NULL,
-                    updated_at = NOW()
-              WHERE sandbox_id = $1
-                AND desired_state = 'open'"
-        ))
-        .bind(sandbox_id)
-        .execute(&mut **tx)
+        pplx_space_sandbox_store::port_exposures::invalidate_open_observations(
+            &mut **tx, sandbox_id,
+        )
         .await?;
     }
     Ok(retired)
-}
-
-/// Candidate select for the unrestorable-`restoring` sweep. Bind order:
-/// `$1` = `managed_by`, `$2` = min placement age seconds (`BIGINT`), `$3` =
-/// batch limit. Lists without flipping; the reported age is time since the
-/// last placement change (the stable clock — see
-/// [`unrestorable_restoring_guards`]).
-pub(crate) fn list_unrestorable_restoring_query() -> String {
-    let guards = unrestorable_restoring_guards();
-    format!(
-        "SELECT sandboxes.id,
-                EXTRACT(EPOCH FROM (NOW() - sandboxes.placement_changed_at))::BIGINT AS age_secs
-           FROM sandboxes
-          WHERE sandboxes.managed_by = $1
-            {guards}
-          ORDER BY random()
-          LIMIT $3"
-    )
 }
 
 pub struct SubstrateSweepSink {
@@ -569,12 +359,6 @@ impl SubstrateSweepSink {
 
     async fn evict_probe_client(&self, node_name: &str) {
         self.probe_clients.lock().await.remove(node_name);
-    }
-
-    /// Saturating seconds-as-`i64` for SQL binds; any value above `i64::MAX`
-    /// is "never" in human terms.
-    fn age_secs_bind(age: PositiveDuration) -> i64 {
-        i64::try_from(age.get().as_secs()).unwrap_or(i64::MAX)
     }
 }
 
@@ -835,6 +619,7 @@ impl SweepSink for SubstrateSweepSink {
             reverted.prior_placement_changed_at,
         )
         .await
+        .map_err(sqlx::Error::from)
     }
 
     async fn revert_to_suspended(
@@ -850,37 +635,18 @@ impl SweepSink for SubstrateSweepSink {
         // the execution check below can't race a new claim, and read the
         // placement clock the CAS clears while holding it.
         let prior_placement_changed_at: Option<Option<time::OffsetDateTime>> =
-            sqlx::query_scalar(sql!(
-                "SELECT placement_changed_at
-                   FROM sandboxes
-                  WHERE id = $1
-                    AND managed_by = $2
-                    FOR UPDATE"
-            ))
-            .bind(sandbox_id)
-            .bind(managed_by)
-            .fetch_optional(&mut *tx)
-            .await?;
+            sweeper::lock_placement_changed_at(&mut *tx, sandbox_id, managed_by).await?;
         let Some(prior_placement_changed_at) = prior_placement_changed_at else {
             tx.rollback().await?;
             return Ok(None);
         };
         // Then the active execution's, which the pod-IP writers take, so the
         // CAS's "no pod IP" check reads a committed IP rather than racing one.
-        // Without waiting: the activation-completion receipt locks the
-        // execution before the sandbox, so waiting here while holding the
-        // sandbox could close a cycle with it. A held execution is one whose
-        // owner is writing it right now, so the row defers to the next tick.
-        let execution_locked = sqlx::query(sql!(
-            "SELECT id
-               FROM sandbox_k8s_executions
-              WHERE sandbox_id = $1
-                AND active
-                FOR UPDATE NOWAIT"
-        ))
-        .bind(sandbox_id)
-        .execute(&mut *tx)
-        .await;
+        // If an execution-only writer holds that lock, defer to the next tick
+        // rather than waiting while holding the sandbox lock.
+        let execution_locked = transient_sweeper::lock_active_nowait(&mut *tx, sandbox_id)
+            .await
+            .map_err(sqlx::Error::from);
         match execution_locked {
             Ok(_) => {}
             Err(error) if crate::node_drain::store::is_lock_timeout(&error) => {
@@ -917,17 +683,7 @@ impl SweepSink for SubstrateSweepSink {
                 retire_reverted_restore_execution(&mut tx, sandbox_id, pod_fence).await?
             }
             RetireFence::NoExecution => {
-                !sqlx::query_scalar::<_, bool>(sql!(
-                    "SELECT EXISTS (
-                     SELECT 1
-                       FROM sandbox_k8s_executions
-                      WHERE sandbox_id = $1
-                        AND active
-                 )"
-                ))
-                .bind(sandbox_id)
-                .fetch_one(&mut *tx)
-                .await?
+                !pplx_space_sandbox_store::k8s_executions::exists(&mut *tx, sandbox_id).await?
             }
             // The candidate select always observes one of the two above; a
             // caller that observed nothing can't name the execution to retire.
@@ -956,7 +712,8 @@ impl SweepSink for SubstrateSweepSink {
             return sweeper::fail_aged_candidate(
                 &self.pool, sandbox_id, managed_by, lifecycle, age, guard,
             )
-            .await;
+            .await
+            .map_err(sqlx::Error::from);
         }
         let mut tx = begin_locked(&self.pool, sandbox_id).await?;
         let token =
@@ -981,6 +738,7 @@ impl SweepSink for SubstrateSweepSink {
             write_token,
         )
         .await
+        .map_err(sqlx::Error::from)
     }
 
     async fn list_unrestorable_restoring(
@@ -988,17 +746,16 @@ impl SweepSink for SubstrateSweepSink {
         min_placement_age: PositiveDuration,
     ) -> Result<Vec<(SandboxId, Duration)>, sqlx::Error> {
         let managed_by = self.substrate.managed_by();
-        let rows: Vec<(SandboxId, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(
-            list_unrestorable_restoring_query()
-        )))
-        .bind(managed_by)
-        .bind(Self::age_secs_bind(min_placement_age))
-        .bind(SWEEP_CANDIDATE_BATCH)
-        .fetch_all(&self.pool)
+        let rows = sweeper::list_unrestorable_restoring(
+            &self.pool,
+            managed_by,
+            min_placement_age,
+            SWEEP_CANDIDATE_BATCH,
+        )
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(id, age_secs)| {
+            .map(|sweeper::UnrestorableRestoringRow { id, age_secs }| {
                 // Negative only under clock skew; clamp defensively.
                 (id, Duration::from_secs(age_secs.max(0).cast_unsigned()))
             })
@@ -1013,6 +770,7 @@ impl SweepSink for SubstrateSweepSink {
         let managed_by = self.substrate.managed_by();
         sweeper::fail_unrestorable_restoring(&self.pool, sandbox_id, managed_by, min_placement_age)
             .await
+            .map_err(sqlx::Error::from)
     }
 
     async fn retire_fence_mismatch(
@@ -1048,11 +806,10 @@ impl SweepSink for SubstrateSweepSink {
         let Some(managed_by) = failed_active_execution_scope(self.substrate.managed_by()) else {
             return Ok(Vec::new());
         };
-        let rows: Vec<FailedCleanupRow> = sqlx::query_as(LIST_FAILED_ACTIVE_EXECUTIONS_SQL)
-            .bind(managed_by)
-            .bind(batch_size)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = pplx_space_sandbox_store::k8s_executions::list_failed_active_executions(
+            &self.pool, managed_by, batch_size,
+        )
+        .await?;
         let observed = observe_candidate_pods(
             &self.substrate,
             rows.iter().map(|row| row.pod_name.as_str()),
@@ -1087,13 +844,16 @@ impl SweepSink for SubstrateSweepSink {
         let Some(managed_by) = failed_active_execution_scope(self.substrate.managed_by()) else {
             return Ok(None);
         };
-        let columns: Option<(bool, bool)> = sqlx::query_as(FIRST_ACTIVATION_SQL)
-            .bind(sandbox_id)
-            .bind(managed_by)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(columns
-            .map(|(unfinished, abandoned)| FirstActivation::from_columns(unfinished, abandoned)))
+        let columns = pplx_space_sandbox_store::k8s_executions::first_activation(
+            &self.pool, sandbox_id, managed_by,
+        )
+        .await?;
+        Ok(columns.map(|columns| {
+            FirstActivation::from_columns(
+                columns.first_activation_unfinished,
+                columns.first_activation_abandoned,
+            )
+        }))
     }
 
     async fn note_failed_cleanup_attempt(&self, sandbox_id: SandboxId) -> Result<(), sqlx::Error> {
@@ -1105,11 +865,7 @@ impl SweepSink for SubstrateSweepSink {
         // because a `failed` sandbox cannot have a create in flight, so
         // nothing reads that age for these rows; were it read, every rotation
         // would refresh it and an abandoned create would defer forever.
-        sqlx::query(NOTE_FAILED_CLEANUP_ATTEMPT_SQL)
-            .bind(sandbox_id)
-            .bind(managed_by)
-            .execute(&self.pool)
-            .await?;
+        transient_sweeper::note_failed_cleanup_attempt(&self.pool, sandbox_id, managed_by).await?;
         Ok(())
     }
 
@@ -1136,7 +892,9 @@ impl SweepSink for SubstrateSweepSink {
         let Some(managed_by) = failed_active_execution_scope(self.substrate.managed_by()) else {
             return Ok(false);
         };
-        sweeper::repair_failed_active_execution(&self.pool, sandbox_id, managed_by).await
+        sweeper::repair_failed_active_execution(&self.pool, sandbox_id, managed_by)
+            .await
+            .map_err(sqlx::Error::from)
     }
 
     /// List preserved `started` rows whose `command_ready_pending` marker has
@@ -1151,14 +909,14 @@ impl SweepSink for SubstrateSweepSink {
         &self,
         age: PositiveDuration,
     ) -> Result<Vec<CommandReadyPendingCandidate>, sqlx::Error> {
-        let age_secs_i64 = i64::try_from(age.get().as_secs()).unwrap_or(i64::MAX);
         let managed_by = self.substrate.managed_by();
-        let rows: Vec<CommandReadyPendingRow> = sqlx::query_as(LIST_COMMAND_READY_PENDING_SQL)
-            .bind(managed_by)
-            .bind(age_secs_i64)
-            .bind(COMMAND_READY_PENDING_BATCH)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sweeper::list_command_ready_pending(
+            &self.pool,
+            managed_by,
+            age,
+            COMMAND_READY_PENDING_BATCH,
+        )
+        .await?;
         // `age_secs` is `NOW() - lifecycle_changed_at`, always positive given
         // the WHERE clause; clamp a negative (clock skew) to zero defensively.
         let observed = observe_candidate_pods(
@@ -1196,7 +954,9 @@ impl SweepSink for SubstrateSweepSink {
 
     async fn heal_command_ready_pending(&self, sandbox_id: SandboxId) -> Result<(), sqlx::Error> {
         let managed_by = self.substrate.managed_by();
-        sweeper::heal_command_ready_pending(&self.pool, sandbox_id, managed_by).await
+        sweeper::heal_command_ready_pending(&self.pool, sandbox_id, managed_by)
+            .await
+            .map_err(sqlx::Error::from)
     }
 
     async fn reap_command_ready_pending(
@@ -1204,7 +964,9 @@ impl SweepSink for SubstrateSweepSink {
         sandbox_id: SandboxId,
     ) -> Result<Option<String>, sqlx::Error> {
         let managed_by = self.substrate.managed_by();
-        sweeper::reap_command_ready_pending(&self.pool, sandbox_id, managed_by).await
+        sweeper::reap_command_ready_pending(&self.pool, sandbox_id, managed_by)
+            .await
+            .map_err(sqlx::Error::from)
     }
 
     async fn undo_reap_command_ready_pending(
@@ -1215,5 +977,6 @@ impl SweepSink for SubstrateSweepSink {
         let managed_by = self.substrate.managed_by();
         sweeper::undo_reap_command_ready_pending(&self.pool, sandbox_id, managed_by, write_token)
             .await
+            .map_err(sqlx::Error::from)
     }
 }

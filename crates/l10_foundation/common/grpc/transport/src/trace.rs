@@ -62,7 +62,9 @@ pub fn trace_grpc_client_transport<S>(inner: S) -> GrpcClientTrace<S> {
 /// a request extension when only the caller knows the code is expected, as a
 /// poll that is refused until the callee is ready. That call's client span
 /// records the code as success. Codes that report a platform failure, such as
-/// UNAVAILABLE or INTERNAL, stay errors even when marked.
+/// UNAVAILABLE or INTERNAL, stay errors even when marked. UNIMPLEMENTED can be
+/// marked: a caller that handles a peer built before the RPC existed expects it
+/// from that peer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExpectedGrpcStatus(tonic::Code);
 
@@ -77,7 +79,8 @@ impl ExpectedGrpcStatus {
     }
 
     fn honored(self) -> Option<tonic::Code> {
-        (self.0 != tonic::Code::Ok && !grpc_status_is_error(self.0)).then_some(self.0)
+        let markable = self.0 == tonic::Code::Unimplemented || !grpc_status_is_error(self.0);
+        (self.0 != tonic::Code::Ok && markable).then_some(self.0)
     }
 }
 
@@ -111,6 +114,23 @@ impl std::fmt::Debug for ClientSpanFields {
         formatter
             .debug_struct("ClientSpanFields")
             .finish_non_exhaustive()
+    }
+}
+
+/// A call whose caller expects its dial may never reach the peer, as while a
+/// node-local server restarts and its socket is absent or refuses the dial,
+/// and reports that failure itself. The client trace logs such a failure of
+/// the marked call at DEBUG rather than as an error; its span is still marked
+/// ERROR. Only a failure whose local error proves the dial failed counts (see
+/// [`crate::client_connect_failure_cause`]): any other transport failure of the
+/// call, such as a connection lost once established, stays an error.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExpectedConnectFailure;
+
+impl ExpectedConnectFailure {
+    /// Mark `request` as one whose failed dial its caller reports.
+    pub fn mark<T>(self, request: &mut tonic::Request<T>) {
+        request.extensions_mut().insert(self);
     }
 }
 
@@ -264,6 +284,10 @@ impl MakeClassifier for GrpcClientMakeClassifier {
                 .extensions()
                 .get::<RetriedOnTransportFailure>()
                 .cloned(),
+            connect_failure_expected: request
+                .extensions()
+                .get::<ExpectedConnectFailure>()
+                .is_some(),
             service_port_ingress: matches!(
                 path,
                 "/space.node.api.v1.WorkerApi/ServicePortIngress"
@@ -284,6 +308,8 @@ pub struct GrpcClientClassifier {
     service_port_ingress: bool,
     /// The request's [`RetriedOnTransportFailure`] mark.
     transport_failure_retried: Option<RetriedOnTransportFailure>,
+    /// Whether the request carries an [`ExpectedConnectFailure`] mark.
+    connect_failure_expected: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -291,6 +317,7 @@ pub struct GrpcClientEosClassifier {
     inner: GrpcEosErrorsAsFailures,
     service_port_ingress: bool,
     transport_failure_retried: Option<RetriedOnTransportFailure>,
+    connect_failure_expected: bool,
 }
 
 /// Carry the request-specific error decision to OnFailure, which cannot recover
@@ -301,6 +328,8 @@ pub struct GrpcClientFailureClass {
     is_error: bool,
     /// The mark of a call whose caller reports this transport failure.
     transport_failure_retried: Option<RetriedOnTransportFailure>,
+    /// Why this failure is a dial its caller expected to fail, when it is one.
+    expected_connect_failure: Option<crate::ClientConnectFailureCause>,
 }
 
 impl GrpcClientFailureClass {
@@ -320,6 +349,7 @@ impl GrpcClientFailureClass {
             inner,
             is_error,
             transport_failure_retried: None,
+            expected_connect_failure: None,
         }
     }
 
@@ -336,6 +366,33 @@ impl GrpcClientFailureClass {
             ..Self::new(inner, service_port_ingress, false)
         }
     }
+
+    /// A failure classified from `error`, a call's transport error, which is
+    /// the dial its caller expected to fail when its chain proves the dial
+    /// failed and the call was marked [`ExpectedConnectFailure`].
+    fn transport_error<E: std::fmt::Display + 'static>(
+        inner: GrpcFailureClass,
+        service_port_ingress: bool,
+        retried: Option<RetriedOnTransportFailure>,
+        connect_failure_expected: bool,
+        error: &E,
+    ) -> Self {
+        let expected_connect_failure = connect_failure_expected
+            .then(|| dial_failure_cause(error))
+            .flatten();
+        Self {
+            expected_connect_failure,
+            ..Self::transport(inner, service_port_ingress, retried)
+        }
+    }
+}
+
+/// Why `error`, a traced channel's error, proves the dial never reached the
+/// peer, if it does. Tonic's channel fails a call with a
+/// [`tonic::transport::Error`] whose sources keep the connector's error.
+fn dial_failure_cause<E: 'static>(error: &E) -> Option<crate::ClientConnectFailureCause> {
+    let error = (error as &dyn std::any::Any).downcast_ref::<tonic::transport::Error>()?;
+    crate::retry::connect_failure_cause_in(Some(error))
 }
 
 impl std::fmt::Display for GrpcClientFailureClass {
@@ -380,16 +437,19 @@ impl ClassifyResponse for GrpcClientClassifier {
                     inner,
                     service_port_ingress: self.service_port_ingress,
                     transport_failure_retried: self.transport_failure_retried,
+                    connect_failure_expected: self.connect_failure_expected,
                 })
             }
         }
     }
 
     fn classify_error<E: std::fmt::Display + 'static>(self, error: &E) -> Self::FailureClass {
-        GrpcClientFailureClass::transport(
+        GrpcClientFailureClass::transport_error(
             self.inner.classify_error(error),
             self.service_port_ingress,
             self.transport_failure_retried,
+            self.connect_failure_expected,
+            error,
         )
     }
 }
@@ -411,10 +471,12 @@ impl ClassifyEos for GrpcClientEosClassifier {
     }
 
     fn classify_error<E: std::fmt::Display + 'static>(self, error: &E) -> Self::FailureClass {
-        GrpcClientFailureClass::transport(
+        GrpcClientFailureClass::transport_error(
             self.inner.classify_error(error),
             self.service_port_ingress,
             self.transport_failure_retried,
+            self.connect_failure_expected,
+            error,
         )
     }
 }
@@ -620,6 +682,18 @@ impl OnFailure<GrpcClientFailureClass> for GrpcClientOnFailure {
             GrpcFailureClass::Error(error) => {
                 span.record("otel.status_code", "ERROR");
                 span.record("otel.status_description", error.as_str());
+                if let Some(cause) = failure.expected_connect_failure {
+                    tracing::debug!(
+                        target: "grpc.client",
+                        rpc_log_side = "client",
+                        grpc_error = %error,
+                        connect_failure = %cause,
+                        latency_ms,
+                        failure_origin = "transport",
+                        "gRPC client dial failed as its caller expected; the caller reports it",
+                    );
+                    return;
+                }
                 let transport_failure = TransportFailure {
                     error,
                     latency_ms,
@@ -675,7 +749,7 @@ where
 }
 
 fn parse_grpc_path(path: &str) -> (&str, &str) {
-    let trimmed = path.strip_prefix('/').unwrap_or(path);
+    let trimmed = path.trim_prefix('/');
     match trimmed.rsplit_once('/') {
         Some((service, method)) => (service, method),
         None => ("", trimmed),

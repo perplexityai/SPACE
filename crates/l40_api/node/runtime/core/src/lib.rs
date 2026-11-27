@@ -1,6 +1,7 @@
 pub mod boot;
 #[cfg(feature = "host-runtime")]
 pub mod cgroup;
+pub mod cgroup_memory;
 pub mod cgroup_paths;
 pub mod control;
 pub mod fc_api;
@@ -35,7 +36,7 @@ use pplx_space_common_grpc::{
 use tonic::transport::{Channel, Endpoint};
 
 pub const RUNTIME_SUPERVISOR_SOCKET: &str =
-    pplx_space_common_core::host::linux::paths::RUNTIME_SUPERVISOR_SOCKET;
+    pplx_space_host_layout::paths::RUNTIME_SUPERVISOR_SOCKET;
 const LOCAL_ENDPOINT_URI: &str = "http://[::]:50051";
 
 pub type RuntimeSupervisorGrpcClient =
@@ -80,7 +81,7 @@ pub async fn connect_runtime_supervisor()
 pub fn reflink_copy(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        pplx_space_common_io::reflink::copy_file(src, dst).map(|_| ())
+        pplx_space_file_io::reflink::copy_file(src, dst).map(|_| ())
     }
 
     #[cfg(target_os = "macos")]

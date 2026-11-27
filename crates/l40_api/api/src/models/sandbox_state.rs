@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{NodeId, SandboxLifecycle};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxLifecycle;
 
 /// What the admin response's `lifecycle` and `status` and the ECW sandbox
 /// state are rendered from: the row's stored lifecycle and the status its node
@@ -44,7 +45,7 @@ impl SandboxStateInput {
     /// is `route_node`; the record carries no execution generation to
     /// compare. `route_node` is the node `Sandbox.active_node_id` names: the
     /// direct route's current node when the sandbox has one, otherwise the
-    /// row's `active_node_id` column (`SANDBOX_COLUMNS` coalesces the two).
+    /// row's `active_node_id` column (the response row coalesces the two).
     /// Where those differ, the row is usually `failed` or `suspended`, which
     /// the stored lifecycle decides anyway.
     pub fn observed_on(

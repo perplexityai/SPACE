@@ -291,7 +291,7 @@ fn hash_rootfs_file_matches_decompressed_hash() {
     )
     .unwrap();
     let (legacy_hash, legacy_size) =
-        hash_rootfs_file(&rootfs, pplx_space_common_core::types::HashAlg::Sha256).unwrap();
+        hash_rootfs_file(&rootfs, pplx_space_content_digest::HashAlg::Sha256).unwrap();
     assert_eq!(legacy_size, 4 * 1024 * 1024);
     assert_eq!(legacy_hash, sha256_bytes(&std::fs::read(&rootfs).unwrap()));
 

@@ -105,6 +105,12 @@ spec:
             - name: SPACE_SBX_CLUSTER_DELETED_QUIESCENCE_SECS
               value: {{ . | quote }}
             {{- end }}
+            {{- if eq (include "space-node-service.rustBuild" $) "test-hooks" }}
+            {{- with .Values.discardAttemptWindowSecs }}
+            - name: SPACE_SBX_DISCARD_ATTEMPT_WINDOW_SECS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             {{- with .Values.sandboxEviction }}
             {{- if .enabled }}
             - name: SPACE_SBX_EVICT_ENABLED

@@ -11,11 +11,11 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+pplx-space-sql-codec = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
-sqlx = { workspace = true, features = ["postgres"], optional = true }
 thiserror = { workspace = true }
 
 [features]
 default = []
 serde = ["dep:serde"]
-sqlx = ["dep:sqlx"]
+sqlx = ["dep:pplx-space-sql-codec", "pplx-space-sql-codec/postgres"]

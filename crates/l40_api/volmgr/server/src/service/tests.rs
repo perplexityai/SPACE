@@ -5,10 +5,7 @@ async fn copy_jobs_deduplicate_live_work_without_claiming_a_pull_writer_barrier(
     let temp = tempfile::tempdir().unwrap();
     let service = test_service(&temp).await;
     let request = crate::proto::CopyObjectRequest {
-        subject_id: format!(
-            "sandbox:{}",
-            pplx_space_common_core::types::SandboxId::new()
-        ),
+        subject_id: format!("sandbox:{}", pplx_space_sandbox_model::SandboxId::new()),
         source_s3_uri: "s3://example-artifacts/source?region=us-east-1".into(),
         destination_s3_uri: "s3://example-artifacts/destination?region=us-east-1".into(),
     };
@@ -112,7 +109,6 @@ fn completed_push_reuse_is_limited_to_immutable_snapshot_artifacts() {
         pplx_space_common_jobs::DuplicatePolicy::ReuseExisting
     );
 }
-use std::sync::Arc;
 
 #[derive(Clone)]
 struct BlockingExecutor;
@@ -146,14 +142,14 @@ fn root_request<T>(message: T) -> Request<T> {
 
 fn service_request<T>(
     message: T,
-    user: pplx_space_common_core::host::linux::identities::LinuxUser,
+    user: pplx_space_host_layout::identities::LinuxUser,
 ) -> Request<T> {
     request_from_peer(message, user.uid, user.primary_group.gid)
 }
 
 async fn test_service(temp: &tempfile::TempDir) -> VolumeManagerService {
     let db_path = temp.path().join("volume-manager.db");
-    crate::run::migrate_volume_manager_db(&db_path)
+    pplx_space_volmgr_store::database::migrate(&db_path)
         .await
         .unwrap();
     VolumeManagerService::new(
@@ -210,23 +206,23 @@ async fn btrfs_resubmission_reuses_live_or_completed_jobs_but_restages_terminal_
             match status {
                 JobStatus::Pending => true,
                 JobStatus::Running => {
-                    assert!(jobs::mark_job_running(&conn, &first_id).unwrap());
+                    assert!(jobs::mark_job_running(conn.raw(), &first_id).unwrap());
                     true
                 }
                 JobStatus::Cancelling | JobStatus::Cancelled => {
-                    jobs::request_job_cancellation(&conn, &first_id).unwrap();
+                    jobs::request_job_cancellation(conn.raw(), &first_id).unwrap();
                     if status == JobStatus::Cancelled {
-                        assert!(jobs::mark_job_cancelled(&conn, &first_id).unwrap());
+                        assert!(jobs::mark_job_cancelled(conn.raw(), &first_id).unwrap());
                     }
                     status == JobStatus::Cancelling
                 }
                 JobStatus::Completed => {
-                    assert!(jobs::mark_job_running(&conn, &first_id).unwrap());
-                    assert!(jobs::complete_job(&conn, &first_id, 42).unwrap());
+                    assert!(jobs::mark_job_running(conn.raw(), &first_id).unwrap());
+                    assert!(jobs::complete_job(conn.raw(), &first_id, 42).unwrap());
                     true
                 }
                 JobStatus::Failed => {
-                    jobs::fail_job_permanent(&conn, &first_id, "upload failed", None).unwrap();
+                    jobs::fail_job_permanent(conn.raw(), &first_id, "upload failed", None).unwrap();
                     false
                 }
             }
@@ -266,7 +262,7 @@ async fn pull_artifact_as(
     service: &VolumeManagerService,
     subject_id: &str,
     artifact_id: &str,
-    user: pplx_space_common_core::host::linux::identities::LinuxUser,
+    user: pplx_space_host_layout::identities::LinuxUser,
 ) -> Result<String, Status> {
     VolumeManager::pull_files_async(
         service,
@@ -365,8 +361,91 @@ async fn closing_admission_rejects_mutations() {
 }
 
 #[tokio::test]
+async fn handing_off_persists_queued_submissions_for_the_successor() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = test_service(&temp).await;
+    let pull = || PullFileRequest {
+        subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
+        s3_uri: "s3://bucket/snapshots/a/memfile?region=us-east-2".to_string(),
+        local_path: "/space/cache/replacements/download-7b47".to_string(),
+        ..Default::default()
+    };
+    service.transfer_admission().hand_off();
+    service.worker().stop_starting_jobs();
+
+    let job_id =
+        VolumeManager::submit_pull_file(&service, service_request(pull(), users::SPACE_SBXMGR))
+            .await
+            .expect("a queued submission is persisted while handing off")
+            .into_inner()
+            .job_id;
+    let job = service
+        .worker()
+        .get_job(&job_id.parse().unwrap())
+        .unwrap()
+        .expect("persisted job");
+    assert_eq!(job.status, "pending");
+
+    let blocking = VolumeManager::pull_file(&service, service_request(pull(), users::SPACE_SBXMGR))
+        .await
+        .expect_err("a transfer the caller waits for is refused while handing off");
+    assert_eq!(blocking.code(), tonic::Code::Unavailable);
+
+    let wait = tokio::spawn({
+        let service = service.clone();
+        let job_id = job_id.clone();
+        async move {
+            VolumeManager::wait_transfer_job(
+                &service,
+                service_request(GetTransferJobRequest { job_id }, users::SPACE_SBXMGR),
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!wait.is_finished(), "the job is still pending");
+    service.transfer_admission().end_waits();
+    let ended = tokio::time::timeout(Duration::from_secs(1), wait)
+        .await
+        .expect("ending waits answers a wait for a job left to the successor")
+        .unwrap()
+        .expect_err("the successor finishes the job");
+    assert_eq!(ended.code(), tonic::Code::Unavailable);
+}
+
+#[tokio::test]
+async fn staging_orphan_sweep_keeps_inputs_of_artifact_pushes_left_to_the_successor() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = test_service(&temp).await;
+    service.worker().stop_starting_jobs();
+    let staged = temp.path().join("staging").join("artifact-entry");
+    let orphan = temp.path().join("staging").join("orphan");
+    std::fs::write(&staged, b"entry").unwrap();
+    std::fs::write(&orphan, b"orphan").unwrap();
+    let mut artifact = sample_artifact();
+    artifact.entries[0].staged_path = Some(staged.to_string_lossy().into_owned());
+    service
+        .worker()
+        .submit(
+            PUSH_ARTIFACT_KIND,
+            &artifact.to_json(),
+            Some(&artifact.subject_id),
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(service.cleanup_staging_orphans().unwrap(), 1);
+
+    assert!(
+        staged.exists(),
+        "a pending artifact push keeps its staged input"
+    );
+    assert!(!orphan.exists());
+}
+
+#[tokio::test]
 async fn rpc_authorization_rejects_group_members_and_separates_subject_kinds() {
-    use pplx_space_common_core::{host::linux::identities::groups, host::linux::identities::users};
+    use pplx_space_host_layout::{identities::groups, identities::users};
 
     let temp = tempfile::tempdir().expect("tempdir");
     let service = test_service(&temp).await;
@@ -471,7 +550,7 @@ async fn rpc_authorization_rejects_group_members_and_separates_subject_kinds() {
 
 #[tokio::test]
 async fn pull_artifact_dedup_never_returns_the_other_manager_class_job() {
-    use pplx_space_common_core::host::linux::identities::users;
+    use pplx_space_host_layout::identities::users;
 
     const SANDBOX_SUBJECT: &str = "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2";
     const TEMPLATE_SUBJECT: &str = "template:seed";
@@ -945,29 +1024,22 @@ fn pull_job_failure_status_preserves_typed_reason_and_retry_semantics() {
     );
 }
 
-fn test_worker() -> (
-    Arc<Mutex<rusqlite::Connection>>,
-    BackgroundWorker<BlockingExecutor>,
-) {
+fn test_worker() -> (SharedConnection, JobWorker<BlockingExecutor>) {
     test_worker_with_active_limit(1)
 }
 
 fn test_worker_with_active_limit(
     active_job_limit: usize,
-) -> (
-    Arc<Mutex<rusqlite::Connection>>,
-    BackgroundWorker<BlockingExecutor>,
-) {
+) -> (SharedConnection, JobWorker<BlockingExecutor>) {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    for migration in sqlx::migrate!("../../../../db/common")
+    for migration in pplx_space_volmgr_store::database::COMMON_MIGRATOR
         .iter()
         .filter(|migration| migration.migration_type.is_up_migration())
     {
         conn.execute_batch(migration.sql.as_ref()).unwrap();
     }
-    let db = Arc::new(Mutex::new(conn));
-    let worker = BackgroundWorker::new(
-        Arc::clone(&db),
+    let db = SharedConnection::new(pplx_space_volmgr_store::Connection::from_raw(conn));
+    let worker = db.background_worker(
         BlockingExecutor,
         WorkerConfig::new(1, Duration::from_secs(60), 3)
             .with_kind_concurrency(PULL_KIND, 2)
@@ -999,7 +1071,7 @@ fn transfer_scope_lookup_is_not_hidden_by_newer_terminal_jobs() {
     };
     let conn = db.lock().unwrap();
     pplx_space_common_jobs::db::insert_job(
-        &conn,
+        conn.raw(),
         pplx_space_common_jobs::db::InsertJob {
             job_id: &"019d84bd-280d-7331-99c6-b63377f3a3a5".parse().unwrap(),
             kind: PULL_KIND,
@@ -1012,13 +1084,14 @@ fn transfer_scope_lookup_is_not_hidden_by_newer_terminal_jobs() {
         },
     )
     .unwrap();
-    conn.execute(
+    conn.raw().execute(
         "UPDATE jobs SET created_at = '2000-01-01 00:00:00' WHERE job_id = '019d84bd-280d-7331-99c6-b63377f3a3a5'",
         [],
     )
     .unwrap();
-    conn.execute_batch(
-        "WITH RECURSIVE seq(value) AS (
+    conn.raw()
+        .execute_batch(
+            "WITH RECURSIVE seq(value) AS (
              VALUES(1)
              UNION ALL
              SELECT value + 1 FROM seq WHERE value < 10000
@@ -1027,8 +1100,8 @@ fn transfer_scope_lookup_is_not_hidden_by_newer_terminal_jobs() {
          SELECT printf('terminal-%05d', value), 'pull', 'completed', '{}',
                 printf('2026-01-01 00:00:%05d', value)
            FROM seq;",
-    )
-    .unwrap();
+        )
+        .unwrap();
 
     assert_eq!(
         transfer_scope_job_ids(&conn, scope).unwrap(),
@@ -1089,7 +1162,7 @@ async fn submit_pull_does_not_reuse_job_with_different_materialization() {
     {
         let conn = db.lock().unwrap();
         pplx_space_common_jobs::db::insert_job(
-            &conn,
+            conn.raw(),
             pplx_space_common_jobs::db::InsertJob {
                 job_id: &"019d84bd-280d-7331-99c6-b63377f3a3a6".parse().unwrap(),
                 kind: "pull",
@@ -1113,6 +1186,7 @@ async fn submit_pull_does_not_reuse_job_with_different_materialization() {
     );
     let conn = db.lock().unwrap();
     let count: i64 = conn
+        .raw()
         .query_row("SELECT count(*) FROM jobs", [], |row| row.get(0))
         .unwrap();
     assert_eq!(
@@ -1120,6 +1194,7 @@ async fn submit_pull_does_not_reuse_job_with_different_materialization() {
         "different materialization postconditions need distinct jobs"
     );
     let persisted: String = conn
+        .raw()
         .query_row(
             "SELECT payload FROM jobs WHERE job_id = ?1",
             ["019d84bd-280d-7331-99c6-b63377f3a3a6"],
@@ -1193,6 +1268,7 @@ async fn pull_artifact_does_not_reuse_job_with_different_materialization() {
     let count: i64 = db
         .lock()
         .unwrap()
+        .raw()
         .query_row("SELECT count(*) FROM jobs", [], |row| row.get(0))
         .unwrap();
     assert_eq!(
@@ -1359,6 +1435,7 @@ async fn pull_artifact_retry_blocks_incompatible_legacy_live_job() {
     let count: i64 = db
         .lock()
         .unwrap()
+        .raw()
         .query_row("SELECT count(*) FROM jobs", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 1, "the retry must not enqueue duplicate work");
@@ -1417,8 +1494,8 @@ async fn pull_artifact_retry_allows_scoped_job_after_incompatible_legacy_complet
         .unwrap();
     {
         let conn = db.lock().unwrap();
-        assert!(pplx_space_common_jobs::db::mark_job_running(&conn, &legacy_job).unwrap());
-        assert!(pplx_space_common_jobs::db::complete_job(&conn, &legacy_job, 0).unwrap());
+        assert!(pplx_space_common_jobs::db::mark_job_running(conn.raw(), &legacy_job).unwrap());
+        assert!(pplx_space_common_jobs::db::complete_job(conn.raw(), &legacy_job, 0).unwrap());
     }
     let scoped_assignment = MaterializationAssignment {
         mode: MaterializationMode::Enabled,
@@ -1556,6 +1633,7 @@ async fn protected_priority_pull_is_admitted_when_default_band_is_full() {
     assert_eq!(
         db.lock()
             .unwrap()
+            .raw()
             .query_row(
                 "SELECT priority FROM jobs WHERE job_id = ?1",
                 [reserved],

@@ -8,13 +8,40 @@ pub(crate) async fn attach_session(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(session_id): Path<String>,
     headers: HeaderMap,
-    upgrade: WebSocketUpgrade,
+    upgrade: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
     uri: axum::http::Uri,
 ) -> Result<Response, AttachError> {
+    // Taken as a `Result` so a request that is not a WebSocket upgrade is
+    // refused in the data-plane envelope, with axum's status (400, 405 or
+    // 426), rather than in axum's plain text.
+    let upgrade = match upgrade {
+        Ok(upgrade) => upgrade,
+        Err(rejection) => {
+            return Ok(data_plane_http_error(
+                rejection.status(),
+                DataPlaneHttpErrorCode::InvalidRequest,
+                "attach must be a WebSocket upgrade request",
+                false,
+                ResponseOrigin::Client,
+                ResponseKind::Validation,
+            ));
+        }
+    };
     reject_query_tokens(uri.query())?;
     let session_id = session_id
         .parse::<DataPlaneSessionId>()
         .map_err(|_| AttachError::BadRequest("invalid session id"))?;
+    let after_seq = websocket_after_seq(uri.query())?;
+    if after_seq.is_some()
+        && !matches!(
+            session_id.kind(),
+            SessionKind::Process | SessionKind::Terminal
+        )
+    {
+        return Err(AttachError::BadRequest(
+            "after_seq applies only to process and terminal sessions",
+        ));
+    }
     let header_token = token_from_headers(&headers)?;
     if state.drain_started.is_cancelled() {
         return Ok(native_draining_response(session_id.kind().as_str()));
@@ -25,7 +52,15 @@ pub(crate) async fn attach_session(
     let task = state.upgrade_tasks.token();
     Ok(upgrade.on_upgrade(move |socket| async move {
         let _task = task;
-        handle_socket(state, peer.ip(), session_id, header_token, socket).await;
+        handle_socket(
+            state,
+            peer.ip(),
+            session_id,
+            header_token,
+            after_seq,
+            socket,
+        )
+        .await;
     }))
 }
 
@@ -34,6 +69,7 @@ pub(crate) async fn handle_socket(
     source_ip: IpAddr,
     session_id: DataPlaneSessionId,
     header_token: Option<String>,
+    after_seq: Option<u64>,
     mut socket: WebSocket,
 ) {
     let attach_deadline = tokio::time::Instant::now() + state.attach_deadline;
@@ -112,7 +148,7 @@ pub(crate) async fn handle_socket(
     let _stream_permit = stream_permit;
     let _native_session_permit = native_session_permit;
     let revocation_cache = Arc::clone(&state.revocation_cache);
-    bridge_attached_session(state, session_id, attached, socket).await;
+    bridge_attached_session(state, session_id, attached, after_seq, socket).await;
     revocation_cache.forget(session_id);
 }
 
@@ -184,12 +220,13 @@ pub(crate) async fn bridge_attached_session(
     state: DataPlaneState,
     session_id: DataPlaneSessionId,
     attached: AttachedSession,
+    after_seq: Option<u64>,
     socket: WebSocket,
 ) {
     match attached.kind {
         SessionKind::Terminal | SessionKind::Process => {
             let kind = attached.kind.as_str();
-            match bridge_process_session(state, session_id, attached, socket).await {
+            match bridge_process_session(state, session_id, attached, after_seq, socket).await {
                 Ok(end) => crate::metrics::stream_closed(kind, end.result_label()),
                 Err(error) => {
                     let result = stream_bridge_error_label(&error);
@@ -481,20 +518,103 @@ pub(super) fn client_message_len(message: &Message) -> usize {
     }
 }
 
+/// A timer for pinging an attached session's socket, so a session that is
+/// otherwise quiet still carries traffic: an idle-timeout proxy between keeps
+/// it open, and a client that watches for the pings can tell a data plane
+/// that went away from a quiet process.
+pub(super) fn websocket_keepalive_interval(state: &DataPlaneState) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + state.websocket_ping_interval,
+        state.websocket_ping_interval,
+    );
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
+
+/// The `seq` after which a stream numbers output it cannot place: the live
+/// tail it follows because a guest too old to say where its retained output
+/// starts evicted it while the process runs. Far above any position a
+/// process's output reaches, so a reattach with such a `seq` is told apart
+/// from one with a position, and replays the retained output from its start
+/// behind `resync_required` instead of continuing at a position that output
+/// never had. Below `i64::MAX`, so `after_seq` accepts it.
+pub(super) const UNPOSITIONED_SEQ_BASE: u64 = 1 << 62;
+
+/// The guest cursor of output `seq`, or `None` for output the stream numbered
+/// itself (see [`UNPOSITIONED_SEQ_BASE`]).
+fn output_position(seq: u64) -> Option<u64> {
+    (seq < UNPOSITIONED_SEQ_BASE).then_some(seq)
+}
+
+/// Where a process stream reopens after the guest refused its position as
+/// outside the output it retains.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WindowMissReopen {
+    /// At this cursor: the start of the output for a cursor past it, or the
+    /// oldest output retained when the guest reports one past the cursor.
+    At(u64),
+    /// At the oldest output retained, from a guest too old to report it: the
+    /// stream finds it once the process has exited
+    /// ([`exited_process_retained_start`]), and follows the live tail
+    /// otherwise.
+    Unlocated,
+    /// At the live tail, which a stream already following it fell behind.
+    LiveTail,
+}
+
+/// How a process stream at `cursor`, `None` while it follows the live tail,
+/// reopens after the window miss `status` reports. `None` leaves the refusal
+/// to end the stream. The guest can refuse a reopen the same way again, so
+/// the stream caps reopens without output at
+/// [`PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS`].
+pub(super) fn window_miss_reopen(
+    status: &tonic::Status,
+    cursor: Option<u64>,
+) -> Option<WindowMissReopen> {
+    match (output_window_miss(status)?, cursor) {
+        (OutputWindowMiss::CursorAhead, Some(cursor)) => {
+            (cursor > 0).then_some(WindowMissReopen::At(0))
+        }
+        (
+            OutputWindowMiss::Evicted {
+                first_retained: Some(first),
+            },
+            Some(cursor),
+        ) => (first > cursor).then_some(WindowMissReopen::At(first)),
+        (
+            OutputWindowMiss::Evicted {
+                first_retained: None,
+            },
+            Some(_),
+        ) => Some(WindowMissReopen::Unlocated),
+        (OutputWindowMiss::Evicted { .. }, None) => Some(WindowMissReopen::LiveTail),
+        (OutputWindowMiss::CursorAhead, None) => None,
+    }
+}
+
 pub(crate) async fn bridge_process_session(
     state: DataPlaneState,
     session_id: DataPlaneSessionId,
     mut attached: AttachedSession,
+    after_seq: Option<u64>,
     socket: WebSocket,
 ) -> Result<BridgeEnd, StreamBridgeError> {
     let shutdown_token = state.stream_shutdown_token.child_token();
     let (mut sink, mut source) = socket.split();
     let sandbox_id = attached.sandbox_id;
+    // Every output `seq` is the output's position in the guest's journal, so
+    // a client that attaches again on any replica with the last one it
+    // received continues after it. Without `after_seq` the stream starts at
+    // the beginning of the retained output, as an SSE stream does without
+    // `Last-Event-ID`, and so does an `after_seq` the stream numbered itself
+    // ([`UNPOSITIONED_SEQ_BASE`]), behind `resync_required`.
+    let resumes_unpositioned = after_seq.is_some_and(|seq| output_position(seq).is_none());
+    let mut output_seq = after_seq.and_then(output_position).unwrap_or(0);
     let open = open_native_process_stream(
         &state,
         session_id,
         &mut attached,
-        None,
+        Some(output_seq),
         ProcessInput::Writable,
     );
     // The deadline can pass while the backend stream is still opening.
@@ -530,8 +650,8 @@ pub(crate) async fn bridge_process_session(
         }
     };
     let mut source = futures_util::stream::iter(buffered.into_iter().map(Ok)).chain(source);
-    let mut stream = match initial {
-        Ok((_client, initial)) => initial,
+    let (mut client, mut stream) = match initial {
+        Ok(opened) => opened,
         Err(error) => {
             forget_route_of_refused_sandbox(&state.route_cache, session_id, &error);
             let _ =
@@ -540,14 +660,30 @@ pub(crate) async fn bridge_process_session(
             return Err(error);
         }
     };
-    let mut output_seq = 0_u64;
+    if resumes_unpositioned
+        && send_server_frame(
+            &mut sink,
+            &resync_required_frame(
+                attached.kind.as_str(),
+                DataPlaneResyncReason::CursorOutOfWindow,
+            ),
+        )
+        .await
+        .is_err()
+    {
+        return Ok(BridgeEnd::Completed);
+    }
     let mut process_id = attached.backend_process_id.clone();
     let mut process_bound = attached.backend_process_id.is_some();
     let mut binding: Option<PendingProcessBinding> = None;
     let mut revocation_tick = revocation_check_interval(&state);
-    // A backend reopened at the live tail can skip output the process wrote
-    // meanwhile, which `process_exited` then reports as `output_truncated`.
+    let mut keepalive = websocket_keepalive_interval(&state);
+    // Moving past output the guest no longer retains skips it, which
+    // `process_exited` then reports as `output_truncated`.
     let mut output_skipped = false;
+    // Reopens after a window miss since the last output, capped at
+    // `PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS`.
+    let mut window_reopens_without_progress = 0_u32;
 
     // Raced as a whole, as in `bridge_raw_service_session`, so a stalled
     // revocation check, route refresh, backend reopen or control RPC doesn't
@@ -569,6 +705,11 @@ pub(crate) async fn bridge_process_session(
                         return Ok(BridgeEnd::Completed);
                     }
                 }
+                _ = keepalive.tick() => {
+                    if sink.send(Message::Ping(bytes::Bytes::new())).await.is_err() {
+                        return Ok(BridgeEnd::Completed);
+                    }
+                }
                 bound = process_binding_settled(&mut binding) => bound?,
                 event = stream.next() => {
                     let Some(event) = event else {
@@ -585,6 +726,32 @@ pub(crate) async fn bridge_process_session(
                     };
                     match event {
                         Ok(event) => {
+                            let reported_start = match &event.event {
+                                Some(spaced_process_event::Event::Connected(connected)) => {
+                                    connected.output_cursor
+                                }
+                                _ => None,
+                            };
+                            // This attach started the process, so its output
+                            // begins here: the position the client resumed
+                            // from was another's. Output from the start
+                            // repeats rather than skips. A stream past any
+                            // position reopened at the live tail, so its
+                            // start is a reconnect's, not this attach's.
+                            if matches!(event.event, Some(spaced_process_event::Event::Started(_)))
+                                && output_position(output_seq).is_some_and(|seq| seq != 0)
+                            {
+                                output_seq = 0;
+                                send_server_frame(
+                                    &mut sink,
+                                    &resync_required_frame(
+                                        attached.kind.as_str(),
+                                        DataPlaneResyncReason::CursorOutOfWindow,
+                                    ),
+                                )
+                                .await
+                                .map_err(|_| StreamBridgeError::ClientClosed)?;
+                            }
                             if matches!(
                                 event.event,
                                 Some(spaced_process_event::Event::Started(_))
@@ -605,9 +772,22 @@ pub(crate) async fn bridge_process_session(
                             }
                             let batch = process_event_frames(event, &mut output_seq);
                             if batch.frames.iter().any(|frame| {
+                                matches!(
+                                    frame,
+                                    DataPlaneServerFrame::Stdout { .. }
+                                        | DataPlaneServerFrame::Stderr { .. }
+                                )
+                            }) {
+                                window_reopens_without_progress = 0;
+                            }
+                            if batch.frames.iter().any(|frame| {
                                 matches!(frame, DataPlaneServerFrame::ProcessExited { .. })
                             }) {
                                 settle_process_binding(&mut binding).await?;
+                                if let Some(process_id) = process_id.as_ref() {
+                                    record_session_process_exited(&state, session_id, process_id)
+                                        .await;
+                                }
                             }
                             record_process_output_bytes(attached.kind.as_str(), &batch);
                             for mut frame in batch.frames {
@@ -632,8 +812,79 @@ pub(crate) async fn bridge_process_session(
                                     return Ok(BridgeEnd::Completed);
                                 }
                             }
+                            // The guest started the stream at its oldest
+                            // retained output, past the output it evicted.
+                            if let Some(start) = reported_start
+                                && start > output_seq
+                            {
+                                output_seq = start;
+                                output_skipped = true;
+                                send_server_frame(
+                                    &mut sink,
+                                    &resync_required_frame(
+                                        attached.kind.as_str(),
+                                        DataPlaneResyncReason::CursorOutOfWindow,
+                                    ),
+                                )
+                                .await
+                                .map_err(|_| StreamBridgeError::ClientClosed)?;
+                            }
                         }
                         Err(status) => {
+                            if let Some(current_process_id) = process_id.clone()
+                                && window_reopens_without_progress
+                                    < PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS
+                                && let Some(reopen) =
+                                    window_miss_reopen(&status, output_position(output_seq))
+                            {
+                                let reopen_at = match reopen {
+                                    WindowMissReopen::At(cursor) => Some(cursor),
+                                    WindowMissReopen::LiveTail => None,
+                                    WindowMissReopen::Unlocated => tokio::time::timeout(
+                                        RETAINED_START_SEARCH_TIMEOUT,
+                                        exited_process_retained_start(
+                                            &mut client,
+                                            &attached.sandbox_id,
+                                            &current_process_id,
+                                            attached.space_api_route_token.as_ref(),
+                                            output_seq,
+                                            UNPOSITIONED_SEQ_BASE - 1,
+                                        ),
+                                    )
+                                    .await
+                                    .ok()
+                                    .flatten(),
+                                };
+                                // A restart from the start of the output
+                                // repeats output; a later cursor, or the live
+                                // tail, skips some.
+                                output_skipped |=
+                                    reopen_at.is_none_or(|cursor| cursor > output_seq);
+                                // The live tail's output gets `seq`s past any
+                                // position.
+                                output_seq =
+                                    reopen_at.unwrap_or(output_seq.max(UNPOSITIONED_SEQ_BASE));
+                                window_reopens_without_progress += 1;
+                                send_server_frame(
+                                    &mut sink,
+                                    &resync_required_frame(
+                                        attached.kind.as_str(),
+                                        DataPlaneResyncReason::CursorOutOfWindow,
+                                    ),
+                                )
+                                .await
+                                .map_err(|_| StreamBridgeError::ClientClosed)?;
+                                stream = connect_process_stream(
+                                    &mut client,
+                                    &attached.sandbox_id,
+                                    &current_process_id,
+                                    reopen_at,
+                                    attached.space_api_route_token.as_ref(),
+                                )
+                                .await
+                                .map_err(process_not_retained)?;
+                                continue;
+                            }
                             if (status.code() == tonic::Code::Unavailable
                                 || is_refreshable_route_identity_rejection(&status))
                                 && let Some(current_process_id) = process_id.clone()
@@ -661,39 +912,33 @@ pub(crate) async fn bridge_process_session(
                                     attached.route_generation,
                                 )
                                 .await?;
+                                // The reopened stream continues where this
+                                // one stopped, or at the live tail it followed.
                                 let reopened = async {
                                     let channel = state
                                         .backend_channels
                                         .channel(&refreshed.backend_endpoint, session_id).await?;
                                     let mut reconnect_client =
                                         WorkerApiClient::new(wrap_grpc_client_channel(channel));
-                                    connect_process_stream(
+                                    let stream = connect_process_stream(
                                         &mut reconnect_client,
                                         &refreshed.sandbox_id,
                                         &current_process_id,
-                                        None,
+                                        output_position(output_seq),
                                         refreshed.space_api_route_token.as_ref(),
                                     )
-                                    .await
+                                    .await?;
+                                    Ok((reconnect_client, stream))
                                 }
                                 .await;
-                                stream = finish_native_stream_refresh(refresh_dimension, reopened)?;
+                                (client, stream) =
+                                    finish_native_stream_refresh(refresh_dimension, reopened)?;
                                 send_server_frame(
                                     &mut sink,
                                     &DataPlaneServerFrame::BackendReconnected {
                                         route_generation: refreshed.route_generation,
                                         current_node_id: refreshed.current_node_id.to_string(),
                                     },
-                                )
-                                .await
-                                .map_err(|_| StreamBridgeError::ClientClosed)?;
-                                output_skipped = true;
-                                send_server_frame(
-                                    &mut sink,
-                                    &resync_required_frame(
-                                        attached.kind.as_str(),
-                                        DataPlaneResyncReason::ProcessStreamReconnected,
-                                    ),
                                 )
                                 .await
                                 .map_err(|_| StreamBridgeError::ClientClosed)?;
@@ -757,13 +1002,13 @@ pub(crate) async fn bridge_process_session(
                                     let channel = state
                                         .backend_channels
                                         .channel(&refreshed.backend_endpoint, session_id).await?;
-                                    let mut reconnect_client =
+                                    client =
                                         WorkerApiClient::new(wrap_grpc_client_channel(channel));
                                     stream = connect_process_stream(
-                                        &mut reconnect_client,
+                                        &mut client,
                                         &refreshed.sandbox_id,
                                         &current_process_id,
-                                        None,
+                                        output_position(output_seq),
                                         refreshed.space_api_route_token.as_ref(),
                                     )
                                     .await?;
@@ -773,16 +1018,6 @@ pub(crate) async fn bridge_process_session(
                                             route_generation: refreshed.route_generation,
                                             current_node_id: refreshed.current_node_id.to_string(),
                                         },
-                                    )
-                                    .await
-                                    .map_err(|_| StreamBridgeError::ClientClosed)?;
-                                    output_skipped = true;
-                                    send_server_frame(
-                                        &mut sink,
-                                        &resync_required_frame(
-                                            attached.kind.as_str(),
-                                            DataPlaneResyncReason::ProcessStreamReconnected,
-                                        ),
                                     )
                                     .await
                                     .map_err(|_| StreamBridgeError::ClientClosed)?;
@@ -873,6 +1108,7 @@ pub(crate) async fn bridge_file_watch_session(
     };
     let mut event_seq = 0_u64;
     let mut revocation_tick = revocation_check_interval(&state);
+    let mut keepalive = websocket_keepalive_interval(&state);
 
     // Raced as a whole, as in `bridge_raw_service_session`.
     let session = async {
@@ -889,6 +1125,11 @@ pub(crate) async fn bridge_file_watch_session(
                         .await
                         .map_err(|_| StreamBridgeError::ClientClosed)?;
                         let _ = sink.close().await;
+                        return Ok(BridgeEnd::Completed);
+                    }
+                }
+                _ = keepalive.tick() => {
+                    if sink.send(Message::Ping(bytes::Bytes::new())).await.is_err() {
                         return Ok(BridgeEnd::Completed);
                     }
                 }

@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # Run the portable typed smoke inventory against the local Kind/Firecracker stack.
 # Usage: scripts/tests/smoke-kind-typed.sh [all|ecw|network_policy|local|native] [INDEX/COUNT]
+#        scripts/tests/smoke-kind-typed.sh SCENARIO_ID
+#   A scenario ID (one with a dot, such as local.no_free_slot_refuses_cold_create)
+#   runs that one scenario (including manual-tier ones, which run only by name),
+#   with its category target's preparation: native.* and native_*.* on the
+#   native API surface, local.* on the ECW surface, and any other ID on
+#   SPACE_SMOKE_API_SURFACE (defaulting to ecw). node.* IDs are refused.
+#   It takes no shard.
 #   Every target needs an admin session token: SPACE_API_TOKEN, or
 #   SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE to read one from, or the seeded root
 #   account this script logs in as when neither is set.
@@ -154,7 +161,7 @@ ensure_build_foreign_org() {
   done
   local admin="${API_URL:-http://127.0.0.1:8080}/admin/api/v1"
   admin_call() {
-    local args=(-fsS -X "$1" "$admin/$2"
+    local args=(-fsS --connect-timeout 5 --max-time 30 -X "$1" "$admin/$2"
       -H "Authorization: Bearer $token"
       -H 'Content-Type: application/json'
       -H "Idempotency-Key: $(cat /proc/sys/kernel/random/uuid)")
@@ -237,9 +244,84 @@ case "$TARGET" in
     env SPACE_SMOKE_API_SURFACE=ecw uv run "$UV_LOCK_MODE" --python 3.11 -m space_smoke run --category "$TARGET" "${SHARD_ARGS[@]}"
     exit $?
     ;;
+  *.*)
+    if (( ${#SHARD_ARGS[@]} > 0 )); then
+      echo "ERROR: a single scenario takes no shard: $TARGET" >&2
+      exit 2
+    fi
+    # The same preparation its category target does, so a scenario run by
+    # name finds the prerequisites a category run would have provisioned.
+    # Validate the scenario ID, backend, API surface, and Kind substrate
+    # before minting admin credentials or seeding test organizations.
+    surface="${SPACE_SMOKE_API_SURFACE:-ecw}"
+    case "$TARGET" in
+      node.*)
+        echo "ERROR: node.* scenarios target a standalone node bench, not smoke-kind-typed.sh: $TARGET" >&2
+        exit 2
+        ;;
+      native.*|native_*.*)
+        surface=native
+        ;;
+      local.*)
+        surface=ecw
+        ;;
+    esac
+    # shellcheck source=../../infra/space/kind/lib/substrate.sh
+    source "$REPO_ROOT/infra/space/kind/lib/substrate.sh"
+    deployed_substrate="$(space_kind_deployed_substrate "${KIND_CLUSTER:-space-local}")" || exit 2
+    uv run "$UV_LOCK_MODE" --python 3.11 python -c '
+import sys
+from space_smoke.scenarios import REGISTRY
+
+target, surface, deployed_substrate = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    scenario = REGISTRY.get(target)
+except KeyError:
+    print(f"ERROR: unknown smoke scenario: {target}", file=sys.stderr)
+    raise SystemExit(2) from None
+if "kind" not in scenario.backends:
+    backends = ", ".join(sorted(scenario.backends))
+    print(f"ERROR: {target} runs only on backend(s) {backends}, not kind", file=sys.stderr)
+    raise SystemExit(2)
+if surface not in scenario.api_surfaces:
+    surfaces = ", ".join(sorted(scenario.api_surfaces))
+    print(f"ERROR: {target} supports API surface(s) {surfaces}, not {surface}", file=sys.stderr)
+    raise SystemExit(2)
+if deployed_substrate and deployed_substrate not in scenario.substrates:
+    substrates = ", ".join(sorted(scenario.substrates))
+    print(
+        f"ERROR: {target} runs only on substrate(s) {substrates}, "
+        f"not the deployed {deployed_substrate} Kind bench",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+' "$TARGET" "$surface" "$deployed_substrate"
+    case "$TARGET" in
+      native.*|native_*.*)
+        prepare_native_kind
+        ;;
+      local.*)
+        resolve_admin_token
+        ensure_build_foreign_org
+        ;;
+      *)
+        if [[ "$surface" == native ]]; then
+          prepare_native_kind
+        else
+          resolve_admin_token
+        fi
+        ;;
+    esac
+    echo "--- typed smoke on the ${surface} API surface"
+    echo "=== RUN ${TARGET} ==="
+    rc=0
+    env SPACE_SMOKE_API_SURFACE="$surface" uv run "$UV_LOCK_MODE" --python 3.11 -m space_smoke run "$TARGET" || rc=$?
+    echo "=== END ${TARGET} (exit ${rc}) ==="
+    exit "$rc"
+    ;;
   *)
     echo "ERROR: unknown typed smoke target: $TARGET" >&2
-    echo "       use all, ecw, network_policy, local, or native" >&2
+    echo "       use all, ecw, network_policy, local, native, or a scenario ID" >&2
     exit 2
     ;;
 esac

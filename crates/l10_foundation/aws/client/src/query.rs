@@ -25,6 +25,8 @@ pub enum AwsClientError {
     Signing(#[from] aws_sigv4::http_request::SigningError),
     #[error("failed to build AWS HTTP request: {0}")]
     HttpBuild(#[from] http::Error),
+    #[error("AWS endpoint is not a valid URL: {0}")]
+    EndpointUrl(#[from] url::ParseError),
     #[error("AWS HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
     #[error("failed to convert AWS HTTP header to UTF-8: {0}")]
@@ -207,16 +209,20 @@ impl<T: QueryTransport> AwsQueryClient<T> {
         }
     }
 
-    pub(crate) async fn send_action(
+    pub(crate) async fn send_action<K: AsRef<str>>(
         &self,
         action: &'static str,
         version: &'static str,
-        params: Vec<(&'static str, String)>,
+        params: Vec<(K, String)>,
     ) -> Result<String, AwsClientError> {
         let mut all_params = Vec::with_capacity(params.len() + 2);
         all_params.push(("Action", action.to_string()));
         all_params.push(("Version", version.to_string()));
-        all_params.extend(params);
+        all_params.extend(
+            params
+                .iter()
+                .map(|(name, value)| (name.as_ref(), value.clone())),
+        );
 
         let body = encode_form(&all_params);
         let request = self.sign_request(body).await?;
@@ -228,11 +234,11 @@ impl<T: QueryTransport> AwsQueryClient<T> {
     }
 
     async fn sign_request(&self, body: String) -> Result<Request<Vec<u8>>, AwsClientError> {
-        let endpoint = self.endpoint()?;
+        let target = self.target()?;
         let bytes = body.into_bytes();
         let mut request = Request::builder()
             .method("POST")
-            .uri(endpoint.as_str())
+            .uri(target.as_str())
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(bytes)?;
 
@@ -273,7 +279,7 @@ impl<T: QueryTransport> AwsQueryClient<T> {
             .collect::<Result<Vec<_>, _>>()?;
         let signable_request = SignableRequest::new(
             "POST",
-            endpoint,
+            target.as_str(),
             header_pairs.into_iter(),
             SignableBody::Bytes(request.body()),
         )?;
@@ -281,6 +287,14 @@ impl<T: QueryTransport> AwsQueryClient<T> {
             sign_http_request(signable_request, &signing_params)?.into_parts();
         instructions.apply_to_request_http1x(&mut request);
         Ok(request)
+    }
+
+    /// The endpoint as url serializes it, which is the target reqwest sends.
+    fn target(&self) -> Result<reqwest::Url, AwsClientError> {
+        let endpoint = self.endpoint()?;
+        // http's parser keeps rejecting what it rejected before url could repair it.
+        endpoint.parse::<http::Uri>().map_err(http::Error::from)?;
+        Ok(reqwest::Url::parse(&endpoint)?)
     }
 
     fn endpoint(&self) -> Result<String, AwsClientError> {

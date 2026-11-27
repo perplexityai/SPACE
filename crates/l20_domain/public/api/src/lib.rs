@@ -4,16 +4,18 @@
 //! plane. It depends on common domain nouns, but common domain crates do not
 //! depend on these wire contracts.
 
-use pplx_space_common_core::types::SnapshotId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::{collections::BTreeMap, fmt, str::FromStr};
 
-use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, EnvMap, RuntimeKind, SandboxAutoLifecyclePatch, SandboxId,
-    SandboxLifecycle, SimpleDuration, TemplateReference,
-};
-pub use pplx_space_common_core::types::{IdempotencyKey, ProcessId};
+use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, SandboxAutoLifecyclePatch};
+use pplx_space_durations::SimpleDuration;
+use pplx_space_execution_spec::RuntimeKind;
+use pplx_space_guest_process::EnvMap;
+pub use pplx_space_guest_process::{IdempotencyKey, ProcessId};
 use pplx_space_net_common::NetworkPolicyV1;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+use pplx_space_template_model::TemplateReference;
 use uuid::Uuid;
 
 #[cfg(feature = "serde")]
@@ -270,8 +272,12 @@ macro_rules! closed_wire_enum_impls {
             where
                 D: Deserializer<'de>,
             {
+                // serde's own unknown-variant error, which names the values
+                // it expected; the API answers it without the value sent.
                 let value = String::deserialize(deserializer)?;
-                value.parse().map_err(de::Error::custom)
+                value
+                    .parse()
+                    .map_err(|_| de::Error::unknown_variant(&value, Self::KNOWN_VALUES))
             }
         }
     };
@@ -1703,7 +1709,9 @@ pub struct CreateCommandRequest {
     /// `Accept: text/event-stream`, even one that never reads input, and
     /// `/sessions/{session_id}/events` refuses to start it. Only a WebSocket
     /// attach can start it; after the WebSocket detaches, `/events` can
-    /// reconnect and read its output.
+    /// reconnect and read its output. It starts with `TERM=xterm-256color`
+    /// and `LANG=C.UTF-8` unless the sandbox's environment or `env` sets
+    /// them; sandboxes from older templates set neither.
     pub pty: Option<TerminalSize>,
     /// Keeps standard input open for a WebSocket attach to write. Server-sent
     /// events carry no input, so when `/sessions/{session_id}/events` starts
@@ -2056,8 +2064,18 @@ pub struct PublicCommand {
         schemars(schema_with = "schema::public_sandbox_id")
     )]
     pub sandbox_id: PublicSandboxId,
-    /// Session state, not proof of command success. Read the process_exited
-    /// event and exit result from the command's stream.
+    /// Session state, not proof of command success: `pending` until an
+    /// attach starts the command, `open` while it runs, and `closed` once an
+    /// attached stream records its exit. The stream sends `process_exited`
+    /// without waiting long for that record, so `closed` does not mean the
+    /// client received `process_exited`, and a read right after the exit can
+    /// still return `open`. A command can stay `open` after it exits: when no
+    /// stream was attached at the exit, or the exit could not be recorded. A
+    /// later attach that still reads the exit can close it. A command that a
+    /// data plane without this tracking started reads `pending` while it
+    /// runs, and can go from `pending` to `closed`. A closed session stays
+    /// readable until it expires. A revoked session is `revoked`. Read the
+    /// process_exited event and exit result from the command's stream.
     pub state: SessionState,
     /// Attachment destination and credentials when available.
     pub attach: Option<DataPlaneAttachInfo>,
@@ -2135,14 +2153,22 @@ pub struct PublicErrorEnvelope {
     /// `not_found`, including a missing or unowned sandbox, carries none. A
     /// `conflict` from replaying a session create whose session has ended
     /// carries `{"key": "reason", "value": "session_ended"}`. A `conflict`
-    /// refusing a command because the sandbox is not running carries `reason`
+    /// refusing a command, or a file or process request, because the sandbox
+    /// is not running carries `reason`
     /// (`sandbox_not_running`), `state` (the sandbox's lifecycle state) and,
     /// unless the sandbox is deleting or failed, `wake` (the request that
-    /// returns it to running). An `invalid_request` for a command streamed
+    /// returns it to running). An `invalid_request` for a command the sandbox
+    /// could not start carries `reason` (`command_not_started`) and, when the
+    /// sandbox says which, `field` (`command`, `cwd` or `user`). An
+    /// `invalid_request` for a command streamed
     /// with a `pty` carries `{"key": "field", "value": "pty"}`. An
     /// `invalid_request` for a sandbox create or update field outside its limit
     /// carries `{"key": "field", "value": "<field>"}`, such as `metadata` or
-    /// `resources.vcpu`.
+    /// `resources.vcpu`, and so does a 422 for a body value of the wrong
+    /// type when the body's decoder reports its path (`command[1]`,
+    /// `env.NAME`). A missing field, or one inside an internally tagged object
+    /// such as a credential reference, carries no field detail; the message
+    /// says what is wrong.
     pub details: Vec<PublicErrorDetail>,
 }
 
@@ -2214,8 +2240,42 @@ pub const INVALID_REQUEST_FIELD_DETAIL_KEY: &str = "field";
 /// command created with `Accept: text/event-stream` and a `pty`.
 pub const INVALID_REQUEST_FIELD_PTY: &str = "pty";
 
-/// [`PublicErrorDetail::key`] naming why a `conflict` was refused.
+/// [`PublicErrorDetail::key`] naming why a `conflict`, or an
+/// `invalid_request` such as [`INVALID_REQUEST_REASON_COMMAND_NOT_STARTED`],
+/// was refused.
 pub const CONFLICT_REASON_DETAIL_KEY: &str = "reason";
+
+/// [`CONFLICT_REASON_DETAIL_KEY`] value of an `invalid_request` for a
+/// command the sandbox could not start: its executable, working directory
+/// or user cannot be used. [`INVALID_REQUEST_FIELD_DETAIL_KEY`] names which
+/// when the sandbox says ([`CommandStartField`]); guests from older
+/// templates do not.
+pub const INVALID_REQUEST_REASON_COMMAND_NOT_STARTED: &str = "command_not_started";
+
+/// The request field a command could not be started with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandStartField {
+    Command,
+    Cwd,
+    User,
+}
+
+impl CommandStartField {
+    /// The field's name in the command and session create requests.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::Cwd => "cwd",
+            Self::User => "user",
+        }
+    }
+}
+
+impl fmt::Display for CommandStartField {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 /// [`CONFLICT_REASON_DETAIL_KEY`] value of a `conflict` for replaying a
 /// session create whose session was revoked, has expired or is no longer
@@ -2247,6 +2307,9 @@ pub struct DataPlaneHttpError {
     /// Bounded typed details, as on [`PublicErrorEnvelope::details`]; omitted
     /// when there are none. A `conflict` refusing to start a command because
     /// the sandbox is not running carries the same details as `createCommand`.
+    /// An `invalid_request` for a command the sandbox could not start carries
+    /// `reason` (`command_not_started`) and, when the sandbox says which,
+    /// `field` (`command`, `cwd` or `user`).
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Vec::is_empty")

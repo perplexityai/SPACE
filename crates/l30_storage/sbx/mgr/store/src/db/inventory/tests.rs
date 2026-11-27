@@ -1,7 +1,7 @@
 use super::*;
 use crate::db::fixture::insert_test_sandbox;
 use crate::state::SandboxState;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 #[test]
 fn orphan_scope_sweep_bounds_discovery_and_progresses_past_retained_rows() {
@@ -11,7 +11,7 @@ fn orphan_scope_sweep_bounds_discovery_and_progresses_past_retained_rows() {
         crate::db::insert_restore_transfer_scope(
             &conn,
             &id,
-            pplx_space_common_core::types::TransferScopeId::new(),
+            pplx_space_snapshot_model::TransferScopeId::new(),
             None,
             None,
             "/retained/staging",
@@ -27,7 +27,7 @@ fn orphan_scope_sweep_bounds_discovery_and_progresses_past_retained_rows() {
         crate::db::insert_restore_transfer_scope(
             &conn,
             &SandboxId::new().to_string(),
-            pplx_space_common_core::types::TransferScopeId::new(),
+            pplx_space_snapshot_model::TransferScopeId::new(),
             None,
             None,
             "/retained/staging",

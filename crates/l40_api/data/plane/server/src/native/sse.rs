@@ -68,7 +68,16 @@ pub(crate) async fn session_events(
         }
     };
 
-    let attached = match resolve_attach_route(&state, session_id, &token).await {
+    // The wait for a sandbox on its way to a route can be long; a drain that
+    // starts during it sends the client to another replica at once.
+    let attached = tokio::select! {
+        biased;
+        () = state.drain_started.cancelled() => {
+            return native_draining_response(session_id.kind().as_str());
+        }
+        attached = resolve_attach_route(&state, session_id, &token) => attached,
+    };
+    let attached = match attached {
         Ok(attached) => attached,
         Err(error) => {
             crate::metrics::attach(session_id.kind().as_str(), error.metric_label());
@@ -89,18 +98,7 @@ pub(crate) async fn session_events(
     let sandbox_id = attached.sandbox_id;
     let stream_state = match attached.kind {
         SessionKind::Process => {
-            // Only a forged id leaves no later id to number the stream with.
-            let Some(replay) = ProcessReplayState::load(last_event_id) else {
-                crate::metrics::attach(session_id.kind().as_str(), "invalid_last_event_id");
-                return data_plane_http_error(
-                    StatusCode::BAD_REQUEST,
-                    DataPlaneHttpErrorCode::InvalidRequest,
-                    "last-event-id is past every event id this stream can send",
-                    false,
-                    ResponseOrigin::Client,
-                    ResponseKind::Validation,
-                );
-            };
+            let replay = ProcessReplayState::load(last_event_id);
             let start_permit = match state.native_sessions.try_acquire(session_id, attached.kind) {
                 Ok(permit) => permit,
                 Err(()) => {
@@ -347,7 +345,7 @@ const PROCESS_EVENT_ID_FIELD_BITS: u32 = PROCESS_EVENT_ID_TAG_BIT - PROCESS_EVEN
 const PROCESS_EVENT_ID_FIELD_MASK: u64 = (1 << PROCESS_EVENT_ID_FIELD_BITS) - 1;
 pub(super) const PROCESS_EVENT_ID_MAX_FRAME: u64 = (1 << PROCESS_EVENT_ID_FRAME_BITS) - 1;
 const PROCESS_EVENT_ID_UNKNOWN: u64 = 1 << (PROCESS_EVENT_ID_FIELD_BITS - 1);
-const PROCESS_EVENT_ID_MAX_POSITION: u64 = PROCESS_EVENT_ID_UNKNOWN - 1;
+pub(super) const PROCESS_EVENT_ID_MAX_POSITION: u64 = PROCESS_EVENT_ID_UNKNOWN - 1;
 /// The highest block a resumed stream starts in: half the blocks, so every
 /// stream has at least 2^(field + frame - 2) = 2^34 ids left to send.
 const PROCESS_EVENT_ID_MAX_RESUME_BLOCK: u64 = 1 << (PROCESS_EVENT_ID_FIELD_BITS - 2);
@@ -478,30 +476,37 @@ impl ProcessReplayState {
     /// an id without one also replays from the start, behind
     /// `resync_required(cursor_replay_unavailable)`, as output the client
     /// already has may repeat. Every id the stream sends is above
-    /// `Last-Event-ID`; `None` when no id can be (see
-    /// [`ProcessEventId::first_after`]).
-    fn load(last_event_id: Option<u64>) -> Option<Self> {
+    /// `Last-Event-ID` while each cursor the session resumed from is one a
+    /// process stream sent. An id too high for any later id (see
+    /// [`ProcessEventId::first_after`]) was never sent, so its replay is
+    /// numbered from the start of the output and a resume from those ids is
+    /// exact. A forged id just below that limit replays in the last resume
+    /// block, whose ids are themselves too high, so the resume after it
+    /// restarts the numbering the same way.
+    fn load(last_event_id: Option<u64>) -> Self {
         let Some(last_event_id) = last_event_id else {
-            return Some(Self {
+            return Self {
                 event_id: ProcessEventId::START,
                 backend_output_cursor: 0,
                 resync: None,
-            });
+            };
         };
         if let Some(event_id @ ProcessEventId::Position { position, .. }) =
             ProcessEventId::decode(last_event_id)
         {
-            return Some(Self {
+            return Self {
                 event_id,
                 backend_output_cursor: position,
                 resync: None,
-            });
+            };
         }
-        Some(Self {
-            event_id: ProcessEventId::first_after(last_event_id)?.next(Some(0)),
+        Self {
+            event_id: ProcessEventId::first_after(last_event_id)
+                .unwrap_or(ProcessEventId::START)
+                .next(Some(0)),
             backend_output_cursor: 0,
             resync: Some(DataPlaneResyncReason::CursorReplayUnavailable),
-        })
+        }
     }
 }
 
@@ -704,6 +709,7 @@ impl ProcessSseState {
                         &process_id,
                         self.attached.space_api_route_token.as_ref(),
                         cursor,
+                        PROCESS_EVENT_ID_MAX_POSITION,
                     ),
                 )
                 .await
@@ -940,10 +946,19 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                             .frames
                             .iter()
                             .any(|frame| matches!(frame, DataPlaneServerFrame::ProcessExited { .. }))
-                            && let Err(error) = settle_process_binding(&mut state.binding).await
                         {
-                            state.finish_with_error(error);
-                            return state.pending.pop_front();
+                            if let Err(error) = settle_process_binding(&mut state.binding).await {
+                                state.finish_with_error(error);
+                                return state.pending.pop_front();
+                            }
+                            if let Some(process_id) = state.process_id.as_ref() {
+                                record_session_process_exited(
+                                    &state.state,
+                                    state.session_id,
+                                    process_id,
+                                )
+                                .await;
+                            }
                         }
                         record_process_output_bytes(state.session_id.kind().as_str(), &batch);
                         for frame in batch.frames {
@@ -1019,12 +1034,12 @@ fn process_frame_has_event_id(frame: &DataPlaneServerFrame) -> bool {
 /// continues at the live tail. A cursor past the output restarts at the
 /// start, which a guest may in turn report as evicted, so two in a row are
 /// expected.
-const PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS: u32 = 3;
+pub(super) const PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS: u32 = 3;
 
 /// Why the guest ended a process stream because its cursor is outside the
 /// output it retains.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OutputWindowMiss {
+pub(super) enum OutputWindowMiss {
     /// The cursor is past the output the process has written.
     CursorAhead,
     /// The output at the cursor was evicted. `first_retained` is the cursor
@@ -1037,26 +1052,30 @@ enum OutputWindowMiss {
 /// those tags, a RESOURCE_EXHAUSTED with its lag message. Other statuses with
 /// these codes (a hop's refusal of an oversized chunk, an HTTP/2 reset) are
 /// not misses.
-fn output_window_miss(status: &tonic::Status) -> Option<OutputWindowMiss> {
-    use pplx_space_common_core::spaced;
+pub(super) fn output_window_miss(status: &tonic::Status) -> Option<OutputWindowMiss> {
+    use pplx_space_guest_process::status::{
+        ERROR_REASON_METADATA_KEY, PROCESS_OUTPUT_CURSOR_AHEAD,
+        PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY, PROCESS_OUTPUT_LAGGED,
+        PROCESS_OUTPUT_LAGGED_MESSAGE,
+    };
     let metadata = status.metadata();
     let reason = metadata
-        .get(spaced::ERROR_REASON_METADATA_KEY)
+        .get(ERROR_REASON_METADATA_KEY)
         .and_then(|value| value.to_str().ok());
     match (status.code(), reason) {
-        (tonic::Code::OutOfRange, Some(spaced::PROCESS_OUTPUT_CURSOR_AHEAD)) => {
+        (tonic::Code::OutOfRange, Some(PROCESS_OUTPUT_CURSOR_AHEAD)) => {
             Some(OutputWindowMiss::CursorAhead)
         }
-        (tonic::Code::ResourceExhausted, Some(spaced::PROCESS_OUTPUT_LAGGED)) => {
+        (tonic::Code::ResourceExhausted, Some(PROCESS_OUTPUT_LAGGED)) => {
             Some(OutputWindowMiss::Evicted {
                 first_retained: metadata
-                    .get(spaced::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY)
+                    .get(PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY)
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| value.parse().ok()),
             })
         }
         (tonic::Code::ResourceExhausted, None)
-            if status.message() == spaced::PROCESS_OUTPUT_LAGGED_MESSAGE =>
+            if status.message() == PROCESS_OUTPUT_LAGGED_MESSAGE =>
         {
             Some(OutputWindowMiss::Evicted {
                 first_retained: None,
@@ -1070,7 +1089,7 @@ fn output_window_miss(status: &tonic::Status) -> Option<OutputWindowMiss> {
 /// long its whole search may: a few dozen connects at most, each a round trip
 /// to the guest, so a guest slower than this follows the live tail instead.
 const RETAINED_START_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-const RETAINED_START_SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const RETAINED_START_SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Where the output that an exited process still retains starts, asked of a
 /// guest too old to say so: it ends a stream from an evicted cursor with a
@@ -1081,13 +1100,15 @@ const RETAINED_START_SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// past the output, which such a guest answers with the exit), then bisects,
 /// one connect per cursor. Such a guest lists only running processes, so one
 /// it lists is still running; that, or any answer other than these, gives
-/// `None`, and the stream follows the live tail as before.
-async fn exited_process_retained_start(
+/// `None`, and the stream follows the live tail as before. So does a start
+/// above `max_position`, the highest cursor the caller can number output from.
+pub(super) async fn exited_process_retained_start(
     client: &mut WorkerApiClient<GrpcClientTrace<Channel>>,
     sandbox_id: &SandboxId,
     process_id: &ProcessId,
     route_token: Option<&SpaceApiRouteTokenState>,
     evicted: u64,
+    max_position: u64,
 ) -> Option<u64> {
     let request = node_api_request_with_timeout_and_route_token_state(
         SpacedListProcessesRequest {
@@ -1118,7 +1139,7 @@ async fn exited_process_retained_start(
     let mut retained = loop {
         let cursor = below
             .checked_add(step)
-            .filter(|cursor| *cursor <= PROCESS_EVENT_ID_MAX_POSITION)?;
+            .filter(|cursor| *cursor <= max_position)?;
         if output_retained_at(client, sandbox_id, process_id, route_token, cursor).await? {
             break cursor;
         }

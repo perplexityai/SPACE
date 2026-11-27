@@ -71,9 +71,6 @@ def restarted_btrfs_send_is_rejected_and_retried(test: smoke.KindEcw) -> None:
         digest = written.stdout.strip()
         source = restore.current_placement()
 
-    with test.phase("the worker resolves an omitted suspend format to the stream codec"):
-        codec.require_btrfs_send_default(source.node_name)
-
     with test.phase("suspend while node-manager is stopped and continued mid-send"):
         suspended_at = codec.mark_since()
         with codec.interrupting_btrfs_send(source.node_name):

@@ -4,10 +4,11 @@ use crate::proto::builder_api_server::BuilderApi;
 use crate::proto::{
     BuildTemplateResponse, TriggerStateReconciliationRequest, TriggerStateReconciliationResponse,
 };
+use pplx_space_accounts::NodeId;
 use pplx_space_build_mgr_client::proto as build_proto;
-use pplx_space_common_core::types::{NodeId, SystemTemplate};
 use pplx_space_common_grpc::{RequestAdmission, fwd_retry};
 use pplx_space_rpc_auth::build::authorize_template_build;
+use pplx_space_template_model::SystemTemplate;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tonic::{Code, Request, Response, Status};

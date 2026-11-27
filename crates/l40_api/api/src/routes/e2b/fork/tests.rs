@@ -1,6 +1,6 @@
-use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
 
-use pplx_space_common_core::types::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
+use pplx_space_accounts::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
 use pplx_space_db_test_fixtures::pg_test_db;
 use pplx_space_public_api::PublicErrorCode;
 
@@ -125,7 +125,7 @@ async fn federated_replay_uses_the_owner_organization_namespace() -> TestResult 
         org_id: UpstreamOrgId::parse("upstream-org")?,
         subject_id: UpstreamSubjectId::parse("upstream-user")?,
     };
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "INSERT INTO organizations (
              id, name, slug, owner_source, upstream_issuer, upstream_org_id
          )
@@ -187,20 +187,14 @@ async fn invalid_federated_grant_does_not_materialize_owner_namespace() -> TestR
     .expect_err("a federated fork without a service grant is unauthorized");
     assert_eq!(error.status, StatusCode::UNAUTHORIZED);
 
-    let owner_org_exists: bool = sqlx::query_scalar(pplx_space_common_core::sql!(
-        "SELECT EXISTS (
-             SELECT 1 FROM organizations
-             WHERE owner_source = 'federated_identity'
-               AND upstream_issuer = $1
-               AND upstream_org_id = $2
-         )"
-    ))
-    .bind(owner.issuer.as_str())
-    .bind(owner.org_id.as_str())
-    .fetch_one(&db.pool)
+    let owner_org = pplx_space_accounts_store::organizations::federated_organization_id(
+        &db.pool,
+        owner.issuer.as_str(),
+        owner.org_id.as_str(),
+    )
     .await?;
     assert!(
-        !owner_org_exists,
+        owner_org.is_none(),
         "unauthorized fork persisted its owner org"
     );
     Ok(())
@@ -274,7 +268,7 @@ async fn completed_fork_is_observed_within_one_second_without_busy_polling() {
 /// semantics: no federated owner, so the child lands in the key's org.
 #[test]
 fn legacy_local_fork_source_drops_the_federated_owner() {
-    use pplx_space_common_core::types::SandboxOwnerSource;
+    use pplx_space_accounts::SandboxOwnerSource;
 
     let owner = crate::federated_identity::FederatedOwner {
         issuer: UpstreamIssuer::parse("example-issuer").unwrap(),

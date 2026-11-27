@@ -1,12 +1,13 @@
 use super::{
     AdminUserResponse, CreateSandboxRequest, CreateTemplateRequest, SandboxFederatedServiceGrant,
-    SandboxMetadataValue, SandboxResponse, UpdateOrgRequest, UpdateSandboxRequest,
-    UpdateTemplateRequest, UpdateUserRequest, User,
+    SandboxResponse, UpdateOrgRequest, UpdateSandboxRequest, UpdateTemplateRequest,
+    UpdateUserRequest, User,
 };
 use crate::user_role::UserRole;
-use pplx_space_common_core::types::{
-    OrgId, SandboxAutoLifecyclePatch, SandboxId, SandboxOwnerSource, UserId,
-};
+use pplx_space_accounts::{OrgId, SandboxOwnerSource, UserId};
+use pplx_space_auto_lifecycle::SandboxAutoLifecyclePatch;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sandbox_store::SandboxMetadataValue;
 use time::OffsetDateTime;
 
 #[test]

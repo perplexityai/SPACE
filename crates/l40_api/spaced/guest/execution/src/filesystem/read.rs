@@ -1,5 +1,5 @@
 use crate::GuestFileChunkStream;
-use pplx_space_common_core::types::GuestPath;
+use pplx_space_guest_process::GuestPath;
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::FileChunk;
 use tokio::io::AsyncReadExt;
 use tokio::sync::OwnedSemaphorePermit;

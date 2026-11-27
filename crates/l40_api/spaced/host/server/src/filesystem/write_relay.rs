@@ -2,9 +2,9 @@ use std::future::Future;
 
 use futures_util::{Stream, StreamExt};
 use pplx_space_common_grpc::{UploadBody, upload_channel};
-use pplx_space_spaced_common::filesystem_limits::{WRITE_BUFFER_FRAMES, WRITE_CHUNK_BYTES};
-use pplx_space_spaced_common::proto::operations::WriteRequest;
-use pplx_space_spaced_common::proto::operations::write_request::Message;
+use pplx_space_spaced_guest_protocol::filesystem_limits::{WRITE_BUFFER_FRAMES, WRITE_CHUNK_BYTES};
+use pplx_space_spaced_guest_protocol::proto::operations::WriteRequest;
+use pplx_space_spaced_guest_protocol::proto::operations::write_request::Message;
 use tonic::Status;
 
 #[derive(Debug, thiserror::Error)]

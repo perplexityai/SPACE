@@ -1,9 +1,9 @@
-use pplx_space_common_core::{
-    sql,
-    types::{SandboxId, SubstrateKind},
-};
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_node_registration_store::direct::registry as direct_registry;
+use pplx_space_sandbox_model::SandboxId;
 use std::time::{Duration, Instant};
 
+use pplx_space_node_registration_store::direct;
 use pplx_space_sandbox_store::tombstone;
 use sqlx::PgPool;
 use tokio::time::MissedTickBehavior;
@@ -45,6 +45,9 @@ pub struct TickReport {
     pub direct_nodes_deleted: u64,
     pub templates_deleted: u64,
     pub deleted_sandboxes_deleted: u64,
+    /// Snapshot storage locations the sandbox prune detached for the
+    /// snapshot-storage sweeper, which can delete their objects.
+    pub storage_locations_detached: u64,
     pub direct_node_tombstones: u64,
     pub template_tombstones: u64,
     pub deleted_sandbox_rows: u64,
@@ -87,120 +90,47 @@ impl RetentionSink for TombstoneRetentionStore {
         let max_records = i64::from(max_records);
         let mut tx = self.pool.begin().await?;
 
-        // Quarantined sandboxes are not terminal for tombstone retention:
-        // they intentionally keep the node association until quarantine-aware
-        // cleanup or operator release resolves the preserved state.
-        let direct_nodes_deleted = sqlx::query_scalar::<_, String>(sql!(
-            "WITH candidates AS (
-                 SELECT n.id
-                   FROM nodes n
-                   JOIN node_direct nd ON nd.node_id = n.id
-                  WHERE n.managed_by = $3
-                    AND COALESCE(n.state, 'registered') = 'deleted'
-                    AND nd.deleted_at IS NOT NULL
-                    AND nd.deleted_at < NOW() - ($1::BIGINT * INTERVAL '1 second')
-                    AND NOT EXISTS (
-                        SELECT 1
-                          FROM sandboxes s
-                         WHERE s.active_node_id = n.id
-                           AND s.lifecycle NOT IN ('deleted', 'failed')
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                          FROM sandboxes s
-                         WHERE s.target_node_id = n.id
-                           AND s.lifecycle NOT IN ('deleted', 'failed')
-                    )
-                  ORDER BY nd.deleted_at ASC, n.id ASC
-                  LIMIT $2
-             )
-             DELETE FROM nodes n
-              USING candidates c
-              WHERE n.id = c.id
-              RETURNING n.id::TEXT"
-        ))
-        .bind(retention_secs)
-        .bind(max_records)
-        .bind(SubstrateKind::Space)
-        .fetch_all(&mut *tx)
-        .await?
-        .len() as u64;
+        let direct_nodes_deleted = direct::prune_expired_direct_node_tombstones(
+            &mut *tx,
+            retention_secs,
+            max_records,
+            SubstrateKind::Space,
+        )
+        .await?;
 
-        let templates_deleted = sqlx::query_scalar::<_, String>(sql!(
-            "WITH candidates AS (
-                 SELECT t.name
-                   FROM templates t
-                  WHERE t.desired_state = 'deleted'
-                    AND COALESCE(t.delete_requested_at, t.updated_at, t.created_at)
-                        < NOW() - ($1::BIGINT * INTERVAL '1 second')
-                    AND NOT EXISTS (
-                        SELECT 1
-                          FROM template_releases r
-                         WHERE r.template_name = t.name
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                          FROM node_template_inventory i
-                         WHERE i.template_name = t.name
-                    )
-                  ORDER BY COALESCE(t.delete_requested_at, t.updated_at, t.created_at) ASC,
-                           t.name ASC
-                  LIMIT $2
-             )
-             DELETE FROM templates t
-              USING candidates c
-              WHERE t.name = c.name
-              RETURNING t.name"
-        ))
-        .bind(retention_secs)
-        .bind(max_records)
-        .fetch_all(&mut *tx)
-        .await?
-        .len() as u64;
+        let templates_deleted = pplx_space_template_store::templates::prune_deleted(
+            &mut *tx,
+            retention_secs,
+            max_records,
+        )
+        .await?;
 
-        let deleted_sandbox_ids =
+        let pruned_sandboxes =
             tombstone::prune_deleted_sandboxes(&mut *tx, retention_secs, max_records).await?;
         // Same rationale as the sandbox store's delete_with_dependents (this
         // reaper predates it): receipts are not foreign-keyed to `sandboxes`,
         // and an orphaned receipt is unreachable by the suspended-fossil drain.
-        let deleted_reservations = deleted_sandbox_ids
+        let deleted_reservations = pruned_sandboxes
+            .sandbox_ids
             .iter()
             .map(|id| SandboxId::from_uuid(*id))
             .collect::<Vec<_>>();
         pplx_space_cluster_pool::WarmPoolStore::delete_claimed_slots_for_retired_executions(
-            &mut tx,
+            &mut *tx,
             &deleted_reservations,
         )
         .await?;
-        let deleted_sandboxes_deleted = deleted_sandbox_ids.len() as u64;
+        let deleted_sandboxes_deleted = pruned_sandboxes.sandbox_ids.len() as u64;
+        let storage_locations_detached = pruned_sandboxes.storage_locations_detached;
 
-        let direct_node_tombstones_count = sqlx::query_scalar::<_, i64>(sql!(
-            "SELECT COUNT(*)
-               FROM nodes n
-               JOIN node_direct nd ON nd.node_id = n.id
-              WHERE n.managed_by = $1
-                AND COALESCE(n.state, 'registered') = 'deleted'
-                AND nd.deleted_at IS NOT NULL"
-        ))
-        .bind(SubstrateKind::Space)
-        .fetch_one(&mut *tx)
-        .await?;
+        let direct_node_tombstones_count =
+            direct_registry::count_tombstones(&mut *tx, SubstrateKind::Space).await?;
         let direct_node_tombstones = count_to_u64(direct_node_tombstones_count);
-        let template_tombstones_count = sqlx::query_scalar::<_, i64>(sql!(
-            "SELECT COUNT(*)
-               FROM templates
-              WHERE desired_state = 'deleted'"
-        ))
-        .fetch_one(&mut *tx)
-        .await?;
+        let template_tombstones_count =
+            pplx_space_template_store::templates::count_deleted(&mut *tx).await?;
         let template_tombstones = count_to_u64(template_tombstones_count);
-        let deleted_sandbox_rows_count = sqlx::query_scalar::<_, i64>(sql!(
-            "SELECT COUNT(*)
-               FROM sandboxes
-              WHERE lifecycle = 'deleted'"
-        ))
-        .fetch_one(&mut *tx)
-        .await?;
+        let deleted_sandbox_rows_count =
+            pplx_space_sandbox_store::deleted_rows::count(&mut *tx).await?;
         let deleted_sandbox_rows = count_to_u64(deleted_sandbox_rows_count);
 
         tx.commit().await?;
@@ -209,6 +139,7 @@ impl RetentionSink for TombstoneRetentionStore {
             direct_nodes_deleted,
             templates_deleted,
             deleted_sandboxes_deleted,
+            storage_locations_detached,
             direct_node_tombstones,
             template_tombstones,
             deleted_sandbox_rows,
@@ -247,10 +178,14 @@ where
                 "sandbox",
                 report.deleted_sandboxes_deleted,
             );
+            crate::metrics::tombstone::retention_storage_locations_detached(
+                report.storage_locations_detached,
+            );
             tracing::info!(
                 direct_nodes_deleted = report.direct_nodes_deleted,
                 templates_deleted = report.templates_deleted,
                 deleted_sandboxes_deleted = report.deleted_sandboxes_deleted,
+                storage_locations_detached = report.storage_locations_detached,
                 "tombstone retention pruned expired rows"
             );
         }
@@ -285,6 +220,7 @@ where
                             direct_nodes_deleted = report.direct_nodes_deleted,
                             templates_deleted = report.templates_deleted,
                             deleted_sandboxes_deleted = report.deleted_sandboxes_deleted,
+                            storage_locations_detached = report.storage_locations_detached,
                             direct_node_tombstones = report.direct_node_tombstones,
                             template_tombstones = report.template_tombstones,
                             deleted_sandbox_rows = report.deleted_sandbox_rows,

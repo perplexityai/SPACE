@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use k8s_openapi::api::core::v1::Pod;
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 
 use super::*;
@@ -26,7 +27,7 @@ async fn control_runtime_client_wakes_only_kubernetes_rows_after_an_unreachable_
         let pool = db.pool.clone();
         let sandbox_id = SandboxId::new();
         insert_test_sandbox_row(&pool, sandbox_id, "suspended").await?;
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "UPDATE sandboxes SET managed_by = $2 WHERE id = $1"
         ))
         .bind(sandbox_id)
@@ -48,12 +49,7 @@ async fn control_runtime_client_wakes_only_kubernetes_rows_after_an_unreachable_
             Substrate::from_direct(crate::controllers::substrate::direct::DirectSubstrate::new(
                 pool.clone(),
             )),
-            crate::cluster_admission::ClusterSandboxAdmissionConfig {
-                enabled: true,
-                refill_rps: 6.0,
-                burst: 60.0,
-                redis_url: None,
-            },
+            crate::test_support::enabled_config(),
             pplx_space_feature_flags::FeatureFlagClient::disabled(),
         );
         let controller = crate::controllers::sandbox::SandboxController::with_cluster_admission(
@@ -202,7 +198,7 @@ async fn control_runtime_client_admits_the_fallback_wake_it_runs() -> TestResult
         let pool = db.pool.clone();
         let sandbox_id = SandboxId::new();
         insert_test_sandbox_row(&pool, sandbox_id, "suspended").await?;
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "UPDATE sandboxes SET managed_by = $2 WHERE id = $1"
         ))
         .bind(sandbox_id)
@@ -227,6 +223,7 @@ async fn control_runtime_client_admits_the_fallback_wake_it_runs() -> TestResult
                 refill_rps: 6.0,
                 burst: 60.0,
                 redis_url: None,
+                slot_check_enabled: false,
             },
             pplx_space_feature_flags::FeatureFlagClient::disabled(),
         );

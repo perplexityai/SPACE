@@ -10,6 +10,7 @@ unset GIT_ASKPASS SSH_ASKPASS GIT_SSH GIT_SSH_COMMAND GIT_CONFIG_PARAMETERS
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 script="${repo_root}/scripts/check-postgres-migrations-isolated.sh"
+base_helper="${repo_root}/scripts/lib/migration-base.sh"
 bootstrap_roles_path="crates/l30_storage/db/migrate/src/bootstrap_roles.rs"
 postgres_bootstrap_test_path="crates/l30_storage/db/migrate/src/bootstrap_roles/tests/postgres_bootstrap_tests.rs"
 postgres_bootstrap_test_with_credential_table="fn new_credential_table_is_fenced() {}"
@@ -235,8 +236,9 @@ commit_scenario() {
 }
 
 work_repo="${tmp_dir}/repo"
-mkdir -p "${work_repo}/scripts"
+mkdir -p "${work_repo}/scripts/lib"
 cp "${script}" "${work_repo}/scripts/check-postgres-migrations-isolated.sh"
+cp "${base_helper}" "${work_repo}/scripts/lib/migration-base.sh"
 cp "${repo_root}/scripts/check_postgres_partial_indexes.py" "${work_repo}/scripts/"
 mkdir -p "${work_repo}/ci/scripts"
 cp "${repo_root}/ci/scripts/ensure-uv.sh" "${work_repo}/ci/scripts/"
@@ -602,6 +604,64 @@ write_file "${work_repo}/docs/space/migration-note.md" "docs"
 commit_scenario "${work_repo}" "migration plus docs"
 expect_guard_success "${work_repo}" "migration-plus-docs"
 
+# A test fixture's schema variant travels with the migration it follows; the
+# fixture crate's code and a file below the variants directory do not.
+schema_variants_dir="crates/test_support/db/test/fixtures/schema-variants"
+git -C "${work_repo}" checkout --quiet -B migration-plus-schema-variant "${base_commit}"
+write_file "${work_repo}/db/postgres/20260623000007_add_column.up.sql" "ALTER TABLE widgets ADD COLUMN name TEXT;"
+write_file "${work_repo}/${schema_variants_dir}/example_variant.sql" "CREATE VIEW widgets_view AS SELECT name FROM widgets;"
+commit_scenario "${work_repo}" "migration plus schema variant"
+expect_guard_success "${work_repo}" "migration-plus-schema-variant"
+grep -F "without runtime app changes" \
+  "${tmp_dir}/migration-plus-schema-variant.stdout" >/dev/null
+
+git -C "${work_repo}" checkout --quiet -B migration-plus-nested-schema-variant "${base_commit}"
+write_file "${work_repo}/db/postgres/20260623000008_add_column.up.sql" "ALTER TABLE widgets ADD COLUMN name TEXT;"
+write_file "${work_repo}/${schema_variants_dir}/nested/example_variant.sql" "SELECT 1;"
+commit_scenario "${work_repo}" "migration plus nested schema variant"
+expect_guard_failure "${work_repo}" "migration-plus-nested-schema-variant"
+grep -F "${schema_variants_dir}/nested/example_variant.sql" \
+  "${tmp_dir}/migration-plus-nested-schema-variant.stderr" >/dev/null
+
+git -C "${work_repo}" checkout --quiet -B migration-plus-schema-variant-and-fixture-code "${base_commit}"
+write_file "${work_repo}/db/postgres/20260623000009_add_column.up.sql" "ALTER TABLE widgets ADD COLUMN name TEXT;"
+write_file "${work_repo}/${schema_variants_dir}/example_variant.sql" "SELECT 1;"
+write_file "${work_repo}/crates/test_support/db/test/fixtures/src/lib.rs" "pub fn fixture() {}"
+commit_scenario "${work_repo}" "migration plus schema variant and fixture code"
+expect_guard_failure "${work_repo}" "migration-plus-schema-variant-and-fixture-code"
+grep -F "crates/test_support/db/test/fixtures/src/lib.rs" \
+  "${tmp_dir}/migration-plus-schema-variant-and-fixture-code.stderr" >/dev/null
+if grep -F "${schema_variants_dir}/example_variant.sql" \
+  "${tmp_dir}/migration-plus-schema-variant-and-fixture-code.stderr" >/dev/null; then
+  echo "a schema variant must not be reported as a runtime change" >&2
+  exit 1
+fi
+
+# A file directly in the variants directory that is not .sql still counts as a runtime change.
+git -C "${work_repo}" checkout --quiet -B migration-plus-non-sql-schema-variant-file "${base_commit}"
+write_file "${work_repo}/db/postgres/20260623000030_add_column.up.sql" "ALTER TABLE widgets ADD COLUMN name TEXT;"
+write_file "${work_repo}/${schema_variants_dir}/loader.rs" "pub fn load() {}"
+commit_scenario "${work_repo}" "migration plus non-sql file in the variants directory"
+expect_guard_failure "${work_repo}" "migration-plus-non-sql-schema-variant-file"
+grep -F "${schema_variants_dir}/loader.rs" \
+  "${tmp_dir}/migration-plus-non-sql-schema-variant-file.stderr" >/dev/null
+
+# A runtime file moved into the variants directory beside a migration is still a
+# runtime change: its old path is a deletion.
+git -C "${work_repo}" checkout --quiet -B runtime-query-seed "${base_commit}"
+write_file "${work_repo}/crates/example/src/queries/widgets.sql" "SELECT name FROM widgets;"
+commit_scenario "${work_repo}" "runtime query seed"
+git -C "${work_repo}" update-ref refs/remotes/origin/main HEAD
+git -C "${work_repo}" checkout --quiet -B migration-plus-runtime-file-moved-into-variants
+mkdir -p "${work_repo}/${schema_variants_dir}"
+git -C "${work_repo}" mv crates/example/src/queries/widgets.sql "${schema_variants_dir}/widgets.sql"
+write_file "${work_repo}/db/postgres/20260623000031_add_column.up.sql" "ALTER TABLE widgets ADD COLUMN name TEXT;"
+commit_scenario "${work_repo}" "migration plus runtime file moved into the variants directory"
+expect_guard_failure "${work_repo}" "migration-plus-runtime-file-moved-into-variants"
+grep -F "crates/example/src/queries/widgets.sql" \
+  "${tmp_dir}/migration-plus-runtime-file-moved-into-variants.stderr" >/dev/null
+git -C "${work_repo}" update-ref refs/remotes/origin/main "${base_commit}"
+
 git -C "${work_repo}" checkout --quiet -B migration-plus-guard-maintenance "${base_commit}"
 write_file "${work_repo}/db/postgres/20260623000005_add_column.up.sql" "ALTER TABLE widgets ADD COLUMN name TEXT;"
 write_file "${work_repo}/scripts/check-postgres-migrations-example.sh" "#!/usr/bin/env bash"
@@ -623,8 +683,9 @@ grep -F "scripts/space-deploy.py" "${tmp_dir}/migration-plus-deploy-script.stder
 # from real main, so a migration-only PR is reported as "migration + runtime app
 # change" and fails a PR that is correct. Freshening is what keeps it honest.
 stale_remote="${tmp_dir}/stale-remote"
-mkdir -p "${stale_remote}/scripts"
+mkdir -p "${stale_remote}/scripts/lib"
 cp "${script}" "${stale_remote}/scripts/check-postgres-migrations-isolated.sh"
+cp "${base_helper}" "${stale_remote}/scripts/lib/migration-base.sh"
 
 git -C "${stale_remote}" init --quiet --initial-branch=main
 git -C "${stale_remote}" config user.email test@example.com
@@ -888,8 +949,9 @@ fi
 # base fetch must deepen history enough for a three-dot diff instead of falling
 # back to a direct tree comparison.
 shallow_remote="${tmp_dir}/shallow-remote"
-mkdir -p "${shallow_remote}/scripts"
+mkdir -p "${shallow_remote}/scripts/lib"
 cp "${script}" "${shallow_remote}/scripts/check-postgres-migrations-isolated.sh"
+cp "${base_helper}" "${shallow_remote}/scripts/lib/migration-base.sh"
 git -C "${shallow_remote}" init --quiet --initial-branch=main
 git -C "${shallow_remote}" config user.email test@example.com
 git -C "${shallow_remote}" config user.name "Migration Isolation Test"

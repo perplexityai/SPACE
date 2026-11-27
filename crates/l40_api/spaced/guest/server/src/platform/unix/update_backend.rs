@@ -14,14 +14,14 @@ impl SpacedGuestService {
     pub(super) async fn update_self_test(&self) -> Result<(), Status> {
         // No listeners exist yet. Exercise the real filesystem worker before
         // closing admission; this read creates no customer retry obligation.
-        use pplx_space_spaced_common::proto::bridge_guest::filesystem_server::Filesystem;
+        use pplx_space_spaced_guest_protocol::proto::bridge_guest::filesystem_server::Filesystem;
         let response = tokio::time::timeout(
             Duration::from_secs(10),
             self.inner
                 .execution
                 .filesystem_service()
                 .stat_info(Request::new(
-                    pplx_space_spaced_common::proto::bridge_guest::StatRequest {
+                    pplx_space_spaced_guest_protocol::proto::bridge_guest::StatRequest {
                         path: "/".into(),
                         user: None,
                     },
@@ -58,6 +58,6 @@ impl SpacedGuestService {
 
 pub(super) fn parse_environment(
     values: std::collections::HashMap<String, String>,
-) -> Result<pplx_space_common_core::types::EnvMap, Status> {
+) -> Result<pplx_space_guest_process::EnvMap, Status> {
     Ok(parse_env(values))
 }

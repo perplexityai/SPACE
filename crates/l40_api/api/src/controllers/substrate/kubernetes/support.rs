@@ -1,7 +1,9 @@
 use super::store::{ActivationFenceOwnership, ActiveExecutionStatusRow};
 use super::*;
 use crate::controllers::substrate::PooledExecutionClaim;
-use pplx_space_common_core::types::{NodeId, PodUid, SandboxActivationAttemptId, SandboxLifecycle};
+use pplx_space_accounts::NodeId;
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxLifecycle};
 use uuid::Uuid;
 
 pub(super) fn k8s_execution_route_identity(
@@ -302,6 +304,15 @@ pub(super) fn activation_wake_action(
         require_split_receipt_capability,
         publish_legacy_route_after_ack,
     })
+}
+
+/// The EC2 instance a Node's AWS `providerID` names. Kind's `kind://…` and
+/// other providers name none.
+pub(super) fn k8s_node_instance_id(node: &Node) -> Option<Ec2InstanceId> {
+    node.spec
+        .as_ref()
+        .and_then(|spec| spec.provider_id.as_deref())
+        .and_then(Ec2InstanceId::from_provider_id)
 }
 
 pub(super) fn k8s_node_internal_ip(node: &Node) -> Option<String> {
@@ -856,16 +867,32 @@ pub(super) fn stale_existing_pod_reason(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WakeRpcErrorDisposition {
     ReadinessPoll(&'static str),
+    /// node-api did not accept this process's own credential. That is no
+    /// verdict on the sandbox: a Pod-bound token stops validating the moment
+    /// its Pod is deleted, while the process still runs out its termination.
+    /// The wake is retried as an operation, by whichever executor claims it.
+    CallerUnauthenticated,
+    /// A node drain sealed the node, which refused the wake before any VM
+    /// work: the caller retries, and the wake lands elsewhere once the drain
+    /// has made the sandbox durable, or goes through once the node is
+    /// undrained.
+    NodeSealed,
     Fail,
 }
 
 pub(super) fn classify_wake_rpc_error(error: &tonic::Status) -> WakeRpcErrorDisposition {
+    if error.code() == Code::Unauthenticated {
+        return WakeRpcErrorDisposition::CallerUnauthenticated;
+    }
     if error.code() == Code::FailedPrecondition
         && error
             .message()
-            .contains(pplx_space_common_core::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER)
+            .contains(pplx_space_rpc_contracts::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER)
     {
         return WakeRpcErrorDisposition::ReadinessPoll("missing_runtime_context");
+    }
+    if crate::controllers::is_activation_sealed(error) {
+        return WakeRpcErrorDisposition::NodeSealed;
     }
     if error.code() == Code::FailedPrecondition
         && (error.message().contains("cannot wake") || error.message().contains("wait for"))
@@ -891,7 +918,10 @@ pub(super) fn classify_wake_rpc_error(error: &tonic::Status) -> WakeRpcErrorDisp
 /// failure, malformed pod IP — is a genuine infra fault that the pod-delete
 /// loop would hit too, so it must propagate.
 pub(super) fn delete_can_skip_runtime_cleanup(err: &SubstrateError) -> bool {
-    matches!(err, SubstrateError::Unavailable { .. })
+    matches!(
+        err,
+        SubstrateError::Unavailable { .. } | SubstrateError::Unschedulable { .. }
+    )
 }
 
 /// Whether an execution teardown destroys node-local sandbox state or
@@ -912,14 +942,14 @@ pub(super) enum ExecutionTeardown {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SandboxDeleteRpcErrorDisposition {
-    ContinueTeardown,
+    ProbeAdmission,
     DeferTeardown,
     RetainedFilesystemOnlyCopy,
 }
 
-/// Preserve the pod and execution tracking only when sbx-mgr explicitly says
-/// an unpublished suspend owns the sandbox. Other `Aborted` cleanup failures
-/// keep the historical best-effort delete behavior.
+/// Explicit safety refusals retain their meaning. Any other failed reply is
+/// ambiguous: admission may have committed before the reply was lost, or the
+/// node may have rejected the request without admitting it.
 pub(super) fn classify_sandbox_delete_rpc_error(
     error: &tonic::Status,
 ) -> SandboxDeleteRpcErrorDisposition {
@@ -928,7 +958,7 @@ pub(super) fn classify_sandbox_delete_rpc_error(
     } else if pplx_space_sbx_mgr_client::is_suspend_publication_pending_status(error) {
         SandboxDeleteRpcErrorDisposition::DeferTeardown
     } else {
-        SandboxDeleteRpcErrorDisposition::ContinueTeardown
+        SandboxDeleteRpcErrorDisposition::ProbeAdmission
     }
 }
 
@@ -969,8 +999,8 @@ pub(super) fn retire_can_skip_backup_enqueue_error(err: &SubstrateError) -> bool
         // No sbx-mgr sandbox row: there is no node-local source left to
         // salvage, so the backup is moot.
         SubstrateError::NotFound { .. } => true,
-        // sbx-mgr's `FailedPrecondition` surfaces as `Conflict` with the
-        // message passed through. Two refusals are terminal for retire's
+        // sbx-mgr's `FailedPrecondition` and `Aborted` surface as `Conflict`
+        // with the message passed through. Two refusals are terminal for retire's
         // fixed current-instance/disk request and can never resolve by
         // retrying: a `failed` local state (nothing moves it to
         // stopped/suspended without external action) and a suspended
@@ -980,10 +1010,10 @@ pub(super) fn retire_can_skip_backup_enqueue_error(err: &SubstrateError) -> bool
         // while the leftover pod keeps feeding kubelet CreatePodSandbox
         // retries; node-local state stays salvageable either way because
         // retire never sends the sbx-mgr delete. Any other `Conflict`
-        // (e.g. a still-stopping row that can converge to a backupable
-        // state) keeps the execution tracked for retry.
+        // (e.g. a still-stopping row, which sbx-mgr answers `Aborted`)
+        // keeps the execution tracked for retry.
         SubstrateError::Conflict { message } => {
-            use pplx_space_common_core::artifact_backup_signals::{
+            use pplx_space_rpc_contracts::artifact_backup_signals::{
                 CURRENT_INSTANCE_BACKUP_PUBLISHES_FULL_MARKER,
                 CURRENT_INSTANCE_BACKUP_SANDBOX_FAILED_MARKER,
             };
@@ -1476,6 +1506,59 @@ pub(super) fn is_nodemgr_unreachable(err: &SubstrateError) -> bool {
 
 pub(super) fn assigned_pod_ip(pod: &SandboxPodView) -> Result<Option<PodIp>, SubstrateError> {
     pod.pod_ip().map(PodIp::parse).transpose()
+}
+
+/// The pod's IP: the one kubelet published in `status.podIP`, else the one
+/// recorded for the same pod UID. A readiness wait records the address the
+/// pod's node reports once the node confirms it serves the execution there,
+/// which is usually before kubelet publishes it.
+pub(super) fn pod_ip_or_recorded<'a>(
+    published_ip: Option<&'a str>,
+    pod_uid: Option<&str>,
+    recorded_uid: Option<&str>,
+    recorded_ip: Option<&'a str>,
+) -> Option<&'a str> {
+    published_ip.or_else(|| recorded_ip.filter(|_| pod_uid.is_some() && pod_uid == recorded_uid))
+}
+
+/// Where a pod address comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PodIpSource {
+    /// Kubelet published it in the pod's `status.podIP`.
+    Published,
+    /// The pod's node reported it, before kubelet published one. A node can
+    /// keep reporting an address its pod no longer has, so only a node that
+    /// affirms the execution at that address confirms it.
+    NodeReported,
+}
+
+/// [`assigned_pod_ip`], falling back to the IP recorded for the same pod UID
+/// (see [`pod_ip_or_recorded`]).
+pub(super) fn current_pod_ip(
+    pod: &SandboxPodView,
+    recorded_uid: Option<&PodUid>,
+    recorded_ip: Option<&str>,
+) -> Result<Option<PodIp>, SubstrateError> {
+    Ok(current_pod_ip_with_source(pod, recorded_uid, recorded_ip)?.map(|(ip, _)| ip))
+}
+
+/// [`current_pod_ip`], with where the address comes from.
+pub(super) fn current_pod_ip_with_source(
+    pod: &SandboxPodView,
+    recorded_uid: Option<&PodUid>,
+    recorded_ip: Option<&str>,
+) -> Result<Option<(PodIp, PodIpSource)>, SubstrateError> {
+    if let Some(ip) = assigned_pod_ip(pod)? {
+        return Ok(Some((ip, PodIpSource::Published)));
+    }
+    pod_ip_or_recorded(
+        None,
+        pod.uid(),
+        recorded_uid.map(PodUid::as_str),
+        recorded_ip,
+    )
+    .map(|ip| Ok((PodIp::parse(ip)?, PodIpSource::NodeReported)))
+    .transpose()
 }
 
 pub(super) fn assigned_pod_node_name(pod: &SandboxPodView) -> Option<&str> {

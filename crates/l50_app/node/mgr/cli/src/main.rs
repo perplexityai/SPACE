@@ -1,7 +1,5 @@
 use clap::Parser;
 use comfy_table::{Table, presets::UTF8_FULL_CONDENSED};
-use pplx_space_common_core::ids::sandbox_label_or_id;
-use pplx_space_common_core::types::{OneOrMany, SandboxId, SandboxSelector};
 use pplx_space_execution_common::environment::RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION as DEFINITION_SCHEMA;
 use pplx_space_node_api_client::proto::GetControllerStateRequest;
 use pplx_space_node_mgr_client::proto::{
@@ -11,6 +9,8 @@ use pplx_space_node_mgr_client::proto::{
     NetworkProtocol, NetworkSlotHealth, NetworkSlotState, ReleaseRequest, RepairNetworkPoolRequest,
     SetNetworkPoolConfigRequest, SetNetworkPoolDrainRequest, UnexposePortRequest,
 };
+use pplx_space_sandbox_model::ids::sandbox_label_or_id;
+use pplx_space_sandbox_model::{OneOrMany, SandboxId, SandboxSelector};
 
 const FACET_SANDBOX_DESIRED_STATE: &str = "sandbox-desired-state";
 
@@ -36,7 +36,7 @@ async fn operator_execution_fence(
 
 fn unbound_execution_fence() -> pplx_space_node_mgr_client::proto::ExecutionFence {
     pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
-        pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+        pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
         None,
     )
     .into()
@@ -135,7 +135,7 @@ enum Commands {
     /// Resolve and verify an execution environment on this node; JSON output.
     Environment {
         #[arg(long)]
-        reference: Option<pplx_space_common_core::types::EnvironmentReference>,
+        reference: Option<pplx_space_execution_spec::EnvironmentReference>,
     },
     /// Show allocated network slots and health
     Status {
@@ -334,7 +334,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                     response.definition.as_ref().ok_or("missing definition")?,
                 )
                 .map_err(|error| error.to_string())?;
-            let execution = pplx_space_common_core::types::ExecutionMetadata::try_from(
+            let execution = pplx_space_execution_spec::ExecutionMetadata::try_from(
                 response.execution.as_ref().ok_or("missing execution")?,
             )
             .map_err(|error| error.to_string())?;
@@ -442,6 +442,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                     slot: None,
                     template: None,
                     execution_only: false,
+                    cgroup_only: false,
                 })
                 .await
                 .map_err(|e| format!("ERROR: {e}"))?

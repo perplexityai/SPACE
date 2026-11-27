@@ -11,6 +11,7 @@
 
 mod create_and_teardown;
 mod create_readiness;
+mod drain_recovery_gate;
 mod durable_snapshot;
 mod hydration_and_suspend;
 mod pooled_adoption;
@@ -19,14 +20,13 @@ mod restoring_access;
 use std::collections::BTreeMap;
 
 use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
-use pplx_space_common_core::kubernetes::{
-    SANDBOX_EXECUTION_GENERATION_ANNOTATION, SANDBOX_ID_ANNOTATION,
-};
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, Email, OrgId, SandboxId, TemplateName, UserId,
-};
+use pplx_space_accounts::{Email, OrgId, UserId};
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_net_common::NetworkPolicyV1;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sandbox_pod::{SANDBOX_EXECUTION_GENERATION_ANNOTATION, SANDBOX_ID_ANNOTATION};
+use pplx_space_sql_locator::sql;
+use pplx_space_template_model::TemplateName;
 use sqlx::PgPool;
 
 use super::scripted_test_doubles::{BoxError, WORKER_NODE};
@@ -228,6 +228,7 @@ impl CreateInputs {
             command_ready_wait: None,
             volume_encryption: false,
             node_pool: None,
+            client_id: None,
         }
     }
 }

@@ -3,15 +3,16 @@
 //! The handlers call [`validate_create_request`] and
 //! [`validate_update_request`] before admitting an operation, and the
 //! published `CreateSandboxRequest` schema reads the same constants, so the
-//! two cannot disagree about what is accepted.
+//! two cannot disagree about what is accepted. ECW's create checks its
+//! resource override with [`validate_resources`].
 
 use std::collections::BTreeMap;
 use std::fmt;
 
-use pplx_space_common_core::sandbox_storage::MAX_SANDBOX_ROOTFS_BYTES;
-use pplx_space_common_core::types::{
+use pplx_space_guest_process::{
     MAX_ENV_ENTRIES, MAX_ENV_KEY_BYTES, MAX_ENV_TOTAL_BYTES, MAX_ENV_VALUE_BYTES,
 };
+use pplx_space_sandbox_model::sandbox_storage::MAX_SANDBOX_ROOTFS_BYTES;
 
 use crate::{
     CreateSandboxRequest, PublicSandboxMetadata, PublicSandboxMetadataValue, SandboxResources,
@@ -36,13 +37,14 @@ pub const MIN_SANDBOX_VCPU: u32 = 1;
 pub const MAX_SANDBOX_VCPU: u32 = 32;
 /// Smallest guest memory a sandbox can request: the smallest memory a template
 /// base snapshot is taken with.
-pub const MIN_SANDBOX_MEMORY_MIB: u32 = pplx_space_common_core::types::MIN_BASE_SNAPSHOT_MEMORY_MIB;
-/// Largest guest memory a sandbox can request: the node runtime's default
-/// guest maximum, `pplx_space_node_runtime_core::cgroup::
-/// DEFAULT_SANDBOX_GUEST_MEMORY_MAX_MIB`, which deployments run. That module
-/// is host-only, so the value is restated here. A node would otherwise clamp a larger request silently. Raising a
-/// node's guest maximum requires raising this too.
-pub const MAX_SANDBOX_MEMORY_MIB: u32 = 8192;
+pub const MIN_SANDBOX_MEMORY_MIB: u32 = pplx_space_snapshot_model::MIN_BASE_SNAPSHOT_MEMORY_MIB;
+/// Largest guest memory a sandbox can request: 2 GiB for each of
+/// [`MAX_SANDBOX_VCPU`] vCPUs. This is an admission bound, not a node's guest
+/// maximum: a node gives the guest the smaller of this request and its own
+/// configured maximum (`sandbox_cgroup_memory_mib` less headroom), so the
+/// bound must cover every shape existing callers send, including ones above
+/// any node's maximum.
+pub const MAX_SANDBOX_MEMORY_MIB: u32 = 2 * 1024 * MAX_SANDBOX_VCPU;
 /// Smallest writable disk a sandbox can request. The template's own rootfs is
 /// the real floor, which the node enforces when it prepares the sandbox.
 pub const MIN_SANDBOX_DISK_MIB: u32 = 1;
@@ -52,17 +54,17 @@ pub const MAX_SANDBOX_DISK_MIB: u32 = (MAX_SANDBOX_ROOTFS_BYTES / (1024 * 1024))
 /// Maximum byte length of a native `Idempotency-Key` header, which the API
 /// checks with `IdempotencyKey::parse_header`.
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize =
-    pplx_space_common_core::types::MAX_IDEMPOTENCY_KEY_HEADER_BYTES;
+    pplx_space_guest_process::MAX_IDEMPOTENCY_KEY_HEADER_BYTES;
 
 /// Why an `Idempotency-Key` header value was rejected.
-pub use pplx_space_common_core::types::IdempotencyKeyHeaderError as IdempotencyKeyError;
+pub use pplx_space_guest_process::IdempotencyKeyHeaderError as IdempotencyKeyError;
 
 /// Checks a native `Idempotency-Key` header value with
 /// `IdempotencyKey::parse_header`: 1 to [`MAX_IDEMPOTENCY_KEY_BYTES`] bytes of
 /// printable ASCII, space or tab.
-#[deprecated(note = "use `pplx_space_common_core::types::IdempotencyKey::parse_header`")]
+#[deprecated(note = "use `pplx_space_public_api::IdempotencyKey::parse_header`")]
 pub fn validate_idempotency_key(value: &[u8]) -> Result<&str, IdempotencyKeyError> {
-    pplx_space_common_core::types::IdempotencyKey::parse_header(value)?;
+    pplx_space_guest_process::IdempotencyKey::parse_header(value)?;
     std::str::from_utf8(value).map_err(|_| IdempotencyKeyError::InvalidEncoding)
 }
 
@@ -173,7 +175,8 @@ pub fn validate_update_request(request: &UpdateSandboxRequest) -> Result<(), Req
     Ok(())
 }
 
-fn validate_resources(resources: &SandboxResources) -> Result<(), RequestLimitError> {
+/// Checks requested vCPU, memory and disk against the limits in this module.
+pub fn validate_resources(resources: &SandboxResources) -> Result<(), RequestLimitError> {
     for (field, value, min, max) in [
         (
             RequestField::Vcpu,

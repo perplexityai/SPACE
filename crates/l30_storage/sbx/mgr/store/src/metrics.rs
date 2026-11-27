@@ -4,8 +4,8 @@
 
 use std::{fmt, str::FromStr};
 
-use pplx_space_common_core::types::SandboxQuarantineReasonCode;
 use pplx_space_metrics_emit::{counter, tag};
+use pplx_space_sandbox_model::SandboxQuarantineReasonCode;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AutoLifecycleDeleteAdmissionReason {
@@ -92,7 +92,7 @@ impl FromStr for AutoLifecycleDeleteAdmissionReason {
 /// `insert_quarantined_sandbox`, `startup_resident_recovery`,
 /// `complete_cleanup_episode`, `complete_row_intent_cleanup`,
 /// `quarantine_cleanup_episode`).
-pub fn quarantine_entered(reason: SandboxQuarantineReasonCode, operation: &'static str) {
+pub(crate) fn quarantine_entered(reason: SandboxQuarantineReasonCode, operation: &'static str) {
     counter(
         "sandbox.worker.quarantine.entered",
         1,

@@ -7,13 +7,15 @@
 //! deployment that needs private wiring can supply its own `main` against
 //! this library without copying any of the service.
 
-pub mod api_surface;
+pub(crate) mod api_surface;
 pub mod auth;
 pub mod client_classification;
 pub mod client_concurrency;
+pub mod client_live_cap;
 pub mod cluster_admission;
 pub mod command_stream;
 pub mod controllers;
+mod credential_injection;
 pub mod e2b;
 pub mod egress_profiles;
 pub mod external_console;
@@ -21,17 +23,18 @@ pub mod federated_identity;
 pub mod fork_operation_executor;
 mod fork_operation_store;
 pub mod fork_operations;
+mod ingress_activation;
 pub mod inline_operations;
+pub(crate) mod limiter_flags;
 pub(crate) mod limiter_liveness;
 pub mod metrics;
 pub mod middleware;
 pub mod models;
+mod native_file_access;
 pub mod native_sandbox_limits;
 // Resolving a node-group candidate set produces a `NodeGroupPlacement`, which
-// lives behind common-core's `kubernetes` feature.
-mod credential_injection;
-mod ingress_activation;
-mod native_file_access;
+// lives in `pplx-space-sandbox-pod`, an optional dependency that this crate's
+// `kubernetes` feature enables.
 #[cfg(feature = "kubernetes")]
 pub mod node_group_placement;
 pub mod public_operation_driver;
@@ -42,7 +45,6 @@ pub mod public_sessions;
 mod public_store;
 pub mod public_template_operations;
 pub mod reconcile_queue;
-pub mod reconcile_trigger;
 pub(crate) mod redis_otel;
 pub mod retry_deferral;
 pub mod routes;

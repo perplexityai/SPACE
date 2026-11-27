@@ -308,6 +308,16 @@ locals {
       ami_id                                  = pool.ami_id
       capacity_reservation_preference         = pool.capacity_reservation_preference
       capacity_reservation_resource_group_arn = pool.capacity_reservation_resource_group_arn
+      # EKS keeps reporting a node group's update strategy once one has been
+      # set and has no way to clear it, so leaving it null plans a diff on
+      # every run for such a group. Builders always carry an explicit
+      # strategy (`var.builders_update_strategy`); changing only the strategy
+      # does not roll nodes.
+      update_strategy = name == "builders" ? var.builders_update_strategy : null
+      # Only builders runs a custom AMI here, and only a custom-AMI pool tracks
+      # its template's latest version; the EKS-managed pools already stay on
+      # theirs.
+      launch_template_version = name == "builders" ? var.builders_launch_template_version : null
       additional_security_group_ids = concat(
         # general_nodes carries the shared-services access RDS/Redis admit.
         # cred-authority hosts credmgr-authority, which reads DATABASE_URL from

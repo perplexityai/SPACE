@@ -68,7 +68,8 @@ class NativeCredentialInjectionTest(unittest.TestCase):
         self.assertEqual(
             aws_secret_network_credential_injection.api_surfaces, frozenset({"native"})
         )
-        self.assertEqual(aws_secret_network_credential_injection.templates, frozenset())
+        self.assertEqual(aws_secret_network_credential_injection.tier, "manual")
+        self.assertTrue(aws_secret_network_credential_injection.manual_reason)
 
 
 if __name__ == "__main__":

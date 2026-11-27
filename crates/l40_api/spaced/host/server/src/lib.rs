@@ -15,13 +15,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pplx_space_common_connection_admission::ConnectionAdmissionFailure;
-use pplx_space_common_core::{host::linux::identities::user_names, host::linux::identities::users};
-use pplx_space_spaced_common::proto::bridge_guest::filesystem_client::FilesystemClient as BridgeGuestFilesystemClient;
-use pplx_space_spaced_common::proto::bridge_guest::meta_client::MetaClient as BridgeGuestClient;
-use pplx_space_spaced_common::proto::bridge_guest::networking_client::NetworkingClient as BridgeGuestNetworkingClient;
-use pplx_space_spaced_common::proto::bridge_guest::process_client::ProcessClient as BridgeGuestProcessClient;
-use pplx_space_spaced_common::proto::bridge_guest::{
+use pplx_space_connection_admission::ConnectionAdmissionFailure;
+use pplx_space_host_layout::{identities::user_names, identities::users};
+use pplx_space_spaced_client::{
+    DEFAULT_COMMAND_RETRY_POLICY, LazyClient, RetryContext, RetryPolicy,
+};
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::filesystem_client::FilesystemClient as BridgeGuestFilesystemClient;
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::meta_client::MetaClient as BridgeGuestClient;
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::networking_client::NetworkingClient as BridgeGuestNetworkingClient;
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_client::ProcessClient as BridgeGuestProcessClient;
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
     ConfigureProcessEnvRequest as BridgeGuestConfigureProcessEnvRequest,
     DisableFileChangesRequest as BridgeGuestDisableFileChangesRequest,
     FlushFilesystemsRequest as BridgeGuestFlushFilesystemsRequest,
@@ -34,10 +37,14 @@ use pplx_space_spaced_common::proto::bridge_guest::{
     RenameRequest as BridgeGuestRenameRequest, WaitReadyRequest as BridgeGuestWaitReadyRequest,
     WaitReadyResponse as BridgeGuestWaitReadyResponse,
 };
-use pplx_space_spaced_common::proto::bridge_host::meta_server::{
+use pplx_space_spaced_guest_protocol::{
+    invalid_argument_status, parse_env, parse_globs, proto_duration, proto_env, proto_globs,
+    validate_duration, validate_optional_duration, validate_optional_timeout,
+};
+use pplx_space_spaced_protocol::proto::bridge_host::meta_server::{
     Meta as BridgeHostMeta, MetaServer as BridgeHostMetaServer,
 };
-use pplx_space_spaced_common::proto::bridge_host::{
+use pplx_space_spaced_protocol::proto::bridge_host::{
     ActivityState as BridgeHostActivityState,
     RequestActiveForRequest as BridgeHostRequestActiveForRequest,
     RequestActiveForResponse as BridgeHostRequestActiveForResponse,
@@ -46,16 +53,11 @@ use pplx_space_spaced_common::proto::bridge_host::{
     SetActivityStateRequest as BridgeHostSetActivityStateRequest,
     SetActivityStateResponse as BridgeHostSetActivityStateResponse,
 };
-pub use pplx_space_spaced_common::proto::host as proto;
-use pplx_space_spaced_common::proto::host_control::host_control_client::HostControlClient;
-use pplx_space_spaced_common::proto::host_control::{
+pub use pplx_space_spaced_protocol::proto::host as proto;
+use pplx_space_spaced_protocol::proto::host_control::host_control_client::HostControlClient;
+use pplx_space_spaced_protocol::proto::host_control::{
     RequestActiveForRequest as HostControlRequestActiveForRequest,
     SetActivityStateRequest as HostControlSetActivityStateRequest,
-};
-use pplx_space_spaced_common::{
-    DEFAULT_COMMAND_RETRY_POLICY, LazyClient, RetryContext, RetryPolicy, invalid_argument_status,
-    parse_env, parse_globs, proto_duration, proto_env, proto_globs, validate_duration,
-    validate_optional_duration, validate_optional_timeout,
 };
 use pplx_space_uds_peer_auth::{UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
 use proto::filesystem_server::{Filesystem, FilesystemServer};
@@ -82,13 +84,14 @@ use proto::{
 use tokio_util::sync::CancellationToken;
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
+mod admission;
 mod authorization;
 mod bridge;
 mod compat;
 mod guest_connection;
 mod update;
 use guest_connection::OperationClient;
-use pplx_space_spaced_common::proto::platform::GuestOperation;
+use pplx_space_spaced_guest_protocol::proto::platform::GuestOperation;
 mod filesystem;
 mod meta;
 pub mod metrics;
@@ -97,7 +100,7 @@ mod process;
 mod protocol;
 mod run;
 
-pub use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
+pub use pplx_space_execution_spec::guest_image::QualifiedGuestAgent;
 pub use run::{RunSpacedHostError, SERVICE_NAME, SpacedHostBootType, SpacedHostRunConfig, run};
 
 const SPACE_SBXMGR_ACCOUNT: &str = user_names::SPACE_SBXMGR;
@@ -116,13 +119,13 @@ pub enum BridgeGuestConnector {
     FirecrackerVsock {
         vsock_uds_path: PathBuf,
         port: u32,
-        expected_peer: pplx_space_spaced_common::ExpectedUdsPeer,
+        expected_peer: pplx_space_spaced_client::ExpectedUdsPeer,
     },
 }
 
 impl Default for BridgeGuestConnector {
     fn default() -> Self {
-        Self::Uds(pplx_space_spaced_common::default_bridge_guest_uds_path())
+        Self::Uds(pplx_space_spaced_client::default_bridge_guest_uds_path())
     }
 }
 
@@ -136,7 +139,7 @@ pub enum SpacedHostPeerAuthorization {
 #[derive(Debug, thiserror::Error)]
 pub enum RunSpacedHostServerError {
     #[error("failed to bind spaced-host unix socket: {0}")]
-    Bind(#[from] pplx_space_spaced_common::BindUdsError),
+    Bind(#[from] pplx_space_spaced_client::BindUdsError),
     #[error("spaced-host gRPC server failed: {0}")]
     Serve(#[source] tonic::transport::Error),
     #[error(transparent)]
@@ -146,14 +149,14 @@ pub enum RunSpacedHostServerError {
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectBridgeGuestError {
     #[error(transparent)]
-    Uds(#[from] pplx_space_spaced_common::UdsConnectError),
+    Uds(#[from] pplx_space_spaced_client::UdsConnectError),
     #[error(transparent)]
-    FirecrackerVsock(#[from] pplx_space_spaced_common::FirecrackerVsockConnectError),
+    FirecrackerVsock(#[from] pplx_space_spaced_client::FirecrackerVsockConnectError),
 }
 
 #[derive(Clone, Debug)]
 pub struct SpacedHostServiceConfig {
-    pub guest_agent: pplx_space_common_core::types::guest_image::QualifiedGuestAgent,
+    pub guest_agent: pplx_space_execution_spec::guest_image::QualifiedGuestAgent,
     pub socket_path: PathBuf,
     pub bridge_host_socket_path: PathBuf,
     pub bridge_guest_connector: BridgeGuestConnector,
@@ -164,15 +167,22 @@ pub struct SpacedHostServiceConfig {
 impl Default for SpacedHostServiceConfig {
     fn default() -> Self {
         Self {
-            socket_path: pplx_space_common_core::host::linux::paths::default_host_uds_path(
-                pplx_space_common_core::host::linux::paths::SPACED_HOST_SOCKET_FILE,
+            // Under the node layout on Linux; other hosts have none, so the
+            // socket goes in the temporary directory.
+            socket_path: pplx_space_host_layout::paths::host_uds_path(
+                if cfg!(target_os = "linux") {
+                    std::path::PathBuf::from(pplx_space_host_layout::paths::SPACED_HOST_SOCKET_DIR)
+                } else {
+                    std::env::temp_dir()
+                },
+                pplx_space_host_layout::paths::SPACED_HOST_SOCKET_FILE,
             ),
-            bridge_host_socket_path: pplx_space_spaced_common::default_bridge_host_uds_path(),
+            bridge_host_socket_path: pplx_space_spaced_client::default_bridge_host_uds_path(),
             // Legacy Linux service configuration; new runtime policy comes from node-manager.
-            guest_agent: pplx_space_common_core::types::guest_image::QualifiedGuestAgent::LinuxV1,
+            guest_agent: pplx_space_execution_spec::guest_image::QualifiedGuestAgent::LinuxV1,
             bridge_guest_connector: BridgeGuestConnector::default(),
             host_control_socket_path: PathBuf::from(
-                pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET,
+                pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET,
             ),
             host_peer_authorization: SpacedHostPeerAuthorization::Enforce,
         }
@@ -194,7 +204,7 @@ impl std::fmt::Debug for SpacedHostService {
 
 #[derive(Clone, Debug)]
 struct GuestPlatformObservation {
-    platform: pplx_space_spaced_common::platform::GuestPlatform,
+    platform: pplx_space_spaced_guest_protocol::platform::GuestPlatform,
     interactive_upgrade_version: Option<String>,
 }
 
@@ -233,11 +243,11 @@ impl GuestReadinessCoordinator {
 
 struct SpacedHostServiceInner {
     update: update::HostUpdate,
-    guest_agent: pplx_space_common_core::types::guest_image::QualifiedGuestAgent,
+    guest_agent: pplx_space_execution_spec::guest_image::QualifiedGuestAgent,
     shutdown: CancellationToken,
     socket_path: PathBuf,
     bridge_host_socket_path: PathBuf,
-    bridge_host_expected_peer: Option<pplx_space_spaced_common::ExpectedUdsPeer>,
+    bridge_host_expected_peer: Option<pplx_space_spaced_client::ExpectedUdsPeer>,
     bridge_guest_connector: BridgeGuestConnector,
     host_control_socket_path: PathBuf,
     bridge_guest_meta_client:
@@ -265,8 +275,8 @@ struct SpacedHostServiceInner {
 fn payload_admission(slots: usize) -> pplx_space_common_grpc::QueuedSlots {
     pplx_space_common_grpc::QueuedSlots::new(Arc::new(tokio::sync::Semaphore::new(slots)))
         .with_queue(
-            pplx_space_spaced_common::admission_queue::WAITERS,
-            pplx_space_spaced_common::admission_queue::MAX_WAIT,
+            pplx_space_spaced_guest_protocol::admission_queue::WAITERS,
+            pplx_space_spaced_guest_protocol::admission_queue::MAX_WAIT,
         )
 }
 

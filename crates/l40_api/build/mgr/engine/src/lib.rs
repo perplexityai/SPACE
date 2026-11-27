@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{JobId, OrgId};
+use pplx_space_accounts::{JobId, OrgId};
 
 pub mod blob;
 mod blob_storage;
@@ -26,24 +26,23 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 pub use crate::metrics::TemplateBuildErrorKind;
-use pplx_space_common_core::{
-    host::linux::identities::group_names,
-    types::{
-        BUILDER_SANDBOX_OWNER, ContentHash, DEFAULT_GUEST_USER, DEFAULT_TEMPLATE_TAG,
-        PolicyAuthority, TemplateBuildId,
-    },
-};
+use pplx_space_accounts::BUILDER_SANDBOX_OWNER;
+use pplx_space_content_digest::ContentHash;
+use pplx_space_guest_process::DEFAULT_GUEST_USER;
+use pplx_space_host_layout::identities::group_names;
 pub use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::proto::NetworkPolicyV1 as NetworkPolicyV1Proto;
 use pplx_space_node_mgr_client::proto::{
     CompletePreparedRootfsRequest, PreparedRootfsDisposition, ReservePreparedRootfsRequest,
 };
 use pplx_space_page_cache as page_cache;
+use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sbx_mgr_client::SandboxManagerGrpcClient;
 use pplx_space_sbx_mgr_client::proto::{CreateRequest, DeleteRequest, StartRequest, StopRequest};
 use pplx_space_template_mgr_client::proto::{
     DeleteTemplateBuildRequest, ListTemplatesRequest, RegisterTemplateRequest, TemplateRef,
 };
+use pplx_space_template_model::{DEFAULT_TEMPLATE_TAG, TemplateBuildId};
 use tempfile::TempDir;
 use tracing::Instrument as _;
 
@@ -52,7 +51,7 @@ use environment::StepEnvironment;
 pub use environment::{BuildEnvironmentError, PreparedRecipe};
 use execution_binding::BuildExecutionBinding;
 pub use execution_binding::BuildExecutionBindingError;
-pub use pplx_space_common_core::types::{SystemPublicationGrantId, TenantPublicationGrantId};
+pub use pplx_space_accounts::{SystemPublicationGrantId, TenantPublicationGrantId};
 pub use publish::{
     PublishError, TemplateOrg, TemplatePublication, publish_build, register_build_template,
 };
@@ -84,11 +83,11 @@ const BUNDLED_BUILD_SEED_SCRIPT: &str = include_str!("../scripts/build-seed.sh")
 const BUNDLED_ROOTFS_BUILDER_SCRIPT: &str =
     include_str!("../../../../../../templates/firecracker/seed/rootfs-builder.sh");
 
-use pplx_space_common_core::types::TemplateMetadata;
+use pplx_space_template_manifest::TemplateMetadata;
 
 pub struct TemplateBuilder {
     caller_org: Option<OrgId>,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     network_policy: NetworkPolicyV1,
 }
 
@@ -102,14 +101,14 @@ pub struct BuildOutcome {
     pub content_hash: Option<String>,
     /// Environment the registered build is bound to, which selects the
     /// template-manager cache partition its artifacts live in.
-    pub environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    pub environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 }
 
 /// A build template-manager accepted.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RegisteredBuild {
     content_hash: String,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 }
 
 impl From<RegisteredBuild> for BuildOutcome {
@@ -196,7 +195,7 @@ pub enum BuildError {
     #[error(transparent)]
     ExecutionBinding(#[from] BuildExecutionBindingError),
     #[error("no guest exit strategy for build runtime {0}")]
-    UnsupportedGuestExit(pplx_space_common_core::types::RuntimeKind),
+    UnsupportedGuestExit(pplx_space_execution_spec::RuntimeKind),
     #[error("recipe builds require an ext4 image with a guest agent; import opaque disks instead")]
     UnsupportedGuestImage,
     #[error(transparent)]
@@ -216,7 +215,7 @@ pub enum BuildError {
         source: semver::Error,
     },
     #[error(transparent)]
-    InvalidSandboxId(#[from] pplx_space_common_core::ids::InvalidSandboxId),
+    InvalidSandboxId(#[from] pplx_space_sandbox_model::ids::InvalidSandboxId),
     #[error(transparent)]
     TemplateRef(#[from] pplx_space_template_mgr_client::TemplateRefFromReferenceError),
     #[error("{0}")]
@@ -468,6 +467,7 @@ async fn delete_sandbox_best_effort(
             sandbox_id: sandbox_id.to_string(),
             template_filter: None,
             blocking: true,
+            discard_retained_filesystem_reason: None,
         })
         .await
     {
@@ -529,7 +529,7 @@ fn build_vm_create_request(
     base_template_name: String,
     base_content_hash: String,
     rootfs_size_mb: Option<u32>,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     network_policy: &NetworkPolicyV1,
 ) -> CreateRequest {
     let mut request = CreateRequest {
@@ -563,6 +563,7 @@ fn build_vm_create_request(
         route_identity: None,
         disk_io_max_operations_per_sec: None,
         disk_io_max_bandwidth_mib_per_sec: None,
+        required_environment: None,
     };
     if let Some(reference) = environment {
         pplx_space_sbx_mgr_client::environment::bind(&mut request, reference);
@@ -621,7 +622,7 @@ impl TemplateBuilder {
 
     pub fn with_environment(
         mut self,
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     ) -> Self {
         self.environment = environment;
         self
@@ -679,10 +680,8 @@ impl TemplateBuilder {
                 let seeds = oci::GuestSeeds::from_env()?;
                 let selected = if seeds.applies_to(base) {
                     let image = oci::mount(oci::OciMountRequest {
-                        cache_dir: Path::new(
-                            pplx_space_common_core::host::linux::paths::FIRECRACKER_CACHE_DIR,
-                        )
-                        .join("builds/oci"),
+                        cache_dir: Path::new(pplx_space_host_layout::paths::FIRECRACKER_CACHE_DIR)
+                            .join("builds/oci"),
                         reference: reference.clone(),
                     })
                     .await
@@ -733,6 +732,7 @@ impl TemplateBuilder {
                     template: Some(TemplateRef::try_from(&base)?),
                     vcpu: None,
                     memory_mib: None,
+                    environment_required: false,
                 })
                 .await
                 .map_err(|e| {
@@ -758,7 +758,7 @@ impl TemplateBuilder {
                     "GetTemplate for base '{base_raw}' returned no template"
                 ))
             })?;
-            let base_name = pplx_space_common_core::types::TemplateName::parse(
+            let base_name = pplx_space_template_model::TemplateName::parse(
                 resolved_template.name,
             )
             .map_err(|error| {
@@ -879,8 +879,7 @@ impl TemplateBuilder {
         let oci_guest_runtime = if let Some((reference, guest_runtime, guest_bin_dir)) = oci_inputs
         {
             let cache_dir =
-                Path::new(pplx_space_common_core::host::linux::paths::FIRECRACKER_CACHE_DIR)
-                    .join("builds/oci");
+                Path::new(pplx_space_host_layout::paths::FIRECRACKER_CACHE_DIR).join("builds/oci");
             let seed_rootfs = resolved_base.rootfs_path.clone();
             let bundle_version = guest_runtime.spaced_version.clone();
             let result = build_phase(template_id, BuildPhase::PrepareOciRootfs, async {
@@ -974,7 +973,7 @@ impl TemplateBuilder {
         println!(
             "Booting build VM in namespace {} (sandbox {})...",
             start_resp.namespace,
-            pplx_space_common_core::ids::sandbox_label(&sandbox_id)?,
+            pplx_space_sandbox_model::ids::sandbox_label(&sandbox_id)?,
         );
 
         // Wait for SSH
@@ -1130,8 +1129,7 @@ impl TemplateBuilder {
         // For runtime-bearing images, confirmed Stop proves the runtime cgroups
         // are gone; no container-local /proc check can strengthen that barrier.
         // Copy the modified rootfs out BEFORE delete removes it.
-        let cache_rootfs =
-            pplx_space_common_core::host::linux::paths::sandbox_rootfs_path(&sandbox_id);
+        let cache_rootfs = pplx_space_host_layout::paths::sandbox_rootfs_path(&sandbox_id);
         let final_rootfs = format!("{output_dir}/rootfs.ext4");
         if let Err(e) = build_phase(template_id, BuildPhase::CopyRootfs, async {
             std::fs::create_dir_all(&output_dir).map_err(|source| BuildError::Io {
@@ -1159,17 +1157,17 @@ impl TemplateBuilder {
         }
 
         let sandbox_metadata_path =
-            pplx_space_common_core::host::linux::paths::sandbox_metadata_path(&sandbox_id);
+            pplx_space_host_layout::paths::sandbox_metadata_path(&sandbox_id);
         let execution = match tokio::fs::read(&sandbox_metadata_path).await {
-            Ok(bytes) => serde_json::from_slice::<
-                pplx_space_common_core::types::SandboxArtifactMetadata,
-            >(&bytes)
-            .map_err(|error| {
-                BuildError::message(format!(
-                    "invalid sandbox runtime metadata {sandbox_metadata_path}: {error}"
-                ))
-            })
-            .map(|metadata| metadata.execution),
+            Ok(bytes) => {
+                serde_json::from_slice::<pplx_space_artifact_model::SandboxArtifactMetadata>(&bytes)
+                    .map_err(|error| {
+                        BuildError::message(format!(
+                            "invalid sandbox runtime metadata {sandbox_metadata_path}: {error}"
+                        ))
+                    })
+                    .map(|metadata| metadata.execution)
+            }
             Err(source) => Err(BuildError::Io {
                 operation: "read sandbox runtime metadata",
                 source,
@@ -1182,6 +1180,7 @@ impl TemplateBuilder {
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: true,
+                discard_retained_filesystem_reason: None,
             })
             .await
             .map_err(|e| BuildError::message(format!("sandbox delete failed: {e}")))?;
@@ -1401,7 +1400,7 @@ impl TemplateBuilder {
         let workspace_cargo_toml = scratch_workspace_cargo_toml();
         let cache_dir = format!(
             "{}/builds/seed-cache",
-            pplx_space_common_core::host::linux::paths::FIRECRACKER_CACHE_DIR
+            pplx_space_host_layout::paths::FIRECRACKER_CACHE_DIR
         );
 
         println!("=== Building template '{template_id}' from recipe '{recipe_label}' ===");
@@ -1748,9 +1747,8 @@ fn validate_scratch_recipe(recipe: &Recipe) -> Result<(), BuildError> {
 }
 
 fn write_scratch_scripts() -> Result<ScratchScriptBundle, BuildError> {
-    let scratch_script_root =
-        Path::new(pplx_space_common_core::host::linux::paths::FIRECRACKER_CACHE_DIR)
-            .join(SCRATCH_SCRIPT_STAGE_SUBDIR);
+    let scratch_script_root = Path::new(pplx_space_host_layout::paths::FIRECRACKER_CACHE_DIR)
+        .join(SCRATCH_SCRIPT_STAGE_SUBDIR);
     fs::create_dir_all(&scratch_script_root).map_err(|source| BuildError::Io {
         operation: "create scratch script staging dir",
         source,
@@ -1890,7 +1888,7 @@ async fn current_guest_runtime_metadata(
 ) -> Result<GuestRuntimeMetadata, BuildError> {
     let spaced_version = guest_binary_version(binaries).await?;
     let spaced_compatibility_family =
-        pplx_space_spaced_common::spaced_compatibility_family_for_version(&spaced_version)
+        pplx_space_spaced_guest_protocol::spaced_compatibility_family_for_version(&spaced_version)
             .map_err(|source| BuildError::InvalidSpacedVersion {
                 version: spaced_version.clone(),
                 source,
@@ -2337,7 +2335,7 @@ fn extract_requested_tar_payload(
 
 fn requested_tar_entry_target(path: &Path, source_path: &Path, staged: &Path) -> Option<PathBuf> {
     path.strip_prefix(source_path).ok().map(|relative_path| {
-        if relative_path.as_os_str().is_empty() {
+        if relative_path.is_empty() {
             staged.to_path_buf()
         } else {
             staged.join(relative_path)
@@ -2470,7 +2468,7 @@ fn validate_supported_tar_entry(
 }
 
 fn validate_tar_entry_path(path: &Path) -> Result<(), SshError> {
-    if path.as_os_str().is_empty() {
+    if path.is_empty() {
         return Err(SshError::CopyPayload(
             "tar payload contains empty entry path".into(),
         ));
@@ -2499,7 +2497,7 @@ fn validate_tar_entry_path(path: &Path) -> Result<(), SshError> {
 /// virtual cursor would step above the staging root. Absolute targets and
 /// any `RootDir` / `Prefix` components are rejected outright.
 fn validate_tar_symlink_target(link_path: &Path, target: &Path) -> Result<(), SshError> {
-    if target.as_os_str().is_empty() {
+    if target.is_empty() {
         return Err(SshError::CopyPayload(format!(
             "tar payload symlink {} has empty target",
             link_path.display()

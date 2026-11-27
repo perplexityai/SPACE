@@ -13,6 +13,12 @@ expression: paths_by_method
   "/debug/sandbox/{sandbox_id}": [
     "get"
   ],
+  "/firewall-rollouts": [
+    "post"
+  ],
+  "/firewall-rules": [
+    "get"
+  ],
   "/nodes": [
     "get",
     "post"
@@ -25,7 +31,13 @@ expression: paths_by_method
     "get",
     "patch"
   ],
+  "/nodes/{node_id}/drain-v2-preview": [
+    "get"
+  ],
   "/nodes/{node_id}/health": [
+    "get"
+  ],
+  "/nodes/{node_id}/holds": [
     "get"
   ],
   "/nodes/{node_id}/network-policy:reconcile": [
@@ -107,6 +119,22 @@ expression: paths_by_method
   ],
   "/runtime-environments/{environment_ref}/state": [
     "put"
+  ],
+  "/runtime-upgrade-campaigns": [
+    "get",
+    "post"
+  ],
+  "/runtime-upgrade-campaigns/{campaign_id}": [
+    "get"
+  ],
+  "/runtime-upgrade-campaigns/{campaign_id}:abort": [
+    "post"
+  ],
+  "/runtime-upgrade-campaigns/{campaign_id}:pause": [
+    "post"
+  ],
+  "/runtime-upgrade-campaigns/{campaign_id}:resume": [
+    "post"
   ],
   "/sandboxes": [
     "get",

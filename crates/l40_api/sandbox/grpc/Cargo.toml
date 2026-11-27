@@ -11,8 +11,10 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-pplx-space-common-core = { workspace = true }
+pplx-space-accounts = { workspace = true }
+pplx-space-sandbox-model = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
+pplx-space-network-roles = { workspace = true }
 pplx-space-observability = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }

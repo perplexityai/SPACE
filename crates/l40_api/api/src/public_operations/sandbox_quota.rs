@@ -63,10 +63,9 @@
 use std::time::Duration;
 
 use crate::metrics::operations as metrics;
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{OrgId, UserId};
-use pplx_space_postgres_pool::contention;
-use pplx_space_public_api::OperationKind;
+use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_postgres_pool::{TxSettings as _, contention};
+use pplx_space_public_operation_store::quota::{self, SandboxesHeld};
 use sqlx::{Postgres, Transaction};
 
 use super::{
@@ -268,7 +267,11 @@ impl PublicOperationAdmission {
             plan.org
                 .map(|(_, mode)| (plan.org_id.as_uuid(), ORG_LOCK_SEED, mode)),
         ];
-        let lock_timeout = bound_lock_timeout_tx(&mut self.tx, self.quota_lock_timeout).await?;
+        let saved_lock_timeout = self
+            .tx
+            .lower_local_lock_timeout(self.quota_lock_timeout)
+            .await
+            .map_err(sqlx::Error::from)?;
         for (id, seed, mode) in locks.into_iter().flatten() {
             match lock_tx(&mut self.tx, id, seed, mode).await {
                 Ok(()) => {}
@@ -286,7 +289,10 @@ impl PublicOperationAdmission {
                 Err(error) => return Err(error.into()),
             }
         }
-        restore_lock_timeout_tx(&mut self.tx, &lock_timeout).await?;
+        self.tx
+            .restore_local_lock_timeout(saved_lock_timeout)
+            .await
+            .map_err(sqlx::Error::from)?;
         let subject_id = plan.subject.map(|(user_id, _, _)| user_id);
         let held = sandboxes_held_tx(&mut self.tx, plan.org_id, subject_id).await?;
         let org = plan.org.map(|(limit, mode)| {
@@ -314,143 +320,37 @@ impl PublicOperationAdmission {
     }
 }
 
-/// Bound this transaction's lock waits by `timeout` unless a shorter bound
-/// is already set. Returns the `lock_timeout` in force before the call, for
-/// [`restore_lock_timeout_tx`].
-async fn bound_lock_timeout_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    timeout: Duration,
-) -> Result<String, sqlx::Error> {
-    let previous: String = sqlx::query_scalar(sql!("SELECT current_setting('lock_timeout')"))
-        .fetch_one(&mut **tx)
-        .await?;
-    // `set_config(..., is_local => true)` is `SET LOCAL` with a bind
-    // parameter. `0` is no bound.
-    sqlx::query(sql!(
-        "SELECT set_config('lock_timeout', $1::text, TRUE)
-          WHERE current_setting('lock_timeout')::interval = interval '0'
-             OR current_setting('lock_timeout')::interval > $1::text::interval"
-    ))
-    .bind(format!("{}ms", timeout.as_millis()))
-    .execute(&mut **tx)
-    .await?;
-    Ok(previous)
-}
-
-/// Return this transaction's `lock_timeout` to `previous`, as read by
-/// [`bound_lock_timeout_tx`], keeping any value the caller had set for the
-/// transaction or the session.
-async fn restore_lock_timeout_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    previous: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!("SELECT set_config('lock_timeout', $1, TRUE)"))
-        .bind(previous)
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
-}
-
 async fn lock_tx(
     tx: &mut Transaction<'_, Postgres>,
     id: uuid::Uuid,
     seed: i64,
     mode: LockMode,
 ) -> Result<(), sqlx::Error> {
-    let statement = match mode {
-        LockMode::Shared => sqlx::query(sql!(
-            "SELECT pg_advisory_xact_lock_shared(hashtextextended($1::text, $2))"
-        )),
-        LockMode::Exclusive => sqlx::query(sql!(
-            "SELECT pg_advisory_xact_lock(hashtextextended($1::text, $2))"
-        )),
-    };
-    statement.bind(id).bind(seed).execute(&mut **tx).await?;
-    Ok(())
+    match mode {
+        LockMode::Shared => quota::lock_quota_shared(&mut **tx, id, seed)
+            .await
+            .map_err(sqlx::Error::from),
+        LockMode::Exclusive => quota::lock_quota_exclusive(&mut **tx, id, seed)
+            .await
+            .map_err(sqlx::Error::from),
+    }
 }
 
-struct SandboxesHeld {
-    org: i64,
-    subject: i64,
-}
-
-/// The org's live sandboxes plus its in-flight native creates without a
-/// live row, and the share of those `subject_id` owns or requested (zero
-/// without one). An in-flight create whose row went terminal (a drain sweep
-/// failed it while the create ran) still counts: it can retry and succeed.
-///
-/// One statement on purpose: split into a row count and an operation count,
-/// two READ COMMITTED snapshots could miss a create whose row lands between
-/// them, counted by neither half. It lives here, beside the
-/// `public_operations` half this module owns and inside the admission
-/// transaction, rather than as a composed verb of `pplx-space-sandbox-store`,
-/// which owns `sandboxes`; moving it there has to keep it one statement. The
-/// terminal set repeats the lifecycle CAS guards' list.
-///
-/// A create's row is the one its target names, so the target is parsed back
-/// to a sandbox id and each create is joined to its row by id. Comparing the
-/// target with `$5 || s.id::text` instead can use no index, and a generic
-/// plan then rescans the org's rows once per create. Only the text
-/// `s.id::text` produces is parsed: the `LIKE` fixes its length and its
-/// hyphens' places, and the expression allows exactly four hyphens with
-/// lowercase hex between them. Any other target names no row, as the text
-/// comparison has it, and never reaches the cast, which would fail the
-/// statement. One expression with counted repetitions would say the same,
-/// but Postgres evaluates it many times slower than this pair.
-///
-/// Cost: the org's rows through `idx_sandboxes_org_id`, `deleted`
-/// tombstones included; the org's queued or running operations, of any
-/// kind or product, through `idx_public_operations_org_state`, which has
-/// neither of those columns, so the native-create filter applies after the
-/// read; and each of the org's in-flight creates joined to its row by id.
-/// A constant rather than a literal at its query site so `plan_tests` can
-/// `EXPLAIN` the text this runs.
-const SANDBOXES_HELD: &str = sql!(
-    "SELECT COUNT(*), COUNT(*) FILTER (WHERE held.user_id = $2)
-       FROM (
-            SELECT s.user_id
-              FROM sandboxes s
-             WHERE s.org_id = $1
-               AND s.lifecycle NOT IN ('failed', 'quarantined', 'deleted')
-            UNION ALL
-            SELECT op.actor_user_id
-              FROM public_operations op
-             WHERE op.org_id = $1
-               AND op.state IN ('queued', 'running')
-               AND op.api_product = $3
-               AND op.kind = $4
-               AND NOT EXISTS (
-                   SELECT 1
-                     FROM sandboxes s
-                    WHERE s.id = CASE
-                              WHEN starts_with(op.target_id, $5)
-                               AND substr(op.target_id, length($5) + 1)
-                                   LIKE '________-____-____-____-____________'
-                               AND substr(op.target_id, length($5) + 1)
-                                   ~ '^[0-9a-f]+-[0-9a-f]+-[0-9a-f]+-[0-9a-f]+-[0-9a-f]+$'
-                              THEN substr(op.target_id, length($5) + 1)::uuid
-                          END
-                      AND s.org_id = $1
-                      AND s.lifecycle NOT IN ('failed', 'quarantined', 'deleted')
-               )
-       ) held"
-);
-
-/// Count with [`SANDBOXES_HELD`]; see there for what is counted.
+/// Count with `pplx_space_public_operation_store::quota::SANDBOXES_HELD`;
+/// see there for what is counted.
 async fn sandboxes_held_tx(
     tx: &mut Transaction<'_, Postgres>,
     org_id: OrgId,
     subject_id: Option<UserId>,
 ) -> Result<SandboxesHeld, sqlx::Error> {
-    let (org, subject) = sqlx::query_as::<_, (i64, i64)>(SANDBOXES_HELD)
-        .bind(org_id)
-        .bind(subject_id)
-        .bind(ApiProduct::Native.as_str())
-        .bind(OperationKind::CreateSandbox.as_str())
-        .bind(pplx_space_public_api::PUBLIC_SANDBOX_ID_PREFIX)
-        .fetch_one(&mut **tx)
-        .await?;
-    Ok(SandboxesHeld { org, subject })
+    pplx_space_public_operation_store::quota::sandboxes_held(
+        &mut **tx,
+        org_id,
+        subject_id,
+        ApiProduct::Native.as_str(),
+    )
+    .await
+    .map_err(sqlx::Error::from)
 }
 
 #[cfg(test)]

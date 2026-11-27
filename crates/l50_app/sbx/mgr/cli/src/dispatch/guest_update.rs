@@ -52,31 +52,42 @@ pub(super) async fn handle(
     // retryable without requiring operators to allocate identifiers themselves.
     eprintln!("Guest maintenance retry: --operation {operation} --expected-execution {execution}");
     let result = if let Some(path) = policy {
-        #[derive(serde::Deserialize)]
-        struct Policy {
-            promotion: pplx_space_spaced_update::policy::Promotion,
-        }
         let bytes = std::fs::File::open(&path)
             .and_then(read_policy_bytes)
             .unwrap_or_else(|error| exit_error(error));
-        let policy: Policy = serde_json::from_slice(&bytes).unwrap_or_else(|e| exit_error(e));
-        let p = policy.promotion;
+        let catalog = pplx_space_spaced_update::catalog::Catalog::parse(&bytes)
+            .unwrap_or_else(|e| exit_error(e));
+        let contract = status
+            .guest
+            .as_ref()
+            .map(|guest| guest.seed_contract.as_str())
+            .unwrap_or_default();
+        let platform = pplx_space_spaced_update::RecoveryPlatform::from_contract(contract)
+            .unwrap_or_else(|| exit_error("guest has no supported update recovery contract"));
+        let architecture = std::env::consts::ARCH
+            .parse()
+            .unwrap_or_else(|e| exit_error(e));
+        let p = catalog
+            .select(platform, architecture)
+            .unwrap_or_else(|| exit_error("node policy has no target for this guest platform"))
+            .promotion
+            .clone();
         client
             .apply_guest_update(ApplyGuestUpdateRequest {
                 sandbox_id: status.sandbox_id,
                 operation_id: operation,
                 expected_execution_id: execution,
                 force: args.force,
-                promotion: Some(pplx_space_spaced_common::proto::update::Promotion {
+                promotion: Some(pplx_space_spaced_guest_protocol::proto::update::Promotion {
                     channel: p.channel,
                     target_version: p.target_version.to_string(),
                     guest_update_required_since: p.guest_update_required_since.to_string(),
                     intent: match p.intent {
                         pplx_space_spaced_update::policy::SelectionIntent::Upgrade => {
-                            pplx_space_spaced_common::proto::update::SelectionIntent::Upgrade
+                            pplx_space_spaced_guest_protocol::proto::update::SelectionIntent::Upgrade
                         }
                         pplx_space_spaced_update::policy::SelectionIntent::Rollback => {
-                            pplx_space_spaced_common::proto::update::SelectionIntent::Rollback
+                            pplx_space_spaced_guest_protocol::proto::update::SelectionIntent::Rollback
                         }
                     } as i32,
                     target_digest: p.target.to_string(),
@@ -108,13 +119,13 @@ fn display(result: GuestUpdateOperation, json: bool) {
             "version": guest.committed_version, "incarnation": guest.incarnation, "admission_held": guest.customer_admission_held,
             "committed_digest": guest.committed.as_ref().map(|value| &value.digest),
             "running_digest": guest.running.as_ref().map(|value| &value.digest),
-            "defer_reasons": guest.defer_reasons.iter().filter_map(|reason| pplx_space_spaced_common::proto::update::DeferReason::try_from(*reason).ok()).map(|reason| reason.as_str_name()).collect::<Vec<_>>(),
+            "defer_reasons": guest.defer_reasons.iter().filter_map(|reason| pplx_space_spaced_guest_protocol::proto::update::DeferReason::try_from(*reason).ok()).map(|reason| reason.as_str_name()).collect::<Vec<_>>(),
         }));
         println!(
             "{}",
             serde_json::json!({"sandbox_id": result.sandbox_id,
             "execution_id": result.execution_id, "operation_id": result.operation_id,
-            "phase": result.phase().as_str_name(), "outcome": result.outcome, "guest": guest})
+            "phase": result.phase().as_str_name(), "outcome": result.outcome, "automatic_deferral": result.automatic_deferral, "guest": guest})
         );
         return;
     }
@@ -125,6 +136,9 @@ fn display(result: GuestUpdateOperation, json: bool) {
         result.operation_id.as_deref().unwrap_or("none"),
         result.phase()
     );
+    if let Some(reason) = result.automatic_deferral {
+        println!("Automatic deferral: {reason}");
+    }
     if let Some(outcome) = result.outcome {
         println!("Outcome: {outcome}");
     }

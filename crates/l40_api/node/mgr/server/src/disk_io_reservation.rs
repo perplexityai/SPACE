@@ -616,7 +616,7 @@ mod linux {
                     .rsplit_once(" path ")
                     .map(|(_, path)| PathBuf::from(path.trim()))
             })
-            .filter(|path| !path.as_os_str().is_empty())
+            .filter(|path| !path.is_empty())
             .collect();
         if paths.is_empty() {
             return Err("btrfs filesystem show returned no member devices".into());

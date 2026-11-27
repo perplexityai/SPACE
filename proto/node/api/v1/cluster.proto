@@ -23,11 +23,15 @@ service ClusterApi {
   rpc RegisterTemplate(RegisterTemplateRequest) returns (RegisterTemplateResponse);
 
   // Register or reuse an immutable release for a template, keyed by
-  // `(template_name, hash)`, plus its tags and storage locations. Performed in
-  // a single transaction. Fails with NOT_FOUND if the template does not
-  // exist; ALREADY_EXISTS only for incompatible existing release identity such
-  // as a runtime mismatch on the same `(template_name, hash)`; INVALID_ARGUMENT
-  // for unsupported runtimes.
+  // `(template_name, hash)` and the node cache partition of its execution
+  // environment (see `RegisterTemplateReleaseRequest.execution`), plus its
+  // tags and storage locations. Performed in a single transaction. Fails with
+  // NOT_FOUND if the template does not exist; ALREADY_EXISTS only for
+  // incompatible existing release identity such as a runtime mismatch on the
+  // same `(template_name, hash)` or different execution metadata for the same
+  // partition; FAILED_PRECONDITION when a twin's registration names a tag
+  // that doesn't already name its hash; INVALID_ARGUMENT for unsupported
+  // runtimes.
   rpc RegisterTemplateRelease(RegisterTemplateReleaseRequest) returns (RegisterTemplateReleaseResponse);
 
   // Resolve a (template_name, runtime, tag) tuple to its release and the
@@ -39,19 +43,23 @@ service ClusterApi {
   // directly rather than going through `template_release_tags`, so
   // it works regardless of whether the digest happens to be
   // registered as a tag. Runtime is intentionally not part of the
-  // key — artifact digests are runtime-scoped by construction, so
-  // `(template_name, hash)` uniquely identifies a release across
-  // every supported runtime. Fails with NOT_FOUND if no release
-  // matches.
+  // key: artifact digests are runtime-scoped by construction, so
+  // `(template_name, hash)` names one build across every supported
+  // runtime. That build can have a release per execution environment
+  // (its original and twins); `environment` picks one, and without it
+  // the original answers. Fails with NOT_FOUND if no release matches.
   rpc FindTemplateReleaseByHash(FindTemplateReleaseByHashRequest) returns (FindTemplateReleaseResponse);
 
   // Return the latest `limit` releases for `(template_name, runtime)`
-  // ordered by `template_releases.created_at` DESC, along with the
+  // ordered newest version first (see `ListLatestTemplateReleasesResponse`),
+  // along with the
   // storage locations holding each. Used by the node-side prefetcher
   // to warm the latest N artifacts per template without going through
   // the tag indirection. An empty `runtime` is rejected; `limit` must
   // be in `[1, 50]`. Returns an empty `releases` list (NOT NOT_FOUND)
-  // when the template exists but has no releases yet.
+  // when the template exists but has no releases yet. Each release's
+  // `hash` is in its `sha256:<hex>` spelling, the one the node keys its
+  // builds and release pins on, even for a release stored bare.
   rpc ListLatestTemplateReleases(ListLatestTemplateReleasesRequest) returns (ListLatestTemplateReleasesResponse);
 
   // Return every `(template_name, hash)` release that warm pools
@@ -62,7 +70,8 @@ service ClusterApi {
   // prefetch pins (and has no live warm slot on the node at tick time)
   // is never evicted — eviction would otherwise turn the next pool
   // refill into a full re-pull under disk pressure. Callers treat any
-  // error as "do not evict this tick" (fail closed).
+  // error as "do not evict this tick" (fail closed). Each `hash` is in
+  // its `sha256:<hex>` spelling, as the node's builds are keyed.
   rpc ListWarmPoolTemplateReleases(ListWarmPoolTemplateReleasesRequest) returns (ListWarmPoolTemplateReleasesResponse);
 
   // Return the control-plane desired network policy state for the node-local
@@ -106,6 +115,13 @@ service ClusterApi {
   // This is a diagnostic/state update only; route resolution remains the
   // source of truth for the current backend endpoint.
   rpc RecordDataPlaneSessionReconnect(RecordDataPlaneSessionReconnectRequest) returns (RecordDataPlaneSessionReconnectResponse);
+
+  // Record that a data-plane stream reported the exit of the process bound to
+  // a terminal or process session, which moves the session's public state to
+  // `closed`. Idempotent, and a state update only: a later attach still
+  // resolves the session and reads the exit. Leaves a revoked session, or one
+  // bound to another process, as it is.
+  rpc RecordDataPlaneSessionProcessExited(RecordDataPlaneSessionProcessExitedRequest) returns (RecordDataPlaneSessionProcessExitedResponse);
 
   // Read the current revocation epoch/status for a protocol session without
   // returning route backend or credential material.
@@ -210,6 +226,17 @@ service ClusterApi {
   // answer is `EXECUTION_CURRENCY_UNSPECIFIED`.
   rpc GetExecutionCurrency(GetExecutionCurrencyRequest) returns (GetExecutionCurrencyResponse);
 
+  // The calling worker's firewall assignment and pending verification round,
+  // read from one snapshot. The server resolves the worker from the caller's
+  // reviewed node identity; the request names nothing. Read-only: fetching
+  // twice changes nothing. After the auth layer's UNAUTHENTICATED and
+  // UNAVAILABLE: PERMISSION_DENIED unless the caller holds the fetch authority
+  // and its reviewed node name maps to exactly one live worker registration
+  // whose UID matches; FAILED_PRECONDITION when that worker isn't enrolled or
+  // no enrollment predicate is approved; INTERNAL when the stored assignment
+  // can't be read.
+  rpc FetchFirewallRules(FetchFirewallRulesRequest) returns (FetchFirewallRulesResponse);
+
   // BYOK volume encryption (per-sandbox DEK gate, KEK resolution, and wrap
   // storage) is owned end to end by the credential manager
   // (credmgr GetOrIssueSandboxVolumeDek), so
@@ -256,6 +283,11 @@ message TemplateRelease {
   string runtime = 3;       // 'fc' (extends as DB CHECK relaxes)
   string hash = 4;
   string created_at = 5;    // RFC3339
+  // The execution environment the release is bound to
+  // (`execution_metadata.environment`); absent for an unbound release. A
+  // release's twin has the same template name and hash and another
+  // environment. Servers that predate twins never set it.
+  optional string environment = 6;
 }
 
 // Who may launch a template (mirrors `templates.visibility`). Carried on the
@@ -330,10 +362,14 @@ message RegisterTemplateReleaseRequest {
   string runtime = 2;
   string hash = 3;
   // Tags to attach to the release. Tags are unique per template
-  // (UNIQUE(template_name, tag)); if a tag already exists for the template it
-  // is reassigned to this release and its `modified_at` is bumped. Repeating
-  // the same `(template_name, hash)` registration remains idempotent because
-  // the release row itself is keyed by hash.
+  // (UNIQUE(template_name, tag)) and attach to the original release of a
+  // hash. If a tag already exists for the template, an original's
+  // registration reassigns it to this release and bumps its `modified_at`.
+  // A twin's registration only confirms tags already on its hash: it leaves
+  // them untouched and fails with FAILED_PRECONDITION for a tag that names
+  // another hash or doesn't exist yet. Repeating a registration remains
+  // idempotent because it attaches to the existing release of its hash and
+  // partition.
   repeated string tags = 4;
   // Storage URIs (e.g. "s3://bucket/key", "https://...") where this release
   // can be fetched from. Duplicates within the request are deduplicated;
@@ -341,8 +377,24 @@ message RegisterTemplateReleaseRequest {
   repeated string storage_connection_strings = 5;
   optional string org_id = 7;
   // Execution environment captured at build time. Releases are immutable per
-  // `(template_name, hash)`, so the first registration that carries this wins;
-  // later registrations never overwrite stored execution metadata.
+  // template, stored spelling of the hash and node cache partition (unbound
+  // and initial-environment releases share the legacy one): the first
+  // registration that carries this for a partition wins, and later
+  // registrations never overwrite stored execution metadata. A registration
+  // looks only under the original's spelling of the digest (where both
+  // spellings have an original, the one that owns a storage location, else
+  // the earlier), apart from finding a twin under the other. A legacy-partition registration
+  // fills a release recorded without it under that spelling, when no release
+  // of its partition with recorded metadata is there first; a release under
+  // the other spelling is never filled. Any other registration with no
+  // release of its partition under that spelling becomes the release's twin
+  // once the schema admits twins, an unbound or initial-environment one
+  // included when that spelling has no release recorded without it (the
+  // first registration of a hash, in any environment, is its original);
+  // until then it falls back to the original release, which it fills when
+  // that release has no execution metadata and is otherwise refused as
+  // different execution metadata. A twin's registration can't move a tag off
+  // another hash.
   optional space.execution.v1.ExecutionMetadata execution = 8;
   // Consumed atomically with the release; never substitutes another build's grant.
   optional string system_publication_grant_id = 9;
@@ -364,6 +416,18 @@ message FindTemplateReleaseRequest {
   optional string caller_org_id = 4;
   // Restrict release and storage resolution to generic templates in one SQL snapshot.
   bool generic_only = 5;
+  // Resolve the tag's template name and hash to the release bound to this
+  // execution environment (a twin, or the tagged release itself) instead of
+  // the tagged release. Selecting the initial environment also selects an
+  // unbound release: nodes cache both in the legacy partition. NotFound when
+  // no release of that hash is bound to it.
+  // Absent resolves the tagged digest's original release: the tagged release,
+  // unless the tag sits on the other spelling's original (one written before
+  // the shared original-release rule), which resolves to the digest original.
+  // Servers that predate the field ignore a selector and answer with the
+  // tagged release: a caller that sends one must require
+  // `environment_applied` on the response.
+  optional string environment = 6;
 }
 
 message FindTemplateReleaseResponse {
@@ -378,18 +442,36 @@ message FindTemplateReleaseResponse {
   // True only when generic-only resolution succeeded. Prefetch must require this
   // acknowledgement so older servers cannot silently ignore the restriction.
   bool generic_authorized = 5;
+  // True when the request's `environment` selector was applied. Servers that
+  // predate the selector ignore it and leave this false, and answer with a
+  // release that may be another environment's, storage locations included.
+  // A caller that sends a selector must not use the release or any storage
+  // location unless this is true.
+  bool environment_applied = 6;
 }
 
 message FindTemplateReleaseByHashRequest {
   string template_name = 1;
   // The full digest including algorithm prefix, e.g.
   // "sha256:7f2c852039ccdd...". Matched against
-  // `template_releases.hash` exactly. Runtime is not needed —
+  // `template_releases.hash` with or without the `sha256:` prefix,
+  // since releases are stored under either spelling. Runtime is not needed:
   // artifact digests are already runtime-scoped, so
-  // `(template_name, hash)` uniquely identifies a release.
+  // `(template_name, hash)` names one build, whose releases differ
+  // only by execution environment.
   string hash = 2;
   optional string caller_org_id = 3;
   bool generic_only = 4;
+  // Resolve the release of this hash bound to this execution environment;
+  // selecting the initial environment also selects an unbound release.
+  // NotFound when none is. Absent returns one release, the digest's
+  // original, with the storage locations of each spelling's original (bare
+  // and `sha256:`, the first registered under it, as before twins), whichever
+  // spelling the request names. Servers that predate the field ignore it and,
+  // once twins exist, can answer with or merge any release of the hash: a
+  // caller that sends a selector must require `environment_applied` on the
+  // response.
+  optional string environment = 5;
 }
 
 message ListLatestTemplateReleasesRequest {
@@ -397,6 +479,15 @@ message ListLatestTemplateReleasesRequest {
   string runtime = 2;
   // Maximum number of releases to return. Must be in `[1, 50]`.
   uint32 limit = 3;
+  // List the latest releases bound to this execution environment (for the
+  // initial environment, unbound releases too), one per digest whichever
+  // spellings it's stored under, preferring one with a storage location.
+  // Absent lists each digest's original release once, never its twins or the
+  // other spelling's original (servers that predate the shared rule list each
+  // spelling's original). Servers that predate the field ignore it and, once
+  // twins exist, list them too: a caller that sends a selector must require
+  // `environment_applied` on the response.
+  optional string environment = 4;
 }
 
 // A single `(release, storage_locations)` entry. Mirrors the shape of
@@ -413,7 +504,13 @@ message ListLatestTemplateReleasesEntry {
 }
 
 message ListLatestTemplateReleasesResponse {
-  // Ordered most-recent-first by `template_releases.created_at`.
+  // Ordered newest version first: by the `created_at` of each digest's
+  // earliest release under either spelling, then the release's own
+  // `created_at`, DESC. A twin registered for an older version after a newer
+  // one ranks by that earliest release. Without a selector every entry is its
+  // digest's original, one per digest, so this is
+  // `template_releases.created_at` unless the digest is stored under both
+  // spellings and its original isn't the earlier one.
   repeated ListLatestTemplateReleasesEntry entries = 1;
   // Visibility of the requested template. Response-level so the signal
   // survives an empty `entries` list: a template row with zero registered
@@ -435,6 +532,11 @@ message ListLatestTemplateReleasesResponse {
   // Best-effort like the per-entry field: UNSPECIFIED when the control
   // plane cannot resolve it.
   TemplateVisibility template_visibility = 2;
+  // True when the request's `environment` selector was applied; as on
+  // `FindTemplateReleaseResponse`, servers that predate it leave this false,
+  // and a caller that sends a selector must not use any entry unless this is
+  // true.
+  bool environment_applied = 3;
 }
 
 message ListWarmPoolTemplateReleasesRequest {}
@@ -671,6 +773,11 @@ message BindDataPlaneSessionProcessRequest {
   string session_id = 1;
   optional string protocol_session_id = 2;
   string process_id = 3;
+  // Set by a caller that records the process's exit with
+  // RecordDataPlaneSessionProcessExited. Only then does the bind move a
+  // pending session to `open`: a caller that never records the exit would
+  // leave the session `open` after the process is gone.
+  bool records_exit = 4;
 }
 
 message BindDataPlaneSessionProcessResponse {
@@ -701,6 +808,18 @@ message RecordDataPlaneSessionReconnectResponse {
   optional string protocol_session_id = 2;
   uint64 reconnect_count = 3;
   DataPlaneReconnectReason last_reconnect_reason = 4;
+}
+
+message RecordDataPlaneSessionProcessExitedRequest {
+  string session_id = 1;
+  optional string protocol_session_id = 2;
+  string process_id = 3;
+}
+
+message RecordDataPlaneSessionProcessExitedResponse {
+  // Whether this call closed the session; false when no pending or open
+  // terminal or process session bound to `process_id` matched.
+  bool closed = 1;
 }
 
 message GetDataPlaneSessionRevocationStateRequest {
@@ -969,6 +1088,10 @@ message PublishedSandboxState {
   // Exact activation attempt observed with this state. Generations may be
   // reused by placement retries, so attempt-scoped evidence must carry both.
   optional string activation_attempt_id = 41;
+  // When sbx-manager will next run an automatic lifecycle transition, such as
+  // the idle suspend; absent when none is scheduled. It moves as the sandbox
+  // is used.
+  optional google.protobuf.Timestamp next_auto_event_at = 42;
 }
 
 message PublishedTemplateState {
@@ -1001,6 +1124,10 @@ message PublishedTemplateState {
   space.net.policy.v1.PolicyAuthority network_policy_authority = 25;
   space.net.policy.v1.PolicyAuthority auto_lifecycle_authority = 26;
   optional space.execution.v1.ExecutionMetadata execution = 27;
+  // An unreleased per-build cache partition report used this number and name
+  // on development branches. Reserved so a later field can't reuse them.
+  reserved 28;
+  reserved "cache_partitions";
 }
 
 message PublishNodeStateRequest {
@@ -1384,4 +1511,34 @@ message GetNodeRuntimeDesiredStateResponse {
   // can't be read fails the whole call, recipe included, rather than coming
   // back absent.
   RuntimeEnvironmentDesiredPolicy execution_policy = 2;
+}
+
+message FetchFirewallRulesRequest {}
+
+// `assignment`, `pending_round`, both or neither may be set.
+message FetchFirewallRulesResponse {
+  // The canonical node ID the server resolved, set on every success.
+  string node_id = 1;
+  // Absent when the node has no assignment, unlike one to an empty revision.
+  optional FirewallRulesAssignment assignment = 2;
+  // Absent when no round is pending; accepted evidence is never one.
+  optional FirewallRulesPendingRound pending_round = 3;
+}
+
+message FirewallRulesAssignment {
+  uint64 generation = 1;
+  string revision_id = 2;
+  // The revision's canonical, ordered JSON document
+  // (pplx-space-firewall-rules-protocol).
+  string revision = 3;
+}
+
+message FirewallRulesPendingRound {
+  uint64 round = 1;
+  // When the control plane first issued the round.
+  google.protobuf.Timestamp issued_at = 2;
+  // The assignment generation the round asks about, which needn't be this
+  // response's assignment; 0 is a generation. Absent from older servers and
+  // for a round that names none: such a round can't be answered.
+  optional uint64 assignment_generation = 3;
 }

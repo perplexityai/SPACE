@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
+use pplx_space_public_api_http::PublicJson;
 
 use std::str::FromStr;
 
@@ -8,7 +9,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
 };
-use pplx_space_common_core::types::{ProcessId, ProcessSignal};
+use pplx_space_guest_process::{ProcessId, ProcessSignal};
 use pplx_space_public_api::{
     DataPlaneProcessExitStatus, DataPlaneSessionId, ProcessMutationResponse, ProcessSignalRequest,
     ProcessState, PublicPage, PublicProcess, PublicSandboxId, process_id_for_session,
@@ -127,13 +128,13 @@ pub async fn apply_process_action(
     Extension(AuthOrg(org)): Extension<AuthOrg>,
     authorized: Option<Extension<AuthorizedSandbox>>,
     Path((sandbox_id, process_id_and_action)): Path<(String, String)>,
-    body: Option<Json<Value>>,
+    body: Option<PublicJson<Value>>,
 ) -> Result<Json<ProcessMutationResponse>, PublicApiError> {
     let (process_id, action) = parse_process_action_segment(&process_id_and_action)?;
     match action {
         ProcessAction::Signal => {
             let request = body
-                .map(|Json(value)| serde_json::from_value::<ProcessSignalRequest>(value))
+                .map(|PublicJson(value)| serde_json::from_value::<ProcessSignalRequest>(value))
                 .transpose()
                 .map_err(|_| PublicApiError::bad_request("invalid signal request"))?
                 .ok_or_else(|| PublicApiError::bad_request("signal request body is required"))?;
@@ -316,6 +317,12 @@ pub(in crate::routes::public) fn controller_error(error: ControllerError) -> Pub
     // would attribute it to the cluster or the node.
     if error.is_lock_contention() {
         return PublicApiError::lock_contention();
+    }
+    if let Some(refusal) = error.sandbox_not_running_refusal() {
+        return PublicApiError::sandbox_not_running(
+            refusal.sandbox_id.into(),
+            &refusal.lifecycle.into(),
+        );
     }
     let retry_after = error.retry_after_header();
     match error.status() {

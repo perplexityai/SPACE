@@ -47,9 +47,9 @@ fn missing_pod_netns_maps_to_terminal_failed_precondition() {
     assert_eq!(
         status
             .metadata()
-            .get(pplx_space_common_core::port_exposure_signals::EXPOSE_TERMINAL_REASON_METADATA_KEY)
+            .get(pplx_space_rpc_contracts::port_exposure_signals::EXPOSE_TERMINAL_REASON_METADATA_KEY)
             .and_then(|value| value.to_str().ok()),
-        Some(pplx_space_common_core::port_exposure_signals::EXPOSE_TERMINAL_REASON_STALE_POD_NETNS)
+        Some(pplx_space_rpc_contracts::port_exposure_signals::EXPOSE_TERMINAL_REASON_STALE_POD_NETNS)
     );
 }
 
@@ -68,7 +68,7 @@ fn root_ns_ingress_rejection_carries_no_terminal_marker() {
     assert!(
         status
             .metadata()
-            .get(pplx_space_common_core::port_exposure_signals::EXPOSE_TERMINAL_REASON_METADATA_KEY)
+            .get(pplx_space_rpc_contracts::port_exposure_signals::EXPOSE_TERMINAL_REASON_METADATA_KEY)
             .is_none()
     );
 }
@@ -110,7 +110,7 @@ async fn update_cgroup_forwards_current_execution_with_clamped_memory() {
         })),
         ..Default::default()
     });
-    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    let sandbox_id = pplx_space_sandbox_model::SandboxId::new().to_string();
     let fence = bind_test_execution(&service, &sandbox_id);
     let request = |execution_fence| UpdateCgroupRequest {
         sandbox_id: sandbox_id.clone(),
@@ -154,7 +154,7 @@ async fn update_cgroup_reports_a_supervisor_refusal_with_its_code() {
 
     // The unit-test service's own supervisor refuses every RPC.
     let service = service_for_unit_tests().await;
-    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    let sandbox_id = pplx_space_sandbox_model::SandboxId::new().to_string();
     let fence = bind_test_execution(&service, &sandbox_id);
 
     let error = service

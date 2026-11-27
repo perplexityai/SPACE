@@ -39,8 +39,9 @@
 use std::{collections::BTreeMap, str::FromStr};
 
 use oci_spec::distribution::Reference as OciReference;
+use pplx_space_accounts::OrgId;
 use pplx_space_build_mgr_client::proto as build_proto;
-use pplx_space_common_core::types::{OrgId, TemplateName, TemplateReference, TemplateSelector};
+use pplx_space_template_model::{TemplateName, TemplateReference, TemplateSelector};
 
 use super::state::TemplateBuildState;
 use super::wire::{TemplateBuildStartV2, TemplateStep};
@@ -236,7 +237,7 @@ fn disk_mib_with_override(
             E2bApiError::internal(format!("{TEMPLATE_BUILD_DISK_MIB_ENV} must be a JSON object of template names or prefixes ending in * to MiB sizes or null"))
         })?;
     for (pattern, disk_mib) in &rules {
-        TemplateName::parse(pattern.strip_suffix('*').unwrap_or(pattern)).map_err(|_| {
+        TemplateName::parse(pattern.trim_suffix('*')).map_err(|_| {
             E2bApiError::internal(format!(
                 "invalid template pattern in {TEMPLATE_BUILD_DISK_MIB_ENV}"
             ))

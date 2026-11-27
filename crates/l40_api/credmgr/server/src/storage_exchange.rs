@@ -1,19 +1,21 @@
 //! Parse and authorize the storage-specific RFC 8693 token exchange contract.
 
-use pplx_space_common_core::types::SnapshotId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::fmt;
 
-use pplx_space_common_core::host::linux::identities::users;
-use pplx_space_common_core::{
-    types::ContentHash, types::OrgId, types::SandboxId, types::SnapshotArtifact, types::SubjectId,
-    types::TemplateArtifact, types::TemplateName, types::snapshot_shard,
-};
+use pplx_space_accounts::OrgId;
+use pplx_space_artifact_model::{SnapshotArtifact, TemplateArtifact, snapshot_shard};
+use pplx_space_content_digest::ContentHash;
 use pplx_space_credmgr_client::{
     AWS_CREDENTIALS_TOKEN_TYPE, BUILD_INPUT_SHA256_TOKEN_TYPE, SERVICE_ACTOR_TOKEN_TYPE,
     STORAGE_READ_SCOPE, STORAGE_SESSION_TTL_SECONDS, STORAGE_TOKEN_AUDIENCE, STORAGE_WRITE_SCOPE,
     SUBJECT_ID_TOKEN_TYPE, TOKEN_EXCHANGE_GRANT_TYPE,
 };
+use pplx_space_host_layout::identities::users;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_subject_model::SubjectId;
+use pplx_space_template_model::TemplateName;
 
 use crate::auth::{ClientService, ResolvedCaller};
 use crate::proto::ExchangeTokenRequest;
@@ -743,6 +745,16 @@ fn validate_template_resource(
                     || TemplateArtifact::PUBLISHED
                         .into_iter()
                         .any(|artifact| artifact.file_name() == *file)) =>
+        {
+            hash.parse::<ContentHash>().ok()
+        }
+        // A twin's own metadata, under the build it shares with its original.
+        (false, [name, hash, environments, environment, file])
+            if *name == template.as_str()
+                && pplx_space_artifact_model::template_environment_metadata_environment(
+                    &format!("{environments}/{environment}/{file}"),
+                )
+                .is_some() =>
         {
             hash.parse::<ContentHash>().ok()
         }

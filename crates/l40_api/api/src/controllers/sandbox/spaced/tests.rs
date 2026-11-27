@@ -1,6 +1,7 @@
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxId;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::{
     convert::Infallible,
     future::{Ready, ready},
@@ -11,8 +12,8 @@ use std::{
 use super::*;
 use axum::body::Bytes;
 use http_body_util::Full;
-use pplx_space_common_core::types::NodeDrainMode;
 use pplx_space_db_test_fixtures::pg_test_db;
+use pplx_space_node_model::NodeDrainMode;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -357,4 +358,33 @@ async fn a_runtime_grant_to_a_suspended_sandbox_admits_the_wake_its_activity_imp
         assert_eq!(admitted(sandbox.id), expected, "{activity:?}");
     }
     Ok(())
+}
+/// The control fallback passes every admission refusal through, matched on
+/// its marker rather than its status, and still falls back for a plain
+/// unreachable-runtime error.
+#[test]
+fn the_control_fallback_passes_admission_refusals_through() {
+    use crate::controllers::substrate::ActivationRejectionKind;
+    for kind in [
+        ActivationRejectionKind::RateLimited,
+        ActivationRejectionKind::EmptyCluster,
+        ActivationRejectionKind::NoFreeSlot,
+    ] {
+        let refusal = kind.controller_error("refused".to_string(), None);
+        assert_eq!(refusal.activation_rejection(), Some(kind));
+        assert!(control_fallback_passes_through(&refusal), "{kind:?}");
+    }
+    let no_free_slot = ActivationRejectionKind::NoFreeSlot.controller_error(
+        "refused".to_string(),
+        Some(std::time::Duration::from_secs(2)),
+    );
+    assert_eq!(no_free_slot.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(control_fallback_passes_through(&no_free_slot));
+
+    let unreachable =
+        ControllerError::service_unavailable("sandbox runtime is not currently reachable");
+    assert!(!control_fallback_passes_through(&unreachable));
+    assert!(control_fallback_passes_through(
+        &ControllerError::rate_limited("a 429 from elsewhere")
+    ));
 }

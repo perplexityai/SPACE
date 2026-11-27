@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::*;
 use crate::snapshot_upload::build_storage_uri_for_tests;
@@ -31,7 +31,7 @@ fn btrfs_disk_restore_stages_only_the_rootfs_diff() {
 fn quarantine_recovery_plan_request_names_the_node_from_the_node_id_file() {
     let dir = tempfile::tempdir().unwrap();
     let node_id_path = dir.path().join("node-id");
-    let node_id = pplx_space_common_core::types::NodeId::new().to_string();
+    let node_id = pplx_space_accounts::NodeId::new().to_string();
     std::fs::write(&node_id_path, format!("{node_id}\n")).unwrap();
 
     let request = quarantine_recovery_plan_request(
@@ -178,7 +178,7 @@ fn restore_key_for(storage_uri: &str, artifact: SnapshotArtifact) -> String {
 fn upload_key_for(sandbox_id: &str, snapshot_id: &str, artifact: SnapshotArtifact) -> String {
     // Mirrors what `snapshot_upload::submit_suspend_snapshot` writes for
     // the bucket-root case (empty cluster key_prefix).
-    pplx_space_common_core::types::snapshot_object_key("", sandbox_id, snapshot_id, artifact)
+    pplx_space_artifact_model::snapshot_object_key("", sandbox_id, snapshot_id, artifact)
 }
 
 #[test]
@@ -366,7 +366,7 @@ fn published_restore_is_recoverable_after_state_commit_gap() {
         storage_uri: storage_uri.clone(),
         meta,
         codec: RestoreCodec::Full,
-        transfer_scope_id: Some(pplx_space_common_core::types::TransferScopeId::new()),
+        transfer_scope_id: Some(pplx_space_snapshot_model::TransferScopeId::new()),
         credential_subject_id: sandbox_id.to_string(),
         filesystem_scope_id: None,
     };
@@ -505,16 +505,15 @@ fn canonical_restore_exchange_publishes_replacement_and_scopes_the_old_root() {
     write_test_published_metadata(&canonical_dir, sandbox_id, sandbox_id, &old_storage_uri);
     std::fs::write(staging_dir.join("replacement"), b"source-b").unwrap();
     std::fs::write(canonical_dir.join("remnant"), b"source-a").unwrap();
-    let transfer_scope_id = pplx_space_common_core::types::TransferScopeId::new();
-    let execution_generation = pplx_space_common_core::types::ExecutionGeneration::new(7).unwrap();
-    let attempt_a = pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
+    let transfer_scope_id = pplx_space_snapshot_model::TransferScopeId::new();
+    let execution_generation = pplx_space_sandbox_model::ExecutionGeneration::new(7).unwrap();
+    let attempt_a = pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
         uuid::Uuid::parse_str("019c0000-0000-7000-8000-000000000001").unwrap(),
     );
-    let activation_attempt_id =
-        pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
-            uuid::Uuid::parse_str("019c0000-0000-7000-8000-000000000002").unwrap(),
-        );
-    let attempt_c = pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
+    let activation_attempt_id = pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
+        uuid::Uuid::parse_str("019c0000-0000-7000-8000-000000000002").unwrap(),
+    );
+    let attempt_c = pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
         uuid::Uuid::parse_str("019c0000-0000-7000-8000-000000000003").unwrap(),
     );
     let mut staged = RestoreMetadataStaged {
@@ -625,9 +624,9 @@ fn same_source_exchange_receipt_recovers_cleanup_after_commit_gap() {
     write_test_published_metadata(&canonical_dir, sandbox_id, sandbox_id, &storage_uri);
     std::fs::write(canonical_dir.join("partial"), b"old incomplete root").unwrap();
 
-    let transfer_scope_id = pplx_space_common_core::types::TransferScopeId::new();
-    let execution_generation = pplx_space_common_core::types::ExecutionGeneration::new(7).unwrap();
-    let activation_attempt_id = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+    let transfer_scope_id = pplx_space_snapshot_model::TransferScopeId::new();
+    let execution_generation = pplx_space_sandbox_model::ExecutionGeneration::new(7).unwrap();
+    let activation_attempt_id = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
     let parsed_storage_uri = storage_uri.parse().unwrap();
     let mut staged = RestoreMetadataStaged {
         sandbox_dir: staging_dir.clone(),
@@ -1027,7 +1026,7 @@ async fn admission_rejection_preserves_completed_restore_work_for_retry() {
 
     let target = pplx_space_node_mgr_client::execution_fence::InstanceTarget::Execution(
         pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
-            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+            pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
             None,
         ),
     );
@@ -1172,7 +1171,7 @@ fn sandbox_cache_dir_guard_defers_scoped_staging_cleanup() {
     {
         let _guard = SandboxCacheDirGuard::for_restore_staging(
             &sandbox_dir,
-            Some(pplx_space_common_core::types::TransferScopeId::new()),
+            Some(pplx_space_snapshot_model::TransferScopeId::new()),
         );
     }
 
@@ -1531,12 +1530,12 @@ fn plan_response(
 
 fn valid_plan_response() -> pplx_space_node_api_client::proto::GetQuarantineRecoveryPlanResponse {
     plan_response(
-        &pplx_space_common_core::types::SandboxCleanupEpisodeId::new().to_string(),
+        &pplx_space_sandbox_model::SandboxCleanupEpisodeId::new().to_string(),
         &uuid::Uuid::now_v7().to_string(),
         &LocalArtifactId::new().to_string(),
         "s3://snapshots/suspend/sandbox/snap?region=us-east-1",
         7,
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestorePrepareFailed.as_str(),
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestorePrepareFailed.as_str(),
         pplx_space_node_api_client::proto::QuarantineRecoveryTargetState::Suspended as i32,
     )
 }
@@ -1567,7 +1566,7 @@ fn a_well_formed_plan_resolves_to_an_actionable_plan() {
     assert_eq!(plan.execution_generation.get(), 7);
     assert_eq!(
         plan.reason_code,
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestorePrepareFailed
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestorePrepareFailed
     );
 }
 
@@ -1627,10 +1626,9 @@ fn a_plan_targeting_an_unsupported_state_is_declined_not_attempted() {
 fn a_plan_for_a_never_recoverable_reason_is_declined() {
     let mut ineligible = valid_plan_response();
     // A reason this release parses but never recovers automatically.
-    ineligible.reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::PauseFailed
-            .as_str()
-            .to_string();
+    ineligible.reason_code = pplx_space_sandbox_model::SandboxQuarantineReasonCode::PauseFailed
+        .as_str()
+        .to_string();
     assert_eq!(
         malformed_reason(ineligible),
         crate::db::QuarantineRecoveryNoProgressReason::PlanReasonIneligible
@@ -1663,7 +1661,7 @@ fn a_malformed_plan_detail_is_bounded_before_it_reaches_a_log() {
     // The shape the production sites build: a bounded-looking field followed by a
     // parse error whose own Display embeds the same unbounded value.
     let hostile = "x".repeat(4096);
-    let reason_code: Result<pplx_space_common_core::types::SandboxQuarantineReasonCode, _> =
+    let reason_code: Result<pplx_space_sandbox_model::SandboxQuarantineReasonCode, _> =
         hostile.parse();
     let error = reason_code.expect_err("a 4 KiB reason code is not a known vocabulary member");
     let detail = format!("invalid recovery reason {hostile:?}: {error}");
@@ -1707,7 +1705,7 @@ fn a_hostile_plan_field_is_bounded_on_the_line_that_is_logged() {
 
     let hostile = "x".repeat(4096);
     let response = plan_response(
-        &pplx_space_common_core::types::SandboxCleanupEpisodeId::new().to_string(),
+        &pplx_space_sandbox_model::SandboxCleanupEpisodeId::new().to_string(),
         &uuid::Uuid::now_v7().to_string(),
         &LocalArtifactId::new().to_string(),
         "s3://snapshots/suspend/sandbox/snap?region=us-east-1",
@@ -1788,7 +1786,7 @@ async fn restore_template_lookup_uses_validated_owner(
 ) {
     use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
     use pplx_space_template_mgr_client::proto::GetTemplateResponse;
-    let id = pplx_space_common_core::types::SandboxId::new();
+    let id = pplx_space_sandbox_model::SandboxId::new();
     let expected = if local {
         TemplateLookupScope::LocalExecution
     } else {
@@ -1809,8 +1807,8 @@ async fn restore_template_lookup_uses_validated_owner(
     });
 
     // The snapshot's binding is the lookup's partition preference.
-    let bound = pplx_space_common_core::types::EnvironmentReference::new(
-        pplx_space_common_core::types::Digest::sha256([2; 32]),
+    let bound = pplx_space_execution_spec::EnvironmentReference::new(
+        pplx_space_content_digest::Digest::sha256([2; 32]),
     );
     let path = ensure_local_template(
         &templates,
@@ -1906,5 +1904,189 @@ fn only_a_bootable_instance_falls_back_to_a_plain_directory() {
     ] {
         plain_instance_fallback(prepared, Snapshottable)
             .expect_err("a stopped re-placement must not proceed without a snapshottable instance");
+    }
+}
+
+#[test]
+fn scoped_restore_staging_is_group_traversable_under_a_restrictive_umask() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if !pplx_space_test_env::enter_test_process(&[]) {
+        return;
+    }
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
+    // Unprivileged, the group is this process's own: this checks modes only.
+    let group = nix::unistd::getegid();
+    for existing in [false, true] {
+        let cache = tempfile::tempdir().unwrap();
+        // A cache that passes no group on to what is created in it.
+        std::fs::set_permissions(cache.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let scope = pplx_space_snapshot_model::TransferScopeId::new();
+        let staging = paths::sandbox_restore_staging_dir_in(
+            cache.path(),
+            &SandboxId::new().to_string(),
+            &scope.to_string(),
+        );
+        if existing {
+            // As an earlier attempt or an older version left it.
+            std::fs::create_dir(&staging).unwrap();
+            std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        create_restore_root(&staging, RestoreMetadataDestination::Scoped(scope), group).unwrap();
+        let metadata = std::fs::metadata(&staging).unwrap();
+        assert_eq!(metadata.gid(), group.as_raw());
+        assert_eq!(
+            metadata.mode() & 0o2050,
+            0o2050,
+            "staging mode {:o} lacks setgid or group traversal (existing: {existing})",
+            metadata.mode()
+        );
+    }
+}
+
+#[test]
+fn in_place_restore_leaves_the_sandbox_directory_as_it_is() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let cache = tempfile::tempdir().unwrap();
+    let sandbox_dir = cache.path().join(SandboxId::new().to_string());
+    std::fs::create_dir(&sandbox_dir).unwrap();
+    std::fs::set_permissions(&sandbox_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let identity = |metadata: std::fs::Metadata| (metadata.uid(), metadata.gid(), metadata.mode());
+    let before = identity(std::fs::metadata(&sandbox_dir).unwrap());
+    create_restore_root(
+        &sandbox_dir,
+        RestoreMetadataDestination::InPlace(pplx_space_snapshot_model::TransferScopeId::new()),
+        nix::unistd::getegid(),
+    )
+    .unwrap();
+    assert_eq!(identity(std::fs::metadata(&sandbox_dir).unwrap()), before);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn volume_manager_downloads_into_scoped_restore_staging_through_the_shared_cache_group() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    use std::time::Duration;
+
+    use nix::unistd::{Gid, Uid, chown, geteuid};
+    use pplx_space_host_layout::identities::{groups, users};
+
+    const STAGE: &str = "SPACE_TEST_RESTORE_STAGING_STAGE";
+    const ROOT: &str = "SPACE_TEST_RESTORE_STAGING_ROOT";
+    const STAGING: &str = "SPACE_TEST_RESTORE_STAGING_DIR";
+    if let Ok(stage) = std::env::var(STAGE) {
+        let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+        let staging = PathBuf::from(std::env::var_os(STAGING).unwrap());
+        let snapshot = staging.join("snapshot");
+        match stage.as_str() {
+            "stage" => {
+                assert_eq!(geteuid().as_raw(), users::SPACE_SBXMGR.uid);
+                nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
+                create_restore_root(
+                    &staging,
+                    RestoreMetadataDestination::Scoped(
+                        pplx_space_snapshot_model::TransferScopeId::new(),
+                    ),
+                    crate::transfer_directory::shared_cache_group(),
+                )
+                .unwrap();
+                // As the restore creates `snapshot/` and each pull prepares it.
+                std::fs::create_dir_all(&snapshot).unwrap();
+                crate::transfer_directory::prepare_under(
+                    &root,
+                    snapshot.strip_prefix(&root).unwrap(),
+                )
+                .unwrap();
+            }
+            "download" => {
+                assert_eq!(geteuid().as_raw(), users::SPACE_VOLMGR.uid);
+                let temp = snapshot.join("rootfs.ext4.partial");
+                std::fs::write(&temp, b"downloaded").unwrap();
+                std::fs::rename(&temp, snapshot.join("rootfs.ext4")).unwrap();
+            }
+            _ => panic!("unexpected test stage"),
+        }
+        println!("verified restore staging stage {stage}");
+        return;
+    }
+    if !pplx_space_test_env::root_or_skip("switch between two real service UIDs") {
+        return;
+    }
+    // Fresh, and private with sandbox-manager's own group as an older version
+    // created it under a restrictive umask.
+    for existing in [
+        None,
+        Some((users::SPACE_SBXMGR.uid, groups::SPACE_SBXMGR.gid, 0o700)),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Group-shared but not setgid: nothing created in it inherits the group.
+        let cache = root.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        chown(
+            &cache,
+            None,
+            Some(Gid::from_raw(groups::SPACE_CACHE_RW.gid)),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let staging = paths::sandbox_restore_staging_dir_in(
+            &cache,
+            &SandboxId::new().to_string(),
+            &pplx_space_snapshot_model::TransferScopeId::new().to_string(),
+        );
+        if let Some((uid, gid, mode)) = existing {
+            std::fs::create_dir(&staging).unwrap();
+            chown(&staging, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))).unwrap();
+            std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        for (stage, uid, primary_gid, supplementary) in [
+            (
+                "stage",
+                users::SPACE_SBXMGR.uid,
+                groups::SPACE_SBXMGR.gid,
+                format!(
+                    "{},{}",
+                    groups::SPACE_SBXCLIENTS.gid,
+                    groups::SPACE_CACHE_RW.gid
+                ),
+            ),
+            (
+                "download",
+                users::SPACE_VOLMGR.uid,
+                groups::SPACE_VOLMGR.gid,
+                format!(
+                    "{},{},{}",
+                    groups::SPACE_SBXCLIENTS.gid,
+                    groups::SPACE_CACHE_RW.gid,
+                    groups::SPACE_VOLCREDCLIENTS.gid
+                ),
+            ),
+        ] {
+            let mut command = Command::new("setpriv");
+            command
+                .arg(format!("--reuid={uid}"))
+                .arg(format!("--regid={primary_gid}"))
+                .arg(format!("--groups={supplementary}"))
+                .arg("--")
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "snapshot_restore::tests::volume_manager_downloads_into_scoped_restore_staging_through_the_shared_cache_group",
+                    "--nocapture",
+                ])
+                .env(STAGE, stage)
+                .env(ROOT, root.path())
+                .env(STAGING, &staging);
+            let (_, output) =
+                pplx_space_test_env::run_command(&mut command, Duration::from_secs(30)).unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success()
+                    && stdout.contains(&format!("verified restore staging stage {stage}")),
+                "{stage} (existing: {existing:?}): {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }

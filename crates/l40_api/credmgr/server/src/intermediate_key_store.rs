@@ -4,8 +4,8 @@
 //! served across organizations. Rows are written by the provisioning path
 //! ([`crate::kek_provisioning`]); this store is read-only.
 
-use pplx_space_common_core::{types::MasterKeyIdentifier, types::OrgId};
-use pplx_space_sql_locator::sql;
+use pplx_space_accounts::OrgId;
+use pplx_space_byok_model::MasterKeyIdentifier;
 
 use crate::intermediate_key_broker::{WrappedIntermediateKeyStore, WrappedKeyStoreError};
 
@@ -26,18 +26,10 @@ impl WrappedIntermediateKeyStore for PgWrappedIntermediateKeyStore {
         org: OrgId,
         key_id: &MasterKeyIdentifier,
     ) -> Result<Option<Vec<u8>>, WrappedKeyStoreError> {
-        // key_identifier is the provider's per-version key id; the join pins
+        // key_identifier is the provider's per-version key id; the store pins
         // both rows to the asserted org so a cross-org claim reads as absent.
-        sqlx::query_scalar(sql!(
-            "SELECT b.wrapped_key FROM org_branching_keys b \
-             JOIN org_master_keys k ON k.id = b.cmk_id AND k.org_id = b.org_id \
-             WHERE k.org_id = $1 AND k.key_identifier = $2 \
-             ORDER BY b.created_at DESC LIMIT 1"
-        ))
-        .bind(org.as_uuid())
-        .bind(key_id.as_str())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(WrappedKeyStoreError::Lookup)
+        pplx_space_byok_store::branching_key(&self.pool, org, key_id)
+            .await
+            .map_err(|error| WrappedKeyStoreError::Lookup(sqlx::Error::from(error)))
     }
 }

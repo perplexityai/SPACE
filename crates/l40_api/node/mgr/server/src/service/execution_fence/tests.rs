@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::SandboxActivationAttemptId;
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
 
 #[rstest::rstest]
 #[case::adopted(true, false, false)]
@@ -453,7 +453,7 @@ async fn canonical_artifact_rpcs_reject_missing_or_superseded_execution_before_h
         );
     }
     use pplx_space_node_mgr_client::execution_fence::InstanceTarget;
-    let scope = pplx_space_common_core::types::TransferScopeId::new();
+    let scope = pplx_space_snapshot_model::TransferScopeId::new();
     let root = service
         .instance_target_root(&sandbox, InstanceTarget::RestoreScope(scope))
         .await

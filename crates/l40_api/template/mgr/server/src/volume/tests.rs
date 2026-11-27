@@ -1,4 +1,5 @@
 pub(crate) mod catalog;
+mod environments;
 
 use super::*;
 use pplx_space_node_api_client::proto::{FindTemplateReleaseResponse, TemplateRelease};
@@ -30,6 +31,17 @@ fn authorized_release_fixture() -> AuthorizedReleaseFixture {
     }
 }
 
+/// A lookup of `base` by digest, or by tag when `hash` is empty, naming no
+/// environment.
+fn lookup(hash: &str) -> ReleaseLookup<'_> {
+    ReleaseLookup {
+        name: "base",
+        req_hash: hash,
+        req_tag: "",
+        environment: None,
+    }
+}
+
 #[rstest::rstest]
 fn scoped_release_response_must_acknowledge_the_org_and_exact_release(
     authorized_release_fixture: AuthorizedReleaseFixture,
@@ -40,7 +52,7 @@ fn scoped_release_response_must_acknowledge_the_org_and_exact_release(
         response: valid,
     } = authorized_release_fixture;
     assert_eq!(
-        parse_release_response("base", &hash, Some(org), false, valid.clone())
+        parse_release_response(lookup(&hash), Some(org), false, valid.clone())
             .unwrap()
             .hash,
         hash
@@ -49,7 +61,7 @@ fn scoped_release_response_must_acknowledge_the_org_and_exact_release(
     legacy_response.authorized_org_id = None;
     for requested_hash in ["", hash.as_str()] {
         let release =
-            parse_release_response("base", requested_hash, None, false, legacy_response.clone())
+            parse_release_response(lookup(requested_hash), None, false, legacy_response.clone())
                 .expect("unscoped callers accept releases from an older ClusterApi");
         assert_eq!(release.hash, hash);
     }
@@ -57,11 +69,11 @@ fn scoped_release_response_must_acknowledge_the_org_and_exact_release(
     let mut generic = legacy_response.clone();
     generic.template_visibility = TemplateVisibility::Generic.into();
     assert!(matches!(
-        parse_release_response("base", &hash, None, true, generic.clone()),
+        parse_release_response(lookup(&hash), None, true, generic.clone()),
         Err(FindReleaseError::InvalidResponse)
     ));
     generic.generic_authorized = true;
-    parse_release_response("base", &hash, None, true, generic)
+    parse_release_response(lookup(&hash), None, true, generic)
         .expect("generic-only catalog acknowledgement permits prefetch");
 
     for mutation in 0..6 {
@@ -76,12 +88,12 @@ fn scoped_release_response_must_acknowledge_the_org_and_exact_release(
             _ => unreachable!(),
         }
         assert!(matches!(
-            parse_release_response("base", &hash, Some(org), false, response),
+            parse_release_response(lookup(&hash), Some(org), false, response),
             Err(FindReleaseError::InvalidResponse)
         ));
     }
 }
-use pplx_space_common_core::types::TEMPLATE_ROOTFS_ZSTD_FILE;
+use pplx_space_artifact_model::TEMPLATE_ROOTFS_ZSTD_FILE;
 
 #[test]
 fn volmgr_admission_rejection_is_retryable() {
@@ -205,8 +217,6 @@ fn lookup_tag_returns_req_tag_or_default() {
 /// is in place).
 #[tokio::test]
 async fn do_pull_aborts_early_when_build_is_marked_deleting() {
-    use std::sync::Mutex;
-
     let conn = crate::db::test_conn();
     let hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     crate::db::upsert_build(
@@ -225,12 +235,13 @@ async fn do_pull_aborts_early_when_build_is_marked_deleting() {
     )
     .unwrap();
     // Eviction Phase 1: flip to deleting.
-    conn.execute(
-        "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
-        rusqlite::params!["seed", hash],
-    )
-    .unwrap();
-    let db = Arc::new(Mutex::new(conn));
+    conn.raw()
+        .execute(
+            "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
+            rusqlite::params!["seed", hash],
+        )
+        .unwrap();
+    let db = crate::db::SharedConnection::new(conn);
 
     // `storage_uris` is empty; the early-abort check fires
     // before the storage-iteration loop so an empty list is
@@ -239,8 +250,12 @@ async fn do_pull_aborts_early_when_build_is_marked_deleting() {
     // different reason.
     let outcome = do_pull(
         db,
-        "seed",
-        hash,
+        ResolvedPull {
+            name: "seed",
+            content_hash: hash,
+            environment: None,
+            served_environment: None,
+        },
         &[],
         &[],
         None,
@@ -257,16 +272,18 @@ async fn do_pull_aborts_early_when_build_is_marked_deleting() {
 
 #[tokio::test]
 async fn do_pull_treats_empty_storage_locations_as_local_only_uncached() {
-    use std::sync::Mutex;
-
     let conn = crate::db::test_conn();
-    let db = Arc::new(Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
     let hash = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     let outcome = do_pull(
         db,
-        "seed",
-        hash,
+        ResolvedPull {
+            name: "seed",
+            content_hash: hash,
+            environment: None,
+            served_environment: None,
+        },
         &[],
         &[],
         None,
@@ -301,6 +318,7 @@ async fn pull_flight_publishes_result_to_waiters_and_cleans_map() {
     guard.finish(PullTaskResult {
         outcome: PullOutcomeSnapshot::Materialized,
         path: PullPath::FreshPull,
+        required: None,
     });
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
@@ -359,6 +377,7 @@ fn coalesced_materialized_result_is_tagged_and_counted() {
     let mut result = PullTaskResult {
         outcome: PullOutcomeSnapshot::Materialized,
         path: PullPath::FreshPull,
+        required: None,
     };
 
     assert!(result.mark_coalesced_if_materialized());
@@ -378,6 +397,7 @@ fn coalesced_non_materialized_result_keeps_owner_path() {
         let mut result = PullTaskResult {
             outcome,
             path: PullPath::FreshPull,
+            required: None,
         };
 
         assert!(!result.mark_coalesced_if_materialized());
@@ -525,7 +545,7 @@ async fn populate_orphaned_digest_dir(digest_dir: &Path) {
 
 #[test]
 fn build_manifest_pull_plan_dedups_zst_pair() {
-    use pplx_space_common_core::types::{
+    use pplx_space_template_manifest::{
         TemplateManifest, TemplateManifestCompression, TemplateManifestFile,
     };
 
@@ -601,7 +621,7 @@ fn build_manifest_pull_plan_handles_multiple_files_and_pairs() {
     // rootfs, the pull plan must (a) include every standalone file
     // and (b) apply the dedup rule to every `(X, X.zst)` pair, not
     // just the rootfs pair.
-    use pplx_space_common_core::types::{
+    use pplx_space_template_manifest::{
         TemplateManifest, TemplateManifestCompression, TemplateManifestFile,
     };
 
@@ -698,7 +718,7 @@ fn build_decompress_targets_pairs_every_zst_with_its_sibling() {
     // Symmetric to `build_manifest_pull_plan_handles_multiple_files_and_pairs`:
     // every `.zst` whose sibling is in the manifest becomes one
     // decompress target, regardless of whether it's the rootfs.
-    use pplx_space_common_core::types::{
+    use pplx_space_template_manifest::{
         TemplateManifest, TemplateManifestCompression, TemplateManifestFile,
     };
 
@@ -859,11 +879,11 @@ fn recovery_normalizes_manifest_before_db_commit() {
     // `bootable_artifact`, `files["rootfs.ext4"]`). The fix re-runs
     // normalization on recovery so the DB row carries the same shape
     // a fresh pull would have committed.
-    let raw_manifest = pplx_space_common_core::types::TemplateManifest {
+    let raw_manifest = pplx_space_template_manifest::TemplateManifest {
         runtime: "fc".to_string(),
         ..Default::default()
     };
-    let metadata = pplx_space_common_core::types::TemplateMetadata {
+    let metadata = pplx_space_template_manifest::TemplateMetadata {
         arch: Some("aarch64".to_string()),
         ..Default::default()
     };
@@ -927,11 +947,11 @@ fn normalize_patches_explicit_null_config_to_empty_object() {
     // `Value::Null`; without the null→{} patch the round-trip would
     // re-emit `"config": null` and the seed-register on-disk shape
     // would drift from the pre-typing one.
-    let raw_manifest = pplx_space_common_core::types::TemplateManifest {
+    let raw_manifest = pplx_space_template_manifest::TemplateManifest {
         config: serde_json::Value::Null,
         ..Default::default()
     };
-    let metadata = pplx_space_common_core::types::TemplateMetadata::default();
+    let metadata = pplx_space_template_manifest::TemplateMetadata::default();
     let normalized = crate::service::normalize_template_manifest(
         raw_manifest,
         "seed",
@@ -950,9 +970,10 @@ fn normalize_patches_explicit_null_config_to_empty_object() {
 
 #[test]
 fn normalize_rejects_conflicting_execution_metadata() {
-    use pplx_space_common_core::types::{
-        Arch, ExecutionMetadata, GuestOperatingSystem, GuestPlatform, RuntimeIdentity, RuntimeKind,
-        RuntimeVersion,
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::RuntimeVersion;
+    use pplx_space_execution_spec::{
+        ExecutionMetadata, GuestOperatingSystem, GuestPlatform, RuntimeIdentity, RuntimeKind,
     };
 
     let metadata_execution = ExecutionMetadata::initial_firecracker(Arch::Aarch64, vec![]);
@@ -969,10 +990,10 @@ fn normalize_rejects_conflicting_execution_metadata() {
         vec![],
     )
     .unwrap();
-    let mut raw_manifest = pplx_space_common_core::types::TemplateManifest::default();
+    let mut raw_manifest = pplx_space_template_manifest::TemplateManifest::default();
     raw_manifest.set_execution_metadata(manifest_execution);
-    let metadata = pplx_space_common_core::types::TemplateMetadata {
-        schema_version: Some(pplx_space_common_core::types::TEMPLATE_METADATA_SCHEMA_VERSION),
+    let metadata = pplx_space_template_manifest::TemplateMetadata {
+        schema_version: Some(pplx_space_template_manifest::TEMPLATE_METADATA_SCHEMA_VERSION),
         execution: Some(metadata_execution),
         arch: Some("aarch64".to_string()),
         ..Default::default()
@@ -1073,7 +1094,9 @@ async fn assert_untouched(dir: &Path) {
 /// The manifest of a release bound to `partition`'s environment, or an
 /// unbound one for the legacy partition, as the partition probe reads it.
 fn probed_manifest(partition: &TemplateCachePartition) -> Vec<u8> {
-    use pplx_space_common_core::types::{Arch, ExecutionMetadata, TemplateManifest};
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::ExecutionMetadata;
+    use pplx_space_template_manifest::TemplateManifest;
     let mut manifest = TemplateManifest::default();
     if let Some(environment) = partition.environment() {
         manifest.set_execution_metadata(
@@ -1093,7 +1116,8 @@ fn probed_manifest(partition: &TemplateCachePartition) -> Vec<u8> {
 #[case::twin(true)]
 #[tokio::test]
 async fn a_pull_refuses_a_rowless_build_dir_and_deletes_nothing(#[case] twin: bool) {
-    use pplx_space_common_core::types::{Digest, EnvironmentReference};
+    use pplx_space_content_digest::Digest;
+    use pplx_space_execution_spec::EnvironmentReference;
     let root = tempfile::tempdir().unwrap();
     let content_hash = format!("sha256:{}", "c".repeat(64));
     let partition = if twin {
@@ -1122,7 +1146,8 @@ async fn a_pull_refuses_a_rowless_build_dir_and_deletes_nothing(#[case] twin: bo
 /// needs a volume manager, which these tests don't serve.
 #[tokio::test]
 async fn a_rowless_dir_in_another_partition_does_not_block_a_pull() {
-    use pplx_space_common_core::types::{Digest, EnvironmentReference};
+    use pplx_space_content_digest::Digest;
+    use pplx_space_execution_spec::EnvironmentReference;
     let root = tempfile::tempdir().unwrap();
     let content_hash = format!("sha256:{}", "d".repeat(64));
     let twin =
@@ -1148,13 +1173,13 @@ async fn a_rowless_dir_in_another_partition_does_not_block_a_pull() {
 /// they must never reach the rootfs path, where a refusal that published
 /// first would leave unverified bytes at the path sandboxes boot from.
 #[rstest::rstest]
-#[case(pplx_space_common_core::types::HashAlg::Sha256)]
-#[case(pplx_space_common_core::types::HashAlg::Blake3)]
+#[case(pplx_space_content_digest::HashAlg::Sha256)]
+#[case(pplx_space_content_digest::HashAlg::Blake3)]
 #[tokio::test(start_paused = true)]
 async fn materialize_rootfs_rejects_decoded_bytes_that_disagree_with_the_release_hash(
-    #[case] algorithm: pplx_space_common_core::types::HashAlg,
+    #[case] algorithm: pplx_space_content_digest::HashAlg,
 ) {
-    use pplx_space_common_core::types::{
+    use pplx_space_template_manifest::{
         TemplateManifest, TemplateManifestCompression, TemplateManifestFile,
     };
 
@@ -1234,7 +1259,7 @@ async fn materialize_rootfs_rejects_decoded_bytes_that_disagree_with_the_release
 #[case::compressed(true)]
 #[tokio::test]
 async fn materialize_blake3_release(#[case] compressed: bool) {
-    use pplx_space_common_core::types::{TemplateManifest, TemplateManifestFile, TemplateMetadata};
+    use pplx_space_template_manifest::{TemplateManifest, TemplateManifestFile, TemplateMetadata};
     let directory = tempfile::tempdir().unwrap();
     let rootfs = directory.path().join(TEMPLATE_ROOTFS_FILE);
     std::fs::write(&rootfs, b"abc").unwrap();
@@ -1298,11 +1323,12 @@ async fn a_pull_waits_for_a_digest_claim_then_runs() {
         async move {
             puller
                 .pull_resolved(
-                    Arc::new(Mutex::new(crate::db::test_conn())),
+                    crate::db::SharedConnection::new(crate::db::test_conn()),
                     "claim-wait-test".to_string(),
                     content_hash,
                     Vec::new(),
                     &[],
+                    PullTarget::default(),
                 )
                 .await
         }
@@ -1369,11 +1395,10 @@ async fn a_template_claim_holds_every_digest_of_the_template() {
 #[test]
 fn digest_dir_partition_reads_build_dirs_only() {
     let hash = format!("sha256:{}", "7".repeat(64));
-    let twin = TemplateCachePartition::Environment(
-        pplx_space_common_core::types::EnvironmentReference::new(
-            pplx_space_common_core::types::Digest::sha256([2; 32]),
-        ),
-    );
+    let twin =
+        TemplateCachePartition::Environment(pplx_space_execution_spec::EnvironmentReference::new(
+            pplx_space_content_digest::Digest::sha256([2; 32]),
+        ));
     assert_eq!(
         digest_dir_partition(&Path::new("/t/seed").join(&hash)),
         Some(TemplateCachePartition::Legacy)
@@ -1406,9 +1431,10 @@ fn partition_probe_dirs_are_reaped_staging_dirs_not_builds() {
 /// one its metadata carries, as registration does.
 #[test]
 fn release_partition_reads_the_manifest_then_the_metadata_binding() {
-    use pplx_space_common_core::types::{
-        Arch, Digest, EnvironmentReference, ExecutionMetadata, TemplateManifest, TemplateMetadata,
-    };
+    use pplx_space_content_digest::Digest;
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{EnvironmentReference, ExecutionMetadata};
+    use pplx_space_template_manifest::{TemplateManifest, TemplateMetadata};
     let environment = EnvironmentReference::new(Digest::sha256([2; 32]));
     let twin = TemplateCachePartition::Environment(environment);
     let bound =
@@ -1441,8 +1467,6 @@ fn release_partition_reads_the_manifest_then_the_metadata_binding() {
 /// left nothing to serve.
 #[tokio::test]
 async fn pull_refuses_retryably_before_counting_a_row_mid_eviction() {
-    use std::sync::Mutex;
-
     let conn = crate::db::test_conn();
     let hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     crate::db::upsert_build(
@@ -1460,17 +1484,23 @@ async fn pull_refuses_retryably_before_counting_a_row_mid_eviction() {
         },
     )
     .unwrap();
-    conn.execute(
-        "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
-        rusqlite::params!["seed", hash],
-    )
-    .unwrap();
+    conn.raw()
+        .execute(
+            "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
+            rusqlite::params!["seed", hash],
+        )
+        .unwrap();
 
     let (outcome, _) = pull_resolved_owner(
-        Arc::new(Mutex::new(conn)),
-        "seed",
-        hash,
-        &[],
+        crate::db::SharedConnection::new(conn),
+        OwnedPull {
+            name: "seed",
+            resolved_hash: hash,
+            storage_uris: &[],
+            required: None,
+            environment: None,
+            served_environment: None,
+        },
         &[],
         None,
         RootfsBackingPolicy::Inherit,
@@ -1484,4 +1514,256 @@ async fn pull_refuses_retryably_before_counting_a_row_mid_eviction() {
         ),
         "{outcome:?}"
     );
+}
+
+/// A DB holding the legacy-partition build of `hash`, unbound.
+fn db_with_legacy_build(hash: &str) -> crate::db::SharedConnection {
+    db_with_legacy_build_bound_to(hash, None)
+}
+
+/// A DB holding the legacy-partition build of `hash` bound to `environment`,
+/// or unbound. One bound to a non-initial environment is a build startup
+/// recovery adopted in place.
+fn db_with_legacy_build_bound_to(
+    hash: &str,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
+) -> crate::db::SharedConnection {
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::ExecutionMetadata;
+    use pplx_space_template_manifest::TemplateManifest;
+    let mut manifest = TemplateManifest::default();
+    if let Some(environment) = environment {
+        manifest.set_execution_metadata(
+            ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![])
+                .with_environment(environment),
+        );
+    }
+    let manifest_json = serde_json::to_string(&manifest).unwrap();
+    let conn = crate::db::test_conn();
+    crate::db::upsert_build(
+        &conn,
+        &crate::db::BuildUpsert {
+            name: "seed",
+            content_hash: hash,
+            cache_partition: TemplateCachePartition::Legacy,
+            build_date: "2026-01-01T00:00:00Z",
+            manifest_json: &manifest_json,
+            runtime: "fc",
+            arch: "x86_64",
+            artifact_size_bytes: 100,
+            state: "ready",
+        },
+    )
+    .unwrap();
+    crate::db::SharedConnection::new(conn)
+}
+
+fn twin_partition() -> TemplateCachePartition {
+    use pplx_space_content_digest::Digest;
+    use pplx_space_execution_spec::EnvironmentReference;
+    TemplateCachePartition::Environment(EnvironmentReference::new(Digest::sha256([2; 32])))
+}
+
+/// The owner's fast path skips a pull when the node holds the digest: any
+/// build of it for a pull that requires no partition, and only one bound to
+/// the required partition for one that does. With no storage locations, a
+/// pull that gets past the fast path fails.
+#[rstest::rstest]
+#[case::unrequired(None, true)]
+#[case::legacy_required(Some(TemplateCachePartition::Legacy), true)]
+#[case::twin_required(Some(twin_partition()), false)]
+#[tokio::test]
+async fn a_required_pull_takes_the_fast_path_only_for_the_required_partition_s_build(
+    #[case] required: Option<TemplateCachePartition>,
+    #[case] fast_path: bool,
+) {
+    let hash = format!("sha256:{}", "b".repeat(64));
+    let result = VolumePuller::new()
+        .pull_resolved(
+            db_with_legacy_build(&hash),
+            "seed".to_string(),
+            hash,
+            Vec::new(),
+            &[],
+            PullTarget {
+                required,
+                environment: None,
+                served_environment: None,
+            },
+        )
+        .await;
+    assert_eq!(result.outcome.is_materialized(), fast_path);
+}
+
+/// Once a pull has probed where its release lands: a row there means the
+/// release's build is already on the node, which a pull that required another
+/// partition reaches past the fast path; a dir there without a row refuses
+/// the pull; and an empty partition is pulled into.
+#[tokio::test]
+async fn a_probed_partition_is_present_refused_or_pulled_into() {
+    let root = tempfile::tempdir().unwrap();
+    let hash = format!("sha256:{}", "a".repeat(64));
+    let db = db_with_legacy_build(&hash);
+    let action = |partition| probed_partition_action(&db, root.path(), "seed", &hash, partition);
+
+    assert_eq!(
+        action(TemplateCachePartition::Legacy).unwrap(),
+        ProbedPartition::Present
+    );
+    assert_eq!(action(twin_partition()).unwrap(), ProbedPartition::Pull);
+    place_rowless_build_dir(root.path(), &hash, &twin_partition()).await;
+    assert_eq!(
+        action(twin_partition()).unwrap(),
+        ProbedPartition::Refuse(rowless_build_dir_refusal("seed", &hash, twin_partition()))
+    );
+}
+
+/// The legacy partition's row of the digest is the release's build only when
+/// it's bound there: unbound, or bound to the initial environment. A build
+/// bound to another environment, as startup recovery adopts in place, holds
+/// the dir the release would land in, so the probe reports it rather than a
+/// hit that a lookup of the legacy partition wouldn't find.
+#[rstest::rstest]
+#[case::unbound(None, ProbedPartition::Present)]
+#[case::initial_environment(
+    Some(pplx_space_node_runtime_core::catalog::initial_environment_reference()),
+    ProbedPartition::Present
+)]
+#[case::adopted(
+    twin_partition().environment(),
+    ProbedPartition::HeldByAnotherEnvironment(twin_partition())
+)]
+fn a_legacy_row_is_present_only_when_bound_to_the_legacy_partition(
+    #[case] environment: Option<pplx_space_execution_spec::EnvironmentReference>,
+    #[case] expected: ProbedPartition,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let hash = format!("sha256:{}", "c".repeat(64));
+    let db = db_with_legacy_build_bound_to(&hash, environment);
+    assert_eq!(
+        probed_partition_action(
+            &db,
+            root.path(),
+            "seed",
+            &hash,
+            TemplateCachePartition::Legacy
+        )
+        .unwrap(),
+        expected
+    );
+}
+
+/// A cache partition held by another environment's build ends the pull at
+/// the location that found it: every location's copy of the digest lands in
+/// that partition, so the next one could only hide the conflict behind its
+/// own failure, a missing manifest's here. Other failures still fall through
+/// to the next location.
+#[tokio::test]
+async fn a_held_partition_ends_the_pull_at_the_location_that_found_it() {
+    let uris = [
+        "s3://bucket/first?region=us-east-1".to_string(),
+        "s3://bucket/second?region=us-east-1".to_string(),
+    ];
+    // Each location's outcome, in order, and how many were tried.
+    let pull = async |outcomes: [Result<PullWrite, PullFailure>; 2]| {
+        let mut outcomes = outcomes.into_iter();
+        let mut tried = 0;
+        let result = pull_from_locations(&uris, &PullCleanupSlot::default(), |_| {
+            tried += 1;
+            std::future::ready(outcomes.next().unwrap().map_err(PullError::Failure))
+        })
+        .await;
+        (result, tried)
+    };
+
+    let (result, tried) = pull([
+        Err(PullFailure::PartitionHeldByAnotherEnvironment),
+        Err(PullFailure::StorageObjectMissing),
+    ])
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(PullError::Failure(
+                PullFailure::PartitionHeldByAnotherEnvironment
+            ))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(tried, 1);
+
+    let (result, tried) = pull([
+        Err(PullFailure::StorageObjectMissing),
+        Ok(PullWrite::AlreadyPresent),
+    ])
+    .await;
+    assert!(
+        matches!(result, Ok(PullWrite::AlreadyPresent)),
+        "{result:?}"
+    );
+    assert_eq!(tried, 2);
+}
+
+/// A pull that requires a partition and joins a flight whose owner found the
+/// digest cached elsewhere goes round again rather than take that answer,
+/// and pulls as the owner: with no storage locations here, that pull fails.
+/// The join is established by polling the pull while the test holds the
+/// flight, not by waiting.
+/// A pull that requires nothing, or the partition the owner's caller
+/// required, takes the owner's answer, as a coalesced pull, which shows it
+/// joined the flight: concurrent required creates of one digest probe once.
+#[rstest::rstest]
+#[case::required(None, Some(twin_partition()), false, PullPath::FreshPull)]
+#[case::unrequired(None, None, true, PullPath::Coalesced)]
+#[case::same_requirement(
+    Some(twin_partition()),
+    Some(twin_partition()),
+    true,
+    PullPath::Coalesced
+)]
+#[tokio::test]
+async fn a_required_pull_retries_after_joining_another_partition_s_fast_path(
+    #[case] owner_required: Option<TemplateCachePartition>,
+    #[case] required: Option<TemplateCachePartition>,
+    #[case] takes_owner_answer: bool,
+    #[case] path: PullPath,
+) {
+    let puller = VolumePuller::new();
+    let hash = format!("sha256:{}", "9".repeat(64));
+    let key = PullKey::new("seed", hash.clone());
+    let (flight, started) = puller.start_or_join_flight(key.clone());
+    assert!(started);
+    let owner = PullFlightGuard::new(key, flight, Arc::clone(&puller.in_flight));
+    let mut joined = Box::pin(puller.pull_resolved(
+        db_with_legacy_build(&hash),
+        "seed".to_string(),
+        hash.clone(),
+        Vec::new(),
+        &[],
+        PullTarget {
+            required,
+            environment: None,
+            served_environment: None,
+        },
+    ));
+    // One poll runs the pull to its first wait. The test holds the digest's
+    // flight, so the pull can only join it, and pending there is the join.
+    // Its notification is enabled before the state is read, so the later
+    // await sees `finish` whichever waker this poll registered.
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(
+        joined.as_mut().poll(&mut context).is_pending(),
+        "the pull waits on the owner's flight"
+    );
+
+    owner.finish(PullTaskResult::new(
+        &PullOutcome::Materialized,
+        PullPath::DbHit,
+        owner_required,
+    ));
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), joined)
+        .await
+        .expect("the joined pull finishes");
+    assert_eq!(result.outcome.is_materialized(), takes_owner_answer);
+    assert_eq!(result.path, path);
 }

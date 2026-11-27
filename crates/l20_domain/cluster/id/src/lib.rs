@@ -8,10 +8,6 @@
 //! `SPACE_CLUSTER_ID` environment variable, and is carried as a `cluster_id`
 //! tag on every metric and a `cluster_id` field on every sandbox event so a
 //! single Datadog org can slice telemetry per cluster.
-//!
-//! It is its own crate so that code can name the cluster identity without
-//! depending on `pplx-space-common-core`. `pplx-space-common-core` re-exports
-//! it from `types::cluster`.
 
 use std::fmt;
 use std::str::FromStr;

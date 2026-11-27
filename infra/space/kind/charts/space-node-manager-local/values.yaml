@@ -48,6 +48,15 @@ loopDeviceTarget: ""
 # Optional per-rootfs operations/s ceiling; empty retains saved assignments.
 diskIoMaxOperationsPerSec: ""
 
+# The node's network-slot count (SPACE_NODEMGR_NETWORK_POOL_MAX_SLOTS), which
+# node-ctl advertises as the Node's space.pplx.net/network-slots capacity. Null
+# or empty leaves the variable unset, so node-manager uses its own default
+# (DEFAULT_MAX_SLOTS in crates/l40_api/node/mgr/server/src/net.rs) and that
+# default stays the one source of the number. A smoke can set a small count,
+# such as 2, to fill a worker's slots with a few sandboxes. It applies to every
+# node of the release it's set on.
+networkPoolMaxSlots: null
+
 # Kind sizing, not production's: small requests so the scheduler accounts for
 # the pod, and no limits, so a bench never OOM-kills a node service at a bound
 # nobody measured. Firecracker and its sidecars run under the host

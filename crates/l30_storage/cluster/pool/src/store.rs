@@ -1,14 +1,19 @@
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
+use pplx_space_template_release_original::digest_original;
 use std::{
     collections::{HashMap, HashSet},
+    sync::LazyLock,
     time::Duration,
 };
 
-use pplx_space_common_core::types::{
-    DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC, DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC, MemorySize,
-    SandboxId, TemplateName, VcpuCount,
+use pplx_space_byte_size::MemorySize;
+use pplx_space_execution_spec::{
+    DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC, DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC, VcpuCount,
 };
-use sqlx::{PgConnection, PgPool, Postgres, Transaction};
+use pplx_space_postgres_pool::{DbError, Executor};
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_template_model::TemplateName;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -16,11 +21,11 @@ use crate::{
     FailedAutoscaleCandidate, InvalidAutoscaleRow, ManualPoolConfigSpec, NewPoolSlot,
     OpenPoolSlotDeleteLock, PoolConfigOwner, PoolConfigRead, PoolConfigWithCounts, PoolError,
     PoolReservation, PoolSlot, PoolSlotCounts, PoolSlotState, ProtectedTemplateRelease,
-    ReleasePoolConfigWithCounts, ReservedPoolSlot, Result, TEMPLATE_USAGE_SANDBOX_ID_LIMIT,
-    TemplateWarmPoolUsage, WarmPoolConfigRef, WarmPoolPolicyShape,
+    ReleasePoolConfigWithCounts, ReservedPoolSlot, Result, TemplateWarmPoolUsage,
+    WarmPoolConfigRef, WarmPoolPolicyShape,
     models::{
-        PoolAutoscaleCandidate, PoolObservedDemand, PoolPolicyRelease, memory_to_mib_i32,
-        vcpu_to_i32,
+        PoolAutoscaleCandidate, PoolObservedDemand, PoolPolicyRelease,
+        TEMPLATE_USAGE_SANDBOX_ID_LIMIT, memory_to_mib_i32, vcpu_to_i32,
     },
     rows::{
         ClaimedPoolSlotRow, PoolConfigRow, PoolObservedDemandRow, PoolPolicyReleaseRow,
@@ -33,7 +38,7 @@ const AUTOSCALE_LOOKBACK: Duration = Duration::from_secs(24 * 60 * 60);
 const AUTOSCALE_DEFAULT_VCPU: i32 = 2;
 const AUTOSCALE_DEFAULT_MEMORY_MIB: i32 = 1024;
 const MAX_ROOTFS_MIB: i64 =
-    (pplx_space_common_core::sandbox_storage::MAX_SANDBOX_ROOTFS_BYTES / (1024 * 1024)) as i64;
+    (pplx_space_sandbox_model::sandbox_storage::MAX_SANDBOX_ROOTFS_BYTES / (1024 * 1024)) as i64;
 // A full sizing bucket is also the admission threshold for a release outside
 // the proactive retained window. That keeps one-off exact releases from each
 // allocating the policy floor while preserving the existing sizing ratio once
@@ -130,6 +135,121 @@ pub struct WarmPoolStore {
     pool: PgPool,
 }
 
+/// [`WarmPoolStore::demanded_policy_release_rows`]'s statement. Binds `$1`
+/// (the demanded release ids) and `$2` and `$3` (the disk I/O defaults).
+pub(crate) const DEMANDED_POLICY_RELEASES: &str = sql!(
+    "SELECT
+             demanded.id AS template_release_id,
+             p.template_name,
+             demanded.hash AS content_hash,
+             p.vcpu,
+             p.memory_mib,
+             p.disk_mib,
+             COALESCE(p.disk_io_max_operations_per_sec, $2)
+                 AS disk_io_max_operations_per_sec,
+             COALESCE(p.disk_io_max_bandwidth_mib_per_sec, $3)
+                 AS disk_io_max_bandwidth_mib_per_sec,
+             p.min_ready_slots,
+             p.max_ready_slots,
+             p.refill_per_tick,
+             p.max_warming_slots,
+             p.retain_releases,
+             FALSE AS retained
+         FROM warm_pool_policies p
+         JOIN LATERAL (
+             SELECT release.id,
+                    release.hash,
+                    COALESCE(
+                        (
+                            SELECT MAX(published.modified_at)
+                            FROM template_release_tags published
+                            JOIN template_releases tagged
+                              ON tagged.id = published.template_release_id
+                            -- Tags on either spelling of the digest: one written
+                            -- before the shared rule can sit on the other spelling.
+                            WHERE tagged.template_name = release.template_name
+                              AND tagged.hash IN (replace(release.hash, 'sha256:', ''),
+                                                  'sha256:' || replace(release.hash, 'sha256:', ''))
+                        ),
+                        release.created_at
+                    ) AS published_at
+             FROM template_releases release
+             WHERE release.template_name = p.template_name
+               AND release.type = p.runtime
+               AND release.id = ANY($1::UUID[])
+         ) demanded ON TRUE
+         WHERE p.enabled
+         ORDER BY p.template_name, p.vcpu, p.memory_mib,
+                  demanded.published_at DESC, demanded.id DESC"
+);
+
+/// [`WarmPoolStore::retained_policy_release_rows`]'s statement. Binds `$1` and
+/// `$2` (the disk I/O defaults) and `$3` (the initial environment).
+pub(crate) static RETAINED_POLICY_RELEASES: LazyLock<String> = LazyLock::new(|| {
+    sql!(format!(
+        "SELECT
+         COALESCE(twin.id, retained.id) AS template_release_id,
+         p.template_name,
+         retained.hash AS content_hash,
+         p.vcpu,
+         p.memory_mib,
+         p.disk_mib,
+         COALESCE(p.disk_io_max_operations_per_sec, $1)
+             AS disk_io_max_operations_per_sec,
+         COALESCE(p.disk_io_max_bandwidth_mib_per_sec, $2)
+             AS disk_io_max_bandwidth_mib_per_sec,
+         p.min_ready_slots,
+         p.max_ready_slots,
+         p.refill_per_tick,
+         p.max_warming_slots,
+         p.retain_releases,
+         TRUE AS retained
+     FROM warm_pool_policies p
+     JOIN LATERAL (
+         SELECT release.id,
+              release.hash,
+              COALESCE(
+                  (
+                      SELECT MAX(published.modified_at)
+                      FROM template_release_tags published
+                      JOIN template_releases tagged
+                        ON tagged.id = published.template_release_id
+                      -- Tags on either spelling of the digest: one written
+                      -- before the shared rule can sit on the other spelling.
+                      WHERE tagged.template_name = release.template_name
+                        AND tagged.hash IN (replace(release.hash, 'sha256:', ''),
+                                            'sha256:' || replace(release.hash, 'sha256:', ''))
+                  ),
+                  release.created_at
+              ) AS published_at
+          FROM template_releases release
+          WHERE release.template_name = p.template_name
+            AND release.type = p.runtime
+            -- Digest originals only: a twin of a retained release,
+            -- bound to another environment, or the other spelling's
+            -- original of its digest would use up a retain slot and
+            -- warm slots no create claims.
+            AND {digest_original}
+          ORDER BY published_at DESC, release.id DESC
+          LIMIT p.retain_releases
+     ) retained ON TRUE
+     -- Creates of a retained release run the release its build
+     -- resolves to, so that release's pools are the ones claimed.
+     LEFT JOIN LATERAL (
+         SELECT CASE WHEN $3::TEXT IS NULL THEN NULL ELSE {resolved} END AS id
+     ) twin ON TRUE
+     WHERE p.enabled
+     ORDER BY p.template_name, p.vcpu, p.memory_mib,
+              retained.published_at DESC, retained.id DESC",
+        digest_original = digest_original("release"),
+        resolved = pplx_space_template_release_store::resolved_release_sql(
+            "p.template_name",
+            "retained.hash",
+            "$3",
+        ),
+    ))
+});
+
 impl WarmPoolStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -139,7 +259,8 @@ impl WarmPoolStore {
         &self.pool
     }
 
-    pub async fn enabled_configs(&self) -> Result<PoolConfigRead> {
+    #[cfg(test)]
+    pub(crate) async fn enabled_configs(&self) -> Result<PoolConfigRead> {
         let rows = sqlx::query_as::<_, PoolConfigRow>(sql!(
             "SELECT c.id, c.template_release_id, r.template_name, r.hash AS content_hash,
                     c.vcpu, c.memory_mib, c.disk_mib, c.disk_io_max_operations_per_sec,
@@ -278,16 +399,57 @@ impl WarmPoolStore {
         Ok(rows)
     }
 
+    /// The disk size config `id` sets, `None` for the template default or
+    /// when there's no such config. Read in `tx`, so it sees the caller's
+    /// own writes. The caller must pass its open transaction.
+    pub async fn config_disk_mib<C>(tx: &mut C, id: Uuid) -> Result<Option<i32>>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
+        Ok(sqlx::query_scalar::<_, Option<i32>>(sql!(
+            "SELECT disk_mib FROM kubernetes_pool_configs WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(tx.into_sqlx())
+        .await?
+        .flatten())
+    }
+
+    /// Set config `to`'s disk I/O limits to config `from`'s. Does nothing when
+    /// either config is gone. Runs in `tx`, so it reads the caller's own
+    /// writes. The caller must pass its open transaction.
+    pub async fn copy_config_disk_io_limits<C>(tx: &mut C, from: Uuid, to: Uuid) -> Result<()>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
+        sqlx::query(sql!(
+            "UPDATE kubernetes_pool_configs t
+             SET disk_io_max_operations_per_sec = f.disk_io_max_operations_per_sec,
+                 disk_io_max_bandwidth_mib_per_sec = f.disk_io_max_bandwidth_mib_per_sec,
+                 updated_at = NOW()
+             FROM kubernetes_pool_configs f
+             WHERE f.id = $1 AND t.id = $2"
+        ))
+        .bind(from)
+        .bind(to)
+        .execute(tx.into_sqlx())
+        .await?;
+        Ok(())
+    }
+
     /// Create or update the operator-owned pool config for the given release
     /// and shape, taking `managed_by` ownership away from the autoscaler.
     /// Runs inside the caller's transaction: the caller resolves the
     /// template release (template-domain logic that lives with the API) and
-    /// both commit atomically.
-    pub async fn upsert_manual_config(
-        tx: &mut Transaction<'_, Postgres>,
+    /// both commit atomically. The caller must pass its open transaction.
+    pub async fn upsert_manual_config<C>(
+        tx: &mut C,
         template_release_id: Uuid,
         spec: &ManualPoolConfigSpec<'_>,
-    ) -> Result<Uuid> {
+    ) -> Result<Uuid>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         // Fenced in the store, not just the API: any persisted encryptable
         // row aborts the autoscaler's partition-scoped ON CONFLICT while the
         // legacy 3-column index is live. Lifted with the index-drop stack.
@@ -308,7 +470,7 @@ impl WarmPoolStore {
         .bind(spec.vcpu)
         .bind(spec.memory_mib)
         .bind(spec.encryptable)
-        .fetch_optional(&mut **tx)
+        .fetch_optional((&mut *tx).into_sqlx())
         .await?;
 
         let id = if let Some(existing) = existing {
@@ -333,7 +495,7 @@ impl WarmPoolStore {
             .bind(spec.namespace)
             .bind(spec.enabled)
             .bind(PoolConfigOwner::Manual.as_str())
-            .execute(&mut **tx)
+            .execute((&mut *tx).into_sqlx())
             .await?;
             existing
         } else {
@@ -366,29 +528,151 @@ impl WarmPoolStore {
                 i64::try_from(DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC)
                     .expect("default disk bandwidth fits in PostgreSQL BIGINT"),
             )
-            .fetch_one(&mut **tx)
+            .fetch_one((&mut *tx).into_sqlx())
             .await?
         };
 
         Ok(id)
     }
 
+    /// Give `twin` a copy of each operator-managed plaintext pool config of
+    /// `originals`: same shape, namespace, targets, disk settings and
+    /// `enabled`. A create that resolves to a twin claims only the twin's
+    /// slots, so a twin without these would have no pool. The originals'
+    /// configs are left as they are.
+    ///
+    /// `originals` may name several releases at once, such as one build's
+    /// releases under both hash spellings, which all resolve to the one twin.
+    /// It is in precedence order: a shape more than one of them configures
+    /// gets the first one's settings.
+    ///
+    /// Autoscaler-owned configs aren't copied: the autoscaler re-derives them
+    /// for the twin from demand ([`Self::autoscale_configs`]). A manual config
+    /// the twin already has for a shape is kept, so a retry copies nothing
+    /// twice; an autoscaler-owned one for the shape takes the copied manual
+    /// settings. Returns how many configs were copied or taken over.
+    /// The caller must pass its open transaction: the one that inserts the
+    /// twin, so the copy commits with that insert and a twin never wins
+    /// resolution without its manual pools.
+    pub async fn copy_manual_configs_from_releases<C>(
+        tx: &mut C,
+        originals: &[Uuid],
+        twin: Uuid,
+    ) -> std::result::Result<u64, DbError>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
+        let copied = sqlx::query(sql!(
+            "INSERT INTO kubernetes_pool_configs (
+                 template_release_id, vcpu, memory_mib, disk_mib, encryptable,
+                 target_ready_slots, refill_per_tick, max_warming_slots,
+                 namespace, enabled, managed_by,
+                 disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec
+             )
+             SELECT $2, c.vcpu, c.memory_mib, c.disk_mib, c.encryptable,
+                    c.target_ready_slots, c.refill_per_tick, c.max_warming_slots,
+                    c.namespace, c.enabled, c.managed_by,
+                    c.disk_io_max_operations_per_sec, c.disk_io_max_bandwidth_mib_per_sec
+             FROM (
+                 -- One config per shape: the first original's in `$1`'s
+                 -- order, so the insert's conflict clause never sees a shape
+                 -- twice.
+                 SELECT DISTINCT ON (pc.vcpu, pc.memory_mib, pc.encryptable) pc.*
+                 FROM kubernetes_pool_configs pc
+                 WHERE pc.template_release_id = ANY($1)
+                   AND pc.managed_by = $3
+                   AND NOT pc.encryptable
+                 ORDER BY pc.vcpu, pc.memory_mib, pc.encryptable,
+                          array_position($1, pc.template_release_id), pc.created_at, pc.id
+             ) c
+             ORDER BY c.created_at, c.id
+             -- idx_kubernetes_pool_configs_release_shape_kind. A manual config
+             -- the twin already has for the shape is kept. One the autoscaler
+             -- made, which it can for a release that's already committed
+             -- (one another inserter made in the target's partition), takes
+             -- the original's manual settings: the autoscaler never
+             -- overwrites a manual config, so the operator's override would
+             -- otherwise be lost.
+             ON CONFLICT (template_release_id, vcpu, memory_mib, encryptable) DO UPDATE
+             SET disk_mib = EXCLUDED.disk_mib,
+                 target_ready_slots = EXCLUDED.target_ready_slots,
+                 refill_per_tick = EXCLUDED.refill_per_tick,
+                 max_warming_slots = EXCLUDED.max_warming_slots,
+                 namespace = EXCLUDED.namespace,
+                 enabled = EXCLUDED.enabled,
+                 managed_by = EXCLUDED.managed_by,
+                 disk_io_max_operations_per_sec = EXCLUDED.disk_io_max_operations_per_sec,
+                 disk_io_max_bandwidth_mib_per_sec = EXCLUDED.disk_io_max_bandwidth_mib_per_sec,
+                 updated_at = NOW()
+             WHERE kubernetes_pool_configs.managed_by <> $3"
+        ))
+        .bind(originals)
+        .bind(twin)
+        .bind(PoolConfigOwner::Manual.as_str())
+        .execute(tx.into_sqlx())
+        .await?;
+        Ok(copied.rows_affected())
+    }
+
     /// Disable a pool config and zero its target so the reconciler drains
     /// its open slots. `managed_by` is deliberately untouched: a disabled
-    /// autoscaler-owned config stays autoscaler-owned. Returns `false` when
-    /// no config has this id.
-    pub async fn disable_config(&self, id: Uuid) -> Result<bool> {
+    /// autoscaler-owned config stays autoscaler-owned. Returns `None` when
+    /// no config has this id. The caller must pass its open transaction.
+    pub async fn disable_config<C>(
+        tx: &mut C,
+        id: Uuid,
+    ) -> Result<Option<crate::DisabledPoolConfig>>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
+        Ok(sqlx::query_as::<_, (Uuid, i32, i32, bool)>(sql!(
+            "UPDATE kubernetes_pool_configs
+             SET enabled = FALSE,
+                 target_ready_slots = 0,
+                 updated_at = NOW()
+             WHERE id = $1
+             RETURNING template_release_id, vcpu, memory_mib, encryptable"
+        ))
+        .bind(id)
+        .fetch_optional(tx.into_sqlx())
+        .await?
+        .map(
+            |(template_release_id, vcpu, memory_mib, encryptable)| crate::DisabledPoolConfig {
+                template_release_id,
+                vcpu,
+                memory_mib,
+                encryptable,
+            },
+        ))
+    }
+
+    /// Disable `template_release_id`'s config for `config`'s shape as
+    /// [`Self::disable_config`] does. Returns `false` when it has none.
+    /// The caller must pass its open transaction.
+    pub async fn disable_shape_config<C>(
+        tx: &mut C,
+        template_release_id: Uuid,
+        config: &crate::DisabledPoolConfig,
+    ) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let result = sqlx::query(sql!(
             "UPDATE kubernetes_pool_configs
              SET enabled = FALSE,
                  target_ready_slots = 0,
                  updated_at = NOW()
-             WHERE id = $1"
+             WHERE template_release_id = $1
+               AND vcpu = $2
+               AND memory_mib = $3
+               AND encryptable = $4"
         ))
-        .bind(id)
-        .execute(&self.pool)
+        .bind(template_release_id)
+        .bind(config.vcpu)
+        .bind(config.memory_mib)
+        .bind(config.encryptable)
+        .execute(tx.into_sqlx())
         .await?;
-
         Ok(result.rows_affected() > 0)
     }
 
@@ -396,10 +680,13 @@ impl WarmPoolStore {
     /// on any of its releases, and enabled policies for its name. Runs on the
     /// caller's connection so a template delete can re-check inside the
     /// transaction that deletes the releases.
-    pub async fn template_usage(
-        conn: &mut PgConnection,
+    pub async fn template_usage<C>(
+        conn: &mut C,
         template: &TemplateName,
-    ) -> std::result::Result<TemplateWarmPoolUsage, sqlx::Error> {
+    ) -> std::result::Result<TemplateWarmPoolUsage, DbError>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let enabled_configs = sqlx::query_as::<_, WarmPoolConfigRef>(sql!(
             "SELECT c.id, c.managed_by
              FROM kubernetes_pool_configs c
@@ -409,7 +696,7 @@ impl WarmPoolStore {
              ORDER BY c.created_at, c.id"
         ))
         .bind(template.as_str())
-        .fetch_all(&mut *conn)
+        .fetch_all((&mut *conn).into_sqlx())
         .await?;
         // Only `bound` slots belong to a sandbox; a `claimed` one has no
         // sandbox row until its bind commits. Any other state counts as open,
@@ -430,7 +717,7 @@ impl WarmPoolStore {
             .bind(template.as_str())
             .bind(PoolSlotState::Bound.as_str())
             .bind(i32::try_from(TEMPLATE_USAGE_SANDBOX_ID_LIMIT).unwrap_or(i32::MAX))
-            .fetch_one(&mut *conn)
+            .fetch_one((&mut *conn).into_sqlx())
             .await?;
         let enabled_policies = sqlx::query_as::<_, WarmPoolPolicyShape>(sql!(
             "SELECT vcpu, memory_mib
@@ -440,7 +727,7 @@ impl WarmPoolStore {
              ORDER BY vcpu, memory_mib"
         ))
         .bind(template.as_str())
-        .fetch_all(&mut *conn)
+        .fetch_all((&mut *conn).into_sqlx())
         .await?;
 
         Ok(TemplateWarmPoolUsage {
@@ -459,11 +746,14 @@ impl WarmPoolStore {
     /// template must not inherit the old name's policies. Enabled rows and
     /// configs that still have slots are left for [`Self::template_usage`] to
     /// report. Takes a transaction because the lock below must be held until
-    /// the delete that follows it.
-    pub async fn delete_disabled_for_template(
-        tx: &mut Transaction<'_, Postgres>,
+    /// the delete that follows it. The caller must pass its open transaction.
+    pub async fn delete_disabled_for_template<C>(
+        tx: &mut C,
         template: &TemplateName,
-    ) -> std::result::Result<DeletedDisabledWarmPools, sqlx::Error> {
+    ) -> std::result::Result<DeletedDisabledWarmPools, DbError>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         // Lock first and look for slots in a later statement. A slot insert
         // holds its config's key-share lock until it commits, so this waits
         // for it, and the delete's fresh snapshot then sees the slot. One
@@ -478,7 +768,7 @@ impl WarmPoolStore {
              FOR UPDATE OF c"
         ))
         .bind(template.as_str())
-        .fetch_all(&mut **tx)
+        .fetch_all((&mut *tx).into_sqlx())
         .await?;
         let configs = sqlx::query(sql!(
             "DELETE FROM kubernetes_pool_configs c
@@ -491,7 +781,7 @@ impl WarmPoolStore {
                )"
         ))
         .bind(&disabled)
-        .execute(&mut **tx)
+        .execute((&mut *tx).into_sqlx())
         .await?
         .rows_affected();
         let policies = sqlx::query(sql!(
@@ -500,7 +790,7 @@ impl WarmPoolStore {
                AND NOT enabled"
         ))
         .bind(template.as_str())
-        .execute(&mut **tx)
+        .execute((&mut *tx).into_sqlx())
         .await?
         .rows_affected();
 
@@ -521,9 +811,21 @@ impl WarmPoolStore {
     /// This sequence intentionally is not transactional: it relies on only
     /// the cluster-controller replica that holds the leader lease running it.
     /// Add serialization or a transaction before calling it concurrently.
-    pub async fn autoscale_configs(&self, namespace: &str) -> Result<AutoscaleRun> {
+    /// `initial_environment` is the initial execution environment's
+    /// reference, which unbound releases count as. A release's demand and
+    /// retained slot go to the release creates of its build resolve to
+    /// (`pplx_space_template_release_store::resolved_release_sql`), which
+    /// may be a twin, since creates claim only that release's pools. `None`
+    /// keeps every candidate on its original.
+    pub async fn autoscale_configs(
+        &self,
+        namespace: &str,
+        initial_environment: Option<&str>,
+    ) -> Result<AutoscaleRun> {
         let mut run = AutoscaleRun::default();
-        let candidates = self.autoscale_candidates(&mut run.invalid_rows).await?;
+        let candidates = self
+            .autoscale_candidates(initial_environment, &mut run.invalid_rows)
+            .await?;
 
         for candidate in &candidates {
             if let Err(error) = self.upsert_autoscale_config(candidate, namespace).await {
@@ -549,9 +851,10 @@ impl WarmPoolStore {
 
     async fn autoscale_candidates(
         &self,
+        initial_environment: Option<&str>,
         invalid: &mut Vec<InvalidAutoscaleRow>,
     ) -> Result<Vec<PoolAutoscaleCandidate>> {
-        let demand = self.observed_demand(invalid).await?;
+        let demand = self.observed_demand(initial_environment, invalid).await?;
         let demanded_release_ids = demand
             .iter()
             .filter(|observed| observed.observed_sandboxes >= AUTOSCALE_MIN_DEMAND_SANDBOXES)
@@ -559,7 +862,9 @@ impl WarmPoolStore {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let releases = self.policy_releases(&demanded_release_ids, invalid).await?;
+        let releases = self
+            .policy_releases(&demanded_release_ids, initial_environment, invalid)
+            .await?;
 
         Ok(select_autoscale_candidates(releases, demand))
     }
@@ -567,10 +872,12 @@ impl WarmPoolStore {
     async fn policy_releases(
         &self,
         demanded_release_ids: &[Uuid],
+        initial_environment: Option<&str>,
         invalid: &mut Vec<InvalidAutoscaleRow>,
     ) -> Result<Vec<PoolPolicyRelease>> {
         let mut releases: Vec<PoolPolicyRelease> = decode_autoscale_rows(
-            self.retained_policy_release_rows().await?,
+            self.retained_policy_release_rows(initial_environment)
+                .await?,
             AutoscaleRead::RetainedPolicyReleases,
             invalid,
         );
@@ -605,8 +912,10 @@ impl WarmPoolStore {
         .await?;
         // All or nothing, unlike the autoscale read: a release left out of
         // this set may be evicted from nodes.
+        // Only names and hashes are kept, which a twin shares with its
+        // original, so which of the two a row names doesn't matter here.
         let retained = self
-            .retained_policy_release_rows()
+            .retained_policy_release_rows(None)
             .await?
             .into_iter()
             .map(PoolPolicyRelease::try_from)
@@ -631,134 +940,75 @@ impl WarmPoolStore {
             .collect())
     }
 
-    async fn retained_policy_release_rows(&self) -> Result<Vec<PoolPolicyReleaseRow>> {
-        Ok(sqlx::query_as::<_, PoolPolicyReleaseRow>(sql!(
-            "SELECT
-                 retained.id AS template_release_id,
-                 p.template_name,
-                 retained.hash AS content_hash,
-                 p.vcpu,
-                 p.memory_mib,
-                 p.disk_mib,
-                 COALESCE(p.disk_io_max_operations_per_sec, $1)
-                     AS disk_io_max_operations_per_sec,
-                 COALESCE(p.disk_io_max_bandwidth_mib_per_sec, $2)
-                     AS disk_io_max_bandwidth_mib_per_sec,
-                 p.min_ready_slots,
-                 p.max_ready_slots,
-                 p.refill_per_tick,
-                 p.max_warming_slots,
-                 p.retain_releases,
-                 TRUE AS retained
-             FROM warm_pool_policies p
-             JOIN LATERAL (
-                 SELECT release.id,
-                      release.hash,
-                      COALESCE(
-                          (
-                              SELECT MAX(published.modified_at)
-                              FROM template_release_tags published
-                              WHERE published.template_release_id = release.id
-                          ),
-                          release.created_at
-                      ) AS published_at
-                  FROM template_releases release
-                  WHERE release.template_name = p.template_name
-                    AND release.type = p.runtime
-                  ORDER BY published_at DESC, release.id DESC
-                  LIMIT p.retain_releases
-             ) retained ON TRUE
-             WHERE p.enabled
-             ORDER BY p.template_name, p.vcpu, p.memory_mib,
-                      retained.published_at DESC, retained.id DESC"
-        ))
-        .bind(
-            i64::try_from(DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC)
-                .expect("disk I/O default fits in PostgreSQL BIGINT"),
+    /// The releases each enabled policy retains: its `retain_releases` newest
+    /// originals, each standing in for the release creates of its build
+    /// resolve to, given `initial_environment` ([`Self::autoscale_configs`]).
+    async fn retained_policy_release_rows(
+        &self,
+        initial_environment: Option<&str>,
+    ) -> Result<Vec<PoolPolicyReleaseRow>> {
+        Ok(
+            sqlx::query_as::<_, PoolPolicyReleaseRow>(sqlx::AssertSqlSafe(
+                RETAINED_POLICY_RELEASES.as_str(),
+            ))
+            .bind(
+                i64::try_from(DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC)
+                    .expect("disk I/O default fits in PostgreSQL BIGINT"),
+            )
+            .bind(
+                i64::try_from(DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC)
+                    .expect("disk I/O default fits in PostgreSQL BIGINT"),
+            )
+            .bind(initial_environment)
+            .fetch_all(&self.pool)
+            .await?,
         )
-        .bind(
-            i64::try_from(DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC)
-                .expect("disk I/O default fits in PostgreSQL BIGINT"),
-        )
-        .fetch_all(&self.pool)
-        .await?)
     }
 
     async fn demanded_policy_release_rows(
         &self,
         demanded_release_ids: &[Uuid],
     ) -> Result<Vec<PoolPolicyReleaseRow>> {
-        Ok(sqlx::query_as::<_, PoolPolicyReleaseRow>(sql!(
-            "SELECT
-                 demanded.id AS template_release_id,
-                 p.template_name,
-                 demanded.hash AS content_hash,
-                 p.vcpu,
-                 p.memory_mib,
-                 p.disk_mib,
-                 COALESCE(p.disk_io_max_operations_per_sec, $2)
-                     AS disk_io_max_operations_per_sec,
-                 COALESCE(p.disk_io_max_bandwidth_mib_per_sec, $3)
-                     AS disk_io_max_bandwidth_mib_per_sec,
-                 p.min_ready_slots,
-                 p.max_ready_slots,
-                 p.refill_per_tick,
-                 p.max_warming_slots,
-                 p.retain_releases,
-                 FALSE AS retained
-             FROM warm_pool_policies p
-             JOIN LATERAL (
-                 SELECT release.id,
-                        release.hash,
-                        COALESCE(
-                            (
-                                SELECT MAX(published.modified_at)
-                                FROM template_release_tags published
-                                WHERE published.template_release_id = release.id
-                            ),
-                            release.created_at
-                        ) AS published_at
-                 FROM template_releases release
-                 WHERE release.template_name = p.template_name
-                   AND release.type = p.runtime
-                   AND release.id = ANY($1::UUID[])
-             ) demanded ON TRUE
-             WHERE p.enabled
-             ORDER BY p.template_name, p.vcpu, p.memory_mib,
-                      demanded.published_at DESC, demanded.id DESC"
-        ))
-        .bind(demanded_release_ids)
-        .bind(
-            i64::try_from(DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC)
-                .expect("disk I/O default fits in PostgreSQL BIGINT"),
+        Ok(
+            sqlx::query_as::<_, PoolPolicyReleaseRow>(DEMANDED_POLICY_RELEASES)
+                .bind(demanded_release_ids)
+                .bind(
+                    i64::try_from(DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC)
+                        .expect("disk I/O default fits in PostgreSQL BIGINT"),
+                )
+                .bind(
+                    i64::try_from(DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC)
+                        .expect("disk I/O default fits in PostgreSQL BIGINT"),
+                )
+                .fetch_all(&self.pool)
+                .await?,
         )
-        .bind(
-            i64::try_from(DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC)
-                .expect("disk I/O default fits in PostgreSQL BIGINT"),
-        )
-        .fetch_all(&self.pool)
-        .await?)
     }
 
+    /// Recent creates by release and shape. A create's release is the one
+    /// its build resolves to, given `initial_environment`
+    /// ([`Self::autoscale_configs`]), else its hash's original.
     async fn observed_demand(
         &self,
+        initial_environment: Option<&str>,
         invalid: &mut Vec<InvalidAutoscaleRow>,
     ) -> Result<Vec<PoolObservedDemand>> {
         let lookback_secs =
             i64::try_from(AUTOSCALE_LOOKBACK.as_secs()).expect("autoscale lookback fits i64");
-        let rows = sqlx::query_as::<_, PoolObservedDemandRow>(sql!(
-            // Aggregate BEFORE the release lateral. The lateral's inputs
-            // (template_id, content_hash and its bare form) are constant
-            // within a demand group, so resolving the release per distinct
-            // group instead of per sandbox row cuts the probe count from one
-            // per recent create to one per distinct (template, hash, shape)
-            // combination. Groups whose hash resolves to no release drop
-            // uniformly, and distinct hashes resolving to the same release
-            // re-merge in the outer GROUP BY — output is identical to the
-            // per-row form. Runs per tick by design: this pass also
-            // re-points pools at freshly published releases, so its
-            // frequency is deliberately untouched.
-            "WITH recent_sandboxes AS (
+        static STATEMENT: LazyLock<String> = LazyLock::new(|| {
+            sql!(format!(
+                // Aggregate BEFORE the release lateral. The lateral's inputs
+                // (template_id, content_hash and its bare form) are constant
+                // within a demand group, so resolving the release per distinct
+                // group instead of per sandbox row cuts the probe count from one
+                // per recent create to one per distinct (template, hash, shape)
+                // combination. Groups whose hash resolves to no release drop
+                // uniformly, and distinct hashes resolving to the same release
+                // re-merge in the outer GROUP BY — output is identical to the
+                // per-row form. Runs per tick by design: this pass also
+                // re-points pools at freshly published releases, so its
+                // frequency is deliberately untouched.
+                "WITH recent_sandboxes AS (
                  SELECT
                      template_id,
                      content_hash,
@@ -776,13 +1026,13 @@ impl WarmPoolStore {
                  GROUP BY 1, 2, 3, 4, 5
              )
              SELECT
-                 release_by_hash.id AS template_release_id,
+                 COALESCE(twin.id, release_by_hash.id) AS template_release_id,
                  s.vcpu,
                  s.memory_mib,
                  SUM(s.observed_sandboxes)::BIGINT AS observed_sandboxes
              FROM recent_sandboxes s
              JOIN LATERAL (
-                 SELECT r.id
+                 SELECT r.id, r.template_name, r.hash
                  FROM template_releases r
                  WHERE r.template_name = s.template_id
                    AND (
@@ -790,16 +1040,32 @@ impl WarmPoolStore {
                        OR r.hash = s.bare_content_hash
                        OR r.hash = 'sha256:' || s.bare_content_hash
                    )
-                 ORDER BY (r.hash = s.content_hash) DESC, r.created_at DESC, r.id DESC
-                 LIMIT 1
+                   -- The digest's original, whichever spelling the create
+                   -- named: the release creates claim slots of. A twin
+                   -- registered after its original, or the other spelling's
+                   -- original, would otherwise take the original's demand.
+                   AND {digest_original}
              ) release_by_hash ON TRUE
-             GROUP BY 1, 2, 3"
-        ))
-        .bind(lookback_secs)
-        .bind(AUTOSCALE_DEFAULT_VCPU)
-        .bind(AUTOSCALE_DEFAULT_MEMORY_MIB)
-        .fetch_all(&self.pool)
-        .await?;
+             LEFT JOIN LATERAL (
+                 SELECT CASE WHEN $4::TEXT IS NULL THEN NULL ELSE {resolved} END AS id
+             ) twin ON TRUE
+             GROUP BY 1, 2, 3",
+                digest_original = digest_original("r"),
+                resolved = pplx_space_template_release_store::resolved_release_sql(
+                    "release_by_hash.template_name",
+                    "release_by_hash.hash",
+                    "$4",
+                ),
+            ))
+        });
+        let rows =
+            sqlx::query_as::<_, PoolObservedDemandRow>(sqlx::AssertSqlSafe(STATEMENT.as_str()))
+                .bind(lookback_secs)
+                .bind(AUTOSCALE_DEFAULT_VCPU)
+                .bind(AUTOSCALE_DEFAULT_MEMORY_MIB)
+                .bind(initial_environment)
+                .fetch_all(&self.pool)
+                .await?;
 
         Ok(decode_autoscale_rows(
             rows,
@@ -1105,10 +1371,11 @@ impl WarmPoolStore {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn lock_open_slot_for_delete(
-        tx: &mut Transaction<'_, Postgres>,
-        slot_id: Uuid,
-    ) -> Result<bool> {
+    /// The caller must pass its open transaction.
+    pub async fn lock_open_slot_for_delete<C>(tx: &mut C, slot_id: Uuid) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let row = sqlx::query_scalar::<_, Uuid>(sql!(
             "SELECT id
              FROM kubernetes_pool_slots
@@ -1117,16 +1384,20 @@ impl WarmPoolStore {
              FOR UPDATE SKIP LOCKED"
         ))
         .bind(slot_id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(tx.into_sqlx())
         .await?;
 
         Ok(row.is_some())
     }
 
-    pub async fn lock_open_slot_for_delete_by_reserved_sandbox_id(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn lock_open_slot_for_delete_by_reserved_sandbox_id<C>(
+        tx: &mut C,
         reserved_sandbox_id: SandboxId,
-    ) -> Result<OpenPoolSlotDeleteLock> {
+    ) -> Result<OpenPoolSlotDeleteLock>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let row = sqlx::query_as::<_, PoolSlotRow>(sql!(
             "SELECT id, config_id, template_release_id, reserved_sandbox_id, template_name,
                     content_hash, vcpu, memory_mib, disk_mib, disk_io_max_operations_per_sec,
@@ -1139,7 +1410,7 @@ impl WarmPoolStore {
              FOR UPDATE SKIP LOCKED"
         ))
         .bind(reserved_sandbox_id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional((&mut *tx).into_sqlx())
         .await?;
 
         if let Some(row) = row {
@@ -1152,7 +1423,7 @@ impl WarmPoolStore {
              WHERE reserved_sandbox_id = $1"
         ))
         .bind(reserved_sandbox_id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional((&mut *tx).into_sqlx())
         .await?;
 
         match state {
@@ -1168,31 +1439,36 @@ impl WarmPoolStore {
         }
     }
 
-    pub async fn delete_locked_open_slot(
-        tx: &mut Transaction<'_, Postgres>,
-        slot_id: Uuid,
-    ) -> Result<bool> {
+    /// The caller must pass its open transaction.
+    pub async fn delete_locked_open_slot<C>(tx: &mut C, slot_id: Uuid) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let result = sqlx::query(sql!(
             "DELETE FROM kubernetes_pool_slots
              WHERE id = $1
                AND state IN ('warming', 'ready')"
         ))
         .bind(slot_id)
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?;
 
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn claim_ready_slot(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn claim_ready_slot<C>(
+        tx: &mut C,
         template_release_id: Uuid,
         vcpu: VcpuCount,
         memory: MemorySize,
         namespace: &str,
         claim_id: Uuid,
         encryptable: bool,
-    ) -> Result<Option<ClaimedPoolSlot>> {
+    ) -> Result<Option<ClaimedPoolSlot>>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let Some(slot) = sqlx::query_as::<_, ClaimedPoolSlotRow>(sql!(
             "SELECT s.id, s.reserved_sandbox_id, s.pod_name, s.pod_namespace, s.pod_uid,
                     host(s.pod_ip) AS pod_ip, s.k8s_node_name, s.vcpu, s.memory_mib, s.disk_mib,
@@ -1211,6 +1487,21 @@ impl WarmPoolStore {
                AND s.disk_io_max_bandwidth_mib_per_sec = c.disk_io_max_bandwidth_mib_per_sec
                AND s.pod_ip IS NOT NULL
                AND s.pod_namespace = $4
+               -- A slot on a node with any drain engine recorded (a v2
+               -- drain, its cancel, or an engine this build doesn't know) is
+               -- never claimed: a v2 node's VMs are leaving, a sealed node
+               -- refuses the claim's activation, and an unknown engine fails
+               -- closed. A v1 drain's node (engine NULL) is claimed as
+               -- before, and so is a slot with no node name. The engine-set
+               -- nodes' names are read once for the statement, not per
+               -- candidate slot; `node_k8s.k8s_node_name` is NOT NULL, so the
+               -- list holds no NULL to make `<> ALL` unknown.
+               AND (s.k8s_node_name IS NULL OR s.k8s_node_name <> ALL (ARRAY(
+                   SELECT nk.k8s_node_name
+                     FROM node_k8s nk
+                     JOIN nodes n ON n.id = nk.node_id
+                    WHERE n.drain_engine IS NOT NULL
+               )))
              ORDER BY s.ready_at ASC
              FOR UPDATE OF s SKIP LOCKED
              LIMIT 1"
@@ -1221,7 +1512,7 @@ impl WarmPoolStore {
         .bind(namespace)
         .bind(encryptable)
         .bind(MAX_ROOTFS_MIB)
-        .fetch_optional(&mut **tx)
+        .fetch_optional((&mut *tx).into_sqlx())
         .await?
         else {
             return Ok(None);
@@ -1237,13 +1528,17 @@ impl WarmPoolStore {
     /// behavior; callers report the returned slot's exact shape on a hit.
     /// Oversized historical slots remain visible to operators but cannot acquire
     /// a new owner. Filter before LIMIT so they cannot starve compatible siblings.
-    pub async fn claim_ready_slot_for_release(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn claim_ready_slot_for_release<C>(
+        tx: &mut C,
         template_release_id: Uuid,
         namespace: &str,
         claim_id: Uuid,
         encryptable: bool,
-    ) -> Result<Option<ClaimedPoolSlot>> {
+    ) -> Result<Option<ClaimedPoolSlot>>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let Some(slot) = sqlx::query_as::<_, ClaimedPoolSlotRow>(sql!(
             "SELECT s.id, s.reserved_sandbox_id, s.pod_name, s.pod_namespace, s.pod_uid,
                     host(s.pod_ip) AS pod_ip, s.k8s_node_name, s.vcpu, s.memory_mib, s.disk_mib,
@@ -1260,6 +1555,14 @@ impl WarmPoolStore {
                AND s.disk_io_max_bandwidth_mib_per_sec = c.disk_io_max_bandwidth_mib_per_sec
                AND s.pod_ip IS NOT NULL
                AND s.pod_namespace = $2
+               -- As `claim_ready_slot`: never a slot on a node with any
+               -- drain engine recorded; a v1 drain's node is claimed.
+               AND (s.k8s_node_name IS NULL OR s.k8s_node_name <> ALL (ARRAY(
+                   SELECT nk.k8s_node_name
+                     FROM node_k8s nk
+                     JOIN nodes n ON n.id = nk.node_id
+                    WHERE n.drain_engine IS NOT NULL
+               )))
              ORDER BY s.ready_at ASC
              FOR UPDATE OF s SKIP LOCKED
              LIMIT 1"
@@ -1268,7 +1571,7 @@ impl WarmPoolStore {
         .bind(namespace)
         .bind(encryptable)
         .bind(MAX_ROOTFS_MIB)
-        .fetch_optional(&mut **tx)
+        .fetch_optional((&mut *tx).into_sqlx())
         .await?
         else {
             return Ok(None);
@@ -1283,13 +1586,17 @@ impl WarmPoolStore {
     /// explicit request resolves only its exact enabled config; a default
     /// request resolves the preferred configured pool after the any-shape
     /// ready-slot claim path has exhausted available warm capacity.
-    pub async fn preferred_enabled_shape_for_release(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn preferred_enabled_shape_for_release<C>(
+        tx: &mut C,
         template_release_id: Uuid,
         namespace: &str,
         requested_shape: Option<(VcpuCount, MemorySize)>,
         encryptable: bool,
-    ) -> Result<Option<crate::PoolAssignment>> {
+    ) -> Result<Option<crate::PoolAssignment>>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         if let Some((vcpu, memory)) = requested_shape {
             let row = sqlx::query_as::<_, (Option<i32>, i64, i64)>(sql!(
                 "SELECT disk_mib, disk_io_max_operations_per_sec,
@@ -1308,7 +1615,7 @@ impl WarmPoolStore {
             .bind(vcpu_to_i32(vcpu))
             .bind(memory_to_mib_i32(memory))
             .bind(encryptable)
-            .fetch_optional(&mut **tx)
+            .fetch_optional((&mut *tx).into_sqlx())
             .await?;
             return row
                 .map(|(disk_mib, operations, bandwidth)| {
@@ -1336,7 +1643,7 @@ impl WarmPoolStore {
         .bind(template_release_id)
         .bind(namespace)
         .bind(encryptable)
-        .fetch_optional(&mut **tx)
+        .fetch_optional((&mut *tx).into_sqlx())
         .await?;
 
         row.map(pool_assignment_from_shape_row).transpose()
@@ -1406,11 +1713,10 @@ impl WarmPoolStore {
         row.map(pool_assignment_from_shape_row).transpose()
     }
 
-    async fn mark_slot_claimed(
-        tx: &mut Transaction<'_, Postgres>,
-        slot_id: Uuid,
-        claim_id: Uuid,
-    ) -> Result<()> {
+    async fn mark_slot_claimed<C>(tx: &mut C, slot_id: Uuid, claim_id: Uuid) -> Result<()>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let claimed_state = PoolSlotState::Ready.claim()?;
         sqlx::query(sql!(
             "UPDATE kubernetes_pool_slots
@@ -1420,7 +1726,7 @@ impl WarmPoolStore {
         .bind(claimed_state.as_str())
         .bind(claim_id)
         .bind(slot_id)
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?;
 
         Ok(())
@@ -1433,11 +1739,15 @@ impl WarmPoolStore {
     /// as a dead handoff. The claim-id and state guards make this a CAS:
     /// `false` means the slot was already reaped, invalidated, or re-claimed,
     /// and the caller must abort the bind.
-    pub async fn bind_claimed_slot(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn bind_claimed_slot<C>(
+        tx: &mut C,
         claim_id: Uuid,
         reserved_sandbox_id: SandboxId,
-    ) -> Result<bool> {
+    ) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let bound_state = PoolSlotState::Claimed.bind()?;
         let result = sqlx::query(
             "UPDATE kubernetes_pool_slots
@@ -1451,25 +1761,30 @@ impl WarmPoolStore {
         .bind(claim_id)
         .bind(reserved_sandbox_id)
         .bind(PoolSlotState::Claimed.as_str())
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?;
 
         Ok(result.rows_affected() == 1)
     }
 
     /// Read the claimed slot's pod identity for the bind transaction. This is
-    /// a column read only: the bind's writes go to sandbox-owned tables and
-    /// live with the API substrate that owns them, keeping each domain's
-    /// tables written from one home. `None` means the claim vanished between
-    /// the claim transaction and the bind (reaped or invalidated), and the
-    /// caller must abort the bind. Runs after [`Self::bind_claimed_slot`],
+    /// a column read only: the bind's write to the sandbox's execution row is
+    /// `pplx-space-sandbox-store`'s
+    /// `k8s_executions::pool_claim::insert_first_generation`, keeping each
+    /// domain's tables written from one home. `None` means the claim vanished
+    /// between the claim transaction and the bind (reaped or invalidated), and
+    /// the caller must abort the bind. Runs after [`Self::bind_claimed_slot`],
     /// whose CAS already row-locks the slot; the `FOR UPDATE` here keeps the
     /// read self-sufficiently locked if callers ever reorder.
-    pub async fn bind_source(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn bind_source<C>(
+        tx: &mut C,
         claim_id: Uuid,
         reserved_sandbox_id: SandboxId,
-    ) -> Result<Option<ClaimedSlotBindSource>> {
+    ) -> Result<Option<ClaimedSlotBindSource>>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let source = sqlx::query_as::<_, ClaimedSlotBindSource>(sql!(
             "SELECT pod_name, pod_namespace, NULLIF(BTRIM(pod_uid), '') AS pod_uid,
                     host(pod_ip) AS pod_ip, k8s_node_name
@@ -1480,7 +1795,7 @@ impl WarmPoolStore {
         ))
         .bind(claim_id)
         .bind(reserved_sandbox_id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(tx.into_sqlx())
         .await?;
 
         Ok(source)
@@ -1495,10 +1810,14 @@ impl WarmPoolStore {
     /// this ID. `reserved_sandbox_id` is unique, so this is at most one row.
     /// The `FOR UPDATE` lock (no `SKIP LOCKED`) waits out a concurrent sweep
     /// or bind instead of misreading a locked row as absent.
-    pub async fn lock_reserved_slot(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn lock_reserved_slot<C>(
+        tx: &mut C,
         reserved_sandbox_id: SandboxId,
-    ) -> Result<Option<ReservedPoolSlot>> {
+    ) -> Result<Option<ReservedPoolSlot>>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let row = sqlx::query_as::<_, ReservedPoolSlotRow>(sql!(
             "SELECT id, reserved_sandbox_id, vcpu, memory_mib, disk_mib,
                     disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec,
@@ -1509,7 +1828,7 @@ impl WarmPoolStore {
              FOR UPDATE"
         ))
         .bind(reserved_sandbox_id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(tx.into_sqlx())
         .await?;
 
         row.map(TryInto::try_into).transpose()
@@ -1521,10 +1840,11 @@ impl WarmPoolStore {
     /// claim timeout passes. Used when a create owns the slot's reserved ID
     /// but will not adopt the slot, so no other create may bind that ID.
     /// `false` means the slot was not `ready`.
-    pub async fn fence_ready_slot(
-        tx: &mut Transaction<'_, Postgres>,
-        slot_id: Uuid,
-    ) -> Result<bool> {
+    /// The caller must pass its open transaction.
+    pub async fn fence_ready_slot<C>(tx: &mut C, slot_id: Uuid) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let claimed_state = PoolSlotState::Ready.claim()?;
         let result = sqlx::query(sql!(
             "UPDATE kubernetes_pool_slots
@@ -1535,7 +1855,7 @@ impl WarmPoolStore {
         .bind(claimed_state.as_str())
         .bind(slot_id)
         .bind(PoolSlotState::Ready.as_str())
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?;
 
         Ok(result.rows_affected() == 1)
@@ -1649,11 +1969,15 @@ impl WarmPoolStore {
 
     /// Transactional form of [`Self::invalidate_claimed_slot`], for a caller
     /// that already holds the slot's row lock.
-    pub async fn invalidate_claimed_slot_in(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn invalidate_claimed_slot_in<C>(
+        tx: &mut C,
         claim_id: Uuid,
         reserved_sandbox_id: SandboxId,
-    ) -> Result<bool> {
+    ) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let result = sqlx::query(sql!(
             "UPDATE kubernetes_pool_slots
              SET claim_id = NULL,
@@ -1665,7 +1989,7 @@ impl WarmPoolStore {
         .bind(claim_id)
         .bind(reserved_sandbox_id)
         .bind(PoolSlotState::Claimed.as_str())
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?;
 
         Ok(result.rows_affected() > 0)
@@ -1724,11 +2048,15 @@ impl WarmPoolStore {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
-    pub async fn mark_claimed_slot_cleanup_pending(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn mark_claimed_slot_cleanup_pending<C>(
+        tx: &mut C,
         claim_id: Uuid,
         reserved_sandbox_id: SandboxId,
-    ) -> Result<bool> {
+    ) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let cleanup_pending_state = PoolSlotState::Bound.cleanup_pending()?;
         let result = sqlx::query(sql!(
             "UPDATE kubernetes_pool_slots
@@ -1743,7 +2071,7 @@ impl WarmPoolStore {
         .bind(reserved_sandbox_id)
         .bind(PoolSlotState::Bound.as_str())
         .bind(PoolSlotState::Claimed.as_str())
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?;
 
         Ok(result.rows_affected() == 1)
@@ -1898,7 +2226,8 @@ impl WarmPoolStore {
         reserved_sandbox_id: SandboxId,
     ) -> Result<bool> {
         let deleted =
-            Self::delete_claimed_slots_for_retired_executions(tx, &[reserved_sandbox_id]).await?;
+            Self::delete_claimed_slots_for_retired_executions(&mut **tx, &[reserved_sandbox_id])
+                .await?;
 
         Ok(deleted > 0)
     }
@@ -1908,15 +2237,22 @@ impl WarmPoolStore {
     /// sandboxes) at once. `reserved_sandbox_id` is unique per slot and ids
     /// without a receipt row are no-ops, so callers pass every finalized
     /// sandbox id without checking whether the sandbox was pool-claimed.
-    /// Returns the number of receipts deleted.
+    /// Returns the number of receipts deleted. The caller must pass its open
+    /// transaction: the one that retires those pods or deletes those
+    /// sandboxes, so the receipts go with it.
     ///
-    /// Returns the raw [`sqlx::Error`] (this verb performs exactly one
-    /// statement) so `sqlx::Error`-boundary callers such as the shared
-    /// sandbox-delete transaction compose without an error-type detour.
-    pub async fn delete_claimed_slots_for_retired_executions(
-        conn: &mut PgConnection,
+    /// Returns [`DbError`] rather than [`PoolError`] (this verb performs
+    /// exactly one statement), so `?` works in a caller whose error type is
+    /// `DbError`, such as the shared sandbox delete
+    /// (`pplx_space_sandbox_store::delete::delete_with_dependents`), and in one
+    /// whose error type is still `sqlx::Error`.
+    pub async fn delete_claimed_slots_for_retired_executions<C>(
+        tx: &mut C,
         reserved_sandbox_ids: &[SandboxId],
-    ) -> std::result::Result<u64, sqlx::Error> {
+    ) -> std::result::Result<u64, DbError>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         if reserved_sandbox_ids.is_empty() {
             return Ok(0);
         }
@@ -1932,7 +2268,7 @@ impl WarmPoolStore {
         .bind(ids)
         .bind(PoolSlotState::Bound.as_str())
         .bind(PoolSlotState::Claimed.as_str())
-        .execute(conn)
+        .execute(tx.into_sqlx())
         .await?;
 
         Ok(result.rows_affected())
@@ -2115,25 +2451,30 @@ impl WarmPoolStore {
         .await?)
     }
 
-    pub async fn lock_stale_unbound_claimed_slot_for_delete(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn lock_stale_unbound_claimed_slot_for_delete<C>(
+        tx: &mut C,
         slot_id: Uuid,
         older_than: Duration,
-    ) -> Result<bool> {
+    ) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let older_than_secs = i64::try_from(older_than.as_secs()).unwrap_or(i64::MAX);
         let row = sqlx::query_scalar::<_, Uuid>(STALE_UNBOUND_CLAIMED_SLOT_BY_ID_FOR_UPDATE_SQL)
             .bind(slot_id)
             .bind(older_than_secs)
-            .fetch_optional(&mut **tx)
+            .fetch_optional(tx.into_sqlx())
             .await?;
 
         Ok(row.is_some())
     }
 
-    pub async fn lock_cleanup_pending_slot_for_delete(
-        tx: &mut Transaction<'_, Postgres>,
-        slot_id: Uuid,
-    ) -> Result<bool> {
+    /// The caller must pass its open transaction.
+    pub async fn lock_cleanup_pending_slot_for_delete<C>(tx: &mut C, slot_id: Uuid) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let row = sqlx::query_scalar::<_, Uuid>(sql!(
             "SELECT id
              FROM kubernetes_pool_slots
@@ -2142,39 +2483,41 @@ impl WarmPoolStore {
              FOR UPDATE SKIP LOCKED"
         ))
         .bind(slot_id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(tx.into_sqlx())
         .await?;
 
         Ok(row.is_some())
     }
 
-    pub async fn delete_locked_claimed_slot(
-        tx: &mut Transaction<'_, Postgres>,
-        slot_id: Uuid,
-    ) -> Result<bool> {
+    /// The caller must pass its open transaction.
+    pub async fn delete_locked_claimed_slot<C>(tx: &mut C, slot_id: Uuid) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let result = sqlx::query(sql!(
             "DELETE FROM kubernetes_pool_slots
              WHERE id = $1
                AND state = 'claimed'"
         ))
         .bind(slot_id)
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?;
 
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn delete_locked_cleanup_pending_slot(
-        tx: &mut Transaction<'_, Postgres>,
-        slot_id: Uuid,
-    ) -> Result<bool> {
+    /// The caller must pass its open transaction.
+    pub async fn delete_locked_cleanup_pending_slot<C>(tx: &mut C, slot_id: Uuid) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let result = sqlx::query(sql!(
             "DELETE FROM kubernetes_pool_slots
              WHERE id = $1
                AND state = 'cleanup_pending'"
         ))
         .bind(slot_id)
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?;
 
         Ok(result.rows_affected() > 0)

@@ -98,6 +98,13 @@ and delete through the SPACE API instead. Put the bearer token in
 `SPACE_API_TOKEN` or a file named by `--api-token-file`, and give each variant
 an API template reference such as `baseline=bench-balloon-baseline:bench`.
 
+Both API-mode scripts send the token only over HTTPS, or over plain HTTP to
+`localhost` or a loopback, private or shared (100.64.0.0/10) IP literal. Plain
+HTTP to a DNS name, including a cluster service name such as
+`space-api.space.svc.cluster.local`, is refused. Use its ClusterIP, a
+port-forward, or HTTPS. The same rule applies to an absolute `events_url`
+returned by the API when `--data-plane-url` is not set.
+
 API mode still reads Firecracker statistics and snapshot sizes from the host,
 so run it on the worker the sandboxes land on and keep every other worker
 cordoned. A create that lands elsewhere is deleted and recorded as an error,
@@ -291,3 +298,30 @@ binding. Compiled environment artifacts remain protected across restarts and
 deployment-mode changes; stopping benchmark submissions does not retire them.
 These measurements qualify cold boot and stop/start. Memory-state operations,
 production placement, and other VMMs require their own qualification.
+
+## Create-to-usable benchmark
+
+`bench-sbx-create-to-usable.py` measures, through the public API only, how long
+a sandbox takes to run its first guest command: once after a cold create and
+once after a wake from suspend. Runs are sequential, one sandbox at a time, and
+every sandbox is deleted after its run. Unlike the other scripts here it does not
+run on a worker; any host that reaches the management API and the data plane
+can run it, including a Kind devbox:
+
+```bash
+python3 scripts/benchmarks/bench-sbx-create-to-usable.py \
+  --token-file "$TOKEN_FILE" --runs 10 --output-dir /tmp/create-to-usable
+```
+
+`--api-url` and `--data-plane-url` default to `$SPACE_API_URL` and
+`$SPACE_DATA_PLANE_URL`, then to the Kind ports. Each row of `results.jsonl`
+records `cold_op_ms` and `warm_op_ms` (the create or wake operation) and
+`cold_usable_ms` and `warm_usable_ms` (until `true` exits 0 in the guest,
+probed every `--poll-secs`). `summary.json` holds p50/p95 per metric and the
+sandboxes the API still finds. A malformed API response fails that run without
+skipping cleanup. If a create is interrupted before its reply arrives, the script
+replays it with the same idempotency key to find the sandbox and delete it. The
+script exits non-zero when a run fails or a sandbox is left behind.
+
+To compare two revisions, alternate them in blocks on the same cluster rather
+than measuring one after the other.

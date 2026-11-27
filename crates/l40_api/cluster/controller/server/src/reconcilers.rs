@@ -8,6 +8,82 @@
 //!    helper for deploy-time knobs and a `run(pool, substrate, shutdown)` entry.
 //! 2. Spawn it from `run_reconcilers` below as a `tokio::spawn(...)` line.
 //! 3. Wire its env vars into the owning deployment configuration.
+//!
+//! # Kubernetes-only loops
+//!
+//! `run_reconcilers` starts the loops below only when the substrate is
+//! Kubernetes. They are sorted by the substrate contract
+//! (`controllers/substrate/AGENTS.md` in `pplx-space-api`), read as follows.
+//! A state loop repairs, drains or collects sandbox, node or queue rows, or
+//! runs other core logic the contract names, such as warm-pool policy;
+//! running it on one substrate is debt, to move into substrate-neutral code
+//! over the adapter, and not precedent. A Kubernetes-object loop manages or
+//! observes pods, Nodes or DaemonSets, or mirrors them into rows, and stays.
+//! A loop that does both is listed as a state loop, naming the part that
+//! stays. Classify a loop added to that arm here.
+//!
+//! State loops (debt):
+//!
+//! - `orphaned_sandboxes`: finalizes deletion of, recovers to `suspended` or
+//!   quarantines non-terminal Kubernetes sandbox rows whose pod is missing,
+//!   finished or unready, whose execution was forgotten, or that an old
+//!   cleanup left `deleting`, deleting a leftover pod it observed before it
+//!   acts.
+//! - `suspended_execution_reaper`: retires active `sandbox_k8s_executions`
+//!   rows on `suspended` sandboxes and unplaces them, clearing
+//!   `active_node_id` and the local-artifact marker, once the pod is
+//!   confirmed gone, first deleting a pod that finished `Succeeded`.
+//! - `failed_restorable_repair`: moves `failed` Kubernetes sandboxes with a
+//!   restorable suspend snapshot back to `suspended`. Postgres only.
+//! - `lost_started_sandboxes`: fails `started` Kubernetes sandboxes whose
+//!   recovery found no restore source once their node is gone.
+//! - `kube_node_sync`: demotes `ready` node rows outside any drain to
+//!   `registered` once their Node is missing from the cluster's full Node
+//!   list (not only the labeled Nodes), their heartbeat is missing or older
+//!   than a grace period, and their `node_k8s` row is older than it. Its
+//!   upsert of Nodes into `nodes` and `node_k8s`, which also sets
+//!   `nodes.state` from each Node's Ready condition, is Kubernetes
+//!   registration, which Direct does through its node registry; that part
+//!   stays.
+//! - `warm_pool`: its autoscaling of `kubernetes_pool_configs` from
+//!   `warm_pool_policies` and recent sandbox demand is warm-pool policy, and
+//!   its delete of a cleanup-pending slot's reserved sandbox
+//!   (`delete_execution`, then `delete_with_dependents`) collects sandbox
+//!   rows; both are debt. Creating, probing and deleting warm-pool pods and
+//!   the `kubernetes_pool_slots` rows that track them stays. Direct adopts
+//!   pool members node-side and has no cluster pool configs (a gap row in
+//!   `direct.rs`).
+//! - `orphaned_nodes`: deletes Kubernetes `nodes` rows outside any drain whose
+//!   EC2 instance is gone. Reads EC2, not Kubernetes.
+//! - `reconcile_queue_gc`, both detectors: prunes live `node_reconcile_queue`
+//!   and `node_reconcile_triggers` rows of Kubernetes nodes reported gone.
+//!   The EC2 instance, off by default (`SPACE_RECONCILE_QUEUE_GC_ENABLED`),
+//!   also prunes dead rows of both tables past their retention for every
+//!   substrate. No loop started on Direct prunes dead `node_reconcile_queue`
+//!   rows by age; trigger fanout prunes dead triggers for both substrates.
+//! - `node_drain`: moves `nodes.drain_phase` from `draining` to `drained`,
+//!   evacuating residents in forced mode, and deletes a `terminating` node's
+//!   row once its terminator (`aws`, `kube-delete` or `noop`) succeeds.
+//! - `drained_node_terminator`: moves `drained` nodes to `terminating` unless
+//!   their Node carries the keep annotation. Under the `aws` terminator, when
+//!   the Node is gone and EC2 reports the instance terminated, it deletes the
+//!   `drained` row instead, or fails the unrecoverable suspended sandboxes
+//!   that block that delete.
+//!
+//! Kubernetes-object loops (stay):
+//!
+//! - `environment_placement_census`: read-only gauges over the pod and Node
+//!   reflectors.
+//! - `stuck_container_creating_gc`: deletes sandbox pods stuck in
+//!   `ContainerCreating`. No Postgres.
+//! - `orphaned_restore_pod_gc`: deletes restore pods their sandbox row has
+//!   superseded. Reads rows, writes none.
+//! - `node_service_readiness`: labels worker Nodes with the readiness of their
+//!   node-local DaemonSet pods.
+//! - `node_group_labeler`: labels shared worker Nodes with their node group and
+//!   seeds the default `node_groups` row.
+//! - `node_group_mirror`: copies each Node's node-group label into
+//!   `nodes.node_group_id`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +95,7 @@ use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_cluster_reconciler::{
     TriggerEndpointResolver, TriggerFanoutConfig, TriggerNodeApiTarget, metrics, trigger_fanout,
 };
+use pplx_space_postgres_pool::Db;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
@@ -75,6 +152,11 @@ pub enum ReconcilerRuntimeError {
     InvalidTerminatorKind(String),
     #[error("invalid or missing SPACE API route signing configuration: {0}")]
     RouteSigningConfiguration(#[from] pplx_space_api_route::ed25519::SpaceApiRouteEd25519Error),
+    /// The drain's v2 runs in the node drain's loop.
+    #[error(
+        "SPACE_DRAIN_V2_ENABLED needs SPACE_NODE_DRAIN_ENABLED: the node drain runs the v2 loop"
+    )]
+    DrainV2NeedsNodeDrain,
 }
 
 /// How [`run_reconcilers`] wound down on a requested shutdown — whether every
@@ -136,6 +218,72 @@ impl TerminatorKind {
             Self::Aws => "aws",
             Self::KubeDelete => "kube-delete",
             Self::Noop => "noop",
+        }
+    }
+}
+
+/// Refuse `SPACE_DRAIN_V2_ENABLED`, which admits new v2 drains, unless the
+/// node drain runs, since its v2 loop drives them. The loop itself runs
+/// wherever the node drain does, flag or not, so a v2 drain already
+/// persisted still has an owner.
+pub(crate) fn ensure_drain_v2_has_its_loop(
+    env: &dyn pplx_space_env_vars::Environment,
+    node_drain_enabled: bool,
+) -> Result<(), ReconcilerRuntimeError> {
+    let enabled = pplx_space_env_vars::env_flag(
+        env.var(pplx_space_api::controllers::DrainV2Switch::ENV)
+            .ok()
+            .as_deref(),
+        false,
+    );
+    if enabled && !node_drain_enabled {
+        return Err(ReconcilerRuntimeError::DrainV2NeedsNodeDrain);
+    }
+    Ok(())
+}
+
+/// The terminator backend a [`TerminatorKind`] selects, with the AWS
+/// config only the `aws` backend loads.
+enum TerminatorBackend {
+    Aws(Box<aws_config::SdkConfig>),
+    KubeDelete,
+    Noop,
+}
+
+impl TerminatorBackend {
+    async fn load(kind: TerminatorKind) -> Self {
+        Self::load_with(kind, || {
+            aws_config::load_defaults(aws_config::BehaviorVersion::latest())
+        })
+        .await
+    }
+
+    /// [`Self::load`], with the AWS config from `aws_config`, which only
+    /// the `aws` backend calls.
+    async fn load_with<F, Fut>(kind: TerminatorKind, aws_config: F) -> Self
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = aws_config::SdkConfig>,
+    {
+        match kind {
+            TerminatorKind::Aws => Self::Aws(Box::new(aws_config().await)),
+            TerminatorKind::KubeDelete => Self::KubeDelete,
+            TerminatorKind::Noop => Self::Noop,
+        }
+    }
+
+    /// The v2 loop's authority: EC2 and Auto Scaling under the `aws`
+    /// backend, which terminate a node `:terminate` moved to `terminating`
+    /// and say when a v2 node's instance is gone. Under any other it never
+    /// fences, and the node waits for an operator, who may still undrain
+    /// it.
+    fn v2_terminator(&self) -> node_drain::v2::V2Terminator {
+        match self {
+            Self::Aws(aws_config) => node_drain::v2::V2Terminator::Ec2 {
+                ec2: pplx_space_aws_client::ec2::Client::from_config(aws_config),
+                autoscaling: pplx_space_aws_client::autoscaling::Client::from_config(aws_config),
+            },
+            Self::KubeDelete | Self::Noop => node_drain::v2::V2Terminator::Refuse,
         }
     }
 }
@@ -220,13 +368,13 @@ pub async fn run_reconcilers(
         })?;
     let mut handles = vec![
         tokio::spawn(trigger_fanout::run(
-            pool.clone(),
+            Db::from(pool.clone()),
             trigger_substrate,
             TriggerFanoutConfig::default(),
             shutdown_token.child_token(),
         )),
         tokio::spawn(metrics::run_queue_metrics(
-            pool.clone(),
+            Db::from(pool.clone()),
             metrics::QueueMetricsConfig::default(),
             shutdown_token.child_token(),
         )),
@@ -256,6 +404,42 @@ pub async fn run_reconcilers(
             shutdown_token.child_token(),
         )),
         tokio::spawn(environment_edge_recompute::run_with_pool(
+            pool.clone(),
+            shutdown_token.child_token(),
+        )),
+        // Runtime upgrade campaigns. Off unless
+        // `SPACE_RUNTIME_UPGRADE_RECONCILER_ENABLED` turns it on. Template
+        // campaigns are driven; the template driver reads the credential-fenced
+        // storage-location sidecar on the credentials pool. On, the loop also
+        // returns an aborted campaign's in-flight items whose leases lapsed to
+        // pending.
+        tokio::spawn({
+            let mut config = crate::runtime_upgrade::ReconcilerConfig::from_env();
+            let origins = crate::runtime_upgrade::template_storage_origins(
+                &mut config,
+                &pplx_space_env_vars::ProcessEnvironment,
+            );
+            crate::runtime_upgrade::run(
+                config,
+                pool.clone(),
+                crate::runtime_upgrade::cluster_drivers(
+                    pool.clone(),
+                    credentials_pool.pool().clone(),
+                    // Only where the worker boots a create's required
+                    // environment, with the placement gate on, does a create
+                    // resolved to a template twin boot the twin's.
+                    substrate.boots_template_twins(),
+                    pplx_space_api::controllers::substrate::SubstrateAdapter::managed_by(
+                        substrate.as_ref(),
+                    ),
+                    origins,
+                ),
+                shutdown_token.child_token(),
+            )
+        }),
+        // Firewall rules canary issuance. Off: nothing configures it yet.
+        tokio::spawn(crate::firewall_rules_issue::run(
+            None,
             pool.clone(),
             shutdown_token.child_token(),
         )),
@@ -354,9 +538,9 @@ pub async fn run_reconcilers(
         }
         // Joins the credential-fenced encrypted-fields sidecar; same lane
         // rule as the storage sweeper above.
-        let sink = snapshot_retention_sweeper::SnapshotRetentionDbStore::new(
+        let sink = snapshot_retention_sweeper::SnapshotRetentionDbStore::new(Db::from(
             credentials_pool.pool().clone(),
-        );
+        ));
         handles.push(tokio::spawn(snapshot_retention_sweeper::run(
             retention_config,
             sink,
@@ -666,10 +850,26 @@ pub async fn run_reconcilers(
                     evacuates_stopped_residents,
                     node_drain_config.replace_stopped_evacuations,
                 );
-                match kind {
-                    TerminatorKind::Aws => {
-                        let aws_config =
-                            aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                let backend = TerminatorBackend::load(kind).await;
+                // The v2 drain's loop, beside v1's: it acts only on the rows
+                // `:drain {engine: v2}` marked, which v1's writers skip. It
+                // runs whether or not new v2 drains are admitted, so a
+                // persisted one is still drained or cancelled; it terminates
+                // a node only through EC2
+                // ([`TerminatorBackend::v2_terminator`]).
+                handles.push(tokio::spawn(node_drain::v2::run(
+                    node_drain::SubstrateSink::v2(pool.clone(), kube.clone()),
+                    backend.v2_terminator(),
+                    node_drain_config.tick,
+                    // Each bound's test hook shrinks it in a test-hooks build;
+                    // a release build reads the defaults.
+                    node_drain::v2::V2LoopConfig::from_environment(
+                        &pplx_space_env_vars::ProcessEnvironment,
+                    ),
+                    shutdown_token.child_token(),
+                )));
+                match backend {
+                    TerminatorBackend::Aws(aws_config) => {
                         let autoscaling_client =
                             pplx_space_aws_client::autoscaling::Client::from_config(&aws_config);
                         let terminator = node_drain::Ec2InstanceTerminator::new(
@@ -699,7 +899,7 @@ pub async fn run_reconcilers(
                             node_drain_token,
                         )));
                     }
-                    TerminatorKind::KubeDelete => {
+                    TerminatorBackend::KubeDelete => {
                         let terminator = node_drain::KubeNodeDeleteTerminator::new(
                             pool.clone(),
                             kube.k8s.client.clone(),
@@ -712,7 +912,7 @@ pub async fn run_reconcilers(
                             node_drain_token,
                         )));
                     }
-                    TerminatorKind::Noop => {
+                    TerminatorBackend::Noop => {
                         let terminator = node_drain::NoopInstanceTerminator::new();
                         handles.push(tokio::spawn(node_drain::run(
                             node_drain_config,

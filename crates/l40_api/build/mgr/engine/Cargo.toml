@@ -27,6 +27,8 @@ hex = { workspace = true }
 jiff = { workspace = true }
 oci-spec = { workspace = true, features = ["image"] }
 object = { workspace = true }
+pplx-space-artifact-model = { workspace = true, features = ["serde"] }
+pplx-space-template-model = { workspace = true }
 reqwest = { workspace = true, features = ["query"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -41,25 +43,37 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 
 # internal
+pplx-space-accounts = { workspace = true, features = ["serde"] }
 pplx-space-build-mgr-client = { workspace = true }
-pplx-space-common-core = { workspace = true, features = ["serde"] }
+pplx-space-sandbox-model = { workspace = true }
+pplx-space-template-runtime = { workspace = true }
+pplx-space-content-digest = { workspace = true, features = ["serde"] }
+pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
 pplx-space-credmgr-client = { workspace = true }
 pplx-space-execution-common = { workspace = true }
+pplx-space-host-layout = { workspace = true }
+pplx-space-host-linux = { workspace = true }
+pplx-space-execution-spec = { workspace = true, features = ["serde"] }
+pplx-space-guest-process = { workspace = true, features = ["serde"] }
 pplx-space-metrics-emit = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-node-api-client = { workspace = true }
+pplx-space-node-disk-admission = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
 pplx-space-node-runtime-core = { workspace = true }
 pplx-space-object-store = { workspace = true }
 pplx-space-page-cache = { workspace = true }
+pplx-space-policy-authority = { workspace = true }
 pplx-space-rpc-auth = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }
-pplx-space-spaced-common = { workspace = true }
+pplx-space-spaced-guest-protocol = { workspace = true }
+pplx-space-template-manifest = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
 
 [dev-dependencies]
 libc = { workspace = true }
 pplx-space-execution-common = { workspace = true, features = ["serde"] }
+pplx-space-sql-locator = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 pplx-space-credmgr = { workspace = true, features = ["test-hooks"] }
 pplx-space-db-test-fixtures = { workspace = true }

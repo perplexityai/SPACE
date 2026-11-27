@@ -1,6 +1,7 @@
 //! Pod metadata and node placement persisted onto the active execution row.
 
 use super::*;
+use pplx_space_accounts::ClientId;
 
 impl K8sStore {
     /// Persist pod metadata onto the active execution row of `generation`.
@@ -15,12 +16,18 @@ impl K8sStore {
     /// a `recovering` row keeps its state by design (the recovery flow owns
     /// the promote to `running`), so its result is `Some(Recovering)`, not a
     /// routable execution.
+    ///
+    /// `pod_client` is the observed pod's `space.pplx.net/client-id` label.
+    /// When the write moves the row to a different pod, or the record lags a
+    /// labeled pod's label, the sandbox's record is set to it in the same
+    /// transaction (see `runtime_attribution`).
     pub(in crate::controllers::substrate::kubernetes) async fn persist_pod_metadata(
         &self,
         sandbox_id: SandboxId,
         generation: i64,
         pod_uid: Option<&str>,
         pod_ip: Option<&str>,
+        pod_client: Option<&ClientId>,
     ) -> Result<Option<ActiveExecutionState>, SubstrateError> {
         let pod_uid = normalize_pod_uid(pod_uid);
         let mut tx = self
@@ -29,27 +36,152 @@ impl K8sStore {
             .await
             .db_context("failed to start pod metadata transaction")?;
 
-        if Self::lock_active_execution_state_in(&mut tx, sandbox_id, generation)
+        let Some(tracked) = self
+            .lock_tracked_pod_in(&mut tx, sandbox_id, generation)
             .await?
-            .is_none()
-        {
+        else {
             return Ok(None);
+        };
+        if self.record_after(&tracked, pod_uid, pod_client).is_some() {
+            // The record has to change, which needs the `sandboxes` row lock
+            // taken before the execution row's: start over in that order,
+            // releasing this row lock first.
+            tx.rollback()
+                .await
+                .db_context("failed to release the pod metadata row lock")?;
+            return self
+                .persist_attributed_pod_metadata(
+                    sandbox_id, generation, pod_uid, pod_ip, pod_client,
+                )
+                .await;
         }
-        self.update_active_execution_pod_metadata(&mut tx, sandbox_id, generation, pod_uid, pod_ip)
+        let resulting_state = self
+            .write_tracked_pod_in(
+                &mut tx, sandbox_id, generation, &tracked, pod_uid, pod_ip, pod_client,
+            )
             .await?;
-        // Re-read the resulting state inside the transaction (sees our own
-        // update; the row is still locked, so it cannot change underneath).
-        let resulting_state = Self::lock_active_execution_state_in(&mut tx, sandbox_id, generation)
-            .await?
-            .ok_or_else(|| SubstrateError::Failed {
-                message: "locked active Kubernetes execution row disappeared mid-transaction"
-                    .to_string(),
-            })?;
-
         tx.commit()
             .await
             .db_context("failed to commit pod metadata transaction")?;
         Ok(Some(resulting_state))
+    }
+
+    /// Record the address the pod's node reported for `pod_uid`, once the
+    /// node confirmed it serves the execution there, for use before kubelet
+    /// publishes `status.podIP`. Only a `created` row of `generation` that
+    /// records `pod_uid` and no address takes it, and becomes `running`; a
+    /// `running` row that already records it is kept. Every other row,
+    /// including one a suspend or retire has moved on, is left as it is.
+    /// Returns whether the row records the address.
+    pub(in crate::controllers::substrate::kubernetes) async fn record_confirmed_pod_ip(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+        pod_uid: &str,
+        pod_ip: PodIp,
+    ) -> Result<bool, SubstrateError> {
+        let recorded = sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions
+             SET pod_ip = $1::INET,
+                 state = 'running',
+                 updated_at = CASE WHEN state = 'created' THEN NOW() ELSE updated_at END
+             WHERE sandbox_id = $2
+               AND generation = $3
+               AND active
+               AND NULLIF(BTRIM(pod_uid), '') = $4
+               AND (
+                   (state = 'created' AND pod_ip IS NULL)
+                   OR (state = 'running' AND pod_ip = $1::INET)
+               )
+             RETURNING 1"
+        ))
+        .bind(pod_ip.to_string())
+        .bind(sandbox_id)
+        .bind(generation)
+        .bind(pod_uid)
+        .fetch_optional(&self.pool)
+        .await
+        .db_context("failed to record the confirmed pod IP")?;
+        Ok(recorded.is_some())
+    }
+
+    /// [`Self::persist_pod_metadata`]'s path for a write that also changes the
+    /// sandbox's record: `sandboxes` is locked first, then the execution row,
+    /// and both are re-read before writing.
+    async fn persist_attributed_pod_metadata(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+        pod_uid: Option<&str>,
+        pod_ip: Option<&str>,
+        pod_client: Option<&ClientId>,
+    ) -> Result<Option<ActiveExecutionState>, SubstrateError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .db_context("failed to start pod attribution transaction")?;
+        if !Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await? {
+            return Ok(None);
+        }
+        let Some(tracked) = self
+            .lock_tracked_pod_in(&mut tx, sandbox_id, generation)
+            .await?
+        else {
+            tx.commit()
+                .await
+                .db_context("failed to commit pod attribution transaction")?;
+            return Ok(None);
+        };
+        let resulting_state = self
+            .write_tracked_pod_in(
+                &mut tx, sandbox_id, generation, &tracked, pod_uid, pod_ip, pod_client,
+            )
+            .await?;
+        tx.commit()
+            .await
+            .db_context("failed to commit pod attribution transaction")?;
+        Ok(Some(resulting_state))
+    }
+
+    /// Write the pod metadata onto the active execution row `tracked` was read
+    /// from, set the sandbox's record when the write moves it to a different
+    /// pod (see `runtime_attribution`), and return the row's resulting state.
+    /// The caller holds the execution-row lock, and the `sandboxes` row lock
+    /// whenever the record has to change.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the transaction, row key, tracked pod and observed metadata are all distinct"
+    )]
+    async fn write_tracked_pod_in(
+        &self,
+        tx: &mut PgConnection,
+        sandbox_id: SandboxId,
+        generation: i64,
+        tracked: &super::runtime_attribution::TrackedPod,
+        pod_uid: Option<&str>,
+        pod_ip: Option<&str>,
+        pod_client: Option<&ClientId>,
+    ) -> Result<ActiveExecutionState, SubstrateError> {
+        let pod_ip = super::super::support::pod_ip_or_recorded(
+            pod_ip,
+            pod_uid,
+            tracked.pod_uid.as_deref(),
+            tracked.pod_ip.as_deref(),
+        );
+        self.update_active_execution_pod_metadata(tx, sandbox_id, generation, pod_uid, pod_ip)
+            .await?;
+        if let Some(record) = self.record_after(tracked, pod_uid, pod_client) {
+            Self::attribute_runtime_in(tx, sandbox_id, record.as_ref()).await?;
+        }
+        // Re-read the resulting state inside the transaction (sees our own
+        // update; the row is still locked, so it cannot change underneath).
+        Self::lock_active_execution_state_in(tx, sandbox_id, generation)
+            .await?
+            .ok_or_else(|| SubstrateError::Failed {
+                message: "locked active Kubernetes execution row disappeared mid-transaction"
+                    .to_string(),
+            })
     }
 
     /// Refresh the dial address only while the complete selected route still
@@ -70,34 +202,19 @@ impl K8sStore {
         pod_uid: &PodUid,
         pod_ip: PodIp,
     ) -> Result<bool, SubstrateError> {
-        let result = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-             SET pod_ip = $1::INET,
-                 state = CASE WHEN state = 'created' THEN 'running' ELSE state END,
-                 updated_at = CASE
-                     WHEN pod_ip IS DISTINCT FROM $1::INET OR state = 'created' THEN NOW()
-                     ELSE updated_at
-                 END
-             WHERE sandbox_id = $2
-               AND generation = $3
-               AND active
-               AND pod_name = $4
-               AND COALESCE(route_activation_id, activation_attempt_id) = $5
-               AND NULLIF(BTRIM(pod_uid), '') = $6
-             RETURNING 1"
-        ))
-        .bind(pod_ip.to_string())
-        .bind(sandbox_id)
-        .bind(generation)
-        .bind(pod_name)
-        .bind(route_activation_id.as_uuid())
-        .bind(pod_uid.as_str())
-        .fetch_optional(&self.pool)
+        pplx_space_sandbox_store::k8s_executions::pod_placement::refresh_selected_route_pod_ip(
+            &self.pool,
+            sandbox_id,
+            generation,
+            pod_name,
+            route_activation_id,
+            pod_uid.as_str(),
+            &pod_ip.to_string(),
+        )
         .await
         .map_err(|err| SubstrateError::Failed {
             message: format!("failed to persist selected Kubernetes route pod IP: {err}"),
-        })?;
-        Ok(result.is_some())
+        })
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn claim_active_execution_pod_materialization(
@@ -117,25 +234,12 @@ impl K8sStore {
 
         // Clearing the pod UID stamps `pod_materialized_at` first if the row
         // held one, so the record that a pod ran outlives the UID.
-        let claimed = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-             SET state = CASE WHEN state = 'recovering' THEN state ELSE 'creating' END,
-                 pod_uid = NULL,
-                 pod_ip = NULL,
-                 pod_materialized_at = COALESCE(
-                     pod_materialized_at,
-                     CASE WHEN NULLIF(BTRIM(pod_uid), '') IS NOT NULL THEN NOW() END
-                 ),
-                 updated_at = NOW()
-             WHERE sandbox_id = $1 AND generation = $2 AND active
-             RETURNING 1"
-        ))
-        .bind(sandbox_id)
-        .bind(generation)
-        .fetch_optional(&mut *tx)
-        .await
-        .db_context("failed to claim pod materialization")?
-        .is_some();
+        let claimed =
+            pplx_space_sandbox_store::k8s_executions::pod_placement::claim_pod_materialization(
+                &mut *tx, sandbox_id, generation,
+            )
+            .await
+            .db_context("failed to claim pod materialization")?;
 
         tx.commit()
             .await
@@ -150,6 +254,7 @@ impl K8sStore {
         expected_lifecycle: SandboxLifecycle,
         pod_uid: Option<&str>,
         pod_ip: Option<&str>,
+        pod_client: Option<&ClientId>,
     ) -> Result<Option<ActiveExecutionState>, SubstrateError> {
         let pod_uid = normalize_pod_uid(pod_uid);
         let mut tx = self
@@ -159,25 +264,26 @@ impl K8sStore {
             .db_context("failed to start pod materialization transaction")?;
 
         let lifecycle = Self::lock_sandbox_execution_lifecycle_in(&mut tx, sandbox_id).await?;
-        if lifecycle != Some(expected_lifecycle)
-            || Self::lock_active_execution_state_in(&mut tx, sandbox_id, generation)
+        let tracked = if lifecycle == Some(expected_lifecycle) {
+            self.lock_tracked_pod_in(&mut tx, sandbox_id, generation)
                 .await?
-                .is_none()
-        {
+        } else {
+            None
+        };
+        let Some(tracked) = tracked else {
             tx.commit()
                 .await
                 .db_context("failed to commit pod materialization transaction")?;
             return Ok(None);
-        }
+        };
 
-        self.update_active_execution_pod_metadata(&mut tx, sandbox_id, generation, pod_uid, pod_ip)
+        // The `sandboxes` row is already locked, so the record is written in
+        // place.
+        let resulting_state = self
+            .write_tracked_pod_in(
+                &mut tx, sandbox_id, generation, &tracked, pod_uid, pod_ip, pod_client,
+            )
             .await?;
-        let resulting_state = Self::lock_active_execution_state_in(&mut tx, sandbox_id, generation)
-            .await?
-            .ok_or_else(|| SubstrateError::Failed {
-                message: "locked active Kubernetes execution row disappeared mid-transaction"
-                    .to_string(),
-            })?;
 
         tx.commit()
             .await
@@ -187,13 +293,17 @@ impl K8sStore {
 
     pub(in crate::controllers::substrate::kubernetes) async fn persist_pod_node_placement(
         &self,
-        sandbox_id: SandboxId,
-        node_name: &str,
-        node_uid: &str,
-        node_id: NodeId,
-        role: NodeRole,
-        address: Option<&str>,
+        placement: PodNodePlacement<'_>,
     ) -> Result<(), SubstrateError> {
+        let PodNodePlacement {
+            sandbox_id,
+            node_name,
+            node_uid,
+            node_id,
+            role,
+            address,
+            instance_id,
+        } = placement;
         let mut tx = self
             .pool
             .begin()
@@ -209,6 +319,7 @@ impl K8sStore {
                 role,
                 address,
                 state: NodeStateWrite::InsertOnly(NodeLifecycleState::Registered),
+                instance_id,
             },
         )
         .await?;
@@ -260,17 +371,7 @@ impl K8sStore {
         placement: PodNodePlacement<'_>,
         retry: PlacementRetryDisposition,
     ) -> Result<(), SubstrateError> {
-        let PodNodePlacement {
-            sandbox_id,
-            node_name,
-            node_uid,
-            node_id,
-            role,
-            address,
-        } = placement;
-        let result = self
-            .persist_pod_node_placement(sandbox_id, node_name, node_uid, node_id, role, address)
-            .await;
+        let result = self.persist_pod_node_placement(placement).await;
         match retry {
             PlacementRetryDisposition::RetryDuplicatesExecution => {
                 result.map_err(SubstrateError::demoted_after_side_effect)

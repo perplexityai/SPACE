@@ -19,9 +19,9 @@
 //! store and the filesystem layer respectively, not folded into a
 //! single "encryption" type here.
 
-use pplx_space_common_core::types::{
-    KekProvider, MasterKeyIdentifier, OrgId, StorageUri, SubjectId,
-};
+use pplx_space_accounts::OrgId;
+use pplx_space_artifact_model::StorageUri;
+use pplx_space_byok_model::{KekProvider, MasterKeyIdentifier};
 use pplx_space_credmgr_client::{
     AWS_CREDENTIALS_TOKEN_TYPE, STORAGE_READ_SCOPE, STORAGE_SESSION_TTL_SECONDS,
     STORAGE_TOKEN_AUDIENCE, STORAGE_WRITE_SCOPE, SUBJECT_ID_TOKEN_TYPE, TOKEN_EXCHANGE_GRANT_TYPE,
@@ -30,6 +30,7 @@ use pplx_space_credmgr_client::{
     },
 };
 use pplx_space_object_store::ObjectCredentials;
+use pplx_space_subject_model::SubjectId;
 use tonic::{Code, Status};
 use zeroize::Zeroizing;
 
@@ -142,7 +143,7 @@ async fn request_credentials(
 ///
 /// Split from [`tonic::Status`] so the executor can map permanent
 /// credmgr-side rejections (bad provider, AAD mismatch, malformed
-/// wrap) onto [`pplx_space_common_jobs::JobError::Permanent`] and
+/// wrap) onto [`pplx_space_volmgr_store::jobs::JobError::Permanent`] and
 /// transport blips onto `Retriable`. The credmgr's own gRPC code
 /// taxonomy informs this split: `InvalidArgument`, `FailedPrecondition`,
 /// and `PermissionDenied` are caller-visible mistakes that won't resolve

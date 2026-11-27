@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::MAX_GUEST_USER_NAME_BYTES;
+use pplx_space_guest_process::MAX_GUEST_USER_NAME_BYTES;
 
 const LINUX_CWD: &str = "/workspace";
 const WINDOWS_DRIVE_CWD: &str = "C:\\Users\\me";
@@ -153,12 +153,12 @@ mod not_running {
         body::Body,
         http::{Method, Request, header},
     };
-    use pplx_space_common_core::sql;
     use pplx_space_db_test_fixtures::{
         SEED_ORG_ID, SEED_USER_ID, TestDb, TestDbResult, pg_test_db,
     };
     use pplx_space_public_api::OperationState;
     use pplx_space_public_api::{OperationKind, OperationTargetType, RequestFingerprint};
+    use pplx_space_sql_locator::sql;
     use serde_json::{Value, json};
     use std::sync::{Arc, Mutex};
     use tokio::sync::Notify;

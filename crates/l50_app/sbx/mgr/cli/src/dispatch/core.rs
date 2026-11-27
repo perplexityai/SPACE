@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::{
+use pplx_space_accounts::{
     LOCAL_OPERATOR_SANDBOX_OWNER_KINDS, ROOT_SANDBOX_OWNER, SandboxOwner, SandboxOwnerKind,
     format_reserved_sandbox_owner_kind_labels,
 };

@@ -3,9 +3,9 @@
 
 use std::{fmt, time::Instant};
 
-use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_sandbox_model::SandboxLifecycle;
 
-use pplx_space_metrics_emit::{counter, elapsed_ms, tag, timing_ms};
+use pplx_space_metrics_emit::{counter, elapsed_ms, metric_vocabulary, tag, timing_ms};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClassificationReason {
@@ -137,6 +137,41 @@ pub fn rows_classified(
             tag("from_lifecycle", from_lifecycle),
             tag("pod_evidence", pod_evidence),
         ],
+    );
+}
+
+/// One row the reconciler deferred, by why. `reason` is bounded:
+/// `in_flight_snapshot`, `pod_cleanup_unconfirmed`, `node_reports_local_copy`.
+/// `node_reports_local_copy` counts a plan that saw a node's report land
+/// after the sweep listed the row; the next listing skips that row while the
+/// node keeps reporting it, so it usually counts once.
+pub fn rows_deferred(reason: &str, mode: Mode) {
+    counter(
+        "sandbox.api.reconciler.rows_deferred",
+        1,
+        &[tag("reason", reason), tag("mode", mode.as_str())],
+    );
+}
+
+metric_vocabulary!(
+    /// The store call that failed for a row; the `step` tag of
+    /// [`rows_failed`].
+    FailedStep {
+        /// Reading or locking the row's disposition plan, in both modes.
+        Plan => "plan",
+        /// Committing the disposition, in live mode only.
+        Classify => "classify",
+    }
+);
+
+/// One row whose store call failed this sweep; the sweep reaches it again.
+/// A failed row is not counted in `rows_classified`, so a dry-run sweep
+/// whose plan read fails would otherwise only stop classifying.
+pub fn rows_failed(step: FailedStep, mode: Mode) {
+    counter(
+        "sandbox.api.reconciler.rows_failed",
+        1,
+        &[tag("step", step), tag("mode", mode.as_str())],
     );
 }
 

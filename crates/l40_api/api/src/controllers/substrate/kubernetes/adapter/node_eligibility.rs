@@ -46,10 +46,8 @@ pub(in crate::controllers::substrate::kubernetes) fn node_not_placement_blocked(
     node.metadata
         .labels
         .as_ref()
-        .and_then(|labels| {
-            labels.get(pplx_space_common_core::kubernetes::SSD_PLACEMENT_BLOCKED_LABEL)
-        })
-        .map(|value| value != pplx_space_common_core::kubernetes::SSD_PLACEMENT_BLOCKED_VALUE)
+        .and_then(|labels| labels.get(pplx_space_sandbox_pod::SSD_PLACEMENT_BLOCKED_LABEL))
+        .map(|value| value != pplx_space_sandbox_pod::SSD_PLACEMENT_BLOCKED_VALUE)
         .unwrap_or(true)
 }
 
@@ -64,12 +62,8 @@ pub(in crate::controllers::substrate::kubernetes) fn node_services_not_ready(nod
     node.metadata
         .labels
         .as_ref()
-        .and_then(|labels| {
-            labels.get(pplx_space_common_core::kubernetes::NODE_SERVICES_READY_LABEL)
-        })
-        .is_some_and(|value| {
-            value == pplx_space_common_core::kubernetes::NODE_SERVICES_NOT_READY_VALUE
-        })
+        .and_then(|labels| labels.get(pplx_space_sandbox_pod::NODE_SERVICES_READY_LABEL))
+        .is_some_and(|value| value == pplx_space_sandbox_pod::NODE_SERVICES_NOT_READY_VALUE)
 }
 
 fn node_network_slot_capacity(node: &Node) -> Option<u64> {
@@ -77,9 +71,7 @@ fn node_network_slot_capacity(node: &Node) -> Option<u64> {
     let advertised = status
         .capacity
         .as_ref()
-        .and_then(|capacity| {
-            capacity.get(pplx_space_common_core::kubernetes::SANDBOX_NETWORK_SLOTS_RESOURCE)
-        })
+        .and_then(|capacity| capacity.get(pplx_space_sandbox_pod::SANDBOX_NETWORK_SLOTS_RESOURCE))
         .and_then(quantity_as_u64)?;
     if advertised == 0 {
         return None;
@@ -89,7 +81,7 @@ fn node_network_slot_capacity(node: &Node) -> Option<u64> {
         .allocatable
         .as_ref()
         .and_then(|allocatable| {
-            allocatable.get(pplx_space_common_core::kubernetes::SANDBOX_NETWORK_SLOTS_RESOURCE)
+            allocatable.get(pplx_space_sandbox_pod::SANDBOX_NETWORK_SLOTS_RESOURCE)
         })
         .and_then(quantity_as_u64)
         .or(Some(advertised))
@@ -139,6 +131,32 @@ pub(in crate::controllers::substrate::kubernetes) fn network_slot_capacity_prefl
     }
 }
 
+/// Headroom over nodes the caller already filtered to the start-eligible set.
+///
+/// A node that doesn't advertise the slot resource, or advertises none, adds
+/// no headroom: every sandbox pod requests one slot, so kube-scheduler can't
+/// place one there. Such a node is still reported, because it usually means
+/// node-ctl isn't advertising the node-manager's slot capacity on the Node,
+/// which the metric should show
+/// whether or not the cluster is full.
+pub(in crate::controllers::substrate::kubernetes) fn network_slot_headroom(
+    eligible_nodes: &[std::sync::Arc<Node>],
+    network_slots: &NodeNetworkSlots,
+) -> crate::controllers::substrate::NetworkSlotHeadroom {
+    use crate::controllers::substrate::NetworkSlotHeadroom;
+    let slotless_nodes = eligible_nodes
+        .iter()
+        .any(|node| node_network_slot_capacity(node).is_none());
+    if eligible_nodes
+        .iter()
+        .any(|node| node_network_slot_available(node, network_slots))
+    {
+        NetworkSlotHeadroom::Available { slotless_nodes }
+    } else {
+        NetworkSlotHeadroom::Full { slotless_nodes }
+    }
+}
+
 impl KubernetesSubstrate {
     /// Resolve the node a slow-create pod can be preserved on, or `None` if it
     /// isn't usefully preservable. Used by the slow-create preserve path to
@@ -157,7 +175,7 @@ impl KubernetesSubstrate {
     /// readiness finalizer. Requiring a live proxy means a preserved create can
     /// actually be reached by the client's data-plane retry; anything else
     /// falls through to teardown, exactly as before this change.
-    pub(super) async fn preservable_create_node(
+    pub(in crate::controllers::substrate::kubernetes) async fn preservable_create_node(
         &self,
         sandbox_uuid: SandboxId,
         pod_name: &str,
@@ -172,13 +190,11 @@ impl KubernetesSubstrate {
             return None;
         }
         let pod = match self.lookup_sandbox_pod(pod_name) {
-            // Trust the cached pod only when it shows BOTH a node assignment
-            // and a pod IP. The reflector can observe the scheduling update
-            // (`nodeName`) before the later `podIP` assignment; an IP-lagged
-            // cached pod would make `assigned_pod_ip` below return `None` and
-            // wrongly drop a reachable slow-create to teardown even though the
-            // per-pod watch already persisted the IP (`row.pod_ip`, checked
-            // above). Fall through to the authoritative GET in that window.
+            // Trust the cached pod only when it shows a node assignment and a
+            // published IP. The reflector can observe the scheduling update
+            // (`nodeName`) before the later `podIP`, and a published IP the
+            // cache has not seen supersedes the row's node-reported one; fall
+            // through to the authoritative GET in that window.
             Some(pod)
                 if assigned_pod_node_name(&pod).is_some()
                     && assigned_pod_ip(&pod).ok().flatten().is_some() =>
@@ -195,15 +211,27 @@ impl KubernetesSubstrate {
             return None;
         }
         // Live evidence the runtime is reachable — not merely that an IP was
-        // assigned. Same probe + timeout the create proxy-reachable loop uses.
-        let pod_ip = assigned_pod_ip(&pod).ok().flatten()?;
-        if !Self::pod_proxy_accepts_tcp(
-            pod_ip,
-            self.k8s.sandbox_proxy_port,
-            START_WAIT_CONNECT_TIMEOUT,
-        )
-        .await
-        {
+        // assigned. The same identity probe the create proxy-reachable loop
+        // uses: the node behind the address must report this execution.
+        let (pod_ip, source) =
+            current_pod_ip_with_source(&pod, row.pod_uid.as_ref(), row.pod_ip.as_deref())
+                .ok()
+                .flatten()?;
+        let target = PodProxyWaitTarget {
+            pod_name,
+            pod_uid: row.pod_uid.as_ref().map(PodUid::as_str),
+            generation: row.generation,
+        };
+        let reachable = self
+            .probe_pod_proxy(
+                sandbox_uuid,
+                pod_ip,
+                source,
+                &target,
+                Instant::now() + START_WAIT_CONNECT_TIMEOUT,
+            )
+            .await;
+        if !reachable {
             return None;
         }
         self.remember_pod_node_placement(

@@ -6,7 +6,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use pplx_space_common_core::{sql, types::SubstrateKind};
+use pplx_space_accounts_store::{NewSession, clusters, organizations, sessions, users};
+use pplx_space_node_model::SubstrateKind;
 use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -16,7 +17,7 @@ use crate::{
     auth::{generate_session_token, hash_token},
     external_console::{ConsoleAuthConfig, is_console_request},
     middleware::auth::{AuthOrg, AuthUser, bearer_token, require_auth},
-    models::{Cluster, LoginRequest, LoginResponse, Organization, User},
+    models::{Cluster, ConsoleSignIn, LoginRequest, LoginResponse, Organization, User},
 };
 
 const SESSION_TTL_SECONDS: i64 = 60 * 60 * 24 * 7;
@@ -228,12 +229,7 @@ async fn create_session_for_password(
     let mut tx = pool.begin().await?;
     // Hold the password read through session insertion so resets revoke every
     // session authenticated with the old password.
-    let Some(user) =
-        sqlx::query_as::<_, User>(sql!("SELECT * FROM users WHERE email = $1 FOR SHARE"))
-            .bind(&request.email)
-            .fetch_optional(&mut *tx)
-            .await?
-    else {
+    let Some(user) = users::share_lock_user_by_email(&mut tx, &request.email).await? else {
         return Err(AuthRouteError::InvalidCredentials);
     };
 
@@ -248,21 +244,20 @@ async fn create_session_for_password(
         return Err(AuthRouteError::InvalidCredentials);
     }
 
-    let org = sqlx::query_as::<_, Organization>(sql!("SELECT * FROM organizations WHERE id = $1"))
-        .bind(user.org_id)
-        .fetch_one(&mut *tx)
-        .await?;
+    let org = organizations::get_organization(&mut *tx, user.org_id)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
 
     let (token, token_hash) = generate_session_token();
-    sqlx::query(sql!(
-        "INSERT INTO sessions (id, user_id, token_hash, expires_at)
-         VALUES ($1, $2, $3, NOW() + ($4::bigint * INTERVAL '1 second'))"
-    ))
-    .bind(Uuid::now_v7())
-    .bind(user.id)
-    .bind(&token_hash)
-    .bind(SESSION_TTL_SECONDS)
-    .execute(&mut *tx)
+    sessions::create_session(
+        &mut *tx,
+        NewSession {
+            id: Uuid::now_v7(),
+            user_id: user.id,
+            token_hash: &token_hash,
+            ttl_seconds: SESSION_TTL_SECONDS,
+        },
+    )
     .await?;
     tx.commit().await?;
 
@@ -271,19 +266,14 @@ async fn create_session_for_password(
 
 async fn delete_session(pool: &PgPool, raw_token: &str) -> Result<(), AuthRouteError> {
     let token_hash = hash_token(raw_token);
-    sqlx::query(sql!("DELETE FROM sessions WHERE token_hash = $1"))
-        .bind(token_hash)
-        .execute(pool)
-        .await?;
+    sessions::delete_session_by_token_hash(pool, &token_hash).await?;
     Ok(())
 }
 
 async fn fetch_cluster(pool: &PgPool) -> Result<Cluster, AuthRouteError> {
-    Ok(
-        sqlx::query_as::<_, Cluster>(sql!("SELECT * FROM clusters WHERE singleton"))
-            .fetch_one(pool)
-            .await?,
-    )
+    Ok(clusters::get_cluster(pool)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?)
 }
 
 #[cfg(test)]

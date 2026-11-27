@@ -1,8 +1,8 @@
 //! Kubernetes label-value vocabulary.
 //!
-//! The one owner of the Kubernetes label-value grammar. `pplx-space-common-core`
-//! re-exports [`LabelValue`] from here so services keep a single validator
-//! (and a single grammar) rather than forking their own.
+//! The one owner of the Kubernetes label-value grammar. Services import
+//! [`LabelValue`] from here so they keep a single validator (and a single
+//! grammar) rather than forking their own.
 
 use std::fmt;
 use std::str::FromStr;

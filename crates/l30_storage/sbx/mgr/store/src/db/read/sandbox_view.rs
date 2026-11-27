@@ -18,11 +18,12 @@
 //! A view is not a snapshot: two accessors are two reads. Callers that compare
 //! their answers hold the connection guard, or a transaction, across both.
 
-use pplx_space_common_core::types::{
-    ExecutionGeneration, LocalArtifactId, SandboxActivationAttemptId, SandboxCleanupEpisodeId,
-    SandboxId, SandboxRuntimeLabel, TransferScopeId,
-};
 use pplx_space_node_mgr_protocol::execution_fence::ExecutionFence;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId,
+    SandboxRuntimeLabel,
+};
+use pplx_space_snapshot_model::{LocalArtifactId, TransferScopeId};
 use rusqlite::params;
 
 use crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt;
@@ -69,7 +70,8 @@ pub enum Decoded<T> {
 
 impl<T> Decoded<T> {
     /// Whether a row exists, decodable or not.
-    pub fn is_present(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_present(&self) -> bool {
         match self {
             Self::Absent => false,
             Self::Present(_) | Self::Undecodable(_) => true,
@@ -77,7 +79,8 @@ impl<T> Decoded<T> {
     }
 
     /// The record, failing on a row that does not decode.
-    pub fn into_strict(self) -> Result<Option<T>> {
+    #[cfg(test)]
+    pub(crate) fn into_strict(self) -> Result<Option<T>> {
         match self {
             Self::Absent => Ok(None),
             Self::Present(value) => Ok(Some(value)),
@@ -437,7 +440,7 @@ impl RouteClaimFacet<'_> {
 
     /// Whether this node rolled back the activation of `claim`, already
     /// matched as the open claim (see
-    /// [`crate::db::route_activation_claims::claim_rolled_back`]).
+    /// `crate::db::route_activation_claims::claim_rolled_back`).
     pub fn rolled_back(self, claim: &OpenRouteActivationClaim) -> Result<bool> {
         crate::db::route_activation_claims::claim_rolled_back(self.0.conn, self.0.id, claim)
     }

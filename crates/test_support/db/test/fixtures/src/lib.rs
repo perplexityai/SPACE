@@ -1,7 +1,7 @@
-use pplx_space_common_core::env::{Environment, ProcessEnvironment};
-use pplx_space_common_core::types::{
-    LocalArtifactId, NodeId, OrgId, SandboxId, SnapshotId, UserId,
-};
+use pplx_space_accounts::{NodeId, OrgId, UserId};
+use pplx_space_env_vars::{Environment, ProcessEnvironment};
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 
 use std::error::Error;
 use std::fmt::Display;
@@ -16,6 +16,8 @@ use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
 use testcontainers_modules::postgres::Postgres as PostgresImage;
 use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
+
+pub mod plan;
 
 const DEFAULT_POSTGRES_IMAGE: &str = "public.ecr.aws/docker/library/postgres:16-alpine";
 /// Default Redis test image. Mirrored on AWS's public ECR for the same reason
@@ -238,7 +240,7 @@ pub async fn raise_sqlstate(pool: &PgPool, sqlstate: &str) -> sqlx::Error {
         sqlstate.len() == 5 && sqlstate.bytes().all(|byte| byte.is_ascii_alphanumeric()),
         "a SQLSTATE is five alphanumeric characters, got {sqlstate:?}"
     );
-    // No `sql!` locator: this crate has `pplx-space-common-core` only as a
+    // No `sql!` locator: this crate has `pplx-space-sql-locator` only as a
     // dev-dependency, which is also why its other runtime-built statements go
     // unwrapped. The locator exists to attribute production SQL in
     // `pg_stat_activity`; nothing here runs outside a test.

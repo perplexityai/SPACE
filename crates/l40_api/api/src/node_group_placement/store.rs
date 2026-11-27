@@ -1,5 +1,7 @@
 //! The one read behind a node-group candidate set: a template's compatibility
-//! slice plus every `node_groups` row and its allowlist.
+//! slice plus every `node_groups` row and its allowlist. The statement is
+//! `pplx_space_node_group_store::template_catalog`; this module builds the
+//! catalog from its rows.
 //!
 //! One statement, not two, because the pair has to be read as a unit: the
 //! candidate set is `{ g : compatible(caller_org, template, g) }`, and a
@@ -37,12 +39,8 @@
 //! cluster into a total create outage. See
 //! [`super::ResolvedPlacement::Unprovisioned`].
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{
-    NodeGroup, NodeGroupId, NodeGroupName, NodeGroupPolicy, NodeGroupTemplatePolicy, OrgId,
-    TemplateCompatSpec, TemplateName, TemplateVisibility,
-};
-use uuid::Uuid;
+use pplx_space_node_model::{NodeGroup, NodeGroupId, NodeGroupPolicy, TemplateCompatSpec};
+use pplx_space_template_model::TemplateName;
 
 /// A template's compatibility slice together with the cluster's node groups —
 /// everything [`NodeGroup::compatible`] needs, read at one instant.
@@ -81,26 +79,10 @@ pub enum NodeGroupCatalogError {
     },
 }
 
-/// Raw column shape. Every `group_*` column is nullable because the
-/// `LEFT JOIN ... ON TRUE` yields one all-NULL group row when `node_groups`
-/// is empty.
-#[derive(sqlx::FromRow)]
-struct CatalogRow {
-    template_org_id: Option<OrgId>,
-    template_visibility: TemplateVisibility,
-    group_id: Option<Uuid>,
-    /// Decoded through [`NodeGroupName`]'s own `sqlx::Decode`, which parses via
-    /// the same smart constructor used at the wire boundary — so an
-    /// out-of-grammar value in the column fails the decode instead of
-    /// materializing a name that could reach a node label.
-    group_name: Option<NodeGroupName>,
-    group_org_id: Option<OrgId>,
-    group_template_policy: Option<NodeGroupTemplatePolicy>,
-    group_is_default: Option<bool>,
-    /// **Narrowed to the queried template.** The join filters
-    /// `template_name = $1`, so this is `[]` or `[$1]` rather than the group's
-    /// whole allowlist — see the statement below for why.
-    group_template_allowlist: Vec<String>,
+impl From<pplx_space_postgres_pool::DbError> for NodeGroupCatalogError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
 }
 
 /// Read the catalog for one template name.
@@ -110,55 +92,12 @@ struct CatalogRow {
 /// a pool or a transaction connection so a caller already inside a transaction
 /// reads the same snapshot.
 pub async fn catalog_for_template(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
     template_name: &str,
 ) -> Result<Option<NodeGroupCatalog>, NodeGroupCatalogError> {
-    // `desired_state` is deliberately not filtered. It records whether a
-    // template is *publishable*, and a suspended sandbox whose template was
-    // since deleted still has to resolve a candidate set to restore into; the
-    // create path's own authorization gate (`gate_template_access`) is what
-    // rejects an unpublished template, and it runs before this.
-    // The compat join is filtered to `$1`, not aggregated whole. The allowlist
-    // has exactly one consumer — `NodeGroup::compatible`'s
-    // `template_allowlist.contains(&template.name)`, where that name *is* `$1`
-    // — so every other allowlisted name would be decoded, parsed and inserted
-    // into a `BTreeSet` per pod build to answer one boolean. Filtering in the
-    // join makes it a probe on the `(node_group_id, template_name)` primary key
-    // and leaves `contains` answering identically.
-    //
-    // `t.name` is deliberately not selected: it is tautologically `$1`, and the
-    // caller's own string is the one that has to survive into the placement
-    // anyway — the pod builder cross-checks the placement's template against
-    // the template the pod renders.
-    let rows: Vec<CatalogRow> = sqlx::query_as(sql!(
-        "SELECT t.org_id AS template_org_id,
-                t.visibility AS template_visibility,
-                g.id AS group_id,
-                g.name AS group_name,
-                g.org_id AS group_org_id,
-                g.template_policy AS group_template_policy,
-                g.is_default AS group_is_default,
-                COALESCE(
-                    ARRAY_AGG(c.template_name) FILTER (WHERE c.template_name IS NOT NULL),
-                    ARRAY[]::TEXT[]
-                ) AS group_template_allowlist
-           FROM templates t
-           LEFT JOIN node_groups g ON TRUE
-           LEFT JOIN node_group_template_compat c
-                  ON c.node_group_id = g.id AND c.template_name = t.name
-          WHERE t.name = $1
-          GROUP BY t.org_id,
-                   t.visibility,
-                   g.id,
-                   g.name,
-                   g.org_id,
-                   g.template_policy,
-                   g.is_default
-          ORDER BY g.name ASC"
-    ))
-    .bind(template_name)
-    .fetch_all(executor)
-    .await?;
+    // The statement, and why it filters what it does, is the node-group
+    // store's `template_catalog`.
+    let rows = pplx_space_node_group_store::template_catalog(executor, template_name).await?;
 
     let Some(first) = rows.first() else {
         return Ok(None);
@@ -212,11 +151,12 @@ pub async fn catalog_for_template(
 
 /// Parses a template name, attaching the column it came from to a failure.
 ///
-/// Only [`TemplateName`] needs this. [`NodeGroupName`] and
-/// [`NodeGroupTemplatePolicy`] carry `sqlx::Decode` impls that parse through
-/// the same constructor used at the wire boundary, so sqlx surfaces their drift
-/// as a `ColumnDecode` error with the column already named; `TemplateName` has
-/// no such impl.
+/// Only [`TemplateName`] needs this.
+/// [`NodeGroupName`](pplx_space_node_model::NodeGroupName) and
+/// [`NodeGroupTemplatePolicy`](pplx_space_node_model::NodeGroupTemplatePolicy)
+/// carry `sqlx::Decode` impls that parse through the same constructor used at
+/// the wire boundary, so sqlx surfaces their drift as a `ColumnDecode` error
+/// with the column already named; `TemplateName` has no such impl.
 fn stored_template_name(
     value: &str,
     column: &'static str,

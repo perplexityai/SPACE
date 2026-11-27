@@ -27,7 +27,8 @@
 
 use std::path::Path;
 
-use pplx_space_common_core::types::{ExecutionGeneration, LocalArtifactId};
+use pplx_space_sandbox_model::ExecutionGeneration;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 /// The record's file name in the capture's directory.
 pub(crate) const CAPTURE_RECORD_FILENAME: &str = "capture.json";

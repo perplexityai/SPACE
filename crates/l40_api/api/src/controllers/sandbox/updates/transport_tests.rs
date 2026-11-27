@@ -6,9 +6,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDb, pg_test_db};
 use pplx_space_node_api_sim::SimWorkerHarness;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::proto::{
     AutoLifecycleStatus, SandboxInfo, SandboxLifecycleState, StateResponse,
 };
@@ -21,6 +22,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 
 use super::*;
+use pplx_space_sql_locator::sql;
 
 #[cfg(feature = "kubernetes")]
 mod kubernetes;

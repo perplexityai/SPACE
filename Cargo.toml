@@ -37,8 +37,9 @@ members = [
     "crates/l10_foundation/spaced/build",
     "crates/l40_api/spaced/guest/execution",
     "crates/l20_domain/spaced/guest/protocol",
-    "crates/l20_domain/spaced/common",
+    "crates/l20_domain/spaced/protocol",
     "crates/l20_domain/spaced/update",
+    "crates/l40_api/spaced/client",
     "crates/l40_api/spaced/guest/client",
     "crates/l40_api/spaced/guest/server",
     "crates/l40_api/spaced/guest/update",
@@ -47,6 +48,7 @@ members = [
     "crates/test_support/test/env",
     "crates/l10_foundation/bearer/token",
     "crates/l10_foundation/tokio/runtime",
+    "crates/l30_storage/accounts/store",
     "crates/l30_storage/sandbox/store",
     "crates/l30_storage/sandbox/quarantine/store",
     "crates/l30_storage/sandbox/teardown",
@@ -62,6 +64,7 @@ members = [
     "crates/l40_api/sbx/mgr/server",
     "crates/l30_storage/sbx/mgr/store",
     "crates/l10_foundation/rustls/provider",
+    "crates/l10_foundation/sql/codec",
     "crates/l10_foundation/sql/locator",
     "crates/l10_foundation/service/lifecycle",
     "crates/l10_foundation/service/mutex",
@@ -79,9 +82,14 @@ members = [
     "crates/l20_domain/k8s/node/id",
     "crates/test_support/node/api/sim",
     "crates/l40_api/node/mgr/client",
+    "crates/l20_domain/node/drain",
     "crates/l20_domain/node/mgr/protocol",
+    "crates/l20_domain/node/model",
+    "crates/l20_domain/sandbox/model",
     "crates/l40_api/node/mgr/server",
     "crates/l30_storage/node/registration/store",
+    "crates/l30_storage/node/group/store",
+    "crates/l30_storage/node/template/inventory/store",
     "crates/l40_api/node/runtime/core",
     "crates/l40_api/node/runtime/manager/client",
     "crates/l40_api/node/runtime/manager/server",
@@ -89,9 +97,12 @@ members = [
     "crates/l20_domain/execution/common",
     "crates/l40_api/execution/catalog",
     "crates/l30_storage/runtime/environment/catalog/store",
+    "crates/l30_storage/runtime/upgrade/campaign/store",
     "crates/l30_storage/node/status/store",
+    "crates/l30_storage/node/execution/inventory/store",
     "crates/l30_storage/runtime/environment/policy/store",
     "crates/l20_domain/net/common",
+    "crates/l10_foundation/transparent/proxy/socket",
     "crates/l40_api/net/gateway/client",
     "crates/l20_domain/net/gateway/protocol",
     "crates/l40_api/net/gateway/server",
@@ -107,19 +118,19 @@ members = [
     "crates/l40_api/api",
     "crates/l20_domain/api/route",
     "crates/l10_foundation/byte/size",
-    "crates/libs/common/core",
     "crates/l10_foundation/semver",
     "crates/l10_foundation/durations",
     "crates/l10_foundation/stopwatch",
     "crates/l10_foundation/common/cli",
-    "crates/l10_foundation/common/connection/admission",
+    "crates/l10_foundation/connection/admission",
     "crates/l10_foundation/common/grpc/transport",
-    "crates/l10_foundation/common/grpc/lb",
-    "crates/l10_foundation/common/io",
+    "crates/l10_foundation/grpc/lb",
+    "crates/l10_foundation/file/io",
     "crates/l10_foundation/common/jobs",
-    "crates/l10_foundation/common/lru/reaper",
+    "crates/l10_foundation/lru/reaper",
     "crates/l10_foundation/common/proto/build",
-    "crates/l10_foundation/common/work/coalescer",
+    "crates/l10_foundation/work/coalescer",
+    "crates/l20_domain/rollout/queue",
     "crates/l40_api/rpc/auth",
     "crates/l40_api/grpc/server",
     "crates/l40_api/local/health",
@@ -137,9 +148,20 @@ members = [
     "crates/l10_foundation/aws/client",
     "crates/l10_foundation/s3/http/client",
     "crates/l10_foundation/env/vars",
+    "crates/l10_foundation/test/hooks",
     "crates/l10_foundation/feature/flags",
     "crates/l20_domain/events",
+    "crates/l30_storage/data/plane/session/store",
+    "crates/l30_storage/direct/coordinator",
+    "crates/l30_storage/direct/store",
+    "crates/l30_storage/admin/audit/store",
     "crates/l30_storage/federated/grant/store",
+    "crates/l30_storage/firewall/rules/store",
+    "crates/l30_storage/public/operation/store",
+    "crates/l30_storage/node/runtime/manager/store",
+    "crates/l30_storage/build/mgr/store",
+    "crates/l30_storage/volmgr/store",
+    "crates/l30_storage/node/mgr/store",
     "crates/l40_api/ingress/admission",
     "crates/l10_foundation/metrics/emit",
     "crates/l10_foundation/grpc/metrics",
@@ -157,10 +179,28 @@ members = [
     "crates/l10_foundation/guest/capability",
     "crates/l10_foundation/guest/status",
     "crates/l10_foundation/job/id",
+    "crates/l10_foundation/uuid/id",
     "crates/l40_api/sandbox/grpc",
+    "crates/l40_api/sandbox/pod",
     "crates/l10_foundation/request/id",
     "crates/l20_domain/execution/spec",
+    "crates/l20_domain/template/runtime",
+    "crates/l20_domain/template/manifest",
+    "crates/l20_domain/template/model",
+    "crates/l20_domain/snapshot/model",
+    "crates/l20_domain/artifact/model",
+    "crates/l20_domain/byok/model",
+    "crates/l20_domain/subject/model",
+    "crates/l20_domain/admin/protocol",
+    "crates/l20_domain/archive/model",
+    "crates/l20_domain/policy/authority",
+    "crates/l20_domain/firewall/rules/model",
+    "crates/l20_domain/firewall/rules/protocol",
     "crates/l10_foundation/linux/ids",
+    "crates/l10_foundation/host/linux",
+    "crates/l20_domain/host/layout",
+    "crates/l40_api/node/disk/admission",
+    "crates/l40_api/template/cache/permissions",
     "crates/l20_domain/network/roles",
     "crates/l20_domain/auto/lifecycle/policy",
     "crates/l10_foundation/pii",
@@ -175,10 +215,16 @@ members = [
     "crates/l40_api/template/mgr/server",
     "crates/l40_api/template/mgr/client",
     "crates/l30_storage/template/mgr/store",
+    "crates/l30_storage/node/ctl/store",
+    "crates/l30_storage/template/release/store",
+    "crates/l30_storage/template/store",
+    "crates/l30_storage/template/release/original",
+    "crates/l30_storage/byok/store",
+    "crates/l30_storage/storage/vend/store",
     "crates/l40_api/template/publisher",
     "crates/l40_api/credmgr/client",
     "crates/l40_api/credmgr/server",
-    "crates/l20_domain/credential/injection/core",
+    "crates/l20_domain/credential/injection",
     "crates/l40_api/credential/provider/client",
     "crates/l20_domain/credential/provider/proto",
     "crates/l50_app/volmgr/svc",
@@ -189,7 +235,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.8.1"
+version = "0.8.2"
 edition = "2024"
 # Minimum supported Rust version (MSRV) floor. Cargo refuses to build on any
 # toolchain below this, giving a clear "requires rustc >= X" error instead of a
@@ -202,7 +248,7 @@ edition = "2024"
 # on): that is the minimum we can prove green. Raise both together when bumping.
 # Edition 2024 independently requires >=1.85. Members inherit via
 # `rust-version.workspace = true`.
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 authors = ["Perplexity AI"]
 license = "Apache-2.0"
 publish = false
@@ -273,7 +319,7 @@ md-5 = "0.11"
 metrics = "0.24.1"
 multer = "3"
 nix = "0.31"
-rustix = "1.1.4"
+rustix = "1.1.6"
 notify = "8"
 oci-spec = { version = "0.10", default-features = false, features = ["distribution"] }
 object = { version = "0.40", default-features = false, features = ["read_core", "elf"] }
@@ -315,6 +361,7 @@ rustls = { version = "0.23.46", default-features = false }
 schemars = "1"
 serde = "1"
 serde_json = "1"
+serde_path_to_error = "0.1"
 semver = "1"
 blake3 = "1.8.7"
 sha2 = "0.11"
@@ -323,6 +370,7 @@ socket2 = "0.6"
 # The published SQLx 0.9 bounds libsqlite3-sys below the patched SQLite release.
 # Pin upstream's compatibility fix until a registry release includes it.
 sqlx = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c", default-features = false }
+syn = { version = "2", default-features = false }
 tempfile = "3"
 tar = "0.4.46"
 flate2 = "1"
@@ -352,6 +400,7 @@ tracing-log = "0.2"
 # tracing-opentelemetry 0.33 is the matching line for opentelemetry 0.32.
 tracing-opentelemetry = "0.33"
 tracing-subscriber = "0.3"
+url = "2"
 uuid = { version = "1", features = ["v4"] }
 webpki-roots = "1"
 x509-parser = "0.18"
@@ -367,45 +416,61 @@ pplx-space-bearer-token = { path = "crates/l10_foundation/bearer/token" }
 pplx-space-build-mgr = { path = "crates/l40_api/build/mgr/engine" }
 pplx-space-build-mgr-client = { path = "crates/l40_api/build/mgr/client" }
 pplx-space-build-mgr-server = { path = "crates/l40_api/build/mgr/server" }
+pplx-space-build-mgr-store = { path = "crates/l30_storage/build/mgr/store" }
 pplx-space-byte-size = { path = "crates/l10_foundation/byte/size" }
-pplx-space-common-core = { path = "crates/libs/common/core" }
 pplx-space-durations = { path = "crates/l10_foundation/durations" }
 pplx-space-stopwatch = { path = "crates/l10_foundation/stopwatch" }
 pplx-space-common-cli = { path = "crates/l10_foundation/common/cli" }
-pplx-space-common-connection-admission = { path = "crates/l10_foundation/common/connection/admission" }
+pplx-space-connection-admission = { path = "crates/l10_foundation/connection/admission" }
 pplx-space-common-grpc = { path = "crates/l10_foundation/common/grpc/transport" }
-pplx-space-common-grpc-lb = { path = "crates/l10_foundation/common/grpc/lb" }
-pplx-space-common-io = { path = "crates/l10_foundation/common/io" }
+pplx-space-grpc-lb = { path = "crates/l10_foundation/grpc/lb" }
+pplx-space-file-io = { path = "crates/l10_foundation/file/io" }
 pplx-space-common-jobs = { path = "crates/l10_foundation/common/jobs" }
-pplx-space-common-lru-reaper = { path = "crates/l10_foundation/common/lru/reaper" }
+pplx-space-lru-reaper = { path = "crates/l10_foundation/lru/reaper" }
 pplx-space-common-proto-build = { path = "crates/l10_foundation/common/proto/build" }
-pplx-space-common-work-coalescer = { path = "crates/l10_foundation/common/work/coalescer" }
+pplx-space-work-coalescer = { path = "crates/l10_foundation/work/coalescer" }
+pplx-space-rollout-queue = { path = "crates/l20_domain/rollout/queue" }
 pplx-space-content-digest = { path = "crates/l10_foundation/content/digest" }
 pplx-space-cpu-arch = { path = "crates/l10_foundation/cpu/arch" }
 pplx-space-data-plane-server = { path = "crates/l40_api/data/plane/server" }
 pplx-space-db-migrate = { path = "crates/l30_storage/db/migrate" }
 pplx-space-db-test-fixtures = { path = "crates/test_support/db/test/fixtures" }
+pplx-space-direct-coordinator = { path = "crates/l30_storage/direct/coordinator" }
+pplx-space-direct-store = { path = "crates/l30_storage/direct/store" }
 pplx-space-dependency-drain = { path = "crates/l10_foundation/dependency/drain" }
 pplx-space-ecw-credential = { path = "crates/l20_domain/ecw/credential" }
 pplx-space-env-vars = { path = "crates/l10_foundation/env/vars" }
+pplx-space-test-hooks = { path = "crates/l10_foundation/test/hooks" }
 pplx-space-migration-checksums = { path = "crates/l10_foundation/migration/checksums" }
 pplx-space-execution-catalog = { path = "crates/l40_api/execution/catalog" }
 pplx-space-execution-common = { path = "crates/l20_domain/execution/common" }
 pplx-space-runtime-environment-catalog-store = { path = "crates/l30_storage/runtime/environment/catalog/store" }
 pplx-space-runtime-environment-policy-store = { path = "crates/l30_storage/runtime/environment/policy/store" }
+pplx-space-runtime-upgrade-campaign-store = { path = "crates/l30_storage/runtime/upgrade/campaign/store" }
 pplx-space-node-status-store = { path = "crates/l30_storage/node/status/store" }
+pplx-space-node-execution-inventory-store = { path = "crates/l30_storage/node/execution/inventory/store" }
 pplx-space-feature-flags = { path = "crates/l10_foundation/feature/flags" }
 pplx-space-events = { path = "crates/l20_domain/events" }
+pplx-space-accounts-store = { path = "crates/l30_storage/accounts/store" }
+pplx-space-data-plane-session-store = { path = "crates/l30_storage/data/plane/session/store" }
+pplx-space-admin-audit-store = { path = "crates/l30_storage/admin/audit/store" }
 pplx-space-federated-grant-store = { path = "crates/l30_storage/federated/grant/store" }
+pplx-space-firewall-rules-store = { path = "crates/l30_storage/firewall/rules/store" }
+pplx-space-public-operation-store = { path = "crates/l30_storage/public/operation/store" }
+pplx-space-node-runtime-manager-store = { path = "crates/l30_storage/node/runtime/manager/store" }
+pplx-space-node-mgr-store = { path = "crates/l30_storage/node/mgr/store" }
 pplx-space-ingress-admission = { path = "crates/l40_api/ingress/admission" }
 pplx-space-credmgr = { path = "crates/l40_api/credmgr/server" }
 pplx-space-credmgr-client = { path = "crates/l40_api/credmgr/client" }
-pplx-space-credential-injection-core = { path = "crates/l20_domain/credential/injection/core" }
+pplx-space-credential-injection = { path = "crates/l20_domain/credential/injection" }
 pplx-space-credential-injection-store = { path = "crates/l30_storage/credential/injection/store" }
+pplx-space-byok-store = { path = "crates/l30_storage/byok/store" }
+pplx-space-storage-vend-store = { path = "crates/l30_storage/storage/vend/store" }
 pplx-space-credential-provider-client = { path = "crates/l40_api/credential/provider/client" }
 pplx-space-credential-provider-proto = { path = "crates/l20_domain/credential/provider/proto" }
 pplx-space-volmgr = { path = "crates/l40_api/volmgr/server" }
 pplx-space-volmgr-client = { path = "crates/l40_api/volmgr/client" }
+pplx-space-volmgr-store = { path = "crates/l30_storage/volmgr/store" }
 pplx-space-net-gateway = { path = "crates/l40_api/net/gateway/server" }
 pplx-space-net-gateway-client = { path = "crates/l40_api/net/gateway/client" }
 pplx-space-net-gateway-protocol = { path = "crates/l20_domain/net/gateway/protocol" }
@@ -413,17 +478,23 @@ pplx-space-node-api-client = { path = "crates/l40_api/node/api/client" }
 pplx-space-node-ctl-client = { path = "crates/l40_api/node/ctl/client" }
 pplx-space-node-api-server = { path = "crates/l40_api/node/api/server" }
 pplx-space-node-ctl-server = { path = "crates/l40_api/node/ctl/server" }
+pplx-space-node-ctl-store = { path = "crates/l30_storage/node/ctl/store" }
 pplx-space-k8s-node-id = { path = "crates/l20_domain/k8s/node/id" }
 pplx-space-node-api-sim = { path = "crates/test_support/node/api/sim" }
 pplx-space-node-mgr = { path = "crates/l40_api/node/mgr/server" }
 pplx-space-node-mgr-client = { path = "crates/l40_api/node/mgr/client" }
+pplx-space-node-drain = { path = "crates/l20_domain/node/drain" }
 pplx-space-node-mgr-protocol = { path = "crates/l20_domain/node/mgr/protocol" }
+pplx-space-node-model = { path = "crates/l20_domain/node/model" }
+pplx-space-node-group-store = { path = "crates/l30_storage/node/group/store" }
 pplx-space-node-registration-store = { path = "crates/l30_storage/node/registration/store" }
 pplx-space-node-runtime-core = { path = "crates/l40_api/node/runtime/core" }
 pplx-space-node-runtime-manager = { path = "crates/l40_api/node/runtime/manager/server" }
 pplx-space-node-runtime-manager-client = { path = "crates/l40_api/node/runtime/manager/client" }
 pplx-space-node-runtime-supervisor = { path = "crates/l40_api/node/runtime/supervisor" }
+pplx-space-node-template-inventory-store = { path = "crates/l30_storage/node/template/inventory/store" }
 pplx-space-net-common = { path = "crates/l20_domain/net/common" }
+pplx-space-transparent-proxy-socket = { path = "crates/l10_foundation/transparent/proxy/socket" }
 pplx-space-object-store = { path = "crates/l10_foundation/object/store" }
 pplx-space-page-cache = { path = "crates/l10_foundation/page/cache" }
 pplx-space-postgres-contention = { path = "crates/l10_foundation/postgres/contention" }
@@ -434,9 +505,9 @@ pplx-space-metrics-emit = { path = "crates/l10_foundation/metrics/emit" }
 pplx-space-grpc-metrics = { path = "crates/l10_foundation/grpc/metrics" }
 pplx-space-reconcile-metrics = { path = "crates/l10_foundation/reconcile/metrics" }
 pplx-space-sandbox-metrics = { path = "crates/l40_api/sandbox/metrics" }
+pplx-space-sandbox-model = { path = "crates/l20_domain/sandbox/model" }
 pplx-space-observability = { path = "crates/l10_foundation/observability", default-features = false }
 pplx-space-internal-api-server = { path = "crates/l40_api/internal/api/server" }
-pplx-space-internal-api-svc = { path = "crates/l50_app/internal/api/svc" }
 pplx-space-k8s-ids = { path = "crates/l10_foundation/k8s/ids" }
 pplx-space-kube-client = { path = "crates/l10_foundation/kube/client" }
 pplx-space-cluster-id = { path = "crates/l20_domain/cluster/id" }
@@ -446,10 +517,27 @@ pplx-space-guest-process = { path = "crates/l20_domain/guest/process" }
 pplx-space-guest-capability = { path = "crates/l10_foundation/guest/capability" }
 pplx-space-guest-status = { path = "crates/l10_foundation/guest/status" }
 pplx-space-job-id = { path = "crates/l10_foundation/job/id" }
+pplx-space-uuid-id = { path = "crates/l10_foundation/uuid/id" }
 pplx-space-sandbox-grpc = { path = "crates/l40_api/sandbox/grpc" }
+pplx-space-sandbox-pod = { path = "crates/l40_api/sandbox/pod" }
 pplx-space-request-id = { path = "crates/l10_foundation/request/id" }
 pplx-space-execution-spec = { path = "crates/l20_domain/execution/spec" }
+pplx-space-template-runtime = { path = "crates/l20_domain/template/runtime" }
+pplx-space-template-manifest = { path = "crates/l20_domain/template/manifest" }
+pplx-space-template-model = { path = "crates/l20_domain/template/model" }
+pplx-space-snapshot-model = { path = "crates/l20_domain/snapshot/model" }
+pplx-space-artifact-model = { path = "crates/l20_domain/artifact/model" }
+pplx-space-byok-model = { path = "crates/l20_domain/byok/model" }
+pplx-space-subject-model = { path = "crates/l20_domain/subject/model" }
+pplx-space-admin-protocol = { path = "crates/l20_domain/admin/protocol" }
+pplx-space-firewall-rules-model = { path = "crates/l20_domain/firewall/rules/model" }
+pplx-space-firewall-rules-protocol = { path = "crates/l20_domain/firewall/rules/protocol" }
+pplx-space-policy-authority = { path = "crates/l20_domain/policy/authority" }
 pplx-space-linux-ids = { path = "crates/l10_foundation/linux/ids" }
+pplx-space-host-linux = { path = "crates/l10_foundation/host/linux" }
+pplx-space-host-layout = { path = "crates/l20_domain/host/layout" }
+pplx-space-node-disk-admission = { path = "crates/l40_api/node/disk/admission" }
+pplx-space-template-cache-permissions = { path = "crates/l40_api/template/cache/permissions" }
 pplx-space-network-roles = { path = "crates/l20_domain/network/roles" }
 pplx-space-auto-lifecycle = { path = "crates/l20_domain/auto/lifecycle/policy" }
 pplx-space-pii = { path = "crates/l10_foundation/pii" }
@@ -483,6 +571,7 @@ pplx-space-sbx-mgr-store = { path = "crates/l30_storage/sbx/mgr/store" }
 pplx-space-postgres-pool = { path = "crates/l30_storage/postgres/pool" }
 pplx-space-rustls-provider = { path = "crates/l10_foundation/rustls/provider" }
 pplx-space-semver = { path = "crates/l10_foundation/semver" }
+pplx-space-sql-codec = { path = "crates/l10_foundation/sql/codec" }
 pplx-space-sql-locator = { path = "crates/l10_foundation/sql/locator" }
 pplx-space-service-lifecycle = { path = "crates/l10_foundation/service/lifecycle" }
 pplx-space-state-reconciliation = { path = "crates/l20_domain/state/reconciliation" }
@@ -492,9 +581,10 @@ pplx-space-systemd-watchdog = { path = "crates/l10_foundation/systemd/watchdog" 
 pplx-space-spaced-build = { path = "crates/l10_foundation/spaced/build" }
 pplx-space-spaced-guest-protocol = { path = "crates/l20_domain/spaced/guest/protocol" }
 pplx-space-spaced-guest-execution = { path = "crates/l40_api/spaced/guest/execution" }
-pplx-space-spaced-common = { path = "crates/l20_domain/spaced/common" }
+pplx-space-spaced-protocol = { path = "crates/l20_domain/spaced/protocol" }
 pplx-space-spaced-update = { path = "crates/l20_domain/spaced/update" }
 pplx-space-spaced-guest-update = { path = "crates/l40_api/spaced/guest/update" }
+pplx-space-spaced-client = { path = "crates/l40_api/spaced/client" }
 pplx-space-spaced-guest-client = { path = "crates/l40_api/spaced/guest/client" }
 pplx-space-spaced-guest-server = { path = "crates/l40_api/spaced/guest/server" }
 pplx-space-spaced-host-client = { path = "crates/l40_api/spaced/host/client" }
@@ -502,12 +592,14 @@ pplx-space-spaced-host-server = { path = "crates/l40_api/spaced/host/server" }
 pplx-space-template-mgr = { path = "crates/l40_api/template/mgr/server" }
 pplx-space-template-mgr-client = { path = "crates/l40_api/template/mgr/client" }
 pplx-space-template-mgr-store = { path = "crates/l30_storage/template/mgr/store" }
+pplx-space-template-release-store = { path = "crates/l30_storage/template/release/store" }
+pplx-space-template-release-original = { path = "crates/l30_storage/template/release/original" }
+pplx-space-template-store = { path = "crates/l30_storage/template/store" }
 pplx-space-template-publisher = { path = "crates/l40_api/template/publisher" }
 pplx-space-test-env = { path = "crates/test_support/test/env" }
 pplx-space-unix-socket-path = { path = "crates/l10_foundation/unix/socket/path" }
 pplx-space-uds-peer-auth = { path = "crates/l10_foundation/uds/peer/auth" }
 pplx-space-unix-socket-bind = { path = "crates/l10_foundation/unix/socket/bind" }
-pplx-space-valkey = { path = "crates/l10_foundation/valkey" }
 pplx-space-grpc-rate-limiter = { path = "crates/l10_foundation/grpc/rate/limiter" }
 pplx-space-tokio-runtime = { path = "crates/l10_foundation/tokio/runtime" }
 [profile.release]

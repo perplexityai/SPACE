@@ -1,5 +1,8 @@
 use super::*;
-use pplx_space_common_core::types::{PodUid, SandboxActivationAttemptId, TemplateId};
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
+use pplx_space_sql_locator::sql;
+use pplx_space_template_model::TemplateId;
 
 mod activation_timeout_tests {
     use super::*;
@@ -200,10 +203,10 @@ mod touch_auto_lifecycle_tests {
 
 mod policy_tests {
 
-    use pplx_space_common_core::types::SandboxId;
+    use pplx_space_sandbox_model::SandboxId;
     use std::collections::BTreeMap;
 
-    use pplx_space_common_core::types::{
+    use pplx_space_auto_lifecycle::{
         AutoLifecycleConditionKind, AutoLifecycleConditionSet, AutoLifecycleConditionSetId,
         AutoLifecycleWakePolicy, AutoLifecycleWakeSource,
     };
@@ -347,51 +350,21 @@ mod policy_tests {
     #[test]
     fn sandbox_port_exposure_admission_enforces_guest_listener_budget() {
         super::ports::enforce_sandbox_port_exposure_capacity(
-            pplx_space_common_core::types::MAX_SANDBOX_PORT_EXPOSURES as i64 - 1,
+            pplx_space_sandbox_model::MAX_SANDBOX_PORT_EXPOSURES as i64 - 1,
             false,
         )
         .unwrap();
         let error = super::ports::enforce_sandbox_port_exposure_capacity(
-            pplx_space_common_core::types::MAX_SANDBOX_PORT_EXPOSURES as i64,
+            pplx_space_sandbox_model::MAX_SANDBOX_PORT_EXPOSURES as i64,
             false,
         )
         .unwrap_err();
         assert_eq!(error.status(), axum::http::StatusCode::CONFLICT);
         super::ports::enforce_sandbox_port_exposure_capacity(
-            pplx_space_common_core::types::MAX_SANDBOX_PORT_EXPOSURES as i64,
+            pplx_space_sandbox_model::MAX_SANDBOX_PORT_EXPOSURES as i64,
             true,
         )
         .expect("existing desired-open exposure remains idempotent above the new admission limit");
-    }
-
-    #[test]
-    fn validate_create_template_reference_accepts_tags_and_full_digest() {
-        let template = TemplateReference::latest(TemplateName::parse("seed").unwrap());
-        validate_create_template_reference(&template).unwrap();
-        assert!(template.uses_default_selector());
-        assert_eq!(template.artifact_digest(), None);
-
-        let template = "seed:prod".parse::<TemplateReference>().unwrap();
-        validate_create_template_reference(&template).unwrap();
-        assert!(!template.uses_default_selector());
-
-        let hash = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
-        let template = format!("seed@{hash}").parse::<TemplateReference>().unwrap();
-        validate_create_template_reference(&template).unwrap();
-        assert_eq!(
-            template.artifact_digest().map(|digest| digest.to_string()),
-            Some(hash.to_string())
-        );
-    }
-
-    #[test]
-    fn validate_create_template_reference_rejects_digest_prefixes() {
-        let template = "seed@sha256:111111111111"
-            .parse::<TemplateReference>()
-            .unwrap();
-
-        let error = validate_create_template_reference(&template).unwrap_err();
-        assert!(error.to_string().contains("digest prefixes"));
     }
 }
 
@@ -476,7 +449,7 @@ mod template_release_resolution_postgres_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn missing_explicit_tag_falls_back_to_latest() -> TestResult {
+    async fn missing_explicit_tag_does_not_resolve_latest() -> TestResult {
         let db = pg_test_db().await?;
         let release_id = Uuid::now_v7();
         let content_hash =
@@ -503,11 +476,23 @@ mod template_release_resolution_postgres_tests {
 
         insert_release_with_latest_tag(&db.pool, "custom-template", release_id, content_hash, None)
             .await?;
-        for reference in [
-            "custom-template:v123",
-            "custom-template:latest",
-            "custom-template",
-        ] {
+        let error = resolve_template_release(
+            &db.pool,
+            &missing,
+            RuntimeKind::Firecracker,
+            caller_org,
+            ReleaseMissReport::Classified,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            error.template_release_miss(),
+            Some(TemplateReleaseMiss::NoMatchingRelease),
+            "{error}"
+        );
+        assert!(error.to_string().contains("tag 'v123'"), "{error}");
+        for reference in ["custom-template:latest", "custom-template"] {
             let template = reference.parse::<TemplateReference>()?;
 
             let resolved = resolve_template_release(
@@ -1105,7 +1090,7 @@ mod template_release_resolution_postgres_tests {
                 Some((release_id, content_hash.to_string())),
             ),
         ] {
-            let resolved = crate::template_releases_store::resolve_template_release_by_digest(
+            let resolved = pplx_space_template_release_store::lookup::resolve_by_digest(
                 &db.pool,
                 &TemplateName::parse("tenant-secret")?,
                 content_hash.parse()?,
@@ -1116,6 +1101,194 @@ mod template_release_resolution_postgres_tests {
             assert_eq!(resolved, expected);
         }
 
+        Ok(())
+    }
+
+    /// A digest resolves to its original release (the first registered),
+    /// never a twin bound to another environment that was registered after
+    /// it. Twins exist only once the `(template_name, hash)` unique index is
+    /// dropped, which the test does to stand in for the contract migration.
+    #[tokio::test(flavor = "current_thread")]
+    async fn digest_lookup_resolves_the_original_not_a_twin() -> TestResult {
+        let db = pg_test_db().await?;
+        let release_id = Uuid::now_v7();
+        let content_hash =
+            "sha256:7777777777777777777777777777777777777777777777777777777777777777";
+        insert_org_specific_template(&db.pool, "tenant-twin", Uuid::parse_str(TENANT_ORG)?).await?;
+        sqlx::query("DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique")
+            .execute(&db.pool)
+            .await?;
+        // The twins go into the heap first, so a lookup with no age order
+        // would scan one of them first.
+        for seed in ["a", "b", "c"] {
+            sqlx::query(
+                "INSERT INTO template_releases
+                     (id, template_name, type, hash, org_id, execution_metadata)
+                 VALUES ($1, 'tenant-twin', 'fc', $2, $3,
+                         jsonb_build_object('environment', 'sha256:' || repeat($4, 64)))",
+            )
+            .bind(Uuid::now_v7())
+            .bind(content_hash)
+            .bind(Uuid::parse_str(TENANT_ORG)?)
+            .bind(seed)
+            .execute(&db.pool)
+            .await?;
+        }
+        insert_release_with_latest_tag(
+            &db.pool,
+            "tenant-twin",
+            release_id,
+            content_hash,
+            Some(Uuid::parse_str(TENANT_ORG)?),
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE template_releases SET created_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
+        )
+        .bind(release_id)
+        .execute(&db.pool)
+        .await?;
+
+        let resolved = pplx_space_template_release_store::lookup::resolve_by_digest(
+            &db.pool,
+            &TemplateName::parse("tenant-twin")?,
+            content_hash.parse()?,
+            RuntimeKind::Firecracker,
+            org(TENANT_ORG),
+        )
+        .await?;
+        assert_eq!(resolved, Some((release_id, content_hash.to_string())));
+        Ok(())
+    }
+
+    /// A create finds the build its tag or digest names, then runs the
+    /// release `resolved_release_sql` picks. With no default the twin's
+    /// environment has no policy state, and with E0 the default the original
+    /// is default-bound, so both stay on the original; with E1 the default
+    /// it's the twin.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_create_resolves_the_twin_bound_to_the_default() -> TestResult {
+        use pplx_space_runtime_environment_policy_store::{
+            PolicyChange, PolicyChangeReason, set_default,
+        };
+
+        let db = pg_test_db().await?;
+        let original = Uuid::now_v7();
+        let content_hash =
+            "sha256:7171717171717171717171717171717171717171717171717171717171717171";
+        let e0 = "sha256:".to_owned() + &"0".repeat(64);
+        let e1 = "sha256:".to_owned() + &"1".repeat(64);
+        insert_org_specific_template(&db.pool, "tenant-twin", Uuid::parse_str(TENANT_ORG)?).await?;
+        insert_release_with_latest_tag(
+            &db.pool,
+            "tenant-twin",
+            original,
+            content_hash,
+            Some(Uuid::parse_str(TENANT_ORG)?),
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE template_releases
+             SET execution_metadata = jsonb_build_object('environment', $2::TEXT)
+             WHERE id = $1",
+        )
+        .bind(original)
+        .bind(&e0)
+        .execute(&db.pool)
+        .await?;
+        // Twins exist only once the `(template_name, hash)` unique index is
+        // dropped; the test drops it to stand in for the contract migration.
+        sqlx::query("DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique")
+            .execute(&db.pool)
+            .await?;
+        let twin: Uuid = sqlx::query_scalar(
+            "INSERT INTO template_releases
+                 (template_name, type, hash, org_id, execution_metadata, created_at)
+             SELECT template_name, type, hash, org_id,
+                    jsonb_build_object('environment', $2::TEXT), clock_timestamp()
+             FROM template_releases WHERE id = $1
+             RETURNING id",
+        )
+        .bind(original)
+        .bind(&e1)
+        .fetch_one(&db.pool)
+        .await?;
+        let by_tag = "tenant-twin:latest".parse::<TemplateReference>()?;
+        let by_digest = format!("tenant-twin@{content_hash}").parse::<TemplateReference>()?;
+        let resolve = |template: TemplateReference| {
+            let pool = db.pool.clone();
+            async move {
+                resolve_template_release(
+                    &pool,
+                    &template,
+                    RuntimeKind::Firecracker,
+                    org(TENANT_ORG),
+                    ReleaseMissReport::Classified,
+                )
+                .await
+            }
+        };
+        let set = |environment: &str| {
+            let pool = db.pool.clone();
+            let environment = environment.parse().expect("environment reference");
+            async move {
+                let mut tx = pool.begin().await?;
+                set_default(
+                    &mut *tx,
+                    environment,
+                    &PolicyChange {
+                        actor: None,
+                        reason: PolicyChangeReason::new("test").expect("reason"),
+                    },
+                )
+                .await?;
+                tx.commit().await?;
+                TestResult::Ok(())
+            }
+        };
+
+        for template in [by_tag.clone(), by_digest.clone()] {
+            assert_eq!(
+                resolve(template).await?,
+                (original, content_hash.to_string())
+            );
+        }
+        set(&e0).await?;
+        for template in [by_tag.clone(), by_digest.clone()] {
+            assert_eq!(
+                resolve(template).await?,
+                (original, content_hash.to_string())
+            );
+        }
+        set(&e1).await?;
+        for template in [by_tag.clone(), by_digest.clone()] {
+            assert_eq!(
+                resolve(template).await?,
+                (twin, content_hash.to_string()),
+                "the twin bound to the default answers, with its original's hash"
+            );
+        }
+        // Where creates don't boot the twin they resolve to, they run the
+        // named release, whose build the worker boots.
+        for (template, boots, expected) in [
+            (by_tag.clone(), true, twin),
+            (by_digest.clone(), true, twin),
+            (by_tag, false, original),
+            (by_digest, false, original),
+        ] {
+            assert_eq!(
+                resolve_create_release(
+                    &db.pool,
+                    &template,
+                    RuntimeKind::Firecracker,
+                    org(TENANT_ORG),
+                    ReleaseMissReport::Classified,
+                    boots,
+                )
+                .await?,
+                (expected, content_hash.to_string())
+            );
+        }
         Ok(())
     }
 
@@ -1139,8 +1312,65 @@ mod template_release_resolution_postgres_tests {
         Ok(())
     }
 
-    /// Characterization of sandbox-create release resolution (tag with
-    /// `latest` fallback, digest stored as given or with `sha256:` stripped)
+    #[tokio::test(flavor = "current_thread")]
+    async fn digest_prefix_shared_by_two_releases_is_rejected() -> TestResult {
+        let db = pg_test_db().await?;
+        sqlx::query(sql!(
+            "INSERT INTO templates (id, name, description, org_id, network_policy_generation)
+             VALUES ($1, 'custom-template', NULL, NULL, 1)"
+        ))
+        .bind(TemplateId::new().as_uuid())
+        .execute(&db.pool)
+        .await?;
+        let shared = "0123456789ab";
+        let first = format!("sha256:{shared}{}", "1".repeat(52));
+        let first_id = Uuid::now_v7();
+        for (id, hash) in [
+            (first_id, first.clone()),
+            (Uuid::now_v7(), format!("sha256:{shared}{}", "2".repeat(52))),
+        ] {
+            sqlx::query(sql!(
+                "INSERT INTO template_releases (id, template_name, type, hash, org_id)
+                 VALUES ($1, 'custom-template', 'fc', $2, NULL)"
+            ))
+            .bind(id)
+            .bind(hash)
+            .execute(&db.pool)
+            .await?;
+        }
+        let caller_org = OrgId::new();
+        let ambiguous = format!("custom-template@sha256:{shared}").parse()?;
+        let error = resolve_template_release(
+            &db.pool,
+            &ambiguous,
+            RuntimeKind::Firecracker,
+            caller_org,
+            ReleaseMissReport::Classified,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            error.to_string().contains("more than one release"),
+            "{error}"
+        );
+
+        let longer = format!("custom-template@sha256:{shared}1").parse()?;
+        let resolved = resolve_template_release(
+            &db.pool,
+            &longer,
+            RuntimeKind::Firecracker,
+            caller_org,
+            ReleaseMissReport::Classified,
+        )
+        .await?;
+        assert_eq!(resolved, (first_id, first));
+        Ok(())
+    }
+
+    /// Characterization of sandbox-create release resolution (exact tag, full
+    /// digest or unique digest prefix, stored as given or with `sha256:`
+    /// stripped)
     /// over the shared resolver world. A bare-hex request cannot reach this
     /// resolver: `TemplateReference` rejects `name@<hex>` without an algorithm.
     #[tokio::test(flavor = "current_thread")]
@@ -1153,6 +1383,8 @@ mod template_release_resolution_postgres_tests {
         let (fc, ch) = (RuntimeKind::Firecracker, RuntimeKind::CloudHypervisor);
         let sha = |c| format!("sha256:{}", hex(c));
         let blake = |c| format!("blake3:{}", hex(c));
+        let sha_prefix = |c: char| format!("sha256:{}", c.to_string().repeat(12));
+        let blake_prefix = |c: char| format!("blake3:{}", c.to_string().repeat(12));
         let hit = |id, hash: String| Some((id, hash));
 
         let cases = [
@@ -1177,9 +1409,54 @@ mod template_release_resolution_postgres_tests {
             ),
             (format!("resolver-fixture@{}", blake('a')), fc, OTHER, None),
             (format!("resolver-fixture@{}", sha('c')), fc, OTHER, None),
-            // Both forms stored: the row stored in the requested form wins over
-            // the newer bare row with the larger id, and over the older bare
-            // row with the smaller id.
+            // A digest prefix resolves to the one release it starts, answered
+            // in canonical form like a full digest. A legacy bare row is a
+            // SHA-256 digest, and one stored in both forms is one release.
+            (
+                format!("resolver-fixture@{}", sha_prefix('a')),
+                fc,
+                OTHER,
+                hit(w.bare, sha('a')),
+            ),
+            (
+                format!("resolver-fixture@{}", sha_prefix('b')),
+                fc,
+                OTHER,
+                hit(w.prefixed, sha('b')),
+            ),
+            (
+                format!("resolver-fixture@{}", blake_prefix('c')),
+                fc,
+                OTHER,
+                hit(w.blake3, blake('c')),
+            ),
+            (
+                format!("resolver-fixture@{}", sha_prefix('9')),
+                fc,
+                OTHER,
+                hit(w.dual_prefixed, sha('9')),
+            ),
+            (
+                format!("resolver-fixture@{}", blake_prefix('a')),
+                fc,
+                OTHER,
+                None,
+            ),
+            (
+                format!("resolver-fixture@{}", sha_prefix('c')),
+                fc,
+                OTHER,
+                None,
+            ),
+            (
+                format!("resolver-fixture@{}", sha_prefix('b')),
+                ch,
+                OTHER,
+                None,
+            ),
+            // Both forms stored, neither with a storage location: the digest's
+            // original is the older row whichever form the request names,
+            // answered in the requested canonical form.
             (
                 format!("resolver-fixture@{}", sha('9')),
                 fc,
@@ -1190,7 +1467,7 @@ mod template_release_resolution_postgres_tests {
                 format!("resolver-fixture@{}", sha('8')),
                 fc,
                 OTHER,
-                hit(w.late_prefixed, sha('8')),
+                hit(w.early_bare, sha('8')),
             ),
             // `latest` moved from `newest_created` to `latest_holder`.
             (
@@ -1212,15 +1489,8 @@ mod template_release_resolution_postgres_tests {
                 OTHER,
                 hit(w.bare, hex('a')),
             ),
-            // Unknown tag falls back to `latest`; build base does not. Pinned as
-            // today's behaviour, not a contract: consolidating the resolvers is
-            // expected to answer not found instead of falling back silently.
-            (
-                "resolver-fixture:missing".into(),
-                fc,
-                OTHER,
-                hit(w.latest_holder, sha('d')),
-            ),
+            // An unknown tag is not found, as it is for a build base.
+            ("resolver-fixture:missing".into(), fc, OTHER, None),
             ("resolver-fixture:latest".into(), ch, OTHER, None),
             ("resolver-fixture:missing".into(), ch, OTHER, None),
             (format!("resolver-fixture@{}", sha('b')), ch, OTHER, None),
@@ -1246,6 +1516,24 @@ mod template_release_resolution_postgres_tests {
             ("resolver-fixture-private:latest".into(), fc, OTHER, None),
             (
                 format!("resolver-fixture-private@{}", sha('f')),
+                fc,
+                OTHER,
+                None,
+            ),
+            (
+                format!("resolver-fixture-private@{}", sha_prefix('f')),
+                fc,
+                OWNER,
+                hit(w.private, sha('f')),
+            ),
+            (
+                format!("resolver-fixture-private@{}", sha_prefix('f')),
+                fc,
+                OTHER,
+                None,
+            ),
+            (
+                format!("resolver-fixture-deleting@{}", sha_prefix('7')),
                 fc,
                 OTHER,
                 None,
@@ -1362,6 +1650,8 @@ mod template_release_resolution_postgres_tests {
 mod response_tests {
 
     use super::*;
+    use pplx_space_accounts::{NodeId, SandboxOwnerSource};
+    use pplx_space_accounts::{OrgId, UserId};
     use pplx_space_api_route::{
         ed25519::SPACE_API_ROUTE_ED25519_ISSUER_ENV,
         ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID_ENV,
@@ -1369,8 +1659,8 @@ mod response_tests {
         ed25519::SpaceApiRouteEd25519Authority,
         ed25519::decode_unverified_space_api_route_ed25519_claims,
     };
-    use pplx_space_common_core::types::{NodeId, NodeManagedBy, SandboxId, SandboxOwnerSource};
-    use pplx_space_common_core::types::{OrgId, UserId};
+    use pplx_space_node_model::NodeManagedBy;
+    use pplx_space_sandbox_model::SandboxId;
 
     use sqlx::types::Json;
 
@@ -1401,7 +1691,7 @@ mod response_tests {
             active_execution_generation: None,
             active_pod_uid: None,
             active_activation_attempt_id: None,
-            ecw_credential_epoch: pplx_space_common_core::types::EcwCredentialEpoch::new(1)
+            ecw_credential_epoch: pplx_space_sandbox_model::EcwCredentialEpoch::new(1)
                 .expect("credential epoch is valid"),
             target_node_id: None,
             placement_changed_at: None,
@@ -1430,6 +1720,7 @@ mod response_tests {
             last_command_at: None,
             created_at: time::OffsetDateTime::UNIX_EPOCH,
             updated_at: time::OffsetDateTime::UNIX_EPOCH,
+            activating_client_id: None,
         }
     }
 
@@ -1460,7 +1751,9 @@ mod response_tests {
             substrate_node_id: None,
             template: None,
             status: None,
-            spaced_version: None,
+            version: ObservedSpacedVersion {
+                spaced_version: None,
+            },
             pid: None,
             namespace: None,
             uptime: None,

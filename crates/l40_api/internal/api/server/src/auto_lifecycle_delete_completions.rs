@@ -3,28 +3,30 @@ use std::{
     str::FromStr,
 };
 
+use pplx_space_accounts::NodeId;
+use pplx_space_auto_lifecycle::{AutoLifecycleIdleAction, AutoLifecyclePolicy};
 use pplx_space_auto_lifecycle_receipt::{
     AUTO_LIFECYCLE_DELETE_COMPLETION_BATCH_SIZE, AUTO_LIFECYCLE_DELETE_COMPLETION_LOCK_TIMEOUT,
     AUTO_LIFECYCLE_DELETE_COMPLETION_OWNERSHIP_GRACE,
     AUTO_LIFECYCLE_DELETE_COMPLETION_REQUEST_LIMIT, AutoLifecyclePolicyFingerprint,
     AutoLifecyclePolicyFingerprintParseError,
 };
-use pplx_space_common_core::{
-    sql,
-    types::{
-        AutoLifecycleDeleteReceiptId, AutoLifecycleIdleAction, AutoLifecyclePolicy,
-        ExecutionGeneration, ExecutionGenerationParseError, NodeId, SandboxActivationAttemptId,
-        SandboxId, SandboxIdParseError, SandboxLifecycle, SandboxQuarantineReasonCode,
-        SandboxQuarantineSource,
-    },
-};
+use pplx_space_postgres_pool::TxSettings as _;
 use pplx_space_postgres_pool::contention::{self, is_lock_not_available};
 use pplx_space_sandbox_metrics::publication::{
     AutoLifecycleDeleteCompletionDisposition, AutoLifecycleDeleteCompletionReason,
 };
+use pplx_space_sandbox_model::{
+    AutoLifecycleDeleteReceiptId, ExecutionGeneration, ExecutionGenerationParseError,
+    SandboxActivationAttemptId, SandboxId, SandboxIdParseError, SandboxLifecycle,
+    SandboxQuarantineReasonCode, SandboxQuarantineSource,
+};
+use pplx_space_sandbox_quarantine_store::locks::lock_orphan_quarantine_match;
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
+use pplx_space_sandbox_store::auto_lifecycle_delete_completion;
 use pplx_space_sandbox_store::delete::delete_with_dependents;
-use sqlx::{Acquire as _, FromRow, Postgres, Transaction, types::Json};
+use pplx_space_sandbox_store::k8s_executions::auto_lifecycle_delete;
+use sqlx::{Acquire as _, Postgres, Transaction};
 use tonic::Status;
 
 use crate::proto::AutoLifecycleDeleteCompletion;
@@ -92,22 +94,6 @@ impl TryFrom<&AutoLifecycleDeleteCompletion> for ParsedCompletion {
             policy_fingerprint,
         })
     }
-}
-
-#[derive(Debug, FromRow)]
-struct CompletionAuthorityRow {
-    lifecycle: String,
-    auto_lifecycle_json: Json<serde_json::Value>,
-    active_node_id: Option<NodeId>,
-    ownership_evidence_expired: bool,
-}
-
-#[derive(Debug, FromRow)]
-struct CompletionEvidenceRow {
-    latest_execution_generation: ExecutionGeneration,
-    route_activation_id: Option<SandboxActivationAttemptId>,
-    publisher_owns_execution: bool,
-    creating_snapshot_exists: bool,
 }
 
 /// What one receipt's evaluation decided, before the caller keeps or discards
@@ -359,12 +345,7 @@ pub(super) async fn consume_auto_lifecycle_delete_completions(
     // holds the batch's sandbox row locks. Bound them for the remainder of the
     // publication transaction; receipt consumption is its last work, and the
     // expiry raises 55P03, which the contention paths already classify.
-    sqlx::query(sql!("SELECT set_config('lock_timeout', $1, TRUE)"))
-        .bind(format!(
-            "{}ms",
-            AUTO_LIFECYCLE_DELETE_COMPLETION_LOCK_TIMEOUT.as_millis()
-        ))
-        .execute(&mut **tx)
+    tx.set_local_lock_timeout(AUTO_LIFECYCLE_DELETE_COMPLETION_LOCK_TIMEOUT)
         .await
         .map_err(|error| {
             Status::internal(format!(
@@ -449,20 +430,13 @@ async fn apply_receipt(
     origin_node_id: NodeId,
     completion: &ParsedCompletion,
 ) -> Result<ReceiptOutcome, Status> {
-    let row = sqlx::query_as::<_, CompletionAuthorityRow>(sql!(
-        "SELECT s.lifecycle,
-                s.auto_lifecycle_json,
-                s.active_node_id,
-                COALESCE(s.placement_changed_at, s.created_at)
-                    <= NOW() - make_interval(secs => $2) AS ownership_evidence_expired
-           FROM sandboxes s
-          WHERE s.id = $1
-          FOR UPDATE OF s NOWAIT"
-    ))
-    .bind(completion.sandbox_id)
-    .bind(AUTO_LIFECYCLE_DELETE_COMPLETION_OWNERSHIP_GRACE.as_secs_f64())
-    .fetch_optional(&mut **tx)
-    .await;
+    let row = auto_lifecycle_delete_completion::lock_completion_authority(
+        &mut **tx,
+        completion.sandbox_id,
+        AUTO_LIFECYCLE_DELETE_COMPLETION_OWNERSHIP_GRACE.as_secs_f64(),
+    )
+    .await
+    .map_err(sqlx::Error::from);
     let row = match row {
         Ok(row) => row,
         Err(error) if is_lock_not_available(&error) => {
@@ -487,31 +461,13 @@ async fn apply_receipt(
     // execution and snapshot inserts through their sandboxes foreign key.
     // Keep this as a second statement: PostgreSQL need not acquire a row
     // lock before evaluating subqueries in the locking SELECT itself.
-    let evidence = sqlx::query_as::<_, CompletionEvidenceRow>(sql!(
-        "SELECT execution.generation AS latest_execution_generation,
-                execution.route_activation_id,
-                EXISTS (
-                    SELECT 1
-                      FROM node_k8s
-                     WHERE node_k8s.node_id = $2
-                       AND node_k8s.k8s_node_name = execution.k8s_node_name
-                ) AS publisher_owns_execution,
-                EXISTS (
-                    SELECT 1
-                      FROM snapshots snapshot
-                     WHERE snapshot.sandbox_id = $1
-                       AND snapshot.state = 'creating'
-                ) AS creating_snapshot_exists
-           FROM sandbox_k8s_executions execution
-          WHERE execution.sandbox_id = $1
-          ORDER BY execution.generation DESC
-          LIMIT 1
-          FOR UPDATE OF execution NOWAIT"
-    ))
-    .bind(completion.sandbox_id)
-    .bind(origin_node_id)
-    .fetch_optional(&mut **tx)
-    .await;
+    let evidence = auto_lifecycle_delete::lock_latest_execution_evidence(
+        &mut **tx,
+        completion.sandbox_id,
+        origin_node_id,
+    )
+    .await
+    .map_err(sqlx::Error::from);
     let evidence = match evidence {
         Ok(evidence) => evidence,
         Err(error) if is_lock_not_available(&error) => {
@@ -621,23 +577,18 @@ async fn apply_receipt(
     }
 
     if from_lifecycle == SandboxLifecycle::Quarantined {
-        let matching_orphan_quarantine = sqlx::query_scalar::<_, bool>(sql!(
-            "SELECT COALESCE(last_observed_node_id = $2, FALSE)
-                    AND source = $3
-                    AND reason_code = ANY($4::TEXT[])
-               FROM sandbox_quarantine_state
-              WHERE sandbox_id = $1
-              FOR UPDATE NOWAIT"
-        ))
-        .bind(completion.sandbox_id)
-        .bind(origin_node_id)
-        .bind(SandboxQuarantineSource::ClusterController)
-        .bind(vec![
-            SandboxQuarantineReasonCode::OrphanedExecutionMissingArtifact,
-            SandboxQuarantineReasonCode::OrphanedExecutionLegacyDeletingState,
-        ])
-        .fetch_optional(&mut **tx)
-        .await;
+        let matching_orphan_quarantine = lock_orphan_quarantine_match(
+            &mut **tx,
+            completion.sandbox_id,
+            origin_node_id,
+            SandboxQuarantineSource::ClusterController,
+            &[
+                SandboxQuarantineReasonCode::OrphanedExecutionMissingArtifact,
+                SandboxQuarantineReasonCode::OrphanedExecutionLegacyDeletingState,
+            ],
+        )
+        .await
+        .map_err(sqlx::Error::from);
         let matching_orphan_quarantine = match matching_orphan_quarantine {
             Ok(matching) => matching.unwrap_or(false),
             Err(error) if is_lock_not_available(&error) => {
@@ -715,7 +666,10 @@ async fn apply_receipt(
         ));
     }
 
-    match delete_with_dependents(tx, completion.sandbox_id).await {
+    match delete_with_dependents(&mut **tx, completion.sandbox_id)
+        .await
+        .map_err(sqlx::Error::from)
+    {
         Ok(()) => Ok(ReceiptOutcome::Applied { from_lifecycle }),
         Err(error) if is_retryable_finalize_error(&error) => Ok(ReceiptOutcome::Deferred(
             AutoLifecycleDeleteCompletionReason::FinalizeContended,

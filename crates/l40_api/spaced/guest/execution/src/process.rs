@@ -6,7 +6,8 @@ use crate::idempotency::{
 };
 use crate::identity::GuestAccount;
 use dashmap::DashMap;
-use pplx_space_common_core::types::{GuestUserName, Pii, ProcessCommand, ProcessId, ProcessSignal};
+use pplx_space_guest_process::{GuestUserName, ProcessCommand, ProcessId, ProcessSignal};
+use pplx_space_pii::Pii;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::sync::Weak;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,6 +17,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 mod pty;
 use pty::PtyIo;
+mod spawn_stage;
+pub(crate) use spawn_stage::SpawnProgress;
+use spawn_stage::SpawnStage;
 
 const DEFAULT_LOGIN_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const DEFAULT_PTY_ROWS: u32 = 24;
@@ -101,6 +105,35 @@ const PROCESS_CAPACITY_MESSAGE: &str = "too many retained processes";
 // the spawn returns, so a slow start names its cause. The account lookup
 // includes its wait for a blocking-pool thread.
 const SLOW_START_PHASE: Duration = Duration::from_secs(1);
+// The longest a start holds its payload admission. Admission bounds decoded
+// start requests, but a start can stall far longer in its account lookup or
+// `spawn` under memory pressure, and a same-key retry waits for it holding
+// admission of its own. Held past this, a start trades its payload slots for
+// a detached-start slot and carries on, so stalled starts cannot refuse every
+// later one.
+const START_ADMISSION_HOLD_LIMIT: Duration = Duration::from_secs(10);
+// How many starts may carry on past the hold limit without payload admission.
+// Each still holds its decoded request and, in its lookup or spawn, a thread,
+// so this caps what stalled starts can pile up. With every detached slot
+// taken, a start keeps its payload slots until one frees.
+const DETACHED_START_LIMIT: usize = 8;
+
+/// How long a start may hold its payload admission, and the budget of starts
+/// that may carry on without it.
+#[derive(Clone, Debug)]
+pub(super) struct StartAdmissionBound {
+    pub(super) hold_limit: Duration,
+    pub(super) detached_starts: Arc<Semaphore>,
+}
+
+impl Default for StartAdmissionBound {
+    fn default() -> Self {
+        Self {
+            hold_limit: START_ADMISSION_HOLD_LIMIT,
+            detached_starts: Arc::new(Semaphore::new(DETACHED_START_LIMIT)),
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 type ExitObserver = ProcessExitObserver;
@@ -113,7 +146,7 @@ struct ProcessSupervision {
     child: tokio::process::Child,
     exit_observer: ExitObserver,
     output_tasks: VecDeque<ProcessOutputTask>,
-    timeout: Option<pplx_space_common_core::types::ReadyTimeout>,
+    timeout: Option<pplx_space_guest_process::ReadyTimeout>,
     shutdown: tokio_util::sync::CancellationToken,
     record: Arc<ProcessRecord>,
     process_id: ProcessId,
@@ -235,16 +268,20 @@ impl ProcessSupervision {
 /// tracked owner task runs it, so it completes even if the request goes away.
 struct ProcessLaunch {
     command: Command,
+    /// What the child's setup recorded, which tells the caller of a failed
+    /// spawn which request field to fix.
+    spawn_progress: SpawnProgress,
     prepared_pty: Option<PreparedPty>,
     stdin_enabled: bool,
     /// What `list` reports; the pid is filled in once the child exists.
     info: ProcessInfo,
-    timeout: Option<pplx_space_common_core::types::ReadyTimeout>,
+    timeout: Option<pplx_space_guest_process::ReadyTimeout>,
     process_id: ProcessId,
     spawn_thread: SpawnThread,
     claim: ProcessIdClaim,
     process_reservation: ProcessRecordReservation,
-    /// Held until the child is published.
+    /// Held until the child is published, or traded for a detached-start
+    /// slot at [`START_ADMISSION_HOLD_LIMIT`] while the start carries on.
     start_admission: pplx_space_common_grpc::RequestPermit,
     account_lookup: Duration,
     inner: Arc<crate::execution::ExecutionServiceInner>,
@@ -347,6 +384,7 @@ impl ProcessLaunch {
     async fn publish(self) -> Result<LaunchedProcess, Status> {
         let ProcessLaunch {
             command,
+            spawn_progress,
             prepared_pty,
             stdin_enabled,
             mut info,
@@ -377,7 +415,10 @@ impl ProcessLaunch {
             );
         }
         let (spawn_result, mut prepared_pty) = spawned?;
-        let mut child = spawn_result.map_err(map_io_error)?;
+        let mut child = match spawn_result {
+            Ok(child) => child,
+            Err(error) => return Err(spawn_error_status(error, spawn_progress.stage())),
+        };
         let Some(pid) = child.id() else {
             terminate_and_reap_failed_start(child, process_reservation, &inner.process_tasks);
             return Err(Status::internal("spawned child has no pid"));
@@ -535,6 +576,7 @@ impl ExecutionService {
 async fn resolve_process_account(
     tasks: tokio_util::task::TaskTracker,
     slots: Arc<Semaphore>,
+    bound: StartAdmissionBound,
     ingress: Option<pplx_space_common_grpc::RequestPermit>,
     resolve: impl FnOnce() -> Result<GuestAccount, Status> + Send + 'static,
 ) -> Result<(GuestAccount, pplx_space_common_grpc::RequestPermit), Status> {
@@ -544,6 +586,7 @@ async fn resolve_process_account(
         pplx_space_grpc_metrics::payload::Budget::GuestProcess,
         ingress,
     )?;
+    bound_start_admission_hold(&admission, bound);
     // NSS may block on external account providers. Keep the existing Start
     // admission with the physical lookup even if its requesting future drops.
     admission
@@ -551,6 +594,49 @@ async fn resolve_process_account(
         .observe(tasks.spawn_blocking(move || resolve().map(|account| (account, admission))))
         .await
         .map_err(|error| Status::internal(format!("guest account lookup task failed: {error}")))?
+}
+
+/// Once `admission` has held its payload slots for the hold limit, trade them
+/// for a detached-start slot, retrying each hold limit while every detached
+/// slot is taken. Holds only a weak reference, so a start that finishes in time
+/// releases its slots as before and the timer then has nothing to do.
+fn bound_start_admission_hold(
+    admission: &pplx_space_common_grpc::RequestPermit,
+    bound: StartAdmissionBound,
+) {
+    use pplx_space_grpc_metrics::payload;
+    let admission = admission.downgrade();
+    let slots = pplx_space_spaced_guest_protocol::process_limits::START_PAYLOAD_SLOTS as usize;
+    tokio::spawn(async move {
+        let mut retained = false;
+        loop {
+            tokio::time::sleep(bound.hold_limit).await;
+            let Some(held) = admission.held_for() else {
+                return;
+            };
+            let Ok(detached) = bound.detached_starts.clone().try_acquire_owned() else {
+                if !retained {
+                    retained = true;
+                    payload::retained_at_hold_limit(payload::Budget::GuestProcess, slots);
+                    tracing::warn!(
+                        held_ms = held.as_millis(),
+                        slots,
+                        "guest process start held its payload admission past the hold limit; every detached-start slot is taken, so it keeps them"
+                    );
+                }
+                continue;
+            };
+            if admission.exchange(detached).is_ok() {
+                payload::released_at_hold_limit(payload::Budget::GuestProcess, slots);
+                tracing::warn!(
+                    held_ms = held.as_millis(),
+                    slots,
+                    "guest process start held its payload admission past the hold limit; released it while the start continues"
+                );
+            }
+            return;
+        }
+    });
 }
 
 // TODO(spaced): persist or reconstruct the process registry if callers need
@@ -901,6 +987,46 @@ struct PreparedPty {
 #[cfg(not(target_os = "linux"))]
 static PTY_INHERITANCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The environment a pty-backed process starts with unless the sandbox or the
+/// request sets these: the values E2B-compatible terminal clients send.
+const PTY_DEFAULT_ENV: [(&str, &str); 2] = [("TERM", "xterm-256color"), ("LANG", "C.UTF-8")];
+
+/// The status of a spawn that failed: its errno's, tagged with the request
+/// field to fix when the step that failed, as the child recorded it, says so.
+/// A permission error stays untagged, as before the child recorded its steps:
+/// either field could be what the account may not use.
+fn spawn_error_status(error: io::Error, stage: SpawnStage) -> Status {
+    let errno = error.raw_os_error();
+    let status = map_io_error(error);
+    let reason = match (stage, errno) {
+        (_, Some(libc::EACCES | libc::EPERM)) => None,
+        (SpawnStage::WorkingDir, Some(libc::ENOENT | libc::ENOTDIR)) => {
+            Some(pplx_space_guest_process::status::PROCESS_START_CWD)
+        }
+        (SpawnStage::Exec, Some(libc::ENOENT | libc::ENOEXEC | libc::ENOTDIR)) => {
+            Some(pplx_space_guest_process::status::PROCESS_START_COMMAND)
+        }
+        _ => None,
+    };
+    match reason {
+        Some(reason) => with_start_reason(status, reason),
+        None => status,
+    }
+}
+
+/// Tag a failed start with the request field it is about, unless the status
+/// already names a reason of its own (a full disk, say).
+fn with_start_reason(mut status: Status, reason: &'static str) -> Status {
+    let metadata = status.metadata_mut();
+    if !metadata.contains_key(pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY) {
+        metadata.insert(
+            pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
+            tonic::metadata::MetadataValue::from_static(reason),
+        );
+    }
+    status
+}
+
 fn spawn_child(command: &mut Command) -> io::Result<tokio::process::Child> {
     #[cfg(not(target_os = "linux"))]
     let _inheritance_guard = PTY_INHERITANCE_LOCK
@@ -1068,7 +1194,7 @@ impl ProcessSignalHandle {
     fn signal(&self, signal: ProcessSignal) -> Result<(), Status> {
         #[cfg(target_os = "linux")]
         {
-            match pplx_space_common_core::host::linux::signal_pidfd(&self.pidfd, signal) {
+            match pplx_space_host_linux::signal_pidfd(&self.pidfd, signal.as_i32()) {
                 Ok(()) => Ok(()),
                 Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
                     Err(Status::not_found("process not found"))
@@ -1851,9 +1977,9 @@ fn process_event_stream_with_prefix(
 fn process_output_cursor_ahead_status() -> Status {
     let mut status = Status::out_of_range(PROCESS_OUTPUT_CURSOR_AHEAD_MESSAGE);
     status.metadata_mut().insert(
-        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
         tonic::metadata::MetadataValue::from_static(
-            pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD,
+            pplx_space_guest_process::status::PROCESS_OUTPUT_CURSOR_AHEAD,
         ),
     );
     status
@@ -1864,17 +1990,17 @@ fn process_output_cursor_ahead_status() -> Status {
 /// can continue from there. `None` once the journal itself is gone.
 fn process_output_lagged_status(first_sequence: Option<u64>) -> Status {
     let mut status =
-        Status::resource_exhausted(pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED_MESSAGE);
+        Status::resource_exhausted(pplx_space_guest_process::status::PROCESS_OUTPUT_LAGGED_MESSAGE);
     let metadata = status.metadata_mut();
     metadata.insert(
-        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
         tonic::metadata::MetadataValue::from_static(
-            pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED,
+            pplx_space_guest_process::status::PROCESS_OUTPUT_LAGGED,
         ),
     );
     if let Some(first_sequence) = first_sequence {
         metadata.insert(
-            pplx_space_common_core::spaced::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY,
+            pplx_space_guest_process::status::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY,
             tonic::metadata::MetadataValue::from(first_sequence),
         );
     }
@@ -2274,7 +2400,9 @@ impl Process for ExecutionService {
         // outcome independent of the idempotency record's lifetime. Payload
         // admission in front of this handler, here and in spaced-host, still
         // applies: it runs before the request is decoded, so while every start
-        // slot is held by a stalled spawn, a reconnect waits or is refused there.
+        // slot is held by a stalled spawn, a reconnect waits or is refused there
+        // until `START_ADMISSION_HOLD_LIMIT` trades the stalled start's slots
+        // for a detached-start slot.
         // Only a published process can be reconnected to. A same-key retry of
         // a start that is still publishing goes on to wait for its outcome.
         if self.inner.processes.is_published(&process_id) {
@@ -2284,10 +2412,21 @@ impl Process for ExecutionService {
         let (account, _start_admission) = resolve_process_account(
             self.inner.process_tasks.clone(),
             self.inner.process_payload_slots.clone(),
+            self.inner.start_admission.clone(),
             ingress,
             move || {
-                GuestAccount::resolve(account_name)
-                    .map_err(crate::identity::ResolveGuestAccountError::into_status)
+                GuestAccount::resolve(account_name).map_err(|error| {
+                    let not_found = error.is_not_found();
+                    let status = error.into_status();
+                    if not_found {
+                        with_start_reason(
+                            status,
+                            pplx_space_guest_process::status::PROCESS_START_USER,
+                        )
+                    } else {
+                        status
+                    }
+                })
             },
         )
         .await?;
@@ -2332,6 +2471,14 @@ impl Process for ExecutionService {
         command.env("USER", account.name().as_str());
         command.env("LOGNAME", account.name().as_str());
         command.env("SHELL", account.shell());
+        // A terminal needs a terminal type and a character set, as an
+        // interactive login has. The sandbox's environment and the request's,
+        // applied below, override them.
+        if pty_config.is_some() {
+            for (key, value) in PTY_DEFAULT_ENV {
+                command.env(key, value);
+            }
+        }
         if !clean_env {
             let process_env = self.inner.process_env.read().await.clone();
             if !process_env.as_map().is_empty() {
@@ -2365,12 +2512,17 @@ impl Process for ExecutionService {
         if !uses_pty {
             command.process_group(0);
         }
+        let working_dir = cwd
+            .as_ref()
+            .map(|cwd| std::path::Path::new(cwd.expose()))
+            .unwrap_or(account.home())
+            .to_path_buf();
+        let spawn_progress = SpawnProgress::new().map_err(map_io_error)?;
         account.configure_child_credentials(
             &mut command,
             self.inner.identity_policy,
-            cwd.as_ref()
-                .map(|cwd| std::path::Path::new(cwd.expose()))
-                .unwrap_or(account.home()),
+            &working_dir,
+            &spawn_progress,
         )?;
         let mut prepared_pty = pty_config
             .map(|pty_config| prepare_pty(pty_config.size))
@@ -2391,6 +2543,8 @@ impl Process for ExecutionService {
             command.stdout(std::process::Stdio::piped());
             command.stderr(std::process::Stdio::piped());
         }
+        // The last hook, so it runs only once every other one has.
+        spawn_progress.record_exec(&mut command);
 
         let reservation = match self
             .inner
@@ -2405,7 +2559,14 @@ impl Process for ExecutionService {
                     .inner
                     .processes
                     .replay(&process_id, Some(0), false)
-                    .ok_or_else(|| Status::failed_precondition("process replay state expired"))?;
+                    .ok_or_else(|| {
+                        // The command may have run: say so, rather than read as
+                        // a start that failed.
+                        with_start_reason(
+                            Status::failed_precondition("process replay state expired"),
+                            pplx_space_guest_process::status::PROCESS_REPLAY_EXPIRED,
+                        )
+                    })?;
                 return Ok(Response::new(
                     replay_process_event_stream(replay) as Self::StartStream
                 ));
@@ -2456,6 +2617,7 @@ impl Process for ExecutionService {
         let request_lifetime = _start_admission.request_lifetime();
         let launch = ProcessLaunch {
             command,
+            spawn_progress,
             prepared_pty,
             stdin_enabled,
             info: ProcessInfo {

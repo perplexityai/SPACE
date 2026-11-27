@@ -13,7 +13,8 @@ use futures_util::stream::TryStreamExt;
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, setns, unshare};
 use rtnetlink::packet_route::AddressFamily;
-use rtnetlink::packet_route::link::LinkAttribute;
+use rtnetlink::packet_route::address::AddressAttribute;
+use rtnetlink::packet_route::link::{LinkAttribute, LinkFlags};
 use rtnetlink::packet_route::neighbour::NeighbourState;
 use rtnetlink::packet_route::route::{
     RouteAddress, RouteAttribute, RouteMessage, RouteScope, RouteType,
@@ -514,6 +515,59 @@ pub fn default_iface(ns: Option<&str>) -> Result<String, DefaultIfaceError> {
     }
 }
 
+pub fn external_ipv4(ns: &str) -> Result<Ipv4Addr, DefaultIfaceError> {
+    run_in_netns(ns, || {
+        block_on_netlink(async move {
+            with_handle(|handle| async move {
+                let mut links = Vec::new();
+                let mut dump = handle.link().get().execute();
+                while let Some(link) = dump
+                    .try_next()
+                    .await
+                    .map_err(|e| format!("failed to dump links: {e}"))?
+                {
+                    let sandbox_link = link.attributes.iter().any(|attr| {
+                        matches!(attr, LinkAttribute::IfName(name) if name.starts_with(super::SANDBOX_LINK_PREFIX))
+                    });
+                    if !link.header.flags.contains(LinkFlags::Loopback) && !sandbox_link {
+                        links.push(link.header.index);
+                    }
+                }
+                links.sort_unstable();
+                for index in links {
+                    let mut addresses = handle
+                        .address()
+                        .get()
+                        .set_link_index_filter(index)
+                        .execute();
+                    while let Some(address) = addresses
+                        .try_next()
+                        .await
+                        .map_err(|e| format!("failed to dump addresses of link {index}: {e}"))?
+                    {
+                        let local = address.attributes.iter().find_map(|attr| match attr {
+                            AddressAttribute::Local(IpAddr::V4(ip)) => Some(*ip),
+                            _ => None,
+                        });
+                        let ip = local.or_else(|| {
+                            address.attributes.iter().find_map(|attr| match attr {
+                                AddressAttribute::Address(IpAddr::V4(ip)) => Some(*ip),
+                                _ => None,
+                            })
+                        });
+                        if let Some(ip) = ip.filter(|ip| !ip.is_loopback() && !ip.is_link_local()) {
+                            return Ok(ip);
+                        }
+                    }
+                }
+                Err("no external IPv4 address".to_string())
+            })
+            .await
+        })
+        .map_err(DefaultIfaceError::Other)
+    })
+}
+
 pub fn ns_exists(name: &str) -> bool {
     Path::new(&netns_path(name)).exists()
 }
@@ -836,8 +890,6 @@ where
     let ns = ns.to_string();
     let thread_ns = ns.clone();
     thread::spawn(move || {
-        let original = fs::File::open("/proc/thread-self/ns/net")
-            .map_err(|source| E::from(NetnsEnterError::OpenCurrent { source }))?;
         let target_path = netns_path(&thread_ns);
         let target = fs::File::open(&target_path).map_err(|source| {
             E::from(NetnsEnterError::OpenTarget {
@@ -845,21 +897,52 @@ where
                 source,
             })
         })?;
-
-        enter_netns_file(&target_path, &target).map_err(E::from)?;
-        IN_NETNS_THREAD.with(|cell| cell.set(true));
-        let result = f();
-        IN_NETNS_THREAD.with(|cell| cell.set(false));
-        let restore_result =
-            setns_file(&original).map_err(|detail| E::from(NetnsEnterError::SetNs { detail }));
-        match (result, restore_result) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(err), _) => Err(err),
-            (Ok(_), Err(err)) => Err(err),
-        }
+        run_entered(&target_path, &target, f)
     })
     .join()
     .map_err(|_| E::from(NetnsEnterError::ThreadPanicked { ns }))?
+}
+
+/// Runs `program` in the namespace `netns` pins, so a namespace removed or
+/// renamed meanwhile is never confused with another.
+pub(crate) fn command_output_in_pinned_ns(
+    netns: &fs::File,
+    program: &str,
+    args: &[&str],
+    stdin: &[u8],
+    budget: Duration,
+) -> io::Result<Output> {
+    let path = format!("/proc/self/fd/{}", netns.as_raw_fd());
+    let run = || crate::host_command::output(Command::new(program).args(args), budget, stdin);
+    // A thread of its own, so a failed restore never strands a caller's thread.
+    thread::scope(|scope| {
+        scope
+            .spawn(|| run_entered(&path, netns, run))
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("pinned namespace thread panicked")))
+    })
+}
+
+/// Runs `f` with this thread in `target`'s network namespace, then returns it
+/// to the namespace it started in.
+fn run_entered<T, E: From<NetnsEnterError>>(
+    path: &str,
+    target: &fs::File,
+    f: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let original = fs::File::open("/proc/thread-self/ns/net")
+        .map_err(|source| E::from(NetnsEnterError::OpenCurrent { source }))?;
+    enter_netns_file(path, target).map_err(E::from)?;
+    IN_NETNS_THREAD.with(|cell| cell.set(true));
+    let result = f();
+    IN_NETNS_THREAD.with(|cell| cell.set(false));
+    let restore_result =
+        setns_file(&original).map_err(|detail| E::from(NetnsEnterError::SetNs { detail }));
+    match (result, restore_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
+    }
 }
 
 /// Enter the namespace an opened /run/netns entry names. Removing a named

@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 
@@ -93,7 +93,7 @@ async fn import_rejects_reserved_owner_before_reserving_identity_or_waiting_for_
 async fn import_rejects_local_network_policy_from_forwarded_service_peer() {
     use crate::service::activation_support::sandbox_peer_authorizer;
     use crate::service::tests::service_tests::service_for_teardown_test;
-    use pplx_space_common_core::host::linux::identities::users;
+    use pplx_space_host_layout::identities::users;
     use pplx_space_net_common::{NetworkPolicyV1, proto::PolicyAuthority};
 
     let service = service_for_teardown_test(crate::db::test_conn());
@@ -136,7 +136,7 @@ async fn import_rejects_local_network_policy_from_forwarded_service_peer() {
 async fn import_rejects_local_auto_lifecycle_from_forwarded_service_peer() {
     use crate::service::activation_support::sandbox_peer_authorizer;
     use crate::service::tests::service_tests::service_for_teardown_test;
-    use pplx_space_common_core::host::linux::identities::users;
+    use pplx_space_host_layout::identities::users;
     use pplx_space_net_common::proto::PolicyAuthority;
 
     let service = service_for_teardown_test(crate::db::test_conn());
@@ -384,7 +384,7 @@ fn import_header_execution_metadata_backfills_legacy_firecracker_header() {
 
     assert_eq!(
         execution.runtime().kind,
-        pplx_space_common_core::types::RuntimeKind::Firecracker
+        pplx_space_execution_spec::RuntimeKind::Firecracker
     );
     assert_eq!(execution.runtime().version.as_str(), "1.15.1");
     assert_eq!(execution.state_format().unwrap().version.as_str(), "9.0.0");
@@ -1144,4 +1144,52 @@ async fn a_delta_base_lookup_that_never_answers_gives_no_base() {
         .await
         .unwrap_err();
     assert_eq!(status.code(), tonic::Code::Unavailable, "{status}");
+}
+
+/// On a sealed node, a sandbox import, whose sandbox has no VM yet, is
+/// refused with the sealed refusal once it holds the sandbox's locks, before
+/// it reserves the row or reads its body.
+#[tokio::test]
+async fn a_sealed_node_refuses_a_sandbox_import() {
+    use crate::service::activation_support::sandbox_peer_authorizer;
+
+    let service = SandboxManagerService::for_test(crate::db::test_conn());
+    service.activation_seal.seal(&service.db, 3).unwrap();
+    let peer = sandbox_peer_authorizer()
+        .authorize_identity(
+            PeerIdentity::new(0, 0, None),
+            "ImportSandbox",
+            ALLOW_SANDBOX_OPERATOR,
+        )
+        .unwrap();
+    let id = SandboxId::new().to_string();
+    let stream = tokio_stream::iter([Ok(ImportSandboxRequest {
+        payload: Some(crate::proto::import_sandbox_request::Payload::Header(
+            crate::proto::ImportSandboxHeader {
+                sandbox_id: id.clone(),
+                template_id: "seed".to_owned(),
+                content_hash: "sha256:abc".to_owned(),
+                runtime: "fc".to_owned(),
+                owner: "root@local".to_owned(),
+                ..Default::default()
+            },
+        )),
+    })]);
+    let refused = service
+        .import_sandbox_owned(stream, peer)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.code(),
+        tonic::Code::FailedPrecondition,
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .message()
+            .starts_with(crate::activation_seal::ACTIVATIONS_SEALED_MARKER),
+        "{refused:?}"
+    );
+    assert!(!crate::db::sandbox_exists(&service.db_conn().unwrap(), &id).unwrap());
+    service.activation_seal.assert_quiesced();
 }

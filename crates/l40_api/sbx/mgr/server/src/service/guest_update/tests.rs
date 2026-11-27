@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::SandboxActivationAttemptId;
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
 
 #[tokio::test]
 async fn completed_restart_receipt_survives_later_lifecycle_changes() {
@@ -312,7 +312,7 @@ async fn capture_excludes_new_admission_and_invalid_execution_never_probes() {
         .await;
     assert_eq!(
         service
-            .admit_guest_update(intent.clone())
+            .admit_guest_update(intent.clone(), false, None)
             .await
             .unwrap_err()
             .code(),
@@ -347,13 +347,25 @@ async fn capture_excludes_new_admission_and_invalid_execution_never_probes() {
     // A brief read must wait, then admit, without granting a capture race.
     service.shutdown_token.cancel();
     let reader = service.auto_lifecycle.artifact_lock(&id).lock().await;
-    let mut admission = Box::pin(service.admit_guest_update(intent));
+    // If another maintenance operation owns the permit, recovery must retain
+    // the manual request's semantics rather than imposing automatic quiet time.
+    let busy = service
+        .guest_update_sem
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    let operation = intent.operation;
+    let mut admission = Box::pin(service.admit_guest_update(intent, false, None));
     assert!(futures_util::poll!(&mut admission).is_pending());
     drop(reader);
     assert_eq!(
         admission.await.unwrap().into_inner().phase,
         crate::proto::GuestUpdateOperationPhase::Pending as i32
     );
+    assert!(!service.guest_auto_updates.requires_quiet(operation));
+    assert_eq!(service.guest_update_sem.available_permits(), 0);
+    drop(busy);
     service.task_tracker.close();
     service.task_tracker.wait().await;
 }
@@ -513,7 +525,48 @@ fn malformed_promotion_fields_are_invalid_arguments() {
 }
 
 #[test]
-fn fresh_authority_requires_the_current_template_attestation() {
+fn guest_update_eligibility_requires_the_baseline_and_matching_image_contract() {
+    for platform in [
+        None,
+        Some(model::RecoveryPlatform::Linux),
+        Some(model::RecoveryPlatform::Windows),
+    ] {
+        for contract in [
+            "linux-systemd-selector-v1",
+            "windows-scm-two-slot-v1",
+            "unknown",
+            "",
+        ] {
+            for (version, baseline) in [
+                ("0.8.0", false),
+                ("0.8.1", false),
+                ("0.8.2-alpha.1", false),
+                ("0.8.2", true),
+                ("0.8.3", true),
+                ("invalid", false),
+            ] {
+                let seen = wire::Status {
+                    seed_contract: contract.into(),
+                    committed_version: version.into(),
+                    ..Default::default()
+                };
+                let matches = match platform {
+                    Some(model::RecoveryPlatform::Linux) => contract == "linux-systemd-selector-v1",
+                    Some(model::RecoveryPlatform::Windows) => contract == "windows-scm-two-slot-v1",
+                    None => false,
+                };
+                assert_eq!(
+                    policy::supported_guest(platform, &seen),
+                    baseline && matches,
+                    "{platform:?}, {contract}, {version}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn installed_authority_must_match_the_current_promotion_and_authorization() {
     let promotion = model::policy::Promotion {
         channel: "stable".into(),
         target: model::ArtifactDigest::of_bytes(b"candidate"),
@@ -528,22 +581,132 @@ fn fresh_authority_requires_the_current_template_attestation() {
         promotion: Box::new(promotion.clone()),
         authorization,
     };
-    for (templates, template, expected) in [
-        (vec!["current", "other"], Some("current"), true),
-        (vec!["other"], Some("current"), false),
-        (vec![], Some("current"), false),
-        (vec!["current"], None, false),
-    ] {
-        let mut policy = policy::Policy {
-            authorization,
-            promotion: promotion.clone(),
-            qualified_templates: templates.into_iter().map(str::to_owned).collect(),
+    let mut policy = policy::Policy {
+        authorization,
+        promotion,
+    };
+    assert!(policy::authorizes(&policy, &action));
+    policy.authorization = Uuid::now_v7();
+    assert!(!policy::authorizes(&policy, &action));
+    policy.authorization = authorization;
+    policy.promotion.maximum_guest = "0.8.3".parse().unwrap();
+    assert!(!policy::authorizes(&policy, &action));
+}
+
+/// Counts endpoint-proof captures while one observer runs against a sandbox
+/// whose node-manager answers every capture with `refusal`.
+struct ObservedCaptures {
+    service: SandboxManagerService,
+    id: String,
+    captures: tokio::sync::watch::Sender<usize>,
+    observer: tokio::task::JoinHandle<()>,
+}
+
+impl ObservedCaptures {
+    fn start(refusal: fn() -> Status) -> Self {
+        use crate::service::tests::service_tests::{
+            complete_runtime_endpoint_identity, insert_test_sandbox_with_runtime,
         };
-        assert_eq!(policy.authorizes(&action, template), expected);
-        policy.authorization = Uuid::now_v7();
-        assert!(!policy.authorizes(&action, template));
-        policy.authorization = authorization;
-        policy.promotion.maximum_guest = "0.8.3".parse().unwrap();
-        assert!(!policy.authorizes(&action, template));
+        use pplx_space_node_mgr_client::proto::{
+            CaptureSandboxEndpointProofRequest, SandboxEndpointProof,
+        };
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        insert_test_sandbox_with_runtime(&conn, &id, SandboxState::Started);
+        complete_runtime_endpoint_identity(&conn, &id);
+        let execution = crate::db::read::sandbox(&conn, &id)
+            .unwrap()
+            .unwrap()
+            .node_execution_id
+            .unwrap();
+        let (captures, _) = tokio::sync::watch::channel(0);
+        let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
+            .unary("CaptureSandboxEndpointProof", {
+                let captures = captures.clone();
+                move |_: CaptureSandboxEndpointProofRequest| {
+                    captures.send_modify(|count| *count += 1);
+                    Err::<SandboxEndpointProof, _>(refusal())
+                }
+            })
+            .serve();
+        let service =
+            crate::service::tests::node_manager_transport_tests::service_with_node_manager(
+                conn,
+                node_manager.connector(),
+            );
+        let observer = tokio::spawn({
+            let (service, id) = (service.clone(), id.clone());
+            async move {
+                let _node_manager = node_manager;
+                service.observe_guest_configuration(&id, execution).await
+            }
+        });
+        Self {
+            service,
+            id,
+            captures,
+            observer,
+        }
     }
+
+    async fn after(&self, wait: Duration) -> usize {
+        tokio::time::sleep(wait).await;
+        *self.captures.borrow()
+    }
+
+    /// Returns once the observer has requested `count` endpoint proofs.
+    async fn until(&self, count: usize) {
+        self.captures
+            .subscribe()
+            .wait_for(|captures| *captures >= count)
+            .await
+            .expect("ObservedCaptures holds a sender");
+    }
+}
+
+impl Drop for ObservedCaptures {
+    fn drop(&mut self) {
+        self.observer.abort();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn refused_endpoint_attestation_waits_for_a_spaced_host_relaunch() {
+    let observed =
+        ObservedCaptures::start(|| Status::failed_precondition("scripted endpoint proof refusal"));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while observed.after(Duration::from_millis(10)).await == 0 {}
+    })
+    .await
+    .expect("the observer requests a first endpoint proof");
+    assert_eq!(
+        observed
+            .after(3 * super::observation::SPACED_HOST_RELAUNCH_POLL)
+            .await,
+        1,
+        "an unchanged launch is not re-attested"
+    );
+    crate::db::update_spaced_host_pid(
+        &observed.service.db_conn().unwrap(),
+        &observed.id,
+        10000,
+        Some(10001),
+        10003,
+    )
+    .unwrap();
+    assert_eq!(
+        observed
+            .after(super::observation::SPACED_HOST_RELAUNCH_POLL + Duration::from_secs(1))
+            .await,
+        2,
+        "a relaunch is attested again"
+    );
+}
+
+#[tokio::test]
+async fn unavailable_endpoint_proof_keeps_reconnecting() {
+    let observed = ObservedCaptures::start(|| Status::unavailable("node-manager restarting"));
+    tokio::time::timeout(Duration::from_secs(3), observed.until(4))
+        .await
+        .expect("transient failures retry within a second");
 }

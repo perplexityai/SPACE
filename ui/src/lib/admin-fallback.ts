@@ -96,6 +96,27 @@ export async function moveReleaseTag(
   return { checked: fieldAccepted };
 }
 
+// Save a warm-pool config. An edit of an existing pool names its release
+// (`releaseId`), so the change goes to that release's config rather than to
+// the release its hash resolves to now, which can be another environment's
+// twin. Releases that don't know `template_release_id` refuse it as an
+// unknown field and get the request without it: they have no twins, so the
+// hash resolves to the same release.
+export async function upsertWarmPool<T>(
+  put: (path: string, body: unknown) => Promise<T>,
+  body: object,
+  releaseId: string | null,
+): Promise<T> {
+  if (releaseId === null) return put('/v1/warm-pools', body);
+  const { result } = await sendWithOptionalField(
+    (sent) => put('/v1/warm-pools', sent),
+    body,
+    'template_release_id',
+    releaseId,
+  );
+  return result;
+}
+
 export const TAG_PRECONDITION_UNCHECKED =
   'This API release does not check where the tag pointed before moving it, so a concurrent move may have been overwritten.';
 

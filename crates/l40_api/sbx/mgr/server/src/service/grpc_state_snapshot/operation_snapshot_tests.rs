@@ -55,7 +55,7 @@ fn operation_snapshot_plan_keeps_started_and_paused_sources_in_place() {
 fn operation_snapshot_replay_uses_the_server_generated_artifact_identity() {
     let sandbox_id = SandboxId::new().to_string();
     let request_id = Uuid::now_v7();
-    let execution_generation = pplx_space_common_core::types::ExecutionGeneration::new(7).unwrap();
+    let execution_generation = pplx_space_sandbox_model::ExecutionGeneration::new(7).unwrap();
     let local_artifact_id = disk_operation_snapshot_artifact_id(
         &sandbox_id,
         request_id,
@@ -67,8 +67,8 @@ fn operation_snapshot_replay_uses_the_server_generated_artifact_identity() {
     let artifact = crate::db::LocalArtifactRow {
         local_artifact_id,
         sandbox_id: sandbox_id.clone(),
-        artifact_kind: pplx_space_common_core::types::ArtifactKind::Disk,
-        artifact_origin: pplx_space_common_core::types::ArtifactOrigin::Snapshot,
+        artifact_kind: pplx_space_snapshot_model::ArtifactKind::Disk,
+        artifact_origin: pplx_space_snapshot_model::ArtifactOrigin::Snapshot,
         snapshot_name: Some(snapshot_name.clone()),
         local_path: paths.artifact.clone(),
     };
@@ -85,7 +85,7 @@ fn operation_snapshot_replay_uses_the_server_generated_artifact_identity() {
         disk_operation_snapshot_artifact_id(
             &sandbox_id,
             request_id,
-            pplx_space_common_core::types::ExecutionGeneration::new(8).unwrap(),
+            pplx_space_sandbox_model::ExecutionGeneration::new(8).unwrap(),
             SandboxState::Paused,
         ),
         &sandbox_id,

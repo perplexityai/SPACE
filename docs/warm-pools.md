@@ -187,9 +187,10 @@ after the release is published.
 way, while an enabled pool config, an enabled rolling policy or a pool slot
 still uses the template. Each kind clears differently:
 
-- Disable its rolling policies (`PUT /admin/api/v1/warm-pool-policies` with
-  `"enabled": false`) and pool configs (`DELETE /admin/api/v1/warm-pools/{id}`
-  or `space-admin-cli warm-pool update ... --disabled`), then wait for their
+- Disable its rolling policies first (`PUT /admin/api/v1/warm-pool-policies`
+  with `"enabled": false`), then its remaining pool configs
+  (`space-admin-cli warm-pool disable <uuid>`, which calls
+  `DELETE /admin/api/v1/warm-pools/{id}`), and wait for their
   open slots to drain. A slot claimed by a create still in flight counts as
   open; it settles within minutes, when the create finishes or the stale claim
   is swept.
@@ -227,7 +228,7 @@ Upgrade every `space-cluster-controller` replica before turning this on; see
 ## Learn more
 
 - [Operator CLI](../crates/l50_app/admin/cli/README.md): `warm-pool update`,
-  `get` and `--disabled`.
+  `get`, `disable` and `--disabled`.
 - [Observability](observability.md): the `warm_pool.slots` and
   `warm_pool.create_path.duration_ms` metrics show pool size and hits.
 - [Warm-pool design](space/design/warm-pools.md): how slots, claims, the

@@ -9,7 +9,7 @@ pub(in crate::controllers::substrate::kubernetes) struct SuspendRestorePlan {
     /// The artifact `storage_uri` holds, which sandbox-manager compares its
     /// local row against. Only the stopped re-placement plan sets it; the
     /// node refuses it with any other wake target.
-    pub expected_local_artifact_id: Option<pplx_space_common_core::types::LocalArtifactId>,
+    pub expected_local_artifact_id: Option<pplx_space_snapshot_model::LocalArtifactId>,
 }
 
 /// Outcome of [`KubernetesSubstrate::hydrate_restored_execution`]: the
@@ -160,6 +160,7 @@ impl KubernetesSubstrate {
                 execution.generation,
                 identity.pod_uid.as_deref(),
                 Some(identity.pod_ip.as_str()),
+                pod.as_ref().and_then(|pod| pod.client_id()).as_ref(),
             )
             .await?
         {
@@ -366,10 +367,10 @@ impl KubernetesSubstrate {
     /// sandbox with: the exact URI of its durable disk artifact and the
     /// artifact id it holds, and no source node.
     ///
-    /// No source node because the drain released it: the teardown cleared the
-    /// placement, and the node is cordoned and on its way out with whatever
-    /// rootfs it still holds, so the pod is placed the way any evacuation pod
-    /// is, from the URI alone.
+    /// No source node because the drain released it: its teardown's release
+    /// cleared the placement, and the node is cordoned and on its way out with
+    /// whatever rootfs it still holds, so the pod is placed the way any
+    /// evacuation pod is, from the URI alone.
     ///
     /// No pod-annotation reuse, unlike [`Self::suspend_restore_plan`]: the
     /// annotation carries only the URI, and the node needs the artifact id too.

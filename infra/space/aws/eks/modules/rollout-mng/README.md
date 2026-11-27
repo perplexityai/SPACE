@@ -8,6 +8,10 @@ the new MNG while sandboxes migrate from the incumbent MNG, then is
 dropped in the cleanup PR once the incumbent is empty and gets
 destroyed.
 
+For when to use a blue-green rollout instead of an EKS in-place node
+group update, see
+[Worker node-update strategies](../../../../../../docs/space/aws/node-update-strategies.md).
+
 ## What this module does
 
 Declares a single `aws_eks_node_group` carrying a cohort taint
@@ -222,6 +226,29 @@ A K8s-version rollout has no input of its own: the kubelet minor comes
 from the custom AMI, and AWS rejects an `UpdateNodegroupVersion` that
 carries both a version and a custom-AMI launch template. So it is a
 launch-template rollout like any other AMI change.
+
+The space module's `worker_capacity_groups` entries are not rollout
+MNGs: Terraform owns their launch template version. An entry with
+`launch_template_version = null` tracks the shared worker template's
+latest version, so a template change updates it in place. Pin every
+populated entry to the version it runs, so a template change only
+publishes a new version that empty entries adopt. Moving a populated
+entry's pin is an EKS managed node group update, not a sandbox-aware
+rollout; the comment at the top of
+[`../space/worker_capacity.tf`](../space/worker_capacity.tf) describes
+its effect. To move a populated entry to a new version without that
+update, empty it first, then clear its pin (`null`, so the empty entry
+tracks the latest version like any other empty entry) before it scales
+out again. Two ways to empty it:
+
+- The flow above, with a `workers_rollout_cohorts` target as the new
+  MNG. A target takes workers-1's instance types and subnets, not the
+  entry's own `instance_types`, `subnet_pool` or `availability_zone`, so
+  for an entry whose settings differ from workers-1's, this moves its
+  sandboxes onto a different instance shape or placement. Capacity type
+  is the same either way: every entry uses `workers_capacity_type`.
+- Drain the entry to zero in place. This keeps its own settings, and is
+  the only path that does: no rollout target takes them.
 
 The cohort taint value (`cohort_taint_value`) **must** be the new
 MNG's running-number index as a string (`"1"`, `"2"`, …) to match the

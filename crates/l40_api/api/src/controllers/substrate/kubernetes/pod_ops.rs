@@ -1,4 +1,8 @@
-use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId};
+use crate::controllers::substrate::{KeyResolution, RecoveryCharge};
+use pplx_space_accounts::ClientId;
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::support::*;
 use super::*;
@@ -12,16 +16,19 @@ use crate::node_group_placement::{
     PlacementSubject, ResolvePath as NodeGroupResolvePath, ResolvedPlacement, RestoreSourceNode,
     check_local_restore_source,
 };
-use pplx_space_common_core::kubernetes::{
-    EvacuationPlacement, NodeGroupPlacement, PodEnvironment, PodToleration,
-};
-use pplx_space_common_core::types::{
-    ExecutionGeneration, NodeRole as SpaceNodeRole, PodUid, PolicyAuthority,
-    SandboxActivationAttemptId, SandboxLifecycle, SandboxOwner, SandboxTransitionTargetState,
-};
+use pplx_space_accounts::SandboxOwner;
 use pplx_space_events::{
     SandboxEvent, SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventType,
     SandboxRestoreProvenance,
+};
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_model::NodeRole as SpaceNodeRole;
+use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, SandboxActivationAttemptId, SandboxLifecycle, SandboxTransitionTargetState,
+};
+use pplx_space_sandbox_pod::{
+    EvacuationPlacement, NodeGroupPlacement, PodEnvironment, PodToleration,
 };
 use rand::RngExt;
 
@@ -35,10 +42,9 @@ mod started_recovery;
 mod wake;
 mod worker_clients;
 use delete::delete_sandbox_pod_with_throttle_retry;
+pub(super) use delete::retry_kube_throttling;
 #[cfg(test)]
-use delete::{
-    K8S_THROTTLE_DELETE_RETRY_ATTEMPTS, lingering_sandbox_pod_names, retry_kube_delete_throttling,
-};
+use delete::{K8S_THROTTLE_RETRY_ATTEMPTS, lingering_sandbox_pod_names};
 #[cfg(test)]
 use ensure_pod::restore_placement_sample;
 #[cfg(test)]
@@ -55,11 +61,11 @@ use restore::restored_pod_routability;
 use started_recovery::started_recovery_replacement_event_details;
 pub(super) use wake::{ActivationWakeFailure, WakeDispatchStatus};
 
-fn is_kube_api_throttling_error(err: &KubeError) -> bool {
+pub(super) fn is_kube_api_throttling_error(err: &KubeError) -> bool {
     matches!(err, kube::Error::Api(resp) if resp.code == 429)
 }
 
-fn is_transient_kube_read_error(err: &KubeError) -> bool {
+pub(super) fn is_transient_kube_read_error(err: &KubeError) -> bool {
     match err {
         kube::Error::Api(response) => {
             response.code == 408 || response.code == 429 || response.code >= 500
@@ -140,6 +146,20 @@ pub(super) struct SandboxPodRequestInputs<'a> {
     /// ([`KubernetesSubstrate::resolve_pod_environment`]): `None` for unbound
     /// work, and while the environment placement gate is off.
     pub(super) environment: Option<PodEnvironment>,
+    /// Rendered as the `space.pplx.net/client-id` label when `Some`.
+    pub(super) client_id: Option<&'a ClientId>,
+}
+
+/// The client id a pod built for `sandbox` is labeled with: the activation's
+/// resolved id, or the sandbox's record when no activation resolved one (a
+/// reconciler's rebuild). See [`KeyResolution::pod_label`].
+pub(super) fn pod_client_id(
+    activation_attempt: Option<&ActivationAttemptAssignment>,
+    sandbox: &Sandbox,
+) -> Option<ClientId> {
+    activation_attempt
+        .map_or(&KeyResolution::Unresolved, |assignment| &assignment.key)
+        .pod_label(sandbox.activating_client_id.as_ref())
 }
 
 impl PodCreateContext<'_> {
@@ -199,6 +219,8 @@ impl StartedRecoveryOwnership {
 pub(super) struct ActivationAttemptAssignment {
     requested_id: SandboxActivationAttemptId,
     target_state: SandboxTransitionTargetState,
+    /// The client id this activation's new pods are labeled with.
+    key: KeyResolution,
     assigned: std::sync::Arc<std::sync::Mutex<Option<(SandboxActivationAttemptId, i64)>>>,
 }
 
@@ -206,10 +228,12 @@ impl ActivationAttemptAssignment {
     pub(super) fn new(
         requested_id: SandboxActivationAttemptId,
         target_state: SandboxTransitionTargetState,
+        key: KeyResolution,
     ) -> Self {
         Self {
             requested_id,
             target_state,
+            key,
             assigned: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -260,6 +284,10 @@ pub(super) struct PodMaterializationOwnership {
     /// read with the storage URI handed alongside it so the two can't name
     /// different artifacts. `None` for every other materialization.
     stopped_materialization_artifact_id: Option<LocalArtifactId>,
+    /// The activation's charge, for the live cap's `Check` point: a pod about
+    /// to be created is checked when its cap policy says so. `None` checks
+    /// nothing.
+    charge: Option<RecoveryCharge>,
 }
 
 impl PodMaterializationOwnership {
@@ -273,6 +301,7 @@ impl PodMaterializationOwnership {
             restore_lease_token,
             activation_attempt,
             stopped_materialization_artifact_id: None,
+            charge: None,
         }
     }
 
@@ -280,6 +309,12 @@ impl PodMaterializationOwnership {
     /// `artifact_id`; see [`EvacuationContext::stopped_materialization`].
     pub(super) fn materializing_stopped(mut self, artifact_id: Option<LocalArtifactId>) -> Self {
         self.stopped_materialization_artifact_id = artifact_id;
+        self
+    }
+
+    /// Check the live cap with `charge` where a pod is about to be created.
+    pub(super) fn with_charge(mut self, charge: &RecoveryCharge) -> Self {
+        self.charge = Some(charge.clone());
         self
     }
 }
@@ -311,7 +346,7 @@ mod tests;
 /// So a caller that can resolve both should pass both: the pair is what
 /// selects the third shape, and suppressing either one collapses it to a
 /// strictly worse placement. `SandboxPodRequest::Restore`'s field docs in
-/// `pplx_space_common_core::k8s` carry the rendering details.
+/// `pplx_space_sandbox_pod` carry the rendering details.
 pub(super) fn parse_pod_create_context<'a>(
     sandbox_id: SandboxId,
     generation: i64,

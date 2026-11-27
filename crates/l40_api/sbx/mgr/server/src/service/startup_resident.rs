@@ -5,7 +5,7 @@ use super::*;
 use crate::db::{SandboxRow, StartupRecoveryOutcome, StartupRecoveryRecord};
 use crate::runtime_reconciliation::{VmStateObservation, observe_vm_state};
 use futures_util::{StreamExt, stream};
-use pplx_space_common_core::types::SandboxQuarantineReasonCode;
+use pplx_space_sandbox_model::SandboxQuarantineReasonCode;
 
 const RESIDENT_SETUP_TIMEOUT: Duration = Duration::from_secs(11);
 const ATTESTED_SETUP_TIMEOUT: Duration = Duration::from_secs(5);

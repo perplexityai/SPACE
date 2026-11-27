@@ -29,13 +29,14 @@
 
 use std::future::Future;
 use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::metrics::operations::{InlineAdmissionPath, InlineAdmissionReason};
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
 use pplx_space_feature_flags::{FeatureFlagClient, SPACE_NATIVE_INLINE_OPERATIONS_FLAG};
 use pplx_space_public_api::{OperationId, OperationKind, OperationState};
 use pplx_space_service_lifecycle::DrainSignal;
@@ -78,6 +79,9 @@ pub const INLINE_ORG_LIMIT_ENV: &str = "SPACE_NATIVE_INLINE_ORG_LIMIT";
 /// smoke can hold a claimed operation in `running` while it kills the API
 /// process or crowds its permits.
 pub const INLINE_TEST_HOLD_SECS_ENV: &str = "SPACE_NATIVE_INLINE_TEST_HOLD_SECS";
+/// Test hook: creating this run-owned file releases the hold early. The
+/// seconds setting remains its fail-safe deadline; release builds ignore both.
+pub const INLINE_TEST_RELEASE_FILE_ENV: &str = "SPACE_NATIVE_INLINE_TEST_RELEASE_FILE";
 const MAX_INLINE_TEST_HOLD: Duration = Duration::from_secs(600);
 
 /// The kinds `SPACE_NATIVE_INLINE_KINDS` may name: wakes, which callers wait
@@ -102,6 +106,8 @@ pub struct InlineOperationsConfig {
     pub org_limit: Option<NonZeroU32>,
     /// [`INLINE_TEST_HOLD_SECS_ENV`], `None` unless a test build sets it.
     pub test_hold: Option<Duration>,
+    /// [`INLINE_TEST_RELEASE_FILE_ENV`], only used with an enabled test hold.
+    pub test_release_file: Option<PathBuf>,
 }
 
 impl Default for InlineOperationsConfig {
@@ -112,13 +118,14 @@ impl Default for InlineOperationsConfig {
             max_concurrent: DEFAULT_INLINE_MAX_CONCURRENT,
             org_limit: None,
             test_hold: None,
+            test_release_file: None,
         }
     }
 }
 
 impl InlineOperationsConfig {
     pub fn from_env() -> Self {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
     /// A kind outside [`INLINE_CAPABLE_KINDS`], or not a kind at all, is
@@ -126,7 +133,7 @@ impl InlineOperationsConfig {
     /// above 1024 is capped. A malformed organization limit sets none, with
     /// a warning. The test hold is capped at 600 s; `0` or a malformed value
     /// sets none.
-    pub fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+    pub fn from_environment(env: &dyn pplx_space_env_vars::Environment) -> Self {
         let default = Self::default();
         let mut kinds = Vec::new();
         for name in env
@@ -149,7 +156,7 @@ impl InlineOperationsConfig {
             }
         }
         Self {
-            enabled: pplx_space_common_core::env::env_flag(
+            enabled: pplx_space_env_vars::env_flag(
                 env.var(INLINE_OPERATIONS_ENABLED_ENV).ok().as_deref(),
                 default.enabled,
             ),
@@ -177,10 +184,13 @@ impl InlineOperationsConfig {
                     }
                 }
             }),
-            test_hold: pplx_space_common_core::env::test_hook(env, INLINE_TEST_HOLD_SECS_ENV)
+            test_hold: pplx_space_test_hooks::test_hook(env, INLINE_TEST_HOLD_SECS_ENV)
                 .and_then(|raw| raw.trim().parse::<u64>().ok())
                 .filter(|secs| *secs > 0)
                 .map(|secs| Duration::from_secs(secs).min(MAX_INLINE_TEST_HOLD)),
+            test_release_file: pplx_space_test_hooks::test_hook(env, INLINE_TEST_RELEASE_FILE_ENV)
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from),
         }
     }
 }
@@ -686,9 +696,10 @@ impl InlineLifecycle {
                 let operation_id = claim.operation().id;
                 let execution = self.executor.execute(claim.operation().clone());
                 let hold = self.runner.inner.config.test_hold;
+                let release_file = self.runner.inner.config.test_release_file.clone();
                 let execution = async move {
                     if let Some(hold) = hold {
-                        tokio::time::sleep(hold).await;
+                        wait_inline_test_hold(hold, release_file.as_deref()).await;
                     }
                     execution.await
                 };
@@ -709,6 +720,28 @@ impl InlineLifecycle {
                 Ok(result)
             }
         }
+    }
+}
+
+/// The execution driver renews the claim while this future is pending. A
+/// missing or unreadable release file never ends the hold early; its bounded
+/// deadline still lets a failed smoke relinquish its permits.
+async fn wait_inline_test_hold(hold: Duration, release_file: Option<&Path>) {
+    let released = async {
+        if let Some(path) = release_file {
+            loop {
+                if tokio::fs::try_exists(path).await.unwrap_or(false) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        () = tokio::time::sleep(hold) => {},
+        () = released => {},
     }
 }
 

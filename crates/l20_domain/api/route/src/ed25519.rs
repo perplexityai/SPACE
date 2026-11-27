@@ -8,7 +8,9 @@ use std::str::FromStr;
 use aws_lc_rs::signature::{ED25519, Ed25519KeyPair, KeyPair, VerificationAlgorithm};
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use pplx_space_common_core::types::{ClusterId, GuestPort, SandboxRouteIdentity};
+use pplx_space_cluster_id::ClusterId;
+use pplx_space_network_roles::GuestPort;
+use pplx_space_sandbox_model::SandboxRouteIdentity;
 use serde::{Deserialize, Serialize};
 use tonic::metadata::{Ascii, MetadataMap, MetadataValue};
 
@@ -349,18 +351,18 @@ pub struct SpaceApiRouteEd25519Authority {
 
 impl SpaceApiRouteEd25519Authority {
     pub fn load_from_env() -> Result<Option<Self>, SpaceApiRouteEd25519Error> {
-        Self::load_from_environment_impl(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::load_from_environment_impl(&pplx_space_env_vars::ProcessEnvironment)
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn load_from_environment(
-        env: &dyn pplx_space_common_core::env::Environment,
+        env: &dyn pplx_space_env_vars::Environment,
     ) -> Result<Option<Self>, SpaceApiRouteEd25519Error> {
         Self::load_from_environment_impl(env)
     }
 
     fn load_from_environment_impl(
-        env: &dyn pplx_space_common_core::env::Environment,
+        env: &dyn pplx_space_env_vars::Environment,
     ) -> Result<Option<Self>, SpaceApiRouteEd25519Error> {
         let key_path = env.var_os(SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV);
         let encoded_key = env.var(SPACE_API_ROUTE_ED25519_SIGNING_KEY_ENV).ok();
@@ -397,18 +399,18 @@ impl SpaceApiRouteEd25519Authority {
     }
 
     pub fn load_required_from_env() -> Result<Self, SpaceApiRouteEd25519Error> {
-        Self::load_required_from_environment_impl(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::load_required_from_environment_impl(&pplx_space_env_vars::ProcessEnvironment)
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn load_required_from_environment(
-        env: &dyn pplx_space_common_core::env::Environment,
+        env: &dyn pplx_space_env_vars::Environment,
     ) -> Result<Self, SpaceApiRouteEd25519Error> {
         Self::load_required_from_environment_impl(env)
     }
 
     fn load_required_from_environment_impl(
-        env: &dyn pplx_space_common_core::env::Environment,
+        env: &dyn pplx_space_env_vars::Environment,
     ) -> Result<Self, SpaceApiRouteEd25519Error> {
         Self::load_from_environment_impl(env)?
             .ok_or(SpaceApiRouteEd25519Error::MissingSigningConfiguration)
@@ -748,7 +750,7 @@ pub enum SpaceApiRouteEd25519Error {
     #[error("SPACE cluster id is required for Ed25519 route tokens")]
     MissingClusterId,
     #[error("SPACE cluster id is invalid: {0}")]
-    InvalidClusterId(#[from] pplx_space_common_core::types::ClusterIdParseError),
+    InvalidClusterId(#[from] pplx_space_cluster_id::ClusterIdParseError),
     #[error("failed to read SPACE API route verification bundle {path}: {source}")]
     ReadVerificationBundle {
         path: PathBuf,
@@ -911,10 +913,7 @@ fn decode_public_verification_key(
 fn decode_pem_block(text: &str, label: &str) -> Result<Vec<u8>, ()> {
     let begin = format!("-----BEGIN {label}-----");
     let end = format!("-----END {label}-----");
-    let body = text
-        .strip_prefix(&begin)
-        .and_then(|value| value.strip_suffix(&end))
-        .ok_or(())?;
+    let body = text.strip_circumfix(&begin, &end).ok_or(())?;
     let encoded = body.lines().map(str::trim).collect::<String>();
     STANDARD.decode(encoded).map_err(|_| ())
 }

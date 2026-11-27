@@ -104,9 +104,9 @@ use std::time::Duration;
 use pplx_space_api::controllers::substrate::{
     CommandReadyProbe, ObservedPodIdentity, PodIdentityFence,
 };
-use pplx_space_common_core::types::{
-    PodName, PodResourceVersion, PodUid, PositiveDuration, SandboxId, SandboxLifecycle,
-};
+use pplx_space_durations::PositiveDuration;
+use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use uuid::Uuid;
 
 use pplx_space_api::controllers::substrate::TeardownProgress;
@@ -2433,6 +2433,55 @@ async fn crp3_disabled_reaper_is_a_noop() {
     assert!(reconciler.sink.cleanup_calls().is_empty());
 }
 
+/// CRP3b — `SPACE_TRANSIENT_LIFECYCLE_SWEEPER_COMMAND_READY_PENDING_ENABLED`
+/// turns the phase on with its built-in ages, and it then heals and reaps by
+/// the probe as CRP1 and CRP2 do. Unset, or any value other than a `true`
+/// spelling, keeps it off and the tick touches no candidate.
+#[tokio::test(flavor = "current_thread")]
+async fn crp3b_the_environment_switch_enables_the_phase_and_defaults_off() {
+    const SWITCH: &str = "SPACE_TRANSIENT_LIFECYCLE_SWEEPER_COMMAND_READY_PENDING_ENABLED";
+    let config_for = |value: Option<&str>| {
+        let mut env = pplx_space_test_env::TestEnv::default();
+        if let Some(value) = value {
+            env.set(SWITCH, value);
+        }
+        ReconcilerConfig::from_environment(&env)
+    };
+    let tick = |config: ReconcilerConfig| async move {
+        let sink = FakeSink::new();
+        let (ready, wedged) = (SandboxId::new(), SandboxId::new());
+        sink.enqueue_command_ready_pending(vec![ready, wedged]);
+        sink.set_probe_outcome(ready, CommandReadyProbe::Ready);
+        sink.set_probe_outcome(wedged, CommandReadyProbe::Wedged);
+        let reconciler = Reconciler::new(config, sink);
+        reconciler.tick().await;
+        (
+            (ready, wedged),
+            reconciler.sink.heal_calls(),
+            reconciler.sink.reap_calls(),
+        )
+    };
+
+    for value in [None, Some("false"), Some("0"), Some("on"), Some("")] {
+        let config = config_for(value);
+        assert!(!config.command_ready_pending_enabled, "{value:?}");
+        let (_, healed, reaped) = tick(config).await;
+        assert!(healed.is_empty() && reaped.is_empty(), "{value:?}");
+    }
+
+    let config = config_for(Some("true"));
+    assert!(config.command_ready_pending_enabled);
+    assert_eq!(
+        (
+            config.command_ready_pending_age.get(),
+            config.command_ready_pending_terminal_age.get()
+        ),
+        (Duration::from_secs(900), Duration::from_secs(3600))
+    );
+    let ((ready, wedged), healed, reaped) = tick(config).await;
+    assert_eq!((healed, reaped), (vec![ready], vec![wedged]));
+}
+
 /// CRP4 — when the reap CAS reports "not claimed" (a concurrent access healed
 /// the row or transitioned it out of `started` between probe and CAS), no
 /// cleanup runs and the row is not counted as reaped.
@@ -2815,21 +2864,24 @@ mod failed_cleanup_stop_route;
 
 mod postgres_backed {
 
-    use super::super::store::{
-        LIST_COMMAND_READY_PENDING_SQL, LIST_FAILED_ACTIVE_EXECUTIONS_SQL,
-        NOTE_FAILED_CLEANUP_ATTEMPT_SQL, failed_active_execution_scope,
+    use super::super::store::failed_active_execution_scope;
+    use super::*;
+    use pplx_space_accounts::NodeId;
+    use pplx_space_db_test_fixtures::try_pg_test_db;
+    use pplx_space_node_model::SubstrateKind;
+    use pplx_space_sandbox_model::SandboxId;
+    use pplx_space_sandbox_model::SandboxLifecycle;
+    use pplx_space_sandbox_store::sweeper::{
+        AgedTransientRow, fail_unrestorable_restoring_query, list_aged_transient_query,
         list_unrestorable_restoring_query,
     };
-    use super::*;
-    use pplx_space_common_core::types::SandboxLifecycle;
-    use pplx_space_common_core::types::{NodeId, SandboxId, SnapshotId, SubstrateKind};
-    use pplx_space_db_test_fixtures::try_pg_test_db;
-    use pplx_space_sandbox_store::sweeper::{
-        AgedTransientRow, HEAL_COMMAND_READY_PENDING_SQL, REAP_COMMAND_READY_PENDING_SQL,
-        REPAIR_FAILED_ACTIVE_EXECUTION_SQL, converge_restoring_query, fail_candidate_query,
-        fail_unrestorable_restoring_query, list_aged_transient_query, revert_to_suspended_query,
+    use pplx_space_sandbox_store::test_support::sweeper::{
+        HEAL_COMMAND_READY_PENDING_SQL, LIST_COMMAND_READY_PENDING_SQL,
+        REAP_COMMAND_READY_PENDING_SQL, REPAIR_FAILED_ACTIVE_EXECUTION_SQL,
+        converge_restoring_query, fail_candidate_query, revert_to_suspended_query,
         undo_revert_to_suspended_query,
     };
+    use pplx_space_snapshot_model::SnapshotId;
     use sqlx::PgPool;
 
     use pplx_space_test_env::TestResult;
@@ -2853,7 +2905,7 @@ mod postgres_backed {
         .await?;
         insert_execution(&db.pool, id, true, 3600, Some("node-proof")).await?;
         set_execution_pod_state(&db.pool, id, "running", Some("10.90.0.9")).await?;
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "UPDATE sandbox_k8s_executions
                 SET route_activation_id = $2, activation_attempt_id = $3,
                     activation_attempt_expires_at = NOW() - INTERVAL '1 hour',
@@ -2885,7 +2937,7 @@ mod postgres_backed {
                 assert!(candidates.iter().all(|row| row.id != id));
             }
         }
-        let row: (bool, Option<Uuid>) = sqlx::query_as(pplx_space_common_core::sql!(
+        let row: (bool, Option<Uuid>) = sqlx::query_as(pplx_space_sql_locator::sql!(
             "SELECT active, activation_attempt_id FROM sandbox_k8s_executions WHERE sandbox_id = $1"
         ))
         .bind(id)
@@ -5348,8 +5400,8 @@ mod postgres_backed {
     }
 
     /// The failed-cleanup statements bind the Kubernetes substrate: a direct
-    /// row with the same failed-with-active-execution shape is not listed,
-    /// not rotated, and not repaired.
+    /// row with the same failed-with-active-execution shape is not listed
+    /// and not repaired.
     #[tokio::test(flavor = "current_thread")]
     async fn r21_failed_cleanup_statements_skip_direct_rows() -> TestResult {
         let Some(db) = try_pg_test_db().await? else {
@@ -5375,23 +5427,15 @@ mod postgres_backed {
         }
         let kubernetes = SubstrateKind::Kubernetes;
 
-        let listed: Vec<(SandboxId,)> = sqlx::query_as(LIST_FAILED_ACTIVE_EXECUTIONS_SQL)
-            .bind(kubernetes)
-            .bind(10_i64)
-            .fetch_all(pool)
-            .await?;
-        assert_eq!(listed, vec![(k8s,)]);
-
-        let rotated = |sandbox_id: SandboxId| async move {
-            sqlx::query(NOTE_FAILED_CLEANUP_ATTEMPT_SQL)
-                .bind(sandbox_id)
-                .bind(kubernetes)
-                .execute(pool)
-                .await
-                .map(|result| result.rows_affected())
-        };
-        assert_eq!(rotated(direct).await?, 0, "a direct row is not rotated");
-        assert_eq!(rotated(k8s).await?, 1);
+        let listed: Vec<SandboxId> =
+            pplx_space_sandbox_store::k8s_executions::list_failed_active_executions(
+                pool, kubernetes, 10,
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(listed, vec![k8s]);
 
         let repaired = |sandbox_id: SandboxId| async move {
             sqlx::query_scalar::<_, SandboxId>(REPAIR_FAILED_ACTIVE_EXECUTION_SQL)

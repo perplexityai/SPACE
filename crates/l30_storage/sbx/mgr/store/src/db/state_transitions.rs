@@ -898,10 +898,12 @@ fn arm_auto_lifecycle_after_activation(conn: &Connection, id: &str) -> Result<()
     Ok(())
 }
 
-pub fn begin_suspend(conn: &Connection, id: &str) -> Result<bool> {
+pub fn begin_suspend(conn: &Connection, id: &str, artifact_id: LocalArtifactId) -> Result<bool> {
     let changed = conn.execute(
         "UPDATE sandboxes
          SET state = 'suspending',
+             suspend_attempt_artifact_id = ?3,
+             suspend_attempt_started_at = ?1,
              restore_origin = NULL,
              restore_phase = NULL,
              restore_storage_uri = NULL,
@@ -919,7 +921,7 @@ pub fn begin_suspend(conn: &Connection, id: &str) -> Result<bool> {
              updated_at = ?1
          WHERE id = ?2 AND state = 'paused'
            AND cleanup_completion IS NULL AND cleanup_keep_filesystem IS NULL",
-        params![now()?, id],
+        params![now()?, id, artifact_id.to_string()],
     )?;
     Ok(changed == 1)
 }
@@ -928,6 +930,7 @@ pub fn begin_teardown_suspend(
     conn: &Connection,
     id: &str,
     execution_generation: ExecutionGeneration,
+    artifact_id: LocalArtifactId,
 ) -> Result<SupersededTeardownGeneration> {
     let tx = immediate_transaction(conn)?;
     let claim = ensure_teardown_suspend_operation(&tx, id, execution_generation)?;
@@ -935,6 +938,8 @@ pub fn begin_teardown_suspend(
     let changed = tx.execute(
         "UPDATE sandboxes
          SET state = 'suspending',
+             suspend_attempt_artifact_id = ?3,
+             suspend_attempt_started_at = ?1,
              restore_origin = NULL,
              restore_phase = NULL,
              restore_storage_uri = NULL,
@@ -952,7 +957,7 @@ pub fn begin_teardown_suspend(
              updated_at = ?1
          WHERE id = ?2
            AND state = 'paused'",
-        params![now()?, id],
+        params![now()?, id, artifact_id.to_string()],
     )?;
     if changed != 1 {
         return Err(Error::no_rows());
@@ -1002,8 +1007,8 @@ pub fn mark_suspending_quarantined(
     )
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub fn mark_starting_quarantined(
+#[cfg(test)]
+pub(crate) fn mark_starting_quarantined(
     conn: &Connection,
     id: &str,
     reason_code: SandboxQuarantineReasonCode,
@@ -1021,7 +1026,7 @@ pub fn mark_starting_quarantined(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn mark_restoring_quarantined(
+pub(crate) fn mark_restoring_quarantined(
     conn: &Connection,
     id: &str,
     reason_code: SandboxQuarantineReasonCode,
@@ -1038,13 +1043,13 @@ pub fn mark_restoring_quarantined(
     )
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub fn rollback_starting(conn: &Connection, id: &str, state: SandboxState) -> Result<bool> {
+#[cfg(test)]
+pub(crate) fn rollback_starting(conn: &Connection, id: &str, state: SandboxState) -> Result<bool> {
     rollback_activation_state(conn, id, SandboxState::Starting, state)
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub fn rollback_restoring(conn: &Connection, id: &str, state: SandboxState) -> Result<bool> {
+#[cfg(test)]
+pub(crate) fn rollback_restoring(conn: &Connection, id: &str, state: SandboxState) -> Result<bool> {
     rollback_activation_state(conn, id, SandboxState::Restoring, state)
 }
 

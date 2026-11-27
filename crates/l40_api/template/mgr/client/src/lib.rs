@@ -4,14 +4,14 @@ pub mod proto {
     tonic::include_proto!("space.template.manager.v1");
 }
 
-use pplx_space_common_core::types::{TemplateReference, TemplateSelector};
 use pplx_space_common_grpc::{
     GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
 };
+use pplx_space_template_model::{TemplateReference, TemplateSelector};
 use tonic::transport::{Channel, Endpoint};
 
 /// Unix socket path for the template-manager gRPC service.
-pub const SOCKET_PATH: &str = pplx_space_common_core::host::linux::paths::TEMPLATE_MANAGER_SOCKET;
+pub const SOCKET_PATH: &str = pplx_space_host_layout::paths::TEMPLATE_MANAGER_SOCKET;
 /// Server request budget, including cold-cache artifact materialization in GetTemplate.
 pub const GRPC_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(10);
 const LOCAL_ENDPOINT_URI: &str = "http://[::]:50051";
@@ -71,8 +71,8 @@ impl proto::TemplateFullInfo {
     pub fn environment(
         &self,
     ) -> Result<
-        Option<pplx_space_common_core::types::EnvironmentReference>,
-        pplx_space_common_core::types::DigestParseError,
+        Option<pplx_space_execution_spec::EnvironmentReference>,
+        pplx_space_content_digest::DigestParseError,
     > {
         self.execution
             .as_ref()

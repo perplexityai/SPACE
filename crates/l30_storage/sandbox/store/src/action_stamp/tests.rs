@@ -1,10 +1,15 @@
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{SandboxId, SubstrateKind};
+use pplx_space_accounts::NodeId;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
-use super::{ActionStamp, StartSubstrate, stamp_action_lifecycle, stamp_started_after_start};
+use super::{
+    ActionStamp, StartSubstrate, stamp_action_lifecycle, stamp_pooled_post_wake,
+    stamp_started_after_start,
+};
 
 /// The lifecycles another intent can own while an action is in flight: a
 /// delete, a stop or a suspend that has begun or finished, and a restore
@@ -132,6 +137,84 @@ async fn the_started_stamp_writes_a_starts_own_states_and_refuses_another_intent
             if written != stamps || after != expected {
                 mismatches.push(format!(
                     "{substrate:?} from {lifecycle}: written {written}, row now {after:?}"
+                ));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+    Ok(())
+}
+
+/// The pooled create's post-wake stamp writes over every lifecycle a resume
+/// admits, matched case- and whitespace-insensitively, and leaves every other
+/// stored value, its placement, node and placement clock untouched.
+#[tokio::test(flavor = "current_thread")]
+async fn the_pooled_post_wake_stamp_writes_a_resumes_states_and_refuses_the_rest() -> TestResult {
+    const CASES: &[(&str, bool)] = &[
+        ("created", true),
+        ("creating", true),
+        ("starting", true),
+        ("started", true),
+        ("pausing", true),
+        ("paused", true),
+        ("resuming", true),
+        ("checkpointing", true),
+        (" Paused ", true),
+        ("STARTED", true),
+        ("stopped", false),
+        ("restoring", false),
+        ("failed", false),
+        ("quarantined", false),
+        ("deleting", false),
+        ("suspending", false),
+        ("suspended", false),
+        ("stopping", false),
+        ("deleted", false),
+        ("bogus", false),
+    ];
+    type Row = (String, String, Option<NodeId>, bool);
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let earlier_node = NodeId::new();
+    let mut mismatches = Vec::new();
+    for &(lifecycle, stamps) in CASES {
+        for node in [Some(NodeId::new()), None] {
+            let id = insert_sandbox(pool, lifecycle).await?;
+            sqlx::query(sql!(
+                "UPDATE sandboxes
+                    SET active_node_id = $1,
+                        placement_changed_at = NOW() - INTERVAL '1 hour'
+                  WHERE id = $2"
+            ))
+            .bind(earlier_node)
+            .bind(id)
+            .execute(pool)
+            .await?;
+            let written = stamp_pooled_post_wake(pool, id, node).await?;
+            let after: Row = sqlx::query_as(sql!(
+                "SELECT lifecycle, placement, active_node_id,
+                        placement_changed_at > NOW() - INTERVAL '1 minute'
+                   FROM sandboxes
+                  WHERE id = $1"
+            ))
+            .bind(id)
+            .fetch_one(pool)
+            .await?;
+            let expected: Row = if stamps {
+                ("started".to_owned(), "on_node".to_owned(), node, true)
+            } else {
+                (
+                    lifecycle.to_owned(),
+                    "unplaced".to_owned(),
+                    Some(earlier_node),
+                    false,
+                )
+            };
+            if written != stamps || after != expected {
+                mismatches.push(format!(
+                    "from {lifecycle:?} to {node:?}: written {written}, row now {after:?}"
                 ));
             }
         }

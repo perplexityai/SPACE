@@ -63,12 +63,12 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use pplx_space_common_core::types::{ArtifactKind, LocalArtifactId, SnapshotName};
+use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId, SnapshotName};
 
 use crate::db::LocalArtifactRow;
 use crate::db::local_artifact_leases as leases;
 pub(crate) use crate::db::local_artifact_leases::NamedArtifactPublication;
-pub use crate::db::local_artifact_leases::{ArtifactState, ParseArtifactStateError, PendingBackup};
+pub(crate) use crate::db::local_artifact_leases::{ArtifactState, PendingBackup};
 
 /// Reason a checkout (restore or delete) failed.
 #[derive(Debug, thiserror::Error)]
@@ -389,7 +389,7 @@ impl LocalArtifacts {
     pub fn publish_stopped(
         &self,
         sandbox_id: &str,
-        expected_execution: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+        expected_execution: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
         local_artifact_id: LocalArtifactId,
         local_path: &str,
     ) -> crate::db::Result<()> {

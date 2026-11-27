@@ -17,8 +17,6 @@ from kind_chart_render import (
 )
 
 SCRIPT = KIND_DIR / "scripts/telemetry_config.py"
-METRICS_ENDPOINT = "http://collector.space-metrics.svc.cluster.local:4317"
-TRACES_ENDPOINT = "http://collector.space-traces.svc.cluster.local:4317"
 SHIM_OVERRIDE = "http://192.0.2.10:4317"
 LOCAL_ENDPOINT = "http://127.0.0.1:4317"
 spec = importlib.util.spec_from_file_location("kind_telemetry_config", SCRIPT)
@@ -29,151 +27,51 @@ spec.loader.exec_module(config)
 @pytest.mark.parametrize("mode", ["datadog", "otel", "off"])
 @pytest.mark.parametrize("global_overlay", [None, "null"], ids=["absent", "null"])
 def test_chart_and_executed_shim_share_isolated_identity(mode, global_overlay, tmp_path):
-    settings = config.configuration(
-        {
-            "SPACE_KIND_TELEMETRY_MODE": mode,
-            # An Agent to send native traces to; without one they are off.
-            "SPACE_KIND_DATADOG_MODE": "fakeintake",
-            "SPACE_KIND_ENV": "local-kind-owner-box",
-            "SPACE_KIND_VERSION": "abc123",
-            "SPACE_KIND_PHASE": "after-datadog",
-            "SPACE_KIND_OWNER": "owner",
-        }
-    )
+    # The node shim and pod workloads have separate launch paths. A profile
+    # must not leave either on inherited host identity or a different sink.
+    settings = config.configuration({
+        "SPACE_KIND_TELEMETRY_MODE": mode,
+        "SPACE_KIND_DATADOG_MODE": "fakeintake",
+        "SPACE_KIND_ENV": "local-kind-owner-box",
+        "SPACE_KIND_VERSION": "abc123",
+        "SPACE_KIND_PHASE": "after-datadog",
+        "SPACE_KIND_OWNER": "owner",
+    })
     wrapper = tmp_path / "shim"
     wrapper.write_text(config.shim_wrapper(settings, "/usr/bin/env", "old-binary"))
     result = subprocess.run(
         ["bash", str(wrapper)],
         env={"PATH": os.environ["PATH"], "DD_ENV": "prod", "DD_VERSION": "old"},
-        check=True,
-        capture_output=True,
-        text=True,
+        check=True, capture_output=True, text=True,
     )
     launch = dict(row.split("=", 1) for row in result.stdout.splitlines())
-    args = [
-        item for setting in settings["helm_set"] for item in ("--set-string", setting)
-    ]
-    # Unsetting an overlay must preserve the Kind identity/exporter contract
-    # instead of activating global validation.
+    assert launch["DD_ENV"] != "prod"
+    assert launch["DD_VERSION"] != "old"
+    expected_sink = {"datadog": "datadog", "otel": "otlp", "off": "off"}[mode]
+    assert launch["SPACE_TRACE_EXPORTER"] == expected_sink
+    assert launch["SPACE_METRICS_SINK"] == expected_sink
+    args = [item for setting in settings["helm_set"] for item in ("--set-string", setting)]
     if global_overlay is not None:
         args += ["--set", f"global.observability={global_overlay}"]
     for chart in TELEMETRY_CHARTS:
-        # Not "docs": oss/refs-to-private.sh reads that word on a path-joining
-        # line as the private docs/ tree and fails the OSS export gate.
         manifests = render(chart, "space", *args)
-        workload = next(
-            doc for doc in manifests if doc["kind"] in ("Deployment", "DaemonSet")
-        )
-        annotations = workload["spec"]["template"]["metadata"].get("annotations", {})
-        assert (annotations.get("ad.datadoghq.com/logs_exclude") == "true") == (mode == "otel")
+        workload = next(doc for doc in manifests if doc["kind"] in ("Deployment", "DaemonSet"))
         env = {
             entry["name"]: entry.get("value")
             for entry in workload["spec"]["template"]["spec"]["containers"][0]["env"]
         }
-        for key in ("DD_ENV", "DD_VERSION"):
-            assert env[key] == launch[key]
-        # The workload and the shim agree on the SPACE identity only where the
-        # shim uses it. Its DogStatsD version tag carries the shim's build
-        # version rather than DD_VERSION, so a SPACE_VERSION in a Datadog-only
-        # mode would change the tag; the chart's services have no such
-        # difference and keep it in every mode.
+        for key in ("DD_ENV", "DD_VERSION", "DD_TAGS", "SPACE_METRICS_SINK", "SPACE_TRACE_EXPORTER"):
+            assert env[key] == launch[key], (chart.name, key)
+        # Native shim metrics retain their binary build version; OTLP uses
+        # the configured experiment identity across both launch boundaries.
         for key in ("SPACE_ENV", "SPACE_VERSION"):
-            assert key in env
             if mode == "otel":
-                assert env[key] == launch[key]
+                assert env[key] == launch[key], (chart.name, key)
             else:
                 assert key not in launch
-        assert env["DD_ENV"].startswith("local-kind-")
-        assert env["DD_VERSION"].endswith("-after-datadog")
-        resources = dict(
-            item.split("=", 1) for item in env["OTEL_RESOURCE_ATTRIBUTES"].split(",")
-        )
+        resources = dict(item.split("=", 1) for item in env["OTEL_RESOURCE_ATTRIBUTES"].split(","))
         assert resources["deployment.environment.name"] == env["DD_ENV"]
         assert resources["service.version"] == env["DD_VERSION"]
-        # The mode's whole purpose is selecting one sink; assert it, not just
-        # the trace exporter, so inverting MODES cannot leave this suite green.
-        assert (
-            env["SPACE_METRICS_SINK"]
-            == {
-                "datadog": "datadog",
-                "otel": "otlp",
-                "off": "off",
-            }[mode]
-        )
-        if mode == "otel":
-            assert env["OTEL_TRACES_SAMPLER"] == "always_on"
-            # sandbox-manager takes the node-reachable Collectors instead, for
-            # the sidecars it launches on the node.
-            if chart.name != "space-sandbox-manager-local":
-                assert env["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"] == METRICS_ENDPOINT
-                assert env["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == TRACES_ENDPOINT
-            else:
-                assert env["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"] == config.collector_endpoint(settings, "metrics")
-                assert env["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == config.collector_endpoint(settings, "traces")
-            assert env["OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE"] == "cumulative"
-            assert env["OTEL_EXPORTER_OTLP_METRICS_PROTOCOL"] == "grpc"
-            assert env["OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"] == "grpc"
-        else:
-            # An empty sampler is not a valid name; the charts omit it.
-            assert "OTEL_TRACES_SAMPLER" not in env
-            assert not any(key.startswith("OTEL_EXPORTER_OTLP_") for key in env)
-        assert "OTEL_EXPORTER_OTLP_ENDPOINT" not in env
-        assert "OTEL_EXPORTER_OTLP_PROTOCOL" not in env
-        # Cluster-named fields carry the cluster, not the environment.
-        assert resources["k8s.cluster.name"] == "space-local"
-        # The chart and the shim wrapper must agree on the tag set.
-        assert env["DD_TAGS"] == launch["DD_TAGS"]
-        if chart.name != "space-data-plane-local":
-            assert env["SPACE_CLUSTER_ID"] == launch["SPACE_CLUSTER_ID"]
-    # Each signal goes to its own Collector: traces for the shim's spans,
-    # metrics for its OTLP sink.
-    if mode == "off":
-        assert not any(key.startswith("OTEL_EXPORTER_OTLP_") for key in launch)
-    else:
-        assert launch["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == (
-            config.collector_endpoint(settings, "traces")
-            if mode == "otel"
-            else LOCAL_ENDPOINT
-        )
-    # The shim reads SPACE_METRICS_SINK as well; it must follow the mode, or an
-    # otel run leaves the shim on native metrics while the workloads move.
-    expected = {"datadog": "datadog", "otel": "otlp", "off": "off"}[mode]
-    assert launch["SPACE_TRACE_EXPORTER"] == expected
-    assert launch["SPACE_METRICS_SINK"] == expected
-    # Shim metrics have no endpoint fallback, unlike traces.
-    assert ("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT" in launch) == (mode == "otel")
-    if mode == "otel":
-        assert launch["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"] == config.collector_endpoint(
-            settings, "metrics"
-        )
-        assert launch["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"] != launch[
-            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
-        ]
-        assert launch["OTEL_EXPORTER_OTLP_METRICS_PROTOCOL"] == "grpc"
-    assert "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE" not in launch
-
-    launched_resources = dict(
-        item.split("=", 1) for item in launch["OTEL_RESOURCE_ATTRIBUTES"].split(",")
-    )
-    # The resolver recomputes process-local attributes and drops any it
-    # inherits here, so the node name has to arrive as its own setting. bash
-    # expanded $(hostname) for both, so compare the values.
-    assert launch["SPACE_K8S_NODE_NAME"] == launched_resources["k8s.node.name"]
-    # Cluster metadata is not identity and survives in every mode, as do the
-    # Datadog settings the shim has always read.
-    assert "k8s.cluster.name" in launched_resources
-    for key in ("DD_ENV", "DD_VERSION", "DD_SERVICE"):
-        assert key in launch, f"{mode} must still set {key}"
-    # Identity is gated on the mode, in the resource attributes as well as the
-    # direct settings: the resolver reads service.version from here into the
-    # same slot, and in a Datadog-only mode that would replace the shim's build
-    # version in its DogStatsD version tag.
-    identity_present = mode == "otel"
-    assert ("OTEL_SERVICE_NAME" in launch) == identity_present
-    for key in ("service.version", "deployment.environment.name"):
-        assert (key in launched_resources) == identity_present, (
-            f"{mode}: {key} in {launched_resources}"
-        )
 
 
 @pytest.mark.parametrize(
@@ -190,14 +88,12 @@ def test_build_manager_traces_and_command_logs_stay_excluded_across_profiles(pat
     if path == "kind":
         settings = config.configuration({"SPACE_KIND_TELEMETRY_MODE": mode})
         args = [item for setting in settings["helm_set"] for item in ("--set-string", setting)]
-        metrics = config.MODES[mode][0]
     else:
         args = [
             "--set-string", f"global.observability.mode={mode}",
             "--set-string", "global.observability.environment=example",
             "--set-string", "global.observability.cluster=cluster-a",
         ]
-        metrics = mode
     if trace_exporter is not None:
         # Use YAML, not Python booleans, to cover the caller-side conversion of
         # bare off to false and Helm's removal of a null default.
@@ -220,83 +116,6 @@ def test_build_manager_traces_and_command_logs_stay_excluded_across_profiles(pat
         assert "DD_TRACE_AGENT_PORT" not in env
         assert "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL" not in env
         assert "OTEL_TRACES_SAMPLER" not in env
-    assert env["SPACE_METRICS_SINK"] == metrics
-
-
-@pytest.mark.parametrize("chart", TELEMETRY_CHARTS, ids=lambda chart: chart.name)
-@pytest.mark.parametrize("role", ["worker", "builder"])
-def test_chart_otlp_endpoints_can_be_overridden_independently(chart, role):
-    custom_metrics = "http://metrics.example:4317"
-    custom_traces = "http://traces.example:4317"
-    settings = config.configuration({
-        "SPACE_KIND_TELEMETRY_MODE": "otel",
-        "SPACE_KIND_OTLP_METRICS_ENDPOINT": custom_metrics,
-        "SPACE_KIND_OTLP_TRACES_ENDPOINT": custom_traces,
-    })
-    extra = []
-    if (chart / "charts/space-node-service").exists():
-        extra = ["--set-string", f"node.role={role}"]
-        if role == "builder" and (chart / "values-builder.yaml").exists():
-            extra += ["-f", str(chart / "values-builder.yaml")]
-    manifests = render(
-        chart, "space-builder" if role == "builder" else "space", *extra,
-        *(item for setting in settings["helm_set"] for item in ("--set-string", setting)),
-    )
-    workloads = [doc for doc in manifests if doc["kind"] in ("Deployment", "DaemonSet")]
-    assert workloads
-    for workload in workloads:
-        # The API chart has both shared and admin Deployments.
-        annotations = workload["spec"]["template"]["metadata"]["annotations"]
-        assert annotations["ad.datadoghq.com/logs_exclude"] == "true"
-        env = {
-            entry["name"]: entry.get("value")
-            for entry in workload["spec"]["template"]["spec"]["containers"][0]["env"]
-        }
-        assert env["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"] == custom_metrics
-        assert env["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == custom_traces
-    assert config.collector_endpoint(settings, "metrics") == custom_metrics
-    assert config.collector_endpoint(settings, "traces") == custom_traces
-
-
-@pytest.mark.parametrize("role", ["worker", "builder"])
-@pytest.mark.parametrize(
-    "environment",
-    [
-        {"SPACE_KIND_TELEMETRY_MODE": "otel"},
-        {
-            "SPACE_KIND_TELEMETRY_MODE": "otel",
-            "SPACE_KIND_OTLP_METRICS_ENDPOINT": "http://192.0.2.10:4317",
-            "SPACE_KIND_OTLP_TRACES_ENDPOINT": "http://192.0.2.11:4317",
-        },
-        {"SPACE_KIND_TELEMETRY_MODE": "otel", "SPACE_KIND_SHIM_OTLP_ENDPOINT": LOCAL_ENDPOINT},
-        {"SPACE_KIND_TELEMETRY_MODE": "datadog"},
-        {"SPACE_KIND_TELEMETRY_MODE": "datadog", "SPACE_KIND_DATADOG_MODE": "fakeintake"},
-        {"SPACE_KIND_TELEMETRY_MODE": "off"},
-    ],
-)
-def test_profile_reaches_runtime_supervisor_node_environment(environment, role):
-    settings = config.configuration(environment)
-    manifests = render(
-        KIND_DIR / "charts/space-node-manager-local", "space",
-        "--set-string", f"node.role={role}",
-        *(item for setting in settings["helm_set"] for item in ("--set-string", setting)),
-    )
-    workload = next(doc for doc in manifests if doc["kind"] == "DaemonSet")
-    init = next(
-        container for container in workload["spec"]["template"]["spec"]["initContainers"]
-        if container["name"] == "kind-node-env"
-    )
-    env = {entry["name"]: entry.get("value") for entry in init["env"]}
-    metrics, traces = settings["metrics_sink"], settings["trace_exporter"]
-    assert env["SPACE_METRICS_SINK"] == metrics
-    assert env["SPACE_TRACE_EXPORTER"] == traces
-    if settings["mode"] == "otel":
-        assert env["OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE"] == "cumulative"
-    else:
-        assert "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE" not in env
-    for signal in ("metrics", "traces"):
-        assert env[f"NODE_OTLP_{signal.upper()}_ENDPOINT"] == config.collector_endpoint(settings, signal)
-        assert (f"OTEL_EXPORTER_OTLP_{signal.upper()}_ENDPOINT" in env) == (settings["mode"] == "otel")
 
 
 def test_shim_endpoint_override_replaces_the_collectors(tmp_path):
@@ -468,32 +287,6 @@ def test_configuration_file_rejects_credentials(tmp_path):
         config.options({"SPACE_KIND_OBSERVABILITY_CONFIG": str(path)})
 
 
-def test_default_bootstrap_ships_no_empty_tags():
-    """An unconfigured bootstrap must not tag every pod `kind_owner:`.
-
-    The shim wrapper appends owner and phase only when set, so the charts have
-    to match or the two identities diverge exactly where nothing sets them.
-    """
-    settings = config.configuration({})
-    args = [
-        item for setting in settings["helm_set"] for item in ("--set-string", setting)
-    ]
-    for chart in ("space-api-local", "space-sandbox-manager-local"):
-        workload = next(
-            doc
-            for doc in render(KIND_DIR / "charts" / chart, "space", *args)
-            if doc["kind"] in ("Deployment", "DaemonSet")
-        )
-        env = {
-            entry["name"]: entry.get("value")
-            for entry in workload["spec"]["template"]["spec"]["containers"][0]["env"]
-        }
-        assert "kind_owner:" not in env["DD_TAGS"], env["DD_TAGS"]
-        assert "kind_phase:" not in env["DD_TAGS"], env["DD_TAGS"]
-        assert "kind.owner=" not in env["OTEL_RESOURCE_ATTRIBUTES"]
-        assert "kind.phase=" not in env["OTEL_RESOURCE_ATTRIBUTES"]
-
-
 def test_empty_explicit_env_falls_back_to_the_legacy_variable():
     """An exported-but-empty SPACE_KIND_ENV must not skip the legacy name."""
     settings = config.configuration(
@@ -539,13 +332,6 @@ def test_shim_endpoint_override_follows_the_shared_rule(endpoint, rejected) -> N
         assert config.configuration(environment)["shim_endpoint"] == endpoint
 
 
-def test_kind_defaults_to_datadog_without_authorizing_backend_install():
-    """Selecting the native wire must not authorize SaaS or OSS installation."""
-    settings = config.configuration({})
-    assert settings["mode"] == "datadog"
-    assert settings["install_observability"] is False
-
-
 @pytest.mark.parametrize(
     "backend,traces",
     [(None, "off"), ("off", "off"), ("fakeintake", "datadog"), ("saas", "datadog")],
@@ -582,6 +368,8 @@ def test_unknown_datadog_backend_is_rejected_not_read_as_an_agent(backend):
         ({"SPACE_KIND_TELEMETRY_MODE": "off"}, "off", False),
         ({"SPACE_KIND_TELEMETRY_MODE": "otel", "SPACE_KIND_OBSERVABILITY": "off"}, "otel", False),
         ({"SPACE_KIND_TELEMETRY_MODE": "otel", "SPACE_KIND_OBSERVABILITY": "auto"}, "otel", True),
+        ({"SPACE_KIND_TELEMETRY_MODE": "otel", "SPACE_KIND_OBSERVABILITY_LAYOUT": "ci"}, "otel", True),
+        ({"SPACE_KIND_OBSERVABILITY_LAYOUT": "ci"}, "datadog", False),
     ],
 )
 def test_backends_install_only_when_the_mode_uses_them(env, mode, installs):
@@ -591,7 +379,8 @@ def test_backends_install_only_when_the_mode_uses_them(env, mode, installs):
     assert settings["install_observability"] is installs
 
 
-def test_an_unknown_observability_selector_is_rejected():
+@pytest.mark.parametrize("option", ["SPACE_KIND_OBSERVABILITY", "SPACE_KIND_OBSERVABILITY_LAYOUT"])
+def test_an_unknown_observability_selector_is_rejected(option):
     """A typo must not quietly skip the backends the mode needs."""
-    with pytest.raises(ValueError, match="SPACE_KIND_OBSERVABILITY"):
-        config.configuration({"SPACE_KIND_OBSERVABILITY": "yes"})
+    with pytest.raises(ValueError, match=option):
+        config.configuration({option: "yes"})

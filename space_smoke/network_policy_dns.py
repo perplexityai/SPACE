@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shlex
 from collections.abc import Sequence
+from math import ceil
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -13,7 +14,7 @@ if TYPE_CHECKING:
 _PROBE_CODE = r"""
 import errno, socket, sys
 
-protocol, resolver, qname_text = sys.argv[1:]
+protocol, resolver, qname_text, timeout_seconds = sys.argv[1:]
 labels = qname_text.rstrip(".").encode("ascii").split(b".")
 qname = b"".join(bytes((len(part),)) + part for part in labels)
 query = (b"SP\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + qname
@@ -36,7 +37,7 @@ try:
         resolver, 53, type=sock_type
     )[0]
     with socket.socket(family, kind, proto) as sock:
-        sock.settimeout(3)
+        sock.settimeout(float(timeout_seconds))
         if protocol == "udp":
             sock.sendto(query, address)
             response, _peer = sock.recvfrom(4096)
@@ -65,12 +66,14 @@ raise SystemExit(12)
 _DNS_ACCEPTED = 0
 _TRANSPORT_BLOCKED = 10
 _DNS_REFUSED = 13
+_REPLY_TIMEOUT_SECONDS = 3
+_DENIAL_TIMEOUT_SECONDS = 2
 
 
-def _command(protocol: str, resolver: str, qname: str) -> str:
+def _command(protocol: str, resolver: str, qname: str, timeout_seconds: int) -> str:
     return (
         f"python3 -c {shlex.quote(_PROBE_CODE)} {protocol} "
-        f"{shlex.quote(resolver)} {shlex.quote(qname)}"
+        f"{shlex.quote(resolver)} {shlex.quote(qname)} {timeout_seconds}"
     )
 
 
@@ -81,6 +84,7 @@ def verify_dns_transport(
     accepted: Sequence[tuple[str, str]],
     refused: Sequence[tuple[str, str]],
     blocked: Sequence[tuple[str, str]],
+    control: Ecw | None = None,
 ) -> None:
     """Require accepted/refused DNS replies and transport denial as declared."""
 
@@ -89,9 +93,16 @@ def verify_dns_transport(
     evidence = test._context.evidence.setdefault("dns_transport_checks", [])
     assert isinstance(evidence, list)
 
-    def probe(resolver: str, qname: str, expectation: str) -> int:
-        result = test.run_command(
-            _command(protocol, resolver, qname),
+    def probe(
+        resolver: str,
+        qname: str,
+        expectation: str,
+        guest: Ecw = test,
+        *,
+        timeout_seconds: int = _REPLY_TIMEOUT_SECONDS,
+    ) -> int:
+        result = guest.run_command(
+            _command(protocol, resolver, qname, timeout_seconds),
             timeout=10,
             failure_message=f"{protocol.upper()} DNS probe did not complete",
         )
@@ -101,6 +112,7 @@ def verify_dns_transport(
                 "resolver": resolver,
                 "qname": qname,
                 "expectation": expectation,
+                "timeout_seconds": timeout_seconds,
                 "exit_code": result.exit_code,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
@@ -108,31 +120,64 @@ def verify_dns_transport(
         )
         return result.exit_code
 
+    def reply(
+        resolver: str,
+        qname: str,
+        expectation: str,
+        guest: Ecw = test,
+        *,
+        timeout_seconds: int = _REPLY_TIMEOUT_SECONDS,
+    ) -> int:
+        # UDP loss may hide a real reply. Retry only transport failures, never
+        # an unexpected DNS response, and keep denial observations single-shot.
+        # A control must reply within the paired denial's bound. Preserve the
+        # positive observation's total timeout budget when its attempts shorten.
+        attempts = ceil(_REPLY_TIMEOUT_SECONDS * (3 if protocol == "udp" else 1) / timeout_seconds)
+        for _ in range(attempts):
+            code = probe(resolver, qname, expectation, guest, timeout_seconds=timeout_seconds)
+            if code != _TRANSPORT_BLOCKED:
+                return code
+        return code
+
     for resolver, qname in accepted:
         test.verify(
-            probe(resolver, qname, "accepted") == _DNS_ACCEPTED,
+            reply(resolver, qname, "accepted") == _DNS_ACCEPTED,
             f"{protocol.upper()} DNS resolver did not accept the allowed QNAME",
             failure_evidence=test.collect_guest_network_snapshot,
             dns_transport_checks=evidence,
         )
     for resolver, qname in refused:
         test.verify(
-            probe(resolver, qname, "refused") == _DNS_REFUSED,
+            reply(resolver, qname, "refused") == _DNS_REFUSED,
             f"{protocol.upper()} DNS resolver did not refuse the policy-denied QNAME",
             failure_evidence=test.collect_guest_network_snapshot,
             dns_transport_checks=evidence,
         )
-    # No settle after an accepted probe: the gateway installs the create-time
-    # policy in one atomic swap and forwards nothing before it (it holds
-    # traffic until then), and records DNS answers before replying, so there
-    # is nothing left to settle. Without an accepted probe, the settle stays.
-    if blocked and not accepted:
-        test.wait(5, reason="for the network policy to settle")
+    # The gateway holds traffic until its create-time policy is installed.
+    # Pair a bounded drop with replies from the same resolver on an unrestricted
+    # guest; repeated timeouts cannot distinguish a dead resolver from policy.
     for resolver, qname in blocked:
-        exits = [probe(resolver, qname, "blocked") for _sample in range(3)]
+        if control is None:
+            raise ValueError("blocked DNS probes require an unrestricted control")
         test.verify(
-            all(exit_code == _TRANSPORT_BLOCKED for exit_code in exits),
+            reply(
+                resolver, qname, "control accepted before", control,
+                timeout_seconds=_DENIAL_TIMEOUT_SECONDS,
+            ) == _DNS_ACCEPTED,
+            "the blocked resolver did not answer the positive control",
+            dns_transport_checks=evidence,
+        )
+        test.verify(
+            probe(resolver, qname, "blocked", timeout_seconds=_DENIAL_TIMEOUT_SECONDS) == _TRANSPORT_BLOCKED,
             f"sandbox unexpectedly reached a blocked {protocol.upper()} DNS resolver",
             failure_evidence=test.collect_guest_network_snapshot,
+            dns_transport_checks=evidence,
+        )
+        test.verify(
+            reply(
+                resolver, qname, "control accepted after", control,
+                timeout_seconds=_DENIAL_TIMEOUT_SECONDS,
+            ) == _DNS_ACCEPTED,
+            "the blocked resolver stopped answering the positive control",
             dns_transport_checks=evidence,
         )

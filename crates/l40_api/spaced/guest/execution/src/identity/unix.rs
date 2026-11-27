@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use pplx_space_common_core::types::GuestUserName;
+use pplx_space_guest_process::GuestUserName;
 use tokio::process::Command;
 use tonic::Status;
 
@@ -17,6 +17,11 @@ pub(crate) enum ResolveGuestAccountError {
 }
 
 impl ResolveGuestAccountError {
+    /// The account does not exist, as opposed to a lookup that failed.
+    pub(crate) fn is_not_found(&self) -> bool {
+        matches!(self, Self::NotFound(_))
+    }
+
     pub(crate) fn into_status(self) -> Status {
         match self {
             Self::NotFound(user) => Status::invalid_argument(format!("user not found: {user}")),
@@ -72,10 +77,21 @@ impl GuestAccount {
         command: &mut Command,
         _policy: crate::IdentityPolicy,
         cwd: &Path,
+        progress: &crate::process::SpawnProgress,
     ) -> Result<(), Status> {
         use nix::unistd::{Gid, Uid};
+        use std::os::unix::ffi::OsStrExt;
 
-        command.current_dir(cwd);
+        let cwd = std::ffi::CString::new(cwd.as_os_str().as_bytes())
+            .map_err(|_| Status::invalid_argument("working directory contains a NUL byte"))?;
+        let progress = progress.clone();
+        // In a hook rather than through Command::current_dir, so a failure
+        // is recorded as the working directory's.
+        // SAFETY: the hook only uses async-signal-safe chdir and an atomic
+        // store, on storage prepared before fork.
+        unsafe {
+            command.pre_exec(move || progress.enter_working_dir(&cwd));
+        }
 
         if Uid::effective().as_raw() == self.uid && Gid::effective().as_raw() == self.gid {
             Ok(())

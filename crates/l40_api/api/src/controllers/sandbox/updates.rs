@@ -1,9 +1,8 @@
 use super::*;
 use crate::controllers::db_contention_error;
 use crate::controllers::substrate::RuntimeRpcError;
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{ExecutionGeneration, SandboxId};
 use pplx_space_events::{SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventType};
+use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_sandbox_store::{self as sandbox_store, FieldPatch};
 use pplx_space_sbx_mgr_client::proto::access_idle_update::Operation as AccessIdleOperation;
 use pplx_space_state_reconciliation::ReconcileReason;
@@ -321,6 +320,32 @@ fn access_idle_deadline_request(
     Ok(request)
 }
 
+/// Retry admission for this elapsed-time window, even when failures are immediate.
+const ROLLBACK_NODE_DELETE_RETRY_WINDOW: Duration = Duration::from_secs(144);
+
+/// Space unconfirmed admission retries from 250 ms up to 5 s apart. The deadline
+/// bounds starting retries, not an in-flight destructive teardown: cancelling
+/// that call could leak a backing instance, especially on the Direct substrate.
+async fn rollback_node_delete<F, Fut>(mut delete: F) -> Result<(), SubstrateError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), SubstrateError>>,
+{
+    let deadline = tokio::time::Instant::now() + ROLLBACK_NODE_DELETE_RETRY_WINDOW;
+    let mut backoff = Duration::from_millis(250);
+    loop {
+        let result = delete().await;
+        if !matches!(result, Err(SubstrateError::NodeDeleteNotAdmitted { .. })) {
+            return result;
+        }
+        tokio::time::sleep_until((tokio::time::Instant::now() + backoff).min(deadline)).await;
+        if tokio::time::Instant::now() >= deadline {
+            return result;
+        }
+        backoff = (backoff * 2).min(Duration::from_secs(5));
+    }
+}
+
 impl SandboxController {
     pub async fn update(
         &self,
@@ -342,7 +367,8 @@ impl SandboxController {
             )
             .await
             .map_err(|err| {
-                // `SandboxStoreError` wraps one transparent `sqlx::Error`, so
+                // `SandboxStoreError` wraps one transparent `DbError`, which
+                // `sqlx::Error::from` turns back into the driver's error, so
                 // the classification survives the store boundary.
                 db_contention_error("failed to update sandbox metadata", &sqlx::Error::from(err))
             })?;
@@ -502,7 +528,7 @@ impl SandboxController {
         .await
         .map_err(|err| {
             let error = "failed to update sandbox network policy";
-            let mapped = db_contention_error(error, &err);
+            let mapped = db_contention_error(error, &sqlx::Error::from(err));
             // Same rule as the enqueue arm below: the transaction has written
             // nothing on a lost race and the caller retries, so a
             // `NetworkPolicyUpdateFailed` event would record a transient
@@ -605,7 +631,12 @@ impl SandboxController {
         })?;
         sandbox_store::intent::set_snapshots_enabled_desired(&mut *tx, sandbox.id, enabled)
             .await
-            .map_err(|err| db_contention_error("failed to update sandbox snapshot intent", &err))?;
+            .map_err(|err| {
+                db_contention_error(
+                    "failed to update sandbox snapshot intent",
+                    &sqlx::Error::from(err),
+                )
+            })?;
 
         let refs = [ReconcileRef::sandbox_desired_state(sandbox.id)];
         let reconcile_queued = enqueue_sandbox_reconcile_and_trigger_tx(
@@ -742,13 +773,11 @@ impl SandboxController {
                     .map_err(|error| db_contention_error("begin timeout intent", &error))?;
                 // Lock separately from the joined read: after waiting for an
                 // activation's row lock, READ COMMITTED must see its new claim.
-                let locked = sqlx::query_scalar::<_, SandboxId>(sql!(
-                    "SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"
-                ))
-                .bind(sandbox.id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|error| db_contention_error("lock timeout intent", &error))?;
+                let locked = sandbox_store::row_locks::lock_id(&mut *tx, sandbox.id)
+                    .await
+                    .map_err(|error| {
+                        db_contention_error("lock timeout intent", &sqlx::Error::from(error))
+                    })?;
                 if locked.is_none() {
                     return Err(ControllerError::not_found("sandbox no longer exists"));
                 }
@@ -1079,13 +1108,26 @@ impl SandboxController {
         // Rollback is destructive and runs through `runtime_client`, which on
         // k8s recovers a missing pod for any recoverable-live lifecycle and
         // re-pins the new pod to `target_node_id`. Gate before the substrate
-        // call so a rollback can't sneak past the drain reconciler.
-        super::lifecycle::ensure_access_path_not_blocked_by_drain(
-            pool,
-            sandbox,
-            super::lifecycle::SandboxAction::Rollback,
-        )
-        .await?;
+        // call so a rollback can't sneak past the drain reconciler. A rollback
+        // without restart leaves the sandbox stopped, which a v2 drain doesn't
+        // move, so it is also refused while the sandbox's node has a v2 drain
+        // recorded, as a stop is, from the same read; a restarting rollback's
+        // restart is refused by the sealed node itself.
+        if auto_restart {
+            super::lifecycle::ensure_access_path_not_blocked_by_drain(
+                pool,
+                sandbox,
+                super::lifecycle::SandboxAction::Rollback,
+            )
+            .await?;
+        } else {
+            super::lifecycle::ensure_stop_admitted_by_drain(
+                pool,
+                sandbox.id,
+                super::lifecycle::SandboxAction::Rollback,
+            )
+            .await?;
+        }
         // Rollback is a recovery-capable data-plane op: if the pod is gone it is
         // recreated, so charge the cluster limiter for that recreation.
         let mut client = self
@@ -1094,6 +1136,10 @@ impl SandboxController {
                 id,
                 crate::controllers::substrate::RecoveryCharge::enforce(
                     self.cluster_admission.as_ref(),
+                    crate::controllers::substrate::CapPolicy::Check,
+                    crate::controllers::substrate::ActivationAttribution::inherit(
+                        sandbox.activating_client_id.as_ref(),
+                    ),
                 ),
             )
             .await?;
@@ -1129,13 +1175,17 @@ impl SandboxController {
     }
 
     pub(super) async fn rollback_created_sandbox(&self, pool: &PgPool, sandbox_id: SandboxId) {
-        // Let the delete complete — it is NOT response-margin-critical: the
-        // binding upstream cut is the node-RPC channel timeout (which bounds the
-        // individual worker stop/delete RPCs), and the ALB idle timeout is far
-        // higher (see `ALB_IDLE_TIMEOUT_SECS`). Cancelling a slow delete would
-        // leak the backing instance (on direct, with no orphan GC, a running VM
-        // invisibly), so the unbounded delete is the safe choice.
-        if let Err(err) = self.substrate.delete_execution(sandbox_id).await {
+        // Keep teardown request-owned until admission succeeds or its retry
+        // window ends. Each in-flight call keeps its substrate-specific bounds;
+        // durable ownership after exhausted rollback is a separate obligation.
+        let teardown = self.live_teardown(sandbox_id).await;
+        let result = rollback_node_delete(|| self.substrate.delete_execution(sandbox_id)).await;
+        // Only a confirmed teardown, or an absent sandbox, uncounts it.
+        // Otherwise its pending live-cap member stays to lapse.
+        if matches!(result, Ok(()) | Err(SubstrateError::NotFound { .. })) {
+            self.forget_live_sandbox(teardown).await;
+        }
+        if let Err(err) = result {
             tracing::warn!(
                 sandbox_id = %sandbox_id,
                 error = %err,
@@ -1146,7 +1196,7 @@ impl SandboxController {
         match pool.begin().await {
             Ok(mut tx) => {
                 let result = async {
-                    delete_reconcile_state_for_elements(&mut tx, &cleanup_refs).await?;
+                    delete_reconcile_state_for_elements(&mut *tx, &cleanup_refs).await?;
                     sandbox_store::create::delete_failed_create(&mut *tx, sandbox_id).await?;
                     tx.commit().await
                 }
@@ -1206,6 +1256,8 @@ fn snapshots_response_json(
 
 #[cfg(test)]
 mod postgres_tests;
+#[cfg(test)]
+mod rollback_tests;
 #[cfg(test)]
 mod transport_tests;
 

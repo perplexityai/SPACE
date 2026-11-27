@@ -1,8 +1,13 @@
 use super::{
-    DatabaseConnectOptionsError, connect_postgres_lazy_as, connect_postgres_lazy_as_capped,
-    database_connect_options, jittered_lifetime, pool_utilization, postgres_pool_options,
+    DatabaseConnectOptionsError, DbOptions, SidelineOptions, connect_postgres_lazy_as,
+    connect_space_user_sideline_pool_lazy, database_connect_options, jittered_lifetime,
+    pool_options_with, pool_utilization, postgres_pool_options,
 };
 use pplx_space_db_identity::DatabaseIdentity;
+use pplx_space_db_test_fixtures::try_pg_test_db;
+use pplx_space_sql_locator::sql;
+use pplx_space_test_env::TestResult;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 const ADMIN_DATABASE_URL: &str =
@@ -16,6 +21,7 @@ async fn lazy_pool_does_not_require_database_at_startup() {
             "test-service",
             identity,
             "pw",
+            DbOptions::default(),
         )
         .unwrap();
 
@@ -30,6 +36,7 @@ fn lazy_pool_requires_a_password() {
         "test-service",
         DatabaseIdentity::SpaceUser,
         "",
+        DbOptions::default(),
     )
     .unwrap_err();
 
@@ -105,7 +112,7 @@ fn lifetime_jitter_spreads_retirement_around_target() {
 
 #[test]
 fn pool_retires_connections_after_release_and_keeps_a_floor() {
-    let options = postgres_pool_options();
+    let options = postgres_pool_options(DatabaseIdentity::SpaceUser);
 
     assert_eq!(options.get_max_lifetime(), None);
     assert!(options.get_min_connections() > 0);
@@ -129,6 +136,7 @@ fn pool_retires_connections_after_release_and_keeps_a_floor() {
 async fn a_capped_pool_ignores_the_service_wide_connection_env() {
     // Set pool overrides before child startup so sibling tests keep their configuration.
     let pool = {
+        let password = std::process::id().to_string();
         let mut vars: Vec<(&str, Option<&std::ffi::OsStr>)> = [
             "POSTGRES_POOL_MAX_CONNECTIONS",
             "POSTGRES_POOL_MIN_CONNECTIONS",
@@ -145,22 +153,22 @@ async fn a_capped_pool_ignores_the_service_wide_connection_env() {
                 "POSTGRES_POOL_MIN_CONNECTIONS",
                 Some(std::ffi::OsStr::new("10")),
             ),
+            (
+                crate::SPACE_DB_USER_PASSWORD_ENV,
+                Some(std::ffi::OsStr::new(&password)),
+            ),
         ]);
         if !pplx_space_test_env::enter_test_process(&vars) {
             return;
         }
 
-        connect_postgres_lazy_as_capped(
+        connect_space_user_sideline_pool_lazy(
             "postgres://space_admin:admin@127.0.0.1:1/space?sslmode=disable",
             "capped-pool-test",
-            DatabaseIdentity::SpaceUser,
-            // Matches the dummy value the sibling lazy-pool tests use. The
-            // pool is never connected (port 1, and it is lazy), so this is
-            // not a credential — spelling it "password" trips CodeQL's
-            // hard-coded-credential heuristic for no gain.
-            "pw",
-            std::num::NonZeroU32::new(3).expect("3 is non-zero"),
-            None,
+            SidelineOptions {
+                max_connections: NonZeroU32::new(3).expect("3 is non-zero"),
+                statement_timeout: None,
+            },
         )
         .expect("capped pool options must build")
     };
@@ -177,6 +185,41 @@ async fn a_capped_pool_ignores_the_service_wide_connection_env() {
     );
 }
 
+/// `POSTGRES_CREDS_POOL_MAX_CONNECTIONS` caps only the `space_creds` pool;
+/// the `space_user` pool beside it keeps `POSTGRES_POOL_MAX_CONNECTIONS`.
+#[tokio::test]
+async fn the_creds_pool_cap_applies_only_to_space_creds() {
+    if !pplx_space_test_env::enter_test_process(&[
+        (
+            "POSTGRES_POOL_MAX_CONNECTIONS",
+            Some(std::ffi::OsStr::new("50")),
+        ),
+        (
+            "POSTGRES_CREDS_POOL_MAX_CONNECTIONS",
+            Some(std::ffi::OsStr::new("4")),
+        ),
+        ("POSTGRES_POOL_MIN_CONNECTIONS", None),
+    ]) {
+        return;
+    }
+    let url = "postgres://space_admin:admin@127.0.0.1:1/space?sslmode=disable";
+    let password = std::process::id().to_string();
+    let max = |identity| {
+        connect_postgres_lazy_as(
+            url,
+            "creds-cap-test",
+            identity,
+            &password,
+            DbOptions::default(),
+        )
+        .unwrap()
+        .options()
+        .get_max_connections()
+    };
+    assert_eq!(max(DatabaseIdentity::SpaceUser), 50);
+    assert_eq!(max(DatabaseIdentity::SpaceCreds), 4);
+}
+
 /// Pins the always-on query spans: SQLx keeps the statement level only in
 /// `PgConnectOptions`' private log settings, which `Debug` exposes.
 #[tokio::test]
@@ -186,24 +229,72 @@ async fn service_pools_emit_query_events_at_info() {
     // The pool is lazy and never connects, so any non-empty password works.
     // A runtime value keeps CodeQL's hard-coded-credential check quiet.
     let password = std::process::id().to_string();
-    let pools = [
-        connect_postgres_lazy_as(url, "query-span-test", identity, &password).unwrap(),
-        connect_postgres_lazy_as_capped(
-            url,
-            "query-span-test",
-            identity,
-            &password,
-            std::num::NonZeroU32::new(1).expect("1 is non-zero"),
-            None,
-        )
-        .unwrap(),
-    ];
+    let pool = connect_postgres_lazy_as(
+        url,
+        "query-span-test",
+        identity,
+        &password,
+        DbOptions::default(),
+    )
+    .unwrap();
 
-    for pool in pools {
-        let options = format!("{:?}", pool.connect_options());
-        assert!(
-            options.contains("statements_level: Info"),
-            "service pools must emit sqlx::query events at INFO: {options}"
+    let options = format!("{:?}", pool.connect_options());
+    assert!(
+        options.contains("statements_level: Info"),
+        "service pools must emit sqlx::query events at INFO: {options}"
+    );
+}
+
+/// `DbOptions::statement_timeout` holds on every connection the pool opens,
+/// not only the first, and a pool without it keeps the role's setting.
+///
+/// Built from the crate's pool options over the test database's own login:
+/// the managed identities are not roles in the test cluster. The role's value
+/// is a role-in-database setting, so it dies with the test database.
+#[tokio::test]
+async fn statement_timeout_applies_to_every_connection_of_its_pool() -> TestResult {
+    let Some(test_db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let database_name = sqlx::query_scalar::<_, String>(sql!("SELECT current_database()"))
+        .fetch_one(&test_db.pool)
+        .await?;
+    let role_setting = format!(
+        "ALTER ROLE CURRENT_USER IN DATABASE \"{database_name}\" SET statement_timeout = '7s'"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(role_setting.as_str()))
+        .execute(&test_db.pool)
+        .await?;
+
+    let two = NonZeroU32::new(2).expect("2 is non-zero");
+    for (statement_timeout, expected) in
+        [(Some(Duration::from_millis(1500)), "1500ms"), (None, "7s")]
+    {
+        let options = DbOptions {
+            max_connections: Some(two),
+            statement_timeout,
+        };
+        let pool = pool_options_with(DatabaseIdentity::SpaceUser, options)
+            .connect_lazy(&test_db.database_url)?;
+        // Held together, so they are two connections rather than one reused.
+        let mut first = pool.acquire().await?;
+        let mut second = pool.acquire().await?;
+        let mut pids = Vec::new();
+        for conn in [&mut first, &mut second] {
+            let (pid, setting) = sqlx::query_as::<_, (i32, String)>(sql!(
+                "SELECT pg_backend_pid(), current_setting('statement_timeout')"
+            ))
+            .fetch_one(&mut **conn)
+            .await?;
+            assert_eq!(setting, expected, "{statement_timeout:?}");
+            pids.push(pid);
+        }
+        assert_ne!(
+            pids[0], pids[1],
+            "the two checks must run on separate connections"
         );
+        drop((first, second));
+        pool.close().await;
     }
+    Ok(())
 }

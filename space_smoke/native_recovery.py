@@ -8,6 +8,8 @@ The invalid-create probe may shorten three operation/readiness budgets under a
 separate exact-restore guard. Images and database sizing stay unchanged.
 The existing cluster-visible controller mutation Lease serializes cooperating
 smokes; the operator must dedicate the acknowledged cluster to this suite.
+Reading the data plane's standing Native upload admission changes nothing, so
+it needs neither the Lease nor the autoscaler pins.
 """
 
 from __future__ import annotations
@@ -30,8 +32,7 @@ from space_smoke.adapters import (
     LEADER_ELECTION_FALSE_VALUES as FALSE_VALUES,
     KindConfig,
     KindHarness,
-    NATIVE_OPERATION_AGE_ENV as M1_AGE_ENV,
-    NATIVE_OPERATION_READY_ENVS as READINESS_BUDGET_ENVS,
+    _env_literals,
 )
 from space_smoke.runtime import ScenarioContext, SmokeConfigurationError, SubprocessExecutor
 
@@ -55,6 +56,25 @@ RECOVERY_ENVIRONMENT = (
 # replacements alone (`begin_restart`, `await_replacements`) and then for the
 # old pods' exit once its stream ends (`await_exit`).
 ROLLOUT_TIMEOUT = 90.0
+DATA_PLANE = "space-data-plane"
+# The data plane's Native upload admission (NativeUploadAdmissionArgs,
+# crates/l40_api/data/plane/server/src/native_files/admission.rs), by the env
+# name its binary's help shows beside each setting's default.
+UPLOAD_ADMISSION_ENVS = {
+    "enabled": "SPACE_DATA_PLANE_NATIVE_UPLOAD_ADMISSION",
+    "slots_per_replica": "SPACE_DATA_PLANE_MAX_CONCURRENT_NATIVE_UPLOADS",
+    "slots_per_org": "SPACE_DATA_PLANE_MAX_CONCURRENT_NATIVE_UPLOADS_PER_ORG",
+    "slots_per_sandbox": "SPACE_DATA_PLANE_MAX_CONCURRENT_NATIVE_UPLOADS_PER_SANDBOX",
+    "bytes_per_replica": "SPACE_DATA_PLANE_MAX_IN_FLIGHT_NATIVE_UPLOAD_BYTES",
+    "bytes_per_org": "SPACE_DATA_PLANE_MAX_IN_FLIGHT_NATIVE_UPLOAD_BYTES_PER_ORG",
+    "bytes_per_sandbox": "SPACE_DATA_PLANE_MAX_IN_FLIGHT_NATIVE_UPLOAD_BYTES_PER_SANDBOX",
+    "wait_ms": "SPACE_DATA_PLANE_NATIVE_UPLOAD_ADMISSION_WAIT_MS",
+}
+# clap's BoolishValueParser.
+BOOLISH = {
+    **dict.fromkeys(("y", "yes", "t", "true", "on", "1"), True),
+    **dict.fromkeys(("n", "no", "f", "false", "off", "0"), False),
+}
 
 
 @dataclass(frozen=True)
@@ -73,6 +93,32 @@ class AutoscalerCapture:
     max_replicas: int
     # Both bounds while the faults run.
     pinned_replicas: int
+
+
+@dataclass(frozen=True)
+class UploadAdmission:
+    """The Native upload admission the data plane's pods run: each setting
+    is its env value in the pod, or the running binary's default."""
+
+    enabled: bool
+    slots_per_replica: int
+    slots_per_org: int
+    slots_per_sandbox: int
+    bytes_per_replica: int
+    bytes_per_org: int
+    bytes_per_sandbox: int
+    wait_ms: int
+
+
+@dataclass(frozen=True)
+class DataPlaneShape:
+    """The data plane as a read-only scenario found it, to check it is the same after."""
+
+    uid: str
+    template_digest: str
+    # Its autoscaler's maxReplicas, or its replica count when nothing scales it.
+    max_replicas: int
+    pods: frozenset[str]
 
 
 def _digest(spec: Mapping[str, object]) -> str:
@@ -95,6 +141,24 @@ class KindNativeHardeningFixture(NativeHardeningFixture):
             api_url=self.config.api_url,
             data_plane_url=self.config.data_plane_url,
         )
+
+
+def _help_flag_for_env(help_text: str, env: str) -> str | None:
+    """The long flag whose clap help entry names `env` (`[env: <env>=...]`), if any.
+
+    An entry starts at its flag line and runs to the next one, and its env
+    marker comes after the flag, so the last flag seen before the marker is
+    the entry's.
+    """
+
+    flag = None
+    for line in help_text.splitlines():
+        match = re.match(r"\s*(?:-\w, )?(--[a-z0-9][a-z0-9-]*)", line)
+        if match:
+            flag = match.group(1)
+        if f"[env: {env}=" in line:
+            return flag
+    return None
 
 
 class NativeRecoveryControl:
@@ -341,7 +405,6 @@ class NativeRecoveryControl:
         self._fence()
         patch = {
             "space-cluster-controller": self.harness.set_native_operation_probe_budgets,
-            "space-data-plane": self.harness.set_native_file_upload_admission_env,
         }[name]
         patch(expected, desired, expected_uid=self._captures[name].uid, remove=remove)
         self._wait(name, self._captures[name].replicas)
@@ -418,35 +481,194 @@ class NativeRecoveryControl:
                     raise
                 primary.add_note(f"Restoring {label} also failed: {error}")
 
-    @contextmanager
-    def operation_age_limit(self, *, seconds: int = 5, readiness_seconds: int | None = None) -> Iterator[None]:
-        """Shorten only probe deadlines and restore their exact deployment entries."""
-        if not 1 <= seconds <= 30 or readiness_seconds is not None and not 1 <= readiness_seconds <= 30:
-            raise ValueError("probe operation budgets must be between 1 and 30 seconds")
-        values = {M1_AGE_ENV: str(seconds)}
-        if readiness_seconds is not None:
-            values.update({key: str(readiness_seconds) for key in READINESS_BUDGET_ENVS})
-        with self._scoped_env("space-cluster-controller", values, "native_probe_budgets"):
-            yield
+    def _data_plane_shape(self) -> tuple[dict, list[dict], DataPlaneShape]:
+        """The data plane's Deployment, its pods and its shape, once it is
+        settled at a replica count its bound covers.
 
-    @contextmanager
-    def one_upload_per_sandbox(self) -> Iterator[None]:
-        """Turn the data plane's Native upload admission on at one write per
-        sandbox with no wait, and put back its exact entries after."""
-        with self._scoped_env(
-            "space-data-plane",
-            {
-                "SPACE_DATA_PLANE_NATIVE_UPLOAD_ADMISSION": "true",
-                "SPACE_DATA_PLANE_MAX_CONCURRENT_NATIVE_UPLOADS_PER_SANDBOX": "1",
-                "SPACE_DATA_PLANE_NATIVE_UPLOAD_ADMISSION_WAIT_MS": "0",
-            },
-            "native_upload_admission",
+        Its autoscaler is not pinned, so a scale-up or scale-down an earlier
+        scenario set off can still be finishing: wait it out, for as long as a
+        rollout may take, rather than refuse at once."""
+        deadline = time.monotonic() + ROLLOUT_TIMEOUT
+        while True:
+            self._identity()
+            deployment = self._deployment(DATA_PLANE)
+            spec, status = deployment["spec"], deployment.get("status", {})
+            labels = spec["selector"].get("matchLabels", {})
+            if spec["selector"].get("matchExpressions") or not labels:
+                raise SmokeConfigurationError(f"{DATA_PLANE} requires a simple selector")
+            selector = ",".join(f"{key}={value}" for key, value in sorted(labels.items()))
+            pods = self._json("get", "pods", "-l", selector, "-o", "json").get("items", [])
+            autoscalers = [
+                item for item in self._json("get", "hpa", "-o", "json").get("items", [])
+                if item.get("spec", {}).get("scaleTargetRef", {}).get("kind") == "Deployment"
+                and item["spec"]["scaleTargetRef"].get("name") == DATA_PLANE
+            ]
+            if len(autoscalers) > 1:
+                raise SmokeConfigurationError(f"more than one autoscaler targets {DATA_PLANE}")
+            replicas = int(spec.get("replicas", 1))
+            bound = int(autoscalers[0]["spec"]["maxReplicas"]) if autoscalers else replicas
+            settled = (
+                status.get("observedGeneration", 0) >= deployment["metadata"]["generation"]
+                and status.get("updatedReplicas", 0) == status.get("readyReplicas", 0) == replicas == len(pods)
+                and all(_pod_ready(pod) and not pod["metadata"].get("deletionTimestamp") for pod in pods)
+            )
+            if settled and 1 <= replicas <= bound:
+                break
+            if time.monotonic() >= deadline:
+                raise SmokeConfigurationError(
+                    f"{DATA_PLANE} is not settled at a replica count within its bound of {bound}"
+                )
+            time.sleep(0.5)
+        shape = DataPlaneShape(
+            deployment["metadata"]["uid"],
+            hashlib.sha256(json.dumps(spec["template"], sort_keys=True).encode()).hexdigest(),
+            bound,
+            frozenset(pod["metadata"]["uid"] for pod in pods),
+        )
+        return deployment, pods, shape
+
+    def standing_upload_admission(self) -> tuple[UploadAdmission, DataPlaneShape]:
+        """The data plane's Native upload admission, read without changing it.
+
+        Read from the running binary's own help inside a data-plane pod: run
+        with the container's env, it prints each setting's env value beside
+        the binary's default, so an env override from any source and a
+        changed default are both read as the pods run them. A literal the
+        Deployment sets must match what the pod sees. A command-line flag
+        would override the env and the help can't show it, so a container
+        that passes any of these settings' flags is refused.
+        """
+        deployment, pods, shape = self._data_plane_shape()
+        containers = deployment["spec"]["template"]["spec"]["containers"]
+        if len(containers) != 1 or not containers[0].get("command"):
+            raise SmokeConfigurationError(f"{DATA_PLANE} admission read requires one container with a command")
+        container = containers[0]
+        literals = _env_literals(
+            container.get("env", []), tuple(UPLOAD_ADMISSION_ENVS.values()), owner=DATA_PLANE,
+            value_from_refusal="; its upload admission is read from literals",
+        )
+        images = {
+            status.get("imageID")
+            for pod in pods for status in pod.get("status", {}).get("containerStatuses", [])
+            if status.get("name") == container["name"]
+        }
+        if len(images) != 1 or None in images:
+            raise SmokeConfigurationError(f"{DATA_PLANE} pods do not all run one image")
+        result = self.harness.kubectl(
+            "exec", pods[0]["metadata"]["name"], "-c", container["name"],
+            "--", container["command"][0], "--help", timeout=30,
+        )
+        if result.returncode:
+            # The help prints env values; keep only the action.
+            raise SmokeConfigurationError(f"could not read the {DATA_PLANE} binary's help")
+        argv = [*container["command"][1:], *container.get("args", [])]
+        # Kubernetes expands `$(NAME)` in the command and args from the env,
+        # so such an arg could pass a flag the literal check can't see.
+        if any("$(" in arg for arg in argv):
+            raise SmokeConfigurationError(
+                f"the {DATA_PLANE} container expands env references in its command or args; "
+                "its upload admission flags cannot be read"
+            )
+        # `envFrom` resolves per pod at its start, and the help is read in one
+        # pod: a source that changed between two starts would give the pods
+        # different admission behind one template.
+        if container.get("envFrom") and any(value is None for value in literals.values()):
+            raise SmokeConfigurationError(
+                f"the {DATA_PLANE} container takes env from `envFrom`; its upload admission is read from literals"
+            )
+        values: dict[str, bool | int] = {}
+        for field, env in UPLOAD_ADMISSION_ENVS.items():
+            flag = _help_flag_for_env(result.stdout, env)
+            if flag is None:
+                raise SmokeConfigurationError(f"the {DATA_PLANE} binary's help names no flag for {env}")
+            if any(arg == flag or arg.startswith(f"{flag}=") for arg in argv):
+                raise SmokeConfigurationError(
+                    f"the {DATA_PLANE} container passes {flag}, which overrides {env}; "
+                    "its upload admission is read from the env and the defaults"
+                )
+            found = re.findall(rf"\[env: {env}=([^\]]*)\]\s*\[default: ([^\]]+)\]", result.stdout)
+            if len(found) != 1:
+                raise SmokeConfigurationError(f"the {DATA_PLANE} binary's help shows no {env} default")
+            seen, default = found[0]
+            if literals[env] is not None and literals[env] != seen:
+                raise SmokeConfigurationError(f"a {DATA_PLANE} pod does not run its Deployment's {env}")
+            raw = (seen or default).strip()
+            if field == "enabled":
+                if raw.lower() not in BOOLISH:
+                    raise SmokeConfigurationError(f"{env} is not a boolean")
+                values[field] = BOOLISH[raw.lower()]
+            elif raw.isdigit():
+                values[field] = int(raw)
+            else:
+                raise SmokeConfigurationError(f"{env} is not a whole number")
+        return UploadAdmission(**values), shape
+
+    def require_same_data_plane(self, before: DataPlaneShape) -> None:
+        """Refuse a data plane that was replaced, reconfigured, rebounded or
+        ran more pods than its bound since `before` was read.
+
+        Read while the scenario still holds its writes open, so a pod that
+        stopped taking new ones but still serves held ones is still counted.
+        """
+        self._identity()
+        deployment = self._deployment(DATA_PLANE)
+        selector = ",".join(
+            f"{key}={value}" for key, value in sorted(deployment["spec"]["selector"].get("matchLabels", {}).items())
+        )
+        pods = {
+            pod["metadata"]["uid"]
+            for pod in self._json("get", "pods", "-l", selector, "-o", "json").get("items", [])
+        }
+        autoscalers = [
+            int(item["spec"]["maxReplicas"])
+            for item in self._json("get", "hpa", "-o", "json").get("items", [])
+            if item.get("spec", {}).get("scaleTargetRef", {}).get("kind") == "Deployment"
+            and item["spec"]["scaleTargetRef"].get("name") == DATA_PLANE
+        ]
+        template = hashlib.sha256(json.dumps(deployment["spec"]["template"], sort_keys=True).encode()).hexdigest()
+        if (
+            deployment["metadata"]["uid"] != before.uid
+            or template != before.template_digest
+            or (autoscalers or [int(deployment["spec"].get("replicas", 1))]) != [before.max_replicas]
+            or len(before.pods | pods) > before.max_replicas
         ):
-            yield
+            raise SmokeConfigurationError(f"{DATA_PLANE} changed while the scenario relied on its shape")
 
-    def data_plane_replicas(self) -> int:
-        """The data plane's replica count, pinned while the faults run."""
-        return self._captures["space-data-plane"].replicas
+    def release_inline_hold(self, path: str) -> None:
+        """Release only this run's test hold on the captured API Deployment."""
+        import re
+
+        if not re.fullmatch(r"/tmp/space-inline-[0-9a-f]{32}", path):
+            raise ValueError("invalid inline hold release path")
+        self._identity()
+        action = "release the API inline test hold"
+        ownership = self.harness._held_public_api_lease(action)
+        self.harness._assert_lease_owned(ownership, action, timeout=15)
+        pods = [
+            pod for pod in self._pods("space-api")
+            if not pod["metadata"].get("deletionTimestamp")
+        ]
+        if len(pods) != self._captures["space-api"].replicas:
+            raise SmokeConfigurationError("cannot release inline holds while API replicas are changing")
+        for pod in pods:
+            self.harness._assert_lease_owned(ownership, action, timeout=15)
+            containers = pod["spec"]["containers"]
+            matches = [
+                container for container in containers
+                if any(
+                    env.get("name") == "SPACE_NATIVE_INLINE_TEST_RELEASE_FILE"
+                    and env.get("value") == path
+                    for env in container.get("env", [])
+                )
+            ]
+            if len(matches) != 1:
+                raise SmokeConfigurationError("API pod does not carry this run's inline hold")
+            result = self.harness.kubectl(
+                "exec", pod["metadata"]["name"], "-c", matches[0]["name"],
+                "--", "touch", "--", path, timeout=15,
+            )
+            if result.returncode:
+                raise SmokeConfigurationError("could not release the API inline test hold")
 
     def restart(self, name: str) -> None:
         before = self.begin_restart(name)

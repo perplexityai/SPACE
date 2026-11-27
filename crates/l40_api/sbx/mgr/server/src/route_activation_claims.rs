@@ -24,7 +24,7 @@ const EXECUTION_CURRENCY_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// unanswered question permits.
 pub(crate) async fn execution_currency_on_cluster(
     sandbox_id: &str,
-    generation: pplx_space_common_core::types::ExecutionGeneration,
+    generation: pplx_space_sandbox_model::ExecutionGeneration,
 ) -> pplx_space_node_api_client::proto::ExecutionCurrency {
     use pplx_space_node_api_client::proto::{ExecutionCurrency, GetExecutionCurrencyRequest};
     let ask = async {

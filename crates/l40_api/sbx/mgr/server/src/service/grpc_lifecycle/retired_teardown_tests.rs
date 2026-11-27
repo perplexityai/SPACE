@@ -5,12 +5,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExecutionGeneration, JobId, LocalArtifactId, SandboxId,
-};
+use pplx_space_accounts::JobId;
+use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_sbx_mgr_client::proto::{
     SuspendSnapshotFormat, TeardownSuspendAction, TeardownSuspendOutcome,
 };
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 
 use super::{OrgSnapshotConfigResolution, TeardownSuspendBackup};
 use crate::service::SandboxManagerService;

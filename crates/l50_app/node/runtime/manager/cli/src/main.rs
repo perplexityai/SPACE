@@ -4,10 +4,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::fmt::Write as _;
 
 use comfy_table::{Table, presets::NOTHING};
-use pplx_space_common_core::types::{
-    ArtifactComponentKind as ComponentKind, ArtifactVersion, Digest, JobId, RuntimeKind as Runtime,
-    RuntimeVersion,
-};
+use pplx_space_accounts::JobId;
+use pplx_space_content_digest::Digest;
+use pplx_space_execution_spec::{ArtifactComponentKind as ComponentKind, RuntimeKind as Runtime};
+use pplx_space_execution_spec::{ArtifactVersion, RuntimeVersion};
 use pplx_space_node_runtime_manager_client::execution::{ArtifactComponentKind, RuntimeKind};
 use pplx_space_node_runtime_manager_client::labels::label;
 use pplx_space_node_runtime_manager_client::proto::{self, *};
@@ -244,7 +244,7 @@ fn parse_release(value: &str) -> Result<ReleaseArg, String> {
             "'{value}' names no release; expected <runtime>-<version>, such as fc-1.16.2 or cloud-hypervisor-54.0"
         )
     })?;
-    let version = RuntimeVersion::parse(version.strip_prefix('v').unwrap_or(&version))
+    let version = RuntimeVersion::parse(version.trim_prefix('v'))
         .map_err(|error| format!("'{value}' names no release: {error}"))?;
     Ok(ReleaseArg {
         kind: runtime.kind,

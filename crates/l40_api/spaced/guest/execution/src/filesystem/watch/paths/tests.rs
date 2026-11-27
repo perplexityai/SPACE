@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::RelativeGlobPattern;
+use pplx_space_guest_process::RelativeGlobPattern;
 
 use super::super::filter::{WatchFilter, WatchFilterConfig};
 use super::*;

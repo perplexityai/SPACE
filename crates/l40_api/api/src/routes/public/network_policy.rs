@@ -6,9 +6,7 @@
 //! write contract.
 
 use crate::routes::public::error::database_error;
-use pplx_space_common_core::types::OrgId;
-
-use pplx_space_common_core::sql;
+use pplx_space_accounts::OrgId;
 
 use axum::{
     Extension, Json,
@@ -75,7 +73,7 @@ mod document {
                 // Do not read it as replacing that log.
                 tracing::debug!(
                     %error,
-                    sandbox_id = %pplx_space_common_core::types::SandboxId::from(sandbox_id),
+                    sandbox_id = %pplx_space_sandbox_model::SandboxId::from(sandbox_id),
                     "failed to load sandbox for network policy"
                 );
                 database_error(error)
@@ -150,14 +148,13 @@ async fn ensure_sandbox_owner(
     org_id: OrgId,
     sandbox_id: PublicSandboxId,
 ) -> Result<(), PublicApiError> {
-    let found = sqlx::query_scalar::<_, bool>(sql!(
-        "SELECT EXISTS(SELECT 1 FROM sandboxes WHERE id = $1 AND org_id = $2)"
-    ))
-    .bind(sandbox_id.as_uuid())
-    .bind(org_id)
-    .fetch_one(pool)
+    let found = pplx_space_sandbox_store::row_reads::org_owns(
+        pool,
+        pplx_space_sandbox_model::SandboxId::from(sandbox_id),
+        org_id,
+    )
     .await
-    .map_err(database_error)?;
+    .map_err(|error| database_error(sqlx::Error::from(error)))?;
     if !found {
         return Err(PublicApiError::not_found("sandbox not found"));
     }

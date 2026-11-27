@@ -110,6 +110,18 @@ impl TemplateManager for TemplateManagerService {
         })
         .await
     }
+
+    async fn get_capabilities(
+        &self,
+        request: Request<crate::proto::GetCapabilitiesRequest>,
+    ) -> Result<Response<crate::proto::GetCapabilitiesResponse>, Status> {
+        self.authorize_peer(&request, "GetCapabilities", ALLOW_TEMPLATE_OBSERVER)?;
+        Ok(Response::new(crate::proto::GetCapabilitiesResponse {
+            // `probe_release_partition` (`volume.rs`) reads a twin's own
+            // metadata.json and binds the shared manifest to it.
+            reads_twin_metadata: true,
+        }))
+    }
 }
 
 /// Run an RPC that holds a template build's claim as its own task, so a

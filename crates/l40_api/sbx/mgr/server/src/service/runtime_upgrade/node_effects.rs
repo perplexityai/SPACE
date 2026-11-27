@@ -5,16 +5,16 @@
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-use pplx_space_common_core::types::{
-    EnvironmentReference, ExecutionMetadata, LocalArtifactId, SandboxActivationAttemptId,
-};
+use pplx_space_execution_spec::{EnvironmentReference, ExecutionMetadata};
 use pplx_space_node_mgr_client::proto::{
     CreateBtrfsSnapshotRequest, DeleteBtrfsSnapshotRequest, RestoreInstanceSnapshotRequest,
 };
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
+use pplx_space_snapshot_model::LocalArtifactId;
 use tonic::metadata::MetadataMap;
 use tonic::{Extensions, Request, Status};
 
-use super::{LocalDisk, RuntimeUpgradeEffects};
+use super::{LocalDisk, Refusal, RuntimeUpgradeEffects};
 use crate::db::{RuntimeUpgradeOperationId, RuntimeUpgradeRecord, SandboxRow};
 use crate::local_artifacts::CheckoutError;
 use crate::proto::{StartRequest, StartResponse};
@@ -24,7 +24,9 @@ use crate::service::suspend_snapshot_publication::{
     canonical_suspend_snapshot_dir, garbage_suspend_snapshot_dir,
     suspend_snapshot_staging_parent_dir,
 };
-use crate::service::tail_support::{checkpoint_execution_metadata, sandbox_execution_metadata_in};
+use crate::service::tail_support::{
+    RuntimeArtifactReadError, checkpoint_execution_metadata, sandbox_execution_metadata_in,
+};
 use crate::state::SandboxState;
 
 /// How long retirement waits for a restore, export or publication holding the
@@ -111,18 +113,54 @@ fn directory_identity(path: &Path) -> std::io::Result<Option<String>> {
     }
 }
 
-fn required_file(path: &Path, what: &str) -> Result<(), Status> {
+/// An absent file is final for the attempt: nothing a retry does brings it
+/// back. One that can't be checked may be readable on a retry.
+fn required_file(path: &Path, what: &str) -> Result<(), Refusal> {
     match path.try_exists() {
         Ok(true) => Ok(()),
-        Ok(false) => Err(Status::failed_precondition(format!(
+        Ok(false) => Err(Refusal::Final(Status::failed_precondition(format!(
             "a runtime upgrade needs the sandbox's local {what}; {} is absent",
             path.display()
-        ))),
-        Err(error) => Err(Status::failed_precondition(format!(
+        )))),
+        Err(error) => Err(Refusal::Retry(Status::failed_precondition(format!(
             "inspect {}: {error}",
             path.display()
-        ))),
+        )))),
     }
+}
+
+/// Runtime metadata that can't be read may be readable on a retry; metadata
+/// that reads but doesn't parse or validate answers every retry the same way.
+pub(super) fn artifact_read_refusal(error: RuntimeArtifactReadError) -> Refusal {
+    let status = Status::failed_precondition(error.to_string());
+    match error {
+        RuntimeArtifactReadError::Read { .. } => Refusal::Retry(status),
+        _ => Refusal::Final(status),
+    }
+}
+
+/// An unencrypted disk is its `rootfs.ext4`, which must be one node-manager's
+/// rollback of the preserved copy restores: a non-empty regular file with one
+/// link, found without following a final symlink
+/// (`sandbox_storage::restorable_disk`). Only an absent file is final for
+/// the attempt, as [`required_file`] says; any other shape is retryable.
+pub(super) fn require_plaintext_rootfs(rootfs: &Path) -> Result<(), Refusal> {
+    use pplx_space_sandbox_model::sandbox_storage::{DiskFile, DiskForm, restorable_disk};
+    let found = crate::rootfs_encryption::disk_file(rootfs).map_err(|error| {
+        Refusal::Retry(Status::failed_precondition(format!(
+            "inspect {}: {error}",
+            rootfs.display()
+        )))
+    })?;
+    if found == DiskFile::Absent {
+        return required_file(rootfs, "rootfs");
+    }
+    restorable_disk(DiskForm::Rootfs, found, DiskFile::Absent).map_err(|incomplete| {
+        Refusal::Retry(Status::failed_precondition(format!(
+            "a runtime upgrade needs a local disk it can roll back; {incomplete} at {}",
+            rootfs.display()
+        )))
+    })
 }
 
 /// The superseded checkpoint can't be told apart from bytes another catalog
@@ -195,7 +233,28 @@ impl NodeRuntimeUpgradeEffects {
 
 #[tonic::async_trait]
 impl RuntimeUpgradeEffects for NodeRuntimeUpgradeEffects {
-    async fn inspect_local_disk(&self, sandbox: &SandboxRow) -> Result<LocalDisk, Status> {
+    async fn complete_staged_disk(&self, sandbox: &SandboxRow) -> Result<(), Refusal> {
+        self.service.complete_staged_upgrade_disk(sandbox).await
+    }
+
+    async fn checkpoint_execution(
+        &self,
+        sandbox: &SandboxRow,
+    ) -> Result<ExecutionMetadata, Refusal> {
+        let checkpoint =
+            canonical_suspend_snapshot_dir(&self.service.cache_root().join(&sandbox.id));
+        Ok(checkpoint_execution_metadata(&checkpoint.to_string_lossy())
+            .map_err(artifact_read_refusal)?
+            .into_execution())
+    }
+
+    async fn require_pinned_checkpoint(&self, sandbox: &SandboxRow) -> Result<(), Status> {
+        let checkpoint =
+            canonical_suspend_snapshot_dir(&self.service.cache_root().join(&sandbox.id));
+        super::staged_disk::require_pinned_checkpoint_identity(sandbox, &checkpoint).map(drop)
+    }
+
+    async fn inspect_local_disk(&self, sandbox: &SandboxRow) -> Result<LocalDisk, Refusal> {
         let cache_root = self.service.cache_root();
         crate::service::create_support::repair_retained_instance_traversal(
             &self.service.node_manager,
@@ -206,24 +265,88 @@ impl RuntimeUpgradeEffects for NodeRuntimeUpgradeEffects {
         let sandbox_dir = cache_root.join(&sandbox.id);
         let instance = sandbox_dir.join("instance");
         let rootfs = instance.join("rootfs.ext4");
-        required_file(&rootfs, "rootfs")?;
         if sandbox.volume_encryption {
-            // Without the COW the encrypted cold start has nothing to reopen.
-            required_file(&instance.join("cow.luks"), "encrypted rootfs COW")?;
+            // The guest's writes are all in the COW, which the cold start
+            // reopens. The rootfs is the read-only origin under it, which the
+            // cold start clones from the template when absent, as a restore
+            // staged on another node does
+            // (`template_source_for_sandbox_prepare_in`), so only the
+            // template's digest names it then. And the disk must be one
+            // node-manager's rollback of the preserved copy restores, which
+            // the same rule requires.
+            let cow = instance.join(crate::rootfs_encryption::ROOTFS_COW_FILE);
+            let file = |path: &Path| {
+                crate::rootfs_encryption::disk_file(path).map_err(|error| {
+                    Status::failed_precondition(format!("inspect {}: {error}", path.display()))
+                })
+            };
+            let origin_named = sandbox.template_hash.as_deref().is_some_and(|digest| {
+                digest
+                    .parse::<pplx_space_content_digest::ContentHash>()
+                    .is_ok()
+            });
+            let rootfs_file = file(&rootfs)?;
+            pplx_space_sandbox_model::sandbox_storage::bootable_encrypted_disk(
+                rootfs_file,
+                file(&cow)?,
+                origin_named,
+            )
+            .map_err(|incomplete| {
+                Status::failed_precondition(format!(
+                    "a runtime upgrade needs a local encrypted disk it can boot and roll back; in \
+                     {}, {incomplete}",
+                    instance.display()
+                ))
+            })?;
+            // A copy without the rootfs is one only a node-manager that
+            // advertises it restores, asked per call because a node-manager
+            // replaced since may be older, whoever asked for the upgrade.
+            // With the switch off it's refused before that, as it was before
+            // the switch existed, so a copy an earlier upgrade finished
+            // starts no new one once the switch is off ahead of a
+            // node-manager downgrade.
+            if rootfs_file == pplx_space_sandbox_model::sandbox_storage::DiskFile::Absent {
+                // Both refusals clear once the switch is on or node-manager
+                // is rolled out, so neither is final for the attempt.
+                if !self.service.staged_checkpoint_disk {
+                    return Err(Refusal::Retry(Status::failed_precondition(format!(
+                        "sandbox {}'s encrypted disk has no rootfs.ext4, which a runtime upgrade \
+                         admits only with {} on",
+                        sandbox.id,
+                        crate::service::STAGED_CHECKPOINT_DISK_ENV
+                    ))));
+                }
+                let mut client = self.service.node_manager.connect().await.map_err(|error| {
+                    Status::unavailable(format!("connect to node-manager: {error}"))
+                })?;
+                if !super::staged_disk::supports_staged_checkpoint_disk(&mut client).await? {
+                    return Err(Refusal::Retry(Status::failed_precondition(format!(
+                        "sandbox {}'s encrypted disk has no rootfs.ext4, and this node-manager \
+                         can't restore such a copy if the upgrade's boot fails; roll \
+                         node-manager out first",
+                        sandbox.id
+                    ))));
+                }
+            }
+        } else {
+            require_plaintext_rootfs(&rootfs)?;
         }
         let execution = sandbox_execution_metadata_in(cache_root, &sandbox.id)
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            .map_err(artifact_read_refusal)?;
         // A stopped sandbox can keep the checkpoint of a suspend before its
         // stop, which a warm start would load over the disk the boot writes,
         // so its identity is recorded for retirement too.
         let checkpoint = canonical_suspend_snapshot_dir(&sandbox_dir);
         let checkpoint_dir_identity = directory_identity(&checkpoint).map_err(|error| {
-            Status::failed_precondition(format!("inspect {}: {error}", checkpoint.display()))
+            Refusal::Retry(Status::failed_precondition(format!(
+                "inspect {}: {error}",
+                checkpoint.display()
+            )))
         })?;
         let checkpoint_execution = if sandbox.state.is_unowned(SandboxState::Suspended) {
             Some(
                 checkpoint_execution_metadata(&checkpoint.to_string_lossy())
-                    .map_err(|error| Status::failed_precondition(error.to_string()))?
+                    .map_err(artifact_read_refusal)?
                     .into_execution(),
             )
         } else {

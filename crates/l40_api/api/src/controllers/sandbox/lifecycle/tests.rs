@@ -1,5 +1,6 @@
-use pplx_space_common_core::types::OrgId;
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_accounts::OrgId;
+use pplx_space_sandbox_model::SandboxId;
 
 use pplx_space_sandbox_store::delete::delete_with_dependents;
 
@@ -17,6 +18,12 @@ fn cluster_delete_miss_reason_classifies_by_substrate_error() {
     assert_eq!(
         cluster_delete_miss_reason(&SubstrateError::Unavailable {
             message: "sandbox is not assigned to an active worker node".into(),
+        }),
+        "node_unavailable",
+    );
+    assert_eq!(
+        cluster_delete_miss_reason(&SubstrateError::Unschedulable {
+            message: "sandbox pod is unschedulable: 0/3 nodes are available".into(),
         }),
         "node_unavailable",
     );
@@ -140,63 +147,68 @@ fn requested_size_kind_classifies_by_action_and_entry_lifecycle() {
 }
 
 /// Admission refusals at request entry and those the substrate charges later
-/// share one constructor, which marks them as admission refusals. Only a
-/// rate-limited refusal carries the backpressure cause the async dispatcher
-/// re-queues behind; an empty cluster keeps its bounded retry.
+/// share one constructor, [`ActivationRejectionKind::controller_error`], which
+/// marks them as admission refusals. Only a rate-limited refusal carries the
+/// backpressure cause the async dispatcher re-queues behind; an empty cluster,
+/// a cluster with no free slot and a client at its live cap keep their
+/// bounded retry, and only the slot refusal is a 503.
 #[test]
 fn admission_refusals_keep_their_dispatcher_retry_causes() {
-    use crate::cluster_admission::ClusterAdmissionError;
+    use crate::controllers::substrate::ActivationRejectionKind;
+    use axum::http::StatusCode;
 
-    let cases = [
+    let kinds = [
         (
-            "request entry, rate limited",
-            cluster_admission_controller_error(ClusterAdmissionError::RateLimited {
-                message: "activation budget exhausted".into(),
-                retry_after: Duration::from_secs(1),
-            }),
-            Some(Duration::from_secs(1)),
+            ActivationRejectionKind::RateLimited,
+            StatusCode::TOO_MANY_REQUESTS,
             Some(ControllerRetryAfterCause::ClusterActivationAdmission),
         ),
         (
-            "request entry, empty cluster",
-            cluster_admission_controller_error(ClusterAdmissionError::EmptyCluster {
-                message: "no eligible nodes".into(),
-                retry_after: Duration::from_secs(5),
-            }),
-            Some(Duration::from_secs(5)),
+            ActivationRejectionKind::EmptyCluster,
+            StatusCode::TOO_MANY_REQUESTS,
             None,
         ),
         (
-            "substrate charge, rate limited",
-            ControllerError::from(SubstrateError::AdmissionRejected {
-                message: "activation budget exhausted".into(),
-                retry_after: Some(Duration::from_secs(1)),
-                rate_limited: true,
-            }),
-            Some(Duration::from_secs(1)),
-            Some(ControllerRetryAfterCause::ClusterActivationAdmission),
+            ActivationRejectionKind::NoFreeSlot,
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
         ),
         (
-            "substrate charge, empty cluster",
-            ControllerError::from(SubstrateError::AdmissionRejected {
-                message: "no eligible nodes".into(),
-                retry_after: None,
-                rate_limited: false,
-            }),
-            None,
+            ActivationRejectionKind::LiveCap,
+            StatusCode::TOO_MANY_REQUESTS,
             None,
         ),
     ];
-    for (case, error, retry_after_header, cause) in cases {
-        assert_eq!(
-            error.status(),
-            axum::http::StatusCode::TOO_MANY_REQUESTS,
-            "{case}"
-        );
-        assert_eq!(error.retry_after_header(), retry_after_header, "{case}");
-        assert_eq!(error.retry_after(), None, "{case}");
-        assert_eq!(error.retry_after_cause(), cause, "{case}");
-        assert!(error.is_cluster_admission_rejection(), "{case}");
+    for (kind, status, cause) in kinds {
+        let cases = [
+            (
+                "request entry",
+                kind.controller_error("refused".into(), Some(Duration::from_secs(1))),
+                Some(Duration::from_secs(1)),
+            ),
+            (
+                "substrate charge",
+                ControllerError::from(SubstrateError::AdmissionRejected {
+                    message: "refused".into(),
+                    retry_after: None,
+                    kind,
+                    live_cap: false,
+                }),
+                None,
+            ),
+        ];
+        for (case, error, retry_after_header) in cases {
+            assert_eq!(error.status(), status, "{kind:?}, {case}");
+            assert_eq!(
+                error.retry_after_header(),
+                retry_after_header,
+                "{kind:?}, {case}"
+            );
+            assert_eq!(error.retry_after(), None, "{kind:?}, {case}");
+            assert_eq!(error.retry_after_cause(), cause, "{kind:?}, {case}");
+            assert_eq!(error.activation_rejection(), Some(kind), "{kind:?}, {case}");
+            assert!(error.is_cluster_admission_rejection(), "{kind:?}, {case}");
+        }
     }
     // A 429 from anything else, such as a per-client limiter, is not one.
     assert!(
@@ -263,7 +275,7 @@ async fn finalize_sandbox_db_delete_removes_live_sandbox() -> TestResult {
     .await?;
 
     let mut tx = db.pool.begin().await?;
-    delete_with_dependents(&mut tx, sandbox_id).await?;
+    delete_with_dependents(&mut *tx, sandbox_id).await?;
     tx.commit().await?;
 
     let row = sqlx::query_scalar::<_, Uuid>(sql!(
@@ -358,12 +370,7 @@ async fn rejected_activation_emits_no_orphaned_requested_event() -> TestResult {
     };
     let admission = crate::cluster_admission::ClusterSandboxAdmission::with_config(
         make_substrate(),
-        crate::cluster_admission::ClusterSandboxAdmissionConfig {
-            enabled: true,
-            refill_rps: 6.0,
-            burst: 60.0,
-            redis_url: None,
-        },
+        crate::test_support::enabled_config(),
         pplx_space_feature_flags::FeatureFlagClient::disabled(),
     );
     let controller = SandboxController::with_cluster_admission(make_substrate(), admission);
@@ -379,6 +386,7 @@ async fn rejected_activation_emits_no_orphaned_requested_event() -> TestResult {
             crate::metrics::sandbox::api::SandboxApiMetricIdentity::ecw("start"),
             SandboxAction::Start,
             None,
+            crate::controllers::substrate::ActivationClient::Native,
         )
         .await;
     drop(guard);
@@ -393,6 +401,144 @@ async fn rejected_activation_emits_no_orphaned_requested_event() -> TestResult {
             .iter()
             .any(|event_type| event_type == "start_requested"),
         "a rejected activation must not emit an orphaned start_requested event; saw {emitted:?}",
+    );
+    Ok(())
+}
+
+/// A stop or kill of a sandbox whose node has a v2 drain recorded is refused
+/// at the action's entry, with the drain's retryable 503 and `Retry-After`,
+/// before its `*_requested` event, so an operation retrying the refused stop
+/// leaves no orphaned event. A rollback without restart is refused the same
+/// way, before any runtime call. The gate follows the node's persisted drain:
+/// this controller reads no drain v2 switch. Once the node has no drain, the
+/// stop goes on to its runtime as before, emitting its requested event.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stop_under_a_v2_drain_is_refused_before_its_requested_event() -> TestResult {
+    use axum::response::IntoResponse as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let db = pg_test_db_with_max_connections(3).await?;
+    let node_id = pplx_space_accounts::NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state, drain_engine, drain_phase,
+                            drain_started_at, drain_status)
+         VALUES ($1, '127.0.0.1', 'worker', 'space', 'ready', 'v2', 'draining', NOW(),
+                 '{\"generation\": 7, \"deadline_at\": 0}'::JSONB)"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    let sandbox_id = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, managed_by, lifecycle, placement, active_node_id,
+             network_policy_override_json, network_policy_generation
+         )
+         VALUES (
+             $1,
+             '00000000-0000-0000-0000-000000000010',
+             '00000000-0000-0000-0000-000000000001',
+             'space',
+             'started',
+             'placed',
+             $2,
+             $3,
+             1
+         )"
+    ))
+    .bind(sandbox_id)
+    .bind(node_id)
+    .bind(sqlx::types::Json(NetworkPolicyV1::default()))
+    .execute(&db.pool)
+    .await?;
+    let sandbox = crate::controllers::sandbox::fetch_sandbox(&db.pool, sandbox_id)
+        .await?
+        .expect("sandbox row exists");
+    let controller = SandboxController::new(crate::test_support::direct_substrate(&db.pool));
+    let act = |action: SandboxAction| {
+        controller.action(
+            &db.pool,
+            sandbox_id,
+            Some(&sandbox),
+            crate::metrics::sandbox::api::SandboxApiMetricIdentity::native(action.as_str()),
+            action,
+            None,
+            crate::controllers::substrate::ActivationClient::Native,
+        )
+    };
+
+    for (action, requested) in [
+        (SandboxAction::Stop, "stop_requested"),
+        (SandboxAction::Kill, "kill_requested"),
+    ] {
+        let capture = SandboxEventCapture::default();
+        let guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let refused = act(action)
+            .await
+            .expect_err("a stop under a v2 drain is refused");
+        drop(guard);
+        assert!(
+            refused.to_string().contains("under a v2 node drain"),
+            "{action}: {refused}"
+        );
+        let response = refused.into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{action}"
+        );
+        assert!(
+            response
+                .headers()
+                .contains_key(axum::http::header::RETRY_AFTER),
+            "{action}"
+        );
+        let emitted = capture.types.lock().unwrap().clone();
+        assert!(
+            !emitted.iter().any(|event_type| event_type == requested),
+            "{action}: a refused stop emits no {requested}; saw {emitted:?}"
+        );
+    }
+
+    let refused = controller
+        .rollback(&db.pool, &sandbox, sandbox_id, "d-snap".to_owned(), false)
+        .await
+        .expect_err("a rollback without restart under a v2 drain is refused");
+    assert!(
+        refused.to_string().contains("under a v2 node drain"),
+        "{refused}"
+    );
+    assert_eq!(
+        refused.into_response().status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    // The node's drain gone, the stop goes on to the runtime.
+    sqlx::query(sql!(
+        "UPDATE nodes SET drain_engine = NULL, drain_phase = NULL, drain_status = NULL
+          WHERE id = $1"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    let capture = SandboxEventCapture::default();
+    let guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+    let answer = act(SandboxAction::Stop).await;
+    drop(guard);
+    if let Err(err) = &answer {
+        assert!(
+            !err.to_string().contains("node drain"),
+            "an undrained node's stop isn't refused by a drain: {err}"
+        );
+    }
+    let emitted = capture.types.lock().unwrap().clone();
+    assert!(
+        emitted
+            .iter()
+            .any(|event_type| event_type == "stop_requested"),
+        "{emitted:?}"
     );
     Ok(())
 }
@@ -432,12 +578,7 @@ async fn direct_start_restore_spends_deferred_admission_at_entry() -> TestResult
     };
     let admission = crate::cluster_admission::ClusterSandboxAdmission::with_config(
         make_substrate(),
-        crate::cluster_admission::ClusterSandboxAdmissionConfig {
-            enabled: true,
-            refill_rps: 6.0,
-            burst: 60.0,
-            redis_url: None,
-        },
+        crate::test_support::enabled_config(),
         pplx_space_feature_flags::FeatureFlagClient::disabled(),
     );
     let controller = SandboxController::with_cluster_admission(make_substrate(), admission);
@@ -451,6 +592,7 @@ async fn direct_start_restore_spends_deferred_admission_at_entry() -> TestResult
             crate::metrics::sandbox::api::SandboxApiMetricIdentity::ecw("start"),
             SandboxAction::Start,
             None,
+            crate::controllers::substrate::ActivationClient::Native,
         )
         .await
         .expect_err("direct restore-shaped Start must pay admission");
@@ -610,7 +752,7 @@ async fn persisted_delete_intent_denies_later_fork_admission() -> TestResult {
 
     let source_sandbox_id = sandbox_id;
     let request = crate::fork_operations::ForkRequest::from_wire(Some(300), Some(1))?;
-    let key = pplx_space_common_core::types::IdempotencyKey::parse("fork-after-delete-intent")?;
+    let key = pplx_space_guest_process::IdempotencyKey::parse("fork-after-delete-intent")?;
     let store = crate::public_operations::PublicOperationStore::new(db.pool.clone());
     let admission = crate::fork_operations::begin_fork_operation_admission(
         &store,
@@ -633,6 +775,7 @@ async fn persisted_delete_intent_denies_later_fork_admission() -> TestResult {
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &key,
+            client_id: &pplx_space_accounts::ClientId::unknown(),
         },
     )
     .await?;
@@ -685,12 +828,7 @@ async fn invalid_activation_options_reject_before_admission_and_requested_event(
     };
     let admission = crate::cluster_admission::ClusterSandboxAdmission::with_config(
         make_substrate(),
-        crate::cluster_admission::ClusterSandboxAdmissionConfig {
-            enabled: true,
-            refill_rps: 6.0,
-            burst: 60.0,
-            redis_url: None,
-        },
+        crate::test_support::enabled_config(),
         pplx_space_feature_flags::FeatureFlagClient::disabled(),
     );
     let controller = SandboxController::with_cluster_admission(make_substrate(), admission);
@@ -709,6 +847,7 @@ async fn invalid_activation_options_reject_before_admission_and_requested_event(
                 blocking: None,
                 ready_timeout_secs: Some(0),
             }),
+            crate::controllers::substrate::ActivationClient::Native,
         )
         .await;
     drop(guard);
@@ -895,9 +1034,7 @@ async fn exhausting_the_finalize_retry_budget_stays_retryable() -> TestResult {
         make_substrate(),
         crate::cluster_admission::ClusterSandboxAdmissionConfig {
             enabled: false,
-            refill_rps: 6.0,
-            burst: 60.0,
-            redis_url: None,
+            ..crate::test_support::enabled_config()
         },
         pplx_space_feature_flags::FeatureFlagClient::disabled(),
     );
@@ -922,12 +1059,13 @@ async fn exhausting_the_finalize_retry_budget_stays_retryable() -> TestResult {
 
 /// The delete pre-flight's `55P03` is retryable, not an unrecoverable delete.
 ///
-/// `in_flight_snapshot_upload_idle_for` is the first database statement
-/// `delete_control_plane` runs, and it is a plain `SELECT` on `snapshots` — so
-/// under the role-level `lock_timeout` it aborts with `55P03` whenever DDL
-/// holds `ACCESS EXCLUSIVE` on that table. It answered a flat 500, telling the
-/// caller the delete had failed for good before anything at all had been
-/// written; nothing had, so the identical retry succeeds.
+/// `pplx_space_snapshot_store::upload::in_flight_idle_for` is the first
+/// database statement `delete_control_plane` runs, and it is a plain `SELECT`
+/// on `snapshots` — so under the role-level `lock_timeout` it aborts with
+/// `55P03` whenever DDL holds `ACCESS EXCLUSIVE` on that table. It answered a
+/// flat 500, telling the caller the delete had failed for good before
+/// anything at all had been written; nothing had, so the identical retry
+/// succeeds.
 ///
 /// Drives `delete_control_plane` rather than asserting `db_contention_error`'s
 /// answer, for the reason recorded on
@@ -1064,7 +1202,10 @@ async fn resume_uses_resolved_runtime_without_async_observation() -> TestResult 
             ));
         let mut client = controller
             .substrate
-            .runtime_client(id, crate::controllers::substrate::RecoveryCharge::Exempt)
+            .runtime_client(
+                id,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
+            )
             .await?;
         let request = controller
             .resume_request_with_current_policy(

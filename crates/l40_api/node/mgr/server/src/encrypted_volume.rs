@@ -43,14 +43,14 @@
 
 use std::path::{Path, PathBuf};
 
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use crate::rootfs_dmcrypt::{
     DmCryptError, ReleaseDevice, crypt_mapper_numbers, luks_format_args, parse_device_numbers, run,
     run_with_stdin, verify_kernel_support,
 };
 
-use crate::device_backing::{self, Backing, LoopDevice};
+use crate::device_backing::{self, Backing, DIRECT_IO_BLOCK_BYTES, LoopDevice};
 
 mod busy_holders;
 #[cfg(any(target_os = "linux", test))]
@@ -98,9 +98,19 @@ fn mapper_name(sandbox_id: &SandboxId, volume_name: &str) -> String {
 
 /// Sparse backing size for the volume: the requested logical size
 /// (caller derives it from VM memory + state + slack) plus header/metadata
-/// headroom, floored at the btrfs minimum. Pure; unit-tested.
+/// headroom, floored at the btrfs minimum and rounded up to whole direct I/O
+/// blocks. Pure; unit-tested.
 fn volume_backing_size_bytes(requested_bytes: u64) -> u64 {
-    (requested_bytes + VOLUME_HEADROOM_BYTES).max(MIN_VOLUME_BYTES)
+    (requested_bytes + VOLUME_HEADROOM_BYTES)
+        .max(MIN_VOLUME_BYTES)
+        .next_multiple_of(DIRECT_IO_BLOCK_BYTES)
+}
+
+/// Whether a backing of `length` bytes can attach with direct I/O. Fresh
+/// backings always can; an older one with a partial trailing 4 KiB block
+/// stays on the buffered 512-byte loop so it still opens. Pure; unit-tested.
+fn backing_supports_direct_io(length: u64) -> bool {
+    length.is_multiple_of(DIRECT_IO_BLOCK_BYTES)
 }
 
 async fn read_mountinfo() -> Result<String, DmCryptError> {
@@ -842,9 +852,9 @@ pub async fn prepare(params: PrepareParams<'_>) -> Result<PreparedEncryptedVolum
     // opening it. Symlink-safe descriptor-relative copy — the source is
     // caller-supplied.
     if let Some(source) = &restore_source {
-        let root = PathBuf::from(
-            pplx_space_common_core::host::linux::paths::sandbox_cache_dir(&sandbox_id.to_string()),
-        );
+        let root = PathBuf::from(pplx_space_host_layout::paths::sandbox_cache_dir(
+            &sandbox_id.to_string(),
+        ));
         let source = source.clone();
         let staged_backing = backing_path.clone();
         tokio::task::spawn_blocking(move || {
@@ -901,7 +911,11 @@ async fn build_volume(
         } else {
             Backing::require(Backing::open(&path, true)?)?
         };
-        let device = LoopDevice::attach(&backing, false)?;
+        let device = if backing_supports_direct_io(backing.file.metadata()?.len()) {
+            LoopDevice::attach_direct(&backing, false)?
+        } else {
+            LoopDevice::attach(&backing, false)?
+        };
         Ok((backing, device))
     })
     .await?;

@@ -1,10 +1,11 @@
 //! Owning store for sandbox-scoped federated service grants.
 
-use pplx_space_common_core::types::{OrgId, SandboxId};
+use pplx_space_accounts::OrgId;
+use pplx_space_sandbox_model::SandboxId;
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::SandboxOwnerSource;
-use sqlx::{PgPool, Postgres};
+use pplx_space_accounts::SandboxOwnerSource;
+use pplx_space_postgres_pool::{Db, DbError, Executor};
+use pplx_space_sql_locator::sql;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -15,13 +16,13 @@ pub enum FederatedGrantStoreError {
     #[error("grant renewal is not newer than the stored grant, and the stored grant has expired")]
     StaleRenewalOfExpiredGrant,
     #[error("failed to upsert sandbox federated service grant: {0}")]
-    Upsert(#[from] sqlx::Error),
+    Upsert(#[from] DbError),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum FreshestLiveFederatedGrantError {
     #[error("freshest live federated service grant query failed: {0}")]
-    Query(#[source] sqlx::Error),
+    Query(#[source] DbError),
 }
 
 /// Borrowed upstream owner fields used to authorize a grant write.
@@ -47,7 +48,7 @@ pub struct FreshestLiveFederatedGrant {
 }
 
 pub async fn upsert_sandbox_federated_service_grant(
-    pool: &PgPool,
+    db: &Db,
     sandbox_id: SandboxId,
     owner: FederatedGrantOwnerRef<'_>,
     grant: FederatedServiceGrantRef<'_>,
@@ -56,7 +57,7 @@ pub async fn upsert_sandbox_federated_service_grant(
 ) -> Result<(), FederatedGrantStoreError> {
     // The guarded upsert and fallback probe must observe one transaction.
     // The savepoint below also requires this transaction boundary.
-    let mut tx = pool.begin().await?;
+    let mut tx = db.begin().await?;
     upsert_sandbox_federated_service_grant_on_conn(
         &mut tx,
         sandbox_id,
@@ -70,14 +71,19 @@ pub async fn upsert_sandbox_federated_service_grant(
     Ok(())
 }
 
-pub async fn upsert_sandbox_federated_service_grant_tx(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
+/// [`upsert_sandbox_federated_service_grant`] inside the caller's transaction.
+/// The caller must pass its open transaction.
+pub async fn upsert_sandbox_federated_service_grant_tx<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     owner: FederatedGrantOwnerRef<'_>,
     grant: FederatedServiceGrantRef<'_>,
     grant_audience: &str,
     grant_purpose: &str,
-) -> Result<(), FederatedGrantStoreError> {
+) -> Result<(), FederatedGrantStoreError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     upsert_sandbox_federated_service_grant_on_conn(
         tx,
         sandbox_id,
@@ -90,20 +96,24 @@ pub async fn upsert_sandbox_federated_service_grant_tx(
 }
 
 /// Stores the producer-owned grant envelope after verifying the sandbox owner.
-async fn upsert_sandbox_federated_service_grant_on_conn(
-    executor: &mut sqlx::PgConnection,
+async fn upsert_sandbox_federated_service_grant_on_conn<C>(
+    executor: &mut C,
     sandbox_id: SandboxId,
     owner: FederatedGrantOwnerRef<'_>,
     grant: FederatedServiceGrantRef<'_>,
     grant_audience: &str,
     grant_purpose: &str,
-) -> Result<(), FederatedGrantStoreError> {
+) -> Result<(), FederatedGrantStoreError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     // Postgres validates CHECK constraints before conflict arbitration. The
     // savepoint lets an expired offered row be classified by the fallback
     // probe without leaving the caller's transaction aborted.
     sqlx::query(sql!("SAVEPOINT sfsg_upsert"))
-        .execute(&mut *executor)
-        .await?;
+        .execute((&mut *executor).into_sqlx())
+        .await
+        .map_err(DbError::from)?;
     let row: Result<Option<(Uuid,)>, sqlx::Error> = sqlx::query_as(sql!(
         "INSERT INTO sandbox_federated_service_grants (
              sandbox_id, grant_audience, grant_purpose, grant_blob, grant_expires_at,
@@ -146,7 +156,7 @@ async fn upsert_sandbox_federated_service_grant_on_conn(
     .bind(grant.bytes)
     .bind(grant.expires_at)
     .bind(grant.issued_at)
-    .fetch_optional(&mut *executor)
+    .fetch_optional((&mut *executor).into_sqlx())
     .await;
 
     let row = match row {
@@ -156,15 +166,17 @@ async fn upsert_sandbox_federated_service_grant_on_conn(
                 == Some("sandbox_federated_service_grants_expires_after_update") =>
         {
             sqlx::query(sql!("ROLLBACK TO SAVEPOINT sfsg_upsert"))
-                .execute(&mut *executor)
-                .await?;
+                .execute((&mut *executor).into_sqlx())
+                .await
+                .map_err(DbError::from)?;
             None
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(DbError::from(error).into()),
     };
     sqlx::query(sql!("RELEASE SAVEPOINT sfsg_upsert"))
-        .execute(&mut *executor)
-        .await?;
+        .execute((&mut *executor).into_sqlx())
+        .await
+        .map_err(DbError::from)?;
 
     if row.is_some() {
         return Ok(());
@@ -196,8 +208,9 @@ async fn upsert_sandbox_federated_service_grant_on_conn(
     .bind(owner.issuer)
     .bind(owner.org_id)
     .bind(owner.subject_id)
-    .fetch_optional(executor)
-    .await?;
+    .fetch_optional(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     match stored_unexpired {
         Some(Some(true)) => Ok(()),
         Some(Some(false)) | Some(None) => Err(FederatedGrantStoreError::StaleRenewalOfExpiredGrant),
@@ -211,7 +224,7 @@ async fn upsert_sandbox_federated_service_grant_on_conn(
 /// `grant_expires_at > now()` cannot become locally expired solely because of
 /// timestamp precision loss at this boundary.
 pub async fn freshest_live_federated_grant(
-    pool: &PgPool,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     grant_audience: &str,
     grant_purpose: &str,
@@ -233,9 +246,9 @@ pub async fn freshest_live_federated_grant(
     .bind(org_id)
     .bind(grant_audience)
     .bind(grant_purpose)
-    .fetch_optional(pool)
+    .fetch_optional(executor.into_sqlx())
     .await
-    .map_err(FreshestLiveFederatedGrantError::Query)?;
+    .map_err(|error| FreshestLiveFederatedGrantError::Query(error.into()))?;
 
     Ok(row.map(
         |(sandbox_id, upstream_subject_id, grant_blob, expires_at_unix)| {
@@ -256,7 +269,7 @@ pub async fn freshest_live_federated_grant(
 /// Expiry is rounded up to whole seconds for the same reason as
 /// [`freshest_live_federated_grant`].
 pub async fn live_federated_grant_prefer_sandbox(
-    pool: &PgPool,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     grant_audience: &str,
     grant_purpose: &str,
@@ -280,9 +293,9 @@ pub async fn live_federated_grant_prefer_sandbox(
     .bind(grant_audience)
     .bind(grant_purpose)
     .bind(sandbox_id)
-    .fetch_optional(pool)
+    .fetch_optional(executor.into_sqlx())
     .await
-    .map_err(FreshestLiveFederatedGrantError::Query)?;
+    .map_err(|error| FreshestLiveFederatedGrantError::Query(error.into()))?;
 
     Ok(row.map(
         |(sandbox_id, upstream_subject_id, grant_blob, expires_at_unix)| {

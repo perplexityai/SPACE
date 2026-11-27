@@ -6,11 +6,12 @@ use crate::db::guest_updates::{
     self as store, Action, Admission, GuestIdentity, Intent, Outcome, Phase, Record,
 };
 use crate::service::cleanup_support::CleanupLockTryResult;
-use pplx_space_common_core::types::SandboxActivationAttemptId;
-use pplx_space_spaced_common::proto::update as wire;
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
+use pplx_space_spaced_guest_protocol::proto::update as wire;
 use pplx_space_spaced_host_client::RawSpacedHostGuestUpdateClient as Client;
 use pplx_space_spaced_update as model;
 
+pub(super) mod automatic;
 mod observation;
 mod policy;
 
@@ -18,7 +19,7 @@ mod policy;
 // The candidate itself has only model::TRIAL_CONFIRMATION_WINDOW from
 // selection to commit. These larger bounds do not extend that trial or lifecycle clocks.
 const OPERATION_BUDGET: Duration = Duration::from_secs(420);
-const ACTIVATION_BUDGET: Duration = Duration::from_secs(210);
+use pplx_space_spaced_guest_protocol::update::ACTIVATION_BUDGET;
 const LIFECYCLE_MARGIN: Duration = Duration::from_secs(30);
 const RPC_BUDGET: Duration = Duration::from_secs(5);
 
@@ -83,6 +84,7 @@ fn response(record: &Record, guest: Option<wire::Status>) -> crate::proto::Guest
             Phase::Complete => P::Complete,
         } as i32,
         outcome: record.outcome.map(|v| v.to_string()),
+        automatic_deferral: None,
         guest,
     }
 }
@@ -110,6 +112,7 @@ impl SandboxManagerService {
                 "operation belongs to another sandbox",
             ));
         }
+        let mut automatic_deferral = None;
         let guest = if sandbox.state.is_unowned(SandboxState::Started) {
             match async {
                 let mut client = self.connect_spaced_host(&sandbox).await?.guest_update();
@@ -125,7 +128,13 @@ impl SandboxManagerService {
                     tracing::debug!(%error, "guest maintenance receipt available without live guest status");
                     None
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    automatic_deferral = self.guest_auto_updates.status(&sandbox.id);
+                    if automatic_deferral.is_none() {
+                        return Err(error);
+                    }
+                    None
+                }
             }
         } else {
             None
@@ -133,11 +142,13 @@ impl SandboxManagerService {
         Ok(Response::new(match record {
             Some(record) => response(&record, guest),
             None => crate::proto::GuestUpdateOperation {
-                sandbox_id: sandbox.id,
+                sandbox_id: sandbox.id.clone(),
                 execution_id: sandbox
                     .node_execution_id
                     .map(|v| v.to_string())
                     .unwrap_or_default(),
+                automatic_deferral: automatic_deferral
+                    .or_else(|| self.guest_auto_updates.status(&sandbox.id)),
                 guest,
                 ..Default::default()
             },
@@ -151,7 +162,7 @@ impl SandboxManagerService {
         self.authorize_peer(&req, "ApplyGuestUpdate", ALLOW_LOCAL_ARTIFACT_OPERATOR)?;
         let req = req.into_inner();
         let execution = parse_execution(&req.expected_execution_id)?;
-        pplx_space_spaced_common::update::HoldOwner::validate_operation(
+        pplx_space_spaced_guest_protocol::update::HoldOwner::validate_operation(
             uuid(&req.operation_id)?,
             uuid(&execution.to_string())?,
         )?;
@@ -169,30 +180,34 @@ impl SandboxManagerService {
         )? {
             return Ok(Response::new(receipt));
         }
-        let bundle = policy::load().await?;
+        let bundle = policy::load(requested.target).await?;
         if requested != bundle.policy.promotion {
             return Err(Status::permission_denied(
                 "promotion is not the configured host authority",
             ));
         }
-        qualify(&sandbox, Some(&bundle.policy), OPERATION_BUDGET)?;
+        qualify(&sandbox, OPERATION_BUDGET)?;
         let platform = self.probe_update_contract(&sandbox).await?;
         if bundle.descriptor.recovery_platform().map_err(internal)? != platform {
             return Err(Status::failed_precondition(
                 "target bundle does not support this guest recovery contract",
             ));
         }
-        self.admit_guest_update(Intent {
-            operation: uuid(&req.operation_id)?,
-            sandbox: sandbox.id.parse().map_err(internal)?,
-            execution,
-            action: Action::Apply {
-                promotion: Box::new(requested),
-                authorization: bundle.policy.authorization,
+        self.admit_guest_update(
+            Intent {
+                operation: uuid(&req.operation_id)?,
+                sandbox: sandbox.id.parse().map_err(internal)?,
+                execution,
+                action: Action::Apply {
+                    promotion: Box::new(requested),
+                    authorization: bundle.policy.authorization,
+                },
+                force: req.force,
+                configuration_revision: 1,
             },
-            force: req.force,
-            configuration_revision: 1,
-        })
+            false,
+            None,
+        )
         .await
     }
 
@@ -203,7 +218,7 @@ impl SandboxManagerService {
         self.authorize_peer(&req, "RestartGuest", ALLOW_LOCAL_ARTIFACT_OPERATOR)?;
         let req = req.into_inner();
         let execution = parse_execution(&req.expected_execution_id)?;
-        pplx_space_spaced_common::update::HoldOwner::validate_operation(
+        pplx_space_spaced_guest_protocol::update::HoldOwner::validate_operation(
             uuid(&req.operation_id)?,
             uuid(&execution.to_string())?,
         )?;
@@ -217,16 +232,20 @@ impl SandboxManagerService {
         )? {
             return Ok(Response::new(receipt));
         }
-        qualify(&sandbox, None, ACTIVATION_BUDGET)?;
+        qualify(&sandbox, ACTIVATION_BUDGET)?;
         self.probe_update_contract(&sandbox).await?;
-        self.admit_guest_update(Intent {
-            operation: uuid(&req.operation_id)?,
-            sandbox: sandbox.id.parse().map_err(internal)?,
-            execution,
-            action: Action::Restart,
-            force: req.force,
-            configuration_revision: 1,
-        })
+        self.admit_guest_update(
+            Intent {
+                operation: uuid(&req.operation_id)?,
+                sandbox: sandbox.id.parse().map_err(internal)?,
+                execution,
+                action: Action::Restart,
+                force: req.force,
+                configuration_revision: 1,
+            },
+            false,
+            None,
+        )
         .await
     }
 
@@ -265,6 +284,8 @@ impl SandboxManagerService {
     async fn admit_guest_update(
         &self,
         intent: Intent,
+        quiet: bool,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<Response<crate::proto::GuestUpdateOperation>, Status> {
         // Admission and capture settlement must share the lock: otherwise a
         // capture can observe no intent and then snapshot a newly admitted one.
@@ -278,43 +299,69 @@ impl SandboxManagerService {
             .map_err(|_| Status::aborted("guest maintenance yields to an artifact operation"))?;
         let _writer = self.state_writer_lease("GuestUpdate")?;
         self.retire_stale_guest_update(&intent.sandbox.to_string())?;
-        let result = store::admit(
-            &*self.db_conn()?,
-            intent,
-            jiff::Timestamp::now().as_second() + OPERATION_BUDGET.as_secs() as i64,
-        )
-        .map_err(internal)?;
+        let operation = intent.operation;
+        let new_origin = self.guest_auto_updates.remember_origin(operation, quiet)?;
+        let result = self.db_conn().and_then(|db| {
+            store::admit(
+                &db,
+                intent,
+                jiff::Timestamp::now().as_second() + OPERATION_BUDGET.as_secs() as i64,
+            )
+            .map_err(internal)
+        });
         let record = match result {
-            Admission::Accepted(value) => *value,
-            Admission::Refused(reason) => {
-                return Err(Status::failed_precondition(format!(
-                    "guest maintenance deferred: {reason:?}"
-                )));
+            Ok(Admission::Accepted(value)) => *value,
+            other => {
+                if new_origin {
+                    self.guest_auto_updates.forget_origin(operation);
+                }
+                return Err(match other {
+                    Err(error) => error,
+                    Ok(Admission::Refused(reason)) => Status::failed_precondition(format!(
+                        "guest maintenance deferred: {reason:?}"
+                    )),
+                    Ok(Admission::Accepted(_)) => unreachable!(),
+                });
             }
         };
+        self.guest_auto_updates.admitted(operation);
         // The receipt is durable. Release admission's locks before the driver
         // can try to acquire them on another executor thread.
         drop(_writer);
         drop(_artifact);
-        if record.phase != Phase::Complete
-            && let Ok(permit) = self.guest_update_sem.clone().try_acquire_owned()
+        if record.phase == Phase::Complete {
+            self.guest_auto_updates.forget_origin(operation);
+        } else if let Some(permit) =
+            permit.or_else(|| self.guest_update_sem.clone().try_acquire_owned().ok())
         {
-            let service = self.clone();
-            let operation = record.intent.operation;
-            self.task_tracker.spawn(async move {
-                let _permit = permit;
-                tokio::select! {
-                    biased;
-                    _ = service.shutdown_token.cancelled() => {},
-                    result = service.run_guest_update(operation) => {
-                        if let Err(error) = result {
-                            tracing::warn!(%operation, %error, "guest update awaits reconciliation");
-                        }
-                    }
-                }
-            });
+            self.spawn_guest_update(
+                operation,
+                permit,
+                self.guest_auto_updates.requires_quiet(operation),
+            );
         }
         Ok(Response::new(response(&record, None)))
+    }
+
+    fn spawn_guest_update(
+        &self,
+        operation: Uuid,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        quiet: bool,
+    ) {
+        let service = self.clone();
+        self.task_tracker.spawn(async move {
+            let _permit = permit;
+            tokio::select! {
+                biased;
+                _ = service.shutdown_token.cancelled() => {},
+                result = service.run_guest_update(operation, quiet) => {
+                    if let Err(error) = result {
+                        tracing::warn!(%operation, %error, "guest update awaits reconciliation");
+                    }
+                }
+            }
+        });
     }
 
     async fn probe_update_contract(
@@ -328,29 +375,14 @@ impl SandboxManagerService {
             .get_status(request(wire::StatusRequest {}))
             .await?
             .into_inner();
-        let reported =
-            model::RecoveryPlatform::from_contract(&status.seed_contract).ok_or_else(|| {
-                Status::failed_precondition("guest selector contract is not supported")
-            })?;
-        use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
-        let qualified = match super::guest_image::profile_for_sandbox(sandbox)
-            .map_err(|error| Status::failed_precondition(error.to_string()))?
-            .agent_protocol()
-        {
-            QualifiedGuestAgent::LinuxV1 => model::RecoveryPlatform::Linux,
-            QualifiedGuestAgent::WindowsV1 => model::RecoveryPlatform::Windows,
-            QualifiedGuestAgent::Absent => {
-                return Err(Status::failed_precondition(
-                    "image has no qualified guest agent",
-                ));
-            }
-        };
-        if reported != qualified {
-            return Err(Status::failed_precondition(
-                "guest selector disagrees with qualified image",
-            ));
+        if !policy::supported_guest(policy::platform(sandbox), &status) {
+            return Err(Status::failed_precondition(format!(
+                "guest maintenance requires version {} or newer and a recovery contract matching the image",
+                model::MANAGED_GUEST_UPDATE_MINIMUM
+            )));
         }
-        Ok(qualified)
+        model::RecoveryPlatform::from_contract(&status.seed_contract)
+            .ok_or_else(|| Status::failed_precondition("guest recovery contract is unsupported"))
     }
 
     fn update_record(&self, operation: Uuid) -> Result<Record, Status> {
@@ -385,24 +417,31 @@ impl SandboxManagerService {
         if !store::advance(&*self.db_conn()?, record, to, seen).map_err(internal)? {
             return Err(Status::aborted("guest update phase or execution changed"));
         }
-        self.update_record(record.intent.operation)
+        let advanced = self.update_record(record.intent.operation)?;
+        self.guest_auto_updates.observe(&advanced);
+        Ok(advanced)
     }
 
     fn retire_stale_guest_update(&self, sandbox: &str) -> Result<(), Status> {
         let active =
             crate::db::read::active_guest_update(&*self.db_conn()?, sandbox).map_err(internal)?;
-        if let Some(record) = active {
-            store::supersede(&*self.db_conn()?, record.intent.operation).map_err(internal)?;
+        if let Some(record) = active
+            && store::supersede(&*self.db_conn()?, record.intent.operation).map_err(internal)?
+        {
+            self.guest_auto_updates
+                .forget_origin(record.intent.operation);
         }
         Ok(())
     }
 
-    async fn run_guest_update(&self, operation: Uuid) -> Result<(), Status> {
+    async fn run_guest_update(&self, operation: Uuid, quiet: bool) -> Result<(), Status> {
         let record = self.update_record(operation)?;
         if record.phase == Phase::Complete {
+            self.guest_auto_updates.forget_origin(operation);
             return Ok(());
         }
         if store::supersede(&*self.db_conn()?, operation).map_err(internal)? {
+            self.guest_auto_updates.forget_origin(operation);
             return Ok(());
         }
         let id = record.intent.sandbox.to_string();
@@ -416,7 +455,8 @@ impl SandboxManagerService {
             return Ok(());
         };
         let _writer = self.state_writer_lease("GuestUpdateRecovery")?;
-        self.drive_guest_update(record, false, priority).await
+        self.drive_guest_update(record, false, quiet, priority)
+            .await
     }
 
     /// Called with the artifact lock before a lifecycle transition. Pending
@@ -445,7 +485,7 @@ impl SandboxManagerService {
             .auto_lifecycle
             .artifact_lock(sandbox)
             .subscribe_capture_requests();
-        self.drive_guest_update(record, true, priority).await
+        self.drive_guest_update(record, true, false, priority).await
     }
 
     fn guest_update_execution_fence(
@@ -466,6 +506,7 @@ impl SandboxManagerService {
         &self,
         mut record: Record,
         lifecycle: bool,
+        quiet: bool,
         mut priority: tokio::sync::watch::Receiver<()>,
     ) -> Result<(), Status> {
         let operation = record.intent.operation;
@@ -529,7 +570,7 @@ impl SandboxManagerService {
                     .await?;
                 return Ok(());
             }
-            let bundle = match policy::load().await {
+            let bundle = match policy::load(promotion.target).await {
                 Ok(bundle)
                     if &bundle.policy.promotion == promotion.as_ref()
                         && &bundle.policy.authorization == authorization =>
@@ -548,12 +589,15 @@ impl SandboxManagerService {
                         .await;
                 }
             };
-            if qualify(&sandbox, Some(&bundle.policy), OPERATION_BUDGET).is_err()
+            if qualify(&sandbox, OPERATION_BUDGET).is_err()
+                || !policy::supported_guest(policy::platform(&sandbox), &observed)
                 || !bundle
                     .descriptor
                     .seed_contracts
                     .contains(&observed.seed_contract)
-                || (!record.intent.force && !observed.defer_reasons.is_empty())
+                || (!record.intent.force
+                    && (!observed.defer_reasons.is_empty()
+                        || (quiet && automatic::quiet_remaining(&sandbox, now_secs()) > 0)))
             {
                 return self
                     .finish_pending_guest_update(record, Outcome::Deferred, observed, &mut client)
@@ -604,7 +648,13 @@ impl SandboxManagerService {
             record = self.update_advance(&record, Phase::Staged, None)?;
         }
         if matches!(record.phase, Phase::Pending | Phase::Staged) {
-            if qualify(&self.update_execution(&record)?, None, ACTIVATION_BUDGET).is_err() {
+            let current = self.update_execution(&record)?;
+            if qualify(&current, ACTIVATION_BUDGET).is_err()
+                || (!record.intent.force
+                    && matches!(record.intent.action, Action::Apply { .. })
+                    && quiet
+                    && automatic::quiet_remaining(&current, now_secs()) > 0)
+            {
                 return self
                     .finish_pending_guest_update(record, Outcome::Deferred, observed, &mut client)
                     .await;
@@ -644,8 +694,8 @@ impl SandboxManagerService {
             }
             match maintenance_decision(&record, &observed)? {
                 Decision::Arm => {
-                    if !policy::permits(&record.intent.action, current.template_hash.as_deref())
-                        .await
+                    if !policy::permits(&record.intent.action).await
+                        || !policy::supported_guest(policy::platform(&current), &observed)
                     {
                         return self
                             .finish_guest_update(record, Outcome::Cancelled, observed, &mut client)
@@ -723,8 +773,7 @@ impl SandboxManagerService {
                     if confirmation_rejected
                         || lifecycle
                         || jiff::Timestamp::now().as_second() >= record.deadline
-                        || !policy::permits(&record.intent.action, current.template_hash.as_deref())
-                            .await
+                        || !policy::permits(&record.intent.action).await
                     {
                         if let Err(error) = client
                             .abort(request(wire::AbortRequest {
@@ -742,13 +791,8 @@ impl SandboxManagerService {
                             Ok(()) => {
                                 // Configuration awaits host/guest RPCs; revocation during
                                 // that work must still prevent the following commit.
-                                let current = self.update_execution(&record)?;
-                                if !policy::permits(
-                                    &record.intent.action,
-                                    current.template_hash.as_deref(),
-                                )
-                                .await
-                                {
+                                self.update_execution(&record)?;
+                                if !policy::permits(&record.intent.action).await {
                                     confirmation_rejected = true;
                                     continue;
                                 }
@@ -925,22 +969,28 @@ impl SandboxManagerService {
         tracker.spawn(async move {
             loop {
                 let mut after = None;
+                let mut obsolete_origins = service.guest_auto_updates.origin_operations();
+                let mut complete_scan = false;
                 loop {
                     let page = service.db_conn().and_then(|db| crate::db::scan::unfinished_guest_updates(&db, after).map_err(internal));
                     let records = match page { Ok(value) => value, Err(error) => { tracing::warn!(%error, "cannot scan guest update recovery"); break; } };
-                    if records.is_empty() { break; }
+                    if records.is_empty() { complete_scan = true; break; }
+                    for record in &records { obsolete_origins.remove(&record.intent.operation); }
                     use futures_util::StreamExt;
                     after = records.last().map(|record| record.intent.operation);
                     let work = futures_util::stream::iter(records).for_each_concurrent(1, |record| {
                         let service = &service;
                         async move {
                             let Ok(_permit) = service.guest_update_sem.clone().try_acquire_owned() else { return; };
-                            if let Err(error) = service.run_guest_update(record.intent.operation).await {
+                            if let Err(error) = service.run_guest_update(record.intent.operation, service.guest_auto_updates.requires_quiet(record.intent.operation)).await {
                                 tracing::warn!(operation = %record.intent.operation, %error, "guest update recovery deferred");
                             }
                         }
                     });
                     tokio::select! { _ = shutdown.cancelled() => return, _ = work => {} }
+                }
+                if complete_scan {
+                    for operation in obsolete_origins { service.guest_auto_updates.forget_origin(operation); }
                 }
                 tokio::select! { _ = shutdown.cancelled() => return, _ = tokio::time::sleep(Duration::from_secs(5)) => {} }
             }
@@ -948,11 +998,7 @@ impl SandboxManagerService {
     }
 }
 
-fn qualify(
-    sandbox: &crate::db::SandboxRow,
-    policy: Option<&policy::Policy>,
-    budget: Duration,
-) -> Result<(), Status> {
+fn qualify(sandbox: &crate::db::SandboxRow, budget: Duration) -> Result<(), Status> {
     if !sandbox.state.is_unowned(SandboxState::Started)
         || sandbox.pool_template.is_some()
         || matches!(
@@ -974,16 +1020,6 @@ fn qualify(
     }) {
         return Err(Status::failed_precondition(
             "insufficient lifecycle deadline headroom",
-        ));
-    }
-    if policy.is_some_and(|p| {
-        !sandbox
-            .template_hash
-            .as_ref()
-            .is_some_and(|hash| p.qualified_templates.contains(hash))
-    }) {
-        return Err(Status::failed_precondition(
-            "installed template has not been qualified for this selector contract",
         ));
     }
     Ok(())
@@ -1205,7 +1241,7 @@ async fn stage(
     // Allow the host's 150-second transfer/verification window to return its
     // result before the manager abandons the RPC. Ambiguous results reconcile.
     tokio::time::timeout(
-        pplx_space_spaced_common::update::STAGE_MANAGER_BUDGET,
+        pplx_space_spaced_guest_protocol::update::STAGE_MANAGER_BUDGET,
         transfer,
     )
     .await

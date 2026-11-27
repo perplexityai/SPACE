@@ -10,6 +10,7 @@ unset GIT_ASKPASS SSH_ASKPASS GIT_SSH GIT_SSH_COMMAND GIT_CONFIG_PARAMETERS
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 script="${repo_root}/scripts/check-postgres-migrations-squawk.sh"
+base_helper="${repo_root}/scripts/lib/migration-base.sh"
 partial_index_checker="${repo_root}/scripts/check_postgres_partial_indexes.py"
 partial_index_checker_test="${repo_root}/scripts/tests/test_check_postgres_partial_indexes.py"
 fixture_dir="${repo_root}/scripts/tests/fixtures/postgres-partial-index"
@@ -176,8 +177,9 @@ expect_guard_failure() {
 }
 
 work_repo="${tmp_dir}/repo"
-mkdir -p "${work_repo}/scripts" "${work_repo}/db/postgres" "${work_repo}/db/common"
+mkdir -p "${work_repo}/scripts/lib" "${work_repo}/db/postgres" "${work_repo}/db/common"
 cp "${script}" "${partial_index_checker}" "${work_repo}/scripts/"
+cp "${base_helper}" "${work_repo}/scripts/lib/migration-base.sh"
 mkdir -p "${work_repo}/ci/scripts"
 cat >"${work_repo}/ci/scripts/ensure-uv.sh" <<'SH'
 #!/usr/bin/env bash
@@ -324,8 +326,9 @@ fi
 # files the author never touched. Assert the fetch actually corrects the ref, and
 # that only the fetch is what corrects it.
 stale_remote="${tmp_dir}/stale-remote"
-mkdir -p "${stale_remote}/scripts" "${stale_remote}/db/postgres"
+mkdir -p "${stale_remote}/scripts/lib" "${stale_remote}/db/postgres"
 cp "${script}" "${partial_index_checker}" "${stale_remote}/scripts/"
+cp "${base_helper}" "${stale_remote}/scripts/lib/migration-base.sh"
 mkdir -p "${stale_remote}/ci/scripts"
 cat >"${stale_remote}/ci/scripts/ensure-uv.sh" <<'SH'
 #!/usr/bin/env bash
@@ -616,8 +619,9 @@ fi
 # Pin the copied guard's deepening flag with a depth-1 feature checkout whose
 # shallow boundary otherwise hides the fork point.
 shallow_remote="${tmp_dir}/shallow-remote"
-mkdir -p "${shallow_remote}/scripts" "${shallow_remote}/db/postgres"
+mkdir -p "${shallow_remote}/scripts/lib" "${shallow_remote}/db/postgres"
 cp "${script}" "${partial_index_checker}" "${shallow_remote}/scripts/"
+cp "${base_helper}" "${shallow_remote}/scripts/lib/migration-base.sh"
 mkdir -p "${shallow_remote}/ci/scripts"
 cat >"${shallow_remote}/ci/scripts/ensure-uv.sh" <<'SH'
 #!/usr/bin/env bash

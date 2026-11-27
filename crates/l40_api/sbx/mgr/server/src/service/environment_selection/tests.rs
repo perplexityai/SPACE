@@ -1,7 +1,7 @@
 use super::*;
 use crate::node_manager_transport::fake::FakeNodeManager;
 use crate::service::SandboxManagerServiceOptions;
-use pplx_space_common_core::types::Arch;
+use pplx_space_cpu_arch::Arch;
 use pplx_space_node_mgr_client::proto::ResolveExecutionEnvironmentResponse;
 use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
 

@@ -1,6 +1,6 @@
 use super::*;
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_node_api_sim::SimWorkerHarness;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::proto as sbx_proto;
 
 #[test]
@@ -404,6 +404,34 @@ fn api_boot_mode_accepts_explicit_warm_modes_without_custom_shape() {
 }
 
 #[test]
+fn shaped_default_create_tries_the_pool_only_with_a_full_shape_and_no_disk() {
+    let shape = |vcpu, memory_mib, disk_mib| SandboxResources {
+        vcpu,
+        memory_mib,
+        disk_mib,
+    };
+    let full = shape(Some(2), Some(1024), None);
+    assert_eq!(
+        CreateBootMode::Cold.for_pool_attempt(None, &full),
+        CreateBootMode::Fallthrough
+    );
+    assert_eq!(
+        CreateBootMode::Cold.for_pool_attempt(Some("cold"), &full),
+        CreateBootMode::Cold
+    );
+    for partial in [
+        shape(Some(2), Some(1024), Some(4096)),
+        shape(Some(2), None, None),
+        shape(None, Some(1024), None),
+    ] {
+        assert_eq!(
+            CreateBootMode::Cold.for_pool_attempt(None, &partial),
+            CreateBootMode::Cold
+        );
+    }
+}
+
+#[test]
 fn committed_suspend_response_keeps_valid_artifact_identity() {
     let sandbox_id = SandboxId::new();
     let local_artifact_id = LocalArtifactId::new();
@@ -435,8 +463,37 @@ fn committed_suspend_response_downgrades_unusable_artifact_identity() {
     );
 }
 
+/// A `DbError` classifies as the `sqlx::Error` it wraps, through both
+/// methods. That the conversion back is lossless is postgres-pool's
+/// `display_and_the_conversion_back_are_the_drivers`.
+async fn assert_db_error_classifies_alike(
+    db: &pplx_space_db_test_fixtures::TestDb,
+    sqlstate: &str,
+    expected: &SubstrateError,
+) {
+    let what = "failed to lock the sandbox row";
+    let raise = || pplx_space_db_test_fixtures::raise_sqlstate(&db.pool, sqlstate);
+    let through = Err::<(), _>(pplx_space_postgres_pool::DbError::from(raise().await))
+        .db_context(what)
+        .expect_err("the statement failed");
+    assert_eq!(
+        format!("{through:?}"),
+        format!("{expected:?}"),
+        "{sqlstate}"
+    );
+    let through = Err::<(), _>(pplx_space_postgres_pool::DbError::from(raise().await))
+        .db_context_with(|| what.to_string())
+        .expect_err("the statement failed");
+    assert_eq!(
+        format!("{through:?}"),
+        format!("{expected:?}"),
+        "{sqlstate}"
+    );
+}
+
 /// The producer half of the substrate's contention classification: what
-/// `db_context` turns each SQLSTATE into.
+/// `db_context` turns each SQLSTATE into, raised as a `sqlx::Error` and as a
+/// `DbError` wrapping one.
 ///
 /// Every `sqlx` statement in the substrate reaches this one function, so its
 /// two dispositions are asserted here rather than at each call site. The
@@ -461,6 +518,7 @@ async fn db_context_separates_a_lost_lock_race_from_a_real_failure()
             matches!(error, SubstrateError::LockContention { .. }),
             "{sqlstate} must classify as contention, got {error:?}"
         );
+        assert_db_error_classifies_alike(&db, sqlstate, &error).await;
     }
 
     // `57014` is a statement timeout, not a lock race: the statement was too
@@ -475,6 +533,7 @@ async fn db_context_separates_a_lost_lock_race_from_a_real_failure()
             matches!(error, SubstrateError::Failed { .. }),
             "{sqlstate} must stay a failure, got {error:?}"
         );
+        assert_db_error_classifies_alike(&db, sqlstate, &error).await;
         // The failure keeps its context so the log names the statement.
         assert!(error.to_string().contains("failed to lock the sandbox row"));
     }
@@ -1025,4 +1084,94 @@ fn the_node_answer_is_never_a_false_all_clear() {
         "a stub whose pin, liveness and lifecycle are defaults must be marked, or it reads as \
          the one shape an evacuation may open on"
     );
+}
+
+/// What a refused `EnqueueArtifactBackup` answers on both enqueue paths.
+/// `Aborted`, a sandbox not yet stopped or suspended, is the `Conflict`
+/// `FailedPrecondition` is: the retire and the drain's promotion key on
+/// `Conflict` and its markers. `Unavailable`, node-manager's busy refusal
+/// that sandbox-manager passes through, stays retryable.
+#[test]
+fn a_not_yet_stopped_backup_refusal_is_the_conflict_it_was() {
+    let sandbox_id = SandboxId::new();
+    for (code, expected) in [
+        (tonic::Code::FailedPrecondition, "conflict"),
+        (tonic::Code::Aborted, "conflict"),
+        (tonic::Code::Unavailable, "unavailable"),
+        (tonic::Code::Internal, "failed"),
+    ] {
+        let error = artifact_backup_refusal(
+            &tonic::Status::new(code, "sandbox is started"),
+            sandbox_id,
+            "node-a",
+        );
+        let answered = match &error {
+            SubstrateError::Conflict { message } if message.contains("sandbox is started") => {
+                "conflict"
+            }
+            SubstrateError::Unavailable { .. } => "unavailable",
+            SubstrateError::Failed { .. } => "failed",
+            _ => "other",
+        };
+        assert_eq!(answered, expected, "{code:?}: {error:?}");
+    }
+}
+
+/// The same refusal, sent by a node over gRPC, through the two enqueue paths
+/// the api's callers take: the teardown retire's (a worker client) and the
+/// admin upload's (the retrying node-api client the adapter builds). Both
+/// answer `Conflict` for `Aborted` as for `FailedPrecondition`.
+#[tokio::test]
+async fn a_not_yet_stopped_backup_refusal_is_a_conflict_on_each_api_path()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let server = SimWorkerHarness::builder("not-yet-stopped-backup-node")
+        .start()
+        .await?;
+    for code in [tonic::Code::FailedPrecondition, tonic::Code::Aborted] {
+        let sandbox_id = SandboxId::new();
+        server
+            .state()
+            .refuse_next_artifact_backup(sandbox_id.to_string(), code)
+            .await;
+        let channel = node_api_endpoint(
+            server.endpoint(),
+            Duration::from_secs(3),
+            Duration::from_secs(10),
+        )?
+        .connect()
+        .await?;
+        let mut client = RuntimeClient::new(channel, server.endpoint());
+        let retire = enqueue_artifact_backup_with_client(
+            &mut client,
+            server.endpoint(),
+            sandbox_id,
+            ArtifactKind::Disk,
+            BackupSource::CurrentInstance,
+        )
+        .await;
+        assert!(
+            matches!(&retire, Err(SubstrateError::Conflict { message }) if message.contains("isn't stopped")),
+            "{code:?}: {retire:?}"
+        );
+
+        server
+            .state()
+            .refuse_next_artifact_backup(sandbox_id.to_string(), code)
+            .await;
+        let upload = enqueue_artifact_backup_via_retrying_node_api(
+            server.endpoint(),
+            sandbox_id,
+            ArtifactKind::Full,
+            BackupSource::CurrentInstance,
+        )
+        .await;
+        assert!(
+            matches!(&upload, Err(SubstrateError::Conflict { message }) if message.contains("isn't stopped")),
+            "{code:?}: {upload:?}"
+        );
+    }
+    Ok(())
 }

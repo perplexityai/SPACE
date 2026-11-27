@@ -137,12 +137,19 @@ fn node_execution_cleanup_acknowledgements_are_retryable_and_fenced() {
         Some(fourth.current())
     );
 }
-use pplx_space_common_core::types::{
-    Arch, ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
+use pplx_space_accounts::UserId;
+use pplx_space_auto_lifecycle::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
-    AutoLifecycleStage, Digest, ExecutionMetadata, LinuxPid, LinuxUid, SandboxActivationAttemptId,
-    SandboxId, UserId, VsockCid,
+    AutoLifecycleStage,
 };
+use pplx_space_content_digest::Digest;
+use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{
+    ArtifactComponentKind, ArtifactComponentMetadata, ExecutionMetadata,
+};
+use pplx_space_execution_spec::{ArtifactFormat, ArtifactVersion};
+use pplx_space_linux_ids::{LinuxPid, LinuxUid, VsockCid};
+use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId};
 use uuid::Uuid;
 
 #[test]
@@ -302,7 +309,7 @@ fn cleanup_intent_cannot_be_replaced_by_suspend_or_resident_completion() {
                     refusal: StateWriteRefusal::Guard(StateWriteGuard::CleanupOwned),
                 }
             );
-            assert!(!begin_suspend(&conn, &id).unwrap());
+            assert!(!begin_suspend(&conn, &id, LocalArtifactId::new()).unwrap());
             let row = get_sandbox(&conn, &id).unwrap().unwrap();
             assert_eq!(row.state, expected);
             assert_eq!(row.cleanup_completion, Some(CleanupCompletion::DeleteRow));
@@ -313,8 +320,8 @@ fn cleanup_intent_cannot_be_replaced_by_suspend_or_resident_completion() {
         &conn,
         TestSandboxInsert::new(&id, "sandbox2", SandboxState::Paused),
     );
-    assert!(begin_suspend(&conn, &id).unwrap());
-    assert!(!begin_suspend(&conn, &id).unwrap());
+    assert!(begin_suspend(&conn, &id, LocalArtifactId::new()).unwrap());
+    assert!(!begin_suspend(&conn, &id, LocalArtifactId::new()).unwrap());
 }
 
 #[test]
@@ -725,8 +732,11 @@ fn a_type_mismatched_column_makes_one_row_malformed_not_the_whole_scan() {
 fn quarantine_recovery_candidate_scan_propagates_statement_failures() {
     let directory = tempfile::tempdir().unwrap();
     let database_path = directory.path().join("sandbox-manager.db");
-    let mut conn = Connection::open_at(&database_path).unwrap();
-    create_test_schema(&mut conn);
+    create_test_schema_on_disk(&database_path);
+    let conn = Connection::open_at(&database_path).unwrap();
+    // The contention is about locks, not durability, so no commit needs an
+    // fsync.
+    conn.pragma_update(None, "synchronous", "OFF").unwrap();
     setup_quarantine_recovery_episode(
         &conn,
         SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
@@ -1678,7 +1688,7 @@ fn restore_adopt_insert_binds_volume_encryption() {
     let user = SandboxOwner::parse("user".to_string()).unwrap();
     let env = BTreeMap::new();
     let lifecycle = AutoLifecyclePolicy::disabled();
-    let restore_source: pplx_space_common_core::types::ExactStorageUri =
+    let restore_source: pplx_space_artifact_model::ExactStorageUri =
         "s3://snapshots/suspend/restore?region=us-east-1"
             .parse()
             .unwrap();
@@ -1798,7 +1808,7 @@ fn restore_adoption_clears_obsolete_auto_lifecycle_delete_block() {
     )
     .unwrap();
 
-    let restore_source: pplx_space_common_core::types::ExactStorageUri =
+    let restore_source: pplx_space_artifact_model::ExactStorageUri =
         "s3://snapshots/suspend/restore?region=us-east-1"
             .parse()
             .unwrap();
@@ -1956,7 +1966,7 @@ fn insert_sandbox_persists_only_explicit_rootfs_size_override() {
 #[test]
 fn insert_sandbox_persists_effective_disk_io_limits() {
     let conn = crate::db::test_conn();
-    let expected = pplx_space_common_core::types::DiskIoLimits::try_new(5_000, 200).unwrap();
+    let expected = pplx_space_execution_spec::DiskIoLimits::try_new(5_000, 200).unwrap();
 
     insert_test_sandbox(
         &conn,
@@ -1991,7 +2001,7 @@ fn suspend_snapshot_publication_exposes_identity_only_with_terminal_state() {
         crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
     )
     .unwrap();
-    begin_suspend(&conn, &sandbox_id).unwrap();
+    begin_suspend(&conn, &sandbox_id, LocalArtifactId::new()).unwrap();
     let accepted = get_sandbox(&conn, &sandbox_id).unwrap().unwrap();
     assert_eq!(
         accepted.state,
@@ -2053,7 +2063,27 @@ fn teardown_suspend_keeps_the_runtime_until_the_staged_artifact_is_durable() {
     let local_artifact_id = LocalArtifactId::new();
     let generation = ExecutionGeneration::new(1).unwrap();
 
-    begin_teardown_suspend(&conn, "sandbox-1", generation).unwrap();
+    begin_teardown_suspend(&conn, "sandbox-1", generation, local_artifact_id).unwrap();
+    let wrong = LocalArtifactId::new();
+    let before = get_sandbox(&conn, "sandbox-1").unwrap().unwrap();
+    assert!(
+        stage_teardown_suspend_artifact(
+            &conn,
+            "sandbox-1",
+            generation,
+            wrong,
+            "/cache/sandbox-1/wrong",
+        )
+        .is_err()
+    );
+    let after = get_sandbox(&conn, "sandbox-1").unwrap().unwrap();
+    assert_eq!(after.state, before.state);
+    assert_eq!(
+        after.current_local_artifact_id,
+        before.current_local_artifact_id
+    );
+    assert_eq!(after.updated_at, before.updated_at);
+    assert!(get_local_artifact(&conn, wrong).unwrap().is_none());
     stage_teardown_suspend_artifact(
         &conn,
         "sandbox-1",
@@ -2130,7 +2160,7 @@ fn retried_suspend_cleanup_retains_publication_identity_for_pinned_artifact() {
     )
     .unwrap();
     let local_artifact_id = LocalArtifactId::new();
-    begin_teardown_suspend(&conn, &sandbox_id, generation).unwrap();
+    begin_teardown_suspend(&conn, &sandbox_id, generation, local_artifact_id).unwrap();
     stage_teardown_suspend_artifact(
         &conn,
         &sandbox_id,
@@ -2163,7 +2193,13 @@ fn teardown_suspend_journal_persists_the_local_execution_lease() {
         &conn,
         TestSandboxInsert::new("sandbox-1", "sandbox1", SandboxState::Paused),
     );
-    begin_teardown_suspend(&conn, "sandbox-1", ExecutionGeneration::new(7).unwrap()).unwrap();
+    begin_teardown_suspend(
+        &conn,
+        "sandbox-1",
+        ExecutionGeneration::new(7).unwrap(),
+        LocalArtifactId::new(),
+    )
+    .unwrap();
 
     let (payload, dedup_key): (String, String) = conn
         .query_row(
@@ -2293,7 +2329,7 @@ fn restaging_the_same_teardown_artifact_preserves_its_durability_marker() {
     let local_artifact_id = LocalArtifactId::new();
     let generation = ExecutionGeneration::new(1).unwrap();
 
-    begin_teardown_suspend(&conn, "sandbox-1", generation).unwrap();
+    begin_teardown_suspend(&conn, "sandbox-1", generation, local_artifact_id).unwrap();
     stage_teardown_suspend_artifact(
         &conn,
         "sandbox-1",
@@ -2346,7 +2382,7 @@ fn suspended_cleanup_completion_dedupes_prior_suspend_row() {
     );
 
     // First suspend: Paused -> Suspending -> Suspended pinned on A1.
-    begin_suspend(&conn, "sandbox-1").unwrap();
+    begin_suspend(&conn, "sandbox-1", LocalArtifactId::new()).unwrap();
     let a1 = LocalArtifactId::new();
     complete_row_intent_cleanup(
         &conn,
@@ -2359,7 +2395,7 @@ fn suspended_cleanup_completion_dedupes_prior_suspend_row() {
 
     // Simulate a wake-and-resuspend cycle, including its stable paused state.
     state_write_fixtures::force_state(&conn, "sandbox-1", SandboxState::Paused);
-    assert!(begin_suspend(&conn, "sandbox-1").unwrap());
+    assert!(begin_suspend(&conn, "sandbox-1", LocalArtifactId::new()).unwrap());
     let a2 = LocalArtifactId::new();
     complete_row_intent_cleanup(
         &conn,
@@ -2416,7 +2452,7 @@ fn publish_restored_suspended_artifact_dedupes_prior_suspend_row() {
         &conn,
         TestSandboxInsert::new("sandbox-1", "sandbox1", SandboxState::Paused),
     );
-    begin_suspend(&conn, "sandbox-1").unwrap();
+    begin_suspend(&conn, "sandbox-1", LocalArtifactId::new()).unwrap();
     let a1 = LocalArtifactId::new();
     complete_row_intent_cleanup(
         &conn,
@@ -2499,7 +2535,7 @@ fn materializing_a_stopped_sandbox_keeps_the_artifact_pin_it_was_evacuated_with(
         insert_restore_transfer_scope(
             &conn,
             "sandbox-1",
-            pplx_space_common_core::types::TransferScopeId::new(),
+            pplx_space_snapshot_model::TransferScopeId::new(),
             None,
             None,
             "/space/cache/restore-staging/evacuated-stopped",
@@ -2958,7 +2994,7 @@ fn restored_disk_as_new_becomes_a_stopped_sandbox_without_donor_runtime_identity
         insert_restore_transfer_scope(
             &conn,
             "sandbox-1",
-            pplx_space_common_core::types::TransferScopeId::new(),
+            pplx_space_snapshot_model::TransferScopeId::new(),
             None,
             None,
             "/space/cache/restore-staging/artifact-as-new",
@@ -3595,7 +3631,7 @@ fn claim_pool_sandbox_claims_matching_required_user() {
     insert_test_sandbox(
         &conn,
         TestSandboxInsert {
-            user: pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER.to_string(),
+            user: pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER.to_string(),
             pool_template: Some("pool-seed".to_string()),
             ..TestSandboxInsert::new("tmplmgr-pool", "tmplpool", SandboxState::Paused)
         },
@@ -3617,7 +3653,7 @@ fn claim_pool_sandbox_claims_matching_required_user() {
         "tmplmgr-pool",
         "pool-seed",
         Some("hash"),
-        Some(&pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER),
+        Some(&pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER),
         &adopter_owner,
         &adopted_env,
     )
@@ -3657,13 +3693,13 @@ fn pool_adoption_rollback_restores_donor_route_identity() {
     insert_test_sandbox(
         &conn,
         TestSandboxInsert {
-            user: pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER.to_string(),
+            user: pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER.to_string(),
             pool_template: Some("pool-seed".to_string()),
             ..TestSandboxInsert::new(&sandbox_id, "tmplpool", SandboxState::Paused)
         },
     );
     let donor_identity_update = SpaceApiRouteIdentity {
-        route_generation: Some(pplx_space_common_core::types::RouteGeneration::new(7).unwrap()),
+        route_generation: Some(pplx_space_sandbox_model::RouteGeneration::new(7).unwrap()),
         ..Default::default()
     };
     update_space_api_route_identity(
@@ -3684,14 +3720,14 @@ fn pool_adoption_rollback_restores_donor_route_identity() {
         &sandbox_id,
         "pool-seed",
         Some("hash"),
-        Some(&pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER),
+        Some(&pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER),
         &adopter_owner,
         &BTreeMap::new(),
     )
     .unwrap()
     .unwrap();
     let adopted_identity = SpaceApiRouteIdentity {
-        route_generation: Some(pplx_space_common_core::types::RouteGeneration::new(8).unwrap()),
+        route_generation: Some(pplx_space_sandbox_model::RouteGeneration::new(8).unwrap()),
         ..Default::default()
     };
     update_space_api_route_identity(
@@ -3714,7 +3750,7 @@ fn pool_adoption_rollback_restores_donor_route_identity() {
         &sandbox_id,
         "pool-seed",
         Some("hash"),
-        Some(&pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER),
+        Some(&pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER),
         &adopter_owner,
         &BTreeMap::new(),
     )
@@ -3779,7 +3815,7 @@ fn claim_pool_sandbox_returns_none_without_required_user_match() {
         "tenant-pool",
         "pool-seed",
         Some("hash"),
-        Some(&pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER),
+        Some(&pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER),
         &adopter_owner,
         &BTreeMap::new(),
     )
@@ -6062,7 +6098,7 @@ fn orphan_quarantine_recovery_clears_staging_failure() {
         is_orphan_quarantine_recovery_state(&conn, &sandbox_id_string, SandboxState::Restoring,)
             .unwrap()
     );
-    let transfer_scope_id = pplx_space_common_core::types::TransferScopeId::new();
+    let transfer_scope_id = pplx_space_snapshot_model::TransferScopeId::new();
     assert!(
         insert_restore_transfer_scope(
             &conn,
@@ -6146,7 +6182,7 @@ fn canonical_restore_reclaim_requires_the_exact_attempt_and_no_runtime() {
     .unwrap();
     let generation = ExecutionGeneration::new(7).unwrap();
     let activation_attempt_id = SandboxActivationAttemptId::new();
-    let transfer_scope_id = pplx_space_common_core::types::TransferScopeId::new();
+    let transfer_scope_id = pplx_space_snapshot_model::TransferScopeId::new();
     assert!(
         insert_restore_transfer_scope(
             &conn,
@@ -6232,7 +6268,7 @@ fn retryable_restore_scope_handoff_rejects_a_after_b_and_admits_c() {
     let attempt_c = SandboxActivationAttemptId::from_uuid(
         Uuid::parse_str("019c0000-0000-7000-8000-000000000003").unwrap(),
     );
-    let scope_a = pplx_space_common_core::types::TransferScopeId::new();
+    let scope_a = pplx_space_snapshot_model::TransferScopeId::new();
     assert!(
         insert_restore_transfer_scope(
             &conn,
@@ -6360,7 +6396,7 @@ fn authoritative_restore_attempt_claims_legacy_unowned_retryable_scope() {
     )
     .unwrap();
 
-    let legacy_scope = pplx_space_common_core::types::TransferScopeId::new();
+    let legacy_scope = pplx_space_snapshot_model::TransferScopeId::new();
     assert!(
         insert_restore_transfer_scope(
             &conn,
@@ -6446,7 +6482,7 @@ fn exchanged_restore_cleanup_owner_advances_without_moving_the_scope() {
     let attempt_c = SandboxActivationAttemptId::from_uuid(
         Uuid::parse_str("019c0000-0000-7000-8000-000000000003").unwrap(),
     );
-    let exchanged_scope = pplx_space_common_core::types::TransferScopeId::new();
+    let exchanged_scope = pplx_space_snapshot_model::TransferScopeId::new();
     let staging_dir = "/space/cache/restore-staging/exchanged";
     assert!(
         insert_restore_transfer_scope(
@@ -6819,8 +6855,11 @@ fn start_arms_access_idle_only_after_guest_readiness() {
 fn legacy_equal_route_and_operation_receipt_survives_restart_without_split_field() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("manager.sqlite");
-    let mut conn = Connection::open_at(&path).unwrap();
-    create_test_schema(&mut conn);
+    create_test_schema_on_disk(&path);
+    let conn = Connection::open_at(&path).unwrap();
+    // The test models a process restart, not a host crash, so no commit
+    // needs an fsync.
+    conn.pragma_update(None, "synchronous", "OFF").unwrap();
     let sandbox_id = SandboxId::new().to_string();
     insert_test_sandbox(
         &conn,
@@ -6843,6 +6882,7 @@ fn legacy_equal_route_and_operation_receipt_survives_restart_without_split_field
 
     drop(conn);
     let conn = Connection::open_at(&path).unwrap();
+    conn.pragma_update(None, "synchronous", "OFF").unwrap();
     assert!(mark_start_succeeded(&conn, &sandbox_id, Some(episode.id)).unwrap());
     let metadata = sandbox_state_publication_metadata(&conn, std::slice::from_ref(&sandbox_id))
         .unwrap()
@@ -10263,6 +10303,7 @@ fn teardown_suspend_reconciliation_skips_healthy_and_retained_jobs_and_bounds_cl
 mod accepted_shapes_cleanup_episodes;
 mod accepted_shapes_quarantine;
 mod accepted_shapes_single_statement;
+mod cleanup_delete_receipt;
 mod cleanup_quarantine_refusal;
 mod cleanup_state_split;
 mod local_network_policy_clear;
@@ -10294,3 +10335,106 @@ fn an_unknown_previous_status_is_reported_as_stored() {
     assert_eq!(details.from_state.as_deref(), Some("stopping"));
     assert_eq!(details.from_cleanup_state.as_deref(), Some("failed"));
 }
+
+#[test]
+fn suspend_attempt_is_atomic_immutable_and_cleared_only_on_resolution() {
+    let conn = test_conn();
+    let id = SandboxId::new().to_string();
+    insert_test_sandbox(
+        &conn,
+        TestSandboxInsert::new(&id, "attempt1", SandboxState::Paused),
+    );
+    assert!(read::suspend_attempt(&conn, &id).unwrap().is_none());
+    let artifact = LocalArtifactId::new();
+    assert!(begin_suspend(&conn, &id, artifact).unwrap());
+    let attempt = read::suspend_attempt(&conn, &id).unwrap().unwrap();
+    assert_eq!(attempt.artifact_id, artifact);
+    assert!(!begin_suspend(&conn, &id, LocalArtifactId::new()).unwrap());
+    conn.execute(
+        "UPDATE sandboxes SET updated_at = updated_at + 3600 WHERE id = ?1",
+        [&id],
+    )
+    .unwrap();
+    assert_eq!(read::suspend_attempt(&conn, &id).unwrap(), Some(attempt));
+    let down = include_str!(
+        "../../../../../../../db/sandbox-manager/20261112160000_suspend_attempt.down.sql"
+    );
+    // A rollback cannot silently discard unresolved ownership.
+    assert!(conn.execute_batch(down).is_err());
+    conn.execute_batch("DROP TABLE IF EXISTS temp.suspend_attempt_rollback_guard")
+        .unwrap();
+    assert!(rollback_suspending_to_paused(&conn, &id).unwrap());
+    assert!(read::suspend_attempt(&conn, &id).unwrap().is_none());
+    assert!(begin_suspend(&conn, &id, artifact).unwrap());
+    pin_suspended_artifact_for_cleanup(&conn, &id, artifact, "/synthetic/snapshot").unwrap();
+    assert!(
+        read::suspend_attempt(&conn, &id).unwrap().is_some(),
+        "cleanup retains the attempt"
+    );
+}
+
+#[test]
+fn cleanup_and_eviction_keep_the_capture_attempt_until_physical_work_settles() {
+    for completion in [
+        CleanupCompletion::DeleteRow,
+        CleanupCompletion::MarkStopped,
+        CleanupCompletion::MarkSuspended,
+    ] {
+        let conn = test_conn();
+        let id = SandboxId::new().to_string();
+        insert_test_sandbox(
+            &conn,
+            TestSandboxInsert::new(&id, "cleanup1", SandboxState::Paused),
+        );
+        assert!(begin_suspend(&conn, &id, LocalArtifactId::new()).unwrap());
+        let attempt = read::suspend_attempt(&conn, &id).unwrap();
+        mark_cleanup_required(
+            &conn,
+            &id,
+            true,
+            completion,
+            "synthetic interrupted cleanup",
+        )
+        .unwrap();
+        assert_eq!(
+            read::suspend_attempt(&conn, &id).unwrap(),
+            attempt,
+            "{completion:?}"
+        );
+    }
+    let conn = test_conn();
+    let id = SandboxId::new().to_string();
+    insert_test_sandbox(
+        &conn,
+        TestSandboxInsert::new(&id, "evict001", SandboxState::Paused),
+    );
+    let generation = ExecutionGeneration::new(1).unwrap();
+    let artifact = LocalArtifactId::new();
+    begin_teardown_suspend(&conn, &id, generation, artifact).unwrap();
+    let attempt = read::suspend_attempt(&conn, &id).unwrap();
+    stage_teardown_suspend_artifact(&conn, &id, generation, artifact, "/synthetic/snapshot")
+        .unwrap();
+    fail_teardown_suspend_backup_operation(&conn, &id, generation, artifact).unwrap();
+    let changed_at: String = conn
+        .query_row(
+            "SELECT state_changed_at FROM sandboxes WHERE id = ?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        claim_teardown_suspend_failed_sandbox_for_eviction(&conn, &id, artifact, &changed_at)
+            .unwrap()
+    );
+    assert_eq!(read::suspend_attempt(&conn, &id).unwrap(), attempt);
+    assert_eq!(
+        sandbox_erase_safety(
+            SandboxState::Quarantined,
+            None,
+            Some(SUSPEND_CAPTURE_UNRESOLVED)
+        ),
+        SandboxEraseSafety::RetainedFilesystemOnlyCopy
+    );
+}
+
+mod published_suspend;

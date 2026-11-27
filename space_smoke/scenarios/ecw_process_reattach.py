@@ -3,6 +3,7 @@
 import space_smoke as smoke
 
 MARKER = "space-smoke-process-reattach"
+RELEASE = "/tmp/space-smoke-process-reattach-release"
 
 
 @smoke.scenario("ecw.process_reattach")
@@ -13,14 +14,17 @@ def process_reattach(test: smoke.Ecw) -> None:
 
     with test.phase("start and disconnect from background process"):
         process = test.sandbox.start_background(
-            f"sleep 10 && printf %s {MARKER}",
+            f"while ! test -f {RELEASE}; do sleep 0.05; done; printf %s {MARKER}",
             timeout=20,
         )
         pid = process.pid
         process.disconnect()
 
     with test.phase("reattach and verify process result"):
-        result = test.reattach_process(pid, timeout=20).wait()
+        attached = test.reattach_process(pid, timeout=20)
+        # The process cannot finish before the new attachment exists.
+        test.sandbox.files.write(RELEASE, "release")
+        result = attached.wait()
         test.verify(
             result.exit_code == 0 and result.stdout == MARKER,
             "reattached ECW process did not return its final result",

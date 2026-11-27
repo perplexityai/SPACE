@@ -55,7 +55,7 @@ where
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn teardown_reuses_ready_backup_but_waits_for_active_local_upload() {
     use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
     use std::ffi::OsStr;
 
     // The parent serves while the isolated child exercises environment-based
@@ -179,7 +179,7 @@ async fn teardown_reuses_ready_backup_but_waits_for_active_local_upload() {
 #[tokio::test]
 async fn failed_teardown_defers_repeated_polls_without_holding_driver_capacity() {
     use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
     let conn = crate::db::test_conn();
     let sandbox = SandboxId::new();
     let generation = ExecutionGeneration::new(7).unwrap();
@@ -222,8 +222,8 @@ async fn teardown_retry_seals_publishes_backs_up_and_completes_the_same_capture(
         record_encrypted_capture_in, sealing_node_manager_builder,
     };
     use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
-    use pplx_space_common_core::types::ExecutionGeneration;
     use pplx_space_node_mgr_client::proto::{CleanupSandboxRequest, CleanupSandboxResponse};
+    use pplx_space_sandbox_model::ExecutionGeneration;
     use std::ffi::OsStr;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -267,6 +267,7 @@ async fn teardown_retry_seals_publishes_backs_up_and_completes_the_same_capture(
         let cache = tempfile::tempdir().unwrap();
         let (capture, _) =
             record_encrypted_capture_in(cache.path(), &id, std::time::Duration::ZERO, true);
+        conn.execute("UPDATE sandboxes SET suspend_attempt_artifact_id = ?1, suspend_attempt_started_at = ?2 WHERE id = ?3", crate::db::fixture::params![capture.to_string(), jiff::Timestamp::now().as_second(), &id]).unwrap();
         let node_manager = sealing_node_manager_builder(1)
             .unary("CleanupSandbox", |_: CleanupSandboxRequest| {
                 Ok(CleanupSandboxResponse::default())
@@ -585,16 +586,23 @@ async fn node_local_handoff(
     upload_retry_secs: Option<u64>,
 ) -> NodeLocalHandoff {
     use crate::service::tests::service_tests::{insert_test_sandbox, runtime_fields};
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
 
     let conn = crate::db::test_conn();
     let id = sandbox_id.to_string();
     insert_test_sandbox(&conn, &id, SandboxState::Paused);
     let mut fields = runtime_fields(ExecutionGeneration::new(GENERATION).unwrap(), 7);
     fields.space_api_route_identity.substrate_kind =
-        Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes);
+        Some(pplx_space_node_model::NodeManagedBy::Kubernetes);
     crate::db::update_runtime_fields(&conn, sandbox_id, fields).unwrap();
-    assert!(crate::db::begin_suspend(&conn, &id).unwrap());
+    assert!(
+        crate::db::begin_suspend(
+            &conn,
+            &id,
+            pplx_space_snapshot_model::LocalArtifactId::new()
+        )
+        .unwrap()
+    );
     let mut options = SandboxManagerServiceOptions {
         volume_manager_socket_path: volume_manager.socket.clone(),
         ..SandboxManagerServiceOptions::for_test_in(scratch)
@@ -619,9 +627,10 @@ async fn node_local_handoff(
             &sandbox,
             artifact_id,
             snapshot_dir.to_str().unwrap(),
-            SuspendSnapshotFormat::Full,
+            Some(SuspendSnapshotFormat::Full),
         )
-        .await;
+        .await
+        .map_err(|error| super::artifact_backup_fence_status(error.to_string()));
     NodeLocalHandoff {
         service,
         artifact_id,
@@ -635,7 +644,7 @@ async fn suspended_after_node_local_upload(
     volume_manager: &FakeVolumeManager,
     scratch: &std::path::Path,
 ) -> NodeLocalSuspended {
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
 
     let sandbox_id = match upload {
         NodeLocalUpload::RegistrationRefused => SandboxId::from_uuid(REFUSED_SANDBOX),
@@ -753,8 +762,8 @@ async fn teardown_after_node_local_suspend_shares_its_upload_or_settles_its_fail
 /// row isn't marked as finished failing until that attempt fails too.
 async fn captured_upload_failing_twice() {
     use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
-    use pplx_space_common_core::types::ExecutionGeneration;
     use pplx_space_common_jobs::JobStatus;
+    use pplx_space_sandbox_model::ExecutionGeneration;
 
     let generation = ExecutionGeneration::new(GENERATION).unwrap();
     let volume_manager = FakeVolumeManager::serve(Transfers::Failed);
@@ -834,8 +843,8 @@ async fn teardown_after_node_local_upload(upload: NodeLocalUpload) {
     use crate::proto::enqueue_artifact_backup_request::Source;
     use crate::service::activation_support::internal_request;
     use crate::service::tests::service_tests::prepare_teardown_suspend_request;
-    use pplx_space_common_core::types::ExecutionGeneration;
     use pplx_space_common_jobs::JobStatus;
+    use pplx_space_sandbox_model::ExecutionGeneration;
 
     let generation = ExecutionGeneration::new(GENERATION).unwrap();
     let volume_manager = FakeVolumeManager::serve(match upload {
@@ -1064,10 +1073,7 @@ async fn upload_after_refused_handoff(after: AfterRefusedHandoff) -> String {
     let id = sandbox_id.to_string();
     let runtime_live = !matches!(after, AfterRefusedHandoff::Quarantined);
     let NodeLocalHandoff {
-        service,
-        artifact_id,
-        handoff,
-        ..
+        service, handoff, ..
     } = node_local_handoff(
         sandbox_id,
         &volume_manager,
@@ -1080,22 +1086,39 @@ async fn upload_after_refused_handoff(after: AfterRefusedHandoff) -> String {
         Some(1),
     )
     .await;
-    if matches!(after, AfterRefusedHandoff::QuarantinedLive) {
-        // The quarantine the failure falls back to when the rollback's write
-        // fails; the test can't fail that write.
-        handoff.expect_err("vol-mgr refuses the handoff's pushes");
+    handoff.expect_err("vol-mgr refuses the handoff's pushes");
+    // Exercise historical/superseded lifecycle outcomes explicitly. Handoff
+    // refusal itself now preserves the publication owner for reconciliation.
+    {
         let db = service.db.lock().unwrap();
-        assert!(crate::db::mark_suspending_quarantined(&db, &id, "rollback failed").unwrap());
-    } else {
-        service
-            .require_node_local_backup_handoff(&id, artifact_id, handoff)
-            .expect_err("vol-mgr refuses the handoff's pushes");
+        match after {
+            AfterRefusedHandoff::Paused | AfterRefusedHandoff::Resuspends => {
+                assert!(crate::db::rollback_suspending_to_paused(&db, &id).unwrap());
+            }
+            AfterRefusedHandoff::Quarantined | AfterRefusedHandoff::QuarantinedLive => {
+                assert!(
+                    crate::db::mark_suspending_quarantined(
+                        &db,
+                        &id,
+                        "synthetic historical failure"
+                    )
+                    .unwrap()
+                );
+            }
+        }
     }
     let expected = match after {
         AfterRefusedHandoff::Paused => SandboxState::Paused,
         AfterRefusedHandoff::Resuspends => {
             let db = service.db.lock().unwrap();
-            assert!(crate::db::begin_suspend(&db, &id).unwrap());
+            assert!(
+                crate::db::begin_suspend(
+                    &db,
+                    &id,
+                    pplx_space_snapshot_model::LocalArtifactId::new()
+                )
+                .unwrap()
+            );
             SandboxState::Suspending
         }
         AfterRefusedHandoff::Quarantined | AfterRefusedHandoff::QuarantinedLive => {

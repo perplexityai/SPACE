@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SnapshotId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -111,7 +111,7 @@ impl RetentionSink for RecordingSink {
         limit: i64,
         _after: Option<SnapshotId>,
         _min_age: Option<Duration>,
-    ) -> Result<pplx_space_snapshot_retention::CandidatePage, sqlx::Error> {
+    ) -> Result<pplx_space_snapshot_retention::CandidatePage, RetentionStoreError> {
         self.scans.fetch_add(1, Ordering::Relaxed);
         if let Some(limits) = &self.limits {
             limits.lock().unwrap().push(limit);
@@ -122,7 +122,7 @@ impl RetentionSink for RecordingSink {
         })
     }
 
-    async fn claimed_scan_epoch(&self) -> Result<Option<ClaimedScanEpoch>, sqlx::Error> {
+    async fn claimed_scan_epoch(&self) -> Result<Option<ClaimedScanEpoch>, RetentionStoreError> {
         Ok(None)
     }
 
@@ -131,7 +131,7 @@ impl RetentionSink for RecordingSink {
         _limit: i64,
         _after: Option<SnapshotId>,
         _through: SnapshotId,
-    ) -> Result<Vec<PruneCandidate>, sqlx::Error> {
+    ) -> Result<Vec<PruneCandidate>, RetentionStoreError> {
         Ok(Vec::new())
     }
 
@@ -140,7 +140,7 @@ impl RetentionSink for RecordingSink {
         _candidate: PruneCandidate,
         _keep_n: i64,
         _min_age: Option<Duration>,
-    ) -> Result<ClaimOutcome, sqlx::Error> {
+    ) -> Result<ClaimOutcome, RetentionStoreError> {
         unreachable!("disabled and misconfigured loops do not claim")
     }
 
@@ -148,7 +148,7 @@ impl RetentionSink for RecordingSink {
         &self,
         _snapshot_id: SnapshotId,
         _keep_n: i64,
-    ) -> Result<PruneFinalize, sqlx::Error> {
+    ) -> Result<PruneFinalize, RetentionStoreError> {
         unreachable!("disabled and misconfigured loops do not finalize")
     }
 }

@@ -11,7 +11,8 @@ use std::net::Ipv4Addr;
 use crate::proto::{RuntimeEnvironmentDesiredPolicy, RuntimeProvisioningRecipe};
 use crate::runtime_desired_state::RuntimeDesiredState;
 use crate::runtime_provisioning_cohort::{RuntimeProvisioningCohort, hash_bucket};
-use pplx_space_common_core::types::{Digest, EnvironmentReference};
+use pplx_space_content_digest::Digest;
+use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_node_api_client::MAX_RECIPE_ENVIRONMENTS;
 use pplx_space_runtime_environment_policy_store::{
     self as policy_store, PolicyChange, PolicyChangeReason, RuntimeEnvironmentState,
@@ -123,22 +124,22 @@ async fn insert_unreadable_catalog(pool: &sqlx::PgPool) -> TestResult {
 /// Default e0, deprecated e1, blocked e2, legacy off.
 async fn write_policy(pool: &sqlx::PgPool) -> TestResult {
     let mut tx = pool.begin().await?;
-    policy_store::set_default(&mut tx, environment(0), &change()).await?;
+    policy_store::set_default(&mut *tx, environment(0), &change()).await?;
     policy_store::set_environment_state(
-        &mut tx,
+        &mut *tx,
         environment(1),
         RuntimeEnvironmentState::Deprecated,
         &change(),
     )
     .await?;
     policy_store::set_environment_state(
-        &mut tx,
+        &mut *tx,
         environment(2),
         RuntimeEnvironmentState::Blocked,
         &change(),
     )
     .await?;
-    policy_store::set_legacy_unbound_allowed(&mut tx, false, &change()).await?;
+    policy_store::set_legacy_unbound_allowed(&mut *tx, false, &change()).await?;
     tx.commit().await?;
     Ok(())
 }

@@ -184,7 +184,7 @@ DEFAULT_COHORT_TAINT_KEY = "space.pplx.net/rollout-cohort"
 ROLLOUT_KINDS = ("lt", "instance_type", "eks_version", "capacity_type", "az", "other")
 
 # Label every sandbox pod (user-create, restore, evacuation, pooled) carries
-# via `build_sandbox_pod` (`crates/libs/common/core/src/k8s.rs`). Used to
+# via `build_sandbox_pod` (`crates/l40_api/sandbox/pod/src/lib.rs`). Used to
 # scope the cluster-wide Pending-pod query for the
 # `node_drain.evacuation_pods_pending` derived gauge.
 SANDBOX_POD_LABEL_SELECTOR = "app.kubernetes.io/name=space-sandbox"
@@ -1218,8 +1218,8 @@ def pick_terminate_candidates(
     `sandboxes_local_snapshots` disagrees with the guard both ways. It misses
     a `suspending` or non-evacuation `restoring` row pinned to the node, which
     the guard refuses on. And its in-flight arm still uses the legacy freshness
-    gate (`legacy_upload` in `admin/node_store/single_node_occupancy.rs`, and
-    the note in `admin/node_store.rs::batched_occupancy_rows`), so it counts a
+    gate (`legacy_upload` in the node and fleet statements of sandbox-store's
+    `admin_occupancy.rs`, and the note in its `batched_occupancy`), so it counts a
     `creating` row naming a non-current artifact, on a source node that isn't
     the sandbox's target, that the guard doesn't count. Screening on it would
     hold a node with only that row out of the wave on every tick without ever

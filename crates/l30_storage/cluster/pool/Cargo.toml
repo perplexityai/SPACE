@@ -8,7 +8,11 @@ license.workspace = true
 publish.workspace = true
 
 [package.metadata.space.state]
-postgres = ["kubernetes_pool_configs", "kubernetes_pool_slots"]
+postgres = [
+  "kubernetes_pool_configs",
+  "kubernetes_pool_slots",
+  "warm_pool_policies",
+]
 
 [lints]
 workspace = true
@@ -16,7 +20,15 @@ workspace = true
 [features]
 default = ["kubernetes"]
 kubernetes = [
-    "dep:pplx-space-common-core",
+    "dep:pplx-space-byte-size",
+    "dep:pplx-space-content-digest",
+    "dep:pplx-space-execution-spec",
+    "dep:pplx-space-postgres-pool",
+    "dep:pplx-space-sandbox-model",
+    "dep:pplx-space-sql-locator",
+    "dep:pplx-space-template-model",
+    "dep:pplx-space-template-release-store",
+    "dep:pplx-space-template-release-original",
     "dep:serde",
     "dep:sqlx",
     "dep:thiserror",
@@ -25,7 +37,15 @@ kubernetes = [
 ]
 
 [dependencies]
-pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"], optional = true }
+pplx-space-byte-size = { workspace = true, features = ["serde"], optional = true }
+pplx-space-sandbox-model = { workspace = true, features = ["sqlx"], optional = true }
+pplx-space-content-digest = { workspace = true, features = ["serde"], optional = true }
+pplx-space-execution-spec = { workspace = true, features = ["serde"], optional = true }
+pplx-space-postgres-pool = { workspace = true, optional = true }
+pplx-space-sql-locator = { workspace = true, optional = true }
+pplx-space-template-model = { workspace = true, optional = true }
+pplx-space-template-release-store = { workspace = true, optional = true }
+pplx-space-template-release-original = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 sqlx = { workspace = true, features = ["derive", "migrate", "postgres", "runtime-tokio", "time", "tls-rustls-aws-lc-rs", "uuid"], optional = true }
 thiserror = { workspace = true, optional = true }
@@ -33,5 +53,9 @@ time = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["v7"], optional = true }
 
 [dev-dependencies]
+pplx-space-template-release-store = { workspace = true, features = ["test-support"] }
+pplx-space-template-store = { workspace = true, features = ["test-support"] }
+pplx-space-accounts = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-db-test-fixtures = { workspace = true }
+rstest = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }

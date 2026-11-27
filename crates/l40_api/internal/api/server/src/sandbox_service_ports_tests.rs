@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use super::*;
 use pplx_space_db_test_fixtures::{insert_ready_worker_node, try_pg_test_db};
@@ -30,7 +30,7 @@ async fn set_drain(
 /// it made ingress the one access path a gentle drain still broke, while every
 /// user-API path stayed open.
 ///
-/// The truth table is `NodeDrainState::blocks_placement`, shared with the
+/// The truth table is `NodeDrain::blocks_placement`, shared with the
 /// user-API drain gates so the two cannot drift.
 #[tokio::test(flavor = "current_thread")]
 async fn gentle_draining_node_does_not_block_a_service_port_open() -> TestResult {
@@ -54,6 +54,67 @@ async fn gentle_draining_node_does_not_block_a_service_port_open() -> TestResult
         .await
         .expect("an unset drain mode reads as gentle, so it must not block either");
 
+    Ok(())
+}
+
+/// A v2 drain blocks a service port open only once `drained` or
+/// `terminating`, from the shared columns alone: while `draining`, whatever
+/// its deadline, and with its cancel pending, its sealed node keeps running
+/// sandboxes running, and ingress stays open. An engine this build doesn't
+/// know blocks, failing closed.
+#[tokio::test(flavor = "current_thread")]
+async fn a_v2_drain_blocks_a_service_port_open_only_once_drained_or_terminating() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    for (case, engine, phase, deadline_at, refused) in [
+        (
+            "draining, holding",
+            "v2",
+            Some("draining"),
+            now + 600,
+            false,
+        ),
+        (
+            "draining, evacuating",
+            "v2",
+            Some("draining"),
+            now - 60,
+            false,
+        ),
+        ("cancel pending", "v2", None, now - 60, false),
+        ("drained", "v2", Some("drained"), now - 60, true),
+        ("terminating", "v2", Some("terminating"), now - 60, true),
+        ("an unknown engine", "v3", Some("draining"), now + 600, true),
+    ] {
+        sqlx::query(
+            "UPDATE nodes SET drain_engine = $2, drain_phase = $3, drain_mode = NULL,
+                              drain_status = jsonb_build_object(
+                                  'generation', 1, 'deadline_at', $4::BIGINT)
+              WHERE id = $1",
+        )
+        .bind(node_id)
+        .bind(engine)
+        .bind(phase)
+        .bind(deadline_at)
+        .execute(&db.pool)
+        .await?;
+        let answer =
+            ensure_sandbox_service_route_node_not_draining(&db.pool, sandbox_id, node_id).await;
+        assert_eq!(answer.is_err(), refused, "{case}: {answer:?}");
+        if let Err(err) = answer {
+            let expected = if engine == "v2" {
+                tonic::Code::FailedPrecondition
+            } else {
+                tonic::Code::Internal
+            };
+            assert_eq!(err.code(), expected, "{case}");
+        }
+    }
     Ok(())
 }
 

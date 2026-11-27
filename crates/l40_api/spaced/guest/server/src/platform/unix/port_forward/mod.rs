@@ -116,7 +116,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_spaced_common::proto::bridge_guest::LoopbackBridgeStatus;
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::LoopbackBridgeStatus;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Semaphore, watch};
 use tokio_util::sync::CancellationToken;

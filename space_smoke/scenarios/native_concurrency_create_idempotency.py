@@ -39,3 +39,12 @@ def create_idempotency(test: NativeHardeningFixture) -> None:
     sandbox_id, operation_id = next(iter(ids))
     test.wait_operation(str(operation_id))
     test.wait_sandbox(str(sandbox_id))
+
+    changed = test.create(
+        {"metadata": {"purpose": "different"}}, idempotency_key=key,
+    )
+    test.context.verify(
+        changed.status == 409 and changed.body.get("code") == "idempotency_conflict",
+        "a changed create request reused the concurrent requests' idempotency key",
+        status=changed.status,
+    )

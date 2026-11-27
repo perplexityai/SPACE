@@ -4,7 +4,7 @@ use tokio::sync::Notify;
 #[tokio::test]
 async fn listener_failures_preserve_drain_and_initial_error_priority() {
     use futures_util::FutureExt;
-    use pplx_space_spaced_common::BindUdsError;
+    use pplx_space_spaced_client::BindUdsError;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     for initial_failure in [false, true] {
@@ -260,11 +260,11 @@ async fn process_adapter_requires_guest_readiness_and_observes_shutdown() {
 
 #[tokio::test]
 async fn daemon_payload_adapters_reuse_transport_admission() {
-    use pplx_space_spaced_common::proto::bridge_guest::{
+    use pplx_space_spaced_guest_execution::FilesystemExecutionMode;
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
         RenameRequest, WriteBatchRequest, WriteOpen, WriteRequest,
         filesystem_client::FilesystemClient, process_client::ProcessClient, write_request::Message,
     };
-    use pplx_space_spaced_guest_execution::FilesystemExecutionMode;
     use tonic::{body::Body, codegen::http};
     use tower::Service;
 

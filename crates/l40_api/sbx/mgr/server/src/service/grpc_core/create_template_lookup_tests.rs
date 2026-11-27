@@ -7,7 +7,7 @@ use super::*;
 use crate::node_manager_transport::fake::FakeNodeManager;
 use crate::template_resolver::TemplateLookupError;
 use crate::template_resolver::fake::{FakeTemplateResolver, LookupChannel};
-use pplx_space_common_core::host::linux::identities::users;
+use pplx_space_host_layout::identities::users;
 use pplx_space_net_common::proto::PolicyAuthority;
 use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
 use pplx_space_template_mgr_client::proto::{GetTemplateRequest, TemplateRef};
@@ -133,7 +133,7 @@ async fn create_checks_auto_lifecycle_authority_before_template_lookup(
         let mut request = Request::new(CreateRequest {
             template: "seed".into(),
             owner: "root@local".into(),
-            runtime: pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS.into(),
+            runtime: pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS.into(),
             boot_mode: BootMode::Cold as i32,
             sandbox_id: Some(SandboxId::new().to_string()),
             auto_lifecycle: Some(Default::default()),
@@ -189,6 +189,7 @@ async fn create_checks_auto_lifecycle_authority_before_template_lookup(
                 }),
                 vcpu: None,
                 memory_mib: None,
+                environment_required: false,
             }]
         } else {
             Vec::new()

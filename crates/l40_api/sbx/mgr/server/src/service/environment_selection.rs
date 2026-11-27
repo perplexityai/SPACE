@@ -1,8 +1,8 @@
 //! Cold creates persist selection before activation. Restore attempts select
 //! from immutable checkpoint provenance; retained cold starts use the saved consumer.
 use super::{SandboxManagerService, tail_support::connect_node};
-use pplx_space_common_core::types::{EnvironmentReference, ExecutionMetadata};
 use pplx_space_execution_common::environment::RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION as DEFINITION_SCHEMA;
+use pplx_space_execution_spec::{EnvironmentReference, ExecutionMetadata};
 use pplx_space_node_mgr_client::{
     NodeManagerGrpcClient,
     environment_selection::{SelectedEnvironment, SelectionResponseError, decode},
@@ -140,7 +140,7 @@ pub(super) async fn resolve_exact(
         })?,
     )
     .map_err(|error| Status::failed_precondition(error.to_string()))?;
-    let actual = pplx_space_common_core::types::ExecutionMetadata::try_from(
+    let actual = pplx_space_execution_spec::ExecutionMetadata::try_from(
         response.execution.as_ref().ok_or_else(|| {
             Status::failed_precondition("node did not acknowledge execution environment")
         })?,

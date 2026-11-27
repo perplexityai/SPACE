@@ -1,7 +1,7 @@
-use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_sandbox_model::SandboxId;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::future::Future;
@@ -23,18 +23,19 @@ use kube::{
     runtime::{reflector, watcher::Event},
 };
 use pplx_space_api::controllers::substrate::direct::DirectSubstrate;
-use pplx_space_common_core::{
-    kubernetes::{
-        DEFAULT_SANDBOX_INTERNAL_CONTROL_TOKEN_KEY, DEFAULT_SANDBOX_INTERNAL_SECRET_NAME,
-        DEFAULT_SANDBOX_INTERNAL_TOKEN_KEY, DEFAULT_SANDBOX_NODE_SELECTOR_KEY,
-        DEFAULT_SANDBOX_NODE_SELECTOR_VALUE, DEFAULT_SANDBOX_POD_IMAGE,
-        DEFAULT_SANDBOX_RUNTIME_CLASS, SANDBOX_INTERNAL_SECRET_NAME_ENV,
-        SANDBOX_NODE_SELECTOR_LABELS_ENV, SANDBOX_NODE_SELECTOR_VALUE_ENV, SANDBOX_POD_IMAGE_ENV,
-        SANDBOX_POOL_CONFIG_ID_KEY, SANDBOX_POOL_ROLE_KEY,
-    },
-    types::{ContentHash, Digest, MemorySize, TemplateName, VcpuCount},
-};
+use pplx_space_byte_size::MemorySize;
+use pplx_space_content_digest::{ContentHash, Digest};
 use pplx_space_db_test_fixtures::{TestDb, pg_test_db};
+use pplx_space_execution_spec::VcpuCount;
+use pplx_space_sandbox_pod::{
+    DEFAULT_SANDBOX_INTERNAL_CONTROL_TOKEN_KEY, DEFAULT_SANDBOX_INTERNAL_SECRET_NAME,
+    DEFAULT_SANDBOX_INTERNAL_TOKEN_KEY, DEFAULT_SANDBOX_NODE_SELECTOR_KEY,
+    DEFAULT_SANDBOX_NODE_SELECTOR_VALUE, DEFAULT_SANDBOX_POD_IMAGE, DEFAULT_SANDBOX_RUNTIME_CLASS,
+    SANDBOX_INTERNAL_SECRET_NAME_ENV, SANDBOX_NODE_SELECTOR_LABELS_ENV,
+    SANDBOX_NODE_SELECTOR_VALUE_ENV, SANDBOX_POD_IMAGE_ENV, SANDBOX_POOL_CONFIG_ID_KEY,
+    SANDBOX_POOL_ROLE_KEY,
+};
+use pplx_space_template_model::TemplateName;
 
 use time::OffsetDateTime;
 use tokio::{net::TcpListener, sync::oneshot};
@@ -47,6 +48,7 @@ use tonic::{
 use tower::Service;
 
 use super::*;
+use pplx_space_sandbox_pod::template_build_presence_label_key;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 type TestResult<T = ()> = std::result::Result<T, BoxError>;
@@ -714,7 +716,7 @@ fn slot_matches_config_requires_cached_policy_and_namespace() {
 
     assert!(matches);
 
-    slot.disk_io_limits = pplx_space_common_core::types::DiskIoLimits::try_new(
+    slot.disk_io_limits = pplx_space_execution_spec::DiskIoLimits::try_new(
         5_000,
         slot.disk_io_limits.max_bandwidth_mib_per_sec(),
     )
@@ -1843,6 +1845,95 @@ fn template_write_request_targets_exact_pool_release_digest() {
     assert_eq!(request.to_string(), format!("seed@{}", config.content_hash));
 }
 
+/// With the environment placement gate on, a pool of a twin asks nodes for
+/// that environment's build and counts only its partition's presence label;
+/// otherwise the write is the digest in any partition, as before twins.
+#[test]
+fn a_pool_requiring_its_environment_asks_nodes_for_that_environment_s_build() {
+    let config = pool_config(10, 3, 5);
+    let environment: pplx_space_execution_spec::EnvironmentReference =
+        format!("sha256:{}", "e".repeat(64)).parse().unwrap();
+    let request = template_write_request(&config);
+
+    let unbound = template_write_target(&config, None);
+    assert_eq!(
+        unbound,
+        TemplateWriteTarget {
+            presence_label: template_build_presence_label_key(
+                config.template_name.as_str(),
+                &config.content_hash.to_string(),
+            ),
+            annotation_key: template_write_annotation_key_for(&request),
+            annotation_value: request.to_string(),
+            environment: None,
+        }
+    );
+
+    let bound = template_write_target(&config, Some(environment));
+    let write = TemplateEnvironmentWrite::new(request, environment).unwrap();
+    assert_eq!(
+        bound,
+        TemplateWriteTarget {
+            presence_label: pplx_space_sandbox_pod::template_partition_presence_label_key(
+                config.template_name.as_str(),
+                &config.content_hash.to_string(),
+                PodEnvironment {
+                    reference: environment,
+                    required: true,
+                }
+                .cache_partition(),
+            ),
+            annotation_key: write.annotation_key(),
+            annotation_value: write.annotation_value(),
+            environment: Some(environment),
+        }
+    );
+    // A node publishing the environment and holding only another
+    // partition's build of the digest still needs the write. One that
+    // doesn't publish it isn't asked: no pod requiring it lands there.
+    let pod_config = pool_pod_config();
+    let environment_label = pplx_space_sandbox_pod::environment_label_key(&environment);
+    let node = |publishes: bool| {
+        let mut labels = vec![
+            (
+                pod_config.sandbox_node_selector_key.as_str(),
+                pod_config.sandbox_node_selector_value.as_str(),
+            ),
+            (
+                unbound.presence_label.as_str(),
+                TEMPLATE_PRESENT_LABEL_VALUE,
+            ),
+        ];
+        if publishes {
+            labels.push((
+                environment_label.as_str(),
+                pplx_space_sandbox_pod::ENVIRONMENT_USABLE_LABEL_VALUE,
+            ));
+        }
+        node_with_metadata(labels, [])
+    };
+    assert!(needs_template_write_annotation(
+        &node(true),
+        &pod_config,
+        &bound
+    ));
+    assert!(!needs_template_write_annotation(
+        &node(false),
+        &pod_config,
+        &bound
+    ));
+    // The write of the digest in any partition doesn't depend on it.
+    let unscoped = TemplateWriteTarget {
+        presence_label: bound.presence_label.clone(),
+        ..unbound
+    };
+    assert!(needs_template_write_annotation(
+        &node(false),
+        &pod_config,
+        &unscoped
+    ));
+}
+
 #[test]
 fn template_write_node_list_params_filters_to_sandbox_nodes() {
     let pod_config = pool_pod_config();
@@ -1921,13 +2012,7 @@ fn cached_cordoned_node_names_filters_reflector_state() {
 fn matching_node_without_template_presence_needs_template_write_annotation() {
     let config = pool_config(10, 3, 5);
     let pod_config = pool_pod_config();
-    let request = template_write_request(&config);
-    let annotation_key = template_write_annotation_key_for(&request);
-    let annotation_value = request.to_string();
-    let presence_label = template_build_presence_label_key(
-        config.template_name.as_str(),
-        &config.content_hash.to_string(),
-    );
+    let target = template_write_target(&config, None);
     let node = node_with_metadata(
         [(
             pod_config.sandbox_node_selector_key.as_str(),
@@ -1936,33 +2021,21 @@ fn matching_node_without_template_presence_needs_template_write_annotation() {
         [],
     );
 
-    assert!(needs_template_write_annotation(
-        &node,
-        &pod_config,
-        &presence_label,
-        &annotation_key,
-        &annotation_value,
-    ));
+    assert!(needs_template_write_annotation(&node, &pod_config, &target,));
 }
 
 #[test]
 fn node_with_template_presence_does_not_need_template_write_annotation() {
     let config = pool_config(10, 3, 5);
     let pod_config = pool_pod_config();
-    let request = template_write_request(&config);
-    let annotation_key = template_write_annotation_key_for(&request);
-    let annotation_value = request.to_string();
-    let presence_label = template_build_presence_label_key(
-        config.template_name.as_str(),
-        &config.content_hash.to_string(),
-    );
+    let target = template_write_target(&config, None);
     let node = node_with_metadata(
         [
             (
                 pod_config.sandbox_node_selector_key.as_str(),
                 pod_config.sandbox_node_selector_value.as_str(),
             ),
-            (&presence_label, TEMPLATE_PRESENT_LABEL_VALUE),
+            (target.presence_label.as_str(), TEMPLATE_PRESENT_LABEL_VALUE),
         ],
         [],
     );
@@ -1970,9 +2043,7 @@ fn node_with_template_presence_does_not_need_template_write_annotation() {
     assert!(!needs_template_write_annotation(
         &node,
         &pod_config,
-        &presence_label,
-        &annotation_key,
-        &annotation_value,
+        &target,
     ));
 }
 
@@ -1980,27 +2051,22 @@ fn node_with_template_presence_does_not_need_template_write_annotation() {
 fn node_with_existing_matching_template_write_annotation_is_current() {
     let config = pool_config(10, 3, 5);
     let pod_config = pool_pod_config();
-    let request = template_write_request(&config);
-    let annotation_key = template_write_annotation_key_for(&request);
-    let annotation_value = request.to_string();
-    let presence_label = template_build_presence_label_key(
-        config.template_name.as_str(),
-        &config.content_hash.to_string(),
-    );
+    let target = template_write_target(&config, None);
     let node = node_with_metadata(
         [(
             pod_config.sandbox_node_selector_key.as_str(),
             pod_config.sandbox_node_selector_value.as_str(),
         )],
-        [(annotation_key.as_str(), annotation_value.as_str())],
+        [(
+            target.annotation_key.as_str(),
+            target.annotation_value.as_str(),
+        )],
     );
 
     assert!(!needs_template_write_annotation(
         &node,
         &pod_config,
-        &presence_label,
-        &annotation_key,
-        &annotation_value,
+        &target,
     ));
 }
 
@@ -2646,6 +2712,215 @@ async fn refill_creates_pool_pods_that_require_the_release_environment() -> Test
     );
     assert!(pod.requires_environment_label());
     Ok(())
+}
+
+/// With the gate on, the create stage reads the pods' environment afresh. A
+/// release without a binding takes its build's holders', and a holder that
+/// reports one while the tick asks nodes for the build (here, during the node
+/// list) is what the pods have to require.
+#[tokio::test]
+async fn refill_requires_the_environment_a_holder_reported_during_the_tick() -> TestResult {
+    use pplx_space_api::controllers::substrate::environment_placement::EnvironmentPlacementGate;
+    const E1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    let db = pg_test_db().await?;
+    let store = WarmPoolStore::new(db.pool.clone());
+    let template_name = TemplateName::parse("app-runtime")?;
+    let template_release_id = Uuid::now_v7();
+    let config_id = Uuid::now_v7();
+    let content_hash = ContentHash::new(Digest::sha256([0x49; 32]));
+    seed_pool_config(
+        &db.pool,
+        &template_name,
+        template_release_id,
+        config_id,
+        content_hash,
+    )
+    .await?;
+    let holder = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by)
+         VALUES ($1, '10.9.8.7'::INET, 'worker', 'k8s')"
+    ))
+    .bind(holder)
+    .execute(&db.pool)
+    .await?;
+    let creates: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
+    let captured = Arc::clone(&creates);
+    let pool = db.pool.clone();
+    let hash = content_hash.to_string();
+    let kube = ClientBuilder::new(
+        tower::service_fn(move |request: Request<KubeBody>| {
+            let captured = Arc::clone(&captured);
+            let pool = pool.clone();
+            let hash = hash.clone();
+            async move {
+                match (request.method().clone(), request.uri().path()) {
+                    (Method::POST, "/api/v1/namespaces/space/pods") => {
+                        let body = http_body_util::BodyExt::collect(request.into_body())
+                            .await?
+                            .to_bytes();
+                        let pod: serde_json::Value = serde_json::from_slice(&body)?;
+                        captured.lock().unwrap().push(pod.clone());
+                        kubernetes_json_response(StatusCode::CREATED, &pod)
+                    }
+                    (Method::GET, "/api/v1/nodes") => {
+                        // The holder reports the build's environment while
+                        // the tick asks nodes to write it.
+                        sqlx::query(sql!(
+                            "INSERT INTO node_template_inventory (
+                                 node_id, template_name, content_hash, runtime, arch,
+                                 has_base_snapshot, vcpu, memory_mib, guest_os,
+                                 state_format_name, state_format_version, execution_metadata
+                             )
+                             VALUES ($1, 'app-runtime', $2, 'fc', 'aarch64', TRUE, 1, 512,
+                                     'linux', 'firecracker-snapshot', '9.0.0',
+                                     jsonb_build_object('environment', $3::TEXT))
+                             ON CONFLICT DO NOTHING"
+                        ))
+                        .bind(holder)
+                        .bind(&hash)
+                        .bind(E1)
+                        .execute(&pool)
+                        .await?;
+                        kubernetes_json_response(
+                            StatusCode::OK,
+                            &serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "List",
+                                "metadata": {},
+                                "items": []
+                            }),
+                        )
+                    }
+                    _ => kubernetes_json_response(
+                        StatusCode::OK,
+                        &serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "List",
+                            "metadata": {},
+                            "items": []
+                        }),
+                    ),
+                }
+            }
+        }),
+        "space",
+    )
+    .build();
+    let reconciler = Reconciler {
+        substrate: Arc::new(Substrate::from_direct(
+            DirectSubstrate::new(db.pool.clone())
+                .with_environment_placement_gate(EnvironmentPlacementGate::On),
+        )),
+        ..reconcile_test_reconciler(kube, store.clone(), db.pool.clone())
+    };
+    let config = seeded_pool_config(&store, config_id).await;
+
+    let summary = reconciler
+        .reconcile_config(&config, &HashSet::new())
+        .await?;
+
+    assert_eq!(summary.created_slots, 1);
+    let creates = creates.lock().unwrap();
+    let [pod] = creates.as_slice() else {
+        panic!("expected one pool pod create, got {}", creates.len());
+    };
+    let pod = pplx_space_api::controllers::substrate::kubernetes::SandboxPodView::from(
+        serde_json::from_value::<Pod>(pod.clone())?,
+    );
+    assert_eq!(
+        pod.annotation(
+            pplx_space_api::controllers::substrate::kubernetes::SandboxPodKey::Environment
+        ),
+        Some(E1)
+    );
+    assert!(pod.requires_environment_label());
+    Ok(())
+}
+
+/// The environment read is bounded like the placement read. With the gate on
+/// it runs before the teardown stages: a stalled read times out, the tick runs
+/// on and creates nothing, and the failure is booked. In shadow a stalled read
+/// reads as unbound, so the refill creates as it would with the gate off.
+#[tokio::test]
+async fn a_stalled_environment_read_is_bounded_and_shadow_places_as_off() -> TestResult {
+    use pplx_space_api::controllers::substrate::environment_placement::EnvironmentPlacementGate;
+    let on = stalled_environment_read_tick(EnvironmentPlacementGate::On, 0x47).await?;
+    assert_eq!(on.created_slots, 0);
+    assert_eq!(on.failed_required_operations, 1);
+    let shadow = stalled_environment_read_tick(EnvironmentPlacementGate::Shadow, 0x48).await?;
+    assert_eq!(shadow.created_slots, 1);
+    assert_eq!(shadow.failed_required_operations, 0);
+    Ok(())
+}
+
+/// One reconcile tick of a fresh pool config under `gate`, while a lock on the
+/// inventory table stalls the environment read.
+async fn stalled_environment_read_tick(
+    gate: pplx_space_api::controllers::substrate::environment_placement::EnvironmentPlacementGate,
+    digest_byte: u8,
+) -> TestResult<ReconcileSummary> {
+    // Room for the lock's holder and the abandoned read's connection.
+    let db = pplx_space_db_test_fixtures::pg_test_db_with_max_connections(4).await?;
+    let store = WarmPoolStore::new(db.pool.clone());
+    let template_name = TemplateName::parse("app-runtime")?;
+    let template_release_id = Uuid::now_v7();
+    let config_id = Uuid::now_v7();
+    seed_pool_config(
+        &db.pool,
+        &template_name,
+        template_release_id,
+        config_id,
+        ContentHash::new(Digest::sha256([digest_byte; 32])),
+    )
+    .await?;
+    let kube = ClientBuilder::new(
+        tower::service_fn(|request: Request<KubeBody>| async move {
+            if request.method() == Method::POST {
+                let body = http_body_util::BodyExt::collect(request.into_body())
+                    .await?
+                    .to_bytes();
+                let pod: serde_json::Value = serde_json::from_slice(&body)?;
+                return kubernetes_json_response(StatusCode::CREATED, &pod);
+            }
+            kubernetes_json_response(
+                StatusCode::OK,
+                &serde_json::json!({"apiVersion": "v1", "kind": "List", "metadata": {}, "items": []}),
+            )
+        }),
+        "space",
+    )
+    .build();
+    let base = reconcile_test_reconciler(kube, store.clone(), db.pool.clone());
+    let reconciler = Reconciler {
+        substrate: Arc::new(Substrate::from_direct(
+            DirectSubstrate::new(db.pool.clone()).with_environment_placement_gate(gate),
+        )),
+        io_timeouts: ReconcileIoTimeouts {
+            postgres: Duration::from_millis(200),
+            ..base.io_timeouts
+        },
+        ..base
+    };
+    let config = seeded_pool_config(&store, config_id).await;
+    // The release names no environment, so the read falls back to the
+    // build's holders; hold the inventory table, which nothing else in the
+    // tick reads, so that read blocks.
+    let mut holder = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "LOCK TABLE node_template_inventory IN ACCESS EXCLUSIVE MODE"
+    ))
+    .execute(&mut *holder)
+    .await?;
+
+    let summary = tokio::time::timeout(
+        Duration::from_secs(30),
+        reconciler.reconcile_config(&config, &HashSet::new()),
+    )
+    .await
+    .expect("the stalled environment read is bounded")?;
+    holder.rollback().await?;
+    Ok(summary)
 }
 
 /// With the gate on, a refill that can't read its build's environment creates

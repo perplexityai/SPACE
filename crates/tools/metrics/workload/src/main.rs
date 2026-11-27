@@ -9,7 +9,7 @@ use pplx_space_sbx_mgr::metrics::sandbox::worker;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let log_context = match pplx_space_common_core::types::cluster::process_cluster_id() {
+    let log_context = match pplx_space_cluster_id::process_cluster_id() {
         Some(cluster_id) => {
             pplx_space_observability::LogContext::default().with_cluster_id(cluster_id.as_str())
         }

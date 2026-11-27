@@ -1,9 +1,13 @@
+use pplx_space_accounts::NodeId;
+use pplx_space_byte_size::MemorySize;
 use pplx_space_cluster_pool::{
     ClaimedPoolSlot, ManualPoolConfigSpec, PoolAssignment, PoolConfigWithCounts, PoolSlotState,
     ReservedPoolSlot, WarmPoolStore,
 };
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{MemorySize, NodeId, PodUid, SandboxId, VcpuCount};
+use pplx_space_execution_spec::VcpuCount;
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_registration_store::lookup as node_lookup;
+use pplx_space_sandbox_model::SandboxId;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
@@ -54,12 +58,16 @@ pub(super) async fn list_pool_configs(
     rows.into_iter().map(TryInto::try_into).collect()
 }
 
+/// `boots_template_twins`: whether this substrate's creates boot the twin
+/// they resolve to (the environment placement gate is on), so the twin's
+/// config takes the change too.
 pub(super) async fn upsert_pool_config(
     store: &K8sStore,
     request: ClusterPoolConfigRequest,
+    boots_template_twins: bool,
 ) -> Result<ClusterPoolConfigResponse, ControllerError> {
     if let Some(disk_mib) = request.disk_mib {
-        pplx_space_common_core::sandbox_storage::validate_rootfs_mib(disk_mib)
+        pplx_space_sandbox_model::sandbox_storage::validate_rootfs_mib(disk_mib)
             .map_err(|error| ControllerError::bad_request(format!("disk_mib: {error}")))?;
     }
     if request.reset_disk_to_template_default && request.disk_mib.is_some() {
@@ -87,21 +95,96 @@ pub(super) async fn upsert_pool_config(
         .begin()
         .await
         .map_err(|err| db_contention_error("failed to start transaction", &err))?;
-    let release = resolve_pool_template_release(
-        &mut tx,
-        &request.template_name,
-        request.content_hash.as_deref(),
-    )
-    .await?
-    .ok_or_else(|| ControllerError::not_found("template release not found"))?;
-    let id = WarmPoolStore::upsert_manual_config(&mut tx, release.id, &spec)
+    // An edit of an existing pool names its release, so the change lands on
+    // that config even after the template's creates move to another twin.
+    let release = match request.template_release_id {
+        Some(release_id) => {
+            named_pool_template_release(
+                &mut tx,
+                release_id,
+                &request.template_name,
+                request.content_hash.as_deref(),
+            )
+            .await?
+        }
+        None => {
+            resolve_pool_template_release(
+                &mut tx,
+                &request.template_name,
+                request.content_hash.as_deref(),
+            )
+            .await?
+        }
+    }
+    .ok_or_else(|| match request.template_release_id {
+        Some(release_id) => ControllerError::not_found(format!(
+            "template release {release_id} isn't a release of the request's template and hash"
+        )),
+        None => ControllerError::not_found("template release not found"),
+    })?;
+    // After the release lookup, which reads no config row, and before the
+    // config write: a template whose first release registered after a lock
+    // taken earlier found no row would otherwise go unlocked.
+    if boots_template_twins {
+        store
+            .lock_template_against_twin_inserts(&mut tx, &request.template_name)
+            .await?;
+    }
+    let upsert_error = |err: pplx_space_cluster_pool::PoolError| match err {
+        pplx_space_cluster_pool::PoolError::EncryptableConfigFenced => {
+            ControllerError::bad_request(err.to_string())
+        }
+        err => pool_store_error("failed to upsert cluster pool config", &err),
+    };
+    let id = WarmPoolStore::upsert_manual_config(&mut *tx, release.id, &spec)
         .await
-        .map_err(|err| match err {
-            pplx_space_cluster_pool::PoolError::EncryptableConfigFenced => {
-                ControllerError::bad_request(err.to_string())
-            }
-            err => pool_store_error("failed to upsert cluster pool config", &err),
-        })?;
+        .map_err(upsert_error)?;
+    // Creates of the release may resolve to one of its twins
+    // (`resolved_release_sql`), and claim only that twin's slots, so the
+    // twin's config takes the same change. The original's stays the one
+    // reported: it's the release the request names, and the pool a rollback
+    // resolves to.
+    let resolved = crate::controllers::resolved_create_release(
+        &mut *tx,
+        &request.template_name,
+        &release.content_hash,
+        boots_template_twins,
+    )
+    .await?;
+    // Only a release in its build's original environment passes the change
+    // on, as only its disable does ([`disable_pool_config`]): a twin's own
+    // upsert, like its disable, changes only its config.
+    let release_is_twin = pplx_space_template_release_store::twin_original(
+        &mut *tx,
+        release.id,
+        pplx_space_execution_catalog::catalog::initial_environment_reference(),
+    )
+    .await
+    .map_err(sqlx::Error::from)
+    .map_err(|err| db_contention_error("failed to read the release's original", &err))?
+    .is_some();
+    if let Some(twin) = resolved.filter(|resolved| !release_is_twin && *resolved != release.id) {
+        // The twin takes the original's effective disk size, not the
+        // request's: a request without `disk_mib` keeps the original's
+        // override, which a twin config made by this upsert would lack. It
+        // takes the original's disk I/O limits too: a config this upsert
+        // makes would get the platform defaults, and once it's
+        // operator-managed the autoscaler no longer sets them from policy.
+        let disk_mib = WarmPoolStore::config_disk_mib(&mut *tx, id)
+            .await
+            .map_err(|err| pool_store_error("failed to read cluster pool config", &err))?;
+        let twin_spec = ManualPoolConfigSpec {
+            disk_mib,
+            reset_disk_to_template_default: disk_mib.is_none(),
+            ..spec
+        };
+        let twin_config = WarmPoolStore::upsert_manual_config(&mut *tx, twin, &twin_spec)
+            .await
+            .map_err(upsert_error)?;
+        WarmPoolStore::copy_config_disk_io_limits(&mut *tx, id, twin_config)
+            .await
+            .map_err(|err| pool_store_error("failed to copy cluster pool config", &err))?;
+    }
     tx.commit()
         .await
         .map_err(|err| db_contention_error("failed to commit cluster pool config", &err))?;
@@ -111,17 +194,74 @@ pub(super) async fn upsert_pool_config(
         .ok_or_else(|| ControllerError::internal("cluster pool config missing after upsert"))
 }
 
+/// Disable pool config `id`. An original's disable also disables the config
+/// for the same shape on every one of its twins, in the same transaction.
+/// Creates of the build may resolve to any twin, and claim only that twin's
+/// slots ([`upsert_pool_config`] writes the twin they resolve to when it
+/// runs), and the twin they resolve to can change after an upsert, when the
+/// default moves or the gate leaves `on`. A disable that reached only the
+/// twin resolving now would leave an earlier twin's config warming slots
+/// that nothing disables. Where the build has no twins, it disables only
+/// `id`, as before twins.
 pub(super) async fn disable_pool_config(
     store: &K8sStore,
     id: Uuid,
 ) -> Result<ClusterPoolConfigResponse, ControllerError> {
-    let disabled = WarmPoolStore::new(store.pool().clone())
-        .disable_config(id)
+    let disable_error = |err: pplx_space_cluster_pool::PoolError| {
+        pool_store_error("failed to disable cluster pool config", &err)
+    };
+    let mut tx = store
+        .pool()
+        .begin()
         .await
-        .map_err(|err| pool_store_error("failed to disable cluster pool config", &err))?;
-    if !disabled {
-        return Err(ControllerError::not_found("cluster pool config not found"));
+        .map_err(|err| db_contention_error("failed to start transaction", &err))?;
+    // Before the config's row, as the upsert takes it: a twin insert holds
+    // the template's row and then locks the twin's config rows, and a twin
+    // it hasn't committed yet is one this disable's read of the twins below
+    // can't see.
+    if let Some(template_name) = store.pool_config_template(&mut tx, id).await? {
+        store
+            .lock_template_against_twin_inserts(&mut tx, &template_name)
+            .await?;
     }
+    let disabled = WarmPoolStore::disable_config(&mut *tx, id)
+        .await
+        .map_err(disable_error)?
+        .ok_or_else(|| ControllerError::not_found("cluster pool config not found"))?;
+    // Only the disable of a release in its build's original environment
+    // reaches the twins, as only such a release's upsert passes its change
+    // on ([`upsert_pool_config`]): a superseded
+    // twin's config, disabled to stop warming slots nobody claims, leaves the
+    // twin creates use and the original alone. The original is the one
+    // resolution picks, across both spellings of the hash.
+    let initial_environment =
+        pplx_space_execution_catalog::catalog::initial_environment_reference();
+    let twin_of = pplx_space_template_release_store::twin_original(
+        &mut *tx,
+        disabled.template_release_id,
+        initial_environment,
+    )
+    .await
+    .map_err(sqlx::Error::from)
+    .map_err(|err| db_contention_error("failed to read the release's original", &err))?;
+    if twin_of.is_none() {
+        let twins = pplx_space_template_release_store::twin_releases(
+            &mut *tx,
+            disabled.template_release_id,
+            initial_environment,
+        )
+        .await
+        .map_err(sqlx::Error::from)
+        .map_err(|err| db_contention_error("failed to read the release's twins", &err))?;
+        for twin in twins {
+            WarmPoolStore::disable_shape_config(&mut *tx, twin, &disabled)
+                .await
+                .map_err(disable_error)?;
+        }
+    }
+    tx.commit()
+        .await
+        .map_err(|err| db_contention_error("failed to commit cluster pool config", &err))?;
 
     fetch_pool_config(store, id)
         .await?
@@ -141,16 +281,21 @@ pub(super) async fn disable_pool_config(
         sandbox_id = tracing::field::Empty,
     )
 )]
+/// `boots_template_twins`: whether this substrate's creates boot the twin
+/// they resolve to (the environment placement gate is on); only then does a
+/// claim without a resolved release take the twin's slots.
 pub(super) async fn claim_pooled_execution(
     pool: &PgPool,
     request: &PooledExecutionClaimRequest<'_>,
     namespace: &str,
+    boots_template_twins: bool,
 ) -> Result<PooledExecutionClaimAttempt, ControllerError> {
     let mut tx = pool
         .begin()
         .await
         .map_err(|err| db_contention_error("failed to start pool claim transaction", &err))?;
-    let claim = claim_pooled_execution_tx(&mut tx, request, namespace).await?;
+    let claim =
+        claim_pooled_execution_tx(&mut tx, request, namespace, boots_template_twins).await?;
     tx.commit()
         .await
         .map_err(|err| db_contention_error("failed to commit pool claim transaction", &err))?;
@@ -161,6 +306,7 @@ async fn claim_pooled_execution_tx(
     tx: &mut Transaction<'_, Postgres>,
     request: &PooledExecutionClaimRequest<'_>,
     namespace: &str,
+    boots_template_twins: bool,
 ) -> Result<PooledExecutionClaimAttempt, ControllerError> {
     let span = tracing::Span::current();
     let (release_id, content_hash) = match (request.template_release_id, request.content_hash) {
@@ -174,7 +320,17 @@ async fn claim_pooled_execution_tx(
                 span.record("result", "template_miss");
                 return Ok(PooledExecutionClaimAttempt::missed(None));
             };
-            (release.id, release.content_hash)
+            // A create claims the slots of the release it resolves to
+            // (`resolved_release_sql`), which may be a twin.
+            let release_id = crate::controllers::resolved_create_release(
+                &mut **tx,
+                request.template,
+                &release.content_hash,
+                boots_template_twins,
+            )
+            .await?
+            .unwrap_or(release.id);
+            (release_id, release.content_hash)
         }
     };
 
@@ -190,7 +346,7 @@ async fn claim_pooled_execution_tx(
         "sandbox_id",
         tracing::field::display(slot.reserved_sandbox_id),
     );
-    let (claim, pool_shape) = pooled_claim_from_slot(tx, slot, claim_id, content_hash)
+    let (claim, pool_shape) = pooled_claim_from_slot(tx, slot, claim_id, release_id, content_hash)
         .await
         .inspect_err(|_| {
             span.record("result", "error");
@@ -203,10 +359,12 @@ async fn claim_pooled_execution_tx(
 /// Build the execution claim for a slot the caller holds under `claim_id`.
 /// Shared by the any-slot claim and the admitted-slot lookup, so both hand
 /// the adoption path the same pod identity, shape, and generation.
+/// `template_release_id` is the release of the slot's pool.
 async fn pooled_claim_from_slot(
     tx: &mut Transaction<'_, Postgres>,
     slot: ClaimedPoolSlot,
     claim_id: Uuid,
+    template_release_id: Uuid,
     content_hash: String,
 ) -> Result<(PooledExecutionClaim, PooledExecutionPoolShape), ControllerError> {
     let pod_ip = slot
@@ -244,6 +402,7 @@ async fn pooled_claim_from_slot(
             pool_slot_id: Some(slot.id),
             sandbox_id: slot.reserved_sandbox_id,
             content_hash,
+            template_release_id: Some(template_release_id),
             pod_name: slot.pod_name,
             pod_uid,
             execution_generation: 1,
@@ -295,7 +454,7 @@ pub(super) async fn lookup_admitted_pooled_execution(
     let mut tx = pool.begin().await.map_err(|err| {
         db_contention_error("failed to start admitted pool claim transaction", &err)
     })?;
-    let reserved = WarmPoolStore::lock_reserved_slot(&mut tx, sandbox_id)
+    let reserved = WarmPoolStore::lock_reserved_slot(&mut *tx, sandbox_id)
         .await
         .map_err(|err| pool_store_error("failed to read admitted pool slot", &err))?;
     let (lookup, result) = match reserved {
@@ -313,6 +472,7 @@ pub(super) async fn lookup_admitted_pooled_execution(
                     &mut tx,
                     reserved.slot,
                     admitted.claim_id,
+                    reserved.template_release_id,
                     reserved.content_hash,
                 )
                 .await?;
@@ -324,7 +484,7 @@ pub(super) async fn lookup_admitted_pooled_execution(
                     "claimed",
                 )
             } else {
-                WarmPoolStore::invalidate_claimed_slot_in(&mut tx, admitted.claim_id, sandbox_id)
+                WarmPoolStore::invalidate_claimed_slot_in(&mut *tx, admitted.claim_id, sandbox_id)
                     .await
                     .map_err(|err| {
                         pool_store_error("failed to invalidate admitted pool slot", &err)
@@ -333,7 +493,7 @@ pub(super) async fn lookup_admitted_pooled_execution(
             }
         }
         Some(reserved) if reserved.state == PoolSlotState::Ready => {
-            WarmPoolStore::fence_ready_slot(&mut tx, reserved.slot.id)
+            WarmPoolStore::fence_ready_slot(&mut *tx, reserved.slot.id)
                 .await
                 .map_err(|err| pool_store_error("failed to fence admitted pool slot", &err))?;
             (AdmittedPoolClaimLookup::ReleasePending, "slot_ready")
@@ -368,9 +528,12 @@ fn admitted_slot_matches_request(
         && request
             .template_release_id
             .is_none_or(|release_id| release_id == reserved.template_release_id)
-        && request
-            .content_hash
-            .is_none_or(|content_hash| content_hash == reserved.content_hash)
+        // Either spelling of the digest: a create resolves a digest stored
+        // bare to its canonical `sha256:` form, and the slot records the
+        // release's stored spelling.
+        && request.content_hash.is_none_or(|content_hash| {
+            content_hash.trim_prefix("sha256:") == reserved.content_hash.trim_prefix("sha256:")
+        })
         && shape_matches
 }
 
@@ -395,7 +558,7 @@ pub(super) async fn claim_admission_pool_slot(
 ) -> Result<Option<AdmissionPoolClaim>, ControllerError> {
     let claim_id = Uuid::now_v7();
     let slot = WarmPoolStore::claim_ready_slot_for_release(
-        tx,
+        &mut **tx,
         template_release_id,
         namespace,
         claim_id,
@@ -453,7 +616,7 @@ async fn claim_ready_pool_slot(
                 ))
             })?;
             let shape = WarmPoolStore::preferred_enabled_shape_for_release(
-                tx,
+                &mut **tx,
                 template_release_id,
                 namespace,
                 Some((pool_vcpu, pool_memory)),
@@ -466,7 +629,7 @@ async fn claim_ready_pool_slot(
             };
             (
                 WarmPoolStore::claim_ready_slot(
-                    tx,
+                    &mut **tx,
                     template_release_id,
                     pool_vcpu,
                     pool_memory,
@@ -480,7 +643,7 @@ async fn claim_ready_pool_slot(
         }
         (None, None) => {
             let slot = WarmPoolStore::claim_ready_slot_for_release(
-                tx,
+                &mut **tx,
                 template_release_id,
                 namespace,
                 claim_id,
@@ -492,7 +655,7 @@ async fn claim_ready_pool_slot(
                 return Ok((slot, None));
             };
             let miss_shape = WarmPoolStore::preferred_enabled_shape_for_release(
-                tx,
+                &mut **tx,
                 template_release_id,
                 namespace,
                 None,
@@ -523,7 +686,7 @@ pub(super) async fn persist_pooled_execution_claim(
     // Stamp the slot bound first: it row-locks the slot for the rest of the
     // transaction and is the marker the stale-claimed sweep uses to tell a
     // committed handoff from one that died between claim and bind.
-    let bound = WarmPoolStore::bind_claimed_slot(tx, claim.claim_id, claim.sandbox_id)
+    let bound = WarmPoolStore::bind_claimed_slot(&mut **tx, claim.claim_id, claim.sandbox_id)
         .await
         .map_err(|err| pool_store_error("failed to stamp pool slot bound", &err))?;
     if !bound {
@@ -532,46 +695,35 @@ pub(super) async fn persist_pooled_execution_claim(
         ));
     }
 
-    let source = WarmPoolStore::bind_source(tx, claim.claim_id, claim.sandbox_id)
+    let source = WarmPoolStore::bind_source(&mut **tx, claim.claim_id, claim.sandbox_id)
         .await
         .map_err(|err| pool_store_error("failed to read pool slot bind source", &err))?
         .ok_or_else(|| {
             ControllerError::internal("claimed pool slot missing during execution bind")
         })?;
 
-    sqlx::query(sql!(
-        "INSERT INTO sandbox_k8s_executions (
-             sandbox_id, generation, pod_name, pod_namespace, pod_uid, pod_ip,
-             k8s_node_name, state, active, route_activation_id, pod_materialized_at
-         )
-         VALUES (
-             $1, 1, $2, $3, $4, $5::inet, $6, 'running', TRUE, $7,
-             CASE WHEN NULLIF(BTRIM($4::TEXT), '') IS NOT NULL THEN NOW() END
-         )"
-    ))
-    .bind(claim.sandbox_id)
-    .bind(&source.pod_name)
-    .bind(&source.pod_namespace)
-    .bind(source.pod_uid.as_deref())
-    .bind(source.pod_ip.as_deref())
-    .bind(source.k8s_node_name.as_deref())
-    .bind(route_activation_id)
-    .execute(&mut **tx)
+    pplx_space_sandbox_store::k8s_executions::pool_claim::insert_first_generation(
+        &mut **tx,
+        claim.sandbox_id,
+        &source,
+        route_activation_id,
+    )
     .await
-    .map_err(|err| db_contention_error("failed to bind pool execution", &err))?;
+    .map_err(|err| db_contention_error("failed to bind pool execution", &sqlx::Error::from(err)))?;
 
     Ok(())
 }
 
+/// Returns whether this call took the slot out; `false` when it was no
+/// longer claimed under this claim (already released, invalidated or bound).
 pub(super) async fn invalidate_claimed_pool_slot(
     pool: &PgPool,
     claim: &PooledExecutionClaim,
-) -> Result<(), ControllerError> {
+) -> Result<bool, ControllerError> {
     WarmPoolStore::new(pool.clone())
         .invalidate_claimed_slot(claim.claim_id, claim.sandbox_id)
         .await
-        .map_err(|err| pool_store_error("failed to invalidate claimed pool slot", &err))?;
-    Ok(())
+        .map_err(|err| pool_store_error("failed to invalidate claimed pool slot", &err))
 }
 
 pub(super) async fn mark_claimed_pool_slot_cleanup_pending(
@@ -584,12 +736,13 @@ pub(super) async fn mark_claimed_pool_slot_cleanup_pending(
             &err,
         )
     })?;
-    let marked =
-        WarmPoolStore::mark_claimed_slot_cleanup_pending(&mut tx, claim.claim_id, claim.sandbox_id)
-            .await
-            .map_err(|err| {
-                pool_store_error("failed to mark claimed pool slot cleanup_pending", &err)
-            })?;
+    let marked = WarmPoolStore::mark_claimed_slot_cleanup_pending(
+        &mut *tx,
+        claim.claim_id,
+        claim.sandbox_id,
+    )
+    .await
+    .map_err(|err| pool_store_error("failed to mark claimed pool slot cleanup_pending", &err))?;
     if !marked {
         return Err(ControllerError::internal(
             "claimed pool slot missing during cleanup-pending mark",
@@ -615,40 +768,63 @@ pub(super) async fn release_claimed_pool_slot(
     Ok(())
 }
 
-#[derive(sqlx::FromRow)]
 struct PoolTemplateReleaseRow {
     id: Uuid,
     content_hash: String,
 }
 
-/// Resolve the template release a pool claim or config upsert targets: the
-/// release matching the requested content hash when one is pinned, otherwise
-/// the tagged-`latest` release, otherwise the newest release of the template.
-/// Template-domain logic; deliberately not part of the warm-pool store.
+/// Resolve the template release a pool claim or config upsert targets
+/// (`pplx_space_template_release_store::lookup::pool_target_release`): with
+/// a pinned content hash, that digest's original, if it has one; without
+/// one, the `latest`-tagged digest's original, else the template's newest
+/// digest original.
 async fn resolve_pool_template_release(
     tx: &mut Transaction<'_, Postgres>,
     template_name: &str,
     content_hash: Option<&str>,
 ) -> Result<Option<PoolTemplateReleaseRow>, ControllerError> {
-    sqlx::query_as::<_, PoolTemplateReleaseRow>(sql!(
-        "SELECT r.id, r.hash AS content_hash
-         FROM template_releases r
-         LEFT JOIN template_release_tags t
-           ON t.template_release_id = r.id
-          AND t.template_name = r.template_name
-          AND t.tag = 'latest'
-         WHERE r.template_name = $1
-           AND ($2::TEXT IS NULL OR r.hash = $2)
-         ORDER BY (t.tag IS NOT NULL) DESC, r.created_at DESC
-         LIMIT 1"
-    ))
-    .bind(template_name)
-    .bind(content_hash)
-    .fetch_optional(&mut **tx)
+    pplx_space_template_release_store::lookup::pool_target_release(
+        &mut **tx,
+        template_name,
+        content_hash,
+    )
     .await
+    .map(|release| {
+        release.map(|release| PoolTemplateReleaseRow {
+            id: release.id,
+            content_hash: release.content_hash,
+        })
+    })
+    .map_err(sqlx::Error::from)
     .map_err(|err| db_contention_error("failed to resolve pool template release", &err))
 }
 
+/// The release `release_id` names, when it's a release of `template_name`
+/// (and of `content_hash`, when given).
+async fn named_pool_template_release(
+    tx: &mut Transaction<'_, Postgres>,
+    release_id: Uuid,
+    template_name: &str,
+    content_hash: Option<&str>,
+) -> Result<Option<PoolTemplateReleaseRow>, ControllerError> {
+    pplx_space_template_release_store::lookup::named_release(
+        &mut **tx,
+        release_id,
+        template_name,
+        content_hash,
+    )
+    .await
+    .map(|release| {
+        release.map(|release| PoolTemplateReleaseRow {
+            id: release.id,
+            content_hash: release.content_hash,
+        })
+    })
+    .map_err(sqlx::Error::from)
+    .map_err(|err| db_contention_error("failed to read the named pool template release", &err))
+}
+
+/// The worker registered under the slot pod's Kubernetes node name.
 async fn resolve_pool_slot_node_id(
     tx: &mut Transaction<'_, Postgres>,
     node_name: Option<&str>,
@@ -656,12 +832,9 @@ async fn resolve_pool_slot_node_id(
     let Some(node_name) = node_name else {
         return Ok(None);
     };
-    sqlx::query_scalar::<_, NodeId>(sql!(
-        "SELECT node_id FROM node_k8s WHERE k8s_node_name = $1"
-    ))
-    .bind(node_name)
-    .fetch_optional(&mut **tx)
-    .await
+    node_lookup::worker_for_k8s_node_name(&mut **tx, node_name)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 async fn fetch_pool_config(

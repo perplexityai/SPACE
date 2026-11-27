@@ -2,16 +2,19 @@ use super::network_runtime::{network_policy_refresh_error_to_status, refresh_net
 use super::spaced_bridge::cleanup_restored_snapshot_dir_async;
 use super::start_support::ActivationCleanupGuard;
 use super::*;
-use pplx_space_common_core::host::linux::identities::users;
-use pplx_space_common_core::types::{
-    ExecutionGeneration, NodeId, NodeRole as SpaceNodeRole, PodUid, RouteGeneration,
-    SandboxActivationAttemptId, SandboxQuarantineReasonCode, SpaceApiRouteIdentity,
-};
-use pplx_space_common_core::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER;
+use pplx_space_accounts::NodeId;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
+use pplx_space_host_layout::identities::users;
+use pplx_space_k8s_ids::PodUid;
 use pplx_space_k8s_node_id::space_node_id;
+use pplx_space_node_model::NodeRole as SpaceNodeRole;
+use pplx_space_rpc_contracts::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxQuarantineReasonCode,
+    SpaceApiRouteIdentity,
+};
 
 const NODE_ID_PATH: &str = "/space/etc/node-id";
 
@@ -94,8 +97,7 @@ pub(super) fn operation_activation_attempt_id_from_wire(
     route: &SpaceApiRouteIdentity,
 ) -> Result<Option<SandboxActivationAttemptId>, Status> {
     let Some(value) = value else { return Ok(None) };
-    if route.effective_substrate_kind()
-        != Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes)
+    if route.effective_substrate_kind() != Some(pplx_space_node_model::NodeManagedBy::Kubernetes)
         || route.route_generation.is_none()
         || route.execution_generation.is_none()
         || route.pod_uid.is_none()
@@ -142,10 +144,10 @@ pub(super) fn space_api_route_identity_to_wire(
         activation_attempt_id: identity.activation_attempt_id.map(|id| id.to_string()),
         substrate_kind: match identity.substrate_kind {
             None => crate::proto::SandboxSubstrateKind::Unspecified as i32,
-            Some(pplx_space_common_core::types::NodeManagedBy::Space) => {
+            Some(pplx_space_node_model::NodeManagedBy::Space) => {
                 crate::proto::SandboxSubstrateKind::Direct as i32
             }
-            Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes) => {
+            Some(pplx_space_node_model::NodeManagedBy::Kubernetes) => {
                 crate::proto::SandboxSubstrateKind::Kubernetes as i32
             }
         },
@@ -214,7 +216,7 @@ pub(super) fn space_api_route_identity_for_runtime_activation(
     if identity.substrate_kind.is_none() && identity.execution_generation.is_some() {
         identity.substrate_kind = identity
             .effective_substrate_kind()
-            .or(Some(pplx_space_common_core::types::NodeManagedBy::Space));
+            .or(Some(pplx_space_node_model::NodeManagedBy::Space));
     }
     // A runtime activation must publish a complete route identity, so an
     // activation that arrives without an attempt mints a placeholder. On the
@@ -257,7 +259,7 @@ fn direct_route_identity(
         identity: SpaceApiRouteIdentity {
             route_generation: Some(route_generation),
             current_node_id: Some(current_node_id),
-            substrate_kind: Some(pplx_space_common_core::types::NodeManagedBy::Space),
+            substrate_kind: Some(pplx_space_node_model::NodeManagedBy::Space),
             execution_generation: Some(execution_generation),
             activation_attempt_id: Some(SandboxActivationAttemptId::new()),
             ..Default::default()
@@ -302,7 +304,7 @@ pub(super) fn runtime_activation_wire_identity_can_open_claim(
     identity.route_generation.is_some()
         && identity.execution_generation.is_some()
         && identity.activation_attempt_id.is_some()
-        && identity.substrate_kind == Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes)
+        && identity.substrate_kind == Some(pplx_space_node_model::NodeManagedBy::Kubernetes)
         && identity.pod_uid.is_some()
 }
 
@@ -324,7 +326,7 @@ pub(super) fn fresh_runtime_activation_identity(
 /// The open-claim identity a cluster-fenced activation records, or `None`
 /// when the activation isn't eligible to hold one.
 pub(super) fn open_route_activation_claim(
-    space_api_route_identity: &pplx_space_common_core::types::SpaceApiRouteIdentity,
+    space_api_route_identity: &pplx_space_sandbox_model::SpaceApiRouteIdentity,
     route_identity_provenance: crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance,
     open_activation_claim_eligible: bool,
 ) -> Option<crate::db::route_activation_claims::OpenRouteActivationClaim> {
@@ -624,7 +626,7 @@ impl SandboxManagerService {
         let substrate_kind = provenance
             .current_substrate_kind
             .or(provenance.retained_substrate_kind);
-        if substrate_kind == Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes) {
+        if substrate_kind == Some(pplx_space_node_model::NodeManagedBy::Kubernetes) {
             return Err(
                 pplx_space_sbx_mgr_client::authoritative_route_identity_required_status(
                     "Kubernetes-managed sandbox activation requires an authoritative route identity",
@@ -710,10 +712,10 @@ pub(super) fn space_api_route_identity_from_wire(
         {
             crate::proto::SandboxSubstrateKind::Unspecified => None,
             crate::proto::SandboxSubstrateKind::Direct => {
-                Some(pplx_space_common_core::types::NodeManagedBy::Space)
+                Some(pplx_space_node_model::NodeManagedBy::Space)
             }
             crate::proto::SandboxSubstrateKind::Kubernetes => {
-                Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes)
+                Some(pplx_space_node_model::NodeManagedBy::Kubernetes)
             }
         },
         execution_generation: identity
@@ -836,7 +838,8 @@ pub(super) enum WakeNetworkContext {
 impl WakeNetworkContext {
     pub(super) fn for_wake_start_context(start: &crate::proto::WakeStartContext) -> Self {
         // Direct activations use a manager-owned namespace even when the
-        // activation carries resources or a restore source.
+        // activation carries resources or a restore source. Reading node-local
+        // hosting from the substrate relies on substrate == hosting today.
         let direct_route_identity = start.route_identity.as_ref().is_some_and(|identity| {
             identity.route_generation.is_some()
                 && identity.current_node_id.is_some()
@@ -997,7 +1000,7 @@ pub(super) fn wake_ready_timeout_secs(
 pub(super) fn spaced_host_socket_path(sandbox_id: &str) -> String {
     format!(
         "{RUN_DIR}/{sandbox_id}/{}",
-        pplx_space_common_core::host::linux::paths::SPACED_HOST_SOCKET_FILE
+        pplx_space_host_layout::paths::SPACED_HOST_SOCKET_FILE
     )
 }
 
@@ -1064,7 +1067,7 @@ where
             status.guest_version.as_ref()
         }
     };
-    pplx_space_spaced_common::validate_spaced_guest_compatibility(
+    pplx_space_spaced_protocol::validate_spaced_guest_compatibility(
         guest.map(|guest| guest.version.as_str()),
         guest.map(|guest| guest.compatibility_family.as_str()),
     )
@@ -1410,7 +1413,7 @@ pub(super) async fn wait_ready_and_mark_started(
     // Keep the RPC-heavy readiness future off the detached finalizer's stack.
     let guest = Box::pin(async {
         match image_and_fence.0.readiness() {
-            pplx_space_common_core::types::guest_image::GuestReadiness::Agent => {
+            pplx_space_execution_spec::guest_image::GuestReadiness::Agent => {
                 let budget = Duration::from_secs(ready_timeout_secs.into());
                 let deadline = tokio::time::Instant::now() + budget;
                 // The readiness wait owns its timeout outcome. An outer timer
@@ -1426,7 +1429,7 @@ pub(super) async fn wait_ready_and_mark_started(
                 })??;
                 Ok(GuestReadyEvidence::Agent(ready))
             }
-            pplx_space_common_core::types::guest_image::GuestReadiness::TcpService { port } => {
+            pplx_space_execution_spec::guest_image::GuestReadiness::TcpService { port } => {
                 let execution = image_and_fence.1.ok_or_else(|| {
                     Status::failed_precondition(
                         "guest service readiness requires an execution identity",
@@ -2107,8 +2110,9 @@ impl ActivationFailureStage {
     ///   CRI layer drops it, leaving only the shim's `[space-err=<Code>]`
     ///   message marker in the pod event. A create waiting for its pod's IP
     ///   reads the `InvalidArgument` marker (`INVALID_ARGUMENT_MARKER` in the
-    ///   API's Kubernetes substrate) and fails with the node's reason; nothing
-    ///   in the control plane reads the other codes yet. Kubelet keeps
+    ///   API's Kubernetes substrate) and fails with the node's reason. The
+    ///   allocation path separately preserves memory-admission refusals for
+    ///   opt-in fail-fast handling. Kubelet keeps
     ///   retrying `RunPodSandbox` on its own backoff whatever is returned
     ///   here, and any other wedged pod is still reaped by the age-based
     ///   stuck-`ContainerCreating` sweep rather than failed at the first

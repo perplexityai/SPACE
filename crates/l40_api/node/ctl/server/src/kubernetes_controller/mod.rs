@@ -1,6 +1,6 @@
 use kube::Client;
-use pplx_space_common_core::kubernetes::SPACE_K8S_NODE_NAME_ENV;
 use pplx_space_node_mgr_client::NodeResourceStatusReader;
+use pplx_space_sandbox_pod::SPACE_K8S_NODE_NAME_ENV;
 use tokio_util::sync::CancellationToken;
 
 mod environment_labels;

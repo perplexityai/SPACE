@@ -138,6 +138,73 @@ pub fn prefetch_release_candidate(template: &str, content_hash: &str, outcome: &
 }
 
 metric_vocabulary!(
+    /// Which prefetch lookup a per-environment decision came from: the `pass`
+    /// tag on `template.prefetch.environment.candidates`.
+    PrefetchEnvironmentPass {
+        /// A configured `(template, tag)` resolved for one environment.
+        Tag => "tag",
+        /// One of a template's latest releases bound to one environment.
+        Release => "release",
+    }
+);
+
+metric_vocabulary!(
+    /// What prefetch decided for one release bound to one environment the
+    /// node can run: the `outcome` tag on
+    /// `template.prefetch.environment.candidates`.
+    PrefetchEnvironmentOutcome {
+        /// A pull into the environment's cache partition was queued.
+        Dispatched => "dispatched",
+        /// The environment's partition already holds the build.
+        AlreadyCached => "already_cached",
+        /// Another pass this tick already queued the same build.
+        Coalesced => "coalesced",
+        /// The release is bound to no environment and the environment's
+        /// partition is the legacy one, where the environment-less passes
+        /// warm unbound releases.
+        Unbound => "unbound",
+        /// No release of the template is bound to the environment.
+        NotBound => "not_bound",
+        /// The cluster lookup failed, or the cluster didn't apply the
+        /// environment selector, as one that predates twins doesn't.
+        ResolveError => "resolve_error",
+        /// The lookup succeeded but the local pin upsert failed.
+        PinError => "pin_error",
+        /// The template is org-specific, so nothing is warmed on shared
+        /// nodes and its pins drop.
+        SkippedOrgSpecific => "skipped_org_specific",
+        /// The cluster couldn't report visibility; nothing is warmed and
+        /// pins are preserved.
+        VisibilityUnknown => "visibility_unknown",
+    }
+);
+
+/// One per decision of the prefetch environment pass, which warms each
+/// tagged and latest release's twin once per environment the node can run.
+/// Kept apart from `template.prefetch.tag.candidates` and
+/// `template.prefetch.release.candidates`, which keep counting the releases
+/// a lookup without an environment resolves. `environment` is an
+/// environment reference from the node's compiled catalog, so the tag is
+/// bounded by that catalog.
+pub fn prefetch_environment_candidate(
+    template: &str,
+    environment: &str,
+    pass: PrefetchEnvironmentPass,
+    outcome: PrefetchEnvironmentOutcome,
+) {
+    counter(
+        "template.prefetch.environment.candidates",
+        1,
+        &[
+            tag("template", template),
+            tag("environment", environment),
+            tag("pass", pass),
+            tag("outcome", outcome),
+        ],
+    );
+}
+
+metric_vocabulary!(
     /// Why a template-manager GC tick failed: the `reason` tag on its
     /// `result:error` series. Every one skips the whole tick, evicting
     /// nothing.
@@ -225,8 +292,9 @@ pub fn digest_pins_pruned(count: u64) {
     counter("template.digest_pins.pruned", count, &[]);
 }
 
-/// The requested content hash uses the legacy `version` tag on DogStatsD and
-/// `version.requested` on OTLP, separate from the emitting process version.
+/// The requested content hash is the `hash` tag, as on
+/// `template.prefetch.release.candidates`; `version` is left to the emitting
+/// process.
 pub fn fetch_error(name: &str, req_hash: &str, req_tag: &str, reason: &str) {
     let tags = vec![
         tag("template", name),
@@ -239,7 +307,7 @@ pub fn fetch_error(name: &str, req_hash: &str, req_tag: &str, reason: &str) {
             },
         ),
         tag(
-            "version",
+            "hash",
             if req_hash.is_empty() {
                 "<unset>"
             } else {

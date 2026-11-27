@@ -42,6 +42,14 @@ pub(super) fn route_resolution_error(status: &tonic::Status) -> RouteResolutionE
             RouteResolutionError::SessionAtRest(at_rest)
         }
         tonic::Code::FailedPrecondition => RouteResolutionError::SessionNotReady,
+        // ClusterApi routes no session to a sandbox that is restoring, and
+        // marks that refusal: the restore is the wake on its way.
+        tonic::Code::Unavailable
+            if pplx_space_common_grpc::SandboxServiceRouteNotReady::from_status(status)
+                .is_some() =>
+        {
+            RouteResolutionError::SessionNotReady
+        }
         _ => RouteResolutionError::ResolutionFailed,
     }
 }
@@ -49,21 +57,34 @@ pub(super) fn route_resolution_error(status: &tonic::Status) -> RouteResolutionE
 /// How often an attach looks again for a route its sandbox does not have yet.
 const SESSION_NOT_READY_POLL: Duration = Duration::from_millis(500);
 
-/// [`resolve_session_route`] for a client attach, which waits up to the
-/// attach deadline while the session's sandbox has no route: a wake started
-/// with the session, such as the one `createCommand` starts for a sandbox at
-/// rest, places the sandbox again in about that time.
+/// How long an events attach waits for a route its sandbox is on its way to.
+///
+/// The wake `createCommand` queues for a sandbox at rest runs behind the
+/// sandbox's earlier lifecycle operations and the organization's lifecycle
+/// limits, so when many sandboxes wake at once the last ones are placed tens
+/// of seconds after their commands were created. The wait stays under the
+/// 60 s idle timeout common to HTTP proxies, so a client behind one gets the
+/// attach's own answer rather than the proxy's.
+const ATTACH_ROUTE_WAIT: Duration = Duration::from_secs(45);
+
+/// [`resolve_session_route`] for a client attach, which waits up to
+/// [`ATTACH_ROUTE_WAIT`] while the session's sandbox has no route but is
+/// about to: it is placing, waking or restoring, as after the wake
+/// `createCommand` starts for a sandbox at rest.
 pub(super) async fn resolve_attach_route(
     state: &DataPlaneState,
     session_id: DataPlaneSessionId,
     token: &str,
 ) -> Result<AttachedSession, RouteResolutionError> {
-    retry_not_ready_until(tokio::time::Instant::now() + state.attach_deadline, || {
+    retry_not_ready_until(tokio::time::Instant::now() + ATTACH_ROUTE_WAIT, || {
         resolve_session_route(state, session_id, token)
     })
     .await
 }
 
+/// Resolve until the route is anything but not ready, or until `deadline`.
+/// A resolve still running at the deadline, such as one ClusterApi holds on
+/// a restore, ends there as not ready: the attach answers by its deadline.
 pub(super) async fn retry_not_ready_until<T, F, Fut>(
     deadline: tokio::time::Instant,
     mut resolve: F,
@@ -73,13 +94,14 @@ where
     Fut: Future<Output = Result<T, RouteResolutionError>>,
 {
     loop {
-        match resolve().await {
-            Err(RouteResolutionError::SessionNotReady)
+        match tokio::time::timeout_at(deadline, resolve()).await {
+            Err(_) => return Err(RouteResolutionError::SessionNotReady),
+            Ok(Err(RouteResolutionError::SessionNotReady))
                 if tokio::time::Instant::now() + SESSION_NOT_READY_POLL < deadline =>
             {
                 tokio::time::sleep(SESSION_NOT_READY_POLL).await;
             }
-            result => return result,
+            Ok(result) => return result,
         }
     }
 }
@@ -110,19 +132,19 @@ async fn resolve_session_route_with_cache(
         return Ok(attached);
     }
 
-    let mut client = state.cluster_api.for_session(&session_id);
-    let read = start_revocation_read(state);
-    let response = client
-        .resolve_data_plane_session_route(ResolveDataPlaneSessionRouteRequest {
+    let (read, response) = resolve_data_plane_session_route(
+        state,
+        session_id,
+        ResolveDataPlaneSessionRouteRequest {
             session_id: session_id.to_string(),
             protocol_session_id: protocol_session_id(session_id),
             token_sha256: Some(token_sha256),
             required_scope: Some(required_scope),
             requested_transport: Some(native_requested_transport(session_id.kind()) as i32),
-        })
-        .await
-        .map_err(|status| route_resolution_error(&status))?
-        .into_inner();
+        },
+    )
+    .await
+    .map_err(|status| route_resolution_error(&status))?;
 
     let mut attached = attached_session_from_route_response(
         response,
@@ -427,19 +449,19 @@ pub(super) async fn resolve_session_route_internal(
     state: &DataPlaneState,
     session_id: DataPlaneSessionId,
 ) -> Result<AttachedSession, StreamBridgeError> {
-    let mut client = state.cluster_api.for_session(&session_id);
-    let read = start_revocation_read(state);
-    let response = client
-        .resolve_data_plane_session_route(ResolveDataPlaneSessionRouteRequest {
+    let (read, response) = resolve_data_plane_session_route(
+        state,
+        session_id,
+        ResolveDataPlaneSessionRouteRequest {
             session_id: session_id.to_string(),
             protocol_session_id: protocol_session_id(session_id),
             token_sha256: None,
             required_scope: None,
             requested_transport: Some(native_requested_transport(session_id.kind()) as i32),
-        })
-        .await
-        .map_err(StreamBridgeError::ClusterStatus)?
-        .into_inner();
+        },
+    )
+    .await
+    .map_err(StreamBridgeError::ClusterStatus)?;
 
     let attached = attached_session_from_route_response(
         response,
@@ -454,6 +476,31 @@ pub(super) async fn resolve_session_route_internal(
         read,
     );
     Ok(attached)
+}
+
+/// Ask ClusterApi for a session's route, sending the request again while this
+/// client's transport to it fails ([`crate::cluster_api_retry`]). The
+/// revocation read is dated from the attempt that answered.
+async fn resolve_data_plane_session_route(
+    state: &DataPlaneState,
+    session_id: DataPlaneSessionId,
+    message: ResolveDataPlaneSessionRouteRequest,
+) -> Result<(RevocationRead, ResolveDataPlaneSessionRouteResponse), tonic::Status> {
+    let client = state.cluster_api.for_session(&session_id);
+    crate::cluster_api_retry::retry_cluster_api_transport(
+        "resolve_data_plane_session_route",
+        tokio::time::Instant::now() + crate::cluster_api_retry::CLUSTER_API_TRANSPORT_RETRY_WINDOW,
+        || {
+            let mut client = client.clone();
+            let message = message.clone();
+            let read = start_revocation_read(state);
+            async move {
+                let response = client.resolve_data_plane_session_route(message).await?;
+                Ok((read, response.into_inner()))
+            }
+        },
+    )
+    .await
 }
 
 pub(super) fn attached_session_from_route_response(
@@ -564,7 +611,7 @@ pub(super) async fn proxy_session(
         .parse::<DataPlaneSessionId>()
         .map_err(|_| ProxyError::BadRequest("invalid session id"))?;
     let (token, token_source) = token_from_headers_with_source(request.headers())
-        .map_err(ProxyError::BadRequest)?
+        .map_err(|MalformedToken| ProxyError::Unauthorized(INVALID_TOKEN_MESSAGE))?
         .ok_or(ProxyError::Unauthorized("data-plane token is required"))?;
     if is_upgrade_request(request.headers()) && state.drain_started.is_cancelled() {
         return Ok(native_draining_response(session_id.kind().as_str()));
@@ -1111,6 +1158,8 @@ pub(super) async fn bind_session_process(
             session_id: session_id.to_string(),
             protocol_session_id: protocol_session_id(session_id),
             process_id: process_id.to_string(),
+            // The stream records the exit when it observes it.
+            records_exit: true,
         })
         .await
         .map_err(StreamBridgeError::ClusterStatus)?;
@@ -1121,6 +1170,105 @@ pub(super) async fn bind_session_process(
     // re-resolves the bound route and connects to the existing process.
     state.route_cache.forget_native_session(session_id);
     Ok(())
+}
+
+/// Records that the process bound to the session exited, before the stream
+/// reports it, so that a client reading the session once it has
+/// `process_exited` finds it `closed`. Only the session's public state depends
+/// on it, so the stream waits at most
+/// [`DataPlaneState::process_exit_record_timeout`] for the first answer and
+/// then reports the exit anyway. The record itself goes on in the
+/// background: an attempt still unanswered keeps running, and one the
+/// cluster API could not take for now is retried, so a slow or restarting
+/// cluster API still closes the session. A refusal that retrying cannot
+/// change, such as from a cluster API older than the call, is logged.
+pub(super) async fn record_session_process_exited(
+    state: &DataPlaneState,
+    session_id: DataPlaneSessionId,
+    process_id: &ProcessId,
+) {
+    let request = RecordDataPlaneSessionProcessExitedRequest {
+        session_id: session_id.to_string(),
+        protocol_session_id: protocol_session_id(session_id),
+        process_id: process_id.to_string(),
+    };
+    let (first_answer, first_answered) = tokio::sync::oneshot::channel();
+    let record_state = state.clone();
+    state.upgrade_tasks.spawn(async move {
+        let shutdown = record_state.stream_shutdown_token.clone();
+        tokio::select! {
+            () = record_process_exit(&record_state, session_id, request, first_answer) => {}
+            () = shutdown.cancelled() => tracing::warn!(
+                session_id = %session_id,
+                "stopped recording a data-plane session's process exit at shutdown"
+            ),
+        }
+    });
+    if tokio::time::timeout(state.process_exit_record_timeout, first_answered)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            session_id = %session_id,
+            timeout_ms = state.process_exit_record_timeout.as_millis() as u64,
+            "reporting a process exit before the cluster API recorded it"
+        );
+    }
+}
+
+/// How many times a stream's exit record is sent before it is given up.
+const PROCESS_EXIT_RECORD_ATTEMPTS: u32 = 4;
+
+async fn record_process_exit(
+    state: &DataPlaneState,
+    session_id: DataPlaneSessionId,
+    request: RecordDataPlaneSessionProcessExitedRequest,
+    first_answer: tokio::sync::oneshot::Sender<()>,
+) {
+    let mut first_answer = Some(first_answer);
+    let mut delay = state.process_exit_record_retry_delay;
+    for attempt in 1..=PROCESS_EXIT_RECORD_ATTEMPTS {
+        let result = state
+            .cluster_api
+            .for_session(&session_id)
+            .record_data_plane_session_process_exited(request.clone())
+            .await;
+        if let Some(answer) = first_answer.take() {
+            let _ = answer.send(());
+        }
+        let Err(status) = result else {
+            return;
+        };
+        // The record is idempotent, so a refusal that may be temporary is
+        // worth repeating: the cluster API answers Internal when its database
+        // write fails.
+        let retryable = matches!(
+            status.code(),
+            tonic::Code::Unavailable
+                | tonic::Code::DeadlineExceeded
+                | tonic::Code::ResourceExhausted
+                | tonic::Code::Aborted
+                | tonic::Code::Internal
+        );
+        if !retryable || attempt == PROCESS_EXIT_RECORD_ATTEMPTS {
+            tracing::warn!(
+                session_id = %session_id,
+                code = ?status.code(),
+                message = status.message(),
+                attempt,
+                "failed to record a data-plane session's process exit"
+            );
+            return;
+        }
+        tracing::debug!(
+            session_id = %session_id,
+            code = ?status.code(),
+            attempt,
+            "retrying a data-plane session's process exit record"
+        );
+        tokio::time::sleep(delay).await;
+        delay = delay.saturating_mul(2);
+    }
 }
 
 /// A session's process binding, persisted while the stream keeps forwarding

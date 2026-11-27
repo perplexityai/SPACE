@@ -16,8 +16,11 @@
 //! variants), a list out of declaration order and an entry dropped from
 //! either list. A variant appended after the last one, or a tombstone given
 //! a position but not listed, still has to be listed by hand.
+//!
+//! Its submodules expose some of this crate's production statements to other
+//! crates' tests.
 
-use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_sandbox_model::SandboxLifecycle;
 
 use crate::StoredSandboxLifecycle;
 
@@ -28,7 +31,7 @@ impl StoredSandboxLifecycle {
     ///
     /// The live half is [`SandboxLifecycle::all`], so a variant listed there
     /// reaches every sweep with no edit here. The tombstone half is
-    /// [`TOMBSTONES`]; the wildcard-free match in `tombstone_position` makes a
+    /// `TOMBSTONES`; the wildcard-free match in `tombstone_position` makes a
     /// new stored-only variant fail to compile until it is classified, and
     /// listing it stays manual.
     pub const fn all() -> &'static [Self] {
@@ -196,6 +199,9 @@ pub fn known_defects<W, const N: usize>(matrix: &[(&str, [(W, Expect); N])]) -> 
         .filter(|(_, expect)| *expect == Expect::KnownDefect)
         .count()
 }
+
+pub mod admin_occupancy;
+pub mod sweeper;
 
 #[cfg(test)]
 mod tests;

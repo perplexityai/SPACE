@@ -1,12 +1,8 @@
 //! Postgres store for the failed-restorable repair loop.
 
-use pplx_space_common_core::types::LocalArtifactId;
-use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_core::types::SubstrateKind;
+use pplx_space_sandbox_model::SandboxId;
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::PositiveDuration;
-use pplx_space_sandbox_portability::failed_repair_revert_eligibility;
+use pplx_space_durations::PositiveDuration;
 use pplx_space_sandbox_store::repair;
 use sqlx::PgPool;
 
@@ -32,36 +28,16 @@ impl RepairDbStore {
         after_sandbox_id: Option<SandboxId>,
         min_age: PositiveDuration,
     ) -> Result<Vec<RepairCandidate>, sqlx::Error> {
-        let eligibility = failed_repair_revert_eligibility("s");
-        let guards = repair::failed_repair_row_state_guards("$4", "$1");
-        let query = format!(
-            "SELECT s.id, s.current_local_artifact_id, {clear} AS clear_marker
-               FROM sandboxes s
-              WHERE {guards}
-                AND {eligible}
-                AND ($2::uuid IS NULL OR s.id > $2)
-              ORDER BY s.id
-              LIMIT $3",
-            clear = eligibility.clear_marker,
-            eligible = eligibility.eligible,
-        );
-        let rows: Vec<(SandboxId, Option<LocalArtifactId>, bool)> =
-            sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                .bind(duration_secs_i64(min_age))
-                .bind(after_sandbox_id)
-                .bind(i64::from(batch_size))
-                .bind(SubstrateKind::Kubernetes)
-                .fetch_all(&self.pool)
+        let rows =
+            repair::failed_restorable_candidates(&self.pool, batch_size, after_sandbox_id, min_age)
                 .await?;
         Ok(rows
             .into_iter()
-            .map(
-                |(sandbox_id, current_local_artifact_id, clear_marker)| RepairCandidate {
-                    sandbox_id,
-                    current_local_artifact_id,
-                    clear_marker,
-                },
-            )
+            .map(|row| RepairCandidate {
+                sandbox_id: row.sandbox_id,
+                current_local_artifact_id: row.current_local_artifact_id,
+                clear_marker: row.clear_marker,
+            })
             .collect())
     }
 
@@ -75,7 +51,7 @@ impl RepairDbStore {
         // rows (CAS lost). See [`repair::revert_failed_to_suspended`].
         let mut tx = self.pool.begin().await?;
         let Some(cleared_marker) =
-            repair::revert_failed_to_suspended(&mut tx, candidate.sandbox_id, min_age).await?
+            repair::revert_failed_to_suspended(&mut *tx, candidate.sandbox_id, min_age).await?
         else {
             tx.rollback().await?;
             return Ok(ApplyOutcome::SkippedRaced);
@@ -88,27 +64,16 @@ impl RepairDbStore {
         // unassigned sandboxes are unpublishable. The shape is re-pinned so
         // a projection that turned live since the guard ran survives (the
         // CAS would have refused the flip in that case anyway).
-        sqlx::query(sql!(
-            "DELETE FROM sandbox_observed_states
-              WHERE sandbox_id = $1 AND status = 'failed' AND pid IS NULL"
-        ))
-        .bind(candidate.sandbox_id)
-        .execute(&mut *tx)
+        pplx_space_sandbox_teardown::observed_states::clear_failed_observation(
+            &mut *tx,
+            candidate.sandbox_id,
+        )
         .await?;
 
-        sqlx::query(sql!(
-            "UPDATE sandbox_port_exposures
-                SET apply_state = 'pending',\n\
-                    last_applied_node_id = NULL,\n\
-                    last_error = NULL,\n\
-                    last_bridge_status = NULL,\n\
-                    last_applied_bridge_generation = NULL,\n\
-                    last_observed_at = NULL,\n\
-                    updated_at = NOW()
-              WHERE sandbox_id = $1 AND desired_state = 'open'"
-        ))
-        .bind(candidate.sandbox_id)
-        .execute(&mut *tx)
+        pplx_space_sandbox_store::port_exposures::invalidate_open_observations(
+            &mut *tx,
+            candidate.sandbox_id,
+        )
         .await?;
 
         tx.commit().await?;
@@ -118,8 +83,4 @@ impl RepairDbStore {
             ApplyOutcome::RevertedToSuspended
         })
     }
-}
-
-fn duration_secs_i64(duration: PositiveDuration) -> i64 {
-    i64::try_from(duration.get().as_secs()).unwrap_or(i64::MAX)
 }

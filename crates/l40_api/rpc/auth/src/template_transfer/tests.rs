@@ -1,6 +1,6 @@
 use super::*;
 use crate::KubernetesAuthenticationMode;
-use pplx_space_common_core::host::linux::identities::user_names;
+use pplx_space_host_layout::identities::user_names;
 
 #[test]
 fn missing_identity_and_forged_metadata_never_authorize_remote_calls() {

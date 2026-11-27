@@ -21,7 +21,7 @@ from pathlib import Path
 import grpc
 from grpc_tools import protoc
 
-# Hardcoded fallbacks matching crates/libs/common/core/.../linux_identities.rs
+# Hardcoded fallbacks matching crates/l20_domain/host/layout/.../linux_identities.rs
 # (canonical source: infra/space/identity/node-identities.sh).
 FALLBACK_UIDS = {"space-sbxmgr": 950, "space-tmplmgr": 955}
 

@@ -1,11 +1,15 @@
+mod digest_original;
 mod prefetch_catalog;
 pub(crate) mod queued_ref;
 mod reconcile_claim_origins;
+mod reconcile_completion;
+mod release_twins;
 mod runtime_desired_state;
 mod substrate_scope;
 #[cfg(feature = "kubernetes")]
 mod template_node_identity;
-use pplx_space_common_core::types::{LocalArtifactId, NodeId, OrgId, SnapshotId, UserId};
+use pplx_space_accounts::{NodeId, OrgId, UserId};
+use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 
 use super::metadata::*;
 use super::*;
@@ -24,17 +28,16 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519Claims, ed25519::SpaceApiRouteEd25519Token,
     ed25519::decode_unverified_space_api_route_ed25519_claims,
 };
-use pplx_space_common_core::{
-    sql,
-    types::{EcwCredentialEpoch, ExecutionGeneration, GuestPort, SandboxId},
-};
 use pplx_space_common_grpc::SandboxServiceRouteNotReady;
 use pplx_space_db_test_fixtures::{
     SEED_ORG_ID as SEEDED_ORG_ID, SEED_USER_ID as SEEDED_USER_ID, TestDb, insert_ready_worker_node,
     try_pg_test_db_with_max_connections,
 };
 use pplx_space_ecw_credential::{EcwCredentialKeyring, EcwCredentialKind};
+use pplx_space_network_roles::GuestPort;
 use pplx_space_node_api_sim::SimWorkerHarness;
+use pplx_space_sandbox_model::{EcwCredentialEpoch, ExecutionGeneration, SandboxId};
+use pplx_space_sql_locator::sql;
 use sha2::{Digest, Sha256};
 use tonic::Code;
 use uuid::Uuid;
@@ -79,6 +82,85 @@ fn verify_proto_route_token(
 struct ClusterFixture {
     service: ClusterApiService,
     _db: TestDb,
+}
+
+/// The static token the reviewed ClusterApi also accepts.
+#[cfg(feature = "kubernetes")]
+const REVIEWED_STATIC_TOKEN: &str = "synthetic-static-token";
+
+/// ClusterApi served behind the real node-api auth layer.
+#[cfg(feature = "kubernetes")]
+struct ReviewedClusterApi {
+    client: crate::proto::cluster_api_client::ClusterApiClient<tonic::transport::Channel>,
+    _server: tokio_util::task::AbortOnDropHandle<Result<(), tonic::transport::Error>>,
+    _reviewer: tokio_util::task::AbortOnDropHandle<std::io::Result<()>>,
+}
+
+/// Serve `service` with TokenReview answered by `review`, admitting the
+/// `allowed` service accounts (comma-separated). With `firewall_rules_fetch`,
+/// that account holds the fetch authority production withholds.
+#[cfg(feature = "kubernetes")]
+async fn serve_reviewed(
+    service: ClusterApiService,
+    allowed: &str,
+    firewall_rules_fetch: Option<&str>,
+    review: impl Fn(
+        k8s_openapi::api::authentication::v1::TokenReviewSpec,
+    ) -> pplx_space_rpc_auth::test_support::TokenReviewStatus
+    + Clone
+    + Send
+    + Sync
+    + 'static,
+) -> TestResult<ReviewedClusterApi> {
+    use pplx_space_rpc_auth::{NodeApiAuthConfig, NodeApiAuthLayer, NodeRole};
+
+    let review_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let kube_config =
+        kube::Config::new(format!("http://{}", review_listener.local_addr()?).parse()?);
+    let reviewer = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+        pplx_space_rpc_auth::test_support::serve_token_reviews(
+            review_listener,
+            review,
+            tokio_util::sync::CancellationToken::new(),
+        ),
+    ));
+    let mut env = pplx_space_test_env::TestEnv::default();
+    for (key, value) in [
+        ("SPACE_K8S_TOKEN_AUTH_ENABLED", "true"),
+        ("SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED", "true"),
+        ("SPACE_K8S_TOKEN_AUTH_NAMESPACE", "space"),
+        ("KUBERNETES_SERVICE_HOST", "127.0.0.1"),
+        ("SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS", allowed),
+    ] {
+        env.set(key, value);
+    }
+    let mut config = NodeApiAuthConfig::from_environment(
+        &env,
+        NodeRole::Cluster,
+        REVIEWED_STATIC_TOKEN.into(),
+        None,
+    )?;
+    if let Some(service_account) = firewall_rules_fetch {
+        config = config.grant_firewall_rules_fetch_for_test(service_account);
+    }
+    let auth =
+        NodeApiAuthLayer::with_k8s_client_for_test(config, kube::Client::try_from(kube_config)?);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .layer(auth)
+            .add_service(crate::proto::cluster_api_server::ClusterApiServer::new(
+                service,
+            ))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+    }));
+    Ok(ReviewedClusterApi {
+        client: crate::proto::cluster_api_client::ClusterApiClient::connect(endpoint).await?,
+        _server: server,
+        _reviewer: reviewer,
+    })
 }
 
 #[tokio::test]
@@ -382,6 +464,20 @@ async fn template_org_id(
         .await
 }
 
+/// The old `(template_name, hash)` unique index, recreated as the baseline
+/// schema defines it (`20261002070625_baseline.up.sql`), for a test of the
+/// schema in which it still stands, whether or not the test database has
+/// had a later migration drop it.
+pub(super) async fn ensure_old_index(pool: &sqlx::PgPool) -> TestResult {
+    sqlx::query(sql!(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_template_releases_template_name_hash_unique
+             ON public.template_releases USING btree (template_name, hash)"
+    ))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 async fn register_release(
     service: &ClusterApiService,
     hash: &str,
@@ -410,7 +506,7 @@ async fn register_release(
 async fn register_release_with_execution(
     service: &ClusterApiService,
     hash: &str,
-    execution: &pplx_space_common_core::types::ExecutionMetadata,
+    execution: &pplx_space_execution_spec::ExecutionMetadata,
 ) -> Result<RegisterTemplateReleaseResponse, tonic::Status> {
     Ok(service
         .register_template_release(publisher_request(RegisterTemplateReleaseRequest {
@@ -485,6 +581,7 @@ async fn scoped_release_lookup_hides_private_bases(
                     service
                         .find_template_release_by_hash(Request::new(
                             FindTemplateReleaseByHashRequest {
+                                environment: None,
                                 generic_only: false,
                                 template_name: name,
                                 hash,
@@ -495,6 +592,7 @@ async fn scoped_release_lookup_hides_private_bases(
                 } else {
                     service
                         .find_template_release(Request::new(FindTemplateReleaseRequest {
+                            environment: None,
                             generic_only: false,
                             template_name: name,
                             runtime: "firecracker".into(),
@@ -919,6 +1017,7 @@ async fn register_template_release_reuses_a_bare_hash_release() -> TestResult {
     let latest = fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            environment: None,
             generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
@@ -986,6 +1085,7 @@ async fn register_template_release_prefers_the_duplicate_that_owns_a_location() 
         let resolved = fixture
             .service
             .find_template_release(Request::new(FindTemplateReleaseRequest {
+                environment: None,
                 generic_only: false,
                 caller_org_id: None,
                 template_name: "code-runtime".to_string(),
@@ -1040,6 +1140,7 @@ async fn register_template_release_is_idempotent_by_hash() -> TestResult {
     let by_hash = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            environment: None,
             generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
@@ -1063,6 +1164,7 @@ async fn register_template_release_is_idempotent_by_hash() -> TestResult {
     let by_tag = fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            environment: None,
             generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
@@ -1108,6 +1210,7 @@ async fn register_template_release_is_idempotent_by_hash() -> TestResult {
     let latest = fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            environment: None,
             generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
@@ -1174,6 +1277,7 @@ async fn storage_policy_rejects_registration_without_changing_release_or_tags() 
         let latest = fixture
             .service
             .find_template_release(Request::new(FindTemplateReleaseRequest {
+                environment: None,
                 generic_only: false,
                 template_name: "code-runtime".into(),
                 runtime: "fc".into(),
@@ -1213,6 +1317,7 @@ async fn register_template_release_allows_no_storage_locations() -> TestResult {
     let by_hash = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            environment: None,
             generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
@@ -1233,11 +1338,16 @@ async fn register_template_release_allows_no_storage_locations() -> TestResult {
 /// metadata is backfilled by a later registration that has it.
 #[tokio::test(flavor = "current_thread")]
 async fn register_template_release_persists_execution_metadata_write_once() -> TestResult {
-    use pplx_space_common_core::types::{Arch, Digest, EnvironmentReference, ExecutionMetadata};
+    use pplx_space_content_digest::Digest;
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{EnvironmentReference, ExecutionMetadata};
 
     let Some(fixture) = cluster_fixture().await? else {
         return Ok(());
     };
+    // Releases are write-once per `(template_name, hash)` here: the schema in
+    // which the old index stands.
+    ensure_old_index(&fixture.service.pool).await?;
     register_template(&fixture.service, "code-runtime").await?;
 
     let digest_a = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1333,7 +1443,8 @@ async fn register_template_release_persists_execution_metadata_write_once() -> T
 /// as they were, including a `NULL` metadata column.
 #[tokio::test(flavor = "current_thread")]
 async fn tags_only_republication_leaves_locations_and_metadata_unchanged() -> TestResult {
-    use pplx_space_common_core::types::{Arch, ExecutionMetadata};
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::ExecutionMetadata;
 
     let Some(fixture) = cluster_fixture().await? else {
         return Ok(());
@@ -1452,6 +1563,7 @@ async fn find_template_release_by_hash_resolves_bare_hash() -> TestResult {
     let by_bare = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            environment: None,
             generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
@@ -1469,6 +1581,7 @@ async fn find_template_release_by_hash_resolves_bare_hash() -> TestResult {
     let by_prefixed = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            environment: None,
             generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
@@ -1514,6 +1627,7 @@ async fn list_latest_template_releases_orders_and_limits() -> TestResult {
     let latest = fixture
         .service
         .list_latest_template_releases(Request::new(ListLatestTemplateReleasesRequest {
+            environment: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
             limit: 3,
@@ -1557,6 +1671,7 @@ async fn list_latest_template_releases_orders_and_limits() -> TestResult {
     let empty = fixture
         .service
         .list_latest_template_releases(Request::new(ListLatestTemplateReleasesRequest {
+            environment: None,
             template_name: "no-releases".to_string(),
             runtime: "firecracker".to_string(),
             limit: 5,
@@ -1569,6 +1684,7 @@ async fn list_latest_template_releases_orders_and_limits() -> TestResult {
     let zero = fixture
         .service
         .list_latest_template_releases(Request::new(ListLatestTemplateReleasesRequest {
+            environment: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
             limit: 0,
@@ -1581,6 +1697,7 @@ async fn list_latest_template_releases_orders_and_limits() -> TestResult {
     let too_big = fixture
         .service
         .list_latest_template_releases(Request::new(ListLatestTemplateReleasesRequest {
+            environment: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
             limit: 51,
@@ -1771,6 +1888,7 @@ async fn template_release_resolution_characterization() -> TestResult {
                 .service
                 .find_template_release(request(
                     FindTemplateReleaseRequest {
+                        environment: None,
                         generic_only: false,
                         caller_org_id: caller.map(|org: Uuid| org.to_string()),
                         template_name: template.to_string(),
@@ -1819,6 +1937,7 @@ async fn template_release_resolution_characterization() -> TestResult {
                 .service
                 .find_template_release_by_hash(request(
                     FindTemplateReleaseByHashRequest {
+                        environment: None,
                         generic_only: false,
                         caller_org_id: caller.map(|org: Uuid| org.to_string()),
                         template_name: template.to_string(),
@@ -1865,6 +1984,7 @@ async fn template_release_resolution_characterization() -> TestResult {
                 .service
                 .list_latest_template_releases(request(
                     ListLatestTemplateReleasesRequest {
+                        environment: None,
                         template_name: template.to_string(),
                         runtime: runtime.to_string(),
                         limit,
@@ -2788,6 +2908,7 @@ async fn data_plane_process_binding_is_idempotent_and_conflict_checked() -> Test
             session_id: session_id.clone(),
             protocol_session_id: None,
             process_id: "proc_1".to_string(),
+            records_exit: false,
         }))
         .await?
         .into_inner();
@@ -2800,6 +2921,7 @@ async fn data_plane_process_binding_is_idempotent_and_conflict_checked() -> Test
             session_id: session_id.clone(),
             protocol_session_id: None,
             process_id: "proc_1".to_string(),
+            records_exit: false,
         }))
         .await?
         .into_inner();
@@ -2825,10 +2947,129 @@ async fn data_plane_process_binding_is_idempotent_and_conflict_checked() -> Test
             session_id,
             protocol_session_id: None,
             process_id: "proc_2".to_string(),
+            records_exit: false,
         }))
         .await
         .expect_err("second process id should be rejected");
     assert_eq!(conflict.code(), Code::AlreadyExists);
+    Ok(())
+}
+
+/// A session's public state follows its process: `pending` until a stream
+/// binds the process it started, `open` while it runs, and `closed` once a
+/// stream reports its exit. A bind from a caller that does not report exits
+/// leaves the session `pending`. A report about another process, a repeated
+/// one, and one for a revoked session leave the state as it is, and so does
+/// a repeated bind of a closed or revoked session.
+#[tokio::test(flavor = "current_thread")]
+async fn data_plane_session_state_follows_its_process() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    insert_data_plane_worker_node(&fixture.service.pool, node_id, "10.0.0.43").await?;
+    insert_data_plane_active_sandbox(&fixture.service.pool, sandbox_id, node_id).await?;
+    let state = |session_id: String| {
+        let pool = fixture.service.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM data_plane_sessions WHERE session_id = $1",
+            )
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+        }
+    };
+    let bind = |session_id: &str, records_exit: bool| {
+        Request::new(BindDataPlaneSessionProcessRequest {
+            session_id: session_id.to_string(),
+            protocol_session_id: None,
+            process_id: "proc_1".to_string(),
+            records_exit,
+        })
+    };
+    let exited = |session_id: &str, process_id: &str| {
+        Request::new(RecordDataPlaneSessionProcessExitedRequest {
+            session_id: session_id.to_string(),
+            protocol_session_id: None,
+            process_id: process_id.to_string(),
+        })
+    };
+
+    let session_id = format!("proc_{}", Uuid::now_v7());
+    let revoked_id = format!("proc_{}", Uuid::now_v7());
+    let untracked_id = format!("proc_{}", Uuid::now_v7());
+    for (session_id, records_exit) in [
+        (&session_id, true),
+        (&revoked_id, true),
+        (&untracked_id, false),
+    ] {
+        insert_data_plane_session_with_protocol(
+            &fixture.service.pool,
+            session_id,
+            None,
+            sandbox_id,
+            "process",
+        )
+        .await?;
+        // As the public API creates a session.
+        sqlx::query("UPDATE data_plane_sessions SET state = 'pending' WHERE session_id = $1")
+            .bind(session_id)
+            .execute(&fixture.service.pool)
+            .await?;
+        fixture
+            .service
+            .bind_data_plane_session_process(bind(session_id, records_exit))
+            .await?;
+    }
+    assert_eq!(state(session_id.clone()).await?, "open");
+    assert_eq!(state(untracked_id).await?, "pending");
+
+    let other = fixture
+        .service
+        .record_data_plane_session_process_exited(exited(&session_id, "proc_2"))
+        .await?
+        .into_inner();
+    assert!(!other.closed);
+    assert_eq!(state(session_id.clone()).await?, "open");
+
+    let first = fixture
+        .service
+        .record_data_plane_session_process_exited(exited(&session_id, "proc_1"))
+        .await?
+        .into_inner();
+    assert!(first.closed);
+    assert_eq!(state(session_id.clone()).await?, "closed");
+    let again = fixture
+        .service
+        .record_data_plane_session_process_exited(exited(&session_id, "proc_1"))
+        .await?
+        .into_inner();
+    assert!(!again.closed);
+    assert_eq!(state(session_id.clone()).await?, "closed");
+    fixture
+        .service
+        .bind_data_plane_session_process(bind(&session_id, true))
+        .await?;
+    assert_eq!(state(session_id.clone()).await?, "closed");
+
+    sqlx::query("UPDATE data_plane_sessions SET state = 'revoked' WHERE session_id = $1")
+        .bind(&revoked_id)
+        .execute(&fixture.service.pool)
+        .await?;
+    let revoked = fixture
+        .service
+        .record_data_plane_session_process_exited(exited(&revoked_id, "proc_1"))
+        .await?
+        .into_inner();
+    assert!(!revoked.closed);
+    assert_eq!(state(revoked_id.clone()).await?, "revoked");
+    fixture
+        .service
+        .bind_data_plane_session_process(bind(&revoked_id, true))
+        .await?;
+    assert_eq!(state(revoked_id).await?, "revoked");
     Ok(())
 }
 
@@ -3794,6 +4035,7 @@ async fn release_visible_from(
             .service
             .find_template_release(node_scoped_request(
                 FindTemplateReleaseRequest {
+                    environment: None,
                     generic_only: false,
                     caller_org_id: caller_org_id.clone(),
                     template_name: template.to_string(),
@@ -3809,6 +4051,7 @@ async fn release_visible_from(
             .service
             .find_template_release_by_hash(node_scoped_request(
                 FindTemplateReleaseByHashRequest {
+                    environment: None,
                     generic_only: false,
                     caller_org_id,
                     template_name: template.to_string(),
@@ -3822,6 +4065,7 @@ async fn release_visible_from(
         .service
         .list_latest_template_releases(node_scoped_request(
             ListLatestTemplateReleasesRequest {
+                environment: None,
                 template_name: template.to_string(),
                 runtime: "firecracker".to_string(),
                 limit: 5,
@@ -3885,6 +4129,7 @@ async fn node_scoped_lookups_hide_unplaced_private_releases() -> TestResult {
     fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            environment: None,
             generic_only: false,
             caller_org_id: None,
             template_name: "private-base".to_string(),
@@ -3931,6 +4176,7 @@ async fn placed_sandbox_unlocks_private_release_for_its_node_only() -> TestResul
         .service
         .find_template_release(node_scoped_request(
             FindTemplateReleaseRequest {
+                environment: None,
                 generic_only: false,
                 caller_org_id: None,
                 template_name: "private-base".to_string(),
@@ -4726,31 +4972,27 @@ fn test_storage_uri(sandbox_id: SandboxId, snapshot_id: SnapshotId) -> String {
 }
 
 fn test_snapshot_execution_for_arch(
-    arch: pplx_space_common_core::types::Arch,
+    arch: pplx_space_cpu_arch::Arch,
 ) -> pplx_space_execution_common::proto::ExecutionMetadata {
-    let execution = pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+    let execution = pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
         arch,
-        vec![pplx_space_common_core::types::ArtifactComponentMetadata {
-            kind: pplx_space_common_core::types::ArtifactComponentKind::Kernel,
-            role: Some(
-                pplx_space_common_core::types::ArtifactComponentRole::parse("boot").unwrap(),
-            ),
-            version: Some(
-                pplx_space_common_core::types::ArtifactVersion::parse("6.10.14").unwrap(),
-            ),
+        vec![pplx_space_execution_spec::ArtifactComponentMetadata {
+            kind: pplx_space_execution_spec::ArtifactComponentKind::Kernel,
+            role: Some(pplx_space_execution_spec::ArtifactComponentRole::parse("boot").unwrap()),
+            version: Some(pplx_space_execution_spec::ArtifactVersion::parse("6.10.14").unwrap()),
             digest: Some(
                 format!("sha256:{}", "c".repeat(64))
-                    .parse::<pplx_space_common_core::types::Digest>()
+                    .parse::<pplx_space_content_digest::Digest>()
                     .unwrap(),
             ),
-            format: Some(pplx_space_common_core::types::ArtifactFormat::parse("vmlinux").unwrap()),
+            format: Some(pplx_space_execution_spec::ArtifactFormat::parse("vmlinux").unwrap()),
         }],
     );
     (&execution).into()
 }
 
 fn test_snapshot_execution() -> pplx_space_execution_common::proto::ExecutionMetadata {
-    test_snapshot_execution_for_arch(pplx_space_common_core::types::Arch::Aarch64)
+    test_snapshot_execution_for_arch(pplx_space_cpu_arch::Arch::Aarch64)
 }
 
 /// Seed a `creating` suspend snapshot without artifact identity: the row
@@ -4796,23 +5038,22 @@ async fn seed_suspend_snapshot_with_identity(
     let storage_uri = ExactStorageUri::parse(&storage_uri)
         .map_err(|e| tonic::Status::invalid_argument(format!("invalid storage_uri: {e}")))?;
     let execution_metadata = snapshot_execution_metadata(Some(&execution))?;
-    let snapshot = service
-        .lookup_snapshot_sandbox(sandbox_id)
-        .await?
-        .new_snapshot(
-            snapshot_id,
-            sandbox_id,
-            SnapshotKind::Full,
-            SnapshotState::Creating,
-            storage_uri,
-        )?
-        .with_execution_metadata(execution_metadata);
+    let sandbox = service.lookup_snapshot_sandbox(sandbox_id).await?;
+    let snapshot = new_snapshot_from_sandbox(
+        &sandbox,
+        snapshot_id,
+        sandbox_id,
+        SnapshotKind::Full,
+        SnapshotState::Creating,
+        storage_uri,
+    )?
+    .with_execution_metadata(execution_metadata);
     let mut tx = service
         .pool
         .begin()
         .await
         .map_err(|e| tonic::Status::internal(format!("begin tx: {e}")))?;
-    snapshot_store::insert(&mut tx, &snapshot)
+    snapshot_store::insert(&mut *tx, &snapshot)
         .await
         .map_err(snapshot_insert_status)?;
     tx.commit()
@@ -4912,7 +5153,7 @@ async fn suspend_snapshot_rejects_reused_id_with_different_identity() -> TestRes
         (
             "different execution",
             sandbox_id,
-            test_snapshot_execution_for_arch(pplx_space_common_core::types::Arch::X86_64),
+            test_snapshot_execution_for_arch(pplx_space_cpu_arch::Arch::X86_64),
         ),
     ] {
         let error = seed_suspend_snapshot_with_identity(
@@ -5339,7 +5580,7 @@ async fn begin_replay_racing_retention_cannot_register_a_row_for_another_node() 
 
     // Retention's delete is in flight.
     let mut retention = pool.begin().await?;
-    assert!(snapshot_store::delete_snapshot_catalog(&mut retention, backup_attempt_id).await?);
+    assert!(snapshot_store::delete_snapshot_catalog(&mut *retention, backup_attempt_id).await?);
 
     let replay = begin_artifact_backup_from_node(
         &fixture.service,
@@ -7057,6 +7298,7 @@ async fn template_visibility_degrades_to_unspecified_without_column() -> TestRes
     let by_tag = fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            environment: None,
             generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
@@ -7074,6 +7316,7 @@ async fn template_visibility_degrades_to_unspecified_without_column() -> TestRes
     let by_hash = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            environment: None,
             generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
@@ -7090,6 +7333,7 @@ async fn template_visibility_degrades_to_unspecified_without_column() -> TestRes
     let latest = fixture
         .service
         .list_latest_template_releases(Request::new(ListLatestTemplateReleasesRequest {
+            environment: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
             limit: 5,
@@ -7159,6 +7403,7 @@ async fn visibility_lookup_reads_from_the_visibility_pool() -> TestResult {
         .with_visibility_pool(sideline.service.pool.clone());
     let response = service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            environment: None,
             generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
@@ -7184,6 +7429,7 @@ async fn visibility_lookup_reads_from_the_visibility_pool() -> TestResult {
     // one of them back to the shared pool is its own distinct bug.
     let by_hash = service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            environment: None,
             generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
@@ -7199,6 +7445,7 @@ async fn visibility_lookup_reads_from_the_visibility_pool() -> TestResult {
 
     let latest = service
         .list_latest_template_releases(Request::new(ListLatestTemplateReleasesRequest {
+            environment: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
             limit: 5,
@@ -7242,6 +7489,7 @@ async fn template_visibility_unrecognized_value_is_unspecified() -> TestResult {
     let by_tag = fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            environment: None,
             generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
@@ -7293,6 +7541,7 @@ async fn template_visibility_maps_column_values() -> TestResult {
         async move {
             service
                 .find_template_release(Request::new(FindTemplateReleaseRequest {
+                    environment: None,
                     generic_only: false,
                     caller_org_id: None,
                     template_name: "code-runtime".to_string(),
@@ -7331,6 +7580,7 @@ async fn template_visibility_maps_column_values() -> TestResult {
     let by_hash = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            environment: None,
             generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
@@ -7346,6 +7596,7 @@ async fn template_visibility_maps_column_values() -> TestResult {
     let latest = fixture
         .service
         .list_latest_template_releases(Request::new(ListLatestTemplateReleasesRequest {
+            environment: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
             limit: 5,
@@ -7381,6 +7632,7 @@ async fn list_latest_carries_visibility_with_zero_releases() -> TestResult {
     let latest = fixture
         .service
         .list_latest_template_releases(Request::new(ListLatestTemplateReleasesRequest {
+            environment: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
             limit: 5,
@@ -7439,6 +7691,7 @@ async fn visibility_of_find(fixture: &ClusterFixture) -> TestResult<TemplateVisi
     Ok(fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            environment: None,
             generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
@@ -7663,6 +7916,8 @@ async fn a_missing_templates_table_degrades_end_to_end() -> TestResult {
 mod activating_routes;
 mod backup_generation_fence;
 mod execution_currency;
+#[cfg(feature = "kubernetes")]
+mod firewall_rules;
 mod publication;
 mod restoring_routes;
 
@@ -7715,7 +7970,7 @@ async fn ecw_route_resolve_enforces_key_surface_and_organization() -> TestResult
     assert_eq!(invalid.code(), Code::Unauthenticated);
 
     for surfaces in [vec!["ecw"], vec!["native"], vec!["ecw", "native"]] {
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "UPDATE api_keys SET allowed_surfaces = $1 WHERE key_hash = $2"
         ))
         .bind(&surfaces)
@@ -7738,7 +7993,7 @@ async fn ecw_route_resolve_enforces_key_surface_and_organization() -> TestResult
         }
     }
 
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE api_keys SET org_id = '00000000-0000-0000-0000-000000000002' WHERE key_hash = $1"
     ))
     .bind(&key_hash)
@@ -7932,7 +8187,7 @@ async fn restore_locations_keep_digests_during_catalog_deletion() -> TestResult 
                 }
                 tokio::task::yield_now().await;
             }
-            pplx_space_sandbox_store::delete::delete_with_dependents(&mut deletion, sandbox_id)
+            pplx_space_sandbox_store::delete::delete_with_dependents(&mut *deletion, sandbox_id)
                 .await?;
             deletion.commit().await
         };

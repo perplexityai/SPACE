@@ -11,9 +11,10 @@
 //! or legacy report says nothing about environments and leaves both alone;
 //! the arrays then age out by their own receipt.
 
-use pplx_space_common_core::types::{ArtifactComponentKind, NodeId};
+use pplx_space_accounts::NodeId;
 use pplx_space_execution_common::environment::{EnvironmentObservation, KnownEnvironment};
 use pplx_space_execution_common::proto::NodeExecutionInventory;
+use pplx_space_execution_spec::ArtifactComponentKind;
 use pplx_space_runtime_environment_catalog_store::{
     self as catalog_store, CatalogIdentity, CertifiedEnvironment,
 };
@@ -36,22 +37,14 @@ pub(super) enum EnvironmentRefs {
 }
 
 impl EnvironmentRefs {
-    /// Whether the publication writes the arrays and their receipt.
-    pub(super) const fn writes(&self) -> bool {
-        !matches!(self, Self::Preserve)
-    }
-
-    pub(super) fn usable(&self) -> Option<&[String]> {
+    /// What the publication writes to the arrays and their receipt.
+    pub(super) fn write(&self) -> pplx_space_node_status_store::EnvironmentRefsWrite<'_> {
         match self {
-            Self::Record { usable, .. } => Some(usable),
-            Self::Preserve | Self::Clear => None,
-        }
-    }
-
-    pub(super) fn known(&self) -> Option<&[String]> {
-        match self {
-            Self::Record { known, .. } => Some(known),
-            Self::Preserve | Self::Clear => None,
+            Self::Preserve => pplx_space_node_status_store::EnvironmentRefsWrite::Preserve,
+            Self::Record { usable, known } => {
+                pplx_space_node_status_store::EnvironmentRefsWrite::Record { usable, known }
+            }
+            Self::Clear => pplx_space_node_status_store::EnvironmentRefsWrite::Clear,
         }
     }
 }
@@ -155,7 +148,7 @@ fn certified(environment: &KnownEnvironment) -> CertifiedEnvironment {
 /// alias, the kernel component's version and the state format.
 fn catalog_identity(environment: &KnownEnvironment) -> Option<CatalogIdentity> {
     let spec = environment.definition().descriptor().spec();
-    let pplx_space_common_core::types::RuntimeBinding::ManagedRelease(release) = &spec.runtime;
+    let pplx_space_execution_spec::RuntimeBinding::ManagedRelease(release) = &spec.runtime;
     let kernel = spec
         .boot
         .components()

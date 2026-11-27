@@ -7,8 +7,10 @@
 //! takes the sandbox row lock (`SELECT ... FOR UPDATE`) first and refuses an
 //! artifact already claimed for snapshot deletion before calling here.
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, LocalArtifactId, SandboxId};
+use pplx_space_postgres_pool::{DbError, Executor};
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
+use pplx_space_sql_locator::sql;
 
 /// **Observed projection.** Set the current local artifact marker to the
 /// artifact a node reported publishing, with `origin` as the operation that
@@ -18,11 +20,11 @@ use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, LocalArtifactI
 /// the caller's row lock and deleting-snapshot check in the same
 /// transaction.
 pub async fn set_current_local_artifact(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     artifact: Option<(LocalArtifactId, ArtifactKind)>,
     origin: ArtifactOrigin,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE sandboxes
             SET current_local_artifact_id = $2,
@@ -34,7 +36,7 @@ pub async fn set_current_local_artifact(
     .bind(artifact.map(|(id, _)| id.as_uuid()))
     .bind(artifact.map(|(_, kind)| kind.as_str()))
     .bind(origin.as_str())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }

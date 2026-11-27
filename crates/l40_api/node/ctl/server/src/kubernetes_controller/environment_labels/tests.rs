@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 
-use pplx_space_common_core::types::{
-    Digest, ExecutionCompatibilityProfile, RuntimeBinding, StateFormatIdentity,
-};
+use pplx_space_content_digest::Digest;
 use pplx_space_execution_common::environment::{
     EnvironmentDefinition, FIRECRACKER_MACHINE_CONTRACT, KnownEnvironment,
+};
+use pplx_space_execution_spec::{
+    ExecutionCompatibilityProfile, RuntimeBinding, StateFormatIdentity,
 };
 
 use super::*;

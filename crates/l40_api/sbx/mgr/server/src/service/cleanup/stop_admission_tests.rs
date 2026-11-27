@@ -22,7 +22,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_uds_peer_auth::PeerIdentity;
 use tonic::Request;
 
@@ -504,7 +504,7 @@ async fn exited_runtime_recovery_requires_death_and_the_current_execution() {
         let mut observed = service.lookup_sandbox(&id.to_string()).unwrap();
         if stale {
             observed.node_execution_id =
-                Some(pplx_space_common_core::types::SandboxActivationAttemptId::new());
+                Some(pplx_space_sandbox_model::SandboxActivationAttemptId::new());
         }
         if exited {
             child.kill().unwrap();
@@ -559,7 +559,7 @@ async fn exited_runtime_recovery_requires_death_and_the_current_execution() {
 
 #[test]
 fn stop_flush_requires_qualification_even_after_catalog_retirement() {
-    use pplx_space_common_core::types::guest_image::{
+    use pplx_space_execution_spec::guest_image::{
         GuestAgent, GuestDiskLayout, GuestImageContract, GuestNetwork, GuestReadiness,
     };
     let windows = GuestImageContract::new(

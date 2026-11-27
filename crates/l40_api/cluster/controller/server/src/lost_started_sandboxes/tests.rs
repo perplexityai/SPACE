@@ -31,7 +31,8 @@
 //! - P10 `p10_flip_rechecks_restore_sources_and_generation`
 //! - P11 `p11_flip_rechecks_placement_drain_lifecycle_and_substrate`
 
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -543,9 +544,9 @@ async fn t12_absence_must_last_the_grace_and_restarts_on_return() {
 // -----------------------------------------------------------------
 
 mod postgres_backed {
-    use pplx_space_common_core::sql;
-    use pplx_space_common_core::types::SnapshotId;
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
+    use pplx_space_snapshot_model::SnapshotId;
+    use pplx_space_sql_locator::sql;
     use pplx_space_test_env::TestResult;
     use sqlx::PgPool;
 

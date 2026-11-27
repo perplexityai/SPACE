@@ -15,7 +15,7 @@ async fn release_drains_the_responder_before_returning_and_is_idempotent() {
     service.guest_networks.entries.insert(
         sandbox,
         DhcpTask {
-            execution: pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+            execution: pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
             task,
         },
     );

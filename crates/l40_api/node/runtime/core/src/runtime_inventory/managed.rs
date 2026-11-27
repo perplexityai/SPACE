@@ -4,7 +4,7 @@ use crate::artifact_store::{
     release_directory, release_directory_names,
 };
 use crate::catalog::InitialEnvironment;
-use pplx_space_common_core::types::{ArtifactComponentRoleParseError, ArtifactFormatParseError};
+use pplx_space_execution_spec::{ArtifactComponentRoleParseError, ArtifactFormatParseError};
 
 impl RuntimeInventory {
     /// Build an executable snapshot from external layouts and the sole managed
@@ -349,7 +349,7 @@ impl RuntimeInventory {
                                 .find(|(_, component, _)| component.digest == kernel.sha256)
                             {
                                 let parsed_format = format.parse().map_err(
-                                    |source: pplx_space_common_core::types::ArtifactFormatParseError| {
+                                    |source: pplx_space_execution_spec::ArtifactFormatParseError| {
                                         RuntimeInventoryError::InvalidStaticIdentifier {
                                             field: "boot format",
                                             value: format.to_owned(),

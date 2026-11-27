@@ -1,6 +1,7 @@
 //! Guest bridge and filesystem-worker wire contracts, including process,
 //! filesystem, metadata, and networking services, plus their shared operations.
-//! Host/control protocols and transport connectors belong to spaced-common.
+//! Host/control protocols belong to spaced-protocol, and transport connectors
+//! to spaced-client.
 
 pub mod proto {
     pub mod update {

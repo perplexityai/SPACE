@@ -19,17 +19,17 @@ use crate::guest_filesystem_flush::{
 use crate::node_state_sync::mark_sandbox_dirty;
 use crate::runtime_reconciliation::{mark_quarantined_best_effort, observe_vm_state};
 use crate::state::SandboxState;
-use pplx_space_common_core::types::{
-    ArtifactKind, LocalArtifactId, SandboxArtifactMetadata, SandboxId, SandboxQuarantineReasonCode,
-    SnapshotExecutionMetadata, SnapshotName,
-};
+use pplx_space_artifact_model::SandboxArtifactMetadata;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
+use pplx_space_execution_spec::SnapshotExecutionMetadata;
 use pplx_space_node_mgr_client::proto::{
     CaptureVmStateRequest, PauseSandboxRequest, ResumeSandboxRequest, SyncGuestRequest,
 };
 use pplx_space_node_runtime_core::vm_state::VmState;
+use pplx_space_sandbox_model::{SandboxId, SandboxQuarantineReasonCode};
+use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId, SnapshotName};
 
 const TICK_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -37,6 +37,27 @@ fn lock_db(ctx: &CheckpointContext) -> Result<crate::db::ConnectionGuard<'_>, St
     ctx.db
         .lock()
         .map_err(|error| format!("database mutex poisoned: {error}"))
+}
+
+/// Admit a scheduled capture of `sandbox_id`, `producer` naming it, with the
+/// activation seal, holding the sandbox's artifact lock: see
+/// [`crate::activation_seal::ActivationSeal::admit_producer`]. A row that is
+/// missing or can't be read has no VM, which only a sealed node refuses.
+fn admit_scheduled_producer(
+    ctx: &CheckpointContext,
+    producer: &str,
+    sandbox_id: &str,
+) -> Result<crate::activation_seal::ArtifactProducerToken, String> {
+    let has_vm = {
+        let db = lock_db(ctx)?;
+        crate::db::read::sandbox(&db, sandbox_id)
+            .ok()
+            .flatten()
+            .is_some_and(|sandbox| crate::activation_seal::has_vm(sandbox.state))
+    };
+    ctx.activation_seal
+        .admit_producer(producer, sandbox_id, has_vm)
+        .map_err(|refusal| refusal.message().to_owned())
 }
 
 /// `do_checkpoint`'s admission to the node-local SQLite `sandboxes.state`:
@@ -139,16 +160,15 @@ fn write_snapshot_sidecar(
 /// `snapshot.json`, not `runtime.json`.
 fn checkpoint_sidecar_execution_metadata(
     metadata: SandboxArtifactMetadata,
-) -> Result<SnapshotExecutionMetadata, pplx_space_common_core::types::ExecutionMetadataError> {
+) -> Result<SnapshotExecutionMetadata, pplx_space_execution_spec::ExecutionMetadataError> {
     Ok(SnapshotExecutionMetadata::new(metadata.execution)?
         .with_cpu_budget(metadata.cpu_budget)
         .with_guest_memory(metadata.guest_memory)
-        .with_host_cpu(pplx_space_common_core::types::HostCpu::current().cloned()))
+        .with_host_cpu(pplx_space_execution_spec::HostCpu::current().cloned()))
 }
 
 fn write_snapshot_execution_sidecar(snapshot_dir: &str, sandbox_id: &str, snapshot_name: &str) {
-    let sandbox_metadata_path =
-        pplx_space_common_core::host::linux::paths::sandbox_metadata_path(sandbox_id);
+    let sandbox_metadata_path = pplx_space_host_layout::paths::sandbox_metadata_path(sandbox_id);
     let bytes = match std::fs::read(&sandbox_metadata_path) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -211,7 +231,7 @@ fn write_snapshot_execution_sidecar(snapshot_dir: &str, sandbox_id: &str, snapsh
     }
 }
 
-const CACHE_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR;
+const CACHE_DIR: &str = pplx_space_host_layout::paths::SANDBOX_CACHE_DIR;
 
 struct SandboxSnapshotState {
     tick_count: u64,
@@ -258,6 +278,8 @@ pub struct CheckpointContext {
     pub auto_lifecycle: crate::auto_lifecycle::AutoLifecycleCoordinator,
     pub health_lifecycle: crate::watchdog::HealthLifecycleEpochs,
     pub node_manager: crate::node_manager_transport::NodeManagerConnector,
+    /// Admits each scheduled capture as a node-local artifact producer.
+    pub(crate) activation_seal: Arc<crate::activation_seal::ActivationSeal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -600,10 +622,8 @@ fn publish_named_artifact(
     let snapshot_name = SnapshotName::parse(snapshot_name.to_string())
         .map_err(|error| format!("generated scheduled snapshot name is invalid: {error}"))?;
     let local_artifact_id = LocalArtifactId::new();
-    let local_path = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
-        sandbox_id,
-        snapshot_name.as_str(),
-    );
+    let local_path =
+        pplx_space_host_layout::paths::sandbox_snapshot_dir(sandbox_id, snapshot_name.as_str());
     crate::local_artifacts::LocalArtifacts::new(ctx.db.clone())
         .publish_named_snapshot(
             sandbox_id,
@@ -635,6 +655,7 @@ async fn do_scheduled_checkpoint(
         .auto_lifecycle
         .artifact_publication_locks(sandbox_id, ArtifactKind::Full)
         .await;
+    let _producer = admit_scheduled_producer(ctx, "scheduled checkpoint", sandbox_id)?;
     let completion = do_checkpoint(ctx, sandbox_id, snapshot_name).await?;
     // A skipped capture wrote nothing: publishing would create a Ready
     // artifact row (and event) pointing at files that do not exist.

@@ -329,7 +329,7 @@ export interface NetworkPolicyV1 {
 export type NodeRole = 'worker' | 'builder' | 'cluster';
 
 /// How aggressively the reconciler empties a draining node. Mirrors
-/// `NodeDrainMode` in `crates/libs/common/core/src/types/node.rs`.
+/// `NodeDrainMode` in `crates/l20_domain/node/model/src/node.rs`.
 export type DrainMode = 'gentle' | 'forced';
 
 export interface ServiceHealth {
@@ -434,6 +434,9 @@ export interface NodeView {
   drain_mode: DrainMode | null;
   drain_started_at: string | null;
   drain_last_error: string | null;
+  /** As `AdminNodeResponse` reports them. */
+  drain_engine?: string;
+  drain?: AdminNodeDrain;
   sandboxes_active: number | null;
   sandboxes_local_snapshots: number | null;
   last_heartbeat: string | null;
@@ -460,6 +463,57 @@ export interface NodeView {
 }
 
 /// Response shape for GET /admin/api/v1/nodes and action endpoints.
+/** A sandbox a v2 drain's node reports durable elsewhere. */
+export interface AdminNodeDrainEvacuated {
+  sandbox_id: string;
+  /** `full` for a suspended sandbox's snapshot, `disk` for a stopped one's. */
+  artifact_kind: string;
+  /** The drain saw the sandbox running. */
+  was_running: boolean;
+  /** The cluster controller has recorded the evacuation; until then it is
+   * recording it. */
+  recorded: boolean;
+}
+
+/** A sandbox a v2 drain's node reports as not able to move yet. */
+export interface AdminNodeDrainPending {
+  sandbox_id: string;
+  /** What it waits on: `hold` (kept running until the drain evacuates),
+   * `moving` (the drain is making it durable), `external` (work the drain
+   * doesn't drive) or `unspecified`. */
+  wait: string;
+  /** A started VM at the node's planning read. */
+  running: boolean;
+  /** A warm-pool member, not a user's sandbox. */
+  pool_member: boolean;
+  /** The node's reason, for display only. */
+  reason: string | null;
+  /** When the sandbox's row entered its current state, RFC 3339 by the
+   * node's clock. */
+  since: string | null;
+}
+
+/** A v2 drain, as the cluster controller stored it (`drain` on the admin
+ * node response, `AdminNodeDrain` in the admin protocol). `deadline` and the
+ * controller's stamps are by the database clock. */
+export interface AdminNodeDrain {
+  generation: number;
+  /** Until when the drain keeps running sandboxes running. */
+  deadline: string | null;
+  /** Undrained, until the controller has cancelled the drain on the node. */
+  cancelling: boolean;
+  /** The terminate fenced the node's instance for termination. */
+  fenced: boolean;
+  reported_at: string | null;
+  /** The last time the evacuated set grew, or the deadline once passed. */
+  evacuated_grew_at: string | null;
+  /** Every sandbox the controller recorded as evacuated in this drain. */
+  evacuated_total: string[];
+  evacuated: AdminNodeDrainEvacuated[];
+  pending: AdminNodeDrainPending[];
+  blocked: { reason: string }[];
+}
+
 export interface AdminNodeResponse {
   id: string;
   name: string | null;
@@ -478,6 +532,12 @@ export interface AdminNodeResponse {
   drain_mode: DrainMode | null;
   drain_started_at: string | null;
   drain_last_error: string | null;
+  /** `v2` for a drain the node runs itself, until it ends; absent for a v1
+   * drain or none. */
+  drain_engine?: string;
+  /** A v2 drain's state; absent for a v1 drain or none, and when the API
+   * can't read the stored state. */
+  drain?: AdminNodeDrain;
   k8s_node_name: string | null;
   metadata: Record<string, unknown>;
   last_heartbeat: string | null;

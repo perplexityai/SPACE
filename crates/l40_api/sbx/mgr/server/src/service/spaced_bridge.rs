@@ -24,7 +24,7 @@ pub(super) async fn launch_spaced_host_via_node(
         .launch(LaunchRequest {
             execution_fence: Some(execution_fence.into()),
             sandbox_id: sandbox_id.to_string(),
-            program: pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN.to_string(),
+            program: pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN.to_string(),
             args: vec![
                 "--socket".to_string(),
                 spaced_host_socket_path(sandbox_id),
@@ -40,6 +40,7 @@ pub(super) async fn launch_spaced_host_via_node(
             uid,
             gid: uid,
             env: crate::sidecar_env::telemetry_env_for_service("space-spaced-host"),
+            replace_gateway_pid: None,
         })
         .instrument(tracing::info_span!(
             "sbxmgr.start.node.launch_spaced_host",
@@ -58,7 +59,7 @@ pub(super) async fn launch_spaced_host_via_node(
                 SandboxEventDetails::default()
                     .boot_type(boot_type)
                     .pid(response.pid.to_string())
-                    .program(pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN),
+                    .program(pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN),
             );
             Ok(response)
         }
@@ -69,7 +70,7 @@ pub(super) async fn launch_spaced_host_via_node(
                 SandboxEventSource::SbxManager,
                 SandboxEventDetails::default()
                     .boot_type(boot_type)
-                    .program(pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN)
+                    .program(pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN)
                     .error(error.to_string()),
             );
             Err(Status::internal(format!(
@@ -239,7 +240,7 @@ pub(super) enum ActivationEndpointProofRequirement {
 }
 
 pub(super) fn activation_endpoint_proof_requirement(
-    route_identity: &pplx_space_common_core::types::SpaceApiRouteIdentity,
+    route_identity: &pplx_space_sandbox_model::SpaceApiRouteIdentity,
     pool_template: Option<&str>,
 ) -> ActivationEndpointProofRequirement {
     if pool_template.is_some() && route_identity.is_absent() {
@@ -276,14 +277,14 @@ fn spaced_endpoint_runtime_identity(
 
 pub(super) fn endpoint_runtime_identity_for_activation(
     sandbox_id: &str,
-    route_identity: &pplx_space_common_core::types::SpaceApiRouteIdentity,
+    route_identity: &pplx_space_sandbox_model::SpaceApiRouteIdentity,
     spaced_host_pid: u32,
     runtime_pid: u32,
     sandbox_uid: u32,
     guest_cid: u32,
     vsock_path: &str,
 ) -> Result<crate::endpoint_proof::SpacedEndpointRuntimeIdentity, Status> {
-    use pplx_space_common_core::types::{LinuxPid, LinuxUid, VsockCid};
+    use pplx_space_linux_ids::{LinuxPid, LinuxUid, VsockCid};
 
     Ok(crate::endpoint_proof::SpacedEndpointRuntimeIdentity {
         sandbox_id: sandbox_id.parse().map_err(|error| {
@@ -460,7 +461,7 @@ fn endpoint_proof_error_status(error: crate::endpoint_proof::SpacedEndpointProof
 }
 
 fn node_endpoint_proof_status(
-    sandbox_id: pplx_space_common_core::types::SandboxId,
+    sandbox_id: pplx_space_sandbox_model::SandboxId,
     command: &'static str,
     error: Status,
 ) -> Status {
@@ -594,7 +595,7 @@ async fn connect_spaced_host_live(
         .with_socket_path(socket_path);
     match pplx_space_spaced_host_client::SpacedHostClient::new_with_config_and_expected_peer(
         config,
-        pplx_space_spaced_common::ExpectedUdsPeer::new(
+        pplx_space_spaced_client::ExpectedUdsPeer::new(
             i32::try_from(spaced_host_pid)
                 .map_err(|_| Status::failed_precondition("spaced-host pid is invalid"))?,
             uid,
@@ -1353,9 +1354,9 @@ pub(super) fn endpoint_proof_after_readiness(
 
 pub(super) fn endpoint_proof_after_readiness_for(
     sandbox: &crate::db::SandboxRow,
-    route_identity: &pplx_space_common_core::types::SpaceApiRouteIdentity,
+    route_identity: &pplx_space_sandbox_model::SpaceApiRouteIdentity,
 ) -> Result<bool, Status> {
-    use pplx_space_common_core::types::{RuntimeKind, guest_image::QualifiedGuestAgent};
+    use pplx_space_execution_spec::{RuntimeKind, guest_image::QualifiedGuestAgent};
     Ok(sandbox
         .execution_metadata
         .as_ref()

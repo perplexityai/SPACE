@@ -1,8 +1,11 @@
 use crate::StoredSandboxLifecycle;
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{LocalArtifactId, OrgId, UserId};
-use pplx_space_common_core::types::{NodeId, SandboxId, SandboxLifecycle, SubstrateKind};
+use pplx_space_accounts::NodeId;
+use pplx_space_accounts::{OrgId, UserId};
 use pplx_space_db_test_fixtures::try_pg_test_db;
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+use pplx_space_snapshot_model::LocalArtifactId;
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -15,8 +18,14 @@ use super::{
 
 use super::sweeper::{EvacuationRestoreTarget, EvacuationRestoreTargetParseError};
 
+mod activity_tests;
 mod create_finish_tests;
+mod direct_tests;
 mod insert_unplaced_tests;
+mod read_modules_tests;
+mod row_locks_tests;
+mod sibling_tables_tests;
+mod uuid_codec_tests;
 
 /// The three desired-state columns, read back raw.
 async fn read_desired_state(
@@ -507,6 +516,42 @@ async fn update_desired_state_leaves_updated_at_to_the_trigger() -> TestResult {
     Ok(())
 }
 
+/// The idle deadline a node publishes moves whenever the sandbox is used, so
+/// like the activity clocks it is an observation, not a change: writing it
+/// leaves `updated_at` alone, while a real change still stamps it.
+#[tokio::test(flavor = "current_thread")]
+async fn writing_the_idle_deadline_leaves_updated_at_alone() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let id = insert_sandbox(&db.pool, Some("idle-deadline"), "started").await?;
+    let before = read_updated_at(&db.pool, id).await?;
+
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET next_auto_event_at = 1893456000 WHERE id = $1"
+    ))
+    .bind(id)
+    .execute(&db.pool)
+    .await?;
+    assert_eq!(
+        read_updated_at(&db.pool, id).await?,
+        before,
+        "a published idle deadline must not bump updated_at"
+    );
+
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET name = 'idle-deadline-renamed' WHERE id = $1"
+    ))
+    .bind(id)
+    .execute(&db.pool)
+    .await?;
+    assert!(
+        read_updated_at(&db.pool, id).await? > before,
+        "a real change must bump updated_at"
+    );
+    Ok(())
+}
+
 /// The write must compose into a caller's open transaction — the controller
 /// paths that will adopt it write and enqueue their reconcile in one tx.
 #[tokio::test(flavor = "current_thread")]
@@ -899,7 +944,7 @@ async fn an_active_fork_source_is_found_by_either_target_id_form() -> TestResult
         };
         let mut tx = db.pool.begin().await?;
         assert!(
-            !crate::fork_source_lifecycle::active_fork_source_operation_exists(&mut tx, source)
+            !crate::fork_source_lifecycle::active_fork_source_operation_exists(&mut *tx, source)
                 .await?
         );
         sqlx::query(sql!(
@@ -913,7 +958,7 @@ async fn an_active_fork_source_is_found_by_either_target_id_form() -> TestResult
         .execute(&mut *tx)
         .await?;
         assert!(
-            crate::fork_source_lifecycle::active_fork_source_operation_exists(&mut tx, source)
+            crate::fork_source_lifecycle::active_fork_source_operation_exists(&mut *tx, source)
                 .await?,
             "{target_id}"
         );

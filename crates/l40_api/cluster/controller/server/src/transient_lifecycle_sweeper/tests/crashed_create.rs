@@ -313,9 +313,10 @@ fn the_creating_age_knob_overrides_the_default_age() {
 }
 
 mod postgres_backed {
-    use pplx_space_common_core::sql;
-    use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
     use pplx_space_db_test_fixtures::{pg_test_db, pg_test_db_with_max_connections};
+    use pplx_space_node_model::SubstrateKind;
+    use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+    use pplx_space_sql_locator::sql;
     use pplx_space_test_env::TestResult;
     use sqlx::PgPool;
 
@@ -323,14 +324,13 @@ mod postgres_backed {
     // Kubernetes API for these statements. The owner check reads the
     // execution row directly, so it decides the same way for either label.
     use super::super::super::lifecycle_writer_tests::{age, direct_sink};
-    use super::super::super::store::LIST_FAILED_ACTIVE_EXECUTIONS_SQL;
     use super::super::super::{FailGuard, FirstActivation, SubstrateSweepSink, SweepSink};
     use crate::lifecycle_writer_test_support::{
         ExecutionSeed, SandboxSeed, bounded, insert_execution, insert_node, insert_sandbox,
         kubernetes_substrate, single_backend_pool, wait_until_blocked,
     };
     use pplx_space_api::controllers::substrate::Substrate;
-    use pplx_space_sandbox_store::sweeper::REPAIR_FAILED_ACTIVE_EXECUTION_SQL;
+    use pplx_space_sandbox_store::test_support::sweeper::REPAIR_FAILED_ACTIVE_EXECUTION_SQL;
     use std::sync::Arc;
 
     /// The activation-attempt columns of the active execution.
@@ -724,14 +724,6 @@ mod postgres_backed {
         Ok(())
     }
 
-    /// The failed-cleanup listing columns this file reads.
-    #[derive(sqlx::FromRow)]
-    struct Listed {
-        id: SandboxId,
-        first_activation_unfinished: bool,
-        first_activation_abandoned: bool,
-    }
-
     /// A `failed` Kubernetes row whose execution never reached `running` (still
     /// `creating`, or `created` once the pod UID was written) and still holds
     /// an activation attempt, the route's or a later one, is a create that
@@ -837,11 +829,12 @@ mod postgres_backed {
                 .await?;
             }
 
-            let listed: Vec<Listed> = sqlx::query_as(LIST_FAILED_ACTIVE_EXECUTIONS_SQL)
-                .bind("k8s")
-                .bind(10_000_i64)
-                .fetch_all(pool)
-                .await?;
+            let listed = pplx_space_sandbox_store::k8s_executions::list_failed_active_executions(
+                pool,
+                SubstrateKind::Kubernetes,
+                10_000,
+            )
+            .await?;
             let reported = listed.iter().find(|row| row.id == id).map(|row| {
                 (
                     row.first_activation_unfinished,

@@ -1,7 +1,7 @@
 //! Standalone VMM process admission. The runtime's control protocol and guest
 //! boot configuration remain owned by the node-manager adapter.
 use super::*;
-use pplx_space_common_core::types::{EnvironmentReference, RuntimeKind};
+use pplx_space_execution_spec::{EnvironmentReference, RuntimeKind};
 use pplx_space_node_runtime_core::{
     artifact_store::release_directory_names,
     authenticated_source::SourcePins,
@@ -189,7 +189,7 @@ fn standalone_config_for_environment(
         .and_then(Path::parent)
         .ok_or_else(|| Status::invalid_argument("runtime source has no release directory"))?;
     let directories = release_directory_names(&release.release, release.digest());
-    if pplx_space_common_core::types::NodeSpacePath::parse(root).is_err()
+    if pplx_space_artifact_model::NodeSpacePath::parse(root).is_err()
         || !directories
             .iter()
             .any(|directory| root.file_name() == Some(std::ffi::OsStr::new(directory)))
@@ -209,11 +209,10 @@ fn standalone_config_for_environment(
         .ok_or_else(|| Status::failed_precondition("runtime executable has no verity pin"))?;
     // The generic wire carries a path, but containment only accepts a validated
     // namespace locator, just like the Firecracker adapter.
-    let network_namespace =
-        pplx_space_common_core::types::NodeSpacePath::parse(&req.network_namespace)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let network_namespace = pplx_space_artifact_model::NodeSpacePath::parse(&req.network_namespace)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let workspace = Path::new(&req.workspace_root);
-    if pplx_space_common_core::types::NodeSpacePath::parse(workspace).is_err() {
+    if pplx_space_artifact_model::NodeSpacePath::parse(workspace).is_err() {
         return Err(Status::invalid_argument(
             "workspace must be an absolute canonical path",
         ));
@@ -231,7 +230,7 @@ fn standalone_config_for_environment(
     }
     Ok(crate::contained_launcher::Config {
         root,
-        registration_directory: pplx_space_common_core::host::linux::paths::sandbox_run_dir(
+        registration_directory: pplx_space_host_layout::paths::sandbox_run_dir(
             &sandbox.to_string(),
         )
         .into(),

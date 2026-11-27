@@ -1,16 +1,16 @@
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use sqlx::{PgPool, Postgres};
 
 use super::{FederatedOwner, FederatedServiceGrant};
 
-pub use pplx_space_federated_grant_store::FederatedGrantStoreError;
+pub(crate) use pplx_space_federated_grant_store::FederatedGrantStoreError;
 use pplx_space_federated_grant_store::{FederatedGrantOwnerRef, FederatedServiceGrantRef};
 pub use pplx_space_federated_identity::{
     DEFAULT_FEDERATED_GRANT_AUDIENCE, FEDERATED_OWNER_GRANT_PURPOSE,
 };
 
-pub async fn upsert_sandbox_federated_service_grant(
+pub(crate) async fn upsert_sandbox_federated_service_grant(
     pool: &PgPool,
     sandbox_id: SandboxId,
     owner: &FederatedOwner,
@@ -19,7 +19,7 @@ pub async fn upsert_sandbox_federated_service_grant(
     grant_purpose: &str,
 ) -> Result<(), FederatedGrantStoreError> {
     pplx_space_federated_grant_store::upsert_sandbox_federated_service_grant(
-        pool,
+        &pplx_space_postgres_pool::Db::from(pool.clone()),
         sandbox_id,
         owner_ref(owner),
         grant_ref(grant),
@@ -29,7 +29,7 @@ pub async fn upsert_sandbox_federated_service_grant(
     .await
 }
 
-pub async fn upsert_sandbox_federated_service_grant_tx(
+pub(crate) async fn upsert_sandbox_federated_service_grant_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     sandbox_id: SandboxId,
     owner: &FederatedOwner,
@@ -38,7 +38,7 @@ pub async fn upsert_sandbox_federated_service_grant_tx(
     grant_purpose: &str,
 ) -> Result<(), FederatedGrantStoreError> {
     pplx_space_federated_grant_store::upsert_sandbox_federated_service_grant_tx(
-        tx,
+        &mut **tx,
         sandbox_id,
         owner_ref(owner),
         grant_ref(grant),
