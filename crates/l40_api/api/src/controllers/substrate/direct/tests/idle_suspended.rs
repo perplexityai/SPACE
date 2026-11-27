@@ -7,7 +7,7 @@ use super::*;
 /// a row whose only placement is `target_node_id = node_id`, and the route
 /// identity of the execution the node suspended, which its publication
 /// leaves in place (so `Sandbox::active_node_id` still reads `node_id`).
-async fn seed_idle_suspended(
+pub(super) async fn seed_idle_suspended(
     pool: &PgPool,
     state: &SimState,
     sandbox_id: SandboxId,

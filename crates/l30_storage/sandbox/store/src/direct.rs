@@ -1,6 +1,7 @@
 //! The Direct substrate's statements on `sandboxes`. This module holds its
-//! guarded writes: the restore lease's claim, renewal, release and
-//! completion, the placement an owned restore receipt records, and the
+//! guarded writes: the restore lease's claim, renewal, release (after a
+//! dispatch, or before any) and completion, the placement an owned restore
+//! receipt records, and the
 //! adoption of a live node record by a row with no active node. Beside them
 //! are the lease owner's row lock ([`lock_restore_lease_owner`]) and the two
 //! unlocked reads of the lease's remaining time by the database clock that a
@@ -34,13 +35,19 @@
 //! and an insert that sets a token starts the row in `restoring`, as
 //! `insert_unplaced` does.
 
+use std::sync::LazyLock;
+
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+use pplx_space_sandbox_portability::restore_revert_forfeits_source_window;
 
 use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
+use sqlx::{Acquire, Postgres};
 use uuid::Uuid;
+
+use crate::restore_lease::RestoreClaimError;
 
 pub mod adoption;
 pub mod node_endpoints;
@@ -66,13 +73,18 @@ pub struct ClaimedRestoreLease {
 /// Guarded in the statement: the row must be `suspended` or `restoring`
 /// (compared case- and whitespace-insensitively) and hold no unexpired lease.
 /// The candidate row is locked by the statement's own `FOR UPDATE`, so the
-/// guard and the write see the same row version.
-pub async fn claim_restore_lease(
-    executor: impl Executor<'_>,
+/// guard and the write see the same row version; on a fresh `suspended ->
+/// restoring` claim, [`crate::restore_lease::commit_fresh_restore_claim`]
+/// advances `lifecycle_changed_at` past any lock wait before committing, or
+/// rolls the claim back and returns
+/// [`RestoreClaimError::CaptureAheadOfClock`], which is retryable.
+pub async fn claim_restore_lease<'e>(
+    executor: impl Acquire<'e, Database = Postgres>,
     sandbox_id: SandboxId,
     lease_seconds: i64,
     token: Uuid,
-) -> Result<Option<ClaimedRestoreLease>, DbError> {
+) -> Result<Option<ClaimedRestoreLease>, RestoreClaimError> {
+    let mut tx = executor.begin().await.map_err(DbError::from)?;
     let claimed = sqlx::query_as::<_, (Uuid, bool)>(sql!(
         "WITH candidate AS (
                  SELECT id,
@@ -94,8 +106,14 @@ pub async fn claim_restore_lease(
     .bind(sandbox_id)
     .bind(lease_seconds)
     .bind(token)
-    .fetch_optional(executor.into_sqlx())
-    .await?;
+    .fetch_optional((&mut *tx).into_sqlx())
+    .await
+    .map_err(DbError::from)?;
+    if let Some((_, false)) = claimed {
+        crate::restore_lease::commit_fresh_restore_claim(tx, sandbox_id).await?;
+    } else {
+        tx.commit().await.map_err(DbError::from)?;
+    }
     Ok(claimed.map(|(token, restore_retry)| ClaimedRestoreLease {
         token,
         restore_retry,
@@ -107,36 +125,81 @@ pub async fn claim_restore_lease(
 ///
 /// Guarded by `token` and `lifecycle = 'restoring'`. A first attempt
 /// (`restore_retry` false) returns the row to `suspended`, which clears the
-/// lease. A retry leaves the row, its lease and its expiry as they were: the
-/// row was already `restoring` when the lease was claimed, and the lease
-/// expires on its own; the write still matches and still fires the row's
-/// update triggers.
+/// lease, unless reverting would forfeit the pre-claim restore source window
+/// ([`restore_revert_forfeits_source_window`]), in which case it clears the
+/// lease pair while keeping `lifecycle = 'restoring'` so `lifecycle_changed_at`
+/// continues to bound the retry source window. A retry leaves the row, its
+/// lease and its expiry as they were: the row was already `restoring` when the
+/// lease was claimed, and the lease expires on its own; the write still matches
+/// and still fires the row's update triggers.
 pub async fn release_restore_lease(
     executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     token: Uuid,
     restore_retry: bool,
 ) -> Result<bool, DbError> {
-    let released = sqlx::query(sql!(
-        "UPDATE sandboxes
-                SET lifecycle = CASE WHEN $3 THEN lifecycle ELSE 'suspended' END,
-                    restore_lease_expires_at = CASE
-                        WHEN $3 THEN restore_lease_expires_at
-                        ELSE NULL
-                    END,
-                    restore_lease_token = CASE
-                        WHEN $3 THEN restore_lease_token
-                        ELSE NULL
-                    END
-              WHERE id = $1
-                AND restore_lease_token = $2
-                AND lifecycle = 'restoring'"
-    ))
-    .bind(sandbox_id)
-    .bind(token)
-    .bind(restore_retry)
-    .execute(executor.into_sqlx())
-    .await?;
+    end_restore_lease(executor, sandbox_id, token, restore_retry, false).await
+}
+
+/// Operation step: ends a Direct restore lease whose owner asked no worker to
+/// start the sandbox. Returns whether the row still held the lease.
+///
+/// As [`release_restore_lease`], except that a retry's lease expires now
+/// rather than on its own: nothing this owner started can still be running,
+/// so the next restore may take the row over at once. The row keeps the
+/// token, as it does under any expired lease, and stays `restoring`, so
+/// `lifecycle_changed_at` doesn't move.
+pub async fn release_undispatched_restore_lease(
+    executor: impl Executor<'_>,
+    sandbox_id: SandboxId,
+    token: Uuid,
+    restore_retry: bool,
+) -> Result<bool, DbError> {
+    end_restore_lease(executor, sandbox_id, token, restore_retry, true).await
+}
+
+/// The write behind [`release_restore_lease`] and
+/// [`release_undispatched_restore_lease`]: `expire_retry` ends a retry's
+/// lease now.
+async fn end_restore_lease<'e>(
+    executor: impl Executor<'_>,
+    sandbox_id: SandboxId,
+    token: Uuid,
+    restore_retry: bool,
+    expire_retry: bool,
+) -> Result<bool, DbError> {
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        let forfeits_window = restore_revert_forfeits_source_window("sandboxes");
+        sql!(
+            format!(
+                "UPDATE sandboxes
+                    SET lifecycle = CASE
+                            WHEN $3 OR {forfeits_window} THEN lifecycle
+                            ELSE 'suspended'
+                        END,
+                        restore_lease_expires_at = CASE
+                            WHEN $3 AND $4 THEN NOW()
+                            WHEN $3 THEN restore_lease_expires_at
+                            ELSE NULL
+                        END,
+                        restore_lease_token = CASE
+                            WHEN $3 THEN restore_lease_token
+                            ELSE NULL
+                        END
+                  WHERE id = $1
+                    AND restore_lease_token = $2
+                    AND lifecycle = 'restoring'"
+            )
+            .as_str()
+        )
+    });
+    let released = sqlx::query(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .bind(sandbox_id)
+        .bind(token)
+        .bind(restore_retry)
+        .bind(expire_retry)
+        .execute(executor.into_sqlx())
+        .await?;
     Ok(released.rows_affected() == 1)
 }
 
@@ -198,7 +261,7 @@ pub async fn complete_restore_lease(
 ///
 /// The lease owner takes it before persisting a restore receipt's route
 /// identity and placement ([`place_owned_restore_receipt`]) in the same
-/// transaction. The caller must pass its open transaction.
+/// transaction.
 pub async fn lock_restore_lease_owner<C>(
     connection: &mut C,
     sandbox_id: SandboxId,
@@ -216,7 +279,7 @@ where
     ))
     .bind(sandbox_id.as_uuid())
     .bind(token)
-    .fetch_optional(connection.into_sqlx())
+    .fetch_optional((&mut *connection).into_sqlx())
     .await?;
     Ok(owns_restore.is_some())
 }

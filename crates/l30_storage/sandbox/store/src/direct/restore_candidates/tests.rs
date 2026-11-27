@@ -4,7 +4,8 @@
 //! The sandbox entered `restoring` between two full snapshots: a ready one
 //! its nodes can load, from before the claim, and a newer failed one they
 //! can't, from after it. A fresh restore reads the newest; a retry reads the
-//! pre-claim source.
+//! pre-claim source. The remote leg restores the capture the shared rule
+//! selects for the mode.
 
 use pplx_space_accounts::{NodeId, OrgId, UserId};
 use pplx_space_db_test_fixtures::{
@@ -15,7 +16,10 @@ use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::{RestoreCandidateRow, remote_candidates, source_candidates};
+use super::{RestoreCandidateRow, source_candidates};
+use crate::restore_source::{
+    RestoreSourceMode, RestoreSourcePlacement, RestoreSourceSelection, select_restore_source,
+};
 
 const STORAGE_URI: &str = "s3://bucket/snapshots/sandbox/source";
 
@@ -169,6 +173,24 @@ async fn seed(pool: &PgPool) -> TestDbResult<Seeded> {
         alternate,
         after_claim,
     })
+}
+
+/// The remote candidates for the capture the shared rule selects, as the
+/// Direct restore asks for them; none when it selects nothing.
+async fn remote_candidates(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    restore_retry: bool,
+    limit: i64,
+    environment_refuses: bool,
+) -> TestDbResult<Vec<RestoreCandidateRow>> {
+    let mode = RestoreSourceMode::or_retry(RestoreSourceMode::NewestFull, restore_retry);
+    let selection =
+        select_restore_source(pool, sandbox_id, mode, RestoreSourcePlacement::Any).await?;
+    let RestoreSourceSelection::Selected(selected) = selection else {
+        return Ok(vec![]);
+    };
+    Ok(super::remote_candidates(pool, sandbox_id, &selected, limit, environment_refuses).await?)
 }
 
 #[tokio::test(flavor = "current_thread")]

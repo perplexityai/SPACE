@@ -54,7 +54,7 @@ pub struct NodeApiTargetRow {
 }
 
 /// The node-api target columns of `node_id`; `None` when the `nodes` row is
-/// gone.
+/// gone or soft-deleted.
 pub async fn node_api_target(
     executor: impl Executor<'_>,
     node_id: NodeId,
@@ -65,7 +65,8 @@ pub async fn node_api_target(
                 nk.k8s_node_name AS substrate_node_id
            FROM nodes n
            LEFT JOIN node_k8s nk ON nk.node_id = n.id
-          WHERE n.id = $1"
+          WHERE n.id = $1
+            AND COALESCE(n.state, 'registered') != 'deleted'"
     ))
     .bind(node_id)
     .fetch_optional(executor.into_sqlx())
@@ -107,6 +108,30 @@ pub async fn worker_for_k8s_node_name(
            AND n.role = 'worker'"
     ))
     .bind(node_name)
+    .fetch_optional(executor.into_sqlx())
+    .await?)
+}
+
+/// Whether a live Kubernetes worker registered under `node_name` is ready;
+/// `None` when no live Kubernetes worker has that name.
+pub async fn k8s_worker_ready(
+    executor: impl Executor<'_>,
+    node_name: &str,
+) -> Result<Option<bool>, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
+        "SELECT COALESCE(n.state, 'registered') = 'ready'
+           FROM node_k8s nk
+           JOIN nodes n ON n.id = nk.node_id
+          WHERE nk.k8s_node_name = $1
+            AND n.managed_by = $2
+            AND n.role = $3
+            AND COALESCE(n.state, 'registered') != 'deleted'
+          ORDER BY COALESCE(n.state, 'registered') = 'ready' DESC, nk.updated_at DESC, n.created_at DESC
+          LIMIT 1"
+    ))
+    .bind(node_name)
+    .bind(SubstrateKind::Kubernetes)
+    .bind(NodeRole::Worker.as_str())
     .fetch_optional(executor.into_sqlx())
     .await?)
 }

@@ -1977,6 +1977,7 @@ async fn project_node_published_suspended_sandboxes(
             clear_marker: candidate.clear_marker,
             published_artifact: candidate.published_artifact.clone(),
             published_execution_identity: candidate.published_execution_identity.clone(),
+            captured_artifact: candidate.captured_artifact,
         })
         .collect::<Vec<_>>();
     let rows = apply_suspended_k8s_finalization(conn, &finalization_candidates).await?;
@@ -2023,6 +2024,7 @@ pub(crate) async fn project_ready_suspend_snapshot(
     let clear_marker = candidate.clear_marker;
     let source_node_id = candidate.source_node_id;
     let from_lifecycle = candidate.lifecycle;
+    let captured_artifact = candidate.captured_artifact;
 
     let projected = apply_suspended_k8s_finalization(
         conn,
@@ -2031,6 +2033,7 @@ pub(crate) async fn project_ready_suspend_snapshot(
             clear_marker,
             published_artifact: None,
             published_execution_identity: None,
+            captured_artifact,
         }],
     )
     .await?;

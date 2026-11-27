@@ -577,26 +577,53 @@ async fn started_pooled_adoption_refuses_a_worker_without_split_receipts() -> Te
 /// not ready; one whose Wake failed after being sent keeps it, because the
 /// node may still be acting on that Wake. A Wake refused for the adopter's
 /// own credential, as once the adopting API's Pod is deleted, says nothing
-/// about the sandbox and is answered retryably. Setup always precedes the
-/// Wake.
+/// about the sandbox and is answered retryably. A Wake refused for an
+/// unordered restore source did no node-side work, so it releases the attempt
+/// unless an earlier send of the same adoption may still be landing: one the
+/// adoption polled through, or one the node-api client replayed in place
+/// after an `UNAVAILABLE` answer. Setup always precedes the Wake.
 #[rstest::rstest]
-#[case::ready_releases_the_attempt(1, None, Ok(()))]
-#[case::not_ready_wake_is_polled_until_ready(2, None, Ok(()))]
+#[case::ready_releases_the_attempt(1, vec![], Ok(()), true)]
+#[case::not_ready_wake_is_polled_until_ready(2, vec![], Ok(()), true)]
 #[case::sent_wake_failure_keeps_the_attempt(
     1,
-    Some(tonic::Status::invalid_argument("wake request rejected")),
-    Err(StatusCode::CONFLICT)
+    vec![tonic::Status::invalid_argument("wake request rejected")],
+    Err(StatusCode::CONFLICT),
+    false
 )]
 #[case::refused_credential_is_retryable(
     1,
-    Some(tonic::Status::unauthenticated("token validation failed")),
-    Err(StatusCode::SERVICE_UNAVAILABLE)
+    vec![tonic::Status::unauthenticated("token validation failed")],
+    Err(StatusCode::SERVICE_UNAVAILABLE),
+    false
+)]
+#[case::unordered_source_on_the_first_send_releases_the_attempt(
+    1,
+    vec![unordered_restore_source()],
+    Err(StatusCode::PRECONDITION_FAILED),
+    true
+)]
+#[case::unordered_source_after_an_earlier_send_keeps_the_attempt(
+    1,
+    vec![runtime_not_ready(), unordered_restore_source()],
+    Err(StatusCode::PRECONDITION_FAILED),
+    false
+)]
+#[case::unordered_source_after_a_send_the_client_replayed_keeps_the_attempt(
+    1,
+    vec![
+        tonic::Status::unavailable("connection closed before the answer"),
+        unordered_restore_source()
+    ],
+    Err(StatusCode::PRECONDITION_FAILED),
+    false
 )]
 #[tokio::test(flavor = "current_thread")]
 async fn started_pooled_adoption_releases_its_attempt_only_when_no_wake_may_be_pending(
     #[case] wake_succeeds_from_attempt: usize,
-    #[case] wake_failure: Option<tonic::Status>,
+    #[case] wake_failures: Vec<tonic::Status>,
     #[case] expected: Result<(), StatusCode>,
+    #[case] attempt_released: bool,
 ) -> TestResult {
     if !crate::test_support::enter_sim_worker_process() {
         return Ok(());
@@ -605,9 +632,17 @@ async fn started_pooled_adoption_releases_its_attempt_only_when_no_wake_may_be_p
     let inputs = PooledInputs::new();
     insert_claimed_pool_execution(&db.pool, &inputs.claim, inputs.claim.pool_slot_id).await?;
     let mut replies = started_setup(&inputs);
-    if let Some(status) = wake_failure {
-        replies.push((WAKE, ScriptedReply::Status(status)));
-    }
+    // The n-th Wake is answered with the n-th failure; with none scripted
+    // the worker answers every Wake itself.
+    replies.push((
+        WAKE,
+        ScriptedReply::Sequence(
+            wake_failures
+                .into_iter()
+                .map(ScriptedReply::Status)
+                .collect(),
+        ),
+    ));
     let worker = start_scripted_worker(ScriptedWorkerConfig {
         wake_succeeds_from_attempt,
         ..ScriptedWorkerConfig::new(replies)
@@ -630,7 +665,7 @@ async fn started_pooled_adoption_releases_its_attempt_only_when_no_wake_may_be_p
     let (attempt, route) = activation_ids(&db.pool, inputs.claim.sandbox_id).await?;
     assert_eq!(
         attempt.is_none(),
-        expected.is_ok(),
+        attempt_released,
         "attempt after {expected:?}: {attempt:?}"
     );
     assert_eq!(
@@ -638,6 +673,20 @@ async fn started_pooled_adoption_releases_its_attempt_only_when_no_wake_may_be_p
         "the pool slot keeps routing the execution"
     );
     Ok(())
+}
+
+/// sandbox-manager's refusal to stage a suspend snapshot whose captures it
+/// can't order.
+fn unordered_restore_source() -> tonic::Status {
+    pplx_space_sbx_mgr_client::restore_source_unordered_status("sandbox captures can't be ordered")
+}
+
+/// The runtime's answer to a Wake it isn't ready for, which the adoption
+/// polls through.
+fn runtime_not_ready() -> tonic::Status {
+    tonic::Status::failed_precondition(
+        pplx_space_rpc_contracts::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER,
+    )
 }
 
 /// A claimed execution bound before route ids were recorded gets the

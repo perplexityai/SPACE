@@ -36,6 +36,7 @@ use crate::{controllers::sandbox::fetch_sandbox as fetch_api_sandbox, models::Sa
 
 use crate::controllers::substrate::{
     DbContext, PublishedLocalArtifact, SubstrateError, reject_deleting_current_local_artifact,
+    restore_claim_error,
 };
 
 mod activation_fence;

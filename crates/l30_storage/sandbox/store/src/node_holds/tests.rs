@@ -53,7 +53,8 @@ struct Seed {
     marker: Option<&'static str>,
     /// A `creating` full snapshot uploading from the node.
     uploading: bool,
-    /// A `ready` full snapshot with a live storage location.
+    /// A `ready` full snapshot with a live storage location, registered after
+    /// the `uploading` one, so that upload doesn't outrank it.
     durable: bool,
 }
 
@@ -136,7 +137,7 @@ async fn insert(pool: &PgPool, node: NodeId, seed: Seed) -> TestResult<SandboxId
         sqlx::query(sql!(
             "WITH ready AS (
                  INSERT INTO snapshots (sandbox_id, type, state, timestamp, source_node_id)
-                 VALUES ($1, 'full', 'ready', NOW() - INTERVAL '30 minutes', $2)
+                 VALUES ($1, 'full', 'ready', NOW() - INTERVAL '30 seconds', $2)
                  RETURNING id
              )
              INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string)

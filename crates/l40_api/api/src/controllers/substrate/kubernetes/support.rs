@@ -877,12 +877,18 @@ pub(super) enum WakeRpcErrorDisposition {
     /// has made the sandbox durable, or goes through once the node is
     /// undrained.
     NodeSealed,
+    /// sandbox-manager refused to stage a remote suspend snapshot because the
+    /// sandbox's captures cannot be ordered without an explicit pin.
+    RestoreSourceUnordered,
     Fail,
 }
 
 pub(super) fn classify_wake_rpc_error(error: &tonic::Status) -> WakeRpcErrorDisposition {
     if error.code() == Code::Unauthenticated {
         return WakeRpcErrorDisposition::CallerUnauthenticated;
+    }
+    if pplx_space_sbx_mgr_client::status_is_restore_source_unordered(error) {
+        return WakeRpcErrorDisposition::RestoreSourceUnordered;
     }
     if error.code() == Code::FailedPrecondition
         && error

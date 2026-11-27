@@ -59,9 +59,14 @@
 //!
 //! The newest `ready` full snapshot can never have `keep_n` newer
 //! siblings, so it is never a candidate while `keep_n >= 1`. That protects
-//! the *markerless* restore path, which selects by recency. It does not
-//! protect either of the two other shapes restore selection can take:
+//! the *markerless* restore path only while it selects by recency, which it
+//! does for snapshots that record no capture generation. It does not protect
+//! the other shapes restore selection can take:
 //!
+//! - A markerless sandbox restores its latest capture by **generation**
+//!   first, and a re-upload of an older capture registers later than it. So
+//!   `keep_n` such re-uploads would push the restore's pick out of the
+//!   keep-set.
 //! - A sandbox carrying `current_local_artifact_id` restores by **exact
 //!   artifact identity**, and once the row is `suspended` that selection has
 //!   no newest-snapshot fallback. A sandbox pinned to an older artifact has
@@ -76,7 +81,7 @@
 //! Both the candidate scan and the pre-reap authorization therefore exclude
 //! any snapshot matching the shared
 //! `sandbox_portability::snapshot_is_live_restore_source` fragment, which
-//! composes both shapes. It is built from the same pieces the restore
+//! composes every shape. It is built from the same pieces the restore
 //! selector itself is built from, so the "never delete this" and "this is
 //! the one to load" answers cannot drift. The exclusion filters the
 //! candidate row itself and never the newer-sibling probe, so a shielded

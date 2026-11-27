@@ -205,14 +205,47 @@ service ClusterApi {
   // (e.g. an env-derived bucket). The URI is returned unparsed.
   rpc GetSandboxSnapshotStorageUri(GetSandboxSnapshotStorageUriRequest) returns (GetSandboxSnapshotStorageUriResponse);
 
-  // Look up the most recent ready suspend-snapshot storage location for a
-  // sandbox. Returns the `s3://…` connection string of the latest row with
-  // `state='ready'` (selected via
-  // `ORDER BY timestamp DESC LIMIT 1`), so partial uploads and failed
-  // attempts are invisible. Used by on-node sbx-mgr to restore a sandbox
-  // whose local snapshot files are absent (e.g. cross-node restore or
-  // restore after a node-local cache wipe). Returns `NOT_FOUND` if no
-  // ready suspend snapshot exists for the sandbox.
+  // Look up the storage location of the ready snapshot a sandbox restores
+  // from: the capture the control plane's own restores select. For a
+  // `restoring` sandbox pinned to an artifact with a backup registered
+  // before the restore claimed it, that's only that artifact, from any of
+  // its ready backups. For any other `restoring` sandbox, it's the latest
+  // suspend capture among the backups registered before the claim; while the
+  // sandbox carries a pin, even one published after the claim, a backup with
+  // no artifact identity doesn't count. If the sandbox's placement last
+  // changed before the claim, only backups registered at or after that
+  // change count. When no ready backup qualifies, that is, when the retry
+  // would select nothing, the lookup returns any ready backup of the
+  // artifact of a capture that qualifies (one that never uploaded, say),
+  // whenever that backup registered, before the placement or after the
+  // claim: it holds the same bytes. While one does qualify, the lookup
+  // returns the retry's pick, even if a capture tied with it has only a
+  // post-claim backup.
+  // Otherwise it's the pinned artifact of a pinned sandbox, or the latest
+  // capture by capture rank, then by the capture's first registration, of an
+  // unpinned one. An unpinned sandbox restores only from suspend captures: a
+  // named snapshot's or a stop's backup is never returned for it.
+  // Partial uploads and failed attempts are never returned. Used by on-node
+  // sbx-mgr to restore a sandbox whose local snapshot files are absent (e.g.
+  // cross-node restore or restore after a node-local cache wipe). Returns
+  // `NOT_FOUND` if no such snapshot exists, or the sandbox isn't placed on
+  // the caller's node. For an unpinned sandbox that includes while, or
+  // after, a later execution's capture is uploading or has failed to, and
+  // for a `restoring` one, while an upload registered before the claim isn't
+  // ready. Returns `FAILED_PRECONDITION`, which the caller must not retry,
+  // when an unpinned sandbox's captures can't be ordered: a suspend capture
+  // without a generation that nothing ranks, in a history where some capture
+  // has a generation. A capture with a generation ranks it when the
+  // execution that took that capture started after it registered or, where
+  // the control plane has no record of that execution (always so on Direct),
+  // when that capture first registered after it and records a higher
+  // generation than every capture with a generation registered up to it.
+  // Sandbox-manager passes the refusal on as `FAILED_PRECONDITION` with
+  // metadata `x-space-restore-refusal: source-unordered`, which its callers
+  // treat as terminal for that restore attempt. A later attempt can succeed
+  // once the sandbox is pinned or a later capture with a generation ranks
+  // the unranked one, as above. A capture registered after a restore's
+  // claim doesn't lift the refusal for that restore.
   // TODO: [legacy] Remove once all restore callers look up exact artifact
   // backups with `GetArtifactBackupLocation`.
   rpc GetSuspendSnapshotLocation(GetSuspendSnapshotLocationRequest) returns (GetSuspendSnapshotLocationResponse);
@@ -1461,7 +1494,7 @@ message GetExecutionCurrencyResponse {
 }
 
 message GetSuspendSnapshotLocationRequest {
-  // Sandbox whose latest suspend snapshot location should be returned.
+  // Sandbox whose restore source location should be returned.
   string sandbox_id = 1;
 }
 

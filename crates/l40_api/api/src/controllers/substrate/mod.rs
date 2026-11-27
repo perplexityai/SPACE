@@ -853,6 +853,28 @@ pub(crate) fn substrate_store_db_error(
     SubstrateError::Failed { message }
 }
 
+/// Classify a restore claim that returned no outcome.
+///
+/// A claim refused because a registered capture is stamped ahead of the
+/// database clock wrote nothing and lands once the clock has passed that
+/// capture, so it's [`SubstrateError::Unavailable`] (503, retryable) rather
+/// than the 500 a database failure is.
+pub(crate) fn restore_claim_error(
+    what: &str,
+    error: pplx_space_sandbox_store::restore_lease::RestoreClaimError,
+) -> SubstrateError {
+    use pplx_space_sandbox_store::restore_lease::RestoreClaimError;
+    match error {
+        RestoreClaimError::CaptureAheadOfClock { .. } => {
+            tracing::warn!(%error, "restore claim refused; retryable");
+            SubstrateError::Unavailable {
+                message: error.to_string(),
+            }
+        }
+        RestoreClaimError::Database(error) => substrate_db_error(what, &sqlx::Error::from(error)),
+    }
+}
+
 /// Postfix [`substrate_db_error`], so classifying a call site is a one-line
 /// change rather than a closure rewrite.
 ///

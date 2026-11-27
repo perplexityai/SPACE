@@ -4502,20 +4502,27 @@ async fn connect_route_recovers_missing_pod_despite_newer_failed_snapshot_attemp
 
     // Arrange.
     let fixture = missing_pod_suspend_fixture.await?;
-    sqlx::query(
+    // A later upload of the suspend's own capture that failed, registered
+    // before the restore claims. It's stamped at the database clock: a
+    // capture stamped ahead of it would refuse the claim.
+    let failed_retry = sqlx::query(
         "INSERT INTO snapshots
              (id, sandbox_id, type, state, timestamp, org_id, source_node_id,
               local_artifact_id, artifact_kind, artifact_origin)
-         VALUES
-             ($1, $2, 'full', 'failed', NOW() + INTERVAL '1 second',
-              '00000000-0000-0000-0000-000000000001', $3, $4, 'full', 'suspend')",
+         SELECT $1, sn.sandbox_id, 'full', 'failed', clock_timestamp(),
+                sn.org_id, $3, sn.local_artifact_id, 'full', 'suspend'
+           FROM snapshots sn
+           JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
+          WHERE sn.sandbox_id = $2
+            AND ssl.storage_connection_string = $4",
     )
     .bind(Uuid::now_v7())
     .bind(fixture.sandbox_id)
     .bind(fixture.app_state.worker_node_id)
-    .bind(Uuid::now_v7())
+    .bind(fixture.storage_uri)
     .execute(&fixture.app_state.pool)
     .await?;
+    assert_eq!(failed_retry.rows_affected(), 1);
 
     // Act.
     let response = fixture

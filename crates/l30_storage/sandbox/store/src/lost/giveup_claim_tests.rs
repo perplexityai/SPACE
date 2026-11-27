@@ -66,6 +66,60 @@ async fn insert_ready_backups(pool: &PgPool, sandbox_ids: &[Uuid], node: Uuid) -
     Ok(())
 }
 
+/// The claim's durability check is the flip's
+/// ([`mark_unrecoverable_sandboxes_lost_query`](super::mark_unrecoverable_sandboxes_lost_query)).
+/// An unpinned row whose history is unordered (a ready capture without a
+/// generation registered after a ready one with a generation) restores only
+/// once it's pinned, so the give-up keeps it while it has a capture an
+/// operator can pin, and the source-release gate holds the node for it. One
+/// whose captures carry no artifact identity can't be pinned or restored, so
+/// keeping it would block the reap for good: the claim takes it, as it does a
+/// row with no copy.
+#[tokio::test(flavor = "current_thread")]
+async fn the_claim_leaves_out_only_an_unordered_history_an_operator_can_pin() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let node = Uuid::now_v7();
+    let pinnable = insert_suspended_rows(pool, node, 1).await?;
+    let unpinnable = insert_suspended_rows(pool, node, 1).await?;
+    let both: Vec<Uuid> = pinnable.iter().chain(&unpinnable).copied().collect();
+    insert_ready_backups(pool, &both, node).await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots
+            SET generation = 5, timestamp = NOW() - INTERVAL '20 minutes'
+          WHERE sandbox_id = ANY($1)"
+    ))
+    .bind(&both)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots
+            SET local_artifact_id = space_uuid_v7(), artifact_kind = 'full',
+                artifact_origin = 'suspend'
+          WHERE sandbox_id = ANY($1)"
+    ))
+    .bind(&pinnable)
+    .execute(pool)
+    .await?;
+    insert_ready_backups(pool, &both, node).await?;
+    let casualty = insert_suspended_rows(pool, node, 1).await?;
+
+    let mut tx = pool.begin().await?;
+    let mut claimed: Vec<Uuid> = lock_unrecoverable_candidates(&mut *tx, NodeId::from_uuid(node))
+        .await?
+        .into_iter()
+        .map(|id| id.as_uuid())
+        .collect();
+    tx.rollback().await?;
+    claimed.sort();
+    let mut expected: Vec<Uuid> = unpinnable.iter().chain(&casualty).copied().collect();
+    expected.sort();
+    assert_eq!(claimed, expected);
+    Ok(())
+}
+
 /// One `EXPLAIN (FORMAT JSON)` plan node, typed so a traversal that
 /// misses the root array, the `Plan` wrapper or the `Plans` nesting isn't
 /// expressible.

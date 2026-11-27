@@ -108,4 +108,4 @@ pplx-space-node-runtime-core = "crates/l40_api/node/runtime/core"
 # Major-version match on a state format, a residual filter after the
 # primary-key lookup by node and runtime.
 "crates/l30_storage/node/registration/store/src/direct/placement_candidates.rs" = 2
-"crates/l30_storage/sandbox/store/src/direct/restore_candidates.rs" = 4
+"crates/l30_storage/sandbox/store/src/direct/restore_candidates.rs" = 2

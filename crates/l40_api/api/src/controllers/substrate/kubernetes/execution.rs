@@ -2070,6 +2070,9 @@ impl KubernetesSubstrate {
         // the lifecycle cleanup decision without being reduced to a plain
         // `SubstrateError`.
         let wake_was_dispatched = AtomicBool::new(false);
+        // Set when the only Wake sent was refused before the node staged
+        // anything, the one dispatched failure that leaves no node-side work.
+        let wake_refused_before_staging = AtomicBool::new(false);
         // With the dispatch fence on, a user restore proves on its execution
         // that it hasn't sent its Wake and renews that proof while this future
         // lives; the Wake goes out only after ownership is confirmed under the
@@ -2266,6 +2269,9 @@ impl KubernetesSubstrate {
                 Ok(outcome) => outcome,
                 Err(failure) => {
                     let dispatched = failure.was_dispatched();
+                    if failure.dispatch == WakeDispatchStatus::RefusedBeforeStaging {
+                        wake_refused_before_staging.store(true, Ordering::Release);
+                    }
                     let error = failure.into_error();
                     if dispatched {
                         SandboxEvent::new(
@@ -2433,10 +2439,12 @@ impl KubernetesSubstrate {
                 }),
             }
         };
-        let wake_dispatch = if wake_was_dispatched.load(Ordering::Acquire) {
-            WakeDispatchStatus::MayHaveLanded
-        } else {
+        let wake_dispatch = if !wake_was_dispatched.load(Ordering::Acquire) {
             WakeDispatchStatus::NotDispatched
+        } else if wake_refused_before_staging.load(Ordering::Acquire) {
+            WakeDispatchStatus::RefusedBeforeStaging
+        } else {
+            WakeDispatchStatus::MayHaveLanded
         };
 
         if matches!(result, Err(SubstrateError::SuspendInFlight { .. }))
@@ -2611,8 +2619,20 @@ impl KubernetesSubstrate {
 ///   `NotDispatched` -> `true`: the restore definitively didn't take, so the
 ///   durable `suspended` state is accurate and a retry re-drives from scratch.
 /// - `MayHaveLanded` -> `false` regardless of error variant: an acknowledged
-///   Wake can be followed by route-publication, binding, or readiness failure.
-///   Preserve `restoring` so its retry/sweeper owner converges the live runtime.
+///   Wake can be followed by route-publication, binding, or readiness failure,
+///   and a send answered "not ready" can still be landing when a later send
+///   is refused. Preserve `restoring` so its retry/sweeper owner converges the
+///   live runtime.
+/// - `RefusedBeforeStaging` -> `true`, as `NotDispatched`: the only Wake sent
+///   got sandbox-manager's serialized pre-stage refusal
+///   (`restore_source_unordered_status`), returned before staging or booting
+///   a VM, so the claim reverts as a clean failure does. With
+///   abandoned-restore retirement enabled, the revert retires the claim's pod
+///   and `restore_pin` accepts a pin at once. Disabled, the execution stays
+///   active, as after any reverted claim, and the next restore claim is
+///   refused while that execution holds its ownership. A row the revert kept
+///   `restoring` takes a pin once it has no active owner
+///   (`restoring_row_accepts_operator_pin`).
 /// - `Timeout` -> `false`: the wake RPC may already have landed and the
 ///   pod/VM is live. `suspended` is swept by neither the orphaned-sandbox
 ///   reconciler nor the transient-lifecycle sweeper, so reverting would orphan

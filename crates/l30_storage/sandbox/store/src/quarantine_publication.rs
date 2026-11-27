@@ -19,9 +19,11 @@ use std::sync::LazyLock;
 
 use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_portability::{
-    current_suspend_origin_marker_snapshot_ready, exact_marker_snapshot_backup_current,
+    capture_registered_at, current_suspend_origin_marker_snapshot_ready,
+    exact_marker_snapshot_backup_current, node_held_capture_is_latest,
     node_published_suspend_evidence, pre_quarantine_suspend_snapshot_current,
-    started_suspend_revert_eligibility, suspended_projection_lifecycle_eligible_with_node_evidence,
+    started_suspend_finalize_eligibility, suspend_snapshot_is_current_capture,
+    suspended_projection_lifecycle_eligible_with_node_evidence,
 };
 use pplx_space_sql_locator::sql;
 use sqlx::types::{Json, JsonValue};
@@ -83,8 +85,9 @@ where
 /// The decoded row of [`lock_suspended_projection_candidates`], in `SELECT`
 /// order: the sandbox id, `clear_marker`, the quarantine episode, the
 /// receipt's reason and id, the prior lifecycle, the published artifact's id,
-/// kind and origin, the published execution generation and pod UID, and
-/// whether the matching running execution was missing its pod UID.
+/// kind and origin, the published execution generation and pod UID, whether
+/// the matching running execution was missing its pod UID, and the published
+/// artifact when it's the capture a restore pin may name.
 pub type SuspendedProjectionCandidateRow = (
     SandboxId,
     bool,
@@ -98,6 +101,7 @@ pub type SuspendedProjectionCandidateRow = (
     Option<i64>,
     Option<String>,
     Option<bool>,
+    Option<Uuid>,
 );
 
 /// The receipt vocabulary [`lock_suspended_projection_candidates`] binds.
@@ -114,7 +118,8 @@ pub struct SuspendedProjectionBinds {
 }
 
 fn suspended_projection_candidates_query() -> String {
-    let eligibility = started_suspend_revert_eligibility("s");
+    // Finalizing records the node's suspend; it chooses no restore source.
+    let eligibility = started_suspend_finalize_eligibility("s");
     let clear_marker = eligibility.clear_marker;
     let eligible = eligibility.eligible;
     // Recovery may retire only the active execution whose generation the node
@@ -131,6 +136,18 @@ fn suspended_projection_candidates_query() -> String {
          AND ({committed_suspend_marker_current})"
     );
     let node_suspend_evidence = node_published_suspend_evidence("s", "input");
+    // The artifact the node publishes is pinned when its ready backup is the
+    // capture the active execution left, even without the published identity.
+    let current_capture = suspend_snapshot_is_current_capture("s", "captured");
+    // So is a capture without a generation that the node reports holding
+    // suspended, while its backup from this node is still the latest capture
+    // of this run: the node's report is the proof the generation can't give.
+    // The report must come from the active execution when it names one, so a
+    // late report from an earlier execution can't pin its capture. A capture
+    // with another execution's generation stays unpinned.
+    let held_capture =
+        node_held_capture_is_latest("s", "held", "input.current_local_artifact_id", "$1");
+    let held_captured = capture_registered_at("held");
     let lifecycle_eligible = suspended_projection_lifecycle_eligible_with_node_evidence(
         "s",
         &committed_suspend_evidence,
@@ -179,7 +196,42 @@ fn suspended_projection_candidates_query() -> String {
                             AND execution.state = 'running'
                             AND execution.generation = input.execution_generation
                             AND execution.pod_uid IS NULL
-                     ) END AS published_pod_uid_was_missing
+                     ) END AS published_pod_uid_was_missing,
+                CASE WHEN LOWER(TRIM(s.lifecycle)) != 'quarantined'
+                          AND (EXISTS (
+                                  SELECT 1
+                                    FROM snapshots captured
+                                   WHERE captured.sandbox_id = s.id
+                                     AND captured.local_artifact_id = input.current_local_artifact_id
+                                     AND {current_capture}
+                              )
+                              OR (input.current_local_artifact_kind = 'full'
+                                  AND input.current_local_artifact_origin = 'suspend'
+                                  AND EXISTS (
+                                      SELECT 1
+                                        FROM snapshots held
+                                       WHERE held.sandbox_id = s.id
+                                         AND {held_capture}
+                                         AND {held_captured} >= s.lifecycle_changed_at
+                                         AND (input.execution_generation IS NULL OR EXISTS (
+                                             SELECT 1
+                                               FROM sandbox_k8s_executions reported
+                                              WHERE reported.sandbox_id = s.id
+                                                AND reported.active
+                                                AND reported.generation = input.execution_generation
+                                                AND (input.pod_uid IS NULL
+                                                     OR reported.pod_uid IS NULL
+                                                     OR reported.pod_uid = input.pod_uid)
+                                         ))
+                                         AND NOT EXISTS (
+                                             SELECT 1
+                                               FROM snapshots stamped
+                                              WHERE stamped.sandbox_id = s.id
+                                                AND stamped.local_artifact_id = held.local_artifact_id
+                                                AND stamped.generation IS NOT NULL
+                                         )
+                                  )))
+                     THEN input.current_local_artifact_id END AS captured_artifact_id
            FROM sandboxes s
            JOIN input ON input.sandbox_id = s.id
            LEFT JOIN sandbox_quarantine_state qs ON qs.sandbox_id = s.id
