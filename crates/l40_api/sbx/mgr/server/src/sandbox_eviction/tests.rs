@@ -1656,3 +1656,101 @@ async fn legacy_reupload_retries_when_the_cluster_api_endpoint_is_empty() {
     }
     assert_missing_wiring_reupload_is_retried().await;
 }
+
+/// A cluster-api stub for the eviction's proofs: every local artifact is
+/// backed up, and the sandbox is durably restorable without the local copy
+/// only when `durably_restorable`.
+#[derive(Clone, Copy)]
+struct EvictionProofs {
+    durably_restorable: bool,
+}
+
+impl tonic::server::NamedService for EvictionProofs {
+    const NAME: &'static str = "space.node.api.v1.ClusterApi";
+}
+
+impl<B> tower::Service<http::Request<B>> for EvictionProofs
+where
+    B: http_body::Body + Send + 'static,
+    B::Error: Into<tonic::codegen::StdError> + Send + 'static,
+{
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = futures_util::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        use pplx_space_node_api_client::proto::backup_readiness_query::Artifact;
+        use pplx_space_node_api_client::proto::{
+            GetArtifactBackupLocationRequest, GetArtifactBackupLocationResponse,
+        };
+        let stub = *self;
+        Box::pin(async move {
+            if !request.uri().path().ends_with("/GetArtifactBackupLocation") {
+                return Ok(
+                    tonic::Status::unimplemented(request.uri().path().to_owned()).into_http(),
+                );
+            }
+            Ok(
+                crate::service::answer(
+                    request,
+                    move |request: GetArtifactBackupLocationRequest| {
+                        let ready = match request.readiness.and_then(|query| query.artifact) {
+                            Some(Artifact::DurablyRestorable(true)) => stub.durably_restorable,
+                            _ => true,
+                        };
+                        Ok(GetArtifactBackupLocationResponse {
+                            ready: Some(ready),
+                            ..Default::default()
+                        })
+                    },
+                )
+                .await,
+            )
+        })
+    }
+}
+
+/// A suspended copy proven backed up is still kept while the cluster can't
+/// restore the sandbox without it: an unpinned history whose captures can't
+/// be ordered refuses its restore, so the copy is its only restore path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eviction_keeps_a_backed_up_copy_the_cluster_cannot_restore_without() {
+    let conn = open_test_db();
+    insert_sandbox(&conn, "sbx-refused", "suspended", 1_000);
+    insert_pinned_artifact(&conn, "sbx-refused", &v7(1_000).to_string(), Some("123"));
+    let service = SandboxManagerService::for_test(conn);
+    let cfg = EvictionConfig {
+        enabled: true,
+        engage_fraction: 0.50,
+        target_fraction: 0.40,
+        min_idle: std::time::Duration::from_secs(0),
+        interval: std::time::Duration::from_secs(60),
+        max_per_tick: 10,
+        reupload_max_per_tick: 5,
+    };
+    let disk = crate::disk_usage::DiskUsage {
+        used_bytes: 80,
+        total_bytes: 100,
+    };
+    let stub = EvictionProofs {
+        durably_restorable: false,
+    };
+    // The body runs in a child process that reaches the stub over gRPC.
+    crate::service::with_cluster_api(stub, async || {
+        let mut scan_state = CandidateScanState::default();
+        let report = evict_tick(&service, cfg, Some(disk), &mut scan_state)
+            .await
+            .unwrap();
+        assert_eq!(report.candidates, 1);
+        assert_eq!(report.evicted, 0);
+        assert_eq!(report.skipped, 1);
+    })
+    .await;
+}

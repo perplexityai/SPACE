@@ -41,6 +41,9 @@ struct Case {
     /// A ready, stored pre-restore snapshot (of the marker's artifact on a
     /// marker row), which is what proves restore selection stays durable.
     durable_source: bool,
+    /// A ready full snapshot registered after the restore claim, which would
+    /// outrank the pre-claim source if reverting reset `lifecycle_changed_at`.
+    post_claim_snapshot: bool,
     execution: Execution,
     /// A node converged the row to `started` before the rollback ran.
     converged_to_started: bool,
@@ -86,6 +89,7 @@ async fn reverted_row(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<Revert
 }
 
 const PRE_RESTORE_URI: &str = "s3://bucket/pre-restore?region=us-east-1";
+const POST_RESTORE_URI: &str = "s3://bucket/post-restore?region=us-east-1";
 
 fn execution_pod_name(sandbox_id: SandboxId) -> String {
     format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple())
@@ -132,6 +136,7 @@ pub(super) async fn failed_restore_revert_retires_only_its_own_proven_execution(
             name: "claimed execution, durable markerless source",
             marker: false,
             durable_source: true,
+            post_claim_snapshot: false,
             execution: Execution::CreatedByClaim,
             converged_to_started: false,
             with_token: true,
@@ -142,6 +147,18 @@ pub(super) async fn failed_restore_revert_retires_only_its_own_proven_execution(
             name: "claimed execution, durable marker source",
             marker: true,
             durable_source: true,
+            post_claim_snapshot: false,
+            execution: Execution::CreatedByClaim,
+            converged_to_started: false,
+            with_token: true,
+            attempt: ClaimAttempt::Assigned,
+            expected: Expected::ExecutionRetired,
+        },
+        Case {
+            name: "claimed execution, post-claim snapshot keeps restoring window",
+            marker: false,
+            durable_source: true,
+            post_claim_snapshot: true,
             execution: Execution::CreatedByClaim,
             converged_to_started: false,
             with_token: true,
@@ -152,6 +169,7 @@ pub(super) async fn failed_restore_revert_retires_only_its_own_proven_execution(
             name: "claimed execution, tokenless claim with its attempt",
             marker: false,
             durable_source: true,
+            post_claim_snapshot: false,
             execution: Execution::CreatedByClaim,
             converged_to_started: false,
             with_token: false,
@@ -162,6 +180,7 @@ pub(super) async fn failed_restore_revert_retires_only_its_own_proven_execution(
             name: "claimed execution, tokenless claim with no attempt",
             marker: false,
             durable_source: true,
+            post_claim_snapshot: false,
             execution: Execution::CreatedByClaim,
             converged_to_started: false,
             with_token: false,
@@ -172,6 +191,7 @@ pub(super) async fn failed_restore_revert_retires_only_its_own_proven_execution(
             name: "execution taken over by a tokenless redrive",
             marker: false,
             durable_source: true,
+            post_claim_snapshot: false,
             execution: Execution::CreatedByClaim,
             converged_to_started: false,
             with_token: false,
@@ -182,6 +202,7 @@ pub(super) async fn failed_restore_revert_retires_only_its_own_proven_execution(
             name: "claimed execution, no durable source",
             marker: false,
             durable_source: false,
+            post_claim_snapshot: false,
             execution: Execution::CreatedByClaim,
             converged_to_started: false,
             with_token: true,
@@ -192,6 +213,7 @@ pub(super) async fn failed_restore_revert_retires_only_its_own_proven_execution(
             name: "execution predates the claim",
             marker: false,
             durable_source: true,
+            post_claim_snapshot: false,
             execution: Execution::PredatesClaim,
             converged_to_started: false,
             with_token: true,
@@ -202,6 +224,18 @@ pub(super) async fn failed_restore_revert_retires_only_its_own_proven_execution(
             name: "no execution, durable source",
             marker: false,
             durable_source: true,
+            post_claim_snapshot: false,
+            execution: Execution::Absent,
+            converged_to_started: false,
+            with_token: true,
+            attempt: ClaimAttempt::Unassigned,
+            expected: Expected::LifecycleOnly,
+        },
+        Case {
+            name: "no execution, post-claim snapshot keeps restoring window",
+            marker: false,
+            durable_source: true,
+            post_claim_snapshot: true,
             execution: Execution::Absent,
             converged_to_started: false,
             with_token: true,
@@ -212,6 +246,7 @@ pub(super) async fn failed_restore_revert_retires_only_its_own_proven_execution(
             name: "row converged to started first",
             marker: false,
             durable_source: true,
+            post_claim_snapshot: false,
             execution: Execution::CreatedByClaim,
             converged_to_started: true,
             with_token: false,
@@ -274,6 +309,22 @@ pub(super) async fn failed_restore_revert_retires_only_its_own_proven_execution(
                 .begin_restore_lifecycle(sandbox_id, false)
                 .await?,
         );
+        let claim_boundary: Option<OffsetDateTime> = sqlx::query_scalar(sql!(
+            "SELECT lifecycle_changed_at FROM sandboxes WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&fixture.pool)
+        .await?;
+        if case.post_claim_snapshot {
+            insert_ready_full_snapshot_relative_to_lifecycle(
+                &fixture.pool,
+                sandbox_id,
+                POST_RESTORE_URI,
+                1,
+                Some(LocalArtifactId::new()),
+            )
+            .await?;
+        }
 
         if case.execution == Execution::CreatedByClaim {
             insert_execution(&fixture.pool, sandbox_id, "0 seconds", execution_attempt).await?;
@@ -311,13 +362,18 @@ pub(super) async fn failed_restore_revert_retires_only_its_own_proven_execution(
             )
             .await?;
 
+        let reverted_lifecycle = if case.post_claim_snapshot {
+            "restoring"
+        } else {
+            "suspended"
+        };
         let (expected_outcome, expected_row) = match case.expected {
             Expected::ExecutionRetired => (
                 RestoreClaimRevert::ExecutionRetired {
                     pod_name: execution_pod_name(sandbox_id),
                 },
                 RevertedRow {
-                    lifecycle: "suspended".to_string(),
+                    lifecycle: reverted_lifecycle.to_string(),
                     placement: "unplaced".to_string(),
                     active_node_id: None,
                     execution_active: Some(false),
@@ -328,14 +384,14 @@ pub(super) async fn failed_restore_revert_retires_only_its_own_proven_execution(
             Expected::LifecycleOnly => (
                 RestoreClaimRevert::LifecycleOnly,
                 RevertedRow {
-                    lifecycle: "suspended".to_string(),
+                    lifecycle: reverted_lifecycle.to_string(),
                     ..before
                 },
             ),
             Expected::ExecutionLeftActive => (
                 RestoreClaimRevert::ExecutionLeftActive,
                 RevertedRow {
-                    lifecycle: "suspended".to_string(),
+                    lifecycle: reverted_lifecycle.to_string(),
                     ..before
                 },
             ),
@@ -345,17 +401,36 @@ pub(super) async fn failed_restore_revert_retires_only_its_own_proven_execution(
         // and the artifact marker.
         let actual = reverted_row(&fixture.pool, sandbox_id).await?;
         // A reverted row with a durable source still restores from it,
-        // although the bind moved its placement past that snapshot.
+        // although the bind moved its placement past that snapshot, and a row
+        // kept in `restoring` to preserve its pre-claim source window can be
+        // immediately re-claimed by the next wake without losing `claim_boundary`.
         let selected = if case.expected == Expected::NotReverted {
             None
         } else {
             let sandbox = crate::controllers::sandbox::fetch_sandbox(&fixture.pool, sandbox_id)
                 .await?
                 .expect("sandbox row exists");
+            let selected_sandbox = if case.post_claim_snapshot {
+                let prepared = fixture
+                    .store
+                    .prepare_wake_sandbox(&sandbox, sandbox_id, None)
+                    .await?;
+                let retry_boundary: Option<OffsetDateTime> = sqlx::query_scalar(sql!(
+                    "SELECT lifecycle_changed_at FROM sandboxes WHERE id = $1"
+                ))
+                .bind(sandbox_id)
+                .fetch_one(&fixture.pool)
+                .await?;
+                assert_eq!(retry_boundary, claim_boundary, "{}", case.name);
+                assert!(prepared.restore_claim.is_some(), "{}", case.name);
+                prepared.sandbox
+            } else {
+                sandbox
+            };
             fixture
                 .store
                 .selected_suspend_restore_storage_uri(
-                    &sandbox,
+                    &selected_sandbox,
                     RestoreSnapshotChoice::SourceNodeOrFresh,
                 )
                 .await?
@@ -476,5 +551,240 @@ pub(super) async fn without_retirement_a_failed_restore_revert_moves_only_the_li
         }
     );
     assert_eq!(clock().await?, clock_before);
+    Ok(())
+}
+
+/// One backup row of a full artifact.
+struct Backup<'a> {
+    artifact: LocalArtifactId,
+    /// `suspend`, or `snapshot` for a user's named snapshot.
+    origin: &'a str,
+    state: &'a str,
+    generation: Option<i64>,
+    /// Registered this many minutes ago.
+    minutes_ago: i32,
+    uri: &'a str,
+}
+
+impl<'a> Backup<'a> {
+    /// A ready suspend capture of a fresh artifact.
+    fn suspend(generation: Option<i64>, minutes_ago: i32, uri: &'a str) -> Self {
+        Self {
+            artifact: LocalArtifactId::new(),
+            origin: "suspend",
+            state: "ready",
+            generation,
+            minutes_ago,
+            uri,
+        }
+    }
+}
+
+async fn insert_backup(pool: &PgPool, sandbox_id: SandboxId, backup: &Backup<'_>) -> TestResult {
+    let snapshot_id = SnapshotId::new();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (
+             id, sandbox_id, type, state, timestamp, local_artifact_id, artifact_kind,
+             artifact_origin, artifact_snapshot_name, generation, org_id
+         )
+         VALUES ($1, $2, 'full', $3, NOW() - make_interval(mins => $4::INT), $5, 'full',
+                 $6, CASE WHEN $6 = 'snapshot' THEN 'f-named' END, $7,
+                 '00000000-0000-0000-0000-000000000001')"
+    ))
+    .bind(snapshot_id)
+    .bind(sandbox_id)
+    .bind(backup.state)
+    .bind(backup.minutes_ago)
+    .bind(backup.artifact)
+    .bind(backup.origin)
+    .bind(backup.generation)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string, org_id)
+         VALUES ($1, $2, '00000000-0000-0000-0000-000000000001')"
+    ))
+    .bind(snapshot_id)
+    .bind(backup.uri)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A sandbox whose restore claimed it 15 minutes ago, under `token` when one
+/// is given.
+async fn insert_claimed_sandbox(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    token: Option<Uuid>,
+) -> TestResult {
+    insert_sandbox(pool, sandbox_id, "restoring").await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET lifecycle_changed_at = NOW() - INTERVAL '15 minutes',
+                restore_lease_token = $2,
+                restore_lease_expires_at = CASE WHEN $2::uuid IS NOT NULL
+                                                THEN NOW() + INTERVAL '5 minutes' END
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(token)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The revert's lifecycle, whether it kept a placement clock, and the capture
+/// the row's next restore loads.
+async fn reverted_restore(
+    fixture: &PostgresStore,
+    sandbox_id: SandboxId,
+) -> TestResult<(String, bool, Option<String>)> {
+    let (lifecycle, has_placement_clock): (String, bool) = sqlx::query_as(sql!(
+        "SELECT lifecycle, placement_changed_at IS NOT NULL FROM sandboxes WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&fixture.pool)
+    .await?;
+    let sandbox = crate::controllers::sandbox::fetch_sandbox(&fixture.pool, sandbox_id)
+        .await?
+        .expect("sandbox row exists");
+    let selected = fixture
+        .store
+        .selected_suspend_restore_storage_uri(&sandbox, RestoreSnapshotChoice::SourceNodeOrFresh)
+        .await?;
+    Ok((lifecycle, has_placement_clock, selected))
+}
+
+/// A failed restore's rollback keeps the row `restoring`, and the placement
+/// clock that bounds its source window, only when a `suspended` row would
+/// refuse the restore the retry makes. A capture without a generation that
+/// registered before the last placement, after execution 5 started, leaves
+/// the history unordered for a `suspended` row, while the retry's window
+/// excludes it. Without that capture the rollback returns the row to
+/// `suspended` and clears the clock. Either way the next restore loads the
+/// capture the failed one started from.
+///
+/// A named snapshot from before the claim, or a failed suspend backup whose
+/// retry lands after it, holds no window: the row returns to `suspended`,
+/// where the backup that landed after the claim restores.
+pub(super) async fn a_failed_restore_revert_keeps_a_window_only_the_retry_can_order(
+    fixture: &PostgresStore,
+) -> TestResult {
+    const SOURCE_URI: &str = "s3://bucket/source?region=us-east-1";
+    const POST_CLAIM_URI: &str = "s3://bucket/post-claim-suspend?region=us-east-1";
+    let pool = &fixture.pool;
+    let enabled = crate::controllers::substrate::AbandonedRestoreRetirement::Enabled;
+
+    for with_unranked in [true, false] {
+        let case = format!("unranked capture {with_unranked}");
+        let sandbox_id = SandboxId::new();
+        let token = Uuid::now_v7();
+        let attempt = SandboxActivationAttemptId::new();
+        insert_claimed_sandbox(pool, sandbox_id, Some(token)).await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET placement_changed_at = NOW() - INTERVAL '30 minutes'
+              WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(pool)
+        .await?;
+        // Execution 5 took the source capture; execution 6 is the claim's.
+        sqlx::query(sql!(
+            "INSERT INTO sandbox_k8s_executions
+                 (sandbox_id, generation, pod_name, pod_namespace, state, active, created_at,
+                  activation_attempt_id, activation_attempt_expires_at,
+                  activation_attempt_target_state)
+             VALUES ($1, 5, $2, 'space', 'suspended', FALSE, NOW() - INTERVAL '60 minutes',
+                     NULL, NULL, NULL),
+                    ($1, 6, $3, 'space', 'created', TRUE, NOW() - INTERVAL '10 minutes',
+                     $4, NOW() + INTERVAL '5 minutes', 'started')"
+        ))
+        .bind(sandbox_id)
+        .bind(format!("space-sbx-{}-g5", sandbox_id.as_uuid().simple()))
+        .bind(format!("space-sbx-{}-g6", sandbox_id.as_uuid().simple()))
+        .bind(attempt)
+        .execute(pool)
+        .await?;
+        if with_unranked {
+            insert_backup(
+                pool,
+                sandbox_id,
+                &Backup::suspend(None, 40, "s3://bucket/unranked?region=us-east-1"),
+            )
+            .await?;
+        }
+        insert_backup(pool, sandbox_id, &Backup::suspend(Some(5), 20, SOURCE_URI)).await?;
+
+        let outcome = fixture
+            .store
+            .revert_restore_claim_to_suspended(sandbox_id, Some(token), Some((attempt, 6)), enabled)
+            .await?;
+
+        assert_eq!(
+            outcome,
+            RestoreClaimRevert::ExecutionRetired {
+                pod_name: format!("space-sbx-{}-g6", sandbox_id.as_uuid().simple()),
+            },
+            "{case}"
+        );
+        let kept_lifecycle = if with_unranked {
+            "restoring"
+        } else {
+            "suspended"
+        };
+        assert_eq!(
+            reverted_restore(fixture, sandbox_id).await?,
+            (
+                kept_lifecycle.to_owned(),
+                with_unranked,
+                Some(SOURCE_URI.to_owned())
+            ),
+            "{case}"
+        );
+    }
+
+    for case in ["named_pre_claim", "retried_pre_claim_suspend"] {
+        let sandbox_id = SandboxId::new();
+        insert_claimed_sandbox(pool, sandbox_id, None).await?;
+        let artifact = LocalArtifactId::new();
+        let pre_claim = match case {
+            "named_pre_claim" => Backup {
+                origin: "snapshot",
+                ..Backup::suspend(None, 25, "s3://bucket/named?region=us-east-1")
+            },
+            _ => Backup {
+                artifact,
+                state: "failed",
+                ..Backup::suspend(Some(5), 25, "s3://bucket/failed-attempt?region=us-east-1")
+            },
+        };
+        insert_backup(pool, sandbox_id, &pre_claim).await?;
+        insert_backup(
+            pool,
+            sandbox_id,
+            &Backup {
+                artifact,
+                ..Backup::suspend(Some(5), 5, POST_CLAIM_URI)
+            },
+        )
+        .await?;
+
+        let outcome = fixture
+            .store
+            .revert_restore_claim_to_suspended(sandbox_id, None, None, enabled)
+            .await?;
+
+        assert_eq!(outcome, RestoreClaimRevert::LifecycleOnly, "{case}");
+        assert_eq!(
+            reverted_restore(fixture, sandbox_id).await?,
+            (
+                "suspended".to_owned(),
+                false,
+                Some(POST_CLAIM_URI.to_owned())
+            ),
+            "{case}"
+        );
+    }
     Ok(())
 }

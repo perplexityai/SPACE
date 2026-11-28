@@ -478,3 +478,54 @@ async fn a_v2_drain_that_commits_while_a_registration_waits_defers_it() -> TestD
     assert_eq!(k8s.k8s_node_uid.as_deref(), Some("uid-2"));
     Ok(())
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn k8s_worker_ready_distinguishes_ready_unready_builder_and_deleted_rows() -> TestDbResult<()>
+{
+    let db = pg_test_db().await?;
+    assert_eq!(lookup::k8s_worker_ready(&db.pool, NAME).await?, None);
+
+    let builder_id = NodeId::new();
+    let mut builder = registration(builder_id, "uid-builder", None);
+    builder.role = NodeRole::Builder;
+    assert!(registered(&db.pool, builder).await?);
+    assert_eq!(lookup::k8s_worker_ready(&db.pool, NAME).await?, None);
+
+    let worker_id = NodeId::new();
+    let mut worker = registration(worker_id, "uid-worker", None);
+    worker.state = "registered";
+    assert!(registered(&db.pool, worker).await?);
+    assert_eq!(lookup::k8s_worker_ready(&db.pool, NAME).await?, Some(false));
+
+    // `nodes.state` is nullable: a NULL state reads as unready (`Some(false)`)
+    // rather than failing bool decode or sorting ahead of a `'ready'` row for
+    // the same Kubernetes node name under `DESC` (`NULLS FIRST`).
+    sqlx::query(sql!("UPDATE nodes SET state = NULL WHERE id = $1"))
+        .bind(worker_id)
+        .execute(&db.pool)
+        .await?;
+    assert_eq!(lookup::k8s_worker_ready(&db.pool, NAME).await?, Some(false));
+
+    let ready_peer_id = NodeId::new();
+    let mut ready_peer = registration(ready_peer_id, "uid-worker-ready", None);
+    ready_peer.state = "ready";
+    assert!(registered(&db.pool, ready_peer).await?);
+    assert_eq!(lookup::k8s_worker_ready(&db.pool, NAME).await?, Some(true));
+    sqlx::query(sql!("UPDATE nodes SET state = 'deleted' WHERE id = $1"))
+        .bind(ready_peer_id)
+        .execute(&db.pool)
+        .await?;
+
+    sqlx::query(sql!("UPDATE nodes SET state = 'ready' WHERE id = $1"))
+        .bind(worker_id)
+        .execute(&db.pool)
+        .await?;
+    assert_eq!(lookup::k8s_worker_ready(&db.pool, NAME).await?, Some(true));
+
+    sqlx::query(sql!("UPDATE nodes SET state = 'deleted' WHERE id = $1"))
+        .bind(worker_id)
+        .execute(&db.pool)
+        .await?;
+    assert_eq!(lookup::k8s_worker_ready(&db.pool, NAME).await?, None);
+    Ok(())
+}

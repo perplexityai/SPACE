@@ -87,4 +87,29 @@ fn a_contended_wake_does_not_revert_the_row_to_suspended() {
         "the restore wrapper delegates to the wake predicate; if this diverges \
          one path reverts a live VM the other preserved"
     );
+
+    // `RestoreContextUnavailable` is sandbox-manager's pre-stage
+    // unordered-source refusal: the refused send booted no VM. When it was
+    // the only send, a fresh claim reverts and retires its pod instead of
+    // blocking `restore_pin` behind an active execution. An earlier send of
+    // the same Wake may still be landing, and keeps the claim for it.
+    for (dispatch, reverts) in [
+        (WakeDispatchStatus::NotDispatched, true),
+        (WakeDispatchStatus::RefusedBeforeStaging, true),
+        (WakeDispatchStatus::MayHaveLanded, false),
+    ] {
+        assert_eq!(
+            restore_failure_should_revert_to_suspended(
+                Some(RestoreClaim::FreshFromSuspended {
+                    restore_lease_token: Some(uuid::Uuid::now_v7()),
+                }),
+                Some(&SubstrateError::RestoreContextUnavailable {
+                    message: "sandbox captures can't be ordered".to_string(),
+                }),
+                dispatch,
+            ),
+            reverts,
+            "an unordered-source refusal with dispatch {dispatch:?}"
+        );
+    }
 }

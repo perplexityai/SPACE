@@ -51,7 +51,8 @@ use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxLifecycleParseError};
 use pplx_space_sandbox_portability::{
     fresh_ready_snapshot_exists, inflight_suspend_upload_exists,
-    recoverable_suspend_snapshot_exists, restore_retry_source_snapshot_exists,
+    recoverable_suspend_snapshot_exists, restore_pinnable_pre_claim_capture_exists,
+    restore_retry_pinnable_revert_snapshot_exists, restore_retry_source_snapshot_exists,
     restore_retry_suspended_revert_snapshot_exists,
 };
 use pplx_space_sandbox_routability::{
@@ -143,6 +144,7 @@ fn restoring_episode_overdue(binds: EpisodeDeadlineBinds) -> String {
     } = binds;
     let revert_safe_snapshot = restore_retry_suspended_revert_snapshot_exists("sandboxes");
     let source_snapshot = restore_retry_source_snapshot_exists("sandboxes");
+    let pinnable_revert_snapshot = restore_retry_pinnable_revert_snapshot_exists("sandboxes");
     format!(
         "({deadline}::BIGINT IS NOT NULL
                      AND sandboxes.managed_by = {kubernetes}
@@ -155,8 +157,8 @@ fn restoring_episode_overdue(binds: EpisodeDeadlineBinds) -> String {
                             AND ip.active
                             AND ip.pod_ip IS NOT NULL
                      )
-                     AND {revert_safe_snapshot}
-                     AND {source_snapshot})"
+                     AND (({revert_safe_snapshot} AND {source_snapshot})
+                          OR {pinnable_revert_snapshot}))"
     )
 }
 
@@ -415,7 +417,9 @@ const LIST_EPISODE_DEADLINE: EpisodeDeadlineBinds = EpisodeDeadlineBinds {
 ///   suspend cycle's bytes (see the sweeper's `classify::decide`).
 fn ready_snapshot_predicate(lifecycle: SandboxLifecycle) -> String {
     if lifecycle == SandboxLifecycle::Restoring {
-        restore_retry_source_snapshot_exists("sandboxes")
+        let source_snapshot = restore_retry_source_snapshot_exists("sandboxes");
+        let pinnable_pre_claim = restore_pinnable_pre_claim_capture_exists("sandboxes");
+        format!("({source_snapshot} OR {pinnable_pre_claim})")
     } else {
         fresh_ready_snapshot_exists("sandboxes")
     }
@@ -1025,6 +1029,7 @@ where
 /// pod IP can converge.
 pub(crate) fn revert_to_suspended_query() -> String {
     let ready_snapshot = restore_retry_suspended_revert_snapshot_exists("sandboxes");
+    let pinnable_revert_snapshot = restore_retry_pinnable_revert_snapshot_exists("sandboxes");
     let ownership_guards = restoring_ownership_guards("$3", Some(REVERT_EPISODE_DEADLINE));
     format!(
         "UPDATE sandboxes
@@ -1034,7 +1039,7 @@ pub(crate) fn revert_to_suspended_query() -> String {
             AND lifecycle = $2
             AND lifecycle = 'restoring'
             AND lifecycle_changed_at < NOW() - make_interval(secs => $3::BIGINT)
-            AND ({ready_snapshot}){ownership_guards}
+            AND ({ready_snapshot} OR {pinnable_revert_snapshot}){ownership_guards}
             AND id = $4
           RETURNING {LIFECYCLE_WRITE_TOKEN}"
     )
@@ -1046,6 +1051,7 @@ pub(crate) fn revert_to_suspended_query() -> String {
 /// under the candidate's fence, refusing a pod that came up since.
 fn revert_to_suspended_lifecycle_only_query() -> String {
     let ready_snapshot = restore_retry_suspended_revert_snapshot_exists("sandboxes");
+    let pinnable_revert_snapshot = restore_retry_pinnable_revert_snapshot_exists("sandboxes");
     let ownership_guards = restoring_ownership_guards("$3", Some(REVERT_EPISODE_DEADLINE));
     format!(
         "UPDATE sandboxes
@@ -1054,7 +1060,7 @@ fn revert_to_suspended_lifecycle_only_query() -> String {
             AND lifecycle = $2
             AND lifecycle = 'restoring'
             AND lifecycle_changed_at < NOW() - make_interval(secs => $3::BIGINT)
-            AND ({ready_snapshot}){ownership_guards}
+            AND ({ready_snapshot} OR {pinnable_revert_snapshot}){ownership_guards}
             AND id = $4
           RETURNING {LIFECYCLE_WRITE_TOKEN}"
     )
@@ -1269,6 +1275,7 @@ pub async fn undo_revert_to_suspended(
 /// statement must bind there.
 fn unrestorable_restoring_guards() -> String {
     let source_snapshot = restore_retry_source_snapshot_exists("sandboxes");
+    let pinnable_pre_claim = restore_pinnable_pre_claim_capture_exists("sandboxes");
     let inflight_upload = inflight_suspend_upload_exists("sandboxes");
     format!(
         "AND sandboxes.lifecycle = 'restoring'
@@ -1288,6 +1295,7 @@ fn unrestorable_restoring_guards() -> String {
                    AND ske.k8s_node_name IS NOT NULL
             )
             AND NOT {source_snapshot}
+            AND NOT {pinnable_pre_claim}
             AND NOT {inflight_upload}
             AND sandboxes.placement_changed_at IS NOT NULL
             AND sandboxes.placement_changed_at < NOW() - make_interval(secs => $2::BIGINT)"

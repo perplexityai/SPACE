@@ -103,16 +103,31 @@ pub(crate) fn database_connect_options(
 const QUERY_EVENT_LEVEL: LevelFilter = LevelFilter::Info;
 
 /// [`database_connect_options`] plus the options every service pool shares.
+///
+/// JIT is off for the session. The control plane runs short, index-driven
+/// statements, and the restore-source and retention predicates compose many
+/// correlated subqueries whose plan cost crosses `jit_above_cost`, so with JIT
+/// on, Postgres compiles thousands of functions per execution of a statement
+/// that runs in milliseconds without it.
 fn service_connect_options(
     database_url: &str,
     application_name: &str,
     identity: DatabaseIdentity,
     password: &str,
 ) -> Result<PgConnectOptions, DatabaseConnectOptionsError> {
-    Ok(
-        database_connect_options(database_url, application_name, identity, password)?
-            .log_statements(QUERY_EVENT_LEVEL),
-    )
+    Ok(service_session_options(database_connect_options(
+        database_url,
+        application_name,
+        identity,
+        password,
+    )?))
+}
+
+/// The session settings [`service_connect_options`] adds.
+fn service_session_options(options: PgConnectOptions) -> PgConnectOptions {
+    options
+        .log_statements(QUERY_EVENT_LEVEL)
+        .options([("jit", "off")])
 }
 
 /// Prepare a managed Postgres identity pool without waiting for a connection.

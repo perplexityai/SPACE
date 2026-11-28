@@ -7,9 +7,12 @@ use std::sync::LazyLock;
 use pplx_space_node_model::SubstrateKind;
 use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_portability::{
-    failed_repair_revert_eligibility, no_newer_full_snapshot,
+    capture_registered_at, failed_repair_revert_eligibility, full_snapshot_outranked_by_generation,
+    no_newer_suspend_capture, registered_before_restore_claim, restore_order_unordered,
+    restore_order_unordered_in_retry_window, restore_pin_predates_claim,
     restore_retry_source_snapshot_is_current, snapshot_is_current_local_artifact,
 };
+use pplx_space_snapshot_model::ArtifactOrigin;
 use pplx_space_sql_locator::sql;
 
 /// One group of [`sandbox_population`]: sandboxes with the same binding
@@ -39,7 +42,16 @@ pub struct SandboxPopulationRow {
 static SANDBOX_POPULATION_QUERY: LazyLock<String> = LazyLock::new(|| {
     let marked = snapshot_is_current_local_artifact("sb", "sn");
     let retry_source = restore_retry_source_snapshot_is_current("sb", "sn");
-    let newest_full = no_newer_full_snapshot("sb", "sn");
+    let newest_suspend = no_newer_suspend_capture("sb", "sn");
+    let outranked_by_generation = full_snapshot_outranked_by_generation("sb", "sn");
+    let unordered = restore_order_unordered("sb");
+    let unordered_in_window = restore_order_unordered_in_retry_window("sb");
+    let pin_pre_claim = restore_pin_predates_claim("sb");
+    let window = registered_before_restore_claim("sb", "sn");
+    let captured = capture_registered_at("sn");
+    let suspend = ArtifactOrigin::Suspend.as_str();
+    let suspend_capture =
+        format!("(sn.artifact_origin IS NULL OR sn.artifact_origin = '{suspend}')");
     let repair = failed_repair_revert_eligibility("sb");
     let (repairable, stale_marker) = (repair.eligible, repair.clear_marker);
     sql!(format!(
@@ -65,12 +77,20 @@ static SANDBOX_POPULATION_QUERY: LazyLock<String> = LazyLock::new(|| {
                 -- live, as the repair loop reads it: a status other than
                 -- failed, a pid, or a sandbox still assigned to a node.
                 -- Otherwise it predates the failure.
+                -- A Direct row's source node's `suspended` observation is the
+                -- copy its own-node restore loads, an unordered history's
+                -- included, unless a pin from before the claim decides.
                 ON sos.sandbox_id = sb.id
                 AND (sb.lifecycle NOT IN ('suspended', 'restoring', 'failed')
                      OR (sb.lifecycle = 'failed'
                          AND (sos.status IS DISTINCT FROM 'failed'
                               OR sos.pid IS NOT NULL
-                              OR sb.active_node_id IS NOT NULL)))
+                              OR sb.active_node_id IS NOT NULL))
+                     OR (sb.managed_by = $1
+                         AND sb.lifecycle IN ('suspended', 'restoring')
+                         AND sos.status = 'suspended'
+                         AND sos.node_id = COALESCE(sb.target_node_id, sb.active_node_id)
+                         AND NOT (sb.lifecycle = 'restoring' AND {pin_pre_claim})))
          -- The repair loop's evidence that a failed sandbox's VM may still run
          -- (`pplx_space_sandbox_store::repair::failed_repair_row_state_guards`):
          -- an execution the Kubernetes substrate holds active or with a pod IP.
@@ -87,10 +107,26 @@ static SANDBOX_POPULATION_QUERY: LazyLock<String> = LazyLock::new(|| {
                AND sn.type = 'full'
                AND (
                    -- A sandbox a restore would bring back: its substrate's rule.
+                   -- Both refuse an unordered history the pin doesn't cover.
                    (sb.lifecycle IN ('suspended', 'restoring')
                     AND (
+                        (sb.lifecycle = 'restoring'
+                         AND (sb.managed_by = $1 OR sb.evacuation_restore_target IS NULL)
+                         AND ({pin_pre_claim} OR NOT {unordered_in_window}))
+                        OR ((sb.lifecycle <> 'restoring'
+                             OR (sb.managed_by = $2 AND sb.evacuation_restore_target IS NOT NULL))
+                            AND (sb.current_local_artifact_id IS NOT NULL OR NOT {unordered}))
+                    )
+                    AND (
                         (sb.managed_by = $1 AND (
-                            sb.lifecycle = 'suspended' OR {retry_source}
+                            (sb.lifecycle = 'suspended'
+                             AND ({marked}
+                                  OR (sb.current_local_artifact_id IS NULL
+                                      AND {suspend_capture}
+                                      AND NOT {outranked_by_generation})))
+                            OR (sb.lifecycle = 'restoring'
+                                AND CASE WHEN {pin_pre_claim} THEN ({marked} AND {window})
+                                         ELSE ({retry_source} OR ({marked} AND {window})) END)
                         ))
                         OR (sb.managed_by = $2
                             AND sn.state = 'ready'
@@ -102,7 +138,9 @@ static SANDBOX_POPULATION_QUERY: LazyLock<String> = LazyLock::new(|| {
                             AND (
                                 (sb.evacuation_restore_target IS NOT NULL AND (
                                     {marked}
-                                    OR (sb.current_local_artifact_id IS NULL AND {newest_full})
+                                    OR (sb.current_local_artifact_id IS NULL
+                                        AND {suspend_capture}
+                                        AND {newest_suspend})
                                 ))
                                 OR (sb.evacuation_restore_target IS NULL
                                     AND sb.lifecycle = 'suspended'
@@ -110,13 +148,16 @@ static SANDBOX_POPULATION_QUERY: LazyLock<String> = LazyLock::new(|| {
                                         {marked}
                                         OR (
                                             sb.current_local_artifact_id IS NULL
+                                            AND {suspend_capture}
                                             AND (sb.placement_changed_at IS NULL
-                                                 OR sn.timestamp >= sb.placement_changed_at)
+                                                 OR {captured} >= sb.placement_changed_at)
+                                            AND NOT {outranked_by_generation}
                                         )
                                     ))
                                 OR (sb.evacuation_restore_target IS NULL
                                     AND sb.lifecycle = 'restoring'
-                                    AND {retry_source})
+                                    AND CASE WHEN {pin_pre_claim} THEN ({marked} AND {window})
+                                             ELSE ({retry_source} OR ({marked} AND {window})) END)
                             ))
                     ))
                    -- A failed sandbox the repair loop can revert to suspended,
@@ -136,9 +177,17 @@ static SANDBOX_POPULATION_QUERY: LazyLock<String> = LazyLock::new(|| {
                        )
                        -- Repair clears a marker no current backup holds, then
                        -- restores as a markerless sandbox would.
-                       AND ({marked} OR sb.current_local_artifact_id IS NULL OR {stale_marker}))
+                       AND (({marked} AND NOT {stale_marker})
+                            OR ((sb.current_local_artifact_id IS NULL OR {stale_marker})
+                                AND {suspend_capture}
+                                AND NOT {outranked_by_generation})))
                )
-             ORDER BY sn.timestamp DESC, sn.id DESC
+             -- A failed row's stale marker is cleared by the repair before it
+             -- restores, so it doesn't decide.
+             ORDER BY (CASE WHEN sb.lifecycle = 'failed' AND {stale_marker} THEN FALSE
+                            ELSE {marked} END) DESC NULLS LAST,
+                      {captured} DESC,
+                      sn.local_artifact_id DESC NULLS LAST, sn.timestamp DESC, sn.id DESC
              LIMIT 1
          ) current_snapshot ON TRUE
          CROSS JOIN LATERAL (
@@ -165,16 +214,20 @@ static SANDBOX_POPULATION_QUERY: LazyLock<String> = LazyLock::new(|| {
 /// restore would pick:
 ///
 /// * **Direct** (`direct_restore_candidates_for_mode`) restores from the
-///   artifact its source node holds, so it takes the newest full snapshot in
-///   any upload state, or, for a restoring sandbox, the newest from before the
-///   restore began, by the shared retry-source rule.
+///   artifact its source node holds, so it takes the full snapshot of its
+///   pinned artifact, or else the latest capture, in any upload state, or,
+///   for a restoring sandbox, the newest from before the restore began, by
+///   the shared retry-source rule. When none qualifies, as for an unordered
+///   history its own-node restore still loads, the source node's
+///   `suspended` observation binds it.
 /// * **Kubernetes** (`selected_suspend_restore_storage_uri`) restores from a
 ///   durable copy, so it takes the newest `ready` full snapshot with a live
 ///   storage location. While a node drain evacuates the sandbox, that's the
 ///   one holding its current local artifact, or, with no artifact marker,
 ///   the newest full snapshot. Otherwise a suspended sandbox takes the one
-///   holding its current local artifact, or, with no marker, one taken since
-///   its last placement, and a restoring sandbox takes the retry source.
+///   holding its current local artifact, or, with no marker, the latest
+///   capture by generation taken since its last placement, and a restoring
+///   sandbox takes the retry source.
 ///
 /// A failed sandbox whose observation looks live, as the repair loop reads
 /// it (a status other than `failed`, a pid, or the sandbox still assigned to
@@ -184,15 +237,19 @@ static SANDBOX_POPULATION_QUERY: LazyLock<String> = LazyLock::new(|| {
 /// Kubernetes sandbox the repair loop can revert to `suspended`
 /// (`failed_repair_revert_eligibility`) is bound by the snapshot it would then
 /// restore from: its newest ready full snapshot with a live storage location,
-/// the marked one if a current backup holds its marker. Placement freshness
+/// the marked one only if a current backup holds its marker; otherwise the
+/// repair clears the marker and it's bound as unpinned. Placement freshness
 /// doesn't apply: a failed transition leaves its placement stamps unreliable.
 /// Any other failed sandbox can't run again and has no record. The repair
 /// loop's age and restore-lease guards aren't modelled, so this can count as
 /// runnable a row the loop would still skip, which only asks for `strand`
 /// more often.
 ///
-/// A suspended or restoring sandbox with no such snapshot has no restore
-/// source and counts as unrecorded.
+/// Both take the latest by the capture's first registration, as the shared
+/// selector does, and both refuse an unordered history
+/// (`restore_order_unordered`) outside the pinned artifact. A suspended or
+/// restoring sandbox with no such snapshot has no restore source and counts
+/// as unrecorded.
 /// Every other sandbox's binding comes from the execution metadata its node
 /// last published. Unbound records (legacy work) aren't attributed to an
 /// environment here: that needs the legacy-equivalence rule, which only a

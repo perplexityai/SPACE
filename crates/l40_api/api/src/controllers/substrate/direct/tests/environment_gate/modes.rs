@@ -153,44 +153,50 @@ async fn the_last_known_fallback_by_mode() -> TestResult {
     Ok(())
 }
 
+/// One case per environment in [`TEMPLATES`] and ready node as the source,
+/// so each case restores one sandbox, and the cases run in parallel.
+#[rstest::rstest]
 #[tokio::test(flavor = "current_thread")]
-async fn restore_candidates_by_mode() -> TestResult {
+async fn restore_candidates_by_mode(
+    #[values(Some(E1), Some(E0), None)] environment: Option<&str>,
+    #[values(0, 1, 2, 3, 4, 5)] source: usize,
+) -> TestResult {
     let Some(fixture) = postgres_fixture().await? else {
         return Ok(());
     };
     let nodes = seed_nodes(&fixture.pool, "9.0.0").await?;
 
-    // Restoring from each ready node in turn checks the source statement
-    // against every kind of node, and the remote one against the rest.
-    for source in nodes.ready() {
-        let others: BTreeSet<NodeId> = nodes.ready().into_iter().filter(|n| *n != source).collect();
-        for (_, environment) in TEMPLATES {
-            let sandbox_id = suspended_sandbox(&fixture.pool, source, environment, "9.0.0").await?;
-            let why = format!("{environment:?} from the node at {source}");
-            let (off, off_counted) = restore(&fixture, Off, sandbox_id).await?;
-            let (shadow, shadow_counted) = restore(&fixture, Shadow, sandbox_id).await?;
-            let (on, on_counted) = restore(&fixture, On, sandbox_id).await?;
-            assert_eq!(off, (Some(source), others.clone()), "{why}, off");
-            assert_eq!(shadow, off, "{why}: shadow places as off");
-            let admitted = nodes.admitted(environment);
-            assert_eq!(
-                on,
-                (
-                    admitted.contains(&source).then_some(source),
-                    others.intersection(&admitted).copied().collect()
-                ),
-                "{why}, on"
-            );
-            assert_eq!(off_counted, Refusals::new(), "{why}: off counts nothing");
-            assert_eq!(on_counted, Refusals::new(), "{why}: on counts nothing");
-            let mut expected = nodes.refusals("restore_source", &[source].into(), environment);
-            expected.extend(nodes.refusals("restore_remote", &others, environment));
-            assert_eq!(
-                shadow_counted, expected,
-                "{why}: shadow counts what on refuses"
-            );
-        }
-    }
+    // Restoring from each ready node, one per case, checks the source
+    // statement against every kind of node, and the remote one against the
+    // rest.
+    let ready = nodes.ready();
+    assert_eq!(ready.len(), 6, "a case per ready node");
+    let source = *ready.iter().nth(source).expect("ready node");
+    let others: BTreeSet<NodeId> = ready.into_iter().filter(|n| *n != source).collect();
+    let sandbox_id = suspended_sandbox(&fixture.pool, source, environment, "9.0.0").await?;
+    let why = format!("{environment:?} from the node at {source}");
+    let (off, off_counted) = restore(&fixture, Off, sandbox_id).await?;
+    let (shadow, shadow_counted) = restore(&fixture, Shadow, sandbox_id).await?;
+    let (on, on_counted) = restore(&fixture, On, sandbox_id).await?;
+    assert_eq!(off, (Some(source), others.clone()), "{why}, off");
+    assert_eq!(shadow, off, "{why}: shadow places as off");
+    let admitted = nodes.admitted(environment);
+    assert_eq!(
+        on,
+        (
+            admitted.contains(&source).then_some(source),
+            others.intersection(&admitted).copied().collect()
+        ),
+        "{why}, on"
+    );
+    assert_eq!(off_counted, Refusals::new(), "{why}: off counts nothing");
+    assert_eq!(on_counted, Refusals::new(), "{why}: on counts nothing");
+    let mut expected = nodes.refusals("restore_source", &[source].into(), environment);
+    expected.extend(nodes.refusals("restore_remote", &others, environment));
+    assert_eq!(
+        shadow_counted, expected,
+        "{why}: shadow counts what on refuses"
+    );
     Ok(())
 }
 

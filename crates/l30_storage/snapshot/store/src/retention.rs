@@ -62,7 +62,7 @@ pub async fn candidates(
                  EXTRACT(EPOCH FROM (NOW() - s.timestamp))::BIGINT AS age_secs
              FROM (
                  SELECT id, sandbox_id, type, state, timestamp, local_artifact_id, artifact_kind,
-                        artifact_origin
+                        artifact_origin, generation
                    FROM snapshots
                   WHERE id >= $5::UUID AND id <= $6::UUID
                     AND id = ANY($3::UUID[])

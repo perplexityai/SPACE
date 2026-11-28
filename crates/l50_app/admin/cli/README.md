@@ -367,6 +367,49 @@ What doesn't help:
 - `terminate-node` is accepted only from `drained` and returns 409 while the
   node has active residents or drain blockers. It has no override.
 
+### Restore refused: captures can't be ordered
+
+An unpinned sandbox whose captures can't be ordered refuses to restore off
+its node. That's a suspend capture with no recorded capture generation, in
+a history where another capture has one, that no later execution's capture
+orders. A capture with a generation orders it, as older, in one of two ways:
+
+- the execution that took that capture started after this one registered;
+- or the control plane has no record of that execution, which is always so
+  on Direct, and that capture first registered after this one and records a
+  higher generation than every capture with a generation registered up to
+  this one.
+
+A named snapshot or a stop's backup never counts. Either capture could hold
+the sandbox's latest state, so the control plane won't guess. The message
+says `its captures can't be ordered`:
+
+- `412` when nothing can restore it: an evacuation, a sandbox with no source
+  node, or a source node that's gone or deregistered;
+- `503` while its source node is still registered but can't take the restore
+  now: on Direct, a node that isn't a restore candidate, and on Kubernetes, a
+  node that isn't ready. It restores there once the node can;
+- `FAILED_PRECONDITION` to a node asking where to restore from.
+
+The drain and drained-node terminator keep the sandbox `suspended` rather
+than failing it. A restore on the node that still holds the sandbox works.
+
+When the node no longer holds the sandbox, the restore refuses until a
+capture is pinned.
+
+### Restore refused: a capture is ahead of the clock
+
+A restore that starts from `suspended`, a drain's evacuation of a suspended
+sandbox included, answers `503` with
+`a registered capture is stamped ahead of the database clock` when one of the
+sandbox's snapshot rows carries a timestamp later than the database's clock,
+which happens when that clock stepped backward after the row was written. The
+refusal writes nothing and spends no activation admission. Retry: the restore
+goes through once the clock has passed that timestamp. A drain counts the
+refusal as a failed restore attempt and retries it on its backoff. A drain's
+evacuation of a stopped sandbox isn't refused: it loads the disk artifact the
+sandbox pins and reads no timestamp.
+
 ## Warm pools
 
 `warm-pool create` creates or updates a cluster warm-pool config through

@@ -2598,7 +2598,12 @@ is stranded.
    own: the running execution just took the capture, the record the
    capturing teardown published with it names it, or an earlier upload of
    the same bytes recorded it so
-   (`BeginArtifactBackupRequest.execution_generation_names_capture`). A
+   (`BeginArtifactBackupRequest.execution_generation_names_capture`). While
+   the catalog retains a backup of an artifact that records a generation,
+   every later backup of that artifact inherits it, whatever its own
+   registration says, so a re-upload keeps its capture's place; if no
+   generation-bearing backup of that artifact remains, the next backup uses
+   its submitted generation or records none. A
    generation the node only infers fences the registration but records
    nothing: one from a teardown still running when it re-uploads an
    unrecorded capture, or one startup recovery recorded. A teardown that

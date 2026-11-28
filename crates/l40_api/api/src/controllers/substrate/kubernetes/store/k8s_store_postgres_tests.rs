@@ -17,6 +17,7 @@ use pplx_space_test_env::TestResult;
 mod cleanup_recovery_lifecycle_matrix_tests;
 mod delete_publication_lock_order_tests;
 mod drain_recovery_gate_tests;
+mod fresh_claim_clock_tests;
 mod lifecycle_writer_tests;
 mod materialization_record_tests;
 mod node_registration_tests;
@@ -31,6 +32,7 @@ mod stopped_restore_selector_tests;
 mod substrate_scope_tests;
 mod suspend_lifecycle_matrix_tests;
 mod unplace_lifecycle_matrix_tests;
+use fresh_claim_clock_tests::a_fresh_claim_is_retryable_while_a_capture_is_ahead_of_the_clock;
 use node_registration_tests::{
     RegistrationCaller, RegistrationFootprint, insert_placeable_sandbox, registration_footprint,
 };
@@ -45,6 +47,7 @@ use restore_dispatch_fence_tests::{
     the_markerless_lease_claim_takes_over_an_expired_fence,
 };
 use restore_revert_tests::{
+    a_failed_restore_revert_keeps_a_window_only_the_retry_can_order,
     failed_restore_revert_retires_only_its_own_proven_execution,
     without_retirement_a_failed_restore_revert_moves_only_the_lifecycle,
 };
@@ -1519,6 +1522,7 @@ mod k8s_store_postgres_behaviors {
         forget_pod_tracking_defers_to_suspend_finalization,
         explicit_teardown_forget_retires_execution_while_suspending,
         forget_pod_tracking_recovers_markerless_restoring_with_ready_snapshot,
+        forget_pod_tracking_keeps_the_pin_of_an_unordered_restoring_row,
         forget_pod_tracking_keeps_restoring_when_recovery_is_not_safe,
         forget_pod_tracking_recovers_started_suspended_by_node_after_current_backup,
         forget_pod_tracking_keeps_started_without_current_suspend_backup,
@@ -1542,6 +1546,7 @@ mod k8s_store_postgres_behaviors {
         stopped_disk_selector_ignores_a_full_artifact_and_a_foreign_disk_artifact,
         stopped_disk_selector_agrees_with_the_retention_never_prune_guard,
         restoring_retry_uses_pre_restore_snapshot_when_late_branch_publishes_artifact,
+        evacuation_redrive_restores_the_newest_capture_the_retry_rule_passes_over,
         restoring_retry_refuses_prior_placement_snapshot_after_late_branch_artifact,
         restoring_retry_refuses_markerless_snapshot_after_late_branch_artifact,
         restoring_sandbox_selects_newest_ready_snapshot_after_placement_bump,
@@ -1555,6 +1560,7 @@ mod k8s_store_postgres_behaviors {
         begin_restore_lifecycle_preserves_retry_and_marker_claim_rules,
         evacuation_claim_takes_only_a_released_stopped_evacuation,
         a_fresh_stopped_claim_is_not_rolled_back_on_a_clean_failure,
+        a_fresh_claim_is_retryable_while_a_capture_is_ahead_of_the_clock,
         user_restore_lease_blocks_concurrent_redrive_until_expiry,
         expired_restore_lease_with_live_execution_stays_in_flight,
         a_dead_owners_unsent_restore_is_taken_over_once_its_fence_expires,
@@ -1569,6 +1575,7 @@ mod k8s_store_postgres_behaviors {
         restore_rollback_requires_fresh_claim_and_clean_failure,
         failed_restore_revert_retires_only_its_own_proven_execution,
         without_retirement_a_failed_restore_revert_moves_only_the_lifecycle,
+        a_failed_restore_revert_keeps_a_window_only_the_retry_can_order,
         owned_restore_completion_requires_its_lease_and_a_routable_execution,
         started_recovery_followers_succeed_only_on_a_started_sandbox,
         prepare_wake_preserves_restore_source_boundary,
@@ -5298,6 +5305,165 @@ async fn explicit_teardown_forget_retires_execution_while_suspending(
     Ok(())
 }
 
+/// A failed restore's cleanup doesn't unpin a row whose history is
+/// unordered: unpinned, its next restore would refuse where the pin restores.
+/// It stays `restoring`, pinned, for the sweeper's revert, which keeps the
+/// pin.
+async fn forget_pod_tracking_keeps_the_pin_of_an_unordered_restoring_row(
+    fixture: &PostgresStore,
+) -> TestResult {
+    let sandbox_id = SandboxId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, "restoring").await?;
+    let (stamped, pinned) = (LocalArtifactId::new(), LocalArtifactId::new());
+    // The pinned capture records no generation and registered after one that
+    // does: unordered. Both registered before the restore's claim.
+    for (artifact, generation, minutes_before) in [(stamped, Some(5_i64), 30), (pinned, None, 20)] {
+        let snapshot_id = Uuid::now_v7();
+        sqlx::query(sql!(
+            "INSERT INTO snapshots (
+                 id, sandbox_id, type, state, timestamp, local_artifact_id, artifact_kind,
+                 artifact_origin, generation
+             )
+             SELECT $1, $2, 'full', 'ready',
+                    s.lifecycle_changed_at - make_interval(mins => $4::INT), $3, 'full',
+                    'suspend', $5
+               FROM sandboxes s
+              WHERE s.id = $2"
+        ))
+        .bind(snapshot_id)
+        .bind(sandbox_id)
+        .bind(artifact)
+        .bind(minutes_before)
+        .bind(generation)
+        .execute(&fixture.pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string)
+             VALUES ($1, 's3://space-test/unordered-restore?region=us-east-1')"
+        ))
+        .bind(snapshot_id)
+        .execute(&fixture.pool)
+        .await?;
+    }
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+         SET current_local_artifact_id = $2,
+             current_local_artifact_kind = 'full',
+             current_local_artifact_origin = 'suspend',
+             placement = 'on_node',
+             placement_changed_at = NOW()
+         WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(pinned)
+    .execute(&fixture.pool)
+    .await?;
+    let execution = fixture
+        .store
+        .ensure_active_execution_row(sandbox_id)
+        .await?;
+
+    let forgotten = fixture
+        .store
+        .forget_pod_tracking_if_generation(
+            sandbox_id,
+            execution.generation,
+            PodTrackingCleanupCause::MissingPodObservation,
+        )
+        .await?;
+    // The cleanup ran: it retired the execution, and only the revert refused.
+    assert!(forgotten, "cleanup must run on the restoring row");
+    assert!(
+        fixture
+            .store
+            .active_execution_status(sandbox_id)
+            .await?
+            .is_none()
+    );
+
+    let (lifecycle, pin): (String, Option<LocalArtifactId>) = sqlx::query_as(sql!(
+        "SELECT lifecycle, current_local_artifact_id FROM sandboxes WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&fixture.pool)
+    .await?;
+    assert_eq!(lifecycle, "restoring");
+    assert_eq!(pin, Some(pinned));
+
+    // A pinned pre-claim capture outranked by a post-claim snapshot is also
+    // kept pinned in `restoring`, rather than stripped to an unpinned
+    // `suspended` row that would restore the post-claim snapshot.
+    let post_claim_sandbox = SandboxId::new();
+    insert_sandbox(&fixture.pool, post_claim_sandbox, "restoring").await?;
+    let (pre_claim_pinned, post_claim_artifact) = (LocalArtifactId::new(), LocalArtifactId::new());
+    for (artifact, generation, offset_mins) in
+        [(pre_claim_pinned, 5_i64, -20), (post_claim_artifact, 6, 5)]
+    {
+        let snapshot_id = Uuid::now_v7();
+        sqlx::query(sql!(
+            "INSERT INTO snapshots (
+                 id, sandbox_id, type, state, timestamp, local_artifact_id, artifact_kind,
+                 artifact_origin, generation
+             )
+             SELECT $1, $2, 'full', 'ready',
+                    s.lifecycle_changed_at + make_interval(mins => $4::INT), $3, 'full',
+                    'suspend', $5
+               FROM sandboxes s
+              WHERE s.id = $2"
+        ))
+        .bind(snapshot_id)
+        .bind(post_claim_sandbox)
+        .bind(artifact)
+        .bind(offset_mins)
+        .bind(generation)
+        .execute(&fixture.pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string)
+             VALUES ($1, 's3://space-test/post-claim-pinned?region=us-east-1')"
+        ))
+        .bind(snapshot_id)
+        .execute(&fixture.pool)
+        .await?;
+    }
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+         SET current_local_artifact_id = $2,
+             current_local_artifact_kind = 'full',
+             current_local_artifact_origin = 'suspend',
+             placement = 'on_node',
+             placement_changed_at = NOW()
+         WHERE id = $1"
+    ))
+    .bind(post_claim_sandbox)
+    .bind(pre_claim_pinned)
+    .execute(&fixture.pool)
+    .await?;
+    let post_claim_exec = fixture
+        .store
+        .ensure_active_execution_row(post_claim_sandbox)
+        .await?;
+    assert!(
+        fixture
+            .store
+            .forget_pod_tracking_if_generation(
+                post_claim_sandbox,
+                post_claim_exec.generation,
+                PodTrackingCleanupCause::MissingPodObservation,
+            )
+            .await?
+    );
+    let (lifecycle, pin): (String, Option<LocalArtifactId>) = sqlx::query_as(sql!(
+        "SELECT lifecycle, current_local_artifact_id FROM sandboxes WHERE id = $1"
+    ))
+    .bind(post_claim_sandbox)
+    .fetch_one(&fixture.pool)
+    .await?;
+    assert_eq!(lifecycle, "restoring");
+    assert_eq!(pin, Some(pre_claim_pinned));
+    Ok(())
+}
+
 async fn forget_pod_tracking_recovers_markerless_restoring_with_ready_snapshot(
     fixture: &PostgresStore,
 ) -> TestResult {
@@ -7495,6 +7661,80 @@ async fn restoring_retry_uses_pre_restore_snapshot_when_late_branch_publishes_ar
     assert_eq!(
         uri.as_deref(),
         Some("s3://space-test/g2-source?region=us-east-1")
+    );
+    Ok(())
+}
+
+/// A node drain's re-drive of its own evacuation restore isn't the user
+/// restore's retry: it reads the newest full capture, as its first attempt
+/// does, where the retry rule over the same rows reads the capture the
+/// restore started from. The drain releases the source node on that
+/// newest-capture rule, so its restore has to load by the same one on every
+/// attempt.
+async fn evacuation_redrive_restores_the_newest_capture_the_retry_rule_passes_over(
+    fixture: &PostgresStore,
+) -> TestResult {
+    // Arrange.
+    let sandbox_id = SandboxId::new();
+    let source_artifact_id = LocalArtifactId::new();
+    let late_branch_artifact_id = LocalArtifactId::new();
+
+    insert_sandbox(&fixture.pool, sandbox_id, "restoring").await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+         SET evacuation_restore_target = 'started',
+             current_local_artifact_id = $2,
+             current_local_artifact_kind = 'full',
+             current_local_artifact_origin = 'suspend'
+         WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(late_branch_artifact_id)
+    .execute(&fixture.pool)
+    .await?;
+    insert_ready_full_snapshot_relative_to_lifecycle(
+        &fixture.pool,
+        sandbox_id,
+        "s3://space-test/g2-source?region=us-east-1",
+        -1,
+        Some(source_artifact_id),
+    )
+    .await?;
+    insert_ready_full_snapshot_relative_to_lifecycle(
+        &fixture.pool,
+        sandbox_id,
+        "s3://space-test/g3-late-branch?region=us-east-1",
+        1,
+        Some(late_branch_artifact_id),
+    )
+    .await?;
+    let claim = fixture
+        .store
+        .begin_restore_lifecycle(sandbox_id, true)
+        .await?;
+    assert_evacuation_redrive_restore_claim(claim);
+    let sandbox = fixture.store.require_sandbox(sandbox_id).await?;
+
+    // Act.
+    let evacuation = fixture
+        .store
+        .selected_suspend_restore_storage_uri(&sandbox, RestoreSnapshotChoice::NewestRemote)
+        .await?;
+    let retry_rule = fixture
+        .store
+        .selected_suspend_restore_storage_uri(&sandbox, RestoreSnapshotChoice::SourceNodeOrFresh)
+        .await?;
+
+    // Assert.
+    assert_eq!(
+        evacuation.as_deref(),
+        Some("s3://space-test/g3-late-branch?region=us-east-1"),
+        "the drain's re-drive loads the newest full capture"
+    );
+    assert_eq!(
+        retry_rule.as_deref(),
+        Some("s3://space-test/g2-source?region=us-east-1"),
+        "the retry rule loads the capture the restore started from"
     );
     Ok(())
 }

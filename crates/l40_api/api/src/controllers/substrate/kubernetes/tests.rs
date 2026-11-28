@@ -32,6 +32,7 @@ mod runtime_upgrade_dispatch;
 mod slot_headroom;
 mod stopped_start_stale_pod;
 mod substrate_scope;
+mod unordered_restore_source_refusal;
 
 mod kubernetes_tests {
 
@@ -2033,7 +2034,8 @@ mod kubernetes_tests {
         /// Every Wake received, in arrival order.
         pub(crate) received:
             Arc<std::sync::Mutex<Vec<pplx_space_sbx_mgr_client::proto::WakeRequest>>>,
-        /// When set, every Wake is answered with this status instead.
+        /// When set, every Wake from `succeed_after_attempt` on is answered
+        /// with this status instead of succeeding.
         pub(crate) rejection: Arc<std::sync::Mutex<Option<tonic::Status>>>,
     }
 
@@ -2099,9 +2101,6 @@ mod kubernetes_tests {
             let request = request.into_inner();
             self.received.lock().unwrap().push(request.clone());
             let attempt = self.wake_attempts.fetch_add(1, Ordering::SeqCst) + 1;
-            if let Some(rejection) = self.rejection.lock().unwrap().clone() {
-                return Err(rejection);
-            }
             if self
                 .succeed_after_attempt
                 .is_none_or(|succeed_after| attempt < succeed_after)
@@ -2109,6 +2108,9 @@ mod kubernetes_tests {
                 return Err(tonic::Status::failed_precondition(
                     pplx_space_rpc_contracts::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER,
                 ));
+            }
+            if let Some(rejection) = self.rejection.lock().unwrap().clone() {
+                return Err(rejection);
             }
             Ok(tonic::Response::new(
                 pplx_space_sbx_mgr_client::proto::WakeResponse {
@@ -2565,6 +2567,38 @@ mod kubernetes_tests {
         timestamp_offset_secs: i64,
         artifact_id: Uuid,
     ) -> Result<(), BoxError> {
+        insert_ready_full_snapshot(
+            pool,
+            sandbox_id,
+            storage_uri,
+            Some(timestamp_offset_secs),
+            artifact_id,
+        )
+        .await
+    }
+
+    /// A ready capture registered now, by the database clock: after every row
+    /// the fixture wrote before it, and not ahead of the clock. A fresh restore
+    /// claim refuses a sandbox with a capture stamped ahead of the clock, so a
+    /// fixture that goes on to claim registers its capture this way.
+    pub(crate) async fn insert_ready_full_snapshot_at_the_clock(
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+        storage_uri: &str,
+        artifact_id: Uuid,
+    ) -> Result<(), BoxError> {
+        insert_ready_full_snapshot(pool, sandbox_id, storage_uri, None, artifact_id).await
+    }
+
+    /// Stamped `timestamp_offset_secs` from the row's `lifecycle_changed_at`,
+    /// or at the database clock when `None`.
+    async fn insert_ready_full_snapshot(
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+        storage_uri: &str,
+        timestamp_offset_secs: Option<i64>,
+        artifact_id: Uuid,
+    ) -> Result<(), BoxError> {
         let snapshot_id = SnapshotId::new();
         sqlx::query(
             "INSERT INTO snapshots
@@ -2575,8 +2609,10 @@ mod kubernetes_tests {
                  $2,
                  'full',
                  'ready',
-                 (SELECT lifecycle_changed_at + make_interval(secs => $3::BIGINT)
-                    FROM sandboxes WHERE id = $2),
+                 CASE WHEN $3::BIGINT IS NULL THEN clock_timestamp()
+                      ELSE (SELECT lifecycle_changed_at + make_interval(secs => $3::BIGINT)
+                              FROM sandboxes WHERE id = $2)
+                 END,
                  '00000000-0000-0000-0000-000000000001',
                  $4,
                  'full',
@@ -2624,14 +2660,6 @@ mod kubernetes_tests {
         .bind(sandbox_id)
         .execute(pool)
         .await?;
-        insert_ready_full_snapshot_relative_to_lifecycle(
-            pool,
-            sandbox_id,
-            "s3://space-test/suspend-snapshots/paused?region=us-east-1",
-            1,
-            Uuid::now_v7(),
-        )
-        .await?;
         let node_id = test_worker_node_id();
         sqlx::query(
             "INSERT INTO nodes (id, address, role, managed_by, state)
@@ -2659,6 +2687,15 @@ mod kubernetes_tests {
         .bind(format!("{pod_name}-uid"))
         .bind(route_activation_id)
         .execute(pool)
+        .await?;
+        // The suspend's capture, registered after the placement and the
+        // execution it came from.
+        insert_ready_full_snapshot_at_the_clock(
+            pool,
+            sandbox_id,
+            "s3://space-test/suspend-snapshots/paused?region=us-east-1",
+            Uuid::now_v7(),
+        )
         .await?;
         let initial_pod = Pod {
             metadata: kube::api::ObjectMeta {
@@ -2997,22 +3034,30 @@ mod kubernetes_tests {
         Ok(())
     }
 
+    /// A failed Wake releases its operation owner only when it left no
+    /// node-side work or receipt behind: nothing was sent, or the only send
+    /// was refused before staging. A refused send still counts as dispatched.
     #[test]
-    fn only_a_proven_no_send_wake_failure_may_release_the_operation() {
-        let failure = |dispatch| ActivationWakeFailure {
-            error: SubstrateError::Unavailable {
-                message: "test".to_string(),
-            },
-            dispatch,
-        };
-        assert!(
-            failure(WakeDispatchStatus::NotDispatched).operation_release_is_safe(),
-            "pre-dispatch failure has no node-side work or receipt to preserve"
-        );
-        assert!(
-            !failure(WakeDispatchStatus::MayHaveLanded).operation_release_is_safe(),
-            "post-dispatch uncertainty must retain ownership for delayed convergence"
-        );
+    fn only_a_wake_failure_that_left_no_node_work_may_release_the_operation() {
+        let cases = [
+            (WakeDispatchStatus::NotDispatched, false, true),
+            (WakeDispatchStatus::RefusedBeforeStaging, true, true),
+            (WakeDispatchStatus::MayHaveLanded, true, false),
+        ];
+        for (dispatch, was_dispatched, release_is_safe) in cases {
+            let failure = ActivationWakeFailure {
+                error: SubstrateError::Unavailable {
+                    message: "test".to_string(),
+                },
+                dispatch,
+            };
+            assert_eq!(failure.was_dispatched(), was_dispatched, "{dispatch:?}");
+            assert_eq!(
+                failure.operation_release_is_safe(),
+                release_is_safe,
+                "{dispatch:?}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11631,6 +11676,122 @@ mod kubernetes_tests {
         Ok(())
     }
 
+    /// An unpinned sandbox whose history is unordered (a capture without a
+    /// generation registered after one with a generation) gets no remote
+    /// source. A restore on
+    /// its own node goes to that node without a URI, to load the local copy
+    /// it suspended with there, while that node is ready; while it's
+    /// registered but not ready, the restore is retryable. An evacuation, or
+    /// a restore with no source node, is refused with the reason: 412, never
+    /// a retryable wait.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unordered_history_restores_only_on_its_source_node() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        let node_id = NodeId::new();
+        insert_test_sandbox_row(&pool, sandbox_id, "suspended").await?;
+        sqlx::query(
+            "INSERT INTO nodes (id, address, role, managed_by, state)
+             VALUES ($1, '10.0.0.11', 'worker', 'k8s', 'ready')",
+        )
+        .bind(node_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query("INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, 'source-node')")
+            .bind(node_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("UPDATE sandboxes SET target_node_id = $2 WHERE id = $1")
+            .bind(sandbox_id)
+            .bind(node_id)
+            .execute(&pool)
+            .await?;
+        let with_generation = "s3://space-test/suspend-snapshots/with-generation?region=us-east-1";
+        insert_ready_full_snapshot_relative_to_lifecycle(
+            &pool,
+            sandbox_id,
+            with_generation,
+            60,
+            Uuid::now_v7(),
+        )
+        .await?;
+        insert_ready_full_snapshot_relative_to_lifecycle(
+            &pool,
+            sandbox_id,
+            "s3://space-test/suspend-snapshots/no-generation?region=us-east-1",
+            120,
+            Uuid::now_v7(),
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE snapshots sn SET generation = 5
+               FROM snapshot_storage_locations ssl
+              WHERE ssl.snapshot_id = sn.id AND ssl.storage_connection_string = $1",
+        )
+        .bind(with_generation)
+        .execute(&pool)
+        .await?;
+        let substrate = substrate_with_store_and_client(
+            pool.clone(),
+            mock_kubernetes_client(Arc::new(Mutex::new(Vec::new()))),
+        );
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("inserted sandbox must be visible");
+
+        let plan = substrate
+            .suspend_restore_plan(&sandbox, RestoreSnapshotChoice::SourceNodeOrFresh)
+            .await?;
+        assert_eq!(plan.source_node_name.as_deref(), Some("source-node"));
+        assert_eq!(plan.storage_uri, None);
+
+        // The source node is registered but not ready: a node-only pod there
+        // wouldn't come up now, and it may come back, so it's retryable.
+        sqlx::query("UPDATE nodes SET state = 'registered' WHERE id = $1")
+            .bind(node_id)
+            .execute(&pool)
+            .await?;
+        assert!(matches!(
+            substrate
+                .suspend_restore_plan(&sandbox, RestoreSnapshotChoice::SourceNodeOrFresh)
+                .await,
+            Err(SubstrateError::Unavailable { message }) if message.contains("can't be ordered")
+        ));
+        sqlx::query("UPDATE nodes SET state = 'ready' WHERE id = $1")
+            .bind(node_id)
+            .execute(&pool)
+            .await?;
+
+        let refused = |result: Result<_, SubstrateError>| {
+            matches!(
+                result,
+                Err(SubstrateError::RestoreContextUnavailable { message })
+                    if message.contains("can't be ordered")
+            )
+        };
+        assert!(refused(
+            substrate
+                .suspend_restore_plan(&sandbox, RestoreSnapshotChoice::NewestRemote)
+                .await
+        ));
+        sqlx::query(
+            "UPDATE sandboxes SET target_node_id = NULL, active_node_id = NULL WHERE id = $1",
+        )
+        .bind(sandbox_id)
+        .execute(&pool)
+        .await?;
+        let unplaced = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("inserted sandbox must be visible");
+        assert!(refused(
+            substrate
+                .suspend_restore_plan(&unplaced, RestoreSnapshotChoice::SourceNodeOrFresh)
+                .await
+        ));
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn expired_restore_redrive_with_vanished_source_uses_remote_snapshot_without_hard_pin()
     -> Result<(), BoxError> {
@@ -15387,6 +15548,14 @@ mod kubernetes_tests {
         assert_eq!(
             disposition,
             WakeRpcErrorDisposition::ReadinessPoll("missing_runtime_context")
+        );
+
+        let unordered = pplx_space_sbx_mgr_client::restore_source_unordered_status(
+            "sandbox captures can't be ordered",
+        );
+        assert_eq!(
+            classify_wake_rpc_error(&unordered),
+            WakeRpcErrorDisposition::RestoreSourceUnordered
         );
     }
 

@@ -5,13 +5,14 @@
 
 use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_model::SandboxId;
-use pplx_space_snapshot_model::SnapshotId;
+use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 
 use std::sync::LazyLock;
 
 use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_portability::{
-    started_suspend_revert_eligibility, suspended_projection_lifecycle_eligible,
+    capture_registered_at, started_suspend_finalize_eligibility,
+    suspend_snapshot_is_current_capture, suspended_projection_lifecycle_eligible,
 };
 use pplx_space_sql_locator::sql;
 
@@ -27,6 +28,10 @@ pub struct ReadySuspendProjectionCandidate {
     pub source_node_id: NodeId,
     /// The row's stored lifecycle, the one the projection would leave.
     pub lifecycle: String,
+    /// The snapshot's artifact when it's this suspend's capture: nothing is
+    /// newer ([`suspend_snapshot_is_current_capture`]), so the projection
+    /// pins the row to it and the restore loads exactly it.
+    pub captured_artifact: Option<LocalArtifactId>,
 }
 
 /// Lock the sandbox that the ready full suspend snapshot `snapshot_id`
@@ -34,8 +39,13 @@ pub struct ReadySuspendProjectionCandidate {
 /// location, its sandbox is still active on its source node, the sandbox's
 /// lifecycle admits the projection ([`suspended_projection_lifecycle_eligible`],
 /// with the row's suspend-origin marker on this snapshot's artifact as
-/// committed evidence), and [`started_suspend_revert_eligibility`] holds.
-/// Empty when nothing qualifies.
+/// committed evidence), and [`started_suspend_finalize_eligibility`] holds:
+/// finalizing records the node's suspend and chooses no restore source.
+/// The snapshot's capture must also have first registered at or after the
+/// row's last lifecycle change ([`capture_registered_at`]): a later backup of
+/// an earlier capture (a re-upload of an earlier cycle's capture, or of a
+/// restore's source) isn't evidence that the row suspended since. Empty when
+/// nothing qualifies.
 ///
 /// `FOR UPDATE OF s`: the sandbox row lock lasts until the caller's
 /// transaction ends, so the caller's projection in the same transaction
@@ -50,7 +60,9 @@ where
 {
     /// Built once: every input is a literal or a bind placeholder.
     static QUERY: LazyLock<String> = LazyLock::new(|| {
-        let eligibility = started_suspend_revert_eligibility("s");
+        let eligibility = started_suspend_finalize_eligibility("s");
+        let current_capture = suspend_snapshot_is_current_capture("s", "sn");
+        let captured = capture_registered_at("sn");
         let lifecycle_eligible = suspended_projection_lifecycle_eligible(
             "s",
             "s.current_local_artifact_id = sn.local_artifact_id
@@ -61,7 +73,9 @@ where
             "SELECT s.id,
                     {clear_marker} AS clear_marker,
                     sn.source_node_id,
-                    s.lifecycle
+                    s.lifecycle,
+                    CASE WHEN {current_capture} THEN sn.local_artifact_id END
+                        AS captured_artifact
                FROM snapshots sn
                JOIN sandboxes s ON s.id = sn.sandbox_id
               WHERE sn.id = $1
@@ -70,6 +84,7 @@ where
                 AND (sn.artifact_origin IS NULL OR sn.artifact_origin = 'suspend')
                 AND sn.source_node_id IS NOT NULL
                 AND s.active_node_id = sn.source_node_id
+                AND (s.lifecycle_changed_at IS NULL OR {captured} >= s.lifecycle_changed_at)
                 AND {lifecycle_eligible}
                 AND EXISTS (
                     SELECT 1

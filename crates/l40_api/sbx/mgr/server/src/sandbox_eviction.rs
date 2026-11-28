@@ -306,10 +306,9 @@ pub(crate) enum SkipReason {
     /// `backup_completed_at` stamp couldn't be written, and the release's
     /// claim requires it. Counted by the teardown driver, not this loop.
     LocalArtifactStampFailed,
-    /// A retired execution's teardown release is held because the cluster
-    /// can't show the sandbox is durably restorable: the refused capture may
-    /// be its only copy. Counted by the teardown driver,
-    /// not this loop.
+    /// The cluster can't show the sandbox is durably restorable without the
+    /// local copy: an eviction, or a retired execution's teardown release,
+    /// would delete what may be its only restore path.
     NoBackedCopy,
 }
 
@@ -1585,6 +1584,43 @@ async fn evict_tick(
             }
             PreDecision::Evict(reason) => reason,
         };
+
+        // A backed-up copy isn't enough: the cluster must also restore the
+        // sandbox without this one. While its restore refuses (an unpinned
+        // row whose captures can't be ordered), the copy here is the only
+        // restore path.
+        let durably_restorable =
+            pplx_space_node_api_client::proto::backup_readiness_query::Artifact::DurablyRestorable(
+                true,
+            );
+        match backup_ready(&mut cluster, &sandbox_id, durably_restorable).await {
+            Ok(true) => {}
+            Ok(false) => {
+                record_continuing_candidate_skip(
+                    &mut report,
+                    scan_state,
+                    &sandbox_id,
+                    cursor,
+                    SkipReason::NoBackedCopy,
+                    scan_started,
+                );
+                continue;
+            }
+            Err(reason) => {
+                let flow = record_candidate_skip(
+                    &mut report,
+                    scan_state,
+                    &sandbox_id,
+                    cursor,
+                    reason,
+                    scan_started,
+                );
+                if flow == CandidateFlow::Stop {
+                    break;
+                }
+                continue;
+            }
+        }
 
         // The proven identity the eviction claim must re-assert: the
         // exact pinned artifact, or "still unpinned" for legacy rows.

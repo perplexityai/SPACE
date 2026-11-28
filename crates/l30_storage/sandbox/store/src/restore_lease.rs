@@ -24,13 +24,153 @@
 use std::sync::LazyLock;
 
 use pplx_space_node_model::SubstrateKind;
-use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId, SandboxLifecycle};
 
-use pplx_space_sandbox_portability::restore_retry_suspended_revert_snapshot_exists;
+use pplx_space_postgres_pool::{DbError, Executor};
+use pplx_space_sandbox_portability::{
+    restore_pinnable_pre_claim_capture_exists, restore_retry_pinnable_revert_snapshot_exists,
+    restore_retry_source_snapshot_exists, restore_retry_suspended_revert_snapshot_exists,
+    restore_revert_forfeits_source_window,
+};
 use pplx_space_sandbox_routability::routable_execution_or_non_k8s;
 use pplx_space_sql_locator::sql;
+use sqlx::{Acquire, Postgres, Transaction};
 use uuid::Uuid;
+
+/// Why a restore claim returned no outcome.
+#[derive(Debug, thiserror::Error)]
+pub enum RestoreClaimError {
+    /// A capture registered for the sandbox, or its last placement, is
+    /// stamped at or ahead of the database clock, so the claim was refused
+    /// and wrote nothing
+    /// ([`advance_fresh_restore_claim_cutoff`]). Retryable: the same claim
+    /// lands once the clock has passed that capture.
+    #[error(
+        "restore claim refused for sandbox {sandbox_id}: a registered capture is stamped ahead \
+         of the database clock; retry once the clock has passed it"
+    )]
+    CaptureAheadOfClock { sandbox_id: SandboxId },
+    #[error(transparent)]
+    Database(#[from] DbError),
+}
+
+/// Advance a fresh restore claim's `lifecycle_changed_at` past the lock wait on
+/// `sandboxes`, or refuse the claim.
+///
+/// `sandboxes_touch_lifecycle_changed_at` stamps `NOW()` (the transaction start
+/// time) when the claim flips `lifecycle` to `'restoring'`. Under `READ
+/// COMMITTED`, a backup `FOR KEY SHARE` holder can commit a row with
+/// `snapshots.timestamp` between that `NOW()` and the moment the claim's
+/// `FOR UPDATE` acquires the sandbox row lock. A lifecycle-preserving second
+/// `UPDATE` in the same transaction while still holding `FOR UPDATE` on
+/// `sandboxes` (`OLD.lifecycle = NEW.lifecycle = 'restoring'`, so the trigger
+/// leaves `lifecycle_changed_at` intact) moves the retry-window cutoff past
+/// `clock_timestamp()` and every backup row already committed for the sandbox,
+/// while post-claim backup registrations remain blocked on `FOR UPDATE` until
+/// the claim commits.
+///
+/// Every row this statement sees was registered before the claim, because a
+/// registration takes `FOR KEY SHARE` on the sandbox row. One of them can still
+/// be stamped ahead of the database clock: the clock stepped backward after it
+/// committed. No cutoff covers that row and stays at the clock. A cutoff below
+/// it leaves the newest capture out of the retry window, so the restore would
+/// take an older generation. A cutoff above it is ahead of the clock, and the
+/// readers that compare an execution's `created_at` or `placement_changed_at`
+/// with `lifecycle_changed_at` would take what this restore writes next for
+/// something older than the claim. So the claim is refused instead: the
+/// statement leaves the row alone and this returns
+/// [`RestoreClaimError::CaptureAheadOfClock`]. The caller rolls its
+/// transaction back, so the row stays as it was before the claim. A later
+/// claim succeeds once the clock has passed that row.
+///
+/// The clock is one `clock_timestamp()` sample, never `lifecycle_changed_at`:
+/// the claim stamped that at its transaction's start, which is ahead of the
+/// clock if it stepped backward since. The newest row must be strictly older
+/// than the sample, so the cutoff never lands ahead of it, and so must the
+/// row's `placement_changed_at`: a cutoff at or before the last placement
+/// would read that placement as one during the restore, and the retry window
+/// would admit captures from before it. Only full
+/// snapshots count, the only ones a suspended restore orders. A row pinned to
+/// an artifact with a full backup counts only that artifact's backups: its
+/// retry restores exactly that artifact ([`restore_pin_predates_claim`]), so
+/// another backup ahead of the clock changes nothing it restores.
+///
+/// [`restore_pin_predates_claim`]: pplx_space_sandbox_portability::restore_pin_predates_claim
+pub(crate) async fn advance_fresh_restore_claim_cutoff<C>(
+    tx: &mut C,
+    sandbox_id: SandboxId,
+) -> Result<(), RestoreClaimError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    let capture_ahead_of_clock: Option<bool> = sqlx::query_scalar(sql!(
+        "WITH clock AS MATERIALIZED (
+             SELECT s.id, clock_timestamp() AS at, s.placement_changed_at AS placed_at
+               FROM sandboxes s
+              WHERE s.id = $1
+         ),
+         newest AS (
+             SELECT MAX(sn.\"timestamp\") AS at
+               FROM snapshots sn
+               JOIN sandboxes s ON s.id = sn.sandbox_id
+              WHERE sn.sandbox_id = $1
+                AND sn.type = 'full'
+                AND (NOT EXISTS (
+                         SELECT 1
+                           FROM snapshots pinned
+                          WHERE pinned.sandbox_id = s.id
+                            AND pinned.type = 'full'
+                            AND pinned.local_artifact_id = s.current_local_artifact_id
+                            AND pinned.artifact_kind = s.current_local_artifact_kind
+                     )
+                     OR (sn.local_artifact_id = s.current_local_artifact_id
+                         AND sn.artifact_kind = s.current_local_artifact_kind))
+         ),
+         advanced AS (
+             UPDATE sandboxes s
+                SET lifecycle_changed_at = GREATEST(
+                        clock.at,
+                        COALESCE(
+                            newest.at + INTERVAL '1 microsecond',
+                            '-infinity'::timestamptz
+                        )
+                    )
+               FROM clock, newest
+              WHERE s.id = clock.id
+                AND NOT COALESCE(newest.at >= clock.at, FALSE)
+                AND NOT COALESCE(clock.placed_at >= clock.at, FALSE)
+         )
+         SELECT COALESCE(newest.at >= clock.at, FALSE)
+                OR COALESCE(clock.placed_at >= clock.at, FALSE)
+           FROM clock, newest"
+    ))
+    .bind(sandbox_id)
+    .fetch_optional((&mut *tx).into_sqlx())
+    .await
+    .map_err(DbError::from)?;
+    if capture_ahead_of_clock == Some(true) {
+        return Err(RestoreClaimError::CaptureAheadOfClock { sandbox_id });
+    }
+    Ok(())
+}
+
+/// Finish a fresh claim made in `tx`, one that moved a `suspended` row to
+/// `restoring`: advance its cutoff and commit, or roll the claim back when the
+/// cutoff is refused ([`advance_fresh_restore_claim_cutoff`]), so a refused
+/// claim leaves the row with the lifecycle, lease and `lifecycle_changed_at`
+/// it had.
+pub(crate) async fn commit_fresh_restore_claim(
+    mut tx: Transaction<'_, Postgres>,
+    sandbox_id: SandboxId,
+) -> Result<(), RestoreClaimError> {
+    match advance_fresh_restore_claim_cutoff(&mut *tx, sandbox_id).await {
+        Ok(()) => Ok(tx.commit().await.map_err(DbError::from)?),
+        Err(error) => {
+            tx.rollback().await.map_err(DbError::from)?;
+            Err(error)
+        }
+    }
+}
 
 /// What a restore claim returns: the lifecycle the row had before the claim,
 /// and the lease token the claim wrote (`None` for the tokenless evacuation
@@ -57,17 +197,25 @@ pub struct RestoreClaimRow {
 /// whatever its value, so a negative value still moves the row to
 /// `restoring` and returns `None`. Pass a non-negative value.
 ///
+/// A claim from `suspended` advances `lifecycle_changed_at` past any lock wait
+/// and is refused, writing nothing, while a capture is stamped ahead of the
+/// database clock ([`advance_fresh_restore_claim_cutoff`]). A claim from
+/// `stopped` does neither: its restore loads the ready disk artifact the row
+/// pins ([`crate::restore_source::stopped_evacuation_restore_source`]) and
+/// reads no cutoff, so another snapshot's timestamp can't hold it back.
+///
 /// `execution_ownership_ttl_secs` is bound as `$4`, which this statement
 /// doesn't read; it keeps the parameter list the statement has always been
 /// prepared with.
-pub async fn claim_evacuation_restore(
-    executor: impl Executor<'_>,
+pub async fn claim_evacuation_restore<'a>(
+    executor: impl Acquire<'a, Database = Postgres>,
     sandbox_id: SandboxId,
     lease_ttl_secs: i64,
     execution_ownership_ttl_secs: i64,
     evacuation_target: Option<SandboxLifecycle>,
-) -> Result<Option<RestoreClaimRow>, DbError> {
-    Ok(sqlx::query_as::<_, RestoreClaimRow>(sql!(
+) -> Result<Option<RestoreClaimRow>, RestoreClaimError> {
+    let mut tx = executor.begin().await.map_err(DbError::from)?;
+    let updated = sqlx::query_as::<_, RestoreClaimRow>(sql!(
         "WITH candidate AS (
                      SELECT id, lifecycle
                        FROM sandboxes
@@ -95,16 +243,27 @@ pub async fn claim_evacuation_restore(
                    FROM updated u
                    CROSS JOIN (
                      SELECT $2::bigint AS ttl_secs, $3::uuid AS restore_lease_token
-                   ) args
-                  WHERE args.ttl_secs >= 0"
+                   ) args"
     ))
     .bind(sandbox_id)
     .bind(lease_ttl_secs)
     .bind(None::<Uuid>)
     .bind(execution_ownership_ttl_secs)
     .bind(evacuation_target.map(SandboxLifecycle::as_str))
-    .fetch_optional(executor.into_sqlx())
-    .await?)
+    .fetch_optional((&mut *tx).into_sqlx())
+    .await
+    .map_err(DbError::from)?;
+    // Only a claim from `suspended` opens a retry window, so only it advances
+    // the cutoff and can be refused. A `restoring` re-drive keeps the cutoff
+    // it has, and a stopped evacuation never reads one.
+    if let Some(row) = &updated
+        && row.lifecycle.trim().eq_ignore_ascii_case("suspended")
+    {
+        commit_fresh_restore_claim(tx, sandbox_id).await?;
+    } else {
+        tx.commit().await.map_err(DbError::from)?;
+    }
+    Ok(updated.filter(|_| lease_ttl_secs >= 0))
 }
 
 /// The user restore claim: flip a `suspended` row, or a markerless
@@ -123,8 +282,9 @@ pub async fn claim_evacuation_restore(
 /// The claim preserves `lifecycle_changed_at` across
 /// `restoring -> restoring` re-drives: restore selection uses it as the
 /// immutable boundary between the original source window and artifacts
-/// published by a failed restore branch. The lifecycle trigger still sets it
-/// for a fresh `suspended -> restoring` claim. The restore lease protects an
+/// published by a failed restore branch. For a fresh `suspended -> restoring`
+/// claim, the lifecycle trigger sets it and [`advance_fresh_restore_claim_cutoff`]
+/// advances it past any lock wait on `sandboxes`. The restore lease protects an
 /// active re-drive from the transient-lifecycle sweeper, with one exception:
 /// when the sweeper's restoring-episode deadline is configured, an overdue
 /// episode (`sweeper::restoring_episode_overdue`) passes the lease and owner
@@ -132,15 +292,16 @@ pub async fn claim_evacuation_restore(
 ///
 /// `evacuation_target` is bound as `$5`, which this statement doesn't read;
 /// it keeps the parameter list the statement has always been prepared with.
-pub async fn claim_user_restore(
-    executor: impl Executor<'_>,
+pub async fn claim_user_restore<'a>(
+    executor: impl Acquire<'a, Database = Postgres>,
     sandbox_id: SandboxId,
     lease_ttl_secs: i64,
     restore_lease_token: Uuid,
     execution_ownership_ttl_secs: i64,
     evacuation_target: Option<SandboxLifecycle>,
-) -> Result<Option<RestoreClaimRow>, DbError> {
-    Ok(sqlx::query_as::<_, RestoreClaimRow>(sql!(
+) -> Result<Option<RestoreClaimRow>, RestoreClaimError> {
+    let mut tx = executor.begin().await.map_err(DbError::from)?;
+    let claimed = sqlx::query_as::<_, RestoreClaimRow>(sql!(
         "WITH candidate AS (
                      SELECT id, lifecycle
                        FROM sandboxes
@@ -188,8 +349,17 @@ pub async fn claim_user_restore(
     .bind(Some(restore_lease_token))
     .bind(execution_ownership_ttl_secs)
     .bind(evacuation_target.map(SandboxLifecycle::as_str))
-    .fetch_optional(executor.into_sqlx())
-    .await?)
+    .fetch_optional((&mut *tx).into_sqlx())
+    .await
+    .map_err(DbError::from)?;
+    if let Some(row) = &claimed
+        && !row.lifecycle.trim().eq_ignore_ascii_case("restoring")
+    {
+        commit_fresh_restore_claim(tx, sandbox_id).await?;
+    } else {
+        tx.commit().await.map_err(DbError::from)?;
+    }
+    Ok(claimed)
 }
 
 /// Take the restore lease of a markerless `restoring` row without moving its
@@ -300,80 +470,115 @@ pub async fn release_user_restore_lease(
     Ok(())
 }
 
-/// Revert an abandoned restore claim to `suspended` whose execution the
-/// caller retired in this transaction: unplace the row and clear
-/// `placement_changed_at`. Writes an **operation step** (the claim's
-/// compensation).
+/// Revert an abandoned restore claim whose execution the caller retired in
+/// this transaction: unplace the row, clear a post-claim `placement_changed_at`,
+/// and clear the restore lease pair. When `keep_restoring` is true, keep
+/// `lifecycle` (and any pre-claim `placement_changed_at < lifecycle_changed_at`
+/// lower bound) as stored so the original `[placement_changed_at, lifecycle_changed_at)`
+/// restore source window stays intact; otherwise return `lifecycle` to
+/// `suspended`. Writes an **operation step** (the claim's compensation).
 ///
 /// No lifecycle or lease predicate of its own; it relies on the caller's row
 /// lock, taken on `restoring` (and, when the claim wrote a lease token, on
 /// that token), and on the caller's proof that the pre-restore source is still restorable.
-/// The caller must pass its open transaction.
 pub async fn revert_restore_claim_retiring_placement<C>(
     tx: &mut C,
     sandbox_id: SandboxId,
+    keep_restoring: bool,
 ) -> Result<(), DbError>
 where
     for<'a> &'a mut C: Executor<'a>,
 {
     sqlx::query(sql!(
         "UPDATE sandboxes
-                        SET lifecycle = 'suspended',
+                        SET lifecycle = CASE WHEN $2 THEN lifecycle ELSE 'suspended' END,
                             placement = 'unplaced',
                             active_node_id = NULL,
-                            placement_changed_at = NULL
+                            placement_changed_at = CASE
+                                WHEN $2
+                                 AND lifecycle_changed_at IS NOT NULL
+                                 AND placement_changed_at < lifecycle_changed_at
+                                    THEN placement_changed_at
+                                ELSE NULL
+                            END,
+                            restore_lease_expires_at = NULL,
+                            restore_lease_token = NULL
                       WHERE id = $1"
     ))
     .bind(sandbox_id)
-    .execute(tx.into_sqlx())
+    .bind(keep_restoring)
+    .execute((&mut *tx).into_sqlx())
     .await?;
     Ok(())
 }
 
-/// Revert an abandoned restore claim with no execution at all to
-/// `suspended`, clearing `placement_changed_at`. Writes an **operation step**
-/// (the claim's compensation).
-///
-/// No lifecycle or lease predicate of its own; it relies on the caller's row
-/// lock and on the caller's proof that the pre-restore source is still
-/// restorable. The caller must pass its open transaction.
-pub async fn revert_restore_claim_clearing_placement_clock<C>(
-    tx: &mut C,
-    sandbox_id: SandboxId,
-) -> Result<(), DbError>
-where
-    for<'a> &'a mut C: Executor<'a>,
-{
-    sqlx::query(sql!(
-        "UPDATE sandboxes
-                        SET lifecycle = 'suspended',
-                            placement_changed_at = NULL
-                      WHERE id = $1"
-    ))
-    .bind(sandbox_id)
-    .execute(tx.into_sqlx())
-    .await?;
-    Ok(())
-}
-
-/// Revert an abandoned restore claim's lifecycle to `suspended`, leaving
-/// its execution, placement and placement clock as the restore left them.
+/// Revert an abandoned restore claim with no execution at all, clearing a
+/// post-claim `placement_changed_at` and the restore lease pair. When
+/// `keep_restoring` is true, keep `lifecycle` (and any pre-claim
+/// `placement_changed_at < lifecycle_changed_at` lower bound) as stored so the
+/// `[placement_changed_at, lifecycle_changed_at)` source window stays intact;
+/// otherwise return `lifecycle` to `suspended`.
 /// Writes an **operation step** (the claim's compensation).
 ///
 /// No lifecycle or lease predicate of its own; it relies on the caller's row
-/// lock. The caller must pass its open transaction.
-pub async fn revert_restore_claim_lifecycle<C>(
+/// lock and on the caller's proof that the pre-restore source is still
+/// restorable.
+pub async fn revert_restore_claim_clearing_placement_clock<C>(
     tx: &mut C,
     sandbox_id: SandboxId,
+    keep_restoring: bool,
 ) -> Result<(), DbError>
 where
     for<'a> &'a mut C: Executor<'a>,
 {
     sqlx::query(sql!(
-        "UPDATE sandboxes SET lifecycle = 'suspended' WHERE id = $1"
+        "UPDATE sandboxes
+                        SET lifecycle = CASE WHEN $2 THEN lifecycle ELSE 'suspended' END,
+                            placement_changed_at = CASE
+                                WHEN $2
+                                 AND lifecycle_changed_at IS NOT NULL
+                                 AND placement_changed_at < lifecycle_changed_at
+                                    THEN placement_changed_at
+                                ELSE NULL
+                            END,
+                            restore_lease_expires_at = NULL,
+                            restore_lease_token = NULL
+                      WHERE id = $1"
     ))
     .bind(sandbox_id)
-    .execute(tx.into_sqlx())
+    .bind(keep_restoring)
+    .execute((&mut *tx).into_sqlx())
+    .await?;
+    Ok(())
+}
+
+/// Revert an abandoned restore claim's lifecycle, clearing the restore lease
+/// pair while leaving its execution, placement and placement clock as the
+/// restore left them. When `keep_restoring` is true, keep `lifecycle` as
+/// stored so `lifecycle_changed_at` preserves the pre-claim source boundary;
+/// otherwise return `lifecycle` to `suspended`. Writes an **operation step**
+/// (the claim's compensation).
+///
+/// No lifecycle or lease predicate of its own; it relies on the caller's row
+/// lock.
+pub async fn revert_restore_claim_lifecycle<C>(
+    tx: &mut C,
+    sandbox_id: SandboxId,
+    keep_restoring: bool,
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+                        SET lifecycle = CASE WHEN $2 THEN lifecycle ELSE 'suspended' END,
+                            restore_lease_expires_at = NULL,
+                            restore_lease_token = NULL
+                      WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(keep_restoring)
+    .execute((&mut *tx).into_sqlx())
     .await?;
     Ok(())
 }
@@ -387,10 +592,9 @@ where
 /// statement waits for its lock can stay locked until the transaction ends.
 ///
 /// The revert takes it in its own statement first, so its later statements
-/// read the snapshots and executions as of after the lock. The caller must
-/// pass its open transaction.
+/// read the snapshots and executions as of after the lock.
 pub async fn lock_restore_claim<C>(
-    tx: &mut C,
+    conn: &mut C,
     sandbox_id: SandboxId,
     restore_lease_token: Option<Uuid>,
 ) -> Result<bool, DbError>
@@ -407,7 +611,7 @@ where
     ))
     .bind(sandbox_id)
     .bind(restore_lease_token)
-    .fetch_optional(tx.into_sqlx())
+    .fetch_optional((&mut *conn).into_sqlx())
     .await?;
     Ok(locked.is_some())
 }
@@ -418,9 +622,9 @@ where
 ///
 /// The caller compares the token under the lock, so a cleanup by a lapsed
 /// lease owner serializes against the lease takeover, which locks the row
-/// before it writes a new token. The caller must pass its open transaction.
+/// before it writes a new token.
 pub async fn lock_restore_lease_token<C>(
-    tx: &mut C,
+    conn: &mut C,
     sandbox_id: SandboxId,
 ) -> Result<Option<Option<Uuid>>, DbError>
 where
@@ -430,26 +634,30 @@ where
         "SELECT restore_lease_token FROM sandboxes WHERE id = $1 FOR UPDATE"
     ))
     .bind(sandbox_id)
-    .fetch_optional(tx.into_sqlx())
+    .fetch_optional((&mut *conn).into_sqlx())
     .await?)
 }
 
 /// What [`restore_revert_evidence`] reads of one row: the active execution
 /// the reverted claim created, if one is identifiable (its generation and
-/// pod name), whether any active execution exists, and whether the
-/// pre-restore source is proven restorable once the row is `suspended`.
+/// pod name), whether any active execution exists, whether the pre-restore
+/// source is proven restorable (or pinnable) once the row is `suspended`,
+/// whether reverting to `suspended` would forfeit the pre-claim source window
+/// to a post-claim snapshot, and whether the `restoring` retry has a source
+/// (or a pinnable pre-claim capture) when the row stays `restoring` instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreRevertEvidence {
     pub claimed_generation: Option<i64>,
     pub claimed_pod_name: Option<String>,
     pub any_active_execution: bool,
     pub source_proven: bool,
+    pub forfeits_window: bool,
+    pub retry_source_proven: bool,
 }
 
 /// Read the evidence a restore revert decides on, after
 /// [`lock_restore_claim`] in the caller's transaction. A plain read: it takes
-/// no lock, and a missing row is an error
-/// ([`DbErrorKind::NotFound`](pplx_space_postgres_pool::DbErrorKind::NotFound)).
+/// no lock, and a missing row is an error ([`sqlx::Error::RowNotFound`]).
 ///
 /// The claimed execution is an active one created at or after the row's
 /// `lifecycle_changed_at` that carries `activation_attempt` (its attempt id
@@ -458,10 +666,13 @@ pub struct RestoreRevertEvidence {
 /// can replace the execution, and `lifecycle_changed_at` still reads this
 /// claim's `restoring` transition, so that execution is the one this claim
 /// created. The source proof is
-/// `pplx_space_sandbox_portability::restore_retry_suspended_revert_snapshot_exists`.
-/// The caller must pass its open transaction.
+/// [`restore_retry_suspended_revert_snapshot_exists`] or
+/// [`restore_retry_pinnable_revert_snapshot_exists`], the forfeit test is
+/// [`restore_revert_forfeits_source_window`], and the retry proof is
+/// [`restore_retry_source_snapshot_exists`] or
+/// [`restore_pinnable_pre_claim_capture_exists`].
 pub async fn restore_revert_evidence<C>(
-    tx: &mut C,
+    conn: &mut C,
     sandbox_id: SandboxId,
     restore_lease_token: Option<Uuid>,
     activation_attempt: Option<(SandboxActivationAttemptId, i64)>,
@@ -471,7 +682,11 @@ where
 {
     /// Built once: every input is a literal or a bind placeholder.
     static QUERY: LazyLock<String> = LazyLock::new(|| {
-        let proof = restore_retry_suspended_revert_snapshot_exists("s");
+        let suspended_proof = restore_retry_suspended_revert_snapshot_exists("s");
+        let pinnable_revert_proof = restore_retry_pinnable_revert_snapshot_exists("s");
+        let forfeits_window = restore_revert_forfeits_source_window("s");
+        let retry_proof = restore_retry_source_snapshot_exists("s");
+        let pinnable_pre_claim_proof = restore_pinnable_pre_claim_capture_exists("s");
         sql!(format!(
             "SELECT claimed.generation,
                     claimed.pod_name,
@@ -481,7 +696,9 @@ where
                          WHERE e.sandbox_id = s.id
                            AND e.active
                     ),
-                    {proof}
+                    ({suspended_proof} OR {pinnable_revert_proof}),
+                    {forfeits_window},
+                    ({retry_proof} OR {pinnable_pre_claim_proof})
                FROM sandboxes s
                LEFT JOIN LATERAL (
                    SELECT e.generation, e.pod_name
@@ -499,23 +716,28 @@ where
               WHERE s.id = $1"
         ))
     });
-    let (claimed_generation, claimed_pod_name, any_active_execution, source_proven): (
-        Option<i64>,
-        Option<String>,
-        bool,
-        bool,
-    ) = sqlx::query_as(sqlx::AssertSqlSafe(QUERY.as_str()))
-        .bind(sandbox_id)
-        .bind(restore_lease_token)
-        .bind(activation_attempt.map(|(attempt, _)| attempt))
-        .bind(activation_attempt.map(|(_, generation)| generation))
-        .fetch_one(tx.into_sqlx())
-        .await?;
+    let (
+        claimed_generation,
+        claimed_pod_name,
+        any_active_execution,
+        source_proven,
+        forfeits_window,
+        retry_source_proven,
+    ): (Option<i64>, Option<String>, bool, bool, bool, bool) =
+        sqlx::query_as(sqlx::AssertSqlSafe(QUERY.as_str()))
+            .bind(sandbox_id)
+            .bind(restore_lease_token)
+            .bind(activation_attempt.map(|(attempt, _)| attempt))
+            .bind(activation_attempt.map(|(_, generation)| generation))
+            .fetch_one((&mut *conn).into_sqlx())
+            .await?;
     Ok(RestoreRevertEvidence {
         claimed_generation,
         claimed_pod_name,
         any_active_execution,
         source_proven,
+        forfeits_window,
+        retry_source_proven,
     })
 }
 
@@ -679,3 +901,6 @@ pub async fn observe_user_restores(
         )
         .collect())
 }
+
+#[cfg(test)]
+mod tests;
