@@ -475,7 +475,7 @@ impl KubernetesSubstrate {
         let started_at = Instant::now();
         while Instant::now() < deadline {
             if let Some(resolved) = self
-                .resolve_pod_ip_for_readiness(sandbox_id, target, deadline)
+                .resolve_pod_ip_for_readiness_poll(sandbox_id, target, deadline)
                 .await?
             {
                 return Ok(Some(resolved));

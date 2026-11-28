@@ -69,9 +69,10 @@ async fn reflect_sandbox_pods_updates_store_and_slots_then_broadcasts_touched_na
     let (_events, tx) = PodEvents::new();
     let mut rx = tx.subscribe();
 
-    // The broadcast must fire for re-list (`InitApply`), applied and deleted
-    // pods alike, so a suspend-side waiter can observe pod absence without
-    // polling. `Init`/`InitDone` carry no pod and broadcast nothing.
+    // The broadcast fires pod names for re-list (`InitApply`), applied, and
+    // deleted pods, plus nameless (`""`) wakeups at `Init`, `InitDone`, watch
+    // error, and stream end so raw subscribers re-check watch health and the
+    // swapped store without waking name-matched `wait_for` callers.
     let raw = stream::iter(
         [
             Event::Init,
@@ -86,7 +87,10 @@ async fn reflect_sandbox_pods_updates_store_and_slots_then_broadcasts_touched_na
     reflect_sandbox_pods(raw.boxed(), writer, tx, TEST_NS).await;
 
     let seen: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-    assert_eq!(seen, ["pod-listed", "pod-applied", "pod-listed"]);
+    assert_eq!(
+        seen,
+        ["", "pod-listed", "", "pod-applied", "pod-listed", ""]
+    );
     let cached: Vec<String> = store
         .state()
         .iter()
@@ -94,6 +98,136 @@ async fn reflect_sandbox_pods_updates_store_and_slots_then_broadcasts_touched_na
         .collect();
     assert_eq!(cached, ["pod-applied"]);
     assert_eq!(network_slots.requested_on("node-a"), 1);
+}
+
+#[tokio::test]
+async fn reflect_sandbox_pods_marks_watch_failing_and_wakes_subscribers_on_watch_error() {
+    use futures_util::stream;
+    use kube::runtime::watcher::Event;
+
+    let (store, indexes, mut writer) = sandbox_pod_view::sandbox_pod_cache();
+    let client_live = indexes.client_pods;
+    let (_events, tx) = PodEvents::new();
+    let mut rx = tx.subscribe();
+
+    // Pre-sync (`ready = false`) never exposes a healthy generation.
+    assert_eq!(client_live.healthy_watch_generation(false), None);
+
+    // Direct writer sequence pins the re-list invariant: `watch_failing` stays
+    // `true` through `Init` and `InitApply` while the store retains the stale
+    // pre-disconnect pod, and clears at `InitDone` only after the rebuilt store
+    // swaps in.
+    writer.apply_watcher_event(&sandbox_pod_view::sandbox_pod_view_event(Event::Init));
+    assert_eq!(client_live.healthy_watch_generation(true), None);
+    writer.apply_watcher_event(&sandbox_pod_view::sandbox_pod_view_event(Event::InitApply(
+        slot_pod("stale-pod", "node-a", 1),
+    )));
+    writer.apply_watcher_event(&sandbox_pod_view::sandbox_pod_view_event(Event::InitDone));
+    let gen_initial = client_live
+        .healthy_watch_generation(true)
+        .expect("healthy after InitDone");
+
+    writer.apply_watcher_event(&sandbox_pod_view::sandbox_pod_view_event(Event::Init));
+    writer.apply_watcher_event(&sandbox_pod_view::sandbox_pod_view_event(Event::InitApply(
+        slot_pod("relisted-pod", "node-a", 1),
+    )));
+    assert_eq!(
+        client_live.healthy_watch_generation(true),
+        None,
+        "healthy_watch_generation must stay None while store still exposes pre-relist entries"
+    );
+    assert_eq!(store.state().len(), 1);
+    assert_eq!(store.state()[0].name(), "stale-pod");
+
+    writer.apply_watcher_event(&sandbox_pod_view::sandbox_pod_view_event(Event::InitDone));
+    let gen_after_relist = client_live
+        .healthy_watch_generation(true)
+        .expect("healthy after relist InitDone");
+    assert_ne!(
+        gen_initial, gen_after_relist,
+        "a complete Init..InitDone re-list must advance healthy_watch_generation"
+    );
+    assert_eq!(store.state().len(), 1);
+    assert_eq!(store.state()[0].name(), "relisted-pod");
+
+    writer.mark_watch_error();
+    assert_eq!(client_live.healthy_watch_generation(true), None);
+    writer.apply_watcher_event(&sandbox_pod_view::sandbox_pod_view_event(Event::Apply(
+        slot_pod("relisted-pod", "node-a", 1),
+    )));
+    let gen_after_fault_recovery = client_live
+        .healthy_watch_generation(true)
+        .expect("healthy after live Apply");
+    assert_ne!(
+        gen_after_relist, gen_after_fault_recovery,
+        "recovering from a watch error via live Apply must advance healthy_watch_generation"
+    );
+
+    // Keep the watch stream open across assertions so `Err(_)` is verified
+    // independently of stream-end cleanup, then verify `Event::Delete` recovery
+    // and finally stream termination.
+    let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
+    let raw = stream::unfold(stream_rx, |mut ch| async move {
+        ch.recv().await.map(|item| (item, ch))
+    });
+    let driver = tokio::spawn(async move {
+        reflect_sandbox_pods(raw.boxed(), writer, tx, TEST_NS).await;
+    });
+    async fn recv_notification(rx: &mut tokio::sync::broadcast::Receiver<String>) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for reflector notification")
+            .expect("reflector notification channel closed unexpectedly")
+    }
+
+    stream_tx
+        .send(Ok(sandbox_pod_view::sandbox_pod_view_event(Event::Init)))
+        .unwrap();
+    assert_eq!(recv_notification(&mut rx).await, "");
+    stream_tx
+        .send(Ok(sandbox_pod_view::sandbox_pod_view_event(
+            Event::InitDone,
+        )))
+        .unwrap();
+    assert_eq!(recv_notification(&mut rx).await, "");
+    let gen_stream_synced = client_live
+        .healthy_watch_generation(true)
+        .expect("healthy after stream InitDone");
+
+    stream_tx
+        .send(Err(watcher::Error::WatchStartFailed(
+            kube::Error::LinesCodecMaxLineLengthExceeded,
+        )))
+        .unwrap();
+    assert_eq!(recv_notification(&mut rx).await, "");
+    assert_eq!(
+        client_live.healthy_watch_generation(true),
+        None,
+        "a watch error on an open stream must clear healthy_watch_generation immediately"
+    );
+
+    stream_tx
+        .send(Ok(sandbox_pod_view::sandbox_pod_view_event(Event::Delete(
+            slot_pod("relisted-pod", "node-a", 1),
+        ))))
+        .unwrap();
+    assert_eq!(recv_notification(&mut rx).await, "relisted-pod");
+    let gen_after_delete_recovery = client_live
+        .healthy_watch_generation(true)
+        .expect("healthy after live Delete");
+    assert_ne!(
+        gen_stream_synced, gen_after_delete_recovery,
+        "recovering from a watch error via live Delete must advance healthy_watch_generation"
+    );
+
+    drop(stream_tx);
+    driver.await.unwrap();
+    assert_eq!(recv_notification(&mut rx).await, "");
+    assert_eq!(
+        client_live.healthy_watch_generation(true),
+        None,
+        "stream termination must mark the watch failing and clear healthy_watch_generation"
+    );
 }
 
 const TEST_NS: &str = "test-ns";

@@ -9,7 +9,7 @@ use sqlx::PgPool;
 
 use super::{
     ExecutionFence, abandon_unmaterialized_create_claim, finish_active, finish_fenced,
-    finish_generation, finish_generation_attempt,
+    finish_generation, finish_generation_attempt, finish_generation_pod_uid,
 };
 use crate::k8s_executions::claim;
 
@@ -280,6 +280,50 @@ async fn finish_generation_attempt_spares_an_execution_another_attempt_holds() -
 
     assert!(finish_generation_attempt(pool, sandbox, 2, attempt, "failed").await?);
     assert_eq!(rows(pool, sandbox).await?, retired(2, "failed"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn finish_generation_pod_uid_spares_same_generation_successor_uid() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+
+    let sandbox = insert_with_execution(
+        pool,
+        &Seed {
+            pod_uid: Some("uid-successor"),
+            pod_ip: Some("10.0.0.5"),
+            ..Seed::active(2, "running")
+        },
+    )
+    .await?;
+    let before = rows(pool, sandbox).await?;
+    assert!(!finish_generation_pod_uid(pool, sandbox, 2, Some("uid-stale"), "forgotten").await?);
+    assert!(!finish_generation_pod_uid(pool, sandbox, 2, None, "forgotten").await?);
+    assert!(!finish_generation_pod_uid(pool, sandbox, 2, Some(" "), "forgotten").await?);
+    assert!(
+        !finish_generation_pod_uid(pool, sandbox, 1, Some("uid-successor"), "forgotten").await?
+    );
+    assert_eq!(rows(pool, sandbox).await?, before);
+
+    assert!(finish_generation_pod_uid(pool, sandbox, 2, Some("uid-successor"), "forgotten").await?);
+    assert_eq!(rows(pool, sandbox).await?, retired(2, "forgotten"));
+
+    // Blank stored and expected UIDs both normalize to `NULL` and match only
+    // an unmaterialized UID.
+    let blank = insert_with_execution(
+        pool,
+        &Seed {
+            pod_uid: Some(" "),
+            ..Seed::active(3, "created")
+        },
+    )
+    .await?;
+    assert!(!finish_generation_pod_uid(pool, blank, 3, Some("uid-1"), "forgotten").await?);
+    assert!(finish_generation_pod_uid(pool, blank, 3, Some(" "), "forgotten").await?);
+    assert_eq!(rows(pool, blank).await?, retired(3, "forgotten"));
     Ok(())
 }
 

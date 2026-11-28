@@ -150,6 +150,42 @@ pub async fn finish_generation_attempt(
         > 0)
 }
 
+/// [`finish_generation`], only while that execution's pod UID still matches
+/// `expected_pod_uid` (with blanks read as `NULL`, matching [`finish_fenced`]).
+/// `false` when a same-generation successor recorded a different pod UID, or
+/// when no active execution matches.
+pub async fn finish_generation_pod_uid(
+    executor: impl Executor<'_>,
+    sandbox_id: SandboxId,
+    generation: i64,
+    expected_pod_uid: Option<&str>,
+    state: &str,
+) -> Result<bool, DbError> {
+    let expected_pod_uid = expected_pod_uid
+        .map(str::trim)
+        .filter(|uid| !uid.is_empty());
+    Ok(sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+             SET active = FALSE,
+                 state = $1,
+                 pod_ip = NULL,
+                 terminated_at = COALESCE(terminated_at, NOW()),
+                 updated_at = NOW()
+             WHERE sandbox_id = $2
+               AND active
+               AND generation = $3
+               AND NULLIF(BTRIM(pod_uid), '') IS NOT DISTINCT FROM $4::TEXT"
+    ))
+    .bind(state)
+    .bind(sandbox_id)
+    .bind(generation)
+    .bind(expected_pod_uid)
+    .execute(executor.into_sqlx())
+    .await?
+    .rows_affected()
+        > 0)
+}
+
 /// Retire `sandbox_id`'s active execution at `generation` as `replaced`
 /// while it is still an unmaterialized `creating` claim (no pod UID or IP)
 /// held by `activation_attempt_id` (`None` matches an execution holding

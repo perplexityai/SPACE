@@ -117,12 +117,21 @@ impl ReflectorReady {
 #[derive(Clone)]
 pub struct PodEvents {
     tx: broadcast::Sender<String>,
+    #[cfg(test)]
+    subscribed: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl PodEvents {
     fn new() -> (Self, broadcast::Sender<String>) {
         let (tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        (Self { tx: tx.clone() }, tx)
+        (
+            Self {
+                tx: tx.clone(),
+                #[cfg(test)]
+                subscribed: std::sync::Arc::new(tokio::sync::Notify::new()),
+            },
+            tx,
+        )
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -130,15 +139,35 @@ impl PodEvents {
         Self::new().0
     }
 
+    #[cfg(test)]
+    pub(super) fn for_test_with_sender() -> (
+        Self,
+        broadcast::Sender<String>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let (events, tx) = Self::new();
+        let subscribed = std::sync::Arc::clone(&events.subscribed);
+        (events, tx, subscribed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn notify_state_change_for_test(&self) {
+        let _ = self.tx.send(String::new());
+    }
+
     /// Subscribe to the raw per-name event stream. Used by waiters that must
-    /// re-check their own store condition on *every* wakeup — including
-    /// `Lagged` — rather than waiting for a specific pod name. An absence
-    /// waiter can't use [`PodEvents::wait_for`] because that swallows `Lagged`
-    /// and keeps blocking: if the target pod's delete signal was one of the
-    /// dropped messages there may be no later event for it, stranding the wait
-    /// even though the store already removed the pod.
-    fn subscribe(&self) -> broadcast::Receiver<String> {
-        self.tx.subscribe()
+    /// re-check their own store or watch-health condition on *every* wakeup —
+    /// including `Lagged` and nameless `InitDone`/watch-error signals — rather
+    /// than waiting for a specific pod name. An absence waiter can't use
+    /// [`PodEvents::wait_for`] because that swallows `Lagged` and keeps
+    /// blocking: if the target pod's delete signal was one of the dropped
+    /// messages there may be no later event for it, stranding the wait even
+    /// though the store already removed the pod.
+    pub(super) fn subscribe(&self) -> broadcast::Receiver<String> {
+        let rx = self.tx.subscribe();
+        #[cfg(test)]
+        self.subscribed.notify_waiters();
+        rx
     }
 
     /// Wait up to `budget` for a reflector event referencing `pod_name`.
@@ -298,9 +327,10 @@ pub(super) async fn wait_for_pod_absence(
 /// lifetime of the process. The returned store is cheap to clone (internally
 /// an `Arc`) and is safe to call from any sync context.
 ///
-/// The returned [`SandboxPodIndexes`] are the per-node network-slot index and
-/// the per-client live-pod index, written from the same events just before
-/// the store.
+/// The returned [`SandboxPodIndexes`] are the per-node network-slot index
+/// (written just before the store) and the per-client live-pod index (written
+/// before the store on `Init`/`InitApply` and after the store on
+/// `InitDone`/`Apply`/`Delete`; see `SandboxPodWriter::apply_watcher_event`).
 ///
 /// The returned `PodEvents` is fed by the same watch stream and lets callers
 /// wait for the next add/modify/delete event for a specific pod name.
@@ -363,7 +393,9 @@ pub fn start(
 }
 
 /// Drains the sandbox-pod watcher stream: applies each event to the slot index
-/// and store, then broadcasts the touched pod's name on `events_tx`. Applied
+/// and store, then broadcasts the touched pod's name on `events_tx` (or an
+/// empty string on `Init`, `InitDone`, watch error, and stream end so raw
+/// subscribers re-check watch health and the swapped store immediately). Applied
 /// (add/modify, including re-list `InitApply`) and deleted pods are both
 /// broadcast, matching `touched_objects()`. A re-list `InitApply` only fills the
 /// store's private buffer, so its broadcast can precede the pod becoming
@@ -382,15 +414,20 @@ async fn reflect_sandbox_pods<S>(
         match event {
             Ok(event) => {
                 writer.apply_watcher_event(&event);
-                if let watcher::Event::Apply(pod)
-                | watcher::Event::InitApply(pod)
-                | watcher::Event::Delete(pod) = &event
-                {
-                    let _ = events_tx.send(pod.name().to_string());
+                match &event {
+                    watcher::Event::Apply(pod)
+                    | watcher::Event::InitApply(pod)
+                    | watcher::Event::Delete(pod) => {
+                        let _ = events_tx.send(pod.name().to_string());
+                    }
+                    watcher::Event::Init | watcher::Event::InitDone => {
+                        let _ = events_tx.send(String::new());
+                    }
                 }
             }
             Err(err) => {
                 writer.mark_watch_error();
+                let _ = events_tx.send(String::new());
                 tracing::warn!(
                     namespace = %namespace,
                     error = %err,
@@ -400,6 +437,7 @@ async fn reflect_sandbox_pods<S>(
         }
     }
     writer.mark_watch_error();
+    let _ = events_tx.send(String::new());
     tracing::warn!(
         namespace = %namespace,
         "sandbox pod reflector stream ended"

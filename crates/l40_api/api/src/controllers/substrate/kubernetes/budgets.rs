@@ -49,8 +49,9 @@ pub(super) struct SubstrateBudgets {
     /// reflector event before it falls back to an apiserver GET, and the
     /// re-check interval of a scheduling-outcome wait.
     pub(super) reflector_wait: Duration,
-    /// Maximum duration of a direct pod GET during IP readiness, further
-    /// clamped to the time left in that phase.
+    /// Maximum duration of a bounded fallback pod `GET` (during IP readiness,
+    /// warm-pool claim verification, or reachability probes), further clamped
+    /// to any enclosing readiness phase deadline.
     pub(super) readiness_pod_get: Duration,
     /// [`super::execution::RETRY_DEFERRAL_GRACE`]: how long a caller under
     /// the dispatcher's retry deferral keeps retrying a fenced restore claim
@@ -70,8 +71,8 @@ impl SubstrateBudgets {
         teardown_worker_connect: super::POD_WORKER_CONNECT_TIMEOUT,
         teardown_node_delete_wait: super::adapter::TEARDOWN_NODE_DELETE_WAIT_BUDGET,
         reflector_wait: super::REFLECTOR_WAIT_BUDGET,
-        // Leave headroom for a slow single-object read without letting it
-        // displace the watch that can observe readiness independently.
+        // Bound fallback single-object pod reads so apiserver slowness fails
+        // fast with retryable 503 instead of stacking 60s client GETs.
         readiness_pod_get: Duration::from_secs(5),
         retry_deferral_grace: super::execution::RETRY_DEFERRAL_GRACE,
     };

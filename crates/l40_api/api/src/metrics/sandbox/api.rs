@@ -981,13 +981,16 @@ pub fn wake_completion_redrive(outcome: WakeCompletionRedriveOutcome) {
     );
 }
 
-/// Outcome of a single `read_sandbox_pod` call. Tagged with `outcome` ∈
-/// `cache_settled` (cache hit and pod was settled — no GET, no wait),
-/// `event_settled` (cache miss/unsettled, but a reflector event arrived in
-/// time and the cache became settled — no GET), or `get_fallback` (event
-/// budget elapsed or event arrived but cache still unsettled — direct GET to
-/// kube-apiserver). Drop ratio `get_fallback` / total is the headline metric
-/// for A4 effectiveness.
+/// Outcome of a cached sandbox pod read (`read_sandbox_pod` or
+/// `read_pooled_claim_pod`). Tagged with `outcome` ∈
+/// `cache_settled` (authoritative cache hit — settled pod, or `Pending` on a
+/// healthy synced reflector — no GET, no wait),
+/// `event_settled` (cache miss or untrusted entry, then a reflector event
+/// arrived within budget and made the cache authoritative — no GET),
+/// `reflector_lagging` (healthy reflector still holds a pre-`Running` snapshot
+/// of a claimed warm-pool pod after the event budget — no GET), or
+/// `get_fallback` (cache miss after the event budget or degraded reflector —
+/// direct GET to kube-apiserver).
 pub fn read_sandbox_pod_outcome(outcome: &str) {
     let tags = vec![tag("backend", "k8s"), tag("outcome", outcome)];
     counter("sandbox.api.k8s.read_sandbox_pod", 1, &tags);

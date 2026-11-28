@@ -2992,16 +2992,23 @@ async fn postgres_admitted_pool_claim_released_slot_builds_cold_without_pool_cal
     Ok(())
 }
 
+#[rstest::rstest]
+#[case::release_pending(
+    AdmittedPoolClaimLookup::ReleasePending,
+    ADMITTED_POOL_SLOT_RELEASE_RETRY
+)]
+#[case::transient_lookup(AdmittedPoolClaimLookup::Transient, ADOPTION_LABEL_TRANSIENT_RETRY)]
 #[tokio::test(flavor = "current_thread")]
-async fn postgres_admitted_pool_claim_waits_while_a_slot_holds_the_id() -> TestResult {
+async fn postgres_admitted_pool_claim_waits_while_a_slot_holds_the_id(
+    #[case] lookup: AdmittedPoolClaimLookup,
+    #[case] expected_retry_after: Duration,
+) -> TestResult {
     let fixture = AdmittedCreateFixture::new().await?;
     let admitted = fixture.admitted();
-    let substrate = fixture
-        .substrate()
-        .with_admitted_lookup(AdmittedPoolClaimLookup::ReleasePending);
+    let substrate = fixture.substrate().with_admitted_lookup(lookup);
 
     let error = match fixture.run(&substrate, admitted, false).await {
-        Ok(_) => panic!("a held slot must not resolve the create"),
+        Ok(_) => panic!("a held or transiently unverified slot must not resolve the create"),
         Err(error) => error,
     };
 
@@ -3009,7 +3016,7 @@ async fn postgres_admitted_pool_claim_waits_while_a_slot_holds_the_id() -> TestR
         error.retry_after_cause(),
         Some(ControllerRetryAfterCause::PoolSlotRelease)
     );
-    assert!(error.retry_after_header().is_some());
+    assert_eq!(error.retry_after_header(), Some(expected_retry_after));
     assert_eq!(substrate.claim_calls(), 0);
     assert_eq!(substrate.prepare_calls(), 0);
     assert_eq!(fixture.sandbox_rows().await?, 0);
