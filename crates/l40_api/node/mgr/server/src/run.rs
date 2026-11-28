@@ -21,7 +21,9 @@ use tokio_util::task::TaskTracker;
 #[cfg(target_os = "linux")]
 use crate::disk_io_reservation::AwsImdsInstanceTypeProvider;
 use crate::disk_io_reservation::DiskIoReservationConfig;
-use crate::memory_admission::MemoryAdmissionConfig;
+use crate::memory_admission::{
+    DEFAULT_MEMORY_ADMISSION_FILE_FLOOR_MIB, MemoryAdmissionConfig, ParentCgroupAdmission,
+};
 use crate::proto::node_manager_server::NodeManagerServer;
 use crate::service::NodeManagerService;
 use crate::slot_pool::{
@@ -181,6 +183,14 @@ pub enum RunNodeMgrError {
         #[source]
         source: ServicePortIngressIsolationParseError,
     },
+    #[error("memory_admission.{setting} requires memory_admission.mode = \"parent_cgroup\"")]
+    MemoryAdmissionSettingRequiresParentCgroup { setting: &'static str },
+    #[error("memory_admission.mode = \"parent_cgroup\" requires memory_admission.active_level_mib")]
+    MemoryAdmissionActiveLevelRequired,
+    #[error("memory_admission.active_level_mib must be greater than 0")]
+    MemoryAdmissionActiveLevelZero,
+    #[error("memory_admission.mode = \"parent_cgroup\" cannot use the sandbox parent cgroup: {0}")]
+    MemoryAdmissionParentCgroupUnusable(#[source] crate::memory_admission::NodeMemoryCapacityError),
     #[error("sandbox_cgroup.vcpu_count must be greater than 0")]
     SandboxCgroupVcpuCountZero,
     #[error(
@@ -274,6 +284,17 @@ struct SandboxCgroupFileConfig {
 #[serde(default, deny_unknown_fields)]
 struct MemoryAdmissionFileConfig {
     reserve_mib: Option<u64>,
+    mode: Option<MemoryAdmissionFileMode>,
+    active_level_mib: Option<u64>,
+    file_floor_mib: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MemoryAdmissionFileMode {
+    #[default]
+    Host,
+    ParentCgroup,
 }
 
 fn read_node_config(path: &Path) -> Result<NodeConfig, RunNodeMgrError> {
@@ -511,6 +532,41 @@ fn resolve_memory_admission_config(
     cli: &NodeMgrRunConfig,
     file: &MemoryAdmissionFileConfig,
 ) -> Result<MemoryAdmissionConfig, RunNodeMgrError> {
+    let parent_cgroup = match setting(
+        "memory_admission.mode",
+        None,
+        None,
+        file.mode,
+        MemoryAdmissionFileMode::Host,
+    ) {
+        MemoryAdmissionFileMode::Host => {
+            for (setting, value) in [
+                ("active_level_mib", file.active_level_mib),
+                ("file_floor_mib", file.file_floor_mib),
+            ] {
+                if value.is_some() {
+                    return Err(
+                        RunNodeMgrError::MemoryAdmissionSettingRequiresParentCgroup { setting },
+                    );
+                }
+            }
+            None
+        }
+        MemoryAdmissionFileMode::ParentCgroup => Some(ParentCgroupAdmission {
+            active_level_mib: match file.active_level_mib {
+                None => return Err(RunNodeMgrError::MemoryAdmissionActiveLevelRequired),
+                Some(0) => return Err(RunNodeMgrError::MemoryAdmissionActiveLevelZero),
+                Some(active_level_mib) => active_level_mib,
+            },
+            file_floor_mib: setting(
+                "memory_admission.file_floor_mib",
+                None,
+                None,
+                file.file_floor_mib,
+                DEFAULT_MEMORY_ADMISSION_FILE_FLOOR_MIB,
+            ),
+        }),
+    };
     Ok(MemoryAdmissionConfig {
         reserve_mib: setting(
             "memory_admission.reserve_mib",
@@ -519,6 +575,7 @@ fn resolve_memory_admission_config(
             file.reserve_mib,
             MemoryAdmissionConfig::default().reserve_mib,
         ),
+        parent_cgroup,
     })
 }
 
@@ -731,6 +788,13 @@ pub async fn run(
     let sandbox_parent_memory_limit =
         crate::cgroup::apply_parent_memory_limit(parent_memory_reserve_mib)
             .map_err(RunNodeMgrError::ApplyParentMemoryLimit)?;
+    if memory_admission_config.parent_cgroup.is_some() {
+        crate::memory_admission::probe_parent_cgroup(std::path::Path::new(
+            pplx_space_node_runtime_core::cgroup_paths::CGROUP_BASE,
+        ))
+        .await
+        .map_err(RunNodeMgrError::MemoryAdmissionParentCgroupUnusable)?;
+    }
     let sandbox_parent_disk_io_reservation =
         crate::disk_io_reservation::apply_parent_disk_io_reservation(&disk_io_reservation_config)
             .map_err(RunNodeMgrError::ApplyParentDiskIoReservation)?;
@@ -886,6 +950,7 @@ pub async fn run(
             sandbox_guest_memory_max_mib,
             sandbox_memory_headroom_mib,
             memory_admission_reserve_mib = memory_admission_config.reserve_mib,
+            memory_admission_parent_cgroup = ?memory_admission_config.parent_cgroup,
             sandbox_cgroup_parent_cpu_reserved_count = sandbox_parent_cpu_limit.reserved_count,
             sandbox_cgroup_parent_cpu_max = sandbox_parent_cpu_limit.cpu_max,
             host_memory_bytes = sandbox_parent_memory_limit.host_memory_bytes,

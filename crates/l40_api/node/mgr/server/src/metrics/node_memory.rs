@@ -90,7 +90,7 @@ pub fn space_cgroup_headroom(state: &CgroupMemoryState) {
 }
 
 /// The growth memory admission booked for the node's existing leases in its
-/// latest decision against `limit` (`host`): each VM's remaining room toward
+/// latest decision against `limit` (`host` or `parent_cgroup`): each VM's remaining room toward
 /// its booking level, as that check counted it.
 pub fn admission_booked_growth(limit: &'static str, booked_growth_mib: u64) {
     gauge(
@@ -108,24 +108,32 @@ pub enum MemoryAdmissionOutcome {
     RequirementOverflow,
     NodeMemoryUnobservable,
     ReservationsUnobservable,
+    ParentCgroupInsufficientCapacity,
+    ParentCgroupUnobservable,
 }
 
 impl MemoryAdmissionOutcome {
     const fn decision(self) -> &'static str {
         match self {
             Self::Accepted => "accepted",
-            Self::InsufficientCapacity | Self::RequirementOverflow => "refused",
-            Self::NodeMemoryUnobservable | Self::ReservationsUnobservable => "unavailable",
+            Self::InsufficientCapacity
+            | Self::RequirementOverflow
+            | Self::ParentCgroupInsufficientCapacity => "refused",
+            Self::NodeMemoryUnobservable
+            | Self::ReservationsUnobservable
+            | Self::ParentCgroupUnobservable => "unavailable",
         }
     }
 
-    const fn reason(self) -> &'static str {
+    pub(crate) const fn reason(self) -> &'static str {
         match self {
             Self::Accepted => "capacity_available",
             Self::InsufficientCapacity => "insufficient_capacity",
             Self::RequirementOverflow => "requirement_overflow",
             Self::NodeMemoryUnobservable => "node_memory_unobservable",
             Self::ReservationsUnobservable => "reservations_unobservable",
+            Self::ParentCgroupInsufficientCapacity => "parent_cgroup_insufficient_capacity",
+            Self::ParentCgroupUnobservable => "parent_cgroup_unobservable",
         }
     }
 }
