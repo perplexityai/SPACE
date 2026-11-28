@@ -650,12 +650,11 @@ pub(super) fn terminal_pod_phase(pod: &SandboxPodView) -> Option<TerminalPodPhas
     }
 }
 
-/// True if the pod is in a status that callers of `read_sandbox_pod` branch
-/// on: it has been assigned an IP, or it has reached a terminal phase, or
-/// the scheduler has flagged it unschedulable. Anything else (notably
-/// pre-binding `Pending` with no IP) is treated as cache-stale so the
-/// reflector watch lag cannot stall callers that are already past the
-/// per-pod watch.
+/// True if the pod is in a status that callers of `read_sandbox_pod` and
+/// readiness waits branch on: it has been assigned an IP, or it has reached a
+/// terminal phase, or the scheduler has flagged it unschedulable. Anything else
+/// (notably pre-binding `Pending` with no IP) is treated as unsettled so
+/// `read_sandbox_pod` can wait briefly on reflector events before falling back.
 pub(super) fn pod_status_is_settled(pod: &SandboxPodView) -> bool {
     assigned_pod_ip(pod).ok().flatten().is_some()
         || terminal_pod_phase(pod).is_some()
@@ -1495,6 +1494,14 @@ pub(super) fn is_nodemgr_unreachable(err: &SubstrateError) -> bool {
         _ => return false,
     };
     let m = message.to_ascii_lowercase();
+    // Kubernetes control-plane overload / fallback-gate refusals carry
+    // `SubstrateError::Unavailable` (or `Timeout`), whose wording can include
+    // "unavailable" or "transport". Those are apiserver signals, not node-mgr
+    // brownout signals, so they must not defer pod cleanup or book
+    // `CancelCause::NodeMgrUnreachable`.
+    if m.contains("kubernetes api") || m.contains("kube apiserver") {
+        return false;
+    }
     // Specific tonic transport phrases — avoids spurious matches on
     // unrelated words containing the "connect" substring ("reconnect",
     // "interconnect", arbitrary uses of "connection").

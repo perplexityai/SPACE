@@ -60,8 +60,8 @@ pub(super) struct ClientLivePods {
 struct ClientLivePodsState {
     live: ClientLivePodIndex,
     rebuilding: Option<ClientLivePodIndex>,
-    /// Set by a watch error or a re-list's start; cleared by the next live
-    /// event or the re-list's swap.
+    /// Set by a watch error or stream end; cleared by the next live event or
+    /// the re-list's swap.
     watch_failing: bool,
 }
 
@@ -175,7 +175,6 @@ impl ClientLivePods {
             }
             watcher::Event::Init => {
                 state.rebuilding = Some(ClientLivePodIndex::default());
-                state.watch_failing = true;
                 false
             }
             watcher::Event::InitApply(pod) => {
@@ -201,6 +200,17 @@ impl ClientLivePods {
             .watch_failing = true;
     }
 
+    /// True from a watch error or stream end until the next live event or
+    /// completed re-list. A healthy re-list (`Init` through `InitDone` without
+    /// a preceding error) leaves this `false` while [`Self::count`] reports
+    /// [`LiveSandboxCountUnknown::PodCacheStale`] until the swap completes.
+    pub(super) fn is_watch_failing(&self) -> bool {
+        self.index
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .watch_failing
+    }
+
     /// Count the distinct sandboxes, other than `activating` and those in
     /// `already_pending`, with a qualifying pod labeled with an id `ids`
     /// selects. `ready` is the reflector's initial-list readiness.
@@ -214,7 +224,7 @@ impl ClientLivePods {
             return LiveSandboxCount::Unknown(LiveSandboxCountUnknown::PodCacheCold);
         }
         let state = self.index.read().unwrap_or_else(PoisonError::into_inner);
-        if state.watch_failing {
+        if state.watch_failing || state.rebuilding.is_some() {
             return LiveSandboxCount::Unknown(LiveSandboxCountUnknown::PodCacheStale);
         }
         LiveSandboxCount::Known(state.live.count(ids, exclusions))

@@ -52,6 +52,15 @@ pub(super) struct SubstrateBudgets {
     /// Maximum duration of a direct pod GET during IP readiness, further
     /// clamped to the time left in that phase.
     pub(super) readiness_pod_get: Duration,
+    /// [`super::READINESS_QUIET_REFLECTOR`]: how long IP readiness waits on a
+    /// completely silent reflector before issuing one gated fallback pod GET
+    /// for a pod the cache has never seen, and the per-waiter interval between
+    /// gated fallback reads while the reflector is cold or its watch is failing.
+    pub(super) readiness_quiet_reflector: Duration,
+    /// [`super::READINESS_FALLBACK_WAIT_BUDGET`]: maximum queue + pacing wait
+    /// for a slot in the replica-wide readiness fallback gate before failing
+    /// fast with `503` instead of piling onto kube-apiserver.
+    pub(super) readiness_fallback_wait: Duration,
     /// [`super::execution::RETRY_DEFERRAL_GRACE`]: how long a caller under
     /// the dispatcher's retry deferral keeps retrying a fenced restore claim
     /// in place before it hands the wait back.
@@ -70,9 +79,11 @@ impl SubstrateBudgets {
         teardown_worker_connect: super::POD_WORKER_CONNECT_TIMEOUT,
         teardown_node_delete_wait: super::adapter::TEARDOWN_NODE_DELETE_WAIT_BUDGET,
         reflector_wait: super::REFLECTOR_WAIT_BUDGET,
-        // Leave headroom for a slow single-object read without letting it
-        // displace the watch that can observe readiness independently.
+        // Bounds a gated fallback pod read during IP readiness so a wedged
+        // apiserver call fails fast rather than consuming `ready_timeout`.
         readiness_pod_get: Duration::from_secs(5),
+        readiness_quiet_reflector: super::READINESS_QUIET_REFLECTOR,
+        readiness_fallback_wait: super::READINESS_FALLBACK_WAIT_BUDGET,
         retry_deferral_grace: super::execution::RETRY_DEFERRAL_GRACE,
     };
 

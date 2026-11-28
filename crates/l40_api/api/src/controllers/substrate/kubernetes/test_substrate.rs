@@ -20,9 +20,10 @@ use crate::controllers::substrate::{AbandonedRestoreRetirement, ActivationClient
 /// `sandbox_k8s_executions` rows in.
 pub const TEST_SANDBOX_NAMESPACE: &str = "space";
 
-/// [`assemble_substrate`]'s reflector-event wait. Its reflectors are seeded
-/// once and never fed, so a pod read's wait can only time out before the
-/// apiserver GET that answers it; a shorter wait changes no outcome.
+/// [`assemble_substrate`]'s reflector-event and quiet-reflector readiness waits.
+/// Its reflectors are seeded once and never fed, so those waits can only time
+/// out before the apiserver GET that answers them; a shorter wait changes no
+/// outcome.
 const TEST_REFLECTOR_WAIT: Duration = Duration::from_millis(20);
 
 /// [`assemble_substrate`]'s blocking-delete budget. Its reflector never sees
@@ -48,8 +49,10 @@ impl KubernetesSubstrate {
     /// data-plane, delete and cancel-rate budgets, and its abandoned-restore
     /// retirement switch (off), are the ones [`Self::try_from_env`] computes
     /// with none of their variables set, and its other waits are
-    /// production's. The node-api client still reads its transport and bearer tokens from the
-    /// process environment, as in production.
+    /// production's except `readiness_quiet_reflector`, which is shortened
+    /// because its pod cache is never fed. The node-api client still reads its
+    /// transport and bearer tokens from the process environment, as in
+    /// production.
     pub fn with_seeded_caches(
         pool: PgPool,
         client: Client,
@@ -62,7 +65,10 @@ impl KubernetesSubstrate {
         substrate.k8s.k8s_blocking_delete_timeout = DEFAULT_K8S_BLOCKING_DELETE_TIMEOUT;
         substrate.k8s.abandoned_restore_retirement = AbandonedRestoreRetirement::Disabled;
         substrate.cancel_tracker = CancelRateTracker::with_default_budget();
-        substrate.budgets = SubstrateBudgets::default();
+        substrate.budgets = SubstrateBudgets {
+            readiness_quiet_reflector: TEST_REFLECTOR_WAIT,
+            ..SubstrateBudgets::DEFAULT
+        };
         substrate.restore_waiters = RestoreWaiters::new(
             substrate.store.clone(),
             substrate.shutdown_token.clone(),
@@ -164,6 +170,7 @@ pub(super) fn assemble_substrate(
         pod_client_index: pod_indexes.client_pods,
         pod_events: pod_reflector::PodEvents::for_test(),
         pod_reflector_ready: ReflectorReady::always_ready(),
+        readiness_fallback_gate: Arc::default(),
         cancel_tracker: Arc::new(CancelRateTracker::with_budget(64)),
         // Gate closed: a closed gate issues no query, so a lazily-connected
         // pool stays undialed. Placement rendering is covered by the
@@ -174,6 +181,7 @@ pub(super) fn assemble_substrate(
         runtime_policy: RuntimePolicyCache::default(),
         budgets: SubstrateBudgets {
             reflector_wait: TEST_REFLECTOR_WAIT,
+            readiness_quiet_reflector: TEST_REFLECTOR_WAIT,
             ..SubstrateBudgets::DEFAULT
         },
         shutdown_token,
@@ -220,4 +228,87 @@ pub async fn release_stopped_evacuation_placement(
     )
     .release_stopped_evacuation_placement(sandbox_id, source_node_id)
     .await
+}
+
+/// Test handle driving a [`KubernetesSubstrate`]'s sandbox-pod reflector store,
+/// live-pod index, and [`pod_reflector::PodEvents`] in lockstep, matching
+/// [`pod_reflector`]'s event order without a background HTTP watcher.
+#[cfg(test)]
+pub(super) struct PodCacheFeed {
+    writer: sandbox_pod_view::SandboxPodWriter,
+    publisher: pod_reflector::PodEventPublisher,
+}
+
+#[cfg(test)]
+impl PodCacheFeed {
+    pub(super) fn apply(&mut self, pod: Pod) {
+        let event = Event::Apply(pod.into());
+        self.writer.apply_watcher_event(&event);
+        self.publisher.record_watcher_event(&event);
+    }
+
+    pub(super) fn delete(&mut self, pod: Pod) {
+        let event = Event::Delete(pod.into());
+        self.writer.apply_watcher_event(&event);
+        self.publisher.record_watcher_event(&event);
+    }
+
+    pub(super) fn begin_relist(&mut self) {
+        let event = Event::Init;
+        self.writer.apply_watcher_event(&event);
+        self.publisher.record_watcher_event(&event);
+    }
+
+    pub(super) fn relist_apply(&mut self, pod: Pod) {
+        let event = Event::InitApply(pod.into());
+        self.writer.apply_watcher_event(&event);
+        self.publisher.record_watcher_event(&event);
+    }
+
+    pub(super) fn finish_relist(&mut self) {
+        let event = Event::InitDone;
+        self.writer.apply_watcher_event(&event);
+        self.publisher.record_watcher_event(&event);
+    }
+
+    pub(super) fn fail_watch(&mut self) {
+        self.writer.mark_watch_error();
+        self.publisher.record_watch_error();
+    }
+}
+
+#[cfg(test)]
+impl KubernetesSubstrate {
+    /// Replace the static sandbox-pod cache with a [`PodCacheFeed`]-backed
+    /// store and event stream seeded with `pods`. Restores the production
+    /// `readiness_quiet_reflector` budget because this cache is actively fed.
+    pub(super) fn with_pod_cache_feed(mut self, pods: Vec<Pod>) -> (Self, PodCacheFeed) {
+        let (pod_store, pod_indexes, writer) = sandbox_pod_view::seeded_sandbox_pod_cache(pods);
+        let (pod_events, publisher) = pod_reflector::PodEvents::new();
+        publisher.record_watcher_event(&Event::InitDone);
+        self.pod_store = pod_store;
+        self.pod_network_slots = pod_indexes.network_slots;
+        self.pod_client_index = pod_indexes.client_pods;
+        self.pod_events = pod_events;
+        self.pod_reflector_ready = ReflectorReady::always_ready();
+        self.budgets.readiness_quiet_reflector =
+            SubstrateBudgets::DEFAULT.readiness_quiet_reflector;
+        (self, PodCacheFeed { writer, publisher })
+    }
+
+    /// Replace the static sandbox-pod cache with [`pod_reflector::start`]
+    /// running against `self.k8s.client`, exercising the real watcher stream
+    /// and watch-error propagation.
+    pub(super) fn with_live_pod_reflector(mut self) -> Self {
+        let (pod_store, pod_indexes, pod_events, pod_reflector_ready) =
+            pod_reflector::start(self.k8s.client.clone(), self.k8s.sandbox_namespace.clone());
+        self.pod_store = pod_store;
+        self.pod_network_slots = pod_indexes.network_slots;
+        self.pod_client_index = pod_indexes.client_pods;
+        self.pod_events = pod_events;
+        self.pod_reflector_ready = pod_reflector_ready;
+        self.budgets.readiness_quiet_reflector =
+            SubstrateBudgets::DEFAULT.readiness_quiet_reflector;
+        self
+    }
 }

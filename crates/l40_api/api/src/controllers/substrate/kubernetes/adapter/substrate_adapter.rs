@@ -687,16 +687,16 @@ impl SubstrateAdapter for KubernetesSubstrate {
             _ => "started",
         };
 
-        // The reflector watch and the per-pod watch used by
-        // `wait_for_pod_proxy_reachable` are independent streams, so the
-        // reflector cache may briefly lag the scheduler-binding MODIFIED
-        // event. We are at the post-readiness step, so the pod must have
+        // When `wait_for_pod_proxy_reachable` learned the pod's address from the
+        // worker node (`PodIpSource::NodeReported`) or from a gated fallback GET,
+        // the shared reflector cache can briefly lag the scheduler-binding
+        // MODIFIED event. We're at the post-readiness step, so the pod must have
         // been bound to a node by now; if the cache still shows it as
-        // unscheduled, that is definitive evidence of a stale cache and
+        // unscheduled, that's definitive evidence of a stale cache and
         // we must fall back to an authoritative GET. Without this check,
         // a stale cache hit would leave `active_node_id` as `None` and the
         // caller's `UPDATE sandboxes SET active_node_id = $3` would clear
-        // the placement that the watch already persisted to the DB.
+        // the placement already persisted to the DB.
         let post_create_pod = match self.lookup_sandbox_pod(&pod_name) {
             Some(pod) if assigned_pod_node_name(&pod).is_some() => Some(pod),
             _ => fetch_sandbox_pod_uncached(&self.k8s, &pod_name)
