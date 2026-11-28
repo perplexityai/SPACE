@@ -109,7 +109,7 @@ async fn local_org_claims_the_space_uuid_and_no_grant() -> TestResult {
     let org = seed_local_org(&db.pool).await?;
 
     let lookup = PgIntermediateKeyIdentityLookup::new(
-        db.pool.clone(),
+        Db::from(db.pool.clone()),
         FederatedGrantAudience::parse(TEST_GRANT_AUDIENCE)?,
     );
     let identity = lookup.identity(org).await?;
@@ -134,7 +134,7 @@ async fn federated_org_claims_the_upstream_id() -> TestResult {
     let org = seed_federated_org(&db.pool, &upstream).await?;
 
     let identity = PgIntermediateKeyIdentityLookup::new(
-        db.pool.clone(),
+        Db::from(db.pool.clone()),
         FederatedGrantAudience::parse(TEST_GRANT_AUDIENCE)?,
     )
     .identity(org)
@@ -173,7 +173,7 @@ async fn presents_the_freshest_live_grant_with_its_user() -> TestResult {
     .await?;
 
     let identity = PgIntermediateKeyIdentityLookup::new(
-        db.pool.clone(),
+        Db::from(db.pool.clone()),
         FederatedGrantAudience::parse(TEST_GRANT_AUDIENCE)?,
     )
     .identity(org)
@@ -203,7 +203,7 @@ async fn skips_expired_grants_but_still_claims_the_upstream_id() -> TestResult {
     seed_grant(&db.pool, sandbox, b"lapsed", -60).await?;
 
     let identity = PgIntermediateKeyIdentityLookup::new(
-        db.pool.clone(),
+        Db::from(db.pool.clone()),
         FederatedGrantAudience::parse(TEST_GRANT_AUDIENCE)?,
     )
     .identity(org)
@@ -227,7 +227,7 @@ async fn does_not_present_another_orgs_grant() -> TestResult {
     seed_grant(&db.pool, their_sandbox, b"theirs", 3600).await?;
 
     let identity = PgIntermediateKeyIdentityLookup::new(
-        db.pool.clone(),
+        Db::from(db.pool.clone()),
         FederatedGrantAudience::parse(TEST_GRANT_AUDIENCE)?,
     )
     .identity(mine)
@@ -259,7 +259,7 @@ async fn ignores_grants_for_another_audience_or_purpose() -> TestResult {
     .await?;
 
     let identity = PgIntermediateKeyIdentityLookup::new(
-        db.pool.clone(),
+        Db::from(db.pool.clone()),
         FederatedGrantAudience::parse(TEST_GRANT_AUDIENCE)?,
     )
     .identity(org)
@@ -279,7 +279,7 @@ async fn unknown_org_claims_the_space_uuid() -> TestResult {
     let org = OrgId::new();
 
     let identity = PgIntermediateKeyIdentityLookup::new(
-        db.pool.clone(),
+        Db::from(db.pool.clone()),
         FederatedGrantAudience::parse(TEST_GRANT_AUDIENCE)?,
     )
     .identity(org)
@@ -303,7 +303,7 @@ async fn sandbox_lookup_prefers_its_own_grant_over_a_fresher_siblings() -> TestR
     seed_grant(&db.pool, sibling, b"sibling-fresher", 3600).await?;
 
     let identity = PgIntermediateKeyIdentityLookup::new(
-        db.pool.clone(),
+        Db::from(db.pool.clone()),
         FederatedGrantAudience::parse(TEST_GRANT_AUDIENCE)?,
     )
     .identity_for_sandbox(org, own)
@@ -328,7 +328,7 @@ async fn sandbox_lookup_falls_back_when_its_own_grant_lapsed() -> TestResult {
     seed_grant(&db.pool, sibling, b"sibling-live", 3600).await?;
 
     let identity = PgIntermediateKeyIdentityLookup::new(
-        db.pool.clone(),
+        Db::from(db.pool.clone()),
         FederatedGrantAudience::parse(TEST_GRANT_AUDIENCE)?,
     )
     .identity_for_sandbox(org, own)
@@ -351,7 +351,7 @@ async fn sandbox_lookup_with_no_live_grant_presents_none() -> TestResult {
     seed_grant(&db.pool, sandbox, b"own-lapsed", -60).await?;
 
     let identity = PgIntermediateKeyIdentityLookup::new(
-        db.pool.clone(),
+        Db::from(db.pool.clone()),
         FederatedGrantAudience::parse(TEST_GRANT_AUDIENCE)?,
     )
     .identity_for_sandbox(org, sandbox)

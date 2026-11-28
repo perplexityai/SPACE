@@ -9,6 +9,7 @@
 
 use pplx_space_accounts::OrgId;
 use pplx_space_byok_model::{KekProvider, MasterKeyIdentifier};
+use pplx_space_postgres_pool::{Db, DbError};
 use uuid::Uuid;
 
 /// A resolved `org_master_keys` row, narrowed to what the key wrapper needs.
@@ -31,13 +32,7 @@ pub enum KekStoreError {
     #[error("KEK row {cmk_id} holds an invalid key identifier: {message}")]
     InvalidKeyIdentifier { cmk_id: Uuid, message: String },
     #[error("KEK lookup query failed: {0}")]
-    Query(#[from] sqlx::Error),
-}
-
-impl From<pplx_space_postgres_pool::DbError> for KekStoreError {
-    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
-        Self::from(sqlx::Error::from(error))
-    }
+    Query(#[from] DbError),
 }
 
 /// Lookup of a KEK row scoped to an organization. A trait so the service
@@ -62,11 +57,11 @@ pub trait KekStore: Send + Sync + 'static {
 }
 
 pub struct PgKekStore {
-    pool: sqlx::PgPool,
+    pool: Db,
 }
 
 impl PgKekStore {
-    pub fn new(pool: sqlx::PgPool) -> Self {
+    pub fn new(pool: Db) -> Self {
         Self { pool }
     }
 }

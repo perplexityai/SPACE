@@ -42,6 +42,7 @@ use pplx_space_credential_provider_client::{
     BearerTokenFileInterceptor, IntermediateKeyBrokerGrpcClient,
     traced_intermediate_key_broker_client,
 };
+use pplx_space_postgres_pool::DbError;
 use pplx_space_sandbox_model::SandboxId;
 use tokio::time::Instant;
 use zeroize::{Zeroize, Zeroizing};
@@ -194,7 +195,7 @@ pub trait IntermediateKeyBrokerApi: Send + Sync + 'static {
 #[derive(Debug, thiserror::Error)]
 pub enum WrappedKeyStoreError {
     #[error("wrapped intermediate-key lookup failed: {0}")]
-    Lookup(#[source] sqlx::Error),
+    Lookup(#[source] DbError),
 }
 
 /// Source of the persisted broker-wrapped intermediate-key blobs, keyed by
@@ -637,7 +638,7 @@ fn wrap_resolve_error(error: ResolveError) -> WrapError {
     // lock on that table would otherwise become a fast permanent-looking
     // credential failure instead of the slow success it used to be.
     if let ResolveError::Store(WrappedKeyStoreError::Lookup(sql)) = &error
-        && pplx_space_postgres_pool::contention::is_lock_contention(sql)
+        && sql.is_lock_contention()
     {
         return WrapError::Unavailable(error.to_string());
     }
@@ -657,7 +658,7 @@ fn wrap_resolve_error(error: ResolveError) -> WrapError {
 fn unwrap_resolve_error(error: ResolveError) -> UnwrapError {
     // As in `wrap_resolve_error`: contention is retryable, not a backend fault.
     if let ResolveError::Store(WrappedKeyStoreError::Lookup(sql)) = &error
-        && pplx_space_postgres_pool::contention::is_lock_contention(sql)
+        && sql.is_lock_contention()
     {
         return UnwrapError::Unavailable(error.to_string());
     }

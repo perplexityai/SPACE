@@ -13,8 +13,8 @@ use pplx_space_db_identity::DatabaseIdentity;
 use sqlx::PgPool;
 
 use super::{
-    DatabaseConnectOptionsError, DbOptions, connect_postgres_lazy_as, password_env_for_identity,
-    spawn_postgres_pool_metrics_reporter_for_identity,
+    DatabaseConnectOptionsError, Db, DbOptions, connect_postgres_lazy_as,
+    password_env_for_identity, spawn_postgres_pool_metrics_reporter_for_identity,
 };
 
 /// Read the projected password for a managed identity, failing when absent.
@@ -200,6 +200,14 @@ impl CredentialsPool {
     #[must_use]
     pub const fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// The fenced lane as a [`Db`] for store verbs. It wraps a clone of the
+    /// same pool rather than opening another, so it keeps this pool's login,
+    /// connect options and metrics.
+    #[must_use]
+    pub fn db(&self) -> Db {
+        Db::from(self.pool.clone())
     }
 }
 

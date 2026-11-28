@@ -11,6 +11,7 @@
 
 use pplx_space_accounts::OrgId;
 use pplx_space_byok_store::VolumeWrapRecord;
+use pplx_space_postgres_pool::{Db, DbError};
 use pplx_space_sandbox_model::SandboxId;
 use uuid::Uuid;
 
@@ -34,13 +35,13 @@ pub struct VolumeWrap {
 #[derive(Debug, thiserror::Error)]
 pub enum VolumeWrapStoreError {
     #[error("sandbox volume wrap query failed: {0}")]
-    Query(#[from] sqlx::Error),
-}
-
-impl From<pplx_space_postgres_pool::DbError> for VolumeWrapStoreError {
-    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
-        Self::from(sqlx::Error::from(error))
-    }
+    Query(#[from] DbError),
+    /// The row this transaction just inserted, or the concurrent winner's,
+    /// was not visible to the read that followed in the same transaction.
+    #[error(
+        "sandbox volume wrap query failed: no rows returned by a query that expected to return at least one row"
+    )]
+    StoredRowMissing,
 }
 
 /// Read and first-writer-wins persistence of per-sandbox volume DEK wraps. A
@@ -66,11 +67,11 @@ pub trait VolumeWrapStore: Send + Sync + 'static {
 }
 
 pub struct PgVolumeWrapStore {
-    pool: sqlx::PgPool,
+    pool: Db,
 }
 
 impl PgVolumeWrapStore {
-    pub fn new(pool: sqlx::PgPool) -> Self {
+    pub fn new(pool: Db) -> Self {
         Self { pool }
     }
 }
@@ -96,17 +97,11 @@ impl VolumeWrapStore for PgVolumeWrapStore {
         // the read cannot observe a state between a different writer's insert
         // and its commit.
         let mut tx = self.pool.begin().await?;
-        pplx_space_byok_store::insert_volume_wrap(
-            &mut *tx,
-            sandbox_id,
-            org_id,
-            cmk_id,
-            wrapped_dek,
-        )
-        .await?;
-        let stored = pplx_space_byok_store::volume_wrap(&mut *tx, sandbox_id)
+        pplx_space_byok_store::insert_volume_wrap(&mut tx, sandbox_id, org_id, cmk_id, wrapped_dek)
+            .await?;
+        let stored = pplx_space_byok_store::volume_wrap(&mut tx, sandbox_id)
             .await?
-            .ok_or(sqlx::Error::RowNotFound)?;
+            .ok_or(VolumeWrapStoreError::StoredRowMissing)?;
         tx.commit().await?;
         Ok(stored.into())
     }

@@ -65,9 +65,11 @@ fn test_reviewer(config: K8sAuthConfig, client: kube::Client) -> CredmgrTokenRev
         review_limiter,
         rate_limiter,
         pods,
-        database_pool: sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://localhost/unused")
-            .unwrap(),
+        database_pool: Db::from(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://localhost/unused")
+                .unwrap(),
+        ),
     }
 }
 
@@ -179,7 +181,7 @@ pub(crate) fn caller_reviewer(
         TEST_NODE_UID,
     );
     let (mut reviewer, calls) = reviewer_returning_status(config, reviewed);
-    reviewer.database_pool = database_pool;
+    reviewer.database_pool = Db::from(database_pool);
     (reviewer, calls)
 }
 
@@ -782,7 +784,7 @@ async fn cached_identity_tracks_postgres_registration() {
             "{name:?}/{uid:?}"
         );
     }
-    reviewer.database_pool = closed_pool.clone();
+    reviewer.database_pool = Db::from(closed_pool.clone());
     let result = reviewer
         .resolve_token_identity(&token, Some("10.0.0.2".parse().unwrap()))
         .await;

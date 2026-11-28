@@ -964,7 +964,9 @@ async fn a_contended_branching_key_read_is_retryable() -> pplx_space_test_env::T
         let for_wrap = pplx_space_db_test_fixtures::raise_sqlstate(&db.pool, sqlstate).await;
         assert!(
             matches!(
-                wrap_resolve_error(ResolveError::Store(WrappedKeyStoreError::Lookup(for_wrap))),
+                wrap_resolve_error(ResolveError::Store(WrappedKeyStoreError::Lookup(
+                    DbError::from(for_wrap)
+                ))),
                 WrapError::Unavailable(_)
             ),
             "{sqlstate} on wrap must be retryable"
@@ -973,7 +975,7 @@ async fn a_contended_branching_key_read_is_retryable() -> pplx_space_test_env::T
         assert!(
             matches!(
                 unwrap_resolve_error(ResolveError::Store(WrappedKeyStoreError::Lookup(
-                    for_unwrap
+                    DbError::from(for_unwrap)
                 ))),
                 UnwrapError::Unavailable(_)
             ),
@@ -985,12 +987,16 @@ async fn a_contended_branching_key_read_is_retryable() -> pplx_space_test_env::T
     // on the SQLSTATE and not on the variant.
     let real = pplx_space_db_test_fixtures::raise_sqlstate(&db.pool, "23505").await;
     assert!(matches!(
-        wrap_resolve_error(ResolveError::Store(WrappedKeyStoreError::Lookup(real))),
+        wrap_resolve_error(ResolveError::Store(WrappedKeyStoreError::Lookup(
+            DbError::from(real)
+        ))),
         WrapError::Backend(_)
     ));
     let real = pplx_space_db_test_fixtures::raise_sqlstate(&db.pool, "23505").await;
     assert!(matches!(
-        unwrap_resolve_error(ResolveError::Store(WrappedKeyStoreError::Lookup(real))),
+        unwrap_resolve_error(ResolveError::Store(WrappedKeyStoreError::Lookup(
+            DbError::from(real)
+        ))),
         UnwrapError::Backend(_)
     ));
     Ok(())

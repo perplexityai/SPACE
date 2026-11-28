@@ -46,6 +46,7 @@ use tonic::Status;
 
 use pplx_space_k8s_ids::{PodName, PodUid};
 use pplx_space_node_registration_store::registered_node;
+use pplx_space_postgres_pool::Db;
 
 use crate::auth::{ClientService, K8sIdentity, K8sNodeIdentity};
 
@@ -253,14 +254,14 @@ pub struct CredmgrTokenReviewer {
     review_limiter: Arc<tokio::sync::Semaphore>,
     rate_limiter: Arc<ReviewRateLimiter>,
     pods: Store<Pod>,
-    database_pool: sqlx::PgPool,
+    database_pool: Db,
 }
 
 impl CredmgrTokenReviewer {
     pub(crate) fn new(
         config: K8sAuthConfig,
         client: kube::Client,
-        database_pool: sqlx::PgPool,
+        database_pool: Db,
         shutdown: CancellationToken,
     ) -> Self {
         let review_limiter = Arc::new(tokio::sync::Semaphore::new(config.max_inflight_reviews));

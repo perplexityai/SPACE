@@ -544,7 +544,7 @@ async fn initialize_authority_service(
                 pplx_space_postgres_pool::CredentialsPool::connect_lazy(&url, SERVICE_NAME)
                     .map_err(RunCredmgrError::DatabasePool)?;
             tracing::info!("prepared lazy space_creds credential-manager database pool");
-            Some(credentials_pool.pool().clone())
+            Some(credentials_pool.db())
         }
         _ => None,
     };

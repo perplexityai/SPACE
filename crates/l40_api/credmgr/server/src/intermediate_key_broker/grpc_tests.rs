@@ -794,10 +794,10 @@ async fn unreadable_identity_fails_the_rpc() {
                 crate::intermediate_key_identity::IdentityLookupError::Unavailable {
                     org: org.as_uuid(),
                     source: crate::intermediate_key_identity::IdentityLookupUnavailable::OrganizationQuery(
-                        sqlx::Error::Io(std::io::Error::new(
+                        DbError::from(sqlx::Error::Io(std::io::Error::new(
                             std::io::ErrorKind::ConnectionRefused,
                             "connection refused",
-                        )),
+                        ))),
                     ),
                 },
             )

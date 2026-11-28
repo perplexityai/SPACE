@@ -1661,18 +1661,18 @@ async fn every_credential_mapper_answers_a_lost_lock_race_as_unavailable()
         let raise = || pplx_space_db_test_fixtures::raise_sqlstate(&db.pool, sqlstate);
 
         assert_eq!(
-            kek_store_error_to_status(KekStoreError::Query(raise().await)).code(),
+            kek_store_error_to_status(KekStoreError::Query(DbError::from(raise().await))).code(),
             tonic::Code::Unavailable,
             "{sqlstate} on a KEK lookup"
         );
         assert_eq!(
-            provision_error_to_status(ProvisionError::Db(raise().await)).code(),
+            provision_error_to_status(ProvisionError::Db(DbError::from(raise().await))).code(),
             tonic::Code::Unavailable,
             "{sqlstate} while provisioning a KEK"
         );
         assert_eq!(
             volume_wrap_store_error_to_status(
-                crate::volume_wrap_store::VolumeWrapStoreError::Query(raise().await)
+                crate::volume_wrap_store::VolumeWrapStoreError::Query(DbError::from(raise().await))
             )
             .code(),
             tonic::Code::Unavailable,
@@ -1681,7 +1681,7 @@ async fn every_credential_mapper_answers_a_lost_lock_race_as_unavailable()
         assert_eq!(
             credential_store_error_to_status(
                 "sandbox owner lookup failed",
-                crate::credential_store::CredentialStoreError::Query(raise().await),
+                crate::credential_store::CredentialStoreError::Query(DbError::from(raise().await)),
             )
             .code(),
             tonic::Code::Unavailable,
@@ -1692,9 +1692,9 @@ async fn every_credential_mapper_answers_a_lost_lock_race_as_unavailable()
     // A real failure keeps `Internal`, and a corrupt KEK row — which is not a
     // `Query` at all — must not be swept into the retryable branch.
     assert_eq!(
-        kek_store_error_to_status(KekStoreError::Query(
+        kek_store_error_to_status(KekStoreError::Query(DbError::from(
             pplx_space_db_test_fixtures::raise_sqlstate(&db.pool, "23505").await
-        ))
+        )))
         .code(),
         tonic::Code::Internal
     );
@@ -1721,6 +1721,17 @@ async fn every_credential_mapper_answers_a_lost_lock_race_as_unavailable()
         tonic::Code::Internal
     );
     Ok(())
+}
+
+/// A volume wrap that is not visible after the store's insert maps to
+/// `Internal`, not the retryable contention status.
+#[test]
+fn a_missing_stored_volume_wrap_is_internal() {
+    let status = volume_wrap_store_error_to_status(
+        crate::volume_wrap_store::VolumeWrapStoreError::StoredRowMissing,
+    );
+    assert_eq!(status.code(), tonic::Code::Internal);
+    assert_eq!(status.message(), "sandbox volume wrap lookup failed");
 }
 
 #[test]

@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use pplx_space_accounts::OrgId;
 use pplx_space_byok_model::{KekProvider, MasterKeyIdentifier};
+use pplx_space_postgres_pool::{Db, DbError};
 use pplx_space_sandbox_model::SandboxId;
 use uuid::Uuid;
 
@@ -27,15 +28,9 @@ pub enum ProvisionError {
     #[error(transparent)]
     KekStore(#[from] KekStoreError),
     #[error("provisioning transaction failed: {0}")]
-    Db(#[from] sqlx::Error),
+    Db(#[from] DbError),
     #[error("provisioning raced a concurrent writer and no active KEK is visible; retry")]
     LostRaceWithoutWinner,
-}
-
-impl From<pplx_space_postgres_pool::DbError> for ProvisionError {
-    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
-        Self::from(sqlx::Error::from(error))
-    }
 }
 
 /// Provision an active KEK for an org that has none. A trait so the service
@@ -52,13 +47,13 @@ pub trait KekProvisioner: Send + Sync + 'static {
 /// [`KekProvisioner`] for [`KekProvider::IntermediateKeyBroker`]: mints a
 /// intermediate key at the broker and persists the KEK row + wrapped blob.
 pub struct IntermediateKeyProvisioner {
-    pool: sqlx::PgPool,
+    pool: Db,
     kek_store: PgKekStore,
     provider: Arc<dyn IntermediateKeyBrokerApi>,
 }
 
 impl IntermediateKeyProvisioner {
-    pub fn new(pool: sqlx::PgPool, provider: Arc<dyn IntermediateKeyBrokerApi>) -> Self {
+    pub fn new(pool: Db, provider: Arc<dyn IntermediateKeyBrokerApi>) -> Self {
         Self {
             kek_store: PgKekStore::new(pool.clone()),
             pool,
@@ -89,7 +84,7 @@ impl KekProvisioner for IntermediateKeyProvisioner {
 
         let mut tx = self.pool.begin().await?;
         let inserted: Option<Uuid> = pplx_space_byok_store::insert_active_master_key(
-            &mut *tx,
+            &mut tx,
             org,
             KekProvider::IntermediateKeyBroker,
             &issued.key_id,
@@ -99,7 +94,7 @@ impl KekProvisioner for IntermediateKeyProvisioner {
         match inserted {
             Some(cmk_id) => {
                 pplx_space_byok_store::insert_branching_key(
-                    &mut *tx,
+                    &mut tx,
                     cmk_id,
                     org,
                     &issued.wrapped_key,
@@ -140,13 +135,13 @@ impl KekProvisioner for IntermediateKeyProvisioner {
 /// opt-in; keeping the database write here ensures API services never become
 /// key authorities, even in local development.
 pub struct InMemoryKekProvisioner {
-    pool: sqlx::PgPool,
+    pool: Db,
     kek_store: PgKekStore,
     key_identifier: MasterKeyIdentifier,
 }
 
 impl InMemoryKekProvisioner {
-    pub fn new(pool: sqlx::PgPool, key_identifier: MasterKeyIdentifier) -> Self {
+    pub fn new(pool: Db, key_identifier: MasterKeyIdentifier) -> Self {
         Self {
             kek_store: PgKekStore::new(pool.clone()),
             pool,
