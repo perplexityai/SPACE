@@ -14,9 +14,10 @@ log() { echo "[install-observability] $*"; }
 
 # Run each queued command in the background, then print each one's output in
 # queue order, so the log reads as if they ran one after another. Fails, after
-# printing everything, when any of them failed. The mirror pulls, the image
-# loads and the metrics and traces releases are each independent of the
-# others; run one by one they took most of a CI shard's two-minute install.
+# printing everything, when any of them failed. The mirror pulls, the source
+# pulls, the image loads and the metrics, traces and logs releases are each
+# independent of the others; run one by one they took most of a CI shard's
+# two-minute install.
 parallel_queue=()
 queue() { parallel_queue+=("$*"); }
 run_queued() {
@@ -83,6 +84,17 @@ load_pinned_images() {
     done
     (( ${#parallel_queue[@]} == 0 )) || run_queued "mirror pull" ||
       echo "::warning::Could not take the observability images from the mirror; the kubelets pull them"
+  else
+    # Elsewhere each image comes from its source at the listed digest, and
+    # those pulls are as independent of each other as the mirror's, so they
+    # run at once too. One that fails is pulled again on its own below.
+    for name in "${pinned[@]}"; do
+      listed="$(bash "$repo_root/ci/scripts/mirror-images.sh" pinned "$name")" || continue
+      tag="${name%%@*}"
+      queue "$(printf '%q ' bash -c 'docker image inspect "$1" >/dev/null 2>&1 || docker pull --quiet "$1" >/dev/null' \
+        _ "${tag%:*}@${listed##*@}")"
+    done
+    (( ${#parallel_queue[@]} == 0 )) || run_queued "source pull" || true
   fi
   for name in "${pinned[@]}"; do
     tag="${name%%@*}"
@@ -161,17 +173,19 @@ elif [[ $(field install_observability) == True ]]; then
   load_pinned_images
   signals=$(python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["local_signals"]))' <<<"$plan")
   grafana=(--set datasources.prometheus.enabled=false --set datasources.tempo.enabled=false)
-  # The metrics and traces receivers are their own charts in their own
-  # namespaces, so they install at once. Logs and then Grafana keep their
-  # place after them.
+  # The metrics and traces receivers and the logs backend are each their own
+  # chart in their own namespace, and none reads another, so they install at
+  # once. Logs, the slowest (Loki's rollout and then Alloy's on every node),
+  # waited about 11 s for the other two in Kind CI. Grafana, whose datasources
+  # name them, follows them.
   while IFS= read -r signal; do
     [[ -n $signal ]] || continue
     queue "$(printf '%q ' bash "$kind_dir/$signal/local.sh" up "${backend_scheduling[@]}")"
     if [[ $signal == metrics ]]; then datasource=prometheus; else datasource=tempo; fi
     grafana+=(--set "datasources.$datasource.enabled=true")
   done <<<"$signals"
-  (( ${#parallel_queue[@]} == 0 )) || run_queued "release"
-  bash "$kind_dir/logs/local.sh" up "${backend_scheduling[@]}"
+  queue "$(printf '%q ' bash "$kind_dir/logs/local.sh" up "${backend_scheduling[@]}")"
+  run_queued "release"
   # External OTLP ingestion URLs are not Prometheus/Tempo query URLs.
   if [[ $layout == full ]]; then
     bash "$kind_dir/grafana/local.sh" up "${grafana[@]}"

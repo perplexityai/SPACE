@@ -307,7 +307,11 @@ class HelperGuardTests(unittest.TestCase):
                     self.assertIn("datasources.prometheus.enabled=false", log)
                     self.assertIn("datasources.tempo.enabled=false", log)
                 else:
-                    self.assertLess(log.index("space-metrics "), log.index("helm install space-logs"))
+                    # Metrics, traces and logs install at once; Grafana,
+                    # whose datasources name them, only after all three.
+                    for receiver in ("helm upgrade --install space-metrics ",
+                                     "helm upgrade --install space-traces "):
+                        self.assertLess(log.index(receiver), log.index("helm upgrade --install space-grafana"))
                     self.assertIn("datasources.prometheus.enabled=true", log)
                     self.assertIn("datasources.tempo.enabled=true", log)
                 self.assertNotIn("delete namespace", log)

@@ -907,20 +907,22 @@ run_bench() {
   # Everything up to the Rust handoff is Rust-independent, so it overlaps the
   # host's build, in kind-ci.yml's order. CI's UI pre-build has no step here:
   # the layer cache holds the host's whole UI build (UI_CACHE_SCOPE).
-  # SPACE_CI_IMAGE_MIRROR for this step only: with it the bring-up loads the
-  # infra charts' third-party images into the infra node from the bench's
-  # daemon (bootstrap_kind_stack__load_mirrored_chart_images), so they come
-  # through the host's Docker Hub mirror instead of one kubelet pull per bench.
-  # Where the GHCR mirror is unreadable each image falls back to its source.
-  phase "bench$i" prepare_cluster bx env SPACE_CI_IMAGE_MIRROR="${SPACE_CI_IMAGE_MIRROR:-ghcr}" \
-    bash "$src/infra/space/kind/scripts/prepare-cluster.sh" || return 1
-  # As CI's step runs it: a failed preflight fails the bench.
+  # SPACE_CI_IMAGE_MIRROR for the cluster preparation only (--prepare-mirror):
+  # with it the bring-up loads the infra charts' third-party images into the
+  # infra node from the bench's daemon
+  # (bootstrap_kind_stack__load_mirrored_chart_images), so they come through
+  # the host's Docker Hub mirror instead of one kubelet pull per bench. Where
+  # the GHCR mirror is unreadable each image falls back to its source. The
+  # observability install keeps the bench's own environment, as its own phase
+  # did: its fallback from an unreadable mirror pulls each image's
+  # multi-platform index, which `kind load` cannot import.
+  # The observability profile is installed as CI's step installs it
+  # (prepare-cluster.sh --observability): a failed preflight fails the bench.
   # Bounded at 30 min, as CI bounds the step: `kind load` and `ctr images ls`
   # have no deadline of their own.
-  phase "bench$i" observability bx env SPACE_KIND_CLUSTER=space-local timeout --kill-after=30 1800 bash -c '
-      set -euo pipefail
-      python3 infra/space/kind/scripts/datadog_backend.py preflight --for-deployment >/dev/null
-      bash infra/space/kind/scripts/install-observability.sh' || return 1
+  phase "bench$i" prepare_cluster bx env SPACE_KIND_CLUSTER=space-local timeout --kill-after=30 1800 \
+    bash "$src/infra/space/kind/scripts/prepare-cluster.sh" --observability \
+    --prepare-mirror "${SPACE_CI_IMAGE_MIRROR:-ghcr}" || return 1
   await rust || return 1
   phase "bench$i" rust_handoff bx python3 "$src/infra/space/kind/scripts/rust-artifact-handoff.py" \
     load "$HOST/rust" || return 1

@@ -13,6 +13,9 @@
 #      command, so the image build never reads a directory being rewritten.
 #   3. Without flock it refuses to run: two unguarded privileged builds would
 #      write the same rootfs.
+#   4. `--builder-only`, which Kind CI runs while the Rust producer builds,
+#      waits for the lock like a build, builds no rootfs, needs no guest
+#      binaries, and creates the sandbox SSH keypair.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -184,7 +187,37 @@ if grep -q "^$out " "$STUB_RUNS"; then
     fail "case 3: without flock the rootfs builder still ran" "$work/case3.log"
 fi
 
+# Case 4: --builder-only (Kind CI runs it while the Rust producer builds)
+# writes the cloud image cache a seed build reads, so it waits for the lock
+# like a build, and it builds no rootfs and needs no guest binaries. It
+# creates the sandbox SSH keypair, in a HOME that has none.
+out="$work/out4"
+home4="$work/home4"
+mkdir -p "$out" "$home4"
+exec 9>>"$out/.build.lock"
+flock -x 9
+HOME="$home4" SPACE_SEED_OUTPUT_DIR="$out" SPACE_SEED_GUEST_BIN_DIR="$work/absent" PATH="$base_path" \
+    bash "$script" --builder-only >"$work/case4.log" 2>&1 9>&- &
+pids+=("$!")
+builder=$!
+if ! wait_for 'grep -q "build.lock is held" "$work/case4.log"'; then
+    fail "case 4: --builder-only did not wait on a held lock" "$work/case4.log"
+fi
+exec 9>&-
+rc=0
+wait "$builder" || rc=$?
+if (( rc != 0 )) || ! grep -q "building seed builder image" "$work/case4.log"; then
+    fail "case 4: --builder-only did not build the seed builder (rc $rc)" "$work/case4.log"
+fi
+if grep -q "^$out " "$STUB_RUNS" || [[ -e "$out/rootfs.ext4" || -e "$out/.inputs-sha256" ]]; then
+    fail "case 4: --builder-only built or stamped a seed" "$work/case4.log"
+fi
+for key in sandbox_ed25519 sandbox_ed25519.pub; do
+    [[ -f "$home4/.space-devbox/kind/ssh/$key" ]] \
+        || fail "case 4: --builder-only did not create $key" "$work/case4.log"
+done
+
 if (( status == 0 )); then
-    echo "ok: build-seed.sh reads its inputs only once it holds its lock, a build waits for a --read-lock reader, and it refuses to run without flock"
+    echo "ok: build-seed.sh reads its inputs only once it holds its lock, a build waits for a --read-lock reader, it refuses to run without flock, and --builder-only builds only the builder and the SSH keypair"
 fi
 exit "$status"
