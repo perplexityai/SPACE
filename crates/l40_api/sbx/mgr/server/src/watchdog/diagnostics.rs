@@ -16,9 +16,10 @@
 //!   `accepted` means the guest kernel still services vsock, so a failing
 //!   agent RPC points at the agent; `timeout` means the kernel did not answer;
 //! - a resource sample of the VM's jailer cgroup (CPU use and throttling over
-//!   a short window, CPU and memory pressure, memory use, OOM kills), to tell
-//!   a starved or memory-exhausted guest from one that stalled while idle,
-//!   and the first of its reads that failed;
+//!   a short window, CPU, memory and IO pressure, memory use, page cache and
+//!   its dirty and writeback parts, cumulative IO, OOM kills), to tell a
+//!   starved, memory-exhausted or writeback-throttled guest from one that
+//!   stalled while idle, and the first of its reads that failed;
 //! - when the composed status became `Degraded`, at most once per
 //!   [`CONSOLE_TAIL_MIN_INTERVAL`] per sandbox, bounded tails of the
 //!   Firecracker log and of the guest console file, when one exists.
@@ -736,7 +737,8 @@ impl EvidenceStage {
 /// One sample of the VM's jailer cgroup, which holds only the Firecracker
 /// process and its vCPU threads. Every field is best effort: a file that
 /// cannot be read (for example PSI disabled on the host) leaves its fields
-/// unset and is counted in `errors`.
+/// unset and is counted in `errors`, except the IO files, whose absence
+/// leaves their fields unset silently.
 #[derive(Debug, Default)]
 struct ResourceSample {
     window: Option<Duration>,
@@ -750,11 +752,26 @@ struct ResourceSample {
     memory_current_mib: Option<u64>,
     /// Anonymous memory: the guest RAM Firecracker has touched.
     memory_anon_mib: Option<u64>,
+    /// Page cache charged to the VM (host-side disk page cache and, for
+    /// snapshot-restored VMs using a file-backed memory mapping, read-only
+    /// guest RAM pages before copy-on-write), plus the parts waiting for and
+    /// under writeback. With guest RAM fully touched, dirty pages here
+    /// throttle the VM's writes without raising memory pressure.
+    memory_file_mib: Option<u64>,
+    memory_file_dirty_mib: Option<u64>,
+    memory_file_writeback_mib: Option<u64>,
     memory_max_mib: Option<u64>,
     memory_pressure_some_avg10: Option<f64>,
     /// Times usage hit `memory.max`, and OOM kills, over the cgroup's life.
     memory_max_events: Option<u64>,
     memory_oom_kills: Option<u64>,
+    /// Cumulative MiB read and written, summed across all `io.stat` device
+    /// lines over the cgroup's life. Stacked block devices (such as
+    /// device-mapper over loop) are summed per layer and can double-count
+    /// bytes, so treat these totals as a relative/trend signal.
+    io_read_mib: Option<u64>,
+    io_write_mib: Option<u64>,
+    io_pressure_some_avg10: Option<f64>,
     errors: SampleErrors,
 }
 
@@ -773,12 +790,30 @@ impl SampleErrors {
         match reads.small(path.clone()).await {
             Ok(content) => Some(content),
             Err(error) => {
-                self.count += 1;
-                self.first
-                    .get_or_insert_with(|| format!("{}: {error}", path.display()));
+                self.record(&path, &error);
                 None
             }
         }
+    }
+
+    /// Read a small cgroup file that may be absent, as `io.stat` is when the
+    /// io controller is not enabled for the cgroup: only a failure other than
+    /// absence is recorded.
+    async fn read_if_present(&mut self, reads: &HostReads, path: PathBuf) -> Option<String> {
+        match reads.small(path.clone()).await {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                self.record(&path, &error);
+                None
+            }
+        }
+    }
+
+    fn record(&mut self, path: &Path, error: &std::io::Error) {
+        self.count += 1;
+        self.first
+            .get_or_insert_with(|| format!("{}: {error}", path.display()));
     }
 
     fn summary(&self) -> Option<String> {
@@ -836,11 +871,13 @@ impl ResourceSample {
             .read(reads, cgroup.join("memory.current"))
             .await
             .and_then(mib);
-        self.memory_anon_mib = errors
-            .read(reads, cgroup.join("memory.stat"))
-            .await
-            .and_then(|content| keyed_u64(&content, "anon"))
-            .map(|bytes| bytes / MIB);
+        if let Some(content) = errors.read(reads, cgroup.join("memory.stat")).await {
+            let stat_mib = |key| keyed_u64(&content, key).map(|bytes| bytes / MIB);
+            self.memory_anon_mib = stat_mib("anon");
+            self.memory_file_mib = stat_mib("file");
+            self.memory_file_dirty_mib = stat_mib("file_dirty");
+            self.memory_file_writeback_mib = stat_mib("file_writeback");
+        }
         self.memory_max_mib = errors
             .read(reads, cgroup.join("memory.max"))
             .await
@@ -853,6 +890,14 @@ impl ResourceSample {
             self.memory_max_events = keyed_u64(&content, "max");
             self.memory_oom_kills = keyed_u64(&content, "oom_kill");
         }
+        if let Some(content) = errors.read_if_present(reads, cgroup.join("io.stat")).await {
+            self.io_read_mib = io_stat_total(&content, "rbytes").map(|bytes| bytes / MIB);
+            self.io_write_mib = io_stat_total(&content, "wbytes").map(|bytes| bytes / MIB);
+        }
+        self.io_pressure_some_avg10 = errors
+            .read_if_present(reads, cgroup.join("io.pressure"))
+            .await
+            .and_then(|content| psi_average(&content, "some", "avg10"));
     }
 }
 
@@ -980,10 +1025,16 @@ impl TransitionEvidence {
             vm_cpu_pressure_some_avg60 = resources.cpu_pressure_some_avg60,
             vm_memory_current_mib = resources.memory_current_mib,
             vm_memory_anon_mib = resources.memory_anon_mib,
+            vm_memory_file_mib = resources.memory_file_mib,
+            vm_memory_file_dirty_mib = resources.memory_file_dirty_mib,
+            vm_memory_file_writeback_mib = resources.memory_file_writeback_mib,
             vm_memory_max_mib = resources.memory_max_mib,
             vm_memory_pressure_some_avg10 = resources.memory_pressure_some_avg10,
             vm_memory_max_events = resources.memory_max_events,
             vm_memory_oom_kills = resources.memory_oom_kills,
+            vm_io_read_mib = resources.io_read_mib,
+            vm_io_write_mib = resources.io_write_mib,
+            vm_io_pressure_some_avg10 = resources.io_pressure_some_avg10,
             vm_sample_error = sample_error.as_deref(),
             resource_window_ms = resources.window.map(duration_ms),
             console_tails = request.console_tails.as_str(),
@@ -1081,6 +1132,33 @@ pub(super) fn keyed_u64(content: &str, key: &str) -> Option<u64> {
         let (name, value) = line.split_once(' ')?;
         (name == key).then(|| value.trim().parse().ok()).flatten()
     })
+}
+
+/// The sum of one counter over the device lines of `io.stat`, such as
+/// `259:0 rbytes=4096 wbytes=0 rios=1 wios=0 dbytes=0 dios=0`. The kernel
+/// lists only devices the cgroup has used, so a file without device lines
+/// reads as zero; a counter no device line carries is unknown. Stacked
+/// block devices appear on separate lines and can be counted more than once.
+fn io_stat_total(content: &str, key: &str) -> Option<u64> {
+    let mut total = 0u64;
+    let mut devices = 0;
+    let mut carried = false;
+    for line in content.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next().is_none() {
+            continue;
+        }
+        devices += 1;
+        let value = fields.find_map(|pair| {
+            let (name, value) = pair.split_once('=')?;
+            (name == key).then(|| value.parse::<u64>().ok()).flatten()
+        });
+        if let Some(value) = value {
+            total = total.saturating_add(value);
+            carried = true;
+        }
+    }
+    (carried || devices == 0).then_some(total)
 }
 
 /// One average from a PSI file line such as
