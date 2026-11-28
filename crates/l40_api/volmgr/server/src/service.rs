@@ -287,6 +287,39 @@ impl VolumeManagerService {
         })
     }
 
+    fn submit_object_copy(
+        &self,
+        request: Request<crate::proto::CopyObjectRequest>,
+        operation: &'static str,
+        kind: &'static str,
+    ) -> Result<Response<SubmitTransferResponse>, Status> {
+        let peer =
+            self.peer_authorizer
+                .authorize_request(&request, operation, SANDBOX_MANAGER_PEERS)?;
+        let _admission = self.transfer_admission.enter_queued()?;
+        let payload = crate::executor::copy::CopyPayload::try_from(request.into_inner())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.authorize_sandbox_subject(&peer, payload.subject(), operation)?;
+        if payload.kind() != kind {
+            return Err(Status::invalid_argument(
+                "copy RPC does not match destination storage class",
+            ));
+        }
+        let json =
+            serde_json::to_string(&payload).map_err(|error| Status::internal(error.to_string()))?;
+        // Reuse live work, but reverify after completion: retention may have
+        // removed a previous destination before this new submission.
+        let job_id = self.worker.submit(
+            kind,
+            &json,
+            Some(&payload.subject().to_string()),
+            Some(&payload.dedup_key()),
+        )?;
+        Ok(Response::new(SubmitTransferResponse {
+            job_id: job_id.to_string(),
+        }))
+    }
+
     fn authorize_sandbox_subject(
         &self,
         peer: &AuthorizedUdsPeer,
@@ -681,7 +714,10 @@ fn job_to_proto(job: Job) -> Result<TransferJob, Status> {
         .as_ref()
         .map(|p| p.s3_uri.clone())
         .unwrap_or_default();
-    if job.kind == crate::executor::copy::KIND {
+    if matches!(
+        job.kind.as_str(),
+        crate::executor::copy::KIND | crate::executor::copy::CLASSED_KIND
+    ) {
         let copy: crate::executor::copy::CopyPayload = job
             .payload_as()
             .map_err(|error| Status::internal(format!("invalid copy job: {error}")))?;
@@ -1364,28 +1400,18 @@ impl VolumeManager for VolumeManagerService {
         &self,
         request: Request<crate::proto::CopyObjectRequest>,
     ) -> Result<Response<SubmitTransferResponse>, Status> {
-        let peer = self.peer_authorizer.authorize_request(
-            &request,
-            "submit_copy_object",
-            SANDBOX_MANAGER_PEERS,
-        )?;
-        let _admission = self.transfer_admission.enter_queued()?;
-        let payload = crate::executor::copy::CopyPayload::try_from(request.into_inner())
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        self.authorize_sandbox_subject(&peer, payload.subject(), "submit_copy_object")?;
-        let json =
-            serde_json::to_string(&payload).map_err(|error| Status::internal(error.to_string()))?;
-        // Reuse live work, but reverify after completion: retention may have
-        // removed a previous destination before this new submission.
-        let job_id = self.worker.submit(
-            crate::executor::copy::KIND,
-            &json,
-            Some(&payload.subject().to_string()),
-            Some(&payload.dedup_key()),
-        )?;
-        Ok(Response::new(SubmitTransferResponse {
-            job_id: job_id.to_string(),
-        }))
+        self.submit_object_copy(request, "submit_copy_object", crate::executor::copy::KIND)
+    }
+
+    async fn submit_classed_copy_object(
+        &self,
+        request: Request<crate::proto::CopyObjectRequest>,
+    ) -> Result<Response<SubmitTransferResponse>, Status> {
+        self.submit_object_copy(
+            request,
+            "submit_classed_copy_object",
+            crate::executor::copy::CLASSED_KIND,
+        )
     }
 
     async fn get_transfer_job(

@@ -3,10 +3,16 @@
 
 use super::*;
 use pplx_space_artifact_model::{ExactStorageUri, StorageUriParseError};
+use pplx_space_object_store::CopyStorageClass;
 use pplx_space_subject_model::SubjectIdParseError;
-use pplx_space_volmgr_client::proto::CopyObjectRequest;
+use pplx_space_volmgr_client::proto::{
+    CopyObjectRequest, CopyStorageClass as WireCopyStorageClass,
+};
 
 pub(crate) const KIND: &str = "copy_object";
+// A worker that predates explicit classes must reject these recovered jobs
+// rather than deserializing them as ordinary copies.
+pub(crate) const CLASSED_KIND: &str = "copy_object_with_storage_class";
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CopyInputError {
@@ -20,6 +26,8 @@ pub(crate) enum CopyInputError {
     DifferentStore,
     #[error("copy requires two different, nonempty object keys")]
     InvalidObjects,
+    #[error("invalid destination storage class: {0}")]
+    InvalidStorageClass(i32),
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -28,6 +36,7 @@ pub(crate) struct CopyPayload {
     subject: SubjectId,
     source: ExactStorageUri,
     destination: ExactStorageUri,
+    storage_class: Option<CopyStorageClass>,
 }
 
 impl TryFrom<CopyObjectRequest> for CopyPayload {
@@ -52,10 +61,23 @@ impl TryFrom<CopyObjectRequest> for CopyPayload {
         if a.key_prefix.is_empty() || b.key_prefix.is_empty() || a.key_prefix == b.key_prefix {
             return Err(CopyInputError::InvalidObjects);
         }
+        let storage_class = request
+            .destination_storage_class
+            .map(|value| match WireCopyStorageClass::try_from(value) {
+                Ok(WireCopyStorageClass::Standard) => Ok(CopyStorageClass::Standard),
+                Ok(WireCopyStorageClass::GlacierInstantRetrieval) => {
+                    Ok(CopyStorageClass::GlacierInstantRetrieval)
+                }
+                Ok(WireCopyStorageClass::Unspecified) | Err(_) => {
+                    Err(CopyInputError::InvalidStorageClass(value))
+                }
+            })
+            .transpose()?;
         Ok(Self {
             subject,
             source,
             destination,
+            storage_class,
         })
     }
 }
@@ -66,6 +88,12 @@ impl From<CopyPayload> for CopyObjectRequest {
             subject_id: payload.subject.to_string(),
             source_s3_uri: payload.source.as_wire().to_string(),
             destination_s3_uri: payload.destination.as_wire().to_string(),
+            destination_storage_class: payload.storage_class.map(|class| match class {
+                CopyStorageClass::Standard => WireCopyStorageClass::Standard as i32,
+                CopyStorageClass::GlacierInstantRetrieval => {
+                    WireCopyStorageClass::GlacierInstantRetrieval as i32
+                }
+            }),
         }
     }
 }
@@ -78,6 +106,13 @@ impl CopyPayload {
         &self.destination
     }
 
+    pub(crate) fn kind(&self) -> &'static str {
+        match self.storage_class {
+            None => KIND,
+            Some(_) => CLASSED_KIND,
+        }
+    }
+
     pub(crate) fn dedup_key(&self) -> String {
         let mut hash = Sha256::new();
         for value in [
@@ -88,7 +123,12 @@ impl CopyPayload {
             hash.update((value.len() as u64).to_be_bytes());
             hash.update(value.as_bytes());
         }
-        format!("{KIND}:{}", hex_encode(&hash.finalize()))
+        if let Some(class) = self.storage_class {
+            let value = class.as_str();
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value.as_bytes());
+        }
+        format!("{}:{}", self.kind(), hex_encode(&hash.finalize()))
     }
 }
 
@@ -101,6 +141,12 @@ impl TransferExecutor {
         let payload: CopyPayload = job.payload_as().map_err(|error| {
             JobError::permanent_with_reason(JobFailureReason::InvalidInput, error)
         })?;
+        if job.kind != payload.kind() {
+            return Err(JobError::permanent_with_reason(
+                JobFailureReason::InvalidInput,
+                "copy job kind does not match destination storage class",
+            ));
+        }
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(JobError::retriable("object copy cancelled")),
@@ -134,16 +180,34 @@ impl TransferExecutor {
                     "copy source object is missing",
                 )
             })?;
-        self.store
-            .copy_object(&creds, source_target, destination_target, source_meta.size)
-            .await
-            .map_err(|error| classify(&error))?;
-        let destination_meta = self
-            .store
-            .head(&creds, destination_target)
-            .await
-            .map_err(|error| classify(&error))?
-            .ok_or_else(|| JobError::retriable("copied object is not visible"))?;
+        let destination_meta = if let Some(class) = payload.storage_class {
+            self.store
+                .copy_object_with_storage_class(
+                    &creds,
+                    source_target,
+                    destination_target,
+                    source_meta.size,
+                    class,
+                )
+                .await
+                .map_err(|error| match error {
+                    ObjectStoreError::CopyStorageClassUnsupported
+                    | ObjectStoreError::CopyStorageClassMismatch { .. } => {
+                        JobError::permanent_with_reason(JobFailureReason::InvalidInput, error)
+                    }
+                    _ => classify(&error),
+                })?
+        } else {
+            self.store
+                .copy_object(&creds, source_target, destination_target, source_meta.size)
+                .await
+                .map_err(|error| classify(&error))?;
+            self.store
+                .head(&creds, destination_target)
+                .await
+                .map_err(|error| classify(&error))?
+                .ok_or_else(|| JobError::retriable("copied object is not visible"))?
+        };
         if destination_meta.size != source_meta.size {
             return Err(JobError::retriable(format!(
                 "copied object length {} differs from source length {}",
