@@ -688,6 +688,10 @@ enum NodeRefusal {
     /// The node refuses the request as invalid, and the apiserver throttles
     /// the first watch of the pod's events.
     InvalidAfterThrottledWatch,
+    /// A memory refusal is already recorded when readiness begins, while
+    /// kubelet has already assigned the pod an IP on a healthy worker: the
+    /// assigned IP wins over the stale refusal.
+    MemoryAfterPodIpAssigned,
     Memory,
     MemoryWithFlagOff,
     MemoryWithFlagUnset,
@@ -695,13 +699,18 @@ enum NodeRefusal {
 }
 
 /// Invalid requests and opt-in memory refusals fail with the node's reason,
-/// delete the pod and retire its execution. Other refusals leave kubelet to
-/// retry until the readiness deadline. Events come from a pod-scoped watch,
-/// including after the apiserver throttles it.
+/// delete the pod and retire its execution, unless kubelet has already assigned
+/// the pod an IP. Other refusals leave kubelet to retry until the readiness
+/// deadline. Events come from the process's one reason-filtered watch,
+/// including after the apiserver throttles it, and the create reads none of its
+/// own. Same-poll lookup-error, expired-deadline, and stalled-precheck
+/// arbitration in `wait_for_pod_ip_assignment` are pinned by
+/// `pod_ip_wait_arbitrates_refusal_boundaries`.
 #[rstest::rstest]
 #[case::invalid_request_fails_the_create(NodeRefusal::Invalid)]
 #[case::other_refusals_wait_for_the_deadline(NodeRefusal::Retryable)]
 #[case::a_throttled_watch_is_watched_again(NodeRefusal::InvalidAfterThrottledWatch)]
+#[case::assigned_pod_ip_beats_prerecorded_refusal(NodeRefusal::MemoryAfterPodIpAssigned)]
 #[case::memory_refusal_is_retryable(NodeRefusal::Memory)]
 #[case::memory_refusal_waits_with_flag_off(NodeRefusal::MemoryWithFlagOff)]
 #[case::memory_refusal_waits_by_default(NodeRefusal::MemoryWithFlagUnset)]
@@ -722,37 +731,54 @@ async fn create_handles_node_refusal(#[case] refusal: NodeRefusal) -> TestResult
     )]) {
         return Ok(());
     }
+    let pod_has_ip = refusal == NodeRefusal::MemoryAfterPodIpAssigned;
     let fails_fast = matches!(
         refusal,
         NodeRefusal::Invalid | NodeRefusal::InvalidAfterThrottledWatch | NodeRefusal::Memory
     );
     let message = match refusal {
         NodeRefusal::Invalid | NodeRefusal::InvalidAfterThrottledWatch => INVALID_DISK_REFUSAL,
-        NodeRefusal::Memory | NodeRefusal::MemoryWithFlagOff | NodeRefusal::MemoryWithFlagUnset => {
-            MEMORY_REFUSAL
-        }
+        NodeRefusal::Memory
+        | NodeRefusal::MemoryAfterPodIpAssigned
+        | NodeRefusal::MemoryWithFlagOff
+        | NodeRefusal::MemoryWithFlagUnset => MEMORY_REFUSAL,
         NodeRefusal::QueueFull => QUEUE_REFUSAL,
         NodeRefusal::Retryable => RETRYABLE_REFUSAL,
     };
     let db = pplx_space_db_test_fixtures::pg_test_db().await?;
     let sandbox_id = SandboxId::new();
     insert_test_sandbox_row(&db.pool, sandbox_id, "creating").await?;
-    let worker = start_scripted_worker(ScriptedWorkerConfig::new([(
-        SPACED_WAIT_READY,
-        ScriptedReply::Hang,
-    )]))
-    .await?;
+    let worker = if pod_has_ip {
+        start_scripted_worker(ScriptedWorkerConfig::new([])).await?
+    } else {
+        start_scripted_worker(ScriptedWorkerConfig::new([(
+            SPACED_WAIT_READY,
+            ScriptedReply::Hang,
+        )]))
+        .await?
+    };
 
+    let release_on_pod_get = refusal == NodeRefusal::Invalid;
     let pod_name: Arc<Mutex<Option<String>>> = Arc::default();
+    let release_refusal = Arc::new(tokio::sync::Notify::new());
+    let refusal_released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sentinel: Arc<Mutex<Option<super::super::pod_sandbox_rejections::RejectionWait>>> =
+        Arc::default();
     let event_watches = Arc::new(AtomicUsize::new(0));
     let reply_pod_name = Arc::clone(&pod_name);
+    let reply_release_refusal = Arc::clone(&release_refusal);
+    let reply_refusal_released = Arc::clone(&refusal_released);
+    let reply_sentinel = Arc::clone(&sentinel);
     let reply_event_watches = Arc::clone(&event_watches);
     let (client, log) = scripted_kube_client_async(move |request| {
         let pod_name = Arc::clone(&reply_pod_name);
+        let release_refusal = Arc::clone(&reply_release_refusal);
+        let refusal_released = Arc::clone(&reply_refusal_released);
+        let sentinel = Arc::clone(&reply_sentinel);
         let event_watches = Arc::clone(&reply_event_watches);
         async move {
             let name = pod_name.lock().unwrap().clone();
-            let pending = |name: &str| {
+            let pending_pod = |name: &str| {
                 pod_reply(&sandbox_pod(
                     name,
                     &format!("{name}-uid"),
@@ -762,39 +788,123 @@ async fn create_handles_node_refusal(#[case] refusal: NodeRefusal) -> TestResult
                     None,
                 ))
             };
+            let pod_state = |name: &str| {
+                if pod_has_ip {
+                    pod_reply(&running_pod(name, sandbox_id, Some(WORKER_NODE)))
+                } else {
+                    pending_pod(name)
+                }
+            };
             match request.method {
                 Method::POST if request.path == PODS_PATH => {
                     let name = requested_pod_name(&request);
                     *pod_name.lock().unwrap() = Some(name.clone());
-                    pending(&name)
+                    if !release_on_pod_get {
+                        refusal_released.store(true, Ordering::SeqCst);
+                        release_refusal.notify_waiters();
+                        let pre_readiness_wait = sentinel.lock().unwrap().take();
+                        if let Some(wait) = pre_readiness_wait {
+                            let _ = wait.refused(false).await;
+                        }
+                    }
+                    pending_pod(&name)
                 }
                 // The per-pod watch never reports an IP.
                 Method::GET if request.path == PODS_PATH => KubeReply::Hang,
                 Method::GET if name.as_deref().map(pod_path).as_ref() == Some(&request.path) => {
-                    pending(name.as_deref().expect("the pod was created"))
+                    if release_on_pod_get {
+                        refusal_released.store(true, Ordering::SeqCst);
+                        release_refusal.notify_waiters();
+                    }
+                    if refusal == NodeRefusal::Invalid {
+                        KubeReply::Hang
+                    } else {
+                        pod_state(name.as_deref().expect("the pod was created"))
+                    }
                 }
                 Method::GET if request.path == EVENTS_PATH => {
-                    let name = name.expect("events are watched after the pod is created");
+                    let watching = request
+                        .query
+                        .as_deref()
+                        .is_some_and(|query| query.contains("watch=true"));
+                    if !watching {
+                        return KubeReply::Json(
+                            StatusCode::OK,
+                            serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "EventList",
+                                "metadata": { "resourceVersion": "1" },
+                                "items": [],
+                            }),
+                        );
+                    }
                     let watch = event_watches.fetch_add(1, Ordering::SeqCst);
                     if refusal == NodeRefusal::InvalidAfterThrottledWatch && watch == 0 {
                         return kube_status(StatusCode::TOO_MANY_REQUESTS, "TooManyRequests");
                     }
-                    KubeReply::WatchEvents(vec![serde_json::json!({
-                        "type": "ADDED",
-                        "object": {
-                            "apiVersion": "v1",
-                            "kind": "Event",
-                            "metadata": { "name": format!("{name}.1"), "namespace": "space" },
-                            "involvedObject": {
-                                "kind": "Pod",
-                                "name": name,
-                                "uid": format!("{name}-uid"),
+                    let first_refusal_watch =
+                        usize::from(refusal == NodeRefusal::InvalidAfterThrottledWatch);
+                    if watch > first_refusal_watch {
+                        return KubeReply::Hang;
+                    }
+                    // The watch opened before the create: the node's refusal
+                    // arrives once the target phase releases it, followed by a
+                    // sentinel event so non-fail-fast and pre-recorded cases
+                    // confirm the tracker processed the pod's event in stream
+                    // order.
+                    let name = loop {
+                        let notified = release_refusal.notified();
+                        tokio::pin!(notified);
+                        notified.as_mut().enable();
+                        if refusal_released.load(Ordering::SeqCst)
+                            && let Some(name) = pod_name.lock().unwrap().clone()
+                        {
+                            break name;
+                        }
+                        notified.await;
+                    };
+                    KubeReply::WatchEvents(vec![
+                        serde_json::json!({
+                            "type": "ADDED",
+                            "object": {
+                                "apiVersion": "v1",
+                                "kind": "Event",
+                                "metadata": {
+                                    "name": format!("{name}.1"),
+                                    "namespace": "space",
+                                    "resourceVersion": "2",
+                                },
+                                "involvedObject": {
+                                    "kind": "Pod",
+                                    "name": name,
+                                    "uid": format!("{name}-uid"),
+                                },
+                                "reason": "FailedCreatePodSandBox",
+                                "message": message,
+                                "type": "Warning",
                             },
-                            "reason": "FailedCreatePodSandBox",
-                            "message": message,
-                            "type": "Warning",
-                        },
-                    })])
+                        }),
+                        serde_json::json!({
+                            "type": "ADDED",
+                            "object": {
+                                "apiVersion": "v1",
+                                "kind": "Event",
+                                "metadata": {
+                                    "name": "sentinel.1",
+                                    "namespace": "space",
+                                    "resourceVersion": "3",
+                                },
+                                "involvedObject": {
+                                    "kind": "Pod",
+                                    "name": "sentinel",
+                                    "uid": "sentinel-uid",
+                                },
+                                "reason": "FailedCreatePodSandBox",
+                                "message": INVALID_DISK_REFUSAL,
+                                "type": "Warning",
+                            },
+                        }),
+                    ])
                 }
                 Method::DELETE if name.as_deref().map(pod_path).as_ref() == Some(&request.path) => {
                     kube_status(StatusCode::OK, "Success")
@@ -803,11 +913,16 @@ async fn create_handles_node_refusal(#[case] refusal: NodeRefusal) -> TestResult
             }
         }
     });
-    let mut substrate = substrate_on(db.pool.clone(), client, &worker);
+    let mut substrate =
+        substrate_on(db.pool.clone(), client, &worker).with_pod_sandbox_rejection_watch();
+    if !fails_fast || pod_has_ip {
+        *sentinel.lock().unwrap() = Some(substrate.pod_sandbox_rejections.register("sentinel-uid"));
+    }
     substrate.k8s.create_data_plane_ready_timeout = Duration::from_secs(60);
-    if fails_fast {
-        // Only the refusal can end the wait inside the test's bound.
+    if fails_fast || pod_has_ip {
+        // Only the refusal (or the assigned pod IP) can end the wait inside the test's bound.
         substrate.budgets = phase_ending_budgets(substrate.budgets);
+        substrate.budgets.readiness_pod_get = Duration::from_secs(10);
     } else {
         substrate.budgets.create_ready = Duration::from_millis(500);
     }
@@ -822,26 +937,47 @@ async fn create_handles_node_refusal(#[case] refusal: NodeRefusal) -> TestResult
     .await
     .map_err(|_| "the create must end")?;
     let elapsed = started.elapsed();
-    let error = outcome.err().ok_or("the pod never got an IP")?;
     let pod_name = pod_name
         .lock()
         .unwrap()
         .clone()
         .expect("the pod was created");
+    substrate.shutdown_token.cancel();
+    substrate.task_tracker.close();
+    substrate.task_tracker.wait().await;
     let event_reads: Vec<_> = requests_matching(&log, &Method::GET)
         .into_iter()
         .filter(|request| request.path == EVENTS_PATH)
         .collect();
-    assert!(!event_reads.is_empty(), "the wait reads its pod's events");
+    assert!(!event_reads.is_empty(), "the process watches refusals");
     for read in &event_reads {
         let query = read.query.as_deref().unwrap_or_default();
         assert!(
-            query.contains("watch=true")
-                && query.contains("resourceVersion=0")
-                && query.contains(&format!("{pod_name}-uid")),
-            "each read is a watch of the pod's events from the apiserver's cache: {query}"
+            query.contains("fieldSelector=reason%3DFailedCreatePodSandBox")
+                && !query.contains(&pod_name)
+                && !query.contains("involvedObject"),
+            "every read is the process's watch, none the create's own: {query}"
         );
     }
+    if pod_has_ip {
+        let created = outcome.map_err(|err| {
+            format!("an assigned pod IP must beat a pre-recorded refusal: {err:?}")
+        })?;
+        assert_eq!(
+            created
+                .binding
+                .expect("cold create binds its pod")
+                .execution_object_id,
+            format!("{pod_name}-uid")
+        );
+        assert!(
+            requests_matching(&log, &Method::DELETE).is_empty(),
+            "a ready pod with an assigned IP must not be deleted"
+        );
+        assert_eq!(active_execution_count(&db.pool, sandbox_id).await?, 1);
+        return Ok(());
+    }
+    let error = outcome.err().ok_or("the pod never got an IP")?;
     if !fails_fast {
         assert!(
             matches!(error, SubstrateError::Timeout { .. }),
@@ -863,11 +999,11 @@ async fn create_handles_node_refusal(#[case] refusal: NodeRefusal) -> TestResult
         _ => panic!("expected the node's refusal, got {error:?}"),
     }
     // Far inside the production readiness budget, with room for a throttled
-    // watch's re-watch delay and a loaded runner. The watch assertion above,
-    // not this bound, is what rules out polling.
+    // watch's jittered DefaultBackoff and a loaded runner. The watch assertion
+    // above, not this bound, is what rules out polling.
     assert!(
-        elapsed < Duration::from_secs(3),
-        "the refusal, not the readiness budget, ends the create: {elapsed:?}"
+        elapsed < Duration::from_secs(5),
+        "the refusal, not the readiness budget or initial pod GET timeout, ends the create: {elapsed:?}"
     );
     let deletes = requests_matching(&log, &Method::DELETE);
     let [delete] = deletes.as_slice() else {
@@ -879,6 +1015,188 @@ async fn create_handles_node_refusal(#[case] refusal: NodeRefusal) -> TestResult
         0,
         "the execution must be retired"
     );
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefusalBoundary {
+    /// The initial Pod `GET` fails with a 503 on the same poll that records a
+    /// refusal: `biased;` polls the lookup arm first and must still surface the
+    /// recorded refusal rather than the 503 lookup error.
+    LookupErrorAndRefusalReadyTogether,
+    /// The pod-IP wait deadline expires on the same poll that records a
+    /// refusal: `biased;` polls `timeout_at` first (`resolved = None`) and must
+    /// still surface the recorded refusal rather than `Ok(None)`.
+    ExpiredDeadlineAndRefusalReadyTogether,
+    /// A pre-recorded memory refusal runs its IP-resolution precheck while the
+    /// execution table is locked past `deadline`: `timeout_at(deadline, ...)`
+    /// ends the precheck and surfaces the recorded refusal instead of stalling.
+    StalledPrecheckBoundsAtDeadline,
+}
+
+#[rstest::rstest]
+#[case::lookup_error_yields_to_recorded_refusal(
+    RefusalBoundary::LookupErrorAndRefusalReadyTogether
+)]
+#[case::expired_deadline_yields_to_recorded_refusal(
+    RefusalBoundary::ExpiredDeadlineAndRefusalReadyTogether
+)]
+#[case::stalled_precheck_bounds_at_deadline_and_returns_refusal(
+    RefusalBoundary::StalledPrecheckBoundsAtDeadline
+)]
+#[tokio::test(flavor = "current_thread")]
+async fn pod_ip_wait_arbitrates_refusal_boundaries(
+    #[case] boundary: RefusalBoundary,
+) -> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    let pod_name = "space-sbx-refusal-boundary-g1";
+    let pod_uid = "refusal-boundary-uid";
+    insert_test_sandbox_row(&db.pool, sandbox_id, "creating").await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions
+             (sandbox_id, generation, pod_name, pod_namespace, pod_uid, state, active)
+         VALUES ($1, 1, $2, 'space', $3, 'running', TRUE)"
+    ))
+    .bind(sandbox_id)
+    .bind(pod_name)
+    .bind(pod_uid)
+    .execute(&db.pool)
+    .await?;
+
+    let make_refusal_event = |message: &str| -> k8s_openapi::api::core::v1::Event {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": {
+                "name": "refusal-boundary.1",
+                "namespace": "space",
+                "resourceVersion": "2",
+            },
+            "involvedObject": {
+                "kind": "Pod",
+                "name": pod_name,
+                "uid": pod_uid,
+            },
+            "reason": "FailedCreatePodSandBox",
+            "message": message,
+            "type": "Warning",
+        }))
+        .expect("valid refusal Event JSON")
+    };
+
+    let mut substrate =
+        substrate_with_inventory_caches_and_pool(Vec::new(), vec![worker_node()], db.pool.clone());
+    substrate.budgets.reflector_wait = Duration::ZERO;
+    let rejections = substrate.pod_sandbox_rejections.clone();
+    let wall_now = jiff::Timestamp::now();
+    let deadline = match boundary {
+        RefusalBoundary::LookupErrorAndRefusalReadyTogether => {
+            Instant::now() + Duration::from_secs(5)
+        }
+        RefusalBoundary::ExpiredDeadlineAndRefusalReadyTogether
+        | RefusalBoundary::StalledPrecheckBoundsAtDeadline => {
+            Instant::now() + Duration::from_millis(60)
+        }
+    };
+
+    let client = match boundary {
+        RefusalBoundary::LookupErrorAndRefusalReadyTogether => {
+            let rejections = rejections.clone();
+            let event = make_refusal_event(INVALID_DISK_REFUSAL);
+            let (client, _) = scripted_kube_client(move |request| {
+                if request.method == Method::GET && request.path == pod_path(pod_name) {
+                    rejections.observe(&event, wall_now, Instant::now());
+                    kube_status(StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable")
+                } else {
+                    kube_status(StatusCode::BAD_REQUEST, "BadRequest")
+                }
+            });
+            client
+        }
+        RefusalBoundary::ExpiredDeadlineAndRefusalReadyTogether => {
+            let rejections = rejections.clone();
+            let event = make_refusal_event(INVALID_DISK_REFUSAL);
+            let pending = sandbox_pod(pod_name, pod_uid, sandbox_id, 1, "Pending", None);
+            let (client, _) = scripted_kube_client_async(move |request| {
+                let rejections = rejections.clone();
+                let event = event.clone();
+                let pending = pending.clone();
+                async move {
+                    if request.method == Method::GET && request.path == pod_path(pod_name) {
+                        pod_reply(&pending)
+                    } else if request.method == Method::GET && request.path == PODS_PATH {
+                        tokio::time::sleep_until(deadline).await;
+                        rejections.observe(&event, wall_now, Instant::now());
+                        KubeReply::Hang
+                    } else {
+                        kube_status(StatusCode::BAD_REQUEST, "BadRequest")
+                    }
+                }
+            });
+            client
+        }
+        RefusalBoundary::StalledPrecheckBoundsAtDeadline => {
+            let (client, _) = scripted_kube_client(|_| KubeReply::Hang);
+            client
+        }
+    };
+    substrate.k8s.client = client;
+
+    let mut table_lock = None;
+    if boundary == RefusalBoundary::StalledPrecheckBoundsAtDeadline {
+        rejections.observe(
+            &make_refusal_event(MEMORY_REFUSAL),
+            wall_now,
+            Instant::now(),
+        );
+        let mut tx = db.pool.begin().await?;
+        sqlx::query(sql!(
+            "LOCK TABLE sandbox_k8s_executions IN ACCESS EXCLUSIVE MODE"
+        ))
+        .execute(&mut *tx)
+        .await?;
+        table_lock = Some(tx);
+    }
+
+    let refusal = (
+        substrate.pod_sandbox_rejections.register(pod_uid),
+        boundary == RefusalBoundary::StalledPrecheckBoundsAtDeadline,
+    );
+    let target = super::super::wait_ready::PodProxyWaitTarget {
+        pod_name,
+        pod_uid: Some(pod_uid),
+        generation: 1,
+    };
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        substrate.wait_for_pod_ip_assignment(
+            crate::metrics::sandbox::api::SandboxApiMetricIdentity::ecw("create"),
+            sandbox_id,
+            &target,
+            deadline,
+            "create",
+            Some(&refusal),
+        ),
+    )
+    .await
+    .map_err(|_| "wait_for_pod_ip_assignment must terminate by its deadline")?;
+    if let Some(tx) = table_lock {
+        tx.rollback().await?;
+    }
+
+    match (boundary, outcome) {
+        (
+            RefusalBoundary::LookupErrorAndRefusalReadyTogether
+            | RefusalBoundary::ExpiredDeadlineAndRefusalReadyTogether,
+            Err(SubstrateError::InvalidRequest { message }),
+        ) => assert!(message.contains("smaller than cloned rootfs size 451 MiB")),
+        (
+            RefusalBoundary::StalledPrecheckBoundsAtDeadline,
+            Err(SubstrateError::Unavailable { message }),
+        ) => assert!(message.contains("node memory admission refused")),
+        (_, other) => panic!("{boundary:?}: expected recorded refusal, got {other:?}"),
+    }
     Ok(())
 }
 

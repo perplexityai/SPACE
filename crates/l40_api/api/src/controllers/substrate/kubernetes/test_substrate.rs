@@ -163,6 +163,7 @@ pub(super) fn assemble_substrate(
         pod_network_slots: pod_indexes.network_slots,
         pod_client_index: pod_indexes.client_pods,
         pod_events: pod_reflector::PodEvents::for_test(),
+        pod_sandbox_rejections: pod_sandbox_rejections::PodSandboxRejections::default(),
         pod_reflector_ready: ReflectorReady::always_ready(),
         cancel_tracker: Arc::new(CancelRateTracker::with_budget(64)),
         // Gate closed: a closed gate issues no query, so a lazily-connected
@@ -178,6 +179,21 @@ pub(super) fn assemble_substrate(
         },
         shutdown_token,
         task_tracker,
+    }
+}
+
+#[cfg(test)]
+impl KubernetesSubstrate {
+    /// This substrate with the process's watch of sandbox refusals running on
+    /// its apiserver client, as [`Self::try_from_env`] starts it.
+    pub(crate) fn with_pod_sandbox_rejection_watch(mut self) -> Self {
+        self.pod_sandbox_rejections = pod_sandbox_rejections::PodSandboxRejections::start(
+            self.k8s.client.clone(),
+            &self.k8s.sandbox_namespace,
+            self.shutdown_token.clone(),
+            &self.task_tracker,
+        );
+        self
     }
 }
 
