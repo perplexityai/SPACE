@@ -31,10 +31,12 @@ pub struct AuthOrg(pub Organization);
 #[derive(Debug, Clone)]
 pub struct AuthApiKey(pub ApiKey);
 
-/// Actor resolved alongside the API key. `None` when the key has
-/// `created_by` set but the user no longer exists, or when the org has no
-/// users at all. Handlers that need an actor are responsible for deciding
-/// whether the missing-actor case is fatal and returning a domain error.
+/// Actor resolved alongside the API key: the user the key acts as, resolved
+/// as `ApiKeyAuthContext::actor` describes. A NULL `created_by` falls back to
+/// the org's oldest user. `None` when `created_by` names a user outside the
+/// key's org, or the org has no users. Handlers that need an actor are
+/// responsible for deciding whether the missing-actor case is fatal and
+/// returning a domain error.
 #[derive(Debug, Clone)]
 pub struct AuthEcwActor(pub Option<User>);
 
