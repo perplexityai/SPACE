@@ -29,7 +29,9 @@ fn client(id: &str) -> ClientId {
 }
 
 async fn seed_record(pool: &PgPool, sandbox_id: SandboxId, id: &str) -> TestResult {
-    assert!(set_activating_client(pool, sandbox_id, Some(&client(id))).await?);
+    let mut transaction = pool.begin().await?;
+    assert!(set_activating_client(&mut *transaction, sandbox_id, Some(&client(id))).await?);
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -332,7 +334,9 @@ async fn a_refused_receipt_leaves_the_record() -> TestResult {
         )
     };
     persist(5).await?;
-    set_activating_client(&fixture.pool, sandbox_id, Some(&client(PREVIOUS))).await?;
+    let mut transaction = fixture.pool.begin().await?;
+    set_activating_client(&mut *transaction, sandbox_id, Some(&client(PREVIOUS))).await?;
+    transaction.commit().await?;
 
     let error = persist(4)
         .await

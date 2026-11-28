@@ -64,12 +64,16 @@ pub(crate) const fn attributes_runtime(lifecycle: SandboxLifecycle) -> bool {
 /// Set the record to `client_id`, or to `NULL` for a runtime that carries no
 /// attribution. Returns whether the row changed: `false` when the record
 /// already holds that value, or the sandbox is in one of the
-/// [`UNATTRIBUTED_LIFECYCLES`] or gone.
-pub async fn set_activating_client(
-    executor: impl Executor<'_>,
+/// [`UNATTRIBUTED_LIFECYCLES`] or gone. The caller must pass its open
+/// transaction.
+pub async fn set_activating_client<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     client_id: Option<&ClientId>,
-) -> Result<bool, DbError> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let changed = sqlx::query(sql!(
         "UPDATE sandboxes
             SET activating_client_id = $2
@@ -80,7 +84,7 @@ pub async fn set_activating_client(
     .bind(sandbox_id)
     .bind(client_id)
     .bind(&UNATTRIBUTED_LIFECYCLES[..])
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?
     .rows_affected();
     Ok(changed == 1)

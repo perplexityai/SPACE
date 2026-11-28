@@ -57,6 +57,35 @@ fn row(identity: &SandboxRouteIdentity) -> RouteIdentityRow {
     }
 }
 
+/// Runs [`route_identities::accept_receipt`] in a transaction of its own and
+/// commits it.
+async fn accept(pool: &PgPool, identity: &SandboxRouteIdentity) -> TestDbResult<bool> {
+    let mut tx = pool.begin().await?;
+    let accepted = route_identities::accept_receipt(&mut *tx, identity).await?;
+    tx.commit().await?;
+    Ok(accepted)
+}
+
+/// Runs [`route_provenance::retain_generations`] in a transaction of its own
+/// and commits it.
+async fn retain(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    route_generation: RouteGeneration,
+    execution_generation: ExecutionGeneration,
+) -> TestDbResult<()> {
+    let mut tx = pool.begin().await?;
+    route_provenance::retain_generations(
+        &mut *tx,
+        sandbox_id,
+        route_generation,
+        execution_generation,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 async fn provenance(pool: &PgPool, sandbox_id: SandboxId) -> TestDbResult<Option<(i64, i64)>> {
     Ok(sqlx::query_as::<_, (i64, i64)>(sql!(
         "SELECT last_route_generation, last_execution_generation
@@ -76,7 +105,7 @@ async fn route_identity_reads_back_and_deletes_without_its_provenance() -> TestD
     let stored = identity(sandbox_id, 2, NodeId::new(), 3, 1);
 
     assert_eq!(route_identities::get(pool, sandbox_id).await?, None);
-    assert!(route_identities::accept_receipt(pool, &stored).await?);
+    assert!(accept(pool, &stored).await?);
     assert!(route_provenance::retain_route_identity_generations(pool, sandbox_id).await?);
     assert_eq!(
         route_identities::get(pool, sandbox_id).await?,
@@ -132,7 +161,7 @@ async fn accept_receipt_refuses_a_stale_receipt_on_the_routed_node() -> TestDbRe
     let sandbox_id = sandbox(pool).await?;
     let node_id = NodeId::new();
     let stored = identity(sandbox_id, 3, node_id, 3, 5);
-    assert!(route_identities::accept_receipt(pool, &stored).await?);
+    assert!(accept(pool, &stored).await?);
     sqlx::query(sql!(
         "UPDATE sandboxes SET active_node_id = $2 WHERE id = $1"
     ))
@@ -154,7 +183,7 @@ async fn accept_receipt_refuses_a_stale_receipt_on_the_routed_node() -> TestDbRe
         ),
     ] {
         assert!(
-            !route_identities::accept_receipt(pool, &stale).await?,
+            !accept(pool, &stale).await?,
             "refuses a receipt with a {case}"
         );
         assert_eq!(
@@ -165,9 +194,9 @@ async fn accept_receipt_refuses_a_stale_receipt_on_the_routed_node() -> TestDbRe
     }
 
     let same_attempt = identity(sandbox_id, 3, node_id, 3, 5);
-    assert!(route_identities::accept_receipt(pool, &same_attempt).await?);
+    assert!(accept(pool, &same_attempt).await?);
     let newer_execution = identity(sandbox_id, 4, node_id, 4, 1);
-    assert!(route_identities::accept_receipt(pool, &newer_execution).await?);
+    assert!(accept(pool, &newer_execution).await?);
     assert_eq!(
         route_identities::get(pool, sandbox_id).await?,
         Some(row(&newer_execution))
@@ -181,14 +210,14 @@ async fn accept_receipt_moves_the_route_only_to_the_sandboxes_active_node() -> T
     let pool = &db.pool;
     let sandbox_id = sandbox(pool).await?;
     let stored = identity(sandbox_id, 3, NodeId::new(), 3, 1);
-    assert!(route_identities::accept_receipt(pool, &stored).await?);
+    assert!(accept(pool, &stored).await?);
 
     // Losing case: another node, while the row names none, is refused even
     // with newer generations.
     let other_node = NodeId::new();
     let moved = identity(sandbox_id, 1, other_node, 1, 0);
     let newer_elsewhere = identity(sandbox_id, 9, other_node, 9, 9);
-    assert!(!route_identities::accept_receipt(pool, &newer_elsewhere).await?);
+    assert!(!accept(pool, &newer_elsewhere).await?);
     assert_eq!(
         route_identities::get(pool, sandbox_id).await?,
         Some(row(&stored))
@@ -203,7 +232,7 @@ async fn accept_receipt_moves_the_route_only_to_the_sandboxes_active_node() -> T
     .bind(other_node.as_uuid())
     .execute(pool)
     .await?;
-    assert!(route_identities::accept_receipt(pool, &moved).await?);
+    assert!(accept(pool, &moved).await?);
     assert_eq!(
         route_identities::get(pool, sandbox_id).await?,
         Some(row(&moved))
@@ -273,9 +302,9 @@ async fn provenance_retains_only_higher_generations() -> TestDbResult<()> {
     let route = |value| RouteGeneration::new(value).expect("positive route generation");
     let execution = |value| ExecutionGeneration::new(value).expect("positive execution generation");
 
-    route_provenance::retain_generations(pool, sandbox_id, route(3), execution(5)).await?;
+    retain(pool, sandbox_id, route(3), execution(5)).await?;
     assert_eq!(provenance(pool, sandbox_id).await?, Some((3, 5)));
-    route_provenance::retain_generations(pool, sandbox_id, route(4), execution(2)).await?;
+    retain(pool, sandbox_id, route(4), execution(2)).await?;
     assert_eq!(
         provenance(pool, sandbox_id).await?,
         Some((4, 5)),
@@ -288,16 +317,16 @@ async fn provenance_retains_only_higher_generations() -> TestDbResult<()> {
     );
     assert_eq!(provenance(pool, sandbox_id).await?, Some((4, 5)));
     let routed = identity(sandbox_id, 6, NodeId::new(), 1, 1);
-    assert!(route_identities::accept_receipt(pool, &routed).await?);
+    assert!(accept(pool, &routed).await?);
     assert!(route_provenance::retain_route_identity_generations(pool, sandbox_id).await?);
     assert_eq!(provenance(pool, sandbox_id).await?, Some((6, 5)));
-    route_provenance::retain_generations(pool, sandbox_id, route(1), execution(9)).await?;
+    retain(pool, sandbox_id, route(1), execution(9)).await?;
     assert_eq!(
         provenance(pool, sandbox_id).await?,
         Some((6, 9)),
         "a lower route generation keeps the stored one"
     );
-    route_provenance::retain_generations(pool, sandbox_id, route(8), execution(1)).await?;
+    retain(pool, sandbox_id, route(8), execution(1)).await?;
     assert!(route_provenance::retain_route_identity_generations(pool, sandbox_id).await?);
     assert_eq!(
         provenance(pool, sandbox_id).await?,

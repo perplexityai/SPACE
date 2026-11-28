@@ -228,12 +228,16 @@ where
 /// Guarded by `token` alone, with no lifecycle predicate: the caller holds
 /// the row lock [`lock_restore_lease_owner`] took while re-checking the same
 /// token, and persists the receipt's route identity in the same transaction.
-pub async fn place_owned_restore_receipt(
-    executor: impl Executor<'_>,
+/// The caller must pass its open transaction.
+pub async fn place_owned_restore_receipt<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     node_id: NodeId,
     token: Uuid,
-) -> Result<bool, DbError> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let placed = sqlx::query(sql!(
         "UPDATE sandboxes
                 SET active_node_id = $2,
@@ -246,7 +250,7 @@ pub async fn place_owned_restore_receipt(
     .bind(sandbox_id)
     .bind(node_id)
     .bind(token)
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(placed.rows_affected() == 1)
 }

@@ -4090,12 +4090,14 @@ async fn cross_node_restore_handles_candidate_failures(
         "9.0.0",
     )
     .await?;
+    let mut transaction = fixture.pool.begin().await?;
     pplx_space_sandbox_store::attribute_runtime::set_activating_client(
-        &fixture.pool,
+        &mut *transaction,
         sandbox_id,
         Some(&pplx_space_accounts::ClientId::parse("previous-client")?),
     )
     .await?;
+    transaction.commit().await?;
     insert_ready_worker(
         &fixture.pool,
         alternate_node_id,
