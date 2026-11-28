@@ -147,11 +147,18 @@ fn service_request<T>(
     request_from_peer(message, user.uid, user.primary_group.gid)
 }
 
+const TEST_DB: &str = "volume-manager.db";
+
 async fn test_service(temp: &tempfile::TempDir) -> VolumeManagerService {
-    let db_path = temp.path().join("volume-manager.db");
-    pplx_space_volmgr_store::database::migrate(&db_path)
+    pplx_space_volmgr_store::database::migrate(&temp.path().join(TEST_DB))
         .await
         .unwrap();
+    service_over_migrated_db(temp)
+}
+
+/// The service over `temp`'s database, which the caller has already migrated.
+fn service_over_migrated_db(temp: &tempfile::TempDir) -> VolumeManagerService {
+    let db_path = temp.path().join(TEST_DB);
     VolumeManagerService::new(
         db_path.to_str().expect("utf8 db path"),
         temp.path().join("staging"),
@@ -171,6 +178,14 @@ async fn test_service(temp: &tempfile::TempDir) -> VolumeManagerService {
 async fn btrfs_resubmission_reuses_live_or_completed_jobs_but_restages_terminal_failures() {
     use pplx_space_common_jobs::{JobStatus, db as jobs};
 
+    // Each status starts from a copy of one migrated database, and its
+    // connection skips fsync. A migration per status and an fsync per commit
+    // were most of this test's time on a busy disk, and no assertion here
+    // depends on a commit surviving a crash.
+    let template = tempfile::tempdir().unwrap();
+    pplx_space_volmgr_store::database::migrate(&template.path().join(TEST_DB))
+        .await
+        .unwrap();
     for status in [
         JobStatus::Pending,
         JobStatus::Running,
@@ -180,7 +195,14 @@ async fn btrfs_resubmission_reuses_live_or_completed_jobs_but_restages_terminal_
         JobStatus::Cancelled,
     ] {
         let temp = tempfile::tempdir().unwrap();
-        let service = test_service(&temp).await;
+        std::fs::copy(template.path().join(TEST_DB), temp.path().join(TEST_DB)).unwrap();
+        let service = service_over_migrated_db(&temp);
+        service
+            .lock_db()
+            .unwrap()
+            .raw()
+            .pragma_update(None, "synchronous", "OFF")
+            .unwrap();
         let request = crate::proto::PushBtrfsSendRequest {
             sandbox_id: uuid::Uuid::now_v7().to_string(),
             source_id: uuid::Uuid::now_v7().to_string(),

@@ -40,7 +40,7 @@ impl JobExecutor for GatedExecutor {
 }
 
 fn create_jobs_db(path: &Path) {
-    let conn = rusqlite::Connection::open(path).unwrap();
+    let conn = open_unsynced_db(path);
     for migration in pplx_space_volmgr_store::database::COMMON_MIGRATOR
         .iter()
         .filter(|migration| migration.migration_type.is_up_migration())
@@ -50,9 +50,17 @@ fn create_jobs_db(path: &Path) {
 }
 
 fn open_jobs_db(path: &Path) -> Arc<std::sync::Mutex<rusqlite::Connection>> {
-    Arc::new(std::sync::Mutex::new(
-        rusqlite::Connection::open(path).expect("open test jobs db"),
-    ))
+    Arc::new(std::sync::Mutex::new(open_unsynced_db(path)))
+}
+
+/// A connection that commits without fsync. No test here depends on a commit
+/// surviving a crash, and each fsync costs up to hundreds of milliseconds on a
+/// busy disk.
+fn open_unsynced_db(path: &Path) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open(path).expect("open test jobs db");
+    conn.pragma_update(None, "synchronous", "OFF")
+        .expect("disable test jobs db fsync");
+    conn
 }
 
 async fn health_status(socket: &Path, service: &str) -> ServingStatus {
@@ -100,8 +108,30 @@ async fn acquire_test_mutex(path: PathBuf) -> ServiceMutex {
     }
 }
 
+/// Takes the flock a [`ServiceMutex`] holds on `path`, blocking in the kernel
+/// until its holder releases it rather than polling for it.
+fn spawn_blocking_successor(path: PathBuf) -> tokio::task::JoinHandle<std::fs::File> {
+    tokio::task::spawn_blocking(move || {
+        let file = open_mutex_file(&path);
+        file.lock().expect("lock successor mutex");
+        file
+    })
+}
+
+fn open_mutex_file(path: &Path) -> std::fs::File {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .expect("open service mutex")
+}
+
 const UNEXPECTED_EXIT_CHILD_DIR_ENV: &str = "VOLMGR_UNEXPECTED_EXIT_CHILD_DIR";
 const UNEXPECTED_EXIT_SCENARIO_ENV: &str = "VOLMGR_UNEXPECTED_EXIT_SCENARIO";
+/// The text the child prints once it holds the mutex and its executor runs.
+/// When libtest runs tests serially, it prints `test <name> ... ` on the same
+/// line first, so the parent matches the line's end.
+const UNEXPECTED_EXIT_CHILD_READY: &str = "volume-manager unexpected-exit child ready";
 
 #[derive(Clone, Copy, Debug)]
 enum UnexpectedExitScenario {
@@ -151,16 +181,6 @@ impl UnexpectedExitScenario {
     }
 }
 
-async fn wait_for_path(path: &Path) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !path.exists() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("child process handshake timed out");
-}
-
 async fn wait_for_task_completion<T>(handle: &tokio::task::JoinHandle<T>) {
     tokio::time::timeout(Duration::from_secs(1), async {
         while !handle.is_finished() {
@@ -189,7 +209,7 @@ async fn run_unexpected_exit_child(dir: &Path, scenario: UnexpectedExitScenario)
     tokio::time::timeout(Duration::from_secs(1), started.notified())
         .await
         .expect("blocked executor started");
-    std::fs::write(dir.join("ready"), b"").expect("signal child ready");
+    println!("{UNEXPECTED_EXIT_CHILD_READY}");
 
     let server_gate = Arc::new(tokio::sync::Notify::new());
     let server_gate_for_task = Arc::clone(&server_gate);
@@ -205,7 +225,11 @@ async fn run_unexpected_exit_child(dir: &Path, scenario: UnexpectedExitScenario)
         Ok(())
     });
     let shutdown = CancellationToken::new();
-    wait_for_path(&dir.join("exit-now")).await;
+    // The parent closes this process's stdin to make the server exit.
+    tokio::task::spawn_blocking(|| std::io::Read::read(&mut std::io::stdin(), &mut [0; 1]))
+        .await
+        .expect("join exit trigger read")
+        .expect("wait for the parent's exit trigger");
 
     if scenario.is_final() {
         // Enter graceful shutdown while the server is still running, then
@@ -246,28 +270,52 @@ async fn unexpected_server_exit_keeps_mutex_until_process_boundary() {
 
     for scenario in UnexpectedExitScenario::ALL {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        let mut child = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
             .arg("--exact")
             .arg("run::tests::unexpected_server_exit_keeps_mutex_until_process_boundary")
             .arg("--nocapture")
             .env(UNEXPECTED_EXIT_CHILD_DIR_ENV, dir.path())
             .env(UNEXPECTED_EXIT_SCENARIO_ENV, scenario.name())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .expect("spawn predecessor process");
-        wait_for_path(&dir.path().join("ready")).await;
+        // Kept open until the child exits, so its later writes cannot fail.
+        let mut child_stdout = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(
+            child.stdout.take().expect("child stdout"),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(line) = child_stdout.next_line().await.expect("read child stdout") {
+                if line.ends_with(UNEXPECTED_EXIT_CHILD_READY) {
+                    return;
+                }
+            }
+            panic!("{scenario:?} predecessor exited before it was ready");
+        })
+        .await
+        .expect("child process handshake timed out");
 
         let mutex_path = dir.path().join("service.mutex");
-        let successor = tokio::spawn(acquire_test_mutex(mutex_path));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Probe before the successor opens the file, so `WouldBlock` can only
+        // come from the predecessor.
+        assert!(
+            matches!(
+                open_mutex_file(&mutex_path).try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ),
+            "the {scenario:?} predecessor must hold the mutex while its executor exists"
+        );
+        let successor = spawn_blocking_successor(mutex_path.clone());
         assert!(
             !successor.is_finished(),
             "successor must not acquire while the {scenario:?} predecessor executor exists"
         );
 
-        std::fs::write(dir.path().join("exit-now"), b"").expect("trigger hard exit");
-        let status = tokio::task::spawn_blocking(move || child.wait())
+        drop(child.stdin.take());
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
             .await
-            .expect("join child wait")
+            .expect("predecessor exits after its stdin closes")
             .expect("wait for predecessor process");
         assert_eq!(
             status.code(),
