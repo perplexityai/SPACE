@@ -1,5 +1,7 @@
 //! [`DbError`]: a failed database call, classified by what callers branch on.
 
+use sqlx::postgres::PgDatabaseError;
+
 /// A database call failed: the driver's error, classified by [`DbError::kind`].
 /// It displays, and chains its sources, exactly as the driver's error does.
 #[derive(Debug, thiserror::Error)]
@@ -8,8 +10,9 @@ pub struct DbError(sqlx::Error);
 
 /// The kinds are the conditions converted callers branch on. `Other` holds
 /// everything else, including conditions some unconverted callers still
-/// classify on the driver's error (I/O errors, decode errors, connection- and
-/// resource-class SQLSTATEs); they get kinds when those callers convert.
+/// classify on the driver's error (connection- and resource-class SQLSTATEs);
+/// a caller reads such a code with [`DbError::sqlstate`], and the code gets a
+/// kind once a second caller branches on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbErrorKind {
     /// A statement that must return a row returned none.
@@ -32,6 +35,15 @@ pub enum DbErrorKind {
     QueryCanceled,
     /// No pool connection became free within the pool's acquire timeout.
     PoolTimedOut,
+    /// A socket-level I/O error: connecting to the server failed, as when the
+    /// connection was refused or the host name did not resolve, or reading
+    /// from or writing to the connection failed, as when it was reset. A
+    /// failure the server reports, whatever its SQLSTATE class, is not one.
+    Io,
+    /// A returned value could not be read as the caller asked: it does not
+    /// decode as the requested type, or the row lacks the requested column,
+    /// by name or by index.
+    Decode,
     /// Any other failure.
     Other,
 }
@@ -47,6 +59,16 @@ impl DbError {
             DbErrorKind::NotFound
         } else if matches!(error, sqlx::Error::PoolTimedOut) {
             DbErrorKind::PoolTimedOut
+        } else if matches!(error, sqlx::Error::Io(_)) {
+            DbErrorKind::Io
+        } else if matches!(
+            error,
+            sqlx::Error::ColumnDecode { .. }
+                | sqlx::Error::Decode(_)
+                | sqlx::Error::ColumnNotFound(_)
+                | sqlx::Error::ColumnIndexOutOfBounds { .. }
+        ) {
+            DbErrorKind::Decode
         } else if database.is_some_and(|database| database.is_unique_violation()) {
             DbErrorKind::UniqueViolation
         } else if database.is_some_and(|database| database.is_foreign_key_violation()) {
@@ -64,6 +86,19 @@ impl DbError {
         } else {
             DbErrorKind::Other
         }
+    }
+
+    /// The SQLSTATE the server reported, such as `"22P02"`; `None` for a
+    /// failure the server did not report, such as an I/O error or a missing
+    /// row. It is for a caller branching on a code no other caller needs;
+    /// once a second caller branches on a code, it gets a [`DbErrorKind`].
+    pub fn sqlstate(&self) -> Option<&str> {
+        // The pool's connections are Postgres's, whose error borrows its code;
+        // the driver's error trait returns it as a `Cow`.
+        self.0
+            .as_database_error()?
+            .try_downcast_ref::<PgDatabaseError>()
+            .map(PgDatabaseError::code)
     }
 
     /// The constraint a violation names, when the server reported one.

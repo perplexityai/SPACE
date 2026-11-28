@@ -7,7 +7,8 @@ use std::time::Duration;
 use pplx_space_db_test_fixtures::{TestDb, try_raw_pg_test_db_with_max_connections};
 use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::{ConnectOptions as _, Row as _};
 
 use crate::{Db, DbError, DbErrorKind};
 
@@ -230,6 +231,80 @@ async fn an_exhausted_pool_is_pool_timed_out() -> TestResult {
         .await
         .expect_err("no connection is free");
     assert_eq!(error.kind(), DbErrorKind::PoolTimedOut, "{error:?}");
+    Ok(())
+}
+
+/// A connection to a port bound but not listening: the socket is refused
+/// before any server could answer. Holding the bound socket through the
+/// attempt keeps another listener from taking the port. Needs no database.
+#[tokio::test]
+async fn a_refused_connection_is_io() -> TestResult {
+    let reserved = tokio::net::TcpSocket::new_v4()?;
+    reserved.bind(([127, 0, 0, 1], 0).into())?;
+    let port = reserved.local_addr()?.port();
+    let error = classify(
+        PgConnectOptions::new()
+            .host("127.0.0.1")
+            .port(port)
+            .connect()
+            .await,
+    )
+    .await;
+    drop(reserved);
+    assert_eq!(error.kind(), DbErrorKind::Io, "{error:?}");
+    assert_eq!(error.sqlstate(), None);
+    Ok(())
+}
+
+/// A row read as the caller asked when it cannot be: a value of the wrong
+/// type, and a column missing by name or by index.
+#[tokio::test]
+async fn reading_a_row_wrongly_is_decode() -> TestResult {
+    let Some((test_db, _db)) = test_db().await? else {
+        return Ok(());
+    };
+    let row = sqlx::query(sql!("SELECT 'x'::text AS name"))
+        .fetch_one(&test_db.pool)
+        .await?;
+    for error in [
+        row.try_get::<i64, _>("name"),
+        row.try_get::<i64, _>("missing"),
+        row.try_get::<i64, _>(1),
+    ] {
+        let error = classify(error).await;
+        assert_eq!(error.kind(), DbErrorKind::Decode, "{error:?}");
+        assert_eq!(error.sqlstate(), None);
+    }
+    // A value failing to decode outside a row, which no statement here
+    // reaches, is classified the same way.
+    let error = DbError::from(sqlx::Error::Decode("not a value".into()));
+    assert_eq!(error.kind(), DbErrorKind::Decode, "{error:?}");
+    Ok(())
+}
+
+/// The server's code for a failure it reported, kind or not, and none for
+/// one it did not.
+#[tokio::test]
+async fn sqlstate_is_the_servers_code() -> TestResult {
+    let Some((test_db, _db)) = test_db().await? else {
+        return Ok(());
+    };
+    let error = classify(
+        sqlx::query(sql!("SELECT 'x'::int"))
+            .execute(&test_db.pool)
+            .await,
+    )
+    .await;
+    assert_eq!(error.kind(), DbErrorKind::Other, "{error:?}");
+    assert_eq!(error.sqlstate(), Some("22P02"));
+    let error = classify(
+        sqlx::query(sql!("INSERT INTO parents (id) VALUES (1)"))
+            .execute(&test_db.pool)
+            .await,
+    )
+    .await;
+    assert_eq!(error.sqlstate(), Some("23505"));
+    assert_eq!(DbError::from(sqlx::Error::RowNotFound).sqlstate(), None);
     Ok(())
 }
 
