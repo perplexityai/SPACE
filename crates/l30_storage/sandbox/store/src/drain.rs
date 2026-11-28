@@ -839,13 +839,16 @@ pub async fn mark_sandbox_lost_on_gone_node(
 /// same row id) — its registration bumps `node_k8s.k8s_node_uid` and the
 /// inventory reflector resets `drain_phase`, and either change must refuse the
 /// give-up so the replacement's freshly suspended sandboxes (and its live
-/// in-flight uploads) can't be mutated under the dead node's verdict.
+/// in-flight uploads) can't be mutated under the dead node's verdict. The
+/// phase is v1's (`drain_engine IS NULL`): a v2 drain's node, or one under an
+/// engine this build doesn't know, is never v1's to give up on.
 pub fn gone_node_identity_guards(node_param: &str, uid_param: &str) -> String {
     format!(
         "AND EXISTS (
                 SELECT 1 FROM nodes
                  WHERE id = {node_param}
                    AND drain_phase = 'draining'
+                   AND drain_engine IS NULL
             )
             AND EXISTS (
                 SELECT 1 FROM node_k8s
@@ -1125,7 +1128,9 @@ pub const STALE_ABANDON_AFTER: Duration = Duration::from_secs(600);
 /// attached to the node (`active_node_id = $1 OR target_node_id = $1`) wedged
 /// in one of those lifecycles past `$2` seconds (measured by
 /// `lifecycle_changed_at`) to `'failed'`, returning the claimed ids, while the
-/// node is still `drain_phase = 'draining'`.
+/// node is still `drain_phase = 'draining'` under the v1 engine
+/// (`drain_engine IS NULL`): a v2 drain's node, or one under an engine this
+/// build doesn't know, is never v1's to sweep.
 ///
 /// The node match is `active_node_id OR target_node_id` so the sweep covers
 /// exactly the rows the drain-complete gate counts as blockers: the resident
@@ -1186,6 +1191,7 @@ pub fn abandon_stale_resident_sandboxes_query() -> String {
                 SELECT 1 FROM nodes
                  WHERE id = $1
                    AND drain_phase = 'draining'
+                   AND drain_engine IS NULL
             )
           FOR UPDATE SKIP LOCKED
      )
@@ -1259,8 +1265,9 @@ pub async fn abandon_stale_resident_sandboxes(
 ///   bookkeeping.
 ///
 /// Guards, atomic with the flip:
-/// - `EXISTS (... drain_phase = 'draining')` — an admin `:undrain` landing
-///   between `list_draining_nodes()` and this UPDATE aborts the sweep
+/// - `EXISTS (... drain_phase = 'draining' AND drain_engine IS NULL)` — an
+///   admin `:undrain` landing between `list_draining_nodes()` and this UPDATE
+///   aborts the sweep, and a node whose drain isn't v1's is never swept
 ///   (mirrors [`abandon_stale_resident_sandboxes_query`]).
 /// - `EXISTS (node_k8s.k8s_node_uid IS NOT DISTINCT FROM $3)` — refuse if a
 ///   same-name kube Node replacement bumped the uid since the EC2 cross-check
@@ -1297,6 +1304,7 @@ pub fn fail_resident_sandboxes_on_gone_node_query() -> String {
                 SELECT 1 FROM nodes
                  WHERE id = $1
                    AND drain_phase = 'draining'
+                   AND drain_engine IS NULL
             )
             AND EXISTS (
                 SELECT 1 FROM node_k8s

@@ -1609,7 +1609,8 @@ pub trait NodeDrainSink: Send + Sync + 'static {
         &self,
         node_id: NodeId,
     ) -> impl std::future::Future<Output = Result<bool, sqlx::Error>> + Send;
-    /// Per-`drain_phase` node counts across the cluster. Used to emit
+    /// Per-`drain_phase` counts of v1 drains (nodes with no `drain_engine`)
+    /// across the cluster. Used to emit
     /// `node_drain.nodes_by_state{state=<phase>}` once per tick. Returns
     /// counts only for non-NULL `drain_phase` values; the reconciler
     /// emits zeros for known phases the query doesn't return so

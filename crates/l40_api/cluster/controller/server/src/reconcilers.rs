@@ -63,12 +63,16 @@
 //!   rows by age; trigger fanout prunes dead triggers for both substrates.
 //! - `node_drain`: moves `nodes.drain_phase` from `draining` to `drained`,
 //!   evacuating residents in forced mode, and deletes a `terminating` node's
-//!   row once its terminator (`aws`, `kube-delete` or `noop`) succeeds.
+//!   row once its terminator (`aws`, `kube-delete` or `noop`) succeeds. Its v2
+//!   loop runs wherever the node drain does; v1's loop, which also re-places
+//!   sandboxes a v1 drain evacuated, runs only with `SPACE_DRAIN_V2_ENABLED`
+//!   off ([`DrainWriters`]).
 //! - `drained_node_terminator`: moves `drained` nodes to `terminating` unless
 //!   their Node carries the keep annotation. Under the `aws` terminator, when
 //!   the Node is gone and EC2 reports the instance terminated, it deletes the
 //!   `drained` row instead, or fails the unrecoverable suspended sandboxes
-//!   that block that delete.
+//!   that block that delete. A v1 writer: it runs only with
+//!   `SPACE_DRAIN_V2_ENABLED` off.
 //!
 //! Kubernetes-object loops (stay):
 //!
@@ -221,6 +225,16 @@ impl TerminatorKind {
     }
 }
 
+/// Whether `SPACE_DRAIN_V2_ENABLED` is on.
+fn drain_v2_enabled(env: &dyn pplx_space_env_vars::Environment) -> bool {
+    pplx_space_env_vars::env_flag(
+        env.var(pplx_space_api::controllers::DrainV2Switch::ENV)
+            .ok()
+            .as_deref(),
+        false,
+    )
+}
+
 /// Refuse `SPACE_DRAIN_V2_ENABLED`, which admits new v2 drains, unless the
 /// node drain runs, since its v2 loop drives them. The loop itself runs
 /// wherever the node drain does, flag or not, so a v2 drain already
@@ -229,16 +243,40 @@ pub(crate) fn ensure_drain_v2_has_its_loop(
     env: &dyn pplx_space_env_vars::Environment,
     node_drain_enabled: bool,
 ) -> Result<(), ReconcilerRuntimeError> {
-    let enabled = pplx_space_env_vars::env_flag(
-        env.var(pplx_space_api::controllers::DrainV2Switch::ENV)
-            .ok()
-            .as_deref(),
-        false,
-    );
-    if enabled && !node_drain_enabled {
+    if drain_v2_enabled(env) && !node_drain_enabled {
         return Err(ReconcilerRuntimeError::DrainV2NeedsNodeDrain);
     }
     Ok(())
+}
+
+/// Which drain engine's writers the controller runs where the node drain
+/// does. One engine owns a node's drain columns at a time: with
+/// `SPACE_DRAIN_V2_ENABLED` on, the API admits only v2 drains and the
+/// controller runs none of v1's writers, neither its node-drain loop
+/// ([`node_drain::run`], which also re-places sandboxes a v1 drain
+/// evacuated) nor the drained-node terminator. The v2 loop runs either way,
+/// so a persisted v2 drain always has an owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrainWriters {
+    /// The switch is off: v1's writers and the v2 loop.
+    V1AndV2,
+    /// The switch is on: the v2 loop alone.
+    V2Only,
+}
+
+impl DrainWriters {
+    pub(crate) fn from_environment(env: &dyn pplx_space_env_vars::Environment) -> Self {
+        if drain_v2_enabled(env) {
+            Self::V2Only
+        } else {
+            Self::V1AndV2
+        }
+    }
+
+    /// Whether v1's node-drain loop and the drained-node terminator run.
+    pub(crate) fn runs_v1(self) -> bool {
+        matches!(self, Self::V1AndV2)
+    }
 }
 
 /// The terminator backend a [`TerminatorKind`] selects, with the AWS
@@ -798,6 +836,16 @@ pub async fn run_reconcilers(
             // the spawn arms below and re-read by the drained-node
             // terminator gate that follows the match.
             let node_drain_enabled = node_drain_config.enabled;
+            // Read the switch once, for both of v1's loops below.
+            let drain_writers =
+                DrainWriters::from_environment(&pplx_space_env_vars::ProcessEnvironment);
+            tracing::info!(
+                v1_drain_writers = node_drain_enabled && drain_writers.runs_v1(),
+                node_drain_enabled,
+                "resolved the drain engines whose writers run: v1's node-drain loop and \
+                 drained-node terminator run only with SPACE_DRAIN_V2_ENABLED off; the v2 \
+                 loop runs wherever the node drain does"
+            );
             // Resolved once, here, because the sink and the reconciler have to
             // agree on it — except that only one of them ends up reading it.
             // The sink decides whether `stopped` rows are listed at all. The
@@ -809,52 +857,54 @@ pub async fn run_reconcilers(
             // WARN is the one place that also reads the raw flag, to tell the
             // operator which half of the pair is missing.
             let evacuates_stopped_residents = node_drain_config.evacuates_stopped_residents();
-            if node_drain_config.evacuate_stopped_residents && !evacuates_stopped_residents {
-                // Worth a WARN rather than silence: the operator asked for a
-                // behaviour they are not getting, and the reason is another
-                // flag rather than anything they can see in this one. Left
-                // unstated, the symptom is a fleet where nothing changes and
-                // no log says why.
-                tracing::warn!(
-                    termination_blocking_gate = node_drain_config.termination_blocking_gate,
+            // Only v1's loop reads these settings, so with the switch on they
+            // aren't logged.
+            if drain_writers.runs_v1() {
+                if node_drain_config.evacuate_stopped_residents && !evacuates_stopped_residents {
+                    // Worth a WARN rather than silence: the operator asked for a
+                    // behaviour they are not getting, and the reason is another
+                    // flag rather than anything they can see in this one. Left
+                    // unstated, the symptom is a fleet where nothing changes and
+                    // no log says why.
+                    tracing::warn!(
+                        termination_blocking_gate = node_drain_config.termination_blocking_gate,
+                        replace_stopped_evacuations = node_drain_config.replace_stopped_evacuations,
+                        "SPACE_NODE_DRAIN_EVACUATE_STOPPED_RESIDENTS is set but \
+                         SPACE_NODE_DRAIN_TERMINATION_BLOCKING_GATE or \
+                         SPACE_NODE_DRAIN_REPLACE_STOPPED_EVACUATIONS is not; stopped-resident \
+                         evacuation stays off. It needs the termination-blocking gate, so draining \
+                         nodes holding stopped residents stay in view, and re-placement, so an \
+                         evacuated sandbox can be placed again; enable both first"
+                    );
+                }
+                tracing::info!(
+                    evacuate_stopped_residents = evacuates_stopped_residents,
                     replace_stopped_evacuations = node_drain_config.replace_stopped_evacuations,
-                    "SPACE_NODE_DRAIN_EVACUATE_STOPPED_RESIDENTS is set but \
-                     SPACE_NODE_DRAIN_TERMINATION_BLOCKING_GATE or \
-                     SPACE_NODE_DRAIN_REPLACE_STOPPED_EVACUATIONS is not; stopped-resident \
-                     evacuation stays off. It needs the termination-blocking gate, so draining \
-                     nodes holding stopped residents stay in view, and re-placement, so an \
-                     evacuated sandbox can be placed again; enable both first"
+                    "resolved stopped-resident evacuation for the node-drain reconciler"
                 );
             }
-            tracing::info!(
-                evacuate_stopped_residents = evacuates_stopped_residents,
-                replace_stopped_evacuations = node_drain_config.replace_stopped_evacuations,
-                "resolved stopped-resident evacuation for the node-drain reconciler"
-            );
             if node_drain_enabled {
                 let kind = TerminatorKind::from_env()?;
-                tracing::info!(
-                    terminator = kind.as_str(),
-                    "starting node-drain reconciler with selected terminator backend"
-                );
+                if drain_writers.runs_v1() {
+                    tracing::info!(
+                        terminator = kind.as_str(),
+                        "starting v1's node-drain loop and the v2 drain loop with the \
+                         selected terminator backend"
+                    );
+                } else {
+                    tracing::info!(
+                        terminator = kind.as_str(),
+                        "SPACE_DRAIN_V2_ENABLED is on; starting the v2 drain loop with the \
+                         selected terminator backend, and not v1's node-drain loop"
+                    );
+                }
                 let node_drain_token = shutdown_token.child_token();
-                // The sink needs the gate too: the completion-edge write's
-                // residency guard is scoped by it, so a sink built without it
-                // would enforce the term the flag withholds.
-                let node_drain_sink = node_drain::SubstrateSink::new(
-                    pool.clone(),
-                    kube.clone(),
-                    residency_evidence,
-                    node_drain_config.termination_blocking_gate,
-                    evacuates_stopped_residents,
-                    node_drain_config.replace_stopped_evacuations,
-                );
                 let backend = TerminatorBackend::load(kind).await;
-                // The v2 drain's loop, beside v1's: it acts only on the rows
-                // `:drain {engine: v2}` marked, which v1's writers skip. It
-                // runs whether or not new v2 drains are admitted, so a
-                // persisted one is still drained or cancelled; it terminates
-                // a node only through EC2
+                // The v2 drain's loop, beside v1's when v1's runs: it acts
+                // only on the rows `:drain {engine: v2}` marked, which v1's
+                // writers skip. It runs whether or not new v2 drains are
+                // admitted, so a persisted one is still drained or
+                // cancelled; it terminates a node only through EC2
                 // ([`TerminatorBackend::v2_terminator`]).
                 handles.push(tokio::spawn(node_drain::v2::run(
                     node_drain::SubstrateSink::v2(pool.clone(), kube.clone()),
@@ -867,8 +917,23 @@ pub async fn run_reconcilers(
                     ),
                     shutdown_token.child_token(),
                 )));
-                match backend {
-                    TerminatorBackend::Aws(aws_config) => {
+                // The sink needs the gate too: the completion-edge write's
+                // residency guard is scoped by it, so a sink built without it
+                // would enforce the term the flag withholds.
+                let node_drain_sink = drain_writers.runs_v1().then(|| {
+                    node_drain::SubstrateSink::new(
+                        pool.clone(),
+                        kube.clone(),
+                        residency_evidence,
+                        node_drain_config.termination_blocking_gate,
+                        evacuates_stopped_residents,
+                        node_drain_config.replace_stopped_evacuations,
+                    )
+                });
+                match (node_drain_sink, backend) {
+                    // Logged above: the switch is on, and v1's loop doesn't start.
+                    (None, _) => {}
+                    (Some(node_drain_sink), TerminatorBackend::Aws(aws_config)) => {
                         let autoscaling_client =
                             pplx_space_aws_client::autoscaling::Client::from_config(&aws_config);
                         let terminator = node_drain::Ec2InstanceTerminator::new(
@@ -898,7 +963,7 @@ pub async fn run_reconcilers(
                             node_drain_token,
                         )));
                     }
-                    TerminatorBackend::KubeDelete => {
+                    (Some(node_drain_sink), TerminatorBackend::KubeDelete) => {
                         let terminator = node_drain::KubeNodeDeleteTerminator::new(
                             pool.clone(),
                             kube.k8s.client.clone(),
@@ -911,7 +976,7 @@ pub async fn run_reconcilers(
                             node_drain_token,
                         )));
                     }
-                    TerminatorBackend::Noop => {
+                    (Some(node_drain_sink), TerminatorBackend::Noop) => {
                         let terminator = node_drain::NoopInstanceTerminator::new();
                         handles.push(tokio::spawn(node_drain::run(
                             node_drain_config,
@@ -1060,44 +1125,51 @@ pub async fn run_reconcilers(
                 );
             }
 
-            let drained_terminator_sink =
-                drained_node_terminator::NodeDbStore::new(pool.clone(), residency_evidence);
-            let drained_annotation_lookup = drained_node_terminator::KubeAnnotationLookup::new(
-                pool.clone(),
-                kube.k8s.client.clone(),
-            );
-            // EC2 cross-check for the KubeNodeGone recovery path. Only the
-            // real-EC2 (`aws`) terminator deploy can meaningfully query EC2;
-            // on `kube-delete` / `noop` substrates (kind / Tilt / smokes)
-            // there is no EC2, so we leave the cross-check unconfigured and
-            // the reconciler preserves its fail-safe "park for manual review"
-            // behavior on a missing k8s Node. Gated on the terminator already
-            // being enabled so we skip AWS SDK init when the reconciler is
-            // dormant (force-disabled above when node-drain is off).
-            let drained_instance_lookup: Option<
-                Arc<dyn drained_node_terminator::InstanceStateLookup>,
-            > = if drained_terminator_config.enabled
-                && TerminatorKind::from_env()? == TerminatorKind::Aws
-            {
-                let aws_config =
-                    aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-                let ec2_client = pplx_space_aws_client::ec2::Client::from_config(&aws_config);
-                Some(Arc::new(
-                    drained_node_terminator::Ec2InstanceStateLookup::new(
-                        pool.clone(),
-                        Arc::new(ec2_client),
-                    ),
-                ))
+            // v1's writer of `drained` rows: not started with the switch on.
+            if drain_writers.runs_v1() {
+                let drained_terminator_sink =
+                    drained_node_terminator::NodeDbStore::new(pool.clone(), residency_evidence);
+                let drained_annotation_lookup = drained_node_terminator::KubeAnnotationLookup::new(
+                    pool.clone(),
+                    kube.k8s.client.clone(),
+                );
+                // EC2 cross-check for the KubeNodeGone recovery path. Only the
+                // real-EC2 (`aws`) terminator deploy can meaningfully query EC2;
+                // on `kube-delete` / `noop` substrates (kind / Tilt / smokes)
+                // there is no EC2, so we leave the cross-check unconfigured and
+                // the reconciler preserves its fail-safe "park for manual review"
+                // behavior on a missing k8s Node. Gated on the terminator already
+                // being enabled so we skip AWS SDK init when the reconciler is
+                // dormant (force-disabled above when node-drain is off).
+                let drained_instance_lookup: Option<
+                    Arc<dyn drained_node_terminator::InstanceStateLookup>,
+                > = if drained_terminator_config.enabled
+                    && TerminatorKind::from_env()? == TerminatorKind::Aws
+                {
+                    let aws_config =
+                        aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                    let ec2_client = pplx_space_aws_client::ec2::Client::from_config(&aws_config);
+                    Some(Arc::new(
+                        drained_node_terminator::Ec2InstanceStateLookup::new(
+                            pool.clone(),
+                            Arc::new(ec2_client),
+                        ),
+                    ))
+                } else {
+                    None
+                };
+                handles.push(tokio::spawn(drained_node_terminator::run(
+                    drained_terminator_config,
+                    drained_terminator_sink,
+                    drained_annotation_lookup,
+                    drained_instance_lookup,
+                    shutdown_token.child_token(),
+                )));
             } else {
-                None
-            };
-            handles.push(tokio::spawn(drained_node_terminator::run(
-                drained_terminator_config,
-                drained_terminator_sink,
-                drained_annotation_lookup,
-                drained_instance_lookup,
-                shutdown_token.child_token(),
-            )));
+                tracing::info!(
+                    "SPACE_DRAIN_V2_ENABLED is on; not starting the drained-node terminator"
+                );
+            }
         }
     }
 

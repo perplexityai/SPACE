@@ -126,8 +126,8 @@ pub struct FailedUpload {
 /// its instance is confirmed terminated: the upload worker died with the
 /// instance, so no finalize can arrive.
 ///
-/// The identity guards are the transition's: `node_id` is still `draining`,
-/// and its `node_k8s.k8s_node_uid` is still `expected_uid` (`IS NOT DISTINCT
+/// The identity guards are the transition's: `node_id` is still `draining`
+/// under the v1 engine (`drain_engine IS NULL`), and its `node_k8s.k8s_node_uid` is still `expected_uid` (`IS NOT DISTINCT
 /// FROM`, so a `None` the caller observed matches only a NULL). A same-name
 /// replacement that registered, or a reset phase, makes it match nothing,
 /// which is a normal outcome: an empty result. The caller decides what to do
@@ -154,6 +154,7 @@ pub async fn fail_inflight_uploads_from_gone_node(
                 SELECT 1 FROM nodes
                  WHERE id = $1
                    AND drain_phase = 'draining'
+                   AND drain_engine IS NULL
             )
             AND EXISTS (
                 SELECT 1 FROM node_k8s

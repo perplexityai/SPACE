@@ -113,9 +113,9 @@ impl<T> Step<T> for Result<T, sqlx::Error> {
 /// `node_k8s` row with the instance its Node names, and refuse it again if a
 /// tombstone committed meanwhile. A Node under a new UID that reports no
 /// instance yet is deferred ([`K8sNodeRegistrationError::AwaitingInstance`])
-/// while the row has a v2 drain, and a v2 drain survives a UID change whose
-/// Node reports the drain's recorded instance: the same machine re-created
-/// its Node.
+/// while the row has a drain under an engine (v2, or one this build doesn't
+/// know), and such a drain survives a UID change whose Node reports the
+/// drain's recorded instance: the same machine re-created its Node.
 /// Returns whether any of those writes changed a row.
 ///
 /// Runs on the caller's connection, inside the caller's transaction: on an error,
@@ -222,7 +222,10 @@ where
 
     // A v2 drain's node is its recorded instance: a Node under a new UID is
     // that machine again only if it reports the same instance, and a
-    // replacement only if it reports another. One that reports none yet is
+    // replacement only if it reports another. A drain under an engine this
+    // build doesn't know (`drain_engine` set, not 'v2') is held the same way:
+    // this build can't tell whether it is v2-like, so it drops it only for
+    // another machine. One that reports none yet is
     // deferred, under the row lock the upsert above took, so the next sync
     // decides once the Node's `providerID` names its instance. A Node's
     // `providerID` never changes once set, so without a UID change the
@@ -231,8 +234,8 @@ where
     // upsert's fallback read sees its statement's snapshot, from before a v2
     // drain that committed meanwhile. Every registration that reports no
     // instance runs it (one primary-key join: every Kind node sync, and the
-    // seconds before a `providerID` appears on EKS); for a row without a v2
-    // drain it reads false. It reads the registration's own columns, never
+    // seconds before a `providerID` appears on EKS); for a row without an
+    // engine it reads false. It reads the registration's own columns, never
     // the drain's status.
     let awaiting_instance = instance_id.is_none()
         && sqlx::query_scalar::<_, bool>(sql!(
@@ -241,7 +244,7 @@ where
                    FROM nodes n
                    JOIN node_k8s k ON k.node_id = n.id
                   WHERE n.id = $1
-                    AND n.drain_engine = 'v2'
+                    AND n.drain_engine IS NOT NULL
                     AND k.k8s_node_uid IS DISTINCT FROM $2
              )"
         ))
@@ -277,7 +280,13 @@ where
     // restart), and its sandbox-manager is still sealed under the drain's
     // generation, which only that drain's undrain or terminate settles. The
     // registering Node's instance must be known and equal to the recorded
-    // one, `node_k8s.instance_id`; an unreported one was deferred above.
+    // one, `node_k8s.instance_id`; an unreported one was deferred above. A
+    // drain under an engine this build doesn't know is kept the same way.
+    //
+    // Only a row with something to clear matches: any drain column set, so
+    // a stray `drain_mode` alone is still cleared. A Node re-created on a
+    // node outside any drain changes nothing here and reports no abandoned
+    // drain.
     //
     // `prior` is the row as this statement reads it before its update (the
     // upsert above holds its lock), so the clear says whether the drain it
@@ -295,8 +304,16 @@ where
                AND k.node_id = n.id
                AND prior.id = n.id
                AND k.k8s_node_uid IS DISTINCT FROM $2
+               AND (
+                 n.drain_phase IS NOT NULL
+                 OR n.drain_mode IS NOT NULL
+                 OR n.drain_started_at IS NOT NULL
+                 OR n.drain_last_error IS NOT NULL
+                 OR n.drain_engine IS NOT NULL
+                 OR n.drain_status IS NOT NULL
+               )
                AND NOT COALESCE(
-                 n.drain_engine = 'v2' AND k.instance_id = $3::TEXT,
+                 n.drain_engine IS NOT NULL AND k.instance_id = $3::TEXT,
                  FALSE
                )
              RETURNING COALESCE(prior.drain_engine = 'v2', FALSE)"
