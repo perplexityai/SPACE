@@ -77,6 +77,14 @@ import { PrefixRequests, supplementalMatches } from '@/lib/prefix-search';
 import { useAuth } from '@/lib/auth';
 import { isOwnOrg } from '@/lib/own-org';
 import {
+  canCreateWithOwner,
+  crossOrgCreateTarget,
+  ownerOptionLabel,
+  sandboxOwner,
+  sandboxOwnerText,
+  type OwnerUsers,
+} from '@/lib/sandbox-owner';
+import {
   AutoLifecyclePolicy,
   NetworkPolicyV1,
   Organization,
@@ -84,6 +92,7 @@ import {
   Sandbox,
   SnapshotInfo,
   Template,
+  User,
 } from '@/lib/types';
 import { formatBytes } from '@/lib/sandbox-debug';
 import { CATALOG_NOTE, CATALOG_TITLE, catalogEmptyText } from '@/lib/snapshot-catalog';
@@ -747,6 +756,10 @@ function SandboxesPage() {
   const [manualRefreshing, setManualRefreshing] = useState(false);
   const [creating, setCreating] = useState(false);
   const creatingRef = useRef(false);
+  // The users of the organization a cross-organization create goes to, one
+  // of whom the operator chooses as the sandbox's owner.
+  const [ownerUsers, setOwnerUsers] = useState<OwnerUsers | null>(null);
+  const [ownerUsersReload, setOwnerUsersReload] = useState(0);
   const [refreshCooldown, setRefreshCooldown] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const refreshCooldownRef = useRef(false);
@@ -1015,6 +1028,26 @@ function SandboxesPage() {
       .catch(() => setAdminTemplateNames(null));
   }, []);
 
+  const createTargetOrgId = crossOrgCreateTarget(Form.useWatch('org_id', form), authOrg?.id);
+  const owner = sandboxOwner({ targetOrgId: createTargetOrgId, loaded: ownerUsers, chosenUserId: Form.useWatch('user_id', form) });
+
+  // Each organization's users are read when it is chosen; an answer for an
+  // organization no longer chosen is dropped, and `sandboxOwner` offers only
+  // the list read for the chosen one.
+  useEffect(() => {
+    if (!createTargetOrgId) return;
+    const orgId = createTargetOrgId;
+    const controller = new AbortController();
+    adminApi.get<User[]>(`/v1/orgs/${orgId}/users`, { signal: controller.signal })
+      .then((users) => {
+        if (!controller.signal.aborted) setOwnerUsers({ orgId, users, error: null });
+      })
+      .catch((err: any) => {
+        if (!controller.signal.aborted) setOwnerUsers({ orgId, users: null, error: err?.message || 'failed to load users' });
+      });
+    return () => controller.abort();
+  }, [createTargetOrgId, ownerUsersReload]);
+
   useEffect(() => {
     void refresh().catch((err: any) => {
       if (!alreadyReported(err)) message.error(err.message);
@@ -1065,10 +1098,20 @@ function SandboxesPage() {
   const handleCreate = async (values: {
     name?: string;
     org_id?: string;
+    user_id?: string;
     template: string;
     snapshots?: boolean;
   }) => {
     if (creatingRef.current) return;
+    // Cross-org creates go through the admin surface, with the owner the
+    // operator chose; the public path only ever creates under the signed-in
+    // admin's own org.
+    const targetOrgId = crossOrgCreateTarget(values.org_id, authOrg?.id);
+    const ownerNow = sandboxOwner({ targetOrgId, loaded: ownerUsers, chosenUserId: values.user_id });
+    if (!canCreateWithOwner(ownerNow)) {
+      message.error(sandboxOwnerText(ownerNow) ?? 'Choose the user who owns the sandbox.');
+      return;
+    }
     creatingRef.current = true;
     setCreating(true);
     try {
@@ -1081,12 +1124,8 @@ function SandboxesPage() {
         resources: null,
         auto_lifecycle: customCreateAutoLifecycle ?? undefined,
       };
-      // Cross-org creates go through the admin surface; the public path
-      // only ever creates under the signed-in admin's own org.
-      const targetOrgId =
-        values.org_id && (!authOrg || values.org_id !== authOrg.id) ? values.org_id : null;
-      const sandbox = targetOrgId
-        ? await createConsoleSandboxForOrg(targetOrgId, payload)
+      const sandbox = ownerNow.kind === 'chosen'
+        ? await createConsoleSandboxForOrg(ownerNow.orgId, ownerNow.user.id, payload)
         : await postPublicOperation('/sandboxes', payload);
       // Accepted: the sandbox exists from here on, so whatever happens next
       // is reported against it rather than through the error path below,
@@ -1772,6 +1811,10 @@ function SandboxesPage() {
           form={form}
           layout="inline"
           onFinish={handleCreate}
+          // An owner belongs to one organization; choosing another clears it.
+          onValuesChange={(changed) => {
+            if ('org_id' in changed) form.setFieldValue('user_id', undefined);
+          }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', flexWrap: 'wrap' }}>
             <Text strong>Create sandbox</Text>
@@ -1787,6 +1830,45 @@ function SandboxesPage() {
                   }))}
                 />
               </Form.Item>
+            )}
+            {createTargetOrgId && (
+              <>
+                <Form.Item
+                  name="user_id"
+                  label="Owner"
+                  rules={[{ required: true, message: 'Choose the owner' }]}
+                  style={{ marginBottom: 0 }}
+                >
+                  <Select
+                    aria-label="Owner"
+                    placeholder="Choose a user"
+                    style={{ width: 240 }}
+                    showSearch={{ optionFilterProp: 'label' }}
+                    loading={owner.kind === 'loading'}
+                    status={owner.kind === 'failed' ? 'error' : undefined}
+                    options={owner.kind === 'chosen' || owner.kind === 'unchosen'
+                      ? owner.users.map((user) => ({ label: ownerOptionLabel(user), value: user.id }))
+                      : []}
+                  />
+                </Form.Item>
+                {sandboxOwnerText(owner) ? (
+                  <Text type={owner.kind === 'failed' || owner.kind === 'no-users' ? 'danger' : 'secondary'}>
+                    {sandboxOwnerText(owner)}
+                    {owner.kind === 'failed' ? (
+                      <Button
+                        type="link"
+                        size="small"
+                        onClick={() => {
+                          setOwnerUsers(null);
+                          setOwnerUsersReload((value) => value + 1);
+                        }}
+                      >
+                        Retry
+                      </Button>
+                    ) : null}
+                  </Text>
+                ) : null}
+              </>
             )}
             <Form.Item name="name" style={{ marginBottom: 0 }}>
               <Input placeholder="Name" style={{ width: 150 }} />
@@ -1810,7 +1892,15 @@ function SandboxesPage() {
                   Clear
                 </Button>
               ) : null}
-              <Button type="primary" htmlType="submit" icon={<PlusOutlined />} loading={creating}>Create</Button>
+              <Button
+                type="primary"
+                htmlType="submit"
+                icon={<PlusOutlined />}
+                loading={creating}
+                disabled={!canCreateWithOwner(owner)}
+              >
+                Create
+              </Button>
             </Space>
           </div>
         </Form>

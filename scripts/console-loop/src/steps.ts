@@ -642,6 +642,98 @@ step('sandboxes-create-form', ['sandboxes'], async (c) => {
   c.rec.check(!offered.some((option) => runtimes.test(option)), 'no select of the create form offers a runtime');
 });
 
+// A create in another organization needs an owner from that organization's
+// users. The form's Owner select, and what it says when it has none to offer.
+const createCard = (c: Ctx) => c.page.locator('.ant-card', { hasText: 'Create sandbox' });
+const ownerSelect = (c: Ctx) => createCard(c).locator('.ant-form-item', { hasText: 'Owner' }).locator('.ant-select');
+// Waits for the create form's owner line to match `want`, and returns it.
+async function ownerLine(c: Ctx, want: RegExp): Promise<string> {
+  const deadline = Date.now() + 10_000;
+  let line = '';
+  while (Date.now() < deadline) {
+    line = await createCard(c).innerText();
+    if (want.test(line)) break;
+    await c.page.waitForTimeout(250);
+  }
+  return line;
+}
+// Whether the create form's Create button reaches `enabled` within a few
+// seconds: it follows the form's values on the next render.
+async function createEnabled(c: Ctx, enabled: boolean): Promise<boolean> {
+  const create = createCard(c).locator('button[type=submit]');
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    if (await create.isEnabled() === enabled) return true;
+    await c.page.waitForTimeout(200);
+  }
+  return false;
+}
+const ownerOptions = async (c: Ctx): Promise<string[]> => {
+  await ownerSelect(c).click();
+  await c.page.waitForTimeout(400);
+  const options = await c.page.locator('.ant-select-dropdown:visible .ant-select-item-option').allInnerTexts();
+  await c.page.keyboard.press('Escape');
+  return options;
+};
+
+// An organization without users, and one whose users cannot be read: the
+// step answers each users read itself, and checks that the form says so,
+// keeps Create disabled, and sends no create when Enter submits it. Retry
+// then reads the real users. It creates nothing: it runs under --no-mutate,
+// so every create POST the page sends is recorded and cut off before it
+// reaches the API, even from a console whose form submits without an owner.
+step('sandboxes-create-owner-states', ['sandboxes'], async (c) => {
+  const acme = orgId(c, 'acme');
+  const globex = orgId(c, 'globex');
+  if (!acme || !globex) return c.rec.check(false, 'the seed has the Acme and Globex organizations');
+  const answers = new Map([[acme, { status: 200, body: [] as unknown }], [globex, { status: 500, body: { error: 'synthetic users read failure' } as unknown }]]);
+  const handler = async (route: Route) => {
+    const id = new URL(route.request().url()).pathname.split('/').at(-2) ?? '';
+    const answer = answers.get(id);
+    if (!answer || route.request().method() !== 'GET') return route.continue();
+    return route.fulfill({ status: answer.status, contentType: 'application/json', headers: { [SYNTHETIC_HEADER]: '1' }, body: JSON.stringify(answer.body) });
+  };
+  const creates: string[] = [];
+  const createUrl = (url: URL) => url.pathname === '/admin/api/v1/sandboxes' || url.pathname === '/api/v1/sandboxes';
+  // Aborted, so the recorder takes it as cut off by the step.
+  const cutCreate = (route: Route) => {
+    if (route.request().method() !== 'POST') return route.fallback();
+    creates.push(route.request().url());
+    return route.abort('aborted');
+  };
+  await c.page.route('**/admin/api/v1/orgs/*/users', handler);
+  await c.page.route(createUrl, cutCreate);
+  try {
+    await visit(c, '/dashboard/sandboxes', 2000);
+    const card = createCard(c);
+    const create = card.locator('button[type=submit]');
+    c.rec.check(await ownerSelect(c).count() === 0, 'the own organization has no Owner field');
+    c.rec.note(`SYNTHETIC: the users of ${orgName(c, 'Acme')} are answered as none, those of ${orgName(c, 'Globex')} as a 500`);
+    await pickSelect(c.page, card.locator('.ant-select').first(), orgName(c, 'Acme'));
+    c.rec.check(/create a user first/.test(await ownerLine(c, /create a user first/)), 'an organization without users says a user must be created first');
+    c.rec.check(await create.isDisabled(), 'Create is disabled for an organization without users');
+    await card.getByPlaceholder('Name').fill(`${c.runTag}-no-owner`);
+    await card.getByPlaceholder('Name').press('Enter');
+    await pickSelect(c.page, card.locator('.ant-select').first(), orgName(c, 'Globex'));
+    c.rec.check(/Could not load/.test(await ownerLine(c, /Could not load/)), 'a failed users read says so');
+    c.rec.check(await create.isDisabled(), 'Create is disabled after a failed users read');
+    await card.getByPlaceholder('Name').press('Enter');
+    await c.page.waitForTimeout(1000);
+    await c.page.screenshot({ path: `${c.rec.outDir}/sandboxes-create-owner-failed.png` }).catch(() => {});
+    if (creates.length) c.rec.note(`create attempts cut off before the API: ${creates.join(', ')}`);
+    c.rec.check(creates.length === 0, `no create is sent without an owner (${creates.length} sent)`);
+    answers.clear();
+    await card.getByRole('button', { name: 'Retry' }).click();
+    c.rec.check(/Choose the user who owns/.test(await ownerLine(c, /Choose the user who owns/)), 'Retry reads the users and asks for an owner');
+    const options = await ownerOptions(c);
+    c.rec.check(options.some((option) => option.includes(email(c, 'globex-dev'))), `Retry offers the organization's users (${options.join(', ')})`);
+    c.rec.check(await create.isDisabled(), 'Create stays disabled until an owner is chosen');
+  } finally {
+    await c.page.unroute(createUrl, cutCreate);
+    await c.page.unroute('**/admin/api/v1/orgs/*/users', handler);
+  }
+});
+
 // The Datadog logs button shows only where SPACE_UI_DATADOG_LOGS_URL is set on
 // the console; the loop reads whether it is set from its own environment, so
 // run it with the console's value. Unset, the link must be absent; set, it must
@@ -706,6 +798,84 @@ step('sandbox-create', ['sandboxes', 'flows', 'lifecycle'], async (c) => {
     }
   }
   c.rec.check(!!c.shared.sandbox, 'creating a sandbox from the form produces one');
+}, true);
+
+// A create in a tenant organization through the form: Create waits for an
+// owner, choosing another organization clears the owner chosen for the first,
+// and the sandbox is owned by the user chosen, Acme Developer, not by Acme
+// Admin, the organization's oldest user. The step deletes the sandbox again.
+step('sandbox-create-other-org-owner', ['sandboxes', 'flows'], async (c) => {
+  const acme = orgId(c, 'acme');
+  const owner = seeded(c).users[email(c, 'acme-dev')];
+  const oldest = seeded(c).users[email(c, 'acme-admin')];
+  if (!acme || !owner || !oldest) return c.rec.check(false, 'the seed has the Acme organization, Acme Admin and Acme Developer');
+  await visit(c, '/dashboard/sandboxes', 3000);
+  const card = createCard(c);
+  const create = card.locator('button[type=submit]');
+  const name = `${c.runTag}-owner`;
+  await card.getByPlaceholder('Name').fill(name);
+  await pickSelect(c.page, card.locator('.ant-select').first(), orgName(c, 'Acme'));
+  await ownerLine(c, /Choose the user who owns/);
+  c.rec.check(await ownerSelect(c).count() === 1, 'another organization shows an Owner field');
+  c.rec.check(await create.isDisabled(), 'Create is disabled until an owner is chosen');
+  // Every Acme user's email starts with this; the Owner select of another
+  // organization must offer none of them.
+  const acmeLocal = `${c.config.prefix}-acme-`;
+  const acmeOptions = await ownerOptions(c);
+  c.rec.check([email(c, 'acme-admin'), email(c, 'acme-dev')].every((e) => acmeOptions.some((o) => o.includes(e) && o.startsWith(acmeLocal))),
+    `the Owner select offers Acme Admin and Acme Developer (${acmeOptions.join(', ')})`);
+  await pickSelect(c.page, ownerSelect(c), email(c, 'acme-dev'));
+  c.rec.check(await createEnabled(c, true), 'choosing an owner enables Create');
+
+  await pickSelect(c.page, card.locator('.ant-select').first(), orgName(c, 'Globex Research'));
+  await ownerLine(c, /Choose the user who owns/);
+  c.rec.check(!(await ownerSelect(c).innerText()).includes(email(c, 'acme-dev')), 'choosing another organization clears the owner');
+  c.rec.check(await createEnabled(c, false), 'Create is disabled again for the other organization');
+  const options = await ownerOptions(c);
+  c.rec.check(options.some((o) => o.includes(email(c, 'research-dev'))) && !options.some((o) => o.includes(acmeLocal)),
+    `the Owner select offers the other organization's users only (${options.join(', ')})`);
+
+  // Back in Acme the owner chosen there before must be gone too: without the
+  // clear it would be Acme Developer again, and Create enabled.
+  await pickSelect(c.page, card.locator('.ant-select').first(), orgName(c, 'Acme'));
+  c.rec.check(/Choose the user who owns/.test(await ownerLine(c, /Choose the user who owns/)), 'back in Acme, the form asks for an owner again');
+  c.rec.check(await createEnabled(c, false), 'back in Acme, Create is disabled until an owner is chosen again');
+  await pickSelect(c.page, ownerSelect(c), email(c, 'acme-dev'));
+  c.rec.check(await createEnabled(c, true), 'choosing the owner again enables Create');
+  await c.page.screenshot({ path: `${c.rec.outDir}/sandbox-create-other-org-owner-chosen.png` }).catch(() => {});
+  const response = nextPost(c.page, (p) => p === '/admin/api/v1/sandboxes');
+  await create.click();
+  const answer = await response;
+  const sent = answer?.request().postDataJSON() ?? null;
+  c.rec.check(sent?.org_id === acme && sent?.user_id === owner.id, `the create sends Acme and the chosen owner (${JSON.stringify({ org_id: sent?.org_id, user_id: sent?.user_id })})`);
+  const accepted = await jsonOf(answer);
+  if (typeof accepted?.sandbox_id !== 'string') return c.rec.check(false, `creating ${name} in Acme from the form is accepted`);
+  const id = sbxId(accepted.sandbox_id);
+  const createOperation = typeof accepted.operation_id === 'string' ? { id: accepted.operation_id, admin: true } : undefined;
+  recordCreated(c.config, { kind: 'sandbox', id, name, orgId: acme, createOperation });
+  try {
+    // The create's answer can come before the row exists; the row is read
+    // once its create operation has finished.
+    const deadline = Date.now() + 120_000;
+    let state = '';
+    while (createOperation && !TERMINAL_OPERATION_STATES.includes(state) && Date.now() < deadline) {
+      const timeoutMs = Math.min(15_000, deadline - Date.now());
+      state = (await adminFetch(c.page, 'GET', `/admin/api/v1/operations/${createOperation.id}`, undefined, { timeoutMs })).json?.state ?? '';
+      if (!TERMINAL_OPERATION_STATES.includes(state)) await c.page.waitForTimeout(Math.max(0, Math.min(1000, deadline - Date.now())));
+    }
+    c.rec.check(state === 'succeeded', `the create operation succeeds (${state || 'unread'})`);
+    const read = await adminFetch(c.page, 'GET', `/admin/api/v1/sandboxes/${id}`, undefined, { timeoutMs: 15_000 });
+    const row: { org_id?: string; user_id?: string } | null = read.status === 200 ? read.json : null;
+    c.rec.check(row?.org_id === acme, `the sandbox is in Acme (${row?.org_id})`);
+    c.rec.check(row?.user_id === owner.id, `the sandbox is owned by the chosen user, not the oldest (${row?.user_id}; chosen ${owner.id}, oldest ${oldest.id})`);
+  } finally {
+    await visit(c, `/dashboard/sandboxes/${id}`, 2000);
+    await c.page.locator('.ant-card', { hasText: 'Controls' }).getByRole('button', { name: /Delete/ }).click();
+    await confirmPopover(c.page);
+    await c.page.waitForURL(/\/dashboard\/sandboxes$/, { timeout: 120_000 }).catch(() => {});
+    await settle(c.page, 1000);
+  }
+  c.rec.check(/\/dashboard\/sandboxes$/.test(c.page.url()), `${name} is deleted again`);
 }, true);
 
 // A checkpoint stays on the sandbox's node, not in the snapshot catalog: the

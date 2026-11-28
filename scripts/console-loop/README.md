@@ -145,6 +145,19 @@ through the admin terminal route, and type into it. They create no objects,
 but they open terminal sessions, and the admin route records an admin audit
 row for each of the second's, so `--no-mutate` skips them too. The steps are in [`src/steps.ts`](src/steps.ts).
 
+A create in another organization needs an owner from its users. The `flows`
+step `sandbox-create-other-org-owner` creates a sandbox in the seeded Acme
+organization through the form: it checks that Create stays disabled until an
+owner is chosen and that choosing another organization clears the owner,
+picks Acme Developer (not Acme Admin, the organization's oldest user), checks
+through the admin API that the sandbox's `user_id` is that user, and deletes
+the sandbox again. `sandboxes-create-owner-states` answers the users reads
+itself, as none for Acme and a 500 for Globex, and checks that the form says
+so, keeps Create disabled and sends no create. It creates nothing, so
+`--no-mutate` keeps it: every create POST the page sends while it runs is
+recorded and aborted before it reaches the API, so a console that submits
+without an owner shows up as a failed check, not as a sandbox.
+
 Two `nodes` `flows` steps preview a v2 drain, which changes nothing on a node:
 `node-drain-preview` runs Preview v2 drain on the node page of the worker
 with the most sandboxes and checks the panel against the API's answer, and
