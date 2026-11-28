@@ -163,6 +163,7 @@ pub(super) fn assemble_substrate(
         pod_network_slots: pod_indexes.network_slots,
         pod_client_index: pod_indexes.client_pods,
         pod_events: pod_reflector::PodEvents::for_test(),
+        pod_sandbox_rejections: pod_sandbox_rejections::PodSandboxRejections::default(),
         pod_reflector_ready: ReflectorReady::always_ready(),
         cancel_tracker: Arc::new(CancelRateTracker::with_budget(64)),
         // Gate closed: a closed gate issues no query, so a lazily-connected
@@ -178,6 +179,78 @@ pub(super) fn assemble_substrate(
         },
         shutdown_token,
         task_tracker,
+    }
+}
+
+/// A feed into a substrate's sandbox-pod cache, standing in for the
+/// reflector's watch: each update reaches the store and the substrate's
+/// [`pod_reflector::PodEvents`] as the watch's would.
+#[cfg(test)]
+pub(super) struct PodCacheFeed {
+    writer: sandbox_pod_view::SandboxPodWriter,
+    events: tokio::sync::broadcast::Sender<String>,
+    delivered: pod_reflector::DeliveryClock,
+}
+
+#[cfg(test)]
+impl PodCacheFeed {
+    /// The watch reports `pod` added or changed.
+    pub(super) fn apply(&mut self, pod: Pod) {
+        self.update(Event::Apply(SandboxPodView::from(pod)));
+    }
+
+    /// The watch reports `pod` deleted.
+    pub(super) fn delete(&mut self, pod: Pod) {
+        self.update(Event::Delete(SandboxPodView::from(pod)));
+    }
+
+    fn update(&mut self, event: Event<SandboxPodView>) {
+        let (Event::Apply(pod) | Event::Delete(pod)) = &event else {
+            unreachable!("only single-pod updates are fed");
+        };
+        let name = pod.name().to_owned();
+        self.writer.apply_watcher_event(&event);
+        self.delivered.stamp();
+        // No receiver is a wait that has not subscribed yet; the store holds
+        // the update for it.
+        if self.events.send(name).is_err() {
+            tracing::debug!("no wait subscribed to the fed pod update");
+        }
+    }
+}
+
+#[cfg(test)]
+impl KubernetesSubstrate {
+    /// This substrate with a sandbox-pod cache that holds `pods` and is fed
+    /// afterwards through the returned [`PodCacheFeed`].
+    pub(super) fn with_pod_cache_feed(mut self, pods: Vec<Pod>) -> (Self, PodCacheFeed) {
+        let (pod_store, indexes, writer) = sandbox_pod_view::seeded_sandbox_pod_cache(pods);
+        let (pod_events, events) = pod_reflector::PodEvents::for_test_with_sender();
+        self.pod_store = pod_store;
+        self.pod_network_slots = indexes.network_slots;
+        self.pod_client_index = indexes.client_pods;
+        let delivered = pod_events.delivery_clock();
+        self.pod_events = pod_events;
+        (
+            self,
+            PodCacheFeed {
+                writer,
+                events,
+                delivered,
+            },
+        )
+    }
+
+    /// This substrate with the process's watch of sandbox refusals running
+    /// on its apiserver client, as [`Self::try_from_env`] starts it.
+    pub(crate) fn with_pod_sandbox_rejection_watch(mut self) -> Self {
+        self.pod_sandbox_rejections = pod_sandbox_rejections::PodSandboxRejections::start(
+            self.k8s.client.clone(),
+            &self.k8s.sandbox_namespace,
+            self.shutdown_token.clone(),
+            &self.task_tracker,
+        );
+        self
     }
 }
 

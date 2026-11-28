@@ -10,6 +10,8 @@ use kube::{
         watcher::{self, Config as WatcherConfig},
     },
 };
+use std::sync::{Arc, Mutex, PoisonError};
+
 use tokio::{
     sync::{broadcast, watch},
     time::{Instant, sleep_until, timeout},
@@ -117,17 +119,62 @@ impl ReflectorReady {
 #[derive(Clone)]
 pub struct PodEvents {
     tx: broadcast::Sender<String>,
+    delivered: DeliveryClock,
+}
+
+/// When the sandbox-pod watch last delivered anything to the reflector: an
+/// applied or deleted pod, or a re-list's start or end. A watch whose
+/// connection has stalled delivers nothing, so a long silence while creates
+/// wait on the store is the signal to read their pods directly.
+#[derive(Clone)]
+pub(super) struct DeliveryClock(Arc<Mutex<Instant>>);
+
+impl DeliveryClock {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Instant::now())))
+    }
+
+    pub(super) fn stamp(&self) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+    }
+
+    fn last(&self) -> Instant {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl PodEvents {
     fn new() -> (Self, broadcast::Sender<String>) {
         let (tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        (Self { tx: tx.clone() }, tx)
+        (
+            Self {
+                tx: tx.clone(),
+                delivered: DeliveryClock::new(),
+            },
+            tx,
+        )
+    }
+
+    /// The clock the watch loop stamps on every delivery.
+    pub(super) fn delivery_clock(&self) -> DeliveryClock {
+        self.delivered.clone()
+    }
+
+    /// When the watch last delivered anything; see [`DeliveryClock`].
+    pub(super) fn last_delivery(&self) -> Instant {
+        self.delivered.last()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn for_test() -> Self {
         Self::new().0
+    }
+
+    /// Events and the sender a test feeds them from, as the reflector's
+    /// watch loop does.
+    #[cfg(test)]
+    pub(super) fn for_test_with_sender() -> (Self, broadcast::Sender<String>) {
+        Self::new()
     }
 
     /// Subscribe to the raw per-name event stream. Used by waiters that must
@@ -137,7 +184,7 @@ impl PodEvents {
     /// and keeps blocking: if the target pod's delete signal was one of the
     /// dropped messages there may be no later event for it, stranding the wait
     /// even though the store already removed the pod.
-    fn subscribe(&self) -> broadcast::Receiver<String> {
+    pub(super) fn subscribe(&self) -> broadcast::Receiver<String> {
         self.tx.subscribe()
     }
 
@@ -328,11 +375,12 @@ pub fn start(
         .map_ok(sandbox_pod_view::sandbox_pod_view_event)
         .default_backoff();
     let (events, events_tx) = PodEvents::new();
+    let delivered = events.delivery_clock();
     let ready = ReflectorReady::new();
 
     let log_namespace = namespace.clone();
     tokio::spawn(async move {
-        reflect_sandbox_pods(stream.boxed(), writer, events_tx, &log_namespace).await;
+        reflect_sandbox_pods(stream.boxed(), writer, events_tx, delivered, &log_namespace).await;
     });
 
     let ready_for_task = ready.clone();
@@ -369,11 +417,12 @@ pub fn start(
 /// store's private buffer, so its broadcast can precede the pod becoming
 /// readable at `InitDone`. Waiters in `PodEvents::wait_for` re-check the store
 /// after a signal, so a delete signal lets them observe pod absence without an
-/// apiserver poll.
+/// apiserver poll. Every delivered event stamps `delivered`.
 async fn reflect_sandbox_pods<S>(
     mut stream: S,
     mut writer: SandboxPodWriter,
     events_tx: broadcast::Sender<String>,
+    delivered: DeliveryClock,
     namespace: &str,
 ) where
     S: Stream<Item = Result<watcher::Event<SandboxPodView>, watcher::Error>> + Unpin,
@@ -382,6 +431,7 @@ async fn reflect_sandbox_pods<S>(
         match event {
             Ok(event) => {
                 writer.apply_watcher_event(&event);
+                delivered.stamp();
                 if let watcher::Event::Apply(pod)
                 | watcher::Event::InitApply(pod)
                 | watcher::Event::Delete(pod) = &event

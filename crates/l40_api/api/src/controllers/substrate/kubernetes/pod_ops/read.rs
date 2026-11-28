@@ -90,12 +90,11 @@ impl KubernetesSubstrate {
     /// branch on: assigned IP, terminal phase, or scheduler-marked
     /// unschedulable.
     ///
-    /// The reflector watch is independent from the per-pod watches used by
-    /// `wait_for_pod_proxy_reachable`, so it can briefly lag a Modified event
-    /// that the per-pod watch already observed. The bounded event wait closes
-    /// most of that window without putting load on the kube apiserver under
-    /// burst; the GET fallback preserves correctness when the reflector
-    /// genuinely lags or the pod is unknown to the cache.
+    /// The reflector can briefly lag a Modified event the apiserver already
+    /// has. The bounded event wait closes most of that window without putting
+    /// load on the kube apiserver under burst; the GET fallback preserves
+    /// correctness when the reflector genuinely lags or the pod is unknown to
+    /// the cache.
     ///
     /// Steady-state behavior is unchanged: once a pod is running with an IP
     /// (or terminal/unschedulable), the cache is authoritative and no GET
@@ -175,7 +174,7 @@ impl KubernetesSubstrate {
     /// `start`/`wake`/`access` (whose retry converges).
     ///
     /// Two call sites pass a constant that is not their operation's:
-    /// `resolve_pod_ip` and `wait_ready`'s `watch_until_pod_ip_assigned` are
+    /// `resolve_pod_ip` and `wait_ready`'s `reflected_pod_ip` are
     /// each reached from create readiness *and* from wake/access/delete, and
     /// both pass `RetryDuplicatesExecution`. That is the safe direction — it
     /// costs a converging caller a 500 where a 503 would have done, rather
