@@ -4,23 +4,40 @@ import time
 from typing import cast
 
 import space_smoke as smoke
-from space_smoke.capabilities import ResidentLifecycleSandbox
+from space_smoke.capabilities import DurableLifecycleSandbox, ResidentLifecycleSandbox
 from space_smoke.drain_v2 import (
     DRAIN_HOLD_FIELD,
     LENGTHENED_DEADLINE_STATUS,
     MODE_WITH_V2_STATUS,
+    REPORT_SECONDS,
+    in_parallel,
 )
 
 PATH = "/tmp/space-smoke-v2-held.txt"
-# Long enough for the idle sandbox to be seen running and answering under
-# the drain; short enough that it suspends on its own inside the run.
-IDLE_TIMEOUT = "120s"
+# Long enough for the idle sandbox to be seen held and answering under the
+# drain (its last command is the file read there), and well under the bench's
+# 120 s eviction floor (`minIdleSecs` in space-sandbox-manager-local's
+# values.yaml), which counts from that same command: the idle suspend lands
+# at about 45 s, so its upload and the next report have more than a minute
+# before eviction may drop the node's rows, where an idle policy equal to the
+# floor left them one 15 s eviction interval. The drain finds it running: the
+# run's last command before the drain is 3-6 s before the held check,
+# measured.
+IDLE_SECONDS = 40
+IDLE_TIMEOUT = f"{IDLE_SECONDS}s"
 # The first hold: the drain must not reach it.
 LONG_HOLD_SECONDS = 60 * 60
 # How far ahead of the repeat the shortened deadline lands: a hold that only
 # has to pass, with the admin view showing it within a couple of the
 # controller's 5 s ticks and the held sandbox answering once before it.
 SHORT_AHEAD_SECONDS = 30
+# The paused resident's suspend and upload, from the seal: the next report
+# and the work, under 5 s measured, four times over, with a 30 s margin.
+DURABLE_SECONDS = REPORT_SECONDS + 4 * 5 + 30
+# The idle suspend, from its last command: the idle policy, the node's 5 s
+# auto-lifecycle sweep, the suspend and upload (under 30 s measured) and a
+# 3 s poll, with a 30 s margin.
+IDLE_SUSPENDED_SECONDS = IDLE_SECONDS + 5 + 30 + 3 + 30
 
 
 # The hold's parts are crate tests: the planner's hold of a started row
@@ -42,7 +59,7 @@ SHORT_AHEAD_SECONDS = 30
     # KVM bench.
     timeout_minutes=45,
     tier="manual",
-    manual_reason="drain v2 is off by default outside Kind, so its scenarios run by name, not in the per-merge set",
+    manual_reason="timing-sensitive on Kind: an idle suspend must be reported before the bench's short eviction floor drops its local rows",
 )
 def v2_drain_holds_running_until_its_deadline(test: smoke.CommandSandboxFixture) -> None:
     """A v2 `:drain` with an hour's hold of a worker holding two running
@@ -64,11 +81,14 @@ def v2_drain_holds_running_until_its_deadline(test: smoke.CommandSandboxFixture)
         with test.phase("pin two running sandboxes, one with an idle policy, and a paused one to one worker"):
             drain.pin_to_resident_worker(away_from_fixture=True)
             drain.give_fake_instance()
-            idle = drain.create_resident(idle_timeout=IDLE_TIMEOUT)
-            busy = drain.create_resident()
-            paused = drain.create_resident()
-            for sandbox in (idle, busy, paused):
-                drain.write_file(sandbox, PATH)
+            idle, busy, paused = in_parallel(
+                [
+                    lambda: drain.create_resident(idle_timeout=IDLE_TIMEOUT),
+                    drain.create_resident,
+                    drain.create_resident,
+                ]
+            )
+            in_parallel([lambda sandbox=sandbox: drain.write_file(sandbox, PATH) for sandbox in (idle, busy, paused)])
             cast(ResidentLifecycleSandbox, paused).pause()
             test.sandbox.suspend()
             drain.release_other_worker()
@@ -87,19 +107,23 @@ def v2_drain_holds_running_until_its_deadline(test: smoke.CommandSandboxFixture)
                 drain.expect_file(sandbox, PATH)
 
         with test.phase("the paused one is made durable at once; a wake lands it on the other worker"):
-            drain.expect_durable(paused.sandbox_id, timeout=600)
+            drain.expect_durable(paused.sandbox_id, timeout=DURABLE_SECONDS)
             drain.wake_elsewhere(paused)
             drain.expect_file(paused, PATH)
 
         with test.phase("the idle one suspends on its own on the sealed worker and is reported evacuated"):
-            drain.expect_lifecycle_back(idle.sandbox_id, "suspended", timeout=600)
+            drain.expect_lifecycle_back(idle.sandbox_id, "suspended", timeout=IDLE_SUSPENDED_SECONDS)
+            # A report names it evacuated, and the controller keeps every
+            # sandbox a report named in `evacuated_total`, which only a report
+            # adds to before `drained`: read from either, so a report this
+            # poll missed still counts, and one that never came does not.
             drain.wait_for_report(
-                lambda report: any(
-                    entry.get("sandbox_id") == drain.bare_id(idle.sandbox_id)
-                    for entry in report.get("evacuated", [])
-                ),
+                lambda report: drain.bare_id(idle.sandbox_id)
+                in drain.evacuated_residents(report, [idle.sandbox_id]) | drain.evacuated_total(report),
                 "the node never reported the self-suspended sandbox evacuated",
-                timeout=600,
+                # The next report after the row reads suspended, inside the
+                # minute eviction leaves it.
+                timeout=REPORT_SECONDS,
             )
             drain.expect_held(busy.sandbox_id)
 
@@ -161,10 +185,12 @@ def v2_drain_holds_running_until_its_deadline(test: smoke.CommandSandboxFixture)
             )
 
         with test.phase("a wake lands each held sandbox on the other worker, its file intact"):
-            for sandbox in (busy, idle):
+            def wake(sandbox: DurableLifecycleSandbox) -> None:
                 drain.expect_suspended_unplaced(sandbox.sandbox_id)
                 drain.wake_elsewhere(sandbox)
                 drain.expect_file(sandbox, PATH)
+
+            in_parallel([lambda sandbox=sandbox: wake(sandbox) for sandbox in (busy, idle)])
             test.sandbox.wake()
 
         with test.phase("undrain: the drain is cancelled on the node"):

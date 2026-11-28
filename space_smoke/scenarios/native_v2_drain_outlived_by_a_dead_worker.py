@@ -5,6 +5,7 @@ from typing import Any, cast
 
 import space_smoke as smoke
 from space_smoke.capabilities import DurableLifecycleSandbox, SandboxRowState
+from space_smoke.drain_v2 import DISPATCH_BACKOFF_CAP_SECONDS, REPORT_SECONDS
 
 # How long Kind's fake EC2 keeps the dead worker's instance `shutting-down`:
 # long enough for failed wakes of the queued residents and many drain ticks
@@ -25,6 +26,12 @@ LOOP_SECONDS = 420
 # published `started` on the worker when it dies.
 STARTED = 10
 WINDOW = 8
+# The let-go once EC2 says terminated: the drain's next EC2 check, backed off
+# to its cap by then, the margin the window left, the next report, and a
+# minute (28 s measured).
+LET_GO_SECONDS = DISPATCH_BACKOFF_CAP_SECONDS + SHUTDOWN_MARGIN_SECONDS + REPORT_SECONDS + 60
+# A parked row's delete landing (seconds measured), with a minute's margin.
+DELETED_SECONDS = 120
 
 
 # The drain's let-go is a crate test (`node_drain::v2`: every unfenced state
@@ -75,10 +82,8 @@ def v2_drain_outlived_by_a_dead_worker(test: smoke.CommandSandboxFixture) -> Non
         with test.phase("pin a suspended resident and more started ones than the window"):
             drain.pin_to_resident_worker(away_from_fixture=True)
             drain.give_fake_instance()
-            kept = drain.create_resident()
-            started = [drain.create_resident() for _ in range(STARTED)]
-            for sandbox in (kept, *started):
-                drain.fill_memory(sandbox, mib=64)
+            kept, *started = drain.create_residents(1 + STARTED)
+            drain.fill_memories([kept, *started], mib=64)
             kept.suspend()
             cast(DurableLifecycleSandbox, test.sandbox).suspend()
             drain.release_other_worker()
@@ -153,7 +158,7 @@ def v2_drain_outlived_by_a_dead_worker(test: smoke.CommandSandboxFixture) -> Non
                 )
 
             with test.phase("EC2 says terminated: the drain lets the node go"):
-                trace = drain.expect_let_go(timeout=900)
+                trace = drain.expect_let_go(timeout=LET_GO_SECONDS)
                 at_let_go = drain.row_states(started)
                 test.record(
                     "at_let_go",
@@ -234,7 +239,7 @@ def v2_drain_outlived_by_a_dead_worker(test: smoke.CommandSandboxFixture) -> Non
         with test.phase("delete the parked rows; the suspended resident wakes elsewhere; the node row is recorded"):
             for sandbox_id in parked:
                 test.delete_sandbox(bare[sandbox_id])
-                drain.expect_deleted(bare[sandbox_id].sandbox_id, timeout=600)
+                drain.expect_deleted(bare[sandbox_id].sandbox_id, timeout=DELETED_SECONDS)
             kept.wake()
             drain.expect_lifecycle(kept.sandbox_id, "started")
             _, node = drain.residency(kept.sandbox_id)

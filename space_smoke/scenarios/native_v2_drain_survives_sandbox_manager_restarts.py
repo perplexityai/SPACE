@@ -1,11 +1,21 @@
 """A v2 drain's seal and deadline hold across the drained worker's sandbox-manager restarting on either side of the deadline."""
 
 import space_smoke as smoke
-from space_smoke.drain_v2 import PENDING_RUNNING_FIELD, WAIT_MOVING
+from space_smoke.drain_v2 import PENDING_RUNNING_FIELD, UPLOAD_RETRY_SECONDS, WAIT_MOVING
 
-# The drain's hold: long enough for a sandbox-manager restart to land before
-# the deadline on a slow bench.
-HOLD_SECONDS = 360
+# The drain's first hold: long enough for a sandbox-manager restart to land
+# before the deadline on any bench. Once the restarted node has reported,
+# the run brings the deadline in (`LEAD_SECONDS`) rather than wait out the
+# rest of a hold sized for the slowest bench.
+HOLD_SECONDS = 900
+# How long before the deadline the watch of the started residents held ends.
+HELD_MARGIN_SECONDS = 5
+# How far ahead the deadline lands once brought in: a 25 s watch of the
+# restarted node holding the started residents, at least two of its 10 s
+# re-plans and four controller ticks, until `HELD_MARGIN_SECONDS` before it.
+# The node is never told a deadline (`bring_deadline_to`), so nothing waits
+# for it to hear this one.
+LEAD_SECONDS = 25 + HELD_MARGIN_SECONDS
 # The latest the first restart may end before the deadline.
 RESTART_MARGIN_SECONDS = 30
 
@@ -31,9 +41,10 @@ RESTART_MARGIN_SECONDS = 30
 )
 def v2_drain_survives_sandbox_manager_restarts(test: smoke.CommandSandboxFixture) -> None:
     """With uploads blocked on the drained worker, a v2 drain with a
-    six-minute hold of two started and a paused resident seals it. Its sandbox-manager restarts before the deadline: the node reports
-    under the same generation again, the deadline is unchanged, and the
-    started residents keep running until it. Past it the node suspends them,
+    hold of two started and a paused resident seals it. Its sandbox-manager restarts before the deadline: the node reports
+    under the same generation again, the stored deadline is unchanged, and the
+    started residents keep running until it, once brought in by a repeat
+    `:drain`. Past it the node suspends them,
     and it restarts again while every upload waits: it reports under the
     generation again, and no started resident runs again. Once uploads are let through the node
     reports each resident evacuated and reaches `drained`; every resident is
@@ -71,13 +82,17 @@ def v2_drain_survives_sandbox_manager_restarts(test: smoke.CommandSandboxFixture
             )
             test.record("report_after_first_restart", after_first)
             shown = drain.expect_view_deadline(after_first)
+            # The node keeps no deadline: the view shows the stored one, which
+            # only a `:drain` may move.
             test.verify(
                 shown == persisted,
-                "the drain's deadline moved across the restart",
+                "the stored deadline moved across the restart",
                 persisted=persisted,
                 shown=shown,
             )
-            drain.expect_started_until_deadline(started, margin=5)
+            drain.bring_deadline_to(LEAD_SECONDS)
+            persisted = drain.expect_view_deadline(drain.report())
+            drain.expect_started_until_deadline(started, margin=HELD_MARGIN_SECONDS)
 
         with test.phase("past the deadline: restart sandbox-manager again while every upload waits"):
             drain.wait_past_deadline()
@@ -107,17 +122,20 @@ def v2_drain_survives_sandbox_manager_restarts(test: smoke.CommandSandboxFixture
             }
             test.record("after_second_restart", {"report": after_second, "node_states": node_states})
             test.verify(
-                shown == persisted
-                and all(state == "suspended" for state in node_states.values()),
-                "the node restarted past the deadline lost its seal's deadline, or ran a suspended resident again",
+                shown == persisted,
+                "the stored deadline moved across the second restart",
                 persisted=persisted,
                 shown=shown,
+            )
+            test.verify(
+                all(state == "suspended" for state in node_states.values()),
+                "the node restarted past the deadline ran a suspended resident again",
                 node_states=node_states,
             )
 
         with test.phase("uploads let through: every resident is evacuated; the node drains"):
             uploads.release()
-            report = drain.expect_drained()
+            report = drain.expect_drained(timeout=UPLOAD_RETRY_SECONDS)
             drain.expect_evacuated(report, lifecycles)
 
         with test.phase("every resident is left suspended and unplaced; a wake lands each elsewhere"):

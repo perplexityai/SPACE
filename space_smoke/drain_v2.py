@@ -43,7 +43,9 @@ drain: each batch of runs checks the switches once (`require_drain_v2`). A
 run whose drain needs EC2's answers, a terminate or a let-go, scopes the
 `aws` terminator to itself (`v2_controller(aws=True)`), under the
 controller-mutation Lease, with the gone-node loops a let-go node is handed
-to when the run asks for them; Kind's other drains run `kube-delete`. The
+to when the run asks for them; Kind's other drains run `kube-delete`. A
+run that waits a stall out scopes a shorter stall bound to itself the same
+way (`v2_controller(stall_bound=...)`). The
 evacuation cap is the API's, read where `:drain` is served, so a run that
 needs it scopes it to the public API Deployment (`evacuation_cap`), under
 the public-API mutation Lease.
@@ -86,7 +88,7 @@ import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from space_smoke.capabilities import (
     CallAnswer,
@@ -100,7 +102,16 @@ from space_smoke.capabilities import (
     SandboxRowState,
     SnapshotRecord,
 )
-from space_smoke.runtime import Compensation, ResourceScope
+from space_smoke.runtime import (
+    Compensation,
+    InconclusiveSmoke,
+    ResourceScope,
+    ScenarioTimedOut,
+    primary_failure,
+    run_concurrently,
+)
+
+T = TypeVar("T")
 
 # The node-drain terminator: `aws` gives the v2 drain its terminate, and
 # EC2's answer for the instance, through Kind's fake EC2.
@@ -119,15 +130,6 @@ ORPHANED_NODES_ENABLED_ENV = "SPACE_ORPHANED_NODES_ENABLED"
 ORPHANED_SANDBOXES_ENABLED_ENV = "SPACE_ORPHANED_SANDBOX_RECONCILER_ENABLED"
 ORPHANED_SANDBOXES_DRY_RUN_ENV = "SPACE_API_RECONCILER_DRY_RUN"
 
-# The only controller env a drain v2 scenario may touch, and the closed
-# vocabulary its overrides come from.
-DRAIN_V2_ENV_KEYS: tuple[str, ...] = (
-    TERMINATOR_KIND_ENV,
-    LOST_STARTED_ENABLED_ENV,
-    ORPHANED_NODES_ENABLED_ENV,
-    ORPHANED_SANDBOXES_ENABLED_ENV,
-    ORPHANED_SANDBOXES_DRY_RUN_ENV,
-)
 # The only public API env a drain v2 scenario may touch: the API counts the
 # evacuating drains when it answers `:drain`.
 DRAIN_V2_API_ENV_KEYS: tuple[str, ...] = (DRAIN_V2_MAX_EVACUATING_ENV,)
@@ -142,6 +144,8 @@ LEGACY_LOOPS_ENV = {
 _TERMINATOR_VALUES = frozenset({"aws", "kube-delete"})
 _FLAG_VALUES = frozenset({"true", "false"})
 _COUNT_VALUE = re.compile(r"[1-9][0-9]{0,2}")
+# A scoped stall bound, in whole seconds: at least 10.
+_STALL_BOUND_VALUE = re.compile(r"[1-9][0-9]{1,2}")
 
 # The controller config a run whose drain needs EC2's answers scopes to
 # itself: the `aws` terminator, which alone gives the v2 loop EC2 and Auto
@@ -161,12 +165,132 @@ DRAIN_V2_HOOK_KEYS: tuple[str, ...] = (
     DISPATCH_BACKOFF_BASE_HOOK,
 )
 RELEASE_STALL_BOUND_SECONDS = 15 * 60
+# The only controller env a drain v2 scenario may touch, and the closed
+# vocabulary its overrides come from.
+DRAIN_V2_ENV_KEYS: tuple[str, ...] = (
+    TERMINATOR_KIND_ENV,
+    LOST_STARTED_ENABLED_ENV,
+    ORPHANED_NODES_ENABLED_ENV,
+    ORPHANED_SANDBOXES_ENABLED_ENV,
+    ORPHANED_SANDBOXES_DRY_RUN_ENV,
+    # A run that waits a stall out shortens it for itself (`v2_controller`).
+    STALL_BOUND_HOOK,
+)
 RELEASE_DISPATCH_BACKOFF_BASE_SECONDS = 10
 # The controller's cap on a fenced node's EC2 check backoff.
 DISPATCH_BACKOFF_CAP_SECONDS = 120
 _FAKE_PROVIDER_PREFIX = "aws:///kind-a/"
 _FAKE_INSTANCE = re.compile(r"i-[0-9a-f]{17}")
 _FAKE_PROVIDER = re.compile(r"aws:///kind-a/(i-[0-9a-f]{17})")
+
+
+# --- How long each wait may take ------------------------------------------
+#
+# A wait's timeout is the fixed timers it waits out, about four times the
+# real work it waits for as measured on a local Kind bench, and a margin: a step that hangs fails within a minute or
+# two of when it should have ended, not ten minutes later. None is shorter
+# than the longest wait it can contain, such as one `DrainNode` call's own
+# budget after a controller tick, or the upload worker's longest retry
+# backoff. Windows a check watches to see that something does *not* happen
+# are not these: each scenario keeps its own.
+
+# The controller's node-drain tick (`node_drain::DEFAULT_TICK`).
+TICK_SECONDS = 5
+# One `DrainNode` call's own budget on the node (`DRAIN_CALL_TIMEOUT`).
+CALL_BUDGET_SECONDS = 45
+# How often a run reads the admin view while it waits for a report.
+REPORT_POLL_SECONDS = 2
+# The next report the controller stores: a tick, a call within its budget,
+# a poll and 10 s.
+REPORT_SECONDS = TICK_SECONDS + CALL_BUDGET_SECONDS + REPORT_POLL_SECONDS + 10
+# A drain of up to three small residents to `drained`, due now: the next
+# report, and their suspends and uploads (8 s for three measured, so 10 s),
+# four times over, with a 30 s margin. A run that drains more sizes its own
+# from this rule.
+DRAINED_SECONDS = REPORT_SECONDS + 4 * 10 + 30
+# A resident's state once the drain is `drained`, or once the node says it
+# is suspended: polls of rows already written (under 5 s measured).
+SETTLED_SECONDS = 60
+# A wake to `started` elsewhere, a restore from a durable snapshot (2-10 s
+# measured), four times over, with a 30 s margin.
+WAKE_SECONDS = 4 * 10 + 30
+# The node's own suspend past the deadline: the next report and the suspend
+# and upload (about 10 s measured), four times over, with a 30 s margin.
+NODE_SUSPEND_SECONDS = REPORT_SECONDS + 4 * 10 + 30
+# An upload the node retried while its path was cut, once the path is back:
+# the upload worker's longest retry backoff (300 s,
+# `crates/l10_foundation/common/jobs/src/worker.rs`), an attempt, a report
+# and a minute's margin.
+UPLOAD_RETRY_SECONDS = 300 + 30 + REPORT_SECONDS + 60
+# The undrain's cancel and uncordon: the next report and the cancel call
+# (3-5 s measured), with a 20 s margin.
+CANCEL_SECONDS = REPORT_SECONDS + 20
+# A worker re-registered under a new providerID, its node services Ready and
+# its row recording the instance (35-40 s measured), four times over.
+REGISTER_SECONDS = 4 * 40
+# A Kind worker started again as a same-name replacement (77 s measured),
+# four times over.
+COME_BACK_SECONDS = 4 * 80
+# A gated activation, retried by the client until the drain made the
+# sandbox durable and the wake restored it (13-49 s measured), four times
+# over, with a minute's margin.
+ACTIVATION_SECONDS = 4 * 50 + 60
+# A stop or kill refused for the dispatcher's whole retry budget: 16 attempts
+# after the gate's Retry-After (`public_operation_driver.rs`), about 150 s
+# measured, with a two-minute margin.
+REFUSED_STOP_SECONDS = 150 + 120
+# How long a run waits, as it pins its workers, for sandboxes an earlier
+# run deleted to leave them: a delete lands in seconds; two minutes.
+LEFTOVER_SECONDS = 120
+# A command on a sandbox whose data plane is coming up, or a memory fill of
+# up to 256 MiB (seconds measured), with a minute's margin.
+COMMAND_SECONDS = 90
+# The node-row states of a running sandbox a drain holds: `started`, or a
+# checkpoint it passes through on the way back to `started` (sandbox-manager's
+# state machine has no checkpoint-to-suspend edge).
+HELD_NODE_STATES = frozenset({"started", "checkpointing"})
+# One probe of a running sandbox around its deadline: the node's own state,
+# a command, and the node's state again. About 0.4 s measured on Kind
+# (26-30 probes in the 12 s before a deadline); 4 s allows for a bench ten
+# times slower.
+PROBE_SECONDS = 4
+# How long before the deadline the probes start. The first one's call is
+# asked up to a probe after they start, so at least `2 * PROBE_SECONDS`
+# before the deadline: room for two calls to meet the VM held there even at
+# 4 s a probe.
+CALLS_LEAD_SECONDS = 3 * PROBE_SECONDS
+# How far past one of the controller's ticks `bring_deadline_to(...,
+# after_a_tick=True)` puts a deadline: the stored deadline may land a second
+# either side of the one asked for (`expect_stored_deadline`), and a tick's
+# stamp is its whole second, so 2 s keeps the deadline after that tick and
+# the next one, which evacuates, 2-5 s past the deadline.
+AFTER_A_TICK_SECONDS = 2
+
+
+# How many independent per-resident calls (creates, fills, wakes, deletes) a
+# run makes at once: enough to overlap their round trips, few enough that a
+# worker's admission and the shared upload lane don't refuse or queue them.
+PARALLEL_WIDTH = 4
+
+
+def in_parallel(calls: Sequence[Callable[[], T]], *, width: int = PARALLEL_WIDTH) -> list[T]:
+    """Run independent calls `width` at a time; their results in order. Once
+    a batch ends with a failure, the first verdict it raised (else the first
+    error) is raised, with the evidence that call recorded, and no later
+    batch starts. An interrupted batch's calls are cancelled and waited for
+    up to `run_concurrently`'s bound before cleanup starts; one still running
+    then is named on stderr. A resident a create makes is owned by the run's
+    cleanup from before the create call starts until it returns, or until
+    cleanup's deadline (`space_smoke.services`)."""
+
+    results: list[T] = []
+    for start in range(0, len(calls), width):
+        outcomes = run_concurrently(calls[start : start + width])
+        failure = primary_failure(outcomes)
+        if failure is not None:
+            raise failure
+        results.extend(cast(list[T], outcomes))
+    return results
 
 
 def validate_fake_instance_id(instance_id: str) -> None:
@@ -206,7 +330,7 @@ def await_recorded_instance(
 
 def register_fake_instance(
     fixture: ScenarioFixture, control: KindWorkerControl, node_name: str, node_id: str,
-    *, timeout: float = 300,
+    *, timeout: float = REGISTER_SECONDS,
 ) -> str:
     """Re-register the worker under a new fake AWS providerID and wait until
     its row records the instance; returns it. Re-registering deletes the
@@ -227,6 +351,10 @@ class DrainV2Gate:
 
     stall_bound_seconds: int
     dispatch_backoff_base_seconds: int
+    # Whether the controller renders the v2 bounds' test hooks at all, which
+    # only a test-hooks build's chart does, whatever values they hold: a
+    # release build renders none and reads none.
+    test_hooks: bool = False
 
 
 # The gate a batch passed, once: every run in one process shares it.
@@ -270,6 +398,7 @@ def require_drain_v2(fixture: ScenarioFixture, control: DrainV2Control) -> Drain
             ),
             DISPATCH_BACKOFF_CAP_SECONDS,
         ),
+        test_hooks=any(hooks.get(key) is not None for key in DRAIN_V2_HOOK_KEYS),
     )
     return _GATE
 
@@ -316,6 +445,8 @@ def validate_drain_v2_overrides(overrides: Mapping[str, str]) -> None:
     for key, value in overrides.items():
         if key == TERMINATOR_KIND_ENV:
             allowed = value in _TERMINATOR_VALUES
+        elif key == STALL_BOUND_HOOK:
+            allowed = _STALL_BOUND_VALUE.fullmatch(value) is not None
         else:
             allowed = value in _FLAG_VALUES
         if not allowed:
@@ -428,6 +559,12 @@ STALL_ERROR_PREFIX = "the drain is stalled"
 # operation's `progress_message`.
 GATE_REFUSAL_STATUS = 503
 GATE_RETRY_TEXT = "retry shortly"
+# What the drain's refusal of a call says in its JSON `error`, beside
+# `GATE_RETRY_TEXT`, whether the gate refused it ("under a node drain") or
+# the sealed node did ("a node drain sealed its node"): the API's
+# `drain_refusal` and its sealed-activation answer. A busy API's 503 says
+# neither.
+GATE_DRAIN_TEXT = "node drain"
 # An operation the dispatcher retried on that refusal until its retry budget
 # ran out fails with this `terminal_error.reason`; its client asks again.
 RETRIES_EXHAUSTED_REASON = "retry_attempts_exhausted"
@@ -539,6 +676,27 @@ def retries_exhausted_on_the_gate(operation: Mapping[str, Any]) -> bool:
     )
 
 
+def _valid_retry_after(value: object) -> bool:
+    """A `Retry-After` the gate sends: whole delta-seconds."""
+
+    return isinstance(value, str) and value.strip().isdigit()
+
+
+def drain_refused_the_call(call: Mapping[str, Any]) -> bool:
+    """A call the v2 drain refused: the gate's 503 with a valid
+    `Retry-After`, whose JSON `error` says it is the drain's
+    (`GATE_DRAIN_TEXT`) and to retry (`GATE_RETRY_TEXT`)."""
+
+    body = call.get("body")
+    error = str(body.get("error") or "") if isinstance(body, Mapping) else ""
+    return (
+        call.get("status") == GATE_REFUSAL_STATUS
+        and _valid_retry_after(call.get("retry_after"))
+        and GATE_DRAIN_TEXT in error
+        and GATE_RETRY_TEXT in error
+    )
+
+
 def stop_refused_by_the_drain(answer: Mapping[str, Any]) -> bool:
     """A stop or kill (`DrainV2Assertions.request_stop`) the v2 drain
     refused: answered with the gate's 503, a `Retry-After` and the drain's
@@ -606,6 +764,10 @@ class DrainV2Assertions:
         self._node_id: str | None = None
         self._other: str | None = None
         self._uncordon_other: Compensation | None = None
+        # The one cleanup uncordon of each worker this run cordons or drains,
+        # by Kubernetes Node name, shared with `companion()`s
+        # (`_own_uncordon`).
+        self._uncordons: dict[str, Compensation] = {}
         self._undrain: Compensation | None = None
         self._generation: int | None = None
         self._hold: int | None = None
@@ -619,6 +781,8 @@ class DrainV2Assertions:
         self._controller_lease = False
         # Each resident a report this run read named evacuated, with its kind.
         self._reported_kinds: dict[str, str] = {}
+        # The stall bound `v2_controller` scoped to this run, if any.
+        self._stall_bound: int | None = None
 
     @staticmethod
     def bare_id(sandbox_id: str) -> str:
@@ -647,6 +811,13 @@ class DrainV2Assertions:
         """The batch's drain v2 gate (`require_drain_v2`)."""
 
         return require_drain_v2(self._fixture, self._control)
+
+    @property
+    def stall_bound_seconds(self) -> int:
+        """The controller's stall bound for this run: the one `v2_controller`
+        scoped to it, else the batch's."""
+
+        return self._stall_bound if self._stall_bound is not None else self.gate.stall_bound_seconds
 
     @property
     def deadline(self) -> int:
@@ -686,6 +857,7 @@ class DrainV2Assertions:
             workers=workers,
             resident_node=placement.node_name,
         )
+        self._expect_no_leftovers(workers, self.bare_id(self._fixture.sandbox.sandbox_id))
         release = self._control.acquire_worker_cordon_mutation()
         self._scope.defer("release the worker cordon lease", release)
         other = others[0]
@@ -694,9 +866,7 @@ class DrainV2Assertions:
         else:
             pinned = placement.node_name
         self._other = other
-        self._uncordon_other = self._scope.defer(
-            f"uncordon {other}", lambda: self._control.uncordon_kube_node(other), critical=True
-        )
+        self._uncordon_other = self._own_uncordon(other)
         self._control.cordon_kube_node(other)
         node = next(
             (n for n in self._control.admin_nodes() if n.k8s_node_name == pinned), None
@@ -708,7 +878,87 @@ class DrainV2Assertions:
         self._fixture.record("drained_worker", pinned)
         return pinned
 
-    def give_fake_instance(self, *, timeout: float = 300) -> str:
+    def _expect_no_leftovers(self, workers: Sequence[str], fixture_id: str) -> None:
+        """Neither worker holds a sandbox a drain would wait on but the
+        fixture's: each one's preview lists nothing else pending. A sandbox
+        left there would be counted in this run's reports and fail it for
+        something it didn't do; so, once the deletes still landing have had
+        `LEFTOVER_SECONDS`, the run ends inconclusive with what it saw in
+        `leftover_sandboxes`, as it does when a preview can't be read for as
+        long. Every worker's preview must be read: one with no SPACE node row
+        yet counts as unread, and the rows are read again each round. Each
+        leftover is classed by its control-plane row: one still live is the
+        bench's (an earlier run's, such as one whose cleanup failed, which
+        stays that run's failure); one the control plane has deleted or is
+        deleting, which the node still holds, may be the product's own orphan,
+        and the verdict says so."""
+
+        deadline = time.monotonic() + LEFTOVER_SECONDS
+        while True:
+            leftovers: dict[str, list[str]] = {}
+            unread: dict[str, str] = {}
+            nodes = {n.k8s_node_name: n.id for n in self._control.admin_nodes() if n.k8s_node_name in workers}
+            for name in workers:
+                node_id = nodes.get(name)
+                if node_id is None:
+                    unread[name] = "no SPACE node row"
+                    continue
+                try:
+                    pending = self._control.drain_v2_preview(node_id).get("pending") or []
+                except ScenarioTimedOut:
+                    raise
+                except Exception as error:  # noqa: BLE001 - a worker still coming up is read again
+                    unread[name] = repr(error)[:300]
+                    continue
+                left = [
+                    str(entry.get("sandbox_id"))
+                    for entry in pending
+                    if isinstance(entry, Mapping) and str(entry.get("sandbox_id")) != fixture_id
+                ]
+                if left:
+                    leftovers[name] = left
+            if not leftovers and not unread:
+                return
+            if time.monotonic() >= deadline:
+                break
+            self._fixture.wait(5)
+        left_ids = [sandbox_id for ids in leftovers.values() for sandbox_id in ids]
+        rows = self._control.sandbox_placements(left_ids) if left_ids else {}
+        live = sorted(i for i in left_ids if i in rows and rows[i][0] not in ("deleting", "deleted"))
+        deleted = sorted(i for i in left_ids if i not in live)
+        self._fixture.record(
+            "leftover_sandboxes",
+            {
+                "by_worker": leftovers,
+                "unread_previews": unread,
+                "rows": {sandbox_id: list(placement) for sandbox_id, placement in rows.items()},
+                "live": live,
+                "deleted_but_held": deleted,
+                "waited_seconds": LEFTOVER_SECONDS,
+            },
+        )
+        found = []
+        if live:
+            found.append(
+                f"{len(live)} live sandbox(es) an earlier run left, such as one whose cleanup "
+                "failed: bench hygiene, delete them or bring the bench up again"
+            )
+        if deleted:
+            found.append(
+                f"{len(deleted)} sandbox(es) the control plane deleted or is deleting that a "
+                "worker still holds: possibly a product orphan, report it before cleaning the bench"
+            )
+        if unread:
+            found.append(
+                f"no drain preview could be read from {sorted(unread)}, so the bench's state is unknown"
+            )
+        raise InconclusiveSmoke(
+            f"the bench is not known to be clean after {LEFTOVER_SECONDS} s: "
+            + "; ".join(found)
+            + " (leftover_sandboxes); this run's drain would count them, so it did not start"
+        )
+
+    def give_fake_instance(self, *, timeout: float = REGISTER_SECONDS) -> str:
         """The pinned worker's fake AWS instance: re-register it under a fake
         AWS providerID unless it has one, and wait until its node row records
         the instance. Run before any resident lands on it: re-registering
@@ -730,32 +980,50 @@ class DrainV2Assertions:
         return instance
 
     @contextmanager
-    def v2_controller(self, *, aws: bool = False, legacy_loops: bool = False) -> Iterator[None]:
+    def v2_controller(
+        self, *, aws: bool = False, legacy_loops: bool = False, stall_bound: int | None = None
+    ) -> Iterator[None]:
         """Run the body on a bench whose values switched drain v2 on, checked
         once per batch. With `aws`, the controller's `aws` terminator, against
         Kind's fake EC2, for a drain that terminates its node or lets it go;
         with `legacy_loops` too, the gone-node loops a let-go node is handed
-        to run and write. Only those change the controller, under its
+        to run and write. With `stall_bound`, the stall bound for this run, in
+        whole seconds, where Kind's values render the bound's test hook (a
+        release build reads none, and keeps its own); `stall_bound_seconds`
+        says which holds. Only those change the controller, under its
         mutation Lease; the standing config goes back when the body ends, and
         is checked to be back."""
 
         self._fixture.record("drain_v2_gate", self.gate.__dict__)
-        if not aws:
-            if legacy_loops:
-                raise ValueError("the gone-node loops take a let-go node: they need aws=True")
-            yield
-            return
-        env = dict(AWS_TERMINATOR_ENV)
+        if legacy_loops and not aws:
+            raise ValueError("the gone-node loops take a let-go node: they need aws=True")
+        env: dict[str, str] = {}
+        if aws:
+            env.update(AWS_TERMINATOR_ENV)
         if legacy_loops:
             env.update(LEGACY_LOOPS_ENV)
+        scoped = stall_bound is not None and self.gate.test_hooks
+        if scoped:
+            env[STALL_BOUND_HOOK] = str(stall_bound)
+        if not env:
+            self._fixture.record("stall_bound_seconds", self.stall_bound_seconds)
+            yield
+            return
         if self._controller_lease:
             raise RuntimeError("the run already holds the controller-mutation lease")
+        previous = self._stall_bound
         with scoped_drain_v2_env(self._fixture, self._control, self._scope) as set_env:
             self._controller_lease = True
             try:
                 set_env(env)
+                # Only once the controller took it: a refused write leaves
+                # the assertions on the bound the controller still runs.
+                if scoped:
+                    self._stall_bound = stall_bound
+                self._fixture.record("stall_bound_seconds", self.stall_bound_seconds)
                 yield
             finally:
+                self._stall_bound = previous
                 self._controller_lease = False
 
     def _hold_controller_lease(self) -> None:
@@ -814,6 +1082,44 @@ class DrainV2Assertions:
         )
         return sandbox
 
+    def create_residents(
+        self,
+        count: int,
+        *,
+        idle_timeout: str | None = None,
+        auto_lifecycle: Mapping[str, object] | None = None,
+    ) -> list[DurableLifecycleSandbox]:
+        """`count` residents (`create_resident`), created a few at a time."""
+
+        return in_parallel(
+            [
+                lambda: self.create_resident(idle_timeout=idle_timeout, auto_lifecycle=auto_lifecycle)
+                for _ in range(count)
+            ]
+        )
+
+    def fill_memories(
+        self, sandboxes: Sequence[DurableLifecycleSandbox], *, mib: int
+    ) -> dict[str, str]:
+        """`fill_memory` of each sandbox, a few at a time; each digest by sandbox id."""
+
+        digests = in_parallel(
+            [lambda sandbox=sandbox: self.fill_memory(sandbox, mib=mib) for sandbox in sandboxes]
+        )
+        return {sandbox.sandbox_id: digest for sandbox, digest in zip(sandboxes, digests)}
+
+    def pause_all(self, sandboxes: Iterable[DurableLifecycleSandbox]) -> None:
+        """Pause each sandbox, a few at a time."""
+
+        in_parallel(
+            [lambda sandbox=sandbox: cast(ResidentLifecycleSandbox, sandbox).pause() for sandbox in sandboxes]
+        )
+
+    def delete_all(self, sandboxes: Iterable[CommandSandbox]) -> None:
+        """Delete each run-owned sandbox, a few at a time."""
+
+        in_parallel([lambda sandbox=sandbox: self._fixture.delete_sandbox(sandbox) for sandbox in sandboxes])
+
     def pin_residents(
         self, counts: dict[str, int], *, mib: int = 64
     ) -> tuple[dict[str, DurableLifecycleSandbox], dict[str, str], dict[str, str]]:
@@ -830,19 +1136,14 @@ class DrainV2Assertions:
             raise ValueError(f"refusing resident lifecycles {unknown}: a v2 drain pins started and paused ones")
         self.pin_to_resident_worker(away_from_fixture=True)
         self.give_fake_instance()
-        sandboxes: dict[str, DurableLifecycleSandbox] = {}
-        lifecycles: dict[str, str] = {}
-        for lifecycle, count in counts.items():
-            for _ in range(count):
-                sandbox = self.create_resident()
-                sandboxes[sandbox.sandbox_id] = sandbox
-                lifecycles[sandbox.sandbox_id] = lifecycle
-        digests = {
-            sandbox_id: self.fill_memory(sandbox, mib=mib) for sandbox_id, sandbox in sandboxes.items()
-        }
-        for sandbox_id, sandbox in sandboxes.items():
-            if lifecycles[sandbox_id] == "paused":
-                cast(ResidentLifecycleSandbox, sandbox).pause()
+        created = self.create_residents(sum(counts.values()))
+        sandboxes = {sandbox.sandbox_id: sandbox for sandbox in created}
+        wanted = [lifecycle for lifecycle, count in counts.items() for _ in range(count)]
+        lifecycles = {sandbox.sandbox_id: lifecycle for sandbox, lifecycle in zip(created, wanted)}
+        digests = self.fill_memories(created, mib=mib)
+        self.pause_all(
+            sandbox for sandbox_id, sandbox in sandboxes.items() if lifecycles[sandbox_id] == "paused"
+        )
         self._fixture.record(
             "residents",
             {self.bare_id(sandbox_id): lifecycle for sandbox_id, lifecycle in lifecycles.items()},
@@ -852,7 +1153,7 @@ class DrainV2Assertions:
         self.expect_lifecycles(lifecycles)
         return sandboxes, lifecycles, digests
 
-    def run_on(self, sandbox: DurableLifecycleSandbox, command: str, *, timeout: float = 180) -> Any:
+    def run_on(self, sandbox: DurableLifecycleSandbox, command: str, *, timeout: float = COMMAND_SECONDS) -> Any:
         """Run `command` in a run-owned sandbox, retrying while its data plane comes up."""
 
         deadline = time.monotonic() + timeout
@@ -908,7 +1209,7 @@ class DrainV2Assertions:
         filled = self.run_on(
             sandbox,
             f"dd if=/dev/urandom of={BALLAST} bs=1M count={int(mib)} 2>/dev/null && {BALLAST_DIGEST}",
-            timeout=300,
+            timeout=COMMAND_SECONDS,
         )
         digest = filled.stdout.strip()
         self._fixture.verify(
@@ -983,43 +1284,54 @@ class DrainV2Assertions:
 
     # --- where the drain leaves each resident -----------------------------------
 
-    def expect_all_evacuated(self, residents: Iterable[str], *, timeout: float = 420) -> None:
+    def expect_all_evacuated(self, residents: Iterable[str], *, timeout: float = SETTLED_SECONDS) -> None:
         """Each resident (sandbox ids), `started` or `paused` before the
-        drain, ends where the drain leaves it: `suspended` and unplaced, with
-        a durable snapshot and no VM on either worker."""
+        drain, ends where the drain leaves it (`expect_suspended_unplaced`)."""
 
-        for sandbox_id in residents:
-            self.expect_suspended_unplaced(sandbox_id, timeout=timeout)
+        ids = list(residents)
+        deadline = time.monotonic() + timeout
+        while True:
+            left = {
+                self.bare_id(sandbox_id): residency
+                for sandbox_id in ids
+                if (residency := self._unless_suspended_unplaced(sandbox_id)) is not None
+            }
+            if not left:
+                break
+            self._fixture.verify(
+                time.monotonic() < deadline,
+                "a resident was never left suspended and unplaced with a durable snapshot",
+                **({"sandbox_id": next(iter(left))} if len(ids) == 1 else {}),
+                residents_left=left,
+            )
+            self._fixture.wait(3)
+        for sandbox_id in ids:
+            self.expect_single_vm(sandbox_id, "suspended")
 
-    def expect_suspended_unplaced(self, sandbox_id: str, *, timeout: float = 300) -> None:
+    def _unless_suspended_unplaced(self, sandbox_id: str) -> dict[str, Any] | None:
+        """None once the sandbox is `suspended` and unplaced with a durable
+        snapshot; else what it is."""
+
+        residency = self._control.sandbox_residency(self.bare_id(sandbox_id))
+        snapshots = self.ready_snapshots(sandbox_id)
+        durable = bool(snapshots) and snapshots[-1].storage_location_count > 0
+        if residency.lifecycle == "suspended" and residency.active_node_id is None and durable:
+            return None
+        return {
+            "lifecycle": residency.lifecycle,
+            "active_node_id": residency.active_node_id,
+            "ready_snapshots": len(snapshots),
+            "durable": durable,
+        }
+
+    def expect_suspended_unplaced(self, sandbox_id: str, *, timeout: float = SETTLED_SECONDS) -> None:
         """The drain left the sandbox `suspended` and unplaced, its snapshot
         durable, with no VM on either worker: nothing restores it, and its
         next user call wakes it wherever the scheduler places it."""
 
-        bare = self.bare_id(sandbox_id)
-        deadline = time.monotonic() + timeout
-        while True:
-            residency = self._control.sandbox_residency(bare)
-            snapshots = self.ready_snapshots(sandbox_id)
-            durable = bool(snapshots) and snapshots[-1].storage_location_count > 0
-            if (
-                residency.lifecycle == "suspended"
-                and residency.active_node_id is None
-                and durable
-            ):
-                break
-            self._fixture.verify(
-                time.monotonic() < deadline,
-                "the resident was never left suspended and unplaced with a durable snapshot",
-                sandbox_id=bare,
-                lifecycle=residency.lifecycle,
-                active_node_id=residency.active_node_id,
-                ready_snapshots=len(snapshots),
-            )
-            self._fixture.wait(3)
-        self.expect_single_vm(sandbox_id, "suspended")
+        self.expect_all_evacuated([sandbox_id], timeout=timeout)
 
-    def expect_back_at_home(self, sandbox_id: str, lifecycle: str, *, timeout: float = 300) -> None:
+    def expect_back_at_home(self, sandbox_id: str, lifecycle: str, *, timeout: float = WAKE_SECONDS) -> None:
         """The sandbox is `lifecycle` again on the worker the drain was on."""
 
         bare = self.bare_id(sandbox_id)
@@ -1038,7 +1350,7 @@ class DrainV2Assertions:
             )
             self._fixture.wait(3)
 
-    def wake_elsewhere(self, sandbox: DurableLifecycleSandbox, *, timeout: float = 300) -> None:
+    def wake_elsewhere(self, sandbox: DurableLifecycleSandbox, *, timeout: float = WAKE_SECONDS) -> None:
         """Wake a sandbox the drain left `suspended`: it is restored `started`
         off the drained worker."""
 
@@ -1054,10 +1366,17 @@ class DrainV2Assertions:
         off the drained worker, with its memory intact when `digests` holds
         it."""
 
-        for sandbox_id, sandbox in sandboxes.items():
+        def wake(sandbox_id: str, sandbox: DurableLifecycleSandbox) -> None:
             self.wake_elsewhere(sandbox)
             if digests is not None:
                 self.expect_memory(sandbox, digests[sandbox_id])
+
+        in_parallel(
+            [
+                lambda sandbox_id=sandbox_id, sandbox=sandbox: wake(sandbox_id, sandbox)
+                for sandbox_id, sandbox in sandboxes.items()
+            ]
+        )
 
     def expect_call_refused_while_suspended(self, sandbox: DurableLifecycleSandbox) -> CallAnswer:
         """A command to a suspended sandbox whose policy has no implicit wake
@@ -1101,15 +1420,14 @@ class DrainV2Assertions:
         other._node_name = self._other
         other._node_id = node.id
         other._other = self.node_name
+        other._uncordons = self._uncordons
         return other
 
     def cordon(self) -> None:
         """Cordon this worker, uncordoned again when the run ends."""
 
         node_name = self.node_name
-        self._scope.defer(
-            f"uncordon {node_name}", lambda: self._control.uncordon_kube_node(node_name), critical=True
-        )
+        self._own_uncordon(node_name, self.node_id)
         self._control.cordon_kube_node(node_name)
         self._cordoned_by_run = True
 
@@ -1143,10 +1461,8 @@ class DrainV2Assertions:
         other = self._other
         if other is None:
             raise RuntimeError("pin_to_resident_worker() must run first")
-        if self._uncordon_other is None:
-            self._uncordon_other = self._scope.defer(
-                f"uncordon {other}", lambda: self._control.uncordon_kube_node(other), critical=True
-            )
+        if self._uncordon_other is None or not self._uncordon_other.armed:
+            self._uncordon_other = self._own_uncordon(other)
         self._control.cordon_kube_node(other)
 
     # --- the preview ----------------------------------------------------------
@@ -1241,12 +1557,61 @@ class DrainV2Assertions:
         if self._undrain is not None:
             return
         node_name, node_id = self.node_name, self.node_id
-        self._scope.defer(
-            f"uncordon {node_name}", lambda: self._control.uncordon_kube_node(node_name), critical=True
-        )
+        # Before the undrain, so cleanup runs the undrain first.
+        self._own_uncordon(node_name, node_id)
         self._undrain = self._scope.defer(
             f"undrain {node_name}", lambda: self._undrain_if_draining(node_id), critical=True
         )
+
+    def _own_uncordon(self, node_name: str, node_id: str | None = None) -> Compensation:
+        """The one cleanup uncordon of `node_name`, whoever cordoned it (the
+        pin, `cordon`, a drain): through the cancel gate
+        (`_uncordon_once_cancelled`), so no path uncordons a worker that may
+        still be sealed. Registered once while armed; `node_id` is the
+        worker's SPACE node, else read by name when cleanup runs."""
+
+        held = self._uncordons.get(node_name)
+        if held is not None and held.armed:
+            return held
+        compensation = self._scope.defer(
+            f"uncordon {node_name}",
+            lambda: self._uncordon_once_cancelled(node_name, node_id),
+            critical=True,
+        )
+        self._uncordons[node_name] = compensation
+        return compensation
+
+    def _drain_cleared(self, node_id: str) -> bool:
+        """The controller cleared the node's v2 engine and status, which it
+        does only once the node answered the cancel and is unsealed; or the
+        node's row is gone, so no seal is left under it."""
+
+        status = self._control.drain_v2_status(node_id)
+        return status is None or (status.engine is None and status.status is None)
+
+    def _uncordon_once_cancelled(self, node_name: str, node_id: str | None) -> None:
+        """Cleanup's uncordon of the drained worker, after the undrain: only
+        once the drain is cancelled on the node (`_drain_cleared`), waited
+        for as long as a cancel may take (`CANCEL_SECONDS`). A worker whose
+        node never answered may still be sealed, so it is left cordoned, and
+        the raise makes cleanup report it, so nothing the next scenario
+        creates lands on a sealed worker."""
+
+        node_ids = (
+            [node_id]
+            if node_id is not None
+            else [node.id for node in self._control.admin_nodes() if node.k8s_node_name == node_name]
+        )
+        deadline = time.monotonic() + CANCEL_SECONDS
+        while not all(self._drain_cleared(each) for each in node_ids):
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"left {node_name} cordoned: its drain's cancel was not confirmed within "
+                    f"{CANCEL_SECONDS} s (the v2 engine or status is still set), so the worker may "
+                    "still be sealed; it is uncordoned once the node answers the controller's cancel"
+                )
+            self._fixture.wait(2)
+        self._control.uncordon_kube_node(node_name)
 
     def expect_drain_refused_for_stopped(self, stopped: Sequence[str], *, hold: int) -> CallAnswer:
         """A v2 `:drain` with a hold of `hold` seconds of the worker, with no
@@ -1285,6 +1650,41 @@ class DrainV2Assertions:
             unschedulable=unschedulable,
         )
         return answer
+
+    def bring_deadline_to(self, lead: int, *, after_a_tick: bool = False) -> int:
+        """A repeat `:drain` with a shorter hold, counted from
+        `drain_started_at`, moves the stored deadline to `lead` seconds from
+        now; returns it. Nothing tells the node: `DrainNode` carries no
+        deadline, only whether to evacuate, which the controller decides each
+        tick from the stored one. So the next tick past the new deadline
+        evacuates, whichever controller process runs it.
+
+        With `after_a_tick`, the deadline instead lands up to a tick later,
+        `AFTER_A_TICK_SECONDS` past one of the controller's ticks: their
+        period is fixed, and the last report's `reported_at` is one tick's
+        own database clock. The next tick then comes 2-5 s past the deadline,
+        a window in which the node still holds a running sandbox. A tick that
+        ran long since shifts the phase, which only narrows that window; and
+        with no report to read, the deadline is `lead` from now."""
+
+        before = self.deadline
+        target = time.time() + lead
+        reported = timestamp_seconds(self.report().get(VIEW_REPORTED_FIELD)) if after_a_tick else None
+        if reported is not None:
+            ticks = -(-(target - AFTER_A_TICK_SECONDS - reported) // TICK_SECONDS)
+            target = reported + ticks * TICK_SECONDS + AFTER_A_TICK_SECONDS
+            self._fixture.record("deadline_after_tick", {"tick_reported_at": reported, "target": target})
+        answer = self.repeat_drain(round(target - self.started_at()))
+        self._fixture.verify(
+            answer.status in (200, 202) and self.deadline < before,
+            "a repeat :drain with a shorter hold did not move the deadline earlier",
+            status=answer.status,
+            body=answer.body,
+            deadline=self.deadline,
+            before=before,
+        )
+        self._fixture.record("brought_in_deadline", {"from": before, "to": self.deadline})
+        return self.deadline
 
     def expect_stored_deadline(self, hold: int) -> int:
         """The row's deadline is `drain_started_at` plus `hold`; returns it."""
@@ -1378,7 +1778,7 @@ class DrainV2Assertions:
         measured from, the view's `evacuated_grew_at`. Returns the error, the
         stamp and the bound."""
 
-        bound = self.gate.stall_bound_seconds
+        bound = self.stall_bound_seconds
         deadline = time.monotonic() + timeout
         while True:
             error = self.last_error() or ""
@@ -1429,7 +1829,7 @@ class DrainV2Assertions:
 
         return self._control.ready_full_snapshots(self.bare_id(sandbox_id))
 
-    def expect_lifecycle(self, sandbox_id: str, lifecycle: str, *, timeout: float = 300) -> None:
+    def expect_lifecycle(self, sandbox_id: str, lifecycle: str, *, timeout: float = WAKE_SECONDS) -> None:
         """The sandbox reaches `lifecycle` on some node."""
 
         deadline = time.monotonic() + timeout
@@ -1533,7 +1933,7 @@ class DrainV2Assertions:
             if report and accept(report):
                 return report
             self._fixture.verify(time.monotonic() < deadline, failure, report=report)
-            self._fixture.wait(2)
+            self._fixture.wait(REPORT_POLL_SECONDS)
 
     def reported(self, report: dict[str, Any]) -> bool:
         """The view holds a report the controller stored under this run's
@@ -1615,7 +2015,8 @@ class DrainV2Assertions:
 
     def expect_view_deadline(self, report: dict[str, Any]) -> float:
         """The admin view shows the stored deadline; returns it. The node
-        keeps none of its own: the controller sends it what remains."""
+        keeps none of its own: the controller decides from the stored one
+        when its calls ask the node to evacuate."""
 
         shown = self.view_deadline(report)
         self._fixture.verify(
@@ -1627,7 +2028,7 @@ class DrainV2Assertions:
         assert shown is not None
         return shown
 
-    def wait_for_reported(self, *, timeout: float = 120) -> dict[str, Any]:
+    def wait_for_reported(self, *, timeout: float = 2 * REPORT_SECONDS) -> dict[str, Any]:
         """The view once the controller stored the node's report under the
         drain's generation, showing the stored deadline."""
 
@@ -1640,7 +2041,7 @@ class DrainV2Assertions:
         return report
 
     def expect_drained(
-        self, *, timeout: float = 420, first_reported: dict[str, float] | None = None
+        self, *, timeout: float = DRAINED_SECONDS, first_reported: dict[str, float] | None = None
     ) -> dict[str, Any]:
         """The node's report under the drain's generation lists nothing
         pending or blocked, and the row reaches `drained`.
@@ -1718,7 +2119,7 @@ class DrainV2Assertions:
 
     # --- the deadline -----------------------------------------------------------
 
-    def expect_held(self, sandbox_id: str, *, timeout: float = 120) -> dict[str, Any]:
+    def expect_held(self, sandbox_id: str, *, timeout: float = 2 * REPORT_SECONDS) -> dict[str, Any]:
         """Before the deadline, the report holds the running sandbox, and it is
         still started on the drained worker."""
 
@@ -1751,20 +2152,44 @@ class DrainV2Assertions:
     ) -> None:
         """Each sandbox stays started on the drained worker until `margin`
         seconds before the deadline; with a negative `margin`, until that
-        long past it."""
+        long past it. Read from both rows: the control-plane row, and the
+        node's own, which a suspend changes at once even while its upload is
+        cut and the control-plane row still reads `started`. The node's row
+        may read `checkpointing`, which a running VM passes through and
+        returns from to `started`, never to a suspend. Only a read that
+        finished while the deadline was still more than `margin` away is
+        judged, and each sandbox needs at least one: a window too short to
+        read in ends the run inconclusive rather than passing."""
 
+        bare = {sandbox_id: self.bare_id(sandbox_id) for sandbox_id in sandbox_ids}
+        judged: dict[str, int] = dict.fromkeys(bare.values(), 0)
+        late: dict[str, int] = dict.fromkeys(bare.values(), 0)
         while self.seconds_to_deadline() > margin:
-            residencies = {self.bare_id(sandbox_id): self.residency(sandbox_id) for sandbox_id in sandbox_ids}
+            residencies: dict[str, tuple[str, str | None, str | None]] = {}
+            for sandbox_id, short in bare.items():
+                read = (*self.residency(sandbox_id), self.node_state(sandbox_id))
+                if self.seconds_to_deadline() > margin:
+                    residencies[short] = read
+                    judged[short] += 1
+                else:
+                    late[short] += 1
             self._fixture.verify(
                 all(
-                    lifecycle == "started" and node == self.node_id
-                    for lifecycle, node in residencies.values()
+                    lifecycle == "started" and node == self.node_id and node_state in HELD_NODE_STATES
+                    for lifecycle, node, node_state in residencies.values()
                 ),
                 "a held sandbox left started before the run stopped watching",
                 residency=residencies,
                 seconds_to_deadline=round(self.seconds_to_deadline()),
             )
-            self._fixture.wait(min(5, max(1, self.seconds_to_deadline() - margin)))
+            if self.seconds_to_deadline() > margin:
+                self._fixture.wait(min(5, max(1, self.seconds_to_deadline() - margin)))
+        self._fixture.record("held_reads", {"judged": judged, "past_the_window": late, "margin": margin})
+        if not all(judged.values()):
+            raise InconclusiveSmoke(
+                "the watch of the held sandboxes judged no read of one of them before the "
+                "deadline came within its margin, so it proved nothing (held_reads); rerun"
+            )
 
     def wait_past_deadline(self) -> None:
         """Return once the deadline has passed."""
@@ -1785,14 +2210,15 @@ class DrainV2Assertions:
 
     def node_holds_vm_running(self, sandbox_id: str) -> bool:
         """Whether the drained worker's sandbox-manager still holds the
-        sandbox `started`. The node's own state, not the row's: a suspend the
-        node made reaches the row only once its snapshot is durable, so with
-        its upload cut the row still reads `started` after the node took the
-        VM down."""
+        sandbox's VM running: its row reads `started`, or a checkpoint a
+        running VM passes through (`HELD_NODE_STATES`), not `suspending`. The
+        node's own state, not the row's: a suspend the node made reaches the
+        row only once its snapshot is durable, so with its upload cut the row
+        still reads `started` after the node took the VM down."""
 
-        return self.node_state(sandbox_id) == "started"
+        return self.node_state(sandbox_id) in HELD_NODE_STATES
 
-    def expect_left_started(self, sandbox_id: str, *, timeout: float = 180) -> str:
+    def expect_left_started(self, sandbox_id: str, *, timeout: float = NODE_SUSPEND_SECONDS) -> str:
         """Past the deadline, the node takes the running sandbox down: its row
         on the drained worker leaves `started` for a suspend, durable or not;
         the state it left for. The control-plane row reads `suspended` only
@@ -1818,7 +2244,7 @@ class DrainV2Assertions:
         )
         return str(state)
 
-    def expect_suspended_by_the_node(self, sandbox_id: str, *, timeout: float = 300) -> None:
+    def expect_suspended_by_the_node(self, sandbox_id: str, *, timeout: float = NODE_SUSPEND_SECONDS) -> None:
         """Past the deadline, the node suspends the running sandbox itself:
         its row leaves started for `suspended`, with a durable snapshot."""
 
@@ -1845,7 +2271,7 @@ class DrainV2Assertions:
     # --- the gate -----------------------------------------------------------------
 
     def request_activation(
-        self, sandbox: DurableLifecycleSandbox, verb: str = "wake", *, timeout: float = 600
+        self, sandbox: DurableLifecycleSandbox, verb: str = "wake", *, timeout: float = ACTIVATION_SECONDS
     ) -> dict[str, Any]:
         """Ask for `verb` and follow it until it ends or `timeout` passes:
         each refusal of the request itself, retried after its `Retry-After`
@@ -1969,49 +2395,135 @@ class DrainV2Assertions:
         )
 
     def expect_calls_pass_until_suspended(
-        self, sandbox: DurableLifecycleSandbox, *, timeout: float = 180
-    ) -> list[int]:
-        """Past the deadline, until the node suspends the sandbox: the status
-        of each command create that met its VM running on the drained worker
-        before and after the call. Each passes, as before the deadline: a
-        drain refuses no call to a running sandbox. Watching starts at the
-        deadline, a call a second: the controller's first evacuating tick
-        lands up to its tick after the deadline and the node's suspend takes
-        longer, so at least one call must meet the VM running."""
+        self, sandbox: DurableLifecycleSandbox, *, lead: float = CALLS_LEAD_SECONDS
+    ) -> dict[str, list[Any]]:
+        """From `lead` seconds before the deadline until the node suspends the
+        sandbox, one probe after another, each call judged by the node's state
+        read just before it. The node must hold the VM until the deadline: the
+        run fails if it first reads the VM not running before then, and the
+        checks below judge only a suspend first seen at or past it. A call made
+        while the node held the VM running must pass, before the deadline and
+        past it, as a drain refuses no call to a running sandbox. If the node
+        read not running just after it, the suspend began during the call: the
+        call may still pass, and the one refusal excused is the drain's
+        documented retryable answer, `drain_refused_the_call`, recorded with
+        its body under `overlapping_suspend`. A 503 with a valid `Retry-After`
+        whose body doesn't say it is the drain's can't be told from a busy
+        API's, so it ends the run inconclusive rather than excused. Any other
+        answer to a call made while the VM ran fails the run; none is
+        discarded. At least one call lands before the deadline, when the node
+        must still hold the VM. Past the deadline the node suspends at the
+        controller's first evacuating call, up to a tick after it, so a run may
+        or may not judge a call there that the VM outlived:
+        `expect_sampled_past_deadline` judges that. The statuses before and
+        past the deadline of the calls the VM outlived, and the overlapping
+        ones."""
 
         subject = cast(RawCallSandbox, sandbox)
-        self.wait_until_deadline()
-        seen: list[int] = []
-        deadline = time.monotonic() + timeout
-        while self.node_holds_vm_running(sandbox.sandbox_id):
-            answer = subject.command_answer("true")
+        bare = self.bare_id(sandbox.sandbox_id)
+        while (remaining := self.seconds_to_deadline()) > lead:
+            self._fixture.wait(max(1, remaining - lead))
+        before: list[int] = []
+        past: list[int] = []
+        overlapping: list[dict[str, Any]] = []
+        # The lead, then the controller's first evacuating tick and its call,
+        # which starts the node's suspend, with a 30 s margin.
+        deadline = time.monotonic() + lead + TICK_SECONDS + CALL_BUDGET_SECONDS + 30
+        # No pause between probes: each takes seconds, and past the deadline
+        # the window before the suspend is about a tick long.
+        while True:
             if not self.node_holds_vm_running(sandbox.sandbox_id):
+                # When the node was first read not running: the suspend began
+                # at or before this.
+                suspend_seen = self.seconds_to_deadline()
                 break
-            seen.append(answer.status)
+            asked = self.seconds_to_deadline()
+            answer = subject.command_answer("true")
+            if self.node_holds_vm_running(sandbox.sandbox_id):
+                (before if asked > 0 else past).append(answer.status)
+            else:
+                suspend_seen = self.seconds_to_deadline()
+                overlapping.append(
+                    {
+                        "status": answer.status,
+                        "retry_after": answer.retry_after,
+                        "body": answer.body,
+                        "seconds_to_deadline": round(asked, 1),
+                    }
+                )
+                break
             self._fixture.verify(
                 time.monotonic() < deadline,
                 "the node never suspended the running sandbox past the deadline",
-                sandbox_id=self.bare_id(sandbox.sandbox_id),
-                statuses=seen[-10:],
+                sandbox_id=bare,
+                before_deadline=before[-10:],
+                past_deadline=past[-10:],
             )
-            self._fixture.wait(1)
-        self._fixture.record(f"calls_past_deadline_{self.bare_id(sandbox.sandbox_id)}", seen)
+        seen: dict[str, list[Any]] = {
+            "before_deadline": before,
+            "past_deadline": past,
+            "overlapping_suspend": overlapping,
+        }
+        self._fixture.record(f"calls_around_deadline_{bare}", seen)
         self._fixture.verify(
-            bool(seen),
-            "no call met the VM running past the deadline",
-            sandbox_id=self.bare_id(sandbox.sandbox_id),
+            suspend_seen <= 0,
+            "the node took the running sandbox down before its deadline",
+            sandbox_id=bare,
+            not_running_seen_seconds_to_deadline=round(suspend_seen, 1),
+            **seen,
         )
         self._fixture.verify(
-            all(status == CALL_PASSED_STATUS for status in seen),
-            "a call to a running sandbox past the deadline did not pass",
-            statuses=seen,
+            bool(before),
+            "no call met the VM running in the seconds before the deadline",
+            sandbox_id=bare,
         )
+        self._fixture.verify(
+            all(status == CALL_PASSED_STATUS for status in before + past),
+            "a call to a running sandbox around the deadline did not pass",
+            **seen,
+        )
+        judged = [
+            call
+            for call in overlapping
+            if call["status"] != CALL_PASSED_STATUS and not drain_refused_the_call(call)
+        ]
+        unattributed = [
+            call
+            for call in judged
+            if call["status"] == GATE_REFUSAL_STATUS and _valid_retry_after(call["retry_after"])
+        ]
+        self._fixture.verify(
+            len(judged) == len(unattributed),
+            "a call made while the VM ran was refused, as its suspend began, with something "
+            "but the drain's retryable 503 with Retry-After",
+            **seen,
+        )
+        if unattributed:
+            raise InconclusiveSmoke(
+                "a call made while the VM ran was answered, as its suspend began, with a 503 and "
+                "Retry-After that doesn't say it is the drain's, which a busy API's could be "
+                f"(calls_around_deadline_{bare})"
+            )
         return seen
+
+    def expect_sampled_past_deadline(self, seen: Mapping[str, list[Any]]) -> None:
+        """At least one call met the VM running past the deadline
+        (`expect_calls_pass_until_suspended`), so the run judged a call
+        there. A run whose calls all landed before it, or after the node's
+        suspend began, judged none: it ends inconclusive, not passed. A
+        scenario calls this last, so its other checks still decide a
+        failure."""
+
+        if not seen.get("past_deadline"):
+            raise InconclusiveSmoke(
+                "no call met the running sandbox past the deadline before the node "
+                "suspended it, so no call there was judged (calls_around_deadline_*); rerun"
+            )
 
     # --- stops and stopped sandboxes ---------------------------------------------
 
     def request_stop(
-        self, sandbox: DurableLifecycleSandbox, verb: str, *, timeout: float = 600
+        self, sandbox: DurableLifecycleSandbox, verb: str, *, timeout: float = REFUSED_STOP_SECONDS
     ) -> dict[str, Any]:
         """Ask once for `verb` (`STOP_VERBS`: the user's `stop` or `kill`
         through the public API, an operator's `force-stop` or `force-kill`
@@ -2054,7 +2566,7 @@ class DrainV2Assertions:
             self._fixture.wait(5)
 
     def expect_stop_refused(
-        self, sandbox: DurableLifecycleSandbox, verb: str, *, timeout: float = 600
+        self, sandbox: DurableLifecycleSandbox, verb: str, *, timeout: float = REFUSED_STOP_SECONDS
     ) -> dict[str, Any]:
         """A `verb` of a running sandbox on the v2-drained worker is refused
         with the drain's retryable 503 (`stop_refused_by_the_drain`), and the
@@ -2165,7 +2677,7 @@ class DrainV2Assertions:
 
     # --- settling -------------------------------------------------------------------
 
-    def expect_back_elsewhere(self, sandbox_id: str, lifecycle: str, *, timeout: float = 300) -> None:
+    def expect_back_elsewhere(self, sandbox_id: str, lifecycle: str, *, timeout: float = WAKE_SECONDS) -> None:
         """The sandbox is `lifecycle` again, no longer on the drained worker."""
 
         bare = self.bare_id(sandbox_id)
@@ -2530,16 +3042,21 @@ class DrainV2Assertions:
         new instance, and verify through the admin preview that it answers
         unsealed."""
 
+        started = time.monotonic()
         restart.release()
+        steps = {"worker_registered": round(time.monotonic() - started, 1)}
         self._instance = replacement
         await_recorded_instance(
             self._fixture, self._control, self.node_name, self.node_id, replacement, timeout=timeout
         )
+        steps["instance_recorded"] = round(time.monotonic() - started, 1)
         self.expect_preview_succeeds(
             "the same-name replacement never answered a drain preview: it came back sealed, "
             "or its drain is still recorded",
             timeout=timeout,
         )
+        steps["preview_answered"] = round(time.monotonic() - started, 1)
+        self._fixture.record("come_back_seconds", steps)
 
     def terminate(self, *, timeout: float = 600) -> None:
         """`:terminate` reaches the worker's instance through the `aws`
@@ -2552,9 +3069,14 @@ class DrainV2Assertions:
         Runs inside `v2_controller` after `give_fake_instance`.
         """
 
+        started = time.monotonic()
         labels, provider_id, replacement = self._terminate_and_dispatch()
+        steps = {"dispatched": round(time.monotonic() - started, 1)}
         restart = self._stop_then_arm_replacement(labels, provider_id)
+        steps["worker_stopped"] = round(time.monotonic() - started, 1)
         self._expect_row_deleted_without_tombstone(timeout=timeout)
+        steps["row_deleted"] = round(time.monotonic() - started, 1)
+        self._fixture.record("terminate_seconds", steps)
         self._come_back(restart, replacement, timeout=timeout)
         self._fixture.record(
             "after_terminate",
@@ -2680,7 +3202,7 @@ class DrainV2Assertions:
         self._come_back(restart, replacement, timeout=timeout)
         self._fixture.record("after_lingering_node", {"replacement_instance": replacement})
 
-    def give_stale_instance(self, *, timeout: float = 300) -> str:
+    def give_stale_instance(self, *, timeout: float = REGISTER_SECONDS) -> str:
         """The pinned worker under Kind's own providerID, which names no EC2
         instance, with a fake instance written into its node row: the stale
         instance an older registration writer leaves across a Node UID
@@ -2795,7 +3317,7 @@ class DrainV2Assertions:
             drain_phase=phase,
         )
 
-    def come_back_after_death(self, restart: Compensation, *, timeout: float = 600) -> None:
+    def come_back_after_death(self, restart: Compensation, *, timeout: float = COME_BACK_SECONDS) -> None:
         """Start the dead worker again as a same-name replacement and open it again."""
 
         if self._replacement is None:
@@ -2811,14 +3333,14 @@ class DrainV2Assertions:
             compensation, self._undrain = self._undrain, None
             compensation.release()
 
-    def undrain_and_expect_cancelled(self, *, timeout: float = 300) -> None:
+    def undrain_and_expect_cancelled(self, *, timeout: float = CANCEL_SECONDS) -> None:
         """`:undrain` returns the node to no phase; the controller cancels the
         drain on the node, and uncordons it once it answers."""
 
         self.undrain()
         self.expect_cancelled(timeout=timeout)
 
-    def expect_cancelled(self, *, timeout: float = 300) -> None:
+    def expect_cancelled(self, *, timeout: float = CANCEL_SECONDS) -> None:
         """The controller clears the undrained node's v2 columns and, unless
         this run cordons the worker itself, uncordons it."""
 

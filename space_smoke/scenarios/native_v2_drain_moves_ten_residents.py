@@ -1,10 +1,10 @@
 """A v2 drain of ten residents leaves each durable and unplaced; a wake brings each back elsewhere, its memory intact."""
 
 from datetime import UTC, datetime
-from typing import cast
 
 import space_smoke as smoke
-from space_smoke.capabilities import DurableLifecycleSandbox, ResidentLifecycleSandbox
+from space_smoke.capabilities import DurableLifecycleSandbox
+from space_smoke.drain_v2 import REPORT_SECONDS
 
 # Seven started and three paused: more suspends than one node's drain runs at
 # once is `native.v2_drain_paces_a_full_worker`; here the point is each
@@ -13,6 +13,10 @@ from space_smoke.capabilities import DurableLifecycleSandbox, ResidentLifecycleS
 RESIDENTS = (("started", 7), ("paused", 3))
 # Guest memory each VM holds.
 BALLAST_MIB = 128
+# The drain to `drained`, due now, by the waits' sizing rule
+# (`space_smoke/drain_v2.py`): the next report, and the ten suspends and
+# uploads (22 s measured) four times over, with a 30 s margin.
+TEN_DRAINED_SECONDS = REPORT_SECONDS + 4 * 22 + 30
 
 
 # `native.v2_drain_evacuates_every_resident` is each lifecycle once. This is
@@ -45,18 +49,12 @@ def v2_drain_moves_ten_residents(test: smoke.CommandSandboxFixture) -> None:
             # worker is left alone.
             drain.pin_to_resident_worker(away_from_fixture=True)
             drain.give_fake_instance()
-            residents: list[tuple[str, DurableLifecycleSandbox]] = [
-                (lifecycle, drain.create_resident())
-                for lifecycle, count in RESIDENTS
-                for _ in range(count)
-            ]
-            digests = {
-                sandbox.sandbox_id: drain.fill_memory(sandbox, mib=BALLAST_MIB)
-                for _, sandbox in residents
-            }
-            for lifecycle, sandbox in residents:
-                if lifecycle == "paused":
-                    cast(ResidentLifecycleSandbox, sandbox).pause()
+            wanted = [lifecycle for lifecycle, count in RESIDENTS for _ in range(count)]
+            residents: list[tuple[str, DurableLifecycleSandbox]] = list(
+                zip(wanted, drain.create_residents(len(wanted)), strict=True)
+            )
+            digests = drain.fill_memories([sandbox for _, sandbox in residents], mib=BALLAST_MIB)
+            drain.pause_all(sandbox for lifecycle, sandbox in residents if lifecycle == "paused")
             lifecycles = {sandbox.sandbox_id: lifecycle for lifecycle, sandbox in residents}
             test.record(
                 "residents",
@@ -71,7 +69,7 @@ def v2_drain_moves_ten_residents(test: smoke.CommandSandboxFixture) -> None:
 
         with test.phase("every resident is reported evacuated with its snapshot; the node drains"):
             first_reported: dict[str, float] = {}
-            report = drain.expect_drained(timeout=1800, first_reported=first_reported)
+            report = drain.expect_drained(timeout=TEN_DRAINED_SECONDS, first_reported=first_reported)
             test.record(
                 "first_reported_evacuated",
                 {
@@ -82,7 +80,7 @@ def v2_drain_moves_ten_residents(test: smoke.CommandSandboxFixture) -> None:
             drain.expect_evacuated(report, lifecycles)
 
         with test.phase("each resident is left suspended and unplaced"):
-            drain.expect_all_evacuated(lifecycles, timeout=1200)
+            drain.expect_all_evacuated(lifecycles)
 
         with test.phase("a wake lands each on the other worker, its memory intact"):
             drain.wake_all_elsewhere({sandbox.sandbox_id: sandbox for _, sandbox in residents}, digests)

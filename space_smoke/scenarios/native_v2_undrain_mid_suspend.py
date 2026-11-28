@@ -4,11 +4,15 @@ from typing import Any, cast
 
 import space_smoke as smoke
 from space_smoke.capabilities import ResidentLifecycleSandbox
+from space_smoke.drain_v2 import NODE_SUSPEND_SECONDS, in_parallel
 
 # More started residents than `SPACE_DRAIN_NODE_WINDOW`'s default of 8, so
 # some wait for a slot in the drain's window.
 STARTED = 12
 FILL_MIB = 256
+# A suspended resident's wake to started: a restore from its local snapshot,
+# measured in seconds, with a two-minute margin.
+WOKEN_SECONDS = 180
 
 
 # `native.v2_undrain_unseals_the_worker` undrains a sealed worker whose
@@ -27,7 +31,7 @@ FILL_MIB = 256
     substrates=("kubernetes",),
     timeout_minutes=40,
     tier="manual",
-    manual_reason="drain v2 is off by default outside Kind, so its scenarios run by name, not in the per-merge set",
+    manual_reason="twelve resident VMs filled with memory, too heavy for the per-merge set",
 )
 def v2_undrain_mid_suspend(test: smoke.CommandSandboxFixture) -> None:
     """A v2 `:drain`, due now, of a worker holding twelve started residents,
@@ -74,7 +78,7 @@ def v2_undrain_mid_suspend(test: smoke.CommandSandboxFixture) -> None:
             # first rather than read a row that hasn't caught up.
             for sandbox_id, state in states.items():
                 if state == "suspended":
-                    drain.expect_lifecycle_back(bare[sandbox_id], "suspended", timeout=300)
+                    drain.expect_lifecycle_back(bare[sandbox_id], "suspended", timeout=NODE_SUSPEND_SECONDS)
             outcome = drain.settled_lifecycles(lifecycles, timeout=300)
             test.record("lifecycles_after_undrain", outcome)
             snapshots = {sandbox_id: drain.ready_snapshots(bare[sandbox_id]) for sandbox_id in untouched}
@@ -100,13 +104,20 @@ def v2_undrain_mid_suspend(test: smoke.CommandSandboxFixture) -> None:
             )
 
         with test.phase("a wake starts each suspended one; every resident's memory is intact"):
-            for sandbox_id in suspended:
+            def wake(sandbox_id: str) -> None:
                 cast(ResidentLifecycleSandbox, sandboxes[bare[sandbox_id]]).wake()
-                drain.expect_lifecycle_back(bare[sandbox_id], "started", timeout=300)
-            for sandbox_id, sandbox in sandboxes.items():
-                drain.expect_memory(sandbox, digests[sandbox_id])
+                drain.expect_lifecycle_back(bare[sandbox_id], "started", timeout=WOKEN_SECONDS)
+
+            in_parallel([lambda sandbox_id=sandbox_id: wake(sandbox_id) for sandbox_id in suspended])
+            in_parallel(
+                [
+                    lambda sandbox_id=sandbox_id, sandbox=sandbox: drain.expect_memory(
+                        sandbox, digests[sandbox_id]
+                    )
+                    for sandbox_id, sandbox in sandboxes.items()
+                ]
+            )
             test.sandbox.wake()
 
         with test.phase("delete the residents"):
-            for sandbox in sandboxes.values():
-                test.delete_sandbox(sandbox)
+            drain.delete_all(sandboxes.values())

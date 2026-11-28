@@ -1,6 +1,7 @@
 """A v2 drain whose node stops answering keeps evacuating on the node, and finishes when it answers."""
 
 import space_smoke as smoke
+from space_smoke.drain_v2 import DRAINED_SECONDS
 
 # How long the run watches the drain wait on a node that doesn't answer:
 # several loop ticks past the call's own timeout.
@@ -50,7 +51,7 @@ def v2_drain_waits_for_an_unreachable_node(test: smoke.CommandSandboxFixture) ->
             error = drain.wait_for_last_error("DrainNode failed", timeout=UNANSWERED_SECONDS)
             test.record("drain_last_error", error)
             for sandbox_id in lifecycles:
-                drain.expect_durable(sandbox_id, timeout=600)
+                drain.expect_durable(sandbox_id, timeout=DRAINED_SECONDS)
                 drain.expect_no_vm_off_the_drained_worker(sandbox_id)
             test.wait(UNANSWERED_SECONDS, reason="while the node does not answer")
             residency = {

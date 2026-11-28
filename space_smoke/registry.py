@@ -132,6 +132,7 @@ def scenario(
     test_hooks: str | None = None,
     drain_v1: bool = False,
     substrates: Iterable[str] | None = None,
+    backends: Iterable[str] | None = None,
     browser: str | None = None,
 ) -> Callable[[Callable[[Fixture], None]], Scenario[Fixture]]:
     """Declare a smoke; its typed parameter selects the prepared fixture.
@@ -173,6 +174,11 @@ def scenario(
     required Kubernetes lane included. A suite run skips, visibly, the
     scenarios its bench's substrate does not serve: on Kind it reads the
     bench's, and on the deployed backend SPACE_SMOKE_SUBSTRATE names it.
+    `backends` narrows the backends the fixture serves (`FIXTURE_BACKENDS`)
+    for a scenario that needs what only one of them provides, such as Kind's
+    cluster controls behind a fixture both serve. Implicit selection skips
+    it, visibly, on any other backend, and a run naming it there stops
+    before anything runs.
     """
 
     if not id or any(part == "" for part in id.split(".")):
@@ -233,6 +239,9 @@ def scenario(
         not narrowed_substrates or not narrowed_substrates <= SUBSTRATES
     ):
         raise ValueError("smoke substrates must contain kubernetes or direct")
+    narrowed_backends = frozenset(backends) if backends is not None else None
+    if narrowed_backends is not None and not narrowed_backends:
+        raise ValueError("smoke backends must name at least one backend")
 
     def define(verify: Callable[[Fixture], None]) -> Scenario[Fixture]:
         docstring = inspect.getdoc(verify)
@@ -293,6 +302,12 @@ def scenario(
                 f"smoke {id} substrates may only narrow its fixture's "
                 f"{', '.join(sorted(fixture_substrates))}"
             )
+        fixture_backends = FIXTURE_BACKENDS[fixture_type]
+        if narrowed_backends is not None and not narrowed_backends < fixture_backends:
+            raise ValueError(
+                f"smoke {id} backends may only narrow its fixture's "
+                f"{', '.join(sorted(fixture_backends))}"
+            )
         if cleanup_timeout_seconds is not None and not 0 < cleanup_timeout_seconds < (timeout_minutes or fixture_type.timeout_minutes) * 60:
             raise ValueError("cleanup reserve must be positive and smaller than the scenario timeout")
         return Scenario(
@@ -310,7 +325,7 @@ def scenario(
             api_surfaces=supported_surfaces,
             timeout_minutes=timeout_minutes or fixture_type.timeout_minutes,
             cleanup_timeout_seconds=cleanup_timeout_seconds,
-            backends=FIXTURE_BACKENDS[fixture_type],
+            backends=narrowed_backends or fixture_backends,
             substrates=narrowed_substrates or fixture_substrates,
             quarantined=quarantined,
             tier=tier,

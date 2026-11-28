@@ -4,7 +4,7 @@ from typing import cast
 
 import space_smoke as smoke
 from space_smoke.capabilities import ResidentLifecycleSandbox
-from space_smoke.drain_v2 import ACCESS_WAKE_POLICY
+from space_smoke.drain_v2 import ACCESS_WAKE_POLICY, in_parallel
 
 PATH = "/tmp/space-smoke-v2-drain.txt"
 
@@ -26,11 +26,17 @@ PATH = "/tmp/space-smoke-v2-drain.txt"
     "native.v2_drain_evacuates_every_resident",
     api_surfaces=("native",),
     substrates=("kubernetes",),
+    # The drain v2 controls are Kind's (`test.drain_v2`): a deployed suite
+    # run skips this, visibly, rather than fail it at setup.
+    backends=("kind",),
     # Three suspends, their uploads, three wakes and the drained edge on a
     # slow KVM bench.
     timeout_minutes=45,
-    tier="manual",
-    manual_reason="drain v2 is off by default outside Kind, so its scenarios run by name, not in the per-merge set",
+    # Routine, the one drain v2 scenario in the per-merge set: Kind runs drain
+    # v2, so the v1 drain scenarios skip there. A shard runs one scenario at
+    # a time against its own cluster, so nothing else runs beside the drain;
+    # it uncordons both workers and cancels its drain before it ends.
+    tier="routine",
 )
 def v2_drain_evacuates_every_resident(test: smoke.CommandSandboxFixture) -> None:
     """A v2 `:drain`, due now, of a worker holding two started sandboxes (one
@@ -52,13 +58,15 @@ def v2_drain_evacuates_every_resident(test: smoke.CommandSandboxFixture) -> None
             # worker is left alone.
             drain.pin_to_resident_worker(away_from_fixture=True)
             drain.give_fake_instance()
-            residents = {
-                "started": drain.create_resident(),
-                "started, woken on access": drain.create_resident(auto_lifecycle=ACCESS_WAKE_POLICY),
-                "paused": drain.create_resident(),
-            }
-            for sandbox in residents.values():
-                drain.write_file(sandbox, PATH)
+            created = in_parallel(
+                [
+                    drain.create_resident,
+                    lambda: drain.create_resident(auto_lifecycle=ACCESS_WAKE_POLICY),
+                    drain.create_resident,
+                ]
+            )
+            residents = dict(zip(("started", "started, woken on access", "paused"), created, strict=True))
+            in_parallel([lambda sandbox=sandbox: drain.write_file(sandbox, PATH) for sandbox in created])
             cast(ResidentLifecycleSandbox, residents["paused"]).pause()
             test.sandbox.suspend()
             drain.release_other_worker()
@@ -88,8 +96,7 @@ def v2_drain_evacuates_every_resident(test: smoke.CommandSandboxFixture) -> None
             drain.wake_elsewhere(residents["paused"])
 
         with test.phase("each sandbox's file survived"):
-            for sandbox in residents.values():
-                drain.expect_file(sandbox, PATH)
+            in_parallel([lambda sandbox=sandbox: drain.expect_file(sandbox, PATH) for sandbox in created])
             test.sandbox.wake()
 
         with test.phase("undrain: the drain is cancelled on the node"):

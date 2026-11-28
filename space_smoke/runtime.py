@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
-from typing import Protocol, TypeVar
+from typing import Literal, Protocol, TypeVar
 
 from space_smoke.model import ScenarioResult, Verdict
 
@@ -89,7 +89,7 @@ class SubprocessExecutor:
                     command_env.pop(name, None)
                 else:
                     command_env[name] = value
-        children = _CHILD_PROCESSES.get()
+        children = _CALL_GROUP.get()
         try:
             if children is None:
                 completed = subprocess.run(
@@ -220,19 +220,30 @@ def background(name: str, target: Callable[[], None]) -> BackgroundWork:
 T = TypeVar("T")
 
 
-class _ChildProcesses:
-    """The subprocesses one `run_concurrently` call's workers start.
+class CallsCancelled(BaseException):
+    """The `run_concurrently` group this call runs in was interrupted.
+
+    A `BaseException`, so a call's own `except Exception` retry or cleanup
+    does not swallow it: the call ends at its next request or wait instead.
+    """
+
+
+class _CallGroup:
+    """The calls of one `run_concurrently`, and the subprocesses they start.
 
     `subprocess.run` enforces its timeout from the thread that called it; a
     daemon worker left running when the process exits takes that enforcement
-    with it, and its child outlives the deadline. `end` kills and reaps every
-    child still running, and refuses new ones.
+    with it, and its child outlives the deadline. `end` cancels the group,
+    which every `cancellation_point` and `pause` in its calls then raises,
+    kills and reaps every child still running, and refuses new ones.
+    `detach` only kills, reaps and refuses: its calls run on, uncancelled.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._running: set[subprocess.Popen[str]] = set()
-        self._ended = False
+        self._detached = False
+        self.cancelled = threading.Event()
 
     def run(
         self,
@@ -246,7 +257,9 @@ class _ChildProcesses:
         """`subprocess.run(..., text=True, capture_output=True)`, owned by this group."""
 
         with self._lock:
-            if self._ended:
+            if self.cancelled.is_set():
+                raise CallsCancelled(f"not started after the concurrent calls ended: {command[0]}")
+            if self._detached:
                 raise RuntimeError(f"not started after the concurrent calls ended: {command[0]}")
             process = subprocess.Popen(
                 command,
@@ -275,40 +288,162 @@ class _ChildProcesses:
 
     def end(self) -> None:
         with self._lock:
-            self._ended = True
+            self.cancelled.set()
             running = list(self._running)
+        self._kill(running)
+
+    def detach(self) -> None:
+        with self._lock:
+            self._detached = True
+            running = list(self._running)
+        self._kill(running)
+
+    @staticmethod
+    def _kill(running: Sequence[subprocess.Popen[str]]) -> None:
         for process in running:
             process.kill()
         for process in running:
             process.wait()
 
 
-_CHILD_PROCESSES: contextvars.ContextVar[_ChildProcesses | None] = contextvars.ContextVar(
-    "space_smoke_child_processes", default=None
+_CALL_GROUP: contextvars.ContextVar[_CallGroup | None] = contextvars.ContextVar(
+    "space_smoke_call_group", default=None
+)
+# Where `ScenarioContext` writes evidence on this thread: the scenario's own
+# while its body runs, one call's own on a `run_concurrently` worker.
+_EVIDENCE_SINK: contextvars.ContextVar[dict[str, object] | None] = contextvars.ContextVar(
+    "space_smoke_evidence_sink", default=None
 )
 
+# How long an interrupted `run_concurrently` waits for its calls to end
+# before cleanup starts. A cancelled call ends at its next request or wait,
+# and most already in a request end within its timeout (Native's is 15 s,
+# `NativeConfig.request_timeout_seconds`, per socket operation). One that
+# takes longer, such as a response still arriving, is not waited for.
+CANCEL_JOIN_SECONDS = 20.0
 
-def run_concurrently(calls: Sequence[Callable[[], T]]) -> list[T | BaseException]:
+
+def cancellation_point() -> None:
+    """Raise `CallsCancelled` if this thread's `run_concurrently` group was
+    interrupted; nothing outside one. Call it before a request that creates
+    or changes something."""
+
+    group = _CALL_GROUP.get()
+    if group is not None and group.cancelled.is_set():
+        raise CallsCancelled("the concurrent calls were interrupted")
+
+
+def pause(seconds: float) -> None:
+    """`time.sleep`, which a call in an interrupted `run_concurrently` group
+    leaves at once, raising `CallsCancelled`."""
+
+    group = _CALL_GROUP.get()
+    if group is None:
+        time.sleep(seconds)
+    elif group.cancelled.wait(seconds):
+        raise CallsCancelled("the concurrent calls were interrupted")
+
+
+def primary_failure(outcomes: Sequence[object]) -> BaseException | None:
+    """The failure among `run_concurrently`'s outcomes that stands for them
+    all: the first verdict (`InvariantViolation`), else the first error."""
+
+    failures = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
+    return next(
+        (failure for failure in failures if isinstance(failure, InvariantViolation)),
+        failures[0] if failures else None,
+    )
+
+
+def _merge_evidence(
+    parent: dict[str, object],
+    evidence: Sequence[dict[str, object]],
+    outcomes: Sequence[object],
+) -> None:
+    """Each call's evidence into its caller's: the calls that returned, in
+    order, then the failures, `primary_failure` last, so the failure a caller
+    raises keeps the evidence it recorded where a sibling recorded the same
+    name. Each failure's own evidence is also kept whole, by call, under
+    `concurrent_failures`."""
+
+    failed = [index for index, outcome in enumerate(outcomes) if isinstance(outcome, BaseException)]
+    primary = primary_failure(outcomes)
+    order = [index for index in range(len(outcomes)) if index not in failed]
+    order += sorted(failed, key=lambda index: outcomes[index] is primary)
+    for index in order:
+        parent.update(dict(evidence[index]))
+    if failed:
+        listed = parent.get("concurrent_failures")
+        earlier = listed if isinstance(listed, list) else []
+        parent["concurrent_failures"] = [
+            *earlier,
+            *(
+                {
+                    "call": index,
+                    "error": f"{type(outcomes[index]).__name__}: {outcomes[index]}"[:500],
+                    "evidence": dict(evidence[index]),
+                }
+                for index in failed
+            ),
+        ]
+
+
+def run_concurrently(
+    calls: Sequence[Callable[[], T]],
+    *,
+    on_interrupt: Literal["cancel", "detach"] = "cancel",
+) -> list[T | BaseException]:
     """Run each call on its own thread; each one's result, or what it raised, in order.
 
-    For independent waits that would otherwise run one after another. An
-    exception that interrupts the wait, such as a scenario or cleanup deadline,
-    is raised at once, after every subprocess the calls started through
-    `SubprocessExecutor` is killed and reaped; the daemon threads themselves
-    start no more.
+    For independent waits that would otherwise run one after another. Inside
+    a scenario, each call records its evidence apart and it joins the
+    scenario's once the calls end (`_merge_evidence`), so a sibling cannot
+    overwrite what a failing call recorded.
+
+    An exception that interrupts the wait, such as a scenario deadline or a
+    SIGTERM, cancels the calls: every subprocess they started through
+    `SubprocessExecutor` is killed and reaped, each call ends at its next
+    `cancellation_point` or `pause`, and the wait for that is bounded
+    (`CANCEL_JOIN_SECONDS`) before the exception is raised and cleanup
+    starts. A call still running after the bound, such as one whose
+    response is still arriving, is named on stderr and not waited for. A
+    call that creates something owns its cleanup itself, registered before
+    the call starts: Native creates do (`space_smoke.services`), and their
+    cleanup waits for the create call to return, within cleanup's deadline.
+
+    `on_interrupt="detach"` neither cancels the calls nor waits for them:
+    once the subprocesses they started are killed and reaped (and new ones
+    refused), the exception is raised at once, and the calls run on, their
+    waits and requests unaffected. It is for a caller that settles calls
+    still running itself. What a detached call records after the raise is
+    not kept.
     """
 
-    children = _ChildProcesses()
+    if on_interrupt not in ("cancel", "detach"):
+        raise ValueError(f"on_interrupt must be 'cancel' or 'detach', not {on_interrupt!r}")
+
+    group = _CallGroup()
+    parent = _EVIDENCE_SINK.get()
+    evidence: list[dict[str, object]] = [{} for _ in calls]
     outcomes: list[T | BaseException] = [
         RuntimeError("the call did not finish") for _ in calls
     ]
+    # Set as each call ends. An interrupted `Thread.join` can leave CPython
+    # reading a worker still in native I/O as stopped, so that a second join
+    # returns at once and `is_alive` misses it: the bounded wait reads these
+    # instead.
+    finished = [threading.Event() for _ in calls]
 
     def run(index: int, call: Callable[[], T]) -> None:
-        _CHILD_PROCESSES.set(children)
         try:
+            _CALL_GROUP.set(group)
+            if parent is not None:
+                _EVIDENCE_SINK.set(evidence[index])
             outcomes[index] = call()
         except BaseException as error:  # noqa: BLE001 - returned to the caller in order
             outcomes[index] = error
+        finally:
+            finished[index].set()
 
     threads = [
         threading.Thread(target=run, args=(index, call), daemon=True)
@@ -320,13 +455,39 @@ def run_concurrently(calls: Sequence[Callable[[], T]]) -> list[T | BaseException
         for thread in threads:
             thread.join()
     except BaseException:
-        children.end()
+        if on_interrupt == "detach":
+            group.detach()
+            if parent is not None:
+                _merge_evidence(parent, evidence, outcomes)
+            raise
+        group.end()
+        deadline = time.monotonic() + CANCEL_JOIN_SECONDS
+        started = [index for index, thread in enumerate(threads) if thread.ident is not None]
+        for index in started:
+            finished[index].wait(max(0.0, deadline - time.monotonic()))
+        still = [index for index in started if not finished[index].is_set()]
+        if still:
+            print(
+                f"NOTE: {len(still)} interrupted concurrent call(s) still running "
+                f"{CANCEL_JOIN_SECONDS:g} s after the interrupt: calls {still}",
+                file=sys.stderr,
+                flush=True,
+            )
+        if parent is not None:
+            _merge_evidence(parent, evidence, outcomes)
         raise
+    if parent is not None:
+        _merge_evidence(parent, evidence, outcomes)
     return outcomes
 
 
 class ResourceScope:
-    """Run cleanup in reverse registration order and report every failure."""
+    """Run cleanup in reverse registration order and report every failure.
+
+    A compensation can read how long its step has left, until the cleanup's
+    deadline or its own cap (`cleanup_seconds_left`), to bound a wait of its
+    own inside it.
+    """
 
     def __init__(self) -> None:
         self._compensations: list[Compensation] = []
@@ -388,6 +549,9 @@ class ResourceScope:
                 )
                 continue
             step_timeout = _compensation_deadline_seconds(remaining, compensation.timeout_seconds)
+            token = _CLEANUP_DEADLINE.set(
+                None if step_timeout is None else time.monotonic() + step_timeout
+            )
             try:
                 with _scenario_deadline(step_timeout, label="cleanup"):
                     compensation.release()
@@ -399,7 +563,26 @@ class ResourceScope:
                         compensation.critical,
                     )
                 )
+            finally:
+                _CLEANUP_DEADLINE.reset(token)
         return tuple(failures)
+
+
+# The deadline (monotonic) of the compensation `ResourceScope.close` is
+# running: the step's own, the cleanup's or a shorter cap of its own, the one
+# its alarm enforces; None if the step has none.
+_CLEANUP_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "space_smoke_cleanup_deadline", default=None
+)
+
+
+def cleanup_seconds_left() -> float | None:
+    """How long the compensation now running in cleanup has left: until the
+    cleanup's deadline, or its own cap (`timeout_seconds`) if that ends
+    sooner. None outside cleanup, or for a step without a deadline."""
+
+    deadline = _CLEANUP_DEADLINE.get()
+    return None if deadline is None else max(0.0, deadline - time.monotonic())
 
 
 def _compensation_deadline_seconds(
@@ -471,9 +654,16 @@ class ScenarioContext:
     scope: ResourceScope
     evidence: dict[str, object]
 
+    def _sink(self) -> dict[str, object]:
+        """Where this thread's evidence goes: its `run_concurrently` call's
+        own, else the scenario's."""
+
+        sink = _EVIDENCE_SINK.get()
+        return self.evidence if sink is None else sink
+
     def record(self, name: str, value: object) -> None:
         require_json_evidence({name: value})
-        self.evidence[name] = value
+        self._sink()[name] = value
 
     def verify(
         self,
@@ -486,24 +676,26 @@ class ScenarioContext:
         failing one keeps such a value as its `repr` instead, so the failure
         and its message are what the run reports."""
 
+        sink = self._sink()
         if condition:
             require_json_evidence(evidence)
-            self.evidence.update(evidence)
+            sink.update(evidence)
             return
-        self.evidence.update(printable_evidence(evidence, self.evidence))
+        sink.update(printable_evidence(evidence, sink))
         raise InvariantViolation(message)
 
     def warn(self, message: str, **evidence: object) -> None:
         """Keep `evidence`, each value the runner can't print as its `repr`,
         and end the run with a warning saying `message`."""
 
-        self.evidence.update(printable_evidence(evidence, self.evidence))
+        sink = self._sink()
+        sink.update(printable_evidence(evidence, sink))
         raise QuarantinedSmoke(message)
 
     def wait(self, seconds: float) -> None:
         if seconds <= 0:
             raise ValueError("wait duration must be positive")
-        time.sleep(seconds)
+        pause(seconds)
 
     @contextmanager
     def phase(self, name: str) -> Iterator[None]:
@@ -558,6 +750,18 @@ def _scenario_deadline(
 
 
 @contextmanager
+def _evidence_sink(evidence: dict[str, object]) -> Iterator[None]:
+    """Make `evidence` this thread's evidence sink while the body runs, so
+    `run_concurrently` can give each call its own and merge them back."""
+
+    token = _EVIDENCE_SINK.set(evidence)
+    try:
+        yield
+    finally:
+        _EVIDENCE_SINK.reset(token)
+
+
+@contextmanager
 def _sigterm_raises() -> Iterator[None]:
     """Turn SIGTERM into `SystemExit` on the main thread while the body runs.
 
@@ -603,7 +807,11 @@ def execute_scenario(
         else None
     )
     try:
-        with _sigterm_raises(), _scenario_deadline(execution_timeout, label="scenario execution"):
+        with (
+            _sigterm_raises(),
+            _scenario_deadline(execution_timeout, label="scenario execution"),
+            _evidence_sink(context.evidence),
+        ):
             body(context)
         result = ScenarioResult(Verdict.PASS, f"{title} passed", dict(context.evidence))
     except InvariantViolation as error:

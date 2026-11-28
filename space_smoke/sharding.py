@@ -132,33 +132,32 @@ _DURATION_SECONDS = {
         "native.resident_pause": 5,
         "native.stopped_restart_preserves_rootfs": 68,
         # The drain set, which runs by name and splits across benches with
-        # `space_smoke list --prefix native.v2_ --shard I/N`: one local Kind
-        # run each (2026-11-20, a 32-core bench, Kind's drain v2 values); the
-        # median of two for the undrain.
-        # The stopped-sandbox refusal is one local Kind run (2026-11-24, four
-        # benches on a 32-core host): four refused stops' retry budgets and
-        # a drain held for an hour that the scenario undrains. Replace with
-        # CI medians once CI runs them.
-        "native.v2_drain_evacuates_every_resident": 191,
-        "native.v2_drain_holds_running_until_its_deadline": 291,
-        "native.v2_drain_keeps_a_live_node_with_a_stale_instance": 294,
-        "native.v2_drain_meets_user_calls": 330,
-        "native.v2_drain_moves_ten_residents": 214,
-        "native.v2_drain_outlived_by_a_dead_worker": 710,
-        "native.v2_drain_paces_a_full_worker": 648,
-        "native.v2_drain_preview_changes_nothing": 46,
-        "native.v2_drain_refused_at_the_cap": 213,
-        "native.v2_drain_refuses_stopped_sandboxes": 644,
-        "native.v2_drain_replaced_while_shutting_down": 154,
-        "native.v2_drain_survives_controller_restarts": 1052,
-        "native.v2_drain_survives_sandbox_manager_restarts": 532,
-        "native.v2_drain_terminates_its_worker": 343,
-        "native.v2_drain_waits_for_a_lingering_node": 213,
-        "native.v2_drain_waits_for_an_unreachable_node": 211,
-        "native.v2_drain_waits_out_blocked_uploads": 509,
-        "native.v2_refuses_v1_drains": 30,
-        "native.v2_undrain_mid_suspend": 170,
-        "native.v2_undrain_unseals_the_worker": 128,
+        # `space_smoke list --prefix native.v2_ --shard I/N`, but for
+        # native.v2_drain_evacuates_every_resident, which is routine too: the
+        # median of three local Kind runs each (2026-11-25,
+        # `smoke-kind-parallel.sh --repeat 3` on four benches of a 32-core
+        # host, Kind's drain v2 values), setup and cleanup included. Replace
+        # with CI medians once CI runs them.
+        "native.v2_drain_evacuates_every_resident": 75,
+        "native.v2_drain_holds_running_until_its_deadline": 122,
+        "native.v2_drain_keeps_a_live_node_with_a_stale_instance": 289,
+        "native.v2_drain_meets_user_calls": 145,
+        "native.v2_drain_moves_ten_residents": 110,
+        "native.v2_drain_outlived_by_a_dead_worker": 469,
+        "native.v2_drain_paces_a_full_worker": 290,
+        "native.v2_drain_preview_changes_nothing": 42,
+        "native.v2_drain_refused_at_the_cap": 70,
+        "native.v2_drain_refuses_stopped_sandboxes": 175,
+        "native.v2_drain_replaced_while_shutting_down": 169,
+        "native.v2_drain_survives_controller_restarts": 266,
+        "native.v2_drain_survives_sandbox_manager_restarts": 199,
+        "native.v2_drain_terminates_its_worker": 282,
+        "native.v2_drain_waits_for_a_lingering_node": 267,
+        "native.v2_drain_waits_for_an_unreachable_node": 205,
+        "native.v2_drain_waits_out_blocked_uploads": 95,
+        "native.v2_refuses_v1_drains": 6,
+        "native.v2_undrain_mid_suspend": 79,
+        "native.v2_undrain_unseals_the_worker": 114,
         "native.v2_undrain_with_the_controller_down": 47,
         "native_concurrency.command_idempotency": 4,
         "native_concurrency.create_idempotency": 4,
@@ -208,17 +207,28 @@ def joint_inventories(
     include_scenarios: tuple[str, ...],
     backend: str,
     browser_selection: str,
+    run_scenarios: tuple[str, ...] = (),
 ) -> dict[str, tuple[Scenario[Any], ...]]:
     """Each joint surface's eligible inventory, as a sharded `--all` pass filters it.
 
-    The tiers and extra scenarios, the surface, the backend, then browser
-    withholding; mode-dependent skips come after the partition. Every pass of
-    a sharded run partitions these, and so does anything that checks the
-    run's coverage (scripts/tests/lib/kind_parallel_report.py).
+    The tiers and extra scenarios, or with `run_scenarios` exactly those, in
+    that order and as often as listed, whatever their tier but not whatever
+    their templates; then the surface, the backend and browser withholding; mode-dependent skips come after the
+    partition. Every pass of a sharded run partitions these, and so does
+    anything that checks the run's coverage
+    (scripts/tests/lib/kind_parallel_report.py).
     """
 
-    selected = registry.select(
-        category=None, template=template, tiers=tiers, include_scenarios=include_scenarios,
+    selected = (
+        tuple(
+            scenario
+            for scenario in map(registry.get, run_scenarios)
+            if scenario.applies_to(template)
+        )
+        if run_scenarios
+        else registry.select(
+            category=None, template=template, tiers=tiers, include_scenarios=include_scenarios,
+        )
     )
     return {
         surface: tuple(
@@ -230,6 +240,41 @@ def joint_inventories(
         )
         for surface in JOINT_SURFACES
     }
+
+
+def named_withheld(
+    registry: ScenarioRegistry,
+    run_scenarios: tuple[str, ...],
+    *,
+    template: str | None,
+    backend: str,
+    browser_selection: str,
+) -> list[tuple[str, str]]:
+    """Each occurrence in `run_scenarios` that no joint surface's inventory
+    holds (`joint_inventories`), with why: an unknown ID, a template it
+    doesn't apply to, another backend, a surface no sharded run covers, or
+    browser withholding. A named run that withholds any did not run what it
+    named. Mode-dependent skips are a bench's, known only once it is up."""
+
+    withheld: list[tuple[str, str]] = []
+    for scenario_id in run_scenarios:
+        try:
+            scenario = registry.get(scenario_id)
+        except KeyError:
+            withheld.append((scenario_id, "no such scenario"))
+            continue
+        if not scenario.applies_to(template):
+            reason = f"applies to template(s) {', '.join(sorted(scenario.templates or ()))}, not {template}"
+        elif backend not in scenario.backends:
+            reason = f"runs only on backend(s) {', '.join(sorted(scenario.backends))}"
+        elif not set(scenario.api_surfaces) & set(JOINT_SURFACES):
+            reason = f"runs only on API surface(s) {', '.join(sorted(scenario.api_surfaces))}"
+        elif browser_selection == "withhold" and scenario.browser is not None:
+            reason = "needs a browser, which this run withholds"
+        else:
+            continue
+        withheld.append((scenario_id, reason))
+    return withheld
 
 
 def select_shard(
@@ -249,21 +294,45 @@ def select_shard(
     pair still runs on exactly one shard.
     """
 
+    chosen = shard_positions(
+        scenarios, index=index, count=count, api_surface=api_surface, inventories=inventories
+    )
+    return tuple(sorted((scenarios[position] for position in chosen), key=lambda scenario: scenario.id))
+
+
+def shard_positions(
+    scenarios: tuple[Scenario[Any], ...],
+    *,
+    index: int,
+    count: int,
+    api_surface: str,
+    inventories: Mapping[str, tuple[Scenario[Any], ...]] | None = None,
+) -> tuple[int, ...]:
+    """`select_shard`'s share as positions in `scenarios`, in position order.
+
+    A named run lists a scenario once per occurrence, so its share keeps each
+    occurrence apart and in the order named. Occurrences of one scenario
+    have equal hints, IDs and surfaces; their positions break that tie, which
+    changes which occurrence lands where but not how many land on each shard.
+    """
+
     pools = dict(inventories or {})
     pools[api_surface] = scenarios
     items = [
-        (surface, scenario, _DURATION_SECONDS.get(surface, {}).get(scenario.id, 30))
+        (surface, position, scenario, _DURATION_SECONDS.get(surface, {}).get(scenario.id, 30))
         for surface in sorted(pools)
-        for scenario in pools[surface]
+        for position, scenario in enumerate(pools[surface])
     ]
     loads = [0] * count
-    chosen: list[Scenario[Any]] = []
+    chosen: list[int] = []
     # Equal hints order by surface and ID, and equal loads choose the lower
     # shard index: neither discovery order nor process-local hash
     # randomization may change the assignment.
-    for surface, scenario, seconds in sorted(items, key=lambda item: (-item[2], item[0], item[1].id)):
+    for surface, position, scenario, seconds in sorted(
+        items, key=lambda item: (-item[3], item[0], item[2].id, item[1])
+    ):
         target = min(range(count), key=loads.__getitem__)
         loads[target] += seconds
         if target == index - 1 and surface == api_surface:
-            chosen.append(scenario)
-    return tuple(sorted(chosen, key=lambda scenario: scenario.id))
+            chosen.append(position)
+    return tuple(sorted(chosen))

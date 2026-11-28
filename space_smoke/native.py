@@ -6,7 +6,7 @@ import base64
 import json
 import time
 import uuid
-from collections.abc import Collection, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from dataclasses import dataclass, replace
 from typing import BinaryIO, cast
 from urllib.error import HTTPError
@@ -23,6 +23,7 @@ from space_smoke.capabilities import (
     SandboxInfo,
     SandboxPages,
 )
+from space_smoke.runtime import cancellation_point
 
 _TERMINAL_OPERATION_STATES = frozenset({"canceled", "expired", "failed", "succeeded"})
 _TERMINAL_CREATE_STATES = frozenset({"deleted", "deleting", "failed"})
@@ -127,7 +128,12 @@ class NativeSandboxFactory:
         *,
         idle_timeout: str | None = None,
         auto_lifecycle: Mapping[str, object] | None = None,
+        accepted: Callable[[DurableLifecycleSandbox], None] | None = None,
     ) -> DurableLifecycleSandbox:
+        """Create a sandbox and wait until it runs. `accepted` is handed it as
+        soon as the API accepts the create, before the wait, so a caller can
+        own its cleanup even if the wait is interrupted."""
+
         body: dict[str, object] = {
             "template": self._config.template,
             "metadata": dict(metadata or {}),
@@ -145,6 +151,8 @@ class NativeSandboxFactory:
         )
         sandbox_id = _required_string(response, "sandbox_id")
         sandbox = _NativeSandbox(self, sandbox_id)
+        if accepted is not None:
+            accepted(sandbox)
         try:
             self._wait_operation(_required_string(response, "operation_id"))
             self._wait_sandbox_running(sandbox_id)
@@ -155,6 +163,35 @@ class NativeSandboxFactory:
                 error.add_note(f"Native create cleanup failed: {cleanup_error}")
             raise
         return sandbox
+
+    def sandbox_labelled(
+        self, key: str, value: str, *, limit: int = 100, max_pages: int = 50
+    ) -> DurableLifecycleSandbox | None:
+        """The caller's sandbox whose metadata sets `key` to `value`, read
+        from the list, or None: how cleanup finds a sandbox it labelled
+        before its create answered. The label is unique per create, so the
+        search ends at the first match, and a later page's error or the page
+        bound can't lose it; only a search that found nothing reads to the
+        end, and one past `max_pages` raises."""
+
+        cursor: str | None = None
+        for _ in range(max_pages):
+            query = {"limit": str(limit)}
+            if cursor is not None:
+                query["cursor"] = cursor
+            response = self._json_request("GET", f"/v1/sandboxes?{urlencode(query)}", expected_status=200)
+            data = response.get("data")
+            if not isinstance(data, list):
+                raise TypeError("Native sandbox page field 'data' was not an array")
+            for index, item in enumerate(data):
+                entry = _page_item(item, index)
+                metadata = entry.get("metadata")
+                if isinstance(metadata, Mapping) and metadata.get(key) == value:
+                    return _NativeSandbox(self, _required_string(entry, "id"))
+            cursor = _optional_string(response, "next_cursor")
+            if cursor is None:
+                return None
+        raise RuntimeError(f"more than {max_pages} pages of sandboxes to search for {key}={value}")
 
     def delete(self, sandbox: CommandSandbox) -> None:
         deadline = time.monotonic() + self._config.ready_timeout_seconds
@@ -682,6 +719,9 @@ class NativeSandboxFactory:
         timeout: float | None = None,
         authenticated: bool = True,
     ) -> dict[str, object]:
+        # A call of an interrupted `run_concurrently` group sends nothing more:
+        # its polls sleep a second at most, so it ends at its next request.
+        cancellation_point()
         headers = {"Accept": "application/json"}
         if authenticated:
             headers["Authorization"] = f"Bearer {self._config.token}"

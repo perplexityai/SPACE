@@ -4,14 +4,26 @@ from typing import cast
 
 import space_smoke as smoke
 from space_smoke.capabilities import RawCallSandbox, ResidentLifecycleSandbox
+from space_smoke.drain_v2 import CALLS_LEAD_SECONDS, UPLOAD_RETRY_SECONDS
 
 PATH = "/tmp/space-smoke-v2-calls.txt"
-# The drain's hold: the run's calls before the deadline (a delete, a
-# Rollback, a pause and its wake elsewhere) fit inside it on a slow bench.
-HOLD_SECONDS = 300
-# The run cuts the drained worker's uploads this long before the deadline at
-# the latest, so the sandbox the node suspends there isn't durable yet.
-BLOCK_MARGIN_SECONDS = 30
+# The drain's first hold: the run's calls before the deadline (a delete, a
+# Rollback, a pause and its wake elsewhere) fit inside it on any bench. Once
+# they are done the run brings the deadline in (`LEAD_SECONDS`), rather than
+# wait out the rest of a hold sized for the slowest bench.
+HOLD_SECONDS = 900
+# How far ahead the deadline lands once brought in, the uploads already
+# cut: at least an 18 s watch of the sandbox held, three of its 5 s reads,
+# until the calls start `CALLS_LEAD_SECONDS` before it; up to a tick more,
+# as the deadline is put just past one of the controller's ticks so the
+# calls have a few seconds past it before the node's suspend. Nothing tells
+# the node of the new deadline (`bring_deadline_to`), so nothing here waits
+# for that.
+LEAD_SECONDS = CALLS_LEAD_SECONDS + 18
+# The resident deleted as the drain began is long gone by the end: its
+# delete, the node's report of it and the finalize, measured in seconds,
+# with a minute's margin.
+DELETED_SECONDS = 120
 
 
 # `native.v2_drain_evacuates_every_resident` is the drain with no user in the
@@ -33,17 +45,20 @@ BLOCK_MARGIN_SECONDS = 30
     substrates=("kubernetes",),
     timeout_minutes=45,
     tier="manual",
-    manual_reason="drain v2 is off by default outside Kind, so its scenarios run by name, not in the per-merge set",
+    manual_reason="timing-sensitive on Kind: its calls past the deadline race the controller's first evacuating tick",
 )
 def v2_drain_meets_user_calls(test: smoke.CommandSandboxFixture) -> None:
-    """Of three residents of a worker v2-drained with a five-minute hold, one
+    """Of three residents of a worker v2-drained with a hold, one
     deleted as the drain begins is gone and doesn't hold the drain. Before
     the deadline the running one answers calls; a Rollback of it is refused
     on the sealed worker, and it keeps running there with its data intact.
     A wake of the one its user paused is told to retry with a 503, never a
     409, and lands it on the other worker once the drain made it durable.
-    Past the deadline, each call to the running one passes until the node
-    suspends it. Once the node suspends it, with its upload cut, a wake and
+    The deadline is then brought in with a shorter hold; the node holds the
+    running one until it, and from just before it each call that meets the
+    running one passes until the node suspends it, and at least one meets
+    it past the deadline, or the run ends
+    inconclusive. Once the node suspends it, with its upload cut, a wake and
     a command of it are recorded, and no second execution of it runs off
     the worker; once the upload goes through, a wake lands it on the other
     worker, its data intact. The node reaches `drained`."""
@@ -85,18 +100,14 @@ def v2_drain_meets_user_calls(test: smoke.CommandSandboxFixture) -> None:
             drain.expect_back_elsewhere(user_paused.sandbox_id, "started")
             drain.expect_file(user_paused, PATH)
 
-        with test.phase("cut the drained worker's uploads before the deadline"):
-            ahead = drain.seconds_to_deadline()
-            test.verify(
-                ahead > BLOCK_MARGIN_SECONDS,
-                "the calls before the deadline outlasted the hold",
-                seconds_to_deadline=round(ahead),
-            )
+        with test.phase("cut the drained worker's uploads, then bring the deadline in"):
             uploads = drain.block("object-store")
-            drain.expect_started_until_deadline([serving.sandbox_id], margin=5)
+            # Cut first, so the deadline is at least the lead after the cut.
+            drain.bring_deadline_to(LEAD_SECONDS, after_a_tick=True)
+            drain.expect_started_until_deadline([serving.sandbox_id], margin=CALLS_LEAD_SECONDS)
 
-        with test.phase("past the deadline: calls to the running one pass until the node suspends it"):
-            drain.expect_calls_pass_until_suspended(serving)
+        with test.phase("around the deadline: calls to the running one pass until the node suspends it"):
+            calls = drain.expect_calls_pass_until_suspended(serving)
 
         # The node's suspend reaches the row only once its snapshot is
         # durable: with the upload cut the row still reads `started`, and the
@@ -116,12 +127,12 @@ def v2_drain_meets_user_calls(test: smoke.CommandSandboxFixture) -> None:
 
         with test.phase("the upload goes through: a wake lands it elsewhere"):
             uploads.release()
-            drain.expect_suspended_by_the_node(serving.sandbox_id)
+            drain.expect_suspended_by_the_node(serving.sandbox_id, timeout=UPLOAD_RETRY_SECONDS)
             drain.wake_elsewhere(serving)
             drain.expect_file(serving, PATH)
 
         with test.phase("the deleted resident is gone and the node drains"):
-            drain.expect_deleted(deleted.sandbox_id, timeout=600)
+            drain.expect_deleted(deleted.sandbox_id, timeout=DELETED_SECONDS)
             # Both others were woken elsewhere before the drain ended, so the
             # last report names neither.
             drain.expect_drained()
@@ -129,3 +140,7 @@ def v2_drain_meets_user_calls(test: smoke.CommandSandboxFixture) -> None:
 
         with test.phase("undrain"):
             drain.undrain_and_expect_cancelled()
+
+        # Last, so every check above still decides a failure: a run with no
+        # call past the deadline judged none there, and passes nothing.
+        drain.expect_sampled_past_deadline(calls)

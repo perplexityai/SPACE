@@ -4,11 +4,13 @@ from typing import cast
 
 import space_smoke as smoke
 from space_smoke.capabilities import StoppableLifecycleSandbox
-from space_smoke.drain_v2 import STOP_VERBS
+from space_smoke.drain_v2 import STOP_VERBS, in_parallel
 
-# The drain's hold: the running resident is held through the refused stops,
+# The drain's hold: the running residents are held through the refused stops,
 # each of which the dispatcher retries until its budget runs out.
 HOLD_SECONDS = 60 * 60
+# A delete landing: measured in seconds, with a minute's margin.
+DELETED_SECONDS = 120
 
 
 # The up-front refusal, its preview and its skip when the preview can't be
@@ -35,22 +37,25 @@ HOLD_SECONDS = 60 * 60
 def v2_drain_refuses_stopped_sandboxes(test: smoke.CommandSandboxFixture) -> None:
     """A v2 `:drain` of a worker holding a stopped sandbox is refused with
     the stopped refusal's 409 naming it, and writes nothing; once it is
-    deleted the same `:drain` is accepted and holds the worker's running
-    sandbox. While the drain lasts, a `:stop`, `:kill`, `:force-stop` and
-    `:force-kill` of it is each refused with the drain's retryable 503, and
-    it keeps running there. Once undrained, its `:stop` goes through."""
+    deleted the same `:drain` is accepted and holds the worker's four running
+    sandboxes. While the drain lasts, a `:stop`, `:kill`, `:force-stop` and
+    `:force-kill`, each of a different one of them, is each refused with the
+    drain's retryable 503, and each keeps running there. Once undrained, a
+    `:stop` goes through."""
 
     drain = test.drain_v2
 
     with drain.v2_controller():
-        with test.phase("pin a stopped and a running sandbox to one worker"):
+        with test.phase("pin a stopped and four running sandboxes to one worker"):
             # A v2 drain needs the node's instance recorded; re-registering
             # under a fake one deletes the pods there, so the fixture's
             # worker is left alone, and stays cordoned.
             drain.pin_to_resident_worker(away_from_fixture=True)
             drain.give_fake_instance()
-            stopped = cast(StoppableLifecycleSandbox, drain.create_resident())
-            held = drain.create_resident()
+            # One running resident per stop verb, so the four refusals, each
+            # retried for the dispatcher's whole budget, run side by side.
+            stopped, *held = drain.create_residents(1 + len(STOP_VERBS))
+            stopped = cast(StoppableLifecycleSandbox, stopped)
             stopped.stop()
             residency = drain.residency(stopped.sandbox_id)
             test.verify(
@@ -63,9 +68,9 @@ def v2_drain_refuses_stopped_sandboxes(test: smoke.CommandSandboxFixture) -> Non
         with test.phase("a v2 :drain of the worker is refused for its stopped sandbox, writing nothing"):
             drain.expect_drain_refused_for_stopped([stopped.sandbox_id], hold=HOLD_SECONDS)
 
-        with test.phase("once it is deleted, the same :drain is accepted and holds the running one"):
+        with test.phase("once it is deleted, the same :drain is accepted and holds the running ones"):
             test.delete_sandbox(stopped)
-            drain.expect_deleted(stopped.sandbox_id, timeout=300)
+            drain.expect_deleted(stopped.sandbox_id, timeout=DELETED_SECONDS)
             drain.drain(hold=HOLD_SECONDS)
             test.verify(
                 drain.drain_phase() == "draining" and drain.seconds_to_deadline() > 0,
@@ -74,25 +79,32 @@ def v2_drain_refuses_stopped_sandboxes(test: smoke.CommandSandboxFixture) -> Non
                 seconds_to_deadline=round(drain.seconds_to_deadline()),
             )
             drain.wait_for_reported()
-            drain.expect_held(held.sandbox_id)
+            for sandbox in held:
+                drain.expect_held(sandbox.sandbox_id)
 
-        with test.phase("each stop and kill of the running one is refused with a 503; it keeps running"):
-            for verb in STOP_VERBS:
-                drain.expect_stop_refused(held, verb)
+        with test.phase("each stop and kill of a running one is refused with a 503; it keeps running"):
+            in_parallel(
+                [
+                    lambda sandbox=sandbox, verb=verb: drain.expect_stop_refused(sandbox, verb)
+                    for sandbox, verb in zip(held, STOP_VERBS, strict=True)
+                ],
+                width=len(STOP_VERBS),
+            )
             test.verify(
                 drain.seconds_to_deadline() > 0,
                 "the refused stops outlasted the hold",
                 seconds_to_deadline=round(drain.seconds_to_deadline()),
             )
 
-        with test.phase("undrained, the running sandbox's :stop goes through"):
+        with test.phase("undrained, a running sandbox's :stop goes through"):
             drain.undrain_and_expect_cancelled()
-            cast(StoppableLifecycleSandbox, held).stop()
-            residency = drain.residency(held.sandbox_id)
+            cast(StoppableLifecycleSandbox, held[0]).stop()
+            residency = drain.residency(held[0].sandbox_id)
             test.verify(
                 residency[0] == "stopped",
                 "the undrained worker's sandbox did not stop",
                 residency=residency,
             )
-            test.delete_sandbox(held)
-            drain.expect_deleted(held.sandbox_id, timeout=300)
+            drain.delete_all(held)
+            for sandbox in held:
+                drain.expect_deleted(sandbox.sandbox_id, timeout=DELETED_SECONDS)

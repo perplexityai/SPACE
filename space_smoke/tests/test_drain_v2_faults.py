@@ -47,7 +47,7 @@ from space_smoke.drain_v2 import (
     validate_drain_v2_api_overrides,
     validate_drain_v2_overrides,
 )
-from space_smoke.runtime import CommandResult, InvariantViolation, ResourceScope
+from space_smoke.runtime import CommandResult, InconclusiveSmoke, InvariantViolation, ResourceScope
 
 NODE = "space-local-worker"
 NODE_ID = "00000000-0000-4000-8000-000000000001"
@@ -176,9 +176,11 @@ class DrainV2Env(unittest.TestCase):
     def test_the_switch_the_restore_knobs_and_the_cap_are_off_the_controller_list(self) -> None:
         validate_drain_v2_overrides(drain_v2.AWS_TERMINATOR_ENV)
         validate_drain_v2_overrides(drain_v2.LEGACY_LOOPS_ENV)
+        validate_drain_v2_overrides({drain_v2.STALL_BOUND_HOOK: "30"})
         for overrides in (
             {DRAIN_V2_ENABLED_ENV: "true"},
-            {drain_v2.STALL_BOUND_HOOK: "60"},
+            {drain_v2.STALL_BOUND_HOOK: "5"},
+            {drain_v2.STALL_BOUND_HOOK: "1000"},
             {"SPACE_DRAIN_RESTORE_TEST_HOLD_SECS": "30"},
             {"SPACE_PUBLIC_OPERATION_DISPATCHER_DRAIN_RESTORE_SLOTS": "4"},
             {DRAIN_V2_MAX_EVACUATING_ENV: "1"},
@@ -399,28 +401,73 @@ class GateAnswers(unittest.TestCase):
         with self.assertRaises(InvariantViolation):
             drain.expect_told_to_retry(self._answer(state="succeeded", progress=[GATE_RETRY_TEXT]))
 
-    def test_past_the_deadline_calls_pass_until_the_node_suspends(self) -> None:
+    def test_calls_around_the_deadline_pass_until_the_node_suspends(self) -> None:
         sandbox = "00000000-0000-4000-8000-00000000000d"
         # The node's own state: its row stays `started` with the upload cut.
         states = ["started", "started", "started", "suspending"]
         drain, fixture = _assertions(_Control(node_states={sandbox: list(states)}))
-        drain._deadline = 0
-        caller = _Sandbox(sandbox, [CALL_PASSED_STATUS, GATE_REFUSAL_STATUS])
-        self.assertEqual(drain.expect_calls_pass_until_suspended(caller), [CALL_PASSED_STATUS])  # type: ignore[arg-type]
+        # Inside the lead: the calls start at once, before the deadline, and
+        # the node suspends at the deadline, before any call lands past it:
+        # no call there judged. The last clock reading is when the node is
+        # first read not running.
+        drain._deadline = int(time.time()) + 3
+        caller = _Sandbox(sandbox, [CALL_PASSED_STATUS, CALL_PASSED_STATUS])
+        with mock.patch.object(type(drain), "seconds_to_deadline", side_effect=[3, 2, 1, 0]):
+            seen = drain.expect_calls_pass_until_suspended(caller)  # type: ignore[arg-type]
+        self.assertEqual(
+            seen,
+            {
+                "before_deadline": [CALL_PASSED_STATUS],
+                "past_deadline": [],
+                "overlapping_suspend": [{"status": CALL_PASSED_STATUS, "retry_after": None, "body": {}, "seconds_to_deadline": 1}],
+            },
+        )
         self.assertEqual(caller.commands, 2)
+        with self.assertRaises(InconclusiveSmoke):
+            drain.expect_sampled_past_deadline(seen)
+        # The same, but the node is first read not running before the
+        # deadline: it took the VM down early, whatever the calls answered.
+        drain, fixture = _assertions(_Control(node_states={sandbox: list(states)}))
+        drain._deadline = int(time.time()) + 3
+        with (
+            mock.patch.object(type(drain), "seconds_to_deadline", side_effect=[3, 2, 1, 0.5]),
+            self.assertRaisesRegex(InvariantViolation, "before its deadline"),
+        ):
+            drain.expect_calls_pass_until_suspended(
+                _Sandbox(sandbox, [CALL_PASSED_STATUS, CALL_PASSED_STATUS])  # type: ignore[arg-type]
+            )
+        # One call before the deadline and one past it, both meeting the VM.
+        drain, fixture = _assertions(_Control(node_states={sandbox: ["started"] * 4 + ["suspending"]}))
+        drain._deadline = int(time.time()) + 3
+        with mock.patch.object(type(drain), "seconds_to_deadline", side_effect=[3, 2, -1, -2]):
+            seen = drain.expect_calls_pass_until_suspended(
+                _Sandbox(sandbox, [CALL_PASSED_STATUS, CALL_PASSED_STATUS])  # type: ignore[arg-type]
+            )
+        self.assertEqual(
+            (seen["before_deadline"], seen["past_deadline"]), ([CALL_PASSED_STATUS], [CALL_PASSED_STATUS])
+        )
+        drain.expect_sampled_past_deadline(seen)
         for refused in (409, GATE_REFUSAL_STATUS):
             drain, fixture = _assertions(_Control(node_states={sandbox: list(states)}))
-            drain._deadline = 0
-            with self.subTest(refused=refused), self.assertRaises(InvariantViolation):
+            drain._deadline = int(time.time()) + 3
+            with (
+                self.subTest(refused=refused),
+                mock.patch.object(type(drain), "seconds_to_deadline", side_effect=[3, 2, 1, 0]),
+                self.assertRaisesRegex(InvariantViolation, "did not pass"),
+            ):
                 drain.expect_calls_pass_until_suspended(_Sandbox(sandbox, [refused, 201]))  # type: ignore[arg-type]
-            self.assertIn(f"calls_past_deadline_{sandbox}", fixture.evidence)
+            self.assertIn(f"calls_around_deadline_{sandbox}", fixture.evidence)
 
-    def test_past_the_deadline_a_call_must_meet_the_vm_running(self) -> None:
+    def test_before_the_deadline_a_call_must_meet_the_vm_running(self) -> None:
         sandbox = "00000000-0000-4000-8000-00000000000e"
         drain, _ = _assertions(_Control(node_states={sandbox: ["suspending"]}))
-        drain._deadline = 0
+        drain._deadline = int(time.time()) + 3
         caller = _Sandbox(sandbox, [CALL_PASSED_STATUS])
-        with self.assertRaisesRegex(InvariantViolation, "no call met the VM running"):
+        # First read not running at the deadline, so no call met the VM.
+        with (
+            mock.patch.object(type(drain), "seconds_to_deadline", side_effect=[3, 0]),
+            self.assertRaisesRegex(InvariantViolation, "no call met the VM running"),
+        ):
             drain.expect_calls_pass_until_suspended(caller)  # type: ignore[arg-type]
 
 

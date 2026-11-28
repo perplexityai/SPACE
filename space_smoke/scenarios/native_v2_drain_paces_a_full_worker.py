@@ -1,11 +1,10 @@
 """A v2 drain of a full worker moves every resident, a window at a time, without blocking or stalling."""
 
 import time
-from typing import Any, cast
+from typing import Any
 
 import space_smoke as smoke
-from space_smoke.capabilities import ResidentLifecycleSandbox
-from space_smoke.drain_v2 import STALL_ERROR_PREFIX
+from space_smoke.drain_v2 import STALL_ERROR_PREFIX, in_parallel
 
 RESIDENTS = 30
 # More than the window: the window starts paused VMs first, so only with more
@@ -18,6 +17,13 @@ IDLE_TIMEOUT = "90s"
 # Guest memory each resident fills, so its snapshot carries real bytes.
 FILL_MIB = 256
 SAMPLE_SECONDS = 3
+# Thirty residents' suspends and uploads, a window at a time, to `drained`:
+# about 80 s measured from the drain, four times over, with a minute's
+# margin.
+FULL_WORKER_DRAINED_SECONDS = 4 * 80 + 60
+# One pass over thirty residents' rows and snapshots takes about a minute
+# of reads; two passes and a margin.
+EVACUATED_SECONDS = 180
 
 
 # The window, the disk check and the upload polling are planner rows
@@ -56,20 +62,15 @@ def v2_drain_paces_a_full_worker(test: smoke.CommandSandboxFixture) -> None:
         with test.phase("fill one worker with thirty residents"):
             drain.pin_to_resident_worker(away_from_fixture=True)
             drain.give_fake_instance()
-            residents = [drain.create_resident() for _ in range(RESIDENTS - IDLE)]
-            idle = [drain.create_resident(idle_timeout=IDLE_TIMEOUT) for _ in range(IDLE)]
-            digests = {
-                sandbox.sandbox_id: drain.fill_memory(sandbox, mib=FILL_MIB)
-                for sandbox in residents + idle
-            }
-            for sandbox in residents[:PAUSED]:
-                cast(ResidentLifecycleSandbox, sandbox).pause()
+            residents = drain.create_residents(RESIDENTS - IDLE)
+            idle = drain.create_residents(IDLE, idle_timeout=IDLE_TIMEOUT)
+            digests = drain.fill_memories(residents + idle, mib=FILL_MIB)
+            drain.pause_all(residents[:PAUSED])
             test.sandbox.suspend()
             drain.release_other_worker()
             # Activity resets the idle clock, so the idle residents suspend
             # themselves while the drain runs.
-            for sandbox in idle:
-                drain.run_on(sandbox, "true")
+            in_parallel([lambda sandbox=sandbox: drain.run_on(sandbox, "true") for sandbox in idle])
 
         everyone = residents + idle
         ids = [drain.bare_id(sandbox.sandbox_id) for sandbox in everyone]
@@ -120,7 +121,7 @@ def v2_drain_paces_a_full_worker(test: smoke.CommandSandboxFixture) -> None:
             drain.expect_back_elsewhere(by_id[queued].sandbox_id, "started")
 
         with test.phase("sample the drain until drained"):
-            deadline = started + 3600
+            deadline = started + FULL_WORKER_DRAINED_SECONDS
             while drain.drain_phase() != "drained":
                 sample(started)
                 test.verify(time.monotonic() < deadline, "the v2 drain never reached drained")
@@ -149,7 +150,7 @@ def v2_drain_paces_a_full_worker(test: smoke.CommandSandboxFixture) -> None:
                 for sandbox in everyone
                 if drain.bare_id(sandbox.sandbox_id) != queued
             }
-            drain.expect_all_evacuated(rest, timeout=900)
+            drain.expect_all_evacuated(rest, timeout=EVACUATED_SECONDS)
             drain.wake_all_elsewhere(rest, digests)
             drain.expect_memory(by_id[queued], digests[by_id[queued].sandbox_id])
 
@@ -159,5 +160,4 @@ def v2_drain_paces_a_full_worker(test: smoke.CommandSandboxFixture) -> None:
         # Thirty deletes outlast the cleanup budget, so the run deletes its
         # residents itself; cleanup deletes only what this leaves.
         with test.phase("delete the residents"):
-            for sandbox in everyone:
-                test.delete_sandbox(sandbox)
+            drain.delete_all(everyone)
