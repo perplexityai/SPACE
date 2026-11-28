@@ -8,9 +8,9 @@ use super::support::*;
 use super::*;
 use crate::controllers::substrate::kubernetes::store::{
     ActiveExecutionState, ActiveExecutionStatusRow, FailedRecoveryPodAbsenceOutcome,
-    PlacementRetryDisposition, PodNodePlacement, PodTrackingCleanupCause, SandboxExecutionClaim,
-    StartedRecoveryReplacement, StartedRecoveryRestoreContext, StartedRecoveryRestoreSource,
-    stopped_evacuation_pending,
+    MissingPodTrackingCleanupOutcome, PlacementRetryDisposition, PodNodePlacement,
+    PodTrackingCleanupCause, SandboxExecutionClaim, StartedRecoveryReplacement,
+    StartedRecoveryRestoreContext, StartedRecoveryRestoreSource, stopped_evacuation_pending,
 };
 use crate::node_group_placement::{
     PlacementSubject, ResolvePath as NodeGroupResolvePath, ResolvedPlacement, RestoreSourceNode,
@@ -47,6 +47,7 @@ pub(super) use delete::retry_kube_throttling;
 use delete::{K8S_THROTTLE_RETRY_ATTEMPTS, lingering_sandbox_pod_names};
 #[cfg(test)]
 use ensure_pod::restore_placement_sample;
+pub(super) use read::PooledClaimPodObservation;
 #[cfg(test)]
 use read::{
     succeeded_pod_publication_grace_remaining, terminal_cleanup_phase_after_uncached_check,
@@ -83,14 +84,7 @@ fn kube_error_for_substrate(operation: &str, err: KubeError) -> SubstrateError {
     // callers return it to their retry owner, avoiding a tight retry loop
     // against an already-overloaded apiserver.
     if is_transient_kube_read_error(&err) {
-        return SubstrateError::Timeout {
-            message: if is_kube_api_throttling_error(&err) {
-                format!("{operation}: Kubernetes API throttling: {err}")
-            } else {
-                format!("{operation}: transient Kubernetes API failure: {err}")
-            },
-            phase: None,
-        };
+        return kube_api_transient_timeout(operation, is_kube_api_throttling_error(&err), err);
     }
     SubstrateError::Failed {
         message: format!("{operation}: {err}"),

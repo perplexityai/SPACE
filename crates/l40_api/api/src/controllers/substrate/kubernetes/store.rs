@@ -577,6 +577,20 @@ pub(super) enum FailedRecoveryPodAbsenceOutcome {
     ConvergedSuspended,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MissingPodTrackingCleanupOutcome {
+    Forgotten,
+    DeferredToSuspend,
+    NotMatched,
+    SandboxAbsent,
+}
+
+impl MissingPodTrackingCleanupOutcome {
+    pub(super) const fn is_forgotten(self) -> bool {
+        matches!(self, Self::Forgotten)
+    }
+}
+
 impl ActiveExecutionState {
     pub(super) const fn as_str(self) -> &'static str {
         match self {

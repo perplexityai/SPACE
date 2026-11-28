@@ -587,13 +587,23 @@ pub(super) struct SandboxPodWriter {
 
 impl SandboxPodWriter {
     pub(super) fn apply_watcher_event(&mut self, event: &watcher::Event<SandboxPodView>) {
-        // Indexes first. It matters at `InitDone`: the store's swap releases
-        // the readiness waiters, and nothing ready should read an index that
-        // hasn't caught up. No reader joins them, so the brief lead on other
-        // events is harmless.
+        // `network_slots` always leads `store` so readiness waiters woken at
+        // `InitDone` never read a slot index that hasn't caught up. For
+        // `client_pods`, `Init` and `InitApply` run before `store` so
+        // `healthy_watch_generation()` clears before a re-list begins, while
+        // events that restore health run *after* `store` updates: `InitDone`
+        // publishes only after the rebuilt store swaps in so re-lists never
+        // expose pre-disconnect entries under a healthy generation, and
+        // incremental `Apply`/`Delete` resume from `last_resource_version`
+        // updates `store` before clearing `watch_failing`.
         self.network_slots.apply(event);
-        self.client_pods.apply(event);
-        self.store.apply_watcher_event(event);
+        if matches!(event, watcher::Event::Init | watcher::Event::InitApply(_)) {
+            self.client_pods.apply(event);
+            self.store.apply_watcher_event(event);
+        } else {
+            self.store.apply_watcher_event(event);
+            self.client_pods.apply(event);
+        }
     }
 
     /// The watch returned an error; see [`ClientLivePods::mark_watch_error`].

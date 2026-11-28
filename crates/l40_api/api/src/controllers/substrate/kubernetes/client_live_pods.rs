@@ -63,6 +63,11 @@ struct ClientLivePodsState {
     /// Set by a watch error or a re-list's start; cleared by the next live
     /// event or the re-list's swap.
     watch_failing: bool,
+    /// Monotonic generation bumped on every watch fault, re-list start,
+    /// re-list swap, and recovery from a faulted watch, so readers bracketing
+    /// `pod_store` detect a fault or re-list that started and finished between
+    /// their two samples.
+    watch_generation: u64,
 }
 
 #[derive(Default)]
@@ -176,6 +181,7 @@ impl ClientLivePods {
             watcher::Event::Init => {
                 state.rebuilding = Some(ClientLivePodIndex::default());
                 state.watch_failing = true;
+                state.watch_generation = state.watch_generation.wrapping_add(1);
                 false
             }
             watcher::Event::InitApply(pod) => {
@@ -184,21 +190,35 @@ impl ClientLivePods {
             }
             watcher::Event::InitDone => {
                 state.live = state.rebuilding.take().unwrap_or_default();
+                state.watch_generation = state.watch_generation.wrapping_add(1);
                 true
             }
         };
-        if delivering {
+        if delivering && state.watch_failing {
             state.watch_failing = false;
+            if !matches!(event, watcher::Event::InitDone) {
+                state.watch_generation = state.watch_generation.wrapping_add(1);
+            }
         }
     }
 
     /// The watch returned an error, or its stream ended: stop trusting the
     /// index until the next live event or completed re-list.
     pub(super) fn mark_watch_error(&self) {
-        self.index
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .watch_failing = true;
+        let mut state = self.index.write().unwrap_or_else(PoisonError::into_inner);
+        state.watch_failing = true;
+        state.watch_generation = state.watch_generation.wrapping_add(1);
+    }
+
+    /// The current watch generation when `ready` (initial list completed) and
+    /// the watch is healthy (`!watch_failing`), or `None` while cold, faulted,
+    /// ended, or mid-re-list.
+    pub(super) fn healthy_watch_generation(&self, ready: bool) -> Option<u64> {
+        if !ready {
+            return None;
+        }
+        let state = self.index.read().unwrap_or_else(PoisonError::into_inner);
+        (!state.watch_failing).then_some(state.watch_generation)
     }
 
     /// Count the distinct sandboxes, other than `activating` and those in

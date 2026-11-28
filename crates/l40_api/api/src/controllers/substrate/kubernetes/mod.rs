@@ -1030,6 +1030,7 @@ impl KubernetesSubstrate {
     #[cfg(test)]
     pub(crate) fn mark_pod_watch_error_for_test(&self) {
         self.pod_client_index.mark_watch_error();
+        self.pod_events.notify_state_change_for_test();
     }
 
     /// Count `ids`'s live sandboxes from the sandbox-pod reflector. See

@@ -301,6 +301,30 @@ impl K8sStore {
         Ok(finished)
     }
 
+    pub(super) async fn finish_active_execution_generation_pod_uid_in(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        sandbox_id: SandboxId,
+        generation: i64,
+        expected_pod_uid: Option<&str>,
+        state: &str,
+    ) -> Result<bool, SubstrateError> {
+        let finished = pplx_space_sandbox_store::k8s_executions::retire::finish_generation_pod_uid(
+            &mut **tx,
+            sandbox_id,
+            generation,
+            expected_pod_uid,
+            state,
+        )
+        .await
+        .db_context("failed to finish pod-UID-fenced Kubernetes execution")?;
+        if finished {
+            self.invalidate_open_port_exposure_observations_in(tx, sandbox_id)
+                .await?;
+        }
+        Ok(finished)
+    }
+
     async fn invalidate_open_port_exposure_observations_in(
         &self,
         tx: &mut Transaction<'_, Postgres>,

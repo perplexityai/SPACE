@@ -1516,6 +1516,7 @@ mod k8s_store_postgres_behaviors {
         persist_pod_metadata_reports_recovering_state_unchanged,
         forget_pod_tracking_if_generation_does_not_forget_newer_active_execution,
         forget_pod_tracking_if_generation_does_not_forget_successor_attempt,
+        forget_missing_pod_tracking_if_generation_and_pod_uid_does_not_forget_successor_pod,
         forget_pod_tracking_defers_to_suspend_finalization,
         explicit_teardown_forget_retires_execution_while_suspending,
         forget_pod_tracking_recovers_markerless_restoring_with_ready_snapshot,
@@ -5194,6 +5195,86 @@ async fn forget_pod_tracking_if_generation_does_not_forget_successor_attempt(
     .fetch_one(&fixture.pool)
     .await?;
     assert_eq!(active_attempt, Some(successor_attempt.as_uuid()));
+
+    Ok(())
+}
+
+async fn forget_missing_pod_tracking_if_generation_and_pod_uid_does_not_forget_successor_pod(
+    fixture: &PostgresStore,
+) -> TestResult {
+    let sandbox_id = SandboxId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, "started").await?;
+    let execution = fixture
+        .store
+        .ensure_active_execution_row(sandbox_id)
+        .await?;
+    let _ = fixture
+        .store
+        .persist_pod_metadata(
+            sandbox_id,
+            execution.generation,
+            Some("uid-successor"),
+            Some("10.244.0.42"),
+            None,
+        )
+        .await?;
+
+    let mismatched_outcome = fixture
+        .store
+        .forget_missing_pod_tracking_if_generation_and_pod_uid(
+            sandbox_id,
+            execution.generation,
+            Some("uid-stale"),
+        )
+        .await?;
+    assert_eq!(
+        mismatched_outcome,
+        MissingPodTrackingCleanupOutcome::NotMatched,
+        "a stale missing-pod observation must not retire a same-generation successor pod"
+    );
+
+    let unmaterialized_outcome = fixture
+        .store
+        .forget_missing_pod_tracking_if_generation_and_pod_uid(
+            sandbox_id,
+            execution.generation,
+            None,
+        )
+        .await?;
+    assert_eq!(
+        unmaterialized_outcome,
+        MissingPodTrackingCleanupOutcome::NotMatched,
+        "an unmaterialized missing-pod observation must not retire a materialized successor pod"
+    );
+
+    let active = fixture
+        .store
+        .active_execution_status(sandbox_id)
+        .await?
+        .expect("same-generation successor execution must stay active");
+    assert_eq!(active.generation, execution.generation);
+    assert_eq!(
+        active.pod_uid.as_ref().map(PodUid::as_str),
+        Some("uid-successor")
+    );
+    assert_eq!(active.pod_ip.as_deref(), Some("10.244.0.42"));
+
+    let matched_outcome = fixture
+        .store
+        .forget_missing_pod_tracking_if_generation_and_pod_uid(
+            sandbox_id,
+            execution.generation,
+            Some("uid-successor"),
+        )
+        .await?;
+    assert_eq!(matched_outcome, MissingPodTrackingCleanupOutcome::Forgotten);
+    assert!(
+        fixture
+            .store
+            .active_execution_status(sandbox_id)
+            .await?
+            .is_none()
+    );
 
     Ok(())
 }

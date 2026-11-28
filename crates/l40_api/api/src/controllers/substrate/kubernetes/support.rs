@@ -650,12 +650,12 @@ pub(super) fn terminal_pod_phase(pod: &SandboxPodView) -> Option<TerminalPodPhas
     }
 }
 
-/// True if the pod is in a status that callers of `read_sandbox_pod` branch
-/// on: it has been assigned an IP, or it has reached a terminal phase, or
-/// the scheduler has flagged it unschedulable. Anything else (notably
-/// pre-binding `Pending` with no IP) is treated as cache-stale so the
-/// reflector watch lag cannot stall callers that are already past the
-/// per-pod watch.
+/// True if the pod is in a status that resolution and readiness callers can act
+/// on without requiring a healthy reflector watch: it has been assigned an IP,
+/// reached a terminal phase, or been flagged unschedulable by the scheduler.
+/// Pre-binding `Pending` without an IP is trusted from the cache only while the
+/// sandbox-pod reflector watch is healthy (see `CacheTrustPolicy` in
+/// `pod_ops/read.rs`).
 pub(super) fn pod_status_is_settled(pod: &SandboxPodView) -> bool {
     assigned_pod_ip(pod).ok().flatten().is_some()
         || terminal_pod_phase(pod).is_some()
@@ -1470,6 +1470,37 @@ pub(super) fn command_ready_timeout_error(
     }
 }
 
+/// Shared marker embedded in Kubernetes apiserver read/throttling errors so
+/// [`is_nodemgr_unreachable`] distinguishes apiserver `Unavailable` / `Timeout`
+/// errors from node-manager gRPC transport outages without relying on ad-hoc
+/// prose at each call site.
+pub(super) const KUBE_API_ERROR_MARKER: &str = "Kubernetes API";
+
+pub(super) fn kube_api_unavailable(
+    error_context: &str,
+    detail: impl std::fmt::Display,
+) -> SubstrateError {
+    SubstrateError::Unavailable {
+        message: format!("{error_context}: {KUBE_API_ERROR_MARKER} {detail}"),
+    }
+}
+
+pub(super) fn kube_api_transient_timeout(
+    operation: &str,
+    throttled: bool,
+    err: impl std::fmt::Display,
+) -> SubstrateError {
+    let message = if throttled {
+        format!("{operation}: {KUBE_API_ERROR_MARKER} throttling: {err}")
+    } else {
+        format!("{operation}: transient {KUBE_API_ERROR_MARKER} failure: {err}")
+    };
+    SubstrateError::Timeout {
+        message,
+        phase: None,
+    }
+}
+
 /// Heuristic: does this error look like "node-mgr is unreachable / down"?
 /// Used to gate the cascade-amplifier defer-cleanup path. The
 /// inner gRPC errors that surface from `wait_for_pod_proxy_reachable` and
@@ -1495,6 +1526,10 @@ pub(super) fn is_nodemgr_unreachable(err: &SubstrateError) -> bool {
         _ => return false,
     };
     let m = message.to_ascii_lowercase();
+    let kube_api_marker = KUBE_API_ERROR_MARKER.to_ascii_lowercase();
+    if m.contains(kube_api_marker.as_str()) || m.contains("kube apiserver") {
+        return false;
+    }
     // Specific tonic transport phrases — avoids spurious matches on
     // unrelated words containing the "connect" substring ("reconnect",
     // "interconnect", arbitrary uses of "connection").

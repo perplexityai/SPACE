@@ -126,20 +126,36 @@ async fn active_attempt(pool: &PgPool, sandbox_id: SandboxId) -> Result<Option<U
     .await?)
 }
 
+/// Verifies create IP-readiness pod `GET` bounds alongside positive watch/poll
+/// readiness:
+/// - `ReadyOnWatch` and `ReadyOnPoll` cover non-failing `Pending` initial `GET`s
+///   that settle via the pod watch or follow-up poll without deleting the pod.
+/// - `GetTimeoutBeforePhaseDeadline` (stalled `readiness_pod_get` timeouts),
+///   `Throttled429`, and `Server503` verify that stalled or transiently failing
+///   readiness `GET`s fail fast with retryable `SubstrateError::Unavailable`
+///   and delete the carrier pod rather than stacking `60s` client `GET`s.
+/// - `PhaseElapsed` verifies an outer readiness phase deadline preempting the
+///   in-flight `GET` surfaces `WaitReadyTimeoutPhase::PodNeverReady`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum StalledGetOutcome {
+enum ReadinessGetOutcome {
     ReadyOnWatch,
     ReadyOnPoll,
+    GetTimeoutBeforePhaseDeadline,
+    Throttled429,
+    Server503,
     PhaseElapsed,
 }
 
 #[rstest::rstest]
-#[case::watch_observes_the_running_pod(StalledGetOutcome::ReadyOnWatch)]
-#[case::polling_recovers_when_the_watch_ends(StalledGetOutcome::ReadyOnPoll)]
-#[case::the_phase_deadline_preempts_the_get(StalledGetOutcome::PhaseElapsed)]
+#[case::watch_observes_the_running_pod(ReadinessGetOutcome::ReadyOnWatch)]
+#[case::polling_recovers_when_the_watch_ends(ReadinessGetOutcome::ReadyOnPoll)]
+#[case::get_timeout_fails_fast(ReadinessGetOutcome::GetTimeoutBeforePhaseDeadline)]
+#[case::throttled_429_fails_fast(ReadinessGetOutcome::Throttled429)]
+#[case::server_503_fails_fast(ReadinessGetOutcome::Server503)]
+#[case::the_phase_deadline_preempts_the_get(ReadinessGetOutcome::PhaseElapsed)]
 #[tokio::test(flavor = "current_thread")]
 async fn create_bounds_stalled_readiness_pod_gets(
-    #[case] expected: StalledGetOutcome,
+    #[case] expected: ReadinessGetOutcome,
 ) -> TestResult {
     if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
         return Ok(());
@@ -151,86 +167,150 @@ async fn create_bounds_stalled_readiness_pod_gets(
     let pod_name = Arc::new(Mutex::new(String::new()));
     let reply_pod_name = Arc::clone(&pod_name);
     let pod_gets = AtomicUsize::new(0);
-    let stalled_gets = if expected == StalledGetOutcome::ReadyOnPoll {
-        2
-    } else {
-        1
-    };
     let (client, log) = scripted_kube_client(move |request| {
         let mut pod_name = reply_pod_name.lock().unwrap();
+        let pending =
+            |name: &str| sandbox_pod(name, &format!("{name}-uid"), sandbox_id, 1, "Pending", None);
         match request.method {
             Method::POST if request.path == PODS_PATH => {
                 *pod_name = requested_pod_name(request);
-                pod_reply(&running_pod(&pod_name, sandbox_id, None))
+                pod_reply(&pending(&pod_name))
             }
-            Method::GET if request.path == pod_path(&pod_name) => {
-                if pod_gets.fetch_add(1, Ordering::Relaxed) < stalled_gets {
-                    KubeReply::Hang
-                } else if expected == StalledGetOutcome::PhaseElapsed {
-                    kube_status(StatusCode::NOT_FOUND, "NotFound")
-                } else {
-                    pod_reply(&running_pod(&pod_name, sandbox_id, Some(WORKER_NODE)))
+            Method::GET if request.path == pod_path(&pod_name) => match expected {
+                ReadinessGetOutcome::ReadyOnWatch => pod_reply(&pending(&pod_name)),
+                ReadinessGetOutcome::ReadyOnPoll => {
+                    if pod_gets.fetch_add(1, Ordering::Relaxed) == 0 {
+                        pod_reply(&pending(&pod_name))
+                    } else {
+                        pod_reply(&running_pod(&pod_name, sandbox_id, Some(WORKER_NODE)))
+                    }
                 }
+                ReadinessGetOutcome::GetTimeoutBeforePhaseDeadline => KubeReply::Hang,
+                ReadinessGetOutcome::PhaseElapsed => {
+                    if pod_gets.fetch_add(1, Ordering::Relaxed) == 0 {
+                        KubeReply::Hang
+                    } else {
+                        kube_status(StatusCode::NOT_FOUND, "NotFound")
+                    }
+                }
+                ReadinessGetOutcome::Throttled429 => {
+                    kube_status(StatusCode::TOO_MANY_REQUESTS, "TooManyRequests")
+                }
+                ReadinessGetOutcome::Server503 => {
+                    kube_status(StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable")
+                }
+            },
+            Method::DELETE if request.path == pod_path(&pod_name) => {
+                kube_status(StatusCode::OK, "Success")
             }
             Method::GET
-                if request.path == PODS_PATH && expected == StalledGetOutcome::ReadyOnPoll =>
+                if request.path == PODS_PATH && expected == ReadinessGetOutcome::ReadyOnWatch =>
             {
-                KubeReply::WatchEvents(vec![])
-            }
-            Method::GET if request.path == PODS_PATH => {
                 KubeReply::WatchEvents(vec![serde_json::json!({
                     "type": "MODIFIED",
                     "object": running_pod(&pod_name, sandbox_id, Some(WORKER_NODE)),
                 })])
             }
+            Method::GET if request.path == PODS_PATH => KubeReply::WatchEvents(vec![]),
             _ => kube_status(StatusCode::BAD_REQUEST, "BadRequest"),
         }
     });
     let mut substrate = substrate_on(db.pool.clone(), client, &worker);
-    if expected == StalledGetOutcome::PhaseElapsed {
-        substrate.budgets.readiness_pod_get = Duration::from_secs(1);
-    } else {
-        substrate.budgets.create_ready = Duration::from_millis(1_300);
-        substrate.budgets.readiness_pod_get = Duration::from_millis(40);
+    match expected {
+        ReadinessGetOutcome::PhaseElapsed => {
+            substrate.budgets.readiness_pod_get = Duration::from_secs(1);
+        }
+        ReadinessGetOutcome::ReadyOnWatch | ReadinessGetOutcome::ReadyOnPoll => {
+            substrate.budgets.create_ready = Duration::from_millis(2_000);
+            substrate.budgets.readiness_pod_get = Duration::from_millis(250);
+        }
+        ReadinessGetOutcome::GetTimeoutBeforePhaseDeadline
+        | ReadinessGetOutcome::Throttled429
+        | ReadinessGetOutcome::Server503 => {
+            substrate.budgets.create_ready = Duration::from_millis(1_300);
+            substrate.budgets.readiness_pod_get = Duration::from_millis(40);
+        }
     }
     let inputs = CreateInputs::new();
     let template_ref = inputs.template_ref();
     let mut request = inputs.create_request(sandbox_id, &template_ref);
     request.wait_until_ready = false;
 
-    let outcome = tokio::time::timeout(Duration::from_secs(2), substrate.create_execution(request))
+    let outcome = tokio::time::timeout(Duration::from_secs(3), substrate.create_execution(request))
         .await
         .map_err(|_| "create exceeded its readiness and cleanup budgets")?;
     let gets = requests_matching(&log, &Method::GET);
     let watched = gets.iter().any(|r| r.path == PODS_PATH);
-    if expected == StalledGetOutcome::PhaseElapsed {
-        let Err(error) = outcome else {
-            panic!("expected the IP readiness phase to expire, but create succeeded");
-        };
-        assert!(
-            matches!(
-                error,
-                SubstrateError::Timeout {
-                    phase: Some(WaitReadyTimeoutPhase::PodNeverReady),
-                    ..
-                }
-            ),
-            "expected the IP readiness phase to expire: {error:?}"
-        );
-        assert!(!watched, "the elapsed phase has no time left to watch");
-    } else {
-        let outcome = outcome?;
-        assert_eq!(outcome.active_node_id, Some(worker_node_id()));
-        assert!(
-            outcome.binding.is_some(),
-            "create must observe a reachable pod"
-        );
-        assert!(watched, "start the pod watch after the stalled GET");
-    }
-    assert!(requests_matching(&log, &Method::DELETE).is_empty());
     let pod_name = pod_name.lock().unwrap();
     let named_pod_path = pod_path(&pod_name);
-    assert!(gets.iter().filter(|r| r.path == named_pod_path).count() > stalled_gets);
+    match expected {
+        ReadinessGetOutcome::ReadyOnWatch | ReadinessGetOutcome::ReadyOnPoll => {
+            let outcome = outcome?;
+            assert_eq!(outcome.active_node_id, Some(worker_node_id()));
+            assert!(
+                outcome.binding.is_some(),
+                "create must observe a reachable pod"
+            );
+            assert!(watched, "start the pod watch after the Pending initial GET");
+            assert!(requests_matching(&log, &Method::DELETE).is_empty());
+            if expected == ReadinessGetOutcome::ReadyOnPoll {
+                assert!(gets.iter().filter(|r| r.path == named_pod_path).count() >= 2);
+            }
+        }
+        ReadinessGetOutcome::PhaseElapsed => {
+            assert!(
+                !watched,
+                "an elapsed readiness GET must not open a pod watch"
+            );
+            assert_eq!(
+                gets.iter().filter(|r| r.path == named_pod_path).count(),
+                // 1 readiness GET (preempted by the phase deadline) + 1 post-timeout
+                // `err_defers_cleanup` check (`preservable_create_node` short-circuits
+                // without a GET because `row.pod_ip` is still `None`).
+                2,
+                "readiness fallback must not stack a second readiness GET on the named pod"
+            );
+            let Err(error) = outcome else {
+                panic!("expected the IP readiness phase to expire, but create succeeded");
+            };
+            assert!(
+                matches!(
+                    error,
+                    SubstrateError::Timeout {
+                        phase: Some(WaitReadyTimeoutPhase::PodNeverReady),
+                        ..
+                    }
+                ),
+                "expected the IP readiness phase to expire: {error:?}"
+            );
+            assert!(requests_matching(&log, &Method::DELETE).is_empty());
+        }
+        ReadinessGetOutcome::GetTimeoutBeforePhaseDeadline
+        | ReadinessGetOutcome::Throttled429
+        | ReadinessGetOutcome::Server503 => {
+            assert!(
+                !watched,
+                "a failed readiness fallback GET must not open a pod watch"
+            );
+            assert_eq!(
+                gets.iter().filter(|r| r.path == named_pod_path).count(),
+                1,
+                "readiness fallback must not stack a second readiness GET on the named pod"
+            );
+            let Err(error) = outcome else {
+                panic!("expected the readiness fallback GET to fail fast with Unavailable");
+            };
+            assert!(
+                matches!(error, SubstrateError::Unavailable { .. }),
+                "expected retryable Unavailable on readiness fallback GET failure: {error:?}"
+            );
+            assert_eq!(
+                requests_matching(&log, &Method::DELETE).len(),
+                1,
+                "apiserver Unavailable on readiness GET cleans up the carrier pod rather than deferring as node-mgr unreachable"
+            );
+        }
+    }
     Ok(())
 }
 

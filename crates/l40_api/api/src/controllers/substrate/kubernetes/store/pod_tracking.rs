@@ -6,6 +6,13 @@ use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_store::k8s_executions::pod_tracking as k8s_execution_pod_tracking;
 use pplx_space_sandbox_store::pod_tracking;
 
+#[derive(Clone, Copy)]
+enum GenerationRetirementGuard<'a> {
+    Any,
+    Attempt(pplx_space_sandbox_model::SandboxActivationAttemptId),
+    PodUid(Option<&'a str>),
+}
+
 impl K8sStore {
     pub(in crate::controllers::substrate::kubernetes) async fn forget_pod_tracking(
         &self,
@@ -58,10 +65,29 @@ impl K8sStore {
         self.finish_execution_and_clear_pod_tracking_if_generation(
             sandbox_id,
             generation,
-            None,
+            GenerationRetirementGuard::Any,
             "forgotten",
             StartedSuspendRecoveryOperation::TerminalPodCleanup,
             cause,
+            PlacementClock::Bump,
+        )
+        .await
+        .map(MissingPodTrackingCleanupOutcome::is_forgotten)
+    }
+
+    pub(in crate::controllers::substrate::kubernetes) async fn forget_missing_pod_tracking_if_generation_and_pod_uid(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+        expected_pod_uid: Option<&str>,
+    ) -> Result<MissingPodTrackingCleanupOutcome, SubstrateError> {
+        self.finish_execution_and_clear_pod_tracking_if_generation(
+            sandbox_id,
+            generation,
+            GenerationRetirementGuard::PodUid(expected_pod_uid),
+            "forgotten",
+            StartedSuspendRecoveryOperation::TerminalPodCleanup,
+            PodTrackingCleanupCause::MissingPodObservation,
             PlacementClock::Bump,
         )
         .await
@@ -411,13 +437,14 @@ impl K8sStore {
         self.finish_execution_and_clear_pod_tracking_if_generation(
             sandbox_id,
             generation,
-            Some(activation_attempt_id),
+            GenerationRetirementGuard::Attempt(activation_attempt_id),
             "forgotten",
             StartedSuspendRecoveryOperation::TerminalPodCleanup,
             PodTrackingCleanupCause::ExplicitTeardown,
             PlacementClock::Bump,
         )
         .await
+        .map(MissingPodTrackingCleanupOutcome::is_forgotten)
     }
 
     /// Whether the execution that names `pod_name` at `generation` is already
@@ -449,13 +476,14 @@ impl K8sStore {
         self.finish_execution_and_clear_pod_tracking_if_generation(
             sandbox_id,
             generation,
-            None,
+            GenerationRetirementGuard::Any,
             "replaced",
             StartedSuspendRecoveryOperation::StalePodReplacementCleanup,
             PodTrackingCleanupCause::ExplicitTeardown,
             PlacementClock::Bump,
         )
         .await
+        .map(MissingPodTrackingCleanupOutcome::is_forgotten)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -463,12 +491,12 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
         generation: i64,
-        activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
+        guard: GenerationRetirementGuard<'_>,
         state: &str,
         recovery_operation: StartedSuspendRecoveryOperation,
         cause: PodTrackingCleanupCause,
         placement_clock: PlacementClock,
-    ) -> Result<bool, SubstrateError> {
+    ) -> Result<MissingPodTrackingCleanupOutcome, SubstrateError> {
         let mut tx = self
             .pool
             .begin()
@@ -476,7 +504,7 @@ impl K8sStore {
             .db_context("failed to start pod tracking cleanup transaction")?;
 
         if !Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await? {
-            return Ok(false);
+            return Ok(MissingPodTrackingCleanupOutcome::SandboxAbsent);
         }
 
         if cause == PodTrackingCleanupCause::MissingPodObservation
@@ -489,27 +517,40 @@ impl K8sStore {
                 "deferring generation-scoped pod tracking cleanup: suspend finalization owns \
                  this pod teardown"
             );
-            return Ok(false);
+            return Ok(MissingPodTrackingCleanupOutcome::DeferredToSuspend);
         }
 
-        let finished = if let Some(activation_attempt_id) = activation_attempt_id {
-            self.finish_active_execution_generation_attempt_in(
-                &mut tx,
-                sandbox_id,
-                generation,
-                activation_attempt_id,
-                state,
-            )
-            .await?
-        } else {
-            self.finish_active_execution_generation_in(&mut tx, sandbox_id, generation, state)
+        let finished = match guard {
+            GenerationRetirementGuard::Any => {
+                self.finish_active_execution_generation_in(&mut tx, sandbox_id, generation, state)
+                    .await?
+            }
+            GenerationRetirementGuard::Attempt(activation_attempt_id) => {
+                self.finish_active_execution_generation_attempt_in(
+                    &mut tx,
+                    sandbox_id,
+                    generation,
+                    activation_attempt_id,
+                    state,
+                )
                 .await?
+            }
+            GenerationRetirementGuard::PodUid(expected_pod_uid) => {
+                self.finish_active_execution_generation_pod_uid_in(
+                    &mut tx,
+                    sandbox_id,
+                    generation,
+                    expected_pod_uid,
+                    state,
+                )
+                .await?
+            }
         };
         if !finished {
             tx.commit()
                 .await
                 .db_context("failed to commit pod tracking cleanup transaction")?;
-            return Ok(false);
+            return Ok(MissingPodTrackingCleanupOutcome::NotMatched);
         }
 
         // Create-cleanup abandonment is delete-shaped (a never-succeeded pod)
@@ -535,7 +576,7 @@ impl K8sStore {
             );
             emit_started_suspend_recovery_event(sandbox_id, recovery_operation);
         }
-        Ok(true)
+        Ok(MissingPodTrackingCleanupOutcome::Forgotten)
     }
 
     pub(super) async fn clear_pod_tracking_in(

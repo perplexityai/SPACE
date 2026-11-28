@@ -2603,6 +2603,9 @@ impl SandboxController {
             AdmittedPoolClaimLookup::ReleasePending => {
                 return Err(admitted_pool_slot_release_pending());
             }
+            AdmittedPoolClaimLookup::Transient => {
+                return Err(admitted_pool_lookup_transient());
+            }
             AdmittedPoolClaimLookup::Adoptable { claim, pool_shape } => (*claim, pool_shape),
         };
 
@@ -3193,6 +3196,19 @@ fn adoption_label_transient() -> ControllerError {
 fn admitted_adoption_label_transient() -> ControllerError {
     ControllerError::service_unavailable(
         "the Kubernetes apiserver failed transiently; the retry adopts the same warm-pool slot",
+    )
+    .with_retry_after_header(ADOPTION_LABEL_TRANSIENT_RETRY)
+    .with_retry_after_cause(ControllerRetryAfterCause::PoolSlotRelease)
+}
+
+/// An admitted create whose warm-pool pod couldn't be verified yet (the
+/// reflector cache still shows the pod pre-`Running` or the fallback apiserver
+/// read failed transiently). Its claim is kept, so the retry adopts the same
+/// slot; like a pending release, that's workflow progress rather than a failed
+/// attempt.
+fn admitted_pool_lookup_transient() -> ControllerError {
+    ControllerError::service_unavailable(
+        "the admitted warm-pool pod could not be verified yet; the retry adopts the same warm-pool slot",
     )
     .with_retry_after_header(ADOPTION_LABEL_TRANSIENT_RETRY)
     .with_retry_after_cause(ControllerRetryAfterCause::PoolSlotRelease)

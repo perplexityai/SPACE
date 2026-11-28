@@ -26,6 +26,19 @@ view doesn't carry, add it to the view and its conversion; don't add a second
 cache or fall back to a full-object GET to get it. Annotation and label reads go
 through `SandboxPodKey`, which is also the set of keys the conversion keeps.
 
+Hot-path pod reads go through the reflector (`lookup_sandbox_pod`,
+`read_sandbox_pod`, or `read_pooled_claim_pod`), not `read_sandbox_pod_uncached`
+or `fetch_sandbox_pod_uncached`. While the reflector has completed its initial
+sync and its watch isn't faulted or mid-re-list, cached `Pending` pods are
+authoritative too — don't bypass the cache merely because a pod lacks an IP yet.
+Reserve uncached `GET`s for degraded-reflector fallback and confirming absence
+or terminal phase before destructive cleanup, and route readiness, reachability,
+and warm-pool fallback `GET`s through `fetch_sandbox_pod_bounded` or
+`fetch_sandbox_pod_until_deadline` (via `get_pod_for_resolution`,
+`resolve_reachable_pod_ip`, or `read_pooled_claim_pod`) so `429`, `5xx`, and
+per-`GET` timeouts fail fast with retryable `SubstrateError::Unavailable`
+instead of stacking overlapping client `GET`s.
+
 ## Substrate contract
 
 Both substrates are supported. Kubernetes runs production. Direct

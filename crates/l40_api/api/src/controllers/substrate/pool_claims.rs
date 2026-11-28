@@ -195,6 +195,11 @@ pub enum AdmittedPoolClaimLookup {
     /// pool's own cleanup collects it; until then a cold create under this ID
     /// would leave that pod with nothing to collect it, so the caller waits.
     ReleasePending,
+    /// The admitted slot's pod couldn't be verified yet (for example, a
+    /// healthy reflector still holds a pre-`Running` snapshot or a degraded
+    /// fallback read failed transiently). The claim is kept so a retry of the
+    /// same operation adopts the same slot without retiring warm capacity.
+    Transient,
 }
 
 pub struct PooledExecutionClaimAttempt {

@@ -1,5 +1,6 @@
 //! `SubstrateAdapter` implementation for `KubernetesSubstrate`.
 
+use super::pod_ops::PooledClaimPodObservation;
 use super::pooled::PooledPodEnvironment;
 use super::*;
 use crate::controllers::substrate::runtime_upgrade::UpgradeActivation;
@@ -1673,8 +1674,27 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 return Ok(claim_attempt);
             };
 
-            let pod = match self.read_sandbox_pod(&claim.pod_name).await {
-                Ok(pod) => pod,
+            let pod = match self
+                .read_pooled_claim_pod(
+                    &claim,
+                    "failed to validate claimed Kubernetes warm-pool pod",
+                )
+                .await
+            {
+                Ok(PooledClaimPodObservation::Observed(pod)) => pod,
+                Ok(PooledClaimPodObservation::ReflectorLagging) => {
+                    pool::release_claimed_pool_slot(self.store.pool(), &claim).await?;
+                    tracing::info!(
+                        claim_id = %claim.claim_id,
+                        sandbox_id = %claim.sandbox_id,
+                        pod_name = %claim.pod_name,
+                        attempt,
+                        "reflector still shows claimed Kubernetes warm-pool pod pre-Running; released claim without retiring slot"
+                    );
+                    return Ok(PooledExecutionClaimAttempt::missed(
+                        claim_attempt.pool_shape,
+                    ));
+                }
                 Err(error) => {
                     pool::release_claimed_pool_slot(self.store.pool(), &claim).await?;
                     tracing::warn!(
@@ -2251,14 +2271,20 @@ impl SubstrateAdapter for KubernetesSubstrate {
         };
 
         // The same pod and placement checks `claim_pooled_execution` makes,
-        // with one difference in how a slot is given up. The ordinary claim
-        // may `release` a slot that is fine for another caller; this slot's
-        // reserved ID is already this create's public ID, so returning it to
-        // the inventory would let another create bind the same ID. Every
-        // refusal here invalidates instead: the slot leaves the inventory, the
-        // stale-claimed sweep collects its pod, and this create builds cold.
-        let usable = match self.read_sandbox_pod(&claim.pod_name).await {
-            Ok(pod) => {
+        // with one difference in how a definitive usability or placement
+        // refusal gives up a slot. The ordinary claim may `release` a slot
+        // that is fine for another caller; this slot's reserved ID is already
+        // this create's public ID, so returning it to the inventory would let
+        // another create bind the same ID. Definitive refusals here invalidate
+        // instead (the slot leaves the inventory, the stale-claimed sweep
+        // collects its pod, and this create builds cold), while reflector lag
+        // or transient apiserver read failures return `Transient` so the
+        // caller retries the same claim without retiring the slot.
+        let usable = match self
+            .read_pooled_claim_pod(&claim, "failed to read the admitted warm-pool pod")
+            .await
+        {
+            Ok(PooledClaimPodObservation::Observed(pod)) => {
                 pooled_claim_pod_is_usable(&claim, pod.as_deref())
                     && self
                         .admitted_pool_pod_placement_admits(request, pod.as_deref())
@@ -2278,6 +2304,25 @@ impl SubstrateAdapter for KubernetesSubstrate {
                             false
                         }
                     }
+            }
+            Ok(PooledClaimPodObservation::ReflectorLagging) => {
+                tracing::info!(
+                    claim_id = %claim.claim_id,
+                    sandbox_id = %claim.sandbox_id,
+                    pod_name = %claim.pod_name,
+                    "reflector still shows admitted warm-pool pod pre-Running; keeping claim for retry"
+                );
+                return Ok(AdmittedPoolClaimLookup::Transient);
+            }
+            Err(error @ (SubstrateError::Unavailable { .. } | SubstrateError::Timeout { .. })) => {
+                tracing::warn!(
+                    claim_id = %claim.claim_id,
+                    sandbox_id = %claim.sandbox_id,
+                    pod_name = %claim.pod_name,
+                    %error,
+                    "failed transiently to read the admitted warm-pool pod; keeping claim for retry"
+                );
+                return Ok(AdmittedPoolClaimLookup::Transient);
             }
             Err(error) => {
                 tracing::warn!(
