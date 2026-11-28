@@ -1,28 +1,37 @@
 use super::*;
 
 #[tokio::test]
-async fn wait_for_returns_true_on_matching_event() {
-    let (events, tx) = PodEvents::new();
+async fn wait_for_returns_true_on_matching_event_or_whole_store_wakeup() {
+    let (events, publisher) = PodEvents::new();
     let waiter = tokio::spawn({
         let events = events.clone();
         async move { events.wait_for("pod-a", Duration::from_secs(5)).await }
     });
     // Yield so the waiter subscribes before the send.
     tokio::task::yield_now().await;
-    tx.send("pod-a".to_string()).unwrap();
+    let pod: SandboxPodView = pod_named("pod-a").into();
+    publisher.record_watcher_event(&watcher::Event::Apply(pod));
     assert!(waiter.await.unwrap());
+
+    let whole_store_waiter = tokio::spawn({
+        let events = events.clone();
+        async move { events.wait_for("pod-b", Duration::from_secs(5)).await }
+    });
+    tokio::task::yield_now().await;
+    publisher.record_watch_error();
+    assert!(whole_store_waiter.await.unwrap());
 }
 
 #[tokio::test]
 async fn wait_for_ignores_other_pod_names() {
-    let (events, tx) = PodEvents::new();
+    let (events, publisher) = PodEvents::new();
     let waiter = tokio::spawn({
         let events = events.clone();
         async move { events.wait_for("pod-a", Duration::from_millis(250)).await }
     });
     tokio::task::yield_now().await;
-    tx.send("pod-b".to_string()).unwrap();
-    tx.send("pod-c".to_string()).unwrap();
+    publisher.record_watcher_event(&watcher::Event::Apply(pod_named("pod-b").into()));
+    publisher.record_watcher_event(&watcher::Event::Apply(pod_named("pod-c").into()));
     assert!(!waiter.await.unwrap());
 }
 
@@ -60,18 +69,31 @@ fn slot_pod(name: &str, node: &str, slots: u64) -> Pod {
 }
 
 #[tokio::test]
-async fn reflect_sandbox_pods_updates_store_and_slots_then_broadcasts_touched_names() {
+async fn reflect_sandbox_pods_updates_store_and_slots_then_broadcasts_readable_updates() {
     use futures_util::stream;
     use kube::runtime::watcher::Event;
 
     let (store, indexes, writer) = sandbox_pod_view::sandbox_pod_cache();
     let network_slots = indexes.network_slots;
-    let (_events, tx) = PodEvents::new();
-    let mut rx = tx.subscribe();
+    let client_pods = indexes.client_pods;
+    let (events, publisher) = PodEvents::new();
+    assert_eq!(events.delivery_epoch(), 0);
+    let mut rx = events.subscribe();
 
-    // The broadcast must fire for re-list (`InitApply`), applied and deleted
-    // pods alike, so a suspend-side waiter can observe pod absence without
-    // polling. `Init`/`InitDone` carry no pod and broadcast nothing.
+    // `Init` and `InitApply` only populate `kube-runtime`'s private rebuild
+    // buffer, so they neither advance `delivery_epoch` nor broadcast.
+    // `InitDone` swaps the buffer in, increments `delivery_epoch`, and
+    // broadcasts `""`; `Apply` and `Delete` increment `delivery_epoch` and
+    // broadcast the pod name; stream end marks the watch failing and
+    // broadcasts `""` without advancing `delivery_epoch`.
+    publisher.record_watcher_event(&Event::Init);
+    publisher.record_watcher_event(&Event::InitApply(slot_pod("buffered", "node-a", 1).into()));
+    assert_eq!(
+        events.delivery_epoch(),
+        0,
+        "Init/InitApply must not advance delivery_epoch before InitDone"
+    );
+
     let raw = stream::iter(
         [
             Event::Init,
@@ -83,10 +105,15 @@ async fn reflect_sandbox_pods_updates_store_and_slots_then_broadcasts_touched_na
         .into_iter()
         .map(|event| Ok::<_, watcher::Error>(sandbox_pod_view::sandbox_pod_view_event(event))),
     );
-    reflect_sandbox_pods(raw.boxed(), writer, tx, TEST_NS).await;
+    reflect_sandbox_pods(raw.boxed(), writer, publisher, TEST_NS).await;
 
+    assert_eq!(events.delivery_epoch(), 3);
+    assert!(
+        client_pods.is_watch_failing(),
+        "stream termination marks the live-pod index failing"
+    );
     let seen: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-    assert_eq!(seen, ["pod-listed", "pod-applied", "pod-listed"]);
+    assert_eq!(seen, ["", "pod-applied", "pod-listed", ""]);
     let cached: Vec<String> = store
         .state()
         .iter()
@@ -136,19 +163,19 @@ async fn wait_for_pod_absence_confirms_fast_delete_when_present_before_delete() 
 
 #[tokio::test]
 async fn wait_for_pod_absence_pending_when_only_matching_signal_and_store_absent() {
-    // A name-matching event with the store still absent must NOT confirm: a
-    // reflector re-list broadcasts buffered `InitApply` names for pods that
-    // still exist before swapping them into the readable store, so this is
-    // not proof of a delete. Without a present-then-absent transition the
-    // wait stays Pending and the caller falls back to an authoritative GET.
+    // A name-matching event with the store still absent must NOT confirm: the
+    // broadcast carries no event type (for example, an `Apply` of a terminal
+    // pod filtered from the store), so a matching name + absent store isn't
+    // proof of a delete. Without a present-then-absent transition the wait
+    // stays Pending and the caller falls back to an authoritative GET.
     let (store, _writer) = pod_store_with(&[]);
-    let (events, tx) = PodEvents::new();
+    let (events, publisher) = PodEvents::new();
     let deadline = Instant::now() + Duration::from_millis(150);
 
     let waiter = wait_for_pod_absence(&store, TEST_NS, &events, "pod-a", deadline, false);
     let driver = async {
         tokio::task::yield_now().await;
-        tx.send("pod-a".to_string()).unwrap();
+        publisher.record_watcher_event(&watcher::Event::Apply(pod_named("pod-a").into()));
     };
     let (absence, ()) = tokio::join!(waiter, driver);
     assert_eq!(absence, ReflectorAbsence::Pending);
@@ -162,17 +189,19 @@ async fn wait_for_pod_absence_confirms_when_pod_appears_then_is_deleted() {
     // transition is a real observed delete, so this confirms.
     let pod = pod_named("pod-a");
     let (store, mut writer) = pod_store_with(&[]);
-    let (events, tx) = PodEvents::new();
+    let (events, publisher) = PodEvents::new();
     let deadline = Instant::now() + Duration::from_secs(5);
 
     let waiter = wait_for_pod_absence(&store, TEST_NS, &events, "pod-a", deadline, false);
     let driver = async {
         tokio::task::yield_now().await;
-        writer.apply_watcher_event(&Event::Apply(pod.clone().into()));
-        tx.send("pod-a".to_string()).unwrap();
+        let applied = Event::Apply(pod.clone().into());
+        writer.apply_watcher_event(&applied);
+        publisher.record_watcher_event(&applied);
         tokio::task::yield_now().await;
-        writer.apply_watcher_event(&Event::Delete(pod.clone().into()));
-        tx.send("pod-a".to_string()).unwrap();
+        let deleted = Event::Delete(pod.clone().into());
+        writer.apply_watcher_event(&deleted);
+        publisher.record_watcher_event(&deleted);
     };
     let (absence, ()) = tokio::join!(waiter, driver);
     assert_eq!(absence, ReflectorAbsence::Confirmed);
@@ -183,7 +212,7 @@ async fn wait_for_pod_absence_confirms_on_delete_signal() {
     use kube::runtime::watcher::Event;
     let pod = pod_named("pod-a");
     let (store, mut writer) = pod_store_with(std::slice::from_ref(&pod));
-    let (events, tx) = PodEvents::new();
+    let (events, publisher) = PodEvents::new();
     let deadline = Instant::now() + Duration::from_secs(5);
 
     let waiter = wait_for_pod_absence(&store, TEST_NS, &events, "pod-a", deadline, true);
@@ -191,8 +220,9 @@ async fn wait_for_pod_absence_confirms_on_delete_signal() {
         // Let the waiter take its first (present) store check and subscribe.
         tokio::task::yield_now().await;
         // Mirror the reflector ordering: store updated, then signal fired.
-        writer.apply_watcher_event(&Event::Delete(pod.clone().into()));
-        tx.send("pod-a".to_string()).unwrap();
+        let deleted = Event::Delete(pod.clone().into());
+        writer.apply_watcher_event(&deleted);
+        publisher.record_watcher_event(&deleted);
     };
     let (absence, ()) = tokio::join!(waiter, driver);
     assert_eq!(absence, ReflectorAbsence::Confirmed);
@@ -207,7 +237,7 @@ async fn wait_for_pod_absence_confirms_on_unrelated_event_after_store_drop() {
     // (here `pod-b`) must still wake the waiter to observe the drop.
     let pod = pod_named("pod-a");
     let (store, mut writer) = pod_store_with(std::slice::from_ref(&pod));
-    let (events, tx) = PodEvents::new();
+    let (events, publisher) = PodEvents::new();
     let deadline = Instant::now() + Duration::from_secs(5);
 
     let waiter = wait_for_pod_absence(&store, TEST_NS, &events, "pod-a", deadline, true);
@@ -216,7 +246,7 @@ async fn wait_for_pod_absence_confirms_on_unrelated_event_after_store_drop() {
         // pod-a's delete lands in the store but its signal never arrives;
         // only an unrelated pod-b event fires.
         writer.apply_watcher_event(&Event::Delete(pod.clone().into()));
-        tx.send("pod-b".to_string()).unwrap();
+        publisher.record_watcher_event(&Event::Apply(pod_named("pod-b").into()));
     };
     let (absence, ()) = tokio::join!(waiter, driver);
     assert_eq!(absence, ReflectorAbsence::Confirmed);

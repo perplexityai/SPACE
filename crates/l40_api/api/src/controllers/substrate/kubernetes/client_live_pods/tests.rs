@@ -214,6 +214,10 @@ fn a_relist_replaces_the_index_when_it_completes() {
     let index = seeded([pod("a-1", a, Some("alpha"), "Running", false)]);
     let alpha = CountedIds::Exactly(vec![id("alpha")]);
     index.apply(&Event::Init);
+    assert!(
+        !index.is_watch_failing(),
+        "a healthy re-list does not mark the watch as failing"
+    );
     index.apply(&Event::InitApply(pod(
         "b-1",
         b,
@@ -256,6 +260,7 @@ fn a_cold_or_failing_reflector_answers_unknown() {
         LiveSandboxCount::Known(1)
     );
     index.mark_watch_error();
+    assert!(index.is_watch_failing());
     assert_eq!(
         index.count(&alpha, &exclusions, true),
         LiveSandboxCount::Unknown(LiveSandboxCountUnknown::PodCacheStale)
@@ -267,13 +272,17 @@ fn a_cold_or_failing_reflector_answers_unknown() {
         "Pending",
         false,
     )));
+    assert!(!index.is_watch_failing());
     assert_eq!(
         index.count(&alpha, &exclusions, true),
         LiveSandboxCount::Known(2),
         "an event after the error shows the watch is delivering again"
     );
-    // A re-list keeps the count untrusted until its rebuilt index is in.
+    // A re-list after an error keeps both `is_watch_failing` and the count
+    // untrusted until its rebuilt index swaps in at `InitDone`.
+    index.mark_watch_error();
     index.apply(&Event::Init);
+    assert!(index.is_watch_failing());
     index.apply(&Event::InitApply(pod(
         "c-1",
         SandboxId::new(),
@@ -281,12 +290,14 @@ fn a_cold_or_failing_reflector_answers_unknown() {
         "Running",
         false,
     )));
+    assert!(index.is_watch_failing());
     assert_eq!(
         index.count(&alpha, &exclusions, true),
         LiveSandboxCount::Unknown(LiveSandboxCountUnknown::PodCacheStale),
         "the old index serves until the re-list completes"
     );
     index.apply(&Event::InitDone);
+    assert!(!index.is_watch_failing());
     assert_eq!(
         index.count(&alpha, &exclusions, true),
         LiveSandboxCount::Known(1)

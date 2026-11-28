@@ -206,6 +206,14 @@ const POD_IP_WATCH_TIMEOUT_SECS: u32 = 55;
 /// A short wait can avoid an apiserver GET when the reflector is catching up,
 /// while bounding the delay before falling back to a direct read.
 const REFLECTOR_WAIT_BUDGET: Duration = Duration::from_millis(250);
+/// Quiet-reflector threshold before a readiness wait issues one gated fallback
+/// `GET /pods/{name}` when the pod has never appeared in `pod_store` and no
+/// readable reflector update has landed since the wait began; also the per-waiter
+/// retry interval while the reflector is cold or its watch is failing.
+const READINESS_QUIET_REFLECTOR: Duration = Duration::from_secs(5);
+/// Maximum time a readiness waiter may spend queued behind the replica-wide
+/// fallback gate before failing fast with `503`.
+const READINESS_FALLBACK_WAIT_BUDGET: Duration = Duration::from_secs(5);
 
 /// How long a source-pinned restore waits to observe the scheduler's first
 /// placement decision before it re-drives cross-node in-request. A required
@@ -889,13 +897,17 @@ pub struct KubernetesSubstrate {
     /// events as `pod_store`. Read by the create-path capacity preflight.
     pod_network_slots: NodeNetworkSlots,
     /// Per-client live sandbox-pod index and reflector freshness, written
-    /// from the same reflector events as `pod_store`. Read by the live cap.
+    /// from the same reflector events as `pod_store`. Read by the live cap
+    /// and by IP readiness to detect watch failures.
     pod_client_index: client_live_pods::ClientLivePods,
-    /// Per-pod-name event signaller fed by the same reflector watch. Lets
-    /// `read_sandbox_pod` wait briefly for the next reflector update before
-    /// falling through to a direct `GET` during the brief window between pod
-    /// creation/scheduling and the reflector observing the bind event.
+    /// Per-pod-name event signaller fed by the same reflector watch. Wakes
+    /// IP-readiness, absence, and `read_sandbox_pod` waiters when a pod's
+    /// cached view updates or the watch changes state.
     pod_events: pod_reflector::PodEvents,
+    /// Replica-wide concurrency and launch-rate gate bounding fallback
+    /// `GET /pods/{name}` reads from IP readiness when the reflector is
+    /// degraded or silent.
+    readiness_fallback_gate: Arc<wait_ready::ReadinessFallbackGate>,
     /// Flipped to `true` once the reflector's initial `LIST` populates the
     /// store. Exposed via `Substrate::readiness()` so the HTTP `/readyz`
     /// probe can keep a freshly-spawned replica out of the Service endpoint
@@ -991,6 +1003,7 @@ impl KubernetesSubstrate {
                     pod_network_slots: pod_indexes.network_slots,
                     pod_client_index: pod_indexes.client_pods,
                     pod_events,
+                    readiness_fallback_gate: Arc::default(),
                     pod_reflector_ready,
                     k8s,
                     node_group_placement,
