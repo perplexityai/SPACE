@@ -419,6 +419,20 @@ variable "workers_ami_id" {
   }
 }
 
+variable "workers_cluster_dns_ips" {
+  description = "Ordered DNS server IPs for custom-AMI worker kubelets. Empty leaves clusterDNS unset so nodeadm derives the cluster DNS service address from cluster_service_cidr."
+  type        = list(string)
+  default     = []
+  nullable    = false
+
+  validation {
+    condition = length(var.workers_cluster_dns_ips) <= 3 && alltrue([
+      for ip in var.workers_cluster_dns_ips : can(cidrhost("${ip}${strcontains(ip, ":") ? "/128" : "/32"}", 0))
+    ])
+    error_message = "workers_cluster_dns_ips must contain at most three valid IP addresses."
+  }
+}
+
 variable "workers_ami_name_pattern" {
   description = "Optional name pattern used to resolve the most recent workers AMI when workers_ami_id is unset"
   type        = string
