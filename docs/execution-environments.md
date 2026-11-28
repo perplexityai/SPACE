@@ -126,8 +126,8 @@ Snapshot metadata records the producing runtime, guest platform, environment
 binding when present, and `StateFormatIdentity { format, version }`. This applies
 to sandbox snapshots and template base snapshots. The state format identifies
 the persisted VM state, independently of the runtime's release version. The
-compiled Firecracker catalog currently maps 1.15.1 to format 9.0.0 and 1.17.0 to
-12.0.0; those releases cannot load each other's state under the current adapter.
+compiled Firecracker catalog maps 1.15.1 to format 9.0.0 and 1.17.0 to 12.0.0;
+those releases cannot load each other's state under the Firecracker adapter.
 
 Producer provenance and loader compatibility are separate facts. Preserve the
 snapshot's original producer when a compatible loader is selected; record the
@@ -135,7 +135,7 @@ runtime that actually executes the restored VM separately. A memory restore
 resumes the snapshotted guest kernel. Selecting another guest kernel requires a
 cold boot, even if another VMM can read the memory-state format.
 
-Today, bound snapshots require their exact qualified environment. The legacy
+A bound snapshot requires its exact qualified environment. The legacy
 Firecracker loader predicate in
 [`runtime_inventory.rs`](../crates/l40_api/node/runtime/core/src/runtime_inventory.rs)
 requires the same format name and major version, with the snapshot's minor
@@ -932,8 +932,8 @@ build certifies and which environments the node can cold boot:
   descriptor. It also carries the runtime release's sort key and the
   environment's certified upgrade and memory edges, from
   `CompiledEnvironment::upgrade_targets` and `memory_targets`. "Selecting a
-  restore consumer" below describes which upgrade edges are certified. No
-  memory edge is certified yet, so none is published.
+  restore consumer" below describes which upgrade edges are certified. The
+  catalog certifies no memory edge, so none is published.
 - `usable_environments` lists the known environments this node can cold boot:
   node-manager's startup policy allows the environment, and a new cold boot
   resolves to it from verified artifacts under its own reference. Cluster
@@ -1058,7 +1058,7 @@ over one that doesn't, then the exact spelling of the digest. A candidate
 that holds nothing takes the release's binding, else the one every holder
 whose row names a binding reports, and none when they disagree. For a
 restore it's the checkpoint's.
-Unbound work keeps today's placement in every mode.
+Unbound work places as with `off` in every mode.
 
 A node's published environments are evidence only while all of these hold,
 as `pplx_space_node_status_store::environment_evidence` defines them:
@@ -1528,8 +1528,10 @@ resolution, pod placement, pool claims, the warm-pool autoscaler and the block
 check above. It applies only where creates boot the twin they resolve to: a
 Kubernetes substrate with the placement gate `on`
 (`Substrate::boots_template_twins`), which the substrate refuses at startup
-today. The API and the cluster controller each read the gate
-(`SPACE_ENVIRONMENT_PLACEMENT_GATE`, [configuration.md](configuration.md)):
+while resume-time runtime upgrades
+(`SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED`) are on. The API and the
+cluster controller each read the gate (`SPACE_ENVIRONMENT_PLACEMENT_GATE`,
+[configuration.md](configuration.md)):
 creates and pool claims follow the API's, and the warm-pool autoscaler the
 controller's, so set it the same on both. Anywhere else all of them keep the
 release a tag or digest names, whose build the worker boots, so twins left
@@ -3585,7 +3587,7 @@ cold-boot profile or resident state; cold-boot JSON belongs to those adapters.
 The existing Firecracker restore configuration is still rendered in lifecycle
 code. Snapshot support is never inferred from the presence of an executable.
 
-The Linux direct-boot adapters currently render Firecracker and Cloud Hypervisor
+The Linux direct-boot adapters render Firecracker and Cloud Hypervisor
 configuration. They share validated resource inputs, but own their device model,
 configuration keys and feature admission. Both adapters retain independent RX/TX
 network buckets. Cloud Hypervisor is configured with one queue pair so additional
