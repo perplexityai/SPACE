@@ -438,6 +438,15 @@ pub enum SourceError {
         #[source]
         source: BoxError,
     },
+    #[error("checking {location} failed")]
+    Head {
+        location: Box<KernelLocation>,
+        #[source]
+        source: BoxError,
+    },
+    /// S3 answers 403 for an absent key to a reader without `ListBucket`.
+    #[error("{location} answered 403: the object is absent or these credentials cannot read it")]
+    Forbidden { location: Box<KernelLocation> },
     #[error("downloading {location} failed")]
     Download {
         location: Box<KernelLocation>,
@@ -480,6 +489,21 @@ pub trait KernelSource: Send + Sync {
         line: RuntimeLine,
         architecture: Arch,
     ) -> Result<Vec<SourceKernel>, SourceError>;
+
+    /// The kernel `version` of `line` on `architecture`, when the source
+    /// offers it.
+    async fn find(
+        &self,
+        line: RuntimeLine,
+        architecture: Arch,
+        version: &KernelVersion,
+    ) -> Result<Option<SourceKernel>, SourceError> {
+        Ok(self
+            .list(line, architecture)
+            .await?
+            .into_iter()
+            .find(|kernel| kernel.version == *version))
+    }
 
     /// The bytes of `kernel`, in order. The stream is not bounded as a
     /// whole: the caller bounds how long it waits for each chunk.

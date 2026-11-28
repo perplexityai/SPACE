@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use pplx_space_artifact_model::StorageUri;
 
+use pplx_space_node_runtime_core::catalog::RuntimeCatalog;
 use pplx_space_node_runtime_core::runtime_inventory::RuntimeInstallationRoot;
 
 use crate::installs::{
@@ -58,6 +59,13 @@ pub enum KernelSourceConfig {
     /// The built-in S3 source of Firecracker kernels, read anonymously from
     /// a root laid out as [`crate::FIRECRACKER_CI_KERNEL_SOURCE`] is.
     S3(StorageUri),
+    /// `upstream`, plus the catalog's SPACE-published kernels read with the
+    /// default AWS credential chain from `root`, laid out as
+    /// `<prefix>/vmlinux-<version>/sha256:<hex>/vmlinux.bin`.
+    SpacePublished {
+        root: StorageUri,
+        upstream: Box<KernelSourceConfig>,
+    },
     /// A source the deployment supplies.
     Custom(Arc<dyn KernelSource>),
     #[cfg(feature = "github")]
@@ -68,6 +76,11 @@ impl std::fmt::Debug for KernelSourceConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::S3(root) => formatter.debug_tuple("S3").field(root).finish(),
+            Self::SpacePublished { root, upstream } => formatter
+                .debug_struct("SpacePublished")
+                .field("root", root)
+                .field("upstream", upstream)
+                .finish(),
             #[cfg(feature = "github")]
             Self::CloudHypervisor => formatter.write_str("CloudHypervisor"),
             Self::Custom(source) => formatter
@@ -82,6 +95,16 @@ impl KernelSourceConfig {
     fn into_source(self) -> Result<Arc<dyn KernelSource>, RunRuntimeManagerError> {
         match self {
             Self::S3(root) => Ok(Arc::new(crate::installs::S3KernelSource::new(root))),
+            Self::SpacePublished { root, upstream } => {
+                let pins = RuntimeCatalog::space_published_kernels()
+                    .map_err(RunRuntimeManagerError::SpaceKernels)?;
+                crate::installs::space_kernels::SpaceKernelSource::wrap(
+                    root,
+                    pins,
+                    upstream.into_source()?,
+                )
+                .map_err(RunRuntimeManagerError::SpaceKernelVersion)
+            }
             Self::Custom(source) => Ok(source),
             #[cfg(feature = "github")]
             Self::CloudHypervisor => Ok(Arc::new(
@@ -213,6 +236,10 @@ pub enum RunRuntimeManagerError {
     Serve(#[source] tonic::transport::Error),
     #[error("failed to enable kernel installs: {0}")]
     Installer(#[source] OpenInstallerError),
+    #[error("the compiled SPACE-published kernel pins are invalid")]
+    SpaceKernels(#[source] pplx_space_node_runtime_core::catalog::CatalogError),
+    #[error("a compiled SPACE-published kernel pin has an invalid version")]
+    SpaceKernelVersion(#[source] crate::installs::source::KernelVersionParseError),
     #[error("artifact installs need a configured source")]
     NoArtifactSource,
     #[error(

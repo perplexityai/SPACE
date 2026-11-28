@@ -64,6 +64,67 @@ node-manager. Existing files must match the SHA-256 pin before a new install
 reports them as already provided. An MD5, when published, is checked as an
 additional transfer checksum.
 
+## SPACE-published kernels
+
+SPACE-published kernels are offered only when runtime-manager runs with
+`--space-kernel-source s3://<bucket>/<prefix>?region=<region>` (the URI also
+accepts `endpoint` and `path_style`). The publisher layout is
+content-addressed:
+
+```text
+<prefix>/vmlinux-<version>/sha256:<hex>/vmlinux.bin
+```
+
+The source offers exactly the compiled SPACE-published pins
+(`SPACE_FIRECRACKER_KERNELS` in
+`crates/l40_api/execution/catalog/src/catalog.rs`), which catalog files cannot
+extend. It never lists the bucket: it checks each pin with a `HEAD` of its key
+(one logical request; the SDK may retry it), offers the pin only when the
+object is present at the pinned size, and verifies the download against the
+pinned SHA-256 like any other install. Requests are signed with the default
+AWS credential chain, loaded on first use, so runtime-manager's credentials
+need `s3:GetObject` on the prefix, and `kms:Decrypt` when the bucket encrypts
+with a KMS key. Without `s3:ListBucket`, S3 answers `403` for an absent key as
+well as for a denied one.
+
+Every other Firecracker kernel is found, listed and downloaded through
+`--kernel-source` as before, without a request to the SPACE source. With no
+compiled SPACE-published pin for the runtime, the flag changes nothing: the
+upstream source is used as is. The cost is one `HEAD` per pin of the line
+on each availability listing and on each install of that pin, and none when
+the table has no pin for the runtime.
+
+The two sources fail independently:
+
+- Installing a pin asks only the SPACE source, so an upstream outage does not
+  block it. An absent object, or one of another size (logged as "not the
+  pinned size"), makes `InstallArtifact` return `NOT_FOUND` ("artifact is not
+  offered by the configured source"). A `403`, a credential failure or a
+  timeout returns `UNAVAILABLE` with the cause, for example "answered 403: the
+  object is absent or these credentials cannot read it", and the next pass
+  retries.
+- Listing availability adds the pins to the upstream listing best-effort.
+  All of a line's pin checks share a 5 second budget; a pin whose check fails
+  is left out with the warning "SPACE-published kernel source failed; not
+  listing the pin", naming its key and the error, and the upstream listing
+  stands. An upstream listing failure fails the listing as it does today.
+
+When the flag is unset, behaviour is unchanged. A node then reports
+`InstallArtifact` for a SPACE-published kernel as `NOT_FOUND`, and cannot
+install it; a copy already in its managed store is still listed as before.
+
+Rollout order: where runtime provisioning is enabled, each in-cohort worker
+and builder is asked for the unretired compiled environments the node knows,
+including any bound to a SPACE-published kernel. A runtime-manager that cannot
+install the kernel makes node-ctl log `runtime artifact installation failed`,
+and its runtime-provisioning facet reports the recipe as blocked on every
+pass. Other installs proceed, and nothing gates readiness or scheduling on it.
+Before a catalog with such an environment reaches a provisioning-enabled
+cluster, publish the kernel at its key, set `--space-kernel-source` on
+runtime-manager, and confirm with runtime-manager's own credentials that the
+object can be read (for example, an `InstallArtifact` that succeeds on one
+node).
+
 ## Managed E0 execution and rollout
 
 The managed store at `/space/vendor/artifacts/{firecracker,kernels}` is separate
