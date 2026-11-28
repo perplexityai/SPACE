@@ -193,6 +193,7 @@ pub(super) async fn list_audit_events(
     let limit = query.normalized_limit()?;
     let events = pplx_space_admin_audit_store::list_newest(&state.pool, limit)
         .await
+        .map_err(sqlx::Error::from)
         .map_err(database_error)?
         .into_iter()
         .map(AdminAuditEvent::from)

@@ -12,6 +12,7 @@
 //! transaction.
 
 use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use sqlx::FromRow;
 use time::OffsetDateTime;
@@ -60,10 +61,10 @@ pub struct NewAdminAuditEvent<'a> {
 
 /// The newest `limit` events, newest first.
 pub async fn list_newest(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     limit: i64,
-) -> Result<Vec<AdminAuditEvent>, sqlx::Error> {
-    sqlx::query_as::<_, AdminAuditEvent>(sql!(
+) -> Result<Vec<AdminAuditEvent>, DbError> {
+    Ok(sqlx::query_as::<_, AdminAuditEvent>(sql!(
         "SELECT
              id,
              actor_user_id,
@@ -84,14 +85,14 @@ pub async fn list_newest(
          LIMIT $1"
     ))
     .bind(limit)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 pub async fn insert(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     event: NewAdminAuditEvent<'_>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "INSERT INTO admin_audit_events (
              id,
@@ -123,7 +124,7 @@ pub async fn insert(
     .bind(event.target_type)
     .bind(event.target_id)
     .bind(event.target_user_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
 
     Ok(())
@@ -132,10 +133,10 @@ pub async fn insert(
 /// Delete up to `limit` of the events ranked after the newest `keep`, oldest
 /// first, and return how many it deleted.
 pub async fn delete_beyond_newest(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     keep: i64,
     limit: i64,
-) -> Result<usize, sqlx::Error> {
+) -> Result<usize, DbError> {
     Ok(sqlx::query_scalar::<_, String>(sql!(
         "WITH ranked AS (
              SELECT id,
@@ -156,7 +157,7 @@ pub async fn delete_beyond_newest(
     ))
     .bind(keep)
     .bind(limit)
-    .fetch_all(executor)
+    .fetch_all(executor.into_sqlx())
     .await?
     .len())
 }
@@ -164,10 +165,10 @@ pub async fn delete_beyond_newest(
 /// Delete up to `limit` of the events created more than `retention_secs`
 /// before the database clock, oldest first, and return how many it deleted.
 pub async fn delete_older_than(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     retention_secs: i64,
     limit: i64,
-) -> Result<usize, sqlx::Error> {
+) -> Result<usize, DbError> {
     Ok(sqlx::query_scalar::<_, String>(sql!(
         "WITH candidates AS (
                  SELECT id
@@ -183,14 +184,16 @@ pub async fn delete_older_than(
     ))
     .bind(retention_secs)
     .bind(limit)
-    .fetch_all(executor)
+    .fetch_all(executor.into_sqlx())
     .await?
     .len())
 }
 
 /// How many events the table holds.
-pub async fn count(executor: impl sqlx::PgExecutor<'_>) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>(sql!("SELECT COUNT(*) FROM admin_audit_events"))
-        .fetch_one(executor)
-        .await
+pub async fn count(executor: impl Executor<'_>) -> Result<i64, DbError> {
+    Ok(
+        sqlx::query_scalar::<_, i64>(sql!("SELECT COUNT(*) FROM admin_audit_events"))
+            .fetch_one(executor.into_sqlx())
+            .await?,
+    )
 }

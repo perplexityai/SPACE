@@ -20,6 +20,7 @@ uuid = { workspace = true }
 
 # internal
 pplx-space-accounts = { workspace = true, features = ["sqlx"] }
+pplx-space-postgres-pool = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 
 [dev-dependencies]
