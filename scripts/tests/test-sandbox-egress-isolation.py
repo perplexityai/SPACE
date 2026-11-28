@@ -29,6 +29,8 @@ Exit codes:
         Hard-fails the build.
 
 Set SECURITY_SMOKE_STRICT=1 to upgrade exit 42 to exit 1.
+Set SECURITY_SMOKE_DEBUG_HTTP=1 to log the SDK's HTTP/2 traffic (httpx/httpcore)
+at DEBUG level; it is off by default.
 EGRESS_POD_IPS is required: a comma-separated list of representative pod IPv4
 addresses from the deployment's pod subnets, with node-api speaking HTTP/2 on
 port 9800. These remain MUST_FAIL isolation probes. EGRESS_TARGET is an optional
@@ -38,17 +40,22 @@ fails before sandbox creation rather than silently omitting pod isolation.
 
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import json
+import logging
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import textwrap
 import time
+import traceback
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Self
 
@@ -60,6 +67,9 @@ DEFAULT_AWS_REGION = "us-east-1"
 PROBE_TIMEOUT_SECS = 5
 DNS_DIAGNOSTIC_HOSTS = ("google.com", "example.com")
 CREATE_TIMEOUT_SECS = 180
+# Extra wall-clock time a guest command gets beyond its own timeout before the
+# script abandons the command stream. See wall_clock_deadline.
+COMMAND_DEADLINE_GRACE_SECS = 60
 CREATE_ATTEMPTS = 3
 CREATE_BACKOFF_BASE_SECS = 10.0
 
@@ -92,6 +102,41 @@ class SmokeContext:
     domain: str
     template: str
     sandbox_id: str
+
+
+class CommandDeadlineExceeded(BaseException):
+    """Raised in the main thread when a guest command outlives its wall-clock deadline.
+
+    A BaseException so the SDK's generic exception handling cannot absorb it.
+    """
+
+
+@contextlib.contextmanager
+def wall_clock_deadline(seconds: int) -> Iterator[None]:
+    """Interrupt the enclosed block after `seconds` of wall-clock time.
+
+    The SDK's command timeout is a per-read socket timeout. Any frame on the
+    live HTTP/2 connection (keepalives, pings, other streams) starts a new
+    read, so a command stream that never ends can block indefinitely. The
+    alarm bounds the whole call, so the caller still reaches sandbox cleanup.
+    """
+
+    def expire(_signum: int, _frame: Any) -> None:
+        raise CommandDeadlineExceeded(f"no command result within {seconds}s wall-clock deadline")
+
+    previous = signal.signal(signal.SIGALRM, expire)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def _deadline_detail(exc: CommandDeadlineExceeded) -> str:
+    # The last frame is the alarm handler; the one before it is where the call blocked.
+    frame = traceback.extract_tb(exc.__traceback__)[-2]
+    return f"{exc}; blocked in {frame.name} ({frame.filename}:{frame.lineno})"
 
 
 class ProbeCommandTransportError(RuntimeError):
@@ -720,13 +765,16 @@ def collect_dns_baseline_diagnostics(sbx: Sandbox, hosts: tuple[str, ...]) -> di
         # collection: if the write itself fails, return an error dict so the
         # caller still prints the probe table and Buildkite summary instead of
         # this exception hiding the original DNS-baseline failure context.
-        sbx.files.write("/tmp/space-egress-dns-diagnostics.py", GUEST_DNS_DIAGNOSTICS_SCRIPT)
-        out = sbx.commands.run(cmd, timeout=90)
+        with wall_clock_deadline(90 + COMMAND_DEADLINE_GRACE_SECS):
+            sbx.files.write("/tmp/space-egress-dns-diagnostics.py", GUEST_DNS_DIAGNOSTICS_SCRIPT)
+            out = sbx.commands.run(cmd, timeout=90)
         stdout = out.stdout or ""
         stderr = out.stderr or ""
     except CommandExitException as exc:
         stdout = exc.stdout or ""
         stderr = exc.stderr or ""
+    except CommandDeadlineExceeded as exc:
+        return {"error": _deadline_detail(exc)}
     except Exception as error:
         return {"error": f"{type(error).__name__}: {error}"}
 
@@ -913,8 +961,6 @@ def run_probes(sbx: Sandbox) -> list[tuple[Probe, str, int, str]]:
         {"idx": i, "host": p.host, "port": p.port, "kind": p.kind}
         for i, p in enumerate(PROBES)
     ]
-    sbx.files.write("/tmp/space-egress-probe.py", GUEST_PROBE_SCRIPT)
-
     # e2b's commands.run doesn't take a stdin kwarg, so embed the JSON in
     # the command line. Use shlex.quote so any future probe name containing
     # single quotes or backslashes survives shell parsing — otherwise the
@@ -924,14 +970,19 @@ def run_probes(sbx: Sandbox) -> list[tuple[Probe, str, int, str]]:
     targets_json = json.dumps(targets)
     cmd = f"echo {shlex.quote(targets_json)} | python3 /tmp/space-egress-probe.py"
 
+    command_timeout = PROBE_TIMEOUT_SECS * len(PROBES) + 30
     stdout = ""
     try:
-        out = sbx.commands.run(cmd, timeout=PROBE_TIMEOUT_SECS * len(PROBES) + 30)
+        with wall_clock_deadline(command_timeout + COMMAND_DEADLINE_GRACE_SECS):
+            sbx.files.write("/tmp/space-egress-probe.py", GUEST_PROBE_SCRIPT)
+            out = sbx.commands.run(cmd, timeout=command_timeout)
         stdout = out.stdout or ""
     except CommandExitException as exc:
         stdout = exc.stdout or ""
         if exc.stderr:
             print(f"[!] guest probe stderr: {exc.stderr}", flush=True)
+    except CommandDeadlineExceeded as exc:
+        raise ProbeCommandTransportError(type(exc).__name__, _deadline_detail(exc)) from exc
     except Exception as exc:
         if _is_probe_command_transport_error(exc):
             raise ProbeCommandTransportError.from_exception(exc) from exc
@@ -1008,6 +1059,10 @@ def main() -> int:
         raise SystemExit("E2B_DOMAIN is required")
     template = os.environ.get("E2B_TEMPLATE", DEFAULT_TEMPLATE)
     strict = os.environ.get("SECURITY_SMOKE_STRICT") in ("1", "true", "True", "TRUE")
+    if os.environ.get("SECURITY_SMOKE_DEBUG_HTTP") == "1":
+        logging.basicConfig(format="%(asctime)s %(name)s %(message)s")
+        for name in ("httpx", "httpcore"):
+            logging.getLogger(name).setLevel(logging.DEBUG)
 
     target = os.environ.get("EGRESS_TARGET", "").strip() or domain
     PROBES.extend(pod_probes())
