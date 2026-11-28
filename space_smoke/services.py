@@ -235,6 +235,8 @@ class SmokeServices:
             fixture._environment_placement_gate_control = cast(Any, kind)
             if isinstance(self.ecw, EcwSdk):
                 fixture._ecw_creator = self.ecw
+                fixture._warm_pool_policy_ecw = self.ecw
+            fixture._warm_pool_policy_control = cast(Any, kind)
             if isinstance(kind, KindHarness) and isinstance(self.ecw, EcwSdk):
                 from space_smoke.private_template_build import PrivateTemplateBuildAssertions
 

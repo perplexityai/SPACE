@@ -171,6 +171,7 @@ from space_smoke.runtime import (
     CommandExecutor,
     CommandResult,
     REPO_ROOT,
+    NoWarmPoolPod,
     ScenarioTimedOut,
     SmokeConfigurationError,
     run_concurrently,
@@ -1727,9 +1728,8 @@ class KindHarness:
             if not pod.get("metadata", {}).get("deletionTimestamp")
         ]
         if len(pods) != 1:
-            raise SmokeConfigurationError(
-                "warm-pool proof requires exactly one matching live pod"
-            )
+            error = NoWarmPoolPod if not pods else SmokeConfigurationError
+            raise error("warm-pool proof requires exactly one matching live pod")
         pod = pods[0]
         metadata = pod.get("metadata", {})
         labels = metadata.get("labels", {})
@@ -9724,7 +9724,11 @@ def _routing_value(value: str) -> str:
 def _template_alias(value: str) -> str:
     """Only the scenario's own throwaway aliases reach a shell or a URL."""
 
-    if not re.fullmatch(r"space-smoke-(oci|parent)-[0-9a-f]{8}", value):
+    # One category per scenario that builds a run-owned template: `oci` and
+    # `parent` (`space_smoke/template_build.py`) and `policy`
+    # (`space_smoke/warm_pool_policy.py`). Each alias is a fixed prefix and a
+    # random 8-hex suffix, so the guard still admits only throwaway names.
+    if not re.fullmatch(r"space-smoke-(oci|parent|policy)-[0-9a-f]{8}", value):
         raise ValueError(f"refusing template alias {value!r}")
     return value
 

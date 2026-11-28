@@ -26,6 +26,10 @@ class SmokeConfigurationError(RuntimeError):
     """The scenario cannot safely run with the supplied configuration."""
 
 
+class NoWarmPoolPod(SmokeConfigurationError):
+    """No live pool pod matched a warm-pool lookup: for a sandbox, it booted cold."""
+
+
 class InvariantViolation(AssertionError):
     """A completed observation disproved the scenario invariant."""
 

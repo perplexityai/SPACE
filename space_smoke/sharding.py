@@ -25,6 +25,9 @@ from space_smoke.registry import Scenario, ScenarioRegistry
 # The leader-election brownout uses the median of three local Kind runs on a
 # 32-CPU host (otel, 2026-11-19), to be replaced by the CI median once CI has
 # run it.
+# The warm-pool policy's follow of a new release uses the median of three
+# local Kind runs on a 32-CPU host with OTel telemetry (2026-11-28), to be
+# replaced by the CI median once CI has run it.
 _DURATION_SECONDS = {
     "ecw": {
         "ecw.access_idle_reconnect_preserves_workspace": 21,
@@ -103,6 +106,7 @@ _DURATION_SECONDS = {
         "local.telemetry_reaches_local_backends": 75,
         "local.template_startup_recovery_decision_table": 18,
         "local.unanswered_template_deleted_after_wait": 104,
+        "local.warm_pool_policy_follows_new_release": 56,
         "network_policy.v1_cidr_allow": 6,
         "network_policy.v1_cidr_deny": 6,
         "network_policy.v1_deny_precedes_allow": 7,

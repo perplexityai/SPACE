@@ -134,6 +134,11 @@ from space_smoke.execution_environment import (
     expect_runtime,
 )
 from space_smoke.runtime_upgrade_campaign import CampaignControl, TemplateCampaignAssertions
+from space_smoke.warm_pool_policy import (
+    WarmPoolPolicyAssertions,
+    WarmPoolPolicyControl,
+    WarmPoolPolicyEcw,
+)
 from space_smoke.drain_gate import DrainGateAssertions
 from space_smoke.no_free_slot import NoFreeSlotAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
@@ -2997,6 +3002,28 @@ class KindAdmin(ScenarioFixture):
                 self, self._campaign_control, self._context.scope
             )
         return self._campaign_assertions
+
+    _warm_pool_policy_control: WarmPoolPolicyControl | None = None
+    _warm_pool_policy_ecw: WarmPoolPolicyEcw | None = None
+    _warm_pool_policy_assertions: WarmPoolPolicyAssertions | None = None
+
+    @property
+    def warm_pool_policy(self) -> WarmPoolPolicyAssertions:
+        """A run-owned template, built through the SDK, and a rolling warm-pool policy on it."""
+
+        if self._warm_pool_policy_control is None or self._warm_pool_policy_ecw is None:
+            raise SmokeConfigurationError(
+                "warm-pool policy control needs the kind backend and the ECW SDK surface"
+            )
+        if self._warm_pool_policy_assertions is None:
+            self._warm_pool_policy_assertions = WarmPoolPolicyAssertions(
+                self,
+                self._warm_pool_policy_control,
+                self._warm_pool_policy_ecw,
+                self._context.scope,
+                retry_delete=retry_sandbox_delete,
+            )
+        return self._warm_pool_policy_assertions
 
     def sandbox_template_name(self) -> str:
         """The bare template name (no tag or digest) selected for this scenario."""
