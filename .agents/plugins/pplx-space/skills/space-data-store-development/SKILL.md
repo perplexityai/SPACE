@@ -64,8 +64,10 @@ Exemplar: `crates/l30_storage/sandbox/store` (`pplx-space-sandbox-store`, the
   `#[sqlx(json(nullable))]` where the column can hold JSON `null`: it
   decodes a stored JSON `null` as `None`, like SQL NULL. A
   `serde_json::Value` or `Option<serde_json::Value>` field or argument may
-  instead decode and bind as itself, with no `Json`: sqlx's `Value` impls go
-  through `Json`, as `SandboxNetworkPolicyInputs` shows. Bind a document as
+  instead decode and bind as itself, with no `Json`, the `Option` form only
+  where `None` is SQL NULL (it binds `None` as SQL NULL and decodes a stored
+  JSON `null` as `Some(Value::Null)`): sqlx's `Value` impls go through
+  `Json`, as `SandboxNetworkPolicyInputs` shows. Bind a document as
   `Json(&value)`, including an optional value that a `NOT NULL` column
   stores as JSON `null`; an optional value of a nullable column as
   `value.as_ref().map(Json)` (`Json(&None)` stores JSON `null`, not SQL
