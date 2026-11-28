@@ -1,4 +1,4 @@
-//! Predicates for operator-pinnable suspend captures (`restore_pin`) and
+//! Predicates for operator-pinnable suspend captures (`restore-pin`) and
 //! `restoring` rows whose automatic retry refuses even though a pre-claim
 //! pinnable suspend capture remains durable.
 
@@ -103,7 +103,7 @@ pub fn pre_claim_restore_order_unordered(sandbox_alias: &str) -> String {
 /// and no active Kubernetes execution holds a pod IP or live activation-attempt
 /// lease) and satisfies [`restore_pinnable_pre_claim_capture_exists`].
 ///
-/// Used by `restore_pin` so an unpinned `restoring` row kept out of `suspended`
+/// Used by `restore-pin` so an unpinned `restoring` row kept out of `suspended`
 /// (either to preserve `lifecycle_changed_at` against a post-claim snapshot, or
 /// because `evacuation_restore_target` is set) can still receive an operator
 /// pin on one of its pre-claim captures without touching `lifecycle_changed_at`.
@@ -130,7 +130,7 @@ pub fn restoring_row_accepts_operator_pin(sandbox_alias: &str) -> String {
 /// Returns a boolean SQL fragment: the unpinned `restoring` row aliased as
 /// `sandbox_alias` has no automatic retry source
 /// ([`restore_retry_source_snapshot_exists`]), yet carries a pre-claim durable
-/// suspend capture an operator could pin via `restore_pin`
+/// suspend capture an operator could pin via `restore-pin`
 /// ([`pinnable_suspend_capture`]) without an unpinned `suspended` restore
 /// silently loading a stale prior-cycle snapshot.
 ///
@@ -166,7 +166,7 @@ pub fn restore_pinnable_pre_claim_capture_exists(sandbox_alias: &str) -> String 
 /// full snapshot was registered at or after `lifecycle_changed_at`.
 ///
 /// Reverting `restoring -> suspended` resets `lifecycle_changed_at` and exposes
-/// every full snapshot to `restore_pin` and `suspended` selection; when a
+/// every full snapshot to `restore-pin` and `suspended` selection; when a
 /// post-claim full snapshot exists, the sweeper spares the row from `failed`
 /// via [`restore_pinnable_pre_claim_capture_exists`] while keeping it in
 /// `restoring` so the claim boundary isn't lost.
@@ -182,5 +182,52 @@ pub fn restore_retry_pinnable_revert_snapshot_exists(sandbox_alias: &str) -> Str
                  AND post_claim.type = 'full'\n\
                  AND NOT {post_before_claim}\n\
           ))"
+    )
+}
+
+/// Returns a boolean SQL fragment: a pin of `sandbox_alias` to the artifact
+/// `artifact_expr` names leaves the sandbox loadable on its substrate.
+///
+/// A pinned Direct sandbox restores with the runtime, guest and state format
+/// recorded on one of the pinned capture's full snapshot rows: the local leg
+/// and the remote leg each pick their own
+/// (`pplx_space_sandbox_store::direct::restore_candidates`), where an
+/// unpinned one can take them from the node's published record. So on Direct
+/// every full snapshot row of that capture must record its runtime, guest and
+/// state format, and execution metadata unless the runtime is `fc`, and the
+/// capture must have at least one such row: a row an older build registered
+/// without them, whichever leg picks it, would leave the pinned sandbox with
+/// no restore source. A capture with any full row missing them can't be pinned. Kubernetes
+/// source selection doesn't read them.
+///
+/// `kubernetes` is the bind placeholder of `SubstrateKind::Kubernetes`.
+pub fn pin_keeps_restore_loadable(
+    sandbox_alias: &str,
+    artifact_expr: &str,
+    kubernetes: &str,
+) -> String {
+    format!(
+        "({sandbox_alias}.managed_by = {kubernetes}\n\
+          OR (EXISTS (\n\
+                  SELECT 1\n\
+                    FROM snapshots described\n\
+                   WHERE described.sandbox_id = {sandbox_alias}.id\n\
+                     AND described.type = 'full'\n\
+                     AND described.local_artifact_id = {artifact_expr}\n\
+              )\n\
+              AND NOT EXISTS (\n\
+                  SELECT 1\n\
+                    FROM snapshots undescribed\n\
+                   WHERE undescribed.sandbox_id = {sandbox_alias}.id\n\
+                     AND undescribed.type = 'full'\n\
+                     AND undescribed.local_artifact_id = {artifact_expr}\n\
+                     AND NOT (undescribed.runtime IS NOT NULL\n\
+                              AND undescribed.guest_os IS NOT NULL\n\
+                              AND undescribed.guest_arch IS NOT NULL\n\
+                              AND undescribed.state_format_name IS NOT NULL\n\
+                              AND undescribed.state_format_version IS NOT NULL\n\
+                              AND (undescribed.runtime = 'fc'\n\
+                                   OR undescribed.execution_metadata IS NOT NULL))\n\
+              )))"
     )
 }

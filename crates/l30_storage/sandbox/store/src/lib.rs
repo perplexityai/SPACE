@@ -274,6 +274,7 @@ pub mod repair;
 pub mod restore_dispatch_fence;
 pub mod restore_lease;
 pub mod restore_pin;
+pub mod restore_pin_repair;
 pub mod restore_pod_owners;
 pub mod restore_source;
 pub mod row_locks;

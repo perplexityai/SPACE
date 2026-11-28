@@ -91,7 +91,7 @@ fn a_contended_wake_does_not_revert_the_row_to_suspended() {
     // `RestoreContextUnavailable` is sandbox-manager's pre-stage
     // unordered-source refusal: the refused send booted no VM. When it was
     // the only send, a fresh claim reverts and retires its pod instead of
-    // blocking `restore_pin` behind an active execution. An earlier send of
+    // blocking `restore-pin` behind an active execution. An earlier send of
     // the same Wake may still be landing, and keeps the claim for it.
     for (dispatch, reverts) in [
         (WakeDispatchStatus::NotDispatched, true),

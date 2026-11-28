@@ -1008,6 +1008,71 @@ class ReconcileQueueGcControl(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class RestorePinRepairConfig:
+    """The restore-pin repair's knobs, as the controller parses them."""
+
+    enabled: bool
+    tick_seconds: int
+    batch: int
+
+
+class RestorePinControl(Protocol):
+    """Kind-only operations for the restore-pin route and repair scenario.
+
+    The route calls go to the isolated Kind API's admin surface and come
+    back as answered. A suspend on this build pins its capture, so the one
+    write, `clear_restore_pin`, produces the unpinned suspended row an older
+    build leaves: it matches only a `suspended` row pinned to exactly the
+    given artifact. The repair's knobs are the cluster-controller
+    Deployment's `SPACE_RESTORE_PIN_REPAIR_*` env (closed key list, closed
+    value vocabulary), changed under the controller-mutation Lease the
+    retention scenarios share and put back from the captured literals. The
+    controller's log is failure evidence only.
+    """
+
+    def restore_pin_answer(self, sandbox_id: str) -> CallAnswer:
+        """`GET /admin/api/v1/sandboxes/{id}/restore-pin`, answered as it came."""
+        ...
+
+    def pin_restore_source_answer(
+        self, sandbox_id: str, body: Mapping[str, object]
+    ) -> CallAnswer:
+        """`POST /admin/api/v1/sandboxes/{id}/restore-pin`, answered as it came."""
+        ...
+
+    def clear_restore_pin(self, sandbox_id: str, expected_artifact_id: str) -> bool:
+        """Clear the pin of the `suspended` row pinned to `expected_artifact_id`.
+
+        Returns False when no such row matched.
+        """
+        ...
+
+    def acquire_controller_mutation(self) -> Callable[[], None]:
+        """Hold the Kind mutation Lease that serializes cooperating smokes' controller writes."""
+        ...
+
+    def restore_pin_repair_env(self) -> dict[str, str | None]:
+        """The Deployment's literal repair env, keyed by every allowlisted key, None if unset."""
+        ...
+
+    def running_restore_pin_repair_envs(self) -> list[dict[str, str | None]]:
+        """The same literals for every running, not-terminating controller pod."""
+        ...
+
+    def set_restore_pin_repair_env(self, overrides: Mapping[str, str]) -> None:
+        """Apply allowlisted overrides and await the rollout; others are refused before kubectl."""
+        ...
+
+    def restore_restore_pin_repair_env(self, standing: Mapping[str, str | None]) -> None:
+        """Put back values `restore_pin_repair_env` returned, verbatim."""
+        ...
+
+    def restore_pin_repair_log_tail(self) -> str:
+        """The repair loop's recent controller log lines, for failure evidence."""
+        ...
+
+
 class OrphanedRestorePodGcControl(Protocol):
     """Kind-only operations for the orphaned-restore-pod GC scenario.
 

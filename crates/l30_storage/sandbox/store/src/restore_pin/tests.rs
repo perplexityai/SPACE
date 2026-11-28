@@ -13,7 +13,7 @@ use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::{pin_restore_source, restore_pin_state};
+use super::{begin_read_snapshot, pin_restore_source, restore_pin_state, restore_pin_state_in};
 
 async fn insert_sandbox(pool: &PgPool, lifecycle: &str) -> TestResult<SandboxId> {
     let id = SandboxId::new();
@@ -268,6 +268,299 @@ async fn a_capture_outranked_only_by_a_failed_upload_is_pinnable() -> TestResult
             "{state}, {generation}"
         );
     }
+    Ok(())
+}
+
+mod main_kubernetes_selector;
+mod main_node_lookup;
+
+/// A ready full suspend backup of `artifact`, registered `minutes_ago` from
+/// `node`, at its own `uri`, so a selector's pick names the backup.
+async fn insert_located_backup(
+    pool: &PgPool,
+    sandbox: SandboxId,
+    node: Option<pplx_space_accounts::NodeId>,
+    (artifact, generation, minutes_ago, uri): (Uuid, Option<i64>, i32, &str),
+) -> TestResult {
+    let snapshot = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (
+             id, sandbox_id, type, state, timestamp, source_node_id, local_artifact_id,
+             artifact_kind, artifact_origin, generation, org_id
+         )
+         VALUES ($1, $2, 'full', 'ready', NOW() - make_interval(mins => $3::INT), $4, $5,
+                 'full', 'suspend', $6, $7)"
+    ))
+    .bind(snapshot)
+    .bind(sandbox)
+    .bind(minutes_ago)
+    .bind(node)
+    .bind(artifact)
+    .bind(generation)
+    .bind(SEED_ORG)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string, org_id)
+         VALUES ($1, $2, $3)"
+    ))
+    .bind(snapshot)
+    .bind(uri)
+    .bind(SEED_ORG)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The storage URIs main's Kubernetes selector picks for `sandbox`: the user
+/// restore's, then the node drain's evacuation restore's.
+async fn main_kubernetes_picks(
+    pool: &PgPool,
+    sandbox: SandboxId,
+) -> TestResult<(Option<String>, Option<String>)> {
+    let mut picks = Vec::new();
+    for statement in [
+        main_kubernetes_selector::SOURCE_NODE_OR_FRESH,
+        main_kubernetes_selector::NEWEST_REMOTE,
+    ] {
+        picks.push(
+            sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(statement))
+                .bind(sandbox)
+                .fetch_optional(pool)
+                .await?,
+        );
+    }
+    let newest_remote = picks.pop().flatten();
+    Ok((picks.pop().flatten(), newest_remote))
+}
+
+/// After a rollback, main's Kubernetes selector restores the capture a pin
+/// this change wrote names, through the admin route's writer or the repair's,
+/// though a re-upload of an older capture registered after it, carrying the
+/// generation it inherits, is what main picks for the row unpinned.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rolled_back_kubernetes_restore_loads_the_capture_a_pin_names() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let reupload_uri = "s3://test/older-capture-reupload?region=us-east-1";
+    let reupload = Some(reupload_uri.to_owned());
+
+    // The admin route pins the capture without a generation in an unordered
+    // history.
+    let sandbox = insert_sandbox(pool, "suspended").await?;
+    let (older, unstamped) = (Uuid::now_v7(), Uuid::now_v7());
+    let pinned_uri = "s3://test/unstamped?region=us-east-1";
+    insert_located_backup(
+        pool,
+        sandbox,
+        None,
+        (older, Some(5), 40, "s3://test/older?region=us-east-1"),
+    )
+    .await?;
+    insert_located_backup(pool, sandbox, None, (unstamped, None, 30, pinned_uri)).await?;
+    insert_located_backup(pool, sandbox, None, (older, Some(5), 10, reupload_uri)).await?;
+    assert_eq!(
+        main_kubernetes_picks(pool, sandbox).await?,
+        (reupload.clone(), reupload.clone()),
+        "unpinned, main picks the re-upload"
+    );
+    let pin_state = restore_pin_state(pool, sandbox).await?.expect("sandbox");
+    let token = pin_state
+        .lifecycle_changed_at
+        .expect("lifecycle_changed_at");
+    assert!(
+        pin_restore_source(
+            pool,
+            sandbox,
+            LocalArtifactId::from_uuid(unstamped),
+            token,
+            pin_state.restore_node_id,
+        )
+        .await?
+    );
+    let pinned = Some(pinned_uri.to_owned());
+    assert_eq!(
+        main_kubernetes_picks(pool, sandbox).await?,
+        (pinned.clone(), pinned),
+        "the admin pin"
+    );
+
+    // The repair pins the latest capture its node reports holding.
+    let node = pplx_space_accounts::NodeId::new();
+    pplx_space_db_test_fixtures::insert_ready_worker_node(pool, node).await?;
+    let sandbox = insert_sandbox(pool, "suspended").await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET target_node_id = $2 WHERE id = $1"
+    ))
+    .bind(sandbox)
+    .bind(node)
+    .execute(pool)
+    .await?;
+    let (older, latest) = (Uuid::now_v7(), Uuid::now_v7());
+    let pinned_uri = "s3://test/latest?region=us-east-1";
+    insert_located_backup(
+        pool,
+        sandbox,
+        Some(node),
+        (older, Some(4), 50, "s3://test/older?region=us-east-1"),
+    )
+    .await?;
+    insert_located_backup(pool, sandbox, Some(node), (latest, Some(5), 40, pinned_uri)).await?;
+    insert_located_backup(
+        pool,
+        sandbox,
+        Some(node),
+        (older, Some(4), 10, reupload_uri),
+    )
+    .await?;
+    assert_eq!(
+        main_kubernetes_picks(pool, sandbox).await?,
+        (reupload.clone(), reupload),
+        "unpinned, main picks the re-upload"
+    );
+    let lifecycle_changed_at = restore_pin_state(pool, sandbox)
+        .await?
+        .and_then(|state| state.lifecycle_changed_at)
+        .expect("lifecycle_changed_at");
+    let candidate = crate::restore_pin_repair::RestorePinRepairCandidate {
+        sandbox_id: sandbox,
+        node_id: node,
+        lifecycle_changed_at,
+    };
+    assert!(
+        crate::restore_pin_repair::repair_restore_pin(
+            pool,
+            candidate,
+            LocalArtifactId::from_uuid(latest)
+        )
+        .await?
+    );
+    let pinned = Some(pinned_uri.to_owned());
+    assert_eq!(
+        main_kubernetes_picks(pool, sandbox).await?,
+        (pinned.clone(), pinned),
+        "the repair's pin"
+    );
+    Ok(())
+}
+
+/// After a rollback, main's Kubernetes retry and its node lookup ignore a pin
+/// this change wrote: each loads the re-upload of an older capture that
+/// registered last, where this change restores the pinned capture.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rolled_back_kubernetes_retry_and_node_lookup_ignore_the_pin() -> TestResult {
+    use crate::restore_source::{
+        RestoreSourceMode, RestoreSourcePlacement, RestoreSourceSelection, select_restore_source,
+    };
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let node = pplx_space_accounts::NodeId::new();
+    pplx_space_db_test_fixtures::insert_ready_worker_node(pool, node).await?;
+    let sandbox = insert_sandbox(pool, "suspended").await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET target_node_id = $2 WHERE id = $1"
+    ))
+    .bind(sandbox)
+    .bind(node)
+    .execute(pool)
+    .await?;
+    let (older, unstamped) = (Uuid::now_v7(), Uuid::now_v7());
+    let pinned_uri = "s3://test/unstamped?region=us-east-1";
+    let reupload_uri = "s3://test/older-capture-reupload?region=us-east-1";
+    insert_located_backup(
+        pool,
+        sandbox,
+        Some(node),
+        (older, Some(5), 40, "s3://test/older?region=us-east-1"),
+    )
+    .await?;
+    insert_located_backup(pool, sandbox, Some(node), (unstamped, None, 30, pinned_uri)).await?;
+    insert_located_backup(
+        pool,
+        sandbox,
+        Some(node),
+        (older, Some(5), 10, reupload_uri),
+    )
+    .await?;
+    let pin_state = restore_pin_state(pool, sandbox).await?.expect("sandbox");
+    let token = pin_state
+        .lifecycle_changed_at
+        .expect("lifecycle_changed_at");
+    assert!(
+        pin_restore_source(
+            pool,
+            sandbox,
+            LocalArtifactId::from_uuid(unstamped),
+            token,
+            pin_state.restore_node_id,
+        )
+        .await?
+    );
+    let picked = |selection: RestoreSourceSelection| match selection {
+        RestoreSourceSelection::Selected(selected) => Some(selected.storage_connection_string),
+        _ => None,
+    };
+
+    // The node lookup, while the row is suspended.
+    let main_lookup: Option<(Uuid, String, Option<i64>)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        main_node_lookup::LATEST_READY_SUSPEND_LOCATION_PLACED_ON,
+    ))
+    .bind(sandbox)
+    .bind(vec![node])
+    .fetch_optional(pool)
+    .await?;
+    let main_lookup = main_lookup.map(|(_, uri, _)| uri);
+    assert_eq!(
+        main_lookup.as_deref(),
+        Some(reupload_uri),
+        "main's node lookup"
+    );
+    let lookup = select_restore_source(
+        pool,
+        sandbox,
+        RestoreSourceMode::NodeLookup,
+        RestoreSourcePlacement::PlacedOn(&[node]),
+    )
+    .await?;
+    assert_eq!(
+        picked(lookup).as_deref(),
+        Some(pinned_uri),
+        "this change's node lookup"
+    );
+
+    // The retry, once a restore claimed the row.
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'restoring', lifecycle_changed_at = NOW() WHERE id = $1"
+    ))
+    .bind(sandbox)
+    .execute(pool)
+    .await?;
+    let main_retry: Option<String> =
+        sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(main_kubernetes_selector::RETRY))
+            .bind(sandbox)
+            .fetch_optional(pool)
+            .await?;
+    assert_eq!(
+        main_retry.as_deref(),
+        Some(reupload_uri),
+        "main's Kubernetes retry"
+    );
+    let retry = select_restore_source(
+        pool,
+        sandbox,
+        RestoreSourceMode::Retry,
+        RestoreSourcePlacement::Any,
+    )
+    .await?;
+    assert_eq!(
+        picked(retry).as_deref(),
+        Some(pinned_uri),
+        "this change's retry"
+    );
     Ok(())
 }
 
@@ -667,5 +960,126 @@ async fn pin_restore_source_refuses_when_restore_node_changes_after_read() -> Te
         .await?,
         "matching expected_restore_node_id succeeds"
     );
+    Ok(())
+}
+
+/// A Direct row restores a pinned capture with the runtime, guest and state
+/// format of one of its full snapshot rows, so the route lists and pins a
+/// Direct capture only when every full row of it carries them
+/// (`pin_keeps_restore_loadable`). Rows of one `local_artifact_id` that
+/// disagree, an older build's next to a newer build's re-upload, refuse.
+#[tokio::test(flavor = "current_thread")]
+async fn a_direct_pin_lists_and_takes_only_a_capture_its_restore_can_load() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    const DESCRIBED: &str = "runtime = 'fc', runtime_version = '1', guest_os = 'linux', \
+         guest_arch = 'x86_64', state_format_name = 'fc-snapshot', state_format_version = '1.0'";
+    // Each case: its name, and which of the capture's two rows (the older
+    // backup, then its re-upload) carry the metadata.
+    let cases = [
+        ("neither", [false, false], false),
+        ("only the older row", [true, false], false),
+        ("only the re-upload", [false, true], false),
+        ("both", [true, true], true),
+    ];
+    let mut mismatches = Vec::new();
+    for (case, described, expected) in cases {
+        let sandbox = insert_sandbox(pool, "suspended").await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET managed_by = 'space' WHERE id = $1"
+        ))
+        .bind(sandbox)
+        .execute(pool)
+        .await?;
+        let artifact = Uuid::now_v7();
+        for (minutes_ago, described) in [(20, described[0]), (10, described[1])] {
+            insert_located_backup(
+                pool,
+                sandbox,
+                None,
+                (
+                    artifact,
+                    None,
+                    minutes_ago,
+                    "s3://test/direct?region=us-east-1",
+                ),
+            )
+            .await?;
+            if described {
+                let statement = format!(
+                    "UPDATE snapshots SET {DESCRIBED}
+                      WHERE sandbox_id = $1
+                        AND timestamp = (SELECT MAX(timestamp) FROM snapshots WHERE sandbox_id = $1)"
+                );
+                sqlx::query(sqlx::AssertSqlSafe(sql!(statement)))
+                    .bind(sandbox)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        let state = restore_pin_state(pool, sandbox).await?.expect("sandbox");
+        let listed = state
+            .captures
+            .iter()
+            .any(|capture| capture.local_artifact_id == LocalArtifactId::from_uuid(artifact));
+        let pinned = pin_restore_source(
+            pool,
+            sandbox,
+            LocalArtifactId::from_uuid(artifact),
+            state.lifecycle_changed_at.expect("lifecycle_changed_at"),
+            state.restore_node_id,
+        )
+        .await?;
+        if (listed, pinned) != (expected, expected) {
+            mismatches.push(format!("{case}: listed {listed}, pinned {pinned}"));
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+    Ok(())
+}
+
+/// The read's two statements, the ordering flag and the capture list, see
+/// one snapshot in its transaction: a capture that registers between them,
+/// making the history unordered, doesn't show up in the list while
+/// `unordered` still reads `false`. Inside a held snapshot both answers stay
+/// as they were; a fresh read sees the new capture and the unordered history.
+#[tokio::test(flavor = "current_thread")]
+async fn the_ordering_flag_and_the_capture_list_read_one_snapshot() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let sandbox = insert_sandbox(pool, "suspended").await?;
+    let (stamped, unstamped) = (Uuid::now_v7(), Uuid::now_v7());
+    insert_backup(pool, sandbox, stamped, "suspend", Some(5), 40).await?;
+
+    // The transaction `restore_pin_state` reads in.
+    let mut held = begin_read_snapshot(pool).await?;
+    let before = restore_pin_state_in(&mut held, sandbox)
+        .await?
+        .expect("sandbox");
+    assert!(!before.unordered);
+    // A capture without a generation registers after one with a generation,
+    // so nothing orders it: the history is unordered from here on.
+    insert_backup(pool, sandbox, unstamped, "suspend", None, 30).await?;
+    let in_snapshot = restore_pin_state_in(&mut held, sandbox)
+        .await?
+        .expect("sandbox");
+    held.commit().await?;
+    assert_eq!(
+        in_snapshot, before,
+        "a held snapshot reads both answers as before"
+    );
+
+    let after = restore_pin_state(pool, sandbox).await?.expect("sandbox");
+    assert!(after.unordered);
+    let listed: Vec<Uuid> = after
+        .captures
+        .iter()
+        .map(|capture| capture.local_artifact_id.as_uuid())
+        .collect();
+    assert!(listed.contains(&unstamped), "{listed:?}");
     Ok(())
 }

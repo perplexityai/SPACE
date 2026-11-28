@@ -130,7 +130,8 @@ pub enum RestoreSourceSelection {
     /// in a history where another capture has one, that no later execution's
     /// capture orders. Either could be the latest, so the restore refuses rather than risk
     /// loading the older one. Terminal until an operator pins a capture
-    /// (`restore_pin`), or a later execution's capture registers.
+    /// (`restore_pin`), the restore-pin repair pins the node's, or a later
+    /// execution's capture registers.
     Unordered,
 }
 
@@ -139,7 +140,8 @@ pub fn unordered_restore_source_message(sandbox_id: SandboxId) -> String {
     format!(
         "refusing to restore sandbox {sandbox_id}: its captures can't be ordered (a suspend capture \
          with no recorded capture generation that no later execution's capture orders), so the control \
-         plane won't guess which is the latest; it restores once a capture is pinned"
+         plane won't guess which is the latest; an operator can pin one through the admin \
+         restore-pin route"
     )
 }
 

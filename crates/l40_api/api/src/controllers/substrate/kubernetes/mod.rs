@@ -25,6 +25,7 @@ use kube::{
     api::{DeleteParams, PostParams, WatchEvent, WatchParams},
     runtime::reflector::{ObjectRef, Store},
 };
+use pplx_space_accounts::NodeId;
 use pplx_space_artifact_model::StorageUri;
 use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
 use pplx_space_k8s_node_id::{Ec2InstanceId, space_k8s_node_id};
@@ -34,6 +35,7 @@ use pplx_space_node_api_client::{
     proto::worker_api_internal_client::WorkerApiInternalClient,
 };
 use pplx_space_node_model::NodeRole as SpaceNodeRole;
+use pplx_space_node_registration_store::lookup as node_lookup;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_pod::{
     DEFAULT_SANDBOX_PROXY_PORT, ForkDiskRestorePodContext,
@@ -93,12 +95,13 @@ use crate::{
 
 use super::{
     ActivationCompletion, ActivationOptions, BuilderClient, CreateExecutionOutcome,
-    CreateExecutionRequest, ExecutionActivation, ExecutionActivityKind, ExecutionBinding,
-    ExecutionIdentity, ExecutionRoutabilityCheck, NODE_RPC_TIMEOUT, NodeApiTarget,
-    NodeInventoryEntry, ObservedPod, ObservedPodIdentity, OwnedNodeApiTarget, PodFenceMismatch,
-    PodIdentityFence, RecordedExecution, RetireExecutionOutcome, RetireExecutionRequest,
-    RetireFence, RetireStopRoute, RuntimeClient, SubstrateAdapter, SubstrateCapabilities,
-    SubstrateError, TeardownProgress, WaitReadyTimeoutPhase, connect_worker, node_api_endpoint,
+    CreateExecutionRequest, DbContext, ExecutionActivation, ExecutionActivityKind,
+    ExecutionBinding, ExecutionIdentity, ExecutionRoutabilityCheck, NODE_RPC_TIMEOUT,
+    NodeApiTarget, NodeInventoryEntry, ObservedPod, ObservedPodIdentity, OwnedNodeApiTarget,
+    PodFenceMismatch, PodIdentityFence, RecordedExecution, RetireExecutionOutcome,
+    RetireExecutionRequest, RetireFence, RetireStopRoute, RuntimeClient, SubstrateAdapter,
+    SubstrateCapabilities, SubstrateError, TeardownProgress, WaitReadyTimeoutPhase, connect_worker,
+    node_api_endpoint,
 };
 
 const START_WAIT_FAST_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -1357,6 +1360,33 @@ impl KubernetesSubstrate {
     pub async fn kube_node_exists(&self, node_name: &str) -> Result<bool, KubeError> {
         let nodes: Api<Node> = Api::all(self.k8s.client.clone());
         nodes.get_opt(node_name).await.map(|node| node.is_some())
+    }
+
+    /// Whether worker `node_id` is gone: the API server reports no Node under
+    /// the name it registered as, and its registration didn't change while
+    /// that was read. A replacement that registers under the same name
+    /// changes the registered UID, so an absence observed across one isn't
+    /// about this worker. `false` for a node with no Kubernetes registration.
+    /// An API server that can't answer is an error, never a gone node.
+    pub async fn node_confirmed_gone(&self, node_id: NodeId) -> Result<bool, SubstrateError> {
+        let registration = || async {
+            node_lookup::k8s_node_identity(self.store.pool(), node_id)
+                .await
+                .db_context("failed to load the node's Kubernetes registration")
+        };
+        let Some(observed) = registration().await? else {
+            return Ok(false);
+        };
+        let exists = self
+            .kube_node_exists(&observed.k8s_node_name)
+            .await
+            .map_err(|error| SubstrateError::Unavailable {
+                message: format!(
+                    "failed to read Kubernetes Node {}: {error}",
+                    observed.k8s_node_name
+                ),
+            })?;
+        Ok(!exists && registration().await? == Some(observed))
     }
 
     /// Patch `spec.unschedulable` on the core.v1.Node identified by

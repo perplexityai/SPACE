@@ -4,9 +4,10 @@
 //! An unpinned sandbox whose history is unordered
 //! ([`pplx_space_sandbox_portability::restore_order_unordered`]) refuses to
 //! restore off its node, since capture order can't tell which of its
-//! captures is the latest. An operator who knows which capture holds the
-//! sandbox's latest state pins it here, and the restore loads exactly that
-//! artifact.
+//! captures is the latest. The restore-pin repair resolves it while the node
+//! still holds the sandbox. When it doesn't, an operator who knows which
+//! capture holds the sandbox's latest state pins it here, and the restore
+//! loads exactly that artifact.
 
 use std::sync::LazyLock;
 
@@ -14,8 +15,9 @@ use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::{
-    capture_registered_at, pinnable_pre_claim_suspend_capture, pinnable_suspend_capture,
-    pre_claim_restore_order_unordered, restore_order_unordered, restoring_row_accepts_operator_pin,
+    capture_registered_at, pin_keeps_restore_loadable, pinnable_pre_claim_suspend_capture,
+    pinnable_suspend_capture, pre_claim_restore_order_unordered, restore_order_unordered,
+    restoring_row_accepts_operator_pin,
 };
 use pplx_space_snapshot_model::LocalArtifactId;
 use pplx_space_sql_locator::sql;
@@ -86,7 +88,7 @@ struct StateRow {
 /// its own node, as the Direct restore reads it: the worker `target_node_id`
 /// names, or `active_node_id` when there's no target. A target that's gone
 /// isn't replaced by `active_node_id`.
-fn restore_node_id_sql(sandbox_alias: &str, kubernetes: &str) -> String {
+pub(crate) fn restore_node_id_sql(sandbox_alias: &str, kubernetes: &str) -> String {
     format!(
         "COALESCE(\n\
              (SELECT nk.node_id\n\
@@ -120,8 +122,32 @@ fn restore_node_id_sql(sandbox_alias: &str, kubernetes: &str) -> String {
 
 /// Read `sandbox_id`'s restore state and the captures an operator may pin.
 /// `None` for a missing sandbox.
+///
+/// Both reads run in one `REPEATABLE READ READ ONLY` transaction, so they see
+/// one snapshot: a capture that registers between them can't show up in the
+/// list while `unordered` still describes the history before it.
 pub async fn restore_pin_state(
-    executor: impl sqlx::PgExecutor<'_> + Copy,
+    pool: &sqlx::PgPool,
+    sandbox_id: SandboxId,
+) -> Result<Option<RestorePinState>, sqlx::Error> {
+    let mut tx = begin_read_snapshot(pool).await?;
+    let state = restore_pin_state_in(&mut tx, sandbox_id).await?;
+    tx.commit().await?;
+    Ok(state)
+}
+
+/// A transaction whose statements all see the database as of its first one.
+pub(crate) async fn begin_read_snapshot(
+    pool: &sqlx::PgPool,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
+    pool.begin_with(sql!("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        .await
+}
+
+/// [`restore_pin_state`]'s reads on `conn`, whose transaction decides
+/// whether they see one snapshot.
+pub(crate) async fn restore_pin_state_in(
+    conn: &mut sqlx::PgConnection,
     sandbox_id: SandboxId,
 ) -> Result<Option<RestorePinState>, sqlx::Error> {
     /// Built once: every input is a literal or a bind placeholder.
@@ -145,6 +171,7 @@ pub async fn restore_pin_state(
     static CAPTURES: LazyLock<String> = LazyLock::new(|| {
         let pinnable = pinnable_suspend_capture("s", "sn");
         let pinnable_pre_claim = pinnable_pre_claim_suspend_capture("s", "sn");
+        let loadable = pin_keeps_restore_loadable("s", "sn.local_artifact_id", "$2");
         let captured = capture_registered_at("sn");
         sql!(format!(
             "SELECT DISTINCT ON (sn.local_artifact_id)
@@ -166,20 +193,22 @@ pub async fn restore_pin_state(
                 AND CASE WHEN s.lifecycle = 'restoring' THEN {pinnable_pre_claim}
                          ELSE {pinnable}
                     END
+                AND {loadable}
               ORDER BY sn.local_artifact_id, sn.timestamp DESC, sn.id DESC"
         ))
     });
     let Some(state) = sqlx::query_as::<_, StateRow>(sqlx::AssertSqlSafe(STATE.as_str()))
         .bind(sandbox_id)
         .bind(SubstrateKind::Kubernetes)
-        .fetch_optional(executor)
+        .fetch_optional(&mut *conn)
         .await?
     else {
         return Ok(None);
     };
     let mut captures: Vec<PinnableCapture> = sqlx::query_as(sqlx::AssertSqlSafe(CAPTURES.as_str()))
         .bind(sandbox_id)
-        .fetch_all(executor)
+        .bind(SubstrateKind::Kubernetes)
+        .fetch_all(&mut *conn)
         .await?;
     captures.sort_by_key(|capture| std::cmp::Reverse(capture.first_registered_at));
     Ok(Some(RestorePinState {
@@ -228,6 +257,7 @@ pub async fn pin_restore_source(
         let pinnable = pinnable_suspend_capture("s", "sn");
         let pinnable_pre_claim = pinnable_pre_claim_suspend_capture("s", "sn");
         let restoring_pinnable = restoring_row_accepts_operator_pin("s");
+        let loadable = pin_keeps_restore_loadable("s", "$2", "$5");
         sql!(format!(
             "UPDATE sandboxes s
                 SET current_local_artifact_id = $2,
@@ -253,7 +283,8 @@ pub async fn pin_restore_source(
                           WHERE sn.local_artifact_id = $2
                             AND {pinnable_pre_claim}
                      ))
-                )"
+                )
+                AND {loadable}"
         ))
     });
     let result = sqlx::query(sqlx::AssertSqlSafe(PIN.as_str()))

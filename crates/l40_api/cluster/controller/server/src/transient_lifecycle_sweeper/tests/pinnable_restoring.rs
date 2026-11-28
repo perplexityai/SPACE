@@ -1,7 +1,8 @@
 //! Unpinned `restoring` rows whose automatic retry selector refuses — an
 //! unordered pre-claim capture history, or a ready suspend capture outranked
-//! only by a failed upload — still carry durable bytes an operator can pin
-//! (`restore_pin::pin_restore_source`) once the row returns to `suspended`. Neither the unrestorable-`restoring` sweep nor the aged
+//! only by a failed upload — still carry durable bytes an operator can pin via
+//! `POST /admin/api/v1/sandboxes/{id}/restore-pin` once the row returns to
+//! `suspended`. Neither the unrestorable-`restoring` sweep nor the aged
 //! transient sweep may mark them `failed`; once unowned (or past the episode
 //! deadline without a pod IP), the sweeper reverts them to `suspended` unless
 //! a post-claim full snapshot makes resetting `lifecycle_changed_at` unsafe.
@@ -70,6 +71,8 @@ async fn insert_unpinned_restoring_sandbox(
     Ok(())
 }
 
+/// A full suspend capture of `artifact`, described as a Direct restore loads
+/// a pinned one (`pin_keeps_restore_loadable`).
 async fn insert_suspend_capture(
     pool: &PgPool,
     sandbox_id: SandboxId,
@@ -82,11 +85,14 @@ async fn insert_suspend_capture(
     sqlx::query(sql!(
         "INSERT INTO snapshots (
              id, sandbox_id, type, state, timestamp, source_node_id,
-             local_artifact_id, artifact_kind, artifact_origin, generation, org_id
+             local_artifact_id, artifact_kind, artifact_origin, generation, org_id,
+             runtime, runtime_version, guest_os, guest_arch, state_format_name,
+             state_format_version
          )
          VALUES (
              $1, $2, 'full', $3, NOW() + make_interval(secs => $4::BIGINT), $5,
-             $6, 'full', 'suspend', $7, $8
+             $6, 'full', 'suspend', $7, $8,
+             'fc', '1', 'linux', 'x86_64', 'fc-snapshot', '1.0'
          )"
     ))
     .bind(snapshot_id)
@@ -259,7 +265,7 @@ async fn unpinned_pinnable_pre_claim_captures_revert_to_suspended_instead_of_fai
                 pin_state.restore_node_id,
             )
             .await?,
-            "{name}: reverted suspended row must accept a pin"
+            "{name}: reverted suspended row must accept restore-pin"
         );
     }
 
@@ -293,7 +299,7 @@ async fn unpinned_pinnable_pre_claim_captures_revert_to_suspended_instead_of_fai
     //    a) Pre-claim unordered captures + post-claim full snapshot: spared
     //       from `failed` (`ready_snapshot = true`), not reverted (`restoring`
     //       kept so `lifecycle_changed_at` continues fencing the post-claim
-    //       row), and once unowned, `restore_pin` lists and pins only the
+    //       row), and once unowned, `restore-pin` lists and pins only the
     //       pre-claim captures without touching `lifecycle_changed_at`.
     let post_claim = SandboxId::new();
     let pre_stamped = Uuid::now_v7();
@@ -338,7 +344,7 @@ async fn unpinned_pinnable_pre_claim_captures_revert_to_suspended_instead_of_fai
     assert_eq!(
         listed_pre_claim,
         vec![pre_unstamped, pre_stamped],
-        "a pin on a restoring row must list only pre-claim pinnable captures"
+        "restore-pin on a restoring row must list only pre-claim pinnable captures"
     );
     let claim_token = pin_state
         .lifecycle_changed_at
@@ -355,7 +361,7 @@ async fn unpinned_pinnable_pre_claim_captures_revert_to_suspended_instead_of_fai
         .await?,
         "post-claim capture must not be pinnable while restoring"
     );
-    // While a restore lease is live, `restore_pin` refuses on the restoring row.
+    // While a restore lease is live, `restore-pin` refuses on the restoring row.
     sqlx::query(sql!(
         "UPDATE sandboxes
             SET restore_lease_expires_at = NOW() + INTERVAL '60 seconds',

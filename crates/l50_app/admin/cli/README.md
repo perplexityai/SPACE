@@ -393,9 +393,76 @@ says `its captures can't be ordered`:
 
 The drain and drained-node terminator keep the sandbox `suspended` rather
 than failing it. A restore on the node that still holds the sandbox works.
+With `SPACE_RESTORE_PIN_REPAIR_ENABLED`, the controller pins such a row from
+that node's answer on its own, but only while the node's capture is still the
+latest the control plane knows of: no full snapshot records a higher
+generation, and no capture of another artifact registered at or after it.
+On Direct, every full snapshot row of that capture must also record its
+runtime, guest and state format (and execution metadata unless the runtime
+is `fc`): a pinned Direct sandbox restores with them, where an unpinned one
+can use the node's published record. Otherwise the repair logs the reason
+and leaves the row unpinned.
 
-When the node no longer holds the sandbox, the restore refuses until a
-capture is pinned.
+When the repair leaves the row unpinned, or the node no longer holds the
+sandbox, pin a capture by hand, as a managing-organization admin:
+
+1. `GET /admin/api/v1/sandboxes/sbx_<uuid>/restore-pin` returns the
+   sandbox's `lifecycle`, `lifecycle_changed_at`, `unordered`, and the
+   `captures` a pin accepts: in an unordered history, the latest pinnable
+   capture of each side that has one, with its `local_artifact_id`,
+   `generation` (none for a side without one), `first_registered_at` and
+   `source_node_id`. A side can be missing from this list: a legacy capture
+   with a `NULL` `artifact_origin` makes the history unordered, but a pin
+   accepts only `artifact_origin = 'suspend'`, so `captures` never lists it.
+   When a side is missing, find the capture that makes the history unordered
+   before pinning the other side. On Direct, `captures` also leaves out a
+   capture with a full snapshot row that doesn't record the runtime, guest
+   and state format the pinned restore loads it with.
+2. Decide which capture holds the latest state. Only evidence outside these
+   rows can tell: the owner's account of what they last did, or the node
+   each capture came from and when the sandbox ran there.
+3. `POST /admin/api/v1/sandboxes/sbx_<uuid>/restore-pin` with
+   `{"local_artifact_id": "<uuid>", "lifecycle_changed_at": "<as read>"}`.
+   It pins an unpinned `suspended` sandbox (or an unowned `restoring` sandbox
+   awaiting a pre-claim pin) that hasn't changed lifecycle
+   since the read, to a listed capture, and answers `409` otherwise; read
+   again and retry. It first asks the sandbox's node what it holds: a node
+   still holding the sandbox suspended restores its own local copy whatever
+   the pin names, so while it holds another capture, or a copy with no
+   recorded capture, the pin is refused with `409`, and while the node can't
+   be asked, `503`. A Kubernetes worker that doesn't answer and is gone
+   isn't one of those: when the Kubernetes API server reports no Node under
+   the name the worker registered as, and no replacement registered under it
+   meanwhile, the pin proceeds as if the node holds no copy. A worker whose
+   Node still exists, or an API server that can't answer, keeps the `503`.
+   A missing Node doesn't prove the machine behind it is gone: a Node object
+   deleted while its instance still runs comes back under the same name and
+   node ID when the kubelet re-registers, and a restore there loads that
+   machine's local copy instead of the pin. So when the sandbox's node
+   doesn't answer and its Node is gone, confirm the backing instance or
+   machine is terminated before you POST the pin.
+   The check reads the state and artifact ID the node reports, not its
+   snapshot files. A node that reports the sandbox suspended under another
+   artifact ID, or under none, is refused even if it has lost that copy's
+   files, and a pin that succeeds doesn't confirm that the pinned capture's
+   files are still on the node. A Direct node whose registration is
+   deleted isn't asked: no restore loads from it. On success it returns the
+   new state, and the next restore loads exactly that capture once every
+   control-plane replica runs a release that has this route. A replica on
+   an earlier release, during a rollout or after a rollback, honors the
+   pin on the first attempt of a Kubernetes user restore and on a node
+   drain's evacuation restore. Its retry of a Kubernetes user restore, its
+   Direct restore on another node and its answer to a node's lookup don't,
+   and can load another capture.
+
+On Kubernetes, a restore that a node refused for this reason may have left a
+pod behind: with `SPACE_ABANDONED_RESTORE_RETIREMENT_ENABLED` off, the refusal
+reverts the sandbox's lifecycle and leaves that restore's execution active. A
+restore answers that one is in flight while that execution holds its
+ownership, pinned or not.
+
+A pin is the operator's word: picking the older side restores the older
+state, and nothing afterwards can tell.
 
 ### Restore refused: a capture is ahead of the clock
 

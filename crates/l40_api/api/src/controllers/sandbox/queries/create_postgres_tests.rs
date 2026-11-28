@@ -1158,6 +1158,13 @@ impl SubstrateAdapter for RetryingPoolSubstrate {
         panic!("unused")
     }
 
+    async fn node_api_target(
+        &self,
+        _node_id: NodeId,
+    ) -> Result<Option<crate::controllers::substrate::OwnedNodeApiTarget>, SubstrateError> {
+        panic!("unused")
+    }
+
     async fn list_inventory_nodes(
         &self,
         _role_filter: Option<&str>,
@@ -1299,6 +1306,13 @@ impl SubstrateAdapter for NodeRpcStubbedKubernetes {
         &self,
         _target: &NodeApiTarget<'_>,
     ) -> Result<String, SubstrateError> {
+        panic!("unused")
+    }
+
+    async fn node_api_target(
+        &self,
+        _node_id: NodeId,
+    ) -> Result<Option<crate::controllers::substrate::OwnedNodeApiTarget>, SubstrateError> {
         panic!("unused")
     }
 
