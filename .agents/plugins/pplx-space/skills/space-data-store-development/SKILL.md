@@ -82,8 +82,10 @@ Exemplar: `crates/l30_storage/sandbox/store` (`pplx-space-sandbox-store`, the
   (usually `#[from] DbError`); callers classify a failure with
   `DbError::kind()`, `constraint()` and `is_lock_contention()`, never by
   matching the driver's error. A failure a caller must tell apart that
-  `kind()` reports as `Other`, such as an I/O, decode or closed-pool error,
-  first gets its own `DbErrorKind` in `pplx-space-postgres-pool`. A guarded
+  `kind()` reports as `Other`, such as a closed-pool error, first gets its
+  own `DbErrorKind` in `pplx-space-postgres-pool`. `DbError::sqlstate()` is
+  the escape hatch for a one-off SQLSTATE; promote a code to a `DbErrorKind`
+  once a second caller branches on it. A guarded
   write that matches zero rows is an outcome (`Option`/`bool`), not an error
   — "another writer won" is a normal race result.
 - Verbs and record columns are added with their first migrated caller, never

@@ -53,8 +53,10 @@
 //!
 //! These timeouts are set on the open transaction and last until it commits
 //! or rolls back, as `SET LOCAL` does; the connection then goes back to the
-//! pool with its session values. A pool-wide `statement_timeout` is
-//! [`DbOptions::statement_timeout`].
+//! pool with its session values. On a savepoint ([`Tx::savepoint`]), a
+//! timeout is undone if that savepoint, or one enclosing it, rolls back, and
+//! otherwise lasts until the top-level transaction ends. A pool-wide
+//! `statement_timeout` is [`DbOptions::statement_timeout`].
 //!
 //! The setters and the lowering take a [`Duration`] and send it in whole
 //! milliseconds, rounded down. Debug builds panic on a duration under 1 ms,
@@ -76,6 +78,43 @@
 //!     let saved = tx.lower_local_lock_timeout(Duration::from_millis(250)).await?;
 //!     // ... statements whose lock waits must stay short ...
 //!     tx.restore_local_lock_timeout(saved).await?;
+//!     tx.commit().await
+//! }
+//! ```
+//!
+//! # Savepoints
+//!
+//! [`Tx::savepoint`] opens a savepoint in a transaction as a nested [`Tx`],
+//! so a step that may fail can be undone without losing the transaction:
+//! after a failed statement in it, roll it back and the outer transaction
+//! carries on as it was before the savepoint. It issues the statements the
+//! driver's nested transactions do: `SAVEPOINT _sqlx_savepoint_N` to open,
+//! `RELEASE SAVEPOINT` on [`Tx::commit`], and `ROLLBACK TO SAVEPOINT` on
+//! [`Tx::rollback`] or drop.
+//!
+//! ```no_run
+//! use pplx_space_postgres_pool::{Db, DbError, DbErrorKind, Executor};
+//!
+//! // A store verb whose insert can conflict.
+//! async fn insert_widget(executor: impl Executor<'_>, id: i64) -> Result<(), DbError> {
+//!     sqlx::query("INSERT INTO widgets (id) VALUES ($1)")
+//!         .bind(id)
+//!         .execute(executor.into_sqlx())
+//!         .await?;
+//!     Ok(())
+//! }
+//!
+//! async fn caller(db: &Db) -> Result<(), DbError> {
+//!     let mut tx = db.begin().await?;
+//!     let mut savepoint = tx.savepoint().await?;
+//!     match insert_widget(&mut savepoint, 1).await {
+//!         Ok(()) => savepoint.commit().await?,
+//!         Err(error) if error.kind() == DbErrorKind::UniqueViolation => {
+//!             savepoint.rollback().await?;
+//!         }
+//!         Err(error) => return Err(error),
+//!     }
+//!     // ... statements that run whether or not the insert conflicted ...
 //!     tx.commit().await
 //! }
 //! ```
@@ -165,7 +204,8 @@ pub struct DbOptions {
     pub statement_timeout: Option<Duration>,
 }
 
-/// An open transaction from [`Db::begin`] or [`Db::begin_snapshot`].
+/// An open transaction from [`Db::begin`] or [`Db::begin_snapshot`], or a
+/// savepoint in one from [`Tx::savepoint`].
 ///
 /// Pass `&mut tx` to store verbs to run them inside it; a function holding
 /// `tx: &mut Tx` passes `&mut *tx`, so each verb borrows it afresh. Dropping
@@ -176,19 +216,49 @@ pub struct Tx<'c> {
 }
 
 impl Tx<'_> {
-    /// Commit the transaction.
+    /// Commit the transaction, or release the savepoint, keeping its writes
+    /// in the transaction around it.
     pub async fn commit(self) -> Result<(), DbError> {
         Ok(self.inner.commit().await?)
     }
 
-    /// Roll the transaction back.
+    /// Roll the transaction back, or roll back to the savepoint.
     pub async fn rollback(self) -> Result<(), DbError> {
         Ok(self.inner.rollback().await?)
+    }
+
+    /// Open a savepoint in this transaction, returned as a nested `Tx` that
+    /// borrows this one until it ends: `SAVEPOINT _sqlx_savepoint_N`, the
+    /// driver's nested transaction, `N` counting the transactions open on
+    /// the connection.
+    ///
+    /// [`Tx::commit`] on it releases the savepoint (`RELEASE SAVEPOINT`),
+    /// keeping its writes until this transaction commits or rolls back.
+    /// [`Tx::rollback`] on it issues `ROLLBACK TO SAVEPOINT`, undoing its
+    /// writes; dropping it queues that statement, which the driver sends on
+    /// the connection's next use. After a statement in it fails without
+    /// closing the connection, roll it back or drop it: this transaction is
+    /// then usable again.
+    ///
+    /// A timeout set on it is undone if it, or a savepoint enclosing it,
+    /// rolls back; otherwise it lasts until the top-level transaction ends,
+    /// so releasing the savepoint keeps it.
+    ///
+    /// If this returns an error, or its future is dropped before it
+    /// completes, the driver has also queued a rollback of this transaction
+    /// (of this savepoint, if it is one), and this `Tx` and any `Tx`
+    /// enclosing it no longer match the connection's state: drop them all
+    /// without committing.
+    pub async fn savepoint(&mut self) -> Result<Tx<'_>, DbError> {
+        Ok(Tx {
+            inner: sqlx::Acquire::begin(&mut self.inner).await?,
+        })
     }
 
     /// Bound each later lock wait in this transaction by `d`, until it ends:
     /// `lock_timeout`, set as `SET LOCAL` does. A wait past it fails with
     /// `55P03` (`lock_not_available`).
+    /// On a savepoint, it lasts as [`Tx::savepoint`] describes.
     ///
     /// `d` is sent in whole milliseconds, rounded down. Debug builds panic on
     /// a duration under 1 ms, and release builds send it as `1ms`, since
@@ -202,6 +272,7 @@ impl Tx<'_> {
     /// Bound each later statement in this transaction by `d`, until it ends:
     /// `statement_timeout`, set as `SET LOCAL` does. A statement past it is
     /// cancelled with `57014` (`query_canceled`).
+    /// On a savepoint, it lasts as [`Tx::savepoint`] describes.
     ///
     /// `d` is sent in whole milliseconds, rounded down. Debug builds panic on
     /// a duration under 1 ms, and release builds send it as `1ms`, since
@@ -215,6 +286,7 @@ impl Tx<'_> {
     /// Bound how long this transaction may sit idle between statements by
     /// `d`, until it ends: `idle_in_transaction_session_timeout`, set as
     /// `SET LOCAL` does. Past it the server ends the session.
+    /// On a savepoint, it lasts as [`Tx::savepoint`] describes.
     ///
     /// `d` is sent in whole milliseconds, rounded down. Debug builds panic on
     /// a duration under 1 ms, and release builds send it as `1ms`, since
@@ -233,6 +305,7 @@ impl Tx<'_> {
     /// session. Returns the `lock_timeout` it found, for
     /// [`Tx::restore_local_lock_timeout`]; without that, the bound lasts
     /// until the transaction ends.
+    /// On a savepoint, it lasts as [`Tx::savepoint`] describes.
     ///
     /// `d` is sent in whole milliseconds, rounded down. Debug builds panic on
     /// a duration under 1 ms, and release builds send it as `1ms`, since
