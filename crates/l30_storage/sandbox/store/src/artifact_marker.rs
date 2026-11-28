@@ -18,13 +18,16 @@ use pplx_space_sql_locator::sql;
 ///
 /// No guard beyond the id: no lifecycle predicate of its own. It relies on
 /// the caller's row lock and deleting-snapshot check in the same
-/// transaction.
-pub async fn set_current_local_artifact(
-    executor: impl Executor<'_>,
+/// transaction. The caller must pass its open transaction.
+pub async fn set_current_local_artifact<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     artifact: Option<(LocalArtifactId, ArtifactKind)>,
     origin: ArtifactOrigin,
-) -> Result<(), DbError> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "UPDATE sandboxes
             SET current_local_artifact_id = $2,
@@ -36,7 +39,7 @@ pub async fn set_current_local_artifact(
     .bind(artifact.map(|(id, _)| id.as_uuid()))
     .bind(artifact.map(|(_, kind)| kind.as_str()))
     .bind(origin.as_str())
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }

@@ -50,12 +50,16 @@ pub struct PrunedDeletedSandboxes {
 /// update); ordinary snapshot retention still applies to them meanwhile. Once
 /// this prune detaches them, the sweeper deletes their objects after its
 /// one-hour grace, except for locations in another bucket or with an
-/// encrypted sidecar, which it leaves in place.
-pub async fn prune_deleted_sandboxes(
-    executor: impl Executor<'_>,
+/// encrypted sidecar, which it leaves in place. The caller must pass its open
+/// transaction.
+pub async fn prune_deleted_sandboxes<C>(
+    tx: &mut C,
     retention_secs: i64,
     max_records: i64,
-) -> Result<PrunedDeletedSandboxes, DbError> {
+) -> Result<PrunedDeletedSandboxes, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let (sandbox_ids, storage_locations_detached) = sqlx::query_as::<_, (Vec<Uuid>, i64)>(sql!(
         "WITH candidates AS MATERIALIZED (
                  SELECT s.id
@@ -88,7 +92,7 @@ pub async fn prune_deleted_sandboxes(
     ))
     .bind(retention_secs)
     .bind(max_records)
-    .fetch_one(executor.into_sqlx())
+    .fetch_one(tx.into_sqlx())
     .await?;
     Ok(PrunedDeletedSandboxes {
         sandbox_ids,

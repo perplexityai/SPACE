@@ -147,13 +147,17 @@ pub async fn clear_command_ready_pending(
 ///
 /// Writes an **operation step**: the restore's ownership lease. Guarded by
 /// the lease token and its expiry only; the caller holds the sandbox row lock
-/// and has re-checked the lifecycle in the same transaction.
-pub async fn renew_restore_lease_for_execution_claim(
-    executor: impl Executor<'_>,
+/// and has re-checked the lifecycle in the same transaction. The caller must
+/// pass its open transaction.
+pub async fn renew_restore_lease_for_execution_claim<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     restore_lease_token: Uuid,
     ttl_secs: i64,
-) -> Result<bool, DbError> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let renewed = sqlx::query_scalar::<_, bool>(sql!(
         "UPDATE sandboxes
                     SET restore_lease_expires_at =
@@ -166,7 +170,7 @@ pub async fn renew_restore_lease_for_execution_claim(
     .bind(sandbox_id)
     .bind(restore_lease_token)
     .bind(ttl_secs)
-    .fetch_optional(executor.into_sqlx())
+    .fetch_optional(tx.into_sqlx())
     .await?;
     Ok(renewed.is_some())
 }
@@ -178,12 +182,16 @@ pub async fn renew_restore_lease_for_execution_claim(
 /// Writes an **observed projection**: the pod's node as Kubernetes reported
 /// it. No lifecycle predicate of its own; it relies on the caller's sandbox
 /// row lock and on the caller having just recorded the node on a still-active
-/// execution in the same transaction.
-pub async fn record_pod_node_placement(
-    executor: impl Executor<'_>,
+/// execution in the same transaction. The caller must pass its open
+/// transaction.
+pub async fn record_pod_node_placement<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     node_id: NodeId,
-) -> Result<(), DbError> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "UPDATE sandboxes
                      SET active_node_id = $1,
@@ -199,7 +207,7 @@ pub async fn record_pod_node_placement(
     ))
     .bind(node_id)
     .bind(sandbox_id)
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }

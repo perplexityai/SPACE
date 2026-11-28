@@ -317,7 +317,9 @@ async fn insert_pooled_records_the_adopting_client() -> TestResult {
     let egress_profiles = inputs.egress_profiles();
     let id = SandboxId::new();
 
-    crate::insert_pooled(&db.pool, &inputs.create(id, &egress_profiles), None).await?;
+    let mut tx = db.pool.begin().await?;
+    crate::insert_pooled(&mut *tx, &inputs.create(id, &egress_profiles), None).await?;
+    tx.commit().await?;
 
     let recorded: Option<String> = sqlx::query_scalar(sql!(
         "SELECT activating_client_id FROM sandboxes WHERE id = $1"
