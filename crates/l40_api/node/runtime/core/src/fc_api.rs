@@ -122,12 +122,37 @@ impl FcApiClient {
     }
 
     /// Load a snapshot. Call on a fresh Firecracker instance before resuming.
+    ///
+    /// On x86_64 this asks Firecracker to advance the guest wall clock
+    /// (`clock_realtime: true`), which Firecracker only accepts when the
+    /// snapshot recorded a realtime KVM clock. That depends on the host
+    /// kernel, not on the snapshot, so hosts without realtime clock support
+    /// must use [`Self::load_snapshot_with_clock_realtime`] with `false`.
     pub async fn load_snapshot(
         &self,
         snapshot_path: impl AsRef<Path>,
         mem_file_path: impl AsRef<Path>,
     ) -> Result<(), FcApiError> {
-        let body = load_snapshot_request_body(snapshot_path, mem_file_path)?;
+        self.load_snapshot_with_clock_realtime(snapshot_path, mem_file_path, true)
+            .await
+    }
+
+    /// Load a snapshot, choosing whether Firecracker may advance the guest
+    /// wall clock on x86_64 (`clock_realtime`).
+    ///
+    /// Firecracker rejects `clock_realtime: true` when the snapshot's KVM
+    /// clock state lacks `KVM_CLOCK_REALTIME` ("clock_realtime requested but
+    /// not present in the snapshot state"), and a failed load leaves the
+    /// Firecracker process unusable, so the choice has to be made before the
+    /// load. The guest monotonic clock resumes correctly either way; only
+    /// the wall clock lags by the suspension time when this is `false`.
+    pub async fn load_snapshot_with_clock_realtime(
+        &self,
+        snapshot_path: impl AsRef<Path>,
+        mem_file_path: impl AsRef<Path>,
+        clock_realtime: bool,
+    ) -> Result<(), FcApiError> {
+        let body = load_snapshot_request_body(snapshot_path, mem_file_path, clock_realtime)?;
         self.put("/snapshot/load", &body).await
     }
 
@@ -526,14 +551,21 @@ fn optional_bool(body: &serde_json::Value, field: &'static str) -> Result<bool, 
 fn load_snapshot_request_body(
     snapshot_path: impl AsRef<Path>,
     mem_file_path: impl AsRef<Path>,
+    clock_realtime: bool,
 ) -> Result<serde_json::Value, FcApiError> {
-    load_snapshot_request_body_for_arch(snapshot_path, mem_file_path, std::env::consts::ARCH)
+    load_snapshot_request_body_for_arch(
+        snapshot_path,
+        mem_file_path,
+        std::env::consts::ARCH,
+        clock_realtime,
+    )
 }
 
 fn load_snapshot_request_body_for_arch(
     snapshot_path: impl AsRef<Path>,
     mem_file_path: impl AsRef<Path>,
     arch: &str,
+    clock_realtime: bool,
 ) -> Result<serde_json::Value, FcApiError> {
     let snapshot_path = firecracker_path_str("snapshot_path", snapshot_path.as_ref())?;
     let backend_path = firecracker_path_str("mem_backend.backend_path", mem_file_path.as_ref())?;
@@ -546,7 +578,7 @@ fn load_snapshot_request_body_for_arch(
         "resume_vm": LOAD_SNAPSHOT_RESUME_VM,
         "track_dirty_pages": LOAD_SNAPSHOT_TRACK_DIRTY_PAGES
     });
-    if arch == "x86_64" {
+    if arch == "x86_64" && clock_realtime {
         body.as_object_mut()
             .ok_or(FcApiError::RequestBodyNotObject)?
             .insert("clock_realtime".to_string(), true.into());

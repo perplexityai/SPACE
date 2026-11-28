@@ -9,9 +9,13 @@ fn snapshot_request_bodies_match_firecracker_contract_on_x86_64() {
     assert_eq!(create_body["mem_file_path"], "/memory");
     assert_eq!(create_body["snapshot_type"], "Diff");
 
-    let load_body =
-        load_snapshot_request_body_for_arch(Path::new("/vmstate"), Path::new("/memory"), "x86_64")
-            .unwrap();
+    let load_body = load_snapshot_request_body_for_arch(
+        Path::new("/vmstate"),
+        Path::new("/memory"),
+        "x86_64",
+        true,
+    )
+    .unwrap();
 
     assert_eq!(load_body["snapshot_path"], "/vmstate");
     assert_eq!(load_body["mem_backend"]["backend_type"], "File");
@@ -22,10 +26,32 @@ fn snapshot_request_bodies_match_firecracker_contract_on_x86_64() {
 }
 
 #[test]
+fn load_snapshot_request_omits_realtime_clock_restore_when_disabled() {
+    let body = load_snapshot_request_body_for_arch(
+        Path::new("/vmstate"),
+        Path::new("/memory"),
+        "x86_64",
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(body["snapshot_path"], "/vmstate");
+    assert_eq!(body["mem_backend"]["backend_type"], "File");
+    assert_eq!(body["mem_backend"]["backend_path"], "/memory");
+    assert_eq!(body["resume_vm"], false);
+    assert_eq!(body["track_dirty_pages"], true);
+    assert!(body.get("clock_realtime").is_none());
+}
+
+#[test]
 fn load_snapshot_request_omits_realtime_clock_restore_on_aarch64() {
-    let body =
-        load_snapshot_request_body_for_arch(Path::new("/vmstate"), Path::new("/memory"), "aarch64")
-            .unwrap();
+    let body = load_snapshot_request_body_for_arch(
+        Path::new("/vmstate"),
+        Path::new("/memory"),
+        "aarch64",
+        true,
+    )
+    .unwrap();
 
     assert_eq!(body["snapshot_path"], "/vmstate");
     assert_eq!(body["mem_backend"]["backend_type"], "File");
@@ -60,6 +86,7 @@ fn load_snapshot_request_rejects_non_utf8_paths() {
         Path::new("/vmstate"),
         Path::new(OsStr::from_bytes(b"/tmp/\xFF")),
         "x86_64",
+        true,
     )
     .expect_err("non-UTF-8 memory backend path should fail before calling Firecracker");
 
