@@ -575,7 +575,13 @@ fn write_cgroup(dir: &Path, scale: u64) {
         ("memory.current", format!("{}\n", 300 * MIB * scale)),
         (
             "memory.stat",
-            format!("anon {}\nfile 4096\n", 256 * MIB * scale),
+            format!(
+                "anon {}\nfile {}\nfile_mapped 0\nfile_dirty {}\nfile_writeback {}\n",
+                256 * MIB * scale,
+                100 * MIB * scale,
+                40 * MIB * scale,
+                5 * MIB * scale
+            ),
         ),
         ("memory.max", format!("{}\n", 1024 * MIB * scale)),
         (
@@ -590,6 +596,24 @@ fn write_cgroup(dir: &Path, scale: u64) {
             format!(
                 "low 0\nhigh 0\nmax {}\noom 1\noom_kill {scale}\n",
                 3 * scale
+            ),
+        ),
+        (
+            "io.stat",
+            format!(
+                "259:0 rbytes={} wbytes={} rios=1 wios=1 dbytes=0 dios=0\n\
+                 253:1 rbytes={} wbytes={} rios=1 wios=1 dbytes=0 dios=0\n",
+                10 * MIB * scale,
+                20 * MIB * scale,
+                MIB * scale,
+                2 * MIB * scale
+            ),
+        ),
+        (
+            "io.pressure",
+            format!(
+                "some avg10={scale}.125 avg60=0.00 avg300=0.00 total=1\n\
+                 full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
             ),
         ),
     ] {
@@ -638,6 +662,14 @@ async fn resource_sample_reads_the_vm_cgroup_under_the_mounted_parent() {
                 resources.memory_max_events,
                 resources.memory_oom_kills,
             ),
+            (
+                resources.memory_file_mib,
+                resources.memory_file_dirty_mib,
+                resources.memory_file_writeback_mib,
+                resources.io_read_mib,
+                resources.io_write_mib,
+                resources.io_pressure_some_avg10,
+            ),
             resources.errors.count,
             resources.errors.first,
         )
@@ -661,15 +693,40 @@ async fn resource_sample_reads_the_vm_cgroup_under_the_mounted_parent() {
                 Some(6),
                 Some(2)
             ),
+            (
+                Some(200),
+                Some(80),
+                Some(10),
+                Some(22),
+                Some(44),
+                Some(2.125)
+            ),
             0,
             None,
+        )
+    );
+
+    // Without the io controller there is no `io.stat`, and without PSI no
+    // `io.pressure`: their fields stay unset and no read counts as failed.
+    std::fs::remove_file(vm_cgroup.join("io.stat")).unwrap();
+    std::fs::remove_file(vm_cgroup.join("io.pressure")).unwrap();
+    let (cpu, memory, page_cache_and_io, failed, first) =
+        sample(TransitionEvidence::gather(&request, None, &paths, limits, &reads).await);
+    assert_eq!(
+        (cpu, memory, page_cache_and_io, failed, first),
+        (
+            full.0.clone(),
+            full.1,
+            (Some(200), Some(80), Some(10), None, None, None),
+            0,
+            None
         )
     );
 
     // A file that cannot be read leaves only its own fields unset, and is
     // reported with its path.
     std::fs::remove_file(vm_cgroup.join("memory.pressure")).unwrap();
-    let (cpu, memory, failed, first) =
+    let (cpu, memory, _, failed, first) =
         sample(TransitionEvidence::gather(&request, None, &paths, limits, &reads).await);
     assert_eq!(
         (cpu, memory, failed),
@@ -688,7 +745,7 @@ async fn resource_sample_reads_the_vm_cgroup_under_the_mounted_parent() {
     // With no VM cgroup under the parent, every read fails and the report
     // keeps the first failure once.
     std::fs::remove_dir_all(&vm_cgroup).unwrap();
-    let (cpu, memory, failed, first) =
+    let (cpu, memory, page_cache_and_io, failed, first) =
         sample(TransitionEvidence::gather(&request, None, &paths, limits, &reads).await);
     assert_eq!(
         (cpu, memory, failed),
@@ -698,6 +755,7 @@ async fn resource_sample_reads_the_vm_cgroup_under_the_mounted_parent() {
             9
         )
     );
+    assert_eq!(page_cache_and_io, (None, None, None, None, None, None));
     assert!(
         first
             .expect("the failed reads are reported")
@@ -720,4 +778,35 @@ async fn cgroup_parent_is_the_mount_when_present_and_the_host_path_otherwise() {
         jailer_cgroup_path_in(&parent, &sandbox_id),
         jailer_cgroup_path(&sandbox_id)
     );
+}
+
+#[test]
+fn memory_stat_keys_match_whole_names_and_missing_keys_are_unknown() {
+    let stat = "anon 1048576\nfile 2097152\nfile_mapped 7\nfile_dirty 4096\n\
+                file_writeback 0\nfile_thp 0\n";
+    assert_eq!(keyed_u64(stat, "file"), Some(2_097_152));
+    assert_eq!(keyed_u64(stat, "file_dirty"), Some(4096));
+    assert_eq!(keyed_u64(stat, "file_writeback"), Some(0));
+    // An older kernel without the writeback breakdown.
+    let stat = "anon 1048576\nfile 2097152\n";
+    assert_eq!(keyed_u64(stat, "file_dirty"), None);
+    assert_eq!(keyed_u64(stat, "file_writeback"), None);
+}
+
+#[test]
+fn io_stat_totals_sum_devices_and_leave_missing_counters_unknown() {
+    let stat = "259:0 rbytes=1000 wbytes=2000 rios=1 wios=2 dbytes=0 dios=0\n\
+                253:1 rbytes=30 wbytes=40 rios=3 wios=4 dbytes=0 dios=0\n";
+    assert_eq!(io_stat_total(stat, "rbytes"), Some(1030));
+    assert_eq!(io_stat_total(stat, "wbytes"), Some(2040));
+    // A device line without the counter adds nothing to the others.
+    let stat = "259:0 rbytes=1000 rios=1\n253:1 rbytes=30 wbytes=40\n";
+    assert_eq!(io_stat_total(stat, "rbytes"), Some(1030));
+    assert_eq!(io_stat_total(stat, "wbytes"), Some(40));
+    assert_eq!(io_stat_total(stat, "dbytes"), None);
+    // The kernel lists only devices the cgroup has used.
+    assert_eq!(io_stat_total("", "wbytes"), Some(0));
+    assert_eq!(io_stat_total("\n", "wbytes"), Some(0));
+    // A counter that does not parse is unknown rather than zero.
+    assert_eq!(io_stat_total("259:0 wbytes=lots\n", "wbytes"), None);
 }
