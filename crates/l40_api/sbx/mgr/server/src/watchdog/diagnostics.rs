@@ -752,10 +752,11 @@ struct ResourceSample {
     memory_current_mib: Option<u64>,
     /// Anonymous memory: the guest RAM Firecracker has touched.
     memory_anon_mib: Option<u64>,
-    /// Page cache charged to the VM, mostly the host side of its disk writes,
-    /// and the parts of it waiting for and under writeback. With guest RAM
-    /// fully touched, dirty pages here throttle the VM's writes without
-    /// raising memory pressure.
+    /// Page cache charged to the VM (host-side disk page cache and, for
+    /// snapshot-restored VMs using a file-backed memory mapping, read-only
+    /// guest RAM pages before copy-on-write), plus the parts waiting for and
+    /// under writeback. With guest RAM fully touched, dirty pages here
+    /// throttle the VM's writes without raising memory pressure.
     memory_file_mib: Option<u64>,
     memory_file_dirty_mib: Option<u64>,
     memory_file_writeback_mib: Option<u64>,
@@ -764,7 +765,10 @@ struct ResourceSample {
     /// Times usage hit `memory.max`, and OOM kills, over the cgroup's life.
     memory_max_events: Option<u64>,
     memory_oom_kills: Option<u64>,
-    /// Bytes read and written across the cgroup's devices over its life.
+    /// Cumulative MiB read and written, summed across all `io.stat` device
+    /// lines over the cgroup's life. Stacked block devices (such as
+    /// device-mapper over loop) are summed per layer and can double-count
+    /// bytes, so treat these totals as a relative/trend signal.
     io_read_mib: Option<u64>,
     io_write_mib: Option<u64>,
     io_pressure_some_avg10: Option<f64>,
@@ -1133,7 +1137,8 @@ pub(super) fn keyed_u64(content: &str, key: &str) -> Option<u64> {
 /// The sum of one counter over the device lines of `io.stat`, such as
 /// `259:0 rbytes=4096 wbytes=0 rios=1 wios=0 dbytes=0 dios=0`. The kernel
 /// lists only devices the cgroup has used, so a file without device lines
-/// reads as zero; a counter no device line carries is unknown.
+/// reads as zero; a counter no device line carries is unknown. Stacked
+/// block devices appear on separate lines and can be counted more than once.
 fn io_stat_total(content: &str, key: &str) -> Option<u64> {
     let mut total = 0u64;
     let mut devices = 0;
