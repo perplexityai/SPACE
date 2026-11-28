@@ -195,15 +195,17 @@ export async function updateConsoleSandbox(
 
 // Create a sandbox under an arbitrary org from the operator surface. The
 // public create path is bound to the signed-in admin's own org; this admin
-// route enqueues the same create operation under the target org (owner
-// defaults to the org's oldest user server-side).
+// route enqueues the same create operation under the target org, owned by
+// `userId`, a user of that org the operator chose (see `sandboxOwner`). The
+// API refuses a `userId` from another org.
 export async function createConsoleSandboxForOrg(
   orgId: string,
+  userId: string,
   sandbox: unknown,
 ): Promise<SandboxOperationResponse> {
   return adminApi.post<SandboxOperationResponse>(
     '/v1/sandboxes',
-    { org_id: orgId, sandbox },
+    { org_id: orgId, user_id: userId, sandbox },
     { 'Idempotency-Key': idempotencyKey() },
   );
 }
