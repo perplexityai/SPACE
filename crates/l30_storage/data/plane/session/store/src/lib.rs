@@ -10,9 +10,12 @@
 //! revocation state and an org's epoch here. The cluster controller's
 //! retention loop deletes ended sessions with [`delete_ended_sessions`].
 //!
-//! Every verb except [`lock_live_revocation_status`] takes an executor, so a
-//! caller can run it in its own transaction. That one takes the caller's open
-//! transaction, and its row lock lasts until the caller's transaction ends.
+//! Every verb except [`lock_live_revocation_status`], [`revoke_live_session`]
+//! and [`direct::repoint_session_route`] takes an executor, so a caller can
+//! run it in its own transaction. Those three take a transaction or
+//! connection and refuse a pool: the caller passes its open transaction, and
+//! the lock [`lock_live_revocation_status`] takes lasts until that
+//! transaction ends.
 //! Statements that compare with the database clock (`NOW()`) keep the
 //! comparison in their SQL: the caller's executor decides which transaction's
 //! start time they compare against. Guarded transitions
@@ -397,15 +400,19 @@ where
 ///
 /// Its token is cleared and its first revocation reason kept. Its revocation
 /// epoch advances only when `advance_epoch`, which the caller decides from
-/// the status it read under [`lock_live_revocation_status`].
-pub async fn revoke_live_session(
-    executor: impl Executor<'_>,
+/// the status it read under [`lock_live_revocation_status`]. The caller must
+/// pass its open transaction.
+pub async fn revoke_live_session<C>(
+    tx: &mut C,
     org_id: OrgId,
     sandbox_id: SandboxId,
     session_id: &str,
     reason: &str,
     advance_epoch: bool,
-) -> Result<Option<Session>, DbError> {
+) -> Result<Option<Session>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     Ok(sqlx::query_as::<_, Session>(sql!(
         "UPDATE data_plane_sessions
              SET revocation_epoch = CASE WHEN $5::BOOL THEN revocation_epoch + 1 ELSE revocation_epoch END,
@@ -440,7 +447,7 @@ pub async fn revoke_live_session(
     .bind(session_id)
     .bind(reason)
     .bind(advance_epoch)
-    .fetch_optional(executor.into_sqlx())
+    .fetch_optional(tx.into_sqlx())
     .await?)
 }
 

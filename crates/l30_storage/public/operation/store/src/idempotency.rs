@@ -85,15 +85,19 @@ pub async fn insert_permanent_native_reply<T: Serialize + Sync>(
 
 /// Record `response_json` under `api_product`'s `key` as record `id`, with
 /// the default expiry. Fails on a record that already holds the key; the
-/// caller deletes an expired one first under the key's lock.
-pub async fn insert_reply<T: Serialize + Sync>(
-    executor: impl Executor<'_>,
+/// caller deletes an expired one first under the key's lock. The caller must
+/// pass its open transaction.
+pub async fn insert_reply<C, T: Serialize + Sync>(
+    tx: &mut C,
     id: Uuid,
     api_product: &str,
     key: IdempotencyKeyRef<'_>,
     request_fingerprint: &str,
     response_json: &T,
-) -> Result<(), DbError> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "INSERT INTO public_idempotency_records
          (id, org_id, api_product, method, path_template, idempotency_key,
@@ -108,7 +112,7 @@ pub async fn insert_reply<T: Serialize + Sync>(
     .bind(key.idempotency_key)
     .bind(request_fingerprint)
     .bind(Json(response_json))
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }

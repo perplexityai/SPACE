@@ -117,15 +117,18 @@ pub async fn partition_release(
 /// caller holds the template's publication lock, so insert order is
 /// registration order, and the original release of a hash (the earliest by
 /// `created_at`) is the one inserted first even when a twin's transaction
-/// began earlier.
-pub async fn insert_release(
-    executor: impl Executor<'_>,
+/// began earlier. The caller must pass its open transaction.
+pub async fn insert_release<C>(
+    tx: &mut C,
     template_name: &str,
     runtime: &str,
     hash: &str,
     org_id: Option<OrgId>,
     execution_metadata: Option<&serde_json::Value>,
-) -> Result<Option<RegisteredRelease>, DbError> {
+) -> Result<Option<RegisteredRelease>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     Ok(sqlx::query_as::<_, RegisteredRelease>(sql!(
         "INSERT INTO template_releases
              (template_name, type, hash, org_id, execution_metadata, created_at)
@@ -141,7 +144,7 @@ pub async fn insert_release(
     .bind(hash)
     .bind(org_id)
     .bind(execution_metadata)
-    .fetch_optional(executor.into_sqlx())
+    .fetch_optional(tx.into_sqlx())
     .await?)
 }
 
@@ -199,19 +202,23 @@ pub async fn insert_storage_location(
 /// records none. `false` when it already records some, or there is no
 /// release `release_id`. A binding another release of the build already
 /// holds fails with the partition index's unique violation. The caller holds
-/// the release's row lock while it compares or fills the metadata.
-pub async fn fill_execution_metadata(
-    executor: impl Executor<'_>,
+/// the release's row lock while it compares or fills the metadata. The
+/// caller must pass its open transaction.
+pub async fn fill_execution_metadata<C>(
+    tx: &mut C,
     release_id: Uuid,
     execution: &serde_json::Value,
-) -> Result<bool, DbError> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let result = sqlx::query(sql!(
         "UPDATE template_releases SET execution_metadata = $2
          WHERE id = $1 AND execution_metadata IS NULL"
     ))
     .bind(release_id)
     .bind(execution)
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(result.rows_affected() == 1)
 }

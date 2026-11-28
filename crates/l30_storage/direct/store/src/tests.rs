@@ -57,6 +57,15 @@ fn row(identity: &SandboxRouteIdentity) -> RouteIdentityRow {
     }
 }
 
+/// Runs [`route_identities::store_unless_newer`] in a transaction of its own
+/// and commits it.
+async fn store(pool: &PgPool, identity: &SandboxRouteIdentity) -> TestDbResult<bool> {
+    let mut tx = pool.begin().await?;
+    let stored = route_identities::store_unless_newer(&mut *tx, identity).await?;
+    tx.commit().await?;
+    Ok(stored)
+}
+
 /// Runs [`route_identities::accept_receipt`] in a transaction of its own and
 /// commits it.
 async fn accept(pool: &PgPool, identity: &SandboxRouteIdentity) -> TestDbResult<bool> {
@@ -131,13 +140,13 @@ async fn store_unless_newer_refuses_a_lower_generation() -> TestDbResult<()> {
     let sandbox_id = sandbox(pool).await?;
     let node_id = NodeId::new();
     let stored = identity(sandbox_id, 5, node_id, 5, 1);
-    assert!(route_identities::store_unless_newer(pool, &stored).await?);
+    assert!(store(pool, &stored).await?);
 
     // Losing cases: either generation lower than the stored one matches no row.
     let older_route = identity(sandbox_id, 4, NodeId::new(), 6, 2);
-    assert!(!route_identities::store_unless_newer(pool, &older_route).await?);
+    assert!(!store(pool, &older_route).await?);
     let older_execution = identity(sandbox_id, 6, NodeId::new(), 4, 2);
-    assert!(!route_identities::store_unless_newer(pool, &older_execution).await?);
+    assert!(!store(pool, &older_execution).await?);
     assert_eq!(
         route_identities::get(pool, sandbox_id).await?,
         Some(row(&stored)),
@@ -146,7 +155,7 @@ async fn store_unless_newer_refuses_a_lower_generation() -> TestDbResult<()> {
 
     // Equal generations are not newer, so they replace it, on any node.
     let moved = identity(sandbox_id, 5, NodeId::new(), 5, 0);
-    assert!(route_identities::store_unless_newer(pool, &moved).await?);
+    assert!(store(pool, &moved).await?);
     assert_eq!(
         route_identities::get(pool, sandbox_id).await?,
         Some(row(&moved))

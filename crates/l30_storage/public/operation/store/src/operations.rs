@@ -903,12 +903,16 @@ pub struct ClaimedPublicOperationRow {
 
 /// Claim `operation_id`, which the caller's transaction just created and
 /// holds: `running` under `claim_token`, one more attempt and generation,
-/// stamped at the statement's clock time.
-pub async fn claim_created(
-    executor: impl Executor<'_>,
+/// stamped at the statement's clock time. The caller must pass its open
+/// transaction.
+pub async fn claim_created<C>(
+    tx: &mut C,
     operation_id: OperationId,
     claim_token: &str,
-) -> Result<ClaimedPublicOperationRow, DbError> {
+) -> Result<ClaimedPublicOperationRow, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     Ok(sqlx::query_as::<_, ClaimedPublicOperationRow>(sql!(
         "UPDATE public_operations
          SET state = $3,
@@ -937,20 +941,24 @@ pub async fn claim_created(
     .bind(operation_id.as_uuid())
     .bind(claim_token)
     .bind(OperationState::Running.as_str())
-    .fetch_one(executor.into_sqlx())
+    .fetch_one(tx.into_sqlx())
     .await?)
 }
 
 /// Record `create_id`, whose row the caller's transaction holds, canceled
 /// with `progress_message` and the terminal error `code` and `error`,
-/// releasing any claim and dropping a federated create's service grant.
-pub async fn cancel_superseded_create(
-    executor: impl Executor<'_>,
+/// releasing any claim and dropping a federated create's service grant. The
+/// caller must pass its open transaction.
+pub async fn cancel_superseded_create<C>(
+    tx: &mut C,
     create_id: OperationId,
     progress_message: &str,
     code: &str,
     error: serde_json::Value,
-) -> Result<(), DbError> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "UPDATE public_operations
          SET state = $2,
@@ -968,7 +976,7 @@ pub async fn cancel_superseded_create(
     .bind(progress_message)
     .bind(code)
     .bind(Json(error))
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -985,11 +993,12 @@ pub struct Expiries<'a> {
 
 /// Record each operation of `expiries`, whose rows the caller's transaction
 /// holds, expired with its message and terminal error, dropping a sandbox
-/// create's federated service grant.
-pub async fn expire_each(
-    executor: impl Executor<'_>,
-    expiries: Expiries<'_>,
-) -> Result<(), DbError> {
+/// create's federated service grant. The caller must pass its open
+/// transaction.
+pub async fn expire_each<C>(tx: &mut C, expiries: Expiries<'_>) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "UPDATE public_operations o
          SET state = $1,
@@ -1016,7 +1025,7 @@ pub async fn expire_each(
             .map(Json)
             .collect::<Vec<_>>(),
     )
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }

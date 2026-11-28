@@ -11,8 +11,10 @@
 //! The three tables are credential-fenced: only the credentials roles can
 //! read them, so run these verbs on a credentials pool.
 //!
-//! Verbs are executor-generic free functions, so a caller that needs two of
-//! them to see one state composes them in its own transaction. The stored
+//! Verbs are free functions, so a caller that needs two of them to see one
+//! state composes them in its own transaction. Most are executor-generic;
+//! [`insert_branching_key`], which must commit with the KEK it belongs to,
+//! takes a transaction or connection and refuses a pool. The stored
 //! provider and key identifier are returned as text: the caller parses them
 //! and reports a malformed row against the KEK it names. Verbs arrive with
 //! their first caller.
@@ -117,13 +119,17 @@ pub async fn insert_active_master_key(
 }
 
 /// Record the broker-wrapped intermediate key of the KEK `cmk_id`. Run it in
-/// the transaction that inserted the KEK, so neither row commits alone.
-pub async fn insert_branching_key(
-    executor: impl Executor<'_>,
+/// the transaction that inserted the KEK, so neither row commits alone. The
+/// caller must pass its open transaction.
+pub async fn insert_branching_key<C>(
+    tx: &mut C,
     cmk_id: Uuid,
     org: OrgId,
     wrapped_key: &[u8],
-) -> Result<(), DbError> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "INSERT INTO org_branching_keys (cmk_id, org_id, wrapped_key) \
          VALUES ($1, $2, $3)"
@@ -131,7 +137,7 @@ pub async fn insert_branching_key(
     .bind(cmk_id)
     .bind(org.as_uuid())
     .bind(wrapped_key)
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }

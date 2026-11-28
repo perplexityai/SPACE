@@ -47,7 +47,9 @@ async fn record_row(pool: &PgPool, id: Uuid) -> TestResult<Option<serde_json::Va
 async fn claimed(pool: &PgPool, kind: OperationKind) -> TestResult<(OperationId, String, i64)> {
     let operation_id = insert_queued(pool, kind, &sandbox_target()).await?;
     let token = format!("test-claim-{}", Uuid::now_v7());
-    let row = operations::claim_created(pool, operation_id, &token).await?;
+    let mut tx = pool.begin().await?;
+    let row = operations::claim_created(&mut *tx, operation_id, &token).await?;
+    tx.commit().await?;
     Ok((operation_id, token, row.claim_generation))
 }
 
@@ -371,8 +373,9 @@ async fn a_reply_no_longer_as_recorded_is_neither_replaced_nor_deleted() -> Test
     let id = Uuid::now_v7();
     let reserved = serde_json::json!({"reservation": "pending"});
     let idempotency_key = Uuid::now_v7().to_string();
+    let mut tx = pool.begin().await?;
     idempotency::insert_reply(
-        pool,
+        &mut *tx,
         id,
         "native",
         key(&idempotency_key)?,
@@ -380,6 +383,7 @@ async fn a_reply_no_longer_as_recorded_is_neither_replaced_nor_deleted() -> Test
         &reserved,
     )
     .await?;
+    tx.commit().await?;
     let before = record_row(pool, id).await?;
 
     let other = serde_json::json!({"reservation": "completed"});
