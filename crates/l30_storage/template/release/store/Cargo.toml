@@ -8,7 +8,14 @@ license.workspace = true
 publish.workspace = true
 
 [package.metadata.space.state]
-postgres = ["template_release_storage_locations", "template_releases"]
+# template_release_storage_location_encrypted_fields is a storage location's
+# credential-fenced encryption sidecar. No production code writes it; its rows
+# go with their location's delete, by foreign-key cascade.
+postgres = [
+  "template_release_storage_location_encrypted_fields",
+  "template_release_storage_locations",
+  "template_releases",
+]
 
 [lints]
 workspace = true
