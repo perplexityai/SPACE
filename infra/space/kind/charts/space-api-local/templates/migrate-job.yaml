@@ -25,9 +25,17 @@ spec:
   activeDeadlineSeconds: {{ .Values.migrate.jobDeadlineSeconds }}
   template:
     metadata:
+      # Without these tags, Datadog files the Job's lines under the API image's
+      # short name without service:space-db-migrator, SPACE's cluster_id, or
+      # version, so lock-race retry and "giving up on the migration" warnings
+      # cannot be scoped to the migrator or cluster. Coerce values with toString
+      # so numeric --set values (e.g. all-digit short SHAs) stay JSON strings.
+      annotations:
+        ad.datadoghq.com/tags: {{ dict "team" (toString .Values.datadogTeam) "cluster_id" (toString .Values.clusterId) "version" (toString (.Values.telemetry.version | default .Values.image.tag)) | toJson | quote }}
       labels:
         app.kubernetes.io/name: space-db-migrate
         app.kubernetes.io/instance: {{ .Release.Name }}
+        tags.datadoghq.com/service: space-db-migrator
     spec:
       restartPolicy: Never
       {{- with .Values.nodeSelector }}
