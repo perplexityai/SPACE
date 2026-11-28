@@ -61,6 +61,7 @@ pub struct ActiveExecutionRecord {
     /// `updated_at` is at least the caller's age limit old, by the database
     /// clock.
     pub create_age_expired: bool,
+    pub updated_at: time::OffsetDateTime,
     pub activation_attempt_id: Option<SandboxActivationAttemptId>,
     pub route_activation_id: Option<SandboxActivationAttemptId>,
 }
@@ -77,6 +78,7 @@ pub async fn active_execution(
                 NULLIF(BTRIM(pod_uid), '') IS NOT NULL AS pod_materialized,
                 state,
                 updated_at <= NOW() - make_interval(secs => $2) AS create_age_expired,
+                updated_at,
                 activation_attempt_id, route_activation_id
          FROM sandbox_k8s_executions
          WHERE sandbox_id = $1 AND active"
@@ -666,10 +668,14 @@ pub struct ActiveExecutionStatus {
     pub current_node_id: Option<NodeId>,
     pub state: String,
     pub lifecycle: String,
+    /// Whether the execution row has ever materialized a pod (`pod_materialized_at IS NOT NULL`).
+    pub pod_materialized_at_set: bool,
+    pub updated_at: time::OffsetDateTime,
     /// Whether the execution row was last updated at least `create_ttl_secs`
     /// ago by the database clock.
     pub create_age_expired: bool,
     pub activation_attempt_id: Option<SandboxActivationAttemptId>,
+    pub activation_attempt_live: bool,
     pub route_activation_id: Option<SandboxActivationAttemptId>,
     pub activating_client_id: Option<ClientId>,
 }
@@ -685,8 +691,13 @@ pub async fn active_execution_status(
         "SELECT e.generation, e.pod_name, NULLIF(BTRIM(e.pod_uid), '') AS pod_uid,
                     host(e.pod_ip) AS pod_ip, s.active_node_id AS current_node_id,
                     e.k8s_node_name, e.state, s.lifecycle,
+                    e.pod_materialized_at IS NOT NULL AS pod_materialized_at_set,
+                    e.updated_at,
                     e.updated_at <= NOW() - make_interval(secs => $2) AS create_age_expired,
                     e.activation_attempt_id,
+                    (e.activation_attempt_id IS NOT NULL
+                        AND COALESCE(e.activation_attempt_expires_at > NOW(), TRUE))
+                        AS activation_attempt_live,
                     e.route_activation_id, s.activating_client_id
              FROM sandbox_k8s_executions e
              JOIN sandboxes s ON s.id = e.sandbox_id

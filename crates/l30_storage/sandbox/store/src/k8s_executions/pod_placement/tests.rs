@@ -8,7 +8,7 @@ use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
-use super::{claim_pod_materialization, refresh_selected_route_pod_ip};
+use super::{claim_pod_materialization, record_confirmed_pod_ip, refresh_selected_route_pod_ip};
 
 async fn insert_sandbox(pool: &PgPool) -> TestResult<SandboxId> {
     let id = SandboxId::new();
@@ -219,5 +219,128 @@ async fn claim_pod_materialization_claims_only_the_active_generation() -> TestRe
     let (state, _, _, materialized, _) = read_execution(pool, recovering, 1).await?;
     assert_eq!(state, "recovering");
     assert!(!materialized);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn record_confirmed_pod_ip_promotes_unassigned_and_avoids_locking_confirmed_rows()
+-> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+
+    // 1. `created` with `pod_ip IS NULL` promotes to `running` at the confirmed IP.
+    let created = insert_sandbox(pool).await?;
+    insert_execution(pool, created, 1, "created", true, Some("uid-a"), None).await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions SET pod_ip = NULL WHERE sandbox_id = $1 AND generation = 1"
+    ))
+    .bind(created)
+    .execute(pool)
+    .await?;
+    let before = read_execution(pool, created, 1).await?;
+
+    // Wrong generation or UID leaves the row untouched.
+    assert!(!record_confirmed_pod_ip(pool, created, 2, "uid-a", "10.1.0.7").await?);
+    assert!(!record_confirmed_pod_ip(pool, created, 1, "uid-b", "10.1.0.7").await?);
+    assert_eq!(read_execution(pool, created, 1).await?, before);
+
+    assert!(record_confirmed_pod_ip(pool, created, 1, "uid-a", "10.1.0.7").await?);
+    let after_confirm = read_execution(pool, created, 1).await?;
+    assert_eq!(after_confirm.0, "running");
+    assert_eq!(after_confirm.2.as_deref(), Some("10.1.0.7"));
+    assert!(after_confirm.4 > before.4);
+
+    // Different IP on an already-confirmed row is rejected without modifying it.
+    assert!(!record_confirmed_pod_ip(pool, created, 1, "uid-a", "10.1.0.8").await?);
+    assert_eq!(read_execution(pool, created, 1).await?, after_confirm);
+
+    // Repeated confirmation on `running` with the same IP does not acquire a row
+    // lock: it succeeds immediately even while another transaction holds `FOR UPDATE`.
+    let mut running_lock_tx = pool.begin().await?;
+    sqlx::query(sql!(
+        "SELECT 1 FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND generation = 1 FOR UPDATE"
+    ))
+    .bind(created)
+    .fetch_one(&mut *running_lock_tx)
+    .await?;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            record_confirmed_pod_ip(pool, created, 1, "uid-a", "10.1.0.7"),
+        )
+        .await
+        .expect("repeated confirmation on running row must not block on FOR UPDATE")?
+    );
+    running_lock_tx.rollback().await?;
+    assert_eq!(read_execution(pool, created, 1).await?, after_confirm);
+
+    // 2. `recovering` with `pod_ip IS NULL` fills `pod_ip` while keeping `state`
+    // and `updated_at`, and repeated confirmation on `recovering` also takes no
+    // row lock while recovery holds `FOR UPDATE`.
+    let recovering = insert_sandbox(pool).await?;
+    insert_execution(pool, recovering, 1, "recovering", true, Some("uid-r"), None).await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET pod_ip = NULL,
+                updated_at = NOW() - INTERVAL '1 hour'
+          WHERE sandbox_id = $1 AND generation = 1"
+    ))
+    .bind(recovering)
+    .execute(pool)
+    .await?;
+    let recovering_before = read_execution(pool, recovering, 1).await?;
+    assert!(record_confirmed_pod_ip(pool, recovering, 1, "uid-r", "10.1.0.7").await?);
+    let recovering_after = read_execution(pool, recovering, 1).await?;
+    assert_eq!(recovering_after.0, "recovering");
+    assert_eq!(recovering_after.2.as_deref(), Some("10.1.0.7"));
+    assert_eq!(recovering_after.4, recovering_before.4);
+
+    let mut recovery_lock_tx = pool.begin().await?;
+    sqlx::query(sql!(
+        "SELECT 1 FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND generation = 1 FOR UPDATE"
+    ))
+    .bind(recovering)
+    .fetch_one(&mut *recovery_lock_tx)
+    .await?;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            record_confirmed_pod_ip(pool, recovering, 1, "uid-r", "10.1.0.7"),
+        )
+        .await
+        .expect("repeated confirmation on recovering row must not block on FOR UPDATE")?
+    );
+    recovery_lock_tx.rollback().await?;
+
+    // 3. `running` with `pod_ip IS NULL` (such as a warm-pool claim bound before
+    // kubelet populated `pod_ip`) fills `pod_ip` and stamps `updated_at`.
+    let running_unassigned = insert_sandbox(pool).await?;
+    insert_execution(
+        pool,
+        running_unassigned,
+        1,
+        "running",
+        true,
+        Some("uid-pool"),
+        None,
+    )
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET pod_ip = NULL,
+                updated_at = NOW() - INTERVAL '1 hour'
+          WHERE sandbox_id = $1 AND generation = 1"
+    ))
+    .bind(running_unassigned)
+    .execute(pool)
+    .await?;
+    let pool_before = read_execution(pool, running_unassigned, 1).await?;
+    assert!(record_confirmed_pod_ip(pool, running_unassigned, 1, "uid-pool", "10.1.0.7").await?);
+    let pool_after = read_execution(pool, running_unassigned, 1).await?;
+    assert_eq!(pool_after.0, "running");
+    assert_eq!(pool_after.2.as_deref(), Some("10.1.0.7"));
+    assert!(pool_after.4 > pool_before.4);
     Ok(())
 }

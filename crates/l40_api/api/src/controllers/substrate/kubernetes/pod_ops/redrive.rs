@@ -696,6 +696,7 @@ impl KubernetesSubstrate {
                 }
             };
 
+            let cross_node_pod_ip = assigned_pod_ip(&cross_node_pod)?.map(|ip| ip.to_string());
             match self
                 .store
                 .persist_materialized_pod_metadata(
@@ -703,7 +704,7 @@ impl KubernetesSubstrate {
                     claim.row.generation,
                     claim_lifecycle,
                     cross_node_pod.uid(),
-                    None,
+                    cross_node_pod_ip.as_deref(),
                     cross_node_pod.client_id().as_ref(),
                 )
                 .await
@@ -713,13 +714,19 @@ impl KubernetesSubstrate {
                     // Materialization ownership was revoked between the two
                     // creates; drop the cross-node pod we just made and let the
                     // winner drive.
-                    self.delete_pod_and_forget_tracking(
-                        sandbox.id,
-                        pod_name,
-                        claim.row.generation,
-                        PodTrackingCleanupCause::ExplicitTeardown,
-                    )
-                    .await?;
+                    let _ = self
+                        .delete_pod_and_forget_tracking(
+                            TerminalPodCleanup {
+                                sandbox_id: sandbox.id,
+                                pod_name,
+                                generation: claim.row.generation,
+                                expected_delete_uid: cross_node_pod.uid(),
+                                activation_attempt_id: claim.row.activation_attempt_id,
+                                pod_fence: crate::controllers::substrate::kubernetes::store::ObservedAttemptPodFence::exact_uid(None),
+                            },
+                            PodTrackingCleanupCause::ExplicitTeardown,
+                        )
+                        .await?;
                     Ok(RedriveOutcome::OwnershipLost)
                 }
                 Err(error) => {

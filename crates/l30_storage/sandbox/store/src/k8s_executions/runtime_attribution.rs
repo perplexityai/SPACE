@@ -16,6 +16,7 @@ use pplx_space_sql_locator::sql;
 pub struct TrackedPodRow {
     pub pod_uid: Option<String>,
     pub pod_ip: Option<String>,
+    pub pod_materialized_at_set: bool,
 }
 
 /// Lock the active execution row of `sandbox_id` at `generation`
@@ -30,8 +31,8 @@ pub async fn lock_tracked_pod<C>(
 where
     for<'a> &'a mut C: Executor<'a>,
 {
-    let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(sql!(
-        "SELECT NULLIF(BTRIM(pod_uid), ''), HOST(pod_ip)::TEXT
+    let row = sqlx::query_as::<_, (Option<String>, Option<String>, bool)>(sql!(
+        "SELECT NULLIF(BTRIM(pod_uid), ''), HOST(pod_ip)::TEXT, pod_materialized_at IS NOT NULL
                FROM sandbox_k8s_executions
               WHERE sandbox_id = $1 AND generation = $2 AND active
               FOR UPDATE"
@@ -40,7 +41,13 @@ where
     .bind(generation)
     .fetch_optional(conn.into_sqlx())
     .await?;
-    Ok(row.map(|(pod_uid, pod_ip)| TrackedPodRow { pod_uid, pod_ip }))
+    Ok(
+        row.map(|(pod_uid, pod_ip, pod_materialized_at_set)| TrackedPodRow {
+            pod_uid,
+            pod_ip,
+            pod_materialized_at_set,
+        }),
+    )
 }
 
 #[cfg(test)]

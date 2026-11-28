@@ -91,8 +91,8 @@ async fn lock_tracked_pod_reads_the_active_generations_uid() -> TestResult {
     assert_eq!(
         lock_tracked_pod(&mut *tx, tracked, 2)
             .await?
-            .map(|pod| pod.pod_uid),
-        Some(Some("uid-a".to_string()))
+            .map(|pod| (pod.pod_uid, pod.pod_materialized_at_set)),
+        Some((Some("uid-a".to_string()), false))
     );
     assert_eq!(
         lock_tracked_pod(&mut *tx, blank, 1)

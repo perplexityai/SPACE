@@ -2,6 +2,12 @@
 
 use super::pooled::PooledPodEnvironment;
 use super::*;
+use crate::controllers::substrate::kubernetes::pod_ops::{
+    ScheduledCreatePodRead, is_kube_api_throttling_error, is_transient_kube_read_error,
+};
+use crate::controllers::substrate::kubernetes::store::{
+    FencedPodMetadataOutcome, ObservedAttemptPodFence, PodMetadataFence, PodTrackingCleanupCause,
+};
 use crate::controllers::substrate::runtime_upgrade::UpgradeActivation;
 use pplx_space_node_model::NodePoolName;
 use pplx_space_node_registration_store::lookup as node_lookup;
@@ -141,79 +147,18 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         Some(owner_attempt_id),
                         SandboxTransitionTargetState::Started,
                     )
-                    .await?;
-                let execution = fence.execution;
+                    .await
+                    .map_err(SubstrateError::preserve_joined_create_row)?;
                 let (_, phase_deadline) = self.budgets.ready_wait_bounds(self.budgets.create_ready);
-                let (pod_ip, binding) = self
-                    .wait_for_pod_proxy_reachable(
-                        request.metric_identity,
+                return self
+                    .join_in_flight_create_execution(
+                        &request,
                         sandbox_id,
-                        PodProxyWaitTarget {
-                            pod_name: &execution.pod_name,
-                            pod_uid: execution.pod_uid.as_ref().map(PodUid::as_str),
-                            generation: execution.generation,
-                        },
-                        "create_join",
+                        fence.execution,
                         phase_deadline,
                     )
-                    .await?;
-                // A guest that does not answer within the create's wait leaves
-                // the joined create returning the owner's reachable pod as
-                // started, not command-ready, as a create that owns its pod
-                // does. An error here would make the caller delete its sandbox
-                // row, and with it the execution the owner is still starting.
-                let binding = if request.wait_until_ready {
-                    match self
-                        .poll_until_command_ready(
-                            sandbox_id,
-                            request.metric_identity,
-                            command_ready_bound(
-                                self.k8s.create_command_ready_timeout,
-                                request.command_ready_wait,
-                            )
-                            .min(remaining_ready_window(phase_deadline)),
-                            CommandReadyPod::PreResolved(pod_ip),
-                            Some(request.template_ref.template.as_str()),
-                        )
-                        .await
-                    {
-                        Ok(binding) => Some(binding),
-                        Err(SubstrateError::Timeout { .. }) => None,
-                        Err(error) => return Err(error),
-                    }
-                } else {
-                    Some(binding)
-                };
-                let joined_pod = match self.lookup_sandbox_pod(&execution.pod_name) {
-                    Some(pod) => Some(pod),
-                    None => fetch_sandbox_pod_uncached(&self.k8s, &execution.pod_name)
-                        .await
-                        .map_err(|error| SubstrateError::Failed {
-                            message: format!("failed to query joined create pod: {error}"),
-                        })?,
-                }
-                .ok_or_else(|| SubstrateError::Unavailable {
-                    message: "joined create reached readiness but its pod disappeared".to_string(),
-                })?;
-                let active_node_id = self
-                    .remember_pod_node_placement(
-                        sandbox_uuid,
-                        &joined_pod,
-                        PlacementRetryDisposition::RetryDuplicatesExecution,
-                    )
-                    .await?
-                    .ok_or_else(|| SubstrateError::Unavailable {
-                        message: "joined create pod has no registered node placement".to_string(),
-                    })?;
-                return Ok(CreateExecutionOutcome {
-                    lease_completion: None,
-                    sandbox_id,
-                    command_ready: binding.is_some(),
-                    binding,
-                    initial_lifecycle: "started",
-                    initial_placement: "on_node",
-                    active_node_id: Some(active_node_id),
-                });
+                    .await
+                    .map_err(SubstrateError::preserve_joined_create_row);
             }
             Err(error) => return Err(error),
         };
@@ -434,43 +379,60 @@ impl SubstrateAdapter for KubernetesSubstrate {
             },
         );
 
-        let mut active_node_id = self
-            .remember_pod_node_placement(
+        let initial_placement_fenced = self
+            .remember_pod_node_placement_fenced(
                 sandbox_uuid,
+                execution.generation,
+                None,
                 &pod,
                 PlacementRetryDisposition::RetryDuplicatesExecution,
             )
             .await?;
+        let mut active_node_id = initial_placement_fenced.node_id;
+        let creating_updated_at = initial_placement_fenced
+            .execution_updated_at
+            .unwrap_or(execution.updated_at);
         let pod_uid = pod.uid().map(str::to_owned);
         let pod_ip = assigned_pod_ip(&pod)?;
         let phase = normalize_pod_phase(pod.phase().map(str::to_owned), "pending");
 
         let pod_ip_string = pod_ip.map(|ip| ip.to_string());
-        match self
+        let creating_repair_epoch = match self
             .store
-            .persist_pod_metadata(
+            .persist_pod_metadata_if_unchanged(
                 sandbox_uuid,
                 execution.generation,
+                PodMetadataFence {
+                    expected_pod_uid: None,
+                    expected_pod_ip: None,
+                    expected_pod_materialized_at_set: false,
+                },
                 pod_uid.as_deref(),
                 pod_ip_string.as_deref(),
                 pod.client_id().as_ref(),
             )
             .await
         {
-            Ok(Some(_)) => {}
-            Ok(None) => tracing::warn!(
-                sandbox_id = %sandbox_id,
-                generation = execution.generation,
-                "pod metadata write no-oped after pod create: the execution was \
-                 retired or replaced mid-flight"
-            ),
-            Err(err) => tracing::warn!(
-                sandbox_id = %sandbox_id,
-                generation = execution.generation,
-                error = %err,
-                "failed to persist Kubernetes pod metadata after pod create"
-            ),
-        }
+            Ok(FencedPodMetadataOutcome::Applied(_)) => None,
+            Ok(FencedPodMetadataOutcome::Retired | FencedPodMetadataOutcome::Superseded) => {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    generation = execution.generation,
+                    "pod metadata write fenced out after pod create: the execution was \
+                     retired or replaced mid-flight"
+                );
+                None
+            }
+            Err(err) => {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    generation = execution.generation,
+                    error = %err,
+                    "failed to persist Kubernetes pod metadata after pod create"
+                );
+                Some(creating_updated_at)
+            }
+        };
 
         let wait_until_ready = request.wait_until_ready;
         // Cap the combined readiness wait at the ALB-aware budget. The two
@@ -487,12 +449,9 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 .wait_for_pod_proxy_reachable(
                     request.metric_identity,
                     sandbox_id,
-                    PodProxyWaitTarget {
-                        pod_name: &pod_name,
-                        pod_uid: pod_uid.as_deref(),
-                        generation: execution.generation,
-                    },
-                    "create",
+                    PodProxyWaitTarget::new(&pod_name, pod_uid.as_deref(), execution.generation)
+                        .with_creating_repair_epoch(creating_repair_epoch)
+                        .abort_on_uid_change(),
                     phase_deadline,
                 )
                 .instrument(tracing::info_span!(
@@ -632,40 +591,114 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 // arm. So this is "cleanup was handed off", which is the most
                 // this call can establish; the orphan reconciler owns the rest.
                 // The distinction matters because it is the demotion's input.
-                let pod_cleanup_accepted = match delete_sandbox_pod(&self.k8s, &pod_name).await {
-                    Ok(()) => true,
-                    // `delete_sandbox_pod` propagates the raw apiserver error,
-                    // so an already-absent pod arrives here as 404. That is the
-                    // most confirmed removal there is — treating it as
-                    // unconfirmed would demote the common benign race.
-                    Err(delete_err) if is_not_found_error(&delete_err) => true,
-                    Err(delete_err) => {
-                        tracing::error!(
-                            sandbox_id = %sandbox_id,
-                            pod_name = %pod_name,
-                            error = %delete_err,
-                            "failed to delete sandbox pod during creation cleanup — pod may be orphaned"
-                        );
-                        false
-                    }
+                let parsed_pod_uid = pod_uid.as_deref().and_then(|uid| PodUid::parse(uid).ok());
+                let delete_result = match parsed_pod_uid.as_ref() {
+                    Some(uid) => delete_sandbox_pod_if_uid(&self.k8s, &pod_name, uid).await,
+                    None => delete_sandbox_pod(&self.k8s, &pod_name).await,
                 };
-                if let Err(forget_err) = self
-                    .store
-                    .forget_pod_tracking_if_generation_and_attempt(
-                        sandbox_uuid,
-                        execution.generation,
-                        activation_attempt_id,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        sandbox_id = %sandbox_id,
-                        generation = execution.generation,
-                        error = %forget_err,
-                        "failed to forget Kubernetes pod tracking after creation cleanup"
+                let (pod_cleanup_accepted, should_forget_tracking) = match delete_result {
+                    Ok(()) => (true, true),
+                    // `delete_sandbox_pod*` propagates the raw apiserver error:
+                    // `404` proves our pod is gone so our attempt's tracking may
+                    // be retired, whereas `409` on the UID precondition proves a
+                    // live successor pod already owns `pod_name` — leave its
+                    // execution row untouched and demote `err` so the caller
+                    // does not create a duplicate sandbox while the successor
+                    // is running.
+                    Err(delete_err) => match classify_fenced_pod_delete_error(&delete_err) {
+                        Some(
+                            FencedPodDeleteOutcome::Deleted | FencedPodDeleteOutcome::NotFound,
+                        ) => (true, true),
+                        Some(FencedPodDeleteOutcome::PreconditionFailed) => {
+                            cancel_guard.defuse();
+                            return self
+                                .recover_or_fail_unmatched_create_execution(
+                                    &request,
+                                    UnmatchedCreateRecovery {
+                                        sandbox_id,
+                                        sandbox_uuid,
+                                        generation: execution.generation,
+                                        pod_name: &pod_name,
+                                        pod_uid: pod_uid.as_deref(),
+                                        creating_repair_epoch,
+                                        activation_attempt_id,
+                                        phase_deadline,
+                                        post_create_not_found: false,
+                                        known_live_successor_pod: true,
+                                        failure_message: err.to_string(),
+                                    },
+                                )
+                                .await;
+                        }
+                        None => {
+                            tracing::error!(
+                                sandbox_id = %sandbox_id,
+                                pod_name = %pod_name,
+                                error = %delete_err,
+                                "failed to delete sandbox pod during creation cleanup — pod may be orphaned"
+                            );
+                            (false, true)
+                        }
+                    },
+                };
+                let mut tracking_superseded = false;
+                if should_forget_tracking {
+                    let pod_fence = ObservedAttemptPodFence::deleted_create_pod(
+                        pod_uid.as_deref(),
+                        creating_repair_epoch,
                     );
+                    match self
+                        .store
+                        .forget_pod_tracking_if_generation_and_observed_attempt(
+                            sandbox_uuid,
+                            execution.generation,
+                            Some(activation_attempt_id),
+                            pod_fence,
+                            PodTrackingCleanupCause::ExplicitTeardown,
+                        )
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            self.store
+                                .release_activation_attempt_best_effort(
+                                    sandbox_id,
+                                    execution.generation,
+                                    activation_attempt_id,
+                                )
+                                .await;
+                            tracking_superseded = self
+                                .store
+                                .active_execution_status(sandbox_id)
+                                .await
+                                .ok()
+                                .flatten()
+                                .is_some();
+                        }
+                        Err(forget_err) => {
+                            tracing::warn!(
+                                sandbox_id = %sandbox_id,
+                                generation = execution.generation,
+                                error = %forget_err,
+                                "failed to forget Kubernetes pod tracking after creation cleanup"
+                            );
+                        }
+                    }
+                } else {
+                    self.store
+                        .release_activation_attempt_best_effort(
+                            sandbox_id,
+                            execution.generation,
+                            activation_attempt_id,
+                        )
+                        .await;
                 }
                 cancel_guard.defuse();
+                if tracking_superseded {
+                    return Err(SubstrateError::CreateSuperseded {
+                        message: err.to_string(),
+                    });
+                }
                 // The pod delete is best-effort and only logs. When it was not
                 // even accepted, nothing is removing this pod, so `err` must
                 // not tell the caller to retry: `create` mints a fresh
@@ -687,34 +720,77 @@ impl SubstrateAdapter for KubernetesSubstrate {
             _ => "started",
         };
 
-        // The reflector watch and the per-pod watch used by
-        // `wait_for_pod_proxy_reachable` are independent streams, so the
-        // reflector cache may briefly lag the scheduler-binding MODIFIED
-        // event. We are at the post-readiness step, so the pod must have
-        // been bound to a node by now; if the cache still shows it as
+        // `wait_for_pod_proxy_reachable` can bind the pod from a backstop
+        // read while the reflector cache still lags the scheduler-binding
+        // MODIFIED event. We are at the post-readiness step, so the pod must
+        // have been bound to a node by now; if the cache still shows it as
         // unscheduled, that is definitive evidence of a stale cache and
         // we must fall back to an authoritative GET. Without this check,
         // a stale cache hit would leave `active_node_id` as `None` and the
         // caller's `UPDATE sandboxes SET active_node_id = $3` would clear
-        // the placement that the watch already persisted to the DB.
-        let post_create_pod = match self.lookup_sandbox_pod(&pod_name) {
-            Some(pod) if assigned_pod_node_name(&pod).is_some() => Some(pod),
-            _ => fetch_sandbox_pod_uncached(&self.k8s, &pod_name)
-                .await
-                .map_err(|err| SubstrateError::Failed {
-                    message: format!("failed to query created sandbox pod placement: {err}"),
-                })?,
-        };
-        if let Some(pod) = post_create_pod
-            && let Some(node_id) = self
-                .remember_pod_node_placement(
-                    sandbox_uuid,
-                    &pod,
-                    PlacementRetryDisposition::RetryDuplicatesExecution,
+        // the placement that the readiness wait already persisted to the DB.
+        let post_create_pod = self
+            .read_scheduled_create_pod(
+                &pod_name,
+                pod_uid.as_deref(),
+                "failed to query created sandbox pod placement",
+            )
+            .await
+            .map_err(|err| err.demoted_after_side_effect())?;
+        let (pod_matched_execution, post_create_not_found, known_live_successor_pod) =
+            match post_create_pod {
+                ScheduledCreatePodRead::Matched(pod) => {
+                    let placement = self
+                        .remember_pod_node_placement_fenced(
+                            sandbox_uuid,
+                            execution.generation,
+                            pod_uid.as_deref().or_else(|| pod.uid()),
+                            &pod,
+                            PlacementRetryDisposition::RetryDuplicatesExecution,
+                        )
+                        .await
+                        .map_err(|err| err.demoted_after_side_effect())?;
+                    if placement.matched_execution {
+                        if let Some(node_id) = placement.node_id {
+                            active_node_id = Some(node_id);
+                        }
+                        (true, false, false)
+                    } else {
+                        (false, false, false)
+                    }
+                }
+                ScheduledCreatePodRead::SupersededUid => (false, false, true),
+                ScheduledCreatePodRead::NotFound => (false, true, false),
+            };
+        if !pod_matched_execution {
+            cancel_guard.defuse();
+            let failure_message = if post_create_not_found {
+                format!(
+                    "sandbox {sandbox_id} pod {pod_name} vanished before node placement completed"
                 )
-                .await?
-        {
-            active_node_id = Some(node_id);
+            } else {
+                format!(
+                    "sandbox {sandbox_id} execution was superseded or retired before node placement completed"
+                )
+            };
+            return self
+                .recover_or_fail_unmatched_create_execution(
+                    &request,
+                    UnmatchedCreateRecovery {
+                        sandbox_id,
+                        sandbox_uuid,
+                        generation: execution.generation,
+                        pod_name: &pod_name,
+                        pod_uid: pod_uid.as_deref(),
+                        creating_repair_epoch,
+                        activation_attempt_id,
+                        phase_deadline,
+                        post_create_not_found,
+                        known_live_successor_pod,
+                        failure_message,
+                    },
+                )
+                .await;
         }
 
         cancel_guard.defuse();
@@ -1673,8 +1749,21 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 return Ok(claim_attempt);
             };
 
-            let pod = match self.read_sandbox_pod(&claim.pod_name).await {
-                Ok(pod) => pod,
+            let pod = match self.read_pooled_claim_pod(&claim).await {
+                Ok(super::pod_ops::PooledClaimPodObservation::Observed(pod)) => pod,
+                Ok(super::pod_ops::PooledClaimPodObservation::ReflectorLagging) => {
+                    pool::release_claimed_pool_slot(self.store.pool(), &claim).await?;
+                    tracing::info!(
+                        claim_id = %claim.claim_id,
+                        sandbox_id = %claim.sandbox_id,
+                        pod_name = %claim.pod_name,
+                        attempt,
+                        "shared pod reflector still shows claimed warm-pool pod as pre-Running; released claim and falling back"
+                    );
+                    return Ok(PooledExecutionClaimAttempt::missed(
+                        claim_attempt.pool_shape,
+                    ));
+                }
                 Err(error) => {
                     pool::release_claimed_pool_slot(self.store.pool(), &claim).await?;
                     tracing::warn!(
@@ -2257,8 +2346,17 @@ impl SubstrateAdapter for KubernetesSubstrate {
         // the inventory would let another create bind the same ID. Every
         // refusal here invalidates instead: the slot leaves the inventory, the
         // stale-claimed sweep collects its pod, and this create builds cold.
-        let usable = match self.read_sandbox_pod(&claim.pod_name).await {
-            Ok(pod) => {
+        let usable = match self.read_pooled_claim_pod(&claim).await {
+            Ok(super::pod_ops::PooledClaimPodObservation::ReflectorLagging) => {
+                tracing::info!(
+                    claim_id = %claim.claim_id,
+                    sandbox_id = %claim.sandbox_id,
+                    pod_name = %claim.pod_name,
+                    "shared pod reflector still shows admitted warm-pool pod as pre-Running; keeping claim for retry"
+                );
+                return Ok(AdmittedPoolClaimLookup::Transient);
+            }
+            Ok(super::pod_ops::PooledClaimPodObservation::Observed(pod)) => {
                 pooled_claim_pod_is_usable(&claim, pod.as_deref())
                     && self
                         .admitted_pool_pod_placement_admits(request, pod.as_deref())
@@ -2278,6 +2376,18 @@ impl SubstrateAdapter for KubernetesSubstrate {
                             false
                         }
                     }
+            }
+            Err(error)
+                if is_kube_api_throttling_error(&error) || is_transient_kube_read_error(&error) =>
+            {
+                tracing::warn!(
+                    claim_id = %claim.claim_id,
+                    sandbox_id = %claim.sandbox_id,
+                    pod_name = %claim.pod_name,
+                    %error,
+                    "transient failure reading admitted warm-pool pod; keeping claim for retry"
+                );
+                return Ok(AdmittedPoolClaimLookup::Transient);
             }
             Err(error) => {
                 tracing::warn!(
@@ -2943,6 +3053,432 @@ impl SubstrateAdapter for KubernetesSubstrate {
         }
         Ok(Some(dedupe_inventory_entries(candidates)))
     }
+}
+
+impl KubernetesSubstrate {
+    fn create_attempt_still_matches_row(
+        row: &ActiveExecutionStatusRow,
+        generation: i64,
+        pod_uid: Option<&str>,
+        creating_repair_epoch: Option<time::OffsetDateTime>,
+    ) -> bool {
+        row.generation == generation
+            && match (&row.pod_uid, pod_uid) {
+                (Some(recorded), Some(expected)) => recorded.as_str() == expected,
+                (Some(_), None) => false,
+                (None, Some(_)) => creating_repair_epoch
+                    .is_some_and(|epoch| !row.pod_materialized_at_set && row.updated_at == epoch),
+                (None, None) => {
+                    !row.pod_materialized_at_set
+                        && creating_repair_epoch.is_none_or(|epoch| row.updated_at == epoch)
+                }
+            }
+    }
+
+    async fn recover_or_fail_unmatched_create_execution(
+        &self,
+        request: &CreateExecutionRequest<'_>,
+        ctx: UnmatchedCreateRecovery<'_>,
+    ) -> Result<CreateExecutionOutcome, SubstrateError> {
+        let UnmatchedCreateRecovery {
+            sandbox_id,
+            sandbox_uuid,
+            generation,
+            pod_name,
+            pod_uid,
+            creating_repair_epoch,
+            activation_attempt_id,
+            phase_deadline,
+            post_create_not_found,
+            known_live_successor_pod,
+            failure_message,
+        } = ctx;
+        let map_recovery_read_err = |err: SubstrateError, failure_message: &str| {
+            if known_live_successor_pod {
+                SubstrateError::CreateSuperseded {
+                    message: format!("{failure_message}: {err}"),
+                }
+            } else {
+                err.demoted_after_side_effect()
+            }
+        };
+        if post_create_not_found {
+            let pre_release_row = self
+                .store
+                .active_execution_status(sandbox_id)
+                .await
+                .map_err(|err| map_recovery_read_err(err, &failure_message))?;
+            if let Some(ref row) = pre_release_row
+                && !is_suspended_lifecycle(&row.lifecycle)
+                && Self::create_attempt_still_matches_row(
+                    row,
+                    generation,
+                    pod_uid,
+                    creating_repair_epoch,
+                )
+            {
+                let pod_fence =
+                    ObservedAttemptPodFence::deleted_create_pod(pod_uid, creating_repair_epoch);
+                match self
+                    .store
+                    .forget_pod_tracking_if_generation_and_observed_attempt(
+                        sandbox_uuid,
+                        generation,
+                        Some(activation_attempt_id),
+                        pod_fence,
+                        PodTrackingCleanupCause::MissingPodObservation,
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        return Err(SubstrateError::Failed {
+                            message: failure_message,
+                        });
+                    }
+                    Ok(false) => {}
+                    Err(forget_err) => {
+                        tracing::warn!(
+                            sandbox_id = %sandbox_id,
+                            generation,
+                            error = %forget_err,
+                            "failed to forget Kubernetes pod tracking after post-readiness pod vanished"
+                        );
+                        self.store
+                            .release_activation_attempt_best_effort(
+                                sandbox_id,
+                                generation,
+                                activation_attempt_id,
+                            )
+                            .await;
+                        return Err(SubstrateError::Failed {
+                            message: failure_message,
+                        });
+                    }
+                }
+            }
+        }
+
+        self.store
+            .release_activation_attempt_best_effort(sandbox_id, generation, activation_attempt_id)
+            .await;
+
+        let current_row = self
+            .store
+            .active_execution_status(sandbox_id)
+            .await
+            .map_err(|err| map_recovery_read_err(err, &failure_message))?;
+        if let Some(current_row) = current_row {
+            if is_suspended_lifecycle(&current_row.lifecycle) {
+                return Err(SubstrateError::CreateSuperseded {
+                    message: failure_message,
+                });
+            }
+            if !Self::create_attempt_still_matches_row(
+                &current_row,
+                generation,
+                pod_uid,
+                creating_repair_epoch,
+            ) {
+                let replacement_pod_name = current_row.pod_name.clone();
+                if Instant::now() < phase_deadline
+                    && let Ok(outcome) = self
+                        .join_in_flight_create_execution(
+                            request,
+                            sandbox_id,
+                            current_row,
+                            phase_deadline,
+                        )
+                        .await
+                {
+                    return Ok(outcome);
+                }
+                if let Ok(Some(node_id)) = tokio::time::timeout(
+                    self.budgets.preserve_decision,
+                    self.preservable_create_node(sandbox_uuid, &replacement_pod_name),
+                )
+                .await
+                {
+                    return Ok(CreateExecutionOutcome {
+                        lease_completion: None,
+                        sandbox_id,
+                        binding: None,
+                        initial_lifecycle: "started",
+                        initial_placement: "on_node",
+                        active_node_id: Some(node_id),
+                        command_ready: false,
+                    });
+                }
+                return Err(SubstrateError::CreateSuperseded {
+                    message: failure_message,
+                });
+            }
+            if known_live_successor_pod {
+                if let Ok(Some(node_id)) = tokio::time::timeout(
+                    self.budgets.preserve_decision,
+                    self.preservable_create_node(sandbox_uuid, pod_name),
+                )
+                .await
+                {
+                    return Ok(CreateExecutionOutcome {
+                        lease_completion: None,
+                        sandbox_id,
+                        binding: None,
+                        initial_lifecycle: "started",
+                        initial_placement: "on_node",
+                        active_node_id: Some(node_id),
+                        command_ready: false,
+                    });
+                }
+                return Err(SubstrateError::CreateSuperseded {
+                    message: failure_message,
+                });
+            }
+        } else if known_live_successor_pod {
+            return Err(SubstrateError::CreateSuperseded {
+                message: failure_message,
+            });
+        }
+
+        Err(SubstrateError::Failed {
+            message: failure_message,
+        })
+    }
+
+    async fn join_in_flight_create_execution(
+        &self,
+        request: &CreateExecutionRequest<'_>,
+        sandbox_id: SandboxId,
+        mut execution: ActiveExecutionStatusRow,
+        phase_deadline: Instant,
+    ) -> Result<CreateExecutionOutcome, SubstrateError> {
+        let (binding, active_node_id) = loop {
+            let mut wait_target = PodProxyWaitTarget::new(
+                &execution.pod_name,
+                execution.pod_uid.as_ref().map(PodUid::as_str),
+                execution.generation,
+            );
+            if execution.pod_uid.is_some() {
+                wait_target = wait_target.abort_on_uid_change();
+            }
+            let (pod_ip, proxy_binding) = match self
+                .wait_for_pod_proxy_reachable(
+                    request.metric_identity,
+                    sandbox_id,
+                    wait_target,
+                    phase_deadline,
+                )
+                .await
+            {
+                Ok(ready) => ready,
+                Err(err) => {
+                    if Instant::now() < phase_deadline
+                        && let Ok(Ok(Some(next_row))) = tokio::time::timeout_at(
+                            phase_deadline,
+                            self.store.active_execution_status(sandbox_id),
+                        )
+                        .await
+                        && !is_suspended_lifecycle(&next_row.lifecycle)
+                        && (next_row.generation > execution.generation
+                            || (next_row.generation == execution.generation
+                                && next_row.pod_uid != execution.pod_uid))
+                    {
+                        execution = next_row;
+                        continue;
+                    }
+                    if crate::controllers::substrate::create_wait_should_preserve_node_work(&err)
+                        && let Ok(Some(node_id)) = tokio::time::timeout(
+                            self.budgets.preserve_decision,
+                            self.preservable_create_node(sandbox_id, &execution.pod_name),
+                        )
+                        .await
+                    {
+                        return Ok(CreateExecutionOutcome {
+                            lease_completion: None,
+                            sandbox_id,
+                            binding: None,
+                            initial_lifecycle: "started",
+                            initial_placement: "on_node",
+                            active_node_id: Some(node_id),
+                            command_ready: false,
+                        });
+                    }
+                    return Err(err);
+                }
+            };
+            let ready_uid = (proxy_binding.execution_object_id != sandbox_id.to_string())
+                .then(|| PodUid::parse(&proxy_binding.execution_object_id).ok())
+                .flatten()
+                .or_else(|| execution.pod_uid.clone());
+            // A guest that does not answer within the create's wait leaves
+            // the joined create returning the owner's reachable pod as
+            // started, not command-ready, as a create that owns its pod
+            // does. An error here would make the caller delete its sandbox
+            // row, and with it the execution the owner is still starting.
+            let binding = if request.wait_until_ready {
+                match self
+                    .poll_until_command_ready(
+                        sandbox_id,
+                        request.metric_identity,
+                        command_ready_bound(
+                            self.k8s.create_command_ready_timeout,
+                            request.command_ready_wait,
+                        )
+                        .min(remaining_ready_window(phase_deadline)),
+                        CommandReadyPod::PreResolved(pod_ip),
+                        Some(request.template_ref.template.as_str()),
+                    )
+                    .await
+                {
+                    Ok(binding) => Some(binding),
+                    Err(SubstrateError::Timeout { .. }) => None,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                Some(proxy_binding)
+            };
+            let current_row = self
+                .store
+                .active_execution_status(sandbox_id)
+                .await?
+                .filter(|row| {
+                    row.generation >= execution.generation
+                        && !is_suspended_lifecycle(&row.lifecycle)
+                })
+                .ok_or_else(|| SubstrateError::Unavailable {
+                    message:
+                        "joined create execution was retired or superseded before node placement"
+                            .to_string(),
+                })?;
+            if current_row.generation > execution.generation {
+                if Instant::now() < phase_deadline {
+                    execution = current_row;
+                    continue;
+                }
+                return Err(SubstrateError::CreateSuperseded {
+                    message: "joined create pod was replaced before node placement completed"
+                        .to_string(),
+                });
+            }
+            let uid_superseded = match (&current_row.pod_uid, &ready_uid) {
+                (Some(current_uid), Some(ready_uid)) => current_uid != ready_uid,
+                (Some(_), None) => true,
+                (None, Some(_)) => current_row.pod_materialized_at_set,
+                (None, None) => false,
+            };
+            if uid_superseded {
+                if Instant::now() < phase_deadline {
+                    execution = current_row;
+                    continue;
+                }
+                return Err(SubstrateError::CreateSuperseded {
+                    message: "joined create pod was replaced before node placement completed"
+                        .to_string(),
+                });
+            }
+            let expected_uid = ready_uid.or(current_row.pod_uid);
+            let joined_pod = match self
+                .read_scheduled_create_pod(
+                    &execution.pod_name,
+                    expected_uid.as_ref().map(PodUid::as_str),
+                    "failed to query joined create pod",
+                )
+                .await?
+            {
+                ScheduledCreatePodRead::Matched(pod) => pod,
+                read @ (ScheduledCreatePodRead::NotFound
+                | ScheduledCreatePodRead::SupersededUid) => {
+                    if Instant::now() < phase_deadline
+                        && let Some(next_row) = self
+                            .store
+                            .active_execution_status(sandbox_id)
+                            .await?
+                            .filter(|row| {
+                                row.generation >= execution.generation
+                                    && !is_suspended_lifecycle(&row.lifecycle)
+                                    && (row.generation > execution.generation
+                                        || row.pod_uid != expected_uid)
+                            })
+                    {
+                        execution = next_row;
+                        continue;
+                    }
+                    return Err(match read {
+                        ScheduledCreatePodRead::SupersededUid => SubstrateError::CreateSuperseded {
+                            message:
+                                "joined create pod was replaced before node placement completed"
+                                    .to_string(),
+                        },
+                        ScheduledCreatePodRead::NotFound | ScheduledCreatePodRead::Matched(_) => {
+                            SubstrateError::Unavailable {
+                                message: "joined create reached readiness but its pod disappeared"
+                                    .to_string(),
+                            }
+                        }
+                    });
+                }
+            };
+            let placement = self
+                .remember_pod_node_placement_fenced(
+                    sandbox_id,
+                    execution.generation,
+                    expected_uid.as_ref().map(PodUid::as_str),
+                    &joined_pod,
+                    PlacementRetryDisposition::RetryDuplicatesExecution,
+                )
+                .await?;
+            if !placement.matched_execution {
+                if Instant::now() < phase_deadline {
+                    let next_row = self
+                        .store
+                        .active_execution_status(sandbox_id)
+                        .await?
+                        .filter(|row| {
+                            row.generation >= execution.generation
+                                && !is_suspended_lifecycle(&row.lifecycle)
+                        })
+                        .ok_or_else(|| SubstrateError::Unavailable {
+                            message: "joined create execution was retired or superseded before node placement"
+                                .to_string(),
+                        })?;
+                    execution = next_row;
+                    continue;
+                }
+                return Err(SubstrateError::CreateSuperseded {
+                    message: "joined create pod was replaced before node placement completed"
+                        .to_string(),
+                });
+            }
+            let active_node_id = placement
+                .node_id
+                .ok_or_else(|| SubstrateError::Unavailable {
+                    message: "joined create pod has no registered node placement".to_string(),
+                })?;
+            break (binding, active_node_id);
+        };
+        Ok(CreateExecutionOutcome {
+            lease_completion: None,
+            sandbox_id,
+            command_ready: binding.is_some(),
+            binding,
+            initial_lifecycle: "started",
+            initial_placement: "on_node",
+            active_node_id: Some(active_node_id),
+        })
+    }
+}
+
+struct UnmatchedCreateRecovery<'a> {
+    sandbox_id: SandboxId,
+    sandbox_uuid: SandboxId,
+    generation: i64,
+    pod_name: &'a str,
+    pod_uid: Option<&'a str>,
+    creating_repair_epoch: Option<time::OffsetDateTime>,
+    activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
+    phase_deadline: Instant,
+    post_create_not_found: bool,
+    known_live_successor_pod: bool,
+    failure_message: String,
 }
 
 /// `create_execution`'s error when its outer readiness budget expires.

@@ -11,15 +11,16 @@ use super::*;
 use k8s_openapi::api::core::v1::PodStatus;
 
 pub(crate) use kubernetes_tests::{
-    SequencedWakeWorker, conflict_then_created_kubernetes_client, deleted_pod_kubernetes_client,
-    existing_then_created_running_pod_kubernetes_client, inert_kubernetes_client,
-    insert_k8s_execution, insert_ready_full_snapshot_relative_to_lifecycle,
-    insert_test_sandbox_row, mock_kubernetes_client, node_api_pod_on_node, node_with_network_slots,
-    paused_restore_test_subject, running_pod_kubernetes_client,
-    running_pod_kubernetes_client_with_create_barrier, sandbox_pod_on_node,
-    start_sequenced_wake_worker, substrate_with_inventory_caches_and_pool, substrate_with_store,
-    substrate_with_store_and_client, substrate_with_store_client_pods_and_nodes,
-    substrate_with_store_client_proxy_port_and_pod,
+    PooledSlotPod, SequencedWakeWorker, conflict_then_created_kubernetes_client,
+    deleted_pod_kubernetes_client, existing_then_created_running_pod_kubernetes_client,
+    inert_kubernetes_client, insert_k8s_execution,
+    insert_ready_full_snapshot_relative_to_lifecycle, insert_test_sandbox_row,
+    k8s_node_with_internal_ip, mock_kubernetes_client, node_api_pod_on_node,
+    node_with_network_slots, paused_restore_test_subject, pool_claim_fixture,
+    running_pod_kubernetes_client, running_pod_kubernetes_client_with_create_barrier,
+    sandbox_pod_on_node, start_sequenced_wake_worker, substrate_with_inventory_caches_and_pool,
+    substrate_with_store, substrate_with_store_and_client,
+    substrate_with_store_client_pods_and_nodes, substrate_with_store_client_proxy_port_and_pod,
     substrate_with_store_client_proxy_port_and_pods, substrate_with_unreachable_store,
     test_sandbox_with_lifecycle,
 };
@@ -187,7 +188,7 @@ mod kubernetes_tests {
         pod
     }
 
-    fn k8s_node_with_internal_ip(name: &str, internal_ip: &str) -> Node {
+    pub(crate) fn k8s_node_with_internal_ip(name: &str, internal_ip: &str) -> Node {
         Node {
             metadata: kube::api::ObjectMeta {
                 name: Some(name.to_string()),
@@ -8051,6 +8052,7 @@ mod kubernetes_tests {
             pod_materialized: false,
             state: ActiveExecutionState::Creating,
             create_age_expired: false,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
             activation_attempt_id: None,
             route_activation_id: None,
         };
@@ -8127,6 +8129,7 @@ mod kubernetes_tests {
             pod_materialized: false,
             state: ActiveExecutionState::Creating,
             create_age_expired: false,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
             activation_attempt_id: Some(operation),
             route_activation_id: Some(route),
         };
@@ -8663,12 +8666,11 @@ mod kubernetes_tests {
                 .wait_for_pod_proxy_reachable(
                     SandboxApiMetricIdentity::ecw("create"),
                     sandbox_id,
-                    super::wait_ready::PodProxyWaitTarget {
-                        pod_name: "space-sbx-replaced-g1",
-                        pod_uid: Some(pod_uid),
-                        generation: 1,
-                    },
-                    "create",
+                    super::wait_ready::PodProxyWaitTarget::new(
+                        "space-sbx-replaced-g1",
+                        Some(pod_uid),
+                        1,
+                    ),
                     Instant::now() + Duration::from_millis(500),
                 )
                 .await
@@ -8750,12 +8752,11 @@ mod kubernetes_tests {
                 .wait_for_pod_proxy_reachable(
                     SandboxApiMetricIdentity::ecw("create"),
                     sandbox_id,
-                    super::wait_ready::PodProxyWaitTarget {
+                    super::wait_ready::PodProxyWaitTarget::new(
                         pod_name,
-                        pod_uid: Some("unconfirmed-uid"),
-                        generation: 1,
-                    },
-                    "create",
+                        Some("unconfirmed-uid"),
+                        1,
+                    ),
                     Instant::now() + Duration::from_millis(500),
                 )
                 .await;
@@ -13073,15 +13074,15 @@ mod kubernetes_tests {
     }
 
     /// The pooled pod a [`pool_claim_fixture`] puts in front of the claim.
-    struct PooledSlotPod<'a> {
-        /// The pod's phase. Anything but `Running` makes the claimed pod
-        /// unusable.
-        phase: &'a str,
+    pub(crate) struct PooledSlotPod<'a> {
+        /// The pod's phase (`Running`, `Pending`, or a terminal phase such as
+        /// `Succeeded`).
+        pub(crate) phase: &'a str,
         /// The node the pod is bound to, or `None` for an unscheduled pod.
-        node_name: Option<&'a str>,
+        pub(crate) node_name: Option<&'a str>,
         /// The nodes the reflector holds, as `(name, node-group label)`. A node
         /// the pod names but this list omits is a reflector miss.
-        nodes: &'a [(&'a str, Option<&'a str>)],
+        pub(crate) nodes: &'a [(&'a str, Option<&'a str>)],
     }
 
     /// One ready warm-pool slot, its pod, and a caller — enough to drive the
@@ -13092,10 +13093,10 @@ mod kubernetes_tests {
     /// `workers` group, so the resolver always produces a set that admits
     /// shared capacity. What each test varies is the pod and the fleet, which
     /// is what the claim's decisions are actually about.
-    struct PoolClaimFixture {
-        db: pplx_space_db_test_fixtures::TestDb,
-        substrate: KubernetesSubstrate,
-        slot_id: Uuid,
+    pub(crate) struct PoolClaimFixture {
+        pub(crate) db: pplx_space_db_test_fixtures::TestDb,
+        pub(crate) substrate: KubernetesSubstrate,
+        pub(crate) slot_id: Uuid,
         release_id: Uuid,
         actor: crate::controllers::substrate::ActorRef,
         env: BTreeMap<String, String>,
@@ -13104,7 +13105,9 @@ mod kubernetes_tests {
     }
 
     impl PoolClaimFixture {
-        fn request(&self) -> crate::controllers::substrate::PooledExecutionClaimRequest<'_> {
+        pub(crate) fn request(
+            &self,
+        ) -> crate::controllers::substrate::PooledExecutionClaimRequest<'_> {
             crate::controllers::substrate::PooledExecutionClaimRequest {
                 metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity {
                     op: "create",
@@ -13141,7 +13144,7 @@ mod kubernetes_tests {
         /// `("ready", None)` here, which no caller of this accepts. So the two
         /// assertions together say "a slot was claimed and then refused",
         /// not merely "nothing came back".
-        async fn slot_disposition(&self) -> Result<(String, Option<Uuid>), BoxError> {
+        pub(crate) async fn slot_disposition(&self) -> Result<(String, Option<Uuid>), BoxError> {
             let row = sqlx::query_as(sql!(
                 "SELECT state, claim_id FROM kubernetes_pool_slots WHERE id = $1"
             ))
@@ -13152,7 +13155,9 @@ mod kubernetes_tests {
         }
     }
 
-    async fn pool_claim_fixture(pod: PooledSlotPod<'_>) -> Result<PoolClaimFixture, BoxError> {
+    pub(crate) async fn pool_claim_fixture(
+        pod: PooledSlotPod<'_>,
+    ) -> Result<PoolClaimFixture, BoxError> {
         pool_claim_fixture_with_node_labels(pod, &[], &[]).await
     }
 
@@ -14912,8 +14917,11 @@ mod kubernetes_tests {
                 current_node_id: None,
                 state,
                 lifecycle: lifecycle.to_string(),
+                pod_materialized_at_set: true,
+                updated_at: time::OffsetDateTime::UNIX_EPOCH,
                 create_age_expired: false,
                 activation_attempt_id: Some(operation),
+                activation_attempt_live: true,
                 route_activation_id: selected,
                 activating_client_id: None,
             };
@@ -14949,8 +14957,11 @@ mod kubernetes_tests {
             current_node_id: None,
             state: ActiveExecutionState::Running,
             lifecycle: "started".to_string(),
+            pod_materialized_at_set: true,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
             create_age_expired: false,
             activation_attempt_id: None,
+            activation_attempt_live: false,
             route_activation_id,
             activating_client_id: None,
         };
@@ -15183,6 +15194,7 @@ mod kubernetes_tests {
             pod_materialized,
             state,
             create_age_expired: false,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
             activation_attempt_id: None,
             route_activation_id: route_initialized.then(SandboxActivationAttemptId::new),
         };

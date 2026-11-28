@@ -27,7 +27,9 @@ use pplx_space_sandbox_model::{
     ExecutionGeneration, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
     SandboxTransitionTargetState,
 };
+pub(in crate::controllers::substrate::kubernetes) use pplx_space_sandbox_store::k8s_executions::retire::ObservedAttemptPodFence;
 use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotState};
+#[cfg(test)]
 use pplx_space_sql_locator::sql;
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -43,6 +45,7 @@ mod environment_placement;
 mod execution_rows;
 mod node_inventory;
 mod pod_placement;
+pub(super) use pod_placement::{FencedPodMetadataOutcome, PodMetadataFence};
 mod pod_tracking;
 mod pool_template_lock;
 mod restore_lease;
@@ -316,8 +319,11 @@ pub(super) struct ActiveExecutionStatusRow {
     pub(super) current_node_id: Option<NodeId>,
     pub(super) state: ActiveExecutionState,
     pub(super) lifecycle: String,
+    pub(super) pod_materialized_at_set: bool,
+    pub(super) updated_at: time::OffsetDateTime,
     pub(super) create_age_expired: bool,
     pub(super) activation_attempt_id: Option<SandboxActivationAttemptId>,
+    pub(super) activation_attempt_live: bool,
     pub(super) route_activation_id: Option<SandboxActivationAttemptId>,
     /// The sandbox's record of whose activation created its runtime.
     pub(super) activating_client_id: Option<pplx_space_accounts::ClientId>,
@@ -348,8 +354,11 @@ impl TryFrom<pplx_space_sandbox_store::k8s_executions::ActiveExecutionStatus>
             current_node_id: status.current_node_id,
             state,
             lifecycle: status.lifecycle,
+            pod_materialized_at_set: status.pod_materialized_at_set,
+            updated_at: status.updated_at,
             create_age_expired: status.create_age_expired,
             activation_attempt_id: status.activation_attempt_id,
+            activation_attempt_live: status.activation_attempt_live,
             route_activation_id: status.route_activation_id,
             activating_client_id: status.activating_client_id,
         })
@@ -404,6 +413,7 @@ pub(super) struct SandboxExecutionRow {
     pub(super) pod_materialized: bool,
     pub(super) state: ActiveExecutionState,
     pub(super) create_age_expired: bool,
+    pub(super) updated_at: time::OffsetDateTime,
     pub(super) activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     pub(super) route_activation_id: Option<SandboxActivationAttemptId>,
 }
@@ -425,6 +435,7 @@ impl TryFrom<pplx_space_sandbox_store::k8s_executions::ActiveExecutionRecord>
             pod_materialized,
             state,
             create_age_expired,
+            updated_at,
             activation_attempt_id,
             route_activation_id,
         } = record;
@@ -439,6 +450,7 @@ impl TryFrom<pplx_space_sandbox_store::k8s_executions::ActiveExecutionRecord>
             pod_materialized,
             state,
             create_age_expired,
+            updated_at,
             activation_attempt_id,
             route_activation_id,
         })

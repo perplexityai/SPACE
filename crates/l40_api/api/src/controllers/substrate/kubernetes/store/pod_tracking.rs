@@ -6,6 +6,16 @@ use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_store::k8s_executions::pod_tracking as k8s_execution_pod_tracking;
 use pplx_space_sandbox_store::pod_tracking;
 
+#[derive(Clone, Copy)]
+enum AttemptCleanupFence<'a> {
+    Any,
+    Exact(pplx_space_sandbox_model::SandboxActivationAttemptId),
+    Observed {
+        activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
+        pod_fence: ObservedAttemptPodFence<'a>,
+    },
+}
+
 impl K8sStore {
     pub(in crate::controllers::substrate::kubernetes) async fn forget_pod_tracking(
         &self,
@@ -49,6 +59,7 @@ impl K8sStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(in crate::controllers::substrate::kubernetes) async fn forget_pod_tracking_if_generation(
         &self,
         sandbox_id: SandboxId,
@@ -58,7 +69,30 @@ impl K8sStore {
         self.finish_execution_and_clear_pod_tracking_if_generation(
             sandbox_id,
             generation,
-            None,
+            AttemptCleanupFence::Any,
+            "forgotten",
+            StartedSuspendRecoveryOperation::TerminalPodCleanup,
+            cause,
+            PlacementClock::Bump,
+        )
+        .await
+    }
+
+    pub(in crate::controllers::substrate::kubernetes) async fn forget_pod_tracking_if_generation_and_observed_attempt(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+        activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
+        pod_fence: ObservedAttemptPodFence<'_>,
+        cause: PodTrackingCleanupCause,
+    ) -> Result<bool, SubstrateError> {
+        self.finish_execution_and_clear_pod_tracking_if_generation(
+            sandbox_id,
+            generation,
+            AttemptCleanupFence::Observed {
+                activation_attempt_id,
+                pod_fence,
+            },
             "forgotten",
             StartedSuspendRecoveryOperation::TerminalPodCleanup,
             cause,
@@ -411,7 +445,7 @@ impl K8sStore {
         self.finish_execution_and_clear_pod_tracking_if_generation(
             sandbox_id,
             generation,
-            Some(activation_attempt_id),
+            AttemptCleanupFence::Exact(activation_attempt_id),
             "forgotten",
             StartedSuspendRecoveryOperation::TerminalPodCleanup,
             PodTrackingCleanupCause::ExplicitTeardown,
@@ -449,7 +483,7 @@ impl K8sStore {
         self.finish_execution_and_clear_pod_tracking_if_generation(
             sandbox_id,
             generation,
-            None,
+            AttemptCleanupFence::Any,
             "replaced",
             StartedSuspendRecoveryOperation::StalePodReplacementCleanup,
             PodTrackingCleanupCause::ExplicitTeardown,
@@ -463,7 +497,7 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
         generation: i64,
-        activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
+        attempt_fence: AttemptCleanupFence<'_>,
         state: &str,
         recovery_operation: StartedSuspendRecoveryOperation,
         cause: PodTrackingCleanupCause,
@@ -492,18 +526,35 @@ impl K8sStore {
             return Ok(false);
         }
 
-        let finished = if let Some(activation_attempt_id) = activation_attempt_id {
-            self.finish_active_execution_generation_attempt_in(
-                &mut tx,
-                sandbox_id,
-                generation,
-                activation_attempt_id,
-                state,
-            )
-            .await?
-        } else {
-            self.finish_active_execution_generation_in(&mut tx, sandbox_id, generation, state)
+        let finished = match attempt_fence {
+            AttemptCleanupFence::Any => {
+                self.finish_active_execution_generation_in(&mut tx, sandbox_id, generation, state)
+                    .await?
+            }
+            AttemptCleanupFence::Exact(activation_attempt_id) => {
+                self.finish_active_execution_generation_attempt_in(
+                    &mut tx,
+                    sandbox_id,
+                    generation,
+                    activation_attempt_id,
+                    state,
+                )
                 .await?
+            }
+            AttemptCleanupFence::Observed {
+                activation_attempt_id,
+                pod_fence,
+            } => {
+                self.finish_active_execution_generation_observed_attempt_in(
+                    &mut tx,
+                    sandbox_id,
+                    generation,
+                    activation_attempt_id,
+                    pod_fence,
+                    state,
+                )
+                .await?
+            }
         };
         if !finished {
             tx.commit()

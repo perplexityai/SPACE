@@ -217,11 +217,11 @@ impl KubernetesSubstrate {
             current_pod_ip_with_source(&pod, row.pod_uid.as_ref(), row.pod_ip.as_deref())
                 .ok()
                 .flatten()?;
-        let target = PodProxyWaitTarget {
+        let target = PodProxyWaitTarget::new(
             pod_name,
-            pod_uid: row.pod_uid.as_ref().map(PodUid::as_str),
-            generation: row.generation,
-        };
+            row.pod_uid.as_ref().map(PodUid::as_str),
+            row.generation,
+        );
         let reachable = self
             .probe_pod_proxy(
                 sandbox_uuid,

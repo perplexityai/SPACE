@@ -665,6 +665,9 @@ impl KubernetesSubstrate {
                                     pin: crate::metrics::sandbox::restore::SourcePin::None,
                                 },
                             );
+                            if let Some(attempt) = activation_attempt.as_ref() {
+                                attempt.record_materialized_pod();
+                            }
                             return Ok(());
                         }
                         RedriveOutcome::OwnershipLost => {
@@ -782,8 +785,12 @@ impl KubernetesSubstrate {
                             existing.client_id().as_ref(),
                         )
                         .await?
-                        .is_none()
+                        .is_some()
                     {
+                        if let Some(attempt) = activation_attempt.as_ref() {
+                            attempt.record_materialized_pod();
+                        }
+                    } else {
                         tracing::warn!(
                             sandbox_id = %sandbox.id,
                             generation = claim.row.generation,
@@ -990,8 +997,12 @@ impl KubernetesSubstrate {
                             existing.client_id().as_ref(),
                         )
                         .await?
-                        .is_none()
+                        .is_some()
                     {
+                        if let Some(attempt) = activation_attempt.as_ref() {
+                            attempt.record_materialized_pod();
+                        }
+                    } else {
                         tracing::warn!(
                             sandbox_id = %sandbox.id,
                             generation = claim.row.generation,
@@ -1335,13 +1346,19 @@ impl KubernetesSubstrate {
                         generation = claim.row.generation,
                         "deleting Kubernetes sandbox pod created after materialization ownership was revoked"
                     );
-                    self.delete_pod_and_forget_tracking(
-                        sandbox.id,
-                        &claim.row.pod_name,
-                        claim.row.generation,
-                        PodTrackingCleanupCause::ExplicitTeardown,
-                    )
-                    .await?;
+                    let _ = self
+                        .delete_pod_and_forget_tracking(
+                            TerminalPodCleanup {
+                                sandbox_id: sandbox.id,
+                                pod_name: &claim.row.pod_name,
+                                generation: claim.row.generation,
+                                expected_delete_uid: pod.uid(),
+                                activation_attempt_id: claim.row.activation_attempt_id,
+                                pod_fence: crate::controllers::substrate::kubernetes::store::ObservedAttemptPodFence::exact_uid(None),
+                            },
+                            PodTrackingCleanupCause::ExplicitTeardown,
+                        )
+                        .await?;
                 }
                 return Ok(());
             }
@@ -1535,6 +1552,9 @@ impl KubernetesSubstrate {
                 PlacementRetryDisposition::RetryConverges,
             )
             .await?;
+        if let Some(attempt) = activation_attempt.as_ref() {
+            attempt.record_materialized_pod();
+        }
         Ok(())
     }
 }

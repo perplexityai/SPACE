@@ -8,7 +8,9 @@ use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
-use super::{record_node_name, record_pod_metadata};
+use super::{
+    record_node_name, record_node_name_fenced, record_pod_metadata, repair_creating_pod_uid,
+};
 
 async fn insert_sandbox(pool: &PgPool) -> TestResult<SandboxId> {
     let id = SandboxId::new();
@@ -98,10 +100,14 @@ fn row(
     )
 }
 
-/// The execution's `updated_at`, as text.
-async fn updated_at(pool: &PgPool, sandbox_id: SandboxId, generation: i64) -> TestResult<String> {
-    Ok(sqlx::query_scalar::<_, String>(sql!(
-        "SELECT updated_at::TEXT
+/// The execution's `updated_at`.
+async fn updated_at(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    generation: i64,
+) -> TestResult<time::OffsetDateTime> {
+    Ok(sqlx::query_scalar::<_, time::OffsetDateTime>(sql!(
+        "SELECT updated_at
            FROM sandbox_k8s_executions
           WHERE sandbox_id = $1 AND generation = $2"
     ))
@@ -180,5 +186,94 @@ async fn node_name_is_recorded_only_while_an_active_execution_exists() -> TestRe
     assert!(record_node_name(pool, sandbox, "node-b").await?);
     assert_eq!(rows(pool, sandbox).await?, moved);
     assert_eq!(updated_at(pool, sandbox, 2).await?, last_updated);
+
+    // `record_node_name_fenced` likewise skips rewriting the execution row when
+    // `k8s_node_name` already matches (leaving `xmin` intact) while still
+    // returning `Some(updated_at)`, and returns `None` on a lost UID fence.
+    let xmin_before: String = sqlx::query_scalar(sql!(
+        "SELECT xmin::TEXT FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND generation = 2"
+    ))
+    .bind(sandbox)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(
+        record_node_name_fenced(pool, sandbox, 2, Some("uid-wrong"), "node-b").await?,
+        None
+    );
+    assert_eq!(
+        record_node_name_fenced(pool, sandbox, 2, None, "node-b").await?,
+        Some(last_updated)
+    );
+    let xmin_after: String = sqlx::query_scalar(sql!(
+        "SELECT xmin::TEXT FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND generation = 2"
+    ))
+    .bind(sandbox)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(xmin_after, xmin_before);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn repair_creating_pod_uid_never_overwrites_materialized_reset_or_running_row() -> TestResult
+{
+    use crate::k8s_executions::claim::reset_to_creating;
+    use crate::k8s_executions::pod_placement::claim_pod_materialization;
+
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let sandbox = insert_sandbox(pool).await?;
+    insert_execution(pool, sandbox, 1, "replaced", false, None).await?;
+    insert_execution(pool, sandbox, 2, "creating", true, None).await?;
+    let initial = rows(pool, sandbox).await?;
+    let initial_updated = updated_at(pool, sandbox, 2).await?;
+
+    // Blank UIDs and retired/missing generations never mutate the row.
+    let mut tx = pool.begin().await?;
+    assert!(!repair_creating_pod_uid(&mut *tx, sandbox, 1, "uid-a", initial_updated).await?);
+    assert!(!repair_creating_pod_uid(&mut *tx, sandbox, 3, "uid-a", initial_updated).await?);
+    assert!(!repair_creating_pod_uid(&mut *tx, sandbox, 2, "   ", initial_updated).await?);
+    tx.commit().await?;
+    assert_eq!(rows(pool, sandbox).await?, initial);
+
+    // If a same-generation reset (`reset_to_creating`) runs on an unmaterialized
+    // `creating` row after pod A observed `initial_updated`, `updated_at`
+    // strictly advances so stale `uid-a` repair is rejected while successor
+    // `uid-b` repair with `after_reset` succeeds.
+    assert!(reset_to_creating(pool, sandbox, 2, None).await?);
+    let after_reset = updated_at(pool, sandbox, 2).await?;
+    assert!(after_reset > initial_updated);
+    let mut tx = pool.begin().await?;
+    assert!(!repair_creating_pod_uid(&mut *tx, sandbox, 2, "uid-a", initial_updated).await?);
+    assert!(repair_creating_pod_uid(&mut *tx, sandbox, 2, "uid-b", after_reset).await?);
+    tx.commit().await?;
+    assert_eq!(
+        rows(pool, sandbox).await?[1],
+        row(2, "created", true, (Some("uid-b"), None), None, true)
+    );
+
+    // Once a pod UID was recorded (`pod_materialized_at IS NOT NULL`) and
+    // `claim_pod_materialization` resets the row back to `creating` (`pod_uid = NULL`),
+    // `repair_creating_pod_uid` refuses even with the post-reset `updated_at`.
+    let mut tx = pool.begin().await?;
+    assert!(claim_pod_materialization(&mut *tx, sandbox, 2).await?);
+    tx.commit().await?;
+    let post_claim_updated = updated_at(pool, sandbox, 2).await?;
+    let mut tx = pool.begin().await?;
+    assert!(!repair_creating_pod_uid(&mut *tx, sandbox, 2, "uid-b", post_claim_updated).await?);
+    tx.commit().await?;
+
+    // Once another materializer has recorded `uid-c` and `10.0.0.2` (`running`),
+    // a stale repair attempt returns `false` and leaves the row intact.
+    assert!(record_pod_metadata(pool, sandbox, 2, Some("uid-c"), Some("10.0.0.2")).await?);
+    let running_snapshot = rows(pool, sandbox).await?;
+    let running_updated = updated_at(pool, sandbox, 2).await?;
+    let mut tx = pool.begin().await?;
+    assert!(!repair_creating_pod_uid(&mut *tx, sandbox, 2, "uid-a", running_updated).await?);
+    tx.commit().await?;
+    assert_eq!(rows(pool, sandbox).await?, running_snapshot);
+    assert_eq!(updated_at(pool, sandbox, 2).await?, running_updated);
     Ok(())
 }

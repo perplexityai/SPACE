@@ -10,6 +10,8 @@ use kube::{
         watcher::{self, Config as WatcherConfig},
     },
 };
+use std::sync::{Arc, Mutex, PoisonError};
+
 use tokio::{
     sync::{broadcast, watch},
     time::{Instant, sleep_until, timeout},
@@ -117,17 +119,77 @@ impl ReflectorReady {
 #[derive(Clone)]
 pub struct PodEvents {
     tx: broadcast::Sender<String>,
+    delivered: DeliveryClock,
+}
+
+/// When the sandbox-pod watch last delivered an event to the reflector: an
+/// applied or deleted pod, an initial-list item, or a re-list's completion.
+/// `None` before the watch has delivered its first event (or on a static test
+/// substrate with no watch). A watch whose connection or re-list has stalled
+/// delivers nothing, so a long silence while creates wait on the store is the
+/// signal to read their pods directly.
+#[derive(Clone)]
+pub(super) struct DeliveryClock(Arc<Mutex<Option<Instant>>>);
+
+impl DeliveryClock {
+    fn unfed() -> Self {
+        Self(Arc::new(Mutex::new(None)))
+    }
+
+    #[cfg(test)]
+    fn stamped_now() -> Self {
+        Self(Arc::new(Mutex::new(Some(Instant::now()))))
+    }
+
+    pub(super) fn stamp(&self) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+    }
+
+    fn last(&self) -> Option<Instant> {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl PodEvents {
     fn new() -> (Self, broadcast::Sender<String>) {
         let (tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        (Self { tx: tx.clone() }, tx)
+        (
+            Self {
+                tx: tx.clone(),
+                delivered: DeliveryClock::unfed(),
+            },
+            tx,
+        )
+    }
+
+    /// The clock the watch loop stamps on every delivery.
+    pub(super) fn delivery_clock(&self) -> DeliveryClock {
+        self.delivered.clone()
+    }
+
+    /// When the watch last delivered anything, or `None` if no watch event has
+    /// been delivered yet; see [`DeliveryClock`].
+    pub(super) fn last_delivery(&self) -> Option<Instant> {
+        self.delivered.last()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn for_test() -> Self {
         Self::new().0
+    }
+
+    /// Events and the sender a test feeds them from, as the reflector's
+    /// watch loop does after initial sync completes.
+    #[cfg(test)]
+    pub(super) fn for_test_with_sender() -> (Self, broadcast::Sender<String>) {
+        let (tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        (
+            Self {
+                tx: tx.clone(),
+                delivered: DeliveryClock::stamped_now(),
+            },
+            tx,
+        )
     }
 
     /// Subscribe to the raw per-name event stream. Used by waiters that must
@@ -137,7 +199,7 @@ impl PodEvents {
     /// and keeps blocking: if the target pod's delete signal was one of the
     /// dropped messages there may be no later event for it, stranding the wait
     /// even though the store already removed the pod.
-    fn subscribe(&self) -> broadcast::Receiver<String> {
+    pub(super) fn subscribe(&self) -> broadcast::Receiver<String> {
         self.tx.subscribe()
     }
 
@@ -166,7 +228,7 @@ impl PodEvents {
                 return false;
             }
             match timeout(remaining, rx.recv()).await {
-                Ok(Ok(name)) if name == pod_name => return true,
+                Ok(Ok(name)) if name.is_empty() || name == pod_name => return true,
                 Ok(Ok(_)) => continue,
                 Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
                     tracing::warn!(
@@ -266,14 +328,11 @@ pub(super) async fn wait_for_pod_absence(
         match timeout(remaining, rx.recv()).await {
             // Any event (matching pod or not), a lagged burst, or the budget
             // elapsing: loop back and let the store re-check at the top resolve
-            // the outcome. We deliberately do NOT shortcut on a name-matching
-            // event with the store absent: the broadcast carries no event type,
-            // and during a reflector re-list kube-runtime buffers `InitApply`
-            // events for pods that still exist, broadcasting their names before
-            // `InitDone` swaps the buffer into the readable store — so a matching
-            // name + absent store is not proof of a delete. Only the reliable
-            // `seen_present`-then-absent transition (checked at the loop top)
-            // confirms; everything else falls through to the caller's GET.
+            // the outcome. We deliberately do NOT shortcut on an event with the
+            // store absent: the broadcast carries no event type (and emits `""`
+            // on `InitDone` / watch faults), so only the `seen_present`-then-
+            // absent transition checked at the loop top confirms a delete;
+            // everything else falls through to the caller's GET.
             Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) | Err(_) => continue,
             Ok(Err(broadcast::error::RecvError::Closed)) => {
                 // Reflector task ended; no further events will arrive. Don't
@@ -328,11 +387,12 @@ pub fn start(
         .map_ok(sandbox_pod_view::sandbox_pod_view_event)
         .default_backoff();
     let (events, events_tx) = PodEvents::new();
+    let delivered = events.delivery_clock();
     let ready = ReflectorReady::new();
 
     let log_namespace = namespace.clone();
     tokio::spawn(async move {
-        reflect_sandbox_pods(stream.boxed(), writer, events_tx, &log_namespace).await;
+        reflect_sandbox_pods(stream.boxed(), writer, events_tx, delivered, &log_namespace).await;
     });
 
     let ready_for_task = ready.clone();
@@ -363,17 +423,22 @@ pub fn start(
 }
 
 /// Drains the sandbox-pod watcher stream: applies each event to the slot index
-/// and store, then broadcasts the touched pod's name on `events_tx`. Applied
-/// (add/modify, including re-list `InitApply`) and deleted pods are both
-/// broadcast, matching `touched_objects()`. A re-list `InitApply` only fills the
-/// store's private buffer, so its broadcast can precede the pod becoming
-/// readable at `InitDone`. Waiters in `PodEvents::wait_for` re-check the store
-/// after a signal, so a delete signal lets them observe pod absence without an
-/// apiserver poll.
+/// and store, then broadcasts live pod updates on `events_tx`. Live `Apply` and
+/// `Delete` events broadcast the touched pod's name; `Init` and `InitApply`
+/// buffer privately in the store without broadcasting per-pod names (avoiding
+/// premature wakeups before the store swaps and channel lag on large re-lists),
+/// and `InitDone` broadcasts the empty-name sentinel (`""`) once the rebuilt
+/// snapshot is readable. Every apiserver-backed event (`InitApply`, `InitDone`,
+/// `Apply`, `Delete`) stamps `delivered`; `Init` is emitted before `api.list`
+/// hits the network and does not stamp it. Watch errors
+/// and stream termination mark the watch unhealthy and broadcast `""` as well
+/// (`PodEvents` retains a `Sender` clone, so dropping `events_tx` alone doesn't
+/// close the channel).
 async fn reflect_sandbox_pods<S>(
     mut stream: S,
     mut writer: SandboxPodWriter,
     events_tx: broadcast::Sender<String>,
+    delivered: DeliveryClock,
     namespace: &str,
 ) where
     S: Stream<Item = Result<watcher::Event<SandboxPodView>, watcher::Error>> + Unpin,
@@ -382,15 +447,22 @@ async fn reflect_sandbox_pods<S>(
         match event {
             Ok(event) => {
                 writer.apply_watcher_event(&event);
-                if let watcher::Event::Apply(pod)
-                | watcher::Event::InitApply(pod)
-                | watcher::Event::Delete(pod) = &event
-                {
-                    let _ = events_tx.send(pod.name().to_string());
+                if !matches!(&event, watcher::Event::Init) {
+                    delivered.stamp();
+                }
+                match &event {
+                    watcher::Event::Apply(pod) | watcher::Event::Delete(pod) => {
+                        let _ = events_tx.send(pod.name().to_string());
+                    }
+                    watcher::Event::InitDone => {
+                        let _ = events_tx.send(String::new());
+                    }
+                    watcher::Event::Init | watcher::Event::InitApply(_) => {}
                 }
             }
             Err(err) => {
                 writer.mark_watch_error();
+                let _ = events_tx.send(String::new());
                 tracing::warn!(
                     namespace = %namespace,
                     error = %err,
@@ -400,6 +472,7 @@ async fn reflect_sandbox_pods<S>(
         }
     }
     writer.mark_watch_error();
+    let _ = events_tx.send(String::new());
     tracing::warn!(
         namespace = %namespace,
         "sandbox pod reflector stream ended"

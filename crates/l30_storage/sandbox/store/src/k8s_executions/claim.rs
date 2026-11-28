@@ -90,8 +90,8 @@ pub async fn insert_creating_claim(
              VALUES ($1, $2, $3, $4, 'creating', TRUE)
              ON CONFLICT DO NOTHING
              RETURNING generation, pod_name, FALSE AS pod_materialized, state,
-                       FALSE AS create_age_expired, activation_attempt_id,
-                       route_activation_id"
+                       FALSE AS create_age_expired, updated_at,
+                       activation_attempt_id, route_activation_id"
     ))
     .bind(sandbox_id)
     .bind(generation)
@@ -122,7 +122,7 @@ pub async fn reset_to_creating(
                      CASE WHEN NULLIF(BTRIM(pod_uid), '') IS NOT NULL THEN NOW() END
                  ),
                  state = 'creating',
-                 updated_at = NOW()
+                 updated_at = GREATEST(NOW(), updated_at + INTERVAL '1 microsecond')
              WHERE sandbox_id = $1
                AND active
                AND generation = $2

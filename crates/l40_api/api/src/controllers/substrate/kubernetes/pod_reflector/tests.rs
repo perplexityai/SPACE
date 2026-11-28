@@ -66,12 +66,14 @@ async fn reflect_sandbox_pods_updates_store_and_slots_then_broadcasts_touched_na
 
     let (store, indexes, writer) = sandbox_pod_view::sandbox_pod_cache();
     let network_slots = indexes.network_slots;
+    let client_live_pods = indexes.client_pods;
     let (_events, tx) = PodEvents::new();
     let mut rx = tx.subscribe();
 
-    // The broadcast must fire for re-list (`InitApply`), applied and deleted
-    // pods alike, so a suspend-side waiter can observe pod absence without
-    // polling. `Init`/`InitDone` carry no pod and broadcast nothing.
+    // `InitApply` buffers privately without premature per-pod broadcasts;
+    // `InitDone` broadcasts `""` once the rebuilt snapshot swaps into the
+    // readable store, followed by live applied/deleted pod names and `""` when
+    // the stream ends.
     let raw = stream::iter(
         [
             Event::Init,
@@ -83,10 +85,11 @@ async fn reflect_sandbox_pods_updates_store_and_slots_then_broadcasts_touched_na
         .into_iter()
         .map(|event| Ok::<_, watcher::Error>(sandbox_pod_view::sandbox_pod_view_event(event))),
     );
-    reflect_sandbox_pods(raw.boxed(), writer, tx, TEST_NS).await;
+    reflect_sandbox_pods(raw.boxed(), writer, tx, _events.delivery_clock(), TEST_NS).await;
 
     let seen: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-    assert_eq!(seen, ["pod-listed", "pod-applied", "pod-listed"]);
+    assert_eq!(seen, ["", "pod-applied", "pod-listed", ""]);
+    assert!(client_live_pods.is_watch_failing());
     let cached: Vec<String> = store
         .state()
         .iter()

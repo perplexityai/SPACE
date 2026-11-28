@@ -49,9 +49,15 @@ pub(super) struct SubstrateBudgets {
     /// reflector event before it falls back to an apiserver GET, and the
     /// re-check interval of a scheduling-outcome wait.
     pub(super) reflector_wait: Duration,
-    /// Maximum duration of a direct pod GET during IP readiness, further
-    /// clamped to the time left in that phase.
+    /// Maximum duration of a degraded-mode fallback pod GET during IP
+    /// readiness, further clamped to the time left in that phase. Exceeding
+    /// this bound before the phase deadline fails fast with `Unavailable`.
     pub(super) readiness_pod_get: Duration,
+    /// [`super::READINESS_QUIET_REFLECTOR`]: how long the sandbox-pod
+    /// reflector may deliver nothing before IP readiness waits treat it as
+    /// degraded and fall back to paced direct pod reads, and how often each
+    /// wait does while the reflector remains degraded.
+    pub(super) readiness_quiet_reflector: Duration,
     /// [`super::execution::RETRY_DEFERRAL_GRACE`]: how long a caller under
     /// the dispatcher's retry deferral keeps retrying a fenced restore claim
     /// in place before it hands the wait back.
@@ -70,9 +76,11 @@ impl SubstrateBudgets {
         teardown_worker_connect: super::POD_WORKER_CONNECT_TIMEOUT,
         teardown_node_delete_wait: super::adapter::TEARDOWN_NODE_DELETE_WAIT_BUDGET,
         reflector_wait: super::REFLECTOR_WAIT_BUDGET,
-        // Leave headroom for a slow single-object read without letting it
-        // displace the watch that can observe readiness independently.
+        // Leave headroom for a slow single-object read without letting a
+        // stalled apiserver pin the readiness phase; timeouts before the phase
+        // deadline surface as `SubstrateError::Unavailable` (503).
         readiness_pod_get: Duration::from_secs(5),
+        readiness_quiet_reflector: super::READINESS_QUIET_REFLECTOR,
         retry_deferral_grace: super::execution::RETRY_DEFERRAL_GRACE,
     };
 

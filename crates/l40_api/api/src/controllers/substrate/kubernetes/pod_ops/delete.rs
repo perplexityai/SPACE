@@ -354,19 +354,45 @@ impl KubernetesSubstrate {
 
         result
     }
+}
 
+pub(in crate::controllers::substrate::kubernetes) struct TerminalPodCleanup<'a> {
+    pub sandbox_id: SandboxId,
+    pub pod_name: &'a str,
+    pub generation: i64,
+    pub expected_delete_uid: Option<&'a str>,
+    pub activation_attempt_id: Option<SandboxActivationAttemptId>,
+    pub pod_fence: crate::controllers::substrate::kubernetes::store::ObservedAttemptPodFence<'a>,
+}
+
+impl KubernetesSubstrate {
     pub(in crate::controllers::substrate::kubernetes) async fn delete_pod_and_forget_tracking(
         &self,
-        sandbox_id: SandboxId,
-        pod_name: &str,
-        generation: i64,
+        cleanup: TerminalPodCleanup<'_>,
         cause: PodTrackingCleanupCause,
-    ) -> Result<(), SubstrateError> {
+    ) -> Result<bool, SubstrateError> {
+        let TerminalPodCleanup {
+            sandbox_id,
+            pod_name,
+            generation,
+            expected_delete_uid,
+            activation_attempt_id,
+            pod_fence,
+        } = cleanup;
         match self
-            .delete_sandbox_pod_for_projection_cleanup(pod_name)
+            .k8s_blocking_delete_sandbox_pod_for_operation(
+                pod_name,
+                "projection_cleanup",
+                expected_delete_uid.map(|uid| (uid, None)),
+            )
             .await
         {
             Ok(K8sBlockingDeleteOutcome::Deleted | K8sBlockingDeleteOutcome::NotFound) => {}
+            Ok(K8sBlockingDeleteOutcome::PreconditionFailed) => {
+                // A same-name successor pod with a different UID already owns
+                // `pod_name`; leave both it and the active execution row alone.
+                return Ok(false);
+            }
             Ok(K8sBlockingDeleteOutcome::TimedOut) => {
                 return Err(SubstrateError::Timeout {
                     message: format!(
@@ -376,10 +402,7 @@ impl KubernetesSubstrate {
                     phase: None,
                 });
             }
-            Ok(
-                K8sBlockingDeleteOutcome::ObserveError
-                | K8sBlockingDeleteOutcome::PreconditionFailed,
-            ) => {
+            Ok(K8sBlockingDeleteOutcome::ObserveError) => {
                 return Err(SubstrateError::Unavailable {
                     message: format!(
                         "could not confirm terminal Kubernetes pod {pod_name} deletion; \
@@ -394,8 +417,13 @@ impl KubernetesSubstrate {
             }
         }
         self.store
-            .forget_pod_tracking_if_generation(sandbox_id, generation, cause)
-            .await?;
-        Ok(())
+            .forget_pod_tracking_if_generation_and_observed_attempt(
+                sandbox_id,
+                generation,
+                activation_attempt_id,
+                pod_fence,
+                cause,
+            )
+            .await
     }
 }

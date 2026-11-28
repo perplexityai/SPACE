@@ -1641,7 +1641,9 @@ impl SandboxController {
                     SandboxEventType::CreateFailed,
                     create_event_details().error(err.to_string()),
                 );
-                let row_removal_confirmed =
+                let row_removal_confirmed = if err.preserves_create_row() {
+                    false
+                } else {
                     match sandbox_store::create::delete_failed_create(pool, sandbox_uuid).await {
                         Ok(_) => true,
                         Err(delete_err) => {
@@ -1652,7 +1654,8 @@ impl SandboxController {
                             );
                             false
                         }
-                    };
+                    }
+                };
                 // With the row gone, this create did NOT leave node work
                 // converging (a timeout here failed the substrate's preserve
                 // check, e.g. the pod never scheduled), so strip any retry
@@ -2603,6 +2606,9 @@ impl SandboxController {
             AdmittedPoolClaimLookup::ReleasePending => {
                 return Err(admitted_pool_slot_release_pending());
             }
+            AdmittedPoolClaimLookup::Transient => {
+                return Err(admitted_pool_lookup_transient());
+            }
             AdmittedPoolClaimLookup::Adoptable { claim, pool_shape } => (*claim, pool_shape),
         };
 
@@ -3193,6 +3199,17 @@ fn adoption_label_transient() -> ControllerError {
 fn admitted_adoption_label_transient() -> ControllerError {
     ControllerError::service_unavailable(
         "the Kubernetes apiserver failed transiently; the retry adopts the same warm-pool slot",
+    )
+    .with_retry_after_header(ADOPTION_LABEL_TRANSIENT_RETRY)
+    .with_retry_after_cause(ControllerRetryAfterCause::PoolSlotRelease)
+}
+
+/// An admitted create whose warm-pool slot verification failed transiently
+/// (replica cache lag or temporary substrate read failure). Its claim is kept
+/// so the short retry adopts the same slot without invalidating it.
+fn admitted_pool_lookup_transient() -> ControllerError {
+    ControllerError::service_unavailable(
+        "warm-pool slot verification failed transiently; the retry adopts the same warm-pool slot",
     )
     .with_retry_after_header(ADOPTION_LABEL_TRANSIENT_RETRY)
     .with_retry_after_cause(ControllerRetryAfterCause::PoolSlotRelease)

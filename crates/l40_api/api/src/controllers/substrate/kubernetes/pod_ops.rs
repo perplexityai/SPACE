@@ -41,15 +41,14 @@ mod restore;
 mod started_recovery;
 mod wake;
 mod worker_clients;
-use delete::delete_sandbox_pod_with_throttle_retry;
 pub(super) use delete::retry_kube_throttling;
 #[cfg(test)]
 use delete::{K8S_THROTTLE_RETRY_ATTEMPTS, lingering_sandbox_pod_names};
+use delete::{TerminalPodCleanup, delete_sandbox_pod_with_throttle_retry};
 #[cfg(test)]
 use ensure_pod::restore_placement_sample;
-#[cfg(test)]
-use read::{
-    succeeded_pod_publication_grace_remaining, terminal_cleanup_phase_after_uncached_check,
+pub(super) use read::{
+    PodGet, PooledClaimPodObservation, ReadinessPodResolution, ScheduledCreatePodRead,
 };
 pub(super) use redrive::RedriveOutcome;
 #[cfg(test)]
@@ -222,6 +221,7 @@ pub(super) struct ActivationAttemptAssignment {
     /// The client id this activation's new pods are labeled with.
     key: KeyResolution,
     assigned: std::sync::Arc<std::sync::Mutex<Option<(SandboxActivationAttemptId, i64)>>>,
+    materialized_pod: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ActivationAttemptAssignment {
@@ -235,6 +235,7 @@ impl ActivationAttemptAssignment {
             target_state,
             key,
             assigned: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            materialized_pod: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -266,6 +267,16 @@ impl ActivationAttemptAssignment {
 
     pub(super) fn assigned_or_requested(&self) -> SandboxActivationAttemptId {
         self.assigned_id().unwrap_or(self.requested_id)
+    }
+
+    pub(super) fn record_materialized_pod(&self) {
+        self.materialized_pod
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(super) fn owns_materialized_pod(&self) -> bool {
+        self.materialized_pod
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 

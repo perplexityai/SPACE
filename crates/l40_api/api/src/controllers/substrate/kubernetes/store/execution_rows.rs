@@ -173,6 +173,25 @@ impl K8sStore {
         .db_context("failed to persist sandbox pod node name")
     }
 
+    pub(super) async fn update_active_execution_node_name_fenced(
+        &self,
+        conn: &mut PgConnection,
+        sandbox_id: SandboxId,
+        generation: i64,
+        expected_pod_uid: Option<&str>,
+        node_name: &str,
+    ) -> Result<Option<time::OffsetDateTime>, SubstrateError> {
+        pplx_space_sandbox_store::k8s_executions::materialize::record_node_name_fenced(
+            conn,
+            sandbox_id,
+            generation,
+            expected_pod_uid,
+            node_name,
+        )
+        .await
+        .db_context("failed to persist fenced sandbox pod node name")
+    }
+
     pub(super) async fn finish_active_execution_in(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -294,6 +313,33 @@ impl K8sStore {
         )
         .await
         .db_context("failed to finish activation-fenced Kubernetes execution")?;
+        if finished {
+            self.invalidate_open_port_exposure_observations_in(tx, sandbox_id)
+                .await?;
+        }
+        Ok(finished)
+    }
+
+    pub(super) async fn finish_active_execution_generation_observed_attempt_in(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        sandbox_id: SandboxId,
+        generation: i64,
+        activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
+        pod_fence: ObservedAttemptPodFence<'_>,
+        state: &str,
+    ) -> Result<bool, SubstrateError> {
+        let finished =
+            pplx_space_sandbox_store::k8s_executions::retire::finish_generation_observed_attempt(
+                &mut **tx,
+                sandbox_id,
+                generation,
+                activation_attempt_id,
+                pod_fence,
+                state,
+            )
+            .await
+            .db_context("failed to finish observed-attempt-fenced Kubernetes execution")?;
         if finished {
             self.invalidate_open_port_exposure_observations_in(tx, sandbox_id)
                 .await?;
@@ -667,6 +713,15 @@ impl K8sStore {
                 route_publication,
             )
             .await?;
+            if !claim.created {
+                claim.row = self
+                    .active_execution_row(&mut *tx, sandbox_uuid)
+                    .await?
+                    .ok_or_else(|| SubstrateError::Conflict {
+                        message: "execution disappeared after activation attempt assignment"
+                            .to_string(),
+                    })?;
+            }
             claim.row.activation_attempt_id = Some(activation_attempt_id);
             if route_publication == ActivationRoutePublication::InitializeFirst {
                 claim.row.route_activation_id = Some(activation_attempt_id);
