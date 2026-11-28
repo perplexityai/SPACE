@@ -44,6 +44,9 @@ from space_smoke.capabilities import (
     TcpProbe,
     TcpTarget,
     AdminNodeGroupView,
+    DEDICATED_NODE_TAINT_KEY,
+    DedicatedOrgToleration,
+    SandboxPodBoundaryRender,
     CensusPublication,
     FencePolicy,
     NodeSnapshot,
@@ -858,6 +861,7 @@ DRAIN_KEEP_ANNOTATION = "space.pplx.net/drain-keep"
 NODE_GROUP_BOUNDARY_LABEL = "node-restriction.kubernetes.io/space-node-group"
 NODE_GROUP_GATE_ENV = "SPACE_SANDBOX_NODE_GROUP_PLACEMENT"
 NODE_GROUP_LABELER_ENV = "SPACE_NODE_GROUP_LABELER_ENABLED"
+NODE_GROUP_MIRROR_ENV = "SPACE_NODE_GROUP_MIRROR_ENABLED"
 # What a template runtime-upgrade campaign needs on the cluster-controller
 # beside the environment placement gate, and no Kind chart sets
 # (`space_smoke/runtime_upgrade_campaign.py`): the campaign loop, and plain
@@ -4179,11 +4183,12 @@ ON CONFLICT (key_hash) DO NOTHING;
         raise SmokeConfigurationError(f"could not {action}: {detail or '<no output>'}")
 
     def node_group_env(self) -> dict[str, str | None]:
-        """`api:<key>` / `controller:<key>` literals for the gate and the labeler."""
+        """`api:<key>` / `controller:<key>` literals for the gate, labeler, and membership mirror."""
 
         api = self._deployment_env_literals(self._public_api_deployment(), (NODE_GROUP_GATE_ENV,))
         controller = self._deployment_env_literals(
-            self._controller_deployment(), (NODE_GROUP_GATE_ENV, NODE_GROUP_LABELER_ENV)
+            self._controller_deployment(),
+            (NODE_GROUP_GATE_ENV, NODE_GROUP_LABELER_ENV, NODE_GROUP_MIRROR_ENV),
         )
         return {
             **{f"api:{k}": v for k, v in api.items()},
@@ -4191,16 +4196,28 @@ ON CONFLICT (key_hash) DO NOTHING;
         }
 
     def _apply_node_group_env(
-        self, values: Mapping[str, str | None], *, controller_first: bool
+        self,
+        values: Mapping[str, str | None],
+        *,
+        controller_first: bool,
+        check_values: bool = True,
     ) -> None:
+        # `set_node_group_env` enforces canonical boolean literals (`check_values=True`).
+        # `restore_node_group_env` passes `check_values=False` because it replays verbatim
+        # literals captured from the live Deployments by `node_group_env()` during teardown:
+        # rejecting a pre-existing non-canonical truthy literal (such as `"TRUE"` or `"yes"`)
+        # would abort cleanup mid-unwind and strand mutated cluster flags. Allowlist key
+        # validation and `_require_isolated_kind` in `_apply_renderer_env` still apply on both paths.
         allowed = {
             f"api:{NODE_GROUP_GATE_ENV}",
             f"controller:{NODE_GROUP_GATE_ENV}",
             f"controller:{NODE_GROUP_LABELER_ENV}",
+            f"controller:{NODE_GROUP_MIRROR_ENV}",
         }
-        for value in values.values():
-            if value is not None and value not in {"", "true", "false", "1", "0"}:
-                raise ValueError(f"refusing node-group env value {value!r}")
+        if check_values:
+            for value in values.values():
+                if value is not None and value not in {"", "true", "false", "1", "0"}:
+                    raise ValueError(f"refusing node-group env value {value!r}")
         self._apply_renderer_env(values, allowed=allowed, controller_first=controller_first, what="node-group")
 
     def _apply_renderer_env(
@@ -4254,16 +4271,20 @@ ON CONFLICT (key_hash) DO NOTHING;
                 if self._set_deployment_env_only(name, assignments):
                     rolling.append(name)
             waits = [
-                background(f"rollout of {name}", lambda name=name: self._await_deployment_rollout(name, timeout=300))
+                background(
+                    f"rollout of {name}",
+                    partial(self._await_deployment_rollout, name, timeout=300),
+                )
                 for name in rolling
             ]
             for wait in waits:
                 wait.join(timeout=330)
 
-    def set_node_group_env(self, *, gate: bool, labeler: bool) -> None:
+    def set_node_group_env(self, *, gate: bool, labeler: bool, mirror: bool) -> None:
         self._apply_node_group_env(
             {
                 f"controller:{NODE_GROUP_LABELER_ENV}": "true" if labeler else "false",
+                f"controller:{NODE_GROUP_MIRROR_ENV}": "true" if mirror else "false",
                 f"controller:{NODE_GROUP_GATE_ENV}": "true" if gate else "false",
                 f"api:{NODE_GROUP_GATE_ENV}": "true" if gate else "false",
             },
@@ -4271,7 +4292,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
 
     def restore_node_group_env(self, standing: Mapping[str, str | None]) -> None:
-        self._apply_node_group_env(standing, controller_first=False)
+        self._apply_node_group_env(standing, controller_first=False, check_values=False)
 
     # --- environment placement gate -----------------------------------------
     #
@@ -4724,14 +4745,23 @@ ON CONFLICT (key_hash) DO NOTHING;
         _require_ok(result, "read the sandbox pod")
         return _newest_pod_render(result.stdout)
 
-    def sandbox_pod_count(self) -> int:
+    def live_sandbox_pods(self) -> tuple[str, ...]:
         result = self.kubectl(
             "get", "pods", "-l", KIND_SANDBOX_POD_SELECTOR, "-o", "json", timeout=15,
             namespace=KIND_SANDBOX_NAMESPACE,
         )
-        _require_ok(result, "count sandbox pods")
+        _require_ok(result, "list live sandbox pods")
         items = json.loads(result.stdout or "{}").get("items", [])
-        return sum(1 for item in items if not (item.get("metadata") or {}).get("deletionTimestamp"))
+        identities = [
+            f"{metadata.get('name', '')}:{metadata.get('uid', '')}"
+            for item in items
+            if isinstance(item, dict)
+            and not (metadata := (item.get("metadata") or {})).get("deletionTimestamp")
+        ]
+        return tuple(sorted(identities))
+
+    def sandbox_pod_count(self) -> int:
+        return len(self.live_sandbox_pods())
 
     def native_create_sandbox(self, *, template: str, metadata: Mapping[str, str]) -> str:
         self._require_isolated_kind("native create")
@@ -4800,8 +4830,11 @@ ON CONFLICT (key_hash) DO NOTHING;
         body: dict[str, object] = {"name": name, "template_policy": "default"}
         if org_id is not None:
             body["org_id"] = _sql_uuid(org_id)
+        url = self.config.api_url.rstrip("/") + "/admin/api/v1/node-groups"
+        if urlsplit(url).scheme not in {"http", "https"}:
+            raise ValueError(f"refusing non-HTTP admin URL {url!r}")
         request = Request(
-            self.config.api_url.rstrip("/") + "/admin/api/v1/node-groups",
+            url,
             method="POST",
             headers={"Authorization": "Bearer " + self._admin_token(), "Content-Type": "application/json"},
             data=json.dumps(body).encode(),
@@ -4813,6 +4846,25 @@ ON CONFLICT (key_hash) DO NOTHING;
             return error.code, error.read(2_000).decode(errors="replace")
         except (URLError, OSError):
             raise RuntimeError("admin POST node-groups failed") from None
+
+    def try_delete_node_group(self, node_group_id: str) -> tuple[int, str]:
+        self._require_isolated_kind("admin node-group deletion")
+        gid = _sql_uuid(node_group_id)
+        url = self.config.api_url.rstrip("/") + f"/admin/api/v1/node-groups/{gid}"
+        if urlsplit(url).scheme not in {"http", "https"}:
+            raise ValueError(f"refusing non-HTTP admin URL {url!r}")
+        request = Request(
+            url,
+            method="DELETE",
+            headers={"Authorization": "Bearer " + self._admin_token()},
+        )
+        try:
+            with _URL_OPEN(request, timeout=20) as response:
+                return int(response.status), response.read().decode(errors="replace")[:2_000]
+        except HTTPError as error:
+            return error.code, error.read(2_000).decode(errors="replace")
+        except (URLError, OSError):
+            raise RuntimeError("admin DELETE node-groups failed") from None
 
     def worker_boundary_labels(self) -> dict[str, str | None]:
         result = self.kubectl(
@@ -4827,15 +4879,83 @@ ON CONFLICT (key_hash) DO NOTHING;
             labels[name] = value if isinstance(value, str) else None
         return labels
 
+    def set_worker_boundary_label(self, node_name: str, group_name: str | None) -> None:
+        self._require_isolated_kind("worker boundary label mutation")
+        node = _kube_node_name(node_name)
+        if group_name is not None and not re.fullmatch(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?", group_name):
+            raise ValueError(f"refusing node group name {group_name!r}")
+        assignment = (
+            f"{NODE_GROUP_BOUNDARY_LABEL}-"
+            if group_name is None
+            else f"{NODE_GROUP_BOUNDARY_LABEL}={group_name}"
+        )
+        _require_ok(
+            self.kubectl("label", "node", node, assignment, "--overwrite", timeout=30),
+            f"set the boundary label on {node}",
+        )
+
     def restore_worker_boundary_labels(self, snapshot: Mapping[str, str | None]) -> None:
         self._require_isolated_kind("worker label restore")
+        errors: list[str] = []
         for node_name, value in snapshot.items():
             node = _kube_node_name(node_name)
-            assignment = f"{NODE_GROUP_BOUNDARY_LABEL}-" if value is None else f"{NODE_GROUP_BOUNDARY_LABEL}={value}"
-            _require_ok(
-                self.kubectl("label", "node", node, assignment, "--overwrite", timeout=30),
-                f"restore the boundary label on {node}",
+            if value is not None and value != "" and not re.fullmatch(
+                r"[A-Za-z0-9]([-._A-Za-z0-9]{0,61}[A-Za-z0-9])?", value
+            ):
+                errors.append(f"{node}: refusing label value {value!r}")
+                continue
+            assignment = (
+                f"{NODE_GROUP_BOUNDARY_LABEL}-"
+                if value is None
+                else f"{NODE_GROUP_BOUNDARY_LABEL}={value}"
             )
+            result = self.kubectl("label", "node", node, assignment, "--overwrite", timeout=30)
+            if result.returncode != 0:
+                errors.append(f"{node}: {result.detail() or '<no output>'}")
+        if errors:
+            raise SmokeConfigurationError("could not restore worker boundary labels: " + "; ".join(errors))
+
+    def worker_dedicated_taints(self) -> dict[str, str | None]:
+        result = self.kubectl(
+            "get", "nodes", "-l", KIND_WORKER_NODE_SELECTOR, "-o", "json", timeout=15,
+        )
+        _require_ok(result, "list worker dedicated-org taints")
+        taints: dict[str, str | None] = {}
+        for item in json.loads(result.stdout or "{}").get("items", []):
+            metadata = item.get("metadata") or {}
+            name = _kube_node_name(str(metadata.get("name", "")))
+            value: str | None = None
+            for taint in ((item.get("spec") or {}).get("taints") or []):
+                if isinstance(taint, dict) and taint.get("key") == DEDICATED_NODE_TAINT_KEY:
+                    raw_value = taint.get("value")
+                    value = raw_value if isinstance(raw_value, str) else ""
+                    break
+            taints[name] = value
+        return taints
+
+    def set_worker_dedicated_taint(self, node_name: str, org_id: str | None) -> None:
+        self._require_isolated_kind("worker dedicated-org taint mutation")
+        node = _kube_node_name(node_name)
+        if org_id is None:
+            result = self.kubectl(
+                "taint", "node", node, f"{DEDICATED_NODE_TAINT_KEY}-", timeout=30,
+            )
+            if result.returncode != 0 and "not found" in (result.stderr + result.stdout).lower():
+                return
+            _require_ok(result, f"clear the dedicated-org taint on {node}")
+            return
+        oid = _sql_uuid(org_id)
+        _require_ok(
+            self.kubectl(
+                "taint",
+                "node",
+                node,
+                f"{DEDICATED_NODE_TAINT_KEY}={oid}:NoSchedule",
+                "--overwrite",
+                timeout=30,
+            ),
+            f"set the dedicated-org taint on {node}",
+        )
 
     def _sandbox_pod_json(self, sandbox_id: str) -> dict[str, Any] | None:
         result = self.kubectl(
@@ -4843,28 +4963,11 @@ ON CONFLICT (key_hash) DO NOTHING;
             namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "read the sandbox pod")
-        items = json.loads(result.stdout or "{}").get("items", [])
-        return items[0] if items else None
+        return _newest_live_pod_item(result.stdout)
 
-    def sandbox_pod_node_group_terms(self, sandbox_id: str) -> list[str]:
+    def sandbox_pod_boundary(self, sandbox_id: str) -> SandboxPodBoundaryRender | None:
         pod = self._sandbox_pod_json(sandbox_id)
-        if pod is None:
-            return []
-        required = (
-            ((pod.get("spec") or {}).get("affinity") or {}).get("nodeAffinity") or {}
-        ).get("requiredDuringSchedulingIgnoredDuringExecution") or {}
-        values: set[str] = set()
-        for term in required.get("nodeSelectorTerms") or []:
-            for expression in term.get("matchExpressions") or []:
-                if expression.get("key") == NODE_GROUP_BOUNDARY_LABEL:
-                    values.update(str(v) for v in expression.get("values") or [])
-        return sorted(values)
-
-    def sandbox_pod_phase_and_node(self, sandbox_id: str) -> tuple[str | None, str | None]:
-        pod = self._sandbox_pod_json(sandbox_id)
-        if pod is None:
-            return None, None
-        return (pod.get("status") or {}).get("phase"), (pod.get("spec") or {}).get("nodeName")
+        return None if pod is None else _parse_pod_boundary_render(pod)
 
     def admin_org_id(self) -> str:
         """The managing org of the kind admin, read from the admin's own listing route."""
@@ -6355,6 +6458,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             phase = item.get("drain_phase")
             mode = item.get("drain_mode")
             engine = item.get("drain_engine")
+            group_id = item.get("node_group_id")
             nodes.append(
                 AdminNodeView(
                     id=str(item.get("id", "")),
@@ -6368,6 +6472,7 @@ ON CONFLICT (key_hash) DO NOTHING;
                         else None
                     ),
                     drain_engine=engine if isinstance(engine, str) else None,
+                    node_group_id=group_id if isinstance(group_id, str) and group_id else None,
                 )
             )
         return nodes
@@ -9970,21 +10075,95 @@ def _parse_nodes(node_list_json: str) -> list[NodeSnapshot]:
     return nodes
 
 
-def _newest_pod_render(pod_list_json: str) -> SandboxPodRender | None:
-    """The newest non-terminating pod: a generation bump can leave two for one sandbox."""
+def _newest_live_pod_item(pod_list_json: str) -> dict[str, Any] | None:
+    """The newest non-terminating pod item: a generation bump can leave two for one sandbox."""
 
-    try:
-        document = json.loads(pod_list_json)
-    except ValueError:
-        return None
+    document = json.loads(pod_list_json or "{}")
     live = [
         item
         for item in ((document.get("items") or []) if isinstance(document, dict) else [])
-        if not (item.get("metadata") or {}).get("deletionTimestamp")
+        if isinstance(item, dict) and not (item.get("metadata") or {}).get("deletionTimestamp")
     ]
     if not live:
         return None
-    newest = max(live, key=lambda item: str((item.get("metadata") or {}).get("creationTimestamp", "")))
+    return max(
+        live,
+        key=lambda item: (
+            str((item.get("metadata") or {}).get("creationTimestamp", "")),
+            str((item.get("metadata") or {}).get("name", "")),
+        ),
+    )
+
+
+def _matches_dedicated_taint(tol: Mapping[str, Any]) -> bool:
+    key = tol.get("key")
+    if key == DEDICATED_NODE_TAINT_KEY:
+        return True
+    if not key and tol.get("operator") == "Exists":
+        effect = tol.get("effect")
+        return effect is None or effect in ("", "NoSchedule")
+    return False
+
+
+def _parse_pod_boundary_render(pod: dict[str, Any]) -> SandboxPodBoundaryRender:
+    metadata = pod.get("metadata") or {}
+    spec = pod.get("spec") or {}
+    status = pod.get("status") or {}
+    node_affinity = ((spec.get("affinity") or {}).get("nodeAffinity")) or {}
+    required = node_affinity.get("requiredDuringSchedulingIgnoredDuringExecution") or {}
+    preferred = node_affinity.get("preferredDuringSchedulingIgnoredDuringExecution") or []
+    required_sets: list[tuple[str, ...]] = []
+    any_terms: list[str] = []
+    for term in required.get("nodeSelectorTerms") or []:
+        in_values: set[str] = set()
+        for expr in (term or {}).get("matchExpressions") or []:
+            if expr.get("key") != NODE_GROUP_BOUNDARY_LABEL:
+                continue
+            operator = str(expr.get("operator") or "")
+            values = sorted(str(v) for v in (expr.get("values") or []))
+            any_terms.append(f"required:{operator}:{','.join(values)}")
+            if operator == "In":
+                in_values.update(values)
+        required_sets.append(tuple(sorted(in_values)))
+    for pref in preferred:
+        preference = (pref or {}).get("preference") or {}
+        for expr in preference.get("matchExpressions") or []:
+            if expr.get("key") != NODE_GROUP_BOUNDARY_LABEL:
+                continue
+            operator = str(expr.get("operator") or "")
+            values = sorted(str(v) for v in (expr.get("values") or []))
+            any_terms.append(f"preferred:{operator}:{','.join(values)}")
+    tolerations = tuple(
+        DedicatedOrgToleration(
+            operator=str(tol["operator"]) if tol.get("operator") is not None else None,
+            value=str(tol["value"]) if tol.get("value") is not None else None,
+            effect=str(tol["effect"]) if tol.get("effect") is not None else None,
+        )
+        for tol in (spec.get("tolerations") or [])
+        if isinstance(tol, dict) and _matches_dedicated_taint(tol)
+    )
+    annotations = metadata.get("annotations") or {}
+    node_name = spec.get("nodeName")
+    phase = status.get("phase")
+    return SandboxPodBoundaryRender(
+        pod_name=str(metadata.get("name") or ""),
+        phase=str(phase) if isinstance(phase, str) and phase else None,
+        node_name=str(node_name) if isinstance(node_name, str) and node_name else None,
+        required_node_group_sets=tuple(required_sets),
+        any_node_group_terms=tuple(any_terms),
+        dedicated_org_tolerations=tolerations,
+        has_restore_storage_uri=bool(
+            annotations.get("space.pplx.net/suspend-restore-storage-uri")
+        ),
+    )
+
+
+def _newest_pod_render(pod_list_json: str) -> SandboxPodRender | None:
+    """The newest non-terminating pod: a generation bump can leave two for one sandbox."""
+
+    newest = _newest_live_pod_item(pod_list_json)
+    if newest is None:
+        return None
     metadata = newest.get("metadata") or {}
     spec = newest.get("spec") or {}
     return SandboxPodRender(
