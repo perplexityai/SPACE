@@ -96,12 +96,16 @@ pub async fn insert_unplaced(
 
 /// Insert a sandbox adopted from a warm pool with its existing placement.
 /// Substrates without a database node row pass no active node id.
-/// The caller owns the transaction that also records the pool claim.
-pub async fn insert_pooled(
-    executor: impl Executor<'_>,
+/// The caller owns the transaction that also records the pool claim. The
+/// caller must pass its open transaction.
+pub async fn insert_pooled<C>(
+    tx: &mut C,
     input: &SandboxCreate<'_>,
     active_node_id: Option<NodeId>,
-) -> Result<(), SandboxStoreError> {
+) -> Result<(), SandboxStoreError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "INSERT INTO sandboxes (
             id, name, user_id, org_id, managed_by, lifecycle, placement,
@@ -137,7 +141,7 @@ pub async fn insert_pooled(
     .bind(input.network_policy_override_json)
     .bind(input.egress_profiles)
     .bind(input.activating_client_id)
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }

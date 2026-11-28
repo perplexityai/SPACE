@@ -290,13 +290,17 @@ pub async fn local_backup_pending(
 ///
 /// The Kubernetes store reads it after its per-sandbox row lock, in that
 /// transaction, and feeds the answer to
-/// [`crate::suspend::finalize_missing_pod_from_current_snapshot`].
-pub async fn missing_suspending_pod_clear_marker(
-    executor: impl Executor<'_>,
+/// [`crate::suspend::finalize_missing_pod_from_current_snapshot`]. The caller
+/// must pass its open transaction.
+pub async fn missing_suspending_pod_clear_marker<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     generation: i64,
     pod_uid: &str,
-) -> Result<Option<bool>, DbError> {
+) -> Result<Option<bool>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     static QUERY: LazyLock<String> = LazyLock::new(|| {
         let eligibility = missing_suspending_pod_revert_eligibility("s");
         let clear_marker = eligibility.clear_marker;
@@ -330,7 +334,7 @@ pub async fn missing_suspending_pod_clear_marker(
             .bind(sandbox_id)
             .bind(generation)
             .bind(pod_uid)
-            .fetch_optional(executor.into_sqlx())
+            .fetch_optional(tx.into_sqlx())
             .await?,
     )
 }

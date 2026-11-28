@@ -966,14 +966,17 @@ pub(crate) fn converge_restoring_query() -> String {
 /// Writes an **inference**: the sweeper concluding that an abandoned restore
 /// finished. The caller runs it in a transaction that already holds the
 /// sandbox row lock, so the owner guard sees any attempt claimed while it
-/// waited.
-pub async fn converge_restoring(
-    executor: impl Executor<'_>,
+/// waited. The caller must pass its open transaction.
+pub async fn converge_restoring<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     managed_by: &str,
     target: SandboxLifecycle,
     age: PositiveDuration,
-) -> Result<bool, DbError> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let claimed =
         sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(sql!(converge_restoring_query())))
             .bind(managed_by)
@@ -981,7 +984,7 @@ pub async fn converge_restoring(
             .bind(sandbox_id)
             .bind(target.as_str())
             .bind(SubstrateKind::Kubernetes)
-            .fetch_optional(executor.into_sqlx())
+            .fetch_optional(tx.into_sqlx())
             .await?;
     Ok(claimed.is_some())
 }
@@ -1074,15 +1077,19 @@ fn revert_to_suspended_lifecycle_only_query() -> String {
 /// matches, calls [`unplace_reverted_restore`]; for a candidate that observed
 /// no execution it only checks that none is active. It rolls the revert back
 /// when the execution is not the one its candidate observed, or when the
-/// candidate has no usable record of it.
-pub async fn revert_to_suspended(
-    executor: impl Executor<'_>,
+/// candidate has no usable record of it. The caller must pass its open
+/// transaction.
+pub async fn revert_to_suspended<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     managed_by: &str,
     lifecycle: SandboxLifecycle,
     age: PositiveDuration,
     restoring_episode_deadline: Option<PositiveDuration>,
-) -> Result<Option<String>, DbError> {
+) -> Result<Option<String>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     Ok(
         sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql!(revert_to_suspended_query())))
             .bind(managed_by)
@@ -1091,7 +1098,7 @@ pub async fn revert_to_suspended(
             .bind(sandbox_id)
             .bind(restoring_episode_deadline.map(secs_bind))
             .bind(SubstrateKind::Kubernetes)
-            .fetch_optional(executor.into_sqlx())
+            .fetch_optional(tx.into_sqlx())
             .await?,
     )
 }
@@ -1102,15 +1109,18 @@ pub async fn revert_to_suspended(
 /// candidate's fence. The same guards and binds, the same write token.
 ///
 /// Writes an **inference**, as [`revert_to_suspended`] does. The caller takes
-/// the same locks first.
-pub async fn revert_to_suspended_lifecycle_only(
-    executor: impl Executor<'_>,
+/// the same locks first. The caller must pass its open transaction.
+pub async fn revert_to_suspended_lifecycle_only<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     managed_by: &str,
     lifecycle: SandboxLifecycle,
     age: PositiveDuration,
     restoring_episode_deadline: Option<PositiveDuration>,
-) -> Result<Option<String>, DbError> {
+) -> Result<Option<String>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     Ok(sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql!(
         revert_to_suspended_lifecycle_only_query()
     )))
@@ -1120,7 +1130,7 @@ pub async fn revert_to_suspended_lifecycle_only(
     .bind(sandbox_id)
     .bind(restoring_episode_deadline.map(secs_bind))
     .bind(SubstrateKind::Kubernetes)
-    .fetch_optional(executor.into_sqlx())
+    .fetch_optional(tx.into_sqlx())
     .await?)
 }
 

@@ -98,13 +98,17 @@ pub async fn claim(
 ///
 /// The only guard is `lifecycle = 'suspending'`, which the statement also
 /// re-assigns. The caller locks the row first and, in the same transaction,
-/// fences a `deleting` artifact and marks the execution suspend-committed.
-pub async fn record_committed_artifact(
-    executor: impl Executor<'_>,
+/// fences a `deleting` artifact and marks the execution suspend-committed. The
+/// caller must pass its open transaction.
+pub async fn record_committed_artifact<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     artifact_id: LocalArtifactId,
     artifact_kind: ArtifactKind,
-) -> Result<bool, DbError> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let updated = sqlx::query(sql!(
         "UPDATE sandboxes
                 SET lifecycle = 'suspending',
@@ -117,7 +121,7 @@ pub async fn record_committed_artifact(
     .bind(sandbox_id.as_uuid())
     .bind(artifact_id.as_uuid())
     .bind(artifact_kind.as_str())
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(updated.rows_affected() == 1)
 }
@@ -130,13 +134,16 @@ pub async fn record_committed_artifact(
 /// exposures. It has no lifecycle
 /// predicate of its own and matches the row by id alone: it relies on the
 /// caller's sandbox and execution row locks and the re-checks it made under
-/// them in the same transaction.
-pub async fn finalize_with_committed_artifact(
-    executor: impl Executor<'_>,
+/// them in the same transaction. The caller must pass its open transaction.
+pub async fn finalize_with_committed_artifact<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     artifact_id: LocalArtifactId,
     artifact_kind: ArtifactKind,
-) -> Result<(), DbError> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "WITH candidate AS MATERIALIZED (
                  SELECT id
@@ -184,7 +191,7 @@ pub async fn finalize_with_committed_artifact(
     .bind(artifact_id.as_uuid())
     .bind(artifact_kind.as_str())
     .bind(ArtifactOrigin::Suspend.as_str())
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -196,12 +203,16 @@ pub async fn finalize_with_committed_artifact(
 ///
 /// Matches the row by id alone, with no lifecycle predicate of its own: it
 /// relies on the caller's sandbox row lock, its eligibility select and its
-/// retirement of the active execution, all in the same transaction.
-pub async fn finalize_missing_pod_from_current_snapshot(
-    executor: impl Executor<'_>,
+/// retirement of the active execution, all in the same transaction. The caller
+/// must pass its open transaction.
+pub async fn finalize_missing_pod_from_current_snapshot<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     clear_marker: bool,
-) -> Result<(), DbError> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "UPDATE sandboxes s SET lifecycle = 'suspended',
                     placement = 'unplaced',
@@ -213,7 +224,7 @@ pub async fn finalize_missing_pod_from_current_snapshot(
     ))
         .bind(sandbox_id)
         .bind(clear_marker)
-        .execute(executor.into_sqlx())
+        .execute(tx.into_sqlx())
         .await?;
     Ok(())
 }

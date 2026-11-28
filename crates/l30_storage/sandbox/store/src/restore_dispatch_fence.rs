@@ -38,13 +38,17 @@ use crate::restore_lease::RestoreClaimRow;
 ///
 /// No guard of its own: the caller holds the sandbox row lock and has just
 /// renewed its restore lease in the same transaction. A fence another owner
-/// wrote is replaced; it is bound to a token the row no longer carries.
-pub async fn fence_unsent_user_restore(
-    executor: impl Executor<'_>,
+/// wrote is replaced; it is bound to a token the row no longer carries. The
+/// caller must pass its open transaction.
+pub async fn fence_unsent_user_restore<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     restore_lease_token: Uuid,
     fence_ttl_secs: i64,
-) -> Result<bool, DbError> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let fenced = sqlx::query_scalar::<_, bool>(sql!(
         "UPDATE sandbox_k8s_executions
             SET restore_dispatch_fence_token = $2,
@@ -56,7 +60,7 @@ pub async fn fence_unsent_user_restore(
     .bind(sandbox_id)
     .bind(restore_lease_token)
     .bind(fence_ttl_secs as f64)
-    .fetch_optional(executor.into_sqlx())
+    .fetch_optional(tx.into_sqlx())
     .await?;
     Ok(fenced.is_some())
 }
@@ -152,10 +156,11 @@ where
 ///
 /// No guard of its own: the caller holds the sandbox row lock and has checked,
 /// under it, that the row is still `restoring` with its restore lease token.
-pub async fn clear_for_dispatch(
-    executor: impl Executor<'_>,
-    sandbox_id: SandboxId,
-) -> Result<(), DbError> {
+/// The caller must pass its open transaction.
+pub async fn clear_for_dispatch<C>(tx: &mut C, sandbox_id: SandboxId) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
             SET restore_dispatch_fence_token = NULL,
@@ -165,7 +170,7 @@ pub async fn clear_for_dispatch(
             AND active"
     ))
     .bind(sandbox_id)
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }

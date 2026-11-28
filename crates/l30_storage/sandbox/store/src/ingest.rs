@@ -205,11 +205,15 @@ pub struct SuspendedFinalizationCandidate {
 ///
 /// The statement checks no lifecycle, node or substrate of its own: it
 /// relies on the caller's candidate selection, which holds the row locks
-/// (`FOR UPDATE OF s`) in the same transaction.
-pub async fn finalize_suspended(
-    executor: impl Executor<'_>,
+/// (`FOR UPDATE OF s`) in the same transaction. The caller must pass its open
+/// transaction.
+pub async fn finalize_suspended<C>(
+    tx: &mut C,
     candidates: &[SuspendedFinalizationCandidate],
-) -> Result<Vec<(SandboxId, bool)>, DbError> {
+) -> Result<Vec<(SandboxId, bool)>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let candidate_ids = candidates
         .iter()
         .map(|candidate| candidate.sandbox_id)
@@ -369,7 +373,7 @@ pub async fn finalize_suspended(
             .bind(&published_execution_generations)
             .bind(&published_pod_uids)
             .bind(&published_pod_uids_were_missing)
-            .fetch_all(executor.into_sqlx())
+            .fetch_all(tx.into_sqlx())
             .await?,
     )
 }
@@ -806,15 +810,18 @@ pub const PAUSE_FAILED_QUARANTINE_REASON: SandboxQuarantineReasonCode =
 /// selection. The lifecycle check is exact (`lifecycle = 'quarantined'`),
 /// where the caller's selection compares `LOWER(TRIM(lifecycle))`: a selected
 /// row whose stored text is not canonical, such as ` Quarantined `, returns
-/// `false`.
-pub async fn recover_published_pause_failed(
-    executor: impl Executor<'_>,
+/// `false`. The caller must pass its open transaction.
+pub async fn recover_published_pause_failed<C>(
+    tx: &mut C,
     node_id: NodeId,
     sandbox_id: SandboxId,
     quarantine_id: Uuid,
     target_state: SandboxTransitionTargetState,
     action: SandboxQuarantineHistoryAction,
-) -> Result<bool, DbError> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let quarantine_source = PAUSE_FAILED_QUARANTINE_SOURCE.as_str();
     let quarantine_reason = PAUSE_FAILED_QUARANTINE_REASON.as_str();
     let recovered = sqlx::query_scalar::<_, Uuid>(sql!(
@@ -882,7 +889,7 @@ pub async fn recover_published_pause_failed(
     .bind(SandboxQuarantineSource::NodeStatePublish.as_str())
     .bind(action.as_str())
     .bind(node_id.to_string())
-    .fetch_optional(executor.into_sqlx())
+    .fetch_optional(tx.into_sqlx())
     .await?;
     Ok(recovered == Some(sandbox_id.as_uuid()))
 }
@@ -985,13 +992,16 @@ static PRUNE_ABSENT_NODE_SANDBOXES_QUERY: LazyLock<String> = LazyLock::new(|| {
 /// Mutate only the captured, advisory-locked candidates. A row that became
 /// visible later may be newer than this census and was not locked by it.
 /// `network_policy_facet` is the facet name of the per-sandbox network-policy
-/// rows it forgets.
-pub async fn prune_census_absent_sandboxes(
-    executor: impl Executor<'_>,
+/// rows it forgets. The caller must pass its open transaction.
+pub async fn prune_census_absent_sandboxes<C>(
+    tx: &mut C,
     node_id: NodeId,
     locked_candidate_ids: &[SandboxId],
     network_policy_facet: &str,
-) -> Result<(), DbError> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sqlx::AssertSqlSafe(
         PRUNE_ABSENT_NODE_SANDBOXES_QUERY.as_str(),
     ))
@@ -999,7 +1009,7 @@ pub async fn prune_census_absent_sandboxes(
     .bind(locked_candidate_ids)
     .bind(network_policy_facet)
     .bind(SubstrateKind::Space)
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -1074,18 +1084,21 @@ static DELETE_ABSENT_STOPPED_SANDBOXES: LazyLock<String> = LazyLock::new(|| {
 /// observations of the absent sandboxes and retires the deleted ones' claimed
 /// warm-pool slots. The caller does not run that helper's reconcile-state
 /// cleanup either, so their `node_reconcile_queue` and `node_facet_conditions`
-/// rows are not deleted here.
-pub async fn delete_published_absent_stopped(
-    executor: impl Executor<'_>,
+/// rows are not deleted here. The caller must pass its open transaction.
+pub async fn delete_published_absent_stopped<C>(
+    tx: &mut C,
     node_id: NodeId,
     absent_sandbox_ids: &[SandboxId],
-) -> Result<Vec<SandboxId>, DbError> {
+) -> Result<Vec<SandboxId>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     Ok(sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(
         DELETE_ABSENT_STOPPED_SANDBOXES.as_str(),
     ))
     .bind(node_id)
     .bind(absent_sandbox_ids)
     .bind(SubstrateKind::Space)
-    .fetch_all(executor.into_sqlx())
+    .fetch_all(tx.into_sqlx())
     .await?)
 }
