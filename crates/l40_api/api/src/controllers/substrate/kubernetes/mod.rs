@@ -56,6 +56,7 @@ mod caches;
 mod cancel_rate_tracker;
 mod client_live_pods;
 mod pod_reflector;
+mod pod_sandbox_rejections;
 mod pod_worker_channels;
 mod restore_dispatch_fence;
 mod restore_waiters;
@@ -896,6 +897,9 @@ pub struct KubernetesSubstrate {
     /// falling through to a direct `GET` during the brief window between pod
     /// creation/scheduling and the reflector observing the bind event.
     pod_events: pod_reflector::PodEvents,
+    /// Node refusals of sandbox pods (`FailedCreatePodSandBox` Events), fed by
+    /// one watch per process and routed to registered create waits by pod UID.
+    pod_sandbox_rejections: pod_sandbox_rejections::PodSandboxRejections,
     /// Flipped to `true` once the reflector's initial `LIST` populates the
     /// store. Exposed via `Substrate::readiness()` so the HTTP `/readyz`
     /// probe can keep a freshly-spawned replica out of the Service endpoint
@@ -963,6 +967,12 @@ impl KubernetesSubstrate {
             Ok(Some(k8s)) => {
                 let (pod_store, pod_indexes, pod_events, pod_reflector_ready) =
                     pod_reflector::start(k8s.client.clone(), k8s.sandbox_namespace.clone());
+                let pod_sandbox_rejections = pod_sandbox_rejections::PodSandboxRejections::start(
+                    k8s.client.clone(),
+                    &k8s.sandbox_namespace,
+                    shutdown_token.clone(),
+                    &task_tracker,
+                );
                 let store = K8sStore::new(
                     pool.clone(),
                     k8s.sandbox_namespace.clone(),
@@ -991,6 +1001,7 @@ impl KubernetesSubstrate {
                     pod_network_slots: pod_indexes.network_slots,
                     pod_client_index: pod_indexes.client_pods,
                     pod_events,
+                    pod_sandbox_rejections,
                     pod_reflector_ready,
                     k8s,
                     node_group_placement,

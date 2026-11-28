@@ -50,6 +50,9 @@ pub(crate) enum KubeReply {
     /// A watch that sends these `{"type": ..., "object": ...}` events, then
     /// ends.
     WatchEvents(Vec<serde_json::Value>),
+    /// An HTTP 200 watch stream that stays open and yields newline-delimited
+    /// watch frames as the test sends them, ending when the sender drops.
+    WatchStream(tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>),
     /// Never answer, for callers that bound the read with their own budget.
     Hang,
 }
@@ -91,12 +94,17 @@ where
                 body,
             };
             log.lock().unwrap().push(request.clone());
+            let once_body = |bytes: Vec<u8>| {
+                http_body_util::Full::new(Bytes::from(bytes))
+                    .map_err(|never: Infallible| -> BoxError { match never {} })
+                    .boxed_unsync()
+            };
             match reply(request).await {
                 KubeReply::Json(status, body) => Ok::<_, BoxError>(
                     http::Response::builder()
                         .status(status)
                         .header("content-type", "application/json")
-                        .body(KubeBody::from(serde_json::to_vec(&body)?))?,
+                        .body(once_body(serde_json::to_vec(&body)?))?,
                 ),
                 KubeReply::WatchEvents(events) => {
                     let mut lines = Vec::new();
@@ -107,7 +115,23 @@ where
                     Ok(http::Response::builder()
                         .status(StatusCode::OK)
                         .header("content-type", "application/json")
-                        .body(KubeBody::from(lines))?)
+                        .body(once_body(lines))?)
+                }
+                KubeReply::WatchStream(rx) => {
+                    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                        let event = rx.recv().await?;
+                        let frame = serde_json::to_vec(&event)
+                            .map(|mut line| {
+                                line.push(b'\n');
+                                Frame::data(Bytes::from(line))
+                            })
+                            .map_err(Into::<BoxError>::into);
+                        Some((frame, rx))
+                    });
+                    Ok(http::Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .body(http_body_util::StreamBody::new(stream).boxed_unsync())?)
                 }
                 KubeReply::Hang => std::future::pending().await,
             }

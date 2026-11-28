@@ -6997,8 +6997,8 @@ async fn ecw_create_cleans_up_a_failed_create_after_its_client_disconnects() -> 
     let (org, actor) = seed_ecw_caller(&db.pool).await?;
 
     let pod_name: Arc<Mutex<Option<String>>> = Arc::default();
-    // Signalled when the create waits on its pod's events; the refusal is
-    // answered only once the test has disconnected the client.
+    // Signalled when the create queries its pod during readiness; the refusal
+    // is answered only once the test has disconnected the client.
     let waiting = Arc::new(tokio::sync::Notify::new());
     let refuse = Arc::new(tokio::sync::Notify::new());
     let (client, log) = {
@@ -7042,18 +7042,43 @@ async fn ecw_create_cleans_up_a_failed_create_after_its_client_disconnects() -> 
                     // The pod never reports an IP.
                     Method::GET if request.path == PODS_PATH => KubeReply::Hang,
                     Method::GET if Some(&request.path) == at_pod.as_ref() => {
+                        waiting.notify_one();
                         pending(name.as_deref().expect("the pod was created"))
                     }
+                    Method::GET
+                        if request.path == EVENTS_PATH
+                            && !request
+                                .query
+                                .as_deref()
+                                .is_some_and(|query| query.contains("watch=true")) =>
+                    {
+                        KubeReply::Json(
+                            StatusCode::OK,
+                            json!({
+                                "apiVersion": "v1",
+                                "kind": "EventList",
+                                "metadata": { "resourceVersion": "1" },
+                                "items": [],
+                            }),
+                        )
+                    }
                     Method::GET if request.path == EVENTS_PATH => {
-                        let name = name.expect("events are watched after the pod is created");
-                        waiting.notify_one();
                         refuse.notified().await;
+                        let name = pod_name
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .expect("the refusal follows the pod create");
                         KubeReply::WatchEvents(vec![json!({
                             "type": "ADDED",
                             "object": {
                                 "apiVersion": "v1",
                                 "kind": "Event",
-                                "metadata": { "name": format!("{name}.1"), "namespace": "space" },
+                                "metadata": {
+                                    "name": format!("{name}.1"),
+                                    "namespace": "space",
+                                    "resourceVersion": "2",
+                                },
                                 "involvedObject": {
                                     "kind": "Pod",
                                     "name": name,
@@ -7077,7 +7102,8 @@ async fn ecw_create_cleans_up_a_failed_create_after_its_client_disconnects() -> 
         crate::controllers::substrate::kubernetes::tests::substrate_with_store_and_client(
             db.pool.clone(),
             client,
-        );
+        )
+        .with_pod_sandbox_rejection_watch();
     let mut state = AppState::from_pool(db.pool.clone()).await?;
     configure_test_ecw_credential_keyring(&mut state);
     state.sandbox_controller = crate::controllers::sandbox::SandboxController::new(
