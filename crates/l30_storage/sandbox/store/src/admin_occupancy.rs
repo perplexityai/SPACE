@@ -1156,20 +1156,23 @@ static TERMINATE_OCCUPANCY_CENSUS_AWARE: LazyLock<String> =
 /// strand-risk count is observed under the same `FOR UPDATE` lock as the
 /// drain-phase write.
 ///
-/// Run it on the caller's transaction: that is what keeps the count under
-/// the caller's lock.
-pub async fn terminate_occupancy(
-    executor: impl Executor<'_>,
+/// The count stays under that lock only when it runs in the caller's
+/// transaction. The caller must pass its open transaction.
+pub async fn terminate_occupancy<C>(
+    tx: &mut C,
     node_id: NodeId,
     residency: ResidencyEvidence,
-) -> Result<TerminateOccupancy, DbError> {
+) -> Result<TerminateOccupancy, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let statement: &str = match residency {
         ResidencyEvidence::LifecycleOnly => &TERMINATE_OCCUPANCY,
         ResidencyEvidence::NodeCensusAware => &TERMINATE_OCCUPANCY_CENSUS_AWARE,
     };
     let row: (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(statement))
         .bind(node_id)
-        .fetch_one(executor.into_sqlx())
+        .fetch_one(tx.into_sqlx())
         .await?;
     Ok(TerminateOccupancy {
         active: row.0,

@@ -25,14 +25,18 @@ use pplx_space_sql_locator::sql;
 /// the caller fences the receipt by first retiring the exact execution
 /// generation and activation attempt it names, and its candidate selection
 /// holds the row `FOR UPDATE` in the same transaction. The caller treats
-/// `false` as lost ownership and rolls back.
-pub async fn converge_activation_rollback(
-    executor: impl Executor<'_>,
+/// `false` as lost ownership and rolls back. The caller must pass its open
+/// transaction.
+pub async fn converge_activation_rollback<C>(
+    tx: &mut C,
     node_id: NodeId,
     sandbox_id: SandboxId,
     target_state: SandboxTransitionTargetState,
     clear_placement_changed_at: bool,
-) -> Result<bool, DbError> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let converged = sqlx::query(sql!(
         "UPDATE sandboxes
                 SET lifecycle = $3,
@@ -50,7 +54,7 @@ pub async fn converge_activation_rollback(
     .bind(node_id)
     .bind(target_state.as_str())
     .bind(clear_placement_changed_at)
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(converged.rows_affected() == 1)
 }

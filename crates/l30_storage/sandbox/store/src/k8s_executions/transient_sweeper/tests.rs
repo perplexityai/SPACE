@@ -1,8 +1,9 @@
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_node_model::SubstrateKind;
-use pplx_space_sandbox_model::SandboxActivationAttemptId;
+use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId};
 use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::super::ownership_test_fixture::{
@@ -10,6 +11,32 @@ use super::super::ownership_test_fixture::{
     insert_execution, insert_sandbox, is_lock_not_available,
 };
 use super::{lock_active_nowait, note_failed_cleanup_attempt, retire_reverted_restore_execution};
+
+/// Runs [`retire_reverted_restore_execution`] in a transaction of its own and
+/// commits it.
+async fn retire(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    pod_name: &str,
+    generation: Option<i64>,
+    activation_attempt_id: Option<SandboxActivationAttemptId>,
+    pod_uid: Option<&str>,
+    route_activation_id: Option<SandboxActivationAttemptId>,
+) -> TestResult<bool> {
+    let mut tx = pool.begin().await?;
+    let retired = retire_reverted_restore_execution(
+        &mut *tx,
+        sandbox_id,
+        pod_name,
+        generation,
+        activation_attempt_id,
+        pod_uid,
+        route_activation_id,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(retired)
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn note_failed_cleanup_attempt_bumps_only_a_failed_kubernetes_rows_active_execution()
@@ -113,7 +140,7 @@ async fn retire_reverted_restore_execution_fences_on_the_recorded_identity() -> 
         (pod_name, Some(2), Some(attempt), Some("uid-2"), None),
     ] {
         assert!(
-            !retire_reverted_restore_execution(
+            !retire(
                 pool, sandbox_id, pod_name, generation, attempt_id, pod_uid, route_id,
             )
             .await?
@@ -123,7 +150,7 @@ async fn retire_reverted_restore_execution_fences_on_the_recorded_identity() -> 
 
     // The stored UID is compared trimmed.
     assert!(
-        retire_reverted_restore_execution(
+        retire(
             pool,
             sandbox_id,
             pod_name,
@@ -141,7 +168,7 @@ async fn retire_reverted_restore_execution_fences_on_the_recorded_identity() -> 
     // Retired, it no longer matches `active`.
     let retired = execution_version(pool, execution.id).await?;
     assert!(
-        !retire_reverted_restore_execution(
+        !retire(
             pool,
             sandbox_id,
             pod_name,

@@ -56,6 +56,23 @@ fn generation(value: u64) -> RouteGeneration {
     RouteGeneration::new(value).expect("positive route generation")
 }
 
+/// Runs [`reset_applied_service_port`] in a transaction of its own and
+/// commits it.
+async fn reset(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    port: i32,
+    route_generation: RouteGeneration,
+    diagnostic: &str,
+) -> TestDbResult<Option<NodeId>> {
+    let mut tx = pool.begin().await?;
+    let node_id =
+        reset_applied_service_port(&mut *tx, sandbox_id, port, route_generation, diagnostic)
+            .await?;
+    tx.commit().await?;
+    Ok(node_id)
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn reset_applied_service_port_refuses_a_stale_route_and_changes_nothing() -> TestDbResult<()>
 {
@@ -117,7 +134,7 @@ async fn reset_applied_service_port_refuses_a_stale_route_and_changes_nothing() 
     // applied on another node match no row.
     for (port, route_generation) in [(8080, 4), (8081, 3), (8082, 3)] {
         assert_eq!(
-            reset_applied_service_port(
+            reset(
                 pool,
                 sandbox_id,
                 port,
@@ -134,7 +151,7 @@ async fn reset_applied_service_port_refuses_a_stale_route_and_changes_nothing() 
     assert_eq!(exposure(pool, sandbox_id, 8082).await?, before_8082);
 
     assert_eq!(
-        reset_applied_service_port(pool, sandbox_id, 8080, generation(3), "unreachable").await?,
+        reset(pool, sandbox_id, 8080, generation(3), "unreachable").await?,
         Some(node_id)
     );
     assert_eq!(
@@ -149,7 +166,7 @@ async fn reset_applied_service_port_refuses_a_stale_route_and_changes_nothing() 
     );
     // Once pending, the same reset matches no row.
     assert_eq!(
-        reset_applied_service_port(pool, sandbox_id, 8080, generation(3), "again").await?,
+        reset(pool, sandbox_id, 8080, generation(3), "again").await?,
         None
     );
     Ok(())
