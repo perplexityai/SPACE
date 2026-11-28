@@ -1,32 +1,41 @@
 //! The node's activation seal, and the VM activations and node-local artifact
 //! producers in flight, which a drain reports as pending.
 //!
-//! While sealed under a generation, [`ActivationSeal::admit`] refuses every VM
-//! activation: the cold boot of a sandbox, the restore of one from a snapshot
-//! and the resume of a resident paused VM, which
-//! `SandboxManagerService::admit_vm_activation` is the one entry point for.
-//! The seal is the `activation_seal` row in sandbox-manager's database, read
-//! once when the service is built and kept in memory, so it holds across a
-//! restart and an activation reads no database.
+//! While sealed under a generation, the seal refuses every VM activation: the
+//! cold boot of a sandbox, the restore of one from a snapshot and the resume
+//! of a resident paused VM. It also decides the node-local writers that
+//! would leave something new for a drain to find, each by its class. The
+//! node's write gate (`crate::service::write_gate`) is the one place either
+//! is asked: activations through `SandboxManagerService::admit_vm_activation`,
+//! writers by their class. The admissions here take the gate's
+//! [`GateKey`], which only the gate makes. The seal is the `activation_seal`
+//! row in sandbox-manager's database, read once when the service is built
+//! and kept in memory, so it holds across a restart and an admission reads
+//! no database for it.
 //!
 //! The seal is in one of three states: unsealed, sealed under a generation, or
-//! unknown, when the startup read failed. Unknown is not unsealed: it refuses
-//! every VM activation with a retryable `Unavailable`
+//! unknown, when the startup read failed. Unknown is not unsealed for an
+//! activation: it refuses every VM activation with a retryable `Unavailable`
 //! ([`ACTIVATION_SEAL_UNREADABLE_MARKER`]), since the row it couldn't read may
-//! say sealed. [`ActivationSeal::recover`] reads the row again in the
+//! say sealed. Every other writer is admitted while it is unknown, as on a
+//! node never sealed. [`ActivationSeal::recover`] reads the row again in the
 //! background with a short bounded backoff, off the async runtime and without
 //! the state lock, so activations are refused, not blocked, meanwhile. It
 //! then publishes what it read under the state lock, only while the seal is
 //! still unknown: a seal or cancel that read the row in between wins. While
-//! it still can't
-//! read, it logs a warning every [`UNREADABLE_WARN_INTERVAL`] naming the
-//! error and how long the seal has been unknown.
+//! it still can't read, it logs a warning every [`UNREADABLE_WARN_INTERVAL`]
+//! naming the error and how long the seal has been unknown.
 //!
 //! Each admitted activation holds an [`ActivationInFlightToken`] from
 //! admission until its last step finishes or fails, including the finalizer
-//! it detaches. The seal state lock orders every admission against every
-//! seal: an activation is admitted and registered entirely before a seal
-//! lands, and counts as in flight, or is refused.
+//! it detaches, and each writer admitted as a producer holds an
+//! [`ArtifactProducerToken`] until it ends. The seal state lock orders every
+//! admission against every seal: one is admitted and registered entirely
+//! before a seal lands, and counts as in flight, or is refused. A drain
+//! reports both as pending: a producer admitted before the seal may not have
+//! written what it leaves when a drain's pass reads the node, and a sandbox
+//! import or a runtime upgrade's stage has no row for the drain to find until
+//! it reserves or adopts one.
 //!
 //! Generations only move forward, and one drain seals the node at a time.
 //! Sealed under a generation, the node refuses a seal under any other, and a
@@ -35,24 +44,13 @@
 //! below it is taken again. Each refusal is a `FailedPrecondition` naming
 //! both generations.
 //!
-//! A node-local artifact producer (a snapshot, an import, a publication)
-//! takes no activation, but it leaves an artifact a drain has to make
-//! durable. Holding the sandbox's artifact lock, it asks
-//! [`ActivationSeal::admit_producer`], which refuses it on a node known
-//! sealed when the sandbox has no VM: a drain may already have found
-//! everything there durable and reported nothing pending. A sandbox with a VM
-//! keeps the drain pending until its suspend, which waits for the same lock,
-//! so its producer is admitted sealed too. An unknown seal admits, as a node
-//! never sealed does. Each admitted producer holds an [`ArtifactProducerToken`]
-//! until it ends, which a drain reports as pending. A rollback that doesn't
-//! restart publishes no artifact, but rewrites the disk a drain may already
-//! have made durable, so it is admitted the same way and holds a token until
-//! it returns. A v2 drain doesn't move a stopped sandbox, so an idle
-//! auto-stop is admitted the same way and holds its token until its state
-//! write commits. It leaves the sandbox without a VM, whether suspended,
-//! started or paused before, so it asks as a producer for a sandbox with no
-//! VM, which a node known sealed refuses. A drain that seals the node while
-//! one runs reports the sandbox pending until it ends.
+//! A refusal of sealed work is a [`SealRefusal`], which names what it
+//! refused: an activation, a runtime upgrade, or another writer. Its status
+//! carries [`ACTIVATIONS_SEALED_MARKER`], or, for an activation while the
+//! seal is unknown, [`ACTIVATION_SEAL_UNREADABLE_MARKER`]; the marker's
+//! contract says what a caller does with each. A writer whose rule needs the
+//! sandbox's row, on a node known sealed, is refused as retryable, with
+//! neither marker, while that row can't be read.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,13 +63,14 @@ use tonic::Status;
 
 use crate::db::SharedConnection;
 use crate::db::activation_seal::{ActivationSealRecord, write_activation_seal};
-use crate::state::{SandboxState, SandboxStatus};
+use crate::service::write_gate::GateKey;
 
 /// The marker in the `FailedPrecondition` status a sealed node refuses a VM
-/// activation with, the contract's one definition, which the API matches.
-/// The node refuses the same activation until it is unsealed, so a caller
-/// places the work on another node or waits for the unseal rather than
-/// retrying here.
+/// activation or a node-local writer with, the contract's one definition,
+/// which the API matches. The node refuses the same work until it is
+/// unsealed: an activation, or a runtime upgrade of a sandbox without a VM,
+/// lands on another node once the drain has made the sandbox durable, and
+/// another writer's refusal holds until the drain is cancelled.
 pub(crate) use pplx_space_rpc_contracts::wake_signals::ACTIVATIONS_SEALED_MARKER;
 
 /// The marker in the `Unavailable` status a node whose seal row couldn't be
@@ -79,14 +78,100 @@ pub(crate) use pplx_space_rpc_contracts::wake_signals::ACTIVATIONS_SEALED_MARKER
 /// seconds once the row reads, so a caller may retry.
 pub(crate) const ACTIVATION_SEAL_UNREADABLE_MARKER: &str = "activation seal unreadable; retrying";
 
-/// Whether a sandbox whose row is in `state` has a VM, as
-/// [`ActivationSeal::admit_producer`] asks: its lifecycle is `started` or
-/// `paused`, and no cleanup owns it.
-pub(crate) fn has_vm(state: SandboxStatus) -> bool {
-    matches!(
-        state.unowned(),
-        Some(SandboxState::Started | SandboxState::Paused)
-    )
+/// Why the seal refused a VM activation or a node-local writer of
+/// `sandbox_id`. Its status ([`Status::from`]) is the one the wire has always
+/// carried, which the API classifies on.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum SealRefusal {
+    /// A VM activation, `activation` naming its kind, on a node sealed under
+    /// `generation`: placed again on another node once the drain has made
+    /// the sandbox durable.
+    #[error(
+        "{} (generation {generation}); refusing the {activation} activation of sandbox \
+         {sandbox_id}",
+        ACTIVATIONS_SEALED_MARKER
+    )]
+    Activation {
+        activation: &'static str,
+        sandbox_id: String,
+        generation: u64,
+    },
+    /// A VM activation while the seal row can't be read: retryable here once
+    /// the background read publishes the row.
+    #[error(
+        "{}; refusing the {activation} activation of sandbox {sandbox_id}",
+        ACTIVATION_SEAL_UNREADABLE_MARKER
+    )]
+    ActivationUnreadable {
+        activation: &'static str,
+        sandbox_id: String,
+    },
+    /// A runtime upgrade's stage or fence, `step` naming which, of a sandbox
+    /// that has no VM on a node sealed under `generation` and isn't stopped:
+    /// like an activation, it lands on another node once the drain has made
+    /// the sandbox durable.
+    #[error(
+        "{} (generation {generation}); refusing the {step} of sandbox {sandbox_id}, which \
+         has no VM on this node",
+        ACTIVATIONS_SEALED_MARKER
+    )]
+    RuntimeUpgrade {
+        step: &'static str,
+        sandbox_id: String,
+        generation: u64,
+    },
+    /// Another node-local writer, `work` naming it, on a node sealed under
+    /// `generation`: a producer for a sandbox without a VM, or the idle
+    /// auto-stop, each of which would leave the sandbox without a VM there.
+    /// Refused here until the undrain.
+    #[error(
+        "{} (generation {generation}); refusing the {work} of sandbox {sandbox_id}, which \
+         would leave it without a VM",
+        ACTIVATIONS_SEALED_MARKER
+    )]
+    Writer {
+        work: &'static str,
+        sandbox_id: String,
+        generation: u64,
+    },
+    /// A writer, `work` naming it, whose admission on a sealed node needs
+    /// the sandbox's row, which couldn't be read: retryable here, since the
+    /// row may read on a retry.
+    #[error(
+        "can't read sandbox {sandbox_id}'s row to admit its {work} on a sealed node; retry: \
+         {error}"
+    )]
+    RowUnreadable {
+        work: &'static str,
+        sandbox_id: String,
+        error: String,
+    },
+}
+
+impl From<SealRefusal> for Status {
+    fn from(refusal: SealRefusal) -> Self {
+        let message = refusal.to_string();
+        match refusal {
+            SealRefusal::ActivationUnreadable { .. } | SealRefusal::RowUnreadable { .. } => {
+                Status::unavailable(message)
+            }
+            SealRefusal::Activation { .. }
+            | SealRefusal::RuntimeUpgrade { .. }
+            | SealRefusal::Writer { .. } => Status::failed_precondition(message),
+        }
+    }
+}
+
+/// The seal as an admission reads it, under the state lock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SealReading {
+    /// Never sealed, or cancelled: the tombstone admits everything.
+    Unsealed,
+    Sealed {
+        generation: u64,
+    },
+    /// The row couldn't be read.
+    Unknown,
 }
 
 /// The first and the longest wait between two reads of a seal row that
@@ -156,6 +241,14 @@ impl SealState {
             .flatten()
             .filter(|record| record.sealed)
             .map(|record| record.generation)
+    }
+
+    fn reading(&self) -> SealReading {
+        match self.sealed_generation() {
+            Some(generation) => SealReading::Sealed { generation },
+            None if self.is_unknown() => SealReading::Unknown,
+            None => SealReading::Unsealed,
+        }
     }
 
     /// The readable row, `None` on a node never sealed or cancelled. A row
@@ -340,7 +433,12 @@ impl ActivationSeal {
 
     /// Refuse an activation while sealed or unknown, without admitting it.
     /// `activation` names its kind in the refusal.
-    pub(crate) fn check(&self, activation: &str, sandbox_id: &str) -> Result<(), Status> {
+    pub(crate) fn check(
+        &self,
+        _gate: &GateKey,
+        activation: &'static str,
+        sandbox_id: &str,
+    ) -> Result<(), SealRefusal> {
         refuse_while_sealed(&self.lock_state(), activation, sandbox_id)
     }
 
@@ -348,9 +446,10 @@ impl ActivationSeal {
     /// the activation as in flight until it is dropped.
     pub(crate) fn admit(
         &self,
-        activation: &str,
+        _gate: &GateKey,
+        activation: &'static str,
         sandbox_id: &str,
-    ) -> Result<ActivationInFlightToken, Status> {
+    ) -> Result<ActivationInFlightToken, SealRefusal> {
         let state = self.lock_state();
         refuse_while_sealed(&state, activation, sandbox_id)?;
         // Registered before the state lock is released, so a seal that
@@ -358,27 +457,24 @@ impl ActivationSeal {
         Ok(self.in_flight.register(sandbox_id))
     }
 
-    /// Admit a node-local artifact producer, `producer` naming it in a
-    /// refusal, for `sandbox_id`, which the caller has read holding the
-    /// sandbox's artifact lock: `has_vm` when the sandbox still has a VM
-    /// after the work, its lifecycle there being `started` or `paused`
-    /// ([`has_vm`]) and the work not stopping it. A node known sealed refuses
-    /// one for a sandbox with no VM with the sealed refusal, so that the
-    /// caller writes nothing; an unknown seal admits, as a node never sealed
-    /// does. The token counts the producer in flight until it is dropped.
-    pub(crate) fn admit_producer(
+    /// Admit a node-local writer of `sandbox_id` as `decide` rules on the
+    /// seal as it stands, under the state lock, so no seal lands between the
+    /// decision and the registration. `decide` answers whether the writer
+    /// counts as an artifact producer in flight; one that does is registered
+    /// before the lock is released and counted until its token drops.
+    /// `decide` may read the sandbox's row: the state lock is taken before
+    /// the database's, as a seal takes them.
+    pub(crate) fn admit_writer(
         &self,
-        producer: &str,
+        _gate: &GateKey,
         sandbox_id: &str,
-        has_vm: bool,
-    ) -> Result<ArtifactProducerToken, Status> {
+        decide: impl FnOnce(SealReading) -> Result<bool, SealRefusal>,
+    ) -> Result<Option<ArtifactProducerToken>, SealRefusal> {
         let state = self.lock_state();
-        refuse_without_vm(&state, producer, sandbox_id, has_vm)?;
-        // Registered before the state lock is released, so a seal that
-        // lands next finds it in flight.
-        Ok(ArtifactProducerToken {
+        let counted = decide(state.reading())?;
+        Ok(counted.then(|| ArtifactProducerToken {
             _in_flight: self.producers.register(sandbox_id),
-        })
+        }))
     }
 
     /// Seal under `generation`, persisted before the seal takes effect. The
@@ -456,10 +552,13 @@ impl ActivationSeal {
         self.lock_state().record.as_ref().err().cloned()
     }
 
+    /// The seal and the activations and producers in flight, read under the
+    /// state lock every admission registers under, so both lists are the
+    /// ones admitted under the seal read with them.
     pub(crate) fn status(&self) -> ActivationSealStatus {
-        let sealed_generation = self.lock_state().sealed_generation();
+        let state = self.lock_state();
         ActivationSealStatus {
-            sealed_generation,
+            sealed_generation: state.sealed_generation(),
             in_flight: self.in_flight.list(),
             producers_in_flight: self.producers.list(),
         }
@@ -490,22 +589,21 @@ impl ActivationSeal {
 
 fn refuse_while_sealed(
     state: &SealState,
-    activation: &str,
+    activation: &'static str,
     sandbox_id: &str,
-) -> Result<(), Status> {
-    if state.is_unknown() {
-        return Err(Status::unavailable(format!(
-            "{ACTIVATION_SEAL_UNREADABLE_MARKER}; refusing the {activation} activation of \
-             sandbox {sandbox_id}"
-        )));
+) -> Result<(), SealRefusal> {
+    match state.reading() {
+        SealReading::Unsealed => Ok(()),
+        SealReading::Sealed { generation } => Err(SealRefusal::Activation {
+            activation,
+            sandbox_id: sandbox_id.to_owned(),
+            generation,
+        }),
+        SealReading::Unknown => Err(SealRefusal::ActivationUnreadable {
+            activation,
+            sandbox_id: sandbox_id.to_owned(),
+        }),
     }
-    let Some(generation) = state.sealed_generation() else {
-        return Ok(());
-    };
-    Err(Status::failed_precondition(format!(
-        "{ACTIVATIONS_SEALED_MARKER} (generation {generation}); refusing the {activation} \
-         activation of sandbox {sandbox_id}"
-    )))
 }
 
 /// The refusal of a seal under `generation` while the row is `current`:
@@ -611,26 +709,9 @@ fn joined_read(
     joined.unwrap_or_else(|error| Err(format!("the activation seal read panicked: {error}")))
 }
 
-/// The sealed refusal of `work` for `sandbox_id` when the node is known
-/// sealed and the sandbox has no VM after the work.
-fn refuse_without_vm(
-    state: &SealState,
-    work: &str,
-    sandbox_id: &str,
-    has_vm: bool,
-) -> Result<(), Status> {
-    match state.sealed_generation() {
-        Some(generation) if !has_vm => Err(Status::failed_precondition(format!(
-            "{ACTIVATIONS_SEALED_MARKER} (generation {generation}); refusing the {work} of sandbox \
-             {sandbox_id}, which would leave it without a VM"
-        ))),
-        _ => Ok(()),
-    }
-}
-
 /// Counts one node-local artifact producer as in flight until dropped, on
 /// success, error, cancellation or unwinding alike
-/// ([`ActivationSeal::admit_producer`]).
+/// ([`ActivationSeal::admit_writer`]).
 #[must_use = "dropping the token ends the producer's in-flight count"]
 #[derive(Debug)]
 pub(crate) struct ArtifactProducerToken {

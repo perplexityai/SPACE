@@ -381,12 +381,43 @@ async fn cancelled_activation_retries_release_admission_without_releasing_the_lo
         if let Some(state) = state {
             insert_test_sandbox(&manager.db.lock().unwrap(), &sandbox_id, state);
         }
-        let lock = match site {
-            LockSite::Staging => manager.auto_lifecycle.staging_lock(&sandbox_id),
-            LockSite::Artifact => manager.auto_lifecycle.artifact_lock(&sandbox_id),
-            LockSite::Wake => manager.auto_lifecycle.wake_lock(&sandbox_id),
+        let held: Box<dyn Send> = match site {
+            LockSite::Staging => Box::new(
+                manager
+                    .auto_lifecycle
+                    .staging_lock(&sandbox_id)
+                    .lock()
+                    .await,
+            ),
+            LockSite::Artifact => Box::new(
+                manager
+                    .write_gate
+                    .lock_for_read(&sandbox_id, crate::service::write_gate::Reader::Test)
+                    .await,
+            ),
+            LockSite::Wake => Box::new(manager.auto_lifecycle.wake_lock(&sandbox_id).lock().await),
         };
-        let held = lock.lock().await;
+        // The site's lock, taken now if it is free.
+        let try_lock = || -> Option<Box<dyn Send>> {
+            match site {
+                LockSite::Staging => manager
+                    .auto_lifecycle
+                    .staging_lock(&sandbox_id)
+                    .try_lock()
+                    .ok()
+                    .map(|guard| Box::new(guard) as Box<dyn Send>),
+                LockSite::Artifact => manager
+                    .write_gate
+                    .try_lock_for_read(&sandbox_id, crate::service::write_gate::Reader::Test)
+                    .map(|guard| Box::new(guard) as Box<dyn Send>),
+                LockSite::Wake => manager
+                    .auto_lifecycle
+                    .wake_lock(&sandbox_id)
+                    .try_lock()
+                    .ok()
+                    .map(|guard| Box::new(guard) as Box<dyn Send>),
+            }
+        };
         let identity = SpaceApiRouteIdentity {
             sandbox_id: Some(sandbox_id.clone()),
             route_generation: Some(8),
@@ -475,8 +506,10 @@ async fn cancelled_activation_retries_release_admission_without_releasing_the_lo
             assert_eq!(error.code(), tonic::Code::Cancelled);
             manager.wait_for_state_transitions_drained().await;
             assert_eq!(manager.active_state_transition_count(), 0);
-            lock.try_lock()
-                .expect_err("cancelling a waiter must not release its owner");
+            assert!(
+                try_lock().is_none(),
+                "cancelling a waiter must not release its owner"
+            );
             match state {
                 Some(state) => {
                     assert_eq!(
@@ -491,10 +524,7 @@ async fn cancelled_activation_retries_release_admission_without_releasing_the_lo
             }
         }
         drop(held);
-        drop(
-            lock.try_lock()
-                .expect("the original owner can release normally"),
-        );
+        drop(try_lock().expect("the original owner can release normally"));
     }
 }
 

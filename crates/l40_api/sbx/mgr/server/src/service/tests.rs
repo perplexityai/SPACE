@@ -7844,9 +7844,8 @@ pub(crate) mod service_tests {
             }));
             let artifact_guard = (hold == "artifact lock").then(|| {
                 service
-                    .auto_lifecycle
-                    .artifact_lock(&sandbox_id)
-                    .try_lock_owned()
+                    .write_gate
+                    .try_lock_for_read(&sandbox_id, crate::service::write_gate::Reader::Test)
                     .unwrap()
             });
 
@@ -13261,9 +13260,11 @@ pub(crate) mod service_tests {
             .lock_owned()
             .await;
         let artifact_guard = service
-            .auto_lifecycle
-            .artifact_lock(&sandbox_id.to_string())
-            .lock_owned()
+            .write_gate
+            .lock_for_capture(
+                &sandbox_id.to_string(),
+                crate::service::write_gate::DrainCompatible::TeardownSuspend,
+            )
             .await;
         let context = SuspendRequestContext::for_teardown(
             sandbox_id.to_string(),
@@ -16148,7 +16149,10 @@ pub(crate) mod service_tests {
         insert_test_sandbox(&conn, &id, SandboxState::Paused);
         let service = service_with_runtime_probe(conn, false);
         let wake = service.auto_lifecycle.wake_lock(&id).lock_owned().await;
-        let artifact = service.auto_lifecycle.artifact_lock(&id).lock_owned().await;
+        let artifact = service
+            .write_gate
+            .lock_for_capture(&id, crate::service::write_gate::DrainCompatible::Suspend)
+            .await;
         let CleanupLockTryResult::Acquired(delete_fence) = service.try_cleanup_fence(&id) else {
             panic!("free fence")
         };
@@ -21411,8 +21415,10 @@ pub(crate) mod service_tests {
             );
             let wake = service.auto_lifecycle.wake_lock(&key);
             let blocker = wake.lock().await;
-            let artifact = service.auto_lifecycle.artifact_lock(&key);
-            let artifact_blocker = artifact.lock().await;
+            let artifact_blocker = service
+                .write_gate
+                .lock_for_read(&key, crate::service::write_gate::Reader::Test)
+                .await;
             let admission = service.admit_ingress(&key, Duration::from_secs(1), |_| Ok(()));
             let scheduler = service.run_due_auto_lifecycle(&key);
             tokio::pin!(admission, scheduler);

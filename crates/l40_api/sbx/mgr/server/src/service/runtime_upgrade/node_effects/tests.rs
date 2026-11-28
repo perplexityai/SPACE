@@ -947,15 +947,44 @@ async fn retirement_gives_up_on_busy_artifacts_rather_than_waiting() {
     f.clear_pin();
     let _busy = f
         .service
-        .auto_lifecycle
-        .artifact_lock(&f.sandbox_id)
-        .lock_owned()
+        .write_gate
+        .lock_for_read(&f.sandbox_id, crate::service::write_gate::Reader::Test)
         .await;
 
     let error = f.effects().retire_checkpoint(&record).await.unwrap_err();
 
     assert_eq!(error.code(), tonic::Code::Unavailable, "{error}");
     assert!(f.checkpoint().join("vmstate").exists());
+}
+
+/// A failed upgrade's restore of a suspended sandbox's disk gives up on its
+/// busy artifacts as retirement does, so one busy sandbox can't stall the
+/// recovery pass, which retries it.
+#[tokio::test(start_paused = true)]
+async fn a_rollbacks_restore_gives_up_on_busy_artifacts_rather_than_waiting() {
+    let f = fixture(SandboxState::Suspended, false, FakeNodeManager::default());
+    let busy = f
+        .service
+        .write_gate
+        .lock_for_read(&f.sandbox_id, crate::service::write_gate::Reader::Test)
+        .await;
+
+    let error = match f
+        .effects()
+        .exclude_disk_mutations_to_restore(&f.sandbox_id)
+        .await
+    {
+        Ok(_) => panic!("the restore took busy artifacts"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), tonic::Code::Unavailable, "{error}");
+
+    drop(busy);
+    f.effects()
+        .exclude_disk_mutations_to_restore(&f.sandbox_id)
+        .await
+        .map_err(|error| error.to_string())
+        .expect("free artifacts are taken");
 }
 
 #[tokio::test]

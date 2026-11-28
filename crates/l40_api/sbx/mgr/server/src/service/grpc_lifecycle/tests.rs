@@ -213,8 +213,14 @@ async fn artifact_alias_waits_on_canonical_lock_and_rereads_after_admission() {
     let db = crate::db::test_conn();
     insert_test_sandbox(&db, id, SandboxState::Suspended);
     let service = service_for_teardown_test(db);
-    let lock = service.auto_lifecycle.artifact_lock(id).lock_owned().await;
-    let pending = service.lock_artifact_for_sandbox("01939e3e1111");
+    let lock = service
+        .write_gate
+        .lock_for_read(id, crate::service::write_gate::Reader::Test)
+        .await;
+    let pending = service.lock_artifact_for_sandbox(
+        "01939e3e1111",
+        crate::service::write_gate::DrainCompatible::BackupUpload,
+    );
     tokio::pin!(pending);
     assert!(futures_util::poll!(&mut pending).is_pending());
     crate::db::test_fixtures::state_write_fixtures::apply_edge(
@@ -226,13 +232,17 @@ async fn artifact_alias_waits_on_canonical_lock_and_rereads_after_admission() {
     let (row, guard) = pending.await.unwrap();
     assert_eq!(row.id, id);
     assert_eq!(row.state, SandboxStatus::from(SandboxState::Stopped));
-    service
-        .auto_lifecycle
-        .artifact_lock(id)
-        .try_lock()
-        .unwrap_err();
+    assert!(
+        service
+            .write_gate
+            .try_lock_for_read(id, crate::service::write_gate::Reader::Test)
+            .is_none()
+    );
     let label = id.parse::<SandboxId>().unwrap().label().to_string();
-    let blocked = service.lock_artifact_for_sandbox(&label);
+    let blocked = service.lock_artifact_for_sandbox(
+        &label,
+        crate::service::write_gate::DrainCompatible::BackupUpload,
+    );
     tokio::pin!(blocked);
     assert!(futures_util::poll!(&mut blocked).is_pending());
     tokio::time::advance(std::time::Duration::from_secs(5)).await;
@@ -1191,9 +1201,9 @@ async fn suspended_artifact_adoption_race_uses_existing_artifact_id() {
 
 #[tokio::test]
 async fn restore_consumer_cannot_observe_suspend_staging_before_publication() {
-    let coordinator = AutoLifecycleCoordinator::default();
+    let artifact_locks = crate::auto_lifecycle::LifecycleLocks::default();
     let sandbox_id = "019e31ec-5633-7111-b27c-1b6ac5cb170a";
-    let artifact_lock = coordinator.artifact_lock(sandbox_id);
+    let artifact_lock = artifact_locks.get(sandbox_id);
     let publication_guard = artifact_lock.lock().await;
     let tmp = tempfile::tempdir().expect("create tempdir");
     let snapshot_dir = tmp.path().join(sandbox_id).join("snapshot");
@@ -1207,7 +1217,7 @@ async fn restore_consumer_cannot_observe_suspend_staging_before_publication() {
     );
 
     let (attempted_tx, attempted_rx) = oneshot::channel();
-    let consumer_lock = coordinator.artifact_lock(sandbox_id);
+    let consumer_lock = artifact_locks.get(sandbox_id);
     let consumer_snapshot_dir = snapshot_dir.clone();
     let consumer = tokio::spawn(async move {
         attempted_tx.send(()).unwrap();
@@ -1231,16 +1241,17 @@ async fn restore_consumer_cannot_observe_suspend_staging_before_publication() {
 #[tokio::test]
 async fn paused_suspend_serializes_resume_behind_wake_and_artifact_locks() {
     let coordinator = AutoLifecycleCoordinator::default();
+    let artifact_locks = crate::auto_lifecycle::LifecycleLocks::default();
     let sandbox_id = "019e31ec-5633-7111-b27c-1b6ac5cb170a";
     let wake_lock = coordinator.wake_lock(sandbox_id);
-    let artifact_lock = coordinator.artifact_lock(sandbox_id);
+    let artifact_lock = artifact_locks.get(sandbox_id);
     let suspend_wake_guard = wake_lock.lock().await;
     let suspend_artifact_guard = artifact_lock.lock().await;
 
     let (attempted_tx, attempted_rx) = oneshot::channel();
     let (resumed_tx, mut resumed_rx) = oneshot::channel();
     let resumed_wake_lock = coordinator.wake_lock(sandbox_id);
-    let resumed_artifact_lock = coordinator.artifact_lock(sandbox_id);
+    let resumed_artifact_lock = artifact_locks.get(sandbox_id);
     let resume = tokio::spawn(async move {
         attempted_tx.send(()).unwrap();
         let _guard = resumed_wake_lock.lock().await;
@@ -2425,7 +2436,10 @@ async fn paused_suspend_admission_requires_a_free_row_and_the_owning_generation(
         };
         let service = service_with_runtime_liveness_and_absent_sockets(conn, false, sockets.path());
         let wake = service.auto_lifecycle.wake_lock(&id).lock_owned().await;
-        let artifact = service.auto_lifecycle.artifact_lock(&id).lock_owned().await;
+        let artifact = service
+            .write_gate
+            .lock_for_capture(&id, crate::service::write_gate::DrainCompatible::Suspend)
+            .await;
 
         let result = service
             .prepare_suspend_snapshot_publication_after_locks(&context, &wake, &artifact)

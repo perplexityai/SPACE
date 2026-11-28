@@ -66,10 +66,10 @@
 //! which it answers `DeadlineExceeded`.
 //!
 //! A node-local artifact producer (a snapshot, an import, a publication)
-//! asks the seal too, once it holds the sandbox's artifact lock
-//! ([`crate::activation_seal::ActivationSeal::admit_producer`]): sealed, one
-//! for a sandbox without a VM is refused, so nothing appears after a pass
-//! found the node finished. One for a started or paused sandbox runs and is
+//! asks the seal too, under the sandbox's artifact lock, which it takes
+//! through the node's write gate ([`crate::service::write_gate`]): sealed,
+//! one for a sandbox without a VM is refused, so nothing appears after a
+//! pass found the node finished. One for a started or paused sandbox runs and is
 //! `pending` ([`planner::Wait::Snapshot`]) until it ends; the drain's suspend
 //! of that VM waits for the same lock, so a producer queued behind the
 //! suspend reads the row after it, finds no VM and is refused. Its artifact

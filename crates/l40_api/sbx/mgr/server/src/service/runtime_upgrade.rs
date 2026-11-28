@@ -261,8 +261,17 @@ pub(super) trait RuntimeUpgradeEffects: Send + Sync {
         execution: SandboxActivationAttemptId,
     ) -> Result<(), Status>;
     /// Hold off every other writer of the instance disk until the returned
-    /// guard drops.
-    async fn exclude_disk_mutations(&self, sandbox_id: &str) -> Box<dyn Send>;
+    /// guard drops, for a new upgrade's fence: a node known sealed refuses it
+    /// while the sandbox has no VM and isn't stopped
+    /// ([`super::write_gate::NodeWriter::RuntimeUpgrade`]).
+    async fn exclude_disk_mutations(&self, sandbox_id: &str) -> Result<Box<dyn Send>, Status>;
+    /// [`Self::exclude_disk_mutations`] for a failed boot's restore of a
+    /// suspended sandbox's preserved disk, which the seal never refuses. A
+    /// wait that runs out answers `Unavailable`, which the next pass retries.
+    async fn exclude_disk_mutations_to_restore(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Box<dyn Send>, Status>;
     /// Retire the checkpoint the upgrade superseded, if it still exists.
     async fn retire_checkpoint(&self, record: &RuntimeUpgradeRecord) -> Result<(), Status>;
 }
@@ -888,10 +897,16 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
         // Snapshot rollback checks the fence under the same exclusion before
         // it rewrites the instance, so it either finishes before the fence or
         // sees it.
+        // A node known sealed refuses a new upgrade while the sandbox has no
+        // VM and isn't stopped, so the refusal is left unrecorded for the
+        // attempt. A seal landing between the stage's admission and this
+        // fence can leave the staged restore behind, which the drain then
+        // handles as any other suspended sandbox.
         let disk_mutations = self
             .effects
             .exclude_disk_mutations(&request.sandbox_id)
-            .await;
+            .await
+            .map_err(Refusal::Retry)?;
         let fenced = self.fence_excluded(request).await;
         if let Err(refusal) = &fenced {
             self.record_refusal(request, refusal);
@@ -1316,8 +1331,20 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
         failure: &str,
     ) -> Result<(), Status> {
         let preserved = preserved_disk_name(record.operation_id);
+        // A suspended sandbox's disk is restored, and its consumer with it,
+        // under the artifact lock a drain finds the sandbox evacuated under,
+        // so the drain re-checks it until the rollback commits. A stopped
+        // sandbox's, which a v2 drain doesn't move, as before.
+        let mut disk_mutations = None;
         if phase == RuntimeUpgradePhase::Booting {
             self.wait_until_settled(record).await?;
+            if record.source_state == SandboxState::Suspended {
+                disk_mutations = Some(
+                    self.effects
+                        .exclude_disk_mutations_to_restore(&record.sandbox_id)
+                        .await?,
+                );
+            }
             self.effects
                 .restore_disk(&record.sandbox_id, &preserved)
                 .await?;
@@ -1330,6 +1357,7 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
             self.attempt_finality,
         )
         .map_err(|error| Status::internal(format!("record runtime upgrade rollback: {error}")))?;
+        drop(disk_mutations);
         if !rolled_back {
             return Err(Status::aborted(format!(
                 "runtime upgrade {} left {phase} during its rollback",

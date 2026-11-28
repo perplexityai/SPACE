@@ -2,6 +2,7 @@
 //! by eviction, with their artifact-format and precondition helpers.
 
 use super::*;
+use crate::service::write_gate::{ArtifactWriteGuard, DrainCompatible, LockedWriter, Producer};
 
 /// Precondition for durable artifact backup: the node must
 /// have both cluster-api env vars wired so the durable worker can
@@ -264,7 +265,7 @@ pub(super) fn artifact_backup_lookup_error(status: Status, full_current_instance
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::service) enum BackupCaller {
     /// The `EnqueueArtifactBackup` RPC. An artifact it publishes first is a
-    /// node-local artifact producer's, admitted by the activation seal.
+    /// node-local artifact producer's ([`Producer::BackupPublication`]).
     Rpc,
     /// The node drain, whose publications and uploads are its own work.
     NodeDrain,
@@ -702,8 +703,14 @@ impl SandboxManagerService {
                 Some(crate::proto::enqueue_artifact_backup_request::Source::CurrentInstance(_))
                     | None
             );
-        let (sandbox, _guard) = self
-            .lock_artifact_for_sandbox(sandbox_id)
+        let (sandbox, mut guard) = self
+            .lock_artifact_for_sandbox(
+                sandbox_id,
+                match caller {
+                    BackupCaller::Rpc => DrainCompatible::BackupUpload,
+                    BackupCaller::NodeDrain => DrainCompatible::DrainPublication,
+                },
+            )
             .await
             .map_err(|status| artifact_backup_lookup_error(status, full_current_instance))?;
         // An eviction claims a row under this lock, so a backup that waited
@@ -725,14 +732,12 @@ impl SandboxManagerService {
         if full_current_instance {
             self.ensure_snapshot_restore_supported("enqueue_artifact_backup")?;
         }
-        let admit_producer = |sandbox: &crate::db::SandboxRow| match caller {
-            BackupCaller::Rpc => self
-                .admit_artifact_producer("artifact backup's publication", sandbox)
-                .map(Some),
-            BackupCaller::NodeDrain => Ok(None),
+        // An RPC that publishes what it adopts is a producer too, admitted
+        // under the lock it already holds, which it keeps until it answers.
+        let admit_producer = |guard: &mut ArtifactWriteGuard| match caller {
+            BackupCaller::Rpc => guard.admit(LockedWriter::Producer(Producer::BackupPublication)),
+            BackupCaller::NodeDrain => Ok(()),
         };
-        // Held until the backup answers, by an RPC that publishes first.
-        let mut _producer = None;
         // Outer Some means the destination was already resolved before adopting
         // an unpinned suspend; its inner None selects the configured env default.
         let mut pre_adoption_upload_config = None;
@@ -792,7 +797,7 @@ impl SandboxManagerService {
                             "snapshot {name} has no published local artifact"
                         )));
                     }
-                    _producer = admit_producer(&sandbox)?;
+                    admit_producer(&mut guard)?;
                     let local_artifact_id = LocalArtifactId::new();
                     self.local_artifacts
                         .publish_named_snapshot(
@@ -821,7 +826,7 @@ impl SandboxManagerService {
                 let current_id = match (sandbox.state.unowned(), sandbox.current_local_artifact_id)
                 {
                     (Some(SandboxState::Suspended), None) => {
-                        _producer = admit_producer(&sandbox)?;
+                        admit_producer(&mut guard)?;
                         let sandbox_dir =
                             std::path::PathBuf::from(format!("{CACHE_DIR}/{}", sandbox.id));
                         let local_path = canonical_suspend_snapshot_dir(&sandbox_dir)
@@ -852,7 +857,7 @@ impl SandboxManagerService {
                         current_id
                     }
                     (Some(SandboxState::Stopped), None) => {
-                        _producer = admit_producer(&sandbox)?;
+                        admit_producer(&mut guard)?;
                         let id = LocalArtifactId::new();
                         let snapshot_name = format!("d-stop-{id}");
                         let mut node_client =
@@ -1103,16 +1108,13 @@ impl SandboxManagerService {
         .await
     }
 
+    /// `selector`'s sandbox, read again under its artifact lock, which
+    /// `writer` holds.
     pub(super) async fn lock_artifact_for_sandbox(
         &self,
         selector: &str,
-    ) -> Result<
-        (
-            crate::db::SandboxRow,
-            crate::auto_lifecycle::LifecycleMutexGuard,
-        ),
-        Status,
-    > {
+        writer: DrainCompatible,
+    ) -> Result<(crate::db::SandboxRow, ArtifactWriteGuard), Status> {
         let id = self.lookup_sandbox(selector)?.id;
         #[cfg(test)]
         if let Some(hook) = self
@@ -1126,7 +1128,7 @@ impl SandboxManagerService {
         }
         let guard = super::restart_admission::wait_for_activation_admission(
             &id,
-            self.auto_lifecycle.artifact_lock(&id).lock_owned(),
+            self.write_gate.lock(&id, writer),
         )
         .await?;
         // Re-resolve only the canonical identity: the selector may match a
@@ -1164,7 +1166,7 @@ impl SandboxManagerService {
         // failures as `SubstrateError::NotFound`, which must stay
         // retryable.
         let (sandbox, _guard) =
-            self.lock_artifact_for_sandbox(sandbox_id)
+            self.lock_artifact_for_sandbox(sandbox_id, DrainCompatible::SuspendReupload)
                 .await
                 .map_err(|status| {
                     if status.code() == tonic::Code::NotFound {

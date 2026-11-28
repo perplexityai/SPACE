@@ -464,9 +464,8 @@ async fn a_discard_delete_refuses_while_a_capture_may_still_finish() {
                 _backup_admission = Some(
                     stranded
                         .service
-                        .auto_lifecycle
-                        .artifact_lock(&id)
-                        .try_lock_owned()
+                        .write_gate
+                        .try_lock_for_read(&id, crate::service::write_gate::Reader::Test)
                         .unwrap(),
                 );
             }

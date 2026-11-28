@@ -19,11 +19,21 @@ pub mod wake_signals {
     pub const MISSING_RUNTIME_CONTEXT_MARKER: &str =
         "wake start context has no network namespace; re-place via restore";
 
-    /// `FailedPrecondition` message marker a node returns when it refuses a
-    /// VM activation (a cold boot, a restore from a snapshot, or a resume)
-    /// because a node drain has sealed it. The refusal comes before any VM
-    /// work, and the same activation lands on another node once the drain
-    /// has made the sandbox durable, so a caller answers it as retryable.
+    /// `FailedPrecondition` message marker a node returns while a node drain
+    /// has sealed it, refusing work that would leave something new on it.
+    /// Each refusal comes before the step it refuses changes anything, and
+    /// the node refuses the same work until the drain is cancelled.
+    ///
+    /// - A VM activation (a cold boot, a restore from a snapshot, or a
+    ///   resume), or a runtime upgrade's stage or fence of a sandbox that has
+    ///   no VM on the node and isn't stopped: the same work lands on another
+    ///   node once the drain has made the sandbox durable, so a caller
+    ///   answers it as retryable.
+    /// - A node-local producer for a sandbox without a VM (a snapshot, an
+    ///   import, a backup's publication, a rollback), or work that would stop
+    ///   a sandbox and leave it stopped there: nothing places it on another
+    ///   node (an import's caller chose this one), and a retry on this node
+    ///   is refused until the drain is cancelled.
     pub const ACTIVATIONS_SEALED_MARKER: &str = "node activations are sealed";
 }
 

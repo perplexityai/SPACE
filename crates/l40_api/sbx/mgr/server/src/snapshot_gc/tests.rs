@@ -11,8 +11,12 @@ fn open_test_db() -> Connection {
 }
 
 fn test_ownership() -> GcOwnership {
+    let coordinator = crate::auto_lifecycle::AutoLifecycleCoordinator::default();
     GcOwnership {
-        coordinator: crate::auto_lifecycle::AutoLifecycleCoordinator::default(),
+        write_gate: crate::service::write_gate::NodeWriteGate::unsealed_for_test(
+            coordinator.clone(),
+        ),
+        coordinator,
         drain: Arc::new(crate::service::drain::DrainState::default()),
         shutdown: CancellationToken::new(),
         node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
@@ -682,11 +686,23 @@ async fn gc_defers_to_publication_staging_drain_and_shutdown_ownership() {
     let db = crate::db::SharedConnection::new(conn);
     let artifacts = LocalArtifacts::new(db.clone());
     let ownership = test_ownership();
-    for lock in [
-        ownership.coordinator.artifact_lock("sbx1"),
-        ownership.coordinator.staging_lock("sbx1"),
-    ] {
-        let guard = lock.lock_owned().await;
+    for artifact in [true, false] {
+        let guard: Box<dyn Send> = if artifact {
+            Box::new(
+                ownership
+                    .write_gate
+                    .lock_for_read("sbx1", crate::service::write_gate::Reader::Test)
+                    .await,
+            )
+        } else {
+            Box::new(
+                ownership
+                    .coordinator
+                    .staging_lock("sbx1")
+                    .lock_owned()
+                    .await,
+            )
+        };
         let report = gc_tick(
             artifacts.clone(),
             db.clone(),
@@ -705,6 +721,7 @@ async fn gc_defers_to_publication_staging_drain_and_shutdown_ownership() {
     }
     let closed = GcOwnership {
         coordinator: ownership.coordinator.clone(),
+        write_gate: ownership.write_gate.clone(),
         drain: crate::service::tests::closed_drain_for_test(),
         shutdown: CancellationToken::new(),
         node_manager: ownership.node_manager.clone(),

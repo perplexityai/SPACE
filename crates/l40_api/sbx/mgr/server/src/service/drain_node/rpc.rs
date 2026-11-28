@@ -89,12 +89,20 @@ impl SandboxManagerService {
 
     /// A drain call's seal: under `generation`, and evacuating under it from
     /// now on when `evacuate` says so. The seal as it stands then.
+    ///
+    /// The seal row is written under a state-writer lease, so a restart
+    /// handoff waits for the write, and its successor reads the row it left.
+    /// Once a handoff has begun the call changes nothing and answers that
+    /// it be retried on the successor. Only the write holds the lease: the
+    /// call's reads and the work it starts don't.
     pub(super) fn begin_drain(
         &self,
         generation: u64,
         evacuate: bool,
     ) -> Result<ActivationSealStatus, Status> {
+        let seal_writer = self.state_writer_lease("DrainNode")?;
         self.activation_seal.seal(&self.db, generation)?;
+        drop(seal_writer);
         if evacuate {
             self.drain_actions.evacuate(generation);
         }
@@ -104,9 +112,18 @@ impl SandboxManagerService {
     /// Cancel `generation`: unsealed, and the evacuating cleared with it.
     /// Nothing is started, stopped or handed back, so the answer comes at
     /// once: the tombstone, the generation at or below which the node now
-    /// refuses seals.
+    /// refuses seals. The cancel writes the seal row under a state-writer
+    /// lease, as [`Self::begin_drain`] does: a successor that read the row
+    /// sealed is never answered done by its predecessor's cancel. A cancel
+    /// refused there still stops this process evacuating, in memory, so a
+    /// drain suspend queued on a started sandbox's locks leaves it running;
+    /// the successor starts evacuating nothing.
     pub(super) fn cancel_drain(&self, generation: u64) -> Result<u64, Status> {
+        let seal_writer = self
+            .state_writer_lease("DrainNode")
+            .inspect_err(|_| self.drain_actions.stop_evacuating())?;
         let tombstone = self.activation_seal.unseal(&self.db, generation)?;
+        drop(seal_writer);
         self.drain_actions.stop_evacuating();
         Ok(tombstone)
     }
@@ -337,15 +354,14 @@ impl SandboxManagerService {
         let mut held = Vec::new();
         for row in rows.iter().filter(|row| !waiting.contains(&row.sandbox_id)) {
             match self
-                .auto_lifecycle
-                .artifact_lock(&row.sandbox_id)
-                .try_lock_owned()
+                .write_gate
+                .try_lock_for_read(&row.sandbox_id, write_gate::Reader::DrainConfirm)
             {
-                Ok(guard) => {
+                Some(guard) => {
                     guards.push(guard);
                     held.push(row);
                 }
-                Err(_) => plan.recheck(&row.sandbox_id, "another writer holds its artifacts"),
+                None => plan.recheck(&row.sandbox_id, "another writer holds its artifacts"),
             }
         }
         if held.is_empty() {

@@ -2,6 +2,7 @@ use super::activation_support::auto_lifecycle_request;
 use super::cleanup_support::{StateWriteRejected, state_write_result};
 use super::grpc_lifecycle::SuspendRequestContext;
 use super::network_runtime::*;
+use super::write_gate::{DrainCompatible, UnlockedWriter};
 use super::*;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -527,25 +528,23 @@ impl SandboxManagerService {
         // it takes only the wake lock, which a drain's artifact-lock confirm
         // doesn't exclude, so a drain that seals the node meanwhile reports
         // the sandbox pending instead of finding it where it was. The stop
-        // leaves the sandbox without a VM, so it asks as a producer for a
-        // sandbox with none. An idle suspend isn't held, since the drain
-        // wants it. The node's Stop RPC isn't refused: the Kubernetes
-        // teardown calls it first in every delete.
+        // leaves the sandbox without a VM, so the gate refuses it on a node
+        // known sealed whatever its lifecycle ([`NodeWriter::IdleStop`]). An
+        // idle suspend isn't held, since the drain wants it. The node's Stop
+        // RPC isn't refused: the Kubernetes teardown calls it first in every
+        // delete.
         let idle_stop = if action == AutoLifecycleIdleAction::Stop
             && matches!(
                 sandbox.state.unowned(),
                 Some(SandboxState::Suspended | SandboxState::Started | SandboxState::Paused)
             ) {
-            match self
-                .activation_seal
-                .admit_producer("idle auto-stop", &sandbox.id, false)
-            {
-                Ok(token) => Some(token),
+            match self.write_gate.admit(&sandbox.id, UnlockedWriter::IdleStop) {
+                Ok(admission) => Some(admission),
                 Err(sealed) => {
                     tracing::debug!(
                         sandbox_id = %sandbox.id,
                         state = %sandbox.state,
-                        reason = sealed.message(),
+                        reason = %sealed,
                         "holding a due auto-stop while the node is sealed; nothing recorded"
                     );
                     self.defer_gated_auto_lifecycle_row(&sandbox.id, now)?;
@@ -587,8 +586,10 @@ impl SandboxManagerService {
                     sandbox.state.unowned(),
                     Some(SandboxState::Started | SandboxState::Paused)
                 ) {
-                    let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
-                    let artifact_guard = artifact_lock.lock_owned().await;
+                    let artifact_guard = self
+                        .write_gate
+                        .lock(&sandbox.id, DrainCompatible::IdleSuspend)
+                        .await;
                     let context = SuspendRequestContext::new(
                         sandbox.id.clone(),
                         true,

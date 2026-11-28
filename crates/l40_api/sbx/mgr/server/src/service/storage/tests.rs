@@ -61,8 +61,10 @@ async fn artifact_work_preserves_ownership_without_starving_cleanup_storage() {
     let mut service = service_for_teardown_test(crate::db::test_conn());
     service.cleanup_io = Arc::new(tokio::sync::Semaphore::new(1));
     service.artifact_io = Arc::new(tokio::sync::Semaphore::new(1));
-    let lock = service.auto_lifecycle.artifact_lock("blocking-owner");
-    let guard = lock.lock().await;
+    let guard = service
+        .write_gate
+        .lock_for_read("blocking-owner", crate::service::write_gate::Reader::Test)
+        .await;
     let writer = service.state_writer_lease("Rollback").unwrap();
     let (started, ready) = tokio::sync::oneshot::channel();
     let (release, wait) = std::sync::mpsc::channel();
@@ -101,9 +103,13 @@ async fn artifact_work_preserves_ownership_without_starving_cleanup_storage() {
     assert!(task.await.unwrap_err().is_cancelled());
     assert_eq!(service.active_state_transition_count(), 1);
     assert_eq!(service.artifact_io.available_permits(), 0);
-    lock.try_lock()
-        .map(|_| ())
-        .expect_err("artifact exclusion must survive");
+    assert!(
+        service
+            .write_gate
+            .try_lock_for_read("blocking-owner", crate::service::write_gate::Reader::Test)
+            .is_none(),
+        "artifact exclusion must survive"
+    );
 
     release.send(()).unwrap();
     tokio::time::timeout(
@@ -113,7 +119,12 @@ async fn artifact_work_preserves_ownership_without_starving_cleanup_storage() {
     .await
     .unwrap();
     assert_eq!(service.artifact_io.available_permits(), 1);
-    drop(lock.try_lock().unwrap());
+    drop(
+        service
+            .write_gate
+            .try_lock_for_read("blocking-owner", crate::service::write_gate::Reader::Test)
+            .unwrap(),
+    );
 }
 
 #[tokio::test]

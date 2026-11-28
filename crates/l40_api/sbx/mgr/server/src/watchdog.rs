@@ -29,11 +29,11 @@ use pplx_space_node_runtime_core::vm_state::VmState;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_semver::SemVer;
 
-use crate::auto_lifecycle::AutoLifecycleCoordinator;
 use crate::db::guest_health_scan::SandboxGuestHealthRow;
 use crate::node_manager_transport::NodeManagerConnector;
 use crate::node_state_sync::mark_sandbox_dirty;
 use crate::service::network_policy::NetworkPolicyReconcileQueue;
+use crate::service::write_gate::{DrainCompatible, NodeWriteGate};
 use crate::sidecar::{sidecar_alive, sidecar_live_pid};
 use crate::snapshot_scheduler::SnapshotScheduler;
 
@@ -860,7 +860,7 @@ impl SandboxWatchdog {
         db: crate::db::SharedConnection,
         network_policy_reconcile_queue: NetworkPolicyReconcileQueue,
         snapshot_scheduler: Arc<SnapshotScheduler>,
-        auto_lifecycle: AutoLifecycleCoordinator,
+        write_gate: NodeWriteGate,
         lifecycle_epochs: HealthLifecycleEpochs,
         feature_flags: pplx_space_feature_flags::FeatureFlagClient,
         shutdown_token: CancellationToken,
@@ -922,7 +922,7 @@ impl SandboxWatchdog {
             sidecars.clone(),
             db.clone(),
             task_snapshot_scheduler,
-            auto_lifecycle,
+            write_gate,
             lifecycle_epochs,
             shutdown_token.child_token(),
             node_manager.clone(),
@@ -953,24 +953,25 @@ impl SandboxWatchdog {
         shutdown_token: CancellationToken,
         task_tracker: &TaskTracker,
     ) -> Self {
-        let auto_lifecycle = AutoLifecycleCoordinator::default();
+        let auto_lifecycle = crate::auto_lifecycle::AutoLifecycleCoordinator::default();
+        let write_gate = NodeWriteGate::unsealed_for_test(auto_lifecycle.clone());
         let lifecycle_epochs = HealthLifecycleEpochs::default();
         // The loops tick immediately; their node-manager is an absent socket.
         let node_manager = crate::node_manager_transport::fake::unbound_in_absent_dir();
         let snapshot_scheduler = Arc::new(SnapshotScheduler::new(Arc::new(
             crate::snapshot_scheduler::CheckpointContext {
                 db: db.clone(),
-                auto_lifecycle: auto_lifecycle.clone(),
+                auto_lifecycle,
                 health_lifecycle: lifecycle_epochs.clone(),
                 node_manager: node_manager.clone(),
-                activation_seal: Arc::new(crate::activation_seal::ActivationSeal::unsealed()),
+                write_gate: write_gate.clone(),
             },
         )));
         Self::new(
             db,
             network_policy_reconcile_queue,
             snapshot_scheduler,
-            auto_lifecycle,
+            write_gate,
             lifecycle_epochs,
             pplx_space_feature_flags::FeatureFlagClient::disabled(),
             shutdown_token,
@@ -2523,7 +2524,7 @@ async fn composed_health_loop(
     sidecars: Arc<Mutex<HashMap<String, SidecarInfo>>>,
     db: crate::db::SharedConnection,
     snapshot_scheduler: Arc<SnapshotScheduler>,
-    auto_lifecycle: AutoLifecycleCoordinator,
+    write_gate: NodeWriteGate,
     lifecycle_epochs: HealthLifecycleEpochs,
     shutdown_token: CancellationToken,
     node_manager: NodeManagerConnector,
@@ -2618,7 +2619,7 @@ async fn composed_health_loop(
                     &state,
                     &db,
                     snapshot_scheduler.as_ref(),
-                    &auto_lifecycle,
+                    &write_gate,
                     &lifecycle_epochs,
                     pending.join_next().await,
                 )
@@ -2645,7 +2646,7 @@ async fn composed_health_loop(
                 &state,
                 &db,
                 snapshot_scheduler.as_ref(),
-                &auto_lifecycle,
+                &write_gate,
                 &lifecycle_epochs,
                 pending.join_next().await,
             )
@@ -3037,7 +3038,7 @@ async fn apply_and_reconcile_composed_health_result(
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
     db: &crate::db::SharedConnection,
     snapshot_scheduler: &SnapshotScheduler,
-    auto_lifecycle: &AutoLifecycleCoordinator,
+    write_gate: &NodeWriteGate,
     lifecycle_epochs: &HealthLifecycleEpochs,
     result: Option<CompletedHealthProbe>,
 ) -> Option<diagnostics::HealthTransition> {
@@ -3063,7 +3064,7 @@ async fn apply_and_reconcile_composed_health_result(
         reconcile_pause_failed_quarantine(
             db,
             snapshot_scheduler,
-            auto_lifecycle,
+            write_gate,
             lifecycle_epochs,
             &sandbox_id,
             lifecycle_epoch,
@@ -3210,14 +3211,15 @@ async fn apply_composed_health_result(
 async fn reconcile_pause_failed_quarantine(
     db: &crate::db::SharedConnection,
     snapshot_scheduler: &SnapshotScheduler,
-    auto_lifecycle: &AutoLifecycleCoordinator,
+    write_gate: &NodeWriteGate,
     lifecycle_epochs: &HealthLifecycleEpochs,
     sandbox_id: &SandboxId,
     lifecycle_epoch: u64,
 ) {
     let sandbox_id_string = sandbox_id.to_string();
-    let artifact_lock = auto_lifecycle.artifact_lock(&sandbox_id_string);
-    let _artifact_guard = artifact_lock.lock().await;
+    let _artifact_guard = write_gate
+        .lock(&sandbox_id_string, DrainCompatible::WatchdogRecovery)
+        .await;
     let target = {
         let map = lifecycle_epochs.state.lock().await;
         let Some(health) = map.get(&sandbox_id_string) else {

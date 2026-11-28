@@ -30,7 +30,7 @@ use crate::proto::{
 };
 use crate::service::activation_support::internal_request;
 use crate::service::grpc_lifecycle::{GUEST_PREPARATION, GuestPreparation};
-use crate::service::start_support::REQUESTED_VM_ACTIVATIONS;
+use crate::service::start_support::{ActivationAdmissionKind, REQUESTED_VM_ACTIVATIONS};
 use crate::service::tests::service_tests::insert_test_sandbox;
 use crate::service::{SandboxManagerService, SandboxManagerServiceOptions};
 use crate::state::SandboxState;
@@ -206,7 +206,12 @@ async fn run(
         Seal::Unsealed => {}
         Seal::Sealed => service.activation_seal.seal(&service.db, 1).unwrap(),
         Seal::Unknown => {
-            let refused = service.activation_seal.check("cold", id).unwrap_err();
+            let refused = Status::from(
+                service
+                    .write_gate
+                    .check_activation(ActivationAdmissionKind::Cold, id)
+                    .unwrap_err(),
+            );
             assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
         }
     }

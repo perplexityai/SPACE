@@ -11,6 +11,7 @@ use std::time::Duration;
 use tonic::Status;
 
 use super::cleanup_support::{CleanupCompletion, CleanupLockTryResult};
+use super::write_gate::DrainCompatible;
 
 use super::cleanup::{CleanupAdmission, SynchronousCleanupRequest};
 use super::*;
@@ -708,10 +709,9 @@ impl SandboxManagerService {
             EvictionClaim::SuspendedPinned(_)
             | EvictionClaim::DeletedSuspended(_)
             | EvictionClaim::StaleUpgradeCopy { .. } => Some(
-                self.auto_lifecycle
-                    .artifact_lock(sandbox_id)
-                    .try_lock_owned()
-                    .map_err(|_| artifact_lock_held_status(sandbox_id))?,
+                self.write_gate
+                    .try_lock(sandbox_id, DrainCompatible::Eviction)
+                    .ok_or_else(|| artifact_lock_held_status(sandbox_id))?,
             ),
             EvictionClaim::Stopped
             | EvictionClaim::FailedRestoring

@@ -263,8 +263,7 @@ fn lifecycle_shortening_compares_against_the_fixed_activation_deadline() {
 
 #[tokio::test]
 async fn lifecycle_waiter_cancels_staging_without_waiting_for_transfer_deadline() {
-    let coordinator = crate::auto_lifecycle::AutoLifecycleCoordinator::default();
-    let artifact = coordinator.artifact_lock("test-capture");
+    let artifact = crate::auto_lifecycle::LifecycleLocks::default().get("test-capture");
     let mut priority = artifact.subscribe_capture_requests();
     let owner = artifact.try_lock().unwrap();
     let mut waiting = Box::pin(artifact.lock_for_capture());
@@ -306,9 +305,8 @@ async fn capture_excludes_new_admission_and_invalid_execution_never_probes() {
         configuration_revision: 1,
     };
     let capture = service
-        .auto_lifecycle
-        .artifact_lock(&id)
-        .lock_for_capture()
+        .write_gate
+        .lock_for_capture(&id, crate::service::write_gate::DrainCompatible::Suspend)
         .await;
     assert_eq!(
         service
@@ -346,7 +344,10 @@ async fn capture_excludes_new_admission_and_invalid_execution_never_probes() {
     );
     // A brief read must wait, then admit, without granting a capture race.
     service.shutdown_token.cancel();
-    let reader = service.auto_lifecycle.artifact_lock(&id).lock().await;
+    let reader = service
+        .write_gate
+        .lock_for_read(&id, crate::service::write_gate::Reader::Test)
+        .await;
     // If another maintenance operation owns the permit, recovery must retain
     // the manual request's semantics rather than imposing automatic quiet time.
     let busy = service

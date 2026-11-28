@@ -10,6 +10,7 @@ use super::template_snapshot_support::{
     rollback_template_base_snapshot_state,
 };
 use super::validation::{canonical_batched_sandbox_ids, snapshot_type_from_proto};
+use super::write_gate::{ArtifactReadGuard, LockedWriter, Producer, Reader};
 use super::*;
 use pplx_space_rpc_contracts::inventory::InventoryBudget;
 
@@ -223,12 +224,18 @@ impl DiskOperationSnapshotPaths {
     }
 }
 
+/// The operation snapshot's paths under `cache_root`, the node's sandbox
+/// cache.
 fn disk_operation_snapshot_paths(
+    cache_root: &str,
     sandbox_id: &str,
     snapshot_name: &pplx_space_snapshot_model::SnapshotName,
 ) -> DiskOperationSnapshotPaths {
-    let capture =
-        pplx_space_host_layout::paths::sandbox_snapshot_dir(sandbox_id, snapshot_name.as_str());
+    let capture = pplx_space_host_layout::paths::sandbox_snapshot_dir_in(
+        cache_root,
+        sandbox_id,
+        snapshot_name.as_str(),
+    );
     DiskOperationSnapshotPaths {
         artifact: format!("{capture}-artifact"),
         capture,
@@ -1213,12 +1220,11 @@ impl SandboxManagerService {
         }
 
         let sandbox = self.lookup_sandbox(&req.sandbox_id)?;
-        let (_wake_guard, _artifact_guard) = self
-            .auto_lifecycle
-            .artifact_publication_locks(&sandbox.id, artifact_kind)
+        let (_wake_guard, locked) = self
+            .write_gate
+            .lock_publication_for_read(&sandbox.id, artifact_kind, Reader::BeforeAdmission)
             .await;
         let sandbox = self.lookup_sandbox(&sandbox.id)?;
-        let _producer = self.admit_artifact_producer("snapshot", &sandbox)?;
         self.ensure_memory_state_supported(&sandbox, "create snapshot")?;
         self.ensure_not_pool_sandbox_for_snapshots(&sandbox, "create snapshot")?;
         self.ensure_no_plaintext_pool_cow_for_snapshots(&sandbox, "create snapshot")?;
@@ -1226,9 +1232,10 @@ impl SandboxManagerService {
 
         if req.creation_identity.is_some() || req.source.is_some() {
             return self
-                .create_operation_snapshot(&req, &sandbox, artifact_kind)
+                .create_operation_snapshot(&req, &sandbox, artifact_kind, locked)
                 .await;
         }
+        let _artifact_guard = locked.admit(LockedWriter::Producer(Producer::Snapshot))?;
 
         // Determine snapshot type (default to full for backward compat)
         let snap_type = match artifact_kind {
@@ -1265,7 +1272,7 @@ impl SandboxManagerService {
                 auto_lifecycle: self.auto_lifecycle.clone(),
                 health_lifecycle: self.watchdog.lifecycle_epochs(),
                 node_manager: self.node_manager.clone(),
-                activation_seal: Arc::clone(&self.activation_seal),
+                write_gate: self.write_gate.clone(),
             };
 
             let completion = crate::snapshot_scheduler::do_checkpoint(&ctx, id, &snapshot_name)
@@ -1403,11 +1410,17 @@ impl SandboxManagerService {
         }))
     }
 
+    /// An operation snapshot of `initial_sandbox`, read under `locked`, its
+    /// artifact lock. A retry of one that already completed is answered with
+    /// its earlier result before the gate admits anything, so a node sealed
+    /// since still answers it; a new one is admitted as a producer under
+    /// the same lock.
     async fn create_operation_snapshot(
         &self,
         req: &crate::proto::CreateSnapshotRequest,
         initial_sandbox: &crate::db::SandboxRow,
         artifact_kind: pplx_space_snapshot_model::ArtifactKind,
+        locked: ArtifactReadGuard,
     ) -> Result<Response<crate::proto::CreateSnapshotResponse>, Status> {
         if artifact_kind != pplx_space_snapshot_model::ArtifactKind::Disk {
             return Err(Status::unimplemented(
@@ -1443,7 +1456,11 @@ impl SandboxManagerService {
             expected_generation,
             expected_state,
         );
-        let paths = disk_operation_snapshot_paths(&sandbox_id, &snapshot_name);
+        let paths = disk_operation_snapshot_paths(
+            &self.cache_root().to_string_lossy(),
+            &sandbox_id,
+            &snapshot_name,
+        );
 
         let existing = {
             let db = self
@@ -1513,6 +1530,7 @@ impl SandboxManagerService {
             }
             OperationSnapshotNextStep::RemoveUnboundSnapshot => true,
         };
+        let _artifact_guard = locked.admit(LockedWriter::Producer(Producer::OperationSnapshot))?;
 
         let validate_source = || -> Result<OperationSnapshotPlan, Status> {
             let sandbox = self.lookup_sandbox(&sandbox_id)?;

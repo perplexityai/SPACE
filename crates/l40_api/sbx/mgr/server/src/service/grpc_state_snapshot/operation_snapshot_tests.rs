@@ -63,7 +63,11 @@ fn operation_snapshot_replay_uses_the_server_generated_artifact_identity() {
         SandboxState::Started,
     );
     let snapshot_name = disk_operation_snapshot_name(request_id).expect("generated name is valid");
-    let paths = disk_operation_snapshot_paths(&sandbox_id, &snapshot_name);
+    let paths = disk_operation_snapshot_paths(
+        pplx_space_host_layout::paths::SANDBOX_CACHE_DIR,
+        &sandbox_id,
+        &snapshot_name,
+    );
     let artifact = crate::db::LocalArtifactRow {
         local_artifact_id,
         sandbox_id: sandbox_id.clone(),
@@ -200,7 +204,11 @@ fn operation_snapshot_paths_separate_capture_from_encoded_artifact() {
     let snapshot_name =
         disk_operation_snapshot_name(Uuid::now_v7()).expect("disk operation snapshot name");
 
-    let paths = disk_operation_snapshot_paths(&sandbox_id, &snapshot_name);
+    let paths = disk_operation_snapshot_paths(
+        pplx_space_host_layout::paths::SANDBOX_CACHE_DIR,
+        &sandbox_id,
+        &snapshot_name,
+    );
 
     assert_eq!(
         paths.capture,
@@ -214,4 +222,107 @@ fn operation_snapshot_paths_separate_capture_from_encoded_artifact() {
         ),
         "the encoded stream needs a writable directory separate from the read-only capture",
     );
+}
+
+/// A retry of an operation snapshot that already completed is answered with
+/// its earlier result before the write gate admits anything, so a node sealed
+/// since answers it too, though the sandbox it captured has been suspended
+/// and a new snapshot of it is refused.
+#[tokio::test]
+async fn a_completed_operation_snapshot_is_replayed_on_a_sealed_node() {
+    let scratch = tempfile::tempdir().unwrap();
+    let conn = crate::db::test_conn();
+    let sandbox_id = pplx_space_sandbox_model::SandboxId::new().to_string();
+    crate::service::tests::service_tests::insert_test_sandbox(
+        &conn,
+        &sandbox_id,
+        SandboxState::Started,
+    );
+    // An encrypted volume skips the plaintext-COW probe of the host cache.
+    conn.execute(
+        "UPDATE sandboxes SET volume_encryption = 1 WHERE id = ?1",
+        [&sandbox_id],
+    )
+    .unwrap();
+    let service = SandboxManagerService::new_with_options(
+        conn,
+        crate::service::SandboxManagerServiceOptions::for_test_in(scratch.path()),
+    );
+    let request_id = Uuid::now_v7();
+    let generation = pplx_space_sandbox_model::ExecutionGeneration::new(3).unwrap();
+    let request = |request_id: Uuid| {
+        crate::service::activation_support::internal_request(crate::proto::CreateSnapshotRequest {
+            sandbox_id: sandbox_id.clone(),
+            r#type: crate::proto::SnapshotType::Disk as i32,
+            creation_identity: Some(crate::proto::SnapshotCreationIdentity {
+                request_id: request_id.to_string(),
+            }),
+            source: Some(crate::proto::CreateSnapshotSource {
+                source: Some(
+                    crate::proto::create_snapshot_source::Source::CurrentSandbox(
+                        crate::proto::CurrentSandboxSnapshotSource {
+                            execution_generation: generation.get(),
+                            lifecycle: crate::proto::SnapshotSourceLifecycle::Started as i32,
+                        },
+                    ),
+                ),
+            }),
+            ..Default::default()
+        })
+    };
+    // The snapshot the first call published, of the running sandbox.
+    let name = disk_operation_snapshot_name(request_id).unwrap();
+    let artifact_id = disk_operation_snapshot_artifact_id(
+        &sandbox_id,
+        request_id,
+        generation,
+        SandboxState::Started,
+    );
+    let paths =
+        disk_operation_snapshot_paths(&service.cache_root().to_string_lossy(), &sandbox_id, &name);
+    std::fs::create_dir_all(&paths.artifact).unwrap();
+    crate::db::publish_named_local_artifact(
+        &service.db.lock().unwrap(),
+        &sandbox_id,
+        artifact_id,
+        pplx_space_snapshot_model::ArtifactKind::Disk,
+        &name,
+        &paths.artifact,
+    )
+    .unwrap();
+    // A drain seals the node and suspends the sandbox.
+    service.activation_seal.seal(&service.db, 7).unwrap();
+    crate::db::test_fixtures::state_write_fixtures::write_status(
+        &service.db.lock().unwrap(),
+        &sandbox_id,
+        SandboxState::Suspended,
+    );
+
+    let replayed = service
+        .create_snapshot(request(request_id))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        replayed
+            .published_artifact
+            .map(|artifact| artifact.local_artifact_id),
+        Some(artifact_id.to_string())
+    );
+    let refused = service
+        .create_snapshot(request(Uuid::now_v7()))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.code(),
+        tonic::Code::FailedPrecondition,
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .message()
+            .starts_with(crate::activation_seal::ACTIVATIONS_SEALED_MARKER),
+        "{refused:?}"
+    );
+    service.activation_seal.assert_quiesced();
 }

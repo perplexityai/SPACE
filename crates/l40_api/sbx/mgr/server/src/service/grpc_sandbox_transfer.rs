@@ -1,6 +1,7 @@
 use super::cleanup_support::{ActivationCleanupSpec, CleanupLockTryResult};
 use super::create_support::{sanitize_process_env, validate_path_component};
 use super::tail_support::{host_architecture, sandbox_execution_metadata};
+use super::write_gate::{LockedWriter, Producer, Reader};
 use super::*;
 use std::mem::DropGuard;
 
@@ -724,7 +725,7 @@ impl SandboxManagerService {
         .await;
         let id = pinned.id;
         let wake = self.auto_lifecycle.wake_lock(&id).lock_owned().await;
-        let artifact = self.auto_lifecycle.artifact_lock(&id).lock_owned().await;
+        let artifact = self.write_gate.lock_for_read(&id, Reader::Export).await;
         let CleanupLockTryResult::Acquired(fence) = self.try_cleanup_fence(&id) else {
             return Err(Status::aborted("sandbox cleanup is in progress"));
         };
@@ -1131,9 +1132,10 @@ impl SandboxManagerService {
             self.auto_lifecycle.wake_lock(&sandbox_id).lock_owned(),
         )
         .await?;
-        let _artifact = super::restart_admission::wait_for_activation_admission(
+        let locked = super::restart_admission::wait_for_activation_admission(
             &sandbox_id,
-            self.auto_lifecycle.artifact_lock(&sandbox_id).lock_owned(),
+            self.write_gate
+                .lock_for_read(&sandbox_id, Reader::BeforeAdmission),
         )
         .await?;
         let CleanupLockTryResult::Acquired(_fence) = self.try_cleanup_fence(&sandbox_id) else {
@@ -1141,10 +1143,10 @@ impl SandboxManagerService {
         };
         self.reject_existing_sandbox_import(validated.sandbox_id)
             .await?;
-        // The sandbox doesn't exist yet, so it has no VM.
-        let _producer =
-            self.activation_seal
-                .admit_producer("sandbox import", &sandbox_id, false)?;
+        // The sandbox doesn't exist yet, so it has no VM. Its row is
+        // reserved below, so until then only its producer token shows a
+        // drain that it's coming.
+        let _artifact = locked.admit(LockedWriter::Producer(Producer::SandboxImport))?;
 
         let paths = SandboxImportPaths::new(&sandbox_id);
         let cleanup_id = SandboxCleanupEpisodeId::new();

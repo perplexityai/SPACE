@@ -10,6 +10,7 @@ use super::suspend_snapshot_publication::recovered_sandbox_row_fields;
 use super::suspend_snapshot_publication::{
     self, SuspendSnapshotPublicationDecision, canonical_suspend_snapshot_dir,
 };
+use super::write_gate::DrainCompatible;
 use super::*;
 use crate::db::{edges, require_startup_state_write};
 use crate::metrics::sandbox::worker::{
@@ -791,9 +792,10 @@ impl SandboxManagerService {
         if !row.volume_encryption {
             return;
         }
-        let (Ok(wake), Ok(artifact)) = (
+        let (Ok(wake), Some(artifact)) = (
             self.auto_lifecycle.wake_lock(&row.id).try_lock_owned(),
-            self.auto_lifecycle.artifact_lock(&row.id).try_lock_owned(),
+            self.write_gate
+                .try_lock(&row.id, DrainCompatible::SuspendRecovery),
         ) else {
             return;
         };
@@ -857,8 +859,10 @@ impl SandboxManagerService {
             }
             let wake = self.auto_lifecycle.wake_lock(&row.id);
             let Ok(_wake) = wake.try_lock() else { continue };
-            let artifact = self.auto_lifecycle.artifact_lock(&row.id);
-            let Ok(_artifact) = artifact.try_lock() else {
+            let Some(_artifact) = self
+                .write_gate
+                .try_lock(&row.id, DrainCompatible::SuspendRecovery)
+            else {
                 continue;
             };
             let CleanupLockTryResult::Acquired(_cleanup) = self.try_cleanup_fence(&row.id) else {
