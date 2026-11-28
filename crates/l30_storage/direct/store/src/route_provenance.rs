@@ -17,13 +17,20 @@ pub struct ReservedGenerations {
 
 /// Raises the sandbox's provenance to `route_generation` and
 /// `execution_generation`, creating it when absent. Each column keeps the
-/// higher of its stored and given values, so it never moves back.
-pub async fn retain_generations(
-    executor: impl Executor<'_>,
+/// higher of its stored and given values, so it never moves back, and the
+/// upsert is correct as a statement of its own. A caller that also writes the
+/// sandbox's route identity passes the transaction that writes it, so the two
+/// commit together; the verb refuses a pool, so such a caller cannot pass the
+/// pool by mistake.
+pub async fn retain_generations<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     route_generation: RouteGeneration,
     execution_generation: ExecutionGeneration,
-) -> Result<(), DbError> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "INSERT INTO sandbox_direct_route_provenance (
              sandbox_id,
@@ -46,7 +53,7 @@ pub async fn retain_generations(
     .bind(sandbox_id)
     .bind(route_generation)
     .bind(execution_generation)
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }

@@ -24,6 +24,14 @@ async fn sandbox_in(pool: &PgPool, lifecycle: &str) -> TestResult<SandboxId> {
     Ok(SandboxId::from_uuid(id))
 }
 
+/// Runs [`set_activating_client`] in a transaction of its own and commits it.
+async fn set(pool: &PgPool, id: SandboxId, client_id: Option<&ClientId>) -> TestResult<bool> {
+    let mut tx = pool.begin().await?;
+    let changed = set_activating_client(&mut *tx, id, client_id).await?;
+    tx.commit().await?;
+    Ok(changed)
+}
+
 async fn record(pool: &PgPool, id: SandboxId) -> TestResult<Option<String>> {
     Ok(sqlx::query_scalar(sql!(
         "SELECT activating_client_id FROM sandboxes WHERE id = $1"
@@ -47,10 +55,7 @@ async fn the_record_is_written_only_where_an_activation_can_create_a_runtime() -
         .map(|lifecycle| lifecycle.as_str())
     {
         let id = sandbox_in(&db.pool, lifecycle).await?;
-        assert!(
-            set_activating_client(&db.pool, id, Some(&alpha)).await?,
-            "{lifecycle}"
-        );
+        assert!(set(&db.pool, id, Some(&alpha)).await?, "{lifecycle}");
         assert_eq!(
             record(&db.pool, id).await?.as_deref(),
             Some("alpha"),
@@ -64,10 +69,7 @@ async fn the_record_is_written_only_where_an_activation_can_create_a_runtime() -
     }
     for lifecycle in UNATTRIBUTED_LIFECYCLES {
         let id = sandbox_in(&db.pool, lifecycle).await?;
-        assert!(
-            !set_activating_client(&db.pool, id, Some(&alpha)).await?,
-            "{lifecycle}"
-        );
+        assert!(!set(&db.pool, id, Some(&alpha)).await?, "{lifecycle}");
         assert_eq!(record(&db.pool, id).await?, None, "{lifecycle}");
     }
     Ok(())
@@ -83,12 +85,12 @@ async fn an_unchanged_value_is_a_no_op_and_none_clears_the_record() -> TestResul
     let id = sandbox_in(&db.pool, "started").await?;
     let native = ClientId::native();
 
-    assert!(set_activating_client(&db.pool, id, Some(&native)).await?);
-    assert!(!set_activating_client(&db.pool, id, Some(&native)).await?);
-    assert!(set_activating_client(&db.pool, id, None).await?);
+    assert!(set(&db.pool, id, Some(&native)).await?);
+    assert!(!set(&db.pool, id, Some(&native)).await?);
+    assert!(set(&db.pool, id, None).await?);
     assert_eq!(record(&db.pool, id).await?, None);
     assert_eq!(activating_client(&db.pool, id).await?, Some(None));
-    assert!(!set_activating_client(&db.pool, id, None).await?);
+    assert!(!set(&db.pool, id, None).await?);
     assert_eq!(activating_client(&db.pool, SandboxId::new()).await?, None);
     Ok(())
 }

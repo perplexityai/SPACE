@@ -11,10 +11,14 @@
 //! module. The admin node registry writes `node_direct` through [`nodes`],
 //! in the transactions `pplx-space-direct-coordinator` runs with the node's
 //! `nodes` row; every read of `node_direct` joins it onto a table another
-//! store owns, so none is here. Each verb takes any executor, so it composes
-//! into the caller's open transaction, and the caller keeps everything around
-//! it: the transactions and their order, the `sandboxes` or `nodes` row locks
-//! it takes first, the decoding of what a verb returns and the mapping of its
+//! store owns, so none is here. Each verb runs on the transaction, connection
+//! or pool its caller passes, so it composes into the caller's open
+//! transaction: most take any executor, and
+//! [`route_identities::accept_receipt`] and
+//! [`route_provenance::retain_generations`] take a transaction or connection
+//! and refuse a pool. The caller keeps everything around them: the
+//! transactions and their order, the `sandboxes` or `nodes` row locks it
+//! takes first, the decoding of what a verb returns and the mapping of its
 //! errors.
 //!
 //! A guarded write that matches no row returns `false` or `None`, whether

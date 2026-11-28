@@ -97,11 +97,12 @@ pub async fn store_unless_newer(
 ///
 /// A sandbox with no stored route always accepts. The guard reads the
 /// `sandboxes` row; a caller that changes it first, in the same transaction,
-/// holds its row lock across this write.
-pub async fn accept_receipt(
-    executor: impl Executor<'_>,
-    identity: &SandboxRouteIdentity,
-) -> Result<bool, DbError> {
+/// holds its row lock across this write. The caller must pass its open
+/// transaction.
+pub async fn accept_receipt<C>(tx: &mut C, identity: &SandboxRouteIdentity) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let persisted = sqlx::query_scalar::<_, i64>(sql!(
         "INSERT INTO sandbox_direct_route_identities (
              sandbox_id,
@@ -155,7 +156,7 @@ pub async fn accept_receipt(
     .bind(identity.execution_generation())
     .bind(identity.activation_attempt_id().as_uuid())
     .bind(identity.pod_uid().map(ToString::to_string))
-    .fetch_optional(executor.into_sqlx())
+    .fetch_optional(tx.into_sqlx())
     .await?;
     Ok(persisted.is_some())
 }
