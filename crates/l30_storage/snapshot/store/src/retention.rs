@@ -233,12 +233,17 @@ pub struct ClaimSafety {
 /// Evaluate the claim's guards on snapshot `snapshot_id`; `None` when it's no
 /// longer `ready` or its sandbox is gone. Run it in the claim's transaction,
 /// after its locks, so it sees writers that committed while it waited.
-pub async fn claim_safety(
-    executor: impl Executor<'_>,
+///
+/// The caller must pass its open transaction.
+pub async fn claim_safety<C>(
+    tx: &mut C,
     snapshot_id: SnapshotId,
     keep_n: i64,
     min_age: Option<Duration>,
-) -> Result<Option<ClaimSafety>, DbError> {
+) -> Result<Option<ClaimSafety>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     static CLAIM_SAFETY: LazyLock<String> = LazyLock::new(|| {
         let restore_source = snapshot_is_live_restore_source("sb", "cur");
         sql!(format!(
@@ -274,7 +279,7 @@ pub async fn claim_safety(
         .bind(snapshot_id)
         .bind(keep_n)
         .bind(min_age_secs)
-        .fetch_optional(executor.into_sqlx())
+        .fetch_optional(tx.into_sqlx())
         .await?)
 }
 

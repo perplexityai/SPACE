@@ -1884,11 +1884,13 @@ async fn registration_fills_only_a_missing_binding_or_owner() -> TestResult {
     insert_template(&db.pool, TEMPLATE).await?;
     let release = insert_release(&db.pool, TEMPLATE, HASH, None).await?;
     let first = metadata(environment(1));
-    assert!(registration::fill_execution_metadata(&db.pool, release, &first).await?);
+    let mut tx = db.pool.begin().await?;
+    assert!(registration::fill_execution_metadata(&mut *tx, release, &first).await?);
     assert!(
-        !registration::fill_execution_metadata(&db.pool, release, &metadata(environment(2)))
+        !registration::fill_execution_metadata(&mut *tx, release, &metadata(environment(2)))
             .await?
     );
+    tx.commit().await?;
     let stored: Option<serde_json::Value> =
         sqlx::query_scalar("SELECT execution_metadata FROM template_releases WHERE id = $1")
             .bind(release)

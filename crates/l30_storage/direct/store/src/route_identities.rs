@@ -51,11 +51,14 @@ pub async fn get(
 ///
 /// The guard compares generations only. Whatever else the write needs, such
 /// as the restore lease it is made under, the caller checks first in the same
-/// transaction.
-pub async fn store_unless_newer(
-    executor: impl Executor<'_>,
+/// transaction. The caller must pass its open transaction.
+pub async fn store_unless_newer<C>(
+    tx: &mut C,
     identity: &SandboxRouteIdentity,
-) -> Result<bool, DbError> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let persisted = sqlx::query_scalar::<_, i64>(sql!(
         "INSERT INTO sandbox_direct_route_identities (
              sandbox_id, route_generation, current_node_id, substrate_kind,
@@ -81,7 +84,7 @@ pub async fn store_unless_newer(
     .bind(identity.execution_generation())
     .bind(identity.activation_attempt_id().as_uuid())
     .bind(identity.pod_uid().map(ToString::to_string))
-    .fetch_optional(executor.into_sqlx())
+    .fetch_optional(tx.into_sqlx())
     .await?;
     Ok(persisted.is_some())
 }

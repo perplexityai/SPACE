@@ -45,6 +45,27 @@ async fn route(pool: &sqlx::PgPool, session_id: &str) -> Result<SessionRoute, sq
         .expect("live session route"))
 }
 
+/// Runs [`repoint_session_route`] in a transaction of its own and commits it.
+async fn repoint(
+    pool: &sqlx::PgPool,
+    session_id: &str,
+    current_node_id: NodeId,
+    backend_endpoint: &str,
+    backend_transport: &str,
+) -> TestResult<Option<SessionRoute>> {
+    let mut tx = pool.begin().await?;
+    let route = repoint_session_route(
+        &mut *tx,
+        session_id,
+        current_node_id,
+        backend_endpoint,
+        backend_transport,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(route)
+}
+
 /// Catches the route read returning another session's values, or reading an
 /// expired session or one whose protocol session id does not match.
 #[tokio::test(flavor = "current_thread")]
@@ -124,7 +145,7 @@ async fn a_repoint_advances_the_route_generation_only_on_change() -> TestResult 
     insert(&db.pool, "dps_route", sandbox_id).await?;
     let first = route(&db.pool, "dps_route").await?;
 
-    let moved = repoint_session_route(&db.pool, "dps_route", node_id, "10.0.0.45:50051", "grpc")
+    let moved = repoint(&db.pool, "dps_route", node_id, "10.0.0.45:50051", "grpc")
         .await?
         .expect("a live session repoints");
     assert_eq!(moved.current_node_id, Some(node_id));
@@ -132,19 +153,19 @@ async fn a_repoint_advances_the_route_generation_only_on_change() -> TestResult 
     assert_eq!(moved.backend_transport.as_deref(), Some("grpc"));
     assert_ne!(moved.route_generation, first.route_generation);
 
-    let same = repoint_session_route(&db.pool, "dps_route", node_id, "10.0.0.45:50051", "grpc")
+    let same = repoint(&db.pool, "dps_route", node_id, "10.0.0.45:50051", "grpc")
         .await?
         .expect("a live session repoints");
     assert_eq!(same.route_generation, moved.route_generation);
 
-    let changed = repoint_session_route(&db.pool, "dps_route", node_id, "10.0.0.45:50052", "grpc")
+    let changed = repoint(&db.pool, "dps_route", node_id, "10.0.0.45:50052", "grpc")
         .await?
         .expect("a live session repoints");
     assert_eq!(changed.backend_endpoint.as_deref(), Some("10.0.0.45:50052"));
     assert_ne!(changed.route_generation, moved.route_generation);
 
     assert!(
-        repoint_session_route(&db.pool, "dps_missing", node_id, "10.0.0.46:50051", "grpc")
+        repoint(&db.pool, "dps_missing", node_id, "10.0.0.46:50051", "grpc")
             .await?
             .is_none()
     );

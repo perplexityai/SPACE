@@ -205,6 +205,29 @@ async fn writable_columns(
     .await
 }
 
+/// Runs [`revoke_live_session`] in a transaction of its own and commits it.
+async fn revoke(
+    pool: &sqlx::PgPool,
+    org_id: OrgId,
+    sandbox_id: SandboxId,
+    session_id: &str,
+    reason: &str,
+    advance_epoch: bool,
+) -> TestResult<Option<Session>> {
+    let mut tx = pool.begin().await?;
+    let session = revoke_live_session(
+        &mut *tx,
+        org_id,
+        sandbox_id,
+        session_id,
+        reason,
+        advance_epoch,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(session)
+}
+
 /// Catches a read or list that returns expired sessions, a list that ignores
 /// its kind, cursor or limit, or one ordered oldest first.
 #[tokio::test(flavor = "current_thread")]
@@ -282,8 +305,7 @@ async fn revoke_clears_the_token_and_advances_the_epoch_only_when_asked() -> Tes
         1
     );
 
-    let again =
-        revoke_live_session(&db.pool, org_id, sandbox_id, "dps_revoked", "second", false).await?;
+    let again = revoke(&db.pool, org_id, sandbox_id, "dps_revoked", "second", false).await?;
     assert!(again.is_some());
     let stored = writable_columns(&db.pool, "dps_revoked").await?;
     assert_eq!(stored.revocation_status, "revoked");
@@ -291,7 +313,7 @@ async fn revoke_clears_the_token_and_advances_the_epoch_only_when_asked() -> Tes
     assert_eq!(stored.revocation_reason.as_deref(), Some("first"));
     assert_eq!(stored.token_hash, None);
 
-    revoke_live_session(&db.pool, org_id, sandbox_id, "dps_revoked", "third", true)
+    revoke(&db.pool, org_id, sandbox_id, "dps_revoked", "third", true)
         .await?
         .expect("a revoked live session still matches");
     let stored = writable_columns(&db.pool, "dps_revoked").await?;
@@ -318,7 +340,7 @@ async fn revoke_leaves_an_expired_session_alone() -> TestResult {
     );
     tx.commit().await?;
     assert_eq!(
-        revoke_live_session(&db.pool, org_id, sandbox_id, "dps_expired", "late", true).await?,
+        revoke(&db.pool, org_id, sandbox_id, "dps_expired", "late", true).await?,
         None
     );
     assert_eq!(writable_columns(&db.pool, "dps_expired").await?, before);
@@ -344,7 +366,7 @@ async fn attach_token_refreshes_only_while_the_session_is_active() -> TestResult
         Some("fresh-hash")
     );
 
-    revoke_live_session(&db.pool, org_id, sandbox_id, "dps_token", "revoked", true).await?;
+    revoke(&db.pool, org_id, sandbox_id, "dps_token", "revoked", true).await?;
     let before = writable_columns(&db.pool, "dps_token").await?;
     assert!(!refresh_live_attach_token(&db.pool, "dps_token", "late-hash", later, later).await?);
     assert!(!refresh_live_attach_token(&db.pool, "dps_missing", "late-hash", later, later).await?);
@@ -441,7 +463,7 @@ async fn only_the_bound_process_exiting_closes_a_live_session() -> TestResult {
     insert(&db.pool, "dps_revoked", sandbox_id, "process").await?;
     bind_session_process(&db.pool, "dps_closes", None, "proc-1", true).await?;
     bind_session_process(&db.pool, "dps_revoked", None, "proc-2", true).await?;
-    revoke_live_session(&db.pool, org_id, sandbox_id, "dps_revoked", "revoked", true).await?;
+    revoke(&db.pool, org_id, sandbox_id, "dps_revoked", "revoked", true).await?;
 
     let before = writable_columns(&db.pool, "dps_closes").await?;
     assert!(!close_exited_process_session(&db.pool, "dps_closes", None, "proc-other").await?);
@@ -514,7 +536,7 @@ async fn revocation_state_reads_the_org_epoch_alongside() -> TestResult {
     assert_eq!(active.revocation_epoch, 0);
     assert_eq!(active.org_revocation_epoch, 0);
 
-    revoke_live_session(&db.pool, org_id, sandbox_id, "dps_state", "gone", true).await?;
+    revoke(&db.pool, org_id, sandbox_id, "dps_state", "gone", true).await?;
     advance_org_revocation_epoch(&db.pool, org_id).await?;
     let revoked = live_session_revocation(&db.pool, "dps_state", None)
         .await?

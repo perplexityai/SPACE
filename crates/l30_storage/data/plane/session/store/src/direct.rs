@@ -142,14 +142,17 @@ pub async fn live_session_route(
 ///
 /// The route generation advances only when one of the three changes. The
 /// caller decides what to do with the sandbox it re-read, and rolls its
-/// transaction back to refuse it.
-pub async fn repoint_session_route(
-    executor: impl Executor<'_>,
+/// transaction back to refuse it. The caller must pass its open transaction.
+pub async fn repoint_session_route<C>(
+    tx: &mut C,
     session_id: &str,
     current_node_id: NodeId,
     backend_endpoint: &str,
     backend_transport: &str,
-) -> Result<Option<SessionRoute>, DbError> {
+) -> Result<Option<SessionRoute>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     Ok(sqlx::query_as::<_, SessionRoute>(sql!(
         "UPDATE data_plane_sessions d
          SET current_node_id = $2,
@@ -215,6 +218,6 @@ pub async fn repoint_session_route(
     .bind(current_node_id)
     .bind(backend_endpoint)
     .bind(backend_transport)
-    .fetch_optional(executor.into_sqlx())
+    .fetch_optional(tx.into_sqlx())
     .await?)
 }

@@ -14,6 +14,7 @@
 //! store owns, so none is here. Each verb runs on the transaction, connection
 //! or pool its caller passes, so it composes into the caller's open
 //! transaction: most take any executor, and
+//! [`route_identities::store_unless_newer`],
 //! [`route_identities::accept_receipt`] and
 //! [`route_provenance::retain_generations`] take a transaction or connection
 //! and refuse a pool. The caller keeps everything around them: the

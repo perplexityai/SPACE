@@ -47,14 +47,16 @@ async fn an_operation_is_active_only_until_it_finishes() -> TestResult {
     let operation_id = insert_queued(&db.pool, OperationKind::CreateSandbox, &target).await?;
     assert!(operations::is_active(&db.pool, operation_id).await?);
 
+    let mut tx = db.pool.begin().await?;
     operations::cancel_superseded_create(
-        &db.pool,
+        &mut *tx,
         operation_id,
         "superseded",
         "operation_failed",
         serde_json::json!({}),
     )
     .await?;
+    tx.commit().await?;
     assert!(!operations::is_active(&db.pool, operation_id).await?);
     assert!(!operations::is_active(&db.pool, OperationId::new()).await?);
     Ok(())
