@@ -219,6 +219,7 @@ class WarmPoolPolicyAssertions:
         ecw: WarmPoolPolicyEcw,
         scope: ResourceScope,
         *,
+        retry_delete: Callable[[Callable[[], None]], int],
         wait: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -226,6 +227,10 @@ class WarmPoolPolicyAssertions:
         self._control = control
         self._ecw = ecw
         self._scope = scope
+        # The harness's shared cleanup retry policy for sandbox deletes
+        # (`space_smoke.fixtures.retry_sandbox_delete`), passed in because
+        # the fixtures module imports this one.
+        self._retry_delete = retry_delete
         self._wait = wait
         self._clock = clock
         self.alias = f"space-smoke-policy-{secrets.token_hex(4)}"
@@ -542,13 +547,17 @@ class WarmPoolPolicyAssertions:
 
         metadata = {"space_smoke_warm_pool_policy": uuid.uuid4().hex}
         by_metadata = self._scope.defer(
-            "kill the policy scenario's sandbox", lambda: self._ecw.kill_matching(metadata), critical=True
+            "kill the policy scenario's sandbox",
+            lambda: self._retry_delete(lambda: self._ecw.kill_matching(metadata)),
+            critical=True,
         )
         sandbox = self._ecw.create(template=self.alias, timeout=SANDBOX_TIMEOUT_SECONDS, metadata=metadata)
         sandbox_id = sandbox.sandbox_id
         self._kills.append(
             self._scope.defer(
-                f"kill sandbox {sandbox_id}", lambda: self._ecw.kill_sandbox(sandbox_id), critical=True
+                f"kill sandbox {sandbox_id}",
+                lambda: self._retry_delete(lambda: self._ecw.kill_sandbox(sandbox_id)),
+                critical=True,
             )
         )
         by_metadata.disarm()

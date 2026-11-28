@@ -3017,7 +3017,11 @@ class KindAdmin(ScenarioFixture):
             )
         if self._warm_pool_policy_assertions is None:
             self._warm_pool_policy_assertions = WarmPoolPolicyAssertions(
-                self, self._warm_pool_policy_control, self._warm_pool_policy_ecw, self._context.scope
+                self,
+                self._warm_pool_policy_control,
+                self._warm_pool_policy_ecw,
+                self._context.scope,
+                retry_delete=retry_sandbox_delete,
             )
         return self._warm_pool_policy_assertions
 
