@@ -955,6 +955,14 @@ sandbox_quarantine_state = ["pplx-space-sandbox-store"]
 # Deleting a sandbox orphans its snapshots' storage locations for cleanup.
 # Temporary: the write folds into snapshot-store.
 snapshot_storage_locations = ["pplx-space-sandbox-store"]
+# The tag verbs in template-store's release_tags.rs set first_mutable_tag_at
+# on the release a mutable tag lands on, in the statement that writes the tag,
+# so no caller can tag a release without the mark. Permanent: the tag and the
+# mark have to be one statement. A mark verb in template-release-store, or a
+# coordinator running both, would make the mark a second statement that every
+# tag writer has to remember. The grant covers the whole table; template-store
+# writes only that column.
+template_releases = ["pplx-space-template-store"]
 
 [rules.layers.state.declarations]  # every store declares its databases; only stores declare state
 mode = "required"

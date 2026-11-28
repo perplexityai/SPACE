@@ -5,7 +5,8 @@
 //! fixtures with both spellings, twins, storage locations and `created_at`
 //! ties. The script tests run `scripts/bootstrap-templates.sh` against a
 //! migrated database and check that it attaches its tag and storage location
-//! to the release the fragment picks.
+//! to the release the fragment picks, and marks that release's
+//! `first_mutable_tag_at`.
 
 use super::{digest_original, spelling_original};
 use pplx_space_db_test_fixtures::{report_unavailable_dependency, try_pg_test_db};
@@ -397,6 +398,23 @@ struct Registered {
     hashes: Vec<String>,
 }
 
+/// Each release of `template`'s `first_mutable_tag_at` and `created_at`, as
+/// text in the session's zone.
+async fn first_mutable_tag_marks(
+    pool: &PgPool,
+    template: &str,
+) -> TestResult<Vec<(Option<String>, String)>> {
+    Ok(sqlx::query_as(sql!(
+        "SELECT first_mutable_tag_at::TEXT, created_at::TEXT
+         FROM template_releases
+         WHERE template_name = $1
+         ORDER BY id"
+    ))
+    .bind(template)
+    .fetch_all(pool)
+    .await?)
+}
+
 async fn registered(pool: &PgPool, template: &str) -> TestResult<Registered> {
     let latest = sqlx::query_scalar(sql!(
         "SELECT template_release_id FROM template_release_tags
@@ -460,6 +478,11 @@ async fn the_script_attaches_to_the_digest_original_under_the_other_spelling() -
     assert_eq!(after.hashes, [BARE], "no release under the other spelling");
     assert_eq!(after.digest_original, [bare]);
     assert_eq!(after.latest, Some(bare));
+    let marks = first_mutable_tag_marks(pool, template).await?;
+    assert!(
+        marks.len() == 1 && marks[0].0.is_some(),
+        "`latest` marks the release it lands on: {marks:?}"
+    );
     assert!(
         after.storage_owners.iter().all(|(_, owner)| *owner == bare),
         "{after:?}"
@@ -528,7 +551,10 @@ async fn the_script_prefers_the_storage_owning_spelling() -> TestResult {
 }
 
 /// A digest with no release yet is registered under the manifest's spelling,
-/// tagged and given its location, and a second run changes nothing.
+/// tagged and given its location, and a second run changes nothing. `latest`
+/// marks the new release as having carried a mutable tag at its own
+/// `created_at`, which the script stamps after its transaction began, and the
+/// second run keeps that time.
 #[tokio::test(flavor = "current_thread")]
 async fn the_script_registers_a_new_digest_once() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -538,11 +564,20 @@ async fn the_script_registers_a_new_digest_once() -> TestResult {
     let work = tempfile::tempdir()?;
     let template = "fresh";
     let hash = format!("sha256:{BARE}");
+    let mut marks = Vec::new();
     for _ in 0..2 {
         if !run_bootstrap(pool, work.path(), template, &hash).await? {
             return Ok(());
         }
+        marks.push(first_mutable_tag_marks(pool, template).await?);
     }
+    assert_eq!(marks[0].len(), 1, "{marks:?}");
+    assert_eq!(
+        marks[0][0].0.as_deref(),
+        Some(marks[0][0].1.as_str()),
+        "{marks:?}"
+    );
+    assert_eq!(marks[0], marks[1], "a rerun keeps the first time");
     let after = registered(pool, template).await?;
     assert_eq!(after.hashes, [hash.as_str()]);
     let [original] = after.digest_original[..] else {

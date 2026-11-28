@@ -24,7 +24,10 @@
 //! Most take any executor. Some reads join other stores' tables, such as
 //! the admin template list's node inventory, the create's builder-reported
 //! auto-lifecycle default, and the node-facing policy reads' sandboxes,
-//! pool configs and releases; none writes them.
+//! pool configs and releases. Only [`release_tags`]' verbs write another
+//! store's table: they set `template_releases.first_mutable_tag_at` on the
+//! release a tag lands on, in the tag's statement, under a co-writer grant
+//! in `ARCHITECTURE.toml`.
 //!
 //! * **Locks.** A verb whose row lock the caller relies on after the
 //!   statement (`FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, as the
@@ -45,8 +48,8 @@
 //!   values and return the outcome; matching nothing is an outcome, not an
 //!   error. The caller keeps its transaction and decides what each outcome means.
 //!
-//! Statements that also write another store's tables stay at their call
-//! sites. Reads of these tables that interpolate a
+//! Other statements that also write another store's tables stay at their
+//! call sites. Reads of these tables that interpolate a
 //! `pplx_space_template_release_original` fragment aren't this store's, as
 //! it is not one of that crate's users; among them, the admin release
 //! delete's check of the tags a release serves is
@@ -62,6 +65,8 @@ pub mod publication_grants;
 pub mod release_tags;
 pub mod templates;
 
+#[cfg(test)]
+mod release_tags_tests;
 #[cfg(test)]
 mod tests;
 
