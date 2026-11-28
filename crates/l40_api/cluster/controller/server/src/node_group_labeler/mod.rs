@@ -385,6 +385,12 @@ pub enum EnsureDefaultGroupError {
     SeedBlockedByExistingGroups { other_groups: i64 },
 }
 
+impl From<pplx_space_postgres_pool::DbError> for EnsureDefaultGroupError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 /// Postgres-side surface. Production impl: [`NodeGroupDbStore`].
 pub trait NodeGroupSink: Send + Sync + 'static {
     /// Return the singleton default generic group, seeding it (UUIDv7,

@@ -3,13 +3,13 @@ use pplx_space_sandbox_model::SandboxId;
 
 use serde::Serialize;
 use serde_json::{Map, Value};
-use sqlx::types::Json as SqlxJson;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_node_model::{NodeAddress, NodeManagedBy, NodeRole};
+use pplx_space_sandbox_store::debug_reads::SandboxDebugRecord;
 
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
@@ -58,48 +58,6 @@ pub(super) struct SandboxDebugResponse {
     pub quarantine: DebugSection<QuarantineSection>,
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
-pub(super) struct SandboxRecord {
-    pub id: SandboxId,
-    pub name: Option<String>,
-    pub user_id: Option<UserId>,
-    pub org_id: Option<OrgId>,
-    pub managed_by: String,
-    pub lifecycle: String,
-    pub placement: String,
-    pub active_node_id: Option<NodeId>,
-    pub active_node_address: Option<NodeAddress>,
-    pub active_node_role: Option<NodeRole>,
-    pub active_node_managed_by: Option<NodeManagedBy>,
-    pub active_k8s_node_name: Option<String>,
-    pub target_node_id: Option<NodeId>,
-    pub target_node_address: Option<NodeAddress>,
-    pub target_node_role: Option<NodeRole>,
-    pub target_node_managed_by: Option<NodeManagedBy>,
-    pub target_k8s_node_name: Option<String>,
-    #[serde(with = "time::serde::rfc3339::option")]
-    pub placement_changed_at: Option<OffsetDateTime>,
-    pub template_id: Option<String>,
-    pub content_hash: Option<String>,
-    pub vcpu: Option<i32>,
-    pub memory_mib: Option<i32>,
-    pub disk_mib: Option<i32>,
-    pub env: SqlxJson<Value>,
-    pub metadata: SqlxJson<Value>,
-    pub auto_lifecycle: SqlxJson<Value>,
-    pub auto_lifecycle_state: SqlxJson<Value>,
-    pub next_auto_event_at: Option<i64>,
-    pub network_policy_override_json: Option<SqlxJson<Value>>,
-    pub network_policy_generation: i64,
-    pub snapshots_enabled_desired: bool,
-    #[serde(with = "time::serde::rfc3339::option")]
-    pub last_used_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub updated_at: OffsetDateTime,
-}
-
 #[derive(Debug, Serialize)]
 pub(super) struct LifecycleSection {
     pub state: String,
@@ -141,11 +99,11 @@ pub(super) struct ResourcesSection {
     pub disk_mib: Option<i32>,
     /// Variable names, each mapped to `null`; see [`env_names`].
     pub env: Map<String, Value>,
-    pub metadata: SqlxJson<Value>,
-    pub auto_lifecycle: SqlxJson<Value>,
-    pub auto_lifecycle_state: SqlxJson<Value>,
+    pub metadata: Value,
+    pub auto_lifecycle: Value,
+    pub auto_lifecycle_state: Value,
     pub next_auto_event_at: Option<i64>,
-    pub network_policy_override_json: Option<SqlxJson<Value>>,
+    pub network_policy_override_json: Option<Value>,
     pub network_policy_generation: i64,
     pub snapshots_enabled_desired: bool,
     pub observed: Option<ObservedResources>,
@@ -158,50 +116,52 @@ pub(super) struct SandboxSections {
     pub resources: ResourcesSection,
 }
 
-impl SandboxRecord {
-    pub(super) fn into_sections(self, observed: Option<ObservedResources>) -> SandboxSections {
-        SandboxSections {
-            lifecycle: LifecycleSection {
-                state: self.lifecycle,
-                managed_by: self.managed_by,
-                name: self.name,
-                user_id: self.user_id,
-                org_id: self.org_id,
-                last_used_at: self.last_used_at,
-                created_at: self.created_at,
-                updated_at: self.updated_at,
-            },
-            placement: PlacementSection {
-                state: self.placement,
-                active_node_id: self.active_node_id,
-                active_node_address: self.active_node_address,
-                active_node_role: self.active_node_role,
-                active_node_managed_by: self.active_node_managed_by,
-                active_k8s_node_name: self.active_k8s_node_name,
-                target_node_id: self.target_node_id,
-                target_node_address: self.target_node_address,
-                target_node_role: self.target_node_role,
-                target_node_managed_by: self.target_node_managed_by,
-                target_k8s_node_name: self.target_k8s_node_name,
-                changed_at: self.placement_changed_at,
-            },
-            resources: ResourcesSection {
-                template_id: self.template_id,
-                content_hash: self.content_hash,
-                vcpu: self.vcpu,
-                memory_mib: self.memory_mib,
-                disk_mib: self.disk_mib,
-                env: env_names(self.env.0),
-                metadata: self.metadata,
-                auto_lifecycle: self.auto_lifecycle,
-                auto_lifecycle_state: self.auto_lifecycle_state,
-                next_auto_event_at: self.next_auto_event_at,
-                network_policy_override_json: self.network_policy_override_json,
-                network_policy_generation: self.network_policy_generation,
-                snapshots_enabled_desired: self.snapshots_enabled_desired,
-                observed,
-            },
-        }
+/// Split the sandbox's stored row into the response's sections.
+pub(super) fn sandbox_sections(
+    record: SandboxDebugRecord,
+    observed: Option<ObservedResources>,
+) -> SandboxSections {
+    SandboxSections {
+        lifecycle: LifecycleSection {
+            state: record.lifecycle,
+            managed_by: record.managed_by,
+            name: record.name,
+            user_id: record.user_id,
+            org_id: record.org_id,
+            last_used_at: record.last_used_at,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        },
+        placement: PlacementSection {
+            state: record.placement,
+            active_node_id: record.active_node_id,
+            active_node_address: record.active_node_address,
+            active_node_role: record.active_node_role,
+            active_node_managed_by: record.active_node_managed_by,
+            active_k8s_node_name: record.active_k8s_node_name,
+            target_node_id: record.target_node_id,
+            target_node_address: record.target_node_address,
+            target_node_role: record.target_node_role,
+            target_node_managed_by: record.target_node_managed_by,
+            target_k8s_node_name: record.target_k8s_node_name,
+            changed_at: record.placement_changed_at,
+        },
+        resources: ResourcesSection {
+            template_id: record.template_id,
+            content_hash: record.content_hash,
+            vcpu: record.vcpu,
+            memory_mib: record.memory_mib,
+            disk_mib: record.disk_mib,
+            env: env_names(record.env),
+            metadata: record.metadata,
+            auto_lifecycle: record.auto_lifecycle,
+            auto_lifecycle_state: record.auto_lifecycle_state,
+            next_auto_event_at: record.next_auto_event_at,
+            network_policy_override_json: record.network_policy_override_json,
+            network_policy_generation: record.network_policy_generation,
+            snapshots_enabled_desired: record.snapshots_enabled_desired,
+            observed,
+        },
     }
 }
 
@@ -219,7 +179,7 @@ fn env_names(env: Value) -> Map<String, Value> {
     }
 }
 
-#[derive(Clone, Debug, Serialize, sqlx::FromRow)]
+#[derive(Clone, Debug, Serialize)]
 pub(super) struct ObservedResources {
     pub sandbox_id: SandboxId,
     pub node_id: Option<NodeId>,
@@ -404,7 +364,7 @@ pub(super) struct SnapshotInventory {
     pub size_bytes: i64,
     pub template_id: Option<String>,
     pub content_hash: Option<String>,
-    pub locations: SqlxJson<Value>,
+    pub locations: Value,
     #[serde(with = "time::serde::rfc3339")]
     pub observed_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -482,5 +442,5 @@ pub(super) struct TimelineEvent {
     #[serde(with = "time::serde::rfc3339")]
     pub at: OffsetDateTime,
     pub kind: String,
-    pub detail: SqlxJson<Value>,
+    pub detail: Value,
 }

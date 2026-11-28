@@ -22,6 +22,7 @@ from space_smoke.adapters import (
     validate_loopback_environment,
 )
 from space_smoke.capabilities import (
+    DrainV2Control,
     ColdEvictionControl,
     CommandSandbox,
     CommandSandboxFactory,
@@ -159,6 +160,16 @@ class SmokeServices:
                 "the Rust build is only readable on the kind backend"
             )
         return self.bench.rust_build()
+
+    def drain_v2_enabled(self) -> bool:
+        """Whether the Kind bench's public API runs drain v2
+        (`SPACE_DRAIN_V2_ENABLED`), read from the cluster."""
+
+        if self.bench is None:
+            raise SmokeConfigurationError(
+                "whether drain v2 is on is only readable on the kind backend"
+            )
+        return self.bench.drain_v2_enabled()
 
     def substrate(self) -> str:
         """The control-plane substrate (`kubernetes` or `direct`) the Kind bench runs."""
@@ -535,6 +546,29 @@ class SmokeServices:
         context.record("sandbox_id", sandbox_ids[0])
         context.record("sandbox_ids", sandbox_ids)
         collection = _NativeScenarioSandboxes(native, tuple(sandboxes))
+
+        def create_owned_sandbox(
+            *,
+            idle_timeout: str | None = None,
+            auto_lifecycle: Mapping[str, object] | None = None,
+        ) -> DurableLifecycleSandbox:
+            # Native create deletes a sandbox whose create failed; the delete
+            # of one that started is armed before it is handed out.
+            created = cast(
+                DurableLifecycleSandbox,
+                native.create(
+                    {**run_metadata, "space_smoke_instance": uuid.uuid4().hex},
+                    idle_timeout=idle_timeout,
+                    auto_lifecycle=auto_lifecycle,
+                ),
+            )
+            context.scope.defer(
+                f"delete Native sandbox {created.sandbox_id}",
+                partial(native.delete, created),
+                critical=True,
+            )
+            return created
+
         return CommandSandboxFixture(
             context,
             sandboxes[0],
@@ -554,6 +588,8 @@ class SmokeServices:
             _stopped_replacement_control=(
                 cast(StoppedReplacementControl, kind) if kind is not None else None
             ),
+            _drain_v2_control=(cast(DrainV2Control, kind) if kind is not None else None),
+            _create_sandbox=create_owned_sandbox,
             _processes=cast(ProcessSandbox, sandboxes[0]),
         )
 

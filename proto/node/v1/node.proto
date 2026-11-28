@@ -595,6 +595,11 @@ message AllocateResponse {
   string slot_label = 9;
   // Slot-derived UID that owns lease-scoped host resources.
   uint32 sandbox_uid = 10;
+  // First IPv4 address, in interface index order, that is neither loopback
+  // nor link-local in the request's netns_path, the externally created
+  // namespace the sandbox bridges to; the same address the shim selects.
+  // Absent without a netns_path or when the node manager could not read it.
+  optional string external_address = 11;
 }
 
 message LaunchRequest {
@@ -896,6 +901,11 @@ message InspectSandboxRequest {
   optional string template = 5;
   // Read durable authority without host probes; works after lease release too.
   bool execution_only = 6;
+  // Read only the sandbox cgroup files, without network, process or
+  // filesystem probes. Ignored when execution_only is set. The response
+  // leaves every non-cgroup field at its default, and an unknown sandbox
+  // answers OK with cgroup_exists = false.
+  bool cgroup_only = 7;
 }
 
 message InspectSandboxResponse {

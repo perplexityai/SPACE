@@ -319,7 +319,8 @@ fn sandbox_info_from_record(rec: &crate::state::SandboxRecord) -> sbx::SandboxIn
         cleanup: None,
         state_changed_at: None,
         execution_generation: rec.execution_generation,
-        pod_uid: None,
+        pod_uid: rec.pod_uid.clone(),
+        external_address: rec.external_address.clone(),
         activation_attempt_id: None,
         spaced_version: None,
         netgtw_git_sha: None,
@@ -465,6 +466,9 @@ impl WorkerApi for SimWorkerApiService {
         &self,
         request: Request<sbx::CreateRequest>,
     ) -> Result<Response<sbx::CreateResponse>, Status> {
+        if let Some(code) = self.state.take_create_refusal().await {
+            return Err(Status::new(code, "create refused"));
+        }
         let req = request.into_inner();
         let sandbox_id = req
             .sandbox_id
@@ -1914,6 +1918,15 @@ impl SimWorkerApiInternalService {
 
 #[tonic::async_trait]
 impl WorkerApiInternal for SimWorkerApiInternalService {
+    async fn abandon_runtime_upgrade(
+        &self,
+        _request: tonic::Request<sbx::AbandonRuntimeUpgradeRequest>,
+    ) -> Result<tonic::Response<sbx::AbandonRuntimeUpgradeResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "the simulator runs no runtime upgrades",
+        ))
+    }
+
     async fn get_runtime_upgrade(
         &self,
         _request: Request<sbx::GetRuntimeUpgradeRequest>,

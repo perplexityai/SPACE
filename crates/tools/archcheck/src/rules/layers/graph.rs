@@ -36,6 +36,20 @@ impl Member<'_> {
     pub fn is_client(&self) -> bool {
         self.layer == Some(Layer::Api) && self.krate.name.ends_with("-client")
     }
+
+    /// A coordinator: a Storage crate named `*-coordinator`, which runs one
+    /// transaction across stores and owns no tables. `layout` puts it at
+    /// `<area>/coordinator`, but its leaf rule also accepts that path for
+    /// `pplx-space-<area>`: only `layers.coordinators`' check of a crate in
+    /// a coordinator's directory makes name and path agree.
+    pub fn is_coordinator(&self) -> bool {
+        self.layer == Some(Layer::Storage) && self.krate.name.ends_with("-coordinator")
+    }
+
+    /// A store: any other Storage crate.
+    pub fn is_store(&self) -> bool {
+        self.layer == Some(Layer::Storage) && !self.is_coordinator()
+    }
 }
 
 /// The layer directory `member` is in, and its path below it (empty for the
@@ -80,8 +94,13 @@ pub(super) enum Problem {
     /// and other clients.
     Clients,
     /// An API or Storage crate's normal or build edge to a store that does
-    /// not list it.
+    /// not list it, but for a Storage crate's to a storage handle crate.
     StoreEdges,
+    /// A coordinator's normal or build edge to another coordinator.
+    Coordinators,
+    /// An API crate's normal or build edge to a coordinator that does not
+    /// list it, or a store's to any coordinator.
+    CoordinatorEdges,
 }
 
 /// Every member by package name, with its edges.
@@ -232,11 +251,23 @@ pub(super) fn production_problem(
     let problem = if edge.from.is_client() {
         let allowed = matches!(to, Layer::Domain | Layer::Foundation) || edge.to.is_client();
         (!allowed).then_some(Problem::Clients)
+    } else if edge.to.is_coordinator() && matches!(from, Layer::Api | Layer::Storage) {
+        let listed = from == Layer::Api
+            && config
+                .coordinator_users
+                .get(edge.to.name())
+                .is_some_and(|users| users.contains(edge.from.name()));
+        if edge.from.is_coordinator() {
+            Some(Problem::Coordinators)
+        } else {
+            (!listed).then_some(Problem::CoordinatorEdges)
+        }
     } else if to == Layer::Storage && matches!(from, Layer::Api | Layer::Storage) {
-        let listed = config
-            .store_users
-            .get(edge.to.name())
-            .is_some_and(|users| users.contains(edge.from.name()));
+        let listed = (from == Layer::Storage && config.storage_handles.contains(edge.to.name()))
+            || config
+                .store_users
+                .get(edge.to.name())
+                .is_some_and(|users| users.contains(edge.from.name()));
         (!listed).then_some(Problem::StoreEdges)
     } else {
         (!may_depend(from, to)).then_some(Problem::Direction)

@@ -1,9 +1,10 @@
 //! `public_operation_events`: each operation's numbered event log.
 
 use pplx_space_accounts::OrgId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_public_api::{OperationId, PublicOperationEventType};
 use pplx_space_sql_locator::sql;
-use sqlx::{FromRow, PgExecutor, types::Json};
+use sqlx::{FromRow, types::Json};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -13,7 +14,8 @@ pub struct PublicOperationEventRow {
     pub operation_id: Uuid,
     pub sequence: i64,
     pub event_type: String,
-    pub event_json: Json<serde_json::Value>,
+    #[sqlx(json)]
+    pub event_json: serde_json::Value,
     pub created_at: OffsetDateTime,
 }
 
@@ -28,12 +30,12 @@ pub struct EventCursor {
 
 /// Up to `limit` events of `operation_id` after `after_sequence`, in order.
 pub async fn list_after_sequence(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     operation_id: OperationId,
     after_sequence: Option<i64>,
     limit: i64,
-) -> Result<Vec<PublicOperationEventRow>, sqlx::Error> {
-    sqlx::query_as::<_, PublicOperationEventRow>(sql!(
+) -> Result<Vec<PublicOperationEventRow>, DbError> {
+    Ok(sqlx::query_as::<_, PublicOperationEventRow>(sql!(
         "SELECT e.operation_id, e.sequence, e.event_type, e.event_json, e.created_at
          FROM public_operation_events e
          WHERE e.operation_id = $1
@@ -44,20 +46,20 @@ pub async fn list_after_sequence(
     .bind(operation_id.as_uuid())
     .bind(after_sequence)
     .bind(limit)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Up to `limit` events after `after` of the operations of `org_id` that
 /// target a sandbox named by any of `target_ids`, oldest first.
 pub async fn list_for_targets_after(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     target_ids: &[String],
     after: EventCursor,
     limit: i64,
-) -> Result<Vec<PublicOperationEventRow>, sqlx::Error> {
-    sqlx::query_as::<_, PublicOperationEventRow>(sql!(
+) -> Result<Vec<PublicOperationEventRow>, DbError> {
+    Ok(sqlx::query_as::<_, PublicOperationEventRow>(sql!(
         "SELECT e.operation_id, e.sequence, e.event_type, e.event_json, e.created_at
          FROM public_operation_events e
          JOIN public_operations o ON o.operation_id = e.operation_id
@@ -74,19 +76,19 @@ pub async fn list_for_targets_after(
     .bind(after.operation_id)
     .bind(after.sequence)
     .bind(limit)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The `limit` most recent events of the operations of `org_id` that target
 /// a sandbox named by any of `target_ids`, oldest first.
 pub async fn list_recent_for_targets(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     target_ids: &[String],
     limit: i64,
-) -> Result<Vec<PublicOperationEventRow>, sqlx::Error> {
-    sqlx::query_as::<_, PublicOperationEventRow>(sql!(
+) -> Result<Vec<PublicOperationEventRow>, DbError> {
+    Ok(sqlx::query_as::<_, PublicOperationEventRow>(sql!(
         "SELECT operation_id, sequence, event_type, event_json, created_at
          FROM (
              SELECT e.operation_id, e.sequence, e.event_type, e.event_json, e.created_at
@@ -103,18 +105,18 @@ pub async fn list_recent_for_targets(
     .bind(org_id)
     .bind(target_ids)
     .bind(limit)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Append an event to `operation_id`'s log, returning its sequence number.
 pub async fn append(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     operation_id: OperationId,
     event_type: PublicOperationEventType,
     event_json: serde_json::Value,
-) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>(sql!(
+) -> Result<i64, DbError> {
+    Ok(sqlx::query_scalar::<_, i64>(sql!(
         "WITH next_sequence AS (
              SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
              FROM public_operation_events
@@ -133,18 +135,18 @@ pub async fn append(
     .bind(operation_id.as_uuid())
     .bind(event_type.as_str())
     .bind(Json(event_json))
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Append one `event_type` event to each operation of `operation_ids`, with
 /// the event of the same index in `event_jsons`.
 pub async fn append_to_each(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     operation_ids: &[Uuid],
-    event_jsons: &[Json<serde_json::Value>],
+    event_jsons: &[serde_json::Value],
     event_type: PublicOperationEventType,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "INSERT INTO public_operation_events (operation_id, sequence, event_type, event_json)
          SELECT expired.operation_id,
@@ -159,9 +161,9 @@ pub async fn append_to_each(
          FROM UNNEST($1::UUID[], $2::JSONB[]) AS expired(operation_id, event_json)"
     ))
     .bind(operation_ids)
-    .bind(event_jsons)
+    .bind(event_jsons.iter().map(Json).collect::<Vec<_>>())
     .bind(event_type.as_str())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }

@@ -98,6 +98,10 @@ class EcwSandboxBusy(EcwSandboxDeleteRetryable):
     """A sandbox delete conflicts with an in-flight lifecycle transition."""
 
 
+class EcwSandboxReconcileUnmatched(RuntimeError):
+    """Run-metadata reconciliation found no sandbox matching an uncertain create."""
+
+
 class EcwSandboxState(StrEnum):
     RUNNING = "running"
     PAUSED = "paused"
@@ -214,6 +218,47 @@ class StoppableLifecycleSandbox(CommandSandbox, Protocol):
     def stop(self) -> None: ...
 
     def start(self) -> None: ...
+
+
+class OperationLifecycleSandbox(CommandSandbox, Protocol):
+    """Command sandbox whose lifecycle calls are recorded operations a caller can follow."""
+
+    def request_lifecycle(self, verb: str) -> str:
+        """Ask for `verb` (`wake`, `resume`, ...) without waiting; the operation's id."""
+        ...
+
+    def operation(self, operation_id: str) -> dict[str, object]:
+        """The operation as `GET /v1/operations/{id}` answers it."""
+        ...
+
+    def state(self) -> str:
+        """The sandbox's state as the public API reports it."""
+        ...
+
+
+@dataclass(frozen=True)
+class CallAnswer:
+    """One HTTP answer, as a caller that judges it itself reads it: the
+    status, its `Retry-After` header and its JSON body (`{}` when it had
+    none or wasn't JSON)."""
+
+    status: int
+    retry_after: str | None
+    body: dict[str, Any]
+
+
+class RawCallSandbox(OperationLifecycleSandbox, Protocol):
+    """Command sandbox whose calls a scenario can make without the client's
+    own handling, to judge a refusal's status and `Retry-After` itself."""
+
+    def lifecycle_answer(self, verb: str) -> CallAnswer:
+        """`POST /v1/sandboxes/{id}:<verb>`, answered as it came."""
+        ...
+
+    def command_answer(self, command: str) -> CallAnswer:
+        """`POST /v1/sandboxes/{id}/commands` for `sh -c command`, answered
+        as it came; the command's output is not attached."""
+        ...
 
 
 class ProcessHandle(Protocol):
@@ -487,12 +532,41 @@ class LimiterProbeOutcome:
     finished_at: float
 
 
+@dataclass(frozen=True)
+class SandboxNodeSlots:
+    """One sandbox-pool node's advertised network slots and bound sandbox pods.
+
+    `capacity` reads `status.capacity["space.pplx.net/network-slots"]` and
+    `allocatable` reads `status.allocatable["space.pplx.net/network-slots"]`
+    without falling back to `capacity`. `used` counts non-terminating sandbox
+    pods bound to the node; `terminating` counts deleting ones whose slot
+    request kube-scheduler still charges until the pod is gone.
+    """
+
+    capacity: int
+    allocatable: int
+    used: int
+    terminating: int
+
+
+@dataclass(frozen=True)
+class OccupiedNetworkSlot:
+    """One worker `network_slots` row that would block shrinking `max_slots` below it."""
+
+    slot_id: int
+    state: str
+    health: str
+    sandbox_id: str | None
+    owned: bool
+
+
 class RateLimitProbe(Protocol):
     """Raw ECW control-plane requests for one client id, plus their cleanup.
 
     The limiter scenario judges statuses and headers the SDK hides, so it
-    goes to the route directly; every create it admits carries the metadata
-    `kill_matching` later deletes by.
+    goes to the route directly; admitted creates are deleted by id through
+    `kill_sandbox`, and every create carries run metadata so an unanswered one
+    can still be reconciled by `kill_matching`.
     """
 
     def race_ecw_request(
@@ -506,7 +580,19 @@ class RateLimitProbe(Protocol):
         gate: Callable[[], None] | None = None,
     ) -> LimiterProbeOutcome: ...
 
-    def kill_matching(self, metadata: Mapping[str, str]) -> None: ...
+    def kill_matching(
+        self,
+        metadata: Mapping[str, str],
+        *,
+        scan_whole_window: bool = False,
+        deadline: float | None = None,
+    ) -> None:
+        """Kill the run's matching sandboxes; `scan_whole_window` keeps polling
+        after a match, for several creates of unknown outcome. `deadline` (a
+        `time.monotonic()` value) bounds every list and DELETE by the time
+        left and stops at the first match, so it can't be combined with
+        `scan_whole_window`."""
+        ...
 
     def kill_sandbox(self, sandbox_id: str) -> None:
         """ECW kill of one bare sandbox uuid, not-found counting as done."""
@@ -527,11 +613,103 @@ class RateLimiterControl(Protocol):
 
     def public_api_env(self, keys: Sequence[str]) -> dict[str, str | None]: ...
 
+    def public_api_has_env_from(self) -> bool:
+        """Whether the public API container takes env from `envFrom` sources."""
+        ...
+
     def set_public_api_env(self, overrides: Mapping[str, str]) -> None: ...
 
-    def restore_public_api_env(self, standing: Mapping[str, str | None]) -> None: ...
+    def restore_public_api_env(
+        self,
+        standing: Mapping[str, str | None],
+        *,
+        rollout_timeout: float = 240,
+        shared_deadline: bool = False,
+    ) -> None: ...
 
     def wait_public_api_ready(self, *, timeout: float) -> None: ...
+
+    def activation_attribution_available(self) -> bool:
+        """Whether the sandbox row can hold an activating client at all.
+
+        A cross-check for the attribution phase, never its probe: the column
+        ships as a migration, and migrations land ahead of the code that
+        writes them, so its presence says nothing about whether a writer
+        exists. The phase runs unconditionally; this read turns a missing
+        column into a precondition failure instead of an attribution red.
+        """
+        ...
+
+    def sandbox_activating_client(self, sandbox_id: str) -> str | None:
+        """The activating client recorded on the sandbox row, empty when unset
+        and `None` when there's no row."""
+        ...
+
+    def sandbox_lifecycle(self, sandbox_id: str) -> str | None:
+        """The lifecycle stored on the sandbox row, `None` when there's no row."""
+        ...
+
+    def sandbox_pod_client_ids(self, sandbox_id: str) -> list[str]:
+        """The activating-client label of each of the sandbox's live pods (as the
+        live cap counts them), empty when a pod carries none."""
+        ...
+
+    def sandbox_live_pod_phases(self, sandbox_id: str) -> list[str]:
+        """The phase of each of the sandbox's live pods, as the live cap
+        counts them: terminal, deleting and stopped-materialization pods are
+        dropped, so a prior generation's pod can't speak for this one."""
+        ...
+
+    def live_client_sandboxes(self, client_id: str) -> list[str]:
+        """The client's live sandboxes, counted the way the live cap counts them."""
+        ...
+
+    def sandbox_node_slots(self) -> dict[str, SandboxNodeSlots]:
+        """Per sandbox-pool node: advertised and allocatable network slots and bound sandbox pods."""
+        ...
+
+    def acquire_worker_network_slots_mutation(self) -> Callable[[], None]: ...
+
+    def worker_network_pool_max_slots_env(self) -> str | None:
+        """The standing `SPACE_NODEMGR_NETWORK_POOL_MAX_SLOTS` literal on worker `node-manager`."""
+        ...
+
+    def set_worker_network_pool_max_slots_env(
+        self,
+        value: str | None,
+        *,
+        record: tuple[str | None, Mapping[str, int]] | None = None,
+        rollout_timeout: float = 300,
+        shared_deadline: bool = False,
+    ) -> None:
+        """Set or unset worker `SPACE_NODEMGR_NETWORK_POOL_MAX_SLOTS` under the held Leases."""
+        ...
+
+    def restore_worker_network_pool_max_slots_env(
+        self,
+        standing_env: str | None,
+        standing_capacities: Mapping[str, int],
+        *,
+        rollout_timeout: float = 300,
+        settle_timeout: float = 120,
+        shared_deadline: bool = False,
+    ) -> None:
+        """Restore `SPACE_NODEMGR_NETWORK_POOL_MAX_SLOTS`, await standing node capacities, and clear record."""
+        ...
+
+    def publish_node_ctl_facet(self, node_name: str, facet: str) -> str | None:
+        """Have node-ctl on `node_name` publish an outbound facet now; None on success."""
+        ...
+
+    def occupied_worker_network_slots_at_or_above(
+        self, min_slot_id: int
+    ) -> dict[str, tuple[OccupiedNetworkSlot, ...]]:
+        """Per sandbox worker node: `network_slots` rows at or above `min_slot_id` that block a shrink."""
+        ...
+
+    def unbound_sandbox_pods(self) -> list[str]:
+        """User sandbox pods no node has been bound to yet."""
+        ...
 
     def redis_replicas(self) -> int:
         """The Redis Deployment's current `.spec.replicas`, read without writing."""
@@ -541,7 +719,19 @@ class RateLimiterControl(Protocol):
 
     def wait_redis_unreachable(self, *, timeout: float) -> None: ...
 
-    def wait_redis_rollout(self, *, timeout: float) -> None: ...
+    def admin_force_delete_sandbox(self, sandbox_id: str) -> bool:
+        """Force-delete one sandbox through the admin API, not the run's ECW key;
+        whether the delete is confirmed done (`False` while it is still queued)."""
+        ...
+
+    def admin_force_delete_matching(self, metadata: Mapping[str, str]) -> list[str]:
+        """Force-delete every live sandbox whose metadata holds each pair; the ids
+        whose delete is queued but not yet confirmed done."""
+        ...
+
+    def wait_redis_rollout(self, *, timeout: float, shared_deadline: bool = False) -> None:
+        """`shared_deadline=True`: `timeout` bounds the rollout and its record clear together."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -1385,6 +1575,8 @@ class EcwSandboxes(Protocol):
         *,
         attempts: int = 10,
         interval_seconds: float = 1.0,
+        scan_whole_window: bool = False,
+        deadline: float | None = None,
     ) -> None: ...
 
     def list_pages(
@@ -1454,11 +1646,14 @@ class KindEnvironment(Protocol):
 
     def rust_build(self) -> str: ...
 
+    def drain_v2_enabled(self) -> bool: ...
+
     def substrate(self) -> str: ...
 
     def admin_request(
         self, method: str, resource: str, body: dict[str, object] | None = None,
         *, expected: tuple[int, ...] = (200, 201, 202, 204),
+        idempotency_key: str | None = None,
     ) -> Any: ...
 
     def seed_api_key(
@@ -1660,6 +1855,9 @@ class AdminNodeView:
     drain_phase: str | None
     drain_mode: str | None
     sandboxes_active: int | None
+    drain_last_error: str | None = None
+    # `v2` while a v2 drain, or its undrain's cancel, is recorded.
+    drain_engine: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1706,6 +1904,313 @@ class NodeDrainControl(NodeFaultControl, Protocol):
     def sandbox_residency(self, sandbox_id: str) -> SandboxResidency: ...
 
     def ready_full_snapshots(self, sandbox_id: str) -> list[SnapshotRecord]: ...
+
+
+@dataclass(frozen=True)
+class SandboxRowState:
+    """The `sandboxes` columns a node cleanup would change, and `updated_at`.
+
+    `updated_at` is trigger-maintained: an update that changes any column
+    other than `last_used_at`, `last_access_at` and `last_command_at` moves it.
+    """
+
+    sandbox_id: str
+    lifecycle: str
+    placement: str
+    active_node_id: str | None
+    target_node_id: str | None
+    updated_at: str
+
+
+class KindWorkerControl(NodeDrainControl, Protocol):
+    """Kind-only operations on a worker's instance and on the controller's env.
+
+    A scenario overrides cluster-controller Deployment env (closed key list,
+    closed value vocabulary) under the controller-mutation Lease, and puts
+    the captured standing values back. A Kind worker gets a fake AWS
+    providerID by re-registering its Node with the kubelet's `--provider-id`
+    rewritten, so its EC2 instance is recorded and Kind's fake EC2 can answer
+    for it. The node fault is named: stop one Kind worker's container, delete
+    its Kubernetes Node or keep it, and mark its instance terminated in the
+    fake EC2; then start the container again, under a new providerID for a
+    same-name replacement.
+    """
+
+    def acquire_controller_mutation(self) -> Callable[[], None]:
+        """Take the cluster-visible controller-deployment Lease; returns its release."""
+        ...
+
+    def drain_v2_switches(self) -> dict[str, str | None]:
+        """`SPACE_DRAIN_V2_ENABLED` as the bench's values rendered it, by
+        Deployment role (`api`, the public API that answers `:drain`, and
+        `controller`); None where unset."""
+        ...
+
+    def drain_v2_test_hooks(self) -> dict[str, str | None]:
+        """The literal value of each `SPACE_DRAIN_V2_TEST_*` hook on the
+        controller Deployment, None if unset."""
+        ...
+
+    def drain_v2_env(self) -> dict[str, str | None]:
+        """The literal value of every drain v2 env key on the controller Deployment."""
+        ...
+
+    def set_drain_v2_env(self, overrides: Mapping[str, str]) -> None:
+        """Apply smoke overrides and await the controller rollout; refuses keys or values off the lists."""
+        ...
+
+    def restore_drain_v2_env(self, standing: Mapping[str, str | None]) -> None:
+        """Put the captured literals back (None unsets), await the controller
+        rollout, and refuse unless the Deployment reads them back exactly."""
+        ...
+
+    def acquire_public_api_mutation(self) -> Callable[[], None]:
+        """Take the cluster-visible public-API-deployment Lease; returns its release."""
+        ...
+
+    def drain_v2_api_env(self) -> dict[str, str | None]:
+        """The literal value of every drain v2 env key on the public API Deployment."""
+        ...
+
+    def set_drain_v2_api_env(self, overrides: Mapping[str, str]) -> None:
+        """Apply the evacuation cap override and await the public API rollout,
+        under the caller's live public-API Lease; refuses keys or values off the list."""
+        ...
+
+    def restore_drain_v2_api_env(self, standing: Mapping[str, str | None]) -> None:
+        """Put the captured literals back (None unsets), await the rollout, and
+        refuse unless the Deployment reads them back exactly."""
+        ...
+
+    def kind_node_provider_id(self, node_name: str) -> str:
+        """The Kind worker's Node `spec.providerID`."""
+        ...
+
+    def set_kind_worker_provider_id(
+        self, node_name: str, provider_id: str, labels: Mapping[str, str], *, timeout: float
+    ) -> None:
+        """Re-register the running Kind worker's Node under `provider_id`, a
+        fake AWS providerID: rewrite the kubelet's `--provider-id`, delete the
+        Node, restart the kubelet, put back `labels`, and wait for the Node
+        and its node services to be Ready."""
+        ...
+
+    def fake_ec2_terminate(self, instance_id: str) -> None:
+        """Mark the instance terminated in Kind's fake EC2, through its loopback test control."""
+        ...
+
+    def set_fake_ec2_terminate_delay(self, seconds: int) -> None:
+        """How long each instance Kind's fake EC2 marks terminated from now on
+        reads `shutting-down` first (0 to 3600), through its loopback test
+        control; 0 puts the default back."""
+        ...
+
+    def release_fake_ec2_instance(self, instance_id: str) -> None:
+        """End the `shutting-down` delay of an instance Kind's fake EC2 already
+        marked terminated, so it reads `terminated` from now on, through its
+        loopback test control."""
+        ...
+
+    def fake_ec2_instance_state(self, instance_id: str) -> str:
+        """What Kind's fake EC2 lists for the instance ID, as DescribeInstances
+        answers it: its states, comma-separated, or `no instance`."""
+        ...
+
+    def node_recorded_instance(self, node_id: str) -> str | None:
+        """`node_k8s.instance_id` of the node, None when it records none or has no row."""
+        ...
+
+    def set_node_recorded_instance(self, node_id: str, instance_id: str | None) -> None:
+        """Write the node's `node_k8s.instance_id` directly: the stale instance
+        an older registration writer leaves across a Node UID change, which no
+        public path sets up. A fake instance id, or None."""
+        ...
+
+    def restore_kind_worker_provider_id(
+        self, node_name: str, labels: Mapping[str, str], *, timeout: float
+    ) -> None:
+        """Re-register the worker under Kind's own providerID, which names no
+        EC2 instance; as `set_kind_worker_provider_id`, it deletes the pods on
+        the worker."""
+        ...
+
+    def node_row_exists(self, node_id: str) -> bool: ...
+
+    def creating_snapshots_from_node(self, node_id: str) -> list[str]:
+        """The ids of the snapshots still `creating` whose `source_node_id`
+        is the node, sorted."""
+        ...
+
+    def node_created_at(self, node_id: str) -> str | None:
+        """`nodes.created_at` of the node, as text; None without a row."""
+        ...
+
+    def kind_node_labels(self, node_name: str) -> dict[str, str]:
+        """The Kind worker's Node labels, which deleting the Node discards."""
+        ...
+
+    def stop_kind_worker(self, node_name: str, *, keep_node: bool = False) -> None:
+        """Stop the Kind worker's container, then delete its Kubernetes Node
+        unless `keep_node`, which leaves the Node behind its machine as a
+        cloud controller that lags would."""
+        ...
+
+    def kube_node_uid(self, node_name: str) -> str | None:
+        """The uid of the Kubernetes Node of that name, None when there is none."""
+        ...
+
+    def delete_kube_node(self, node_name: str, *, uid: str) -> None:
+        """Delete the Kubernetes Node of that name with a uid precondition, so
+        a replacement under the same name is never the one deleted."""
+        ...
+
+    def start_kind_worker(
+        self,
+        node_name: str,
+        labels: Mapping[str, str],
+        *,
+        timeout: float,
+        provider_id: str | None = None,
+    ) -> None:
+        """Start the Kind worker's container, under `provider_id` when given
+        (the kubelet's `--provider-id` rewritten while it is stopped), put
+        back the `labels` its re-registered Node lacks as soon as it exists,
+        then wait, each with the whole `timeout`, for the Node and the node
+        services on it to be Ready."""
+        ...
+
+    def sandbox_row_states(self, sandbox_ids: Sequence[str]) -> list[SandboxRowState]: ...
+
+
+@dataclass(frozen=True)
+class NodeCliOutcome:
+    """A `space-sbxmgr` call on a node, as it ended."""
+
+    exit_code: int
+    stdout: str
+    stderr: str
+
+
+@dataclass(frozen=True)
+class DrainV2Status:
+    """`nodes.drain_engine` and `nodes.drain_status` of one node; `status` is the JSON object."""
+
+    engine: str | None
+    status: dict[str, Any] | None
+
+
+class DrainV2Control(KindWorkerControl, Protocol):
+    """Kind-only operations for the drain v2 scenarios, with the controller's
+    drain env and the Kind worker's instance, stop and replacement."""
+
+    def drain_node_v2(self, node_id: str, *, hold_seconds: int) -> None:
+        """`POST :drain` with `engine: v2` and the hold, in seconds (0: due
+        now); refused unless the API accepts it."""
+        ...
+
+    def sandbox_pods(self, sandbox_id: str) -> list[SandboxPodView]:
+        """Every execution pod of the sandbox, bound or not, as the apiserver shows it."""
+        ...
+
+    def drain_node_answer(self, node_id: str, body: Mapping[str, object]) -> CallAnswer:
+        """`POST :drain` with `body`, answered as it came."""
+        ...
+
+    def admin_node_drain(self, node_id: str) -> dict[str, Any] | None:
+        """The admin node response's `drain` view of a v2 drain; None when
+        the node has no v2 drain."""
+        ...
+
+    def drain_started_at(self, node_id: str) -> int | None:
+        """`nodes.drain_started_at` in whole Unix seconds; None when unset."""
+        ...
+
+    def drain_v2_status(self, node_id: str) -> DrainV2Status | None:
+        """The node's v2 drain columns; `None` once its row is gone."""
+        ...
+
+    def terminate_node(self, node_id: str) -> int:
+        """`POST :terminate`; the HTTP status it answered."""
+        ...
+
+    def drain_v2_preview(self, node_id: str) -> dict[str, Any]:
+        """`GET /nodes/{node_id}/drain-v2-preview`: what a v2 drain would find
+        on the node, which the node answers without changing anything."""
+        ...
+
+    def plant_orphan_cache_dir(self, node_name: str, sandbox_id: str) -> str:
+        """Make an empty sandbox cache directory named `sandbox_id` on the
+        Kind worker, as a sandbox the node lost track of leaves; its path."""
+        ...
+
+    def remove_orphan_cache_dir(self, node_name: str, sandbox_id: str) -> None:
+        """Remove what `plant_orphan_cache_dir` left: the quarantined row
+        sandbox-manager's inventory made of the directory, if it made one,
+        and the directory, if it is still there and empty."""
+        ...
+
+    def disk_snapshot_ids(self, sandbox_id: str) -> list[str]:
+        """The sandbox's disk snapshot ids."""
+        ...
+
+    def admin_sandbox_action_answer(self, sandbox_id: str, action: str) -> CallAnswer:
+        """An operator's `POST /admin/api/v1/sandboxes/{id}:force-<action>`
+        (`stop` or `kill`), answered as it came."""
+        ...
+
+    def admin_operation(self, operation_id: str) -> dict[str, Any]:
+        """The operation as `GET /admin/api/v1/operations/{id}` answers it."""
+        ...
+
+    def node_tombstoned(self, node_id: str) -> bool:
+        """Whether `node_k8s_tombstones` holds a tombstone for the node id."""
+        ...
+
+    def node_sandbox_state(self, node_name: str, sandbox_id: str) -> str | None:
+        """The sandbox's row state in that node's sandbox-manager, or None without a row."""
+        ...
+
+    def restart_node_service(self, node_name: str, component: str, *, timeout: float) -> str:
+        """Delete that node service's pod and wait for its Ready replacement on the same node."""
+        ...
+
+    def block_node_traffic(self, node_name: str, path: str) -> None:
+        """Cut one node-local path on the Kind node (`object-store`: its pods'
+        and host processes' connections to the object store are reset;
+        `node-api`: connections to its node-api go unanswered)."""
+        ...
+
+    def unblock_node_traffic(self, node_name: str, path: str) -> None:
+        """Remove exactly the rules `block_node_traffic` added for `path`."""
+        ...
+
+    def restart_controller(self, *, timeout: float) -> list[str]:
+        """Kill every cluster-controller pod at once and await Ready
+        replacements; the killed pods' names."""
+        ...
+
+    def scale_controller(self, replicas: int, *, timeout: float) -> int:
+        """Scale the cluster-controller Deployment (0..2) under the caller's
+        controller-mutation Lease and await it; the replicas it had."""
+        ...
+
+    def controller_replicas(self) -> int:
+        """The cluster-controller Deployment's desired replica count."""
+        ...
+
+    def sandbox_placements(self, sandbox_ids: Sequence[str]) -> dict[str, tuple[str, str | None]]:
+        """Each sandbox's lifecycle and active node id, by bare id, in one read."""
+        ...
+
+    def node_disk_snapshot(self, node_name: str, sandbox_id: str) -> str:
+        """`space-sbxmgr snapshot` (disk) of the sandbox on that node; the
+        snapshot's name."""
+        ...
+
+    def node_rollback(self, node_name: str, sandbox_id: str, snapshot: str) -> NodeCliOutcome:
+        """`space-sbxmgr rollback` of the sandbox to `snapshot` on that node,
+        as it ended."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -2664,6 +3169,7 @@ class ControllerLease:
 class ControllerPod:
     """One cluster-controller pod and its controller container's status.
 
+    `ready_changed_at` is when the pod's Ready condition last changed status;
     `started_at` is when the current container started; `last_exit_code` and
     `last_finished_at` describe the previous container, the one kubelet last
     restarted. Times are epoch seconds.
@@ -2673,6 +3179,7 @@ class ControllerPod:
     uid: str
     node: str
     ready: bool
+    ready_changed_at: float | None
     deleting: bool
     restart_count: int
     started_at: float | None
@@ -2696,18 +3203,6 @@ class NodeContainer:
     exit_code: int | None
 
 
-class ControllerLeaseWatch(Protocol):
-    """A running watch of the leadership Lease."""
-
-    def latest(self) -> ControllerLease | None:
-        """The delivered Lease with the newest `renewTime`, or None before the first."""
-        ...
-
-    def stop(self) -> None:
-        """End the watch; idempotent."""
-        ...
-
-
 class NodeExitWatch(Protocol):
     """A running watch of one node's container exits, read from its containerd."""
 
@@ -2728,11 +3223,12 @@ class LeaderElectionControl(TelemetryBackendControl, Protocol):
     """Kind-only operations for the cluster-controller leader-election scenario.
 
     The faults are a third contender Pod that runs the controller's own
-    pod template under a ServiceAccount with no `leases` grant, and the
-    control-plane apiserver's static-pod manifest moved out of kubelet's
-    manifest directory. Everything asserted is read from Kubernetes objects,
-    the node's container runtime, the readiness marker file the controller's
-    probe reads, or Prometheus.
+    pod template under a ServiceAccount with no `leases` grant, a budget
+    control that runs it against an unreachable API endpoint, and the healthy
+    replicas cut off from the apiserver in their own network namespaces.
+    Everything asserted is read from Kubernetes objects, the node's container
+    runtime, the readiness marker file the controller's probe reads, or
+    Prometheus.
     """
 
     def acquire_retention_sweeper_mutation(self) -> Callable[[], None]:
@@ -2751,6 +3247,15 @@ class LeaderElectionControl(TelemetryBackendControl, Protocol):
         """The literals of the settings that tick the histogram-recording reconcilers.
 
         Keyed by `leader_election.RECONCILER_TICK_ENV`; None when unset.
+        """
+        ...
+
+    def controller_metric_export_interval_seconds(self) -> float:
+        """The controller Deployment's OTLP metric export interval, as the binary reads it.
+
+        `OTEL_METRIC_EXPORT_INTERVAL` in milliseconds; unset or blank, the
+        SDKs' 10 s. Anything else is refused: such a controller exports no
+        metrics.
         """
         ...
 
@@ -2781,12 +3286,12 @@ class LeaderElectionControl(TelemetryBackendControl, Protocol):
         """
         ...
 
-    def controller_lease(self) -> ControllerLease | None:
-        """The leadership Lease, or None when it does not exist yet."""
+    def await_controller_rollout(self, *, timeout: float = 180) -> None:
+        """Wait for the controller Deployment's rollout to complete."""
         ...
 
-    def watch_controller_lease(self) -> ControllerLeaseWatch:
-        """Start watching the leadership Lease; every change it delivers is kept."""
+    def controller_lease(self, *, timeout: float = 15) -> ControllerLease | None:
+        """The leadership Lease, or None when it does not exist yet; one read bounded by `timeout`."""
         ...
 
     def controller_pods(
@@ -2795,19 +3300,24 @@ class LeaderElectionControl(TelemetryBackendControl, Protocol):
         """The healthy Deployment's pods, or the refused contender's."""
         ...
 
-    def place_budget_contender(self) -> None:
-        """Run the controller template with an unreachable pod-local API endpoint."""
+    def place_budget_contender(self, *, liveness_budget: str, lease_ttl: str) -> None:
+        """Run the controller template with an unreachable pod-local API endpoint.
+
+        Placed with the given budget and lease-TTL hooks rather than the
+        Deployment's, so it can start before the healthy replicas roll.
+        """
         ...
 
     def remove_budget_contender(self, *, wait: bool = False) -> None:
         """Delete this run's budget control without waiting for its teardown."""
         ...
 
-    def place_refused_contender(self) -> None:
+    def place_refused_contender(self, *, liveness_budget: str, lease_ttl: str) -> None:
         """Place one more pod of the controller's pod template without `leases` RBAC.
 
-        Returns once its gate container runs, holding the controller container
-        back until `release_refused_contender`. Refuses when the substitute
+        Placed with the given budget and lease-TTL hooks. Returns once its
+        gate container runs, holding the controller container back until
+        `release_refused_contender`. Refuses when the substitute
         ServiceAccount can read Leases, since every lease call then succeeds
         and nothing would be refused.
         """
@@ -2828,22 +3338,39 @@ class LeaderElectionControl(TelemetryBackendControl, Protocol):
         """Start recording the node's container exits as containerd reports them."""
         ...
 
-    def control_plane_node(self) -> str:
-        """The Kind node container that runs the apiserver's static pod."""
+    def apiserver_cut_targets(self) -> list[str]:
+        """The `ip:port` targets a cut REJECTs: the `kubernetes` Service's ClusterIPs and endpoints.
+
+        Refused as a configuration the cut cannot cover unless every
+        ClusterIP and endpoint is IPv4 and every EndpointSlice's
+        `addressType` is `IPv4`, or unless there is a ClusterIP and an
+        endpoint.
+        """
         ...
 
-    def apiserver_answers(self) -> bool:
-        """`/readyz` answers through the kube context within a few seconds."""
+    def cut_controllers_off_from_apiserver(
+        self, pod_names: Sequence[str], targets: Sequence[str], *, timeout: float
+    ) -> dict[str, tuple[float, float]]:
+        """REJECT each pod's connections to `targets`, in its own network namespace.
+
+        With `apiserver_cut_targets`, the pod's calls are refused as through
+        a ClusterIP with no apiserver behind it, while every other client
+        keeps the apiserver. The rule lives in the pod sandbox's namespace,
+        so it outlasts a container restart. Refuses a pod on its node's
+        network. Every lookup is made first; the pods are then cut in order,
+        each by one node exec bounded by `timeout` that applies its rules in
+        one transaction. Returns each pod's exec start and end, epoch
+        seconds: its cut took hold between them.
+        """
         ...
 
-    def park_apiserver(self, node_name: str) -> None:
-        """Move the apiserver's static-pod manifest out of kubelet's directory."""
-        ...
+    def reconnect_controller_to_apiserver(
+        self, node_name: str, pod_name: str, *, timeout: float | None = None
+    ) -> None:
+        """Remove the pod's cut, if any, in one node exec; idempotent.
 
-    def restore_apiserver(self, node_name: str, *, timeout: float = 30) -> None:
-        """Put a parked apiserver manifest back; a no-op when none is parked.
-
-        The node exec is bounded by `timeout`.
+        The exec is bounded by `timeout`, or by default by the bound cleanup
+        gives each of its requests.
         """
         ...
 

@@ -21,6 +21,7 @@ use pplx_space_credential_injection::proto::ResolvedNetworkCredential;
 use pplx_space_credential_injection_store::references::ReferenceState;
 use pplx_space_k8s_ids::K8sNodeUid;
 use pplx_space_net_common::EffectiveNetworkPolicyRef;
+use pplx_space_postgres_pool::{Db, DbError};
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 
 use crate::credential_injection_bundle::{
@@ -155,7 +156,7 @@ pub struct CredentialInjectionAuthority {
 
 impl CredentialInjectionAuthority {
     /// Construct the production Postgres-backed authority.
-    pub fn new(pool: sqlx::PgPool, materializer: CredentialInjectionBundleMaterializer) -> Self {
+    pub fn new(pool: Db, materializer: CredentialInjectionBundleMaterializer) -> Self {
         Self::from_state_reader(Arc::new(PgResolutionStateReader::new(pool)), materializer)
     }
 
@@ -258,7 +259,7 @@ pub(crate) enum BundleResolutionError {
     #[error("sandbox credential-resolution state is no longer current")]
     StaleCandidate,
     #[error("credential-injection resolution state is unavailable")]
-    StateUnavailable(#[source] sqlx::Error),
+    StateUnavailable(#[source] DbError),
     #[error("credential-injection resolution state is invalid: {0}")]
     InvalidState(&'static str),
     #[error(transparent)]

@@ -100,7 +100,7 @@ async fn a_registration_racing_a_delete_never_succeeds_over_or_loses_a_build() {
     // publishes the dir and before it writes the row.
     let (_fixture, hash) = stage(root.path(), "race-b");
     let published = root.path().join("race-b").join(&hash);
-    let db = Arc::clone(&service.db);
+    let db = service.db.clone();
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let parker = std::thread::spawn(move || {
@@ -160,7 +160,7 @@ async fn a_cancelled_registration_keeps_its_claim_until_its_row_is_written() {
 
     // Holding the DB parks the registration after it publishes the dir and
     // before it writes the row.
-    let db = Arc::clone(&service.db);
+    let db = service.db.clone();
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let parker = std::thread::spawn(move || {

@@ -549,7 +549,7 @@ impl TemplateDriver {
         // commits for a target that isn't the default at commit time. Taken
         // first, before the template row: nothing that holds a template row
         // waits on the policy row.
-        let default = pplx_space_runtime_environment_policy_store::share_lock_default(&mut tx)
+        let default = pplx_space_runtime_environment_policy_store::share_lock_default(&mut *tx)
             .await
             .map_err(|error| MoveError::database("reading the cluster default", error))?;
         if default != Some(campaign.to) {
@@ -577,7 +577,7 @@ impl TemplateDriver {
                 readers.holding, readers.workers
             )));
         }
-        let inserted = match releases::insert_twin(
+        let (inserted, new) = match releases::insert_twin(
             &mut tx,
             subject.id,
             target,
@@ -587,7 +587,8 @@ impl TemplateDriver {
         .await
         .map_err(|error| MoveError::database("inserting the twin", error))?
         {
-            InsertTwin::Inserted(twin) | InsertTwin::Existing(twin) => twin,
+            InsertTwin::Inserted(twin) => (twin, true),
+            InsertTwin::Existing(twin) => (twin, false),
             InsertTwin::OriginalGone => {
                 return Ok(Moved::Skipped(
                     "the release or its template went away".to_owned(),
@@ -612,6 +613,21 @@ impl TemplateDriver {
         tx.commit()
             .await
             .map_err(|error| MoveError::database("inserting the twin", error))?;
+        // The message contains the text registration logs its twins with
+        // (`RegisterTemplateRelease`), so one substring search finds both.
+        // `subject_id` is the release copied, as in `item finished`; after an
+        // earlier campaign it can itself be a twin, not the hash's original.
+        if new {
+            tracing::info!(
+                campaign_id = %campaign.id,
+                template_name = %subject.template_name,
+                hash = %subject.hash,
+                environment = %campaign.to,
+                release_id = %inserted,
+                subject_id = %subject.id,
+                "runtime_upgrade: inserted template release twin"
+            );
+        }
         Ok(Moved::Done)
     }
 

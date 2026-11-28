@@ -10,7 +10,9 @@ use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::fail_quiet_full_uploads_from_node;
+use super::{
+    FailedUpload, fail_inflight_uploads_from_gone_node, fail_quiet_full_uploads_from_node,
+};
 
 const SETTLE: Duration = Duration::from_mins(10);
 /// Past [`SETTLE`].
@@ -163,7 +165,7 @@ async fn fail_quiet_full_uploads_from_node_fails_only_the_nodes_dead_uploads() -
     .await?;
 
     let mut tx = pool.begin().await?;
-    fail_quiet_full_uploads_from_node(&mut tx, gone, &[lost], SETTLE).await?;
+    fail_quiet_full_uploads_from_node(&mut *tx, gone, &[lost], SETTLE).await?;
     tx.commit().await?;
 
     for (id, kind, state, expected) in sweep {
@@ -205,5 +207,166 @@ async fn fail_quiet_full_uploads_from_node_fails_only_the_nodes_dead_uploads() -
     .fetch_one(pool)
     .await?;
     assert!(queued);
+    Ok(())
+}
+
+const GONE_UID: &str = "uid-gone";
+const REASON: &str = "the upload worker died with the instance";
+
+/// A `draining` Kubernetes node registered under `uid`.
+async fn insert_draining_k8s_node(pool: &PgPool, node_id: NodeId, uid: Option<&str>) -> TestResult {
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state, drain_phase, drain_started_at)
+         VALUES ($1, '10.0.0.50'::inet, 'worker', 'k8s', 'ready', 'draining', NOW())"
+    ))
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid)
+         VALUES ($1, 'ip-10-0-0-50.ec2.internal', $2)"
+    ))
+    .bind(node_id)
+    .bind(uid)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn snapshot_state_and_reason(
+    pool: &PgPool,
+    id: SnapshotId,
+) -> TestResult<(String, Option<String>)> {
+    Ok(sqlx::query_as(sql!(
+        "SELECT state, failure_reason FROM snapshots WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Under the identity the caller observed, every `creating` full upload from
+/// the node is finalized `failed` with the reason, and returned; a recorded
+/// reason is kept. Other kinds and states, and uploads from another node, are
+/// untouched.
+#[tokio::test(flavor = "current_thread")]
+async fn fail_inflight_uploads_from_gone_node_fails_the_nodes_creating_full_uploads() -> TestResult
+{
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let gone = NodeId::new();
+    let live = NodeId::new();
+    insert_draining_k8s_node(pool, gone, Some(GONE_UID)).await?;
+    let sandbox = insert_sandbox(pool).await?;
+    let insert =
+        |node_id, kind, state| insert_snapshot(pool, sandbox, node_id, kind, state, FRESH, None);
+    let creating = insert(gone, SnapshotKind::Full, SnapshotState::Creating).await?;
+    let with_reason = insert(gone, SnapshotKind::Full, SnapshotState::Creating).await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots SET failure_reason = 'recorded by the worker' WHERE id = $1"
+    ))
+    .bind(with_reason)
+    .execute(pool)
+    .await?;
+    let ready = insert(gone, SnapshotKind::Full, SnapshotState::Ready).await?;
+    let other_node = insert(live, SnapshotKind::Full, SnapshotState::Creating).await?;
+    let disk = insert(gone, SnapshotKind::Disk, SnapshotState::Creating).await?;
+
+    let mut failed =
+        fail_inflight_uploads_from_gone_node(pool, gone, Some(GONE_UID), REASON).await?;
+    failed.sort_by_key(|row| row.snapshot_id.as_uuid());
+    let mut expected = vec![
+        FailedUpload {
+            snapshot_id: creating,
+            sandbox_id: sandbox,
+        },
+        FailedUpload {
+            snapshot_id: with_reason,
+            sandbox_id: sandbox,
+        },
+    ];
+    expected.sort_by_key(|row| row.snapshot_id.as_uuid());
+    assert_eq!(failed, expected);
+    assert_eq!(
+        snapshot_state_and_reason(pool, creating).await?,
+        ("failed".to_owned(), Some(REASON.to_owned()))
+    );
+    assert_eq!(
+        snapshot_state_and_reason(pool, with_reason).await?,
+        (
+            "failed".to_owned(),
+            Some("recorded by the worker".to_owned())
+        )
+    );
+    assert_eq!(snapshot_state(pool, ready).await?, "ready");
+    assert_eq!(snapshot_state(pool, other_node).await?, "creating");
+    assert_eq!(
+        snapshot_state_and_reason(pool, disk).await?,
+        ("creating".to_owned(), None)
+    );
+    Ok(())
+}
+
+/// The losing cases: a uid that changed since the caller observed it, a node
+/// that left `draining`, and a node with no row at all each match no row, the
+/// verb returns nothing, and the upload stays `creating` with no reason.
+#[tokio::test(flavor = "current_thread")]
+async fn fail_inflight_uploads_from_gone_node_changes_nothing_when_its_guards_refuse() -> TestResult
+{
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let node = NodeId::new();
+    insert_draining_k8s_node(pool, node, Some(GONE_UID)).await?;
+    let sandbox = insert_sandbox(pool).await?;
+    let upload = insert_snapshot(
+        pool,
+        sandbox,
+        node,
+        SnapshotKind::Full,
+        SnapshotState::Creating,
+        FRESH,
+        None,
+    )
+    .await?;
+    let untouched = ("creating".to_owned(), None);
+
+    for observed in [Some("uid-replacement"), None] {
+        let failed = fail_inflight_uploads_from_gone_node(pool, node, observed, REASON).await?;
+        assert!(failed.is_empty(), "observed uid {observed:?}");
+        assert_eq!(snapshot_state_and_reason(pool, upload).await?, untouched);
+    }
+
+    sqlx::query(sql!(
+        "UPDATE nodes SET drain_phase = 'drained' WHERE id = $1"
+    ))
+    .bind(node)
+    .execute(pool)
+    .await?;
+    let failed = fail_inflight_uploads_from_gone_node(pool, node, Some(GONE_UID), REASON).await?;
+    assert!(failed.is_empty(), "a node no longer draining");
+    assert_eq!(snapshot_state_and_reason(pool, upload).await?, untouched);
+
+    let unregistered = NodeId::new();
+    let orphan_upload = insert_snapshot(
+        pool,
+        sandbox,
+        unregistered,
+        SnapshotKind::Full,
+        SnapshotState::Creating,
+        FRESH,
+        None,
+    )
+    .await?;
+    let failed =
+        fail_inflight_uploads_from_gone_node(pool, unregistered, Some(GONE_UID), REASON).await?;
+    assert!(failed.is_empty(), "a node with no row");
+    assert_eq!(
+        snapshot_state_and_reason(pool, orphan_upload).await?,
+        untouched
+    );
     Ok(())
 }

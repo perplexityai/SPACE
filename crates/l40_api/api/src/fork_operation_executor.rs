@@ -480,15 +480,15 @@ impl ForkSandboxOperationExecutor {
             template,
             source_template_id: Some(source_template_id),
             runtime: None,
-            env: source.env.0,
-            metadata: source.metadata.0,
+            env: source.env,
+            metadata: source.metadata,
             vcpu: source.vcpu.and_then(|value| u32::try_from(value).ok()),
             memory_mib: source
                 .memory_mib
                 .and_then(|value| u32::try_from(value).ok()),
             disk_mib: source.disk_mib.and_then(|value| u32::try_from(value).ok()),
-            auto_lifecycle: source.auto_lifecycle.0,
-            network_policy: source.network_policy.map(|policy| policy.0),
+            auto_lifecycle: source.auto_lifecycle,
+            network_policy: source.network_policy,
         };
         let source_snapshot = if lifecycle == ForkSourceLifecycle::Suspended {
             Some(

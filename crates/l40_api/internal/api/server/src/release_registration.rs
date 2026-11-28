@@ -7,9 +7,6 @@
 //! is dropped.
 
 use pplx_space_accounts::OrgId;
-use pplx_space_sql_locator::sql;
-use pplx_space_template_release_original::digest_original;
-use std::sync::LazyLock;
 use tonic::Status;
 use uuid::Uuid;
 
@@ -82,7 +79,7 @@ pub(super) async fn ensure_template_release(
     hash: &str,
     org_id: Option<OrgId>,
     execution: Option<&ReleaseExecution>,
-) -> Result<TemplateReleaseRow, Status> {
+) -> Result<EnsuredRelease, Status> {
     // The original decides which of the digest's spellings (bare or
     // `sha256:`) the release lives under, as before twins. The partition
     // lookup prefers that stored spelling, and the insert uses it only, so a
@@ -104,7 +101,9 @@ pub(super) async fn ensure_template_release(
     )
     .await?
     {
-        return accept_existing_release(tx, existing, runtime, org_id, execution).await;
+        return accept_existing_release(tx, existing, runtime, org_id, execution)
+            .await
+            .map(EnsuredRelease::existing);
     }
     // A twin has its original's runtime and owner. The owner can differ: the
     // `(template_name, org_id)` foreign key doesn't check a release recorded
@@ -122,10 +121,14 @@ pub(super) async fn ensure_template_release(
         execution.map(|execution| &execution.json),
     )
     .await
+    .map_err(sqlx::Error::from)
     .map_err(|error| {
         crate::template_publication::storage_status("insert template release", &error)
     })? {
-        return Ok(TemplateReleaseRow::from(inserted));
+        return Ok(EnsuredRelease {
+            release: TemplateReleaseRow::from(inserted),
+            twin_of: original.map(|original| original.id),
+        });
     }
 
     // The insert conflicted: with a concurrent registration of the same
@@ -148,7 +151,27 @@ pub(super) async fn ensure_template_release(
             ))
         })?,
     };
-    accept_existing_release(tx, existing, runtime, org_id, execution).await
+    accept_existing_release(tx, existing, runtime, org_id, execution)
+        .await
+        .map(EnsuredRelease::existing)
+}
+
+/// The release [`ensure_template_release`] attached to or inserted.
+pub(super) struct EnsuredRelease {
+    pub(super) release: TemplateReleaseRow,
+    /// The original release's id when this registration inserted `release`
+    /// as its twin, which only a schema without the `(template_name, hash)`
+    /// index admits.
+    pub(super) twin_of: Option<Uuid>,
+}
+
+impl EnsuredRelease {
+    fn existing(release: TemplateReleaseRow) -> Self {
+        Self {
+            release,
+            twin_of: None,
+        }
+    }
 }
 
 /// The existing release a registration attaches to: with execution metadata,
@@ -233,6 +256,7 @@ async fn first_registered_release_id(
         hash,
     )
     .await
+    .map_err(sqlx::Error::from)
     .map_err(|err| crate::template_publication::storage_status("query template_release", &err))
 }
 
@@ -344,27 +368,18 @@ async fn find_original_release_row(
     template_name: &str,
     hash: &str,
 ) -> Result<Option<TemplateReleaseRow>, Status> {
-    /// Built once: every input is a literal or a bind placeholder.
-    static QUERY: LazyLock<String> = LazyLock::new(|| {
-        sql!(format!(
-            "SELECT r.id, r.template_name, r.type, r.hash, r.org_id, r.created_at,
-                    r.execution_metadata->>'environment' AS environment
-             FROM template_releases r
-             WHERE r.template_name = $1
-               AND r.hash IN ($2, $3)
-               AND {digest_original}",
-            digest_original = digest_original("r"),
-        ))
-    });
     let bare_hash = hash.trim_prefix("sha256:");
     let canonical_hash = format!("sha256:{bare_hash}");
-    sqlx::query_as::<_, TemplateReleaseRow>(sqlx::AssertSqlSafe(QUERY.as_str()))
-        .bind(template_name)
-        .bind(&canonical_hash)
-        .bind(bare_hash)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|err| crate::template_publication::storage_status("query template_release", &err))
+    pplx_space_template_release_store::registration::original_release(
+        &mut **tx,
+        template_name,
+        &canonical_hash,
+        bare_hash,
+    )
+    .await
+    .map(|release| release.map(TemplateReleaseRow::from))
+    .map_err(sqlx::Error::from)
+    .map_err(|err| crate::template_publication::storage_status("query template_release", &err))
 }
 
 /// The release of `template_name` stored under exactly `hash` in `partition`
@@ -402,6 +417,7 @@ async fn find_partition_release_row(
     )
     .await
     .map(|release| release.map(TemplateReleaseRow::from))
+    .map_err(sqlx::Error::from)
     .map_err(|err| crate::template_publication::storage_status("query template_release", &err))
 }
 
@@ -420,12 +436,11 @@ async fn check_template_release_execution_metadata(
 ) -> Result<MetadataCheck, Status> {
     // Fence the check and backfill against node publication and other writers,
     // including those that do not take the parent-template publication lock.
-    let existing: Option<serde_json::Value> = sqlx::query_scalar(sql!(
-        "SELECT execution_metadata FROM template_releases WHERE id = $1 FOR UPDATE"
-    ))
-    .bind(release_id)
-    .fetch_one(&mut **tx)
+    let existing = pplx_space_template_release_store::registration::lock_execution_metadata(
+        &mut **tx, release_id,
+    )
     .await
+    .map_err(sqlx::Error::from)
     .map_err(|error| {
         crate::template_publication::storage_status("lock release execution metadata", &error)
     })?;
@@ -455,6 +470,7 @@ async fn fill_release_execution_metadata(
         execution,
     )
     .await
+    .map_err(sqlx::Error::from)
     {
         Ok(_) => {
             savepoint.commit().await.map_err(|error| storage(&error))?;
@@ -518,23 +534,17 @@ pub(super) async fn twin_tags(
         .hash
         .strip_prefix("sha256:")
         .unwrap_or(&original.hash);
-    let rows = sqlx::query_as::<_, TemplateReleaseTagRow>(sql!(
-        "SELECT t.id, t.tag, t.created_at
-         FROM template_release_tags t
-         JOIN template_releases r ON r.id = t.template_release_id
-         WHERE t.template_name = $1
-           AND t.tag = ANY($2)
-           AND r.hash IN ($3, $4, 'sha256:' || $4)
-         ORDER BY t.tag
-         FOR SHARE OF t"
-    ))
-    .bind(&original.template_name)
-    .bind(tags)
-    .bind(&original.hash)
-    .bind(bare_hash)
-    .fetch_all(&mut **tx)
+    let rows = pplx_space_template_store::release_tags::share_lock_tags_of_digest(
+        &mut **tx,
+        &original.template_name,
+        tags,
+        &original.hash,
+        bare_hash,
+    )
     .await
-    .map_err(|err| crate::template_publication::storage_status("check twin tags", &err))?;
+    .map_err(|err| {
+        crate::template_publication::storage_status("check twin tags", &sqlx::Error::from(err))
+    })?;
     match tags
         .iter()
         .find(|tag| !rows.iter().any(|row| &row.tag == *tag))
@@ -543,6 +553,13 @@ pub(super) async fn twin_tags(
             "tag '{tag}' doesn't name this release; a registration that attaches to a release \
              other than its hash's original confirms tags already on the hash and writes none"
         ))),
-        None => Ok(rows),
+        None => Ok(rows
+            .into_iter()
+            .map(|row| TemplateReleaseTagRow {
+                id: row.id,
+                tag: row.tag,
+                created_at: row.created_at,
+            })
+            .collect()),
     }
 }

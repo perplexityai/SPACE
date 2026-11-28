@@ -1,3 +1,5 @@
+mod plan;
+
 use pplx_space_accounts::{OrgId, UserId};
 
 use std::time::Duration;
@@ -1839,7 +1841,7 @@ async fn store_claims_oldest_ready_slot_once() -> TestResult {
 
     let mut tx = fixture.pool.begin().await?;
     let claimed = WarmPoolStore::claim_ready_slot(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         vcpu,
         memory,
@@ -1918,7 +1920,7 @@ async fn store_claims_exclude_oversized_disks_without_consuming_slots() -> TestR
             let mut tx = fixture.pool.begin().await?;
             let claim = if exact_shape {
                 WarmPoolStore::claim_ready_slot(
-                    &mut tx,
+                    &mut *tx,
                     release_id,
                     vcpu,
                     memory,
@@ -1929,7 +1931,7 @@ async fn store_claims_exclude_oversized_disks_without_consuming_slots() -> TestR
                 .await?
             } else {
                 WarmPoolStore::claim_ready_slot_for_release(
-                    &mut tx,
+                    &mut *tx,
                     release_id,
                     "space",
                     Uuid::now_v7(),
@@ -1987,7 +1989,7 @@ async fn store_claim_routes_by_encryptable_partition() -> TestResult {
     // While the config is plaintext, an encrypted claim must not touch it.
     let mut tx = fixture.pool.begin().await?;
     let encrypted_claim_on_plaintext = WarmPoolStore::claim_ready_slot(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         vcpu,
         memory,
@@ -2001,7 +2003,7 @@ async fn store_claim_routes_by_encryptable_partition() -> TestResult {
         "encrypted claim must not drain a plaintext pool"
     );
     let encrypted_shape_on_plaintext = WarmPoolStore::preferred_enabled_shape_for_release(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         "space",
         None,
@@ -2018,7 +2020,7 @@ async fn store_claim_routes_by_encryptable_partition() -> TestResult {
 
     let mut tx = fixture.pool.begin().await?;
     let plaintext_claim = WarmPoolStore::claim_ready_slot(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         vcpu,
         memory,
@@ -2032,7 +2034,7 @@ async fn store_claim_routes_by_encryptable_partition() -> TestResult {
         "plaintext claim must not see the encryptable pool"
     );
     let plaintext_release_claim = WarmPoolStore::claim_ready_slot_for_release(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         "space",
         Uuid::now_v7(),
@@ -2041,7 +2043,7 @@ async fn store_claim_routes_by_encryptable_partition() -> TestResult {
     .await?;
     assert!(plaintext_release_claim.is_none());
     let plaintext_shape = WarmPoolStore::preferred_enabled_shape_for_release(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         "space",
         None,
@@ -2054,7 +2056,7 @@ async fn store_claim_routes_by_encryptable_partition() -> TestResult {
     );
 
     let encrypted_shape = WarmPoolStore::preferred_enabled_shape_for_release(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         "space",
         None,
@@ -2063,7 +2065,7 @@ async fn store_claim_routes_by_encryptable_partition() -> TestResult {
     .await?;
     assert!(encrypted_shape.is_some());
     let encrypted_claim = WarmPoolStore::claim_ready_slot(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         vcpu,
         memory,
@@ -2097,7 +2099,7 @@ async fn manual_pool_creation_uses_platform_limits_and_updates_preserve_assignme
         encryptable: false,
     };
     let mut tx = fixture.pool.begin().await?;
-    let id = WarmPoolStore::upsert_manual_config(&mut tx, release_id, &spec).await?;
+    let id = WarmPoolStore::upsert_manual_config(&mut *tx, release_id, &spec).await?;
     tx.commit().await?;
     let created = fixture.store.config_with_counts(id).await?.unwrap();
     let defaults = pplx_space_execution_spec::DiskIoLimits::default();
@@ -2123,7 +2125,7 @@ async fn manual_pool_creation_uses_platform_limits_and_updates_preserve_assignme
     .await?;
     let mut tx = fixture.pool.begin().await?;
     assert_eq!(
-        WarmPoolStore::upsert_manual_config(&mut tx, release_id, &spec).await?,
+        WarmPoolStore::upsert_manual_config(&mut *tx, release_id, &spec).await?,
         id
     );
     tx.commit().await?;
@@ -2160,7 +2162,7 @@ async fn store_manual_upsert_fences_encryptable_partition() -> TestResult {
     };
 
     let mut tx = fixture.pool.begin().await?;
-    let err = WarmPoolStore::upsert_manual_config(&mut tx, template_release_id, &spec)
+    let err = WarmPoolStore::upsert_manual_config(&mut *tx, template_release_id, &spec)
         .await
         .expect_err("encryptable specs must be fenced in the store");
     assert!(matches!(err, PoolError::EncryptableConfigFenced));
@@ -2239,7 +2241,7 @@ async fn store_claim_skips_slot_with_stale_disk_io_assignment() -> TestResult {
 
     let mut tx = fixture.pool.begin().await?;
     let claimed = WarmPoolStore::claim_ready_slot(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         vcpu,
         memory,
@@ -2329,7 +2331,7 @@ async fn store_claim_ready_slot_skips_ready_slot_without_pod_ip() -> TestResult 
     // act
     let mut tx = fixture.pool.begin().await?;
     let claimed = WarmPoolStore::claim_ready_slot(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         vcpu,
         memory,
@@ -2385,7 +2387,7 @@ async fn store_claim_ready_slot_skips_other_namespaces() -> TestResult {
     // act
     let mut tx = fixture.pool.begin().await?;
     let claimed = WarmPoolStore::claim_ready_slot(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         vcpu,
         memory,
@@ -2460,7 +2462,7 @@ async fn store_claim_ready_slot_for_release_skips_ready_slot_without_pod_ip() ->
     // act
     let mut tx = fixture.pool.begin().await?;
     let claimed = WarmPoolStore::claim_ready_slot_for_release(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         "space",
         claim_id,
@@ -2544,7 +2546,7 @@ async fn store_delete_open_slot_skips_claimed_slot() -> TestResult {
     .await?;
     let mut tx = fixture.pool.begin().await?;
     WarmPoolStore::claim_ready_slot(
-        &mut tx,
+        &mut *tx,
         template_release_id,
         vcpu,
         memory,
@@ -2598,7 +2600,7 @@ async fn store_stale_unbound_claimed_slots_can_be_locked_and_deleted() -> TestRe
     .await?;
     let mut claim_tx = fixture.pool.begin().await?;
     WarmPoolStore::claim_ready_slot(
-        &mut claim_tx,
+        &mut *claim_tx,
         template_release_id,
         vcpu,
         memory,
@@ -2631,13 +2633,13 @@ async fn store_stale_unbound_claimed_slots_can_be_locked_and_deleted() -> TestRe
     let mut delete_tx = fixture.pool.begin().await?;
     assert!(
         WarmPoolStore::lock_stale_unbound_claimed_slot_for_delete(
-            &mut delete_tx,
+            &mut *delete_tx,
             slot.id,
             Duration::from_secs(5 * 60),
         )
         .await?
     );
-    assert!(WarmPoolStore::delete_locked_claimed_slot(&mut delete_tx, slot.id).await?);
+    assert!(WarmPoolStore::delete_locked_claimed_slot(&mut *delete_tx, slot.id).await?);
     delete_tx.commit().await?;
 
     let exists: bool = sqlx::query_scalar(
@@ -2681,7 +2683,7 @@ async fn store_stale_claimed_slot_exists_tracks_staleness_and_bind_stamp() -> Te
     .await?;
     let mut claim_tx = fixture.pool.begin().await?;
     WarmPoolStore::claim_ready_slot(
-        &mut claim_tx,
+        &mut *claim_tx,
         template_release_id,
         vcpu,
         memory,
@@ -2763,7 +2765,7 @@ async fn store_stale_claimed_slot_exists_tracks_staleness_and_bind_stamp() -> Te
     // invisible to the sweep.
     let mut bind_tx = fixture.pool.begin().await?;
     assert!(
-        WarmPoolStore::bind_claimed_slot(&mut bind_tx, claim_id, slot.reserved_sandbox_id).await?
+        WarmPoolStore::bind_claimed_slot(&mut *bind_tx, claim_id, slot.reserved_sandbox_id).await?
     );
     bind_tx.commit().await?;
     assert!(
@@ -2805,7 +2807,7 @@ async fn store_cleanup_pending_slots_can_be_locked_and_deleted() -> TestResult {
     .await?;
     let mut claim_tx = fixture.pool.begin().await?;
     WarmPoolStore::claim_ready_slot(
-        &mut claim_tx,
+        &mut *claim_tx,
         template_release_id,
         vcpu,
         memory,
@@ -2816,7 +2818,7 @@ async fn store_cleanup_pending_slots_can_be_locked_and_deleted() -> TestResult {
     .await?;
     assert!(
         WarmPoolStore::mark_claimed_slot_cleanup_pending(
-            &mut claim_tx,
+            &mut *claim_tx,
             claim_id,
             reserved_sandbox_id,
         )
@@ -2833,8 +2835,8 @@ async fn store_cleanup_pending_slots_can_be_locked_and_deleted() -> TestResult {
     assert_eq!(cleanup_pending[0].state, PoolSlotState::CleanupPending);
 
     let mut delete_tx = fixture.pool.begin().await?;
-    assert!(WarmPoolStore::lock_cleanup_pending_slot_for_delete(&mut delete_tx, slot.id).await?);
-    assert!(WarmPoolStore::delete_locked_cleanup_pending_slot(&mut delete_tx, slot.id).await?);
+    assert!(WarmPoolStore::lock_cleanup_pending_slot_for_delete(&mut *delete_tx, slot.id).await?);
+    assert!(WarmPoolStore::delete_locked_cleanup_pending_slot(&mut *delete_tx, slot.id).await?);
     delete_tx.commit().await?;
 
     let exists: bool = sqlx::query_scalar(
@@ -2881,7 +2883,7 @@ async fn store_delete_claimed_slot_for_retired_execution_deletes_claimed_slot() 
     .await?;
     let mut claim_tx = fixture.pool.begin().await?;
     WarmPoolStore::claim_ready_slot(
-        &mut claim_tx,
+        &mut *claim_tx,
         template_release_id,
         vcpu,
         memory,
@@ -2955,7 +2957,7 @@ async fn store_delete_claimed_slot_for_retired_execution_skips_open_and_cleanup_
     .await?;
     let mut claim_tx = fixture.pool.begin().await?;
     WarmPoolStore::claim_ready_slot(
-        &mut claim_tx,
+        &mut *claim_tx,
         template_release_id,
         vcpu,
         memory,
@@ -2966,7 +2968,7 @@ async fn store_delete_claimed_slot_for_retired_execution_skips_open_and_cleanup_
     .await?;
     assert!(
         WarmPoolStore::mark_claimed_slot_cleanup_pending(
-            &mut claim_tx,
+            &mut *claim_tx,
             claim_id,
             cleanup_pending_sandbox_id,
         )
@@ -3049,7 +3051,7 @@ async fn store_delete_claimed_slots_for_retired_executions_deletes_receipts_in_b
     let mut claim_tx = fixture.pool.begin().await?;
     let bound_claim_id = Uuid::now_v7();
     let bound_slot = WarmPoolStore::claim_ready_slot(
-        &mut claim_tx,
+        &mut *claim_tx,
         template_release_id,
         vcpu,
         memory,
@@ -3061,14 +3063,14 @@ async fn store_delete_claimed_slots_for_retired_executions_deletes_receipts_in_b
     .expect("bound slot claim must hit");
     assert!(
         WarmPoolStore::bind_claimed_slot(
-            &mut claim_tx,
+            &mut *claim_tx,
             bound_claim_id,
             bound_slot.reserved_sandbox_id
         )
         .await?
     );
     let claimed_slot = WarmPoolStore::claim_ready_slot(
-        &mut claim_tx,
+        &mut *claim_tx,
         template_release_id,
         vcpu,
         memory,
@@ -3083,9 +3085,9 @@ async fn store_delete_claimed_slots_for_retired_executions_deletes_receipts_in_b
     // act
     let mut conn = fixture.pool.acquire().await?;
     let no_ids_deleted =
-        WarmPoolStore::delete_claimed_slots_for_retired_executions(&mut conn, &[]).await?;
+        WarmPoolStore::delete_claimed_slots_for_retired_executions(&mut *conn, &[]).await?;
     let deleted = WarmPoolStore::delete_claimed_slots_for_retired_executions(
-        &mut conn,
+        &mut *conn,
         &[
             bound_slot.reserved_sandbox_id,
             claimed_slot.reserved_sandbox_id,
@@ -3350,7 +3352,7 @@ async fn store_reserved_sandbox_delete_lock_deletes_ready_slot() -> TestResult {
     // act
     let mut tx = fixture.pool.begin().await?;
     let locked = match WarmPoolStore::lock_open_slot_for_delete_by_reserved_sandbox_id(
-        &mut tx,
+        &mut *tx,
         reserved_sandbox_id,
     )
     .await?
@@ -3358,7 +3360,7 @@ async fn store_reserved_sandbox_delete_lock_deletes_ready_slot() -> TestResult {
         OpenPoolSlotDeleteLock::Locked(locked) => locked,
         other => panic!("expected locked slot, got {other:?}"),
     };
-    let deleted = WarmPoolStore::delete_locked_open_slot(&mut tx, locked.id).await?;
+    let deleted = WarmPoolStore::delete_locked_open_slot(&mut *tx, locked.id).await?;
     tx.commit().await?;
 
     // assert
@@ -3421,7 +3423,7 @@ async fn store_claim_ready_slot_only_locks_slots() -> TestResult {
 
     let mut first_tx = fixture.pool.begin().await?;
     let first_claim = WarmPoolStore::claim_ready_slot(
-        &mut first_tx,
+        &mut *first_tx,
         template_release_id,
         vcpu,
         memory,
@@ -3435,7 +3437,7 @@ async fn store_claim_ready_slot_only_locks_slots() -> TestResult {
     // act
     let mut second_tx = fixture.pool.begin().await?;
     let second_claim = WarmPoolStore::claim_ready_slot(
-        &mut second_tx,
+        &mut *second_tx,
         template_release_id,
         vcpu,
         memory,
@@ -3495,7 +3497,7 @@ async fn claim_slot_for_bind(
 ) -> TestResult {
     let mut claim_tx = fixture.pool.begin().await?;
     WarmPoolStore::claim_ready_slot(
-        &mut claim_tx,
+        &mut *claim_tx,
         template_release_id,
         VcpuCount::try_from_u32(2)?,
         MemorySize::mib(1024)?,
@@ -3541,9 +3543,9 @@ async fn store_bind_claimed_slot_stamps_bound_exactly_once() -> TestResult {
     // act
     let mut bind_tx = fixture.pool.begin().await?;
     let bound =
-        WarmPoolStore::bind_claimed_slot(&mut bind_tx, claim_id, reserved_sandbox_id).await?;
+        WarmPoolStore::bind_claimed_slot(&mut *bind_tx, claim_id, reserved_sandbox_id).await?;
     let rebound =
-        WarmPoolStore::bind_claimed_slot(&mut bind_tx, claim_id, reserved_sandbox_id).await?;
+        WarmPoolStore::bind_claimed_slot(&mut *bind_tx, claim_id, reserved_sandbox_id).await?;
     bind_tx.commit().await?;
 
     // assert: the stamp is a CAS — the second attempt finds no claimed row.
@@ -3573,7 +3575,7 @@ async fn store_stale_sweep_ignores_bound_slots() -> TestResult {
     .await?;
     claim_slot_for_bind(&fixture, template_release_id, claim_id).await?;
     let mut bind_tx = fixture.pool.begin().await?;
-    assert!(WarmPoolStore::bind_claimed_slot(&mut bind_tx, claim_id, reserved_sandbox_id).await?);
+    assert!(WarmPoolStore::bind_claimed_slot(&mut *bind_tx, claim_id, reserved_sandbox_id).await?);
     bind_tx.commit().await?;
     sqlx::query(
         "UPDATE kubernetes_pool_slots
@@ -3621,13 +3623,13 @@ async fn store_cleanup_pending_marks_bound_slot() -> TestResult {
     .await?;
     claim_slot_for_bind(&fixture, template_release_id, claim_id).await?;
     let mut bind_tx = fixture.pool.begin().await?;
-    assert!(WarmPoolStore::bind_claimed_slot(&mut bind_tx, claim_id, reserved_sandbox_id).await?);
+    assert!(WarmPoolStore::bind_claimed_slot(&mut *bind_tx, claim_id, reserved_sandbox_id).await?);
     bind_tx.commit().await?;
 
     // act: a failed prepare parks the bound slot as reconciler-owned work.
     let mut mark_tx = fixture.pool.begin().await?;
     let marked = WarmPoolStore::mark_claimed_slot_cleanup_pending(
-        &mut mark_tx,
+        &mut *mark_tx,
         claim_id,
         reserved_sandbox_id,
     )
@@ -3660,7 +3662,7 @@ async fn store_retired_execution_delete_removes_bound_slot() -> TestResult {
     .await?;
     claim_slot_for_bind(&fixture, template_release_id, claim_id).await?;
     let mut bind_tx = fixture.pool.begin().await?;
-    assert!(WarmPoolStore::bind_claimed_slot(&mut bind_tx, claim_id, reserved_sandbox_id).await?);
+    assert!(WarmPoolStore::bind_claimed_slot(&mut *bind_tx, claim_id, reserved_sandbox_id).await?);
     bind_tx.commit().await?;
 
     // act
@@ -3704,7 +3706,7 @@ async fn store_dead_claimed_drain_deletes_suspended_bound_slot() -> TestResult {
     .await?;
     claim_slot_for_bind(&fixture, template_release_id, claim_id).await?;
     let mut bind_tx = fixture.pool.begin().await?;
-    assert!(WarmPoolStore::bind_claimed_slot(&mut bind_tx, claim_id, reserved_sandbox_id).await?);
+    assert!(WarmPoolStore::bind_claimed_slot(&mut *bind_tx, claim_id, reserved_sandbox_id).await?);
     bind_tx.commit().await?;
     insert_sandbox_with_lifecycle(
         &fixture.pool,
@@ -3775,7 +3777,7 @@ async fn store_bind_source_reads_locked_identity_and_normalizes_pod_uid() -> Tes
         .await?;
     let mut claim_tx = fixture.pool.begin().await?;
     WarmPoolStore::claim_ready_slot(
-        &mut claim_tx,
+        &mut *claim_tx,
         template_release_id,
         vcpu,
         memory,
@@ -3789,9 +3791,9 @@ async fn store_bind_source_reads_locked_identity_and_normalizes_pod_uid() -> Tes
 
     // act
     let mut bind_tx = fixture.pool.begin().await?;
-    let source = WarmPoolStore::bind_source(&mut bind_tx, claim_id, reserved_sandbox_id).await?;
+    let source = WarmPoolStore::bind_source(&mut *bind_tx, claim_id, reserved_sandbox_id).await?;
     let missing =
-        WarmPoolStore::bind_source(&mut bind_tx, Uuid::now_v7(), reserved_sandbox_id).await?;
+        WarmPoolStore::bind_source(&mut *bind_tx, Uuid::now_v7(), reserved_sandbox_id).await?;
     bind_tx.commit().await?;
 
     // assert: identity columns come back, and a blank pod_uid is normalized
@@ -5157,7 +5159,7 @@ async fn a_twin_gets_copies_of_its_originals_manual_configs() -> TestResult {
         encryptable: false,
     };
     let mut tx = fixture.pool.begin().await?;
-    WarmPoolStore::upsert_manual_config(&mut tx, original, &spec).await?;
+    WarmPoolStore::upsert_manual_config(&mut *tx, original, &spec).await?;
     tx.commit().await?;
     sqlx::query(
         "INSERT INTO kubernetes_pool_configs (
@@ -5177,18 +5179,18 @@ async fn a_twin_gets_copies_of_its_originals_manual_configs() -> TestResult {
     .await?;
 
     assert_eq!(
-        WarmPoolStore::copy_manual_configs_to_release(
+        WarmPoolStore::copy_manual_configs_from_releases(
             &mut *fixture.pool.acquire().await?,
-            original,
+            &[original],
             twin
         )
         .await?,
         1
     );
     assert_eq!(
-        WarmPoolStore::copy_manual_configs_to_release(
+        WarmPoolStore::copy_manual_configs_from_releases(
             &mut *fixture.pool.acquire().await?,
-            original,
+            &[original],
             twin
         )
         .await?,
@@ -5265,7 +5267,7 @@ async fn a_twin_copy_takes_over_the_autoscalers_config_of_a_manual_shape() -> Te
     let mut tx = fixture.pool.begin().await?;
     for (vcpu, memory_mib, target_ready_slots) in [(4, 2048, 3), (8, 4096, 5)] {
         WarmPoolStore::upsert_manual_config(
-            &mut tx,
+            &mut *tx,
             original,
             &ManualPoolConfigSpec {
                 vcpu,
@@ -5303,9 +5305,9 @@ async fn a_twin_copy_takes_over_the_autoscalers_config_of_a_manual_shape() -> Te
     .execute(&fixture.pool)
     .await?;
 
-    WarmPoolStore::copy_manual_configs_to_release(
+    WarmPoolStore::copy_manual_configs_from_releases(
         &mut *fixture.pool.acquire().await?,
-        original,
+        &[original],
         twin,
     )
     .await?;
@@ -5324,6 +5326,164 @@ async fn a_twin_copy_takes_over_the_autoscalers_config_of_a_manual_shape() -> Te
             (4, 2048, Some(8192), 3, true, "manual".to_owned()),
             (8, 4096, None, 9, false, "manual".to_owned()),
         ]
+    );
+    Ok(())
+}
+
+/// A ready slot on a node with a v2 drain, in any phase or being cancelled,
+/// or with a drain engine this build doesn't know, is never claimed, though
+/// it is the oldest, by a shape's claim or a release's. A v1 drain's node, in
+/// any phase, is claimed as before, oldest first, and so is an undrained one
+/// and a slot with no node name; with only those slots left the claim finds
+/// none.
+#[tokio::test(flavor = "current_thread")]
+async fn a_slot_on_a_v2_draining_node_is_never_claimed() -> TestResult {
+    for by_release in [false, true] {
+        a_slot_on_a_v2_draining_node_is_never_claimed_by(by_release).await?;
+    }
+    Ok(())
+}
+
+async fn a_slot_on_a_v2_draining_node_is_never_claimed_by(by_release: bool) -> TestResult {
+    let fixture = postgres_fixture().await?;
+    let template = TemplateName::parse("seed")?;
+    let (template_release_id, config_id, content_hash) =
+        seed_pool_config(&fixture.pool, 0x12).await?;
+    let (vcpu, memory) = default_shape()?;
+    // Oldest first: every v2 drain phase and a v2 drain being cancelled, an
+    // engine this build doesn't know with no phase, every v1 drain phase,
+    // then an undrained node.
+    let nodes = [
+        ("worker-v2-draining", Some("draining"), Some("v2")),
+        ("worker-v2-drained", Some("drained"), Some("v2")),
+        ("worker-v2-terminating", Some("terminating"), Some("v2")),
+        ("worker-v2-cancelling", None, Some("v2")),
+        ("worker-unknown-engine", None, Some("v9")),
+        ("worker-v1-draining", Some("draining"), None),
+        ("worker-v1-drained", Some("drained"), None),
+        ("worker-v1-terminating", Some("terminating"), None),
+        ("worker-undrained", None, None),
+    ];
+    let mut slots = Vec::new();
+    for (index, (node_name, phase, engine)) in nodes.into_iter().enumerate() {
+        let node_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO nodes (id, address, role, managed_by, state, drain_phase, drain_engine)
+             VALUES ($1, '10.0.0.50', 'worker', 'k8s', 'registered', $2, $3)",
+        )
+        .bind(node_id)
+        .bind(phase)
+        .bind(engine)
+        .execute(&fixture.pool)
+        .await?;
+        sqlx::query("INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, $2)")
+            .bind(node_id)
+            .bind(node_name)
+            .execute(&fixture.pool)
+            .await?;
+        let slot = fixture
+            .store
+            .insert_warming_slot(NewPoolSlot {
+                reserved_sandbox_id: SandboxId::new(),
+                ..new_slot(
+                    config_id,
+                    template_release_id,
+                    &template,
+                    content_hash,
+                    vcpu,
+                    memory,
+                    &format!("space-sbx-drain-{index}-g1"),
+                )
+            })
+            .await?;
+        sqlx::query(
+            "UPDATE kubernetes_pool_slots
+             SET state = 'ready',
+                 ready_at = NOW() - make_interval(secs => 10 - $2),
+                 pod_uid = 'pod-uid',
+                 pod_ip = '10.90.0.8',
+                 k8s_node_name = $3
+             WHERE id = $1",
+        )
+        .bind(slot.id)
+        .bind(index as i32)
+        .bind(node_name)
+        .execute(&fixture.pool)
+        .await?;
+        slots.push(slot.id);
+    }
+    // The newest: a ready slot whose pod has no node name yet.
+    let nameless = fixture
+        .store
+        .insert_warming_slot(NewPoolSlot {
+            reserved_sandbox_id: SandboxId::new(),
+            ..new_slot(
+                config_id,
+                template_release_id,
+                &template,
+                content_hash,
+                vcpu,
+                memory,
+                "space-sbx-drain-nameless-g1",
+            )
+        })
+        .await?;
+    sqlx::query(
+        "UPDATE kubernetes_pool_slots
+         SET state = 'ready',
+             ready_at = NOW() - make_interval(secs => 1),
+             pod_uid = 'pod-uid',
+             pod_ip = '10.90.0.8',
+             k8s_node_name = NULL
+         WHERE id = $1",
+    )
+    .bind(nameless.id)
+    .execute(&fixture.pool)
+    .await?;
+
+    let claim = || async {
+        let mut tx = fixture.pool.begin().await?;
+        let claimed = if by_release {
+            WarmPoolStore::claim_ready_slot_for_release(
+                &mut *tx,
+                template_release_id,
+                "space",
+                Uuid::now_v7(),
+                false,
+            )
+            .await?
+        } else {
+            WarmPoolStore::claim_ready_slot(
+                &mut *tx,
+                template_release_id,
+                vcpu,
+                memory,
+                "space",
+                Uuid::now_v7(),
+                false,
+            )
+            .await?
+        };
+        tx.commit().await?;
+        TestResult::Ok(claimed.map(|slot| slot.id))
+    };
+    for (index, node) in nodes.iter().enumerate().skip(5) {
+        assert_eq!(
+            claim().await?,
+            slots.get(index).copied(),
+            "by_release={by_release}: {}'s slot",
+            node.0
+        );
+    }
+    assert_eq!(
+        claim().await?,
+        Some(nameless.id),
+        "by_release={by_release}: the slot with no node name"
+    );
+    assert_eq!(
+        claim().await?,
+        None,
+        "by_release={by_release}: only v2 and unknown engines' slots are left"
     );
     Ok(())
 }

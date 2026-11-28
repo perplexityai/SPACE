@@ -1,9 +1,11 @@
 //! `reconciliation_status`: one row per node-ctl reconciler, with its
 //! schedule and the outcome of its last run.
 
-use rusqlite::{Connection, Result, params};
+use rusqlite::params;
 
 use pplx_space_sql_locator::sql;
+
+use crate::database::{Connection, Result};
 
 /// A reconciler's row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,7 +41,7 @@ pub struct FinishedRun<'a> {
 /// poll interval, clear its running flag and, when a run was left running,
 /// make it due now.
 pub fn register(conn: &Connection, name: &str, poll_interval_secs: i64, now: i64) -> Result<()> {
-    conn.execute(
+    conn.0.execute(
         sql!(
             "INSERT INTO reconciliation_status
                  (name, poll_interval_secs, next_due_at, running, updated_at)
@@ -61,7 +63,7 @@ pub fn register(conn: &Connection, name: &str, poll_interval_secs: i64, now: i64
 
 /// Set the reconciler's next due time.
 pub fn set_next_due(conn: &Connection, name: &str, next_due_at: i64, now: i64) -> Result<()> {
-    conn.execute(
+    conn.0.execute(
         sql!(
             "UPDATE reconciliation_status
              SET next_due_at = ?1,
@@ -75,7 +77,7 @@ pub fn set_next_due(conn: &Connection, name: &str, next_due_at: i64, now: i64) -
 
 /// Record that the reconciler started a run at `now`.
 pub fn mark_started(conn: &Connection, name: &str, now: i64) -> Result<()> {
-    conn.execute(
+    conn.0.execute(
         sql!(
             "UPDATE reconciliation_status
              SET last_started_at = ?1,
@@ -90,7 +92,7 @@ pub fn mark_started(conn: &Connection, name: &str, now: i64) -> Result<()> {
 
 /// Record the outcome of the reconciler's run and clear its running flag.
 pub fn mark_finished(conn: &Connection, name: &str, run: &FinishedRun<'_>) -> Result<()> {
-    conn.execute(
+    conn.0.execute(
         sql!(
             "UPDATE reconciliation_status
              SET last_completed_at = ?1,
@@ -120,7 +122,7 @@ pub fn mark_finished(conn: &Connection, name: &str, run: &FinishedRun<'_>) -> Re
 
 /// Every reconciler's row, ordered by name.
 pub fn list(conn: &Connection) -> Result<Vec<ReconciliationStatusRow>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT name,
                 poll_interval_secs,
                 last_started_at,
@@ -152,5 +154,5 @@ pub fn list(conn: &Connection) -> Result<Vec<ReconciliationStatusRow>> {
             last_error: row.get(11)?,
         })
     })?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }

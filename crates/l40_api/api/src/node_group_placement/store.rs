@@ -79,6 +79,12 @@ pub enum NodeGroupCatalogError {
     },
 }
 
+impl From<pplx_space_postgres_pool::DbError> for NodeGroupCatalogError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 /// Read the catalog for one template name.
 ///
 /// `Ok(None)` means no `templates` row exists under that name — distinct from
@@ -86,7 +92,7 @@ pub enum NodeGroupCatalogError {
 /// a pool or a transaction connection so a caller already inside a transaction
 /// reads the same snapshot.
 pub async fn catalog_for_template(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
     template_name: &str,
 ) -> Result<Option<NodeGroupCatalog>, NodeGroupCatalogError> {
     // The statement, and why it filters what it does, is the node-group

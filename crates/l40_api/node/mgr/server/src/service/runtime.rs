@@ -7,6 +7,10 @@ use pplx_space_host_layout::paths;
 use pplx_space_linux_ids::LinuxPid;
 use pplx_space_sandbox_model::SandboxId;
 
+use crate::metrics::node_memory::{
+    MemoryAdmissionOutcome, admission_booked_growth, admission_decision,
+};
+
 pub(super) fn registered_firecracker_pid(
     run_dir: &Path,
     sandbox_id: &str,
@@ -115,6 +119,32 @@ pub(super) enum AllocateNewLeaseError {
     Slot(#[from] AllocateSlotError),
 }
 
+fn record_memory_admission_error(error: &MemoryAdmissionEvaluationError) {
+    let (outcome, booked_growth_mib) = match error {
+        MemoryAdmissionEvaluationError::NodeMemory(_) => {
+            (MemoryAdmissionOutcome::NodeMemoryUnobservable, None)
+        }
+        MemoryAdmissionEvaluationError::Admission(MemoryAdmissionError::InsufficientCapacity {
+            existing_growth_reserve_mib,
+            ..
+        }) => (
+            MemoryAdmissionOutcome::InsufficientCapacity,
+            Some(*existing_growth_reserve_mib),
+        ),
+        MemoryAdmissionEvaluationError::Admission(MemoryAdmissionError::RequirementOverflow {
+            existing_growth_reserve_mib,
+            ..
+        }) => (
+            MemoryAdmissionOutcome::RequirementOverflow,
+            Some(*existing_growth_reserve_mib),
+        ),
+    };
+    admission_decision(outcome);
+    if let Some(booked_growth_mib) = booked_growth_mib {
+        admission_booked_growth("host", booked_growth_mib);
+    }
+}
+
 impl NodeManagerService {
     pub(super) async fn allocate_new_lease(
         &self,
@@ -122,22 +152,32 @@ impl NodeManagerService {
         pod_netns: Option<&str>,
         sandbox_cgroup_memory_mib: u64,
     ) -> Result<SlotInfo, AllocateNewLeaseError> {
-        let observed_active_leases = self.pool.active_memory_reservations()?;
+        let observed_active_leases = self.pool.active_memory_reservations().inspect_err(|_| {
+            admission_decision(MemoryAdmissionOutcome::ReservationsUnobservable)
+        })?;
         let observation = self
             .memory_admission_config
             .observe_active_leases(&observed_active_leases, &self.memory_admission_sources)
             .await
-            .map_err(MemoryAdmissionEvaluationError::from)?;
+            .map_err(MemoryAdmissionEvaluationError::from)
+            .inspect_err(record_memory_admission_error)?;
         let allocation = {
             let _guard = self.memory_admission_lock.lock().await;
-            let active_leases_at_commit = self.pool.active_memory_reservations()?;
-            self.memory_admission_config
+            let active_leases_at_commit =
+                self.pool.active_memory_reservations().inspect_err(|_| {
+                    admission_decision(MemoryAdmissionOutcome::ReservationsUnobservable)
+                })?;
+            let measurement = self
+                .memory_admission_config
                 .check_new_allocation_at_commit(
                     sandbox_cgroup_memory_mib,
                     &observation,
                     &active_leases_at_commit,
                 )
-                .map_err(MemoryAdmissionEvaluationError::from)?;
+                .map_err(MemoryAdmissionEvaluationError::from)
+                .inspect_err(record_memory_admission_error)?;
+            admission_decision(MemoryAdmissionOutcome::Accepted);
+            admission_booked_growth("host", measurement.existing_growth_reserve_mib);
             self.pool.claim_allocation(
                 &sandbox_id.to_string(),
                 pod_netns,
@@ -430,6 +470,10 @@ impl NodeManagerService {
         let ns_name = info.ns_name();
 
         let ns_path = info.ns_path();
+        let external_address = match pod_netns {
+            Some(netns) => read_external_address(sandbox_id, netns).await,
+            None => None,
+        };
 
         Ok(Response::new(AllocateResponse {
             slot: info.slot,
@@ -442,6 +486,7 @@ impl NodeManagerService {
             slot_generation: info.generation,
             slot_label: info.slot_label(),
             sandbox_uid: info.sandbox_uid,
+            external_address,
         }))
     }
 
@@ -1260,3 +1305,18 @@ impl NodeManagerService {
 #[cfg(test)]
 #[cfg(target_os = "linux")]
 pub(super) mod tests;
+
+/// Best effort: a caller without the address falls back to its own source.
+async fn read_external_address(sandbox_id: &str, netns: String) -> Option<String> {
+    match tokio::task::spawn_blocking(move || net::external_ipv4(&netns)).await {
+        Ok(Ok(ip)) => Some(ip.to_string()),
+        Ok(Err(error)) => {
+            tracing::warn!(sandbox_id, %error, "failed to read external netns address");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(sandbox_id, %error, "external netns address read task failed");
+            None
+        }
+    }
+}

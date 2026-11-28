@@ -170,9 +170,9 @@ pub async fn serve_firewall_wake_for_test(
     let service = crate::NodeCtlService::new(
         tx.clone(),
         crate::ClusterReconcileTrigger::new(tx, ""),
-        Arc::new(std::sync::Mutex::new(
-            rusqlite::Connection::open_in_memory().expect("open in-memory SQLite"),
-        )),
+        pplx_space_node_ctl_store::database::SharedConnection::new(
+            pplx_space_node_ctl_store::database::Connection::open_in_memory(),
+        ),
         Some(wake),
     );
     let served = pplx_space_grpc_server::grpc_server_builder()

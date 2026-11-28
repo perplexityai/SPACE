@@ -1,5 +1,6 @@
 //! Durable authorization context for scoped storage credential exchange.
 
+use pplx_space_postgres_pool::{Db, DbError};
 use pplx_space_snapshot_model::SnapshotId;
 
 use std::str::FromStr;
@@ -9,7 +10,6 @@ use pplx_space_artifact_model::StorageUri;
 use pplx_space_content_digest::ContentHash;
 use pplx_space_k8s_ids::{K8sNodeName, K8sNodeUid};
 use pplx_space_sandbox_model::SandboxId;
-use pplx_space_sql_locator::sql;
 use pplx_space_template_model::TemplateName;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,7 +70,7 @@ pub struct StorageVendIdentity {
 #[derive(Debug, thiserror::Error)]
 pub enum StorageVendStoreError {
     #[error("storage credential authorization query failed: {0}")]
-    Query(#[from] sqlx::Error),
+    Query(#[from] DbError),
     #[error("stored storage vend provider is unsupported")]
     UnsupportedProvider,
 }
@@ -104,11 +104,11 @@ pub trait StorageVendStore: Send + Sync + 'static {
 }
 
 pub struct PgStorageVendStore {
-    pool: sqlx::PgPool,
+    pool: Db,
 }
 
 impl PgStorageVendStore {
-    pub fn new(pool: sqlx::PgPool) -> Self {
+    pub fn new(pool: Db) -> Self {
         Self { pool }
     }
 }
@@ -120,16 +120,12 @@ impl StorageVendStore for PgStorageVendStore {
         sandbox_id: SandboxId,
         snapshot_id: SnapshotId,
     ) -> Result<Option<SandboxStorageContext>, StorageVendStoreError> {
-        let row: Option<(uuid::Uuid, Option<String>)> = sqlx::query_as(sql!(
-            "SELECT s.org_id, o.snapshot_base_object_storage_uri
-             FROM sandboxes s
-             JOIN organizations o ON o.id = s.org_id
-             WHERE s.id = $1"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some((organization_id, current_snapshot_storage)) = row else {
+        let Some(pplx_space_sandbox_store::org_storage::SandboxOrgStorage {
+            organization_id,
+            snapshot_base_object_storage_uri: current_snapshot_storage,
+        }) = pplx_space_sandbox_store::org_storage::sandbox_org_storage(&self.pool, sandbox_id)
+            .await?
+        else {
             return Ok(None);
         };
 
@@ -145,7 +141,6 @@ impl StorageVendStore for PgStorageVendStore {
             uid: node.k8s_node_uid,
         })
         .collect();
-        let organization_id = OrgId::from_uuid(organization_id);
 
         let recorded_snapshot = pplx_space_snapshot_store::org_storage_location(
             &self.pool,

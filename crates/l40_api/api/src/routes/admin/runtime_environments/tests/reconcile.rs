@@ -57,7 +57,7 @@ async fn seed_nodes(pool: &PgPool) -> TestResult<Vec<NodeId>> {
 }
 
 /// Every queued trigger's node and reasons, by node: the whole table, which
-/// the crate's `queued_triggers` (by node id) can't show.
+/// the trigger-queue store's `queued_triggers` (by node id) can't show.
 async fn all_queued_triggers(pool: &PgPool) -> TestResult<Vec<(NodeId, Vec<String>)>> {
     Ok(sqlx::query_as(sql!(
         "SELECT node_id, reasons::TEXT[] FROM node_reconcile_triggers ORDER BY node_id"

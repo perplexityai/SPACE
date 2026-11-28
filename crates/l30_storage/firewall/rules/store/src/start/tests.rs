@@ -8,6 +8,7 @@ use pplx_space_db_test_fixtures::{
 use pplx_space_firewall_rules_model::{
     FirewallRuleRevision, Match, Name, PayloadHeader, Read, Rule, RuleId, Value, diff,
 };
+use pplx_space_postgres_pool::DbError;
 use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::{PgConnection, PgPool};
@@ -75,7 +76,8 @@ impl Targets for Fixture {
         }
         Ok(sqlx::query_scalar(sql!("SELECT id FROM nodes ORDER BY id"))
             .fetch_all(tx)
-            .await?)
+            .await
+            .map_err(DbError::from)?)
     }
 
     fn qualify(
@@ -104,7 +106,7 @@ async fn start_by(
         revision: revision.clone(),
         expected_adopted,
     };
-    let mut conn = pool.acquire().await?;
+    let mut conn = pool.acquire().await.map_err(DbError::from)?;
     start_with(&mut conn, &start, &mut targets).await
 }
 

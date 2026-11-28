@@ -47,7 +47,7 @@ async fn start(pool: &PgPool, node_id: NodeId, hold_seconds: i64) -> TestDbResul
     .bind(node_id)
     .execute(&mut *tx)
     .await?;
-    start_v2_drain(&mut tx, node_id, hold_seconds).await?;
+    start_v2_drain(&mut *tx, node_id, hold_seconds).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -73,7 +73,7 @@ async fn set(
 
 async fn admission(pool: &PgPool, node_id: NodeId) -> TestDbResult<V2StartAdmission> {
     let mut tx = pool.begin().await?;
-    let admission = admit_v2_start(&mut tx, node_id).await?;
+    let admission = admit_v2_start(&mut *tx, node_id).await?;
     tx.commit().await?;
     Ok(admission)
 }
@@ -258,7 +258,7 @@ async fn a_repeat_only_shortens_the_deadline() -> TestDbResult<()> {
     ] {
         let mut tx = pool.begin().await?;
         assert_eq!(
-            shorten_v2_hold(&mut tx, node_id, hold).await?,
+            shorten_v2_hold(&mut *tx, node_id, hold).await?,
             change,
             "{hold}"
         );
@@ -405,6 +405,66 @@ fn report_pending(pending: &[&str]) -> StoredV2Report {
             .collect(),
         ..StoredV2Report::default()
     }
+}
+
+/// The drained tick adds the durable rows it finds to `evacuated_total`,
+/// keeping those a report recorded, sorted and without repeats, and keeps
+/// the rest of the status; adding only ids the set holds writes nothing,
+/// and under another generation it adds nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn the_drained_tick_adds_to_the_evacuated_set_once() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let node_id = node(pool, true).await?;
+    start(pool, node_id, 600).await?;
+    let generation = generation_of(pool, node_id).await?;
+    let report = report_pending(&[]);
+    let recorded = "00000000-0000-4000-8000-0000000000b2".to_owned();
+    let unreported = "00000000-0000-4000-8000-0000000000a1".to_owned();
+    assert!(
+        record_v2_report(
+            pool,
+            node_id,
+            generation,
+            &report,
+            &[],
+            std::slice::from_ref(&recorded)
+        )
+        .await?
+    );
+    assert!(
+        add_v2_evacuated(
+            pool,
+            node_id,
+            generation,
+            &[recorded.clone(), unreported.clone()]
+        )
+        .await?
+    );
+    let status = status_of(pool, node_id).await?;
+    assert_eq!(
+        status.evacuated_total,
+        [unreported.clone(), recorded.clone()]
+    );
+    assert_eq!(status.report, Some(report));
+    assert!(
+        !add_v2_evacuated(pool, node_id, generation, std::slice::from_ref(&unreported)).await?,
+        "every id counted already: no write"
+    );
+    assert!(
+        !add_v2_evacuated(
+            pool,
+            node_id,
+            generation + 1,
+            &["00000000-0000-4000-8000-0000000000c3".to_owned()]
+        )
+        .await?
+    );
+    assert_eq!(
+        status_of(pool, node_id).await?.evacuated_total,
+        [unreported, recorded]
+    );
+    Ok(())
 }
 
 /// Each stored report adds the sandboxes it lists running to the drain's

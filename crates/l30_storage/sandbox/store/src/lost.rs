@@ -1,5 +1,6 @@
-//! Guarded writes for sandboxes given up as lost because the node holding
-//! their only copy is gone.
+//! Guarded writes, and the give-up's candidate lock, for sandboxes given up
+//! as lost because the node holding their only copy is gone, and the scan
+//! that finds the `started` ones ([`started_lost_candidates`]).
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
@@ -8,12 +9,12 @@ use pplx_space_sandbox_model::SandboxId;
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_portability::{
     inflight_suspend_upload_from_other_node_exists, snapshot_durable_for_source_release,
     started_restore_source_absent,
 };
 use pplx_space_sql_locator::sql;
-use sqlx::{Postgres, Transaction};
 
 /// Quiet period a same-node `creating` snapshot row must have sat without a
 /// worker heartbeat (`COALESCE(last_attempt_at, timestamp)`) before the
@@ -27,6 +28,91 @@ use sqlx::{Postgres, Transaction};
 /// one quiet for longer can no longer become `ready` and is finalized
 /// `failed` so the reap converges.
 pub const DEAD_UPLOAD_SETTLE: Duration = Duration::from_mins(10);
+
+/// A `started` Kubernetes sandbox whose recovery failed on a source node that
+/// may be gone, from [`started_lost_candidates`].
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct StartedLostCandidate {
+    #[sqlx(rename = "id")]
+    pub sandbox_id: SandboxId,
+    /// The active `recovery_failed` execution's generation.
+    pub generation: i64,
+    /// The source node, `sandboxes.active_node_id`.
+    pub active_node_id: NodeId,
+    /// Whether the source node's `nodes` row still exists.
+    pub node_row_exists: bool,
+    pub k8s_node_name: Option<String>,
+    pub k8s_node_uid: Option<String>,
+}
+
+/// One keyset page, ordered by id, of the candidates for
+/// [`mark_started_lost`]: at most `limit` rows strictly after `after`
+/// (`None` starts a scan), each with its source node's `nodes` and
+/// `node_k8s` identity when those rows exist. `dead_upload_settle` is the
+/// settle window of [`started_restore_source_absent`].
+///
+/// The execution must track no pod. A recovery that materialized a
+/// replacement pod records its identity before the pod's placement moves
+/// `active_node_id`, so a tracked pod may be live on another node; the
+/// failed-recovery convergence likewise waits for an authoritative absence
+/// check to clear it.
+///
+/// A sandbox whose source node is in any drain phase is left to `node_drain`
+/// and `drained_node_terminator`, which own residents of a drained node. The
+/// restore-source condition is the one the flip re-checks
+/// ([`started_restore_source_absent`]).
+///
+/// A plain read; the settle window compares with `NOW()`, so it reads the
+/// clock of the executor's transaction.
+pub async fn started_lost_candidates(
+    executor: impl Executor<'_>,
+    after: Option<SandboxId>,
+    limit: u32,
+    dead_upload_settle: Duration,
+) -> Result<Vec<StartedLostCandidate>, DbError> {
+    /// Built once: every input is a literal or a bind placeholder.
+    static LIST_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
+        let no_restore_source = started_restore_source_absent("s", "$4");
+        sql!(
+            format!(
+                "SELECT s.id,
+                        e.generation,
+                        s.active_node_id,
+                        n.id IS NOT NULL AS node_row_exists,
+                        nk.k8s_node_name,
+                        nk.k8s_node_uid
+                   FROM sandboxes s
+                   JOIN sandbox_k8s_executions e
+                     ON e.sandbox_id = s.id
+                    AND e.active
+                    AND e.state = 'recovery_failed'
+                    AND NULLIF(BTRIM(e.pod_uid), '') IS NULL
+                    AND e.pod_ip IS NULL
+                    AND e.k8s_node_name IS NULL
+                   LEFT JOIN nodes n ON n.id = s.active_node_id
+                   LEFT JOIN node_k8s nk ON nk.node_id = n.id
+                  WHERE s.managed_by = $1
+                    AND s.lifecycle = 'started'
+                    AND s.active_node_id IS NOT NULL
+                    AND (n.id IS NULL OR (n.managed_by = $1 AND n.drain_phase IS NULL))
+                    AND ($2::UUID IS NULL OR s.id > $2)
+                    AND {no_restore_source}
+                  ORDER BY s.id
+                  LIMIT $3"
+            )
+            .as_str()
+        )
+    });
+    Ok(
+        sqlx::query_as(sqlx::AssertSqlSafe(LIST_CANDIDATES.as_str()))
+            .bind(SubstrateKind::Kubernetes)
+            .bind(after)
+            .bind(i64::from(limit))
+            .bind(dead_upload_settle.as_secs().cast_signed())
+            .fetch_all(executor.into_sqlx())
+            .await?,
+    )
+}
 
 /// The guarded flip of `sandboxes` from `started` to `failed`. Returns
 /// whether the row flipped.
@@ -43,13 +129,18 @@ pub const DEAD_UPLOAD_SETTLE: Duration = Duration::from_mins(10);
 /// that the node is still gone, and, in the same transaction, the write-off:
 /// `pplx_space_snapshot_store::lost::fail_quiet_full_uploads_from_node`, then
 /// [`write_off_lost_sandboxes`].
-pub async fn mark_started_lost(
-    tx: &mut Transaction<'_, Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn mark_started_lost<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     source_node_id: NodeId,
     generation: i64,
     dead_upload_settle: Duration,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     /// Built once: every input is a literal or a bind placeholder.
     static MARK_STARTED_LOST: LazyLock<String> = LazyLock::new(|| {
         let no_restore_source = started_restore_source_absent("s", "$4");
@@ -83,7 +174,7 @@ pub async fn mark_started_lost(
         .bind(generation)
         .bind(dead_upload_settle.as_secs().cast_signed())
         .bind(SubstrateKind::Kubernetes)
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?
         .rows_affected();
     Ok(flipped == 1)
@@ -97,10 +188,10 @@ pub async fn mark_started_lost(
 ///
 /// Guarded only by `lifecycle = 'failed'`: the caller flips the rows in the
 /// same transaction and holds their locks.
-pub async fn release_lost_placement(
-    tx: &mut Transaction<'_, Postgres>,
-    ids: &[SandboxId],
-) -> Result<(), sqlx::Error> {
+async fn release_lost_placement<C>(tx: &mut C, ids: &[SandboxId]) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "UPDATE sandboxes
             SET placement = 'unplaced',
@@ -109,7 +200,7 @@ pub async fn release_lost_placement(
             AND lifecycle = 'failed'"
     ))
     .bind(ids)
-    .execute(&mut **tx)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -128,23 +219,28 @@ pub async fn release_lost_placement(
 ///   that can only deadlock against a census from the gone node itself.
 /// - **Executions.** The active execution is written off as `forgotten`, the
 ///   pod-tracking write-off state: its pod, if one ran, died with the node.
-/// - **Placement.** Released through [`release_lost_placement`], so the row
+/// - **Placement.** Released through `release_lost_placement`, so the row
 ///   stops pinning the gone node.
 ///
 /// Port exposures are left alone: re-queueing them for a terminal sandbox
 /// would only create work that can never apply.
-pub async fn write_off_lost_sandboxes(
-    tx: &mut Transaction<'_, Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn write_off_lost_sandboxes<C>(
+    tx: &mut C,
     node_id: NodeId,
     ids: &[SandboxId],
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "DELETE FROM node_local_backup_pending
           WHERE node_id = $1 AND sandbox_id = ANY($2)"
     ))
     .bind(node_id)
     .bind(ids)
-    .execute(&mut **tx)
+    .execute((&mut *tx).into_sqlx())
     .await?;
     sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
@@ -157,7 +253,7 @@ pub async fn write_off_lost_sandboxes(
             AND active"
     ))
     .bind(ids)
-    .execute(&mut **tx)
+    .execute((&mut *tx).into_sqlx())
     .await?;
     release_lost_placement(tx, ids).await
 }
@@ -198,7 +294,7 @@ pub async fn write_off_lost_sandboxes(
 /// The `EXISTS` guards re-check the node's `drained` + Kubernetes-managed
 /// phase and the `node_k8s.k8s_node_uid` identity (`IS NOT DISTINCT FROM
 /// $2`) **inside the UPDATE**, mirroring the terminator's
-/// `delete_drained_node_if_orphan_query`: a same-name kube replacement or an
+/// `drained_node::delete_if_orphan`: a same-name kube replacement or an
 /// admin undrain that lands after the EC2
 /// cross-check makes this match nothing, so the terminal flip can never
 /// outlive the observation that justified it.
@@ -259,6 +355,61 @@ pub fn mark_unrecoverable_sandboxes_lost_query() -> String {
     )
 }
 
+/// `$1` = node id. Built once: the fragment is
+/// [`snapshot_durable_for_source_release`] over a fixed alias.
+///
+/// The durability check is wrapped in a scalar subquery, `NOT (SELECT …)`: a
+/// bare `NOT EXISTS` is pullable, and the planner may realise it as a hash or
+/// merge anti-join over the whole `snapshots` ⋈ `snapshot_storage_locations`
+/// product. Inside a scalar subquery it stays a per-row `SubPlan`, whose
+/// `sn.sandbox_id = s.id` makes each execution an index probe. `FOR UPDATE`
+/// locks the rows of its own `FROM` list only, so it locks `sandboxes` rows and
+/// nothing else: the durability check is a sublink.
+static LOCK_UNRECOVERABLE_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
+    let durable = snapshot_durable_for_source_release("s");
+    sql!(format!(
+        "SELECT s.id
+           FROM sandboxes s
+          WHERE s.lifecycle = 'suspended'
+            AND s.target_node_id = $1
+            AND NOT (SELECT {durable})
+          ORDER BY s.id
+          FOR UPDATE"
+    ))
+});
+
+/// Lock the `suspended` sandboxes pinned to `node_id` that have no durable
+/// copy, in `id` order, and return their ids: the drained-node terminator's
+/// gone-node give-up claim, taken before [`mark_unrecoverable_sandboxes_lost`]
+/// so the flip can act only on rows it claimed.
+///
+/// It claims only rows without a durable copy, because those are the only rows
+/// [`mark_unrecoverable_sandboxes_lost`] can flip: the flip re-checks
+/// `AND NOT {durable}` on the claimed ids. A row that loses durability after
+/// the claim isn't claimed this tick; it still blocks the reap through the
+/// drain-gate blockers, so the next tick's give-up claims it.
+///
+/// The `FOR UPDATE` row locks last until the caller's transaction ends. They
+/// conflict with the `KEY SHARE` foreign-key lock a concurrent artifact backup
+/// insert takes on the sandbox row, which the flip's own `NO KEY UPDATE` lock
+/// does not.
+///
+/// The caller must pass its open transaction.
+pub async fn lock_unrecoverable_candidates<C>(
+    tx: &mut C,
+    node_id: NodeId,
+) -> Result<Vec<SandboxId>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(LOCK_UNRECOVERABLE_CANDIDATES.as_str()))
+            .bind(node_id)
+            .fetch_all(tx.into_sqlx())
+            .await?,
+    )
+}
+
 /// Fail the `claimed` `suspended` sandboxes pinned to a drained, gone node that
 /// have no recoverable copy anywhere ([`mark_unrecoverable_sandboxes_lost_query`]),
 /// returning the ids it flipped. `expected_uid` is the `node_k8s.k8s_node_uid`
@@ -267,25 +418,35 @@ pub fn mark_unrecoverable_sandboxes_lost_query() -> String {
 ///
 /// Writes an **inference**: the terminator's give-up on the cloud provider's
 /// verdict. Its node guards are snapshot reads, so it runs only in the
-/// transaction that claimed `claimed` and locked the `nodes` and `node_k8s`
-/// rows.
-pub async fn mark_unrecoverable_sandboxes_lost(
-    tx: &mut Transaction<'_, Postgres>,
+/// transaction that claimed `claimed` ([`lock_unrecoverable_candidates`]) and
+/// locked the `nodes` and `node_k8s` rows.
+///
+/// The caller must pass its open transaction.
+pub async fn mark_unrecoverable_sandboxes_lost<C>(
+    tx: &mut C,
     node_id: NodeId,
     expected_uid: Option<&str>,
     claimed: &[SandboxId],
     dead_upload_settle: Duration,
-) -> Result<Vec<SandboxId>, sqlx::Error> {
+) -> Result<Vec<SandboxId>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let query = mark_unrecoverable_sandboxes_lost_query();
-    sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(node_id)
-        .bind(expected_uid)
-        .bind(claimed)
-        .bind(dead_upload_settle.as_secs().cast_signed())
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_all(&mut **tx)
-        .await
+    Ok(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
+            .bind(node_id)
+            .bind(expected_uid)
+            .bind(claimed)
+            .bind(dead_upload_settle.as_secs().cast_signed())
+            .bind(SubstrateKind::Kubernetes)
+            .fetch_all(tx.into_sqlx())
+            .await?,
+    )
 }
+
+#[cfg(test)]
+mod giveup_claim_tests;
 
 #[cfg(test)]
 mod tests;

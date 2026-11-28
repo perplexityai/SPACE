@@ -3,6 +3,7 @@
 //! writer that asked for it, and the claimant's read of a ref it holds.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 
 /// What an enqueue does to a ref that is already queued on the node.
@@ -39,13 +40,13 @@ pub struct QueuedReconcileRefs {
 /// whole-facet ref) while `claim_token` holds its claim. `None` when the ref
 /// isn't queued or another claim holds it. Takes no lock.
 pub async fn claimed_ref_attempts(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     facet: &str,
     element: Option<&str>,
     claim_token: &str,
-) -> Result<Option<i32>, sqlx::Error> {
-    sqlx::query_scalar::<_, i32>(sql!(
+) -> Result<Option<i32>, DbError> {
+    Ok(sqlx::query_scalar::<_, i32>(sql!(
         "SELECT attempts
          FROM node_reconcile_queue
          WHERE node_id = $1
@@ -57,8 +58,8 @@ pub async fn claimed_ref_attempts(
     .bind(facet)
     .bind(element)
     .bind(claim_token)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Intent: queue each `(facet, element)` ref on each node, as stored (an
@@ -78,12 +79,12 @@ pub async fn claimed_ref_attempts(
 /// node that is not a worker or builder; that undoes these refs only when
 /// both run in one transaction. Not every caller queues a trigger
 /// (`enqueue_sandbox_reconcile` does not).
-pub async fn queue_node_reconcile_refs<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
+pub async fn queue_node_reconcile_refs(
+    executor: impl Executor<'_>,
     node_ids: &[NodeId],
     refs: &[(String, String)],
     conflict: QueuedRefConflict,
-) -> Result<Vec<QueuedReconcileRefs>, sqlx::Error> {
+) -> Result<Vec<QueuedReconcileRefs>, DbError> {
     if node_ids.is_empty() || refs.is_empty() {
         return Ok(Vec::new());
     }
@@ -109,14 +110,14 @@ fn current_storable_traceparent() -> Option<String> {
         .filter(|traceparent| pplx_space_observability::is_storable_traceparent(traceparent))
 }
 
-async fn upsert_node_reconcile_refs<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
+async fn upsert_node_reconcile_refs(
+    executor: impl Executor<'_>,
     node_ids: &[NodeId],
     facets: &[&str],
     elements: &[&str],
     traceparent: Option<&str>,
     conflict: QueuedRefConflict,
-) -> Result<Vec<QueuedReconcileRefs>, sqlx::Error> {
+) -> Result<Vec<QueuedReconcileRefs>, DbError> {
     let query = match conflict {
         QueuedRefConflict::KeepProgress => sqlx::query_as::<_, (NodeId, String, i64)>(sql!(
             "WITH nodes AS (
@@ -223,7 +224,7 @@ async fn upsert_node_reconcile_refs<'e>(
         .bind(facets)
         .bind(elements)
         .bind(traceparent)
-        .fetch_all(executor)
+        .fetch_all(executor.into_sqlx())
         .await?;
     Ok(rows
         .into_iter()

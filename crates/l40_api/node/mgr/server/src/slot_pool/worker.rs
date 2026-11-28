@@ -545,7 +545,7 @@ pub(super) fn claim_missing_for_create(pool: &NetworkPool, repair: bool) -> Opti
     let Ok(mut conn) = pool.db.lock() else {
         return None;
     };
-    let tx = conn.transaction().ok()?;
+    let tx = Transaction::deferred(&mut conn).ok()?;
     if meta::meta_bool(&tx, "draining").ok()? {
         return None;
     }
@@ -553,29 +553,9 @@ pub(super) fn claim_missing_for_create(pool: &NetworkPool, repair: bool) -> Opti
     let (slot_id, generation) = slots::missing_slot_to_create(&tx, health, config.max_slots)
         .ok()
         .flatten()?;
-    let changed = tx
-        .execute(
-            concat!(
-                "UPDATE network_slots
-             SET state = 'creating', health = 'unknown',
-                 sandbox_id = NULL, sandbox_uid = NULL, pid = NULL,
-                 lease_kind = ?1, memory_reservation_mib = NULL,
-                 ",
-                clear_cleanup_reset_retry_sql!(),
-                ",
-                 updated_at = ?2
-             WHERE slot_id = ?3 AND generation = ?4
-               AND state = 'missing' AND health = ?5 AND sandbox_id IS NULL"
-            ),
-            params![
-                LeaseKind::Pooled.as_str(),
-                SqliteU64(now_secs()),
-                slot_id,
-                SqliteU64(generation),
-                health
-            ],
-        )
-        .ok()?;
+    let changed =
+        slots::worker::claim_missing_for_create(&tx, slot_id, generation, health, now_secs())
+            .ok()?;
     if changed == 0 {
         return None;
     }
@@ -595,7 +575,7 @@ pub(super) fn claim_ready_for_destroy(pool: &NetworkPool) -> Result<Option<u32>,
     }
     let retained = pool.config().retained_ready_slots;
     let mut conn = pool.db.lock().map_err(|_| SlotStoreError::LockPoisoned)?;
-    let tx = conn.transaction()?;
+    let tx = Transaction::deferred(&mut conn)?;
     // Count all ready rows, including those awaiting startup revalidation.
     // A zero-sized pool can retire interrupted, unowned setup directly rather
     // than needing a successful rebuild before teardown. Quarantine still
@@ -612,14 +592,7 @@ pub(super) fn claim_ready_for_destroy(pool: &NetworkPool) -> Result<Option<u32>,
     {
         return Ok(None);
     }
-    tx.execute(
-        "UPDATE network_slots
-         SET state = 'destroying', health = 'unknown', memory_reservation_mib = NULL,
-             updated_at = ?1
-         WHERE slot_id = ?2 AND state IN ('ready', 'missing') AND sandbox_id IS NULL
-           AND sandbox_uid IS NULL AND pid IS NULL",
-        params![SqliteU64(now_secs()), slot_id],
-    )?;
+    slots::worker::claim_for_destroy(&tx, slot_id, now_secs())?;
     tx.commit()?;
     pool.mark_node_status_dirty();
     Ok(Some(slot_id))
@@ -630,26 +603,13 @@ pub(super) fn persist_created_slot(
     config: &NetworkPoolConfig,
     slot_id: u32,
     generation: u64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
-        concat!(
-            "UPDATE network_slots
-             SET state = 'ready', health = 'healthy', sandbox_id = NULL,
-                 sandbox_uid = NULL, pid = NULL, last_error = NULL,
-                 pod_netns_path = ?1, lease_kind = ?2, memory_reservation_mib = NULL,
-                 ",
-            clear_cleanup_reset_retry_sql!(),
-            ",
-                 updated_at = ?3, last_reset_at = ?3
-             WHERE slot_id = ?4 AND generation = ?5 AND state = 'creating'"
-        ),
-        params![
-            config.pod_netns_path,
-            LeaseKind::Pooled.as_str(),
-            SqliteU64(now_secs()),
-            slot_id,
-            SqliteU64(generation)
-        ],
+) -> pplx_space_node_mgr_store::Result<usize> {
+    slots::worker::mark_created_ready(
+        conn,
+        slot_id,
+        generation,
+        config.pod_netns_path.as_deref(),
+        now_secs(),
     )
 }
 
@@ -658,27 +618,8 @@ pub(super) fn persist_transient_create_failure(
     slot_id: u32,
     generation: u64,
     error: &str,
-) -> rusqlite::Result<usize> {
-    conn.execute(
-        concat!(
-            "UPDATE network_slots
-             SET state = 'missing', health = 'degraded',
-                 sandbox_id = NULL, sandbox_uid = NULL, pid = NULL,
-                 lease_kind = ?1, memory_reservation_mib = NULL,
-                 ",
-            clear_cleanup_reset_retry_sql!(),
-            ",
-                 last_error = ?2, updated_at = ?3
-             WHERE slot_id = ?4 AND generation = ?5 AND state = 'creating'"
-        ),
-        params![
-            LeaseKind::Pooled.as_str(),
-            error,
-            SqliteU64(now_secs()),
-            slot_id,
-            SqliteU64(generation)
-        ],
-    )
+) -> pplx_space_node_mgr_store::Result<usize> {
+    slots::worker::degrade_failed_create(conn, slot_id, generation, error, now_secs())
 }
 
 pub(super) fn persist_create_quarantine(
@@ -686,28 +627,8 @@ pub(super) fn persist_create_quarantine(
     slot_id: u32,
     generation: u64,
     error: &str,
-) -> rusqlite::Result<usize> {
-    conn.execute(
-        concat!(
-            "UPDATE network_slots
-             SET state = 'quarantined', health = 'invalid',
-                 sandbox_id = NULL, sandbox_uid = NULL, pid = NULL,
-                 lease_kind = ?1, memory_reservation_mib = NULL,
-                 ",
-            clear_cleanup_reset_retry_sql!(),
-            ",
-                 last_error = ?2, updated_at = ?3,
-                 quarantine_count = quarantine_count + 1
-             WHERE slot_id = ?4 AND generation = ?5 AND state = 'creating'"
-        ),
-        params![
-            LeaseKind::Pooled.as_str(),
-            error,
-            SqliteU64(now_secs()),
-            slot_id,
-            SqliteU64(generation)
-        ],
-    )
+) -> pplx_space_node_mgr_store::Result<usize> {
+    slots::worker::quarantine_failed_create(conn, slot_id, generation, error, now_secs())
 }
 
 pub(super) async fn create_slot(
@@ -897,56 +818,37 @@ pub(super) async fn destroy_slot_with(
         return;
     };
     let status_changed = match result {
-        Ok(()) => {
-            match conn.execute(
-                concat!(
-                    "UPDATE network_slots
-                     SET state = 'missing', health = 'unknown',
-                         sandbox_id = NULL, sandbox_uid = NULL, pid = NULL,
-                         pod_netns_path = NULL, lease_kind = ?1, memory_reservation_mib = NULL,
-                         ",
-                    clear_cleanup_reset_retry_sql!(),
-                    ",
-                         last_error = NULL, updated_at = ?2
-                     WHERE slot_id = ?3 AND generation = ?4 AND state = 'destroying' AND sandbox_id IS NULL"
-                ),
-                params![LeaseKind::Pooled.as_str(), SqliteU64(now_secs()), slot_id, SqliteU64(generation)],
-            ) {
-                Ok(changed) => {
-                    tracing::info!(
-                        slot_id,
-                        target_ready_slots = config.target_ready_slots,
-                        retained_ready_slots = config.retained_ready_slots,
-                        "destroyed surplus ready network slot"
-                    );
-                    changed > 0
-                }
-                Err(error) => {
-                    tracing::error!(
-                        slot_id,
-                        error = %error,
-                        "failed to persist destroyed network slot"
-                    );
-                    false
-                }
+        Ok(()) => match slots::worker::finish_destroy(&conn, slot_id, generation, now_secs()) {
+            Ok(changed) => {
+                tracing::info!(
+                    slot_id,
+                    target_ready_slots = config.target_ready_slots,
+                    retained_ready_slots = config.retained_ready_slots,
+                    "destroyed surplus ready network slot"
+                );
+                changed > 0
             }
-        }
+            Err(error) => {
+                tracing::error!(
+                    slot_id,
+                    error = %error,
+                    "failed to persist destroyed network slot"
+                );
+                false
+            }
+        },
         Err(error) => {
             // Retain durable destruction intent and namespace identity. The
             // maintenance worker retries after its normal backoff, including
             // after restart; a failed delete must never make the slot reusable.
             tracing::warn!(slot_id, %error, "network slot teardown incomplete; retrying maintenance");
             schedule_topup_retry(pool.clone());
-            match conn.execute(
-                "UPDATE network_slots
-                 SET state = 'destroying', last_error = ?1, updated_at = ?2
-                 WHERE slot_id = ?3 AND generation = ?4 AND state = 'destroying' AND sandbox_id IS NULL",
-                params![
-                    error,
-                    SqliteU64(now_secs()),
-                    slot_id,
-                    SqliteU64(generation)
-                ],
+            match slots::worker::record_destroy_failure(
+                &conn,
+                slot_id,
+                generation,
+                &error,
+                now_secs(),
             ) {
                 Ok(changed) => changed > 0,
                 Err(db_error) => {
@@ -1336,8 +1238,8 @@ pub(super) fn apply_ready_validation_updates(
     conn: &mut Connection,
     config: &NetworkPoolConfig,
     updates: &[ReadyValidationUpdate],
-) -> rusqlite::Result<()> {
-    let tx = conn.transaction()?;
+) -> pplx_space_node_mgr_store::Result<()> {
+    let tx = Transaction::deferred(conn)?;
     let now = now_secs();
     for update in updates {
         match update {
@@ -1346,27 +1248,13 @@ pub(super) fn apply_ready_validation_updates(
                 generation,
                 previous_state,
             } => {
-                tx.execute(
-                    concat!(
-                        "UPDATE network_slots
-                         SET state = 'ready', health = 'healthy', last_error = NULL,
-                             sandbox_id = NULL, sandbox_uid = NULL, pid = NULL,
-                             pod_netns_path = ?1, lease_kind = ?2, memory_reservation_mib = NULL,
-                             ",
-                        clear_cleanup_reset_retry_sql!(),
-                        ",
-                             updated_at = ?3
-                         WHERE slot_id = ?4 AND generation = ?5 AND state = ?6
-                           AND sandbox_id IS NULL"
-                    ),
-                    params![
-                        config.pod_netns_path,
-                        LeaseKind::Pooled.as_str(),
-                        SqliteU64(now),
-                        slot_id,
-                        SqliteU64(*generation),
-                        previous_state.as_str()
-                    ],
+                slots::worker::mark_validated_ready(
+                    &tx,
+                    *slot_id,
+                    *generation,
+                    *previous_state,
+                    config.pod_netns_path.as_deref(),
+                    now,
                 )?;
             }
             ReadyValidationUpdate::Degraded {
@@ -1375,27 +1263,13 @@ pub(super) fn apply_ready_validation_updates(
                 previous_state,
                 error,
             } => {
-                tx.execute(
-                    concat!(
-                        "UPDATE network_slots
-                         SET state = 'missing', health = 'degraded',
-                             sandbox_id = NULL, sandbox_uid = NULL, pid = NULL,
-                             lease_kind = ?1, memory_reservation_mib = NULL,
-                             ",
-                        clear_cleanup_reset_retry_sql!(),
-                        ",
-                             last_error = ?2, updated_at = ?3
-                         WHERE slot_id = ?4 AND generation = ?5 AND state = ?6
-                           AND sandbox_id IS NULL"
-                    ),
-                    params![
-                        LeaseKind::Pooled.as_str(),
-                        error,
-                        SqliteU64(now),
-                        slot_id,
-                        SqliteU64(*generation),
-                        previous_state.as_str()
-                    ],
+                slots::worker::degrade_failed_validation(
+                    &tx,
+                    *slot_id,
+                    *generation,
+                    *previous_state,
+                    error,
+                    now,
                 )?;
             }
         }
@@ -1441,28 +1315,13 @@ pub(super) fn quarantine_resetting_slot(
     conn: &Connection,
     reset_key: &ResetKey,
     error: &str,
-) -> rusqlite::Result<usize> {
-    conn.execute(
-        concat!(
-            "UPDATE network_slots
-             SET state = 'quarantined', health = 'invalid',
-                 sandbox_id = NULL, sandbox_uid = NULL, pid = NULL,
-                 lease_kind = ?1, memory_reservation_mib = NULL,
-                 last_error = ?2, updated_at = ?3,
-                 ",
-            clear_cleanup_reset_retry_sql!(),
-            ",
-                 quarantine_count = quarantine_count + 1
-             WHERE slot_id = ?4 AND generation = ?5
-               AND state = 'resetting'"
-        ),
-        params![
-            LeaseKind::Pooled.as_str(),
-            error,
-            SqliteU64(now_secs()),
-            reset_key.slot_id,
-            SqliteU64(reset_key.generation)
-        ],
+) -> pplx_space_node_mgr_store::Result<usize> {
+    slots::reset::quarantine_reset(
+        conn,
+        reset_key.slot_id,
+        reset_key.generation,
+        error,
+        now_secs(),
     )
 }
 
@@ -1470,24 +1329,12 @@ pub(super) fn quarantine_resetting_slot_preserving_lease(
     conn: &Connection,
     reset_key: &ResetKey,
     error: &str,
-) -> rusqlite::Result<usize> {
-    conn.execute(
-        concat!(
-            "UPDATE network_slots
-             SET state = 'quarantined', health = 'invalid',
-                 last_error = ?1, updated_at = ?2,
-                 ",
-            clear_cleanup_reset_retry_sql!(),
-            ",
-                 quarantine_count = quarantine_count + 1
-             WHERE slot_id = ?3 AND generation = ?4
-               AND state = 'resetting'"
-        ),
-        params![
-            error,
-            SqliteU64(now_secs()),
-            reset_key.slot_id,
-            SqliteU64(reset_key.generation)
-        ],
+) -> pplx_space_node_mgr_store::Result<usize> {
+    slots::reset::quarantine_reset_preserving_lease(
+        conn,
+        reset_key.slot_id,
+        reset_key.generation,
+        error,
+        now_secs(),
     )
 }

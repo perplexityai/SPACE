@@ -1,5 +1,6 @@
 //! How many evacuated `stopped` sandboxes can't serve a `start` yet.
 
+use pplx_space_postgres_pool::Executor;
 use pplx_space_sql_locator::sql;
 
 use crate::SandboxStoreError;
@@ -33,7 +34,7 @@ use crate::SandboxStoreError;
 ///   stays unstartable until the drain settles it, which is exactly where a
 ///   re-placement that never converges (a destination whose shim predates
 ///   stopped materialization, say) sits indefinitely.
-pub async fn pending(executor: impl sqlx::PgExecutor<'_>) -> Result<i64, SandboxStoreError> {
+pub async fn pending(executor: impl Executor<'_>) -> Result<i64, SandboxStoreError> {
     Ok(sqlx::query_scalar::<_, i64>(sql!(
         "SELECT COUNT(*)::BIGINT
            FROM sandboxes s
@@ -43,6 +44,6 @@ pub async fn pending(executor: impl sqlx::PgExecutor<'_>) -> Result<i64, Sandbox
                 OR s.lifecycle = 'restoring'
             )"
     ))
-    .fetch_one(executor)
+    .fetch_one(executor.into_sqlx())
     .await?)
 }

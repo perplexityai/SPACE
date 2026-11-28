@@ -24,6 +24,7 @@ aws-config = { workspace = true, features = ["behavior-version-latest"] }
 aws-credential-types = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sqlx = { workspace = true, features = ["derive", "json", "postgres", "runtime-tokio", "time", "tls-rustls-aws-lc-rs", "uuid"] }
 thiserror = { workspace = true }
@@ -37,6 +38,7 @@ pplx-space-artifact-model = { workspace = true }
 pplx-space-content-digest = { workspace = true }
 pplx-space-execution-spec = { workspace = true }
 pplx-space-object-store = { workspace = true }
+pplx-space-postgres-pool = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 pplx-space-template-model = { workspace = true }
 pplx-space-template-release-original = { workspace = true }

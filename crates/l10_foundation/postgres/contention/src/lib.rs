@@ -34,6 +34,18 @@ pub fn is_lock_not_available(error: &sqlx::Error) -> bool {
     sqlstate(error).is_some_and(|code| code == "55P03")
 }
 
+/// True when `error` is `40001` (`serialization_failure`): a `REPEATABLE READ`
+/// or `SERIALIZABLE` transaction conflicted with a concurrent one.
+pub fn is_serialization_failure(error: &sqlx::Error) -> bool {
+    sqlstate(error).is_some_and(|code| code == "40001")
+}
+
+/// True when `error` is `40P01` (`deadlock_detected`): Postgres aborted this
+/// transaction to break a lock cycle.
+pub fn is_deadlock_detected(error: &sqlx::Error) -> bool {
+    sqlstate(error).is_some_and(|code| code == "40P01")
+}
+
 /// True when `error` is a contention abort: `40001` (`serialization_failure`),
 /// `40P01` (`deadlock_detected`), or `55P03` (`lock_not_available`).
 ///

@@ -55,7 +55,7 @@ use time::OffsetDateTime;
 use pplx_space_runtime_upgrade_campaign_store::{self as campaign_store, CampaignId, CampaignKind};
 
 use super::audit::{self, AdminRuntimeEnvironmentAuditEntry};
-use super::node_store::{AdminNodeRow, AdminNodeStore};
+use super::node_store::{self, AdminNodeRow, AdminNodeStore};
 use super::runtime_environment_store as store;
 use super::runtime_upgrade_campaigns::campaign_read_error;
 use super::support::{
@@ -140,7 +140,7 @@ fn policy_response(record: &RuntimeEnvironmentPolicyRecord) -> PolicyResponse {
 
 fn policy_read_error(error: GetPolicyError) -> Response {
     match error {
-        GetPolicyError::Database(err) => read_db_error(err),
+        GetPolicyError::Database(err) => read_db_error(sqlx::Error::from(err)),
         // A stored value this build can't read. The message names it; an
         // unknown state is repaired with `PUT .../{ref}/state`, the rest need
         // a cluster administrator.
@@ -449,7 +449,9 @@ async fn block_check(
                 });
             }
         }
-        Err(GetPolicyError::Database(err)) => return Err(Box::new(read_db_error(err))),
+        Err(GetPolicyError::Database(err)) => {
+            return Err(Box::new(read_db_error(sqlx::Error::from(err))));
+        }
         // A stored value this build can't read, possibly this environment's
         // own, which this write repairs. Whether it executes can't be told,
         // so check as for any block.
@@ -538,7 +540,7 @@ async fn first_default_template_campaign(
             pplx_space_execution_catalog::catalog::initial_environment_reference(),
         )
         .await
-        .map_err(|err| Box::new(read_db_error(err)))?
+        .map_err(|err| Box::new(read_db_error(sqlx::Error::from(err))))?
         .iter()
         .filter_map(|environment| environment.parse().ok())
         .collect();
@@ -562,7 +564,7 @@ async fn first_default_template_campaign(
         if let Some(campaign_id) =
             campaign_store::unfinished_from_locked(&mut *tx, CampaignKind::Templates, source)
                 .await
-                .map_err(|err| Box::new(read_db_error(err)))?
+                .map_err(|err| Box::new(read_db_error(sqlx::Error::from(err))))?
         {
             return Ok(Some((campaign_id, source)));
         }
@@ -638,7 +640,7 @@ pub(super) async fn set_default_runtime_environment(
             .await
             .map(|existing| existing.is_none())
     };
-    let generation = match policy_store::set_default(&mut tx, environment, &change).await {
+    let generation = match policy_store::set_default(&mut *tx, environment, &change).await {
         Ok(generation) => generation,
         Err(SetDefaultError::Blocked(environment)) => {
             return audit.refuse(
@@ -664,7 +666,10 @@ pub(super) async fn set_default_runtime_environment(
             return audit.refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
         }
         Err(SetDefaultError::Database(err)) => {
-            return audit.fail("the write failed", db_error(err).into_response());
+            return audit.fail(
+                "the write failed",
+                db_error(sqlx::Error::from(err)).into_response(),
+            );
         }
     };
     // After the store's own refusals, which describe the policy as it is
@@ -848,38 +853,47 @@ pub(super) async fn set_runtime_environment_state(
         }
         None => None,
     };
-    let generation =
-        match policy_store::set_environment_state(&mut tx, environment, requested, &change).await {
-            Ok(generation) => generation,
-            Err(SetEnvironmentStateError::DefaultMustStayAllowed {
-                environment,
-                requested,
-            }) => {
-                return audit.refuse(
-                    StatusCode::CONFLICT,
-                    format!(
-                        "environment {environment} is the cluster default and must stay \
+    let generation = match policy_store::set_environment_state(
+        &mut *tx,
+        environment,
+        requested,
+        &change,
+    )
+    .await
+    {
+        Ok(generation) => generation,
+        Err(SetEnvironmentStateError::DefaultMustStayAllowed {
+            environment,
+            requested,
+        }) => {
+            return audit.refuse(
+                StatusCode::CONFLICT,
+                format!(
+                    "environment {environment} is the cluster default and must stay \
                          allowed, not {requested}; make another environment the default first"
-                    ),
-                );
-            }
-            Err(SetEnvironmentStateError::BlockRequiresDefault(environment)) => {
-                return audit.refuse(
-                    StatusCode::CONFLICT,
-                    format!(
-                        "blocking environment {environment} requires a cluster default; set \
+                ),
+            );
+        }
+        Err(SetEnvironmentStateError::BlockRequiresDefault(environment)) => {
+            return audit.refuse(
+                StatusCode::CONFLICT,
+                format!(
+                    "blocking environment {environment} requires a cluster default; set \
                          one with PUT /runtime-environments/default first"
-                    ),
-                );
-            }
-            Err(error @ SetEnvironmentStateError::PolicyRowMissing) => {
-                tracing::error!(%error, "set runtime environment state");
-                return audit.refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
-            }
-            Err(SetEnvironmentStateError::Database(err)) => {
-                return audit.fail("the write failed", db_error(err).into_response());
-            }
-        };
+                ),
+            );
+        }
+        Err(error @ SetEnvironmentStateError::PolicyRowMissing) => {
+            tracing::error!(%error, "set runtime environment state");
+            return audit.refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
+        }
+        Err(SetEnvironmentStateError::Database(err)) => {
+            return audit.fail(
+                "the write failed",
+                db_error(sqlx::Error::from(err)).into_response(),
+            );
+        }
+    };
 
     // As for the default: after the store's refusals, before the strand check.
     if let Some(expected) = expected.filter(|_| !precondition_holds(expected, generation)) {
@@ -921,7 +935,7 @@ pub(super) async fn set_runtime_environment_state(
     // stop, so the refusal reports that work too: `strand: true` waives both.
     let template_campaign =
         if requested == RuntimeEnvironmentState::Blocked && !request.strand && !stops_nothing_new {
-            campaign_store::unfinished_from_locked(&mut tx, CampaignKind::Templates, environment)
+            campaign_store::unfinished_from_locked(&mut *tx, CampaignKind::Templates, environment)
                 .await
         } else {
             Ok(None)
@@ -941,7 +955,7 @@ pub(super) async fn set_runtime_environment_state(
             drop(tx);
             return audit.fail(
                 "couldn't check for an unfinished template campaign",
-                db_error(err).into_response(),
+                db_error(sqlx::Error::from(err)).into_response(),
             );
         }
     }
@@ -1085,7 +1099,7 @@ fn node_status(
     row: AdminNodeRow,
     now: OffsetDateTime,
 ) -> NodeRuntimePolicyStatus {
-    let enforced = row.execution_policy();
+    let enforced = node_store::execution_policy(&row);
     let applied_generation = enforced
         .as_ref()
         .and_then(|(policy, _)| policy.applied_generation());
@@ -1318,7 +1332,7 @@ async fn recheck_block(
     expected: Option<u64>,
     boots_template_twins: bool,
 ) -> Result<Option<Recheck>, Box<Response>> {
-    let generation = policy_store::lock_generation(tx)
+    let generation = policy_store::lock_generation(&mut **tx)
         .await
         .map_err(|error| Box::new(policy_read_error(error)))?;
     if checked_at == Some(generation) || expected.is_some_and(|expected| expected != generation) {

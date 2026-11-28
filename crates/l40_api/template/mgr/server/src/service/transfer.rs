@@ -76,7 +76,7 @@ impl TemplateManagerService {
             super::lookup::requested_cache_partition(tmpl_ref.environment.as_deref())?;
 
         // Verify build exists and is ready
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let name = template_id.clone();
         let hash = content_hash.clone();
         let build = tokio::task::spawn_blocking(move || {

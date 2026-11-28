@@ -16,6 +16,7 @@ use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_cluster_pool::PoolConfigOwner;
 use pplx_space_db_test_fixtures::pg_test_db;
 use pplx_space_net_common::NetworkPolicyV1;
+use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
 use pplx_space_test_env::TestResult;
@@ -1563,7 +1564,8 @@ async fn a_disable_racing_a_twin_insert_reaches_the_twins_copy() -> TestResult {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         let copied =
-            WarmPoolStore::copy_manual_configs_to_release(&mut campaign, original, twin).await?;
+            WarmPoolStore::copy_manual_configs_from_releases(&mut *campaign, &[original], twin)
+                .await?;
         campaign.commit().await?;
         TestResult::Ok(copied)
     });
@@ -1748,7 +1750,8 @@ async fn an_upsert_racing_a_twin_insert_reaches_the_twins_copy() -> TestResult {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         let copied =
-            WarmPoolStore::copy_manual_configs_to_release(&mut campaign, original, twin).await?;
+            WarmPoolStore::copy_manual_configs_from_releases(&mut *campaign, &[original], twin)
+                .await?;
         campaign.commit().await?;
         TestResult::Ok(copied)
     });

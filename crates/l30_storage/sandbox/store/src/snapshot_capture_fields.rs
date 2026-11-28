@@ -2,6 +2,7 @@
 //! sandbox.
 
 use pplx_space_accounts::{NodeId, OrgId};
+use pplx_space_postgres_pool::Executor;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 
@@ -21,7 +22,7 @@ pub struct SnapshotSandboxRow {
 
 /// The capture-time fields of `sandbox_id`; `None` when no row exists.
 pub async fn get(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
 ) -> Result<Option<SnapshotSandboxRow>, SandboxStoreError> {
     Ok(sqlx::query_as::<_, SnapshotSandboxRow>(sql!(
@@ -34,6 +35,6 @@ pub async fn get(
              WHERE id = $1"
     ))
     .bind(sandbox_id)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?)
 }

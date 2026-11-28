@@ -20,10 +20,29 @@ reconcilers:
       SPACE_ORPHANED_RESTORE_POD_GC_INTERVAL_SECS: "10"
       SPACE_ORPHANED_RESTORE_POD_GC_TICK_BUDGET_SECS: "9"
 
+# Drain v2 on the controller (SPACE_DRAIN_V2_ENABLED), as on the API in
+# space-api-local's values-kind.yaml, so the drain v2 scenarios change no
+# Deployment to drain; off in the chart default.
+drainV2:
+  enabled: "true"
+
 # Rendered only for the test-hooks build (values.yaml). The reconcile-queue
 # GC's EC2 instance ticks every 10 s rather than 300 s, so its scenario waits
 # seconds, not up to five minutes, for a tick; the release lane renders no
 # hook, and the scenario then waits out the binary's 300 s tick.
+#
+# The v2 drain's bounds (`node_drain::v2::V2LoopConfig`), each 15 minutes or
+# a 10 s backoff base in a release, shortened so the drain v2 scenarios that
+# wait one out wait minutes or seconds: a drain is stalled 180 s past its
+# deadline with nothing evacuated, a sandbox it saw running counts as still
+# suspended after 180 s, the loop says EC2 still lists a fenced instance 120 s
+# after Auto Scaling accepted its termination, and a fenced node's EC2 checks
+# back off from 2 s (to the 120 s cap). The scenarios read them back from the
+# Deployment (`space_smoke.drain_v2.require_drain_v2`).
 testHookEnv:
   SPACE_FAILED_RESTORABLE_REPAIR_TICK_SECS: "10"
   SPACE_RECONCILE_QUEUE_GC_TICK_SECS: "10"
+  SPACE_DRAIN_V2_TEST_STALL_BOUND_SECONDS: "180"
+  SPACE_DRAIN_V2_TEST_STILL_SUSPENDED_AFTER_SECONDS: "180"
+  SPACE_DRAIN_V2_TEST_TERMINATE_BOUND_SECONDS: "120"
+  SPACE_DRAIN_V2_TEST_DISPATCH_BACKOFF_BASE_SECONDS: "2"

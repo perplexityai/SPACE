@@ -17,6 +17,8 @@ use testcontainers_modules::postgres::Postgres as PostgresImage;
 use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
 
+pub mod plan;
+
 const DEFAULT_POSTGRES_IMAGE: &str = "public.ecr.aws/docker/library/postgres:16-alpine";
 /// Default Redis test image. Mirrored on AWS's public ECR for the same reason
 /// as Postgres above: anonymous Docker Hub pulls are rate-limited per source

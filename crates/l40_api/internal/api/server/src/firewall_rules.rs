@@ -110,7 +110,7 @@ impl ClusterApiService {
             _ => return Err(denied("ambiguous_name")),
         };
         self.firewall_enrollment.admit(node)?;
-        let instructions = pplx_space_firewall_rules_store::fetch_instructions(&mut tx, node)
+        let instructions = pplx_space_firewall_rules_store::fetch_instructions(&mut *tx, node)
             .await
             .map_err(|error| Status::internal(format!("fetch firewall instructions: {error}")))?;
         tx.commit()
@@ -130,6 +130,7 @@ impl ClusterApiService {
                 .map(|pending| FirewallRulesPendingRound {
                     round: pending.round,
                     issued_at: Some(SystemTime::from(pending.issued_at).into()),
+                    assignment_generation: pending.assignment_generation,
                 }),
         }))
     }

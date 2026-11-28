@@ -2,6 +2,7 @@ mod digest_original;
 mod prefetch_catalog;
 pub(crate) mod queued_ref;
 mod reconcile_claim_origins;
+mod reconcile_completion;
 mod release_twins;
 mod runtime_desired_state;
 mod substrate_scope;
@@ -5052,7 +5053,7 @@ async fn seed_suspend_snapshot_with_identity(
         .begin()
         .await
         .map_err(|e| tonic::Status::internal(format!("begin tx: {e}")))?;
-    snapshot_store::insert(&mut tx, &snapshot)
+    snapshot_store::insert(&mut *tx, &snapshot)
         .await
         .map_err(snapshot_insert_status)?;
     tx.commit()
@@ -5579,7 +5580,7 @@ async fn begin_replay_racing_retention_cannot_register_a_row_for_another_node() 
 
     // Retention's delete is in flight.
     let mut retention = pool.begin().await?;
-    assert!(snapshot_store::delete_snapshot_catalog(&mut retention, backup_attempt_id).await?);
+    assert!(snapshot_store::delete_snapshot_catalog(&mut *retention, backup_attempt_id).await?);
 
     let replay = begin_artifact_backup_from_node(
         &fixture.service,
@@ -8186,7 +8187,7 @@ async fn restore_locations_keep_digests_during_catalog_deletion() -> TestResult 
                 }
                 tokio::task::yield_now().await;
             }
-            pplx_space_sandbox_store::delete::delete_with_dependents(&mut deletion, sandbox_id)
+            pplx_space_sandbox_store::delete::delete_with_dependents(&mut *deletion, sandbox_id)
                 .await?;
             deletion.commit().await
         };

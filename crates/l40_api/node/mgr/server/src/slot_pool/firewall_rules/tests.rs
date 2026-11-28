@@ -85,7 +85,12 @@ pub(crate) fn set_slot(pool: &NetworkPool, slot_id: u32, state: SlotState, gener
                   sandbox_id = CASE ?1 WHEN 'ready' THEN NULL ELSE 'sandbox-' || ?3 END
                   WHERE slot_id = ?3";
     let params = params![state.as_str(), generation, slot_id];
-    pool.db.lock().unwrap().execute(update, params).unwrap();
+    pool.db
+        .lock()
+        .unwrap()
+        .raw()
+        .execute(update, params)
+        .unwrap();
 }
 
 /// Holds the slot as other work would, until dropped.

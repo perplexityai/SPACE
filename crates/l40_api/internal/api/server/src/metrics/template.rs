@@ -1,4 +1,4 @@
-use pplx_space_metrics_emit::{counter, distribution, tag};
+use pplx_space_metrics_emit::{counter, distribution, metric_vocabulary, tag};
 
 /// Why a template-visibility lookup could not produce a definite
 /// answer; the `reason` tag on `template.visibility_lookup.degraded`.
@@ -170,6 +170,76 @@ impl std::fmt::Display for VisibilityLookupCacheOutcome {
 pub fn visibility_lookup_cache(outcome: VisibilityLookupCacheOutcome) {
     counter(
         "template.visibility_lookup.cache",
+        1,
+        &[tag("outcome", outcome.as_str())],
+    );
+}
+
+metric_vocabulary!(
+    /// How one `RegisterTemplateRelease` call ended; the `outcome` tag on
+    /// `template.release_registration`.
+    ///
+    /// Classified from the call's gRPC status, so `failed` separates a
+    /// server-side fault in the release lookup, insert or row decoding from the
+    /// refusals a publisher's own request causes. `failed` takes the codes the
+    /// gRPC server's span classifier counts as errors, apart from `UNAVAILABLE`.
+    TemplateReleaseRegistrationOutcome {
+        /// The release, its tags and its storage locations committed.
+        Registered => "registered",
+        /// The request was refused: an invalid field, missing build or
+        /// publication authority, an unregistered template, or a release whose
+        /// runtime, owner or execution metadata differs from the recorded one.
+        /// Caller-driven, as are `CANCELLED` and `RESOURCE_EXHAUSTED`, which
+        /// also count here.
+        Rejected => "rejected",
+        /// `UNAVAILABLE` or `ABORTED`: a serialization failure, deadlock or
+        /// lock timeout against a concurrent publication, or a publisher node
+        /// not yet synchronized into inventory. Nothing committed, and the
+        /// publisher retries.
+        Unavailable => "unavailable",
+        /// Any other status, chiefly `INTERNAL`: a storage error, or a release
+        /// the server could not decode or reload. The server-side fault.
+        Failed => "failed",
+    }
+);
+
+impl TemplateReleaseRegistrationOutcome {
+    pub fn of<T>(result: &Result<T, tonic::Status>) -> Self {
+        use tonic::Code;
+        let Err(status) = result else {
+            return Self::Registered;
+        };
+        match status.code() {
+            Code::Cancelled
+            | Code::InvalidArgument
+            | Code::NotFound
+            | Code::AlreadyExists
+            | Code::PermissionDenied
+            | Code::ResourceExhausted
+            | Code::FailedPrecondition
+            | Code::OutOfRange
+            | Code::Unauthenticated => Self::Rejected,
+            Code::Unavailable | Code::Aborted => Self::Unavailable,
+            Code::Ok
+            | Code::Unknown
+            | Code::DeadlineExceeded
+            | Code::Unimplemented
+            | Code::Internal
+            | Code::DataLoss => Self::Failed,
+        }
+    }
+}
+
+/// One per `RegisterTemplateRelease` call that returns a status, tagged by how
+/// it ended. A call the publisher abandons, by cancelling it or letting its
+/// deadline pass, is dropped before it returns and is not counted.
+///
+/// Registrations are rare, so a server version can run for a long time before
+/// one reaches this path. Compare `outcome:failed` across the constant
+/// `version` tag rather than alerting on a fleet-wide rate.
+pub fn release_registration(outcome: TemplateReleaseRegistrationOutcome) {
+    counter(
+        "template.release_registration",
         1,
         &[tag("outcome", outcome.as_str())],
     );

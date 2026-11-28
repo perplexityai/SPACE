@@ -12,6 +12,7 @@ use pplx_space_accounts::NodeId;
 use pplx_space_db_test_fixtures::pg_test_db;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
@@ -332,7 +333,7 @@ async fn classify_orphan_waits_for_uncommitted_publish_and_defers() -> TestResul
     let holder_pid: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
         .fetch_one(&mut *publish_holder)
         .await?;
-    orphan::lock_published_sandbox_observations(&mut publish_holder, &[sandbox_id]).await?;
+    orphan::lock_published_sandbox_observations(&mut *publish_holder, &[sandbox_id]).await?;
     sqlx::query(sql!(
         "INSERT INTO sandbox_observed_states (
              sandbox_id, node_id, status, runtime, sandbox_owner,

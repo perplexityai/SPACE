@@ -2,7 +2,7 @@ use pplx_space_accounts::{OrgId, UserId};
 use pplx_space_data_plane_session_store::{
     self as data_plane_session_store, Session as PublicSessionRow,
 };
-use pplx_space_sql_locator::sql;
+use pplx_space_public_operation_store as operation_store;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -15,7 +15,7 @@ use pplx_space_public_api::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -65,6 +65,12 @@ pub enum PublicSessionStoreError {
     SessionEnded,
     #[error("database error: {0}")]
     Sql(#[from] sqlx::Error),
+}
+
+impl From<pplx_space_postgres_pool::DbError> for PublicSessionStoreError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
 }
 
 impl From<InvalidStoredEnum> for PublicSessionStoreError {
@@ -213,12 +219,13 @@ impl PublicSessionStore {
         session_id: DataPlaneSessionId,
     ) -> Result<Option<PublicSession>, PublicSessionStoreError> {
         let session_id_string = session_id.to_string();
-        let row = sqlx::query_as::<_, PublicSessionRow>(SESSION_SELECT_SQL)
-            .bind(org_id)
-            .bind(sandbox_id.as_uuid())
-            .bind(&session_id_string)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = data_plane_session_store::live_session(
+            &self.pool,
+            org_id,
+            sandbox_id.into(),
+            &session_id_string,
+        )
+        .await?;
 
         row.map(|row| session_into_public(row, None, self.data_plane_base_url.as_str()))
             .transpose()
@@ -229,44 +236,29 @@ impl PublicSessionStore {
         input: ListPublicSessions,
     ) -> Result<Vec<PublicSession>, PublicSessionStoreError> {
         let kind = input.kind.map(SessionKind::as_str);
-        let rows = sqlx::query_as::<_, PublicSessionRow>(sql!(
-            "SELECT session_id,
-                    sandbox_id,
-                    kind,
-                    state,
-                    reconnect_count,
-                    last_reconnect_reason,
-                    scopes,
-                    target_port,
-                    target_protocol,
-                    target_path,
-                    created_at,
-                    updated_at,
-                    expires_at
-             FROM data_plane_sessions
-             WHERE org_id = $1
-               AND sandbox_id = $2
-               AND ($3::TEXT IS NULL OR kind = $3)
-               AND (
-                   $4::TIMESTAMPTZ IS NULL
-                   OR (created_at, session_id) < ($4::TIMESTAMPTZ, $5::TEXT)
-               )
-               AND (expires_at IS NULL OR expires_at > NOW())
-             ORDER BY created_at DESC, session_id DESC
-             LIMIT $6"
-        ))
-        .bind(input.org_id)
-        .bind(input.sandbox_id.as_uuid())
-        .bind(kind)
-        .bind(input.cursor.as_ref().map(|cursor| cursor.created_at))
-        .bind(
+        let cursor_session_id = input
+            .cursor
+            .as_ref()
+            .map(|cursor| cursor.session_id.to_string());
+        let cursor =
             input
                 .cursor
                 .as_ref()
-                .map(|cursor| cursor.session_id.to_string()),
+                .zip(cursor_session_id.as_deref())
+                .map(
+                    |(cursor, session_id)| data_plane_session_store::SessionCursor {
+                        created_at: cursor.created_at,
+                        session_id,
+                    },
+                );
+        let rows = data_plane_session_store::list_live_sessions(
+            &self.pool,
+            input.org_id,
+            input.sandbox_id.into(),
+            kind,
+            cursor,
+            i64::from(input.limit) + 1,
         )
-        .bind(i64::from(input.limit) + 1)
-        .fetch_all(&self.pool)
         .await?;
 
         rows.into_iter()
@@ -279,61 +271,32 @@ impl PublicSessionStore {
         input: RevokePublicSession<'_>,
     ) -> Result<Option<PublicSession>, PublicSessionStoreError> {
         let mut tx = self.pool.begin().await?;
-        let prior_status = sqlx::query_scalar::<_, String>(sql!(
-            "SELECT revocation_status
-             FROM data_plane_sessions
-             WHERE org_id = $1
-               AND sandbox_id = $2
-               AND session_id = $3
-               AND (expires_at IS NULL OR expires_at > NOW())
-             FOR UPDATE"
-        ))
-        .bind(input.org_id)
-        .bind(input.sandbox_id.as_uuid())
-        .bind(input.session_id.to_string())
-        .fetch_optional(&mut *tx)
+        let session_id = input.session_id.to_string();
+        let prior_status = data_plane_session_store::lock_live_revocation_status(
+            &mut *tx,
+            input.org_id,
+            input.sandbox_id.into(),
+            &session_id,
+        )
         .await?;
         let Some(prior_status) = prior_status else {
             return Ok(None);
         };
         let transitioned = prior_status != "revoked";
 
-        let row = sqlx::query_as::<_, PublicSessionRow>(
-            sql!("UPDATE data_plane_sessions
-             SET revocation_epoch = CASE WHEN $5::BOOL THEN revocation_epoch + 1 ELSE revocation_epoch END,
-                 revocation_status = 'revoked',
-                 revocation_reason = COALESCE(revocation_reason, $4),
-                 revocation_updated_at = NOW(),
-                 state = 'revoked',
-                 token_hash = NULL,
-                 token_expires_at = NOW(),
-                 attach_deadline_at = NULL,
-                 updated_at = NOW()
-             WHERE org_id = $1
-               AND sandbox_id = $2
-               AND session_id = $3
-               AND (expires_at IS NULL OR expires_at > NOW())
-             RETURNING session_id,
-                       sandbox_id,
-                       kind,
-                       state,
-                       reconnect_count,
-                       last_reconnect_reason,
-                       scopes,
-                       target_port,
-                       target_protocol,
-                       target_path,
-                       created_at,
-                       updated_at,
-                       expires_at"),
+        // The row lock above keeps other writers off the row until the
+        // transaction ends, and `NOW()` is the transaction's start in both
+        // statements, so the revoke matches the row the lock read.
+        let row = data_plane_session_store::revoke_live_session(
+            &mut *tx,
+            input.org_id,
+            input.sandbox_id.into(),
+            &session_id,
+            input.reason,
+            transitioned,
         )
-        .bind(input.org_id)
-        .bind(input.sandbox_id.as_uuid())
-        .bind(input.session_id.to_string())
-        .bind(input.reason)
-        .bind(transitioned)
-        .fetch_one(&mut *tx)
-        .await?;
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
 
         if transitioned {
             data_plane_session_store::advance_org_revocation_epoch(&mut *tx, input.org_id).await?;
@@ -461,33 +424,6 @@ struct PublicSessionIdempotencyRecord {
     request_fingerprint: RequestFingerprint,
 }
 
-#[derive(Debug, FromRow)]
-struct PublicSessionIdempotencyRow {
-    operation_id: Option<Uuid>,
-    request_fingerprint: String,
-}
-
-const SESSION_SELECT_SQL: &str = sql!(
-    "SELECT session_id,
-       sandbox_id,
-       kind,
-       state,
-       reconnect_count,
-       last_reconnect_reason,
-       scopes,
-       target_port,
-       target_protocol,
-       target_path,
-       created_at,
-       updated_at,
-       expires_at
-FROM data_plane_sessions
-WHERE org_id = $1
-  AND sandbox_id = $2
-  AND session_id = $3
-  AND (expires_at IS NULL OR expires_at > NOW())"
-);
-
 async fn find_idempotency_record(
     tx: &mut Transaction<'_, Postgres>,
     org_id: OrgId,
@@ -499,32 +435,16 @@ async fn find_idempotency_record(
     // unique, so a live record and an expired one never coexist: this deletes
     // only when the lookup comes back empty. `NOW()` is the transaction's
     // start, so the two predicates partition the record exactly.
-    let row = sqlx::query_as::<_, PublicSessionIdempotencyRow>(sql!(
-        "WITH expired AS (
-             DELETE FROM public_idempotency_records
-             WHERE org_id = $1
-               AND api_product = $2
-               AND method = $3
-               AND path_template = $4
-               AND idempotency_key = $5
-               AND expires_at <= NOW()
-         )
-         SELECT operation_id, request_fingerprint
-         FROM public_idempotency_records
-         WHERE org_id = $1
-           AND api_product = $2
-           AND method = $3
-           AND path_template = $4
-           AND idempotency_key = $5
-           AND expires_at > NOW()
-         FOR UPDATE"
-    ))
-    .bind(org_id)
-    .bind(API_PRODUCT_NATIVE.as_str())
-    .bind(idempotency.method.as_str())
-    .bind(idempotency.path_template.as_str())
-    .bind(idempotency.key.as_str())
-    .fetch_optional(&mut **tx)
+    let row = operation_store::idempotency::delete_expired_and_lock_live(
+        &mut **tx,
+        API_PRODUCT_NATIVE.as_str(),
+        operation_store::idempotency::IdempotencyKeyRef {
+            org_id,
+            method: idempotency.method.as_str(),
+            path_template: idempotency.path_template.as_str(),
+            idempotency_key: idempotency.key.as_str(),
+        },
+    )
     .await?;
 
     row.map(TryInto::try_into).transpose()
@@ -535,9 +455,7 @@ async fn lock_idempotency_key(
     org_id: OrgId,
     idempotency: CreatePublicSessionIdempotency<'_>,
 ) -> Result<(), PublicSessionStoreError> {
-    sqlx::query(sql!("SELECT pg_advisory_xact_lock($1)"))
-        .bind(idempotency_lock_key(org_id, idempotency))
-        .execute(&mut **tx)
+    operation_store::idempotency::lock_key(&mut **tx, idempotency_lock_key(org_id, idempotency))
         .await?;
     Ok(())
 }
@@ -594,23 +512,15 @@ async fn refresh_attach_token_tx(
     let token = DataPlaneToken::new();
     let now = OffsetDateTime::now_utc();
     let session_id_string = session_id.to_string();
-    let refreshed = sqlx::query(sql!(
-        "UPDATE data_plane_sessions
-         SET token_hash = $2,
-             token_expires_at = $3,
-             attach_deadline_at = $4,
-             updated_at = NOW()
-         WHERE session_id = $1
-           AND revocation_status = 'active'
-           AND (expires_at IS NULL OR expires_at > NOW())"
-    ))
-    .bind(&session_id_string)
-    .bind(token.hash.as_str())
-    .bind(now + DEFAULT_ATTACH_TOKEN_TTL)
-    .bind(now + DEFAULT_ATTACH_DEADLINE)
-    .execute(&mut **tx)
+    let refreshed = data_plane_session_store::refresh_live_attach_token(
+        &mut **tx,
+        &session_id_string,
+        token.hash.as_str(),
+        now + DEFAULT_ATTACH_TOKEN_TTL,
+        now + DEFAULT_ATTACH_DEADLINE,
+    )
     .await?;
-    Ok((refreshed.rows_affected() > 0).then_some(token))
+    Ok(refreshed.then_some(token))
 }
 
 async fn fetch_session_tx(
@@ -620,12 +530,9 @@ async fn fetch_session_tx(
     session_id: DataPlaneSessionId,
 ) -> Result<Option<PublicSessionRow>, sqlx::Error> {
     let session_id_string = session_id.to_string();
-    sqlx::query_as::<_, PublicSessionRow>(SESSION_SELECT_SQL)
-        .bind(org_id)
-        .bind(sandbox_id.as_uuid())
-        .bind(&session_id_string)
-        .fetch_optional(&mut **tx)
+    data_plane_session_store::live_session(&mut **tx, org_id, sandbox_id.into(), &session_id_string)
         .await
+        .map_err(sqlx::Error::from)
 }
 
 async fn insert_completed_session_operation_tx(
@@ -645,7 +552,7 @@ async fn insert_completed_session_operation_tx(
     let result_json = serde_json::to_value(&result).expect("public session result serializes");
 
     // The operation is new, so its completion is its first event: sequence 1
-    // is what `append_operation_event_tx` would compute.
+    // is what `operation_store::events::append` would compute.
     pplx_space_public_operation_store::operations::insert_completed_session_create(
         &mut **tx,
         pplx_space_public_operation_store::operations::CompletedSessionCreate {
@@ -663,6 +570,7 @@ async fn insert_completed_session_operation_tx(
         },
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 async fn insert_idempotency_record_tx(
@@ -687,6 +595,7 @@ async fn insert_idempotency_record_tx(
         IDEMPOTENCY_TTL_HOURS,
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 fn request_fingerprint(
@@ -797,10 +706,10 @@ fn session_into_public(
     })
 }
 
-impl TryFrom<PublicSessionIdempotencyRow> for PublicSessionIdempotencyRecord {
+impl TryFrom<operation_store::idempotency::OperationKeyRow> for PublicSessionIdempotencyRecord {
     type Error = PublicSessionStoreError;
 
-    fn try_from(row: PublicSessionIdempotencyRow) -> Result<Self, Self::Error> {
+    fn try_from(row: operation_store::idempotency::OperationKeyRow) -> Result<Self, Self::Error> {
         Ok(Self {
             operation_id: row.operation_id,
             request_fingerprint: RequestFingerprint::parse(row.request_fingerprint.clone())

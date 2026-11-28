@@ -2413,13 +2413,21 @@ pub(crate) mod service_tests {
         use pplx_space_sandbox_model::SandboxTransitionReceiptKind;
         // Exercise the real Wake join before dropping all request/service state.
         // The NULL injection models carrying B only in volatile request memory.
+        // The test models a process restart, not a host crash, so neither
+        // connection needs SQLite's per-commit fsyncs, which wait behind every
+        // other writer on a busy disk.
+        let open = |path: &std::path::Path| {
+            let conn = crate::db::Connection::open_at(path).unwrap();
+            conn.pragma_update(None, "synchronous", "OFF").unwrap();
+            conn
+        };
         for (persist_operation, allocated) in
             [(false, false), (true, false), (false, true), (true, true)]
         {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("manager.sqlite");
-            let mut conn = crate::db::Connection::open_at(&path).unwrap();
-            crate::db::create_test_schema(&mut conn);
+            crate::db::create_test_schema_on_disk(&path);
+            let conn = open(&path);
             let sandbox_id = SandboxId::new();
             let id = sandbox_id.to_string();
             insert_test_sandbox(&conn, &id, SandboxState::Stopped);
@@ -2491,8 +2499,7 @@ pub(crate) mod service_tests {
                     .unwrap();
             }
             drop(service);
-            let recovered =
-                service_for_teardown_test(crate::db::Connection::open_at(&path).unwrap());
+            let recovered = service_for_teardown_test(open(&path));
             recovered
                 .recover_interrupted_startup_states()
                 .await
@@ -2990,6 +2997,91 @@ pub(crate) mod service_tests {
             row.space_api_route_identity.activation_attempt_id,
             Some(next_attempt),
             "a successful resume must adopt before the wake returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_info_reports_the_allocated_external_address_only_for_that_execution() {
+        use pplx_space_k8s_ids::PodUid;
+        use pplx_space_sandbox_model::{ExecutionGeneration, SpaceApiRouteIdentity};
+        let conn = crate::db::test_conn();
+        let started = SandboxId::new();
+        insert_test_sandbox(&conn, &started.to_string(), SandboxState::Started);
+        let service = SandboxManagerService::for_test(conn);
+        let execution = |generation: i64, pod_uid: &str| SpaceApiRouteIdentity {
+            execution_generation: Some(ExecutionGeneration::new(generation).unwrap()),
+            pod_uid: Some(PodUid::parse(pod_uid).unwrap()),
+            ..Default::default()
+        };
+        let set_execution = |sandbox_id: SandboxId, identity: &SpaceApiRouteIdentity| {
+            crate::db::update_space_api_route_identity(
+                &service.db.lock().unwrap(),
+                sandbox_id,
+                identity,
+                crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::ClusterFenced,
+            )
+            .unwrap();
+        };
+        let reported_ip = async |sandbox_id: SandboxId| {
+            let sandbox = service.lookup_sandbox(&sandbox_id.to_string()).unwrap();
+            service
+                .build_sandbox_info(sandbox, None, None, None, None)
+                .await
+                .unwrap()
+                .external_address
+        };
+
+        set_execution(started, &execution(1, "pod-a"));
+        assert_eq!(reported_ip(started).await, None);
+        service.external_addresses.record(
+            &started.to_string(),
+            &execution(1, "pod-a"),
+            Some("10.1.2.3"),
+        );
+        assert_eq!(reported_ip(started).await.as_deref(), Some("10.1.2.3"));
+
+        set_execution(started, &execution(1, "pod-b"));
+        assert_eq!(
+            reported_ip(started).await,
+            None,
+            "an instance re-created under the same generation must not inherit the address"
+        );
+        set_execution(started, &execution(2, "pod-a"));
+        assert_eq!(
+            reported_ip(started).await,
+            None,
+            "a later execution must not inherit the address"
+        );
+
+        service.external_addresses.record(
+            &started.to_string(),
+            &execution(2, "pod-a"),
+            Some("10.1.2.4"),
+        );
+        assert_eq!(reported_ip(started).await.as_deref(), Some("10.1.2.4"));
+        service
+            .external_addresses
+            .record(&started.to_string(), &execution(2, "pod-a"), None);
+        assert_eq!(
+            reported_ip(started).await,
+            None,
+            "an allocation without an address must not report the previous one"
+        );
+        service.external_addresses.record(
+            &started.to_string(),
+            &execution(2, "pod-a"),
+            Some("10.1.2.4"),
+        );
+        service
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE sandboxes SET state = 'stopped'", [])
+            .unwrap();
+        assert_eq!(
+            reported_ip(started).await,
+            None,
+            "a stopped sandbox released its external network"
         );
     }
 
@@ -10773,8 +10865,11 @@ pub(crate) mod service_tests {
         let current_generation = ExecutionGeneration::new(2).unwrap();
 
         {
-            let mut conn = crate::db::Connection::open_at(&db_path).unwrap();
-            crate::db::create_test_schema(&mut conn);
+            crate::db::create_test_schema_on_disk(&db_path);
+            let conn = crate::db::Connection::open_at(&db_path).unwrap();
+            // The test models a process restart, not a host crash, so no
+            // commit needs an fsync.
+            conn.pragma_update(None, "synchronous", "OFF").unwrap();
             insert_test_sandbox(&conn, &sandbox_id.to_string(), SandboxState::Paused);
             let service = service_for_teardown_test(conn);
             service
@@ -11534,6 +11629,7 @@ pub(crate) mod service_tests {
                 guest_image: Default::default(),
                 node_execution_id: None,
                 sandbox_id: sandbox_id.to_string(),
+                created_at: None,
                 uid: None,
                 runtime_pid: None,
                 spaced_host_pid: None,
@@ -12906,8 +13002,11 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         let deleted_generation = ExecutionGeneration::new(2).unwrap();
         {
-            let mut conn = crate::db::Connection::open_at(&db_path).unwrap();
-            crate::db::create_test_schema(&mut conn);
+            crate::db::create_test_schema_on_disk(&db_path);
+            let conn = crate::db::Connection::open_at(&db_path).unwrap();
+            // The test models a process restart, not a host crash, so no
+            // commit needs an fsync.
+            conn.pragma_update(None, "synchronous", "OFF").unwrap();
             delete_sandbox_with_generation_receipt(&conn, &sandbox_id, deleted_generation);
         }
         let service = service_for_teardown_test(crate::db::Connection::open_at(&db_path).unwrap());

@@ -913,3 +913,115 @@ async fn cleanup_proceeds_once_the_claim_holder_releases_it() {
         node.stop().await;
     }
 }
+
+#[test]
+fn inspect_reads_the_jailer_cgroup_before_the_sidecar_cgroup() {
+    let parent = tempfile::tempdir().unwrap();
+    let id = SandboxId::new().to_string();
+    let read = || {
+        sandbox_cgroup_dir(parent.path(), &id).map(|dir| read_cgroup_file(&dir, "memory.current"))
+    };
+    assert_eq!(read(), None);
+
+    let sidecar = parent.path().join(format!("sbx-{id}"));
+    std::fs::create_dir(&sidecar).unwrap();
+    std::fs::write(sidecar.join("memory.current"), "4096\n").unwrap();
+    assert_eq!(read().as_deref(), Some("4096"));
+
+    let jailer = parent.path().join(&id);
+    std::fs::create_dir(&jailer).unwrap();
+    std::fs::write(jailer.join("memory.current"), "536870912\n").unwrap();
+    assert_eq!(read().as_deref(), Some("536870912"));
+}
+
+#[test]
+fn sandbox_cgroup_reads_either_cgroup_name_and_reports_an_absent_one() {
+    let id = SandboxId::new().to_string();
+    for name in [id.clone(), format!("sbx-{id}")] {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            SandboxCgroup::read(root.path(), &id),
+            SandboxCgroup::default()
+        );
+        let dir = root.path().join(&name);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("memory.current"), "4096\n").unwrap();
+        std::fs::write(dir.join("cpu.stat"), "usage_usec 7\n").unwrap();
+        // Absent files read as empty.
+        assert_eq!(
+            SandboxCgroup::read(root.path(), &id),
+            SandboxCgroup {
+                exists: true,
+                memory_current: "4096".to_string(),
+                cpu_stat: "usage_usec 7".to_string(),
+                ..Default::default()
+            },
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cgroup_only_inspect_answers_without_host_probes() {
+    let service = crate::service::tests::service_tests::service_for_unit_tests().await;
+    let id = SandboxId::new();
+    let mut request = Request::new(InspectSandboxRequest {
+        sandbox_id: id.to_string(),
+        uuid8: id.label().to_string(),
+        uid: Some(10_000),
+        slot: Some(7),
+        cgroup_only: true,
+        ..Default::default()
+    });
+    request
+        .extensions_mut()
+        .insert(pplx_space_uds_peer_auth::PeerIdentity::new(
+            pplx_space_host_layout::identities::users::SPACE_SBXMGR.uid,
+            pplx_space_host_layout::identities::users::SPACE_SBXMGR
+                .primary_group
+                .gid,
+            None,
+        ));
+    let inspection = service.inspect_sandbox(request).await.unwrap().into_inner();
+    // Only identity and cgroup figures: no slot, process, network or
+    // filesystem probe ran, so none is reported.
+    assert_eq!(
+        inspection,
+        InspectSandboxResponse {
+            sandbox_id: id.to_string(),
+            ..Default::default()
+        }
+    );
+}
+
+#[test]
+fn cgroup_only_inspect_reports_each_jailer_cgroup_file_in_its_own_field() {
+    let root = tempfile::tempdir().unwrap();
+    let id = SandboxId::new().to_string();
+    let dir = jailer_cgroup_path_in(root.path(), &id);
+    std::fs::create_dir(&dir).unwrap();
+    for (file, value) in [
+        ("cpu.max", "200000 100000"),
+        ("memory.max", "1073741824"),
+        ("memory.current", "524288"),
+        ("pids.max", "512"),
+        ("pids.current", "3"),
+        ("cpu.stat", "usage_usec 4200"),
+    ] {
+        std::fs::write(dir.join(file), format!("{value}\n")).unwrap();
+    }
+    assert_eq!(
+        inspect_sandbox_cgroup(root.path(), id.clone()),
+        InspectSandboxResponse {
+            sandbox_id: id,
+            cgroup_exists: true,
+            cgroup_cpu_max: "200000 100000".to_string(),
+            cgroup_memory_max: "1073741824".to_string(),
+            cgroup_memory_current: "524288".to_string(),
+            cgroup_pids_max: "512".to_string(),
+            cgroup_pids_current: "3".to_string(),
+            cgroup_cpu_stat: "usage_usec 4200".to_string(),
+            ..Default::default()
+        }
+    );
+}

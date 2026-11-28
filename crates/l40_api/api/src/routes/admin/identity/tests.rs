@@ -1,6 +1,8 @@
 use super::*;
 use axum::body::to_bytes;
 use pplx_space_accounts::OrgId;
+use pplx_space_sql_locator::sql;
+use uuid::Uuid;
 
 #[tokio::test(flavor = "current_thread")]
 async fn password_update_revokes_existing_sessions_but_profile_update_does_not()
@@ -734,7 +736,7 @@ async fn org_delete_blockers_classify_the_database_constraint() -> pplx_space_te
         .await
         .expect_err("encrypted fields restrict their master key's delete");
     assert_eq!(
-        OrgDeleteBlocker::from_delete_error(&error),
+        OrgDeleteBlocker::from_delete_error(&DbError::from(error)),
         Some(OrgDeleteBlocker::Sandboxes)
     );
     tx.rollback().await?;
@@ -755,7 +757,7 @@ async fn org_delete_blockers_classify_the_database_constraint() -> pplx_space_te
         .await
         .expect_err("volume encryption restricts its master key's delete");
     assert_eq!(
-        OrgDeleteBlocker::from_delete_error(&error),
+        OrgDeleteBlocker::from_delete_error(&DbError::from(error)),
         Some(OrgDeleteBlocker::Sandboxes)
     );
     tx.rollback().await?;
@@ -777,7 +779,7 @@ async fn org_delete_blockers_classify_the_database_constraint() -> pplx_space_te
         .await
         .expect_err("template encrypted fields restrict their master key's delete");
     assert_eq!(
-        OrgDeleteBlocker::from_delete_error(&error),
+        OrgDeleteBlocker::from_delete_error(&DbError::from(error)),
         Some(OrgDeleteBlocker::Templates)
     );
     tx.rollback().await?;
@@ -790,7 +792,7 @@ async fn org_delete_blockers_classify_the_database_constraint() -> pplx_space_te
         .await
         .expect_err("encrypted snapshot storage restricts its master key's delete");
     assert_eq!(
-        OrgDeleteBlocker::from_delete_error(&error),
+        OrgDeleteBlocker::from_delete_error(&DbError::from(error)),
         Some(OrgDeleteBlocker::OrphanedSnapshotStorage)
     );
     tx.rollback().await?;
@@ -832,7 +834,7 @@ async fn org_delete_blockers_classify_the_database_constraint() -> pplx_space_te
         .await
         .expect_err("encrypted template release storage restricts its master key's delete");
     assert_eq!(
-        OrgDeleteBlocker::from_delete_error(&error),
+        OrgDeleteBlocker::from_delete_error(&DbError::from(error)),
         Some(OrgDeleteBlocker::Templates)
     );
     tx.rollback().await?;
@@ -858,7 +860,7 @@ async fn org_delete_blockers_classify_the_database_constraint() -> pplx_space_te
         .await
         .expect_err("the managing organization cannot be deleted");
     assert_eq!(
-        OrgDeleteBlocker::from_delete_error(&error),
+        OrgDeleteBlocker::from_delete_error(&DbError::from(error)),
         Some(OrgDeleteBlocker::ManagesCluster)
     );
     tx.rollback().await?;
@@ -1028,6 +1030,14 @@ async fn org_branding_updates_answer_a_field_error_for_invalid_values()
         org["logo_url"],
         serde_json::Value::Null,
         "null still clears"
+    );
+    assert_eq!(
+        org["theme_primary"], "#0a7",
+        "a field the patch omits is kept"
+    );
+    assert_eq!(
+        org["theme_secondary"], "#00AA77",
+        "a field the patch omits is kept"
     );
 
     // A value stored before validation existed is re-sent unchanged by the

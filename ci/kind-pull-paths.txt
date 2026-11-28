@@ -57,6 +57,9 @@ crates/l40_api/template/mgr/server/src/volume.rs
 crates/l40_api/template/mgr/server/src/service/lookup.rs
 infra/space/observability/**
 crates/l10_foundation/observability/**
+# Stores hold the runtime's SQL: statements moved out of the selected service
+# paths above still run on every request and node loop.
+crates/l30_storage/**
 shim/otlp.go
 shim/identity.go
 shim/telemetry*.go

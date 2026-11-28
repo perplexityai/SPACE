@@ -52,8 +52,7 @@ outside `[stale_paths]`:
 * `ARCHITECTURE.toml`: moved crates leave `unmoved`, and a rewritten glob that
   another entry of its list covers is dropped; `architecture-baseline.toml`
   tables whose keys changed are re-sorted as archcheck writes them, each
-  comment staying with the entries it heads;
-* each agent plugin whose content changed gets a patch version bump.
+  comment staying with the entries it heads.
 
 The run exits 1 after listing what it could not rewrite exactly: a path split
 across layers where a single path must go (code, or a `{a,b}` list after it), a
@@ -1031,34 +1030,6 @@ def text_of(data: bytes) -> str | None:
         return None
 
 
-PLUGIN_VERSIONS = (
-    ("plugin.yaml", re.compile(r"(?m)^(version:\s*['\"]?)(\d+)\.(\d+)\.(\d+)")),
-    (".claude-plugin/plugin.json", re.compile(r'("version":\s*")(\d+)\.(\d+)\.(\d+)')),
-    (".codex-plugin/plugin.json", re.compile(r'("version":\s*")(\d+)\.(\d+)\.(\d+)')),
-)
-
-
-def bump_plugins(root: Path, changed: list[str]) -> list[str]:
-    """Bump the patch version of each agent plugin whose shipped content the
-    rewrite changed, in its three manifests (.agents/plugins/AGENTS.md)."""
-    plugins = sorted({f.split("/")[2] for f in changed if f.startswith(".agents/plugins/") and f.count("/") >= 3})
-    lines = []
-    for plugin in plugins:
-        base = root / ".agents/plugins" / plugin
-        for name, rx in PLUGIN_VERSIONS:
-            path = base / name
-            if not path.exists():
-                continue
-            text = path.read_text()
-            m = rx.search(text)
-            if m is None:
-                raise MoveError(f"{path.relative_to(root)} has no version to bump")
-            version = f"{m[2]}.{m[3]}.{int(m[4]) + 1}"
-            path.write_text(text[: m.start()] + m[1] + version + text[m.end():])
-        lines.append(f"plugin {plugin}: version bumped to {version}")
-    return lines
-
-
 def is_text(path: Path) -> str | None:
     if path.is_symlink() or not path.is_file():
         return None
@@ -1133,7 +1104,6 @@ def apply(root: Path, mapping_path: Path) -> int:
         if updated != text:
             path.write_text(updated)
             changed.append(new)
-    bumped = bump_plugins(root, changed)
 
     problems = list(rw.unrewritten)
     problems += glob_changes((root / "ARCHITECTURE.toml").read_text(), before_arch, p, rw.new_files)
@@ -1142,8 +1112,6 @@ def apply(root: Path, mapping_path: Path) -> int:
     run(["cargo", "update", "--workspace", "--offline"], root)
     run(["git", "add", "-u"], root)
     print_lists(p)
-    for line in bumped:
-        print(line)
     if rw.umbrella:
         print(f"left as they are: {len(rw.umbrella)} reference(s) to crates/apps or crates/libs itself:")
         for line in rw.umbrella:

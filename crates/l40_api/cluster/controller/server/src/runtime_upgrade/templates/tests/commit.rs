@@ -105,7 +105,7 @@ async fn a_default_moved_mid_item_commits_no_twin() -> TestResult {
     // reads E1, so the item is leased and moved up to the twin's commit.
     let mut write = fixture.pool().begin().await?;
     set_default(
-        &mut write,
+        &mut *write,
         fixture.e0,
         &PolicyChange {
             actor: None,

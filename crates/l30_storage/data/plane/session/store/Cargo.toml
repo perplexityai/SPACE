@@ -20,6 +20,8 @@ time = { workspace = true }
 
 # internal
 pplx-space-accounts = { workspace = true, features = ["sqlx"] }
+pplx-space-k8s-ids = { workspace = true, features = ["sqlx"] }
+pplx-space-postgres-pool = { workspace = true }
 pplx-space-sandbox-model = { workspace = true, features = ["sqlx"] }
 pplx-space-sql-locator = { workspace = true }
 

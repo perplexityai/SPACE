@@ -198,7 +198,8 @@ use std::time::{Duration, Instant};
 
 use crate::metrics::cluster_reconciler::{
     self as metrics, AgedTransientOutcome, CleanupOutcome, CommandReadyOutcome,
-    FailedCleanupOutcome, Loop, OutcomeEvent, UnrestorableOutcome, WakeLifecycle,
+    FailedCleanupOutcome, Loop, OutcomeEvent, UnrestorableOutcome, VERDICT_NOT_PROBED,
+    WakeLifecycle,
 };
 use pplx_space_api::controllers::substrate::{
     AbandonedRestoreRetirement, CommandReadyProbe, PodFenceMismatch, RetireExecutionOutcome,
@@ -737,9 +738,8 @@ pub(crate) const DEFAULT_COMMAND_READY_PENDING_PROBE_TIMEOUT: Duration = Duratio
 pub(crate) const DEFAULT_COMMAND_READY_PENDING_TERMINAL_AGE_SECS: u64 = 3600;
 /// Minimum time since the last placement change before a provably-
 /// unrestorable `restoring` row (no source node, no eligible snapshot, no
-/// in-flight upload — see
-/// `pplx_space_sandbox_store::sweeper::unrestorable_restoring_guards`) is
-/// failed.
+/// in-flight upload — see `unrestorable_restoring_guards` in
+/// `pplx-space-sandbox-store`'s `sweeper` module) is failed.
 /// The predicate itself is the primary guard; this window is belt-and-braces
 /// against enqueue latency and unmodeled transients, so it only needs to
 /// comfortably exceed suspend→backup-enqueue time (seconds).
@@ -1237,9 +1237,9 @@ pub trait SweepSink: Send + Sync + 'static {
     /// `placement_changed_at`, **not** `lifecycle_changed_at`: restore claims
     /// preserve the latter as the source-selection boundary, so it is not an
     /// activity clock; legacy rows may also carry prior lifecycle-clock
-    /// refreshes. See
-    /// `pplx_space_sandbox_store::sweeper::unrestorable_restoring_guards` for
-    /// the full predicate and the deliberate absence of a lease guard.
+    /// refreshes. See `unrestorable_restoring_guards` in
+    /// `pplx-space-sandbox-store`'s `sweeper` module for the full predicate
+    /// and the deliberate absence of a lease guard.
     fn list_unrestorable_restoring(
         &self,
         min_placement_age: PositiveDuration,
@@ -1650,11 +1650,16 @@ impl<S: SweepSink> Reconciler<S> {
         {
             Ok(claimed) => claimed,
             Err(err) => {
-                tracing::warn!(
-                    sandbox_id = %candidate.sandbox_id,
-                    error = %err,
-                    "transient_lifecycle_sweeper: converge CAS failed; will retry on next tick"
-                );
+                OutcomeEvent::aged_transient(
+                    AgedTransientOutcome::Error,
+                    candidate.lifecycle.as_str(),
+                    verdict.as_str(),
+                )
+                .reason("converge_write_failed")
+                .sandbox_id(candidate.sandbox_id)
+                .age_secs(candidate.age.as_secs())
+                .error(&err)
+                .warn();
                 return;
             }
         };
@@ -1754,12 +1759,16 @@ impl<S: SweepSink> Reconciler<S> {
         {
             Ok(claimed) => claimed,
             Err(err) => {
-                tracing::warn!(
-                    sandbox_id = %candidate.sandbox_id,
-                    error = %err,
-                    "transient_lifecycle_sweeper: converge CAS failed after hydration; \
-                     will retry on next tick"
-                );
+                OutcomeEvent::aged_transient(
+                    AgedTransientOutcome::Error,
+                    candidate.lifecycle.as_str(),
+                    verdict.as_str(),
+                )
+                .reason("converge_write_failed")
+                .sandbox_id(candidate.sandbox_id)
+                .age_secs(candidate.age.as_secs())
+                .error(&err)
+                .warn();
                 return;
             }
         };
@@ -1850,11 +1859,16 @@ impl<S: SweepSink> Reconciler<S> {
         {
             Ok(claimed) => claimed,
             Err(err) => {
-                tracing::warn!(
-                    sandbox_id = %candidate.sandbox_id,
-                    error = %err,
-                    "transient_lifecycle_sweeper: revert CAS failed; will retry on next tick"
-                );
+                OutcomeEvent::aged_transient(
+                    AgedTransientOutcome::Error,
+                    candidate.lifecycle.as_str(),
+                    verdict.as_str(),
+                )
+                .reason("revert_write_failed")
+                .sandbox_id(candidate.sandbox_id)
+                .age_secs(candidate.age.as_secs())
+                .error(&err)
+                .warn();
                 return;
             }
         };
@@ -1980,13 +1994,18 @@ impl<S: SweepSink> Reconciler<S> {
                         sandbox_id = %candidate.sandbox_id,
                         "the reverted row moved on before the refused retire could undo it"
                     ),
-                    Err(err) => tracing::error!(
-                        sandbox_id = %candidate.sandbox_id,
-                        error = %err,
-                        lifecycle = %candidate.lifecycle,
+                    Err(err) => OutcomeEvent::substrate_cleanup(
+                        CleanupOutcome::Error,
+                        candidate.lifecycle.as_str(),
+                    )
+                    .reason("undo_revert_write_failed")
+                    .sandbox_id(candidate.sandbox_id)
+                    .error(&err)
+                    .detail(
                         "could not undo a revert whose cleanup was refused; the row is \
-                         suspended with an active execution and no reconciler revisits it"
-                    ),
+                         suspended with an active execution and no reconciler revisits it",
+                    )
+                    .error_level(),
                 }
             }
             Err(err) => {
@@ -2080,12 +2099,16 @@ impl<S: SweepSink> Reconciler<S> {
         {
             Ok(claimed) => claimed,
             Err(err) => {
-                tracing::warn!(
-                    sandbox_id = %sandbox_id,
-                    lifecycle = %lifecycle_label,
-                    error = %err,
-                    "transient_lifecycle_sweeper: fail CAS failed; will retry on next tick"
-                );
+                OutcomeEvent::aged_transient(
+                    AgedTransientOutcome::Error,
+                    &lifecycle_label,
+                    verdict.as_str(),
+                )
+                .reason("give_up_write_failed")
+                .sandbox_id(sandbox_id)
+                .age_secs(candidate.age.as_secs())
+                .error(&err)
+                .warn();
                 return;
             }
         };
@@ -2214,13 +2237,17 @@ impl<S: SweepSink> Reconciler<S> {
                         sandbox_id = %sandbox_id,
                         "the failed row moved on before the refused retire could undo it"
                     ),
-                    Err(err) => tracing::error!(
-                        sandbox_id = %sandbox_id,
-                        error = %err,
-                        lifecycle = %lifecycle_label,
-                        "could not undo an age-out whose retire was refused; the row is failed \
-                         with a live execution and nothing walks a failed row back"
-                    ),
+                    Err(err) => {
+                        OutcomeEvent::substrate_cleanup(CleanupOutcome::Error, &lifecycle_label)
+                            .reason("undo_give_up_write_failed")
+                            .sandbox_id(sandbox_id)
+                            .error(&err)
+                            .detail(
+                                "could not undo an age-out whose retire was refused; the row is \
+                                 failed with a live execution and nothing walks a failed row back",
+                            )
+                            .error_level()
+                    }
                 }
             }
             Err(err) => {
@@ -2279,12 +2306,12 @@ impl<S: SweepSink> Reconciler<S> {
             let claimed = match self.sink.fail_unrestorable_restoring(sandbox_id, age).await {
                 Ok(claimed) => claimed,
                 Err(err) => {
-                    tracing::warn!(
-                        sandbox_id = %sandbox_id,
-                        error = %err,
-                        "transient_lifecycle_sweeper: unrestorable-restoring fail CAS \
-                         errored; will retry on next tick"
-                    );
+                    OutcomeEvent::unrestorable_restoring(UnrestorableOutcome::Error)
+                        .reason("fail_write_failed")
+                        .sandbox_id(sandbox_id)
+                        .age_secs(placement_age.as_secs())
+                        .error(&err)
+                        .warn();
                     continue;
                 }
             };
@@ -2382,12 +2409,12 @@ impl<S: SweepSink> Reconciler<S> {
             {
                 CommandReadyProbe::Ready => {
                     if let Err(err) = self.sink.heal_command_ready_pending(sandbox_id).await {
-                        tracing::warn!(
-                            sandbox_id = %sandbox_id,
-                            error = %err,
-                            "transient_lifecycle_sweeper: failed to clear command_ready_pending \
-                             marker after a ready probe; will retry on next tick"
-                        );
+                        OutcomeEvent::command_ready_pending(CommandReadyOutcome::Error)
+                            .reason("heal_write_failed")
+                            .sandbox_id(sandbox_id)
+                            .age_secs(pending_age.as_secs())
+                            .error(&err)
+                            .warn();
                         continue;
                     }
                     OutcomeEvent::command_ready_pending(
@@ -2497,11 +2524,13 @@ impl<S: SweepSink> Reconciler<S> {
         let write_token = match self.sink.reap_command_ready_pending(sandbox_id).await {
             Ok(claimed) => claimed,
             Err(err) => {
-                tracing::warn!(
-                    sandbox_id = %sandbox_id,
-                    error = %err,
-                    "transient_lifecycle_sweeper: reap CAS failed; will retry on next tick"
-                );
+                OutcomeEvent::command_ready_pending(CommandReadyOutcome::Error)
+                    .reason("reap_write_failed")
+                    .sandbox_id(sandbox_id)
+                    .age_secs(pending_age.as_secs())
+                    .detail(outcome.as_str())
+                    .error(&err)
+                    .warn();
                 return;
             }
         };
@@ -2612,12 +2641,15 @@ impl<S: SweepSink> Reconciler<S> {
                         sandbox_id = %sandbox_id,
                         "the reaped row moved on before the refused retire could undo it"
                     ),
-                    Err(err) => tracing::error!(
-                        sandbox_id = %sandbox_id,
-                        error = %err,
-                        "could not undo a reap whose retire was refused; the row is failed \
-                         without its command-ready marker and will not be reaped again"
-                    ),
+                    Err(err) => OutcomeEvent::substrate_cleanup(CleanupOutcome::Error, "started")
+                        .reason("undo_reap_write_failed")
+                        .sandbox_id(sandbox_id)
+                        .error(&err)
+                        .detail(
+                            "could not undo a reap whose retire was refused; the row is failed \
+                             without its command-ready marker and will not be reaped again",
+                        )
+                        .error_level(),
                 }
             }
             Err(err) => {
@@ -2689,6 +2721,7 @@ impl<S: SweepSink> Reconciler<S> {
                     FailedCleanupOutcome::Error,
                     observation.verdict.as_str(),
                 )
+                .reason("repair_write_failed")
                 .sandbox_id(sandbox_id)
                 .detail(node_status_label(observation))
                 .error(&error)
@@ -2786,11 +2819,18 @@ impl<S: SweepSink> Reconciler<S> {
             // Rotate before acting either way, so a persistently deferred
             // candidate cannot monopolize the front of the batch.
             if let Err(error) = self.sink.note_failed_cleanup_attempt(sandbox_id).await {
-                tracing::warn!(
-                    sandbox_id = %sandbox_id,
-                    error = %error,
-                    "transient_lifecycle_sweeper: failed to rotate failed cleanup candidate; skipping attempt"
-                );
+                // A waiting candidate was not probed, so it has no verdict.
+                let event = if waiting.contains(&sandbox_id) {
+                    OutcomeEvent::failed_cleanup(FailedCleanupOutcome::Error, VERDICT_NOT_PROBED)
+                } else {
+                    OutcomeEvent::failed_cleanup(FailedCleanupOutcome::Error, verdict.as_str())
+                        .detail(node_status_label(observation))
+                };
+                event
+                    .reason("rotate_write_failed")
+                    .sandbox_id(sandbox_id)
+                    .error(&error)
+                    .warn();
                 continue;
             }
             if waiting.contains(&sandbox_id) {
@@ -2824,12 +2864,12 @@ impl<S: SweepSink> Reconciler<S> {
                         continue;
                     }
                     Err(error) => {
-                        tracing::warn!(
-                            sandbox_id = %sandbox_id,
-                            error = %error,
-                            "transient_lifecycle_sweeper: could not re-read a failed create's \
-                             first activation; not retiring its live VM this tick"
-                        );
+                        OutcomeEvent::failed_cleanup(FailedCleanupOutcome::Error, verdict.as_str())
+                            .reason("first_activation_read_failed")
+                            .sandbox_id(sandbox_id)
+                            .detail(node_status_label(observation))
+                            .error(&error)
+                            .warn();
                         continue;
                     }
                 }

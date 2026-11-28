@@ -80,7 +80,8 @@ async fn ranked_fleet_occupancy_counts_only_unmarked_restores_as_drain_blockers(
 }
 
 /// The `:terminate` guard's `active` count applies the census discount, so it
-/// refuses exactly what node-drain's gate and `mark_terminating_query` refuse.
+/// refuses exactly what node-drain's gate and `drained_node::mark_terminating`
+/// refuse.
 ///
 /// This is the wedge the guard would otherwise be: `active` used to restate the
 /// exclusion list with no census term. A worker whose own census disproves its
@@ -157,4 +158,64 @@ async fn terminate_guard_active_count_honors_the_census_discount() -> TestResult
         );
     }
     Ok(())
+}
+
+/// The ordinary admin listing asks for no drainability counters, so its
+/// occupancy CTE must stay streamable. Materializing it would spool every
+/// active sandbox row in the listed set into a tuplestore — on a fleet listing
+/// that is the whole `sandboxes` working set, and the listing predates the
+/// ranking, so paying that cost for it is a regression rather than a tradeoff.
+///
+/// Materialization is only owed to the mode that plans a correlated census
+/// subquery per row, where re-evaluating it three times is the worse cost.
+///
+/// This guards the *decision*, not the plan: it pins which of the two modes
+/// gets the optimizer fence, which is the regression that matters. It does not
+/// verify the plan-shape reasoning in `row_cte_materialization`'s docstring —
+/// no `EXPLAIN` runs anywhere in this module, so the per-aggregate re-expansion
+/// and `jit_above_cost` claims rest on the shared fragment's own measurements
+/// rather than on this assertion.
+#[test]
+fn only_census_aware_ranking_materializes_the_per_row_cte() {
+    for residency in [
+        ResidencyEvidence::LifecycleOnly,
+        ResidencyEvidence::NodeCensusAware,
+    ] {
+        assert_eq!(
+            super::row_cte_materialization(false, residency),
+            "",
+            "a listing with no ranking has no expensive flag to protect, \
+             whatever the cluster's residency policy is"
+        );
+    }
+
+    assert_eq!(
+        super::row_cte_materialization(true, ResidencyEvidence::LifecycleOnly),
+        "",
+        "lifecycle-only ranking plans no census probe, so the flags are a \
+         constant and an `IN` test over a column already on the row"
+    );
+    assert_eq!(
+        super::row_cte_materialization(true, ResidencyEvidence::NodeCensusAware),
+        " MATERIALIZED",
+        "three aggregates over an inlined census predicate is three \
+         evaluations of the absence proof per row"
+    );
+
+    // The fleet statements spell the fence out; pin each shape to the
+    // decision above.
+    for ranked in [false, true] {
+        for residency in [
+            ResidencyEvidence::LifecycleOnly,
+            ResidencyEvidence::NodeCensusAware,
+        ] {
+            assert_eq!(
+                super::fleet_occupancy_statement(ranked, residency)
+                    .contains("active_rows AS MATERIALIZED ("),
+                ranked && residency == ResidencyEvidence::NodeCensusAware,
+                "the fleet statement fences active_rows only for census-aware ranking \
+                 (ranked {ranked}, {residency:?})"
+            );
+        }
+    }
 }

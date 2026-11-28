@@ -8,6 +8,7 @@ use pplx_space_state_reconciliation::ReconcileReason;
 use super::*;
 
 mod canary;
+mod round;
 
 /// Bound for tests only: there is no production first-check delay yet.
 const FIRST_CHECK_IN: Duration = Duration::from_secs(90);
@@ -32,15 +33,15 @@ enum Queue {
 }
 
 impl Wakeup for Queue {
-    async fn wake(
-        &mut self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        node: NodeId,
-    ) -> Result<u64, sqlx::Error> {
+    async fn wake<C>(&mut self, tx: &mut C, node: NodeId) -> Result<u64, DbError>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         if let Self::Fails = self {
-            return Err(sqlx::Error::Protocol("injected wakeup failure".into()));
+            return Err(sqlx::Error::Protocol("injected wakeup failure".into()).into());
         }
-        let queued = enqueue_triggers_tx(tx, [node], ReconcileReason::FirewallRulesChanged).await?;
+        let queued =
+            enqueue_triggers_tx(&mut *tx, [node], ReconcileReason::FirewallRulesChanged).await?;
         match *self {
             Self::Reports(count) => Ok(count),
             Self::ThenLapses => {
@@ -50,7 +51,7 @@ impl Wakeup for Queue {
                      WHERE node_id = $1 AND phase = 'in_flight'"
                 ))
                 .bind(node)
-                .execute(&mut **tx)
+                .execute((&mut *tx).into_sqlx())
                 .await?;
                 Ok(queued)
             }
@@ -61,7 +62,7 @@ impl Wakeup for Queue {
                      WHERE node_id = $1 AND phase = 'in_flight'"
                 ))
                 .bind(node)
-                .execute(&mut **tx)
+                .execute((&mut *tx).into_sqlx())
                 .await?;
                 Ok(queued)
             }
@@ -70,7 +71,7 @@ impl Wakeup for Queue {
                     "ALTER TABLE firewall_rules_rollout_items
                      ADD CONSTRAINT test_no_release CHECK (lease_token IS NOT NULL) NOT VALID"
                 ))
-                .execute(&mut **tx)
+                .execute((&mut *tx).into_sqlx())
                 .await?;
                 Ok(queued)
             }
@@ -85,7 +86,9 @@ async fn issue_with(
     mut queue: Queue,
 ) -> Result<Issuance, sqlx::Error> {
     let mut conn = pool.acquire().await?;
-    issue_first_assignment(&mut conn, target, FIRST_CHECK_IN, &mut queue).await
+    issue_first_assignment(&mut conn, target, FIRST_CHECK_IN, &mut queue)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 /// Issue with the real wakeup, which must succeed.
@@ -96,14 +99,16 @@ async fn issued(pool: &PgPool, target: &LeasedTarget) -> TestResult<Stamp> {
     }
 }
 
-/// Everything issuance may write for `node`: its assignment (generation,
-/// revision), its item's stamp and schedule, and its trigger row (reasons,
-/// generation, attempts, requested and next attempt times).
+/// Everything issuance or a round's opening may write for `node`: its
+/// assignment (generation, revision), its item's stamp and schedule, its
+/// trigger row (reasons, generation, attempts, requested and next attempt
+/// times), and its observation row.
 #[derive(Debug, PartialEq)]
 struct Effects {
     assignment: Option<(i64, Uuid)>,
     stamp: Option<(Option<i64>, Option<Timestamp>, Option<Timestamp>)>,
     trigger: Option<(Vec<String>, i64, i32, OffsetDateTime, OffsetDateTime)>,
+    observation: Option<Observation>,
 }
 
 impl Effects {
@@ -111,7 +116,19 @@ impl Effects {
         assignment: None,
         stamp: Some((None, None, None)),
         trigger: None,
+        observation: None,
     };
+}
+
+#[derive(Debug, PartialEq, sqlx::FromRow)]
+struct Observation {
+    manager_epoch: i64,
+    pending_round: Option<i64>,
+    pending_round_issued_at: Option<OffsetDateTime>,
+    pending_assignment_generation: Option<i64>,
+    accepted_round: Option<i64>,
+    accepted_round_issued_at: Option<OffsetDateTime>,
+    accepted_report: Option<String>,
 }
 
 async fn effects(pool: &PgPool, rollout: RolloutId, node: NodeId) -> TestResult<Effects> {
@@ -139,6 +156,15 @@ async fn effects(pool: &PgPool, rollout: RolloutId, node: NodeId) -> TestResult<
         trigger: sqlx::query_as(sql!(
             "SELECT reasons::text[], generation, attempts, requested_at, next_attempt_at
              FROM node_reconcile_triggers WHERE node_id = $1"
+        ))
+        .bind(node)
+        .fetch_optional(pool)
+        .await?,
+        observation: sqlx::query_as(sql!(
+            "SELECT manager_epoch, pending_round, pending_round_issued_at,
+                    pending_assignment_generation, accepted_round,
+                    accepted_round_issued_at, accepted_report::text AS accepted_report
+             FROM firewall_rules_node_observations WHERE node_id = $1"
         ))
         .bind(node)
         .fetch_optional(pool)
@@ -407,10 +433,10 @@ async fn the_first_to_lock_the_header_wins_pause_or_abort_against_issuance() -> 
     save_targets(&db.pool, rollout, &nodes).await?;
     let leased = lease(&db.pool, rollout, 10).await?;
 
-    let mut pausing = hold_header(&db.pool, rollout).await?;
+    let mut pausing = hold_header(&Db::from(db.pool.clone()), rollout).await?;
     let issuing = spawn_issue(&db.pool, &leased[0]);
     wait_for_lock_waiters(&db.pool, 1).await?;
-    set_phase(&mut *pausing, rollout, "paused").await?;
+    set_phase(&mut pausing, rollout, "paused").await?;
     pausing.commit().await?;
     assert_eq!(issuing.await??, Issuance::Refused(Refusal::NotIssuing));
     assert_eq!(effects(&db.pool, rollout, a).await?, Effects::NONE);

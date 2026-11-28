@@ -7,9 +7,10 @@
 
 use pplx_space_accounts::OrgId;
 use pplx_space_node_model::{NodeGroupName, NodeGroupTemplatePolicy};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use pplx_space_template_model::TemplateVisibility;
-use sqlx::{FromRow, PgExecutor};
+use sqlx::FromRow;
 use uuid::Uuid;
 
 /// One row per node group, in group-name order. Every `group_*` column is
@@ -37,9 +38,9 @@ pub struct TemplateCatalogRow {
 
 /// Read the catalog rows for one template name.
 pub async fn template_catalog(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &str,
-) -> Result<Vec<TemplateCatalogRow>, sqlx::Error> {
+) -> Result<Vec<TemplateCatalogRow>, DbError> {
     // `desired_state` is deliberately not filtered. It records whether a
     // template is *publishable*, and a suspended sandbox whose template was
     // since deleted still has to resolve a candidate set to restore into; the
@@ -57,7 +58,7 @@ pub async fn template_catalog(
     // caller's own string is the one that has to survive into the placement
     // anyway — the pod builder cross-checks the placement's template against
     // the template the pod renders.
-    sqlx::query_as::<_, TemplateCatalogRow>(sql!(
+    Ok(sqlx::query_as::<_, TemplateCatalogRow>(sql!(
         "SELECT t.org_id AS template_org_id,
                 t.visibility AS template_visibility,
                 g.id AS group_id,
@@ -84,6 +85,6 @@ pub async fn template_catalog(
           ORDER BY g.name ASC"
     ))
     .bind(template_name)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }

@@ -23,13 +23,69 @@ Exemplar: `crates/l30_storage/sandbox/store` (`pplx-space-sandbox-store`, the
   and limits is the default. No query builder and no `SELECT`-shaped
   arguments — callers pick an API, never pass columns, predicates, or sort
   orders.
-- Executor-generic free functions (`impl PgExecutor`) so an operation composes
-  into the caller's open transaction. A pool-owning store forces callers to
-  choose between committing early and bypassing the store.
-- `sql!` locators on every statement; small operation-specific `thiserror`
-  enums. A guarded write that matches zero rows is an outcome
-  (`Option`/`bool`), not an error — "another writer won" is a normal race
-  result.
+- Free functions on `pplx-space-postgres-pool`'s handles so an operation
+  composes into the caller's open transaction. A pool-owning store forces
+  callers to choose between committing early and bypassing the store. A verb
+  that runs one statement on whatever the caller passes, the pool or its
+  transaction, takes `impl Executor<'_>` and runs it on
+  `executor.into_sqlx()`, which consumes the executor. A verb that runs
+  several statements takes `impl Executor<'_> + Copy`, which only a pool
+  satisfies, when each statement may run on whichever connection the pool
+  hands out, as `pplx-space-firewall-rules-store`'s `read_adopted` does.
+  When its statements must run in the caller's transaction, for example to
+  read one snapshot of a `db.begin_snapshot()` transaction or to see the
+  caller's uncommitted writes, it takes the caller's transaction in the form
+  the next item gives and runs each statement on `(&mut *tx).into_sqlx()`, as
+  that store's `fetch_instructions` does.
+- A verb whose lock the caller relies on after the statement, that runs under
+  a lock the caller took, or that must commit together with another of the
+  caller's statements takes the caller's transaction: `tx: &mut C` where
+  `for<'a> &'a mut C: Executor<'a>`, which accepts a `Tx` or a
+  `PgConnection` and refuses a pool. The bound cannot prove a transaction is
+  open, so the verb's doc says the caller must pass its open transaction. Take
+  `&mut Tx` instead where every caller already holds one. A verb that opens
+  its own transaction takes `&Db` and calls `db.begin()` (or
+  `db.begin_snapshot()`).
+- No sqlx type in a store's public signatures, public fields or public type
+  aliases; sqlx stays the store's own dependency. A Storage crate depends on
+  `pplx-space-postgres-pool` without a `[rules.layers.store_users]` entry
+  (archcheck's `[rules.layers] storage_handles`). A JSON column or argument
+  crosses the API as its plain Rust type (the typed document or
+  `serde_json::Value`): public rows, verb arguments and return types use
+  `T`, `Option<T>`, `&T`, `Vec<T>` or `&[T]`, and `sqlx::types::Json`
+  appears only inside the store. There it keeps the shape of the SQL value:
+  `Json<T>` for one document, `Option<Json<T>>` where the value can be SQL
+  NULL, `Json<Option<T>>` where a `NOT NULL` column stores `None` as JSON
+  `null`, and `Vec<Json<T>>` for a `JSONB[]`. Decode a document field of a
+  `FromRow` row with `#[sqlx(json)]` only when its type is not an `Option`:
+  the attribute decodes `Json<field type>`, which fails on SQL NULL. Decode
+  anything else as its shape, in a private row or at the `query_scalar` or
+  `try_get`, and map `.0` (per element for a `JSONB[]`). Don't use
+  `#[sqlx(json(nullable))]` where the column can hold JSON `null`: it
+  decodes a stored JSON `null` as `None`, like SQL NULL. A
+  `serde_json::Value` or `Option<serde_json::Value>` field or argument may
+  instead decode and bind as itself, with no `Json`, the `Option` form only
+  where `None` is SQL NULL (it binds `None` as SQL NULL and decodes a stored
+  JSON `null` as `Some(Value::Null)`): sqlx's `Value` impls go through
+  `Json`, as `SandboxNetworkPolicyInputs` shows. Bind a document as
+  `Json(&value)`, including an optional value that a `NOT NULL` column
+  stores as JSON `null`; an optional value of a nullable column as
+  `value.as_ref().map(Json)` (`Json(&None)` stores JSON `null`, not SQL
+  NULL); and a `JSONB[]` as `values.iter().map(Json).collect::<Vec<_>>()`
+  (`Json(&values)` binds one document holding an array, as
+  `jsonb_to_recordset($1::jsonb)` reads). A `JSONB[]` whose elements can be
+  SQL NULL is a `Vec<Option<Json<T>>>`, each element bound as
+  `v.as_ref().map(Json)`: `.map(Json)` turns a `None` into a JSON `null`
+  element, and `Json<T>` fails to decode a SQL NULL element.
+- `sql!` locators on every statement. Verbs return `DbError`, or a small
+  operation-specific `thiserror` enum with a variant that wraps `DbError`
+  (usually `#[from] DbError`); callers classify a failure with
+  `DbError::kind()`, `constraint()` and `is_lock_contention()`, never by
+  matching the driver's error. A failure a caller must tell apart that
+  `kind()` reports as `Other`, such as an I/O, decode or closed-pool error,
+  first gets its own `DbErrorKind` in `pplx-space-postgres-pool`. A guarded
+  write that matches zero rows is an outcome (`Option`/`bool`), not an error
+  — "another writer won" is a normal race result.
 - Verbs and record columns are added with their first migrated caller, never
   speculatively, and `SELECT` lists stay explicit.
 - Keep every SQL statement syntactically whole and reviewable at its query
@@ -80,7 +136,7 @@ Exemplar: `crates/l30_storage/sandbox/store` (`pplx-space-sandbox-store`, the
   warm against different releases of one digest. Build the statement once,
   bind every value, and keep the rest of the statement whole at its query
   site.
-- The last is the column list of one row type read from one table: a shared
+- Another is the column list of one row type read from one table: a shared
   constant of that table's bare column names, with no expressions, aliases, or
   joined columns, matching one `FromRow` struct field for field. Interpolate it
   only as the entire `SELECT` list of a statement whose only `FROM` item is that
@@ -89,7 +145,24 @@ Exemplar: `crates/l30_storage/sandbox/store` (`pplx-space-sandbox-store`, the
   column to one SQL edit, and no read falls back to `SELECT *`, whose cached
   statements fail with `0A000` once the table gains or loses a column. Nothing
   else is exempt: predicates, joins, `FROM` clauses, assignments, ordering, and
-  any other column list stay whole at their query sites.
+  any other column list stay whole at their query sites, except as the next
+  item allows.
+- The last is a store-private projection and join for one family of reads: a
+  store module may keep one constant of the select list (columns and
+  expressions across joined tables, each named for a field of one `FromRow`
+  struct) and one constant of the joins that list needs, lateral subqueries
+  included, used only by that module's own statements. Each such statement
+  decodes that struct, directly or through a `#[sqlx(flatten)]` field of a
+  row that adds the statement's own columns after the list, such as a page's
+  `has_next`. Keep both constants private to the module (no `pub` of any
+  kind) and build each statement once (a `LazyLock<String>`) from them plus
+  everything else written whole in that statement, or interpolated as an item
+  above allows: its CTEs, the `FROM` items the joins follow, its predicates,
+  any keyset condition or page walk, its ordering and its limits. Bind every
+  value. Nothing else builds part of these statements, inside the module or
+  out of it. It exists for read families that share a wide multi-table
+  projection, such as the sandbox listing and fetch reads, so a column change
+  stays one edit.
 - A migration that changes a predicate's shape (`SELECT EXISTS(..)` to
   `get(..).is_some_and(..)`, a hand-rolled probe onto a shared fragment) pins
   the equivalence with a Postgres-backed test before it merges.
@@ -116,9 +189,10 @@ move must keep.
     and nothing changes.
 
   The caller keeps its transaction, its locks, and the decision of what to do
-  with each outcome. Two kinds stay with the paths that issue them: the
-  execution-ownership writes of `sandbox_k8s_executions`, as
-  `pplx-space-sandbox-store`'s `k8s_executions` docs say, and node drain's
+  with each outcome. A guarded statement that writes two owners' tables
+  splits into one such verb per store, which a coordinator runs, in the
+  caller's open transaction when the statement was one step of it (see
+  Coordinators). One kind stays with the path that issues it: node drain's
   phase compare-and-sets, as `pplx-space-node-registration-store`'s docs say.
   Other store docs that say a guarded write stays at its call site do not
   override this item; the change that moves the write updates them. The
@@ -147,9 +221,10 @@ move must keep.
   still move as a store verb, under these conditions:
   - the statement moves verbatim, lock clause included (`OF …`, `NOWAIT`,
     `SKIP LOCKED`), along with any setting written in the same statement;
-  - the verb takes the caller's `&mut sqlx::Transaction<'_, Postgres>`, or
-    `&mut sqlx::PgConnection` when every caller passes its open transaction
-    (`&mut *tx`). It never takes `impl PgExecutor`, which also accepts a
+  - the verb takes the caller's open transaction, as `tx: &mut C` where
+    `for<'a> &'a mut C: Executor<'a>`, or `&mut Tx` where every caller
+    already holds one, and its doc says the caller must pass its open
+    transaction. It never takes `impl Executor<'_>`, which also accepts a
     pool;
   - its name says it locks (`lock_…`, `share_lock_…`, `…_locked`), and its
     doc says the lock lasts until the caller's transaction ends, as
@@ -162,8 +237,8 @@ move must keep.
   with the caller that owns the transaction. A lock that serves only its own
   statement, such as a `FOR UPDATE` CTE or subquery that feeds the same
   statement's `UPDATE` or `DELETE`, needs no caller transaction, and its
-  verb may be executor-generic, as `pplx-space-sandbox-store`'s
-  `ingest::mark_published_failed` is. A session-level advisory lock
+  verb may take `impl Executor<'_>`, as `pplx-space-sandbox-store`'s
+  `restore_lease::claim_user_restore` does. A session-level advisory lock
   (`pg_advisory_lock`) outlives the transaction; leave it with the code that
   unlocks it.
 - **Database-clock predicates.** A `NOW()`-relative freshness check decides
@@ -180,6 +255,62 @@ When a store change adds a workspace crate or dependency edge, run a lib-only
 unification and can mask a missing cargo feature on the crate itself. Release
 artifact digests read the crate graph from the workspace manifests, so no
 input list needs updating.
+
+### Coordinators
+
+A coordinator (`crates/l30_storage/<area>/coordinator`,
+`pplx-space-<area>-coordinator`) runs one transaction across two or more
+stores: it calls each store's verb for that store's own rows and keeps which
+rows change together and in what order they are locked. When the split
+statement is one step of a transaction a service already owns, such as
+internal-api's node-state publish, the coordinator's verb takes that open
+transaction, and its docs say which locks the caller must already hold;
+otherwise the coordinator opens and commits the transaction itself. It
+reaches Postgres through `pplx-space-postgres-pool` alone: it takes the
+caller's open transaction as `&mut pplx_space_postgres_pool::Tx`, or opens
+its own with `Db::begin` and ends it with `Tx::commit`. It passes the
+transaction to each store verb (`&mut tx` for one it opened, `&mut *tx` for
+one it was given). A verb that runs under a lock an earlier step took, that
+must commit together with the other steps, or whose lock the caller relies on
+after the statement takes the caller's transaction (see the store shape and
+"Locks the caller relies on after the statement" above); any other takes
+`impl Executor<'_>`. So neither the coordinator nor its callers name a driver
+type. While its caller still opens the transaction with the driver and passes
+`&mut *tx`, the verb takes any `&mut C` where
+`for<'a> &'a mut C: Executor<'a>`, documents that the caller must pass an open
+transaction, and narrows to `Tx` once the caller moves. The caller decides what
+to write and when, passes that in, and gets each guarded
+verb's outcome back to act on. Make one only when one of
+these holds:
+
+- a statement writes two owners' tables (today through a co-writer grant),
+  including a guarded transition that spans stores: split it into one verb
+  per store and run them from the coordinator. Each verb that keeps a guard
+  takes the guarded-transition form above, its guard whole and bound to the
+  caller's values, named for the transition, its outcome returned and its
+  losing case pinned by a store test. The split takes the guard or row lock
+  the old statement relied on first. The steps that follow it may return
+  nothing, as that item allows, and run only if the guard matched. A
+  Postgres-backed test shows the split keeps the old statement's
+  all-or-nothing result, losing case included;
+- two or more services run the same multi-store transaction;
+- a cross-store invariant or lock order needs enforcing in one place.
+
+A statement in one store that writes only another store's table needs no
+coordinator: it moves into the owning store as a verb, which the first store
+calls as one of its users.
+
+Otherwise the service opens its own transaction and calls the stores.
+
+Each coordinator documents its lock order in its crate docs: which rows it
+locks, in which order, and why. It owns no tables and has no normal or build
+dependency on a driver, storage helper or codec facade, which archcheck's
+`layers` rule enforces, as it does the `[rules.layers.coordinator_users]`
+list in `ARCHITECTURE.toml`. It holds no SQL either; archcheck reports only a
+write statement in it that names a table a store owns
+(`layers.state.writes`) and checks no other SQL. No long
+external I/O (network calls, object storage, waits on another service) runs
+while its transaction is open. archcheck does not check for it.
 
 ## PostgreSQL migrations
 
@@ -232,3 +363,16 @@ isolated clones; direct `cargo test` can use a process-local testcontainer.
 Unavailable Postgres or Redis fails the test unless the run opts out with
 `SPACE_TEST_DEPS_OPTIONAL=1`. Opted-out skips are diagnostic only, not
 acceptable final validation when Docker can be started.
+
+A statement on a hot path that matches rows of a table growing per template,
+node or org, such as releases, against other rows of it needs a plan-cost
+test: seed one owner with a few hundred rows among other owners' rows, so the
+tables are too large to rescan cheaply, and bound the per-row work its plan
+does under both plan modes, through `pplx_space_db_test_fixtures::plan`
+(its docs say why both), on the statement text the store runs. Bound how much
+more the plan touches at a fixture several times larger too, which catches an
+index walked per row. Show the bounds catch the regression by mutating the
+statement, such as wrapping the probed column, and say so in the pull
+request; a check that drops an index breaks once another index serves the
+probe. `crates/l30_storage/template/release/store/src/plan_tests.rs` is an
+example.

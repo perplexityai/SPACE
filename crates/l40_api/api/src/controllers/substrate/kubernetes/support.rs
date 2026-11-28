@@ -872,6 +872,11 @@ pub(super) enum WakeRpcErrorDisposition {
     /// its Pod is deleted, while the process still runs out its termination.
     /// The wake is retried as an operation, by whichever executor claims it.
     CallerUnauthenticated,
+    /// A node drain sealed the node, which refused the wake before any VM
+    /// work: the caller retries, and the wake lands elsewhere once the drain
+    /// has made the sandbox durable, or goes through once the node is
+    /// undrained.
+    NodeSealed,
     Fail,
 }
 
@@ -885,6 +890,9 @@ pub(super) fn classify_wake_rpc_error(error: &tonic::Status) -> WakeRpcErrorDisp
             .contains(pplx_space_rpc_contracts::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER)
     {
         return WakeRpcErrorDisposition::ReadinessPoll("missing_runtime_context");
+    }
+    if crate::controllers::is_activation_sealed(error) {
+        return WakeRpcErrorDisposition::NodeSealed;
     }
     if error.code() == Code::FailedPrecondition
         && (error.message().contains("cannot wake") || error.message().contains("wait for"))
@@ -1498,6 +1506,59 @@ pub(super) fn is_nodemgr_unreachable(err: &SubstrateError) -> bool {
 
 pub(super) fn assigned_pod_ip(pod: &SandboxPodView) -> Result<Option<PodIp>, SubstrateError> {
     pod.pod_ip().map(PodIp::parse).transpose()
+}
+
+/// The pod's IP: the one kubelet published in `status.podIP`, else the one
+/// recorded for the same pod UID. A readiness wait records the address the
+/// pod's node reports once the node confirms it serves the execution there,
+/// which is usually before kubelet publishes it.
+pub(super) fn pod_ip_or_recorded<'a>(
+    published_ip: Option<&'a str>,
+    pod_uid: Option<&str>,
+    recorded_uid: Option<&str>,
+    recorded_ip: Option<&'a str>,
+) -> Option<&'a str> {
+    published_ip.or_else(|| recorded_ip.filter(|_| pod_uid.is_some() && pod_uid == recorded_uid))
+}
+
+/// Where a pod address comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PodIpSource {
+    /// Kubelet published it in the pod's `status.podIP`.
+    Published,
+    /// The pod's node reported it, before kubelet published one. A node can
+    /// keep reporting an address its pod no longer has, so only a node that
+    /// affirms the execution at that address confirms it.
+    NodeReported,
+}
+
+/// [`assigned_pod_ip`], falling back to the IP recorded for the same pod UID
+/// (see [`pod_ip_or_recorded`]).
+pub(super) fn current_pod_ip(
+    pod: &SandboxPodView,
+    recorded_uid: Option<&PodUid>,
+    recorded_ip: Option<&str>,
+) -> Result<Option<PodIp>, SubstrateError> {
+    Ok(current_pod_ip_with_source(pod, recorded_uid, recorded_ip)?.map(|(ip, _)| ip))
+}
+
+/// [`current_pod_ip`], with where the address comes from.
+pub(super) fn current_pod_ip_with_source(
+    pod: &SandboxPodView,
+    recorded_uid: Option<&PodUid>,
+    recorded_ip: Option<&str>,
+) -> Result<Option<(PodIp, PodIpSource)>, SubstrateError> {
+    if let Some(ip) = assigned_pod_ip(pod)? {
+        return Ok(Some((ip, PodIpSource::Published)));
+    }
+    pod_ip_or_recorded(
+        None,
+        pod.uid(),
+        recorded_uid.map(PodUid::as_str),
+        recorded_ip,
+    )
+    .map(|ip| Ok((PodIp::parse(ip)?, PodIpSource::NodeReported)))
+    .transpose()
 }
 
 pub(super) fn assigned_pod_node_name(pod: &SandboxPodView) -> Option<&str> {

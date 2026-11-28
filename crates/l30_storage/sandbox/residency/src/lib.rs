@@ -73,6 +73,13 @@
 //! its recovery to `suspended` do use [`node_observes_sandbox`], to defer to a
 //! node whose report lands after that candidate listing; otherwise this
 //! module is the definition for node-release decisions.
+//!
+//! # What still names a node
+//!
+//! [`node_unreferenced`] is the stricter question node drain's guarded delete
+//! (`pplx_space_node_registration_store::guarded_delete::delete_unreferenced_stale_node`)
+//! asks before a v2 drain's terminate deletes the node's row: any row outside `failed` and `deleted` that names the node, and any active
+//! execution on its Kubernetes name, holds it, with no census discount.
 
 use pplx_space_sandbox_model::SandboxLifecycle;
 use std::time::Duration;
@@ -385,9 +392,9 @@ pub fn non_resident_lifecycle_exclusion(sandbox_alias: &str) -> String {
 /// destructive: the drained-node terminator's `drained → terminating` flip, the
 /// admin `POST :terminate` 409, and node-drain's pre-terminate recheck all
 /// refuse on a match, and the terminator's KubeNodeGone reap **deletes** the
-/// `nodes` row behind the same `resident_blocking_clause`. Two ungated readers
+/// `nodes` row behind the same resident guard. Two ungated readers
 /// refuse nothing at all — node-drain's per-lifecycle gauge and the terminator's
-/// `delete_refusal_diagnostics_query`, which exist so an environment can measure
+/// refusal diagnosis (`pplx_space_node_registration_store::orphan_reap_refusal::diagnose`), which exist so an environment can measure
 /// this population before it holds anything on it. So neither "it refuses" nor
 /// "the flag governs it" generalizes across the set; grep the callers rather
 /// than trusting this list, which has grown before.
@@ -503,7 +510,7 @@ pub const CENSUS_PLACEMENT_SETTLE: Duration = Duration::from_mins(10);
 /// A NULL `placement_changed_at` is treated as not-settled: unknown placement
 /// age is not evidence, and the fail-closed reading of no evidence is "keep
 /// counting".
-pub fn placement_settled(sandbox_alias: &str, settle: Duration) -> String {
+fn placement_settled(sandbox_alias: &str, settle: Duration) -> String {
     format!(
         "(\n\
              {sandbox_alias}.placement_changed_at IS NOT NULL\n\
@@ -600,10 +607,10 @@ const _: () = assert!(
 /// NULL and therefore not-TRUE on a NULL timestamp. It is spelled out because
 /// the fail-closed reading of a never-published census must be intentional
 /// rather than a by-product of three-valued logic — the same reason
-/// [`placement_settled`] spells its own out.
+/// `placement_settled` spells its own out.
 ///
 /// See [`node_heartbeat_fresh`] on why `node_expr` wants a bound parameter.
-pub fn node_census_fresh(node_expr: &str) -> String {
+fn node_census_fresh(node_expr: &str) -> String {
     format!(
         "EXISTS (\n\
              SELECT 1\n\
@@ -621,7 +628,7 @@ pub fn node_census_fresh(node_expr: &str) -> String {
 /// for an **empty** set to mean "nothing is pending" rather than "nobody
 /// asked".
 ///
-/// Sibling of [`node_census_fresh`] in every respect — same table, the column
+/// Sibling of `node_census_fresh` in every respect — same table, the column
 /// beside it, the same [`CENSUS_INVENTORY_MAX_AGE`] window, the same
 /// uncorrelated `node_expr`-only key so Postgres hoists it into a
 /// once-per-execution InitPlan instead of a per-row SubPlan. It is a separate
@@ -650,7 +657,7 @@ pub fn node_census_fresh(node_expr: &str) -> String {
 /// accepted from it — the state of every row when the column shipped), and
 /// when that timestamp is older than the window. The explicit `IS NOT NULL` is
 /// redundant against the comparison for the same reason it is in
-/// [`node_census_fresh`]: the fail-closed reading of a never-reported
+/// `node_census_fresh`: the fail-closed reading of a never-reported
 /// inventory should be intentional, not a by-product of three-valued logic.
 pub fn node_backup_inventory_fresh(node_expr: &str) -> String {
     format!(
@@ -708,7 +715,7 @@ pub fn node_observes_sandbox(sandbox_alias: &str, node_expr: &str) -> String {
 ///
 /// Four conjuncts, each removable only in the data-loss direction: the node
 /// answered recently ([`node_heartbeat_fresh`]), the census it answered with is
-/// itself recent ([`node_census_fresh`]), the row has been placed long enough
+/// itself recent (`node_census_fresh`), the row has been placed long enough
 /// for that census to mean something ([`CENSUS_PLACEMENT_SETTLE`]), and the
 /// census omitted the sandbox.
 ///
@@ -729,6 +736,37 @@ pub fn node_proves_sandbox_absent(sandbox_alias: &str, node_expr: &str) -> Strin
              AND {census_fresh}\n\
              AND {settled}\n\
              AND NOT {observed}\n\
+         )"
+    )
+}
+
+/// Boolean SQL fragment: TRUE iff nothing names the node `node_param` (a
+/// node id) with Kubernetes name `name_param`: no row outside `failed` and
+/// `deleted` whose `active_node_id` or `target_node_id` is the node, and no
+/// active execution on the name. A NULL name matches no execution. Both are
+/// placeholders or expressions of the caller's statement.
+/// `pplx_space_sandbox_store::drain_terminate::node_references` reads the
+/// same three guards.
+///
+/// Unlike the residency fragments above, it reads no census: it is a v2
+/// drain's require-empty check before the node's row goes, and any row that
+/// still names the node refuses it.
+pub fn node_unreferenced(node_param: &str, name_param: &str) -> String {
+    format!(
+        "NOT EXISTS (
+             SELECT 1 FROM sandboxes
+              WHERE active_node_id = {node_param}
+                AND lifecycle NOT IN ('failed', 'deleted')
+         )
+         AND NOT EXISTS (
+             SELECT 1 FROM sandboxes
+              WHERE target_node_id = {node_param}
+                AND lifecycle NOT IN ('failed', 'deleted')
+         )
+         AND NOT EXISTS (
+             SELECT 1 FROM sandbox_k8s_executions
+              WHERE active
+                AND k8s_node_name = {name_param}
          )"
     )
 }

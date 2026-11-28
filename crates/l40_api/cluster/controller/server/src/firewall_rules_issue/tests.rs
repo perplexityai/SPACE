@@ -6,6 +6,7 @@ use pplx_space_firewall_rules_store::test_support::{
     hold_header, make_checks_due, rollout, save_targets, wait_for_lock_waiters,
 };
 use pplx_space_node_status_store::test_support::{SnapshotSeed, upsert_snapshot};
+use pplx_space_postgres_pool::Db;
 use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -117,7 +118,7 @@ async fn the_wakeup_queues_firewall_rules_changed() -> TestResult {
     let node = NodeId::new();
     insert_ready_worker_node(&db.pool, node).await?;
     let mut tx = db.pool.begin().await?;
-    assert_eq!(FirewallWakeup.wake(&mut tx, node).await?, 1);
+    assert_eq!(FirewallWakeup.wake(&mut *tx, node).await?, 1);
     tx.commit().await?;
     let reasons = sqlx::query_scalar::<_, Vec<String>>(sql!(
         "SELECT reasons::text[] FROM node_reconcile_triggers WHERE node_id = $1"
@@ -277,7 +278,7 @@ async fn racing_ticks_issue_one_canary() -> TestResult {
         return Ok(());
     };
     let (rollout, _) = canary(&db.pool, 2).await?;
-    let holder = hold_header(&db.pool, rollout).await?;
+    let holder = hold_header(&Db::from(db.pool.clone()), rollout).await?;
     let ticks: Vec<_> = (0..2)
         .map(|_| {
             let pool = db.pool.clone();

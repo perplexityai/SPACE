@@ -886,6 +886,70 @@ async fn limiter_unknown_ids_share_one_throttled_bucket() -> TestResult {
 }
 
 #[tokio::test]
+async fn limiter_at_cap_does_not_spend_another_allowlisted_clients_budget() -> TestResult {
+    let Some((_node, url)) = try_redis_url().await? else {
+        return Ok(());
+    };
+    // The property an operator cares about: while one client is being turned
+    // away for exceeding its own cap, an unrelated client's reconnect still
+    // gets through. `limiter_unknown_ids_share_one_throttled_bucket` covers
+    // the allowlisted-versus-`Unspecified` pair and
+    // `limiter_enforces_cluster_wide_per_client_cap` covers one client across
+    // replicas; neither covers two *allowlisted* clients, which is the pair a
+    // per-client cap exists to keep apart.
+    //
+    // The held guard is the overlap, so nothing here depends on timing:
+    // `noisy` is provably at its cap at the moment `control` asks.
+    let noisy = format!("foreground_client-{}", Uuid::now_v7());
+    let control = format!("background_client-{}", Uuid::now_v7());
+    let config = ClientConcurrencyConfig {
+        // Both ids allowlisted. `tight_enforce` is borrowed only for the
+        // mode, the caps and the hold -- its own single-id allowlist is the
+        // field being replaced here, so its argument does not reach this
+        // config.
+        known_clients: known_set(&[&noisy, &control]),
+        ..tight_enforce(&noisy)
+    };
+
+    // Both ids must resolve to buckets of their own. The shared `Unspecified`
+    // bucket is also capped at 1 but may hold nothing here, so a `control` that
+    // fell through to it could still be admitted below. Filling it here to
+    // close that gap would race the other tests that use the same unnamespaced
+    // key on this Redis.
+    for id in [&noisy, &control] {
+        assert_eq!(
+            classify(Some(id), &config, None),
+            ClientKey::Client(id.clone().into()),
+            "{id} must get its own bucket"
+        );
+    }
+    let limiter = redis_limiter(&url, config);
+
+    let _held = admit(limiter.try_acquire(Operation::Create, Some(&noisy)).await);
+    assert_rejected(
+        limiter
+            .try_acquire(Operation::Reconnect, Some(&noisy))
+            .await,
+    );
+    // Same limiter, same instant, same store, and admitted: the two ids
+    // resolve to different ZSET keys. A regression that stopped
+    // discriminating them would reject this instead.
+    let _control = admit(
+        limiter
+            .try_acquire(Operation::Reconnect, Some(&control))
+            .await,
+    );
+    // And control's bucket is enforced too, not just separate: at its own
+    // cap of 1 it's refused.
+    assert_rejected(
+        limiter
+            .try_acquire(Operation::Reconnect, Some(&control))
+            .await,
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn limiter_guard_drop_releases_the_shared_slot() -> TestResult {
     let Some((_node, url)) = try_redis_url().await? else {
         return Ok(());

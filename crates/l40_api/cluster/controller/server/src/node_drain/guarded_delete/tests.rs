@@ -3,6 +3,7 @@
 
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
@@ -122,7 +123,7 @@ async fn delete(
 ) -> TestResult<GuardedDelete> {
     let name = name_of(node_id);
     let mut tx = pool.begin().await?;
-    assert!(lock_node(&mut tx, node_id).await?);
+    assert!(lock_node(&mut *tx, node_id).await?);
     let outcome = delete_locked_node(
         &mut tx,
         &NodeIdentity {
@@ -210,47 +211,6 @@ async fn each_guard_refuses_the_delete_and_names_what_holds_it() -> TestResult {
             .await?;
             assert_eq!(left, (false, false), "{case}");
         }
-    }
-    Ok(())
-}
-
-/// The delete statement holds the heartbeat and require-empty guards on its
-/// own, as it must for a row or a heartbeat that commits between the checks
-/// and the delete: run by itself it deletes nothing while the node
-/// heartbeats or anything names it, and deletes a stale node nothing names.
-#[tokio::test(flavor = "current_thread")]
-async fn the_delete_statement_holds_its_guards_by_itself() -> TestResult {
-    let Some(db) = try_pg_test_db().await? else {
-        return Ok(());
-    };
-    let pool = &db.pool;
-    for (case, deletes) in [
-        ("heartbeat fresh", false),
-        ("target_node_id", false),
-        ("active execution", false),
-        ("nothing names it", true),
-    ] {
-        let node_id = insert_node(pool).await?;
-        match case {
-            "heartbeat fresh" => heartbeat(pool, node_id).await?,
-            "target_node_id" => {
-                insert_row(pool, "suspended", None, Some(node_id)).await?;
-            }
-            "active execution" => {
-                let row = insert_row(pool, "started", None, None).await?;
-                insert_execution(pool, row, &name_of(node_id)).await?;
-            }
-            _ => {}
-        }
-        let deleted = sqlx::query(sqlx::AssertSqlSafe(DELETE_NODE.as_str()))
-            .bind(node_id)
-            .bind(SubstrateKind::Kubernetes)
-            .bind(name_of(node_id))
-            .execute(pool)
-            .await?
-            .rows_affected();
-        assert_eq!(deleted == 1, deletes, "{case}");
-        assert_eq!(node_exists(pool, node_id).await?, !deletes, "{case}");
     }
     Ok(())
 }

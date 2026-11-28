@@ -27,14 +27,8 @@ use pplx_space_sandbox_model::{
     ExecutionGeneration, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
     SandboxTransitionTargetState,
 };
-use pplx_space_sandbox_portability::{
-    fresh_ready_snapshot_exists, missing_suspending_pod_revert_eligibility, no_newer_full_snapshot,
-    restore_retry_source_snapshot_is_current, restore_retry_suspended_revert_snapshot_exists,
-    snapshot_is_current_local_artifact,
-};
 use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotState};
 use pplx_space_sql_locator::sql;
-use pplx_space_state_reconciliation::{FACET_SANDBOX_DESIRED_STATE, SANDBOX_LOCAL_SUSPEND_KEY};
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
@@ -403,21 +397,20 @@ impl ReconciledActivationFence {
     }
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub(super) struct SandboxExecutionRow {
     pub(super) generation: i64,
     pub(super) pod_name: String,
     pub(super) pod_materialized: bool,
-    #[sqlx(try_from = "String")]
     pub(super) state: ActiveExecutionState,
     pub(super) create_age_expired: bool,
     pub(super) activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     pub(super) route_activation_id: Option<SandboxActivationAttemptId>,
 }
 
-/// Parses `state` as the derive's `try_from` does, failing with the same
-/// column-decode error, so a stored state this crate does not know fails the
-/// store read as it fails this row's own statements.
+/// Parses `state`, failing with a `state` column-decode error, so a stored
+/// state this crate does not know fails the store read as an undecodable
+/// column does.
 impl TryFrom<pplx_space_sandbox_store::k8s_executions::ActiveExecutionRecord>
     for SandboxExecutionRow
 {
@@ -738,7 +731,7 @@ pub(super) enum RestoreClaim {
     /// node outside the evacuation claim's window. Left `restoring` with the
     /// marker, it stays inside that window, and the claim's next call takes it
     /// as `RedroveRestoring`; the drain's restore sweep lists such a row
-    /// (the stopped arm of `restore_pending_evacuations_query` admits
+    /// (the stopped arm of `pplx_space_sandbox_store::evacuation_restores::pending` admits
     /// `restoring`). Its restore plan resolves the disk artifact for that
     /// `restoring` row through `selected_stopped_evacuation_restore_source`,
     /// since `selected_stopped_restore_storage_uri` serves only `lifecycle =

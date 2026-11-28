@@ -53,9 +53,11 @@ fn artifact_id(s: &str) -> LocalArtifactId {
 fn gc_checkout_serializes_eligibility_with_a_concurrent_restore_release() {
     let root = tempfile::TempDir::new().unwrap();
     let path = root.path().join("artifacts.db");
+    crate::db::create_test_schema_on_disk(&path);
     let mut conn = Connection::open_at(&path).unwrap();
-    crate::db::create_test_schema(&mut conn);
     conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    // The race is about locks, not durability, so no commit needs an fsync.
+    conn.pragma_update(None, "synchronous", "OFF").unwrap();
     let id = "01939e3e-1111-7000-8000-000000000001";
     insert_row(&conn, id, "sbx", "/artifact");
     conn.execute(
@@ -65,6 +67,7 @@ fn gc_checkout_serializes_eligibility_with_a_concurrent_restore_release() {
     .unwrap();
     let competing = Connection::open_at(&path).unwrap();
     competing.busy_timeout(std::time::Duration::ZERO).unwrap();
+    competing.pragma_update(None, "synchronous", "OFF").unwrap();
     let competing_store = LocalArtifacts::new(crate::db::SharedConnection::new(competing));
     let restore = competing_store
         .check_out_for_restore(artifact_id(id))

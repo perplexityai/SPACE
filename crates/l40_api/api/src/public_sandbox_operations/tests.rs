@@ -1,3 +1,4 @@
+use pplx_space_sql_locator::sql;
 use std::{collections::BTreeMap, fmt};
 use uuid::Uuid;
 
@@ -167,6 +168,7 @@ async fn native_create_executor_preserves_operator_policy_across_replacements(
     // proxy port answers for.
     let worker = pplx_space_node_api_sim::SimWorkerHarness::builder(NodeId::new().to_string())
         .with_internal_api()
+        .as_sandbox_pod()
         .start()
         .await?;
     let substrate = crate::controllers::substrate::Substrate::from_kubernetes(
@@ -277,7 +279,7 @@ async fn native_create_executor_preserves_operator_policy_across_replacements(
                 let updated = fetch_sandbox(&db.pool, sandbox_id)
                     .await?
                     .expect("updated sandbox");
-                let effective = updated.network_policy.expect("profile remains composed").0;
+                let effective = updated.network_policy.expect("profile remains composed");
                 assert!(effective.allows_domain("updated.example.test"));
                 assert!(!effective.allows_domain("sensor.example.test"));
                 assert!(!effective.allows_domain("retired.example.test"));

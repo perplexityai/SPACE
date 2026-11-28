@@ -23,15 +23,17 @@ pub(in crate::controllers::substrate::kubernetes) struct RecordedActivation {
 struct RecordedExecutionRow {
     subject: String,
     local_artifact_id: Option<LocalArtifactId>,
-    execution_metadata: Option<sqlx::types::Json<serde_json::Value>>,
+    execution_metadata: Option<serde_json::Value>,
     runtime: Option<String>,
     runtime_version: Option<String>,
     state_format_name: Option<String>,
     state_format_version: Option<String>,
 }
 
-impl From<pplx_space_sandbox_store::observed_states::PublishedExecution> for RecordedExecutionRow {
-    fn from(row: pplx_space_sandbox_store::observed_states::PublishedExecution) -> Self {
+impl From<pplx_space_sandbox_teardown::observed_states::PublishedExecution>
+    for RecordedExecutionRow
+{
+    fn from(row: pplx_space_sandbox_teardown::observed_states::PublishedExecution) -> Self {
         Self {
             subject: row.subject,
             local_artifact_id: row.local_artifact_id,
@@ -46,8 +48,7 @@ impl From<pplx_space_sandbox_store::observed_states::PublishedExecution> for Rec
 
 impl From<RecordedExecutionRow> for RecordedActivation {
     fn from(row: RecordedExecutionRow) -> Self {
-        let metadata = row.execution_metadata.map(|metadata| metadata.0);
-        let metadata = metadata.as_ref();
+        let metadata = row.execution_metadata.as_ref();
         // Read leniently: a record is evidence, and a field it lacks or holds
         // in another shape matches anything rather than failing the
         // activation.
@@ -99,30 +100,25 @@ impl K8sStore {
         sandbox_id: SandboxId,
         storage_uri: Option<&str>,
     ) -> Result<Option<RecordedActivation>, SubstrateError> {
-        let row: Option<RecordedExecutionRow> = sqlx::query_as(sql!(
-            "SELECT sn.id::text AS subject, sn.local_artifact_id, sn.execution_metadata, sn.runtime,
-                    sn.runtime_version, sn.state_format_name, sn.state_format_version
-               FROM snapshots sn
-               JOIN sandboxes s ON s.id = sn.sandbox_id
-              WHERE sn.sandbox_id = $1
-                AND sn.type = 'full'
-                AND CASE WHEN $2::text IS NULL
-                         THEN sn.local_artifact_id = s.current_local_artifact_id
-                         ELSE EXISTS (
-                             SELECT 1
-                               FROM snapshot_storage_locations ssl
-                              WHERE ssl.snapshot_id = sn.id
-                                AND ssl.storage_connection_string = $2)
-                    END
-              ORDER BY sn.timestamp DESC
-              LIMIT 1"
-        ))
-        .bind(sandbox_id)
-        .bind(storage_uri)
-        .fetch_optional(&self.pool)
+        let row = pplx_space_snapshot_store::checkpoint::restore_execution(
+            &self.pool,
+            sandbox_id,
+            storage_uri,
+        )
         .await
         .db_context("failed to read the restore checkpoint's execution")?;
-        Ok(row.map(Into::into))
+        Ok(row.map(|row| {
+            RecordedExecutionRow {
+                subject: row.subject,
+                local_artifact_id: row.local_artifact_id,
+                execution_metadata: row.execution_metadata,
+                runtime: row.runtime,
+                runtime_version: row.runtime_version,
+                state_format_name: row.state_format_name,
+                state_format_version: row.state_format_version,
+            }
+            .into()
+        }))
     }
 
     /// The execution `sandbox_id` last published, which a start of the
@@ -135,7 +131,7 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<RecordedActivation>, SubstrateError> {
-        let row = pplx_space_sandbox_store::observed_states::last_published_execution(
+        let row = pplx_space_sandbox_teardown::observed_states::last_published_execution(
             &self.pool, sandbox_id,
         )
         .await
@@ -186,7 +182,7 @@ impl K8sStore {
                 GetPolicyError::Database(error) => {
                     crate::controllers::substrate::substrate_db_error(
                         "failed to read the runtime environment policy",
-                        &error,
+                        &sqlx::Error::from(error),
                     )
                 }
                 error => SubstrateError::Failed {

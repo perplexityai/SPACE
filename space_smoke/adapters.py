@@ -8,16 +8,16 @@ import hashlib
 import importlib
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
 import shlex
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
-import socket
-import sys
 import time
 import uuid
 from collections import deque
@@ -33,6 +33,9 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
+    CallAnswer,
+    DrainV2Status,
+    NodeCliOutcome,
     ControllerLease,
     ControllerPod,
     NodeContainer,
@@ -47,8 +50,10 @@ from space_smoke.capabilities import (
     NodeCtlFacetRun,
     NodeCtlIdentity,
     NodeTemplatePresence,
+    OccupiedNetworkSlot,
     PendingBackupRow,
     SaWriteOutcome,
+    SandboxNodeSlots,
     WhoAmI,
     GuestMetadata,
     TemplateBuildJob,
@@ -57,6 +62,7 @@ from space_smoke.capabilities import (
     SandboxPodRender,
     AdminNodeView,
     SandboxResidency,
+    SandboxRowState,
     StoppedResidency,
     EncryptedSnapshotObservation,
     ExecutionRow,
@@ -84,6 +90,7 @@ from space_smoke.capabilities import (
     EcwSandboxDeleteRetryable,
     EcwSandboxInfo,
     EcwSandboxPages,
+    EcwSandboxReconcileUnmatched,
     EcwSandboxState,
     EcwSandboxUnavailable,
     EcwWatchHandle,
@@ -111,6 +118,23 @@ from space_smoke.capabilities import (
     WarmPoolSelection,
 )
 from space_smoke.credmgr_socket import exchange_token, relay_argv
+from space_smoke.drain_v2 import (
+    DRAIN_HOLD_FIELD,
+    DRAIN_V2_API_ENV_KEYS,
+    DRAIN_V2_ENABLED_ENV,
+    DRAIN_V2_ENV_KEYS,
+    DRAIN_V2_HOOK_KEYS,
+    DRAIN_VIEW_FIELD,
+    PREVIEW_BUSY_REASON,
+    PREVIEW_BUSY_RETRY_SECONDS,
+    PREVIEW_BUSY_STATUS,
+    validate_drain_v2_api_keys,
+    validate_drain_v2_api_overrides,
+    validate_drain_v2_keys,
+    validate_drain_v2_overrides,
+    validate_fake_instance_id,
+    validate_fake_provider_id,
+)
 from space_smoke.environment_placement_gate import (
     GATE_ENV as ENVIRONMENT_PLACEMENT_GATE_ENV,
     RUNTIME_UPGRADE_ENV as RUNTIME_UPGRADE_AT_ACTIVATION_ENV,
@@ -122,6 +146,7 @@ from space_smoke.execution_environment import (
     WORKER_ROLE,
 )
 from space_smoke.leader_election import RECONCILER_TICK_ENV
+from space_smoke.native import _URL_OPEN
 from space_smoke.reconcile_queue_gc import (
     GC_ENV_KEYS as RECONCILE_QUEUE_GC_ENV_KEYS,
     validate_marker,
@@ -146,6 +171,7 @@ from space_smoke.runtime import (
     CommandExecutor,
     CommandResult,
     REPO_ROOT,
+    ScenarioTimedOut,
     SmokeConfigurationError,
     run_concurrently,
 )
@@ -177,6 +203,45 @@ def _serialize_network_config(
     if network.deny_out:
         network_options["deny_out"] = list(network.deny_out)
     return network_options
+
+
+# A sandbox-manager snapshot name, as `space-sbxmgr snapshot` prints it.
+_NODE_SNAPSHOT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+
+
+def _preview_busy_retry_after(status: int, headers: Any, detail: str) -> float | None:
+    """Seconds to wait before asking for a drain preview again, when the
+    admin API's answer is the node busy with another drain call; None for
+    any other answer. Classified by the answer's status and `reason`, never
+    its message."""
+
+    if status != PREVIEW_BUSY_STATUS:
+        return None
+    try:
+        body = json.loads(detail)
+    except ValueError:
+        return None
+    if not isinstance(body, dict) or body.get("reason") != PREVIEW_BUSY_REASON:
+        return None
+    value = None if headers is None else headers.get("Retry-After")
+    try:
+        return max(1.0, float(value)) if value is not None else 1.0
+    except ValueError:
+        return 1.0
+
+
+def _call_answer(status: int, headers: Any, raw: bytes) -> CallAnswer:
+    """An HTTP answer as `CallAnswer` carries it."""
+
+    try:
+        body = json.loads(raw) if raw else {}
+    except ValueError:
+        body = {"raw": raw[:2000].decode(errors="replace")}
+    return CallAnswer(
+        status=status,
+        retry_after=None if headers is None else headers.get("Retry-After"),
+        body=body if isinstance(body, dict) else {"value": body},
+    )
 
 
 def _require_ok(result: CommandResult, action: str) -> str:
@@ -320,6 +385,107 @@ def _recorded_template_campaign_env(recorded: str) -> dict[str, str | None]:
     ):
         raise SmokeConfigurationError("the recorded template campaign settings hold an entry a restore cannot write")
     return standing
+
+
+_NETWORK_POOL_MAX_SLOTS_SYNTAX = re.compile(r"\+?[0-9]+")
+
+
+def _network_pool_max_slots_count(value: object) -> int | None:
+    """The count node-manager reads from the env literal, or None if it would refuse it.
+
+    Mirrors `env_u32` in node-manager's `run.rs`: the value is trimmed, an
+    empty one is unset (the default), and the rest is `u32` syntax, so `0300`
+    and `+300` both read as 300. The literal itself is kept for the restore.
+    """
+
+    if value is None:
+        return DEFAULT_NETWORK_POOL_MAX_SLOTS
+    if not isinstance(value, str):
+        return None
+    trimmed = value.strip()
+    if not trimmed:
+        return DEFAULT_NETWORK_POOL_MAX_SLOTS
+    if not _NETWORK_POOL_MAX_SLOTS_SYNTAX.fullmatch(trimmed):
+        return None
+    count = int(trimmed)
+    return count if 1 <= count <= 16_383 else None
+
+
+def _valid_network_pool_max_slots_literal(value: object) -> bool:
+    return _network_pool_max_slots_count(value) is not None
+
+
+def expected_worker_network_pool_capacity(value: str | None) -> int:
+    """The per-worker network-slot capacity `node-manager` advertises for `value`."""
+
+    count = _network_pool_max_slots_count(value)
+    if count is None:
+        raise SmokeConfigurationError(f"invalid worker network-slot literal {value!r}")
+    return count
+
+
+def _recorded_network_pool_max_slots(recorded: str) -> tuple[str | None, dict[str, int]]:
+    """The standing worker slot-pool env and per-node counts a Lease recorded."""
+
+    try:
+        payload = json.loads(recorded)
+    except json.JSONDecodeError as error:
+        raise SmokeConfigurationError("the recorded worker network-slot setting is not JSON") from error
+    if not isinstance(payload, dict) or set(payload) != {"env", "capacities"}:
+        raise SmokeConfigurationError("the recorded worker network-slot setting is malformed")
+    env = payload["env"]
+    capacities = payload["capacities"]
+    if (
+        not _valid_network_pool_max_slots_literal(env)
+        or not isinstance(capacities, dict)
+        or not capacities
+        or not all(
+            isinstance(node, str)
+            and bool(node)
+            and isinstance(count, int)
+            and not isinstance(count, bool)
+            and count > 0
+            for node, count in capacities.items()
+        )
+    ):
+        raise SmokeConfigurationError("the recorded worker network-slot setting holds an invalid value")
+    expected = expected_worker_network_pool_capacity(env)
+    if any(count != expected for count in capacities.values()):
+        raise SmokeConfigurationError(
+            f"the recorded worker network-slot setting disagrees between env {env!r} "
+            f"(produces {expected}) and capacities {capacities!r}"
+        )
+    return env, {str(node): int(count) for node, count in capacities.items()}
+
+
+def _is_slot_pool_node_manager_lease(document: Mapping[str, object]) -> bool:
+    # The marker carries the holder that stamped it, so a marker left behind
+    # by a dead slot-pool holder doesn't vouch for a later holder that kept it.
+    marker = _lease_annotations(document).get(NODE_MANAGER_SLOT_POOL_HOLDER_ANNOTATION)
+    spec = document.get("spec")
+    holder = spec.get("holderIdentity") if isinstance(spec, dict) else None
+    return isinstance(marker, str) and bool(marker) and marker == holder
+
+
+def _append_lease_annotation_ops(
+    patch: list[dict[str, object]],
+    metadata: Mapping[str, object],
+    annotations: Mapping[str, str | None] | None,
+) -> None:
+    if not annotations:
+        return
+    existing = metadata.get("annotations")
+    existing = existing if isinstance(existing, dict) else None
+    for key, value in annotations.items():
+        path = f"/metadata/annotations/{_json_pointer_token(key)}"
+        if value is None:
+            if existing is not None and key in existing:
+                patch.append({"op": "remove", "path": path})
+            continue
+        if existing is None:
+            patch.append({"op": "add", "path": "/metadata/annotations", "value": {}})
+            existing = {}
+        patch.append({"op": "add", "path": path, "value": value})
 
 
 def _holder_process_gone(holder: object) -> bool:
@@ -576,19 +742,20 @@ _LIVENESS_BUDGET_VALUE = re.compile(r"[1-9][0-9]{0,3}")
 # gets its own `app.kubernetes.io/name`, so no selector of the healthy
 # Deployment's, nor KIND_CONTROLLER_SELECTOR, overlaps it. It is a bare Pod
 # bound to a healthy replica's node, and an init container holds it until the
-# scenario opens a gate file through the node's CRI. So it can be placed
-# before an apiserver outage and start right after one: once the apiserver is
-# back, kubelets and the controller-manager take a minute or more to watch
-# new pods again, while a CRI exec needs neither.
+# scenario opens a gate file through the node's CRI, so it is placed while the
+# healthy replicas roll and released once one of them has renewed the Lease.
 REFUSED_CONTENDER_NAME = "space-cluster-controller-refused"
 BUDGET_CONTENDER_NAME = "space-cluster-controller-budget"
 REFUSED_CONTENDER_SELECTOR = f"app.kubernetes.io/name={REFUSED_CONTENDER_NAME}"
 REFUSED_CONTENDER_SERVICE_ACCOUNT = "space-api"
 REFUSED_CONTENDER_GATE_CONTAINER = "space-smoke-gate"
 REFUSED_CONTENDER_GATE_DIR = "/space-smoke-gate"
-# Outside kubelet's static-pod directory, which it reads every file of.
-APISERVER_MANIFEST = "/etc/kubernetes/manifests/kube-apiserver.yaml"
-APISERVER_PARKED_MANIFEST = "/etc/kubernetes/kube-apiserver.yaml.space-smoke-parked"
+# The chain that cuts one controller pod off from the apiserver, in that pod's
+# own network namespace: a REJECT with a TCP reset for the `kubernetes`
+# Service's ClusterIP and for each of its endpoints, so the pod's apiserver
+# calls fail as they do through a ClusterIP with no apiserver behind it.
+# Removing it needs nothing but its name.
+APISERVER_CUT_CHAIN = "SPACE-SMOKE-APISERVER-CUT"
 # Node services run one DaemonSet per service per role, as production's do
 # (infra/space/kind/lib/node-services.sh). Every pod carries its node role as
 # `app.kubernetes.io/name` (space-worker or space-builder) and its service as
@@ -665,7 +832,20 @@ ENVIRONMENT_PLACEMENT_GATE_ANNOTATION = "space.pplx.net/smoke-environment-placem
 # The template campaign's controller settings a run recorded before writing
 # them, put back by the next holder's repair as the gate's are.
 TEMPLATE_CAMPAIGN_ENV_ANNOTATION = "space.pplx.net/smoke-template-campaign-env"
+NETWORK_POOL_MAX_SLOTS_ANNOTATION = "space.pplx.net/smoke-network-pool-max-slots"
+NETWORK_POOL_MAX_SLOTS_ENV = "SPACE_NODEMGR_NETWORK_POOL_MAX_SLOTS"
+# Mirrors `DEFAULT_MAX_SLOTS` in `crates/l40_api/node/mgr/server/src/net.rs` for
+# the Kind chart's default `networkPoolMaxSlots: null`.
+DEFAULT_NETWORK_POOL_MAX_SLOTS = 300
+_NODE_CTL_SLOT_RECONCILE_NUDGE_SECONDS = 5.0
+NODE_MANAGER_SLOT_POOL_HOLDER_ANNOTATION = "space.pplx.net/smoke-node-manager-slot-pool-holder"
 REDIS_REPLICAS_ANNOTATION = "space.pplx.net/smoke-redis-replicas"
+# The floor of a strict Redis rollout budget held back for the Lease read and
+# patch that clear the Redis record once the rollout is confirmed. Each takes
+# tens of milliseconds on an idle Kind bench; the floor leaves room for a
+# loaded API server without taking the rollout's time, and the clear also gets
+# whatever the rollout leaves unused.
+REDIS_RECORD_CLEAR_SECONDS = 2.0
 # A rollout a scenario starts only to apply or restore its env
 # (`KindHarness._fast_rollout`) runs with every replacement surged at once and
 # no `minReadySeconds`, and the Deployment carries the `minReadySeconds` and
@@ -694,11 +874,25 @@ SELECTOR_VALUE_ENV = "SPACE_SANDBOX_NODE_SELECTOR_VALUE"
 SELECTOR_LABELS_ENV = "SPACE_SANDBOX_NODE_SELECTOR_LABELS"
 ADMISSION_ENABLED_ENV = "SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED"
 # Non-pool sandbox pods: `build_pool_pod` stamps `pool-role`, a user create does not.
+POOL_ROLE_LABEL = "space.pplx.net/pool-role"
 KIND_SANDBOX_POD_SELECTOR = "app.kubernetes.io/name=space-sandbox,!space.pplx.net/pool-role"
 CONTROL_PLANE_LABEL = "node-role.kubernetes.io/control-plane"
 KIND_WORKER_NODE_SELECTOR = f"!{CONTROL_PLANE_LABEL}"
 SANDBOX_RESIDENCY_SQL = """\
 SELECT lifecycle, coalesce(active_node_id::text, '') FROM sandboxes WHERE id = '{sandbox_id}'::uuid;
+"""
+# Where kubeadm keeps the kubelet's flags on a Kind node, `--provider-id`
+# among them.
+KIND_KUBELET_FLAGS = "/var/lib/kubelet/kubeadm-flags.env"
+# sandbox-manager's SQLite database on a node, and its WAL and shared-memory
+# files (`pplx_space_host_layout::paths::SANDBOX_MANAGER_DB`).
+SANDBOX_MANAGER_DB_FILES = tuple(
+    "/space/run/sandbox-manager/sbx-manager.db" + suffix for suffix in ("", "-wal", "-shm")
+)
+SANDBOX_ROW_STATES_SQL = """\
+SELECT id, lifecycle, placement, coalesce(active_node_id::text, ''),
+       coalesce(target_node_id::text, ''), updated_at
+  FROM sandboxes WHERE id = ANY('{{{sandbox_ids}}}'::uuid[]) ORDER BY id;
 """
 STOPPED_RESIDENCY_SQL = """\
 SELECT lifecycle, coalesce(active_node_id::text, ''), placement, coalesce(evacuation_restore_target, '')
@@ -800,6 +994,10 @@ K8S_CONTROL_PLANE_ENV = "SPACE_K8S_CONTROL_PLANE"
 KIND_REDIS_DEPLOYMENT = "space-redis"
 KIND_OBJECT_STORE_DEPLOYMENT = "space-object-store"
 KIND_OBJECT_STORE_POD_SELECTOR = "app.kubernetes.io/name=space-object-store"
+KIND_NODE_API_PORT = 9800
+# The node-local paths `block_node_traffic` cuts.
+NODE_TRAFFIC_OBJECT_STORE = "object-store"
+NODE_TRAFFIC_NODE_API = "node-api"
 KIND_INTERNAL_API_SELECTOR = "app.kubernetes.io/name=space-internal-api"
 PENDING_BACKUP_QUEUE_SQL = """\
 SELECT artifact_id::text, artifact_kind FROM node_local_backup_pending
@@ -819,7 +1017,45 @@ SELECT state FROM snapshots WHERE sandbox_id = '{sandbox_id}'::uuid AND type = '
 """
 KIND_REDIS_POD_SELECTOR = "app.kubernetes.io/name=space-redis"
 SANDBOX_ID_LABEL = "space.pplx.net/sandbox-id"
+# The label the activating client's id is carried on, and the column it is
+# recorded in. Both are read-only here: the smoke asserts what the API wrote,
+# and writing either from the harness would be asserting its own value back.
+ACTIVATION_CLIENT_LABEL = "space.pplx.net/client-id"
+# The selector the API's own pod reflector watches. The live cap counts from
+# that reflector, so a count taken here has to carry this label too: the
+# client-id label alone would also match a pod the API does not manage, and the
+# whole point of the count is to be the one the cap is working from.
+SANDBOX_MANAGED_BY_SELECTOR = "space.pplx.net/managed-by=space-api"
+# The extended resource every sandbox pod requests one of. Read with `-o json`
+# and parsed here rather than through a jsonpath: the resource key carries dots
+# and a slash, and kubectl answers a malformed jsonpath with empty output
+# instead of an error -- which would read as "no capacity".
+SANDBOX_NETWORK_SLOTS_RESOURCE = "space.pplx.net/network-slots"
+# Whether the sandbox row can hold an activating client at all. Necessary for
+# the capability, never sufficient for it: migrations land in their own change
+# ahead of the code that reads them, so a tree can carry this column and none
+# of the writer. The phase runs unconditionally and uses this only to report
+# a missing column as a precondition rather than as an attribution failure.
+ACTIVATION_ATTRIBUTION_COLUMN_SQL = """
+SELECT count(*)
+  FROM information_schema.columns
+ WHERE table_schema = current_schema()
+   AND table_name = 'sandboxes'
+   AND column_name = 'activating_client_id';
+"""
+SANDBOX_LIFECYCLE_SQL = """
+SELECT 'row:' || lifecycle
+  FROM sandboxes
+ WHERE id = '{sandbox_id}'::uuid;
+"""
+SANDBOX_ACTIVATING_CLIENT_SQL = """
+SELECT 'row:' || coalesce(activating_client_id, '')
+  FROM sandboxes
+ WHERE id = '{sandbox_id}';
+"""
 CHECKPOINT_ANNOTATION = "space.pplx.net/checkpoint"
+# The checkpoint value a stopped sandbox's materialization pod carries.
+STOPPED_MATERIALIZATION_CHECKPOINT = "stopped-materialization"
 RESTORE_SOURCE_NODE_ANNOTATION = "space.pplx.net/suspend-restore-source-node"
 RESTORE_STORAGE_URI_ANNOTATION = "space.pplx.net/suspend-restore-storage-uri"
 SANDBOX_EXECUTIONS_SQL = """\
@@ -1119,9 +1355,57 @@ _RETENTION_BOOLEAN_ENV_VALUES = {
 }
 _RETENTION_ENV_VALUE = re.compile(r"[a-z0-9]{1,16}")
 # Limiter values: booleans, small numbers, a redis:// URL, a client id, and
-# a comma-separated list (SPACE_NATIVE_INLINE_KINDS).
-_LIMITER_ENV_VALUE = re.compile(r"[A-Za-z0-9._:/@,-]{1,64}")
+# comma-separated lists — `SPACE_NATIVE_INLINE_KINDS`, and
+# `SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS`, which is an allowlist by the
+# limiter's own grammar, so any value naming more than one client needs the
+# comma. One class covers every limiter key, so this admits a comma in the
+# others too; that is safe rather than intended — `_apply_public_api_env`
+# hands each value to `kubectl set env` as one `key=value` argv element, and
+# kubectl splits that on the first `=` and never on a comma, with no shell in
+# between. Everything this guard exists to refuse — whitespace, quotes, `$`,
+# backticks, newlines — stays out.
+LIMITER_ENV_VALUE_MAX = 64
+LIMITER_ENV_VALUE = re.compile(rf"[A-Za-z0-9._:/@,-]{{1,{LIMITER_ENV_VALUE_MAX}}}")
+_LIMITER_ENV_VALUE = LIMITER_ENV_VALUE
+CLIENT_LABEL_VALUE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,61}[A-Za-z0-9])?")
 _UNSIGNED_INTEGER = re.compile(r"\+?[0-9]+")
+
+
+def _live_cap_counts_pod(pod: Mapping[str, Any]) -> bool:
+    """Whether the live cap's index would count this pod (`client_live_pods.rs`).
+
+    Neither terminal, nor being deleted, nor a stopped-materialization
+    checkpoint pod.
+    """
+
+    metadata = pod.get("metadata") or {}
+    if metadata.get("deletionTimestamp"):
+        return False
+    if (pod.get("status") or {}).get("phase") in ("Succeeded", "Failed"):
+        return False
+    annotations = metadata.get("annotations") or {}
+    return annotations.get(CHECKPOINT_ANNOTATION) != STOPPED_MATERIALIZATION_CHECKPOINT
+
+
+def _live_cap_sandbox_id(pod: Mapping[str, Any]) -> str | None:
+    """The sandbox a qualifying pod counts for, read as the cap's index reads it.
+
+    `annotation_or_label` takes the annotation whenever the key is present,
+    even empty, and the index drops a value that doesn't parse as a
+    `SandboxId` (a UUID), so a census that fell back to the label or kept an
+    unparseable id would count a pod the cap doesn't.
+    """
+
+    metadata = pod.get("metadata") or {}
+    annotations = metadata.get("annotations") or {}
+    if SANDBOX_ID_LABEL in annotations:
+        value = annotations[SANDBOX_ID_LABEL]
+    else:
+        value = (metadata.get("labels") or {}).get(SANDBOX_ID_LABEL)
+    try:
+        return str(uuid.UUID(str(value))) if value is not None else None
+    except ValueError:
+        return None
 
 
 def _env_flag_default(value: str | None, default: bool) -> bool:
@@ -1220,6 +1504,15 @@ NATIVE_OPERATION_READY_ENVS = (
 )
 
 
+class AdminReapIncomplete(SmokeConfigurationError):
+    """A run-metadata admin reap that raised, with the ids whose deletes it
+    queued or left of unknown outcome, for the caller to keep polling."""
+
+    def __init__(self, message: str, pending: Sequence[str]) -> None:
+        super().__init__(message)
+        self.pending = list(pending)
+
+
 class KindHarness:
     def __init__(
         self,
@@ -1237,6 +1530,7 @@ class KindHarness:
         self._liveness_budget_target: tuple[str, str] | None = None
         self._cordon_lease_ownership: _LeaseOwnership | None = None
         self._public_api_lease_ownership: _LeaseOwnership | None = None
+        self._redis_fault_clear_ready: bool = False
         self._drain_gate_lease_ownership: _LeaseOwnership | None = None
         self._node_ctl_lease_ownership: _LeaseOwnership | None = None
         self._node_manager_lease_ownership: _LeaseOwnership | None = None
@@ -1245,6 +1539,11 @@ class KindHarness:
         self._public_api_autoscaler_bounds: tuple[str, str, int, int] | None = None
         # The operator session the console scenarios' API reads and writes use.
         self._console_token: str | None = None
+        # The late probe reap's force-delete per sandbox: the idempotency key
+        # reserved before its first POST and the operation it was accepted
+        # under, so no caller or retry queues a second (`admin_force_delete_sandbox`).
+        self._late_reap_deletes: dict[str, dict[str, str]] = {}
+        self._late_reap_lock = threading.Lock()
 
     def kubectl(
         self,
@@ -1280,6 +1579,7 @@ class KindHarness:
         body: dict[str, object] | None = None,
         *,
         expected: tuple[int, ...] = (200, 201, 202, 204),
+        idempotency_key: str | None = None,
     ) -> Any:
         self._require_isolated_kind("admin smoke operations")
         token_file = self.environment.get("SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE")
@@ -1294,13 +1594,13 @@ class KindHarness:
             headers={
                 "Authorization": "Bearer " + token,
                 "Content-Type": "application/json",
-                "Idempotency-Key": str(uuid.uuid4()),
+                "Idempotency-Key": idempotency_key or str(uuid.uuid4()),
             },
             data=json.dumps(body).encode() if body is not None else None,
         )
         try:
             try:
-                response = urlopen(request, timeout=30)
+                response = _URL_OPEN(request, timeout=30)
             except HTTPError as error:
                 response = error
             with response:
@@ -1647,6 +1947,10 @@ class KindHarness:
         subject: str,
         *,
         repair: Callable[[Mapping[str, object], _LeaseOwnership], None] | None = None,
+        reclaim_dead_holder: Callable[[Mapping[str, object]], bool] | None = None,
+        annotations: Mapping[str, str | None] | None = None,
+        holder_annotations: Sequence[str] = (),
+        clear_on_release: Sequence[str] = (),
         duration_seconds: int = RETENTION_MUTATION_LEASE_DURATION_SECONDS,
     ) -> _LeaseOwnership:
         """Create or take over `name`; refuse while another live holder exists.
@@ -1658,16 +1962,20 @@ class KindHarness:
         Lease is no proof that nothing is left to undo. Two contenders can both
         read the same Lease; running repairs before the patch would let the
         loser undo a fault the winner has since started. The callback must
-        fence its own writes on `ownership`. A Lease with a repair may also be
-        taken over from a holder `_holder_process_gone` proves dead, since the
-        repair undoes what that holder left. If the repair fails, the Lease is
-        released with its records for the next holder to retry.
+        fence its own writes on `ownership`. A Lease with a repair (or an
+        explicit `reclaim_dead_holder` predicate) may also be taken over from a
+        holder `_holder_process_gone` proves dead, since the repair undoes what
+        that holder left. If the repair fails, the Lease is released with its
+        records for the next holder to retry.
         """
 
         holder = (
             f"uid={os.getuid()};pid={os.getpid()};host={socket.gethostname()};"
             f"token={secrets.token_hex(16)}"
         )
+        if holder_annotations:
+            # Stamped with this acquisition's holder identity.
+            annotations = {**(annotations or {}), **dict.fromkeys(holder_annotations, holder)}
         acquired_at = datetime.now(UTC)
         spec = {
             "holderIdentity": holder,
@@ -1682,10 +1990,16 @@ class KindHarness:
                     f"could not inspect the {subject} Lease: "
                     f"{observed.detail() or '<no output>'}"
                 )
+            create_metadata: dict[str, object] = {"name": name, "namespace": KIND_NAMESPACE}
+            initial_annotations = {
+                key: value for key, value in (annotations or {}).items() if value is not None
+            }
+            if initial_annotations:
+                create_metadata["annotations"] = initial_annotations
             document = {
                 "apiVersion": "coordination.k8s.io/v1",
                 "kind": "Lease",
-                "metadata": {"name": name, "namespace": KIND_NAMESPACE},
+                "metadata": create_metadata,
                 "spec": spec,
             }
             created = self.kubectl(
@@ -1714,19 +2028,30 @@ class KindHarness:
                     raise SmokeConfigurationError(
                         f"existing {subject} Lease has an unsafe duration"
                     )
+                can_reclaim = (
+                    reclaim_dead_holder(lease)
+                    if reclaim_dead_holder is not None
+                    else repair is not None
+                )
                 if acquired_at < _parse_kube_timestamp(renewed) + timedelta(
                     seconds=duration
-                ) and not (repair is not None and _holder_process_gone(current_holder)):
+                ) and not (can_reclaim and _holder_process_gone(current_holder)):
                     raise SmokeConfigurationError(
                         f"another smoke holds the {subject} Lease on this kind "
                         f"cluster (owner {current_holder})"
                     )
             previous = lease
-            lease = self._replace_lease_spec(name, metadata, spec, subject=subject)
+            lease = self._replace_lease_spec(
+                name, metadata, spec, subject=subject, annotations=annotations
+            )
 
         metadata, _ = _lease_parts(lease)
         ownership = _LeaseOwnership(
-            name=name, uid=metadata["uid"], holder=holder, subject=subject
+            name=name,
+            uid=metadata["uid"],
+            holder=holder,
+            subject=subject,
+            clear_annotations=tuple(clear_on_release),
         )
         if observed.returncode == 0 and repair is not None:
             try:
@@ -1758,8 +2083,13 @@ class KindHarness:
             )
         released = dict(spec)
         released["holderIdentity"] = ""
+        clear = dict.fromkeys(ownership.clear_annotations, None) or None
         self._replace_lease_spec(
-            ownership.name, metadata, released, subject=ownership.subject,
+            ownership.name,
+            metadata,
+            released,
+            subject=ownership.subject,
+            annotations=clear,
             timeout=CLEANUP_REQUEST_SECONDS,
         )
 
@@ -1796,6 +2126,8 @@ class KindHarness:
         ownership: _LeaseOwnership,
         action: str,
         annotations: Mapping[str, str | None] | None = None,
+        *,
+        deadline: float | None = None,
     ) -> None:
         """Renew our live Lease and set or clear `annotations` in one guarded patch.
 
@@ -1804,12 +2136,19 @@ class KindHarness:
         and repaired its records; the patch tests uid, resourceVersion and
         holder, so that runner fails here instead of undoing the successor's
         fault or erasing its records, and a renewed Lease cannot expire under
-        the write that follows.
+        the write that follows. With `deadline` (a `time.monotonic()` value),
+        the read and the patch each get only what is left of it.
         """
 
-        metadata, _ = self._assert_lease_owned(ownership, action)
-        existing = metadata.get("annotations")
-        existing = existing if isinstance(existing, dict) else None
+        def request_timeout() -> float:
+            if deadline is None:
+                return 15.0
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"{action} ran out of its budget before the Lease write")
+            return min(15.0, remaining)
+
+        metadata, _ = self._assert_lease_owned(ownership, action, timeout=request_timeout())
         patch: list[dict[str, object]] = [
             {"op": "test", "path": "/metadata/uid", "value": metadata["uid"]},
             {
@@ -1824,18 +2163,15 @@ class KindHarness:
                 "value": _kube_timestamp(datetime.now(UTC)),
             },
         ]
-        for key, value in (annotations or {}).items():
-            path = f"/metadata/annotations/{_json_pointer_token(key)}"
-            if value is None:
-                if existing is not None and key in existing:
-                    patch.append({"op": "remove", "path": path})
-                continue
-            if existing is None:
-                patch.append({"op": "add", "path": "/metadata/annotations", "value": {}})
-                existing = {}
-            patch.append({"op": "add", "path": path, "value": value})
+        _append_lease_annotation_ops(patch, metadata, annotations)
         result = self.kubectl(
-            "patch", "lease", ownership.name, "--type=json", "--patch", json.dumps(patch)
+            "patch",
+            "lease",
+            ownership.name,
+            "--type=json",
+            "--patch",
+            json.dumps(patch),
+            timeout=request_timeout(),
         )
         if result.returncode != 0:
             raise SmokeConfigurationError(
@@ -1857,6 +2193,7 @@ class KindHarness:
         spec: Mapping[str, object],
         *,
         subject: str,
+        annotations: Mapping[str, str | None] | None = None,
         timeout: float | None = None,
     ) -> dict[str, object]:
         patch = [
@@ -1868,6 +2205,7 @@ class KindHarness:
             },
             {"op": "replace", "path": "/spec", "value": dict(spec)},
         ]
+        _append_lease_annotation_ops(patch, metadata, annotations)
         result = self.kubectl(
             "patch",
             "lease",
@@ -2507,19 +2845,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         """
 
         raw = self._node_service_env(node_name, component).get(OTEL_METRIC_EXPORT_INTERVAL_ENV)
-        if raw is None or not raw.strip():
-            return OTEL_METRIC_EXPORT_DEFAULT_SECONDS
-        try:
-            millis = int(raw.strip())
-        except ValueError:
-            raise SmokeConfigurationError(
-                f"{component} on {node_name} sets {OTEL_METRIC_EXPORT_INTERVAL_ENV}={raw!r}, not milliseconds"
-            ) from None
-        if millis <= 0:
-            raise SmokeConfigurationError(
-                f"{component} on {node_name} sets {OTEL_METRIC_EXPORT_INTERVAL_ENV}={raw!r}, not positive"
-            )
-        return millis / 1000
+        return _metric_export_interval_seconds(raw, owner=f"{component} on {node_name}")
 
     def template_cache_gc_config(self, node_name: str) -> TemplateCacheGcConfig:
         return _template_cache_gc_config_from_env(
@@ -3389,10 +3715,10 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     # --- concurrent restore contention -------------------------------------
 
-    def _public_api_deployment(self) -> str:
+    def _public_api_deployment(self, *, timeout: float = 15) -> str:
         result = self.kubectl(
             "get", "deploy", "-l", PUBLIC_API_DEPLOYMENT_SELECTOR,
-            "-o", "jsonpath={.items[*].metadata.name}", timeout=15,
+            "-o", "jsonpath={.items[*].metadata.name}", timeout=timeout,
         )
         names = _require_ok(result, "find the public API Deployment").split()
         if len(names) != 1:
@@ -3470,23 +3796,59 @@ ON CONFLICT (key_hash) DO NOTHING;
             f"set {name} bounds to {minimum}..{maximum}",
         )
 
-    def wait_public_api_rollout(self, *, timeout: float) -> None:
-        name = self._public_api_deployment()
+    def wait_public_api_rollout(
+        self, *, timeout: float, shared_deadline: bool = False
+    ) -> None:
+        if not shared_deadline:
+            name = self._public_api_deployment()
+            rollout_seconds = max(1, math.ceil(timeout))
+            grace_seconds = min(30.0, max(5.0, timeout * 0.25))
+            _require_ok(
+                self.kubectl(
+                    "rollout",
+                    "status",
+                    f"deploy/{name}",
+                    f"--timeout={rollout_seconds}s",
+                    timeout=rollout_seconds + grace_seconds,
+                ),
+                f"await rollout of {name}",
+            )
+            self._wait_deployment_pods_drained(name, timeout=timeout)
+            return
+
+        deadline = time.monotonic() + timeout
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(f"public API rollout budget ({timeout:g}s) is already exhausted")
+        name = self._public_api_deployment(timeout=min(15.0, remaining))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"await rollout of {name} exhausted its {timeout:g}s budget during Deployment lookup"
+            )
+        # kubectl's own `--timeout` takes whole seconds (and 0 means "wait
+        # forever"), so it rounds up; the process timeout is the remaining
+        # budget itself, so no call outlives the shared deadline.
         _require_ok(
             self.kubectl(
-                "rollout", "status", f"deploy/{name}", f"--timeout={int(timeout)}s",
-                timeout=timeout + 30,
+                "rollout",
+                "status",
+                f"deploy/{name}",
+                f"--timeout={max(1, math.ceil(remaining))}s",
+                timeout=remaining,
             ),
             f"await rollout of {name}",
         )
-        self._wait_deployment_pods_drained(name, timeout=timeout)
+        self._wait_deployment_pods_drained(name, timeout=timeout, deadline=deadline)
 
     def wait_public_api_pods_drained(self, *, timeout: float) -> None:
         """Block until only the Deployment's desired API pods exist, none Terminating."""
 
         self._wait_deployment_pods_drained(self._public_api_deployment(), timeout=timeout)
 
-    def _wait_deployment_pods_drained(self, name: str, *, timeout: float) -> None:
+    def _wait_deployment_pods_drained(
+        self, name: str, *, timeout: float, deadline: float | None = None
+    ) -> None:
         """Block until only the Deployment's desired pods exist, none Terminating.
 
         `kubectl rollout status` completes a rolling update, or a scale-down,
@@ -3498,12 +3860,26 @@ ON CONFLICT (key_hash) DO NOTHING;
         connections first.
         """
 
-        deadline = time.monotonic() + timeout
+        strict_deadline = deadline is not None
+        effective_deadline = time.monotonic() + timeout if deadline is None else deadline
+
+        def _read_timeout() -> float:
+            remaining = effective_deadline - time.monotonic()
+            if not strict_deadline:
+                return min(15.0, max(5.0, remaining + 5.0))
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"{name} pods did not drain within {timeout:g}s"
+                )
+            return min(15.0, remaining)
+
         while True:
             # Re-read each poll: an autoscaler may move the desired count.
             deployment = json.loads(
                 _require_ok(
-                    self.kubectl("get", "deploy", name, "-o", "json", timeout=15),
+                    self.kubectl(
+                        "get", "deploy", name, "-o", "json", timeout=_read_timeout()
+                    ),
                     f"read {name}",
                 )
             )
@@ -3514,21 +3890,28 @@ ON CONFLICT (key_hash) DO NOTHING;
             selector = ",".join(f"{key}={value}" for key, value in sorted(match_labels.items()))
             pods = json.loads(
                 _require_ok(
-                    self.kubectl("get", "pods", "-l", selector, "-o", "json", timeout=15),
+                    self.kubectl(
+                        "get", "pods", "-l", selector, "-o", "json", timeout=_read_timeout()
+                    ),
                     f"list {name} pods",
                 )
             ).get("items", [])
             terminating = [
                 pod["metadata"]["name"] for pod in pods if pod["metadata"].get("deletionTimestamp")
             ]
+            status_detail = f"(present={len(pods)}, terminating={terminating})"
+            if strict_deadline and time.monotonic() >= effective_deadline:
+                raise RuntimeError(
+                    f"{name} pods did not drain to {desired} within {timeout:g}s {status_detail}"
+                )
             if not terminating and len(pods) == desired:
                 return
-            if time.monotonic() > deadline:
+            remaining = effective_deadline - time.monotonic()
+            if remaining < 0 or (strict_deadline and remaining <= 0):
                 raise RuntimeError(
-                    f"{name} pods did not drain to {desired} within {timeout:g}s "
-                    f"(present={len(pods)}, terminating={terminating})"
+                    f"{name} pods did not drain to {desired} within {timeout:g}s {status_detail}"
                 )
-            time.sleep(1)
+            time.sleep(min(1.0, remaining) if strict_deadline else 1)
 
     # --- node groups ----------------------------------------------------------
 
@@ -3667,7 +4050,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         """
 
         ownership = ownership or self._held_public_api_lease(f"a fast rollout of {name}")
-        self._assert_lease_owned(ownership, f"a fast rollout of {name}")
+        self._assert_lease_owned(ownership, f"a fast rollout of {name}", timeout=15)
 
         # Armed before the first patch is sent: a patch whose reply is lost,
         # or that a deadline interrupts, may still have committed, and the
@@ -3677,7 +4060,12 @@ ON CONFLICT (key_hash) DO NOTHING;
             self._speed_up_rollout(name, armed.append)
             yield
         except BaseException as error:
-            if armed:
+            if armed and isinstance(error, ScenarioTimedOut):
+                error.add_note(
+                    f"skipping rollout pace restore of {name} after deadline; "
+                    "the next scenario's preflight repair restores it from the Deployment's record"
+                )
+            elif armed:
                 try:
                     self._restore_rollout_pace(name, armed[-1])
                 except Exception as restore_error:  # noqa: BLE001 - attached to the body's error below
@@ -4361,7 +4749,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             data=body,
         )
         try:
-            with urlopen(request, timeout=30) as response:
+            with _URL_OPEN(request, timeout=30) as response:
                 payload = json.load(response)
         except HTTPError as error:
             raise RuntimeError(f"native create returned HTTP {error.code}") from None
@@ -4419,7 +4807,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             data=json.dumps(body).encode(),
         )
         try:
-            with urlopen(request, timeout=20) as response:
+            with _URL_OPEN(request, timeout=20) as response:
                 return int(response.status), response.read().decode(errors="replace")[:2_000]
         except HTTPError as error:
             return error.code, error.read(2_000).decode(errors="replace")
@@ -4537,6 +4925,112 @@ ON CONFLICT (key_hash) DO NOTHING;
             "await the object-store rollout",
         )
 
+    # --- node-local traffic faults (drain v2) -----------------------------------
+    #
+    # A REJECT or DROP rule in one Kind node's own netfilter, tagged so the
+    # unblock removes exactly what the block added: the node's pods and host
+    # processes lose the path, every other node keeps it.
+
+    def block_node_traffic(self, node_name: str, path: str) -> None:
+        self._require_isolated_kind("node traffic faults")
+        for rule in self._node_traffic_rules(node_name, path):
+            if self._docker_exec(node_name, "iptables", "-C", *rule).returncode != 0:
+                _require_ok(
+                    self._docker_exec(node_name, "iptables", "-I", *rule),
+                    f"block {path} on {node_name}",
+                )
+
+    def unblock_node_traffic(self, node_name: str, path: str) -> None:
+        self._require_isolated_kind("node traffic faults")
+        for rule in self._node_traffic_rules(node_name, path):
+            while self._docker_exec(node_name, "iptables", "-C", *rule).returncode == 0:
+                _require_ok(
+                    self._docker_exec(node_name, "iptables", "-D", *rule),
+                    f"unblock {path} on {node_name}",
+                )
+
+    def _node_traffic_rules(self, node_name: str, path: str) -> list[tuple[str, ...]]:
+        tag = ("-m", "comment", "--comment", f"space-smoke-{path}")
+        if path == NODE_TRAFFIC_OBJECT_STORE:
+            # The object store's pod, as the node's pods (FORWARD) and host
+            # processes (OUTPUT) reach it once its Service is translated.
+            listing = self.kubectl(
+                "get", "pods", "-l", KIND_OBJECT_STORE_POD_SELECTOR, "-o", "json", timeout=15
+            )
+            ips = [
+                str((item.get("status") or {}).get("podIP"))
+                for item in json.loads(_require_ok(listing, "list object-store pods") or "{}").get(
+                    "items", []
+                )
+                if (item.get("status") or {}).get("podIP")
+            ]
+            if not ips:
+                raise RuntimeError("the object store has no pod IP to block")
+            return [
+                (chain, "-d", ip, "-p", "tcp", *tag, "-j", "REJECT", "--reject-with", "tcp-reset")
+                for ip in ips
+                for chain in ("FORWARD", "OUTPUT")
+            ]
+        if path == NODE_TRAFFIC_NODE_API:
+            # node-api's host port, unanswered rather than refused: a node
+            # that is up but unreachable.
+            return [("INPUT", "-p", "tcp", "--dport", str(KIND_NODE_API_PORT), *tag, "-j", "DROP")]
+        raise ValueError(f"refusing unknown node traffic path {path!r}")
+
+    def scale_controller(self, replicas: int, *, timeout: float) -> int:
+        """Scale the cluster-controller Deployment and await it; the replicas it had."""
+
+        self._require_isolated_kind("cluster-controller scaling")
+        if not 0 <= replicas <= 2:
+            raise ValueError(f"refusing to scale the cluster-controller to {replicas} replicas")
+        ownership = self._retention_lease_ownership
+        if ownership is None:
+            raise SmokeConfigurationError(
+                "refusing a cluster-controller scale without the caller's live mutation Lease"
+            )
+        self._assert_lease_owned(ownership, "a cluster-controller scale")
+        previous = self.controller_replicas()
+        name = self._controller_deployment()
+        _require_ok(
+            self.kubectl("scale", f"deploy/{name}", f"--replicas={replicas}", timeout=30),
+            f"scale the cluster-controller to {replicas}",
+        )
+        if replicas == 0:
+            deadline = time.monotonic() + timeout
+            while self.controller_pods():
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f"the cluster-controller pods outlived {timeout:.0f}s")
+                time.sleep(2)
+        else:
+            self._await_deployment_rollout(name, timeout=timeout)
+        return previous
+
+    def restart_controller(self, *, timeout: float) -> list[str]:
+        """Kill every cluster-controller pod at once and await its replacements; the killed pods' names."""
+
+        self._require_isolated_kind("cluster-controller restarts")
+        killed = [pod.name for pod in self.controller_pods() if not pod.deleting]
+        _require_ok(
+            self.kubectl(
+                "delete", "pod", "-l", KIND_CONTROLLER_SELECTOR, "--grace-period=1", "--wait=false",
+                timeout=60,
+            ),
+            "delete the cluster-controller pods",
+        )
+        replicas = self.controller_replicas()
+        deadline = time.monotonic() + timeout
+        while True:
+            pods = [pod for pod in self.controller_pods() if not pod.deleting]
+            fresh = [pod for pod in pods if pod.name not in killed and pod.ready]
+            if len(fresh) >= replicas and all(pod.name not in killed for pod in pods):
+                return killed
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"the cluster-controller did not come back within {timeout:.0f}s "
+                    f"(killed {killed}, now {[(pod.name, pod.ready) for pod in pods]})"
+                )
+            time.sleep(2)
+
     def log_since_time(self) -> str:
         return (datetime.now(UTC) - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -4554,7 +5048,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             data=b"{}",
         )
         try:
-            with urlopen(request, timeout=20) as response:
+            with _URL_OPEN(request, timeout=20) as response:
                 payload = json.load(response)
         except HTTPError as error:
             raise RuntimeError(f"native :suspend returned HTTP {error.code}") from None
@@ -4579,7 +5073,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             headers={"Authorization": "Bearer " + self._admin_token()},
         )
         try:
-            with urlopen(request, timeout=20) as response:
+            with _URL_OPEN(request, timeout=20) as response:
                 return json.load(response)
         except HTTPError as error:
             raise RuntimeError(f"native {method} /v1/{resource} returned HTTP {error.code}") from None
@@ -4760,7 +5254,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             },
         )
         try:
-            with urlopen(request, timeout=20) as response:
+            with _URL_OPEN(request, timeout=20) as response:
                 payload = json.load(response)
         except HTTPError as error:
             if error.code == 404:
@@ -4789,11 +5283,15 @@ ON CONFLICT (key_hash) DO NOTHING;
             duration_seconds=duration_seconds,
         )
         self._public_api_lease_ownership = ownership
+        self._redis_fault_clear_ready = False
 
         def release() -> None:
-            self._release_lease(ownership)
-            if self._public_api_lease_ownership is ownership:
-                self._public_api_lease_ownership = None
+            try:
+                self._release_lease(ownership)
+            finally:
+                if self._public_api_lease_ownership is ownership:
+                    self._public_api_lease_ownership = None
+                    self._redis_fault_clear_ready = False
 
         return release
 
@@ -4815,15 +5313,68 @@ ON CONFLICT (key_hash) DO NOTHING;
             self._renew_lease(
                 ownership, "clearing the Redis record", {REDIS_REPLICAS_ANNOTATION: None}
             )
+        # The limiter env before the worker slot count, as a scenario's own
+        # unwind does: a worker repair that fails still leaves the API's slot
+        # check restored, and its record keeps later runs refusing to start.
         recorded_env = annotations.get(LIMITER_ENV_ANNOTATION)
         if isinstance(recorded_env, str) and recorded_env:
-            standing = _recorded_limiter_env(recorded_env)
+            try:
+                standing = _recorded_limiter_env(recorded_env)
+            except ValueError as error:
+                # A record a newer runner wrote, naming limiter keys this
+                # checkout doesn't know. The exact recovery goes in the error:
+                # a runner that knows the keys repairs it (restoring the env and
+                # clearing the record); clearing it by hand only unblocks this
+                # one and leaves the env as the aborted run set it.
+                raise ValueError(
+                    f"{error}. The limiter env record on Lease {ownership.name} was written "
+                    "by a newer smoke runner. Run any Kind scenario from a checkout that "
+                    "knows these keys to restore the env and clear the record, or clear "
+                    "the record by hand (the limiter env then stays as that run left it): "
+                    f"kubectl annotate lease {ownership.name} {LIMITER_ENV_ANNOTATION}- "
+                    f"-n {KIND_NAMESPACE} --context {self.config.context}"
+                ) from error
             self._renew_lease(ownership, "an orphaned limiter env repair")
             self._apply_public_api_env(
                 standing, "restore the limiter env a previous smoke Lease holder left", ownership
             )
             self._renew_lease(
                 ownership, "clearing the limiter env record", {LIMITER_ENV_ANNOTATION: None}
+            )
+        recorded_slots = annotations.get(NETWORK_POOL_MAX_SLOTS_ANNOTATION)
+        if isinstance(recorded_slots, str) and recorded_slots:
+            standing_slots_env, standing_capacities = _recorded_network_pool_max_slots(recorded_slots)
+            self._renew_lease(ownership, "an orphaned worker network-slot setting repair")
+            try:
+                release_nm = self.acquire_worker_network_slots_mutation()
+                try:
+                    self._set_daemonset_env(
+                        {NODE_MANAGER_DAEMONSETS[0]: standing_slots_env},
+                        NODE_MANAGER,
+                        NETWORK_POOL_MAX_SLOTS_ENV,
+                        ownership=self._node_manager_lease_ownership,
+                        what="worker node-manager",
+                    )
+                    self._await_repaired_worker_network_slots(
+                        standing_slots_env, standing_capacities, timeout=120
+                    )
+                finally:
+                    release_nm()
+            except SmokeConfigurationError as error:
+                raise SmokeConfigurationError(
+                    f"could not put back the worker network-slot setting {standing_slots_env!r} an earlier run "
+                    f"recorded: {error}; the record stays on the Lease, so the next preflight retries the repair"
+                ) from error
+            after_slots_env = self.worker_network_pool_max_slots_env()
+            if after_slots_env != standing_slots_env:
+                raise SmokeConfigurationError(
+                    f"worker {NETWORK_POOL_MAX_SLOTS_ENV} reads {after_slots_env!r} after its repair, not the "
+                    f"recorded {standing_slots_env!r}"
+                )
+            self._renew_lease(
+                ownership,
+                "clearing the worker network-slot setting record",
+                {NETWORK_POOL_MAX_SLOTS_ANNOTATION: None},
             )
         # Before the gate: a run turns the gate on first and these second.
         recorded_campaign = annotations.get(TEMPLATE_CAMPAIGN_ENV_ANNOTATION)
@@ -4908,6 +5459,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             REDIS_REPLICAS_ANNOTATION,
             ENVIRONMENT_PLACEMENT_GATE_ANNOTATION,
             TEMPLATE_CAMPAIGN_ENV_ANNOTATION,
+            NETWORK_POOL_MAX_SLOTS_ANNOTATION,
         )
         if not any(annotations.get(key) for key in recorded_keys):
             return False
@@ -4916,8 +5468,8 @@ ON CONFLICT (key_hash) DO NOTHING;
         except SmokeConfigurationError as error:
             _, spec = _lease_parts(document)
             raise SmokeConfigurationError(
-                "refusing to run while the public API mutation Lease records a limiter fault, an "
-                "environment placement gate or template campaign settings "
+                "refusing to run while the public API mutation Lease records a limiter fault, "
+                "worker network-slot setting, environment placement gate, or template campaign settings "
                 f"(holder {spec.get('holderIdentity') or '<none>'}): {error}"
             ) from error
         release()
@@ -4985,7 +5537,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         return ownership
 
     def _lease_annotation(self, ownership: _LeaseOwnership, key: str) -> str | None:
-        current = self.kubectl("get", "lease", ownership.name, "-o", "json")
+        current = self.kubectl("get", "lease", ownership.name, "-o", "json", timeout=15)
         _require_ok(current, f"read the {ownership.subject} Lease")
         value = _lease_annotations(_lease_document(current.stdout)).get(key)
         return value if isinstance(value, str) and value else None
@@ -5011,8 +5563,21 @@ ON CONFLICT (key_hash) DO NOTHING;
 
         return self._deployment_env_literals(self._public_api_deployment(), keys)
 
+    def public_api_has_env_from(self) -> bool:
+        result = self.kubectl(
+            "get", "deploy", self._public_api_deployment(), "-o",
+            "jsonpath={.spec.template.spec.containers[0].envFrom}", timeout=15,
+        )
+        return bool(json.loads(_require_ok(result, "read the public API envFrom") or "[]"))
+
     def _apply_public_api_env(
-        self, values: Mapping[str, str | None], action: str, ownership: _LeaseOwnership | None = None
+        self,
+        values: Mapping[str, str | None],
+        action: str,
+        ownership: _LeaseOwnership | None = None,
+        *,
+        rollout_timeout: float = 240,
+        shared_deadline: bool = False,
     ) -> None:
         _require_limiter_env_keys(values)
         self._require_isolated_kind("public API env override")
@@ -5028,7 +5593,9 @@ ON CONFLICT (key_hash) DO NOTHING;
                 self.kubectl("set", "env", f"deploy/{name}", "-c", container, *assignments, timeout=30),
                 action,
             )
-            self.wait_public_api_rollout(timeout=240)
+            self.wait_public_api_rollout(
+                timeout=rollout_timeout, shared_deadline=shared_deadline
+            )
 
     def set_public_api_env(self, overrides: Mapping[str, str]) -> None:
         from space_smoke.rate_limiters import LIMITER_ENV_KEYS
@@ -5046,11 +5613,23 @@ ON CONFLICT (key_hash) DO NOTHING;
         record: dict[str, str | None] = {}
         if self._lease_annotation(ownership, LIMITER_ENV_ANNOTATION) is None:
             standing = self.public_api_env(LIMITER_ENV_KEYS)
-            record[LIMITER_ENV_ANNOTATION] = json.dumps(standing, sort_keys=True)
+            recorded = json.dumps(standing, sort_keys=True)
+            # Refused here, before anything is written, if the orphan repair
+            # couldn't restore it: a run that died after the override would
+            # otherwise leave a record the next run refuses, and the
+            # overrides in place.
+            _recorded_limiter_env(recorded)
+            record[LIMITER_ENV_ANNOTATION] = recorded
         self._renew_lease(ownership, action, record)
         self._apply_public_api_env(overrides, "set the public API limiter env")
 
-    def restore_public_api_env(self, standing: Mapping[str, str | None]) -> None:
+    def restore_public_api_env(
+        self,
+        standing: Mapping[str, str | None],
+        *,
+        rollout_timeout: float = 240,
+        shared_deadline: bool = False,
+    ) -> None:
         """Put the standing env back, then clear its record; both only while the Lease is ours.
 
         A runner that lost its Lease refuses: the successor that took it over
@@ -5061,7 +5640,12 @@ ON CONFLICT (key_hash) DO NOTHING;
         action = "restoring the public API limiter env"
         ownership = self._held_public_api_lease(action)
         self._renew_lease(ownership, action)
-        self._apply_public_api_env(standing, "restore the public API limiter env")
+        self._apply_public_api_env(
+            standing,
+            "restore the public API limiter env",
+            rollout_timeout=rollout_timeout,
+            shared_deadline=shared_deadline,
+        )
         self._renew_lease(
             ownership, "clearing the limiter env record", {LIMITER_ENV_ANNOTATION: None}
         )
@@ -5082,6 +5666,236 @@ ON CONFLICT (key_hash) DO NOTHING;
                 raise RuntimeError(f"the public API did not report /readyz=200 within {timeout:g}s")
             time.sleep(1)
 
+    def activation_attribution_available(self) -> bool:
+        """Whether this build records the activating client on the sandbox row.
+
+        Reads `information_schema`, so it answers for the schema the running
+        API is actually against rather than for the source tree the bench was
+        built from -- the two can differ when a rollout is stale.
+        """
+
+        count = self._psql(
+            ACTIVATION_ATTRIBUTION_COLUMN_SQL,
+            action="probe for the activating-client column",
+        )
+        return count.strip() == "1"
+
+    def sandbox_activating_client(self, sandbox_id: str) -> str | None:
+        """The activating client recorded on the sandbox row, empty when unset.
+
+        `None` when there's no row, which an unset column must not read as.
+        """
+
+        value = self._psql(
+            SANDBOX_ACTIVATING_CLIENT_SQL.format(sandbox_id=_sql_uuid(sandbox_id)),
+            action="read the sandbox's activating client",
+        ).strip()
+        return value.removeprefix("row:") if value.startswith("row:") else None
+
+    def sandbox_lifecycle(self, sandbox_id: str) -> str | None:
+        """The lifecycle stored on the sandbox row, `None` when there's no row."""
+
+        value = self._psql(
+            SANDBOX_LIFECYCLE_SQL.format(sandbox_id=_sql_uuid(sandbox_id)),
+            action="read the sandbox's lifecycle",
+        ).strip()
+        return value.removeprefix("row:") if value.startswith("row:") else None
+
+    def sandbox_pod_client_ids(self, sandbox_id: str) -> list[str]:
+        """The activating-client label of each of the sandbox's live pods.
+
+        Live as the live cap counts them: terminal, deleting and
+        stopped-materialization pods are dropped, so an empty list can mean
+        the sandbox has only dead pods.
+
+        A pod carrying no such label contributes an empty string rather than
+        being dropped, so a caller can tell "no pod" from "a pod the API never
+        labelled" -- the second is the defect, and silently filtering it out
+        would make the verdict pass by having nothing to judge.
+        """
+
+        return [
+            str(((pod.get("metadata") or {}).get("labels") or {}).get(ACTIVATION_CLIENT_LABEL, ""))
+            for pod in self._live_sandbox_pods(sandbox_id)
+        ]
+
+    def sandbox_live_pod_phases(self, sandbox_id: str) -> list[str]:
+        """The phase of each of the sandbox's live pods, filtered as above."""
+
+        return [
+            str((pod.get("status") or {}).get("phase") or "")
+            for pod in self._live_sandbox_pods(sandbox_id)
+        ]
+
+    def _live_sandbox_pods(self, sandbox_id: str) -> list[Mapping[str, Any]]:
+        result = self.kubectl(
+            "get",
+            "pods",
+            "-l",
+            f"{SANDBOX_MANAGED_BY_SELECTOR},{SANDBOX_ID_LABEL}={_sql_uuid(sandbox_id)}",
+            "-o",
+            "json",
+            timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        _require_ok(result, "read the sandbox's live pods")
+        # Only the pods the live cap would count: a prior execution's pod that
+        # is terminating or terminal can predate the activation being judged,
+        # and its label or phase would misjudge a build that worked.
+        return [
+            pod
+            for pod in json.loads(result.stdout or "{}").get("items", [])
+            if _live_cap_counts_pod(pod)
+        ]
+
+    def live_client_sandboxes(self, client_id: str) -> list[str]:
+        """The client's live *sandboxes*, as the live cap counts them.
+
+        Not pod names, and not every pod: the cap's index maps a client-id
+        label to "the sandboxes that have at least one qualifying pod
+        carrying it: a sandbox or restore pod that's neither terminal nor
+        being deleted" (`client_live_pods.rs`). Two things follow, and both
+        are easy to get wrong in the direction that breaks a verdict:
+
+        * **Deduplicate by sandbox.** A wake is exactly the case that has a
+          restore pod and a sandbox pod at once, so counting pods would read
+          one capped sandbox as two and red a working cap.
+        * **Drop deleting pods.** The cap excludes them deliberately -- one
+          stuck terminating on a lost node must not hold its client's slot --
+          so counting them lets a leftover satisfy a verdict that is supposed
+          to prove something was placed. Terminal pods and stopped-
+          materialization checkpoint pods are dropped for the same reason.
+        """
+
+        if not CLIENT_LABEL_VALUE.fullmatch(client_id):
+            raise ValueError(
+                f"refusing invalid client_id label value {client_id!r}"
+            )
+        result = self.kubectl(
+            "get",
+            "pods",
+            "-l",
+            f"{SANDBOX_MANAGED_BY_SELECTOR},{ACTIVATION_CLIENT_LABEL}={client_id}",
+            "-o",
+            "json",
+            timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        _require_ok(result, "count the client's live sandboxes")
+        sandboxes: set[str] = set()
+        for pod in json.loads(result.stdout or "{}").get("items", []):
+            if not _live_cap_counts_pod(pod):
+                continue
+            sandbox_id = _live_cap_sandbox_id(pod)
+            if sandbox_id:
+                sandboxes.add(sandbox_id)
+        return sorted(sandboxes)
+
+    def sandbox_node_slots(self) -> dict[str, SandboxNodeSlots]:
+        """Per sandbox-pool node: advertised and allocatable network slots and bound sandbox pods.
+
+        Reads every node in `space.pplx.net/node-pool=sandbox` without copying
+        the API's start-eligibility filters: the scenario judges fullness from
+        the API's own slot-shortage 503 and checks that admitted sandboxes match
+        `status.allocatable`. `allocatable` never falls back to `capacity`, so a
+        kubelet status lag stays visible instead of reading as schedulable.
+
+        `used` counts non-terminating sandbox pods bound to the node, and
+        `terminating` counts deleting ones whose slot request kube-scheduler
+        still charges until the pod is gone.
+        """
+
+        nodes = self.kubectl(
+            "get", "nodes", "-l", KIND_SANDBOX_NODE_SELECTOR, "-o", "json", timeout=15
+        )
+        _require_ok(nodes, "read the sandbox nodes' network-slot capacity")
+        capacities: dict[str, tuple[int, int]] = {}
+        used_by_node: dict[str, int] = {}
+        terminating_by_node: dict[str, int] = {}
+        for node in json.loads(nodes.stdout or "{}").get("items", []):
+            name = (node.get("metadata") or {}).get("name") or ""
+            if not name:
+                continue
+            status = node.get("status") or {}
+            raw_capacity = str((status.get("capacity") or {}).get(SANDBOX_NETWORK_SLOTS_RESOURCE, "0"))
+            raw_allocatable = str((status.get("allocatable") or {}).get(SANDBOX_NETWORK_SLOTS_RESOURCE, "0"))
+            capacity = int(raw_capacity) if raw_capacity.isdigit() else 0
+            allocatable = int(raw_allocatable) if raw_allocatable.isdigit() else 0
+            capacities[name] = (capacity, allocatable)
+            used_by_node[name] = 0
+            terminating_by_node[name] = 0
+        pods = self.kubectl(
+            "get",
+            "pods",
+            "-l",
+            SANDBOX_MANAGED_BY_SELECTOR,
+            "-o",
+            "json",
+            timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        _require_ok(pods, "count the sandbox pods holding network slots")
+        for pod in json.loads(pods.stdout or "{}").get("items", []):
+            node_name = (pod.get("spec") or {}).get("nodeName") or ""
+            if node_name not in capacities:
+                continue
+            phase = (pod.get("status") or {}).get("phase")
+            if phase in ("Succeeded", "Failed"):
+                continue
+            requested = sum(
+                int(raw)
+                for container in (pod.get("spec") or {}).get("containers") or []
+                if (
+                    raw := str(
+                        ((container.get("resources") or {}).get("requests") or {}).get(
+                            SANDBOX_NETWORK_SLOTS_RESOURCE, "0"
+                        )
+                    )
+                ).isdigit()
+            )
+            if requested <= 0:
+                continue
+            if (pod.get("metadata") or {}).get("deletionTimestamp"):
+                terminating_by_node[node_name] += requested
+            else:
+                used_by_node[node_name] += requested
+        return {
+            name: SandboxNodeSlots(
+                capacity=capacity,
+                allocatable=allocatable,
+                used=used_by_node[name],
+                terminating=terminating_by_node[name],
+            )
+            for name, (capacity, allocatable) in capacities.items()
+        }
+
+    def unbound_sandbox_pods(self) -> list[str]:
+        """User sandbox pods no node has been bound to, deleting ones included.
+
+        `sandbox_node_slots` only counts pods bound to a node, so a pod still
+        waiting for a slot is invisible to it -- and that pod takes the next
+        slot to come free. Pool pods are left out: they're the warm pool's,
+        not a create's, and a pool kept short of slots stays unbound.
+        """
+
+        pods = self.kubectl(
+            "get",
+            "pods",
+            "-l",
+            f"{SANDBOX_MANAGED_BY_SELECTOR},!{POOL_ROLE_LABEL}",
+            "-o",
+            "json",
+            timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        _require_ok(pods, "list the unbound sandbox pods")
+        return sorted(
+            (pod.get("metadata") or {}).get("name") or ""
+            for pod in json.loads(pods.stdout or "{}").get("items", [])
+            if not (pod.get("spec") or {}).get("nodeName")
+            and (pod.get("status") or {}).get("phase") not in ("Succeeded", "Failed")
+        )
+
     def redis_replicas(self) -> int:
         previous = _require_ok(
             self.kubectl(
@@ -5096,9 +5910,10 @@ ON CONFLICT (key_hash) DO NOTHING;
 
         Every Kind API, admin API and cluster-controller replica runs its
         limiters against this store, so scaling it to zero is recorded on the
-        Lease first, where the next holder scales it back if this run does
-        not. A runner that lost its Lease refuses either way, so it cannot
-        undo or erase a successor's fault.
+        Lease first, and the record is cleared only once `wait_redis_rollout`
+        confirms the store is back, leaving it for the next holder if this run
+        does not finish recovery. A runner that lost its Lease refuses either
+        way, so it cannot undo or erase a successor's fault.
         """
 
         self._require_isolated_kind("Redis scaling")
@@ -5108,6 +5923,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         ownership = self._held_public_api_lease(action)
         previous = self.redis_replicas()
         if replicas == 0:
+            self._redis_fault_clear_ready = False
             record: dict[str, str | None] = {}
             if self._lease_annotation(ownership, REDIS_REPLICAS_ANNOTATION) is None:
                 record[REDIS_REPLICAS_ANNOTATION] = str(previous)
@@ -5116,9 +5932,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         else:
             self._renew_lease(ownership, action)
             self._scale_redis_deployment(replicas)
-            self._renew_lease(
-                ownership, "clearing the Redis record", {REDIS_REPLICAS_ANNOTATION: None}
-            )
+            self._redis_fault_clear_ready = True
         return previous
 
     def _scale_redis_deployment(self, replicas: int) -> None:
@@ -5163,14 +5977,53 @@ ON CONFLICT (key_hash) DO NOTHING;
                 raise RuntimeError("Redis endpoints did not drain after the pod left")
             time.sleep(1)
 
-    def wait_redis_rollout(self, *, timeout: float) -> None:
+    def wait_redis_rollout(self, *, timeout: float, shared_deadline: bool = False) -> None:
+        """Await the Redis rollout, then clear the Lease's Redis record if it was armed.
+
+        `shared_deadline=True` makes `timeout` a hard bound on the rollout and
+        the record clear together, for a caller whose own budget ends with it:
+        the rollout gets `timeout` less `REDIS_RECORD_CLEAR_SECONDS` when a
+        clear will follow, and the Lease read and patch get what is left. A
+        clear that runs out fails and leaves the record for the orphan repair.
+        Otherwise kubectl gets a grace period past its own `--timeout`, and
+        the clear its usual per-request timeouts.
+        """
+
+        if timeout <= 0:
+            raise RuntimeError(f"Redis rollout budget ({timeout:g}s) is already exhausted")
+        clearing = self._redis_fault_clear_ready and self._public_api_lease_ownership is not None
+        deadline: float | None = None
+        if shared_deadline:
+            deadline = time.monotonic() + timeout
+            process_timeout = timeout - (REDIS_RECORD_CLEAR_SECONDS if clearing else 0.0)
+            if process_timeout <= 0:
+                raise RuntimeError(
+                    f"Redis rollout budget ({timeout:g}s) leaves nothing past the record "
+                    f"clear's {REDIS_RECORD_CLEAR_SECONDS:g}s; the record stays for the repair"
+                )
+            rollout_seconds = max(1, math.ceil(process_timeout))
+        else:
+            rollout_seconds = max(1, math.ceil(timeout))
+            process_timeout = rollout_seconds + min(30.0, max(5.0, timeout * 0.25))
         _require_ok(
             self.kubectl(
-                "rollout", "status", f"deploy/{KIND_REDIS_DEPLOYMENT}",
-                f"--timeout={int(timeout)}s", timeout=timeout + 30,
+                "rollout",
+                "status",
+                f"deploy/{KIND_REDIS_DEPLOYMENT}",
+                f"--timeout={rollout_seconds}s",
+                timeout=process_timeout,
             ),
             "await the Redis rollout",
         )
+        if clearing:
+            ownership = self._held_public_api_lease("clearing the Redis record")
+            self._renew_lease(
+                ownership,
+                "clearing the Redis record",
+                {REDIS_REPLICAS_ANNOTATION: None},
+                deadline=deadline,
+            )
+            self._redis_fault_clear_ready = False
 
     # --- admin console ---------------------------------------------------------
     #
@@ -5248,7 +6101,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             data=None if body is None else json.dumps(body).encode(),
         )
         try:
-            with urlopen(request, timeout=30) as response:
+            with _URL_OPEN(request, timeout=30) as response:
                 status, raw = int(response.status), response.read()
         except HTTPError as error:
             with error:
@@ -5261,6 +6114,142 @@ ON CONFLICT (key_hash) DO NOTHING;
         except ValueError:
             parsed = raw.decode(errors="replace")[:500]
         return ConsoleApiResponse(status, parsed)
+
+    # --- late probe cleanup ---------------------------------------------------
+    #
+    # A limiter probe's create can answer after the sweep moved past it, and
+    # after teardown deleted the run's ECW key, so the late reap goes through
+    # the admin API with the bench's admin bearer instead.
+
+    def admin_force_delete_sandbox(self, sandbox_id: str) -> bool:
+        """Drive the admin `:force-delete` of one sandbox; whether it's done.
+
+        Done is a sandbox already gone or a delete operation that succeeded;
+        a queued or running one answers `False` for the caller to poll again.
+        The admin route queues another delete for each new idempotency key:
+        unlike the ECW DELETE it doesn't join one already active. So one key
+        per sandbox is reserved before the first POST and shared by every
+        caller and by a retry whose reply was lost, which the route answers
+        with the operation already queued under it. Only an operation that
+        ended failed, canceled or expired gets a fresh key and a new delete.
+        """
+
+        target = _sql_uuid(sandbox_id.removeprefix("sbx_"))
+        with self._late_reap_lock:
+            entry = self._late_reap_deletes.setdefault(
+                target, {"key": str(uuid.uuid4()), "operation": ""}
+            )
+            operation = entry["operation"]
+        if operation:
+            answer = self.console_api(
+                "GET", f"/admin/api/v1/operations/{quote(operation, safe='')}"
+            )
+            state = answer.body.get("state") if isinstance(answer.body, dict) else None
+            if answer.status == 200 and state == "succeeded":
+                # Kept: a later call answers done from it instead of reserving
+                # a fresh key and queueing a delete the row may not reflect yet.
+                return True
+            if answer.status == 200 and state in ("queued", "running"):
+                return False
+            if answer.status == 200 and state in ("failed", "canceled", "expired"):
+                with self._late_reap_lock:
+                    if self._late_reap_deletes.get(target) is entry:
+                        entry = {"key": str(uuid.uuid4()), "operation": ""}
+                        self._late_reap_deletes[target] = entry
+                    else:
+                        entry = self._late_reap_deletes.setdefault(
+                            target, {"key": str(uuid.uuid4()), "operation": ""}
+                        )
+            elif answer.status != 404:
+                raise SmokeConfigurationError(
+                    f"admin operation read answered HTTP {answer.status}"
+                )
+        answer = self.console_api(
+            "POST",
+            f"/admin/api/v1/sandboxes/{target}:force-delete",
+            idempotency_key=entry["key"],
+        )
+        if answer.status == 404:
+            with self._late_reap_lock:
+                self._late_reap_deletes.pop(target, None)
+            return True
+        if answer.status not in (200, 202):
+            raise SmokeConfigurationError(f"admin force-delete answered HTTP {answer.status}")
+        operation_id = answer.body.get("operation_id") if isinstance(answer.body, dict) else None
+        if isinstance(operation_id, str) and operation_id:
+            with self._late_reap_lock:
+                entry["operation"] = operation_id
+        return False
+
+    def admin_force_delete_matching(
+        self, metadata: Mapping[str, str], *, max_pages: int = 20
+    ) -> list[str]:
+        """Force-delete every live sandbox whose metadata holds each pair, and
+        return those whose delete is queued but not yet confirmed done.
+
+        The admin list has no metadata filter, so each page is matched here, as
+        the ECW list's JSONB containment would: every given key, string-equal.
+        Every match is attempted, including those found before a page failed;
+        an incomplete scan, else the first delete failure, is raised after as
+        `AdminReapIncomplete`, carrying the ids still pending.
+        """
+
+        matched: list[str] = []
+        scan_error: SmokeConfigurationError | None = None
+        cursor = ""
+        try:
+            for _ in range(max_pages):
+                query = urlencode({"cursor": cursor, "limit": 1000})
+                answer = self.console_api("GET", f"/admin/api/v1/sandboxes?{query}")
+                if answer.status != 200 or not isinstance(answer.body, dict):
+                    raise SmokeConfigurationError(
+                        f"admin sandbox list answered HTTP {answer.status}"
+                    )
+                for row in answer.body.get("sandboxes") or []:
+                    if not isinstance(row, dict) or row.get("status") == "deleted":
+                        continue
+                    stored = row.get("metadata")
+                    if isinstance(stored, dict) and all(
+                        stored.get(key) == value for key, value in metadata.items()
+                    ):
+                        matched.append(str(row["id"]))
+                next_cursor = answer.body.get("next_cursor")
+                if not isinstance(next_cursor, str) or not next_cursor:
+                    break
+                cursor = next_cursor
+            else:
+                raise SmokeConfigurationError(
+                    f"admin sandbox list ran past {max_pages} pages while matching run metadata"
+                )
+        except SmokeConfigurationError as error:
+            # The pages already read still name sandboxes of this run: delete
+            # those before reporting, or a page that keeps failing would keep
+            # them alive across every rescan.
+            scan_error = error
+        # Every match is attempted before a failure is reported: one sandbox
+        # whose delete keeps failing must not keep the rest alive. A row whose
+        # delete went through stops matching once it reads deleted, so a
+        # rescan retries only what is still live.
+        first_error: Exception | None = None
+        pending: list[str] = []
+        for sandbox_id in matched:
+            try:
+                if not self.admin_force_delete_sandbox(sandbox_id):
+                    pending.append(sandbox_id)
+            except Exception as error:  # noqa: BLE001 - finish the other deletes first
+                # Its outcome is unknown, and its reserved key makes a retry safe.
+                pending.append(sandbox_id)
+                first_error = first_error or error
+        # Either failure carries what is still pending, so the caller polls the
+        # deletes this call queued even though it raised.
+        if scan_error is not None:
+            raise AdminReapIncomplete(
+                f"run-metadata scan incomplete after {len(matched)} match(es): {scan_error}",
+                pending,
+            ) from scan_error
+        if first_error is not None:
+            raise AdminReapIncomplete(f"a matched delete failed: {first_error}", pending) from first_error
+        return pending
 
     # --- node drain ----------------------------------------------------------
 
@@ -5285,7 +6274,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             method="POST",
         )
         try:
-            with urlopen(request, timeout=15) as response:
+            with _URL_OPEN(request, timeout=15) as response:
                 token = json.load(response).get("token")
         except (HTTPError, URLError, OSError, ValueError):
             raise SmokeConfigurationError("kind admin login failed") from None
@@ -5293,13 +6282,27 @@ ON CONFLICT (key_hash) DO NOTHING;
             raise SmokeConfigurationError("kind admin login returned no token")
         return token
 
-    def _admin(
-        self, method: str, resource: str, *, expect: Collection[int], body: Any = None
-    ) -> Any:
-        self._require_isolated_kind("admin node operations")
+    def _admin_request(
+        self,
+        method: str,
+        resource: str,
+        *,
+        body: Any = None,
+        idempotency_key: str | None = None,
+        timeout: float = 20,
+    ) -> tuple[int, Any, bytes]:
+        """`method /admin/api/v1/<resource>` on the isolated Kind API: its
+        status, headers and body, whatever the status. The opener bypasses
+        proxies and refuses redirects, so the admin bearer goes only to the
+        loopback API; a redirect is answered as its 3xx. A failed transport
+        raises."""
+
+        self._require_isolated_kind("admin API calls")
         headers = {"Authorization": "Bearer " + self._admin_token()}
         if body is not None:
             headers["Content-Type"] = "application/json"
+        if idempotency_key is not None:
+            headers["Idempotency-Key"] = idempotency_key
         request = Request(
             self.config.api_url.rstrip("/") + "/admin/api/v1/" + resource,
             method=method,
@@ -5307,14 +6310,37 @@ ON CONFLICT (key_hash) DO NOTHING;
             data=None if body is None else json.dumps(body).encode(),
         )
         try:
-            with urlopen(request, timeout=20) as response:
-                if response.status not in expect:
-                    raise RuntimeError(f"admin {method} {resource} returned HTTP {response.status}")
-                raw = response.read()
+            with _URL_OPEN(request, timeout=timeout) as response:
+                return int(response.status), response.headers, response.read()
         except HTTPError as error:
-            raise RuntimeError(f"admin {method} {resource} returned HTTP {error.code}") from None
+            with error:
+                return int(error.code), error.headers, error.read()
         except (URLError, OSError):
             raise RuntimeError(f"admin {method} {resource} failed") from None
+
+    def _admin_answer(
+        self,
+        method: str,
+        resource: str,
+        *,
+        body: Any = None,
+        idempotency_key: str | None = None,
+        timeout: float = 20,
+    ) -> CallAnswer:
+        """An admin call answered as it came, for a caller that judges it."""
+
+        return _call_answer(
+            *self._admin_request(
+                method, resource, body=body, idempotency_key=idempotency_key, timeout=timeout
+            )
+        )
+
+    def _admin(
+        self, method: str, resource: str, *, expect: Collection[int], body: Any = None
+    ) -> Any:
+        status, _, raw = self._admin_request(method, resource, body=body)
+        if status not in expect:
+            raise RuntimeError(f"admin {method} {resource} returned HTTP {status}")
         return json.loads(raw) if raw else None
 
     def admin_nodes(self) -> list[AdminNodeView]:
@@ -5328,6 +6354,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             active = item.get("sandboxes_active")
             phase = item.get("drain_phase")
             mode = item.get("drain_mode")
+            engine = item.get("drain_engine")
             nodes.append(
                 AdminNodeView(
                     id=str(item.get("id", "")),
@@ -5335,6 +6362,12 @@ ON CONFLICT (key_hash) DO NOTHING;
                     drain_phase=phase if isinstance(phase, str) else None,
                     drain_mode=mode if isinstance(mode, str) else None,
                     sandboxes_active=active if isinstance(active, int) else None,
+                    drain_last_error=(
+                        item["drain_last_error"]
+                        if isinstance(item.get("drain_last_error"), str)
+                        else None
+                    ),
+                    drain_engine=engine if isinstance(engine, str) else None,
                 )
             )
         return nodes
@@ -5352,6 +6385,137 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def undrain_node(self, node_id: str) -> None:
         self._admin("POST", f"nodes/{quote(_sql_uuid(node_id), safe='')}:undrain", expect=(200, 202))
+
+    def drain_node_v2(self, node_id: str, *, hold_seconds: int) -> None:
+        if not 0 <= hold_seconds <= 86400:
+            raise ValueError(f"refusing a drain hold of {hold_seconds}s")
+        self._admin(
+            "POST",
+            f"nodes/{quote(_sql_uuid(node_id), safe='')}:drain",
+            expect=(200, 202),
+            body={"engine": "v2", DRAIN_HOLD_FIELD: hold_seconds},
+        )
+
+    def drain_node_answer(self, node_id: str, body: Mapping[str, object]) -> CallAnswer:
+        return self._admin_answer(
+            "POST", f"nodes/{quote(_sql_uuid(node_id), safe='')}:drain", body=dict(body)
+        )
+
+    _ADMIN_SANDBOX_ACTIONS = frozenset({"stop", "kill"})
+
+    def admin_sandbox_action_answer(self, sandbox_id: str, action: str) -> CallAnswer:
+        if action not in self._ADMIN_SANDBOX_ACTIONS:
+            raise ValueError(f"unsupported admin sandbox action {action!r}")
+        return self._admin_answer(
+            "POST",
+            f"sandboxes/sbx_{_sql_uuid(sandbox_id.removeprefix('sbx_'))}:force-{action}",
+            idempotency_key=f"space-smoke-force-{action}-{secrets.token_hex(8)}",
+        )
+
+    def admin_operation(self, operation_id: str) -> dict[str, Any]:
+        payload = self._admin("GET", f"operations/{quote(operation_id, safe='')}", expect=(200,))
+        if not isinstance(payload, dict):
+            raise RuntimeError("the admin operation response was not an object")
+        return payload
+
+    def admin_node_drain(self, node_id: str) -> dict[str, Any] | None:
+        node = self._admin("GET", f"nodes/{quote(_sql_uuid(node_id), safe='')}", expect=(200,))
+        if not isinstance(node, dict):
+            raise RuntimeError("the admin node response was not an object")
+        view = node.get(DRAIN_VIEW_FIELD)
+        return view if isinstance(view, dict) else None
+
+    def drain_started_at(self, node_id: str) -> int | None:
+        out = self._psql(
+            "SELECT COALESCE(floor(extract(epoch FROM drain_started_at))::bigint::text, '')"
+            f" FROM nodes WHERE id = '{_sql_uuid(node_id)}';",
+            action="read the node's drain_started_at",
+        ).strip()
+        return int(out) if out else None
+
+    def drain_v2_status(self, node_id: str) -> DrainV2Status | None:
+        row = self._psql(
+            "SELECT COALESCE(drain_engine, ''), COALESCE(drain_status::TEXT, '') "
+            f"FROM nodes WHERE id = '{_sql_uuid(node_id)}'",
+            action="read the node's v2 drain columns",
+        )
+        if not row:
+            return None
+        engine, _, status = row.partition("|")
+        return DrainV2Status(
+            engine=engine.strip() or None,
+            status=json.loads(status) if status.strip() else None,
+        )
+
+    def terminate_node(self, node_id: str) -> int:
+        return self._admin_answer(
+            "POST", f"nodes/{quote(_sql_uuid(node_id), safe='')}:terminate"
+        ).status
+
+    def drain_v2_preview(self, node_id: str) -> dict[str, Any]:
+        resource = f"nodes/{quote(_sql_uuid(node_id), safe='')}/drain-v2-preview"
+        # The API bounds a preview at 60 s once it has authorized the caller,
+        # its reads and the node call together; wait longer, so its own
+        # answer arrives first. A node busy with another drain call is
+        # contention, not an answer: ask again after its `Retry-After`.
+        give_up_at = time.monotonic() + PREVIEW_BUSY_RETRY_SECONDS
+        while True:
+            status, headers, raw = self._admin_request("GET", resource, timeout=75)
+            if status < 300:
+                try:
+                    body = json.loads(raw or b"null")
+                except ValueError:
+                    body = None
+                if not isinstance(body, dict):
+                    raise RuntimeError("the admin drain preview was not an object")
+                return body
+            detail = raw[:2000].decode(errors="replace")
+            retry_after = _preview_busy_retry_after(status, headers, detail)
+            if retry_after is not None and time.monotonic() + retry_after < give_up_at:
+                time.sleep(retry_after)
+                continue
+            raise RuntimeError(f"admin drain preview returned HTTP {status}: {detail}")
+
+    def plant_orphan_cache_dir(self, node_name: str, sandbox_id: str) -> str:
+        path = f"{SANDBOX_CACHE_ROOT}/{uuid.UUID(sandbox_id)}"
+        _require_ok(
+            self._docker_exec(node_name, "mkdir", path),
+            f"plant an orphan cache directory on {node_name}",
+        )
+        return path
+
+    def remove_orphan_cache_dir(self, node_name: str, sandbox_id: str) -> None:
+        canonical = str(uuid.UUID(sandbox_id))
+        # sandbox-manager's inventory makes a quarantined row of a cache
+        # directory no row owns; that row is the plant's as well. Refused for
+        # an id the cluster knows, which no planted one is.
+        if self.node_sandbox_state(node_name, canonical) is not None:
+            if self._psql(
+                SANDBOX_LIVE_SQL.format(sandbox_id=canonical), action="probe sandbox liveness"
+            ).strip():
+                raise SmokeConfigurationError(
+                    f"sandbox {canonical} exists on the cluster; its row on {node_name} is not a plant's"
+                )
+            _require_ok(
+                self._node_shell_exec(
+                    node_name, f"space-sbxmgr delete --blocking {canonical}", timeout=180
+                ),
+                f"delete the planted sandbox's quarantined row on {node_name}",
+            )
+        path = shlex.quote(f"{SANDBOX_CACHE_ROOT}/{canonical}")
+        # `rmdir`: only the empty directory the plant made, never a real one.
+        _require_ok(
+            self._docker_exec(node_name, "sh", "-c", f"test ! -e {path} || rmdir {path}"),
+            f"remove the planted cache directory on {node_name}",
+        )
+
+    def node_tombstoned(self, node_id: str) -> bool:
+        out = self._psql(
+            "SELECT count(*) FROM node_k8s_tombstones"
+            f" WHERE node_id = '{_sql_uuid(node_id)}';",
+            action="read the node's tombstone",
+        )
+        return out.strip() != "0"
 
     def set_drain_keep(self, node_name: str, value: str) -> None:
         self._require_isolated_kind("drain-keep override")
@@ -5383,6 +6547,19 @@ ON CONFLICT (key_hash) DO NOTHING;
     def kube_node_exists(self, node_name: str) -> bool:
         node = _kube_node_name(node_name)
         return self.kubectl("get", "node", node, "-o", "name", timeout=15).returncode == 0
+
+    def sandbox_placements(self, sandbox_ids: Sequence[str]) -> dict[str, tuple[str, str | None]]:
+        rows = self._psql(
+            "SELECT id, lifecycle, coalesce(active_node_id::text, '') FROM sandboxes"
+            f" WHERE id IN ({_sql_uuid_list(sandbox_ids)});\n",
+            action="read the sandboxes' lifecycles and nodes",
+        )
+        placements: dict[str, tuple[str, str | None]] = {}
+        for line in rows.splitlines():
+            if line.strip():
+                sandbox_id, lifecycle, node = (part.strip() for part in line.split("|", 2))
+                placements[sandbox_id] = (lifecycle, node or None)
+        return placements
 
     def sandbox_residency(self, sandbox_id: str) -> SandboxResidency:
         row = self._psql(
@@ -5646,19 +6823,439 @@ ON CONFLICT (key_hash) DO NOTHING;
         self._apply_orphaned_restore_pod_gc_env(standing)
 
     def _apply_orphaned_restore_pod_gc_env(self, values: Mapping[str, str | None]) -> None:
-        self._require_isolated_kind("orphaned-restore-pod GC env override")
+        self._set_controller_env(values, "an orphaned-restore-pod GC controller deployment write")
+
+    # --- controller env for the drain ---------------------------------------
+    #
+    # The key/value lists live in `space_smoke.drain_v2`.
+
+    def _set_controller_env(self, values: Mapping[str, str | None], purpose: str) -> None:
+        """Write `values` (None unsets) to the cluster-controller Deployment and
+        await its rollout, under the caller's live controller-mutation Lease.
+
+        At the charts' pace, not `_fast_rollout`'s: the loops these values
+        configure run on the Lease holder, so the rollout's end is when they
+        run under them.
+        """
+
+        self._require_isolated_kind(purpose)
         ownership = self._retention_lease_ownership
         if ownership is None:
             raise SmokeConfigurationError(
-                "refusing an orphaned-restore-pod GC controller deployment write without the "
-                "caller's live mutation Lease"
+                f"refusing {purpose} without the caller's live mutation Lease"
             )
-        self._assert_lease_owned(ownership, "an orphaned-restore-pod GC controller deployment write")
-        # At the charts' pace, not `_fast_rollout`'s, as for the retention
-        # sweeper: the GC runs on the Lease holder, and the fast rollout's
-        # earlier return was spent waiting for the new holder's first reaps
-        # (bench: 125-127 s at this pace, 123-126 s at the fast one).
+        self._assert_lease_owned(ownership, purpose)
         self._set_deployment_env(self._controller_deployment(), values, timeout=180)
+
+    def drain_v2_switches(self) -> dict[str, str | None]:
+        api = self._deployment_env_literals(self._public_api_deployment(), (DRAIN_V2_ENABLED_ENV,))
+        controller = self._deployment_env_literals(
+            self._controller_deployment(), (DRAIN_V2_ENABLED_ENV,)
+        )
+        return {"api": api[DRAIN_V2_ENABLED_ENV], "controller": controller[DRAIN_V2_ENABLED_ENV]}
+
+    def drain_v2_test_hooks(self) -> dict[str, str | None]:
+        return self._deployment_env_literals(self._controller_deployment(), DRAIN_V2_HOOK_KEYS)
+
+    def drain_v2_env(self) -> dict[str, str | None]:
+        return self._deployment_env_literals(self._controller_deployment(), DRAIN_V2_ENV_KEYS)
+
+    def set_drain_v2_env(self, overrides: Mapping[str, str]) -> None:
+        validate_drain_v2_overrides(overrides)
+        self._apply_drain_v2_env(overrides)
+
+    def restore_drain_v2_env(self, standing: Mapping[str, str | None]) -> None:
+        validate_drain_v2_keys(standing)
+        self._apply_drain_v2_env(standing)
+        restored = self.drain_v2_env()
+        if restored != dict(standing):
+            raise RuntimeError(
+                f"the controller's drain v2 env is {restored}, not the standing {dict(standing)}"
+            )
+
+    def _apply_drain_v2_env(self, values: Mapping[str, str | None]) -> None:
+        self._set_controller_env(values, "a drain v2 controller deployment write")
+
+    # --- public API env for the drain -----------------------------------------
+    #
+    # The evacuation cap is read by the API that answers `:drain`: the shared
+    # surface's Deployment, which the harness's admin calls reach.
+
+    def drain_v2_api_env(self) -> dict[str, str | None]:
+        return self._deployment_env_literals(self._public_api_deployment(), DRAIN_V2_API_ENV_KEYS)
+
+    def set_drain_v2_api_env(self, overrides: Mapping[str, str]) -> None:
+        validate_drain_v2_api_overrides(overrides)
+        self._apply_drain_v2_api_env(overrides, "set the drain v2 public API env")
+
+    def restore_drain_v2_api_env(self, standing: Mapping[str, str | None]) -> None:
+        validate_drain_v2_api_keys(standing)
+        self._apply_drain_v2_api_env(standing, "restore the drain v2 public API env")
+        restored = self.drain_v2_api_env()
+        if restored != dict(standing):
+            raise RuntimeError(
+                f"the public API's drain v2 env is {restored}, not the standing {dict(standing)}"
+            )
+
+    def _apply_drain_v2_api_env(self, values: Mapping[str, str | None], action: str) -> None:
+        """Write `values` (None unsets) to the public API Deployment and await
+        its rollout, under the caller's live public-API mutation Lease."""
+
+        self._require_isolated_kind(action)
+        ownership = self._held_public_api_lease(action)
+        self._renew_lease(ownership, action)
+        assignments = [f"{k}-" if v is None else f"{k}={v}" for k, v in values.items()]
+        if not assignments:
+            return
+        name = self._public_api_deployment()
+        container = self._public_api_container(name)
+        with self._fast_rollout(name, ownership):
+            _require_ok(
+                self.kubectl("set", "env", f"deploy/{name}", "-c", container, *assignments, timeout=30),
+                action,
+            )
+            self.wait_public_api_rollout(timeout=240)
+        self.wait_public_api_ready(timeout=120)
+
+    def kind_node_provider_id(self, node_name: str) -> str:
+        node = _kube_node_name(node_name)
+        listed = self.kubectl("get", "node", node, "-o", "jsonpath={.spec.providerID}", timeout=15)
+        return _require_ok(listed, f"read the providerID of {node}").strip()
+
+    def _kind_provider_id(self, container: str) -> str:
+        """The providerID Kind gives a node, which names no EC2 instance."""
+
+        return f"kind://docker/{self.config.cluster}/{container}"
+
+    def _rewritten_kubelet_flags(self, flags: str, provider_id: str, container: str) -> str:
+        """kubeadm's kubelet flags with `--provider-id` set to `provider_id`:
+        a fake AWS one, or Kind's own for `container`."""
+
+        if provider_id != self._kind_provider_id(container):
+            validate_fake_provider_id(provider_id)
+        rewritten, count = re.subn(r"--provider-id=[^\s\"]*", f"--provider-id={provider_id}", flags)
+        if count != 1:
+            raise RuntimeError(
+                "the Kind worker's kubeadm-flags.env does not set --provider-id exactly once"
+            )
+        return rewritten
+
+    def set_kind_worker_provider_id(
+        self, node_name: str, provider_id: str, labels: Mapping[str, str], *, timeout: float
+    ) -> None:
+        self._require_isolated_kind("re-registering a Kind worker")
+        container = self._kind_worker_container(node_name)
+        read = self.executor.run(
+            ["docker", "exec", container, "cat", KIND_KUBELET_FLAGS], timeout=30
+        )
+        flags = self._rewritten_kubelet_flags(
+            _require_ok(read, f"read the kubelet flags of {container}"), provider_id, container
+        )
+        # A Node's providerID can't change once set, so the kubelet registers
+        # a new Node: delete the old one, then restart the kubelet with the
+        # rewritten flag.
+        _require_ok(
+            self.executor.run(
+                ["docker", "exec", "-i", container, "sh", "-c", f"cat > {KIND_KUBELET_FLAGS}"],
+                timeout=30,
+                input_text=flags,
+            ),
+            f"write the kubelet flags of {container}",
+        )
+        _require_ok(
+            self.kubectl("delete", "node", container, "--wait=true", timeout=120),
+            f"delete the Kubernetes Node {container}",
+        )
+        _require_ok(
+            self.executor.run(
+                ["docker", "exec", container, "systemctl", "restart", "kubelet"], timeout=60
+            ),
+            f"restart the kubelet of {container}",
+        )
+        self._await_reregistered(container, labels, timeout=timeout)
+        registered = self.kind_node_provider_id(container)
+        if registered != provider_id:
+            raise RuntimeError(
+                f"Kind worker {container} registered providerID {registered!r}, "
+                f"not {provider_id!r}"
+            )
+
+    def restore_kind_worker_provider_id(
+        self, node_name: str, labels: Mapping[str, str], *, timeout: float
+    ) -> None:
+        container = self._kind_worker_container(node_name)
+        self.set_kind_worker_provider_id(
+            node_name, self._kind_provider_id(container), labels, timeout=timeout
+        )
+
+    def fake_ec2_terminate(self, instance_id: str) -> None:
+        self._require_isolated_kind("terminating a fake EC2 instance")
+        validate_fake_instance_id(instance_id)
+        _require_ok(
+            self.kubectl(
+                "exec", "deployment/space-kind-fake-ec2", "--",
+                "space-kind-fake-ec2", "terminate", instance_id,
+                timeout=30,
+            ),
+            f"terminate {instance_id} in the fake EC2",
+        )
+
+    def set_fake_ec2_terminate_delay(self, seconds: int) -> None:
+        self._require_isolated_kind("setting the fake EC2's termination delay")
+        if not 0 <= seconds <= 3600:
+            raise ValueError(f"refusing a termination delay of {seconds}s")
+        _require_ok(
+            self.kubectl(
+                "exec", "deployment/space-kind-fake-ec2", "--",
+                "space-kind-fake-ec2", "delay", str(seconds),
+                timeout=30,
+            ),
+            f"set the fake EC2's termination delay to {seconds}s",
+        )
+
+    def release_fake_ec2_instance(self, instance_id: str) -> None:
+        self._require_isolated_kind("releasing a fake EC2 instance")
+        validate_fake_instance_id(instance_id)
+        _require_ok(
+            self.kubectl(
+                "exec", "deployment/space-kind-fake-ec2", "--",
+                "space-kind-fake-ec2", "release", instance_id,
+                timeout=30,
+            ),
+            f"release {instance_id} in the fake EC2",
+        )
+
+    def fake_ec2_instance_state(self, instance_id: str) -> str:
+        self._require_isolated_kind("reading a fake EC2 instance")
+        validate_fake_instance_id(instance_id)
+        result = self.kubectl(
+            "exec", "deployment/space-kind-fake-ec2", "--",
+            "space-kind-fake-ec2", "state", instance_id,
+            timeout=30,
+        )
+        _require_ok(result, f"read {instance_id} in the fake EC2")
+        return result.stdout.strip()
+
+    def set_node_recorded_instance(self, node_id: str, instance_id: str | None) -> None:
+        self._require_isolated_kind("writing a node's recorded instance")
+        if instance_id is not None:
+            validate_fake_instance_id(instance_id)
+        value = "NULL" if instance_id is None else f"'{instance_id}'"
+        self._psql(
+            f"UPDATE node_k8s SET instance_id = {value} WHERE node_id = '{_sql_uuid(node_id)}';",
+            action="write the node's recorded instance",
+        )
+
+    def node_recorded_instance(self, node_id: str) -> str | None:
+        out = self._psql(
+            f"SELECT coalesce(instance_id, '') FROM node_k8s WHERE node_id = '{_sql_uuid(node_id)}';",
+            action="read the node's recorded instance",
+        )
+        return out.strip() or None
+
+    def node_row_exists(self, node_id: str) -> bool:
+        out = self._psql(
+            f"SELECT count(*) FROM nodes WHERE id = '{_sql_uuid(node_id)}';",
+            action="read the node row",
+        )
+        return out.strip() == "1"
+
+    def creating_snapshots_from_node(self, node_id: str) -> list[str]:
+        out = self._psql(
+            "SELECT id FROM snapshots"
+            f" WHERE source_node_id = '{_sql_uuid(node_id)}' AND state = 'creating'"
+            " ORDER BY id;",
+            action="read the node's creating snapshots",
+        )
+        return [line.strip() for line in out.splitlines() if line.strip()]
+
+    def node_created_at(self, node_id: str) -> str | None:
+        out = self._psql(
+            f"SELECT created_at FROM nodes WHERE id = '{_sql_uuid(node_id)}';",
+            action="read the node row's creation time",
+        )
+        return out.strip() or None
+
+    def _kind_worker_container(self, node_name: str) -> str:
+        container = self._kind_node_container(_kube_node_name(node_name))
+        if not re.fullmatch(rf"{re.escape(self.config.cluster)}-worker[0-9]*", container):
+            raise ValueError(f"refusing to stop {container!r}: not a Kind worker")
+        return container
+
+    def kind_node_labels(self, node_name: str) -> dict[str, str]:
+        container = self._kind_worker_container(node_name)
+        listed = self.kubectl("get", "node", container, "-o", "jsonpath={.metadata.labels}", timeout=15)
+        labels = json.loads(_require_ok(listed, f"read the labels of {container}") or "{}")
+        return {str(key): str(value) for key, value in labels.items()}
+
+    def stop_kind_worker(self, node_name: str, *, keep_node: bool = False) -> None:
+        self._require_isolated_kind("stopping a Kind worker")
+        container = self._kind_worker_container(node_name)
+        stopped = self.executor.run(["docker", "stop", container], timeout=120)
+        _require_ok(stopped, f"stop Kind worker container {container}")
+        if keep_node:
+            return
+        _require_ok(
+            self.kubectl("delete", "node", container, "--wait=true", timeout=120),
+            f"delete the Kubernetes Node {container}",
+        )
+
+    def kube_node_uid(self, node_name: str) -> str | None:
+        container = self._kind_worker_container(node_name)
+        listed = self.kubectl(
+            "get", "node", container, "--ignore-not-found", "-o", "jsonpath={.metadata.uid}",
+            timeout=15,
+        )
+        return _require_ok(listed, f"read the uid of {container}").strip() or None
+
+    def delete_kube_node(self, node_name: str, *, uid: str) -> None:
+        self._require_isolated_kind("deleting a Kind worker's Node")
+        container = self._kind_worker_container(node_name)
+        if not re.fullmatch(r"[0-9a-f-]{36}", uid):
+            raise ValueError(f"refusing Node uid {uid!r}")
+        body = json.dumps(
+            {"kind": "DeleteOptions", "apiVersion": "v1", "preconditions": {"uid": uid}}
+        )
+        _require_ok(
+            self.kubectl(
+                "delete", "--raw", f"/api/v1/nodes/{container}", "-f", "-",
+                input_text=body,
+                timeout=60,
+            ),
+            f"delete the Kubernetes Node {container} with uid {uid}",
+        )
+
+    def start_kind_worker(
+        self,
+        node_name: str,
+        labels: Mapping[str, str],
+        *,
+        timeout: float,
+        provider_id: str | None = None,
+    ) -> None:
+        self._require_isolated_kind("starting a Kind worker")
+        container = self._kind_worker_container(node_name)
+        if provider_id is not None:
+            # A same-name replacement: the stopped container's kubelet starts
+            # under a new providerID, so it registers a new instance.
+            with tempfile.TemporaryDirectory() as scratch:
+                local = Path(scratch) / "kubeadm-flags.env"
+                _require_ok(
+                    self.executor.run(
+                        ["docker", "cp", f"{container}:{KIND_KUBELET_FLAGS}", str(local)],
+                        timeout=30,
+                    ),
+                    f"copy the kubelet flags out of {container}",
+                )
+                local.write_text(
+                    self._rewritten_kubelet_flags(local.read_text(), provider_id, container)
+                )
+                _require_ok(
+                    self.executor.run(
+                        ["docker", "cp", str(local), f"{container}:{KIND_KUBELET_FLAGS}"],
+                        timeout=30,
+                    ),
+                    f"copy the kubelet flags into {container}",
+                )
+        _require_ok(
+            self.executor.run(["docker", "start", container], timeout=120),
+            f"start Kind worker container {container}",
+        )
+        if provider_id is not None:
+            # A same-name replacement stands for a new machine, which starts
+            # with an empty sandbox-manager database: the one the stopped
+            # machine left would come back sealed under its drain, holding the
+            # drain's records. Its Node was deleted, and sandbox-manager's
+            # DaemonSet runs only on a Node with the bring-up labels, which go
+            # back on below, so nothing has the database open yet. The cache
+            # it described is reformatted on every start of the node.
+            _require_ok(
+                self.executor.run(
+                    ["docker", "exec", container, "rm", "-f", *SANDBOX_MANAGER_DB_FILES],
+                    timeout=30,
+                ),
+                f"remove the sandbox-manager database the stopped {container} left",
+            )
+        self._await_reregistered(container, labels, timeout=timeout)
+
+    def _await_reregistered(
+        self, container: str, labels: Mapping[str, str], *, timeout: float
+    ) -> None:
+        """Wait for the kubelet to re-register the Node it lost, put back the
+        bring-up's labels, then wait for the Node and its node services."""
+
+        deadline = time.monotonic() + timeout
+        while not self.kube_node_exists(container):
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Kind worker {container} did not re-register its Node")
+            time.sleep(2)
+        # The kubelet registers only the labels it was started with; the
+        # bring-up labels the node after that, and the delete took those. Put
+        # them back first, so a wait below that fails leaves them in place.
+        current = self.kind_node_labels(container)
+        missing = [f"{key}={value}" for key, value in labels.items() if key not in current]
+        if missing:
+            _require_ok(
+                self.kubectl("label", "node", container, *missing, timeout=30),
+                f"restore the labels of {container}",
+            )
+        # Each wait has the whole budget.
+        budget = max(int(timeout), 1)
+        _require_ok(
+            self.kubectl(
+                "wait", "--for=condition=Ready", f"node/{container}", f"--timeout={budget}s",
+                timeout=budget + 30,
+            ),
+            f"await Kind worker {container} Ready",
+        )
+        # The node services' DaemonSet pods come back with the Node; a sandbox
+        # on it can't be deleted until they serve.
+        _require_ok(
+            self.kubectl(
+                "wait", "--for=condition=Ready", "pod", "--all",
+                "--field-selector", f"spec.nodeName={container}", f"--timeout={budget}s",
+                timeout=budget + 30,
+            ),
+            f"await the node services on {container}",
+        )
+        # node-ctl advertises the sandbox network slots on the new Node a
+        # moment after its pods are Ready; until then a sandbox pod can't be
+        # scheduled there.
+        while True:
+            listed = self.kubectl(
+                "get", "node", container, "-o",
+                "jsonpath={.status.allocatable.space\\.pplx\\.net/network-slots}",
+                timeout=15,
+            )
+            slots = _require_ok(listed, f"read the network slots of {container}").strip()
+            if slots.isdigit() and int(slots) > 0:
+                break
+            if time.monotonic() >= deadline + budget:
+                raise RuntimeError(f"Kind worker {container} never advertised network slots")
+            time.sleep(2)
+
+    def sandbox_row_states(self, sandbox_ids: Sequence[str]) -> list[SandboxRowState]:
+        ids = ",".join(_sql_uuid(sandbox_id) for sandbox_id in sandbox_ids)
+        out = self._psql(
+            SANDBOX_ROW_STATES_SQL.format(sandbox_ids=ids), action="read sandbox row states"
+        )
+        rows = []
+        for line in out.splitlines():
+            fields = line.strip().split("|")
+            if len(fields) != 6:
+                continue
+            sandbox_id, lifecycle, placement, active, target, updated_at = fields
+            rows.append(
+                SandboxRowState(
+                    sandbox_id=sandbox_id,
+                    lifecycle=lifecycle,
+                    placement=placement,
+                    active_node_id=active or None,
+                    target_node_id=target or None,
+                    updated_at=updated_at,
+                )
+            )
+        return rows
 
     def controller_log_records(self, *, since_time: str) -> list[dict[str, Any]]:
         listing = self.kubectl(
@@ -5810,6 +7407,8 @@ ON CONFLICT (key_hash) DO NOTHING;
         *,
         ownership: _LeaseOwnership | None,
         what: str,
+        rollout_timeout: float = 300,
+        shared_deadline: bool = False,
     ) -> None:
         """Set `key` (None unsets) on each DaemonSet under the caller's Lease, then await every rollout."""
 
@@ -5818,54 +7417,94 @@ ON CONFLICT (key_hash) DO NOTHING;
             raise SmokeConfigurationError(
                 f"refusing a {what} DaemonSet write without the caller's live mutation Lease"
             )
+        deadline = time.monotonic() + rollout_timeout if shared_deadline else None
         self._renew_lease(ownership, f"a {what} DaemonSet write")
         for daemonset, value in values.items():
+            set_timeout = (
+                min(30.0, max(1.0, deadline - time.monotonic()))
+                if deadline is not None
+                else 30
+            )
             _require_ok(
                 self.kubectl(
                     "set", "env", f"daemonset/{daemonset}", "-c", container,
-                    f"{key}-" if value is None else f"{key}={value}", timeout=30,
+                    f"{key}-" if value is None else f"{key}={value}", timeout=set_timeout,
                 ),
                 f"set env on {daemonset}",
             )
         for daemonset in values:
-            self._await_daemonset_rollout(daemonset, timeout=300)
+            remaining = (
+                max(0.1, deadline - time.monotonic())
+                if deadline is not None
+                else rollout_timeout
+            )
+            self._await_daemonset_rollout(
+                daemonset, timeout=remaining, shared_deadline=shared_deadline
+            )
 
-    def _await_daemonset_rollout(self, name: str, *, timeout: float) -> None:
+    def _await_daemonset_rollout(
+        self, name: str, *, timeout: float, shared_deadline: bool = False
+    ) -> None:
         """`rollout status`, then until each node runs one pod and none is Terminating.
 
         The node services surge: the replaced pod is still shutting down when
         the rollout reports done, and a per-node read would find two pods.
         """
 
+        shared_end = time.monotonic() + timeout if shared_deadline else None
+        rollout_secs = max(1, math.ceil(timeout)) if shared_deadline else int(timeout)
+        kubectl_timeout = max(2.0, timeout + 2.0) if shared_deadline else timeout + 30
         _require_ok(
             self.kubectl(
-                "rollout", "status", f"daemonset/{name}", f"--timeout={int(timeout)}s",
-                timeout=timeout + 30,
+                "rollout", "status", f"daemonset/{name}", f"--timeout={rollout_secs}s",
+                timeout=kubectl_timeout,
             ),
             f"await rollout of {name}",
         )
-        deadline = time.monotonic() + timeout
+        deadline = shared_end if shared_end is not None else time.monotonic() + timeout
         while True:
+            read_timeout = (
+                min(15.0, max(1.0, deadline - time.monotonic()))
+                if shared_end is not None
+                else 15
+            )
             daemonset = json.loads(
-                _require_ok(self.kubectl("get", "daemonset", name, "-o", "json", timeout=15), f"read {name}")
+                _require_ok(
+                    self.kubectl("get", "daemonset", name, "-o", "json", timeout=read_timeout),
+                    f"read {name}",
+                )
             )
             desired = int((daemonset.get("status") or {}).get("desiredNumberScheduled", 0))
             match_labels = daemonset["spec"]["selector"].get("matchLabels") or {}
             if not match_labels:
                 raise SmokeConfigurationError(f"{name} has no matchLabels selector to list its pods by")
             selector = ",".join(f"{key}={value}" for key, value in sorted(match_labels.items()))
+            pods_timeout = (
+                min(15.0, max(1.0, deadline - time.monotonic()))
+                if shared_end is not None
+                else 15
+            )
             pods = json.loads(
-                _require_ok(self.kubectl("get", "pods", "-l", selector, "-o", "json", timeout=15), f"list {name} pods")
+                _require_ok(
+                    self.kubectl("get", "pods", "-l", selector, "-o", "json", timeout=pods_timeout),
+                    f"list {name} pods",
+                )
             ).get("items", [])
             terminating = [pod["metadata"]["name"] for pod in pods if pod["metadata"].get("deletionTimestamp")]
             if not terminating and len(pods) == desired:
                 return
-            if time.monotonic() > deadline:
+            if time.monotonic() >= deadline:
                 raise RuntimeError(
                     f"{name} pods did not settle to {desired} within {timeout:g}s "
                     f"(present={len(pods)}, terminating={terminating})"
                 )
-            time.sleep(2)
+            sleep_for = (
+                min(2.0, max(0.0, deadline - time.monotonic()))
+                if shared_end is not None
+                else 2
+            )
+            if sleep_for > 0:
+                time.sleep(sleep_for)
 
     def running_unanswered_template_evict_env(self, node_name: str) -> str | None:
         return self._node_service_env(node_name, NODE_CTL).get(UNANSWERED_TEMPLATE_EVICT_AFTER_ENV)
@@ -5877,21 +7516,76 @@ ON CONFLICT (key_hash) DO NOTHING;
     # (`space_smoke/execution_environment.py`). The captured literals go back
     # verbatim.
 
-    def acquire_node_manager_mutation(self) -> Callable[[], None]:
+    def _node_manager_lease_name(self) -> str:
         context_hash = hashlib.sha256(self.config.context.encode()).hexdigest()[:16]
+        return f"space-smoke-node-manager-{context_hash}"
+
+    def _ensure_no_recorded_worker_slots_before_node_manager_takeover(
+        self, previous: Mapping[str, object], ownership: _LeaseOwnership
+    ) -> None:
+        observed = self.kubectl("get", "lease", self._public_api_lease_name(), "-o", "json", timeout=15)
+        if observed.returncode != 0:
+            if "notfound" not in observed.detail().lower():
+                raise SmokeConfigurationError(
+                    "could not inspect the public API mutation Lease while taking over node-manager Lease: "
+                    f"{observed.detail() or '<no output>'}"
+                )
+        elif _lease_annotations(_lease_document(observed.stdout)).get(NETWORK_POOL_MAX_SLOTS_ANNOTATION):
+            raise SmokeConfigurationError(
+                "refusing node-manager Lease takeover while the public API mutation Lease still "
+                "records an un-repaired worker network-slot setting"
+            )
+        if _lease_annotations(previous).get(NODE_MANAGER_SLOT_POOL_HOLDER_ANNOTATION) is not None:
+            self._renew_lease(
+                ownership,
+                "clearing the worker slot-pool holder marker",
+                {NODE_MANAGER_SLOT_POOL_HOLDER_ANNOTATION: None},
+            )
+
+    def acquire_node_manager_mutation(self) -> Callable[[], None]:
         # Held from admission until the allowlist is back, which can be a
         # whole scenario and its cleanup, so it outlasts the longest budget.
+        # Only a dead holder stamped by `acquire_worker_network_slots_mutation`
+        # may be reclaimed here: an unannotated execution-allowlist Lease whose
+        # restore failed deliberately blocks the next run until manual cleanup.
         ownership = self._acquire_named_mutation_lease(
-            f"space-smoke-node-manager-{context_hash}",
+            self._node_manager_lease_name(),
             "node-manager DaemonSet mutation",
+            repair=self._ensure_no_recorded_worker_slots_before_node_manager_takeover,
+            reclaim_dead_holder=_is_slot_pool_node_manager_lease,
             duration_seconds=NODE_MANAGER_MUTATION_LEASE_DURATION_SECONDS,
         )
         self._node_manager_lease_ownership = ownership
 
         def release() -> None:
-            self._release_lease(ownership)
-            if self._node_manager_lease_ownership is ownership:
-                self._node_manager_lease_ownership = None
+            try:
+                self._release_lease(ownership)
+            finally:
+                if self._node_manager_lease_ownership is ownership:
+                    self._node_manager_lease_ownership = None
+
+        return release
+
+    def acquire_worker_network_slots_mutation(self) -> Callable[[], None]:
+        # Stamped atomically on acquisition so a killed slot-pool holder can be
+        # reclaimed by `repair_orphaned_limiter_faults` without ever reclaiming
+        # an unannotated execution-allowlist Lease.
+        ownership = self._acquire_named_mutation_lease(
+            self._node_manager_lease_name(),
+            "node-manager DaemonSet mutation",
+            reclaim_dead_holder=_is_slot_pool_node_manager_lease,
+            holder_annotations=(NODE_MANAGER_SLOT_POOL_HOLDER_ANNOTATION,),
+            clear_on_release=(NODE_MANAGER_SLOT_POOL_HOLDER_ANNOTATION,),
+            duration_seconds=NODE_MANAGER_MUTATION_LEASE_DURATION_SECONDS,
+        )
+        self._node_manager_lease_ownership = ownership
+
+        def release() -> None:
+            try:
+                self._release_lease(ownership)
+            finally:
+                if self._node_manager_lease_ownership is ownership:
+                    self._node_manager_lease_ownership = None
 
         return release
 
@@ -5914,6 +7608,242 @@ ON CONFLICT (key_hash) DO NOTHING;
             ALLOWED_ENVIRONMENTS_ENV,
             ownership=self._node_manager_lease_ownership,
             what="node-manager",
+        )
+
+    def worker_network_pool_max_slots_env(self) -> str | None:
+        return self._daemonset_env_literal(NODE_MANAGER_DAEMONSETS[0], NODE_MANAGER, NETWORK_POOL_MAX_SLOTS_ENV)
+
+    def set_worker_network_pool_max_slots_env(
+        self,
+        value: str | None,
+        *,
+        record: tuple[str | None, Mapping[str, int]] | None = None,
+        rollout_timeout: float = 300,
+        shared_deadline: bool = False,
+    ) -> None:
+        """Set `SPACE_NODEMGR_NETWORK_POOL_MAX_SLOTS` on worker node-manager under both mutation Leases."""
+
+        if not _valid_network_pool_max_slots_literal(value):
+            raise ValueError(f"refusing worker network-slot literal {value!r}")
+        action = (
+            "a worker network-slot env override"
+            if record is not None
+            else "a worker network-slot env restore"
+        )
+        public_ownership = self._held_public_api_lease(action)
+        if self._node_manager_lease_ownership is None:
+            raise SmokeConfigurationError(
+                "refusing a worker network-slot write without the caller's live node-manager mutation Lease"
+            )
+        if record is not None:
+            standing_env, standing_capacities = record
+            encoded = json.dumps(
+                {"env": standing_env, "capacities": {str(k): int(v) for k, v in standing_capacities.items()}},
+                sort_keys=True,
+            )
+            _recorded_network_pool_max_slots(encoded)
+            self._renew_lease(
+                public_ownership,
+                action,
+                {NETWORK_POOL_MAX_SLOTS_ANNOTATION: encoded},
+            )
+        else:
+            self._renew_lease(public_ownership, action)
+        self._set_daemonset_env(
+            {NODE_MANAGER_DAEMONSETS[0]: value},
+            NODE_MANAGER,
+            NETWORK_POOL_MAX_SLOTS_ENV,
+            ownership=self._node_manager_lease_ownership,
+            what="worker node-manager",
+            rollout_timeout=rollout_timeout,
+            shared_deadline=shared_deadline,
+        )
+
+    def restore_worker_network_pool_max_slots_env(
+        self,
+        standing_env: str | None,
+        standing_capacities: Mapping[str, int],
+        *,
+        rollout_timeout: float = 300,
+        settle_timeout: float = 120,
+        shared_deadline: bool = False,
+    ) -> None:
+        """Restore `SPACE_NODEMGR_NETWORK_POOL_MAX_SLOTS`, await standing node capacities, and clear record."""
+
+        expected = expected_worker_network_pool_capacity(standing_env)
+        if not standing_capacities or any(
+            not isinstance(node, str)
+            or not node
+            or not isinstance(count, int)
+            or isinstance(count, bool)
+            or count != expected
+            for node, count in standing_capacities.items()
+        ):
+            raise SmokeConfigurationError(
+                f"refusing worker network-slot restore whose standing env {standing_env!r} "
+                f"(produces {expected}) disagrees with capacities {dict(standing_capacities)!r}"
+            )
+        public_ownership = self._held_public_api_lease("a worker network-slot env restore")
+        deadline = time.monotonic() + rollout_timeout if shared_deadline else None
+        self.set_worker_network_pool_max_slots_env(
+            standing_env,
+            rollout_timeout=max(0.1, deadline - time.monotonic()) if deadline is not None else rollout_timeout,
+            shared_deadline=shared_deadline,
+        )
+        remaining_settle = (
+            max(0.0, deadline - time.monotonic())
+            if deadline is not None
+            else settle_timeout
+        )
+        self._await_repaired_worker_network_slots(standing_env, standing_capacities, timeout=remaining_settle)
+        self._renew_lease(
+            public_ownership,
+            "clearing the worker network-slot setting record",
+            {NETWORK_POOL_MAX_SLOTS_ANNOTATION: None},
+        )
+
+    def _await_repaired_worker_network_slots(
+        self, standing_env: str | None, standing_capacities: Mapping[str, int], *, timeout: float
+    ) -> None:
+        # Every current sandbox node, not just the recorded ones: a worker that
+        # joined during the override advertises the shrunk count too. Nodes
+        # that left the pool drop out of the read.
+        expected = expected_worker_network_pool_capacity(standing_env)
+        deadline = time.monotonic() + timeout
+        last_nudge: float | None = None
+        last: dict[str, SandboxNodeSlots] = {}
+        while True:
+            last = self.sandbox_node_slots()
+            pending = [
+                node_name
+                for node_name, slots in last.items()
+                if slots.capacity != expected or slots.allocatable != expected
+            ]
+            if not pending:
+                return
+            now = time.monotonic()
+            if now >= deadline:
+                raise SmokeConfigurationError(
+                    f"worker network-slot capacity did not return to {expected} on every sandbox node "
+                    f"(standing record {dict(standing_capacities)}) within {timeout:g}s (last read: {last})"
+                )
+            if last_nudge is None or now - last_nudge >= _NODE_CTL_SLOT_RECONCILE_NUDGE_SECONDS:
+                for node_name in pending:
+                    self.publish_node_ctl_facet(node_name, "template-inventory")
+                last_nudge = time.monotonic()
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(1.0, remaining))
+
+    def occupied_worker_network_slots_at_or_above(
+        self, min_slot_id: int
+    ) -> dict[str, tuple[OccupiedNetworkSlot, ...]]:
+        """Per worker node: persisted `network_slots` rows at or above `min_slot_id` that block shrink.
+
+        Mirrors `validate_startup_ownership` in `slot_pool/db.rs`: shrinking
+        `SPACE_NODEMGR_NETWORK_POOL_MAX_SLOTS` to `min_slot_id` fails startup
+        with `UnsafeShrink` if any persisted slot `>= min_slot_id` still carries
+        ownership fields or non-torn-down interface state.
+        """
+
+        if min_slot_id < 1:
+            raise ValueError(f"min_slot_id must be >= 1, got {min_slot_id}")
+        occupied: dict[str, tuple[OccupiedNetworkSlot, ...]] = {}
+        for node_name in self.node_manager_nodes(roles=(WORKER_ROLE,)):
+            rows = self._query_worker_occupied_slots(node_name, min_slot_id)
+            if rows:
+                occupied[node_name] = rows
+        return occupied
+
+    def _query_worker_occupied_slots(
+        self, node_name: str, min_slot_id: int
+    ) -> tuple[OccupiedNetworkSlot, ...]:
+        self._require_isolated_kind("on-node operations")
+        script = (
+            "import contextlib, json, os, sqlite3, sys, time\n"
+            "db_path = '/space/run/node-manager/node-manager.db'\n"
+            "min_slot_id = int(sys.argv[1])\n"
+            "query = (\n"
+            "    \"SELECT slot_id, NULLIF(sandbox_id, ''), state, health, (\"\n"
+            "    \"COALESCE(sandbox_id, '') != '' \"\n"
+            "    \"OR COALESCE(sandbox_uid, 0) != 0 \"\n"
+            "    \"OR pid IS NOT NULL \"\n"
+            "    \"OR pod_netns_path IS NOT NULL \"\n"
+            "    \"OR memory_reservation_mib IS NOT NULL\"\n"
+            "    \") FROM network_slots \"\n"
+            "    \"WHERE slot_id >= ? AND (\"\n"
+            "    \"COALESCE(sandbox_id, '') != '' \"\n"
+            "    \"OR COALESCE(sandbox_uid, 0) != 0 \"\n"
+            "    \"OR pid IS NOT NULL \"\n"
+            "    \"OR pod_netns_path IS NOT NULL \"\n"
+            "    \"OR memory_reservation_mib IS NOT NULL \"\n"
+            "    \"OR state != 'missing' \"\n"
+            "    \"OR health != 'unknown'\"\n"
+            "    \") ORDER BY slot_id\"\n"
+            ")\n"
+            "last_error = None\n"
+            "for attempt in range(3):\n"
+            "    if not os.path.exists(db_path):\n"
+            "        print('[]')\n"
+            "        raise SystemExit(0)\n"
+            "    try:\n"
+            "        with contextlib.closing(\n"
+            "            sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=5.0, isolation_level=None)\n"
+            "        ) as conn:\n"
+            "            conn.execute('PRAGMA busy_timeout = 5000')\n"
+            "            conn.execute('BEGIN DEFERRED')\n"
+            "            try:\n"
+            "                rows = conn.execute(query, (min_slot_id,)).fetchall()\n"
+            "            finally:\n"
+            "                with contextlib.suppress(sqlite3.Error):\n"
+            "                    conn.execute('ROLLBACK')\n"
+            "        print(json.dumps(rows))\n"
+            "        raise SystemExit(0)\n"
+            "    except sqlite3.OperationalError as error:\n"
+            "        message = str(error).lower()\n"
+            "        if 'no such table' in message or (\n"
+            "            'unable to open database file' in message and not os.path.exists(db_path)\n"
+            "        ):\n"
+            "            print('[]')\n"
+            "            raise SystemExit(0) from None\n"
+            "        last_error = error\n"
+            "    except sqlite3.DatabaseError as error:\n"
+            "        last_error = error\n"
+            "    if attempt + 1 < 3:\n"
+            "        time.sleep(0.2)\n"
+            "print(f'sqlite read failed after 3 attempts: {last_error}', file=sys.stderr)\n"
+            "raise SystemExit(1)\n"
+        )
+        # Run in the Kind node container (`kindest/node` ships `/usr/bin/python3`
+        # with stdlib `sqlite3` and shares the `/space/run` hostPath inode with
+        # `space-node-manager`); `_node_shell_exec` uses `space-worker`, which
+        # carries neither `python3` nor `sqlite3`.
+        result = self._docker_exec(node_name, "python3", "-c", script, str(min_slot_id), timeout=30)
+        if result.returncode != 0:
+            raise SmokeConfigurationError(
+                f"could not read {node_name}'s node-manager.db: {result.detail() or '<no output>'}"
+            )
+        try:
+            raw_rows = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError as error:
+            raise SmokeConfigurationError(
+                f"could not decode {node_name}'s node-manager.db slot rows: {result.stdout!r}"
+            ) from error
+        if not isinstance(raw_rows, list) or not all(
+            isinstance(row, list) and len(row) == 5 for row in raw_rows
+        ):
+            raise SmokeConfigurationError(
+                f"unexpected {node_name} node-manager.db slot row payload: {raw_rows!r}"
+            )
+        return tuple(
+            OccupiedNetworkSlot(
+                slot_id=int(slot_id),
+                sandbox_id=str(sandbox_id) if sandbox_id is not None else None,
+                state=str(state),
+                health=str(health),
+                owned=bool(owned),
+            )
+            for slot_id, sandbox_id, state, health, owned in raw_rows
         )
 
     def node_manager_daemonsets(self) -> Mapping[str, str]:
@@ -6004,6 +7934,15 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
 
     def running_controller_stopped_replacement_envs(self) -> list[dict[str, str | None]]:
+        return self._running_controller_env_literals(
+            STOPPED_REPLACEMENT_ENV_KEYS, value_from_refusal="; the scenario reads only literal flags"
+        )
+
+    def _running_controller_env_literals(
+        self, keys: Sequence[str], *, value_from_refusal: str
+    ) -> list[dict[str, str | None]]:
+        """The literals of `keys` on every running, not-terminating controller pod."""
+
         listing = self.kubectl(
             "get", "pods", "-l", KIND_CONTROLLER_SELECTOR, "-o", "json", timeout=15
         )
@@ -6019,9 +7958,9 @@ ON CONFLICT (key_hash) DO NOTHING;
             envs.append(
                 _env_literals(
                     containers[0].get("env") or [],
-                    STOPPED_REPLACEMENT_ENV_KEYS,
+                    keys,
                     owner=str(metadata.get("name", "a cluster-controller pod")),
-                    value_from_refusal="; the scenario reads only literal flags",
+                    value_from_refusal=value_from_refusal,
                 )
             )
         return envs
@@ -6216,6 +8155,29 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
         return state
 
+    def node_disk_snapshot(self, node_name: str, sandbox_id: str) -> str:
+        canonical = _sql_uuid(sandbox_id)
+        result = self._node_shell_exec(
+            node_name, f"space-sbxmgr snapshot --disk {canonical}", timeout=120
+        )
+        out = _require_ok(result, f"take a disk snapshot of {canonical} on {node_name}")
+        # `Disk snapshot: <label> -> <name>`
+        name = out.strip().rsplit("->", 1)[-1].strip()
+        if not _NODE_SNAPSHOT_NAME.fullmatch(name):
+            raise RuntimeError(f"space-sbxmgr snapshot printed no snapshot name: {out.strip()!r}")
+        return name
+
+    def node_rollback(self, node_name: str, sandbox_id: str, snapshot: str) -> NodeCliOutcome:
+        canonical = _sql_uuid(sandbox_id)
+        if not _NODE_SNAPSHOT_NAME.fullmatch(snapshot):
+            raise ValueError(f"refusing snapshot name {snapshot!r}")
+        result = self._node_shell_exec(
+            node_name, f"space-sbxmgr rollback {canonical} {shlex.quote(snapshot)}", timeout=180
+        )
+        return NodeCliOutcome(
+            exit_code=result.returncode, stdout=result.stdout, stderr=result.stderr
+        )
+
     def pause_in_memory(self, sandbox_id: str) -> None:
         """Native `:pause`: keep the VM resident, paused. Returns once accepted."""
 
@@ -6232,7 +8194,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             data=b"{}",
         )
         try:
-            with urlopen(request, timeout=20) as response:
+            with _URL_OPEN(request, timeout=20) as response:
                 response.read()
         except HTTPError as error:
             raise RuntimeError(f"native :pause returned HTTP {error.code}") from None
@@ -6257,7 +8219,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             headers={"Authorization": "Bearer " + self._admin_token()},
         )
         try:
-            with urlopen(request, timeout=20) as response:
+            with _URL_OPEN(request, timeout=20) as response:
                 response.read()
                 return True
         except HTTPError as error:
@@ -6281,7 +8243,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             },
         )
         try:
-            with urlopen(request, timeout=60) as response:
+            with _URL_OPEN(request, timeout=60) as response:
                 payload = json.load(response)
         except HTTPError as error:
             raise RuntimeError(f"native delete returned HTTP {error.code}") from None
@@ -6400,6 +8362,14 @@ ON CONFLICT (key_hash) DO NOTHING;
             raise SmokeConfigurationError(f"the bench runs no single Rust build: {result.detail()}")
         return result.stdout.strip()
 
+    def drain_v2_enabled(self) -> bool:
+        # The public API Deployment's SPACE_DRAIN_V2_ENABLED, which is what
+        # refuses a v1 `:drain`, read with the API's own flag vocabulary
+        # (`pplx_space_env_vars::parse_env_flag`).
+        name = self._public_api_deployment()
+        value = self._read_deployment_env(name, ("SPACE_DRAIN_V2_ENABLED",))["SPACE_DRAIN_V2_ENABLED"]
+        return (value or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
     def substrate(self) -> str:
         # The API Deployment's SPACE_K8S_CONTROL_PLANE, which the bring-up
         # reads too (space_kind_deployed_substrate, infra/space/kind/lib/substrate.sh).
@@ -6414,11 +8384,12 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     # --- cluster-controller leader election ------------------------------------
     #
-    # The two faults behind `local.leader_election_brownout_keeps_one_leader`:
-    # a refused third contender, and the apiserver's static pod taken away. The
-    # node reads go through `docker exec` and the node's CRI rather than
-    # kubectl, because they are the only reads that answer while the apiserver
-    # is down.
+    # The faults behind `local.leader_election_brownout_keeps_one_leader`: a
+    # refused third contender, an unreachable budget control, and the two
+    # healthy replicas cut off from the apiserver in their own network
+    # namespaces.
+    # Container exits and readiness markers are read through `docker exec` and
+    # the node's CRI, which see an exit kubelet has already cleaned up.
 
     def controller_replicas(self) -> int:
         result = self.kubectl(
@@ -6436,6 +8407,12 @@ ON CONFLICT (key_hash) DO NOTHING;
     def controller_reconciler_tick_env(self) -> dict[str, str | None]:
         return self._deployment_env_literals(self._controller_deployment(), tuple(RECONCILER_TICK_ENV))
 
+    def controller_metric_export_interval_seconds(self) -> float:
+        raw = self._deployment_env_literals(
+            self._controller_deployment(), (OTEL_METRIC_EXPORT_INTERVAL_ENV,)
+        )[OTEL_METRIC_EXPORT_INTERVAL_ENV]
+        return _metric_export_interval_seconds(raw, owner="the cluster-controller")
+
     def controller_liveness_budget_env(self, *, refused_contender: bool = False) -> str | None:
         if not refused_contender:
             return self._deployment_env_literals(
@@ -6452,9 +8429,8 @@ ON CONFLICT (key_hash) DO NOTHING;
         )[LIVENESS_BUDGET_ENV]
 
     def set_controller_liveness_budget_env(self, seconds: str, *, lease_ttl: str) -> None:
-        for name, value in (("liveness-budget", seconds), ("lease-TTL", lease_ttl)):
-            if _LIVENESS_BUDGET_VALUE.fullmatch(value) is None:
-                raise ValueError(f"refusing {name} value {value!r}")
+        # Refuses either value as a contender's placement would.
+        _contender_timings(seconds, lease_ttl)
         # Resolved here, in setup, so the restore in cleanup looks nothing up.
         deployment = self._controller_deployment()
         # The restore removes the TTL key rather than writing a captured
@@ -6526,9 +8502,12 @@ ON CONFLICT (key_hash) DO NOTHING;
         if wait:
             self._await_deployment_rollout(deployment, timeout=180)
 
-    def controller_lease(self) -> ControllerLease | None:
+    def await_controller_rollout(self, *, timeout: float = 180) -> None:
+        self._await_deployment_rollout(self._controller_deployment(), timeout=timeout)
+
+    def controller_lease(self, *, timeout: float = 15) -> ControllerLease | None:
         result = self.kubectl(
-            "get", "lease", CONTROLLER_LEASE_NAME, "-o", "json", timeout=15
+            "get", "lease", CONTROLLER_LEASE_NAME, "-o", "json", timeout=timeout
         )
         if result.returncode != 0 and "notfound" in result.detail().lower().replace(" ", ""):
             return None
@@ -6546,14 +8525,6 @@ ON CONFLICT (key_hash) DO NOTHING;
                 "docker", "exec", "-i", self._kind_node_container(node_name), "sh", "-c",
                 "timeout 3600 ctr -n k8s.io events 'topic==\"/tasks/exit\"' & watch=$!; "
                 "cat >/dev/null; kill \"$watch\" 2>/dev/null; wait",
-            ]
-        )
-
-    def watch_controller_lease(self) -> KubectlLeaseWatch:
-        return KubectlLeaseWatch(
-            [
-                "kubectl", "--context", self.config.context, "-n", KIND_NAMESPACE,
-                "get", "lease", CONTROLLER_LEASE_NAME, "--watch", "-o", "json",
             ]
         )
 
@@ -6581,15 +8552,21 @@ ON CONFLICT (key_hash) DO NOTHING;
                 (container.get("state") or {}).get("terminated")
                 or (container.get("lastState") or {}).get("terminated") or {}
             )
+            ready = next(
+                (
+                    condition
+                    for condition in status.get("conditions") or []
+                    if condition.get("type") == "Ready"
+                ),
+                {},
+            )
             pods.append(
                 ControllerPod(
                     name=str(metadata.get("name", "")),
                     uid=str(metadata.get("uid", "")),
                     node=str((item.get("spec") or {}).get("nodeName") or ""),
-                    ready=any(
-                        condition.get("type") == "Ready" and condition.get("status") == "True"
-                        for condition in status.get("conditions") or []
-                    ),
+                    ready=ready.get("status") == "True",
+                    ready_changed_at=_kube_epoch(ready.get("lastTransitionTime")),
                     deleting=bool(metadata.get("deletionTimestamp")),
                     restart_count=int(container.get("restartCount") or 0),
                     started_at=_kube_epoch(
@@ -6601,7 +8578,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
         return sorted(pods, key=lambda pod: pod.name)
 
-    def place_budget_contender(self) -> None:
+    def place_budget_contender(self, *, liveness_budget: str, lease_ttl: str) -> None:
         """Run the same controller against an unreachable, pod-local API endpoint."""
         self._require_isolated_kind("placing a leader-election budget control")
         result = self.kubectl("get", "deploy", self._controller_deployment(), "-o", "json", timeout=15)
@@ -6609,7 +8586,9 @@ ON CONFLICT (key_hash) DO NOTHING;
         nodes = sorted({pod.node for pod in self.controller_pods() if pod.node})
         if not nodes:
             raise SmokeConfigurationError("no controller node for the budget control")
-        document = refused_contender_pod(deployment, node=nodes[0])
+        document = refused_contender_pod(
+            deployment, node=nodes[0], env=_contender_timings(liveness_budget, lease_ttl)
+        )
         document["metadata"]["name"] = BUDGET_CONTENDER_NAME
         document["metadata"]["labels"]["app.kubernetes.io/name"] = BUDGET_CONTENDER_NAME
         spec = document["spec"]
@@ -6643,8 +8622,9 @@ ON CONFLICT (key_hash) DO NOTHING;
                     raise SmokeConfigurationError("the old budget control outlived its deletion")
                 time.sleep(2)
 
-    def place_refused_contender(self) -> None:
+    def place_refused_contender(self, *, liveness_budget: str, lease_ttl: str) -> None:
         self._require_isolated_kind("placing a refused leader-election contender")
+        timings = _contender_timings(liveness_budget, lease_ttl)
         account = f"system:serviceaccount:{KIND_NAMESPACE}:{REFUSED_CONTENDER_SERVICE_ACCOUNT}"
         for verb in ("get", "update"):
             allowed = self.kubectl(
@@ -6670,7 +8650,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         _require_ok(
             self.kubectl(
                 "create", "-f", "-",
-                input_text=json.dumps(refused_contender_pod(deployment, node=nodes[0])),
+                input_text=json.dumps(refused_contender_pod(deployment, node=nodes[0], env=timings)),
                 timeout=30,
             ),
             "create the refused leader-election contender",
@@ -6682,8 +8662,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             time.sleep(2)
 
     def release_refused_contender(self) -> None:
-        # Read right after the apiserver answers again, while kubectl may still
-        # be reconnecting.
+        # A plain retry of the read, which kubectl can briefly fail.
         deadline = time.monotonic() + 60
         while True:
             result = self.kubectl(
@@ -6716,9 +8695,9 @@ ON CONFLICT (key_hash) DO NOTHING;
     def remove_refused_contender(self, *, wait: bool = True) -> None:
         # The Deployment is the shape earlier versions of the scenario ran the
         # contender as; one a killed run left behind would keep a pod under the
-        # contender's selector. Not `--wait`: right after an apiserver outage
-        # the node's kubelet can take a minute or more to see the deletion,
-        # which the poll below outlasts.
+        # contender's selector. Not `--wait`, so cleanup can bound the request
+        # at CLEANUP_REQUEST_SECONDS; with `wait`, the poll below outlasts the
+        # contender's teardown.
         _require_ok(
             self.kubectl(
                 "delete", f"pod/{REFUSED_CONTENDER_NAME}", f"deployment/{REFUSED_CONTENDER_NAME}",
@@ -6735,46 +8714,108 @@ ON CONFLICT (key_hash) DO NOTHING;
                 raise RuntimeError("the refused contender's pod outlived its deletion")
             time.sleep(2)
 
-    def control_plane_node(self) -> str:
-        result = self.kubectl(
-            "get", "nodes", "-l", "node-role.kubernetes.io/control-plane", "-o",
-            "jsonpath={.items[*].metadata.name}", timeout=15,
-        )
-        names = _require_ok(result, "find the Kind control-plane node").split()
-        if len(names) != 1:
-            raise SmokeConfigurationError(
-                f"expected one Kind control-plane node, found {names or 'none'}"
+    def cut_controllers_off_from_apiserver(
+        self, pod_names: Sequence[str], targets: Sequence[str], *, timeout: float
+    ) -> dict[str, tuple[float, float]]:
+        self._require_isolated_kind("cutting a cluster-controller pod off from the apiserver")
+        for target in targets:
+            if _APISERVER_TARGET.fullmatch(target) is None:
+                raise ValueError(f"refusing apiserver target {target!r}")
+        # Every lookup comes first, so the cuts follow one another.
+        nodes = {}
+        for pod_name in pod_names:
+            result = self.kubectl("get", "pod", _kube_pod_name(pod_name), "-o", "json", timeout=15)
+            spec = json.loads(_require_ok(result, f"read pod {pod_name}") or "{}").get("spec") or {}
+            if spec.get("hostNetwork"):
+                raise SmokeConfigurationError(
+                    f"{pod_name} shares its node's network namespace; cutting it off would cut the node off"
+                )
+            nodes[pod_name] = str(spec.get("nodeName") or "")
+        cuts = {}
+        for pod_name in pod_names:
+            started = time.time()
+            _require_ok(
+                self._docker_exec(
+                    nodes[pod_name], "sh", "-c", _APISERVER_CUT_SCRIPT, "sh",
+                    KIND_NAMESPACE, pod_name, APISERVER_CUT_CHAIN, "cut", *targets,
+                    timeout=timeout,
+                ),
+                f"cut {pod_name} off from the apiserver",
             )
-        return self._kind_node_container(names[0])
+            cuts[pod_name] = (started, time.time())
+        return cuts
 
-    def apiserver_answers(self) -> bool:
-        result = self.executor.run(
-            ["kubectl", "--context", self.config.context, "get", "--raw", "/readyz",
-             "--request-timeout=3s"],
-            timeout=10,
-        )
-        return result.returncode == 0 and result.stdout.strip() == "ok"
-
-    def park_apiserver(self, node_name: str) -> None:
-        self._require_isolated_kind("taking the Kind apiserver down")
+    def reconnect_controller_to_apiserver(
+        self, node_name: str, pod_name: str, *, timeout: float | None = None
+    ) -> None:
+        # One exec, which looks nothing up through the apiserver, so cleanup
+        # can bound it; a pod whose sandbox is gone has no cut left to remove.
         _require_ok(
             self._docker_exec(
-                node_name, "sh", "-c",
-                f"test ! -e {APISERVER_PARKED_MANIFEST} && mv {APISERVER_MANIFEST} {APISERVER_PARKED_MANIFEST}",
+                node_name, "sh", "-c", _APISERVER_CUT_SCRIPT, "sh",
+                KIND_NAMESPACE, _kube_pod_name(pod_name), APISERVER_CUT_CHAIN, "reconnect",
+                timeout=CLEANUP_REQUEST_SECONDS if timeout is None else timeout,
             ),
-            "park the apiserver manifest",
+            f"reconnect {pod_name} to the apiserver",
         )
 
-    def restore_apiserver(self, node_name: str, *, timeout: float = 30) -> None:
-        _require_ok(
-            self._docker_exec(
-                node_name, "sh", "-c",
-                f"if test -e {APISERVER_PARKED_MANIFEST}; then "
-                f"mv {APISERVER_PARKED_MANIFEST} {APISERVER_MANIFEST}; fi",
-                timeout=timeout,
-            ),
-            "restore the apiserver manifest",
+    def apiserver_cut_targets(self) -> list[str]:
+        """`ip:port` of each of the `kubernetes` Service's ClusterIPs and of each of its endpoints."""
+
+        service = json.loads(
+            _require_ok(
+                self.kubectl("-n", "default", "get", "service", "kubernetes", "-o", "json", timeout=15),
+                "read the kubernetes Service",
+            )
+            or "{}"
+        ).get("spec") or {}
+        slices = json.loads(
+            _require_ok(
+                self.kubectl(
+                    "-n", "default", "get", "endpointslices",
+                    "-l", "kubernetes.io/service-name=kubernetes", "-o", "json", timeout=15,
+                ),
+                "read the kubernetes Service's endpoints",
+            )
+            or "{}"
+        ).get("items") or []
+        # A dual-stack Service lists a second ClusterIP and a second slice of
+        # endpoints; a pod could reach the apiserver through either, and the
+        # cut covers IPv4 only, so either refuses the bench.
+        for item in slices:
+            address_type = item.get("addressType")
+            if address_type != "IPv4":
+                raise SmokeConfigurationError(
+                    f"the apiserver cut supports IPv4 only; the kubernetes Service has an "
+                    f"EndpointSlice of addressType {address_type!r}"
+                )
+        cluster_ips = [str(ip) for ip in service.get("clusterIPs") or [service.get("clusterIP") or ""]]
+        pairs = {
+            (cluster_ip, int(port["port"]))
+            for cluster_ip in cluster_ips
+            for port in service.get("ports") or []
+        }
+        pairs.update(
+            (str(address), int(port["port"]))
+            for item in slices
+            for endpoint in item.get("endpoints") or []
+            for address in endpoint.get("addresses") or []
+            for port in item.get("ports") or []
         )
+        targets = []
+        for address, port in sorted(pairs):
+            try:
+                ipaddress.IPv4Address(address)
+            except ValueError:
+                raise SmokeConfigurationError(
+                    f"the apiserver cut supports IPv4 only; the kubernetes Service names {address!r}"
+                ) from None
+            if not 0 < port < 65536:
+                raise ValueError(f"refusing apiserver port {port}")
+            targets.append(f"{address}:{port}")
+        if len(targets) < 2:
+            raise SmokeConfigurationError(f"expected the apiserver's ClusterIP and an endpoint, found {targets}")
+        return targets
 
     def node_controller_containers(self, node_name: str, pod_name: str) -> list[NodeContainer]:
         listing = self._docker_exec(
@@ -7419,7 +9460,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             data=b"{}",
         )
         try:
-            with urlopen(request, timeout=30) as response:
+            with _URL_OPEN(request, timeout=30) as response:
                 return TerminateAttempt(response.status, _json_object(response.read()))
         except HTTPError as error:
             # A refusal is the expected answer, so the error carries the body.
@@ -8222,59 +10263,6 @@ class KubectlPodWatch:
         self._stderr_reader.join(timeout=5)
 
 
-class KubectlLeaseWatch:
-    """`kubectl get lease --watch`, keeping the newest renewal it delivered.
-
-    The stream is a sequence of JSON documents, one per change; a reader
-    thread decodes them as they arrive. It ends by itself when the apiserver
-    goes away, and `stop` ends it otherwise.
-    """
-
-    def __init__(self, command: Sequence[str]) -> None:
-        self._process = subprocess.Popen(
-            list(command), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-        )
-        self._latest: ControllerLease | None = None
-        self._lock = threading.Lock()
-        self._reader = threading.Thread(target=self._read, name="lease-watch", daemon=True)
-        self._reader.start()
-
-    def _read(self) -> None:
-        assert self._process.stdout is not None
-        decoder = json.JSONDecoder()
-        buffer = ""
-        for chunk in iter(lambda: self._process.stdout.read1(65536), b""):  # type: ignore[union-attr]
-            buffer += chunk.decode(errors="replace")
-            while True:
-                buffer = buffer.lstrip()
-                try:
-                    document, end = decoder.raw_decode(buffer)
-                except ValueError:
-                    break
-                buffer = buffer[end:]
-                try:
-                    lease = _controller_lease(document)
-                except (RuntimeError, ValueError, AttributeError):
-                    continue
-                with self._lock:
-                    if self._latest is None or lease.renew_time >= self._latest.renew_time:
-                        self._latest = lease
-
-    def latest(self) -> ControllerLease | None:
-        with self._lock:
-            return self._latest
-
-    def stop(self) -> None:
-        if self._process.poll() is None:
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait(timeout=5)
-        self._reader.join(timeout=5)
-
-
 class CtrExitWatch:
     """containerd's task-exit events on one node, keyed by container id.
 
@@ -8378,14 +10366,16 @@ def task_exit(line: str) -> tuple[str, int, float] | None:
         return None
 
 
-def refused_contender_pod(deployment: Mapping[str, Any], *, node: str) -> dict[str, Any]:
+def refused_contender_pod(
+    deployment: Mapping[str, Any], *, node: str, env: Mapping[str, str] | None = None
+) -> dict[str, Any]:
     """The live controller Deployment's pod template as one refused pod under another identity.
 
     Derived rather than written out, so the contender runs the image and env
-    of the replicas it is compared against. Only the name, the selector label
-    and the ServiceAccount change; the pod is bound to `node`, and an init
-    container on the controller's image waits for a gate file in a volume of
-    its own before the unchanged controller container starts.
+    of the replicas it is compared against. Only the name, the selector label,
+    the ServiceAccount and the controller's `env` entries change; the pod is
+    bound to `node`, and an init container on the controller's image waits for
+    a gate file in a volume of its own before the controller container starts.
     """
 
     template = json.loads(json.dumps((deployment.get("spec") or {}).get("template") or {}))
@@ -8398,6 +10388,11 @@ def refused_contender_pod(deployment: Mapping[str, Any], *, node: str) -> dict[s
     spec.pop("serviceAccount", None)
     spec["nodeName"] = node
     controller = (spec.get("containers") or [{}])[0]
+    if env:
+        controller["env"] = [
+            *(entry for entry in controller.get("env") or [] if entry.get("name") not in env),
+            *({"name": name, "value": value} for name, value in env.items()),
+        ]
     spec["initContainers"] = [
         *(spec.get("initContainers") or []),
         {
@@ -8430,6 +10425,103 @@ def refused_contender_pod(deployment: Mapping[str, Any], *, node: str) -> dict[s
         "spec": spec,
     }
 
+
+def _contender_timings(liveness_budget: str, lease_ttl: str) -> dict[str, str]:
+    """The budget and TTL hooks a contender is placed with, as the healthy replicas get them.
+
+    Refuses either value unless it is 1 to 9999 whole seconds; the healthy
+    replicas' env write checks its values here too.
+    """
+
+    for name, value in (("liveness-budget", liveness_budget), ("lease-TTL", lease_ttl)):
+        if _LIVENESS_BUDGET_VALUE.fullmatch(value) is None:
+            raise ValueError(f"refusing {name} value {value!r}")
+    return {LIVENESS_BUDGET_ENV: liveness_budget, LEASE_TTL_ENV: lease_ttl}
+
+
+# Run on the pod's node: `sh -c SCRIPT sh NAMESPACE POD CHAIN cut|reconnect
+# [IP:PORT...]`. The pod sandbox's network namespace outlives its containers,
+# so a container kubelet restarts stays cut off; the pause process's pid
+# names it. Each mode is one `iptables-restore --noflush` transaction, which
+# applies whole or not at all and waits at most 4 s for the xtables lock, so
+# the exec's 8 s holds it with the lookups and the lock-free `iptables-save`
+# reads around it. Either mode first deletes every jump to the chain the read
+# found, so a cut is never doubled; `cut` needs exactly one ready sandbox and
+# (re)creates the chain empty, adds a rule per target and one jump, and
+# `reconnect` deletes the chain and then checks that it is gone from a read
+# that must itself succeed, so an iptables that cannot run is a failure
+# rather than a removed cut. The local exec's timeout does not stop the
+# script on the node, so a transaction that waits on the lock long enough can
+# still land after its exec gave up; the next run's preflight removes it.
+_APISERVER_CUT_SCRIPT = r"""set -eu
+namespace=$1 pod=$2 chain=$3 mode=$4
+shift 4
+ids=$(crictl pods -q --state ready --namespace "$namespace" --label "io.kubernetes.pod.name=$pod")
+count=$(printf '%s\n' $ids | grep -c . || true)
+if [ "$mode" = cut ] && [ "$count" -ne 1 ]; then
+  echo "expected one ready sandbox for $pod, found $count" >&2
+  exit 1
+fi
+for id in $ids; do
+  pid=$(crictl inspectp -o go-template --template '{{.info.pid}}' "$id")
+  rules=$(nsenter -t "$pid" -n iptables-save -t filter)
+  jumps=$(printf '%s\n' "$rules" | grep -cx -- "-A OUTPUT -j $chain" || true)
+  exists=$(printf '%s\n' "$rules" | grep -c -- "^:$chain " || true)
+  if [ "$mode" = reconnect ] && [ "$jumps" -eq 0 ] && [ "$exists" -eq 0 ]; then
+    continue
+  fi
+  {
+    echo '*filter'
+    i=0
+    while [ "$i" -lt "$jumps" ]; do echo "-D OUTPUT -j $chain"; i=$((i + 1)); done
+    if [ "$mode" = cut ]; then
+      echo ":$chain - [0:0]"
+      for target in "$@"; do
+        echo "-A $chain -p tcp -d ${target%:*} --dport ${target##*:} -j REJECT --reject-with tcp-reset"
+      done
+      echo "-I OUTPUT -j $chain"
+    elif [ "$exists" -ne 0 ]; then
+      echo "-F $chain"
+      echo "-X $chain"
+    fi
+    echo COMMIT
+  } | nsenter -t "$pid" -n iptables-restore --noflush -w 4
+  if [ "$mode" = reconnect ]; then
+    rules=$(nsenter -t "$pid" -n iptables-save -t filter)
+    if printf '%s\n' "$rules" | grep -q -- "$chain"; then
+      echo "the cut on $pod outlived its removal" >&2
+      exit 1
+    fi
+  fi
+done
+"""
+
+
+def _metric_export_interval_seconds(raw: str | None, *, owner: str) -> float:
+    """`OTEL_METRIC_EXPORT_INTERVAL` as the Rust producers read it.
+
+    Unset or blank keeps the SDKs' 10 s; anything but a positive whole number
+    of milliseconds is refused, since such a producer exports no metrics at
+    all (`export_interval_from_value` in
+    crates/l10_foundation/observability/src/sink/otlp.rs).
+    """
+
+    if raw is None or not raw.strip():
+        return OTEL_METRIC_EXPORT_DEFAULT_SECONDS
+    try:
+        millis = int(raw.strip())
+    except ValueError:
+        raise SmokeConfigurationError(
+            f"{owner} sets {OTEL_METRIC_EXPORT_INTERVAL_ENV}={raw!r}, not milliseconds"
+        ) from None
+    if millis <= 0:
+        raise SmokeConfigurationError(
+            f"{owner} sets {OTEL_METRIC_EXPORT_INTERVAL_ENV}={raw!r}, not positive"
+        )
+    return millis / 1000
+
+
+_APISERVER_TARGET = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}")
 
 _RFC3339 = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})")
 
@@ -8469,6 +10561,7 @@ class _LeaseOwnership:
     uid: object
     holder: str
     subject: str
+    clear_annotations: tuple[str, ...] = ()
 
 
 def _kube_node_name(value: str) -> str:
@@ -9421,33 +11514,216 @@ class EcwSdk:
         *,
         attempts: int = 10,
         interval_seconds: float = 1.0,
+        scan_whole_window: bool = False,
+        deadline: float | None = None,
     ) -> None:
+        """Kill what matches `metadata`, polling until something does.
+
+        By default the first scan that matches ends it. `scan_whole_window`
+        keeps scanning for every attempt instead, for a caller with several
+        creates of unknown outcome under the same metadata: one becoming
+        visible says nothing about the others, which may commit later. In
+        that mode a failed DELETE doesn't stop the others: the sandbox stays
+        eligible for the next scan, and a failure no later DELETE cleared is
+        raised once the window ends.
+
+        `deadline` (a `time.monotonic()` value) bounds every list and DELETE
+        call by the time left. It stops at the first match, so it can't be
+        combined with `scan_whole_window`.
+        """
+
         if attempts <= 0:
             raise ValueError("reconciliation attempts must be positive")
+        if deadline is not None:
+            if scan_whole_window:
+                raise ValueError("deadline-bounded reconciliation stops at the first match")
+            self._kill_matching_before_deadline(
+                metadata,
+                attempts=attempts,
+                interval_seconds=interval_seconds,
+                deadline=deadline,
+            )
+            return
         e2b = importlib.import_module("e2b")
+        matched_any = False
+        unresolved: dict[str, Exception] = {}
+        def kill(sandbox_id: str) -> None:
+            try:
+                _kill_with_sdk(e2b.Sandbox.kill, sandbox_id, **self.config.sdk_options())
+            except ScenarioTimedOut:
+                raise
+            except Exception as error:
+                if not scan_whole_window:
+                    raise
+                unresolved[sandbox_id] = error
+            else:
+                unresolved.pop(sandbox_id, None)
+
+        incomplete: EcwSandboxDeleteRetryable | None = None
         for attempt in range(attempts):
             matched = False
-            paginator = e2b.Sandbox.list(
-                query=e2b.SandboxQuery(metadata=dict(metadata)),
-                limit=100,
-                **self.config.sdk_options(),
-            )
-            while paginator.has_next:
-                for sandbox in paginator.next_items():
-                    matched = True
-                    _kill_with_sdk(
-                        e2b.Sandbox.kill,
-                        sandbox.sandbox_id,
+            seen: set[str] = set()
+            incomplete = None
+            paginator = None
+            try:
+                paginator = _sdk_reconcile_call(
+                    e2b,
+                    lambda: e2b.Sandbox.list(
+                        query=e2b.SandboxQuery(metadata=dict(metadata)),
+                        limit=100,
                         **self.config.sdk_options(),
-                    )
-            if matched:
+                    ),
+                )
+            except EcwSandboxDeleteRetryable as error:
+                incomplete = error
+            while paginator is not None and incomplete is None and paginator.has_next:
+                try:
+                    items = _sdk_reconcile_call(e2b, paginator.next_items)
+                except EcwSandboxDeleteRetryable as error:
+                    # The pages after this one are unchecked, so this scan
+                    # can't end the call; the next attempt lists from the start.
+                    incomplete = error
+                    break
+                for sandbox in items:
+                    matched = True
+                    seen.add(sandbox.sandbox_id)
+                    kill(sandbox.sandbox_id)
+            # A DELETE whose reply was lost may have committed, so its sandbox
+            # can drop out of the list: retry it by id, which counts a gone
+            # sandbox as done, rather than report it as a failure.
+            for sandbox_id in [sid for sid in unresolved if sid not in seen]:
+                kill(sandbox_id)
+            matched_any = matched_any or matched
+            if matched and not scan_whole_window and incomplete is None:
                 return
             if attempt + 1 < attempts:
                 time.sleep(interval_seconds)
-        raise RuntimeError(
+        if unresolved:
+            raise next(iter(unresolved.values()))
+        if incomplete is not None:
+            raise incomplete
+        if matched_any:
+            return
+        raise EcwSandboxReconcileUnmatched(
             "sandbox create may have committed, but no sandbox became visible "
             "during run-metadata reconciliation"
         )
+
+    def _kill_matching_before_deadline(
+        self,
+        metadata: Mapping[str, str],
+        *,
+        attempts: int,
+        interval_seconds: float,
+        deadline: float,
+    ) -> None:
+        # The pinned E2B SDK ignores `request_timeout` on `Sandbox.list` and
+        # `Sandbox.kill`, so deadline-bounded reaping drives `/v2/sandboxes` and
+        # `DELETE /sandboxes/{id}` over `urlopen(..., timeout=remaining)`.
+        encoded_metadata = urlencode({quote(k): quote(v) for k, v in metadata.items()})
+        headers = dict(self.config.api_headers())
+        headers.pop("Content-Type", None)
+        for attempt in range(attempts):
+            matched = False
+            next_token: str | None = None
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise EcwSandboxDeleteRetryable(
+                        "reconciliation deadline expired before listing matching sandboxes"
+                    )
+                params: dict[str, object] = {"limit": 100}
+                if encoded_metadata:
+                    params["metadata"] = encoded_metadata
+                if next_token:
+                    params["nextToken"] = next_token
+                list_url = f"{self.config.api_endpoint('/v2/sandboxes')}?{urlencode(params)}"
+                payload, next_token = self._reconcile_http_list(
+                    Request(list_url, headers=headers, method="GET"),
+                    timeout=remaining,
+                )
+                for item in payload:
+                    raw_id = item.get("sandboxID") if isinstance(item, dict) else None
+                    if not isinstance(raw_id, str) or not raw_id:
+                        raise RuntimeError(f"ECW listed sandbox omitted sandboxID: {item!r}")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise EcwSandboxDeleteRetryable(
+                            "reconciliation deadline expired before deleting every matching sandbox"
+                        )
+                    matched = True
+                    delete_url = self.config.api_endpoint(f"/sandboxes/{quote(raw_id, safe='')}")
+                    # A 202 is a durable delete still running, which can yet
+                    # fail. A repeat DELETE joins it (or starts a new one after
+                    # a failure), so repeat until 204 or 404, or the deadline
+                    # leaves this probe pending for the next sweep.
+                    while not self._reconcile_http_delete(
+                        Request(delete_url, headers=headers, method="DELETE"),
+                        timeout=remaining,
+                    ):
+                        time.sleep(min(interval_seconds, max(0.0, deadline - time.monotonic())))
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise EcwSandboxDeleteRetryable(
+                                f"reconciliation deadline expired while the delete of {raw_id} was still in progress"
+                            )
+                if not next_token:
+                    break
+            if matched:
+                return
+            if attempt + 1 < attempts:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise EcwSandboxDeleteRetryable(
+                        "reconciliation deadline expired before completing run-metadata reconciliation"
+                    )
+                time.sleep(min(interval_seconds, remaining))
+        raise EcwSandboxReconcileUnmatched(
+            "sandbox create may have committed, but no sandbox became visible "
+            "during run-metadata reconciliation"
+        )
+
+    @staticmethod
+    def _reconcile_http_list(request: Request, *, timeout: float) -> tuple[list[Any], str | None]:
+        # `_URL_OPEN` refuses redirects, so `X-API-Key` never follows one off the Kind API.
+        try:
+            with _URL_OPEN(request, timeout=timeout) as response:
+                next_token = response.headers.get("x-next-token") or None
+                body = response.read().decode(errors="replace")
+        except HTTPError as error:
+            detail = error.read(4_000).decode(errors="replace")
+            if error.code in _ECW_TRANSIENT_STATUSES:
+                raise EcwSandboxDeleteRetryable(f"HTTP {error.code}: {detail[:300]}") from error
+            raise RuntimeError(f"ECW sandbox list failed with HTTP {error.code}: {detail[:300]}") from error
+        except (URLError, TimeoutError, HTTPException, OSError) as error:
+            raise EcwSandboxDeleteRetryable(str(error)) from error
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as error:
+            raise RuntimeError("ECW sandbox list returned a non-JSON response") from error
+        if not isinstance(payload, list):
+            raise RuntimeError(f"ECW sandbox list returned a non-list JSON body: {payload!r}")
+        return payload, next_token
+
+    @staticmethod
+    def _reconcile_http_delete(request: Request, *, timeout: float) -> bool:
+        """True once the sandbox is gone (204 or 404); False for a 202, a delete still running."""
+
+        try:
+            with _URL_OPEN(request, timeout=timeout) as response:
+                response.read()
+                return int(response.status) != 202
+        except HTTPError as error:
+            detail = error.read(4_000).decode(errors="replace")
+            if error.code == 404:
+                return True
+            if error.code == 409:
+                raise EcwSandboxBusy(f"HTTP 409: {detail[:300]}") from error
+            if error.code in _ECW_TRANSIENT_STATUSES:
+                raise EcwSandboxDeleteRetryable(f"HTTP {error.code}: {detail[:300]}") from error
+            raise RuntimeError(f"ECW sandbox delete failed with HTTP {error.code}: {detail[:300]}") from error
+        except (URLError, TimeoutError, HTTPException, OSError) as error:
+            raise EcwSandboxDeleteRetryable(str(error)) from error
 
     def list_pages(
         self,
@@ -9474,6 +11750,28 @@ class EcwSdk:
         return EcwSandboxPages(tuple(pages), bool(paginator.has_next))
 
 
+def _is_retryable_sdk_reconcile_error(error: Exception, e2b: Any) -> bool:
+    sandbox_exc = getattr(e2b, "SandboxException", ())
+    timeout_exc = getattr(e2b, "TimeoutException", ())
+    rate_limit_exc = getattr(e2b, "RateLimitException", ())
+    # The pinned SDK lets an HTTPX transport timeout (`httpx.ReadTimeout` on a
+    # page read) escape unwrapped, and it is neither `TimeoutError` nor `OSError`.
+    httpx = sys.modules.get("httpx")
+    httpx_timeout_exc = getattr(httpx, "TimeoutException", ()) if httpx is not None else ()
+    if isinstance(error, (timeout_exc, rate_limit_exc, httpx_timeout_exc, TimeoutError, OSError)):
+        return True
+    return isinstance(error, sandbox_exc) and _sdk_http_status(error) in _ECW_TRANSIENT_STATUSES
+
+
+def _sdk_reconcile_call(e2b: Any, operation: Callable[[], Any]) -> Any:
+    try:
+        return operation()
+    except Exception as error:
+        if _is_retryable_sdk_reconcile_error(error, e2b):
+            raise EcwSandboxDeleteRetryable(str(error)) from error
+        raise
+
+
 def _kill_with_sdk(
     kill: Callable[..., object],
     *args: object,
@@ -9488,16 +11786,10 @@ def _kill_with_sdk(
         if deleted is False:
             return
     except Exception as error:
-        status = _sdk_http_status(error)
-        if isinstance(error, e2b.SandboxException) and status == 409:
+        sandbox_exc = getattr(e2b, "SandboxException", ())
+        if isinstance(error, sandbox_exc) and _sdk_http_status(error) == 409:
             raise EcwSandboxBusy(str(error)) from error
-        if isinstance(error, e2b.SandboxException) and status in {
-            408,
-            429,
-            502,
-            503,
-            504,
-        }:
+        if _is_retryable_sdk_reconcile_error(error, e2b):
             raise EcwSandboxDeleteRetryable(str(error)) from error
         raise
 

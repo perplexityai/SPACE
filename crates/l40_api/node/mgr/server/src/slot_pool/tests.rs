@@ -63,7 +63,7 @@ mod slot_pool_tests {
                                 .unwrap_err();
                         }
                         "pid-write-failure" => {
-                            pool.db.lock().unwrap().execute_batch(
+                            pool.db.lock().unwrap().raw().execute_batch(
                                 "CREATE TRIGGER reject_pid BEFORE UPDATE OF pid ON network_slots
                                  BEGIN SELECT RAISE(ABORT, 'injected PID write failure'); END;",
                             ).unwrap();
@@ -71,6 +71,7 @@ mod slot_pool_tests {
                             pool.db
                                 .lock()
                                 .unwrap()
+                                .raw()
                                 .execute_batch("DROP TRIGGER reject_pid")
                                 .unwrap();
                         }
@@ -108,11 +109,12 @@ mod slot_pool_tests {
         let pool = test_pool(NetworkPoolConfig::new(1));
         {
             let conn = pool.db.lock().unwrap();
-            conn.execute_batch(
-                "UPDATE network_slots SET state = 'leasing', sandbox_id = 'sandbox-a',
+            conn.raw()
+                .execute_batch(
+                    "UPDATE network_slots SET state = 'leasing', sandbox_id = 'sandbox-a',
                 generation = 7, memory_reservation_mib = 8320",
-            )
-            .unwrap();
+                )
+                .unwrap();
             *pool.startup_leasing.lock().unwrap() = query_startup_leasing(&conn).unwrap();
             *pool.startup_leases.lock().unwrap() = query_startup_leases(&conn).unwrap();
         }
@@ -193,15 +195,16 @@ mod slot_pool_tests {
                 std::sync::Arc::get_mut(&mut pool).unwrap().job_tx = sender;
                 {
                     let conn = pool.db.lock().unwrap();
-                    conn.execute_batch(
-                        "UPDATE network_slots SET state = 'leasing', sandbox_id = 'sandbox-a',
+                    conn.raw()
+                        .execute_batch(
+                            "UPDATE network_slots SET state = 'leasing', sandbox_id = 'sandbox-a',
                              generation = 7, memory_reservation_mib = 8320 WHERE slot_id = 0;",
-                    )
-                    .unwrap();
+                        )
+                        .unwrap();
                     *pool.startup_leasing.lock().unwrap() = query_startup_leasing(&conn).unwrap();
                     *pool.startup_leases.lock().unwrap() = query_startup_leases(&conn).unwrap();
                     // A request admitted after startup is not recovery work.
-                    conn.execute_batch(
+                    conn.raw().execute_batch(
                         "UPDATE network_slots SET state = 'leasing', sandbox_id = 'sandbox-new',
                              generation = 1, memory_reservation_mib = 4096 WHERE slot_id = 1;",
                     )
@@ -217,6 +220,7 @@ mod slot_pool_tests {
                     pool.db
                         .lock()
                         .unwrap()
+                        .raw()
                         .execute_batch(
                             "CREATE TRIGGER reject_recovery BEFORE UPDATE ON network_slots
                          BEGIN SELECT RAISE(ABORT, 'injected recovery write failure'); END;",
@@ -229,6 +233,7 @@ mod slot_pool_tests {
                     pool.db
                         .lock()
                         .unwrap()
+                        .raw()
                         .execute_batch("DROP TRIGGER reject_recovery")
                         .unwrap();
                 }
@@ -239,16 +244,18 @@ mod slot_pool_tests {
                     let conn = pool.db.lock().unwrap();
                     match supersession {
                         "generation" => {
-                            conn.execute_batch(
-                                "UPDATE network_slots SET generation = 8 WHERE slot_id = 0",
-                            )
-                            .unwrap();
+                            conn.raw()
+                                .execute_batch(
+                                    "UPDATE network_slots SET generation = 8 WHERE slot_id = 0",
+                                )
+                                .unwrap();
                         }
                         "release" => {
-                            conn.execute_batch(
-                                "UPDATE network_slots SET state = 'dirty' WHERE slot_id = 0",
-                            )
-                            .unwrap();
+                            conn.raw()
+                                .execute_batch(
+                                    "UPDATE network_slots SET state = 'dirty' WHERE slot_id = 0",
+                                )
+                                .unwrap();
                         }
                         _ => {}
                     }
@@ -279,6 +286,7 @@ mod slot_pool_tests {
                     pool.db
                         .lock()
                         .unwrap()
+                        .raw()
                         .execute_batch("UPDATE network_slots SET state = 'dirty' WHERE slot_id = 0")
                         .unwrap();
                     assert!(
@@ -344,17 +352,18 @@ mod slot_pool_tests {
         let mut pool = test_pool(config.clone());
         let leases = {
             let mut conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots SET state = 'leased', sandbox_id = ?1, generation = 7,
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots SET state = 'leased', sandbox_id = ?1, generation = 7,
                      pid = NULL, memory_reservation_mib = 8320, health = 'healthy',
                      last_error = NULL, updated_at = ?2
                  WHERE slot_id = 0",
-                rusqlite::params![
-                    SandboxId::new().to_string(),
-                    SqliteU64(now_secs() - age.as_secs())
-                ],
-            )
-            .unwrap();
+                    rusqlite::params![
+                        SandboxId::new().to_string(),
+                        SqliteU64(now_secs() - age.as_secs())
+                    ],
+                )
+                .unwrap();
             // The startup steps NetworkPool::open runs on it.
             let young =
                 query_startup_young_leases(&conn, now_secs(), STARTUP_YOUNG_LEASE_GRACE).unwrap();
@@ -480,7 +489,7 @@ mod slot_pool_tests {
             // Interrupted mid-setup: its allocation failed, so it is repaired.
             (4, 10, "leasing", None),
         ] {
-            conn.execute(
+            conn.raw().execute(
                 "UPDATE network_slots SET state = ?1, sandbox_id = ?2, pid = ?3, updated_at = ?4
                  WHERE slot_id = ?5",
                 rusqlite::params![
@@ -508,14 +517,16 @@ mod slot_pool_tests {
             let (sender, mut jobs) = mpsc::channel(1);
             let (startup_leases, startup_leasing) = {
                 let conn = pool.db.lock().unwrap();
-                conn.execute(
-                    "UPDATE network_slots SET state = 'leased', sandbox_id = ?1,
+                conn.raw()
+                    .execute(
+                        "UPDATE network_slots SET state = 'leased', sandbox_id = ?1,
                          generation = 7, pid = 0, memory_reservation_mib = 8320 WHERE slot_id = 0",
-                    [SandboxId::new().to_string()],
-                )
-                .unwrap();
+                        [SandboxId::new().to_string()],
+                    )
+                    .unwrap();
                 if resolution == "gone" {
-                    conn.execute_batch("UPDATE network_slots SET state = 'leasing'")
+                    conn.raw()
+                        .execute_batch("UPDATE network_slots SET state = 'leasing'")
                         .unwrap();
                 }
                 (
@@ -548,19 +559,22 @@ mod slot_pool_tests {
                 let conn = pool.db.lock().unwrap();
                 match resolution {
                     "gone" => {
-                        conn.execute_batch(
-                            "UPDATE network_slots SET pid = NULL;
+                        conn.raw()
+                            .execute_batch(
+                                "UPDATE network_slots SET pid = NULL;
                             CREATE TRIGGER reject_recovery BEFORE UPDATE ON network_slots
                             BEGIN SELECT RAISE(ABORT, 'injected recovery write failure'); END;",
-                        )
-                        .unwrap();
+                            )
+                            .unwrap();
                     }
                     "generation" => {
-                        conn.execute_batch("UPDATE network_slots SET generation = 8, pid = NULL")
+                        conn.raw()
+                            .execute_batch("UPDATE network_slots SET generation = 8, pid = NULL")
                             .unwrap();
                     }
                     "release" => {
-                        conn.execute_batch("UPDATE network_slots SET state = 'dirty'")
+                        conn.raw()
+                            .execute_batch("UPDATE network_slots SET state = 'dirty'")
                             .unwrap();
                     }
                     _ => unreachable!(),
@@ -574,6 +588,7 @@ mod slot_pool_tests {
                 pool.db
                     .lock()
                     .unwrap()
+                    .raw()
                     .execute_batch("DROP TRIGGER reject_recovery")
                     .unwrap();
             }
@@ -613,12 +628,13 @@ mod slot_pool_tests {
         {
             let conn = pool.db.lock().unwrap();
             // Invalid tracked PID gives Unknown without relying on host processes.
-            conn.execute(
-                "UPDATE network_slots SET state = 'leasing', sandbox_id = ?1,
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots SET state = 'leasing', sandbox_id = ?1,
                      generation = 7, pid = 0, memory_reservation_mib = 8320 WHERE slot_id = 0",
-                [SandboxId::new().to_string()],
-            )
-            .unwrap();
+                    [SandboxId::new().to_string()],
+                )
+                .unwrap();
             *pool.startup_leasing.lock().unwrap() = query_startup_leasing(&conn).unwrap();
             *pool.startup_leases.lock().unwrap() = query_startup_leases(&conn).unwrap();
         }
@@ -634,6 +650,7 @@ mod slot_pool_tests {
         pool.db
             .lock()
             .unwrap()
+            .raw()
             .execute_batch("UPDATE network_slots SET state = 'dirty' WHERE slot_id = 0")
             .unwrap();
         fill_ready_slots(pool.clone()).await;
@@ -713,15 +730,15 @@ mod slot_pool_tests {
             {
                 let conn = pool.db.lock().unwrap();
                 match failure {
-                    "execute" => conn.execute_batch(
+                    "execute" => conn.raw().execute_batch(
                         "CREATE TRIGGER reject_claim BEFORE UPDATE ON network_slots
                          BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
                     ).unwrap(),
-                    "unchanged" => conn.execute_batch(
+                    "unchanged" => conn.raw().execute_batch(
                         "CREATE TRIGGER ignore_claim BEFORE UPDATE ON network_slots
                          BEGIN SELECT RAISE(IGNORE); END;",
                     ).unwrap(),
-                    "commit" => conn.execute_batch(
+                    "commit" => conn.raw().execute_batch(
                         "CREATE TABLE parent (id INTEGER PRIMARY KEY);
                          CREATE TABLE child (id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
                          CREATE TRIGGER fail_commit AFTER UPDATE ON network_slots
@@ -809,6 +826,7 @@ mod slot_pool_tests {
         pool.db
             .lock()
             .unwrap()
+            .raw()
             .execute_batch(
                 "CREATE TRIGGER reject_completion BEFORE UPDATE ON network_slots
              BEGIN SELECT RAISE(FAIL, 'injected storage failure'); END;",
@@ -827,6 +845,7 @@ mod slot_pool_tests {
             pool.db
                 .lock()
                 .unwrap()
+                .raw()
                 .execute_batch("DROP TRIGGER reject_completion")
                 .unwrap();
             tokio::time::advance(POOL_FILL_RETRY_DELAY).await;
@@ -853,6 +872,7 @@ mod slot_pool_tests {
         pool.db
             .lock()
             .unwrap()
+            .raw()
             .execute_batch(
                 "UPDATE network_slots
                  SET state = 'dirty', generation = 7, lease_kind = 'ephemeral'",
@@ -883,6 +903,7 @@ mod slot_pool_tests {
             pool.db
                 .lock()
                 .unwrap()
+                .raw()
                 .execute(
                     "UPDATE network_slots SET state = ?1, generation = 7",
                     [state],
@@ -1044,16 +1065,18 @@ mod slot_pool_tests {
         // Preflight must not create a missing authoritative store.
         NetworkPool::validate_startup(&config, &path).unwrap_err();
         assert!(!path.exists());
-        let mut conn = Connection::open(&path).unwrap();
+        let mut conn = Connection::from_raw(rusqlite::Connection::open(&path).unwrap());
         init_in_memory_db(&mut conn, &config).unwrap();
         for state in ["leased", "ready", "creating", "future-state"] {
-            conn.execute(
-                "UPDATE network_slots SET state = ?1 WHERE slot_id = 1",
-                [state],
-            )
-            .unwrap();
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots SET state = ?1 WHERE slot_id = 1",
+                    [state],
+                )
+                .unwrap();
             NetworkPool::validate_startup(&NetworkPoolConfig::new(1), &path).unwrap_err();
             let persisted: String = conn
+                .raw()
                 .query_row(
                     "SELECT state FROM network_slots WHERE slot_id = 1",
                     [],
@@ -1062,7 +1085,8 @@ mod slot_pool_tests {
                 .unwrap();
             assert_eq!(persisted, state);
         }
-        conn.execute("UPDATE network_slots SET state = 'missing'", [])
+        conn.raw()
+            .execute("UPDATE network_slots SET state = 'missing'", [])
             .unwrap();
         NetworkPool::validate_startup(&NetworkPoolConfig::new(1), &path).unwrap();
     }
@@ -1079,9 +1103,9 @@ mod slot_pool_tests {
             let pool = test_pool(NetworkPoolConfig::new(2));
             let mut conn = pool.db.lock().unwrap();
             if state == "old-schema" {
-                conn.execute_batch("UPDATE network_slots SET state = 'ready', schema_version = 0 WHERE slot_id = 1").unwrap();
+                conn.raw().execute_batch("UPDATE network_slots SET state = 'ready', schema_version = 0 WHERE slot_id = 1").unwrap();
             } else {
-                conn.execute(
+                conn.raw().execute(
                     "UPDATE network_slots SET state = ?1, health = 'degraded' WHERE slot_id = 1",
                     [state],
                 )
@@ -1111,13 +1135,14 @@ mod slot_pool_tests {
         for state in ["leasing", "leased", "dirty", "resetting", "quarantined"] {
             let pool = test_pool(NetworkPoolConfig::new(2));
             let mut conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots SET state = ?1, sandbox_id = 'sandbox-a',
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots SET state = ?1, sandbox_id = 'sandbox-a',
                  sandbox_uid = 1234, generation = 7, memory_reservation_mib = 8320
                  WHERE slot_id = 1",
-                params![state],
-            )
-            .unwrap();
+                    params![state],
+                )
+                .unwrap();
             assert!(
                 init_db(&mut conn, &NetworkPoolConfig::new(1)).is_err(),
                 "{state}"
@@ -1135,11 +1160,12 @@ mod slot_pool_tests {
         for state in ["ready", "creating", "destroying"] {
             let pool = test_pool(NetworkPoolConfig::new(2));
             let mut conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots SET state = ?1 WHERE slot_id = 1",
-                [state],
-            )
-            .unwrap();
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots SET state = ?1 WHERE slot_id = 1",
+                    [state],
+                )
+                .unwrap();
             assert!(
                 init_db(&mut conn, &NetworkPoolConfig::new(1)).is_err(),
                 "{state}"
@@ -1159,6 +1185,7 @@ mod slot_pool_tests {
         pool.db
             .lock()
             .unwrap()
+            .raw()
             .execute_batch("DROP TABLE network_slots; DROP TABLE network_pool_meta;")
             .unwrap();
         pool.get("sandbox-a").unwrap_err();
@@ -1182,7 +1209,12 @@ mod slot_pool_tests {
             "UPDATE network_slots SET lease_kind = 'future-kind'",
         ] {
             let pool = test_pool(NetworkPoolConfig::new(1));
-            pool.db.lock().unwrap().execute_batch(statement).unwrap();
+            pool.db
+                .lock()
+                .unwrap()
+                .raw()
+                .execute_batch(statement)
+                .unwrap();
             assert!(pool.all_records().is_err(), "{statement}");
             assert!(
                 init_db(&mut pool.db.lock().unwrap(), &NetworkPoolConfig::new(1)).is_err(),
@@ -1205,12 +1237,13 @@ mod slot_pool_tests {
 
     fn cleanup_reset_attempts(pool: &NetworkPool, slot_id: u32) -> u32 {
         let conn = pool.db.lock().unwrap();
-        conn.query_row(
-            "SELECT cleanup_reset_attempts FROM network_slots WHERE slot_id = ?1",
-            params![slot_id],
-            |row| row.get::<_, u32>(0),
-        )
-        .unwrap()
+        conn.raw()
+            .query_row(
+                "SELECT cleanup_reset_attempts FROM network_slots WHERE slot_id = ?1",
+                params![slot_id],
+                |row| row.get::<_, u32>(0),
+            )
+            .unwrap()
     }
 
     fn memory_admission() -> Option<NewLeaseMemoryReservation> {
@@ -1332,14 +1365,15 @@ mod slot_pool_tests {
         let pool = test_pool(config);
         {
             let conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET state = 'ready', health = 'healthy', pod_netns_path = 'old-pod',
                      lease_kind = ?1
                  WHERE slot_id = 0",
-                params![LeaseKind::Pooled.as_str()],
-            )
-            .unwrap();
+                    params![LeaseKind::Pooled.as_str()],
+                )
+                .unwrap();
         }
 
         let claim = pool
@@ -1503,16 +1537,17 @@ mod slot_pool_tests {
         let pool = test_pool(config);
         {
             let conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 1, state = 'leased', health = 'healthy',
                      sandbox_id = 'sandbox-a', sandbox_uid = ?1, pid = NULL,
                      pod_netns_path = 'space-test-missing-netns-old',
                      lease_kind = ?2
                  WHERE slot_id = 0",
-                params![net::sandbox_uid_for_slot(0), LeaseKind::Ephemeral.as_str()],
-            )
-            .unwrap();
+                    params![net::sandbox_uid_for_slot(0), LeaseKind::Ephemeral.as_str()],
+                )
+                .unwrap();
         }
 
         let claim = pool
@@ -1556,20 +1591,21 @@ mod slot_pool_tests {
         let child = SandboxMarkerProcess::spawn("sandbox-a");
         {
             let conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 1, state = 'leased', health = 'healthy',
                      sandbox_id = 'sandbox-a', sandbox_uid = ?1, pid = ?2,
                      pod_netns_path = 'space-test-missing-netns-old',
                      lease_kind = ?3
                  WHERE slot_id = 0",
-                params![
-                    net::sandbox_uid_for_slot(0),
-                    child.id(),
-                    LeaseKind::Ephemeral.as_str()
-                ],
-            )
-            .unwrap();
+                    params![
+                        net::sandbox_uid_for_slot(0),
+                        child.id(),
+                        LeaseKind::Ephemeral.as_str()
+                    ],
+                )
+                .unwrap();
         }
 
         let error = pool
@@ -1593,15 +1629,16 @@ mod slot_pool_tests {
         let pool = test_pool(config);
         {
             let conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 1, state = 'leased', health = 'healthy',
                      sandbox_id = 'sandbox-a', sandbox_uid = ?1, lease_kind = ?2,
                      memory_reservation_mib = 8320
                  WHERE slot_id = 0",
-                params![net::sandbox_uid_for_slot(0), LeaseKind::Pooled.as_str()],
-            )
-            .unwrap();
+                    params![net::sandbox_uid_for_slot(0), LeaseKind::Pooled.as_str()],
+                )
+                .unwrap();
         }
         let released = pool.release("sandbox-a").unwrap().unwrap();
         assert_eq!(released.slot, 0);
@@ -1652,15 +1689,16 @@ mod slot_pool_tests {
         let pool = test_pool(config);
         {
             let conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 1, state = 'leased', health = 'healthy',
                      sandbox_id = 'sandbox-a', sandbox_uid = ?1, lease_kind = ?2,
                      memory_reservation_mib = NULL
                  WHERE slot_id = 0",
-                params![net::sandbox_uid_for_slot(0), LeaseKind::Ephemeral.as_str()],
-            )
-            .unwrap();
+                    params![net::sandbox_uid_for_slot(0), LeaseKind::Ephemeral.as_str()],
+                )
+                .unwrap();
 
             slots::backfill_active_memory_reservations(&conn, 8320).unwrap();
         }
@@ -1677,22 +1715,24 @@ mod slot_pool_tests {
         let pool = test_pool(config);
         {
             let conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 1, state = 'dirty', health = 'unknown',
                      sandbox_id = 'sandbox-a', sandbox_uid = ?1, lease_kind = ?2
                  WHERE slot_id = 0",
-                params![net::sandbox_uid_for_slot(0), LeaseKind::Pooled.as_str()],
-            )
-            .unwrap();
-            conn.execute(
-                "UPDATE network_slots
+                    params![net::sandbox_uid_for_slot(0), LeaseKind::Pooled.as_str()],
+                )
+                .unwrap();
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 1, state = 'leased', health = 'healthy',
                      sandbox_id = 'sandbox-a', sandbox_uid = ?1, lease_kind = ?2
                  WHERE slot_id = 1",
-                params![net::sandbox_uid_for_slot(1), LeaseKind::Ephemeral.as_str()],
-            )
-            .unwrap();
+                    params![net::sandbox_uid_for_slot(1), LeaseKind::Ephemeral.as_str()],
+                )
+                .unwrap();
         }
 
         let released = pool.release("sandbox-a").unwrap().unwrap();
@@ -1713,19 +1753,20 @@ mod slot_pool_tests {
         let pool = test_pool(config);
         let conn = pool.db.lock().unwrap();
         let lease = |slot_id: u32, sandbox_id: &str| {
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 1, state = 'leased', health = 'healthy',
                      sandbox_id = ?1, sandbox_uid = ?2, lease_kind = ?3
                  WHERE slot_id = ?4",
-                params![
-                    sandbox_id,
-                    net::sandbox_uid_for_slot(slot_id),
-                    LeaseKind::Ephemeral.as_str(),
-                    slot_id
-                ],
-            )
-            .unwrap();
+                    params![
+                        sandbox_id,
+                        net::sandbox_uid_for_slot(slot_id),
+                        LeaseKind::Ephemeral.as_str(),
+                        slot_id
+                    ],
+                )
+                .unwrap();
         };
         lease(0, "abcd1234-5678-4abc-8def-000000000001");
         lease(1, "feed0000-5678-4abc-8def-000000000001");
@@ -1760,15 +1801,16 @@ mod slot_pool_tests {
         let pool = test_pool(config.clone());
         {
             let conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 1, state = 'leased', health = 'healthy',
                      sandbox_id = 'sandbox-a', sandbox_uid = ?1, pid = NULL,
                      lease_kind = ?2
                  WHERE slot_id = 0",
-                params![net::sandbox_uid_for_slot(0), LeaseKind::Pooled.as_str()],
-            )
-            .unwrap();
+                    params![net::sandbox_uid_for_slot(0), LeaseKind::Pooled.as_str()],
+                )
+                .unwrap();
 
             reconcile_startup(&conn, &config).unwrap();
         }
@@ -1788,15 +1830,16 @@ mod slot_pool_tests {
         let pool = test_pool(config.clone());
         {
             let mut conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 1, state = 'leased', health = 'healthy',
                      sandbox_id = 'sandbox-a', sandbox_uid = ?1, pid = NULL,
                      lease_kind = ?2
                  WHERE slot_id = 0",
-                params![net::sandbox_uid_for_slot(0), LeaseKind::Pooled.as_str()],
-            )
-            .unwrap();
+                    params![net::sandbox_uid_for_slot(0), LeaseKind::Pooled.as_str()],
+                )
+                .unwrap();
 
             reconcile_startup(&conn, &config).unwrap();
             reconcile_runtime_state(&mut conn, &config, &HashMap::new()).unwrap();
@@ -1829,15 +1872,16 @@ mod slot_pool_tests {
         let pool = test_pool(config.clone());
         {
             let mut conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 1, state = 'leasing', health = 'unknown',
                      sandbox_id = 'sandbox-a', sandbox_uid = ?1, pid = NULL,
                      lease_kind = ?2
                  WHERE slot_id = 0",
-                params![net::sandbox_uid_for_slot(0), LeaseKind::Ephemeral.as_str()],
-            )
-            .unwrap();
+                    params![net::sandbox_uid_for_slot(0), LeaseKind::Ephemeral.as_str()],
+                )
+                .unwrap();
 
             reconcile_startup(&conn, &config).unwrap();
             reconcile_runtime_state(&mut conn, &config, &HashMap::new()).unwrap();
@@ -1886,16 +1930,17 @@ mod slot_pool_tests {
         let pool = test_pool(config.clone());
         {
             let conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 8, state = 'leased', health = 'healthy',
                      sandbox_id = 'sandbox-new', sandbox_uid = ?1, pid = 4242,
                      pod_netns_path = 'pod-new', lease_kind = ?2,
                      memory_reservation_mib = 4096, last_error = NULL
                  WHERE slot_id = 0",
-                params![net::sandbox_uid_for_slot(0), LeaseKind::Ephemeral.as_str()],
-            )
-            .unwrap();
+                    params![net::sandbox_uid_for_slot(0), LeaseKind::Ephemeral.as_str()],
+                )
+                .unwrap();
         }
 
         let stale_generation = 7;
@@ -1964,15 +2009,16 @@ mod slot_pool_tests {
         let pool = test_pool(config.clone());
         {
             let conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 7, state = 'creating', health = 'unknown',
                      pod_netns_path = NULL, lease_kind = ?1,
                      cleanup_reset_attempts = 3, last_reset_retry_at = 42
                  WHERE slot_id = 0",
-                params![LeaseKind::Pooled.as_str()],
-            )
-            .unwrap();
+                    params![LeaseKind::Pooled.as_str()],
+                )
+                .unwrap();
 
             reconcile_startup(&conn, &config).unwrap();
             let candidates = query_startup_recoverable_idle_records(&conn, &config).unwrap();
@@ -1996,15 +2042,16 @@ mod slot_pool_tests {
         let pool = test_pool(config.clone());
         let candidates = {
             let conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 4, state = 'creating', health = 'unknown',
                      pod_netns_path = 'space-test-missing-pod-netns', lease_kind = ?1,
                      last_error = 'root cause from interrupted create'
                  WHERE slot_id = 0",
-                params![LeaseKind::Pooled.as_str()],
-            )
-            .unwrap();
+                    params![LeaseKind::Pooled.as_str()],
+                )
+                .unwrap();
 
             reconcile_startup(&conn, &config).unwrap();
             query_startup_recoverable_idle_records(&conn, &config).unwrap()
@@ -2053,16 +2100,17 @@ mod slot_pool_tests {
         let pool = test_pool(config.clone());
         {
             let conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 4, state = 'creating', health = 'unknown',
                      pod_netns_path = NULL, lease_kind = ?1,
                      cleanup_reset_attempts = 3, last_reset_retry_at = 42,
                      last_error = 'original interrupted create error'
                  WHERE slot_id = 0",
-                params![LeaseKind::Pooled.as_str()],
-            )
-            .unwrap();
+                    params![LeaseKind::Pooled.as_str()],
+                )
+                .unwrap();
 
             reconcile_startup(&conn, &config).unwrap();
         }
@@ -2092,23 +2140,25 @@ mod slot_pool_tests {
             let pool = test_pool(config.clone());
             {
                 let conn = pool.db.lock().unwrap();
-                conn.execute(
-                    "UPDATE network_slots
+                conn.raw()
+                    .execute(
+                        "UPDATE network_slots
                  SET generation = 2, state = 'ready', health = 'healthy',
                      lease_kind = ?1, pod_netns_path = 'old-pod'
                  WHERE slot_id = 0",
-                    params![LeaseKind::Pooled.as_str()],
-                )
-                .unwrap();
+                        params![LeaseKind::Pooled.as_str()],
+                    )
+                    .unwrap();
             }
             assert_eq!(claim_ready_for_destroy(&pool).unwrap(), Some(0));
             {
                 let conn = pool.db.lock().unwrap();
-                conn.execute(
-                    "UPDATE network_slots SET schema_version = ?1 WHERE slot_id = 0",
-                    [schema_version],
-                )
-                .unwrap();
+                conn.raw()
+                    .execute(
+                        "UPDATE network_slots SET schema_version = ?1 WHERE slot_id = 0",
+                        [schema_version],
+                    )
+                    .unwrap();
                 reconcile_startup(&conn, &config).unwrap();
                 let candidates = query_startup_recoverable_idle_records(&conn, &config).unwrap();
                 assert!(candidates.is_empty());
@@ -2160,7 +2210,7 @@ mod slot_pool_tests {
             ("creating", "unknown"),
         ] {
             let pool = test_pool(NetworkPoolConfig::new(2));
-            pool.db.lock().unwrap().execute(
+            pool.db.lock().unwrap().raw().execute(
                 "UPDATE network_slots SET state = ?1, health = ?2, pod_netns_path = 'old-pod' WHERE slot_id = 0",
                 params![state, health],
             ).unwrap();
@@ -2203,27 +2253,30 @@ mod slot_pool_tests {
         let pool = test_pool(config.clone());
         {
             let conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET state = 'ready', health = 'unknown', lease_kind = ?1
                  WHERE slot_id = 0",
-                params![LeaseKind::Pooled.as_str()],
-            )
-            .unwrap();
-            conn.execute(
-                "UPDATE network_slots
+                    params![LeaseKind::Pooled.as_str()],
+                )
+                .unwrap();
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET state = 'creating', health = 'unknown', lease_kind = ?1
                  WHERE slot_id = 1",
-                params![LeaseKind::Pooled.as_str()],
-            )
-            .unwrap();
-            conn.execute(
-                "UPDATE network_slots
+                    params![LeaseKind::Pooled.as_str()],
+                )
+                .unwrap();
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET state = 'missing', health = 'degraded', lease_kind = ?1
                  WHERE slot_id = 2",
-                params![LeaseKind::Pooled.as_str()],
-            )
-            .unwrap();
+                    params![LeaseKind::Pooled.as_str()],
+                )
+                .unwrap();
 
             let recurring = query_adoptable_ready_records(&conn, &config).unwrap();
             assert_eq!(recurring.len(), 1);
@@ -2243,15 +2296,16 @@ mod slot_pool_tests {
         let pool = test_pool(config.clone());
         {
             let mut conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 3, state = 'resetting', health = 'unknown',
                      pod_netns_path = NULL, lease_kind = ?1,
                      cleanup_reset_attempts = 4, last_reset_retry_at = 42
                  WHERE slot_id = 0",
-                params![LeaseKind::Pooled.as_str()],
-            )
-            .unwrap();
+                    params![LeaseKind::Pooled.as_str()],
+                )
+                .unwrap();
 
             apply_ready_validation_updates(
                 &mut conn,
@@ -2285,14 +2339,15 @@ mod slot_pool_tests {
         let pool = test_pool(config);
         {
             let conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET state = 'missing', health = 'degraded',
                      cleanup_reset_attempts = 4, last_reset_retry_at = 42
                  WHERE slot_id = 0",
-                [],
-            )
-            .unwrap();
+                    [],
+                )
+                .unwrap();
         }
 
         assert_eq!(claim_missing_for_create(&pool, true), Some((0, 0)));
@@ -2311,14 +2366,15 @@ mod slot_pool_tests {
         let pool = test_pool(config.clone());
         {
             let mut conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 9, state = 'creating', health = 'unknown',
                      pod_netns_path = NULL, lease_kind = ?1
                  WHERE slot_id = 0",
-                params![LeaseKind::Pooled.as_str()],
-            )
-            .unwrap();
+                    params![LeaseKind::Pooled.as_str()],
+                )
+                .unwrap();
 
             apply_ready_validation_updates(
                 &mut conn,
@@ -2346,14 +2402,15 @@ mod slot_pool_tests {
         let pool = test_pool(config);
         {
             let conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 7, state = 'leased', health = 'unknown',
                      sandbox_id = 'sandbox-a', sandbox_uid = ?1, lease_kind = ?2
                  WHERE slot_id = 0",
-                params![net::sandbox_uid_for_slot(0), LeaseKind::Ephemeral.as_str()],
-            )
-            .unwrap();
+                    params![net::sandbox_uid_for_slot(0), LeaseKind::Ephemeral.as_str()],
+                )
+                .unwrap();
 
             apply_live_lease_validation_updates(
                 &conn,
@@ -2398,14 +2455,15 @@ mod slot_pool_tests {
         let pool = test_pool(config);
         let reset_key = {
             let conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 5, state = 'resetting', health = 'unknown',
                      sandbox_id = 'sandbox-a', sandbox_uid = ?1, lease_kind = ?2
                  WHERE slot_id = 0",
-                params![net::sandbox_uid_for_slot(0), LeaseKind::Ephemeral.as_str()],
-            )
-            .unwrap();
+                    params![net::sandbox_uid_for_slot(0), LeaseKind::Ephemeral.as_str()],
+                )
+                .unwrap();
             ResetKey::from_record(&query_record_by_slot(&conn, 0).unwrap().unwrap())
         };
 
@@ -2450,13 +2508,14 @@ mod slot_pool_tests {
         let pool = test_pool(config);
         if repair {
             let conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET state = 'missing', health = 'degraded'
                  WHERE slot_id IN (0, 1)",
-                [],
-            )
-            .unwrap();
+                    [],
+                )
+                .unwrap();
         }
 
         fill_ready_slots(pool).await;
@@ -2476,7 +2535,7 @@ mod slot_pool_tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         {
             let conn = pool.db.lock().unwrap();
-            conn.execute("DROP TABLE network_slots", []).unwrap();
+            conn.raw().execute("DROP TABLE network_slots", []).unwrap();
         }
 
         fill_ready_slots(pool.clone()).await;
@@ -2687,13 +2746,14 @@ mod slot_pool_tests {
         assert_eq!(record_transient_setup_failure_for_key(&pool, other_slot), 1);
         {
             let conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 2, state = 'missing', health = 'unknown'
                  WHERE slot_id = 0",
-                [],
-            )
-            .unwrap();
+                    [],
+                )
+                .unwrap();
         }
 
         pool.update_config(NetworkPoolConfigUpdate {
@@ -2743,19 +2803,21 @@ mod slot_pool_tests {
         let pool = test_pool(config);
         {
             let conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 1, state = 'dirty', health = 'unknown',
                      sandbox_id = ?1, sandbox_uid = ?2, pid = NULL, lease_kind = ?3
                  WHERE slot_id = 0",
-                params![sandbox_id, lease_uid, LeaseKind::Ephemeral.as_str()],
-            )
-            .unwrap();
-            conn.execute(
-                "ALTER TABLE network_slots DROP COLUMN cleanup_reset_attempts",
-                [],
-            )
-            .unwrap();
+                    params![sandbox_id, lease_uid, LeaseKind::Ephemeral.as_str()],
+                )
+                .unwrap();
+            conn.raw()
+                .execute(
+                    "ALTER TABLE network_slots DROP COLUMN cleanup_reset_attempts",
+                    [],
+                )
+                .unwrap();
         }
 
         let (teardown, teardowns) = refusing_teardown!();
@@ -2801,14 +2863,15 @@ mod slot_pool_tests {
         let pool = test_pool(config);
         {
             let conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 1, state = 'dirty', health = 'unknown',
                      sandbox_id = ?1, sandbox_uid = ?2, pid = NULL, lease_kind = ?3
                  WHERE slot_id = 0",
-                params![sandbox_id, lease_uid, LeaseKind::Ephemeral.as_str()],
-            )
-            .unwrap();
+                    params![sandbox_id, lease_uid, LeaseKind::Ephemeral.as_str()],
+                )
+                .unwrap();
         }
 
         let (teardown, teardowns) = refusing_teardown!();
@@ -2858,14 +2921,15 @@ mod slot_pool_tests {
         let pool = test_pool(config);
         {
             let conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots
                  SET generation = 1, state = 'dirty', health = 'unknown',
                      sandbox_id = ?1, sandbox_uid = ?2, pid = NULL, lease_kind = ?3
                  WHERE slot_id = 0",
-                params![sandbox_id, lease_uid, LeaseKind::Ephemeral.as_str()],
-            )
-            .unwrap();
+                    params![sandbox_id, lease_uid, LeaseKind::Ephemeral.as_str()],
+                )
+                .unwrap();
         }
 
         let (teardown, teardowns) = refusing_teardown!();
@@ -2920,6 +2984,7 @@ mod slot_pool_tests {
         pool.db
             .lock()
             .unwrap()
+            .raw()
             .execute(
                 "UPDATE network_slots
                  SET generation = 1, state = 'leased', health = 'healthy',
@@ -2937,6 +3002,7 @@ mod slot_pool_tests {
         pool.db
             .lock()
             .unwrap()
+            .raw()
             .execute(
                 "UPDATE network_slots SET state = 'dirty' WHERE slot_id BETWEEN 1 AND ?1",
                 [BACKLOG],

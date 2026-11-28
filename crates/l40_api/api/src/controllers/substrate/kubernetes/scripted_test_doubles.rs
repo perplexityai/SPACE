@@ -376,7 +376,8 @@ pub(super) async fn start_scripted_worker(
         dir.path().join("snapshots"),
         dir.path().join("sandboxes"),
         WORKER_NODE.to_string(),
-    );
+    )
+    .as_sandbox_pod();
     let calls: CallLog = Arc::default();
     let replies = Arc::new(config.replies);
     let observers = Arc::new(config.observers);

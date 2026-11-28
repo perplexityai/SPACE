@@ -107,8 +107,8 @@ impl Error {
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn into_raw(self) -> rusqlite::Error {
+    #[cfg(test)]
+    pub(crate) fn into_raw(self) -> rusqlite::Error {
         self.0
     }
 }
@@ -324,7 +324,6 @@ impl SharedConnection {
     }
 
     /// [`Mutex::try_lock`].
-    #[cfg(any(test, feature = "test-support"))]
     pub fn try_lock(&self) -> std::sync::TryLockResult<ConnectionGuard<'_>> {
         use std::sync::TryLockError;
         match self.0.try_lock() {

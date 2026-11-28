@@ -6,15 +6,16 @@
 
 use pplx_space_accounts::OrgId;
 use pplx_space_byok_model::MasterKeyIdentifier;
+use pplx_space_postgres_pool::Db;
 
 use crate::intermediate_key_broker::{WrappedIntermediateKeyStore, WrappedKeyStoreError};
 
 pub struct PgWrappedIntermediateKeyStore {
-    pool: sqlx::PgPool,
+    pool: Db,
 }
 
 impl PgWrappedIntermediateKeyStore {
-    pub fn new(pool: sqlx::PgPool) -> Self {
+    pub fn new(pool: Db) -> Self {
         Self { pool }
     }
 }

@@ -16,13 +16,14 @@ use pplx_space_db_test_fixtures::{pg_test_db, pg_test_db_with_max_connections};
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_node_model::SubstrateKind;
 use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId, SandboxLifecycle};
-use pplx_space_sandbox_store::sweeper::REPAIR_FAILED_ACTIVE_EXECUTION_SQL;
+use pplx_space_sandbox_store::row_locks;
+use pplx_space_sandbox_store::test_support::sweeper::REPAIR_FAILED_ACTIVE_EXECUTION_SQL;
 use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
 use super::super::lifecycle_writer_tests::{age, direct_sink};
-use super::super::store::{LOCK_SANDBOX_ROW_SQL, candidate_pod_fence_with_observation};
+use super::super::store::candidate_pod_fence_with_observation;
 use super::super::{FailGuard, SWEEPABLE_LIFECYCLES, SubstrateSweepSink, SweepSink};
 use crate::lifecycle_writer_test_support::{
     ExecutionSeed, SandboxSeed, bounded, insert_execution, insert_node, insert_sandbox,
@@ -421,10 +422,7 @@ async fn a_new_owner_that_claims_first_keeps_the_row(
         let owner_pid: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
             .fetch_one(&mut *owner)
             .await?;
-        sqlx::query(LOCK_SANDBOX_ROW_SQL)
-            .bind(id)
-            .execute(&mut *owner)
-            .await?;
+        row_locks::lock_id(&mut *owner, id).await?;
 
         let (sweep_pool, sweep_pid) = single_backend_pool(&db).await?;
         // The revert that only moves the lifecycle: the one that also

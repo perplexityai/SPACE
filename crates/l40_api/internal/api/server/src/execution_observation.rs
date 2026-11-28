@@ -10,7 +10,7 @@ use pplx_space_node_execution_inventory_store::{
     self as inventory_store, ArtifactComponent, RuntimeGuest, RuntimeInstallation,
     RuntimeStateFormat,
 };
-use pplx_space_sql_locator::sql;
+use pplx_space_node_registration_store::locks;
 use tonic::Status;
 
 use crate::proto::{ExecutionInventoryObservation, execution_inventory_observation::Outcome};
@@ -97,12 +97,12 @@ pub(super) async fn prepare<'a>(
     // Keep artifact writes before the status upsert, as legacy readers do.
     // Locking the status row first would invert that order during rollout.
     // NO KEY UPDATE permits the foreign-key key-share locks of node reports.
-    sqlx::query_scalar::<_, NodeId>(sql!("SELECT id FROM nodes WHERE id = $1 FOR NO KEY UPDATE"))
-        .bind(node_id)
-        .fetch_optional(&mut **tx)
+    let exists = locks::lock_node_for_no_key_update(&mut **tx, node_id)
         .await
-        .map_err(|error| Status::internal(format!("lock node execution publication: {error}")))?
-        .ok_or_else(|| Status::not_found("publishing node no longer exists"))?;
+        .map_err(|error| Status::internal(format!("lock node execution publication: {error}")))?;
+    if !exists {
+        return Err(Status::not_found("publishing node no longer exists"));
+    }
     Ok(Some(PreparedObservation { node_id, report }))
 }
 

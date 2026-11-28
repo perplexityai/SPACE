@@ -42,7 +42,7 @@ impl PoolSlotState {
 
     /// The warming pod was observed running and ready: the slot joins the
     /// claimable inventory.
-    pub fn mark_ready(self) -> Result<Self, PoolError> {
+    pub(crate) fn mark_ready(self) -> Result<Self, PoolError> {
         match self {
             Self::Warming => Ok(Self::Ready),
             from => Err(from.invalid_transition(Self::Ready)),
@@ -50,7 +50,7 @@ impl PoolSlotState {
     }
 
     /// A create request takes the slot out of the inventory.
-    pub fn claim(self) -> Result<Self, PoolError> {
+    pub(crate) fn claim(self) -> Result<Self, PoolError> {
         match self {
             Self::Ready => Ok(Self::Claimed),
             from => Err(from.invalid_transition(Self::Claimed)),
@@ -61,7 +61,7 @@ impl PoolSlotState {
     /// slot row is only a retirement receipt. Stamped inside that same
     /// transaction, so its absence on an old `claimed` row proves the
     /// handoff died.
-    pub fn bind(self) -> Result<Self, PoolError> {
+    pub(crate) fn bind(self) -> Result<Self, PoolError> {
         match self {
             Self::Claimed => Ok(Self::Bound),
             from => Err(from.invalid_transition(Self::Bound)),
@@ -70,7 +70,7 @@ impl PoolSlotState {
 
     /// The claim is abandoned before the sandbox bind (the claimed pod
     /// failed validation), returning the still-warm slot to the inventory.
-    pub fn release(self) -> Result<Self, PoolError> {
+    pub(crate) fn release(self) -> Result<Self, PoolError> {
         match self {
             Self::Claimed => Ok(Self::Ready),
             from => Err(from.invalid_transition(Self::Ready)),
@@ -80,7 +80,7 @@ impl PoolSlotState {
     /// The sandbox boot failed after the claim: the slot becomes a durable
     /// work item owing a pod delete and sandbox finalize, drained by the
     /// warm-pool reconciler.
-    pub fn cleanup_pending(self) -> Result<Self, PoolError> {
+    pub(crate) fn cleanup_pending(self) -> Result<Self, PoolError> {
         match self {
             Self::Claimed | Self::Bound => Ok(Self::CleanupPending),
             from => Err(from.invalid_transition(Self::CleanupPending)),

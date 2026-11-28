@@ -2,10 +2,12 @@
 //! and executions that still name its node.
 //!
 //! A node is terminated, and its row deleted, only once nothing names it
-//! ([`node_references`], [`node_unreferenced`]): no non-terminal row's
-//! `active_node_id` or `target_node_id`, and no active execution on its
-//! Kubernetes name. A refused check names what holds the node. A released
-//! row's execution on the node is retired ([`retire_source_execution`]).
+//! ([`node_references`],
+//! [`node_unreferenced`](pplx_space_sandbox_residency::node_unreferenced)): no
+//! non-terminal row's `active_node_id` or `target_node_id`, and no active
+//! execution on its Kubernetes name. A refused check names what holds the
+//! node. A released row's execution on the node is retired
+//! ([`retire_source_execution`]).
 //!
 //! Before that check, the terminate's fence transaction cleans up
 //! the references of rows that no longer need the sealed, drained node, the
@@ -21,10 +23,10 @@
 use std::sync::LazyLock;
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::snapshot_durable_for_source_release;
 use pplx_space_sql_locator::sql;
-use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 /// What still names a node, as [`node_references`] reads it: each list holds
@@ -76,42 +78,17 @@ impl std::fmt::Display for NodeReferences {
     }
 }
 
-/// Boolean SQL fragment: TRUE iff nothing names the node `node_param` (a
-/// node id) with Kubernetes name `name_param`: no row outside `failed` and
-/// `deleted` whose `active_node_id` or `target_node_id` is the node, and no
-/// active execution on the name. A NULL name matches no execution. Both are
-/// placeholders or expressions of the caller's statement. [`node_references`]
-/// reads the same three guards.
-pub fn node_unreferenced(node_param: &str, name_param: &str) -> String {
-    format!(
-        "NOT EXISTS (
-             SELECT 1 FROM sandboxes
-              WHERE active_node_id = {node_param}
-                AND lifecycle NOT IN ('failed', 'deleted')
-         )
-         AND NOT EXISTS (
-             SELECT 1 FROM sandboxes
-              WHERE target_node_id = {node_param}
-                AND lifecycle NOT IN ('failed', 'deleted')
-         )
-         AND NOT EXISTS (
-             SELECT 1 FROM sandbox_k8s_executions
-              WHERE active
-                AND k8s_node_name = {name_param}
-         )"
-    )
-}
-
 /// What still names `node_id` (Kubernetes name `k8s_node_name`), by the
-/// guards of [`node_unreferenced`]: up to `limit` sandbox ids of each, by id.
-/// A read: it takes no lock. Empty is what [`node_unreferenced`] reads as
-/// TRUE at the same snapshot.
+/// guards of
+/// [`node_unreferenced`](pplx_space_sandbox_residency::node_unreferenced):
+/// up to `limit` sandbox ids of each, by id. A read: it takes no lock. Empty
+/// is what that fragment reads as TRUE at the same snapshot.
 pub async fn node_references(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     k8s_node_name: Option<&str>,
     limit: u32,
-) -> Result<NodeReferences, sqlx::Error> {
+) -> Result<NodeReferences, DbError> {
     let rows: Vec<(String, SandboxId)> = sqlx::query_as(sql!(
         "(SELECT 'active', id FROM sandboxes
            WHERE active_node_id = $1
@@ -134,7 +111,7 @@ pub async fn node_references(
     .bind(node_id)
     .bind(k8s_node_name)
     .bind(i64::from(limit))
-    .fetch_all(executor)
+    .fetch_all(executor.into_sqlx())
     .await?;
     let mut references = NodeReferences::default();
     for (guard, sandbox_id) in rows {
@@ -150,12 +127,16 @@ pub async fn node_references(
 /// Retire `execution_id`, the row's source execution, as `forgotten`, the
 /// pod-tracking write-off state: the row no longer runs on the node, and its
 /// pod dies with the machine. Only that execution, and only while it is
-/// active; returns whether it changed.
-pub async fn retire_source_execution(
-    tx: &mut Transaction<'_, Postgres>,
+/// active; returns whether it changed. The caller must pass its open
+/// transaction.
+pub async fn retire_source_execution<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     execution_id: Uuid,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let retired = sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
             SET active = FALSE,
@@ -169,7 +150,7 @@ pub async fn retire_source_execution(
     ))
     .bind(sandbox_id)
     .bind(execution_id)
-    .execute(&mut **tx)
+    .execute(tx.into_sqlx())
     .await?
     .rows_affected();
     Ok(retired == 1)
@@ -215,7 +196,9 @@ fn activation_in_flight() -> &'static str {
 /// placement are cleared and its execution on the node retired. Writes an
 /// **operation step** (the release), in the caller's transaction. Returns
 /// the released ids, by id. A row it skips keeps naming the node, so the
-/// terminate's reference check ([`node_unreferenced`]) refuses the node.
+/// terminate's reference check
+/// ([`node_unreferenced`](pplx_space_sandbox_residency::node_unreferenced))
+/// refuses the node. The caller must pass its open transaction.
 ///
 /// Only for a node sealed under its drain's generation that reported nothing
 /// pending or blocked: the seal refuses every activation on it, so nothing
@@ -223,12 +206,15 @@ fn activation_in_flight() -> &'static str {
 /// and a released row restores elsewhere. Releasing a row whose drain is
 /// later undrained is harmless: its state is durable, and a wake places it
 /// anywhere.
-pub async fn release_durable_suspended(
-    tx: &mut Transaction<'_, Postgres>,
+pub async fn release_durable_suspended<C>(
+    tx: &mut C,
     node_id: NodeId,
     k8s_node_name: Option<&str>,
     execution_ownership_ttl_secs: i64,
-) -> Result<Vec<SandboxId>, sqlx::Error> {
+) -> Result<Vec<SandboxId>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     /// `$1` = node id, `$2` = ownership TTL in seconds.
     static CANDIDATES: LazyLock<String> = LazyLock::new(|| {
         let durable = snapshot_durable_for_source_release("s");
@@ -274,13 +260,13 @@ pub async fn release_durable_suspended(
     let candidates: Vec<SandboxId> = sqlx::query_scalar(sqlx::AssertSqlSafe(CANDIDATES.as_str()))
         .bind(node_id)
         .bind(execution_ownership_ttl_secs)
-        .fetch_all(&mut **tx)
+        .fetch_all((&mut *tx).into_sqlx())
         .await?;
     let mut released = Vec::new();
     for sandbox_id in candidates {
         sqlx::query(sql!("SELECT 1 FROM sandboxes WHERE id = $1 FOR UPDATE"))
             .bind(sandbox_id)
-            .execute(&mut **tx)
+            .execute((&mut *tx).into_sqlx())
             .await?;
         let source: Option<Uuid> = sqlx::query_scalar(sql!(
             "SELECT id FROM sandbox_k8s_executions
@@ -290,24 +276,56 @@ pub async fn release_durable_suspended(
         ))
         .bind(sandbox_id)
         .bind(k8s_node_name)
-        .fetch_optional(&mut **tx)
+        .fetch_optional((&mut *tx).into_sqlx())
         .await?;
         let changed = sqlx::query(sqlx::AssertSqlSafe(RELEASE.as_str()))
             .bind(sandbox_id)
             .bind(node_id)
             .bind(execution_ownership_ttl_secs)
-            .execute(&mut **tx)
+            .execute((&mut *tx).into_sqlx())
             .await?
             .rows_affected();
         if changed == 0 {
             continue;
         }
         if let Some(execution_id) = source {
-            retire_source_execution(tx, sandbox_id, execution_id).await?;
+            retire_source_execution(&mut *tx, sandbox_id, execution_id).await?;
         }
         released.push(sandbox_id);
     }
     Ok(released)
+}
+
+/// The rows the drained tick of a v2 drain counts evacuated from
+/// `node_id`, by id: the `suspended` rows naming it, active or target, whose
+/// state a durable snapshot holds
+/// ([`snapshot_durable_for_source_release`]). A v2 drain never moves a
+/// stopped sandbox, so no stopped row is counted. A read: it takes no lock
+/// and writes nothing.
+pub async fn durable_suspended_rows_naming(
+    executor: impl Executor<'_>,
+    node_id: NodeId,
+) -> Result<Vec<SandboxId>, DbError> {
+    /// `$1` = node id.
+    static DURABLE: LazyLock<String> = LazyLock::new(|| {
+        let suspended = snapshot_durable_for_source_release("s");
+        sql!(format!(
+            "SELECT s.id
+               FROM sandboxes s
+              WHERE s.id IN (
+                      SELECT id FROM sandboxes WHERE active_node_id = $1
+                      UNION
+                      SELECT id FROM sandboxes WHERE target_node_id = $1
+                    )
+                AND s.lifecycle = 'suspended'
+                AND {suspended}
+              ORDER BY s.id"
+        ))
+    });
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(DURABLE.as_str()))
+        .bind(node_id)
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }
 
 #[cfg(test)]

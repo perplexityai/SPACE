@@ -359,6 +359,7 @@ pub struct SlotInfo {
     /// If set, the pod's network namespace name (from CNI). The sandbox namespace
     /// bridges to this namespace via a veth pair + MASQUERADE instead of to the
     /// root namespace.
+    // TODO: rename to `external_netns`; the node manager needs no pod concept.
     pub pod_netns: Option<String>,
 }
 
@@ -403,7 +404,7 @@ impl NetId {
         format!("/var/run/netns/sns-{}", self.label)
     }
     pub fn sveth(&self) -> String {
-        format!("sveth-{}", self.label)
+        format!("{SANDBOX_LINK_PREFIX}{}", self.label)
     }
     pub fn vpeer(&self) -> String {
         format!("vpeer-{}", self.label)
@@ -451,6 +452,9 @@ pub fn slot_label(slot: u32) -> String {
         .unwrap_or_else(|_| format!("{slot:06}"))
 }
 
+/// Prefix of the sandbox-side veth node-mgr adds to the pod namespace. The
+/// shim's redirect address selection skips the same prefix.
+pub(crate) const SANDBOX_LINK_PREFIX: &str = "sveth-";
 const SANDBOX_IPV4_BASE: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 12, 0, 0);
 const VPEER_IPV4_BASE_OFFSET: u32 = 32_768;
 pub const MAX_IPV4_NETWORK_SLOTS: u32 = 16_383;
@@ -719,8 +723,9 @@ fn log_cleanup_result(operation: &str, result: Result<(), String>) {
 /// Reset a reusable network slot in place.
 ///
 /// This preserves the stable namespace/veth/tap objects and only scrubs
-/// lease-scoped mutable state. If core slot objects are missing, callers should
-/// fall back to full teardown + setup.
+/// lease-scoped mutable state, including every SPACE-owned nftables table. If
+/// core slot objects are missing, callers should fall back to full teardown +
+/// setup.
 pub fn reset_network_slot(ns: &str, net: &NetId, pod_netns: Option<&str>) -> Result<(), String> {
     if !ns_exists(ns) {
         return Err(format!("missing namespace {ns}"));
@@ -742,8 +747,7 @@ pub fn reset_network_slot(ns: &str, net: &NetId, pod_netns: Option<&str>) -> Res
         &vpeer_ip,
     )
     .map_err(|e| e.to_string())?;
-    crate::firewall::teardown_proxy_rules(ns);
-    crate::firewall::teardown_namespace_rules(ns);
+    crate::firewall::scrub_namespace_tables(ns).map_err(|e| e.to_string())?;
     clear_tproxy_policy_routing(ns);
     flush_namespace_transient_state(ns);
     native::reset_namespace_links(ns, net)?;
@@ -829,6 +833,14 @@ fn ensure_root_ip_forward() -> Result<(), String> {
 /// Get the default outgoing interface from inside a network namespace.
 fn get_default_iface_in_ns(ns: &str) -> Result<String, DefaultIfaceError> {
     native::default_iface(Some(ns))
+}
+
+/// The address the containerd shim redirects to the node-api proxy in the
+/// external namespace `ns`: the first IPv4 address, in interface index order,
+/// that is neither loopback nor link-local, on a non-loopback interface. It
+/// must match the shim's `podIPFromCurrentNetns`.
+pub fn external_ipv4(ns: &str) -> Result<std::net::Ipv4Addr, DefaultIfaceError> {
+    native::external_ipv4(ns)
 }
 
 /// Return the ingress interface to bind host-port DNAT rules to.

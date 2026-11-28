@@ -74,6 +74,18 @@ impl WorkerApiInternal for SucceedingWake {
         Err(tonic::Status::unimplemented("not used by this test"))
     }
 
+    async fn abandon_runtime_upgrade(
+        &self,
+        _request: tonic::Request<pplx_space_sbx_mgr_client::proto::AbandonRuntimeUpgradeRequest>,
+    ) -> Result<
+        tonic::Response<pplx_space_sbx_mgr_client::proto::AbandonRuntimeUpgradeResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "a restore runs no runtime upgrade",
+        ))
+    }
+
     async fn get_runtime_upgrade(
         &self,
         _request: tonic::Request<pplx_space_sbx_mgr_client::proto::GetRuntimeUpgradeRequest>,
@@ -155,6 +167,18 @@ impl WorkerApiInternal for StoppedWake {
         tonic::Status,
     > {
         Err(tonic::Status::unimplemented("not used by this test"))
+    }
+
+    async fn abandon_runtime_upgrade(
+        &self,
+        _request: tonic::Request<pplx_space_sbx_mgr_client::proto::AbandonRuntimeUpgradeRequest>,
+    ) -> Result<
+        tonic::Response<pplx_space_sbx_mgr_client::proto::AbandonRuntimeUpgradeResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "a restore runs no runtime upgrade",
+        ))
     }
 
     async fn get_runtime_upgrade(
@@ -663,12 +687,9 @@ async fn a_re_placement_every_worker_excludes_waits_unschedulable_and_backs_off(
         )
         .await?;
     assert_eq!(attempts, Some(1), "the failure must arm the backoff");
-    let sweep = restore_pending_evacuations_query(true);
-    let swept: Vec<(SandboxId, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(sweep.as_str())))
-        .fetch_all(pool)
-        .await?;
+    let swept = pplx_space_sandbox_store::evacuation_restores::pending(pool, true).await?;
     assert!(
-        !swept.iter().any(|(id, _)| *id == sandbox_id),
+        !swept.iter().any(|row| row.id == sandbox_id),
         "the backoff must keep the re-placement out of the next sweep: {swept:?}"
     );
     let pending = pplx_space_sandbox_store::stopped_replacements::pending(pool).await?;

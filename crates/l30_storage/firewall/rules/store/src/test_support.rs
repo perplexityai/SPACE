@@ -5,21 +5,22 @@
 use std::time::Duration;
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{Db, DbError, Executor, Tx};
 use pplx_space_sql_locator::sql;
-use sqlx::PgPool;
 
 use crate::RolloutId;
 
 /// A rollout header in `phase`, with the revision it references. The schema
-/// admits one unfinished header per database.
-pub async fn rollout(pool: &PgPool, phase: &str) -> Result<RolloutId, sqlx::Error> {
+/// admits one unfinished header per database. It takes the pool, `&Db` (or
+/// the driver's pool during the transition).
+pub async fn rollout(pool: impl Executor<'_> + Copy, phase: &str) -> Result<RolloutId, DbError> {
     let revision = uuid::Uuid::now_v7();
     sqlx::query(sql!(
         "INSERT INTO firewall_rules_revisions (id, ruleset_format_version, ruleset)
          VALUES ($1, 1, '[]'::jsonb)"
     ))
     .bind(revision)
-    .execute(pool)
+    .execute(pool.into_sqlx())
     .await?;
     let id = uuid::Uuid::now_v7();
     sqlx::query(sql!(
@@ -34,17 +35,17 @@ pub async fn rollout(pool: &PgPool, phase: &str) -> Result<RolloutId, sqlx::Erro
     .bind(id)
     .bind(revision)
     .bind(phase)
-    .execute(pool)
+    .execute(pool.into_sqlx())
     .await?;
     Ok(RolloutId(id))
 }
 
 /// Move `rollout` to `phase`, keeping the slot and finish time consistent.
 pub async fn set_phase(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     rollout: RolloutId,
     phase: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE firewall_rules_rollouts
          SET phase = $2,
@@ -54,17 +55,18 @@ pub async fn set_phase(
     ))
     .bind(rollout)
     .bind(phase)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
 
-/// Save `nodes` as `rollout`'s pending targets.
+/// Save `nodes` as `rollout`'s pending targets. It takes the pool, as
+/// [`rollout`] does.
 pub async fn save_targets(
-    pool: &PgPool,
+    pool: impl Executor<'_> + Copy,
     rollout: RolloutId,
     nodes: &[NodeId],
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     for node in nodes {
         sqlx::query(sql!(
             "INSERT INTO firewall_rules_rollout_items (rollout_id, node_id, phase)
@@ -72,43 +74,47 @@ pub async fn save_targets(
         ))
         .bind(rollout)
         .bind(*node)
-        .execute(pool)
+        .execute(pool.into_sqlx())
         .await?;
     }
     Ok(())
 }
 
 /// Make the checks of `rollout`'s issued items due.
-pub async fn make_checks_due(pool: &PgPool, rollout: RolloutId) -> Result<(), sqlx::Error> {
+pub async fn make_checks_due(
+    executor: impl Executor<'_>,
+    rollout: RolloutId,
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE firewall_rules_rollout_items SET next_check_at = now() - interval '1 second'
          WHERE rollout_id = $1 AND issued_at IS NOT NULL"
     ))
     .bind(rollout)
-    .execute(pool)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
 
 /// Lock `rollout`'s header in an open transaction, so claims queue behind it.
-pub async fn hold_header(
-    pool: &PgPool,
-    rollout: RolloutId,
-) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
-    let mut tx = pool.begin().await?;
+pub async fn hold_header(db: &Db, rollout: RolloutId) -> Result<Tx<'static>, DbError> {
+    let mut tx = db.begin().await?;
     sqlx::query(sql!(
         "SELECT 1 FROM firewall_rules_rollouts WHERE id = $1 FOR UPDATE"
     ))
     .bind(rollout)
-    .execute(&mut *tx)
+    .execute((&mut tx).into_sqlx())
     .await?;
     Ok(tx)
 }
 
 /// Wait, for at most ten seconds, until `count` sessions on this test
 /// database wait for a lock: each racing statement is then known to be
-/// blocked rather than not started yet.
-pub async fn wait_for_lock_waiters(pool: &PgPool, count: i64) -> Result<(), sqlx::Error> {
+/// blocked rather than not started yet. It takes the pool, as [`rollout`]
+/// does.
+pub async fn wait_for_lock_waiters(
+    pool: impl Executor<'_> + Copy,
+    count: i64,
+) -> Result<(), DbError> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let waiting = sqlx::query_scalar::<_, i64>(sql!(
@@ -117,7 +123,7 @@ pub async fn wait_for_lock_waiters(pool: &PgPool, count: i64) -> Result<(), sqlx
              WHERE datname = current_database()
                AND wait_event_type = 'Lock'"
         ))
-        .fetch_one(pool)
+        .fetch_one(pool.into_sqlx())
         .await?;
         if waiting >= count {
             return Ok(());

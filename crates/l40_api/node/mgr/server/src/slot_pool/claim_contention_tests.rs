@@ -140,12 +140,13 @@ fn startup_leasing_reprobe_skips_claimed_sandboxes_and_keeps_the_obligation() {
         let sandbox_id = SandboxId::new().to_string();
         {
             let conn = pool.db.lock().unwrap();
-            conn.execute(
-                "UPDATE network_slots SET state = 'leasing', sandbox_id = ?1,
+            conn.raw()
+                .execute(
+                    "UPDATE network_slots SET state = 'leasing', sandbox_id = ?1,
                      generation = 7, memory_reservation_mib = 8320 WHERE slot_id = 0",
-                params![sandbox_id],
-            )
-            .unwrap();
+                    params![sandbox_id],
+                )
+                .unwrap();
             *pool.startup_leasing.lock().unwrap() = query_startup_leasing(&conn).unwrap();
             *pool.startup_leases.lock().unwrap() = query_startup_leases(&conn).unwrap();
         }
@@ -193,6 +194,7 @@ async fn reset_slot_defers_a_claimed_sandbox_and_requeues_itself() {
         pool.db
             .lock()
             .unwrap()
+            .raw()
             .execute(
                 "UPDATE network_slots
                  SET generation = 1, state = 'dirty', health = 'unknown',
@@ -255,6 +257,7 @@ fn ephemeral_allocation_skips_a_free_slot_whose_claim_is_still_held() {
         pool.db
             .lock()
             .unwrap()
+            .raw()
             .execute(
                 "UPDATE network_slots SET state = 'ready', health = 'healthy' WHERE slot_id = 1",
                 [],

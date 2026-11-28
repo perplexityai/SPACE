@@ -47,11 +47,14 @@
 //! on these tables.
 
 use pplx_space_accounts::UserId;
+use pplx_space_postgres_pool::{Db, DbError, Executor};
 use pplx_space_rollout_queue::{HeaderPhase, Locked, OperatorStore, Refusal};
 use pplx_space_sql_locator::sql;
-use sqlx::{Acquire, PgConnection, Postgres};
+use sqlx::{Acquire, Postgres};
 
-use crate::{CampaignId, CampaignPhase, ItemPhase, UnknownValue, end_transaction};
+use crate::{
+    CampaignId, CampaignPhase, ItemPhase, UnknownValue, end_db_transaction, end_transaction,
+};
 
 /// Who asks for a phase change, and the generation they read.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -98,7 +101,7 @@ pub enum ChangePhaseError {
     #[error(transparent)]
     UnknownValue(#[from] UnknownValue),
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 }
 
 /// [`Operating`]'s error: a [`ChangePhaseError`] that the shared verbs'
@@ -137,7 +140,7 @@ impl From<Refusal> for OperatorError {
 
 impl From<sqlx::Error> for OperatorError {
     fn from(error: sqlx::Error) -> Self {
-        Self(error.into())
+        Self(DbError::from(error).into())
     }
 }
 
@@ -148,13 +151,19 @@ impl From<UnknownValue> for OperatorError {
 }
 
 /// An operator change's steps.
-struct Operating<'c> {
-    tx: &'c mut PgConnection,
+///
+/// `C` is the verb's own transaction: a [`pplx_space_postgres_pool::Tx`],
+/// or the connection of the driver's transaction or savepoint.
+struct Operating<'c, C> {
+    tx: &'c mut C,
     campaign_id: CampaignId,
     actor: Option<UserId>,
 }
 
-impl OperatorStore for Operating<'_> {
+impl<C> OperatorStore for Operating<'_, C>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     type Error = OperatorError;
 
     async fn lock(&mut self) -> Result<Option<Locked>, OperatorError> {
@@ -166,7 +175,7 @@ impl OperatorStore for Operating<'_> {
                  FOR UPDATE"
             ))
             .bind(self.campaign_id)
-            .fetch_optional(&mut *self.tx)
+            .fetch_optional((&mut *self.tx).into_sqlx())
             .await?
         else {
             return Ok(None);
@@ -196,7 +205,7 @@ impl OperatorStore for Operating<'_> {
         .bind(self.campaign_id)
         .bind(ItemPhase::Done.as_str())
         .bind(ItemPhase::Failed.as_str())
-        .fetch_one(&mut *self.tx)
+        .fetch_one((&mut *self.tx).into_sqlx())
         .await?;
         // The count is never negative.
         Ok((any_done, u64::try_from(failed).unwrap_or(0)))
@@ -213,7 +222,7 @@ impl OperatorStore for Operating<'_> {
         .bind(self.campaign_id)
         .bind(ItemPhase::Failed.as_str())
         .bind(ItemPhase::Pending.as_str())
-        .execute(&mut *self.tx)
+        .execute((&mut *self.tx).into_sqlx())
         .await?
         .rows_affected())
     }
@@ -227,7 +236,7 @@ impl OperatorStore for Operating<'_> {
         ))
         .bind(self.campaign_id)
         .bind(ItemPhase::InFlight.as_str())
-        .fetch_one(&mut *self.tx)
+        .fetch_one((&mut *self.tx).into_sqlx())
         .await?;
         Ok(u64::try_from(in_flight).unwrap_or(0))
     }
@@ -246,21 +255,20 @@ impl OperatorStore for Operating<'_> {
         .bind(phase.as_str())
         .bind(self.actor)
         .bind(phase.finished())
-        .fetch_one(&mut *self.tx)
+        .fetch_one((&mut *self.tx).into_sqlx())
         .await?;
         Ok(u64::try_from(generation).unwrap_or(0))
     }
 }
 
 /// Pause a canary or rolling campaign: nothing new is leased, and items in
-/// flight finish under their leases. Opens a transaction, or a savepoint
-/// inside the caller's.
+/// flight finish under their leases. Opens a transaction on `db`.
 pub async fn pause_campaign(
-    conn: impl Acquire<'_, Database = Postgres>,
+    db: &Db,
     campaign_id: CampaignId,
     change: &PhaseChange,
 ) -> Result<PhaseChanged, ChangePhaseError> {
-    let mut tx = conn.begin().await?;
+    let mut tx = db.begin().await?;
     let mut operating = Operating {
         tx: &mut tx,
         campaign_id,
@@ -275,26 +283,26 @@ pub async fn pause_campaign(
             draining: 0,
         })
         .map_err(|OperatorError(error)| error);
-    end_transaction(tx, paused).await
+    end_db_transaction(tx, paused).await
 }
 
 /// Resume a paused campaign, or move a canary whose item is done on to
 /// rolling. With `retry_failed`, failed items go back to pending first; see
 /// the module docs for the budget and the phase a resume goes to. Opens a
-/// transaction, or a savepoint inside the caller's.
+/// transaction on `db`.
 ///
-/// The caller's transaction must run at `READ COMMITTED`, Postgres's
-/// default. Under `REPEATABLE READ` or `SERIALIZABLE` its snapshot can
-/// predate the campaign lock, so the budget check could count failures as
-/// they were before an outcome committed, and a retry would miss items that
-/// failed since.
+/// The transaction must run at `READ COMMITTED`, Postgres's default;
+/// `db.begin()` sets no isolation level of its own. Under `REPEATABLE READ`
+/// or `SERIALIZABLE` its snapshot can predate the campaign lock, so the
+/// budget check could count failures as they were before an outcome
+/// committed, and a retry would miss items that failed since.
 pub async fn resume_campaign(
-    conn: impl Acquire<'_, Database = Postgres>,
+    db: &Db,
     campaign_id: CampaignId,
     change: &PhaseChange,
     retry_failed: bool,
 ) -> Result<PhaseChanged, ChangePhaseError> {
-    let mut tx = conn.begin().await?;
+    let mut tx = db.begin().await?;
     let mut operating = Operating {
         tx: &mut tx,
         campaign_id,
@@ -310,7 +318,7 @@ pub async fn resume_campaign(
                 draining: 0,
             })
             .map_err(|OperatorError(error)| error);
-    end_transaction(tx, resumed).await
+    end_db_transaction(tx, resumed).await
 }
 
 /// Abort an unfinished campaign (canary, rolling or paused); see the module
@@ -325,9 +333,9 @@ pub async fn abort_campaign(
     campaign_id: CampaignId,
     change: &PhaseChange,
 ) -> Result<PhaseChanged, ChangePhaseError> {
-    let mut tx = conn.begin().await?;
+    let mut tx = conn.begin().await.map_err(DbError::from)?;
     let mut operating = Operating {
-        tx: &mut tx,
+        tx: &mut *tx,
         campaign_id,
         actor: change.actor,
     };

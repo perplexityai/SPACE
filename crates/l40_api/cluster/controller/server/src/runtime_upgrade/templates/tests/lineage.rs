@@ -37,7 +37,13 @@ async fn a_derived_template_is_twinned_after_its_base() -> TestResult {
         "the base's twin comes first"
     );
 
-    store::resume_campaign(fixture.pool(), campaign, &PhaseChange::default(), false).await?;
+    store::resume_campaign(
+        &Db::from(fixture.pool().clone()),
+        campaign,
+        &PhaseChange::default(),
+        false,
+    )
+    .await?;
     for _ in 0..3 {
         fixture.tick(&reconciler).await;
     }

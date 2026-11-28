@@ -14,6 +14,7 @@
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 
 use pplx_space_sandbox_routability::routable_execution_or_non_k8s;
@@ -35,10 +36,10 @@ use uuid::Uuid;
 /// owner. No locking read precedes it; the `UPDATE` itself locks the row, so
 /// it can wait on a concurrent holder of that lock.
 pub async fn complete_wake(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     enforce_published_suspend_fence: bool,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let completed = sqlx::query_scalar::<_, bool>(sql!(
         "UPDATE sandboxes
             SET lifecycle = 'started', placement = 'on_node'
@@ -60,7 +61,7 @@ pub async fn complete_wake(
     ))
     .bind(sandbox_id)
     .bind(enforce_published_suspend_fence)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(completed.is_some())
 }
@@ -92,7 +93,7 @@ fn fenced_completion_cas() -> String {
 }
 
 /// Complete a wake whose request was cancelled mid-flight, once the redrive
-/// found its execution routable ([`fenced_completion_cas`]). Returns whether
+/// found its execution routable (`fenced_completion_cas`). Returns whether
 /// the row flipped; `false` means the row moved on, a restore lease is still
 /// live, or the execution was replaced after the redrive checked it.
 ///
@@ -100,13 +101,13 @@ fn fenced_completion_cas() -> String {
 /// in `restoring`. Every precondition is re-checked in the `WHERE`; the caller
 /// holds no lock.
 pub async fn complete_redriven_wake(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let claimed = sqlx::query(sqlx::AssertSqlSafe(sql!(fenced_completion_cas())))
         .bind(sandbox_id)
         .bind(SubstrateKind::Kubernetes)
-        .execute(executor)
+        .execute(executor.into_sqlx())
         .await?;
     Ok(claimed.rows_affected() > 0)
 }
@@ -123,16 +124,16 @@ pub async fn complete_redriven_wake(
 /// another access already cleared; callers re-read the lifecycle to tell them
 /// apart.
 pub async fn clear_command_ready_pending(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "UPDATE sandboxes
              SET command_ready_pending = FALSE
              WHERE id = $1 AND lifecycle = 'started' AND command_ready_pending"
     ))
     .bind(sandbox_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -148,11 +149,11 @@ pub async fn clear_command_ready_pending(
 /// the lease token and its expiry only; the caller holds the sandbox row lock
 /// and has re-checked the lifecycle in the same transaction.
 pub async fn renew_restore_lease_for_execution_claim(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     restore_lease_token: Uuid,
     ttl_secs: i64,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let renewed = sqlx::query_scalar::<_, bool>(sql!(
         "UPDATE sandboxes
                     SET restore_lease_expires_at =
@@ -165,7 +166,7 @@ pub async fn renew_restore_lease_for_execution_claim(
     .bind(sandbox_id)
     .bind(restore_lease_token)
     .bind(ttl_secs)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(renewed.is_some())
 }
@@ -179,10 +180,10 @@ pub async fn renew_restore_lease_for_execution_claim(
 /// row lock and on the caller having just recorded the node on a still-active
 /// execution in the same transaction.
 pub async fn record_pod_node_placement(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     node_id: NodeId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE sandboxes
                      SET active_node_id = $1,
@@ -198,7 +199,7 @@ pub async fn record_pod_node_placement(
     ))
     .bind(node_id)
     .bind(sandbox_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }

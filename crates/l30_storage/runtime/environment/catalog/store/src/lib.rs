@@ -19,6 +19,7 @@ use std::collections::BTreeSet;
 use pplx_space_accounts::NodeId;
 use pplx_space_content_digest::DigestParseError;
 use pplx_space_execution_spec::EnvironmentReference;
+use pplx_space_postgres_pool::{Db, DbError, Executor};
 use pplx_space_sql_locator::sql;
 
 mod certifications;
@@ -66,7 +67,7 @@ pub enum ListUnretiredError {
         source: DigestParseError,
     },
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 }
 
 /// The unretired catalog environments `node_id` should install: the recipe
@@ -79,23 +80,19 @@ pub enum ListUnretiredError {
 /// new build wrote. Takes a pool, since it opens that transaction; takes no
 /// lock.
 pub async fn list_unretired_for_node(
-    pool: &sqlx::PgPool,
+    db: &Db,
     node_id: NodeId,
 ) -> Result<Vec<EnvironmentReference>, ListUnretiredError> {
-    let mut tx = pool.begin().await?;
-    sqlx::query(sql!(
-        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
-    ))
-    .execute(&mut *tx)
-    .await?;
+    let mut tx = db.begin_snapshot().await?;
     let known = sqlx::query_scalar::<_, Option<Vec<String>>>(sql!(
         "SELECT known_environment_refs FROM node_status_snapshots WHERE node_id = $1"
     ))
     .bind(node_id)
-    .fetch_optional(&mut *tx)
-    .await?
+    .fetch_optional((&mut tx).into_sqlx())
+    .await
+    .map_err(DbError::from)?
     .flatten();
-    let recipe = list_unretired_within(&mut *tx, known.as_deref()).await?;
+    let recipe = list_unretired_within(&mut tx, known.as_deref()).await?;
     tx.commit().await?;
     Ok(recipe)
 }
@@ -108,7 +105,7 @@ pub async fn list_unretired_for_node(
 /// every node at once. The publication path samples this recipe's size, so the
 /// served recipe and its alert share one rule. Takes no lock.
 pub async fn list_unretired_within(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     known: Option<&[String]>,
 ) -> Result<Vec<EnvironmentReference>, ListUnretiredError> {
     let rows = sqlx::query_scalar::<_, String>(sql!(
@@ -119,8 +116,9 @@ pub async fn list_unretired_within(
          ORDER BY environment_ref"
     ))
     .bind(known)
-    .fetch_all(executor)
-    .await?;
+    .fetch_all(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     rows.into_iter()
         .map(|value| {
             value
@@ -136,9 +134,9 @@ pub async fn list_unretired_within(
 /// isn't in the catalog. One query however many edges. Accepts a pool or a
 /// transaction connection; takes no lock.
 pub async fn upgrade_edges_certified(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     edges: &[(EnvironmentReference, EnvironmentReference)],
-) -> Result<Vec<bool>, sqlx::Error> {
+) -> Result<Vec<bool>, DbError> {
     if edges.is_empty() {
         return Ok(Vec::new());
     }
@@ -161,7 +159,7 @@ pub async fn upgrade_edges_certified(
     ))
     .bind(sources)
     .bind(targets)
-    .fetch_all(executor)
+    .fetch_all(executor.into_sqlx())
     .await?;
     let mut answers = vec![false; edges.len()];
     for position in certified {
@@ -178,16 +176,16 @@ pub async fn upgrade_edges_certified(
 /// Which of `environments` the catalog holds as retired. Accepts a pool or a
 /// transaction connection; takes no lock.
 pub async fn retired_among(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     environments: &[String],
-) -> Result<BTreeSet<String>, sqlx::Error> {
+) -> Result<BTreeSet<String>, DbError> {
     let retired = sqlx::query_scalar::<_, String>(sql!(
         "SELECT environment_ref
          FROM runtime_environments
          WHERE environment_ref = ANY($1) AND retired_at IS NOT NULL"
     ))
     .bind(environments)
-    .fetch_all(executor)
+    .fetch_all(executor.into_sqlx())
     .await?;
     Ok(retired.into_iter().collect())
 }
@@ -210,17 +208,17 @@ pub struct CatalogEnvironmentRow {
 /// the text of `environment_ref`. Accepts a pool or a transaction connection;
 /// takes no lock.
 pub async fn unretired_environments(
-    executor: impl sqlx::PgExecutor<'_>,
-) -> Result<Vec<CatalogEnvironmentRow>, sqlx::Error> {
-    sqlx::query_as::<_, CatalogEnvironmentRow>(sql!(
+    executor: impl Executor<'_>,
+) -> Result<Vec<CatalogEnvironmentRow>, DbError> {
+    Ok(sqlx::query_as::<_, CatalogEnvironmentRow>(sql!(
         "SELECT environment_ref, runtime, runtime_version, kernel_version,
                 state_format_name, state_format_version, upgrade_edges, memory_edges
            FROM runtime_environments
           WHERE retired_at IS NULL
           ORDER BY environment_ref"
     ))
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 #[cfg(test)]

@@ -112,7 +112,7 @@ async fn a_key_revoked_after_its_lookup_keeps_its_last_used_at() -> TestResult {
         .bind(id)
         .fetch_one(pool)
         .await?;
-    // Revoked as the admin key store revokes, before the use is recorded.
+    // Revoked as `api_keys::revoke_organization_api_key` revokes, before the use is recorded.
     sqlx::query(sql!(
         "UPDATE api_keys
             SET revoked_at = NOW(),

@@ -56,3 +56,35 @@ fn slot_vocabularies_round_trip_through_text() {
     "sick".parse::<SlotHealth>().unwrap_err();
     "borrowed".parse::<LeaseKind>().unwrap_err();
 }
+
+/// A migrated in-memory node-manager database.
+pub(crate) fn migrated_db() -> Connection {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    for migration in database::MIGRATOR
+        .iter()
+        .filter(|migration| migration.migration_type.is_up_migration())
+    {
+        conn.execute_batch(migration.sql.as_ref()).unwrap();
+    }
+    Connection(conn)
+}
+
+#[test]
+fn retire_execution_leaves_a_newer_execution_bound() {
+    use pplx_space_node_mgr_protocol::execution_fence::ExecutionFence;
+    use pplx_space_sandbox_model::SandboxActivationAttemptId;
+
+    let conn = migrated_db();
+    let stale = SandboxActivationAttemptId::new();
+    let fence = ExecutionFence::new(SandboxActivationAttemptId::new(), Some(stale));
+    executions::bind_execution(&conn, "sbx", fence).unwrap();
+
+    assert!(!executions::retire_execution(&conn, "sbx", stale).unwrap());
+    assert_eq!(
+        executions::execution_fence(&conn, "sbx").unwrap(),
+        Some(fence)
+    );
+
+    assert!(executions::retire_execution(&conn, "sbx", fence.current()).unwrap());
+    assert_eq!(executions::execution_fence(&conn, "sbx").unwrap(), None);
+}

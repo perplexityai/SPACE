@@ -25,7 +25,6 @@ use pplx_space_execution_spec::DiskIoLimits;
 use pplx_space_net_common::TlsInterception;
 use pplx_space_public_api::OperationId;
 use pplx_space_sandbox_store::{self as sandbox_store, delete::delete_with_dependents};
-use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::ReconcileReason;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{
@@ -72,6 +71,7 @@ async fn finalize_created_sandbox(
         restore_operation_id.map(|operation_id| operation_id.as_uuid()),
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 struct PooledCreateInput<'a> {
@@ -381,23 +381,12 @@ pub(crate) async fn org_byok_enabled(
     pool: &PgPool,
     org_id: OrgId,
 ) -> Result<bool, ControllerError> {
-    let row: Option<(bool,)> =
-        sqlx::query_as(sql!("SELECT byok_enabled FROM organizations WHERE id = $1"))
-            .bind(org_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|err| db_contention_error("failed to read org BYOK flag", &err))?;
-    Ok(row.map(|(enabled,)| enabled).unwrap_or(false))
-}
-
-/// The owner org's encryption flag, or `None` when the org row is missing.
-/// For decisions that must fail closed on an unknown org, unlike
-/// [`org_byok_enabled`].
-async fn org_encryption_flag(pool: &PgPool, org_id: OrgId) -> Result<Option<bool>, sqlx::Error> {
-    sqlx::query_scalar(sql!("SELECT byok_enabled FROM organizations WHERE id = $1"))
-        .bind(org_id)
-        .fetch_optional(pool)
+    let enabled = pplx_space_accounts_store::organizations::organization_byok_enabled(pool, org_id)
         .await
+        .map_err(|err| {
+            db_contention_error("failed to read org BYOK flag", &sqlx::Error::from(err))
+        })?;
+    Ok(enabled.unwrap_or(false))
 }
 
 /// Cluster-wide opt-in for stamping `volume_encryption` on new sandboxes.
@@ -722,6 +711,7 @@ async fn original_pool_assignment(
         pplx_space_execution_catalog::catalog::initial_environment_reference(),
     )
     .await
+    .map_err(sqlx::Error::from)
     .map_err(|err| db_contention_error("failed to read the release's original", &err))?;
     match original {
         Some(original) => enabled_pool_assignment(pool, original).await,
@@ -859,9 +849,10 @@ fn federated_service_grant_store_error(
                 "grant renewal is older than the stored, already-expired grant; re-mint and retry",
             )
         }
-        crate::federated_identity::FederatedGrantStoreError::Upsert(err) => {
-            db_contention_error("failed to upsert sandbox federated service grant", &err)
-        }
+        crate::federated_identity::FederatedGrantStoreError::Upsert(err) => db_contention_error(
+            "failed to upsert sandbox federated service grant",
+            &sqlx::Error::from(err),
+        ),
     }
 }
 
@@ -1110,7 +1101,10 @@ impl SandboxController {
         let Ok(boot_mode) = CreateBootMode::from_api(req.boot_mode.as_deref(), false) else {
             return AdmissionPoolPlan::Ineligible;
         };
-        match org_encryption_flag(pool, org_id).await {
+        // Fails closed on an unknown org, unlike `org_byok_enabled`.
+        match pplx_space_accounts_store::organizations::organization_byok_enabled(pool, org_id)
+            .await
+        {
             Ok(Some(false)) => {}
             Ok(Some(true) | None) => return AdmissionPoolPlan::Ineligible,
             Err(error) => {
@@ -2908,8 +2902,9 @@ impl SandboxController {
             .begin()
             .await
             .map_err(PooledCreateRollbackError::BeginCleanup)?;
-        delete_with_dependents(&mut tx, sandbox_id)
+        delete_with_dependents(&mut *tx, sandbox_id)
             .await
+            .map_err(sqlx::Error::from)
             .map_err(PooledCreateRollbackError::Cleanup)?;
         tx.commit()
             .await
@@ -2942,10 +2937,9 @@ impl SandboxController {
             runtime_alias,
         )
         .await?;
-        let policy =
-            create_auto_lifecycle_policy(defaults.default_auto_lifecycle.map(|policy| policy.0))?;
+        let policy = create_auto_lifecycle_policy(defaults.default_auto_lifecycle)?;
 
-        let default_network_policy = defaults.network_policy.0;
+        let default_network_policy = defaults.network_policy;
 
         Ok(ResolvedCreateTemplate {
             template_release_id,

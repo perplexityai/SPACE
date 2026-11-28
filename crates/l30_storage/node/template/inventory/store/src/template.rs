@@ -1,11 +1,11 @@
 //! Reads of what the nodes cache of one template, or of a few.
 
 use pplx_space_execution_spec::RuntimeKind;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use pplx_space_template_model::{TemplateDesiredState, TemplateName};
 use serde::de::DeserializeOwned;
-use sqlx::types::Json;
-use sqlx::{FromRow, PgExecutor};
+use sqlx::FromRow;
 
 /// The VM shape a node reports a build of a template was built for, each
 /// value as stored.
@@ -21,7 +21,8 @@ pub struct TemplatePoolObserved {
     pub pool_target: Option<i32>,
     pub pool_current: i32,
     pub pool_pending: i32,
-    pub pool_sandbox_ids: Json<Vec<String>>,
+    #[sqlx(json)]
+    pub pool_sandbox_ids: Vec<String>,
 }
 
 /// One cached build variant (template, hash, runtime) of a template, from
@@ -36,7 +37,8 @@ pub struct TemplateVariant<Snapshots> {
     pub artifact_size_bytes: Option<i64>,
     pub has_base_snapshot: bool,
     pub base_snapshot_size_bytes: Option<i64>,
-    pub snapshots: Json<Snapshots>,
+    #[sqlx(json)]
+    pub snapshots: Snapshots,
     pub vcpu: Option<i32>,
     pub memory_mib: Option<i32>,
     pub disk_size_mb: Option<i32>,
@@ -44,25 +46,25 @@ pub struct TemplateVariant<Snapshots> {
 
 /// How many cached builds of `template_name` nodes report, across nodes.
 pub async fn template_inventory_rows(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &str,
-) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>(sql!(
+) -> Result<i64, DbError> {
+    Ok(sqlx::query_scalar::<_, i64>(sql!(
         "SELECT COUNT(*)::BIGINT FROM node_template_inventory WHERE template_name = $1"
     ))
     .bind(template_name)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// The shape a present template's builds report, preferring a worker's row,
 /// then a builder's, then the latest observed, built and lowest hash. `None`
 /// when no node reports either value.
 pub async fn template_snapshot_shape(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &TemplateName,
-) -> Result<Option<ReleaseShape>, sqlx::Error> {
-    sqlx::query_as::<_, ReleaseShape>(sql!(
+) -> Result<Option<ReleaseShape>, DbError> {
+    Ok(sqlx::query_as::<_, ReleaseShape>(sql!(
         "SELECT nti.vcpu, nti.memory_mib
          FROM node_template_inventory nti
          JOIN nodes n ON n.id = nti.node_id
@@ -78,20 +80,20 @@ pub async fn template_snapshot_shape(
     ))
     .bind(template_name.as_str())
     .bind(TemplateDesiredState::Present.as_str())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The shape of build `content_hash` of `template` for `runtime` (or no
 /// runtime), from a node reporting both values positive: the builder's row
 /// first, then the latest observed. `None` when no node reports one.
 pub async fn release_build_shape(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &TemplateName,
     content_hash: &str,
     runtime: RuntimeKind,
-) -> Result<Option<ReleaseShape>, sqlx::Error> {
-    sqlx::query_as::<_, ReleaseShape>(sql!(
+) -> Result<Option<ReleaseShape>, DbError> {
+    Ok(sqlx::query_as::<_, ReleaseShape>(sql!(
         "SELECT nti.vcpu, nti.memory_mib
          FROM node_template_inventory nti
          JOIN nodes n ON n.id = nti.node_id
@@ -106,8 +108,8 @@ pub async fn release_build_shape(
     .bind(template.as_str())
     .bind(content_hash)
     .bind(runtime.alias())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The execution environment every node holding `content_hash` (either
@@ -115,12 +117,12 @@ pub async fn release_build_shape(
 /// reports it bound to, unparsed. `None` when none does, or when they
 /// disagree.
 pub async fn agreed_build_environment(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &str,
     content_hash: &str,
     excluded: &[String],
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, Option<String>>(sql!(
+) -> Result<Option<String>, DbError> {
+    Ok(sqlx::query_scalar::<_, Option<String>>(sql!(
         "SELECT CASE WHEN COUNT(DISTINCT bindings.environment) = 1
                      THEN MIN(bindings.environment) END
          FROM (
@@ -136,18 +138,18 @@ pub async fn agreed_build_environment(
     .bind(template)
     .bind(content_hash)
     .bind(excluded)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// The warm pool `template_name`'s nodes report, restricted to the build the
 /// newest builder row names when there is one. `None` when no node reports a
 /// pool target.
 pub async fn template_pool_observed(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &TemplateName,
-) -> Result<Option<TemplatePoolObserved>, sqlx::Error> {
-    sqlx::query_as::<_, TemplatePoolObserved>(sql!(
+) -> Result<Option<TemplatePoolObserved>, DbError> {
+    Ok(sqlx::query_as::<_, TemplatePoolObserved>(sql!(
         "WITH builder_metadata AS (
              SELECT nti.content_hash
              FROM node_template_inventory nti
@@ -186,20 +188,20 @@ pub async fn template_pool_observed(
          WHERE observed.pool_target IS NOT NULL"
     ))
     .bind(template_name.as_str())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Every cached build variant of `template_names`, each from its latest
 /// report, by template then newest build.
 pub async fn template_variants<Snapshots>(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_names: &[String],
-) -> Result<Vec<TemplateVariant<Snapshots>>, sqlx::Error>
+) -> Result<Vec<TemplateVariant<Snapshots>>, DbError>
 where
     Snapshots: DeserializeOwned + Send + Unpin + 'static,
 {
-    sqlx::query_as::<_, TemplateVariant<Snapshots>>(sql!(
+    Ok(sqlx::query_as::<_, TemplateVariant<Snapshots>>(sql!(
         "SELECT *
          FROM (
              SELECT DISTINCT ON (template_name, content_hash, COALESCE(runtime, ''))
@@ -226,6 +228,9 @@ where
          ORDER BY template_name ASC, built_at DESC NULLS LAST, content_hash ASC"
     ))
     .bind(template_names)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
+
+#[cfg(test)]
+mod inventory_rows_tests;

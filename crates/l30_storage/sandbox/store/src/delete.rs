@@ -2,15 +2,19 @@
 //! puts the previous lifecycle back when the delete fails, and the hard
 //! delete of the row with the dependents it clears in the same transaction
 //! (observed state, reconcile state and claimed warm-pool slots are deleted,
-//! and snapshot storage locations are detached).
+//! and snapshot storage locations are detached). The observed state and the
+//! reconcile state's observed-status and condition rows are
+//! `pplx-space-sandbox-teardown`'s, and its queued refs
+//! `pplx-space-cluster-trigger-queue`'s; teardown's verbs delete all of them in
+//! the same transaction.
 
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_teardown::{
-    delete_reconcile_state_for_elements, sandbox_reconcile_cleanup_refs,
+    delete_reconcile_state_for_elements, observed_states, sandbox_reconcile_cleanup_refs,
 };
 use pplx_space_sql_locator::sql;
-use sqlx::{Postgres, Transaction};
 
 /// Record a caller's delete intent: set `sandboxes.lifecycle` to `deleting`.
 /// An **intent** write. A missing row writes nothing and is not an error.
@@ -30,17 +34,19 @@ use sqlx::{Postgres, Transaction};
 /// ([`crate::action_stamp`]) and its pooled post-wake update refuse the row.
 /// Other writers can still move it off `deleting` (see
 /// [`restore_lifecycle_from_deleting`]).
-pub async fn mark_deleting(
-    tx: &mut Transaction<'_, Postgres>,
-    sandbox_id: SandboxId,
-) -> Result<(), sqlx::Error> {
+///
+/// The caller must pass its open transaction.
+pub async fn mark_deleting<C>(tx: &mut C, sandbox_id: SandboxId) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "UPDATE sandboxes
          SET lifecycle = 'deleting'
          WHERE id = $1"
     ))
     .bind(sandbox_id)
-    .execute(&mut **tx)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -54,10 +60,10 @@ pub async fn mark_deleting(
 /// gone, or another writer moved it off `deleting`. Telling those apart is the
 /// caller's job.
 pub async fn restore_lifecycle_from_deleting(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     lifecycle: SandboxLifecycle,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let changed = sqlx::query(sql!(
         "UPDATE sandboxes
          SET lifecycle = $2
@@ -65,7 +71,7 @@ pub async fn restore_lifecycle_from_deleting(
     ))
     .bind(sandbox_id)
     .bind(lifecycle.as_str())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected();
     Ok(changed == 1)
@@ -98,25 +104,22 @@ pub async fn restore_lifecycle_from_deleting(
 /// draining a batch of sandboxes, has to bound its own waits first (a
 /// transaction-local `lock_timeout`) and classify the resulting `55P03` as
 /// retryable; otherwise one contended row stalls everything it holds.
-pub async fn delete_with_dependents(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    sandbox_id: SandboxId,
-) -> Result<(), sqlx::Error> {
+///
+/// The caller must pass its open transaction.
+pub async fn delete_with_dependents<C>(tx: &mut C, sandbox_id: SandboxId) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let cleanup_refs = sandbox_reconcile_cleanup_refs(sandbox_id);
-    sqlx::query(sql!(
-        "DELETE FROM sandbox_observed_states WHERE sandbox_id = $1"
-    ))
-    .bind(sandbox_id.as_uuid())
-    .execute(&mut **tx)
-    .await?;
-    delete_reconcile_state_for_elements(tx, &cleanup_refs).await?;
+    observed_states::delete(&mut *tx, sandbox_id).await?;
+    delete_reconcile_state_for_elements(&mut *tx, &cleanup_refs).await?;
     sqlx::query(sql!(
         "UPDATE snapshot_storage_locations
          SET snapshot_id = NULL, orphaned_at = NOW()
          WHERE snapshot_id IN (SELECT id FROM snapshots WHERE sandbox_id = $1)"
     ))
     .bind(sandbox_id.as_uuid())
-    .execute(&mut **tx)
+    .execute((&mut *tx).into_sqlx())
     .await?;
     // Warm-pool slot receipts are not foreign-keyed to `sandboxes` either
     // (the reservation predates the sandbox row), and a receipt whose sandbox
@@ -125,13 +128,13 @@ pub async fn delete_with_dependents(
     // the verb leaves open (`warming`/`ready`) and `cleanup_pending` slots
     // alone.
     pplx_space_cluster_pool::WarmPoolStore::delete_claimed_slots_for_retired_executions(
-        tx,
+        &mut *tx,
         &[sandbox_id],
     )
     .await?;
     sqlx::query(sql!("DELETE FROM sandboxes WHERE id = $1"))
         .bind(sandbox_id.as_uuid())
-        .execute(&mut **tx)
+        .execute(tx.into_sqlx())
         .await?;
     Ok(())
 }

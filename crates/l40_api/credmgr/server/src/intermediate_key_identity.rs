@@ -15,13 +15,14 @@
 //! none — the provider decides whether that is fatal.
 
 use pplx_space_accounts::{FederatedGrantAudience, OrgId};
+use pplx_space_accounts_store::{OrganizationOwner, organizations};
 use pplx_space_federated_grant_store::{
     FreshestLiveFederatedGrant, FreshestLiveFederatedGrantError, freshest_live_federated_grant,
     live_federated_grant_prefer_sandbox,
 };
 use pplx_space_federated_identity::FEDERATED_OWNER_GRANT_PURPOSE;
+use pplx_space_postgres_pool::{Db, DbError};
 use pplx_space_sandbox_model::SandboxId;
-use pplx_space_sql_locator::sql;
 
 /// `organizations.owner_source` for an org whose identity came from a trusted upstream client.
 const FEDERATED_IDENTITY_OWNER_SOURCE: &str = "federated_identity";
@@ -77,7 +78,7 @@ pub enum IdentityLookupError {
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityLookupUnavailable {
     #[error("organization identity query failed: {0}")]
-    OrganizationQuery(#[source] sqlx::Error),
+    OrganizationQuery(#[source] DbError),
     #[error(transparent)]
     FederatedGrant(#[from] FreshestLiveFederatedGrantError),
 }
@@ -126,12 +127,12 @@ impl IntermediateKeyIdentityLookup for SpaceIntermediateKeyIdentity {
 
 /// Reads the org's owner identity and its freshest live grant from Postgres.
 pub struct PgIntermediateKeyIdentityLookup {
-    pool: sqlx::PgPool,
+    pool: Db,
     grant_audience: FederatedGrantAudience,
 }
 
 impl PgIntermediateKeyIdentityLookup {
-    pub fn new(pool: sqlx::PgPool, grant_audience: FederatedGrantAudience) -> Self {
+    pub fn new(pool: Db, grant_audience: FederatedGrantAudience) -> Self {
         Self {
             pool,
             grant_audience,
@@ -142,20 +143,20 @@ impl PgIntermediateKeyIdentityLookup {
         &self,
         org: OrgId,
     ) -> Result<Option<String>, IdentityLookupError> {
-        let owner: Option<(String, Option<String>)> = sqlx::query_as(sql!(
-            "SELECT owner_source, upstream_org_id FROM organizations WHERE id = $1"
-        ))
-        .bind(org.as_uuid())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|error| {
-            IdentityLookupError::unavailable(
-                org,
-                IdentityLookupUnavailable::OrganizationQuery(error),
-            )
-        })?;
+        let owner = organizations::organization_owner(&self.pool, org)
+            .await
+            .map_err(|error| {
+                IdentityLookupError::unavailable(
+                    org,
+                    IdentityLookupUnavailable::OrganizationQuery(error),
+                )
+            })?;
 
-        let Some((owner_source, upstream_org_id)) = owner else {
+        let Some(OrganizationOwner {
+            owner_source,
+            upstream_org_id,
+        }) = owner
+        else {
             return Ok(None);
         };
         if owner_source != FEDERATED_IDENTITY_OWNER_SOURCE {

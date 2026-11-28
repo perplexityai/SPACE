@@ -1,27 +1,25 @@
 use pplx_space_accounts::NodeId;
 
 use pplx_space_sandbox_model::SandboxId;
-use pplx_space_sql_locator::sql;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use pplx_space_postgres_pool::Executor;
 use sqlx::PgPool;
 
 use pplx_space_sandbox_store::delete::delete_with_dependents;
 use pplx_space_sandbox_store::fork_source_lifecycle::{
     active_fork_source_operation_exists, lock_fork_source_lifecycle,
 };
+use pplx_space_sandbox_store::orphan::lock_orphan_observation;
 
-pub use pplx_space_sandbox_teardown::{
-    delete_reconcile_state_for_elements, sandbox_reconcile_cleanup_refs,
-};
 pub use pplx_space_state_reconciliation::{
     NetworkPolicyTarget, ReconcileElementRef, ReconcileFacet, ReconcileReason, ReconcileRef,
 };
 
-use crate::reconcile_trigger::{enqueue_triggers, enqueue_triggers_tx};
 use pplx_space_cluster_trigger_queue::{
-    QueuedReconcileRefs, QueuedRefConflict, queue_node_reconcile_refs,
+    QueuedReconcileRefs, QueuedRefConflict, enqueue_triggers, enqueue_triggers_tx,
+    queue_node_reconcile_refs,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -71,6 +69,12 @@ pub enum FinalizeSandboxDbDeleteError {
     Db(#[from] sqlx::Error),
 }
 
+impl From<pplx_space_postgres_pool::DbError> for FinalizeSandboxDbDeleteError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 /// Variant of [`finalize_sandbox_db_delete`] safe for user-facing
 /// DELETEs: refuses to orphan storage-location rows while any
 /// `snapshots` row for the sandbox is in `state='creating'`. See
@@ -78,7 +82,13 @@ pub enum FinalizeSandboxDbDeleteError {
 ///
 /// ## Concurrency
 ///
-/// Takes a `FOR UPDATE` lock on the parent `sandboxes` row first.
+/// Serializes with node-state publication before taking any row locks:
+/// publication can write observed state before it updates the sandbox row,
+/// or remove observed state before locking an absent stopped Direct sandbox.
+/// Finalization locks the sandbox row before deleting observed state and does
+/// not require the caller to have marked the sandbox `deleting`.
+///
+/// Takes a `FOR UPDATE` lock on the parent `sandboxes` row before checking uploads.
 /// PostgreSQL's foreign-key enforcement makes a concurrent
 /// `INSERT INTO snapshots (sandbox_id, …)` take an implicit
 /// `FOR KEY SHARE` lock on the same row; `FOR UPDATE` conflicts with
@@ -102,17 +112,15 @@ pub async fn finalize_sandbox_db_delete_user_initiated(
     sandbox_id: SandboxId,
 ) -> Result<(), FinalizeSandboxDbDeleteError> {
     let mut tx = pool.begin().await?;
-    lock_fork_source_lifecycle(&mut tx, sandbox_id).await?;
+    lock_orphan_observation(&mut *tx, sandbox_id).await?;
+    lock_fork_source_lifecycle(&mut *tx, sandbox_id).await?;
     // Lock the parent sandbox row to serialize against any
     // concurrent BeginArtifactBackup INSERT (which acquires the
     // implicit FK FOR KEY SHARE on this row). Result is discarded —
     // if the sandbox doesn't exist (already deleted), the
     // subsequent delete_with_dependents deletes no `sandboxes` row
     // and only clears any dependent rows left for this id.
-    sqlx::query(sql!("SELECT 1 FROM sandboxes WHERE id = $1 FOR UPDATE"))
-        .bind(sandbox_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+    pplx_space_sandbox_store::row_locks::lock_exists(&mut *tx, sandbox_id).await?;
     // Under the parent-row lock above, no new `creating` row can
     // appear between this SELECT and the orphan UPDATE inside
     // `delete_with_dependents`. A plain SELECT (no row lock)
@@ -125,10 +133,10 @@ pub async fn finalize_sandbox_db_delete_user_initiated(
         // ROLLBACK explicitly — sqlx will roll back on drop.
         return Err(FinalizeSandboxDbDeleteError::InFlightSuspendUpload { idle_for });
     }
-    if active_fork_source_operation_exists(&mut tx, sandbox_id).await? {
+    if active_fork_source_operation_exists(&mut *tx, sandbox_id).await? {
         return Err(FinalizeSandboxDbDeleteError::ForkInProgress);
     }
-    delete_with_dependents(&mut tx, sandbox_id).await?;
+    delete_with_dependents(&mut *tx, sandbox_id).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -138,7 +146,7 @@ pub async fn finalize_sandbox_db_delete(
     sandbox_id: SandboxId,
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    delete_with_dependents(&mut tx, sandbox_id).await?;
+    delete_with_dependents(&mut *tx, sandbox_id).await?;
     tx.commit().await
 }
 
@@ -254,8 +262,8 @@ fn normalized_refs(refs: &[ReconcileRef]) -> Vec<(String, String)> {
         .collect()
 }
 
-async fn enqueue_node_reconcile_refs_for_nodes_on<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
+async fn enqueue_node_reconcile_refs_for_nodes_on(
+    executor: impl Executor<'_>,
     node_ids: &[NodeId],
     refs: &[(String, String)],
     conflict: QueuedRefConflict,
@@ -288,7 +296,7 @@ async fn enqueue_node_reconcile_refs_for_nodes_on<'e>(
                     crate::metrics::reconcile::queued(facet, "error");
                 }
             }
-            Err(error)
+            Err(sqlx::Error::from(error))
         }
     }
 }
@@ -311,7 +319,7 @@ pub async fn enqueue_node_reconcile_refs_and_trigger_tx(
     reason: ReconcileReason,
 ) -> Result<EnqueuedNodeReconcile, sqlx::Error> {
     let enqueued = enqueue_node_reconcile_refs_tx(tx, node_id, refs).await?;
-    enqueue_triggers_tx(tx, [enqueued.node_id], reason).await?;
+    enqueue_triggers_tx(&mut **tx, [enqueued.node_id], reason).await?;
     Ok(enqueued)
 }
 
@@ -331,13 +339,14 @@ pub async fn enqueue_sandbox_reconcile_tx(
     sandbox_id: SandboxId,
     refs: &[ReconcileRef],
 ) -> Result<Option<EnqueuedNodeReconcile>, sqlx::Error> {
-    let node_id: Option<NodeId> = sqlx::query_scalar(sql!(
-        "SELECT active_node_id FROM sandboxes WHERE id = $1 FOR UPDATE"
-    ))
-    .bind(sandbox_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .flatten();
+    // Keep placement stable through enqueue without blocking foreign-key
+    // checks in a node publication that already holds its reconcile trigger.
+    let node_id: Option<NodeId> =
+        pplx_space_sandbox_store::row_locks::lock_active_node_id_no_key_update(
+            &mut **tx, sandbox_id,
+        )
+        .await?
+        .flatten();
     let Some(node_id) = node_id else {
         return Ok(None);
     };
@@ -367,7 +376,7 @@ pub async fn enqueue_sandbox_reconcile_and_trigger_tx(
 ) -> Result<Option<EnqueuedNodeReconcile>, sqlx::Error> {
     let enqueued = enqueue_sandbox_reconcile_tx(tx, sandbox_id, refs).await?;
     if let Some(enqueued) = enqueued {
-        enqueue_triggers_tx(tx, [enqueued.node_id], reason).await?;
+        enqueue_triggers_tx(&mut **tx, [enqueued.node_id], reason).await?;
         return Ok(Some(enqueued));
     }
     Ok(None)

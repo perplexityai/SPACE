@@ -2,9 +2,12 @@
 //! shared pool configuration, per-connection setup and pool-occupancy
 //! metrics every control-plane service uses, and the lock-contention
 //! classification for errors those pools return.
+//!
+//! It also owns the types store verbs take and return, so their callers never
+//! name the driver: [`Db`], [`Tx`], [`Executor`] and [`DbError`] (see
+//! [`db`]).
 
 use pplx_space_sql_locator::sql;
-use std::num::NonZeroU32;
 use std::time::Duration;
 
 use log::LevelFilter;
@@ -14,8 +17,15 @@ use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 pub mod contention;
+pub mod db;
+mod error;
 pub mod identity;
+mod listener;
 pub mod metrics;
+
+pub use db::{Db, DbOptions, Executor, SavedLockTimeout, Tx, TxSettings};
+pub use error::{DbError, DbErrorKind};
+pub use listener::set_listener_keepalives;
 
 const POOL_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -27,12 +37,12 @@ const DEFAULT_MAX_LIFETIME_SECS: u64 = 30 * 60;
 const DEFAULT_MAX_LIFETIME_JITTER_FRACTION: f64 = 1.0 / 6.0;
 
 /// Password projections for managed application database identities.
-pub const SPACE_DB_USER_PASSWORD_ENV: &str = "SPACE_DB_USER_PASSWORD";
-pub const SPACE_DB_CREDS_PASSWORD_ENV: &str = "SPACE_DB_CREDS_PASSWORD";
+pub(crate) const SPACE_DB_USER_PASSWORD_ENV: &str = "SPACE_DB_USER_PASSWORD";
+pub(crate) const SPACE_DB_CREDS_PASSWORD_ENV: &str = "SPACE_DB_CREDS_PASSWORD";
 
 pub use identity::{
-    CredentialsPool, connect_space_user_pool, connect_space_user_pool_lazy,
-    connect_space_user_sideline_pool_lazy, managed_database_password,
+    CredentialsPool, SidelineOptions, connect_space_user_pool_lazy,
+    connect_space_user_sideline_pool_lazy,
 };
 
 /// Building connection options for a managed database identity failed.
@@ -61,7 +71,7 @@ pub enum DatabaseConnectOptionsError {
 /// `application_name` (the caller's service name) is stamped on every
 /// connection so `pg_stat_activity` and server logs attribute connections to
 /// the owning service when debugging pool or server-side saturation.
-pub fn database_connect_options(
+pub(crate) fn database_connect_options(
     database_url: &str,
     application_name: &str,
     identity: DatabaseIdentity,
@@ -105,7 +115,7 @@ fn service_connect_options(
     )
 }
 
-/// Connect a managed Postgres identity with the shared pool configuration.
+/// Prepare a managed Postgres identity pool without waiting for a connection.
 ///
 /// One generic pool knob per setting, set per-Deployment in Helm (env is
 /// per-container, so per-service env names add nothing):
@@ -116,120 +126,63 @@ fn service_connect_options(
 /// `POSTGRES_POOL_ACQUIRE_TIMEOUT_SECS` (default 5),
 /// `POSTGRES_POOL_IDLE_TIMEOUT_SECS` (default 300),
 /// `POSTGRES_POOL_MAX_LIFETIME_SECS` (default 1800), and
-/// `POSTGRES_POOL_MAX_LIFETIME_JITTER_FRACTION` (default 1/6).
-///
-/// Every statement emits a query-completion event; see
-/// [`QUERY_EVENT_LEVEL`].
-pub async fn connect_postgres_as(
-    database_url: &str,
-    application_name: &str,
-    identity: DatabaseIdentity,
-    password: &str,
-) -> Result<PgPool, ConnectPostgresAsError> {
-    let options = service_connect_options(database_url, application_name, identity, password)?;
-    postgres_pool_options(identity)
-        .connect_with(options)
-        .await
-        .map_err(ConnectPostgresAsError::Connect)
-}
-
-/// Connecting a managed Postgres identity failed.
-#[derive(Debug, thiserror::Error)]
-pub enum ConnectPostgresAsError {
-    #[error(transparent)]
-    Options(#[from] DatabaseConnectOptionsError),
-    #[error("failed to connect Postgres pool")]
-    Connect(#[source] sqlx::Error),
-}
-
-/// Prepare a managed Postgres identity pool whose connection ceiling is capped
-/// at `max_connections`, ignoring `POSTGRES_POOL_MAX_CONNECTIONS`.
-///
-/// For a *sideline* workload: one that shares a database with a service's
-/// load-bearing pool but must never be able to starve it. A sideline sharing
-/// the general pool can do exactly that without ever failing itself — if its
-/// statements block (a relation lock taken by DDL is the usual way), each one
-/// holds a connection until the role's `statement_timeout` fires, and once the
-/// general pool is drained the *load-bearing* queries start failing their
-/// acquire even though nothing is wrong with them. A separate small pool turns
-/// that cross-workload failure into a self-contained one: the sideline's own
-/// acquires fail, its caller degrades, and the general pool is untouched.
-///
-/// Size it to the sideline's steady-state concurrency, not its peak — the
-/// point is the ceiling. `NonZeroU32` because a zero cap is the one value with
-/// no useful meaning and a silent failure mode: sqlx validates nothing, so the
-/// pool would start, never yield a connection, and burn the full acquire
-/// timeout on every request while the caller degraded forever. A cap computed
-/// at a call site (`replicas / n`, a parsed env default) can reach zero, so the
-/// type refuses it rather than a runtime check nobody writes. Every other knob matches [`connect_postgres_as`], and
-/// `min_connections` is clamped to the cap so a large
-/// `POSTGRES_POOL_MIN_CONNECTIONS` cannot exceed it.
-///
-/// `statement_timeout`, when set, is applied per connection as a session
-/// setting for this pool alone. That is the piece a connection cap cannot
-/// provide: the cap bounds how much of the database's capacity a blocked
-/// sideline can hold, but each blocked statement still runs to the *role's*
-/// `statement_timeout` (10s for `space_user`), and its caller waits that long.
-/// A pool-scoped setting cancels server-side — no abandoned statement, no
-/// dropped future, and no effect on any other pool using the same role.
-pub fn connect_postgres_lazy_as_capped(
-    database_url: &str,
-    application_name: &str,
-    identity: DatabaseIdentity,
-    password: &str,
-    max_connections: NonZeroU32,
-    statement_timeout: Option<Duration>,
-) -> Result<PgPool, DatabaseConnectOptionsError> {
-    let max_connections = max_connections.get();
-    let options = service_connect_options(database_url, application_name, identity, password)?;
-    let pool_options = postgres_pool_options(identity)
-        .max_connections(max_connections)
-        .min_connections(min_connections_from_env().min(max_connections));
-    let pool_options = match statement_timeout {
-        // Replaces the base `after_connect`, which is a single-slot callback in
-        // sqlx, so the type-cache warm has to be re-run here rather than added
-        // to. Both are per-connection setup, so the cost is unchanged.
-        Some(statement_timeout) => {
-            let timeout_setting = format!("{}ms", statement_timeout.as_millis());
-            pool_options.after_connect(move |conn, _meta| {
-                let timeout_setting = timeout_setting.clone();
-                Box::pin(async move {
-                    // Every base setup step, then the pool-local addition.
-                    // `after_connect` is single-slot, so this override has to
-                    // re-run the shared setup rather than add to it — going
-                    // through `per_connection_setup` is what keeps a future
-                    // step from being silently skipped by capped pools.
-                    per_connection_setup(conn).await?;
-                    // `set_config(..., false)` is session-scoped, which is the
-                    // right lifetime for `after_connect`: it holds for every
-                    // statement this connection serves. Bound as a parameter
-                    // rather than interpolated so the statement stays static.
-                    sqlx::query(sql!("SELECT set_config('statement_timeout', $1, false)"))
-                        .bind(timeout_setting)
-                        .execute(&mut *conn)
-                        .await?;
-                    Ok(())
-                })
-            })
-        }
-        None => pool_options,
-    };
-    Ok(pool_options.connect_lazy_with(options))
-}
-
-/// Prepare a managed Postgres identity pool without waiting for a connection.
-///
-/// Same options and pool knobs as [`connect_postgres_as`]. The minimum pool
-/// floor is established in the background, while configuration errors still
-/// fail eagerly.
+/// `POSTGRES_POOL_MAX_LIFETIME_JITTER_FRACTION` (default 1/6),
+/// except where `options` sets one (see [`DbOptions`]). The minimum pool
+/// floor is established in the background, while configuration errors
+/// still fail eagerly.
 pub fn connect_postgres_lazy_as(
     database_url: &str,
     application_name: &str,
     identity: DatabaseIdentity,
     password: &str,
+    options: DbOptions,
 ) -> Result<PgPool, DatabaseConnectOptionsError> {
-    let options = service_connect_options(database_url, application_name, identity, password)?;
-    Ok(postgres_pool_options(identity).connect_lazy_with(options))
+    let connect_options =
+        service_connect_options(database_url, application_name, identity, password)?;
+    Ok(pool_options_with(identity, options).connect_lazy_with(connect_options))
+}
+
+/// [`postgres_pool_options`] with `options` applied over the env knobs. The
+/// setters run after the env reads, so an explicit setting wins.
+fn pool_options_with(identity: DatabaseIdentity, options: DbOptions) -> PgPoolOptions {
+    let DbOptions {
+        max_connections,
+        statement_timeout,
+    } = options;
+    let mut pool_options = postgres_pool_options(identity);
+    if let Some(max_connections) = max_connections {
+        let max_connections = max_connections.get();
+        pool_options = pool_options
+            .max_connections(max_connections)
+            .min_connections(min_connections_from_env().min(max_connections));
+    }
+    if let Some(statement_timeout) = statement_timeout {
+        // Replaces the base `after_connect`, which is a single-slot callback in
+        // sqlx, so the type-cache warm has to be re-run here rather than added
+        // to. Both are per-connection setup, so the cost is unchanged.
+        let timeout_setting = db::setting_millis(statement_timeout);
+        pool_options = pool_options.after_connect(move |conn, _meta| {
+            let timeout_setting = timeout_setting.clone();
+            Box::pin(async move {
+                // Every base setup step, then the pool-local addition.
+                // `after_connect` is single-slot, so this override has to
+                // re-run the shared setup rather than add to it — going
+                // through `per_connection_setup` is what keeps a future
+                // step from being silently skipped by these pools.
+                per_connection_setup(conn).await?;
+                // `set_config(..., false)` is session-scoped, which is the
+                // right lifetime for `after_connect`: it holds for every
+                // statement this connection serves. Bound as a parameter
+                // rather than interpolated so the statement stays static.
+                sqlx::query(sql!("SELECT set_config('statement_timeout', $1, false)"))
+                    .bind(timeout_setting)
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        });
+    }
+    pool_options
 }
 
 fn postgres_pool_options(identity: DatabaseIdentity) -> PgPoolOptions {
@@ -263,21 +216,21 @@ const fn password_env_for_identity(identity: DatabaseIdentity) -> &'static str {
     }
 }
 
-/// Run a no-op cast query against each custom Postgres enum so sqlx caches
-/// its OID + variant table at connection time. Without this, the first hot-path
-/// request that touches a custom enum pays ~7ms for three pg_catalog
-/// introspection queries (`regtype::oid`, `pg_type`, `pg_enum`) mid-request.
 /// Per-connection setup shared by every pool this module builds.
 ///
 /// The single home for anything that must run on a fresh connection. sqlx's
 /// `after_connect` holds one callback, so a pool that needs its own step (see
-/// [`connect_postgres_lazy_as_capped`]) replaces this hook rather than
+/// [`DbOptions::statement_timeout`]) replaces this hook rather than
 /// extending it — and must call this first. Adding a step here reaches every
 /// pool; inlining one into a caller's own hook does not.
 async fn per_connection_setup(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
     warm_type_cache(conn).await
 }
 
+/// Run a no-op cast query against each custom Postgres enum so sqlx caches
+/// its OID + variant table at connection time. Without this, the first hot-path
+/// request that touches a custom enum pays ~7ms for three pg_catalog
+/// introspection queries (`regtype::oid`, `pg_type`, `pg_enum`) mid-request.
 async fn warm_type_cache(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
     sqlx::query_scalar::<_, Vec<pplx_space_state_reconciliation::ReconcileReason>>(sql!(
         "SELECT ARRAY['sandbox_network_policy_updated'::state_reconciliation_reason]"
@@ -389,7 +342,10 @@ fn parse_positive_env_u64(var: &str, default: u64) -> u64 {
 ///
 /// Successful real-acquire timing comes from SQLx's `sqlx::pool::acquire`
 /// events; this reporter reads state only and never consumes pool capacity.
-pub fn spawn_postgres_pool_metrics_reporter_for_identity(pool: PgPool, identity: DatabaseIdentity) {
+pub(crate) fn spawn_postgres_pool_metrics_reporter_for_identity(
+    pool: PgPool,
+    identity: DatabaseIdentity,
+) {
     let max = pool.options().get_max_connections();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(POOL_METRICS_INTERVAL);

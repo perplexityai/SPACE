@@ -49,7 +49,7 @@ pub struct DecodedStateRow {
     /// The diagnostic rendering of `state_changed_at`.
     pub state_changed_at: Option<String>,
     /// The pinned artifact's capture time, as
-    /// [`crate::db::pinned_local_artifact_created_at`] reports it.
+    /// `crate::db::pinned_local_artifact_created_at` reports it.
     pub pinned_artifact_created_at: Option<EpochSeconds>,
     /// `None` unless the row has an automatic-recovery observation.
     pub recovery_observation: Option<RawQuarantineRecoveryObservationRead>,

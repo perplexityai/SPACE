@@ -144,7 +144,7 @@ impl KubernetesSubstrate {
                     .to_string(),
             });
         }
-        let Some(pod_ip) = assigned_pod_ip(&pod)? else {
+        let Some(pod_ip) = current_pod_ip(&pod, Some(pod_uid), execution.pod_ip.as_deref())? else {
             return Ok(None);
         };
         let live_pod_ip = pod_ip.to_string();
@@ -566,6 +566,18 @@ impl KubernetesSubstrate {
                                     return Err(SubstrateError::Unavailable {
                                         message: format!(
                                             "worker node-api did not accept this API process's credential: {error}"
+                                        ),
+                                    });
+                                }
+                                WakeRpcErrorDisposition::NodeSealed => {
+                                    self.store
+                                        .note_sealed_refusal(sandbox_id, error.message())
+                                        .await;
+                                    return Err(SubstrateError::NodeSealed {
+                                        message: format!(
+                                            "sandbox cannot be woken yet: its node is \
+                                             draining; retry shortly: {}",
+                                            error.message()
                                         ),
                                     });
                                 }

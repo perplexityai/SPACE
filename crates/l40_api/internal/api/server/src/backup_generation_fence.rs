@@ -6,18 +6,8 @@ use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_sandbox_portability::execution_supersession::{
     ExecutionSupersessionRow, execution_generation_superseded,
 };
-use pplx_space_sql_locator::sql;
+use pplx_space_sandbox_store::k8s_executions::backup_generation_fence;
 use tonic::Status;
-
-/// One execution row as the fence's query selects it, decoded by column name
-/// so a reordered `SELECT` can't swap two of the flags.
-#[derive(sqlx::FromRow)]
-struct FenceRow {
-    generation: i64,
-    active: bool,
-    replaced: bool,
-    materialized: bool,
-}
 
 /// Refuse a new execution-bound backup whose generation the control plane has
 /// superseded: a newer execution is active or has materialized a pod, or this
@@ -59,20 +49,10 @@ pub(crate) async fn refuse_superseded_backup_execution(
     sandbox_id: SandboxId,
     generation: ExecutionGeneration,
 ) -> Result<(), Status> {
-    let rows: Vec<FenceRow> = sqlx::query_as(sql!(
-        "SELECT generation, active, state = 'replaced' AS replaced,
-                pod_materialized_at IS NOT NULL OR NULLIF(BTRIM(pod_uid), '') IS NOT NULL
-                    AS materialized
-           FROM sandbox_k8s_executions
-          WHERE sandbox_id = $1
-            AND generation >= $2
-            FOR SHARE"
-    ))
-    .bind(sandbox_id)
-    .bind(generation.get())
-    .fetch_all(&mut **tx)
-    .await
-    .map_err(|e| Status::internal(format!("backup execution lookup: {e}")))?;
+    let rows =
+        backup_generation_fence::share_lock_from_generation(&mut **tx, sandbox_id, generation)
+            .await
+            .map_err(|e| Status::internal(format!("backup execution lookup: {e}")))?;
     let executions: Vec<ExecutionSupersessionRow> = rows
         .into_iter()
         .map(|row| ExecutionSupersessionRow {

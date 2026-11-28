@@ -17,9 +17,10 @@
 //!   ([`insert_unplaced`], [`insert_pooled`], [`update_desired_state`],
 //!   [`set_auto_lifecycle_policy`]) touch `sandboxes` only and re-check
 //!   nothing in their `WHERE` beyond the row's id. A write whose caller
-//!   answers with a row shape this crate does not own, such as the api's
-//!   joined response row, still moves here: the caller reads its shape after
-//!   the verb in the same transaction, as the pooled create does after
+//!   answers with a joined row, such as the api's response row
+//!   ([`direct::sandbox_listing::Sandbox`]), still moves here as its own
+//!   verb: the caller reads that row after the verb in the same transaction,
+//!   as the pooled create does with [`direct::sandbox_listing::by_id`] after
 //!   [`action_stamp::stamp_pooled_post_wake`].
 //! * **Column writes respect the row's triggers.** `sandboxes` carries five
 //!   `BEFORE UPDATE` triggers. `updated_at` is trigger-maintained, so verbs
@@ -43,25 +44,40 @@
 //!   some rows that do not cascade from it (observed state, reconcile state,
 //!   claimed warm-pool slots) have to be deleted, and snapshot storage
 //!   locations detached, in the same transaction. It calls
-//!   `pplx-space-sandbox-teardown` for the reconcile-state rows and
-//!   `pplx-space-cluster-pool` for the slots; the observed-state delete and
-//!   the snapshot-storage detach are written inline, although
+//!   `pplx-space-sandbox-teardown` for the observed-state and
+//!   reconcile-state rows and `pplx-space-cluster-pool` for the slots; the
+//!   snapshot-storage detach is written inline, although
 //!   `snapshot_storage_locations` belongs to `pplx-space-snapshot-store`.
 //!   [`lost::write_off_lost_sandboxes`] reaches past the row too: it deletes
 //!   the gone node's backup-queue rows and retires the active execution of
 //!   the sandboxes it unplaces.
 //!   A transition that is one statement whose CTEs also write a sibling
 //!   table, as several in [`ingest`] do, stays one statement: splitting it
-//!   would change what it does.
+//!   would change what it does. Two of them also write
+//!   `pplx-space-sandbox-teardown`'s tables under temporary co-writer grants:
+//!   [`ingest::recover_published_pause_failed`] clears the observed row's
+//!   failure reason, and [`ingest::prune_census_absent_sandboxes`] deletes
+//!   the observed rows and their network-policy facet rows.
 //! * **Locking reads are not gets.** `SELECT ... FOR UPDATE` acquires a row
 //!   lock inside a caller's transaction; converting one to [`get`] would drop
 //!   the lock. One moves here only as a lock verb: the statement verbatim, on
-//!   the caller's transaction, named and documented as a lock, in a module
-//!   named for the path that takes it (as [`fork_source_lifecycle`] is for
-//!   its advisory lock). The caller keeps its transaction and the re-checks
-//!   it runs under the lock.
-//! * **The node-local SQLite `sandboxes` table** (`crates/l30_storage/sbx/mgr/store`) is a
-//!   different database on a different machine and is out of scope.
+//!   the caller's transaction, named and documented as a lock. The plain
+//!   by-id row locks that several paths share live in [`row_locks`]; a lock
+//!   that carries a guard, joins another table or serves one path lives in a
+//!   module named for that path (as [`fork_source_lifecycle`] is for its
+//!   advisory lock, [`snapshot_retention_claim`] for retention's claim,
+//!   [`snapshot_retention_finalize`] for its finalizer's row lock,
+//!   [`ready_suspend_projection`] for the published suspend projection,
+//!   [`sweeper::lock_placement_changed_at`] for the sweeper's revert,
+//!   [`restore_lease::lock_restore_claim`] for the restore revert,
+//!   [`restore_lease::lock_restore_lease_token`] for the create-claim
+//!   cleanup, [`restore_dispatch_fence::lock_dispatch_ownership`] for the
+//!   restore's Wake dispatch and [`suspend::lock_committed_artifact`] for
+//!   the suspend's pod retirement). The caller keeps its transaction, its
+//!   lock settings and errors, and the re-checks it runs under the lock.
+//! * **The node-local SQLite `sandboxes` table**
+//!   (`crates/l30_storage/sbx/mgr/store`) is a different database on a
+//!   different machine and is out of scope.
 //!
 //! * **Composed predicates are in scope, on terms.** Most verbs here are row
 //!   CRUD, but [`any_undescribed_artifact_owner`] is a question rather than a
@@ -85,25 +101,91 @@
 //!   included. [`k8s_node_attribution`] lists the registered nodes the
 //!   sandbox's placement, latest execution and a named snapshot attribute to
 //!   it, for scoping the storage credentials a node may receive.
+//!   [`spaced_version_counts`] groups the rows and the observed states nodes
+//!   publish by the template, `spaced` version and status the admin list
+//!   shows. [`drain_gate_blockers`] counts the rows that block one node's
+//!   release, and [`node_residents`] the rows node drain's resident scan and
+//!   termination-blocking gate count against it.
 //! * **So are single-question reads.** A read of the `sandboxes` row that
 //!   callers made inline moves here whole, as a module named for the question
-//!   it answers, such as [`restore_pod_owners`] or [`stopped_replacements`].
-//!   Two such modules also read a table another store owns:
-//!   [`active_quarantines`] and [`quarantine_recovery_authority`] join
-//!   `sandbox_quarantine_state`, which belongs to
-//!   `pplx-space-sandbox-quarantine-store`.
+//!   it answers, such as [`restore_pod_owners`],
+//!   [`stale_suspended_executions`], [`stopped_replacements`],
+//!   [`placement_gate`] or [`template_usage`]
+//!   (node drain's are [`drain_evacuation`], [`evacuation_candidates`],
+//!   [`evacuation_restores`], [`pinned_local_only`], [`pod_less_giveup`] and
+//!   [`stopped_evacuations`]), and so does one
+//!   that joins the row to what it references, as [`row_reads::owner`]
+//!   (its organization) and [`debug_reads::record`] (its nodes) do.
+//!   The two restore-lease reads the Direct restore takes before and after
+//!   its claim stay beside that claim in [`direct`].
+//!   Some such modules also read tables another store owns. For example,
+//!   [`active_quarantines`], [`quarantine_recovery_authority`],
+//!   [`quarantine_recovery_candidates`] and the locks in
+//!   [`quarantine_publication`] join `sandbox_quarantine_state`, which
+//!   belongs to `pplx-space-sandbox-quarantine-store`, and
+//!   [`quarantine_publication::lock_pause_failed_recovery_candidates`] also
+//!   locks the joined episode rows (`FOR UPDATE OF s, qs`).
+//!   [`debug_reads::record`] joins `nodes` and `node_k8s`, which belong to
+//!   `pplx-space-node-registration-store`; [`stopped_evacuations`] reads
+//!   `nodes` too, and `snapshots`, which belongs to
+//!   `pplx-space-snapshot-store`. [`pod_less_giveup`], the give-up's
+//!   guards, reads `nodes`' drain columns, and `sandbox_observed_states`,
+//!   which belongs to `pplx-space-sandbox-teardown`; [`drain_evacuation`],
+//!   a v2 drain's evacuation record, reads `node_k8s` for the node's
+//!   Kubernetes name. Both read the snapshot tables through
+//!   `pplx-space-sandbox-portability`'s fragments.
+//!   [`org_storage`] joins the owning organization's row in `organizations`,
+//!   which no store owns yet, for its configured snapshot storage.
+//! * **The api's response row and list pages live in
+//!   [`direct::sandbox_listing`].** They read a sandbox's node from its
+//!   Direct route, and the admin list filters on the node the response
+//!   reports, so they moved there whole; the module shares only its
+//!   projection and join constants, private to it and its children, and
+//!   writes everything else, the page walk included, whole in each
+//!   statement. They also read
+//!   tables this crate does not declare: `users`, `organizations`,
+//!   `templates`, `template_releases`, `template_release_tags`, `nodes`,
+//!   `node_k8s`, `node_direct`, `sandbox_direct_route_identities` and
+//!   `node_facet_observed_status`.
 //! * **Sibling tables get a module each.** The unlocked reads and the
 //!   unguarded steps that callers ran on the sandbox-scoped tables this
 //!   crate declares, mostly inside a larger transaction, move into modules
-//!   named for the table: [`port_exposures`], [`observed_states`],
+//!   named for the table: [`port_exposures`],
 //!   [`snapshot_inventory`], [`node_local_backup_pending`],
 //!   [`ecw_credential_epochs`] and [`k8s_executions`]. [`k8s_executions`]
-//!   holds unlocked reads only: the table's writes, the generation
-//!   allocation and its `FOR UPDATE` reads stay with the execution-ownership
-//!   paths that issue them. A step that is part of a transition statement
-//!   stays in that transition's module. A read of the `sandboxes` row
-//!   alone, such as [`runtime_access`], gets a module named for the
-//!   question it answers.
+//!   holds the table's unlocked reads; its submodules, named for the
+//!   transition or the path that issues them, hold the execution-ownership
+//!   transitions and lock verbs, such as [`k8s_executions::activation_fence`],
+//!   and the callers keep their transactions, lock order and outcome
+//!   decisions (see the [`k8s_executions`] module docs). A step that is part
+//!   of a transition statement stays in that transition's module. The other
+//!   sibling-table modules also hold the guarded writes confined to their
+//!   table, each a statement of its own with its guard whole, such as
+//!   [`port_exposures::record_apply_states`],
+//!   [`port_exposures::mark_applied`] and [`port_exposures::mark_failed`],
+//!   and a step that more than one transition runs, such as
+//!   [`port_exposures::invalidate_open_observations`]. The node-observation
+//!   cache, `sandbox_observed_states` and its facet rows, is
+//!   `pplx-space-sandbox-teardown`'s. [`snapshot_inventory`]'s rows, which
+//!   cascade from the observed rows, stay here. A read of the
+//!   `sandboxes` row alone, such as [`runtime_access`], gets a module named
+//!   for the question it answers.
+//! * **Statements that join a Direct table live under [`direct`].** A
+//!   statement whose main table this crate declares, but which also joins
+//!   one of the Direct substrate's tables (the ones archcheck's
+//!   `pattern_ratchet.direct_tables` names), moves whole into a module
+//!   under [`direct`] named for the question it answers, not into the
+//!   table's module above: that rule lets a storage crate name those
+//!   tables only in its `direct` module. Their callers aren't only the
+//!   Direct substrate: [`direct::route_reads`] serves the api's sandbox
+//!   responses and internal-api-server's data-plane sessions, and
+//!   [`direct::service_route_reset`] internal-api-server's service routes.
+//!   A statement whose main table is `sandbox_observed_states` lives in
+//!   `pplx-space-sandbox-teardown`'s `direct` module instead, as the api's
+//!   observed-state reads and internal-api-server's node publication do.
+//!   [`any_undescribed_artifact_owner`] and
+//!   [`auto_lifecycle_execution`], in this file, are the rule's baselined
+//!   exceptions.
 //!
 //! # Fact kinds
 //!
@@ -132,6 +214,7 @@ use std::time::Duration;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::{
     artifact_has_durable_copy, latest_full_snapshot_ready, restore_retry_source_snapshot_exists,
@@ -148,14 +231,20 @@ pub mod active_quarantines;
 pub mod admin_occupancy;
 pub mod artifact_marker;
 pub mod attribute_runtime;
+pub mod auto_lifecycle_delete_completion;
 pub mod create;
 pub mod debug_reads;
 pub mod delete;
 pub mod deleted_rows;
 pub mod direct;
 pub mod drain;
+pub mod drain_admission;
+pub mod drain_evacuation;
+pub mod drain_gate_blockers;
 pub mod drain_terminate;
 pub mod ecw_credential_epochs;
+pub mod evacuation_candidates;
+pub mod evacuation_restores;
 pub mod fork_source_lifecycle;
 pub mod ingest;
 pub mod intent;
@@ -167,30 +256,45 @@ pub mod node_desired_state;
 pub mod node_holds;
 pub mod node_local_backup_pending;
 pub mod node_placements;
-pub mod observed_states;
+pub mod node_residents;
+pub mod org_storage;
 pub mod orphan;
+pub mod pinned_local_only;
+pub mod placement_gate;
+pub mod pod_less_giveup;
 pub mod pod_tracking;
 pub mod port_exposures;
 pub mod published_quarantine_candidates;
 pub mod quarantine;
+pub mod quarantine_publication;
 pub mod quarantine_recovery_authority;
+pub mod quarantine_recovery_candidates;
+pub mod ready_suspend_projection;
 pub mod repair;
 pub mod restore_dispatch_fence;
 pub mod restore_lease;
 pub mod restore_pod_owners;
 pub mod restore_source;
+pub mod row_locks;
 pub mod row_reads;
 pub mod runtime_access;
 pub mod runtime_population;
 pub mod sandbox_id_bounds;
 pub mod snapshot_capture_fields;
 pub mod snapshot_inventory;
+pub mod snapshot_retention_claim;
+pub mod snapshot_retention_finalize;
+pub mod spaced_version_counts;
+pub mod stale_suspended_executions;
+pub mod started_recovery_source;
+pub mod stopped_evacuations;
 pub mod stopped_replacement_claim;
 pub mod stopped_replacements;
 pub mod stuck;
 pub mod suspend;
 pub mod suspend_reads;
 pub mod sweeper;
+pub mod template_usage;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod tombstone;
@@ -198,12 +302,6 @@ pub mod wake;
 
 pub use create::{SandboxCreate, insert_pooled, insert_unplaced};
 pub use lifecycle::StoredSandboxLifecycle;
-
-/// The nullable `spaced_version` column shared by sandbox observation queries.
-#[derive(Clone, Debug, sqlx::FromRow)]
-pub struct ObservedSpacedVersion {
-    pub spaced_version: Option<pplx_space_semver::SemVer>,
-}
 
 /// The `sandboxes.metadata` document: caller-supplied labels, untyped by
 /// design. Distinct from the validated `SandboxMetadata` newtype in
@@ -221,11 +319,20 @@ pub enum SandboxMetadataValue {
 }
 
 /// A sandbox-store operation failed. A malformed stored row surfaces as a
-/// `sqlx::Error` decode failure, like every other typed column.
+/// [`DbError`] that wraps the driver's decode error, like every other typed
+/// column.
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxStoreError {
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
+}
+
+/// Lets a verb's `?` turn the driver's error into this one, losslessly,
+/// through [`DbError`]'s own conversion.
+impl From<sqlx::Error> for SandboxStoreError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(DbError::from(error))
+    }
 }
 
 /// Migration scaffolding: callers converted to the store one statement at a
@@ -236,7 +343,7 @@ pub enum SandboxStoreError {
 impl From<SandboxStoreError> for sqlx::Error {
     fn from(error: SandboxStoreError) -> Self {
         match error {
-            SandboxStoreError::Database(source) => source,
+            SandboxStoreError::Database(source) => sqlx::Error::from(source),
         }
     }
 }
@@ -273,7 +380,7 @@ pub struct SandboxRecord {
 /// inside a caller's transaction (without taking a lock — see the crate docs
 /// for why `FOR UPDATE` reads are not this verb).
 pub async fn get(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
 ) -> Result<Option<SandboxRecord>, SandboxStoreError> {
     let record = sqlx::query_as::<_, SandboxRecord>(sql!(
@@ -284,7 +391,7 @@ pub async fn get(
          WHERE id = $1"
     ))
     .bind(sandbox_id)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(record)
 }
@@ -308,7 +415,7 @@ pub enum UserSandboxRows {
 
 /// Classify `user_id`'s sandbox rows; see [`UserSandboxRows`].
 pub async fn user_sandbox_rows(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     user_id: UserId,
 ) -> Result<UserSandboxRows, SandboxStoreError> {
     let (live, retained_until) = sqlx::query_as::<_, (Option<bool>, Option<OffsetDateTime>)>(sql!(
@@ -319,7 +426,7 @@ pub async fn user_sandbox_rows(
     ))
     .bind(user_id)
     .bind(DELETED_SANDBOX_RETENTION.as_secs_f64())
-    .fetch_one(executor)
+    .fetch_one(executor.into_sqlx())
     .await?;
     Ok(match (live, retained_until) {
         (Some(true), _) => UserSandboxRows::Live,
@@ -331,14 +438,14 @@ pub async fn user_sandbox_rows(
 /// Whether `org_id` has any `sandboxes` row, deleted ones kept for retention
 /// included: the rows `sandboxes_org_id_fkey` holds the organization by.
 pub async fn org_has_sandbox_rows(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
 ) -> Result<bool, SandboxStoreError> {
     let exists = sqlx::query_scalar(sql!(
         "SELECT EXISTS (SELECT 1 FROM sandboxes WHERE org_id = $1)"
     ))
     .bind(org_id)
-    .fetch_one(executor)
+    .fetch_one(executor.into_sqlx())
     .await?;
     Ok(exists)
 }
@@ -367,7 +474,7 @@ pub struct SandboxNetworkPolicyInputs {
 /// that is not placed there is absent from the result, not an error: the
 /// caller is a node asking about its own set.
 pub async fn network_policy_inputs_placed_on(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     sandbox_ids: &[SandboxId],
 ) -> Result<Vec<SandboxNetworkPolicyInputs>, SandboxStoreError> {
@@ -387,7 +494,7 @@ pub async fn network_policy_inputs_placed_on(
     ))
     .bind(sandbox_ids)
     .bind(node_id)
-    .fetch_all(executor)
+    .fetch_all(executor.into_sqlx())
     .await?;
     Ok(rows)
 }
@@ -405,7 +512,7 @@ pub struct SandboxSnapshotStorage {
 /// migration or restore. A sandbox placed elsewhere is `None`, not an error:
 /// the caller is a node asking about its own set.
 pub async fn snapshot_storage_placed_on(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     node_ids: &[NodeId],
 ) -> Result<Option<SandboxSnapshotStorage>, SandboxStoreError> {
@@ -418,7 +525,7 @@ pub async fn snapshot_storage_placed_on(
     ))
     .bind(sandbox_id)
     .bind(node_ids)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(row)
 }
@@ -481,7 +588,7 @@ pub async fn snapshot_storage_placed_on(
 /// Being a composition rather than a column list is also why this is a
 /// predicate verb rather than a row `get`.
 pub async fn any_undescribed_artifact_owner(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     candidates: &[SandboxId],
 ) -> Result<Option<SandboxId>, SandboxStoreError> {
@@ -528,7 +635,7 @@ pub async fn any_undescribed_artifact_owner(
         sqlx::query_scalar(sqlx::AssertSqlSafe(ANY_UNDESCRIBED_ARTIFACT_OWNER.as_str()))
             .bind(candidates)
             .bind(node_id.as_uuid())
-            .fetch_optional(executor)
+            .fetch_optional(executor.into_sqlx())
             .await?;
     Ok(holding.map(SandboxId::from_uuid))
 }
@@ -547,7 +654,7 @@ pub async fn any_undescribed_artifact_owner(
 /// only holds a release. An older ready snapshot the restore wouldn't select
 /// doesn't count. `false` for a missing sandbox.
 pub async fn durably_restorable(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
 ) -> Result<bool, SandboxStoreError> {
     /// Built once: every input is a literal or a bind placeholder.
@@ -572,7 +679,7 @@ pub async fn durably_restorable(
     Ok(
         sqlx::query_scalar(sqlx::AssertSqlSafe(DURABLY_RESTORABLE.as_str()))
             .bind(sandbox_id)
-            .fetch_one(executor)
+            .fetch_one(executor.into_sqlx())
             .await?,
     )
 }
@@ -640,15 +747,16 @@ pub struct SandboxDesiredStatePatch<'a> {
 /// `updated_at` is deliberately not assigned here. The
 /// `sandboxes_set_updated_at` trigger stamps it, and only when a column
 /// outside `{updated_at, last_used_at, last_access_at, last_command_at,
-/// next_auto_event_at}` actually changed; writing it explicitly makes the trigger return early
-/// and defeats that no-op detection.
+/// next_auto_event_at}` actually changed; writing it explicitly makes the
+/// trigger return early and defeats that no-op detection.
 ///
 /// This row carries four further `BEFORE UPDATE` triggers, two of which
-/// (`sandboxes_clear_restore_lease`, `sandboxes_clear_evacuation_restore_target`)
-/// have no change guard. They fire on any update regardless of which columns
-/// this sets, so an all-`Unchanged` patch is still not a database no-op.
+/// (`sandboxes_clear_restore_lease` and
+/// `sandboxes_clear_evacuation_restore_target`) have no change guard. They
+/// fire on any update regardless of which columns this sets, so an
+/// all-`Unchanged` patch is still not a database no-op.
 pub async fn update_desired_state(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     patch: SandboxDesiredStatePatch<'_>,
 ) -> Result<bool, SandboxStoreError> {
@@ -667,7 +775,7 @@ pub async fn update_desired_state(
     .bind(vcpu)
     .bind(write_memory_mib)
     .bind(memory_mib)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -677,14 +785,14 @@ mod tests;
 
 /// Observe restore ownership using the database clock; this never claims work.
 pub async fn restore_owner_active(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     id: SandboxId,
 ) -> Result<bool, SandboxStoreError> {
     Ok(sqlx::query_scalar::<_, bool>(sql!(
         "SELECT COALESCE(restore_lease_expires_at > NOW(), false) FROM sandboxes WHERE id = $1"
     ))
     .bind(id)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?
     .unwrap_or(false))
 }
@@ -699,7 +807,8 @@ pub struct SandboxActivationObservation {
     /// restore or wake) is queued or running for it.
     pub activation_pending: bool,
     /// The sandbox's stored lifecycle policy, read with the lifecycle.
-    pub auto_lifecycle: sqlx::types::Json<pplx_space_auto_lifecycle::AutoLifecyclePolicy>,
+    #[sqlx(json)]
+    pub auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy,
 }
 
 /// Observe the org's sandbox's lifecycle, policy and pending activation, the
@@ -708,7 +817,7 @@ pub struct SandboxActivationObservation {
 /// behind, never as an old lifecycle with no activation coming. `None` when
 /// the org has no such sandbox. Observation only: it never claims the work.
 pub async fn activation_observation(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     sandbox_id: SandboxId,
     target_id: &str,
@@ -732,13 +841,13 @@ pub async fn activation_observation(
     .bind(sandbox_id)
     .bind(org_id)
     .bind(target_id)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?)
 }
 
 /// Replace desired lifecycle policy and clear its stale published observation.
 pub async fn set_auto_lifecycle_policy(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     id: SandboxId,
     policy: &pplx_space_auto_lifecycle::AutoLifecyclePolicy,
 ) -> Result<bool, SandboxStoreError> {
@@ -748,7 +857,7 @@ pub async fn set_auto_lifecycle_policy(
     ))
     .bind(sqlx::types::Json(policy))
     .bind(id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected()
         == 1)
@@ -758,7 +867,7 @@ pub async fn set_auto_lifecycle_policy(
 /// Read after the claim, so a policy-only update accepted before that claim is
 /// included even when the caller's original sandbox snapshot predates it.
 pub async fn auto_lifecycle_policy(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     id: SandboxId,
 ) -> Result<Option<pplx_space_auto_lifecycle::AutoLifecyclePolicy>, SandboxStoreError> {
     let policy =
@@ -766,7 +875,7 @@ pub async fn auto_lifecycle_policy(
             sql!("SELECT auto_lifecycle_json FROM sandboxes WHERE id = $1"),
         )
         .bind(id)
-        .fetch_optional(executor)
+        .fetch_optional(executor.into_sqlx())
         .await?;
     Ok(policy.map(|policy| policy.0))
 }
@@ -788,7 +897,8 @@ pub struct AutoLifecycleExecution {
     pub execution_generation: Option<i64>,
     pub has_direct_route: bool,
     pub has_activation_lease: bool,
-    pub policy: sqlx::types::Json<pplx_space_auto_lifecycle::AutoLifecyclePolicy>,
+    #[sqlx(json)]
+    pub policy: pplx_space_auto_lifecycle::AutoLifecyclePolicy,
 }
 
 impl AutoLifecycleExecution {
@@ -808,7 +918,7 @@ impl AutoLifecycleExecution {
 }
 
 pub async fn auto_lifecycle_execution(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     id: SandboxId,
 ) -> Result<Option<AutoLifecycleExecution>, SandboxStoreError> {
     Ok(sqlx::query_as::<_, AutoLifecycleExecution>(sql!(
@@ -824,20 +934,20 @@ pub async fn auto_lifecycle_execution(
          WHERE s.id = $1"
     ))
     .bind(id)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?)
 }
 
 /// Immutable operator profile names selected at create.
 /// Tenant policy replacements never write this column.
 pub async fn egress_profiles(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
 ) -> Result<Option<Vec<String>>, SandboxStoreError> {
     Ok(
         sqlx::query_scalar(sql!("SELECT egress_profiles FROM sandboxes WHERE id = $1"))
             .bind(sandbox_id)
-            .fetch_optional(executor)
+            .fetch_optional(executor.into_sqlx())
             .await?,
     )
 }

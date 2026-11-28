@@ -200,3 +200,24 @@ pub async fn retire_executions_predating_current_stop(
     .retire_executions_predating_current_stop(sandbox_id)
     .await
 }
+
+/// The node release that ends
+/// [`KubernetesSubstrate::delete_execution_with_no_active_execution`]: release
+/// `source_node_id` for a `stopped` sandbox the drain has evacuated. It runs the
+/// production statement and transaction
+/// ([`K8sStore::release_stopped_evacuation_placement`]), so another crate's test
+/// that fakes only the pod delete still exercises the real release guard.
+/// `Ok(false)` when the guard refused and nothing changed.
+pub async fn release_stopped_evacuation_placement(
+    pool: PgPool,
+    sandbox_id: SandboxId,
+    source_node_id: pplx_space_accounts::NodeId,
+) -> Result<bool, SubstrateError> {
+    K8sStore::new(
+        pool,
+        TEST_SANDBOX_NAMESPACE.to_string(),
+        ActivationClientAttribution::Enabled,
+    )
+    .release_stopped_evacuation_placement(sandbox_id, source_node_id)
+    .await
+}

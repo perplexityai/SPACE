@@ -96,14 +96,14 @@ async fn provisions_kek_row_and_readable_blob() -> TestResult {
     };
     let org = seed_org(&db.pool).await?;
     let issuer = Arc::new(FakeIssuer::new(false));
-    let provisioner = IntermediateKeyProvisioner::new(db.pool.clone(), issuer.clone());
+    let provisioner = IntermediateKeyProvisioner::new(Db::from(db.pool.clone()), issuer.clone());
 
     let record = provisioner.provision_active_kek(org, None).await?;
     assert_eq!(record.provider, KekProvider::IntermediateKeyBroker);
     assert!(!record.retired);
 
     // The blob round-trips through the read path the unwrap flow uses.
-    let store = PgWrappedIntermediateKeyStore::new(db.pool.clone());
+    let store = PgWrappedIntermediateKeyStore::new(Db::from(db.pool.clone()));
     let blob = store
         .wrapped_key(org, &record.key_identifier)
         .await?
@@ -128,7 +128,7 @@ async fn second_call_adopts_the_existing_kek_without_issuing() -> TestResult {
     };
     let org = seed_org(&db.pool).await?;
     let issuer = Arc::new(FakeIssuer::new(false));
-    let provisioner = IntermediateKeyProvisioner::new(db.pool.clone(), issuer.clone());
+    let provisioner = IntermediateKeyProvisioner::new(Db::from(db.pool.clone()), issuer.clone());
 
     let first = provisioner.provision_active_kek(org, None).await?;
     let second = provisioner.provision_active_kek(org, None).await?;
@@ -153,7 +153,7 @@ async fn concurrent_provisioners_converge_on_one_active_kek() -> TestResult {
     const RACERS: usize = 8;
     let issuer = Arc::new(FakeIssuer::with_barrier(RACERS));
     let provisioner = Arc::new(IntermediateKeyProvisioner::new(
-        db.pool.clone(),
+        Db::from(db.pool.clone()),
         issuer.clone(),
     ));
 
@@ -201,7 +201,7 @@ async fn issue_denial_provisions_nothing() -> TestResult {
     };
     let org = seed_org(&db.pool).await?;
     let issuer = Arc::new(FakeIssuer::new(true));
-    let provisioner = IntermediateKeyProvisioner::new(db.pool.clone(), issuer);
+    let provisioner = IntermediateKeyProvisioner::new(Db::from(db.pool.clone()), issuer);
 
     let err = provisioner
         .provision_active_kek(org, None)
@@ -231,7 +231,7 @@ async fn in_memory_provisioning_is_authority_owned_and_idempotent() -> TestResul
     };
     let org = seed_org(&db.pool).await?;
     let identifier = MasterKeyIdentifier::parse("local-development-key")?;
-    let provisioner = InMemoryKekProvisioner::new(db.pool.clone(), identifier.clone());
+    let provisioner = InMemoryKekProvisioner::new(Db::from(db.pool.clone()), identifier.clone());
 
     let first = provisioner.provision_active_kek(org, None).await?;
     let second = provisioner.provision_active_kek(org, None).await?;

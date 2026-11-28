@@ -1,24 +1,24 @@
 //! Writes of a node's drain columns that check only its id. The caller decides
 //! what to write and holds whatever lock makes that decision current, such as
-//! the admin handlers' `FOR UPDATE` of the node's row; the phase
-//! compare-and-sets stay with their callers.
+//! the admin handlers' `FOR UPDATE` of the node's row; node drain's phase
+//! compare-and-sets (`set_drain_phase`) stay with their caller.
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::NodeDrainMode;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 
 /// Write `message` into `node_id`'s `drain_last_error`, for the node-drain
 /// reconciler to pick up. Returns whether a row was written.
 pub async fn set_drain_last_error(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     message: &str,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!("UPDATE nodes SET drain_last_error = $1 WHERE id = $2"))
         .bind(message)
         .bind(node_id)
-        .execute(executor)
+        .execute(executor.into_sqlx())
         .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -42,10 +42,10 @@ pub struct DrainColumnsUpdate {
 /// Write `update` into `node_id`'s drain columns. Returns whether a row was
 /// written.
 pub async fn update_drain_columns(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     update: DrainColumnsUpdate,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let DrainColumnsUpdate {
         phase,
         set_started_at,
@@ -75,7 +75,7 @@ pub async fn update_drain_columns(
     .bind(clear_started_at)
     .bind(terminate_decrement_capacity)
     .bind(drain_mode)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() > 0)
 }

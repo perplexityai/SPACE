@@ -1,21 +1,27 @@
 //! The `node_status_snapshots` row: what each node last reported about
 //! itself, one row per node.
 //!
-//! One writer predates this store and hasn't moved in yet: the Direct
-//! substrate's own snapshot. What lives here today is the rule for reading
-//! the row's published environments, so every reader asks the same
-//! question; [`upsert_from_publish`], the internal API's write from a
-//! node-state publication; and [`status_summaries`], the admin node
-//! inventory's read.
+//! What lives here is the rule for reading the row's published
+//! environments, so every reader asks the same question;
+//! [`upsert_from_publish`], the internal API's write from a node-state
+//! publication; [`create_failure`], the Direct substrate's write after a
+//! create on a worker failed; [`status_summaries`], the admin node
+//! inventory's read; and [`backup_inventory`], whether a node's pending
+//! backup report is fresh enough for node drain to believe.
 
 use std::fmt;
 use std::str::FromStr;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_execution_spec::ExecutionPolicyObservation;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
+use serde::de::DeserializeOwned;
 use sqlx::types::Json;
 use time::OffsetDateTime;
+
+pub mod backup_inventory;
+pub mod create_failure;
 
 #[cfg(test)]
 mod tests;
@@ -88,9 +94,9 @@ pub struct NodeStatusPublication<'a> {
 /// environment arrays are the statement's clock (`clock_timestamp()`), the
 /// rest the transaction's.
 pub async fn upsert_from_publish(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     publication: &NodeStatusPublication<'_>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     let (usable_environment_refs, known_environment_refs) = match publication.environment_refs {
         EnvironmentRefsWrite::Record { usable, known } => (Some(usable), Some(known)),
         EnvironmentRefsWrite::Preserve | EnvironmentRefsWrite::Clear => (None, None),
@@ -303,35 +309,63 @@ pub async fn upsert_from_publish(
         publication.environment_refs,
         EnvironmentRefsWrite::Preserve
     ))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
 
 /// A node's reachability and health from its snapshot. `services` and
-/// `node_ctl` are JSON the caller decodes as `S` and `C`; a row that doesn't
-/// decode fails the read.
-#[derive(Debug, Clone, sqlx::FromRow)]
+/// `node_ctl` are the snapshot's JSON columns decoded as the caller's `S` and
+/// `C`; a row whose JSON doesn't decode as them fails the read.
+#[derive(Debug, Clone)]
 pub struct NodeStatusSummary<S, C> {
     pub node_id: NodeId,
     pub stale_after: OffsetDateTime,
     pub reachable: bool,
     pub error: Option<String>,
     pub health_healthy: Option<bool>,
-    pub services: Json<S>,
-    pub node_ctl: Option<Json<C>>,
+    pub services: S,
+    pub node_ctl: Option<C>,
+}
+
+/// [`NodeStatusSummary`] as [`status_summaries`] decodes it, its JSON
+/// columns through [`Json`].
+#[derive(sqlx::FromRow)]
+struct NodeStatusSummaryDecodeRow<S, C> {
+    node_id: NodeId,
+    stale_after: OffsetDateTime,
+    reachable: bool,
+    error: Option<String>,
+    health_healthy: Option<bool>,
+    services: Json<S>,
+    node_ctl: Option<Json<C>>,
+}
+
+impl<S, C> From<NodeStatusSummaryDecodeRow<S, C>> for NodeStatusSummary<S, C> {
+    fn from(row: NodeStatusSummaryDecodeRow<S, C>) -> Self {
+        Self {
+            node_id: row.node_id,
+            stale_after: row.stale_after,
+            reachable: row.reachable,
+            error: row.error,
+            health_healthy: row.health_healthy,
+            services: row.services.0,
+            node_ctl: row.node_ctl.map(|json| json.0),
+        }
+    }
 }
 
 /// The snapshots of those of `node_ids` that have one, in no particular
 /// order. Takes no lock.
 pub async fn status_summaries<S, C>(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_ids: &[NodeId],
-) -> Result<Vec<NodeStatusSummary<S, C>>, sqlx::Error>
+) -> Result<Vec<NodeStatusSummary<S, C>>, DbError>
 where
-    NodeStatusSummary<S, C>: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin,
+    S: DeserializeOwned + Send + Unpin + 'static,
+    C: DeserializeOwned + Send + Unpin + 'static,
 {
-    sqlx::query_as::<_, NodeStatusSummary<S, C>>(sql!(
+    Ok(sqlx::query_as::<_, NodeStatusSummaryDecodeRow<S, C>>(sql!(
         "SELECT node_id,
                 stale_after,
                 reachable,
@@ -343,8 +377,11 @@ where
          WHERE node_id = ANY($1)"
     ))
     .bind(node_ids)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?
+    .into_iter()
+    .map(NodeStatusSummary::from)
+    .collect())
 }
 
 /// A boolean SQL predicate, TRUE iff the node status snapshot aliased as

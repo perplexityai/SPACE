@@ -109,7 +109,6 @@ fn completed_push_reuse_is_limited_to_immutable_snapshot_artifacts() {
         pplx_space_common_jobs::DuplicatePolicy::ReuseExisting
     );
 }
-use std::sync::Arc;
 
 #[derive(Clone)]
 struct BlockingExecutor;
@@ -207,23 +206,23 @@ async fn btrfs_resubmission_reuses_live_or_completed_jobs_but_restages_terminal_
             match status {
                 JobStatus::Pending => true,
                 JobStatus::Running => {
-                    assert!(jobs::mark_job_running(&conn, &first_id).unwrap());
+                    assert!(jobs::mark_job_running(conn.raw(), &first_id).unwrap());
                     true
                 }
                 JobStatus::Cancelling | JobStatus::Cancelled => {
-                    jobs::request_job_cancellation(&conn, &first_id).unwrap();
+                    jobs::request_job_cancellation(conn.raw(), &first_id).unwrap();
                     if status == JobStatus::Cancelled {
-                        assert!(jobs::mark_job_cancelled(&conn, &first_id).unwrap());
+                        assert!(jobs::mark_job_cancelled(conn.raw(), &first_id).unwrap());
                     }
                     status == JobStatus::Cancelling
                 }
                 JobStatus::Completed => {
-                    assert!(jobs::mark_job_running(&conn, &first_id).unwrap());
-                    assert!(jobs::complete_job(&conn, &first_id, 42).unwrap());
+                    assert!(jobs::mark_job_running(conn.raw(), &first_id).unwrap());
+                    assert!(jobs::complete_job(conn.raw(), &first_id, 42).unwrap());
                     true
                 }
                 JobStatus::Failed => {
-                    jobs::fail_job_permanent(&conn, &first_id, "upload failed", None).unwrap();
+                    jobs::fail_job_permanent(conn.raw(), &first_id, "upload failed", None).unwrap();
                     false
                 }
             }
@@ -1025,19 +1024,13 @@ fn pull_job_failure_status_preserves_typed_reason_and_retry_semantics() {
     );
 }
 
-fn test_worker() -> (
-    Arc<Mutex<rusqlite::Connection>>,
-    BackgroundWorker<BlockingExecutor>,
-) {
+fn test_worker() -> (SharedConnection, JobWorker<BlockingExecutor>) {
     test_worker_with_active_limit(1)
 }
 
 fn test_worker_with_active_limit(
     active_job_limit: usize,
-) -> (
-    Arc<Mutex<rusqlite::Connection>>,
-    BackgroundWorker<BlockingExecutor>,
-) {
+) -> (SharedConnection, JobWorker<BlockingExecutor>) {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     for migration in pplx_space_volmgr_store::database::COMMON_MIGRATOR
         .iter()
@@ -1045,9 +1038,8 @@ fn test_worker_with_active_limit(
     {
         conn.execute_batch(migration.sql.as_ref()).unwrap();
     }
-    let db = Arc::new(Mutex::new(conn));
-    let worker = BackgroundWorker::new(
-        Arc::clone(&db),
+    let db = SharedConnection::new(pplx_space_volmgr_store::Connection::from_raw(conn));
+    let worker = db.background_worker(
         BlockingExecutor,
         WorkerConfig::new(1, Duration::from_secs(60), 3)
             .with_kind_concurrency(PULL_KIND, 2)
@@ -1079,7 +1071,7 @@ fn transfer_scope_lookup_is_not_hidden_by_newer_terminal_jobs() {
     };
     let conn = db.lock().unwrap();
     pplx_space_common_jobs::db::insert_job(
-        &conn,
+        conn.raw(),
         pplx_space_common_jobs::db::InsertJob {
             job_id: &"019d84bd-280d-7331-99c6-b63377f3a3a5".parse().unwrap(),
             kind: PULL_KIND,
@@ -1092,13 +1084,14 @@ fn transfer_scope_lookup_is_not_hidden_by_newer_terminal_jobs() {
         },
     )
     .unwrap();
-    conn.execute(
+    conn.raw().execute(
         "UPDATE jobs SET created_at = '2000-01-01 00:00:00' WHERE job_id = '019d84bd-280d-7331-99c6-b63377f3a3a5'",
         [],
     )
     .unwrap();
-    conn.execute_batch(
-        "WITH RECURSIVE seq(value) AS (
+    conn.raw()
+        .execute_batch(
+            "WITH RECURSIVE seq(value) AS (
              VALUES(1)
              UNION ALL
              SELECT value + 1 FROM seq WHERE value < 10000
@@ -1107,8 +1100,8 @@ fn transfer_scope_lookup_is_not_hidden_by_newer_terminal_jobs() {
          SELECT printf('terminal-%05d', value), 'pull', 'completed', '{}',
                 printf('2026-01-01 00:00:%05d', value)
            FROM seq;",
-    )
-    .unwrap();
+        )
+        .unwrap();
 
     assert_eq!(
         transfer_scope_job_ids(&conn, scope).unwrap(),
@@ -1169,7 +1162,7 @@ async fn submit_pull_does_not_reuse_job_with_different_materialization() {
     {
         let conn = db.lock().unwrap();
         pplx_space_common_jobs::db::insert_job(
-            &conn,
+            conn.raw(),
             pplx_space_common_jobs::db::InsertJob {
                 job_id: &"019d84bd-280d-7331-99c6-b63377f3a3a6".parse().unwrap(),
                 kind: "pull",
@@ -1193,6 +1186,7 @@ async fn submit_pull_does_not_reuse_job_with_different_materialization() {
     );
     let conn = db.lock().unwrap();
     let count: i64 = conn
+        .raw()
         .query_row("SELECT count(*) FROM jobs", [], |row| row.get(0))
         .unwrap();
     assert_eq!(
@@ -1200,6 +1194,7 @@ async fn submit_pull_does_not_reuse_job_with_different_materialization() {
         "different materialization postconditions need distinct jobs"
     );
     let persisted: String = conn
+        .raw()
         .query_row(
             "SELECT payload FROM jobs WHERE job_id = ?1",
             ["019d84bd-280d-7331-99c6-b63377f3a3a6"],
@@ -1273,6 +1268,7 @@ async fn pull_artifact_does_not_reuse_job_with_different_materialization() {
     let count: i64 = db
         .lock()
         .unwrap()
+        .raw()
         .query_row("SELECT count(*) FROM jobs", [], |row| row.get(0))
         .unwrap();
     assert_eq!(
@@ -1439,6 +1435,7 @@ async fn pull_artifact_retry_blocks_incompatible_legacy_live_job() {
     let count: i64 = db
         .lock()
         .unwrap()
+        .raw()
         .query_row("SELECT count(*) FROM jobs", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 1, "the retry must not enqueue duplicate work");
@@ -1497,8 +1494,8 @@ async fn pull_artifact_retry_allows_scoped_job_after_incompatible_legacy_complet
         .unwrap();
     {
         let conn = db.lock().unwrap();
-        assert!(pplx_space_common_jobs::db::mark_job_running(&conn, &legacy_job).unwrap());
-        assert!(pplx_space_common_jobs::db::complete_job(&conn, &legacy_job, 0).unwrap());
+        assert!(pplx_space_common_jobs::db::mark_job_running(conn.raw(), &legacy_job).unwrap());
+        assert!(pplx_space_common_jobs::db::complete_job(conn.raw(), &legacy_job, 0).unwrap());
     }
     let scoped_assignment = MaterializationAssignment {
         mode: MaterializationMode::Enabled,
@@ -1636,6 +1633,7 @@ async fn protected_priority_pull_is_admitted_when_default_band_is_full() {
     assert_eq!(
         db.lock()
             .unwrap()
+            .raw()
             .query_row(
                 "SELECT priority FROM jobs WHERE job_id = ?1",
                 [reserved],

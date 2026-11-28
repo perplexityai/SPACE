@@ -47,9 +47,12 @@
 //! until it ends, which a drain reports as pending. A rollback that doesn't
 //! restart publishes no artifact, but rewrites the disk a drain may already
 //! have made durable, so it is admitted the same way and holds a token until
-//! it returns. A v2 drain doesn't move a stopped sandbox, so the idle
-//! auto-stop of a suspended sandbox asks [`ActivationSeal::check_without_vm`],
-//! which refuses it on a node known sealed, counting nothing in flight.
+//! it returns. A v2 drain doesn't move a stopped sandbox, so an idle
+//! auto-stop is admitted the same way and holds its token until its state
+//! write commits. It leaves the sandbox without a VM, whether suspended,
+//! started or paused before, so it asks as a producer for a sandbox with no
+//! VM, which a node known sealed refuses. A drain that seals the node while
+//! one runs reports the sandbox pending until it ends.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,10 +68,11 @@ use crate::db::activation_seal::{ActivationSealRecord, write_activation_seal};
 use crate::state::{SandboxState, SandboxStatus};
 
 /// The marker in the `FailedPrecondition` status a sealed node refuses a VM
-/// activation with. The node refuses the same activation until it is
-/// unsealed, so a caller places the work on another node or waits for the
-/// unseal rather than retrying here.
-pub(crate) const ACTIVATIONS_SEALED_MARKER: &str = "node activations are sealed";
+/// activation with, the contract's one definition, which the API matches.
+/// The node refuses the same activation until it is unsealed, so a caller
+/// places the work on another node or waits for the unseal rather than
+/// retrying here.
+pub(crate) use pplx_space_rpc_contracts::wake_signals::ACTIVATIONS_SEALED_MARKER;
 
 /// The marker in the `Unavailable` status a node whose seal row couldn't be
 /// read refuses a VM activation with. The background read clears it within
@@ -356,11 +360,12 @@ impl ActivationSeal {
 
     /// Admit a node-local artifact producer, `producer` naming it in a
     /// refusal, for `sandbox_id`, which the caller has read holding the
-    /// sandbox's artifact lock: `has_vm` when its lifecycle there is
-    /// `started` or `paused` ([`has_vm`]). A node known sealed refuses one
-    /// for a sandbox with no VM with the sealed refusal, so that the caller
-    /// writes nothing; an unknown seal admits, as a node never sealed does.
-    /// The token counts the producer in flight until it is dropped.
+    /// sandbox's artifact lock: `has_vm` when the sandbox still has a VM
+    /// after the work, its lifecycle there being `started` or `paused`
+    /// ([`has_vm`]) and the work not stopping it. A node known sealed refuses
+    /// one for a sandbox with no VM with the sealed refusal, so that the
+    /// caller writes nothing; an unknown seal admits, as a node never sealed
+    /// does. The token counts the producer in flight until it is dropped.
     pub(crate) fn admit_producer(
         &self,
         producer: &str,
@@ -374,15 +379,6 @@ impl ActivationSeal {
         Ok(ArtifactProducerToken {
             _in_flight: self.producers.register(sandbox_id),
         })
-    }
-
-    /// The refusal [`Self::admit_producer`] gives a sandbox without a VM, for
-    /// work that would leave it stopped on the node, which a v2 drain doesn't
-    /// move: the idle auto-stop of a suspended sandbox. `work` names it in the
-    /// refusal. A node known sealed refuses it; an unknown seal admits.
-    /// Nothing is counted in flight.
-    pub(crate) fn check_without_vm(&self, work: &str, sandbox_id: &str) -> Result<(), Status> {
-        refuse_without_vm(&self.lock_state(), work, sandbox_id, false)
     }
 
     /// Seal under `generation`, persisted before the seal takes effect. The
@@ -616,7 +612,7 @@ fn joined_read(
 }
 
 /// The sealed refusal of `work` for `sandbox_id` when the node is known
-/// sealed and the sandbox has no VM.
+/// sealed and the sandbox has no VM after the work.
 fn refuse_without_vm(
     state: &SealState,
     work: &str,
@@ -626,7 +622,7 @@ fn refuse_without_vm(
     match state.sealed_generation() {
         Some(generation) if !has_vm => Err(Status::failed_precondition(format!(
             "{ACTIVATIONS_SEALED_MARKER} (generation {generation}); refusing the {work} of sandbox \
-             {sandbox_id}, which has no VM"
+             {sandbox_id}, which would leave it without a VM"
         ))),
         _ => Ok(()),
     }

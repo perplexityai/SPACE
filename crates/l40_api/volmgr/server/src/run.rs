@@ -19,13 +19,14 @@ use pplx_space_service_mutex::{
 use pplx_space_unix_socket_bind::BindUnixSocketError;
 use pplx_space_unix_socket_bind::UnixSocketOptions;
 use pplx_space_volmgr_store::database::{self, SqliteError};
+use pplx_space_volmgr_store::jobs::{JobPriority, PriorityBand};
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::ObjectCredentials;
 use crate::executor::TransferExecutorConfig;
 use crate::proto::volume_manager_server::VolumeManagerServer;
 use crate::service::{NewServiceError, VolumeManagerService, VolumeManagerServiceConfig};
-use crate::{JobPriority, ObjectCredentials, PriorityBand};
 
 pub const SERVICE_NAME: &str = "space-volume-manager";
 const SOCKET_GROUP: &str = group_names::SPACE_SBXCLIENTS;

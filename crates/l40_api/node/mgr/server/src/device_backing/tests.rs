@@ -221,3 +221,17 @@ async fn pinned_devices_survive_replacement_and_encrypted_reopen() {
             .unwrap();
     }
 }
+
+#[test]
+fn direct_loop_io_pairs_the_flag_with_a_4k_block() {
+    // The kernel keeps a loop device buffered unless its block size covers
+    // the backing filesystem's 4 KiB block, so the flag alone is a no-op.
+    assert_eq!(
+        (LoopIo::Direct.flags(), LoopIo::Direct.block_size()),
+        (LO_FLAGS_DIRECT_IO, 4096)
+    );
+    assert_eq!(
+        (LoopIo::Buffered.flags(), LoopIo::Buffered.block_size()),
+        (0, 0)
+    );
+}

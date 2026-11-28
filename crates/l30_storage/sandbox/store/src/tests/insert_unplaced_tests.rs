@@ -16,7 +16,7 @@ use pplx_space_execution_spec::DiskIoLimits;
 use sqlx::types::JsonValue;
 
 use super::*;
-use crate::{SandboxCreate, SandboxStoreError, insert_unplaced};
+use crate::{SandboxCreate, insert_unplaced};
 
 const LEASE_SECONDS: i32 = 120;
 
@@ -294,8 +294,9 @@ async fn insert_unplaced_refuses_an_existing_id_in_every_lifecycle() -> TestResu
         )
         .await
         .expect_err("a duplicate id must be refused");
+        let error = sqlx::Error::from(error);
 
-        let SandboxStoreError::Database(sqlx::Error::Database(database)) = &error else {
+        let sqlx::Error::Database(database) = &error else {
             return Err(format!("{lifecycle}: not a database error: {error:?}").into());
         };
         assert!(database.is_unique_violation(), "{lifecycle}: {error:?}");

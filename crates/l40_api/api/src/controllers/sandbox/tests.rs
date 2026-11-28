@@ -1,6 +1,7 @@
 use super::*;
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_sandbox_model::SandboxActivationAttemptId;
+use pplx_space_sql_locator::sql;
 use pplx_space_template_model::TemplateId;
 
 mod activation_timeout_tests {
@@ -1233,7 +1234,7 @@ mod template_release_resolution_postgres_tests {
             async move {
                 let mut tx = pool.begin().await?;
                 set_default(
-                    &mut tx,
+                    &mut *tx,
                     environment,
                     &PolicyChange {
                         actor: None,
@@ -1661,8 +1662,6 @@ mod response_tests {
     use pplx_space_node_model::NodeManagedBy;
     use pplx_space_sandbox_model::SandboxId;
 
-    use sqlx::types::Json;
-
     fn sandbox_with_network_policy(
         override_policy: Option<NetworkPolicyV1>,
         override_generation: i64,
@@ -1702,13 +1701,13 @@ mod response_tests {
             disk_mib: None,
             disk_io_max_operations_per_sec: 1_000,
             disk_io_max_bandwidth_mib_per_sec: 100,
-            env: Json(Default::default()),
-            metadata: Json(Default::default()),
-            auto_lifecycle: Json(AutoLifecyclePolicy::disabled()),
-            auto_lifecycle_state: Json(AutoLifecycleRuntimeState::default()),
-            network_policy: override_policy.map(Json),
+            env: Default::default(),
+            metadata: Default::default(),
+            auto_lifecycle: AutoLifecyclePolicy::disabled(),
+            auto_lifecycle_state: AutoLifecycleRuntimeState::default(),
+            network_policy: override_policy,
             network_policy_generation: override_generation,
-            template_network_policy: template_policy.map(Json),
+            template_network_policy: template_policy,
             template_network_policy_generation: template_generation,
             next_auto_event_at: None,
             snapshots_enabled_desired: false,
@@ -1770,7 +1769,7 @@ mod response_tests {
             observed_network_policy_source: Some(source.to_string()),
             observed_network_policy_authority: Some("cluster".to_string()),
             observed_network_policy_at: None,
-            network_policy_conditions: Json(Vec::new()),
+            network_policy_conditions: Vec::new(),
         }
     }
 

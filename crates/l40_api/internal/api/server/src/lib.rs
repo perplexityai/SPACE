@@ -14,7 +14,6 @@
 pub use pplx_space_node_api_client::proto;
 pub use pplx_space_rpc_auth as auth;
 
-mod api_key_store;
 pub mod metrics;
 pub mod node_info;
 pub use node_info::ClusterNodeInfoService;
@@ -58,8 +57,8 @@ use pplx_space_events::{
 };
 use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_node_model::{NodeRole as SpaceNodeRole, SubstrateKind};
+use pplx_space_node_registration_store::direct::registry as direct_registry;
 use pplx_space_node_registration_store::lookup as node_lookup;
-use pplx_space_rpc_contracts::node_drain_signals::EVACUATION_RESTORE_READY_CHANNEL;
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_sandbox_store::snapshot_capture_fields::{self, SnapshotSandboxRow};
 use pplx_space_snapshot_model::{
@@ -132,39 +131,29 @@ struct BackupAttemptFinalization<'a> {
     suspend_uncommitted: bool,
 }
 
-/// The `snapshots` row [`ClusterApiService::finalize_backup_attempt`] flips,
-/// exactly as that statement's `RETURNING` produces it.
-#[derive(Debug, FromRow)]
-struct FinalizedSnapshotRow {
-    sandbox_id: SandboxId,
-    source_node_id: Option<NodeId>,
-    local_artifact_id: Option<LocalArtifactId>,
-    artifact_kind: Option<String>,
-}
-
-impl FinalizedSnapshotRow {
-    /// The pending-backup queue identity this finalize is entitled to delete,
-    /// if the row carries a complete one.
-    ///
-    /// `source_node_id` is NULL on rows that predate node attribution and
-    /// `local_artifact_id` on rollout-skew rows with no artifact identity; a
-    /// row missing either cannot name a queue row, since every mirrored row
-    /// carries both, so `None` costs nothing the census set-replace does not
-    /// heal.
-    ///
-    /// The `artifact_kind` arm is unreachable rather than lenient:
-    /// `snapshots_artifact_identity_check` makes the column non-NULL whenever
-    /// `local_artifact_id` is, and its own `CHECK` admits only `disk` and
-    /// `full`. It is written as a fallible parse anyway because the type
-    /// system cannot see either constraint.
-    fn artifact(&self) -> Option<node_local_backup_pending::FinalizedArtifact> {
-        Some(node_local_backup_pending::FinalizedArtifact {
-            source_node_id: self.source_node_id?,
-            sandbox_id: self.sandbox_id,
-            artifact_id: self.local_artifact_id?,
-            artifact_kind: ArtifactKind::from_str(self.artifact_kind.as_deref()?).ok()?,
-        })
-    }
+/// The pending-backup queue identity a finalize is entitled to delete, if the
+/// row [`ClusterApiService::finalize_backup_attempt`] flipped carries a
+/// complete one.
+///
+/// `source_node_id` is NULL on rows that predate node attribution and
+/// `local_artifact_id` on rollout-skew rows with no artifact identity; a row
+/// missing either cannot name a queue row, since every mirrored row carries
+/// both, so `None` costs nothing the census set-replace does not heal.
+///
+/// The `artifact_kind` arm is unreachable rather than lenient:
+/// `snapshots_artifact_identity_check` makes the column non-NULL whenever
+/// `local_artifact_id` is, and its own `CHECK` admits only `disk` and `full`.
+/// It is written as a fallible parse anyway because the type system cannot
+/// see either constraint.
+fn finalized_artifact(
+    row: &snapshot_store::upload::FinalizedAttempt,
+) -> Option<node_local_backup_pending::FinalizedArtifact> {
+    Some(node_local_backup_pending::FinalizedArtifact {
+        source_node_id: row.source_node_id?,
+        sandbox_id: row.sandbox_id,
+        artifact_id: row.local_artifact_id?,
+        artifact_kind: ArtifactKind::from_str(row.artifact_kind.as_deref()?).ok()?,
+    })
 }
 
 #[path = "published_state.rs"]
@@ -173,8 +162,8 @@ mod published_state;
 pub use published_state::{publish_sandbox_states, publish_sandbox_states_with_retirement};
 mod sandbox_quarantine_store;
 use published_state::{
-    capture_host_cpu, project_ready_suspend_snapshot, prune_absent_node_templates,
-    publish_template_states, snapshot_execution_metadata,
+    capture_host_cpu, project_ready_suspend_snapshot, publish_template_states,
+    snapshot_execution_metadata,
 };
 
 const SUPPORTED_TEMPLATE_RUNTIMES: &[RuntimeKind] = &[RuntimeKind::Firecracker];
@@ -369,7 +358,7 @@ pub struct ClusterApiService {
     firewall_enrollment: firewall_rules::Enrollment,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 struct NodeRow {
     id: String,
     name: Option<String>,
@@ -383,6 +372,25 @@ struct NodeRow {
     updated_at: OffsetDateTime,
     deleted_at: Option<OffsetDateTime>,
     metadata_json: String,
+}
+
+impl From<direct_registry::ListedNodeRow> for NodeRow {
+    fn from(row: direct_registry::ListedNodeRow) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            address: row.address,
+            node_api_endpoint: row.node_api_endpoint,
+            role: row.role,
+            managed_by: row.managed_by,
+            state: row.state,
+            last_heartbeat: row.last_heartbeat,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            deleted_at: row.deleted_at,
+            metadata_json: row.metadata_json,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -639,7 +647,7 @@ impl ClusterApiService {
 
     /// Point the template-visibility lookup at its own pool.
     ///
-    /// See [`ClusterApiService::visibility_pool`]. Call this with a small
+    /// See `ClusterApiService::visibility_pool`. Call this with a small
     /// dedicated pool in any deployment that serves sandbox-create pulls;
     /// without it the lookup shares the load-bearing pool and an
     /// `ALTER TABLE templates` can starve release resolution.
@@ -658,7 +666,7 @@ impl ClusterApiService {
 
     /// Point the runtime environment catalog read at its own pool.
     ///
-    /// See [`ClusterApiService::runtime_catalog_pool`]. Call this with a small
+    /// See `ClusterApiService::runtime_catalog_pool`. Call this with a small
     /// dedicated pool in any deployment that admits nodes to the provisioning
     /// recipe; without it a blocked `runtime_environments` read shares the
     /// load-bearing pool.
@@ -777,23 +785,13 @@ impl ClusterApiService {
         // the node's pending-backup mirror. Taking all four from the row this
         // statement just flipped is what makes that delete safe: nothing else
         // here knows which artifact the caller finalized.
-        let finalized_snapshot: Option<FinalizedSnapshotRow> = sqlx::query_as(sql!(
-            "UPDATE snapshots
-                SET state = $2,
-                    size_bytes = COALESCE($3, size_bytes),
-                    failure_reason = CASE
-                        WHEN $2 = 'failed' THEN COALESCE($4, failure_reason)
-                        ELSE NULL
-                    END
-              WHERE id = $1
-                AND state IN ('creating', $2)
-            RETURNING sandbox_id, source_node_id, local_artifact_id, artifact_kind"
-        ))
-        .bind(snapshot_id)
-        .bind(target_state.as_str())
-        .bind(size_bytes)
-        .bind(failure_reason)
-        .fetch_optional(&mut *tx)
+        let finalized_snapshot = snapshot_store::upload::finalize_attempt(
+            &mut *tx,
+            snapshot_id,
+            target_state,
+            size_bytes,
+            failure_reason,
+        )
         .await
         .map_err(|e| Status::internal(format!("finalize snapshot: {e}")))?;
 
@@ -825,7 +823,7 @@ impl ClusterApiService {
         let sandbox_id = finalized_snapshot.sandbox_id;
 
         if target_state.is_ready() {
-            snapshot_store::record_artifact_digests(&mut tx, snapshot_id, artifact_digests)
+            snapshot_store::record_artifact_digests(&mut *tx, snapshot_id, artifact_digests)
                 .await
                 .map_err(|error| match &error {
                     snapshot_store::RecordArtifactDigestsError::Conflict { .. } => {
@@ -859,8 +857,10 @@ impl ClusterApiService {
         // every mirrored row carries a non-null node and artifact — so the
         // fast path skips it and the census set-replace stays the backstop for
         // every row this path does not reach.
-        let cleared_pending_backup = match (target_state.is_ready(), finalized_snapshot.artifact())
-        {
+        let cleared_pending_backup = match (
+            target_state.is_ready(),
+            finalized_artifact(&finalized_snapshot),
+        ) {
             (true, Some(artifact)) => {
                 node_local_backup_pending::clear_finalized(&mut tx, artifact).await?
             }
@@ -910,16 +910,9 @@ impl ClusterApiService {
     /// no value in distinguishing "missing" from "already terminal" with an
     /// error the caller would only swallow.
     async fn touch_backup_attempt(&self, snapshot_id: SnapshotId) -> Result<(), Status> {
-        sqlx::query(sql!(
-            "UPDATE snapshots
-                SET last_attempt_at = NOW()
-              WHERE id = $1
-                AND state = 'creating'"
-        ))
-        .bind(snapshot_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Status::internal(format!("touch snapshot: {e}")))?;
+        snapshot_store::upload::touch_attempt(&self.pool, snapshot_id)
+            .await
+            .map_err(|e| Status::internal(format!("touch snapshot: {e}")))?;
 
         Ok(())
     }
@@ -1020,7 +1013,7 @@ impl ClusterApiService {
             .await
             .map_err(|e| Status::internal(format!("begin tx: {e}")))?;
 
-        let (persisted, outcome) = snapshot_store::insert(&mut tx, &snapshot)
+        let (persisted, outcome) = snapshot_store::insert(&mut *tx, &snapshot)
             .await
             .map_err(snapshot_insert_status)?;
         // Only a capture's first registration is fenced. Refusing a replay
@@ -1269,11 +1262,10 @@ impl ClusterApiService {
     /// restored), and the periodic sweep is the correctness fallback, so a
     /// failed or spurious NOTIFY only affects latency.
     async fn notify_evacuation_restore_ready(&self, sandbox_id: SandboxId) {
-        if let Err(err) = sqlx::query(sql!("SELECT pg_notify($1, $2)"))
-            .bind(EVACUATION_RESTORE_READY_CHANNEL)
-            .bind(sandbox_id.to_string())
-            .execute(&self.pool)
-            .await
+        if let Err(err) = pplx_space_cluster_trigger_queue::signal::notify_evacuation_restore_ready(
+            &self.pool, sandbox_id,
+        )
+        .await
         {
             tracing::warn!(
                 error = %err,
@@ -1418,32 +1410,10 @@ impl ClusterApiService {
         role: Option<SpaceNodeRole>,
         include_deleted: bool,
     ) -> Result<Vec<NodeRow>, Status> {
-        sqlx::query_as::<_, NodeRow>(sql!(
-            "SELECT n.id::TEXT AS id,
-                    nd.name,
-                    host(n.address) AS address,
-                    nd.node_api_endpoint,
-                    n.role,
-                    n.managed_by,
-                    n.state,
-                    n.last_heartbeat,
-                    n.created_at,
-                    nd.updated_at,
-                    nd.deleted_at,
-                    nd.metadata::TEXT AS metadata_json
-             FROM nodes n
-             JOIN node_direct nd ON nd.node_id = n.id
-             WHERE ($1::TEXT IS NULL OR n.role = $1)
-               AND ($2::BOOL OR nd.deleted_at IS NULL)
-               AND n.managed_by = $3
-             ORDER BY n.role ASC, nd.name ASC NULLS LAST, nd.node_api_endpoint ASC"
-        ))
-        .bind(role.map(SpaceNodeRole::as_str))
-        .bind(include_deleted)
-        .bind(SubstrateKind::Space)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|err| Status::internal(format!("query nodes: {err}")))
+        direct_registry::listed_nodes(&self.pool, role, include_deleted, SubstrateKind::Space)
+            .await
+            .map(|rows| rows.into_iter().map(NodeRow::from).collect())
+            .map_err(|err| Status::internal(format!("query nodes: {err}")))
     }
 
     /// Resolve a caller-named node to its existing registration. Rows are
@@ -1512,7 +1482,7 @@ impl ClusterApiService {
     /// name a node. No source node fails closed. Returns the admitted node.
     async fn authorize_backup_source_node(
         &self,
-        executor: impl sqlx::PgExecutor<'_>,
+        executor: impl pplx_space_postgres_pool::Executor<'_>,
         source_node_id: Option<NodeId>,
         remote_addr: Option<std::net::SocketAddr>,
         subject: &str,
@@ -1531,7 +1501,7 @@ impl ClusterApiService {
 /// Look up a registered node by ID on `executor`, so a caller holding a
 /// transaction does not need a second pooled connection.
 async fn registered_origin_node(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
     display_id: &str,
     node_id: NodeId,
     role_hint: Option<SpaceNodeRole>,
@@ -1618,7 +1588,6 @@ mod template_publication;
 mod template_registration_store;
 mod template_releases_store;
 mod template_system_publication_grants;
-mod template_tenant_publication_grants;
 mod template_visibility_cache;
 #[cfg(test)]
 mod tests;

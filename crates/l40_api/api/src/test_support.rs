@@ -28,7 +28,7 @@ pub(crate) async fn set_default_environment(
         reason: PolicyChangeReason::new("test")?,
     };
     let mut tx = pool.begin().await?;
-    set_default(&mut tx, environment.parse()?, &change).await?;
+    set_default(&mut *tx, environment.parse()?, &change).await?;
     tx.commit().await?;
     Ok(())
 }

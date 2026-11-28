@@ -154,7 +154,9 @@ pub(super) async fn fetch_node_status_map(
     if node_ids.is_empty() {
         return Ok(Vec::new());
     }
-    pplx_space_node_status_store::status_summaries(pool, node_ids).await
+    pplx_space_node_status_store::status_summaries(pool, node_ids)
+        .await
+        .map_err(sqlx::Error::from)
 }
 
 pub(super) async fn node_status_refresh_needed(
@@ -212,8 +214,8 @@ pub(super) async fn fetch_cached_node_health(
                 reachable: status.reachable,
                 healthy: status.health_healthy.unwrap_or(false),
                 error: status.error,
-                services: status.services.0,
-                node_ctl: status.node_ctl.map(|node_ctl| node_ctl.0),
+                services: status.services,
+                node_ctl: status.node_ctl,
             }
         }
         Err(err) => NodeHealthStatusResponse {

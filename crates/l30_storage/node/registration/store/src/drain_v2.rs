@@ -8,9 +8,9 @@
 use pplx_space_accounts::NodeId;
 use pplx_space_node_drain::NodeDrainEngine;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use serde::{Deserialize, Serialize};
-use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 
 /// A v2 drain's `drain_status`, as the admin API starts it and the cluster
 /// controller writes it, and as every reader reads it. Its keys are frozen:
@@ -173,9 +173,9 @@ pub struct DrainV2Columns {
 /// The node's v2 drain columns; `None` when there is no such node. A
 /// `drain_status` that doesn't read as [`StoredV2Status`] is a decode error.
 pub async fn drain_v2_columns(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
-) -> Result<Option<DrainV2Columns>, sqlx::Error> {
+) -> Result<Option<DrainV2Columns>, DbError> {
     type Row = (Option<String>, Option<serde_json::Value>, bool);
     let row: Option<Row> = sqlx::query_as(sql!(
         "SELECT n.drain_engine, n.drain_status, k.instance_id IS NOT NULL
@@ -184,7 +184,7 @@ pub async fn drain_v2_columns(
           WHERE n.id = $1"
     ))
     .bind(node_id)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     row.map(|(engine, status, recorded_instance)| {
         Ok(DrainV2Columns {
@@ -209,11 +209,15 @@ pub async fn drain_v2_columns(
 ///
 /// `drain_engine` is bound from [`NodeDrainEngine`], the one closed set of
 /// engines: the column has no CHECK, so no statement spells a value itself.
-pub async fn start_v2_drain(
-    tx: &mut Transaction<'_, Postgres>,
+/// The caller must pass its open transaction.
+pub async fn start_v2_drain<C>(
+    tx: &mut C,
     node_id: NodeId,
     hold_seconds: i64,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "UPDATE nodes
             SET drain_engine = $3::TEXT,
@@ -227,7 +231,7 @@ pub async fn start_v2_drain(
     .bind(node_id)
     .bind(hold_seconds)
     .bind(NodeDrainEngine::V2.column())
-    .execute(&mut **tx)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -249,12 +253,15 @@ pub enum HoldChange {
 /// Move the deadline of the v2 drain in flight on `node_id`, whose row the
 /// caller has locked, to `hold_seconds` after the drain's start, only if
 /// that is earlier, by the clock [`start_v2_drain`] reads. A row with no
-/// deadline is refused.
-pub async fn shorten_v2_hold(
-    tx: &mut Transaction<'_, Postgres>,
+/// deadline is refused. The caller must pass its open transaction.
+pub async fn shorten_v2_hold<C>(
+    tx: &mut C,
     node_id: NodeId,
     hold_seconds: i64,
-) -> Result<HoldChange, sqlx::Error> {
+) -> Result<HoldChange, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let (requested, stored): (Option<i64>, Option<i64>) = sqlx::query_as(sql!(
         "SELECT FLOOR(EXTRACT(EPOCH FROM drain_started_at))::BIGINT + $2::BIGINT,
                 (drain_status->>'deadline_at')::BIGINT
@@ -263,7 +270,7 @@ pub async fn shorten_v2_hold(
     ))
     .bind(node_id)
     .bind(hold_seconds)
-    .fetch_optional(&mut **tx)
+    .fetch_optional((&mut *tx).into_sqlx())
     .await?
     .unwrap_or((None, None));
     let (Some(requested), Some(stored)) = (requested, stored) else {
@@ -282,7 +289,7 @@ pub async fn shorten_v2_hold(
     ))
     .bind(node_id)
     .bind(requested)
-    .execute(&mut **tx)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(HoldChange::Shortened)
 }
@@ -329,22 +336,23 @@ static V2_START_ADMISSION: std::sync::LazyLock<String> = std::sync::LazyLock::ne
 /// ends, so two starts can't both see a free slot; then read the node's
 /// heartbeat and count the slots other nodes hold ([`V2StartAdmission`]).
 /// Only a v2 drain's start takes the lock; the caller writes the start in
-/// the same transaction, so the lock covers the count and the write.
-pub async fn admit_v2_start(
-    tx: &mut Transaction<'_, Postgres>,
-    node_id: NodeId,
-) -> Result<V2StartAdmission, sqlx::Error> {
+/// the same transaction, so the lock covers the count and the write. The
+/// caller must pass its open transaction.
+pub async fn admit_v2_start<C>(tx: &mut C, node_id: NodeId) -> Result<V2StartAdmission, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     const EVACUATION_LOCK: &str = "node_drain_v2_evacuation_slots";
     sqlx::query(sql!(
         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
     ))
     .bind(EVACUATION_LOCK)
-    .execute(&mut **tx)
+    .execute((&mut *tx).into_sqlx())
     .await?;
     let (heartbeat_fresh, evacuating): (bool, i64) =
         sqlx::query_as(sqlx::AssertSqlSafe(V2_START_ADMISSION.as_str()))
             .bind(node_id)
-            .fetch_one(&mut **tx)
+            .fetch_one(tx.into_sqlx())
             .await?;
     Ok(V2StartAdmission {
         heartbeat_fresh,
@@ -430,15 +438,13 @@ static LIST_V2_NODES: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| 
     ))
 });
 
-/// Every v2 drain's node of the Kubernetes substrate, as [`LIST_V2_NODES`]
+/// Every v2 drain's node of the Kubernetes substrate, as `LIST_V2_NODES`
 /// reads it.
-pub async fn list_v2_node_rows(
-    executor: impl sqlx::PgExecutor<'_>,
-) -> Result<Vec<V2NodeRow>, sqlx::Error> {
-    sqlx::query_as(sqlx::AssertSqlSafe(LIST_V2_NODES.as_str()))
+pub async fn list_v2_node_rows(executor: impl Executor<'_>) -> Result<Vec<V2NodeRow>, DbError> {
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(LIST_V2_NODES.as_str()))
         .bind(SubstrateKind::Kubernetes)
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?)
 }
 
 /// For each v2 drain's node of the Kubernetes substrate, how many of the
@@ -447,11 +453,11 @@ pub async fn list_v2_node_rows(
 /// seconds by the database clock: a drain restores nothing, so each waits
 /// for a call. A node with none is absent.
 pub async fn evacuated_still_suspended(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     after_secs: f64,
-) -> Result<Vec<(NodeId, i64)>, sqlx::Error> {
+) -> Result<Vec<(NodeId, i64)>, DbError> {
     // An id in the set that isn't a UUID names no sandbox.
-    sqlx::query_as(sql!(
+    Ok(sqlx::query_as(sql!(
         "SELECT n.id, COUNT(*)
            FROM nodes n
           CROSS JOIN LATERAL jsonb_array_elements_text(
@@ -470,8 +476,8 @@ pub async fn evacuated_still_suspended(
     ))
     .bind(SubstrateKind::Kubernetes)
     .bind(after_secs)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The locked node's v2 state, as the terminate transaction and the
@@ -505,15 +511,19 @@ static LOCKED_V2_NODE: std::sync::LazyLock<String> = std::sync::LazyLock::new(||
 });
 
 /// Read the v2 state of `node_id`'s row, which the caller has locked
-/// `FOR UPDATE`; `None` when the row is gone.
-pub async fn read_locked_v2_node(
-    conn: &mut PgConnection,
+/// `FOR UPDATE`; `None` when the row is gone. The caller must pass its open
+/// transaction.
+pub async fn read_locked_v2_node<C>(
+    tx: &mut C,
     node_id: NodeId,
-) -> Result<Option<LockedV2Node>, sqlx::Error> {
-    sqlx::query_as(sqlx::AssertSqlSafe(LOCKED_V2_NODE.as_str()))
+) -> Result<Option<LockedV2Node>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(LOCKED_V2_NODE.as_str()))
         .bind(node_id)
-        .fetch_optional(conn)
-        .await
+        .fetch_optional(tx.into_sqlx())
+        .await?)
 }
 
 impl LockedV2Node {
@@ -533,27 +543,30 @@ impl LockedV2Node {
 }
 
 /// Record what holds the locked node from its terminate transaction's fence
-/// in `drain_last_error`.
-pub async fn record_terminate_held(
-    conn: &mut PgConnection,
+/// in `drain_last_error`. The caller must pass its open transaction.
+pub async fn record_terminate_held<C>(
+    tx: &mut C,
     node_id: NodeId,
     held: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!("UPDATE nodes SET drain_last_error = $2 WHERE id = $1"))
         .bind(node_id)
         .bind(held)
-        .execute(conn)
+        .execute(tx.into_sqlx())
         .await?;
     Ok(())
 }
 
 /// Write the locked node's fence, `drain_status.terminate_instance`, the
-/// instance its v2 drain terminates, and clear its last error.
-pub async fn write_fence(
-    conn: &mut PgConnection,
-    node_id: NodeId,
-    instance_id: &str,
-) -> Result<(), sqlx::Error> {
+/// instance its v2 drain terminates, and clear its last error. The caller
+/// must pass its open transaction.
+pub async fn write_fence<C>(tx: &mut C, node_id: NodeId, instance_id: &str) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "UPDATE nodes
             SET drain_status = drain_status || jsonb_build_object('terminate_instance', $2::TEXT),
@@ -562,7 +575,7 @@ pub async fn write_fence(
     ))
     .bind(node_id)
     .bind(instance_id)
-    .execute(conn)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -572,11 +585,11 @@ pub async fn write_fence(
 /// dispatches it again. False for a row that is no longer that generation's
 /// `terminating` node fenced on that instance with no dispatch recorded.
 pub async fn record_v2_dispatched(
-    pool: &PgPool,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     generation: i64,
     instance_id: &str,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     Ok(sqlx::query(sql!(
         "UPDATE nodes
             SET drain_status = drain_status
@@ -592,7 +605,7 @@ pub async fn record_v2_dispatched(
     .bind(node_id)
     .bind(generation)
     .bind(instance_id)
-    .execute(pool)
+    .execute(executor.into_sqlx())
     .await?
     .rows_affected()
         == 1)
@@ -630,17 +643,17 @@ static RECORD_TERMINATED_OBSERVED: std::sync::LazyLock<String> = std::sync::Lazy
 /// does. Keeps the first time. False for a row that is no longer that
 /// generation's v2 drain asking about that instance.
 pub async fn record_v2_terminated_observed(
-    pool: &PgPool,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     generation: i64,
     instance_id: &str,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     Ok(
         sqlx::query(sqlx::AssertSqlSafe(RECORD_TERMINATED_OBSERVED.as_str()))
             .bind(node_id)
             .bind(generation)
             .bind(instance_id)
-            .execute(pool)
+            .execute(executor.into_sqlx())
             .await?
             .rows_affected()
             == 1,
@@ -671,43 +684,46 @@ static LET_GO_V2_NODE: std::sync::LazyLock<String> = std::sync::LazyLock::new(||
 /// them, and record `trace`. Writes no sandbox row. Returns whether it
 /// matched.
 pub async fn let_go_v2_node(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     generation: i64,
     phase: Option<&str>,
     fence: Option<&str>,
     trace: &str,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     Ok(sqlx::query(sqlx::AssertSqlSafe(LET_GO_V2_NODE.as_str()))
         .bind(node_id)
         .bind(generation)
         .bind(phase)
         .bind(fence)
         .bind(trace)
-        .execute(executor)
+        .execute(executor.into_sqlx())
         .await?
         .rows_affected()
         == 1)
+}
+
+/// The `drain_status` id set `key` with the ids of the `TEXT[]` parameter
+/// `param` added, sorted and without repeats.
+fn id_set_union(key: &str, param: &str) -> String {
+    format!(
+        "(SELECT COALESCE(jsonb_agg(ids.sandbox_id ORDER BY ids.sandbox_id), '[]'::JSONB)
+            FROM (
+                  SELECT jsonb_array_elements_text(
+                             COALESCE(drain_status->'{key}', '[]'::JSONB)
+                         ) AS sandbox_id
+                  UNION
+                  SELECT unnest({param}::TEXT[])
+                 ) AS ids)"
+    )
 }
 
 /// `$1` = node id, `$2` = generation, `$3` = report, `$4` = the sandboxes it
 /// lists running, `$5` = the evacuations recorded. Stores the report and
 /// adds to the two id sets, each kept sorted and without repeats.
 static RECORD_V2_REPORT_STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    let union = |key: &str, param: &str| {
-        format!(
-            "(SELECT COALESCE(jsonb_agg(ids.sandbox_id ORDER BY ids.sandbox_id), '[]'::JSONB)
-                FROM (
-                      SELECT jsonb_array_elements_text(
-                                 COALESCE(drain_status->'{key}', '[]'::JSONB)
-                             ) AS sandbox_id
-                      UNION
-                      SELECT unnest({param}::TEXT[])
-                     ) AS ids)"
-        )
-    };
-    let observed_running = union("observed_running", "$4");
-    let evacuated_total = union("evacuated_total", "$5");
+    let observed_running = id_set_union("observed_running", "$4");
+    let evacuated_total = id_set_union("evacuated_total", "$5");
     sql!(format!(
         "UPDATE nodes
             SET drain_status = drain_status || jsonb_build_object(
@@ -729,13 +745,13 @@ static RECORD_V2_REPORT_STATEMENT: std::sync::LazyLock<String> = std::sync::Lazy
 /// grow. Clears the last error. Returns false when the row is no longer
 /// that generation's v2 drain.
 pub async fn record_v2_report(
-    pool: &PgPool,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     generation: i64,
     report: &StoredV2Report,
     running: &[String],
     evacuated: &[String],
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let report = serde_json::to_value(report).map_err(|error| sqlx::Error::Encode(error.into()))?;
     Ok(
         sqlx::query(sqlx::AssertSqlSafe(RECORD_V2_REPORT_STATEMENT.as_str()))
@@ -744,7 +760,49 @@ pub async fn record_v2_report(
             .bind(report)
             .bind(running)
             .bind(evacuated)
-            .execute(pool)
+            .execute(executor.into_sqlx())
+            .await?
+            .rows_affected()
+            == 1,
+    )
+}
+
+/// `$1` = node id, `$2` = generation, `$3` = the sandboxes evacuated.
+static ADD_V2_EVACUATED_STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let evacuated_total = id_set_union("evacuated_total", "$3");
+    sql!(format!(
+        "UPDATE nodes
+            SET drain_status = drain_status
+                    || jsonb_build_object('evacuated_total', {evacuated_total})
+          WHERE id = $1
+            AND drain_engine = 'v2'
+            AND {GENERATION} = $2
+            AND EXISTS (
+                SELECT 1 FROM UNNEST($3::TEXT[]) AS added(id)
+                 WHERE NOT COALESCE(drain_status->'evacuated_total', '[]'::JSONB) ? added.id
+            )"
+    ))
+});
+
+/// Add `evacuated`, the sandboxes the drain under `generation` finds
+/// durable and still homed on its `drained` node, to
+/// `drain_status.evacuated_total`, which only grows. A sandbox the node
+/// evicted before a report named it evacuated is counted this way. The row
+/// is written only when one of them isn't in the set yet. Run it under the
+/// node's row lock. Returns whether it wrote: false when every one was
+/// counted already, or the row is no longer that generation's v2 drain.
+pub async fn add_v2_evacuated(
+    executor: impl Executor<'_>,
+    node_id: NodeId,
+    generation: i64,
+    evacuated: &[String],
+) -> Result<bool, DbError> {
+    Ok(
+        sqlx::query(sqlx::AssertSqlSafe(ADD_V2_EVACUATED_STATEMENT.as_str()))
+            .bind(node_id)
+            .bind(generation)
+            .bind(evacuated)
+            .execute(executor.into_sqlx())
             .await?
             .rows_affected()
             == 1,
@@ -773,15 +831,15 @@ static ADVANCE_V2_DRAINED_STATEMENT: std::sync::LazyLock<String> = std::sync::La
 /// `draining -> drained` for the v2 drain under `generation`, only with a
 /// stored report that is finished: nothing pending, blocked or unrecorded.
 pub async fn advance_v2_drained(
-    pool: &PgPool,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     generation: i64,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     Ok(
         sqlx::query(sqlx::AssertSqlSafe(ADVANCE_V2_DRAINED_STATEMENT.as_str()))
             .bind(node_id)
             .bind(generation)
-            .execute(pool)
+            .execute(executor.into_sqlx())
             .await?
             .rows_affected()
             == 1,
@@ -806,17 +864,17 @@ static RETURN_V2_DRAINED_STATEMENT: std::sync::LazyLock<String> = std::sync::Laz
 /// as its last error: the operator retries `:terminate`. False for a row
 /// that is no longer that generation's unfenced `terminating` node.
 pub async fn return_v2_drained(
-    pool: &PgPool,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     generation: i64,
     refused: &str,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     Ok(
         sqlx::query(sqlx::AssertSqlSafe(RETURN_V2_DRAINED_STATEMENT.as_str()))
             .bind(node_id)
             .bind(generation)
             .bind(refused)
-            .execute(pool)
+            .execute(executor.into_sqlx())
             .await?
             .rows_affected()
             == 1,
@@ -839,15 +897,15 @@ static FINISH_V2_CANCEL_STATEMENT: std::sync::LazyLock<String> = std::sync::Lazy
 /// cancelled on the node; false for a row that is no longer that
 /// generation's cancel (a v2 engine with no phase).
 pub async fn finish_v2_cancel(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     generation: i64,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     Ok(
         sqlx::query(sqlx::AssertSqlSafe(FINISH_V2_CANCEL_STATEMENT.as_str()))
             .bind(node_id)
             .bind(generation)
-            .execute(executor)
+            .execute(executor.into_sqlx())
             .await?
             .rows_affected()
             == 1,
@@ -855,16 +913,16 @@ pub async fn finish_v2_cancel(
 }
 
 pub async fn record_v2_error(
-    pool: &PgPool,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     message: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE nodes SET drain_last_error = $2 WHERE id = $1 AND drain_engine = 'v2'"
     ))
     .bind(node_id)
     .bind(message)
-    .execute(pool)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }

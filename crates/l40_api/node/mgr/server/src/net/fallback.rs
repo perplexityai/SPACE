@@ -245,6 +245,27 @@ pub fn default_iface(ns: Option<&str>) -> Result<String, DefaultIfaceError> {
         })
 }
 
+pub fn external_ipv4(ns: &str) -> Result<std::net::Ipv4Addr, DefaultIfaceError> {
+    let output = Command::new("ip")
+        .args(["-n", ns, "-4", "-o", "addr", "show"])
+        .output()
+        .map_err(|e| DefaultIfaceError::Other(format!("cannot run ip addr: {e}")))?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.split_whitespace().nth(1) != Some("lo"))
+        .filter_map(|line| {
+            let mut words = line.split_whitespace().skip_while(|word| *word != "inet");
+            words
+                .nth(1)?
+                .split('/')
+                .next()?
+                .parse::<std::net::Ipv4Addr>()
+                .ok()
+        })
+        .find(|ip| !ip.is_loopback() && !ip.is_link_local())
+        .ok_or_else(|| DefaultIfaceError::Other("no external IPv4 address".to_string()))
+}
+
 pub fn ns_exists(name: &str) -> bool {
     Command::new("ip")
         .args(["netns", "list"])

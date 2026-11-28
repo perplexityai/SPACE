@@ -11,11 +11,21 @@
 //! The same freshness fragment shows up in two decision-points with subtly
 //! different lifecycle scopes:
 //!
-//! * **Drain-completion** — admin `:terminate` guard, drain reconciler
-//!   blocker count, drain reconciler mark-failed atomic re-check. Only
-//!   `lifecycle = 'suspended'` rows can be portable here: `suspending` /
-//!   `restoring` rows are mid-flight and don't yet have a snapshot to
-//!   promote, so they always block drain.
+//! * **Source release**: may a draining node let go of its sandboxes? The
+//!   drain gate holds the node while a row pinned to it (`target_node_id`) is
+//!   `suspending`, `restoring` for a restore that isn't an evacuation, or
+//!   `suspended` without a durable snapshot, and while a suspend upload from
+//!   the node is still in flight for a row that isn't durable yet. "Durable"
+//!   is [`snapshot_durable_for_source_release`]: [`latest_full_snapshot_ready`]
+//!   for an evacuation-marked row, the freshness fragment
+//!   ([`fresh_ready_snapshot_exists`]) for an unmarked one. For a row with
+//!   `current_local_artifact_id` both require a `ready` full backup of that
+//!   exact artifact on a storage location that isn't orphaned, so the
+//!   evacuation mark changes the test only for a row whose
+//!   `current_local_artifact_id` is NULL. Production asks
+//!   [`drain_gate_blockers_for_node`] or [`drain_gate_blocker_pairs`];
+//!   `drain_gate_blocks_source_release` writes the gate down as the reference
+//!   definition the tests compare them with.
 //! * **Restore fallback selection** — the API drain gate's portable-bypass and
 //!   the initial Kubernetes user-restore fallback selection. The scope widens
 //!   to `lifecycle IN ('suspended', 'restoring')` because
@@ -51,7 +61,7 @@
 //! it directly. Enumerated rather than counted, because an earlier revision of
 //! this paragraph undercounted them:
 //!
-//! 1. [`matching_ready_backup_exists`], in this file.
+//! 1. `matching_ready_backup_exists`, in this file.
 //! 2. [`snapshot_is_live_restore_source`], in this file — the deletion guard.
 //! 3. The snapshot-retention store's marked-restore-breach reporting query,
 //!    which composes the fragment directly rather than through (2).
@@ -327,8 +337,8 @@ pub fn snapshot_has_durable_copy(snapshot_alias: &str) -> String {
 /// rather than NULL, so a caller may safely negate it.
 ///
 /// **Only safe as a filter on an already-joined row.** `orphaned_nodes`
-/// deliberately does *not* use this shape: its comment
-/// (`orphaned_nodes/store.rs`) explains that driving a scan from
+/// deliberately does *not* use this shape: the docs of
+/// `pplx_space_node_registration_store::orphaned_nodes::candidates` explain that driving a scan from
 /// `(active_node_id = n.id OR target_node_id = n.id)` can make the planner
 /// BitmapOr both partial indexes and materialize every sandbox pinned to the
 /// node, so it splits the question into two `NOT EXISTS` probes. Use this
@@ -463,7 +473,7 @@ pub fn sandbox_attached_anywhere(sandbox_alias: &str) -> String {
 ///   a real relocation (`target_node_id = placed.node_id`), so a genuine
 ///   restore elsewhere satisfies them.
 ///
-///   Deliberately **not** [`matching_ready_backup_exists`], which looks like
+///   Deliberately **not** `matching_ready_backup_exists`, which looks like
 ///   exactly this and filters `sn.type = 'full'`. `begin_artifact_backup`
 ///   derives `snapshots.type` from the artifact kind, so that filter means
 ///   `artifact_kind = 'full'`, and a `stopped` sandbox's marker is a `disk`
@@ -715,7 +725,7 @@ pub fn snapshot_is_live_restore_source(sandbox_alias: &str, snapshot_alias: &str
 /// When the newest full snapshot is `failed` (the current evacuation upload
 /// failed), this makes [`latest_full_snapshot_ready`] false, so the sandbox is
 /// not restore-pending and keeps blocking source release. It does **not**
-/// wedge: the node-drain reupload queue (`pinned_local_only_sandboxes_query`)
+/// wedge: the node-drain reupload queue (`pplx_space_sandbox_store::pinned_local_only::page`)
 /// uses [`snapshot_durable_for_source_release`] — also marker-aware — so a
 /// marked sandbox whose newest snapshot is `failed` is enumerated, reuploaded
 /// from the on-disk artifacts (still present, since the source can't terminate
@@ -1721,7 +1731,7 @@ fn inflight_snapshot_matches_current_suspend(sandbox_alias: &str) -> String {
 ///   disk in practice, but nothing here requires it.
 ///
 /// Deliberately **not** placement-gated, following the exact-identity branch
-/// of [`fresh_ready_snapshot_exists`] — [`matching_ready_backup_exists`] omits
+/// of [`fresh_ready_snapshot_exists`] — `matching_ready_backup_exists` omits
 /// `placement_changed_at`, and only the markerless legacy branch beside it
 /// compares timestamps. Matching the pin is this module's currency test, so a
 /// re-place must not revoke the exemption.
@@ -1940,7 +1950,7 @@ pub fn current_disk_artifact_backup_ready(sandbox_alias: &str) -> String {
 ///
 /// The two branches are nested *inside* a single correlated `EXISTS`, the same
 /// shape [`snapshot_durable_for_source_release`] uses, rather than composed
-/// through [`artifact_identity_or_legacy`] as two sibling `EXISTS`
+/// through `artifact_identity_or_legacy` as two sibling `EXISTS`
 /// expressions. The two forms are logically identical — the branch key
 /// `current_local_artifact_id IS [NOT] NULL` reads only the outer row, so
 /// distributing it inside the `EXISTS` preserves truth for every row — but they
@@ -2133,20 +2143,6 @@ pub fn started_restore_source_absent(sandbox_alias: &str, settle_param: &str) ->
 }
 
 /// SQL fragment evaluating to TRUE iff the sandbox aliased as `sandbox_alias`
-/// is **portable for drain-completion**:
-///
-/// `{alias}.lifecycle = 'suspended' AND <fresh ready snapshot exists>`.
-///
-/// Use this at decision points that gate the source node's drain on the
-/// absence of local-only snapshots. `suspending` / `restoring` rows are
-/// deliberately excluded — their state isn't yet uploadable so they always
-/// block drain regardless of any prior snapshot.
-pub fn portable_for_drain_completion(sandbox_alias: &str) -> String {
-    let snapshot_exists = fresh_ready_snapshot_exists(sandbox_alias);
-    format!("{sandbox_alias}.lifecycle = 'suspended' AND {snapshot_exists}")
-}
-
-/// SQL fragment evaluating to TRUE iff the sandbox aliased as `sandbox_alias`
 /// is **portable for restore-affinity drop**:
 ///
 /// `{alias}.lifecycle IN ('suspended', 'restoring') AND <fresh ready snapshot exists>`.
@@ -2212,11 +2208,13 @@ pub fn portable_for_restore_affinity(sandbox_alias: &str) -> String {
 /// — `pplx_space_sandbox_residency`'s docs point here for it — and it is the
 /// oracle the executed forms are differentially tested against in
 /// `drain_gate_differential_tests`. Neither of those needs `pub`, since that
-/// test is in this crate; what does is `pplx-space-api`'s
-/// `live_residents_tests`, which uses it cross-crate as the same oracle. So it
-/// stays the definition of the question; it is just not how the question gets
-/// asked. Reach for [`drain_gate_blockers_for_node`] instead, always: this
-/// form's access path does not survive a production-sized `sandboxes`.
+/// test is in this crate; it is exposed under the `test-support` feature for
+/// `pplx-space-api`'s `live_residents_tests`, which uses it cross-crate as the
+/// same oracle. So it stays the definition of the question; it is just not how
+/// the question gets asked. Reach for [`drain_gate_blockers_for_node`]
+/// instead, always: this form's access path does not survive a
+/// production-sized `sandboxes`.
+#[cfg(any(test, feature = "test-support"))]
 pub fn drain_gate_blocks_source_release(sandbox_alias: &str, node_expr: &str) -> String {
     let target_pinned = drain_gate_target_pinned_blocks(sandbox_alias, node_expr);
     let durable = snapshot_durable_for_source_release(sandbox_alias);
@@ -2229,7 +2227,7 @@ pub fn drain_gate_blocks_source_release(sandbox_alias: &str, node_expr: &str) ->
     )
 }
 
-/// The `target_node_id`-attributed half of [`drain_gate_blocks_source_release`]:
+/// The `target_node_id`-attributed half of `drain_gate_blocks_source_release`:
 /// the mid-flight and not-yet-portable lifecycles pinned to the node, without
 /// the in-flight-upload disjunct.
 ///
@@ -2254,7 +2252,7 @@ fn drain_gate_target_pinned_blocks(sandbox_alias: &str, node_expr: &str) -> Stri
     )
 }
 
-/// Batched counterpart of [`drain_gate_blocks_source_release`]: a complete
+/// Batched counterpart of `drain_gate_blocks_source_release`: a complete
 /// `SELECT` yielding one `(node_id, sandbox_id)` pair per sandbox that blocks a
 /// node's drain gate, for an entire set of nodes in one pass.
 ///
@@ -2270,7 +2268,7 @@ fn drain_gate_target_pinned_blocks(sandbox_alias: &str, node_expr: &str) -> Stri
 /// is what this module's `drain_gate_differential_tests` assert against a live
 /// Postgres:
 ///
-/// * The first branch applies [`drain_gate_target_pinned_blocks`] with the node
+/// * The first branch applies `drain_gate_target_pinned_blocks` with the node
 ///   expression bound to `s.target_node_id`, so the lifecycle vocabulary and the
 ///   durability rules are never restated here — only pre-filtered by an
 ///   indexable equality so the planner has a driver. It carries the
@@ -2321,7 +2319,7 @@ pub fn drain_gate_blocker_pairs(node_ids_param: &str) -> String {
 
 /// Complete `SELECT` of the sandbox ids blocking **one** node's drain gate.
 ///
-/// Same rows as [`drain_gate_blocks_source_release`] evaluated for that node,
+/// Same rows as `drain_gate_blocks_source_release` evaluated for that node,
 /// but reached through [`drain_gate_blocker_pairs`] so each of the gate's two
 /// attributions drives off its own indexable column. Use this anywhere a
 /// statement needs one node's blockers — as a `COUNT(*)` source, or inside a
@@ -2357,5 +2355,7 @@ pub mod execution_supersession;
 mod drain_gate_differential_tests;
 #[cfg(test)]
 mod inflight_upload_shape_differential_tests;
+#[cfg(test)]
+mod portable_predicate_tests;
 #[cfg(test)]
 mod queued_artifact_recoverable_tests;

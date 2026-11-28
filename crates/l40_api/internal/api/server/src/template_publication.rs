@@ -1,6 +1,5 @@
 use super::{ClusterApiService, adapter::TemplateOrg};
 use pplx_space_accounts::{NodeId, OrgId, SystemPublicationGrantId, TenantPublicationGrantId};
-use pplx_space_sql_locator::sql;
 use pplx_space_template_model::{TemplateDesiredState, TemplateName};
 use std::collections::BTreeSet;
 use tonic::Status;
@@ -98,16 +97,13 @@ impl ClusterApiService {
     ) -> Result<Option<OrgId>, Status> {
         // Hold the ownership check through registration and tag writes, including
         // against concurrent administrative ownership or lifecycle changes.
-        let (owner, desired_state, managing_org) =
-            sqlx::query_as::<_, (Option<OrgId>, String, Option<OrgId>)>(sql!(
-                "SELECT org_id, desired_state,
-                    (SELECT managing_org_id FROM clusters WHERE singleton)
-             FROM templates WHERE name = $1 FOR UPDATE"
-            ))
-            .bind(name.as_str())
-            .fetch_optional(&mut **tx)
+        let pplx_space_template_store::templates::PublicationOwner {
+            org_id: owner,
+            desired_state,
+            managing_org_id: managing_org,
+        } = pplx_space_template_store::templates::lock_publication_owner(&mut **tx, name)
             .await
-            .map_err(|err| storage_status("lock publication owner", &err))?
+            .map_err(|err| storage_status("lock publication owner", &sqlx::Error::from(err)))?
             .ok_or_else(|| Status::not_found("template does not exist"))?;
         let allowed = match publisher {
             TemplateOrg::Owned { org_id } => owner == Some(org_id),

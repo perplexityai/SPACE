@@ -2011,7 +2011,7 @@ impl Reconciler {
         if !self
             .timed_postgres(
                 "delete-slot-lock-open-slot",
-                WarmPoolStore::lock_open_slot_for_delete(&mut tx, slot.id),
+                WarmPoolStore::lock_open_slot_for_delete(&mut *tx, slot.id),
             )
             .await?
         {
@@ -2031,7 +2031,7 @@ impl Reconciler {
         }
         self.timed_postgres(
             "delete-slot-row",
-            WarmPoolStore::delete_locked_open_slot(&mut tx, slot.id),
+            WarmPoolStore::delete_locked_open_slot(&mut *tx, slot.id),
         )
         .await?;
         self.timed_postgres("delete-slot-txn-commit", tx.commit())
@@ -2104,7 +2104,7 @@ impl Reconciler {
                     .timed_postgres(
                         "delete-claimed-slot-lock",
                         WarmPoolStore::lock_stale_unbound_claimed_slot_for_delete(
-                            &mut tx,
+                            &mut *tx,
                             slot.id,
                             self.claimed_slot_timeout,
                         ),
@@ -2115,7 +2115,7 @@ impl Reconciler {
                 }
                 self.timed_postgres(
                     "delete-claimed-slot-row",
-                    WarmPoolStore::delete_locked_claimed_slot(&mut tx, slot.id),
+                    WarmPoolStore::delete_locked_claimed_slot(&mut *tx, slot.id),
                 )
                 .await?;
                 self.timed_postgres("delete-claimed-slot-txn-commit", tx.commit())
@@ -2140,7 +2140,7 @@ impl Reconciler {
         if !self
             .timed_postgres(
                 "cleanup-pending-lock-slot",
-                WarmPoolStore::lock_cleanup_pending_slot_for_delete(&mut tx, slot.id),
+                WarmPoolStore::lock_cleanup_pending_slot_for_delete(&mut *tx, slot.id),
             )
             .await?
         {
@@ -2148,12 +2148,12 @@ impl Reconciler {
         }
         self.timed_postgres(
             "cleanup-pending-finalize-sandbox-delete",
-            delete_with_dependents(&mut tx, slot.reserved_sandbox_id),
+            delete_with_dependents(&mut *tx, slot.reserved_sandbox_id),
         )
         .await?;
         self.timed_postgres(
             "cleanup-pending-delete-slot-row",
-            WarmPoolStore::delete_locked_cleanup_pending_slot(&mut tx, slot.id),
+            WarmPoolStore::delete_locked_cleanup_pending_slot(&mut *tx, slot.id),
         )
         .await?;
         self.timed_postgres("cleanup-pending-txn-commit", tx.commit())

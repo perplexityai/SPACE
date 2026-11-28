@@ -3,8 +3,10 @@
 
 use pplx_space_accounts::NodeId;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
+use pplx_space_postgres_pool::Executor;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
+use sqlx::FromRow;
 use sqlx::types::Json;
 
 use crate::SandboxStoreError;
@@ -15,12 +17,33 @@ use crate::SandboxStoreError;
 /// live elsewhere are fetched solely for the exists/deleted partition,
 /// and shipping their jsonb policy fleet-wide would multiply the result
 /// bytes ~30x for data the handler discards.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub struct SandboxDesiredStateRow {
     pub sandbox_id: SandboxId,
     pub assigned_here: bool,
     pub snapshots_enabled_desired: Option<bool>,
-    pub auto_lifecycle_json: Option<Json<AutoLifecyclePolicy>>,
+    pub auto_lifecycle_json: Option<AutoLifecyclePolicy>,
+}
+
+/// [`SandboxDesiredStateRow`] as Postgres returns it: the policy still
+/// wrapped for decoding.
+#[derive(FromRow)]
+struct DesiredStateRow {
+    sandbox_id: SandboxId,
+    assigned_here: bool,
+    snapshots_enabled_desired: Option<bool>,
+    auto_lifecycle_json: Option<Json<AutoLifecyclePolicy>>,
+}
+
+impl From<DesiredStateRow> for SandboxDesiredStateRow {
+    fn from(row: DesiredStateRow) -> Self {
+        Self {
+            sandbox_id: row.sandbox_id,
+            assigned_here: row.assigned_here,
+            snapshots_enabled_desired: row.snapshots_enabled_desired,
+            auto_lifecycle_json: row.auto_lifecycle_json.map(|json| json.0),
+        }
+    }
 }
 
 /// Every one of `sandbox_ids` that has a `sandboxes` row, whichever node it is
@@ -29,11 +52,11 @@ pub struct SandboxDesiredStateRow {
 /// into assigned-here, exists-elsewhere or unplaced, and absent (no row at
 /// all).
 pub async fn partition(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_ids: &[SandboxId],
     node_id: NodeId,
 ) -> Result<Vec<SandboxDesiredStateRow>, SandboxStoreError> {
-    Ok(sqlx::query_as::<_, SandboxDesiredStateRow>(sql!(
+    Ok(sqlx::query_as::<_, DesiredStateRow>(sql!(
         "SELECT id AS sandbox_id,
                     (active_node_id = $2) IS TRUE AS assigned_here,
                     CASE WHEN active_node_id = $2
@@ -45,6 +68,9 @@ pub async fn partition(
     ))
     .bind(sandbox_ids)
     .bind(node_id)
-    .fetch_all(executor)
-    .await?)
+    .fetch_all(executor.into_sqlx())
+    .await?
+    .into_iter()
+    .map(SandboxDesiredStateRow::from)
+    .collect())
 }

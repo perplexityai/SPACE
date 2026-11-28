@@ -50,6 +50,12 @@ pub struct SandboxRecord {
     /// change.
     #[serde(default)]
     pub activation_attempt_id: Option<String>,
+    /// The pod UID and external address the node reports for the sandbox's
+    /// current network allocation.
+    #[serde(default)]
+    pub pod_uid: Option<String>,
+    #[serde(default)]
+    pub external_address: Option<String>,
 }
 
 impl SandboxRecord {
@@ -79,11 +85,27 @@ impl SandboxRecord {
             auto_lifecycle_authority: Default::default(),
             route_substrate_kind: None,
             activation_attempt_id: None,
+            pod_uid: None,
+            external_address: None,
         }
     }
 
     pub fn with_pool_template(mut self, pool_template: Option<String>) -> Self {
         self.pool_template = pool_template;
+        self
+    }
+
+    /// Report `execution_generation`'s network allocation for `pod_uid` at
+    /// `external_address`.
+    pub fn with_allocation(
+        mut self,
+        execution_generation: i64,
+        pod_uid: &str,
+        external_address: &str,
+    ) -> Self {
+        self.execution_generation = Some(execution_generation);
+        self.pod_uid = Some(pod_uid.to_owned());
+        self.external_address = Some(external_address.to_owned());
         self
     }
 
@@ -123,11 +145,13 @@ pub struct SimState {
     failing_wakes: Arc<Mutex<HashSet<String>>>,
     refused_artifact_backups: Arc<Mutex<HashMap<String, tonic::Code>>>,
     refused_resource_updates: Arc<Mutex<HashMap<String, tonic::Code>>>,
+    refused_create: Arc<Mutex<Option<tonic::Code>>>,
     snapshot_dir: PathBuf,
     node_id: String,
     fs: crate::fs::SandboxFs,
     last_wait_ready_route_token: Arc<Mutex<Option<String>>>,
     processes: crate::processes::SimProcessTable,
+    sandbox_pod: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -168,12 +192,23 @@ impl SimState {
             failing_wakes: Default::default(),
             refused_artifact_backups: Default::default(),
             refused_resource_updates: Default::default(),
+            refused_create: Default::default(),
             snapshot_dir,
             node_id,
             fs: crate::fs::SandboxFs::new(sandbox_fs_dir),
             last_wait_ready_route_token: Arc::new(Mutex::new(None)),
             processes: crate::processes::SimProcessTable::default(),
+            sandbox_pod: false,
         }
+    }
+
+    /// Serve as a Kubernetes sandbox pod's node, which already runs every
+    /// sandbox it is asked about: `SandboxState` reports an unseen sandbox
+    /// as running, as [`Self::ensure_default_running`] records it, instead of
+    /// missing.
+    pub fn as_sandbox_pod(mut self) -> Self {
+        self.sandbox_pod = true;
+        self
     }
 
     pub(crate) fn node_id(&self) -> &str {
@@ -207,16 +242,14 @@ impl SimState {
         // only surface as an error when `ensure_sandbox_root` tries to
         // create the directory, leaving a poisoned record behind.
         validate_state_sandbox_id(&record.sandbox_id)?;
-        {
-            let mut map = self.inner.lock().await;
-            if map.contains_key(&record.sandbox_id) {
-                return Err(SimStateError::AlreadyExists(record.sandbox_id));
-            }
-            map.insert(record.sandbox_id.clone(), record.clone());
+        let mut map = self.inner.lock().await;
+        if map.contains_key(&record.sandbox_id) {
+            return Err(SimStateError::AlreadyExists(record.sandbox_id));
         }
-        // Eagerly materialize the per-sandbox FS root so spaced file ops have
-        // a directory to operate against. Failures bubble up so callers know
-        // a malformed sandbox-fs-dir would silently strand later writes.
+        // The per-sandbox FS root exists before the record is visible, so
+        // spaced file ops always have a directory to operate against. Failures
+        // bubble up so callers know a malformed sandbox-fs-dir would silently
+        // strand later writes.
         self.fs
             .ensure_sandbox_root(&record.sandbox_id)
             .await
@@ -224,6 +257,7 @@ impl SimState {
                 sandbox_id: record.sandbox_id.clone(),
                 source: std::io::Error::other(err.to_string()),
             })?;
+        map.insert(record.sandbox_id.clone(), record);
         Ok(())
     }
 
@@ -275,6 +309,8 @@ impl SimState {
             auto_lifecycle_authority: Default::default(),
             route_substrate_kind: None,
             activation_attempt_id: None,
+            pod_uid: None,
+            external_address: None,
         };
         // insert_new races are tolerable: another concurrent call already
         // created the record, so fall through to a fresh get().
@@ -343,7 +379,24 @@ impl SimState {
             .remove(sandbox_id)
     }
 
+    /// Refuse the next create, whatever its sandbox, with `code`, as
+    /// sandbox-manager refuses one when the node is full or failing.
+    pub async fn refuse_next_create(&self, code: tonic::Code) {
+        *self.refused_create.lock().await = Some(code);
+    }
+
+    pub(crate) async fn take_create_refusal(&self) -> Option<tonic::Code> {
+        self.refused_create.lock().await.take()
+    }
+
     pub async fn state_of(&self, ids: &[String]) -> (Vec<SandboxRecord>, Vec<String>) {
+        if self.sandbox_pod {
+            for id in ids {
+                // Recorded as a create records it, with its file root; one
+                // whose root cannot be created stays missing below.
+                let _ = self.ensure_default_running(id).await;
+            }
+        }
         let mut map = self.inner.lock().await;
         let mut transitions = self.transition_after_state_read.lock().await;
         let mut found = Vec::with_capacity(ids.len());

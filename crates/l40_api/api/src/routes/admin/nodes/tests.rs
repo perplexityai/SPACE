@@ -43,6 +43,8 @@ fn test_admin_node_row() -> AdminNodeRow {
         drain_mode: None,
         drain_started_at: None,
         drain_last_error: None,
+        drain_engine: None,
+        drain_status: None,
         terminate_decrement_capacity: false,
         node_group_id: None,
         metadata: None,
@@ -343,6 +345,31 @@ fn force_upload_refusal_text_has_no_embedded_indentation() {
             );
         }
     }
+}
+
+/// The force-upload gate aborts on an engine or a phase this build doesn't
+/// know, as an unknown phase did before v2, rather than reading the drain:
+/// it can't tell whether such a drain refuses wakes. Known drains read as
+/// they are.
+#[test]
+fn force_upload_aborts_on_an_unknown_drain() {
+    use pplx_space_node_drain::V2DrainPhase;
+    for (engine, phase, expected) in [
+        (Some("v9"), Some("drained"), "unrecognized drain engine"),
+        (None, Some("unrecognized"), "unrecognized drain phase"),
+        (Some("v2"), Some("unrecognized"), "unrecognized drain phase"),
+    ] {
+        let err = super::force_upload_drain_state(engine, phase, None)
+            .expect_err("an unknown drain aborts the upload");
+        assert!(err.contains(expected), "{err}");
+    }
+    assert_eq!(
+        super::force_upload_drain_state(Some("v2"), Some("drained"), None),
+        Ok(Some(NodeDrain::V2 {
+            phase: V2DrainPhase::Drained
+        }))
+    );
+    assert_eq!(super::force_upload_drain_state(None, None, None), Ok(None));
 }
 
 #[test]
@@ -1592,8 +1619,9 @@ async fn fleet_http_inventory_preserves_legacy_counts_and_explicit_opt_out() -> 
     .bind(nodes[0])
     .execute(&db.pool)
     .await?;
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
     let app = axum::Router::new()
         .route("/admin/api/v1/nodes", axum::routing::get(list_admin_nodes))
         .layer(Extension(AuthUser(actor)))
@@ -1659,8 +1687,9 @@ async fn inventory_reads_skip_locked_sandbox_accounting_but_diagnostics_do_not()
         )
         .await?;
     let state = AppState::from_pool(pool).await?;
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
     let node_id = NodeId::new();
     sqlx::query(sql!(
         "INSERT INTO nodes (id, address, role) VALUES ($1, '127.0.0.1', 'worker'),
@@ -1751,6 +1780,7 @@ async fn inventory_reads_skip_locked_sandbox_accounting_but_diagnostics_do_not()
         ResidencyEvidence::LifecycleOnly,
     )
     .await
+    .map_err(sqlx::Error::from)
     .unwrap_err();
     assert_eq!(
         error.as_database_error().unwrap().code().as_deref(),
@@ -1802,8 +1832,9 @@ async fn node_sandbox_pages_are_scoped_deduplicated_and_complete() -> TestResult
         return Ok(());
     };
     let state = AppState::from_pool(db.pool.clone()).await?;
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
     let node_id = NodeId::new();
     let other_node = Uuid::now_v7();
     sqlx::query(sql!("INSERT INTO nodes (id, address, role) VALUES ($1, '127.0.0.1', 'worker'), ($2, '127.0.0.2', 'worker')"))
@@ -1924,8 +1955,9 @@ async fn node_sandbox_history_filters_orders_and_pages_by_change() -> TestResult
         return Ok(());
     };
     let state = AppState::from_pool(db.pool.clone()).await?;
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
     let node_id = NodeId::new();
     let other_node = NodeId::new();
     sqlx::query(sql!("INSERT INTO nodes (id, address, role) VALUES ($1, '127.0.0.3', 'worker'), ($2, '127.0.0.4', 'worker')"))
@@ -2345,8 +2377,9 @@ async fn direct_refuses_node_drain_and_cordon_before_writing() -> TestResult {
         return Ok(());
     };
     let state = AppState::from_pool(db.pool.clone()).await?;
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
     let refused = serde_json::json!({
         "error": "node drain and cordon are not supported on the Direct substrate"
     });
@@ -2410,8 +2443,9 @@ async fn direct_undrain_clears_a_phase_an_earlier_drain_left() -> TestResult {
         return Ok(());
     };
     let state = AppState::from_pool(db.pool.clone()).await?;
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
     let node_id =
         insert_drain_test_node(&db.pool, NodeManagedBy::Space, Some(PHASE_DRAINING)).await?;
 
@@ -2483,8 +2517,9 @@ async fn kubernetes_node_drain_and_cordon_converge_the_node() -> TestResult {
             ),
         ),
     );
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
 
     for (action, phase, unschedulable, phase_after) in [
         (DrainAction::Drain, None, Some(true), Some(PHASE_DRAINING)),
@@ -2573,8 +2608,9 @@ async fn node_inspection_reports_execution_receipt_independently_of_heartbeat() 
         return Ok(());
     };
     let state = AppState::from_pool(db.pool.clone()).await?;
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
     let node_id = NodeId::new();
     pplx_space_db_test_fixtures::insert_ready_worker_node(&db.pool, node_id).await?;
     for collection in [None, Some("complete"), Some("unavailable"), Some("legacy")] {
@@ -2667,11 +2703,8 @@ async fn node_inspection_reports_execution_receipt_independently_of_heartbeat() 
         assert_eq!(observation.policy.is_some(), expected);
         assert_eq!(observation.policy_received_at.is_some(), expected);
         let mut tx = db.pool.begin().await?;
-        assert!(
-            node_store::lock_node_for_update(&mut tx, node_id)
-                .await?
-                .is_some()
-        );
+        let row: Option<AdminNodeRow> = direct::lock_admin_node(&mut *tx, node_id).await?;
+        assert!(row.is_some());
         tx.rollback().await?;
     }
     Ok(())
@@ -2760,7 +2793,7 @@ async fn node_reads_report_cordon_group_trigger_and_runtimes() -> TestResult {
     .bind(busy)
     .execute(&db.pool)
     .await?;
-    crate::reconcile_trigger::enqueue_triggers(
+    pplx_space_cluster_trigger_queue::enqueue_triggers(
         &db.pool,
         [busy],
         pplx_space_state_reconciliation::ReconcileReason::ManualNodeReconcile,
@@ -2798,8 +2831,9 @@ async fn node_reads_report_cordon_group_trigger_and_runtimes() -> TestResult {
             ],
         )),
     );
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
     for (state, busy_cordoned, idle_cordoned) in
         [(direct, None, None), (kubernetes, Some(true), Some(false))]
     {
@@ -2897,10 +2931,11 @@ async fn node_reads_survive_a_failed_read_state_read() -> TestResult {
         )
         .await?;
     let state = AppState::from_pool(pool).await?;
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
     let node_id = insert_drain_test_node(&db.pool, NodeManagedBy::Space, None).await?;
-    crate::reconcile_trigger::enqueue_triggers(
+    pplx_space_cluster_trigger_queue::enqueue_triggers(
         &db.pool,
         [node_id],
         pplx_space_state_reconciliation::ReconcileReason::ManualNodeReconcile,
@@ -2981,8 +3016,9 @@ async fn node_holds_reports_each_row_with_its_gates_and_refuses_as_its_siblings(
         return Ok(());
     };
     let state = AppState::from_pool(db.pool.clone()).await?;
-    let actor =
-        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let actor = inventory_test_actor(
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?,
+    );
     let node_id = NodeId::new();
     sqlx::query(sql!(
         "INSERT INTO nodes (id, address, role) VALUES ($1, '127.0.0.6', 'worker')"
@@ -3074,4 +3110,26 @@ async fn node_holds_reports_each_row_with_its_gates_and_refuses_as_its_siblings(
     member.role = UserRole::Member;
     assert_eq!(holds(member, node_id).await.status(), StatusCode::FORBIDDEN);
     Ok(())
+}
+
+#[test]
+fn the_evacuation_cap_is_validated_only_while_drain_v2_is_on() {
+    for raw in ["0", "1025", "four", ""] {
+        assert!(
+            drain_v2_max_evacuating_nodes(true, Some(raw)).is_err(),
+            "{raw:?} must stop an API with drain v2 on from starting"
+        );
+        assert_eq!(
+            drain_v2_max_evacuating_nodes(false, Some(raw)),
+            Ok(drain_v2::DEFAULT_DRAIN_V2_MAX_EVACUATING_NODES),
+            "{raw:?} must be ignored while drain v2 is off"
+        );
+    }
+    for enabled in [true, false] {
+        assert_eq!(drain_v2_max_evacuating_nodes(enabled, Some(" 2 ")), Ok(2));
+        assert_eq!(
+            drain_v2_max_evacuating_nodes(enabled, None),
+            Ok(drain_v2::DEFAULT_DRAIN_V2_MAX_EVACUATING_NODES)
+        );
+    }
 }

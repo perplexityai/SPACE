@@ -233,7 +233,7 @@ async fn snapshot_catalog_store_contract() -> TestResult {
     };
     let snapshot = make_snapshot(expected_uri.clone());
     let mut insert_tx = db.pool.begin().await?;
-    let (inserted, outcome) = insert(&mut insert_tx, &snapshot).await?;
+    let (inserted, outcome) = insert(&mut *insert_tx, &snapshot).await?;
     assert_eq!(outcome, InsertOutcome::Created);
     assert_eq!(inserted.id(), inserted_snapshot_id);
     // The capture's generation is recorded with the attempt.
@@ -248,7 +248,7 @@ async fn snapshot_catalog_store_contract() -> TestResult {
     insert_tx.commit().await?;
 
     let mut retry_tx = db.pool.begin().await?;
-    let (retried, outcome) = insert(&mut retry_tx, &snapshot).await?;
+    let (retried, outcome) = insert(&mut *retry_tx, &snapshot).await?;
     assert_eq!(outcome, InsertOutcome::AlreadyRegistered);
     assert_eq!(retried, inserted);
     retry_tx.commit().await?;
@@ -268,14 +268,14 @@ async fn snapshot_catalog_store_contract() -> TestResult {
             .with_host_cpu(Some(HostCpu::parse("genuineintel-6-85-7")?)),
     );
     let mut host_cpu_retry_tx = db.pool.begin().await?;
-    let (retried, outcome) = insert(&mut host_cpu_retry_tx, &replay_with_host_cpu).await?;
+    let (retried, outcome) = insert(&mut *host_cpu_retry_tx, &replay_with_host_cpu).await?;
     assert_eq!(outcome, InsertOutcome::AlreadyRegistered);
     assert_eq!(retried, inserted);
     host_cpu_retry_tx.commit().await?;
 
     let mut location_conflict_tx = db.pool.begin().await?;
     let error = insert(
-        &mut location_conflict_tx,
+        &mut *location_conflict_tx,
         &make_snapshot(different_uri.clone()),
     )
     .await
@@ -296,7 +296,7 @@ async fn snapshot_catalog_store_contract() -> TestResult {
     let conflicting_snapshot =
         make_snapshot(expected_uri.clone()).with_artifact(conflicting_artifact);
     let mut identity_conflict_tx = db.pool.begin().await?;
-    let error = insert(&mut identity_conflict_tx, &conflicting_snapshot)
+    let error = insert(&mut *identity_conflict_tx, &conflicting_snapshot)
         .await
         .expect_err("one snapshot ID cannot identify two snapshots");
     assert!(matches!(
@@ -406,8 +406,8 @@ async fn snapshot_catalog_store_contract() -> TestResult {
     ));
 
     let mut delete_tx = db.pool.begin().await?;
-    assert!(delete_snapshot_catalog(&mut delete_tx, snapshot_id).await?);
-    assert!(!delete_snapshot_catalog(&mut delete_tx, snapshot_id).await?);
+    assert!(delete_snapshot_catalog(&mut *delete_tx, snapshot_id).await?);
+    assert!(!delete_snapshot_catalog(&mut *delete_tx, snapshot_id).await?);
     assert!(get(&mut *delete_tx, snapshot_id).await?.is_none());
     delete_tx.rollback().await?;
     let restored = get(&db.pool, snapshot_id)
@@ -460,7 +460,7 @@ async fn artifact_digests_follow_their_snapshot() -> TestResult {
         },
     ];
     let mut tx = db.pool.begin().await?;
-    record_artifact_digests(&mut tx, snapshot_id, &digests).await?;
+    record_artifact_digests(&mut *tx, snapshot_id, &digests).await?;
     tx.commit().await?;
 
     let mut expected = digests.to_vec();
@@ -470,11 +470,11 @@ async fn artifact_digests_follow_their_snapshot() -> TestResult {
     // An identical replay is a no-op; a conflicting one is refused and
     // leaves the recorded digests untouched.
     let mut tx = db.pool.begin().await?;
-    record_artifact_digests(&mut tx, snapshot_id, &digests[..1]).await?;
+    record_artifact_digests(&mut *tx, snapshot_id, &digests[..1]).await?;
     tx.commit().await?;
     let mut tx = db.pool.begin().await?;
     let conflict = record_artifact_digests(
-        &mut tx,
+        &mut *tx,
         snapshot_id,
         &[SnapshotArtifactDigest {
             artifact: SnapshotArtifactFile::VmState,
@@ -492,7 +492,7 @@ async fn artifact_digests_follow_their_snapshot() -> TestResult {
     assert_eq!(artifact_digests(&db.pool, snapshot_id).await?, expected);
 
     let mut tx = db.pool.begin().await?;
-    assert!(delete_snapshot_catalog(&mut tx, snapshot_id).await?);
+    assert!(delete_snapshot_catalog(&mut *tx, snapshot_id).await?);
     tx.commit().await?;
     assert!(artifact_digests(&db.pool, snapshot_id).await?.is_empty());
     Ok(())

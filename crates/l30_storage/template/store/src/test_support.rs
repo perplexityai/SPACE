@@ -2,8 +2,8 @@
 //! behind the `test-support` feature; enable it only from
 //! `[dev-dependencies]`.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Point `tag` of `template_name` at `release`, as a tag written before the
@@ -12,11 +12,11 @@ use uuid::Uuid;
 /// `pplx_space_template_release_store::spelling_pairs` tag the pair's other
 /// release with it.
 pub async fn tag_release(
-    pool: &PgPool,
+    executor: impl Executor<'_>,
     template_name: &str,
     release: Uuid,
     tag: &str,
-) -> sqlx::Result<()> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "INSERT INTO template_release_tags (template_release_id, template_name, tag)
          VALUES ($1, $2, $3)
@@ -27,7 +27,7 @@ pub async fn tag_release(
     .bind(release)
     .bind(template_name)
     .bind(tag)
-    .execute(pool)
-    .await
-    .map(drop)
+    .execute(executor.into_sqlx())
+    .await?;
+    Ok(())
 }

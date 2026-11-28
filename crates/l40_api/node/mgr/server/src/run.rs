@@ -77,6 +77,8 @@ const ENV_TARGET_READY: &[&str] = &["SPACE_NODEMGR_NETWORK_POOL_TARGET"];
 const ENV_RETAINED_READY: &[&str] = &["SPACE_NODEMGR_NETWORK_POOL_RETAIN_READY"];
 const ENV_MIN_READY: &[&str] = &["SPACE_NODEMGR_NETWORK_POOL_MIN_READY"];
 const ENV_SANDBOX_CGROUP_MEMORY_MIB: &str = "SPACE_NODEMGR_SANDBOX_CGROUP_MEMORY_MIB";
+const ENV_SANDBOX_CGROUP_PARENT_MEMORY_RESERVE_MIB: &str =
+    "SPACE_NODEMGR_SANDBOX_CGROUP_PARENT_MEMORY_RESERVE_MIB";
 const ENV_SERVICE_PORT_INGRESS_ISOLATION: &[&str] =
     &["SPACE_NODEMGR_SERVICE_PORT_INGRESS_ISOLATION"];
 const ENV_DISK_IO_RESERVATION_ENABLED: &[&str] = &["SPACE_NODEMGR_DISK_IO_RESERVATION_ENABLED"];
@@ -126,6 +128,9 @@ pub struct NodeMgrRunConfig {
     pub sandbox_cgroup_memory_mib: Option<u64>,
     /// Firecracker cgroup cpu.max vCPU count for launched sandboxes.
     pub sandbox_cgroup_vcpu_count: Option<u32>,
+    /// Host memory reserved outside the parent sandbox cgroup, in MiB.
+    /// `None` reserves 10% of host RAM.
+    pub sandbox_cgroup_parent_memory_reserve_mib: Option<u64>,
     /// Node memory kept available in addition to a new sandbox cgroup demand,
     /// in MiB.
     pub memory_admission_reserve_mib: Option<u64>,
@@ -262,6 +267,7 @@ struct NetworkPoolFileConfig {
 struct SandboxCgroupFileConfig {
     vcpu_count: Option<u32>,
     memory_mib: Option<u64>,
+    parent_memory_reserve_mib: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -483,6 +489,24 @@ fn resolve_sandbox_cgroup_config(
     Ok(config)
 }
 
+fn resolve_parent_memory_reserve_mib(
+    cli: &NodeMgrRunConfig,
+    file: &SandboxCgroupFileConfig,
+) -> Result<Option<u64>, RunNodeMgrError> {
+    let env = if cli.sandbox_cgroup_parent_memory_reserve_mib.is_some() {
+        None
+    } else {
+        env_u64(ENV_SANDBOX_CGROUP_PARENT_MEMORY_RESERVE_MIB)?.map(Some)
+    };
+    Ok(setting(
+        "sandbox_cgroup.parent_memory_reserve_mib",
+        cli.sandbox_cgroup_parent_memory_reserve_mib.map(Some),
+        env,
+        file.parent_memory_reserve_mib.map(Some),
+        None,
+    ))
+}
+
 fn resolve_memory_admission_config(
     cli: &NodeMgrRunConfig,
     file: &MemoryAdmissionFileConfig,
@@ -615,6 +639,7 @@ pub async fn run(
     let file = read_node_config(&cli.config_path)?;
     let pool_config = resolve_pool_config(&cli, &file.network_pool)?;
     let sandbox_cgroup_config = resolve_sandbox_cgroup_config(&cli, &file.sandbox_cgroup)?;
+    let parent_memory_reserve_mib = resolve_parent_memory_reserve_mib(&cli, &file.sandbox_cgroup)?;
     let memory_admission_config = resolve_memory_admission_config(&cli, &file.memory_admission)?;
     let mut disk_io_reservation_config =
         resolve_disk_io_reservation_config(file.disk_io_reservation)?;
@@ -703,8 +728,9 @@ pub async fn run(
     let sandbox_parent_cpu_limit =
         crate::cgroup::apply_parent_cpu_reservation(parent_cpu_reserved_count)
             .map_err(RunNodeMgrError::ApplyParentCpuLimit)?;
-    let sandbox_parent_memory_limit = crate::cgroup::apply_parent_memory_limit()
-        .map_err(RunNodeMgrError::ApplyParentMemoryLimit)?;
+    let sandbox_parent_memory_limit =
+        crate::cgroup::apply_parent_memory_limit(parent_memory_reserve_mib)
+            .map_err(RunNodeMgrError::ApplyParentMemoryLimit)?;
     let sandbox_parent_disk_io_reservation =
         crate::disk_io_reservation::apply_parent_disk_io_reservation(&disk_io_reservation_config)
             .map_err(RunNodeMgrError::ApplyParentDiskIoReservation)?;
@@ -863,6 +889,7 @@ pub async fn run(
             sandbox_cgroup_parent_cpu_reserved_count = sandbox_parent_cpu_limit.reserved_count,
             sandbox_cgroup_parent_cpu_max = sandbox_parent_cpu_limit.cpu_max,
             host_memory_bytes = sandbox_parent_memory_limit.host_memory_bytes,
+            sandbox_cgroup_parent_memory_reserve_bytes = sandbox_parent_memory_limit.reserve_bytes,
             sandbox_cgroup_parent_memory_max = sandbox_parent_memory_limit.memory_max,
             sandbox_cgroup_parent_memory_swap_max = sandbox_parent_memory_limit.memory_swap_max,
             sandbox_cgroup_parent_disk_io_mode = sandbox_parent_disk_io_reservation.mode(),
@@ -882,11 +909,22 @@ pub async fn run(
             shutdown_token.child_token(),
             &task_tracker,
         );
+        crate::service::node_memory_metrics::start_node_memory_metrics(
+            std::path::PathBuf::from(pplx_space_node_runtime_core::cgroup_paths::CGROUP_BASE),
+            shutdown_token.child_token(),
+            &task_tracker,
+        );
         crate::service::network_pool_metrics::start_network_pool_metrics(
             service.pool(),
             shutdown_token.child_token(),
             &task_tracker,
         );
+        crate::service::node_cpu_metrics::start_node_cpu_metrics(
+            shutdown_token.child_token(),
+            &task_tracker,
+        );
+        #[cfg(target_os = "linux")]
+        crate::service::cgroup_oom::start(shutdown_token.child_token(), &task_tracker);
         service
             .disk_admission()
             .start_refresh_loop(shutdown_token.child_token(), &task_tracker);

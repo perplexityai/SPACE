@@ -54,7 +54,7 @@ fn build_row(name: &str, content_hash: &str) -> crate::db::BuildRow {
     }
 }
 
-fn insert_ready_build(conn: &rusqlite::Connection, name: &str, content_hash: &str) {
+fn insert_ready_build(conn: &crate::db::Connection, name: &str, content_hash: &str) {
     crate::db::upsert_build(
         conn,
         &crate::db::BuildUpsert {
@@ -1540,7 +1540,7 @@ fn cached_base_fixture() -> CachedBaseFixture {
         crate::db::PolicyAuthority::Local,
     )
     .unwrap();
-    conn.execute(
+    conn.raw().execute(
         "UPDATE template_builds SET build_date = '2026-09-16T00:00:00Z' WHERE content_hash = ?1",
         [&hash_b],
     )
@@ -1829,6 +1829,7 @@ async fn a_cached_only_hit_refreshes_its_build_s_lru_recency() {
         .db
         .lock()
         .unwrap()
+        .raw()
         .execute(
             "UPDATE template_builds SET last_used_at = '0' WHERE content_hash = ?1",
             [&hash],
@@ -2409,6 +2410,7 @@ fn resolve_template_advances_last_used_at_on_both_paths() {
         )
     );
     let after_explicit: u64 = conn
+        .raw()
         .query_row(
             "SELECT last_used_at FROM template_builds WHERE name = ?1 AND content_hash = ?2",
             params![
@@ -2436,6 +2438,7 @@ fn resolve_template_advances_last_used_at_on_both_paths() {
     .unwrap();
     let _ = TemplateManagerService::resolve_template_build(&conn, "seed", "", None).unwrap();
     let after_latest: u64 = conn
+        .raw()
         .query_row(
             "SELECT last_used_at FROM template_builds WHERE name = ?1 AND content_hash = ?2",
             params![
@@ -2487,12 +2490,13 @@ fn resolve_template_filters_out_deleting_state_rows() {
     let _ = TemplateManagerService::resolve_template_build(&conn, "seed", hash, None).unwrap();
 
     // Eviction Phase 1 flips state.
-    conn.execute(
-        "UPDATE template_builds SET state = 'deleting'
+    conn.raw()
+        .execute(
+            "UPDATE template_builds SET state = 'deleting'
          WHERE name = ?1 AND content_hash = ?2",
-        params!["seed", hash],
-    )
-    .unwrap();
+            params!["seed", hash],
+        )
+        .unwrap();
 
     // Resolution now refuses to hand out a doomed build.
     let err =

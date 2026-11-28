@@ -8,7 +8,6 @@ use pplx_space_execution_spec::{
 };
 use pplx_space_execution_spec::{ArtifactFormat, ArtifactVersion};
 use pplx_space_template_manifest::TemplateManifest;
-use rusqlite::Connection;
 
 use super::*;
 
@@ -179,11 +178,12 @@ fn same_date_builds_resolve_to_the_larger_content_hash() {
     );
 
     // A latest row that doesn't decode is an error, not a missing build.
-    conn.execute(
-        "UPDATE template_builds SET artifact_size_bytes = -1 WHERE content_hash = ?1",
-        [larger],
-    )
-    .unwrap();
+    conn.raw()
+        .execute(
+            "UPDATE template_builds SET artifact_size_bytes = -1 WHERE content_hash = ?1",
+            [larger],
+        )
+        .unwrap();
     get_latest_build(&conn, NAME, None).unwrap_err();
     get_latest_build_in_partition(&conn, NAME, TemplateCachePartition::Legacy).unwrap_err();
 }
@@ -212,12 +212,15 @@ fn an_environment_partition_s_latest_build_skips_rows_bound_elsewhere() {
     )
     .unwrap();
     // The store refuses this filing; the runtime connection enforces no keys.
-    conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
-    conn.execute(
-        "UPDATE template_builds SET cache_partition = ?1 WHERE content_hash = ?2",
-        rusqlite::params![twin().key(), misfiled],
-    )
-    .unwrap();
+    conn.raw()
+        .execute_batch("PRAGMA foreign_keys = OFF")
+        .unwrap();
+    conn.raw()
+        .execute(
+            "UPDATE template_builds SET cache_partition = ?1 WHERE content_hash = ?2",
+            rusqlite::params![twin().key(), misfiled],
+        )
+        .unwrap();
 
     assert_eq!(
         get_latest_build_in_partition(&conn, NAME, twin())
@@ -408,7 +411,8 @@ fn a_cloud_hypervisor_environment_build_fills_a_pool_from_its_partition() {
         &cloud_hypervisor_manifest(),
     );
     assert_ne!(partition, TemplateCachePartition::Legacy);
-    conn.execute("UPDATE template_builds SET last_used_at = '0'", [])
+    conn.raw()
+        .execute("UPDATE template_builds SET last_used_at = '0'", [])
         .unwrap();
 
     let refill = crate::pool_manager::pool_refill_build(&conn, NAME)
@@ -420,7 +424,7 @@ fn a_cloud_hypervisor_environment_build_fills_a_pool_from_its_partition() {
         (CH_HASH, partition)
     );
     let last_used: String = conn
-        .query_row(
+        .raw().query_row(
             "SELECT last_used_at FROM template_builds WHERE content_hash = ?1 AND cache_partition = ?2",
             rusqlite::params![CH_HASH, partition.key()],
             |row| row.get(0),
@@ -513,18 +517,22 @@ fn pools_skip_environment_rows_filed_outside_their_binding_partition(#[case] mis
     if misfiled {
         // The store refuses this filing; the runtime connection enforces no
         // keys.
-        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
-        conn.execute(
-            "UPDATE template_builds SET cache_partition = ?1 WHERE content_hash = ?2",
-            rusqlite::params![twin().key(), CH_HASH],
-        )
-        .unwrap();
+        conn.raw()
+            .execute_batch("PRAGMA foreign_keys = OFF")
+            .unwrap();
+        conn.raw()
+            .execute(
+                "UPDATE template_builds SET cache_partition = ?1 WHERE content_hash = ?2",
+                rusqlite::params![twin().key(), CH_HASH],
+            )
+            .unwrap();
     } else {
-        conn.execute(
-            "UPDATE template_builds SET execution_metadata_json = '{' WHERE content_hash = ?1",
-            [CH_HASH],
-        )
-        .unwrap();
+        conn.raw()
+            .execute(
+                "UPDATE template_builds SET execution_metadata_json = '{' WHERE content_hash = ?1",
+                [CH_HASH],
+            )
+            .unwrap();
     }
     assert!(
         crate::pool_manager::pool_base_build(&conn, NAME)
@@ -675,6 +683,7 @@ fn twins_keep_separate_components_and_base_snapshots() {
     let conn = test_conn();
     seed_twins(&conn);
     let components: i64 = conn
+        .raw()
         .query_row(
             "SELECT COUNT(*) FROM template_build_components",
             [],
@@ -714,6 +723,7 @@ fn twins_keep_separate_components_and_base_snapshots() {
         Some("legacy")
     );
     let components: i64 = conn
+        .raw()
         .query_row(
             "SELECT COUNT(*) FROM template_build_components WHERE cache_partition = ''",
             [],
@@ -721,6 +731,7 @@ fn twins_keep_separate_components_and_base_snapshots() {
         )
         .unwrap();
     let twin_components: i64 = conn
+        .raw()
         .query_row(
             "SELECT COUNT(*) FROM template_build_components WHERE cache_partition != ''",
             [],
@@ -753,6 +764,7 @@ fn builds_are_refused_outside_their_binding_partition() {
         );
     }
     let rows: i64 = conn
+        .raw()
         .query_row("SELECT COUNT(*) FROM template_builds", [], |row| row.get(0))
         .unwrap();
     assert_eq!(rows, 0);
@@ -776,15 +788,16 @@ fn builds_are_refused_outside_their_binding_partition() {
 
 #[test]
 fn tag_pins_are_kept_per_partition_and_protect_the_digest() {
-    let conn = std::sync::Arc::new(std::sync::Mutex::new(test_conn()));
+    let conn = crate::db::SharedConnection::new(test_conn());
     seed_twins(&conn.lock().unwrap());
-    let pins = crate::pinned_digests::PinnedDigestsStore::new(std::sync::Arc::clone(&conn));
+    let pins = crate::pinned_digests::PinnedDigestsStore::new(conn.clone());
     pins.upsert_tag(NAME, "latest", TemplateCachePartition::Legacy, HASH)
         .unwrap();
     pins.upsert_tag(NAME, "latest", twin(), HASH).unwrap();
     let count: i64 = conn
         .lock()
         .unwrap()
+        .raw()
         .query_row(
             "SELECT COUNT(*) FROM template_pinned_tags WHERE name = ?1 AND tag = 'latest'",
             [NAME],
@@ -806,10 +819,12 @@ fn apply(conn: &Connection, version: i64, up: bool) {
     }) {
         // As the production migrator runs it: foreign keys enforced, one
         // transaction per migration. The runtime connection leaves them off.
-        conn.execute_batch("PRAGMA foreign_keys = ON; BEGIN;")
+        conn.raw()
+            .execute_batch("PRAGMA foreign_keys = ON; BEGIN;")
             .unwrap();
-        conn.execute_batch(migration.sql.as_ref()).unwrap();
-        conn.execute_batch("COMMIT; PRAGMA foreign_keys = OFF;")
+        conn.raw().execute_batch(migration.sql.as_ref()).unwrap();
+        conn.raw()
+            .execute_batch("COMMIT; PRAGMA foreign_keys = OFF;")
             .unwrap();
     }
 }
@@ -819,7 +834,7 @@ fn apply_common_and_baseline(conn: &Connection) {
         .iter()
         .filter(|migration| migration.migration_type.is_up_migration())
     {
-        conn.execute_batch(migration.sql.as_ref()).unwrap();
+        conn.raw().execute_batch(migration.sql.as_ref()).unwrap();
     }
     apply(conn, 20260930000000, true);
 }
@@ -828,9 +843,9 @@ const PARTITIONS: i64 = 20261026220935;
 
 #[test]
 fn partition_migration_keeps_existing_rows_in_the_legacy_partition() {
-    let conn = Connection::open_in_memory().unwrap();
+    let conn = Connection::open_in_memory();
     apply_common_and_baseline(&conn);
-    conn.execute_batch(&format!(
+    conn.raw().execute_batch(&format!(
         "INSERT INTO template_builds (name, content_hash, build_date, manifest_json, runtime, arch, created_at)
          VALUES ('{NAME}', '{HASH}', 'd', '{{}}', 'fc', 'x86_64', '1');
          INSERT INTO template_build_components (name, content_hash, kind, role_key)
@@ -847,6 +862,7 @@ fn partition_migration_keeps_existing_rows_in_the_legacy_partition() {
     // temporary table the migration built it as.
     for child in ["template_build_components", "template_snapshots"] {
         let parents: Vec<String> = conn
+            .raw()
             .prepare(&format!(
                 "SELECT DISTINCT \"table\" FROM pragma_foreign_key_list('{child}')"
             ))
@@ -865,11 +881,12 @@ fn partition_migration_keeps_existing_rows_in_the_legacy_partition() {
         "template_pinned_tags",
     ] {
         let partitions: Vec<String> = conn
+            .raw()
             .prepare(&format!("SELECT cache_partition FROM {table}"))
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
-            .collect::<Result<_>>()
+            .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(partitions, [""], "{table}");
     }
@@ -891,16 +908,17 @@ fn partition_migration_keeps_existing_rows_in_the_legacy_partition() {
 /// deleted builds behind; the migrations drop them rather than fail on them.
 #[test]
 fn partition_migrations_drop_child_rows_of_deleted_builds() {
-    let conn = Connection::open_in_memory().unwrap();
+    let conn = Connection::open_in_memory();
     apply_common_and_baseline(&conn);
     let orphans = |conn: &Connection| {
-        conn.execute(
-            "INSERT INTO template_build_components (name, content_hash, kind, role_key)
+        conn.raw()
+            .execute(
+                "INSERT INTO template_build_components (name, content_hash, kind, role_key)
              VALUES (?1, ?2, 'kernel', '')",
-            [NAME, HASH],
-        )
-        .unwrap();
-        conn.execute(
+                [NAME, HASH],
+            )
+            .unwrap();
+        conn.raw().execute(
             "INSERT INTO template_snapshots (name, content_hash, vcpu, memory_mib, snapshot_hash, built_at)
              VALUES (?1, ?2, 2, 1024, 'orphan', '0')",
             [NAME, HASH],
@@ -908,10 +926,11 @@ fn partition_migrations_drop_child_rows_of_deleted_builds() {
         .unwrap();
     };
     let count = |conn: &Connection, table: &str| -> i64 {
-        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-            row.get(0)
-        })
-        .unwrap()
+        conn.raw()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
     };
     orphans(&conn);
 
@@ -927,7 +946,7 @@ fn partition_migrations_drop_child_rows_of_deleted_builds() {
 
 #[test]
 fn partition_down_migration_keeps_only_legacy_rows() {
-    let conn = Connection::open_in_memory().unwrap();
+    let conn = Connection::open_in_memory();
     apply_common_and_baseline(&conn);
     apply(&conn, PARTITIONS, true);
     seed_twins(&conn);
@@ -942,34 +961,37 @@ fn partition_down_migration_keeps_only_legacy_rows() {
         ("legacy-stamp", TemplateCachePartition::Legacy),
         ("twin-stamp", twin()),
     ] {
-        conn.execute(
-            "INSERT INTO jobs (job_id, kind, payload) VALUES (?1, ?2, ?3)",
-            rusqlite::params![
-                job_id,
-                crate::background_jobs::STAMP_JOB_KIND,
-                serde_json::to_string(&crate::background_jobs::StampPayload::new(
-                    NAME, HASH, partition
-                ))
-                .unwrap(),
-            ],
-        )
-        .unwrap();
+        conn.raw()
+            .execute(
+                "INSERT INTO jobs (job_id, kind, payload) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    job_id,
+                    crate::background_jobs::STAMP_JOB_KIND,
+                    serde_json::to_string(&crate::background_jobs::StampPayload::new(
+                        NAME, HASH, partition
+                    ))
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
     }
     // Jobs whose payload isn't JSON survive untouched.
     for (job_id, kind) in [
         ("empty-stamp", crate::background_jobs::STAMP_JOB_KIND),
         ("empty-other", "other"),
     ] {
-        conn.execute(
-            "INSERT INTO jobs (job_id, kind, payload) VALUES (?1, ?2, '')",
-            [job_id, kind],
-        )
-        .unwrap();
+        conn.raw()
+            .execute(
+                "INSERT INTO jobs (job_id, kind, payload) VALUES (?1, ?2, '')",
+                [job_id, kind],
+            )
+            .unwrap();
     }
 
     apply(&conn, PARTITIONS, false);
     for child in ["template_build_components", "template_snapshots"] {
         let parents: Vec<String> = conn
+            .raw()
             .prepare(&format!(
                 "SELECT DISTINCT \"table\" FROM pragma_foreign_key_list('{child}')"
             ))
@@ -982,6 +1004,7 @@ fn partition_down_migration_keeps_only_legacy_rows() {
     }
 
     let jobs: Vec<String> = conn
+        .raw()
         .prepare("SELECT job_id FROM jobs ORDER BY job_id")
         .unwrap()
         .query_map([], |row| row.get(0))
@@ -991,6 +1014,7 @@ fn partition_down_migration_keeps_only_legacy_rows() {
     assert_eq!(jobs, ["empty-other", "empty-stamp", "legacy-stamp"]);
 
     let builds: i64 = conn
+        .raw()
         .query_row(
             "SELECT COUNT(*) FROM template_builds WHERE name = ?1 AND content_hash = ?2",
             [NAME, HASH],
@@ -998,6 +1022,7 @@ fn partition_down_migration_keeps_only_legacy_rows() {
         )
         .unwrap();
     let snapshot: String = conn
+        .raw()
         .query_row(
             "SELECT snapshot_hash FROM template_snapshots WHERE name = ?1",
             [NAME],
@@ -1012,11 +1037,12 @@ fn a_twin_mid_eviction_holds_back_pulls_of_its_digest() {
     let conn = test_conn();
     seed_twins(&conn);
     assert!(!is_build_marked_deleting(&conn, NAME, HASH).unwrap());
-    conn.execute(
-        "UPDATE template_builds SET state = 'deleting' WHERE cache_partition = ?1",
-        [twin().key()],
-    )
-    .unwrap();
+    conn.raw()
+        .execute(
+            "UPDATE template_builds SET state = 'deleting' WHERE cache_partition = ?1",
+            [twin().key()],
+        )
+        .unwrap();
     // A pull learns its partition only from the release manifest.
     assert!(is_build_marked_deleting(&conn, NAME, HASH).unwrap());
 }

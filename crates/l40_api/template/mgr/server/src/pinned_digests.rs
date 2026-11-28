@@ -18,48 +18,43 @@
 //!
 //! `pplx-space-template-mgr-store` owns both tables, and its [`pins`]
 //! module holds their statements. [`PinnedDigestsStore`] mirrors
-//! [`WarmPoolStore`] in `pplx-space-cluster-pool`: per-domain struct
+//! `WarmPoolStore` in `pplx-space-cluster-pool`: per-domain struct
 //! holding a connection handle, methods that lock it and call the
-//! store, no trait abstraction. The prunes that build a placeholder per
-//! listed template or kept key still issue their statements here. Methods are synchronous
-//! because the on-node SQLite database is wrapped in
-//! `Arc<Mutex<Connection>>` and must be locked under a
+//! store, no trait abstraction. Methods are synchronous
+//! because the on-node SQLite database is wrapped in a
+//! [`SharedConnection`] and must be locked under a
 //! `tokio::task::spawn_blocking` boundary anyway — async wrappers here
 //! would add a layer without removing the boundary.
-//!
-//! [`WarmPoolStore`]: pplx_space_cluster_pool::WarmPoolStore
-
-use std::sync::{Arc, Mutex, MutexGuard};
-
-use rusqlite::{Connection, Result};
 
 use pplx_space_template_mgr_store::pins;
 
+use crate::db::{ConnectionGuard, Result, SharedConnection, Transaction};
+
 /// Pinned-digest store backing the template-manager prefetcher.
 ///
-/// Cheap to clone — wraps the shared `Arc<Mutex<Connection>>` that
+/// Cheap to clone — wraps the [`SharedConnection`] that
 /// every template-manager subsystem already uses to serialize SQLite
 /// access.
 #[derive(Clone)]
 pub struct PinnedDigestsStore {
-    conn: Arc<Mutex<Connection>>,
+    conn: SharedConnection,
 }
 
 impl PinnedDigestsStore {
-    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
+    pub fn new(conn: SharedConnection) -> Self {
         Self { conn }
     }
 
     /// Borrow the underlying connection handle. Exposed for callers
     /// like the volume puller that mutate `template_builds` against
-    /// the same connection — having one shared `Arc<Mutex<…>>`
+    /// the same connection — having one shared connection mutex
     /// avoids deadlocks from holding two locks against the same
     /// SQLite file.
-    pub fn conn(&self) -> Arc<Mutex<Connection>> {
-        Arc::clone(&self.conn)
+    pub fn conn(&self) -> SharedConnection {
+        self.conn.clone()
     }
 
-    fn lock_conn(&self) -> Result<MutexGuard<'_, Connection>> {
+    fn lock_conn(&self) -> Result<ConnectionGuard<'_>> {
         self.conn
             .lock()
             .map_err(|_| crate::db::mutex_poison_error("pinned digests store"))
@@ -94,28 +89,7 @@ impl PinnedDigestsStore {
             pins::delete_all_tag_pins(&conn)?;
             return Ok(());
         }
-        // SQLite's parameter binding doesn't expand a `Vec` into a
-        // tuple list, so build the predicate by enumerating
-        // placeholders. The const is small, so the dynamic SQL is
-        // fine.
-        let mut sql =
-            String::from("DELETE FROM template_pinned_tags WHERE (name, tag) NOT IN (VALUES ");
-        for i in 0..keep.len() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            let a = i * 2 + 1;
-            let b = a + 1;
-            sql.push_str(&format!("(?{a}, ?{b})"));
-        }
-        sql.push(')');
-        let mut stmt = conn.prepare(&sql)?;
-        let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(keep.len() * 2);
-        for (n, t) in keep {
-            params_vec.push(n);
-            params_vec.push(t);
-        }
-        stmt.execute(rusqlite::params_from_iter(params_vec.iter().copied()))?;
+        pins::delete_tag_pins_outside(&conn, keep)?;
         Ok(())
     }
 
@@ -149,8 +123,7 @@ impl PinnedDigestsStore {
 
     pub fn prune_without_local_builds(&self) -> Result<usize> {
         let conn = self.lock_conn()?;
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let tx = Transaction::immediate(&conn)?;
         let tags = pins::delete_tag_pins_without_local_builds(&tx)?;
         let releases = pins::delete_release_pins_without_local_builds(&tx)?;
         tx.commit()?;
@@ -197,57 +170,13 @@ impl PinnedDigestsStore {
             return Ok(());
         }
         let conn = self.lock_conn()?;
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let tx = Transaction::immediate(&conn)?;
         if keep.is_empty() {
-            let mut sql = String::from("DELETE FROM template_pinned_releases WHERE name IN (");
-            for i in 0..templates.len() {
-                if i > 0 {
-                    sql.push_str(", ");
-                }
-                sql.push_str(&format!("?{}", i + 1));
-            }
-            sql.push(')');
-            let mut stmt = tx.prepare(&sql)?;
-            let params_vec: Vec<&dyn rusqlite::ToSql> = templates
-                .iter()
-                .map(|t| t as &dyn rusqlite::ToSql)
-                .collect();
-            stmt.execute(rusqlite::params_from_iter(params_vec.iter().copied()))?;
-            drop(stmt);
+            pins::delete_release_pins_of_templates(&tx, templates)?;
             tx.commit()?;
             return Ok(());
         }
-        let mut sql = String::from("DELETE FROM template_pinned_releases WHERE name IN (");
-        for i in 0..templates.len() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            sql.push_str(&format!("?{}", i + 1));
-        }
-        sql.push_str(") AND (name, content_hash) NOT IN (VALUES ");
-        let template_count = templates.len();
-        for i in 0..keep.len() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            let a = template_count + i * 2 + 1;
-            let b = a + 1;
-            sql.push_str(&format!("(?{a}, ?{b})"));
-        }
-        sql.push(')');
-        let mut stmt = tx.prepare(&sql)?;
-        let mut params_vec: Vec<&dyn rusqlite::ToSql> =
-            Vec::with_capacity(template_count + keep.len() * 2);
-        for t in templates {
-            params_vec.push(t);
-        }
-        for (n, h) in keep {
-            params_vec.push(n);
-            params_vec.push(h);
-        }
-        stmt.execute(rusqlite::params_from_iter(params_vec.iter().copied()))?;
-        drop(stmt);
+        pins::delete_release_pins_of_templates_outside(&tx, templates, keep)?;
         tx.commit()?;
         Ok(())
     }

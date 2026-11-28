@@ -1,5 +1,6 @@
 use pplx_space_accounts::{CredentialReferenceId, OrgId};
 use pplx_space_credential_injection::validation::ValidatedCredentialReference;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
@@ -52,15 +53,16 @@ pub enum ReferenceState {
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct Reference {
     pub id: CredentialReferenceId,
-    pub config: Json<Config>,
+    #[sqlx(json)]
+    pub config: Config,
     pub state: ReferenceState,
 }
 
 pub async fn create(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     organization: OrgId,
     reference: &ValidatedCredentialReference,
-) -> Result<CredentialReferenceId, sqlx::Error> {
+) -> Result<CredentialReferenceId, DbError> {
     let id = CredentialReferenceId::new();
     sqlx::query(sql!(
         "INSERT INTO credential_references (id, org_id, upstream_provider, upstream_provider_config)
@@ -69,19 +71,24 @@ pub async fn create(
     .bind(id)
     .bind(organization)
     .bind(Json(Config::from(reference)))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(id)
 }
 
-/// Lock references in UUID order before using them in a transaction.
-pub async fn lock(
-    executor: impl sqlx::PgExecutor<'_>,
+/// Lock and return the references in `ids` that belong to `organization`,
+/// in UUID order (`SELECT ... FOR UPDATE`). The locks last until the
+/// caller's transaction ends, so the caller must pass its open transaction.
+pub async fn lock<C>(
+    tx: &mut C,
     organization: OrgId,
     ids: &[CredentialReferenceId],
-) -> Result<Vec<Reference>, sqlx::Error> {
+) -> Result<Vec<Reference>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let ids: Vec<_> = ids.iter().map(|id| id.as_uuid()).collect();
-    sqlx::query_as(sql!(
+    Ok(sqlx::query_as(sql!(
         "SELECT id, jsonb_build_object('upstream_provider', upstream_provider,
                   'upstream_provider_config', upstream_provider_config) AS config, state
          FROM credential_references WHERE org_id = $1 AND id = ANY($2)
@@ -89,22 +96,22 @@ pub async fn lock(
     ))
     .bind(organization)
     .bind(ids)
-    .fetch_all(executor)
-    .await
+    .fetch_all(tx.into_sqlx())
+    .await?)
 }
 
 pub async fn retire(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     organization: OrgId,
     id: CredentialReferenceId,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE credential_references SET state = 'retired'
          WHERE org_id = $1 AND id = $2 AND state = 'active'"
     ))
     .bind(organization)
     .bind(id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }

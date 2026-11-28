@@ -39,7 +39,7 @@ pub(super) struct SandboxPopulationRow {
 /// and lifecycle, as [`pplx_space_sandbox_store::runtime_population::sandbox_population`]
 /// reads them.
 pub(super) async fn sandbox_population(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
 ) -> Result<Vec<SandboxPopulationRow>, sqlx::Error> {
     Ok(
         pplx_space_sandbox_store::runtime_population::sandbox_population(executor)
@@ -106,7 +106,7 @@ pub(super) struct TemplateReleasePopulationRow {
 /// whether it's in use. Resolution counts an unbound release as the initial
 /// environment's; the rows still report it as unbound.
 pub(super) async fn template_release_population(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
     boots_template_twins: bool,
 ) -> Result<Vec<TemplateReleasePopulationRow>, sqlx::Error> {
     Ok(

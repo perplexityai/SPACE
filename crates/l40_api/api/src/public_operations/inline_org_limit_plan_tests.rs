@@ -1,4 +1,5 @@
-//! Plan-cost regression for [`INLINE_ORG_AT_LIMIT`].
+//! Plan-cost regression for
+//! [`INLINE_ORG_AT_LIMIT`](pplx_space_public_operation_store::test_support::INLINE_ORG_AT_LIMIT).
 //!
 //! The limit's behaviour is covered in `tests`; this covers how much its count
 //! reads. A cached statement can switch to a generic plan, which knows no org,
@@ -15,17 +16,18 @@
 //! plan node handles, under both plan modes, by a few passes over that input,
 //! and [`seed`] sizes the fixture so each of the three costs above exceeds that
 //! bound on its own. It reads rows off the plan through
-//! [`super::plan_explain`].
+//! [`pplx_space_db_test_fixtures::plan`].
 
 use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_db_test_fixtures::plan::{PLAN_CACHE_MODES, PlanNode, explain_prepared};
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_public_api::OperationState;
 use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
-use super::plan_explain::{PLAN_CACHE_MODES, PlanNode, explain_prepared};
-use super::{ADMISSION_CLAIM_TOKEN_PREFIX, INLINE_ORG_AT_LIMIT, TEARDOWN_KINDS};
+use super::{ADMISSION_CLAIM_TOKEN_PREFIX, TEARDOWN_KINDS};
+use pplx_space_public_operation_store::test_support::INLINE_ORG_AT_LIMIT;
 
 /// How many plan nodes may handle each of the org's running operations: its
 /// index entry, its heap row, and the filter that drops it or the aggregate
@@ -95,7 +97,7 @@ async fn the_count_reads_only_the_orgs_running_operations() -> TestResult {
             handled <= bound as f64,
             "the count must handle no more rows than {PASSES} passes over the org's {} \
              running operations ({bound}) ({plan_cache_mode}); it handled {handled}. Rows \
-             handled by node, children included:{outline}",
+             handled by each node, per loop:{outline}",
             fixture.org_running,
         );
     }

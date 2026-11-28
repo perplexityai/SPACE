@@ -3947,8 +3947,10 @@ type SandboxInfo struct {
 	// Exact Kubernetes execution identity observed for this sandbox. These
 	// fields are carried with node state publication so the control plane can
 	// fence a terminal suspend projection to the pod that produced the bytes.
-	ExecutionGeneration *int64  `protobuf:"varint,49,opt,name=execution_generation,json=executionGeneration,proto3,oneof" json:"execution_generation,omitempty"`
-	PodUid              *string `protobuf:"bytes,50,opt,name=pod_uid,json=podUid,proto3,oneof" json:"pod_uid,omitempty"`
+	ExecutionGeneration *int64 `protobuf:"varint,49,opt,name=execution_generation,json=executionGeneration,proto3,oneof" json:"execution_generation,omitempty"`
+	// TODO: rename to an opaque `instance_id` that the sandbox manager compares
+	// and never interprets.
+	PodUid *string `protobuf:"bytes,50,opt,name=pod_uid,json=podUid,proto3,oneof" json:"pod_uid,omitempty"`
 	// Highest current or retained node-local route generations. These remain
 	// available after the active runtime identity is cleared.
 	RouteProvenanceGeneration          *uint64 `protobuf:"varint,51,opt,name=route_provenance_generation,json=routeProvenanceGeneration,proto3,oneof" json:"route_provenance_generation,omitempty"`
@@ -3984,9 +3986,14 @@ type SandboxInfo struct {
 	CurrentLocalArtifactCreatedAt *timestamppb.Timestamp `protobuf:"bytes,58,opt,name=current_local_artifact_created_at,json=currentLocalArtifactCreatedAt,proto3,oneof" json:"current_local_artifact_created_at,omitempty"`
 	// The row's recorded node-local cleanup. Absent when none is recorded, or
 	// from an older node that never set it.
-	Cleanup       *SandboxCleanup `protobuf:"bytes,59,opt,name=cleanup,proto3,oneof" json:"cleanup,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Cleanup *SandboxCleanup `protobuf:"bytes,59,opt,name=cleanup,proto3,oneof" json:"cleanup,omitempty"`
+	// The address the node manager read from the externally created network
+	// namespace of the execution this row's current `execution_generation` and
+	// `pod_uid` name. Absent without such a namespace, once the sandbox stops,
+	// and after a sandbox-manager restart; callers fall back to their own source.
+	ExternalAddress *string `protobuf:"bytes,60,opt,name=external_address,json=externalAddress,proto3,oneof" json:"external_address,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *SandboxInfo) Reset() {
@@ -4388,6 +4395,13 @@ func (x *SandboxInfo) GetCleanup() *SandboxCleanup {
 		return x.Cleanup
 	}
 	return nil
+}
+
+func (x *SandboxInfo) GetExternalAddress() string {
+	if x != nil && x.ExternalAddress != nil {
+		return *x.ExternalAddress
+	}
+	return ""
 }
 
 // A node-local cleanup recorded on a sandbox row. An activation records one,
@@ -15323,7 +15337,7 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x0emetadata_valid\x18\x04 \x01(\bR\rmetadataValidB\v\n" +
 	"\t_template\"b\n" +
 	"\x12CleanupTargetBatch\x12L\n" +
-	"\atargets\x18\x01 \x03(\v22.space.sandbox.manager.v1.CleanupTargetObservationR\atargets\"\xda\x1f\n" +
+	"\atargets\x18\x01 \x03(\v22.space.sandbox.manager.v1.CleanupTargetObservationR\atargets\"\x9f \n" +
 	"\vSandboxInfo\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x1f\n" +
@@ -15382,7 +15396,8 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x15activation_attempt_id\x188 \x01(\tH#R\x13activationAttemptId\x88\x01\x01\x12R\n" +
 	"\tlifecycle\x189 \x01(\x0e2/.space.sandbox.manager.v1.SandboxLifecycleStateH$R\tlifecycle\x88\x01\x01\x12i\n" +
 	"!current_local_artifact_created_at\x18: \x01(\v2\x1a.google.protobuf.TimestampH%R\x1dcurrentLocalArtifactCreatedAt\x88\x01\x01\x12G\n" +
-	"\acleanup\x18; \x01(\v2(.space.sandbox.manager.v1.SandboxCleanupH&R\acleanup\x88\x01\x01B\v\n" +
+	"\acleanup\x18; \x01(\v2(.space.sandbox.manager.v1.SandboxCleanupH&R\acleanup\x88\x01\x01\x12.\n" +
+	"\x10external_address\x18< \x01(\tH'R\x0fexternalAddress\x88\x01\x01B\v\n" +
 	"\t_templateB\x06\n" +
 	"\x04_pidB\f\n" +
 	"\n" +
@@ -15428,7 +15443,8 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"_lifecycleB$\n" +
 	"\"_current_local_artifact_created_atB\n" +
 	"\n" +
-	"\b_cleanup\"\xa9\x01\n" +
+	"\b_cleanupB\x13\n" +
+	"\x11_external_address\"\xa9\x01\n" +
 	"\x0eSandboxCleanup\x12R\n" +
 	"\n" +
 	"completion\x18\x01 \x01(\x0e22.space.sandbox.manager.v1.SandboxCleanupCompletionR\n" +

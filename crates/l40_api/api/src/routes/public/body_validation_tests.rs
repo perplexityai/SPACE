@@ -59,6 +59,18 @@ async fn send(
     path: &str,
     body: &Value,
 ) -> TestDbResult<(StatusCode, Value)> {
+    send_text(app, method, path, &body.to_string()).await
+}
+
+/// [`send`], with the body's exact text. serde_json writes an object's keys
+/// in an order a feature can change, so a test that reads a position in the
+/// body sends its text.
+async fn send_text(
+    app: &Router,
+    method: Method,
+    path: &str,
+    body: &str,
+) -> TestDbResult<(StatusCode, Value)> {
     let request = Request::builder()
         .method(method)
         .uri(path)
@@ -68,7 +80,7 @@ async fn send(
             "idempotency-key",
             format!("body-validation-{}", Uuid::now_v7()),
         )
-        .body(Body::from(serde_json::to_vec(body)?))?;
+        .body(Body::from(body.to_owned()))?;
     let response = app.clone().oneshot(request).await?;
     let status = response.status();
     let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
@@ -206,19 +218,19 @@ async fn a_refused_value_is_not_answered_back() -> TestDbResult<()> {
     let cases = [
         (
             format!("/v1/sandboxes/{sandbox}/port-sessions"),
-            json!({"port": 8080, "protocol": SENT}),
+            format!(r#"{{"port":8080,"protocol":"{SENT}"}}"#),
             "invalid request body: protocol: unknown variant, expected `http` or `tcp` at line 1 column 44",
             "protocol",
         ),
         (
             "/v1/sandboxes".to_string(),
-            json!({"template": "seed", "idle_timeout": SENT}),
+            format!(r#"{{"template":"seed","idle_timeout":"{SENT}"}}"#),
             "invalid request body: idle_timeout: invalid value at line 1 column 54",
             "idle_timeout",
         ),
     ];
     for (path, body, message, field) in cases {
-        let (status, answer) = send(&app, Method::POST, &path, &body).await?;
+        let (status, answer) = send_text(&app, Method::POST, &path, &body).await?;
         assert!(!answer.to_string().contains(SENT), "{path}: {answer}");
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{path}: {answer}");
         assert_eq!(answer["code"], "invalid_request", "{path}: {answer}");

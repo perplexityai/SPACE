@@ -5,11 +5,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use pplx_space_accounts::{ApiKeyId, OrgId, UserId};
+use pplx_space_accounts_store::{
+    ApiKeyRevocation, ApiKeyRow, CreateApiKey, api_keys, organizations, users,
+};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use super::{
-    api_key_store::{self, CreateApiKey, RevokeOutcome},
     audit::AdminAuditTarget,
     support::{self, ContentionScope, api_error},
 };
@@ -74,8 +76,8 @@ pub(super) struct CreatedApiKey {
     secret: String,
 }
 
-impl From<api_key_store::ApiKeyRow> for ApiKeyMetadata {
-    fn from(row: api_key_store::ApiKeyRow) -> Self {
+impl From<ApiKeyRow> for ApiKeyMetadata {
+    fn from(row: ApiKeyRow) -> Self {
         Self {
             id: row.id,
             org_id: row.org_id,
@@ -99,21 +101,21 @@ pub(super) async fn list_api_keys(
     Path(org_id): Path<OrgId>,
     Query(query): Query<ListApiKeysQuery>,
 ) -> Response {
-    match api_key_store::organization_exists(&state.pool, org_id).await {
+    match organizations::organization_exists(&state.pool, org_id).await {
         Ok(false) => {
             return api_error(StatusCode::NOT_FOUND, "Organization not found").into_response();
         }
         Ok(true) => {}
-        Err(error) => return read_error(error),
+        Err(error) => return read_error(sqlx::Error::from(error)),
     }
-    match api_key_store::list_for_organization(&state.pool, org_id, query.include_revoked).await {
+    match api_keys::list_organization_api_keys(&state.pool, org_id, query.include_revoked).await {
         Ok(keys) => Json(
             keys.into_iter()
                 .map(ApiKeyMetadata::from)
                 .collect::<Vec<_>>(),
         )
         .into_response(),
-        Err(error) => read_error(error),
+        Err(error) => read_error(sqlx::Error::from(error)),
     }
 }
 
@@ -137,12 +139,12 @@ pub(super) async fn create_api_key(
     Path(org_id): Path<OrgId>,
     Json(request): Json<CreateApiKeyRequest>,
 ) -> Response {
-    match api_key_store::organization_exists(&state.pool, org_id).await {
+    match organizations::organization_exists(&state.pool, org_id).await {
         Ok(true) => {}
         Ok(false) => {
             return api_error(StatusCode::NOT_FOUND, "Organization not found").into_response();
         }
-        Err(error) => return read_error(error),
+        Err(error) => return read_error(sqlx::Error::from(error)),
     }
     let org_target = Extension(AdminAuditTarget::api_key(org_id, None, None));
     let name = match api_key_name(&request.name) {
@@ -172,7 +174,7 @@ pub(super) async fn create_api_key(
         created_by: user_id,
         allowed_surfaces: &allowed_surfaces,
     };
-    match api_key_store::create(&state.pool, input).await {
+    match api_keys::create_api_key(&state.pool, input).await {
         Ok(row) => (
             StatusCode::CREATED,
             [(header::CACHE_CONTROL, "no-store")],
@@ -189,7 +191,7 @@ pub(super) async fn create_api_key(
             .into_response(),
         Err(error) => (
             Extension(AdminAuditTarget::api_key(org_id, None, Some(user_id))),
-            create_error(error),
+            create_error(sqlx::Error::from(error)),
         )
             .into_response(),
     }
@@ -250,13 +252,11 @@ async fn key_user(
 ) -> Result<UserId, KeyUserRefusal> {
     match requested {
         None if org_id == actor.org_id => Ok(actor.id),
-        Some(user_id) => {
-            match api_key_store::user_in_organization(&state.pool, org_id, user_id).await {
-                Ok(true) => Ok(user_id),
-                Ok(false) => Err(KeyUserRefusal::NotInOrganization),
-                Err(error) => Err(KeyUserRefusal::Read(error)),
-            }
-        }
+        Some(user_id) => match users::user_in_organization(&state.pool, org_id, user_id).await {
+            Ok(true) => Ok(user_id),
+            Ok(false) => Err(KeyUserRefusal::NotInOrganization),
+            Err(error) => Err(KeyUserRefusal::Read(sqlx::Error::from(error))),
+        },
         None => Err(KeyUserRefusal::Required),
     }
 }
@@ -271,16 +271,16 @@ pub(super) async fn delete_api_key(
     State(state): State<AppState>,
     Path((org_id, api_key_id)): Path<(OrgId, ApiKeyId)>,
 ) -> Response {
-    match api_key_store::revoke(&state.pool, org_id, api_key_id).await {
-        Ok(RevokeOutcome::Revoked | RevokeOutcome::AlreadyRevoked) => (
+    match api_keys::revoke_organization_api_key(&state.pool, org_id, api_key_id).await {
+        Ok(ApiKeyRevocation::Revoked | ApiKeyRevocation::AlreadyRevoked) => (
             StatusCode::NO_CONTENT,
             Extension(AdminAuditTarget::api_key(org_id, Some(api_key_id), None)),
         )
             .into_response(),
-        Ok(RevokeOutcome::NotFound) => {
+        Ok(ApiKeyRevocation::NotFound) => {
             api_error(StatusCode::NOT_FOUND, "API key not found").into_response()
         }
-        Err(error) => support::db_error(error).into_response(),
+        Err(error) => support::db_error(sqlx::Error::from(error)).into_response(),
     }
 }
 

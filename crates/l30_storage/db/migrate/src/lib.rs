@@ -12,8 +12,8 @@
 //! whatever crate holds the macro: only the job that applies them should
 //! carry that weight, and no long-running service links this.
 
+use pplx_space_node_runtime_manager_store::database::MIGRATOR as RUNTIME_MANAGER_MIGRATOR;
 use pplx_space_sql_locator::sql;
-use pplx_space_sqlite::runtime_manager::MIGRATOR as RUNTIME_MANAGER_MIGRATOR;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -389,7 +389,7 @@ async fn run_sqlite(database: SqliteDatabase, args: SqliteArgs) -> Result<(), Ru
     let database = if database.name == "runtime-manager" && !matches!(args.command, Command::Reset)
     {
         SqliteDatabase {
-            migrator: sqlite::runtime_manager::catalog(&database_path)?,
+            migrator: pplx_space_node_runtime_manager_store::database::catalog(&database_path)?,
             ..database
         }
     } else {
@@ -538,10 +538,20 @@ async fn rollback_last_postgres(
     ensure_sqlx_migrations_table_postgres(pool).await?;
     let applied_versions = applied_versions_postgres(pool).await?;
     rollback_last(migrator, &applied_versions, |target| async move {
-        migrator
-            .undo(pool, target)
-            .await
-            .map_err(RunDbMigrateError::RollbackPostgres)
+        let result = migrator.undo(pool, target).await;
+        // As `run_up` does for an up: a failed `-- no-transaction` down, such
+        // as a `CREATE INDEX CONCURRENTLY` that restores an index, can leave an
+        // INVALID index behind while the up's history row stays.
+        if let Err(MigrateError::ExecuteMigration(_, version)) = &result
+            && migrator.iter().any(|migration| {
+                migration.version == *version
+                    && migration.migration_type.is_down_migration()
+                    && migration.no_tx
+            })
+        {
+            migration_retry::report_invalid_indexes(pool, *version).await;
+        }
+        result.map_err(RunDbMigrateError::RollbackPostgres)
     })
     .await
 }

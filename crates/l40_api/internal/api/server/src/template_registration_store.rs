@@ -2,10 +2,9 @@ use super::{NetworkPolicyV1, TemplateRow};
 use pplx_space_accounts::OrgId;
 use pplx_space_template_model::{TemplateDesiredState, TemplateId, TemplateVisibility};
 use pplx_space_template_store::templates::{self, NewTemplate, RegisteredTemplate};
-use sqlx::PgExecutor;
 
 pub(super) async fn insert(
-    executor: impl PgExecutor<'_>,
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
     name: &str,
     description: Option<&str>,
     owner: Option<OrgId>,
@@ -39,13 +38,14 @@ pub(super) async fn insert(
 }
 
 pub(super) async fn fill_description(
-    executor: impl PgExecutor<'_>,
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
     name: &str,
     description: Option<&str>,
 ) -> Result<TemplateRow, sqlx::Error> {
     templates::fill_description(executor, name, description)
         .await
         .map(TemplateRow::from)
+        .map_err(sqlx::Error::from)
 }
 
 impl From<RegisteredTemplate> for TemplateRow {

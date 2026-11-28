@@ -20,8 +20,10 @@ use super::sweeper::{EvacuationRestoreTarget, EvacuationRestoreTargetParseError}
 
 mod activity_tests;
 mod create_finish_tests;
+mod direct_tests;
 mod insert_unplaced_tests;
 mod read_modules_tests;
+mod row_locks_tests;
 mod sibling_tables_tests;
 mod uuid_codec_tests;
 
@@ -127,7 +129,7 @@ fn proves_no_execution_only_for_kubernetes_rows() {
             execution_generation: None,
             has_direct_route: false,
             has_activation_lease: false,
-            policy: sqlx::types::Json(Default::default()),
+            policy: Default::default(),
         };
         assert_eq!(execution.proves_no_execution(), proves, "{managed_by:?}");
     }
@@ -942,7 +944,7 @@ async fn an_active_fork_source_is_found_by_either_target_id_form() -> TestResult
         };
         let mut tx = db.pool.begin().await?;
         assert!(
-            !crate::fork_source_lifecycle::active_fork_source_operation_exists(&mut tx, source)
+            !crate::fork_source_lifecycle::active_fork_source_operation_exists(&mut *tx, source)
                 .await?
         );
         sqlx::query(sql!(
@@ -956,7 +958,7 @@ async fn an_active_fork_source_is_found_by_either_target_id_form() -> TestResult
         .execute(&mut *tx)
         .await?;
         assert!(
-            crate::fork_source_lifecycle::active_fork_source_operation_exists(&mut tx, source)
+            crate::fork_source_lifecycle::active_fork_source_operation_exists(&mut *tx, source)
                 .await?,
             "{target_id}"
         );

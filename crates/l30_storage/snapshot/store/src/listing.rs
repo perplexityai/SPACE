@@ -2,6 +2,7 @@
 //! catalog holds even when a value would not parse.
 
 use pplx_space_accounts::{NodeId, OrgId};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_snapshot_model::SnapshotId;
 use pplx_space_sql_locator::sql;
@@ -31,10 +32,10 @@ pub struct StoredSnapshot {
 
 /// Every catalog row of `sandbox_id`, newest first.
 pub async fn stored_for_sandbox(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
-) -> Result<Vec<StoredSnapshot>, sqlx::Error> {
-    sqlx::query_as::<_, StoredSnapshot>(sql!(
+) -> Result<Vec<StoredSnapshot>, DbError> {
+    Ok(sqlx::query_as::<_, StoredSnapshot>(sql!(
         "SELECT id,
                 sandbox_id,
                 type,
@@ -55,6 +56,6 @@ pub async fn stored_for_sandbox(
           ORDER BY timestamp DESC, id DESC"
     ))
     .bind(sandbox_id)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }

@@ -1,4 +1,3 @@
-use pplx_space_sql_locator::sql;
 use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
@@ -64,48 +63,15 @@ impl RetentionSink for DataPlaneSessionRetentionStore {
     ) -> Result<TickReport, sqlx::Error> {
         let grace_secs = i64::try_from(grace.as_secs()).unwrap_or(i64::MAX);
         let max_records = i64::from(max_records);
-        // A row bound to a process id other than its session id comes from a
-        // guest that minted the id itself. The process routes resolve the
-        // session's process id through it for as long as the process runs,
-        // which can be long past the session, so it stays until the sandbox
-        // is deleted and takes it along. Other guests bind the session id.
-        // A closed terminal or process session is a command that exited; it
-        // stays until it expires, as an open one does, so that reading it,
-        // replaying its create and reattaching to read the exit keep working
-        // for the session's lifetime.
-        let rows = sqlx::query_scalar::<_, String>(sql!(
-            "WITH candidates AS (
-                 SELECT session_id
-                   FROM data_plane_sessions
-                  WHERE (
-                            (
-                                expires_at IS NOT NULL
-                            AND expires_at < NOW() - ($1::BIGINT * INTERVAL '1 second')
-                            )
-                         OR (
-                                (
-                                    state IN ('revoked', 'failed')
-                                 OR (state = 'closed' AND kind NOT IN ('terminal', 'process'))
-                                )
-                            AND updated_at < NOW() - ($1::BIGINT * INTERVAL '1 second')
-                            )
-                        )
-                    AND (backend_process_id IS NULL OR backend_process_id = session_id)
-                  ORDER BY updated_at ASC, session_id ASC
-                  LIMIT $2
-             )
-             DELETE FROM data_plane_sessions AS d
-              USING candidates AS c
-              WHERE d.session_id = c.session_id
-              RETURNING d.session_id"
-        ))
-        .bind(grace_secs)
-        .bind(max_records)
-        .fetch_all(&self.pool)
+        let deleted = pplx_space_data_plane_session_store::delete_ended_sessions(
+            &self.pool,
+            grace_secs,
+            max_records,
+        )
         .await?;
 
         Ok(TickReport {
-            sessions_deleted: rows.len() as u64,
+            sessions_deleted: deleted as u64,
         })
     }
 }

@@ -332,8 +332,8 @@ hints only: new or renamed scenarios receive a 30-second estimate and still run;
 obsolete hints do not add scenarios. No assertion, timeout, or scenario is removed.
 Fourteen shards shorten the serial critical path but duplicate cluster startup and
 consume fourteen concurrent runners; queue time remains a separate constraint.
-At fourteen, the leader-election brownout's shard holds it alone and is the
-slowest, so more shards would not shorten the run.
+At fourteen, the longest scenario by hint (`space_smoke/sharding.py`) bounds
+the slowest shard, so more shards would not shorten the run below it.
 
 ## The whole suite on one host
 
@@ -449,8 +449,14 @@ scenarios run unchanged. What isolates it
   one tree raced in Helm's chart vendoring.
 
 What is the same on every bench is done once on the host: the Rust artifact
-image is built once and handed to each bench as CI hands it to its shards
-(`rust-artifact-handoff.py record`/`load`, `SPACE_KIND_RUST_ARTIFACTS=prebuilt`);
+image is built once, or reused from main as a CI producer reuses it, and
+handed to each bench as CI hands it to its shards
+(`rust-artifact-handoff.py record`/`load`, `SPACE_KIND_RUST_ARTIFACTS=prebuilt`).
+Where the image package cannot be read directly, exporting
+`SPACE_KIND_REGISTRY_MIRROR` reuses main's image by digest through a
+pull-through mirror of ghcr.io (see [Smoke test](#smoke-test)); the
+summary's `Rust image` line says whether the image was built on the host or
+reused, and from where;
 the node images and build bases are saved once and loaded into each bench; the
 seed is built once and copied in; the host's loop-device pool and inotify
 limits are raised before any bench starts (loop devices are kernel-global, but
@@ -542,7 +548,7 @@ the Kind services with no crate's `test-hooks` feature enabled:
 | `local.garbage_collectors_reclaim_independent_resources` | the chart's template GC interval and grace, prefetch latest-N, and `SPACE_SBX_GC_*` target, interval, grace and idle | release template GC uses an 1800 s grace and the snapshot reaper requires a day of idle time, beyond the combined scenario's budget |
 | `local.retention_claim_finish_forward`, `local.retention_restore_source_guard` | the retention sweeper's dry-run, tick and minimum age, which they stage | a release sweeper ticks every 300 s and keeps snapshots younger than an hour |
 | `local.rate_limiters_enforce_and_fail_open` | `SPACE_CLUSTER_ACTIVATION_ADMISSION_BURST`, which it shrinks to 2 | draining the release burst of 60 would take sixty real boots |
-| `local.leader_election_brownout_keeps_one_leader`, `local.leader_election_refusal_does_not_restart` | the cluster-controller's lease TTL and liveness budget, `SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_LEASE_TTL_SECS` and `..._LEASE_FAILURE_GRACE_SECS` | at the release 60 s TTL and 600 s budget, a replica spends its budget long after the outage's bound |
+| `local.leader_election_brownout_keeps_one_leader` | the cluster-controller's lease TTL and liveness budget, `SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_LEASE_TTL_SECS` and `..._LEASE_FAILURE_GRACE_SECS` | at the release 60 s TTL and 600 s budget, the budget control and the refusal watch each take minutes longer |
 | `native_recovery.inline_wake_survives_api_pod_kill`, `native_recovery.inline_load_survives_leader_failover` | `SPACE_NATIVE_INLINE_TEST_HOLD_SECS` and `SPACE_NATIVE_INLINE_TEST_RELEASE_FILE`, which hold each claimed inline operation `running`, renewing its claim, until the scenario releases it or the bounded hold expires | a wake or create the API runs inline can end before the scenario kills its API pod or fails the controller's leadership over |
 
 The 40 GiB cache needs no replacement for the reservation hook: release
@@ -1767,7 +1773,7 @@ kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 │   ├── space-kind-key-broker (Deployment; Kind-only intermediate-key broker fixture behind the platform KEK)
 │   ├── space-data-plane      (Deployment, 2–3 replicas by HPA)
 │   ├── space-cluster-controller (Deployment, 2 replicas, one leader; materializes per-sandbox pods on the default (Kubernetes) lane)
-│   ├── space-kind-fake-ec2   (Deployment; Kind-only fake EC2 endpoint the reconcile-queue GC asks about non-ready nodes)
+│   ├── space-kind-fake-ec2   (Deployment; Kind-only fake EC2 endpoint the reconcile-queue GC asks about non-ready nodes, the v2 node drain about an instance id, and the `aws` node-drain terminator, through Auto Scaling, to terminate an instance)
 │   ├── metrics-server        (Deployment in kube-system; resource metrics for the HPAs)
 │   ├── space-seed-publish    (Job; publishes the locally built seed)
 │   └── space-ui              (Deployment)
@@ -1867,16 +1873,16 @@ load-balanced entry, scaled on load.
   substrate: the Lease holder runs every reconciler and the other stands by,
   Ready, to take over.
   The typed scenario `local.leader_election_brownout_keeps_one_leader`
-  exercises outage recovery; `local.leader_election_refusal_does_not_restart`
-  verifies that a contender refused Lease access remains unready without
-  restarting. Both run by default and can occupy separate CI shards. Each
+  exercises outage recovery, with both replicas cut off from the apiserver
+  in their own network namespaces, and verifies alongside it that a
+  contender refused Lease access remains unready without restarting. It
   needs `otel` mode, lowers the controller's lease TTL to its 18 s floor and
   the liveness budget to its 72 s floor, and restores the standing settings
   afterward. These hooks require the `test-hooks` feature used by Kind.
-  Both change the budget only while owning the mutation Lease and restore
+  It changes the budget only while owning the mutation Lease and restores
   it before another scenario runs. Shards start with the standing chart
   settings, so unrelated recovery tests do not inherit the shortened budget.
-  Run either alone with `uv run --frozen --python 3.11 -m space_smoke run`
+  Run it alone with `uv run --frozen --python 3.11 -m space_smoke run`
   followed by its scenario ID.
 - **internal-api** (ClusterApi) runs two replicas behind its ClusterIP
   Service and rolls one at a time. It needs no election: its state is in
@@ -2345,7 +2351,9 @@ file access RPCs there.
 | The node bootstrap installs a checksum-verified `containerd-shim-space-v2` before containerd starts, and registers the `space` runtime under `io.containerd.cri.v1.runtime` with a `CniConfDir` option | the node image registers the same runtime with the same options (in kind's version 2 config format, which containerd migrates to that plugin), so containerd loads it on its first start; the binary arrives after the cluster exists, copied onto each running sandbox worker by `install-shim.sh`, which checks its SHA-256 on the node. Installing it at boot would need the shim built and staged on a host path before `kind create` |
 | Every node group's bootstrap sets kubelet `eventRecordQPS: 0` and `--fail-swap-on=false` | the same settings on sandbox workers and builders, baked into the node image as a kubelet `--config-dir` drop-in (`node/kubelet/50-space.conf`); the infra node runs the unmodified base image, so its kubelet keeps kind's event rate limit (`failSwapOn` is already `false` there). No sandbox pod runs on it, so none of their events pass through that limit |
 | Release binaries read no test hooks | by default every binary is built with `test-hooks`, and the charts set these hooks on every run: sandbox-manager's on-node snapshot reaper at target fraction 0, interval 15 s, grace 60 s and idle 60 s, against release values of 0.40, 300 s, 1800 s and 86400 s (`charts/space-sandbox-manager-local/values.yaml`, `snapshot_gc.rs`); template-manager's cache GC at interval 15 s and grace 60 s, against 300 s and 1800 s, and its prefetch latest-N at 1, against 5 (`charts/space-template-manager-local/values.yaml`, `eviction.rs`, `prefetch.rs`); the cluster-controller's failed-restorable repair tick and its reconcile-queue GC tick at 10 s, against 60 s and 300 s (`SPACE_FAILED_RESTORABLE_REPAIR_TICK_SECS`, `SPACE_RECONCILE_QUEUE_GC_TICK_SECS`, in `testHookEnv` of `charts/space-cluster-controller-local/values-kind.yaml`); and the disk-admission reservation below. Scenarios shorten further hooks, such as the snapshot-retention sweeper's minimum age and the activation-admission burst, for their own run and restore them. The public-operation dispatcher's tick, claim limit and claim staleness stay at their release values. The release lane (`SPACE_KIND_RUST_BUILD=release`) builds every Kind service with no crate's `test-hooks` feature, renders none of these chart hooks, and skips the scenarios that need one ([Release-build lane](#release-build-lane)) |
+| The v2 node drain's bounds: 15 minutes past its deadline with nothing evacuated before a drain is stalled, 15 minutes before a sandbox a drain saw running counts as still suspended, 15 minutes after Auto Scaling accepted a termination before the loop says EC2 still lists the instance, and a fenced node's EC2 checks backing off from 10 s to 120 s | 180 s, 180 s, 120 s and a 2 s base, through the cluster controller's test hooks, in whole seconds: `SPACE_DRAIN_V2_TEST_STALL_BOUND_SECONDS`, `SPACE_DRAIN_V2_TEST_STILL_SUSPENDED_AFTER_SECONDS`, `SPACE_DRAIN_V2_TEST_TERMINATE_BOUND_SECONDS` and `SPACE_DRAIN_V2_TEST_DISPATCH_BACKOFF_BASE_SECONDS` (the base never above the 120 s cap), set only by the Kind bring-up (`testHookEnv` in `charts/space-cluster-controller-local/values-kind.yaml`) and read through `pplx_space_test_hooks::test_hook` (`node_drain::v2::V2LoopConfig`); unset, zero or unreadable keeps the release value, and the release lane renders and reads none. The drain v2 scenarios read the bounds back from the controller Deployment |
 | space-api waits up to 120 s for a new sandbox pod's IP and proxy (`SPACE_CREATE_DATA_PLANE_READY_TIMEOUT_SECS`, binary default) | 45 s, set only by the Kind bring-up (`charts/space-api-local/values-kind.yaml`, which the Tiltfile passes and the caller-provided-cluster chart does not). A restore that cannot complete keeps its pod retrying, so the two btrfs-send failure scenarios wait the whole timeout; healthy creates and restores on Kind take a few seconds |
+| Drain v2 is off (`SPACE_DRAIN_V2_ENABLED` unset or `false`, the binary default) | on for space-api, space-admin-api and the cluster-controller, set only by the Kind bring-up (`drainV2.enabled` in `charts/space-api-local/values-kind.yaml` and `charts/space-cluster-controller-local/values-kind.yaml`); each chart's default is `"false"`, and the caller-provided-cluster chart refuses anything else (`templates/validate.yaml`). A drain v2 scenario checks the switches once per batch and changes no Deployment to drain; one whose drain terminates or lets go of its node turns the controller's `aws` terminator on for its own run, against the fake EC2, and puts Kind's `kube-delete` back after. The evacuation cap (`SPACE_DRAIN_V2_MAX_EVACUATING_NODES`, 4 by default) is read by the API that answers `:drain`, and the cap scenario lowers it on space-api for its own run. With drain v2 on, v1 and v2 drains never run together: the API refuses every v1 `:drain` (409, `code` `drain_v1_refused_while_v2_enabled`), so a suite run skips the v1 drain scenarios (those declaring `drain_v1`) on a Kind bench, visibly; run them on a bench whose API and controller run with `SPACE_DRAIN_V2_ENABLED` `false` |
 | Services export OTLP metrics every 10 s (the SDK default) | in `otel` mode the Rust services in Pods export every 2 s (`telemetry.otlpMetricExportIntervalMillis`, `scripts/telemetry_config.py`) to the bench's own Prometheus, and Tempo search withholds the newest 5 s instead of 30 s (`tempo.queryEndCutoff` in the traces chart's Kind profile); the shim and runtime-supervisor keep 10 s |
 | 8 GiB disk-admission reservation per cache allocation (release default) | 1 GiB through the `SPACE_NODE_DISK_ADMISSION_ALLOCATION_RESERVATION_BYTES` test hook, with the 1 GiB `MIN_AVAILABLE_BYTES` floor, so allocations fit the 40 GiB cache (`charts/space-node-service/values.yaml`); the release lane renders only the floor, and the cache admits its binaries' release 8 GiB reservation too ([Release-build lane](#release-build-lane)) |
 | Postgres on RDS, secrets via ExternalSecrets / AWS Secrets Manager | In-cluster `space-postgres` StatefulSet, one pod on a 1 GiB volume, static Kubernetes Secrets |
@@ -2621,13 +2629,31 @@ commit. A build from committed inputs, with every base from its mirrored
 digest, labels the image with its key and commit. A separate main-only job then
 pushes it to `ghcr.io/perplexityai/space-kind-rust-artifacts:<key>`, replacing
 the key's earlier image, and keeps the twenty newest versions. The shards
-never wait for that push.
+never wait for that push. That job also uploads a digest record of each push,
+`{"key", "digest", "repository", "commit"}`, as the Actions artifact
+`kind-rust-artifact-digest` (kept 30 days), for readers that can pull only by
+digest.
 
 Each PR first tries to pull its key's image. Any miss or failure builds as
 before, with a notice, including a fork, or any PR whose token cannot read the
 package. Setting the repository variable `SPACE_KIND_RUST_REUSE` to `off`
 turns PR reuse off without a code change. A reused image goes through the same
 handoff. The runtime images Tilt builds still record the checkout's commit.
+
+Outside CI, `rust-artifact-handoff.py reuse` can take main's image through a
+pull-through mirror of ghcr.io that serves content by digest, where the
+package itself cannot be read. Set `SPACE_KIND_REGISTRY_MIRROR` to the
+mirror's host and path prefix, under which it serves `ghcr.io/<owner>/<repo>`
+as `<mirror>/<owner>/<repo>`. Reuse then looks up the digest for the
+checkout's input key: in `SPACE_KIND_RUST_DIGESTS_FILE` when that names a JSON
+list of `{"key", "digest"}` records (tests and offline use), otherwise in the
+`kind-rust-artifact-digest` artifacts of the newest main CI push runs,
+read with `gh api` and the caller's GitHub token (`repo` scope), those from the
+checkout's own history first. It pulls the image by that digest, verifies its
+input-key and commit labels as it does a tagged pull, and tags it for the
+handoff. A main commit's record appears as soon as its publish job uploads
+it. With no record for the key, or any failure, it logs one line saying why
+and goes on as before: the tagged pull, then the build.
 
 A PR whose Rust inputs match no published image builds incrementally from
 main's build state instead. Main CI's `kind_rust_state` job builds each main

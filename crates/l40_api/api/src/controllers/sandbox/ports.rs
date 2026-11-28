@@ -5,7 +5,6 @@ use pplx_space_api_route::{
 };
 use pplx_space_events::{SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventType};
 use pplx_space_sandbox_model::{MAX_SANDBOX_PORT_EXPOSURES, SandboxId};
-use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::ReconcileReason;
 
 impl SandboxController {
@@ -17,7 +16,12 @@ impl SandboxController {
         pplx_space_sandbox_store::port_exposures::list(pool, sandbox.id)
             .await
             .map(|exposures| exposures.into_iter().map(Into::into).collect())
-            .map_err(|err| db_contention_error("failed to list sandbox port exposures", &err))
+            .map_err(|err| {
+                db_contention_error(
+                    "failed to list sandbox port exposures",
+                    &sqlx::Error::from(err),
+                )
+            })
     }
 
     pub async fn open_sandbox_port(
@@ -64,13 +68,16 @@ impl SandboxController {
         // Serialize admission per sandbox so concurrent API and internal ECW
         // opens cannot both observe the last free slot. Existing desired-open
         // rows remain idempotent and do not consume another slot.
-        let locked_sandbox = sqlx::query_scalar::<_, Uuid>(sql!(
-            "SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"
-        ))
-        .bind(sandbox.id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|err| db_contention_error("failed to lock sandbox for port admission", &err))?;
+        // Allow foreign-key checks while this transaction waits on reconciliation.
+        let locked_sandbox =
+            pplx_space_sandbox_store::row_locks::lock_id_no_key_update(&mut *tx, sandbox.id)
+                .await
+                .map_err(|err| {
+                    db_contention_error(
+                        "failed to lock sandbox for port admission",
+                        &sqlx::Error::from(err),
+                    )
+                })?;
         if locked_sandbox.is_none() {
             return Err(ControllerError::not_found("Sandbox"));
         }
@@ -82,7 +89,10 @@ impl SandboxController {
         )
         .await
         .map_err(|err| {
-            db_contention_error("failed to check existing sandbox port exposure", &err)
+            db_contention_error(
+                "failed to check existing sandbox port exposure",
+                &sqlx::Error::from(err),
+            )
         })?;
         let other_open_ports = pplx_space_sandbox_store::port_exposures::count_other_open(
             &mut *tx,
@@ -91,7 +101,12 @@ impl SandboxController {
             port as i32,
         )
         .await
-        .map_err(|err| db_contention_error("failed to count sandbox port exposures", &err))?;
+        .map_err(|err| {
+            db_contention_error(
+                "failed to count sandbox port exposures",
+                &sqlx::Error::from(err),
+            )
+        })?;
         if let Err(error) = enforce_sandbox_port_exposure_capacity(other_open_ports, already_open) {
             SandboxEvent::new(
                 sandbox.id,
@@ -118,7 +133,7 @@ impl SandboxController {
             // sandbox row lock this transaction took. A lost race is not a
             // failed open: the caller retries and it succeeds, so it must not
             // leave a permanent-looking failure on the sandbox's timeline.
-            let mapped = db_contention_error(error, &err);
+            let mapped = db_contention_error(error, &sqlx::Error::from(err));
             if !mapped.is_lock_contention() {
                 SandboxEvent::new(
                     sandbox.id,
@@ -200,7 +215,12 @@ impl SandboxController {
             pplx_space_sandbox_store::port_exposures::get_tcp(pool, sandbox.id, port as i32)
                 .await
                 .map(|exposure| exposure.map(SandboxPortExposure::from))
-                .map_err(|err| db_contention_error("failed to load sandbox port exposure", &err))?;
+                .map_err(|err| {
+                    db_contention_error(
+                        "failed to load sandbox port exposure",
+                        &sqlx::Error::from(err),
+                    )
+                })?;
 
         if let Some(exposure) = existing
             && exposure.desired_state == SANDBOX_PORT_DESIRED_OPEN
@@ -361,7 +381,10 @@ impl SandboxController {
             )
             .await
             .map_err(|err| {
-                db_contention_error("failed to invalidate sandbox port exposure", &err)
+                db_contention_error(
+                    "failed to invalidate sandbox port exposure",
+                    &sqlx::Error::from(err),
+                )
             })?;
 
         tx.commit().await.map_err(|error| {
@@ -701,13 +724,15 @@ impl SandboxController {
         // Keep the same sandbox-row-first lock order as open admission. The
         // reconcile enqueue below also locks this row, so updating the port
         // row first would permit an open/close deadlock.
-        let locked_sandbox = sqlx::query_scalar::<_, Uuid>(sql!(
-            "SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"
-        ))
-        .bind(sandbox.id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|err| db_contention_error("failed to lock sandbox for port close", &err))?;
+        let locked_sandbox =
+            pplx_space_sandbox_store::row_locks::lock_id_no_key_update(&mut *tx, sandbox.id)
+                .await
+                .map_err(|err| {
+                    db_contention_error(
+                        "failed to lock sandbox for port close",
+                        &sqlx::Error::from(err),
+                    )
+                })?;
         if locked_sandbox.is_none() {
             return Err(ControllerError::not_found("Sandbox"));
         }
@@ -726,7 +751,7 @@ impl SandboxController {
             // sandbox row lock this transaction took. A lost race is not a
             // failed close: the caller retries and it succeeds, so it must not
             // leave a permanent-looking failure on the sandbox's timeline.
-            let mapped = db_contention_error(error, &err);
+            let mapped = db_contention_error(error, &sqlx::Error::from(err));
             if !mapped.is_lock_contention() {
                 SandboxEvent::new(
                     sandbox.id,

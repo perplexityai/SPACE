@@ -152,7 +152,12 @@ pub(super) async fn refresh_sandbox_desired_state(
             .await
         {
             Ok(response) => {
-                for error in response.into_inner().errors {
+                let response = response.into_inner();
+                crate::metrics::reconcile::port_exposure_apply_state_publish(
+                    response.accepted,
+                    response.errors.len() as u64,
+                );
+                for error in response.errors {
                     tracing::warn!(
                         sandbox_id = %error.sandbox_id,
                         protocol = port_protocol_label(error.protocol),

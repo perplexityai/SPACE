@@ -12,22 +12,31 @@
 //! Release registration (`RegisterTemplateRelease`, in internal-api) reads
 //! and inserts releases and their storage locations through
 //! [`registration`]'s verbs, the api's lookups and admin routes read them
-//! through [`lookup`]'s, and the template and admin release deletes remove
-//! rows through [`removal`]'s. The credential manager asks
+//! through [`lookup`]'s, internal-api's template catalog reads them through
+//! [`catalog`]'s, and the template and admin release deletes remove rows
+//! through [`removal`]'s. The credential manager asks
 //! [`release_published`] before it vends write credentials for a release's
-//! storage, and refuses them for a published release. Other statements
-//! against these tables still run in api and internal-api:
+//! storage, and refuses them for a published release. Of the other
+//! statements against these tables:
 //!
-//! * the locking reads (`FOR UPDATE`, `FOR NO KEY UPDATE`) of registration
-//!   and the admin routes stay with their callers, whose locks and re-checks
-//!   keep them correct; registration's fills of a release's execution
+//! * the locking reads (`FOR UPDATE`) of registration and the admin routes
+//!   are [`registration::lock_execution_metadata`],
+//!   [`lookup::lock_release_of_present_template`] and
+//!   [`removal::lock_releases_of_digest`]; each takes the caller's
+//!   transaction, and its lock lasts until that transaction ends. The
+//!   callers keep the order they take locks in and the re-checks those
+//!   locks keep correct. Registration's fills of a release's execution
 //!   metadata and of a found storage location's owner are
-//!   [`registration`]'s, run under those locks;
+//!   [`registration`]'s, run under those locks. The template row locks
+//!   they take first are `pplx-space-template-store`'s;
 //! * statements that interpolate `digest_original` or `spelling_original`
-//!   in the api's pool configs and admin release routes, and in
-//!   internal-api's original lookup and `TemplateReleasesStore`, haven't
-//!   moved yet; the api's create, base and placement resolvers and the
-//!   admin release population are [`lookup`]'s;
+//!   are this store's, except `pplx-space-cluster-pool`'s reads of the
+//!   releases its pool policies retain and of observed demand: the api's
+//!   create, base, placement and pool target resolvers, the admin release
+//!   population, the tag move's original lookup and the release delete's tag
+//!   and twin checks are [`lookup`]'s, internal-api's catalog lookups are
+//!   [`catalog`]'s, and registration's original lookup is
+//!   [`registration::original_release`];
 //! * other reads of other tables that join a release, and test fixtures,
 //!   stay where they are; the create's tag lookup, which reads the tags,
 //!   is [`lookup::resolve_by_tag`].
@@ -71,10 +80,12 @@
 
 use pplx_space_content_digest::ContentHash;
 use pplx_space_execution_spec::EnvironmentReference;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::{PgExecutor, Postgres};
+use sqlx::Postgres;
 use uuid::Uuid;
 
+pub mod catalog;
 pub mod lookup;
 mod objects;
 pub mod registration;
@@ -86,6 +97,8 @@ pub use objects::{ObjectAccessError, ReleaseObjects, S3ReleaseObjects, TwinMetad
 pub use resolution::{resolved_release, resolved_release_sql};
 pub use twin::{InsertTwin, insert_twin};
 
+#[cfg(test)]
+mod plan_tests;
 #[cfg(test)]
 mod tests;
 
@@ -143,12 +156,12 @@ pub struct ReleaseSubject {
 /// the other spelling) is skipped; a build with no storage locations on any
 /// release still appears so the caller surfaces it.
 pub async fn source_releases_page(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     source: PartitionSelector,
     after: Option<Uuid>,
     limit: u32,
-) -> Result<Vec<Uuid>, sqlx::Error> {
-    sqlx::query_scalar::<_, Uuid>(sql!(
+) -> Result<Vec<Uuid>, DbError> {
+    Ok(sqlx::query_scalar::<_, Uuid>(sql!(
         "SELECT r.id
          FROM template_releases r
          WHERE (r.execution_metadata->>'environment' = $1
@@ -183,16 +196,16 @@ pub async fn source_releases_page(
     .bind(source.includes_unbound)
     .bind(after)
     .bind(i64::from(limit))
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The release `release_id`, or `None` when there is none. Takes no lock.
 pub async fn release_subject(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     release_id: Uuid,
-) -> Result<Option<ReleaseSubject>, sqlx::Error> {
-    sqlx::query_as::<_, ReleaseSubject>(sql!(
+) -> Result<Option<ReleaseSubject>, DbError> {
+    Ok(sqlx::query_as::<_, ReleaseSubject>(sql!(
         "SELECT r.id,
                 r.template_name,
                 r.hash,
@@ -204,8 +217,8 @@ pub async fn release_subject(
          WHERE r.id = $1"
     ))
     .bind(release_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The original of release `release_id` when it's a twin, as registration
@@ -218,11 +231,11 @@ pub async fn release_subject(
 /// build's other spelling beside it) or gone. `initial_environment` is the
 /// initial environment, which unbound releases count as. Takes no lock.
 pub async fn twin_original(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     release_id: Uuid,
     initial_environment: EnvironmentReference,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar::<_, Uuid>(sql!(
+) -> Result<Option<Uuid>, DbError> {
+    Ok(sqlx::query_scalar::<_, Uuid>(sql!(
         "SELECT o.id
          FROM template_releases r
          CROSS JOIN LATERAL (
@@ -259,8 +272,8 @@ pub async fn twin_original(
     ))
     .bind(release_id)
     .bind(initial_environment.to_string())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The twins of release `original`: the releases of its template at its
@@ -272,11 +285,11 @@ pub async fn twin_original(
 /// The caller decides that `original` is an original; of a twin, this
 /// returns the other releases outside the twin's environment. Takes no lock.
 pub async fn twin_releases(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     original: Uuid,
     initial_environment: EnvironmentReference,
-) -> Result<Vec<Uuid>, sqlx::Error> {
-    sqlx::query_scalar::<_, Uuid>(sql!(
+) -> Result<Vec<Uuid>, DbError> {
+    Ok(sqlx::query_scalar::<_, Uuid>(sql!(
         "SELECT r.id
          FROM template_releases o
          JOIN template_releases r
@@ -298,8 +311,8 @@ pub async fn twin_releases(
     ))
     .bind(original)
     .bind(initial_environment.to_string())
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The release of `template_name` at `hash` that `selector` selects, under
@@ -316,17 +329,17 @@ pub async fn twin_releases(
 /// names its base by template and hash, so this finds the base's release in a
 /// campaign's source partition, an original or a twin. Takes no lock.
 pub async fn release_of_hash_in_partition(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &str,
     hash: &str,
     selector: PartitionSelector,
-) -> Result<Option<Uuid>, sqlx::Error> {
+) -> Result<Option<Uuid>, DbError> {
     let other_spelling = match objects::sha256_hex(hash) {
         Some(hex) if hash.starts_with("sha256:") => hex.to_owned(),
         Some(hex) => format!("sha256:{hex}"),
         None => hash.to_owned(),
     };
-    sqlx::query_scalar::<_, Uuid>(sql!(
+    Ok(sqlx::query_scalar::<_, Uuid>(sql!(
         "SELECT r.id
          FROM template_releases r
          WHERE r.template_name = $1
@@ -352,8 +365,8 @@ pub async fn release_of_hash_in_partition(
     .bind(&other_spelling)
     .bind(selector.environment.to_string())
     .bind(selector.includes_unbound)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Every release of `template_name`'s build in `selector`'s partition under
@@ -362,17 +375,17 @@ pub async fn release_of_hash_in_partition(
 /// without storage locations is included: its pool configs serve creates of
 /// its spelling too. Takes no lock.
 pub async fn releases_of_hash_in_partition(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &str,
     hash: &str,
     selector: PartitionSelector,
-) -> Result<Vec<Uuid>, sqlx::Error> {
+) -> Result<Vec<Uuid>, DbError> {
     let other_spelling = match objects::sha256_hex(hash) {
         Some(hex) if hash.starts_with("sha256:") => hex.to_owned(),
         Some(hex) => format!("sha256:{hex}"),
         None => hash.to_owned(),
     };
-    sqlx::query_scalar::<_, Uuid>(sql!(
+    Ok(sqlx::query_scalar::<_, Uuid>(sql!(
         "SELECT r.id
          FROM template_releases r
          WHERE r.template_name = $1
@@ -386,8 +399,8 @@ pub async fn releases_of_hash_in_partition(
     .bind(&other_spelling)
     .bind(selector.environment.to_string())
     .bind(selector.includes_unbound)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The storage connection strings of `release_id`, oldest first, encrypted
@@ -395,18 +408,18 @@ pub async fn releases_of_hash_in_partition(
 /// [`has_encrypted_storage_locations`] on the credentials pool before
 /// treating them as plaintext. Takes no lock.
 pub async fn storage_locations(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     release_id: Uuid,
-) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>(sql!(
+) -> Result<Vec<String>, DbError> {
+    Ok(sqlx::query_scalar::<_, String>(sql!(
         "SELECT storage_connection_string
          FROM template_release_storage_locations
          WHERE template_release_id = $1
          ORDER BY created_at, id"
     ))
     .bind(release_id)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether any storage location of `release_id` carries an owner-scoped
@@ -415,10 +428,10 @@ pub async fn storage_locations(
 /// The sidecar is credential-fenced: run this on the credentials pool, since
 /// the application pool has no grant on it.
 pub async fn has_encrypted_storage_locations(
-    credentials_executor: impl PgExecutor<'_>,
+    credentials_executor: impl Executor<'_>,
     release_id: Uuid,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
         "SELECT EXISTS (
              SELECT 1
              FROM template_release_storage_location_encrypted_fields e
@@ -427,8 +440,8 @@ pub async fn has_encrypted_storage_locations(
              WHERE l.template_release_id = $1)"
     ))
     .bind(release_id)
-    .fetch_one(credentials_executor)
-    .await
+    .fetch_one(credentials_executor.into_sqlx())
+    .await?)
 }
 
 /// Whether a storage location is registered for any release of
@@ -437,13 +450,13 @@ pub async fn has_encrypted_storage_locations(
 /// prefix was required is stored under. A published release is immutable.
 /// Takes no lock.
 pub async fn release_published(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template_name: &str,
     hash: &ContentHash,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let canonical = hash.to_string();
     let bare = canonical.trim_prefix("sha256:").to_string();
-    sqlx::query_scalar(sql!(
+    Ok(sqlx::query_scalar(sql!(
         "SELECT EXISTS (
              SELECT 1
              FROM template_release_storage_locations location
@@ -455,8 +468,8 @@ pub async fn release_published(
     .bind(template_name)
     .bind(canonical)
     .bind(bare)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether `template_name` carries an owner-scoped encryption sidecar: the
@@ -467,10 +480,10 @@ pub async fn release_published(
 /// Both sidecars are credential-fenced: run this on the credentials pool,
 /// since the application pool has no grant on them. Takes no lock.
 pub async fn template_has_owner_encryption(
-    credentials_executor: impl PgExecutor<'_>,
+    credentials_executor: impl Executor<'_>,
     template_name: &str,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
         "SELECT EXISTS (
                  SELECT 1 FROM template_encrypted_fields WHERE template_name = $1
              )
@@ -485,8 +498,8 @@ pub async fn template_has_owner_encryption(
              )"
     ))
     .bind(template_name)
-    .fetch_one(credentials_executor)
-    .await
+    .fetch_one(credentials_executor.into_sqlx())
+    .await?)
 }
 
 /// End a verb's transaction: commit it when `result` is `Ok`, roll it back

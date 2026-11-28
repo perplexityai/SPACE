@@ -506,6 +506,23 @@ is nonzero, roll the binary back only to a release that honors recorded
 finality (see "Upgrading a sandbox's runtime" in
 `docs/execution-environments.md`).
 
+`20261120230000_sandbox_runtime_upgrade_abandoned` adds
+`sandbox_runtime_upgrade_abandoned`, which records each operation the control
+plane abandoned. It has no foreign key to `sandboxes`, so a record outlives its
+sandbox's row and can precede it. Its down refuses, before it changes the
+schema, while the table holds any row: a release without it doesn't know an
+operation was abandoned, so a late call for one could change a disk the
+control plane has already captured. This read-only query counts the rows that
+hold it back:
+
+```sql
+SELECT COUNT(*) FROM sandbox_runtime_upgrade_abandoned;
+```
+
+An image-only rollback runs no down, so once that count is nonzero, roll the
+binary back only to a release that enforces abandonment, or keep every caller
+of the abandoned operations quiet first.
+
 ## Console password provisioning
 
 The password hash marker `!` locks console password login and rejects existing
@@ -629,6 +646,27 @@ which is safe because SQLx rolls the file and its `_sqlx_migrations` row back
 together. A `-- no-transaction` migration is not retried at all, because a
 failed `CREATE INDEX CONCURRENTLY` can leave an INVALID index behind with no
 history row, and recovering that needs a `DROP INDEX CONCURRENTLY` and a rerun.
+A failed `DROP INDEX CONCURRENTLY` can leave one too, and so can a
+`-- no-transaction` down, whose failure keeps the up's history row. When the
+statement of a `-- no-transaction` file fails under `control-plane up`,
+`reset` or `down`, the migrator logs one error per INVALID index in the
+database before it exits, with the `failed_version`, the `index`, its `table`,
+`ready` (whether writes still maintain it) and `in_progress`. The list is not
+capped or filtered to the failed file, so it can name an index from an earlier
+failure or another session's build; check which file names it before
+recovering.
+A Job killed partway through such a file logs none of this, and its statement
+keeps running on the server: the index it leaves is INVALID while the build or
+drop runs, and stays INVALID only if that statement later fails or is
+terminated. So `control-plane up`, and `reset` after it drops the schema, also
+run the same query before they apply anything, and log a warning per INVALID
+index with the same fields but no `failed_version`; the run goes on either way.
+`in_progress` is true when another session holds `SHARE UPDATE EXCLUSIVE` on
+the table, as a running `CONCURRENTLY` build or drop does. `VACUUM`, `ANALYZE`
+and a build or drop of another index on that table hold it too, so true means
+it may be running. Do not drop an index while it is true: wait for the
+statement to end, then check again. When it is false, no build or drop holds
+the table now; one still waiting for the lock also shows false.
 
 [The migration lint guard](../scripts/check-postgres-migrations-squawk.sh)
 checks changed `db/postgres/*.up.sql` files with Squawk. Squawk catches generic
@@ -651,8 +689,13 @@ semantics; only its exact reviewed content is exempt from the new-migration lint
 The same guard lane also rejects PRs that combine `db/postgres/*.sql`
 migrations with runtime/deployable app changes. Land Postgres migrations in a
 separate PR from application behavior changes so lock risk, rollout, and
-rollback are reviewed independently. Docs, tests, and migration-guard
-maintenance can travel with migration-only PRs.
+rollback are reviewed independently. Docs, tests under `scripts/tests/`, the
+SQL files directly in `crates/test_support/db/test/fixtures/schema-variants/`,
+and the migration guards under `scripts/` with their tests can travel with
+migration-only PRs. Apart from the bootstrap-role exceptions below, every other
+file under `crates/`, Rust tests included, counts as a runtime change, so a
+migration must keep every existing Rust test passing: tighten a constraint
+they violate only after a separate PR updates them.
 
 The sole production-code exception is the credential fence required by a
 credential-table migration. That PR may change the canonical table-name entries
@@ -902,13 +945,14 @@ the caller, not of the statement:
 Inside the substrate the classification is reached through an extension trait,
 `DbContext::db_context`, rather than a bare `map_err` at each site. That is
 partly ergonomics — one line per call site instead of a five-line closure — but
-mostly a type check: the trait is implemented only for `Result<_, sqlx::Error>`
-and for the warm-pool store's error, so reaching for it on a `kube` or `tonic`
-result does not compile, and the compiler rather than review is what keeps the
-classification on database errors. A `SubstrateError::Failed` built directly
-from a `sqlx::Error` is the regression to look for. `direct.rs` keeps one
-hand-written mapper on top of it, because its route reservation classifies
-`Io`/`PoolTimedOut`/`57014` as retryable-but-not-contention.
+mostly a type check: the trait is implemented only for `Result<_, sqlx::Error>`,
+for the warm-pool store's error and for postgres-pool's `DbError`, so reaching
+for it on a `kube` or `tonic` result does not compile, and the compiler rather
+than review is what keeps the classification on database errors. A
+`SubstrateError::Failed` built directly from a `sqlx::Error` or a `DbError` is
+the regression to look for. `direct.rs` keeps one hand-written mapper on top of
+it, because its route reservation classifies `Io`/`PoolTimedOut`/`57014` as
+retryable-but-not-contention.
 
 Finding a gap like this is a matter of reading the error mapping, not the SQL:
 the statement looks ordinary and the disposition lives at the boundary, often
@@ -951,9 +995,9 @@ Two shapes need care when adding code:
 ### Application pools
 
 Long-running services connect only as the managed logins, with no selector
-and no fallback to the connecting admin. `pplx-space-postgres-pool`
-exposes three constructors: `connect_space_user_pool` (the service's
-general-purpose pool, as `space_user`), `CredentialsPool::connect` (the
+and no fallback to the connecting admin. They build their pools with three
+`pplx-space-postgres-pool` constructors: `connect_space_user_pool_lazy` (the service's
+general-purpose pool, as `space_user`), `CredentialsPool::connect_lazy` (the
 credential-fenced lane, as `space_creds`), and
 `connect_space_user_sideline_pool_lazy` (a *sideline* pool, also `space_user`,
 with an explicit connection cap). A sideline pool exists for one reason: a

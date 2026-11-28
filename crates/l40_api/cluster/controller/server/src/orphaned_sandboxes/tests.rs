@@ -1,5 +1,6 @@
 use pplx_space_accounts::NodeId;
 use pplx_space_snapshot_model::SnapshotId;
+use pplx_space_sql_locator::sql;
 
 use super::*;
 use k8s_openapi::api::core::v1::{
@@ -12,6 +13,7 @@ use pplx_space_auto_lifecycle::{
     AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStage,
 };
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
+use sqlx::types::Json;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -1007,7 +1009,7 @@ async fn the_recovery_statement_refuses_while_the_node_reports_the_sandbox() -> 
 
         let mut tx = db.pool.begin().await?;
         let written = orphan::recover_orphan_to_suspended(
-            &mut tx,
+            &mut *tx,
             sandbox_id,
             ORPHAN_RECONCILER_STOP_LIFECYCLES,
             &guard.store_guard(),

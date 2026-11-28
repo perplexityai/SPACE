@@ -2429,6 +2429,11 @@ impl SandboxManagerService {
                 ))
             })?
             .into_inner();
+        self.external_addresses.record(
+            id,
+            &start_ctx.space_api_route_identity,
+            alloc.external_address.as_deref(),
+        );
         let sbx_uid = alloc.sandbox_uid;
         if sbx_uid < 10000 {
             // No VM, sidecar, cgroup, or filesystem work has been launched yet.

@@ -135,7 +135,7 @@ once nothing is left in it.
 `--only` and `--skip` take comma-separated step names or tags, each matched
 exactly; a name that is neither is an error. The tags are `routes`, `orgs`,
 `users`, `api-keys`, `sandboxes`, `flows`, `lifecycle`, `templates`, `nodes`,
-`roles`, `terminal`. Sign-in always runs. Steps tagged `flows` create objects
+`drain-v2`, `roles`, `terminal`. Sign-in always runs. Steps tagged `flows` create objects
 and delete them again; each records its object's ID as soon as the create is answered,
 so if one fails before deleting, `npm run clean` removes it. They need a seed
 state for the prefix, and the identity check above passes before any runs.
@@ -144,6 +144,15 @@ running sandbox and in the tenant organization's running sandbox, the second
 through the admin terminal route, and type into it. They create no objects,
 but they open terminal sessions, and the admin route records an admin audit
 row for each of the second's, so `--no-mutate` skips them too. The steps are in [`src/steps.ts`](src/steps.ts).
+
+Two `nodes` `flows` steps preview a v2 drain, which changes nothing on a node:
+`node-drain-preview` runs Preview v2 drain on the node page of the worker
+with the most sandboxes and checks the panel against the API's answer, and
+`nodes-drain-preview-all` runs Preview v2 drain on all workers and checks that
+every listed worker gets a row, with at most four previews in flight. Both
+fail on any admin write the page sends while they run and check that each
+worker keeps its drain phase. They create nothing, so `--no-mutate` keeps
+them.
 
 Two `nodes` steps are `flows` that drain a node: `node-forced-drain-undrain`
 forced-drains a Kind worker through the node page and undrains it, and
@@ -173,6 +182,95 @@ the annotation with
 `kubectl --context <context> annotate node <node> space.pplx.net/drain-keep-`,
 where `<context>` is the run's `--kube-context` or `CONSOLE_LOOP_KUBE_CONTEXT`
 (`kind-space-local` by default).
+
+`node-gentle-drain-undrain` drains a worker the same way through the node
+page's Drain, a v1 gentle drain: it checks that the request is
+`{"mode":"gentle"}` with no engine and that the page shows a mode, no
+engine and no Drain progress panel, then undrains it.
+
+These three v1 drain steps (`node-forced-drain-undrain`,
+`node-terminate-refused` and `node-gentle-drain-undrain`) need drain v2 off,
+since the API refuses every v1 `:drain` while it is on. Kind's values turn it
+on, so on a Kind bench each notes that and returns; run them against a stack
+whose API and controller run with `SPACE_DRAIN_V2_ENABLED` `false`. A run
+reads the switch once, from the cluster controller Deployment's literal
+`SPACE_DRAIN_V2_ENABLED` through `--kube-context`.
+
+The `drain-v2` steps run v2 drains (`:drain {engine: "v2", hold_seconds}`)
+on a real Kind worker. The API serves them on Kind, but only the cluster
+controller's v2 loop moves one along, and a v2 drain needs the node's EC2
+instance recorded, so `nodes-v2-setup` does what `space_smoke`'s drain v2
+scenarios do, with `kubectl` and `docker` through `--kube-context`: it takes
+the smokes' controller and worker-cordon Leases, checks that the bench's
+values turn `SPACE_DRAIN_V2_ENABLED` on for the controller, records its
+standing `SPACE_NODE_DRAIN_TERMINATOR_KIND` and its replicas in
+`out/drain-v2-standing.json`, turns the `aws` terminator on (against Kind's
+fake EC2; Kind's v1 drains run `kube-delete`) and waits for the rollout, and
+re-registers each worker that holds no sandbox under a fake AWS providerID,
+waiting until the node's preview no longer names its instance unrecorded.
+`nodes-v2-teardown` puts the recorded config back and releases the Leases;
+the workers keep their fake instances. A setup that fails part way puts the
+recorded config back too, before it releases the Leases; if that fails, the
+file keeps it. Both carry every v2 flow's name as a
+tag, so `--only node-drain-progress` runs them around it. A run interrupted
+in between leaves the file, which the next setup restores from, and Leases
+held by a loop process that is gone, which the next run on this host takes
+over.
+
+The v2 flows drain only such a worker, while no node is in any drain, under
+the drain-keep override, and undrain it in `finally`, waiting until the v2
+drain, its cancel included, is gone. A worker that a seeded sandbox runs on
+is never re-registered or v2-drained, so seed with one worker cordoned (for
+example `:cordon` it through the admin API before `npm run seed` and
+`:uncordon` it after) to keep it free. They read the node through the
+loop's own API client, outside the page, so that the node answers the page
+receives are the console's own:
+
+- `node-v2-drain-now` starts a v2 drain with the hold Now (`hold_seconds:
+  0`), follows the empty worker to `drained`, shows the API's own phase
+  refusal for a terminate sent after an undrain (`:terminate` refuses a v2
+  node only on its phase), and waits for the undrain's cancel to finish;
+- `node-v2-hold-shorten-undrain` places one running sandbox on the worker,
+  starts with a custom hold of 600 s, waits for the controller to store the
+  node's report under the drain's generation (the API doesn't show the seal),
+  checks the panel and the nodes-list cell, shows the API's 409
+  `drain_v2_in_progress` for a preview of the drained node, shows that
+  Shorten hold refuses a longer
+  hold before sending it, shortens the hold to 300 s and follows the deadline
+  there, gets the API's 409 for a shorten a stale page sends
+  after another client shortened the drain, the API's 400 for `mode` beside
+  `engine: v2` (the step adds it to the request), a 503 and a network error
+  (answered by the step), and the page's stale-read warning, then, with the
+  cluster controller scaled to 0 so nothing moves, End hold now (`hold_seconds:
+  0`) and an undrain mid-drain, whose cancel stays pending until the
+  controller is scaled back;
+- `node-v2-refusals` shows the cap's 409 with `Retry-After`, the stale
+  heartbeat's 409 and the switched-off 400, each answered by the step with
+  the API's body;
+- `node-v2-states` renders states the stack can't be put in on demand from
+  the node's own answer with its drain fields changed: terminating with the
+  instance fenced, a v2 drain whose progress the API left out, an unknown
+  phase and engine, a malformed and an unrecognized report, a node the
+  controller's fresh terminate check returned to `drained` with why in
+  `drain_last_error`, the nodes list with a malformed one, and a node the
+  drain let go (404);
+- `node-drain-progress` places two running sandboxes and a paused one on
+  the worker (a v2 drain refuses a node that holds a stopped sandbox),
+  drains it with a hold of 150 s, and at each stage (held until the
+  deadline, the paused one evacuated at once, past the
+  deadline, every one evacuated, `drained`) checks the Drain progress panel
+  against the answer the page rendered it from (its headline, the counts
+  from `evacuated_total` and the report, each pending row's wait, `running`
+  and warm-pool label, each evacuated row) and each sandbox's own row
+  against that answer, and at `drained` that every resident is counted,
+  a released one through `evacuated_total`; a warm-pool member, stalled
+  (past the deadline, 15 minutes after `evacuated_grew_at`) and cancelling
+  are that answer with the fields that make each set by the step. It writes
+  every report it read to
+  `node-drain-progress-timeline.json` in the run directory and deletes the
+  sandboxes at the end.
+
+A step that answers the page itself notes `SYNTHETIC:` and what it answered.
 
 Two read-only `nodes` steps cover what holds a node. Both pick the worker
 the admin API's `GET /v1/nodes/{id}/holds` reports the most holds for, a node
@@ -218,8 +316,13 @@ what the console under test has, and the detail step then requires the
 A prefix is up to 32 lowercase letters, digits and dashes. `npm run seed`
 also takes `--skip-sandboxes`, and `npm run clean` takes `--delete-orgs`.
 `npm run loop` also takes `--label NAME`, `--slow-ms N` (default 1500),
-`--compare RUN`, `--headed`, and `--video`, which records the run as
-`run.webm` in its run directory. Run `npm run typecheck` and `npm test` (unit
+`--compare RUN`, `--headed`, `--loopback-hosts` (see below), and `--video`, which records the run as
+`run.webm` in its run directory and each step's place in it (`video` in
+`summary.json`). `npm run gifs -- <run> [--steps NAMES] [--width N] [--fps N]
+[--max-seconds N]` cuts that recording into one GIF per step,
+`<run>/gifs/<NNN>-<step>.gif`, with `ffmpeg`; a step longer than
+`--max-seconds` (40) plays faster so its GIF lasts that long, and
+`gifs/cuts.json` says by how much. Run `npm run typecheck` and `npm test` (unit
 tests that need no stack) after changing the scripts; the SPACE Guide job of
 Pull CI runs both. The tool lives under `scripts/`, outside the paths that
 select the Kind smoke (`ci/kind-pull-paths.txt`) and outside `ui/`'s build.
@@ -335,6 +438,25 @@ This signs in, records the routes at 1280×800, and writes
 `out/media/nodes-page.webm`, plus `nodes-page.gif` when `ffmpeg` is installed.
 Step screenshots from a run are in its run directory. Attach media to the pull
 request instead of committing it.
+
+`--loopback-hosts`, on `npm run loop` and `npm run capture`, rewrites each
+IPv4 literal outside `127.0.0.0/8` in the JSON responses it intercepts (the
+page's `/admin/` and `/api/` requests) to `127.0.0.<last octet>` before the
+page sees it, a Kind node's address included. That is all it rewrites:
+hostnames, IPv6 addresses, any other response, event streams and anything
+the page renders from elsewhere reach screenshots and videos as they are,
+so check the media before you share it. A step's checks that read the API
+through the page see the same rewritten answers. The tool's own requests
+outside the browser (the seed, `clean` and the stack identity check) are not
+rewritten.
+
+`--click LABEL` clicks the button LABEL names on each route that has one and
+records what it shows, for an action whose result is the point, such as
+`--click 'Preview v2 drain'` on a node page. LABEL is the button's visible
+text, or its whole accessible name, which an icon's label leads ("eye Preview
+v2 drain"); either must match exactly, so a label never picks a longer button.
+A LABEL that more than one button on a page matches stops the capture with
+the buttons it matched.
 
 A new API key's secret is shown once, in a dialog. The API-key step sends
 every POST through `page.route`: it fetches the answer without following a

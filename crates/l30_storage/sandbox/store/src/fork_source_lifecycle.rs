@@ -3,25 +3,26 @@
 
 use pplx_space_sandbox_model::SandboxId;
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::{Postgres, Transaction};
 
 /// Stable namespace for the per-source advisory transaction lock.
-pub const FORK_SOURCE_LIFECYCLE_LOCK_SEED: i64 = 734_927_411;
+const FORK_SOURCE_LIFECYCLE_LOCK_SEED: i64 = 734_927_411;
 
 /// Serialize fork admission, source deletion, and snapshot-retention claims for
 /// one sandbox. Every participant must acquire this lock before the sandbox
-/// row lock so their ordering cannot deadlock.
-pub async fn lock_fork_source_lifecycle(
-    tx: &mut Transaction<'_, Postgres>,
-    sandbox_id: SandboxId,
-) -> Result<(), sqlx::Error> {
+/// row lock so their ordering cannot deadlock. The caller must pass its open
+/// transaction.
+pub async fn lock_fork_source_lifecycle<C>(tx: &mut C, sandbox_id: SandboxId) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "SELECT pg_advisory_xact_lock(hashtextextended($1::text, $2))"
     ))
     .bind(sandbox_id)
     .bind(FORK_SOURCE_LIFECYCLE_LOCK_SEED)
-    .execute(&mut **tx)
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }
@@ -33,12 +34,16 @@ pub async fn lock_fork_source_lifecycle(
 /// guard holds across the change and for rows written before it.
 ///
 /// Callers that use this as a lifecycle or snapshot-deletion guard must first
-/// acquire [`lock_fork_source_lifecycle`] in the same transaction.
-pub async fn active_fork_source_operation_exists(
-    tx: &mut Transaction<'_, Postgres>,
+/// acquire [`lock_fork_source_lifecycle`] in the same transaction. The caller
+/// must pass its open transaction.
+pub async fn active_fork_source_operation_exists<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_scalar(sql!(
         "SELECT EXISTS (
              SELECT 1
                FROM public_operations
@@ -48,6 +53,6 @@ pub async fn active_fork_source_operation_exists(
          )"
     ))
     .bind(sandbox_id.to_string())
-    .fetch_one(&mut **tx)
-    .await
+    .fetch_one(tx.into_sqlx())
+    .await?)
 }

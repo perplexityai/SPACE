@@ -17,7 +17,7 @@ pub use pplx_space_observability::DB_POOL_ACQUIRE_TOTAL_MS_METRIC;
 /// Emitted as a distribution so `max`/percentile queries aggregate every
 /// pod's samples server-side; per-replica gauges from co-scheduled pods
 /// would collapse into one last-write-wins series at the node agent.
-pub fn utilization_for_identity(ratio: f64, identity: DatabaseIdentity) {
+pub(crate) fn utilization_for_identity(ratio: f64, identity: DatabaseIdentity) {
     distribution(
         "db.pool.utilization",
         ratio,
@@ -26,7 +26,7 @@ pub fn utilization_for_identity(ratio: f64, identity: DatabaseIdentity) {
 }
 
 /// Checked-out connections tagged by the Postgres login backing the pool.
-pub fn connections_in_use_for_identity(in_use: u32, identity: DatabaseIdentity) {
+pub(crate) fn connections_in_use_for_identity(in_use: u32, identity: DatabaseIdentity) {
     distribution(
         "db.pool.connections_in_use",
         f64::from(in_use),
@@ -35,7 +35,7 @@ pub fn connections_in_use_for_identity(in_use: u32, identity: DatabaseIdentity) 
 }
 
 /// Idle connections tagged by the Postgres login backing the pool.
-pub fn connections_idle_for_identity(idle: usize, identity: DatabaseIdentity) {
+pub(crate) fn connections_idle_for_identity(idle: usize, identity: DatabaseIdentity) {
     distribution(
         "db.pool.connections_idle",
         idle as f64,

@@ -1,5 +1,5 @@
 //! Postgres-backed implementation of [`super::NodeGroupSink`], over
-//! `pplx-space-node-group-store`'s verbs. The seed's lock statements stay here.
+//! `pplx-space-node-group-store`'s verbs. The seed's `lock_timeout` stays here.
 //!
 //! - **Seed**: a lock-free `SELECT ... WHERE is_default` fast path, and — only
 //!   when no default exists — a short transaction taking
@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use pplx_space_node_model::NodeGroupId;
 use pplx_space_node_model::NodeGroupName;
-use pplx_space_sql_locator::sql;
+use pplx_space_postgres_pool::TxSettings as _;
 use sqlx::PgPool;
 
 use super::{DefaultNodeGroup, EnsureDefaultGroupError, EnsuredDefaultGroup, NodeGroupSink};
@@ -98,12 +98,9 @@ fn to_default_group(
     }
 }
 
-async fn select_default_group<'e, E>(
-    executor: E,
-) -> Result<Option<DefaultNodeGroup>, EnsureDefaultGroupError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
+async fn select_default_group(
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
+) -> Result<Option<DefaultNodeGroup>, EnsureDefaultGroupError> {
     let row = pplx_space_node_group_store::default_node_group(executor).await?;
     row.map(|row| to_default_group(row.id, row.name))
         .transpose()
@@ -165,18 +162,10 @@ impl NodeGroupSink for NodeGroupDbStore {
         // invisible to a plain SELECT, because ACCESS SHARE conflicts only with
         // ACCESS EXCLUSIVE — Postgres admits a lock request that doesn't
         // conflict with the wait queue's mask. The bound is for this tick alone.
-        //
-        // `set_config(..., is_local => true)` rather than `SET LOCAL` because
-        // `SET` takes no bind parameter. It is the same statement in function
-        // form: transaction-local scope, the same value, and a wait past it
-        // still fails with `55P03`.
-        sqlx::query(sql!("SELECT set_config('lock_timeout', $1, TRUE)"))
-            .bind(format!("{}ms", self.seed_lock_timeout.as_millis()))
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(sql!("LOCK TABLE node_groups IN SHARE ROW EXCLUSIVE MODE"))
-            .execute(&mut *tx)
-            .await?;
+        tx.set_local_lock_timeout(self.seed_lock_timeout)
+            .await
+            .map_err(sqlx::Error::from)?;
+        pplx_space_node_group_store::locks::lock_node_groups_share_row_exclusive(&mut *tx).await?;
 
         // Both facts are re-read under the lock: another replica may have
         // seeded a default since the fast path (making us a reader), or a
@@ -238,7 +227,9 @@ impl NodeGroupSink for NodeGroupDbStore {
 
     async fn non_default_group_count(&self) -> Result<i64, sqlx::Error> {
         // `is_default` is NOT NULL, so `NOT is_default` has no third case.
-        pplx_space_node_group_store::non_default_node_group_count(&self.pool).await
+        pplx_space_node_group_store::non_default_node_group_count(&self.pool)
+            .await
+            .map_err(sqlx::Error::from)
     }
 }
 

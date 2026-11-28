@@ -1,12 +1,14 @@
 //! Migrating and opening template-manager's database, which template-manager
 //! does once at startup after taking its service mutex: [`migrate`], then
-//! [`open`] for the one connection it shares.
+//! [`open`] for the one connection it shares through a
+//! [`SharedConnection`](crate::SharedConnection).
 
 use std::path::Path;
 
 pub use pplx_space_sqlite::SqliteError;
-use rusqlite::Connection;
 use sqlx::migrate::Migrator;
+
+use crate::Connection;
 
 /// template-manager's embedded migrations, `db/template-manager`.
 pub static MIGRATOR: Migrator = sqlx::migrate!("../../../../../db/template-manager");
@@ -31,4 +33,5 @@ pub async fn migrate(path: &Path) -> Result<(), SqliteError> {
 /// with `synchronous=NORMAL`.
 pub fn open(path: &Path) -> Result<Connection, SqliteError> {
     pplx_space_sqlite::open_rusqlite(path, pplx_space_sqlite::RusqliteOpenOptions::default())
+        .map(Connection)
 }

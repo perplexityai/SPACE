@@ -217,8 +217,6 @@ fn lookup_tag_returns_req_tag_or_default() {
 /// is in place).
 #[tokio::test]
 async fn do_pull_aborts_early_when_build_is_marked_deleting() {
-    use std::sync::Mutex;
-
     let conn = crate::db::test_conn();
     let hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     crate::db::upsert_build(
@@ -237,12 +235,13 @@ async fn do_pull_aborts_early_when_build_is_marked_deleting() {
     )
     .unwrap();
     // Eviction Phase 1: flip to deleting.
-    conn.execute(
-        "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
-        rusqlite::params!["seed", hash],
-    )
-    .unwrap();
-    let db = Arc::new(Mutex::new(conn));
+    conn.raw()
+        .execute(
+            "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
+            rusqlite::params!["seed", hash],
+        )
+        .unwrap();
+    let db = crate::db::SharedConnection::new(conn);
 
     // `storage_uris` is empty; the early-abort check fires
     // before the storage-iteration loop so an empty list is
@@ -273,10 +272,8 @@ async fn do_pull_aborts_early_when_build_is_marked_deleting() {
 
 #[tokio::test]
 async fn do_pull_treats_empty_storage_locations_as_local_only_uncached() {
-    use std::sync::Mutex;
-
     let conn = crate::db::test_conn();
-    let db = Arc::new(Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
     let hash = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     let outcome = do_pull(
@@ -1326,7 +1323,7 @@ async fn a_pull_waits_for_a_digest_claim_then_runs() {
         async move {
             puller
                 .pull_resolved(
-                    Arc::new(Mutex::new(crate::db::test_conn())),
+                    crate::db::SharedConnection::new(crate::db::test_conn()),
                     "claim-wait-test".to_string(),
                     content_hash,
                     Vec::new(),
@@ -1470,8 +1467,6 @@ fn release_partition_reads_the_manifest_then_the_metadata_binding() {
 /// left nothing to serve.
 #[tokio::test]
 async fn pull_refuses_retryably_before_counting_a_row_mid_eviction() {
-    use std::sync::Mutex;
-
     let conn = crate::db::test_conn();
     let hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     crate::db::upsert_build(
@@ -1489,14 +1484,15 @@ async fn pull_refuses_retryably_before_counting_a_row_mid_eviction() {
         },
     )
     .unwrap();
-    conn.execute(
-        "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
-        rusqlite::params!["seed", hash],
-    )
-    .unwrap();
+    conn.raw()
+        .execute(
+            "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
+            rusqlite::params!["seed", hash],
+        )
+        .unwrap();
 
     let (outcome, _) = pull_resolved_owner(
-        Arc::new(Mutex::new(conn)),
+        crate::db::SharedConnection::new(conn),
         OwnedPull {
             name: "seed",
             resolved_hash: hash,
@@ -1521,7 +1517,7 @@ async fn pull_refuses_retryably_before_counting_a_row_mid_eviction() {
 }
 
 /// A DB holding the legacy-partition build of `hash`, unbound.
-fn db_with_legacy_build(hash: &str) -> Arc<Mutex<rusqlite::Connection>> {
+fn db_with_legacy_build(hash: &str) -> crate::db::SharedConnection {
     db_with_legacy_build_bound_to(hash, None)
 }
 
@@ -1531,7 +1527,7 @@ fn db_with_legacy_build(hash: &str) -> Arc<Mutex<rusqlite::Connection>> {
 fn db_with_legacy_build_bound_to(
     hash: &str,
     environment: Option<pplx_space_execution_spec::EnvironmentReference>,
-) -> Arc<Mutex<rusqlite::Connection>> {
+) -> crate::db::SharedConnection {
     use pplx_space_cpu_arch::Arch;
     use pplx_space_execution_spec::ExecutionMetadata;
     use pplx_space_template_manifest::TemplateManifest;
@@ -1559,7 +1555,7 @@ fn db_with_legacy_build_bound_to(
         },
     )
     .unwrap();
-    Arc::new(Mutex::new(conn))
+    crate::db::SharedConnection::new(conn)
 }
 
 fn twin_partition() -> TemplateCachePartition {

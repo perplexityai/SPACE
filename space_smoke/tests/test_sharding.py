@@ -59,6 +59,7 @@ def test_shards_run_every_eligible_scenario_once_and_propagate_failures(count):
                     "return_value.browser_unavailable.return_value": None,
                     "return_value.storage_credentials.return_value": "exchange",
                     "return_value.substrate.return_value": "kubernetes",
+                    "return_value.drain_v2_enabled.return_value": False,
                 },
             ) as bootstrap,
             mock.patch("space_smoke.__main__.run_scenarios", side_effect=execute),
@@ -102,6 +103,25 @@ def test_shard_cli_routes_to_the_selected_inventory():
     ):
         assert main() == 42
     run.assert_called_once_with(shard=(2, 3))
+
+
+def _listed(*args):
+    out = StringIO()
+    with mock.patch("sys.argv", ["space-smoke", "list", *args]), redirect_stdout(out):
+        assert main() == 0
+    return [line.split("\t", 1)[0] for line in out.getvalue().splitlines()]
+
+
+def test_a_listed_set_splits_into_shards_that_run_by_name_each_once():
+    """The drain set, manual scenarios included, runs by name; its listed
+    shards cover it exactly once and each holds a share of it."""
+
+    selection = ["--prefix", "native.v2_", "--tier", "routine", "--tier", "manual"]
+    listed = _listed(*selection)
+    assert listed and all(scenario_id.startswith("native.v2_") for scenario_id in listed)
+    shards = [_listed(*selection, "--shard", f"{index}/4") for index in range(1, 5)]
+    assert sorted(scenario_id for shard in shards for scenario_id in shard) == sorted(listed)
+    assert all(shards)
 
 
 def test_shard_cannot_silently_ignore_a_named_scenario():

@@ -8,6 +8,7 @@
 
 use uuid::Uuid;
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 
 /// What one [`prune_deleted_sandboxes`] call removed.
@@ -51,10 +52,10 @@ pub struct PrunedDeletedSandboxes {
 /// one-hour grace, except for locations in another bucket or with an
 /// encrypted sidecar, which it leaves in place.
 pub async fn prune_deleted_sandboxes(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     retention_secs: i64,
     max_records: i64,
-) -> Result<PrunedDeletedSandboxes, sqlx::Error> {
+) -> Result<PrunedDeletedSandboxes, DbError> {
     let (sandbox_ids, storage_locations_detached) = sqlx::query_as::<_, (Vec<Uuid>, i64)>(sql!(
         "WITH candidates AS MATERIALIZED (
                  SELECT s.id
@@ -87,7 +88,7 @@ pub async fn prune_deleted_sandboxes(
     ))
     .bind(retention_secs)
     .bind(max_records)
-    .fetch_one(executor)
+    .fetch_one(executor.into_sqlx())
     .await?;
     Ok(PrunedDeletedSandboxes {
         sandbox_ids,

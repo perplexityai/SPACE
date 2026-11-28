@@ -15,7 +15,7 @@ use base64::Engine;
 use k8s_openapi::api::core::v1::{Pod, PodIP, PodStatus};
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDb, pg_test_db};
 use pplx_space_node_api_sim::{SimWorkerHarness, state::status};
-use pplx_space_sandbox_store::StoredSandboxLifecycle;
+use pplx_space_sandbox_store::{SandboxMetadataValue, StoredSandboxLifecycle};
 use pplx_space_sql_locator::sql;
 use rstest::{fixture, rstest};
 use serde::Deserialize;
@@ -69,8 +69,7 @@ use crate::{
     },
     middleware::auth::{AuthEcwActor, AuthOrg},
     models::{
-        Organization, Sandbox, SandboxMetadataValue, SandboxNetworkPolicyPatch, SandboxResponse,
-        SandboxStateInput,
+        Organization, Sandbox, SandboxNetworkPolicyPatch, SandboxResponse, SandboxStateInput,
     },
     routes::AppState,
 };
@@ -310,7 +309,12 @@ async fn build_kubernetes_app_state_fixture(
     let db = pg_test_db().await?;
     let pool = db.pool.clone();
     let worker_node_id = NodeId::new();
-    let worker = start_connect_route_sim_worker(worker_node_id).await?;
+    // The worker answers on the sandbox pod's proxy port.
+    let worker = SimWorkerHarness::builder(worker_node_id.to_string())
+        .with_internal_api()
+        .as_sandbox_pod()
+        .start()
+        .await?;
     let pod_creates = Arc::new(Mutex::new(Vec::new()));
     let initial_pod = existing_pod.then(|| Pod {
         metadata: kube::api::ObjectMeta {
@@ -770,13 +774,11 @@ fn test_sandbox() -> Sandbox {
         disk_mib: None,
         disk_io_max_operations_per_sec: 1_000,
         disk_io_max_bandwidth_mib_per_sec: 100,
-        env: sqlx::types::Json(std::collections::BTreeMap::new()),
-        metadata: sqlx::types::Json(std::collections::BTreeMap::new()),
-        auto_lifecycle: sqlx::types::Json(AutoLifecyclePolicy::disabled()),
-        auto_lifecycle_state: sqlx::types::Json(AutoLifecycleRuntimeState::default()),
-        network_policy: Some(sqlx::types::Json(
-            pplx_space_net_common::NetworkPolicyV1::default(),
-        )),
+        env: std::collections::BTreeMap::new(),
+        metadata: std::collections::BTreeMap::new(),
+        auto_lifecycle: AutoLifecyclePolicy::disabled(),
+        auto_lifecycle_state: AutoLifecycleRuntimeState::default(),
+        network_policy: Some(pplx_space_net_common::NetworkPolicyV1::default()),
         network_policy_generation: 1,
         template_network_policy: None,
         template_network_policy_generation: None,
@@ -1682,7 +1684,7 @@ async fn egress_profile_header_applies_only_to_federated_creates(
         let sandbox = crate::controllers::sandbox::fetch_sandbox(&fixture.pool, sandbox_id)
             .await?
             .expect("created sandbox");
-        let policy = sandbox.network_policy.expect("resolved policy").0;
+        let policy = sandbox.network_policy.expect("resolved policy");
         assert_eq!(policy.allows_domain("sensor.example.test"), federated);
         assert!(!policy.allows_domain("unlisted.example.test"));
         assert_eq!(
@@ -5005,14 +5007,14 @@ async fn start_connect_route_sim_worker(node_id: NodeId) -> TestResult<SimWorker
 #[test]
 fn metadata_uses_sandbox_metadata() {
     let mut sandbox = test_sandbox();
-    sandbox.metadata = sqlx::types::Json(std::collections::BTreeMap::from([
+    sandbox.metadata = std::collections::BTreeMap::from([
         (
             "name".to_string(),
             SandboxMetadataValue::String("session-123".to_string()),
         ),
         ("priority".to_string(), SandboxMetadataValue::Number(3)),
         ("debug".to_string(), SandboxMetadataValue::Bool(true)),
-    ]));
+    ]);
     let response = SandboxResponse {
         name: sandbox.name.clone(),
         user_id: Some(sandbox.user_id),
@@ -5020,7 +5022,7 @@ fn metadata_uses_sandbox_metadata() {
         lifecycle: Some(sandbox.lifecycle.clone()),
         placement: Some(sandbox.placement.clone()),
         active_node_id: sandbox.active_node_id,
-        metadata: sandbox.metadata.0.clone(),
+        metadata: sandbox.metadata.clone(),
         status: Some("started".to_string()),
         ..native_sandbox_response(sandbox.id)
     };
@@ -5318,7 +5320,7 @@ fn detail_sandbox_uses_cached_runtime_spec() {
 #[test]
 fn detail_reports_authoritative_federated_ownership_not_metadata() {
     let mut sandbox = test_sandbox();
-    sandbox.metadata.0.insert(
+    sandbox.metadata.insert(
         "space.owner".into(),
         SandboxMetadataValue::String(
             r#"{"source":"federated_identity","orgID":"forged-org"}"#.into(),
@@ -5346,9 +5348,15 @@ fn detail_reports_authoritative_federated_ownership_not_metadata() {
         let detail =
             build_detail_sandbox(&test_ecw_credential_keyring(), &sandbox, &response, None)
                 .unwrap();
-        let detail = serde_json::to_value(detail).unwrap();
-        assert_eq!(detail["ownership"], expected);
-        ownerships.push(detail["ownership"].clone());
+        // Compared as parsed values, so the order serde_json keeps an
+        // object's keys in, which a feature can change, does not matter.
+        assert_eq!(
+            serde_json::to_value(&detail).unwrap()["ownership"],
+            expected
+        );
+        // The snapshot takes the typed ownership, which serializes its keys in
+        // the order it declares them, whatever the features.
+        ownerships.push(detail.ownership);
     }
     insta::assert_json_snapshot!(ownerships, @r#"
     [
@@ -6621,7 +6629,6 @@ async fn seed_ecw_caller(pool: &PgPool) -> TestResult<(Organization, crate::mode
 }
 
 /// Seeds the `seed` template with a `latest` release an ECW create resolves.
-#[cfg(feature = "kubernetes")]
 async fn seed_ecw_create_template(pool: &PgPool) -> TestResult {
     sqlx::query(sql!(
         "INSERT INTO templates (id, name, visibility) VALUES ($1, 'seed', 'generic')"
@@ -6734,6 +6741,117 @@ async fn ecw_create_refuses_out_of_bounds_resources_up_front() -> TestResult {
         .fetch_one(&db.pool)
         .await?;
     assert_eq!(sandboxes, 0, "a refused create wrote a sandbox row");
+    Ok(())
+}
+
+/// A Direct create the only worker refuses as full fails, and marks the
+/// worker's status snapshot `full`, with no ready network slots, for a short
+/// window in place of the hour its last publication gave it. A full worker
+/// is still reachable and healthy. The next create passes the worker over
+/// instead of asking it again, though it would take that one.
+#[tokio::test(flavor = "current_thread")]
+async fn a_create_a_direct_worker_refuses_as_full_marks_the_worker_full() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let db = pg_test_db().await?;
+    seed_ecw_create_template(&db.pool).await?;
+    let node_id = NodeId::new();
+    let worker = start_connect_route_sim_worker(node_id).await?;
+    worker
+        .state()
+        .refuse_next_create(tonic::Code::ResourceExhausted)
+        .await;
+    // Published ready for an hour.
+    insert_connect_route_ready_worker(&db.pool, node_id, worker.endpoint()).await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_template_inventory (
+             node_id, template_name, content_hash, runtime, arch,
+             has_base_snapshot, vcpu, memory_mib, guest_os,
+             state_format_name, state_format_version
+         )
+         VALUES (
+             $1, 'seed', 'sha256:ecw-create-seed', 'fc', 'aarch64',
+             TRUE, 1, 512, 'linux', 'firecracker-snapshot', '9.0.0'
+         )"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    let mut state = AppState::from_pool(db.pool.clone()).await?;
+    state.sandbox_controller = crate::controllers::sandbox::SandboxController::new(
+        crate::test_support::direct_substrate(&db.pool),
+    );
+    let (_, actor) = seed_ecw_caller(&db.pool).await?;
+    let app = e2b_api_routes()
+        .layer(Extension(AuthEcwActor(Some(actor))))
+        .layer(Extension(test_ecw_host_config()))
+        .with_state(state);
+    let create = || async {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/sandboxes")
+                    .header(header::HOST, TEST_ECW_API_HOST)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"templateID":"seed"}"#))?,
+            )
+            .await?;
+        let status = response.status();
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
+        TestResult::Ok((
+            status,
+            body["message"].as_str().unwrap_or_default().to_owned(),
+        ))
+    };
+
+    let (status, message) = create().await?;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{message}");
+    assert!(message.contains("create refused"), "{message}");
+    #[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
+    struct Snapshot {
+        reachable: bool,
+        error: Option<String>,
+        scheduling_status: String,
+        scheduling_reason: Option<String>,
+        health_healthy: Option<bool>,
+        network_slots_ready: Option<i32>,
+        short_window: bool,
+    }
+    let snapshot = sqlx::query_as::<_, Snapshot>(sql!(
+        "SELECT reachable, error, scheduling_status, scheduling_reason, health_healthy,
+                network_slots_ready,
+                stale_after > observed_at
+                  AND stale_after < observed_at + INTERVAL '1 hour' AS short_window
+         FROM node_status_snapshots WHERE node_id = $1"
+    ))
+    .bind(node_id)
+    .fetch_one(&db.pool)
+    .await?;
+    let reason = snapshot.scheduling_reason.clone().unwrap_or_default();
+    assert!(reason.starts_with("node-api create error: "), "{reason}");
+    assert_eq!(
+        snapshot,
+        Snapshot {
+            reachable: true,
+            error: None,
+            scheduling_status: "full".to_string(),
+            scheduling_reason: Some(reason),
+            health_healthy: Some(true),
+            network_slots_ready: Some(0),
+            short_window: true,
+        }
+    );
+
+    let (status, message) = create().await?;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{message}");
+    assert!(
+        message.starts_with("no cached-ready worker"),
+        "the next create asked the worker again: {message}"
+    );
     Ok(())
 }
 

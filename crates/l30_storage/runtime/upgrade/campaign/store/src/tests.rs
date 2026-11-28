@@ -7,6 +7,7 @@ use pplx_space_db_test_fixtures::{
 };
 use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::Db;
 use pplx_space_sandbox_model::SandboxLifecycle;
 use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
@@ -15,7 +16,7 @@ use uuid::Uuid;
 
 use pplx_space_node_status_store::test_support::{SnapshotSeed, upsert_snapshot};
 
-use super::test_support::{CampaignSeed, insert_campaign};
+use super::test_support::{CampaignSeed, insert_campaign, insert_campaign_with_kind};
 use super::*;
 
 mod kinds;
@@ -505,7 +506,7 @@ async fn a_lease_that_waits_on_another_lease_of_its_campaign_counts_what_that_on
 
     let pool = db.pool.clone();
     let second = tokio::spawn(async move {
-        let mut conn = pool.acquire().await?;
+        let mut conn = pool.acquire().await.map_err(DbError::from)?;
         lease_items(&mut *conn, campaign, LEASE, SCAN).await
     });
     wait_for_lock_waiter(&db.pool).await?;
@@ -608,7 +609,7 @@ async fn a_lease_counts_a_sandbox_on_the_node_that_published_it_while_the_lease_
 
     let pool = db.pool.clone();
     let leasing = tokio::spawn(async move {
-        let mut conn = pool.acquire().await?;
+        let mut conn = pool.acquire().await.map_err(DbError::from)?;
         lease_items(&mut *conn, campaign, LEASE, SCAN).await
     });
     wait_for_lock_waiter(&db.pool).await?;
@@ -961,7 +962,7 @@ async fn a_lease_waits_for_a_renewal_in_an_open_transaction_and_then_skips_the_s
 
     let pool = db.pool.clone();
     let leasing = tokio::spawn(async move {
-        let mut conn = pool.acquire().await?;
+        let mut conn = pool.acquire().await.map_err(DbError::from)?;
         lease_items(&mut *conn, campaign, LEASE, SCAN).await
     });
     wait_for_lock_waiter(&db.pool).await?;
@@ -1182,7 +1183,7 @@ async fn a_failure_committed_while_a_lease_waits_counts_against_the_budget() -> 
 
     let pool = db.pool.clone();
     let leasing = tokio::spawn(async move {
-        let mut conn = pool.acquire().await?;
+        let mut conn = pool.acquire().await.map_err(DbError::from)?;
         lease_items(&mut *conn, campaign, LEASE, SCAN).await
     });
     wait_for_lock_waiter(&db.pool).await?;
@@ -1449,16 +1450,16 @@ async fn a_campaign_pauses_itself_when_failures_reach_its_budget() -> TestResult
         &ItemOutcome::Skipped(ItemError::new("gone")),
     )
     .await?;
-    assert!(!pause_if_over_budget(&db.pool, campaign).await?);
+    assert!(!pause_if_over_budget(&Db::from(db.pool.clone()), campaign).await?);
 
     finish_item(&db.pool, &leased[2], &failed).await?;
-    assert!(pause_if_over_budget(&db.pool, campaign).await?);
+    assert!(pause_if_over_budget(&Db::from(db.pool.clone()), campaign).await?);
     assert_eq!(
         campaign_phase(&db.pool, campaign).await?,
         ("paused".to_owned(), false)
     );
     // Already paused: nothing more to do.
-    assert!(!pause_if_over_budget(&db.pool, campaign).await?);
+    assert!(!pause_if_over_budget(&Db::from(db.pool.clone()), campaign).await?);
     Ok(())
 }
 
@@ -1490,7 +1491,7 @@ async fn an_operator_phase_isnt_overwritten_by_the_budget() -> TestResult {
     .execute(&db.pool)
     .await?;
 
-    assert!(!pause_if_over_budget(&db.pool, campaign).await?);
+    assert!(!pause_if_over_budget(&Db::from(db.pool.clone()), campaign).await?);
     assert_eq!(
         campaign_phase(&db.pool, campaign).await?,
         ("aborted".to_owned(), true)
@@ -1774,7 +1775,7 @@ async fn a_campaign_over_its_budget_doesnt_complete_or_lease() -> TestResult {
     .execute(&db.pool)
     .await?;
     assert!(!complete_if_drained(&db.pool, campaign).await?);
-    assert!(pause_if_over_budget(&db.pool, campaign).await?);
+    assert!(pause_if_over_budget(&Db::from(db.pool.clone()), campaign).await?);
     Ok(())
 }
 
@@ -1987,11 +1988,14 @@ async fn a_verb_that_fails_after_locking_the_campaign_releases_it() -> TestResul
         .await
         .expect_err("the trigger refuses the lease");
     // The trigger fires on the item update, after the campaign is locked.
+    let LeaseError::Database(refused) = refused else {
+        panic!("{refused:?}");
+    };
+    let refused = sqlx::Error::from(refused);
     assert!(
         matches!(
             &refused,
-            LeaseError::Database(sqlx::Error::Database(error))
-                if error.message() == "leases are down"
+            sqlx::Error::Database(error) if error.message() == "leases are down"
         ),
         "{refused:?}"
     );

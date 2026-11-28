@@ -1150,3 +1150,23 @@ fn tls_exemptions_select_transport_by_destination() {
         );
     }
 }
+
+/// The API returns this JSON in a sandbox's network-policy status, and
+/// sandbox-teardown's observed-state read decodes the same shape.
+#[cfg(feature = "serde")]
+#[test]
+fn network_policy_condition_json_names_its_type_and_keeps_absent_fields() {
+    let json = r#"{"type":"Applied","status":"True","reason":null,"message":null,"last_transition_at":"2026-01-02T03:04:05Z"}"#;
+    let condition = NetworkPolicyCondition {
+        condition_type: "Applied".to_owned(),
+        status: "True".to_owned(),
+        last_transition_at: Some("2026-01-02T03:04:05Z".to_owned()),
+        ..NetworkPolicyCondition::default()
+    };
+
+    assert_eq!(serde_json::to_string(&condition).unwrap(), json);
+    assert_eq!(
+        serde_json::from_str::<NetworkPolicyCondition>(json).unwrap(),
+        condition
+    );
+}

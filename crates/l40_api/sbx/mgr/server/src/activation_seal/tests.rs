@@ -555,18 +555,24 @@ fn a_sealed_node_refuses_only_the_producers_of_sandboxes_without_a_vm() {
     unknown.assert_quiesced();
 }
 
-/// The check of work that would leave a sandbox without a VM stopped, the
-/// idle auto-stop of a suspended sandbox: a node known sealed refuses it with
-/// the sealed refusal, a node never sealed, cancelled or whose seal row can't
-/// be read admits it, and nothing is counted in flight.
+/// The admission of work that would leave a sandbox stopped, the idle
+/// auto-stop of a suspended, started or paused sandbox, which asks as a
+/// producer of a sandbox without a VM: a node known sealed refuses it with
+/// the sealed refusal and counts nothing; a node never sealed, cancelled or
+/// whose seal row can't be read admits it, and counts it in flight until its
+/// token is dropped.
 #[test]
 fn a_sealed_node_refuses_work_that_would_leave_a_sandbox_stopped() {
     let db = SharedConnection::new(crate::db::test_conn());
     let seal = ActivationSeal::load(&db.lock().unwrap());
-    seal.check_without_vm("idle auto-stop", SANDBOX).unwrap();
+    let admitted = seal
+        .admit_producer("idle auto-stop", SANDBOX, false)
+        .unwrap();
+    assert_eq!(seal.status().producers_in_flight, [SANDBOX]);
+    drop(admitted);
     seal.seal(&db, 3).unwrap();
     let refused = seal
-        .check_without_vm("idle auto-stop", SANDBOX)
+        .admit_producer("idle auto-stop", SANDBOX, false)
         .unwrap_err();
     assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
     assert!(
@@ -576,12 +582,20 @@ fn a_sealed_node_refuses_work_that_would_leave_a_sandbox_stopped() {
     );
     seal.assert_quiesced();
     seal.unseal(&db, 3).unwrap();
-    seal.check_without_vm("idle auto-stop", SANDBOX).unwrap();
+    drop(
+        seal.admit_producer("idle auto-stop", SANDBOX, false)
+            .unwrap(),
+    );
+    seal.assert_quiesced();
 
     hide_seal_table(&db);
     let unknown = ActivationSeal::load(&db.lock().unwrap());
     assert!(unknown.read_error().is_some());
-    unknown.check_without_vm("idle auto-stop", SANDBOX).unwrap();
+    let admitted = unknown
+        .admit_producer("idle auto-stop", SANDBOX, false)
+        .unwrap();
+    assert_eq!(unknown.status().producers_in_flight, [SANDBOX]);
+    drop(admitted);
     unknown.assert_quiesced();
 }
 

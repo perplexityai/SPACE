@@ -4,11 +4,11 @@ use super::describe;
 use super::executor::InstallExecutor;
 use super::source::{ContentMd5, KernelVersion, SourceError, VerifiableKernel};
 use super::staging::{self, FinishedImage, ImageDigests, KERNEL_IMAGE, StagedImage, StagingError};
-use pplx_space_common_jobs::JobError;
 use pplx_space_content_digest::Digest;
 use pplx_space_cpu_arch::Arch;
 use pplx_space_execution_spec::ArtifactVersion;
 use pplx_space_node_runtime_core::catalog::CatalogError;
+use pplx_space_node_runtime_manager_store::jobs::JobError;
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 

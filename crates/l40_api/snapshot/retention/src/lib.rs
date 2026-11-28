@@ -128,6 +128,7 @@ use futures_util::{
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_postgres_pool::DbError;
 use pplx_space_sandbox_model::SandboxId;
 use uuid::Uuid;
 
@@ -231,6 +232,20 @@ pub struct CandidatePage {
     pub exhausted: bool,
 }
 
+/// A [`RetentionSink`] call failed.
+#[derive(Debug, thiserror::Error)]
+pub enum RetentionStoreError {
+    /// A database call failed.
+    #[error(transparent)]
+    Database(#[from] DbError),
+    /// A candidate or claim row had a storage location identity without its
+    /// route, or a route without its identity.
+    #[error(
+        "encountered unexpected or invalid data: snapshot retention location projection had mismatched identity and route"
+    )]
+    MismatchedLocation,
+}
+
 /// Postgres-side surface. Production impl: [`SnapshotRetentionDbStore`].
 pub trait RetentionSink: Send + Sync + 'static {
     /// Discover a bounded raw page and return at most `limit` eligible rows.
@@ -241,12 +256,12 @@ pub trait RetentionSink: Send + Sync + 'static {
         limit: i64,
         after: Option<SnapshotId>,
         min_age: Option<Duration>,
-    ) -> impl std::future::Future<Output = Result<CandidatePage, sqlx::Error>> + Send;
+    ) -> impl std::future::Future<Output = Result<CandidatePage, RetentionStoreError>> + Send;
 
     /// Fixed upper bound for one claimed-recovery epoch.
     fn claimed_scan_epoch(
         &self,
-    ) -> impl std::future::Future<Output = Result<Option<ClaimedScanEpoch>, sqlx::Error>> + Send;
+    ) -> impl std::future::Future<Output = Result<Option<ClaimedScanEpoch>, RetentionStoreError>> + Send;
 
     /// Page `deleting` rows independently within one bounded recovery epoch.
     fn list_claimed(
@@ -254,7 +269,7 @@ pub trait RetentionSink: Send + Sync + 'static {
         limit: i64,
         after: Option<SnapshotId>,
         through: SnapshotId,
-    ) -> impl std::future::Future<Output = Result<Vec<PruneCandidate>, sqlx::Error>> + Send;
+    ) -> impl std::future::Future<Output = Result<Vec<PruneCandidate>, RetentionStoreError>> + Send;
 
     /// Revalidate the complete candidate under the shared fork-source and
     /// sandbox locks, then commit `ready -> deleting`. The expected optional
@@ -265,7 +280,7 @@ pub trait RetentionSink: Send + Sync + 'static {
         candidate: PruneCandidate,
         keep_n: i64,
         min_age: Option<Duration>,
-    ) -> impl std::future::Future<Output = Result<ClaimOutcome, sqlx::Error>> + Send;
+    ) -> impl std::future::Future<Output = Result<ClaimOutcome, RetentionStoreError>> + Send;
 
     /// After the reap, require `deleting`, report post-claim drift, and delete
     /// storage locations before the snapshot row.
@@ -273,7 +288,7 @@ pub trait RetentionSink: Send + Sync + 'static {
         &self,
         snapshot_id: SnapshotId,
         keep_n: i64,
-    ) -> impl std::future::Future<Output = Result<PruneFinalize, sqlx::Error>> + Send;
+    ) -> impl std::future::Future<Output = Result<PruneFinalize, RetentionStoreError>> + Send;
 }
 
 pub use crate::metrics::ClaimRefusalReason;
@@ -1034,7 +1049,7 @@ fn record_finalize_result(
     candidate: &PruneCandidate,
     resumed: bool,
     delete_outcome: DeletePrefixOutcome,
-    finalize: Result<PruneFinalize, sqlx::Error>,
+    finalize: Result<PruneFinalize, RetentionStoreError>,
     report: &mut TickReport,
 ) {
     match finalize {

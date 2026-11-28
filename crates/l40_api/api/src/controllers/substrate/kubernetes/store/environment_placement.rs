@@ -88,22 +88,10 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<String>, SubstrateError> {
-        Ok(sqlx::query_scalar::<_, Option<String>>(sql!(
-            "SELECT sn.execution_metadata->>'environment'
-               FROM sandboxes s
-               JOIN snapshots sn
-                 ON sn.sandbox_id = s.id
-                AND sn.local_artifact_id = s.current_local_artifact_id
-              WHERE s.id = $1
-                AND sn.type = 'disk'
-                AND sn.state = 'ready'
-              ORDER BY sn.timestamp DESC
-              LIMIT 1"
-        ))
-        .bind(sandbox_id)
-        .fetch_optional(&self.pool)
+        pplx_space_snapshot_store::environment::of_current_ready_disk_artifact(
+            &self.pool, sandbox_id,
+        )
         .await
-        .db_context("failed to read the stopped disk artifact's environment")?
-        .flatten())
+        .db_context("failed to read the stopped disk artifact's environment")
     }
 }

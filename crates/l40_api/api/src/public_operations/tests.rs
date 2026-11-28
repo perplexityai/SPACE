@@ -7,6 +7,8 @@ use pplx_space_public_api::{
 };
 
 use super::*;
+use pplx_space_sql_locator::sql;
+use sqlx::types::Json;
 
 use pplx_space_test_env::TestResult;
 

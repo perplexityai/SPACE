@@ -1,8 +1,10 @@
 //! `pools`: the warm-pool target for each template.
 
-use rusqlite::{Connection, Result, params};
+use rusqlite::params;
 
 use pplx_space_sql_locator::sql;
+
+use crate::{Connection, Result};
 
 use crate::now;
 
@@ -15,7 +17,7 @@ pub fn insert_pool(
     memory_mib: u32,
 ) -> Result<()> {
     let ts = now();
-    conn.execute(
+    conn.0.execute(
         sql!("INSERT INTO pools (template, target_count, boot_mode, vcpu, memory_mib, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
          ON CONFLICT(template) DO UPDATE SET target_count = ?2, boot_mode = ?3, vcpu = ?4, memory_mib = ?5, updated_at = ?6"),
@@ -25,7 +27,7 @@ pub fn insert_pool(
 }
 
 pub fn delete_pool(conn: &Connection, template: &str) -> Result<()> {
-    conn.execute(
+    conn.0.execute(
         sql!("DELETE FROM pools WHERE template = ?1"),
         params![template],
     )?;
@@ -47,7 +49,7 @@ impl PoolRow {
 }
 
 pub fn get_pool(conn: &Connection, template: &str) -> Result<Option<PoolRow>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT template, target_count, boot_mode, vcpu, memory_mib FROM pools WHERE template = ?1"
     ))?;
     let mut rows = stmt.query_map(params![template], |row| {
@@ -66,7 +68,7 @@ pub fn get_pool(conn: &Connection, template: &str) -> Result<Option<PoolRow>> {
 }
 
 pub fn get_all_pools(conn: &Connection) -> Result<Vec<PoolRow>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT template, target_count, boot_mode, vcpu, memory_mib FROM pools"
     ))?;
     let rows = stmt.query_map([], |row| {
@@ -78,5 +80,5 @@ pub fn get_all_pools(conn: &Connection) -> Result<Vec<PoolRow>> {
             memory_mib: row.get(4)?,
         })
     })?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }

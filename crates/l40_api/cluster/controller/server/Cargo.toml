@@ -78,6 +78,8 @@ pplx-space-bearer-token = { workspace = true }
 pplx-space-cluster-id = { workspace = true }
 pplx-space-cluster-pool = { workspace = true }
 pplx-space-cluster-reconciler = { workspace = true }
+pplx-space-cluster-trigger-queue = { workspace = true }
+pplx-space-data-plane-session-store = { workspace = true }
 pplx-space-sandbox-model = { workspace = true }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-env-vars = { workspace = true }
@@ -94,6 +96,7 @@ pplx-space-postgres-pool = { workspace = true }
 pplx-space-sandbox-quarantine-store = { workspace = true }
 pplx-space-sandbox-residency = { workspace = true }
 pplx-space-node-registration-store = { workspace = true }
+pplx-space-node-status-store = { workspace = true }
 pplx-space-sandbox-store = { workspace = true }
 pplx-space-sandbox-teardown = { workspace = true }
 pplx-space-snapshot-storage = { workspace = true, features = ["s3"] }
@@ -137,6 +140,7 @@ pplx-space-node-status-store = { workspace = true, features = ["test-support"] }
 pplx-space-node-api-sim = { workspace = true }
 pplx-space-policy-authority = { workspace = true }
 pplx-space-sandbox-store = { workspace = true, features = ["test-support"] }
+pplx-space-sandbox-portability = { workspace = true, features = ["test-support"] }
 pplx-space-runtime-upgrade-campaign-store = { workspace = true, features = ["test-support"] }
 pplx-space-test-env = { workspace = true }
 pplx-space-test-hooks = { workspace = true, features = ["test-hooks"] }

@@ -47,7 +47,9 @@
 # SPACE_SMOKE_TIERS (default routine), SPACE_SMOKE_INCLUDE_SCENARIOS,
 # SPACE_SMOKE_SUBSTRATE, SPACE_SMOKE_KNOWN_FAILURES, SPACE_KIND_TELEMETRY_MODE
 # (default otel) and SPACE_CI_IMAGE_MIRROR pass through to every bench. SPACE_KIND_BENCH_ROOT
-# (default ~/.space-benches) holds the benches' Docker data.
+# (default ~/.space-benches) holds the benches' Docker data. SPACE_KIND_REGISTRY_MIRROR
+# and SPACE_KIND_RUST_DIGESTS_FILE let the host's Rust step reuse main's image by
+# digest through a pull-through mirror of ghcr.io (rust-artifact-handoff.py reuse).
 # shellcheck source-path=SCRIPTDIR
 # Most functions run only through phase, host_step or a trap.
 # shellcheck disable=SC2317
@@ -736,7 +738,9 @@ rust_image() {
   while IFS= read -r line; do identity+=("$line"); done <<<"$listed"
   local reuse_out="$HOST/rust-reuse.out"
   : >"$reuse_out" || return 1
-  # Main's image for identical Rust inputs, where the registry is readable.
+  # Main's image for identical Rust inputs, by digest through
+  # SPACE_KIND_REGISTRY_MIRROR when it is set, else where the registry is
+  # readable. The summary reads which, if either, from the output file.
   env "${identity[@]}" GITHUB_OUTPUT="$reuse_out" \
     python3 "$REPO_ROOT/infra/space/kind/scripts/rust-artifact-handoff.py" reuse \
     ghcr.io/perplexityai/space-kind-rust-artifacts || true

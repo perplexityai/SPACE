@@ -6,8 +6,8 @@
 use jiff::Timestamp;
 use pplx_space_accounts::NodeId;
 use pplx_space_firewall_rules_model::FirewallRuleRevision;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::PgConnection;
 use time::OffsetDateTime;
 
 use crate::RevisionId;
@@ -35,49 +35,67 @@ pub struct Assignment {
 pub struct PendingRound {
     pub round: u64,
     pub issued_at: Timestamp,
+    /// The assignment generation the round asks about, read from the round
+    /// rather than the assignment. `None` for a round that names none, which
+    /// can't be answered.
+    pub assignment_generation: Option<u64>,
 }
 
-/// Read `node`'s assignment and pending round.
-pub async fn fetch_instructions(
-    conn: &mut PgConnection,
+/// Read `node`'s assignment and pending round. It takes a `Tx` or a
+/// connection and refuses the pool, so both statements run on one
+/// connection; it can't tell whether that connection has a transaction open.
+pub async fn fetch_instructions<C>(
+    conn: &mut C,
     node: NodeId,
-) -> Result<NodeInstructions, StoredStateError> {
+) -> Result<NodeInstructions, StoredStateError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     // Anchored on the node, so a round without an assignment still returns.
-    let (generation, revision_id, round, issued_at) = sqlx::query_as::<
+    let (generation, revision_id, round, issued_at, round_generation) = sqlx::query_as::<
         _,
         (
             Option<i64>,
             Option<RevisionId>,
             Option<i64>,
             Option<OffsetDateTime>,
+            Option<i64>,
         ),
     >(sql!(
         "SELECT a.assignment_generation,
                 a.revision_id,
                 o.pending_round,
-                o.pending_round_issued_at
+                o.pending_round_issued_at,
+                o.pending_assignment_generation
          FROM (SELECT $1::uuid AS node_id) n
          LEFT JOIN firewall_rules_node_assignments a ON a.node_id = n.node_id
          LEFT JOIN firewall_rules_node_observations o ON o.node_id = n.node_id"
     ))
     .bind(node)
-    .fetch_one(&mut *conn)
-    .await?;
+    .fetch_one((&mut *conn).into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     let assignment = match (generation, revision_id) {
         (Some(generation), Some(id)) => Some(Assignment {
-            generation: non_negative(generation)?,
+            generation: non_negative(generation).map_err(DbError::from)?,
             revision_id: id,
-            revision: read_revision(&mut *conn, id).await?,
+            revision: read_revision((&mut *conn).into_sqlx(), id).await?,
         }),
         _ => None,
     };
     // The schema sets the round and its issue time together.
     let pending_round = match (round, issued_at) {
-        (Some(round), Some(issued_at)) => Some(PendingRound {
-            round: non_negative(round)?,
-            issued_at: Timestamp::from_nanosecond(issued_at.unix_timestamp_nanos())
-                .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
-        }),
+        (Some(round), Some(issued_at)) => Some(
+            pending_round(
+                round,
+                issued_at,
+                round_generation
+                    .map(non_negative)
+                    .transpose()
+                    .map_err(DbError::from)?,
+            )
+            .map_err(DbError::from)?,
+        ),
         _ => None,
     };
     Ok(NodeInstructions {
@@ -86,8 +104,23 @@ pub async fn fetch_instructions(
     })
 }
 
-/// The schema keeps both counters non-negative; report a violation rather
+/// A pending round as stored, with the generation it asks about, decoded
+/// alike for Fetch and the round opener.
+pub(crate) fn pending_round(
+    round: i64,
+    issued_at: OffsetDateTime,
+    assignment_generation: Option<u64>,
+) -> Result<PendingRound, sqlx::Error> {
+    Ok(PendingRound {
+        round: non_negative(round)?,
+        issued_at: Timestamp::from_nanosecond(issued_at.unix_timestamp_nanos())
+            .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
+        assignment_generation,
+    })
+}
+
+/// The schema keeps every counter non-negative; report a violation rather
 /// than guess.
-fn non_negative(value: i64) -> Result<u64, sqlx::Error> {
+pub(crate) fn non_negative(value: i64) -> Result<u64, sqlx::Error> {
     u64::try_from(value).map_err(|error| sqlx::Error::Decode(Box::new(error)))
 }

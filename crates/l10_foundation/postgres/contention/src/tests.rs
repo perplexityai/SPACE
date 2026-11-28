@@ -1,4 +1,6 @@
-use super::{is_lock_contention, is_lock_not_available};
+use super::{
+    is_deadlock_detected, is_lock_contention, is_lock_not_available, is_serialization_failure,
+};
 use pplx_space_db_test_fixtures::{raise_sqlstate, try_pg_test_db};
 use pplx_space_sql_locator::sql;
 
@@ -26,7 +28,11 @@ async fn classifies_contention_sqlstates() -> TestResult {
             !is_lock_not_available(&error),
             "{sqlstate} is not a lock-wait expiry"
         );
+        assert_eq!(is_serialization_failure(&error), sqlstate == "40001");
+        assert_eq!(is_deadlock_detected(&error), sqlstate == "40P01");
     }
+    assert!(!is_serialization_failure(&lock_not_available));
+    assert!(!is_deadlock_detected(&lock_not_available));
 
     // 57014 is a `statement_timeout` cancellation: deliberately excluded, so
     // a caller that wants it retryable has to say so at its own call site.

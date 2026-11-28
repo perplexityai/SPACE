@@ -155,7 +155,7 @@ async fn private_republication() -> TestResult {
         Arc::new(InMemoryKeyWrapper::new()),
         pplx_space_uds_peer_auth::PeerProcessCheckMode::Off,
     )
-    .with_storage_vend_store(Arc::new(PgStorageVendStore::new(db.pool.clone())));
+    .with_storage_vend_store(Arc::new(PgStorageVendStore::new(db.pool.clone().into())));
     let credential_service =
         CredentialManagerServer::with_interceptor(authority, move |mut request: Request<()>| {
             observed_exchanges.fetch_add(1, Ordering::SeqCst);

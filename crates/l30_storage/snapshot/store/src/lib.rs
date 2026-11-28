@@ -10,6 +10,7 @@ use pplx_space_artifact_model::{
 };
 use pplx_space_content_digest::{Digest, DigestParseError};
 use pplx_space_execution_spec::SnapshotExecutionMetadata;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::{ExecutionGeneration, ExecutionGenerationParseError, SandboxId};
 use pplx_space_snapshot_model::{
     ArtifactKind, ArtifactKindParseError, ArtifactOrigin, ArtifactOriginParseError,
@@ -24,12 +25,18 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub mod attempt;
+pub mod checkpoint;
 pub mod claimed;
 pub mod disk_artifact;
 pub mod environment;
+pub mod fork_source;
 pub mod listing;
 pub mod lost;
+pub mod orphan_locations;
 mod placement;
+pub mod public;
+pub mod quarantine_recovery;
+pub mod retention;
 pub mod storage_location;
 pub mod upload;
 pub use placement::{SnapshotStoragePlacement, storage_placements};
@@ -38,7 +45,7 @@ pub use placement::{SnapshotStoragePlacement, storage_placements};
 #[derive(Debug, thiserror::Error)]
 pub enum GetSnapshotError {
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 
     #[error("snapshot {snapshot_id} has an invalid kind")]
     InvalidKind {
@@ -115,7 +122,7 @@ pub enum GetSnapshotError {
 #[derive(Debug, thiserror::Error)]
 pub enum InsertSnapshotError {
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 
     #[error("failed to load snapshot {snapshot_id} after insert")]
     Load {
@@ -500,7 +507,7 @@ struct SnapshotRow {
 #[derive(Debug, thiserror::Error)]
 pub enum DeleteSnapshotCatalogError {
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 }
 
 /// Migration scaffolding for callers whose surrounding workflow still uses
@@ -509,7 +516,7 @@ pub enum DeleteSnapshotCatalogError {
 impl From<DeleteSnapshotCatalogError> for sqlx::Error {
     fn from(error: DeleteSnapshotCatalogError) -> Self {
         match error {
-            DeleteSnapshotCatalogError::Database(source) => source,
+            DeleteSnapshotCatalogError::Database(source) => source.into(),
         }
     }
 }
@@ -520,22 +527,29 @@ impl From<DeleteSnapshotCatalogError> for sqlx::Error {
 /// storage backend. The caller owns authorization and row locks; requiring its
 /// open transaction keeps the child-before-parent deletion atomic with those
 /// workflow checks. Returns `false` when the snapshot did not exist.
-pub async fn delete_snapshot_catalog(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn delete_snapshot_catalog<C>(
+    tx: &mut C,
     snapshot_id: SnapshotId,
-) -> Result<bool, DeleteSnapshotCatalogError> {
+) -> Result<bool, DeleteSnapshotCatalogError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     // The catalog contract permits at most one row. Keep the predicate-based
     // delete defensive so legacy corruption cannot strand the parent row.
     sqlx::query(sql!(
         "DELETE FROM snapshot_storage_locations WHERE snapshot_id = $1"
     ))
     .bind(snapshot_id.as_uuid())
-    .execute(&mut **tx)
-    .await?;
+    .execute((&mut *tx).into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     let result = sqlx::query(sql!("DELETE FROM snapshots WHERE id = $1"))
         .bind(snapshot_id.as_uuid())
-        .execute(&mut **tx)
-        .await?;
+        .execute((&mut *tx).into_sqlx())
+        .await
+        .map_err(DbError::from)?;
     Ok(result.rows_affected() == 1)
 }
 
@@ -553,7 +567,7 @@ pub struct SnapshotArtifactDigest {
 #[derive(Debug, thiserror::Error)]
 pub enum RecordArtifactDigestsError {
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 
     #[error("snapshot {snapshot_id} already records a different digest for {artifact}")]
     Conflict {
@@ -572,7 +586,7 @@ pub enum RecordArtifactDigestsError {
 #[derive(Debug, thiserror::Error)]
 pub enum GetArtifactDigestsError {
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 
     #[error("snapshot {snapshot_id} records an unknown artifact")]
     InvalidArtifact {
@@ -600,11 +614,16 @@ pub enum GetArtifactDigestsError {
 ///
 /// Digests are write-once: a replay that repeats them is a no-op and one that
 /// disagrees is refused, so a later finalize cannot swap what restore verifies.
-pub async fn record_artifact_digests(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn record_artifact_digests<C>(
+    tx: &mut C,
     snapshot_id: SnapshotId,
     digests: &[SnapshotArtifactDigest],
-) -> Result<(), RecordArtifactDigestsError> {
+) -> Result<(), RecordArtifactDigestsError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     for entry in digests {
         let size_bytes = i64::try_from(entry.size_bytes).map_err(|_| {
             RecordArtifactDigestsError::SizeOutOfRange {
@@ -627,8 +646,9 @@ pub async fn record_artifact_digests(
         .bind(entry.artifact.file_name())
         .bind(entry.digest.to_string())
         .bind(size_bytes)
-        .execute(&mut **tx)
-        .await?;
+        .execute((&mut *tx).into_sqlx())
+        .await
+        .map_err(DbError::from)?;
         if result.rows_affected() != 1 {
             return Err(RecordArtifactDigestsError::Conflict {
                 snapshot_id,
@@ -642,7 +662,7 @@ pub async fn record_artifact_digests(
 /// The digests recorded for `snapshot_id`, ordered by artifact file name.
 /// Empty for attempts finalized before digests were recorded.
 pub async fn artifact_digests(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     snapshot_id: SnapshotId,
 ) -> Result<Vec<SnapshotArtifactDigest>, GetArtifactDigestsError> {
     let rows: Vec<(String, String, i64)> = sqlx::query_as(sql!(
@@ -652,8 +672,9 @@ pub async fn artifact_digests(
          ORDER BY artifact"
     ))
     .bind(snapshot_id.as_uuid())
-    .fetch_all(executor)
-    .await?;
+    .fetch_all(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
 
     rows.into_iter()
         .map(|(artifact, digest, size_bytes)| {
@@ -685,12 +706,12 @@ pub async fn artifact_digests(
 }
 
 /// Reading a ready artifact's storage location failed. A malformed stored
-/// row surfaces as a `sqlx::Error` decode failure, like every other typed
+/// row surfaces as a `DbError` decode failure, like every other typed
 /// column.
 #[derive(Debug, thiserror::Error)]
 pub enum ReadyArtifactLocationError {
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 }
 
 /// Where a `ready` snapshot's bytes live, as a restoring node needs it: the
@@ -713,7 +734,7 @@ pub struct ReadyArtifactLocation {
 /// `creating`, `failed` or `deleting` are invisible, which keeps a mid-flight
 /// upload, or a row claimed for prune, out of restore.
 pub async fn latest_ready_suspend_location_placed_on(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     node_ids: &[NodeId],
 ) -> Result<Option<ReadyArtifactLocation>, ReadyArtifactLocationError> {
@@ -734,8 +755,9 @@ pub async fn latest_ready_suspend_location_placed_on(
     ))
     .bind(sandbox_id)
     .bind(node_ids)
-    .fetch_optional(executor)
-    .await?;
+    .fetch_optional(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     Ok(row)
 }
 
@@ -744,7 +766,7 @@ pub async fn latest_ready_suspend_location_placed_on(
 /// placed on one of `node_ids`. Same placement and absence semantics as
 /// [`latest_ready_suspend_location_placed_on`].
 pub async fn ready_backup_location_placed_on(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     local_artifact_id: LocalArtifactId,
     artifact_kind: ArtifactKind,
@@ -769,22 +791,23 @@ pub async fn ready_backup_location_placed_on(
     .bind(local_artifact_id.as_uuid())
     .bind(artifact_kind.as_str())
     .bind(node_ids)
-    .fetch_optional(executor)
-    .await?;
+    .fetch_optional(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     Ok(row)
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum CheckBackupError {
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 }
 
 /// Whether these exact immutable bytes have a usable ready backup. This is
 /// placement-independent so a former hosting node can release its local copy;
 /// it discloses neither the backup identity nor its storage credentials.
 pub async fn artifact_backup_ready(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     local_artifact_id: LocalArtifactId,
     artifact_kind: ArtifactKind,
@@ -804,8 +827,9 @@ pub async fn artifact_backup_ready(
     .bind(sandbox_id)
     .bind(local_artifact_id.as_uuid())
     .bind(artifact_kind.as_str())
-    .fetch_one(executor)
-    .await?)
+    .fetch_one(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?)
 }
 
 /// Whether `later`'s ready backup was captured by a later execution of
@@ -816,7 +840,7 @@ pub async fn artifact_backup_ready(
 /// registered in. `false` when either artifact has no such backup recording a
 /// generation.
 pub async fn artifact_captured_after(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     later: (LocalArtifactId, ArtifactKind),
     earlier: (LocalArtifactId, ArtifactKind),
@@ -847,14 +871,15 @@ pub async fn artifact_captured_after(
     .bind(later.1.as_str())
     .bind(earlier.0.as_uuid())
     .bind(earlier.1.as_str())
-    .fetch_one(executor)
-    .await?)
+    .fetch_one(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?)
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum CheckArtifactRegistrationError {
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 }
 
 /// Whether an attempt other than `except` already registered the local
@@ -862,7 +887,7 @@ pub enum CheckArtifactRegistrationError {
 /// committed attempt for these bytes was admitted, fenced or not. Only as durable as that
 /// row: once retention deletes it, this answers `false`.
 pub async fn artifact_registered_by_another_attempt(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     local_artifact_id: LocalArtifactId,
     except: SnapshotId,
@@ -879,8 +904,9 @@ pub async fn artifact_registered_by_another_attempt(
     .bind(sandbox_id)
     .bind(local_artifact_id.as_uuid())
     .bind(except)
-    .fetch_one(executor)
-    .await?)
+    .fetch_one(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?)
 }
 
 /// Whether `snapshot_id` is still the latest ready suspend attempt of
@@ -888,7 +914,7 @@ pub async fn artifact_registered_by_another_attempt(
 /// local cache needs: a ready backup of an older attempt cannot show which
 /// generation that cache contains.
 pub async fn is_latest_ready_suspend(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_id: SandboxId,
     snapshot_id: SnapshotId,
 ) -> Result<bool, CheckBackupError> {
@@ -907,8 +933,9 @@ pub async fn is_latest_ready_suspend(
     ))
     .bind(sandbox_id)
     .bind(snapshot_id)
-    .fetch_one(executor)
-    .await?)
+    .fetch_one(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?)
 }
 
 /// Up to `limit` snapshot ids greater than `after` (all ids when `None`), in
@@ -916,11 +943,11 @@ pub async fn is_latest_ready_suspend(
 ///
 /// One array avoids per-row wire/decoder overhead for a large id page.
 pub async fn snapshot_ids_after(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     after: Option<SnapshotId>,
     limit: i64,
-) -> Result<Vec<SnapshotId>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<Vec<SnapshotId>, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT ARRAY(
              SELECT id FROM snapshots
               WHERE id > COALESCE($1::UUID, '00000000-0000-0000-0000-000000000000'::UUID)
@@ -930,8 +957,8 @@ pub async fn snapshot_ids_after(
     ))
     .bind(after)
     .bind(limit)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// The live storage location recorded for a snapshot, as
@@ -949,10 +976,10 @@ pub struct OrgStorageLocation {
 /// and the snapshot belongs to `org_id` or to no organization. `None`
 /// otherwise, including when the snapshot is another organization's.
 pub async fn org_storage_location(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     snapshot_id: SnapshotId,
     org_id: OrgId,
-) -> Result<Option<OrgStorageLocation>, sqlx::Error> {
+) -> Result<Option<OrgStorageLocation>, DbError> {
     let row: Option<(String, Option<bool>)> = sqlx::query_as(sql!(
         "SELECT location.storage_connection_string,
                 snapshot.artifact_origin = 'fork' AND snapshot.state = 'creating'
@@ -964,7 +991,7 @@ pub async fn org_storage_location(
     ))
     .bind(snapshot_id)
     .bind(org_id.as_uuid())
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(row.map(
         |(storage_connection_string, creating_fork_copy)| OrgStorageLocation {
@@ -979,7 +1006,7 @@ pub async fn org_storage_location(
 ///
 /// Returns the same typed model for every read. `None` means no row has this id.
 pub async fn get(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     snapshot_id: SnapshotId,
 ) -> Result<Option<SnapshotRecord>, GetSnapshotError> {
     let row: Option<SnapshotRow> = sqlx::query_as(sql!(
@@ -1001,8 +1028,9 @@ pub async fn get(
          WHERE sn.id = $1"
     ))
     .bind(snapshot_id.as_uuid())
-    .fetch_optional(executor)
-    .await?;
+    .fetch_optional(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
 
     row.map(SnapshotRecord::try_from).transpose()
 }
@@ -1206,10 +1234,15 @@ pub enum InsertOutcome {
 /// id for different content or a different location is a domain conflict. The
 /// caller owns the transaction so the two-table mutation cannot be committed
 /// partially.
-pub async fn insert(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+///
+/// The caller must pass its open transaction.
+pub async fn insert<C>(
+    tx: &mut C,
     snapshot: &NewSnapshot,
-) -> Result<(SnapshotRecord, InsertOutcome), InsertSnapshotError> {
+) -> Result<(SnapshotRecord, InsertOutcome), InsertSnapshotError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let artifact = snapshot.artifact.as_ref();
     let execution = snapshot
         .execution_metadata
@@ -1268,8 +1301,9 @@ pub async fn insert(
     .bind(state_format.map(|identity| identity.version.as_str()))
     .bind(snapshot.execution_metadata.as_ref().map(Json))
     .bind(snapshot.generation.map(ExecutionGeneration::get))
-    .fetch_optional(&mut **tx)
-    .await?;
+    .fetch_optional((&mut *tx).into_sqlx())
+    .await
+    .map_err(DbError::from)?;
 
     if inserted_id.is_none() {
         let persisted = load_after_insert(tx, snapshot.id).await?;
@@ -1292,8 +1326,9 @@ pub async fn insert(
     .bind(snapshot.id.as_uuid())
     .bind(snapshot.storage_uri.as_wire())
     .bind(snapshot.org_id)
-    .execute(&mut **tx)
-    .await?;
+    .execute((&mut *tx).into_sqlx())
+    .await
+    .map_err(DbError::from)?;
 
     let persisted = load_after_insert(tx, snapshot.id).await?;
     let Some(location) = persisted.storage_location() else {
@@ -1314,11 +1349,14 @@ pub async fn insert(
     Ok((persisted, outcome))
 }
 
-async fn load_after_insert(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+async fn load_after_insert<C>(
+    tx: &mut C,
     snapshot_id: SnapshotId,
-) -> Result<SnapshotRecord, InsertSnapshotError> {
-    get(&mut **tx, snapshot_id)
+) -> Result<SnapshotRecord, InsertSnapshotError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    get(&mut *tx, snapshot_id)
         .await
         .map_err(|source| InsertSnapshotError::Load {
             snapshot_id,

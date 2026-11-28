@@ -7,7 +7,8 @@
 //! * `firewall_rules_revisions`: immutable rulesets.
 //! * `firewall_rules_control`: the default revision for newly enrolled nodes.
 //! * `firewall_rules_node_assignments`: each node's current intent.
-//! * `firewall_rules_node_observations`: each node's accepted observations.
+//! * `firewall_rules_node_observations`: each node's pending round and
+//!   accepted observations.
 //!
 //! [`read_adopted`] reads the default a candidate is reviewed against, and
 //! [`start_rollout`] saves a reviewed revision and the nodes it targets
@@ -20,16 +21,21 @@
 //! its node's wakeup. [`lease_first_canary`] and [`issue_canary_and_release`]
 //! do both for a canary's one target, leaving it pending once issued.
 //!
-//! [`fetch_instructions`] reads one node's assignment and pending round.
+//! [`open_round`] asks an issued target's node to verify that assignment,
+//! with its wakeup. [`fetch_instructions`] reads one node's assignment and
+//! pending round.
 
 use std::fmt;
 
+use pplx_space_postgres_pool::DbError;
 use pplx_space_rollout_queue::HeaderPhase;
 
 mod fetch;
 mod issue;
 mod lease;
+mod leased_item;
 mod read;
+mod round;
 mod start;
 
 pub use fetch::{Assignment, NodeInstructions, PendingRound, fetch_instructions};
@@ -42,6 +48,7 @@ pub use lease::{
 };
 pub use pplx_space_rollout_queue::{MAX_LEASE, RedriveReport, clamp_lease};
 pub use read::{StoredStateError, read_adopted};
+pub use round::{OpenRefusal, Opening, open_round};
 pub use start::{
     AdoptedRevision, REASON_MAX_CHARS, Review, StartError, StartRollout, StartedRollout,
     start_rollout,
@@ -116,13 +123,13 @@ enum Scope {
 
 /// Commit on `Ok`, roll back otherwise, so a verb's locks end with it rather
 /// than when the connection is next used.
-async fn end_transaction<T, E: From<sqlx::Error>>(
+async fn end_transaction<T, E: From<DbError>>(
     tx: sqlx::Transaction<'_, sqlx::Postgres>,
     result: Result<T, E>,
 ) -> Result<T, E> {
     match result {
         Ok(value) => {
-            tx.commit().await?;
+            tx.commit().await.map_err(DbError::from)?;
             Ok(value)
         }
         Err(error) => {

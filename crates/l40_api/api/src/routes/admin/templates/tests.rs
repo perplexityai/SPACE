@@ -8,6 +8,7 @@ use crate::public_template_operations::tests::{
 };
 use pplx_space_cluster_pool::{PoolConfigOwner, PoolSlotState};
 use pplx_space_db_test_fixtures::pg_test_db;
+use pplx_space_sql_locator::sql;
 
 use pplx_space_test_env::TestResult;
 
@@ -133,7 +134,7 @@ async fn template_rows_include_observed_base_snapshot_inventory() -> TestResult 
     .execute(&db.pool)
     .await?;
 
-    let templates = fetch_template_rows(&db.pool, None).await?;
+    let templates = pplx_space_template_store::templates::list_admin(&db.pool, None).await?;
     let response = templates
         .into_iter()
         .map(template_response)
@@ -1604,7 +1605,8 @@ async fn template_builds_list_reports_each_jobs_builder_status() -> TestResult {
     }
     let db = pg_test_db().await?;
     let state = AppState::from_pool(db.pool.clone()).await?;
-    let managing_org_id = crate::routes::authz::cluster_managing_org_id(&db.pool).await?;
+    let managing_org_id =
+        pplx_space_accounts_store::clusters::cluster_managing_org_id(&db.pool).await?;
     let actor = User {
         id: UserId::new(),
         email: "builds-test@example.invalid".into(),

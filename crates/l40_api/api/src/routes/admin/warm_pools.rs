@@ -90,7 +90,10 @@ pub async fn list_warm_pool_policies(
         return err.into_response();
     }
 
-    match fetch_policies(&state.pool).await {
+    match pplx_space_cluster_pool::fc_warm_pool_policies(&state.pool)
+        .await
+        .map_err(sqlx::Error::from)
+    {
         Ok(policies) => Json(
             policies
                 .into_iter()
@@ -173,10 +176,6 @@ fn api_error(
     (status, Json(serde_json::json!({"error": message.into()})))
 }
 
-async fn fetch_policies(pool: &sqlx::PgPool) -> Result<Vec<WarmPoolPolicyRecord>, sqlx::Error> {
-    pplx_space_cluster_pool::fc_warm_pool_policies(pool).await
-}
-
 async fn store_policy(
     pool: &sqlx::PgPool,
     request: &WarmPoolPolicyRequest,
@@ -203,6 +202,7 @@ async fn store_policy(
         },
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 fn validate_policy_request(

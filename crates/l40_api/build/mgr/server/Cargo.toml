@@ -32,7 +32,6 @@ async-trait = { workspace = true }
 futures-util = { workspace = true }
 pplx-space-execution-spec = { workspace = true, features = ["serde"] }
 prost = { workspace = true }
-rusqlite = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -43,16 +42,19 @@ tonic-health = { workspace = true }
 tracing = { workspace = true }
 
 # internal
+pplx-space-accounts = { workspace = true }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-build-mgr = { workspace = true }
 pplx-space-build-mgr-client = { workspace = true }
 pplx-space-build-mgr-store = { workspace = true }
-pplx-space-common-jobs = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
 pplx-space-observability = { workspace = true }
 pplx-space-rpc-auth = { workspace = true }
 
 [dev-dependencies]
+# The tests seed and inspect the database, jobs table included, directly.
+pplx-space-build-mgr-store = { workspace = true, features = ["test-support"] }
+rusqlite = { workspace = true }
 pplx-space-content-digest = { workspace = true, features = ["serde"] }
 rcgen = { workspace = true, features = ["aws_lc_rs", "pem"] }
 rustls = { workspace = true, features = ["aws_lc_rs"] }

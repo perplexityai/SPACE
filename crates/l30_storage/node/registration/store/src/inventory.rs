@@ -2,8 +2,8 @@
 //! registration and tombstone.
 
 use pplx_space_node_model::{NodeRole, SubstrateKind};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 use time::OffsetDateTime;
 
 /// One registered Kubernetes node as the inventory lists it.
@@ -34,13 +34,13 @@ pub struct KubernetesInventoryRow {
 /// `node_api_port`; a node without an address gets an empty endpoint. It is
 /// never derived from a Kubernetes node name.
 pub async fn list_kubernetes_nodes(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     role: Option<NodeRole>,
     include_deleted: bool,
     node_api_port: &str,
     endpoint_prefix: &str,
-) -> Result<Vec<KubernetesInventoryRow>, sqlx::Error> {
-    sqlx::query_as::<_, KubernetesInventoryRow>(sql!(
+) -> Result<Vec<KubernetesInventoryRow>, DbError> {
+    Ok(sqlx::query_as::<_, KubernetesInventoryRow>(sql!(
         "SELECT n.id::TEXT AS id,
                 nk.k8s_node_name AS name,
                 host(n.address) AS address,
@@ -63,6 +63,6 @@ pub async fn list_kubernetes_nodes(
     .bind(node_api_port)
     .bind(endpoint_prefix)
     .bind(SubstrateKind::Kubernetes)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }

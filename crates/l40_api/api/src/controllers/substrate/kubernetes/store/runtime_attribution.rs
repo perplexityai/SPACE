@@ -25,6 +25,7 @@ use pplx_space_sandbox_store::attribute_runtime::{UNATTRIBUTED_LIFECYCLES, set_a
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TrackedPod {
     pub(super) pod_uid: Option<String>,
+    pub(super) pod_ip: Option<String>,
     /// `None` with attribution off, when nothing reads or writes the record.
     pub(super) sandbox: Option<TrackedSandbox>,
 }
@@ -118,15 +119,12 @@ impl K8sStore {
         sandbox_id: SandboxId,
         generation: i64,
     ) -> Result<Option<TrackedPod>, SubstrateError> {
-        let Some(pod_uid) = sqlx::query_scalar::<_, Option<String>>(sql!(
-            "SELECT NULLIF(BTRIM(pod_uid), '')
-               FROM sandbox_k8s_executions
-              WHERE sandbox_id = $1 AND generation = $2 AND active
-              FOR UPDATE"
-        ))
-        .bind(sandbox_id)
-        .bind(generation)
-        .fetch_optional(&mut *conn)
+        let Some(pplx_space_sandbox_store::k8s_executions::runtime_attribution::TrackedPodRow {
+            pod_uid,
+            pod_ip,
+        }) = pplx_space_sandbox_store::k8s_executions::runtime_attribution::lock_tracked_pod(
+            &mut *conn, sandbox_id, generation,
+        )
         .await
         .db_context("failed to lock the tracked Kubernetes pod")?
         else {
@@ -135,6 +133,7 @@ impl K8sStore {
         if !self.attribution.is_enabled() {
             return Ok(Some(TrackedPod {
                 pod_uid,
+                pod_ip,
                 sandbox: None,
             }));
         }
@@ -144,6 +143,7 @@ impl K8sStore {
                 .db_context("failed to read the sandbox's activating client")?;
         Ok(sandbox.map(|sandbox| TrackedPod {
             pod_uid,
+            pod_ip,
             sandbox: Some(TrackedSandbox {
                 lifecycle: sandbox.lifecycle,
                 record: sandbox.activating_client_id,

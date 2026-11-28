@@ -34,7 +34,6 @@ use crate::{
 };
 pub use runtime_upgrade_campaigns::RUNTIME_UPGRADE_DRIVEN_KINDS;
 
-mod api_key_store;
 mod api_keys;
 pub mod audit;
 mod docs;
@@ -145,6 +144,10 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
         .route(
             "/nodes/{node_id}/health",
             get(node_maintenance::node_health),
+        )
+        .route(
+            "/nodes/{node_id}/drain-v2-preview",
+            get(nodes::preview_node_drain),
         )
         .route(
             "/nodes/{node_id}/network-policy:reconcile",

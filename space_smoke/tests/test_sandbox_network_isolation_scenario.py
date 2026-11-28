@@ -19,6 +19,7 @@ import subprocess
 import unittest
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest import mock
 
 from space_smoke.adapters import (
     KIND_SANDBOX_NAMESPACE,
@@ -209,7 +210,12 @@ class PolicyOutcomes(unittest.TestCase):
     def test_a_missing_sandbox_pod_fails_before_any_probe(self) -> None:
         cluster = _Cluster()
         cluster.sandbox_pod_network = lambda sandbox_id: None  # type: ignore[method-assign]
-        with self.assertRaisesRegex(InvariantViolation, "no running execution pod"):
+        with (
+            mock.patch(
+                "space_smoke.sandbox_network_isolation.POD_IP_PUBLISH_TIMEOUT_SECONDS", 0.0
+            ),
+            self.assertRaisesRegex(InvariantViolation, "no running execution pod"),
+        ):
             _run(cluster)
 
 

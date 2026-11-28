@@ -1,5 +1,4 @@
 use pplx_space_execution_spec::RuntimeKind;
-use sqlx::types::Json as SqlJson;
 use time::OffsetDateTime;
 
 use super::*;
@@ -79,11 +78,11 @@ fn public_template_variant_maps_runtime_alias_and_bounds_sizes() {
         artifact_size_bytes: Some(42),
         has_base_snapshot: true,
         base_snapshot_size_bytes: Some(-1),
-        snapshots: SqlJson(vec![PublicTemplateSnapshot {
+        snapshots: vec![PublicTemplateSnapshot {
             vcpu: 2,
             memory_mib: 1024,
             snapshot_hash: "snap".to_string(),
-        }]),
+        }],
         vcpu: Some(2),
         memory_mib: Some(1024),
         disk_size_mb: Some(4096),

@@ -169,9 +169,9 @@ async fn failed_projection_decides_on_the_row_committed_while_it_waits() -> Test
         let waiter_pid: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
             .fetch_one(&mut *projection_tx)
             .await?;
-        let rows_json = Json(serde_json::json!([
+        let rows_json = serde_json::json!([
             { "sandbox_id": sandbox_id.to_string(), "published_lifecycle": "failed" }
-        ]));
+        ]);
         let projection = tokio::spawn(async move {
             let moved =
                 project_node_published_failed_sandboxes(&mut projection_tx, node_id, rows_json)
@@ -512,7 +512,7 @@ async fn uncommitted_node_publish_and_orphan_revert_serialize() -> TestResult {
             create_age_threshold_secs: 600,
         };
         let recovered =
-            recover_orphan_to_suspended(&mut tx, sandbox_id, STOP_LIFECYCLES, &guard).await?;
+            recover_orphan_to_suspended(&mut *tx, sandbox_id, STOP_LIFECYCLES, &guard).await?;
         tx.commit().await?;
         assert!(
             recovered.is_some(),
@@ -548,7 +548,7 @@ async fn uncommitted_node_publish_and_orphan_revert_serialize() -> TestResult {
                 create_age_threshold_secs: 600,
             };
             let outcome =
-                recover_orphan_to_suspended(&mut recover_tx, sandbox_id, STOP_LIFECYCLES, &guard)
+                recover_orphan_to_suspended(&mut *recover_tx, sandbox_id, STOP_LIFECYCLES, &guard)
                     .await?;
             recover_tx.commit().await?;
             TestResult::Ok(outcome.is_some())
@@ -582,7 +582,7 @@ async fn uncommitted_node_publish_and_orphan_revert_serialize() -> TestResult {
             create_age_threshold_secs: 600,
         };
         let outcome =
-            recover_orphan_to_suspended(&mut recover_holder, sandbox_id, STOP_LIFECYCLES, &guard)
+            recover_orphan_to_suspended(&mut *recover_holder, sandbox_id, STOP_LIFECYCLES, &guard)
                 .await?;
         assert!(outcome.is_some());
 

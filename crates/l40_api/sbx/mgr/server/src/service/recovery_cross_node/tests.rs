@@ -1489,8 +1489,8 @@ fn an_adoption_inside_the_claim_transaction_commits_the_row() {
 fn an_ordinary_cross_node_retry_takes_no_write_lock() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sbxmgr.db");
-    let mut conn = crate::db::Connection::open_at(&path).unwrap();
-    crate::db::create_test_schema(&mut conn);
+    crate::db::create_test_schema_on_disk(&path);
+    let conn = crate::db::Connection::open_at(&path).unwrap();
     conn.busy_timeout(std::time::Duration::ZERO).unwrap();
 
     let blocker = crate::db::Connection::open_at(&path).unwrap();

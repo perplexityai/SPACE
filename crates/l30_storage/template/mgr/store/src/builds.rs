@@ -13,9 +13,11 @@
 //! nothing cascades: each delete here removes the child rows by hand before
 //! the build row.
 
-use rusqlite::{Connection, Result, Transaction, params};
+use rusqlite::params;
 
 use pplx_space_sql_locator::sql;
+
+use crate::{Connection, Result, Transaction};
 use pplx_space_template_model::TemplateCachePartition;
 
 use crate::codec::{nonnegative_i64_to_u64, parse_cache_partition};
@@ -52,7 +54,7 @@ pub struct BuildEvictionRow {
 }
 
 /// Maps the column list shared by every `template_builds` read below.
-fn build_row(row: &rusqlite::Row<'_>) -> Result<TemplateBuildRow> {
+fn build_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TemplateBuildRow> {
     Ok(TemplateBuildRow {
         name: row.get(0)?,
         content_hash: row.get(1)?,
@@ -76,7 +78,7 @@ pub fn get_build(
     content_hash: &str,
     cache_partition: TemplateCachePartition,
 ) -> Result<Option<TemplateBuildRow>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
          FROM template_builds WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3"
     ))?;
@@ -84,7 +86,7 @@ pub fn get_build(
         params![name, content_hash, cache_partition.key()],
         build_row,
     )?;
-    rows.next().transpose()
+    Ok(rows.next().transpose()?)
 }
 
 /// The ready build of a digest, preferring `preferred`'s partition, then
@@ -95,7 +97,7 @@ pub fn find_ready_build(
     content_hash: &str,
     preferred: Option<TemplateCachePartition>,
 ) -> Result<Option<TemplateBuildRow>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
          FROM template_builds
          WHERE name = ?1 AND content_hash = ?2 AND state = 'ready'
@@ -109,24 +111,28 @@ pub fn find_ready_build(
         ],
         build_row,
     )?;
-    rows.next().transpose()
+    Ok(rows.next().transpose()?)
 }
 
 /// Whether a row exists for the digest in any partition, in any state.
 pub fn build_exists(conn: &Connection, name: &str, content_hash: &str) -> Result<bool> {
-    conn.query_row(
-        sql!("SELECT EXISTS(SELECT 1 FROM template_builds WHERE name = ?1 AND content_hash = ?2)"),
-        params![name, content_hash],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(|exists| exists != 0)
+    Ok(conn
+        .0
+        .query_row(
+            sql!(
+                "SELECT EXISTS(SELECT 1 FROM template_builds WHERE name = ?1 AND content_hash = ?2)"
+            ),
+            params![name, content_hash],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|exists| exists != 0)?)
 }
 
 /// The keys of builds in `state='deleting'`.
 pub fn list_deleting_builds(
     conn: &Connection,
 ) -> Result<Vec<(String, String, TemplateCachePartition)>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT name, content_hash, cache_partition FROM template_builds WHERE state = 'deleting'"
     ))?;
     let rows = stmt.query_map([], |row| {
@@ -136,7 +142,7 @@ pub fn list_deleting_builds(
             parse_cache_partition(&row.get::<_, String>(2)?, 2)?,
         ))
     })?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Every build of one rootfs digest, in any state, legacy partition first.
@@ -145,19 +151,19 @@ pub fn list_builds_for_hash(
     name: &str,
     content_hash: &str,
 ) -> Result<Vec<TemplateBuildRow>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
          FROM template_builds WHERE name = ?1 AND content_hash = ?2
          ORDER BY cache_partition ASC"
     ))?;
     let rows = stmt.query_map(params![name, content_hash], build_row)?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Whether a build of the digest, in any cache partition, is in
 /// `state='deleting'`.
 pub fn is_build_marked_deleting(conn: &Connection, name: &str, content_hash: &str) -> Result<bool> {
-    let count: i64 = conn.query_row(
+    let count: i64 = conn.0.query_row(
         sql!(
             "SELECT COUNT(*) FROM template_builds
          WHERE name = ?1 AND content_hash = ?2 AND state = 'deleting'"
@@ -177,7 +183,7 @@ pub fn touch_build(
     cache_partition: TemplateCachePartition,
     last_used_at: &str,
 ) -> Result<()> {
-    conn.execute(
+    conn.0.execute(
         sql!(
             "UPDATE template_builds SET last_used_at = ?4
          WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3"
@@ -190,7 +196,7 @@ pub fn touch_build(
 /// Every `ready` build with its size and timestamps. A timestamp that
 /// doesn't parse as epoch seconds reads as 0.
 pub fn list_eviction_candidates(conn: &Connection) -> Result<Vec<BuildEvictionRow>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT name, content_hash, cache_partition, artifact_size_bytes, created_at, last_used_at
          FROM template_builds WHERE state = 'ready'"
     ))?;
@@ -206,28 +212,28 @@ pub fn list_eviction_candidates(conn: &Connection) -> Result<Vec<BuildEvictionRo
             last_used_at_secs: last_used_str.parse::<u64>().unwrap_or(0),
         })
     })?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Every ready build, by name, build date, digest and partition.
 pub fn list_builds(conn: &Connection) -> Result<Vec<TemplateBuildRow>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
          FROM template_builds WHERE state = 'ready'
          ORDER BY name ASC, build_date ASC, content_hash ASC, cache_partition ASC"
     ))?;
     let rows = stmt.query_map([], build_row)?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Every ready build of `name`.
 pub fn list_builds_by_name(conn: &Connection, name: &str) -> Result<Vec<TemplateBuildRow>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
          FROM template_builds WHERE name = ?1 AND state = 'ready'"
     ))?;
     let rows = stmt.query_map(params![name], build_row)?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Newest ready build of `name` in any partition. Same-date builds go to
@@ -238,7 +244,7 @@ pub fn get_latest_build(
     name: &str,
     preferred: Option<TemplateCachePartition>,
 ) -> Result<Option<TemplateBuildRow>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
          FROM template_builds
          WHERE name = ?1 AND state = 'ready'
@@ -251,7 +257,7 @@ pub fn get_latest_build(
         params![name, preferred.map(TemplateCachePartition::key)],
         build_row,
     )?;
-    rows.next().transpose()
+    Ok(rows.next().transpose()?)
 }
 
 /// The first of `name`'s ready builds in `cache_partition` or the legacy
@@ -264,7 +270,7 @@ pub fn find_latest_build_in_partition_or_legacy<T>(
     cache_partition: TemplateCachePartition,
     mut pick: impl FnMut(TemplateBuildRow) -> Option<T>,
 ) -> Result<Option<T>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
          FROM template_builds
          WHERE name = ?1 AND cache_partition IN (?2, '') AND state = 'ready'
@@ -287,7 +293,7 @@ pub fn find_latest_build_in_partition<T>(
     cache_partition: TemplateCachePartition,
     mut pick: impl FnMut(TemplateBuildRow) -> Option<T>,
 ) -> Result<Option<T>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
          FROM template_builds
          WHERE name = ?1 AND cache_partition = ?2 AND state = 'ready'
@@ -303,7 +309,7 @@ pub fn find_latest_build_in_partition<T>(
 
 /// Partitions that hold at least one ready build of `name`, legacy first.
 pub fn list_build_partitions(conn: &Connection, name: &str) -> Result<Vec<TemplateCachePartition>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT DISTINCT cache_partition FROM template_builds
          WHERE name = ?1 AND state = 'ready'
          ORDER BY cache_partition ASC"
@@ -311,7 +317,7 @@ pub fn list_build_partitions(conn: &Connection, name: &str) -> Result<Vec<Templa
     let rows = stmt.query_map(params![name], |row| {
         parse_cache_partition(&row.get::<_, String>(0)?, 0)
     })?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// The columns [`upsert_build`] writes, as template-manager derives them from
@@ -374,7 +380,7 @@ pub fn upsert_build(
     components: &[BuildComponentRow<'_>],
 ) -> Result<bool> {
     let partition = build.cache_partition.key();
-    let rows = tx.execute(
+    let rows = tx.0.execute(
         sql!("INSERT INTO template_builds (name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, created_at, last_used_at, runtime_version, guest_os, state_format_name, state_format_version, execution_metadata_json)
          VALUES (?1, ?2, ?15, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(name, content_hash, cache_partition) DO UPDATE SET build_date = ?3, manifest_json = ?4, runtime = ?5, arch = ?6, artifact_size_bytes = ?7, state = ?8, runtime_version = ?10, guest_os = ?11, state_format_name = ?12, state_format_version = ?13, execution_metadata_json = ?14
@@ -386,7 +392,7 @@ pub fn upsert_build(
     }
     delete_build_components(tx, build.name, build.content_hash, &partition)?;
     for component in components {
-        tx.execute(
+        tx.0.execute(
             sql!("INSERT INTO template_build_components (name, content_hash, cache_partition, kind, role_key, version, digest, format)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),
             params![
@@ -415,7 +421,7 @@ pub fn delete_build(
     let partition = cache_partition.key();
     delete_build_components(conn, name, content_hash, &partition)?;
     delete_snapshots_for_build(conn, name, content_hash, cache_partition)?;
-    conn.execute(
+    conn.0.execute(
         sql!(
             "DELETE FROM template_builds
          WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3"
@@ -431,7 +437,7 @@ fn delete_build_components(
     content_hash: &str,
     partition: &str,
 ) -> Result<()> {
-    conn.execute(
+    conn.0.execute(
         sql!(
             "DELETE FROM template_build_components
          WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3"

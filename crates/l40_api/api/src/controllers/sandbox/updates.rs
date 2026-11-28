@@ -5,7 +5,6 @@ use pplx_space_events::{SandboxEvent, SandboxEventDetails, SandboxEventSource, S
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_sandbox_store::{self as sandbox_store, FieldPatch};
 use pplx_space_sbx_mgr_client::proto::access_idle_update::Operation as AccessIdleOperation;
-use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::ReconcileReason;
 
 /// `UpdateSandboxRequest` has no spelling for "clear this override and
@@ -139,7 +138,7 @@ impl TimeoutIntent {
         timeout_secs: u32,
         expected_policy: Option<&AutoLifecyclePolicy>,
     ) -> Self {
-        let current = execution.policy.0.clone().normalized();
+        let current = execution.policy.clone().normalized();
         let next = crate::e2b::policy_for_timeout_update(&current, timeout_secs).normalized();
         let expected_matches =
             expected_policy.is_none_or(|expected| expected.clone().normalized() == current);
@@ -368,7 +367,8 @@ impl SandboxController {
             )
             .await
             .map_err(|err| {
-                // `SandboxStoreError` wraps one transparent `sqlx::Error`, so
+                // `SandboxStoreError` wraps one transparent `DbError`, which
+                // `sqlx::Error::from` turns back into the driver's error, so
                 // the classification survives the store boundary.
                 db_contention_error("failed to update sandbox metadata", &sqlx::Error::from(err))
             })?;
@@ -466,20 +466,14 @@ impl SandboxController {
             "inherit_template_default"
         };
         let profiles = crate::egress_profiles::load(pool, sandbox.id).await?;
-        let policy_override = self.egress_profiles.resolve(&profiles)?.compose_override(
-            policy_override,
-            sandbox
-                .template_network_policy
-                .as_ref()
-                .map(|policy| &policy.0),
-        )?;
+        let policy_override = self
+            .egress_profiles
+            .resolve(&profiles)?
+            .compose_override(policy_override, sandbox.template_network_policy.as_ref())?;
         let policy_override = crate::tls_interception_exemptions::compose(
             self.tls_interception_exemptions.as_ref(),
             policy_override,
-            sandbox
-                .template_network_policy
-                .as_ref()
-                .map(|policy| &policy.0),
+            sandbox.template_network_policy.as_ref(),
         );
         let base_details = || {
             let mut details = SandboxEventDetails::default()
@@ -528,7 +522,7 @@ impl SandboxController {
         .await
         .map_err(|err| {
             let error = "failed to update sandbox network policy";
-            let mapped = db_contention_error(error, &err);
+            let mapped = db_contention_error(error, &sqlx::Error::from(err));
             // Same rule as the enqueue arm below: the transaction has written
             // nothing on a lost race and the caller retries, so a
             // `NetworkPolicyUpdateFailed` event would record a transient
@@ -631,7 +625,12 @@ impl SandboxController {
         })?;
         sandbox_store::intent::set_snapshots_enabled_desired(&mut *tx, sandbox.id, enabled)
             .await
-            .map_err(|err| db_contention_error("failed to update sandbox snapshot intent", &err))?;
+            .map_err(|err| {
+                db_contention_error(
+                    "failed to update sandbox snapshot intent",
+                    &sqlx::Error::from(err),
+                )
+            })?;
 
         let refs = [ReconcileRef::sandbox_desired_state(sandbox.id)];
         let reconcile_queued = enqueue_sandbox_reconcile_and_trigger_tx(
@@ -768,13 +767,11 @@ impl SandboxController {
                     .map_err(|error| db_contention_error("begin timeout intent", &error))?;
                 // Lock separately from the joined read: after waiting for an
                 // activation's row lock, READ COMMITTED must see its new claim.
-                let locked = sqlx::query_scalar::<_, SandboxId>(sql!(
-                    "SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"
-                ))
-                .bind(sandbox.id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|error| db_contention_error("lock timeout intent", &error))?;
+                let locked = sandbox_store::row_locks::lock_id(&mut *tx, sandbox.id)
+                    .await
+                    .map_err(|error| {
+                        db_contention_error("lock timeout intent", &sqlx::Error::from(error))
+                    })?;
                 if locked.is_none() {
                     return Err(ControllerError::not_found("sandbox no longer exists"));
                 }
@@ -1105,13 +1102,26 @@ impl SandboxController {
         // Rollback is destructive and runs through `runtime_client`, which on
         // k8s recovers a missing pod for any recoverable-live lifecycle and
         // re-pins the new pod to `target_node_id`. Gate before the substrate
-        // call so a rollback can't sneak past the drain reconciler.
-        super::lifecycle::ensure_access_path_not_blocked_by_drain(
-            pool,
-            sandbox,
-            super::lifecycle::SandboxAction::Rollback,
-        )
-        .await?;
+        // call so a rollback can't sneak past the drain reconciler. A rollback
+        // without restart leaves the sandbox stopped, which a v2 drain doesn't
+        // move, so it is also refused while the sandbox's node has a v2 drain
+        // recorded, as a stop is, from the same read; a restarting rollback's
+        // restart is refused by the sealed node itself.
+        if auto_restart {
+            super::lifecycle::ensure_access_path_not_blocked_by_drain(
+                pool,
+                sandbox,
+                super::lifecycle::SandboxAction::Rollback,
+            )
+            .await?;
+        } else {
+            super::lifecycle::ensure_stop_admitted_by_drain(
+                pool,
+                sandbox.id,
+                super::lifecycle::SandboxAction::Rollback,
+            )
+            .await?;
+        }
         // Rollback is a recovery-capable data-plane op: if the pod is gone it is
         // recreated, so charge the cluster limiter for that recreation.
         let mut client = self
@@ -1180,7 +1190,7 @@ impl SandboxController {
         match pool.begin().await {
             Ok(mut tx) => {
                 let result = async {
-                    delete_reconcile_state_for_elements(&mut tx, &cleanup_refs).await?;
+                    delete_reconcile_state_for_elements(&mut *tx, &cleanup_refs).await?;
                     sandbox_store::create::delete_failed_create(&mut *tx, sandbox_id).await?;
                     tx.commit().await
                 }

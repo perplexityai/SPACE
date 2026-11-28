@@ -2,6 +2,8 @@
 //! started-suspend recovery that runs after execution cleanup.
 
 use super::*;
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_store::k8s_executions::pod_tracking as k8s_execution_pod_tracking;
 use pplx_space_sandbox_store::pod_tracking;
 
 impl K8sStore {
@@ -119,7 +121,7 @@ impl K8sStore {
         if !Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await? {
             return Ok(false);
         }
-        let refuse = pod_tracking::stopped_execution_retirement_refused(&mut tx, sandbox_id)
+        let refuse = pod_tracking::stopped_execution_retirement_refused(&mut *tx, sandbox_id)
             .await
             .db_context("failed to check for an execution newer than the stop")?;
         if refuse {
@@ -131,6 +133,39 @@ impl K8sStore {
             .await
             .db_context("failed to commit stopped execution retirement")?;
         Ok(true)
+    }
+
+    /// Release `source_node_id`, the node of a `stopped` sandbox whose stopped
+    /// evacuation the drain has torn down, under the sandbox row lock
+    /// execution creation also takes. `Ok(false)`, changing nothing, unless
+    /// the row is still `stopped`, carries the evacuation marker and a durable
+    /// pinned disk artifact, has no active execution, and is still placed on
+    /// `source_node_id` or already released; see
+    /// [`pod_tracking::release_published_stopped_evacuation`].
+    pub(in crate::controllers::substrate::kubernetes) async fn release_stopped_evacuation_placement(
+        &self,
+        sandbox_id: SandboxId,
+        source_node_id: NodeId,
+    ) -> Result<bool, SubstrateError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .db_context("failed to start stopped evacuation release transaction")?;
+        if !Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await? {
+            return Ok(false);
+        }
+        let released = pod_tracking::release_published_stopped_evacuation(
+            &mut *tx,
+            sandbox_id,
+            source_node_id,
+        )
+        .await
+        .db_context("failed to release stopped evacuation placement")?;
+        tx.commit()
+            .await
+            .db_context("failed to commit stopped evacuation release")?;
+        Ok(released)
     }
 
     /// Clear pod tracking for a sandbox that has **no** active execution,
@@ -213,31 +248,16 @@ impl K8sStore {
         {
             return Ok(false);
         }
-        let filled = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-                SET pod_uid = $4,
-                    pod_materialized_at = COALESCE(
-                        pod_materialized_at,
-                        CASE WHEN NULLIF(BTRIM($4::TEXT), '') IS NOT NULL THEN NOW() END
-                    ),
-                    updated_at = NOW()
-              WHERE sandbox_id = $1
-                AND generation IS NOT DISTINCT FROM $2
-                AND active
-                AND activation_attempt_id IS NOT DISTINCT FROM $3
-                AND NULLIF(BTRIM(pod_uid), '') IS NULL
-                AND route_activation_id IS NOT DISTINCT FROM $5"
-        ))
-        .bind(sandbox_id)
-        .bind(generation)
-        .bind(activation_attempt_id)
-        .bind(pod_uid)
-        .bind(route_activation_id)
-        .execute(&mut *tx)
+        let filled = k8s_execution_pod_tracking::backfill_missing_pod_uid(
+            &mut *tx,
+            sandbox_id,
+            generation,
+            activation_attempt_id,
+            pod_uid,
+            route_activation_id,
+        )
         .await
-        .db_context("failed to backfill pod uid")?
-        .rows_affected()
-            > 0;
+        .db_context("failed to backfill pod uid")?;
         if filled
             && self.attribution.is_enabled()
             && let Some(generation) = generation
@@ -332,35 +352,17 @@ impl K8sStore {
 
         // Clearing the pod UID stamps `pod_materialized_at` first if the row
         // held one, so the record that a pod ran outlives the UID.
-        let cleared = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-             SET pod_uid = NULL,
-                 pod_ip = NULL,
-                 k8s_node_name = NULL,
-                 pod_materialized_at = COALESCE(
-                     pod_materialized_at,
-                     CASE WHEN NULLIF(BTRIM(pod_uid), '') IS NOT NULL THEN NOW() END
-                 ),
-                 updated_at = NOW()
-             WHERE sandbox_id = $1
-               AND generation = $2
-               AND active
-               AND state = $3
-               AND NULLIF(BTRIM(pod_uid), '') IS NOT DISTINCT FROM $4
-               AND pod_ip IS NOT DISTINCT FROM $5::INET
-               AND k8s_node_name IS NOT DISTINCT FROM $6"
-        ))
-        .bind(sandbox_id)
-        .bind(generation.get())
-        .bind(ActiveExecutionState::RecoveryFailed.as_str())
-        .bind(expected_pod_uid)
-        .bind(expected_pod_ip)
-        .bind(expected_k8s_node_name)
-        .execute(&mut *tx)
+        let cleared = k8s_execution_pod_tracking::clear_absent_recovery_pod(
+            &mut *tx,
+            sandbox_id,
+            generation,
+            ActiveExecutionState::RecoveryFailed.as_str(),
+            expected_pod_uid,
+            expected_pod_ip,
+            expected_k8s_node_name,
+        )
         .await
-        .db_context("failed to clear missing recovery pod metadata")?
-        .rows_affected()
-            > 0;
+        .db_context("failed to clear missing recovery pod metadata")?;
         if !cleared {
             tx.commit()
                 .await
@@ -562,14 +564,30 @@ impl K8sStore {
         // retire keeps `placement_changed_at` so the legacy snapshot-freshness
         // gate doesn't strand a markerless row's ready snapshot. See
         // [`PlacementClock`].
-        match placement_clock {
-            PlacementClock::Bump => pod_tracking::unplace_after_pod_teardown(tx, sandbox_id).await,
+        let unplaced = match placement_clock {
+            PlacementClock::Bump => {
+                pod_tracking::unplace_after_pod_teardown(&mut **tx, sandbox_id).await
+            }
             PlacementClock::Preserve => {
-                pod_tracking::unplace_after_pod_teardown_preserving_placement_clock(tx, sandbox_id)
-                    .await
+                pod_tracking::unplace_after_pod_teardown_preserving_placement_clock(
+                    &mut **tx, sandbox_id,
+                )
+                .await
             }
         }
-        .db_context("failed to mark sandbox unplaced")
+        .db_context("failed to mark sandbox unplaced")?;
+        // The unplace refuses a `stopped` row, whose disk is on the node it
+        // names; see `pod_tracking::unplace_after_pod_teardown`. Every caller
+        // holds the row lock, so the row exists and that refusal is the only
+        // way here. The drain's stopped evacuation releases the node itself,
+        // with `release_stopped_evacuation_placement`.
+        if !unplaced {
+            tracing::debug!(
+                sandbox_id = %sandbox_id,
+                "kept the placement of a stopped sandbox after its pod teardown"
+            );
+        }
+        Ok(())
     }
 
     pub(super) async fn recover_markerless_restoring_after_execution_cleanup_in(
@@ -580,7 +598,7 @@ impl K8sStore {
         // Callers hold the sandbox row lock and retire the authoritative
         // execution earlier in this transaction. Execution creation takes the
         // same lock, so a successor cannot appear between this proof and commit.
-        pod_tracking::recover_markerless_restoring_after_execution_cleanup(tx, sandbox_id)
+        pod_tracking::recover_markerless_restoring_after_execution_cleanup(&mut **tx, sandbox_id)
             .await
             .db_context("failed to recover markerless restoring sandbox after execution cleanup")
     }
@@ -590,7 +608,7 @@ impl K8sStore {
         tx: &mut Transaction<'_, Postgres>,
         sandbox_id: SandboxId,
     ) -> Result<bool, SubstrateError> {
-        pod_tracking::recover_started_after_execution_retired(tx, sandbox_id)
+        pod_tracking::recover_started_after_execution_retired(&mut **tx, sandbox_id)
             .await
             .db_context("failed to recover started sandbox with current suspend snapshot")
     }
@@ -601,7 +619,7 @@ impl K8sStore {
         sandbox_id: SandboxId,
         generation: ExecutionGeneration,
     ) -> Result<bool, SubstrateError> {
-        pod_tracking::recover_started_after_failed_recovery(tx, sandbox_id, generation)
+        pod_tracking::recover_started_after_failed_recovery(&mut **tx, sandbox_id, generation)
             .await
             .db_context("failed to recover started sandbox with current suspend snapshot")
     }

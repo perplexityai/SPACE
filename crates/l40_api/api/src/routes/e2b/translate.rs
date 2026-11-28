@@ -887,7 +887,7 @@ pub(super) fn sandbox_end_at(sandbox: &Sandbox, native: &SandboxResponse) -> Off
         .auto_lifecycle
         .as_ref()
         .and_then(e2b_lifecycle_config_from_policy)
-        .or_else(|| e2b_lifecycle_config_from_policy(&sandbox.auto_lifecycle.0))
+        .or_else(|| e2b_lifecycle_config_from_policy(&sandbox.auto_lifecycle))
         .map(|config| config.timeout_secs)
         .unwrap_or(ECW_RESPONSE_DEFAULT_TIMEOUT_SECS);
 
@@ -896,7 +896,7 @@ pub(super) fn sandbox_end_at(sandbox: &Sandbox, native: &SandboxResponse) -> Off
 
 pub(super) fn sandbox_metadata(sandbox: &Sandbox, native: &SandboxResponse) -> StringMap {
     let source = if native.metadata.is_empty() {
-        &sandbox.metadata.0
+        &sandbox.metadata
     } else {
         &native.metadata
     };

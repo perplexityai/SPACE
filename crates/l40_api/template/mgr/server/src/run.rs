@@ -65,7 +65,7 @@ pub enum RunTemplateMgrError {
     #[error("failed to open the template-manager SQLite database: {0}")]
     OpenDatabase(#[source] pplx_space_template_mgr_store::database::SqliteError),
     #[error("failed to initialize template-manager service state: {0}")]
-    InitializeService(#[source] rusqlite::Error),
+    InitializeService(#[source] crate::db::Error),
     #[error("failed to bind the template-manager socket: {0}")]
     BindSocket(#[source] pplx_space_unix_socket_bind::BindUnixSocketError),
 }

@@ -214,6 +214,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 infra/space/kind/scripts/rust-artifact-handoff.py wait --timeout 300
 
+      # For a moment after the producer job reports completed, which is what
+      # `wait` reads, the artifact service can still answer "Artifact not
+      # found for name" or "No artifacts found for ID". So every download of
+      # the producer's image is retried once after a pause.
       - name: Download this attempt's Rust artifact image
         id: download
         if: steps.producer.outcome == 'success'
@@ -223,17 +227,50 @@ jobs:
           name: kind-rust-${{ github.sha }}-${{ env.SPACE_KIND_RUST_PRODUCER_ATTEMPT }}
           path: ${{ runner.temp }}/kind-rust
 
+      - &pause-before-download-retry
+        name: Give the artifact service time to serve the image
+        if: steps.download.outcome == 'failure'
+        run: sleep 30
+
+      - name: Download this attempt's Rust artifact image again
+        id: download_retry
+        if: steps.download.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kind-rust-${{ github.sha }}-${{ env.SPACE_KIND_RUST_PRODUCER_ATTEMPT }}
+          path: ${{ runner.temp }}/kind-rust
+
       - name: Load and verify the Rust artifact image
         id: load
-        if: steps.download.outcome == 'success'
+        if: steps.download.outcome == 'success' || steps.download_retry.outcome == 'success'
         continue-on-error: true
         run: python3 infra/space/kind/scripts/rust-artifact-handoff.py load "${RUNNER_TEMP}/kind-rust"
 
       # Main builds on every push, so this replaces the key's earlier image.
+      # The record names the digest it pushed, for readers that can pull only
+      # by digest: a box behind a pull-through mirror of ghcr.io that serves
+      # content by digest (rust-artifact-handoff.py reuse).
       - name: Publish the artifact image under its Rust input key
+        id: publish
         if: steps.load.outcome == 'success'
         continue-on-error: true
-        run: python3 infra/space/kind/scripts/rust-artifact-handoff.py publish ghcr.io/perplexityai/space-kind-rust-artifacts
+        run: >-
+          python3 infra/space/kind/scripts/rust-artifact-handoff.py publish
+          ghcr.io/perplexityai/space-kind-rust-artifacts
+          --record "${RUNNER_TEMP}/kind-rust-artifact-digest/kind-rust-artifact-digest.json"
+
+      # {key, digest, repository, commit}; publish writes it only after a push.
+      - name: Upload the published image's digest record
+        if: steps.publish.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kind-rust-artifact-digest
+          path: ${{ runner.temp }}/kind-rust-artifact-digest/kind-rust-artifact-digest.json
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 30
 
       # Only this dedicated cache package is pruned, never release images.
       # Fixed tagged heads stay intact; retain ten untagged versions for readers
@@ -460,8 +497,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 infra/space/kind/scripts/rust-artifact-handoff.py wait
 
+      # Retried once after a pause, as in rust_artifacts_publish; a second
+      # failure fails the shard.
       - &download-rust-artifacts
         name: Download this attempt's Rust artifact image
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kind-rust-${{ github.sha }}-${{ env.SPACE_KIND_RUST_PRODUCER_ATTEMPT }}
+          path: ${{ runner.temp }}/kind-rust
+
+      - *pause-before-download-retry
+
+      - &download-rust-artifacts-again
+        name: Download this attempt's Rust artifact image again
+        if: steps.download.outcome == 'failure'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: kind-rust-${{ github.sha }}-${{ env.SPACE_KIND_RUST_PRODUCER_ATTEMPT }}
@@ -750,6 +801,8 @@ jobs:
       - *install-observability
       - *wait-producer
       - *download-rust-artifacts
+      - *pause-before-download-retry
+      - *download-rust-artifacts-again
       - *load-rust-artifacts
       - *record-bringup-timeline
 

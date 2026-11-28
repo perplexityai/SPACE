@@ -4,8 +4,12 @@
 //! bytes are reaped, so a restarted reconciler finishes the claims it finds
 //! here instead of waiting for fresh discovery to revisit them.
 
+use std::sync::LazyLock;
+
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
-use pplx_space_snapshot_model::SnapshotId;
+use pplx_space_sandbox_portability::deleting_snapshot_matches_artifact;
+use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId, SnapshotId};
 use pplx_space_sql_locator::sql;
 use sqlx::FromRow;
 use uuid::Uuid;
@@ -85,28 +89,59 @@ pub struct ClaimedSnapshot {
 /// [`list`]. The bound is an id, not a fixed set of claims: a claim with a
 /// higher id waits for a later pass, and a snapshot claimed during the pass
 /// with an id at or below the bound can still be paged in it.
-pub async fn scan_epoch(
-    executor: impl sqlx::PgExecutor<'_>,
-) -> Result<Option<SnapshotId>, sqlx::Error> {
-    sqlx::query_scalar(SCAN_EPOCH_SQL)
-        .fetch_optional(executor)
-        .await
+pub async fn scan_epoch(executor: impl Executor<'_>) -> Result<Option<SnapshotId>, DbError> {
+    Ok(sqlx::query_scalar(SCAN_EPOCH_SQL)
+        .fetch_optional(executor.into_sqlx())
+        .await?)
 }
 
 /// Up to `limit` claimed snapshots with ids in `(after, through]`, oldest id
 /// first. `after` is `None` for the first page.
 pub async fn list(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     limit: i64,
     after: Option<SnapshotId>,
     through: SnapshotId,
-) -> Result<Vec<ClaimedSnapshot>, sqlx::Error> {
-    sqlx::query_as(LIST_SQL)
+) -> Result<Vec<ClaimedSnapshot>, DbError> {
+    Ok(sqlx::query_as(LIST_SQL)
         .bind(limit)
         .bind(after)
         .bind(through)
-        .fetch_all(executor)
-        .await
+        .fetch_all(executor.into_sqlx())
+        .await?)
+}
+
+/// Whether a claim has parked a snapshot of `sandbox_id`'s local artifact
+/// `artifact_id` of kind `artifact_kind` in `deleting` while no ready copy of
+/// that artifact keeps a live location.
+///
+/// Run it after locking the sandbox row in the same transaction. Retention
+/// takes that lock before it claims a snapshot, so this read sees the
+/// committed claim and a caller can refuse to pin an artifact whose bytes may
+/// be going.
+///
+/// The caller must pass its open transaction.
+pub async fn deleting_without_ready_copy<C>(
+    tx: &mut C,
+    sandbox_id: SandboxId,
+    artifact_id: LocalArtifactId,
+    artifact_kind: ArtifactKind,
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    static DELETING_WITHOUT_READY_COPY: LazyLock<String> = LazyLock::new(|| {
+        let deleting_snapshot = deleting_snapshot_matches_artifact("$1", "$2", "$3");
+        sql!(format!("SELECT {deleting_snapshot}"))
+    });
+    Ok(
+        sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(DELETING_WITHOUT_READY_COPY.as_str()))
+            .bind(sandbox_id.as_uuid())
+            .bind(artifact_id.as_uuid())
+            .bind(artifact_kind.as_str())
+            .fetch_one(tx.into_sqlx())
+            .await?,
+    )
 }
 
 #[cfg(test)]

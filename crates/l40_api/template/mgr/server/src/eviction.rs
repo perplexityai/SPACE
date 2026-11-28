@@ -48,14 +48,15 @@
 //! deterministic LRU tiebreak.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use pplx_space_lru_reaper::{self as lru_reaper, EvictionInput};
-use pplx_space_template_mgr_store::{builds, snapshots};
-use rusqlite::{Connection, params};
+use pplx_space_template_mgr_store::{builds, eviction, snapshots};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+
+use crate::db::{Connection, SharedConnection};
 
 pub(crate) use pplx_space_lru_reaper::EvictionConfig;
 
@@ -180,7 +181,7 @@ struct PlanDbSnapshot {
 /// connection lock is held for the duration of this call and is
 /// released as soon as it returns — `disk_size_for` runs under the
 /// caller's stackframe, NOT under the lock.
-fn read_plan_db_snapshot(conn: &Connection) -> rusqlite::Result<PlanDbSnapshot> {
+fn read_plan_db_snapshot(conn: &Connection) -> crate::db::Result<PlanDbSnapshot> {
     let builds = crate::db::list_eviction_candidates(conn)?;
     let mut snapshot_dims: std::collections::HashMap<BuildKey, Vec<(u32, u32)>> =
         std::collections::HashMap::with_capacity(builds.len());
@@ -219,7 +220,7 @@ pub(crate) fn plan_from_db(
     warm_pool: &HashSet<(String, String)>,
     cfg: &EvictionConfig,
     disk_size_for: impl Fn(&str, &str, TemplateCachePartition, u64, &[(u32, u32)]) -> u64,
-) -> rusqlite::Result<EvictionPlan> {
+) -> crate::db::Result<EvictionPlan> {
     let db_snapshot = read_plan_db_snapshot(conn)?;
     plan_from_snapshot(db_snapshot, active, warm_pool, cfg, disk_size_for)
 }
@@ -235,7 +236,7 @@ fn plan_from_snapshot(
     warm_pool: &HashSet<(String, String)>,
     cfg: &EvictionConfig,
     disk_size_for: impl Fn(&str, &str, TemplateCachePartition, u64, &[(u32, u32)]) -> u64,
-) -> rusqlite::Result<EvictionPlan> {
+) -> crate::db::Result<EvictionPlan> {
     let PlanDbSnapshot {
         builds: builds_rows,
         snapshot_dims,
@@ -335,7 +336,7 @@ fn execute_precheck(
     warm_pool: &HashSet<(String, String)>,
     candidate: &EvictionCandidate,
     touched_before_secs: Option<u64>,
-) -> rusqlite::Result<PrecheckOutcome> {
+) -> crate::db::Result<PrecheckOutcome> {
     let key = (candidate.name.clone(), candidate.content_hash.clone());
     if active.contains(&key) {
         return Ok(PrecheckOutcome::SkipActive);
@@ -343,12 +344,8 @@ fn execute_precheck(
     if warm_pool.contains(&key) {
         return Ok(PrecheckOutcome::SkipWarmPool);
     }
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    if pplx_space_template_mgr_store::eviction::digest_is_pinned(
-        &tx,
-        &candidate.name,
-        &candidate.content_hash,
-    )? {
+    let tx = crate::db::Transaction::immediate(conn)?;
+    if eviction::digest_is_pinned(&tx, &candidate.name, &candidate.content_hash)? {
         return Ok(PrecheckOutcome::SkipPinned);
     }
 
@@ -356,19 +353,14 @@ fn execute_precheck(
     // `state='ready'`. A zero-row UPDATE means the row was deleted
     // out from under us OR another path (manual delete, parallel
     // eviction) already grabbed it.
-    let updated = tx.execute(
-        "UPDATE template_builds SET state = 'deleting'
-         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3 AND state = 'ready'
-           AND (?4 IS NULL
-                OR MAX(CAST(created_at AS INTEGER), CAST(last_used_at AS INTEGER)) <= ?4)",
-        params![
-            candidate.name,
-            candidate.content_hash,
-            candidate.cache_partition.key(),
-            touched_before_secs.map(|secs| i64::try_from(secs).unwrap_or(i64::MAX)),
-        ],
+    let marked = eviction::mark_ready_build_deleting(
+        &tx,
+        &candidate.name,
+        &candidate.content_hash,
+        candidate.cache_partition,
+        touched_before_secs,
     )?;
-    if updated == 0 {
+    if !marked {
         return Ok(PrecheckOutcome::SkipRowMissing);
     }
 
@@ -381,8 +373,8 @@ fn execute_precheck(
 /// already completed; if a pin landed between phases the disk is gone and
 /// the next pull will re-materialize (pin's job is to keep the digest
 /// available, not to keep this exact row).
-fn execute_finalize(conn: &Connection, candidate: &EvictionCandidate) -> rusqlite::Result<()> {
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+fn execute_finalize(conn: &Connection, candidate: &EvictionCandidate) -> crate::db::Result<()> {
+    let tx = crate::db::Transaction::immediate(conn)?;
     builds::delete_build(
         &tx,
         &candidate.name,
@@ -405,8 +397,8 @@ pub(crate) fn execute_one(
     active: &HashSet<(String, String)>,
     warm_pool: &HashSet<(String, String)>,
     candidate: &EvictionCandidate,
-    delete_disk: impl FnOnce(&str, &str, TemplateCachePartition) -> rusqlite::Result<()>,
-) -> rusqlite::Result<EvictionOutcome> {
+    delete_disk: impl FnOnce(&str, &str, TemplateCachePartition) -> crate::db::Result<()>,
+) -> crate::db::Result<EvictionOutcome> {
     match execute_precheck(conn, active, warm_pool, candidate, None)? {
         PrecheckOutcome::SkipPinned => return Ok(EvictionOutcome::SkippedPinnedAtExecute),
         PrecheckOutcome::SkipActive => return Ok(EvictionOutcome::SkippedActiveAtExecute),
@@ -437,29 +429,29 @@ pub(crate) fn execute_one(
 /// next prefetch tick re-pulling. The row delete is monotonic;
 /// leaving it would orphan a row with no rootfs.
 pub(crate) async fn execute_one_async(
-    db: Arc<Mutex<Connection>>,
+    db: SharedConnection,
     active: HashSet<(String, String)>,
     warm_pool: HashSet<(String, String)>,
     candidate: EvictionCandidate,
     delete_disk: DeleteDiskFn,
-) -> rusqlite::Result<EvictionOutcome> {
+) -> crate::db::Result<EvictionOutcome> {
     execute_one_async_touched_before(db, active, warm_pool, candidate, delete_disk, None).await
 }
 
 /// [`execute_one_async`], with the pre-check's optional touch bound.
 async fn execute_one_async_touched_before(
-    db: Arc<Mutex<Connection>>,
+    db: SharedConnection,
     active: HashSet<(String, String)>,
     warm_pool: HashSet<(String, String)>,
     candidate: EvictionCandidate,
     delete_disk: DeleteDiskFn,
     touched_before_secs: Option<u64>,
-) -> rusqlite::Result<EvictionOutcome> {
+) -> crate::db::Result<EvictionOutcome> {
     // Phase 1: pre-check in a short locked region.
     let cand_for_precheck = candidate.clone();
     let active_for_precheck = active.clone();
     let warm_pool_for_precheck = warm_pool.clone();
-    let db_for_precheck = Arc::clone(&db);
+    let db_for_precheck = db.clone();
     let precheck = tokio::task::spawn_blocking(move || {
         let conn = db_for_precheck
             .lock()
@@ -474,9 +466,9 @@ async fn execute_one_async_touched_before(
     })
     .await
     .map_err(|e| {
-        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+        crate::db::Error::to_sql_conversion(std::io::Error::other(format!(
             "precheck spawn_blocking: {e}"
-        ))))
+        )))
     })??;
 
     match precheck {
@@ -500,7 +492,7 @@ async fn execute_one_async_touched_before(
 
     // Phase 3: finalize in a short locked region.
     let cand_for_finalize = candidate.clone();
-    let db_for_finalize = Arc::clone(&db);
+    let db_for_finalize = db.clone();
     tokio::task::spawn_blocking(move || {
         let conn = db_for_finalize
             .lock()
@@ -509,9 +501,9 @@ async fn execute_one_async_touched_before(
     })
     .await
     .map_err(|e| {
-        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+        crate::db::Error::to_sql_conversion(std::io::Error::other(format!(
             "finalize spawn_blocking: {e}"
-        ))))
+        )))
     })??;
 
     Ok(EvictionOutcome::Deleted)
@@ -613,27 +605,27 @@ impl std::fmt::Display for IdleTemplateKept {
 /// delete fails is repaired before returning, as the GC's next tick would:
 /// back to `ready` when its artifacts are intact, dropped otherwise.
 pub(crate) async fn evict_idle_template(
-    db: Arc<Mutex<Connection>>,
+    db: SharedConnection,
     gate: &EvictionGate,
     name: &str,
     touched_before_secs: u64,
     active: HashSet<(String, String)>,
     warm_pool: HashSet<(String, String)>,
     disk: EvictionDisk,
-) -> rusqlite::Result<IdleTemplateEviction> {
+) -> crate::db::Result<IdleTemplateEviction> {
     // Held until the last build is finalized, so no repair pass sees this
     // eviction's `deleting` rows as abandoned.
     let Some(_evicting) = gate.try_hold() else {
         return Ok(IdleTemplateEviction::Busy);
     };
     let builds = {
-        let db = Arc::clone(&db);
+        let db = db.clone();
         let name = name.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = db
                 .lock()
                 .map_err(|_| crate::db::mutex_poison_error("idle template eviction"))?;
-            Ok::<_, rusqlite::Error>(
+            Ok::<_, crate::db::Error>(
                 crate::db::list_eviction_candidates(&conn)?
                     .into_iter()
                     .filter(|build| build.name == name)
@@ -642,9 +634,9 @@ pub(crate) async fn evict_idle_template(
         })
         .await
         .map_err(|e| {
-            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+            crate::db::Error::to_sql_conversion(std::io::Error::other(format!(
                 "idle template eviction spawn_blocking: {e}"
-            ))))
+            )))
         })??
     };
     if builds.is_empty() {
@@ -678,7 +670,7 @@ pub(crate) async fn evict_idle_template(
             });
         };
         let outcome = execute_one_async_touched_before(
-            Arc::clone(&db),
+            db.clone(),
             active.clone(),
             warm_pool.clone(),
             candidate,
@@ -692,7 +684,7 @@ pub(crate) async fn evict_idle_template(
                 // Still holding the gate, so every `deleting` row is ours
                 // or abandoned. Don't leave this one for a GC loop that may
                 // be disabled.
-                reap_stuck_deleting(Arc::clone(&db), &disk.probe).await;
+                reap_stuck_deleting(db.clone(), &disk.probe).await;
                 return Err(error);
             }
         };
@@ -718,9 +710,9 @@ pub(crate) async fn evict_idle_template(
     })
     .await
     .map_err(|e| {
-        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+        crate::db::Error::to_sql_conversion(std::io::Error::other(format!(
             "idle template eviction spawn_blocking: {e}"
-        ))))
+        )))
     })??;
     Ok(if removed {
         IdleTemplateEviction::Evicted
@@ -738,7 +730,7 @@ pub(crate) async fn evict_idle_template(
 /// `(vcpu, memory_mib)` snapshot pairs the planner already read from
 /// `template_snapshots` — passed in so the closure does NOT need to
 /// hit the DB itself. Hitting the DB here would deadlock the
-/// non-reentrant `Arc<Mutex<Connection>>` the surrounding
+/// non-reentrant `SharedConnection` the surrounding
 /// `spawn_blocking` already holds.
 pub(crate) type DiskSizeFn =
     Arc<dyn Fn(&str, &str, TemplateCachePartition, u64, &[(u32, u32)]) -> u64 + Send + Sync>;
@@ -747,7 +739,7 @@ pub(crate) type DiskSizeFn =
 /// production closure (which RPCs to node-mgr for the btrfs subvol
 /// delete) can be called from `execute_one_async` *without* the DB
 /// lock held — that's the structural property the DB-lock-release
-/// fix depends on. The returned `rusqlite::Result` is a
+/// fix depends on. The returned `crate::db::Result` is a
 /// convenience carrier so the future plugs cleanly into
 /// `execute_one_async`; production wraps the underlying io::Error
 /// or RPC error inside a synthetic SQLITE_IOERR.
@@ -757,7 +749,7 @@ pub(crate) type DeleteDiskFn = Arc<
             &str,
             TemplateCachePartition,
         )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = rusqlite::Result<()>> + Send>>
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::db::Result<()>> + Send>>
         + Send
         + Sync,
 >;
@@ -854,11 +846,11 @@ pub(crate) type ReaperDiskProbeFn = Arc<
 /// crash, not from an eviction still in flight. Tests model this
 /// directly by planting `'deleting'` before invoking `gc_tick`.
 pub(crate) async fn reap_stuck_deleting(
-    db: Arc<Mutex<Connection>>,
+    db: SharedConnection,
     reaper_probe: &ReaperDiskProbeFn,
 ) -> usize {
-    let db_for_query = Arc::clone(&db);
-    let stuck = match tokio::task::spawn_blocking(move || -> rusqlite::Result<Vec<BuildKey>> {
+    let db_for_query = db.clone();
+    let stuck = match tokio::task::spawn_blocking(move || -> crate::db::Result<Vec<BuildKey>> {
         let conn = db_for_query
             .lock()
             .map_err(|_| crate::db::mutex_poison_error("template GC reaper query"))?;
@@ -880,46 +872,24 @@ pub(crate) async fn reap_stuck_deleting(
     let mut handled = 0usize;
     for (name, content_hash, partition) in stuck {
         let state = reaper_probe(&name, &content_hash, partition).await;
-        let partition_key = partition.key();
-        let db_for_update = Arc::clone(&db);
+        let db_for_update = db.clone();
         let n = name.clone();
         let h = content_hash.clone();
-        let update_result = tokio::task::spawn_blocking(move || -> rusqlite::Result<()> {
+        let update_result = tokio::task::spawn_blocking(move || -> crate::db::Result<()> {
             let conn = db_for_update
                 .lock()
                 .map_err(|_| crate::db::mutex_poison_error("template GC reaper update"))?;
             match state {
                 ReaperDiskState::Intact => {
-                    conn.execute(
-                        "UPDATE template_builds SET state = 'ready'
-                         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3
-                           AND state = 'deleting'",
-                        params![n, h, partition_key],
-                    )?;
+                    eviction::reaper_reset_deleting_build_to_ready(&conn, &n, &h, partition)?;
                 }
                 ReaperDiskState::Missing => {
-                    let tx = rusqlite::Transaction::new_unchecked(
-                        &conn,
-                        rusqlite::TransactionBehavior::Immediate,
-                    )?;
+                    let tx = crate::db::Transaction::immediate(&conn)?;
                     snapshots::delete_snapshots_for_build(&tx, &n, &h, partition)?;
-                    tx.execute(
-                        "DELETE FROM template_builds
-                         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3
-                           AND state = 'deleting'",
-                        params![n, h, partition_key],
-                    )?;
+                    eviction::reaper_delete_deleting_build(&tx, &n, &h, partition)?;
                     // Nothing cascades on the runtime connection; drop the
                     // components only if the build row went.
-                    tx.execute(
-                        "DELETE FROM template_build_components
-                         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3
-                           AND NOT EXISTS (
-                               SELECT 1 FROM template_builds
-                               WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3
-                           )",
-                        params![n, h, partition_key],
-                    )?;
+                    eviction::delete_components_of_absent_build(&tx, &n, &h, partition)?;
                     tx.commit()?;
                 }
             }
@@ -1120,9 +1090,9 @@ pub(crate) enum GcTickError {
     #[error("plan spawn_blocking: {0}")]
     Task(#[source] tokio::task::JoinError),
     #[error("read_plan_db_snapshot: {0}")]
-    PlanSnapshot(#[source] rusqlite::Error),
+    PlanSnapshot(#[source] crate::db::Error),
     #[error("plan_from_snapshot: {0}")]
-    Plan(#[source] rusqlite::Error),
+    Plan(#[source] crate::db::Error),
 }
 
 impl GcTickError {
@@ -1139,7 +1109,7 @@ impl GcTickError {
 /// Run one tick of the GC loop. Pure with respect to its callbacks —
 /// the only external side effects are whatever `disk_size_for` and
 /// `delete_disk_for` perform. The DB connection is shared via
-/// `Arc<Mutex<>>` so the SQL inside [`plan_from_db`] and
+/// a `SharedConnection` so the SQL inside [`plan_from_db`] and
 /// [`execute_one`] serializes against the rest of the daemon.
 ///
 /// The blocking work (DB reads, fs `metadata()` calls inside
@@ -1160,7 +1130,7 @@ impl GcTickError {
     reason = "the tick's protected sets plus one hook per side effect tests replace"
 )]
 pub(crate) async fn gc_tick(
-    db: Arc<Mutex<Connection>>,
+    db: SharedConnection,
     cfg: &GcConfig,
     active: HashSet<(String, String)>,
     warm_pool: HashSet<(String, String)>,
@@ -1184,7 +1154,7 @@ pub(crate) async fn gc_tick(
     // `do_pull` re-materializes on next access. Race-free: no Phase 1
     // CAS has run yet in this tick, so any `'deleting'` row here is
     // necessarily a leftover, not in-flight.
-    let reaped = reap_stuck_deleting(Arc::clone(&db), &reaper_probe).await;
+    let reaped = reap_stuck_deleting(db.clone(), &reaper_probe).await;
     if reaped > 0 {
         tracing::debug!(reaped, "template GC reaped stuck-deleting rows");
     }
@@ -1193,7 +1163,7 @@ pub(crate) async fn gc_tick(
     // union) under a single locked region. Released before
     // `disk_size_for` runs so the production closure can take the
     // same mutex without deadlocking.
-    let db_for_plan = Arc::clone(&db);
+    let db_for_plan = db.clone();
     let db_snapshot = tokio::task::spawn_blocking(move || {
         let conn = db_for_plan
             .lock()
@@ -1249,7 +1219,7 @@ pub(crate) async fn gc_tick(
             crate::metrics::gc_skipped("claimed");
             continue;
         };
-        let db_for_exec = Arc::clone(&db);
+        let db_for_exec = db.clone();
         let active = active.clone();
         let warm_pool = warm_pool.clone();
         let cand = candidate.clone();
@@ -1259,14 +1229,15 @@ pub(crate) async fn gc_tick(
         // held until the delete and finalize finish, and no registration
         // publishes the digest while its files are being removed.
         // `execute_one_async` releases the DB lock around the disk delete.
-        let outcome: Result<rusqlite::Result<EvictionOutcome>, String> = tokio::spawn(async move {
-            let outcome =
-                execute_one_async(db_for_exec, active, warm_pool, cand, delete_disk).await;
-            drop(claim);
-            outcome
-        })
-        .await
-        .map_err(|error| format!("eviction task: {error}"));
+        let outcome: Result<crate::db::Result<EvictionOutcome>, String> =
+            tokio::spawn(async move {
+                let outcome =
+                    execute_one_async(db_for_exec, active, warm_pool, cand, delete_disk).await;
+                drop(claim);
+                outcome
+            })
+            .await
+            .map_err(|error| format!("eviction task: {error}"));
 
         match outcome {
             Ok(Ok(EvictionOutcome::Deleted)) => {
@@ -1362,7 +1333,7 @@ pub type ReconcileRowlessFn =
 /// type, or the cluster API client — the orchestration in `service.rs`
 /// plugs those in.
 pub async fn run_loop(
-    db: Arc<Mutex<Connection>>,
+    db: SharedConnection,
     cfg: GcConfig,
     shutdown: CancellationToken,
     hooks: GcHooks,
@@ -1508,7 +1479,7 @@ pub async fn run_loop(
             biased;
             _ = shutdown.cancelled() => return,
             result = gc_tick(
-                Arc::clone(&db),
+                db.clone(),
                 &cfg,
                 active,
                 warm_pool,

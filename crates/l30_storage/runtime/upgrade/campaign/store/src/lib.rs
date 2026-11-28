@@ -70,6 +70,11 @@
 //!   refuses a second, so two campaigns don't compete for the same subjects
 //!   on that source. Campaigns from different sources can name one subject;
 //!   a lease never gives it to two at once (**One worker per subject**).
+//! * **Unknown kinds are skipped on read.** A campaign row whose `kind` this
+//!   build doesn't know (written by a newer build during a rollout or before a
+//!   rollback) is logged as a warning and omitted from [`list_unfinished`],
+//!   [`get_record`] and [`list_records`], without shrinking a page. Every
+//!   other unreadable column on a known kind still fails closed.
 //!
 //! Nothing here deletes a campaign.
 
@@ -79,6 +84,7 @@ use std::str::FromStr;
 use pplx_space_accounts::UserId;
 use pplx_space_content_digest::DigestParseError;
 use pplx_space_execution_spec::EnvironmentReference;
+use pplx_space_postgres_pool::{DbError, Executor, Tx};
 use pplx_space_rollout_queue::HeaderPhase;
 use pplx_space_sql_locator::sql;
 use time::OffsetDateTime;
@@ -114,8 +120,31 @@ pub mod test_support;
 /// otherwise. A read-only `Ok` commits too, which releases its row locks just
 /// as a rollback would. A failed rollback is logged and left to the
 /// connection's own cleanup; the verb's error is the one the caller needs.
-pub(crate) async fn end_transaction<T, E: From<sqlx::Error>>(
+pub(crate) async fn end_transaction<T, E: From<DbError>>(
     tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    result: Result<T, E>,
+) -> Result<T, E> {
+    match result {
+        Ok(value) => {
+            tx.commit().await.map_err(DbError::from)?;
+            Ok(value)
+        }
+        Err(error) => {
+            if let Err(rollback) = tx.rollback().await {
+                tracing::warn!(
+                    error = %rollback,
+                    "couldn't roll back a runtime upgrade campaign verb's transaction"
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+/// [`end_transaction`] for a verb that began its transaction on a
+/// [`pplx_space_postgres_pool::Db`].
+pub(crate) async fn end_db_transaction<T, E: From<DbError>>(
+    tx: Tx<'_>,
     result: Result<T, E>,
 ) -> Result<T, E> {
     match result {
@@ -148,7 +177,7 @@ impl fmt::Display for CampaignId {
 
 /// Names the fixed vocabulary of a text column: `as_str`, `ALL`, `Display`
 /// and a `FromStr` that refuses anything else, so a stored value outside the
-/// set fails the read rather than being treated as one of them.
+/// set is never treated as one of them.
 macro_rules! closed_vocabulary {
     ($(#[$meta:meta])* $name:ident, $error:literal { $($(#[$variant_meta:meta])* $variant:ident => $value:literal),+ $(,)? }) => {
         $(#[$meta])*
@@ -347,7 +376,7 @@ pub enum ReadCampaignError {
         column: &'static str,
     },
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 }
 
 #[derive(sqlx::FromRow)]
@@ -364,11 +393,19 @@ struct CampaignRow {
     generation: i64,
 }
 
-impl TryFrom<CampaignRow> for Campaign {
-    type Error = ReadCampaignError;
-
-    fn try_from(row: CampaignRow) -> Result<Self, Self::Error> {
-        let campaign_id = row.id;
+impl CampaignRow {
+    /// Decode `self`, or log and skip it when `kind` is one this build doesn't
+    /// know. Every other unreadable column on a known kind still fails closed.
+    fn decode(self) -> Result<Option<Campaign>, ReadCampaignError> {
+        let campaign_id = self.id;
+        let Ok(kind) = self.kind.parse() else {
+            tracing::warn!(
+                %campaign_id,
+                kind = %self.kind,
+                "skipping runtime upgrade campaign of an unknown kind"
+            );
+            return Ok(None);
+        };
         let reference = |value: String| {
             value
                 .parse()
@@ -388,21 +425,21 @@ impl TryFrom<CampaignRow> for Campaign {
                 column,
             })
         };
-        Ok(Self {
+        Ok(Some(Campaign {
             id: campaign_id,
-            from: reference(row.from_environment_ref)?,
-            to: reference(row.to_environment_ref)?,
-            kind: row.kind.parse().map_err(vocabulary)?,
-            phase: row.phase.parse().map_err(vocabulary)?,
-            max_in_flight_per_node: count(row.max_in_flight_per_node, "max_in_flight_per_node")?,
+            from: reference(self.from_environment_ref)?,
+            to: reference(self.to_environment_ref)?,
+            kind,
+            phase: self.phase.parse().map_err(vocabulary)?,
+            max_in_flight_per_node: count(self.max_in_flight_per_node, "max_in_flight_per_node")?,
             max_in_flight_per_cluster: count(
-                row.max_in_flight_per_cluster,
+                self.max_in_flight_per_cluster,
                 "max_in_flight_per_cluster",
             )?,
-            failure_budget: count(row.failure_budget, "failure_budget")?,
-            include_running: row.include_running,
-            generation: count(row.generation, "generation")?,
-        })
+            failure_budget: count(self.failure_budget, "failure_budget")?,
+            include_running: self.include_running,
+            generation: count(self.generation, "generation")?,
+        }))
     }
 }
 
@@ -418,26 +455,29 @@ struct CampaignRecordRow {
     finished_at: Option<OffsetDateTime>,
 }
 
-impl TryFrom<CampaignRecordRow> for CampaignRecord {
-    type Error = ReadCampaignError;
-
-    fn try_from(row: CampaignRecordRow) -> Result<Self, Self::Error> {
-        Ok(Self {
-            campaign: row.campaign.try_into()?,
-            reason: row.reason,
-            created_at: row.created_at,
-            created_by: row.created_by_user_id,
-            updated_at: row.updated_at,
-            updated_by: row.updated_by_user_id,
-            finished_at: row.finished_at,
-        })
+impl CampaignRecordRow {
+    fn decode(self) -> Result<Option<CampaignRecord>, ReadCampaignError> {
+        let Some(campaign) = self.campaign.decode()? else {
+            return Ok(None);
+        };
+        Ok(Some(CampaignRecord {
+            campaign,
+            reason: self.reason,
+            created_at: self.created_at,
+            created_by: self.created_by_user_id,
+            updated_at: self.updated_at,
+            updated_by: self.updated_by_user_id,
+            finished_at: self.finished_at,
+        }))
     }
 }
 
-/// Every campaign that hasn't finished (canary, rolling or paused), oldest
-/// first. One unreadable row fails the whole read. Takes no lock.
+/// Every campaign of a known kind that hasn't finished (canary, rolling or
+/// paused), oldest first. A row whose kind this build doesn't know is logged
+/// and skipped; an unreadable column on a known kind fails the whole read.
+/// Takes no lock.
 pub async fn list_unfinished(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
 ) -> Result<Vec<Campaign>, ReadCampaignError> {
     let rows = sqlx::query_as::<_, CampaignRow>(sql!(
         "SELECT id, from_environment_ref, to_environment_ref, kind, phase,
@@ -447,15 +487,19 @@ pub async fn list_unfinished(
          WHERE finished_at IS NULL
          ORDER BY created_at, id"
     ))
-    .fetch_all(executor)
-    .await?;
-    rows.into_iter().map(Campaign::try_from).collect()
+    .fetch_all(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
+    rows.into_iter()
+        .filter_map(|row| row.decode().transpose())
+        .collect()
 }
 
-/// `campaign_id` with its provenance, or `None` when there's no such
-/// campaign. Takes no lock.
+/// `campaign_id` with its provenance, or `None` when there's no such campaign
+/// or its kind is one this build doesn't know (logged and skipped). An
+/// unreadable column on a known kind fails the read. Takes no lock.
 pub async fn get_record(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     campaign_id: CampaignId,
 ) -> Result<Option<CampaignRecord>, ReadCampaignError> {
     let row = sqlx::query_as::<_, CampaignRecordRow>(sql!(
@@ -467,42 +511,70 @@ pub async fn get_record(
          WHERE id = $1"
     ))
     .bind(campaign_id)
-    .fetch_optional(executor)
-    .await?;
-    row.map(CampaignRecord::try_from).transpose()
+    .fetch_optional(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    row.decode()
 }
 
-/// Up to `limit` campaigns after `after`, in id order. Ids are UUIDv7, so
-/// that's creation order to the millisecond; campaigns created within one
-/// millisecond come in no particular order. With `unfinished_only`, only canary, rolling and
-/// paused ones. One unreadable row fails the whole read. Takes no lock.
+/// Up to `limit` campaigns of known kinds after `after`, in id order. Ids are
+/// UUIDv7, so that's creation order to the millisecond; campaigns created
+/// within one millisecond come in no particular order. With `unfinished_only`,
+/// only canary, rolling and paused ones. Rows whose kind this build doesn't
+/// know are logged and skipped without shrinking the page; an unreadable column
+/// on a known kind fails the whole read. Takes no lock.
 pub async fn list_records(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     unfinished_only: bool,
     after: Option<CampaignId>,
     limit: u32,
 ) -> Result<Vec<CampaignRecord>, ReadCampaignError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let known_kinds: Vec<&str> = CampaignKind::ALL.iter().map(|kind| kind.as_str()).collect();
+    // Stop at the `limit`th known-kind row so skipped unknown-kind rows don't
+    // shrink the page below `limit`, while still scanning and logging every
+    // unknown-kind row the page walks past.
     let rows = sqlx::query_as::<_, CampaignRecordRow>(sql!(
-        "SELECT id, from_environment_ref, to_environment_ref, kind, phase,
+        "WITH page_end AS (
+             SELECT id
+             FROM runtime_upgrade_campaigns
+             WHERE (NOT $1 OR finished_at IS NULL)
+               AND ($2::uuid IS NULL OR id > $2)
+               AND kind = ANY($4)
+             ORDER BY id
+             OFFSET $3
+             LIMIT 1
+         )
+         SELECT id, from_environment_ref, to_environment_ref, kind, phase,
                 max_in_flight_per_node, max_in_flight_per_cluster, failure_budget,
                 include_running, generation, reason, created_at, created_by_user_id,
                 updated_at, updated_by_user_id, finished_at
          FROM runtime_upgrade_campaigns
          WHERE (NOT $1 OR finished_at IS NULL)
            AND ($2::uuid IS NULL OR id > $2)
-         ORDER BY id
-         LIMIT $3"
+           AND id <= COALESCE((SELECT id FROM page_end), $5)
+         ORDER BY id"
     ))
     .bind(unfinished_only)
     .bind(after)
-    .bind(i64::from(limit))
-    .fetch_all(executor)
-    .await?;
-    rows.into_iter().map(CampaignRecord::try_from).collect()
+    .bind(i64::from(limit - 1))
+    .bind(&known_kinds)
+    .bind(uuid::Uuid::max())
+    .fetch_all(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
+    rows.into_iter()
+        .filter_map(|row| row.decode().transpose())
+        .collect()
 }
 
-/// [`unfinished_from`] after taking the transaction-scoped advisory lock
-/// that every [`create_campaign`] for `kind` and `source` takes first. Run
+/// The id of an unfinished campaign of `kind` from `source`, if any, read
+/// under the advisory lock every such [`create_campaign`] takes first. Run
 /// inside a caller's transaction, it holds off any such create until that
 /// transaction ends, so a caller that refuses to act while a campaign is
 /// unfinished (a policy block, say) can't race one into existence. The lock
@@ -511,31 +583,34 @@ pub async fn list_records(
 /// The caller's transaction must run at `READ COMMITTED`, Postgres's
 /// default. Under `REPEATABLE READ` or `SERIALIZABLE` its snapshot can
 /// predate the lock, so the read would miss a campaign a create committed
-/// while this waited.
-pub async fn unfinished_from_locked(
-    conn: &mut sqlx::PgConnection,
+/// while this waited. The caller must pass its open transaction.
+pub async fn unfinished_from_locked<C>(
+    tx: &mut C,
     kind: CampaignKind,
     source: EnvironmentReference,
-) -> Result<Option<CampaignId>, sqlx::Error> {
+) -> Result<Option<CampaignId>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
     ))
     .bind(format!("runtime_upgrade_campaigns/{kind}/{source}"))
-    .execute(&mut *conn)
+    .execute((&mut *tx).into_sqlx())
     .await?;
-    unfinished_from(&mut *conn, kind, source).await
+    unfinished_from(tx, kind, source).await
 }
 
 /// Whether an unfinished campaign of `kind` moves `source`: the one
 /// [`create_campaign`] would refuse a second for. Takes no lock, so it's a
 /// read for a caller's check, not a guarantee; [`unfinished_from_locked`]
 /// is the guarded form.
-pub async fn unfinished_from(
-    executor: impl sqlx::PgExecutor<'_>,
+pub(crate) async fn unfinished_from(
+    executor: impl Executor<'_>,
     kind: CampaignKind,
     source: EnvironmentReference,
-) -> Result<Option<CampaignId>, sqlx::Error> {
-    sqlx::query_scalar::<_, CampaignId>(sql!(
+) -> Result<Option<CampaignId>, DbError> {
+    Ok(sqlx::query_scalar::<_, CampaignId>(sql!(
         "SELECT id
          FROM runtime_upgrade_campaigns
          WHERE from_environment_ref = $1
@@ -546,8 +621,8 @@ pub async fn unfinished_from(
     ))
     .bind(source.to_string())
     .bind(kind.as_str())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// A campaign's items, counted by phase.
@@ -587,12 +662,12 @@ pub enum ItemCountsError {
     #[error(transparent)]
     UnknownValue(#[from] UnknownValue),
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 }
 
 /// `campaign_id`'s items counted by phase. Takes no lock.
 pub async fn item_counts(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     campaign_id: CampaignId,
 ) -> Result<ItemCounts, ItemCountsError> {
     let rows = sqlx::query_as::<_, (String, i64)>(sql!(
@@ -602,8 +677,9 @@ pub async fn item_counts(
          GROUP BY phase"
     ))
     .bind(campaign_id)
-    .fetch_all(executor)
-    .await?;
+    .fetch_all(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     let mut counts = ItemCounts::default();
     for (phase, count) in rows {
         // count(*) is never negative.
@@ -616,7 +692,7 @@ pub async fn item_counts(
 /// The items of each of `campaign_ids` counted by phase, in one read; a
 /// campaign with no items gets zero counts. Takes no lock.
 pub async fn item_counts_of(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl Executor<'_>,
     campaign_ids: &[CampaignId],
 ) -> Result<std::collections::HashMap<CampaignId, ItemCounts>, ItemCountsError> {
     let rows = sqlx::query_as::<_, (CampaignId, String, i64)>(sql!(
@@ -626,8 +702,9 @@ pub async fn item_counts_of(
          GROUP BY campaign_id, phase"
     ))
     .bind(campaign_ids)
-    .fetch_all(executor)
-    .await?;
+    .fetch_all(executor.into_sqlx())
+    .await
+    .map_err(DbError::from)?;
     let mut counts: std::collections::HashMap<CampaignId, ItemCounts> = campaign_ids
         .iter()
         .map(|campaign_id| (*campaign_id, ItemCounts::default()))

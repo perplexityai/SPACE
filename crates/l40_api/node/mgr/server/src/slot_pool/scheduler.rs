@@ -217,12 +217,7 @@ pub(super) fn recover_abandoned_work(
             }
             continue;
         }
-        let changed = conn.execute(
-            "UPDATE network_slots SET state = 'missing', health = 'degraded',
-             last_error = 'abandoned setup completion; revalidating host resources'
-             WHERE slot_id = ?1 AND generation = ?2 AND state = 'creating' AND sandbox_id IS NULL",
-            params![slot, SqliteU64(generation)],
-        )?;
+        let changed = slots::worker::revalidate_abandoned_setup(&conn, slot, generation)?;
         if changed != 0 {
             pool.startup_recovery_pending.store(true, Ordering::Relaxed);
             pool.mark_node_status_dirty();

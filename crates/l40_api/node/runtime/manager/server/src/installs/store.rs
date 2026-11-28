@@ -6,18 +6,17 @@
 use std::path::Path;
 
 use pplx_space_node_runtime_manager_store::JobResultError;
-use pplx_space_node_runtime_manager_store::database::{self, SqliteError};
+use pplx_space_node_runtime_manager_store::database::{self, Connection, SqliteError};
 pub(crate) use pplx_space_node_runtime_manager_store::{
-    JobOutcome, JobPhase, JobResult, get_job_result, put_job_result,
+    JobOutcome, JobPhase, JobResult, delete_orphaned_job_results, get_job_result, put_job_result,
 };
-use rusqlite::Connection;
 
 pub(crate) const DATABASE_FILE: &str = "runtime-manager.db";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("runtime-manager database")]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(#[from] database::Error),
     #[error("runtime-manager database migration")]
     Migrate(#[source] SqliteError),
     #[error("cannot open the runtime-manager database")]
@@ -43,12 +42,6 @@ pub(crate) async fn open(state_dir: &Path) -> Result<Connection, StoreError> {
         .await
         .map_err(StoreError::Migrate)?;
     database::open(&path).map_err(StoreError::Open)
-}
-
-/// Drop results once their terminal jobs have expired. A later request is
-/// idempotent at node-manager; it needs no provenance from an earlier job.
-pub(crate) fn delete_orphaned_job_results(conn: &Connection) -> Result<usize, StoreError> {
-    Ok(pplx_space_node_runtime_manager_store::delete_orphaned_job_results(conn)?)
 }
 
 #[cfg(test)]

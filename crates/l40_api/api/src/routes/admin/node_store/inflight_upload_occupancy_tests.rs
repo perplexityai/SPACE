@@ -5,11 +5,10 @@ use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_sandbox_residency::ResidencyEvidence;
 use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
-use std::num::NonZeroUsize;
 use uuid::Uuid;
 
-use super::{AdminNodeStore, list_pinned_local_only_sandboxes};
-use pplx_space_sandbox_store::admin_occupancy::terminate_occupancy;
+use super::AdminNodeStore;
+use pplx_space_sandbox_store::admin_occupancy::{pinned_local_only_sandboxes, terminate_occupancy};
 
 use pplx_space_test_env::TestResult;
 
@@ -253,8 +252,7 @@ async fn force_upload_enumeration_excludes_inflight_uploads() -> TestResult {
     .execute(pool)
     .await?;
 
-    let listed =
-        list_pinned_local_only_sandboxes(pool, node, NonZeroUsize::new(100).unwrap()).await?;
+    let listed = pinned_local_only_sandboxes(pool, node).await?;
     assert_eq!(
         listed,
         vec![needs_upload],
@@ -438,8 +436,7 @@ async fn inflight_upload_from_the_target_node_counts_once_not_twice() -> TestRes
     // The enumeration operators read to decide what to do about it excludes
     // in-flight uploads, so the sandbox is counted but not offered for a
     // force-upload — those are different questions about the same row.
-    let pinned =
-        list_pinned_local_only_sandboxes(pool, node, NonZeroUsize::new(10).unwrap()).await?;
+    let pinned = pinned_local_only_sandboxes(pool, node).await?;
     assert!(
         !pinned.contains(&SandboxId::from_uuid(sandbox)),
         "an upload already in flight is not a force-upload candidate"

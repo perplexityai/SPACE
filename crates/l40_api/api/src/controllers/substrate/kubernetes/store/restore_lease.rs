@@ -210,71 +210,36 @@ impl K8sStore {
         // Lock first, in its own statement: a later statement in this
         // transaction then reads the snapshots and executions as of after the
         // lock, so a writer that committed while this waited is seen.
-        let locked: Option<bool> = sqlx::query_scalar(sql!(
-            "SELECT TRUE
-               FROM sandboxes
-              WHERE id = $1
-                AND lifecycle = 'restoring'
-                AND ($2::uuid IS NULL OR restore_lease_token = $2)
-                FOR UPDATE"
-        ))
-        .bind(sandbox_id)
-        .bind(restore_lease_token)
-        .fetch_optional(&mut *tx)
+        let locked = pplx_space_sandbox_store::restore_lease::lock_restore_claim(
+            &mut *tx,
+            sandbox_id,
+            restore_lease_token,
+        )
         .await
         .db_context("failed to lock sandbox for restore revert")?;
-        if locked.is_none() {
+        if !locked {
             tx.commit()
                 .await
                 .db_context("failed to commit restore revert transaction")?;
             return Ok(RestoreClaimRevert::NotReverted);
         }
 
-        let proof = restore_retry_suspended_revert_snapshot_exists("s");
-        // Under the row lock no other claim can replace the execution, and
-        // `lifecycle_changed_at` still reads this claim's `restoring`
-        // transition, so an active execution created since, carrying this
-        // claim's attempt (or, with no attempt, under this claim's lease
-        // token), is the one it created.
-        let query = format!(
-            "SELECT claimed.generation,
-                    claimed.pod_name,
-                    EXISTS (
-                        SELECT 1
-                          FROM sandbox_k8s_executions e
-                         WHERE e.sandbox_id = s.id
-                           AND e.active
-                    ),
-                    {proof}
-               FROM sandboxes s
-               LEFT JOIN LATERAL (
-                   SELECT e.generation, e.pod_name
-                     FROM sandbox_k8s_executions e
-                    WHERE e.sandbox_id = s.id
-                      AND e.active
-                      AND e.created_at >= s.lifecycle_changed_at
-                      AND CASE
-                              WHEN $3::uuid IS NOT NULL
-                                  THEN e.activation_attempt_id = $3
-                                       AND e.generation = $4
-                              ELSE $2::uuid IS NOT NULL
-                          END
-               ) claimed ON TRUE
-              WHERE s.id = $1"
-        );
-        let (claimed_generation, claimed_pod, any_active, source_proven): (
-            Option<i64>,
-            Option<String>,
-            bool,
-            bool,
-        ) = sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(sandbox_id)
-            .bind(restore_lease_token)
-            .bind(activation_attempt.map(|(attempt, _)| attempt))
-            .bind(activation_attempt.map(|(_, generation)| generation))
-            .fetch_one(&mut *tx)
-            .await
-            .db_context("failed to read restore revert evidence")?;
+        // Under the row lock no other claim can replace the execution, so the
+        // claimed execution the evidence names is the one this claim created
+        // (see `restore_revert_evidence`).
+        let pplx_space_sandbox_store::restore_lease::RestoreRevertEvidence {
+            claimed_generation,
+            claimed_pod_name: claimed_pod,
+            any_active_execution: any_active,
+            source_proven,
+        } = pplx_space_sandbox_store::restore_lease::restore_revert_evidence(
+            &mut *tx,
+            sandbox_id,
+            restore_lease_token,
+            activation_attempt,
+        )
+        .await
+        .db_context("failed to read restore revert evidence")?;
 
         let retire = source_proven && retirement.is_enabled();
         let outcome = match (claimed_generation.zip(claimed_pod), retire) {
@@ -303,7 +268,7 @@ impl K8sStore {
                 // pre-restore source, and both the suspended selector and
                 // `durably_restorable` take a markerless snapshot only when
                 // it is newer than the last placement.
-                restore_lease::revert_restore_claim_retiring_placement(&mut tx, sandbox_id)
+                restore_lease::revert_restore_claim_retiring_placement(&mut *tx, sandbox_id)
                     .await
                     .db_context("failed to revert sandbox lifecycle to suspended")?;
                 RestoreClaimRevert::ExecutionRetired { pod_name }
@@ -313,13 +278,13 @@ impl K8sStore {
                 // clear as above. An execution the claim reused rather than
                 // created keeps the clock, since nothing proves its pod
                 // holds no state of its own.
-                restore_lease::revert_restore_claim_clearing_placement_clock(&mut tx, sandbox_id)
+                restore_lease::revert_restore_claim_clearing_placement_clock(&mut *tx, sandbox_id)
                     .await
                     .db_context("failed to revert sandbox lifecycle to suspended")?;
                 RestoreClaimRevert::LifecycleOnly
             }
             (claimed, _) => {
-                restore_lease::revert_restore_claim_lifecycle(&mut tx, sandbox_id)
+                restore_lease::revert_restore_claim_lifecycle(&mut *tx, sandbox_id)
                     .await
                     .db_context("failed to revert sandbox lifecycle to suspended")?;
                 if claimed.is_some() || any_active {

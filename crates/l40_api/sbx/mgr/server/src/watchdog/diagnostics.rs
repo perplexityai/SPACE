@@ -654,7 +654,7 @@ impl HostReads {
         }
     }
 
-    async fn blocking<T: Send + 'static>(
+    pub(super) async fn blocking<T: Send + 'static>(
         &self,
         read: impl FnOnce() -> T + Send + 'static,
     ) -> Option<T> {
@@ -669,16 +669,9 @@ impl HostReads {
 
     /// A small cgroup or proc file, up to [`SMALL_FILE_MAX_BYTES`].
     async fn small(&self, path: PathBuf) -> std::io::Result<String> {
-        self.blocking(move || {
-            use std::io::Read as _;
-            let mut content = String::new();
-            std::fs::File::open(path)?
-                .take(SMALL_FILE_MAX_BYTES)
-                .read_to_string(&mut content)?;
-            Ok(content)
-        })
-        .await
-        .unwrap_or_else(|| Err(std::io::Error::other("the read did not complete")))
+        self.blocking(move || read_small(&path))
+            .await
+            .unwrap_or_else(|| Err(std::io::Error::other("the read did not complete")))
     }
 
     /// The newest lines of a log file within `window`. `None` when the file
@@ -701,6 +694,15 @@ impl HostReads {
         .await
         .flatten()
     }
+}
+
+pub(super) fn read_small(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut content = String::new();
+    std::fs::File::open(path)?
+        .take(SMALL_FILE_MAX_BYTES)
+        .read_to_string(&mut content)?;
+    Ok(content)
 }
 
 /// How far collection got; a partial report names the step its deadline
@@ -1041,16 +1043,12 @@ pub(super) fn host_reads() -> HostReads {
 }
 
 /// Where the collectors find the VMs' jailer cgroups, chosen once when they
-/// start and logged: [`SANDBOX_CGROUP_PARENT`] when the deployment mounts it,
+/// start: [`SANDBOX_CGROUP_PARENT`] when the deployment mounts it,
 /// otherwise the host path.
 pub(super) async fn sandbox_cgroup_parent() -> Arc<Path> {
-    let parent = choose_cgroup_parent(Path::new(SANDBOX_CGROUP_PARENT)).await;
-    tracing::info!(
-        target: super::LOG_TARGET,
-        cgroup_parent = %parent.display(),
-        "guest-health evidence samples VM jailer cgroups under this parent"
-    );
-    parent.into()
+    choose_cgroup_parent(Path::new(SANDBOX_CGROUP_PARENT))
+        .await
+        .into()
 }
 
 /// `mounted` when it is a directory, as in a container whose deployment
@@ -1078,7 +1076,7 @@ const GUEST_CONSOLE_TAIL: TailWindow = TailWindow {
 
 /// The value of a `key value` line, as in `cpu.stat`, `memory.stat`, and
 /// `memory.events`.
-fn keyed_u64(content: &str, key: &str) -> Option<u64> {
+pub(super) fn keyed_u64(content: &str, key: &str) -> Option<u64> {
     content.lines().find_map(|line| {
         let (name, value) = line.split_once(' ')?;
         (name == key).then(|| value.trim().parse().ok()).flatten()

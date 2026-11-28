@@ -147,10 +147,9 @@ impl From<TemplateVisibility> for String {
     }
 }
 
-// sqlx codecs: `pplx-space-api` decodes `templates.visibility` into this enum
-// (`CompatTemplateRow` / `TemplateVisibilityRow` in its `routes/admin/`, and
-// its node-group store, `node_group_placement/store.rs`), so the type binds
-// directly against the TEXT column.
+// sqlx codecs: `pplx-space-template-store` decodes `templates.visibility`
+// into this enum (for example `templates::VisibilityOwner`), so the type
+// binds directly against the TEXT column.
 #[cfg(feature = "sqlx")]
 impl pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres> for TemplateVisibility {
     fn type_info() -> pplx_space_sql_codec::postgres::PgTypeInfo {

@@ -1,10 +1,6 @@
 //! Production [`ReaperSink`] backed by Postgres.
 
-use pplx_space_accounts::NodeId;
 use pplx_space_durations::PositiveDuration;
-use pplx_space_sandbox_model::SandboxId;
-use pplx_space_snapshot_model::SnapshotId;
-use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
 use super::{REAP_FAILURE_REASON, ReapedSnapshot, ReaperSink};
@@ -58,35 +54,26 @@ impl ReaperSink for SnapshotDbStore {
         &self,
         min_age: PositiveDuration,
     ) -> Result<Vec<ReapedSnapshot>, sqlx::Error> {
-        // `make_interval(secs => $1::BIGINT)` needs an i64 bind. Saturate
-        // rather than wrap: any value above i64::MAX (~2.9e11 years) means
-        // "never reap" in human terms, which matches what an operator typing
-        // a huge minimum age was expressing.
+        // The verb saturates rather than wraps a value above i64::MAX
+        // seconds (~2.9e11 years): "never reap" in human terms, which matches
+        // what an operator typing a huge minimum age was expressing.
         let secs = min_age.get().as_secs();
         debug_assert!(
             secs <= i64::MAX as u64,
             "min_age {secs}s exceeds i64::MAX; will saturate to i64::MAX (effectively disabling the reaper)"
         );
-        let min_age_secs_i64 = i64::try_from(secs).unwrap_or(i64::MAX);
-        let rows: Vec<(SnapshotId, SandboxId, Option<NodeId>)> = sqlx::query_as(sql!(
-            "UPDATE snapshots
-                SET state = 'failed',
-                    failure_reason = COALESCE(failure_reason, $2)
-              WHERE state = 'creating'
-                AND type = 'full'
-                AND COALESCE(last_attempt_at, timestamp) < NOW() - make_interval(secs => $1::BIGINT)
-              RETURNING id, sandbox_id, source_node_id"
-        ))
-        .bind(min_age_secs_i64)
-        .bind(REAP_FAILURE_REASON)
-        .fetch_all(&self.pool)
+        let rows = pplx_space_snapshot_store::upload::fail_stuck_full_uploads(
+            &self.pool,
+            min_age.get(),
+            REAP_FAILURE_REASON,
+        )
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(snapshot_id, sandbox_id, source_node_id)| ReapedSnapshot {
-                snapshot_id,
-                sandbox_id,
-                source_node_id,
+            .map(|row| ReapedSnapshot {
+                snapshot_id: row.snapshot_id,
+                sandbox_id: row.sandbox_id,
+                source_node_id: row.source_node_id,
             })
             .collect())
     }

@@ -19,6 +19,12 @@ pub(crate) enum ReferenceError {
     Database(#[from] sqlx::Error),
 }
 
+impl From<pplx_space_postgres_pool::DbError> for ReferenceError {
+    fn from(error: pplx_space_postgres_pool::DbError) -> Self {
+        Self::from(sqlx::Error::from(error))
+    }
+}
+
 pub(crate) fn definition(
     request: &wire::RegisterCredentialReferenceRequest,
 ) -> Result<ValidatedCredentialReference, ReferenceError> {
@@ -40,7 +46,7 @@ pub(crate) async fn register(
     let mut tx = pool.begin().await?;
     if let Some(reply) = idempotency::get::<wire::CredentialReference>(&mut *tx, &scope).await? {
         return if reply.fingerprint == fingerprint.as_str() {
-            Ok(reply.response.0)
+            Ok(reply.response)
         } else {
             Err(ReferenceError::IdempotencyConflict)
         };
@@ -62,7 +68,7 @@ pub(crate) async fn register(
     if reply.fingerprint != fingerprint.as_str() {
         return Err(ReferenceError::IdempotencyConflict);
     }
-    Ok(reply.response.0)
+    Ok(reply.response)
 }
 
 pub(crate) async fn retire(

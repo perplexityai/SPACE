@@ -30,10 +30,7 @@ impl NetworkPool {
         expected: SandboxActivationAttemptId,
     ) -> Result<(), SlotStoreError> {
         let db = self.db.lock().map_err(|_| SlotStoreError::LockPoisoned)?;
-        db.execute(
-            "DELETE FROM sandbox_executions WHERE sandbox_id = ?1 AND execution_id = ?2",
-            params![sandbox_id, expected.to_string()],
-        )?;
+        executions::retire_execution(&db, sandbox_id, expected)?;
         Ok(())
     }
 }

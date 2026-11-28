@@ -90,6 +90,14 @@ impl ClusterApiService {
                 Some((name, content_hash))
             })
             .collect::<Vec<_>>();
+        // The templates listed with a network-policy generation, which
+        // `publish_template_states` records: the prune keeps their rows.
+        let policy_template_names = request
+            .templates
+            .iter()
+            .filter(|template| template.present && template.network_policy_generation != 0)
+            .filter_map(|template| optional_trimmed(Some(&template.template)))
+            .collect::<Vec<_>>();
 
         let mut tx = self
             .pool
@@ -106,11 +114,25 @@ impl ClusterApiService {
         .await?;
         let templates_accepted =
             publish_template_states(&mut tx, origin.id, origin.role, &request.templates).await?;
-        let sandbox_publication = crate::published_state::publish_sandbox_states_with_retirement(
+        let census_prune_ids = if sandbox_inventory_prunable {
+            pplx_space_sandbox_store::ingest::census_prune_candidates(
+                &mut *tx,
+                origin.id,
+                &present_sandbox_ids,
+            )
+            .await
+            .map_err(|error| {
+                Status::internal(format!("select sandbox census prune candidates: {error}"))
+            })?
+        } else {
+            Vec::new()
+        };
+        let sandbox_publication = crate::published_state::publish_sandbox_states_with_census(
             &mut tx,
             origin.id,
             &request.sandboxes,
             self.abandoned_restore_retirement,
+            &census_prune_ids,
         )
         .await?;
         let execution_observation =
@@ -121,13 +143,20 @@ impl ClusterApiService {
         // transaction, so they cannot come to disagree — which is what lets the
         // drain gates read the timestamp as "this node's census is current".
         let inventory_prune = if sandbox_inventory_prunable {
-            prune_absent_node_sandboxes(&mut tx, origin.id, &present_sandbox_ids).await?;
+            prune_absent_node_sandboxes(&mut tx, origin.id, &census_prune_ids).await?;
             SandboxInventoryPrune::Applied
         } else {
             SandboxInventoryPrune::Skipped
         };
         if template_inventory_complete {
-            prune_absent_node_templates(&mut tx, origin.id, &present_template_keys).await?;
+            pplx_space_node_template_inventory_store::prune_absent_templates(
+                &mut *tx,
+                origin.id,
+                &present_template_keys,
+                &policy_template_names,
+            )
+            .await
+            .map_err(|err| Status::internal(format!("prune absent published templates: {err}")))?;
         }
         // Mirror the node's pending-backup set before the status upsert that
         // stamps its freshness gate, so the gate is only ever written after

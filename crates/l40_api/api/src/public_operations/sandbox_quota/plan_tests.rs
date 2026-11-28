@@ -24,16 +24,16 @@
 //! bounds the rows every plan node handles, under both plan modes, by a few
 //! passes over those inputs, and [`seed`] sizes the fixture so each of the
 //! four costs above exceeds that bound on its own. It reads rows off the
-//! plan through [`super::super::plan_explain`].
+//! plan through [`pplx_space_db_test_fixtures::plan`].
 
 use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_db_test_fixtures::plan::{PLAN_CACHE_MODES, PlanNode, explain_prepared};
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
-use super::super::plan_explain::{PLAN_CACHE_MODES, PlanNode, explain_prepared};
-use pplx_space_public_operation_store::quota::SANDBOXES_HELD;
+use pplx_space_public_operation_store::test_support::SANDBOXES_HELD;
 
 /// How many plan nodes may handle each input row. The count's linear plans
 /// handle an org row in its scan (the bitmap index entry and the heap row),
@@ -118,7 +118,7 @@ async fn the_count_reads_only_the_orgs_rows_and_in_flight_operations() -> TestRe
             handled <= bound as f64,
             "the count must handle no more rows than {PASSES} passes over the org's {} rows \
              and its {} in-flight operations ({bound}) ({plan_cache_mode}); it handled \
-             {handled}. Rows handled by node, children included:{outline}",
+             {handled}. Rows handled by each node, per loop:{outline}",
             fixture.org_rows,
             fixture.org_in_flight,
         );

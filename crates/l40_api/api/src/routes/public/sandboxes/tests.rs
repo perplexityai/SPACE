@@ -2,9 +2,16 @@ use pplx_space_accounts::NodeId;
 use pplx_space_accounts::{OrgId, UserId};
 use pplx_space_auto_lifecycle::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
-    AutoLifecycleStage,
+    AutoLifecyclePolicy, AutoLifecycleStage,
 };
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sql_locator::sql;
+use pplx_space_state_reconciliation::{
+    FACET_SANDBOX_DESIRED_STATE, SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY,
+    SANDBOX_FAILURE_EPISODE_KEY, SANDBOX_FAILURE_EXECUTION_GENERATION_KEY,
+    SANDBOX_FAILURE_POD_UID_KEY,
+};
+use sqlx::types::Json as SqlJson;
 use uuid::Uuid;
 
 use super::*;
@@ -754,7 +761,7 @@ fn sandbox_idle_configuration_requires_one_access_idle_delete_or_suspend_stage()
 
     for (policy, expected_timeout, expected_action) in cases {
         let mut row = public_sandbox_row(OffsetDateTime::UNIX_EPOCH, SandboxId::new());
-        row.auto_lifecycle = SqlJson(policy.clone());
+        row.auto_lifecycle = policy.clone();
         let sandbox = public_sandbox_from_row(row).unwrap();
         assert_eq!(sandbox.idle_timeout, expected_timeout, "{policy:?}");
         assert_eq!(sandbox.idle_action, expected_action, "{policy:?}");
@@ -1799,9 +1806,9 @@ fn public_sandbox_row(created_at: OffsetDateTime, id: SandboxId) -> PublicSandbo
         vcpu: Some(2),
         memory_mib: Some(1024),
         disk_mib: Some(4096),
-        metadata: SqlJson(Default::default()),
+        metadata: Default::default(),
         next_auto_event_at: None,
-        auto_lifecycle: SqlJson(AutoLifecyclePolicy::disabled()),
+        auto_lifecycle: AutoLifecyclePolicy::disabled(),
         created_at,
         updated_at: created_at,
         has_next: false,
@@ -2449,7 +2456,7 @@ async fn sandbox_list_query_bounds_the_bytes_it_returns() -> TestDbResult<()> {
         .await?;
         let metadata_bytes = rows
             .iter()
-            .map(|row| serde_json::to_vec(&row.metadata.0).unwrap().len())
+            .map(|row| serde_json::to_vec(&row.metadata).unwrap().len())
             .sum::<usize>();
         if rows.len() > 1 {
             assert!(metadata_bytes <= BUDGET as usize, "{metadata_bytes}");

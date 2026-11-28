@@ -94,6 +94,11 @@ impl<'a> State<'a> {
         }
         let mut owners: Declarers<'a> = BTreeMap::new();
         for member in graph.members.values() {
+            // A coordinator owns no tables: `layers.coordinators` reports its
+            // declaration, which leaves an unowned table unowned.
+            if member.is_coordinator() {
+                continue;
+            }
             let Some(declarations) = &member.krate.state else {
                 continue;
             };
@@ -341,6 +346,11 @@ fn declarations(mode: Mode, graph: &Graph<'_>, state: &State<'_>) -> Vec<Finding
     };
     let mut findings = Vec::new();
     for member in graph.members.values() {
+        // A coordinator owns no tables; `layers.coordinators` reports its
+        // declaration.
+        if member.is_coordinator() {
+            continue;
+        }
         let is_store = member.layer == Some(Layer::Storage);
         let Some(declarations) = &member.krate.state else {
             if is_store {
@@ -472,27 +482,37 @@ fn store_write_findings(mode: Mode, state: &State<'_>, writes: &[StoreWrite<'_>]
         } else {
             declared
         };
-        if candidates.iter().any(|key| state.may_write(key, name)) {
+        if !write.member.is_coordinator() && candidates.iter().any(|key| state.may_write(key, name))
+        {
             continue;
         }
         let Some(key) = candidates.first() else {
             continue;
         };
         let owners = list(&state.owner_names(key), 5);
-        let whose = if undeclared {
+        let detail = if write.member.is_coordinator() {
+            // A coordinator holds no SQL: no declaration or grant lets it
+            // write a store's table.
             format!(
-                "a table {owners} owns in a database {name} doesn't declare, and {name} is not \
-                 its co-writer"
+                ": {name} writes {} here ({} {}), but {owners} owns that table, and a coordinator \
+                 holds no SQL. Move the statement into {owners} as a verb, and call it from \
+                 {name}'s transaction. See {GUIDE}.",
+                qualified(key),
+                write.head,
+                key.1,
             )
         } else {
-            format!("but {owners} owns that table, and {name} is neither its owner nor a co-writer")
-        };
-        findings.push(Finding {
-            rule: RULE,
-            instance: Some("state".to_owned()),
-            behaviour: "writes",
-            path: write.path.to_owned(),
-            detail: format!(
+            let whose = if undeclared {
+                format!(
+                    "a table {owners} owns in a database {name} doesn't declare, and {name} is \
+                     not its co-writer"
+                )
+            } else {
+                format!(
+                    "but {owners} owns that table, and {name} is neither its owner nor a co-writer"
+                )
+            };
+            format!(
                 ": {name} writes {} here ({} {}), {whose}. Move the statement into {owners} and \
                  call it from there; or, for an approved co-writer, add \"{name}\" to {} in \
                  [rules.{RULE}.state.co_writers.{}] in {CONFIG_FILE}, a policy change that \
@@ -502,7 +522,14 @@ fn store_write_findings(mode: Mode, state: &State<'_>, writes: &[StoreWrite<'_>]
                 key.1,
                 key.1,
                 key.0,
-            ),
+            )
+        };
+        findings.push(Finding {
+            rule: RULE,
+            instance: Some("state".to_owned()),
+            behaviour: "writes",
+            path: write.path.to_owned(),
+            detail,
             mode,
             location: Location {
                 path: write.path.to_owned(),
@@ -584,6 +611,9 @@ fn stale_grants(
             } else {
                 match graph.member(store) {
                     None => "no workspace member has this name".to_owned(),
+                    Some(member) if member.is_coordinator() => {
+                        "it is a coordinator, which owns and writes no tables".to_owned()
+                    }
                     Some(member) if member.layer != Some(Layer::Storage) => {
                         let layer = member
                             .layer

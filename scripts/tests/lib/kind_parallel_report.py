@@ -274,6 +274,23 @@ def timeline(out: Path, start: int, timings: list[dict], benches: list[str]) -> 
     return "\n".join(lines) + "\n"
 
 
+def rust_image_origin(image: dict) -> str:
+    """Where the run's Rust image came from, for the summary."""
+
+    if not image.get("image_id"):
+        return "no image recorded"
+    if not image["reused_from_main"]:
+        return "built on the host"
+    how = (
+        "pulled by digest through a registry mirror"
+        if image.get("reused_from") == "mirror"
+        else "pulled"
+    )
+    return f"main's image for the same input key, {how}" + (
+        f": {image['reused_image']}" if image.get("reused_image") else ""
+    )
+
+
 def summarize(out: Path) -> int:
     start = int((out / "started").read_text())
     count = int((out / "bench-count").read_text())
@@ -394,9 +411,19 @@ def summarize(out: Path) -> int:
     source["changed_during_run"] = source_changes
     manifest = read_json(out / "host" / "rust" / "manifest.json") or {}
     reuse = out / "host" / "rust-reuse.out"
+    reuse_outputs = dict(
+        line.partition("=")[::2]
+        for line in (reuse.read_text().splitlines() if reuse.exists() else [])
+    )
+    reused = reuse_outputs.get("reused") == "true"
     source["rust_image"] = {
         key: manifest.get(key) for key in ("image_id", "built_from", "input_key")
-    } | {"reused_from_main": reuse.exists() and "reused=true" in reuse.read_text()}
+    } | {
+        "reused_from_main": reused,
+        # mirror (by digest through SPACE_KIND_REGISTRY_MIRROR) or registry.
+        "reused_from": reuse_outputs.get("reused_from") if reused else None,
+        "reused_image": reuse_outputs.get("reused_image") if reused else None,
+    }
 
     host_rows = [row for row in timings if row["owner"] in ("host", "run")]
     ended = max((row["end"] for row in timings), default=start)
@@ -434,8 +461,7 @@ def summarize(out: Path) -> int:
         f"- lane: substrate {source.get('substrate')}, Rust build {source.get('rust_build')},"
         f" tiers {source.get('tiers')}",
         f"- Rust image: {source['rust_image'].get('image_id')} built from"
-        f" {source['rust_image'].get('built_from')}"
-        + (" (main's image for the same input key)" if source["rust_image"]["reused_from_main"] else ""),
+        f" {source['rust_image'].get('built_from')} ({rust_image_origin(source['rust_image'])})",
     ]
     if source_changes:
         md.append(

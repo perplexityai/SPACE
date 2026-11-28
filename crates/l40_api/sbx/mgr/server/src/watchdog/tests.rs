@@ -150,6 +150,7 @@ fn restart_test_info(sandbox_id: &str) -> SidecarInfo {
         guest_image: Default::default(),
         node_execution_id: None,
         sandbox_id: sandbox_id.to_string(),
+        created_at: None,
         uid: Some(20_001),
         runtime_pid: Some(30_001),
         spaced_host_pid: Some(30_002),
@@ -297,6 +298,7 @@ async fn clear_netgtw_probe_state_drops_cached_process_observations() {
             guest_image: Default::default(),
             node_execution_id: None,
             sandbox_id: "0199c1e0-0000-7000-8000-000000000001".to_string(),
+            created_at: None,
             uid: Some(20001),
             runtime_pid: None,
             spaced_host_pid: None,
@@ -530,6 +532,21 @@ async fn recover_all_monitors_running_vm_without_consulting_cache_dir() {
         watchdog.get_health(&sandbox_id).await.is_some(),
         "running VM with a DB row must be re-registered for monitoring \
          regardless of cache-dir readability"
+    );
+    let persisted_created_at = {
+        let db = watchdog.db.lock().expect("database lock");
+        crate::db::read::sandbox(&db, &sandbox_id)
+            .expect("read sandbox row")
+            .expect("sandbox row")
+            .created_at
+    };
+    let info = watchdog
+        .sidecar_info_for_test(&sandbox_id)
+        .await
+        .expect("recovered VM");
+    assert_eq!(
+        info.created_at.expect("recovered creation time").get(),
+        persisted_created_at.parse::<i64>().expect("epoch seconds"),
     );
 }
 

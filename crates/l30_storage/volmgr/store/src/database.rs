@@ -1,12 +1,14 @@
 //! Migrating and opening volume-manager's database. volume-manager runs
 //! [`migrate`] once at startup after taking its service mutex, and its
-//! service then takes its one connection from [`open`].
+//! service then takes its one connection from [`open`] and shares it through
+//! a [`SharedConnection`](crate::SharedConnection).
 
 use std::path::Path;
 
 pub use pplx_space_sqlite::SqliteError;
-use rusqlite::Connection;
 use sqlx::migrate::Migrator;
+
+use crate::{Connection, Result};
 
 static MIGRATOR: Migrator = sqlx::migrate!("../../../../db/volume-manager");
 /// The shared schema the database also carries, `db/common`.
@@ -28,6 +30,6 @@ pub async fn migrate(path: &Path) -> Result<(), SqliteError> {
 
 /// Opens the database at `path` with `rusqlite::Connection::open` alone:
 /// rusqlite's default busy timeout and no PRAGMAs.
-pub fn open(path: &Path) -> rusqlite::Result<Connection> {
-    Connection::open(path)
+pub fn open(path: &Path) -> Result<Connection> {
+    Ok(Connection(rusqlite::Connection::open(path)?))
 }

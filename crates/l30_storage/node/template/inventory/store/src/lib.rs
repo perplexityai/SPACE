@@ -3,13 +3,17 @@
 //! control-plane database.
 //!
 //! Nodes publish their inventory through internal-api, which upserts it and
-//! its components and deletes the templates a node reports absent here. The
-//! full-inventory prune, internal-api's `prune_absent_node_templates`, still
-//! deletes rows directly, in one statement with the `node_facet_observed_status`
-//! rows of the templates it removes. The admin node-template routes delete one
-//! node's cached copies and list them; template admin and public routes, and
-//! the release lookups, read what nodes hold. Each verb takes any executor, so
-//! a caller's guard keeps its transaction and locks.
+//! its components and deletes the templates a node reports absent here. A
+//! complete publication's prune ([`prune_absent_templates`]) also deletes, in
+//! the same statement, the node's `network-policy` rows in
+//! `node_facet_observed_status` for the templates whose builds it deletes and
+//! which the publication doesn't list with a network-policy generation, a
+//! table this store writes under a temporary co-writer grant. The admin
+//! node-template routes delete one node's cached copies and list them;
+//! template admin and public routes, and the release lookups, read what
+//! nodes hold. Each verb takes any executor, so a caller's guard keeps its
+//! transaction and locks. The reads that also ask whether a Direct node's
+//! registry row is live are in [`direct`].
 //!
 //! Rows whose `snapshots` JSON a caller decodes are generic over that payload
 //! type: the shape belongs to the caller's response, and decoding it in the
@@ -17,16 +21,17 @@
 
 use pplx_space_accounts::{NodeId, OrgId};
 use pplx_space_node_model::NodeGroupId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use serde::de::DeserializeOwned;
-use sqlx::types::Json;
-use sqlx::{FromRow, PgExecutor};
+use sqlx::FromRow;
 
+pub mod direct;
 mod publish;
 mod template;
 
 pub use publish::{
-    AcceptedTemplateBuild, delete_unpublished_template_components,
+    AcceptedTemplateBuild, delete_unpublished_template_components, prune_absent_templates,
     upsert_published_template_components, upsert_published_templates,
 };
 pub use template::{
@@ -46,18 +51,19 @@ pub struct NodeTemplateBuild<Snapshots> {
     pub disk_size_mb: Option<i32>,
     pub runtime: Option<String>,
     pub arch: Option<String>,
-    pub snapshots: Json<Snapshots>,
+    #[sqlx(json)]
+    pub snapshots: Snapshots,
 }
 
 /// The builds `node_id` caches, by template name then content hash.
 pub async fn node_template_builds<Snapshots>(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
-) -> Result<Vec<NodeTemplateBuild<Snapshots>>, sqlx::Error>
+) -> Result<Vec<NodeTemplateBuild<Snapshots>>, DbError>
 where
     Snapshots: DeserializeOwned + Send + Unpin + 'static,
 {
-    sqlx::query_as::<_, NodeTemplateBuild<Snapshots>>(sql!(
+    Ok(sqlx::query_as::<_, NodeTemplateBuild<Snapshots>>(sql!(
         "SELECT template_name AS name,
                 NULLIF(content_hash, '') AS content_hash,
                 built_at AS build_date,
@@ -72,17 +78,17 @@ where
          ORDER BY template_name ASC, content_hash ASC"
     ))
     .bind(node_id)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// How many builds of `template` `node_id` caches.
 pub async fn node_template_build_count(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     template: &str,
-) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<i64, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT COUNT(*)::BIGINT
          FROM node_template_inventory
          WHERE node_id = $1
@@ -90,17 +96,17 @@ pub async fn node_template_build_count(
     ))
     .bind(node_id)
     .bind(template)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Forget `node_id`'s cached build `content_hash` of `template`.
 pub async fn delete_node_template_build(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     template: &str,
     content_hash: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "DELETE FROM node_template_inventory
          WHERE node_id = $1
@@ -110,17 +116,17 @@ pub async fn delete_node_template_build(
     .bind(node_id)
     .bind(template)
     .bind(content_hash)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
 
 /// Forget every cached build of `template` on `node_id`.
 pub async fn delete_node_template(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     template: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "DELETE FROM node_template_inventory
          WHERE node_id = $1
@@ -128,7 +134,7 @@ pub async fn delete_node_template(
     ))
     .bind(node_id)
     .bind(template)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -136,17 +142,17 @@ pub async fn delete_node_template(
 /// Forget every cached build of each of `templates` on `node_id`, and return
 /// how many rows went.
 pub async fn delete_node_templates(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_id: NodeId,
     templates: &[String],
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, DbError> {
     let result = sqlx::query(sql!(
         "DELETE FROM node_template_inventory
              WHERE node_id = $1 AND template_name = ANY($2)"
     ))
     .bind(node_id)
     .bind(templates)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected())
 }
@@ -156,11 +162,11 @@ pub async fn delete_node_templates(
 /// group to `new_org_id` would strand: those owned by another org, or, for a
 /// release to generic (`None`), every one.
 pub async fn stranded_org_specific_templates(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     node_group_id: NodeGroupId,
     new_org_id: Option<OrgId>,
-) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>(sql!(
+) -> Result<i64, DbError> {
+    Ok(sqlx::query_scalar::<_, i64>(sql!(
         "SELECT COUNT(*)::BIGINT
            FROM node_template_inventory nti
            JOIN nodes n ON n.id = nti.node_id
@@ -171,8 +177,8 @@ pub async fn stranded_org_specific_templates(
     ))
     .bind(node_group_id)
     .bind(new_org_id)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 #[cfg(test)]

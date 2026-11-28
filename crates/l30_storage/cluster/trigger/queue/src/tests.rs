@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use pplx_space_accounts::NodeId;
 
 use super::*;
-use pplx_space_db_test_fixtures::pg_test_db;
+use pplx_space_db_test_fixtures::{pg_test_db, pg_test_db_with_max_connections};
 use sqlx::PgPool;
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -92,7 +93,13 @@ async fn enqueue_claim_and_complete_coalesces_reasons() -> TestResult {
         "sandbox_network_policy_updated,sandbox_desired_state_updated"
     );
 
-    complete_claim(&db.pool, &claim.claim_token, &[node_id], &[]).await?;
+    complete_claim(
+        &Db::from(db.pool.clone()),
+        &claim.claim_token,
+        &[node_id],
+        &[],
+    )
+    .await?;
     let count: i64 = sqlx::query_scalar(sql!(
         "SELECT COUNT(*)::BIGINT FROM node_reconcile_triggers WHERE node_id = $1"
     ))
@@ -142,6 +149,110 @@ async fn enqueue_rejects_cluster_role_nodes() -> TestResult {
     Ok(())
 }
 
+/// Two enqueues over the same nodes lock their trigger rows in node-id order,
+/// whichever plan each runs the upsert with. The settings force each plan mode;
+/// on the fixture's Postgres, `nodes` never analyzed, the custom plan without
+/// hash aggregation walks the sorted ids, the generic one scans `nodes`, stored
+/// in descending id order. A third enqueue holds the middle row, so without the
+/// ORDER BY each would hold one end and wait on the middle, then on the other:
+/// a deadlock (40P01).
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_enqueues_on_different_plans_do_not_deadlock() -> TestResult {
+    // The holder, the two enqueues, and the lock probe.
+    let db = pg_test_db_with_max_connections(4).await?;
+    let mut node_ids = [NodeId::new(), NodeId::new(), NodeId::new()];
+    node_ids.sort();
+    for &node_id in node_ids.iter().rev() {
+        insert_node(
+            &db.pool,
+            node_id,
+            SpaceNodeRole::Worker.as_str(),
+            "k8s",
+            None,
+        )
+        .await?;
+    }
+    let reason = ReconcileReason::TemplateDesiredStateUpdated;
+
+    let mut holder = db.pool.begin().await?;
+    enqueue_triggers_tx(&mut *holder, [node_ids[1]], reason).await?;
+    let (custom_pid, custom) = spawn_enqueue(
+        &db.pool,
+        &[
+            ("plan_cache_mode", "force_custom_plan"),
+            ("enable_hashagg", "off"),
+        ],
+        node_ids,
+        reason,
+    )
+    .await?;
+    wait_until_waiting(&db.pool, custom_pid).await?;
+    let (generic_pid, generic) = spawn_enqueue(
+        &db.pool,
+        &[("plan_cache_mode", "force_generic_plan")],
+        node_ids,
+        reason,
+    )
+    .await?;
+    wait_until_waiting(&db.pool, generic_pid).await?;
+    holder.commit().await?;
+
+    let custom = tokio::time::timeout(Duration::from_secs(10), custom).await??;
+    let generic = tokio::time::timeout(Duration::from_secs(10), generic).await??;
+    assert!(
+        matches!((&custom, &generic), (Ok(3), Ok(3))),
+        "custom plan: {custom:?}, generic plan: {generic:?}"
+    );
+    Ok(())
+}
+
+/// Start an enqueue of `node_ids`, in its own transaction, on a connection
+/// with `settings` applied, and return that connection's backend pid.
+async fn spawn_enqueue(
+    pool: &PgPool,
+    settings: &[(&str, &str)],
+    node_ids: [NodeId; 3],
+    reason: ReconcileReason,
+) -> TestResult<(i32, tokio::task::JoinHandle<Result<u64, sqlx::Error>>)> {
+    let mut conn = pool.acquire().await?;
+    for (name, value) in settings {
+        sqlx::query(sql!("SELECT set_config($1, $2, false)"))
+            .bind(name)
+            .bind(value)
+            .execute(&mut *conn)
+            .await?;
+    }
+    let pid: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+        .fetch_one(&mut *conn)
+        .await?;
+    let enqueue = tokio::spawn(async move {
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+        let queued = enqueue_triggers_tx(&mut *tx, node_ids, reason).await?;
+        tx.commit().await?;
+        Ok(queued)
+    });
+    Ok((pid, enqueue))
+}
+
+/// Return once backend `pid` waits on a lock another backend holds.
+async fn wait_until_waiting(pool: &PgPool, pid: i32) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let waiting: bool =
+            sqlx::query_scalar(sql!("SELECT cardinality(pg_blocking_pids($1)) > 0"))
+                .bind(pid)
+                .fetch_one(pool)
+                .await?;
+        if waiting {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("backend {pid} never waited on a lock").into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn repeated_failures_dead_letter_trigger() -> TestResult {
     let db = pg_test_db().await?;
@@ -168,7 +279,7 @@ async fn repeated_failures_dead_letter_trigger() -> TestResult {
         let claim = claim_triggers(&db.pool, 10).await?;
         assert_eq!(claim.triggers.len(), 1, "attempt {attempt}");
         complete_claim(
-            &db.pool,
+            &Db::from(db.pool.clone()),
             &claim.claim_token,
             &[],
             &[(node_id, format!("failure-{attempt}"))],
@@ -201,7 +312,7 @@ async fn permanent_failure_dead_letters_immediately() -> TestResult {
     enqueue_triggers(&db.pool, [node_id], ReconcileReason::ManualNodeReconcile).await?;
     let claim = claim_triggers(&db.pool, 10).await?;
     dead_letter_claim(
-        &db.pool,
+        &Db::from(db.pool.clone()),
         &claim.claim_token,
         &[(node_id, "invalid endpoint".to_string())],
     )
@@ -235,7 +346,7 @@ async fn failed_trigger_can_recover_on_next_claim() -> TestResult {
     enqueue_triggers(&db.pool, [node_id], ReconcileReason::ManualNodeReconcile).await?;
     let claim = claim_triggers(&db.pool, 10).await?;
     complete_claim(
-        &db.pool,
+        &Db::from(db.pool.clone()),
         &claim.claim_token,
         &[],
         &[(node_id, "temporary failure".to_string())],
@@ -250,7 +361,13 @@ async fn failed_trigger_can_recover_on_next_claim() -> TestResult {
 
     let retry_claim = claim_triggers(&db.pool, 10).await?;
     assert_eq!(retry_claim.triggers.len(), 1);
-    complete_claim(&db.pool, &retry_claim.claim_token, &[node_id], &[]).await?;
+    complete_claim(
+        &Db::from(db.pool.clone()),
+        &retry_claim.claim_token,
+        &[node_id],
+        &[],
+    )
+    .await?;
 
     let count: i64 = sqlx::query_scalar(sql!(
         "SELECT COUNT(*)::BIGINT FROM node_reconcile_triggers WHERE node_id = $1"
@@ -470,7 +587,7 @@ async fn queued_triggers_reports_each_node_until_its_trigger_drains() -> TestRes
     assert!(claimed.claimed_at.is_some());
 
     complete_claim(
-        &db.pool,
+        &Db::from(db.pool.clone()),
         &claim.claim_token,
         &[],
         &[(queued_node, "node unreachable".to_string())],
@@ -489,14 +606,20 @@ async fn queued_triggers_reports_each_node_until_its_trigger_drains() -> TestRes
     .execute(&db.pool)
     .await?;
     let claim = claim_triggers(&db.pool, 10).await?;
-    complete_claim(&db.pool, &claim.claim_token, &[queued_node], &[]).await?;
+    complete_claim(
+        &Db::from(db.pool.clone()),
+        &claim.claim_token,
+        &[queued_node],
+        &[],
+    )
+    .await?;
     assert!(queued_triggers(&db.pool, &nodes).await?.is_empty());
 
     // Dead-lettered at once, as for a node whose Kubernetes Node is gone.
     enqueue_triggers(&db.pool, [queued_node], ReconcileReason::NodeUpdated).await?;
     let claim = claim_triggers(&db.pool, 10).await?;
     dead_letter_claim(
-        &db.pool,
+        &Db::from(db.pool.clone()),
         &claim.claim_token,
         &[(queued_node, "node is gone".to_string())],
     )
@@ -666,7 +789,7 @@ async fn a_claim_skips_reasons_this_build_does_not_know() -> TestResult {
     // A failure is recorded against the row, so it backs off and
     // dead-letters like any other instead of being claimed again unchanged.
     complete_claim(
-        &db.pool,
+        &Db::from(db.pool.clone()),
         &claim.claim_token,
         &[mixed, firewall_rules_beside_unknown, known],
         &[(unknown_only, "node unreachable".to_string())],

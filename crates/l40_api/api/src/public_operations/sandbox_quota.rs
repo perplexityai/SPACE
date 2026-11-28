@@ -64,9 +64,8 @@ use std::time::Duration;
 
 use crate::metrics::operations as metrics;
 use pplx_space_accounts::{OrgId, UserId};
-use pplx_space_postgres_pool::contention;
-use pplx_space_public_operation_store::quota::SandboxesHeld;
-use pplx_space_sql_locator::sql;
+use pplx_space_postgres_pool::{TxSettings as _, contention};
+use pplx_space_public_operation_store::quota::{self, SandboxesHeld};
 use sqlx::{Postgres, Transaction};
 
 use super::{
@@ -268,7 +267,11 @@ impl PublicOperationAdmission {
             plan.org
                 .map(|(_, mode)| (plan.org_id.as_uuid(), ORG_LOCK_SEED, mode)),
         ];
-        let lock_timeout = bound_lock_timeout_tx(&mut self.tx, self.quota_lock_timeout).await?;
+        let saved_lock_timeout = self
+            .tx
+            .lower_local_lock_timeout(self.quota_lock_timeout)
+            .await
+            .map_err(sqlx::Error::from)?;
         for (id, seed, mode) in locks.into_iter().flatten() {
             match lock_tx(&mut self.tx, id, seed, mode).await {
                 Ok(()) => {}
@@ -286,7 +289,10 @@ impl PublicOperationAdmission {
                 Err(error) => return Err(error.into()),
             }
         }
-        restore_lock_timeout_tx(&mut self.tx, &lock_timeout).await?;
+        self.tx
+            .restore_local_lock_timeout(saved_lock_timeout)
+            .await
+            .map_err(sqlx::Error::from)?;
         let subject_id = plan.subject.map(|(user_id, _, _)| user_id);
         let held = sandboxes_held_tx(&mut self.tx, plan.org_id, subject_id).await?;
         let org = plan.org.map(|(limit, mode)| {
@@ -314,62 +320,23 @@ impl PublicOperationAdmission {
     }
 }
 
-/// Bound this transaction's lock waits by `timeout` unless a shorter bound
-/// is already set. Returns the `lock_timeout` in force before the call, for
-/// [`restore_lock_timeout_tx`].
-async fn bound_lock_timeout_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    timeout: Duration,
-) -> Result<String, sqlx::Error> {
-    let previous: String = sqlx::query_scalar(sql!("SELECT current_setting('lock_timeout')"))
-        .fetch_one(&mut **tx)
-        .await?;
-    // `set_config(..., is_local => true)` is `SET LOCAL` with a bind
-    // parameter. `0` is no bound.
-    sqlx::query(sql!(
-        "SELECT set_config('lock_timeout', $1::text, TRUE)
-          WHERE current_setting('lock_timeout')::interval = interval '0'
-             OR current_setting('lock_timeout')::interval > $1::text::interval"
-    ))
-    .bind(format!("{}ms", timeout.as_millis()))
-    .execute(&mut **tx)
-    .await?;
-    Ok(previous)
-}
-
-/// Return this transaction's `lock_timeout` to `previous`, as read by
-/// [`bound_lock_timeout_tx`], keeping any value the caller had set for the
-/// transaction or the session.
-async fn restore_lock_timeout_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    previous: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!("SELECT set_config('lock_timeout', $1, TRUE)"))
-        .bind(previous)
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
-}
-
 async fn lock_tx(
     tx: &mut Transaction<'_, Postgres>,
     id: uuid::Uuid,
     seed: i64,
     mode: LockMode,
 ) -> Result<(), sqlx::Error> {
-    let statement = match mode {
-        LockMode::Shared => sqlx::query(sql!(
-            "SELECT pg_advisory_xact_lock_shared(hashtextextended($1::text, $2))"
-        )),
-        LockMode::Exclusive => sqlx::query(sql!(
-            "SELECT pg_advisory_xact_lock(hashtextextended($1::text, $2))"
-        )),
-    };
-    statement.bind(id).bind(seed).execute(&mut **tx).await?;
-    Ok(())
+    match mode {
+        LockMode::Shared => quota::lock_quota_shared(&mut **tx, id, seed)
+            .await
+            .map_err(sqlx::Error::from),
+        LockMode::Exclusive => quota::lock_quota_exclusive(&mut **tx, id, seed)
+            .await
+            .map_err(sqlx::Error::from),
+    }
 }
 
-/// Count with [`SANDBOXES_HELD`](pplx_space_public_operation_store::quota::SANDBOXES_HELD);
+/// Count with `pplx_space_public_operation_store::quota::SANDBOXES_HELD`;
 /// see there for what is counted.
 async fn sandboxes_held_tx(
     tx: &mut Transaction<'_, Postgres>,
@@ -383,6 +350,7 @@ async fn sandboxes_held_tx(
         ApiProduct::Native.as_str(),
     )
     .await
+    .map_err(sqlx::Error::from)
 }
 
 #[cfg(test)]

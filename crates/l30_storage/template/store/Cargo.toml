@@ -39,6 +39,8 @@ uuid = { workspace = true }
 pplx-space-accounts = { workspace = true, features = ["sqlx"] }
 pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
 pplx-space-net-common = { workspace = true, features = ["serde"] }
+pplx-space-node-model = { workspace = true }
+pplx-space-postgres-pool = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }
 pplx-space-template-model = { workspace = true, features = ["sqlx"] }

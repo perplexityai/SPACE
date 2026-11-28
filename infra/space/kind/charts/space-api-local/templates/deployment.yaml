@@ -170,6 +170,10 @@ spec:
             # fork whatever the values file meant.
             - name: SPACE_SANDBOX_FORK_ENABLED
               value: {{ required "fork.enabled is required: an empty value enables fork" .Values.fork.enabled | quote }}
+            # The drain's v2 engine: `:drain {engine: v2}` starts one only
+            # with this on; see `drainV2` in values.yaml.
+            - name: SPACE_DRAIN_V2_ENABLED
+              value: {{ .Values.drainV2.enabled | quote }}
             - name: POSTGRES_CONNECTION_STRING
               valueFrom:
                 secretKeyRef:

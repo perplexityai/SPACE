@@ -1,30 +1,36 @@
 //! The `templates` catalog row.
 
-use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_accounts::{NodeId, OrgId, UserId};
 use std::time::Duration;
 
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_net_common::NetworkPolicyV1;
+use pplx_space_node_model::NodeRole;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::ReconcileFacet;
 use pplx_space_template_model::{
     TemplateDesiredState, TemplateId, TemplateName, TemplateVisibility,
 };
 use serde::de::DeserializeOwned;
-use sqlx::{FromRow, PgExecutor, types::Json};
+use sqlx::{FromRow, types::Json};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 /// The stored `desired_state` of `template`, unparsed, or `None` when no row
 /// names it. Callers parse it, as each treats an unknown value its own way.
 pub async fn desired_state(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &TemplateName,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>(sql!("SELECT desired_state FROM templates WHERE name = $1"))
+) -> Result<Option<String>, DbError> {
+    Ok(
+        sqlx::query_scalar::<_, String>(sql!(
+            "SELECT desired_state FROM templates WHERE name = $1"
+        ))
         .bind(template.as_str())
-        .fetch_optional(executor)
-        .await
+        .fetch_optional(executor.into_sqlx())
+        .await?,
+    )
 }
 
 /// The fields a sandbox create authorizes a template by.
@@ -40,33 +46,34 @@ pub struct TemplateAccess {
 /// `template`'s access fields, whatever its state and owner, or `None` when
 /// no row names it. The caller decides access from them.
 pub async fn access(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &str,
-) -> Result<Option<TemplateAccess>, sqlx::Error> {
-    sqlx::query_as::<_, TemplateAccess>(sql!(
+) -> Result<Option<TemplateAccess>, DbError> {
+    Ok(sqlx::query_as::<_, TemplateAccess>(sql!(
         "SELECT visibility, org_id, desired_state
          FROM templates
          WHERE name = $1"
     ))
     .bind(template)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// A present template's network policy and its generation.
 #[derive(Debug, FromRow)]
 pub struct PresentNetworkPolicy {
-    pub network_policy_json: Json<NetworkPolicyV1>,
+    #[sqlx(json)]
+    pub network_policy_json: NetworkPolicyV1,
     pub network_policy_generation: i64,
 }
 
 /// `template`'s network policy and generation, or `None` when no present
 /// row names it.
 pub async fn present_network_policy(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &str,
-) -> Result<Option<PresentNetworkPolicy>, sqlx::Error> {
-    sqlx::query_as::<_, PresentNetworkPolicy>(sql!(
+) -> Result<Option<PresentNetworkPolicy>, DbError> {
+    Ok(sqlx::query_as::<_, PresentNetworkPolicy>(sql!(
         "SELECT network_policy_json, network_policy_generation
          FROM templates
          WHERE name = $1
@@ -74,8 +81,8 @@ pub async fn present_network_policy(
     ))
     .bind(template)
     .bind(TemplateDesiredState::Present.as_str())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// A template's visibility, read with the database's clock.
@@ -98,59 +105,59 @@ pub struct ObservedVisibility {
 /// value", and `templates.name` is unique (`templates_name_key`), so the
 /// subselect cannot return more than one row.
 pub async fn observed_visibility(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &str,
-) -> Result<ObservedVisibility, sqlx::Error> {
-    sqlx::query_as::<_, ObservedVisibility>(sql!(
+) -> Result<ObservedVisibility, DbError> {
+    Ok(sqlx::query_as::<_, ObservedVisibility>(sql!(
         "SELECT clock_timestamp() AS observed_at,
                 (SELECT visibility FROM templates WHERE name = $1) AS visibility"
     ))
     .bind(template)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether a row named `template` exists and is not deleted: the rows the
 /// template read routes list.
 pub async fn exists_not_deleted(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &TemplateName,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT EXISTS (SELECT 1 FROM templates WHERE name = $1 AND desired_state <> $2)"
     ))
     .bind(template.as_str())
     .bind(TemplateDesiredState::Deleted.as_str())
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Whether no organization other than `org_id` owns `template`: true for an
 /// ownerless template, one `org_id` owns, and a name no row has yet.
 pub async fn not_owned_by_another_org(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &TemplateName,
     org_id: OrgId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sql!(
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar(sql!(
         "SELECT NOT EXISTS (SELECT 1 FROM templates WHERE name = $1 AND org_id <> $2)"
     ))
     .bind(template.as_str())
     .bind(org_id.as_uuid())
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// The owner of `template`: `None` when no row names it, `Some(None)` for an
 /// ownerless template.
 pub async fn owner(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &TemplateName,
-) -> Result<Option<Option<OrgId>>, sqlx::Error> {
+) -> Result<Option<Option<OrgId>>, DbError> {
     let owner: Option<Option<Uuid>> =
         sqlx::query_scalar(sql!("SELECT org_id FROM templates WHERE name = $1"))
             .bind(template.as_str())
-            .fetch_optional(executor)
+            .fetch_optional(executor.into_sqlx())
             .await?;
     Ok(owner.map(|organization_id| organization_id.map(OrgId::from_uuid)))
 }
@@ -169,9 +176,9 @@ pub struct DeleteState {
 
 /// `template`'s delete state, or `None` when no row names it.
 pub async fn delete_state(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &TemplateName,
-) -> Result<Option<DeleteState>, sqlx::Error> {
+) -> Result<Option<DeleteState>, DbError> {
     let row = sqlx::query_as::<_, (String, Option<Uuid>, bool)>(sql!(
         "SELECT t.desired_state,
                 t.delete_operation_id,
@@ -181,7 +188,7 @@ pub async fn delete_state(
          WHERE t.name = $1"
     ))
     .bind(template.as_str())
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(row.map(
         |(desired_state, delete_operation_id, delete_operation_live)| DeleteState {
@@ -207,10 +214,10 @@ pub struct OrgTemplates {
 
 /// Summarize `org_id`'s template rows; see [`OrgTemplates`].
 pub async fn org_templates(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     retention: Duration,
-) -> Result<OrgTemplates, sqlx::Error> {
+) -> Result<OrgTemplates, DbError> {
     let (any_live, any_held, retained_until) =
         sqlx::query_as::<_, (Option<bool>, Option<bool>, Option<OffsetDateTime>)>(sql!(
             "SELECT bool_or(t.desired_state <> $2),
@@ -232,7 +239,7 @@ pub async fn org_templates(
         .bind(org_id)
         .bind(TemplateDesiredState::Deleted.as_str())
         .bind(retention.as_secs_f64())
-        .fetch_one(executor)
+        .fetch_one(executor.into_sqlx())
         .await?;
     Ok(OrgTemplates {
         any_live,
@@ -246,10 +253,11 @@ pub async fn org_templates(
 /// network policy generation nodes observe. `Snapshots` decodes the
 /// inventory's `snapshots` JSON.
 ///
-/// The api's admin template create also decodes its upsert's `RETURNING`
-/// row into this type, so a field added here needs a column in that
-/// `RETURNING` list too.
-#[derive(Debug, FromRow)]
+/// [`list_admin`] and [`create_or_undelete`] decode their rows into a
+/// private row type with the same field names and convert it, so a field
+/// added here also needs a field there, and a column in both
+/// `list_admin`'s select list and `create_or_undelete`'s `RETURNING` list.
+#[derive(Debug)]
 pub struct AdminTemplate<Snapshots> {
     pub name: String,
     pub description: Option<String>,
@@ -268,26 +276,87 @@ pub struct AdminTemplate<Snapshots> {
     pub artifact_size_bytes: Option<i64>,
     pub cache_size_bytes: Option<i64>,
     pub base_snapshot_size_bytes: Option<i64>,
-    pub snapshots: Option<Json<Snapshots>>,
+    pub snapshots: Option<Snapshots>,
     pub vcpu: Option<i32>,
     pub memory_mib: Option<i32>,
     pub disk_size_mb: Option<i32>,
-    pub default_auto_lifecycle: Option<Json<AutoLifecyclePolicy>>,
-    pub network_policy: Json<NetworkPolicyV1>,
+    pub default_auto_lifecycle: Option<AutoLifecyclePolicy>,
+    pub network_policy: NetworkPolicyV1,
     pub observed_network_policy_generation: Option<i64>,
     pub observed_network_policy_authority: Option<String>,
+}
+
+#[derive(FromRow)]
+struct AdminTemplateRow<Snapshots> {
+    name: String,
+    description: Option<String>,
+    org_id: Option<OrgId>,
+    desired_state: String,
+    network_policy_generation: i64,
+    created_at: OffsetDateTime,
+    built_at: Option<String>,
+    content_hash: Option<String>,
+    runtime: Option<String>,
+    runtime_version: Option<String>,
+    arch: Option<String>,
+    has_base_snapshot: Option<bool>,
+    pool_target: Option<i32>,
+    pool_current: Option<i32>,
+    artifact_size_bytes: Option<i64>,
+    cache_size_bytes: Option<i64>,
+    base_snapshot_size_bytes: Option<i64>,
+    snapshots: Option<Json<Snapshots>>,
+    vcpu: Option<i32>,
+    memory_mib: Option<i32>,
+    disk_size_mb: Option<i32>,
+    default_auto_lifecycle: Option<Json<AutoLifecyclePolicy>>,
+    network_policy: Json<NetworkPolicyV1>,
+    observed_network_policy_generation: Option<i64>,
+    observed_network_policy_authority: Option<String>,
+}
+
+impl<Snapshots> From<AdminTemplateRow<Snapshots>> for AdminTemplate<Snapshots> {
+    fn from(row: AdminTemplateRow<Snapshots>) -> Self {
+        Self {
+            name: row.name,
+            description: row.description,
+            org_id: row.org_id,
+            desired_state: row.desired_state,
+            network_policy_generation: row.network_policy_generation,
+            created_at: row.created_at,
+            built_at: row.built_at,
+            content_hash: row.content_hash,
+            runtime: row.runtime,
+            runtime_version: row.runtime_version,
+            arch: row.arch,
+            has_base_snapshot: row.has_base_snapshot,
+            pool_target: row.pool_target,
+            pool_current: row.pool_current,
+            artifact_size_bytes: row.artifact_size_bytes,
+            cache_size_bytes: row.cache_size_bytes,
+            base_snapshot_size_bytes: row.base_snapshot_size_bytes,
+            snapshots: row.snapshots.map(|json| json.0),
+            vcpu: row.vcpu,
+            memory_mib: row.memory_mib,
+            disk_size_mb: row.disk_size_mb,
+            default_auto_lifecycle: row.default_auto_lifecycle.map(|json| json.0),
+            network_policy: row.network_policy.0,
+            observed_network_policy_generation: row.observed_network_policy_generation,
+            observed_network_policy_authority: row.observed_network_policy_authority,
+        }
+    }
 }
 
 /// Every template that is not deleted, or only `template` when given, by
 /// name. A template without a stored network policy lists deny-all.
 pub async fn list_admin<Snapshots>(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: Option<&TemplateName>,
-) -> Result<Vec<AdminTemplate<Snapshots>>, sqlx::Error>
+) -> Result<Vec<AdminTemplate<Snapshots>>, DbError>
 where
     Snapshots: DeserializeOwned + Send + Unpin + 'static,
 {
-    sqlx::query_as::<_, AdminTemplate<Snapshots>>(
+    Ok(sqlx::query_as::<_, AdminTemplateRow<Snapshots>>(
          sql!("WITH template_names AS (
              SELECT name
              FROM templates
@@ -381,36 +450,39 @@ where
     .bind(ReconcileFacet::NetworkPolicy.as_str())
     .bind(template.map(TemplateName::as_str))
     .bind(TemplateDesiredState::Deleted.as_str())
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?
+    .into_iter()
+    .map(AdminTemplate::from)
+    .collect())
 }
 
 /// The network policy stored for `template`, or `None` when no row names it.
 pub async fn network_policy(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &str,
-) -> Result<Option<NetworkPolicyV1>, sqlx::Error> {
+) -> Result<Option<NetworkPolicyV1>, DbError> {
     let policy = sqlx::query_scalar::<_, Option<Json<NetworkPolicyV1>>>(sql!(
         "SELECT network_policy_json
              FROM templates
              WHERE name = $1"
     ))
     .bind(template)
-    .fetch_optional(executor)
+    .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(policy.flatten().map(|policy| policy.0))
 }
 
 /// The number of deleted template rows that tombstone retention still
 /// holds.
-pub async fn count_deleted(executor: impl PgExecutor<'_>) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>(sql!(
+pub async fn count_deleted(executor: impl Executor<'_>) -> Result<i64, DbError> {
+    Ok(sqlx::query_scalar::<_, i64>(sql!(
         "SELECT COUNT(*)
                FROM templates
               WHERE desired_state = 'deleted'"
     ))
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// A present template an organization may launch, as the public template
@@ -426,12 +498,12 @@ pub struct VisibleTemplate {
 /// Up to `limit` present templates that are generic or owned by `org_id`,
 /// by name, after `after` when given.
 pub async fn list_visible(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     after: Option<&str>,
     limit: i64,
-) -> Result<Vec<VisibleTemplate>, sqlx::Error> {
-    sqlx::query_as::<_, VisibleTemplate>(sql!(
+) -> Result<Vec<VisibleTemplate>, DbError> {
+    Ok(sqlx::query_as::<_, VisibleTemplate>(sql!(
         "SELECT name, description, created_at, updated_at
          FROM templates
          WHERE (visibility = $1 OR org_id = $2)
@@ -444,18 +516,18 @@ pub async fn list_visible(
     .bind(org_id)
     .bind(after)
     .bind(limit)
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// The present template `template`, when it is generic or owned by
 /// `org_id`.
 pub async fn get_visible(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     org_id: OrgId,
     template: &str,
-) -> Result<Option<VisibleTemplate>, sqlx::Error> {
-    sqlx::query_as::<_, VisibleTemplate>(sql!(
+) -> Result<Option<VisibleTemplate>, DbError> {
+    Ok(sqlx::query_as::<_, VisibleTemplate>(sql!(
         "SELECT name, description, created_at, updated_at
          FROM templates
          WHERE name = $1
@@ -465,19 +537,19 @@ pub async fn get_visible(
     .bind(template)
     .bind(TemplateVisibility::Generic.as_str())
     .bind(org_id)
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Write `visibility`, assigning `new_org_id` as the owner in the same
 /// statement when it is given: the `org_specific_requires_owner` CHECK
 /// demands owner and visibility move together for ownerless templates.
 pub async fn update_visibility(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &str,
     visibility: TemplateVisibility,
     new_org_id: Option<OrgId>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE templates
             SET visibility = $2,
@@ -487,7 +559,7 @@ pub async fn update_visibility(
     .bind(template)
     .bind(visibility)
     .bind(new_org_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -498,7 +570,8 @@ pub struct RegisteredTemplate {
     pub name: String,
     pub description: Option<String>,
     pub created_at: OffsetDateTime,
-    pub network_policy_json: Json<NetworkPolicyV1>,
+    #[sqlx(json)]
+    pub network_policy_json: NetworkPolicyV1,
     pub network_policy_generation: i64,
 }
 
@@ -518,10 +591,10 @@ pub struct NewTemplate<'a> {
 /// Insert `template`, or `None` when its name or its name and owner
 /// conflict with an existing row, which may have committed concurrently.
 pub async fn insert_if_absent(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: NewTemplate<'_>,
-) -> Result<Option<RegisteredTemplate>, sqlx::Error> {
-    sqlx::query_as(sql!(
+) -> Result<Option<RegisteredTemplate>, DbError> {
+    Ok(sqlx::query_as(sql!(
         "INSERT INTO templates
             (id, name, description, org_id, visibility, network_policy_json, network_policy_generation, desired_state)
          VALUES ($1, $2, $3, $4, $7, $5, 1, $6)
@@ -535,37 +608,38 @@ pub async fn insert_if_absent(
     .bind(Json(template.network_policy))
     .bind(template.desired_state.as_str())
     .bind(template.visibility.as_str())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// Set `template`'s description to `description` when it has none, and
-/// read the row back. Fails with [`sqlx::Error::RowNotFound`] when no row
-/// names it.
+/// read the row back. Fails with a [`DbError`] of kind
+/// [`DbErrorKind::NotFound`](pplx_space_postgres_pool::DbErrorKind::NotFound)
+/// when no row names it.
 pub async fn fill_description(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &str,
     description: Option<&str>,
-) -> Result<RegisteredTemplate, sqlx::Error> {
-    sqlx::query_as(sql!(
+) -> Result<RegisteredTemplate, DbError> {
+    Ok(sqlx::query_as(sql!(
         "UPDATE templates SET description = COALESCE(description, $2) WHERE name = $1
          RETURNING name, description, created_at, network_policy_json, network_policy_generation"
     ))
     .bind(template)
     .bind(description)
-    .fetch_one(executor)
-    .await
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Record that `template` is being deleted by operation `operation_id`,
 /// keeping the request time, actor and operation an earlier call already
 /// recorded.
 pub async fn mark_deleting(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &TemplateName,
     actor_user_id: Option<UserId>,
     operation_id: Uuid,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE templates
          SET desired_state = $2,
@@ -579,7 +653,7 @@ pub async fn mark_deleting(
     .bind(TemplateDesiredState::Deleting.as_str())
     .bind(actor_user_id)
     .bind(operation_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
@@ -587,10 +661,10 @@ pub async fn mark_deleting(
 /// Record that `template` is deleted, keeping the operation a delete
 /// request already recorded.
 pub async fn mark_deleted(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &TemplateName,
     operation_id: Uuid,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "UPDATE templates
          SET desired_state = $2,
@@ -601,7 +675,694 @@ pub async fn mark_deleted(
     .bind(template.as_str())
     .bind(TemplateDesiredState::Deleted.as_str())
     .bind(operation_id)
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }
+
+/// Share-lock `template`'s row when it is present, against a runtime upgrade
+/// campaign's twin insert, which holds it `FOR NO KEY UPDATE`. A template in
+/// any other state, or no row, takes no lock. The lock lasts until the
+/// caller's transaction ends. The caller must pass its open transaction.
+pub async fn share_lock_if_present<C>(tx: &mut C, template: &str) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    sqlx::query(sql!(
+        "SELECT 1 FROM templates WHERE name = $1 AND desired_state = 'present' FOR SHARE"
+    ))
+    .bind(template)
+    .execute(tx.into_sqlx())
+    .await?;
+    Ok(())
+}
+
+/// Lock `template`'s row `FOR NO KEY UPDATE`, whatever its state, or take
+/// no lock when no row names it. The lock lasts until the caller's
+/// transaction ends; it doesn't conflict with foreign-key checks'
+/// key-share locks. The caller must pass its open transaction.
+pub async fn lock_no_key_update<C>(tx: &mut C, template: &TemplateName) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    sqlx::query(sql!(
+        "SELECT 1 FROM templates WHERE name = $1 FOR NO KEY UPDATE"
+    ))
+    .bind(template.as_str())
+    .execute(tx.into_sqlx())
+    .await?;
+    Ok(())
+}
+
+/// Lock `FOR NO KEY UPDATE` the row of the template `release_id` is a
+/// release of, or take no lock when there is no such release. The lock
+/// lasts until the caller's transaction ends. The caller must pass its open
+/// transaction.
+pub async fn lock_no_key_update_of_release<C>(tx: &mut C, release_id: Uuid) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    sqlx::query(sql!(
+        "SELECT 1
+             FROM templates t
+             JOIN template_releases r ON r.template_name = t.name
+             WHERE r.id = $1
+             FOR NO KEY UPDATE OF t"
+    ))
+    .bind(release_id)
+    .execute(tx.into_sqlx())
+    .await?;
+    Ok(())
+}
+
+/// A template's visibility and owner, as the admin visibility flip and the
+/// node-group allowlist validation read them under a row lock.
+#[derive(Debug, Clone, FromRow)]
+pub struct VisibilityOwner {
+    pub name: String,
+    pub org_id: Option<OrgId>,
+    pub visibility: TemplateVisibility,
+}
+
+/// `template`'s visibility and owner, or `None` when no row names it,
+/// locking the row `FOR UPDATE` until the caller's transaction ends. The
+/// caller must pass its open transaction.
+pub async fn lock_visibility<C>(
+    tx: &mut C,
+    template: &str,
+) -> Result<Option<VisibilityOwner>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_as::<_, VisibilityOwner>(sql!(
+        "SELECT name, org_id, visibility FROM templates WHERE name = $1 FOR UPDATE"
+    ))
+    .bind(template)
+    .fetch_optional(tx.into_sqlx())
+    .await?)
+}
+
+/// The visibility and owner of each row `names` names, share-locking the
+/// rows `FOR SHARE` until the caller's transaction ends. The caller must pass
+/// its open transaction.
+pub async fn share_lock_visibilities<C>(
+    tx: &mut C,
+    names: &[String],
+) -> Result<Vec<VisibilityOwner>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query_as::<_, VisibilityOwner>(sql!(
+        "SELECT name, visibility, org_id FROM templates WHERE name = ANY($1::TEXT[]) FOR SHARE"
+    ))
+    .bind(names)
+    .fetch_all(tx.into_sqlx())
+    .await?)
+}
+
+/// A template's owner and desired state, and the cluster's managing
+/// organization, as release registration checks its publisher against them.
+#[derive(Debug)]
+pub struct PublicationOwner {
+    pub org_id: Option<OrgId>,
+    /// The stored desired state, unparsed.
+    pub desired_state: String,
+    /// The cluster's managing organization, `None` when it records none.
+    pub managing_org_id: Option<OrgId>,
+}
+
+/// `template`'s publication owner, or `None` when no row names it, locking
+/// the template's row `FOR UPDATE` until the caller's transaction ends. The
+/// caller must pass its open transaction.
+pub async fn lock_publication_owner<C>(
+    tx: &mut C,
+    template: &TemplateName,
+) -> Result<Option<PublicationOwner>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    let row = sqlx::query_as::<_, (Option<OrgId>, String, Option<OrgId>)>(sql!(
+        "SELECT org_id, desired_state,
+                    (SELECT managing_org_id FROM clusters WHERE singleton)
+             FROM templates WHERE name = $1 FOR UPDATE"
+    ))
+    .bind(template.as_str())
+    .fetch_optional(tx.into_sqlx())
+    .await?;
+    Ok(row.map(
+        |(org_id, desired_state, managing_org_id)| PublicationOwner {
+            org_id,
+            desired_state,
+            managing_org_id,
+        },
+    ))
+}
+
+/// A template for the admin create to insert, or to undelete in place.
+#[derive(Clone, Copy, Debug)]
+pub struct AdminCreate<'a> {
+    pub id: TemplateId,
+    pub name: &'a TemplateName,
+    pub description: Option<&'a str>,
+    pub org_id: OrgId,
+    pub network_policy: &'a NetworkPolicyV1,
+}
+
+/// Insert `template` as present, or, when a row of its name exists that
+/// `template.org_id` may take over (ownerless or its own) and that is
+/// present, or deleted with no node's inventory naming it, overwrite that
+/// row as present and clear its delete request. The network policy
+/// generation advances only when the policy changes. `None` when a row of
+/// the name exists that the guard refuses, which is left unchanged.
+pub async fn create_or_undelete<Snapshots>(
+    executor: impl Executor<'_>,
+    template: AdminCreate<'_>,
+) -> Result<Option<AdminTemplate<Snapshots>>, DbError>
+where
+    Snapshots: DeserializeOwned + Send + Unpin + 'static,
+{
+    Ok(sqlx::query_as::<_, AdminTemplateRow<Snapshots>>(
+        sql!("INSERT INTO templates
+                 (id, name, description, org_id, desired_state, network_policy_json, network_policy_generation)
+             VALUES ($1, $2, $3, $4, $6, $5, 1)
+             ON CONFLICT (name) DO UPDATE
+             SET description = EXCLUDED.description,
+                 org_id = COALESCE(templates.org_id, EXCLUDED.org_id),
+                 desired_state = EXCLUDED.desired_state,
+                 delete_requested_at = NULL,
+                 delete_requested_by = NULL,
+                 delete_operation_id = NULL,
+                 network_policy_json = EXCLUDED.network_policy_json,
+                 network_policy_generation =
+                     templates.network_policy_generation
+                     + CASE WHEN templates.network_policy_json IS DISTINCT FROM EXCLUDED.network_policy_json
+                            THEN 1 ELSE 0 END,
+                 updated_at = NOW()
+             WHERE (templates.org_id IS NULL OR templates.org_id = EXCLUDED.org_id)
+               AND (
+                   templates.desired_state = $6
+                   OR (
+                       templates.desired_state = $7
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM node_template_inventory nti
+                           WHERE nti.template_name = EXCLUDED.name
+                       )
+                   )
+               )
+             RETURNING name, description, org_id, desired_state, network_policy_generation, created_at,
+                       NULL::TEXT AS built_at,
+                       NULL::TEXT AS content_hash,
+                       NULL::TEXT AS runtime,
+                       NULL::TEXT AS runtime_version,
+                       NULL::TEXT AS arch,
+                       NULL::BOOLEAN AS has_base_snapshot,
+                       NULL::INTEGER AS pool_target,
+                       NULL::INTEGER AS pool_current,
+                       NULL::BIGINT AS artifact_size_bytes,
+                       NULL::BIGINT AS cache_size_bytes,
+                       NULL::BIGINT AS base_snapshot_size_bytes,
+                       NULL::JSONB AS snapshots,
+                       NULL::INTEGER AS vcpu,
+                       NULL::INTEGER AS memory_mib,
+                       NULL::INTEGER AS disk_size_mb,
+                       NULL::JSONB AS default_auto_lifecycle,
+                       network_policy_json AS network_policy,
+                       NULL::BIGINT AS observed_network_policy_generation,
+                       NULL::TEXT AS observed_network_policy_authority"),
+    )
+    .bind(template.id.as_uuid())
+    .bind(template.name.as_str())
+    .bind(template.description)
+    .bind(template.org_id)
+    .bind(Json(template.network_policy))
+    .bind(TemplateDesiredState::Present.as_str())
+    .bind(TemplateDesiredState::Deleted.as_str())
+    .fetch_optional(executor.into_sqlx())
+    .await?
+    .map(AdminTemplate::from))
+}
+
+/// Replace a present `template`'s network policy with `policy`, advancing
+/// its generation when the policy changes, and only when the generation is
+/// still `expected_generation` (any generation when `None`). The new
+/// generation, or `None` when the template isn't present or its
+/// generation moved, which leaves the row unchanged.
+pub async fn replace_network_policy_if_present(
+    executor: impl Executor<'_>,
+    template: &TemplateName,
+    policy: &NetworkPolicyV1,
+    expected_generation: Option<i64>,
+) -> Result<Option<i64>, DbError> {
+    Ok(sqlx::query_scalar::<_, i64>(sql!(
+        "UPDATE templates
+                 SET network_policy_json = $2,
+                     network_policy_generation =
+                       CASE WHEN network_policy_json IS DISTINCT FROM $2
+                            THEN network_policy_generation + 1
+                            ELSE network_policy_generation END,
+                     updated_at = NOW()
+                 WHERE name = $1
+                   AND desired_state = $4
+                   AND ($3::BIGINT IS NULL OR network_policy_generation = $3)
+                 RETURNING network_policy_generation"
+    ))
+    .bind(template.as_str())
+    .bind(Json(policy))
+    .bind(expected_generation)
+    .bind(TemplateDesiredState::Present.as_str())
+    .fetch_optional(executor.into_sqlx())
+    .await?)
+}
+
+/// Set a present `template`'s description. `false` when the template
+/// isn't present, which leaves the row unchanged.
+pub async fn set_description_if_present(
+    executor: impl Executor<'_>,
+    template: &TemplateName,
+    description: &str,
+) -> Result<bool, DbError> {
+    let result = sqlx::query(sql!(
+        "UPDATE templates
+                 SET description = $2, updated_at = NOW()
+                 WHERE name = $1 AND desired_state = $3"
+    ))
+    .bind(template.as_str())
+    .bind(description)
+    .bind(TemplateDesiredState::Present.as_str())
+    .execute(executor.into_sqlx())
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Mark `template` deleting for operation `operation_id`, unless it is
+/// already deleted. The request time and actor an earlier request recorded
+/// are kept, and so is its operation, unless that is `stale_operation_id`,
+/// the stale operation the caller observed, which `operation_id` replaces.
+/// The number of rows marked: `0` when no row names the template or it is
+/// deleted, which leaves the row unchanged.
+pub async fn request_delete(
+    executor: impl Executor<'_>,
+    template: &TemplateName,
+    actor_user_id: UserId,
+    operation_id: Uuid,
+    stale_operation_id: Option<Uuid>,
+) -> Result<u64, DbError> {
+    Ok(sqlx::query(sql!(
+        "UPDATE templates
+             SET desired_state = $2,
+                 delete_requested_at = COALESCE(delete_requested_at, NOW()),
+                 delete_requested_by = COALESCE(delete_requested_by, $3),
+                 delete_operation_id = CASE
+                     WHEN delete_operation_id IS NULL
+                       OR delete_operation_id = $6 THEN $4
+                     ELSE delete_operation_id
+                 END,
+                 updated_at = NOW()
+             WHERE name = $1
+               AND desired_state <> $5"
+    ))
+    .bind(template.as_str())
+    .bind(TemplateDesiredState::Deleting.as_str())
+    .bind(actor_user_id)
+    .bind(operation_id)
+    .bind(TemplateDesiredState::Deleted.as_str())
+    .bind(stale_operation_id)
+    .execute(executor.into_sqlx())
+    .await?
+    .rows_affected())
+}
+
+/// Delete up to `max_records` deleted templates whose delete was requested
+/// (or, without a request, that were last updated or created) more than
+/// `retention_secs` before the database's `NOW()`, once no release and
+/// no node's inventory names them, oldest first. The number deleted; a
+/// deleted template still held or within retention is left in place.
+pub async fn prune_deleted(
+    executor: impl Executor<'_>,
+    retention_secs: i64,
+    max_records: i64,
+) -> Result<u64, DbError> {
+    Ok(sqlx::query_scalar::<_, String>(sql!(
+        "WITH candidates AS (
+                 SELECT t.name
+                   FROM templates t
+                  WHERE t.desired_state = 'deleted'
+                    AND COALESCE(t.delete_requested_at, t.updated_at, t.created_at)
+                        < NOW() - ($1::BIGINT * INTERVAL '1 second')
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM template_releases r
+                         WHERE r.template_name = t.name
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM node_template_inventory i
+                         WHERE i.template_name = t.name
+                    )
+                  ORDER BY COALESCE(t.delete_requested_at, t.updated_at, t.created_at) ASC,
+                           t.name ASC
+                  LIMIT $2
+             )
+             DELETE FROM templates t
+              USING candidates c
+              WHERE t.name = c.name
+              RETURNING t.name"
+    ))
+    .bind(retention_secs)
+    .bind(max_records)
+    .fetch_all(executor.into_sqlx())
+    .await?
+    .len() as u64)
+}
+
+/// A requested template's network policy as a node reads it.
+#[derive(Debug, Clone, FromRow)]
+pub struct NodeTemplateNetworkPolicy {
+    pub template: String,
+    #[sqlx(json)]
+    pub network_policy_json: NetworkPolicyV1,
+    pub network_policy_generation: i64,
+}
+
+/// The network policy of each of `templates` that node `node_id`, in
+/// `role`, may see: a present generic template, one a sandbox placed on
+/// the node runs, for a worker one an enabled pool config's release names,
+/// and for a builder the base of a build its grant, fresh by the database
+/// clock, authorizes. Names with no row, and names the node may not see,
+/// are left out.
+pub async fn node_network_policies(
+    executor: impl Executor<'_>,
+    templates: &[String],
+    node_id: NodeId,
+    role: NodeRole,
+) -> Result<Vec<NodeTemplateNetworkPolicy>, DbError> {
+    Ok(sqlx::query_as::<_, NodeTemplateNetworkPolicy>(sql!(
+        "WITH requested AS (
+                     SELECT DISTINCT UNNEST($1::TEXT[]) AS template
+                 ),
+                 private_requested AS (
+                     SELECT t.name
+                     FROM requested r
+                     JOIN templates t ON t.name = r.template
+                     WHERE NOT (t.visibility = 'generic' AND t.desired_state = 'present')
+                 ),
+                 placed AS (
+                     SELECT sb.template_id
+                     FROM sandboxes sb
+                     WHERE sb.target_node_id = $3
+                       AND EXISTS (SELECT 1 FROM private_requested)
+                     UNION
+                     SELECT sb.template_id
+                     FROM sandboxes sb
+                     WHERE sb.active_node_id = $3
+                       AND EXISTS (SELECT 1 FROM private_requested)
+                 )
+                 SELECT r.template,
+                        COALESCE(t.network_policy_json, $2::JSONB) AS network_policy_json,
+                        COALESCE(t.network_policy_generation, 0) AS network_policy_generation
+                 FROM requested r
+                 LEFT JOIN templates t ON t.name = r.template
+                 WHERE (t.visibility = 'generic' AND t.desired_state = 'present')
+                    OR t.name IN (SELECT template_id FROM placed)
+                    OR ($4 = 'worker' AND EXISTS (
+                        SELECT 1
+                        FROM kubernetes_pool_configs pc
+                        JOIN template_releases pr ON pr.id = pc.template_release_id
+                        WHERE pc.enabled
+                          AND pr.template_name = t.name
+                    ))
+                    OR ($4 = 'builder' AND EXISTS (
+                        SELECT 1
+                        FROM template_build_base_grants g
+                        WHERE g.base_template_name = t.name
+                          AND g.org_id = t.org_id
+                          AND ((g.builder_node_id IS NULL
+                                AND g.granted_at > NOW() - INTERVAL '1 hour')
+                               OR (g.builder_node_id = $3
+                                   AND g.granted_at > NOW() - INTERVAL '7 days'))
+                    ))"
+    ))
+    .bind(templates)
+    .bind(Json(NetworkPolicyV1::deny_all()))
+    .bind(node_id)
+    .bind(role.as_str())
+    .fetch_all(executor.into_sqlx())
+    .await?)
+}
+
+/// A requested template's base snapshot policy as a node reads it.
+#[derive(Debug, Clone, FromRow)]
+pub struct NodeTemplateBaseSnapshotPolicy {
+    pub template: String,
+    pub ensure_base_snapshot: bool,
+    pub snapshot_vcpu: Option<i32>,
+    pub snapshot_memory_mib: Option<i32>,
+}
+
+/// The base snapshot policy of each of `templates` that node `node_id`,
+/// in `role`, may see, as [`node_network_policies`] decides it, with the
+/// shape the node's own inventory last reported in place of the policy's.
+pub async fn node_base_snapshot_policies(
+    executor: impl Executor<'_>,
+    templates: &[String],
+    node_id: NodeId,
+    role: NodeRole,
+) -> Result<Vec<NodeTemplateBaseSnapshotPolicy>, DbError> {
+    Ok(sqlx::query_as::<_, NodeTemplateBaseSnapshotPolicy>(sql!(
+        "WITH requested AS (
+                 SELECT DISTINCT UNNEST($1::TEXT[]) AS template
+             ),
+             private_requested AS (
+                 SELECT t.name
+                 FROM requested r
+                 JOIN templates t ON t.name = r.template
+                 WHERE NOT (t.visibility = 'generic' AND t.desired_state = 'present')
+             ),
+             placed AS (
+                 SELECT sb.template_id
+                 FROM sandboxes sb
+                 WHERE sb.target_node_id = $2
+                   AND EXISTS (SELECT 1 FROM private_requested)
+                 UNION
+                 SELECT sb.template_id
+                 FROM sandboxes sb
+                 WHERE sb.active_node_id = $2
+                   AND EXISTS (SELECT 1 FROM private_requested)
+             ),
+             local_inventory AS (
+                 SELECT DISTINCT ON (nti.template_name)
+                        nti.template_name,
+                        nti.vcpu,
+                        nti.memory_mib
+                 FROM node_template_inventory nti
+                 WHERE nti.node_id = $2
+                   AND (nti.vcpu IS NOT NULL OR nti.memory_mib IS NOT NULL)
+                 ORDER BY nti.template_name,
+                          nti.observed_at DESC,
+                          nti.built_at DESC NULLS LAST,
+                          nti.content_hash ASC
+             )
+             SELECT r.template,
+                    COALESCE(p.ensure_base_snapshot, FALSE) AS ensure_base_snapshot,
+                    COALESCE(li.vcpu, p.snapshot_vcpu) AS snapshot_vcpu,
+                    COALESCE(li.memory_mib, p.snapshot_memory_mib) AS snapshot_memory_mib
+             FROM requested r
+             LEFT JOIN template_base_snapshot_policies p ON p.template = r.template
+             LEFT JOIN local_inventory li ON li.template_name = r.template
+             LEFT JOIN templates t ON t.name = r.template
+             WHERE (t.visibility = 'generic' AND t.desired_state = 'present')
+                OR t.name IN (SELECT template_id FROM placed)
+                OR ($3 = 'worker' AND EXISTS (
+                    SELECT 1
+                    FROM kubernetes_pool_configs pc
+                    JOIN template_releases pr ON pr.id = pc.template_release_id
+                    WHERE pc.enabled
+                      AND pr.template_name = t.name
+                ))
+                OR ($3 = 'builder' AND EXISTS (
+                    SELECT 1
+                    FROM template_build_base_grants g
+                    WHERE g.base_template_name = t.name
+                      AND g.org_id = t.org_id
+                      AND ((g.builder_node_id IS NULL
+                            AND g.granted_at > NOW() - INTERVAL '1 hour')
+                           OR (g.builder_node_id = $2
+                               AND g.granted_at > NOW() - INTERVAL '7 days'))
+                ))"
+    ))
+    .bind(templates)
+    .bind(node_id)
+    .bind(role.as_str())
+    .fetch_all(executor.into_sqlx())
+    .await?)
+}
+
+/// A requested template's desired state as a node reads it.
+#[derive(Debug, Clone)]
+pub struct NodeTemplateDesiredState {
+    pub template: String,
+    /// The stored desired state, unparsed.
+    pub desired_state: String,
+    pub default_auto_lifecycle_json: Option<AutoLifecyclePolicy>,
+    pub pool_target: Option<i32>,
+    pub pool_boot_mode: Option<String>,
+    pub pool_vcpu: Option<i32>,
+    pub pool_memory_mib: Option<i32>,
+    /// The node has a reason to hold the template, so it is answered.
+    pub admitted: bool,
+    /// The node's published inventory lists the template.
+    pub held_here: bool,
+}
+
+#[derive(FromRow)]
+struct NodeTemplateDesiredStateRow {
+    template: String,
+    desired_state: String,
+    default_auto_lifecycle_json: Option<Json<AutoLifecyclePolicy>>,
+    pool_target: Option<i32>,
+    pool_boot_mode: Option<String>,
+    pool_vcpu: Option<i32>,
+    pool_memory_mib: Option<i32>,
+    admitted: bool,
+    held_here: bool,
+}
+
+impl From<NodeTemplateDesiredStateRow> for NodeTemplateDesiredState {
+    fn from(row: NodeTemplateDesiredStateRow) -> Self {
+        Self {
+            template: row.template,
+            desired_state: row.desired_state,
+            default_auto_lifecycle_json: row.default_auto_lifecycle_json.map(|json| json.0),
+            pool_target: row.pool_target,
+            pool_boot_mode: row.pool_boot_mode,
+            pool_vcpu: row.pool_vcpu,
+            pool_memory_mib: row.pool_memory_mib,
+            admitted: row.admitted,
+            held_here: row.held_here,
+        }
+    }
+}
+
+/// The desired state of each of `templates` that has a row, for node
+/// `node_id` in `role`: `admitted` when the node may see it, as
+/// [`node_network_policies`] decides it, or when it isn't present and the
+/// node's inventory still holds it, so the node hears to delete it.
+pub async fn node_desired_states(
+    executor: impl Executor<'_>,
+    templates: &[String],
+    node_id: NodeId,
+    role: NodeRole,
+) -> Result<Vec<NodeTemplateDesiredState>, DbError> {
+    Ok(sqlx::query_as::<_, NodeTemplateDesiredStateRow>(sql!("WITH requested AS (
+                 SELECT DISTINCT UNNEST($1::TEXT[]) AS template
+             ),
+             private_requested AS (
+                 SELECT t.name
+                 FROM requested r
+                 JOIN templates t ON t.name = r.template
+                 WHERE NOT (t.visibility = 'generic' AND t.desired_state = 'present')
+             ),
+             placed AS (
+                 SELECT sb.template_id
+                 FROM sandboxes sb
+                 WHERE sb.target_node_id = $3
+                   AND EXISTS (SELECT 1 FROM private_requested)
+                 UNION
+                 SELECT sb.template_id
+                 FROM sandboxes sb
+                 WHERE sb.active_node_id = $3
+                   AND EXISTS (SELECT 1 FROM private_requested)
+             ),
+             local_inventory AS (
+                 SELECT DISTINCT ON (nti.template_name)
+                        nti.template_name,
+                        nti.vcpu,
+                        nti.memory_mib
+                 FROM node_template_inventory nti
+                 WHERE nti.node_id = $3
+                   AND (nti.vcpu IS NOT NULL OR nti.memory_mib IS NOT NULL)
+                 ORDER BY nti.template_name,
+                          nti.observed_at DESC,
+                          nti.built_at DESC NULLS LAST,
+                          nti.content_hash ASC
+             )
+             SELECT r.template,
+                    t.desired_state,
+                    al.default_auto_lifecycle_json,
+                    CASE
+                        WHEN $2 = 'worker' AND t.desired_state = 'present'
+                        THEN pp.target_count
+                        ELSE NULL
+                    END AS pool_target,
+                    CASE
+                        WHEN $2 = 'worker' AND t.desired_state = 'present'
+                        THEN pp.boot_mode
+                        ELSE NULL
+                    END AS pool_boot_mode,
+                    CASE
+                        WHEN $2 = 'worker' AND t.desired_state = 'present' AND pp.boot_mode = 'snapshot'
+                        THEN COALESCE(li.vcpu, bsp.snapshot_vcpu)
+                        ELSE NULL
+                    END AS pool_vcpu,
+                    CASE
+                        WHEN $2 = 'worker' AND t.desired_state = 'present' AND pp.boot_mode = 'snapshot'
+                        THEN COALESCE(li.memory_mib, bsp.snapshot_memory_mib)
+                        ELSE NULL
+                    END AS pool_memory_mib,
+                    COALESCE(
+                        (t.visibility = 'generic' AND t.desired_state = 'present')
+                        OR t.name IN (SELECT template_id FROM placed)
+                        OR ($2 = 'worker' AND EXISTS (
+                            SELECT 1
+                            FROM kubernetes_pool_configs pc
+                            JOIN template_releases pr ON pr.id = pc.template_release_id
+                            WHERE pc.enabled
+                              AND pr.template_name = t.name
+                        ))
+                        OR ($2 = 'builder' AND EXISTS (
+                            SELECT 1
+                            FROM template_build_base_grants g
+                            WHERE g.base_template_name = t.name
+                              AND g.org_id = t.org_id
+                              AND ((g.builder_node_id IS NULL
+                                    AND g.granted_at > NOW() - INTERVAL '1 hour')
+                                   OR (g.builder_node_id = $3
+                                       AND g.granted_at > NOW() - INTERVAL '7 days'))
+                        ))
+                        OR (t.desired_state <> 'present' AND EXISTS (
+                            SELECT 1
+                            FROM node_template_inventory nti
+                            WHERE nti.template_name = r.template
+                              AND nti.node_id = $3
+                        )),
+                        FALSE
+                    ) AS admitted,
+                    EXISTS (
+                        SELECT 1
+                        FROM node_template_inventory nti
+                        WHERE nti.template_name = r.template
+                          AND nti.node_id = $3
+                    ) AS held_here
+             FROM requested r
+             JOIN templates t ON t.name = r.template
+             LEFT JOIN template_default_auto_lifecycle_policies al
+                    ON al.template = r.template
+             LEFT JOIN template_pool_policies pp
+                    ON pp.template = r.template
+             LEFT JOIN template_base_snapshot_policies bsp
+                    ON bsp.template = r.template
+             LEFT JOIN local_inventory li
+                    ON li.template_name = r.template"))
+    .bind(templates)
+    .bind(role.as_str())
+    .bind(node_id)
+    .fetch_all(executor.into_sqlx())
+    .await?
+    .into_iter()
+    .map(NodeTemplateDesiredState::from)
+    .collect())
+}
+
+#[cfg(test)]
+mod visibility_tests;

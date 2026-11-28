@@ -7,9 +7,18 @@ use crate::proto::{
     FetchFirewallRulesRequest, FetchFirewallRulesResponse, FirewallRulesAssignment,
     FirewallRulesPendingRound, cluster_api_client::ClusterApiClient,
 };
+use pplx_space_cluster_trigger_queue::enqueue_triggers_tx;
+use pplx_space_firewall_rules_store::test_support::{rollout, save_targets, set_phase};
+use pplx_space_firewall_rules_store::{
+    Issuance, LeasedTarget, Opening, Requeue, RolloutId, Wakeup, issue_first_assignment,
+    lease_targets, open_round, requeue,
+};
+use pplx_space_node_status_store::test_support::{SnapshotSeed, upsert_snapshot};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_rpc_auth::test_support::{
     TokenReviewStatus, pod_bound_service_account_status, projected_token, service_account_status,
 };
+use pplx_space_state_reconciliation::ReconcileReason;
 use tonic::transport::Channel;
 
 const AUDIENCE: &str = "space-cluster-api";
@@ -123,17 +132,17 @@ async fn insert_revision(pool: &sqlx::PgPool, rules: &str) -> TestResult<Uuid> {
     Ok(id)
 }
 
-/// Give `node` an assignment to `revision` and a pending round, returning
-/// the response that carries them.
+/// Give `node` an assignment to `revision` and a pending round, asking about
+/// the generation `round` names, returning the response that carries them.
 async fn give_work(
     pool: &sqlx::PgPool,
     node: NodeId,
     generation: u64,
     (revision, rules): (Uuid, &str),
-    round: u64,
+    round: (u64, u64),
 ) -> TestResult<FetchFirewallRulesResponse> {
     let issued_at = time::OffsetDateTime::from_unix_timestamp_nanos(
-        1_790_000_000_000_000_000 + i128::from(round) * 1_000_123_000,
+        1_790_000_000_000_000_000 + i128::from(round.0) * 1_000_123_000,
     )?;
     sqlx::query(sql!(
         "INSERT INTO firewall_rules_node_assignments (node_id, assignment_generation, revision_id)
@@ -146,13 +155,15 @@ async fn give_work(
     .await?;
     sqlx::query(sql!(
         "INSERT INTO firewall_rules_node_observations (
-             node_id, manager_epoch, pending_round, pending_round_issued_at
+             node_id, manager_epoch, pending_round, pending_round_issued_at,
+             pending_assignment_generation
          )
-         VALUES ($1, 1, $2, $3)"
+         VALUES ($1, 1, $2, $3, $4)"
     ))
     .bind(node)
-    .bind(i64::try_from(round)?)
+    .bind(i64::try_from(round.0)?)
     .bind(issued_at)
+    .bind(i64::try_from(round.1)?)
     .execute(pool)
     .await?;
     Ok(response(
@@ -168,7 +179,7 @@ fn response(
     node: NodeId,
     generation: u64,
     (revision, rules): (Uuid, &str),
-    round: u64,
+    (round, round_generation): (u64, u64),
     issued_at: time::OffsetDateTime,
 ) -> FetchFirewallRulesResponse {
     FetchFirewallRulesResponse {
@@ -181,14 +192,16 @@ fn response(
         pending_round: Some(FirewallRulesPendingRound {
             round,
             issued_at: Some(std::time::SystemTime::from(issued_at).into()),
+            assignment_generation: Some(round_generation),
         }),
     }
 }
 
 /// Only node-ctl, bound by reviewed name and UID to exactly one live,
 /// enrolled worker, learns that worker's instructions, and never by its
-/// address: the server's peer address is worker B's. A revision that doesn't
-/// decode is an error, not no work.
+/// address: the server's peer address is worker B's. A's round asks about
+/// generation 0, not its assignment's. A revision that doesn't decode is an
+/// error, not no work.
 #[tokio::test(flavor = "current_thread")]
 async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
     let Some(fixture) = cluster_fixture().await? else {
@@ -214,7 +227,7 @@ async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
     .bind(unsynced)
     .execute(pool)
     .await?;
-    give_work(pool, b, 9, (ssh, SSH), 70).await?;
+    give_work(pool, b, 9, (ssh, SSH), (70, 9)).await?;
     service.firewall_enrollment =
         Enrollment::Fixture(vec![a, b, builder, deleted, twin, twin_peer]);
 
@@ -276,7 +289,7 @@ async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
             pending_round: None,
         })
     );
-    let a_work = give_work(pool, a, 4, (ordered, ORDERED), 7).await?;
+    let a_work = give_work(pool, a, 4, (ordered, ORDERED), (7, 0)).await?;
 
     let unreviewed = [
         (Some(REVIEWED_STATIC_TOKEN.to_owned()), denied()),
@@ -341,6 +354,96 @@ async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
     Ok(())
 }
 
+/// The node's real wakeup, as the controller queues it.
+struct Wake;
+
+impl Wakeup for Wake {
+    async fn wake<C>(&mut self, tx: &mut C, node: NodeId) -> Result<u64, DbError>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
+        enqueue_triggers_tx(tx, [node], ReconcileReason::FirewallRulesChanged).await
+    }
+}
+
+/// Lease `rollout`'s one target and issue it, returning the lease and the
+/// generation issued.
+async fn issue_one(
+    conn: &mut sqlx::PgConnection,
+    rollout: RolloutId,
+) -> TestResult<(LeasedTarget, u64)> {
+    let lease = std::time::Duration::from_secs(600);
+    let target = lease_targets(&mut *conn, rollout, 1, lease, 1)
+        .await?
+        .remove(0);
+    let first_check_in = std::time::Duration::from_secs(90);
+    match issue_first_assignment(&mut *conn, &target, first_check_in, &mut Wake).await? {
+        Issuance::Issued(stamp) => Ok((target, stamp.assignment_generation)),
+        other => panic!("{target:?} wasn't issued: {other:?}"),
+    }
+}
+
+/// The stack end to end: the round the opener committed comes back to its
+/// worker's canonical ID as it was asked, generation and original issue time
+/// included, after a later rollout moved the assignment on. Catches a Fetch
+/// that takes the round's generation from the assignment or maps either part
+/// from the wrong field.
+#[tokio::test(flavor = "current_thread")]
+async fn fetch_returns_the_round_its_writer_opened() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let mut service = fixture.service;
+    let pool = service.pool.clone();
+    let pool = &pool;
+    let a = register(pool, "worker", "ready", "192.0.2.10", "worker-a", "uid-a").await?;
+    upsert_snapshot(pool, a, SnapshotSeed::default()).await?;
+    service.firewall_enrollment = Enrollment::Fixture(vec![a]);
+    let mut conn = pool.acquire().await?;
+
+    let first = rollout(pool, "rolling").await?;
+    save_targets(pool, first, &[a]).await?;
+    let (target, asked) = issue_one(&mut conn, first).await?;
+    let Opening::Opened(question) = open_round(&mut conn, &target, 1, &mut Wake).await? else {
+        panic!("no round was opened");
+    };
+    assert_eq!(question.assignment_generation, Some(asked));
+    let release = Requeue::Release { error: None };
+    assert!(requeue(&mut *conn, &target, &release).await?);
+    set_phase(pool, first, "completed").await?;
+    let next = rollout(pool, "rolling").await?;
+    save_targets(pool, next, &[a]).await?;
+    let (_, current) = issue_one(&mut conn, next).await?;
+    assert_ne!(current, asked);
+    let revision = sqlx::query_scalar::<_, Uuid>(sql!(
+        "SELECT to_revision_id FROM firewall_rules_rollouts WHERE id = $1"
+    ))
+    .bind(next)
+    .fetch_one(pool)
+    .await?;
+
+    let token = projected_token("node-ctl-a");
+    let reviews = vec![(token.clone(), node_ctl_on("worker-a", "uid-a"))];
+    let mut harness = serve(service, reviews, true).await?;
+    assert_eq!(
+        fetch(&mut harness.client, Some(&token)).await?,
+        Ok(FetchFirewallRulesResponse {
+            node_id: a.to_string(),
+            assignment: Some(FirewallRulesAssignment {
+                generation: current,
+                revision_id: revision.to_string(),
+                revision: r#"{"schema_version":1,"rules":[]}"#.to_owned(),
+            }),
+            pending_round: Some(FirewallRulesPendingRound {
+                round: question.round,
+                issued_at: Some(std::time::SystemTime::from(question.issued_at).into()),
+                assignment_generation: Some(asked),
+            }),
+        })
+    );
+    Ok(())
+}
+
 /// Production's defaults refuse an otherwise valid caller: no node-ctl
 /// principal holds the authority, and no worker is enrolled.
 #[tokio::test(flavor = "current_thread")]
@@ -379,12 +482,12 @@ async fn fetch_is_closed_while_authority_or_enrollment_is_unapproved() -> TestRe
     Ok(())
 }
 
-/// A Fetch overlapping a commit that moves the worker to the next (revision,
-/// round) pair returns exactly the old pair: its first read fixes the snapshot
-/// before the commit. The writer locks the observations, the assignments, then
-/// the registrations, so each read in turn waits for the commit. Reading
-/// either part, or the binding the last commit deletes, in a later snapshot
-/// returns something else.
+/// A Fetch overlapping a commit that moves the worker to the next assignment
+/// and a round bound to its generation returns exactly the old pair: its
+/// first read fixes the snapshot before the commit. The writer locks the
+/// observations, the assignments, then the registrations, so each read in
+/// turn waits for the commit. Reading either part, or the binding the last
+/// commit deletes, in a later snapshot returns something else.
 #[tokio::test(flavor = "current_thread")]
 async fn fetch_returns_assignment_and_round_from_one_snapshot() -> TestResult {
     let Some(fixture) = cluster_fixture_with_max_connections(4).await? else {
@@ -399,7 +502,7 @@ async fn fetch_returns_assignment_and_round_from_one_snapshot() -> TestResult {
         (insert_revision(pool, ORDERED).await?, ORDERED),
         (insert_revision(pool, SSH).await?, SSH),
     ];
-    let mut old = give_work(pool, a, 1, revisions[0], 7).await?;
+    let mut old = give_work(pool, a, 1, revisions[0], (7, 1)).await?;
     let token = projected_token("node-ctl-a");
     let reviews = vec![(token.clone(), node_ctl_on("worker-a", "uid-a"))];
     let mut harness = serve(service, reviews, true).await?;
@@ -414,7 +517,7 @@ async fn fetch_returns_assignment_and_round_from_one_snapshot() -> TestResult {
         let issued_at = time::OffsetDateTime::from_unix_timestamp_nanos(
             1_800_000_000_000_000_000 + i128::from(round) * 1_000_456_000,
         )?;
-        let new = response(a, generation, *revision, round, issued_at);
+        let new = response(a, generation, *revision, (round, generation), issued_at);
 
         let mut writer = pool.begin().await?;
         sqlx::query(match step {
@@ -454,12 +557,14 @@ async fn fetch_returns_assignment_and_round_from_one_snapshot() -> TestResult {
         .await?;
         sqlx::query(sql!(
             "UPDATE firewall_rules_node_observations
-             SET pending_round = $2, pending_round_issued_at = $3
+             SET pending_round = $2, pending_round_issued_at = $3,
+                 pending_assignment_generation = $4
              WHERE node_id = $1"
         ))
         .bind(a)
         .bind(i64::try_from(round)?)
         .bind(issued_at)
+        .bind(i64::try_from(generation)?)
         .execute(&mut *writer)
         .await?;
         if delete {

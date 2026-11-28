@@ -1,7 +1,5 @@
-use pplx_space_sql_locator::sql;
 use std::time::Duration;
 
-use sqlx::FromRow;
 use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use tonic::{Code, Request, Status};

@@ -21,6 +21,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
+    DrainV2Control,
     ConcurrentRestoreControl,
     ConsoleControl,
     DrainGateControl,
@@ -106,6 +107,7 @@ from space_smoke.adapters import (
     SUSPEND_ROOTFS_OBJECTS,
     template_received_uuid,
 )
+from space_smoke.drain_v2 import DrainV2Assertions
 from space_smoke.concurrent_restore import ConcurrentRestoreAssertions
 from space_smoke.node_drain import NodeDrainAssertions
 from space_smoke.node_groups import NodeGroupAssertions
@@ -133,6 +135,7 @@ from space_smoke.execution_environment import (
 )
 from space_smoke.runtime_upgrade_campaign import CampaignControl, TemplateCampaignAssertions
 from space_smoke.drain_gate import DrainGateAssertions
+from space_smoke.no_free_slot import NoFreeSlotAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
 from space_smoke.sandbox_network_isolation import SandboxNetworkIsolationAssertions
 from space_smoke.storage_exchange import StorageExchangeScopingAssertions
@@ -992,6 +995,8 @@ class CommandSandboxFixture(ScenarioFixture):
     _node_ctl_facet_control: NodeCtlFacetControl | None = None
     _encrypted_resuspend_control: EncryptedResuspendControl | None = None
     _stopped_replacement_control: StoppedReplacementControl | None = None
+    _drain_v2_control: DrainV2Control | None = None
+    _create_sandbox: Callable[..., DurableLifecycleSandbox] | None = None
     _processes: ProcessSandbox | None = None
 
     fixture_name: ClassVar[str] = "command_sandbox"
@@ -1036,6 +1041,23 @@ class CommandSandboxFixture(ScenarioFixture):
             )
         return StoppedReplacementAssertions(
             self, self._stopped_replacement_control, self._context.scope
+        )
+
+    @property
+    def drain_v2(self) -> DrainV2Assertions:
+        """Drain the sandbox's worker with the v2 engine and judge what follows.
+
+        Each access builds fresh assertions that own the scenario's cordon,
+        drain and unseal compensations, so a scenario takes it once.
+        """
+
+        if self._drain_v2_control is None or self._create_sandbox is None:
+            raise SmokeConfigurationError(
+                "drain v2 control is only available on the kind backend "
+                "with a native sandbox collection"
+            )
+        return DrainV2Assertions(
+            self, self._drain_v2_control, self._create_sandbox, self._context.scope
         )
 
     def delete_sandbox(self, sandbox: CommandSandbox | None = None) -> int:
@@ -2979,9 +3001,14 @@ class KindAdmin(ScenarioFixture):
     def sandbox_template_name(self) -> str:
         """The bare template name (no tag or digest) selected for this scenario."""
 
+        return self.sandbox_template_selector().split("@", 1)[0].split(":", 1)[0]
+
+    def sandbox_template_selector(self) -> str:
+        """The full template selector (including any `:tag` or `@digest`) for this scenario."""
+
         if not self._template_selector:
             raise SmokeConfigurationError("the fixture template is unknown")
-        return self._template_selector.split("@", 1)[0].split(":", 1)[0]
+        return self._template_selector
 
 
 class KindNetworkEcw(Ecw):
@@ -3411,6 +3438,22 @@ class KindEcw(Ecw, KindAdmin):
         """The sandbox's running VM reports `environment`'s Firecracker."""
 
         expect_runtime(self, self._environment_control(), environment, sandbox_id, step=step)
+
+    _no_free_slot_assertions: NoFreeSlotAssertions | None = None
+
+    @property
+    def no_free_slot(self) -> NoFreeSlotAssertions:
+        """Privileged assertions for the activation limiter's network-slot check."""
+
+        if self._rate_limiter_control is None or self._rate_limit_probe is None:
+            raise SmokeConfigurationError(
+                "slot-check control is only available on the kind backend"
+            )
+        if self._no_free_slot_assertions is None:
+            self._no_free_slot_assertions = NoFreeSlotAssertions(
+                self, self._rate_limiter_control, self._rate_limit_probe, self._context.scope
+            )
+        return self._no_free_slot_assertions
 
     _cross_node_control: CrossNodeRestoreControl | None = None
     _cross_node_assertions: CrossNodeRestoreAssertions | None = None

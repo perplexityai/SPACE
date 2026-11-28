@@ -1,16 +1,54 @@
 //! `sandbox_snapshot_inventory`: the snapshots each sandbox's node last
-//! published for it, one row per `(sandbox, snapshot)`.
+//! published for it, one row per `(sandbox, snapshot)`. Its rows reference
+//! `sandbox_observed_states` (`pplx-space-sandbox-teardown`'s) with `ON DELETE
+//! CASCADE`: deleting a sandbox's observed row deletes its inventory rows.
 //!
 //! The census prune of rows for sandboxes no longer reported is part of
-//! [`crate::ingest`]. [`upsert_published`] is the publish path's upsert, run
-//! on the executor (usually the publish transaction) its caller passes; the
-//! publish path's prune of snapshots a node no longer lists is not in this
-//! crate yet.
+//! [`crate::ingest`]. [`prune_unpublished`] and [`upsert_published`] are the
+//! publish path's prune and upsert, run on the executor (usually the publish
+//! transaction) its caller passes.
 
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
 use sqlx::types::{Json, JsonValue};
+
+/// Delete the inventory rows of the sandboxes in `sandbox_ids` whose snapshot
+/// is not listed in `published` (an observed projection), a JSON array of
+/// objects with the keys `sandbox_id` and `snapshot_id`: the snapshots a
+/// node's publication no longer lists. Rows of other sandboxes are kept.
+pub async fn prune_unpublished(
+    executor: impl Executor<'_>,
+    sandbox_ids: &[SandboxId],
+    published: JsonValue,
+) -> Result<(), DbError> {
+    sqlx::query(sql!(
+        "WITH scope AS (
+             SELECT UNNEST($1::UUID[]) AS sandbox_id
+         ),
+         incoming AS (
+             SELECT *
+             FROM jsonb_to_recordset($2::jsonb) AS incoming(
+                 sandbox_id UUID,
+                 snapshot_id TEXT
+             )
+         )
+         DELETE FROM sandbox_snapshot_inventory ssi
+         USING scope
+         WHERE ssi.sandbox_id = scope.sandbox_id
+           AND NOT EXISTS (
+               SELECT 1
+               FROM incoming
+               WHERE incoming.sandbox_id = ssi.sandbox_id
+                 AND incoming.snapshot_id = ssi.snapshot_id
+           )"
+    ))
+    .bind(sandbox_ids)
+    .bind(Json(published))
+    .execute(executor.into_sqlx())
+    .await?;
+    Ok(())
+}
 
 /// Upsert the published snapshots in `snapshots` (an observed projection), a
 /// JSON array of objects with the keys `sandbox_id`, `snapshot_id`, `type`,
@@ -20,10 +58,10 @@ use sqlx::types::{Json, JsonValue};
 /// and a row whose published columns are unchanged is not rewritten, so its
 /// `observed_at` and `updated_at` keep their values.
 pub async fn upsert_published(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     sandbox_ids: &[SandboxId],
     snapshots: JsonValue,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbError> {
     sqlx::query(sql!(
         "WITH scope AS (
              SELECT UNNEST($1::UUID[]) AS sandbox_id
@@ -116,7 +154,7 @@ pub async fn upsert_published(
     ))
     .bind(sandbox_ids)
     .bind(Json(snapshots))
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }

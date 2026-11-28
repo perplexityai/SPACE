@@ -823,20 +823,24 @@ version = "1.1.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.kube]]
-version = "4.2.0"
+version = "4.2.1"
 criteria = "safe-to-deploy"
+notes = "Carry forward the existing exemption to the release fixing RUSTSEC-2026-0600. No imported audit covers this version; this is not an independent audit."
 
 [[exemptions.kube-client]]
-version = "4.2.0"
+version = "4.2.1"
 criteria = "safe-to-deploy"
+notes = "Carry forward the existing exemption to the release fixing RUSTSEC-2026-0600. No imported audit covers this version; this is not an independent audit."
 
 [[exemptions.kube-core]]
-version = "4.2.0"
+version = "4.2.1"
 criteria = "safe-to-deploy"
+notes = "Carry forward the existing exemption to the release fixing RUSTSEC-2026-0600. No imported audit covers this version; this is not an independent audit."
 
 [[exemptions.kube-runtime]]
-version = "4.2.0"
+version = "4.2.1"
 criteria = "safe-to-deploy"
+notes = "Carry forward the existing exemption to the release fixing RUSTSEC-2026-0600. No imported audit covers this version; this is not an independent audit."
 
 [[exemptions.libc]]
 version = "0.2.189"

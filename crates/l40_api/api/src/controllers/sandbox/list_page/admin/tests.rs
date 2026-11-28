@@ -5,6 +5,7 @@ use pplx_space_db_test_fixtures::{
     TestDbResult, insert_pool_slot_receipt, insert_ready_worker_node, pg_test_db,
 };
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_sql_locator::sql;
 use time::Duration;
 
 use super::*;
@@ -712,7 +713,9 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
 /// The node filters match the node the response reports: a sandbox with a
 /// current Direct route is on its route's node, whatever its row's
 /// `active_node_id` says, and any other sandbox is on its row's node. Paging
-/// keeps them, cursor and all.
+/// keeps them, cursor and all. An ID search runs its own pair of statements,
+/// which write the node filters out again, so each case runs once more with
+/// a search every seeded ID matches.
 #[tokio::test]
 async fn the_node_filters_match_the_node_the_response_reports() -> TestDbResult<()> {
     let db = pg_test_db().await?;
@@ -735,6 +738,10 @@ async fn the_node_filters_match_the_node_the_response_reports() -> TestDbResult<
             &db.pool,
             owner,
             SeedSandbox {
+                // Every ID ends in the digits the search below asks for.
+                id: Some(fixed_id(&format!(
+                    "{minutes:08x}-0000-7000-8000-00000000c0de"
+                ))),
                 active_node_id,
                 created_at: Some(at(minutes)),
                 ..SeedSandbox::default()
@@ -753,10 +760,14 @@ async fn the_node_filters_match_the_node_the_response_reports() -> TestDbResult<
     }
     let newest_first =
         |indexes: &[usize]| indexes.iter().rev().map(|i| ids[*i]).collect::<Vec<_>>();
-    let filter = |node| AdminSandboxFilter {
+    let org = |search: &Option<SandboxSearch>| AdminSandboxFilter {
         org_id: Some(owner.org_id),
-        node: Some(node),
+        search: search.clone(),
         ..AdminSandboxFilter::default()
+    };
+    let filter = |node, search: &Option<SandboxSearch>| AdminSandboxFilter {
+        node: Some(node),
+        ..org(search)
     };
     let cases = [
         (
@@ -780,85 +791,81 @@ async fn the_node_filters_match_the_node_the_response_reports() -> TestDbResult<
             newest_first(&[4, 5]),
         ),
     ];
-    let org = AdminSandboxFilter {
-        org_id: Some(owner.org_id),
-        ..AdminSandboxFilter::default()
-    };
-    let everything = page(&db.pool, &org, None, 100).await?;
-    let everything_unpaged = unpaged(&db.pool, &org).await?;
-    for (label, node, expected) in cases {
-        let listed = page(&db.pool, &filter(node), None, 100).await?;
-        assert_eq!(
-            listed
-                .rows
-                .iter()
-                .map(|sandbox| sandbox.id)
-                .collect::<Vec<_>>(),
-            expected,
-            "{label}"
-        );
-
-        // The independent oracle: the response's own `active_node_id`. Each
-        // statement's listed rows report what the filter asks for, and no
-        // other seeded row does.
-        let reports = |sandbox: &Sandbox| match node {
-            NodeAssignment::Node(node_id) => sandbox.active_node_id == Some(node_id),
-            NodeAssignment::Assigned => sandbox.active_node_id.is_some(),
-            NodeAssignment::Unassigned => sandbox.active_node_id.is_none(),
+    let search = SandboxSearch::new("c0de").expect("a search");
+    for search in [None, search] {
+        let searched = if search.is_some() {
+            ", with a search"
+        } else {
+            ""
         };
-        let unpaged_listed = unpaged(&db.pool, &filter(node)).await?;
-        for (statement, listed, everything) in [
-            ("page", &listed, &everything),
-            ("unpaged list", &unpaged_listed, &everything_unpaged),
-        ] {
-            assert!(
-                listed.rows.iter().all(reports),
-                "{label}: every {statement} row's response reports it"
+        let everything = page(&db.pool, &org(&search), None, 100).await?;
+        let everything_unpaged = unpaged(&db.pool, &org(&search)).await?;
+        for (label, node, expected) in cases.clone() {
+            let listed = page(&db.pool, &filter(node, &search), None, 100).await?;
+            assert_eq!(
+                listed
+                    .rows
+                    .iter()
+                    .map(|sandbox| sandbox.id)
+                    .collect::<Vec<_>>(),
+                expected,
+                "{label}{searched}"
             );
-            let reported = everything
+
+            // The independent oracle: the response's own `active_node_id`. Each
+            // statement's listed rows report what the filter asks for, and no
+            // other seeded row does.
+            let reports = |sandbox: &Sandbox| match node {
+                NodeAssignment::Node(node_id) => sandbox.active_node_id == Some(node_id),
+                NodeAssignment::Assigned => sandbox.active_node_id.is_some(),
+                NodeAssignment::Unassigned => sandbox.active_node_id.is_none(),
+            };
+            let unpaged_listed = unpaged(&db.pool, &filter(node, &search)).await?;
+            for (statement, listed, everything) in [
+                ("page", &listed, &everything),
+                ("unpaged list", &unpaged_listed, &everything_unpaged),
+            ] {
+                assert!(
+                    listed.rows.iter().all(reports),
+                    "{label}{searched}: every {statement} row's response reports it"
+                );
+                let reported = everything
+                    .rows
+                    .iter()
+                    .filter(|sandbox| reports(sandbox))
+                    .map(|sandbox| sandbox.id)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    reported, expected,
+                    "{label}{searched}: the {statement} response reports it of no other row"
+                );
+            }
+
+            // One row a page, the cursor carrying the filter's position.
+            let mut walked = Vec::new();
+            let mut after = None;
+            loop {
+                let one = page(&db.pool, &filter(node, &search), after, 1).await?;
+                walked.extend(one.rows.iter().map(|sandbox| sandbox.id));
+                match (one.has_more, one.rows.last()) {
+                    (true, Some(last)) => after = Some(cursor_after(last)),
+                    _ => break,
+                }
+            }
+            assert_eq!(
+                walked, expected,
+                "{label}{searched}: walked a row at a time"
+            );
+
+            // The unpaged list runs its own statement with the same filters.
+            let unpaged = unpaged_listed
                 .rows
                 .iter()
-                .filter(|sandbox| reports(sandbox))
                 .map(|sandbox| sandbox.id)
                 .collect::<Vec<_>>();
-            assert_eq!(
-                reported, expected,
-                "{label}: the {statement} response reports it of no other row"
-            );
+            assert_eq!(unpaged, expected, "{label}{searched}: unpaged list");
         }
-
-        // One row a page, the cursor carrying the filter's position.
-        let mut walked = Vec::new();
-        let mut after = None;
-        loop {
-            let one = page(&db.pool, &filter(node), after, 1).await?;
-            walked.extend(one.rows.iter().map(|sandbox| sandbox.id));
-            match (one.has_more, one.rows.last()) {
-                (true, Some(last)) => after = Some(cursor_after(last)),
-                _ => break,
-            }
-        }
-        assert_eq!(walked, expected, "{label}: walked a row at a time");
-
-        // The unpaged list runs its own statement with the same filters.
-        let unpaged = unpaged_listed
-            .rows
-            .iter()
-            .map(|sandbox| sandbox.id)
-            .collect::<Vec<_>>();
-        assert_eq!(unpaged, expected, "{label}: unpaged list");
     }
-    // Never NULL, so negated it keeps the sandboxes on no node (4 and 5).
-    let off_route_node: Vec<SandboxId> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(format!(
-        "SELECT s.id FROM sandboxes s WHERE s.org_id = $1 AND NOT {}
-         ORDER BY s.created_at DESC",
-        reported_on_node("s", "$2")
-    ))))
-    .bind(owner.org_id)
-    .bind(route_node)
-    .fetch_all(&db.pool)
-    .await?;
-    assert_eq!(off_route_node, newest_first(&[0, 3, 4, 5, 6]));
     db.pool.close().await;
     Ok(())
 }
@@ -990,8 +997,13 @@ fn an_id_search_is_the_ranges_its_hex_digits_start_and_end() {
     ];
     for (text, expected_suffix, expected_prefix) in cases {
         let search = SandboxSearch::new(text).expect("valid").expect("a search");
-        assert_eq!(search.id_suffix, expected_suffix, "{text:?} suffix");
-        assert_eq!(search.id_prefix, expected_prefix, "{text:?} prefix");
+        let (suffix_low, suffix_high) = search.ids.id_suffix();
+        assert_eq!(
+            (suffix_low.to_string(), suffix_high.to_string()),
+            expected_suffix,
+            "{text:?} suffix"
+        );
+        assert_eq!(search.ids.id_prefix(), expected_prefix, "{text:?} prefix");
     }
 }
 

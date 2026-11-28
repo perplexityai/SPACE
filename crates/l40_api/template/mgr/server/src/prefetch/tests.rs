@@ -533,7 +533,8 @@ async fn an_ignored_selector_expires_only_its_own_tag_s_pin() {
         runnable: BTreeSet::from([environment]),
     };
     let left_after = async |expired: bool| {
-        let pins = PinnedDigestsStore::new(Arc::new(std::sync::Mutex::new(crate::db::test_conn())));
+        let pins =
+            PinnedDigestsStore::new(crate::db::SharedConnection::new(crate::db::test_conn()));
         for tag in ["errored", "ignored"] {
             pins.upsert_tag("seed", tag, partition, "sha256:aa")
                 .unwrap();
@@ -561,6 +562,7 @@ async fn an_ignored_selector_expires_only_its_own_tag_s_pin() {
         let conn = pins.conn();
         let conn = conn.lock().unwrap();
         let mut stmt = conn
+            .raw()
             .prepare(
                 "SELECT tag, cache_partition FROM template_pinned_tags \
                  ORDER BY tag, cache_partition",

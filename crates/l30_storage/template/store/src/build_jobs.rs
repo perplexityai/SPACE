@@ -6,9 +6,10 @@
 //! organization is anyone's.
 
 use pplx_space_accounts::{NodeId, OrgId};
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
 use pplx_space_template_model::{BuildRunId, TemplateName};
-use sqlx::{FromRow, PgExecutor};
+use sqlx::FromRow;
 use time::OffsetDateTime;
 
 /// A build a builder accepted, for [`record_accepted`].
@@ -25,9 +26,9 @@ pub struct AcceptedBuild<'a> {
 /// Record `build`'s job and builder, creating its row or updating the one
 /// the spec wrote. `false` when another organization recorded the row.
 pub async fn record_accepted(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     build: AcceptedBuild<'_>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "INSERT INTO template_build_jobs (
                  template_id,
@@ -47,7 +48,7 @@ pub async fn record_accepted(
     .bind(build.daemon_job_id.to_string())
     .bind(build.builder_node_id.map(NodeId::as_uuid))
     .bind(build.org_id.as_uuid())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() != 0)
 }
@@ -64,12 +65,12 @@ pub struct BuildSpec<'a> {
 /// row or updating its spec. `false` when another organization recorded the
 /// row.
 pub async fn record_spec(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &TemplateName,
     build_id: &str,
     org_id: OrgId,
     spec: BuildSpec<'_>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, DbError> {
     let result = sqlx::query(sql!(
         "INSERT INTO template_build_jobs (template_id, build_id, cpu_count, memory_mb, tags, org_id)
              VALUES ($1, $2, $3, $4, $5, $6)
@@ -85,7 +86,7 @@ pub async fn record_spec(
     .bind(spec.memory_mb)
     .bind(spec.tags)
     .bind(org_id.as_uuid())
-    .execute(executor)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(result.rows_affected() != 0)
 }
@@ -93,12 +94,12 @@ pub async fn record_spec(
 /// The stored job id of build `build_id` of `template`, unparsed, when a
 /// builder accepted it and the row is `org_id`'s or no organization's.
 pub async fn daemon_job_id(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &TemplateName,
     build_id: &str,
     org_id: OrgId,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>(sql!(
+) -> Result<Option<String>, DbError> {
+    Ok(sqlx::query_scalar::<_, String>(sql!(
         "SELECT daemon_job_id
              FROM template_build_jobs
              WHERE template_id = $1
@@ -109,26 +110,26 @@ pub async fn daemon_job_id(
     .bind(template.as_str())
     .bind(build_id)
     .bind(org_id.as_uuid())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }
 
 /// The builder that accepted job `daemon_job_id`, or `None` when no row
 /// records the job, it was routed without a pinned builder, or the builder's
 /// node row has since been deleted.
 pub async fn builder_node(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     daemon_job_id: BuildRunId,
-) -> Result<Option<NodeId>, sqlx::Error> {
-    sqlx::query_as::<_, (Option<uuid::Uuid>,)>(sql!(
+) -> Result<Option<NodeId>, DbError> {
+    let row = sqlx::query_as::<_, (Option<uuid::Uuid>,)>(sql!(
         "SELECT builder_node_id
              FROM template_build_jobs
              WHERE daemon_job_id = $1"
     ))
     .bind(daemon_job_id.to_string())
-    .fetch_optional(executor)
-    .await
-    .map(|row| row.and_then(|(builder_node_id,)| builder_node_id.map(NodeId::from_uuid)))
+    .fetch_optional(executor.into_sqlx())
+    .await?;
+    Ok(row.and_then(|(builder_node_id,)| builder_node_id.map(NodeId::from_uuid)))
 }
 
 /// A build a builder accepted, as [`recent_accepted`] reads it.
@@ -143,11 +144,11 @@ pub struct RecordedBuild {
 /// The newest `limit` builds of `template` that a builder accepted, newest
 /// first. Rows recorded before submission carry no job id and are left out.
 pub async fn recent_accepted(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &TemplateName,
     limit: u32,
-) -> Result<Vec<RecordedBuild>, sqlx::Error> {
-    sqlx::query_as::<_, RecordedBuild>(sql!(
+) -> Result<Vec<RecordedBuild>, DbError> {
+    Ok(sqlx::query_as::<_, RecordedBuild>(sql!(
         "SELECT daemon_job_id, builder_node_id, created_at
              FROM template_build_jobs
              WHERE template_id = $1
@@ -157,8 +158,8 @@ pub async fn recent_accepted(
     ))
     .bind(template.as_str())
     .bind(i64::from(limit))
-    .fetch_all(executor)
-    .await
+    .fetch_all(executor.into_sqlx())
+    .await?)
 }
 
 /// A build's stored spec, as [`spec`] reads it.
@@ -172,12 +173,12 @@ pub struct StoredBuildSpec {
 /// The spec of build `build_id` of `template`, when the row is `org_id`'s or
 /// no organization's.
 pub async fn spec(
-    executor: impl PgExecutor<'_>,
+    executor: impl Executor<'_>,
     template: &TemplateName,
     build_id: &str,
     org_id: OrgId,
-) -> Result<Option<StoredBuildSpec>, sqlx::Error> {
-    sqlx::query_as::<_, StoredBuildSpec>(sql!(
+) -> Result<Option<StoredBuildSpec>, DbError> {
+    Ok(sqlx::query_as::<_, StoredBuildSpec>(sql!(
         "SELECT tags, cpu_count, memory_mb
              FROM template_build_jobs
              WHERE template_id = $1
@@ -187,6 +188,6 @@ pub async fn spec(
     .bind(template.as_str())
     .bind(build_id)
     .bind(org_id.as_uuid())
-    .fetch_optional(executor)
-    .await
+    .fetch_optional(executor.into_sqlx())
+    .await?)
 }

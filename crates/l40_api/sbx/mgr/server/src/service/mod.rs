@@ -411,6 +411,9 @@ pub struct SandboxManagerService {
     /// Guest maintenance leaves excess intent durable instead of queueing
     /// unbounded transfer/activation tasks alongside customer work.
     guest_update_sem: Arc<tokio::sync::Semaphore>,
+    /// Concurrent Stats calls. Stats takes no state-writer slot; excess polls
+    /// are rejected rather than queued, and the next poll retries.
+    stats_admission: Arc<tokio::sync::Semaphore>,
     guest_auto_updates: Arc<guest_update::automatic::Automatic>,
     automatic_guest_updates: bool,
     /// Shared blocking cleanup I/O budget, acquired before task allocation.
@@ -436,6 +439,7 @@ pub struct SandboxManagerService {
     /// for a sandbox. The durable operation itself lives in SQLite; this map
     /// only bounds concurrent reattachment attempts from shim polling.
     teardown_suspend_drivers: TeardownSuspendDrivers,
+    external_addresses: Arc<external_addresses::ExternalAddresses>,
     /// Node-wide admission for background durable-suspend drivers. A full
     /// semaphore returns `Pending` to the shim, whose next poll retries
     /// admission without leaving an unbounded queue of tasks on this node.
@@ -1894,6 +1898,9 @@ impl SandboxManagerService {
             ),
             cleanup_sem: Arc::new(tokio::sync::Semaphore::new(DEFAULT_CLEANUP_CONCURRENCY_CAP)),
             guest_update_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            stats_admission: Arc::new(tokio::sync::Semaphore::new(
+                grpc_spaced_files::STATS_CONCURRENCY_CAP,
+            )),
             guest_auto_updates: Arc::default(),
             automatic_guest_updates: options.automatic_guest_updates,
             cleanup_io: Arc::new(tokio::sync::Semaphore::new(CLEANUP_IO_CONCURRENCY_CAP)),
@@ -1912,6 +1919,7 @@ impl SandboxManagerService {
                 drain_node::drain_node_window_from_env(),
             )),
             teardown_suspend_drivers: Arc::new(dashmap::DashMap::new()),
+            external_addresses: Arc::default(),
             teardown_suspend_driver_sem: Arc::new(tokio::sync::Semaphore::new(
                 teardown_suspend_driver_concurrency,
             )),
@@ -2189,6 +2197,7 @@ mod eviction;
 pub(crate) mod snapshot_capture;
 pub(crate) use eviction::{EvictionClaim, is_unrecorded_snapshot_refusal};
 mod drain_node;
+mod external_addresses;
 mod grpc_auto_lifecycle_delete_receipts;
 mod grpc_core;
 mod grpc_lifecycle;

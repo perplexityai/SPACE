@@ -20,35 +20,17 @@ pub(crate) const KEY_BINDING_TTL_MINUTES: i32 = 10;
 /// no row with the `id` it selected, so it cannot delete a binding renewed
 /// under it, whatever version of the sweep is running.
 pub(crate) async fn bind_idempotency_key(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl pplx_space_postgres_pool::Executor<'_>,
     org_id: OrgId,
     idempotency: &CreatePublicOperationIdempotency<'_>,
 ) -> Result<bool, sqlx::Error> {
-    let bound = sqlx::query_scalar::<_, Uuid>(sql!(
-        "INSERT INTO public_idempotency_records (
-             id, org_id, api_product, method, path_template, idempotency_key,
-             request_fingerprint, response_json, expires_at
-         )
-         VALUES (
-             $1, $2, 'native', $3, $4, $5, $6, '{}'::jsonb,
-             NOW() + make_interval(mins => $7)
-         )
-         ON CONFLICT (org_id, api_product, method, path_template, idempotency_key) DO UPDATE
-         SET id = EXCLUDED.id,
-             request_fingerprint = EXCLUDED.request_fingerprint,
-             expires_at = EXCLUDED.expires_at
-         WHERE public_idempotency_records.expires_at <= NOW()
-            OR public_idempotency_records.request_fingerprint = EXCLUDED.request_fingerprint
-         RETURNING id"
-    ))
-    .bind(Uuid::now_v7())
-    .bind(org_id)
-    .bind(idempotency.method.as_str())
-    .bind(idempotency.path_template.as_str())
-    .bind(idempotency.key.as_str())
-    .bind(idempotency.request_fingerprint.as_str())
-    .bind(KEY_BINDING_TTL_MINUTES)
-    .fetch_optional(executor)
-    .await?;
-    Ok(bound.is_some())
+    operation_store::idempotency::bind_native_key(
+        executor,
+        Uuid::now_v7(),
+        idempotency.store_key(org_id),
+        idempotency.request_fingerprint.as_str(),
+        KEY_BINDING_TTL_MINUTES,
+    )
+    .await
+    .map_err(sqlx::Error::from)
 }
