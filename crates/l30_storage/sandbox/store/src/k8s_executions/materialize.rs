@@ -101,6 +101,53 @@ pub async fn record_pod_metadata(
         > 0)
 }
 
+/// Repair a missing `pod_uid` on `sandbox_id`'s active `'creating'` execution
+/// at `generation`, promoting it to `'created'` and stamping
+/// `pod_materialized_at` while leaving `pod_ip` `NULL`.
+///
+/// Applies only when `pod_uid` is non-blank and the execution is still
+/// `active`, at `generation`, in state `'creating'`, with no recorded `pod_uid`,
+/// `pod_ip`, or `pod_materialized_at`, and `updated_at` still equals
+/// `observed_updated_at`. If a concurrent materializer or same-generation reset
+/// has recorded or cleared a pod, stamped `pod_materialized_at`, or advanced
+/// `updated_at`, nothing changes and `false` is returned. The caller must pass
+/// its open transaction (`conn`).
+pub async fn repair_creating_pod_uid<C>(
+    conn: &mut C,
+    sandbox_id: SandboxId,
+    generation: i64,
+    pod_uid: &str,
+    observed_updated_at: time::OffsetDateTime,
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
+    Ok(sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET pod_uid = NULLIF(BTRIM($3::TEXT), ''),
+                state = 'created',
+                pod_materialized_at = COALESCE(pod_materialized_at, NOW()),
+                updated_at = NOW()
+          WHERE sandbox_id = $1
+            AND generation = $2
+            AND active
+            AND state = 'creating'
+            AND NULLIF(BTRIM(pod_uid), '') IS NULL
+            AND pod_ip IS NULL
+            AND pod_materialized_at IS NULL
+            AND updated_at = $4
+            AND NULLIF(BTRIM($3::TEXT), '') IS NOT NULL"
+    ))
+    .bind(sandbox_id)
+    .bind(generation)
+    .bind(pod_uid)
+    .bind(observed_updated_at)
+    .execute(conn.into_sqlx())
+    .await?
+    .rows_affected()
+        > 0)
+}
+
 /// Record `node_name` as the Kubernetes node of `sandbox_id`'s active
 /// execution when it records another, touching `updated_at` unless the
 /// execution is `recovering`. Returns whether the sandbox had an active
@@ -129,6 +176,59 @@ pub async fn record_node_name(
     .bind(node_name)
     .bind(sandbox_id)
     .fetch_one(executor.into_sqlx())
+    .await?)
+}
+
+/// Record `node_name` on `sandbox_id`'s active execution at `generation` while
+/// its pod identity still matches, returning the row's post-write `updated_at`
+/// (`None` when the execution was retired, suspended, moved to another
+/// generation, or no longer matches the expected pod identity).
+///
+/// When `expected_pod_uid` is `Some(uid)`, requires `pod_uid = uid`. When
+/// `None`, requires `NULLIF(BTRIM(pod_uid), '') IS NULL` and
+/// `pod_materialized_at IS NULL` so an unmaterialized create never writes
+/// placement onto a row another attempt already materialized.
+pub async fn record_node_name_fenced(
+    executor: impl Executor<'_>,
+    sandbox_id: SandboxId,
+    generation: i64,
+    expected_pod_uid: Option<&str>,
+    node_name: &str,
+) -> Result<Option<time::OffsetDateTime>, DbError> {
+    Ok(sqlx::query_scalar::<_, time::OffsetDateTime>(sql!(
+        "WITH matched AS (
+             SELECT id, k8s_node_name, updated_at
+               FROM sandbox_k8s_executions
+              WHERE sandbox_id = $2
+                AND generation = $3
+                AND active
+                AND state <> 'suspended'
+                AND CASE
+                    WHEN $4::TEXT IS NOT NULL THEN pod_uid = $4::TEXT
+                    ELSE NULLIF(BTRIM(pod_uid), '') IS NULL AND pod_materialized_at IS NULL
+                END
+              FOR NO KEY UPDATE
+         ),
+         updated AS (
+             UPDATE sandbox_k8s_executions AS e
+                SET k8s_node_name = $1::TEXT,
+                    updated_at = CASE
+                        WHEN e.state = 'recovering' THEN e.updated_at
+                        ELSE GREATEST(NOW(), e.updated_at + INTERVAL '1 microsecond')
+                    END
+               FROM matched
+              WHERE e.id = matched.id
+                AND matched.k8s_node_name IS DISTINCT FROM $1::TEXT
+             RETURNING e.updated_at
+         )
+         SELECT COALESCE((SELECT updated_at FROM updated), matched.updated_at)
+           FROM matched"
+    ))
+    .bind(node_name)
+    .bind(sandbox_id)
+    .bind(generation)
+    .bind(expected_pod_uid)
+    .fetch_optional(executor.into_sqlx())
     .await?)
 }
 

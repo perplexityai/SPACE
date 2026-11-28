@@ -1016,3 +1016,207 @@ async fn sweeper_revert_cleanup_deletes_a_restore_pod_that_bound_after_its_check
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn joined_create_fetches_scheduled_pod_when_cache_holds_unscheduled_pod() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
+        return Ok(());
+    }
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    insert_test_sandbox_row(&db.pool, sandbox_id, "creating").await?;
+    let worker = start_scripted_worker(ScriptedWorkerConfig::new([])).await?;
+    let pod_name_slot = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let pod_name_for_client = std::sync::Arc::clone(&pod_name_slot);
+    let (client, log) = scripted_kube_client(move |req| {
+        let name = pod_name_for_client.lock().unwrap().clone();
+        if !name.is_empty() && req.method == Method::GET && req.path == pod_path(&name) {
+            let mut scheduled = (*sandbox_pod_on_node(&name, WORKER_NODE, 1, "Running")).clone();
+            scheduled.metadata.namespace = Some("space".to_string());
+            scheduled.metadata.uid = Some(format!("{name}-uid"));
+            scheduled.status.get_or_insert_with(Default::default).pod_ip =
+                Some("127.0.0.1".to_string());
+            return pod_reply(&scheduled);
+        }
+        kube_status(StatusCode::NOT_FOUND, "NotFound")
+    });
+
+    let mut substrate = substrate_with_inventory_caches_and_pool(
+        vec![super::hydration_and_suspend::node_api_pod(worker.port)],
+        vec![super::super::tests::k8s_node_with_internal_ip(
+            WORKER_NODE,
+            "10.0.1.1",
+        )],
+        db.pool.clone(),
+    );
+    substrate.k8s.client = client;
+    substrate.k8s.sandbox_proxy_port = worker.port;
+    substrate.budgets.create_ready = Duration::from_secs(15);
+    let (substrate, mut feed) = substrate.with_pod_cache_feed(Vec::new());
+
+    let owner_exec = substrate
+        .store
+        .begin_activation_execution_row(
+            sandbox_id,
+            pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
+            pplx_space_sandbox_model::SandboxTransitionTargetState::Started,
+        )
+        .await?;
+    let pod_name = owner_exec.pod_name;
+    *pod_name_slot.lock().unwrap() = pod_name.clone();
+    let pod_uid = format!("{pod_name}-uid");
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+         SET state = 'running', pod_uid = $2, pod_ip = '127.0.0.1'
+         WHERE sandbox_id = $1 AND generation = $3"
+    ))
+    .bind(sandbox_id)
+    .bind(&pod_uid)
+    .bind(owner_exec.generation)
+    .execute(&db.pool)
+    .await?;
+
+    let mut record = pplx_space_node_api_sim::SandboxRecord::new_creating(
+        sandbox_id.to_string(),
+        "seed".into(),
+        "fc".into(),
+        "root".into(),
+        None,
+        false,
+    )
+    .with_allocation(1, &pod_uid, "127.0.0.1");
+    record.status = "running".into();
+    worker.sim.insert_new(record).await?;
+
+    let mut unscheduled_cached = k8s_openapi::api::core::v1::Pod::default();
+    unscheduled_cached.metadata.name = Some(pod_name.clone());
+    unscheduled_cached.metadata.namespace = Some("space".to_string());
+    unscheduled_cached.metadata.uid = Some(pod_uid);
+    unscheduled_cached.status = Some(k8s_openapi::api::core::v1::PodStatus {
+        phase: Some("Pending".to_string()),
+        ..Default::default()
+    });
+    feed.apply(unscheduled_cached);
+
+    let inputs = CreateInputs::new();
+    let template_ref = inputs.template_ref();
+    let mut request = inputs.create_request(sandbox_id, &template_ref);
+    request.wait_until_ready = false;
+    let outcome =
+        crate::controllers::substrate::SubstrateAdapter::create_execution(&substrate, request)
+            .await?;
+    assert!(outcome.binding.is_some());
+    let expected = pod_path(&pod_name);
+    let pod_gets = requests_matching(&log, &Method::GET)
+        .into_iter()
+        .filter(|req| req.path == expected)
+        .count();
+    assert_eq!(
+        pod_gets, 1,
+        "joined create must bypass an unscheduled cache view via one uncached pod GET"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn joined_create_waits_for_reflector_placement_without_uncached_get() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
+        return Ok(());
+    }
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    insert_test_sandbox_row(&db.pool, sandbox_id, "creating").await?;
+
+    let worker = start_scripted_worker(ScriptedWorkerConfig::new([])).await?;
+    let (client, log) =
+        scripted_kube_client(move |_req| kube_status(StatusCode::NOT_FOUND, "NotFound"));
+
+    let mut substrate = substrate_with_inventory_caches_and_pool(
+        vec![super::hydration_and_suspend::node_api_pod(worker.port)],
+        vec![super::super::tests::k8s_node_with_internal_ip(
+            WORKER_NODE,
+            "10.0.1.1",
+        )],
+        db.pool.clone(),
+    );
+    substrate.k8s.client = client;
+    substrate.k8s.sandbox_proxy_port = worker.port;
+    substrate.budgets.create_ready = Duration::from_secs(15);
+    substrate.budgets.reflector_wait = Duration::from_millis(250);
+    let (substrate, mut feed) = substrate.with_pod_cache_feed(Vec::new());
+
+    let owner_exec = substrate
+        .store
+        .begin_activation_execution_row(
+            sandbox_id,
+            pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
+            pplx_space_sandbox_model::SandboxTransitionTargetState::Started,
+        )
+        .await?;
+    let pod_name = owner_exec.pod_name;
+    let pod_uid = format!("{pod_name}-uid");
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+         SET state = 'running', pod_uid = $2, pod_ip = '127.0.0.1'
+         WHERE sandbox_id = $1 AND generation = $3"
+    ))
+    .bind(sandbox_id)
+    .bind(&pod_uid)
+    .bind(owner_exec.generation)
+    .execute(&db.pool)
+    .await?;
+
+    let mut record = pplx_space_node_api_sim::SandboxRecord::new_creating(
+        sandbox_id.to_string(),
+        "seed".into(),
+        "fc".into(),
+        "root".into(),
+        None,
+        false,
+    )
+    .with_allocation(1, &pod_uid, "127.0.0.1");
+    record.status = "running".into();
+    worker.sim.insert_new(record).await?;
+
+    let mut unscheduled_cached = k8s_openapi::api::core::v1::Pod::default();
+    unscheduled_cached.metadata.name = Some(pod_name.clone());
+    unscheduled_cached.metadata.namespace = Some("space".to_string());
+    unscheduled_cached.metadata.uid = Some(pod_uid.clone());
+    unscheduled_cached.status = Some(k8s_openapi::api::core::v1::PodStatus {
+        phase: Some("Pending".to_string()),
+        ..Default::default()
+    });
+    feed.apply(unscheduled_cached);
+
+    let scheduled_name = pod_name.clone();
+    let scheduled_uid = pod_uid.clone();
+    let deliver = tokio::spawn(async move {
+        feed.wait_for_subscriber().await;
+        let mut scheduled =
+            (*sandbox_pod_on_node(&scheduled_name, WORKER_NODE, 1, "Pending")).clone();
+        scheduled.metadata.namespace = Some("space".to_string());
+        scheduled.metadata.uid = Some(scheduled_uid);
+        feed.apply(scheduled);
+    });
+
+    let inputs = CreateInputs::new();
+    let template_ref = inputs.template_ref();
+    let mut request = inputs.create_request(sandbox_id, &template_ref);
+    request.wait_until_ready = false;
+    let outcome =
+        crate::controllers::substrate::SubstrateAdapter::create_execution(&substrate, request)
+            .await?;
+    deliver.await?;
+    assert!(outcome.binding.is_some());
+    assert!(outcome.active_node_id.is_some());
+    let expected = pod_path(&pod_name);
+    let pod_gets = requests_matching(&log, &Method::GET)
+        .into_iter()
+        .filter(|req| req.path == expected)
+        .count();
+    assert_eq!(
+        pod_gets, 0,
+        "healthy reflector delivering scheduler binding within reflector_wait must emit zero pod GETs"
+    );
+    Ok(())
+}

@@ -2932,8 +2932,12 @@ impl NodeDrainSink for SubstrateSink {
                 | SubstrateError::Unsupported { message }
                 | SubstrateError::NodeTombstoned { message }
                 | SubstrateError::EvacuationClaimLost { message }
+                | SubstrateError::CreateSuperseded { message }
                 | SubstrateError::Failed { message },
             ) => Err(PromoteError::NodeApi(message)),
+            Err(SubstrateError::JoinedCreateFailed { source }) => {
+                Err(PromoteError::NodeApi(source.to_string()))
+            }
         }
     }
 

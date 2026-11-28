@@ -715,11 +715,14 @@ fn reconnect_error_outcome(
             initial_lifecycle_terminal_phase(initial_lifecycle),
             ReconnectReason::LockContention,
         ),
-        SubstrateError::Failed { .. } => (
+        SubstrateError::Failed { .. } | SubstrateError::CreateSuperseded { .. } => (
             ReconnectOutcome::WakeFailed,
             initial_lifecycle_terminal_phase(initial_lifecycle),
             ReconnectReason::Failed,
         ),
+        SubstrateError::JoinedCreateFailed { source } => {
+            reconnect_error_outcome(initial_lifecycle, source)
+        }
         SubstrateError::Cancelled { .. } => (
             ReconnectOutcome::WakeFailed,
             initial_lifecycle_terminal_phase(initial_lifecycle),

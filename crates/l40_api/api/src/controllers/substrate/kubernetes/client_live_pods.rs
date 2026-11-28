@@ -43,6 +43,7 @@ use kube::runtime::watcher;
 use pplx_space_accounts::ClientId;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_pod::STOPPED_MATERIALIZATION_CHECKPOINT;
+use tokio::time::Instant;
 
 use super::sandbox_pod_view::{SandboxPodKey, SandboxPodView};
 use crate::controllers::substrate::{
@@ -60,9 +61,12 @@ pub(super) struct ClientLivePods {
 struct ClientLivePodsState {
     live: ClientLivePodIndex,
     rebuilding: Option<ClientLivePodIndex>,
-    /// Set by a watch error or a re-list's start; cleared by the next live
-    /// event or the re-list's swap.
-    watch_failing: bool,
+    /// When the watch stream faulted or ended; cleared by the next live
+    /// delivery or completed re-list swap. Tracked separately from `rebuilding`
+    /// so a healthy paginated re-list (`Init` -> `InitApply` -> `InitDone`)
+    /// keeps the per-client count untrusted until `InitDone` without reporting
+    /// the watch stream itself as faulted.
+    watch_faulted_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -175,7 +179,6 @@ impl ClientLivePods {
             }
             watcher::Event::Init => {
                 state.rebuilding = Some(ClientLivePodIndex::default());
-                state.watch_failing = true;
                 false
             }
             watcher::Event::InitApply(pod) => {
@@ -188,17 +191,34 @@ impl ClientLivePods {
             }
         };
         if delivering {
-            state.watch_failing = false;
+            state.watch_faulted_at = None;
         }
     }
 
     /// The watch returned an error, or its stream ended: stop trusting the
-    /// index until the next live event or completed re-list.
+    /// index until the next live event or completed re-list, preserving the
+    /// initial fault timestamp across repeated errors in the same outage.
     pub(super) fn mark_watch_error(&self) {
         self.index
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .watch_failing = true;
+            .watch_faulted_at
+            .get_or_insert_with(Instant::now);
+    }
+
+    /// When the sandbox-pod watch faulted or ended if it hasn't yet delivered
+    /// a live event or completed a re-list.
+    pub(super) fn watch_faulted_at(&self) -> Option<Instant> {
+        self.index
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .watch_faulted_at
+    }
+
+    /// True while the sandbox-pod watch has faulted or ended and hasn't yet
+    /// delivered a live event or completed a re-list.
+    pub(super) fn is_watch_failing(&self) -> bool {
+        self.watch_faulted_at().is_some()
     }
 
     /// Count the distinct sandboxes, other than `activating` and those in
@@ -214,7 +234,7 @@ impl ClientLivePods {
             return LiveSandboxCount::Unknown(LiveSandboxCountUnknown::PodCacheCold);
         }
         let state = self.index.read().unwrap_or_else(PoisonError::into_inner);
-        if state.watch_failing {
+        if state.watch_faulted_at.is_some() || state.rebuilding.is_some() {
             return LiveSandboxCount::Unknown(LiveSandboxCountUnknown::PodCacheStale);
         }
         LiveSandboxCount::Known(state.live.count(ids, exclusions))

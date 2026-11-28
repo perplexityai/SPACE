@@ -819,6 +819,7 @@ async fn every_pod_build_path_renders_the_environment() {
         pod_materialized: false,
         state: ActiveExecutionState::Creating,
         create_age_expired: false,
+        updated_at: time::OffsetDateTime::UNIX_EPOCH,
         activation_attempt_id: None,
         route_activation_id: None,
     };

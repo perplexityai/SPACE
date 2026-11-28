@@ -48,7 +48,9 @@ impl KubernetesSubstrate {
     /// data-plane, delete and cancel-rate budgets, and its abandoned-restore
     /// retirement switch (off), are the ones [`Self::try_from_env`] computes
     /// with none of their variables set, and its other waits are
-    /// production's. The node-api client still reads its transport and bearer tokens from the
+    /// production's, save the reflector waits ([`TEST_REFLECTOR_WAIT`]),
+    /// because no reflector feeds its caches after seeding. The node-api client
+    /// still reads its transport and bearer tokens from the
     /// process environment, as in production.
     pub fn with_seeded_caches(
         pool: PgPool,
@@ -62,7 +64,11 @@ impl KubernetesSubstrate {
         substrate.k8s.k8s_blocking_delete_timeout = DEFAULT_K8S_BLOCKING_DELETE_TIMEOUT;
         substrate.k8s.abandoned_restore_retirement = AbandonedRestoreRetirement::Disabled;
         substrate.cancel_tracker = CancelRateTracker::with_default_budget();
-        substrate.budgets = SubstrateBudgets::default();
+        substrate.budgets = SubstrateBudgets {
+            reflector_wait: TEST_REFLECTOR_WAIT,
+            readiness_quiet_reflector: TEST_REFLECTOR_WAIT,
+            ..SubstrateBudgets::DEFAULT
+        };
         substrate.restore_waiters = RestoreWaiters::new(
             substrate.store.clone(),
             substrate.shutdown_token.clone(),
@@ -163,6 +169,7 @@ pub(super) fn assemble_substrate(
         pod_network_slots: pod_indexes.network_slots,
         pod_client_index: pod_indexes.client_pods,
         pod_events: pod_reflector::PodEvents::for_test(),
+        pod_sandbox_rejections: pod_sandbox_rejections::PodSandboxRejections::default(),
         pod_reflector_ready: ReflectorReady::always_ready(),
         cancel_tracker: Arc::new(CancelRateTracker::with_budget(64)),
         // Gate closed: a closed gate issues no query, so a lazily-connected
@@ -174,10 +181,137 @@ pub(super) fn assemble_substrate(
         runtime_policy: RuntimePolicyCache::default(),
         budgets: SubstrateBudgets {
             reflector_wait: TEST_REFLECTOR_WAIT,
+            readiness_quiet_reflector: TEST_REFLECTOR_WAIT,
             ..SubstrateBudgets::DEFAULT
         },
+        #[cfg(test)]
+        readiness_test_hooks: wait_ready::target::ReadinessTestHooks::default(),
         shutdown_token,
         task_tracker,
+    }
+}
+
+/// A feed into a substrate's sandbox-pod cache, standing in for the
+/// reflector's watch: each update reaches the store and the substrate's
+/// [`pod_reflector::PodEvents`] as the watch's would.
+#[cfg(test)]
+pub(super) struct PodCacheFeed {
+    writer: sandbox_pod_view::SandboxPodWriter,
+    events: tokio::sync::broadcast::Sender<String>,
+    delivered: pod_reflector::DeliveryClock,
+}
+
+#[cfg(test)]
+impl PodCacheFeed {
+    /// The watch reports `pod` added or changed.
+    pub(super) fn apply(&mut self, pod: Pod) {
+        self.update(Event::Apply(SandboxPodView::from(pod)));
+    }
+
+    /// The watch reports `pod` deleted.
+    pub(super) fn delete(&mut self, pod: Pod) {
+        self.update(Event::Delete(SandboxPodView::from(pod)));
+    }
+
+    /// The watch reports an error or stream disconnect.
+    pub(super) fn mark_watch_error(&mut self) {
+        self.writer.mark_watch_error();
+        let _ = self.events.send(String::new());
+    }
+
+    /// Wait until at least one subscriber is listening on `pod_events`, so
+    /// tests synchronize deterministically with `subscribe()` rather than
+    /// racing wall-clock sleeps against preceding Postgres queries.
+    pub(super) async fn wait_for_subscriber(&self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while self.events.receiver_count() == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for pod_events subscriber"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Begin a paginated re-list (`Event::Init`).
+    pub(super) fn begin_relist(&mut self) {
+        self.writer.apply_watcher_event(&Event::Init);
+    }
+
+    /// Buffer one re-list item (`Event::InitApply`) without swapping the store.
+    pub(super) fn relist_apply(&mut self, pod: Pod) {
+        let view = SandboxPodView::from(pod);
+        self.writer.apply_watcher_event(&Event::InitApply(view));
+        self.delivered.stamp();
+    }
+
+    /// Swap the buffered re-list into the readable store (`Event::InitDone`).
+    pub(super) fn finish_relist(&mut self) {
+        self.writer.apply_watcher_event(&Event::InitDone);
+        self.delivered.stamp();
+        let _ = self.events.send(String::new());
+    }
+
+    /// The watch resets and re-lists `pods` (`Init` -> `InitApply*` ->
+    /// `InitDone`), mirroring `reflect_sandbox_pods`'s ordering where
+    /// `InitApply` buffers privately before `InitDone` swaps the store.
+    pub(super) fn relist(&mut self, pods: impl IntoIterator<Item = Pod>) {
+        self.begin_relist();
+        for pod in pods {
+            self.relist_apply(pod);
+        }
+        self.finish_relist();
+    }
+
+    fn update(&mut self, event: Event<SandboxPodView>) {
+        let (Event::Apply(pod) | Event::Delete(pod)) = &event else {
+            unreachable!("only single-pod updates are fed");
+        };
+        let name = pod.name().to_owned();
+        self.writer.apply_watcher_event(&event);
+        self.delivered.stamp();
+        // No receiver is a wait that has not subscribed yet; the store holds
+        // the update for it.
+        if self.events.send(name).is_err() {
+            tracing::debug!("no wait subscribed to the fed pod update");
+        }
+    }
+}
+
+#[cfg(test)]
+impl KubernetesSubstrate {
+    /// This substrate with a sandbox-pod cache that holds `pods` and is fed
+    /// afterwards through the returned [`PodCacheFeed`].
+    pub(super) fn with_pod_cache_feed(mut self, pods: Vec<Pod>) -> (Self, PodCacheFeed) {
+        let (pod_store, indexes, writer) = sandbox_pod_view::seeded_sandbox_pod_cache(pods);
+        let (pod_events, events) = pod_reflector::PodEvents::for_test_with_sender();
+        self.pod_store = pod_store;
+        self.pod_network_slots = indexes.network_slots;
+        self.pod_client_index = indexes.client_pods;
+        let delivered = pod_events.delivery_clock();
+        self.pod_events = pod_events;
+        self.budgets.readiness_quiet_reflector =
+            SubstrateBudgets::DEFAULT.readiness_quiet_reflector;
+        (
+            self,
+            PodCacheFeed {
+                writer,
+                events,
+                delivered,
+            },
+        )
+    }
+
+    /// This substrate with the process's watch of sandbox refusals running
+    /// on its apiserver client, as [`Self::try_from_env`] starts it.
+    pub(crate) fn with_pod_sandbox_rejection_watch(mut self) -> Self {
+        self.pod_sandbox_rejections = pod_sandbox_rejections::PodSandboxRejections::start(
+            self.k8s.client.clone(),
+            &self.k8s.sandbox_namespace,
+            self.shutdown_token.clone(),
+            &self.task_tracker,
+        );
+        self
     }
 }
 

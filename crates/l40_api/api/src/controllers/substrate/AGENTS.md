@@ -138,6 +138,29 @@ For new work:
   `select_ready_worker_node_api_target`) and `supports_node_drain`, a
   capability for a missing feature, are debt, not precedent.
 
+## Kubernetes API Watch and Read Discipline
+
+- Never open per-pod `WATCH` streams or per-create field-selected `Event`
+  `WATCH` streams (especially with `resourceVersion="0"`, which forces
+  `kube-apiserver` to scan the entire namespace event ring in etcd on every
+  cold create) on request hot paths. Pod IP readiness and pod-status checks
+  consume the process-wide `Store<SandboxPodView>` and `PodEvents` reflector in
+  `kubernetes/pod_reflector.rs`, and node sandbox-creation refusals (`FailedCreatePodSandBox`)
+  consume the single namespace-scoped watch in `kubernetes/pod_sandbox_rejections.rs`.
+- Don't run routine timer-driven uncached `GET /pods/{name}` backstops or fall
+  through to uncached `GET`s for `Pending` pods already present in
+  `Store<SandboxPodView>` while the shared pod reflector is healthy. Reserve
+  uncached pod `GET`s strictly for confirming cache-miss `404` / terminal
+  identity before destructive state transitions, for the bounded one-shot
+  post-readiness placement recovery `GET` in `read_scheduled_create_pod` when a
+  joined create's proxy is already ready while a healthy reflector still shows
+  `Pending` without `spec.nodeName`, or for paced fallback when the pod
+  reflector is demonstrably degraded (initial sync incomplete, watch faulted,
+  or silent past `readiness_quiet_reflector`). Degraded-mode fallback `GET`s
+  during readiness must stay strictly bounded by `readiness_pod_get`, mustn't
+  overlap, and must fail fast with `SubstrateError::Unavailable` on `429`,
+  `5xx`, or per-`GET` timeout rather than burning the outer create budget.
+
 ## Tests
 
 Kubernetes pod rendering is owned by `pplx_space_sandbox_pod`.

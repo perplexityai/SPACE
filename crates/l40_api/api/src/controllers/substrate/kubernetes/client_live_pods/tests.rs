@@ -272,7 +272,8 @@ fn a_cold_or_failing_reflector_answers_unknown() {
         LiveSandboxCount::Known(2),
         "an event after the error shows the watch is delivering again"
     );
-    // A re-list keeps the count untrusted until its rebuilt index is in.
+    // A healthy re-list keeps the per-client count untrusted until its rebuilt
+    // index is swapped in, without marking the watch stream itself as faulted.
     index.apply(&Event::Init);
     index.apply(&Event::InitApply(pod(
         "c-1",
@@ -281,6 +282,10 @@ fn a_cold_or_failing_reflector_answers_unknown() {
         "Running",
         false,
     )));
+    assert!(
+        !index.is_watch_failing(),
+        "an active paginated re-list without a watch error isn't a watch failure"
+    );
     assert_eq!(
         index.count(&alpha, &exclusions, true),
         LiveSandboxCount::Unknown(LiveSandboxCountUnknown::PodCacheStale),
@@ -291,6 +296,14 @@ fn a_cold_or_failing_reflector_answers_unknown() {
         index.count(&alpha, &exclusions, true),
         LiveSandboxCount::Known(1)
     );
+
+    // A faulted watch stays marked failing through `Init` and `InitApply`
+    // until `InitDone` completes the recovery list.
+    index.mark_watch_error();
+    index.apply(&Event::Init);
+    assert!(index.is_watch_failing());
+    index.apply(&Event::InitDone);
+    assert!(!index.is_watch_failing());
 }
 
 /// A drain's stopped re-placement pod runs no VM, so it never counts while

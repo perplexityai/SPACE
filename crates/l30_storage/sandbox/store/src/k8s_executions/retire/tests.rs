@@ -8,8 +8,9 @@ use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
 use super::{
-    ExecutionFence, abandon_unmaterialized_create_claim, finish_active, finish_fenced,
-    finish_generation, finish_generation_attempt,
+    ExecutionFence, ObservedAttemptPodFence, abandon_unmaterialized_create_claim, finish_active,
+    finish_fenced, finish_generation, finish_generation_attempt,
+    finish_generation_observed_attempt,
 };
 use crate::k8s_executions::claim;
 
@@ -382,6 +383,316 @@ async fn a_replacement_claim_goes_live_only_after_the_retire_before_it() -> Test
             (1, "replaced".to_string(), false, None, true),
             (2, "creating".to_string(), true, None, false),
         ]
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn finish_generation_observed_attempt_fences_null_and_successor_attempts() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let successor = SandboxActivationAttemptId::new();
+    let other = SandboxActivationAttemptId::new();
+
+    // Observed `None` must not retire the generation once a successor attempt
+    // claims `activation_attempt_id = Some(successor)`.
+    let claimed_by_successor = insert_with_execution(
+        pool,
+        &Seed {
+            activation_attempt_id: Some(successor),
+            ..Seed::active(4, "creating")
+        },
+    )
+    .await?;
+    let before = rows(pool, claimed_by_successor).await?;
+    assert!(
+        !finish_generation_observed_attempt(
+            pool,
+            claimed_by_successor,
+            4,
+            None,
+            ObservedAttemptPodFence::exact_uid(None),
+            "lost",
+        )
+        .await?
+    );
+    assert!(
+        !finish_generation_observed_attempt(
+            pool,
+            claimed_by_successor,
+            4,
+            Some(other),
+            ObservedAttemptPodFence::exact_uid(None),
+            "lost",
+        )
+        .await?
+    );
+    assert_eq!(rows(pool, claimed_by_successor).await?, before);
+    assert!(
+        finish_generation_observed_attempt(
+            pool,
+            claimed_by_successor,
+            4,
+            Some(successor),
+            ObservedAttemptPodFence::exact_uid(None),
+            "lost",
+        )
+        .await?
+    );
+    assert_eq!(rows(pool, claimed_by_successor).await?, retired(4, "lost"));
+
+    // Observed `pod_uid = None` refuses once a concurrent materializer records
+    // `uid-live`, and observed `Some("uid-old")` refuses once `pod_uid` changes.
+    let materialized = insert_with_execution(
+        pool,
+        &Seed {
+            activation_attempt_id: Some(successor),
+            pod_uid: Some("uid-live"),
+            ..Seed::active(6, "created")
+        },
+    )
+    .await?;
+    let materialized_before = rows(pool, materialized).await?;
+    assert!(
+        !finish_generation_observed_attempt(
+            pool,
+            materialized,
+            6,
+            Some(successor),
+            ObservedAttemptPodFence::exact_uid(None),
+            "lost",
+        )
+        .await?
+    );
+    assert!(
+        !finish_generation_observed_attempt(
+            pool,
+            materialized,
+            6,
+            Some(successor),
+            ObservedAttemptPodFence::exact_uid(Some("uid-old")),
+            "lost",
+        )
+        .await?
+    );
+    assert_eq!(rows(pool, materialized).await?, materialized_before);
+    assert!(
+        finish_generation_observed_attempt(
+            pool,
+            materialized,
+            6,
+            Some(successor),
+            ObservedAttemptPodFence::exact_uid(Some("uid-live")),
+            "lost",
+        )
+        .await?
+    );
+    assert_eq!(rows(pool, materialized).await?, retired(6, "lost"));
+
+    // Observed `None` still retires an unclaimed (`activation_attempt_id IS NULL`)
+    // active execution at the matching generation, and ignores `Some(...)`.
+    let unclaimed = insert_with_execution(pool, &Seed::active(5, "creating")).await?;
+    let unclaimed_before = rows(pool, unclaimed).await?;
+    assert!(
+        !finish_generation_observed_attempt(
+            pool,
+            unclaimed,
+            5,
+            Some(successor),
+            ObservedAttemptPodFence::exact_uid(None),
+            "lost",
+        )
+        .await?
+    );
+    assert_eq!(rows(pool, unclaimed).await?, unclaimed_before);
+    assert!(
+        finish_generation_observed_attempt(
+            pool,
+            unclaimed,
+            5,
+            None,
+            ObservedAttemptPodFence::exact_uid(None),
+            "lost",
+        )
+        .await?
+    );
+    assert_eq!(rows(pool, unclaimed).await?, retired(5, "lost"));
+
+    // `observed_row` with `pod_uid = None` fences on both `pod_materialized_at`
+    // and `updated_at`, so a subsequent `reset_to_creating` (whether after a
+    // pod materialized or on an unmaterialized claim) rejects the stale `404`.
+    let reset_race = insert_with_execution(
+        pool,
+        &Seed {
+            activation_attempt_id: Some(successor),
+            ..Seed::active(7, "creating")
+        },
+    )
+    .await?;
+    let observed_ts: time::OffsetDateTime = sqlx::query_scalar(sql!(
+        "SELECT updated_at FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND generation = 7"
+    ))
+    .bind(reset_race)
+    .fetch_one(pool)
+    .await?;
+    assert!(claim::reset_to_creating(pool, reset_race, 7, Some(successor)).await?);
+    assert!(
+        !finish_generation_observed_attempt(
+            pool,
+            reset_race,
+            7,
+            Some(successor),
+            ObservedAttemptPodFence::observed_row(None, false, observed_ts),
+            "forgotten",
+        )
+        .await?
+    );
+    let post_reset_ts: time::OffsetDateTime = sqlx::query_scalar(sql!(
+        "SELECT updated_at FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND generation = 7"
+    ))
+    .bind(reset_race)
+    .fetch_one(pool)
+    .await?;
+    assert!(
+        finish_generation_observed_attempt(
+            pool,
+            reset_race,
+            7,
+            Some(successor),
+            ObservedAttemptPodFence::observed_row(None, false, post_reset_ts),
+            "forgotten",
+        )
+        .await?
+    );
+
+    // `deleted_create_pod(Some(uid), Some(epoch))` retires both a
+    // readiness-repaired row (`pod_uid = uid`) and an unrepaired initial claim
+    // at `epoch`, while rejecting a reset row (whether `pod_materialized_at` is
+    // set or `reset_to_creating` advanced `updated_at` with `pod_materialized_at`
+    // still `NULL`) or a different UID.
+    let repaired = insert_with_execution(
+        pool,
+        &Seed {
+            activation_attempt_id: Some(successor),
+            ..Seed::active(8, "creating")
+        },
+    )
+    .await?;
+    let pre_repair_ts: time::OffsetDateTime = sqlx::query_scalar(sql!(
+        "SELECT updated_at FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND generation = 8"
+    ))
+    .bind(repaired)
+    .fetch_one(pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET pod_uid = 'uid-repaired',
+                pod_materialized_at = NOW(),
+                state = 'created',
+                updated_at = updated_at + INTERVAL '1 second'
+          WHERE sandbox_id = $1 AND generation = 8"
+    ))
+    .bind(repaired)
+    .execute(pool)
+    .await?;
+    assert!(
+        !finish_generation_observed_attempt(
+            pool,
+            repaired,
+            8,
+            Some(successor),
+            ObservedAttemptPodFence::deleted_create_pod(Some("uid-other"), Some(pre_repair_ts)),
+            "forgotten",
+        )
+        .await?
+    );
+    assert!(
+        finish_generation_observed_attempt(
+            pool,
+            repaired,
+            8,
+            Some(successor),
+            ObservedAttemptPodFence::deleted_create_pod(Some("uid-repaired"), Some(pre_repair_ts)),
+            "forgotten",
+        )
+        .await?
+    );
+    let unrepaired = insert_with_execution(
+        pool,
+        &Seed {
+            activation_attempt_id: Some(successor),
+            ..Seed::active(9, "creating")
+        },
+    )
+    .await?;
+    let unrepaired_ts: time::OffsetDateTime = sqlx::query_scalar(sql!(
+        "SELECT updated_at FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND generation = 9"
+    ))
+    .bind(unrepaired)
+    .fetch_one(pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions SET pod_materialized_at = NOW() WHERE sandbox_id = $1 AND generation = 9"
+    ))
+    .bind(unrepaired)
+    .execute(pool)
+    .await?;
+    assert!(
+        !finish_generation_observed_attempt(
+            pool,
+            unrepaired,
+            9,
+            Some(successor),
+            ObservedAttemptPodFence::deleted_create_pod(Some("uid-repaired"), Some(unrepaired_ts)),
+            "forgotten",
+        )
+        .await?
+    );
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions SET pod_materialized_at = NULL WHERE sandbox_id = $1 AND generation = 9"
+    ))
+    .bind(unrepaired)
+    .execute(pool)
+    .await?;
+    assert!(
+        finish_generation_observed_attempt(
+            pool,
+            unrepaired,
+            9,
+            Some(successor),
+            ObservedAttemptPodFence::deleted_create_pod(Some("uid-repaired"), Some(unrepaired_ts)),
+            "forgotten",
+        )
+        .await?
+    );
+
+    let reset_unmaterialized = insert_with_execution(
+        pool,
+        &Seed {
+            activation_attempt_id: Some(successor),
+            ..Seed::active(10, "creating")
+        },
+    )
+    .await?;
+    let pre_reset_ts: time::OffsetDateTime = sqlx::query_scalar(sql!(
+        "SELECT updated_at FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND generation = 10"
+    ))
+    .bind(reset_unmaterialized)
+    .fetch_one(pool)
+    .await?;
+    assert!(claim::reset_to_creating(pool, reset_unmaterialized, 10, Some(successor)).await?);
+    assert!(
+        !finish_generation_observed_attempt(
+            pool,
+            reset_unmaterialized,
+            10,
+            Some(successor),
+            ObservedAttemptPodFence::deleted_create_pod(Some("uid-repaired"), Some(pre_reset_ts)),
+            "forgotten",
+        )
+        .await?
     );
     Ok(())
 }

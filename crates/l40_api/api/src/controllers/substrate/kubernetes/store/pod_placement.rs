@@ -3,6 +3,38 @@
 use super::*;
 use pplx_space_accounts::ClientId;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::controllers::substrate::kubernetes) enum FencedPodMetadataOutcome {
+    Applied(ActiveExecutionState),
+    Retired,
+    Superseded,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::controllers::substrate::kubernetes) struct PodMetadataFence<'a> {
+    pub expected_pod_uid: Option<&'a str>,
+    pub expected_pod_ip: Option<&'a str>,
+    pub expected_pod_materialized_at_set: bool,
+}
+
+fn tracked_pod_matches_fence(
+    tracked: &super::runtime_attribution::TrackedPod,
+    fence: PodMetadataFence<'_>,
+    new_pod_uid: Option<&str>,
+    new_pod_ip: Option<&str>,
+) -> bool {
+    let expected_pod_uid = normalize_pod_uid(fence.expected_pod_uid);
+    let uid_matches = tracked.pod_uid.as_deref() == expected_pod_uid
+        && (expected_pod_uid.is_some()
+            || tracked.pod_materialized_at_set == fence.expected_pod_materialized_at_set);
+    let ip_matches = tracked.pod_ip.as_deref() == fence.expected_pod_ip
+        || (new_pod_ip.is_some() && tracked.pod_ip.as_deref() == new_pod_ip);
+    (uid_matches && ip_matches)
+        || (new_pod_uid.is_some()
+            && tracked.pod_uid.as_deref() == new_pod_uid
+            && tracked.pod_ip.as_deref() == new_pod_ip)
+}
+
 impl K8sStore {
     /// Persist pod metadata onto the active execution row of `generation`.
     ///
@@ -66,12 +98,65 @@ impl K8sStore {
         Ok(Some(resulting_state))
     }
 
-    /// Record the address the pod's node reported for `pod_uid`, once the
-    /// node confirmed it serves the execution there, for use before kubelet
-    /// publishes `status.podIP`. Only a `created` row of `generation` that
-    /// records `pod_uid` and no address takes it, and becomes `running`; a
-    /// `running` row that already records it is kept. Every other row,
-    /// including one a suspend or retire has moved on, is left as it is.
+    /// [`Self::persist_pod_metadata`] fenced on the pre-lookup execution-row
+    /// snapshot (`expected_pod_uid`, `expected_pod_ip`, and whether the row had
+    /// already materialized a pod). Prevents an in-flight fallback or cache read
+    /// for pod A from overwriting a same-generation replacement pod B (including
+    /// across a same-generation reset that cleared `pod_uid`/`pod_ip` while
+    /// preserving `pod_materialized_at`) before this write acquired the row lock.
+    pub(in crate::controllers::substrate::kubernetes) async fn persist_pod_metadata_if_unchanged(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+        fence: PodMetadataFence<'_>,
+        pod_uid: Option<&str>,
+        pod_ip: Option<&str>,
+        pod_client: Option<&ClientId>,
+    ) -> Result<FencedPodMetadataOutcome, SubstrateError> {
+        let pod_uid = normalize_pod_uid(pod_uid);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .db_context("failed to start fenced pod metadata transaction")?;
+
+        let Some(tracked) = self
+            .lock_tracked_pod_in(&mut tx, sandbox_id, generation)
+            .await?
+        else {
+            return Ok(FencedPodMetadataOutcome::Retired);
+        };
+        if !tracked_pod_matches_fence(&tracked, fence, pod_uid, pod_ip) {
+            return Ok(FencedPodMetadataOutcome::Superseded);
+        }
+        if self.record_after(&tracked, pod_uid, pod_client).is_some() {
+            tx.rollback()
+                .await
+                .db_context("failed to release the fenced pod metadata row lock")?;
+            return self
+                .persist_attributed_pod_metadata_if_unchanged(
+                    sandbox_id, generation, fence, pod_uid, pod_ip, pod_client,
+                )
+                .await;
+        }
+        let resulting_state = self
+            .write_tracked_pod_in(
+                &mut tx, sandbox_id, generation, &tracked, pod_uid, pod_ip, pod_client,
+            )
+            .await?;
+        tx.commit()
+            .await
+            .db_context("failed to commit fenced pod metadata transaction")?;
+        Ok(FencedPodMetadataOutcome::Applied(resulting_state))
+    }
+
+    /// Record the address the pod's node reported or published for `pod_uid`,
+    /// once confirmed to serve the execution there. Only a `created`,
+    /// `running`, or `recovering` row of `generation` that records `pod_uid`
+    /// and no address takes it (`created` becomes `running`, while `running`
+    /// and `recovering` keep their state), and a `running` or `recovering` row
+    /// that already records it is kept without taking a row lock. Every other
+    /// row, including one a suspend or retire has moved on, is left as it is.
     /// Returns whether the row records the address.
     pub(in crate::controllers::substrate::kubernetes) async fn record_confirmed_pod_ip(
         &self,
@@ -80,29 +165,69 @@ impl K8sStore {
         pod_uid: &str,
         pod_ip: PodIp,
     ) -> Result<bool, SubstrateError> {
-        let recorded = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-             SET pod_ip = $1::INET,
-                 state = 'running',
-                 updated_at = CASE WHEN state = 'created' THEN NOW() ELSE updated_at END
-             WHERE sandbox_id = $2
-               AND generation = $3
-               AND active
-               AND NULLIF(BTRIM(pod_uid), '') = $4
-               AND (
-                   (state = 'created' AND pod_ip IS NULL)
-                   OR (state = 'running' AND pod_ip = $1::INET)
-               )
-             RETURNING 1"
-        ))
-        .bind(pod_ip.to_string())
-        .bind(sandbox_id)
-        .bind(generation)
-        .bind(pod_uid)
-        .fetch_optional(&self.pool)
+        pplx_space_sandbox_store::k8s_executions::pod_placement::record_confirmed_pod_ip(
+            &self.pool,
+            sandbox_id,
+            generation,
+            pod_uid,
+            &pod_ip.to_string(),
+        )
         .await
-        .db_context("failed to record the confirmed pod IP")?;
-        Ok(recorded.is_some())
+        .db_context("failed to record the confirmed pod IP")
+    }
+
+    /// Repair a missing `pod_uid` on an active `'creating'` execution row of
+    /// `generation`, promoting it to `'created'` without overwriting any UID,
+    /// IP, or state written by a concurrent materializer or same-generation reset.
+    pub(in crate::controllers::substrate::kubernetes) async fn repair_creating_pod_uid(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+        pod_uid: &str,
+        observed_updated_at: time::OffsetDateTime,
+        pod_client: Option<&ClientId>,
+    ) -> Result<bool, SubstrateError> {
+        let Some(pod_uid) = normalize_pod_uid(Some(pod_uid)) else {
+            return Ok(false);
+        };
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .db_context("failed to start creating pod metadata repair transaction")?;
+        if !Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await? {
+            return Ok(false);
+        }
+        let repaired =
+            pplx_space_sandbox_store::k8s_executions::materialize::repair_creating_pod_uid(
+                &mut *tx,
+                sandbox_id,
+                generation,
+                pod_uid,
+                observed_updated_at,
+            )
+            .await
+            .db_context("failed to repair creating pod metadata")?;
+        if repaired
+            && self.attribution.is_enabled()
+            && let Some(tracked) = self
+                .lock_tracked_pod_in(&mut tx, sandbox_id, generation)
+                .await?
+            && let Some(sandbox) = tracked.sandbox.as_ref()
+            && let Some(record) = super::attribution_update(
+                &sandbox.lifecycle,
+                None,
+                Some(pod_uid),
+                pod_client,
+                sandbox.record.as_ref(),
+            )
+        {
+            Self::attribute_runtime_in(&mut tx, sandbox_id, record.as_ref()).await?;
+        }
+        tx.commit()
+            .await
+            .db_context("failed to commit creating pod metadata repair transaction")?;
+        Ok(repaired)
     }
 
     /// [`Self::persist_pod_metadata`]'s path for a write that also changes the
@@ -142,6 +267,49 @@ impl K8sStore {
             .await
             .db_context("failed to commit pod attribution transaction")?;
         Ok(Some(resulting_state))
+    }
+
+    async fn persist_attributed_pod_metadata_if_unchanged(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+        fence: PodMetadataFence<'_>,
+        pod_uid: Option<&str>,
+        pod_ip: Option<&str>,
+        pod_client: Option<&ClientId>,
+    ) -> Result<FencedPodMetadataOutcome, SubstrateError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .db_context("failed to start fenced pod attribution transaction")?;
+        if !Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await? {
+            return Ok(FencedPodMetadataOutcome::Retired);
+        }
+        let Some(tracked) = self
+            .lock_tracked_pod_in(&mut tx, sandbox_id, generation)
+            .await?
+        else {
+            tx.commit()
+                .await
+                .db_context("failed to commit fenced pod attribution transaction")?;
+            return Ok(FencedPodMetadataOutcome::Retired);
+        };
+        if !tracked_pod_matches_fence(&tracked, fence, pod_uid, pod_ip) {
+            tx.commit()
+                .await
+                .db_context("failed to commit fenced pod attribution transaction")?;
+            return Ok(FencedPodMetadataOutcome::Superseded);
+        }
+        let resulting_state = self
+            .write_tracked_pod_in(
+                &mut tx, sandbox_id, generation, &tracked, pod_uid, pod_ip, pod_client,
+            )
+            .await?;
+        tx.commit()
+            .await
+            .db_context("failed to commit fenced pod attribution transaction")?;
+        Ok(FencedPodMetadataOutcome::Applied(resulting_state))
     }
 
     /// Write the pod metadata onto the active execution row `tracked` was read
@@ -378,5 +546,89 @@ impl K8sStore {
             }
             PlacementRetryDisposition::RetryConverges => result,
         }
+    }
+
+    pub(in crate::controllers::substrate::kubernetes) async fn persist_pod_node_placement_fenced_after_pod_exists(
+        &self,
+        placement: PodNodePlacement<'_>,
+        generation: i64,
+        expected_pod_uid: Option<&str>,
+        retry: PlacementRetryDisposition,
+    ) -> Result<Option<time::OffsetDateTime>, SubstrateError> {
+        let expected_pod_uid = normalize_pod_uid(expected_pod_uid);
+        let result = self
+            .persist_pod_node_placement_fenced(placement, generation, expected_pod_uid)
+            .await;
+        match retry {
+            PlacementRetryDisposition::RetryDuplicatesExecution => {
+                result.map_err(SubstrateError::demoted_after_side_effect)
+            }
+            PlacementRetryDisposition::RetryConverges => result,
+        }
+    }
+
+    async fn persist_pod_node_placement_fenced(
+        &self,
+        placement: PodNodePlacement<'_>,
+        generation: i64,
+        expected_pod_uid: Option<&str>,
+    ) -> Result<Option<time::OffsetDateTime>, SubstrateError> {
+        let PodNodePlacement {
+            sandbox_id,
+            node_name,
+            node_uid,
+            node_id,
+            role,
+            address,
+            instance_id,
+        } = placement;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .db_context("failed to start fenced pod node placement transaction")?;
+
+        self.upsert_k8s_node_role(
+            &mut tx,
+            K8sNodeRoleUpsert {
+                node_name,
+                node_uid,
+                node_id,
+                role,
+                address,
+                state: NodeStateWrite::InsertOnly(NodeLifecycleState::Registered),
+                instance_id,
+            },
+        )
+        .await?;
+
+        let sandbox_exists =
+            Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await?;
+        let execution_updated_at = if sandbox_exists {
+            let updated_at = self
+                .update_active_execution_node_name_fenced(
+                    &mut tx,
+                    sandbox_id,
+                    generation,
+                    expected_pod_uid,
+                    node_name,
+                )
+                .await?;
+            if updated_at.is_some() {
+                pplx_space_sandbox_store::wake::record_pod_node_placement(
+                    &mut *tx, sandbox_id, node_id,
+                )
+                .await
+                .db_context("failed to persist sandbox Kubernetes placement")?;
+            }
+            updated_at
+        } else {
+            None
+        };
+
+        tx.commit()
+            .await
+            .db_context("failed to commit fenced pod node placement transaction")?;
+        Ok(execution_updated_at)
     }
 }

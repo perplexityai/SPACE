@@ -195,6 +195,11 @@ pub enum AdmittedPoolClaimLookup {
     /// pool's own cleanup collects it; until then a cold create under this ID
     /// would leave that pod with nothing to collect it, so the caller waits.
     ReleasePending,
+    /// Verification of the admitted slot failed transiently (for example, a
+    /// replica cache is still catching up to the slot's `Running` state or a
+    /// fallback substrate read returned a temporary error). The slot keeps its
+    /// claim so a short retry adopts the same warm pod without invalidating it.
+    Transient,
 }
 
 pub struct PooledExecutionClaimAttempt {

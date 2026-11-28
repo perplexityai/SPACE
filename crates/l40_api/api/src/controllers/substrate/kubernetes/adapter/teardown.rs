@@ -399,11 +399,11 @@ impl KubernetesSubstrate {
         let Some(address) = fenced.runtime_address else {
             return Ok(None);
         };
-        let target = PodProxyWaitTarget {
-            pod_name: &fenced.pod_name,
-            pod_uid: fenced.pod_uid.as_ref().map(PodUid::as_str),
-            generation: fenced.generation,
-        };
+        let target = PodProxyWaitTarget::new(
+            &fenced.pod_name,
+            fenced.pod_uid.as_ref().map(PodUid::as_str),
+            fenced.generation,
+        );
         self.confirmed_runtime(
             sandbox_id,
             address,
@@ -435,11 +435,11 @@ impl KubernetesSubstrate {
                 .and_then(|active| active.k8s_node_name),
         };
         let pod_name = K8sStore::execution_pod_name(sandbox_id, pod.generation);
-        let target = PodProxyWaitTarget {
-            pod_name: &pod_name,
-            pod_uid: pod.pod_uid.as_ref().map(PodUid::as_str),
-            generation: pod.generation,
-        };
+        let target = PodProxyWaitTarget::new(
+            &pod_name,
+            pod.pod_uid.as_ref().map(PodUid::as_str),
+            pod.generation,
+        );
         self.confirmed_runtime(
             sandbox_id,
             (pod.ip, pod.source),

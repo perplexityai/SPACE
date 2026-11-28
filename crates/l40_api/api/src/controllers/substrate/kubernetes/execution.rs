@@ -2149,9 +2149,12 @@ impl KubernetesSubstrate {
                 }) => (requested_attempt_id, Some(owner_attempt_id)),
                 Err(error) => return Err(error),
             };
+            let owns_materialized_pod =
+                joined_attempt_id.is_none() && activation_assignment.owns_materialized_pod();
             self.ensure_active_execution_pod_proxy_reachable(
                 metric_identity,
                 sandbox_id,
+                owns_materialized_pod,
                 phase_deadline,
             )
             .await?;

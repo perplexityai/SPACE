@@ -193,7 +193,13 @@ pub(crate) const RESTORE_RETRY_AFTER_FLOOR: Duration = Duration::from_secs(1);
 /// this is gated to that feature to stay dead-code-free in default builds.
 #[cfg(feature = "kubernetes")]
 pub(crate) fn create_wait_should_preserve_node_work(err: &SubstrateError) -> bool {
-    matches!(err, SubstrateError::Timeout { .. })
+    match err {
+        SubstrateError::Timeout { .. } => true,
+        SubstrateError::JoinedCreateFailed { source } => {
+            create_wait_should_preserve_node_work(source)
+        }
+        _ => false,
+    }
 }
 
 /// Runtime endpoint for the active execution object backing a stable sandbox.
@@ -781,6 +787,21 @@ pub enum SubstrateError {
     /// path); a contended read must trigger neither.
     #[error("{message}")]
     LockContention { message: String },
+    /// A `create_execution` attempt lost ownership to a live successor
+    /// execution or pod that could not be joined within the request's budget.
+    /// Non-retryable so the caller does not mint a duplicate `SandboxId`, while
+    /// preserving the `sandboxes` row owned by the successor.
+    #[error("{message}")]
+    CreateSuperseded { message: String },
+    /// A joined `create_execution` failed while another request owns (or may
+    /// still own) the active execution for this `SandboxId`. Preserves the
+    /// wrapped status translation while preventing controller rollback from
+    /// deleting the owner's `sandboxes` row.
+    #[error("{source}")]
+    JoinedCreateFailed {
+        #[source]
+        source: Box<Self>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -958,14 +979,40 @@ impl SubstrateError {
     pub(crate) fn demoted_after_side_effect(self) -> Self {
         match self {
             Self::LockContention { message } => Self::Failed { message },
+            Self::JoinedCreateFailed { source } => Self::JoinedCreateFailed {
+                source: Box::new(source.demoted_after_side_effect()),
+            },
             other => other,
         }
+    }
+
+    /// Wrap a joined-create failure so controller rollback preserves the
+    /// owner's `sandboxes` row while retaining `CreateSuperseded` directly.
+    #[cfg(feature = "kubernetes")]
+    pub(crate) fn preserve_joined_create_row(self) -> Self {
+        if self.preserves_create_row() {
+            self
+        } else {
+            Self::JoinedCreateFailed {
+                source: Box::new(self),
+            }
+        }
+    }
+
+    /// Whether a failed `create_execution` left a successor execution or pod in
+    /// charge of the `sandboxes` row so controller rollback must not delete it.
+    pub(crate) const fn preserves_create_row(&self) -> bool {
+        matches!(
+            self,
+            Self::CreateSuperseded { .. } | Self::JoinedCreateFailed { .. }
+        )
     }
 
     /// The readiness phase a [`Self::Timeout`] fired in, when known.
     pub fn wait_ready_timeout_phase(&self) -> Option<WaitReadyTimeoutPhase> {
         match self {
             Self::Timeout { phase, .. } => *phase,
+            Self::JoinedCreateFailed { source } => source.wait_ready_timeout_phase(),
             _ => None,
         }
     }
@@ -1000,7 +1047,10 @@ impl From<SubstrateError> for ControllerError {
             SubstrateError::FailedPrecondition { message } => {
                 ControllerError::new(axum::http::StatusCode::PRECONDITION_FAILED, message)
             }
-            SubstrateError::Failed { message } => ControllerError::internal(message),
+            SubstrateError::Failed { message } | SubstrateError::CreateSuperseded { message } => {
+                ControllerError::internal(message)
+            }
+            SubstrateError::JoinedCreateFailed { source } => Self::from(*source),
             SubstrateError::NotFound { message } => ControllerError::not_found(message),
             SubstrateError::InvalidRequest { message } => ControllerError::bad_request(message),
             // A substrate wait that exhausted its ALB-aware budget is not a

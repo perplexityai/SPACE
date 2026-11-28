@@ -1,6 +1,7 @@
 //! Guarded writes the Kubernetes substrate's pod placement makes to the
 //! active execution row: refreshing the dial address a selected route reads,
-//! and claiming the row for a new pod's materialization.
+//! recording a node-confirmed pod IP, and claiming the row for a new pod's
+//! materialization.
 //!
 //! The caller keeps the executor each write runs on, the `sandboxes` row
 //! lock it takes before a write that needs one, and what to do with each
@@ -58,6 +59,81 @@ pub async fn refresh_selected_route_pod_ip(
     Ok(result.is_some())
 }
 
+async fn has_confirmed_pod_ip(
+    executor: impl Executor<'_>,
+    sandbox_id: SandboxId,
+    generation: i64,
+    pod_uid: &str,
+    pod_ip: &str,
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
+        "SELECT EXISTS (
+            SELECT 1
+              FROM sandbox_k8s_executions
+             WHERE sandbox_id = $1
+               AND generation = $2
+               AND active
+               AND NULLIF(BTRIM(pod_uid), '') = $3
+               AND state IN ('running', 'recovering')
+               AND pod_ip = $4::INET
+         )"
+    ))
+    .bind(sandbox_id)
+    .bind(generation)
+    .bind(pod_uid)
+    .bind(pod_ip)
+    .fetch_one(executor.into_sqlx())
+    .await?)
+}
+
+/// Record a node-confirmed `pod_ip` on `sandbox_id`'s active execution at
+/// `generation` and `pod_uid`.
+///
+/// Promotes `'created'` to `'running'` (stamping `updated_at`), fills a `NULL`
+/// `pod_ip` on `'running'` (stamping `updated_at`), and fills a `NULL`
+/// `pod_ip` on `'recovering'` without changing `state` or `updated_at`.
+/// When `'running'` or `'recovering'` already records `pod_ip`, returns `true`
+/// from a read-only lookup without taking a row lock on `sandbox_k8s_executions`.
+/// `false` when the generation, UID, state, or existing IP no longer matches.
+pub async fn record_confirmed_pod_ip<'a, E>(
+    executor: E,
+    sandbox_id: SandboxId,
+    generation: i64,
+    pod_uid: &str,
+    pod_ip: &str,
+) -> Result<bool, DbError>
+where
+    E: Executor<'a> + Copy,
+{
+    if has_confirmed_pod_ip(executor, sandbox_id, generation, pod_uid, pod_ip).await? {
+        return Ok(true);
+    }
+    let updated = sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+             SET pod_ip = $1::INET,
+                 state = CASE WHEN state = 'recovering' THEN state ELSE 'running' END,
+                 updated_at = CASE WHEN state = 'recovering' THEN updated_at ELSE NOW() END
+             WHERE sandbox_id = $2
+               AND generation = $3
+               AND active
+               AND NULLIF(BTRIM(pod_uid), '') = $4
+               AND state IN ('created', 'running', 'recovering')
+               AND pod_ip IS NULL"
+    ))
+    .bind(pod_ip)
+    .bind(sandbox_id)
+    .bind(generation)
+    .bind(pod_uid)
+    .execute(executor.into_sqlx())
+    .await?
+    .rows_affected()
+        > 0;
+    if updated {
+        return Ok(true);
+    }
+    has_confirmed_pod_ip(executor, sandbox_id, generation, pod_uid, pod_ip).await
+}
+
 /// Claim the active execution of `sandbox_id` at `generation` for a new
 /// pod's materialization: forget its pod UID and IP, and move it to
 /// `creating` unless it is `recovering`, which keeps its state. Clearing the
@@ -86,7 +162,7 @@ where
                      pod_materialized_at,
                      CASE WHEN NULLIF(BTRIM(pod_uid), '') IS NOT NULL THEN NOW() END
                  ),
-                 updated_at = NOW()
+                 updated_at = GREATEST(NOW(), updated_at + INTERVAL '1 microsecond')
              WHERE sandbox_id = $1 AND generation = $2 AND active
              RETURNING 1"
     ))

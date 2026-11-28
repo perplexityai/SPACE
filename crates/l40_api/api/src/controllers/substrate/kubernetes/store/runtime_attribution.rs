@@ -26,6 +26,7 @@ use pplx_space_sandbox_store::attribute_runtime::{UNATTRIBUTED_LIFECYCLES, set_a
 pub(super) struct TrackedPod {
     pub(super) pod_uid: Option<String>,
     pub(super) pod_ip: Option<String>,
+    pub(super) pod_materialized_at_set: bool,
     /// `None` with attribution off, when nothing reads or writes the record.
     pub(super) sandbox: Option<TrackedSandbox>,
 }
@@ -122,6 +123,7 @@ impl K8sStore {
         let Some(pplx_space_sandbox_store::k8s_executions::runtime_attribution::TrackedPodRow {
             pod_uid,
             pod_ip,
+            pod_materialized_at_set,
         }) = pplx_space_sandbox_store::k8s_executions::runtime_attribution::lock_tracked_pod(
             &mut *conn, sandbox_id, generation,
         )
@@ -134,6 +136,7 @@ impl K8sStore {
             return Ok(Some(TrackedPod {
                 pod_uid,
                 pod_ip,
+                pod_materialized_at_set,
                 sandbox: None,
             }));
         }
@@ -144,6 +147,7 @@ impl K8sStore {
         Ok(sandbox.map(|sandbox| TrackedPod {
             pod_uid,
             pod_ip,
+            pod_materialized_at_set,
             sandbox: Some(TrackedSandbox {
                 lifecycle: sandbox.lifecycle,
                 record: sandbox.activating_client_id,

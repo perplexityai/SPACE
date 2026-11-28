@@ -18,11 +18,10 @@ use std::{
 
 use time::OffsetDateTime;
 
-use futures_util::{TryStreamExt, pin_mut};
 use k8s_openapi::api::core::v1::{Node, Pod};
 use kube::{
     Api, Client, Error as KubeError,
-    api::{DeleteParams, PostParams, WatchEvent, WatchParams},
+    api::{DeleteParams, PostParams},
     runtime::reflector::{ObjectRef, Store},
 };
 use pplx_space_artifact_model::StorageUri;
@@ -56,6 +55,7 @@ mod caches;
 mod cancel_rate_tracker;
 mod client_live_pods;
 mod pod_reflector;
+mod pod_sandbox_rejections;
 mod pod_worker_channels;
 mod restore_dispatch_fence;
 mod restore_waiters;
@@ -200,7 +200,16 @@ const ACTIVATION_ATTEMPT_LEASE_TTL_SECS: i64 = RESTORE_EXECUTION_OWNERSHIP_TTL_S
 /// timeout is a soft outcome (a timeout after an accepted delete still
 /// finalizes the suspend), so the bounded overrun is acceptable.
 const K8S_BLOCKING_DELETE_FALLBACK_GET_TIMEOUT: Duration = Duration::from_secs(2);
-const POD_IP_WATCH_TIMEOUT_SECS: u32 = 55;
+/// How long the sandbox-pod reflector may deliver nothing at all before IP
+/// readiness waits and cached pod reads treat the watch as degraded and fall
+/// back to paced direct `GET`s (paced by this interval after each fallback
+/// read completes).
+/// A watch whose connection has stalled delivers nothing, yet reports no error
+/// until it resumes, which can take the apiserver's retransmission backoff,
+/// tens of seconds. While creates are starting pods, the reflector normally
+/// delivers several updates a second, so healthy reflectors emit zero fallback
+/// `GET`s.
+const READINESS_QUIET_REFLECTOR: Duration = Duration::from_secs(5);
 /// Wall-clock budget for `read_sandbox_pod` to wait on a reflector event for
 /// the target pod before falling through to a direct `GET /pods/{name}`.
 /// A short wait can avoid an apiserver GET when the reflector is catching up,
@@ -896,6 +905,9 @@ pub struct KubernetesSubstrate {
     /// falling through to a direct `GET` during the brief window between pod
     /// creation/scheduling and the reflector observing the bind event.
     pod_events: pod_reflector::PodEvents,
+    /// Node refusals of sandbox pods from the process's one Events watch,
+    /// routed by pod UID to the creates waiting for those pods' IPs.
+    pod_sandbox_rejections: pod_sandbox_rejections::PodSandboxRejections,
     /// Flipped to `true` once the reflector's initial `LIST` populates the
     /// store. Exposed via `Substrate::readiness()` so the HTTP `/readyz`
     /// probe can keep a freshly-spawned replica out of the Service endpoint
@@ -936,6 +948,9 @@ pub struct KubernetesSubstrate {
     /// Readiness, preserve-decision, suspend and connect budgets. Production
     /// takes the default, which is the constants each one names.
     budgets: SubstrateBudgets,
+    #[cfg(test)]
+    pub(in crate::controllers::substrate::kubernetes) readiness_test_hooks:
+        wait_ready::target::ReadinessTestHooks,
     shutdown_token: CancellationToken,
     task_tracker: TaskTracker,
 }
@@ -963,6 +978,12 @@ impl KubernetesSubstrate {
             Ok(Some(k8s)) => {
                 let (pod_store, pod_indexes, pod_events, pod_reflector_ready) =
                     pod_reflector::start(k8s.client.clone(), k8s.sandbox_namespace.clone());
+                let pod_sandbox_rejections = pod_sandbox_rejections::PodSandboxRejections::start(
+                    k8s.client.clone(),
+                    &k8s.sandbox_namespace,
+                    shutdown_token.clone(),
+                    &task_tracker,
+                );
                 let store = K8sStore::new(
                     pool.clone(),
                     k8s.sandbox_namespace.clone(),
@@ -991,6 +1012,7 @@ impl KubernetesSubstrate {
                     pod_network_slots: pod_indexes.network_slots,
                     pod_client_index: pod_indexes.client_pods,
                     pod_events,
+                    pod_sandbox_rejections,
                     pod_reflector_ready,
                     k8s,
                     node_group_placement,
@@ -998,6 +1020,8 @@ impl KubernetesSubstrate {
                     recovery_join_backoff: execution::RecoveryJoinBackoffPolicy::default(),
                     runtime_policy: super::runtime_upgrade::RuntimePolicyCache::default(),
                     budgets: SubstrateBudgets::default(),
+                    #[cfg(test)]
+                    readiness_test_hooks: wait_ready::target::ReadinessTestHooks::default(),
                     shutdown_token,
                     task_tracker,
                 }))
