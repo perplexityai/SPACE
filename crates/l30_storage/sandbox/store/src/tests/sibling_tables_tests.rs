@@ -190,7 +190,9 @@ async fn port_exposure_invalidations_reset_only_open_exposures() -> TestResult {
         "a closed exposure is not invalidated"
     );
 
-    port_exposures::invalidate_open_observations(&db.pool, sandbox).await?;
+    let mut tx = db.pool.begin().await?;
+    port_exposures::invalidate_open_observations(&mut *tx, sandbox).await?;
+    tx.commit().await?;
     assert_eq!(read_observation(&db.pool, id, 8080).await?, reset);
     assert_eq!(read_observation(&db.pool, id, 8081).await?, reset);
     assert_eq!(read_observation(&db.pool, id, 9090).await?, applied);

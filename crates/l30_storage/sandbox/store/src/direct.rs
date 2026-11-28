@@ -270,15 +270,19 @@ where
 /// `read_lifecycle` (compared case- and whitespace-insensitively), no live
 /// restore lease, and either no restore-lease token or `one_generation`. The
 /// row becomes `started` only when `started_now`; otherwise it keeps its
-/// lifecycle, and a row that stays `restoring` keeps its token.
-pub async fn adopt_live_execution(
-    executor: impl Executor<'_>,
+/// lifecycle, and a row that stays `restoring` keeps its token. The caller
+/// must pass its open transaction.
+pub async fn adopt_live_execution<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     node_id: NodeId,
     read_lifecycle: SandboxLifecycle,
     one_generation: bool,
     started_now: bool,
-) -> Result<bool, DbError> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     let adopted = sqlx::query(sql!(
         "UPDATE sandboxes
                 SET active_node_id = $2,
@@ -299,7 +303,7 @@ pub async fn adopt_live_execution(
     .bind(one_generation)
     .bind(started_now)
     .bind(SubstrateKind::Space)
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(adopted.rows_affected() == 1)
 }

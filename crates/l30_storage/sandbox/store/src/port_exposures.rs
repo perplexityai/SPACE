@@ -303,11 +303,15 @@ pub async fn invalidate_open_tcp_exposure_after_proxy_failure(
 /// [`crate::orphan`], [`crate::ingest`] and
 /// [`crate::direct::service_route_reset`] reset the same columns in a CTE
 /// of their own, so change them together.
-/// [`crate::lost::write_off_lost_sandboxes`] leaves exposures alone.
-pub async fn invalidate_open_observations(
-    executor: impl Executor<'_>,
+/// [`crate::lost::write_off_lost_sandboxes`] leaves exposures alone. The
+/// caller must pass its open transaction.
+pub async fn invalidate_open_observations<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
-) -> Result<(), DbError> {
+) -> Result<(), DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     sqlx::query(sql!(
         "UPDATE sandbox_port_exposures
          SET apply_state = 'pending',
@@ -321,7 +325,7 @@ pub async fn invalidate_open_observations(
            AND desired_state = 'open'"
     ))
     .bind(sandbox_id)
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?;
     Ok(())
 }

@@ -42,16 +42,19 @@ pub async fn note_failed_cleanup_attempt(
 /// NULL-safe its `generation`, `activation_attempt_id`, trimmed `pod_uid` and
 /// `route_activation_id`. **Operation step** of the revert, run in the
 /// revert's transaction. `false` when the active execution is no longer that
-/// one, and nothing changes.
-pub async fn retire_reverted_restore_execution(
-    executor: impl Executor<'_>,
+/// one, and nothing changes. The caller must pass its open transaction.
+pub async fn retire_reverted_restore_execution<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     pod_name: &str,
     generation: Option<i64>,
     activation_attempt_id: Option<SandboxActivationAttemptId>,
     pod_uid: Option<&str>,
     route_activation_id: Option<SandboxActivationAttemptId>,
-) -> Result<bool, DbError> {
+) -> Result<bool, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
             SET active = FALSE,
@@ -73,7 +76,7 @@ pub async fn retire_reverted_restore_execution(
     .bind(activation_attempt_id)
     .bind(pod_uid)
     .bind(route_activation_id)
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?
     .rows_affected()
         == 1)

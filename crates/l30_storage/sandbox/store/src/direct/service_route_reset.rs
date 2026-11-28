@@ -26,14 +26,17 @@ mod tests;
 /// It resets the exposure columns
 /// [`crate::port_exposures::invalidate_open_observations`] resets,
 /// recording `diagnostic` where that clears `last_error`, so change them
-/// together.
-pub async fn reset_applied_service_port(
-    executor: impl Executor<'_>,
+/// together. The caller must pass its open transaction.
+pub async fn reset_applied_service_port<C>(
+    tx: &mut C,
     sandbox_id: SandboxId,
     guest_port: i32,
     route_generation: RouteGeneration,
     diagnostic: &str,
-) -> Result<Option<NodeId>, DbError> {
+) -> Result<Option<NodeId>, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     Ok(sqlx::query_scalar::<_, NodeId>(sql!(
         "WITH current_route AS (
              SELECT s.id AS sandbox_id, s.active_node_id
@@ -71,6 +74,6 @@ pub async fn reset_applied_service_port(
     .bind(guest_port)
     .bind(route_generation)
     .bind(diagnostic)
-    .fetch_optional(executor.into_sqlx())
+    .fetch_optional(tx.into_sqlx())
     .await?)
 }

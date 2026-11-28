@@ -1,11 +1,22 @@
 use pplx_space_db_test_fixtures::try_pg_test_db;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_test_env::TestResult;
+use sqlx::PgPool;
 
 use super::super::ownership_test_fixture::{
     execution_key_share_blocked, execution_state, execution_version, insert_execution,
     insert_sandbox,
 };
 use super::{lock_executions_in_generation_order, retire_active_executions};
+
+/// Runs [`retire_active_executions`] in a transaction of its own and commits
+/// it.
+async fn retire(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<u64> {
+    let mut tx = pool.begin().await?;
+    let retired = retire_active_executions(&mut *tx, sandbox_id).await?;
+    tx.commit().await?;
+    Ok(retired)
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn lock_executions_in_generation_order_locks_every_execution_for_update() -> TestResult {
@@ -45,11 +56,11 @@ async fn retire_active_executions_retires_only_the_active_execution() -> TestRes
     let other_before = execution_version(pool, other.id).await?;
 
     // The losing case: no active execution, and nothing changes.
-    assert_eq!(retire_active_executions(pool, sandbox_id).await?, 0);
+    assert_eq!(retire(pool, sandbox_id).await?, 0);
     assert_eq!(execution_version(pool, retired.id).await?, retired_before);
 
     let active = insert_execution(pool, sandbox_id, 2, "creating", true, None).await?;
-    assert_eq!(retire_active_executions(pool, sandbox_id).await?, 1);
+    assert_eq!(retire(pool, sandbox_id).await?, 1);
     assert_eq!(
         execution_state(pool, active.id).await?,
         (false, "suspended".to_string())

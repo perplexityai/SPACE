@@ -40,11 +40,11 @@ where
 /// `WHERE` checks only `active`, because the caller's locks
 /// ([`lock_executions_in_generation_order`] among them) and guard re-reads
 /// guard it. Returns how many executions it retired: `0` when none was
-/// active, and nothing changes.
-pub async fn retire_active_executions(
-    executor: impl Executor<'_>,
-    sandbox_id: SandboxId,
-) -> Result<u64, DbError> {
+/// active, and nothing changes. The caller must pass its open transaction.
+pub async fn retire_active_executions<C>(tx: &mut C, sandbox_id: SandboxId) -> Result<u64, DbError>
+where
+    for<'a> &'a mut C: Executor<'a>,
+{
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions e
             SET active = FALSE,\n\
@@ -56,7 +56,7 @@ pub async fn retire_active_executions(
             AND e.active"
     ))
     .bind(sandbox_id)
-    .execute(executor.into_sqlx())
+    .execute(tx.into_sqlx())
     .await?
     .rows_affected())
 }

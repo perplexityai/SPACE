@@ -1,5 +1,6 @@
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_test_env::TestResult;
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::super::ownership_test_fixture::{
@@ -7,6 +8,15 @@ use super::super::ownership_test_fixture::{
     insert_sandbox,
 };
 use super::{lock_executions, retire_recovered_execution};
+
+/// Runs [`retire_recovered_execution`] in a transaction of its own and
+/// commits it.
+async fn retire(pool: &PgPool, execution_id: Uuid) -> TestResult<bool> {
+    let mut tx = pool.begin().await?;
+    let retired = retire_recovered_execution(&mut *tx, execution_id).await?;
+    tx.commit().await?;
+    Ok(retired)
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn lock_executions_locks_every_execution_of_the_sandbox_for_update() -> TestResult {
@@ -43,10 +53,10 @@ async fn retire_recovered_execution_retires_only_the_named_execution() -> TestRe
     let before = execution_version(pool, named.id).await?;
 
     // The losing case: no execution has that id, and nothing changes.
-    assert!(!retire_recovered_execution(pool, Uuid::now_v7()).await?);
+    assert!(!retire(pool, Uuid::now_v7()).await?);
     assert_eq!(execution_version(pool, named.id).await?, before);
 
-    assert!(retire_recovered_execution(pool, named.id).await?);
+    assert!(retire(pool, named.id).await?);
     assert_eq!(
         execution_state(pool, named.id).await?,
         (false, "suspended".to_string())
