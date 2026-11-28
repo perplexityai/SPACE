@@ -19,7 +19,8 @@ use std::sync::LazyLock;
 
 use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_portability::{
-    current_disk_artifact_backup_ready, failed_repair_revert_eligibility,
+    current_disk_artifact_backup_ready, failed_repair_revert_eligibility, no_newer_suspend_capture,
+    restore_order_unordered, restore_retry_pinnable_revert_snapshot_exists,
     restore_retry_suspended_revert_snapshot_exists, started_suspend_revert_eligibility,
 };
 use pplx_space_sql_locator::sql;
@@ -162,7 +163,13 @@ where
 /// abandoned).
 ///
 /// Guarded on `restoring`, no evacuation marker, no active execution, and
-/// [`restore_retry_suspended_revert_snapshot_exists`]. The caller holds the
+/// [`restore_retry_suspended_revert_snapshot_exists`]. A pinned row whose
+/// history is unordered ([`restore_order_unordered`]) or whose pinned capture
+/// isn't the newest suspend capture ([`no_newer_suspend_capture`] — for
+/// example, when a post-claim or later failed capture outranks it) isn't
+/// reverted here: clearing its pin would change or block what `suspended`
+/// restores. It stays `restoring` until the sweeper's revert, which keeps the
+/// pin. The caller holds the
 /// sandbox row lock, which execution creation also takes, so no successor
 /// execution can appear between this proof and commit. Callers retire the
 /// execution, or confirm that none is active, earlier in this transaction.
@@ -175,6 +182,9 @@ where
     for<'a> &'a mut C: Executor<'a>,
 {
     let safe_revert_snapshot = restore_retry_suspended_revert_snapshot_exists("s");
+    let pinnable_revert_snapshot = restore_retry_pinnable_revert_snapshot_exists("s");
+    let unordered = restore_order_unordered("s");
+    let pinned_newest = no_newer_suspend_capture("s", "pinned_sn");
     let query = format!(
         "UPDATE sandboxes s
                 SET lifecycle = 'suspended',
@@ -197,7 +207,22 @@ where
                      WHERE e.sandbox_id = s.id
                        AND e.active
                 )
-                AND {safe_revert_snapshot}"
+                AND ({safe_revert_snapshot} OR {pinnable_revert_snapshot})
+                AND (
+                    s.current_local_artifact_id IS NULL
+                    OR (NOT {unordered}
+                        AND EXISTS (
+                            SELECT 1
+                              FROM snapshots pinned_sn
+                             WHERE pinned_sn.sandbox_id = s.id
+                               AND pinned_sn.type = 'full'
+                               AND pinned_sn.state = 'ready'
+                               AND pinned_sn.local_artifact_id = s.current_local_artifact_id
+                               AND pinned_sn.artifact_kind IS NOT DISTINCT FROM s.current_local_artifact_kind
+                               AND COALESCE(pinned_sn.artifact_origin, 'suspend') = 'suspend'
+                               AND {pinned_newest}
+                        ))
+                )"
     );
     sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
         .bind(sandbox_id)

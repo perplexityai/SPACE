@@ -41,10 +41,11 @@ use std::time::Duration;
 
 use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_portability::{
-    current_disk_artifact_backup_ready, current_suspend_snapshot_ready,
-    failed_repair_revert_eligibility, inflight_suspend_upload_exists, latest_full_snapshot_ready,
-    newest_full_snapshot_unambiguous, pod_less_drain_revert_loses_no_newer_bytes,
-    recoverable_suspend_snapshot_exists, snapshot_durable_for_source_release,
+    current_disk_artifact_backup_ready, current_suspend_capture_is_restore_source,
+    current_suspend_snapshot_ready, failed_repair_revert_eligibility,
+    inflight_suspend_upload_exists, latest_full_snapshot_ready, newest_full_snapshot_unambiguous,
+    pinned_capture_is_restore_source, pod_less_drain_revert_loses_no_newer_bytes,
+    recoverable_suspend_snapshot_exists, restore_order_unordered, snapshot_durable_copy_exists,
 };
 use pplx_space_sql_locator::sql;
 
@@ -722,7 +723,12 @@ pub fn mark_sandbox_lost_query() -> String {
     // marked `failed` if its artifacts are genuinely gone, never restored
     // from a stale older snapshot. For an unmarked sandbox this is identical
     // to `fresh_ready_snapshot_exists`.
-    let snapshot_exists = snapshot_durable_for_source_release("sandboxes");
+    // An unordered history's durable suspend captures keep the row too
+    // (`snapshot_durable_copy_exists`): failing it would end its last restore
+    // path. A named snapshot's or a stop's backup doesn't keep an unpinned
+    // row: nothing restores a suspended sandbox from one, so the row would
+    // block the drain on every tick with nothing left to wait for.
+    let snapshot_exists = snapshot_durable_copy_exists("sandboxes");
     // Node-agnostic: marking the sandbox `failed` is a terminal flip on the
     // sandbox row, so it must not race a durable upload from *any* node. A
     // `$2`-scoped check would miss an upload still in flight from the
@@ -767,7 +773,7 @@ pub async fn mark_sandbox_lost(
 /// artifact is gone" needs no on-node RPC to establish.
 ///
 /// **Stricter snapshot guard than [`mark_sandbox_lost_query`], on purpose.**
-/// That query refuses on `snapshot_durable_for_source_release`, whose
+/// That query refuses on `snapshot_durable_copy_exists`, whose
 /// unmarked branch is placement-freshness-anchored — a ready snapshot left
 /// placement-stale by a stuck restore's pod bump does *not* refuse it. On
 /// the artifact-missing path that's correct (the freshness test is the
@@ -859,7 +865,7 @@ pub fn gone_node_identity_guards(node_param: &str, uid_param: &str) -> String {
 /// `node_k8s.k8s_node_uid` (nullable), `$4` = settle seconds (BIGINT). The
 /// KubeNodeGone variant of [`adopt_remote_snapshot_for_drain_query`]: makes a
 /// pinned local-only `suspended` row durable from its remote snapshot so a
-/// node whose EC2 instance is confirmed terminated can finish draining. Two
+/// node whose EC2 instance is confirmed terminated can finish draining. Three
 /// guards are added on top of the shared adopt CAS:
 ///
 /// - **Node identity** ([`gone_node_identity_guards`]): refuse once a
@@ -883,10 +889,25 @@ pub fn gone_node_identity_guards(node_param: &str, uid_param: &str) -> String {
 ///   identity-carrying rows the anchor adds nothing (their exact-artifact
 ///   branch already pins the snapshot to the current artifact), so the
 ///   composition only tightens the legacy branch.
+/// - **The capture the restore loads**
+///   ([`current_suspend_capture_is_restore_source`]). The two guards above
+///   accept a legacy row on any ready full snapshot of this cycle, and a
+///   named snapshot registered since the suspend is one. The unpinned restore
+///   never loads it: it takes the newest suspend capture, an earlier
+///   suspend's or one that snapshot's generation outranks. The row stays
+///   pinned, with its placement cutoff, and keeps blocking the drain.
+///
+/// As in the shared adopt CAS, a pin is cleared only when the unpinned
+/// restore loads the pinned capture ([`pinned_capture_is_restore_source`]).
 pub fn adopt_remote_snapshot_on_gone_node_query() -> String {
     let inflight_upload = inflight_suspend_upload_exists("s");
     let latest_ready = latest_full_snapshot_ready("s");
     let current_cycle_ready = current_suspend_snapshot_ready("s");
+    let restore_loads_current_cycle = current_suspend_capture_is_restore_source("s");
+    let restore_loads_pinned = pinned_capture_is_restore_source("s");
+    // Adopting unpins the row, and an unpinned unordered history refuses to
+    // restore: leave it pinned and blocking instead.
+    let unordered = restore_order_unordered("s");
     // The identity guards are uncorrelated EXISTS subqueries on `nodes` /
     // `node_k8s`, so they compose unchanged under this query's `s` alias.
     let identity_guards = gone_node_identity_guards("$2", "$3");
@@ -904,6 +925,9 @@ pub fn adopt_remote_snapshot_on_gone_node_query() -> String {
             AND NOT {inflight_upload}
             AND {latest_ready}
             AND {current_cycle_ready}
+            AND {restore_loads_current_cycle}
+            AND {restore_loads_pinned}
+            AND NOT {unordered}
             {identity_guards}"
     )
 }
@@ -1013,7 +1037,7 @@ pub async fn mark_sandbox_failed_on_node(
 /// The flip clears the current-artifact pointer (`current_local_artifact_id`
 /// /kind/origin → NULL) and the `evacuation_restore_target` marker, and resets
 /// `placement_changed_at` to NULL. Together these route the portability gate
-/// ([`snapshot_durable_for_source_release`]) through the unmarked legacy
+/// (`snapshot_durable_for_source_release`) through the unmarked legacy
 /// `fresh_ready_snapshot_exists` branch with the placement-freshness
 /// comparison short-circuited, so the existing ready full snapshot satisfies
 /// "durable for source release" unconditionally and the row drops out of both
@@ -1047,10 +1071,17 @@ pub async fn mark_sandbox_failed_on_node(
 ///   `suspending`, then `evacuate_sandbox` advances `lifecycle_changed_at` to
 ///   the later `suspended` transition, so a `sn.timestamp >= lifecycle_changed_at`
 ///   gate would never match the legitimately-current snapshot.
+/// - the pinned capture is the one the unpinned restore loads
+///   ([`pinned_capture_is_restore_source`]). `latest_full_snapshot_ready`
+///   accepts a pinned row on any ready backup of its pinned artifact, and
+///   clearing the pin hands the choice to the capture order: a later ready
+///   suspend capture would be loaded instead, and a later failed one would
+///   leave the row nothing to restore. Such a row stays pinned and keeps
+///   blocking the drain.
 ///
 /// The caller reads `rows_affected()` to detect whether the flip fired (1 row)
 /// or was a no-op (0 rows: still settling, newest snapshot not ready, in-flight
-/// upload, or drifted). Extracted as a builder so the guard is unit-testable
+/// upload, a pin the unpinned restore wouldn't load, or drifted). Extracted as a builder so the guard is unit-testable
 /// against a live Postgres without constructing a `KubernetesSubstrate`.
 pub fn adopt_remote_snapshot_for_drain_query() -> String {
     // Node-agnostic, matching `mark_sandbox_lost_query`: adopting the remote
@@ -1069,6 +1100,12 @@ pub fn adopt_remote_snapshot_for_drain_query() -> String {
     // unwedges the drain and refuses a stale prior-cycle snapshot left behind a
     // newer failed re-suspend.
     let latest_ready = latest_full_snapshot_ready("s");
+    // Adopting unpins the row, which then restores by capture order: adopt
+    // only when that order loads the pinned capture.
+    let restore_loads_pinned = pinned_capture_is_restore_source("s");
+    // Adopting unpins the row, and an unpinned unordered history refuses to
+    // restore: leave it pinned and blocking instead.
+    let unordered = restore_order_unordered("s");
     format!(
         "UPDATE sandboxes s
             SET current_local_artifact_id = NULL,
@@ -1081,7 +1118,9 @@ pub fn adopt_remote_snapshot_for_drain_query() -> String {
             AND s.target_node_id = $2
             AND s.lifecycle_changed_at < NOW() - make_interval(secs => $3::BIGINT)
             AND NOT {inflight_upload}
-            AND {latest_ready}"
+            AND {latest_ready}
+            AND {restore_loads_pinned}
+            AND NOT {unordered}"
     )
 }
 

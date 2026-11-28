@@ -2581,3 +2581,314 @@ async fn gone_node_inflight_snapshot_flip_unblocks_drain_gate() -> TestResult {
     );
     Ok(())
 }
+
+/// Both adopt give-ups unpin the row, and an unpinned row whose history is
+/// unordered (a capture without a generation registered after one with a generation) refuses
+/// to restore. So neither adopts a row pinned to that later capture: it stays
+/// pinned and blocking. Once the pinned capture records its generation, the
+/// history is ordered and both adopt it.
+#[tokio::test(flavor = "current_thread")]
+async fn adopt_refuses_to_unpin_an_unordered_history() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    for gone_node in [false, true] {
+        let node = NodeId::new();
+        if gone_node {
+            insert_draining_node(pool, node).await?;
+            insert_node_k8s(pool, node, Some("uid-1")).await?;
+        }
+        let sandbox = SandboxId::new();
+        insert_sandbox(pool, sandbox, "suspended", Some(node)).await?;
+        age_lifecycle(pool, sandbox, 3600).await?;
+        insert_ready_capture_aged(pool, sandbox, node, false, (120, Some(5))).await?;
+        let capture = insert_ready_capture_aged(pool, sandbox, node, false, (60, None)).await?;
+        let pinned = pin_to_capture(pool, sandbox, capture).await?;
+        let adopt = async || -> TestResult<u64> {
+            if gone_node {
+                adopt_on_gone_node(pool, sandbox, node, Some("uid-1"), 600).await
+            } else {
+                adopt_remote_snapshot(pool, sandbox, node, 60).await
+            }
+        };
+        assert_eq!(adopt().await?, 0, "gone node {gone_node}");
+        assert_eq!(give_up_columns(pool, sandbox).await?.1, Some(pinned));
+
+        sqlx::query(sql!("UPDATE snapshots SET generation = 6 WHERE id = $1"))
+            .bind(capture)
+            .execute(pool)
+            .await?;
+        assert_eq!(adopt().await?, 1, "gone node {gone_node}, ordered");
+    }
+    Ok(())
+}
+
+/// Pin the sandbox to the artifact of its suspend capture `snapshot_id`, and
+/// return that artifact's id.
+async fn pin_to_capture(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    snapshot_id: SnapshotId,
+) -> TestResult<Uuid> {
+    Ok(sqlx::query_scalar(sql!(
+        "UPDATE sandboxes s
+            SET current_local_artifact_id = sn.local_artifact_id,
+                current_local_artifact_kind = sn.artifact_kind,
+                current_local_artifact_origin = sn.artifact_origin
+           FROM snapshots sn
+          WHERE s.id = $1 AND sn.id = $2
+      RETURNING s.current_local_artifact_id"
+    ))
+    .bind(sandbox_id)
+    .bind(snapshot_id)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Both adopt give-ups unpin the row, so its next restore loads what the
+/// unpinned selection picks: the newest suspend capture, and nothing when a
+/// capture of any state outranks that one. So neither adopts a row pinned to
+/// an earlier capture: unpinned, a later ready capture would replace the
+/// state it's pinned to, and a later failed one would leave it nothing to
+/// restore. The row keeps its pin, and the restore keeps loading the pinned
+/// capture, whether or not the adopt took the row.
+#[tokio::test(flavor = "current_thread")]
+async fn adopt_keeps_a_pin_the_unpinned_restore_would_not_load() -> TestResult {
+    use sandbox_store::restore_source::{
+        RestoreSourceMode, RestoreSourcePlacement, select_restore_source,
+    };
+
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    // Each case: the state of a capture of a later generation registered
+    // after the pinned one, if there's one, and whether the adopts take the
+    // row.
+    let cases = [
+        ("the pinned capture is the newest", None, true),
+        ("a later capture failed", Some("failed"), false),
+        ("a later capture is ready", Some("ready"), false),
+    ];
+    for (gone_node, (case, later_capture, adopts)) in [false, true]
+        .into_iter()
+        .flat_map(|gone| cases.map(|c| (gone, c)))
+    {
+        let case = format!("{case}, gone node {gone_node}");
+        let node = NodeId::new();
+        if gone_node {
+            insert_draining_node(pool, node).await?;
+            insert_node_k8s(pool, node, Some("uid-1")).await?;
+        }
+        let sandbox = SandboxId::new();
+        insert_sandbox(pool, sandbox, "suspended", Some(node)).await?;
+        age_lifecycle(pool, sandbox, 3600).await?;
+        let capture =
+            insert_ready_capture_aged(pool, sandbox, node, false, (1800, Some(3))).await?;
+        let pinned = pin_to_capture(pool, sandbox, capture).await?;
+        if let Some(state) = later_capture {
+            let later =
+                insert_ready_capture_aged(pool, sandbox, node, false, (600, Some(5))).await?;
+            sqlx::query(sql!("UPDATE snapshots SET state = $2 WHERE id = $1"))
+                .bind(later)
+                .bind(state)
+                .execute(pool)
+                .await?;
+        }
+
+        let adopted = if gone_node {
+            adopt_on_gone_node(pool, sandbox, node, Some("uid-1"), 600).await?
+        } else {
+            adopt_remote_snapshot(pool, sandbox, node, 60).await?
+        };
+
+        assert_eq!(adopted, u64::from(adopts), "{case}");
+        assert_eq!(
+            give_up_columns(pool, sandbox).await?.1,
+            (!adopts).then_some(pinned),
+            "{case}"
+        );
+        let restored = select_restore_source(
+            pool,
+            sandbox,
+            RestoreSourceMode::PlacementFresh,
+            RestoreSourcePlacement::Any,
+        )
+        .await?;
+        assert_eq!(
+            restored.selected().map(|source| source.snapshot_id),
+            Some(capture),
+            "{case}: the restore loads the capture the row was pinned to"
+        );
+    }
+    Ok(())
+}
+
+/// Insert a ready full snapshot of a new artifact with a stored copy,
+/// registered `age_secs` ago with `generation`: a suspend capture, or with
+/// `named` a backup of a named snapshot.
+async fn insert_ready_capture_aged(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    source_node_id: NodeId,
+    named: bool,
+    (age_secs, generation): (i64, Option<i64>),
+) -> TestResult<SnapshotId> {
+    let snapshot_id = SnapshotId::new();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (
+             id, sandbox_id, type, state, source_node_id, timestamp,
+             local_artifact_id, artifact_kind, artifact_origin, artifact_snapshot_name,
+             generation
+         )
+         VALUES (
+             $1, $2, 'full', 'ready', $3, NOW() - make_interval(secs => $4),
+             $5, 'full',
+             CASE WHEN $6 THEN 'snapshot' ELSE 'suspend' END,
+             CASE WHEN $6 THEN 'checkpoint' END,
+             $7
+         )"
+    ))
+    .bind(snapshot_id)
+    .bind(sandbox_id)
+    .bind(source_node_id)
+    .bind(age_secs)
+    .bind(Uuid::now_v7())
+    .bind(named)
+    .bind(generation)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string)
+         VALUES ($1, $2)"
+    ))
+    .bind(snapshot_id)
+    .bind(format!("s3://test-bucket/{snapshot_id}"))
+    .execute(pool)
+    .await?;
+    Ok(snapshot_id)
+}
+
+/// The gone-node adopt unpins the row and clears its placement cutoff, so
+/// the next restore loads whatever the unpinned selection picks: the newest
+/// suspend capture, never a named snapshot's backup. So for a row with no
+/// artifact identity it adopts only when that pick is a capture of the
+/// current suspend. A named snapshot's backup registered since the suspend
+/// doesn't stand in for one: with only a prior suspend's capture behind it,
+/// adopting would restore that older state, and with a later generation than
+/// this suspend's capture it would leave nothing to restore. Either way the
+/// row stays as it was, holding its node.
+#[tokio::test(flavor = "current_thread")]
+async fn gone_node_adopt_needs_the_capture_the_restore_loads() -> TestResult {
+    use sandbox_store::restore_source::{
+        RestoreSourceMode, RestoreSourcePlacement, RestoreSourceSelection, select_restore_source,
+    };
+
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let node = NodeId::new();
+    insert_draining_node(pool, node).await?;
+    insert_node_k8s(pool, node, Some("uid-1")).await?;
+
+    // The row entered `suspended` an hour ago. Each case: how long ago its
+    // suspend capture registered and with which generation, the generation of
+    // a named snapshot's backup registered half an hour ago, if there's one,
+    // and whether the adopt takes the row.
+    const SUSPENDED_AGO: i64 = 3600;
+    let this_suspend = SUSPENDED_AGO - 600;
+    let prior_suspend = SUSPENDED_AGO + 3600;
+    let cases = [
+        ("this suspend's capture", (this_suspend, None), None, true),
+        (
+            "this suspend's capture, then a named backup",
+            (this_suspend, None),
+            Some(None),
+            true,
+        ),
+        (
+            "a prior suspend's capture, then a named backup",
+            (prior_suspend, None),
+            Some(None),
+            false,
+        ),
+        (
+            "this suspend's capture, then a named backup of a later generation",
+            (this_suspend, Some(3)),
+            Some(Some(5)),
+            false,
+        ),
+    ];
+    for (case, capture, named_backup, adopts) in cases {
+        let sandbox = SandboxId::new();
+        insert_sandbox(pool, sandbox, "suspended", Some(node)).await?;
+        age_lifecycle(pool, sandbox, SUSPENDED_AGO).await?;
+        let capture = insert_ready_capture_aged(pool, sandbox, node, false, capture).await?;
+        if let Some(generation) = named_backup {
+            let registered = (SUSPENDED_AGO / 2, generation);
+            insert_ready_capture_aged(pool, sandbox, node, true, registered).await?;
+        }
+        // A failed restore placed the sandbox after every capture registered,
+        // so no capture reads fresh and the row holds the node.
+        bump_placement_to_future(pool, sandbox).await?;
+        let selected = async || -> TestResult<RestoreSourceSelection> {
+            Ok(select_restore_source(
+                pool,
+                sandbox,
+                RestoreSourceMode::PlacementFresh,
+                RestoreSourcePlacement::Any,
+            )
+            .await?)
+        };
+        assert_eq!(
+            selected().await?,
+            RestoreSourceSelection::Unavailable,
+            "{case}"
+        );
+        assert!(
+            pinned_local_only(pool, node).await?.contains(&sandbox),
+            "{case}"
+        );
+
+        let adopted = adopt_on_gone_node(pool, sandbox, node, Some("uid-1"), 600).await?;
+
+        assert_eq!(adopted, u64::from(adopts), "{case}");
+        if adopts {
+            assert_eq!(
+                give_up_columns(pool, sandbox).await?,
+                (None, None, true),
+                "{case}"
+            );
+            assert_eq!(
+                selected()
+                    .await?
+                    .selected()
+                    .map(|source| source.snapshot_id),
+                Some(capture),
+                "{case}: the restore loads the capture the adopt accepted"
+            );
+            assert!(
+                !pinned_local_only(pool, node).await?.contains(&sandbox),
+                "{case}"
+            );
+        } else {
+            assert_eq!(
+                give_up_columns(pool, sandbox).await?,
+                (None, None, false),
+                "{case}"
+            );
+            assert_eq!(
+                selected().await?,
+                RestoreSourceSelection::Unavailable,
+                "{case}"
+            );
+            assert!(
+                pinned_local_only(pool, node).await?.contains(&sandbox),
+                "{case}"
+            );
+        }
+    }
+    Ok(())
+}

@@ -13,12 +13,15 @@ pub(in crate::controllers::substrate::kubernetes) struct SelectedWakeOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::controllers::substrate::kubernetes) enum WakeDispatchStatus {
     NotDispatched,
+    /// The only Wake sent was answered with a refusal the node gives before
+    /// it stages anything, so it left no work behind.
+    RefusedBeforeStaging,
     MayHaveLanded,
 }
 
 impl WakeDispatchStatus {
     pub(in crate::controllers::substrate::kubernetes) const fn was_dispatched(self) -> bool {
-        matches!(self, Self::MayHaveLanded)
+        matches!(self, Self::RefusedBeforeStaging | Self::MayHaveLanded)
     }
 
     /// An operation owner may be released after failure only when no node-side
@@ -26,7 +29,7 @@ impl WakeDispatchStatus {
     pub(in crate::controllers::substrate::kubernetes) const fn operation_release_is_safe(
         self,
     ) -> bool {
-        matches!(self, Self::NotDispatched)
+        matches!(self, Self::NotDispatched | Self::RefusedBeforeStaging)
     }
 }
 
@@ -407,7 +410,7 @@ impl KubernetesSubstrate {
             phase_deadline
         };
         let mut last_pod_ip = None;
-        let mut wake_may_have_landed = false;
+        let mut dispatch = WakeDispatchStatus::NotDispatched;
         let mut last_pre_dispatch_error = None;
         let mut on_dispatch = Some(on_dispatch);
         let wait = async {
@@ -519,7 +522,8 @@ impl KubernetesSubstrate {
                         if let Some(on_dispatch) = on_dispatch.take() {
                             on_dispatch();
                         }
-                        wake_may_have_landed = true;
+                        let earlier_sends = dispatch;
+                        dispatch = WakeDispatchStatus::MayHaveLanded;
                         match client.wake_sandbox(request.clone()).await {
                             Ok(response) => {
                                 if let Err(error) = validate_wake_route_identity_if_present(
@@ -581,6 +585,17 @@ impl KubernetesSubstrate {
                                         ),
                                     });
                                 }
+                                WakeRpcErrorDisposition::RestoreSourceUnordered => {
+                                    // The node refused this send before
+                                    // staging anything, so only an earlier
+                                    // send can have left work behind.
+                                    if earlier_sends == WakeDispatchStatus::NotDispatched {
+                                        dispatch = WakeDispatchStatus::RefusedBeforeStaging;
+                                    }
+                                    return Err(SubstrateError::RestoreContextUnavailable {
+                                        message: error.message().to_owned(),
+                                    });
+                                }
                                 WakeRpcErrorDisposition::Fail => {
                                     return Err(SubstrateError::Conflict {
                                         message: format!("sandbox wake failed: {error}"),
@@ -614,15 +629,11 @@ impl KubernetesSubstrate {
         let result = match tokio::time::timeout_at(deadline, wait).await {
             Ok(result) => result,
             Err(_) if probe => Ok(SelectedWakeOutcome {
-                dispatch: if wake_may_have_landed {
-                    WakeDispatchStatus::MayHaveLanded
-                } else {
-                    WakeDispatchStatus::NotDispatched
-                },
+                dispatch,
                 landed: false,
                 pod_ip: last_pod_ip,
             }),
-            Err(_) if wake_may_have_landed => Err(SubstrateError::Timeout {
+            Err(_) if dispatch.was_dispatched() => Err(SubstrateError::Timeout {
                 message: "required Wake did not complete within the readiness budget; sandbox-manager may still be completing the same activation".to_string(),
                 phase: None,
             }),
@@ -632,13 +643,6 @@ impl KubernetesSubstrate {
                 }),
             }),
         };
-        result.map_err(|error| ActivationWakeFailure {
-            error,
-            dispatch: if wake_may_have_landed {
-                WakeDispatchStatus::MayHaveLanded
-            } else {
-                WakeDispatchStatus::NotDispatched
-            },
-        })
+        result.map_err(|error| ActivationWakeFailure { error, dispatch })
     }
 }

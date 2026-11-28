@@ -189,41 +189,6 @@ macro_rules! node_api_unary_methods {
     };
 }
 
-macro_rules! node_api_internal_unary_methods {
-    ($(
-        $method:ident, $client_new:path, $request:ty, $response:ty;
-    )*) => {
-        $(
-            pub async fn $method(
-                &mut self,
-                request: $request,
-                timeout: Duration,
-            ) -> Result<tonic::Response<$response>, tonic::Status> {
-                let client = self.client();
-                GrpcClient::call(
-                    &mut client.inner,
-                    stringify!($method),
-                    GrpcRetryContext::with_timeout(timeout),
-                    move |channel| {
-                        let request = request.clone();
-                        async move {
-                            let mut client = $client_new(wrap_grpc_client_channel(channel));
-                            client
-                                .$method(node_request_with_metadata(
-                                    request,
-                                    tonic::metadata::MetadataMap::new(),
-                                    SpaceBearerToken::NodeApiInternal,
-                                )?)
-                                .await
-                        }
-                    },
-                )
-                .await
-            }
-        )*
-    };
-}
-
 trait RoleNodeApiClient {
     fn client(&mut self) -> &mut NodeApiClient;
 }
@@ -583,8 +548,56 @@ impl<'a> WorkerApiInternalClient<'a> {
         Self { client }
     }
 
-    node_api_internal_unary_methods! {
-        wake_sandbox, proto::worker_api_internal_client::WorkerApiInternalClient::new, pplx_space_sbx_mgr_client::proto::WakeRequest, pplx_space_sbx_mgr_client::proto::WakeResponse;
+    pub async fn wake_sandbox(
+        &mut self,
+        request: pplx_space_sbx_mgr_client::proto::WakeRequest,
+        timeout: Duration,
+    ) -> Result<tonic::Response<pplx_space_sbx_mgr_client::proto::WakeResponse>, tonic::Status>
+    {
+        self.wake_sandbox_counting_sends(request, timeout).await.0
+    }
+
+    /// [`Self::wake_sandbox`], with the number of times the request was sent.
+    ///
+    /// This client replays a retryable transport status in place, so the
+    /// answer it returns is the last send's alone: an earlier send may have
+    /// reached the node before its connection failed. A caller that decides
+    /// from a refusal whether node-side work can exist reads the count, since
+    /// only a single send makes the refusal the whole story.
+    pub async fn wake_sandbox_counting_sends(
+        &mut self,
+        request: pplx_space_sbx_mgr_client::proto::WakeRequest,
+        timeout: Duration,
+    ) -> (
+        Result<tonic::Response<pplx_space_sbx_mgr_client::proto::WakeResponse>, tonic::Status>,
+        usize,
+    ) {
+        let mut sends = 0;
+        let client = self.client();
+        let result = GrpcClient::call(
+            &mut client.inner,
+            "wake_sandbox",
+            GrpcRetryContext::with_timeout(timeout),
+            |channel| {
+                sends += 1;
+                let request = request.clone();
+                async move {
+                    let mut client =
+                        proto::worker_api_internal_client::WorkerApiInternalClient::new(
+                            wrap_grpc_client_channel(channel),
+                        );
+                    client
+                        .wake_sandbox(node_request_with_metadata(
+                            request,
+                            tonic::metadata::MetadataMap::new(),
+                            SpaceBearerToken::NodeApiInternal,
+                        )?)
+                        .await
+                }
+            },
+        )
+        .await;
+        (result, sends)
     }
 }
 

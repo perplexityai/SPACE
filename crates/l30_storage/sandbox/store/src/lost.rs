@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sandbox_portability::{
-    inflight_suspend_upload_from_other_node_exists, snapshot_durable_for_source_release,
+    inflight_suspend_upload_from_other_node_exists, snapshot_durable_copy_exists,
     started_restore_source_absent,
 };
 use pplx_space_sql_locator::sql;
@@ -283,11 +283,17 @@ where
 ///   the permanent park this give-up exists to break. An upload from any
 ///   still-live node may yet finalize `ready`, so it still vetoes.
 ///
-/// The portability test is the same marker-aware
-/// [`snapshot_durable_for_source_release`] the snapshot guard and
-/// `mark_sandbox_lost_query` use, so "blocks the reap" and "eligible for
-/// give-up" can't drift: a durably-portable suspended sandbox neither blocks
-/// nor is flipped; a local-only one both blocks and (here) is flipped.
+/// The portability test is [`snapshot_durable_copy_exists`], the durable
+/// copy the snapshot guard's marker-aware
+/// `snapshot_durable_for_source_release` looks for, so "blocks the reap" and
+/// "eligible for give-up" agree on every row but one kind: an unpinned row
+/// whose history is unordered blocks the reap, since its restore refuses, but
+/// keeps its durable suspend captures, so it isn't flipped. It parks until an
+/// operator pins one. A durably-portable suspended sandbox neither blocks nor
+/// is flipped; a local-only one both blocks and (here) is flipped. So is an
+/// unpinned one whose only durable copy is a named snapshot's or a stop's
+/// backup: no restore loads that copy and no operator can pin it, so keeping
+/// the row would park the node for good. The backup stays.
 /// Mid-flight rows (`suspending` / `restoring`) are deliberately out of
 /// scope — they keep blocking and stay parked for their own sweepers.
 ///
@@ -309,7 +315,7 @@ where
 /// transaction before running this statement; run it only under that
 /// protocol.
 pub fn mark_unrecoverable_sandboxes_lost_query() -> String {
-    let durable = snapshot_durable_for_source_release("sandboxes");
+    let durable = snapshot_durable_copy_exists("sandboxes");
     let inflight_from_other_node =
         inflight_suspend_upload_from_other_node_exists("sandboxes", "$1");
     format!(
@@ -355,8 +361,8 @@ pub fn mark_unrecoverable_sandboxes_lost_query() -> String {
     )
 }
 
-/// `$1` = node id. Built once: the fragment is
-/// [`snapshot_durable_for_source_release`] over a fixed alias.
+/// `$1` = node id. Built once: the fragment is the flip's
+/// [`snapshot_durable_copy_exists`] over a fixed alias.
 ///
 /// The durability check is wrapped in a scalar subquery, `NOT (SELECT …)`: a
 /// bare `NOT EXISTS` is pullable, and the planner may realise it as a hash or
@@ -366,7 +372,7 @@ pub fn mark_unrecoverable_sandboxes_lost_query() -> String {
 /// locks the rows of its own `FROM` list only, so it locks `sandboxes` rows and
 /// nothing else: the durability check is a sublink.
 static LOCK_UNRECOVERABLE_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
-    let durable = snapshot_durable_for_source_release("s");
+    let durable = snapshot_durable_copy_exists("s");
     sql!(format!(
         "SELECT s.id
            FROM sandboxes s

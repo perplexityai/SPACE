@@ -632,6 +632,18 @@ async fn verdict_only_registration_persists_nothing() -> TestResult {
     let ready_attempt = SnapshotId::new();
     begin_teardown_backup(&fixture.service, source_ip, sandbox_id, ready_attempt, 1).await?;
     finalize_artifact_backup_from_node(&fixture.service, source_ip, ready_attempt).await?;
+    // The projection pinned the capture with a generation. Unpinned, the release check
+    // refuses to look past any newer full row, which is what this probes.
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET current_local_artifact_id = NULL,
+                current_local_artifact_kind = NULL,
+                current_local_artifact_origin = NULL
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
     assert!(pplx_space_sandbox_store::durably_restorable(pool, sandbox_id).await?);
 
     let verdict_only = |backup_attempt_id, generation| BeginArtifactBackupRequest {
@@ -924,6 +936,176 @@ async fn a_rolled_back_restore_keeps_its_capture_with_retirement_disabled() -> T
     assert_eq!(
         snapshot_state(&fixture.service.pool, relaunched_capture).await?,
         "creating"
+    );
+    Ok(())
+}
+
+/// When a post-claim full snapshot has already registered while `restoring`,
+/// `activation_rollback` to `suspended` must keep `lifecycle = 'restoring'`
+/// and preserve `lifecycle_changed_at` (clearing the restore lease pair and
+/// retiring the failed attempt's execution as `replaced`) so the next restore
+/// still selects the pre-claim snapshot instead of the post-claim capture.
+#[tokio::test(flavor = "current_thread")]
+async fn activation_rollback_with_post_claim_snapshot_preserves_retry_source_window() -> TestResult
+{
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let (sandbox_id, source_ip, _) = seed_sandbox_on_source_node(pool).await?;
+    let node_id: NodeId = sqlx::query_scalar(sql!("SELECT id FROM nodes WHERE host(address) = $1"))
+        .bind(source_ip.to_string())
+        .fetch_one(pool)
+        .await?;
+
+    let pre_restore = SnapshotId::new();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (
+             id, sandbox_id, type, state, source_node_id, org_id,
+             local_artifact_id, artifact_kind, artifact_origin, generation, timestamp
+         )
+         VALUES (
+             $1, $2, 'full', 'ready', $3, $4::uuid, $5, 'full', 'suspend', 2,
+             NOW() - INTERVAL '1 minute'
+         )"
+    ))
+    .bind(pre_restore)
+    .bind(sandbox_id)
+    .bind(node_id)
+    .bind(SEEDED_ORG_ID)
+    .bind(LocalArtifactId::new())
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshot_storage_locations
+             (snapshot_id, storage_connection_string, org_id)
+         VALUES ($1, 's3://space-test/pre-restore', $2::uuid)"
+    ))
+    .bind(pre_restore)
+    .bind(SEEDED_ORG_ID)
+    .execute(pool)
+    .await?;
+
+    let lease_token = Uuid::now_v7();
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET lifecycle = 'restoring',
+                lifecycle_changed_at = NOW(),
+                restore_lease_token = $2,
+                restore_lease_expires_at = NOW() + INTERVAL '2 minutes'
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(lease_token)
+    .execute(pool)
+    .await?;
+    let claim_boundary: Option<String> = sqlx::query_scalar(sql!(
+        "SELECT lifecycle_changed_at::text FROM sandboxes WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(pool)
+    .await?;
+
+    insert_execution(pool, sandbox_id, 3, "creating", true).await?;
+    let activation_attempt_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET activation_attempt_id = $2
+          WHERE sandbox_id = $1 AND generation = 3"
+    ))
+    .bind(sandbox_id)
+    .bind(activation_attempt_id)
+    .execute(pool)
+    .await?;
+
+    let post_claim = SnapshotId::new();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (
+             id, sandbox_id, type, state, source_node_id, org_id,
+             local_artifact_id, artifact_kind, artifact_origin, generation, timestamp
+         )
+         VALUES (
+             $1, $2, 'full', 'ready', $3, $4::uuid, $5, 'full', 'suspend', 3,
+             (SELECT lifecycle_changed_at + INTERVAL '1 second' FROM sandboxes WHERE id = $2)
+         )"
+    ))
+    .bind(post_claim)
+    .bind(sandbox_id)
+    .bind(node_id)
+    .bind(SEEDED_ORG_ID)
+    .bind(LocalArtifactId::new())
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshot_storage_locations
+             (snapshot_id, storage_connection_string, org_id)
+         VALUES ($1, 's3://space-test/post-claim', $2::uuid)"
+    ))
+    .bind(post_claim)
+    .bind(SEEDED_ORG_ID)
+    .execute(pool)
+    .await?;
+
+    let rollback = PublishedSandboxState {
+        transition_receipt: Some(pplx_space_sbx_mgr_client::proto::TransitionReceipt {
+            id: Uuid::now_v7().to_string(),
+            kind: "activation_rollback".to_string(),
+            target_state: "suspended".to_string(),
+            execution_generation: 3,
+            reason_code: SandboxQuarantineReasonCode::RestorePrepareFailed.to_string(),
+            activation_attempt_id: Some(activation_attempt_id.to_string()),
+        }),
+        ..published_sandbox_state(sandbox_id, "suspended")
+    };
+    let mut conn = pool.acquire().await?;
+    let outcome = publish_sandbox_states_with_retirement(
+        &mut conn,
+        node_id,
+        &[rollback],
+        AbandonedRestoreRetirement::Enabled,
+    )
+    .await?;
+    drop(conn);
+    assert_eq!(outcome.post_commit_events.len(), 1, "the rollback applies");
+
+    let (lifecycle, after_boundary, lease_cleared, exec_state): (
+        String,
+        Option<String>,
+        bool,
+        String,
+    ) = sqlx::query_as(sql!(
+        "SELECT s.lifecycle,
+                s.lifecycle_changed_at::text,
+                (s.restore_lease_token IS NULL AND s.restore_lease_expires_at IS NULL),
+                e.state
+           FROM sandboxes s
+           JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id AND e.generation = 3
+          WHERE s.id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(lifecycle, "restoring");
+    assert_eq!(after_boundary, claim_boundary);
+    assert!(lease_cleared, "rollback clears the restore lease pair");
+    assert_eq!(exec_state, "replaced");
+
+    let selected = pplx_space_sandbox_store::restore_source::select_restore_source(
+        pool,
+        sandbox_id,
+        pplx_space_sandbox_store::restore_source::RestoreSourceMode::Retry,
+        pplx_space_sandbox_store::restore_source::RestoreSourcePlacement::Any,
+    )
+    .await?;
+    assert_eq!(
+        selected,
+        pplx_space_sandbox_store::restore_source::RestoreSourceSelection::Selected(
+            pplx_space_sandbox_store::restore_source::SelectedRestoreSource {
+                snapshot_id: pre_restore,
+                storage_connection_string: "s3://space-test/pre-restore".to_string(),
+                size_bytes: None,
+            }
+        )
     );
     Ok(())
 }

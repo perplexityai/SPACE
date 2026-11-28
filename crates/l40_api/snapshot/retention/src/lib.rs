@@ -58,10 +58,20 @@
 //! ### Recency is not sufficient — the restore-source guard
 //!
 //! The newest `ready` full snapshot can never have `keep_n` newer
-//! siblings, so it is never a candidate while `keep_n >= 1`. That protects
-//! the *markerless* restore path, which selects by recency. It does not
-//! protect either of the two other shapes restore selection can take:
+//! siblings, so it is never a candidate while `keep_n >= 1`. That ranks
+//! snapshots by backup row recency, but restore selection doesn't: a
+//! markerless sandbox restores its latest capture by **generation**, then
+//! by the capture's **first registration** (`capture_registered_at`, the
+//! earliest backup row of its artifact), even when no capture records a
+//! generation. So the keep floor doesn't protect the restore source in
+//! these shapes:
 //!
+//! - A re-upload of an older capture registers later than the restore's
+//!   pick but doesn't make its capture newer. With `keep_n = 2`, register
+//!   capture A, then capture B, then two re-uploads of A: both re-uploads
+//!   rank ahead of B for retention, yet restore still selects B, so B falls
+//!   outside the keep-set. The source guard protects B, and A's first
+//!   backup, which anchors A's first registration.
 //! - A sandbox carrying `current_local_artifact_id` restores by **exact
 //!   artifact identity**, and once the row is `suspended` that selection has
 //!   no newest-snapshot fallback. A sandbox pinned to an older artifact has
@@ -76,7 +86,7 @@
 //! Both the candidate scan and the pre-reap authorization therefore exclude
 //! any snapshot matching the shared
 //! `sandbox_portability::snapshot_is_live_restore_source` fragment, which
-//! composes both shapes. It is built from the same pieces the restore
+//! composes every shape. It is built from the same pieces the restore
 //! selector itself is built from, so the "never delete this" and "this is
 //! the one to load" answers cannot drift. The exclusion filters the
 //! candidate row itself and never the newer-sibling probe, so a shielded

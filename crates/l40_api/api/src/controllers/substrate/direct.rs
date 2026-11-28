@@ -39,6 +39,16 @@
 //!   stays `suspended` until the stamp. A start and a stop also write over
 //!   `stopped` and `restoring`, so a start or stop that races a restore lease
 //!   can make the lease's completion miss.
+//! - A restore's source is the shared rule
+//!   (`pplx_space_sandbox_store::restore_source::select_restore_source`).
+//!   The source-node candidate sends no URI, and reads its compatibility
+//!   metadata from the pinned artifact's snapshot row, else the source node's
+//!   published execution observation (`sandbox_observed_states`), else that
+//!   source node's suspend captures (generated captures ahead of ungenerated
+//!   ones), in any upload state. A remote candidate restores the pinned
+//!   artifact's ready backup, or for an unpinned row the newest suspend
+//!   capture by capture generation, from a live storage location, and a
+//!   retry restores the source its restore claimed.
 //! - Warm-pool claims adopt node-side, so `label_adopted_execution` has no
 //!   pod to label and answers `Labeled`.
 //! - Create, pool-adoption and restore candidates evaluate the environment
@@ -134,7 +144,7 @@ use pplx_space_sandbox_model::{
     SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxRouteIdentity,
     SandboxRouteIdentityInvariantError,
 };
-use pplx_space_sandbox_store::direct as sandbox_direct;
+use pplx_space_sandbox_store::{direct as sandbox_direct, restore_source};
 use pplx_space_sbx_mgr_client::proto::{
     BootMode, StartRequest, SuspendRequest, WakeResponse, WakeTransition,
 };
@@ -152,7 +162,7 @@ use super::{
     PooledExecutionClaimAttempt, PooledExecutionClaimRequest, PooledExecutionPoolShape,
     RetireExecutionOutcome, RetireExecutionRequest, RuntimeClient, SandboxResources,
     SubstrateAdapter, SubstrateCapabilities, SubstrateError, connect_builder, connect_worker,
-    node_api_endpoint, substrate_db_error,
+    node_api_endpoint, restore_claim_error, substrate_db_error,
 };
 use crate::controllers::auto_lifecycle::policy_to_proto;
 use crate::controllers::substrate::{ChargeState, KeyResolution, RecoveryCharge};
@@ -431,7 +441,12 @@ fn should_try_next_worker_candidate(error: &tonic::Status) -> bool {
 }
 
 fn should_try_next_restore_candidate(error: &tonic::Status) -> bool {
-    if pplx_space_credmgr_client::status_is_invalid_key_reference(error) {
+    // A refused restore source is terminal: every node asks the control plane
+    // the same question. The candidate loop handles a source node's refusal
+    // first, since the remote candidates carry the selector's own pick.
+    if pplx_space_credmgr_client::status_is_invalid_key_reference(error)
+        || pplx_space_sbx_mgr_client::status_is_restore_source_unordered(error)
+    {
         return false;
     }
     matches!(
@@ -442,6 +457,27 @@ fn should_try_next_restore_candidate(error: &tonic::Status) -> bool {
             | Code::ResourceExhausted
             | Code::Internal
     )
+}
+
+/// A source node's Start refused because its own lookup found the history
+/// unordered. The candidate loop then tries the remote candidates, which
+/// carry the selector's pick, and ends the restore with the refusal only
+/// when the selector chose no remote source: one it chose means it found the
+/// history ordered, so a failure to restore it, or no worker able to take it
+/// now, ends the attempt as retryable. From a remote candidate the refusal is terminal at
+/// once ([`should_try_next_restore_candidate`]).
+fn source_refused_unordered(kind: &DirectRestoreCandidateKind, status: &tonic::Status) -> bool {
+    matches!(kind, DirectRestoreCandidateKind::SourceNode)
+        && pplx_space_sbx_mgr_client::status_is_restore_source_unordered(status)
+}
+
+/// The source node's unordered refusal that ends a restore whose candidates
+/// all failed: only when the selector chose no remote source.
+fn terminal_source_refusal(
+    source_unordered: Option<tonic::Status>,
+    remote_source_selected: bool,
+) -> Option<tonic::Status> {
+    source_unordered.filter(|_| !remote_source_selected)
 }
 
 fn direct_route_generation_reservation_error(error: sqlx::Error) -> SubstrateError {
@@ -466,6 +502,11 @@ fn direct_route_generation_reservation_error(error: sqlx::Error) -> SubstrateErr
 }
 
 fn restore_status_error(status: &tonic::Status) -> SubstrateError {
+    if pplx_space_sbx_mgr_client::status_is_restore_source_unordered(status) {
+        return SubstrateError::RestoreContextUnavailable {
+            message: status.message().to_owned(),
+        };
+    }
     let message = format!("node-api restore error: {status}");
     if pplx_space_credmgr_client::status_is_invalid_key_reference(status) {
         SubstrateError::FailedPrecondition { message }
@@ -704,6 +745,19 @@ fn lifecycle_holds_live_runtime(
             | SandboxLifecycleState::Suspending
             | SandboxLifecycleState::Restoring
     )
+}
+
+/// The execution generation of a record a wake may adopt
+/// (`DirectSubstrate::adopt_live_source_record`): one no operation owns, in
+/// a lifecycle that holds a live runtime, that reports its execution.
+fn adoptable_execution_generation(
+    record: &pplx_space_sbx_mgr_client::proto::SandboxInfo,
+) -> Option<i64> {
+    record
+        .observed_status()
+        .is_ok_and(|status| status.unowned().is_some_and(lifecycle_holds_live_runtime))
+        .then_some(record.execution_generation)
+        .flatten()
 }
 
 /// The restore's `Start` checks no wake policy, so an implicit wake of an
@@ -2309,6 +2363,7 @@ impl DirectSubstrate {
         Ok((endpoint, client))
     }
 
+    #[cfg(test)]
     async fn direct_restore_candidates(
         &self,
         sandbox_id: SandboxId,
@@ -2317,6 +2372,7 @@ impl DirectSubstrate {
             .await
     }
 
+    #[cfg(test)]
     async fn direct_restore_retry_candidates(
         &self,
         sandbox_id: SandboxId,
@@ -2325,11 +2381,25 @@ impl DirectSubstrate {
             .await
     }
 
+    #[cfg(test)]
     async fn direct_restore_candidates_for_mode(
         &self,
         sandbox_id: SandboxId,
         restore_retry: bool,
     ) -> Result<Vec<DirectRestoreCandidate>, SubstrateError> {
+        self.direct_restore_candidate_selection(sandbox_id, restore_retry)
+            .await
+            .map(|(candidates, _)| candidates)
+    }
+
+    /// [`Self::direct_restore_candidates_for_mode`], and whether the shared
+    /// selector chose a remote source: it found the history ordered, whether
+    /// or not a worker can take that source now.
+    async fn direct_restore_candidate_selection(
+        &self,
+        sandbox_id: SandboxId,
+        restore_retry: bool,
+    ) -> Result<(Vec<DirectRestoreCandidate>, bool), SubstrateError> {
         let mut candidates = Vec::new();
         let source_candidates = sandbox_direct::restore_candidates::source_candidates(
             &self.pool,
@@ -2351,10 +2421,57 @@ impl DirectSubstrate {
                 .map(DirectRestoreCandidate::source_node),
         );
 
+        // The remote leg restores the capture the shared rule selects, the
+        // same one a Kubernetes restore away from the source node loads.
+        let selected = match restore_source::select_restore_source(
+            &self.pool,
+            sandbox_id,
+            restore_source::RestoreSourceMode::or_retry(
+                restore_source::RestoreSourceMode::NewestFull,
+                restore_retry,
+            ),
+            restore_source::RestoreSourcePlacement::Any,
+        )
+        .await
+        .db_context("failed to select direct remote restore snapshot")?
+        {
+            restore_source::RestoreSourceSelection::Selected(selected) => selected,
+            restore_source::RestoreSourceSelection::Unavailable => return Ok((candidates, false)),
+            // No remote source: capture order can't choose one. The source
+            // node's local copy is the state it last suspended with there, so
+            // its leg still restores, unless the node refuses too
+            // (`status_is_restore_source_unordered`), which is terminal.
+            restore_source::RestoreSourceSelection::Unordered if !candidates.is_empty() => {
+                return Ok((candidates, false));
+            }
+            // No source leg now. While the worker that holds the local copy is
+            // still registered (its `node_direct` row not deleted, its `nodes`
+            // row not a `deleted` tombstone), it may take the restore once
+            // it's eligible again, so that's transient; with the node gone or
+            // deregistered, nothing can.
+            restore_source::RestoreSourceSelection::Unordered => {
+                let source_node_registered =
+                    sandbox_direct::restore_candidates::source_node_registered(
+                        &self.pool, sandbox_id,
+                    )
+                    .await
+                    .db_context("failed to look up the direct restore source node")?;
+                let message = restore_source::unordered_restore_source_message(sandbox_id);
+                return Err(if source_node_registered {
+                    SubstrateError::Unavailable {
+                        message: format!(
+                            "{message}; the node holding its local copy isn't taking the restore now"
+                        ),
+                    }
+                } else {
+                    SubstrateError::RestoreContextUnavailable { message }
+                });
+            }
+        };
         let remote_candidates = sandbox_direct::restore_candidates::remote_candidates(
             &self.pool,
             sandbox_id,
-            restore_retry,
+            &selected,
             DIRECT_REMOTE_RESTORE_CANDIDATE_LIMIT,
             self.environment_placement.refuses(),
         )
@@ -2372,28 +2489,29 @@ impl DirectSubstrate {
                 .map(DirectRestoreCandidate::remote_snapshot),
         );
 
-        Ok(candidates)
+        Ok((candidates, true))
     }
 
     async fn direct_restore_candidates_or_unavailable(
         &self,
         sandbox_id: SandboxId,
         lease: DirectRestoreLease,
-    ) -> Result<Vec<DirectRestoreCandidate>, SubstrateError> {
+    ) -> Result<(Vec<DirectRestoreCandidate>, bool), SubstrateError> {
         self.direct_restore_candidates_for_mode_or_unavailable(sandbox_id, lease.restore_retry)
             .await
     }
 
+    /// The candidates, or `Unavailable` when there are none, and whether the
+    /// selector chose a remote source
+    /// ([`Self::direct_restore_candidate_selection`]).
     async fn direct_restore_candidates_for_mode_or_unavailable(
         &self,
         sandbox_id: SandboxId,
         restore_retry: bool,
-    ) -> Result<Vec<DirectRestoreCandidate>, SubstrateError> {
-        let candidates = if restore_retry {
-            self.direct_restore_retry_candidates(sandbox_id).await?
-        } else {
-            self.direct_restore_candidates(sandbox_id).await?
-        };
+    ) -> Result<(Vec<DirectRestoreCandidate>, bool), SubstrateError> {
+        let (candidates, remote_source_selected) = self
+            .direct_restore_candidate_selection(sandbox_id, restore_retry)
+            .await?;
         if candidates.is_empty() {
             return Err(SubstrateError::Unavailable {
                 message: format!(
@@ -2403,7 +2521,7 @@ impl DirectSubstrate {
                 ),
             });
         }
-        Ok(candidates)
+        Ok((candidates, remote_source_selected))
     }
 
     async fn direct_restore_preflight_mode(
@@ -2451,7 +2569,7 @@ impl DirectSubstrate {
             token,
         )
         .await
-        .db_context("failed to claim direct restore lease")?;
+        .map_err(|error| restore_claim_error("failed to claim direct restore lease", error))?;
         if let Some(sandbox_direct::ClaimedRestoreLease {
             token: claimed_token,
             restore_retry,
@@ -2511,6 +2629,33 @@ impl DirectSubstrate {
             )));
         }
         Ok(())
+    }
+
+    /// Gives back the lease of a restore admission refused, which asked no
+    /// worker to start the sandbox. A retry's lease, which a release leaves
+    /// to expire on its own, expires now, so the next restore doesn't wait
+    /// out a lease nothing runs under.
+    async fn release_refused_direct_restore_lease_best_effort(
+        &self,
+        sandbox_id: SandboxId,
+        lease: DirectRestoreLease,
+        primary_error: &SubstrateError,
+    ) {
+        let released = sandbox_direct::release_undispatched_restore_lease(
+            &self.pool,
+            sandbox_id,
+            lease.token,
+            lease.restore_retry,
+        )
+        .await;
+        if !matches!(released, Ok(true)) {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                %primary_error,
+                ?released,
+                "failed to release direct restore lease while preserving the primary restore error"
+            );
+        }
     }
 
     async fn release_direct_restore_lease_best_effort(
@@ -2584,21 +2729,50 @@ impl DirectSubstrate {
         // Claim the sandbox before selecting a durable restore source. The
         // retention claim takes the same row lock and rechecks lifecycle after
         // it acquires it, so it cannot mark a source `deleting` between
-        // candidate selection and restore.
-        let candidates = match self
+        // candidate selection and restore. The selection follows the claim
+        // directly: a first attempt's isn't bound by the claim, so a capture
+        // that registers between the two is one it can load and a retry
+        // passes over.
+        let (candidates, remote_source_selected) = match self
             .direct_restore_candidates_or_unavailable(sandbox_id, lease)
             .await
         {
-            Ok(candidates) => candidates,
+            Ok(selection) => selection,
             Err(error) => {
                 self.release_direct_restore_lease_best_effort(sandbox_id, lease, &error)
                     .await;
                 return Err(error);
             }
         };
+        // The claim winner pays, as on Kubernetes, before it asks a worker
+        // for anything: a restore the claim refuses, including the retryable
+        // refusal for a capture stamped ahead of the database clock, spends
+        // no admission. `charge` is already paid when a resident wake fell
+        // back to this restore.
+        // Admission can wait, and a caller that goes away meanwhile drops
+        // this future. The guard gives the claim back then, as a refusal
+        // does below.
+        let mut dropped_at_admission =
+            UndispatchedRestoreLease::held(self.pool.clone(), sandbox_id, lease);
+        if let Err(error) = charge.charge_restore_claim().await {
+            // Still the guard's lease until this release returns: dropped
+            // while the release waits, the guard releases it instead.
+            self.release_refused_direct_restore_lease_best_effort(sandbox_id, lease, &error)
+                .await;
+            dropped_at_admission.settled();
+            return Err(error);
+        }
+        dropped_at_admission.settled();
         let attempt_timeout =
             split_restore_attempt_timeout(options.ready_timeout, candidates.len());
         let mut failures = Vec::new();
+        // A source node whose own lookup refused the history as unordered:
+        // the remote candidates the selector chose still get their attempt.
+        // The refusal ends the restore only when the selector chose no
+        // remote source. When it chose one, it found the history ordered, so
+        // remote failures, or no worker able to take that source now, end
+        // the attempt with the retryable summary.
+        let mut source_unordered: Option<tonic::Status> = None;
 
         for candidate in candidates {
             let attempt_deadline = tokio::time::Instant::now() + attempt_timeout;
@@ -2752,6 +2926,20 @@ impl DirectSubstrate {
                         execution_generation: receipt_execution_generation(route_identity.as_ref()),
                     });
                 }
+                Ok(Err(status)) if source_refused_unordered(&candidate.kind, &status) => {
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        node_id = %candidate.node.id,
+                        error = %status,
+                        "source node refused its restore source as unordered; trying the selected remote candidates"
+                    );
+                    failures.push(format!(
+                        "{} ({}): node-api restore error: {status}",
+                        candidate.node.id,
+                        candidate.kind.as_str()
+                    ));
+                    source_unordered = Some(status);
+                }
                 Ok(Err(status)) if should_try_next_restore_candidate(&status) => {
                     tracing::warn!(
                         sandbox_id = %sandbox_id,
@@ -2793,6 +2981,12 @@ impl DirectSubstrate {
             }
         }
 
+        if let Some(status) = terminal_source_refusal(source_unordered, remote_source_selected) {
+            let error = restore_status_error(&status);
+            self.release_direct_restore_lease_best_effort(sandbox_id, lease, &error)
+                .await;
+            return Err(error);
+        }
         let failure_summary = if failures.is_empty() {
             "no eligible candidates".to_string()
         } else {
@@ -3044,13 +3238,7 @@ impl DirectSubstrate {
     ) -> Result<Option<DirectNode>, SubstrateError> {
         use pplx_space_sbx_mgr_client::proto::SandboxLifecycleState;
 
-        if !record
-            .observed_status()
-            .is_ok_and(|status| status.unowned().is_some_and(lifecycle_holds_live_runtime))
-        {
-            return Ok(None);
-        }
-        let Some(execution_generation) = record.execution_generation else {
+        let Some(execution_generation) = adoptable_execution_generation(record) else {
             return Ok(None);
         };
         let started = record
@@ -4317,10 +4505,7 @@ impl SubstrateAdapter for DirectSubstrate {
         options: ActivationOptions,
         charge: crate::controllers::substrate::RecoveryCharge,
     ) -> Result<ActivationCompletion, SubstrateError> {
-        // Direct restore claims its substrate lease below; admission remains
-        // charged at entry because the Direct path does not support joining a
-        // prior owner's completion.
-        charge.charge_restore_claim().await?;
+        // Admission is charged once the restore lease is claimed.
         self.restore_execution_with_candidates(sandbox_id, options, &charge)
             .await?;
         Ok(ActivationCompletion::Owned)
@@ -4362,9 +4547,8 @@ impl SubstrateAdapter for DirectSubstrate {
         sandbox: &Sandbox,
         timeout: Duration,
         wake_activity: Option<ExecutionActivityKind>,
-        charge: crate::controllers::substrate::RecoveryCharge,
+        mut charge: crate::controllers::substrate::RecoveryCharge,
     ) -> Result<ExecutionActivation, SubstrateError> {
-        charge.charge_restore_claim().await?;
         let sandbox_id = sandbox.id;
         // A node's idle suspend leaves no active node to answer Wake, only
         // `target_node_id` on the node holding the artifact. The record that
@@ -4380,7 +4564,7 @@ impl SubstrateAdapter for DirectSubstrate {
                     }
                     _ => return Err(unassigned_worker_error(sandbox_id)),
                 };
-                let deadline = tokio::time::Instant::now() + timeout;
+                let mut deadline = tokio::time::Instant::now() + timeout;
                 let adopted = match self
                     .unplaced_source_record(
                         sandbox_id,
@@ -4393,6 +4577,19 @@ impl SubstrateAdapter for DirectSubstrate {
                             refuse_wake_denied_by_local_override(
                                 sandbox_id, node.id, &record, activity,
                             )?;
+                        }
+                        // A record the wake adopts is woken on its node
+                        // without a restore claim, so the wake pays before
+                        // it places the row there: a wake admission refuses
+                        // leaves the row unplaced. Any other record is
+                        // restored, and that restore pays at its claim.
+                        // Admission time doesn't come out of the wake's
+                        // readiness budget: the deadline moves by it.
+                        if adoptable_execution_generation(&record).is_some() {
+                            let admission_started = tokio::time::Instant::now();
+                            charge.charge_restore_claim().await?;
+                            charge = charge.after_charge();
+                            deadline += admission_started.elapsed();
                         }
                         let budget =
                             deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -4431,10 +4628,16 @@ impl SubstrateAdapter for DirectSubstrate {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 match adopted {
                     Some(node) => (node, remaining),
+                    // The restore charges once it has claimed its lease.
                     None => return self.restore_for_wake(sandbox, remaining, &charge).await,
                 }
             }
         };
+        // A wake on the node the sandbox is on claims no restore lease, so
+        // its admission is spent here, before the node is asked to wake it,
+        // unless it was spent before the row was placed on that node.
+        charge.charge_restore_claim().await?;
+        let charge = charge.after_charge();
         let endpoint = Self::endpoint(&node.node_api_endpoint)?;
         let mut observer = connect_worker(endpoint.clone()).await.map_err(|error| {
             SubstrateError::Unavailable {
@@ -4724,6 +4927,10 @@ fn ensure_direct_create_supported(fork_disk_restore: bool) -> Result<(), Substra
     }
     Ok(())
 }
+
+mod undispatched_restore_lease;
+
+use undispatched_restore_lease::UndispatchedRestoreLease;
 
 #[cfg(test)]
 mod cluster_admission_tests;

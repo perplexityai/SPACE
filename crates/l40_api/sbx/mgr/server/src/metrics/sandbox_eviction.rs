@@ -132,10 +132,11 @@ pub fn malformed_updated_at(rows: u64) {
 ///   is held because the cluster proved another local artifact of the sandbox
 ///   backed, but its node-local backup stamp couldn't be written, and the
 ///   release requires it. Emitted by the teardown driver once per drive.
-/// - `no_backed_copy` — a retired execution's teardown release is held
-///   because the cluster can't show the sandbox is durably restorable, so the
-///   refused capture may be its only copy; the runtime stays resident.
-///   Emitted by the teardown driver once per drive.
+/// - `no_backed_copy` — the cluster can't show the sandbox is durably
+///   restorable without the local copy, which may be its only restore path.
+///   The eviction loop skips the sandbox, and a retired execution's teardown
+///   release keeps the runtime resident (emitted by the teardown driver once
+///   per drive).
 pub fn skipped(reason: &str) {
     counter("sandbox.evict.skipped", 1, &[tag("reason", reason)]);
 }

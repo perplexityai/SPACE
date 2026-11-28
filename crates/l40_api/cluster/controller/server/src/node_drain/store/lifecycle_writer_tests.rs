@@ -746,6 +746,102 @@ async fn mark_lost_fails_only_suspended_rows_without_a_durable_copy() -> TestRes
             "{case}"
         );
     }
+
+    // Unordered: a ready capture without a generation registered after one
+    // with a generation. Its restore refuses, but its pinnable copy remains,
+    // and failing it would end its last restore path.
+    let sandbox_id = SandboxId::new();
+    insert_sandbox(pool, sandbox_id, &SandboxSeed::new("suspended", "k8s")).await?;
+    set_target_node(pool, sandbox_id, node_id).await?;
+    insert_snapshot(pool, sandbox_id, "ready", -20).await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots
+            SET generation = 5, local_artifact_id = space_uuid_v7(), artifact_kind = 'full',
+                artifact_origin = 'suspend'
+          WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    insert_snapshot(pool, sandbox_id, "ready", 0).await?;
+    assert_eq!(sink.mark_sandbox_lost(sandbox_id, node_id).await?, 0);
+    assert_eq!(
+        row(pool, sandbox_id).await?,
+        Row::new("suspended", None, None)
+    );
+
+    // Evacuation-marked, with a ready suspend capture and a later failed named
+    // snapshot of the same execution: the suspend capture is the one the
+    // evacuation restore loads, so the row keeps it.
+    let sandbox_id = SandboxId::new();
+    insert_sandbox(pool, sandbox_id, &SandboxSeed::new("suspended", "k8s")).await?;
+    set_target_node(pool, sandbox_id, node_id).await?;
+    insert_snapshot(pool, sandbox_id, "ready", -20).await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots SET generation = 5 WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (
+             id, sandbox_id, type, state, source_node_id, timestamp, local_artifact_id,
+             artifact_kind, artifact_origin, artifact_snapshot_name, generation
+         )
+         SELECT $1, $2, 'full', 'failed', $3, s.lifecycle_changed_at, $4, 'full', 'snapshot',
+                'named', 5
+           FROM sandboxes s
+          WHERE s.id = $2"
+    ))
+    .bind(uuid::Uuid::now_v7())
+    .bind(sandbox_id)
+    .bind(NodeId::new())
+    .bind(uuid::Uuid::now_v7())
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET evacuation_restore_target = 'started' WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    assert_eq!(sink.mark_sandbox_lost(sandbox_id, node_id).await?, 0);
+    assert_eq!(
+        row(pool, sandbox_id).await?,
+        Row::new("suspended", Some("started"), None)
+    );
+
+    // Only a named snapshot's backup, ready since the placement: no restore
+    // loads it and no pin accepts it, so the row is failed like one with no
+    // backup. The backup stays.
+    let sandbox_id = SandboxId::new();
+    insert_sandbox(pool, sandbox_id, &SandboxSeed::new("suspended", "k8s")).await?;
+    set_target_node(pool, sandbox_id, node_id).await?;
+    insert_snapshot(pool, sandbox_id, "ready", 0).await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots
+            SET local_artifact_id = $2,
+                artifact_kind = 'full',
+                artifact_origin = 'snapshot',
+                artifact_snapshot_name = 'named'
+          WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(uuid::Uuid::now_v7())
+    .execute(pool)
+    .await?;
+    assert_eq!(sink.mark_sandbox_lost(sandbox_id, node_id).await?, 1);
+    assert_eq!(row(pool, sandbox_id).await?, Row::new("failed", None, None));
+    let backups: i64 = sqlx::query_scalar(sql!(
+        "SELECT count(*)
+           FROM snapshots sn
+           JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
+          WHERE sn.sandbox_id = $1 AND sn.state = 'ready' AND ssl.orphaned_at IS NULL"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(backups, 1);
     Ok(())
 }
 

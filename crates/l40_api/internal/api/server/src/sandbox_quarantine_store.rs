@@ -41,6 +41,7 @@ pub(super) struct SuspendedProjectionCandidate {
     pub(super) clear_marker: bool,
     pub(super) published_artifact: Option<PublishedSuspendArtifact>,
     pub(super) published_execution_identity: Option<PublishedExecutionIdentity>,
+    pub(super) captured_artifact: Option<LocalArtifactId>,
     pub(super) recovery: Option<QuarantineRecoveryCandidate>,
 }
 
@@ -562,6 +563,7 @@ pub(super) async fn select_suspended_projection_candidates(
                 published_execution_generation,
                 published_pod_uid,
                 published_pod_uid_was_missing,
+                captured_artifact_id,
             )| {
                 let published_artifact = match (
                     published_artifact_id,
@@ -642,6 +644,7 @@ pub(super) async fn select_suspended_projection_candidates(
                     clear_marker,
                     published_artifact,
                     published_execution_identity,
+                    captured_artifact: captured_artifact_id.map(LocalArtifactId::from_uuid),
                     recovery,
                 })
             },

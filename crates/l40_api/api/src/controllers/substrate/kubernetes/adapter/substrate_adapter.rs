@@ -2646,9 +2646,13 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         // Polling the RPC is the point of no return: any
                         // transport error after this may hide a manager-side
                         // lifecycle transition or delayed completion receipt.
+                        let earlier_send_may_have_landed = wake_may_have_landed;
                         wake_may_have_landed = true;
-                        let response = internal_client
-                            .wake_sandbox(wake_request.clone(), remaining.min(NODE_RPC_TIMEOUT))
+                        let (response, sends) = internal_client
+                            .wake_sandbox_counting_sends(
+                                wake_request.clone(),
+                                remaining.min(NODE_RPC_TIMEOUT),
+                            )
                             .instrument(tracing::info_span!(
                                 "substrate.k8s.pool.wake_sandbox.client",
                                 sandbox_id = %sandbox_id,
@@ -2690,6 +2694,21 @@ impl SubstrateAdapter for KubernetesSubstrate {
                                         .note_sealed_refusal(sandbox_id, error.message())
                                         .await;
                                     return Err(ControllerError::from(error));
+                                }
+                                WakeRpcErrorDisposition::RestoreSourceUnordered => {
+                                    // The node refused this send before
+                                    // staging anything, so only an earlier
+                                    // send can have left work behind: one
+                                    // from an earlier pass of this loop, or
+                                    // one the client replayed within this
+                                    // call after a transport failure.
+                                    wake_may_have_landed =
+                                        earlier_send_may_have_landed || sends > 1;
+                                    return Err(ControllerError::from(
+                                        SubstrateError::RestoreContextUnavailable {
+                                            message: error.message().to_owned(),
+                                        },
+                                    ));
                                 }
                                 WakeRpcErrorDisposition::Fail => {
                                     return Err(ControllerError::conflict(format!(

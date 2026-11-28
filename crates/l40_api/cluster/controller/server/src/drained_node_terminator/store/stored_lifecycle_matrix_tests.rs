@@ -17,7 +17,9 @@ use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
 use super::*;
-use crate::lifecycle_writer_test_support::{SandboxSeed, insert_node, insert_sandbox};
+use crate::lifecycle_writer_test_support::{
+    SandboxSeed, insert_node, insert_sandbox, insert_snapshot,
+};
 
 /// The kube uid every node here registers and the mark-lost binds.
 const NODE_UID: &str = "uid-synthetic";
@@ -104,5 +106,130 @@ async fn drained_node_mark_lost_fails_only_suspended_rows() -> TestResult {
         }
     }
     assert!(mismatches.is_empty(), "{mismatches:#?}");
+    Ok(())
+}
+
+/// An unordered history's pinnable copy keeps its row: its restore refuses
+/// until a capture is pinned, but failing it would end its last restore path.
+/// That holds for an evacuation-marked row too, whose newest row, a capture
+/// without a generation that never uploaded, isn't ready.
+#[rstest::rstest]
+#[tokio::test(flavor = "current_thread")]
+async fn drained_node_mark_lost_keeps_an_unordered_history_with_durable_copies(
+    #[values(false, true)] evacuation_marked: bool,
+) -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let store = NodeDbStore::new(pool.clone(), ResidencyEvidence::default());
+    let node_id = insert_drained_node(pool).await?;
+    let sandbox_id = SandboxId::new();
+    insert_sandbox(
+        pool,
+        sandbox_id,
+        &SandboxSeed::new("suspended", "k8s").on_node(node_id),
+    )
+    .await?;
+    insert_snapshot(pool, sandbox_id, "ready", -20).await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots
+            SET generation = 5, local_artifact_id = space_uuid_v7(), artifact_kind = 'full',
+                artifact_origin = 'suspend'
+          WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    insert_snapshot(
+        pool,
+        sandbox_id,
+        if evacuation_marked { "failed" } else { "ready" },
+        0,
+    )
+    .await?;
+    if evacuation_marked {
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET evacuation_restore_target = 'started' WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(pool)
+        .await?;
+    }
+
+    let flipped = store
+        .mark_unrecoverable_sandboxes_lost(node_id, Some(NODE_UID.to_owned()))
+        .await?;
+    assert!(!flipped.contains(&sandbox_id));
+    assert_eq!(lifecycle_of(pool, sandbox_id).await?, "suspended");
+    Ok(())
+}
+
+/// A named snapshot's backup isn't a copy the sandbox restores from, and no
+/// pin accepts it. A row whose suspend capture died with the node and that
+/// has nothing else blocks the reap, so the give-up fails it like a row with
+/// no backup and the reap can finish. The backup stays. Beside a suspend
+/// capture's backup the named snapshot changes nothing: the row is durable
+/// and never blocked.
+#[rstest::rstest]
+#[tokio::test(flavor = "current_thread")]
+async fn drained_node_mark_lost_fails_a_row_with_only_a_named_backup(
+    #[values(false, true)] suspend_capture_uploaded: bool,
+) -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let store = NodeDbStore::new(pool.clone(), ResidencyEvidence::default());
+    let node_id = insert_drained_node(pool).await?;
+    let sandbox_id = SandboxId::new();
+    insert_sandbox(
+        pool,
+        sandbox_id,
+        &SandboxSeed::new("suspended", "k8s").on_node(node_id),
+    )
+    .await?;
+    insert_snapshot(pool, sandbox_id, "ready", 0).await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots
+            SET local_artifact_id = $2,
+                artifact_kind = 'full',
+                artifact_origin = 'snapshot',
+                artifact_snapshot_name = 'named'
+          WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(uuid::Uuid::now_v7())
+    .execute(pool)
+    .await?;
+    if suspend_capture_uploaded {
+        insert_snapshot(pool, sandbox_id, "ready", 0).await?;
+    }
+    let blocked = i64::from(!suspend_capture_uploaded);
+    assert_eq!(store.count_local_snapshots(node_id).await?, blocked);
+
+    let flipped = store
+        .mark_unrecoverable_sandboxes_lost(node_id, Some(NODE_UID.to_owned()))
+        .await?;
+
+    assert_eq!(flipped.contains(&sandbox_id), !suspend_capture_uploaded);
+    assert_eq!(
+        lifecycle_of(pool, sandbox_id).await?,
+        if suspend_capture_uploaded {
+            "suspended"
+        } else {
+            "failed"
+        }
+    );
+    assert_eq!(store.count_local_snapshots(node_id).await?, 0);
+    let named_backups: i64 = sqlx::query_scalar(sql!(
+        "SELECT count(*)
+           FROM snapshots sn
+           JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
+          WHERE sn.sandbox_id = $1
+            AND sn.artifact_origin = 'snapshot'
+            AND sn.state = 'ready'
+            AND ssl.orphaned_at IS NULL"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(named_backups, 1);
     Ok(())
 }

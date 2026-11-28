@@ -768,6 +768,12 @@ Service database pools always emit SQLx `sqlx::query` events at `INFO`, which
 become DB spans under traced requests. To turn them off, add a
 `sqlx::query=off` directive to `RUST_LOG` or `SPACE_TRACE_FILTER`.
 
+Service database pools set `jit = off` on every connection. The restore and
+retention predicates are many small correlated subqueries whose estimated
+cost crosses `jit_above_cost`, and compiling them takes longer than running
+them. Connections that don't go through a service pool, such as `psql`, keep
+the server's setting.
+
 ## Execution eligibility
 
 | Variable | Default | Notes |

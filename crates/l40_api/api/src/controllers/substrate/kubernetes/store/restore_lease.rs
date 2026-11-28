@@ -226,12 +226,17 @@ impl K8sStore {
 
         // Under the row lock no other claim can replace the execution, so the
         // claimed execution the evidence names is the one this claim created
-        // (see `restore_revert_evidence`).
+        // (see `restore_revert_evidence`). When reverting to `suspended` would
+        // forfeit the pre-claim source window to a post-claim snapshot, keep
+        // `lifecycle = 'restoring'` with the lease cleared and evaluate
+        // execution retirement against the `restoring` retry proof instead.
         let pplx_space_sandbox_store::restore_lease::RestoreRevertEvidence {
             claimed_generation,
             claimed_pod_name: claimed_pod,
             any_active_execution: any_active,
             source_proven,
+            forfeits_window,
+            retry_source_proven,
         } = pplx_space_sandbox_store::restore_lease::restore_revert_evidence(
             &mut *tx,
             sandbox_id,
@@ -241,7 +246,8 @@ impl K8sStore {
         .await
         .db_context("failed to read restore revert evidence")?;
 
-        let retire = source_proven && retirement.is_enabled();
+        let retire =
+            (source_proven || (forfeits_window && retry_source_proven)) && retirement.is_enabled();
         let outcome = match (claimed_generation.zip(claimed_pod), retire) {
             (Some((generation, pod_name)), true) => {
                 if !self
@@ -268,9 +274,13 @@ impl K8sStore {
                 // pre-restore source, and both the suspended selector and
                 // `durably_restorable` take a markerless snapshot only when
                 // it is newer than the last placement.
-                restore_lease::revert_restore_claim_retiring_placement(&mut *tx, sandbox_id)
-                    .await
-                    .db_context("failed to revert sandbox lifecycle to suspended")?;
+                restore_lease::revert_restore_claim_retiring_placement(
+                    &mut *tx,
+                    sandbox_id,
+                    forfeits_window,
+                )
+                .await
+                .db_context("failed to revert sandbox lifecycle to suspended")?;
                 RestoreClaimRevert::ExecutionRetired { pod_name }
             }
             (None, true) if !any_active => {
@@ -278,15 +288,23 @@ impl K8sStore {
                 // clear as above. An execution the claim reused rather than
                 // created keeps the clock, since nothing proves its pod
                 // holds no state of its own.
-                restore_lease::revert_restore_claim_clearing_placement_clock(&mut *tx, sandbox_id)
-                    .await
-                    .db_context("failed to revert sandbox lifecycle to suspended")?;
+                restore_lease::revert_restore_claim_clearing_placement_clock(
+                    &mut *tx,
+                    sandbox_id,
+                    forfeits_window,
+                )
+                .await
+                .db_context("failed to revert sandbox lifecycle to suspended")?;
                 RestoreClaimRevert::LifecycleOnly
             }
             (claimed, _) => {
-                restore_lease::revert_restore_claim_lifecycle(&mut *tx, sandbox_id)
-                    .await
-                    .db_context("failed to revert sandbox lifecycle to suspended")?;
+                restore_lease::revert_restore_claim_lifecycle(
+                    &mut *tx,
+                    sandbox_id,
+                    forfeits_window,
+                )
+                .await
+                .db_context("failed to revert sandbox lifecycle to suspended")?;
                 if claimed.is_some() || any_active {
                     RestoreClaimRevert::ExecutionLeftActive
                 } else {
@@ -379,7 +397,7 @@ impl K8sStore {
             )
             .await
         }
-        .db_context("failed to begin sandbox restore")?;
+        .map_err(|error| restore_claim_error("failed to begin sandbox restore", error))?;
         // An owner that died before sending its Wake leaves the guards above
         // closed for their whole window; its expired dispatch fence lets the
         // user claim take the restore over.
