@@ -734,9 +734,6 @@ fn quarantine_recovery_candidate_scan_propagates_statement_failures() {
     let database_path = directory.path().join("sandbox-manager.db");
     create_test_schema_on_disk(&database_path);
     let conn = Connection::open_at(&database_path).unwrap();
-    // The contention is about locks, not durability, so no commit needs an
-    // fsync.
-    conn.pragma_update(None, "synchronous", "OFF").unwrap();
     setup_quarantine_recovery_episode(
         &conn,
         SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
@@ -6857,9 +6854,6 @@ fn legacy_equal_route_and_operation_receipt_survives_restart_without_split_field
     let path = dir.path().join("manager.sqlite");
     create_test_schema_on_disk(&path);
     let conn = Connection::open_at(&path).unwrap();
-    // The test models a process restart, not a host crash, so no commit
-    // needs an fsync.
-    conn.pragma_update(None, "synchronous", "OFF").unwrap();
     let sandbox_id = SandboxId::new().to_string();
     insert_test_sandbox(
         &conn,
@@ -6882,7 +6876,6 @@ fn legacy_equal_route_and_operation_receipt_survives_restart_without_split_field
 
     drop(conn);
     let conn = Connection::open_at(&path).unwrap();
-    conn.pragma_update(None, "synchronous", "OFF").unwrap();
     assert!(mark_start_succeeded(&conn, &sandbox_id, Some(episode.id)).unwrap());
     let metadata = sandbox_state_publication_metadata(&conn, std::slice::from_ref(&sandbox_id))
         .unwrap()

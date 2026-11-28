@@ -727,10 +727,16 @@ fn is_row_decode_error(error: &rusqlite::Error) -> bool {
     )
 }
 
+/// An in-memory database with every up migration replayed onto it, from
+/// which [`test_schema_image`] is taken.
+///
+/// It opens its own in-memory connection rather than taking one, so the
+/// replay's per-statement commits never journal or sync a file.
 #[cfg(any(test, feature = "test-support"))]
 #[allow(clippy::unwrap_used)]
-pub fn create_test_schema(conn: &mut Connection) {
+fn migrated_in_memory() -> Connection {
     use pplx_space_sbx_mgr_migrations::{COMMON_SCHEMA_MIGRATOR, SANDBOX_MANAGER_MIGRATOR};
+    let conn = Connection::from_raw(rusqlite::Connection::open_in_memory().unwrap());
     for migration in COMMON_SCHEMA_MIGRATOR
         .iter()
         .chain(SANDBOX_MANAGER_MIGRATOR.iter())
@@ -738,6 +744,7 @@ pub fn create_test_schema(conn: &mut Connection) {
     {
         conn.execute_batch(migration.sql.as_ref()).unwrap();
     }
+    conn
 }
 
 /// Byte image of a freshly migrated database, built once per nextest run of
@@ -764,8 +771,7 @@ fn test_schema_image() -> &'static [u8] {
         if let Some(image) = cache.as_ref().and_then(|cache| cache.read()) {
             return image;
         }
-        let mut conn = Connection::from_raw(rusqlite::Connection::open_in_memory().unwrap());
-        create_test_schema(&mut conn);
+        let mut conn = migrated_in_memory();
         let image = conn.serialize_main_database().unwrap();
         if let Some(cache) = &cache {
             cache.write(&image);
@@ -777,8 +783,9 @@ fn test_schema_image() -> &'static [u8] {
 /// Create a file-backed database carrying the migrated schema at `db_path`.
 ///
 /// For tests that need durability across a close and reopen: the file left
-/// behind is the one `create_test_schema` would have produced on that path, so
-/// the connections the test then opens are ordinary file connections.
+/// behind carries the schema that replaying the migrations on that path would
+/// have produced, so the connections the test then opens are ordinary file
+/// connections.
 #[cfg(any(test, feature = "test-support"))]
 #[allow(clippy::unwrap_used)]
 pub fn create_test_schema_on_disk(db_path: &std::path::Path) {

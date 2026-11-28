@@ -373,12 +373,14 @@ async fn pool_clone_restart_preserves_disposal_ownership() {
     }
     let persisted = tempfile::tempdir().unwrap();
     let database = persisted.path().join("sandbox.sqlite");
-    service
-        .db
-        .lock()
-        .unwrap()
-        .execute("VACUUM INTO ?1", [database.to_str().unwrap()])
-        .unwrap();
+    {
+        let db = service.db.lock().unwrap();
+        // `VACUUM INTO` syncs the file it writes at the source's level. The
+        // restart below is a process restart, not a host crash.
+        db.pragma_update(None, "synchronous", "OFF").unwrap();
+        db.execute("VACUUM INTO ?1", [database.to_str().unwrap()])
+            .unwrap();
+    }
     drop(service);
     let service =
         SandboxManagerService::for_test(crate::db::Connection::open_at(database).unwrap());

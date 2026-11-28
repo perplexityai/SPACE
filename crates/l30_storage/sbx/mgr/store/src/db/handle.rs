@@ -152,11 +152,24 @@ impl Connection {
         Self(rusqlite::Connection::open_in_memory().expect("open an in-memory SQLite database"))
     }
 
-    /// A plain connection to the database file at `path`, without the
-    /// production open's settings.
+    /// A connection to the database file at `path`, without the production
+    /// open's settings, and with `synchronous=OFF`.
+    ///
+    /// A commit still reaches the operating system before it returns, so
+    /// every connection in the host, including one opened after this one
+    /// closes, reads it: a test modelling a process restart, a lock race or a
+    /// second reader observes what it would with fsyncs. Only a host crash
+    /// could lose it. Without this, each commit waits on one or more fsyncs,
+    /// which a busy disk can stretch to seconds. A test about crash
+    /// durability sets `synchronous` back itself. Setting the pragma reads the
+    /// schema, so the open itself reads the file: it fails on a non-empty file
+    /// that is not a SQLite database and, in rollback-journal mode, waits up to
+    /// the busy timeout behind a connection holding a pending or exclusive lock.
     #[cfg(any(test, feature = "test-support"))]
     pub fn open_at(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Ok(Self(rusqlite::Connection::open(path)?))
+        let conn = rusqlite::Connection::open(path)?;
+        conn.pragma_update(None, "synchronous", "OFF")?;
+        Ok(Self(conn))
     }
 
     #[cfg(any(test, feature = "test-support"))]
