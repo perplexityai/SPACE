@@ -293,10 +293,11 @@ async fn a_row_that_moved_on_from_the_reported_artifact_is_recorded() -> TestRes
 
 /// A node-initiated suspend projects the row `suspended` on the node without
 /// pinning its artifact. That evacuation is recorded once the catalog holds
-/// the reported artifact ready and stored and the row has a ready full
-/// snapshot since its placement changed, which a markerless restore takes;
-/// without either it waits, and says which is missing. So is one the fence
-/// already unplaced.
+/// the reported artifact ready and stored and the terminate's source-release
+/// test holds for the row (for an unmarked row, a ready full snapshot since
+/// its placement changed, which a markerless restore takes); without either
+/// it waits, and says which is missing. So is one the fence already
+/// unplaced.
 #[tokio::test(flavor = "current_thread")]
 async fn a_markerless_suspended_row_is_recorded_once_its_artifact_and_a_fresh_snapshot_are_ready()
 -> TestResult {
@@ -345,7 +346,37 @@ async fn a_markerless_suspended_row_is_recorded_once_its_artifact_and_a_fresh_sn
     let EvacuationRecord::NotYet(reason) = record(stale).await? else {
         panic!("the ready artifact predates the placement");
     };
-    assert!(reason.contains("since its placement changed"), "{reason}");
+    assert!(reason.contains("durable enough to release"), "{reason}");
+
+    // A row marked for an evacuation restore waits for its newest full
+    // snapshot, which that restore takes, though the reported one is ready
+    // and newer than its placement.
+    let marked = sandbox(pool, "suspended", Some(node)).await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET evacuation_restore_target = 'started',
+                placement_changed_at = NOW() - INTERVAL '1 hour'
+          WHERE id = $1"
+    ))
+    .bind(marked)
+    .execute(pool)
+    .await?;
+    let reported = catalog(pool, marked, artifact, "full", "ready").await?;
+    let newer = catalog(pool, marked, Uuid::now_v7(), "full", "creating").await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots
+            SET timestamp = NOW() - CASE WHEN id = $1 THEN INTERVAL '10 minutes'
+                                         ELSE INTERVAL '1 minute' END
+          WHERE id IN ($1, $2)"
+    ))
+    .bind(reported)
+    .bind(newer)
+    .execute(pool)
+    .await?;
+    let EvacuationRecord::NotYet(reason) = record(marked).await? else {
+        panic!("the newest full snapshot is uploading");
+    };
+    assert!(reason.contains("durable enough to release"), "{reason}");
 
     // A row the fence already unplaced, homed nowhere, is read the same way:
     // it waits for the reported artifact, then is recorded.
@@ -417,7 +448,9 @@ async fn a_stopped_disk_evacuation_is_never_recorded() -> TestResult {
     // A stopped row reported with a full snapshot stays on the node.
     assert_eq!(
         record_v2_evacuated(pool, node, &entry(ArtifactKind::Full)).await?,
-        EvacuationRecord::NotYet(STOPPED_NOT_RECORDED.to_owned())
+        EvacuationRecord::NotYet(
+            pplx_space_sandbox_store::drain_terminate::evacuation_verdict::STOPPED_HELD.to_owned()
+        )
     );
     let elsewhere = v2_node(
         pool,
@@ -456,8 +489,10 @@ async fn a_stopped_disk_evacuation_is_never_recorded() -> TestResult {
 
 /// An evacuation waits while the catalog doesn't hold its artifact ready, or
 /// while the node's suspend isn't projected onto a row still on the node, or
-/// while a running row has no execution elsewhere; a sandbox a user woke on
-/// another node, or deleted, has moved on.
+/// while a running row has no execution bound to another node (one bound to
+/// no node yet runs nowhere known), or while a row in a transient lifecycle
+/// is homed on no other node; a sandbox a user woke on another node, or
+/// deleted, has moved on.
 #[tokio::test(flavor = "current_thread")]
 async fn an_evacuation_waits_for_its_catalog_and_projection_and_skips_what_moved_on() -> TestResult
 {
@@ -471,6 +506,7 @@ async fn an_evacuation_waits_for_its_catalog_and_projection_and_skips_what_moved
         serde_json::json!({"generation": 5, "deadline_at": 0}),
     )
     .await?;
+    identity(pool, node, Some(INSTANCE)).await?;
     let elsewhere = NodeId::new();
     let artifact = Uuid::now_v7();
 
@@ -492,6 +528,19 @@ async fn an_evacuation_waits_for_its_catalog_and_projection_and_skips_what_moved
     .await?;
     let stale = sandbox(pool, "started", Some(elsewhere)).await?;
     catalog(pool, stale, artifact, "full", "ready").await?;
+    let unbound = sandbox(pool, "started", None).await?;
+    catalog(pool, unbound, artifact, "full", "ready").await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions
+             (sandbox_id, generation, pod_name, pod_namespace, state, k8s_node_name)
+         VALUES ($1, 1, $2, 'space', 'creating', NULL)"
+    ))
+    .bind(unbound)
+    .bind(format!("pod-{unbound}"))
+    .execute(pool)
+    .await?;
+    let restoring = sandbox(pool, "restoring", None).await?;
+    catalog(pool, restoring, artifact, "full", "ready").await?;
     let control = sandbox(pool, "suspended", None).await?;
     pin_full(pool, control, artifact).await?;
     catalog(pool, control, artifact, "full", "ready").await?;
@@ -500,6 +549,12 @@ async fn an_evacuation_waits_for_its_catalog_and_projection_and_skips_what_moved
         ("unprojected", unprojected, "not yet"),
         ("woken elsewhere", woken, "recorded"),
         ("placed elsewhere, running nowhere", stale, "not yet"),
+        (
+            "running on an execution bound to no node",
+            unbound,
+            "not yet",
+        ),
+        ("restoring, placed nowhere", restoring, "not yet"),
         ("deleted", SandboxId::new(), "recorded"),
         ("control", control, "recorded"),
     ] {
@@ -719,14 +774,17 @@ async fn listed(pool: &PgPool, node_id: NodeId) -> TestResult<V2Node> {
         .ok_or("listed")?)
 }
 
-/// The drained tick adds every durably suspended row still homed on its
-/// generation's `drained` node to the drain's `evacuated_total`, writing no
+/// The drained tick adds every row still naming its generation's `drained`
+/// node that the terminate would release (suspended, durable, no restore or
+/// activation in flight) to the drain's `evacuated_total`, writing no
 /// sandbox row, the first one the node evicted before any report named it
 /// evacuated. One a report already recorded isn't counted twice, and ids
 /// already in the set stay, sorted. A v2 drain never moves a stopped
 /// sandbox, so a stopped row isn't counted, even with its disk durable since
-/// its stop; nor is a suspended row that isn't durable. A node of another generation
-/// or phase counts nothing.
+/// its stop; nor is a suspended row that isn't durable. The count takes no
+/// row lock, so its write re-checks the row: a node of another generation,
+/// or one that left `drained` (`:terminate` moved it on, or it was
+/// undrained), has nothing written.
 #[tokio::test(flavor = "current_thread")]
 async fn the_drained_tick_counts_each_durable_suspended_row_once_and_writes_no_sandbox_row()
 -> TestResult {
@@ -802,15 +860,16 @@ async fn the_drained_tick_counts_each_durable_suspended_row_once_and_writes_no_s
 
     count_v2_drained_evacuations(pool, node_id, 7).await?;
     assert_eq!(total().await?, expected, "counted again, added nothing");
-    for (generation, phase) in [(8, "drained"), (7, "terminating")] {
-        let other = v2_node(pool, Some(phase), done(7, serde_json::json!({}))).await?;
+    for (generation, phase) in [(8, Some("drained")), (7, Some("terminating")), (7, None)] {
+        let other = v2_node(pool, phase, done(7, serde_json::json!({}))).await?;
         let row = sandbox(pool, "suspended", Some(other)).await?;
         durable(pool, row).await?;
-        assert!(
-            count_v2_drained_evacuations(pool, other, generation)
-                .await?
-                .is_empty(),
-            "{phase} under {generation}"
+        let before = columns(pool, other).await?;
+        count_v2_drained_evacuations(pool, other, generation).await?;
+        assert_eq!(
+            columns(pool, other).await?,
+            before,
+            "{phase:?} under {generation}: nothing written"
         );
     }
     Ok(())
@@ -819,8 +878,10 @@ async fn the_drained_tick_counts_each_durable_suspended_row_once_and_writes_no_s
 /// The terminate transaction fences only its generation's unfenced
 /// `terminating` node with a recorded instance, after its reference
 /// cleanup: the durably suspended rows naming it released, their executions
-/// retired. A row or execution that still names it holds the fence,
-/// recorded in `drain_last_error`, while the cleanup it ran commits.
+/// retired, and counted in `evacuated_total`, though no drained tick ran
+/// before the terminate. A row or execution that still names it holds the
+/// fence, recorded in `drain_last_error`, while the cleanup it ran commits,
+/// its count included.
 #[tokio::test(flavor = "current_thread")]
 async fn the_terminate_transaction_fences_only_an_empty_node() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -924,6 +985,8 @@ async fn the_terminate_transaction_fences_only_an_empty_node() -> TestResult {
             .fetch_one(pool)
             .await?;
             assert_eq!((active, target), (None, None), "{case}: released");
+            let status = StoredV2Status::from_column(stored.as_ref())?.ok_or("status")?;
+            assert_eq!(status.evacuated_total, [id.to_string()], "{case}: counted");
         }
     }
     Ok(())

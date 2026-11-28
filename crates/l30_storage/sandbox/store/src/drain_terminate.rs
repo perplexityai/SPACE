@@ -18,7 +18,12 @@
 //! never evacuates, are among them. A released suspended row keeps its
 //! lifecycle, is placed nowhere, and its next wake restores it on any node.
 //! A v2 drain never moves a stopped sandbox: nothing here writes a stopped
-//! row, and one that still names the node holds it.
+//! row, and one that still names the node holds it. The drained tick counts
+//! as evacuated exactly the rows the release would take
+//! ([`releasable_suspended_rows_naming`]).
+//!
+//! Earlier, while the node drains, [`evacuation_verdict`] answers whether a
+//! sandbox the node reported evacuated still needs it.
 
 use std::sync::LazyLock;
 
@@ -28,6 +33,8 @@ use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::snapshot_durable_for_source_release;
 use pplx_space_sql_locator::sql;
 use uuid::Uuid;
+
+pub mod evacuation_verdict;
 
 /// What still names a node, as [`node_references`] reads it: each list holds
 /// up to the read's limit of sandbox ids, by id.
@@ -185,18 +192,35 @@ fn activation_in_flight() -> &'static str {
      )"
 }
 
-/// Release from `node_id` (Kubernetes name `k8s_node_name`) every
-/// `suspended` row that names it, active or target, whose state a durable
-/// snapshot holds ([`snapshot_durable_for_source_release`], the v1 drain's
-/// source-release test), whose restore isn't in flight (no active
-/// execution younger than `execution_ownership_ttl_secs`) and whose
-/// activation isn't either (no active execution whose activation attempt is
-/// unexpired). Each row is taken under its row lock, the lock a restore
-/// claim takes, and re-checked after it; then its node references and
-/// placement are cleared and its execution on the node retired. Writes an
-/// **operation step** (the release), in the caller's transaction. Returns
-/// the released ids, by id. A row it skips keeps naming the node, so the
-/// terminate's reference check
+/// Boolean SQL fragment over the row aliased `s`: the terminate's release
+/// would take it, wherever it is placed. It is `suspended`, a durable
+/// snapshot holds its state ([`snapshot_durable_for_source_release`], the v1
+/// drain's source-release test), its restore isn't in flight (no active
+/// execution younger than `ttl_param` seconds) and its activation isn't
+/// either (no active execution whose activation attempt is unexpired). The
+/// release's candidate read, its guarded update and the drained tick's count
+/// all ask it, so the count never counts a row the release skips.
+fn releasable_suspended(ttl_param: &str) -> String {
+    let durable = snapshot_durable_for_source_release("s");
+    let in_flight = restore_in_flight(ttl_param);
+    let activating = activation_in_flight();
+    format!(
+        "(s.lifecycle = 'suspended'
+          AND {durable}
+          AND NOT {in_flight}
+          AND NOT {activating})"
+    )
+}
+
+/// Release from `node_id` (Kubernetes name `k8s_node_name`) every row that
+/// names it, active or target, that is releasable ([`releasable_suspended`]
+/// under `execution_ownership_ttl_secs`): `suspended`, durable, with no
+/// restore or activation in flight. Each row is taken under its row lock,
+/// the lock a restore claim takes, and re-checked after it; then its node
+/// references and placement are cleared and its execution on the node
+/// retired. Writes an **operation step** (the release), in the caller's
+/// transaction. Returns the released ids, by id. A row it skips keeps naming
+/// the node, so the terminate's reference check
 /// ([`node_unreferenced`](pplx_space_sandbox_residency::node_unreferenced))
 /// refuses the node. The caller must pass its open transaction.
 ///
@@ -215,33 +239,11 @@ pub async fn release_durable_suspended<C>(
 where
     for<'a> &'a mut C: Executor<'a>,
 {
-    /// `$1` = node id, `$2` = ownership TTL in seconds.
-    static CANDIDATES: LazyLock<String> = LazyLock::new(|| {
-        let durable = snapshot_durable_for_source_release("s");
-        let in_flight = restore_in_flight("$2");
-        let activating = activation_in_flight();
-        sql!(format!(
-            "SELECT s.id
-               FROM sandboxes s
-              WHERE s.id IN (
-                      SELECT id FROM sandboxes WHERE active_node_id = $1
-                      UNION
-                      SELECT id FROM sandboxes WHERE target_node_id = $1
-                    )
-                AND s.lifecycle = 'suspended'
-                AND {durable}
-                AND NOT {in_flight}
-                AND NOT {activating}
-              ORDER BY s.id"
-        ))
-    });
     /// `$1` = sandbox id, `$2` = node id, `$3` = ownership TTL in seconds.
     /// Run under the row's lock, in a statement after the one that took it,
     /// so it reads what committed before the lock was granted.
     static RELEASE: LazyLock<String> = LazyLock::new(|| {
-        let durable = snapshot_durable_for_source_release("s");
-        let in_flight = restore_in_flight("$3");
-        let activating = activation_in_flight();
+        let releasable = releasable_suspended("$3");
         sql!(format!(
             "UPDATE sandboxes s
                 SET active_node_id = NULL,
@@ -250,18 +252,12 @@ where
                     command_ready_pending = FALSE,
                     placement_changed_at = NULL
               WHERE s.id = $1
-                AND s.lifecycle = 'suspended'
                 AND (s.active_node_id = $2 OR s.target_node_id = $2)
-                AND {durable}
-                AND NOT {in_flight}
-                AND NOT {activating}"
+                AND {releasable}"
         ))
     });
-    let candidates: Vec<SandboxId> = sqlx::query_scalar(sqlx::AssertSqlSafe(CANDIDATES.as_str()))
-        .bind(node_id)
-        .bind(execution_ownership_ttl_secs)
-        .fetch_all((&mut *tx).into_sqlx())
-        .await?;
+    let candidates =
+        releasable_suspended_rows_naming(&mut *tx, node_id, execution_ownership_ttl_secs).await?;
     let mut released = Vec::new();
     for sandbox_id in candidates {
         sqlx::query(sql!("SELECT 1 FROM sandboxes WHERE id = $1 FOR UPDATE"))
@@ -297,18 +293,20 @@ where
 }
 
 /// The rows the drained tick of a v2 drain counts evacuated from
-/// `node_id`, by id: the `suspended` rows naming it, active or target, whose
-/// state a durable snapshot holds
-/// ([`snapshot_durable_for_source_release`]). A v2 drain never moves a
+/// `node_id`, by id: the rows naming it, active or target, that the
+/// terminate's release would take ([`releasable_suspended`] under
+/// `execution_ownership_ttl_secs`), which are also the release's
+/// candidates ([`release_durable_suspended`]). A v2 drain never moves a
 /// stopped sandbox, so no stopped row is counted. A read: it takes no lock
 /// and writes nothing.
-pub async fn durable_suspended_rows_naming(
+pub async fn releasable_suspended_rows_naming(
     executor: impl Executor<'_>,
     node_id: NodeId,
+    execution_ownership_ttl_secs: i64,
 ) -> Result<Vec<SandboxId>, DbError> {
-    /// `$1` = node id.
-    static DURABLE: LazyLock<String> = LazyLock::new(|| {
-        let suspended = snapshot_durable_for_source_release("s");
+    /// `$1` = node id, `$2` = ownership TTL in seconds.
+    static RELEASABLE: LazyLock<String> = LazyLock::new(|| {
+        let releasable = releasable_suspended("$2");
         sql!(format!(
             "SELECT s.id
                FROM sandboxes s
@@ -317,13 +315,13 @@ pub async fn durable_suspended_rows_naming(
                       UNION
                       SELECT id FROM sandboxes WHERE target_node_id = $1
                     )
-                AND s.lifecycle = 'suspended'
-                AND {suspended}
+                AND {releasable}
               ORDER BY s.id"
         ))
     });
-    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(DURABLE.as_str()))
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(RELEASABLE.as_str()))
         .bind(node_id)
+        .bind(execution_ownership_ttl_secs)
         .fetch_all(executor.into_sqlx())
         .await?)
 }

@@ -767,7 +767,8 @@ pub async fn record_v2_report(
     )
 }
 
-/// `$1` = node id, `$2` = generation, `$3` = the sandboxes evacuated.
+/// `$1` = node id, `$2` = generation, `$3` = the sandboxes evacuated,
+/// `$4` = the drain phase.
 static ADD_V2_EVACUATED_STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     let evacuated_total = id_set_union("evacuated_total", "$3");
     sql!(format!(
@@ -776,6 +777,7 @@ static ADD_V2_EVACUATED_STATEMENT: std::sync::LazyLock<String> = std::sync::Lazy
                     || jsonb_build_object('evacuated_total', {evacuated_total})
           WHERE id = $1
             AND drain_engine = 'v2'
+            AND drain_phase = $4
             AND {GENERATION} = $2
             AND EXISTS (
                 SELECT 1 FROM UNNEST($3::TEXT[]) AS added(id)
@@ -784,17 +786,21 @@ static ADD_V2_EVACUATED_STATEMENT: std::sync::LazyLock<String> = std::sync::Lazy
     ))
 });
 
-/// Add `evacuated`, the sandboxes the drain under `generation` finds
-/// durable and still homed on its `drained` node, to
-/// `drain_status.evacuated_total`, which only grows. A sandbox the node
-/// evicted before a report named it evacuated is counted this way. The row
-/// is written only when one of them isn't in the set yet. Run it under the
-/// node's row lock. Returns whether it wrote: false when every one was
-/// counted already, or the row is no longer that generation's v2 drain.
+/// Add `evacuated`, sandboxes the drain under `generation` no longer needs
+/// its node for, to `drain_status.evacuated_total`, which only grows, while
+/// the row is still that generation's v2 drain in `phase`: the drained
+/// tick's count of the rows the terminate would release, which needs no row
+/// lock because this statement re-checks the phase, and the terminate's own
+/// released rows. A sandbox the node evicted before a report named it
+/// evacuated is counted this way. The row is written only when one of them
+/// isn't in the set yet. Returns whether it wrote: false when every one was
+/// counted already, or the row is no longer that generation's v2 drain in
+/// `phase`.
 pub async fn add_v2_evacuated(
     executor: impl Executor<'_>,
     node_id: NodeId,
     generation: i64,
+    phase: &str,
     evacuated: &[String],
 ) -> Result<bool, DbError> {
     Ok(
@@ -802,6 +808,7 @@ pub async fn add_v2_evacuated(
             .bind(node_id)
             .bind(generation)
             .bind(evacuated)
+            .bind(phase)
             .execute(executor.into_sqlx())
             .await?
             .rows_affected()

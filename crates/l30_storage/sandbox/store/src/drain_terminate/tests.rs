@@ -134,6 +134,11 @@ async fn execution_active(pool: &PgPool, execution_id: Uuid) -> TestResult<bool>
     .await?)
 }
 
+/// The rows the drained tick counts evacuated from `node`.
+async fn counted(pool: &PgPool, node: NodeId) -> TestResult<Vec<SandboxId>> {
+    Ok(releasable_suspended_rows_naming(pool, node, TTL_SECS).await?)
+}
+
 async fn release(pool: &PgPool, node: NodeId) -> TestResult<Vec<SandboxId>> {
     let mut tx = pool.begin().await?;
     let released = release_durable_suspended(&mut *tx, node, Some(NODE_NAME), TTL_SECS).await?;
@@ -146,7 +151,8 @@ async fn release(pool: &PgPool, node: NodeId) -> TestResult<Vec<SandboxId>> {
 /// it is unplaced from the node, keeping its lifecycle, and its execution on
 /// the node is retired. A row without a durable snapshot of its current
 /// placement, one with a restore in flight, one in another lifecycle and
-/// one on another node stay as they were. A second release changes nothing.
+/// one on another node stay as they were. The drained tick's count reads
+/// exactly the rows the release takes. A second release changes nothing.
 #[tokio::test(flavor = "current_thread")]
 async fn the_release_takes_only_durable_suspended_rows_with_no_restore_in_flight() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -178,6 +184,7 @@ async fn the_release_takes_only_durable_suspended_rows_with_no_restore_in_flight
 
     let mut expected = vec![by_target, by_active, stale_execution];
     expected.sort();
+    assert_eq!(counted(pool, node).await?, expected);
     assert_eq!(release(pool, node).await?, expected);
     for id in &expected {
         assert_eq!(
@@ -204,10 +211,11 @@ async fn the_release_takes_only_durable_suspended_rows_with_no_restore_in_flight
 }
 
 /// A suspended row with an activation in flight, an active execution whose
-/// activation attempt hasn't expired, is not released: it keeps naming the
-/// node and its execution, so the terminate's reference check refuses the
-/// node. Once the attempt expires the release takes it, and nothing names
-/// the node.
+/// activation attempt hasn't expired, is not released, nor counted
+/// evacuated by the drained tick: it keeps naming the node and its
+/// execution, so the terminate's reference check refuses the node. Once the
+/// attempt expires the count and the release take it, and nothing names the
+/// node.
 #[tokio::test(flavor = "current_thread")]
 async fn the_release_skips_a_row_with_an_activation_in_flight() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -248,6 +256,7 @@ async fn the_release_skips_a_row_with_an_activation_in_flight() -> TestResult {
     };
 
     attempt(60).await?;
+    assert!(counted(pool, node).await?.is_empty(), "counted in flight");
     assert!(release(pool, node).await?.is_empty());
     assert_eq!(
         placement(pool, id).await?,
@@ -267,6 +276,7 @@ async fn the_release_skips_a_row_with_an_activation_in_flight() -> TestResult {
     assert!(!unreferenced().await?, "the terminate refuses the node");
 
     attempt(-60).await?;
+    assert_eq!(counted(pool, node).await?, [id]);
     assert_eq!(release(pool, node).await?, [id]);
     assert_eq!(
         placement(pool, id).await?,

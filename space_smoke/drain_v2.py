@@ -12,7 +12,8 @@ wake policy, wherever the scheduler places it. The controller writes no
 sandbox row while it drains. The node's report is rebuilt from its
 sandboxes each call, and the drain is finished exactly when it lists
 nothing pending and nothing blocked; once `drained`, the controller stops
-calling the node and adds every durably suspended row still homed on it to
+calling the node and adds every row still naming it that the terminate
+would release (suspended, durable, no restore or activation in flight) to
 `evacuated_total`, which keeps every sandbox it recorded as evacuated. The
 terminate transaction releases the suspended ones.
 
@@ -1975,8 +1976,8 @@ class DrainV2Assertions:
 
     def evacuated_total(self, report: dict[str, Any]) -> set[str]:
         """Every sandbox the controller recorded as evacuated in this drain
-        (`evacuated_total`), the drained ticks' count of durable homed rows
-        included, by bare id."""
+        (`evacuated_total`), the drained ticks' count of the rows the
+        terminate would release included, by bare id."""
 
         total = report.get(VIEW_EVACUATED_TOTAL_FIELD)
         return {str(sandbox_id) for sandbox_id in total} if isinstance(total, list) else set()
@@ -2081,8 +2082,8 @@ class DrainV2Assertions:
         (sandbox ids, either form) evacuated as a suspended snapshot, the
         only artifact a v2 drain makes. A resident the node evicted before
         any report named it is counted by the controller's ticks after
-        `drained`, which add every durably suspended row still homed on the
-        node, so this reads the drain again for up to `timeout` until
+        `drained`, which add every row still naming the node that the
+        terminate would release, so this reads the drain again for up to `timeout` until
         `evacuated_total` holds every resident."""
 
         wanted = {self.bare_id(sandbox_id): EVACUATED_FULL for sandbox_id in expected}

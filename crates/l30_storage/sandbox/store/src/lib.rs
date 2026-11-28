@@ -92,6 +92,10 @@
 //!   the caller keeps the domain logic that decides which ids to ask about.
 //!   A predicate that is neither shared nor latency-bound is still better off
 //!   as a `get` plus a filter.
+//! * **A pure verdict over one composed read may sit beside the predicate
+//!   it must agree with.** [`drain_terminate::evacuation_verdict`] decides
+//!   whether a v2 drain records a reported evacuation next to the release it
+//!   answers for, and its controller caller only maps the answer.
 //! * **Aggregate reads are modules too.** [`stuck`] counts the rows in each
 //!   transient lifecycle by age for a gauge; it reads the row's own clock and
 //!   writes nothing. [`node_holds`] lists the rows the node-release gates
@@ -111,8 +115,8 @@
 //!   it answers, such as [`restore_pod_owners`],
 //!   [`stale_suspended_executions`], [`stopped_replacements`],
 //!   [`placement_gate`] or [`template_usage`]
-//!   (node drain's are [`drain_evacuation`], [`evacuation_candidates`],
-//!   [`evacuation_restores`], [`pinned_local_only`], [`pod_less_giveup`] and
+//!   (node drain's are [`evacuation_candidates`], [`evacuation_restores`],
+//!   [`pinned_local_only`], [`pod_less_giveup`] and
 //!   [`stopped_evacuations`]), and so does one
 //!   that joins the row to what it references, as [`row_reads::owner`]
 //!   (its organization) and [`debug_reads::record`] (its nodes) do.
@@ -130,9 +134,9 @@
 //!   `nodes` too, and `snapshots`, which belongs to
 //!   `pplx-space-snapshot-store`. [`pod_less_giveup`], the give-up's
 //!   guards, reads `nodes`' drain columns, and `sandbox_observed_states`,
-//!   which belongs to `pplx-space-sandbox-teardown`; [`drain_evacuation`],
-//!   a v2 drain's evacuation record, reads `node_k8s` for the node's
-//!   Kubernetes name. Both read the snapshot tables through
+//!   which belongs to `pplx-space-sandbox-teardown`;
+//!   [`drain_terminate::evacuation_verdict`], a v2 drain's evacuation
+//!   record, reads `node_k8s` for the node's Kubernetes name. Both read the snapshot tables through
 //!   `pplx-space-sandbox-portability`'s fragments.
 //!   [`org_storage`] joins the owning organization's row in `organizations`,
 //!   which no store owns yet, for its configured snapshot storage.
@@ -239,7 +243,6 @@ pub mod deleted_rows;
 pub mod direct;
 pub mod drain;
 pub mod drain_admission;
-pub mod drain_evacuation;
 pub mod drain_gate_blockers;
 pub mod drain_terminate;
 pub mod ecw_credential_epochs;
