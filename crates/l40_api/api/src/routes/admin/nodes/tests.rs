@@ -304,21 +304,6 @@ fn force_upload_local_snapshots_never_changes_drain_phase() {
     }
 }
 
-/// `:force-upload-local-snapshots` may only run while the user-API drain gate is
-/// refusing wakes, because the legacy reupload it triggers reads the live
-/// `/space/cache/<id>/snapshot/` directory and a concurrent wake plus re-suspend
-/// would let it register a torn snapshot.
-///
-/// The handler expresses that as `NodeDrain::blocks_placement`, the same
-/// predicate the gate itself uses — sharing it is the point, since the hazard is
-/// precisely a reader that believes wakes are blocked when they are not. This
-/// test pins the truth table that makes the sharing correct: a **gentle**
-/// `draining` node is the one non-NULL phase the endpoint must refuse.
-///
-/// Coverage gap, stated rather than papered over: this asserts the predicate, not
-/// the handler wiring — `apply_force_upload_local_snapshots` needs a full
-/// `AppState` (pool + substrate + auth) that this module has no harness for. What
-/// it does catch is the predicate drifting out from under the endpoint.
 /// The refusal text an operator actually reads must not carry the source
 /// indentation of the literal that produced it.
 ///
@@ -330,20 +315,91 @@ fn force_upload_local_snapshots_never_changes_drain_phase() {
 /// on the source is what gives this an oracle.
 #[test]
 fn force_upload_refusal_text_has_no_embedded_indentation() {
+    use pplx_space_node_drain::V2DrainPhase;
     use pplx_space_node_model::{NodeDrain, NodeDrainPhase};
 
     let states = [
         None,
         NodeDrain::from_v1_columns(Some(NodeDrainPhase::Draining), Some("gentle")),
+        Some(NodeDrain::V2 {
+            phase: V2DrainPhase::Cancelling,
+        }),
+        Some(NodeDrain::Unknown),
     ];
     for state in states {
-        let (error, detail) = super::force_upload_gate_open_message(state);
-        for text in [error, detail] {
+        let refusal = super::force_upload_refusal(state).expect("refused");
+        for text in [refusal.audit, refusal.detail] {
             assert!(
                 !text.contains("  "),
                 "operator-facing text carries embedded indentation: {text:?}"
             );
         }
+    }
+}
+
+/// `:force-upload-local-snapshots` may only run while the user-API drain gate is
+/// refusing wakes, because the legacy reupload it triggers reads the live
+/// `/space/cache/<id>/snapshot/` directory and a concurrent wake plus re-suspend
+/// would let it register a torn snapshot.
+///
+/// The handler expresses that as `force_upload_refusal`, which admits a v1
+/// drain only through `NodeDrain::refuses_activations`, the same predicate the
+/// gate itself uses — sharing it is the point, since the hazard is precisely a
+/// reader that believes wakes are blocked when they are not. A **gentle**
+/// `draining` node is the one non-NULL v1 phase the endpoint must refuse.
+///
+/// Under a v2 drain, in every phase and while its cancel is pending, it is
+/// refused with its own code: the cancel can unseal the node before the row
+/// says so, and the upload reads the live snapshot directory. A v1 drain whose
+/// gate is open, no drain, and a drain this build can't read are refused
+/// without a code, as before v2. The handler's wiring is covered by
+/// `drain_handler_tests::force_upload_is_refused_under_a_v2_drain_and_runs_under_v1`.
+#[test]
+fn force_upload_runs_only_under_a_v1_drain_that_refuses_activations() {
+    use pplx_space_node_drain::V2DrainPhase;
+    use pplx_space_node_model::NodeDrain;
+
+    let v1 = |phase, mode| NodeDrain::from_columns(None, Some(phase), mode);
+    let v2 = |phase| Some(NodeDrain::V2 { phase });
+    for (name, drain) in [
+        ("v1 forced draining", v1(PHASE_DRAINING, Some("forced"))),
+        ("v1 drained", v1(PHASE_DRAINED, Some("gentle"))),
+        ("v1 terminating", v1(PHASE_TERMINATING, None)),
+    ] {
+        assert_eq!(super::force_upload_refusal(drain), None, "{name}");
+    }
+    for (name, drain, code) in [
+        ("no drain", None, None),
+        (
+            "v1 gentle draining",
+            v1(PHASE_DRAINING, Some("gentle")),
+            None,
+        ),
+        ("v1 draining, no mode", v1(PHASE_DRAINING, None), None),
+        ("unknown", Some(NodeDrain::Unknown), None),
+        (
+            "v2 draining",
+            v2(V2DrainPhase::Draining),
+            Some(super::FORCE_UPLOAD_DRAIN_V2_CODE),
+        ),
+        (
+            "v2 drained",
+            v2(V2DrainPhase::Drained),
+            Some(super::FORCE_UPLOAD_DRAIN_V2_CODE),
+        ),
+        (
+            "v2 terminating",
+            v2(V2DrainPhase::Terminating),
+            Some(super::FORCE_UPLOAD_DRAIN_V2_CODE),
+        ),
+        (
+            "v2 cancel pending",
+            v2(V2DrainPhase::Cancelling),
+            Some(super::FORCE_UPLOAD_DRAIN_V2_CODE),
+        ),
+    ] {
+        let refusal = super::force_upload_refusal(drain).unwrap_or_else(|| panic!("{name} runs"));
+        assert_eq!(refusal.code, code, "{name}");
     }
 }
 

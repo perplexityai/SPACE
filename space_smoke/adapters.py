@@ -6401,6 +6401,11 @@ ON CONFLICT (key_hash) DO NOTHING;
             "POST", f"nodes/{quote(_sql_uuid(node_id), safe='')}:drain", body=dict(body)
         )
 
+    def force_upload_answer(self, node_id: str) -> CallAnswer:
+        return self._admin_answer(
+            "POST", f"nodes/{quote(_sql_uuid(node_id), safe='')}:force-upload-local-snapshots"
+        )
+
     _ADMIN_SANDBOX_ACTIONS = frozenset({"stop", "kill"})
 
     def admin_sandbox_action_answer(self, sandbox_id: str, action: str) -> CallAnswer:

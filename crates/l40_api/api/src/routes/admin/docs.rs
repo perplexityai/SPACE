@@ -185,12 +185,13 @@ fn admin_openapi_value() -> Value {
             "/nodes/{node_id}:force-upload-local-snapshots": {
                 "post": {
                     "summary": "Trigger local snapshot upload repair for one node",
+                    "description": "Asks the node to upload the snapshots of the suspended sandboxes pinned to it that the catalog holds no durable copy of. Accepted only under a v1 drain whose gate refuses wakes: drained, terminating, or draining in forced mode. Under a v2 drain, the node's drain uploads, while the node is sealed, each local snapshot of a suspended resident that the node has not recorded as backed up, so the action is refused in every phase of a v2 drain, its undrain's cancel included.",
                     "parameters": [
                         { "name": "node_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
                     ],
                     "responses": {
                         "200": { "description": "Repair trigger result" },
-                        "409": { "description": "Node transition conflict" },
+                        "409": { "description": "The node has no drain, or a gentle v1 drain, whose gate is open to wakes; or a v2 drain, in any phase or with its cancel pending (code drain_v2_uploads_local_snapshots)" },
                         "501": { "description": "Not available on the active substrate" }
                     }
                 }

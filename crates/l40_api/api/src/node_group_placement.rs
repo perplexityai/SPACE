@@ -238,8 +238,8 @@ impl NodeGroupPlacementResolveError {
 /// the same end state through `enqueue_artifact_backup`: the admin action
 /// selects the current instance, while drain pins the exact local artifact
 /// when its identity is recorded. That
-/// action also refuses unless the node is already draining in a mode whose gate
-/// blocks concurrent wakes (`force_upload_gate_open_message`,
+/// action also refuses unless the node is already under a v1 drain whose gate
+/// blocks concurrent wakes (`force_upload_refusal`,
 /// `routes/admin/nodes.rs`), because it reads the live on-disk snapshot
 /// directory and a concurrent wake plus re-suspend would race it. Naming the
 /// drain therefore covers both without sending the reader at an endpoint that
