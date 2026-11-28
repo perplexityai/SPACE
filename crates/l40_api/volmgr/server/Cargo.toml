@@ -83,4 +83,5 @@ tonic-health = { workspace = true }
 tracing-subscriber = { workspace = true }
 # `test-util` enables `#[tokio::test(start_paused = true)]` so the codec
 # admission tests can assert a blocked acquire without real-time sleeps.
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+# `io-util` reads the hard-exit child's stdout in the run tests.
+tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "test-util"] }
