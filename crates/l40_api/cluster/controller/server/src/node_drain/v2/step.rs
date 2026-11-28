@@ -44,10 +44,6 @@ impl Recording {
             .map(|(sandbox_id, _)| sandbox_id.clone())
             .collect()
     }
-
-    fn all_recorded(&self) -> bool {
-        self.records.iter().all(|(_, record)| record.is_recorded())
-    }
 }
 
 /// How the stored report names an evacuated sandbox's artifact kind.
@@ -94,17 +90,22 @@ fn drain_report(response: &DrainNodeResponse, generation: u64) -> Result<&DrainR
 
 /// What `drain_status.report` holds: the node's report, what the loop
 /// recorded of it (`unrecorded`), when it stored it (`reported_at`, the
-/// recording's `now`) and the stall clock (`evacuated_grew_at`, see
-/// [`evacuated_grew_at`]). Every stamp is Unix seconds by the database clock
-/// but a pending entry's `since`, which is the node's.
+/// recording's `now`), the stall clock (`evacuated_grew_at`, see
+/// [`evacuated_grew_at`]) and the listing time of the first evacuating tick
+/// whose report it stored (`evacuate_asked_at`, see [`evacuate_asked_at`]).
+/// Every stamp is
+/// Unix seconds by the database clock but a pending entry's `since`, which
+/// is the node's.
 pub fn stored_report(
     report: &DrainReport,
     recording: &Recording,
     evacuated_grew_at: i64,
+    evacuate_asked_at: Option<i64>,
 ) -> StoredV2Report {
     StoredV2Report {
         reported_at: recording.now,
         evacuated_grew_at,
+        evacuate_asked_at,
         evacuated: report
             .evacuated
             .iter()
@@ -144,16 +145,19 @@ pub fn stored_report(
     }
 }
 
-/// Why a drain is stalled at `now`, if it is: past its deadline (a drain
-/// without one is), not finished, and the set of sandboxes its node reports
-/// evacuated hasn't grown for `bound`, counted from the later of when it
-/// last grew ([`evacuated_grew_at`]) and the deadline. Before its deadline a
-/// drain is never stalled, however long it holds: its running sandboxes
-/// wait for the deadline. `pending` and `blocked` are what the report still
-/// lists, for the message.
+/// Why a drain is stalled at `now`, if it is: it evacuates (the database
+/// clock had reached its deadline when the tick listed it, or it has none),
+/// it isn't finished, and the set of sandboxes its node reports evacuated
+/// hasn't grown for `bound`, counted from its stall stamp
+/// ([`evacuated_grew_at`]): the later of when the set last grew and the
+/// listing time of the first evacuating tick whose report the loop stored.
+/// A drain that still holds is never
+/// stalled, however long it holds: its running sandboxes wait for the
+/// deadline. `pending` and `blocked` are what the report still lists, for
+/// the message.
 pub fn stalled(
     finished: bool,
-    deadline_at: Option<i64>,
+    evacuate: bool,
     evacuated_grew_at: i64,
     now: i64,
     bound: Duration,
@@ -161,13 +165,10 @@ pub fn stalled(
     blocked: usize,
 ) -> Option<String> {
     let bound_secs = i64::try_from(bound.as_secs()).unwrap_or(i64::MAX);
-    if finished || deadline_at.is_some_and(|deadline_at| now < deadline_at) {
+    if finished || !evacuate {
         return None;
     }
-    let since = deadline_at.map_or(evacuated_grew_at, |deadline_at| {
-        evacuated_grew_at.max(deadline_at)
-    });
-    (now.saturating_sub(since) >= bound_secs).then(|| {
+    (now.saturating_sub(evacuated_grew_at) >= bound_secs).then(|| {
         format!(
             "the drain is stalled: no sandbox evacuated for over {} past its deadline \
              ({pending} pending, {blocked} blocked)",
@@ -186,11 +187,32 @@ fn humanize(bound: Duration) -> String {
     }
 }
 
+/// The listing time of the drain generation's first evacuating tick whose
+/// report the loop stored, as the report it stores this tick records it
+/// (`evacuate_asked_at`): none while the drain holds; once it evacuates, the
+/// stamp the stored report carries, else now. A failed or aborted
+/// evacuating call stores no report, so it stamps nothing. A stored report
+/// without the stamp, stored while the drain held or by a controller from
+/// before the stamp, reads as not evacuating yet, so the clock starts at
+/// this tick.
+pub fn evacuate_asked_at(node: &V2Node) -> Option<i64> {
+    if !node.evacuate {
+        return None;
+    }
+    Some(
+        node.report
+            .as_ref()
+            .and_then(|report| report.evacuate_asked_at)
+            .unwrap_or(node.db_now),
+    )
+}
+
 /// The stall clock a report stores: the last time the set of sandboxes the
 /// node reports evacuated grew (now, when `report` names one the stored
 /// report didn't, or on the first report; the stored stamp otherwise), or
-/// the deadline once it has passed, if the set hasn't grown since, so the
-/// stamp plus the stall bound is when the drain stalls.
+/// the listing time of the first evacuating tick whose report the loop
+/// stored ([`evacuate_asked_at`]), if the set hasn't grown since, so the stamp plus the stall bound is when
+/// the drain stalls.
 pub fn evacuated_grew_at(node: &V2Node, report: &DrainReport) -> i64 {
     let now = node.db_now;
     let grew_at = match node.stored_evacuated() {
@@ -204,9 +226,9 @@ pub fn evacuated_grew_at(node: &V2Node, report: &DrainReport) -> i64 {
         }
         _ => now,
     };
-    match node.deadline_at {
-        Some(deadline_at) if now >= deadline_at => grew_at.max(deadline_at),
-        _ => grew_at,
+    match evacuate_asked_at(node) {
+        Some(asked) => grew_at.max(asked),
+        None => grew_at,
     }
 }
 
@@ -254,8 +276,8 @@ pub(super) struct OutstandingRows {
     /// for, or whose evacuation is unrecorded.
     pub(super) pending: u64,
     /// The rows every pending entry the node reports for is a hold: a
-    /// running sandbox the drain leaves running until its deadline, with
-    /// nothing started for it.
+    /// running sandbox the drain leaves running until its deadline, whose
+    /// pinned artifact's upload may be under way.
     pub(super) held: u64,
 }
 
@@ -282,19 +304,6 @@ pub(super) fn outstanding_rows(report: &DrainReport, recording: &Recording) -> O
     }
 }
 
-/// Publish what `report` and the loop's `recording` of it leave to do, as
-/// [`outstanding_rows`] counts it, and whether the drain is stalled.
-fn publish_report(node: &V2Node, report: &DrainReport, recording: &Recording, stalled: bool) {
-    let rows = outstanding_rows(report, recording);
-    crate::metrics::node_drain::v2_report(
-        &node.id.to_string(),
-        rows.blocked,
-        rows.pending,
-        rows.held,
-        stalled,
-    );
-}
-
 pub(super) async fn step<S: DrainV2Sink, A: V2InstanceAuthority>(
     sink: &S,
     authority: &A,
@@ -302,64 +311,62 @@ pub(super) async fn step<S: DrainV2Sink, A: V2InstanceAuthority>(
     evidence: Option<&InstanceEvidence>,
     backoff: &DispatchBackoff,
     config: &V2LoopConfig,
-) -> Option<NodeStep> {
+    warn_pacer: &PerNodeWarnPacer,
+) -> NodeOutcome {
     let Some(generation) = node.generation else {
         // The admin route writes the generation with the phase; a row
         // without one gets no call, sealed under nothing.
-        tracing::warn!(node_id = %node.id, "node_drain v2: drain_status has no generation");
-        return None;
+        if warn_pacer.due(node.id, "no_generation") {
+            tracing::warn!(node_id = %node.id, "node_drain v2: drain_status has no generation");
+        }
+        return NodeOutcome::kept();
     };
     if let Some(fence) = node.fenced() {
-        let evidence = evidence?;
+        // No answer this tick: the dispatch backoff isn't due.
+        let Some(evidence) = evidence else {
+            return NodeOutcome::kept();
+        };
         return terminated_or_dispatch(
             sink, authority, node, generation, fence, evidence, backoff, config,
         )
         .await;
     }
-    if let Some(evidence) = evidence
-        && let Some(step) = let_go_unfenced(sink, node, generation, evidence).await
-    {
-        return step;
-    }
-    match node.phase.as_deref() {
-        None => cancel(sink, node, generation)
-            .await
-            .then_some(NodeStep::Cancelled),
-        Some("draining") => drain(sink, node, generation, config)
-            .await
-            .then_some(NodeStep::Drained),
-        // A drained node waits for `:terminate` or `:undrain`. It is still
-        // sealed, so its tick keeps its cordon; it writes no sandbox row and
-        // makes no node call, and counts evacuated every row still naming it
-        // that the terminate would release.
-        Some("drained") => {
-            if let Err(NoCall::Moved) = converge_cordon(sink, node).await {
-                return None;
-            }
-            count_drained(sink, node.id, generation).await;
-            None
+    let mut note = None;
+    if let Some(evidence) = evidence {
+        match let_go_unfenced(sink, node, generation, evidence).await {
+            ControlFlow::Break(outcome) => return outcome,
+            ControlFlow::Continue(found) => note = Some(found),
         }
-        Some("terminating") => terminate(sink, authority, node, generation).await,
+    }
+    let outcome = match node.phase.as_deref() {
+        None => cancel(sink, node, generation).await,
+        Some("draining") => drain(sink, node, generation, config).await,
+        Some("drained") => drained(sink, node, generation, warn_pacer).await,
+        Some("terminating") => terminate(sink, authority, node, generation, config).await,
         Some(other) => {
-            tracing::warn!(node_id = %node.id, phase = other, "node_drain v2: unknown phase");
-            None
+            if warn_pacer.due(node.id, "unknown_phase") {
+                tracing::warn!(node_id = %node.id, phase = other, "node_drain v2: unknown phase");
+            }
+            NodeOutcome::kept()
         }
-    }
+    };
+    outcome.or_note(note)
 }
 
 /// Let go of an unfenced node whose heartbeat is stale, with EC2's answer
 /// for its recorded instance: `terminated` now, or not listed once the
 /// drain recorded it `terminated`, and the machine EC2 answered about the
 /// one the node registered ([`super::cleanup::unregistered_machine`]). The
-/// first `terminated` answer is recorded. `Some` when the tick is done with
-/// the node: let go, or moved on. Any other answer is recorded as the last
-/// error, and the node's step goes on.
+/// first `terminated` answer is recorded. `Break` with the tick's outcome
+/// when the tick is done with the node: let go, moved on, or waiting on a
+/// live machine. Otherwise `Continue` with what EC2 answered, which the
+/// node's status shows when its step has nothing else to report.
 async fn let_go_unfenced<S: DrainV2Sink>(
     sink: &S,
     node: &V2Node,
     generation: u64,
     evidence: &InstanceEvidence,
-) -> Option<Option<NodeStep>> {
+) -> ControlFlow<NodeOutcome, String> {
     let instance = node.instance_id.as_deref().unwrap_or("<none>");
     if *evidence == InstanceEvidence::Terminated
         && node.terminated_observed_at.is_none()
@@ -370,14 +377,14 @@ async fn let_go_unfenced<S: DrainV2Sink>(
             .await
         {
             Ok(true) => {}
-            Ok(false) => return Some(None),
-            Err(error) => {
-                sink.record_error(
-                    node.id,
-                    &format!("recording that {asked} is terminated failed: {error}"),
-                )
-                .await
-            }
+            Ok(false) => return ControlFlow::Break(NodeOutcome::kept()),
+            // EC2 answers `terminated` now, so this tick doesn't need the
+            // record; the next one that sees it records it.
+            Err(error) => tracing::warn!(
+                node_id = %node.id,
+                %error,
+                "node_drain v2: recording that {asked} is terminated failed"
+            ),
         }
     }
     let terminated = match evidence {
@@ -386,32 +393,18 @@ async fn let_go_unfenced<S: DrainV2Sink>(
         _ => false,
     };
     if !terminated {
-        sink.record_error(
-            node.id,
-            &format!(
-                "the node's heartbeat is stale; EC2 answers {evidence} for its instance {instance}"
-            ),
-        )
-        .await;
-        return None;
+        return ControlFlow::Continue(format!(
+            "the node's heartbeat is stale; EC2 answers {evidence} for its instance {instance}"
+        ));
     }
     if let Some(why) = super::cleanup::unregistered_machine(sink, node, instance).await {
-        sink.record_error(
-            node.id,
-            &format!(
-                "EC2 answers terminated for the node's recorded instance {instance}, but {why}; \
-                 not letting it go"
-            ),
-        )
-        .await;
-        return Some(None);
+        return ControlFlow::Break(NodeOutcome::says(format!(
+            "EC2 answers terminated for the node's recorded instance {instance}, but {why}; \
+             not letting it go"
+        )));
     }
     let trace = format!("v2 drain let go: instance {instance} terminated outside the drain");
-    Some(
-        let_go(sink, node, generation, &trace)
-            .await
-            .then_some(NodeStep::LetGo),
-    )
+    ControlFlow::Break(let_go(sink, node, generation, &trace).await)
 }
 
 /// The node's answer to one drain call, as a step reads it.
@@ -443,18 +436,46 @@ async fn call_drain<S: DrainV2Sink>(sink: &S, node: &V2Node, generation: u64) ->
     }
 }
 
+/// A drain report the tick stored, and what it shows.
+struct Stored {
+    /// The report as stored, whose [`StoredV2Report::finished`] is the one
+    /// rule of a finished drain.
+    report: StoredV2Report,
+    /// What the gauges read for it.
+    gauges: Gauges,
+    /// Why the drain is stalled, if it is ([`stalled`]).
+    stall: Option<String>,
+    recording: Recording,
+}
+
 /// Record the evacuations `report` lists and store it, with the evacuations
-/// recorded and the sandboxes it lists running. Returns the recording, and
-/// whether the row still carries the generation; `None` when storing it
-/// failed, which is recorded.
+/// recorded and the sandboxes it lists running, and what its gauges read.
+/// The draining and the terminating tick store a report the same way, so
+/// the same report reads the same. `Ok(None)` when the row no longer
+/// carries the generation; `Err` with the status when storing failed.
 async fn store<S: DrainV2Sink>(
     sink: &S,
     node: &V2Node,
     generation: u64,
     report: &DrainReport,
-    grew_at: i64,
-) -> Option<(Recording, bool)> {
+    config: &V2LoopConfig,
+) -> Result<Option<Stored>, String> {
     let recording = record_evacuations(sink, node, report).await;
+    let grew_at = evacuated_grew_at(node, report);
+    let stored = stored_report(report, &recording, grew_at, evacuate_asked_at(node));
+    let stall = stalled(
+        stored.finished(),
+        node.evacuate,
+        grew_at,
+        node.db_now,
+        config.stall_bound,
+        report.pending.len(),
+        report.blocked.len(),
+    );
+    let gauges = Gauges::Report {
+        rows: outstanding_rows(report, &recording),
+        stalled: stall.is_some(),
+    };
     // A running warm-pool member isn't a user's sandbox: the observed set
     // holds user sandboxes only.
     let running = report
@@ -467,42 +488,41 @@ async fn store<S: DrainV2Sink>(
         .record_report(
             node.id,
             generation,
-            stored_report(report, &recording, grew_at),
+            stored.clone(),
             running,
             recording.recorded(),
         )
         .await
     {
-        Ok(stored) => Some((recording, stored)),
-        Err(error) => {
-            sink.record_error(
-                node.id,
-                &format!("storing the drain report failed: {error}"),
-            )
-            .await;
-            None
-        }
+        Ok(true) => Ok(Some(Stored {
+            report: stored,
+            gauges,
+            stall,
+            recording,
+        })),
+        // The current generation's tick stores, and publishes, its own.
+        Ok(false) => Ok(None),
+        Err(error) => Err(format!("storing the drain report failed: {error}")),
     }
 }
 
 /// Why the cordon's convergence leaves the node uncalled this tick.
 enum NoCall {
-    /// The Kubernetes Node under the name is another one than the drain's;
-    /// recorded as the node's last error.
+    /// The Kubernetes Node under the name is another one than the drain's:
+    /// the status, which says so.
     AnotherNode(String),
-    /// The row moved on since the tick listed it; nothing recorded.
+    /// The row moved on since the tick listed it.
     Moved,
 }
 
 /// Converge `node`'s cordon ([`DrainV2Sink::ensure_cordon`]): a v2 node
 /// stays cordoned in every phase where it may still be sealed, `draining`,
 /// `drained`, `terminating` and its cancel pending, so nothing is placed on
-/// it. Each failure is recorded as the node's last error. `Err` when the
-/// Kubernetes Node under the name has another UID than the one the tick
-/// listed: the drain's node isn't the one a call would reach, so the caller
-/// makes no call; and, recording nothing, when the row moved on since the
-/// tick listed it. `Ok(Some(error))` for any other failure, which the caller
-/// goes on past; `Ok(None)` once converged.
+/// it. `Err` when the Kubernetes Node under the name has another UID than
+/// the one the tick listed: the drain's node isn't the one a call would
+/// reach, so the caller makes no call; and when the row moved on since the
+/// tick listed it. `Ok(Some(status))` for any other failure, which the
+/// caller goes on past; `Ok(None)` once converged.
 async fn converge_cordon<S: DrainV2Sink>(
     sink: &S,
     node: &V2Node,
@@ -510,33 +530,25 @@ async fn converge_cordon<S: DrainV2Sink>(
     match sink.ensure_cordon(node).await {
         Ok(()) => Ok(None),
         Err(CordonFailure::Moved) => Err(NoCall::Moved),
-        Err(CordonFailure::UidMismatch(error)) => {
-            sink.record_error(
-                node.id,
-                &format!("cordon convergence failed: {error}; not calling DrainNode"),
-            )
-            .await;
-            Err(NoCall::AnotherNode(error))
-        }
-        Err(CordonFailure::Other(error)) => {
-            let error = format!("cordon convergence failed: {error}");
-            sink.record_error(node.id, &error).await;
-            Ok(Some(error))
-        }
+        Err(CordonFailure::UidMismatch(error)) => Err(NoCall::AnotherNode(format!(
+            "cordon convergence failed: {error}; not calling DrainNode"
+        ))),
+        Err(CordonFailure::Other(error)) => Ok(Some(format!("cordon convergence failed: {error}"))),
     }
 }
 
-/// Ask the node, record what it reports, mark the drain stalled when it is,
-/// and advance a node that has finished. Returns whether the node moved to
-/// `drained`.
+/// Ask the node, record what it reports, and advance a node that has
+/// finished. The status is the stall, else a cordon that failed, else none.
 async fn drain<S: DrainV2Sink>(
     sink: &S,
     node: &V2Node,
     generation: u64,
     config: &V2LoopConfig,
-) -> bool {
-    let Ok(cordon_error) = converge_cordon(sink, node).await else {
-        return false;
+) -> NodeOutcome {
+    let cordon_error = match converge_cordon(sink, node).await {
+        Ok(error) => error,
+        Err(NoCall::Moved) => return NodeOutcome::kept(),
+        Err(NoCall::AnotherNode(error)) => return NodeOutcome::says(error),
     };
     let report = match call_drain(sink, node, generation).await {
         DrainAnswer::Report(report) => report,
@@ -546,111 +558,133 @@ async fn drain<S: DrainV2Sink>(
                 "node_drain v2: another DrainNode call is in progress on the node; skipping it \
                  this tick"
             );
-            return false;
+            return NodeOutcome::kept();
         }
-        DrainAnswer::Moved => return false,
-        DrainAnswer::Failed(error) => {
-            crate::metrics::node_drain::v2_unanswered(&node.id.to_string());
-            sink.record_error(node.id, &error).await;
-            return false;
-        }
+        DrainAnswer::Moved => return NodeOutcome::kept(),
+        DrainAnswer::Failed(error) => return NodeOutcome::unanswered(error),
     };
-    let grew_at = evacuated_grew_at(node, &report);
-    let Some((recording, stored)) = store(sink, node, generation, &report, grew_at).await else {
-        return false;
+    let stored = match store(sink, node, generation, &report, config).await {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return NodeOutcome::kept(),
+        Err(error) => return NodeOutcome::says(error),
     };
-    let finished =
-        report.pending.is_empty() && report.blocked.is_empty() && recording.all_recorded();
-    let stall = stalled(
-        finished,
-        node.deadline_at,
-        grew_at,
-        node.db_now,
-        config.stall_bound,
-        report.pending.len(),
-        report.blocked.len(),
-    );
-    // A report the generation guard rejected publishes nothing: the current
-    // generation's tick publishes its own.
-    if !stored {
-        return false;
-    }
-    publish_report(node, &report, &recording, stall.is_some());
-    if !report.blocked.is_empty() {
-        tracing::warn!(
-            node_id = %node.id,
-            blocked = report.blocked.len(),
-            "node_drain v2: the node reports node-wide problems; the drain can't end until \
-             they are resolved"
-        );
-    }
-    // Storing the report clears the last error; a cordon that failed this
-    // tick keeps its error until one succeeds, and a stalled drain says so
-    // for as long as it lasts.
-    for error in [&cordon_error, &stall].into_iter().flatten() {
-        sink.record_error(node.id, error).await;
-    }
-    if !finished {
-        return false;
+    let mut outcome = NodeOutcome {
+        step: None,
+        status: stored
+            .stall
+            .or(cordon_error)
+            .map_or(Status::Clear, Status::Says),
+        gauges: stored.gauges,
+    };
+    if !stored.report.finished() {
+        return outcome;
     }
     match sink.advance_drained(node.id, generation).await {
-        Ok(moved) => moved,
+        Ok(true) => outcome.step = Some(NodeStep::Drained),
+        Ok(false) => {}
         Err(error) => {
-            sink.record_error(node.id, &format!("advancing to drained failed: {error}"))
-                .await;
-            false
+            outcome.status = Status::Says(format!("advancing to drained failed: {error}"));
         }
+    }
+    outcome
+}
+
+/// A drained node waits for `:terminate` or `:undrain`. It is still sealed,
+/// so its tick keeps its cordon; it writes no sandbox row and makes no node
+/// call, and counts evacuated every row still naming it that the
+/// terminate would release. Its status is a failed count, else a failed
+/// cordon, else none. A node a terminate returned here keeps why
+/// ([`TERMINATE_REFUSED`]) until the next `:terminate` or `:undrain`, its
+/// tick's own failures included, which then go only to a paced warning;
+/// only a let-go that waits on the node's machine replaces it
+/// ([`let_go_unfenced`]).
+async fn drained<S: DrainV2Sink>(
+    sink: &S,
+    node: &V2Node,
+    generation: u64,
+    warn_pacer: &PerNodeWarnPacer,
+) -> NodeOutcome {
+    let refused = node
+        .last_error
+        .as_deref()
+        .is_some_and(|error| error.starts_with(TERMINATE_REFUSED));
+    let cordon_error = match converge_cordon(sink, node).await {
+        Ok(error) => error,
+        Err(NoCall::Moved) => return NodeOutcome::kept(),
+        Err(NoCall::AnotherNode(error)) => Some(error),
+    };
+    match count_drained(sink, node.id, generation)
+        .await
+        .err()
+        .or(cordon_error)
+    {
+        Some(error) if refused => {
+            if warn_pacer.due(node.id, "drained_failure") {
+                tracing::warn!(
+                    node_id = %node.id,
+                    error,
+                    "node_drain v2: a drained node's tick failed; keeping the terminate's refusal"
+                );
+            }
+            NodeOutcome::kept()
+        }
+        Some(error) => NodeOutcome::says(error),
+        None if refused => NodeOutcome::kept(),
+        None => NodeOutcome::default(),
     }
 }
 
 /// A terminating node's one fresh check: the report must list nothing
-/// pending or blocked, and every evacuation it lists must be recorded,
-/// before the loop fences. Any other outcome returns the
-/// node to `drained` with why ([`DrainV2Sink::return_drained`]), and the
-/// operator retries `:terminate`. The node's cordon is converged first; a
-/// Node under the name with another UID refuses the terminate without a
-/// call. With no terminating authority, the node isn't called: it waits for
-/// an operator, who may still undrain it.
+/// pending or blocked, and every evacuation it lists must be recorded
+/// ([`StoredV2Report::finished`]), before the loop fences. A node that
+/// records no instance to terminate, a Node under the name with another UID
+/// (without a call), a failed call, or a report that isn't finished returns
+/// the node to `drained` with why ([`DrainV2Sink::return_drained`]), and the
+/// operator retries `:terminate`. A call refused because another one is in
+/// progress on the node (`Aborted`) changed nothing: the node stays
+/// `terminating` and the next tick checks again, its status saying so. With
+/// no terminating authority, the node isn't called: it waits for an
+/// operator, who may still undrain it.
 async fn terminate<S: DrainV2Sink, A: V2InstanceAuthority>(
     sink: &S,
     authority: &A,
     node: &V2Node,
     generation: u64,
-) -> Option<NodeStep> {
+    config: &V2LoopConfig,
+) -> NodeOutcome {
     if !authority.terminates() {
-        sink.record_error(node.id, super::cleanup::REFUSED_TERMINATE)
-            .await;
-        return None;
+        return NodeOutcome::says(super::cleanup::NOT_AWS_TERMINATOR);
+    }
+    if node.instance_id.is_none() {
+        return return_drained(sink, node, generation, NO_INSTANCE_TO_TERMINATE).await;
     }
     let refused = match converge_cordon(sink, node).await {
-        Err(NoCall::Moved) => return None,
-        Err(NoCall::AnotherNode(error)) => {
-            format!("terminate refused: cordon convergence failed: {error}; not calling DrainNode")
-        }
-        Ok(_) => {
-            match call_drain(sink, node, generation).await {
+        Err(NoCall::Moved) => return NodeOutcome::kept(),
+        Err(NoCall::AnotherNode(error)) => format!("{TERMINATE_REFUSED}: {error}"),
+        Ok(_) => match call_drain(sink, node, generation).await {
             DrainAnswer::Report(report) => {
-                let grew_at = evacuated_grew_at(node, &report);
-                let (recording, stored) = store(sink, node, generation, &report, grew_at).await?;
-                if !stored {
-                    return None;
-                }
-                if !report.pending.is_empty() || !report.blocked.is_empty() {
+                let stored = match store(sink, node, generation, &report, config).await {
+                    Ok(Some(stored)) => stored,
+                    Ok(None) => return NodeOutcome::kept(),
+                    Err(error) => return NodeOutcome::says(error),
+                };
+                let refused = if stored.report.finished() {
+                    return fence(sink, node, generation)
+                        .await
+                        .with_gauges(stored.gauges);
+                } else if !report.pending.is_empty() || !report.blocked.is_empty() {
                     format!(
-                        "terminate refused: the node reports {} pending, {} blocked: {}",
+                        "{TERMINATE_REFUSED}: the node reports {} pending, {} blocked: {}",
                         report.pending.len(),
                         report.blocked.len(),
                         first_reasons(&report)
                     )
-                } else if recording.all_recorded() {
-                    return fence(sink, node.id, generation).await;
                 } else {
-                    // The draining path treats the same report as
-                    // unfinished: an evacuation not yet recorded hasn't
-                    // left the node's books.
-                    let unrecorded: Vec<_> = recording.unrecorded().collect();
+                    // An evacuation not yet recorded hasn't left the node's
+                    // books.
+                    let unrecorded: Vec<_> = stored.recording.unrecorded().collect();
                     format!(
-                        "terminate refused: the node reports 0 pending, 0 blocked, and {} \
+                        "{TERMINATE_REFUSED}: the node reports 0 pending, 0 blocked, and {} \
                          evacuated not yet recorded: {}",
                         unrecorded.len(),
                         unrecorded
@@ -660,34 +694,35 @@ async fn terminate<S: DrainV2Sink, A: V2InstanceAuthority>(
                             .collect::<Vec<_>>()
                             .join("; ")
                     )
-                }
+                };
+                // Back in `drained`, the node keeps the refused report's
+                // rows, which its refusal names, and isn't stalled.
+                return return_drained(sink, node, generation, &refused)
+                    .await
+                    .with_gauges(stored.gauges.unstalled());
             }
-            DrainAnswer::Aborted => {
-                "terminate refused: DrainNode failed: another DrainNode call is in progress on the \
-             node"
-                    .to_owned()
+            DrainAnswer::Aborted => return NodeOutcome::says(TERMINATE_WAITS_FOR_A_CALL),
+            DrainAnswer::Moved => return NodeOutcome::kept(),
+            // A failed fresh call changes no gauge: back in `drained`,
+            // nothing calls the node, so it isn't unanswered.
+            DrainAnswer::Failed(error) => {
+                return return_drained(
+                    sink,
+                    node,
+                    generation,
+                    &format!("{TERMINATE_REFUSED}: {error}"),
+                )
+                .await;
             }
-            DrainAnswer::Moved => return None,
-            DrainAnswer::Failed(error) => format!("terminate refused: {error}"),
-        }
-        }
+        },
     };
-    match sink.return_drained(node.id, generation, &refused).await {
-        Ok(true) => {
-            tracing::warn!(node_id = %node.id, refused, "node_drain v2: returned the node to drained");
-            Some(NodeStep::Returned)
-        }
-        Ok(false) => None,
-        Err(error) => {
-            sink.record_error(
-                node.id,
-                &format!("{refused}; returning the node to drained failed: {error}"),
-            )
-            .await;
-            None
-        }
-    }
+    return_drained(sink, node, generation, &refused).await
 }
+
+/// The status of a terminating node whose fresh check found another
+/// `DrainNode` call in progress on the node.
+pub(super) const TERMINATE_WAITS_FOR_A_CALL: &str = "terminate waiting: another DrainNode call is \
+     in progress on the node; the fresh check runs again next tick";
 
 /// The first [`REFUSAL_REASONS`] reasons a report isn't empty, blockers
 /// first: each node-wide reason, then each pending sandbox with its reason.
@@ -715,40 +750,35 @@ fn first_reasons(report: &DrainReport) -> String {
 /// skipped. Once it answers the cancel, lift the cordon, which `:undrain`
 /// leaves on a v2 node so that nothing is placed on a node still sealed,
 /// then clear the v2 columns, only after the lift and while the row is
-/// still this generation's cancel ([`DrainV2Sink::finish_cancel`]). Anything but a
-/// cancel's answer, an `Aborted` call included, is unanswered and retried
-/// next tick. Returns whether the columns were cleared.
-async fn cancel<S: DrainV2Sink>(sink: &S, node: &V2Node, generation: u64) -> bool {
-    if converge_cordon(sink, node).await.is_err() {
-        return false;
+/// still this generation's cancel ([`DrainV2Sink::finish_cancel`]). Anything
+/// but a cancel's answer, an `Aborted` call included, is unanswered and
+/// retried next tick.
+async fn cancel<S: DrainV2Sink>(sink: &S, node: &V2Node, generation: u64) -> NodeOutcome {
+    match converge_cordon(sink, node).await {
+        Ok(_) => {}
+        Err(NoCall::Moved) => return NodeOutcome::kept(),
+        Err(NoCall::AnotherNode(error)) => return NodeOutcome::says(error),
     }
     let unanswered = match sink.drain_node(node, cancel_request(generation)).await {
         Ok(DrainNodeResponse {
             result: Some(drain_node_response::Result::Cancel(_)),
             ..
         }) => None,
-        Err(error) if error.is_moved() => return false,
+        Err(error) if error.is_moved() => return NodeOutcome::kept(),
         Ok(_) => Some(format!(
             "the node answered the cancel of generation {generation} without a cancel's result"
         )),
         Err(error) => Some(format!("DrainNode cancel failed: {error}")),
     };
     if let Some(error) = unanswered {
-        crate::metrics::node_drain::v2_unanswered(&node.id.to_string());
-        sink.record_error(node.id, &error).await;
-        return false;
+        return NodeOutcome::unanswered(error);
     }
     match sink.finish_cancel(node).await {
-        Ok(cleared) => {
-            if cleared {
-                crate::metrics::node_drain::clear_v2_gauges(&node.id.to_string());
-            }
-            cleared
+        Ok(true) => {
+            crate::metrics::node_drain::clear_v2_gauges(&node.id.to_string());
+            NodeOutcome::moved(NodeStep::Cancelled)
         }
-        Err(error) => {
-            sink.record_error(node.id, &format!("clearing the cancel failed: {error}"))
-                .await;
-            false
-        }
+        Ok(false) => NodeOutcome::kept(),
+        Err(error) => NodeOutcome::says(format!("clearing the cancel failed: {error}")),
     }
 }

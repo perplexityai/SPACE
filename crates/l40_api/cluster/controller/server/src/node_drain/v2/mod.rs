@@ -21,6 +21,17 @@
 //! the listed one, and names that UID in the patch, which the API server
 //! refuses once the Node under the name is another one.
 //!
+//! Each node's step decides one outcome for the tick: what moved, the status
+//! its row shows afterwards (`drain_last_error`: what it waits for or what
+//! failed, or nothing to report) and what its report gauges read. One
+//! writer applies it: it writes the status only when it differs from what
+//! the listing read, once, under the listed generation, logs at WARN only
+//! when it changes, and publishes the gauges of every report the tick
+//! stored, draining or terminating, and an unanswered call on both paths.
+//! A guarded transition that records a status with its move (the terminate
+//! transaction's fence or what holds it, the dispatch, the return to
+//! `drained`, the let-go's trace) keeps it: the outcome leaves it as it is.
+//!
 //! Per v2 node, each tick:
 //!
 //! 1. **Let-go first.** A node whose machine is gone some other way is let
@@ -42,7 +53,8 @@
 //!    The node unseals and hands nothing back: a sandbox the drain suspended
 //!    stays suspended until a call wakes it. Then lift the cordon, which
 //!    `:undrain` leaves on a v2 node so nothing places on a node still
-//!    sealed, and once it is lifted clear the engine and status, only while
+//!    sealed, and once it is lifted clear the engine, `drain_status` and
+//!    the status (`drain_last_error`), only while
 //!    the row is still this generation's cancel. No row lock spans the
 //!    lift. While one controller runs ticks, the API refuses a `:drain`
 //!    until the clear lands, so no drain of the node starts and cordons in
@@ -73,11 +85,18 @@
 //!    report is stored in
 //!    `drain_status`, each recorded evacuation is added to
 //!    `evacuated_total`, and each pending entry the node reports running,
-//!    but for a warm-pool member, to `observed_running`. Past its deadline, a drain whose evacuated set
-//!    hasn't grown for the stall bound (15 minutes) is stalled, in
-//!    `drain_last_error` and on the `node_drain.v2.stalled` gauge; the mark
-//!    changes nothing else. Once the report has nothing pending or blocked
-//!    and every evacuation is recorded, the node moves to `drained`.
+//!    but for a warm-pool member, to `observed_running`. A drain the loop
+//!    asks to evacuate whose evacuated set hasn't grown for the stall bound
+//!    (15 minutes), counted from the later of its last growth and the
+//!    listing time of the generation's first evacuating tick whose report
+//!    the loop stored (`report.evacuate_asked_at`; a failed or aborted
+//!    evacuating call stamps nothing, and a report without it counts from
+//!    the next evacuating tick), is stalled, in `drain_last_error` and on
+//!    the `node_drain.v2.stalled` gauge; the mark changes nothing else. A
+//!    hold shortened into the past thus doesn't stall at once. Once the
+//!    stored report is finished (nothing pending, nothing blocked, every
+//!    evacuation recorded: `StoredV2Report::finished`, the one rule), the
+//!    node moves to `drained`.
 //! 4. **Drained**: no sandbox-row write, and the node isn't called. Every
 //!    suspended row still naming the node that the terminate would
 //!    release (its snapshot durable, no restore or activation of it in
@@ -85,7 +104,13 @@
 //!    stopped sandbox, so none is counted), a `drain_status` write only,
 //!    which re-checks the phase instead of locking the row: the node evicts
 //!    a durable copy on its own, so one it evicted before a report named it
-//!    evacuated is counted too.
+//!    evacuated is counted too. A tick whose cordon and count succeed has
+//!    nothing to report, and clears an earlier failure; why a terminate
+//!    returned the node here stays until the next `:terminate` or
+//!    `:undrain`, through the tick's own failures (a paced warning then
+//!    says what failed), unless the loop finds the node's machine
+//!    terminated and waits on it. The report gauges keep the refused
+//!    report's rows, with the node neither stalled nor unanswered.
 //! 5. **Terminating** (`:terminate` moved it here, from `drained`): one fresh
 //!    `DrainNode` call, whose report is recorded as a draining one's. Only
 //!    an answer with nothing pending or blocked lets the loop fence, so a
@@ -99,9 +124,14 @@
 //!    names the node (whose blockers go to `drain_last_error`), and records
 //!    the instance to terminate, `node_k8s.instance_id`, as the fence
 //!    (`drain_status.terminate_instance`). Any other outcome, a failed call
-//!    (an unreadable seal among them) or a report that isn't empty, fences
+//!    (an unreadable seal among them) or a report that isn't finished, fences
 //!    nothing: the node returns to `drained`, with why in
-//!    `drain_last_error`, and the operator retries.
+//!    `drain_last_error`, and the operator retries. So does a node that
+//!    records no instance to terminate, before any call when the listing
+//!    shows none, else from the terminate transaction. A call refused
+//!    because another `DrainNode` call is in progress on the node
+//!    (`Aborted`) changed nothing: the node stays `terminating`, its status
+//!    saying so, and the next tick checks again.
 //!    Only the `aws` terminator fences. After the fence, the loop asks EC2
 //!    about that instance on its dispatch backoff (one EC2 call per tick
 //!    asks about every instance the tick asks about) and, while EC2 lists it in
@@ -125,13 +155,20 @@
 //! Every v1 writer keyed on drain phase skips a v2 row, so this loop is the
 //! only one that moves one. It keeps nothing between ticks but its tick
 //! timer and [`V2LoopState`]: the dispatch backoff, where a lost backoff
-//! only retries sooner, and the nodes it listed, so a node that leaves its
-//! listing, however its row lost the drain, has its v2 gauges zeroed.
+//! only retries sooner, the nodes it listed, so a node that leaves its
+//! listing, however its row lost the drain, has its v2 gauges zeroed, and
+//! the pacer of its warnings about a node's node-wide problems. Once
+//! shutdown is requested, no tick starts and a tick takes no new node. The
+//! steps already running go on until the controller's shutdown grace
+//! (`SHUTDOWN_DRAIN_TIMEOUT`, 10 s) ends; the process then exits and drops
+//! any still running, so a dispatch in flight then has an unknown outcome,
+//! as a timed-out one does.
 
 mod cleanup;
 mod step;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -146,20 +183,27 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use cleanup::{
-    DispatchBackoff, REFUSED_TERMINATE, count_drained, fence, let_go, terminated_or_dispatch,
+    DispatchBackoff, NO_INSTANCE_TO_TERMINATE, NOT_AWS_TERMINATOR, TERMINATE_REFUSED,
+    count_drained, fence, let_go, return_drained, terminated_or_dispatch,
 };
 pub use cleanup::{Fence, TerminatedDelete};
-use step::step;
+use step::{OutstandingRows, step};
 #[cfg(test)]
-use step::{OutstandingRows, Recording, outstanding_rows, stalled, stored_report};
+use step::{
+    Recording, TERMINATE_WAITS_FOR_A_CALL, evacuated_grew_at, outstanding_rows, stalled,
+    stored_report,
+};
+
+use crate::warn_pacer::PerNodeWarnPacer;
 
 /// The v2 loop's bounds. Each has a test-hooks override
 /// ([`Self::from_environment`]) so Kind and tests can shrink it; a release
 /// build reads the defaults.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct V2LoopConfig {
-    /// How long past its deadline a drain may evacuate no further sandbox
-    /// before the loop marks it stalled.
+    /// How long, counted from the stall stamp (`evacuated_grew_at`), a
+    /// drain may evacuate no further sandbox before the loop marks it
+    /// stalled.
     pub stall_bound: Duration,
     /// How long a sandbox a drain saw running may stay suspended before
     /// `node_drain.v2.evacuated_still_suspended` counts it.
@@ -386,7 +430,7 @@ impl V2InstanceAuthority for V2Terminator {
         decrement_capacity: bool,
     ) -> Result<(), String> {
         let Self::Ec2 { autoscaling, .. } = self else {
-            return Err(REFUSED_TERMINATE.to_owned());
+            return Err(NOT_AWS_TERMINATOR.to_owned());
         };
         let instance = Ec2InstanceId::parse(instance_id)
             .ok_or_else(|| format!("{instance_id} is not an instance id"))?;
@@ -438,6 +482,9 @@ pub struct V2Node {
     pub terminated_observed_at: Option<i64>,
     /// `nodes.terminate_decrement_capacity`, which the termination passes on.
     pub decrement_capacity: bool,
+    /// `nodes.drain_last_error`, the status the row showed when the tick
+    /// listed it.
+    pub last_error: Option<String>,
     /// The database clock when the tick listed the node, in Unix seconds: the
     /// clock of the drain's deadline, of the stored report's stamps, and of
     /// the stall rules.
@@ -494,14 +541,31 @@ pub fn cancel_request(generation: u64) -> DrainNodeRequest {
 }
 
 /// What the loop keeps between ticks: its [`V2LoopConfig`], the
-/// [`DispatchBackoff`], and the nodes its last listing returned. In memory
-/// only: a controller that restarts starts with no listing.
-#[derive(Debug)]
+/// [`DispatchBackoff`], the nodes its last listing returned, and its warning
+/// pacer; and the shutdown token its ticks watch. In memory only: a
+/// controller that restarts starts with no listing.
 pub struct V2LoopState {
     config: V2LoopConfig,
     backoff: DispatchBackoff,
     listed: Mutex<HashSet<NodeId>>,
+    warn_pacer: PerNodeWarnPacer,
+    shutdown: CancellationToken,
 }
+
+impl std::fmt::Debug for V2LoopState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("V2LoopState")
+            .field("config", &self.config)
+            .field("backoff", &self.backoff)
+            .field("listed", &self.listed)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How often the loop repeats a warning about a node while it lasts: a
+/// report that lists node-wide problems, a drain with no generation, a
+/// phase this build doesn't know.
+const BLOCKED_WARN_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 impl Default for V2LoopState {
     fn default() -> Self {
@@ -511,10 +575,17 @@ impl Default for V2LoopState {
 
 impl V2LoopState {
     pub fn new(config: V2LoopConfig) -> Self {
+        Self::with_shutdown(config, CancellationToken::new())
+    }
+
+    /// A state whose ticks take no new node once `shutdown` is cancelled.
+    pub fn with_shutdown(config: V2LoopConfig, shutdown: CancellationToken) -> Self {
         Self {
             config,
             backoff: DispatchBackoff::new(config.dispatch_backoff_base),
             listed: Mutex::default(),
+            warn_pacer: PerNodeWarnPacer::new(BLOCKED_WARN_INTERVAL),
+            shutdown,
         }
     }
 
@@ -719,11 +790,16 @@ pub trait DrainV2Sink: Send + Sync + 'static {
         &self,
         after: Duration,
     ) -> impl std::future::Future<Output = Result<HashMap<NodeId, u64>, String>> + Send;
-    fn record_error(
+    /// Make `drain_last_error` of the v2 drain under `generation` read
+    /// `status` (`None` clears it), the status the tick decided on; only on
+    /// a row that is still that generation's v2 drain and doesn't read it
+    /// already. Whether it wrote.
+    fn write_status(
         &self,
         node_id: NodeId,
-        message: &str,
-    ) -> impl std::future::Future<Output = ()> + Send;
+        generation: u64,
+        status: Option<&str>,
+    ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
     /// Add every row still naming the `drained` node under `generation`
     /// that the terminate would release to its drain's `evacuated_total`
     /// (`pplx_space_sandbox_store::drain_terminate::releasable_suspended_rows_naming`),
@@ -822,7 +898,8 @@ pub struct V2TickReport {
 /// and a slow node must not hold up the rest.
 const NODE_CONCURRENCY: usize = 8;
 
-/// What one tick did to a node.
+/// What one tick moved for a node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NodeStep {
     Cancelled,
     Drained,
@@ -833,13 +910,188 @@ enum NodeStep {
     LetGo,
 }
 
+/// What one tick did to a v2 node: what moved, the status its row shows
+/// after the tick, and what its report gauges read. The step decides it;
+/// [`apply`] alone writes the status and publishes the gauges, but for a
+/// move that clears the node's gauges with its own write (the cancel, the
+/// let-go, the delete), which keeps that with the move.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct NodeOutcome {
+    step: Option<NodeStep>,
+    status: Status,
+    gauges: Gauges,
+}
+
+/// The status a v2 node's row shows after a tick, its `drain_last_error`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum Status {
+    /// The tick has nothing to report: the row shows none.
+    #[default]
+    Clear,
+    /// The row shows this.
+    Says(String),
+    /// The row keeps what it holds: a guarded transition wrote the status
+    /// with its move this tick (the fence or what holds it, the dispatch,
+    /// the return to `drained`, the let-go's trace), the node left the
+    /// drain, a `drained` node keeps why a terminate returned it there, or
+    /// the tick acted on nothing (the row moved on since the listing,
+    /// another call held the node, the dispatch backoff isn't due).
+    Kept,
+}
+
+/// What a v2 node's report gauges read after a tick.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Gauges {
+    /// As they were.
+    #[default]
+    Kept,
+    /// What the report the tick stored leaves to do, and whether the drain
+    /// is stalled, on the draining and the terminating path alike.
+    Report {
+        rows: OutstandingRows,
+        stalled: bool,
+    },
+    /// The node didn't answer the tick's `DrainNode` call.
+    Unanswered,
+}
+
+impl Gauges {
+    /// The same gauges with the stall off: a node a refused terminate
+    /// returns to `drained` isn't draining any more, so it isn't stalled.
+    fn unstalled(self) -> Self {
+        match self {
+            Self::Report { rows, .. } => Self::Report {
+                rows,
+                stalled: false,
+            },
+            other => other,
+        }
+    }
+}
+
+impl NodeOutcome {
+    /// Nothing moved, and the row shows `status`.
+    fn says(status: impl Into<String>) -> Self {
+        Self {
+            status: Status::Says(status.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Nothing moved, and the row keeps its status.
+    fn kept() -> Self {
+        Self {
+            status: Status::Kept,
+            ..Self::default()
+        }
+    }
+
+    /// `step` moved, writing the row's status with its move.
+    fn moved(step: NodeStep) -> Self {
+        Self {
+            step: Some(step),
+            ..Self::kept()
+        }
+    }
+
+    /// The node didn't answer the tick's call: `status` says how.
+    fn unanswered(status: String) -> Self {
+        Self {
+            gauges: Gauges::Unanswered,
+            ..Self::says(status)
+        }
+    }
+
+    fn with_gauges(self, gauges: Gauges) -> Self {
+        Self { gauges, ..self }
+    }
+
+    /// `note` as the status, when the tick has nothing else to report.
+    fn or_note(self, note: Option<String>) -> Self {
+        match (self.status, note) {
+            (Status::Clear, Some(note)) => Self {
+                status: Status::Says(note),
+                ..self
+            },
+            (status, _) => Self { status, ..self },
+        }
+    }
+}
+
+/// Apply `outcome`, what `node`'s tick did: publish its gauges, and make
+/// the row's `drain_last_error` show its status. The status is written at
+/// most once per tick, only when it differs from what the listing read,
+/// and only on the row of the generation the tick listed; a status a
+/// guarded transition wrote with its move is left as it is. A status that
+/// changes is logged at WARN; one that repeats isn't, and a report's
+/// node-wide problems are warned about at most every
+/// [`BLOCKED_WARN_INTERVAL`] while they last, as the step warns about a
+/// drain with no generation or an unknown phase. Returns what moved.
+async fn apply<S: DrainV2Sink>(
+    sink: &S,
+    node: &V2Node,
+    outcome: NodeOutcome,
+    warn_pacer: &PerNodeWarnPacer,
+) -> Option<NodeStep> {
+    let label = node.id.to_string();
+    match outcome.gauges {
+        Gauges::Kept => {}
+        Gauges::Report { rows, stalled } => {
+            crate::metrics::node_drain::v2_report(
+                &label,
+                rows.blocked,
+                rows.pending,
+                rows.held,
+                stalled,
+            );
+            if rows.blocked > 0 && warn_pacer.due(node.id, "blocked") {
+                tracing::warn!(
+                    node_id = %node.id,
+                    blocked = rows.blocked,
+                    "node_drain v2: the node reports node-wide problems; the drain can't end \
+                     until they are resolved"
+                );
+            }
+        }
+        Gauges::Unanswered => crate::metrics::node_drain::v2_unanswered(&label),
+    }
+    let status = match outcome.status {
+        Status::Kept => return outcome.step,
+        Status::Clear => None,
+        Status::Says(status) => Some(status),
+    };
+    let Some(generation) = node.generation else {
+        return outcome.step;
+    };
+    if status == node.last_error {
+        return outcome.step;
+    }
+    match sink
+        .write_status(node.id, generation, status.as_deref())
+        .await
+    {
+        Ok(true) => match &status {
+            Some(status) => tracing::warn!(node_id = %node.id, status, "node_drain v2"),
+            None => tracing::info!(node_id = %node.id, "node_drain v2: nothing to report"),
+        },
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(node_id = %node.id, %error, "node_drain v2: writing the node's status failed");
+        }
+    }
+    outcome.step
+}
+
 /// One pass over every v2 node, [`NODE_CONCURRENCY`] at a time. A node the
 /// last tick listed and this one doesn't has its v2 gauges zeroed. EC2 is
 /// asked first, in one call about every instance the tick asks about: each
 /// fenced node's that the backoff lets ask and each other node's whose
-/// heartbeat is stale; each node's step reads its answer.
-/// Then the sandboxes each listed node's drain left suspended longer than
-/// the config's bound are counted.
+/// heartbeat is stale; each node's step reads its answer, and its outcome
+/// is applied ([`apply`]). Once the state's shutdown token is cancelled, a
+/// tick doesn't start, and one under way takes no new node; the steps
+/// already running go on until the controller's shutdown grace ends, which
+/// drops any still running. Then the sandboxes each listed node's drain
+/// left suspended longer than the config's bound are counted.
 pub async fn tick<S: DrainV2Sink, A: V2InstanceAuthority>(
     sink: &S,
     authority: &A,
@@ -848,6 +1100,9 @@ pub async fn tick<S: DrainV2Sink, A: V2InstanceAuthority>(
     use futures_util::StreamExt as _;
 
     let mut report = V2TickReport::default();
+    if state.shutdown.is_cancelled() {
+        return report;
+    }
     let nodes = match sink.list_v2_nodes().await {
         Ok(nodes) => nodes,
         Err(error) => {
@@ -859,8 +1114,11 @@ pub async fn tick<S: DrainV2Sink, A: V2InstanceAuthority>(
         crate::metrics::node_drain::clear_v2_gauges(&node_id.to_string());
     }
     let listed: Vec<NodeId> = nodes.iter().map(|node| node.id).collect();
+    state.warn_pacer.retain_live(&listed);
     let backoff = &state.backoff;
     let config = &state.config;
+    let warn_pacer = &state.warn_pacer;
+    let shutdown = &state.shutdown;
     backoff.retain(
         &nodes
             .iter()
@@ -905,11 +1163,19 @@ pub async fn tick<S: DrainV2Sink, A: V2InstanceAuthority>(
         let evidence = evidence.get(&node.id).cloned();
         (node, evidence)
     }))
+    .take_while(|_| std::future::ready(!shutdown.is_cancelled()))
     .map(|(node, evidence)| async move {
-        (
-            node.id,
-            step(sink, authority, &node, evidence.as_ref(), backoff, config).await,
+        let outcome = step(
+            sink,
+            authority,
+            &node,
+            evidence.as_ref(),
+            backoff,
+            config,
+            warn_pacer,
         )
+        .await;
+        (node.id, apply(sink, &node, outcome, warn_pacer).await)
     })
     .buffer_unordered(NODE_CONCURRENCY)
     .collect()
@@ -926,7 +1192,9 @@ pub async fn tick<S: DrainV2Sink, A: V2InstanceAuthority>(
             None => {}
         }
     }
-    publish_still_suspended(sink, &listed, config.still_suspended_after).await;
+    if !shutdown.is_cancelled() {
+        publish_still_suspended(sink, &listed, config.still_suspended_after).await;
+    }
     report
 }
 
@@ -970,11 +1238,14 @@ pub async fn run<S: DrainV2Sink, A: V2InstanceAuthority>(
         ?config,
         "starting the node drain's v2 loop"
     );
-    let state = V2LoopState::new(config);
+    let state = V2LoopState::with_shutdown(config, shutdown.clone());
     let mut interval = tokio::time::interval(tick_every);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            // Shutdown first: a tick longer than `tick_every` leaves the
+            // interval ready.
+            biased;
             () = shutdown.cancelled() => break,
             _ = interval.tick() => {}
         }

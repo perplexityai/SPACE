@@ -4,7 +4,18 @@
 use super::*;
 
 /// The `drain_last_error` of a `terminating` node no authority terminates.
-pub const REFUSED_TERMINATE: &str = "a v2 node is terminated only through the aws terminator (SPACE_NODE_DRAIN_TERMINATOR_KIND=aws)";
+pub const NOT_AWS_TERMINATOR: &str = "a v2 node is terminated only through the aws terminator (SPACE_NODE_DRAIN_TERMINATOR_KIND=aws)";
+
+/// How every reason a terminate returned the node to `drained` starts: the
+/// status the `drained` node then keeps until the next `:terminate` or
+/// `:undrain`, unless the controller finds the node's machine terminated
+/// and waits on it.
+pub(super) const TERMINATE_REFUSED: &str = "terminate refused";
+
+/// Why a terminate returned a node that records no EC2 instance to
+/// `drained`.
+pub(super) const NO_INSTANCE_TO_TERMINATE: &str =
+    "terminate refused: the node records no EC2 instance to terminate";
 
 /// When each fenced node is next asked about: its EC2 check, and the
 /// dispatch it may lead to, wait out a backoff that doubles from its base
@@ -109,47 +120,61 @@ impl V2Node {
 
 /// Add every row still naming a `drained` node that the terminate would
 /// release (suspended, durable, no restore or activation in flight) to its
-/// drain's `evacuated_total`: a `drain_status` write only.
-pub(super) async fn count_drained<S: DrainV2Sink>(sink: &S, node_id: NodeId, generation: u64) {
-    if let Err(error) = sink.count_drained_evacuations(node_id, generation).await {
-        sink.record_error(
-            node_id,
-            &format!("counting the drained node's durable rows evacuated failed: {error}"),
-        )
-        .await;
-    }
-}
-
-/// Run the terminate transaction of an unfenced `terminating` node whose
-/// fresh check found nothing pending or blocked.
-pub(super) async fn fence<S: DrainV2Sink>(
+/// drain's `evacuated_total`: a `drain_status` write only. `Err` with the
+/// status when the count failed.
+pub(super) async fn count_drained<S: DrainV2Sink>(
     sink: &S,
     node_id: NodeId,
     generation: u64,
-) -> Option<NodeStep> {
-    match sink.fence(node_id, generation).await {
+) -> Result<(), String> {
+    sink.count_drained_evacuations(node_id, generation)
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            format!("counting the drained node's durable rows evacuated failed: {error}")
+        })
+}
+
+/// Run the terminate transaction of an unfenced `terminating` node whose
+/// fresh check found its report finished. The transaction writes the
+/// node's status with its outcome, the fence or what holds it; a node that
+/// records no instance to terminate returns to `drained`.
+pub(super) async fn fence<S: DrainV2Sink>(sink: &S, node: &V2Node, generation: u64) -> NodeOutcome {
+    match sink.fence(node.id, generation).await {
         Ok(Fence::Fenced(instance_id)) => {
             tracing::info!(
-                node_id = %node_id,
+                node_id = %node.id,
                 instance_id,
                 "node_drain v2: fenced the node's instance for termination"
             );
-            Some(NodeStep::Fenced)
+            NodeOutcome::moved(NodeStep::Fenced)
         }
-        Ok(Fence::Held(_) | Fence::Moved) => None,
+        Ok(Fence::Held(_) | Fence::Moved) => NodeOutcome::kept(),
         Ok(Fence::NoInstance) => {
-            sink.record_error(node_id, "the node records no EC2 instance to terminate")
-                .await;
-            None
+            return_drained(sink, node, generation, NO_INSTANCE_TO_TERMINATE).await
         }
-        Err(error) => {
-            sink.record_error(
-                node_id,
-                &format!("the terminate transaction failed: {error}"),
-            )
-            .await;
-            None
+        Err(error) => NodeOutcome::says(format!("the terminate transaction failed: {error}")),
+    }
+}
+
+/// Return a `terminating` node to `drained`, recording `refused` with the
+/// move ([`DrainV2Sink::return_drained`]): the operator retries
+/// `:terminate`.
+pub(super) async fn return_drained<S: DrainV2Sink>(
+    sink: &S,
+    node: &V2Node,
+    generation: u64,
+    refused: &str,
+) -> NodeOutcome {
+    match sink.return_drained(node.id, generation, refused).await {
+        Ok(true) => {
+            tracing::warn!(node_id = %node.id, refused, "node_drain v2: returned the node to drained");
+            NodeOutcome::moved(NodeStep::Returned)
         }
+        Ok(false) => NodeOutcome::kept(),
+        Err(error) => NodeOutcome::says(format!(
+            "{refused}; returning the node to drained failed: {error}"
+        )),
     }
 }
 
@@ -163,8 +188,8 @@ pub(super) async fn fence<S: DrainV2Sink>(
 /// termination was confirmed and the Node is gone, or let the node go if it
 /// wasn't, the node's heartbeat is stale and the machine EC2 answered about
 /// is the registered one ([`unregistered_machine`]). Every path that waits
-/// defers the next check from the clock after the calls it waited on; the
-/// status it then records isn't counted.
+/// defers the next check from the clock after the calls it waited on, and
+/// its outcome says what it waits for.
 #[expect(
     clippy::too_many_arguments,
     reason = "the node, its fence and EC2's answer, and the loop's backoff and bounds"
@@ -178,22 +203,23 @@ pub(super) async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthorit
     evidence: &InstanceEvidence,
     backoff: &DispatchBackoff,
     config: &V2LoopConfig,
-) -> Option<NodeStep> {
+) -> NodeOutcome {
+    // Defer the node's next check, and say why it waits.
+    let waits = |why: String| {
+        backoff.defer(node.id, Instant::now());
+        NodeOutcome::says(why)
+    };
     if *evidence == InstanceEvidence::Terminated && node.terminated_observed_at.is_none() {
         match sink
             .record_terminated_observed(node.id, generation, fence)
             .await
         {
             Ok(true) => {}
-            Ok(false) => return None,
+            Ok(false) => return NodeOutcome::kept(),
             Err(error) => {
-                backoff.defer(node.id, Instant::now());
-                sink.record_error(
-                    node.id,
-                    &format!("recording that {fence} is terminated failed: {error}"),
-                )
-                .await;
-                return None;
+                return waits(format!(
+                    "recording that {fence} is terminated failed: {error}"
+                ));
             }
         }
     }
@@ -205,38 +231,27 @@ pub(super) async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthorit
     if !node.dispatched() {
         if terminated {
             if node.heartbeat_fresh {
-                backoff.defer(node.id, Instant::now());
-                sink.record_error(
-                    node.id,
-                    &format!(
-                        "fenced instance {fence} is terminated, but the node's heartbeat is \
-                         fresh; not letting it go"
-                    ),
-                )
-                .await;
-                return None;
+                return waits(format!(
+                    "fenced instance {fence} is terminated, but the node's heartbeat is fresh; \
+                     not letting it go"
+                ));
             }
             if let Some(why) = unregistered_machine(sink, node, fence).await {
-                backoff.defer(node.id, Instant::now());
-                sink.record_error(
-                    node.id,
-                    &format!("fenced instance {fence} is terminated, but {why}; not letting it go"),
-                )
-                .await;
-                return None;
+                return waits(format!(
+                    "fenced instance {fence} is terminated, but {why}; not letting it go"
+                ));
             }
             let trace = format!(
                 "v2 drain let go: fenced instance {fence} terminated; dispatch unconfirmed"
             );
-            let gone = let_go(sink, node, generation, &trace).await;
-            if !gone {
+            let outcome = let_go(sink, node, generation, &trace).await;
+            if outcome.step.is_none() {
                 backoff.defer(node.id, Instant::now());
             }
-            return gone.then_some(NodeStep::LetGo);
+            return outcome;
         }
         let InstanceEvidence::Listed(_) = evidence else {
-            backoff.defer(node.id, Instant::now());
-            let why = if *evidence == InstanceEvidence::NotListed {
+            return waits(if *evidence == InstanceEvidence::NotListed {
                 format!(
                     "EC2 does not list fenced instance {fence}, and was never seen to list it \
                      terminated; not dispatching its termination"
@@ -246,118 +261,83 @@ pub(super) async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthorit
                     "EC2 answers {evidence} for fenced instance {fence}; not dispatching its \
                      termination"
                 )
-            };
-            sink.record_error(node.id, &why).await;
-            return None;
+            });
         };
         let dispatched = authority
             .terminate_instance(fence, node.decrement_capacity)
             .await;
         backoff.defer(node.id, Instant::now());
         return match dispatched {
+            // The dispatch's record clears the status with its write.
             Ok(()) => match sink.record_dispatched(node.id, generation, fence).await {
-                Ok(recorded) => {
-                    if recorded {
-                        tracing::info!(
-                            node_id = %node.id,
-                            instance_id = fence,
-                            "node_drain v2: Auto Scaling accepted the fenced instance's termination"
-                        );
-                    }
-                    recorded.then_some(NodeStep::Dispatched)
+                Ok(true) => {
+                    tracing::info!(
+                        node_id = %node.id,
+                        instance_id = fence,
+                        "node_drain v2: Auto Scaling accepted the fenced instance's termination"
+                    );
+                    NodeOutcome::moved(NodeStep::Dispatched)
                 }
+                Ok(false) => NodeOutcome::kept(),
                 Err(error) => {
-                    sink.record_error(
-                        node.id,
-                        &format!("recording the dispatch of {fence} failed: {error}"),
-                    )
-                    .await;
-                    None
+                    NodeOutcome::says(format!("recording the dispatch of {fence} failed: {error}"))
                 }
             },
             Err(error) => {
                 crate::metrics::node_drain::v2_terminate_failure(&node.id.to_string());
-                sink.record_error(
-                    node.id,
-                    &format!("terminating fenced instance {fence} failed: {error}"),
-                )
-                .await;
-                None
+                NodeOutcome::says(format!(
+                    "terminating fenced instance {fence} failed: {error}"
+                ))
             }
         };
     }
     if !terminated {
-        backoff.defer(node.id, Instant::now());
         // By the database clock the dispatch was recorded on.
         let elapsed = node
             .dispatched_at
             .map(|dispatched_at| node.db_now.saturating_sub(dispatched_at));
         let bound = i64::try_from(config.terminate_bound.as_secs()).unwrap_or(i64::MAX);
-        if *evidence == InstanceEvidence::NotListed {
-            sink.record_error(
-                node.id,
-                &format!(
-                    "EC2 does not list fenced instance {fence}, and was never seen to list it \
-                     terminated; not deleting the row"
-                ),
-            )
-            .await;
+        let why = if *evidence == InstanceEvidence::NotListed {
+            Some(format!(
+                "EC2 does not list fenced instance {fence}, and was never seen to list it \
+                 terminated; not deleting the row"
+            ))
         } else if let InstanceEvidence::Unknown(_) = evidence {
             // No answer says nothing about the machine, however long ago the
             // dispatch was: say so on every check, not only past the bound.
-            let since = elapsed.map_or_else(String::new, |elapsed| {
-                format!(" {} minutes ago", elapsed / 60)
-            });
-            sink.record_error(
-                node.id,
-                &format!(
-                    "the termination of fenced instance {fence} was dispatched{since}; EC2 \
-                     answers {evidence}, so the drain can't tell whether it is terminated; \
-                     not deleting the row"
-                ),
-            )
-            .await;
-        } else if let Some(elapsed) = elapsed.filter(|elapsed| *elapsed >= bound) {
-            sink.record_error(
-                node.id,
-                &format!(
+            // The status names no age, so it changes only with the situation:
+            // `drain_status.dispatched_at` carries the time.
+            Some(format!(
+                "the termination of fenced instance {fence} was dispatched; EC2 answers \
+                 {evidence}, so the drain can't tell whether it is terminated; not deleting the \
+                 row"
+            ))
+        } else {
+            elapsed.filter(|elapsed| *elapsed >= bound).map(|_| {
+                format!(
                     "Auto Scaling accepted the termination of {fence}; EC2 still answers \
-                     {evidence} after {} minutes",
-                    elapsed / 60
-                ),
-            )
-            .await;
-        }
-        return None;
+                     {evidence} past the terminate bound"
+                )
+            })
+        };
+        backoff.defer(node.id, Instant::now());
+        return why.map_or_else(NodeOutcome::default, NodeOutcome::says);
     }
     let Some(node_name) = node.k8s_node_name.as_deref() else {
-        backoff.defer(node.id, Instant::now());
-        sink.record_error(node.id, "the node has no Kubernetes name to look up")
-            .await;
-        return None;
+        return waits("the node has no Kubernetes name to look up".to_owned());
     };
     match sink.node_exists(node_name).await {
         Ok(false) => {}
         Ok(true) => {
-            backoff.defer(node.id, Instant::now());
-            sink.record_error(
-                node.id,
-                &format!(
-                    "fenced instance {fence} is terminated; waiting for its Kubernetes Node \
-                     {node_name} to go"
-                ),
-            )
-            .await;
-            return None;
+            return waits(format!(
+                "fenced instance {fence} is terminated; waiting for its Kubernetes Node \
+                 {node_name} to go"
+            ));
         }
         Err(error) => {
-            backoff.defer(node.id, Instant::now());
-            sink.record_error(
-                node.id,
-                &format!("looking up the Kubernetes Node {node_name} failed: {error}"),
-            )
-            .await;
-            return None;
+            return waits(format!(
+                "looking up the Kubernetes Node {node_name} failed: {error}"
+            ));
         }
     }
     match sink.delete_terminated(node, generation, fence).await {
@@ -369,37 +349,24 @@ pub(super) async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthorit
                 instance_id = fence,
                 "node_drain v2: deleted the row of the node whose instance it terminated"
             );
-            Some(NodeStep::Deleted)
+            NodeOutcome::moved(NodeStep::Deleted)
         }
         Ok(TerminatedDelete::LetGo(trace)) => {
             crate::metrics::node_drain::clear_v2_gauges(&node.id.to_string());
             crate::metrics::node_drain::v2_let_go("guard_refused");
             tracing::warn!(node_id = %node.id, trace, "node_drain v2: let the node go");
-            Some(NodeStep::LetGo)
+            NodeOutcome::moved(NodeStep::LetGo)
         }
-        Ok(TerminatedDelete::Unfenced) => None,
-        Ok(TerminatedDelete::Wait(why)) => {
-            backoff.defer(node.id, Instant::now());
-            sink.record_error(
-                node.id,
-                &format!("fenced instance {fence} is terminated; not deleting the row yet: {why}"),
-            )
-            .await;
-            None
-        }
-        Err(error) => {
-            backoff.defer(node.id, Instant::now());
-            sink.record_error(
-                node.id,
-                &format!("deleting the terminated node's row failed: {error}"),
-            )
-            .await;
-            None
-        }
+        Ok(TerminatedDelete::Unfenced) => NodeOutcome::kept(),
+        Ok(TerminatedDelete::Wait(why)) => waits(format!(
+            "fenced instance {fence} is terminated; not deleting the row yet: {why}"
+        )),
+        Err(error) => waits(format!(
+            "deleting the terminated node's row failed: {error}"
+        )),
     }
 }
 
-/// Let `node` go, recording `trace`. Returns whether the row was cleared.
 /// Why the machine EC2 answered about as `instance` can't be taken for the
 /// one the node registered, if it can't. The drain lets a node go on EC2's
 /// `terminated` only when its Kubernetes Node is gone, or when the Node's
@@ -432,12 +399,14 @@ pub(super) async fn unregistered_machine<S: DrainV2Sink>(
     }
 }
 
+/// Let `node` go, recording `trace` with the move: `LetGo` once the row is
+/// cleared, nothing when it moved on.
 pub(super) async fn let_go<S: DrainV2Sink>(
     sink: &S,
     node: &V2Node,
     generation: u64,
     trace: &str,
-) -> bool {
+) -> NodeOutcome {
     match sink.let_go(node, generation, trace).await {
         Ok(true) => {
             crate::metrics::node_drain::clear_v2_gauges(&node.id.to_string());
@@ -447,13 +416,9 @@ pub(super) async fn let_go<S: DrainV2Sink>(
                 "terminated_outside_the_drain"
             });
             tracing::warn!(node_id = %node.id, trace, "node_drain v2: let the node go");
-            true
+            NodeOutcome::moved(NodeStep::LetGo)
         }
-        Ok(false) => false,
-        Err(error) => {
-            sink.record_error(node.id, &format!("letting the node go failed: {error}"))
-                .await;
-            false
-        }
+        Ok(false) => NodeOutcome::kept(),
+        Err(error) => NodeOutcome::says(format!("letting the node go failed: {error}")),
     }
 }

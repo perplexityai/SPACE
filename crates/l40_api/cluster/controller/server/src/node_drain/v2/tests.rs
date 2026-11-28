@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use pplx_space_node_registration_store::drain_v2::{StoredV2ArtifactKind, StoredV2Wait};
+use pplx_space_node_registration_store::drain_v2::{
+    StoredV2ArtifactKind, StoredV2Evacuated, StoredV2Wait,
+};
 use pplx_space_sbx_mgr_client::proto::{
     CancelResult, DrainBlocked, DrainEvacuated, DrainPending, DrainReport, DrainWait,
     drain_node_response,
@@ -64,6 +66,14 @@ struct FakeSink {
     registered_uid: Mutex<HashMap<NodeId, String>>,
     /// When set, each Node GET takes this long.
     node_lookup_takes: Option<Duration>,
+    /// When set, the drained count fails with this.
+    count_error: Option<String>,
+    /// When set, each `DrainNode` call reports its arrival on the sender,
+    /// then waits for a permit of the semaphore.
+    call_gate: Option<(
+        tokio::sync::mpsc::UnboundedSender<NodeId>,
+        std::sync::Arc<tokio::sync::Semaphore>,
+    )>,
 }
 
 impl FakeSink {
@@ -138,6 +148,14 @@ impl DrainV2Sink for FakeSink {
             return Err(DrainCallError::moved());
         }
         let node_id = node.id;
+        if let Some((arrived, permits)) = &self.call_gate {
+            let _ = arrived.send(node_id);
+            permits
+                .acquire()
+                .await
+                .expect("the gate stays open")
+                .forget();
+        }
         self.requests.lock().unwrap().push(request);
         let cancel = matches!(request.op, Some(drain_node_request::Op::Cancel(_)));
         self.log(format!(
@@ -223,8 +241,17 @@ impl DrainV2Sink for FakeSink {
         Ok(self.still_suspended.clone())
     }
 
-    async fn record_error(&self, node_id: NodeId, message: &str) {
-        self.log(format!("error {node_id} {message}"));
+    async fn write_status(
+        &self,
+        node_id: NodeId,
+        generation: u64,
+        status: Option<&str>,
+    ) -> Result<bool, String> {
+        self.log(match status {
+            Some(status) => format!("error {node_id} {status}"),
+            None => format!("clear {node_id} {generation}"),
+        });
+        Ok(true)
     }
 
     async fn count_drained_evacuations(
@@ -233,7 +260,7 @@ impl DrainV2Sink for FakeSink {
         generation: u64,
     ) -> Result<Vec<SandboxId>, String> {
         self.log(format!("count_drained {node_id} {generation}"));
-        Ok(Vec::new())
+        self.count_error.clone().map_or(Ok(Vec::new()), Err)
     }
 
     async fn fence(&self, node_id: NodeId, generation: u64) -> Result<Fence, String> {
@@ -418,6 +445,7 @@ fn node(phase: Option<&str>, generation: Option<u64>) -> V2Node {
         dispatched_at: None,
         terminated_observed_at: None,
         decrement_capacity: false,
+        last_error: None,
         db_now: DB_NOW,
     }
 }
@@ -739,7 +767,7 @@ async fn the_loop_owns_persisted_drains_without_terminating() {
     assert!(report.fenced.is_empty());
     let calls = sink.calls();
     assert!(
-        calls.contains(&format!("error {} {REFUSED_TERMINATE}", terminating.id)),
+        calls.contains(&format!("error {} {NOT_AWS_TERMINATOR}", terminating.id)),
         "{calls:?}"
     );
     assert!(
@@ -976,7 +1004,7 @@ async fn a_terminating_node_fences_only_on_a_fresh_empty_report() {
             refusal(tonic::Status::aborted("in progress")),
             None,
             false,
-            Some("terminate refused: DrainNode failed: another DrainNode call is in progress"),
+            None,
             None,
         ),
         (
@@ -1041,6 +1069,20 @@ async fn a_terminating_node_fences_only_on_a_fresh_empty_report() {
                     "{case}: {calls:?}"
                 );
                 assert!(!calls.contains(&fenced_call), "{case}: {calls:?}");
+            }
+            // Another call held the node's slot and changed nothing: the
+            // node stays terminating, its status saying so, and the next
+            // tick checks again.
+            None if case == "aborted" => {
+                assert!(!calls.contains(&fenced_call), "{case}: {calls:?}");
+                assert!(!called(&sink, "return", &terminating), "{case}: {calls:?}");
+                assert!(
+                    calls.contains(&format!(
+                        "error {} {TERMINATE_WAITS_FOR_A_CALL}",
+                        terminating.id
+                    )),
+                    "{case}: {calls:?}"
+                );
             }
             None => {
                 assert!(calls.contains(&fenced_call), "{case}: {calls:?}");
@@ -1125,7 +1167,7 @@ async fn a_terminating_node_waits_without_a_terminating_authority() {
         [format!(
             "error {} {}",
             terminating.id,
-            super::cleanup::REFUSED_TERMINATE
+            super::cleanup::NOT_AWS_TERMINATOR
         )]
     );
 }
@@ -1330,7 +1372,8 @@ async fn an_unlisted_instance_after_a_recorded_terminated_reads_terminated() {
 /// Once `dispatched_at` is recorded the loop never dispatches again,
 /// whatever EC2 answers; past the bound it says the termination was
 /// accepted and the instance still runs. No answer from EC2 is said on
-/// every check, with the dispatch's age.
+/// every check. Neither names the dispatch's age, so the status changes
+/// only with the situation.
 #[tokio::test]
 async fn a_dispatched_node_is_never_dispatched_again() {
     let bound = V2LoopConfig::default().terminate_bound;
@@ -1343,19 +1386,19 @@ async fn a_dispatched_node_is_never_dispatched_again() {
             "past the bound",
             past_bound,
             running(),
-            Some("EC2 still answers running after 16 minutes"),
+            Some("EC2 still answers running past the terminate bound"),
         ),
         (
             "just dispatched, no answer",
             DB_NOW,
             unknown(),
-            Some("was dispatched 0 minutes ago; EC2 answers unknown (the EC2 call timed out)"),
+            Some("was dispatched; EC2 answers unknown (the EC2 call timed out)"),
         ),
         (
             "past the bound, no answer",
             past_bound,
             unknown(),
-            Some("was dispatched 16 minutes ago; EC2 answers unknown"),
+            Some("was dispatched; EC2 answers unknown"),
         ),
     ] {
         let node = V2Node {
@@ -1597,8 +1640,9 @@ async fn a_dispatched_node_is_deleted_once_terminated_with_its_node_gone() {
 /// with a trace naming it, recorded first (`terminated_observed_at`), and
 /// the node is called for nothing; so does an unlisted instance once the
 /// drain recorded it `terminated`. An unlisted one never seen `terminated`
-/// isn't death, and any other answer only records what EC2 said, after
-/// which the state's own step runs. A fresh heartbeat asks EC2 nothing.
+/// isn't death, and with any other answer the state's own step runs; what
+/// EC2 said is the node's status when that step has nothing else to report.
+/// A fresh heartbeat asks EC2 nothing.
 #[tokio::test]
 async fn every_unfenced_v2_state_lets_go_once_ec2_says_terminated() {
     type Build = fn() -> V2Node;
@@ -1694,7 +1738,10 @@ async fn every_unfenced_v2_state_lets_go_once_ec2_says_terminated() {
             );
             assert_eq!(
                 sink.calls().iter().any(|call| call.contains("EC2 answers")),
-                evidence.is_some() && !lets_go,
+                // The drained step alone has nothing else to report here:
+                // the others' calls are unscripted, and the terminate
+                // returns the node with its own reason.
+                evidence.is_some() && !lets_go && state == "drained",
                 "{case}: {:?}",
                 sink.calls()
             );
@@ -1878,12 +1925,14 @@ fn the_stored_report_names_the_evacuations_not_yet_recorded() {
             now: 1_060,
         },
         1_000,
+        Some(990),
     );
     assert_eq!(
         serde_json::to_value(&stored).unwrap(),
         serde_json::json!({
             "reported_at": 1_060,
             "evacuated_grew_at": 1_000,
+            "evacuate_asked_at": 990,
             "evacuated": [
                 {"sandbox_id": "a", "artifact_kind": "full", "artifact_id": "artifact"},
                 {"sandbox_id": "b", "artifact_kind": "full", "artifact_id": "artifact"},
@@ -2190,7 +2239,8 @@ async fn a_tick_with_no_v2_node_counts_nothing() {
 }
 
 /// The gauges count each row once: a row the node reports twice pending is
-/// one pending row, a held row with work started for it is pending, and an
+/// one pending row, a held row with another artifact's upload started for it
+/// is pending, and an
 /// unrecorded evacuation is pending. `blocked` counts the node-wide
 /// problems.
 #[test]
@@ -2232,73 +2282,106 @@ const MINUTE: i64 = 60;
 const HOUR: i64 = 60 * MINUTE;
 const DAY: i64 = 24 * HOUR;
 
-/// Before its deadline a drain is never stalled, however long its node has
-/// evacuated nothing. Past it, a drain that isn't finished stalls once
-/// nothing more has been evacuated for the bound, counted from the later of
-/// the set's last growth and the deadline. A finished drain never stalls,
-/// and one without a deadline counts from the last growth.
+/// A drain is stalled once it evacuates, its report isn't finished, and the
+/// set its node reports evacuated hasn't grown for the bound since the
+/// later of its last growth and the first evacuating tick whose report the
+/// loop stored. A drain that holds never is. A report without the stamp,
+/// stored while the drain held or by a controller from before the stamp,
+/// starts the clock at the first evacuating tick, so a hold shortened into
+/// the past doesn't stall at once.
 #[test]
-fn a_drain_stalls_only_past_its_deadline_with_nothing_evacuated_for_the_bound() {
+fn a_drain_stalls_only_once_evacuating_with_nothing_evacuated_for_the_bound() {
     let bound = V2LoopConfig::default().stall_bound;
-    for (case, finished, deadline, grew_at, stalls) in [
+    // (case, evacuates, the stored report's grew-at and asked-at stamps or
+    // none stored, the deadline, finished, stalls)
+    for (case, evacuate, stored, deadline, finished, stalls) in [
         (
-            "holding a day before the deadline",
+            "holding, a day since it grew",
             false,
-            Some(DB_NOW + 1),
-            DB_NOW - DAY,
+            Some((DB_NOW - DAY, None)),
+            DB_NOW + 1,
+            false,
             false,
         ),
         (
-            "14 minutes past the deadline",
-            false,
-            Some(DB_NOW - 14 * MINUTE),
+            "asked 14 minutes ago",
+            true,
+            Some((DB_NOW - DAY, Some(DB_NOW - 14 * MINUTE))),
             DB_NOW - DAY,
+            false,
             false,
         ),
         (
-            "15 minutes past the deadline",
-            false,
-            Some(DB_NOW - 15 * MINUTE),
+            "asked 15 minutes ago",
+            true,
+            Some((DB_NOW - DAY, Some(DB_NOW - 15 * MINUTE))),
             DB_NOW - DAY,
+            false,
             true,
         ),
         (
-            "grew 14 minutes ago, past the deadline",
-            false,
-            Some(DB_NOW - HOUR),
-            DB_NOW - 14 * MINUTE,
-            false,
-        ),
-        (
-            "grew 15 minutes ago, past the deadline",
-            false,
-            Some(DB_NOW - HOUR),
-            DB_NOW - 15 * MINUTE,
+            "grew 14 minutes ago, asked an hour ago",
             true,
-        ),
-        (
-            "finished, an hour past the deadline",
-            true,
-            Some(DB_NOW - HOUR),
+            Some((DB_NOW - 14 * MINUTE, Some(DB_NOW - HOUR))),
             DB_NOW - DAY,
             false,
+            false,
         ),
         (
-            "no deadline, grew 14 minutes ago",
+            "grew 15 minutes ago, asked an hour ago",
+            true,
+            Some((DB_NOW - 15 * MINUTE, Some(DB_NOW - HOUR))),
+            DB_NOW - DAY,
             false,
+            true,
+        ),
+        (
+            "finished, asked an hour ago",
+            true,
+            Some((DB_NOW - DAY, Some(DB_NOW - HOUR))),
+            DB_NOW - DAY,
+            true,
+            false,
+        ),
+        (
+            "a hold shortened a day into the past, first evacuating tick",
+            true,
+            Some((DB_NOW - DAY, None)),
+            DB_NOW - DAY,
+            false,
+            false,
+        ),
+        (
+            "no report stored yet, deadline a day ago",
+            true,
             None,
-            DB_NOW - 14 * MINUTE,
+            DB_NOW - DAY,
+            false,
             false,
         ),
         (
-            "no deadline, grew 15 minutes ago",
-            false,
-            None,
-            DB_NOW - 15 * MINUTE,
+            "a report without the stamp, an hour past the deadline",
             true,
+            Some((DB_NOW - DAY, None)),
+            DB_NOW - HOUR,
+            false,
+            false,
         ),
     ] {
-        let stall = stalled(finished, deadline, grew_at, DB_NOW, bound, 2, 1);
+        let node = V2Node {
+            evacuate,
+            deadline_at: Some(deadline),
+            report: stored.map(|(evacuated_grew_at, evacuate_asked_at)| StoredV2Report {
+                reported_at: DB_NOW - DAY,
+                evacuated_grew_at,
+                evacuate_asked_at,
+                ..StoredV2Report::default()
+            }),
+            ..node(Some("draining"), Some(5))
+        };
+        // Nothing new evacuated.
+        let grew_at = evacuated_grew_at(&node, &DrainReport::default());
+        let stall = stalled(finished, node.evacuate, grew_at, DB_NOW, bound, 2, 1);
         assert_eq!(stall.is_some(), stalls, "{case}");
         if let Some(stall) = stall {
             assert!(
@@ -2311,8 +2394,8 @@ fn a_drain_stalls_only_past_its_deadline_with_nothing_evacuated_for_the_bound() 
     // A shorter bound, as the test hook sets it, stalls sooner.
     let stall = stalled(
         false,
-        Some(DB_NOW - 30),
-        DB_NOW - DAY,
+        true,
+        DB_NOW - 30,
         DB_NOW,
         Duration::from_secs(30),
         0,
@@ -2327,10 +2410,12 @@ fn a_drain_stalls_only_past_its_deadline_with_nothing_evacuated_for_the_bound() 
 /// The stall clock a report stores, which is what the next tick, by a
 /// controller that restarted in between, reads back: a drain past its
 /// deadline whose node reports no new evacuation stalls 15 minutes after
-/// the deadline under another controller, and stays stalled; a report
-/// naming a new evacuation clears it and starts the clock again. A hold
-/// before the deadline is never stalled. The stall is in `drain_last_error`;
-/// the stored stamp plus the bound is when it began.
+/// the first tick that asked it to evacuate under another controller, and
+/// stays stalled; a report naming a new evacuation clears it and starts the
+/// clock again. A hold before the deadline is never stalled, and a hold
+/// shortened into the past starts the clock at its first evacuating tick.
+/// The stall is in `drain_last_error`; the stored stamp plus the bound is
+/// when it began.
 #[tokio::test(flavor = "current_thread")]
 async fn the_stall_clock_survives_a_controller_restart() {
     let deadline = DB_NOW + HOUR;
@@ -2358,6 +2443,9 @@ async fn the_stall_clock_survives_a_controller_restart() {
     let mut stored = first.stored();
     assert_eq!(stored.evacuated_grew_at, DB_NOW);
 
+    assert_eq!(stored.evacuate_asked_at, None, "holding");
+    // The first tick that asks the node to evacuate.
+    let asked = deadline + MINUTE;
     for (case, at, evacuated_ids, grew_at, stalls) in [
         (
             "holding until just before the deadline",
@@ -2366,25 +2454,26 @@ async fn the_stall_clock_survives_a_controller_restart() {
             DB_NOW,
             false,
         ),
+        ("the first evacuating tick", asked, &["a"][..], asked, false),
         (
-            "14 minutes past the deadline",
-            deadline + 14 * MINUTE,
+            "14 minutes after it",
+            asked + 14 * MINUTE,
             &["a"][..],
-            deadline,
+            asked,
             false,
         ),
         (
-            "15 minutes past the deadline",
-            deadline + 15 * MINUTE,
+            "15 minutes after it",
+            asked + 15 * MINUTE,
             &["a"][..],
-            deadline,
+            asked,
             true,
         ),
         (
             "still nothing new, later",
             deadline + HOUR,
             &["a"][..],
-            deadline,
+            asked,
             true,
         ),
         (
@@ -2417,6 +2506,9 @@ async fn the_stall_clock_survives_a_controller_restart() {
         run_tick(&next, &FakeAuthority::ok()).await;
         stored = next.stored();
         assert_eq!(stored.evacuated_grew_at, grew_at, "{case}");
+        if at >= deadline {
+            assert_eq!(stored.evacuate_asked_at, Some(asked), "{case}");
+        }
         assert_eq!(
             next.calls().iter().any(
                 |call| call.starts_with(&format!("error {} the drain is stalled", relisted.id))
@@ -2490,7 +2582,11 @@ async fn a_registration_replaced_after_the_listing_gets_no_effect() {
         ("terminating", Some("terminating")),
         ("cancel", None),
     ] {
-        let target = node(phase, Some(5));
+        // An earlier status, which a tick that acted on nothing keeps.
+        let target = V2Node {
+            last_error: Some("an earlier status".to_owned()),
+            ..node(phase, Some(5))
+        };
         let sink = FakeSink {
             nodes: vec![target.clone()],
             responses: HashMap::from([
@@ -2510,6 +2606,7 @@ async fn a_registration_replaced_after_the_listing_gets_no_effect() {
             "finish_cancel",
             "count_drained",
             "error",
+            "clear",
             "return",
             "fence",
         ] {
@@ -2533,7 +2630,11 @@ async fn a_registration_replaced_after_the_cordon_gets_no_further_effect() {
         ("terminating", Some("terminating")),
         ("cancel", None),
     ] {
-        let target = node(phase, Some(5));
+        // An earlier status, which a tick that acted on nothing keeps.
+        let target = V2Node {
+            last_error: Some("an earlier status".to_owned()),
+            ..node(phase, Some(5))
+        };
         let sink = FakeSink {
             nodes: vec![target.clone()],
             responses: HashMap::from([
@@ -2552,6 +2653,7 @@ async fn a_registration_replaced_after_the_cordon_gets_no_further_effect() {
             "drain_node",
             "finish_cancel",
             "error",
+            "clear",
             "report",
             "return",
             "fence",
@@ -2704,4 +2806,481 @@ async fn a_backoff_counts_from_after_the_calls_it_waited_on() {
     tokio::time::advance(config.dispatch_backoff_base).await;
     tick(&sink, &authority, &state).await;
     assert_eq!(authority.described().len(), 2, "the backoff ran out");
+}
+
+/// The status writes of `node` this tick, in order: `Some(text)` for a
+/// status, `None` for a clear.
+fn status_writes(sink: &FakeSink, node: &V2Node) -> Vec<Option<String>> {
+    sink.calls()
+        .iter()
+        .filter_map(|call| {
+            if let Some(text) = call.strip_prefix(&format!("error {} ", node.id)) {
+                Some(Some(text.to_owned()))
+            } else {
+                call.starts_with(&format!("clear {} ", node.id))
+                    .then_some(None)
+            }
+        })
+        .collect()
+}
+
+/// The tick writes a node's status at most once, from its outcome: nothing
+/// when it reads what the row holds already, once when it changes (the
+/// stall wins over a cordon error, with no clear between them), a clear
+/// when the tick has nothing to report, and nothing over a status a guarded
+/// transition wrote with its move this tick.
+#[tokio::test]
+async fn a_tick_writes_a_nodes_status_once_and_only_when_it_changes() {
+    const UNANSWERED: &str = "DrainNode failed: unscripted";
+    let stalled_report = || {
+        Ok(answer(
+            5,
+            DrainReport {
+                pending: vec![pending("c", DrainWait::Moving)],
+                ..DrainReport::default()
+            },
+        ))
+    };
+    let stale_report = |since: i64| StoredV2Report {
+        reported_at: since,
+        evacuated_grew_at: since,
+        evacuate_asked_at: Some(since),
+        ..StoredV2Report::default()
+    };
+    // (case, node, the answer to its drain call, its cordon's failure, the
+    // writes expected)
+    type Case = (
+        &'static str,
+        V2Node,
+        Option<Result<DrainNodeResponse, String>>,
+        Option<CordonFailure>,
+        Vec<Option<String>>,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "unchanged",
+            V2Node {
+                last_error: Some(UNANSWERED.to_owned()),
+                ..node(Some("draining"), Some(5))
+            },
+            None,
+            None,
+            vec![],
+        ),
+        (
+            "changed",
+            V2Node {
+                last_error: Some("an older status".to_owned()),
+                ..node(Some("draining"), Some(5))
+            },
+            None,
+            None,
+            vec![Some(UNANSWERED.to_owned())],
+        ),
+        (
+            "stalled, with a cordon error",
+            V2Node {
+                report: Some(stale_report(DB_NOW - HOUR)),
+                ..node(Some("draining"), Some(5))
+            },
+            Some(stalled_report()),
+            Some(CordonFailure::Other("the API server timed out".to_owned())),
+            vec![Some(
+                "the drain is stalled: no sandbox evacuated for over 15 minutes past its \
+                 deadline (1 pending, 0 blocked)"
+                    .to_owned(),
+            )],
+        ),
+        (
+            "nothing to report",
+            V2Node {
+                last_error: Some(UNANSWERED.to_owned()),
+                ..node(Some("draining"), Some(5))
+            },
+            Some(Ok(response(5, &[]))),
+            None,
+            vec![None],
+        ),
+        (
+            "a terminate's refusal, written with its move",
+            V2Node {
+                last_error: Some("an older status".to_owned()),
+                ..node(Some("terminating"), Some(5))
+            },
+            Some(stalled_report()),
+            None,
+            vec![],
+        ),
+    ];
+    for (case, target, answer, cordon_error, writes) in cases {
+        let sink = FakeSink {
+            nodes: vec![target.clone()],
+            responses: answer
+                .map(|answer| HashMap::from([((target.id, false), answer)]))
+                .unwrap_or_default(),
+            cordon_error,
+            ..FakeSink::default()
+        };
+        run_tick(&sink, &FakeAuthority::ok()).await;
+        assert_eq!(
+            status_writes(&sink, &target),
+            writes,
+            "{case}: {:?}",
+            sink.calls()
+        );
+    }
+}
+
+/// A drained node shows a failed count, and the next tick whose count
+/// succeeds clears it. Why a terminate returned it to drained stays: a
+/// tick whose count fails doesn't replace it, and the next good tick keeps
+/// it.
+#[tokio::test]
+async fn a_drained_nodes_error_clears_once_its_tick_succeeds() {
+    const FAILED: &str = "counting the drained node's durable rows evacuated failed: timeout";
+    let drained = node(Some("drained"), Some(5));
+    let failing = FakeSink {
+        nodes: vec![drained.clone()],
+        count_error: Some("timeout".to_owned()),
+        ..FakeSink::default()
+    };
+    run_tick(&failing, &FakeAuthority::ok()).await;
+    assert_eq!(status_writes(&failing, &drained), [Some(FAILED.to_owned())]);
+
+    let showing = V2Node {
+        last_error: Some(FAILED.to_owned()),
+        ..drained.clone()
+    };
+    let succeeding = FakeSink {
+        nodes: vec![showing.clone()],
+        ..FakeSink::default()
+    };
+    run_tick(&succeeding, &FakeAuthority::ok()).await;
+    assert_eq!(status_writes(&succeeding, &showing), [None]);
+
+    let returned = V2Node {
+        last_error: Some(NO_INSTANCE_TO_TERMINATE.to_owned()),
+        ..drained
+    };
+    let refused_and_failing = FakeSink {
+        nodes: vec![returned.clone()],
+        count_error: Some("timeout".to_owned()),
+        ..FakeSink::default()
+    };
+    run_tick(&refused_and_failing, &FakeAuthority::ok()).await;
+    assert!(
+        status_writes(&refused_and_failing, &returned).is_empty(),
+        "{:?}",
+        refused_and_failing.calls()
+    );
+    let keeping = FakeSink {
+        nodes: vec![returned.clone()],
+        ..FakeSink::default()
+    };
+    run_tick(&keeping, &FakeAuthority::ok()).await;
+    assert!(
+        status_writes(&keeping, &returned).is_empty(),
+        "{:?}",
+        keeping.calls()
+    );
+}
+
+/// A terminating node that records no instance to terminate returns to
+/// drained with that reason, without a call, once: the next tick finds it
+/// drained, keeps the reason and doesn't return it again. A terminate
+/// transaction that finds no instance returns it the same way.
+#[tokio::test]
+async fn a_terminate_with_no_instance_returns_to_drained_once() {
+    let terminating = V2Node {
+        instance_id: None,
+        ..node(Some("terminating"), Some(5))
+    };
+    let sink = FakeSink {
+        nodes: vec![terminating.clone()],
+        ..FakeSink::default()
+    };
+    let report = run_tick(&sink, &FakeAuthority::ok()).await;
+    assert_eq!(report.returned, [terminating.id]);
+    assert_eq!(
+        sink.calls(),
+        [format!(
+            "return {} 5 {NO_INSTANCE_TO_TERMINATE}",
+            terminating.id
+        )]
+    );
+
+    let returned = V2Node {
+        phase: Some("drained".to_owned()),
+        last_error: Some(NO_INSTANCE_TO_TERMINATE.to_owned()),
+        ..terminating
+    };
+    let next = FakeSink {
+        nodes: vec![returned.clone()],
+        ..FakeSink::default()
+    };
+    let report = run_tick(&next, &FakeAuthority::ok()).await;
+    assert_eq!(report, V2TickReport::default());
+    assert!(!called(&next, "return", &returned), "{:?}", next.calls());
+    assert!(
+        status_writes(&next, &returned).is_empty(),
+        "{:?}",
+        next.calls()
+    );
+
+    let found_none = node(Some("terminating"), Some(5));
+    let sink = FakeSink {
+        nodes: vec![found_none.clone()],
+        responses: HashMap::from([((found_none.id, false), Ok(response(5, &[])))]),
+        fence: Some(Fence::NoInstance),
+        ..FakeSink::default()
+    };
+    let report = run_tick(&sink, &FakeAuthority::ok()).await;
+    assert_eq!(report.returned, [found_none.id]);
+    assert!(
+        sink.calls().contains(&format!(
+            "return {} 5 {NO_INSTANCE_TO_TERMINATE}",
+            found_none.id
+        )),
+        "{:?}",
+        sink.calls()
+    );
+}
+
+/// A terminate's fresh report that refuses the terminate publishes the same
+/// rows as a draining tick's for that report, with the stall off, since the
+/// node goes back to `drained`, though the draining path reads the same
+/// report stalled. A fresh call the node doesn't answer counts as
+/// unanswered on the draining path and changes no gauge on the terminating
+/// one: nothing calls a drained node.
+#[tokio::test]
+async fn a_refused_terminate_publishes_its_reports_rows_unstalled() {
+    let config = V2LoopConfig::default();
+    let backoff = DispatchBackoff::new(config.dispatch_backoff_base);
+    let report = || {
+        Ok(answer(
+            5,
+            DrainReport {
+                evacuated: vec![evacuated("a")],
+                pending: vec![
+                    pending("b", DrainWait::Hold),
+                    pending("c", DrainWait::Moving),
+                ],
+                blocked: vec![blocked("scan failed")],
+            },
+        ))
+    };
+    for (case, answer) in [("a report", Some(report())), ("no answer", None)] {
+        let mut gauges = Vec::new();
+        for phase in ["draining", "terminating"] {
+            // The node reported `a` evacuated an hour ago and nothing since,
+            // so the draining path reads the report stalled.
+            let target = V2Node {
+                report: Some(StoredV2Report {
+                    evacuated_grew_at: DB_NOW - HOUR,
+                    evacuate_asked_at: Some(DB_NOW - HOUR),
+                    evacuated: vec![StoredV2Evacuated {
+                        sandbox_id: "a".to_owned(),
+                        artifact_kind: StoredV2ArtifactKind::Full,
+                        artifact_id: "artifact".to_owned(),
+                    }],
+                    ..StoredV2Report::default()
+                }),
+                deadline_at: Some(DB_NOW - HOUR),
+                ..node(Some(phase), Some(5))
+            };
+            let sink = FakeSink {
+                nodes: vec![target.clone()],
+                responses: answer
+                    .clone()
+                    .map(|answer| HashMap::from([((target.id, false), answer)]))
+                    .unwrap_or_default(),
+                records: HashMap::from([(
+                    "a".to_owned(),
+                    EvacuationRecord::NotYet("uploading".into()),
+                )]),
+                ..FakeSink::default()
+            };
+            let outcome = step(
+                &sink,
+                &FakeAuthority::ok(),
+                &target,
+                None,
+                &backoff,
+                &config,
+                &PerNodeWarnPacer::new(Duration::from_secs(60)),
+            )
+            .await;
+            gauges.push(outcome.gauges);
+        }
+        let (draining, terminating) = (gauges[0], gauges[1]);
+        match draining {
+            Gauges::Report { rows, stalled } => {
+                assert!(stalled, "{case}: the draining path reads it stalled");
+                assert_eq!(
+                    terminating,
+                    Gauges::Report {
+                        rows,
+                        stalled: false
+                    },
+                    "{case}"
+                );
+            }
+            Gauges::Unanswered => assert_eq!(terminating, Gauges::Kept, "{case}"),
+            Gauges::Kept => panic!("{case}: the draining path publishes"),
+        }
+    }
+}
+
+/// A terminating node whose fresh call finds another call in progress on
+/// the node stays terminating and fences nothing, across ticks; its status
+/// says so, written once.
+#[tokio::test]
+async fn an_aborted_terminate_call_keeps_the_node_terminating() {
+    let terminating = node(Some("terminating"), Some(5));
+    for last_error in [None, Some(TERMINATE_WAITS_FOR_A_CALL.to_owned())] {
+        let listed = V2Node {
+            last_error: last_error.clone(),
+            ..terminating.clone()
+        };
+        let sink = FakeSink {
+            nodes: vec![listed.clone()],
+            refusal: Some(tonic::Status::aborted("in progress")),
+            ..FakeSink::default()
+        };
+        let report = run_tick(&sink, &FakeAuthority::ok()).await;
+        assert_eq!(report, V2TickReport::default(), "{last_error:?}");
+        for moved in ["fence", "return"] {
+            assert!(
+                !called(&sink, moved, &listed),
+                "{moved}: {:?}",
+                sink.calls()
+            );
+        }
+        let expected = if last_error.is_some() {
+            vec![]
+        } else {
+            vec![Some(TERMINATE_WAITS_FOR_A_CALL.to_owned())]
+        };
+        assert_eq!(status_writes(&sink, &listed), expected, "{last_error:?}");
+    }
+}
+
+/// A tick that starts once shutdown is requested does nothing: EC2 isn't
+/// asked about a node whose heartbeat is stale, and no node is cordoned or
+/// called.
+#[tokio::test]
+async fn a_tick_after_shutdown_takes_no_node() {
+    let target = V2Node {
+        heartbeat_fresh: false,
+        ..node(Some("draining"), Some(5))
+    };
+    let sink = FakeSink {
+        nodes: vec![target.clone()],
+        responses: HashMap::from([((target.id, false), Ok(response(5, &[])))]),
+        ..FakeSink::default()
+    };
+    let authority = FakeAuthority::ok();
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    let state = V2LoopState::with_shutdown(V2LoopConfig::default(), shutdown);
+    let report = tick(&sink, &authority, &state).await;
+    assert_eq!(report, V2TickReport::default());
+    assert!(
+        authority.described().is_empty(),
+        "{:?}",
+        authority.described()
+    );
+    assert!(sink.calls().is_empty(), "{:?}", sink.calls());
+    assert!(sink.requests().is_empty());
+}
+
+/// Once shutdown is requested, a tick over more nodes than it calls at once
+/// takes no new node, and the calls already in flight finish: each of those
+/// nodes' reports is stored.
+#[tokio::test(flavor = "current_thread")]
+async fn a_tick_takes_no_new_node_after_shutdown() {
+    let nodes: Vec<V2Node> = (0..NODE_CONCURRENCY + 4)
+        .map(|_| node(Some("draining"), Some(5)))
+        .collect();
+    let (arrived, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let sink = FakeSink {
+        responses: nodes
+            .iter()
+            .map(|node| ((node.id, false), Ok(response(5, &[]))))
+            .collect(),
+        nodes,
+        call_gate: Some((arrived, std::sync::Arc::clone(&permits))),
+        ..FakeSink::default()
+    };
+    let shutdown = CancellationToken::new();
+    let state = V2LoopState::with_shutdown(V2LoopConfig::default(), shutdown.clone());
+    let authority = FakeAuthority::ok();
+    let (report, ()) = tokio::join!(tick(&sink, &authority, &state), async {
+        for _ in 0..NODE_CONCURRENCY {
+            arrivals.recv().await.expect("a call");
+        }
+        shutdown.cancel();
+        permits.add_permits(sink.nodes.len());
+    });
+    assert_eq!(sink.requests().len(), NODE_CONCURRENCY);
+    assert_eq!(sink.reports.lock().unwrap().len(), NODE_CONCURRENCY);
+    assert_eq!(report.drained.len(), NODE_CONCURRENCY);
+}
+
+/// A hold shortened into the past doesn't stall the drain on the next tick:
+/// the stall clock starts at the first tick that asks the node to
+/// evacuate, and the drain stalls once the bound has passed since it with
+/// nothing evacuated.
+#[tokio::test]
+async fn a_hold_shortened_into_the_past_stalls_only_after_the_bound() {
+    let bound = V2LoopConfig::default().stall_bound;
+    let bound_secs = i64::try_from(bound.as_secs()).unwrap();
+    let held = || {
+        Ok(answer(
+            5,
+            DrainReport {
+                pending: vec![pending("c", DrainWait::Moving)],
+                ..DrainReport::default()
+            },
+        ))
+    };
+    // Its last report was stored while it held, a day after it started;
+    // the hold is then shortened to end at the drain's start.
+    let mut stored = StoredV2Report {
+        reported_at: DB_NOW - 60,
+        evacuated_grew_at: DB_NOW - DAY,
+        evacuate_asked_at: None,
+        ..StoredV2Report::default()
+    };
+    for (case, at, stalls) in [
+        ("the first evacuating tick", DB_NOW, false),
+        ("just short of the bound", DB_NOW + bound_secs - 1, false),
+        ("the bound past it", DB_NOW + bound_secs, true),
+    ] {
+        let target = V2Node {
+            deadline_at: Some(DB_NOW - DAY),
+            evacuate: true,
+            db_now: at,
+            report: Some(stored.clone()),
+            ..node(Some("draining"), Some(5))
+        };
+        let sink = FakeSink {
+            nodes: vec![target.clone()],
+            responses: HashMap::from([((target.id, false), held())]),
+            ..FakeSink::default()
+        };
+        run_tick(&sink, &FakeAuthority::ok()).await;
+        stored = sink.stored();
+        assert_eq!(stored.evacuate_asked_at, Some(DB_NOW), "{case}");
+        assert_eq!(
+            status_writes(&sink, &target)
+                .iter()
+                .flatten()
+                .any(|status| status.starts_with("the drain is stalled")),
+            stalls,
+            "{case}: {:?}",
+            sink.calls()
+        );
+    }
 }
