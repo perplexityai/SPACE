@@ -31,8 +31,7 @@
 # as this bring-up's is ever signalled.
 #
 # Public entry points: `bootstrap_kind_stack`, `kind_stack_prepare_cluster`,
-# `kind_stack_recheck_for_scenario` for each scenario of a suite whose runner
-# already bootstrapped, plus `kind_stack_sweep_stale_node_tombstones` and
+# plus `kind_stack_sweep_stale_node_tombstones` and
 # `kind_stack_psql` for suites that have to repeat a bring-up step in their own
 # setup or cleanup.
 #
@@ -1151,24 +1150,6 @@ kind_stack_start_detached() {
     kind_stack_assert_cluster_mounts
     kind_stack_assert_postgres_data
     KIND_STACK_DETACH=1 bootstrap_kind_stack__bring_up
-}
-
-# For each scenario the typed suite runner (`python -m space_smoke run --all`)
-# launches after its own `bootstrap_kind_stack` passed against the same live
-# stack. It repeats what can change between two scenarios: another cluster
-# taking the API port, another bring-up switching the storage credentials
-# mode, and node tombstones a scenario left. It leaves out the prerequisite,
-# mount, node vendor copy, Postgres data and substrate checks, which only
-# provisioning the box or creating the cluster changes, and the image provenance and Rust
-# build checks, which only a Tilt build changes; scenarios restart and
-# reconfigure workloads but build no image. The runner uses this only when its own bootstrap's
-# provenance check passed (KIND_STACK_PROVENANCE_PASSED_FILE), not when a busy
-# Tilt skipped it.
-# Each check added to `bootstrap_kind_stack` belongs here or in that list.
-kind_stack_recheck_for_scenario() {
-    bootstrap_kind_stack__assert_port_owner
-    bootstrap_kind_stack__refuse_storage_mode_mismatch
-    kind_stack_sweep_stale_node_tombstones
 }
 
 bootstrap_kind_stack() {

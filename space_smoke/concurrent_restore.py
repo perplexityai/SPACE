@@ -2,9 +2,10 @@
 
 The compose hammer fired gated `connect` callers at three API processes and
 read a stub apiserver's counters. This module is its kind form: the callers
-are threads over the public route, the API is scaled to three replicas for
-the scenario, the counters are the API's own `sandbox_k8s_executions` rows and
-the sandbox's pods by label, and the windows are a namespace pod-count quota.
+are threads over the public route spread over the API's replicas, at least
+two and held at their standing count for the scenario, the counters are the
+API's own `sandbox_k8s_executions` rows and the sandbox's pods by label, and
+the windows are a namespace pod-count quota.
 Every fault is a named kind-only operation with its compensation armed before
 dispatch; the control surface is [`ConcurrentRestoreControl`].
 """
@@ -82,11 +83,12 @@ class ConcurrentRestoreAssertions:
 
     The compose hammer fired gated `connect` callers at three API processes
     and read a stub apiserver's counters. Here the callers are threads over
-    the public route, the API is scaled to three replicas for the scenario,
-    the counters are the API's own `sandbox_k8s_executions` rows and the pods
-    by label, the forced first-POST failure is a namespace pod-count quota
-    (the POST is refused at admission), and the mid-restore window is the
-    real restore's own: from the `creating` claim row until the pod runs.
+    the public route spread over the API's replicas, at least two and held
+    at their standing count for the scenario, the counters are the API's own
+    `sandbox_k8s_executions` rows and the pods by label, the forced
+    first-POST failure is a namespace pod-count quota (the POST is refused at
+    admission), and the mid-restore window is the real restore's own: from
+    the `creating` claim row until the pod runs.
     Every fault is a named kind-only operation with its compensation armed
     before dispatch.
     """
@@ -106,9 +108,17 @@ class ConcurrentRestoreAssertions:
 
     # --- environment shape ------------------------------------------------
 
-    def scale_api_for_contention(self, replicas: int = 3, *, rollout_timeout: float = 300) -> None:
-        """Run the public API at `replicas` for the scenario; scaled back at scope end."""
+    def pin_api_for_contention(self, *, at_least: int = 2, rollout_timeout: float = 300) -> None:
+        """Hold the public API at its standing replica count, and at least
+        `at_least`, for the scenario; released at scope end.
 
+        Kind's autoscaler keeps two replicas at least, which already puts the
+        callers in more than one API process, so this is a scale only where
+        the count is lower. Pinning the autoscaler's bounds stops it moving the
+        count, and resetting a caller's connection, mid-race.
+        """
+
+        replicas = max(at_least, self._control.public_api_replicas())
         previous_holder: list[int] = []
 
         def scale_back() -> None:

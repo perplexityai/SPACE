@@ -17,10 +17,11 @@ def private_template_build_isolation(test: smoke.KindAdmin) -> None:
     builds = test.template_builds
     with test.phase("seed run-owned credentials and build a private base"):
         builds.prepare()
-    with test.phase("a second tenant can build from the shared seed"):
-        builds.build_shared_control()
-    with test.phase("the owner can materialize private base files by tag and digest"):
-        builds.build_owner_children()
+    with test.phase(
+        "a second tenant can build from the shared seed while the owner "
+        "materializes private base files by tag and digest"
+    ):
+        builds.build_shared_control_and_owner_children()
     with test.phase("another tenant is denied private tag and digest bases"):
         builds.reject_foreign_children()
     with test.phase("delete run-owned templates and credentials"):

@@ -69,7 +69,9 @@ class NativeConfig:
     template: str
     ready_timeout_seconds: float = 180
     request_timeout_seconds: float = 15
-    poll_interval_seconds: float = 1
+    # One operation or sandbox read per poll; most of what it waits for
+    # settles in well under a second.
+    poll_interval_seconds: float = 0.2
     # Templates built from this tree retain a finished command's exit.
     reports_exited_processes: bool = True
 
@@ -228,7 +230,9 @@ class NativeSandboxFactory:
                     raise TimeoutError(
                         "Native delete snapshot upload conflict did not clear"
                     ) from error
-                time.sleep(min(max(self._config.poll_interval_seconds, 0.1), remaining))
+                # At most once a second, as before the faster poll: each try
+                # is a fresh delete operation, not a read.
+                time.sleep(min(max(self._config.poll_interval_seconds, 1.0), remaining))
 
     def register_credential_reference(self, secret_arn: str) -> str:
         """Register an AWS secret by reference through the public API."""

@@ -2450,6 +2450,10 @@ class ConcurrentRestoreControl(Protocol):
     scenario obtains separately.
     """
 
+    def public_api_replicas(self) -> int:
+        """The kind public API Deployment's replica count, as its spec holds it."""
+        ...
+
     def scale_public_api(self, replicas: int) -> int:
         """Set the kind public API Deployment's replica count; returns the previous count.
 

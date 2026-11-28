@@ -22,6 +22,8 @@ from space_smoke.runtime import (
     ResourceScope,
     ScenarioContext,
     SmokeConfigurationError,
+    cancellation_point,
+    primary_failure,
     run_concurrently,
 )
 
@@ -113,6 +115,21 @@ class PrivateTemplateBuildAssertions:
         self.context.record("private_base", self.base)
         self.context.record("private_base_digest", self.digest)
 
+    def build_shared_control_and_owner_children(self) -> None:
+        """The foreign tenant's shared-seed control and the owner's children, at once.
+
+        Neither build reads what the other makes: the control derives from the
+        shared seed under the foreign key, the owner's children from the
+        private base under the owner's. Both finish before the denials, so a
+        denial still follows a build the foreign key was seen to make.
+        """
+
+        failure = primary_failure(
+            run_concurrently([self.build_shared_control, self.build_owner_children])
+        )
+        if failure is not None:
+            raise failure
+
     def build_shared_control(self) -> None:
         assert self.foreign is not None
         name = self.prefix + "-shared-control"
@@ -189,6 +206,7 @@ class PrivateTemplateBuildAssertions:
     def _build(self, config: EcwConfig, name: str, base: str, command: str) -> None:
         spec = self._allocate(config, name)
         path = f"/templates/{name}/builds/{spec['buildID']}"
+        cancellation_point()
         self._ecw(
             config,
             "POST",
@@ -230,6 +248,7 @@ class PrivateTemplateBuildAssertions:
             lambda: retry_sandbox_delete(delete_sandbox),
             critical=True,
         )
+        cancellation_point()
         sandbox = sdk.create(template=name, timeout=120, metadata=metadata)
         created.append(sandbox)
         self.context.record(name + "_sandbox_id", sandbox.sandbox_id)
@@ -240,6 +259,10 @@ class PrivateTemplateBuildAssertions:
         cleanup.release()
 
     def _own_template(self, name: str) -> None:
+        # An interrupted concurrent build stops here, and before its build POST
+        # and its sandbox create: its cleanup may already be running and would
+        # not see what it created next.
+        cancellation_point()
         # One compensation, armed with the first template, deletes them all.
         if not self.templates:
             self.resources.defer(

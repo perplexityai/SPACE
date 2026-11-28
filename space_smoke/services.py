@@ -114,6 +114,10 @@ NATIVE_API_SURFACE = "native"
 # Set by the suite runner on the scenarios it launches once its own bootstrap
 # has passed; a scenario run on its own does every bootstrap check itself.
 SUITE_BOOTSTRAPPED_ENV = "SPACE_SMOKE_SUITE_BOOTSTRAPPED"
+# The ECW credential the suite runner seeded on Kind for its scenarios and
+# deletes once they end, in place of one each scenario seeds and deletes. A
+# BYOK scenario seeds its own still: its key belongs to its own organization.
+SUITE_ECW_API_KEY_ENV = "SPACE_SMOKE_SUITE_ECW_API_KEY"
 
 
 @dataclass(frozen=True)
@@ -841,9 +845,10 @@ class SmokeServices:
             endpoint_name="ECW_DATA_PLANE_BASE_URL",
         )
 
+        suite_key = None if scenario.sandbox.kind_byok else values.get(SUITE_ECW_API_KEY_ENV) or None
         # Random, not pid+clock: the fallback is seeded into the shared Local
         # org for the run, and another local user could otherwise predict it.
-        api_key = supplied_key or secrets.token_hex(32)
+        api_key = supplied_key or suite_key or secrets.token_hex(32)
         kind_config = KindConfig(
             cluster=values.get("KIND_CLUSTER", "space-local"),
             api_url=api_url,
@@ -869,7 +874,7 @@ class SmokeServices:
             kind=kind,
             ecw=ecw,
             api_key=api_key,
-            owns_api_key=supplied_key is None,
+            owns_api_key=supplied_key is None and suite_key is None,
             template_override=template_override,
             bench=kind,
         )

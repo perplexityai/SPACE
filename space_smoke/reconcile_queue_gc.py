@@ -57,6 +57,10 @@ def gc_tick_seconds(env: dict[str, str | None]) -> int:
     raw = env.get(GC_TICK_ENV) or ""
     return int(raw) if raw.isdigit() and int(raw) > 0 else GC_TICK_SECONDS
 
+# How often the queue rows are read while a tick is awaited: a read is one
+# psql query, and the prune is seen within this of the tick that made it.
+REFS_POLL_SECONDS = 1
+
 LIVE_REF_FACET = "node-status"
 OLD_DEAD_FACET = "sandbox-inventory"
 FRESH_DEAD_FACET = "template-inventory"
@@ -180,7 +184,7 @@ class ReconcileQueueGcAssertions:
                 refs=sorted(refs),
                 failure_evidence=lambda: {"fake_ec2_log": self._control.fake_ec2_log_tail()},
             )
-            self._fixture.wait(10)
+            self._fixture.wait(REFS_POLL_SECONDS)
 
     def _refs(self) -> set[tuple[str, str, bool]]:
         rows: list[ReconcileQueueRef] = self._control.reconcile_queue_refs((self.live_id, self.gone_id))

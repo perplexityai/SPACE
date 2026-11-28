@@ -1002,7 +1002,10 @@ class CommandSandboxFixture(ScenarioFixture):
     fixture_name: ClassVar[str] = "command_sandbox"
     timeout_minutes: ClassVar[int] = 30
     lifecycle_transition_timeout: ClassVar[int] = 60
-    lifecycle_poll_interval: ClassVar[float] = 1
+    # Each poll is one public API read or one guest command; most transitions
+    # it waits out take well under a second, so a coarser poll would mostly
+    # be idle time.
+    lifecycle_poll_interval: ClassVar[float] = 0.2
     process_transition_timeout: ClassVar[float] = 60
     sandbox_delete_failure_message: ClassVar[str] = "sandbox deletion did not complete"
 

@@ -6,12 +6,14 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
 
 from space_smoke.registry import Scenario
+from space_smoke.runtime import CANCEL_JOIN_SECONDS, cleanup_reserve_seconds
 
 ProcessRunner = Callable[..., subprocess.CompletedProcess[str]]
 LineSink = Callable[[str], None]
@@ -20,6 +22,10 @@ RESULT_PREFIX = "RESULT: "
 # Names a lane's known-failures list (load_known_failures). Only a runner
 # that sets it, as the Kind Direct lane does, excuses the scenarios listed.
 KNOWN_FAILURES_ENV = "SPACE_SMOKE_KNOWN_FAILURES"
+# How long past a scenario's cleanup reserve an interrupted runner waits for
+# the scenario's process: the bounded join of its concurrent calls, which
+# comes before its cleanup, and its exit.
+INTERRUPT_WAIT_MARGIN_SECONDS = CANCEL_JOIN_SECONDS + 10.0
 
 
 @dataclass(frozen=True)
@@ -67,20 +73,36 @@ def run_scenarios(
     on_start: ScenarioStarted | None = None,
     line_sink: LineSink | None = None,
     on_result: Callable[[ScenarioProcessResult], None] | None = None,
+    processes: list[subprocess.Popen[str]] | None = None,
 ) -> tuple[ScenarioProcessResult, ...]:
-    """Run each scenario in its own process, one scenario at a time."""
+    """Run each scenario in its own process, one scenario at a time.
+
+    A streamed run (a `line_sink` and no `process_runner`) that is
+    interrupted, by Ctrl-C or by a SIGTERM its caller turns into an
+    exception, waits for the running scenario's process to exit, for up to
+    its cleanup reserve and a margin, then re-raises. The process is not
+    signalled: one interrupted with its process group cleans up on its own.
+    A second interrupt cuts the wait short. `processes`, when given,
+    receives each streamed scenario's process as it starts, so the caller
+    can tell whether one outlived the wait.
+    """
 
     values = dict(os.environ if environment is None else environment)
     results: list[ScenarioProcessResult] = []
     for registered in scenarios:
         if on_start is not None:
             on_start(registered.id)
+        reserve = cleanup_reserve_seconds(
+            registered.timeout_minutes * 60, registered.cleanup_timeout_seconds
+        )
         result = _run_one(
             registered.id,
             environment=values,
             executable=executable,
             process_runner=process_runner,
             line_sink=line_sink,
+            interrupt_wait_seconds=(reserve or 0.0) + INTERRUPT_WAIT_MARGIN_SECONDS,
+            processes=processes,
         )
         results.append(result)
         if on_result is not None:
@@ -162,6 +184,8 @@ def _run_one(
     executable: str,
     process_runner: ProcessRunner | None,
     line_sink: LineSink | None,
+    interrupt_wait_seconds: float,
+    processes: list[subprocess.Popen[str]] | None,
 ) -> ScenarioProcessResult:
     command = [executable, "-m", "space_smoke", "run", scenario_id]
     if process_runner is None and line_sink is not None:
@@ -170,6 +194,8 @@ def _run_one(
             command=command,
             environment=environment,
             line_sink=line_sink,
+            interrupt_wait_seconds=interrupt_wait_seconds,
+            processes=processes,
         )
 
     runner = process_runner or subprocess.run
@@ -205,6 +231,8 @@ def _run_one_streamed(
     command: list[str],
     environment: Mapping[str, str],
     line_sink: LineSink,
+    interrupt_wait_seconds: float = INTERRUPT_WAIT_MARGIN_SECONDS,
+    processes: list[subprocess.Popen[str]] | None = None,
 ) -> ScenarioProcessResult:
     """Tee one scenario's merged output while retaining its structured result."""
 
@@ -222,12 +250,20 @@ def _run_one_streamed(
         line_sink(f"{detail}\n")
         return ScenarioProcessResult(scenario_id, 2, "", detail)
 
-    assert process.stdout is not None
+    # A child an interrupt leaves unregistered here has created nothing yet.
+    if processes is not None:
+        processes.append(process)
+    stdout = process.stdout
+    assert stdout is not None
     lines: list[str] = []
-    with process.stdout:
-        for line in process.stdout:
+    try:
+        for line in stdout:
             lines.append(line)
             line_sink(line)
+    except BaseException:
+        _await_interrupted(scenario_id, process, stdout, line_sink, interrupt_wait_seconds)
+        raise
+    stdout.close()
     returncode = process.wait()
     stdout = "".join(lines)
     return ScenarioProcessResult(
@@ -237,6 +273,39 @@ def _run_one_streamed(
         "",
         _parse_report(stdout),
     )
+
+
+def _await_interrupted(
+    scenario_id: str,
+    process: subprocess.Popen[str],
+    stdout: Any,
+    line_sink: LineSink,
+    wait_seconds: float,
+) -> None:
+    """Wait up to `wait_seconds` for an interrupted scenario's process to exit.
+
+    Its output is still read meanwhile, from a thread: a process whose
+    cleanup fills the pipe would otherwise block in it, and one whose pipe
+    was closed would fail its cleanup's first print. What reads this
+    runner's own output may have gone with the interrupt (a `| tee` the
+    same Ctrl-C ended), so failing to pass a line on does not end the wait.
+    """
+
+    def emit(line: str) -> None:
+        try:
+            line_sink(line)
+        except (OSError, ValueError):
+            pass
+
+    emit(f"\nINTERRUPTED: waiting up to {wait_seconds:g} s for {scenario_id} to finish its cleanup\n")
+    drain = threading.Thread(target=lambda: [emit(line) for line in stdout], daemon=True)
+    drain.start()
+    try:
+        process.wait(timeout=wait_seconds)
+    except subprocess.TimeoutExpired:
+        emit(f"INTERRUPTED: {scenario_id} is still running after {wait_seconds:g} s\n")
+        return
+    drain.join(timeout=5)
 
 
 def _parse_report(stdout: str) -> Mapping[str, Any] | None:
