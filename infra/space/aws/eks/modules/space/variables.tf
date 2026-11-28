@@ -227,6 +227,23 @@ variable "vpc_cni_node_agent_resources" {
   }
 }
 
+variable "vpc_cni_node_agent_log_level" {
+  description = "Optional log verbosity level for the VPC CNI network-policy agent (nodeAgent.logLevel). Null leaves the key unset and preserves the addon default. Setting \"debug\" increases log volume on every node (and logs every ACCEPT decision when policy event logs are enabled); use it for a bounded diagnosis window rather than permanently."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.vpc_cni_node_agent_log_level == null ? true : contains(["debug", "info", "warn", "error"], var.vpc_cni_node_agent_log_level)
+    error_message = "vpc_cni_node_agent_log_level must be one of debug, info, warn, or error when set."
+  }
+}
+
+variable "vpc_cni_node_agent_enable_policy_event_logs" {
+  description = "Optional toggle for VPC CNI network-policy decision logs (nodeAgent.enablePolicyEventLogs). Null leaves the key unset and preserves the addon default. ACCEPT decisions are logged only when vpc_cni_node_agent_log_level is \"debug\" (the addon default when unset); enabling both logs every ACCEPT decision on every node, so enable policy event logs for a bounded diagnosis window rather than permanently."
+  type        = bool
+  default     = null
+}
+
 variable "aws_load_balancer_controller_resources" {
   description = "Optional AWS Load Balancer Controller memory reservation and limit override."
   type = object({

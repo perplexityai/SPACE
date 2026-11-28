@@ -106,7 +106,7 @@ locals {
       # high-cardinality clusters override it with a measured per-node
       # working set after checking their smallest node shape. The cpu request
       # restates the addon default so this override cannot drop it.
-      nodeAgent = {
+      nodeAgent = merge({
         resources = {
           requests = {
             cpu    = "25m"
@@ -116,7 +116,14 @@ locals {
             memory = var.vpc_cni_node_agent_resources.memory_limit
           }
         }
-      }
+        },
+        var.vpc_cni_node_agent_log_level == null ? {} : {
+          logLevel = var.vpc_cni_node_agent_log_level
+        },
+        var.vpc_cni_node_agent_enable_policy_event_logs == null ? {} : {
+          enablePolicyEventLogs = tostring(var.vpc_cni_node_agent_enable_policy_event_logs)
+        },
+      )
     })
   }
 
