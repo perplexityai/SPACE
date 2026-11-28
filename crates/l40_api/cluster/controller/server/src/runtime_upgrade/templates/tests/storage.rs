@@ -262,7 +262,7 @@ async fn an_unbound_release_is_the_initial_environments() -> TestResult {
         .execute(fixture.pool())
         .await?;
     let driver = fixture.driver();
-    let page = driver
+    let SubjectScan::Page(page) = driver
         .find_subjects(
             &Campaign {
                 id: CampaignId(Uuid::now_v7()),
@@ -283,7 +283,10 @@ async fn an_unbound_release_is_the_initial_environments() -> TestResult {
             None,
             10,
         )
-        .await?;
+        .await?
+    else {
+        panic!("templates driver always returns SubjectScan::Page");
+    };
     assert_eq!(page.on_source, vec![release]);
 
     fixture.set_default(fixture.e1).await?;

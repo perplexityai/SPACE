@@ -2712,11 +2712,12 @@ decision is counted by `runtime_upgrade.activation.decision`.
 ### Runtime upgrade campaigns
 
 A campaign moves one kind of subject, template releases (`templates`) or
-sandboxes (`sandboxes`), off one execution environment and onto another, at a
-pace an operator sets. Campaigns live in `runtime_upgrade_campaigns`, with one
-row per subject in `runtime_upgrade_items`. The cluster controller's
-`runtime_upgrade` loop drives them, and the admin API starts and steers them.
-Both read `runtime_upgrade_campaigns.generation`, so the migration that adds it
+sandboxes (`sandboxes` and `sandbox_force_restarts`), off one execution
+environment and onto another, at a pace an operator sets. Campaigns live in
+`runtime_upgrade_campaigns`, with one row per subject in
+`runtime_upgrade_items`. The cluster controller's `runtime_upgrade` loop drives
+them, and the admin API starts and steers them. Both read
+`runtime_upgrade_campaigns.generation`, so the migration that adds it
 (`20261118041622_runtime_upgrade_campaigns_generation`) has to be applied to a
 cluster before a build with campaigns runs there, and stay applied for as long
 as such a build may be rolled back to.
@@ -2728,8 +2729,18 @@ kind's driver. Only template campaigns have one the controller runs
 ([Template runtime upgrade campaigns](#template-runtime-upgrade-campaigns)), so
 the admin API refuses to start a valid sandbox campaign (409), and the loop
 only reports one it finds; a campaign row of a kind from a newer build is
-logged and skipped. The sandbox driver is built but not registered: it moves
-sandboxes through a node-side upgrade dispatcher that doesn't exist yet.
+logged and skipped. Both sandbox drivers (`sandboxes` and
+`sandbox_force_restarts`) are built but not registered: they move sandboxes
+through a sandbox upgrade dispatcher that doesn't exist yet. Because
+`sandbox_force_restarts` consults `public_operations` to fence external stops,
+rollbacks and activations across paused or retried leases and checks stopped-drain
+`'disk'` pins cleared on activation completion in `internal-api`, `api`'s
+`public_operation_retention` loop retains those `succeeded` sandbox receipts
+while an unfinished or draining-aborted `sandbox_force_restarts` campaign can
+still inspect them; every `api`, `cluster-controller` and `internal-api`
+replica has to run a build with those fences before `sandbox_force_restarts`
+campaigns are enabled, and rolling any of those services back past them requires
+finishing or draining active `sandbox_force_restarts` campaigns first.
 Each tick the
 loop also returns a finished campaign's in-flight items whose leases lapsed to
 pending (see abort below), and for every unfinished campaign whose kind has a
@@ -2741,7 +2752,9 @@ driver, it:
 3. asks the driver whether the campaign is held this tick, and whether what
    it finds moves or is stranded;
 4. records one page of the driver's subjects on the source as pending items.
-   Stranded subjects are recorded too, but not leased;
+   Untouched stranded subjects aren't leased, though `sandbox_force_restarts`
+   still leases items this campaign already started that have reached the
+   target so they settle `done`;
 5. completes a rolling campaign on the tick a whole pass of subjects ends
    with no item pending or in flight, its failures under budget and the
    driver's plan moving (a stranded campaign stays open until its plan
@@ -2762,7 +2775,9 @@ counts against `max_in_flight_per_node` on the node that last published its
 sandbox, and is leased only while that node is reachable with fresh
 environment evidence; until then it stays pending. A sandbox item whose
 sandbox no node has published counts against the cluster cap only and is
-leased, so the driver can skip it instead of holding the campaign open. A
+leased: `sandboxes` campaigns skip it, while `sandbox_force_restarts` campaigns
+skip terminal rows and release active or mid-transition rows back to pending
+until their node publishes execution state. A
 template release has no node, so only the cluster
 cap applies to it. A campaign that starts as a canary leases one item at a
 time until one is done, then waits for a resume; one whose items all fail or
@@ -2784,8 +2799,11 @@ managing-organization admin. `space-admin-cli runtime campaign` wraps them
   target, `canary_size` (`1`, the default, or `0` to start rolling; a canary
   is one subject, so nothing else is accepted),
   `max_in_flight_per_cluster`, `max_in_flight_per_node` (default 1),
-  `failure_budget`, `include_running` (sandbox campaigns only: also take
-  running and paused sandboxes, as the sandbox driver defines it) and a
+  `failure_budget`, `include_running` (`sandboxes` campaigns only: also take
+  running and paused sandboxes, as the sandbox driver defines it; refused on
+  `templates` and `sandbox_force_restarts`, since `sandbox_force_restarts`
+  always scans active and mid-transition sandboxes without taking `stopped` or
+  `suspended` ones) and a
   required `reason`. An invalid request is refused (400) first. A valid one is
   refused (409) for a kind with no driver, and while an unfinished campaign of
   the same kind moves the same source.
@@ -2821,7 +2839,17 @@ upgrade that finishes before that renewal still records its outcome, which is
 true of the subject. A lease never takes a subject another campaign holds in flight under a
 live lease, so a new campaign for the same source upgrades such a subject
 only after the aborted campaign's worker has stopped: one worker upgrades a
-subject at a time.
+subject at a time. For `sandbox_force_restarts`, if `:abort` drops a worker
+after its stop finished and before it dispatched `start` (or if `:abort`
+arrives after its `start` fails), the sandbox stays `'stopped'` once the
+aborted lease drains — whereas an already-dispatched node `start` that
+continues to completion on the target leaves the sandbox started on the
+default environment without recording `done` on the aborted campaign. A
+replacement `sandbox_force_restarts` campaign only scans active or
+mid-transition sandboxes so it never boots user-stopped ones, while a
+`sandboxes` campaign or the caller's next start or wake upgrades any
+remaining stopped disk onto the current default once the catalog certifies an
+upgrade edge to it.
 
 Blocking an environment needs `strand: true` while an unfinished template
 campaign moves its releases: a block mid-campaign stops the releases that

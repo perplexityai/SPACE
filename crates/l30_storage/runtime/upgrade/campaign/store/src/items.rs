@@ -6,8 +6,21 @@
 //! [`pplx_space_rollout_queue::claim`] and [`pplx_space_rollout_queue::renew`]
 //! on these tables.
 
+pub(crate) mod candidates;
+mod receipts;
+
+pub(crate) use self::receipts::{
+    RUN_STARTED, STARTED_HOLD_PREFIX, TARGET_START_SETTLED, TARGET_START_SETTLED_PREFIX,
+    TARGET_STARTING, TARGET_STARTING_PREFIX, UNSTARTED_PREFIX,
+};
+pub use self::receipts::{
+    clear_leased_starting_on_target, clear_starting_on_target, continuing_run,
+    mark_leased_started_on_target, mark_leased_starting_on_target, mark_run_started,
+    mark_started_on_target, mark_starting_on_target, started_on_target, starting_on_target,
+};
+use self::receipts::{force_restart_errors, partial_move_error};
+
 use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
 use std::time::Duration;
 
 use pplx_space_accounts::NodeId;
@@ -187,9 +200,14 @@ pub struct LeasedItem {
 ///   (an aborted campaign's, while its worker may still be on it); the item
 ///   stays pending until that lease lapses.
 ///
-/// Only the first `scan_limit` pending items in subject order are
-/// considered, so items on a saturated node can hold back items behind them
-/// until the node drains.
+/// Only the first `scan_limit` pending items are considered: in `canary`, an
+/// item whose upgrade run has already started stays ahead of untouched items so
+/// one active canary finishes before another subject is touched, while
+/// unstarted or `rolling` items advance around the `(campaign_id, phase,
+/// subject_id)` index ring via [`lease_items_after`] so items returned to
+/// `pending` by [`finish_item`] (`Retry`/`Release`) don't starve later
+/// subjects. Items parked on a saturated node hold their spot on that node
+/// without blocking cursor progress across unsaturated nodes.
 ///
 /// Each lease runs from the moment it's written (`clock_timestamp()`), not
 /// from the transaction's start, so time spent waiting for the locks below
@@ -219,10 +237,86 @@ pub async fn lease_items(
     lease: Duration,
     scan_limit: u32,
 ) -> Result<Vec<LeasedItem>, LeaseError> {
+    let (leased, _) = lease_items_with_cursor(conn, campaign_id, None, lease, scan_limit).await?;
+    Ok(leased)
+}
+
+/// Like [`lease_items`], advancing `after` around the `(campaign_id, phase,
+/// subject_id)` index ring so released or blocked items don't starve later
+/// subjects while keeping rolling candidate selection bounded to `scan_limit`
+/// index rows per tick.
+pub async fn lease_items_after(
+    conn: impl Acquire<'_, Database = Postgres>,
+    campaign_id: CampaignId,
+    after: &mut Option<uuid::Uuid>,
+    lease: Duration,
+    scan_limit: u32,
+) -> Result<Vec<LeasedItem>, LeaseError> {
+    let cursor = (*after).unwrap_or_else(uuid::Uuid::nil);
+    let (leased, next) =
+        lease_items_with_cursor(conn, campaign_id, Some(cursor), lease, scan_limit).await?;
+    if let Some(next) = next {
+        *after = Some(next);
+    }
+    Ok(leased)
+}
+
+async fn lease_items_with_cursor(
+    conn: impl Acquire<'_, Database = Postgres>,
+    campaign_id: CampaignId,
+    after: Option<uuid::Uuid>,
+    lease: Duration,
+    scan_limit: u32,
+) -> Result<(Vec<LeasedItem>, Option<uuid::Uuid>), LeaseError> {
     let mut tx = conn.begin().await.map_err(DbError::from)?;
     let mut claiming = Claiming {
         tx: &mut tx,
         campaign_id,
+        only_subjects: None,
+        after,
+        last_scanned: None,
+        skipped_on_saturated_node: false,
+        cursor_before_saturated_skip: None,
+        on_node: HashMap::new(),
+    };
+    let leased = pplx_space_rollout_queue::claim(&mut claiming, lease, scan_limit).await;
+    let last_scanned = claiming.last_scanned;
+    let skipped_on_saturated_node = claiming.skipped_on_saturated_node;
+    let cursor_before_saturated_skip = claiming.cursor_before_saturated_skip;
+    let leased = end_transaction(tx, leased).await?;
+    let next = if skipped_on_saturated_node {
+        cursor_before_saturated_skip
+            .or_else(|| leased.first().map(|item| item.subject_id))
+            .or(last_scanned)
+    } else {
+        leased.last().map(|item| item.subject_id).or(last_scanned)
+    };
+    Ok((leased, next))
+}
+
+/// Like [`lease_items`], restricted to `subject_ids` while keeping the same
+/// campaign lock, failure budget, canary gate, cluster/per-node caps, node
+/// reachability/evidence check, and cross-campaign lease handoff. Returns
+/// nothing without opening a transaction when `subject_ids` is empty.
+pub async fn lease_selected_items(
+    conn: impl Acquire<'_, Database = Postgres>,
+    campaign_id: CampaignId,
+    subject_ids: &[uuid::Uuid],
+    lease: Duration,
+    scan_limit: u32,
+) -> Result<Vec<LeasedItem>, LeaseError> {
+    if subject_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut tx = conn.begin().await.map_err(DbError::from)?;
+    let mut claiming = Claiming {
+        tx: &mut tx,
+        campaign_id,
+        only_subjects: Some(subject_ids),
+        after: None,
+        last_scanned: None,
+        skipped_on_saturated_node: false,
+        cursor_before_saturated_skip: None,
         on_node: HashMap::new(),
     };
     let leased = pplx_space_rollout_queue::claim(&mut claiming, lease, scan_limit).await;
@@ -242,6 +336,11 @@ pub enum LeaseError {
 struct Claiming<'c> {
     tx: &'c mut PgConnection,
     campaign_id: CampaignId,
+    only_subjects: Option<&'c [uuid::Uuid]>,
+    after: Option<uuid::Uuid>,
+    last_scanned: Option<uuid::Uuid>,
+    skipped_on_saturated_node: bool,
+    cursor_before_saturated_skip: Option<uuid::Uuid>,
     /// Items in flight by the node that last published each sandbox,
     /// counting those this lease takes.
     on_node: HashMap<NodeId, u64>,
@@ -249,9 +348,12 @@ struct Claiming<'c> {
 
 /// What [`lease_items`] read of the campaign under its lock that it needs
 /// after.
-struct LeaseHeader {
-    subject_kind: SubjectKind,
-    per_node: u64,
+pub(crate) struct LeaseHeader {
+    pub(crate) kind: CampaignKind,
+    pub(crate) canary: bool,
+    pub(crate) subject_kind: SubjectKind,
+    pub(crate) per_node: u64,
+    pub(crate) effective_per_cluster: i64,
 }
 
 impl FailedItems for Claiming<'_> {
@@ -293,11 +395,20 @@ impl ClaimStore for Claiming<'_> {
         else {
             return Ok(None);
         };
-        let subject_kind = kind.parse::<CampaignKind>()?.subject_kind();
+        let parsed_kind = kind.parse::<CampaignKind>()?;
+        let subject_kind = parsed_kind.subject_kind();
+        let effective_per_cluster = if canary {
+            per_cluster.clamp(0, 1)
+        } else {
+            per_cluster.max(0)
+        };
         Ok(Some((
             LeaseHeader {
+                kind: parsed_kind,
+                canary,
                 subject_kind,
                 per_node: u64::try_from(per_node).unwrap_or(0),
+                effective_per_cluster,
             },
             Pacing {
                 canary,
@@ -308,7 +419,7 @@ impl ClaimStore for Claiming<'_> {
     }
 
     async fn canary_progress(&mut self) -> Result<(bool, u64), LeaseError> {
-        let (canary_done, canary_in_flight) = sqlx::query_as::<_, (bool, i64)>(sql!(
+        let (canary_done, canary_in_flight): (bool, i64) = sqlx::query_as(sql!(
             "SELECT coalesce(bool_or(phase = $2), false), count(*) FILTER (WHERE phase = $3)
              FROM runtime_upgrade_items
              WHERE campaign_id = $1
@@ -340,11 +451,28 @@ impl ClaimStore for Claiming<'_> {
         scan_limit: u32,
     ) -> Result<Candidates<uuid::Uuid, Option<NodeId>>, LeaseError> {
         let subject_kind = header.subject_kind;
-        let (in_flight, pending) = if subject_kind.has_node() {
-            node_bound_candidates(self.tx, self.campaign_id, subject_kind, scan_limit).await?
+        let (in_flight, pending, last_scanned) = if subject_kind.has_node() {
+            candidates::node_bound_candidates(
+                self.tx,
+                self.campaign_id,
+                header,
+                self.only_subjects,
+                self.after,
+                scan_limit,
+            )
+            .await?
         } else {
-            nodeless_candidates(self.tx, self.campaign_id, subject_kind, scan_limit).await?
+            candidates::nodeless_candidates(
+                self.tx,
+                self.campaign_id,
+                header,
+                self.only_subjects,
+                self.after,
+                scan_limit,
+            )
+            .await?
         };
+        self.last_scanned = last_scanned;
         let mut in_cluster = 0_u64;
         for (node_id, count) in in_flight {
             // count(*) is never negative.
@@ -374,6 +502,7 @@ impl ClaimStore for Claiming<'_> {
         if let Some(node_id) = node_id
             && self.on_node.get(&node_id).copied().unwrap_or(0) >= header.per_node
         {
+            self.skipped_on_saturated_node = true;
             return Ok(None);
         }
         let attempts = sqlx::query_scalar::<_, i64>(sql!(
@@ -401,6 +530,9 @@ impl ClaimStore for Claiming<'_> {
         let Some(attempts) = attempts else {
             return Ok(None);
         };
+        if !self.skipped_on_saturated_node {
+            self.cursor_before_saturated_skip = Some(subject_id);
+        }
         if let Some(node_id) = node_id {
             *self.on_node.entry(node_id).or_default() += 1;
         }
@@ -485,122 +617,6 @@ async fn lock_lease_handoff(
         .execute(&mut *tx)
         .await?;
     Ok(())
-}
-
-/// In-flight counts by node, and the pending items to consider with their
-/// nodes.
-type NodeCandidates = (
-    Vec<(Option<NodeId>, i64)>,
-    Vec<(uuid::Uuid, Option<NodeId>)>,
-);
-
-/// For sandbox items: in flight by the node that last published each
-/// sandbox, and pending items whose node qualifies or that have none.
-async fn node_bound_candidates(
-    tx: &mut PgConnection,
-    campaign_id: CampaignId,
-    subject_kind: SubjectKind,
-    scan_limit: u32,
-) -> Result<NodeCandidates, DbError> {
-    debug_assert_eq!(subject_kind, SubjectKind::Sandbox);
-    // One statement, so one snapshot: the in-flight counts and the pending
-    // items see each sandbox on the same node. Read in two, a sandbox
-    // published on another node in between could be counted on its old node
-    // while a pending item on its new one is leased past the cap. A sandbox
-    // a node publishes after this read is seen by the next lease.
-    //
-    // A sandbox published on a node is leased only while that node is
-    // reachable and its status is evidence of its environments. One with no
-    // published node is leased, for the driver to skip.
-    /// Built once: the node evidence predicate is the only interpolation.
-    static CANDIDATES: LazyLock<String> = LazyLock::new(|| {
-        sql!(format!(
-            "WITH in_flight AS (
-                 SELECT o.node_id, count(*) AS items
-                 FROM runtime_upgrade_items i
-                 LEFT JOIN sandbox_observed_states o ON o.sandbox_id = i.subject_id
-                 WHERE i.campaign_id = $1
-                   AND i.subject_kind = $2
-                   AND i.phase = $5
-                 GROUP BY o.node_id
-             ),
-             pending AS (
-                 SELECT i.subject_id, o.node_id
-                 FROM runtime_upgrade_items i
-                 LEFT JOIN sandbox_observed_states o ON o.sandbox_id = i.subject_id
-                 LEFT JOIN node_status_snapshots nss ON nss.node_id = o.node_id
-                 WHERE i.campaign_id = $1
-                   AND i.subject_kind = $2
-                   AND i.phase = $3
-                   AND (o.node_id IS NULL OR (nss.reachable IS TRUE AND {}))
-                 ORDER BY i.subject_id
-                 LIMIT $4
-             )
-             SELECT node_id, items, NULL::uuid AS subject_id FROM in_flight
-             UNION ALL
-             SELECT node_id, NULL::bigint, subject_id FROM pending",
-            pplx_space_node_status_store::environment_evidence("nss")
-        ))
-    });
-    let rows = sqlx::query_as::<_, (Option<NodeId>, Option<i64>, Option<uuid::Uuid>)>(
-        sqlx::AssertSqlSafe(CANDIDATES.as_str()),
-    )
-    .bind(campaign_id)
-    .bind(subject_kind.as_str())
-    .bind(ItemPhase::Pending.as_str())
-    .bind(i64::from(scan_limit))
-    .bind(ItemPhase::InFlight.as_str())
-    .fetch_all(&mut *tx)
-    .await?;
-    let mut in_flight = Vec::new();
-    let mut pending = Vec::new();
-    for (node_id, items, subject_id) in rows {
-        match (items, subject_id) {
-            (Some(items), _) => in_flight.push((node_id, items)),
-            (None, Some(subject_id)) => pending.push((subject_id, node_id)),
-            (None, None) => {}
-        }
-    }
-    // UNION ALL doesn't promise the branch's order.
-    pending.sort_unstable_by_key(|(subject_id, _)| *subject_id);
-    Ok((in_flight, pending))
-}
-
-/// For items with no node: the in-flight count and the first pending items.
-async fn nodeless_candidates(
-    tx: &mut PgConnection,
-    campaign_id: CampaignId,
-    subject_kind: SubjectKind,
-    scan_limit: u32,
-) -> Result<NodeCandidates, DbError> {
-    // One statement, so one snapshot: an item that leaves flight in between
-    // would otherwise count both in flight and pending.
-    let (in_flight, pending) = sqlx::query_as::<_, (i64, Vec<uuid::Uuid>)>(sql!(
-        "SELECT
-             (SELECT count(*)
-              FROM runtime_upgrade_items
-              WHERE campaign_id = $1
-                AND subject_kind = $2
-                AND phase = $5),
-             ARRAY(SELECT subject_id
-                   FROM runtime_upgrade_items
-                   WHERE campaign_id = $1
-                     AND subject_kind = $2
-                     AND phase = $3
-                   ORDER BY subject_id
-                   LIMIT $4)"
-    ))
-    .bind(campaign_id)
-    .bind(subject_kind.as_str())
-    .bind(ItemPhase::Pending.as_str())
-    .bind(i64::from(scan_limit))
-    .bind(ItemPhase::InFlight.as_str())
-    .fetch_one(&mut *tx)
-    .await?;
-    Ok((
-        vec![(None, in_flight)],
-        pending.into_iter().map(|id| (id, None)).collect(),
-    ))
 }
 
 /// Extend `item`'s lease to `lease` from now (clamped as for
@@ -749,6 +765,7 @@ impl ItemOutcome {
         }
     }
 
+    /// The error text to store, if any.
     fn error(&self) -> Option<&str> {
         match self {
             Self::Done => None,
@@ -770,10 +787,33 @@ pub async fn finish_item(
     item: &LeasedItem,
     outcome: &ItemOutcome,
 ) -> Result<bool, DbError> {
+    let errors = force_restart_errors(outcome);
+    let partial_move = partial_move_error(outcome);
     let finished = sqlx::query(sql!(
         "UPDATE runtime_upgrade_items
          SET phase = $5,
-             last_error = $6,
+             last_error = CASE
+                 WHEN EXISTS (
+                     SELECT 1
+                     FROM runtime_upgrade_campaigns
+                     WHERE id = $1
+                       AND kind = $9
+                 )
+                 THEN CASE
+                     WHEN last_error IS NULL OR starts_with(last_error, $10) THEN $11
+                     WHEN $18 IS NOT NULL
+                      AND (last_error = $16 OR starts_with(last_error, $17))
+                     THEN $18
+                     WHEN $21 IS NOT NULL
+                      AND (last_error = $19 OR starts_with(last_error, $20))
+                     THEN $21
+                     ELSE $12
+                 END
+                 WHEN $15 IS NOT NULL
+                  AND (last_error = $13 OR starts_with(last_error, $14))
+                 THEN $15
+                 ELSE $6
+             END,
              attempts = GREATEST(attempts - $8, 0),
              lease_token = NULL,
              lease_expires_at = NULL
@@ -791,6 +831,24 @@ pub async fn finish_item(
     .bind(outcome.error())
     .bind(ItemPhase::InFlight.as_str())
     .bind(outcome.refunded_attempts())
+    .bind(CampaignKind::SandboxForceRestarts.as_str())
+    .bind(UNSTARTED_PREFIX)
+    .bind(errors.unstarted.as_ref().and_then(ItemError::as_deref))
+    .bind(errors.started.as_ref().and_then(ItemError::as_deref))
+    .bind(RUN_STARTED)
+    .bind(STARTED_HOLD_PREFIX)
+    .bind(partial_move.as_ref().and_then(ItemError::as_deref))
+    .bind(TARGET_START_SETTLED)
+    .bind(TARGET_START_SETTLED_PREFIX)
+    .bind(errors.target_started.as_ref().and_then(ItemError::as_deref))
+    .bind(TARGET_STARTING)
+    .bind(TARGET_STARTING_PREFIX)
+    .bind(
+        errors
+            .target_starting
+            .as_ref()
+            .and_then(ItemError::as_deref),
+    )
     .execute(executor.into_sqlx())
     .await?
     .rows_affected();
@@ -806,10 +864,32 @@ pub async fn redrive_expired(
     campaign_id: CampaignId,
     max_attempts: u64,
 ) -> Result<RedriveReport, DbError> {
+    let unstarted_expired = ItemError::new(format!("{UNSTARTED_PREFIX}{LEASE_EXPIRED}"));
+    let partial_move_expired = ItemError::new(format!("{STARTED_HOLD_PREFIX}{LEASE_EXPIRED}"));
+    let target_starting_expired =
+        ItemError::new(format!("{TARGET_STARTING_PREFIX}{LEASE_EXPIRED}"));
+    let target_started_expired =
+        ItemError::new(format!("{TARGET_START_SETTLED_PREFIX}{LEASE_EXPIRED}"));
     let phases = sqlx::query_scalar::<_, String>(sql!(
         "UPDATE runtime_upgrade_items
          SET phase = CASE WHEN attempts >= $2 THEN $3 ELSE $4 END,
-             last_error = $5,
+             last_error = CASE
+                 WHEN EXISTS (
+                     SELECT 1
+                     FROM runtime_upgrade_campaigns
+                     WHERE id = $1
+                       AND kind = $7
+                 )
+                 THEN CASE
+                     WHEN last_error IS NULL OR starts_with(last_error, $8) THEN $9
+                     WHEN last_error = $13 OR starts_with(last_error, $14) THEN $15
+                     WHEN last_error = $16 OR starts_with(last_error, $17) THEN $18
+                     ELSE $5
+                 END
+                 WHEN last_error = $10 OR starts_with(last_error, $11)
+                 THEN $12
+                 ELSE $5
+             END,
              lease_token = NULL,
              lease_expires_at = NULL
          WHERE campaign_id = $1
@@ -823,6 +903,18 @@ pub async fn redrive_expired(
     .bind(ItemPhase::Pending.as_str())
     .bind(LEASE_EXPIRED)
     .bind(ItemPhase::InFlight.as_str())
+    .bind(CampaignKind::SandboxForceRestarts.as_str())
+    .bind(UNSTARTED_PREFIX)
+    .bind(unstarted_expired.as_deref())
+    .bind(RUN_STARTED)
+    .bind(STARTED_HOLD_PREFIX)
+    .bind(partial_move_expired.as_deref())
+    .bind(TARGET_START_SETTLED)
+    .bind(TARGET_START_SETTLED_PREFIX)
+    .bind(target_started_expired.as_deref())
+    .bind(TARGET_STARTING)
+    .bind(TARGET_STARTING_PREFIX)
+    .bind(target_starting_expired.as_deref())
     .fetch_all(executor.into_sqlx())
     .await?;
     let failed = phases
@@ -842,10 +934,32 @@ pub async fn redrive_expired(
 /// other campaign leases the subject while that worker may still be on it
 /// ([`lease_items`]); this tidies up after. Returns how many it released.
 pub async fn release_lapsed_in_finished(executor: impl Executor<'_>) -> Result<u64, DbError> {
+    let unstarted_expired = ItemError::new(format!("{UNSTARTED_PREFIX}{LEASE_EXPIRED}"));
+    let partial_move_expired = ItemError::new(format!("{STARTED_HOLD_PREFIX}{LEASE_EXPIRED}"));
+    let target_starting_expired =
+        ItemError::new(format!("{TARGET_STARTING_PREFIX}{LEASE_EXPIRED}"));
+    let target_started_expired =
+        ItemError::new(format!("{TARGET_START_SETTLED_PREFIX}{LEASE_EXPIRED}"));
     Ok(sqlx::query(sql!(
         "UPDATE runtime_upgrade_items
          SET phase = $2,
-             last_error = $3,
+             last_error = CASE
+                 WHEN EXISTS (
+                     SELECT 1
+                     FROM runtime_upgrade_campaigns
+                     WHERE id = runtime_upgrade_items.campaign_id
+                       AND kind = $5
+                 )
+                 THEN CASE
+                     WHEN last_error IS NULL OR starts_with(last_error, $6) THEN $7
+                     WHEN last_error = $11 OR starts_with(last_error, $12) THEN $13
+                     WHEN last_error = $14 OR starts_with(last_error, $15) THEN $16
+                     ELSE $3
+                 END
+                 WHEN last_error = $8 OR starts_with(last_error, $9)
+                 THEN $10
+                 ELSE $3
+             END,
              lease_token = NULL,
              lease_expires_at = NULL
          WHERE phase = $1
@@ -859,6 +973,18 @@ pub async fn release_lapsed_in_finished(executor: impl Executor<'_>) -> Result<u
     .bind(ItemPhase::Pending.as_str())
     .bind(LEASE_EXPIRED)
     .bind(CampaignPhase::Aborted.as_str())
+    .bind(CampaignKind::SandboxForceRestarts.as_str())
+    .bind(UNSTARTED_PREFIX)
+    .bind(unstarted_expired.as_deref())
+    .bind(RUN_STARTED)
+    .bind(STARTED_HOLD_PREFIX)
+    .bind(partial_move_expired.as_deref())
+    .bind(TARGET_START_SETTLED)
+    .bind(TARGET_START_SETTLED_PREFIX)
+    .bind(target_started_expired.as_deref())
+    .bind(TARGET_STARTING)
+    .bind(TARGET_STARTING_PREFIX)
+    .bind(target_starting_expired.as_deref())
     .execute(executor.into_sqlx())
     .await?
     .rows_affected())

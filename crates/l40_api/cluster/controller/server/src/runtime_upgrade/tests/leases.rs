@@ -682,3 +682,56 @@ async fn a_dispatch_of_a_campaign_aborted_since_its_lease_never_runs_the_upgrade
     assert_eq!(item(&db.pool, campaign, found[0]).await?.0, "in_flight");
     Ok(())
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn slow_stranded_candidate_discovery_does_not_eat_into_the_worker_lease_budget() -> TestResult
+{
+    let Some(db) = test_db().await? else {
+        return Ok(());
+    };
+    let campaign = insert_campaign(&db.pool, seed()).await?;
+    let found = subjects(1);
+    store::insert_pending(
+        &db.pool,
+        campaign,
+        SubjectKind::TemplateRelease,
+        &found,
+        MAX_ATTEMPTS,
+    )
+    .await?;
+    // Candidate discovery advances Tokio's clock by 950ms on a 1s lease
+    // (`held_for = 900ms`) and a 500ms item deadline, with PostgreSQL kept on
+    // real time. If `leased_at` were stamped before candidate discovery, both
+    // `first_held_until` (900ms) and `item_deadline` (500ms) would already
+    // have elapsed before the worker started driving the item.
+    let driver = FakeDriver::default();
+    {
+        let mut state = driver.state();
+        state.plan = Ok(Plan::Scan(ScanPlan {
+            moves: false,
+            inputs: 1,
+        }));
+        state.stranded_candidates = found.clone();
+        state.stranded_discovery_delay = Duration::from_millis(950);
+    }
+    let reconciler = Reconciler::new(
+        db.pool.clone(),
+        Drivers::default().with(driver.clone()),
+        ReconcilerConfig {
+            enabled: true,
+            lease: Duration::from_secs(1),
+            item_deadline: Duration::from_millis(500),
+            ..config()
+        },
+    );
+
+    let report = tick(&reconciler).await;
+    assert_eq!(report.leased, 1);
+
+    assert_eq!(driver.upgraded(), found);
+    assert_eq!(
+        item(&db.pool, campaign, found[0]).await?,
+        ("done".to_owned(), None, 1)
+    );
+    Ok(())
+}

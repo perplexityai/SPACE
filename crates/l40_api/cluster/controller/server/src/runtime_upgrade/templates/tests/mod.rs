@@ -291,8 +291,9 @@ enum OnWrite {
     MarkDeleting,
     /// Move the cluster default to this environment, then fail the write.
     MoveDefaultAndFail(EnvironmentReference),
-    /// Register a worker that reports no twin support, then write.
-    AddWorkerThatDoesntReadTwins,
+    /// Register a worker that reports no twin support on the first matching
+    /// write, then write.
+    AddWorkerThatDoesntReadTwins(std::sync::atomic::AtomicBool),
 }
 
 /// The fixture's objects, with a race injected into the twin-metadata writes
@@ -366,13 +367,15 @@ impl ReleaseObjects for HookedObjects {
                     },
                 )
             }
-            OnWrite::AddWorkerThatDoesntReadTwins => {
-                pplx_space_db_test_fixtures::insert_ready_worker_node(
-                    &self.pool,
-                    pplx_space_accounts::NodeId::new(),
-                )
-                .await
-                .expect("register a worker");
+            OnWrite::AddWorkerThatDoesntReadTwins(ref fired) => {
+                if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    pplx_space_db_test_fixtures::insert_ready_worker_node(
+                        &self.pool,
+                        pplx_space_accounts::NodeId::new(),
+                    )
+                    .await
+                    .expect("register a worker");
+                }
                 self.inner
                     .write_twin_metadata(target, environment, document)
                     .await

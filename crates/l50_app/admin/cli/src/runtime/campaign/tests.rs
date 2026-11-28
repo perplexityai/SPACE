@@ -166,6 +166,40 @@ async fn start_sends_the_settings_and_leaves_unset_defaults_to_the_server() {
                 "reason": "r",
             })
         );
+
+        client
+            .runtime_command(campaign(&[
+                "start",
+                "--kind",
+                "sandbox_force_restarts",
+                "--from",
+                E0,
+                "--to",
+                E1,
+                "--wave-size",
+                "3",
+                "--per-node",
+                "1",
+                "--failure-budget",
+                "2",
+                "--reason",
+                "retire memory",
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(
+            requests.try_recv().unwrap().1,
+            json!({
+                "kind": "sandbox_force_restarts",
+                "from_environment_ref": E0,
+                "to_environment_ref": E1,
+                "max_in_flight_per_cluster": 3,
+                "max_in_flight_per_node": 1,
+                "failure_budget": 2,
+                "include_running": false,
+                "reason": "retire memory",
+            })
+        );
     })
     .await;
 }

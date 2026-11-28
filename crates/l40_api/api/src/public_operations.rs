@@ -2694,25 +2694,24 @@ async fn gc_expired(
         .await?;
     }
 
+    operation_store::operations::share_lock_campaign_retention(&mut *tx).await?;
     let operation_ids = operation_store::operations::due_for_gc(&mut *tx, max_records).await?;
 
     let idempotency_rows =
         operation_store::idempotency::delete_expired_batch(&mut *tx, max_records).await?;
 
-    let dependent_idempotency_rows =
-        operation_store::idempotency::delete_for_operations(&mut *tx, &operation_ids).await?;
-
-    let operation_rows =
-        operation_store::operations::delete_by_ids(&mut *tx, &operation_ids).await?;
+    let deleted =
+        operation_store::operations::delete_by_ids_with_idempotency(&mut *tx, &operation_ids)
+            .await?;
 
     tx.commit().await?;
 
     Ok(PublicOperationGcReport {
-        operations_deleted: u64::try_from(operation_rows.len()).unwrap_or(u64::MAX),
+        operations_deleted: u64::try_from(deleted.operations.len()).unwrap_or(u64::MAX),
         idempotency_records_deleted: u64::try_from(
             idempotency_rows
                 .len()
-                .saturating_add(dependent_idempotency_rows.len()),
+                .saturating_add(deleted.idempotency_records.len()),
         )
         .unwrap_or(u64::MAX),
     })

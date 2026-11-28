@@ -44,14 +44,14 @@ pub(super) fn insert_runtime_upgrade_campaign_paths(paths: &mut Map<String, Valu
                                 "additionalProperties": false,
                                 "required": ["kind", "from_environment_ref", "to_environment_ref", "max_in_flight_per_cluster", "failure_budget", "reason"],
                                 "properties": {
-                                    "kind": { "type": "string", "enum": ["templates", "sandboxes"] },
+                                    "kind": { "type": "string", "enum": ["templates", "sandboxes", "sandbox_force_restarts"] },
                                     "from_environment_ref": environment_ref.clone(),
                                     "to_environment_ref": environment_ref,
                                     "canary_size": { "type": "integer", "enum": [0, 1], "default": 1, "description": "Subjects upgraded before the campaign waits for a resume: 1, or 0 to start rolling. Only 0 and 1 are accepted, since a canary upgrades exactly one subject." },
                                     "max_in_flight_per_cluster": { "type": "integer", "minimum": 1, "maximum": i64::MAX, "description": "The wave size: items in flight at once across the cluster" },
                                     "max_in_flight_per_node": { "type": "integer", "minimum": 1, "maximum": i64::MAX, "default": 1, "description": "Items in flight at once on any one node, at most max_in_flight_per_cluster. Only sandbox campaigns, whose subjects have a node, apply it, but it must stay in that range for every kind." },
                                     "failure_budget": { "type": "integer", "minimum": 1, "maximum": i64::MAX, "description": "Failed items at which the campaign pauses itself" },
-                                    "include_running": { "type": "boolean", "default": false, "description": "For a sandbox campaign, also take running and paused sandboxes" },
+                                    "include_running": { "type": "boolean", "default": false, "description": "For a sandboxes campaign, also take running and paused sandboxes. Refused on templates and sandbox_force_restarts campaigns." },
                                     "reason": reason.clone()
                                 }
                             }
@@ -60,7 +60,7 @@ pub(super) fn insert_runtime_upgrade_campaign_paths(paths: &mut Map<String, Valu
                 },
                 "responses": {
                     "201": { "description": "Object with the new campaign's id, phase and generation (0)" },
-                    "400": { "description": "Invalid body, kind, environment reference, canary size, pacing (max_in_flight_per_cluster 0, max_in_flight_per_node 0 or over max_in_flight_per_cluster, failure_budget 0, or a count over the maximum) or reason, the same source and target, or include_running on a templates campaign" },
+                    "400": { "description": "Invalid body, kind, environment reference, canary size, pacing (max_in_flight_per_cluster 0, max_in_flight_per_node 0 or over max_in_flight_per_cluster, failure_budget 0, or a count over the maximum) or reason, the same source and target, or include_running on a templates or sandbox_force_restarts campaign" },
                     "403": { "description": "Managing organization administrator required" },
                     "409": { "description": "No driver moves this kind yet, or an unfinished campaign of the kind already moves the source" }
                 }

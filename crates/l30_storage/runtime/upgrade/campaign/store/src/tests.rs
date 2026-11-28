@@ -21,6 +21,7 @@ use super::*;
 
 mod kinds;
 mod operator;
+mod receipts;
 mod sandboxes;
 mod twin_readers;
 
@@ -1253,7 +1254,7 @@ async fn completion_inside_a_transaction_older_than_the_campaign_succeeds() -> T
     tokio::time::sleep(Duration::from_millis(10)).await;
     let campaign = insert_campaign(&db.pool, CampaignSeed::default()).await?;
 
-    assert!(complete_if_drained(&mut *caller, campaign).await?);
+    assert!(complete_if_drained(&mut *caller, campaign, 0).await?);
     caller.commit().await?;
     let record = get_record(&db.pool, campaign).await?.expect("exists");
     assert_eq!(record.campaign.phase, CampaignPhase::Completed);
@@ -1269,17 +1270,18 @@ async fn outcomes_store_their_phase_and_error() -> TestResult {
     let campaign = insert_campaign(
         &db.pool,
         CampaignSeed {
-            per_node: 4,
-            per_cluster: 4,
+            per_node: 5,
+            per_cluster: 5,
             ..CampaignSeed::default()
         },
     )
     .await?;
-    pending_on(&db, campaign, None, 4).await?;
+    pending_on(&db, campaign, None, 5).await?;
     let leased = lease(&db, campaign).await?;
     let long = "x".repeat(ItemError::MAX_CHARS + 10);
     let outcomes = [
         (ItemOutcome::Done, "done", None),
+        (ItemOutcome::Skipped(ItemError::new("")), "skipped", None),
         (
             ItemOutcome::Skipped(ItemError::new("deleted")),
             "skipped",
@@ -1529,16 +1531,16 @@ async fn only_a_drained_rolling_campaign_completes() -> TestResult {
     let mut conn = db.pool.acquire().await?;
 
     assert!(
-        !complete_if_drained(&mut *conn, canary).await?,
+        !complete_if_drained(&mut *conn, canary, 0).await?,
         "a canary waits for resume"
     );
     assert!(
-        !complete_if_drained(&mut *conn, campaign).await?,
+        !complete_if_drained(&mut *conn, campaign, 0).await?,
         "an item is pending"
     );
     let leased = lease(&db, campaign).await?;
     assert!(
-        !complete_if_drained(&mut *conn, campaign).await?,
+        !complete_if_drained(&mut *conn, campaign, 0).await?,
         "an item is in flight"
     );
     finish_item(
@@ -1548,12 +1550,16 @@ async fn only_a_drained_rolling_campaign_completes() -> TestResult {
     )
     .await?;
 
-    assert!(complete_if_drained(&mut *conn, campaign).await?);
+    assert!(
+        !complete_if_drained(&mut *conn, campaign, 1).await?,
+        "a stale or mismatched expected_generation refuses completion"
+    );
+    assert!(complete_if_drained(&mut *conn, campaign, 0).await?);
     assert_eq!(
         campaign_phase(&db.pool, campaign).await?,
         ("completed".to_owned(), true)
     );
-    assert!(!complete_if_drained(&mut *conn, campaign).await?);
+    assert!(!complete_if_drained(&mut *conn, campaign, 1).await?);
     Ok(())
 }
 
@@ -1775,7 +1781,7 @@ async fn a_campaign_over_its_budget_doesnt_complete_or_lease() -> TestResult {
     .bind(campaign)
     .execute(&db.pool)
     .await?;
-    assert!(!complete_if_drained(&db.pool, campaign).await?);
+    assert!(!complete_if_drained(&db.pool, campaign, 0).await?);
     assert!(pause_if_over_budget(&Db::from(db.pool.clone()), campaign).await?);
     Ok(())
 }
@@ -1926,7 +1932,15 @@ fn a_campaign_with_impossible_pacing_or_reason_is_refused_before_the_database() 
                 ..new_campaign(10, CampaignKind::Templates)
             },
             "include_running on a template campaign",
-            "include_running applies only to sandbox campaigns",
+            "include_running applies only to sandboxes campaigns",
+        ),
+        (
+            NewCampaign {
+                include_running: true,
+                ..new_campaign(10, CampaignKind::SandboxForceRestarts)
+            },
+            "include_running on a force-restart campaign",
+            "include_running applies only to sandboxes campaigns",
         ),
         (
             NewCampaign {

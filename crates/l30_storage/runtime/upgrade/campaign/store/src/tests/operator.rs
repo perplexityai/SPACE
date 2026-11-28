@@ -724,7 +724,7 @@ async fn completion_and_the_budget_pause_leave_an_aborted_campaign_alone() -> Te
     }
     let counts = item_counts(&db.pool, drained).await?;
     assert_eq!((counts.pending, counts.in_flight, counts.failed), (0, 0, 1));
-    assert!(!complete_if_drained(&db.pool, drained).await?);
+    assert!(!complete_if_drained(&db.pool, drained, 1).await?);
     assert_eq!(item_counts(&db.pool, at_budget).await?.failed, 3);
     assert!(!pause_if_over_budget(&Db::from(db.pool.clone()), at_budget).await?);
     for campaign in [drained, at_budget] {
@@ -988,7 +988,7 @@ async fn a_drained_canary_with_nothing_done_completes_and_one_with_a_done_item_w
     };
     // No subjects at all.
     let empty = insert_campaign(&db.pool, canary(50)).await?;
-    assert!(complete_if_drained(&db.pool, empty).await?);
+    assert!(complete_if_drained(&db.pool, empty, 0).await?);
     // Every subject skipped.
     let skipped = insert_campaign(&db.pool, canary(51)).await?;
     pending_on(&db, skipped, None, 1).await?;
@@ -999,14 +999,14 @@ async fn a_drained_canary_with_nothing_done_completes_and_one_with_a_done_item_w
         &ItemOutcome::Skipped(ItemError::new("gone")),
     )
     .await?;
-    assert!(complete_if_drained(&db.pool, skipped).await?);
+    assert!(complete_if_drained(&db.pool, skipped, 0).await?);
     // A done canary waits for the operator's resume.
     let done = insert_campaign(&db.pool, canary(52)).await?;
     pending_on(&db, done, None, 1).await?;
     let leased = lease(&db, done).await?;
     assert!(finish_item(&db.pool, &leased[0], &ItemOutcome::Done).await?);
     assert_eq!(item_counts(&db.pool, done).await?.done, 1);
-    assert!(!complete_if_drained(&db.pool, done).await?);
+    assert!(!complete_if_drained(&db.pool, done, 0).await?);
     // One whose subject failed, under its budget, completes like a rolling
     // campaign would, with the failure in its counts.
     let failed = insert_campaign(&db.pool, canary(54)).await?;
@@ -1018,7 +1018,7 @@ async fn a_drained_canary_with_nothing_done_completes_and_one_with_a_done_item_w
         &ItemOutcome::Failed(ItemError::new("boot failed")),
     )
     .await?;
-    assert!(complete_if_drained(&db.pool, failed).await?);
+    assert!(complete_if_drained(&db.pool, failed, 0).await?);
     assert_eq!(item_counts(&db.pool, failed).await?.failed, 1);
 
     for (campaign, phase) in [

@@ -694,7 +694,10 @@ pub async fn converge_published_stopped(
 /// writes an activation-completed receipt only once the guest has passed its
 /// readiness gate, so the receipt for the attempt a create gave up waiting on
 /// is the evidence the marker was waiting for. A receipt that releases
-/// nothing leaves the marker to the data-plane confirmation.
+/// nothing leaves the marker to the data-plane confirmation. A projected
+/// `started` or `paused` target also clears a `disk` local-artifact pin (matching
+/// `action_stamp::stamp_started_after_start`), while preserving a `full`
+/// suspend pin for started-recovery until guest activity invalidates it.
 pub async fn release_completed_activations(
     executor: impl Executor<'_>,
     node_id: NodeId,
@@ -765,6 +768,24 @@ pub async fn release_completed_activations(
                     WHEN released.transition_receipt_target_state = 'started'
                     THEN FALSE
                     ELSE sandbox.command_ready_pending
+                END,
+                current_local_artifact_id = CASE
+                    WHEN released.transition_receipt_target_state IN ('started', 'paused')
+                     AND sandbox.current_local_artifact_kind = 'disk'
+                    THEN NULL
+                    ELSE sandbox.current_local_artifact_id
+                END,
+                current_local_artifact_kind = CASE
+                    WHEN released.transition_receipt_target_state IN ('started', 'paused')
+                     AND sandbox.current_local_artifact_kind = 'disk'
+                    THEN NULL
+                    ELSE sandbox.current_local_artifact_kind
+                END,
+                current_local_artifact_origin = CASE
+                    WHEN released.transition_receipt_target_state IN ('started', 'paused')
+                     AND sandbox.current_local_artifact_kind = 'disk'
+                    THEN NULL
+                    ELSE sandbox.current_local_artifact_origin
                 END
            FROM released
           WHERE sandbox.id = released.sandbox_id

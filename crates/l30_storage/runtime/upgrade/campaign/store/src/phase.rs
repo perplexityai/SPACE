@@ -30,6 +30,7 @@ pub async fn pause_if_over_budget(db: &Db, campaign_id: CampaignId) -> Result<bo
     let mut reconciling = Reconciling {
         tx: &mut tx,
         campaign_id,
+        expected_generation: None,
     };
     let paused = pplx_space_rollout_queue::pause_if_over_budget(&mut reconciling).await;
     end_db_transaction(tx, paused).await
@@ -56,8 +57,12 @@ pub async fn pause_if_over_budget(db: &Db, campaign_id: CampaignId) -> Result<bo
 /// when this call completed the campaign.
 ///
 /// Locks the campaign row before reading its items, in a statement of its
-/// own: a single `UPDATE` would read the items from a snapshot taken before
-/// it waited for the lock, and could complete a campaign under items that
+/// own, and checks that `generation` still equals `expected_generation` (the
+/// generation under which the pass scanned): an operator `:pause`/`:resume`
+/// while the final page was finishing advances `generation`, so the stale pass
+/// refuses completion until a fresh pass scans under the new generation. A
+/// single `UPDATE` would read the items from a snapshot taken before it waited
+/// for the lock, and could complete a campaign under items that
 /// [`crate::insert_pending`] committed meanwhile. That holds at `READ
 /// COMMITTED`, where each statement takes a new snapshot; a caller's
 /// `REPEATABLE READ` transaction would read the items as they were before
@@ -65,11 +70,13 @@ pub async fn pause_if_over_budget(db: &Db, campaign_id: CampaignId) -> Result<bo
 pub async fn complete_if_drained(
     conn: impl Acquire<'_, Database = Postgres>,
     campaign_id: CampaignId,
+    expected_generation: u64,
 ) -> Result<bool, DbError> {
     let mut tx = conn.begin().await?;
     let mut reconciling = Reconciling {
         tx: &mut *tx,
         campaign_id,
+        expected_generation: Some(expected_generation),
     };
     let completed = pplx_space_rollout_queue::complete_if_drained(&mut reconciling).await;
     end_transaction(tx, completed).await
@@ -101,6 +108,7 @@ where
 struct Reconciling<'c, C> {
     tx: &'c mut C,
     campaign_id: CampaignId,
+    expected_generation: Option<u64>,
 }
 
 impl<C> FailedItems for Reconciling<'_, C>
@@ -124,8 +132,8 @@ where
             .filter(|phase| phase.leases())
             .map(|phase| phase.as_str())
             .collect();
-        let locked = sqlx::query_as::<_, (i64, bool)>(sql!(
-            "SELECT failure_budget, phase = $3
+        let locked = sqlx::query_as::<_, (i64, bool, i64)>(sql!(
+            "SELECT failure_budget, phase = $3, generation
              FROM runtime_upgrade_campaigns
              WHERE id = $1
                AND phase = ANY($2)
@@ -136,7 +144,15 @@ where
         .bind(CampaignPhase::Canary.as_str())
         .fetch_optional((&mut *self.tx).into_sqlx())
         .await?;
-        Ok(locked.map(|(failure_budget, canary)| Leasing {
+        let Some((failure_budget, canary, generation)) = locked else {
+            return Ok(None);
+        };
+        if let Some(expected) = self.expected_generation
+            && u64::try_from(generation).ok() != Some(expected)
+        {
+            return Ok(None);
+        }
+        Ok(Some(Leasing {
             canary,
             // The schema keeps it at least 1.
             failure_budget: u64::try_from(failure_budget).unwrap_or(0),

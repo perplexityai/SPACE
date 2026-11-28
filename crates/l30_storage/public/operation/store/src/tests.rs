@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::operations;
 
+mod gc_retention;
 mod guarded;
 
 pub(super) const SEED_ORG: &str = "00000000-0000-0000-0000-000000000001";

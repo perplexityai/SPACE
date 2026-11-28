@@ -139,6 +139,7 @@ pplx-space-firewall-rules-store = { workspace = true, features = ["test-support"
 pplx-space-node-status-store = { workspace = true, features = ["test-support"] }
 pplx-space-node-api-sim = { workspace = true }
 pplx-space-policy-authority = { workspace = true }
+pplx-space-public-operation-store = { workspace = true }
 pplx-space-sandbox-store = { workspace = true, features = ["test-support"] }
 pplx-space-sandbox-portability = { workspace = true, features = ["test-support"] }
 pplx-space-runtime-upgrade-campaign-store = { workspace = true, features = ["test-support"] }

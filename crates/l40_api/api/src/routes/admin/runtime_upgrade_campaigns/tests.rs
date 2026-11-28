@@ -16,16 +16,14 @@ use crate::routes::admin::test_fixtures::{
     assert_error_contains,
 };
 
-const BOTH_KINDS: &[CampaignKind] = &[CampaignKind::Templates, CampaignKind::Sandboxes];
-
 fn environment(byte: u8) -> EnvironmentReference {
     EnvironmentReference::new(Digest::sha256([byte; 32]))
 }
 
-/// A harness whose API starts campaigns of both kinds, as it will once both
-/// drivers land.
+/// A harness whose API starts campaigns of every kind, as it will once every
+/// driver is registered.
 async fn driven() -> TestResult<Option<AdminRouterHarness>> {
-    admin_router_harness_with(|state| state.runtime_upgrade_driven_kinds = BOTH_KINDS).await
+    admin_router_harness_with(|state| state.runtime_upgrade_driven_kinds = CampaignKind::ALL).await
 }
 
 fn start_body(kind: &str, from: u8) -> Value {
@@ -92,15 +90,22 @@ async fn a_start_for_a_kind_with_no_driver_is_refused() -> TestResult {
     let Some(h) = admin_router_harness().await? else {
         return Ok(());
     };
-    let (status, body) = start(&h, start_body("sandboxes", 1)).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_error_contains(&body, "no cluster-controller driver moves");
+    for kind in ["sandboxes", "sandbox_force_restarts"] {
+        let (status, body) = start(&h, start_body(kind, 1)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{kind}: {body}");
+        assert_error_contains(&body, "no cluster-controller driver moves");
+    }
     // An invalid start is refused as invalid, not for its kind.
     let mut invalid = start_body("templates", 1);
     invalid["failure_budget"] = json!(0);
     let (status, body) = start(&h, invalid).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_error_contains(&body, "failure_budget must be at least 1");
+    let mut invalid_force = start_body("sandbox_force_restarts", 1);
+    invalid_force["include_running"] = json!(true);
+    let (status, body) = start(&h, invalid_force).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_error_contains(&body, "include_running applies only to sandboxes campaigns");
     let (status, body) = h
         .as_operator(Method::GET, "/runtime-upgrade-campaigns", &[], None)
         .await;
@@ -217,7 +222,26 @@ async fn a_start_is_refused_while_a_campaign_moves_the_same_source() -> TestResu
     let (status, body) = start(&h, start_body("sandboxes", 1)).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_error_contains(&body, first["id"].as_str().unwrap());
-    // Another kind or another source is free.
+    // Another kind (including a coexisting `sandbox_force_restarts` campaign on
+    // the same source) or another source is free, while a duplicate
+    // `sandbox_force_restarts` for that source is refused.
+    let (status, force_restarts) = start(&h, start_body("sandbox_force_restarts", 1)).await;
+    assert_eq!(status, StatusCode::CREATED, "{force_restarts}");
+    let force_id = force_restarts["id"].as_str().unwrap();
+    let (status, force_detail) = h
+        .as_operator(
+            Method::GET,
+            &format!("/runtime-upgrade-campaigns/{force_id}"),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{force_detail}");
+    assert_eq!(force_detail["kind"], "sandbox_force_restarts");
+    assert_eq!(force_detail["include_running"], false);
+    let (status, duplicate_force) = start(&h, start_body("sandbox_force_restarts", 1)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{duplicate_force}");
+    assert_error_contains(&duplicate_force, force_id);
     let (status, _) = start(&h, start_body("templates", 1)).await;
     assert_eq!(status, StatusCode::CREATED);
     let (status, _) = start(&h, start_body("sandboxes", 2)).await;
@@ -465,6 +489,23 @@ async fn a_sandbox_campaign_without_an_edge_reports_its_pending_items_stranded()
     )
     .await?;
     items(&h, uncertified, SubjectKind::Sandbox, ItemPhase::Pending, 2).await?;
+    let uncertified_force_restarts = insert_campaign(
+        &h.db.pool,
+        CampaignSeed {
+            from: environment(8),
+            kind: CampaignKind::SandboxForceRestarts,
+            ..CampaignSeed::default()
+        },
+    )
+    .await?;
+    items(
+        &h,
+        uncertified_force_restarts,
+        SubjectKind::Sandbox,
+        ItemPhase::Pending,
+        4,
+    )
+    .await?;
     let templates = insert_campaign(
         &h.db.pool,
         CampaignSeed {
@@ -489,6 +530,7 @@ async fn a_sandbox_campaign_without_an_edge_reports_its_pending_items_stranded()
     assert_eq!(stranded_of(campaign), Some(json!(0)));
     assert_eq!(stranded_of(finished), Some(json!(0)));
     assert_eq!(stranded_of(uncertified), Some(json!(2)));
+    assert_eq!(stranded_of(uncertified_force_restarts), Some(json!(4)));
     assert_eq!(stranded_of(templates), Some(Value::Null));
     Ok(())
 }
@@ -829,11 +871,13 @@ fn a_template_campaign_reports_its_workers_hold_after_the_substrates() {
                 expected,
                 "{phase:?} boots={boots} workers_hold={workers_hold}"
             );
-            assert_eq!(
-                held(CampaignKind::Sandboxes, phase, boots, workers_hold),
-                None,
-                "{phase:?}"
-            );
+            for kind in [CampaignKind::Sandboxes, CampaignKind::SandboxForceRestarts] {
+                assert_eq!(
+                    held(kind, phase, boots, workers_hold),
+                    None,
+                    "{kind:?} {phase:?}"
+                );
+            }
         }
     }
     assert!(NODES_DONT_READ_TWINS.detail.contains("reads_twin_metadata"));

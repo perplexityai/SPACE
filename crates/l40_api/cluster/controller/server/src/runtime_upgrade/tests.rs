@@ -107,6 +107,14 @@ struct FakeState {
     already_on_target: usize,
     /// Per-call delays, in call order; [`FakeDriver::delay`] once they run out.
     delays: VecDeque<Duration>,
+    /// One-shot pause + resume + new source subject triggered during a
+    /// continuation page (`after.is_some()`) after `list_unfinished` already
+    /// captured the pre-pause `generation`.
+    pause_and_resume_mid_pass: Option<(PgPool, CampaignId, Uuid)>,
+    /// Target-ready pending subjects returned while `plan.moves == false`, plus
+    /// simulated discovery latency before the reconciler claims the lease.
+    stranded_candidates: Vec<Uuid>,
+    stranded_discovery_delay: Duration,
 }
 
 impl Default for FakeState {
@@ -128,6 +136,9 @@ impl Default for FakeState {
             applied: std::collections::HashSet::new(),
             already_on_target: 0,
             delays: VecDeque::new(),
+            pause_and_resume_mid_pass: None,
+            stranded_candidates: Vec::new(),
+            stranded_discovery_delay: Duration::ZERO,
         }
     }
 }
@@ -192,7 +203,24 @@ impl CampaignDriver for FakeDriver {
         _plan: ScanPlan,
         after: Option<Uuid>,
         limit: u32,
-    ) -> Result<SubjectPage, String> {
+    ) -> Result<SubjectScan, String> {
+        let mid_pass = if after.is_some() {
+            self.state().pause_and_resume_mid_pass.take()
+        } else {
+            None
+        };
+        if let Some((pool, campaign_id, behind_cursor)) = mid_pass {
+            let db = Db::from(pool);
+            store::pause_campaign(&db, campaign_id, &store::PhaseChange::default())
+                .await
+                .map_err(|error| error.to_string())?;
+            store::resume_campaign(&db, campaign_id, &store::PhaseChange::default(), false)
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut state = self.state();
+            state.on_source.push(behind_cursor);
+            state.on_source.sort();
+        }
         let mut state = self.state();
         state.finds.push(after);
         let page: Vec<Uuid> = state
@@ -202,12 +230,37 @@ impl CampaignDriver for FakeDriver {
             .filter(|subject| after.is_none_or(|after| *subject > after))
             .take(limit as usize)
             .collect();
-        Ok(SubjectPage {
+        Ok(SubjectScan::Page(SubjectPage {
             examined: page.len(),
             last: page.last().copied(),
             on_source: page,
             elsewhere: Vec::new(),
-        })
+        }))
+    }
+
+    async fn stranded_lease_candidates(
+        &self,
+        _campaign: &Campaign,
+        scan_limit: u32,
+    ) -> Result<Vec<Uuid>, String> {
+        let (delay, candidates) = {
+            let state = self.state();
+            (
+                state.stranded_discovery_delay,
+                state
+                    .stranded_candidates
+                    .iter()
+                    .copied()
+                    .take(scan_limit as usize)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        if !delay.is_zero() {
+            tokio::time::pause();
+            tokio::time::advance(delay).await;
+            tokio::time::resume();
+        }
+        Ok(candidates)
     }
 
     async fn upgrade(&self, _campaign: &Campaign, item: &LeasedItem) -> ItemOutcome {
@@ -628,6 +681,61 @@ async fn a_campaign_completes_only_on_a_tick_that_ends_a_pass() -> TestResult {
     let report = tick(&reconciler).await;
     assert_eq!(report.completed, vec![campaign]);
     assert_eq!(counts(&db.pool, campaign).await?.done, 3);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pausing_and_resuming_during_pass_end_refuses_completion_until_next_pass() -> TestResult {
+    let Some(db) = test_db().await? else {
+        return Ok(());
+    };
+    let campaign = insert_campaign(
+        &db.pool,
+        CampaignSeed {
+            per_cluster: 10,
+            ..seed()
+        },
+    )
+    .await?;
+    let pair = subjects(2);
+    let (behind_cursor, ahead) = (pair[0], pair[1]);
+    let driver = FakeDriver::with_subjects(&[ahead]);
+    let reconciler = Reconciler::new(
+        db.pool.clone(),
+        Drivers::default().with(driver.clone()),
+        ReconcilerConfig {
+            candidate_page: 1,
+            ..config()
+        },
+    );
+
+    // Pass 1 upgrades `ahead` across two ticks (`examined == 1`, then `0`);
+    // tick 3 starts Pass 2 settled at `generation = 0` (`after = Some(ahead)`).
+    tick(&reconciler).await;
+    tick(&reconciler).await;
+    tick(&reconciler).await;
+    assert_eq!(campaign_phase(&db.pool, campaign).await?, "rolling");
+
+    // On Pass 2's ending page (`after = Some(ahead)`), an operator pauses and
+    // resumes `campaign` (`generation` 0 -> 2) after `list_unfinished` read
+    // `generation = 0`, while `behind_cursor` appears behind `ahead`.
+    driver.state().pause_and_resume_mid_pass = Some((db.pool.clone(), campaign, behind_cursor));
+    let raced = tick(&reconciler).await;
+    assert!(
+        raced.completed.is_empty(),
+        "complete_if_drained must reject a pass whose generation changed mid-tick"
+    );
+    assert_eq!(campaign_phase(&db.pool, campaign).await?, "rolling");
+
+    // Subsequent ticks restart from `after = None` under `generation = 2`,
+    // upgrade `behind_cursor`, and complete only after a full settled pass.
+    let mut ticks = 0;
+    while campaign_phase(&db.pool, campaign).await? == "rolling" && ticks < 8 {
+        tick(&reconciler).await;
+        ticks += 1;
+    }
+    assert_eq!(campaign_phase(&db.pool, campaign).await?, "completed");
+    assert_eq!(counts(&db.pool, campaign).await?.done, 2);
     Ok(())
 }
 

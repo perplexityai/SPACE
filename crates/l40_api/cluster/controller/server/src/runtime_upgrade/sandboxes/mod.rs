@@ -24,9 +24,9 @@
 //!   attempts run out. One in a lifecycle the plan doesn't scan (a sandbox
 //!   that had started under a stopped-only campaign, say) isn't, and one that
 //!   stops after its part of a pass was scanned is left to the start-time
-//!   upgrade. The plan's fingerprint covers every catalog row's identity, the
-//!   source row's edges, the legacy unbound setting and which lifecycles
-//!   count, so a change of any restarts the pass.
+//!   upgrade. The plan's fingerprint covers the policy generation, every
+//!   catalog row's identity, the source row's edges, the legacy unbound
+//!   setting and which lifecycles count, so a change of any restarts the pass.
 //! * **Upgrade.** Decided on the sandbox as it is now, read fresh. A stopped
 //!   sandbox on the source or target goes to
 //!   [`SandboxUpgradeDispatcher::upgrade_stopped`] and stays stopped. A
@@ -59,6 +59,8 @@ use pplx_space_api::controllers::substrate::runtime_upgrade::{
     attribute, decide,
 };
 use pplx_space_execution_spec::EnvironmentReference;
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_postgres_pool::{Db, Executor as PoolExecutor};
 use pplx_space_runtime_environment_policy_store::{
     RuntimeEnvironmentPolicy, RuntimeEnvironmentState,
 };
@@ -69,36 +71,39 @@ use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::{CampaignDriver, MAX_ATTEMPTS, Plan, ScanPlan, SubjectPage};
+use super::{CampaignDriver, MAX_ATTEMPTS, Plan, ScanPlan, SubjectPage, SubjectScan};
 
 mod dispatcher;
+mod force_restarts;
 
 #[cfg(test)]
 mod tests;
 
-pub use dispatcher::{DispatchError, GuardedStop, SandboxUpgradeDispatcher, StoppedUpgrade};
+pub use dispatcher::{
+    DispatchError, GuardedStop, InitiatedStop, RecordedStop, SandboxUpgradeDispatcher,
+    StartingClaim, StartingRecovery, StopFence, StoppedK8sExecution, StoppedUpgrade, TargetStart,
+};
 use dispatcher::{Step, step};
+pub use force_restarts::{MemoryRetirement, MemoryRetirementSource, SandboxForceRestartDriver};
 
 pub(super) const NO_LONGER_ON_SOURCE: &str = "the sandbox is no longer on the campaign's source";
 pub(super) const ON_NEITHER_END: &str =
     "the sandbox is on neither the campaign's source nor its target";
 pub(super) const POLICY_STOPPED_MOVING_RUNNING: &str =
     "the policy no longer moves this campaign's running sandboxes";
-pub(super) const PLAN_CHANGED: &str =
-    "the policy or catalog changed since the campaign was planned; retrying next tick";
 
 /// Drives `sandboxes` campaigns of one substrate's sandboxes.
 pub struct SandboxDriver<D> {
     pool: PgPool,
     /// The substrate's `sandboxes.managed_by`: only its sandboxes are found.
-    managed_by: &'static str,
+    managed_by: SubstrateKind,
     dispatcher: Arc<D>,
 }
 
 impl<D: SandboxUpgradeDispatcher> SandboxDriver<D> {
     /// A driver for the sandboxes `managed_by` owns
     /// (`SubstrateAdapter::managed_by`), moved through `dispatcher`.
-    pub fn new(pool: PgPool, managed_by: &'static str, dispatcher: D) -> Self {
+    pub fn new(pool: PgPool, managed_by: SubstrateKind, dispatcher: D) -> Self {
         Self {
             pool,
             managed_by,
@@ -181,32 +186,53 @@ const fn scanned_lifecycles(takes_running: bool) -> &'static [SandboxLifecycle] 
 }
 
 /// The policy and the unretired catalog, as every decision reads them.
-struct Inputs {
-    policy: RuntimeEnvironmentPolicy,
-    catalog: Vec<CatalogEnvironment>,
+pub(super) struct Inputs {
+    pub(super) policy: RuntimeEnvironmentPolicy,
+    pub(super) catalog: Vec<CatalogEnvironment>,
 }
 
 impl Inputs {
-    async fn read(pool: &PgPool) -> Result<Self, String> {
-        let policy = pplx_space_runtime_environment_policy_store::get(pool)
+    pub(super) async fn read(pool: &PgPool) -> Result<Self, String> {
+        let mut tx = Db::from(pool.clone())
+            .begin_snapshot()
+            .await
+            .map_err(|error| format!("beginning snapshot read failed: {error}"))?;
+        let inputs = Self::read_conn(&mut tx).await?;
+        tx.commit()
+            .await
+            .map_err(|error| format!("finishing snapshot read failed: {error}"))?;
+        Ok(inputs)
+    }
+
+    pub(super) async fn read_conn<C>(conn: &mut C) -> Result<Self, String>
+    where
+        for<'a> &'a mut C: PoolExecutor<'a>,
+    {
+        let policy = pplx_space_runtime_environment_policy_store::get(&mut *conn)
             .await
             .map_err(|error| format!("reading the policy failed: {error}"))?;
-        let catalog = pplx_space_runtime_environment_catalog_store::unretired_environments(pool)
-            .await
-            .map_err(|error| format!("reading the catalog failed: {error}"))?
-            .into_iter()
-            .map(CatalogEnvironment::from_row)
-            .collect::<Result<_, _>>()
-            .map_err(|error| format!("reading the catalog failed: {error}"))?;
+        let catalog =
+            pplx_space_runtime_environment_catalog_store::unretired_environments(&mut *conn)
+                .await
+                .map_err(|error| format!("reading the catalog failed: {error}"))?
+                .into_iter()
+                .map(CatalogEnvironment::from_row)
+                .collect::<Result<_, _>>()
+                .map_err(|error| format!("reading the catalog failed: {error}"))?;
         Ok(Self { policy, catalog })
     }
 
-    fn plan(&self, campaign: &Campaign) -> SandboxPlan {
-        let from_catalog = self
-            .catalog
+    pub(super) fn catalog_entry(
+        &self,
+        reference: EnvironmentReference,
+    ) -> Option<&CatalogEnvironment> {
+        self.catalog
             .iter()
-            .find(|environment| environment.reference == campaign.from);
-        sandbox_plan(&self.policy, from_catalog, campaign)
+            .find(|environment| environment.reference == reference)
+    }
+
+    fn plan(&self, campaign: &Campaign) -> SandboxPlan {
+        sandbox_plan(&self.policy, self.catalog_entry(campaign.from), campaign)
     }
 
     /// The loop's plan for `campaign`, and which lifecycles it scans.
@@ -227,15 +253,17 @@ impl Inputs {
     }
 
     /// A fingerprint of what judges `campaign`'s sandboxes besides `moves`:
-    /// every catalog row's identity, which an unbound record is matched
-    /// against ([`attribute`]); the source row's edges, which the plan reads;
-    /// the legacy unbound setting; and which lifecycles count. Other rows'
-    /// edges judge nothing here, so an edge recompute elsewhere doesn't
-    /// restart the pass. Within one process, equal inputs give equal
-    /// fingerprints.
-    fn fingerprint(&self, campaign: &Campaign, takes_running: bool) -> u64 {
+    /// the policy generation (so a policy hold-and-unhold between ticks
+    /// restarts an open pass); every catalog row's identity, which an unbound
+    /// record is matched against ([`attribute`]); the source row's edges,
+    /// which the plan reads; the legacy unbound setting; and any mode-specific
+    /// selector (`extra`). Other catalog rows' edges judge nothing here, so an
+    /// edge recompute elsewhere doesn't restart the pass. Within one process,
+    /// equal inputs give equal fingerprints.
+    pub(super) fn fingerprint(&self, campaign: &Campaign, extra: impl std::hash::Hash) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.policy.generation.hash(&mut hasher);
         for environment in &self.catalog {
             (
                 environment.reference.to_string(),
@@ -255,30 +283,40 @@ impl Inputs {
             }
         }
         self.policy.legacy_unbound_allowed.hash(&mut hasher);
-        takes_running.hash(&mut hasher);
+        extra.hash(&mut hasher);
         hasher.finish()
     }
 
-    /// The environment `execution` puts its sandbox on, as a start
-    /// attributes it.
-    ///
-    /// Only a publish that carried an execution reaches here:
-    /// [`store::sandbox_candidates`] and [`store::subject_sandbox`] apply the
-    /// start's own evidence rule
-    /// (`pplx_space_sandbox_teardown::observed_states::publish_carries_execution`).
-    fn attributed(&self, execution: &SandboxCandidate) -> Option<EnvironmentReference> {
-        let recorded = RecordedExecution::from_record(
+    fn parse_recorded(execution: &SandboxCandidate) -> RecordedExecution {
+        RecordedExecution::from_record(
             execution.execution_metadata.as_ref(),
             execution.runtime.clone(),
             execution.runtime_version.clone(),
             execution.state_format_name.clone(),
             execution.state_format_version.clone(),
-        );
+        )
+    }
+
+    /// Whether `execution` carries an unbound record (whose attribution
+    /// depends on the catalog or `legacy_unbound_allowed`).
+    pub(super) fn is_unbound(execution: &SandboxCandidate) -> bool {
+        Self::parse_recorded(execution).environment.is_none()
+    }
+
+    /// The environment `execution` puts its sandbox on, as a start
+    /// attributes it.
+    ///
+    /// Only a publish or stop-disk snapshot that carried an execution reaches
+    /// here: [`store::sandbox_candidates`], [`store::force_restart_candidates`],
+    /// and [`store::subject_sandbox`] apply the start's own evidence rule
+    /// (`pplx_space_sandbox_teardown::observed_states::publish_carries_execution`).
+    pub(super) fn attributed(&self, execution: &SandboxCandidate) -> Option<EnvironmentReference> {
+        let recorded = Self::parse_recorded(execution);
         attribute(&recorded, &self.catalog, self.policy.legacy_unbound_allowed)
     }
 
     /// Whether `execution` puts its sandbox on `campaign`'s source.
-    fn on_source(&self, execution: &SandboxCandidate, campaign: &Campaign) -> bool {
+    pub(super) fn on_source(&self, execution: &SandboxCandidate, campaign: &Campaign) -> bool {
         self.attributed(execution) == Some(campaign.from)
     }
 }
@@ -303,14 +341,14 @@ impl<D: SandboxUpgradeDispatcher> CampaignDriver for SandboxDriver<D> {
         plan: ScanPlan,
         after: Option<Uuid>,
         limit: u32,
-    ) -> Result<SubjectPage, String> {
+    ) -> Result<SubjectScan, String> {
         // Read again rather than trusting `plan`'s inputs: the page is
         // judged under what's read here, so it must be what `plan` was made
         // from. A change since restarts the pass next tick.
         let inputs = Inputs::read(&self.pool).await?;
         let takes_running = match inputs.scan_plan(campaign) {
             Ok((now, takes_running)) if now == plan => takes_running,
-            _ => return Err(PLAN_CHANGED.to_owned()),
+            _ => return Ok(SubjectScan::PlanChanged),
         };
         let page = store::sandbox_candidates(
             &self.pool,
@@ -328,7 +366,7 @@ impl<D: SandboxUpgradeDispatcher> CampaignDriver for SandboxDriver<D> {
             .filter(|candidate| inputs.on_source(candidate, campaign))
             .map(|candidate| candidate.sandbox_id)
             .collect();
-        Ok(SubjectPage {
+        Ok(SubjectScan::Page(SubjectPage {
             on_source,
             // Nothing is retired: a catalog that attributes a sandbox
             // elsewhere now may attribute it to the source again, and a
@@ -336,7 +374,7 @@ impl<D: SandboxUpgradeDispatcher> CampaignDriver for SandboxDriver<D> {
             elsewhere: Vec::new(),
             last: page.last().map(|candidate| candidate.sandbox_id),
             examined: page.len(),
-        })
+        }))
     }
 
     async fn upgrade(&self, campaign: &Campaign, item: &LeasedItem) -> ItemOutcome {
@@ -362,23 +400,47 @@ impl<D: SandboxUpgradeDispatcher> CampaignDriver for SandboxDriver<D> {
         // back.
         let execution = sandbox.execution.as_ref();
         let refusal = match step {
-            Step::Upgrade => on_either_end(&self.pool, campaign, execution).await,
+            Step::Upgrade => on_either_end(&self.pool, campaign, execution)
+                .await
+                .map(|reason| reason.map(PreMoveRefusal::Skip)),
             Step::StopThenUpgrade => may_stop(&self.pool, campaign, execution).await,
             Step::Settling(_) | Step::Skip(_) => Ok(None),
         };
         match refusal {
             Ok(None) => {}
-            Ok(Some(reason)) => return ItemOutcome::Skipped(ItemError::new(reason)),
+            Ok(Some(PreMoveRefusal::Hold(reason))) => {
+                return ItemOutcome::Release(ItemError::new(reason));
+            }
+            Ok(Some(PreMoveRefusal::Skip(reason))) => {
+                return ItemOutcome::Skipped(ItemError::new(reason));
+            }
             Err(error) => return ItemOutcome::Retry(ItemError::new(error)),
         }
         match step {
             Step::Upgrade => {}
             Step::StopThenUpgrade => match self
                 .dispatcher
-                .stop(sandbox_id, campaign.from, campaign.to)
+                .stop(item, false, sandbox_id, campaign.from, campaign.to)
                 .await
             {
-                Ok(GuardedStop::Stopped) => {}
+                Ok(GuardedStop::Stopped(_)) => {
+                    match store::mark_run_started(&self.pool, item).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return ItemOutcome::Release(ItemError::new(
+                                "item lease is no longer active",
+                            ));
+                        }
+                        Err(error) => {
+                            return ItemOutcome::Retry(ItemError::new(format!(
+                                "recording run progress after stopping the sandbox failed: {error}"
+                            )));
+                        }
+                    }
+                }
+                Ok(GuardedStop::Held(reason)) => {
+                    return ItemOutcome::Release(ItemError::new(reason));
+                }
                 Ok(GuardedStop::Declined(reason)) => {
                     return ItemOutcome::Skipped(ItemError::new(reason));
                 }
@@ -404,19 +466,25 @@ impl<D: SandboxUpgradeDispatcher> CampaignDriver for SandboxDriver<D> {
         }
         match self
             .dispatcher
-            .upgrade_stopped(sandbox_id, campaign.from, campaign.to)
+            .upgrade_stopped(item, sandbox_id, campaign.from, campaign.to)
             .await
         {
             Ok(StoppedUpgrade::Upgraded | StoppedUpgrade::AlreadyOnTarget) => ItemOutcome::Done,
+            Ok(StoppedUpgrade::Held(reason)) => ItemOutcome::Release(ItemError::new(reason)),
             Ok(StoppedUpgrade::NotMoved(reason)) => ItemOutcome::Skipped(ItemError::new(reason)),
             Err(error) => error_outcome(error),
         }
     }
 }
 
+enum PreMoveRefusal {
+    Hold(&'static str),
+    Skip(&'static str),
+}
+
 /// The outcome a dispatch error records. The loop fails a retry on the
 /// item's last attempt.
-fn error_outcome(error: DispatchError) -> ItemOutcome {
+pub(super) fn error_outcome(error: DispatchError) -> ItemOutcome {
     match error {
         DispatchError::Retryable(message) => ItemOutcome::Retry(ItemError::new(message)),
         DispatchError::Failed(message) => ItemOutcome::Failed(ItemError::new(message)),
@@ -426,22 +494,31 @@ fn error_outcome(error: DispatchError) -> ItemOutcome {
 /// Why `campaign` may not stop a running sandbox that published
 /// `execution` (`None`: no execution), read fresh, or `None` when it may: the
 /// sandbox is still on the source, and the policy still blocks the source
-/// with an edge to the target.
+/// with an edge to the target. A temporary campaign hold or missing catalog
+/// edge releases without spending an attempt (`PreMoveRefusal::Hold`), while
+/// moving stopped sandboxes only (`Deprecated` with an edge) skips running
+/// items so stopped-only passes can still drain and complete.
 async fn may_stop(
     pool: &PgPool,
     campaign: &Campaign,
     execution: Option<&SandboxCandidate>,
-) -> Result<Option<&'static str>, String> {
+) -> Result<Option<PreMoveRefusal>, String> {
     let inputs = Inputs::read(pool).await?;
     if !execution.is_some_and(|execution| inputs.on_source(execution, campaign)) {
-        return Ok(Some(NO_LONGER_ON_SOURCE));
+        return Ok(Some(PreMoveRefusal::Skip(NO_LONGER_ON_SOURCE)));
     }
     Ok(match inputs.plan(campaign) {
         SandboxPlan::Scan {
             moves: true,
             takes_running: true,
         } => None,
-        _ => Some(POLICY_STOPPED_MOVING_RUNNING),
+        SandboxPlan::Hold(_) | SandboxPlan::Scan { moves: false, .. } => {
+            Some(PreMoveRefusal::Hold(POLICY_STOPPED_MOVING_RUNNING))
+        }
+        SandboxPlan::Scan {
+            moves: true,
+            takes_running: false,
+        } => Some(PreMoveRefusal::Skip(POLICY_STOPPED_MOVING_RUNNING)),
     })
 }
 
