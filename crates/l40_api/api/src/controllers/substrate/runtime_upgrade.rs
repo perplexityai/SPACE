@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pplx_space_execution_spec::{
-    EnvironmentReference, INITIAL_FIRECRACKER_RUNTIME_VERSION,
+    ArtifactComponentKind, EnvironmentReference, INITIAL_FIRECRACKER_RUNTIME_VERSION,
     INITIAL_FIRECRACKER_STATE_FORMAT_VERSION,
 };
 use pplx_space_runtime_environment_policy_store::{
@@ -117,6 +117,45 @@ pub struct RecordedExecution {
     pub state_format_version: Option<String>,
 }
 
+impl RecordedExecution {
+    /// The execution a stored record describes: its `execution_metadata`
+    /// document and the legacy identity columns beside it. Read leniently: a
+    /// record is evidence, and a field it lacks or holds in another shape
+    /// matches anything rather than failing the read.
+    pub fn from_record(
+        execution_metadata: Option<&serde_json::Value>,
+        runtime: Option<String>,
+        runtime_version: Option<String>,
+        state_format_name: Option<String>,
+        state_format_version: Option<String>,
+    ) -> Self {
+        let environment = execution_metadata
+            .and_then(|metadata| metadata.get("environment"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let kernel_version = execution_metadata
+            .and_then(|metadata| metadata.get("components"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|components| {
+                components.iter().find(|component| {
+                    component.get("kind").and_then(serde_json::Value::as_str)
+                        == Some(ArtifactComponentKind::Kernel.as_str())
+                })
+            })
+            .and_then(|kernel| kernel.get("version"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        Self {
+            environment,
+            runtime,
+            runtime_version,
+            kernel_version,
+            state_format_name,
+            state_format_version,
+        }
+    }
+}
+
 /// One row of the environment catalog, `runtime_environments`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogEnvironment {
@@ -130,6 +169,48 @@ pub struct CatalogEnvironment {
     pub upgrade_edges: BTreeSet<EnvironmentReference>,
     /// Upgrade edges whose target also loads this one's checkpoints.
     pub memory_edges: BTreeSet<EnvironmentReference>,
+}
+
+impl CatalogEnvironment {
+    /// The environment a catalog row stores, its references parsed. The
+    /// first reference that doesn't parse, the row's own or an edge's, is the
+    /// error, with its text.
+    pub fn from_row(
+        row: pplx_space_runtime_environment_catalog_store::CatalogEnvironmentRow,
+    ) -> Result<Self, InvalidCatalogReference> {
+        let parse = |value: String| {
+            value
+                .parse()
+                .map_err(|source| InvalidCatalogReference { value, source })
+        };
+        Ok(Self {
+            reference: parse(row.environment_ref)?,
+            runtime: row.runtime,
+            runtime_version: row.runtime_version,
+            kernel_version: row.kernel_version,
+            state_format_name: row.state_format_name,
+            state_format_version: row.state_format_version,
+            upgrade_edges: row
+                .upgrade_edges
+                .into_iter()
+                .map(parse)
+                .collect::<Result<_, _>>()?,
+            memory_edges: row
+                .memory_edges
+                .into_iter()
+                .map(parse)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+/// A catalog row holds a reference that doesn't parse.
+#[derive(Debug, thiserror::Error)]
+#[error("runtime_environments holds an invalid reference {value:?}: {source}")]
+pub struct InvalidCatalogReference {
+    pub value: String,
+    #[source]
+    pub source: pplx_space_content_digest::DigestParseError,
 }
 
 /// The environment `recorded` ran under, as far as the control plane can tell
