@@ -17,7 +17,14 @@
 //!    ClusterApi, then submits or rejoins the exact artifact's vol-mgr jobs and
 //!    persists those transfer handles.
 //!    Payloads persisted by older binaries already contain transfer IDs and
-//!    skip this step.
+//!    skip this step. An upload whose artifact directory a later publication
+//!    replaced before it registered, or before or while it submitted, fails
+//!    permanently: no attempt can upload bytes the directory no longer holds.
+//!    Its row is marked failed, best effort. A handoff that submitted the
+//!    same upload concurrently and persisted its transfers first staged the
+//!    artifact's bytes, so the attempt polls those instead. Once submitted,
+//!    an upload's transfers read vol-mgr's staged copies and node-manager's
+//!    leased source, so a later publication leaves its retries their bytes.
 //! 2. Concurrently polls all vol-mgr jobs — every VM artifact and the
 //!    `snapshot.json` metadata document — to a terminal
 //!    state. Any permanent vol-mgr failure → [`JobError::Permanent`]; any
@@ -46,8 +53,8 @@ use pplx_space_volmgr_client::proto::{GetTransferJobRequest, TransferJobStatus};
 use pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat;
 
 use crate::snapshot_upload::{
-    ROOTFS_BTRFS_SEND_FILENAME, SnapshotMeta, SnapshotUploadJobs, artifact_kind_from_meta,
-    format_from_meta, upload_artifacts_for_meta,
+    ROOTFS_BTRFS_SEND_FILENAME, SnapshotMeta, SnapshotUploadJobs, SubmitPreparedSnapshotError,
+    artifact_kind_from_meta, format_from_meta, upload_artifacts_for_meta,
 };
 
 pub(crate) use crate::db::snapshot_upload_jobs::{
@@ -175,6 +182,16 @@ impl JobExecutor for SnapshotUploadExecutor {
         // required before volume staging so an authoritative rejection cannot
         // create transfer work. Teardown-gated callers perform the same Begin
         // synchronously and retain the runtime if the control plane rejects it.
+        // Before registering, so an upload superseded before it ever registered
+        // doesn't register a row only to fail it.
+        if payload.job_ids.is_empty()
+            && let Err(superseded) =
+                crate::snapshot_upload::check_prepared_artifact_identity(&payload)
+        {
+            payload = self
+                .end_superseded_upload(&job.job_id, &payload, &superseded)
+                .await?;
+        }
         if prepared_upload_requires_begin(&payload)
             && let Err(refusal) = begin_prepared_upload_naming_supersession(&payload).await
         {
@@ -204,16 +221,27 @@ impl JobExecutor for SnapshotUploadExecutor {
         // jobs survive it. Persist the durable transfer handles before allowing
         // a teardown-gated caller to release the runtime.
         if payload.job_ids.is_empty() {
-            payload = crate::snapshot_upload::submit_prepared_snapshot(
+            payload = match crate::snapshot_upload::submit_prepared_snapshot(
                 &payload,
                 &self.node_manager,
                 &self.volume_manager_socket,
             )
             .await
-            .map_err(|error| {
-                JobError::retriable(format!("vol-mgr submit prepared snapshot: {error}"))
-            })?;
-            persist_submitted_transfer_ids(&self.db, &job.job_id, &payload)?;
+            {
+                Ok(submitted) => {
+                    persist_submitted_transfer_ids(&self.db, &job.job_id, &submitted)?;
+                    submitted
+                }
+                Err(SubmitPreparedSnapshotError::Superseded(superseded)) => {
+                    self.end_superseded_upload(&job.job_id, &payload, &superseded)
+                        .await?
+                }
+                Err(SubmitPreparedSnapshotError::Failed(error)) => {
+                    return Err(JobError::retriable(format!(
+                        "vol-mgr submit prepared snapshot: {error}"
+                    )));
+                }
+            };
         }
 
         // Heartbeat the cluster row at the start of every attempt (including
@@ -835,23 +863,96 @@ fn classify_begin_error(error: BeginArtifactBackupError) -> JobError {
     }
 }
 
-/// Mark failed the row an upload registered whose job was cancelled because
-/// a later publication superseded its artifact, as an exhausted upload's is
-/// ([`converge_failed_upload`]).
-pub(crate) async fn converge_superseded_upload(job: &Job) {
-    match job.payload_as::<SnapshotUploadJobs>() {
-        Ok(payload) => {
-            converge_failed_upload(
-                &payload,
-                "superseded",
-                "a later suspend superseded the artifact before its upload finished",
+const SUPERSEDED_UPLOAD_ERROR: &str =
+    "a later suspend superseded the artifact before its upload finished";
+
+impl SnapshotUploadExecutor {
+    /// End an upload whose artifact a later publication superseded, unless a
+    /// handoff staged it meanwhile. This attempt read `payload` as it started,
+    /// and the restore-visible handoff registers and submits the same job
+    /// concurrently: once it persisted transfer IDs, they hold the capture's
+    /// staged bytes, so the upload carries on with them, returned here.
+    /// Otherwise the job fails for good, since no attempt can upload bytes its
+    /// directory no longer holds, and the row it registered is marked failed,
+    /// as an exhausted upload's is ([`converge_failed_upload`]).
+    ///
+    /// The job ends in one statement that requires a payload without transfer
+    /// IDs ([`end_unsubmitted_upload_job`](crate::db::snapshot_upload_jobs::end_unsubmitted_upload_job)),
+    /// so a handoff persists its transfers either before it, and the attempt
+    /// polls them, or after it, and finds the job ended and fails. The worker's
+    /// own write of the failure then finds the job failed already, and logs at
+    /// WARN that it skipped the update. The job's end is durable before the
+    /// row is marked; marking the row is best effort, and restart recovery
+    /// doesn't retry it, so a row the control plane doesn't hear about stays
+    /// `creating`, refusing the sandbox's delete, until an enabled
+    /// stuck-snapshot reaper or an operator fails it. An upload that never
+    /// registered has no row to mark; a handoff that registers it after this
+    /// mark found no row marks the row itself
+    /// ([`finalize_superseded_upload_failed`]).
+    async fn end_superseded_upload(
+        &self,
+        job_id: &JobId,
+        payload: &SnapshotUploadJobs,
+        superseded: &crate::snapshot_upload::SupersededArtifact,
+    ) -> Result<SnapshotUploadJobs, JobError> {
+        use crate::db::snapshot_upload_jobs::UnsubmittedUploadEnd;
+
+        let error = JobError::permanent(format!("{SUPERSEDED_UPLOAD_ERROR}: {superseded}"));
+        let ended = {
+            let conn = self.db.lock().map_err(|_| {
+                JobError::permanent(format!(
+                    "snapshot-upload database mutex poisoned while ending superseded job {job_id}"
+                ))
+            })?;
+            crate::db::snapshot_upload_jobs::end_unsubmitted_upload_job(
+                &conn,
+                job_id,
+                error.message(),
             )
-            .await;
-        }
-        Err(error) => {
-            tracing::error!(job_id = %job.job_id, %error, "failed to decode a superseded snapshot upload");
+            .map_err(|error| {
+                JobError::retriable(format!(
+                    "end superseded snapshot-upload job {job_id}: {error}"
+                ))
+            })?
+        };
+        match ended {
+            UnsubmittedUploadEnd::Ended => {
+                converge_failed_upload(payload, "superseded", SUPERSEDED_UPLOAD_ERROR).await;
+                Err(error)
+            }
+            UnsubmittedUploadEnd::Kept(Some(persisted)) => {
+                let persisted: SnapshotUploadJobs =
+                    serde_json::from_str(&persisted).map_err(|decode| {
+                        JobError::permanent(format!(
+                            "decode snapshot-upload job {job_id} after its supersession: {decode}"
+                        ))
+                    })?;
+                if persisted.job_ids.is_empty() {
+                    // Not running: the worker settles a cancelled job, and
+                    // one that ended has no attempt left to stop.
+                    return Err(error);
+                }
+                tracing::info!(
+                    job_id = %job_id,
+                    sandbox_id = %payload.meta.sandbox_id,
+                    snapshot_id = %payload.snapshot_id,
+                    %superseded,
+                    "a handoff staged the superseded upload's transfers first; polling them"
+                );
+                Ok(persisted)
+            }
+            UnsubmittedUploadEnd::Kept(None) => Err(error),
         }
     }
+}
+
+/// Mark failed the row of an upload the worker ended as superseded, with the
+/// failure reason the worker's own finalize sends, for a caller that
+/// registered the row after that finalize found none. The worker already
+/// emitted the attempt's `artifact_backup_failed` event and removed its
+/// metadata staging.
+pub(crate) async fn finalize_superseded_upload_failed(payload: &SnapshotUploadJobs) {
+    finalize_with_cluster_api_failed(&payload.snapshot_id, SUPERSEDED_UPLOAD_ERROR).await;
 }
 
 async fn converge_failed_upload(payload: &SnapshotUploadJobs, reason: &'static str, error: &str) {
@@ -1621,6 +1722,10 @@ async fn touch_with_cluster_api(snapshot_id: &str) {
 /// `submit_suspend_snapshot` / `submit_json` would otherwise leave the
 /// `creating` row orphaned (no durable worker will ever pick it up,
 /// because submission never happened or never got persisted).
+///
+/// An attempt that never registered has no row: the control plane answers
+/// `NotFound` and writes nothing, so a caller that can't tell whether its
+/// attempt registered may still call this.
 pub(crate) async fn finalize_with_cluster_api_failed(snapshot_id: &str, reason: &str) {
     let client_result = pplx_space_node_api_client::cluster::connect_from_env().await;
     let mut client = match client_result {

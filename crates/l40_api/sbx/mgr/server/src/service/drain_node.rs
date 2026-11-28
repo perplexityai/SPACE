@@ -56,6 +56,10 @@
 //! a resident or an artifact succeeded and the seal held, under the call's
 //! generation, from before the walk to its end, and lists the activations
 //! and the artifact producers in flight at its first read as pending.
+//! A capture a later suspend's publication retired, such as one a failed
+//! drain suspend left pinned, is nothing the drain keeps: the publication
+//! removes its artifact row, and the backup worker ends its upload if it had
+//! not staged its transfers yet ([`crate::snapshot_upload_jobs`]).
 //!
 //! One `DrainNode` call runs at a time, drain and cancel alike, its scans
 //! included: a call that arrives while another is in progress fails at once

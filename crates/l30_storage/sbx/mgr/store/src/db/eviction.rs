@@ -496,10 +496,7 @@ pub fn claim_retired_teardown_execution_for_release(
 /// is cancelled outright and never runs. A running one is only marked
 /// `cancelling`: its worker records it cancelled once it returns, but an
 /// attempt already past its registration isn't interrupted.
-pub(in crate::db) fn cancel_live_upload_job(
-    conn: &Connection,
-    artifact: LocalArtifactId,
-) -> Result<()> {
+fn cancel_live_upload_job(conn: &Connection, artifact: LocalArtifactId) -> Result<()> {
     use pplx_space_common_jobs::{JobStatus, db as jobs};
     let Some(job) = jobs::find_job_by_dedup_key(
         conn.raw(),

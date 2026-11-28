@@ -646,7 +646,8 @@ impl SandboxManagerService {
             )
             .into());
         }
-        if crate::snapshot_upload_jobs::prepared_upload_requires_begin(&payload) {
+        let registers = crate::snapshot_upload_jobs::prepared_upload_requires_begin(&payload);
+        if registers {
             crate::snapshot_upload_jobs::begin_prepared_upload_naming_supersession(&payload)
                 .await
                 .map_err(|refusal| ArtifactBackupSubmissionError::Begin {
@@ -655,7 +656,7 @@ impl SandboxManagerService {
                 })?;
         }
         if payload.job_ids.is_empty() {
-            match crate::snapshot_upload::submit_prepared_snapshot(
+            let staged = match crate::snapshot_upload::submit_prepared_snapshot(
                 &payload,
                 &self.node_manager,
                 &self.volume_manager_socket_path,
@@ -666,19 +667,20 @@ impl SandboxManagerService {
                     match crate::snapshot_upload_jobs::persist_submitted_transfer_ids(
                         &self.db, job_id, &submitted,
                     ) {
-                        Ok(()) => payload = submitted,
+                        Ok(()) => Ok(submitted),
                         Err(error) => {
                             // The durable worker may have persisted the same
                             // deterministic transfers or completed between our
                             // read and write. Join its payload instead of
-                            // failing a valid handoff.
-                            payload = self
-                                .persisted_submitted_artifact_backup(job_id)
+                            // failing a valid handoff. A worker that found the
+                            // artifact superseded and ended the job first left
+                            // it no transfer IDs, so the handoff fails.
+                            self.persisted_submitted_artifact_backup(job_id)
                                 .map_err(|reload_error| {
                                     format!(
                                         "persist staged snapshot transfer IDs: {error}; {reload_error}"
                                     )
-                                })?;
+                                })
                         }
                     }
                 }
@@ -687,13 +689,22 @@ impl SandboxManagerService {
                     // metadata staging file after durably recording transfer
                     // IDs. Re-read before treating the local staging error as
                     // authoritative.
-                    payload = self.persisted_submitted_artifact_backup(job_id).map_err(
-                        |reload_error| {
+                    self.persisted_submitted_artifact_backup(job_id)
+                        .map_err(|reload_error| {
                             format!("stage snapshot artifacts in vol-mgr: {error}; {reload_error}")
-                        },
-                    )?;
+                        })
                 }
-            }
+            };
+            payload = match staged {
+                Ok(staged) => staged,
+                Err(error) => {
+                    if registers {
+                        self.finalize_superseded_upload_registered_late(job_id, &payload)
+                            .await;
+                    }
+                    return Err(error.into());
+                }
+            };
         }
         Ok(payload)
     }
@@ -716,6 +727,49 @@ impl SandboxManagerService {
             ));
         }
         Ok(payload)
+    }
+
+    /// Mark failed the row this handoff registered for an upload the worker
+    /// ended as superseded, as the worker marks it. The worker can end the
+    /// upload after this handoff read the job and before it registered, and
+    /// then its own finalize finds no row, so nothing else would fail the one
+    /// registered here, and a row left `creating` refuses the sandbox's delete.
+    /// A job still live is the worker's to end, and to mark. Best effort, as
+    /// the worker's is: the control plane re-finalizes a failed attempt failed
+    /// again without effect, so a worker finalize that lands too is harmless.
+    async fn finalize_superseded_upload_registered_late(
+        &self,
+        job_id: &JobId,
+        payload: &crate::snapshot_upload::SnapshotUploadJobs,
+    ) {
+        let job = match self.snapshot_upload_worker.get_job(job_id) {
+            Ok(Some(job)) => job,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(snapshot_upload_job_id = %job_id, %error,
+                    "could not re-read a snapshot upload the handoff registered and failed to stage");
+                return;
+            }
+        };
+        let Ok(persisted) = job.payload_as::<crate::snapshot_upload::SnapshotUploadJobs>() else {
+            return;
+        };
+        if job.failure.map(crate::db::jobs::JobFailure::kind)
+            != Some(crate::db::jobs::JobFailureKind::Permanent)
+            || !persisted.job_ids.is_empty()
+        {
+            return;
+        }
+        // The worker's end marks the job superseded in the same statement.
+        // Only a job without the mark, one an older version ended, or one
+        // ended another way, falls back to the directory: a replaced artifact
+        // never comes back to it, but a sidecar gone or unreadable since
+        // proves nothing.
+        if persisted.superseded
+            || crate::snapshot_upload::check_prepared_artifact_identity(payload).is_err()
+        {
+            crate::snapshot_upload_jobs::finalize_superseded_upload_failed(payload).await;
+        }
     }
 
     /// Hand a node-local suspend's capture to a durable upload, registered

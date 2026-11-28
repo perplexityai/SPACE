@@ -1,7 +1,7 @@
 //! `jobs` rows of the snapshot-upload pipeline, and the backup markers its
 //! completed jobs prove.
 
-use crate::db::{Connection, Result};
+use crate::db::{Connection, OptionalExtension as _, Result};
 use pplx_space_accounts::JobId;
 use pplx_space_snapshot_model::LocalArtifactId;
 use rusqlite::params;
@@ -16,29 +16,6 @@ pub const SNAPSHOT_UPLOAD_JOB_KIND: &str = "snapshot_upload";
 /// looks the artifact's upload up finds the newest of them.
 pub fn artifact_backup_dedup_key(local_artifact_id: LocalArtifactId) -> String {
     local_artifact_id.to_string()
-}
-
-/// Cancel the live upload of `artifact`, a drain suspend's capture that a
-/// later publication superseded, as eviction cancels an evicted artifact's
-/// (`super::eviction`): a pending job is cancelled outright and never runs
-/// again; a running one is marked `cancelling`, and its worker records it
-/// cancelled once its attempt returns. Returns the job as it was before, so
-/// the caller can settle what it registered; none when no live job uploads
-/// the artifact.
-pub fn cancel_superseded_upload_job(
-    conn: &Connection,
-    artifact: LocalArtifactId,
-) -> Result<Option<pplx_space_common_jobs::Job>> {
-    let Some(job) = pplx_space_common_jobs::db::find_job_by_dedup_key(
-        conn.raw(),
-        SNAPSHOT_UPLOAD_JOB_KIND,
-        &artifact_backup_dedup_key(artifact),
-    )?
-    .filter(|job| !job.is_terminal()) else {
-        return Ok(None);
-    };
-    super::eviction::cancel_live_upload_job(conn, artifact)?;
-    Ok(Some(job))
 }
 
 /// Give back the attempt a restart interrupted: every running job of `kind`
@@ -75,6 +52,60 @@ pub fn set_upload_failure_scope(conn: &Connection, job_id: &JobId, scope: &str) 
          WHERE job_id = ?2 AND kind = ?3 AND status IN ('pending', 'running')",
         params![scope, job_id, SNAPSHOT_UPLOAD_JOB_KIND],
     )
+}
+
+/// What [`end_unsubmitted_upload_job`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnsubmittedUploadEnd {
+    /// It failed the job permanently.
+    Ended,
+    /// It left the job alone, since the job wasn't running or its payload
+    /// named transfers. Carries the payload as it stands, `None` for a job
+    /// that is gone.
+    Kept(Option<String>),
+}
+
+/// Fail a running snapshot-upload job permanently with `error`, as the worker
+/// records a permanent failure, but only while its payload names no transfer,
+/// and mark its payload `superseded`, which the worker ends a job this way
+/// for. One statement, so a handoff that persists transfer IDs into the
+/// payload, which requires a pending or running job, either did so first and
+/// keeps the job, or finds it ended, and one that registers the attempt
+/// afterwards finds the mark with the end. A payload that isn't JSON is left
+/// alone; `CASE` keeps `json_array_length` off it, as SQLite needn't
+/// short-circuit `AND`. A job this leaves alone is read back under the same
+/// connection.
+pub fn end_unsubmitted_upload_job(
+    conn: &Connection,
+    job_id: &JobId,
+    error: &str,
+) -> Result<UnsubmittedUploadEnd> {
+    let changed = conn.execute(
+        "UPDATE jobs
+         SET status = 'failed', error_kind = ?3, error = ?4, failure_reason = NULL,
+             completed_at = datetime('now'),
+             payload = json_set(payload, '$.superseded', json('true'))
+         WHERE job_id = ?1 AND kind = ?2 AND status = 'running'
+           AND CASE WHEN json_valid(payload)
+                    THEN json_array_length(payload, '$.job_ids') END IS 0",
+        params![
+            job_id,
+            SNAPSHOT_UPLOAD_JOB_KIND,
+            pplx_space_common_jobs::JobFailureKind::Permanent.as_str(),
+            error
+        ],
+    )?;
+    if changed == 1 {
+        return Ok(UnsubmittedUploadEnd::Ended);
+    }
+    let payload = conn
+        .query_row(
+            "SELECT payload FROM jobs WHERE job_id = ?1 AND kind = ?2",
+            params![job_id, SNAPSHOT_UPLOAD_JOB_KIND],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(UnsubmittedUploadEnd::Kept(payload))
 }
 
 /// How many snapshot-upload jobs under `dedup_key` failed permanently with a

@@ -63,6 +63,22 @@ static ADMITTED_REGISTRATIONS: CrossProcessLog =
 static FINALIZED_BACKUPS: CrossProcessLog =
     CrossProcessLog::new("SPACE_TEST_FINALIZED_ARTIFACT_BACKUPS");
 
+/// The backup attempt of each registration a stub was asked for, a probe
+/// that registers nothing aside, admitted or not.
+static BEGUN_ATTEMPTS: CrossProcessLog = CrossProcessLog::new("SPACE_TEST_BEGUN_ARTIFACT_BACKUPS");
+
+/// The backup attempts of every registration a stub recorded with
+/// [`record_begun_attempt`], once per request, in arrival order.
+pub(in crate::service::grpc_lifecycle) fn begun_attempts() -> Vec<String> {
+    BEGUN_ATTEMPTS.lines()
+}
+
+/// Record a registration of `backup_attempt_id` for the child's
+/// [`begun_attempts`].
+pub(in crate::service::grpc_lifecycle) fn record_begun_attempt(backup_attempt_id: &str) {
+    BEGUN_ATTEMPTS.append(backup_attempt_id);
+}
+
 /// The local artifact ids of every registration the stub admitted, a probe
 /// that registers nothing aside. Admitting one is what lets a backup proceed.
 pub(super) fn admitted_registrations() -> Vec<String> {
@@ -74,10 +90,16 @@ fn record_admitted_registration(local_artifact_id: &str) {
 }
 
 /// A `FinalizeArtifactBackup` a stub answered, as the node sent it.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(in crate::service::grpc_lifecycle) struct FinalizedBackup {
     pub(in crate::service::grpc_lifecycle) backup_attempt_id: String,
+    /// `SuspendSnapshotTerminalState`, as sent.
+    pub(in crate::service::grpc_lifecycle) target_state: i32,
+    pub(in crate::service::grpc_lifecycle) failure_reason: Option<String>,
     pub(in crate::service::grpc_lifecycle) suspend_uncommitted: bool,
+    /// Whether the stub had registered the attempt. It answers a finalize of
+    /// one it hadn't `NotFound`, as the control plane does.
+    pub(in crate::service::grpc_lifecycle) registered: bool,
 }
 
 /// Every `FinalizeArtifactBackup` a stub recorded with
@@ -86,24 +108,26 @@ pub(in crate::service::grpc_lifecycle) fn finalized_backups() -> Vec<FinalizedBa
     FINALIZED_BACKUPS
         .lines()
         .iter()
-        .map(|line| {
-            let (backup_attempt_id, suspend_uncommitted) = line.split_once(' ').unwrap();
-            FinalizedBackup {
-                backup_attempt_id: backup_attempt_id.to_owned(),
-                suspend_uncommitted: suspend_uncommitted.parse().unwrap(),
-            }
-        })
+        .map(|line| serde_json::from_str(line).unwrap())
         .collect()
 }
 
-/// Record `request` for the child's [`finalized_backups`].
+/// Record `request`, of an attempt the stub had `registered` or not, for the
+/// child's [`finalized_backups`].
 pub(in crate::service::grpc_lifecycle) fn record_finalized_backup(
     request: &pplx_space_node_api_client::proto::FinalizeArtifactBackupRequest,
+    registered: bool,
 ) {
-    FINALIZED_BACKUPS.append(&format!(
-        "{} {}",
-        request.backup_attempt_id, request.suspend_uncommitted
-    ));
+    FINALIZED_BACKUPS.append(
+        &serde_json::to_string(&FinalizedBackup {
+            backup_attempt_id: request.backup_attempt_id.clone(),
+            target_state: request.target_state,
+            failure_reason: request.failure_reason.clone(),
+            suspend_uncommitted: request.suspend_uncommitted,
+            registered,
+        })
+        .unwrap(),
+    );
 }
 
 /// A cluster-api stub. Its `BeginArtifactBackup` refuses every
@@ -343,9 +367,11 @@ where
     std::fs::write(token.path(), "synthetic-backup-test-token").unwrap();
     let admitted = tempfile::NamedTempFile::new().unwrap();
     let finalized = tempfile::NamedTempFile::new().unwrap();
+    let begun = tempfile::NamedTempFile::new().unwrap();
     let child = pplx_space_test_env::enter_test_process(&[
         ADMITTED_REGISTRATIONS.serve_into(&admitted),
         FINALIZED_BACKUPS.serve_into(&finalized),
+        BEGUN_ATTEMPTS.serve_into(&begun),
         ("SPACE_INTERNAL_RPC_INSECURE_DEV", Some(OsStr::new("1"))),
         (
             pplx_space_node_api_client::cluster::CLUSTER_API_ENDPOINT_ENV,
@@ -410,7 +436,7 @@ where
 }
 
 /// Answer one gRPC `request` with `handler`, for a stub's `tower::Service`.
-pub(in crate::service) async fn answer<B, Req, Resp>(
+pub(crate) async fn answer<B, Req, Resp>(
     request: http::Request<B>,
     handler: impl Fn(Req) -> Result<Resp, tonic::Status>,
 ) -> http::Response<tonic::body::Body>
@@ -423,6 +449,46 @@ where
     tonic::server::Grpc::new(tonic_prost::ProstCodec::<Resp, Req>::default())
         .unary(
             Answer(std::sync::Arc::new(handler), std::marker::PhantomData),
+            request,
+        )
+        .await
+}
+
+/// A gRPC handler answering one request type once its future resolves, for
+/// [`answer_later`].
+struct AnswerLater<F, Resp>(std::sync::Arc<F>, std::marker::PhantomData<fn() -> Resp>);
+
+impl<Req, Resp, F, Fut> tonic::server::UnaryService<Req> for AnswerLater<F, Resp>
+where
+    F: Fn(Req) -> Fut,
+    Fut: std::future::Future<Output = Result<Resp, tonic::Status>> + Send + 'static,
+{
+    type Response = Resp;
+    type Future =
+        futures_util::future::BoxFuture<'static, Result<tonic::Response<Resp>, tonic::Status>>;
+
+    fn call(&mut self, request: tonic::Request<Req>) -> Self::Future {
+        let answer = (self.0)(request.into_inner());
+        Box::pin(async move { answer.await.map(tonic::Response::new) })
+    }
+}
+
+/// Answer one gRPC `request` with the future `handler` returns, for a stub
+/// that holds a request until something else happened.
+pub(in crate::service::grpc_lifecycle) async fn answer_later<B, Req, Resp, Fut>(
+    request: http::Request<B>,
+    handler: impl Fn(Req) -> Fut,
+) -> http::Response<tonic::body::Body>
+where
+    B: http_body::Body + Send + 'static,
+    B::Error: Into<tonic::codegen::StdError> + Send + 'static,
+    Req: prost::Message + Default + Send + 'static,
+    Resp: prost::Message + Send + 'static,
+    Fut: std::future::Future<Output = Result<Resp, tonic::Status>> + Send + 'static,
+{
+    tonic::server::Grpc::new(tonic_prost::ProstCodec::<Resp, Req>::default())
+        .unary(
+            AnswerLater(std::sync::Arc::new(handler), std::marker::PhantomData),
             request,
         )
         .await

@@ -2698,146 +2698,152 @@ fn the_drain_window_reads_a_positive_number_or_the_default() {
     }
 }
 
-/// A failed drain suspend that left its capture pinned with a live upload is
-/// remembered, and its upload ended once a later attempt's publication moves
-/// the pin past it, whether that attempt fails or succeeds. The pin an
-/// attempt leaves is never ended: a successful suspend's own capture keeps
-/// its upload. A failure that pinned nothing new, or whose capture has no
-/// live upload, remembers nothing.
-#[test]
-fn a_failed_drain_suspends_capture_is_ended_once_superseded() {
-    let actions = DrainActions::default();
-    // The first attempt publishes capture `c1` and fails its backup
-    // handoff: `c1` stays pinned, its upload queued.
-    assert!(
-        actions
-            .settle_captures("s", Some("c0"), Some("c1"), true, true)
-            .is_empty()
-    );
-    // The second publishes `c2`, retiring `c1`, and fails before any upload.
-    assert_eq!(
-        actions.settle_captures("s", Some("c1"), Some("c2"), true, false),
-        ["c1"]
-    );
-    // The third succeeds on `c3`: nothing left to end, and `c3` untouched.
-    assert!(
-        actions
-            .settle_captures("s", Some("c2"), Some("c3"), false, true)
-            .is_empty()
-    );
-
-    // A capture remembered across a success that superseded it is ended,
-    // never the success's own.
-    assert!(
-        actions
-            .settle_captures("t", Some("d0"), Some("d1"), true, true)
-            .is_empty()
-    );
-    assert_eq!(
-        actions.settle_captures("t", Some("d1"), Some("d2"), false, true),
-        ["d1"]
-    );
-    assert!(
-        actions
-            .settle_captures("t", Some("d2"), Some("d3"), false, true)
-            .is_empty()
-    );
-
-    // A failure that left the pin where it was, or a new pin with no live
-    // upload, remembers nothing; a capture still pinned is kept.
-    assert!(
-        actions
-            .settle_captures("u", Some("e0"), Some("e0"), true, true)
-            .is_empty()
-    );
-    assert!(
-        actions
-            .settle_captures("u", Some("e0"), Some("e1"), true, false)
-            .is_empty()
-    );
-    assert!(
-        actions
-            .settle_captures("u", Some("e1"), Some("e2"), false, true)
-            .is_empty()
-    );
-    assert!(
-        actions
-            .settle_captures("v", Some("f0"), Some("f1"), true, true)
-            .is_empty()
-    );
-    assert!(
-        actions
-            .settle_captures("v", Some("f1"), Some("f1"), true, true)
-            .is_empty()
-    );
-    assert_eq!(
-        actions.settle_captures("v", Some("f1"), Some("f2"), false, true),
-        ["f1"]
-    );
+/// How the suspend after a failed drain suspend ends.
+#[derive(Clone, Copy, Debug)]
+enum LaterSuspend {
+    /// Its backup handoff fails too, and it rolls back keeping its own capture.
+    Fails,
+    Succeeds,
 }
 
-/// Ending a superseded capture's upload cancels its live job and no other:
-/// the upload of the capture that superseded it, and any other sandbox's,
-/// keep running.
+/// A failed drain suspend rolls the VM back to `paused`, keeping the capture
+/// it published pinned and its upload live, which the drain counts. The next
+/// suspend publishes over the sandbox's snapshot directory, retiring that
+/// capture, whether it fails the same way, leaving the VM `paused` for the
+/// drain to suspend, or succeeds, leaving it `suspended`. From then on the
+/// drain plans nothing for the retired capture: it isn't one of the sandbox's
+/// artifacts without a durable copy, and its upload, still live, is no upload
+/// the drain waits on. A suspended sandbox waits for the newer capture's
+/// upload, which the drain doesn't enqueue again.
 #[tokio::test]
-async fn ending_a_superseded_capture_cancels_only_its_upload() {
-    use pplx_space_accounts::JobId;
+async fn the_drain_keeps_nothing_of_a_capture_a_later_publication_retired() {
     use pplx_space_snapshot_model::LocalArtifactId;
-    let service = SandboxManagerService::for_test(crate::db::test_conn());
-    let (superseded, kept, other) = (
-        LocalArtifactId::new(),
-        LocalArtifactId::new(),
-        LocalArtifactId::new(),
-    );
-    let insert = |sandbox_id: &str, artifact: LocalArtifactId| {
-        let job_id = JobId::new();
-        let conn = service.db_conn().unwrap();
-        pplx_space_common_jobs::db::insert_job(
-            conn.raw(),
-            pplx_space_common_jobs::db::InsertJob {
-                job_id: &job_id,
-                kind: crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
-                payload: "{}",
-                subject_id: Some(sandbox_id),
-                dedup_key: Some(&crate::snapshot_upload_jobs::artifact_backup_dedup_key(
-                    artifact,
-                )),
-                max_attempts: 5,
-                traceparent: None,
-                priority: pplx_space_common_jobs::JobPriority::default(),
-            },
-        )
-        .unwrap();
-        job_id
-    };
-    let ended = insert("sbx-a", superseded);
-    let own = insert("sbx-a", kept);
-    let elsewhere = insert("sbx-b", other);
-
-    service.end_superseded_capture_upload("sbx-a", &superseded.to_string());
-    service.end_superseded_capture_upload("sbx-a", &LocalArtifactId::new().to_string());
-
-    let status = |job_id: &JobId| {
-        let conn = service.db_conn().unwrap();
-        pplx_space_common_jobs::db::get_job(conn.raw(), job_id)
+    for later in [LaterSuspend::Fails, LaterSuspend::Succeeds] {
+        let id = pplx_space_sandbox_model::SandboxId::new().to_string();
+        let conn = crate::db::test_conn();
+        crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Paused);
+        let (service, _) = sealed_service_with(conn, 7);
+        let path = format!("/space/cache/{id}/snapshot");
+        let (retired, newer) = (LocalArtifactId::new(), LocalArtifactId::new());
+        let upload = |artifact: LocalArtifactId| {
+            let job_id = pplx_space_accounts::JobId::new();
+            let conn = service.db_conn().unwrap();
+            pplx_space_common_jobs::db::insert_job(
+                conn.raw(),
+                pplx_space_common_jobs::db::InsertJob {
+                    job_id: &job_id,
+                    kind: crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+                    payload: "{}",
+                    subject_id: Some(&id),
+                    dedup_key: Some(&crate::snapshot_upload_jobs::artifact_backup_dedup_key(
+                        artifact,
+                    )),
+                    max_attempts: 5,
+                    traceparent: None,
+                    priority: pplx_space_common_jobs::JobPriority::default(),
+                },
+            )
+            .unwrap();
+            job_id
+        };
+        // As the suspend path does, with the row it read before suspending.
+        let suspend_then_roll_back = |artifact: LocalArtifactId| {
+            let paused = service.lookup_sandbox(&id).unwrap();
+            let conn = service.db_conn().unwrap();
+            assert!(crate::db::begin_suspend(&conn, &id, artifact).unwrap());
+            assert!(
+                crate::db::rollback_published_suspend_to_paused(&conn, &paused, artifact, &path)
+                    .unwrap()
+            );
+        };
+        suspend_then_roll_back(retired);
+        let retired_upload = upload(retired);
+        assert!(
+            service
+                .read_plan_reads(None)
+                .unwrap()
+                .inputs
+                .active_uploads
+                .contains(&retired.to_string()),
+            "{later:?}: the drain counts the pinned capture's upload"
+        );
+        match later {
+            LaterSuspend::Fails => suspend_then_roll_back(newer),
+            LaterSuspend::Succeeds => {
+                let conn = service.db_conn().unwrap();
+                assert!(crate::db::begin_suspend(&conn, &id, newer).unwrap());
+                crate::db::pin_suspended_artifact_for_cleanup(&conn, &id, newer, &path).unwrap();
+                crate::db::complete_row_intent_cleanup_for_job(
+                    &conn,
+                    &id,
+                    crate::db::CleanupCompletion::MarkSuspended,
+                    Some((newer, &path)),
+                    None,
+                    None,
+                )
+                .unwrap();
+            }
+        }
+        upload(newer);
+        let retired_job = service
+            .snapshot_upload_worker
+            .get_job(&retired_upload)
             .unwrap()
-            .unwrap()
-            .status
-    };
-    assert_eq!(
-        status(&ended),
-        pplx_space_common_jobs::JobStatus::Cancelled.as_str()
-    );
-    assert_eq!(
-        status(&own),
-        pplx_space_common_jobs::JobStatus::Pending.as_str()
-    );
-    assert_eq!(
-        status(&elsewhere),
-        pplx_space_common_jobs::JobStatus::Pending.as_str()
-    );
-    assert!(!service.upload_job_active(&superseded.to_string()));
-    assert!(service.upload_job_active(&kept.to_string()));
+            .unwrap();
+        assert!(!retired_job.is_terminal(), "{later:?}: {retired_job:?}");
+
+        let reads = service.read_plan_reads(None).unwrap();
+        let row = reads.rows.iter().find(|row| row.sandbox_id == id).unwrap();
+        assert_eq!(
+            row.lifecycle,
+            SandboxStatus::Unowned(match later {
+                LaterSuspend::Fails => SandboxState::Paused,
+                LaterSuspend::Succeeds => SandboxState::Suspended,
+            }),
+            "{later:?}"
+        );
+        assert_eq!(
+            row.pin,
+            Some((newer.to_string(), ArtifactKind::Full)),
+            "{later:?}"
+        );
+        assert_eq!(
+            reads.inputs.local_only.get(&id),
+            Some(&vec![(newer.to_string(), ArtifactKind::Full)]),
+            "{later:?}"
+        );
+        assert_eq!(
+            reads.inputs.active_uploads,
+            BTreeSet::from([newer.to_string()]),
+            "{later:?}"
+        );
+        let plan = plan(&reads.rows, &reads.inputs);
+        assert!(
+            !plan.actions.iter().any(|action| matches!(
+                action,
+                PlannedAction::Upload { artifact_id, .. } if *artifact_id == retired.to_string()
+            )),
+            "{later:?}: {plan:?}"
+        );
+        match later {
+            LaterSuspend::Fails => assert_eq!(
+                plan.actions,
+                [PlannedAction::Suspend {
+                    sandbox_id: id.clone(),
+                    from: SuspendFrom::StartedOrPaused,
+                }],
+                "{plan:?}"
+            ),
+            LaterSuspend::Succeeds => {
+                assert_eq!(plan.actions, [], "{plan:?}");
+                assert!(
+                    plan.pending.iter().any(|wait| wait.sandbox_id == id
+                        && wait.wait == Wait::Work(DrainAction::Upload)),
+                    "{plan:?}"
+                );
+            }
+        }
+    }
 }
 
 /// End `service`'s drain under `generation` and let a suspend `wake` held back
