@@ -155,8 +155,8 @@ fixture account `root@local` / `password`. That account is an
 
 Every admin request carries a bearer token from `SPACE_API_TOKEN`. This is a
 SPACE session token from `POST /auth/v1/sessions`, not a Kubernetes token or an
-E2B API key. Admin operations require role `organization_admin`; system-template
-builds additionally require membership in the cluster's managing organization.
+E2B API key. Every admin operation requires an `organization_admin` of the
+cluster's managing organization; admins of other organizations are refused.
 Session tokens are valid for 7 days; log in again when they expire.
 The CLI does not provision accounts or refresh expired sessions automatically.
 
