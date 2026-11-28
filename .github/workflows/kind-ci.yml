@@ -441,6 +441,15 @@ jobs:
       - name: Start building the UI image while the Rust producer builds
         run: bash ci/scripts/background-step.sh start ui-image bash infra/space/kind/scripts/prebuild-ui-image.sh
 
+      # The seed's builder image and the Ubuntu cloud image it starts from need
+      # no Rust, and were the first 15-17 s of the seed build on the baseline's
+      # critical path. Built here, the seed build after the handoff finds both
+      # (build-seed.sh --builder-only), which also creates the sandbox SSH
+      # keypair the seed bakes in, long before Tilt's sandbox-ssh-secret
+      # resource reads it.
+      - name: Start building the seed builder while the Rust producer builds
+        run: bash ci/scripts/background-step.sh start seed-builder bash infra/space/kind/scripts/build-seed.sh --builder-only
+
       # The BYOK scenario seals snapshots with the host kernel's device-mapper
       # crypt and snapshot targets. Kind nodes share the runner's kernel and
       # cannot load modules themselves, so load them here, where a runner that
@@ -468,27 +477,23 @@ jobs:
 
       # Stays on this shard's runner: no cluster or mutable test state crosses
       # jobs. Rust-independent setup now overlaps the shared producer.
-      - &prepare-kind
-        name: Prepare Kind while the Rust producer builds
-        run: bash infra/space/kind/scripts/prepare-cluster.sh
-
       # Tiltfile evaluation installs the selected observability profile before
       # Tilt registers its context, and none of it needs a SPACE image. In otel
       # mode that is minutes of image loads and Helm waits, which ran after the
       # producer finished. Installed here, they overlap the producer instead,
-      # and Tilt's own pass finds each release unchanged. The Datadog preflight
-      # runs first, as it does in the Tiltfile. Inside Tilt the install was
-      # bounded by the bring-up's 1800 s initialization timeout; the step keeps
-      # that bound, since `ctr images ls` and `kind load` have none of their own.
-      - &install-observability
-        name: Install the observability profile while the Rust producer builds
+      # and Tilt's own pass finds each release unchanged. --observability runs
+      # the Datadog preflight and the install, as the Tiltfile does, as soon as
+      # the cluster exists, beside the load of the infra charts' images: as a
+      # step of its own after the preparation it added about a minute. Inside
+      # Tilt the install was bounded by the bring-up's 1800 s initialization
+      # timeout; the step keeps that bound, since `ctr images ls` and
+      # `kind load` have none of their own.
+      - &prepare-kind
+        name: Prepare Kind and its observability profile while the Rust producer builds
         timeout-minutes: 30
         env:
           SPACE_KIND_CLUSTER: space-local
-        run: |
-          set -euo pipefail
-          python3 infra/space/kind/scripts/datadog_backend.py preflight --for-deployment >/dev/null
-          bash infra/space/kind/scripts/install-observability.sh
+        run: bash infra/space/kind/scripts/prepare-cluster.sh --observability
 
       - &wait-producer
         name: Wait for this attempt's Rust producer
@@ -522,8 +527,31 @@ jobs:
         name: Load and verify the shared Rust artifact image
         run: python3 infra/space/kind/scripts/rust-artifact-handoff.py load "${RUNNER_TEMP}/kind-rust"
 
+      # The seed's rootfs is built from the guest binaries in the Rust image,
+      # and its build and the seed-publish image after it are the longest
+      # chain of the bring-up. Tilt's seed-artifacts resource started it only
+      # after the Tiltfile and the bootstrap resources, 20-23 s into the
+      # baseline. Started here, it overlaps them; that resource and the
+      # seed-publish build then wait for its lock and find the seed up to date
+      # (build-seed.sh). A failed or missing builder costs only its time: the
+      # seed build builds it, and a failed seed build is built again by Tilt.
+      # Bounded: the wait for the builder runs in the foreground, and a stalled
+      # build would otherwise hold the shard until the job's timeout. A hung
+      # builder holds the seed lock, so Tilt could not build the seed either.
+      - name: Start building the seed while the bring-up starts
+        id: seed-start
+        timeout-minutes: 10
+        run: |
+          bash ci/scripts/background-step.sh wait seed-builder \
+            || echo "::warning::The seed builder pre-build failed; the seed build builds it."
+          bash ci/scripts/background-step.sh start seed bash infra/space/kind/scripts/build-seed.sh
+
       # A failed pre-build costs only its time: Tilt builds the UI as before.
+      # Bounded like the seed builder's wait, so a stalled build fails the
+      # shard at the bound, and the failure diagnostics print its output,
+      # instead of waiting for the job's timeout.
       - name: Finish building the UI image
+        timeout-minutes: 10
         run: |
           bash ci/scripts/background-step.sh wait ui-image \
             || echo "::warning::The UI image pre-build failed; Tilt builds the UI itself."
@@ -556,6 +584,17 @@ jobs:
           BOOTSTRAP_TIMEOUT: 1800
           DATA_PLANE_URL: http://127.0.0.1:8090
         run: bash scripts/tests/smoke-kind-e2e.sh
+
+      # The early seed build's own log. After a passing baseline it has ended,
+      # since the bring-up's seed builds ran after it under the same lock.
+      # After an earlier failure this step waits for it, within its bound.
+      - name: Finish building the seed
+        if: always() && steps.seed-start.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          bash ci/scripts/background-step.sh wait seed \
+            || echo "::warning::The seed pre-build failed; Tilt's seed-artifacts builds the seed again when the bring-up reaches it."
 
       # Snapshots Tilt's build history while Tilt still runs, stops the
       # recorder and prints the timeline; the next step uploads its raw files.
@@ -626,6 +665,14 @@ jobs:
         if: failure()
         timeout-minutes: 5
         run: |
+          # A step killed at its timeout never reaches its waiter's print, so
+          # show what each unfinished background step had written.
+          for dir in "${RUNNER_TEMP}"/background-steps/*/; do
+            [[ -d "$dir" && ! -e "${dir}status" ]] || continue
+            echo "::group::Unfinished background step $(basename "$dir")"
+            tail -n 200 "${dir}output" || true
+            echo "::endgroup::"
+          done
           k() { timeout "$1" kubectl --context kind-space-local "${@:2}"; }
           k 30s get nodes -o wide || true
           k 30s get pods -A -o wide || true
@@ -798,7 +845,6 @@ jobs:
       - *load-byok-targets
       - *provide-node-image
       - *prepare-kind
-      - *install-observability
       - *wait-producer
       - *download-rust-artifacts
       - *pause-before-download-retry

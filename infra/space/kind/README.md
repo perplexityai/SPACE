@@ -281,11 +281,20 @@ export SPACE_SMOKE_KIND_CLUSTER_UID="$(kubectl --context "kind-${KIND_CLUSTER:-s
   get namespace kube-system -o jsonpath='{.metadata.uid}')"
 ```
 
-The shards prepare their node image, vendor mounts, cluster, and chart-image
-preloads while the Rust producer compiles or pulls the image, and build the UI
-image, which needs no Rust, so that Tilt's UI build is a cache hit
-([`prebuild-ui-image.sh`](scripts/prebuild-ui-image.sh)). Application startup remains behind
-the verified artifact handoff; preparation never starts Tilt or compiles Rust.
+The shards prepare their node image, vendor mounts, cluster, chart-image
+preloads and observability profile while the Rust producer compiles or pulls
+the image, and build the UI image and the seed's builder image, which need no
+Rust, so that Tilt's UI build is a cache hit
+([`prebuild-ui-image.sh`](scripts/prebuild-ui-image.sh)) and the seed build
+finds its builder and the sandbox SSH keypair (`build-seed.sh --builder-only`). Application startup remains
+behind the verified artifact handoff; preparation never starts Tilt or compiles
+Rust. Right after the handoff a shard starts the seed build in the background,
+beside the bring-up's own start: the seed's rootfs, built from the image's
+guest binaries, and the seed-publish image after it are the bring-up's longest
+chain, and Tilt's `seed-artifacts` resource reached it only after the Tiltfile
+and the bootstrap resources. That resource and the seed-publish build wait for
+the build's lock and find the seed up to date; a failed early build is built
+again by Tilt.
 Their runners are requested once the producer has one
 (`rust-artifact-handoff.py started`), or after 75 s: requested together, the
 shards took the large runners already up, and the producer waited for a new
@@ -1094,8 +1103,12 @@ default; `SPACE_BOOTSTRAP_TIMEOUT` for `up.sh`) for that initialization, while s
 An exited Tilt process or failed evaluation ends the wait early with a log
 tail. Detached bring-up also waits for this initialization, but not application
 builds or rollouts; the timeout is per stage, not a whole-bring-up deadline.
-Kind CI runs `install-observability.sh` in a step of its own while the Rust
-producer builds, so Tilt's evaluation finds each release unchanged.
+Kind CI installs the profile while the Rust producer builds, so Tilt's
+evaluation finds each release unchanged: its preparation step runs
+`prepare-cluster.sh --observability`, which starts the Datadog preflight and
+`install-observability.sh` as soon as the cluster exists, beside the load of
+the infra charts' images, and the `smoke-kind-parallel.sh` benches prepare the
+same way.
 
 Before installing, `install-observability.sh` loads each backend image onto
 every node at the linux/amd64 digest `ci/mirrored-images.txt` lists for the
@@ -1103,11 +1116,11 @@ charts' pin, under the tag the Kind profiles name, so the pods start without a
 registry pull. GitHub CI takes these images from the GHCR mirror; elsewhere
 they come from Docker Hub. A load that fails leaves the pull to the kubelet.
 In GitHub CI the mirror pulls run in parallel; with `GHCR_TOKEN` set, the
-first one logs in alone before the rest. Elsewhere the images are pulled one
-at a time. The loads run in parallel, and the local metrics and traces
-releases install at the same time; the logs and Grafana releases follow them
-in that order. A failed release fails the install; a failed pull or load only
-warns, as before.
+first one logs in alone before the rest. Elsewhere the pulls from the sources
+run in parallel too, and one that fails is retried on its own. The loads run in parallel, and the local metrics, traces and logs
+releases install at the same time, each its own chart in its own namespace;
+the Grafana release, whose datasources name them, follows them. A failed
+release fails the install; a failed pull or load only warns, as before.
 
 The `off` and `datadog` modes install no local OSS backends:
 

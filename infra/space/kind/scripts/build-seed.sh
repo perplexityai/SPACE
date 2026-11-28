@@ -39,6 +39,10 @@
 #   bash infra/space/kind/scripts/build-seed.sh
 #   bash infra/space/kind/scripts/build-seed.sh --cache-only   # build just the
 #       stages the cache keeps; main CI exports them (runtime-image-cache.sh publish)
+#   bash infra/space/kind/scripts/build-seed.sh --builder-only # build the seed
+#       builder image, hold the cloud image in SPACE_SEED_OUTPUT_DIR and create
+#       the sandbox SSH keypair, which need no Rust, so a later seed build finds
+#       all three; Kind CI's shards run it while the Rust producer builds
 #   bash infra/space/kind/scripts/build-seed.sh --read-lock -- <command> [args...]
 #       run <command> while no seed build can rewrite SPACE_SEED_OUTPUT_DIR
 #
@@ -70,7 +74,9 @@ die() { printf '[build-seed] ERROR: %s\n' "$*" >&2; exit 1; }
 
 # Tilt runs the seed build from its seed-artifacts resource and from the
 # seed-publish image build, which can overlap, and that image build then reads
-# $OUT_DIR. A lock in $OUT_DIR keeps them apart. A build holds it exclusively
+# $OUT_DIR. Kind CI's shards also run --builder-only while the Rust producer
+# builds, and an early seed build right after the Rust handoff, beside Tilt's
+# two. A lock in $OUT_DIR keeps them apart. A build holds it exclusively
 # from before it reads any input until its outputs and stamp are written, so a
 # build that waited reads the inputs as they are once it runs, and a later
 # caller finds the seed up to date instead of rebuilding it under the first.
@@ -80,7 +86,7 @@ die() { printf '[build-seed] ERROR: %s\n' "$*" >&2; exit 1; }
 SEED_LOCK="$OUT_DIR/.build.lock"
 seed_lock() { # -x | -s
   command -v flock >/dev/null 2>&1 \
-    || die "flock (util-linux) is required: Tilt runs this from two resources"
+    || die "flock (util-linux) is required: Tilt runs this from two resources, and Kind CI beside them"
   mkdir -p "$OUT_DIR"
   exec 7>>"$SEED_LOCK"
   if ! flock -n "$1" 7; then
@@ -165,10 +171,63 @@ if [[ "${1:-}" == "--cache-only" ]]; then
   seed_builder_build --target cloud-image --output type=cacheonly
   exit 0
 fi
-(( $# == 0 )) || die "usage: $0 [--cache-only | --read-lock -- <command>]"
+builder_only=0
+if [[ "${1:-}" == "--builder-only" ]]; then
+  builder_only=1
+  shift
+fi
+(( $# == 0 )) || die "usage: $0 [--cache-only | --builder-only | --read-lock -- <command>]"
 
 seed_lock -x
 read_seed_source
+
+# ── The seed builder image and the cloud image (no Rust needed) ──────────────
+# The builder image, and the recipe's cloud image held in $OUT_DIR/.cache: the
+# builder's /cache holds it under its name and the release's signed checksums
+# under the release URL. When the cache lacks either, export the builder's
+# cloud-image stage into it: from the build cache when that holds this release,
+# otherwise downloaded and verified by the stage itself. With --builder-only
+# done earlier, the builder build here finds every layer in the local cache
+# and the cloud image is already held, which took 15-17 s of a CI shard's
+# bring-up.
+prepare_builder() {
+  log "building seed builder image (templates/firecracker/seed/Dockerfile)"
+  SPACE_KIND_BUILD_CACHE_WRITE=0 seed_builder_build -t space-seed-builder:local
+
+  mkdir -p "$OUT_DIR" "$OUT_DIR/.cache"
+  seed_image_source "$SEED_UBUNTU_RELEASE" "$SEED_UBUNTU_VERSION" "$SEED_UBUNTU_DATE" "$(uname -m)"
+  local sums_cache="$OUT_DIR/.cache/sums/${SEED_IMAGE_BASE_URL#*://}" held
+  if [[ -f "$OUT_DIR/.cache/$SEED_IMAGE_NAME" && -f "$sums_cache/SHA256SUMS" && -f "$sums_cache/SHA256SUMS.gpg" ]]; then
+    log "cloud image already held in $OUT_DIR/.cache"
+  else
+    held="$(mktemp -d "$OUT_DIR/.cloud-image.XXXXXX")"
+    if SPACE_KIND_BUILD_CACHE_WRITE=0 seed_builder_build --target cloud-image --output "type=local,dest=$held" \
+        && cp -R --remove-destination "$held/." "$OUT_DIR/.cache/"; then
+      log "cloud image held in $OUT_DIR/.cache"
+    else
+      log "WARNING: could not prepare a copy of the cloud image; rootfs-builder.sh downloads it"
+    fi
+    rm -rf "$held"
+  fi
+}
+
+# ── Sandbox SSH keypair (Packer-parity, generated once per devbox) ───────────
+# Tilt's sandbox-ssh-secret resource also creates it when absent, with no lock;
+# Tilt orders it before its own seed builds, and CI's --builder-only creates it
+# before Tilt starts.
+ensure_ssh_keypair() {
+  if [[ ! -f "$SSH_DIR/sandbox_ed25519" ]]; then
+    log "generating sandbox SSH keypair → $SSH_DIR/sandbox_ed25519"
+    install -d -m 0755 "$SSH_DIR"
+    ssh-keygen -q -t ed25519 -N '' -C 'space-sandbox-local' -f "$SSH_DIR/sandbox_ed25519"
+  fi
+}
+
+if (( builder_only )); then
+  ensure_ssh_keypair
+  prepare_builder
+  exit 0
+fi
 
 # $OUT_DIR is shared by every checkout on the host; see the library for who
 # reads this mark.
@@ -187,12 +246,7 @@ SEED_KERNEL_SHA256="$(sha256sum "$kernel_path" | awk '{print $1}')"
 SEED_KERNEL_VERSION="legacy-${SEED_KERNEL_SHA256:0:12}"
 SEED_KERNEL_DIGEST="sha256:$SEED_KERNEL_SHA256"
 
-# ── Sandbox SSH keypair (Packer-parity, generated once per devbox) ───────────
-if [[ ! -f "$SSH_DIR/sandbox_ed25519" ]]; then
-  log "generating sandbox SSH keypair → $SSH_DIR/sandbox_ed25519"
-  install -d -m 0755 "$SSH_DIR"
-  ssh-keygen -q -t ed25519 -N '' -C 'space-sandbox-local' -f "$SSH_DIR/sandbox_ed25519"
-fi
+ensure_ssh_keypair
 
 # ── Guest binaries (from the worker Rust build image, or a local dir) ────────
 if [[ -n "${SPACE_SEED_GUEST_BIN_DIR:-}" ]]; then
@@ -235,29 +289,7 @@ if [[ "${SPACE_SEED_REBUILD:-0}" != "1" \
 fi
 
 # ── Build the seed with the production seed builder ──────────────────────────
-log "building seed builder image (templates/firecracker/seed/Dockerfile)"
-SPACE_KIND_BUILD_CACHE_WRITE=0 seed_builder_build -t space-seed-builder:local
-
-mkdir -p "$OUT_DIR" "$OUT_DIR/.cache"
-
-# The builder's /cache holds the cloud image under its name and the release's
-# signed checksums under the release URL. When it lacks either, export the
-# builder's cloud-image stage into it: from the build cache when that holds
-# this release, otherwise downloaded and verified by the stage itself.
-seed_image_source "$SEED_UBUNTU_RELEASE" "$SEED_UBUNTU_VERSION" "$SEED_UBUNTU_DATE" "$(uname -m)"
-sums_cache="$OUT_DIR/.cache/sums/${SEED_IMAGE_BASE_URL#*://}"
-if [[ -f "$OUT_DIR/.cache/$SEED_IMAGE_NAME" && -f "$sums_cache/SHA256SUMS" && -f "$sums_cache/SHA256SUMS.gpg" ]]; then
-  log "cloud image already held in $OUT_DIR/.cache"
-else
-  held="$(mktemp -d "$OUT_DIR/.cloud-image.XXXXXX")"
-  if SPACE_KIND_BUILD_CACHE_WRITE=0 seed_builder_build --target cloud-image --output "type=local,dest=$held" \
-      && cp -R --remove-destination "$held/." "$OUT_DIR/.cache/"; then
-    log "cloud image held in $OUT_DIR/.cache"
-  else
-    log "WARNING: could not prepare a copy of the cloud image; rootfs-builder.sh downloads it"
-  fi
-  rm -rf "$held"
-fi
+prepare_builder
 rm -f "$OUT_DIR/rootfs.ext4" "$OUT_DIR/metadata.json" "$OUT_DIR/manifest.json"
 
 log "running rootfs-builder.sh (privileged; downloads the Ubuntu minimal squashfs on first run)"

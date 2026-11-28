@@ -695,7 +695,10 @@ bootstrap_kind_stack__wait_for_job() {
             echo "  ...waiting for the $name Job (timeout in $(( deadline - now ))s)"
             last_log_at=$now
         fi
-        sleep 2
+        # Each probe is one cheap read; the failure checks above pace
+        # themselves (BOOTSTRAP_TILT_FAILCHECK_INTERVAL), so a short poll
+        # notices completion sooner without checking them more often.
+        sleep 1
     done
 }
 
@@ -745,7 +748,8 @@ bootstrap_kind_stack__wait_for_api() {
             echo "  ...waiting for $API_URL/healthz (timeout in $(( deadline - now ))s)"
             last_log_at=$now
         fi
-        sleep 2
+        # As in __wait_for_job: the failure checks pace themselves.
+        sleep 1
     done
     return 1
 }
@@ -1188,28 +1192,56 @@ bootstrap_kind_stack() {
 # anonymous registry pull. The images are read from the charts' values; an
 # image neither the mirror nor its source gives is left to the kubelet, as
 # before. Never fails the bring-up.
-bootstrap_kind_stack__load_mirrored_chart_images() {
-    [[ -n "${SPACE_CI_IMAGE_MIRROR:-}" ]] || return 0
-    local chart image images=() present=() nodes="" attempt
+#
+# The pulls need no cluster, so the bring-up starts them before `kind create`
+# and they overlap it; one at a time after it they took 16-17 s of a CI
+# shard's preparation. Each image is pulled at once; with GHCR_TOKEN set, the
+# first logs in alone, so no two `docker login`s write the Docker config at once.
+bootstrap_kind_stack__chart_images() {
+    local chart
     # Each chart's top-level `image:` block, plus the object store's
     # `bucketInitImage:` (its bucket-init Job runs the aws CLI image).
     # metrics-server is pinned to the infra node for the same reason.
     for chart in space-postgres space-redis-local space-object-store space-metrics-server; do
-        while IFS= read -r image; do
-            [[ -n "$image" ]] && images+=("$image")
-        done < <(awk '
+        awk '
             function emit() { if (in_image && repository != "" && tag != "") print repository ":" tag }
             /^(image|bucketInitImage):/ { emit(); in_image = 1; repository = ""; tag = ""; next }
             /^[^ ]/ { emit(); in_image = 0 }
             in_image && $1 == "repository:" { repository = $2 }
             in_image && $1 == "tag:" { gsub(/"/, "", $2); tag = $2 }
             END { emit() }' \
-            "$REPO_ROOT/infra/space/kind/charts/$chart/values.yaml")
+            "$REPO_ROOT/infra/space/kind/charts/$chart/values.yaml"
     done
-    bash "$REPO_ROOT/ci/scripts/mirror-images.sh" pull "${images[@]}"
+}
+
+bootstrap_kind_stack__pull_mirrored_chart_images() {
+    local image images=() dir i=0 pids=()
+    mapfile -t images < <(bootstrap_kind_stack__chart_images)
+    (( ${#images[@]} > 0 )) || return 0
+    if [[ -n "${GHCR_TOKEN:-}" ]]; then
+        bash "$REPO_ROOT/ci/scripts/mirror-images.sh" pull "${images[0]}" || true
+        images=("${images[@]:1}")
+    fi
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/kind-chart-pulls.XXXXXX")"
     for image in "${images[@]}"; do
-        docker image inspect "$image" >/dev/null 2>&1 && present+=("$image")
+        env -u GHCR_TOKEN bash "$REPO_ROOT/ci/scripts/mirror-images.sh" pull "$image" >"$dir/$i" 2>&1 &
+        pids+=("$!")
+        i=$((i + 1))
     done
+    # In queue order, so the log reads as one pull after another.
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" || true
+        cat "$dir/$i"
+    done
+    rm -rf "$dir"
+}
+
+bootstrap_kind_stack__load_mirrored_chart_images() {
+    [[ -n "${SPACE_CI_IMAGE_MIRROR:-}" ]] || return 0
+    local image present=() nodes="" attempt
+    while IFS= read -r image; do
+        docker image inspect "$image" >/dev/null 2>&1 && present+=("$image")
+    done < <(bootstrap_kind_stack__chart_images)
     # kind labels each node as its kubelet registers.
     for ((attempt = 1; attempt <= 30 && ${#present[@]} > 0; attempt++)); do
         nodes="$(kubectl --context "kind-$KIND_CLUSTER" get nodes -l space.pplx.net/node-pool=infra \
@@ -1226,19 +1258,35 @@ bootstrap_kind_stack__load_mirrored_chart_images() {
     fi
 }
 
+# With `kind_stack_prepare_cluster --defer-chart-images`, a cluster the
+# preparation creates loads the charts' images in the background, and the
+# caller runs other cluster setup beside the load (prepare-cluster.sh
+# --observability) before it waits for it with kind_stack_finish_chart_images,
+# which prints its output.
+KIND_STACK_CHART_IMAGES_PID=""
+KIND_STACK_CHART_IMAGES_LOG=""
+kind_stack_finish_chart_images() {
+    [[ -n "$KIND_STACK_CHART_IMAGES_PID" ]] || return 0
+    wait "$KIND_STACK_CHART_IMAGES_PID" || true
+    cat "$KIND_STACK_CHART_IMAGES_LOG"
+    rm -f "$KIND_STACK_CHART_IMAGES_LOG"
+    KIND_STACK_CHART_IMAGES_PID=""
+    KIND_STACK_CHART_IMAGES_LOG=""
+}
+
 # Prepare the same cluster as the full bootstrap, without starting Tilt or
 # requiring Rust artifacts. CI can do this while its producer compiles.
-kind_stack_prepare_cluster() {
+kind_stack_prepare_cluster() { # [--defer-chart-images]
     # As the Tiltfile refuses it, before a cluster is created for it.
     kind_stack_assert_substrate_request
     kind_stack_assert_smoke_prereqs
     kind_stack_assert_cluster_mounts
     kind_stack_assert_postgres_data
     bootstrap_kind_stack__assert_port_owner
-    bootstrap_kind_stack__prepare_cluster
+    bootstrap_kind_stack__prepare_cluster "$@"
 }
 
-bootstrap_kind_stack__prepare_cluster() {
+bootstrap_kind_stack__prepare_cluster() { # [--defer-chart-images]
     # `kind create` reads static YAML, so the host paths it bind-mounts are
     # resolved and stamped in here — including staging the vendor tree, because
     # `kind_prepare_host_mounts` refuses a missing one and this bring-up is
@@ -1286,21 +1334,36 @@ bootstrap_kind_stack__prepare_cluster() {
             rm -f "$kind_stack_config"
             return 1
         fi
+        # The charts' images, pulled while the nodes are seeded and created.
+        local kind_stack_pulls="" kind_stack_pull_pid=""
+        if [[ -n "${SPACE_CI_IMAGE_MIRROR:-}" ]]; then
+            kind_stack_pulls="$(mktemp "${TMPDIR:-/tmp}/kind-chart-pulls.XXXXXX")"
+            bootstrap_kind_stack__pull_mirrored_chart_images >"$kind_stack_pulls" 2>&1 &
+            kind_stack_pull_pid=$!
+        fi
         # The add-on images each node image preloads, into the empty
         # containerd directories the config mounts over them. Never fails.
         bash "$REPO_ROOT/infra/space/kind/scripts/seed-node-containerd.sh" "$kind_stack_config"
         echo "[bootstrap] kind cluster '$KIND_CLUSTER' not found; creating from $kind_stack_config"
-        # Tested in the `if`, not followed by `$?`: a caller running under
-        # `set -e` would exit on the failure before the cleanup and the
-        # rendered config would leak.
-        if kind create cluster --name "$KIND_CLUSTER" \
-            --config "$kind_stack_config"; then
-            rm -f "$kind_stack_config"
-            bootstrap_kind_stack__load_mirrored_chart_images
+        # Its status is taken with `||`, not read from `$?` after it: a caller
+        # running under `set -e` would exit on the failure before the cleanup
+        # and the rendered config would leak.
+        local kind_stack_create_rc=0
+        kind create cluster --name "$KIND_CLUSTER" \
+            --config "$kind_stack_config" || kind_stack_create_rc=$?
+        rm -f "$kind_stack_config"
+        if [[ -n "$kind_stack_pull_pid" ]]; then
+            wait "$kind_stack_pull_pid" || true
+            cat "$kind_stack_pulls"
+            rm -f "$kind_stack_pulls"
+        fi
+        (( kind_stack_create_rc == 0 )) || return "$kind_stack_create_rc"
+        if [[ "${1:-}" == --defer-chart-images ]]; then
+            KIND_STACK_CHART_IMAGES_LOG="$(mktemp "${TMPDIR:-/tmp}/kind-chart-loads.XXXXXX")"
+            bootstrap_kind_stack__load_mirrored_chart_images >"$KIND_STACK_CHART_IMAGES_LOG" 2>&1 &
+            KIND_STACK_CHART_IMAGES_PID=$!
         else
-            local kind_stack_create_rc=$?
-            rm -f "$kind_stack_config"
-            return "$kind_stack_create_rc"
+            bootstrap_kind_stack__load_mirrored_chart_images
         fi
     else
         rm -f "$kind_stack_config"
@@ -1794,7 +1857,8 @@ bootstrap_kind_stack__bring_up() {
         fi
         bootstrap_kind_stack__die_on_failed_builds
         bootstrap_kind_stack__die_on_failed_migration
-        sleep 3
+        # As in __wait_for_job: the failure checks pace themselves.
+        sleep 1
     done
     # Never fall through: an expired existence loop is its own diagnosis, and
     # letting it reach the completion wait is what produced the wrong one.
@@ -1889,7 +1953,7 @@ bootstrap_kind_stack__bring_up() {
             if curl -sf -m 2 "$DATA_PLANE_URL/healthz" >/dev/null 2>&1; then
                 return 0
             fi
-            sleep 2
+            sleep 1
         done
         echo "ERROR: data plane did not become reachable within ${BOOTSTRAP_TIMEOUT}s" >&2
         exit 1
