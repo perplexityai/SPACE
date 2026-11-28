@@ -10,10 +10,9 @@ use pplx_space_byte_size::MemorySize;
 use pplx_space_execution_spec::{
     DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC, DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC, VcpuCount,
 };
-use pplx_space_postgres_pool::{DbError, Executor};
+use pplx_space_postgres_pool::{Db, DbError, Executor};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_template_model::TemplateName;
-use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -132,7 +131,7 @@ impl BackstopWindow {
 
 #[derive(Debug, Clone)]
 pub struct WarmPoolStore {
-    pool: PgPool,
+    pool: Db,
 }
 
 /// [`WarmPoolStore::demanded_policy_release_rows`]'s statement. Binds `$1`
@@ -251,11 +250,11 @@ pub(crate) static RETAINED_POLICY_RELEASES: LazyLock<String> = LazyLock::new(|| 
 });
 
 impl WarmPoolStore {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: Db) -> Self {
         Self { pool }
     }
 
-    pub fn pool(&self) -> &PgPool {
+    pub fn pool(&self) -> &Db {
         &self.pool
     }
 
@@ -272,7 +271,7 @@ impl WarmPoolStore {
              WHERE c.enabled
              ORDER BY c.created_at"
         ))
-        .fetch_all(&self.pool)
+        .fetch_all((&self.pool).into_sqlx())
         .await?;
 
         Ok(decode_config_rows(rows))
@@ -296,7 +295,7 @@ impl WarmPoolStore {
                 )
              ORDER BY c.created_at"
         ))
-        .fetch_all(&self.pool)
+        .fetch_all((&self.pool).into_sqlx())
         .await?;
 
         Ok(decode_config_rows(rows))
@@ -323,7 +322,7 @@ impl WarmPoolStore {
              ORDER BY c.created_at"
         ))
         .bind(grace_secs)
-        .fetch_all(&self.pool)
+        .fetch_all((&self.pool).into_sqlx())
         .await?;
 
         Ok(decode_config_rows(rows))
@@ -345,7 +344,7 @@ impl WarmPoolStore {
              GROUP BY c.id, r.template_name, r.hash
              ORDER BY r.template_name, c.created_at"
         ))
-        .fetch_all(&self.pool)
+        .fetch_all((&self.pool).into_sqlx())
         .await?;
 
         Ok(rows)
@@ -368,7 +367,7 @@ impl WarmPoolStore {
              GROUP BY c.id, r.template_name, r.hash"
         ))
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional((&self.pool).into_sqlx())
         .await?;
 
         Ok(row)
@@ -393,7 +392,7 @@ impl WarmPoolStore {
              ORDER BY c.created_at"
         ))
         .bind(release_ids)
-        .fetch_all(&self.pool)
+        .fetch_all((&self.pool).into_sqlx())
         .await?;
 
         Ok(rows)
@@ -908,7 +907,7 @@ impl WarmPoolStore {
              JOIN template_releases r ON r.id = c.template_release_id
              WHERE c.enabled"
         ))
-        .fetch_all(&self.pool)
+        .fetch_all((&self.pool).into_sqlx())
         .await?;
         // All or nothing, unlike the autoscale read: a release left out of
         // this set may be evicted from nodes.
@@ -960,7 +959,7 @@ impl WarmPoolStore {
                     .expect("disk I/O default fits in PostgreSQL BIGINT"),
             )
             .bind(initial_environment)
-            .fetch_all(&self.pool)
+            .fetch_all((&self.pool).into_sqlx())
             .await?,
         )
     }
@@ -980,7 +979,7 @@ impl WarmPoolStore {
                     i64::try_from(DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC)
                         .expect("disk I/O default fits in PostgreSQL BIGINT"),
                 )
-                .fetch_all(&self.pool)
+                .fetch_all((&self.pool).into_sqlx())
                 .await?,
         )
     }
@@ -1064,7 +1063,7 @@ impl WarmPoolStore {
                 .bind(AUTOSCALE_DEFAULT_VCPU)
                 .bind(AUTOSCALE_DEFAULT_MEMORY_MIB)
                 .bind(initial_environment)
-                .fetch_all(&self.pool)
+                .fetch_all((&self.pool).into_sqlx())
                 .await?;
 
         Ok(decode_autoscale_rows(
@@ -1136,7 +1135,7 @@ impl WarmPoolStore {
         .bind(candidate.refill_per_tick)
         .bind(candidate.max_warming_slots)
         .bind(namespace)
-        .execute(&self.pool)
+        .execute((&self.pool).into_sqlx())
         .await?;
 
         Ok(())
@@ -1181,7 +1180,7 @@ impl WarmPoolStore {
         .bind(vcpus)
         .bind(memory_mib)
         .bind(held_release_ids)
-        .execute(&self.pool)
+        .execute((&self.pool).into_sqlx())
         .await?;
 
         Ok(())
@@ -1210,7 +1209,7 @@ impl WarmPoolStore {
                )
              FOR UPDATE OF c"
         ))
-        .fetch_all(&mut *tx)
+        .fetch_all((&mut tx).into_sqlx())
         .await?;
         let read = decode_config_rows(rows);
         let config_ids = read
@@ -1224,7 +1223,7 @@ impl WarmPoolStore {
              WHERE id = ANY($1::UUID[])"
         ))
         .bind(&config_ids)
-        .execute(&mut *tx)
+        .execute((&mut tx).into_sqlx())
         .await?;
         tx.commit().await?;
 
@@ -1241,7 +1240,7 @@ impl WarmPoolStore {
                AND state IN ('warming', 'ready')"
         ))
         .bind(config_id)
-        .fetch_one(&self.pool)
+        .fetch_one((&self.pool).into_sqlx())
         .await?;
 
         Ok(counts.into())
@@ -1260,7 +1259,7 @@ impl WarmPoolStore {
              ORDER BY created_at"
         ))
         .bind(config_id)
-        .fetch_all(&self.pool)
+        .fetch_all((&self.pool).into_sqlx())
         .await?;
 
         rows.into_iter().map(TryInto::try_into).collect()
@@ -1279,7 +1278,7 @@ impl WarmPoolStore {
              ORDER BY ready_at NULLS LAST, created_at"
         ))
         .bind(config_id)
-        .fetch_all(&self.pool)
+        .fetch_all((&self.pool).into_sqlx())
         .await?;
 
         rows.into_iter().map(TryInto::try_into).collect()
@@ -1316,7 +1315,7 @@ impl WarmPoolStore {
         .bind(memory_to_mib_i32(slot.memory))
         .bind(slot.pod_name)
         .bind(slot.pod_namespace)
-        .fetch_one(&self.pool)
+        .fetch_one((&self.pool).into_sqlx())
         .await?;
 
         row.try_into()
@@ -1351,7 +1350,7 @@ impl WarmPoolStore {
         .bind(pod_uid)
         .bind(pod_ip)
         .bind(k8s_node_name)
-        .fetch_optional(&self.pool)
+        .fetch_optional((&self.pool).into_sqlx())
         .await?
         .ok_or(PoolError::SlotNotWarming { slot_id })?;
 
@@ -1365,7 +1364,7 @@ impl WarmPoolStore {
                AND state IN ('warming', 'ready')"
         ))
         .bind(slot_id)
-        .execute(&self.pool)
+        .execute((&self.pool).into_sqlx())
         .await?;
 
         Ok(result.rows_affected() > 0)
@@ -1668,7 +1667,7 @@ impl WarmPoolStore {
              LIMIT 1"
         ))
         .bind(template_release_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional((&self.pool).into_sqlx())
         .await?;
 
         row.map(pool_assignment_from_shape_row).transpose()
@@ -1707,7 +1706,7 @@ impl WarmPoolStore {
             i64::try_from(DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC)
                 .expect("default disk bandwidth fits in PostgreSQL BIGINT"),
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional((&self.pool).into_sqlx())
         .await?;
 
         row.map(pool_assignment_from_shape_row).transpose()
@@ -1878,7 +1877,7 @@ impl WarmPoolStore {
         ))
         .bind(reserved_sandbox_id)
         .bind(PoolSlotState::CleanupPending.as_str())
-        .fetch_one(&self.pool)
+        .fetch_one((&self.pool).into_sqlx())
         .await?;
 
         Ok(pending)
@@ -1902,7 +1901,7 @@ impl WarmPoolStore {
              WHERE reserved_sandbox_id = ANY($1)"
         ))
         .bind(sandbox_ids)
-        .fetch_all(&self.pool)
+        .fetch_all((&self.pool).into_sqlx())
         .await?;
 
         Ok(rows)
@@ -1933,7 +1932,7 @@ impl WarmPoolStore {
         .bind(claim_id)
         .bind(reserved_sandbox_id)
         .bind(PoolSlotState::Claimed.as_str())
-        .execute(&self.pool)
+        .execute((&self.pool).into_sqlx())
         .await?;
 
         Ok(result.rows_affected() > 0)
@@ -1961,7 +1960,7 @@ impl WarmPoolStore {
         .bind(claim_id)
         .bind(reserved_sandbox_id)
         .bind(PoolSlotState::Claimed.as_str())
-        .execute(&self.pool)
+        .execute((&self.pool).into_sqlx())
         .await?;
 
         Ok(result.rows_affected() > 0)
@@ -2022,7 +2021,7 @@ impl WarmPoolStore {
         ))
         .bind(older_than_secs)
         .bind(limit.max(0))
-        .fetch_all(&self.pool)
+        .fetch_all((&self.pool).into_sqlx())
         .await?;
 
         rows.into_iter().map(TryInto::try_into).collect()
@@ -2042,7 +2041,7 @@ impl WarmPoolStore {
              LIMIT $1"
         ))
         .bind(limit.max(0))
-        .fetch_all(&self.pool)
+        .fetch_all((&self.pool).into_sqlx())
         .await?;
 
         rows.into_iter().map(TryInto::try_into).collect()
@@ -2093,7 +2092,7 @@ impl WarmPoolStore {
         let row = sqlx::query_scalar::<_, Uuid>(STALE_UNBOUND_CLAIMED_SLOT_BY_ID_SQL)
             .bind(slot_id)
             .bind(older_than_secs)
-            .fetch_optional(&self.pool)
+            .fetch_optional((&self.pool).into_sqlx())
             .await?;
 
         Ok(row.is_some())
@@ -2114,7 +2113,7 @@ impl WarmPoolStore {
             "SELECT id FROM kubernetes_pool_slots WHERE id = ANY($1)"
         ))
         .bind(slot_ids)
-        .fetch_all(&self.pool)
+        .fetch_all((&self.pool).into_sqlx())
         .await?;
 
         Ok(rows.into_iter().collect())
@@ -2159,7 +2158,7 @@ impl WarmPoolStore {
         ))
         .bind(sandbox_ids)
         .bind(pod_names)
-        .fetch_all(&self.pool)
+        .fetch_all((&self.pool).into_sqlx())
         .await?;
 
         Ok(rows.into_iter().collect())
@@ -2195,7 +2194,7 @@ impl WarmPoolStore {
         .bind(slot_id)
         .bind(sandbox_id)
         .bind(pod_name)
-        .fetch_one(&self.pool)
+        .fetch_one((&self.pool).into_sqlx())
         .await?;
 
         Ok(unowned)
@@ -2221,13 +2220,16 @@ impl WarmPoolStore {
     /// `cleanup_pending` slot is a durable work item that still owes a pod
     /// kill and sandbox finalize. `claimed` stays accepted alongside `bound`
     /// while receipts from binds that predate the bind stamp still exist.
-    pub async fn delete_claimed_slot_for_retired_execution(
-        tx: &mut Transaction<'_, Postgres>,
+    /// The caller must pass its open transaction.
+    pub async fn delete_claimed_slot_for_retired_execution<C>(
+        tx: &mut C,
         reserved_sandbox_id: SandboxId,
-    ) -> Result<bool> {
+    ) -> Result<bool>
+    where
+        for<'a> &'a mut C: Executor<'a>,
+    {
         let deleted =
-            Self::delete_claimed_slots_for_retired_executions(&mut **tx, &[reserved_sandbox_id])
-                .await?;
+            Self::delete_claimed_slots_for_retired_executions(tx, &[reserved_sandbox_id]).await?;
 
         Ok(deleted > 0)
     }
@@ -2327,7 +2329,7 @@ impl WarmPoolStore {
         .bind(range.last_id)
         .bind(PoolSlotState::Bound.as_str())
         .bind(PoolSlotState::Claimed.as_str())
-        .execute(&self.pool)
+        .execute((&self.pool).into_sqlx())
         .await?;
 
         Ok(range.into_outcome(result.rows_affected()))
@@ -2383,7 +2385,7 @@ impl WarmPoolStore {
         .bind(cursor)
         .bind(range.last_id)
         .bind(PoolSlotState::Bound.as_str())
-        .execute(&self.pool)
+        .execute((&self.pool).into_sqlx())
         .await?;
 
         Ok(range.into_outcome(result.rows_affected()))
@@ -2426,7 +2428,7 @@ impl WarmPoolStore {
         .bind(cursor)
         .bind(through)
         .bind(window.max(0))
-        .fetch_all(&self.pool)
+        .fetch_all((&self.pool).into_sqlx())
         .await?;
 
         let Some(last_id) = ids.last().copied() else {
@@ -2447,7 +2449,7 @@ impl WarmPoolStore {
              ORDER BY id DESC
              LIMIT 1"
         ))
-        .fetch_optional(&self.pool)
+        .fetch_optional((&self.pool).into_sqlx())
         .await?)
     }
 

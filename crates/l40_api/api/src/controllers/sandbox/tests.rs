@@ -1023,9 +1023,11 @@ mod template_release_resolution_postgres_tests {
         .bind(template_name)
         .fetch_one(&db.pool)
         .await?;
-        let protected = pplx_space_cluster_pool::WarmPoolStore::new(db.pool.clone())
-            .protected_template_releases()
-            .await?;
+        let protected = pplx_space_cluster_pool::WarmPoolStore::new(
+            pplx_space_postgres_pool::Db::from(db.pool.clone()),
+        )
+        .protected_template_releases()
+        .await?;
 
         assert_eq!(resolved, (newer_release_id, newer_hash.to_string()));
         assert_eq!(latest.0, newer_release_id);

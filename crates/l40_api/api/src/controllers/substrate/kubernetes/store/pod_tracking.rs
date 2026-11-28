@@ -549,9 +549,10 @@ impl K8sStore {
         // sweep's working set bounded by live capacity instead of delete
         // churn. No-op for non-pooled sandboxes and for `cleanup_pending`
         // slots (the failed-boot path still owns those).
-        let slot_deleted = WarmPoolStore::delete_claimed_slot_for_retired_execution(tx, sandbox_id)
-            .await
-            .db_context("failed to delete claimed pool slot")?;
+        let slot_deleted =
+            WarmPoolStore::delete_claimed_slot_for_retired_execution(&mut **tx, sandbox_id)
+                .await
+                .db_context("failed to delete claimed pool slot")?;
         if slot_deleted {
             tracing::info!(
                 sandbox_id = %sandbox_id,

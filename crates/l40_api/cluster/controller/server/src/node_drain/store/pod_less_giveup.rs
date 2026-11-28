@@ -544,10 +544,10 @@ async fn recover_pod_less_sandbox_locked(
     }
 
     retire_executions(&mut tx, candidate.sandbox_id).await?;
-    WarmPoolStore::delete_claimed_slot_for_retired_execution(&mut tx, candidate.sandbox_id)
+    WarmPoolStore::delete_claimed_slot_for_retired_execution(&mut *tx, candidate.sandbox_id)
         .await
         .map_err(|err| match err {
-            PoolError::Sql(err) => err,
+            PoolError::Sql(err) => sqlx::Error::from(err),
             other => sqlx::Error::Protocol(format!("delete claimed pool slot: {other}")),
         })?;
     reset_open_port_exposures(&mut tx, candidate.sandbox_id).await?;

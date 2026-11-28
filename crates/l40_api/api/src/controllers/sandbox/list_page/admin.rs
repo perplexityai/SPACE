@@ -343,7 +343,7 @@ impl SandboxController {
                         &sqlx::Error::from(err),
                     )
                 })?;
-            WarmPoolStore::new(pool.clone())
+            WarmPoolStore::new(pplx_space_postgres_pool::Db::from(pool.clone()))
                 .pool_reservations(&rowless)
                 .await
                 .map_err(|err| {

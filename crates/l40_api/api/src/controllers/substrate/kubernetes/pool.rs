@@ -50,7 +50,7 @@ fn i64_count_to_u32(value: i64, field: &'static str) -> Result<u32, ControllerEr
 pub(super) async fn list_pool_configs(
     store: &K8sStore,
 ) -> Result<Vec<ClusterPoolConfigResponse>, ControllerError> {
-    let rows = WarmPoolStore::new(store.pool().clone())
+    let rows = WarmPoolStore::new(pplx_space_postgres_pool::Db::from(store.pool().clone()))
         .list_configs_with_counts()
         .await
         .map_err(|err| pool_store_error("failed to load cluster pool configs", &err))?;
@@ -582,7 +582,7 @@ pub(super) async fn admitted_pool_cleanup_pending(
     pool: &PgPool,
     sandbox_id: SandboxId,
 ) -> Result<bool, ControllerError> {
-    WarmPoolStore::new(pool.clone())
+    WarmPoolStore::new(pplx_space_postgres_pool::Db::from(pool.clone()))
         .reserved_slot_cleanup_pending(sandbox_id)
         .await
         .map_err(|err| pool_store_error("failed to read admitted pool slot cleanup", &err))
@@ -720,7 +720,7 @@ pub(super) async fn invalidate_claimed_pool_slot(
     pool: &PgPool,
     claim: &PooledExecutionClaim,
 ) -> Result<bool, ControllerError> {
-    WarmPoolStore::new(pool.clone())
+    WarmPoolStore::new(pplx_space_postgres_pool::Db::from(pool.clone()))
         .invalidate_claimed_slot(claim.claim_id, claim.sandbox_id)
         .await
         .map_err(|err| pool_store_error("failed to invalidate claimed pool slot", &err))
@@ -761,7 +761,7 @@ pub(super) async fn release_claimed_pool_slot(
     pool: &PgPool,
     claim: &PooledExecutionClaim,
 ) -> Result<(), ControllerError> {
-    WarmPoolStore::new(pool.clone())
+    WarmPoolStore::new(pplx_space_postgres_pool::Db::from(pool.clone()))
         .release_claimed_slot(claim.claim_id, claim.sandbox_id)
         .await
         .map_err(|err| pool_store_error("failed to release claimed pool slot", &err))?;
@@ -841,7 +841,7 @@ async fn fetch_pool_config(
     store: &K8sStore,
     id: Uuid,
 ) -> Result<Option<ClusterPoolConfigResponse>, ControllerError> {
-    let row = WarmPoolStore::new(store.pool().clone())
+    let row = WarmPoolStore::new(pplx_space_postgres_pool::Db::from(store.pool().clone()))
         .config_with_counts(id)
         .await
         .map_err(|err| pool_store_error("failed to load cluster pool config", &err))?;

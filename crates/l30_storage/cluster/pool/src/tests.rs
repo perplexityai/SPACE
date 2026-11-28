@@ -8,6 +8,7 @@ use pplx_space_byte_size::MemorySize;
 use pplx_space_content_digest::{ContentHash, Digest};
 use pplx_space_db_test_fixtures::{TestDb, pg_test_db};
 use pplx_space_execution_spec::VcpuCount;
+use pplx_space_postgres_pool::Db;
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_template_model::TemplateName;
 use sqlx::PgPool;
@@ -131,7 +132,7 @@ async fn postgres_fixture() -> TestResult<PostgresFixture> {
     let pool = db.pool.clone();
 
     Ok(PostgresFixture {
-        store: WarmPoolStore::new(pool.clone()),
+        store: WarmPoolStore::new(Db::from(pool.clone())),
         pool,
         _db: db,
     })
@@ -2897,12 +2898,12 @@ async fn store_delete_claimed_slot_for_retired_execution_deletes_claimed_slot() 
     // act
     let mut retire_tx = fixture.pool.begin().await?;
     let deleted = WarmPoolStore::delete_claimed_slot_for_retired_execution(
-        &mut retire_tx,
+        &mut *retire_tx,
         reserved_sandbox_id,
     )
     .await?;
     let unknown_deleted =
-        WarmPoolStore::delete_claimed_slot_for_retired_execution(&mut retire_tx, SandboxId::new())
+        WarmPoolStore::delete_claimed_slot_for_retired_execution(&mut *retire_tx, SandboxId::new())
             .await?;
     retire_tx.commit().await?;
 
@@ -2996,12 +2997,12 @@ async fn store_delete_claimed_slot_for_retired_execution_skips_open_and_cleanup_
     // act
     let mut retire_tx = fixture.pool.begin().await?;
     let cleanup_pending_deleted = WarmPoolStore::delete_claimed_slot_for_retired_execution(
-        &mut retire_tx,
+        &mut *retire_tx,
         cleanup_pending_sandbox_id,
     )
     .await?;
     let ready_deleted =
-        WarmPoolStore::delete_claimed_slot_for_retired_execution(&mut retire_tx, ready_sandbox_id)
+        WarmPoolStore::delete_claimed_slot_for_retired_execution(&mut *retire_tx, ready_sandbox_id)
             .await?;
     retire_tx.commit().await?;
 
@@ -3668,7 +3669,7 @@ async fn store_retired_execution_delete_removes_bound_slot() -> TestResult {
     // act
     let mut retire_tx = fixture.pool.begin().await?;
     let deleted = WarmPoolStore::delete_claimed_slot_for_retired_execution(
-        &mut retire_tx,
+        &mut *retire_tx,
         reserved_sandbox_id,
     )
     .await?;

@@ -13225,7 +13225,7 @@ mod kubernetes_tests {
         .execute(&db.pool)
         .await?;
 
-        let store = WarmPoolStore::new(db.pool.clone());
+        let store = WarmPoolStore::new(pplx_space_postgres_pool::Db::from(db.pool.clone()));
         let reserved = SandboxId::new();
         let slot = store
             .insert_warming_slot(NewPoolSlot {

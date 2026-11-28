@@ -2174,13 +2174,13 @@ async fn fetch_release_warm_pools(
     pool: &sqlx::PgPool,
     release_ids: &[Uuid],
 ) -> Result<HashMap<Uuid, Vec<TemplateReleaseWarmPoolResponse>>, sqlx::Error> {
-    let rows = WarmPoolStore::new(pool.clone())
+    let rows = WarmPoolStore::new(pplx_space_postgres_pool::Db::from(pool.clone()))
         .release_configs_with_counts(release_ids)
         .await
         .map_err(|err| match err {
             // This chain is sqlx::Error-typed end to end; a raw read model
             // can only fail in sqlx, so unwrap that case and box the rest.
-            pplx_space_cluster_pool::PoolError::Sql(err) => err,
+            pplx_space_cluster_pool::PoolError::Sql(err) => sqlx::Error::from(err),
             other => sqlx::Error::Decode(Box::new(other)),
         })?;
     let mut pools = HashMap::<Uuid, Vec<TemplateReleaseWarmPoolResponse>>::new();
