@@ -84,13 +84,6 @@ pplx-space-volmgr = [
 ]
 
 [layers.unowned]
-postgres = [
-  "data_plane_session_output_events",
-  "org_credentials",
-  "sandbox_archives",
-  "sandbox_encrypted_fields",
-  "user_credentials",
-]
 
 # [crate_names] maps each workspace package with a catch-all name (a part such
 # as `common`, `utils` or `core`) to its member path. Only remove entries: a pull
