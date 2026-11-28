@@ -92,8 +92,6 @@ postgres = [
   "org_credentials",
   "sandbox_archives",
   "sandbox_encrypted_fields",
-  "template_encrypted_fields",
-  "template_release_storage_location_encrypted_fields",
   "user_credentials",
 ]
 

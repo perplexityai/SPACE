@@ -8,12 +8,17 @@ license.workspace = true
 publish.workspace = true
 
 [package.metadata.space.state]
+# template_encrypted_fields is a template's credential-fenced encryption
+# sidecar. No production code writes it; its rows go with their template's
+# delete, by foreign-key cascade. pplx-space-template-release-store's
+# template_has_owner_encryption reads it, on the credentials pool.
 postgres = [
     "template_base_snapshot_policies",
     "template_build_base_grants",
     "template_build_blobs",
     "template_build_jobs",
     "template_default_auto_lifecycle_policies",
+    "template_encrypted_fields",
     "template_pool_policies",
     "template_release_tags",
     "template_system_publication_grants",
